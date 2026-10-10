@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/blot-host", "crates/gdev", "crates/gdev-protocol", "crates/gdev-render"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+blot-host = { path = "crates/blot-host" }
+gdev-protocol = { path = "crates/gdev-protocol" }
+gdev-render = { path = "crates/gdev-render" }
+wgpu = "30"
+wasmtime = "49"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = true
+
+# Shaders and wasm compilation are slow unoptimized; keep dependencies fast in dev.
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,30 @@
+[package]
+name = "gdev-native"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Native runtime for gdev: winit window, wgpu renderer, wasmtime guest"
+
+[[bin]]
+name = "gdev"
+path = "src/main.rs"
+
+[features]
+default = []
+steam = ["dep:steamworks"]
+
+[dependencies]
+anyhow.workspace = true
+blot-host.workspace = true
+gdev-protocol.workspace = true
+gdev-render.workspace = true
+wasmtime.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+dirs = "7"
+kira = "0.12"
+pollster = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+steamworks = { version = "0.13", optional = true }
+wgpu.workspace = true
+winit = "0.30"

@@ -1,0 +1,895 @@
+[
+ {
+  "name": "catalog fields",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[\"rock_menhir.mesh.json\",\"a-b.c.json\",\"cube.mesh.json\"],\"materials\":[\"brass.material.json\",\"brass.png.material.json\"],\"sounds\":[\"blip.wav\",\"hum.ogg\",\"x.y.wav\",\"wind😀.wav\"],\"textures\":[\"ignored.png\"]}"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes { rock_menhir: U32, a_b_c: U32, cube: U32 }\ntype Materials is data = #Materials { brass: U32, brass_png: U32 }\ntype Sounds is data = #Sounds { blip: U32, hum: U32, x_y: U32, wind__: U32 }\nconst meshes: Meshes = (#Meshes { rock_menhir: 0, a_b_c: 1, cube: 2 })\nconst materials: Materials = (#Materials { brass: 0, brass_png: 1 })\nconst sounds: Sounds = (#Sounds { blip: 0, hum: 1, x_y: 2, wind__: 3 })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "catalog empty lists",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[]}"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "text words and lists",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/text.json": "{\"title\":\"Åsa's café\",\"plain\":\"Hello, world! ~\",\"extra\":\"åäöÅÄÖéüÉ‹›•…×–—\",\"lines\":[\"one\",\"two\",\"\"],\"empty\":\"\",\"none\":[]}"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   },
+   {
+    "path": "/checkout/src/text.json.blot",
+    "source": "type Text is data = #Text { title: (Array U32), plain: (Array U32), extra: (Array U32), lines: (Array (Array U32)), empty: (Array U32), none: (Array (Array U32)) }\nconst text: Text = (#Text { title: #[197, 115, 97, 39, 115, 32, 99, 97, 102, 233], plain: #[72, 101, 108, 108, 111, 44, 32, 119, 111, 114, 108, 100, 33, 32, 126], extra: #[229, 228, 246, 197, 196, 214, 233, 252, 201, 8249, 8250, 8226, 8230, 215, 8211, 8212], lines: #[#[111, 110, 101], #[116, 119, 111], #[]], empty: #[], none: #[] })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/catalog.json",
+   "/checkout/src/text.json"
+  ]
+ },
+ {
+  "name": "text bom",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/text.json": "﻿{\"a\":\"b\"}"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   },
+   {
+    "path": "/checkout/src/text.json.blot",
+    "source": "type Text is data = #Text { a: (Array U32) }\nconst text: Text = (#Text { a: #[98] })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/catalog.json",
+   "/checkout/src/text.json"
+  ]
+ },
+ {
+  "name": "text duplicate keys",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/text.json": "{\"a\": \"first\", \"b\": \"x\", \"a\": \"second\"}"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   },
+   {
+    "path": "/checkout/src/text.json.blot",
+    "source": "type Text is data = #Text { a: (Array U32), b: (Array U32) }\nconst text: Text = (#Text { a: #[115, 101, 99, 111, 110, 100], b: #[120] })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/catalog.json",
+   "/checkout/src/text.json"
+  ]
+ },
+ {
+  "name": "tunables working",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"about\": \"ignored\",\n  \"tunables\": [\n    {\n      \"name\": \"camera.zoom_speed\",\n      \"default\": 0.001,\n      \"min\": 0.0001,\n      \"max\": 0.01\n    },\n    {\n      \"name\": \"salt.per_strike\",\n      \"default\": 3,\n      \"min\": 1,\n      \"max\": 12,\n      \"step\": 1,\n      \"doc\": \"Salt a strike frees ✓ — or so.\"\n    },\n    {\n      \"name\": \"a.negative\",\n      \"default\": -0.5,\n      \"min\": -1,\n      \"max\": 1e+21\n    },\n    {\n      \"name\": \"tiny\",\n      \"default\": 1e-7,\n      \"min\": 1e-8,\n      \"max\": 0.000001\n    },\n    {\n      \"name\": \"big\",\n      \"default\": 3e+38,\n      \"min\": -3e+38,\n      \"max\": 3.4e+38\n    },\n    {\n      \"name\": \"zero\",\n      \"default\": 0,\n      \"min\": -1,\n      \"max\": 1\n    }\n  ]\n}"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   },
+   {
+    "path": "/checkout/src/tunables.json.blot",
+    "source": "type Tunables is data = #Tunables { camera_zoom_speed: (U32, F32, F32, F32), salt_per_strike: (U32, F32, F32, F32), a_negative: (U32, F32, F32, F32), tiny: (U32, F32, F32, F32), big: (U32, F32, F32, F32), zero: (U32, F32, F32, F32) }\ntype Declaration is data = #Declaration { name: (Array U32), id: U32, initial: F32, least: F32, most: F32, doc: (Array U32) }\nconst tunables: Tunables = (#Tunables { camera_zoom_speed: (11175412, 0.0010000000474974513, 0.00009999999747378752, 0.009999999776482582), salt_per_strike: (13555305, 3.0, 1.0, 12.0), a_negative: (10690027, (-0.5), (-1.0), 1.0000000200408773e+21), tiny: (3532298, 1.0000000116860974e-7, 9.99999993922529e-9, 9.999999974752427e-7), big: (13290986, 3.0000000054977558e+38, (-3.0000000054977558e+38), 3.3999999521443642e+38), zero: (7333864, 0.0, (-1.0), 1.0) })\nconst declarations: (Array Declaration) = #[(#Declaration { name: #[99, 97, 109, 101, 114, 97, 46, 122, 111, 111, 109, 95, 115, 112, 101, 101, 100], id: 11175412, initial: 0.0010000000474974513, least: 0.00009999999747378752, most: 0.009999999776482582, doc: #[] }), (#Declaration { name: #[115, 97, 108, 116, 46, 112, 101, 114, 95, 115, 116, 114, 105, 107, 101], id: 13555305, initial: 3.0, least: 1.0, most: 12.0, doc: #[83, 97, 108, 116, 32, 97, 32, 115, 116, 114, 105, 107, 101, 32, 102, 114, 101, 101, 115, 32, 63, 32, 8212, 32, 111, 114, 32, 115, 111, 46] }), (#Declaration { name: #[97, 46, 110, 101, 103, 97, 116, 105, 118, 101], id: 10690027, initial: (-0.5), least: (-1.0), most: 1.0000000200408773e+21, doc: #[] }), (#Declaration { name: #[116, 105, 110, 121], id: 3532298, initial: 1.0000000116860974e-7, least: 9.99999993922529e-9, most: 9.999999974752427e-7, doc: #[] }), (#Declaration { name: #[98, 105, 103], id: 13290986, initial: 3.0000000054977558e+38, least: (-3.0000000054977558e+38), most: 3.3999999521443642e+38, doc: #[] }), (#Declaration { name: #[122, 101, 114, 111], id: 7333864, initial: 0.0, least: (-1.0), most: 1.0, doc: #[] })]\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/catalog.json",
+   "/checkout/src/tunables.json"
+  ]
+ },
+ {
+  "name": "tunables none",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": []\n}"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   },
+   {
+    "path": "/checkout/src/tunables.json.blot",
+    "source": "type Tunables is data = #Tunables {  }\ntype Declaration is data = #Declaration { name: (Array U32), id: U32, initial: F32, least: F32, most: F32, doc: (Array U32) }\nconst tunables: Tunables = (#Tunables {  })\nconst declarations: (Array Declaration) = #[]\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/catalog.json",
+   "/checkout/src/tunables.json"
+  ]
+ },
+ {
+  "name": "text missing glyph",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/text.json": "{\"hello\":\"héllo ✓ ✓ ♥\"}"
+  },
+  "error": {
+   "file": "/checkout/src/text.json",
+   "message": "text hello: the font has no ✓♥"
+  }
+ },
+ {
+  "name": "text missing glyph in a list",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/text.json": "{\"menu\":[\"ok\",\"naïve\"]}"
+  },
+  "error": {
+   "file": "/checkout/src/text.json",
+   "message": "text menu: the font has no ï"
+  }
+ },
+ {
+  "name": "text astral glyph",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/text.json": "{\"face\":\"a😀b\"}"
+  },
+  "error": {
+   "file": "/checkout/src/text.json",
+   "message": "text face: the font has no 😀"
+  }
+ },
+ {
+  "name": "text field name",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/text.json": "{\"Title\":\"x\"}"
+  },
+  "error": {
+   "file": "/checkout/src/text.json",
+   "message": "Invalid Blot value/field name: Title"
+  }
+ },
+ {
+  "name": "text keyword field",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/text.json": "{\"type\":\"x\"}"
+  },
+  "error": {
+   "file": "/checkout/src/text.json",
+   "message": "Invalid Blot value/field name: type"
+  }
+ },
+ {
+  "name": "catalog two files share a name",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[\"a.mesh.json\",\"a.json\"]}"
+  },
+  "error": {
+   "file": "/checkout/src/assets/catalog.json",
+   "message": "catalog meshes: two files share a name"
+  }
+ },
+ {
+  "name": "catalog field name",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"sounds\":[\"1st.wav\"]}"
+  },
+  "error": {
+   "file": "/checkout/src/assets/catalog.json",
+   "message": "Invalid Blot value/field name: 1st"
+  }
+ },
+ {
+  "name": "tunables not a list",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunable\": []\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: expected { \"tunables\": [...] }"
+  }
+ },
+ {
+  "name": "tunables not an object",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    3\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: tunable 0 is not an object"
+  }
+ },
+ {
+  "name": "tunables bad name",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"Camera.zoom\"\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: tunable 0 needs a name of lowercase words joined by dots, such as \"camera.zoom_speed\""
+  }
+ },
+ {
+  "name": "tunables unknown fields",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"a\",\n      \"default\": 0,\n      \"min\": 0,\n      \"max\": 1,\n      \"low\": 0,\n      \"high\": 1\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: a: unknown low, high (a tunable has name, default, min, max, step, doc)"
+  }
+ },
+ {
+  "name": "tunables missing number",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"a\",\n      \"min\": 0,\n      \"max\": 1\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: a: default must be a finite number"
+  }
+ },
+ {
+  "name": "tunables not finite in f32",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"a\",\n      \"default\": 1e+39,\n      \"min\": 0,\n      \"max\": 1\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: a: default must be a finite number"
+  }
+ },
+ {
+  "name": "tunables min not below max",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"a\",\n      \"default\": 1,\n      \"min\": 1,\n      \"max\": 1.00000001\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: a: min must be below max"
+  }
+ },
+ {
+  "name": "tunables default outside",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"a\",\n      \"default\": 0.30000000000000004,\n      \"min\": 0.5,\n      \"max\": 1e+21\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: a: its default 0.30000000000000004 is outside 0.5..1e+21"
+  }
+ },
+ {
+  "name": "tunables step",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"a\",\n      \"default\": 0,\n      \"min\": 0,\n      \"max\": 1,\n      \"step\": 0\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: a: step must be positive"
+  }
+ },
+ {
+  "name": "tunables doc",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"a\",\n      \"default\": 0,\n      \"min\": 0,\n      \"max\": 1,\n      \"doc\": 3\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: a: doc must be text"
+  }
+ },
+ {
+  "name": "tunables same field",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"a.b\",\n      \"default\": 0,\n      \"min\": 0,\n      \"max\": 1\n    },\n    {\n      \"name\": \"a_b\",\n      \"default\": 0,\n      \"min\": 0,\n      \"max\": 1\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: a_b: reads as a_b, as a.b does; rename one"
+  }
+ },
+ {
+  "name": "tunables same id",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"t858\",\n      \"default\": 0,\n      \"min\": 0,\n      \"max\": 1\n    },\n    {\n      \"name\": \"t8662\",\n      \"default\": 0,\n      \"min\": 0,\n      \"max\": 1\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "tunables.json: t8662: its id 6937671 is t858's too; rename one"
+  }
+ },
+ {
+  "name": "tunables keyword field",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\n  \"tunables\": [\n    {\n      \"name\": \"type\",\n      \"default\": 0,\n      \"min\": 0,\n      \"max\": 1\n    }\n  ]\n}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "Invalid Blot value/field name: type"
+  }
+ },
+ {
+  "name": "shader parameters and scalars",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "\nconst a = 1.5;\nconst b = -2.05;\nconst c: f32 = 0.1;\nconst d = 3u;\nconst e = true;\nconst f = false;\nconst g = 3;\nconst h = -3;\nconst i = 4i;\nconst j = vec3f(1.0, 2.0, 3.0);\nconst k = 1e3;\nconst l = 2.5f;\nconst m = 0.0;\nconst n = -0.0;\nconst o: bool = true;\nconst p: u32 = 7u;\nconst q = 16777217.0;\nconst r = 1e-7;\nconst s = 3.4e38;\nconst t = array<f32, 2>(1.0, 2.0);\nconst u = 1.0 + 2.0;\nconst v = 2u * 3u;\nstruct Parameters { width: f32, height: f32, seed: f32 }\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "type Parameters is data = #Parameters { width: F32, height: F32, seed: F32 }\nconst a: F32 = 1.5\nconst b: F32 = (-2.049999952316284)\nconst c: F32 = 0.10000000149011612\nconst d: U32 = 3\nconst e: Bool = #True\nconst f: Bool = #False\nconst k: F32 = 1000.0\nconst l: F32 = 2.5\nconst m: F32 = 0.0\nconst n: F32 = (-0.0)\nconst o: Bool = #True\nconst p: U32 = 7\nconst q: F32 = 16777216.0\nconst r: F32 = 1.0000000116860974e-7\nconst s: F32 = 3.3999999521443642e+38\nconst u: F32 = 3.0\nconst v: U32 = 6\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader no parameters",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const scale = 0.25;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "const scale: F32 = 0.25\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader one parameter and another struct",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "struct Parameters { x: f32 }\nstruct Other { y: u32 }\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "type Parameters is data = #Parameters { x: F32 }\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader comments and nesting",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "// const not_this = 1.0;\n/* const nor_this = 2.0; /* nested */ const still_not = 3.0; */\nconst before = 4.0;\nfn helper() -> f32 { const inside = 5.0; return inside; }\nconst after = 6.0;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "const before: F32 = 4.0\nconst after: F32 = 6.0\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader five parameters",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "\nstruct Parameters { a: f32, b: f32, c: f32, d: f32, e: f32 }\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "error": {
+   "file": "/checkout/src/assets/case.wgsl",
+   "message": "/checkout/src/assets/case.wgsl: Parameters must be up to four f32s, a draw's parameters"
+  }
+ },
+ {
+  "name": "shader a vector parameter",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "\nstruct Parameters { a: vec2f, b: f32 }\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "error": {
+   "file": "/checkout/src/assets/case.wgsl",
+   "message": "/checkout/src/assets/case.wgsl: Parameters must be up to four f32s, a draw's parameters"
+  }
+ },
+ {
+  "name": "shader upper-case constant",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const SCALE = 2.0;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "error": {
+   "file": "/checkout/src/assets/case.wgsl",
+   "message": "Invalid Blot value/field name: SCALE"
+  }
+ },
+ {
+  "name": "shader keyword constant",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const data = 2.0;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "error": {
+   "file": "/checkout/src/assets/case.wgsl",
+   "message": "Invalid Blot value/field name: data"
+  }
+ },
+ {
+  "name": "shader a parse error",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const a = 1.0;\nfn broken( {\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "differs": "the message is naga's, not wgsl_reflect's",
+  "error": {
+   "file": "/checkout/src/assets/case.wgsl",
+   "message": "/checkout/src/assets/case.wgsl: Expected argument name.. Line: 2"
+  }
+ },
+ {
+  "name": "shader typed constants from integers",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const a: u32 = 3;\nconst b: f32 = 2;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "differs": "wgsl_reflect leaves out a typed constant whose value is an integer literal without a suffix; naga converts it",
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": ""
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader a computed float",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const a = 16777217.0 - 16777216.0;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "differs": "wgsl_reflect rounds each literal to f32 before it computes; naga computes in f64 and rounds once",
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "const a: F32 = 0.0\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader a forward reference",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const b = a * 2.0;\nconst a = 1.0;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "differs": "wgsl_reflect leaves out a constant that uses one declared after it; naga computes it",
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "const a: F32 = 1.0\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader a hexadecimal float",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const h = 0x1p4;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "differs": "wgsl_reflect reads a hexadecimal float as 0; naga reads it",
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "const h: F32 = 0.0\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader an aliased parameter",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "alias Scalar = f32;\nstruct Parameters { a: Scalar }\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "type Parameters is data = #Parameters { a: F32 }\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader an unknown name in a function",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const a = 1.0;\nfn f() -> f32 { return missing; }\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "differs": "wgsl_reflect only parses; naga also resolves names as it makes the module",
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "const a: F32 = 1.0\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader a wrong return type",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const a = 1.0;\nfn f() -> f32 { return 1u; }\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "const a: F32 = 1.0\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader a float too big for f32",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const huge = 1e39;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "error": {
+   "file": "/checkout/src/assets/case.wgsl",
+   "message": "Asset number does not fit finite F32"
+  }
+ },
+ {
+  "name": "shader an integer too big for i32",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "const big = 3000000000;\nconst after = 1.0;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "const after: F32 = 1.0\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "shader more scalars",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/assets/case.wgsl": "enable f16;\nconst big = 4294967295u;\nconst i: i32 = -5;\nconst half = 1.0h;\nconst both = true && false;\nconst either = false || true;\nconst not = !false;\nconst quarter = 1.0 / 4.0;\nconst product = 2u * 3u + 1u;\noverride tweak: f32 = 1.0;\nvar<private> state: f32 = 2.0;\nconst_assert big > 0u;\nconst last = 7.5;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/case.wgsl.blot",
+    "source": "const big: U32 = 4294967295\nconst both: Bool = #False\nconst either: Bool = #True\nconst not: Bool = #True\nconst quarter: F32 = 0.25\nconst product: U32 = 7\nconst last: F32 = 7.5\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds {  }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds {  })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/case.wgsl",
+   "/checkout/src/assets/catalog.json"
+  ]
+ },
+ {
+  "name": "catalog not JSON",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{ meshes: [] }"
+  },
+  "error": {
+   "file": "/checkout/src/assets/catalog.json",
+   "message": "Expected property name or '}' in JSON at position 2 (line 1 column 3)"
+  }
+ },
+ {
+  "name": "text a trailing comma",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/text.json": "{\n  \"a\": \"b\",\n}\n"
+  },
+  "error": {
+   "file": "/checkout/src/text.json",
+   "message": "Expected double-quoted property name in JSON at position 14 (line 3 column 1)"
+  }
+ },
+ {
+  "name": "tunables an unexpected token",
+  "root": "/checkout",
+  "entry": "/checkout/src/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"meshes\":[],\"materials\":[],\"sounds\":[]}",
+   "src/tunables.json": "{\"tunables\": [{\"name\": \"a\", \"default\": .5}]}"
+  },
+  "error": {
+   "file": "/checkout/src/tunables.json",
+   "message": "Unexpected token '.', ...\"default\": .5}]}\" is not valid JSON"
+  }
+ },
+ {
+  "name": "layout tools beside src",
+  "root": "/checkout",
+  "entry": "/checkout/tools/main.blot",
+  "files": {
+   "src/assets/catalog.json": "{\"sounds\":[\"a.wav\"]}",
+   "src/text.json": "{\"game\":\"Game\"}",
+   "src/assets/a.wgsl": "const a = 1.0;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n",
+   "tools/text.json": "{\"tool\":\"Tool\"}",
+   "tools/assets/b.wgsl": "const b = 2u;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n"
+  },
+  "modules": [
+   {
+    "path": "/checkout/src/assets/a.wgsl.blot",
+    "source": "const a: F32 = 1.0\n"
+   },
+   {
+    "path": "/checkout/src/assets/catalog.json.blot",
+    "source": "type Meshes is data = #Meshes {  }\ntype Materials is data = #Materials {  }\ntype Sounds is data = #Sounds { a: U32 }\nconst meshes: Meshes = (#Meshes {  })\nconst materials: Materials = (#Materials {  })\nconst sounds: Sounds = (#Sounds { a: 0 })\n"
+   },
+   {
+    "path": "/checkout/src/text.json.blot",
+    "source": "type Text is data = #Text { game: (Array U32) }\nconst text: Text = (#Text { game: #[71, 97, 109, 101] })\n"
+   },
+   {
+    "path": "/checkout/tools/assets/b.wgsl.blot",
+    "source": "const b: U32 = 2\n"
+   },
+   {
+    "path": "/checkout/tools/text.json.blot",
+    "source": "type Text is data = #Text { tool: (Array U32) }\nconst text: Text = (#Text { tool: #[84, 111, 111, 108] })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/src/assets/a.wgsl",
+   "/checkout/src/assets/catalog.json",
+   "/checkout/src/text.json",
+   "/checkout/tools/assets/b.wgsl",
+   "/checkout/tools/text.json"
+  ]
+ },
+ {
+  "name": "layout without a catalog",
+  "root": "/checkout",
+  "entry": "/checkout/game/main.blot",
+  "files": {
+   "game/text.json": "{\"word\":\"Word\"}",
+   "game/assets/c.wgsl": "const c = true;\n\nstruct Out { @builtin(position) position: vec4f };\n@vertex fn main() -> Out { var out: Out; out.position = vec4f(0.0); return out; }\n",
+   "game/assets/notes.txt": "not a shader"
+  },
+  "modules": [
+   {
+    "path": "/checkout/game/assets/c.wgsl.blot",
+    "source": "const c: Bool = #True\n"
+   },
+   {
+    "path": "/checkout/game/text.json.blot",
+    "source": "type Text is data = #Text { word: (Array U32) }\nconst text: Text = (#Text { word: #[87, 111, 114, 100] })\n"
+   }
+  ],
+  "dependencies": [
+   "/checkout/game/assets/c.wgsl",
+   "/checkout/game/text.json"
+  ]
+ }
+]

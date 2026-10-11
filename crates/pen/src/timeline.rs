@@ -966,8 +966,9 @@ mod contract {
         let end = game.timeline.position();
         let catalog = game.runtime.catalog().clone();
         let mesh = |at: usize, name: &str| first.frames[at].draws.iter().filter(|draw| catalog.mesh(draw.mesh) == name).count();
-        let material =
-            |at: usize, name: &str| first.frames[at].draws.iter().any(|draw| catalog.material(draw.material) == name);
+        // A building going up draws one of its stage meshes
+        // (`building_{kind}_stage{1..5}.mesh.json`) until it is finished.
+        let staged = |at: usize| first.frames[at].draws.iter().any(|draw| catalog.mesh(draw.mesh).contains("_stage"));
         let bubble = |at: usize| {
             first.frames[at].sprites.iter().any(|sprite| catalog.material(sprite.material) == "bubble.material.json")
         };
@@ -975,7 +976,7 @@ mod contract {
         // gnorps speaking, and a route asked.
         assert!((60..end as usize).all(|at| mesh(at, "robot3d.mesh.json") == 12), "twelve gnorps");
         assert!((150..300).any(|at| mesh(at, "wind_strip.mesh.json") > 0), "a gust");
-        assert!(material(end as usize - 1, "building_stage.material.json"), "a building going up");
+        assert!(staged(end as usize - 1), "a building going up");
         assert!((0..end as usize).filter(|&at| bubble(at)).count() > 60, "gnorps speaking");
         assert!(first.frames.iter().any(|frame| frame.services.iter().any(|request| request.service == service::PATHFINDING)));
         let state = game.runtime.snapshot().unwrap().state;

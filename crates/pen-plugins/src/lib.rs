@@ -40,7 +40,7 @@ mod host;
 mod watch;
 
 pub use host::{Level, Logger};
-pub use watch::{Built, Outcome, Watching, build, watch};
+pub use watch::{Builder, Built, Outcome, Watching, build, watch};
 
 /// The bindings `wit/pen-plugin.wit` makes for the compiler world, whose
 /// imports the assets world shares.

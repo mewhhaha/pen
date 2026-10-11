@@ -1,8 +1,9 @@
 //! `pen test-blot`: a gdev checkout's Blot tests (its PEN_MIGRATION.md,
-//! phase 2). Each test module compiles to Wasm: against the game on the
-//! tests' level when its first line is `// test: game`, else alone, as if it
-//! stood at `src/test_fixture.blot`. Its directory says what its tests must
-//! do:
+//! phase 2). Each test module compiles to Wasm through the checkout's
+//! compiler plugin (its `pen.json`, `pen-plugins`), as if it stood at
+//! `src/test_fixture.blot`, with the game's asset modules. Each worker keeps
+//! one compiler session from module to module, so each compiles
+//! incrementally. Its directory says what its tests must do:
 //!
 //! - `tests/*.blot`: every `test_…` entry it exports, Unit to Array F32,
 //!   runs in a fresh instance and returns the report of its checks (gdev's
@@ -27,20 +28,19 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use blot_host::{Guest, GuestFunction, GuestModule, Parameter, Value, ValueType};
+use pen_plugins::{Builder, Outcome as Building, Overlay, Plugins};
 use wasmtime::{Engine, Trap};
 
-const BUILD_SCRIPT: &str = include_str!("../scripts/blot_test_build.ts");
-
-/// The first line of a module that compiles against the game.
-const AGAINST_GAME: &str = "// test: game";
+/// Where each test module compiles, as if it stood there, beside the game's
+/// own sources.
+const FIXTURE: &str = "src/test_fixture.blot";
 
 /// What the line of a module that must not compile starts with, before the
 /// text its diagnostics must contain.
@@ -155,8 +155,10 @@ pub fn run(checkout: &Path, options: Options) -> Result<()> {
     let jobs = options.jobs.unwrap_or_else(default_jobs);
     ensure!(jobs > 0, "--jobs is how many modules compile at once: 1 or more");
     let jobs = jobs.min(modules.len()).max(1);
-    // Each module that compiles against the game repeats it; the
-    // development engine compiles each function it has seen only once.
+    let plugins = test_plugins(checkout)?;
+    let entry = plugins.root().join(FIXTURE);
+    // The modules share much of their code; the development engine
+    // compiles each function it has seen only once.
     let engine = blot_host::dev_engine()?;
     let started = Instant::now();
     let mut tallies = [Tally::default(); Kind::ALL.len()];
@@ -164,7 +166,8 @@ pub fn run(checkout: &Path, options: Options) -> Result<()> {
     in_order(
         &modules,
         jobs,
-        |module| run_module(checkout, &engine, module, filter),
+        || Builder::new(plugins.clone(), &entry),
+        |builder, module| run_module(builder, &engine, module, filter),
         |module, ran| {
             eprintln!("{}", module_lines(module, &ran, filter).join("\n"));
             let tally = &mut tallies[module.kind as usize];
@@ -245,20 +248,28 @@ impl std::fmt::Display for Tally {
 }
 
 /// Runs `work` on each of `items`, up to `jobs` at once and earliest first,
-/// and hands each result to `done` on this thread in the items' order: each
-/// as soon as it and every one before it are ready.
-fn in_order<T: Sync, R: Send>(items: &[T], jobs: usize, work: impl Fn(&T) -> R + Sync, mut done: impl FnMut(&T, R)) {
+/// each worker with a `state` of its own (`start` makes it), and hands each
+/// result to `done` on this thread in the items' order: each as soon as it
+/// and every one before it are ready.
+fn in_order<T: Sync, S, R: Send>(
+    items: &[T],
+    jobs: usize,
+    start: impl Fn() -> S + Sync,
+    work: impl Fn(&mut S, &T) -> R + Sync,
+    mut done: impl FnMut(&T, R),
+) {
     let next = AtomicUsize::new(0);
     let (sender, results) = mpsc::channel();
     std::thread::scope(|scope| {
         for _ in 0..jobs.max(1).min(items.len()) {
-            let (next, work, sender) = (&next, &work, sender.clone());
+            let (next, start, work, sender) = (&next, &start, &work, sender.clone());
             scope.spawn(move || {
+                let mut state = start();
                 loop {
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(item) = items.get(index) else { break };
                     // Only fails once `done` has panicked.
-                    if sender.send((index, work(item))).is_err() {
+                    if sender.send((index, work(&mut state, item))).is_err() {
                         break;
                     }
                 }
@@ -286,9 +297,9 @@ struct Ran {
 
 /// Compiles `module` and runs its tests whose names contain `filter`, or,
 /// for one that must not compile, judges how compiling it went.
-fn run_module(checkout: &Path, engine: &Engine, module: &Module, filter: Option<&str>) -> Ran {
+fn run_module(builder: &mut Builder, engine: &Engine, module: &Module, filter: Option<&str>) -> Ran {
     let compiling = Instant::now();
-    let compiled = compile_test_module(checkout, &module.path);
+    let compiled = compile_test_module(builder, &module.path);
     let blot = compiling.elapsed();
     let tests = match &module.rejects {
         Some(rejects) => Ok(rejection(rejects, compiled)),
@@ -360,81 +371,45 @@ fn locate(checkout: &Path, file: &Path) -> Result<PathBuf> {
         .with_context(|| format!("there is no Blot test module {}", file.display()))
 }
 
-/// Whether a module compiles against the game.
-fn against_game(source: &str) -> bool {
-    source.lines().next() == Some(AGAINST_GAME)
-}
-
-/// Compiles the Blot test module at `module` to Wasm with `checkout`'s
-/// compiler setup: against the game on the tests' level when its first line
-/// is `// test: game` (gdev's `test_support/compile.ts`, `gameFixture`),
-/// else alone, as if it stood at `src/test_fixture.blot`. A module that does
-/// not compile fails with the compiler's diagnostics. Several threads call
-/// it at once, each compiling a module of its own.
-///
-/// For now this runs the checkout's TypeScript compiler setup through Deno,
-/// from a script embedded here, as `project.rs` builds the game; a Rust
-/// client of the Blot compiler is to take its place.
-pub fn compile_test_module(checkout: &Path, module: &Path) -> Result<Vec<u8>> {
-    static BUILDS: AtomicUsize = AtomicUsize::new(0);
-    let checkout = std::path::absolute(checkout)?;
-    let module = std::path::absolute(module)?;
-    let source = std::fs::read_to_string(&module).with_context(|| format!("reading {}", module.display()))?;
-    let mode = if against_game(&source) { "game" } else { "alone" };
-    let directory = checkout.join(".pen/blot-tests");
-    std::fs::create_dir_all(&directory)?;
-    let out = directory.join(format!("{}-{}.wasm", std::process::id(), BUILDS.fetch_add(1, Ordering::Relaxed)));
-    // The Blot compiler unpacks itself into the temporary directory: the
-    // cache directory's, where what a killed one leaves is swept.
-    let temporary = crate::project::temporary_dir()?;
-    let mut command = Command::new("deno");
-    command
-        .args(["run", "-A", "--no-lock", "--config"])
-        .arg(checkout.join("deno.json"))
-        .arg(script()?)
-        .arg(&checkout)
-        .arg(&module)
-        .arg(mode)
-        .arg(&out)
-        .current_dir(&checkout)
-        .env("TMPDIR", &temporary)
-        .stdin(Stdio::null());
-    #[cfg(windows)]
-    command.env("TMP", &temporary).env("TEMP", &temporary);
-    let output = command.output().context("running deno, which compiles Blot test modules")?;
-    let bytes = std::fs::read(&out);
-    let _ = std::fs::remove_file(&out);
-    if !output.status.success() {
-        let diagnostics = String::from_utf8_lossy(&output.stderr);
-        let diagnostics = diagnostics.trim();
-        if diagnostics.is_empty() {
-            bail!("deno exited with {} while compiling {}", output.status, module.display());
+/// The checkout's plugins, which compile its tests; their log's errors go
+/// to stderr, the rest stays quiet.
+fn test_plugins(checkout: &Path) -> Result<Arc<Plugins>> {
+    let log: pen_plugins::Logger = Arc::new(|level, message| {
+        if level == pen_plugins::Level::Error {
+            eprintln!("{message}");
         }
-        bail!("{diagnostics}");
-    }
-    bytes.with_context(|| format!("reading the compiled {}", out.display()))
+    });
+    Plugins::load(checkout, log)?.filter(|plugins| plugins.compiles()).ok_or_else(|| {
+        anyhow!(
+            "pen test-blot compiles through the checkout's Wasm plugins, and {} has no pen.json that \
+             chooses a compiler",
+            checkout.display()
+        )
+    })
 }
 
-fn pen_directory() -> Result<PathBuf> {
-    let directory = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("pen");
-    std::fs::create_dir_all(&directory)?;
-    Ok(directory)
-}
-
-/// The embedded build script, written out for Deno beside project.rs's.
-fn script() -> Result<PathBuf> {
-    // One thread of this run writes it at a time, as they share the
-    // temporary file's name.
-    static WRITING: Mutex<()> = Mutex::new(());
-    let _writing = WRITING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let path = pen_directory()?.join(format!("blot_test_build-{}.ts", env!("CARGO_PKG_VERSION")));
-    if std::fs::read_to_string(&path).ok().as_deref() != Some(BUILD_SCRIPT) {
-        // In one rename, since other runs may be reading it.
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&temporary, BUILD_SCRIPT)?;
-        std::fs::rename(&temporary, &path)?;
+/// Compiles the Blot test module at `module` to Wasm in `builder`'s session
+/// (the checkout's compiler plugin, for `src/test_fixture.blot`), its source
+/// standing in at that entry. A module that does not compile fails with the
+/// compiler's diagnostics, placed in the module's own source.
+pub fn compile_test_module(builder: &mut Builder, module: &Path) -> Result<Vec<u8>> {
+    let source = std::fs::read_to_string(module).with_context(|| format!("reading {}", module.display()))?;
+    let entry = builder.entry().display().to_string();
+    let standing_in = Overlay { path: entry.clone(), contents: Some(source.clone()) };
+    match builder.build(&[standing_in]) {
+        Building::Built(built) => Ok(built.wasm),
+        Building::Rejected(diagnostics) => {
+            let module = module.display().to_string();
+            let lines: Vec<String> = diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    crate::plugin_build::describe(diagnostic, Some((&entry, &source))).replacen(&entry, &module, 1)
+                })
+                .collect();
+            bail!("{}", lines.join("\n"))
+        }
+        Building::Failed(error) => bail!("the compiler failed: {error}"),
     }
-    Ok(path)
 }
 
 /// A module's tests, run.
@@ -935,15 +910,6 @@ mod tests {
     }
 
     #[test]
-    fn chooses_how_a_module_compiles() {
-        assert!(against_game("// test: game\nimport * as check from \"gdev/check\"\n"));
-        assert!(against_game("// test: game\r\n"));
-        assert!(!against_game("// test: games\n"));
-        assert!(!against_game("import * as salt from \"./salt\"\n// test: game\n"));
-        assert!(!against_game(""));
-    }
-
-    #[test]
     fn runs_tests_that_must_trap() {
         let engine = blot_host::engine().unwrap();
         let tests = run_tests(&engine, &trapping_sample(), Kind::Traps, None).unwrap();
@@ -1098,7 +1064,8 @@ mod tests {
         in_order(
             &items,
             4,
-            |&item| {
+            || (),
+            |(), &item| {
                 most.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                 // Later items finish sooner.
                 std::thread::sleep(Duration::from_millis(3 * (12 - item)));
@@ -1111,9 +1078,9 @@ mod tests {
         let most = most.load(Ordering::SeqCst);
         assert!((2..=4).contains(&most), "{most} at once");
         // Nothing to do, and one at a time.
-        in_order(&[] as &[u64], 4, |_| unreachable!(), |_, ()| unreachable!());
+        in_order(&[] as &[u64], 4, || (), |(), _| unreachable!(), |_, ()| unreachable!());
         let mut one = Vec::new();
-        in_order(&items, 1, |&item| item, |_, result| one.push(result));
+        in_order(&items, 1, || (), |(), &item| item, |_, result| one.push(result));
         assert_eq!(one, items);
     }
 
@@ -1144,14 +1111,17 @@ mod tests {
     #[test]
     fn runs_the_checkouts_pilot() {
         // The sibling gdev checkout's pilot module, when this repo has one
-        // and Deno is there to compile it.
+        // and its plugins are there to compile it.
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../gdev");
         let pilot = root.join("tests/hand_salt.blot");
-        if !pilot.is_file() || Command::new("deno").arg("--version").output().is_err() {
-            eprintln!("skipped: no ../gdev/tests/hand_salt.blot, or no deno");
+        let plugins = pilot.is_file().then(|| test_plugins(&root).ok()).flatten();
+        let Some(plugins) = plugins else {
+            eprintln!("skipped: no ../gdev/tests/hand_salt.blot, or no plugins to compile it");
             return;
-        }
-        let wasm = compile_test_module(&root, &pilot).unwrap();
+        };
+        let entry = plugins.root().join(FIXTURE);
+        let mut builder = Builder::new(plugins, &entry);
+        let wasm = compile_test_module(&mut builder, &pilot).unwrap();
         let engine = blot_host::dev_engine().unwrap();
         let tests = run_tests(&engine, &wasm, Kind::Checks, None).unwrap();
         assert!(!tests.tests.is_empty());
@@ -1177,11 +1147,14 @@ mod tests {
             eprintln!("{}", lines.join("\n"));
             assert!(lines[1].starts_with("    check "), "{lines:?}");
         }
-        // A module that does not compile fails with the compiler's diagnostics.
+        // A module that does not compile, in the same session, fails with the
+        // compiler's diagnostics, placed in the module.
         let broken = std::env::temp_dir().join(format!("pen-broken-{}.blot", std::process::id()));
         std::fs::write(&broken, "entry const test_broken = fn () => missing_name\n").unwrap();
-        let error = compile_test_module(&root, &broken).unwrap_err();
+        let error = compile_test_module(&mut builder, &broken).unwrap_err();
         let _ = std::fs::remove_file(&broken);
-        assert!(format!("{error:#}").contains("missing_name"), "{error:#}");
+        let error = format!("{error:#}");
+        assert!(error.contains("missing_name"), "{error}");
+        assert!(error.starts_with(&format!("{}:1:", broken.display())), "{error}");
     }
 }

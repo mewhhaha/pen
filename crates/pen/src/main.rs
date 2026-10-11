@@ -7,6 +7,7 @@
 #![cfg_attr(all(windows, not(feature = "compiler")), windows_subsystem = "windows")]
 mod accessibility;
 mod audio;
+#[cfg(feature = "plugins")]
 mod blot_test;
 mod crash;
 mod dev;
@@ -270,11 +271,11 @@ commands, in a gdev checkout (or with --project DIR):
                       each frame's input and render packet, without rendering
   test-blot [FILE...] [--filter TEXT] [--jobs N]
                       the checkout's Blot tests (default tests/*.blot, then tests/traps/ and
-                      tests/rejected/): each module's test_ entries, compiled against the game if its
-                      first line is `// test: game`, else alone; those in traps/ must trap at
-                      `unreachable`, and a module in rejected/ must not compile, with diagnostics
-                      holding its `// rejects: TEXT`; N modules compile at once (default half the
-                      cores, at most 8)
+                      tests/rejected/): each module's test_ entries, compiled through the checkout's
+                      compiler plugin (pen.json) as if at src/test_fixture.blot; those in traps/ must
+                      trap at `unreachable`, and a module in rejected/ must not compile, with
+                      diagnostics holding its `// rejects: TEXT`; N modules compile at once (default
+                      half the cores, at most 8), each worker in one compiler session
 
 without a command, pen plays a packaged game: game/ beside the executable, or --game DIR.
 
@@ -783,12 +784,15 @@ fn main() -> Result<()> {
             })
             .map(drop)
         }
+        #[cfg(feature = "plugins")]
         Some("test-blot") => {
             let project = checkout()?;
             let files = args.positional.iter().map(PathBuf::from).collect();
             let jobs = args.value("--jobs").map(|jobs| jobs.parse()).transpose()?;
             blot_test::run(&project.root, blot_test::Options { files, filter: args.value("--filter"), jobs })
         }
+        #[cfg(not(feature = "plugins"))]
+        Some("test-blot") => bail!("this pen has no plugins, which compile a checkout's Blot tests"),
         Some(other) => bail!("unknown command {other}"),
     }
 }

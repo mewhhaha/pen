@@ -31,8 +31,9 @@ pub struct Built {
     pub seconds: f64,
 }
 
-/// One program and the plugin sessions that build it.
-struct Program {
+/// One program and the plugin sessions that build it, kept open from build
+/// to build: an edit rebuilds incrementally.
+pub struct Builder {
     plugins: Arc<Plugins>,
     entry: PathBuf,
     compiler: Option<Compiler>,
@@ -41,13 +42,20 @@ struct Program {
     watched: BTreeSet<PathBuf>,
 }
 
-impl Program {
-    fn new(plugins: Arc<Plugins>, entry: &Path) -> Program {
-        Program { plugins, entry: entry.to_owned(), compiler: None, assets: None, watched: BTreeSet::new() }
+impl Builder {
+    pub fn new(plugins: Arc<Plugins>, entry: &Path) -> Builder {
+        Builder { plugins, entry: entry.to_owned(), compiler: None, assets: None, watched: BTreeSet::new() }
     }
 
-    fn build(&mut self) -> Outcome {
-        let outcome = self.attempt();
+    /// The program's entry.
+    pub fn entry(&self) -> &Path {
+        &self.entry
+    }
+
+    /// Builds the program, with `extra` overlays over its asset modules and
+    /// the files on disk (a test module standing in at its entry, say).
+    pub fn build(&mut self, extra: &[crate::Overlay]) -> Outcome {
+        let outcome = self.attempt(extra);
         // A build that failed before anything named its inputs (an asset
         // that does not parse, a compiler that does not start) watches the
         // whole checkout, so that the fix sets the next build off.
@@ -57,12 +65,13 @@ impl Program {
         outcome
     }
 
-    fn attempt(&mut self) -> Outcome {
+    fn attempt(&mut self, extra: &[crate::Overlay]) -> Outcome {
         let started = Instant::now();
-        let overlays = match self.overlays() {
+        let mut overlays = match self.overlays() {
             Ok(overlays) => overlays,
             Err(error) => return Outcome::Failed(format!("{error:#}")),
         };
+        overlays.extend_from_slice(extra);
         // A compiler that stopped (its process crashed on a source, say)
         // fails every later build: a fresh one gets one more try.
         let mut tries = 0;
@@ -111,7 +120,7 @@ impl Program {
 
 /// Builds the program at `entry` once.
 pub fn build(plugins: Arc<Plugins>, entry: &Path) -> Outcome {
-    Program::new(plugins, entry).build()
+    Builder::new(plugins, entry).build(&[])
 }
 
 /// A program being built again as its files change; dropping it stops.
@@ -139,14 +148,14 @@ pub fn watch(
     ignored: Vec<PathBuf>,
     mut each: impl FnMut(Outcome) + Send + 'static,
 ) -> Result<Watching> {
-    let mut program = Program::new(plugins, entry);
+    let mut program = Builder::new(plugins, entry);
     let (stop, stopped) = channel::<()>();
     let (sender, events) = channel();
     let mut watcher = notify::recommended_watcher(sender)?;
     let thread = std::thread::Builder::new().name("pen-plugin-build".into()).spawn(move || {
         let mut watching = BTreeSet::new();
         loop {
-            let outcome = program.build();
+            let outcome = program.build(&[]);
             // Watched before the outcome is told: an edit made as soon as
             // it is seen must not slip past.
             for path in program.watched.difference(&watching).cloned().collect::<Vec<_>>() {

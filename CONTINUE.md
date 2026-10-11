@@ -131,7 +131,6 @@ Where Deno is still used:
   the catalog, text checked against the font's glyphs, tunables, WGSL
   reflection) and blot2's `compiler/assets.ts`, which turns them into Blot
   modules sent as source overlays.
-- **`pen test-blot`'s compiles**, through gdev's `test_support/`.
 - **Tunables bake** (`scripts/bake_tunables.ts`), `pen parity` (gdev's
   `renderer.ts` on Deno's WebGPU), `tools/*_v8.ts`, `pen web` and
   `pen build --web`.
@@ -202,12 +201,15 @@ code in pen.
     - `plugins/blot` (187 KB) and `plugins/gdev-assets` (986 KB; naga for
       WGSL; byte-identical to TypeScript for both programs, fixtures in its
       `tests/fixtures`, regenerated with `expected.ts`).
-  - **Still on Deno:** `pen test-blot`. Its "alone" modules can move to the
-    compiler plugin as they are. Its `// test: game` modules are spliced into
-    `src/main.blot` by gdev's TypeScript `gameFixture`. That splicing has to
-    become something Blot can express before pen can compile them without
-    gdev-specific code; it's gdev-94's call. Checkouts without a `pen.json`
-    keep the Deno build. `blot_build.ts` goes when nothing needs it.
+  - **`pen test-blot` is Deno-free too.** gdev-94 made every test module a
+    plain entry file (`src/game.blot`, `test_support/sandbox.blot`), so the
+    runner's game mode and its Deno script are gone. Every module compiles
+    through the compiler plugin at `src/test_fixture.blot`, one session per
+    worker. 472 tests in 54 modules pass with no Deno on `PATH`, in about a
+    minute.
+  - **Still on Deno:** checkouts without a `pen.json` (`blot_build.ts`, kept
+    for them), tunables bake, `pen parity`, the V8 tools, `pen web` and
+    `pen build --web`.
   - **WIT changes the plugin agents suggested** (not made yet):
     - an explicit `close` on compiler sessions (today a drop saves blotc's
       restart cache, which can block up to 10 s);

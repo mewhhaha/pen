@@ -367,12 +367,14 @@ pen run --size 1920x1080 --record clip.mp4 --frames 600
   answers service requests 40 frames late, and name the first packet field
   that differs. See [docs/determinism.md](docs/determinism.md), "Checks".
 - **Blot tests** (`pen test-blot`, `just blot-tests`): gdev's game logic,
-  tested in Blot. Each module in the checkout's `tests/*.blot` compiles
-  against the game on the tests' level when its first line is
-  `// test: game`, else alone, as if it stood in `src/` (through Deno and the
-  checkout's `test_support/` for now). Each `test_…` entry, Unit to Array F32,
-  runs in a fresh instance and returns its checks' report (gdev's
-  `packages/check.blot`); a failed check prints what it expected and got.
+  tested in Blot. Each module in the checkout's `tests/*.blot` is an entry
+  file, compiled through the checkout's compiler plugin as if it stood at
+  `src/test_fixture.blot`, with the game's asset modules; each worker keeps
+  one compiler session from module to module ("Wasm plugins"). Each `test_…`
+  entry, Unit to Array F32, runs in a fresh instance and returns its checks'
+  report (gdev's `packages/check.blot`); a failed check prints what it
+  expected and got. `tests/traps/` must trap, and `tests/rejected/` must not
+  compile. gdev's whole suite, 472 tests in 54 modules, takes about a minute.
 - gdev's own TypeScript tests (`deno task test` in the checkout) cover the
   game logic not yet moved into Blot tests.
 

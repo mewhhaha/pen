@@ -35,10 +35,14 @@ fn write(path: &Path, bytes: &[u8]) -> Result<bool> {
 }
 
 /// A diagnostic as `file:line:column: code: message`, its place counted in
-/// the file when it can be read, else its byte offset.
-fn describe(diagnostic: &Diagnostic) -> String {
-    let place = std::fs::read(&diagnostic.file)
-        .ok()
+/// the file when it can be read (or in `standing_in`'s source, when it is
+/// that path's: a file that is only an overlay), else its byte offset.
+pub fn describe(diagnostic: &Diagnostic, standing_in: Option<(&str, &str)>) -> String {
+    let source = match standing_in {
+        Some((path, source)) if path == diagnostic.file => Some(source.as_bytes().to_vec()),
+        _ => std::fs::read(&diagnostic.file).ok(),
+    };
+    let place = source
         .filter(|bytes| diagnostic.start as usize <= bytes.len())
         .map(|bytes| {
             let before = &bytes[..diagnostic.start as usize];
@@ -71,7 +75,7 @@ fn take(what: &str, out: &Path, outcome: Outcome) -> bool {
         Outcome::Rejected(diagnostics) => {
             overlay::error(Source::Build, format!("plugins: {what} build failed"));
             for diagnostic in &diagnostics {
-                overlay::error(Source::Build, describe(diagnostic));
+                overlay::error(Source::Build, describe(diagnostic, None));
             }
             false
         }

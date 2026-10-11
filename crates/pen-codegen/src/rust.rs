@@ -1173,7 +1173,7 @@ pub fn emit(model: &Model, header: &str) -> String {
         .collect::<Vec<_>>();
     lines(
         &mut out,
-        "//! The packets crossing between gdev's host and its Blot program: their types,\n//! constants, the render packet decoder and the input packet encoder.\n",
+        "//! The packets crossing between the host and a game: their types,\n//! constants, the render packet decoder and the input packet encoder.\n",
     );
     out.extend(types(model));
     out.push(String::new());

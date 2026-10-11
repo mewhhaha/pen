@@ -385,7 +385,7 @@
     "messages": {
       "frame": "invalid frame clock, viewport or event count",
       "nonfinite": "frame contains a nonfinite float32 value",
-      "tag": "invalid gdev event tag"
+      "tag": "invalid input event tag"
     },
     "keys": {
       "ArrowLeft": 1114368,
@@ -414,7 +414,7 @@
       {
         "tag": 1,
         "name": "KeyDown",
-        "doc": "A key by its browser `KeyboardEvent.key` name (\"a\", \"A\", \"ArrowLeft\", \"Shift\", ...); the game gets its code (packages/input/keys.blot).",
+        "doc": "A key by its browser `KeyboardEvent.key` name (\"a\", \"A\", \"ArrowLeft\", \"Shift\", ...); the game gets its code.",
         "value": {
           "lane": "code",
           "wire": "key",
@@ -731,11 +731,11 @@
     "groups": {
       "quality": {
         "type": "Quality",
-        "doc": "How the game wants this frame drawn (packages/preferences.blot): samples per pixel, FXAA, render scale, texture filtering, ambient occlusion, a sky, screen effects and bloom."
+        "doc": "How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture filtering, ambient occlusion, a sky, screen effects and bloom."
       },
       "sky": {
         "type": "Sky",
-        "doc": "The sky's colors and the way toward the sun or moon (packages/graphics.blot)."
+        "doc": "The sky's colors and the way toward the sun or moon."
       },
       "fog": {
         "type": "Fog",
@@ -747,7 +747,7 @@
       },
       "clouds": {
         "type": "Clouds",
-        "doc": "Clouds over the scene (packages/render.blot): how much of the sky they cover, 0 for none, and how far the wind has carried them along x and z."
+        "doc": "Clouds over the scene: how much of the sky they cover, 0 for none, and how far the wind has carried them along x and z."
       }
     },
     "header": {
@@ -1416,7 +1416,7 @@
         "kind": "lanes",
         "name": "preferences",
         "constant": "PREFERENCE",
-        "doc": "The player's preferences to store, when they changed (packages/preferences.blot); the host plays them back as Preference events when the game starts.",
+        "doc": "The player's preferences to store, when they changed; the host plays them back as Preference events when the game starts.",
         "max": 14,
         "exactly": {
           "counts": [
@@ -1496,7 +1496,7 @@
       {
         "kind": "variable",
         "name": "ui",
-        "doc": "The interface the game declares for assistive technology and keyboard focus (packages/ui.blot), every frame, whole: its nodes, parents first.",
+        "doc": "The interface the game declares for assistive technology and keyboard focus, every frame, whole: its nodes, parents first.",
         "max": {
           "limit": "MAX_UI_NODES",
           "value": 4096,
@@ -1628,7 +1628,7 @@
       {
         "kind": "variable",
         "name": "services",
-        "doc": "The frame's requests to services (packages/services.blot), each in one packet only: hosts answer each once, with ServiceAnswer and ServiceData events in a later frame, and a replay, whose recorded input holds the answers, asks no service again.",
+        "doc": "The frame's requests to services, each in one packet only: hosts answer each once, with ServiceAnswer and ServiceData events in a later frame, and a replay, whose recorded input holds the answers, asks no service again.",
         "max": {
           "limit": "MAX_SERVICE_REQUESTS",
           "value": 256,
@@ -1700,7 +1700,7 @@
       {
         "kind": "records",
         "name": "buses",
-        "doc": "The mix's buses (packages/audio.blot), every frame, whole: the master first. A frame without buses plays everything through an open master at gain 1, the reverb coming back at 1; a bus it lacks is open and dry at gain 1.",
+        "doc": "The mix's buses, every frame, whole: the master first. A frame without buses plays everything through an open master at gain 1, the reverb coming back at 1; a bus it lacks is open and dry at gain 1.",
         "record": {
           "name": "Bus",
           "constant": "BUS",
@@ -1727,7 +1727,7 @@
       {
         "kind": "records",
         "name": "voices",
-        "doc": "The voices the game keeps playing (packages/audio.blot), every frame, whole: hosts start, fade out and glide them by id.",
+        "doc": "The voices the game keeps playing, every frame, whole: hosts start, fade out and glide them by id.",
         "record": {
           "name": "Voice",
           "constant": "VOICE",

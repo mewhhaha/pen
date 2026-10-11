@@ -66,6 +66,8 @@ mod tests {
     fn blot_bindings_own_their_nominal_types() {
         let model = model::build(schema()).unwrap();
         assert!(!SCHEMA.contains("\"blot\""));
+        assert!(!SCHEMA.contains("gdev"));
+        assert!(!SCHEMA.contains("packages/"));
         let sources = blot::emit(&model, HEADER);
         for (_, source) in &sources {
             for import in source.lines().filter(|line| line.starts_with("import ")) {

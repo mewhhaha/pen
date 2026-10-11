@@ -1,0 +1,12 @@
+# Time travel after tests/determinism.steps (`just determinism`): back into
+# the interface it ends in, to the moments (one every 30 frames) where the
+# keyboard focus has just gone to the build bar, which rises (630), is on it
+# (660), the station's card opens (690), the pause menu flies up (750),
+# shows its second row (780) and flies back down (810), stepping through
+# recorded frames after each; then into play, over the loads and undo,
+# forward through recorded frames, on live from the past, and the last
+# second replayed. Every frame that runs again must give the packet it gave
+# the first time, and the run's input recording must replay the packets of
+# its final timeline.
+pause step=3 rewind=203 step=40 rewind=10 step=40 rewind=10 step=70 rewind=10 step=40
+rewind=10 step=40 rewind=10 step=10 rewind=400 step=100 rewind=50 step=20 resume wait=60 replay=1 wait=90

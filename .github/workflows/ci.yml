@@ -1,0 +1,166 @@
+# CI for pen, gdev's native runtime.
+#
+# What runs here needs only this repository: the build, clippy and the unit
+# and GPU tests (the GPU tests draw on Mesa's lavapipe, a software Vulkan
+# driver, since runners have no GPU), and the shippable player runtimes:
+# Linux for glibc 2.28 (every Steam Linux Runtime container, SteamOS) and Windows, both
+# cross-compiled with zig.
+#
+# The game itself lives in private sibling checkouts, ../gdev and ../blot2,
+# which this workflow cannot see by default. Tests that read the exported
+# bundle (dist/gdev) skip themselves without it. The `game` job runs the
+# golden images, engine conformance and a package only when the repository
+# variables GDEV_REPOSITORY and BLOT2_REPOSITORY (owner/name) are set, and
+# the secret CHECKOUTS_TOKEN can read both.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # zig as cargo-zigbuild runs it; the version the Justfile recipes were tried with.
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  linux:
+    name: Linux build, clippy and tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        # ALSA and D-Bus for audio (cpal), CMake for libopus, lavapipe for
+        # the GPU tests, ffmpeg for the recording tests.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake libasound2-dev libdbus-1-dev mesa-vulkan-drivers ffmpeg
+      - name: Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --profile minimal
+          rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build (with Steam)
+        run: cargo build --workspace --all-targets --features pen/steam
+      - name: Build the player runtime (no compiler)
+        run: cargo build -p pen --no-default-features --features steam
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features pen/steam -- -D warnings
+      - name: Clippy (player runtime)
+        run: cargo clippy -p pen --all-targets --no-default-features --features steam -- -D warnings
+      - name: Tests
+        # wgpu finds lavapipe as the only adapter; PEN_SOFTWARE makes pen
+        # itself ask for the software one.
+        env:
+          PEN_SOFTWARE: "1"
+        run: cargo test --workspace
+      - name: Renderer tests in release
+        env:
+          PEN_SOFTWARE: "1"
+        run: cargo test --release -p pen-render
+
+  player:
+    name: Player runtimes (Linux glibc 2.28, Windows)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config cmake libasound2-dev libdbus-1-dev
+      - name: Rust (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add x86_64-pc-windows-gnu
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux player runtime, glibc 2.28
+        # `just player` also checks the newest glibc symbol it needs.
+        run: just player
+      - name: Windows player runtime
+        run: just windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: player-runtimes
+          path: |
+            target/x86_64-unknown-linux-gnu/dist/player/
+            target/x86_64-pc-windows-gnu/dist/player/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        # The same builds unstripped: what resolves their crash reports.
+        with:
+          name: player-runtime-symbols
+          path: |
+            target/x86_64-unknown-linux-gnu/dist/pen
+            target/x86_64-pc-windows-gnu/dist/pen.exe
+          if-no-files-found: error
+
+  game:
+    name: Game tests (needs the gdev and blot2 checkouts)
+    if: ${{ vars.GDEV_REPOSITORY != '' && vars.BLOT2_REPOSITORY != '' }}
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: pen
+    steps:
+      # The recipes expect the checkouts side by side: ../gdev, ../blot2.
+      - uses: actions/checkout@v4
+        with:
+          path: pen
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GDEV_REPOSITORY }}
+          token: ${{ secrets.CHECKOUTS_TOKEN }}
+          path: gdev
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.BLOT2_REPOSITORY }}
+          token: ${{ secrets.CHECKOUTS_TOKEN }}
+          path: blot2
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config cmake libasound2-dev libdbus-1-dev mesa-vulkan-drivers ffmpeg
+      - name: Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pen
+      - name: Export the bundle (dist/gdev), then the tests that read it
+        env:
+          PEN_SOFTWARE: "1"
+        run: |
+          just export
+          cargo test --workspace
+      - name: Engine conformance (wasmtime against V8)
+        run: just conformance
+      - name: A package of the game
+        run: cargo run --release -q -p pen -- build --project ../gdev --out dist/package
+      - name: Golden images on lavapipe
+        # The goldens come from a desktop GPU; a software rasterizer may
+        # differ by more than the 1% the tests allow, so this only reports.
+        continue-on-error: true
+        env:
+          PEN_SOFTWARE: "1"
+        run: just visual
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: visual-diffs
+          # Relative to the workspace, not the working directory above.
+          path: gdev/.pen/visual
+          if-no-files-found: ignore

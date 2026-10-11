@@ -5,6 +5,20 @@ edition.workspace = true
 license.workspace = true
 description = "Runs Blot guest programs (guest ABI 2) on wasmtime"
 
+[features]
+default = ["compiler"]
+# Cranelift, to compile Wasm. Without it only modules precompiled by a build
+# with it (`precompile`) load, and the runtime is several MB smaller.
+compiler = ["wasmtime/cranelift", "wasmtime/incremental-cache", "wasmtime/parallel-compilation"]
+
 [dependencies]
 anyhow.workspace = true
 wasmtime.workspace = true
+
+[[example]]
+name = "compile_time"
+required-features = ["compiler"]
+
+[[example]]
+name = "precompile"
+required-features = ["compiler"]

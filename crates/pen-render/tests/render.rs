@@ -1,0 +1,166 @@
+//! The renderer on a real (headless) GPU, over a small asset directory: what
+//! loads draws, what fails is reported and left out, packed textures stream
+//! in until the renderer is quiet. Skips when no adapter is available.
+// Native only: in the browser the renderer runs on the page, not under cargo test.
+#![cfg(not(target_arch = "wasm32"))]
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+mod common;
+
+use common::*;
+use pen_protocol::*;
+use pen_render::{Renderer, RendererOptions};
+
+
+// Draws its triangle in its material's color, wherever the draw puts it.
+const SHADER: &str = r#"
+struct Scene { view: mat4x4f, projection: mat4x4f };
+struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f, settings: vec4f, parameters: vec4f };
+@group(0) @binding(0) var<uniform> scene: Scene;
+@group(1) @binding(0) var<uniform> draw: Draw;
+@vertex fn vertex(@location(0) position: vec3f) -> @builtin(position) vec4f {
+  return scene.projection * scene.view * draw.model * vec4f(position, 1.0);
+}
+@fragment fn fragment() -> @location(0) vec4f { return draw.color; }
+"#;
+
+fn deflate(bytes: &[u8]) -> Vec<u8> {
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// A 512 x 512 colour texture, packed with all ten levels.
+fn packed_texture() -> Vec<u8> {
+    let mut bytes = b"GTEX".to_vec();
+    bytes.extend([2, 4, 1, 10]);
+    bytes.extend(512u32.to_le_bytes());
+    bytes.extend(512u32.to_le_bytes());
+    for level in (0..10).rev() {
+        let size = 512usize >> level;
+        let packed = deflate(&vec![200; size * size * 4]);
+        bytes.extend((packed.len() as u32).to_le_bytes());
+        bytes.extend(packed);
+    }
+    bytes
+}
+
+fn assets() -> PathBuf {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pen-render-assets-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let write = |key: &str, bytes: &[u8]| std::fs::write(root.join(key), bytes).unwrap();
+    write(
+        "catalog.json",
+        br#"{"meshes":["tri.mesh.json","bad.mesh.json"],
+             "materials":["green.material.json","broken.material.json","missing.material.json"]}"#,
+    );
+    write(
+        "tri.mesh.json",
+        br#"{"positions":[-0.5,-0.5,0.5, 0.5,-0.5,0.5, 0,0.5,0.5],"normals":[0,0,1,0,0,1,0,0,1],
+             "uvs":[0,0,1,0,0.5,1],"indices":[0,1,2]}"#,
+    );
+    write("bad.mesh.json", br#"{"positions":[0,0,0],"normals":[0,0,0],"uvs":[0,0],"indices":[0,0,0]}"#);
+    write("flat.wgsl", SHADER.as_bytes());
+    write("broken.wgsl", b"@vertex fn vertex( -> {");
+    write("stream.gtex", &packed_texture());
+    write(
+        "green.material.json",
+        br#"{"shader":"flat.wgsl","texture":"stream.gtex","color":[0,1,0,1],"lighting":"unlit"}"#,
+    );
+    write("broken.material.json", br#"{"shader":"broken.wgsl","color":[1,0,0,1],"lighting":"unlit"}"#);
+    write(
+        "missing.material.json",
+        br#"{"shader":"flat.wgsl","texture":"nowhere.png","color":[0,0,1,1],"lighting":"unlit"}"#,
+    );
+    root
+}
+
+
+
+
+#[test]
+fn draws_what_loads_and_reports_what_fails() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let root = assets();
+    let catalog = boundary::read_catalog(&root).unwrap();
+    let mut renderer =
+        Renderer::new(device.clone(), queue.clone(), RendererOptions { format: FORMAT, assets: root, veil: Some(0.1) })
+            .unwrap();
+    renderer.preload(&catalog);
+    let mut target = Offscreen::new(&device, 64);
+    let draw = |mesh: u32, material: u32, x: f32| {
+        let mut transform = IDENTITY;
+        transform[12] = x;
+        Draw { material, mesh, transform, parameters: None, extra: None }
+    };
+    // The green triangle in the middle; the others off to the side.
+    let frame = frame(vec![draw(0, 0, 0.0), draw(0, 1, 2.0), draw(1, 0, 2.0), draw(0, 2, 2.0)]);
+    let mut ready = Vec::new();
+    let mut failed = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(20) {
+        renderer.submit(&frame, &catalog, &mut target).unwrap();
+        for event in renderer.take_events() {
+            match event {
+                GameEvent::AssetReady { key, .. } => ready.push(key),
+                GameEvent::AssetFailed { key, kind, message, .. } => failed.push((key, kind, message)),
+                _ => {}
+            }
+        }
+        if renderer.quiet() && failed.len() >= 3 && ready.iter().any(|key| key == "stream.gtex") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let failed_keys: Vec<&str> = failed.iter().map(|(key, _, _)| key.as_str()).collect();
+    for key in ["broken.wgsl", "bad.mesh.json", "nowhere.png"] {
+        assert!(failed_keys.contains(&key), "{key} should fail: {failed:?}");
+    }
+    for key in ["tri.mesh.json", "green.material.json", "flat.wgsl", "stream.gtex"] {
+        assert!(ready.iter().any(|ready| ready == key), "{key} should load: {ready:?}");
+    }
+    assert!(renderer.quiet(), "streaming, fading and the veil are done");
+    renderer.submit(&frame, &catalog, &mut target).unwrap();
+    // The green triangle, and the one whose texture failed (as the checker);
+    // the broken shader and the bad mesh draw nothing.
+    assert_eq!(renderer.stats().draw_calls, 2);
+    // Green past the shoulder rolls off: 1 - 0.01 / 0.2.
+    let [r, g, b, _] = middle(&device, &queue, &target.0);
+    assert!(r < 2 && b < 2 && (240..=244).contains(&g), "middle pixel {r} {g} {b}");
+
+    // Four samples a pixel: the frames keep one until the shader's
+    // pipelines for four have compiled in the background, then switch.
+    let mut multisampled = frame.clone();
+    multisampled.quality.msaa = 4;
+    multisampled.quality.fxaa = true;
+    for _ in 0..50 {
+        renderer.submit(&multisampled, &catalog, &mut target).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let [r, g, b, _] = middle(&device, &queue, &target.0);
+    assert!(r < 2 && b < 2 && (240..=244).contains(&g), "middle pixel {r} {g} {b} with MSAA");
+}
+
+#[test]
+fn renderer_moves_between_threads() {
+    fn send<T: Send>() {}
+    send::<Renderer>();
+}
+
+#[test]
+fn rejects_invalid_frames() {
+    let mut bad = frame(Vec::new());
+    bad.light_direction = Vector::default();
+    assert!(pen_render::validate_frame(&bad).is_err());
+    let mut bad = frame(vec![Draw { material: 0, mesh: 0, transform: [0.0; 16], parameters: None, extra: None }]);
+    assert!(pen_render::validate_frame(&bad).is_err());
+    bad.draws.clear();
+    bad.blur = 0.75;
+    assert!(pen_render::validate_frame(&bad).is_err());
+    assert!(pen_render::validate_frame(&frame(Vec::new())).is_ok());
+}

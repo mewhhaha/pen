@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/blot-host", "crates/gdev", "crates/gdev-protocol", "crates/gdev-render"]
+members = ["crates/blot-host", "crates/pen", "crates/pen-protocol", "crates/pen-render"]
 
 [workspace.package]
 edition = "2024"
@@ -8,16 +8,39 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1"
-blot-host = { path = "crates/blot-host" }
-gdev-protocol = { path = "crates/gdev-protocol" }
-gdev-render = { path = "crates/gdev-render" }
+blot-host = { path = "crates/blot-host", default-features = false }
+pen-protocol = { path = "crates/pen-protocol" }
+pen-render = { path = "crates/pen-render" }
 wgpu = "30"
-wasmtime = "49"
+# What running a precompiled guest needs (externref lives on the GC heap;
+# `backtrace` names guest functions in traps). blot-host's `compiler`
+# feature adds Cranelift. Builds with and without it must agree on every
+# feature that changes the engine's Wasm features or tunables, or a
+# game.cwasm from one would not load in the other.
+wasmtime = { version = "49", default-features = false, features = ["anyhow", "runtime", "std", "gc", "gc-drc", "backtrace"] }
 
+# What development builds (`cargo run --release`, `just install`) use:
+# quick to rebuild after an edit.
 [profile.release]
 lto = "thin"
 codegen-units = 4
 strip = true
+
+# What ships (`just player`, `just windows`): whole-program LTO in one unit
+# and no unwinding (a panic writes its crash report, then ends the game),
+# which make the player runtime a quarter smaller than release does at no
+# measurable frame time, for builds a few minutes longer. opt-level "s"
+# would save another fifth but costs about 5% of the host's frame time.
+# The build keeps its symbols and line tables, which resolve its crash
+# reports; the recipes ship a stripped copy (stripping in the build itself
+# would compile different code). See docs/shipping.md for the measurements.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "none"
+debug = "line-tables-only"
 
 # Shaders and wasm compilation are slow unoptimized; keep dependencies fast in dev.
 [profile.dev.package."*"]

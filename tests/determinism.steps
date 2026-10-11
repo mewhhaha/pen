@@ -1,0 +1,27 @@
+# Input for `just determinism`: the same frames run twice, recorded and
+# replayed, overlapped (--overlap) and rewound must give the same packets.
+# Besides play, it covers what a replay reproduces without reading input:
+# edits (the host's undo history), undo (U) and redo (Shift+U), and
+# quicksaves and loads, from the script and the game's own keys (F6, F9),
+# live-tunable constants (tune=), which the game keeps as state, and
+# assistive technology's actions on the game's interface (ui=: the build
+# bar's blueprints and plans, the editor's tools and grid) and the keyboard
+# focus moving through it (F10, Tab, Enter). It ends in the interface, which
+# tests/rewind.steps rewinds into: the keyboard focus going to the build bar
+# (which rises as it does), the station's card opening, and the pause menu
+# flying up, its second row focused and it flying back down.
+wait=30 key=Tab wait=40
+ui=0x20001,activate wait=20 ui=0x20011,activate wait=10 ui=0x20001,collapse wait=10
+key=F10 wait=2 key=Tab wait=2 key=Enter wait=20 key=Escape wait=2 key=Escape wait=10
+click=470,150 wait=20 click=470,152 wait=20 click=471,150 wait=30
+tune=salt.per_strike=3 tune=camera.zoom_speed=0.003 click=470,151 wait=20
+key=Tab wait=30 drag=300,500,600,450 wait=20 drag=200,400,500,350 wait=20
+ui=0x50011,activate wait=5 ui=0x50002,increment wait=5 ui=0x50002,set_value,0.25 wait=5 ui=0x50010,activate wait=5
+key=KeyU wait=10 key=KeyU wait=10 down=Shift key=KeyU up=Shift wait=10
+save=dist/determinism/quick.bin wait=20 key=F6 wait=20
+drag=300,300,400,450 wait=20 load=dist/determinism/quick.bin wait=20
+drag=250,450,450,350 wait=20 key=F9 wait=20
+key=Tab wait=30 wheel=-300,480,320 wait=30
+wait=22 key=F10 wait=50 key=Escape wait=5
+ui=0x30000,activate wait=40 ui=0x30000,collapse wait=10
+key=Escape wait=20 key=ArrowDown wait=44 key=Escape wait=30

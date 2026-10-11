@@ -1,0 +1,46 @@
+[package]
+name = "pen-render"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "wgpu renderer for gdev render packets (port of gdev's renderer.ts)"
+
+[dependencies]
+anyhow.workspace = true
+pen-protocol.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+flate2 = "1"
+pollster = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wgpu.workspace = true
+
+# Natively, asset files are read and decoded on loader threads.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# In the browser, assets are fetched and decoded by the page (see web/).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3.106"
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-sys = { version = "0.3.106", features = [
+  "Blob",
+  "BlobPropertyBag",
+  "CanvasRenderingContext2d",
+  "ColorSpaceConversion",
+  "ImageBitmap",
+  "ImageBitmapOptions",
+  "ImageData",
+  "OffscreenCanvas",
+  "OffscreenCanvasRenderingContext2d",
+  "Performance",
+  "PremultiplyAlpha",
+  "Response",
+  "Window",
+  "WorkerGlobalScope",
+  "console",
+] }
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

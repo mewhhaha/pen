@@ -1,0 +1,63 @@
+[package]
+name = "pen"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Native runtime for gdev: winit window, wgpu renderer, wasmtime guest"
+
+[[bin]]
+name = "pen"
+path = "src/main.rs"
+
+[features]
+default = ["compiler", "devtools"]
+# Cranelift, which compiles game.wasm: every command but playing a packaged
+# game needs it. Without it (`--no-default-features`) this is the player
+# runtime `pen build` ships: it only loads the game.cwasm the package was
+# precompiled with.
+compiler = ["blot-host/compiler"]
+steam = ["dep:steamworks"]
+# The dev overlay (`overlay`, toggled with the backquote key in `pen dev`
+# and `pen run`): console, profiler, timeline and hot reload panels drawn
+# with egui. The player runtime leaves it out.
+devtools = ["dep:egui", "dep:egui-wgpu", "dep:egui-winit"]
+
+[dependencies]
+anyhow.workspace = true
+blot-host.workspace = true
+pen-protocol.workspace = true
+pen-render.workspace = true
+wasmtime.workspace = true
+# The game's interface (and the dev overlay's) for assistive technology:
+# AT-SPI on Linux, UI Automation on Windows, NSAccessibility on macOS. The
+# player runtime has it too.
+accesskit = "0.24"
+accesskit_winit = "0.33"
+# The clipboard the game copies to and pastes from (services::clipboard): X11
+# (and XWayland), Windows and macOS, without arboard's image support.
+arboard = { version = "3.6", default-features = false }
+bytemuck = { version = "1", features = ["derive"] }
+dirs = "7"
+egui = { version = "0.36", optional = true, default-features = false, features = ["default_fonts"] }
+egui-wgpu = { version = "0.36", optional = true, default-features = false }
+egui-winit = { version = "0.36", optional = true, default-features = false, features = ["clipboard", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+kira = "0.12"
+notify = "8"
+ogg = "0.9"
+opus-head-sys = { version = "0.3", default-features = false }
+pollster = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+steamworks = { version = "0.13", optional = true }
+wgpu.workspace = true
+winit = "0.30"
+
+# The player's locale (services::platform).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
+
+[dev-dependencies]
+# What the platform adapters keep of an AccessKit tree, which fails on an
+# inconsistent tree or update: the accessibility tests check theirs with it.
+accesskit_consumer = "0.38"

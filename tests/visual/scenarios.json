@@ -1,0 +1,31 @@
+{
+  "size": [960, 640],
+  "fps": 60,
+  "threshold": 0.01,
+  "scenarios": {
+    "editor": {
+      "about": "the level editor the game starts in",
+      "script": "wait=10 shot=editor"
+    },
+    "play": {
+      "about": "playing from the god's view, after Tab",
+      "script": "key=Tab wait=60 shot=play"
+    },
+    "struck": {
+      "about": "the rock struck three times, its scars fresh and salt knocked out",
+      "script": "key=Tab wait=40 click=470,150 wait=20 click=470,152 wait=20 click=471,150 wait=60 shot=struck"
+    },
+    "zoomed": {
+      "about": "the play camera wheeled in on the rock",
+      "script": "key=Tab wait=30 wheel=-400,480,320 wait=40 shot=zoomed"
+    },
+    "menu": {
+      "about": "the pause menu over play",
+      "script": "key=Tab wait=30 key=Escape wait=30 shot=menu"
+    },
+    "brush": {
+      "about": "a new brush drawn on the editor's floor",
+      "script": "wait=10 drag=300,500,600,450 wait=30 shot=brush"
+    }
+  }
+}

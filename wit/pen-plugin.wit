@@ -30,6 +30,8 @@ interface types {
         start: u32,
         end: u32,
         message: string,
+        /// Toolchain-specific explanation, as text or encoded JSON.
+        details: option<string>,
     }
 
     /// A program of the checkout's: its root, its entry file (absolute) and
@@ -52,13 +54,16 @@ interface log {
 }
 
 /// Reading the checkout's files, under the roots `pen.json` grants the
-/// plugin. Paths are absolute; one outside every granted root is refused.
+/// plugin. Paths are absolute, `/`-separated on every platform; one outside
+/// every granted root is refused.
 interface files {
     read: func(path: string) -> result<list<u8>, string>;
     /// The names in a directory (files and directories), sorted.
     read-directory: func(directory: string) -> result<list<string>, string>;
     /// Whether a file or directory is there.
     exists: func(path: string) -> bool;
+    is-file: func(path: string) -> bool;
+    canonical: func(path: string) -> result<string, string>;
 }
 
 /// Running the programs `pen.json` grants the plugin, by the names it grants
@@ -119,6 +124,9 @@ interface compiler {
         build: func(overlays: list<overlay>) -> result<build-result, string>;
         /// The paths (files or directories) whose changes need a new build.
         watched: func() -> list<string>;
+        /// Saves retained compiler work and closes its process. Dropping
+        /// the resource only releases it; callers choose when to wait.
+        close: func() -> result<_, string>;
     }
 }
 
@@ -137,8 +145,15 @@ interface assets {
         dependencies: list<string>,
     }
 
+    record generation-error {
+        message: string,
+        /// Inputs read before failure, including missing inputs whose
+        /// creation should retry generation.
+        dependencies: list<string>,
+    }
+
     /// The modules for `program`, or why they cannot be made.
-    generate: func(program: program) -> result<generated, string>;
+    generate: func(program: program) -> result<generated, generation-error>;
 }
 
 /// A plugin that compiles programs.

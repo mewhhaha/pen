@@ -1,6 +1,6 @@
 //! The game's program alone, without rendering: guest timing (`--bench`),
 //! and each frame's input and render packet for renderer tests, engine
-//! conformance (`tools/conformance_v8.ts`) and `pen parity`.
+//! native/browser qualification.
 use std::path::PathBuf;
 use std::time::Instant;
 

@@ -1,0 +1,1799 @@
+{
+  "catalog": {
+    "mesh": {
+      "list": "meshes"
+    },
+    "material": {
+      "list": "materials"
+    },
+    "sound": {
+      "list": "sounds",
+      "doc": "Sound clips, by the IDs the game plays them with.",
+      "empty": "game played a sound with no sounds in the catalog"
+    }
+  },
+  "state": {
+    "max": {
+      "limit": "MAX_STATE_FLOATS",
+      "value": 16777215,
+      "doc": "Counts travel in float32 lanes: the wire format's exact-integer range, not a runtime memory budget."
+    },
+    "message": "game state must be a bounded array of finite float32 values",
+    "schemaMessage": "state schema must be an integer in 1..16777215"
+  },
+  "vectors": [
+    {
+      "name": "Vector",
+      "components": [
+        "x",
+        "y",
+        "z"
+      ]
+    },
+    {
+      "name": "Color",
+      "components": [
+        "r",
+        "g",
+        "b",
+        "a"
+      ]
+    },
+    {
+      "name": "Aberration",
+      "components": [
+        "x",
+        "y"
+      ]
+    },
+    {
+      "name": "Drift",
+      "components": [
+        "x",
+        "z"
+      ]
+    }
+  ],
+  "limits": [
+    {
+      "limit": "MAX_STATE_FLOATS",
+      "value": 16777215,
+      "doc": "Counts travel in float32 lanes: the wire format's exact-integer range, not a runtime memory budget."
+    },
+    {
+      "limit": "MAX_EVENTS",
+      "value": 100000
+    },
+    {
+      "limit": "MAX_DRAWS",
+      "value": 100000
+    },
+    {
+      "limit": "MAX_SOLIDS",
+      "value": 100000
+    },
+    {
+      "limit": "MAX_SOLID_FACES",
+      "value": 64,
+      "doc": "Faces of one convex solid; games may use fewer."
+    },
+    {
+      "limit": "MAX_DECALS",
+      "value": 4096
+    },
+    {
+      "limit": "MAX_SOUNDS",
+      "value": 256
+    },
+    {
+      "limit": "MAX_SPRITES",
+      "value": 65536
+    },
+    {
+      "limit": "MAX_INSETS",
+      "value": 16
+    },
+    {
+      "limit": "MAX_FIELD_PATCHES",
+      "value": 4096
+    },
+    {
+      "limit": "MAX_FIELD",
+      "value": 4096,
+      "doc": "The widest or tallest field."
+    },
+    {
+      "limit": "MAX_DRAW_EXTRA",
+      "value": 32,
+      "doc": "The most extra vec4s one draw may carry."
+    },
+    {
+      "limit": "MAX_UI_NODES",
+      "value": 4096,
+      "doc": "The most nodes one frame's interface may have."
+    },
+    {
+      "limit": "MAX_UI_TEXT",
+      "value": 1024,
+      "doc": "The most code points one interface node's name, description and value text may have together."
+    },
+    {
+      "limit": "MAX_UI_ID",
+      "value": 16777215,
+      "doc": "Interface node ids are whole numbers from 1 to this, the wire's exact-integer range."
+    },
+    {
+      "limit": "MAX_SERVICE_REQUESTS",
+      "value": 256,
+      "doc": "The most service requests one frame may make."
+    },
+    {
+      "limit": "MAX_SERVICE_DATA",
+      "value": 16384,
+      "doc": "The most values (a text's code points, or a compute service's numbers) one service request or answer carries."
+    },
+    {
+      "limit": "MAX_SERVICE_ID",
+      "value": 16777215,
+      "doc": "Service request ids are whole numbers from 1 to this, the wire's exact-integer range."
+    },
+    {
+      "limit": "MAX_SERVICE_OPERATION",
+      "value": 255,
+      "doc": "Operation codes run from 0 to this; each service numbers its own."
+    },
+    {
+      "limit": "MAX_VOICES",
+      "value": 256,
+      "doc": "The most voices one frame may declare."
+    },
+    {
+      "limit": "MAX_BUSES",
+      "value": 16,
+      "doc": "The most buses one frame may declare, the master (bus 0) included."
+    },
+    {
+      "limit": "MAX_VOICE_ID",
+      "value": 16777215,
+      "doc": "Voice ids are whole numbers from 1 to this, the wire's exact-integer range."
+    },
+    {
+      "limit": "AUDIO_GLIDE_MS",
+      "value": 20,
+      "doc": "The time constant, in milliseconds, of the glide that takes a voice's or bus's gain, pan, pitch, lowpass and reverb toward a frame's new value (WebAudio's setTargetAtTime), so that values set every frame do not click."
+    },
+    {
+      "limit": "AUDIO_FADE_MS",
+      "value": 30,
+      "doc": "The shortest fade, in milliseconds, of a voice that leaves or changes clip."
+    },
+    {
+      "limit": "AUDIO_OPEN",
+      "value": 24000,
+      "doc": "A lowpass cutoff, in Hz, at or above which a filter is open; hosts also leave one open at or above half their sample rate."
+    }
+  ],
+  "enumerations": [
+    {
+      "name": "UiRole",
+      "constant": "UI_ROLE",
+      "values": [
+        "group",
+        "text",
+        "heading",
+        "button",
+        "checkbox",
+        "switch",
+        "slider",
+        "spinbutton",
+        "list",
+        "listitem",
+        "dialog",
+        "menu",
+        "menuitem",
+        "tablist",
+        "tab",
+        "tabpanel",
+        "toolbar",
+        "image",
+        "status",
+        "progressbar",
+        "radiogroup",
+        "radio",
+        "textbox",
+        "log"
+      ],
+      "doc": "What an interface node is; hosts expose it with the matching role. A textbox's value text is the text in it; a log is a list of messages whose newest lines a screen reader may announce."
+    },
+    {
+      "name": "UiAction",
+      "constant": "UI_ACTION",
+      "values": [
+        "focus",
+        "blur",
+        "activate",
+        "increment",
+        "decrement",
+        "set_value",
+        "expand",
+        "collapse"
+      ],
+      "doc": "What assistive technology, or the game's keyboard focus, does to an interface node: moves the focus to it or away from it, does what clicking it does, steps its value up or down or sets it (to the UiAction event's value), opens or closes it. A node lists the actions it takes in its `actions` bits, 1 << code each."
+    },
+    {
+      "name": "UiState",
+      "constant": "UI_STATE",
+      "values": [
+        "none",
+        "false",
+        "true",
+        "mixed"
+      ],
+      "doc": "An interface node's checked, expanded or selected state: none for a node without one."
+    },
+    {
+      "name": "UiLive",
+      "constant": "UI_LIVE",
+      "values": [
+        "off",
+        "polite",
+        "assertive"
+      ],
+      "doc": "Whether assistive technology announces an interface node's changes as they come, and how urgently."
+    },
+    {
+      "name": "Service",
+      "constant": "SERVICE",
+      "values": [
+        "steam",
+        "clipboard",
+        "url",
+        "platform",
+        "pathfinding",
+        "devtools"
+      ],
+      "doc": "Which service a request is for: Steam's achievements, stats and rich presence, the system clipboard, the browser for a web address, what the game runs on, a native compute library (grid pathfinding), and the host's developer tools (DEVTOOLS_OP_*), which only a dev tools program asks of. A host without one answers unavailable."
+    },
+    {
+      "name": "ServiceStatus",
+      "constant": "SERVICE_STATUS",
+      "values": [
+        "ok",
+        "unavailable",
+        "failed",
+        "unknown"
+      ],
+      "doc": "How a service request went: done; the service is not there (Steam is off, no clipboard, the browser cannot); it is there but refused or failed; or the host does not know the service or operation."
+    },
+    {
+      "name": "SteamOperation",
+      "constant": "STEAM_OP",
+      "values": [
+        "unlock_achievement",
+        "clear_achievement",
+        "set_stat",
+        "set_stat_float",
+        "add_stat",
+        "get_stat",
+        "set_presence",
+        "clear_presence",
+        "status"
+      ],
+      "doc": "Steam's operations. Achievements and stats go by their API names (the text); set_stat and set_stat_float set `a`, add_stat adds `a` to an integer stat, and these and get_stat answer the stat's value. set_presence sets rich presence key (the text's first `a` code points) to the rest of the text; clear_presence clears every key. status answers ok while Steam runs for the game, unavailable otherwise."
+    },
+    {
+      "name": "ClipboardOperation",
+      "constant": "CLIPBOARD_OP",
+      "values": [
+        "copy",
+        "paste"
+      ],
+      "doc": "The clipboard's operations: copy the text to it, or answer with the text on it."
+    },
+    {
+      "name": "UrlOperation",
+      "constant": "URL_OP",
+      "values": [
+        "open"
+      ],
+      "doc": "Open the http or https address in the text in the player's browser."
+    },
+    {
+      "name": "PlatformOperation",
+      "constant": "PLATFORM_OP",
+      "values": [
+        "os",
+        "locale",
+        "device"
+      ],
+      "doc": "What the game runs on, answered as text: the operating system (linux, windows, macos, web), the player's locale (a BCP 47 tag, en-US), and the device (value 1 on a Steam Deck, with its name as text)."
+    },
+    {
+      "name": "PathfindingOperation",
+      "constant": "PATHFINDING_OP",
+      "values": [
+        "find"
+      ],
+      "doc": "The shortest 4-connected path over a grid of `a` columns and `b` rows whose cells are the request's values (0 open, anything else blocked), from cell `c` to cell `d` (row * columns + column): it answers the path's cells in order, start and goal included, its length as the value, or none when there is no path."
+    },
+    {
+      "name": "DevtoolsOperation",
+      "constant": "DEVTOOLS_OP",
+      "values": [
+        "log",
+        "frame",
+        "gpu",
+        "command",
+        "pause",
+        "play",
+        "step",
+        "rewind",
+        "replay",
+        "history",
+        "record",
+        "shot",
+        "tune",
+        "bake",
+        "tuned"
+      ],
+      "doc": "The host's developer tools. log answers the log's lines from serial `a` on, value the serial after the last, each line as its source (0 game, 1 build, 2 reload, 3 asset, 4 pipeline, 5 session), 1 if an error, its length and its code points. frame answers the last frame's numbers in DEVTOOLS_FRAME's order, timing the game's frames while `a` is 1. gpu answers the graphics adapter's name. command sends the game console command `a` with argument `b`. pause and play stop and start the game's clock; step runs `a` frames and stays paused; rewind goes back `a` seconds of game time, paused; replay plays the last `a` seconds again, then live; history keeps the past to travel in (unavailable answers what needs it while none is kept). record starts recording the input to the text's path, or a new file when it is empty, or stops a recording. shot saves the window with the dev tools over it to the text's path, or a new file. tune sets the live-tunable constant whose id is `a` to `b`, and tuned answers the game's tuned values as id and value pairs. bake writes them into the checkout as the defaults."
+    },
+    {
+      "name": "DevtoolsFrame",
+      "constant": "DEVTOOLS_FRAME",
+      "values": [
+        "interval",
+        "guest",
+        "wait",
+        "decode",
+        "validate",
+        "submit",
+        "housekeeping",
+        "total",
+        "packet",
+        "draw_calls",
+        "instanced_draw_calls",
+        "instances",
+        "meshes",
+        "brushes",
+        "memory",
+        "width",
+        "height",
+        "position",
+        "paused",
+        "replaying",
+        "history",
+        "pipelined",
+        "recording"
+      ],
+      "doc": "Where each number sits in a devtools frame answer: the milliseconds since the frame before; the game's frame phases in milliseconds (guest, waited for an overlapped guest, packet decode, validation, render and present, housekeeping, and their total), each -1 when the frame was not timed or did not run; its packet's bytes; the renderer's draw calls, instanced ones and instances; the frame's meshes and brushes; the game's memory in bytes; the frame's width and height in pixels; and the timeline: the next frame's position, 1 when paused, replaying, keeping history or overlapping frames, and the frame an input recording started at, or -1."
+    }
+  ],
+  "input": {
+    "doc": "The host's frame: the seconds since the last one, the viewport, its events and the state.",
+    "lanes": [
+      "code",
+      "x",
+      "y",
+      "delta"
+    ],
+    "maxEvents": {
+      "limit": "MAX_EVENTS",
+      "value": 100000
+    },
+    "maxExtent": 16777215,
+    "messages": {
+      "frame": "invalid frame clock, viewport or event count",
+      "nonfinite": "frame contains a nonfinite float32 value",
+      "tag": "invalid gdev event tag"
+    },
+    "keys": {
+      "ArrowLeft": 1114368,
+      "ArrowRight": 1114369,
+      "ArrowUp": 1114370,
+      "ArrowDown": 1114371,
+      "Tab": 1114372,
+      "Delete": 1114373,
+      "Escape": 1114374,
+      "Backspace": 1114375,
+      "Enter": 1114376,
+      "PageUp": 1114377,
+      "PageDown": 1114378,
+      "Home": 1114379,
+      "End": 1114380,
+      "F2": 1114626,
+      "F6": 1114630,
+      "F9": 1114633,
+      "F10": 1114634,
+      "Shift": 1114880,
+      "Control": 1114881,
+      "Alt": 1114882,
+      "Meta": 1114883
+    },
+    "events": [
+      {
+        "tag": 1,
+        "name": "KeyDown",
+        "doc": "A key by its browser `KeyboardEvent.key` name (\"a\", \"A\", \"ArrowLeft\", \"Shift\", ...); the game gets its code (packages/input/keys.blot).",
+        "value": {
+          "lane": "code",
+          "wire": "key",
+          "ts": "string",
+          "rust": "String"
+        }
+      },
+      {
+        "tag": 2,
+        "name": "KeyUp",
+        "value": {
+          "lane": "code",
+          "wire": "key",
+          "ts": "string",
+          "rust": "String"
+        }
+      },
+      {
+        "tag": 3,
+        "name": "PointerDown",
+        "fields": {
+          "button": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 7,
+            "ts": "bigint",
+            "rust": "u32"
+          },
+          "x": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "y": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 4,
+        "name": "PointerUp",
+        "fields": {
+          "button": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 7,
+            "ts": "bigint",
+            "rust": "u32"
+          },
+          "x": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "y": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 5,
+        "name": "PointerMove",
+        "fields": {
+          "x": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "y": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 6,
+        "name": "Wheel",
+        "fields": {
+          "x": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "y": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "delta": {
+            "lane": "delta",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 7,
+        "name": "FocusLost"
+      },
+      {
+        "tag": 8,
+        "name": "AssetChanged",
+        "doc": "An asset finished loading, or failed to.",
+        "hosts": [
+          {
+            "name": "AssetReady",
+            "fields": {
+              "key": {
+                "ts": "string",
+                "rust": "String"
+              },
+              "kind": {
+                "ts": "string",
+                "rust": "String"
+              },
+              "revision": {
+                "ts": "bigint",
+                "rust": "u64"
+              }
+            }
+          },
+          {
+            "name": "AssetFailed",
+            "fields": {
+              "key": {
+                "ts": "string",
+                "rust": "String"
+              },
+              "kind": {
+                "ts": "string",
+                "rust": "String"
+              },
+              "revision": {
+                "ts": "bigint",
+                "rust": "u64"
+              },
+              "message": {
+                "ts": "string",
+                "rust": "String"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "tag": 9,
+        "name": "Console",
+        "doc": "A console command for the game: which, and its argument.",
+        "fields": {
+          "command": {
+            "lane": "code",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "argument": {
+            "lane": "x",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 10,
+        "name": "Preference",
+        "doc": "A stored preference, played back when the game starts.",
+        "fields": {
+          "index": {
+            "lane": "code",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "value": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 11,
+        "name": "Tune",
+        "doc": "A live-tunable constant set from the host: which, and its value.",
+        "fields": {
+          "index": {
+            "lane": "code",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          },
+          "value": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 12,
+        "name": "UiAction",
+        "doc": "An action on a node of the interface the game declared (the render packet's `ui`), from assistive technology: the node's id, the action (UI_ACTION_*), and the value set_value sets.",
+        "fields": {
+          "node": {
+            "lane": "x",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          },
+          "action": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 7,
+            "ts": "number",
+            "rust": "u32"
+          },
+          "value": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 13,
+        "name": "ServiceAnswer",
+        "doc": "The answer to a service request the game made (the render packet's `services`), once, in a later frame: the request's id, how it went (SERVICE_STATUS_*), a number, and how many values (a text's code points, or numbers) follow in the ServiceData events right after it.",
+        "fields": {
+          "request": {
+            "lane": "x",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          },
+          "status": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 3,
+            "ts": "number",
+            "rust": "u32"
+          },
+          "value": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "length": {
+            "lane": "delta",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          }
+        }
+      },
+      {
+        "tag": 14,
+        "name": "ServiceData",
+        "doc": "Three of an answer's values, in order, after its ServiceAnswer: the request's id, then the values; lanes past the answer's length are zero.",
+        "fields": {
+          "request": {
+            "lane": "code",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          },
+          "a": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "b": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "c": {
+            "lane": "delta",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      }
+    ]
+  },
+  "render": {
+    "doc": "The game's frame: what to draw and play, and what to do.",
+    "messages": {
+      "header": "game returned an invalid frame header or state schema",
+      "count": "game returned an invalid frame count or flag",
+      "length": "game returned a truncated, oversized or nonfinite frame"
+    },
+    "groups": {
+      "quality": {
+        "type": "Quality",
+        "doc": "How the game wants this frame drawn (packages/preferences.blot): samples per pixel, FXAA, render scale, texture filtering, ambient occlusion, a sky, screen effects and bloom."
+      },
+      "sky": {
+        "type": "Sky",
+        "doc": "The sky's colors and the way toward the sun or moon (packages/graphics.blot)."
+      },
+      "fog": {
+        "type": "Fog",
+        "doc": "Mist beyond `radius` of the middle; density 0 for none."
+      },
+      "shadow": {
+        "type": "Shadow",
+        "doc": "The shadow map's view; `texels` 0 for no shadows."
+      },
+      "clouds": {
+        "type": "Clouds",
+        "doc": "Clouds over the scene (packages/render.blot): how much of the sky they cover, 0 for none, and how far the wind has carried them along x and z."
+      }
+    },
+    "header": {
+      "magic": {
+        "kind": "magic",
+        "value": 4670534
+      },
+      "schema": {
+        "kind": "schema"
+      },
+      "state_count": {
+        "kind": "size",
+        "section": "state",
+        "of": "lanes"
+      },
+      "draw_count": {
+        "kind": "size",
+        "section": "draws",
+        "of": "count"
+      },
+      "solid_count": {
+        "kind": "size",
+        "section": "solids",
+        "of": "count"
+      },
+      "solid_lanes": {
+        "kind": "size",
+        "section": "solids",
+        "of": "lanes"
+      },
+      "decal_count": {
+        "kind": "size",
+        "section": "decals",
+        "of": "count"
+      },
+      "sound_count": {
+        "kind": "size",
+        "section": "sounds",
+        "of": "count"
+      },
+      "sprite_count": {
+        "kind": "size",
+        "section": "sprites",
+        "of": "count"
+      },
+      "inset_count": {
+        "kind": "size",
+        "section": "insets",
+        "of": "count"
+      },
+      "inset_draw_count": {
+        "kind": "size",
+        "section": "inset_draws",
+        "of": "count"
+      },
+      "preference_count": {
+        "kind": "size",
+        "section": "preferences",
+        "of": "lanes"
+      },
+      "save_requested": {
+        "kind": "flag"
+      },
+      "load_requested": {
+        "kind": "flag"
+      },
+      "scene_save_requested": {
+        "kind": "flag"
+      },
+      "scene_load_requested": {
+        "kind": "flag"
+      },
+      "checkpoint_requested": {
+        "kind": "flag",
+        "doc": "An edit finished: the host records the scene for undo."
+      },
+      "undo_requested": {
+        "kind": "flag"
+      },
+      "redo_requested": {
+        "kind": "flag"
+      },
+      "exit_requested": {
+        "kind": "flag",
+        "doc": "The game is over: the host stops it."
+      },
+      "view": {
+        "kind": "matrix"
+      },
+      "projection": {
+        "kind": "matrix"
+      },
+      "clear": {
+        "kind": "vector",
+        "type": {
+          "name": "Color",
+          "components": [
+            "r",
+            "g",
+            "b",
+            "a"
+          ]
+        }
+      },
+      "ambient": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        }
+      },
+      "light_direction": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        }
+      },
+      "light_color": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        }
+      },
+      "aberration": {
+        "kind": "vector",
+        "type": {
+          "name": "Aberration",
+          "components": [
+            "x",
+            "y"
+          ]
+        },
+        "doc": "How far red moves from green, in screen heights across and down, and blue as far the other way, on the surfaces whose material asks for it."
+      },
+      "quality.msaa": {
+        "kind": "choice",
+        "values": [
+          4
+        ],
+        "otherwise": 1,
+        "doc": "Samples per pixel: 1 or 4."
+      },
+      "quality.fxaa": {
+        "kind": "flag"
+      },
+      "quality.scale": {
+        "kind": "f32"
+      },
+      "quality.filtering": {
+        "kind": "count",
+        "max": 16,
+        "doc": "0 linear, 1 trilinear, otherwise anisotropic samples."
+      },
+      "quality.occlusion": {
+        "kind": "flag"
+      },
+      "quality.sky": {
+        "kind": "flag"
+      },
+      "quality.effects": {
+        "kind": "flag"
+      },
+      "sky.zenith": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        }
+      },
+      "sky.horizon": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        }
+      },
+      "sky.ground": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        }
+      },
+      "sky.sun": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        }
+      },
+      "sky.night": {
+        "kind": "f32",
+        "doc": "1 at full night, when stars show."
+      },
+      "fog.radius": {
+        "kind": "f32"
+      },
+      "fog.density": {
+        "kind": "f32"
+      },
+      "fog.height": {
+        "kind": "f32"
+      },
+      "shadow.view": {
+        "kind": "matrix"
+      },
+      "shadow.projection": {
+        "kind": "matrix"
+      },
+      "shadow.texel": {
+        "kind": "f32",
+        "doc": "A map texel's width in world units."
+      },
+      "shadow.texels": {
+        "kind": "count",
+        "max": 8192
+      },
+      "blur": {
+        "kind": "f32",
+        "doc": "How far the picture smears toward the middle of the screen, as a share of the way there (0 to 0.5), as speed would."
+      },
+      "quality.bloom": {
+        "kind": "flag"
+      },
+      "clouds.cover": {
+        "kind": "f32"
+      },
+      "clouds.drift": {
+        "kind": "vector",
+        "type": {
+          "name": "Drift",
+          "components": [
+            "x",
+            "z"
+          ]
+        }
+      },
+      "hide_cursor": {
+        "kind": "flag",
+        "doc": "The frame supplies its own cursor and asks the host to hide the system one."
+      },
+      "field_count": {
+        "kind": "size",
+        "section": "fields",
+        "of": "count"
+      },
+      "field_lanes": {
+        "kind": "size",
+        "section": "fields",
+        "of": "lanes"
+      },
+      "ui_count": {
+        "kind": "size",
+        "section": "ui",
+        "of": "count"
+      },
+      "ui_lanes": {
+        "kind": "size",
+        "section": "ui",
+        "of": "lanes"
+      },
+      "service_count": {
+        "kind": "size",
+        "section": "services",
+        "of": "count"
+      },
+      "service_lanes": {
+        "kind": "size",
+        "section": "services",
+        "of": "lanes"
+      },
+      "bus_count": {
+        "kind": "size",
+        "section": "buses",
+        "of": "count"
+      },
+      "voice_count": {
+        "kind": "size",
+        "section": "voices",
+        "of": "count"
+      }
+    },
+    "sections": [
+      {
+        "kind": "lanes",
+        "name": "state",
+        "max": {
+          "limit": "MAX_STATE_FLOATS",
+          "value": 16777215,
+          "doc": "Counts travel in float32 lanes: the wire format's exact-integer range, not a runtime memory budget."
+        },
+        "apart": true
+      },
+      {
+        "kind": "records",
+        "name": "draws",
+        "record": {
+          "name": "Draw",
+          "constant": "DRAW",
+          "fields": {
+            "mesh": {
+              "kind": "reference",
+              "to": "mesh"
+            },
+            "material": {
+              "kind": "reference",
+              "to": "material"
+            },
+            "transform": {
+              "kind": "matrix"
+            },
+            "parameters": {
+              "kind": "optional",
+              "count": 4,
+              "message": "draw parameters must contain zero or four lanes",
+              "doc": "Optional four shader values, overriding the material's instance defaults."
+            },
+            "extra": {
+              "kind": "tail",
+              "section": "extras",
+              "unit": 4,
+              "max": {
+                "limit": "MAX_DRAW_EXTRA",
+                "value": 32,
+                "doc": "The most extra vec4s one draw may carry."
+              },
+              "doc": "Up to 32 more vec4s, flattened, that the shader reads after the parameters; a draw with any is drawn alone."
+            }
+          }
+        },
+        "max": {
+          "limit": "MAX_DRAWS",
+          "value": 100000
+        }
+      },
+      {
+        "kind": "variable",
+        "name": "solids",
+        "doc": "Convex solids: the points behind every face plane (normal \u00b7 p <= distance).",
+        "max": {
+          "limit": "MAX_SOLIDS",
+          "value": 100000
+        },
+        "maxLanes": 32100000,
+        "record": {
+          "name": "Solid",
+          "constant": "SOLID",
+          "doc": "A convex solid: the points behind every face plane (normal \u00b7 p <= distance).",
+          "head": {},
+          "rest": {
+            "kind": "repeat",
+            "name": "faces",
+            "record": {
+              "name": "SolidFace",
+              "constant": "SOLID_FACE",
+              "fields": {
+                "normal": {
+                  "kind": "vector",
+                  "type": {
+                    "name": "Vector",
+                    "components": [
+                      "x",
+                      "y",
+                      "z"
+                    ]
+                  }
+                },
+                "distance": {
+                  "kind": "f32"
+                },
+                "material": {
+                  "kind": "reference",
+                  "to": "material"
+                }
+              }
+            },
+            "min": 4,
+            "max": {
+              "limit": "MAX_SOLID_FACES",
+              "value": 64,
+              "doc": "Faces of one convex solid; games may use fewer."
+            }
+          }
+        },
+        "messages": {
+          "truncated": "game returned truncated solids",
+          "invalid": "game returned an invalid solid",
+          "mismatch": "game returned solid lanes that do not match"
+        }
+      },
+      {
+        "kind": "records",
+        "name": "decals",
+        "doc": "Decals: `material`'s texture laid onto the surfaces inside the box, the cube -1..1 under `transform`, along its y axis, where their material takes decals; `opacity` fades it.",
+        "record": {
+          "name": "Decal",
+          "constant": "DECAL",
+          "fields": {
+            "material": {
+              "kind": "reference",
+              "to": "material"
+            },
+            "transform": {
+              "kind": "matrix"
+            },
+            "opacity": {
+              "kind": "f32"
+            }
+          },
+          "doc": "`material`'s texture laid onto the surfaces inside the box, the cube -1..1 under `transform`, along its y axis, where their material takes decals; `opacity` fades it."
+        },
+        "max": {
+          "limit": "MAX_DECALS",
+          "value": 4096
+        }
+      },
+      {
+        "kind": "records",
+        "name": "sounds",
+        "doc": "Sounds to play once, each on a bus: gain, pan, pitch, lowpass and reverb send, all worked out by the game.",
+        "record": {
+          "name": "Sound",
+          "constant": "SOUND",
+          "fields": {
+            "clip": {
+              "kind": "reference",
+              "to": "sound"
+            },
+            "bus": {
+              "kind": "count",
+              "max": 15,
+              "doc": "The bus it plays through; one the frame lacks passes it on to the master as it is."
+            },
+            "gain": {
+              "kind": "f32"
+            },
+            "pan": {
+              "kind": "f32"
+            },
+            "pitch": {
+              "kind": "f32"
+            },
+            "lowpass": {
+              "kind": "f32"
+            },
+            "reverb": {
+              "kind": "f32",
+              "doc": "How much of it goes to the shared reverb."
+            }
+          },
+          "doc": "A sound to play once on a bus at the gain, pan, pitch, lowpass cutoff and reverb send given, all worked out by the game."
+        },
+        "max": {
+          "limit": "MAX_SOUNDS",
+          "value": 256
+        }
+      },
+      {
+        "kind": "records",
+        "name": "sprites",
+        "record": {
+          "name": "Sprite",
+          "constant": "SPRITE",
+          "fields": {
+            "x": {
+              "kind": "f32"
+            },
+            "y": {
+              "kind": "f32"
+            },
+            "width": {
+              "kind": "f32"
+            },
+            "height": {
+              "kind": "f32"
+            },
+            "u0": {
+              "kind": "f32"
+            },
+            "v0": {
+              "kind": "f32"
+            },
+            "u1": {
+              "kind": "f32"
+            },
+            "v1": {
+              "kind": "f32"
+            },
+            "color": {
+              "kind": "lanes",
+              "count": 4,
+              "as": "tuple"
+            },
+            "material": {
+              "kind": "reference",
+              "to": "material"
+            },
+            "parameters": {
+              "kind": "lanes",
+              "count": 4,
+              "as": "view"
+            }
+          },
+          "doc": "A rectangle over the screen, in pixels from its top left, drawn by its material's sprite shader, which reads the four `parameters` as it likes."
+        },
+        "max": {
+          "limit": "MAX_SPRITES",
+          "value": 65536
+        }
+      },
+      {
+        "kind": "records",
+        "name": "insets",
+        "record": {
+          "name": "Inset",
+          "constant": "INSET",
+          "fields": {
+            "x": {
+              "kind": "f32"
+            },
+            "y": {
+              "kind": "f32"
+            },
+            "width": {
+              "kind": "f32"
+            },
+            "height": {
+              "kind": "f32"
+            },
+            "view": {
+              "kind": "matrix"
+            },
+            "projection": {
+              "kind": "matrix"
+            },
+            "ambient": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "Its own light: ambient, the way its rays travel, and their color."
+            },
+            "light_direction": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              }
+            },
+            "light_color": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              }
+            },
+            "draws": {
+              "kind": "children",
+              "section": "inset_draws",
+              "max": {
+                "limit": "MAX_DRAWS",
+                "value": 100000
+              },
+              "over": "game returned more inset draws than it counted",
+              "under": "game returned inset draws that do not match"
+            },
+            "pixel_size": {
+              "kind": "f32",
+              "doc": "Block size in screen pixels, or zero for a smooth image."
+            }
+          },
+          "doc": "A small 3D view over the screen, in the rectangle at (x, y)."
+        },
+        "max": {
+          "limit": "MAX_INSETS",
+          "value": 16
+        }
+      },
+      {
+        "kind": "records",
+        "name": "inset_draws",
+        "record": {
+          "name": "Draw",
+          "constant": "DRAW",
+          "fields": {
+            "mesh": {
+              "kind": "reference",
+              "to": "mesh"
+            },
+            "material": {
+              "kind": "reference",
+              "to": "material"
+            },
+            "transform": {
+              "kind": "matrix"
+            },
+            "parameters": {
+              "kind": "optional",
+              "count": 4,
+              "message": "draw parameters must contain zero or four lanes",
+              "doc": "Optional four shader values, overriding the material's instance defaults."
+            },
+            "extra": {
+              "kind": "tail",
+              "section": "extras",
+              "unit": 4,
+              "max": {
+                "limit": "MAX_DRAW_EXTRA",
+                "value": 32,
+                "doc": "The most extra vec4s one draw may carry."
+              },
+              "doc": "Up to 32 more vec4s, flattened, that the shader reads after the parameters; a draw with any is drawn alone."
+            }
+          }
+        },
+        "max": {
+          "limit": "MAX_DRAWS",
+          "value": 100000
+        },
+        "owner": "insets.draws"
+      },
+      {
+        "kind": "lanes",
+        "name": "preferences",
+        "constant": "PREFERENCE",
+        "doc": "The player's preferences to store, when they changed (packages/preferences.blot); the host plays them back as Preference events when the game starts.",
+        "max": 14,
+        "exactly": {
+          "counts": [
+            0,
+            14
+          ],
+          "message": "game returned partial preferences"
+        },
+        "nullable": true
+      },
+      {
+        "kind": "variable",
+        "name": "fields",
+        "doc": "Patches of the values the host keeps for some materials.",
+        "max": {
+          "limit": "MAX_FIELD_PATCHES",
+          "value": 4096
+        },
+        "maxLanes": 16805888,
+        "record": {
+          "name": "FieldPatch",
+          "constant": "FIELD",
+          "doc": "A patch of a field: a `width` x `height` grid of values the host keeps for `material`, which every draw of it reads as a texture at binding 3 (red, half-float). The patch's `columns` x `rows` values land row by row at column `x`, row `z`; the rest of the field keeps what it had.",
+          "head": {
+            "material": {
+              "kind": "reference",
+              "to": "material"
+            },
+            "width": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_FIELD",
+                "value": 4096,
+                "doc": "The widest or tallest field."
+              }
+            },
+            "height": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_FIELD",
+                "value": 4096,
+                "doc": "The widest or tallest field."
+              }
+            },
+            "x": {
+              "kind": "count",
+              "max": "width"
+            },
+            "z": {
+              "kind": "count",
+              "max": "height"
+            },
+            "columns": {
+              "kind": "count",
+              "max": "width - x"
+            },
+            "rows": {
+              "kind": "count",
+              "max": "height - z"
+            }
+          },
+          "rest": {
+            "kind": "values",
+            "name": "values",
+            "of": [
+              "columns",
+              "rows"
+            ]
+          }
+        },
+        "messages": {
+          "truncated": "game returned truncated field patches",
+          "invalid": "game returned truncated field patches",
+          "mismatch": "game returned field lanes that do not match"
+        }
+      },
+      {
+        "kind": "variable",
+        "name": "ui",
+        "doc": "The interface the game declares for assistive technology and keyboard focus (packages/ui.blot), every frame, whole: its nodes, parents first.",
+        "max": {
+          "limit": "MAX_UI_NODES",
+          "value": 4096,
+          "doc": "The most nodes one frame's interface may have."
+        },
+        "maxLanes": 4292608,
+        "record": {
+          "name": "UiNode",
+          "constant": "UI_NODE",
+          "doc": "A node of the interface: its id, the same from frame to frame, its parent, what it is, where it lies on the screen in pixels from its top left (empty for one that is not drawn), its states, a range's value and bounds, the actions it takes, and its text: its name, description and value text one after the other, in code points.",
+          "head": {
+            "id": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_UI_ID",
+                "value": 16777215,
+                "doc": "Interface node ids are whole numbers from 1 to this, the wire's exact-integer range."
+              },
+              "doc": "1 to MAX_UI_ID, from the node's key, so it stays the same."
+            },
+            "parent": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_UI_NODES",
+                "value": 4096,
+                "doc": "The most nodes one frame's interface may have."
+              },
+              "doc": "Its parent's place in the section plus one, or 0 at the top. Parents come first: hosts put a node whose parent does not come before it at the top."
+            },
+            "role": {
+              "kind": "count",
+              "max": 23
+            },
+            "x": {
+              "kind": "f32"
+            },
+            "y": {
+              "kind": "f32"
+            },
+            "width": {
+              "kind": "f32"
+            },
+            "height": {
+              "kind": "f32"
+            },
+            "focusable": {
+              "kind": "flag"
+            },
+            "focused": {
+              "kind": "flag",
+              "doc": "It has the game's keyboard focus."
+            },
+            "disabled": {
+              "kind": "flag"
+            },
+            "hidden": {
+              "kind": "flag",
+              "doc": "Assistive technology leaves it out."
+            },
+            "modal": {
+              "kind": "flag",
+              "doc": "A dialog that keeps the focus while it is open."
+            },
+            "checked": {
+              "kind": "count",
+              "max": 3
+            },
+            "expanded": {
+              "kind": "count",
+              "max": 2
+            },
+            "selected": {
+              "kind": "count",
+              "max": 2
+            },
+            "live": {
+              "kind": "count",
+              "max": 2
+            },
+            "value": {
+              "kind": "f32",
+              "doc": "A slider's or spin button's value, in its range."
+            },
+            "minimum": {
+              "kind": "f32"
+            },
+            "maximum": {
+              "kind": "f32"
+            },
+            "step": {
+              "kind": "f32"
+            },
+            "actions": {
+              "kind": "count",
+              "max": 255
+            },
+            "text_length": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_UI_TEXT",
+                "value": 1024,
+                "doc": "The most code points one interface node's name, description and value text may have together."
+              }
+            },
+            "name_length": {
+              "kind": "count",
+              "max": "text_length"
+            },
+            "description_length": {
+              "kind": "count",
+              "max": "text_length - name_length"
+            }
+          },
+          "rest": {
+            "kind": "values",
+            "name": "text",
+            "of": [
+              "text_length"
+            ],
+            "doc": "Its name's code points, then its description's, then its value text's."
+          }
+        },
+        "messages": {
+          "truncated": "game returned truncated interface nodes",
+          "invalid": "game returned an invalid interface node",
+          "mismatch": "game returned interface lanes that do not match"
+        }
+      },
+      {
+        "kind": "variable",
+        "name": "services",
+        "doc": "The frame's requests to services (packages/services.blot), each in one packet only: hosts answer each once, with ServiceAnswer and ServiceData events in a later frame, and a replay, whose recorded input holds the answers, asks no service again.",
+        "max": {
+          "limit": "MAX_SERVICE_REQUESTS",
+          "value": 256,
+          "doc": "The most service requests one frame may make."
+        },
+        "maxLanes": 4196352,
+        "record": {
+          "name": "ServiceRequest",
+          "constant": "SERVICE_REQUEST",
+          "doc": "A request to a service: its id, unique in the run and never in two packets, which its answer carries back; the service (SERVICE_*) and its operation; four numbers; and its values: text as code points (an API name, the text to copy, an address), or the numbers a compute service takes.",
+          "head": {
+            "request": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_SERVICE_ID",
+                "value": 16777215,
+                "doc": "Service request ids are whole numbers from 1 to this, the wire's exact-integer range."
+              },
+              "doc": "1 to MAX_SERVICE_ID."
+            },
+            "service": {
+              "kind": "count",
+              "max": 5
+            },
+            "operation": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_SERVICE_OPERATION",
+                "value": 255,
+                "doc": "Operation codes run from 0 to this; each service numbers its own."
+              }
+            },
+            "a": {
+              "kind": "f32"
+            },
+            "b": {
+              "kind": "f32"
+            },
+            "c": {
+              "kind": "f32"
+            },
+            "d": {
+              "kind": "f32"
+            },
+            "value_count": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_SERVICE_DATA",
+                "value": 16384,
+                "doc": "The most values (a text's code points, or a compute service's numbers) one service request or answer carries."
+              }
+            }
+          },
+          "rest": {
+            "kind": "values",
+            "name": "values",
+            "of": [
+              "value_count"
+            ],
+            "doc": "Its text's code points, or its numbers."
+          }
+        },
+        "messages": {
+          "truncated": "game returned truncated service requests",
+          "invalid": "game returned an invalid service request",
+          "mismatch": "game returned service lanes that do not match"
+        }
+      },
+      {
+        "kind": "records",
+        "name": "buses",
+        "doc": "The mix's buses (packages/audio.blot), every frame, whole: the master first. A frame without buses plays everything through an open master at gain 1, the reverb coming back at 1; a bus it lacks is open and dry at gain 1.",
+        "record": {
+          "name": "Bus",
+          "constant": "BUS",
+          "fields": {
+            "gain": {
+              "kind": "f32"
+            },
+            "lowpass": {
+              "kind": "f32"
+            },
+            "reverb": {
+              "kind": "f32",
+              "doc": "How much of it goes to the shared reverb; on the master, how loud the reverb comes back."
+            }
+          },
+          "doc": "A bus: the voices and sounds on it mix through its lowpass and gain into the master, and `reverb` of that goes to the shared reverb, as do their own sends through its lowpass and gain. Bus 0 is the master: everything passes through it last, the reverb's return included."
+        },
+        "max": {
+          "limit": "MAX_BUSES",
+          "value": 16,
+          "doc": "The most buses one frame may declare, the master (bus 0) included."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "voices",
+        "doc": "The voices the game keeps playing (packages/audio.blot), every frame, whole: hosts start, fade out and glide them by id.",
+        "record": {
+          "name": "Voice",
+          "constant": "VOICE",
+          "fields": {
+            "id": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_VOICE_ID",
+                "value": 16777215,
+                "doc": "Voice ids are whole numbers from 1 to this, the wire's exact-integer range."
+              },
+              "doc": "1 to MAX_VOICE_ID, the same from frame to frame while it plays."
+            },
+            "clip": {
+              "kind": "reference",
+              "to": "sound"
+            },
+            "bus": {
+              "kind": "count",
+              "max": 15,
+              "doc": "The bus it plays through; one the frame lacks passes it on to the master as it is."
+            },
+            "gain": {
+              "kind": "f32"
+            },
+            "pan": {
+              "kind": "f32"
+            },
+            "pitch": {
+              "kind": "f32"
+            },
+            "lowpass": {
+              "kind": "f32"
+            },
+            "reverb": {
+              "kind": "f32",
+              "doc": "How much of it goes to the shared reverb."
+            },
+            "looping": {
+              "kind": "flag"
+            },
+            "start": {
+              "kind": "f32",
+              "doc": "Seconds into the clip it starts from, round a looping clip as often as need be."
+            },
+            "fade_in": {
+              "kind": "f32",
+              "doc": "Seconds it fades in over as it starts."
+            },
+            "fade_out": {
+              "kind": "f32",
+              "doc": "Seconds it fades out over once frames leave it out."
+            }
+          },
+          "doc": "A voice the game keeps playing, declared by every frame that has it, whole. Hosts start a new id from `start`, fading in over `fade_in`; fade out an id the frame leaves out over its `fade_out` (at least AUDIO_FADE_MS), and one that comes back while fading returns where it is (over its `fade_in`, at least AUDIO_FADE_MS); start one whose clip or bus changed afresh, the old fading out; and glide the values that change (AUDIO_GLIDE_MS). A voice that does not loop plays once and is then silent for as long as frames keep it."
+        },
+        "max": {
+          "limit": "MAX_VOICES",
+          "value": 256,
+          "doc": "The most voices one frame may declare."
+        }
+      },
+      {
+        "kind": "trailing",
+        "name": "extras"
+      }
+    ]
+  }
+}

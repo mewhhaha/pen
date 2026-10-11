@@ -1,4 +1,4 @@
-//! `pen test-blot`: a gdev checkout's Blot tests (its PEN_MIGRATION.md,
+//! `pen test-blot`: a gdev checkout's Blot tests (its tests/README.md,
 //! phase 2). Each test module compiles to Wasm through the checkout's
 //! compiler plugin (its `pen.json`, `pen-plugins`), as if it stood at
 //! `src/test_fixture.blot`, with the game's asset modules. Each worker keeps

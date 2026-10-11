@@ -87,6 +87,8 @@ pub struct Diagnostic {
     pub start: u32,
     pub end: u32,
     pub message: String,
+    /// Toolchain-specific explanation, as text or encoded JSON.
+    pub details: Option<String>,
 }
 
 /// What a build made.

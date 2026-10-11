@@ -9,5 +9,5 @@ pub mod tunables;
 
 #[cfg(feature = "devtools")]
 pub use log::{Line, since};
-pub use log::{Source, error, forward_build_output, info, note};
+pub use log::{Source, error, info, note};
 pub use tunables::{load as load_tunables, tunable_id};

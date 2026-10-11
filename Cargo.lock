@@ -2793,9 +2793,11 @@ dependencies = [
  "notify",
  "ogg",
  "opus-head-sys",
+ "pen-codegen",
  "pen-plugins",
  "pen-protocol",
  "pen-render",
+ "pen-runtime",
  "pollster",
  "serde",
  "serde_json",
@@ -2804,6 +2806,14 @@ dependencies = [
  "wgpu",
  "windows-sys 0.61.2",
  "winit",
+]
+
+[[package]]
+name = "pen-codegen"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
 ]
 
 [[package]]
@@ -2846,6 +2856,15 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "wgpu",
+]
+
+[[package]]
+name = "pen-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pen-protocol",
+ "web-time",
 ]
 
 [[package]]
@@ -3390,6 +3409,7 @@ version = "1.0.151"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",

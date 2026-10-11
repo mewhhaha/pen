@@ -2,7 +2,6 @@
 //! Blot compiler's output, new builds, asset reloads and the asset pipeline's
 //! recipe runs. Each line still goes to stderr as before; builds with the
 //! `devtools` feature also keep the last ones for the dev tools to read.
-use std::io::{BufRead, BufReader, Read};
 
 /// Where a line came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,6 +9,7 @@ pub enum Source {
     /// The game runtime's reports (`Host::report`).
     Game,
     /// The Blot compiler watching the checkout (`pen dev`).
+    #[cfg_attr(not(feature = "plugins"), allow(dead_code))]
     Build,
     /// New builds of the game: compiled, reloaded or refused.
     Reload,
@@ -48,26 +48,6 @@ pub fn note(source: Source, text: impl Into<String>) {
 fn say(source: Source, error: bool, text: String) {
     eprintln!("{text}");
     keep(source, error, text);
-}
-
-/// The Blot compiler's stderr, line by line, to ours and the overlay's, on a
-/// thread of its own until the compiler closes it. A failed build's
-/// diagnostics follow its `blot: Game build failed` line, up to the next
-/// `blot:` line.
-pub fn forward_build_output(stderr: impl Read + Send + 'static) {
-    let forwarding = std::thread::Builder::new().name("pen-build-output".into()).spawn(move || {
-        let mut failing = false;
-        for line in BufReader::new(stderr).split(b'\n').map_while(Result::ok) {
-            let line = String::from_utf8_lossy(&line).trim_end().to_owned();
-            if line.starts_with("blot: ") {
-                failing = line.contains("build failed");
-            }
-            say(Source::Build, failing, line);
-        }
-    });
-    if let Err(error) = forwarding {
-        eprintln!("cannot forward the Blot compiler's output: {error}");
-    }
 }
 
 #[cfg(feature = "devtools")]

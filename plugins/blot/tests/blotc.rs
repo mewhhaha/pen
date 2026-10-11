@@ -160,6 +160,33 @@ fn builds_a_program() {
 }
 
 #[test]
+fn native_assets_survive_edits_rejections_and_restarts() {
+    let project = Project::new(&[
+        ("main.blot", "import * as settings from \"./settings.json\"\nentry const answer = fn () => (settings.value).answer\n"),
+        ("settings.json", "{\"answer\":41}"),
+    ]);
+    let settings = json!({
+        "std": std_root(),
+        "nativeAssets": {"imports": [{"module":"settings.json.blot", "path":"settings.json", "kind":"json"}]},
+    });
+    let mut session = project.open(settings.clone()).unwrap();
+    let first = built(session.build(&[]));
+    assert!(session.watched().contains(&project.path("settings.json")));
+    std::fs::write(project.path("settings.json"), "{\"answer\":99}").unwrap();
+    let changed = built(session.build(&[]));
+    assert_ne!(first, changed);
+    std::fs::write(project.path("settings.json"), "{broken}").unwrap();
+    let problems = rejected(session.build(&[]));
+    assert_eq!(problems[0].stage, "asset");
+    assert_eq!(problems[0].file, project.path("settings.json"));
+    std::fs::write(project.path("settings.json"), "{\"answer\":41}").unwrap();
+    assert_eq!(built(session.build(&[])), first);
+    session.close().unwrap();
+    session.close().unwrap();
+    assert_eq!(built(project.open(settings).unwrap().build(&[])), first);
+}
+
+#[test]
 fn rejects_a_type_error_where_it_is() {
     let main =
         "import * as lib from \"./lib\"\n\nconst wrong: Bool = lib.base\n\nentry const answer = fn () => wrong\n";
@@ -266,40 +293,4 @@ fn gdev_math() -> Option<(PathBuf, Vec<u8>)> {
 #[test]
 fn compiles_gdevs_math_tests() {
     gdev_math();
-}
-
-/// What `pen test-blot` compiles gdev's math tests to today, through Deno
-/// (crates/pen/scripts/blot_test_build.ts), is what the plugin compiles them
-/// to. Run with `--ignored`: it needs Deno, and gdev's Deno packages.
-#[test]
-#[ignore]
-fn compiles_gdevs_math_tests_as_deno_does() {
-    let Some((gdev, wasm)) = gdev_math() else { return };
-    let lock = std::fs::read(gdev.join("deno.lock")).ok();
-    let script = std::fs::canonicalize(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/pen/scripts/blot_test_build.ts"),
-    )
-    .expect("pen's Blot test build script");
-    let out = Project::new(&[]);
-    let deno_wasm = out.root.join("math.wasm");
-    let mut command = Command::new("deno");
-    command
-        .args(["run", "-A", "--no-lock", "--config"])
-        .arg(gdev.join("deno.json"))
-        .arg(&script)
-        .arg(&gdev)
-        .arg(gdev.join("tests/math.blot"))
-        .arg("alone")
-        .arg(&deno_wasm)
-        .current_dir(&gdev)
-        .env("TMPDIR", temporary());
-    if let Some(compiler) = std::env::var_os("BLOT_TEST_COMPILER") {
-        command.env("GDEV_BLOT_COMPILER", compiler);
-    }
-    let output = command.output().expect("deno");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(std::fs::read(gdev.join("deno.lock")).ok(), lock, "gdev's deno.lock changed");
-    let deno = std::fs::read(&deno_wasm).unwrap();
-    eprintln!("the plugin: {} bytes; Deno: {} bytes", wasm.len(), deno.len());
-    assert!(wasm == deno, "the plugin's module differs from Deno's");
 }

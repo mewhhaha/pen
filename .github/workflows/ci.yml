@@ -1,17 +1,5 @@
-# CI for pen, gdev's native runtime.
-#
-# What runs here needs only this repository: the build, clippy and the unit
-# and GPU tests (the GPU tests draw on Mesa's lavapipe, a software Vulkan
-# driver, since runners have no GPU), and the shippable player runtimes:
-# Linux for glibc 2.28 (every Steam Linux Runtime container, SteamOS) and Windows, both
-# cross-compiled with zig.
-#
-# The game itself lives in private sibling checkouts, ../gdev and ../blot2,
-# which this workflow cannot see by default. Tests that read the exported
-# bundle (dist/gdev) skip themselves without it. The `game` job runs the
-# golden images, engine conformance and a package only when the repository
-# variables GDEV_REPOSITORY and BLOT2_REPOSITORY (owner/name) are set, and
-# the secret CHECKOUTS_TOKEN can read both.
+# Native/browser verification and portable player builds.
+# The game job requires sibling checkout repository and revision variables.
 name: CI
 
 on:
@@ -46,6 +34,14 @@ jobs:
         run: cargo build --workspace --all-targets --features pen/steam
       - name: Build the player runtime (no compiler)
         run: cargo build -p pen --no-default-features --features steam
+      - name: Compiler component and tests
+        run: |
+          cargo build --manifest-path plugins/Cargo.toml --release --target wasm32-wasip2
+          cargo test --manifest-path plugins/Cargo.toml
+      - name: Browser host
+        run: |
+          sh crates/pen-web/build.sh
+          cargo clippy --manifest-path crates/pen-web/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
       - name: Clippy
         run: cargo clippy --workspace --all-targets --features pen/steam -- -D warnings
       - name: Clippy (player runtime)
@@ -55,11 +51,11 @@ jobs:
         # itself ask for the software one.
         env:
           PEN_SOFTWARE: "1"
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1
       - name: Renderer tests in release
         env:
           PEN_SOFTWARE: "1"
-        run: cargo test --release -p pen-render
+        run: cargo test --release -p pen-render -- --test-threads=1
 
   player:
     name: Player runtimes (Linux glibc 2.28, Windows)
@@ -104,7 +100,7 @@ jobs:
 
   game:
     name: Game tests (needs the gdev and blot2 checkouts)
-    if: ${{ vars.GDEV_REPOSITORY != '' && vars.BLOT2_REPOSITORY != '' }}
+    if: ${{ vars.GDEV_REPOSITORY != '' && vars.BLOT2_REPOSITORY != '' && vars.GDEV_REF != '' && vars.BLOT2_REF != '' && vars.INK_REPOSITORY != '' && vars.INK_REF != '' }}
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -117,13 +113,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ vars.GDEV_REPOSITORY }}
+          ref: ${{ vars.GDEV_REF }}
           token: ${{ secrets.CHECKOUTS_TOKEN }}
           path: gdev
       - uses: actions/checkout@v4
         with:
           repository: ${{ vars.BLOT2_REPOSITORY }}
+          ref: ${{ vars.BLOT2_REF }}
           token: ${{ secrets.CHECKOUTS_TOKEN }}
           path: blot2
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.INK_REPOSITORY }}
+          ref: ${{ vars.INK_REF }}
+          token: ${{ secrets.CHECKOUTS_TOKEN }}
+          path: ink
       - name: System libraries
         run: |
           sudo apt-get update
@@ -131,29 +135,57 @@ jobs:
             pkg-config cmake libasound2-dev libdbus-1-dev mesa-vulkan-drivers ffmpeg
       - name: Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
-      - uses: denoland/setup-deno@v2
+      - uses: mlugg/setup-zig@v2
         with:
-          deno-version: v2.x
+          version: ${{ env.ZIG_VERSION }}
       - uses: taiki-e/install-action@v2
         with:
           tool: just
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: pen
-      - name: Export the bundle (dist/gdev), then the tests that read it
+      - name: Native compiler and component
+        run: |
+          cd ../blot2/zig-native
+          zig build install compiler-identity -Doptimize=fast
+          mkdir -p ../generated/compiler
+          gzip -c zig-out/bin/blotc > ../generated/compiler/blotc.gz
+          cd ../../pen
+          just plugins
+      - name: Protocol freshness and game tests
         env:
           PEN_SOFTWARE: "1"
         run: |
+          cargo run -q -p pen-codegen -- --project ../gdev --rust crates/pen-protocol/src/packets.rs --check
           just export
-          cargo test --workspace
-      - name: Engine conformance (wasmtime against V8)
-        run: just conformance
-      - name: A package of the game
-        run: cargo run --release -q -p pen -- build --project ../gdev --out dist/package
+          cargo test --workspace -- --test-threads=1
+          just blot-tests
+          just determinism
+      - name: Native package and browser export
+        run: |
+          cargo run --release -q -p pen -- build --project ../gdev --out dist/package
+          cargo run --release -q -p pen -- build --web --project ../gdev --out dist/web
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+      - name: Headless browser prerequisites
+        run: |
+          npm install --global pnpm@latest
+          mkdir -p target/browser-tools
+          printf '{"private":true}\n' > target/browser-tools/package.json
+          pnpm --dir target/browser-tools add playwright-core@latest
+          pnpm --dir target/browser-tools exec playwright-core install --with-deps chromium
+      - name: Browser host and engine qualification
+        run: |
+          export PLAYWRIGHT_MODULE="$(pwd)/target/browser-tools/node_modules/playwright-core/index.mjs"
+          python3 -m http.server --bind 127.0.0.1 --directory dist/web 8044 > target/browser-server.log 2>&1 &
+          browser_server=$!
+          trap 'kill "$browser_server"' EXIT
+          PEN_FXAA_WITNESSES=dist/web/fxaa cargo test --release -p pen-render post::fxaa_tests -- --test-threads=1
+          PEN_FXAA_URL=http://127.0.0.1:8044/fxaa/ node crates/pen-web/tests/fxaa.mjs
+          cargo run --release -q -p pen -- packets target/browser-conformance --project ../gdev --script-file tests/conformance.steps
+          PEN_CONFORMANCE_URL=http://127.0.0.1:8044/qualification.html node crates/pen-web/tests/conformance.mjs
       - name: Golden images on lavapipe
-        # The goldens come from a desktop GPU; a software rasterizer may
-        # differ by more than the 1% the tests allow, so this only reports.
-        continue-on-error: true
         env:
           PEN_SOFTWARE: "1"
         run: just visual

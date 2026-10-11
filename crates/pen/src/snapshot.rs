@@ -2,56 +2,9 @@
 //! state's float32 lanes, all little-endian (gdev's `snapshot.ts`).
 use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
-use pen_protocol::boundary::{MAX_STATE_FLOATS, validate_schema, validate_state};
+use anyhow::{Context, Result};
 
-const MAGIC: &[u8; 8] = b"GDEVSAVE";
-pub const HEADER_BYTES: usize = 20;
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SavedState {
-    pub schema: u32,
-    pub state: Vec<f32>,
-}
-
-pub fn encode(saved: &SavedState) -> Result<Vec<u8>> {
-    validate_schema(saved.schema as f32)?;
-    validate_state(&saved.state)?;
-    let mut bytes = Vec::with_capacity(HEADER_BYTES + saved.state.len() * 4);
-    bytes.extend_from_slice(MAGIC);
-    bytes.extend_from_slice(&1u32.to_le_bytes());
-    bytes.extend_from_slice(&saved.schema.to_le_bytes());
-    bytes.extend_from_slice(&(saved.state.len() as u32).to_le_bytes());
-    for value in &saved.state {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    Ok(bytes)
-}
-
-pub fn decode(bytes: &[u8]) -> Result<SavedState> {
-    ensure!(
-        bytes.len() >= HEADER_BYTES
-            && bytes.len() <= HEADER_BYTES + MAX_STATE_FLOATS * 4
-            && bytes.starts_with(MAGIC),
-        "file is not a bounded gdev quicksave"
-    );
-    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-    let schema = word(12);
-    let length = word(16) as usize;
-    ensure!(
-        word(8) == 1 && bytes.len() == HEADER_BYTES + length * 4,
-        "invalid quicksave version or length"
-    );
-    validate_schema(schema as f32)?;
-    let state: Vec<f32> = bytes[HEADER_BYTES..]
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| f32::from_le_bytes(*chunk))
-        .collect();
-    validate_state(&state)?;
-    Ok(SavedState { schema, state })
-}
+pub use pen_runtime::snapshot::*;
 
 pub fn read(path: &Path) -> Result<SavedState> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;

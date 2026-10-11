@@ -1,8 +1,4 @@
-//! Building a checkout's programs through its Wasm plugins (`pen.json`,
-//! `pen-plugins`) instead of Deno: the game's `game.wasm` and the dev tools'
-//! `devtools.wasm`, written whole in one rename as the Deno build did, once
-//! or again as their sources change. What the plugins and the builds say
-//! goes to the log, so to stderr and the dev tools' console.
+//! Compile and watch checkout programs through Wasm components.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
@@ -54,7 +50,12 @@ pub fn describe(diagnostic: &Diagnostic, standing_in: Option<(&str, &str)>) -> S
             format!("{line}:{column}")
         })
         .unwrap_or_else(|| format!("@{}", diagnostic.start));
-    format!("{}:{place}: {}: {}", diagnostic.file, diagnostic.code, diagnostic.message)
+    let mut description = format!("{}:{place}: {}: {}", diagnostic.file, diagnostic.code, diagnostic.message);
+    if let Some(details) = &diagnostic.details {
+        description.push('\n');
+        description.push_str(details);
+    }
+    description
 }
 
 /// Says what a build of `what` came to, and writes its Wasm to `out`;

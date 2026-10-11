@@ -27,7 +27,7 @@ The runtime it ships is the **player runtime**: pen built without the
 `compiler` feature (`--no-default-features`), so without Cranelift. It only
 loads the `game.cwasm` its package was precompiled with, and is less than
 half the size of the development build (10.2 against 23.9 MB). Everything that compiles a checkout
-(`dev`, `run`, `build`, `test`, `parity`, `bench` and `packets` on a
+(`dev`, `run`, `build`, `test`, `bench` and `packets` on a
 checkout) refuses in it and says to use a full build.
 
 - `just player` builds it for Linux (below) and `just windows` for Windows,
@@ -188,10 +188,13 @@ themselves built against glibc 2.44; the player's system has its own
 builds. The window system (X11, Wayland, xkbcommon) and Vulkan are loaded
 at run time by winit and wgpu, not linked.
 
-Verified here: the `.2.31` and `.2.28` player runtimes, packaged with
-`pen build`, load their x86-64-v2 `game.cwasm` in 6 ms and play (headless,
-the same picture as the development build). Not verified: a real Steam
-Deck, the Steam Linux Runtime containers, Steam Input. gdev has no gamepad support, so on the Deck Steam Input's "Keyboard
+Verified here: the final `.2.28` player package loads its x86-64-v2 guest and
+renders headlessly on the host and installed soldier/sniper containers, with
+identical PNGs. Container-only library probes use glibc 2.31; GPU execution
+imports the host's graphics stack and glibc 2.44. The symbol requirement remains
+2.28, but an actual glibc 2.28 installation was not exercised. See
+[local qualification](qualification.md). A real Steam Deck and Steam Input
+were not verified. gdev has no gamepad support, so on the Deck Steam Input's "Keyboard
 (WASD) and Mouse" template is what makes it playable until it has.
 
 ### Windows
@@ -374,19 +377,14 @@ own name, so that it cannot collide with another game's `gdev`.
 
 ## CI
 
-`.github/workflows/ci.yml` runs what needs only this repository: the build,
-clippy (`-D warnings`, with and without the compiler) and the tests on
-Linux, with Mesa's lavapipe as the GPU, and the two player runtimes
-(`just player`, `just windows`) as artifacts. The game's checkouts are
-private siblings (`../gdev`, `../blot2`); its job (exporting `dist/gdev`,
-the tests that read it, engine conformance, a package, and golden images on
-lavapipe, which only report) runs when the repository variables
-`GDEV_REPOSITORY` and `BLOT2_REPOSITORY` name them and the secret
-`CHECKOUTS_TOKEN` can read both. There is no git remote yet, so the
-workflow has not run.
+The workflow builds native and browser hosts, runs strict Clippy and tests on
+Mesa lavapipe, and cross-builds Linux (glibc 2.28) and Windows players. The game
+job checks out sibling repositories at `GDEV_REF` and `BLOT2_REF`, builds blotc
+with Zig, checks out Ink at `INK_REF`, compiles the plugin, then runs the full Blot suite, deterministic
+replays, required golden images and packaging. `CHECKOUTS_TOKEN` grants access
+to private siblings.
 
-`--software` (or `PEN_SOFTWARE=1`) asks wgpu for a fallback adapter:
-lavapipe on Linux, WARP on Windows. Lavapipe is not installed on the
-development machine, so that mode is untested here: without it the run
-stops with `no software GPU adapter for PEN_SOFTWARE (on Linux: Mesa's
-lavapipe, in mesa-vulkan-drivers)`.
+Cross-compilation does not establish runtime compatibility. Only this Linux
+machine was available for completion: Windows, Steam Deck, live Steam, audible
+output and manual window checks still require those environments. The player
+runtime can be tested here headlessly without starting Steam.

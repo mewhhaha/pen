@@ -15,14 +15,14 @@ default = ["compiler", "devtools", "plugins"]
 # game needs it. Without it (`--no-default-features`) this is the player
 # runtime `pen build` ships: it only loads the game.cwasm the package was
 # precompiled with.
-compiler = ["blot-host/compiler"]
+compiler = ["blot-host/compiler", "dep:pen-codegen"]
 steam = ["dep:steamworks"]
 # The dev tools (`devtools`): the checkout's own Blot program for its
 # console and diagnostics, run beside the game in `pen dev` and `pen run`.
 # The player runtime leaves them out.
 devtools = []
 # Wasm plugins (`pen-plugins`, wit/pen-plugin.wit) the checkout's pen.json
-# chooses to build its programs, instead of Deno. They compile, so they need
+# chooses to build its programs. They compile, so they need
 # the compiler; the player runtime leaves them out.
 plugins = ["compiler", "dep:pen-plugins"]
 
@@ -30,7 +30,9 @@ plugins = ["compiler", "dep:pen-plugins"]
 anyhow.workspace = true
 blot-host.workspace = true
 pen-plugins = { workspace = true, optional = true }
+pen-codegen = { workspace = true, optional = true }
 pen-protocol.workspace = true
+pen-runtime.workspace = true
 pen-render.workspace = true
 wasmtime.workspace = true
 # The game's interface (and the dev overlay's) for assistive technology:
@@ -50,7 +52,7 @@ ogg = "0.9"
 opus-head-sys = { version = "0.3", default-features = false }
 pollster = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 steamworks = { version = "0.13", optional = true }
 wgpu.workspace = true
 winit = "0.30"

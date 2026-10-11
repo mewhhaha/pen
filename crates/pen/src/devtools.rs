@@ -11,7 +11,7 @@
 //! from the game: the keyboard while one of its nodes has the focus (its
 //! console's input), and the pointer and wheel over its dialogs. It asks the
 //! runtime for what it shows and does through the `devtools` service
-//! (gdev's `protocol/schema.ts`, DevtoolsOperation): the log, the last frame's
+//! (`protocol/schema.json`, DevtoolsOperation): the log, the last frame's
 //! numbers and the GPU's name, which it answers in its next frame, and game
 //! commands, time travel, input recordings, screenshots and tunables, which it
 //! carries out.
@@ -486,7 +486,7 @@ impl Devtools {
     }
 
     /// Writes the game's tuned values into the checkout as the defaults, on
-    /// a thread of its own (it runs Deno); the log says how it went.
+    /// a thread of its own (Rust number-token edits); the log says how it went.
     fn bake(&mut self, session: &mut Session) -> Answer {
         if self.baking.is_some() {
             return Answer::unavailable();
@@ -577,6 +577,44 @@ impl Devtools {
 }
 
 impl Overlay for Devtools {
+    fn script_event(&mut self, event: &GameEvent) -> bool {
+        match event {
+            GameEvent::KeyDown(_) | GameEvent::KeyUp(_) | GameEvent::FocusLost => {},
+            GameEvent::PointerMove { x, y } | GameEvent::PointerDown { x, y, .. }
+            | GameEvent::PointerUp { x, y, .. } | GameEvent::Wheel { x, y, .. } => {
+                self.pointer = (*x, *y);
+                let ui = self.frame.as_ref().map_or(&[][..], |frame| &frame.ui);
+                self.over = inside_dialog(ui, self.pointer);
+            }
+            _ => return true,
+        }
+        self.events.push(event.clone());
+        if matches!(event, GameEvent::KeyDown(key) | GameEvent::KeyUp(key) if key == "`") {
+            return false;
+        }
+        if self.runtime.is_none() {
+            return true;
+        }
+        let button_bit = |button: u32| match button { 0 => 1, 1 => 4, 2 => 2, 3 => 8, 4 => 16, _ => 32 };
+        match event {
+            GameEvent::KeyDown(_) | GameEvent::KeyUp(_) => !self.typing,
+            GameEvent::PointerMove { .. } => self.buttons != 0 || !self.over,
+            GameEvent::PointerDown { button, .. } => {
+                let game = self.buttons != 0 || !self.over;
+                if game {
+                    self.buttons |= button_bit(*button);
+                }
+                game
+            }
+            GameEvent::PointerUp { button, .. } => {
+                self.buttons &= !button_bit(*button);
+                true
+            }
+            GameEvent::Wheel { .. } => !self.over,
+            _ => true,
+        }
+    }
+
     fn window_event(&mut self, _window: &Window, event: &WindowEvent) -> bool {
         self.take(event);
         // The backquote key is the dev tools' alone, as in the browser.
@@ -638,7 +676,10 @@ impl Overlay for Devtools {
         // Typed into its console, opened first unless it has the keyboard or
         // is opening already.
         let opening = self.typed.iter().any(|typed| typed.first() == Some(&GameEvent::KeyDown("`".to_owned())));
-        self.typed.extend(typed_line(&line, self.typing || opening));
+        let console_focused = self.frame.as_ref().is_some_and(|frame| {
+            frame.ui.iter().any(|node| node.id == 0x1_0002 && node.focused)
+        });
+        self.typed.extend(typed_line(&line, console_focused || opening));
     }
 
     fn paint(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue, target: &wgpu::Texture) {

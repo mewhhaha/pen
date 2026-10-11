@@ -1,0 +1,793 @@
+use crate::model::*;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
+
+fn comment(text: Option<&str>) -> Vec<String> {
+    text.map(|text| {
+        wrap(text, 78)
+            .iter()
+            .map(|line| format!("// {line}"))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+fn count(record: &Value) -> String {
+    floats(record).to_lowercase()
+}
+fn bound_blot(value: &Value) -> String {
+    if value.is_object() {
+        return format!("protocol.{}", s(&value["limit"]).to_lowercase());
+    }
+    value.to_string()
+}
+fn chunk(lanes: &[String], width: usize) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut line = String::new();
+    for lane in lanes {
+        if !line.is_empty() && line.len() + 2 + lane.len() > width {
+            result.push(line);
+            line = String::new();
+        }
+        if !line.is_empty() {
+            line.push_str(", ");
+        }
+        line.push_str(lane);
+    }
+    if !line.is_empty() {
+        result.push(line);
+    }
+    result
+}
+fn encode(field: &Value, path: &str, local: &str) -> (Vec<String>, Vec<String>) {
+    let xyzw = ["x", "y", "z", "w"];
+    match kind(field) {
+        "f32" => (vec![], vec![path.to_owned()]),
+        "vector" => (
+            vec![],
+            array(&field["type"]["components"])
+                .iter()
+                .map(|component| format!("{path}.{}", s(component)))
+                .collect(),
+        ),
+        "matrix" => {
+            let columns: Vec<_> = xyzw
+                .iter()
+                .map(|column| format!("{local}_{column}"))
+                .collect();
+            let bindings = xyzw
+                .iter()
+                .zip(&columns)
+                .map(|(column, local)| format!("{column}: {local}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                vec![format!("let #types.Mat4 {{ {bindings} }} = {path}")],
+                columns
+                    .iter()
+                    .flat_map(|column| xyzw.iter().map(move |row| format!("{column}.{row}")))
+                    .collect(),
+            )
+        }
+        "lanes" => (
+            vec![],
+            xyzw.iter()
+                .map(|component| format!("{path}.{component}"))
+                .collect(),
+        ),
+        "count" | "reference" | "choice" | "present" => (vec![], vec![format!("from {path}")]),
+        "flag" => (vec![], vec![format!("lanes.bit {path}")]),
+        "optional" => {
+            let mut lanes = vec![format!("{local}_count")];
+            lanes.extend(xyzw.iter().map(|component| format!("{local}.{component}")));
+            (
+                vec![
+                    format!("let ({local}_count, {local}) = case {path} of"),
+                    "  #Some value => (4.0, value)".to_owned(),
+                    "  #Nothing => (0.0, types.zero4)".to_owned(),
+                ],
+                lanes,
+            )
+        }
+        "children" => (vec![], vec![format!("from {path}.length")]),
+        "tail" => (
+            vec![],
+            vec![format!(
+                "from (min {path}.length {})",
+                bound_blot(&field["max"])
+            )],
+        ),
+        _ => unreachable!(),
+    }
+}
+fn field_path(variable: &str, laid: &Laid) -> String {
+    format!("{variable}.{}", laid.name)
+}
+fn record(layout: &Layout) -> Vec<String> {
+    let name = s(&layout.record["name"]);
+    let variable = singular(&snake(name));
+    let about = match layout.record["doc"].as_str() {
+        Some(doc) => format!("{name}: {doc}"),
+        None => format!("A {name}'s lanes."),
+    };
+    let mut out = comment(Some(&about));
+    out.push(format!(
+        "const {} = fn ({variable}: types.{name}) => do:",
+        encoder(&layout.record)
+    ));
+    let mut lets = Vec::new();
+    let mut lanes = Vec::new();
+    for laid in &layout.fields {
+        let (local, values) = encode(&laid.field, &field_path(&variable, laid), &laid.name);
+        lets.extend(local);
+        lanes.extend(values);
+    }
+    out.extend(lets.iter().map(|line| format!("  {line}")));
+    out.push("  return #[".to_owned());
+    out.extend(chunk(&lanes, 76).iter().map(|line| format!("    {line},")));
+    out.push("  ]".to_owned());
+    out
+}
+fn constants(model: &Model) -> Vec<String> {
+    let mut out = vec!["// Limits.".to_owned()];
+    for limit in array(&model.protocol["limits"]) {
+        out.extend(comment(limit["doc"].as_str()));
+        out.push(format!(
+            "const {} = {}",
+            s(&limit["limit"]).to_lowercase(),
+            limit["value"]
+        ));
+    }
+    for enumeration in array(&model.protocol["enumerations"]) {
+        out.push(String::new());
+        out.extend(comment(enumeration["doc"].as_str()));
+        for (code, value) in array(&enumeration["values"]).iter().enumerate() {
+            out.push(format!(
+                "const {}_{} = {code}",
+                s(&enumeration["constant"]).to_lowercase(),
+                s(value)
+            ));
+        }
+    }
+    out.extend([
+        String::new(),
+        "// Sizes in lanes.".to_owned(),
+        format!("const packet_magic = {}.0", model.magic),
+        format!("const packet_header_floats = {}", model.header_lanes),
+        "const frame_header_floats = 5".to_owned(),
+        format!("const event_floats = {}", model.event_lanes()),
+    ]);
+    let mut seen = HashSet::new();
+    for entry in &model.sections {
+        let mut values = Vec::new();
+        if let Some(layout) = &entry.fixed {
+            values.push((count(&layout.record), layout.lanes));
+        }
+        if kind(&entry.section) == "variable" {
+            values.push((count(&entry.section["record"]), entry.head_lanes));
+        }
+        if let Some(layout) = &entry.item {
+            values.push((count(&layout.record), layout.lanes));
+        }
+        if kind(&entry.section) == "lanes"
+            && let Some(constant) = entry.section["constant"].as_str()
+        {
+            values.push((
+                format!("{}_floats", constant.to_lowercase()),
+                n(&entry.section["max"]),
+            ));
+        }
+        for (name, value) in values {
+            if seen.insert(name.clone()) {
+                out.push(format!("const {name} = {value}"));
+            }
+        }
+    }
+    out.extend([
+        String::new(),
+        "// Where each header lane and record field starts.".to_owned(),
+    ]);
+    for entry in &model.header {
+        out.push(format!(
+            "const header_{}_lane = {}",
+            entry.key.replace('.', "_"),
+            entry.laid.offset
+        ));
+    }
+    for layout in &model.records {
+        for field in &layout.fields {
+            out.push(format!(
+                "const {}_{}_lane = {}",
+                snake(s(&layout.record["name"])),
+                field.name,
+                field.offset
+            ));
+        }
+    }
+    for entry in &model.sections {
+        if kind(&entry.section) != "variable" {
+            continue;
+        }
+        let name = snake(s(&entry.section["record"]["name"]));
+        for field in &entry.head {
+            out.push(format!(
+                "const {name}_{}_lane = {}",
+                field.name, field.offset
+            ));
+        }
+        let rest = &entry.section["record"]["rest"];
+        if kind(rest) == "repeat" {
+            out.push(format!(
+                "const {name}_{}_lane = {}",
+                s(&rest["name"]),
+                entry.head_lanes - 1
+            ));
+        }
+    }
+    out.extend([String::new(), "// Each event's tag.".to_owned()]);
+    for event in model.events() {
+        out.push(format!(
+            "const {}_tag = {}",
+            snake(s(&event["name"])),
+            event["tag"]
+        ));
+    }
+    out
+}
+fn input(model: &Model) -> Vec<String> {
+    let input = &model.protocol["input"];
+    let input_lanes = array(&input["lanes"]);
+    let mut out = comment(Some("The events the host sends, as their lanes hold them."));
+    out.push("type Event is data =".to_owned());
+    let wire_type = |field: &Value| -> &str {
+        if field["wire"] == "f32" {
+            return "F32";
+        }
+        "U32"
+    };
+    for event in model.events() {
+        let name = s(&event["name"]);
+        let fields = event_fields(event);
+        if !event["value"].is_null() {
+            out.push(format!("  | #{name} {}", wire_type(&event["value"])));
+        } else if !fields.is_empty() {
+            out.push(format!(
+                "  | #{name} {{ {} }}",
+                fields
+                    .iter()
+                    .map(|(name, field)| format!("{name}: {}", wire_type(field)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        } else {
+            out.push(format!("  | #{name}"));
+        }
+    }
+    out.extend([String::new(), "type Input is data = #Input { elapsed: F32, width: F32, height: F32, events: Array Event, state: Array F32 }".to_owned(), String::new()]);
+    out.extend(comment(Some(&format!("An event's lanes from `start`: its tag, then {}. The {} lane holds a whole number; lanes an event does not use are zero.", input_lanes.iter().map(s).collect::<Vec<_>>().join(", "), s(&input_lanes[0])))));
+    out.push("const decode_event = fn (values: Array F32) => fn (start: U32) => do:".to_owned());
+    out.push(format!(
+        "  let tag = lanes.integer values[start] {}",
+        model
+            .events()
+            .iter()
+            .map(|event| n(&event["tag"]))
+            .max()
+            .unwrap()
+    ));
+    for (index, lane) in input_lanes.iter().enumerate() {
+        if index == 0 {
+            out.push(format!(
+                "  let {} = lanes.integer values[start + 1] lanes.max_integer",
+                s(lane)
+            ));
+        } else {
+            out.push(format!("  let {} = values[start + {}]", s(lane), index + 1));
+        }
+    }
+    out.push("  return case tag of".to_owned());
+    for event in model.events() {
+        let fields = event_fields(event);
+        let name = s(&event["name"]);
+        out.push(format!("    {} => do:", event["tag"]));
+        for (index, lane) in input_lanes.iter().enumerate() {
+            if let Some((_, field)) = fields.iter().find(|(_, field)| &field["lane"] == lane) {
+                if !field["max"].is_null() && field["wire"] != "f32" {
+                    out.push(format!(
+                        "      use lanes.require ({} <= {})",
+                        s(lane),
+                        field["max"]
+                    ));
+                }
+            } else {
+                let mut zero = "0.0";
+                if index == 0 {
+                    zero = "0";
+                }
+                out.push(format!("      use lanes.require ({} == {zero})", s(lane)));
+            }
+        }
+        let value = |field: &Value| -> String {
+            if field["wire"] != "f32" && field["lane"] != input_lanes[0] {
+                return format!("lanes.integer {} lanes.max_integer", s(&field["lane"]));
+            }
+            s(&field["lane"]).to_owned()
+        };
+        if !event["value"].is_null() {
+            out.push(format!("      return #{name} {}", value(&event["value"])));
+        } else if !fields.is_empty() {
+            let fields = fields
+                .iter()
+                .map(|(name, field)| {
+                    let lane = value(field);
+                    if lane == *name {
+                        return lane;
+                    }
+                    format!("{name}: {lane}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!("      return #{name} {{ {fields} }}"));
+        } else {
+            out.push(format!("      return #{name}"));
+        }
+    }
+    out.push(format!(
+        "    _ => @panic {}",
+        quote(&input["messages"]["tag"])
+    ));
+    out.push(String::new());
+    out.extend(comment(Some("The input packet: the seconds since the last frame, the viewport's width and height, the event and state counts, the events and the state. Anything else traps.")));
+    out.extend("const decode_input = fn (values: Array F32) => do:\n  use lanes.require (values.length >= frame_header_floats)\n  use lanes.finite values\n  let elapsed = values[0]\n  use lanes.require (elapsed >= 0.0)\n  let width = values[1]\n  let height = values[2]\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)".lines().map(str::to_owned));
+    out.push(format!(
+        "  let event_count = lanes.integer values[3] {}",
+        s(&input["maxEvents"]["limit"]).to_lowercase()
+    ));
+    out.push(format!(
+        "  let state_count = lanes.integer values[4] {}",
+        s(&model.protocol["state"]["max"]["limit"]).to_lowercase()
+    ));
+    out.extend("  let state_start = frame_header_floats + event_count * event_floats\n  use lanes.require (values.length == state_start + state_count)\n  return #Input {\n    state: array.slice state_start state_count values,\n    elapsed, width, height,\n    events: array.generate event_count (fn index => decode_event values (frame_header_floats + index * event_floats)),\n  }".lines().map(str::to_owned));
+    out
+}
+fn render(model: &Model) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut emitted = HashSet::new();
+    for entry in &model.sections {
+        if let Some(layout) = &entry.fixed
+            && emitted.insert(s(&layout.record["name"]))
+        {
+            out.push(String::new());
+            out.extend(record(layout));
+        }
+        if kind(&entry.section) != "variable" {
+            continue;
+        }
+        let record = &entry.section["record"];
+        let rest = &record["rest"];
+        let name = singular(&snake(s(&record["name"])));
+        let rest_name = s(&rest["name"]);
+        out.push(String::new());
+        if kind(rest) == "values" {
+            let mut lets = Vec::new();
+            let mut lanes = Vec::new();
+            for laid in &entry.head {
+                let (local, values) = encode(&laid.field, &field_path(&name, laid), &laid.name);
+                lets.extend(local);
+                lanes.extend(values);
+            }
+            out.extend(comment(Some(&format!(
+                "{}: its {}, then its {rest_name}.",
+                s(&record["name"]),
+                entry
+                    .head
+                    .iter()
+                    .map(|field| field.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))));
+            out.push(format!(
+                "const {} = fn ({name}: types.{}) => do:",
+                encoder(record),
+                s(&record["name"])
+            ));
+            out.extend(lets.iter().map(|line| format!("  {line}")));
+            out.push("  return array.concat #[".to_owned());
+            out.extend(chunk(&lanes, 76).iter().map(|line| format!("    {line},")));
+            out.push(format!("  ] {name}.{rest_name}"));
+        } else {
+            let item = entry.item.as_ref().unwrap();
+            let item_name = singular(rest_name);
+            let mut lines = Vec::new();
+            let mut lane = 0;
+            for laid in &entry.head {
+                let (local, values) = encode(&laid.field, &field_path(&name, laid), &laid.name);
+                lines.extend(local);
+                for value in values {
+                    lines.push(format!("encoded[{lane}] := {value}"));
+                    lane += 1;
+                }
+            }
+            lines.push(format!("encoded[{lane}] := from {rest_name}.length"));
+            let mut writes = Vec::new();
+            let mut offset = 0;
+            for laid in &item.fields {
+                let (local, values) =
+                    encode(&laid.field, &field_path(&item_name, laid), &laid.name);
+                writes.extend(local);
+                for value in values {
+                    let mut index = "start".to_owned();
+                    if offset != 0 {
+                        index = format!("start + {offset}");
+                    }
+                    writes.push(format!("encoded[{index}] := {value}"));
+                    offset += 1;
+                }
+            }
+            let mut head = String::new();
+            if !entry.head.is_empty() {
+                head = format!(
+                    "its {}, ",
+                    entry
+                        .head
+                        .iter()
+                        .map(|field| field.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            out.extend(comment(Some(&format!(
+                "{}: {head}its {rest_name}' count, then each of them.",
+                s(&record["name"])
+            ))));
+            out.push(format!(
+                "const {} = fn ({name}: types.{}) => do:",
+                encoder(record),
+                s(&record["name"])
+            ));
+            out.push(format!("  let {rest_name} = {name}.{rest_name}"));
+            out.push(format!(
+                "  let encoded = @array.fill (protocol.{} + {rest_name}.length * protocol.{}) 0.0",
+                count(record),
+                count(&item.record)
+            ));
+            out.extend(lines.iter().map(|line| format!("  {line}")));
+            out.push(format!("  for index in 0 .. {rest_name}.length:"));
+            out.push(format!("    let {item_name} = {rest_name}[index]"));
+            out.push(format!(
+                "    let start = protocol.{} + index * protocol.{}",
+                count(record),
+                count(&item.record)
+            ));
+            out.extend(writes.iter().map(|line| format!("    {line}")));
+            out.push("  return encoded".to_owned());
+        }
+    }
+    let mut tail_encoders = HashMap::new();
+    for (_, owners) in &model.tails {
+        for owner in owners {
+            let key = format!("{}.{}", s(&owner.layout.record["name"]), owner.field.name);
+            if tail_encoders.contains_key(&key) {
+                continue;
+            }
+            let name = format!(
+                "encode_{}_{}",
+                snake(s(&owner.layout.record["name"])),
+                owner.field.name
+            );
+            tail_encoders.insert(key, name.clone());
+            let variable = singular(&snake(s(&owner.layout.record["name"])));
+            let path = field_path(&variable, &owner.field);
+            let max = bound_blot(&owner.field.field["max"]);
+            out.push(String::new());
+            out.extend(comment(Some(&format!(
+                "A {}'s {}, at most {max} of them, for the packet's last section.",
+                s(&owner.layout.record["name"]),
+                owner.field.name
+            ))));
+            out.push(format!(
+                "const {name} = fn ({variable}: types.{}) => do:",
+                s(&owner.layout.record["name"])
+            ));
+            out.push(format!("  let kept = min {path}.length {max}"));
+            out.push(format!("  return #[lane | index <- array.generate kept identity, lane <- vec4_lanes {path}[index]]"));
+        }
+    }
+    if !tail_encoders.is_empty() {
+        out.extend([
+            String::new(),
+            "const vec4_lanes = fn (v: types.Vec4) => #[v.x, v.y, v.z, v.w]".to_owned(),
+        ]);
+    }
+    let section_names = model
+        .sections
+        .iter()
+        .filter(|entry| kind(&entry.section) != "trailing" && entry.owner.is_none())
+        .map(|entry| s(&entry.section["name"]))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push(String::new());
+    out.extend(comment(Some(&format!("The render packet from `packet`, a record of the header's values by their names in protocol/schema.json (grouped ones in a record of their group: `quality.msaa`), and of the sections: {section_names}. Its records use Pen's wire types."))));
+    out.push("const encode_render = fn (packet: types.RenderFrame) => do:".to_owned());
+    let mut sections = HashMap::new();
+    let mut lengths = HashMap::new();
+    for entry in &model.sections {
+        let section = &entry.section;
+        let name = s(&section["name"]);
+        if kind(section) == "trailing" {
+            continue;
+        }
+        if let Some((owner_section, owner_field)) = &entry.owner {
+            out.push(format!(
+                "  let {name} = array.flatten #[{}.{} | {} <- packet.{owner_section}]",
+                singular(owner_section),
+                owner_field,
+                singular(owner_section)
+            ));
+            sections.insert(name, name.to_owned());
+            continue;
+        }
+        sections.insert(name, format!("packet.{name}"));
+        if kind(section) == "variable" {
+            out.push(format!(
+                "  let {name}_encoded = #[{} {} | {} <- packet.{name}]",
+                encoder(&section["record"]),
+                singular(name),
+                singular(name)
+            ));
+            out.push(format!("  let {name}_lanes = array.fold_left (fn total => fn record => total + record.length) 0 {name}_encoded"));
+            lengths.insert(name, format!("{name}_lanes"));
+        }
+    }
+    let mut lets = Vec::new();
+    let mut header = Vec::new();
+    for entry in &model.header {
+        let lane = &entry.laid.field;
+        match kind(lane) {
+            "magic" => header.push("protocol.packet_magic".to_owned()),
+            "schema" => header.push("from packet.schema".to_owned()),
+            "size" => {
+                let name = s(&lane["section"]);
+                let mut value = format!("{}.length", sections[name]);
+                if lane["of"] == "lanes"
+                    && let Some(length) = lengths.get(name)
+                {
+                    value.clone_from(length);
+                }
+                header.push(format!("from {value}"));
+            }
+            _ => {
+                let mut group = String::new();
+                if let Some(name) = &entry.group {
+                    group = format!("{name}.");
+                }
+                let path = format!("packet.{group}{}", entry.laid.name);
+                let (local, values) = encode(lane, &path, &entry.key.replace('.', "_"));
+                lets.extend(local);
+                header.extend(values);
+            }
+        }
+    }
+    out.extend(lets.iter().map(|line| format!("  {line}")));
+    out.extend(["  return array.flatten #[".to_owned(), "    #[".to_owned()]);
+    out.extend(
+        chunk(&header, 72)
+            .iter()
+            .map(|line| format!("      {line},")),
+    );
+    out.push("    ],".to_owned());
+    let mut chunks = Vec::new();
+    for entry in &model.sections {
+        let section = &entry.section;
+        let name = s(&section["name"]);
+        match kind(section) {
+            "lanes" => chunks.push(format!("#[packet.{name}]")),
+            "records" => {
+                let item = singular(name);
+                chunks.push(format!(
+                    "#[{} {item} | {item} <- {}]",
+                    encoder(&section["record"]),
+                    sections[name]
+                ));
+            }
+            "variable" => chunks.push(format!("{name}_encoded")),
+            _ => {
+                if let Some((_, owners)) = model.tails.iter().find(|(section, _)| section == name) {
+                    for owner in owners {
+                        let item = singular(&owner.section);
+                        chunks.push(format!(
+                            "#[{} {item} | {item} <- {}]",
+                            tail_encoders[&format!(
+                                "{}.{}",
+                                s(&owner.layout.record["name"]),
+                                owner.field.name
+                            )],
+                            sections[owner.section.as_str()]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out.push("    ...array.flatten #[".to_owned());
+    out.extend(chunks.iter().map(|line| format!("      {line},")));
+    out.extend(["    ],".to_owned(), "  ]".to_owned()]);
+    out
+}
+fn field_type(model: &Model, field: &Value) -> String {
+    match kind(field) {
+        "f32" => "F32".to_owned(),
+        "count" | "reference" | "choice" | "present" | "schema" => "U32".to_owned(),
+        "flag" => "Bool".to_owned(),
+        "vector" => s(&field["type"]["name"]).to_owned(),
+        "matrix" => "Mat4".to_owned(),
+        "lanes" => "Vec4".to_owned(),
+        "optional" => "Maybe Vec4".to_owned(),
+        "tail" => "Array Vec4".to_owned(),
+        "children" => format!(
+            "Array {}",
+            s(&model.section(s(&field["section"])).section["record"]["name"])
+        ),
+        _ => unreachable!(),
+    }
+}
+
+fn structure(out: &mut Vec<String>, name: &str, fields: Vec<String>) {
+    out.push(String::new());
+    out.push(format!("type {name} is data = #{name} {{"));
+    out.extend(fields.into_iter().map(|field| format!("  {field},")));
+    out.push("}".to_owned());
+}
+
+fn member(model: &Model, laid: &Laid) -> String {
+    format!("{}: {}", laid.name, field_type(model, &laid.field))
+}
+
+fn types(model: &Model) -> Vec<String> {
+    let mut out = vec![
+        "// Wire records. Mat4 stores four columns; vectors follow schema lane order.".to_owned(),
+        "type Vec4 is data = #Vec4 { x: F32, y: F32, z: F32, w: F32 }".to_owned(),
+        "type Mat4 is data = #Mat4 { x: Vec4, y: Vec4, z: Vec4, w: Vec4 }".to_owned(),
+        "const zero4 = #Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 0.0 }".to_owned(),
+    ];
+    for vector in array(&model.protocol["vectors"]) {
+        structure(
+            &mut out,
+            s(&vector["name"]),
+            array(&vector["components"])
+                .iter()
+                .map(|component| format!("{}: F32", s(component)))
+                .collect(),
+        );
+    }
+    for layout in &model.records {
+        structure(
+            &mut out,
+            s(&layout.record["name"]),
+            layout
+                .fields
+                .iter()
+                .map(|laid| member(model, laid))
+                .collect(),
+        );
+    }
+    for entry in &model.sections {
+        if kind(&entry.section) != "variable" {
+            continue;
+        }
+        let record = &entry.section["record"];
+        let rest = &record["rest"];
+        let mut fields: Vec<_> = entry.head.iter().map(|laid| member(model, laid)).collect();
+        let mut ty = "F32";
+        if kind(rest) == "repeat" {
+            ty = s(&rest["record"]["name"]);
+        }
+        fields.push(format!("{}: Array {ty}", s(&rest["name"])));
+        structure(&mut out, s(&record["name"]), fields);
+    }
+    for (group, value) in object(&model.protocol["render"]["groups"]) {
+        structure(
+            &mut out,
+            s(&value["type"]),
+            model
+                .header
+                .iter()
+                .filter(|entry| entry.group.as_ref() == Some(group))
+                .map(|entry| member(model, &entry.laid))
+                .collect(),
+        );
+    }
+    let mut fields = Vec::new();
+    let mut groups = HashSet::new();
+    for entry in &model.header {
+        if matches!(kind(&entry.laid.field), "magic" | "size") {
+            continue;
+        }
+        if let Some(group) = &entry.group {
+            if groups.insert(group) {
+                fields.push(format!(
+                    "{group}: {}",
+                    s(&model.protocol["render"]["groups"][group]["type"])
+                ));
+            }
+        } else {
+            fields.push(member(model, &entry.laid));
+        }
+    }
+    for entry in &model.sections {
+        if kind(&entry.section) == "trailing" || entry.owner.is_some() {
+            continue;
+        }
+        let mut ty = "F32";
+        if kind(&entry.section) != "lanes" {
+            ty = s(&entry.section["record"]["name"]);
+        }
+        fields.push(format!("{}: Array {ty}", s(&entry.section["name"])));
+    }
+    structure(&mut out, "RenderFrame", fields);
+    out
+}
+
+const NUMERIC: &str = r#"import * as array from "std/array"
+
+const max_integer = 16777215
+
+const require = fn (condition: Bool) => do:
+  if condition:
+    return ()
+  return @panic "invalid Pen numeric packet"
+
+const finite = fn (values: Array F32) => require (array.all is_finite values)
+
+const integer = fn (value: F32) => fn (maximum: U32) => do:
+  let number = F32.to_u32 value
+  use require (value == U32.to_f32 number)
+  use require (number <= maximum)
+  return number
+
+const bit = fn (value: Bool) => do:
+  if value:
+    return 1.0
+  return 0.0"#;
+
+pub fn emit(model: &Model, header: &str) -> Vec<(&'static str, String)> {
+    let top: Vec<_> = header.lines().map(|line| format!("// {line}")).collect();
+    let mut protocol = top.clone();
+    protocol.extend(
+        r#"//
+// Packet limits, offsets and input decoding.
+import * as array from "std/array"
+import * as lanes from "./lanes"
+"#
+        .split('\n')
+        .map(str::to_owned),
+    );
+    protocol.extend(constants(model));
+    protocol.push(String::new());
+    protocol.extend(input(model));
+    protocol.push(String::new());
+    let mut render_source = top.clone();
+    render_source.extend(
+        r#"//
+// Encode Pen wire records without application dependencies.
+import * as array from "std/array"
+import * as lanes from "./lanes"
+import * as protocol from "./protocol"
+import * as types from "./types""#
+            .lines()
+            .map(str::to_owned),
+    );
+    render_source.extend(render(model));
+    render_source.push(String::new());
+    let mut wire_types = top.clone();
+    wire_types.extend(types(model));
+    wire_types.push(String::new());
+    let mut numeric = top;
+    numeric.extend(NUMERIC.lines().map(str::to_owned));
+    numeric.push(String::new());
+    vec![
+        ("protocol.blot", protocol.join("\n")),
+        ("protocol_render.blot", render_source.join("\n")),
+        ("types.blot", wire_types.join("\n")),
+        ("lanes.blot", numeric.join("\n")),
+    ]
+}

@@ -1,7 +1,7 @@
 //! Development reloads: watches the game's compiled program and its asset
-//! directory. A new `game.wasm` (which `scripts/blot_build.ts` writes after
-//! each Blot change) compiles on a background thread and then replaces the
-//! running build with its state carried over; changed assets reload in the
+//! directory. A new `game.wasm` produced after each Blot change compiles on a
+//! background thread and then replaces the running build with its state
+//! carried over; changed assets reload in the
 //! renderer and audio.
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

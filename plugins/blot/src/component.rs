@@ -79,6 +79,7 @@ impl GuestSession for Compiler {
                         start: diagnostic.start,
                         end: diagnostic.end,
                         message: diagnostic.message,
+                        details: diagnostic.details,
                     })
                     .collect(),
             ),
@@ -88,14 +89,8 @@ impl GuestSession for Compiler {
     fn watched(&self) -> Vec<String> {
         self.0.borrow().watched().to_vec()
     }
-}
 
-impl Drop for Compiler {
-    /// Closes the compiler, which saves its restart cache, so that the next
-    /// session starts from this one's work.
-    fn drop(&mut self) {
-        if let Err(error) = self.0.get_mut().close() {
-            log::write(Level::Error, &format!("closing the Blot compiler: {error}"));
-        }
+    fn close(&self) -> Result<(), String> {
+        self.0.borrow_mut().close()
     }
 }

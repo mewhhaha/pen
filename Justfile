@@ -1,99 +1,83 @@
-# The gdev checkout the recipes work on (override with `just gdev=PATH ...`).
+# Override with `just gdev=PATH ...`.
 gdev := "../gdev"
-# The runtime, built with `cargo build --release` (`just install` puts a
-# Steam-enabled one on PATH as `pen`).
 pen := "cargo run --release -q -p pen --"
 
-# Build the runtime with Steam and install it as ~/.local/bin/pen, beside
-# the Steam library it links against and its Wasm plugins (plugins/<name>.wasm,
-# the names a checkout's pen.json uses). Each file is copied beside its old one
-# and renamed over it, so a pen still running keeps the files it started with.
-# Installs the Steam-enabled runtime as ~/.local/bin/pen.
-install: plugins
+# Install the native CLI, compiler component and browser host.
+install: plugins web-host
   cargo build --release -p pen --features steam
-  mkdir -p ~/.local/lib/pen-runtime/plugins
+  mkdir -p ~/.local/lib/pen-runtime/plugins ~/.local/lib/pen-runtime/web
   cp target/release/pen ~/.local/lib/pen-runtime/pen.new
   mv -f ~/.local/lib/pen-runtime/pen.new ~/.local/lib/pen-runtime/pen
   cp "$(ls -t target/release/build/steamworks-sys-*/out/libsteam_api.so | head -1)" ~/.local/lib/pen-runtime/libsteam_api.so.new
   mv -f ~/.local/lib/pen-runtime/libsteam_api.so.new ~/.local/lib/pen-runtime/libsteam_api.so
-  for wasm in plugins/target/wasm32-wasip2/release/pen_plugin_*.wasm; do \
-    name=$(basename "$wasm" .wasm | sed 's/^pen_plugin_//; s/_/-/g'); \
-    cp "$wasm" ~/.local/lib/pen-runtime/plugins/$name.wasm.new; \
-    mv -f ~/.local/lib/pen-runtime/plugins/$name.wasm.new ~/.local/lib/pen-runtime/plugins/$name.wasm; \
-  done
+  cp plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm ~/.local/lib/pen-runtime/plugins/blot.wasm.new
+  mv -f ~/.local/lib/pen-runtime/plugins/blot.wasm.new ~/.local/lib/pen-runtime/plugins/blot.wasm
+  cp crates/pen-web/pkg/{pen_web.js,pen_web_bg.wasm,guest.js,index.html} ~/.local/lib/pen-runtime/web/
+  cp LICENSE THIRD_PARTY_NOTICES.md ~/.local/lib/pen-runtime/
   ln -sf ~/.local/lib/pen-runtime/pen ~/.local/bin/pen
-  @echo "installed: pen dev | web | run | build | test | test-blot | parity | bench | packets (in a gdev checkout)"
 
-# pen's Wasm plugins (plugins/, wit/pen-plugin.wit) as components, into
-# plugins/target/wasm32-wasip2/release, where a pen built here finds them.
-# Builds the Wasm plugins.
 plugins:
   cd plugins && cargo build --release --target wasm32-wasip2
 
-# The plugins' own tests, natively.
-# Tests the Wasm plugins.
 plugin-tests:
   cd plugins && cargo test
 
-# Develop natively: Blot, shader and asset edits reload into the running
-# game with its state kept (`just dev --mute`, ...).
-# Develops natively with hot reload.
+web-host:
+  sh crates/pen-web/build.sh
+
 dev *args:
   {{pen}} dev --project {{gdev}} {{args}}
 
-# Develop in the browser: gdev's own hot-reloading web build.
-web:
-  cd {{gdev}} && just web
+web *args:
+  {{pen}} web --project {{gdev}} {{args}}
 
-# Compile once and play natively.
 run *args:
   {{pen}} run --project {{gdev}} {{args}}
 
-# Run headless: `just headless --frames 300 --record out.mp4`, or with a --script.
 headless *args:
   {{pen}} run --project {{gdev}} --headless {{args}}
 
-# A shippable folder in dist/package; with Steam from `just install`'s build.
 package:
   {{pen}} build --project {{gdev}} --out dist/package
 
-# Guest time per frame on wasmtime, and the same frames on V8 for comparison.
 bench:
   {{pen}} bench --project {{gdev}} --frames 600
-  deno run -A --no-lock --config {{gdev}}/deno.json tools/bench_v8.ts {{gdev}} 600
 
-# Golden-image tests (tests/visual): `just visual --update` accepts what the
-# scenarios show now; `just visual --only menu` runs one.
-# Golden-image tests; `--update` accepts what they show now.
 visual *args:
   {{pen}} test --project {{gdev}} tests/visual/scenarios.json {{args}}
 
-# The checkout's Blot tests (its tests/*.blot), compiled and run on wasmtime:
-# `just blot-tests tests/hand_salt.blot` runs one module, `--filter TEXT`
-# the tests whose names hold TEXT.
-# The checkout's Blot tests.
 blot-tests *args:
   {{pen}} test-blot --project {{gdev}} {{args}}
 
-# The native renderer against the checkout's renderer.ts on the same frames.
-parity *args:
-  {{pen}} parity --project {{gdev}} {{args}}
+# Cache browser tools outside the source tree; an existing module can be supplied.
+[private]
+browser-tools:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ -n "${PLAYWRIGHT_MODULE:-}" ]; then exit 0; fi
+  if [ ! -f target/browser-tools/node_modules/playwright-core/index.mjs ]; then
+    mkdir -p target/browser-tools
+    printf '{"private":true}\n' > target/browser-tools/package.json
+    pnpm --dir target/browser-tools add playwright-core@latest
+  fi
+  pnpm --dir target/browser-tools exec playwright-core install chromium
 
-# Engine conformance: the same scripted input on wasmtime and on V8 (Deno)
-# must give bit-identical render packets.
-# Wasmtime and V8 give bit-identical packets on the same input.
-conformance:
-  {{pen}} packets dist/conformance --project {{gdev}} --script-file tests/conformance.steps
-  deno run -A --no-lock --config {{gdev}}/deno.json tools/conformance_v8.ts {{gdev}} dist/conformance
+conformance: browser-tools
+  #!/usr/bin/env bash
+  set -euo pipefail
+  {{pen}} build --web --project {{gdev}} --out dist/web
+  {{pen}} packets target/browser-conformance --project {{gdev}} --script-file tests/conformance.steps
+  export PLAYWRIGHT_MODULE="${PLAYWRIGHT_MODULE:-$PWD/target/browser-tools/node_modules/playwright-core/index.mjs}"
+  browser_port=${PEN_CONFORMANCE_PORT:-8046}
+  python3 -m http.server --bind 127.0.0.1 --directory dist/web "$browser_port" > target/browser-server.log 2>&1 &
+  browser_server=$!
+  trap 'kill "$browser_server"' EXIT
+  PEN_CONFORMANCE_URL="http://127.0.0.1:$browser_port/qualification.html" node crates/pen-web/tests/conformance.mjs
 
-# The asset bundle some renderer tests and examples read (dist/gdev).
+# Game/scene/assets consumed by protocol, renderer and determinism tests.
 export:
-  deno run -A --no-lock --config {{gdev}}/deno.json tools/export_gdev.ts {{gdev}} dist/gdev
+  {{pen}} export --project {{gdev}} --out dist/gdev
 
-# The packets pen-protocol's real-packet test and the render_packet example
-# read: dist/packets holds NNNN.f32 and schema.txt (the assets in dist/gdev),
-# the first 120 frames of a headless run.
-# Writes dist/packets, the real packets the protocol tests read.
 packets: export
   {{pen}} packets dist/packets-run --project {{gdev}} --frames 120
   rm -rf dist/packets && mkdir -p dist/packets
@@ -101,26 +85,19 @@ packets: export
   for path in dist/packets-run/output/*.f32; do name=$(basename "$path" .f32); cp "$path" "dist/packets/${name#0}.f32"; done
   rm -rf dist/packets-run
 
-# Regenerate crates/pen-protocol/src/packets.rs from the checkout's
-# protocol/schema.ts, the packets' one description (gdev's README, "Host
-# boundary"); `just check` fails while it is stale.
-# Regenerates the Rust protocol from gdev's protocol/schema.ts.
 sync-protocol:
-  deno run --allow-read --allow-write --allow-env --no-lock --config {{gdev}}/deno.json {{gdev}}/scripts/generate_protocol.ts --only rust --rust crates/pen-protocol/src/packets.rs
+  cargo run -q -p pen-codegen -- --project {{gdev}} --rust crates/pen-protocol/src/packets.rs
 
-# Everything: clippy, unit and GPU tests, golden images, renderer parity,
-# engine conformance, the determinism contract and the checkout's Blot tests.
-# Runs every check.
-test: check visual parity conformance determinism (blot-tests "tests/hand_salt.blot" "tests/math.blot" "tests/traps/protocol_rejects.blot" "tests/rejected/ecs_component_registered_twice.blot")
+# Includes the full Blot suite, not only smoke fixtures.
+test: check visual determinism blot-tests conformance
 
-# The generated protocol is fresh, clippy and tests; the renderer's GPU tests
-# also in release, where the optimizer once broke what debug builds hid.
-# The protocol is fresh, clippy is clean and the tests pass.
-check:
-  deno run --allow-read --allow-env --no-lock --config {{gdev}}/deno.json {{gdev}}/scripts/generate_protocol.ts --only rust --rust crates/pen-protocol/src/packets.rs --check
-  cargo clippy --workspace --all-targets --features pen/steam
-  cargo test --workspace
-  cargo test --release -p pen-render
+check: plugins plugin-tests packets
+  cargo run -q -p pen-codegen -- --project {{gdev}} --rust crates/pen-protocol/src/packets.rs --check
+  cargo clippy --workspace --all-targets --features pen/steam -- -D warnings
+  cargo clippy -p pen --all-targets --no-default-features --features steam -- -D warnings
+  cargo test --workspace -- --test-threads=1
+  cargo test --release -p pen-render -- --test-threads=1
+  cargo clippy --manifest-path crates/pen-web/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
 
 # No Wasm compiler (it loads the game.cwasm its package was precompiled
 # with), Steam, the `dist` profile, and glibc 2.28 and later (every Steam
@@ -167,6 +144,7 @@ stripped dir exe library:
   mkdir -p {{dir}}/player
   objcopy --strip-all {{dir}}/{{exe}} {{dir}}/player/{{exe}}
   cp "$(ls -t {{dir}}/build/steamworks-sys-*/out/{{library}} | head -1)" {{dir}}/player/
+  cp LICENSE THIRD_PARTY_NOTICES.md {{dir}}/player/
 
 # The newest glibc an executable needs; fails above 2.28 (the soldier container's).
 glibc exe="target/x86_64-unknown-linux-gnu/dist/pen":

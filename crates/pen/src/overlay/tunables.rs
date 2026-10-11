@@ -7,20 +7,13 @@
 //! browser. A tunable reaches the game as a `GameEvent::Tune` whose `index`
 //! is the tunable's id, a hash of its name, and what the game holds is game
 //! state, in a saved section this reads back (`tuned_values`). Baking writes
-//! the game's values into the file as defaults, through the checkout's
-//! `scripts/bake_tunables.ts`.
+//! the game's values into the file as defaults, preserving its formatting.
 // The player runtime (no `devtools`) only names tunables, for scripts.
 #![cfg_attr(not(feature = "devtools"), allow(dead_code))]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-
-/// The saved section holding what the host set tunables to (gdev's
-/// `packages/tune.blot` codec key): `id, value` pairs.
-const TUNED_SECTION: f32 = 11.0;
-/// A saved state's first lane (gdev's `packages/persist.blot`).
-const STATE_MAGIC: f32 = 5678.0;
 
 /// A tunable as `src/tunables.json` declares it.
 #[derive(Clone, Debug, PartialEq)]
@@ -128,30 +121,8 @@ pub fn load(root: &Path) -> Result<Vec<Declared>, String> {
 /// What a saved state holds for each tunable the host set, by id (gdev's
 /// `tunedValues`): persist.blot's framing, `magic, schema, count`, then
 /// each section's `key, version, width, length` and lanes.
-pub fn tuned_values(state: &[f32]) -> HashMap<u32, f32> {
-    let mut tuned = HashMap::new();
-    if state.len() < 3 || state[0] != STATE_MAGIC {
-        return tuned;
-    }
-    let mut offset = 3;
-    for _ in 0..state[2] as usize {
-        let Some(&[key, _, _, length]) = state.get(offset..offset + 4).and_then(|header| <&[f32; 4]>::try_from(header).ok())
-        else {
-            break;
-        };
-        let start = offset + 4;
-        let end = start + length as usize;
-        if key == TUNED_SECTION
-            && let Some(lanes) = state.get(start..end)
-        {
-            for &[id, value] in lanes.as_chunks::<2>().0 {
-                tuned.insert(id as u32, value);
-            }
-        }
-        offset = end;
-    }
-    tuned
-}
+#[cfg(any(feature = "devtools", test))]
+pub use pen_runtime::tunables::tuned_values;
 
 impl Declared {
     /// The value the game reads (gdev's `tune.value`): as set, or its
@@ -161,27 +132,71 @@ impl Declared {
     }
 }
 
-/// Writes `values` (by name) into the checkout's `src/tunables.json` as the
-/// defaults, with its `scripts/bake_tunables.ts`; returns what it says
-/// changed. Blocks while Deno runs.
+/// Changes only the selected defaults' number tokens. Borrowed raw JSON
+/// values locate those tokens without rewriting any surrounding bytes.
+fn bake_text(text: &str, values: &[(String, f32)]) -> Result<(String, Vec<String>)> {
+    #[derive(serde::Deserialize)]
+    struct File<'a> {
+        #[serde(borrow)]
+        tunables: Vec<Entry<'a>>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Entry<'a> {
+        name: String,
+        #[serde(borrow)]
+        default: &'a serde_json::value::RawValue,
+    }
+
+    let declared = parse(text).map_err(anyhow::Error::msg)?;
+    let mut requested = HashMap::new();
+    for (name, value) in values {
+        let tunable = declared.iter().find(|entry| entry.name == *name).with_context(|| format!("no tunable {name}"))?;
+        if !value.is_finite() || !(tunable.min..=tunable.max).contains(value) {
+            bail!("{name}: {value} is outside {}..{}", tunable.min, tunable.max);
+        }
+        if requested.insert(name.as_str(), *value).is_some() {
+            bail!("{name} is given twice");
+        }
+    }
+    let file: File<'_> = serde_json::from_str(text)?;
+    let mut edits = Vec::new();
+    let mut changed = Vec::new();
+    for (entry, tunable) in file.tunables.iter().zip(&declared) {
+        let Some(&value) = requested.get(entry.name.as_str()) else { continue };
+        if value == tunable.default {
+            continue;
+        }
+        let token = entry.default.get();
+        let start = token.as_ptr() as usize - text.as_ptr() as usize;
+        let to = value.to_string();
+        edits.push((start, start + token.len(), to.clone()));
+        changed.push(format!("{}: {} -> {to}", entry.name, tunable.default));
+    }
+    let mut baked = text.to_owned();
+    for (start, end, to) in edits.into_iter().rev() {
+        baked.replace_range(start..end, &to);
+    }
+    Ok((baked, changed))
+}
+
+/// Bakes in one rename so the watcher sees a complete declarations file.
 pub fn bake(root: &Path, values: &[(String, f32)]) -> Result<String> {
-    let script = root.join("scripts").join("bake_tunables.ts");
-    if !script.is_file() {
-        bail!("{} is missing; this checkout cannot bake", script.display());
+    let path = path(root);
+    let original = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let (baked, changed) = bake_text(&original, values)?;
+    if changed.is_empty() {
+        return Ok("nothing to bake: each value is its default already".into());
     }
-    let output = std::process::Command::new("deno")
-        .args(["run", "--allow-read", "--allow-write", "--no-lock", "--config"])
-        .arg(root.join("deno.json"))
-        .arg(&script)
-        .args(values.iter().map(|(name, value)| format!("{name}={value}")))
-        .current_dir(root)
-        .output()
-        .context("running deno, which bakes the tunables")?;
-    let said = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_owned();
-    if !output.status.success() {
-        bail!("baking failed: {}", said(&output.stderr));
+    let temporary = path.with_file_name(format!(".tunables.{}-{}.tmp", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+    let result = (|| {
+        std::fs::write(&temporary, baked)?;
+        std::fs::rename(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
-    Ok(said(&output.stdout))
+    result.with_context(|| format!("baking {}", path.display()))?;
+    Ok(changed.join("\n"))
 }
 
 #[cfg(test)]
@@ -239,35 +254,17 @@ mod tests {
     }
 
     #[test]
-    fn reads_and_bakes_the_checkout() {
-        // The sibling gdev checkout, when this repo has one and it has tunables.
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../gdev");
-        if !path(&root).is_file() || !root.join("scripts/bake_tunables.ts").is_file() {
-            return;
+    fn bakes_only_number_tokens_and_rejects_without_editing() {
+        let original = "{\n  \"about\": \"default: 999\",\n  \"tunables\": [\n    {\"default\": 1e0, \"name\": \"camera.zoom\", \"min\": 0, \"max\": 4},\n    {\"name\": \"speed\", \"default\": 2.00, \"min\": 0, \"max\": 8}\n  ]\n}\n";
+        let values = [("camera.zoom".into(), 3.5), ("speed".into(), 2.0)];
+        let (baked, changed) = bake_text(original, &values).unwrap();
+        assert_eq!(baked, original.replacen("1e0", "3.5", 1));
+        assert_eq!(changed, ["camera.zoom: 1 -> 3.5"]);
+        assert_eq!(bake_text(&baked, &values).unwrap(), (baked, Vec::new()));
+        for value in [f32::NAN, f32::INFINITY, -1.0, 5.0] {
+            assert!(bake_text(original, &[("camera.zoom".into(), value)]).is_err());
         }
-        let declared = load(&root).unwrap();
-        assert!(!declared.is_empty());
-        // Baking a copy (with the script's --file): only the default's number changes.
-        let directory = std::env::temp_dir().join(format!("pen-bake-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let copy = directory.join("tunables.json");
-        let original = std::fs::read_to_string(path(&root)).unwrap();
-        std::fs::write(&copy, &original).unwrap();
-        let first = &declared[0];
-        let value = (first.min + first.max) * 0.5;
-        let output = std::process::Command::new("deno")
-            .args(["run", "--allow-read", "--allow-write", "--no-lock", "--config"])
-            .arg(root.join("deno.json"))
-            .arg(root.join("scripts/bake_tunables.ts"))
-            .arg("--file")
-            .arg(&copy)
-            .arg(format!("{}={value}", first.name))
-            .output();
-        let Ok(output) = output else { return };
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-        let baked = parse(&std::fs::read_to_string(&copy).unwrap()).unwrap();
-        assert_eq!(baked[0].default, value);
-        assert_eq!(baked[1..], declared[1..]);
-        let _ = std::fs::remove_dir_all(&directory);
+        assert!(bake_text(original, &[("unknown".into(), 1.0)]).is_err());
+        assert!(bake_text(original, &[("speed".into(), 1.0), ("speed".into(), 2.0)]).is_err());
     }
 }

@@ -89,6 +89,7 @@ pub struct Session<C: Child> {
     watched: Vec<String>,
     identity: String,
     overlays: bool,
+    native_assets: bool,
     epoch: String,
     revision: u64,
     next_id: u64,
@@ -119,6 +120,7 @@ impl<C: Child> Session<C> {
             entry,
             identity: String::new(),
             overlays: false,
+            native_assets: settings.native_assets.is_some(),
             epoch: String::new(),
             revision: 0,
             next_id: 1,
@@ -160,16 +162,23 @@ impl<C: Child> Session<C> {
         }
         self.identity = identity.to_string();
         self.overlays = capabilities.contains(&"source-overlays");
+        if self.native_assets && !capabilities.contains(&"native-assets-v1") {
+            return Err("it cannot do native-assets-v1".into());
+        }
         let imports: Vec<Value> =
             settings.imports.iter().map(|(prefix, root)| json!({ "prefix": prefix, "root": root })).collect();
         let mut open = json!({
             "kind": "open",
+            "version": VERSION,
             "entry": self.entry,
             "prelude": settings.prelude,
             "stdRoot": settings.std,
             "imports": imports,
             "dependencies": settings.dependencies,
         });
+        if let Some(assets) = &settings.native_assets {
+            open["nativeAssets"] = assets.clone();
+        }
         if let Some(tier) = settings.codegen_tier {
             open["codegenTier"] = json!(tier.name());
         }
@@ -253,8 +262,28 @@ impl<C: Child> Session<C> {
             if !reply.payload.starts_with(&WASM_HEADER) {
                 return Err(format!("what it built ({} bytes) is not a Wasm module", reply.payload.len()));
             }
+            let mut wasm = reply.payload;
+            if self.native_assets {
+                let length = metadata.get("wasmBytes").and_then(Value::as_u64).ok_or("native build has no wasmBytes")?;
+                let length = usize::try_from(length).map_err(|_| "native wasmBytes is too large")?;
+                let assets = metadata.get("assets").and_then(Value::as_array).ok_or("native build has no assets")?;
+                // pen's frame protocol names external game assets by catalog
+                // index; content-handle imports require a different guest ABI.
+                if !assets.is_empty() || length != wasm.len() {
+                    return Err("this game's ABI does not accept native content-handle resources".into());
+                }
+                let dependencies = metadata.get("assetDependencies").and_then(Value::as_array)
+                    .ok_or("native build has no assetDependencies")?;
+                for dependency in dependencies {
+                    let path = dependency.get("path").and_then(Value::as_str).ok_or("asset dependency has no path")?;
+                    if !self.watched.iter().any(|watched| watched == path) {
+                        self.watched.push(path.to_owned());
+                    }
+                }
+                wasm.truncate(length);
+            }
             self.revision += 1;
-            return Ok(Build::Built(reply.payload));
+            return Ok(Build::Built(wasm));
         }
         if revision != Some(self.revision) || !reply.payload.is_empty() {
             return Err(format!(
@@ -454,6 +483,12 @@ fn diagnostic(value: &Value) -> Result<Diagnostic, String> {
         start,
         end,
         message: text("message")?,
+        details: value.get("details").filter(|details| !details.is_null()).map(|details| {
+            if let Some(text) = details.as_str() {
+                return text.to_owned();
+            }
+            details.to_string()
+        }),
     })
 }
 
@@ -551,6 +586,7 @@ mod tests {
             session.child.as_ref().unwrap().written[0],
             json!({
                 "kind": "open",
+                "version": VERSION,
                 "id": 1,
                 "entry": "/p/src/main.blot",
                 "prelude": "/std/prelude.blot",

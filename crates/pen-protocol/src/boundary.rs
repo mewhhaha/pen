@@ -1,6 +1,6 @@
 //! The packets crossing between host and game, as gdev's `boundary.ts` lays
 //! them out: frames in, render packets out. Their layout, the frame encoder
-//! and the render packet decoder are generated from gdev's protocol/schema.ts
+//! and the render packet decoder are generated from gdev's protocol/schema.json
 //! into packets.rs (`just sync-protocol`); this adds reading the asset catalog.
 use anyhow::{Context, Result, anyhow};
 

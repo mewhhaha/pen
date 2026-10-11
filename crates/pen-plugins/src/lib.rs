@@ -67,6 +67,14 @@ mod assets_bindings {
 pub use bindings::exports::pen::plugin::compiler::BuildResult;
 pub use bindings::pen::plugin::types::{Diagnostic, Overlay};
 
+/// Plugin paths have one spelling on every platform.
+pub(crate) fn portable(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    let text = text.replace('\\', "/");
+    text
+}
+
 /// pen's cache directory for plugins and what they run.
 pub(crate) fn cache_root() -> PathBuf {
     dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("pen")
@@ -115,8 +123,8 @@ pub struct Plugins {
 /// A program for a plugin: the checkout, its entry and the plugin's settings.
 fn program(root: &Path, entry: &Path, settings: &Option<serde_json::Value>) -> bindings::pen::plugin::types::Program {
     bindings::pen::plugin::types::Program {
-        root: root.display().to_string(),
-        entry: entry.display().to_string(),
+        root: portable(root),
+        entry: portable(entry),
         settings: settings.as_ref().map_or_else(|| "{}".to_owned(), |settings| settings.to_string()),
     }
 }
@@ -264,6 +272,12 @@ impl Compiler {
         let paths = self.plugin.pen_plugin_compiler().session().call_watched(&mut self.store, self.session)?;
         Ok(paths.into_iter().map(PathBuf::from).collect())
     }
+
+    /// Gracefully saves the compiler's retained work. Drop itself is fast.
+    pub fn close(&mut self) -> Result<()> {
+        self.plugin.pen_plugin_compiler().session().call_close(&mut self.store, self.session)?
+            .map_err(anyhow::Error::msg)
+    }
 }
 
 impl Drop for Compiler {
@@ -286,13 +300,23 @@ pub struct Generated {
     pub dependencies: Vec<PathBuf>,
 }
 
+#[derive(Debug)]
+pub struct GenerationError {
+    pub message: String,
+    pub dependencies: Vec<PathBuf>,
+}
+
 impl Assets {
-    pub fn generate(&mut self) -> Result<Generated> {
+    pub fn generate(&mut self) -> std::result::Result<Generated, GenerationError> {
         let generated = self
             .plugin
             .pen_plugin_assets()
-            .call_generate(&mut self.store, &self.program)?
-            .map_err(|error| anyhow!("{}: {error}", self.name))?;
+            .call_generate(&mut self.store, &self.program)
+            .map_err(|error| GenerationError { message: format!("{}: {error}", self.name), dependencies: Vec::new() })?
+            .map_err(|error| GenerationError {
+                message: format!("{}: {}", self.name, error.message),
+                dependencies: error.dependencies.into_iter().map(PathBuf::from).collect(),
+            })?;
         Ok(Generated {
             modules: generated.modules,
             dependencies: generated.dependencies.into_iter().map(PathBuf::from).collect(),

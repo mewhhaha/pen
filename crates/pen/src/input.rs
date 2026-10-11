@@ -20,18 +20,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window};
 /// Pixels a wheel notch scrolls, as browsers report `deltaY` for one line.
 pub(crate) const PIXELS_PER_LINE: f32 = 100.0;
 
-/// The window's time travel keys.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Hotkey {
-    /// Ctrl+Shift+P.
-    Pause,
-    /// Ctrl+Shift+period.
-    Step,
-    /// Ctrl+Shift+comma.
-    Back,
-    /// Ctrl+Shift+R.
-    Replay,
-}
+pub use pen_runtime::input::Hotkey;
 
 #[derive(Default)]
 pub struct Input {

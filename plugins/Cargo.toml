@@ -4,7 +4,7 @@
 # bindings are Wasm-only.
 [workspace]
 resolver = "3"
-members = ["blot", "gdev-assets"]
+members = ["blot"]
 
 [workspace.package]
 edition = "2024"

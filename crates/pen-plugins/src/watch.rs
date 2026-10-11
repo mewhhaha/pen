@@ -52,6 +52,13 @@ impl Builder {
         &self.entry
     }
 
+    pub fn close(&mut self) -> Result<()> {
+        if let Some(mut compiler) = self.compiler.take() {
+            compiler.close()?;
+        }
+        Ok(())
+    }
+
     /// Builds the program, with `extra` overlays over its asset modules and
     /// the files on disk (a test module standing in at its entry, say).
     pub fn build(&mut self, extra: &[crate::Overlay]) -> Outcome {
@@ -112,7 +119,13 @@ impl Builder {
             self.assets = Some(self.plugins.assets(&self.entry)?);
         }
         let Some(Some(assets)) = &mut self.assets else { return Ok(Vec::new()) };
-        let generated = assets.generate()?;
+        let generated = match assets.generate() {
+            Ok(generated) => generated,
+            Err(error) => {
+                self.watched.extend(error.dependencies);
+                return Err(anyhow::Error::msg(error.message));
+            }
+        };
         self.watched.extend(generated.dependencies);
         Ok(generated.modules)
     }
@@ -120,7 +133,10 @@ impl Builder {
 
 /// Builds the program at `entry` once.
 pub fn build(plugins: Arc<Plugins>, entry: &Path) -> Outcome {
-    Builder::new(plugins, entry).build(&[])
+    let mut builder = Builder::new(plugins, entry);
+    let outcome = builder.build(&[]);
+    let _ = builder.close();
+    outcome
 }
 
 /// A program being built again as its files change; dropping it stops.
@@ -171,6 +187,7 @@ pub fn watch(
             let mut changed: Option<Instant> = None;
             loop {
                 if stopped.try_recv() != Err(std::sync::mpsc::TryRecvError::Empty) {
+                    let _ = program.close();
                     return;
                 }
                 let wait = changed.map_or(Duration::from_millis(100), |at| SETTLE.saturating_sub(at.elapsed()));
@@ -188,7 +205,10 @@ pub fn watch(
                     Ok(Err(_)) => {}
                     Err(RecvTimeoutError::Timeout) if changed.is_some_and(|at| at.elapsed() >= SETTLE) => break,
                     Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Disconnected) => {
+                        let _ = program.close();
+                        return;
+                    }
                 }
             }
         }

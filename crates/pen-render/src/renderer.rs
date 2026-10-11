@@ -50,13 +50,112 @@ pub(crate) struct ShaderAsset {
     /// Its opaque pipeline for insets, once compiled.
     inset: Option<wgpu::RenderPipeline>,
     /// Its depth-only pipelines into the shadow map, plain and instanced,
-    /// compiled as it loaded; made on first use where that failed.
+    /// compiled in the background when a loaded material casts shadows.
     shadow: [Option<wgpu::RenderPipeline>; 2],
+    shadow_compiling: bool,
 }
 
 impl ShaderAsset {
     fn inset(&self) -> Option<&wgpu::RenderPipeline> {
         self.inset.as_ref().or_else(|| self.made.get(&INSET_SAMPLES).map(|pipelines| &pipelines.opaque))
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod shadow_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const SHADER: &str = r#"
+@vertex fn vertex(@location(0) position: vec3f) -> @builtin(position) vec4f {
+    return vec4f(position, 1.0);
+}
+@vertex fn vertex_instanced(@location(0) position: vec3f) -> @builtin(position) vec4f {
+    return vec4f(position, 1.0);
+}
+@fragment fn fragment() -> @location(0) vec4f { return vec4f(1.0); }
+"#;
+
+    fn pump(state: &mut State, ready: impl Fn(&State) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !ready(state) {
+            state.receive(state.now());
+            assert!(Instant::now() < deadline, "shadow pipeline work did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn shader(state: &State, slot: usize) -> &ShaderAsset {
+        let Some(GpuAsset::Shader(shader)) = state.assets.current(slot) else { panic!("shader not loaded") };
+        shader
+    }
+
+    #[test]
+    fn shadows_follow_casting_materials_and_reload_without_frame_thread_compilation() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("shadow pipeline regression requires a GPU adapter");
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let root = std::env::temp_dir().join(format!("pen-shadow-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("scene.wgsl"), SHADER).unwrap();
+        let unlit = br#"{"shader":"scene.wgsl","color":[1,1,1,1],"lighting":"unlit"}"#;
+        let lit = br#"{"shader":"scene.wgsl","color":[1,1,1,1],"lighting":"lit"}"#;
+        std::fs::write(root.join("paint.json"), unlit).unwrap();
+        let mut state = State::new(device, queue, RendererOptions {
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            assets: root.clone(),
+            veil: None,
+        }).unwrap();
+        let material_slot = state.assets.get(AssetKind::Material, "paint.json").unwrap();
+        pump(&mut state, |state| state.assets.current(material_slot).is_some());
+        let shader_slot = state.assets.get(AssetKind::Shader, "scene.wgsl").unwrap();
+        pump(&mut state, |state| state.assets.current(shader_slot).is_some());
+        assert!(shader(&state, shader_slot).shadow.iter().all(Option::is_none));
+        assert!(!shader(&state, shader_slot).shadow_compiling);
+        assert!(!state.ensure_pipelines(shader_slot, 4));
+        assert!(!state.ensure_pipelines(shader_slot, 4));
+        assert_eq!(shader(&state, shader_slot).compiling.len(), 1);
+        assert!(state.pending() > 0);
+        pump(&mut state, |state| shader(state, shader_slot).made.contains_key(&4));
+        assert!(state.ensure_pipelines(shader_slot, 4));
+
+        // A caster arriving after its shared shader asks for background work.
+        let caster_started = Instant::now();
+        std::fs::write(root.join("paint.json"), lit).unwrap();
+        state.assets.reload(&["paint.json".to_owned()]);
+        pump(&mut state, |state| {
+            matches!(state.assets.current(material_slot), Some(GpuAsset::Material(material)) if material.material.lit)
+        });
+        assert_eq!(state.shader(&crate::asset_store::parse_material(unlit).unwrap()).unwrap(), Some(shader_slot));
+        if shader(&state, shader_slot).shadow_compiling {
+            assert!(state.shader(&crate::asset_store::parse_material(lit).unwrap()).unwrap().is_none());
+        }
+        pump(&mut state, |state| shader(state, shader_slot).shadow[0].is_some());
+        assert!(shader(&state, shader_slot).shadow[1].is_some());
+        assert_eq!(state.pending(), 0);
+        eprintln!("late caster material and both shadow variants ready: {:.2} ms", caster_started.elapsed().as_secs_f64() * 1000.0);
+
+        // A known caster's new shader includes shadows before publication.
+        state.assets.reload(&["scene.wgsl".to_owned()]);
+        assert_eq!(shader(&state, shader_slot).revision, 1);
+        assert!(shader(&state, shader_slot).shadow[0].is_some());
+        pump(&mut state, |state| shader(state, shader_slot).revision == 2);
+        assert!(shader(&state, shader_slot).shadow[0].is_some());
+        assert!(!shader(&state, shader_slot).shadow_compiling);
+        assert!(shader(&state, shader_slot).shadow[1].is_some());
+
+        // Reloading the last caster as unlit removes the loader's demand.
+        std::fs::write(root.join("paint.json"), unlit).unwrap();
+        state.assets.reload(&["paint.json".to_owned()]);
+        pump(&mut state, |state| {
+            matches!(state.assets.current(material_slot), Some(GpuAsset::Material(material)) if !material.material.lit)
+        });
+        state.assets.reload(&["scene.wgsl".to_owned()]);
+        pump(&mut state, |state| shader(state, shader_slot).revision == 3);
+        assert!(shader(&state, shader_slot).shadow.iter().all(Option::is_none));
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -590,7 +689,6 @@ pub(crate) struct State {
     // Dropped before the assets, so its threads stop streaming.
     loader: Loader,
     assets: AssetStore<GpuAsset>,
-    context: PipelineContext,
     // The last frame's texture filtering and samples per pixel: those its
     // settings asked for, and those it drew with (which wait for the shaders).
     filtering: u32,
@@ -809,7 +907,7 @@ impl State {
             immediate_size: 0,
         });
         let context = PipelineContext { device: device.clone(), layout, sprite_layout, format: options.format };
-        let loader = Loader::new(options.assets.clone(), context.clone())?;
+        let loader = Loader::new(options.assets.clone(), context)?;
         let assets = AssetStore::new(loader.jobs.clone());
         let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
         let stride = DRAW_BYTES.div_ceil(alignment) * alignment;
@@ -841,7 +939,6 @@ impl State {
             clock: crate::platform::Clock::new(),
             loader,
             assets,
-            context,
             filtering: 0,
             samples_now: 1,
             samples_shown: 1,
@@ -924,7 +1021,7 @@ impl State {
             .slots
             .iter()
             .map(|slot| match &slot.current {
-                Some(GpuAsset::Shader(shader)) => shader.compiling.len(),
+                Some(GpuAsset::Shader(shader)) => shader.compiling.len() + usize::from(shader.shadow_compiling),
                 _ => 0,
             })
             .sum::<usize>();
@@ -1026,6 +1123,22 @@ impl State {
                         shader.inset = Some(pipeline);
                     }
                 }
+                Message::Shadow { slot, revision, result } => {
+                    if let Some(GpuAsset::Shader(shader)) = self.assets.current_mut(slot)
+                        && shader.revision == revision
+                    {
+                        shader.shadow_compiling = false;
+                        match result {
+                            Ok(pipelines) => shader.shadow = pipelines,
+                            Err(message) => self.assets.events.push(GameEvent::AssetFailed {
+                                key: self.assets.slots[slot].key.clone(),
+                                kind: AssetKind::Shader.name().to_owned(),
+                                revision,
+                                message,
+                            }),
+                        }
+                    }
+                }
             }
         }
         // Assets whose error scopes came back since the last frame.
@@ -1079,6 +1192,13 @@ impl State {
                 Ok(Some((asset, Some(check))))
             }
             Loaded::Material(material) => {
+                if material.casts_shadow()
+                    && let Some(slot) = self.assets.slots.iter().position(|slot| {
+                        slot.kind == AssetKind::Shader && slot.key == material.shader
+                    })
+                {
+                    self.compile_shadow(slot);
+                }
                 if self.preloading {
                     for key in [&material.texture, &material.normal_texture, &material.layer_texture].into_iter().flatten() {
                         let _ = self.assets.prefetch(AssetKind::Texture, key);
@@ -1088,8 +1208,8 @@ impl State {
                 let state = material.state_key();
                 Ok(Some((GpuAsset::Material(Arc::new(MaterialAsset { material, state })), None)))
             }
-            Loaded::Shader { module, instancing, samples, pipelines, shadow } => Ok(Some((
-                GpuAsset::Shader(ShaderAsset {
+            Loaded::Shader { module, instancing, samples, pipelines, shadow } => {
+                let mut shader = ShaderAsset {
                     revision,
                     module,
                     instancing,
@@ -1097,9 +1217,17 @@ impl State {
                     compiling: HashSet::new(),
                     inset: None,
                     shadow,
-                }),
-                None,
-            ))),
+                    shadow_compiling: false,
+                };
+                let key = &self.assets.slots[slot].key;
+                if self.assets.slots.iter().any(|slot| {
+                    matches!(&slot.current, Some(GpuAsset::Material(material))
+                        if material.material.shader == *key && material.material.casts_shadow())
+                }) {
+                    Self::queue_shadow(&self.loader.jobs, slot, &mut shader);
+                }
+                Ok(Some((GpuAsset::Shader(shader), None)))
+            }
             Loaded::SpriteShader(pipeline) => Ok(Some((GpuAsset::SpriteShader(pipeline), None))),
             Loaded::Image(image) => {
                 let id = self.view_id();
@@ -1308,6 +1436,10 @@ impl State {
         self.assets.reload(keys);
     }
 
+    pub fn reload_all(&mut self) {
+        self.assets.reload_all();
+    }
+
     // ----- Looking assets up for a frame -----
 
     /// The asset's slot, asking for it if it is not loaded yet; notes when a
@@ -1329,9 +1461,33 @@ impl State {
     }
 
     /// The shader's slot, if it is loaded.
-    fn shader(&mut self, key: &str) -> Result<Option<usize>> {
-        let slot = self.resolve(AssetKind::Shader, key)?;
-        Ok(matches!(self.assets.current(slot), Some(GpuAsset::Shader(_))).then_some(slot))
+    fn shader(&mut self, material: &Material) -> Result<Option<usize>> {
+        let slot = self.resolve(AssetKind::Shader, &material.shader)?;
+        match self.assets.current(slot) {
+            Some(GpuAsset::Shader(shader)) if shader.shadow_compiling && material.casts_shadow() => {
+                self.waiting = true;
+                Ok(None)
+            }
+            Some(GpuAsset::Shader(_)) => Ok(Some(slot)),
+            _ => Ok(None),
+        }
+    }
+
+    fn compile_shadow(&mut self, slot: usize) {
+        if let Some(GpuAsset::Shader(shader)) = self.assets.current_mut(slot) {
+            Self::queue_shadow(&self.loader.jobs, slot, shader);
+        }
+    }
+
+    fn queue_shadow(jobs: &crate::loader::JobQueue, slot: usize, shader: &mut ShaderAsset) {
+        if shader.shadow_compiling || shader.shadow[0].is_some() {
+            return;
+        }
+        shader.shadow_compiling = true;
+        jobs.push(
+            Job::Shadow { slot, revision: shader.revision, module: shader.module.clone(), instancing: shader.instancing },
+            Priority::Urgent,
+        );
     }
 
     fn texture(&self, texture: TextureRef) -> &TextureAsset {
@@ -1355,16 +1511,21 @@ impl State {
         Ok(matches!(self.assets.current(slot), Some(GpuAsset::Texture(_))).then_some(slot))
     }
 
-    /// Makes sure the shader has pipelines for `samples` per pixel, compiling
-    /// them now if the background has not.
-    fn ensure_pipelines(&mut self, slot: usize, samples: u32) {
-        let context = &self.context;
-        if let Some(GpuAsset::Shader(shader)) = self.assets.current_mut(slot)
-            && !shader.made.contains_key(&samples)
-        {
-            let pipelines = shader::pipelines(context, &shader.module, shader.instancing, samples);
-            shader.made.insert(samples, pipelines);
+    /// A newly visible shader may have loaded at a different sample count.
+    /// Keep its compilation on the loader, even when MSAA itself is unchanged.
+    fn ensure_pipelines(&mut self, slot: usize, samples: u32) -> bool {
+        let Some(GpuAsset::Shader(shader)) = self.assets.current_mut(slot) else { return false };
+        if shader.made.contains_key(&samples) {
+            return true;
         }
+        if shader.compiling.insert(samples) {
+            self.loader.jobs.push(
+                Job::Compile { slot, revision: shader.revision, samples, module: shader.module.clone(), instancing: shader.instancing },
+                Priority::Urgent,
+            );
+        }
+        self.waiting = true;
+        false
     }
 
     fn pipelines(&self, slot: usize, samples: u32) -> &Pipelines {
@@ -1841,26 +2002,11 @@ impl State {
             materials.dedup();
             for index in materials {
                 let Some(material) = self.material(catalog, index)? else { continue };
-                let Some(slot) = self.shader(&material.material.shader)? else { continue };
+                let Some(slot) = self.shader(&material.material)? else { continue };
                 let samples = self.samples_now;
-                let Some(GpuAsset::Shader(shader)) = self.assets.current_mut(slot) else { continue };
-                if shader.made.contains_key(&samples) {
-                    continue;
+                if !self.ensure_pipelines(slot, samples) {
+                    compiled = false;
                 }
-                // Compiles its pipelines for `samples` per pixel in the background.
-                if shader.compiling.insert(samples) {
-                    self.loader.jobs.push(
-                        Job::Compile {
-                            slot,
-                            revision: shader.revision,
-                            samples,
-                            module: shader.module.clone(),
-                            instancing: shader.instancing,
-                        },
-                        Priority::Urgent,
-                    );
-                }
-                compiled = false;
             }
             if compiled {
                 self.samples_shown = self.samples_now;
@@ -1871,6 +2017,7 @@ impl State {
         let quality = pen_protocol::Quality { msaa: self.samples_shown, ..frame.quality };
         let targets = self.post.as_mut().unwrap().begin(frame, quality, target.size());
         let samples = targets.samples;
+        self.decals.get_or_insert_with(|| Decals::new(&self.device, SCENE_FORMAT)).prepare(&self.device, samples);
         self.update_solids(&frame.solids);
         let mut stats = RenderStats::default();
 
@@ -1899,7 +2046,7 @@ impl State {
             }
             let material = self.material(catalog, draw.material)?;
             let shader = match &material {
-                Some(material) => self.shader(&material.material.shader)?,
+                Some(material) => self.shader(&material.material)?,
                 None => None,
             };
             let mesh = self.resolve(AssetKind::Mesh, catalog.mesh(draw.mesh))?;
@@ -1915,7 +2062,9 @@ impl State {
                     let batch = match found {
                         Some(batch) => batch,
                         None => {
-                            self.ensure_pipelines(shader, samples);
+                            if !self.ensure_pipelines(shader, samples) {
+                                continue;
+                            }
                             let pipeline = self.pipelines(shader, samples).instanced.clone().unwrap();
                             batches.push(InstanceBatch {
                                 mesh,
@@ -2082,7 +2231,7 @@ impl State {
         let mut ready: Vec<ReadyEntry> = Vec::new();
         for (index, item) in items.iter().enumerate() {
             let Some(material) = self.material(catalog, item.material)? else { continue };
-            let Some(shader) = self.shader(&material.material.shader)? else { continue };
+            let Some(shader) = self.shader(&material.material)? else { continue };
             let field = self.field_ids.get(catalog.material(item.material)).copied();
             let Some((textures, normal_setting, outline_setting)) = self.dress(&material.material, field)? else { continue };
             let group = self.draw_group(textures);
@@ -2105,7 +2254,9 @@ impl State {
                 let count = values.len().min(MAX_DRAW_EXTRA * 4);
                 extra[..count].copy_from_slice(&values[..count]);
             }
-            self.ensure_pipelines(shader, samples);
+            if !self.ensure_pipelines(shader, samples) {
+                continue;
+            }
             let mesh = match item.shape {
                 Shape::Mesh(mesh) => Some(self.resolve(AssetKind::Mesh, catalog.mesh(mesh))?),
                 _ => None,
@@ -2137,20 +2288,15 @@ impl State {
         let overlays: Vec<&ReadyEntry> = scene_entries.iter().copied().filter(|entry| entry.material.material.overlay).collect();
         // Lit, opaque surfaces cast shadows, unless their material says not.
         let casters: Vec<&ReadyEntry> = if shadow_map.is_some() {
-            opaque.iter().copied().filter(|entry| entry.material.material.lit && entry.material.material.shadow).collect()
+            opaque.iter().copied().filter(|entry| {
+                let instanced = matches!(items[entry.item].shape, Shape::Batch(_));
+                entry.material.material.casts_shadow()
+                    && matches!(self.assets.current(entry.shader), Some(GpuAsset::Shader(shader))
+                        if shader.shadow[instanced as usize].is_some())
+            }).collect()
         } else {
             Vec::new()
         };
-        // Their shadow pipelines compiled as their shaders loaded; one that
-        // failed to is made here.
-        for entry in &casters {
-            let instanced = matches!(items[entry.item].shape, Shape::Batch(_));
-            let context = &self.context;
-            if let Some(GpuAsset::Shader(shader)) = self.assets.current_mut(entry.shader) {
-                let module = &shader.module;
-                shader.shadow[instanced as usize].get_or_insert_with(|| shader::shadow_pipeline(context, module, instanced));
-            }
-        }
         // Decals whose material and texture are ready, by material.
         let mut decal_batches: Vec<DecalBatch<'_>> = Vec::new();
         for decal in &frame.decals {

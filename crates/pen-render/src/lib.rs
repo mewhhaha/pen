@@ -98,6 +98,11 @@ impl Renderer {
         self.state.reload(keys);
     }
 
+    /// Reload every requested mesh, material, shader and texture.
+    pub fn reload_all(&mut self) {
+        self.state.reload_all();
+    }
+
     /// `quiet()`: whether nothing is streaming in or settling, and the veil is gone.
     pub fn quiet(&self) -> bool {
         self.state.quiet()

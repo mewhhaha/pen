@@ -1,14 +1,10 @@
 //! A gdev checkout as a project the binary develops, runs and packages:
 //! its programs compile through the Wasm plugins its `pen.json` chooses
-//! (`plugin_build`), or else with its own compiler setup through Deno (the
-//! script is embedded here), and its assets and scene are used in place.
+//! (`plugin_build`), and its assets and scene are used in place.
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
-
-const BUILD_SCRIPT: &str = include_str!("../scripts/blot_build.ts");
 
 pub struct Project {
     pub root: PathBuf,
@@ -26,7 +22,7 @@ impl Project {
         };
         let start = std::fs::canonicalize(&start).with_context(|| format!("{} does not exist", start.display()))?;
         for directory in start.ancestors() {
-            if directory.join("blot_runtime.ts").is_file() && directory.join("src/main.blot").is_file() {
+            if directory.join("pen.json").is_file() && directory.join("src/main.blot").is_file() {
                 return Ok(Project {
                     root: directory.to_owned(),
                     #[cfg(feature = "plugins")]
@@ -35,7 +31,7 @@ impl Project {
             }
         }
         bail!(
-            "{} is not inside a gdev checkout (no blot_runtime.ts and src/main.blot); pass --project DIR",
+            "{} is not inside a gdev checkout (no pen.json and src/main.blot); pass --project DIR",
             start.display()
         )
     }
@@ -53,16 +49,6 @@ impl Project {
         self.root.join(".pen/runtime")
     }
 
-    fn script(&self) -> Result<PathBuf> {
-        let directory = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("pen");
-        std::fs::create_dir_all(&directory)?;
-        let path = directory.join(format!("blot_build-{}.ts", env!("CARGO_PKG_VERSION")));
-        if std::fs::read_to_string(&path).ok().as_deref() != Some(BUILD_SCRIPT) {
-            std::fs::write(&path, BUILD_SCRIPT)?;
-        }
-        Ok(path)
-    }
-
     /// The dev tools' program (gdev's `devtools/main.blot`), relative to
     /// the checkout, if it has one.
     pub fn devtools(&self) -> Option<&'static str> {
@@ -70,7 +56,7 @@ impl Project {
     }
 
     /// The checkout's plugins, when its `pen.json` chooses a compiler: they
-    /// build its programs instead of Deno.
+    /// build its programs.
     #[cfg(feature = "plugins")]
     fn plugins(&self) -> Result<Option<std::sync::Arc<pen_plugins::Plugins>>> {
         if let Some(plugins) = self.plugins.get() {
@@ -86,140 +72,80 @@ impl Project {
         vec![self.root.join(".pen"), self.root.join("target")]
     }
 
-    fn command(&self, out: &Path, watch: bool) -> Result<Command> {
-        ensure!(
-            blot_host::COMPILER,
-            "this pen is a player runtime, built without the Wasm compiler: it plays packaged games \
-             but cannot compile a checkout's program (use a full build, `just install`)"
-        );
-        let temporary = temporary_dir()?;
-        let mut command = Command::new("deno");
-        command
-            .args(["run", "-A", "--no-lock", "--config"])
-            .arg(self.root.join("deno.json"))
-            .arg(self.script()?)
-            .arg(&self.root)
-            // Absolute, since deno runs in the checkout.
-            .arg(std::path::absolute(out)?)
-            .args(watch.then_some("--watch"))
-            .current_dir(&self.root)
-            .env("TMPDIR", &temporary);
-        #[cfg(windows)]
-        command.env("TMP", &temporary).env("TEMP", &temporary);
-        Ok(command)
-    }
-
-    /// Starts building the dev tools' program into `out/devtools.wasm`
-    /// beside the game's build, once or (`watch`) again as its sources
-    /// change, until the returned watcher is dropped; none when the checkout
-    /// has none. The runtime picks the program up when its file appears.
-    pub fn build_devtools(&self, out: &Path, watch: bool) -> Result<Option<Watcher>> {
+    /// Builds the checkout's optional dev tools and watches their sources.
+    pub fn build_devtools(&self, out: &Path, _watch: bool) -> Result<Option<Watcher>> {
         let Some(entry) = self.devtools() else { return Ok(None) };
         std::fs::create_dir_all(out)?;
         #[cfg(feature = "plugins")]
-        if let Some(plugins) = self.plugins()? {
-            // Built again as it changes, in `run` too: the dev tools reload.
+        {
+            let plugins = self.plugins()?.context("pen.json must choose a compiler plugin")?;
             let built = crate::plugin_build::watch(
-                plugins,
-                "dev tools",
-                &self.root.join(entry),
-                &out.join("devtools.wasm"),
-                self.written(),
+                plugins, "dev tools", &self.root.join(entry), &out.join("devtools.wasm"), self.written(),
             )?;
-            return Ok(Some(Watcher { child: None, plugin: Some(built) }));
+            Ok(Some(Watcher { plugin: Some(built) }))
         }
-        let _ = watch;
-        let mut child = self
-            .command(out, watch)?
-            .args(["--entry", entry, "--name", "devtools.wasm"])
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("running deno, which compiles the dev tools' Blot program")?;
-        if let Some(stderr) = child.stderr.take() {
-            crate::overlay::forward_build_output(stderr);
+        #[cfg(not(feature = "plugins"))]
+        {
+            let _ = entry;
+            bail!("this player runtime cannot build a checkout; use a full pen build")
         }
-        Ok(Some(Watcher::deno(child)))
     }
 
-    /// Compiles the Blot program into `out/game.wasm` once.
+    /// Compiles the game's Wasm once through the checkout's compiler plugin.
     pub fn compile(&self, out: &Path) -> Result<()> {
         std::fs::create_dir_all(out)?;
         #[cfg(feature = "plugins")]
-        if let Some(plugins) = self.plugins()? {
-            return crate::plugin_build::compile(plugins, "game", &self.root.join("src/main.blot"), &out.join("game.wasm"));
+        {
+            let plugins = self.plugins()?.context("pen.json must choose a compiler plugin")?;
+            crate::plugin_build::compile(plugins, "game", &self.root.join("src/main.blot"), &out.join("game.wasm"))
         }
-        let started = Instant::now();
-        let status = self
-            .command(out, false)?
-            .status()
-            .context("running deno, which compiles the game's Blot program")?;
-        if !status.success() {
-            bail!("the game's Blot program did not compile");
-        }
-        eprintln!("compiled {} in {:.1} s", out.join("game.wasm").display(), started.elapsed().as_secs_f64());
-        Ok(())
+        #[cfg(not(feature = "plugins"))]
+        bail!("this player runtime cannot build a checkout; use a full pen build")
     }
 
-    /// Compiles into `out/game.wasm`, then keeps compiling as sources change,
-    /// until the returned watcher is dropped. Returns once the first build is
-    /// there.
+    /// Compiles the optional dev tools once, for a browser export.
+    pub fn compile_devtools(&self, out: &Path) -> Result<()> {
+        let Some(entry) = self.devtools() else { return Ok(()) };
+        #[cfg(feature = "plugins")]
+        {
+            let plugins = self.plugins()?.context("pen.json must choose a compiler plugin")?;
+            crate::plugin_build::compile(plugins, "dev tools", &self.root.join(entry), &out.join("devtools.wasm"))
+        }
+        #[cfg(not(feature = "plugins"))]
+        {
+            let _ = (entry, out);
+            bail!("this player runtime cannot build a checkout; use a full pen build")
+        }
+    }
+
+    /// Watches the program and waits for its first successful build.
     pub fn watch(&self, out: &Path) -> Result<Watcher> {
         std::fs::create_dir_all(out)?;
-        let wasm = out.join("game.wasm");
-        let _ = std::fs::remove_file(&wasm);
         #[cfg(feature = "plugins")]
-        if let Some(plugins) = self.plugins()? {
-            let (watching, built) =
-                crate::plugin_build::watch(plugins, "game", &self.root.join("src/main.blot"), &wasm, self.written())?;
-            // As with Deno, play starts with the first build that compiles.
+        {
+            let plugins = self.plugins()?.context("pen.json must choose a compiler plugin")?;
+            let (watching, built) = crate::plugin_build::watch(
+                plugins, "game", &self.root.join("src/main.blot"), &out.join("game.wasm"), self.written(),
+            )?;
             loop {
                 match built.recv() {
-                    Ok(true) => return Ok(Watcher { child: None, plugin: Some((watching, built)) }),
+                    Ok(true) => return Ok(Watcher { plugin: Some((watching, built)) }),
                     Ok(false) => overlay_waiting(),
                     Err(_) => bail!("the game's plugin build stopped"),
                 }
             }
         }
-        let mut child = self
-            .command(out, true)?
-            .stdin(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("running deno, which compiles the game's Blot program")?;
-        // To stderr as before, and to the dev tools' console.
-        if let Some(stderr) = child.stderr.take() {
-            crate::overlay::forward_build_output(stderr);
-        }
-        loop {
-            if wasm.exists() {
-                return Ok(Watcher::deno(child));
-            }
-            if let Some(status) = child.try_wait()? {
-                bail!("the game's Blot program did not compile ({status})");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        #[cfg(not(feature = "plugins"))]
+        bail!("this player runtime cannot build a checkout; use a full pen build")
     }
+
 }
 
-/// The Blot compiler's temporary directory, on disk in the cache directory
-/// rather than a RAM-backed /tmp: each compiler it opens unpacks a 35 MB
-/// `blotc-*` there and removes it only when closed normally, so every
-/// killed build leaves one behind. Those older than an hour are swept away.
+/// On-disk temporary storage; shared compiler caches are not swept by age.
+#[cfg(test)]
 pub(crate) fn temporary_dir() -> Result<PathBuf> {
     let directory = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("pen/tmp");
     std::fs::create_dir_all(&directory)?;
-    let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
-    for entry in std::fs::read_dir(&directory)?.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let stale = entry.metadata().and_then(|metadata| metadata.modified()).is_ok_and(|time| time < hour_ago);
-        if stale && (name.starts_with("blotc-") || name.starts_with("blot-std-")) {
-            let path = entry.path();
-            let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
-        }
-    }
     Ok(directory)
 }
 
@@ -231,51 +157,19 @@ fn overlay_waiting() {
     SAID.call_once(|| crate::overlay::info(crate::overlay::Source::Build, "waiting for an edit that compiles"));
 }
 
-/// The compiler watching the project (Deno's, or the plugins' build
-/// thread); stops when dropped.
+/// Plugin build workers; dropping them joins their explicit shutdown.
 pub struct Watcher {
-    child: Option<Child>,
     #[cfg(feature = "plugins")]
     plugin: Option<(pen_plugins::Watching, std::sync::mpsc::Receiver<bool>)>,
 }
 
 impl Watcher {
-    fn deno(child: Child) -> Watcher {
-        Watcher {
-            child: Some(child),
-            #[cfg(feature = "plugins")]
-            plugin: None,
-        }
-    }
-
-    /// Waits for a build that does not watch (or a plugin build's first) to
-    /// finish; whether it built.
     pub fn wait(&mut self) -> Result<bool> {
         #[cfg(feature = "plugins")]
         if let Some((_, built)) = &self.plugin {
             return Ok(built.recv().unwrap_or(false));
         }
-        match &mut self.child {
-            Some(child) => Ok(child.wait()?.success()),
-            None => Ok(true),
-        }
-    }
-}
-
-impl Drop for Watcher {
-    fn drop(&mut self) {
-        let Some(child) = &mut self.child else { return };
-        // Closing stdin asks the script to finish its build and stop.
-        drop(child.stdin.take());
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let _ = child.kill();
-        let _ = child.wait();
+        Ok(true)
     }
 }
 
@@ -384,6 +278,12 @@ fn steam_library(runtime: &Path, bytes: &[u8], target: &str) -> Result<Option<Pa
         .with_context(|| format!("{} needs {name} beside it, and it is not there", runtime.display()))
 }
 
+fn notices(out: &Path) -> Result<()> {
+    std::fs::write(out.join("LICENSE"), include_str!("../../../LICENSE"))?;
+    std::fs::write(out.join("THIRD_PARTY_NOTICES.md"), include_str!("../../../THIRD_PARTY_NOTICES.md"))?;
+    Ok(())
+}
+
 fn size_of(path: &Path) -> u64 {
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => std::fs::read_dir(path)
@@ -401,6 +301,12 @@ fn size_of(path: &Path) -> u64 {
 /// the game: its compiled program, precompiled for the runtime's platform
 /// and a CPU baseline players' machines have, its assets and starting scene.
 pub fn package(project: &Project, out: &Path, options: PackageOptions) -> Result<()> {
+    let staging = crate::staging::Staging::new(&project.root, out)?;
+    package_into(project, &staging.directory, out, options)?;
+    staging.publish()
+}
+
+fn package_into(project: &Project, out: &Path, destination: &Path, options: PackageOptions) -> Result<()> {
     let runtime = match options.runtime {
         Some(runtime) => runtime,
         None => default_runtime()?,
@@ -416,7 +322,6 @@ pub fn package(project: &Project, out: &Path, options: PackageOptions) -> Result
     let engine = blot_host::portable_engine(Some(&target), options.cpu.as_deref())?;
 
     let game = out.join("game");
-    let _ = std::fs::remove_dir_all(out);
     std::fs::create_dir_all(&game)?;
     project.compile(&game)?;
     copy_tree(&project.assets(), &game.join("assets"))?;
@@ -429,12 +334,13 @@ pub fn package(project: &Project, out: &Path, options: PackageOptions) -> Result
     if let Some(library) = &steam {
         std::fs::copy(library, out.join(library.file_name().unwrap()))?;
     }
+    notices(out)?;
     let megabytes = |path: &Path| size_of(path) as f64 / 1e6;
     let x86_64 = target.starts_with("x86_64");
     let cpu = options.cpu.as_deref().unwrap_or(if x86_64 { blot_host::PORTABLE_X86_64 } else { "baseline" });
     eprintln!(
         "packaged {} for {target} ({} CPU): runtime {:.1} MB{}, game.cwasm {:.1} MB, assets {:.1} MB, {:.1} MB in all",
-        out.display(),
+        destination.display(),
         cpu,
         runtime_bytes.len() as f64 / 1e6,
         steam.as_ref().map(|library| format!(" + Steam {:.1} MB", megabytes(library))).unwrap_or_default(),
@@ -445,25 +351,42 @@ pub fn package(project: &Project, out: &Path, options: PackageOptions) -> Result
     Ok(())
 }
 
-/// The browser build as static files for any web host, from the checkout's
-/// `scripts/export_web.ts`: its page and bundled code, the compiled game, its
-/// assets and its starting scene.
+/// The browser front end, guest programs and assets as a complete static site.
 pub fn export_web(project: &Project, out: &Path) -> Result<()> {
-    let script = project.root.join("scripts/export_web.ts");
-    ensure!(script.is_file(), "{} has no scripts/export_web.ts to export the browser build", project.root.display());
-    let temporary = temporary_dir()?;
-    let mut command = Command::new("deno");
-    command
-        .args(["run", "--allow-all"])
-        .arg(&script)
-        .arg(std::path::absolute(out)?)
-        .current_dir(&project.root)
-        .env("TMPDIR", &temporary);
-    #[cfg(windows)]
-    command.env("TMP", &temporary).env("TEMP", &temporary);
-    let status = command.status().context("running deno, which exports the browser build")?;
-    ensure!(status.success(), "the browser build did not export");
-    Ok(())
+    let staging = crate::staging::Staging::new(&project.root, out)?;
+    let out = &staging.directory;
+    project.compile(out)?;
+    project.compile_devtools(out)?;
+    copy_tree(&project.assets(), &out.join("assets"))?;
+    std::fs::copy(project.assets().join("catalog.json"), out.join("catalog.json"))?;
+    if project.scene().is_file() {
+        std::fs::copy(project.scene(), out.join("scene.bin"))?;
+    }
+    let host = std::env::var_os("PEN_WEB_HOST").map(PathBuf::from).or_else(|| {
+        let beside = std::env::current_exe().ok()?.parent()?.join("web");
+        beside.join("pen_web_bg.wasm").is_file().then_some(beside)
+    });
+    if let Some(host) = host {
+        for file in ["pen_web.js", "pen_web_bg.wasm", "guest.js", "index.html"] {
+            std::fs::copy(host.join(file), out.join(file)).with_context(|| format!("copying browser host {file}"))?;
+        }
+    } else {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pen-web/build.sh");
+        ensure!(script.is_file(), "set PEN_WEB_HOST to a built pen-web host directory");
+        let status = Command::new("sh").arg(script).arg(out).status().context("building pen-web")?;
+        ensure!(status.success(), "the browser host did not build");
+    }
+    notices(out)?;
+    staging.publish()
+}
+
+/// A compiled bundle for tests and packet tools, without a player executable.
+pub fn export_bundle(project: &Project, out: &Path) -> Result<()> {
+    let staging = crate::staging::Staging::new(&project.root, out)?;
+    project.compile(&staging.directory)?;
+    copy_tree(&project.assets(), &staging.directory.join("assets"))?;
+    std::fs::copy(project.scene(), staging.directory.join("main.scene"))?;
+    staging.publish()
 }
 
 #[cfg(test)]

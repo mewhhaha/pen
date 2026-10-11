@@ -137,11 +137,18 @@ impl Decals {
         }
     }
 
+    /// The shared painted-decal shader settles with the scene, before its
+    /// first gameplay frame introduces world-space labels.
+    pub fn prepare(&mut self, device: &wgpu::Device, samples: u32) {
+        self.pipeline(device, samples, true);
+    }
+
     fn pipeline(&mut self, device: &wgpu::Device, samples: u32, paint: bool) -> wgpu::RenderPipeline {
         let format = self.format;
         self.pipelines
             .entry((samples, paint))
             .or_insert_with(|| {
+                let clock = crate::platform::Clock::new();
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("decals"),
                     source: wgpu::ShaderSource::Wgsl(shader(samples).into()),
@@ -157,7 +164,7 @@ impl Decals {
                 } else {
                     BlendComponent { src_factor: BlendFactor::Dst, dst_factor: BlendFactor::Zero, operation: BlendOperation::Add }
                 };
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("decals"),
                     layout: None,
                     vertex: wgpu::VertexState {
@@ -197,7 +204,14 @@ impl Decals {
                     }),
                     multiview_mask: None,
                     cache: None,
-                })
+                });
+                #[cfg(not(target_arch = "wasm32"))]
+                if std::env::var_os("PEN_FRAME_TIMES").is_some() {
+                    eprintln!("decal pipeline samples {samples} paint {paint}: {:.2} ms", clock.now() * 1000.0);
+                }
+                #[cfg(target_arch = "wasm32")]
+                let _ = clock;
+                pipeline
             })
             .clone()
     }

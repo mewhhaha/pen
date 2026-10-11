@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use blot_host::GuestModule;
 use pen_protocol::Catalog;
 use serde::Deserialize;
@@ -136,6 +136,12 @@ pub struct Game<'a> {
 pub fn run(test: TestOptions, game: Game, engine: wasmtime::Engine, module: GuestModule, catalog: Catalog) -> Result<()> {
     let text = std::fs::read_to_string(&test.file).with_context(|| format!("reading {}", test.file.display()))?;
     let file: Scenarios = serde_json::from_str(&text).with_context(|| format!("parsing {}", test.file.display()))?;
+    ensure!(file.size.0 > 0 && file.size.1 > 0, "visual size must not be empty");
+    ensure!(file.fps.is_finite() && file.fps > 0.0, "visual fps must be finite and positive");
+    ensure!((0.0..=1.0).contains(&file.threshold), "visual threshold must be within 0..1");
+    ensure!(!file.scenarios.is_empty(), "visual scenarios must not be empty");
+    ensure!(test.only.is_empty() || file.scenarios.keys().any(|name| test.only.iter().any(|only| name.contains(only.as_str()))),
+        "no visual scenario matches --only");
     let mut gpu = Some(Gpu::headless(file.size, game.assets)?);
     let scratch = std::env::temp_dir().join(format!("pen-visual-{}", std::process::id()));
     let (mut passed, mut failed, mut updated) = (0, Vec::new(), 0);
@@ -198,11 +204,15 @@ pub fn run(test: TestOptions, game: Game, engine: wasmtime::Engine, module: Gues
             let shot = actual_path.file_name().unwrap().to_string_lossy().into_owned();
             let label = format!("{name}/{shot}");
             let golden_path = test.golden.join(name).join(&shot);
-            if test.update || !golden_path.exists() {
+            if test.update {
                 std::fs::create_dir_all(golden_path.parent().unwrap())?;
                 std::fs::copy(&actual_path, &golden_path)?;
-                eprintln!("  {label}: {}", if test.update { "updated" } else { "new golden image" });
+                eprintln!("  {label}: updated");
                 updated += 1;
+                continue;
+            }
+            if !golden_path.is_file() {
+                failed.push(format!("{label}: missing golden {}; use --update to create it", golden_path.display()));
                 continue;
             }
             let actual = image::open(&actual_path)?.to_rgba8();

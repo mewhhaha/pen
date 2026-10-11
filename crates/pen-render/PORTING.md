@@ -1,4 +1,7 @@
-# Porting gdev's renderer to wgpu
+> Historical port measurements and shader notes. The TypeScript host is retired.
+> Current runtime and browser entry points are described in pen's README.
+
+# Renderer port notes gdev's renderer to wgpu
 
 This crate is a Rust/wgpu port of the WebGPU renderer in the gdev checkout at
 `/home/jacobt/src/gdev` (read-only: never edit it or `../blot2`). gdev already
@@ -100,8 +103,9 @@ indices, not strings.
 
 ## WGSL changes for naga
 
-None. Every WGSL string from the TS (post.ts, decals.ts, mipmaps.ts and
-renderer.ts's composite and veil shaders) is carried over verbatim, with the
+Other than the FXAA Quality replacement described below, WGSL strings from
+the TS (decals.ts, mipmaps.ts and renderer.ts's composite and veil shaders)
+are carried over verbatim, with the
 TS template holes (`${...}`) filled by `str::replace`, and all 31 shader
 assets in dist/gdev/assets compile under naga 30 unchanged.
 
@@ -111,14 +115,20 @@ assets in dist/gdev/assets compile under naga 30 unchanged.
   gtex inflating and PNG/JPEG decoding, and, where the TS uses
   `createRenderPipelineAsync`, shader modules and pipelines (a shader's
   first pipelines, its inset pipeline, `warm`ed sample counts, sprite
-  pipelines). A shader's shadow pipelines, which the TS makes with
-  `createRenderPipeline` on first use, also compile there as it loads, so
-  the first frame it casts a shadow in does not stall on the driver.
+  pipelines). Shadow pipelines compile there only when a loaded opaque,
+  lit material casts shadows. A material arriving after its shader requests
+  the same background work. Newly visible shaders also request missing MSAA
+  variants there, even when the frame's MSAA setting did not change.
   wgpu's `Device` is `Send + Sync` and error scopes are per thread, so each
   thread scopes its own work. Buffer and texture uploads, mipmap generation
-  and the TS's other synchronous `createRenderPipeline` calls (a sample
-  count used before its background compile, a shadow pipeline that failed
-  to compile as its shader loaded) stay on the thread calling `submit`.
+  and built-in post/decal pipelines stay on the thread calling `submit`.
+  The shared painted-decal variant prepares during initial scene settling,
+  before gameplay introduces world-space labels.
+  Shadow and scene variants never fall back to frame-thread compilation.
+- FXAA uses the shared WGSL Quality algorithm in `src/fxaa.wgsl`, with a
+  bounded preset-12 search and measured subpixel blending. It filters toned
+  display RGB before HUD and UI sprites. [Measurements](../../docs/render-performance.md)
+  cover independent supersampled references and actual browser agreement.
 - Loads that arrive are taken in at the start of `submit`, as are streamed
   texture levels; the TS takes them whenever their promises settle.
 - A frame whose `RenderTarget::view()` returns None is dropped (the TS would
@@ -140,16 +150,13 @@ assets in dist/gdev/assets compile under naga 30 unchanged.
 - `timestampWrites`, `close()` and `idle()` are not ported; dropping the
   `Renderer` stops its threads.
 
-## Checking it against the TS
+## Image verification
 
-`examples/render_packet.rs` renders packets headlessly to PNGs. Rendering the
-same packets with gdev's own renderer.ts under plain Deno WebGPU and diffing
-gives an RMSE of about 0.013% of full scale for frames 0-59 (and for those
-frames with MSAA 1, FXAA, trilinear or no mip filtering, render scale 0.75,
-blur, aberration, and 16 or 36 instanced robots added). Frames from 60 on
-have a full-screen inset whose 2560 x 1440 4x targets Deno's wgpu refuses
-("not enough memory left"); with both sides patched to draw insets at 1x
-instead of 2x they also agree to 0.014%.
+Native GPU regressions and independent supersampled FXAA witnesses cover the
+shared renderer. Headless browser witnesses compare the same WGSL against native
+output; the game protocol also has a native/browser engine conformance harness.
+See [renderer measurements](../../docs/render-performance.md) and
+[the browser host](../pen-web/README.md).
 
 ## In the browser
 
@@ -165,13 +172,8 @@ and an asset made on the submitting thread is published once its check has
 settled, which natively is at once, in the same call as before. A packed
 texture is fetched whole before its levels stream in, one per task turn.
 
-`web/` is a separate cargo workspace (so native builds never link it) with a
-wasm-bindgen API shaped like `createRenderer`: `createRenderer({ canvas,
-assets, veil })`, then `preload(catalog)`, `submit(packet, catalog, schema)`,
-`takeEvents()`, `reload(keys)`, `quiet()`, `pending()`, `stats()` and
-`framesInFlight()`. It makes its own WebGPU device and configures the canvas
-with it. `web/build.sh [OUT]` builds `pen_render.js` and
-`pen_render_bg.wasm` (installing the matching wasm-bindgen CLI under
-target/wasm-tools on first use). gdev's `scripts/rust_renderer.ts` runs it into
-`.gdev/rust-renderer`, which its dev server and static export serve as `rust/`
-for `?renderer=rust` (web/rust_renderer.ts).
+`../pen-web` is the browser front end in a separate Cargo workspace. It owns
+input, scheduling, audio and services, and calls this renderer directly. Build
+it with `crates/pen-web/build.sh`; `pen build --web` exports the host with the
+guest programs and assets. Browser and native builds use separate target
+directories to keep their incremental build locks independent.

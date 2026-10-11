@@ -107,6 +107,14 @@ impl files::Host for State {
     fn exists(&mut self, path: String) -> bool {
         self.grants.readable(&path).is_ok()
     }
+
+    fn is_file(&mut self, path: String) -> bool {
+        self.grants.readable(&path).is_ok_and(|path| path.is_file())
+    }
+
+    fn canonical(&mut self, path: String) -> std::result::Result<String, String> {
+        self.grants.readable(&path).map(|path| crate::portable(&path))
+    }
 }
 
 /// A program a plugin runs, its output read on threads of its own: standard
@@ -237,7 +245,7 @@ impl process::Host for State {
 
     fn cache_directory(&mut self) -> String {
         let _ = std::fs::create_dir_all(&self.grants.cache);
-        self.grants.cache.display().to_string()
+        crate::portable(&self.grants.cache)
     }
 }
 

@@ -8,6 +8,7 @@ pub struct Platform;
 
 /// A POSIX locale (`en_US.UTF-8`, `sv_SE`) as a BCP 47 tag (`en-US`), or
 /// None for none (`C`, `POSIX`).
+#[cfg(any(not(windows), test))]
 pub fn bcp47(posix: &str) -> Option<String> {
     let tag = posix.split(['.', '@']).next()?.replace('_', "-");
     let valid = !tag.is_empty() && tag != "C" && tag != "POSIX" && tag.chars().all(|char| char.is_ascii_alphanumeric() || char == '-');

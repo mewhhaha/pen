@@ -2,16 +2,15 @@
 
 gdev is a pure function of its input: the same starting state and the same
 frames of input give the same render packets, bit for bit. That holds
-between runs (`just determinism`) and between engines (wasmtime and V8,
-`just conformance`). On top of it the runtime records and replays sessions,
+between runs (`just determinism`) and between native and browser engines
+(the browser qualification harness). On top of it the runtime records and replays sessions,
 travels back in time, and replays the last seconds on a new build after a
 hot reload. This page says what the contract is, what keeps runs inside it,
 and what breaks it.
 
 ## The contract
 
-**A frame's input** is exactly what `encode_frame` sends the game (gdev's
-`boundary.ts`):
+**A frame's input** is exactly what `encode_frame` sends the game (`pen-protocol::encode_frame`):
 
 - the game time since the last frame (elapsed seconds, as f32);
 - the viewport (width and height in pixels);

@@ -90,6 +90,10 @@ impl Material {
     pub fn opaque(&self) -> bool {
         !self.overlay && !self.blend && self.color[3] == 1.0
     }
+
+    pub fn casts_shadow(&self) -> bool {
+        self.opaque() && self.lit && self.shadow
+    }
 }
 
 pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
@@ -377,6 +381,15 @@ impl<T> AssetStore<T> {
                 if slot.revision > 0 && !slot.queued {
                     self.load(id, false);
                 }
+            }
+        }
+    }
+
+    pub fn reload_all(&mut self) {
+        for id in 0..self.slots.len() {
+            let slot = &self.slots[id];
+            if slot.revision > 0 && !slot.queued {
+                self.load(id, false);
             }
         }
     }

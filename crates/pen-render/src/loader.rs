@@ -5,7 +5,8 @@
 // thread that submits frames, which uploads it to the GPU. Natively it runs
 // on threads; in the browser, as tasks on the page's event loop.
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -26,6 +27,8 @@ pub(crate) enum Job {
     Sort { key: String },
     /// Compile a shader's pipelines for another sample count.
     Compile { slot: usize, revision: u64, samples: u32, module: wgpu::ShaderModule, instancing: bool },
+    /// Compile depth-only pipelines once a loaded material can cast shadows.
+    Shadow { slot: usize, revision: u64, module: wgpu::ShaderModule, instancing: bool },
 }
 
 #[derive(Clone, Copy)]
@@ -42,6 +45,7 @@ pub(crate) enum Message {
     Compiled { slot: usize, revision: u64, samples: u32, result: Result<Pipelines, String> },
     /// A shader's opaque pipeline for insets, compiled after it loaded.
     Inset { slot: usize, revision: u64, result: Result<wgpu::RenderPipeline, String> },
+    Shadow { slot: usize, revision: u64, result: Result<[Option<wgpu::RenderPipeline>; 2], String> },
 }
 
 pub(crate) enum Loaded {
@@ -52,8 +56,6 @@ pub(crate) enum Loaded {
         instancing: bool,
         samples: u32,
         pipelines: Pipelines,
-        /// Its depth-only pipelines, plain and instanced; None where one
-        /// failed, for the first frame that needs it to make.
         shadow: [Option<wgpu::RenderPipeline>; 2],
     },
     SpriteShader(wgpu::RenderPipeline),
@@ -164,6 +166,8 @@ pub(crate) struct Worker {
     /// pipelines are compiled for.
     samples_now: Arc<AtomicU32>,
     closed: Arc<AtomicBool>,
+    /// Material keys and their casting shaders, updated before shader loads.
+    casters: Arc<Mutex<HashMap<String, String>>>,
     results: Sender<Message>,
 }
 
@@ -186,6 +190,7 @@ impl Loader {
             context,
             samples_now: samples_now.clone(),
             closed: closed.clone(),
+            casters: Arc::new(Mutex::new(HashMap::new())),
             results: sender,
         };
         #[cfg(not(target_arch = "wasm32"))]
@@ -254,7 +259,30 @@ impl Worker {
                 .await;
                 self.send(Message::Compiled { slot, revision, samples, result });
             }
+            Job::Shadow { slot, revision, module, instancing } => {
+                let result = self.compile_shadow(slot, &module, instancing).await;
+                self.send(Message::Shadow { slot, revision, result });
+            }
         }
+    }
+
+    async fn compile_shadow(
+        &self,
+        slot: usize,
+        module: &wgpu::ShaderModule,
+        instancing: bool,
+    ) -> Result<[Option<wgpu::RenderPipeline>; 2], String> {
+        let clock = platform::Clock::new();
+        let result = shader::checked(&self.context.device, || {
+            shader::shadow_pipelines(&self.context, module, instancing)
+        }).await;
+        #[cfg(not(target_arch = "wasm32"))]
+        if std::env::var_os("PEN_FRAME_TIMES").is_some() {
+            eprintln!("shadow pipelines: slot {slot}, {} variants, {:.2} ms", 1 + usize::from(instancing), clock.now() * 1000.0);
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (slot, clock);
+        result
     }
 
     async fn load(&self, slot: usize, kind: AssetKind, key: &str, revision: u64, early: bool) {
@@ -279,6 +307,14 @@ impl Worker {
                     }
                     Ok(material)
                 });
+                if let Ok(material) = &material {
+                    let mut casters = self.casters.lock().unwrap();
+                    if material.casts_shadow() {
+                        casters.insert(key.to_owned(), material.shader.clone());
+                    } else {
+                        casters.remove(key);
+                    }
+                }
                 self.send(loaded(material.map(Loaded::Material)));
             }
             AssetKind::SpriteShader => {
@@ -305,14 +341,17 @@ impl Worker {
                     Ok(pipelines) => pipelines,
                     Err(message) => return self.send(loaded(Err(anyhow::Error::msg(message)))),
                 };
-                // Its shadow pipelines compile now too, so the first frame it
-                // casts a shadow in does not wait on the driver: on a cold
-                // shader cache a large vertex stage takes it most of a second
-                // or more. One that fails is made on first use, which reports
-                // the error.
-                let shadow = shader::checked(device, || shader::shadow_pipelines(&self.context, &module, instancing))
-                    .await
-                    .unwrap_or_default();
+                // Keep hot reload's old shader available until the new one
+                // has its casting variants. Later materials request them
+                // separately; neither path compiles on the frame thread.
+                let casts = self.casters.lock().unwrap().values().any(|shader| shader == key);
+                let mut shadow = Default::default();
+                if casts {
+                    shadow = match self.compile_shadow(slot, &module, instancing).await {
+                        Ok(pipelines) => pipelines,
+                        Err(message) => return self.send(loaded(Err(anyhow::Error::msg(message)))),
+                    };
+                }
                 self.send(loaded(Ok(Loaded::Shader { module: module.clone(), instancing, samples, pipelines, shadow })));
                 // Insets draw with 4 samples a pixel: their pipeline compiles
                 // in the background now, so an inset first shown never waits

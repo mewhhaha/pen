@@ -415,35 +415,6 @@ impl Gpu {
         Ok(pixels)
     }
 
-    /// Draws `frame` offscreen until its assets have loaded and settled
-    /// (at least twice), and returns it as RGBA, rows packed.
-    pub fn draw_settled(&mut self, frame: &RenderFrame, catalog: &Catalog) -> Result<Vec<u8>> {
-        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
-        let started = Instant::now();
-        let texture = self.capture_texture();
-        for draws in 0.. {
-            let output = Output {
-                device: &self.device,
-                queue: &self.queue,
-                surface: None,
-                size: self.size,
-                blitter: None,
-                overlay: None,
-            };
-            self.renderer.submit(frame, catalog, &mut CaptureTarget { output, texture: texture.clone() })?;
-            self.device.poll(wgpu::PollType::wait_indefinitely())?;
-            if let Some(fault) = self.take_fault() {
-                return Err(anyhow!(fault));
-            }
-            if (draws >= 1 && self.renderer.quiet()) || started.elapsed() > PATIENCE {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(4));
-        }
-        let pixels = self.read(&texture)?;
-        Ok(if self.bgra() { swap_red_blue(pixels) } else { pixels })
-    }
-
     fn bgra(&self) -> bool {
         matches!(self.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb)
     }
@@ -457,6 +428,10 @@ impl Gpu {
 pub trait Overlay {
     /// A window event, before the game: whether the game gets it too.
     fn window_event(&mut self, window: &Window, event: &WindowEvent) -> bool;
+    /// Scripted input follows the same ownership rules as window input.
+    fn script_event(&mut self, _event: &GameEvent) -> bool {
+        true
+    }
     /// Before a step: what the overlay shows, and what it asks of the
     /// session; headless, it has no window and lays itself out on the frame.
     fn update(&mut self, session: &mut Session, window: Option<&Window>);
@@ -930,6 +905,7 @@ pub struct Session {
     capture: Capture,
     dev: Option<Dev>,
     profile: Option<Profile>,
+    frame_times: bool,
     /// Steps taken (frames run or paused ones presented).
     frames: usize,
     /// Paces a window's frames to game time (a steady clock, a replay):
@@ -1097,7 +1073,8 @@ impl Session {
             settle(&mut gpu, frame, runtime.catalog())?;
         }
         let profile = Profile::from_env()?;
-        runtime.measure_frames(profile.is_some());
+        let frame_times = std::env::var_os("PEN_FRAME_TIMES").is_some();
+        runtime.measure_frames(profile.is_some() || frame_times);
         let script = (!options.script.is_empty()).then(|| Script::new(options.script.clone()));
         let mut timeline = Timeline::default();
         if options.dev || script::travels_back(&options.script) {
@@ -1118,6 +1095,7 @@ impl Session {
             capture,
             dev,
             profile,
+            frame_times,
             frames: 0,
             pacer: None,
             timeline,
@@ -1293,7 +1271,7 @@ impl Session {
     #[cfg(feature = "devtools")]
     /// Times each frame's phases (`frame_timings`), as PEN_PROFILE_FRAMES does.
     pub fn measure_frames(&mut self, enabled: bool) {
-        self.runtime.measure_frames(enabled || self.profile.is_some());
+        self.runtime.measure_frames(enabled || self.profile.is_some() || self.frame_times);
     }
 
     #[cfg(feature = "devtools")]
@@ -1540,7 +1518,10 @@ impl Session {
         let viewport = Viewport { width: self.gpu.size.0, height: self.gpu.size.1 };
         let mut tick = self.script.as_mut().map(|script| script.tick(viewport)).unwrap_or_default();
         for event in tick.events.drain(..) {
-            self.input.enqueue(event);
+            let game = self.overlay.as_mut().is_none_or(|overlay| overlay.script_event(&event));
+            if game {
+                self.input.enqueue(event);
+            }
         }
         if let Some(overlay) = &mut self.overlay {
             for line in tick.overlay.drain(..) {
@@ -1573,7 +1554,9 @@ impl Session {
         let shell = shell!(self, window);
         self.timeline.prepare(&mut self.runtime, &shell)?;
         self.frames += 1;
-        let last = self.options.frames != 0 && self.frames >= self.options.frames;
+        let last = (self.options.frames != 0 && self.frames >= self.options.frames)
+            || tick.quit
+            || self.script_over();
         let viewport = Viewport { width: self.gpu.size.0, height: self.gpu.size.1 };
         let (input, replayed) = match self.timeline.next() {
             Some(recorded) => {
@@ -1603,7 +1586,7 @@ impl Session {
             overlay_shots,
             saves: tick.saves,
             loads: tick.loads,
-            stop: last || tick.quit || self.script_over(),
+            stop: last,
         })
     }
 
@@ -1689,7 +1672,9 @@ impl Session {
     /// recording), and the script's shots of it.
     fn present_paused(&mut self, window: Option<&Window>, tick: Tick) -> Result<bool> {
         self.frames += 1;
-        let last = self.options.frames != 0 && self.frames >= self.options.frames;
+        let last = (self.options.frames != 0 && self.frames >= self.options.frames)
+            || tick.quit
+            || self.script_over();
         for name in &tick.shots {
             self.capture.screenshots.push(self.paths.shots.join(format!("{name}.png")));
         }
@@ -1711,7 +1696,7 @@ impl Session {
                 return Err(anyhow!(fault));
             }
         }
-        Ok(!(last || tick.quit || self.script_over()))
+        Ok(!last)
     }
 
     /// Runs one frame (or, paused, shows the last again); returns whether
@@ -1899,6 +1884,13 @@ impl Session {
                     .max(0.0);
             timings
         });
+        if self.frame_times && let Some(timing) = self.timings {
+            eprintln!(
+                "frame {}: guest {:.3} wait {:.3} decode {:.3} validate {:.3} submit {:.3} housekeeping {:.3} total {:.3} ms",
+                self.frames, timing.guest_ms, timing.wait_ms, timing.decode_ms,
+                timing.validate_ms, timing.submit_ms, timing.housekeeping_ms, timing.total_ms,
+            );
+        }
         if let Some(profile) = &mut self.profile
             && profile.sample(self.frames, self.timings)
         {

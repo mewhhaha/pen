@@ -11,22 +11,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use blot_host::{Argument, CallbackType, Guest, GuestModule, Parameter, Value, ValueType};
-use pen_protocol::boundary::validate_schema;
 use wasmtime::Engine;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Operation {
-    Stop = 0,
-    Create = 1,
-    Frame = 2,
-    Snapshot = 3,
-    Restore = 4,
-    Scene = 5,
-    LoadScene = 6,
-}
-
-const HANDSHAKE_MAGIC: f32 = 4670544.0;
+pub use pen_runtime::program::Operation;
 
 /// What the guest thread sends back.
 enum Reply {
@@ -110,15 +97,7 @@ impl Program {
             memory,
         };
         let description = program.receive().context("game program handshake")?;
-        ensure!(
-            description.len() == 4
-                && description[0] == HANDSHAKE_MAGIC
-                && description[1] == 1.0
-                && (description[3] == 0.0 || description[3] == 1.0),
-            "invalid game program handshake"
-        );
-        program.schema = validate_schema(description[2])?;
-        program.scenes = description[3] == 1.0;
+        (program.schema, program.scenes) = pen_runtime::program::handshake(&description)?;
         Ok(program)
     }
 
@@ -159,10 +138,7 @@ impl Program {
     pub fn send(&mut self, operation: Operation, payload: &[f32]) -> Result<()> {
         ensure!(!self.stopping, "game program is closed");
         ensure!(self.pending.is_none(), "game program already has a request in flight");
-        let mut request = Vec::with_capacity(2 + payload.len());
-        request.push(if self.commit { 1.0 } else { 0.0 });
-        request.push(operation as u8 as f32);
-        request.extend_from_slice(payload);
+        let request = pen_runtime::program::request(self.commit, operation, payload);
         let sender = self.requests.as_ref().ok_or_else(|| anyhow!("game program is closed"))?;
         if let Some(failure) = &self.failure {
             bail!("game program failed: {failure}");
@@ -184,16 +160,7 @@ impl Program {
     /// Waits for the response to the request in flight.
     pub fn response(&mut self) -> Result<Vec<f32>> {
         let operation = self.pending.take().ok_or_else(|| anyhow!("game program has no request in flight"))?;
-        let mut packet = self.receive()?;
-        if packet.len() == 1 && packet[0] == -1.0 {
-            bail!("game state must be a bounded array of finite float32 values");
-        }
-        ensure!(
-            packet.first() == Some(&(operation as u8 as f32)),
-            "game response does not match its request"
-        );
-        packet.remove(0);
-        Ok(packet)
+        pen_runtime::program::response(operation, self.receive()?)
     }
 
     /// The guest's committed linear-memory bytes, as of its last response.
@@ -227,4 +194,27 @@ impl Drop for Program {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+#[derive(Clone)]
+pub struct NativeBackend(pub Engine);
+impl pen_runtime::program::Backend for NativeBackend {
+    type Module = GuestModule;
+    type Program = Program;
+    async fn start(&self, module: &GuestModule) -> Result<Program> { Program::start(&self.0, module) }
+}
+impl pen_runtime::program::Program for Program {
+    fn schema(&self) -> u32 { self.schema }
+    fn scenes(&self) -> bool { self.scenes }
+    fn send(&mut self, operation: Operation, payload: &[f32]) -> Result<()> { self.send(operation, payload) }
+    async fn response(&mut self) -> Result<Vec<f32>> { self.response() }
+    fn accept(&mut self) { self.accept(); }
+    fn answered(&self) -> Option<Instant> { self.answered() }
+    fn memory_bytes(&self) -> usize {
+        #[cfg(feature = "devtools")]
+        { self.memory_bytes() }
+        #[cfg(not(feature = "devtools"))]
+        { 0 }
+    }
+    async fn close(&mut self) { self.close(); }
 }

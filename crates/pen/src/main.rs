@@ -1,7 +1,4 @@
-//! pen, gdev's native runtime: a winit window (or none), the wgpu renderer and the
-//! game's Blot program on wasmtime. It does what gdev's TypeScript desktop
-//! host does, and can also run headless, record, follow a script and hot
-//! reload while developing.
+//! Native front end: windows, rendering, audio, headless verification and packaging.
 // The player runtime opens no console window on Windows (crash reports go
 // to a file); the development one keeps its console.
 #![cfg_attr(all(windows, not(feature = "compiler")), windows_subsystem = "windows")]
@@ -18,7 +15,6 @@ mod input;
 mod opus;
 mod overlay;
 mod packets;
-mod parity;
 mod pipeline;
 #[cfg(feature = "plugins")]
 mod plugin_build;
@@ -30,10 +26,12 @@ mod script;
 mod services;
 mod session;
 mod snapshot;
+mod staging;
 #[cfg(feature = "steam")]
 mod steam;
 mod timeline;
 mod visual;
+mod web;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -251,8 +249,7 @@ commands, in a gdev checkout (or with --project DIR):
   dev [--no-pipeline] compile the game's Blot program and play it, reloading the program,
                       shaders and assets as they change, with the game's state kept; and
                       rerun the checkout's asset recipes (pipeline.json) as their sources change
-  web                 the checkout's browser build (`deno task web`): its console,
-                      diagnostics and the browser's devtools, with hot reload
+  web [--port N]      browser development server with hot reload and dev tools
   run                 compile once and play
   build [--out DIR] [--runtime EXE] [--target TRIPLE] [--cpu PRESET]
                       a shippable folder: the player runtime (default: player/ beside this
@@ -260,12 +257,13 @@ commands, in a gdev checkout (or with --project DIR):
                       the runtime's platform and a CPU baseline (default x86-64-v2, or native)
                       (default .pen/package)
   build --web [--out DIR]
-                      the browser build as static files for any web host (scripts/export_web.ts;
-                      default .pen/web-export)
+                      Rust browser host and game as static files (default .pen/web-export)
+  check               compile the game and dev tools
+  codegen [--check] [--rust FILE]
+                      generate or check protocol code from the embedded schema
+  export --out DIR    export game.wasm, scene and assets for verification
   test [FILE] [--update] [--only NAME...] [--golden DIR] [--out DIR]
                       golden-image tests (default tests/visual/scenarios.json)
-  parity [--at N,N...] [--size WxH] [--script STEPS] [--threshold T]
-                      compare the native renderer with renderer.ts on the same frames
   bench [--frames N]  guest time per frame, without rendering
   packets DIR [--frames N] [--script STEPS]
                       each frame's input and render packet, without rendering
@@ -348,7 +346,7 @@ struct Args {
 impl Args {
     fn parse() -> Args {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let commands = ["dev", "web", "run", "build", "test", "parity", "bench", "packets", "test-blot"];
+        let commands = ["dev", "web", "run", "build", "export", "check", "codegen", "test", "bench", "packets", "test-blot"];
         let command = args.first().filter(|first| commands.contains(&first.as_str())).cloned();
         let rest = if command.is_some() { args[1..].to_vec() } else { args };
         // Words that are neither options nor their values.
@@ -374,6 +372,7 @@ impl Args {
                 | "--settle"
                 | "--no-settle"
                 | "--update"
+                | "--check"
                 | "--help"
                 | "--version"
                 | "--steam"
@@ -653,20 +652,19 @@ fn main() -> Result<()> {
         }
         Some("web") => {
             let project = checkout()?;
-            let mut command = std::process::Command::new("deno");
-            command.args(["task", "web"]).current_dir(&project.root);
-            // Become the server, so stopping pen stops it.
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                Err(command.exec()).context("running deno task web in the checkout")
-            }
-            #[cfg(not(unix))]
-            {
-                let status = command.status().context("running deno task web in the checkout")?;
-                std::process::exit(status.code().unwrap_or(1));
-            }
+            web::serve(project, args.value("--port").map(|port| port.parse()).transpose()?)
         }
+        Some("export") => project::export_bundle(&checkout()?, &args.path("--out").context("export needs --out DIR")?),
+        Some("check") => {
+            let project = checkout()?;
+            project.compile(&project.native())?;
+            project.compile_devtools(&project.native())?;
+            Ok(())
+        }
+        #[cfg(feature = "compiler")]
+        Some("codegen") => pen_codegen::generate(&checkout()?.root, args.path("--rust").as_deref(), args.flag("--check")),
+        #[cfg(not(feature = "compiler"))]
+        Some("codegen") => bail!("this player runtime has no protocol generator"),
         Some("run") => {
             let project = checkout()?;
             let mut devtools = if devtools_wanted(&args)? { project.build_devtools(&project.native(), false)? } else { None };
@@ -723,31 +721,6 @@ fn main() -> Result<()> {
             let scene = game.scene_to_start();
             let visual_game = visual::Game { directory: &game.directory, assets: &game.assets, scene: &scene };
             visual::run(test, visual_game, engine, module, catalog)
-        }
-        Some("parity") => {
-            let project = checkout()?;
-            project.compile(&project.native())?;
-            let engine = blot_host::engine()?;
-            let module = load_module(&engine, &project.native(), true)?;
-            let steps = args.script()?;
-            let options = parity::ParityOptions {
-                size: args.value("--size").map(|text| size(&text)).transpose()?.unwrap_or((960, 640)),
-                steps: if steps.is_empty() {
-                    script::parse(&[
-                        "wait=30 key=Tab wait=40 click=470,150 wait=20 drag=300,500,600,450 wait=30 key=Tab wait=30".into(),
-                    ])?
-                } else {
-                    steps
-                },
-                at: args
-                    .value("--at")
-                    .map(|list| list.split(',').map(str::parse).collect::<Result<Vec<usize>, _>>())
-                    .transpose()?
-                    .unwrap_or_default(),
-                threshold: args.value("--threshold").map(|value| value.parse()).transpose()?.unwrap_or(0.002),
-                out: args.path("--out").unwrap_or_else(|| project.root.join(".pen/parity")),
-            };
-            parity::run(&project, &engine, &module, options)
         }
         Some(command @ ("bench" | "packets")) => {
             let game = match args.path("--game") {

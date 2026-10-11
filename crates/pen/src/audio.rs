@@ -391,7 +391,7 @@ mod tests {
         std::fs::write(&out, bytes).unwrap();
     }
 
-    /// Every clip in the exported bundle decodes (run tools/export_gdev.ts first).
+    /// Every clip in an exported bundle decodes.
     #[test]
     fn bundle_clips_decode() {
         let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist/gdev/assets");

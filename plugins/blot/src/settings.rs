@@ -43,6 +43,8 @@ pub struct Settings {
     pub semantic_workers: Option<u32>,
     /// The only compiler identity (64 lowercase hex digits) to accept.
     pub expected_identity: Option<String>,
+    /// Native readers owned by blotc. Paths are resolved against the project.
+    pub native_assets: Option<Value>,
 }
 
 impl Settings {
@@ -53,7 +55,7 @@ impl Settings {
         let Value::Object(fields) = value else {
             return Err("the settings are not a JSON object".into());
         };
-        const KNOWN: [&str; 8] = [
+        const KNOWN: [&str; 9] = [
             "program",
             "imports",
             "std",
@@ -62,6 +64,7 @@ impl Settings {
             "codegenTier",
             "semanticWorkers",
             "expectedIdentity",
+            "nativeAssets",
         ];
         if let Some(unknown) = fields.keys().find(|key| !KNOWN.contains(&key.as_str())) {
             return Err(format!("the settings have no `{unknown}` (they have {})", KNOWN.join(", ")));
@@ -112,6 +115,7 @@ impl Settings {
             codegen_tier,
             semantic_workers,
             expected_identity,
+            native_assets: native_assets(fields.get("nativeAssets"), root)?,
         })
     }
 
@@ -138,8 +142,50 @@ impl Settings {
                 watched.push(path);
             }
         }
+        if let Some(assets) = &self.native_assets {
+            for root in assets["roots"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                let root = root.to_owned();
+                if !watched.contains(&root) {
+                    watched.push(root);
+                }
+            }
+            for import in assets["imports"].as_array().into_iter().flatten() {
+                if let Some(path) = import["path"].as_str() {
+                    watched.push(path.to_owned());
+                }
+            }
+        }
         watched
     }
+}
+
+fn native_assets(value: Option<&Value>, root: &str) -> Result<Option<Value>, String> {
+    let mut assets = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(assets)) => assets.clone(),
+        _ => return Err("nativeAssets must be an object".into()),
+    };
+    if assets.keys().any(|key| !["roots", "imports"].contains(&key.as_str())) {
+        return Err("nativeAssets accepts roots and imports".into());
+    }
+    for field in ["roots", "imports"] {
+        assets.entry(field.to_owned()).or_insert_with(|| Value::Array(Vec::new()));
+    }
+    let roots = assets.get_mut("roots").and_then(Value::as_array_mut).ok_or("nativeAssets.roots must be an array")?;
+    for path in roots {
+        let text = path.as_str().ok_or("nativeAssets root must be a path")?;
+        *path = Value::String(resolve(root, checked_path(text, "nativeAssets.roots")?));
+    }
+    let imports = assets.get_mut("imports").and_then(Value::as_array_mut).ok_or("nativeAssets.imports must be an array")?;
+    for import in imports {
+        let fields = import.as_object_mut().ok_or("nativeAssets import must be an object")?;
+        for field in ["module", "path"] {
+            let path = fields.get(field).and_then(Value::as_str).ok_or_else(|| format!("nativeAssets import needs {field}"))?;
+            let path = resolve(root, checked_path(path, field)?);
+            fields.insert(field.into(), Value::String(path));
+        }
+    }
+    Ok(Some(Value::Object(assets)))
 }
 
 /// The settings' `imports`: an object of prefixes, each ending in `/`, and
@@ -188,18 +234,22 @@ fn drive(path: &str) -> bool {
 
 /// `path`, absolute: as it is when it is, else from `directory`, without
 /// its `.` and `..` (as Node's `path.resolve` has it). A Windows path (from
-/// a drive or a share) takes either separator and is written with `\`.
+/// a drive or a share) takes either separator. Protocol paths use `/`.
 pub(crate) fn resolve(directory: &str, path: &str) -> String {
-    let joined = if is_absolute(path) { path.to_string() } else { format!("{directory}/{path}") };
-    let windows = drive(&joined) || joined.starts_with("\\\\");
+    let joined = if is_absolute(path) {
+        path.to_string()
+    } else {
+        format!("{}/{path}", directory.trim_end_matches(['/', '\\']))
+    };
+    let windows = drive(&joined) || (joined.starts_with("\\\\") || joined.starts_with("//"));
     let separators: &[char] = if windows { &['/', '\\'] } else { &['/'] };
     // What `..` never climbs above: `/`, `C:\` or `\\server\share\`.
     let (prefix, rest) = if drive(&joined) {
-        (joined[..2].to_string() + "\\", &joined[3..])
+        (joined[..2].to_string() + "/", &joined[3..])
     } else if windows {
         let mut parts = joined[2..].splitn(3, separators);
         let (server, share) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-        (format!("\\\\{server}\\{share}\\"), parts.next().unwrap_or(""))
+        (format!("//{server}/{share}/"), parts.next().unwrap_or(""))
     } else {
         ("/".to_string(), joined.trim_start_matches('/'))
     };
@@ -213,7 +263,7 @@ pub(crate) fn resolve(directory: &str, path: &str) -> String {
             part => parts.push(part),
         }
     }
-    prefix + &parts.join(if windows { "\\" } else { "/" })
+    prefix + &parts.join("/")
 }
 
 /// The directory the file at `path` (absolute) is in; the root's is itself.
@@ -232,10 +282,10 @@ mod tests {
         assert_eq!(resolve("/a/b", "../c/./d/"), "/a/c/d");
         assert_eq!(resolve("/a/b", "/x/../y"), "/y");
         assert_eq!(resolve("/a", "../../.."), "/");
-        assert_eq!(resolve("C:\\games\\gdev", "../blot2/std"), "C:\\games\\blot2\\std");
-        assert_eq!(resolve("C:/games/gdev", "packages/"), "C:\\games\\gdev\\packages");
-        assert_eq!(resolve("\\\\host\\share\\gdev", "..\\..\\x"), "\\\\host\\share\\x");
-        assert_eq!(resolve("/a", "D:\\b"), "D:\\b");
+        assert_eq!(resolve("C:\\games\\gdev", "../blot2/std"), "C:/games/blot2/std");
+        assert_eq!(resolve("C:/games/gdev", "packages/"), "C:/games/gdev/packages");
+        assert_eq!(resolve("\\\\host\\share\\gdev", "..\\..\\x"), "//host/share/x");
+        assert_eq!(resolve("/a", "D:\\b"), "D:/b");
     }
 
     #[test]
@@ -243,8 +293,8 @@ mod tests {
         assert_eq!(parent("/a/b/main.blot"), "/a/b");
         assert_eq!(parent("/main.blot"), "/");
         assert_eq!(parent("/"), "/");
-        assert_eq!(parent("C:\\gdev\\src\\main.blot"), "C:\\gdev\\src");
-        assert_eq!(parent("C:\\main.blot"), "C:\\");
+        assert_eq!(parent("C:\\gdev\\src\\main.blot"), "C:/gdev/src");
+        assert_eq!(parent("C:\\main.blot"), "C:/");
     }
 
     #[test]

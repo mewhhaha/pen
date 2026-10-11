@@ -1,0 +1,31 @@
+[package]
+name = "pen-web"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+pen-protocol = { path = "../pen-protocol" }
+pen-runtime = { path = "../pen-runtime" }
+pen-render = { path = "../pen-render" }
+futures-channel = "0.3"
+js-sys = "0.3.106"
+serde_json = "1"
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4.79"
+web-time = "1"
+web-sys = { version = "0.3.106", features = ["HtmlCanvasElement", "DomRect", "console", "Window", "Document", "Element", "EventTarget", "Event", "KeyboardEvent", "MouseEvent", "WheelEvent", "Response", "Request", "RequestInit", "Headers", "Storage", "Location", "IdbFactory", "IdbDatabase", "IdbOpenDbRequest", "IdbRequest", "IdbObjectStore", "IdbTransaction", "IdbTransactionMode", "DomException", "Performance", "Navigator", "Clipboard", "CssStyleDeclaration", "HtmlElement", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioParam", "GainNode", "StereoPannerNode", "BiquadFilterNode", "BiquadFilterType", "ConvolverNode", "AudioScheduledSourceNode"] }
+wgpu = "30"
+
+[workspace]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

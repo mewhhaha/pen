@@ -10,7 +10,7 @@ name = "pen"
 path = "src/main.rs"
 
 [features]
-default = ["compiler", "devtools"]
+default = ["compiler", "devtools", "plugins"]
 # Cranelift, which compiles game.wasm: every command but playing a packaged
 # game needs it. Without it (`--no-default-features`) this is the player
 # runtime `pen build` ships: it only loads the game.cwasm the package was
@@ -21,10 +21,15 @@ steam = ["dep:steamworks"]
 # console and diagnostics, run beside the game in `pen dev` and `pen run`.
 # The player runtime leaves them out.
 devtools = []
+# Wasm plugins (`pen-plugins`, wit/pen-plugin.wit) the checkout's pen.json
+# chooses to build its programs, instead of Deno. They compile, so they need
+# the compiler; the player runtime leaves them out.
+plugins = ["compiler", "dep:pen-plugins"]
 
 [dependencies]
 anyhow.workspace = true
 blot-host.workspace = true
+pen-plugins = { workspace = true, optional = true }
 pen-protocol.workspace = true
 pen-render.workspace = true
 wasmtime.workspace = true

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/blot-host", "crates/pen", "crates/pen-protocol", "crates/pen-render"]
+members = ["crates/blot-host", "crates/pen", "crates/pen-plugins", "crates/pen-protocol", "crates/pen-render"]
+# Wasm plugins build apart, for wasm32-wasip2 (plugins/Cargo.toml).
+exclude = ["plugins"]
 
 [workspace.package]
 edition = "2024"
@@ -9,6 +11,7 @@ license = "MIT"
 [workspace.dependencies]
 anyhow = "1"
 blot-host = { path = "crates/blot-host", default-features = false }
+pen-plugins = { path = "crates/pen-plugins" }
 pen-protocol = { path = "crates/pen-protocol" }
 pen-render = { path = "crates/pen-render" }
 wgpu = "30"

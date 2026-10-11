@@ -1,0 +1,157 @@
+/// pen's Wasm plugins: components a checkout chooses (its `pen.json`) to do
+/// what is specific to its language or toolchain, so that pen itself only
+/// runs Wasm. A compiler plugin turns a program's sources into a Wasm module,
+/// again and again as they change; an assets plugin makes the virtual modules
+/// a program imports its assets through.
+///
+/// A plugin has no ambient access to the machine. WASI gives it clocks,
+/// randomness and stdout and stderr (which reach pen's log); pen's own
+/// interfaces below give it what the checkout granted it, and nothing more.
+package pen:plugin@0.1.0;
+
+/// What plugins and pen exchange.
+interface types {
+    /// A source file for one build: its absolute path and its contents, or
+    /// none to hide the file on disk for this build.
+    record overlay {
+        path: string,
+        contents: option<string>,
+    }
+
+    /// A problem a build found in a program.
+    record diagnostic {
+        /// The absolute path of the file it is in.
+        file: string,
+        /// Where in the toolchain it was found (the compiler's word).
+        stage: string,
+        /// A stable name for the problem.
+        code: string,
+        /// UTF-8 byte offsets in `file`; both 0 when it has no place.
+        start: u32,
+        end: u32,
+        message: string,
+    }
+
+    /// A program of the checkout's: its root, its entry file (absolute) and
+    /// the settings `pen.json` gives the plugin, as JSON text ("{}" when
+    /// none).
+    record program {
+        root: string,
+        entry: string,
+        settings: string,
+    }
+}
+
+/// Lines for pen's log (the terminal, and the dev tools' console).
+interface log {
+    enum level {
+        info,
+        error,
+    }
+    write: func(level: level, message: string);
+}
+
+/// Reading the checkout's files, under the roots `pen.json` grants the
+/// plugin. Paths are absolute; one outside every granted root is refused.
+interface files {
+    read: func(path: string) -> result<list<u8>, string>;
+    /// The names in a directory (files and directories), sorted.
+    read-directory: func(directory: string) -> result<list<string>, string>;
+    /// Whether a file or directory is there.
+    exists: func(path: string) -> bool;
+}
+
+/// Running the programs `pen.json` grants the plugin, by the names it grants
+/// them under, with piped standard input and output.
+interface process {
+    variant read-error {
+        /// The program closed its output.
+        closed,
+        /// Nothing came within the time asked for.
+        timeout,
+        other(string),
+    }
+
+    resource child {
+        /// Writes all of `bytes` to its standard input.
+        write: func(bytes: list<u8>) -> result<_, string>;
+        /// Closes its standard input.
+        close-input: func();
+        /// Waits for its standard output, up to `timeout-ms` (forever when
+        /// none), and returns what came: at least one byte, at most `max`.
+        read: func(max: u32, timeout-ms: option<u32>) -> result<list<u8>, read-error>;
+        /// The last 64 KiB of its standard error, as text.
+        error-tail: func() -> string;
+        /// Waits up to `timeout-ms` for it to exit; its exit code, or none
+        /// while it still runs (or when a signal stopped it).
+        wait: func(timeout-ms: option<u32>) -> option<s32>;
+        kill: func();
+    }
+
+    /// Starts the program granted as `name` with `args`, in the checkout's
+    /// root, its environment only `env`.
+    spawn: func(name: string, args: list<string>, env: list<tuple<string, string>>) -> result<child, string>;
+
+    /// A directory of pen's cache that is this plugin's own (it exists), for
+    /// the programs it runs to keep their caches in.
+    cache-directory: func() -> string;
+}
+
+/// Turning a program's sources into a Wasm module. pen opens one compiler per
+/// program it builds, builds it, and builds it again whenever a file under
+/// one of its watched paths changes, until it closes it.
+interface compiler {
+    use types.{overlay, diagnostic, program};
+
+    variant build-result {
+        /// The program's Wasm module.
+        built(list<u8>),
+        /// Why it does not compile: at least one diagnostic.
+        rejected(list<diagnostic>),
+    }
+
+    resource session {
+        /// Opens `program` (the compiler may start a process and keep it).
+        open: static func(program: program) -> result<session, string>;
+        /// Builds it from the files on disk, and `overlays` over them for
+        /// this build only. An error is a failure of the compiler itself,
+        /// not of the program: pen reports it and may open a new session.
+        build: func(overlays: list<overlay>) -> result<build-result, string>;
+        /// The paths (files or directories) whose changes need a new build.
+        watched: func() -> list<string>;
+    }
+}
+
+/// The virtual modules a program imports its assets through (its catalog,
+/// words, shaders...), made from the checkout's files. pen asks before each
+/// build and passes them to the compiler as overlays.
+interface assets {
+    use types.{overlay, program};
+
+    record generated {
+        /// Each module, at the absolute path the program imports it from.
+        modules: list<overlay>,
+        /// The files (absolute) they were made from, and directories whose
+        /// new or removed files would change them: a change to one makes
+        /// pen ask again.
+        dependencies: list<string>,
+    }
+
+    /// The modules for `program`, or why they cannot be made.
+    generate: func(program: program) -> result<generated, string>;
+}
+
+/// A plugin that compiles programs.
+world compiler-plugin {
+    import log;
+    import files;
+    import process;
+    export compiler;
+}
+
+/// A plugin that makes asset modules.
+world assets-plugin {
+    import log;
+    import files;
+    export assets;
+}

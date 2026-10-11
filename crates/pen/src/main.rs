@@ -19,6 +19,8 @@ mod overlay;
 mod packets;
 mod parity;
 mod pipeline;
+#[cfg(feature = "plugins")]
+mod plugin_build;
 mod program;
 mod project;
 mod record;

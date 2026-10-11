@@ -1,2 +1,4 @@
 [toolchain]
 channel = "1.99.0"
+# Plugins (plugins/) are components for wasm32-wasip2.
+targets = ["wasm32-wasip2"]

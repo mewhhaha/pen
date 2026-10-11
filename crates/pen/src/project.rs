@@ -1,7 +1,7 @@
 //! A gdev checkout as a project the binary develops, runs and packages:
-//! its Blot program compiles with the checkout's own compiler setup through
-//! Deno (the script is embedded here), and its assets and scene are used in
-//! place.
+//! its programs compile through the Wasm plugins its `pen.json` chooses
+//! (`plugin_build`), or else with its own compiler setup through Deno (the
+//! script is embedded here), and its assets and scene are used in place.
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -12,6 +12,9 @@ const BUILD_SCRIPT: &str = include_str!("../scripts/blot_build.ts");
 
 pub struct Project {
     pub root: PathBuf,
+    /// Its Wasm plugins, loaded when first asked for.
+    #[cfg(feature = "plugins")]
+    plugins: std::sync::OnceLock<Option<std::sync::Arc<pen_plugins::Plugins>>>,
 }
 
 impl Project {
@@ -24,7 +27,11 @@ impl Project {
         let start = std::fs::canonicalize(&start).with_context(|| format!("{} does not exist", start.display()))?;
         for directory in start.ancestors() {
             if directory.join("blot_runtime.ts").is_file() && directory.join("src/main.blot").is_file() {
-                return Ok(Project { root: directory.to_owned() });
+                return Ok(Project {
+                    root: directory.to_owned(),
+                    #[cfg(feature = "plugins")]
+                    plugins: std::sync::OnceLock::new(),
+                });
             }
         }
         bail!(
@@ -62,6 +69,23 @@ impl Project {
         ["devtools/main.blot", "src/devtools/main.blot"].into_iter().find(|entry| self.root.join(entry).is_file())
     }
 
+    /// The checkout's plugins, when its `pen.json` chooses a compiler: they
+    /// build its programs instead of Deno.
+    #[cfg(feature = "plugins")]
+    fn plugins(&self) -> Result<Option<std::sync::Arc<pen_plugins::Plugins>>> {
+        if let Some(plugins) = self.plugins.get() {
+            return Ok(plugins.clone());
+        }
+        let loaded = crate::plugin_build::load(&self.root)?;
+        Ok(self.plugins.get_or_init(|| loaded).clone())
+    }
+
+    /// What a plugin build never watches: what pen writes.
+    #[cfg(feature = "plugins")]
+    fn written(&self) -> Vec<PathBuf> {
+        vec![self.root.join(".pen"), self.root.join("target")]
+    }
+
     fn command(&self, out: &Path, watch: bool) -> Result<Command> {
         ensure!(
             blot_host::COMPILER,
@@ -92,6 +116,19 @@ impl Project {
     pub fn build_devtools(&self, out: &Path, watch: bool) -> Result<Option<Watcher>> {
         let Some(entry) = self.devtools() else { return Ok(None) };
         std::fs::create_dir_all(out)?;
+        #[cfg(feature = "plugins")]
+        if let Some(plugins) = self.plugins()? {
+            // Built again as it changes, in `run` too: the dev tools reload.
+            let built = crate::plugin_build::watch(
+                plugins,
+                "dev tools",
+                &self.root.join(entry),
+                &out.join("devtools.wasm"),
+                self.written(),
+            )?;
+            return Ok(Some(Watcher { child: None, plugin: Some(built) }));
+        }
+        let _ = watch;
         let mut child = self
             .command(out, watch)?
             .args(["--entry", entry, "--name", "devtools.wasm"])
@@ -102,12 +139,16 @@ impl Project {
         if let Some(stderr) = child.stderr.take() {
             crate::overlay::forward_build_output(stderr);
         }
-        Ok(Some(Watcher { child }))
+        Ok(Some(Watcher::deno(child)))
     }
 
     /// Compiles the Blot program into `out/game.wasm` once.
     pub fn compile(&self, out: &Path) -> Result<()> {
         std::fs::create_dir_all(out)?;
+        #[cfg(feature = "plugins")]
+        if let Some(plugins) = self.plugins()? {
+            return crate::plugin_build::compile(plugins, "game", &self.root.join("src/main.blot"), &out.join("game.wasm"));
+        }
         let started = Instant::now();
         let status = self
             .command(out, false)?
@@ -127,6 +168,19 @@ impl Project {
         std::fs::create_dir_all(out)?;
         let wasm = out.join("game.wasm");
         let _ = std::fs::remove_file(&wasm);
+        #[cfg(feature = "plugins")]
+        if let Some(plugins) = self.plugins()? {
+            let (watching, built) =
+                crate::plugin_build::watch(plugins, "game", &self.root.join("src/main.blot"), &wasm, self.written())?;
+            // As with Deno, play starts with the first build that compiles.
+            loop {
+                match built.recv() {
+                    Ok(true) => return Ok(Watcher { child: None, plugin: Some((watching, built)) }),
+                    Ok(false) => overlay_waiting(),
+                    Err(_) => bail!("the game's plugin build stopped"),
+                }
+            }
+        }
         let mut child = self
             .command(out, true)?
             .stdin(Stdio::piped())
@@ -139,7 +193,7 @@ impl Project {
         }
         loop {
             if wasm.exists() {
-                return Ok(Watcher { child });
+                return Ok(Watcher::deno(child));
             }
             if let Some(status) = child.try_wait()? {
                 bail!("the game's Blot program did not compile ({status})");
@@ -169,31 +223,59 @@ pub(crate) fn temporary_dir() -> Result<PathBuf> {
     Ok(directory)
 }
 
-/// The compiler watching the project; stops when dropped.
+/// Says once, while waiting for a game that does not compile yet, that its
+/// next edit is awaited.
+#[cfg(feature = "plugins")]
+fn overlay_waiting() {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| crate::overlay::info(crate::overlay::Source::Build, "waiting for an edit that compiles"));
+}
+
+/// The compiler watching the project (Deno's, or the plugins' build
+/// thread); stops when dropped.
 pub struct Watcher {
-    child: Child,
+    child: Option<Child>,
+    #[cfg(feature = "plugins")]
+    plugin: Option<(pen_plugins::Watching, std::sync::mpsc::Receiver<bool>)>,
 }
 
 impl Watcher {
-    /// Waits for a build that does not watch to finish; whether it built.
+    fn deno(child: Child) -> Watcher {
+        Watcher {
+            child: Some(child),
+            #[cfg(feature = "plugins")]
+            plugin: None,
+        }
+    }
+
+    /// Waits for a build that does not watch (or a plugin build's first) to
+    /// finish; whether it built.
     pub fn wait(&mut self) -> Result<bool> {
-        Ok(self.child.wait()?.success())
+        #[cfg(feature = "plugins")]
+        if let Some((_, built)) = &self.plugin {
+            return Ok(built.recv().unwrap_or(false));
+        }
+        match &mut self.child {
+            Some(child) => Ok(child.wait()?.success()),
+            None => Ok(true),
+        }
     }
 }
 
 impl Drop for Watcher {
     fn drop(&mut self) {
+        let Some(child) = &mut self.child else { return };
         // Closing stdin asks the script to finish its build and stop.
-        drop(self.child.stdin.take());
+        drop(child.stdin.take());
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
+            if let Ok(Some(_)) = child.try_wait() {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 

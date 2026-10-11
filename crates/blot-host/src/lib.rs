@@ -740,6 +740,11 @@ fn config() -> wasmtime::Config {
 fn config_inlining(inlining: bool) -> wasmtime::Config {
     let mut config = wasmtime::Config::new();
     config.wasm_reference_types(true);
+    // Guests are core modules. pen's plugins turn wasmtime's component model
+    // on in the builds that have them, which would otherwise enable it here
+    // too, and a precompiled game records the features it was made with: a
+    // player runtime (no plugins) would refuse one from a development build.
+    config.wasm_features(wasmtime::WasmFeatures::COMPONENT_MODEL, false);
     config.max_wasm_stack(GUEST_STACK_BYTES);
     // Only checked against max_wasm_stack; guests run synchronously.
     config.async_stack_size(GUEST_STACK_BYTES + (1 << 20));

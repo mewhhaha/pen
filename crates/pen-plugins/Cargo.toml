@@ -1,0 +1,22 @@
+[package]
+name = "pen-plugins"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Hosts pen's Wasm plugins (wit/pen-plugin.wit): compiler and asset components"
+
+[dependencies]
+anyhow.workspace = true
+# Components and Cranelift to compile them: plugins are a development tool,
+# in the builds that compile (pen's `plugins` feature).
+wasmtime = { workspace = true, features = ["component-model", "cranelift"] }
+wasmtime-wasi = { version = "49", default-features = false, features = ["p2"] }
+dirs = "7"
+flate2 = "1"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+serde_json = "1"

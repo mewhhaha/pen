@@ -88,6 +88,11 @@ of the old one's state and draws a frame before it replaces it. A build that
 fails to compile, start or take the state leaves the old one running, and the
 console says why.
 
+An invalid game frame pauses `pen dev` at its last accepted state instead of
+closing it. The window, dev tools and watcher keep running; a valid reload
+resumes playback unless you paused it yourself. Decode errors identify the
+packet length or the first nonfinite lane. Play can retry the running build.
+
 The state survives most edits. gdev saves it in keyed, versioned sections, one
 per saved type (gdev's README, "Saved state"). A new build keeps each section
 saved with its type's current version, migrates one saved with another

@@ -63,6 +63,16 @@ pub enum ReloadResult {
     Incompatible,
 }
 
+/// Output rejected before accepting the guest's candidate state.
+#[derive(Debug)]
+pub struct InvalidFrame;
+
+impl std::fmt::Display for InvalidFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid game frame")
+    }
+}
+
 /// CPU wall times, in milliseconds. Guest includes simulation, render prep and bridge.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameTimings {
@@ -421,10 +431,18 @@ impl<B: Backend> GameRuntime<B> {
         let waiting = Instant::now();
         let packet = self.active.program.response().await?;
         let returned = Instant::now();
-        let next = decode_frame(&packet, self.active.schema, &self.catalog)?;
-        ensure!(next.state.is_empty(), "program frame must keep its state inside the guest");
+        let next = decode_frame(&packet, self.active.schema, &self.catalog).map_err(|error| {
+            let details = match packet.iter().position(|value| !value.is_finite()) {
+                Some(lane) => format!("nonfinite value {} at frame lane {lane}", packet[lane]),
+                None => format!("decoding a {}-lane game frame", packet.len()),
+            };
+            error.context(details).context(InvalidFrame)
+        })?;
+        if !next.state.is_empty() {
+            return Err(anyhow::anyhow!("program frame must keep its state inside the guest").context(InvalidFrame));
+        }
         let decoded = Instant::now();
-        host.validate(&next.render)?;
+        host.validate(&next.render).map_err(|error| error.context(InvalidFrame))?;
         self.active.program.accept();
         if self.hashing {
             self.packet_hash = hash_lanes(&packet);

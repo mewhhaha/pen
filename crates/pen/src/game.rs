@@ -6,7 +6,7 @@ use pen_protocol::{Catalog, Frame, RenderFrame};
 use wasmtime::Engine;
 use crate::program::NativeBackend;
 use crate::snapshot::{self, SavedState};
-pub use pen_runtime::game::{Edits, FrameTimings, Host, Moment, Quiet, ReloadResult, hash_lanes};
+pub use pen_runtime::game::{Edits, FrameTimings, Host, InvalidFrame, Moment, Quiet, ReloadResult, hash_lanes};
 
 pub struct GameRuntime(pen_runtime::game::GameRuntime<NativeBackend>);
 impl GameRuntime {

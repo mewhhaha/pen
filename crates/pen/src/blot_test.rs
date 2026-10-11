@@ -694,7 +694,7 @@ fn milliseconds(duration: Duration) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn leb(mut value: u32) -> Vec<u8> {
@@ -710,7 +710,7 @@ mod tests {
         }
     }
 
-    fn signed_leb(mut value: i32) -> Vec<u8> {
+    pub(crate) fn signed_leb(mut value: i32) -> Vec<u8> {
         let mut bytes = Vec::new();
         loop {
             let byte = (value & 0x7f) as u8;
@@ -752,6 +752,15 @@ mod tests {
     /// each entry is a name, its manifest tags and its Wasm type and body.
     /// The arrays it returns lie at fixed places in its memory.
     fn guest(entries: &[(&str, &[u8], usize, Vec<u8>)], arrays: &[(i32, &[f32])]) -> Vec<u8> {
+        guest_with_main(entries, arrays, constant(0))
+    }
+
+    /// A long-lived program fixture, without a compiler or plugin dependency.
+    pub(crate) fn program(main: Vec<u8>, arrays: &[(i32, &[f32])]) -> Vec<u8> {
+        guest_with_main(&[], arrays, main)
+    }
+
+    fn guest_with_main(entries: &[(&str, &[u8], usize, Vec<u8>)], arrays: &[(i32, &[f32])], main: Vec<u8>) -> Vec<u8> {
         let function_type = |parameters: &[u8], results: &[u8]| {
             [
                 vec![0x60],
@@ -771,7 +780,7 @@ mod tests {
         let imports =
             vector(vec![[name(blot_host::HOST_MODULE), name("call_array_f32_array_f32"), vec![0x00, 2]].concat()]);
         // Functions after the import: blot:allocate, blot:reset, main, then the entries.
-        let mut bodies = vec![constant(1024), constant(0), constant(0)];
+        let mut bodies = vec![constant(1024), constant(0), main];
         let mut type_indices = vec![0, 0, 3];
         let mut exports = vec![
             [name("blot:memory"), vec![0x02, 0]].concat(),

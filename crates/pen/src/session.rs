@@ -26,7 +26,7 @@ use winit::window::Window;
 
 use crate::audio::Audio;
 use crate::dev::{Dev, Update};
-use crate::game::{FrameTimings, GameRuntime, Host, Quiet, ReloadResult, hash_lanes};
+use crate::game::{FrameTimings, GameRuntime, Host, InvalidFrame, Quiet, ReloadResult, hash_lanes};
 use crate::input::{Hotkey, Input};
 use crate::overlay::{self, Source};
 use crate::record::Recorder;
@@ -913,6 +913,8 @@ pub struct Session {
     pacer: Option<(Instant, f64)>,
     timeline: Timeline,
     paused: bool,
+    /// A rejected frame paused live playback; a valid reload should play on.
+    resume_after_reload: bool,
     /// Frames to run while paused.
     steps: u32,
     /// Positions to go back (or forward) to once the guest is idle.
@@ -1100,6 +1102,7 @@ impl Session {
             pacer: None,
             timeline,
             paused: false,
+            resume_after_reload: false,
             steps: 0,
             rewinds: VecDeque::new(),
             replaying: None,
@@ -1163,6 +1166,7 @@ impl Session {
     /// Stops the game where it is; the window keeps showing (and drawing)
     /// the last frame.
     pub fn pause(&mut self) {
+        self.resume_after_reload = false;
         if !self.paused {
             self.paused = true;
             self.clock.pause();
@@ -1173,6 +1177,7 @@ impl Session {
     /// Plays on. After a rewind, play continues live from there, and the
     /// frames that had followed are forgotten; a paused replay plays on.
     pub fn resume(&mut self) {
+        self.resume_after_reload = false;
         if !self.paused {
             return;
         }
@@ -1636,6 +1641,9 @@ impl Session {
             if let Some(drawn) = self.runtime.take_drawn() {
                 self.last = Some(drawn);
             }
+            if self.resume_after_reload {
+                self.resume();
+            }
             if self.timeline.history() {
                 overlay::info(Source::Reload, format!("dev: Ctrl+Shift+R replays the last {REPLAY_SECONDS} s on the new build"));
             }
@@ -1684,6 +1692,11 @@ impl Session {
         if last && let Some(path) = &self.final_overlay_shot {
             self.capture.overlay_shots.push(path.clone());
         }
+        self.present_last(window)?;
+        Ok(!last)
+    }
+
+    fn present_last(&mut self, window: Option<&Window>) -> Result<()> {
         if let Some(frame) = self.last.take() {
             let recorder = self.capture.recorder.take();
             let mut shell = shell!(self, window);
@@ -1696,7 +1709,30 @@ impl Session {
                 return Err(anyhow!(fault));
             }
         }
-        Ok(!last)
+        Ok(())
+    }
+
+    /// Invalid guest output never commits its candidate state. Keep the last
+    /// valid frame visible and the development watcher running until a fix.
+    fn reject_frame(&mut self, window: Option<&Window>, planned: Planned, error: anyhow::Error) -> Result<bool> {
+        if !self.options.dev || !error.is::<InvalidFrame>() {
+            return Err(error);
+        }
+        let resume = !self.paused;
+        self.pause();
+        self.resume_after_reload = resume;
+        self.steps = 0;
+        self.timings = None;
+        self.input.discard();
+        self.input.enqueue(GameEvent::FocusLost);
+        overlay::error(Source::Game, format!(
+            "dev: frame {} rejected: {error:#}\ngame paused; fix the source to reload, or use Play to retry",
+            planned.position,
+        ));
+        self.capture.screenshots.extend(planned.shots);
+        self.capture.overlay_shots.extend(planned.overlay_shots);
+        self.present_last(window)?;
+        Ok(!planned.stop)
     }
 
     /// Runs one frame (or, paused, shows the last again); returns whether
@@ -1785,7 +1821,11 @@ impl Session {
         };
         let rendered = {
             let shell = shell!(self, window);
-            self.runtime.receive(&shell)?
+            self.runtime.receive(&shell)
+        };
+        let rendered = match rendered {
+            Ok(rendered) => rendered,
+            Err(error) => return self.reject_frame(window, planned, error),
         };
         let overlapped = self.overlaps(&planned, &rendered);
         let mut planned = planned;
@@ -1917,3 +1957,6 @@ impl Session {
         Ok(self.gpu)
     }
 }
+
+#[cfg(all(test, feature = "plugins"))]
+mod recovery_tests;

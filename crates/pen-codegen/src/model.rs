@@ -269,10 +269,8 @@ fn symbol(name: &str) -> bool {
 }
 fn lane(value: &Value, header: bool) -> Result<()> {
     string(&value["kind"])?;
-    for key in ["doc"] {
-        if !value[key].is_null() {
-            string(&value[key])?;
-        }
+    if !value["doc"].is_null() {
+        string(&value["doc"])?;
     }
     match kind(value) {
         "f32" | "matrix" | "flag" => {}

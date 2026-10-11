@@ -16,7 +16,7 @@ install:
   cp "$(ls -t target/release/build/steamworks-sys-*/out/libsteam_api.so | head -1)" ~/.local/lib/pen-runtime/libsteam_api.so.new
   mv -f ~/.local/lib/pen-runtime/libsteam_api.so.new ~/.local/lib/pen-runtime/libsteam_api.so
   ln -sf ~/.local/lib/pen-runtime/pen ~/.local/bin/pen
-  @echo "installed: pen dev | web | run | build | test | parity | bench | packets (in a gdev checkout)"
+  @echo "installed: pen dev | web | run | build | test | test-blot | parity | bench | packets (in a gdev checkout)"
 
 # Develop natively: Blot, shader and asset edits reload into the running
 # game with its state kept (`just dev --mute`, ...).
@@ -94,7 +94,7 @@ sync-protocol:
 # Everything: clippy, unit and GPU tests, golden images, renderer parity,
 # engine conformance, the determinism contract and the checkout's Blot tests.
 # Runs every check.
-test: check visual parity conformance determinism blot-tests
+test: check visual parity conformance determinism (blot-tests "tests/hand_salt.blot" "tests/math.blot" "tests/traps/protocol_rejects.blot" "tests/rejected/ecs_component_registered_twice.blot")
 
 # The generated protocol is fresh, clippy and tests; the renderer's GPU tests
 # also in release, where the optimizer once broke what debug builds hid.

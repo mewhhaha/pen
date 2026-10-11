@@ -5,18 +5,35 @@ gdev := "../gdev"
 pen := "cargo run --release -q -p pen --"
 
 # Build the runtime with Steam and install it as ~/.local/bin/pen, beside
-# the Steam library it links against. Each file is copied beside its old one
+# the Steam library it links against and its Wasm plugins (plugins/<name>.wasm,
+# the names a checkout's pen.json uses). Each file is copied beside its old one
 # and renamed over it, so a pen still running keeps the files it started with.
 # Installs the Steam-enabled runtime as ~/.local/bin/pen.
-install:
+install: plugins
   cargo build --release -p pen --features steam
-  mkdir -p ~/.local/lib/pen-runtime
+  mkdir -p ~/.local/lib/pen-runtime/plugins
   cp target/release/pen ~/.local/lib/pen-runtime/pen.new
   mv -f ~/.local/lib/pen-runtime/pen.new ~/.local/lib/pen-runtime/pen
   cp "$(ls -t target/release/build/steamworks-sys-*/out/libsteam_api.so | head -1)" ~/.local/lib/pen-runtime/libsteam_api.so.new
   mv -f ~/.local/lib/pen-runtime/libsteam_api.so.new ~/.local/lib/pen-runtime/libsteam_api.so
+  for wasm in plugins/target/wasm32-wasip2/release/pen_plugin_*.wasm; do \
+    name=$(basename "$wasm" .wasm | sed 's/^pen_plugin_//; s/_/-/g'); \
+    cp "$wasm" ~/.local/lib/pen-runtime/plugins/$name.wasm.new; \
+    mv -f ~/.local/lib/pen-runtime/plugins/$name.wasm.new ~/.local/lib/pen-runtime/plugins/$name.wasm; \
+  done
   ln -sf ~/.local/lib/pen-runtime/pen ~/.local/bin/pen
   @echo "installed: pen dev | web | run | build | test | test-blot | parity | bench | packets (in a gdev checkout)"
+
+# pen's Wasm plugins (plugins/, wit/pen-plugin.wit) as components, into
+# plugins/target/wasm32-wasip2/release, where a pen built here finds them.
+# Builds the Wasm plugins.
+plugins:
+  cd plugins && cargo build --release --target wasm32-wasip2
+
+# The plugins' own tests, natively.
+# Tests the Wasm plugins.
+plugin-tests:
+  cd plugins && cargo test
 
 # Develop natively: Blot, shader and asset edits reload into the running
 # game with its state kept (`just dev --mute`, ...).

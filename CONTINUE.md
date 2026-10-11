@@ -187,6 +187,36 @@ code in pen.
       layer works, so a plugin can own gdev's typed imports.
     - **at run time:** `decode(key, bytes) -> mesh, texture or sound` for
       formats pen-render doesn't know. Designed, not built first.
+- **Status (2026-10-11, evening): steps 1 to 3 are done.**
+  - **Deno-free:** gdev compiles through its `pen.json` with no Deno on the
+    machine, and `game.wasm` and `devtools.wasm` are byte-identical to the
+    Deno builds. The game compiles in 2.9 s instead of 3.5 s.
+  - **Hot reload** goes through the plugins: watched paths, an incremental
+    session, and a fresh session when the compiler process dies.
+  - **Packages still load:** game engines turn wasmtime's component model off
+    explicitly, so a package made by a plugin-enabled pen loads in the player
+    runtime. Checked with `just player` and a packaged gdev run headless.
+  - **The pieces:**
+    - `crates/pen-plugins` hosts the plugins, and `crates/pen/src/plugin_build.rs`
+      wires them into `project.rs`;
+    - `plugins/blot` (187 KB) and `plugins/gdev-assets` (986 KB; naga for
+      WGSL; byte-identical to TypeScript for both programs, fixtures in its
+      `tests/fixtures`, regenerated with `expected.ts`).
+  - **Still on Deno:** `pen test-blot`. Its "alone" modules can move to the
+    compiler plugin as they are. Its `// test: game` modules are spliced into
+    `src/main.blot` by gdev's TypeScript `gameFixture`. That splicing has to
+    become something Blot can express before pen can compile them without
+    gdev-specific code; it's gdev-94's call. Checkouts without a `pen.json`
+    keep the Deno build. `blot_build.ts` goes when nothing needs it.
+  - **WIT changes the plugin agents suggested** (not made yet):
+    - an explicit `close` on compiler sessions (today a drop saves blotc's
+      restart cache, which can block up to 10 s);
+    - diagnostics' `details` as `option<string>`, for typed holes and dispatch
+      explanations;
+    - a failing `generate` that still names its dependencies. Today pen
+      watches the whole checkout after such a failure.
+    - `files` gaining `is-file` and `canonical`;
+    - a path convention for Windows: always pass `/`-separated paths.
 - **Order of work:**
   1. The plugin host in pen: WIT, loading, grants, tests with a small plugin.
   2. A `blot` compiler plugin (Rust, `wasm32-wasip2`), a `serve-project`

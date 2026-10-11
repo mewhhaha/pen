@@ -137,6 +137,52 @@ arrives with a new build, and a deleted asset keeps its last version until it
 comes back. After a reload, Ctrl+Shift+R replays the last 5 s of input on the
 new build ("Recording, replay and time travel").
 
+### Wasm plugins
+
+pen's contract is with Wasm, not with one language: what is specific to a
+language or toolchain lives in Wasm plugins the checkout chooses, not in pen.
+A plugin is a WebAssembly component implementing a world of
+[wit/pen-plugin.wit](wit/pen-plugin.wit):
+
+- **compiler**: a session per program that builds it (with overlays over the
+  files on disk) into its Wasm module or diagnostics, and names the paths
+  whose changes need a new build. `plugins/blot` drives the Blot compiler,
+  `blotc serve-project`, as blot2's `zig-native/PROJECT_PROTOCOL.md`
+  specifies it.
+- **assets**: the virtual modules a program imports its assets through (its
+  catalog, words, shaders), made from the checkout's files, which pen passes
+  to the compiler as overlays. `plugins/gdev-assets` makes gdev's.
+
+A checkout chooses them in a `pen.json` at its root:
+
+```json
+{
+  "plugins": {
+    "blot": { "read": ["../blot2/std"], "run": { "blotc": "../blot2/generated/compiler/blotc.gz" } },
+    "gdev-assets": {}
+  },
+  "compiler": { "plugin": "blot", "settings": { "imports": { "gdev/": "packages/" }, "std": "../blot2/std" } },
+  "assets": { "plugin": "gdev-assets" }
+}
+```
+
+With a compiler chosen, `pen dev`, `pen run` and the dev tools' build go
+through the plugins instead of Deno: each program builds in a session kept
+open, so an edit rebuilds incrementally, and its watched paths are watched;
+a build that compiles is written to `.pen/runtime/` as the Deno build's was
+and reloads the same way. Without a `pen.json`, Deno builds as before.
+
+A plugin has no ambient access to the machine. WASI gives it clocks,
+randomness and output (to pen's log); pen's own interfaces give it what
+`pen.json` grants: reading under the checkout and its `read` directories,
+and starting its `run` programs by name with piped input and output (a `.gz`
+one is unpacked into pen's cache first). Plugins are found by name in
+`PEN_PLUGINS`, in `plugins/` beside the pen executable (`just install` puts
+them there), or in this repository's `plugins/target`, or at a `pen.json`
+plugin's `wasm` path. `just plugins` builds them (Rust for `wasm32-wasip2`)
+and `just plugin-tests` tests them natively. The player runtime has no
+plugins (the `plugins` feature).
+
 ### The asset pipeline
 
 gdev's `pipeline.json` maps the files its assets are built from (model

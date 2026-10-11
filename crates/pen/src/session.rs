@@ -182,7 +182,8 @@ impl Preferences {
     }
 }
 
-/// What the last frame drawn held, for the diagnostics.
+/// What the last frame drawn held, for the dev tools' diagnostics.
+#[cfg(feature = "devtools")]
 #[derive(Clone, Copy, Default)]
 pub struct Drawn {
     pub meshes: usize,
@@ -195,6 +196,7 @@ pub struct Gpu {
     pub renderer: pen_render::Renderer,
     pub format: wgpu::TextureFormat,
     pub size: (u32, u32),
+    #[cfg(feature = "devtools")]
     pub drawn: Drawn,
     /// The window's swapchain; none when headless.
     pub surface: Option<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
@@ -313,6 +315,7 @@ impl Gpu {
             renderer,
             format,
             capture: None,
+            #[cfg(feature = "devtools")]
             drawn: Drawn::default(),
             fault,
         })
@@ -335,6 +338,7 @@ impl Gpu {
             blitter: None,
             pinned: Some(size),
             capture: None,
+            #[cfg(feature = "devtools")]
             drawn: Drawn::default(),
             fault,
         })
@@ -610,7 +614,10 @@ impl Host for Shell<'_> {
             || !capture.overlay_shots.is_empty();
         let texture = offscreen.then(|| self.gpu.capture_texture());
         let gpu = &mut *self.gpu;
-        gpu.drawn = Drawn { meshes: frame.draws.len(), brushes: frame.solids.len() };
+        #[cfg(feature = "devtools")]
+        {
+            gpu.drawn = Drawn { meshes: frame.draws.len(), brushes: frame.solids.len() };
+        }
         let output = Output {
             device: &gpu.device,
             queue: &gpu.queue,

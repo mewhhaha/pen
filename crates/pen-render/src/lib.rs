@@ -66,6 +66,24 @@ impl Renderer {
         self.state.submit(frame, catalog, target)
     }
 
+    /// Starts loading what `sprites` draw with; whether it is all ready.
+    pub fn prepare_sprites(&mut self, sprites: &[pen_protocol::Sprite], catalog: &Catalog) -> anyhow::Result<bool> {
+        self.state.prepare_sprites(sprites, catalog)
+    }
+
+    /// Draws `sprites` over `output`, a finished image of `size`: another
+    /// program's interface (pen's dev tools) over the game's frame. Sprites
+    /// whose assets are still loading wait for them.
+    pub fn overlay(
+        &mut self,
+        sprites: &[pen_protocol::Sprite],
+        catalog: &Catalog,
+        output: &wgpu::TextureView,
+        size: (u32, u32),
+    ) -> anyhow::Result<()> {
+        self.state.overlay(sprites, catalog, output, size)
+    }
+
     /// Asset events the TS passes to `options.event` (AssetReady/AssetFailed);
     /// the app forwards them to the game.
     pub fn take_events(&mut self) -> Vec<GameEvent> {

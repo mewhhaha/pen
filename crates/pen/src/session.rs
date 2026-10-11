@@ -9,7 +9,7 @@
 //! overlap frames: the guest computes the next frame while this one draws
 //! (`Playback::pipeline`, one frame more input latency).
 //!
-//! In a window, a dev overlay (`Overlay`) can draw over the game's frames.
+//! In a window, the dev tools (`Overlay`) can draw over the game's frames.
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -182,12 +182,20 @@ impl Preferences {
     }
 }
 
+/// What the last frame drawn held, for the diagnostics.
+#[derive(Clone, Copy, Default)]
+pub struct Drawn {
+    pub meshes: usize,
+    pub brushes: usize,
+}
+
 pub struct Gpu {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub renderer: pen_render::Renderer,
     pub format: wgpu::TextureFormat,
     pub size: (u32, u32),
+    pub drawn: Drawn,
     /// The window's swapchain; none when headless.
     pub surface: Option<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
     /// Shows frames drawn offscreen in the window, scaled to fit.
@@ -305,6 +313,7 @@ impl Gpu {
             renderer,
             format,
             capture: None,
+            drawn: Drawn::default(),
             fault,
         })
     }
@@ -326,6 +335,7 @@ impl Gpu {
             blitter: None,
             pinned: Some(size),
             capture: None,
+            drawn: Drawn::default(),
             fault,
         })
     }
@@ -435,16 +445,20 @@ impl Gpu {
     }
 }
 
-/// A dev overlay over the window (`crate::overlay`): it sees the window's
-/// events before the game, lays itself out before each step (acting on the
-/// session), and draws over the window's image after the game's frame and
-/// before it is presented. It never draws into captures, recordings or
-/// headless output.
+/// The dev tools over the window (`crate::devtools`): they see the window's
+/// events before the game, run before each step (acting on the session),
+/// and draw over the window's image after the game's frame and before it is
+/// presented. They never draw into captures, recordings or headless output,
+/// only into overlay shots.
 pub trait Overlay {
     /// A window event, before the game: whether the game gets it too.
     fn window_event(&mut self, window: &Window, event: &WindowEvent) -> bool;
-    /// Before a step: what the overlay shows, and what it asks of the session.
-    fn update(&mut self, session: &mut Session, window: &Window);
+    /// Before a step: what the overlay shows, and what it asks of the
+    /// session; headless, it has no window and lays itself out on the frame.
+    fn update(&mut self, session: &mut Session, window: Option<&Window>);
+    /// A line for its console, as if typed there (a script's `overlay=`),
+    /// run on the next update.
+    fn command(&mut self, _line: String) {}
     /// Draws what was laid out last over `target`, an image about to be shown.
     fn paint(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::Texture);
     /// The pointer is the overlay's (over a panel, or dragging one), so it
@@ -456,7 +470,7 @@ pub trait Overlay {
         false
     }
     /// Its AccessKit tree from its last layout, once: a whole tree in its
-    /// own ids (egui's root tree).
+    /// own ids (its own root tree).
     fn accesskit_update(&mut self) -> Option<accesskit::TreeUpdate> {
         None
     }
@@ -596,6 +610,7 @@ impl Host for Shell<'_> {
             || !capture.overlay_shots.is_empty();
         let texture = offscreen.then(|| self.gpu.capture_texture());
         let gpu = &mut *self.gpu;
+        gpu.drawn = Drawn { meshes: frame.draws.len(), brushes: frame.solids.len() };
         let output = Output {
             device: &gpu.device,
             queue: &gpu.queue,
@@ -841,7 +856,7 @@ pub struct Playback {
     pub trace: Option<PathBuf>,
 }
 
-/// Where the session stands in time, for a dev overlay.
+/// Where the session stands in time, for the dev tools.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TimelineStatus {
     /// Frames run so far: the next frame's position. What shows is the
@@ -1307,12 +1322,6 @@ impl Session {
     }
 
     #[cfg(feature = "devtools")]
-    /// Reloads the game and its assets as their files change (`pen dev`).
-    pub fn developing(&self) -> bool {
-        self.options.dev
-    }
-
-    #[cfg(feature = "devtools")]
     /// Starts recording the input to `path` (a `.penrec`, from the frame
     /// it then is), or with None stops, once the guest is idle.
     pub fn record_input(&mut self, path: Option<PathBuf>) {
@@ -1526,6 +1535,11 @@ impl Session {
         for event in tick.events.drain(..) {
             self.input.enqueue(event);
         }
+        if let Some(overlay) = &mut self.overlay {
+            for line in tick.overlay.drain(..) {
+                overlay.command(line);
+            }
+        }
         tick
     }
 
@@ -1700,7 +1714,7 @@ impl Session {
             return Ok(true);
         }
         // Laid out before the frame's time starts: its drawing counts in render+present.
-        if let (Some(window), Some(mut overlay)) = (window, self.overlay.take()) {
+        if let Some(mut overlay) = self.overlay.take() {
             overlay.update(self, window);
             self.overlay = Some(overlay);
         }

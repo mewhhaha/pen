@@ -1,7 +1,7 @@
-//! What the dev overlay shows besides its own lines: the game's reports, the
+//! What the dev tools show in their console: the game's reports, the
 //! Blot compiler's output, new builds, asset reloads and the asset pipeline's
 //! recipe runs. Each line still goes to stderr as before; builds with the
-//! `devtools` feature also keep the last ones for the overlay to read.
+//! `devtools` feature also keep the last ones for the dev tools to read.
 use std::io::{BufRead, BufReader, Read};
 
 /// Where a line came from.
@@ -21,7 +21,7 @@ pub enum Source {
     Session,
 }
 
-/// A line kept for the overlay.
+/// A line kept for the dev tools.
 #[cfg(feature = "devtools")]
 #[derive(Clone, Debug)]
 pub struct Line {
@@ -30,7 +30,6 @@ pub struct Line {
     pub source: Source,
     pub error: bool,
     pub text: String,
-    pub at: std::time::Instant,
 }
 
 pub fn info(source: Source, text: impl Into<String>) {
@@ -93,7 +92,7 @@ mod kept {
         let mut kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let serial = kept.next;
         kept.next += 1;
-        kept.lines.push_back(Line { serial, source, error, text, at: std::time::Instant::now() });
+        kept.lines.push_back(Line { serial, source, error, text });
         if kept.lines.len() > KEEP {
             kept.lines.pop_front();
         }

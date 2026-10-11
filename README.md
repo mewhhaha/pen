@@ -4,8 +4,8 @@ Runs [gdev](../gdev), a game written in [Blot](../blot2) and compiled to
 WebAssembly, as a native program: a winit window, a wgpu port of gdev's
 WebGPU renderer, and the game's Blot program on wasmtime, with no JavaScript
 engine at run time (Deno only compiles the Blot program while developing).
-One `pen` binary develops a gdev checkout with hot reload, a dev overlay and
-live tunables; tests it with golden images, renderer parity and an engine
+One `pen` binary develops a gdev checkout with hot reload, its own dev
+tools and live tunables; tests it with golden images, renderer parity and an engine
 conformance check; records and replays sessions bit for bit; and packages the
 game with a smaller player runtime for Linux, the Steam Deck and Windows. The
 same Rust renderer also builds for the browser, where gdev's web build uses it
@@ -19,7 +19,7 @@ pen (the runtime)                           game/ (a package's bundle)
 ├─ packets           (pen-protocol)         └─ main.scene  the starting level
 ├─ audio: gdev's WebAudio mix on kira's output (+ libopus for Opus clips)
 ├─ AccessKit, and services: Steam, clipboard, url, platform, pathfinding
-└─ dev overlay (egui; not in the player runtime)
+└─ the checkout's dev tools program (not in the player runtime)
 ```
 
 The crates:
@@ -58,6 +58,7 @@ library. In a gdev checkout (or with `--project DIR`):
 | `pen build [--out DIR]` | A shippable folder: the player runtime, its Steam library and the game, precompiled (default `.pen/package`) |
 | `pen build --web [--out DIR]` | The browser build as static files for any web host (default `.pen/web-export`) |
 | `pen test [FILE]` | Golden-image tests (default `tests/visual/scenarios.json`) |
+| `pen test-blot [FILE...]` | The checkout's Blot tests (default `tests/*.blot`; `--filter TEXT` runs the tests whose names hold it) |
 | `pen parity` | The native renderer against the checkout's `renderer.ts` on the same frames |
 | `pen bench` | Guest time per frame, without rendering |
 | `pen packets DIR` | Each frame's input and render packet, without rendering |
@@ -68,17 +69,11 @@ variable.
 
 The checkout needs nothing new. The runtime compiles its Blot program with the
 checkout's own compiler setup (`blot_runtime.ts`) through Deno, from a small
-script embedded in the binary, into `.pen/runtime/` (beside Deno Desktop's
-`.gdev/native/`, which it leaves alone). The compiler's temporary files go
-under the cache directory (`~/.cache/pen/tmp`), not `/tmp`. Assets and the
-editor's scene are used in place from `src/`. So gdev's Justfile only needs:
-
-```just
-run:
-  pen run
-dev:
-  pen dev
-```
+script embedded in the binary, into `.pen/runtime/`. The compiler's temporary
+files go under the cache directory (`~/.cache/pen/tmp`), not `/tmp`. Assets and
+the editor's scene are used in place from `src/`. gdev's own `just dev` and
+`just run` are `pen dev` and `pen run`, passing their arguments on; pen replaced
+the Deno Desktop host there on 2026-10-11.
 
 This repository's Justfile runs the same commands on `../gdev`
 (`just gdev=PATH ...` for another checkout):
@@ -87,7 +82,7 @@ This repository's Justfile runs the same commands on `../gdev`
 |---|---|
 | `just dev`, `just run`, `just headless ARGS` | Play the checkout (`just dev --mute`, `just headless --frames 300 --record out.mp4`) |
 | `just web` | gdev's browser build |
-| `just test` | Everything in "Testing": `check`, `visual`, `parity`, `conformance` and `determinism` |
+| `just test` | Everything in "Testing": `check`, `visual`, `parity`, `conformance`, `determinism` and `blot-tests` |
 | `just bench` | Guest time on wasmtime, then the same frames on V8 |
 | `just export`, `just packets` | The bundle `dist/gdev` and the packets `dist/packets` that some tests and examples read |
 | `just sync-protocol` | Regenerate pen-protocol's `packets.rs` from the checkout's schema |
@@ -168,34 +163,63 @@ like `renderer.ts`'s `createRenderer`, and gdev's `scripts/rust_renderer.ts`
 builds it into `.gdev/rust-renderer`, which the dev server and the export
 serve for `?renderer=rust` (PORTING.md, "In the browser").
 
-### The dev overlay
+### The dev tools
 
-In `pen dev` and `pen run`, the backquote key shows a dev overlay over the
-game (`--overlay` or `PEN_OVERLAY=1` shows it from the start), the native
-counterpart of the browser build's console and diagnostics:
+The dev tools are the checkout's own: a second Blot program beside the game
+(gdev's `devtools/main.blot`, its console and diagnostics, written with the
+game's interface packages), which `pen dev` and `pen run` build and run
+while the game runs, drawing its sprites over the game's frame. pen hosts it
+and draws nothing of its own; gdev's README ("Dev tools") says what it does.
+A checkout without one runs without dev tools.
 
-- **Console**: the game's commands, read from the checkout's `commands.ts`
-  (and the browser console's ranges and defaults in `web/client.ts`), with
-  completion and history. Its own commands are `/help`, `/clear`,
-  `/diagnostics`, `/command N ARG` for any game command by number, `/tune`,
-  and `/pause`, `/play`, `/step`, `/rewind`, `/replay`, `/record` and `/shot`.
-  It prints the game's reports, the Blot compiler's output, reloads and time
-  travel.
-- **Profiler**: frame interval and CPU work with a graph, the frame's phases,
-  draws and instances, guest memory and the GPU (frames are timed only while
-  it shows).
-- **Timeline**: play, pause and step, rewind a frame or a second or scrub to a
-  frame, replay the last seconds, and record the input from here to a
-  `.penrec`.
-- **Hot reload**: the Blot build's status and errors, reloads of the running
-  build, and asset and recipe events.
-- **Tunables**: the live-tunable constants (below).
+It is a program of its own, with its own state, outside the game's saves,
+recordings and timeline: it keeps running while the game is paused,
+rewinding, failing to build or stopped on an error, and what it is told
+(frame timings, the log) never reaches the game, so determinism and
+recordings are untouched. Each frame (`crates/pen/src/devtools.rs`):
 
-While a panel has the keyboard or the pointer, the game gets neither. The
-overlay is drawn over the window's image only, never into screenshots,
-recordings or headless output; `--overlay-shot PNG` (and `/shot`) saves the
-window as shown, overlay included. It is the `devtools` cargo feature, on by
-default; the player runtime leaves it out.
+- **Input.** It gets every window event before the game, key repeats
+  included, and the key left of 1 always as the backquote, which the game
+  never sees. Its interface says what it takes from the game: the keyboard
+  while one of its nodes has the focus (its console's input; the game gets
+  FocusLost then, so held keys let go), and the pointer and wheel over its
+  dialogs. A drag the game started stays the game's.
+- **What it asks.** The `devtools` service (gdev's `protocol/schema.ts`,
+  DevtoolsOperation): the log (the game's reports, the Blot compiler's
+  output, reloads, assets, recipes, time travel), the last frame's numbers
+  (DevtoolsFrame: frame interval, the frame's phases when it asks for
+  timing, draws, meshes, memory, size, the timeline's state) and the GPU's
+  name come back in its next frame; game console commands, pause, play,
+  step, rewind, replay, keeping history, input recordings, shots, tunable
+  values and bake are carried out.
+- **Drawing.** Its sprites, through a renderer of its own (so its assets'
+  events never reach the game), over the window's image only, never into
+  screenshots, recordings or headless output; its interface hangs from the
+  window's accessibility tree.
+
+Its build (`.pen/runtime/devtools.wasm`) compiles beside the game's (lines
+in the log name its entry); a new one is picked up with its state carried
+over, as the game's is. Its state is kept in the checkout's
+`.pen/devtools.state` between windowed sessions (the console's history, the
+diagnostics' level). `--overlay` or `PEN_OVERLAY=1` opens its console from
+the start. `--overlay-shot PNG` and its `/shot` save the frame with the dev
+tools over it, headless too (where a run waits for its build and its
+assets). A script's `overlay=/COMMAND[,ARG...]` step types a line into its
+console (opening it first), so
+
+```sh
+pen run --headless --frames 300 --script "overlay=/diagnostics,high" --overlay-shot shot.png
+```
+
+shows the diagnostics without a window; a headless run keeps no state. They
+are the `devtools` cargo feature, on by default; the player runtime leaves
+them out.
+
+Not in the program yet: the timeline, tunables and builds panels of pen's
+earlier egui overlay (`/timeline`, `/tunables` and `/builds` say so), and
+Bake, which the service carries out but nothing asks for yet. Time travel
+works from the console (`/pause`, `/play`, `/step`, `/rewind`, `/replay`,
+`/history`, `/record`) and its keys ("Recording, replay and time travel").
 
 ### Live tunables
 
@@ -203,15 +227,12 @@ A number to get right by feel, such as how fast the camera zooms or the gnorps
 walk, can be a live-tunable constant, declared in the checkout's
 `src/tunables.json` (gdev's README, "Tunables"). Setting one needs no build:
 it reaches the game as a Tune input event in the next frame the game runs, so
-recordings, replays and rewinds keep it. The overlay's Tunables panel has a
-slider for each (click its number to type one) and a reset to the default;
-`/tune` in the console lists them, and `/tune NAME VALUE` sets one, as the
-script step `tune=NAME=VALUE` does. The panel reads what the game holds from
-its state, so loads, rewinds, reloads and replays show in it, and the file is
-watched, so a tunable added or a default edited shows at once (the game has
-it after its build). **Bake** writes the game's values into the file as the
-defaults (through the checkout's `scripts/bake_tunables.ts`); the game
-rebuilds, reloads and keeps them, so nothing moves.
+recordings, replays and rewinds keep it. `/tune` in the dev tools' console
+lists them with the values the game holds, and `/tune NAME VALUE` sets one,
+as the script step `tune=NAME=VALUE` does. Baking the game's values into the
+file as the defaults (through the checkout's `scripts/bake_tunables.ts`) is
+the devtools service's `bake`, for the dev tools' coming Tunables panel; the
+game then rebuilds, reloads and keeps them, so nothing moves.
 
 ### Headless runs, scripts, screenshots and videos
 
@@ -244,8 +265,9 @@ pen run --size 1920x1080 --record clip.mp4 --frames 600
   (`scripts/page.ts`): `wait key down up type move click press release drag
   wheel shot save load`, plus `quit`, `tune=NAME=VALUE` (above),
   `console=CODE[,ARG]` (a console command by number: `console=3,12` hires
-  twelve gnorps), the time travel steps ("Recording, replay and time travel")
-  and `ui=NODE,ACTION[,VALUE]` ("Accessibility"). Coordinates are page pixels of a
+  twelve gnorps), `overlay=/COMMAND[,ARG...]` (a line typed into the dev
+  tools' console, above), the time travel steps ("Recording, replay and
+  time travel") and `ui=NODE,ACTION[,VALUE]` ("Accessibility"). Coordinates are page pixels of a
   page 960 wide, scaled to the viewport, so `looks.json` coordinates land in
   the same places at 1920x1280 (the headless default). `view=`, `over=`,
   `reload` and `storage=` need the browser tooling.
@@ -253,7 +275,7 @@ pen run --size 1920x1080 --record clip.mp4 --frames 600
 
 ## Testing
 
-`just test` runs all of these but gdev's own tests.
+`just test` runs all of these but gdev's own TypeScript tests.
 
 - **Unit and GPU tests** (`just check`): it checks that pen-protocol's
   generated `packets.rs` matches the checkout's schema, then runs clippy,
@@ -261,7 +283,7 @@ pen run --size 1920x1080 --record clip.mp4 --frames 600
   ("Toolchain note"). The tests cover the guest ABI manifest, packet encoding,
   scripts, saves, input recordings and time travel, video recordings (exact
   frame counts and durations, through ffprobe), the mixer and reverb, the
-  accessibility tree, services, the pipeline, the overlay's console and
+  accessibility tree, services, the pipeline, the dev tools' host and
   tunables, and the renderer against real assets, hot reload included. Tests
   that read the exported bundle `dist/gdev` (`just export`) skip themselves
   without it.
@@ -298,7 +320,15 @@ pen run --size 1920x1080 --record clip.mp4 --frames 600
   The contract tests check the same from every moment, with a host that
   answers service requests 40 frames late, and name the first packet field
   that differs. See [docs/determinism.md](docs/determinism.md), "Checks".
-- gdev's own tests (`deno task test` in the checkout) cover the game logic.
+- **Blot tests** (`pen test-blot`, `just blot-tests`): gdev's game logic,
+  tested in Blot. Each module in the checkout's `tests/*.blot` compiles
+  against the game on the tests' level when its first line is
+  `// test: game`, else alone, as if it stood in `src/` (through Deno and the
+  checkout's `test_support/` for now). Each `test_…` entry, Unit to Array F32,
+  runs in a fresh instance and returns its checks' report (gdev's
+  `packages/check.blot`); a failed check prints what it expected and got.
+- gdev's own TypeScript tests (`deno task test` in the checkout) cover the
+  game logic not yet moved into Blot tests.
 
 ### CI
 
@@ -353,9 +383,9 @@ In a window, time travel is on keys the game never sees:
 | Ctrl+Shift+R | Replay the last 5 s (after a reload, on the new build) |
 
 Scripts have the same as steps: `pause`, `resume`, `step[=N]`, `rewind=N`
-(frames) and `replay=SECONDS`. The dev overlay has them in its timeline panel
-and console, and `/record [FILE]` starts or stops an input recording in the
-middle of a session.
+(frames) and `replay=SECONDS`. The dev tools' console has them too, and
+`/record [FILE]` starts or stops an input recording in the middle of a
+session.
 
 **Edit and replay.** In `pen dev`, pause when something goes wrong
 (Ctrl+Shift+P), so the moment stays in the history while you edit. Save the
@@ -438,12 +468,12 @@ The game declares its interface as a tree of nodes every frame (gdev's README,
 and the level editor's toolbar. The runtime shows it to assistive technology
 through [AccessKit](https://accesskit.dev) (`accessibility.rs`, with
 `accesskit_winit`: AT-SPI on Linux, UI Automation on Windows, NSAccessibility
-on macOS), in the player runtime too, and the dev overlay's own egui tree is
-grafted under it while it shows. Each node has its role, name, description,
+on macOS), in the player runtime too, and the dev tools' own tree (their
+program's interface) is grafted under it while it shows. Each node has its role, name, description,
 value, states, range and the actions it takes, and lies where the game draws
 it, scaled to the window. The game drives the keyboard focus itself (F10, Tab,
 the arrows, Enter: the same in the browser); the tree's focus follows it, or
-the overlay's while one of its widgets has the keyboard. An assistive
+the dev tools' while one of their nodes has the keyboard. An assistive
 technology's action on a game node reaches the game as a `UiAction` input
 event with the next frame, so input recordings capture it and replays repeat
 it. The tree is rebuilt only when the interface changed (otherwise a
@@ -471,7 +501,7 @@ at the top.
 
 It ships the **player runtime**: pen built without its default `compiler`
 and `devtools` features (`--no-default-features --features steam`), so without
-Cranelift or the dev overlay. It only loads the `game.cwasm` its package was
+Cranelift or the dev tools. It only loads the `game.cwasm` its package was
 precompiled with, and refuses every command that compiles a checkout.
 `pen build` ships the runtime in `player/` beside itself, else itself (and
 says so); `--runtime EXE` ships another. `game.cwasm` is compiled for the

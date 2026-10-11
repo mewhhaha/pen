@@ -16,8 +16,8 @@ and what breaks it.
 - the game time since the last frame (elapsed seconds, as f32);
 - the viewport (width and height in pixels);
 - the events since the last frame: keys, pointer, wheel, focus lost, console
-  commands, stored preferences, live-tunable constants set (Tune: the overlay's
-  Tunables panel, `/tune`, `tune=` script steps; what the game holds of them
+  commands, stored preferences, live-tunable constants set (Tune: the dev tools'
+  `/tune`, `tune=` script steps; what the game holds of them
   is part of its state), assistive technology's actions on the game's
   interface (UiAction: AccessKit's action requests, the browser's
   accessibility layer, `ui=` script steps), assets ready or failed (these
@@ -168,7 +168,7 @@ though its rewinds would not.
 
 The game never sees these keys. In scripts the same actions are `pause`,
 `resume`, `step[=N]` (N frames, one per script frame), `rewind=N` and
-`replay=SECONDS`. For a dev overlay, `Session` has `pause`, `resume`,
+`replay=SECONDS`. For the dev tools, `Session` has `pause`, `resume`,
 `step_frame`, `rewind_to(frame)`, `replay_recent(seconds)` and `timeline()`
 (position, the recorded end, the earliest frame reachable, seconds kept,
 paused, replaying). `rewind_to` and `replay_recent` take effect on the next
@@ -182,8 +182,8 @@ nearest moment before its target and runs up to 30 frames unseen: 7 to 15
 ms. After a rewind, stepping runs the recorded frames again.
 Playing on drops them and continues live from there.
 
-The dev overlay (README, "The dev overlay") puts these behind its timeline
-panel and console. It can also start and stop an input recording in the
+The dev tools (README, "The dev tools") put these behind their console's
+commands, which can also start and stop an input recording in the
 middle of a session: the game is then restored from its own state where the
 recording starts, as a replay of it is, so the replay gives the packets the
 session did, rewinds within it included.

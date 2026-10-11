@@ -8,7 +8,7 @@
 //! pauses and resumes, period steps a frame, comma steps a frame back, and
 //! R replays the last seconds (after a hot reload, on the new build).
 //!
-//! In `pen dev` and `pen run` the dev overlay (`overlay`) sees window
+//! In `pen dev` and `pen run` the dev tools (`devtools`) see window
 //! events before this does (`Session::overlay_event`): the backquote key is
 //! its own, and while one of its panels has the keyboard or the pointer, the
 //! game gets neither.
@@ -18,7 +18,7 @@ use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window};
 
 /// Pixels a wheel notch scrolls, as browsers report `deltaY` for one line.
-const PIXELS_PER_LINE: f32 = 100.0;
+pub(crate) const PIXELS_PER_LINE: f32 = 100.0;
 
 /// The window's time travel keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,7 +56,7 @@ fn hotkey(code: KeyCode) -> Option<Hotkey> {
 
 /// The `KeyboardEvent.key` value for a key, or None for keys the browser
 /// would not report either.
-fn key_name(key: &Key) -> Option<String> {
+pub(crate) fn key_name(key: &Key) -> Option<String> {
     Some(match key {
         Key::Character(text) => text.to_string(),
         Key::Named(NamedKey::Space) => " ".to_owned(),
@@ -68,7 +68,7 @@ fn key_name(key: &Key) -> Option<String> {
     })
 }
 
-fn button_number(button: MouseButton) -> u32 {
+pub(crate) fn button_number(button: MouseButton) -> u32 {
     match button {
         MouseButton::Left => 0,
         MouseButton::Middle => 1,

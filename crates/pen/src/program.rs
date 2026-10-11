@@ -49,7 +49,7 @@ pub struct Program {
     pending: Option<Operation>,
     /// When the guest sent its last packet.
     answered: Option<Instant>,
-    /// The guest's linear memory, as of its last host call (for the dev overlay).
+    /// The guest's linear memory, as of its last host call (for the dev tools).
     #[cfg(feature = "devtools")]
     memory: Arc<AtomicUsize>,
 }

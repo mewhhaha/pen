@@ -47,7 +47,15 @@ pub(crate) enum Message {
 pub(crate) enum Loaded {
     Mesh(Mesh),
     Material(Material),
-    Shader { module: wgpu::ShaderModule, instancing: bool, samples: u32, pipelines: Pipelines },
+    Shader {
+        module: wgpu::ShaderModule,
+        instancing: bool,
+        samples: u32,
+        pipelines: Pipelines,
+        /// Its depth-only pipelines, plain and instanced; None where one
+        /// failed, for the first frame that needs it to make.
+        shadow: [Option<wgpu::RenderPipeline>; 2],
+    },
     SpriteShader(wgpu::RenderPipeline),
     Image(DecodedImage),
     /// A packed texture: its header now, its levels as each is inflated.
@@ -297,7 +305,15 @@ impl Worker {
                     Ok(pipelines) => pipelines,
                     Err(message) => return self.send(loaded(Err(anyhow::Error::msg(message)))),
                 };
-                self.send(loaded(Ok(Loaded::Shader { module: module.clone(), instancing, samples, pipelines })));
+                // Its shadow pipelines compile now too, so the first frame it
+                // casts a shadow in does not wait on the driver: on a cold
+                // shader cache a large vertex stage takes it most of a second
+                // or more. One that fails is made on first use, which reports
+                // the error.
+                let shadow = shader::checked(device, || shader::shadow_pipelines(&self.context, &module, instancing))
+                    .await
+                    .unwrap_or_default();
+                self.send(loaded(Ok(Loaded::Shader { module: module.clone(), instancing, samples, pipelines, shadow })));
                 // Insets draw with 4 samples a pixel: their pipeline compiles
                 // in the background now, so an inset first shown never waits
                 // on it.

@@ -41,8 +41,7 @@ impl Project {
         self.root.join("src/main.scene")
     }
 
-    /// Where `dev` and `run` keep the compiled program (beside Deno
-    /// Desktop's `.gdev/native`, which this does not touch).
+    /// Where `dev` and `run` keep the compiled program.
     pub fn native(&self) -> PathBuf {
         self.root.join(".pen/runtime")
     }
@@ -55,6 +54,12 @@ impl Project {
             std::fs::write(&path, BUILD_SCRIPT)?;
         }
         Ok(path)
+    }
+
+    /// The dev tools' program (gdev's `devtools/main.blot`), relative to
+    /// the checkout, if it has one.
+    pub fn devtools(&self) -> Option<&'static str> {
+        ["devtools/main.blot", "src/devtools/main.blot"].into_iter().find(|entry| self.root.join(entry).is_file())
     }
 
     fn command(&self, out: &Path, watch: bool) -> Result<Command> {
@@ -78,6 +83,26 @@ impl Project {
         #[cfg(windows)]
         command.env("TMP", &temporary).env("TEMP", &temporary);
         Ok(command)
+    }
+
+    /// Starts building the dev tools' program into `out/devtools.wasm`
+    /// beside the game's build, once or (`watch`) again as its sources
+    /// change, until the returned watcher is dropped; none when the checkout
+    /// has none. The runtime picks the program up when its file appears.
+    pub fn build_devtools(&self, out: &Path, watch: bool) -> Result<Option<Watcher>> {
+        let Some(entry) = self.devtools() else { return Ok(None) };
+        std::fs::create_dir_all(out)?;
+        let mut child = self
+            .command(out, watch)?
+            .args(["--entry", entry, "--name", "devtools.wasm"])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("running deno, which compiles the dev tools' Blot program")?;
+        if let Some(stderr) = child.stderr.take() {
+            crate::overlay::forward_build_output(stderr);
+        }
+        Ok(Some(Watcher { child }))
     }
 
     /// Compiles the Blot program into `out/game.wasm` once.
@@ -108,7 +133,7 @@ impl Project {
             .stderr(Stdio::piped())
             .spawn()
             .context("running deno, which compiles the game's Blot program")?;
-        // To stderr as before, and to the dev overlay's hot reload panel.
+        // To stderr as before, and to the dev tools' console.
         if let Some(stderr) = child.stderr.take() {
             crate::overlay::forward_build_output(stderr);
         }
@@ -128,7 +153,7 @@ impl Project {
 /// rather than a RAM-backed /tmp: each compiler it opens unpacks a 35 MB
 /// `blotc-*` there and removes it only when closed normally, so every
 /// killed build leaves one behind. Those older than an hour are swept away.
-fn temporary_dir() -> Result<PathBuf> {
+pub(crate) fn temporary_dir() -> Result<PathBuf> {
     let directory = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("pen/tmp");
     std::fs::create_dir_all(&directory)?;
     let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
@@ -147,6 +172,13 @@ fn temporary_dir() -> Result<PathBuf> {
 /// The compiler watching the project; stops when dropped.
 pub struct Watcher {
     child: Child,
+}
+
+impl Watcher {
+    /// Waits for a build that does not watch to finish; whether it built.
+    pub fn wait(&mut self) -> Result<bool> {
+        Ok(self.child.wait()?.success())
+    }
 }
 
 impl Drop for Watcher {

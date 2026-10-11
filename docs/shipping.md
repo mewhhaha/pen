@@ -103,7 +103,7 @@ The runtime, with Steam, on Linux:
 | | Size |
 |---|---|
 | Before: `cargo build --release`, wasmtime's default features (what shipped) | 27.4 MB |
-| Development build now (`just install`): wasmtime with only what gdev uses | 23.9 MB (30.2 MB with the egui dev overlay since added; the player leaves it out) |
+| Development build now (`just install`): wasmtime with only what gdev uses | 23.9 MB (30.2 MB with the egui dev overlay added later, since replaced by the checkout's own dev tools program; the player leaves the dev tools out) |
 | Player runtime, `release` profile (no compiler) | 13.5 MB |
 | **Player runtime, `dist` profile (`just player`, what ships)** | **10.2 MB** |
 | Windows player runtime (`just windows`) | 9.2 MB |

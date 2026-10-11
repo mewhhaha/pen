@@ -8,7 +8,9 @@
 pub mod types {
     /// A column-major 4x4 matrix, as WGSL and the packet lay it out.
     pub type Matrix = [f32; 16];
-    /// What an interface node is; hosts expose it with the matching role.
+    /// What an interface node is; hosts expose it with the matching role. A textbox's value
+    /// text is the text in it; a log is a list of messages whose newest lines a screen reader
+    /// may announce.
     pub mod ui_role {
         pub const GROUP: u32 = 0;
         pub const TEXT: u32 = 1;
@@ -32,8 +34,10 @@ pub mod types {
         pub const PROGRESSBAR: u32 = 19;
         pub const RADIOGROUP: u32 = 20;
         pub const RADIO: u32 = 21;
+        pub const TEXTBOX: u32 = 22;
+        pub const LOG: u32 = 23;
         /// The names of the codes, by code.
-        pub const NAMES: [&str; 22] = ["group", "text", "heading", "button", "checkbox", "switch", "slider", "spinbutton", "list", "listitem", "dialog", "menu", "menuitem", "tablist", "tab", "tabpanel", "toolbar", "image", "status", "progressbar", "radiogroup", "radio"];
+        pub const NAMES: [&str; 24] = ["group", "text", "heading", "button", "checkbox", "switch", "slider", "spinbutton", "list", "listitem", "dialog", "menu", "menuitem", "tablist", "tab", "tabpanel", "toolbar", "image", "status", "progressbar", "radiogroup", "radio", "textbox", "log"];
     }
     /// What assistive technology, or the game's keyboard focus, does to an interface node:
     /// moves the focus to it or away from it, does what clicking it does, steps its value up or
@@ -70,16 +74,18 @@ pub mod types {
         pub const NAMES: [&str; 3] = ["off", "polite", "assertive"];
     }
     /// Which service a request is for: Steam's achievements, stats and rich presence, the
-    /// system clipboard, the browser for a web address, what the game runs on, and a native
-    /// compute library (grid pathfinding). A host without one answers unavailable.
+    /// system clipboard, the browser for a web address, what the game runs on, a native compute
+    /// library (grid pathfinding), and the host's developer tools (DEVTOOLS_OP_*), which only a
+    /// dev tools program asks of. A host without one answers unavailable.
     pub mod service {
         pub const STEAM: u32 = 0;
         pub const CLIPBOARD: u32 = 1;
         pub const URL: u32 = 2;
         pub const PLATFORM: u32 = 3;
         pub const PATHFINDING: u32 = 4;
+        pub const DEVTOOLS: u32 = 5;
         /// The names of the codes, by code.
-        pub const NAMES: [&str; 5] = ["steam", "clipboard", "url", "platform", "pathfinding"];
+        pub const NAMES: [&str; 6] = ["steam", "clipboard", "url", "platform", "pathfinding", "devtools"];
     }
     /// How a service request went: done; the service is not there (Steam is off, no clipboard,
     /// the browser cannot); it is there but refused or failed; or the host does not know the
@@ -141,6 +147,73 @@ pub mod types {
         pub const FIND: u32 = 0;
         /// The names of the codes, by code.
         pub const NAMES: [&str; 1] = ["find"];
+    }
+    /// The host's developer tools. log answers the log's lines from serial `a` on, value the
+    /// serial after the last, each line as its source (0 game, 1 build, 2 reload, 3 asset, 4
+    /// pipeline, 5 session), 1 if an error, its length and its code points. frame answers the
+    /// last frame's numbers in DEVTOOLS_FRAME's order, timing the game's frames while `a` is 1.
+    /// gpu answers the graphics adapter's name. command sends the game console command `a` with
+    /// argument `b`. pause and play stop and start the game's clock; step runs `a` frames and
+    /// stays paused; rewind goes back `a` seconds of game time, paused; replay plays the last
+    /// `a` seconds again, then live; history keeps the past to travel in (unavailable answers
+    /// what needs it while none is kept). record starts recording the input to the text's path,
+    /// or a new file when it is empty, or stops a recording. shot saves the window with the dev
+    /// tools over it to the text's path, or a new file. tune sets the live-tunable constant
+    /// whose id is `a` to `b`, and tuned answers the game's tuned values as id and value pairs.
+    /// bake writes them into the checkout as the defaults.
+    pub mod devtools_op {
+        pub const LOG: u32 = 0;
+        pub const FRAME: u32 = 1;
+        pub const GPU: u32 = 2;
+        pub const COMMAND: u32 = 3;
+        pub const PAUSE: u32 = 4;
+        pub const PLAY: u32 = 5;
+        pub const STEP: u32 = 6;
+        pub const REWIND: u32 = 7;
+        pub const REPLAY: u32 = 8;
+        pub const HISTORY: u32 = 9;
+        pub const RECORD: u32 = 10;
+        pub const SHOT: u32 = 11;
+        pub const TUNE: u32 = 12;
+        pub const BAKE: u32 = 13;
+        pub const TUNED: u32 = 14;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 15] = ["log", "frame", "gpu", "command", "pause", "play", "step", "rewind", "replay", "history", "record", "shot", "tune", "bake", "tuned"];
+    }
+    /// Where each number sits in a devtools frame answer: the milliseconds since the frame
+    /// before; the game's frame phases in milliseconds (guest, waited for an overlapped guest,
+    /// packet decode, validation, render and present, housekeeping, and their total), each -1
+    /// when the frame was not timed or did not run; its packet's bytes; the renderer's draw
+    /// calls, instanced ones and instances; the frame's meshes and brushes; the game's memory
+    /// in bytes; the frame's width and height in pixels; and the timeline: the next frame's
+    /// position, 1 when paused, replaying, keeping history or overlapping frames, and the frame
+    /// an input recording started at, or -1.
+    pub mod devtools_frame {
+        pub const INTERVAL: u32 = 0;
+        pub const GUEST: u32 = 1;
+        pub const WAIT: u32 = 2;
+        pub const DECODE: u32 = 3;
+        pub const VALIDATE: u32 = 4;
+        pub const SUBMIT: u32 = 5;
+        pub const HOUSEKEEPING: u32 = 6;
+        pub const TOTAL: u32 = 7;
+        pub const PACKET: u32 = 8;
+        pub const DRAW_CALLS: u32 = 9;
+        pub const INSTANCED_DRAW_CALLS: u32 = 10;
+        pub const INSTANCES: u32 = 11;
+        pub const MESHES: u32 = 12;
+        pub const BRUSHES: u32 = 13;
+        pub const MEMORY: u32 = 14;
+        pub const WIDTH: u32 = 15;
+        pub const HEIGHT: u32 = 16;
+        pub const POSITION: u32 = 17;
+        pub const PAUSED: u32 = 18;
+        pub const REPLAYING: u32 = 19;
+        pub const HISTORY: u32 = 20;
+        pub const PIPELINED: u32 = 21;
+        pub const RECORDING: u32 = 22;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 23] = ["interval", "guest", "wait", "decode", "validate", "submit", "housekeeping", "total", "packet", "draw_calls", "instanced_draw_calls", "instances", "meshes", "brushes", "memory", "width", "height", "position", "paused", "replaying", "history", "pipelined", "recording"];
     }
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Vector {
@@ -877,6 +950,8 @@ pub mod codec {
             "Enter" => 0x110108,
             "PageUp" => 0x110109,
             "PageDown" => 0x11010a,
+            "Home" => 0x11010b,
+            "End" => 0x11010c,
             "F2" => 0x110202,
             "F6" => 0x110206,
             "F9" => 0x110209,
@@ -1288,7 +1363,7 @@ pub mod codec {
             ensure!(ui_record_lane + UI_NODE_FLOATS <= ui_end, "game returned truncated interface nodes");
             let id = reader.count(ui_record_lane, MAX_UI_ID)?;
             let parent = reader.count(ui_record_lane + 1, MAX_UI_NODES)?;
-            let role = reader.count(ui_record_lane + 2, 21)?;
+            let role = reader.count(ui_record_lane + 2, 23)?;
             let x = reader.packet[ui_record_lane + 3];
             let y = reader.packet[ui_record_lane + 4];
             let width = reader.packet[ui_record_lane + 5];
@@ -1323,7 +1398,7 @@ pub mod codec {
         for _ in 0..services_count {
             ensure!(service_lane + SERVICE_REQUEST_FLOATS <= services_end, "game returned truncated service requests");
             let request = reader.count(service_lane, MAX_SERVICE_ID)?;
-            let service = reader.count(service_lane + 1, 4)?;
+            let service = reader.count(service_lane + 1, 5)?;
             let operation = reader.count(service_lane + 2, MAX_SERVICE_OPERATION)?;
             let a = reader.packet[service_lane + 3];
             let b = reader.packet[service_lane + 4];

@@ -111,11 +111,14 @@ assets in dist/gdev/assets compile under naga 30 unchanged.
   gtex inflating and PNG/JPEG decoding, and, where the TS uses
   `createRenderPipelineAsync`, shader modules and pipelines (a shader's
   first pipelines, its inset pipeline, `warm`ed sample counts, sprite
-  pipelines). wgpu's `Device` is `Send + Sync` and error scopes are per
-  thread, so each thread scopes its own work. Buffer and texture uploads,
-  mipmap generation and the TS's synchronous `createRenderPipeline` calls
-  (shadow pipelines, a sample count used before its background compile)
-  stay on the thread calling `submit`.
+  pipelines). A shader's shadow pipelines, which the TS makes with
+  `createRenderPipeline` on first use, also compile there as it loads, so
+  the first frame it casts a shadow in does not stall on the driver.
+  wgpu's `Device` is `Send + Sync` and error scopes are per thread, so each
+  thread scopes its own work. Buffer and texture uploads, mipmap generation
+  and the TS's other synchronous `createRenderPipeline` calls (a sample
+  count used before its background compile, a shadow pipeline that failed
+  to compile as its shader loaded) stay on the thread calling `submit`.
 - Loads that arrive are taken in at the start of `submit`, as are streamed
   texture levels; the TS takes them whenever their promises settle.
 - A frame whose `RenderTarget::view()` returns None is dropped (the TS would

@@ -5,13 +5,16 @@ gdev := "../gdev"
 pen := "cargo run --release -q -p pen --"
 
 # Build the runtime with Steam and install it as ~/.local/bin/pen, beside
-# the Steam library it links against.
+# the Steam library it links against. Each file is copied beside its old one
+# and renamed over it, so a pen still running keeps the files it started with.
 # Installs the Steam-enabled runtime as ~/.local/bin/pen.
 install:
   cargo build --release -p pen --features steam
   mkdir -p ~/.local/lib/pen-runtime
-  cp target/release/pen ~/.local/lib/pen-runtime/pen
-  cp "$(ls -t target/release/build/steamworks-sys-*/out/libsteam_api.so | head -1)" ~/.local/lib/pen-runtime/
+  cp target/release/pen ~/.local/lib/pen-runtime/pen.new
+  mv -f ~/.local/lib/pen-runtime/pen.new ~/.local/lib/pen-runtime/pen
+  cp "$(ls -t target/release/build/steamworks-sys-*/out/libsteam_api.so | head -1)" ~/.local/lib/pen-runtime/libsteam_api.so.new
+  mv -f ~/.local/lib/pen-runtime/libsteam_api.so.new ~/.local/lib/pen-runtime/libsteam_api.so
   ln -sf ~/.local/lib/pen-runtime/pen ~/.local/bin/pen
   @echo "installed: pen dev | web | run | build | test | parity | bench | packets (in a gdev checkout)"
 
@@ -48,6 +51,13 @@ bench:
 visual *args:
   {{pen}} test --project {{gdev}} tests/visual/scenarios.json {{args}}
 
+# The checkout's Blot tests (its tests/*.blot), compiled and run on wasmtime:
+# `just blot-tests tests/hand_salt.blot` runs one module, `--filter TEXT`
+# the tests whose names hold TEXT.
+# The checkout's Blot tests.
+blot-tests *args:
+  {{pen}} test-blot --project {{gdev}} {{args}}
+
 # The native renderer against the checkout's renderer.ts on the same frames.
 parity *args:
   {{pen}} parity --project {{gdev}} {{args}}
@@ -82,9 +92,9 @@ sync-protocol:
   deno run --allow-read --allow-write --allow-env --no-lock --config {{gdev}}/deno.json {{gdev}}/scripts/generate_protocol.ts --only rust --rust crates/pen-protocol/src/packets.rs
 
 # Everything: clippy, unit and GPU tests, golden images, renderer parity,
-# engine conformance and the determinism contract.
+# engine conformance, the determinism contract and the checkout's Blot tests.
 # Runs every check.
-test: check visual parity conformance determinism
+test: check visual parity conformance determinism blot-tests
 
 # The generated protocol is fresh, clippy and tests; the renderer's GPU tests
 # also in release, where the optimizer once broke what debug builds hid.

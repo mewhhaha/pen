@@ -66,6 +66,8 @@ pub enum Step {
     Tune(String, f32),
     /// A console command's number and argument.
     Console(f32, f32),
+    /// A line typed into the dev tools' console.
+    Overlay(String),
 }
 
 /// A time travel step.
@@ -194,6 +196,10 @@ pub fn parse(arguments: &[String]) -> Result<Vec<Step>> {
                 ensure!(at[0] >= 0.0 && at[0].fract() == 0.0, usage());
                 Step::Console(at[0], at.get(1).copied().unwrap_or(0.0))
             }
+            "overlay" => {
+                ensure!(value.starts_with('/'), "overlay takes a console line, /COMMAND[,ARGUMENT...], not {value}");
+                Step::Overlay(value.replace(',', " "))
+            }
             "pause" => Step::Travel(Travel::Pause),
             "resume" => Step::Travel(Travel::Resume),
             "step" => Step::Travel(Travel::Step(if value.is_empty() {
@@ -233,6 +239,8 @@ pub struct Tick {
     pub quit: bool,
     /// Time travel, before the frame runs.
     pub travel: Option<Travel>,
+    /// Lines for the dev tools' console.
+    pub overlay: Vec<String>,
 }
 
 /// Plays steps one frame at a time: each input step takes a frame, a tap
@@ -340,6 +348,7 @@ impl Script {
                 tick.events.push(GameEvent::Tune { index: crate::overlay::tunable_id(&name), value });
             }
             Step::Console(command, argument) => tick.events.push(GameEvent::Console { command, argument }),
+            Step::Overlay(line) => tick.overlay.push(line),
             Step::Travel(travel) => {
                 // Stepping takes a frame per frame stepped, as waiting does.
                 if let Travel::Step(frames) = travel {
@@ -460,6 +469,16 @@ mod tests {
         }
         let mut script = Script::new(parse(&["console=3,10".into()]).unwrap());
         assert_eq!(script.tick(VIEW).events, [GameEvent::Console { command: 3.0, argument: 10.0 }]);
+    }
+
+    #[test]
+    fn parses_overlay_lines() {
+        let steps = parse(&["overlay=/timeline overlay=/diagnostics,high".into()]).unwrap();
+        assert_eq!(steps, [Step::Overlay("/timeline".into()), Step::Overlay("/diagnostics high".into())]);
+        assert!(parse(&["overlay=timeline".into()]).is_err());
+        let mut script = Script::new(steps);
+        assert_eq!(script.tick(VIEW).overlay, ["/timeline"]);
+        assert_eq!(script.tick(VIEW).overlay, ["/diagnostics high"]);
     }
 
     #[test]

@@ -7,8 +7,11 @@
 #![cfg_attr(all(windows, not(feature = "compiler")), windows_subsystem = "windows")]
 mod accessibility;
 mod audio;
+mod blot_test;
 mod crash;
 mod dev;
+#[cfg(feature = "devtools")]
+mod devtools;
 mod game;
 mod input;
 mod opus;
@@ -90,10 +93,10 @@ struct Pending {
     catalog: Catalog,
     present_mode: wgpu::PresentMode,
     size: Option<(u32, u32)>,
-    /// The dev overlay, in `dev` and `run`.
+    /// The dev tools, in `dev` and `run`.
     #[cfg(feature = "devtools")]
-    overlay: Option<overlay::Settings>,
-    /// Write the last frame with the overlay (`--overlay-shot`).
+    devtools: Option<devtools::Settings>,
+    /// Write the last frame with the dev tools (`--overlay-shot`).
     overlay_shot: Option<PathBuf>,
 }
 
@@ -130,6 +133,8 @@ impl App {
             &pending.paths.assets,
             pinned,
         )?;
+        #[cfg(feature = "devtools")]
+        let (assets, catalog) = (pending.paths.assets.clone(), pending.catalog.clone());
         let mut session = Session::start(
             pending.options,
             pending.paths,
@@ -145,9 +150,9 @@ impl App {
         #[cfg(feature = "steam")]
         session.services.register(Box::new(services::steam::SteamService::new(self.steam.take())));
         #[cfg(feature = "devtools")]
-        if let Some(settings) = pending.overlay {
-            let developing = session.developing();
-            session.set_overlay(Box::new(overlay::DevOverlay::new(&window, &session.gpu, developing, settings)));
+        if let Some(settings) = pending.devtools {
+            let devtools = devtools::Devtools::new(Some(&window), &session.gpu, catalog, &assets, settings)?;
+            session.set_overlay(Box::new(devtools));
         }
         if let Some(path) = pending.overlay_shot {
             session.overlay_shot_at_end(path);
@@ -201,7 +206,7 @@ impl ApplicationHandler for App {
                     Err(error) => self.fail(event_loop, error),
                 }
             }
-            // The dev overlay sees events first, and keeps some from the game.
+            // The dev tools see events first, and keep some from the game.
             _ => {
                 if session.overlay_event(&window, &event) {
                     session.input.window_event(&window, &event);
@@ -261,6 +266,9 @@ commands, in a gdev checkout (or with --project DIR):
   bench [--frames N]  guest time per frame, without rendering
   packets DIR [--frames N] [--script STEPS]
                       each frame's input and render packet, without rendering
+  test-blot [FILE...] [--filter TEXT]
+                      the checkout's Blot tests (default tests/*.blot): each module's test_ entries,
+                      compiled against the game if its first line is `// test: game`, else alone
 
 without a command, pen plays a packaged game: game/ beside the executable, or --game DIR.
 
@@ -279,6 +287,7 @@ options for playing (pen, dev, run):
                       ui=ID,ACTION[,VALUE] (an assistive technology's action on an interface node:
                       focus, blur, activate, increment, decrement, set_value, expand or collapse)
                       tune=NAME=VALUE (a live-tunable constant of the checkout's src/tunables.json)
+                      overlay=/COMMAND[,ARG...] (a line typed into the dev tools' console)
   --script-file FILE  the same, from a file
   --data DIR          keep saves and preferences in DIR instead of the user's data directory
   --settle, --no-settle
@@ -293,16 +302,16 @@ options for playing (pen, dev, run):
   --history           keep the last 10 s to rewind and replay (always in dev and replays)
   --overlap           compute the next frame while this one draws (one frame more input latency)
   --trace FILE        a line per frame: its number, and its input's and packet's hashes
-  --overlay           show the dev overlay from the start (dev and run; or PEN_OVERLAY=1)
-  --overlay-shot PNG  write the last frame as the window shows it, the dev overlay included
+  --overlay           open the dev tools' console from the start (dev and run; or PEN_OVERLAY=1)
+  --overlay-shot PNG  write the last frame with the dev tools over it (headless too)
 
 time travel: Ctrl+Shift+P pauses and plays, Ctrl+Shift+period steps a frame, Ctrl+Shift+comma
   steps back, Ctrl+Shift+R replays the last 5 s (after a reload, on the new build); in scripts,
   pause resume step[=N] rewind=N replay=SECONDS.
 
-dev overlay (dev and run, in a window): the backquote key shows and hides the console (the
-  game's commands, /help), profiler, timeline (time travel, input recording) and hot reload
-  panels over the game.
+dev tools (dev and run): the checkout's own program for them (devtools/main.blot) runs beside
+  the game and draws over it: its console on the backquote key (/help lists what it does), and
+  its diagnostics; a checkout without one runs without dev tools.
 
 environment: PEN_PRESENT_MODE, PEN_PROFILE_FRAMES, PEN_PROFILE_WARMUP, PEN_SMOKE_FRAMES, PEN_OVERLAY,
              PEN_GPU_BACKTRACE (where a GPU validation error came from), PEN_STEAM=1 (Steam
@@ -332,7 +341,7 @@ struct Args {
 impl Args {
     fn parse() -> Args {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let commands = ["dev", "web", "run", "build", "test", "parity", "bench", "packets"];
+        let commands = ["dev", "web", "run", "build", "test", "parity", "bench", "packets", "test-blot"];
         let command = args.first().filter(|first| commands.contains(&first.as_str())).cloned();
         let rest = if command.is_some() { args[1..].to_vec() } else { args };
         // Words that are neither options nor their values.
@@ -359,6 +368,7 @@ impl Args {
                 | "--no-settle"
                 | "--update"
                 | "--help"
+                | "--version"
                 | "--steam"
                 | "--software"
                 | "--no-pipeline"
@@ -453,8 +463,18 @@ fn check_tunes(steps: &[script::Step], root: &Path) {
     }
 }
 
+/// Whether `run` builds the dev tools: a window always has them, a headless
+/// run when its console should show, a shot of them is wanted or its script
+/// types into them.
+fn devtools_wanted(args: &Args) -> Result<bool> {
+    Ok(!args.flag("--headless")
+        || args.flag("--overlay")
+        || args.path("--overlay-shot").is_some()
+        || args.script()?.iter().any(|step| matches!(step, script::Step::Overlay(_))))
+}
+
 /// `checkout` is the gdev checkout played (`dev` and `run`), which has the
-/// dev overlay.
+/// dev tools.
 fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>) -> Result<()> {
     let headless = args.flag("--headless");
     let frames: Option<usize> = args.value("--frames").map(|frames| frames.parse()).transpose()?;
@@ -467,12 +487,16 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
         check_tunes(&script, root);
     }
     let settle = (headless || record.is_some() || args.flag("--settle")) && !args.flag("--no-settle");
-    if (args.flag("--overlay") || overlay_shot.is_some()) && (headless || checkout.is_none()) {
-        bail!("the dev overlay shows in a window, in `pen dev` and `pen run`");
+    // A window always has the overlay; a headless run, when something asks for it.
+    let overlay_asked = args.flag("--overlay")
+        || overlay_shot.is_some()
+        || script.iter().any(|step| matches!(step, script::Step::Overlay(_)));
+    if overlay_asked && checkout.is_none() {
+        bail!("the dev tools are for a checkout, in `pen dev` and `pen run`");
     }
     #[cfg(not(feature = "devtools"))]
-    if args.flag("--overlay") || overlay_shot.is_some() {
-        bail!("this pen has no dev overlay (it was built without the devtools feature)");
+    if overlay_asked {
+        bail!("this pen has no dev tools (it was built without the devtools feature)");
     }
     let shot = screenshot.is_some() || overlay_shot.is_some();
     let options = Options {
@@ -513,11 +537,32 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
     let engine = if dev { blot_host::dev_engine()? } else { blot_host::engine()? };
     let module = load_module(&engine, &game.directory, !dev)?;
     let catalog = read_catalog(&paths.assets)?;
+    #[cfg(feature = "devtools")]
+    let devtools = |keep: bool| {
+        checkout.map(|root| devtools::Settings {
+            project: root.to_owned(),
+            build: game.directory.clone(),
+            open: devtools::requested(args.flag("--overlay")),
+            keep,
+        })
+    };
 
     if headless {
         let gpu = Gpu::headless(size.unwrap_or((1920, 1280)), &paths.assets)?;
+        #[cfg(feature = "devtools")]
+        let (assets, devtools_catalog) = (paths.assets.clone(), catalog.clone());
         let mut session = Session::start(options, paths, engine, module, catalog, gpu, None)?;
         session.playback(playback, None)?;
+        #[cfg(feature = "devtools")]
+        if let Some(settings) = devtools(false).filter(|_| overlay_asked) {
+            let mut devtools = devtools::Devtools::new(None, &session.gpu, devtools_catalog, &assets, settings)?;
+            // Headless, the program's build is waited for: what it shows is the point.
+            devtools.start_now()?;
+            session.set_overlay(Box::new(devtools));
+        }
+        if let Some(path) = overlay_shot {
+            session.overlay_shot_at_end(path);
+        }
         let mut accessibility = accessibility::Accessibility::headless()?;
         let started = Instant::now();
         let mut frames = 0usize;
@@ -553,10 +598,7 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
             present_mode: present_mode()?,
             size,
             #[cfg(feature = "devtools")]
-            overlay: checkout.map(|root| overlay::Settings {
-                project: Some(root.to_owned()),
-                open: overlay::requested(args.flag("--overlay")),
-            }),
+            devtools: devtools(true),
             overlay_shot,
         }),
         window: None,
@@ -581,6 +623,10 @@ fn main() -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
+    if args.flag("--version") {
+        println!("pen {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     crash::install(args.path("--data"));
     if args.flag("--software") {
         // SAFETY: no other thread exists yet. The variable reaches every GPU
@@ -592,6 +638,8 @@ fn main() -> Result<()> {
         None => play(&args, Game::bundle(&args), false, packaged_game().is_some(), None),
         Some("dev") => {
             let project = checkout()?;
+            // The dev tools' program builds beside the game's.
+            let _devtools = project.build_devtools(&project.native(), true)?;
             let _compiler = project.watch(&project.native())?;
             let _pipeline = (!args.flag("--no-pipeline")).then(|| pipeline::Pipeline::start(&project.root)).flatten();
             play(&args, Game::checkout(&project), true, false, Some(&project.root))
@@ -614,7 +662,15 @@ fn main() -> Result<()> {
         }
         Some("run") => {
             let project = checkout()?;
+            let mut devtools = if devtools_wanted(&args)? { project.build_devtools(&project.native(), false)? } else { None };
             project.compile(&project.native())?;
+            // Headless, the dev tools are wanted from the first frame.
+            if args.flag("--headless")
+                && let Some(build) = &mut devtools
+                && !build.wait()?
+            {
+                eprintln!("devtools: its program did not compile");
+            }
             play(&args, Game::checkout(&project), false, false, Some(&project.root))
         }
         Some("build") => {
@@ -720,6 +776,11 @@ fn main() -> Result<()> {
                 steps,
             })
             .map(drop)
+        }
+        Some("test-blot") => {
+            let project = checkout()?;
+            let files = args.positional.iter().map(PathBuf::from).collect();
+            blot_test::run(&project.root, blot_test::Options { files, filter: args.value("--filter") })
         }
         Some(other) => bail!("unknown command {other}"),
     }

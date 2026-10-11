@@ -12,7 +12,7 @@
 //!
 //! The game sends its whole interface every frame; the tree is built and
 //! handed to the adapter only when it changes, and only while an assistive
-//! technology listens. The dev overlay's own tree (egui's) hangs from a graft
+//! technology listens. The dev tools' own tree (their program's) hangs from a graft
 //! node under the root as a subtree with ids of its own (`OVERLAY_TREE`), and
 //! has the focus while one of its widgets has the keyboard.
 //!
@@ -42,12 +42,12 @@ pub const TITLE: &str = "gdev — Blot 3D";
 
 /// The root: the window.
 const ROOT: NodeId = NodeId(0);
-/// The dev overlay's graft node, which egui's tree hangs from.
+/// The dev tools' graft node, which their program's tree hangs from.
 const GRAFT: NodeId = NodeId(1);
 /// Game nodes' ids (1 to MAX_UI_ID) are offset by this, away from the
 /// host's own nodes.
 const GAME: u64 = 1 << 32;
-/// The dev overlay's egui tree: a subtree with ids of its own.
+/// The dev tools' tree: a subtree with ids of its own.
 const OVERLAY_TREE: TreeId = TreeId(Uuid::from_u128(0x5d1c_7a2e_93b4_4c8f_a6e0_2f71_c0de_9a11));
 
 /// The game's actions and AccessKit's, by the game's codes.
@@ -70,7 +70,7 @@ struct Interface {
     /// Window pixels per frame pixel, across and down: frames can keep a size
     /// the window does not have, and the window shows them stretched.
     scale: [f64; 2],
-    /// The dev overlay shows (its tree hangs from the graft node), and
+    /// The dev tools show (their tree hangs from the graft node), and
     /// whether one of its widgets has the keyboard.
     overlay: Option<bool>,
 }
@@ -149,6 +149,8 @@ fn role(role: u32, plain: bool) -> Role {
         ui_role::PROGRESSBAR => Role::ProgressIndicator,
         ui_role::RADIOGROUP => Role::RadioGroup,
         ui_role::RADIO => Role::RadioButton,
+        ui_role::TEXTBOX => Role::TextInput,
+        ui_role::LOG => Role::Log,
         _ => Role::Unknown,
     }
 }
@@ -342,18 +344,38 @@ fn game_event(ui: &[UiNode], request: &ActionRequest) -> Option<GameEvent> {
     takes(node, action).then_some(GameEvent::UiAction { node: id, action, value })
 }
 
-/// An assistive technology's request for the dev overlay's subtree, as egui
+/// The dev tools program's interface as a tree of its own, as the overlay's
+/// subtree takes it (in its own root tree's terms): its nodes under a group,
+/// the focus on its focused node.
+#[cfg(feature = "devtools")]
+pub fn program_tree(ui: &[UiNode]) -> TreeUpdate {
+    let mut update = build(&Interface { ui: ui.to_vec(), scale: [1.0, 1.0], overlay: None }, false);
+    if let Some((_, root)) = update.nodes.iter_mut().find(|(id, _)| *id == ROOT) {
+        root.set_role(Role::Group);
+        root.set_label("Dev tools");
+    }
+    update
+}
+
+/// An assistive technology's request for one of the dev tools program's
+/// nodes, as the UiAction event its next frame takes.
+#[cfg(feature = "devtools")]
+pub fn program_event(ui: &[UiNode], request: &ActionRequest) -> Option<GameEvent> {
+    game_event(ui, request)
+}
+
+/// An assistive technology's request for the dev tools' subtree, as they
 /// takes it: for its own (root) tree.
 fn overlay_request(request: &ActionRequest) -> Option<ActionRequest> {
     (request.target_tree == OVERLAY_TREE).then(|| ActionRequest { target_tree: TreeId::ROOT, ..request.clone() })
 }
 
-/// Whether one of egui's widgets has the keyboard, in its tree.
+/// Whether one of the overlay's nodes has the keyboard, in its tree.
 fn overlay_focused(update: &TreeUpdate) -> bool {
     update.tree.as_ref().is_some_and(|tree| update.focus != tree.root)
 }
 
-/// egui's tree as the overlay's subtree, its focus on one of its nodes.
+/// The overlay's tree as its subtree, its focus on one of its nodes.
 fn overlay_subtree(mut update: TreeUpdate) -> TreeUpdate {
     update.tree_id = OVERLAY_TREE;
     if let Some(tree) = &update.tree
@@ -385,7 +407,7 @@ fn line(text: &mut String, id: NodeId, node: &Node, depth: usize, focused: bool)
         let _ = write!(text, " #{game}");
     }
     if node.tree_id() == Some(OVERLAY_TREE) {
-        text.push_str(" (the dev overlay)");
+        text.push_str(" (the dev tools)");
     }
     if let Some(label) = node.label() {
         let _ = write!(text, " {label:?}");
@@ -530,7 +552,7 @@ fn whole(sent: &mut Sent, shared: &Mutex<Shared>, interface: &Interface) -> Tree
 }
 
 /// Brings the adapter's tree up to date: the whole tree when it changed, then
-/// egui's subtree, then the focus on it if it was not the adapter's to have.
+/// The overlay's subtree, then the focus on it if it was not the adapter's to have.
 /// `push` hands the adapter an update, made only while an assistive
 /// technology listens; each one first sees whether one has started since the
 /// last, and is then the whole tree.
@@ -538,14 +560,14 @@ fn sync(
     sent: &mut Sent,
     shared: &Mutex<Shared>,
     interface: &Interface,
-    egui: Option<TreeUpdate>,
+    overlay: Option<TreeUpdate>,
     push: &mut dyn FnMut(&mut dyn FnMut() -> TreeUpdate),
 ) {
     if std::mem::take(&mut sent.stale) {
         push(&mut || whole(sent, shared, interface));
     }
     // A subtree's first update must have its tree.
-    if let Some(update) = egui
+    if let Some(update) = overlay
         && interface.overlay.is_some()
         && (update.tree.is_some() || sent.grafted)
     {
@@ -605,7 +627,7 @@ impl Dump {
     }
 }
 
-/// The game's interface (and the dev overlay's) for assistive technology:
+/// The game's interface (and the dev tools') for assistive technology:
 /// the window's AccessKit adapter, and the PEN_A11Y_DUMP file.
 pub struct Accessibility {
     /// None headless.
@@ -663,8 +685,8 @@ impl Accessibility {
             Some(_) => previous.map_or([1.0, 1.0], |previous| previous.scale),
             None => [1.0, 1.0],
         };
-        let (shown, egui) = session.overlay_accesskit();
-        let overlay = shown.then(|| match &egui {
+        let (shown, program) = session.overlay_accesskit();
+        let overlay = shown.then(|| match &program {
             Some(update) => overlay_focused(update),
             None => previous.and_then(|previous| previous.overlay).unwrap_or(false),
         });
@@ -686,7 +708,7 @@ impl Accessibility {
             std::mem::take(&mut shared.requests)
         };
         if let (Some(adapter), Some(interface)) = (&mut self.adapter, &self.current) {
-            sync(&mut self.sent, &self.shared, interface, egui, &mut |update| adapter.update_if_active(update));
+            sync(&mut self.sent, &self.shared, interface, program, &mut |update| adapter.update_if_active(update));
         }
         for request in requests {
             if let Some(request) = overlay_request(&request) {
@@ -775,6 +797,8 @@ mod tests {
             Role::ProgressIndicator,
             Role::RadioGroup,
             Role::RadioButton,
+            Role::TextInput,
+            Role::Log,
         ];
         assert_eq!(expected.len(), ui_role::NAMES.len());
         let ui: Vec<UiNode> = (0..expected.len() as u32).map(|code| named(code + 1, 0, code, "x")).collect();
@@ -954,11 +978,11 @@ mod tests {
         assert_eq!(event(game_node(99), Action::Click, None), None);
         assert_eq!(event(ROOT, Action::Focus, None), None);
         assert_eq!(event(GRAFT, Action::Focus, None), None);
-        // The overlay's go to egui, as requests for its own tree.
-        let mut egui = request(NodeId(7), Action::Click, None);
-        egui.target_tree = OVERLAY_TREE;
-        assert_eq!(game_event(&ui, &egui), None);
-        assert_eq!(overlay_request(&egui), Some(request(NodeId(7), Action::Click, None)));
+        // The overlay's go to it, as requests for its own tree.
+        let mut overlaid = request(NodeId(7), Action::Click, None);
+        overlaid.target_tree = OVERLAY_TREE;
+        assert_eq!(game_event(&ui, &overlaid), None);
+        assert_eq!(overlay_request(&overlaid), Some(request(NodeId(7), Action::Click, None)));
         assert_eq!(overlay_request(&request(game_node(12), Action::Click, None)), None);
     }
 
@@ -976,7 +1000,7 @@ mod tests {
              \x20   Slider #13 \"Volume\" value=\"80%\" number=0.8 range=0..1 step=0.1 \
              actions=focus,increment,decrement,set_value\n\
              \x20   CheckBox #16 \"Music\" toggled=true actions=activate\n\
-             \x20 GenericContainer (the dev overlay)\n"
+             \x20 GenericContainer (the dev tools)\n"
         );
     }
 
@@ -1027,9 +1051,9 @@ mod tests {
         }
     }
 
-    /// egui's tree as its context gives it: a window root with a button
+    /// An overlay's tree as it gives it: a window root with a button
     /// (`focused`: with the keyboard), in its own ids.
-    fn egui(focused: bool) -> TreeUpdate {
+    fn overlay_tree(focused: bool) -> TreeUpdate {
         let (root, button) = (NodeId(0xe9e9), NodeId(0x1234));
         let mut window = Node::new(Role::Window);
         window.push_child(button);
@@ -1049,11 +1073,11 @@ mod tests {
         shared: &Arc<Mutex<Shared>>,
         adapter: &mut Adapter,
         interface: &Interface,
-        egui: Option<TreeUpdate>,
+        overlay: Option<TreeUpdate>,
     ) {
         sent.stale = true;
         lock(shared).latest = Some(Arc::new(interface.clone()));
-        sync(sent, shared, interface, egui, &mut |update| adapter.push(update));
+        sync(sent, shared, interface, overlay, &mut |update| adapter.push(update));
     }
 
     #[test]
@@ -1077,23 +1101,23 @@ mod tests {
         // The overlay shows, its console with the keyboard: the graft, its
         // subtree, then the focus on it, in one frame.
         game.overlay = Some(true);
-        frame(&mut sent, &shared, &mut adapter, &game, Some(egui(true)));
+        frame(&mut sent, &shared, &mut adapter, &game, Some(overlay_tree(true)));
         assert_eq!(adapter.focus(), (NodeId(0x1234), OVERLAY_TREE));
         assert!(sent.grafted);
         // Its tree comes again every frame.
-        sync(&mut sent, &shared, &game, Some(egui(true)), &mut |update| adapter.push(update));
+        sync(&mut sent, &shared, &game, Some(overlay_tree(true)), &mut |update| adapter.push(update));
         // The console lets go of the keyboard: the game's focus again.
         game.overlay = Some(false);
-        frame(&mut sent, &shared, &mut adapter, &game, Some(egui(false)));
+        frame(&mut sent, &shared, &mut adapter, &game, Some(overlay_tree(false)));
         assert_eq!(adapter.focus(), (game_node(13), TreeId::ROOT));
         // An assistive technology starts again while the overlay has the
         // keyboard: its tree comes first, then the subtree and the focus.
         game.overlay = Some(true);
-        frame(&mut sent, &shared, &mut adapter, &game, Some(egui(true)));
+        frame(&mut sent, &shared, &mut adapter, &game, Some(overlay_tree(true)));
         adapter.activate(&shared);
         assert_eq!(adapter.focus(), (game_node(13), TreeId::ROOT));
-        sync(&mut sent, &shared, &game, Some(egui(true)), &mut |update| adapter.push(update));
-        sync(&mut sent, &shared, &game, Some(egui(true)), &mut |update| adapter.push(update));
+        sync(&mut sent, &shared, &game, Some(overlay_tree(true)), &mut |update| adapter.push(update));
+        sync(&mut sent, &shared, &game, Some(overlay_tree(true)), &mut |update| adapter.push(update));
         assert_eq!(adapter.focus(), (NodeId(0x1234), OVERLAY_TREE));
         // The overlay hides: its graft and subtree go.
         game.overlay = None;
@@ -1103,7 +1127,7 @@ mod tests {
         assert_eq!(adapter.focus(), (game_node(13), TreeId::ROOT));
         // And shows again.
         game.overlay = Some(false);
-        frame(&mut sent, &shared, &mut adapter, &game, Some(egui(false)));
+        frame(&mut sent, &shared, &mut adapter, &game, Some(overlay_tree(false)));
         assert!(adapter.tree.as_ref().unwrap().state().subtree_root(OVERLAY_TREE).is_some());
     }
 
@@ -1116,7 +1140,7 @@ mod tests {
         let mut game = interface(menu());
         game.overlay = Some(true);
         // The overlay's subtree may not come first.
-        frame(&mut sent, &shared, &mut adapter, &game, Some(egui(true)));
+        frame(&mut sent, &shared, &mut adapter, &game, Some(overlay_tree(true)));
         assert_eq!(adapter.focus(), (NodeId(0x1234), OVERLAY_TREE));
     }
 

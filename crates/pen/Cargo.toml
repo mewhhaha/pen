@@ -17,10 +17,10 @@ default = ["compiler", "devtools"]
 # precompiled with.
 compiler = ["blot-host/compiler"]
 steam = ["dep:steamworks"]
-# The dev overlay (`overlay`, toggled with the backquote key in `pen dev`
-# and `pen run`): console, profiler, timeline and hot reload panels drawn
-# with egui. The player runtime leaves it out.
-devtools = ["dep:egui", "dep:egui-wgpu", "dep:egui-winit"]
+# The dev tools (`devtools`): the checkout's own Blot program for its
+# console and diagnostics, run beside the game in `pen dev` and `pen run`.
+# The player runtime leaves them out.
+devtools = []
 
 [dependencies]
 anyhow.workspace = true
@@ -38,9 +38,6 @@ accesskit_winit = "0.33"
 arboard = { version = "3.6", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 dirs = "7"
-egui = { version = "0.36", optional = true, default-features = false, features = ["default_fonts"] }
-egui-wgpu = { version = "0.36", optional = true, default-features = false }
-egui-winit = { version = "0.36", optional = true, default-features = false, features = ["clipboard", "wayland", "x11"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 kira = "0.12"
 notify = "8"

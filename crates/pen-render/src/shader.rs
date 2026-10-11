@@ -336,6 +336,16 @@ pub(crate) fn shadow_pipeline(context: &PipelineContext, module: &wgpu::ShaderMo
     })
 }
 
+/// A shader's depth-only pipelines into the shadow map, plain and, if it has
+/// a `vertex_instanced` entry point, instanced.
+pub(crate) fn shadow_pipelines(
+    context: &PipelineContext,
+    module: &wgpu::ShaderModule,
+    instancing: bool,
+) -> [Option<wgpu::RenderPipeline>; 2] {
+    [Some(shadow_pipeline(context, module, false)), instancing.then(|| shadow_pipeline(context, module, true))]
+}
+
 /// A sprite shader's pipeline, blending over the output format.
 pub(crate) fn sprite_pipeline(context: &PipelineContext, module: &wgpu::ShaderModule) -> wgpu::RenderPipeline {
     use wgpu::{BlendComponent, BlendFactor, BlendOperation};

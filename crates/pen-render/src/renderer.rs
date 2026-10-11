@@ -10,7 +10,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use anyhow::{Result, anyhow, ensure};
 use pen_protocol::boundary::{MAX_DRAW_EXTRA, MAX_FIELD};
-use pen_protocol::{Catalog, Draw, FieldPatch, GameEvent, Matrix, RenderFrame, Solid, Vector};
+use pen_protocol::{Catalog, Draw, FieldPatch, GameEvent, Matrix, RenderFrame, Solid, Sprite, Vector};
 
 use crate::asset_store::{AssetKind, AssetStore, Material};
 use crate::decals::{DECAL_MARK, DecalBatch, Decals};
@@ -49,7 +49,8 @@ pub(crate) struct ShaderAsset {
     compiling: HashSet<u32>,
     /// Its opaque pipeline for insets, once compiled.
     inset: Option<wgpu::RenderPipeline>,
-    /// Its depth-only pipelines into the shadow map, plain and instanced.
+    /// Its depth-only pipelines into the shadow map, plain and instanced,
+    /// compiled as it loaded; made on first use where that failed.
     shadow: [Option<wgpu::RenderPipeline>; 2],
 }
 
@@ -1087,7 +1088,7 @@ impl State {
                 let state = material.state_key();
                 Ok(Some((GpuAsset::Material(Arc::new(MaterialAsset { material, state })), None)))
             }
-            Loaded::Shader { module, instancing, samples, pipelines } => Ok(Some((
+            Loaded::Shader { module, instancing, samples, pipelines, shadow } => Ok(Some((
                 GpuAsset::Shader(ShaderAsset {
                     revision,
                     module,
@@ -1095,7 +1096,7 @@ impl State {
                     made: HashMap::from([(samples, pipelines)]),
                     compiling: HashSet::new(),
                     inset: None,
-                    shadow: [None, None],
+                    shadow,
                 }),
                 None,
             ))),
@@ -1673,6 +1674,88 @@ impl State {
 
     // ----- A frame -----
 
+    /// `sprites` in batches of one texture and shader, in order; a sprite
+    /// whose material, shader or texture is still loading is left out.
+    fn sprite_batches<'a>(&mut self, sprites: &'a [Sprite], catalog: &Catalog) -> Result<Vec<SpriteBatch<'a>>> {
+        let mut batches: Vec<SpriteBatch<'a>> = Vec::new();
+        for sprite in sprites {
+            let Some(material) = self.material(catalog, sprite.material)? else { continue };
+            let shader_slot = self.resolve(AssetKind::SpriteShader, &material.material.shader)?;
+            let Some(GpuAsset::SpriteShader(pipeline)) = self.assets.current(shader_slot) else { continue };
+            let pipeline = pipeline.clone();
+            let image = match &material.material.texture {
+                None => Some((self.white.view.clone(), self.white.view_id)),
+                Some(key) => {
+                    let slot = self.resolve(AssetKind::Texture, key)?;
+                    match self.assets.current(slot) {
+                        Some(GpuAsset::Texture(texture)) => Some((texture.view.clone(), texture.view_id)),
+                        _ => None,
+                    }
+                }
+            };
+            let Some((texture, texture_id)) = image else { continue };
+            match batches.last_mut() {
+                Some(last) if last.key == (texture_id, shader_slot) => last.sprites.push(sprite),
+                _ => batches.push(SpriteBatch { pipeline, texture, key: (texture_id, shader_slot), sprites: vec![sprite] }),
+            }
+        }
+        Ok(batches)
+    }
+
+    /// Starts loading what `sprites` draw with (their materials, shaders and
+    /// textures); whether all of it is ready to draw.
+    pub fn prepare_sprites(&mut self, sprites: &[Sprite], catalog: &Catalog) -> Result<bool> {
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        let now = self.now();
+        self.receive(now);
+        let mut ready = true;
+        let mut seen = HashSet::new();
+        for sprite in sprites.iter().filter(|sprite| seen.insert(sprite.material)) {
+            let key = catalog.materials.get(sprite.material as usize).ok_or_else(|| anyhow!("sprite must name a material"))?;
+            crate::asset_store::validate_asset_key(key)?;
+            let Some(material) = self.material(catalog, sprite.material)? else {
+                ready = false;
+                continue;
+            };
+            let shader = self.resolve(AssetKind::SpriteShader, &material.material.shader)?;
+            ready &= matches!(self.assets.current(shader), Some(GpuAsset::SpriteShader(_)));
+            if let Some(texture) = &material.material.texture {
+                let slot = self.resolve(AssetKind::Texture, texture)?;
+                ready &= matches!(self.assets.current(slot), Some(GpuAsset::Texture(_)));
+            }
+        }
+        Ok(ready)
+    }
+
+    /// Draws `sprites` over `output`, a finished image of `size`, which stays
+    /// under them: another program's interface over the game's frame.
+    pub fn overlay(
+        &mut self,
+        sprites: &[Sprite],
+        catalog: &Catalog,
+        output: &wgpu::TextureView,
+        size: (u32, u32),
+    ) -> Result<()> {
+        for sprite in sprites {
+            let key = catalog.materials.get(sprite.material as usize).ok_or_else(|| anyhow!("sprite must name a material"))?;
+            crate::asset_store::validate_asset_key(key)?;
+        }
+        let _ = self.device.poll(wgpu::PollType::Poll);
+        let now = self.now();
+        self.receive(now);
+        let batches = self.sprite_batches(sprites, catalog)?;
+        if batches.is_empty() {
+            return Ok(());
+        }
+        let device = self.device.clone();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("overlay") });
+        let layout = self.sprite_group_layout.clone();
+        let drawer = self.sprites.get_or_insert_with(|| Sprites::new(&device, layout));
+        drawer.draw(&device, &self.queue, &mut encoder, output, size, &batches);
+        self.queue.submit([encoder.finish()]);
+        Ok(())
+    }
+
     pub fn submit(&mut self, frame: &RenderFrame, catalog: &Catalog, target: &mut dyn RenderTarget) -> Result<()> {
         validate_frame(frame)?;
         // Every asset the frame names is in the catalog and stays inside the
@@ -2058,6 +2141,8 @@ impl State {
         } else {
             Vec::new()
         };
+        // Their shadow pipelines compiled as their shaders loaded; one that
+        // failed to is made here.
         for entry in &casters {
             let instanced = matches!(items[entry.item].shape, Shape::Batch(_));
             let context = &self.context;
@@ -2092,28 +2177,7 @@ impl State {
             }
         }
         // Sprites over the finished image, in order.
-        let mut sprite_batches: Vec<SpriteBatch<'_>> = Vec::new();
-        for sprite in &frame.sprites {
-            let Some(material) = self.material(catalog, sprite.material)? else { continue };
-            let shader_slot = self.resolve(AssetKind::SpriteShader, &material.material.shader)?;
-            let Some(GpuAsset::SpriteShader(pipeline)) = self.assets.current(shader_slot) else { continue };
-            let pipeline = pipeline.clone();
-            let image = match &material.material.texture {
-                None => Some((self.white.view.clone(), self.white.view_id)),
-                Some(key) => {
-                    let slot = self.resolve(AssetKind::Texture, key)?;
-                    match self.assets.current(slot) {
-                        Some(GpuAsset::Texture(texture)) => Some((texture.view.clone(), texture.view_id)),
-                        _ => None,
-                    }
-                }
-            };
-            let Some((texture, texture_id)) = image else { continue };
-            match sprite_batches.last_mut() {
-                Some(last) if last.key == (texture_id, shader_slot) => last.sprites.push(sprite),
-                _ => sprite_batches.push(SpriteBatch { pipeline, texture, key: (texture_id, shader_slot), sprites: vec![sprite] }),
-            }
-        }
+        let sprite_batches = self.sprite_batches(&frame.sprites, catalog)?;
         // Each inset's targets and scene, ready to draw into.
         let (output_width, output_height) = target.size();
         let mut insets = Vec::new();

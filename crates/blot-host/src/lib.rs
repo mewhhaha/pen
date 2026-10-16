@@ -6,244 +6,37 @@
 //! callback. Here a callback simply blocks its thread, which preserves the
 //! Wasm stack the same way: run a long-lived `main(host)` on its own thread
 //! and let the callback wait on a channel.
+//!
+//! A guest of the development engine that runs past its [`DEADLINE`] without
+//! returning or calling the host traps with an [`Overrun`]; time it spends
+//! blocked in a callback does not count.
 use std::any::Any;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use wasmtime::{
-    AsContext, AsContextMut, Caller, Engine, ExternRef, FuncType, Instance, Linker, Memory,
-    Module, Store, TypedFunc, Val, ValType,
+    AsContext, AsContextMut, Caller, Engine, ExternRef, FuncType, Instance, Linker, Memory, Module, Store, Trap,
+    TypedFunc, Val, ValType,
 };
 
 /// The host import module every capability adapter comes from.
 pub const HOST_MODULE: &str = "blot:host/1";
-const ABI_SECTION: &str = "blot:abi";
-const ABI_VERSION: u32 = 2;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum ValueType {
-    Unit,
-    U32,
-    Bool,
-    F32,
-    ArrayU32,
-    ArrayF32,
-}
+// The manifest is pen-runtime's: the browser reads it too.
+pub use pen_runtime::abi::{
+    CallbackType, GuestAbi, GuestConstant, GuestFunction, Parameter, ValueType, parse_abi, read_abi,
+};
 
-impl ValueType {
-    fn is_array(self) -> bool {
-        matches!(self, ValueType::ArrayU32 | ValueType::ArrayF32)
+/// The Wasm type a value crosses the boundary as.
+fn wasm_type(value: ValueType) -> ValType {
+    match value {
+        ValueType::F32 => ValType::F32,
+        _ => ValType::I32,
     }
-    fn is_scalar(self) -> bool {
-        !self.is_array()
-    }
-    fn import_name(self) -> &'static str {
-        match self {
-            ValueType::Unit => "unit",
-            ValueType::U32 => "u32",
-            ValueType::Bool => "bool",
-            ValueType::F32 => "f32",
-            ValueType::ArrayU32 => "array_u32",
-            ValueType::ArrayF32 => "array_f32",
-        }
-    }
-    fn wasm(self) -> ValType {
-        match self {
-            ValueType::F32 => ValType::F32,
-            _ => ValType::I32,
-        }
-    }
-    fn from_tag(tag: u8) -> Result<ValueType> {
-        Ok(match tag {
-            0 => ValueType::Unit,
-            1 => ValueType::U32,
-            2 => ValueType::Bool,
-            3 => ValueType::F32,
-            5 => ValueType::ArrayU32,
-            6 => ValueType::ArrayF32,
-            _ => bail!("invalid_abi: unknown value type tag {tag}"),
-        })
-    }
-}
-
-impl fmt::Display for ValueType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            ValueType::Unit => "Unit",
-            ValueType::U32 => "U32",
-            ValueType::Bool => "Bool",
-            ValueType::F32 => "F32",
-            ValueType::ArrayU32 => "Array U32",
-            ValueType::ArrayF32 => "Array F32",
-        })
-    }
-}
-
-/// A host callback's signature: one value in, one value out, `! {Foreign}`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct CallbackType {
-    pub parameter: ValueType,
-    pub result: ValueType,
-}
-
-impl CallbackType {
-    /// `call_<parameter>_<result>`, the adapter this signature imports.
-    pub fn import_name(self) -> String {
-        format!("call_{}_{}", self.parameter.import_name(), self.result.import_name())
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Parameter {
-    Value(ValueType),
-    Callback(CallbackType),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GuestFunction {
-    pub name: String,
-    pub parameter: Parameter,
-    pub result: ValueType,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GuestConstant {
-    pub name: String,
-    pub value: ValueType,
-}
-
-/// The `blot:abi` manifest: the module's exports, in declaration order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct GuestAbi {
-    pub functions: Vec<GuestFunction>,
-    pub constants: Vec<GuestConstant>,
-}
-
-impl GuestAbi {
-    pub fn function(&self, name: &str) -> Option<&GuestFunction> {
-        self.functions.iter().find(|function| function.name == name)
-    }
-
-    /// Callback signatures, deduplicated in first-export order.
-    pub fn callbacks(&self) -> Vec<CallbackType> {
-        let mut found = Vec::new();
-        for function in &self.functions {
-            if let Parameter::Callback(signature) = function.parameter
-                && !found.contains(&signature)
-            {
-                found.push(signature);
-            }
-        }
-        found
-    }
-
-    fn uses_arrays(&self) -> bool {
-        self.functions.iter().any(|function| {
-            function.result.is_array()
-                || match function.parameter {
-                    Parameter::Value(value) => value.is_array(),
-                    Parameter::Callback(signature) => {
-                        signature.parameter.is_array() || signature.result.is_array()
-                    }
-                }
-        })
-    }
-}
-
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl Reader<'_> {
-    fn byte(&mut self) -> Result<u8> {
-        let byte = *self.bytes.get(self.at).ok_or_else(|| anyhow!("invalid_abi: truncated manifest"))?;
-        self.at += 1;
-        Ok(byte)
-    }
-
-    /// A canonical unsigned LEB128 u32.
-    fn u32(&mut self) -> Result<u32> {
-        let mut value = 0u64;
-        for index in 0..5 {
-            let byte = self.byte()?;
-            value |= u64::from(byte & 0x7f) << (index * 7);
-            if byte & 0x80 == 0 {
-                ensure!(index == 0 || byte != 0, "invalid_abi: non-canonical LEB128");
-                ensure!(value <= u64::from(u32::MAX), "invalid_abi: LEB128 exceeds u32");
-                return Ok(value as u32);
-            }
-        }
-        bail!("invalid_abi: LEB128 too long")
-    }
-
-    fn name(&mut self) -> Result<String> {
-        let length = self.u32()? as usize;
-        let end = self.at.checked_add(length).filter(|end| *end <= self.bytes.len());
-        let end = end.ok_or_else(|| anyhow!("invalid_abi: truncated name"))?;
-        let name = std::str::from_utf8(&self.bytes[self.at..end])
-            .map_err(|_| anyhow!("invalid_abi: name is not UTF-8"))?;
-        self.at = end;
-        Ok(name.to_owned())
-    }
-}
-
-/// Parses a `blot:abi` custom section's payload.
-pub fn parse_abi(payload: &[u8]) -> Result<GuestAbi> {
-    let mut reader = Reader { bytes: payload, at: 0 };
-    let version = reader.u32()?;
-    ensure!(version == ABI_VERSION, "invalid_abi: unsupported ABI version {version}");
-    let mut abi = GuestAbi::default();
-    let mut names = std::collections::HashSet::new();
-    for _ in 0..reader.u32()? {
-        let name = reader.name()?;
-        let tag = reader.byte()?;
-        let parameter = if tag == 4 {
-            Parameter::Callback(CallbackType {
-                parameter: ValueType::from_tag(reader.byte()?)?,
-                result: ValueType::from_tag(reader.byte()?)?,
-            })
-        } else {
-            Parameter::Value(ValueType::from_tag(tag)?)
-        };
-        let result = ValueType::from_tag(reader.byte()?)?;
-        ensure!(names.insert(name.clone()), "invalid_abi: duplicate export {name}");
-        abi.functions.push(GuestFunction { name, parameter, result });
-    }
-    for _ in 0..reader.u32()? {
-        let name = reader.name()?;
-        let value = ValueType::from_tag(reader.byte()?)?;
-        ensure!(value.is_scalar(), "invalid_abi: constant {name} is not a scalar");
-        ensure!(names.insert(name.clone()), "invalid_abi: duplicate export {name}");
-        abi.constants.push(GuestConstant { name, value });
-    }
-    ensure!(reader.at == payload.len(), "invalid_abi: trailing manifest bytes");
-    Ok(abi)
-}
-
-/// Finds the single `blot:abi` custom section in a module's bytes.
-pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
-    ensure!(wasm.len() >= 8 && wasm[..4] == *b"\0asm", "not a Wasm module");
-    let mut reader = Reader { bytes: wasm, at: 8 };
-    let mut found = None;
-    while reader.at < wasm.len() {
-        let id = reader.byte()?;
-        let size = reader.u32()? as usize;
-        let end = reader.at.checked_add(size).filter(|end| *end <= wasm.len());
-        let end = end.ok_or_else(|| anyhow!("truncated Wasm section"))?;
-        if id == 0 {
-            let mut section = Reader { bytes: &wasm[..end], at: reader.at };
-            if section.name()? == ABI_SECTION {
-                ensure!(found.is_none(), "invalid_abi: more than one {ABI_SECTION} section");
-                found = Some(parse_abi(&wasm[section.at..end])?);
-            }
-        }
-        reader.at = end;
-    }
-    found.ok_or_else(|| anyhow!("invalid_abi: missing {ABI_SECTION} section"))
 }
 
 /// A compiled guest module and its manifest, ready to instantiate many times.
@@ -305,8 +98,7 @@ impl GuestModule {
 pub const COMPILER: bool = cfg!(feature = "compiler");
 
 #[cfg(not(feature = "compiler"))]
-const NO_COMPILER: &str =
-    "this runtime was built without a Wasm compiler (blot-host's `compiler` feature): it only loads \
+const NO_COMPILER: &str = "this runtime was built without a Wasm compiler (blot-host's `compiler` feature): it only loads \
      games precompiled for it";
 
 /// Compiles `wasm` ahead of time for `engine` (see [`portable_engine`]), to
@@ -337,16 +129,19 @@ fn compile(_engine: &Engine, _wasm: &[u8], _cache: Option<&Path>) -> Result<Modu
 
 #[cfg(feature = "compiler")]
 fn compile_cached(engine: &Engine, wasm: &[u8], directory: &Path) -> Result<Module> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    wasm.hash(&mut hasher);
-    engine.precompile_compatibility_hash().hash(&mut hasher);
-    let path = directory.join(format!("{:016x}.cwasm", hasher.finish()));
+    let path = directory.join(format!("{}.cwasm", cache_key(engine, wasm)));
     if path.exists() {
         // SAFETY: the file is one this function wrote from these exact bytes
         // with a compatible engine; wasmtime still checks its header.
         match unsafe { Module::deserialize_file(engine, &path) } {
-            Ok(module) => return Ok(module),
+            Ok(module) => {
+                // Its modification time says when it was last used, for `prune`.
+                let _ = std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+                return Ok(module);
+            }
             Err(_) => {
                 let _ = std::fs::remove_file(&path);
             }
@@ -359,9 +154,69 @@ fn compile_cached(engine: &Engine, wasm: &[u8], directory: &Path) -> Result<Modu
         let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
         std::fs::write(&temporary, module.serialize()?)?;
         std::fs::rename(&temporary, &path)?;
+        prune(directory, std::time::SystemTime::now())?;
         Ok(())
     })();
     Ok(module)
+}
+
+/// The module cache's name for `wasm` compiled by `engine`: SHA-256 over the
+/// bytes and the engine's compatibility hash, which covers wasmtime's version,
+/// the target and CPU features, the compiler's flags, the tunables (inlining
+/// and epoch checks among them) and the Wasm features.
+#[cfg(feature = "compiler")]
+fn cache_key(engine: &Engine, wasm: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::hash::Hash;
+    struct Hasher(Sha256);
+    impl std::hash::Hasher for Hasher {
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.update(bytes);
+        }
+        fn finish(&self) -> u64 {
+            unreachable!("only the digest is read")
+        }
+    }
+    let mut hasher = Hasher(Sha256::new());
+    hasher.0.update(wasm);
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    hasher.0.finalize().iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The module cache keeps the compiled modules used last, this many (gdev's
+/// is about 6 MB)...
+#[cfg(feature = "compiler")]
+const CACHE_ENTRIES: usize = 8;
+/// ...and none unused for this long (two weeks).
+#[cfg(feature = "compiler")]
+const CACHE_UNUSED: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Drops the module cache's entries beyond the newest [`CACHE_ENTRIES`] or
+/// unused for [`CACHE_UNUSED`] as of `now`, by modification time, and
+/// temporary files a write left behind an hour or more ago.
+#[cfg(feature = "compiler")]
+fn prune(directory: &Path, now: std::time::SystemTime) -> std::io::Result<()> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let used = entry.metadata()?.modified()?;
+        let unused = now.duration_since(used).unwrap_or_default();
+        match path.extension().and_then(|extension| extension.to_str()) {
+            Some("cwasm") => entries.push((used, unused, path)),
+            Some("tmp") if unused > Duration::from_secs(60 * 60) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            _ => {}
+        }
+    }
+    entries.sort_by_key(|(used, ..)| std::cmp::Reverse(*used));
+    for (index, (_, unused, path)) in entries.iter().enumerate() {
+        if index >= CACHE_ENTRIES || *unused > CACHE_UNUSED {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(())
 }
 
 fn validate_module(module: &Module, abi: &GuestAbi) -> Result<()> {
@@ -391,6 +246,14 @@ fn validate_module(module: &Module, abi: &GuestAbi) -> Result<()> {
     if abi.uses_arrays() {
         for name in ["blot:memory", "blot:allocate", "blot:reset"] {
             ensure!(module.get_export(name).is_some(), "invalid_abi: missing array arena export {name}");
+        }
+    }
+    if abi.ownership {
+        for name in [OWNERSHIP_ENTER, OWNERSHIP_LEAVE] {
+            ensure!(
+                module.get_export(name).is_some_and(|export| export.func().is_some()),
+                "invalid_abi: missing ownership export {name}"
+            );
         }
     }
     Ok(())
@@ -461,12 +324,68 @@ struct Arena {
     reset: TypedFunc<i32, i32>,
 }
 
+/// ABI 3's hooks around each call ([`GuestAbi::ownership`]).
+const OWNERSHIP_ENTER: &str = "blot:ownership_enter";
+const OWNERSHIP_LEAVE: &str = "blot:ownership_leave";
+
+/// `blot:ownership_leave`'s outcomes. (2, teardown, releases the module's
+/// roots before the instance is discarded; dropping the store does as much.)
+const LEFT_NORMALLY: i32 = 0;
+const LEFT_FAILING: i32 = 1;
+
+#[derive(Clone)]
+struct Ownership {
+    enter: TypedFunc<(), ()>,
+    leave: TypedFunc<i32, ()>,
+}
+
 #[derive(Default)]
 struct State {
     active: Option<Active>,
     arena: Option<Arena>,
+    ownership: Option<Ownership>,
+    /// Whether this call entered ownership, so it must leave.
+    entered: bool,
     /// Committed linear-memory bytes as of the guest's last host call.
     memory: Option<Arc<AtomicUsize>>,
+    /// When the guest last started running (again), its deadline counting from then.
+    resumed: Option<Instant>,
+    /// Its deadline in epoch ticks, when not [`DEADLINE_TICKS`].
+    deadline: Option<u64>,
+    /// The last array passed in, its buffer reused for the next array out.
+    spare: Vec<u32>,
+}
+
+/// Why a guest stopped: it ran this long without returning or calling the
+/// host, past its [`DEADLINE`].
+/// Errors from [`Guest::call`] carry it as context over the trap and its
+/// Wasm backtrace, which say where the guest was.
+#[derive(Clone, Copy, Debug)]
+pub struct Overrun {
+    pub ran: Duration,
+}
+
+impl fmt::Display for Overrun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the guest ran {:.1} s without calling the host", self.ran.as_secs_f64())
+    }
+}
+
+/// Starts the guest's deadline afresh (for an engine that has one): it is
+/// about to run (again), and only the time it runs counts.
+fn resume(mut store: impl AsContextMut<Data = State>) {
+    let mut store = store.as_context_mut();
+    let ticks = store.data().deadline.unwrap_or(u64::from(DEADLINE_TICKS));
+    store.set_epoch_deadline(ticks);
+    store.data_mut().resumed = Some(Instant::now());
+}
+
+/// `error`, marked as an [`Overrun`] when the guest's deadline stopped it.
+fn overran(state: &State, error: anyhow::Error) -> anyhow::Error {
+    match (error.downcast_ref::<Trap>(), state.resumed) {
+        (Some(Trap::Interrupt), Some(resumed)) => error.context(Overrun { ran: resumed.elapsed() }),
+        _ => error,
+    }
 }
 
 /// One instance of a guest module.
@@ -479,18 +398,21 @@ pub struct Guest {
 impl Guest {
     pub fn new(engine: &Engine, module: &GuestModule) -> Result<Guest> {
         let mut store = Store::new(engine, State::default());
+        // Instantiating runs the module's start function, if it has one.
+        resume(&mut store);
         let mut linker = Linker::new(engine);
         for signature in module.abi.callbacks() {
             let ty = FuncType::new(
                 engine,
-                [ValType::EXTERNREF, signature.parameter.wasm()],
-                [signature.result.wasm()],
+                [ValType::EXTERNREF, wasm_type(signature.parameter)],
+                [wasm_type(signature.result)],
             );
             linker.func_new(HOST_MODULE, &signature.import_name(), ty, move |caller, params, results| {
                 invoke_import(caller, signature, params, results).map_err(wasmtime::Error::from_anyhow)
             })?;
         }
-        let instance = linker.instantiate(&mut store, &module.module)?;
+        let instance =
+            linker.instantiate(&mut store, &module.module).map_err(|error| overran(store.data(), error.into()))?;
         if module.abi.uses_arrays() {
             let memory = instance
                 .get_memory(&mut store, "blot:memory")
@@ -499,11 +421,25 @@ impl Guest {
             let reset = instance.get_typed_func::<i32, i32>(&mut store, "blot:reset")?;
             store.data_mut().arena = Some(Arena { memory, allocate, reset });
         }
+        if module.abi.ownership {
+            // Typed lookups check the hooks' exact signatures before either runs.
+            let enter = instance.get_typed_func::<(), ()>(&mut store, OWNERSHIP_ENTER)?;
+            let leave = instance.get_typed_func::<i32, ()>(&mut store, OWNERSHIP_LEAVE)?;
+            store.data_mut().ownership = Some(Ownership { enter, leave });
+        }
         Ok(Guest { store, instance, abi: module.abi.clone() })
     }
 
     pub fn abi(&self) -> &GuestAbi {
         &self.abi
+    }
+
+    /// Lets the guest run up to `deadline` at a time instead of [`DEADLINE`],
+    /// on [`dev_engine`], to within a fiftieth of [`DEADLINE`].
+    pub fn set_deadline(&mut self, deadline: Duration) {
+        let tick = DEADLINE / DEADLINE_TICKS;
+        let ticks = u64::try_from(deadline.as_nanos() / tick.as_nanos()).unwrap_or(u64::MAX);
+        self.store.data_mut().deadline = Some(ticks.max(1));
     }
 
     /// Committed linear-memory bytes, including temporary allocation capacity.
@@ -522,16 +458,14 @@ impl Guest {
     }
 
     /// Calls the entrypoint `name`. A callback argument stays live only for
-    /// this invocation, and the guest's arena is reset before and after it.
+    /// this invocation, and the guest's arena is reset before and after it
+    /// (and, under ABI 3, ownership entered before it and left after).
     pub fn call(&mut self, name: &str, argument: impl Into<Argument>) -> Result<Value> {
-        let function = self
-            .abi
-            .function(name)
-            .ok_or_else(|| anyhow!("unknown_export: unknown function export {name}"))?
-            .clone();
+        let function =
+            self.abi.function(name).ok_or_else(|| anyhow!("unknown_export: unknown function export {name}"))?.clone();
         let argument = argument.into();
-        let result = self.begin_and_run(&function, argument);
-        let finish = self.finish();
+        let result = self.begin_and_run(&function, argument).map_err(|error| overran(self.store.data(), error));
+        let finish = self.finish(if result.is_ok() { LEFT_NORMALLY } else { LEFT_FAILING });
         let result = result?;
         finish?;
         Ok(result)
@@ -539,6 +473,11 @@ impl Guest {
 
     fn begin_and_run(&mut self, function: &GuestFunction, argument: Argument) -> Result<Value> {
         let name = &function.name;
+        resume(&mut self.store);
+        if let Some(ownership) = self.store.data().ownership.clone() {
+            ownership.enter.call(&mut self.store, ())?;
+            self.store.data_mut().entered = true;
+        }
         if let Some(arena) = self.store.data().arena.clone() {
             arena.reset.call(&mut self.store, 0)?;
         }
@@ -555,12 +494,8 @@ impl Guest {
             (Parameter::Callback(signature), Argument::Callback(callback)) => {
                 let token = TOKENS.fetch_add(1, Ordering::Relaxed);
                 let reference = ExternRef::new(&mut self.store, Token(token))?;
-                self.store.data_mut().active = Some(Active {
-                    token,
-                    signature,
-                    callback: Some(callback),
-                    export: name.clone(),
-                });
+                self.store.data_mut().active =
+                    Some(Active { token, signature, callback: Some(callback), export: name.clone() });
                 Val::ExternRef(Some(reference))
             }
             (Parameter::Callback(_), Argument::Value(_)) => {
@@ -577,15 +512,24 @@ impl Guest {
         let mut results = [Val::I32(0)];
         func.call(&mut self.store, &[parameter], &mut results)?;
         let arena = self.store.data().arena.clone();
-        from_wasm(&self.store, arena.as_ref(), function.result, &results[0])
+        from_wasm(&mut self.store, arena.as_ref(), function.result, &results[0])
     }
 
-    fn finish(&mut self) -> Result<()> {
+    /// Ends a call: leaves ownership with `outcome` if it entered, then
+    /// resets the arena, both attempted even when one fails.
+    fn finish(&mut self, outcome: i32) -> Result<()> {
         self.store.data_mut().active = None;
+        resume(&mut self.store);
+        let mut left = Ok(());
+        if std::mem::take(&mut self.store.data_mut().entered)
+            && let Some(ownership) = self.store.data().ownership.clone()
+        {
+            left = ownership.leave.call(&mut self.store, outcome);
+        }
         if let Some(arena) = self.store.data().arena.clone() {
             arena.reset.call(&mut self.store, 0)?;
         }
-        Ok(())
+        Ok(left?)
     }
 
     /// Reads an exported scalar constant.
@@ -602,7 +546,7 @@ impl Guest {
             .get_global(&mut self.store, name)
             .ok_or_else(|| anyhow!("validated constant export {name} disappeared"))?;
         let value = global.get(&mut self.store);
-        from_wasm(&self.store, None, constant.value, &value)
+        from_wasm(&mut self.store, None, constant.value, &value)
     }
 }
 
@@ -623,15 +567,12 @@ fn invoke_import(
         Some(active) if Some(active.token) == token => (active.export.clone(), active.signature),
         _ => bail!("stale_capability: host call has no active capability reference"),
     };
-    ensure!(
-        expected == signature,
-        "capability_signature: host call signature does not match its capability"
-    );
+    ensure!(expected == signature, "capability_signature: host call signature does not match its capability");
     let arena = caller.data().arena.clone();
     if let (Some(gauge), Some(arena)) = (&caller.data().memory, &arena) {
         gauge.store(arena.memory.data_size(&caller), Ordering::Relaxed);
     }
-    let argument = from_wasm(&caller, arena.as_ref(), signature.parameter, &params[1])?;
+    let argument = from_wasm(&mut caller, arena.as_ref(), signature.parameter, &params[1])?;
     let mut callback = caller
         .data_mut()
         .active
@@ -639,6 +580,7 @@ fn invoke_import(
         .and_then(|active| active.callback.take())
         .ok_or_else(|| anyhow!("reentrant_call: cannot reenter an active guest instance"))?;
     let result = callback(argument);
+    resume(&mut caller);
     if let Some(active) = caller.data_mut().active.as_mut() {
         active.callback = Some(callback);
     }
@@ -656,7 +598,7 @@ fn invoke_import(
 /// The byte address of an array header at `pointer` holding `length` words,
 /// checked against the arena's current size.
 fn array_range(memory_bytes: usize, pointer: i32, length: usize) -> Result<usize> {
-    let address = pointer as u32 as usize;
+    let address = pointer.cast_unsigned() as usize;
     ensure!(
         address >= 4
             && address.is_multiple_of(4)
@@ -667,30 +609,44 @@ fn array_range(memory_bytes: usize, pointer: i32, length: usize) -> Result<usize
     Ok(address)
 }
 
-fn to_wasm(mut store: impl AsContextMut, arena: Option<&Arena>, value: Value) -> Result<Val> {
+/// Copies an array into the guest's arena, then keeps its buffer for the
+/// next array out of it.
+fn to_wasm(mut store: impl AsContextMut<Data = State>, arena: Option<&Arena>, value: Value) -> Result<Val> {
     let words: Vec<u32> = match value {
         Value::Unit => return Ok(Val::I32(0)),
-        Value::U32(value) => return Ok(Val::I32(value as i32)),
+        Value::U32(value) => return Ok(Val::I32(value.cast_signed())),
         Value::Bool(value) => return Ok(Val::I32(value as i32)),
         Value::F32(value) => return Ok(Val::F32(value.to_bits())),
         Value::ArrayU32(values) => values,
-        Value::ArrayF32(values) => values.into_iter().map(f32::to_bits).collect(),
+        Value::ArrayF32(values) => bytemuck::allocation::cast_vec(values),
     };
     let arena = arena.ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
     ensure!(words.len() < 1_073_741_823, "array byte count exceeds the Wasm32 address range");
-    let pointer = arena.allocate.call(&mut store, ((words.len() + 1) * 4) as i32)?;
+    // So its length word and words' bytes fit a u32, which Wasm passes as an i32.
+    let length = u32::try_from(words.len())?;
+    let pointer = arena.allocate.call(&mut store, ((length + 1) * 4).cast_signed())?;
     // Allocation may grow memory, so look at its size only afterwards.
     let memory = arena.memory.data_mut(&mut store);
     let address = array_range(memory.len(), pointer, words.len())?;
-    memory[address..address + 4].copy_from_slice(&(words.len() as u32).to_le_bytes());
+    memory[address..address + 4].copy_from_slice(&length.to_le_bytes());
     let body = &mut memory[address + 4..address + 4 + words.len() * 4];
-    for (chunk, word) in body.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
-        *chunk = word.to_le_bytes();
+    if cfg!(target_endian = "little") {
+        body.copy_from_slice(bytemuck::cast_slice(&words));
+    } else {
+        for (chunk, word) in body.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+            *chunk = word.to_le_bytes();
+        }
     }
+    store.as_context_mut().data_mut().spare = words;
     Ok(Val::I32(pointer))
 }
 
-fn from_wasm(store: impl AsContext, arena: Option<&Arena>, kind: ValueType, value: &Val) -> Result<Value> {
+fn from_wasm(
+    mut store: impl AsContextMut<Data = State>,
+    arena: Option<&Arena>,
+    kind: ValueType,
+    value: &Val,
+) -> Result<Value> {
     let non_canonical = || anyhow!("invalid_abi: non-canonical Wasm {kind} value");
     match (kind, value) {
         (ValueType::F32, Val::F32(bits)) => Ok(Value::F32(f32::from_bits(*bits))),
@@ -698,46 +654,65 @@ fn from_wasm(store: impl AsContext, arena: Option<&Arena>, kind: ValueType, valu
         (ValueType::Unit, Val::I32(_)) => Err(non_canonical()),
         (ValueType::Bool, Val::I32(value @ (0 | 1))) => Ok(Value::Bool(*value == 1)),
         (ValueType::Bool, Val::I32(_)) => Err(non_canonical()),
-        (ValueType::U32, Val::I32(value)) => Ok(Value::U32(*value as u32)),
+        (ValueType::U32, Val::I32(value)) => Ok(Value::U32(value.cast_unsigned())),
         (ValueType::ArrayU32 | ValueType::ArrayF32, Val::I32(pointer)) => {
             let arena = arena.ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
+            let mut words = std::mem::take(&mut store.as_context_mut().data_mut().spare);
+            words.clear();
             // Guest execution may also grow memory; read it afresh.
             let memory = arena.memory.data(&store);
             let address = array_range(memory.len(), *pointer, 0)?;
             let length = u32::from_le_bytes(memory[address..address + 4].try_into().unwrap()) as usize;
             array_range(memory.len(), *pointer, length)?;
-            let words = memory[address + 4..address + 4 + length * 4]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|chunk| u32::from_le_bytes(*chunk));
+            let body = &memory[address + 4..address + 4 + length * 4];
+            match bytemuck::try_cast_slice::<u8, u32>(body) {
+                Ok(aligned) if cfg!(target_endian = "little") => words.extend_from_slice(aligned),
+                _ => words.extend(body.as_chunks::<4>().0.iter().map(|chunk| u32::from_le_bytes(*chunk))),
+            }
             Ok(if kind == ValueType::ArrayU32 {
-                Value::ArrayU32(words.collect())
+                Value::ArrayU32(words)
             } else {
-                Value::ArrayF32(words.map(f32::from_bits).collect())
+                Value::ArrayF32(bytemuck::allocation::cast_vec(words))
             })
         }
         _ => bail!("invalid_abi: Wasm {kind} value has the wrong representation"),
     }
 }
 
-/// An engine configured for Blot guests: optimizing compiler with inlining
-/// and a stack deep enough for recursive programs. Run guests on threads whose stack
-/// exceeds [`GUEST_STACK_BYTES`] plus the host's own needs. It compiles for
-/// this machine's exact CPU; [`portable_engine`] compiles code to ship.
+/// How long a guest of [`dev_engine`] may run without returning or calling
+/// the host before it traps with an [`Overrun`]: an edit that loops costs a
+/// few seconds. Its code checks the time at every function entry and loop
+/// head, which on gdev retires 50 to 65% more instructions per frame (and
+/// takes 30 to 50% more cycles), so no other engine does.
+pub const DEADLINE: Duration = Duration::from_secs(5);
+
+/// Epoch ticks per deadline: a guest traps within one tick before it.
+const DEADLINE_TICKS: u32 = 50;
+
+/// An engine for Blot guests: optimizing compiler with inlining (unless
+/// BLOT_INLINING=0, see [`inlining`]) and a stack deep enough for recursive
+/// programs. Run guests on threads whose stack exceeds [`GUEST_STACK_BYTES`]
+/// plus the host's own needs. It compiles for this machine's exact CPU;
+/// [`portable_engine`] compiles code to ship.
 pub fn engine() -> Result<Engine> {
-    Ok(Engine::new(&config())?)
+    Ok(Engine::new(&config(inlining(true)))?)
+}
+
+/// Whether Cranelift inlines calls, which makes gdev's frames about a
+/// quarter faster for a slower compile. BLOT_INLINING=1 or 0 turns it on or
+/// off for every engine, to compare; otherwise it is `default`: on for
+/// [`engine`] and [`portable_engine`], off for [`dev_engine`].
+fn inlining(default: bool) -> bool {
+    match std::env::var("BLOT_INLINING").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => default,
+    }
 }
 
 /// The same with and without the compiler: a precompiled module only loads
 /// into an engine with the tunables (inlining among them) it was made with.
-/// Inlining makes gdev's frames about a quarter faster for a slower first
-/// compile (cached afterwards). BLOT_INLINING=0 turns it off to compare.
-fn config() -> wasmtime::Config {
-    config_inlining(std::env::var_os("BLOT_INLINING").is_none_or(|value| value != "0"))
-}
-
-fn config_inlining(inlining: bool) -> wasmtime::Config {
+fn config(inlining: bool) -> wasmtime::Config {
     let mut config = wasmtime::Config::new();
     config.wasm_reference_types(true);
     // Guests are core modules. pen's plugins turn wasmtime's component model
@@ -754,6 +729,22 @@ fn config_inlining(inlining: bool) -> wasmtime::Config {
     config
 }
 
+/// `engine`, its epoch advanced [`DEADLINE_TICKS`] times per `deadline` by a
+/// thread that ends with it, for an engine whose code checks it.
+#[cfg(feature = "compiler")]
+fn ticking(engine: Engine, deadline: Duration) -> Result<Engine> {
+    let tick = deadline / DEADLINE_TICKS;
+    let weak = engine.weak();
+    std::thread::Builder::new().name("blot-deadline".into()).spawn(move || {
+        while let Some(engine) = weak.upgrade() {
+            engine.increment_epoch();
+            drop(engine);
+            std::thread::sleep(tick);
+        }
+    })?;
+    Ok(engine)
+}
+
 /// The CPU [`portable_engine`] compiles for on x86-64 unless told otherwise:
 /// x86-64-v2 (SSE4.2, POPCNT, CMPXCHG16B), which x86-64 CPUs have had since
 /// about 2009 and Windows 11 requires. It keeps `floor`, `ceil`, `trunc` and
@@ -768,7 +759,7 @@ pub const PORTABLE_X86_64: &str = "x86-64-v2";
 /// player's CPU has every feature a module was compiled for.
 #[cfg(feature = "compiler")]
 pub fn portable_engine(target: Option<&str>, cpu: Option<&str>) -> Result<Engine> {
-    let mut config = config();
+    let mut config = config(inlining(true));
     if cpu == Some("native") {
         ensure!(target.is_none(), "`--cpu native` compiles for this machine, not for {}", target.unwrap_or_default());
         return Ok(Engine::new(&config)?);
@@ -806,32 +797,86 @@ fn host_triple() -> String {
     format!("{}-{system}", std::env::consts::ARCH)
 }
 
-/// An engine for development, where the same program is compiled again
+/// The engine for development, where the same program is compiled again
 /// after every edit: Cranelift keeps each function's machine code in memory
 /// and reuses it when the function comes back unchanged, so a small edit
-/// recompiles only what it touched. Without inlining, unless BLOT_INLINING=1:
-/// on gdev that halves each reload's compile (about 100 to 50 ms) and the
-/// first one (about 360 to 105 ms), for guest code about a quarter slower.
+/// recompiles only what it touched. Without inlining (see [`inlining`]): on
+/// gdev that halves each reload's compile (about 100 to 50 ms) and the first
+/// one (about 360 to 105 ms), for guest code about a quarter slower. Its
+/// guests have a [`DEADLINE`]. Every call returns the same engine, so the
+/// game and the dev tools share its cache.
 pub fn dev_engine() -> Result<Engine> {
     #[cfg(feature = "compiler")]
     {
-        let mut config = config_inlining(std::env::var_os("BLOT_INLINING").is_some_and(|value| value == "1"));
-        config.enable_incremental_compilation(Arc::new(MemoryCache::default()))?;
-        Ok(Engine::new(&config)?)
+        static ENGINE: std::sync::Mutex<Option<Engine>> = std::sync::Mutex::new(None);
+        let mut engine = ENGINE.lock().unwrap();
+        if engine.is_none() {
+            let mut config = config(inlining(false));
+            config.enable_incremental_compilation(Arc::new(MemoryCache::new(DEV_CACHE_BYTES)))?;
+            config.epoch_interruption(true);
+            *engine = Some(ticking(Engine::new(&config)?, DEADLINE)?);
+        }
+        Ok(engine.clone().unwrap())
     }
     #[cfg(not(feature = "compiler"))]
     bail!(NO_COMPILER)
 }
 
-/// Compiled functions by Cranelift's cache key, for [`dev_engine`].
+/// What [`dev_engine`]'s cache keeps of compiled functions, at most twice
+/// over. Compiling gdev's game and dev tools puts about 3.7 MB in it.
+#[cfg(feature = "compiler")]
+const DEV_CACHE_BYTES: usize = 32 << 20;
+
+/// Compiled functions by Cranelift's cache key, for [`dev_engine`], in two
+/// generations: a function found in the older moves to the newer, and once
+/// the newer holds `limit` bytes the older is dropped and the newer takes
+/// its place. What the edits keep compiling stays; the rest goes.
 #[cfg(feature = "compiler")]
 #[derive(Debug, Default)]
-struct MemoryCache(std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>);
+struct MemoryCache(std::sync::Mutex<Generations>);
+
+#[cfg(feature = "compiler")]
+#[derive(Debug, Default)]
+struct Generations {
+    newer: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    older: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    /// The newer generation's keys and values.
+    bytes: usize,
+    limit: usize,
+}
+
+#[cfg(feature = "compiler")]
+impl MemoryCache {
+    fn new(limit: usize) -> MemoryCache {
+        MemoryCache(std::sync::Mutex::new(Generations { limit, ..Generations::default() }))
+    }
+}
+
+#[cfg(feature = "compiler")]
+impl Generations {
+    fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
+        if self.bytes >= self.limit {
+            self.older = std::mem::take(&mut self.newer);
+            self.bytes = 0;
+        }
+        let (key_bytes, value_bytes) = (key.len(), value.len());
+        if let Some(replaced) = self.newer.insert(key, value) {
+            self.bytes -= key_bytes + replaced.len();
+        }
+        self.bytes += key_bytes + value_bytes;
+    }
+}
 
 #[cfg(feature = "compiler")]
 impl wasmtime::CacheStore for MemoryCache {
     fn get(&self, key: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
-        self.0.lock().unwrap().get(key).cloned().map(std::borrow::Cow::Owned)
+        let mut cache = self.0.lock().unwrap();
+        if let Some(value) = cache.newer.get(key) {
+            return Some(std::borrow::Cow::Owned(value.clone()));
+        }
+        let value = cache.older.remove(key)?;
+        cache.insert(key.to_vec(), value.clone());
+        Some(std::borrow::Cow::Owned(value))
     }
 
     fn insert(&self, key: &[u8], value: Vec<u8>) -> bool {
@@ -847,22 +892,199 @@ pub const GUEST_STACK_BYTES: usize = 8 << 20;
 mod tests {
     use super::*;
 
+    /// A Wasm section: its id, then its contents' size.
+    #[cfg(feature = "compiler")]
+    fn section(id: u8, contents: &[u8]) -> Vec<u8> {
+        assert!(contents.len() < 128, "one-byte LEB128 sizes only");
+        [&[id, u8::try_from(contents.len()).unwrap()], contents].concat()
+    }
+
+    /// A Wasm name: its length, then its bytes.
+    #[cfg(feature = "compiler")]
+    fn name(text: &str) -> Vec<u8> {
+        [&[u8::try_from(text.len()).unwrap()], text.as_bytes()].concat()
+    }
+
+    /// A guest exporting `spin: Unit -> Unit`, which never returns, and
+    /// `main: (U32 -> U32 ! {Foreign}) -> U32`, which calls the host three
+    /// times and then never returns either.
+    #[cfg(feature = "compiler")]
+    fn looping_guest() -> Vec<u8> {
+        let abi =
+            [&[0x02, 0x02][..], &name("spin"), &[0x00, 0x00], &name("main"), &[0x04, 0x01, 0x01, 0x01, 0x00]].concat();
+        let forever = [0x03, 0x40, 0x0c, 0x00, 0x0b, 0x41, 0x00, 0x0b];
+        let call_host = [0x20, 0x00, 0x41, 0x01, 0x10, 0x00, 0x1a];
+        let spin = [&[0x00][..], &forever].concat();
+        let main = [&[0x00][..], &call_host, &call_host, &call_host, &forever].concat();
+        [
+            &b"\0asm\x01\0\0\0"[..],
+            &section(0, &[&name(pen_runtime::abi::ABI_SECTION)[..], &abi].concat()),
+            // (externref, i32) -> i32, i32 -> i32, externref -> i32
+            &section(
+                1,
+                &[0x03, 0x60, 0x02, 0x6f, 0x7f, 0x01, 0x7f, 0x60, 0x01, 0x7f, 0x01, 0x7f, 0x60, 0x01, 0x6f, 0x01, 0x7f],
+            ),
+            &section(2, &[&[0x01][..], &name(HOST_MODULE), &name("call_u32_u32"), &[0x00, 0x00]].concat()),
+            &section(3, &[0x02, 0x01, 0x02]),
+            &section(7, &[&[0x02][..], &name("spin"), &[0x00, 0x01], &name("main"), &[0x00, 0x02]].concat()),
+            &section(
+                10,
+                &[&[0x02, u8::try_from(spin.len()).unwrap()][..], &spin, &[u8::try_from(main.len()).unwrap()], &main]
+                    .concat(),
+            ),
+        ]
+        .concat()
+    }
+
     #[test]
-    fn manifest_test_vectors() {
-        assert_eq!(parse_abi(&[0x02, 0x00, 0x00]).unwrap(), GuestAbi::default());
-        let abi = parse_abi(&[0x02, 0x01, 0x04, 0x6d, 0x61, 0x69, 0x6e, 0x04, 0x01, 0x01, 0x01, 0x00]).unwrap();
-        assert_eq!(
-            abi.functions,
-            vec![GuestFunction {
-                name: "main".into(),
-                parameter: Parameter::Callback(CallbackType {
-                    parameter: ValueType::U32,
-                    result: ValueType::U32
-                }),
-                result: ValueType::U32,
-            }]
-        );
-        assert!(parse_abi(&[0x02, 0x00, 0x00, 0x00]).is_err());
-        assert!(parse_abi(&[0x03, 0x00, 0x00]).is_err());
+    #[cfg(feature = "compiler")]
+    fn deadlines_stop_looping_guests_but_not_waiting_ones() {
+        let deadline = Duration::from_millis(100);
+        let mut config = config(false);
+        config.epoch_interruption(true);
+        let engine = ticking(Engine::new(&config).unwrap(), deadline).unwrap();
+        let module = GuestModule::new(&engine, &looping_guest(), None).unwrap();
+        let mut guest = Guest::new(&engine, &module).unwrap();
+        let started = Instant::now();
+        let error = guest.call("spin", Value::Unit).unwrap_err();
+        let overrun = error.downcast_ref::<Overrun>().expect("an overrun");
+        assert!(overrun.ran >= deadline * 9 / 10 && started.elapsed() < deadline * 10, "{error:#}");
+        // The host taking longer than the deadline to answer does not count.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let callback = Box::new(move |value: Value| -> Result<Value> {
+            counted.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(deadline * 2);
+            Ok(value)
+        });
+        let error = guest.call("main", Argument::Callback(callback)).unwrap_err();
+        assert!(error.is::<Overrun>(), "{error:#}");
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        // A stopped guest runs again with a deadline of its own.
+        assert!(guest.call("spin", Value::Unit).unwrap_err().is::<Overrun>());
+    }
+
+    /// An ABI 3 guest exporting `ok: Unit -> U32`, which returns the
+    /// constant `log`, and `fail: Unit -> Unit`, which traps. Its ownership
+    /// hooks append to `log`: entering a 1, leaving 2 plus the outcome. With
+    /// `hooks` false it leaves them out of its exports.
+    #[cfg(feature = "compiler")]
+    fn ownership_guest(hooks: bool) -> Vec<u8> {
+        let abi = [
+            &[0x03, 0x02][..],
+            &name("ok"),
+            &[0x00, 0x01],
+            &name("fail"),
+            &[0x00, 0x00],
+            &[0x01],
+            &name("log"),
+            &[0x01],
+        ]
+        .concat();
+        let mut exports = vec![[name("ok"), vec![0x00, 2]].concat(), [name("fail"), vec![0x00, 3]].concat()];
+        exports.push([name("log"), vec![0x03, 0]].concat());
+        if hooks {
+            exports.push([name(OWNERSHIP_ENTER), vec![0x00, 0]].concat());
+            exports.push([name(OWNERSHIP_LEAVE), vec![0x00, 1]].concat());
+        }
+        // log = log * 10 + 1, and log = log * 10 + 2 + outcome.
+        let enter = [0x00, 0x23, 0x00, 0x41, 10, 0x6c, 0x41, 1, 0x6a, 0x24, 0x00, 0x0b];
+        let leave = [0x00, 0x23, 0x00, 0x41, 10, 0x6c, 0x41, 2, 0x6a, 0x20, 0x00, 0x6a, 0x24, 0x00, 0x0b];
+        let ok = [0x00, 0x23, 0x00, 0x0b];
+        let fail = [0x00, 0x00, 0x0b];
+        let mut code = vec![0x04];
+        for body in [&enter[..], &leave, &ok, &fail] {
+            code.push(u8::try_from(body.len()).unwrap());
+            code.extend(body);
+        }
+        [
+            &b"\0asm\x01\0\0\0"[..],
+            &section(0, &[&name(pen_runtime::abi::ABI_SECTION)[..], &abi].concat()),
+            // () -> (), i32 -> (), i32 -> i32
+            &section(1, &[0x03, 0x60, 0x00, 0x00, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x01, 0x7f, 0x01, 0x7f]),
+            &section(3, &[0x04, 0x00, 0x01, 0x02, 0x02]),
+            // A mutable i32, from 0.
+            &section(6, &[0x01, 0x7f, 0x01, 0x41, 0x00, 0x0b]),
+            &section(7, &[&[u8::try_from(exports.len()).unwrap()][..], &exports.concat()].concat()),
+            &section(10, &code),
+        ]
+        .concat()
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn abi_3_calls_run_between_entering_and_leaving_ownership() {
+        let engine = engine().unwrap();
+        let module = GuestModule::new(&engine, &ownership_guest(true), None).unwrap();
+        assert!(module.abi().ownership);
+        let mut guest = Guest::new(&engine, &module).unwrap();
+        assert_eq!(guest.call("ok", Value::Unit).unwrap(), Value::U32(1), "entered before the call");
+        assert_eq!(guest.read("log").unwrap(), Value::U32(12), "left normally after it");
+        assert!(guest.call("fail", Value::Unit).is_err());
+        assert_eq!(guest.read("log").unwrap(), Value::U32(1213), "left failing after a trap");
+        assert_eq!(guest.call("ok", Value::Unit).unwrap(), Value::U32(12131), "and runs again");
+        let error = GuestModule::new(&engine, &ownership_guest(false), None).err().unwrap();
+        assert!(format!("{error:#}").contains("missing ownership export"), "{error:#}");
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn development_cache_keeps_what_is_used() {
+        let cache = MemoryCache::new(10);
+        let store: &dyn wasmtime::CacheStore = &cache;
+        store.insert(b"a", vec![0; 4]);
+        store.insert(b"b", vec![0; 4]);
+        // Ten bytes: the next insert starts a new generation.
+        store.insert(b"c", vec![0; 4]);
+        assert!(store.get(b"a").is_some(), "found in the older generation, it moves to the newer");
+        store.insert(b"d", vec![0; 4]);
+        store.insert(b"e", vec![0; 4]);
+        assert!(store.get(b"b").is_none(), "dropped with its generation");
+        assert!(store.get(b"a").is_some() && store.get(b"e").is_some());
+        let generations = cache.0.lock().unwrap();
+        assert!(generations.bytes <= 10 + 5 && generations.newer.len() + generations.older.len() <= 4);
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn module_cache_keys_and_pruning() {
+        let engine = engine().unwrap();
+        let wasm = looping_guest();
+        let key = cache_key(&engine, &wasm);
+        assert_eq!(key.len(), 64);
+        assert_eq!(key, cache_key(&engine, &wasm));
+        assert_ne!(key, cache_key(&dev_engine().unwrap(), &wasm), "the engine's configuration is in the key");
+        assert_ne!(key, cache_key(&engine, &wasm[..wasm.len() - 1]));
+
+        let directory = std::env::temp_dir().join(format!("blot-host-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let now = std::time::SystemTime::now();
+        let day = Duration::from_secs(24 * 60 * 60);
+        let file = |name: &str, age: Duration| {
+            let path = directory.join(name);
+            std::fs::File::create(&path).unwrap().set_modified(now - age).unwrap();
+            path
+        };
+        let stale = file("stale.cwasm", day * 15);
+        let used = file("used.cwasm", day * 13);
+        let abandoned = file("a.1234.tmp", day);
+        let writing = file("b.1234.tmp", Duration::ZERO);
+        let other = file("notes.txt", day * 30);
+        prune(&directory, now).unwrap();
+        assert!(!stale.exists() && used.exists() && !abandoned.exists() && writing.exists() && other.exists());
+        let recent: Vec<_> = (0..CACHE_ENTRIES)
+            .map(|age| file(&format!("{age}.cwasm"), day * u32::try_from(age).unwrap() / 4))
+            .collect();
+        prune(&directory, now).unwrap();
+        assert!(!used.exists(), "the oldest beyond the newest {CACHE_ENTRIES}");
+        assert!(recent.iter().all(|path| path.exists()));
+
+        // A compile writes its entry, and loads it the next time.
+        let module = GuestModule::new(&engine, &wasm, Some(&directory)).unwrap();
+        assert!(directory.join(format!("{key}.cwasm")).exists());
+        GuestModule::new(&engine, &wasm, Some(&directory)).unwrap();
+        assert_eq!(module.abi().functions.len(), 2);
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

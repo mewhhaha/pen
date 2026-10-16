@@ -11,10 +11,13 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-wit-bindgen = "0.62"
+wit-bindgen = "0.63"
 
+# A panic traps the component, which the host reports as the plugin's
+# error; nothing catches it. wasm32's default, kept should Rust unwind there.
 [profile.release]
 opt-level = "s"
 lto = true
 codegen-units = 1
+panic = "abort"
 strip = true

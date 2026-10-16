@@ -5,63 +5,75 @@ edition.workspace = true
 license.workspace = true
 description = "Native runtime for gdev: winit window, wgpu renderer, wasmtime guest"
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "pen"
 path = "src/main.rs"
 
 [features]
-default = ["compiler", "devtools", "plugins"]
-# Cranelift, which compiles game.wasm: every command but playing a packaged
-# game needs it. Without it (`--no-default-features`) this is the player
-# runtime `pen build` ships: it only loads the game.cwasm the package was
-# precompiled with.
-compiler = ["blot-host/compiler", "dep:pen-codegen"]
+default = ["compiler", "devtools"]
+# Everything that builds a checkout: Cranelift, which compiles game.wasm;
+# the Wasm plugins (`pen-plugins`, wit/pen-plugin.wit) its pen.json chooses
+# to compile its programs; and the protocol generator. Every command but
+# playing a packaged game needs it. Without it (`--no-default-features`)
+# this is the player runtime `pen build` ships: it only loads the
+# game.cwasm the package was precompiled with.
+compiler = ["blot-host/compiler", "dep:pen-codegen", "dep:pen-plugins"]
 steam = ["dep:steamworks"]
-# The dev tools (`devtools`): the checkout's own Blot program for its
-# console and diagnostics, run beside the game in `pen dev` and `pen run`.
-# The player runtime leaves them out.
-devtools = []
-# Wasm plugins (`pen-plugins`, wit/pen-plugin.wit) the checkout's pen.json
-# chooses to build its programs. They compile, so they need
-# the compiler; the player runtime leaves them out.
-plugins = ["compiler", "dep:pen-plugins"]
+# The dev tools: the checkout's own Blot program for its console and
+# diagnostics, compiled through its plugins and run beside the game in
+# `pen dev` and `pen run`. The player runtime leaves them out.
+devtools = ["compiler"]
 
 [dependencies]
 anyhow.workspace = true
 blot-host.workspace = true
+log = { version = "0.4", features = ["std"] }
 pen-plugins = { workspace = true, optional = true }
 pen-codegen = { workspace = true, optional = true }
 pen-protocol.workspace = true
 pen-runtime.workspace = true
 pen-render.workspace = true
 wasmtime.workspace = true
-# The game's interface (and the dev overlay's) for assistive technology:
+# The game's interface (and the dev tools') for assistive technology:
 # AT-SPI on Linux, UI Automation on Windows, NSAccessibility on macOS. The
 # player runtime has it too.
-accesskit = "0.24"
-accesskit_winit = "0.33"
+accesskit = "0.25"
+accesskit_winit = "0.34"
 # The clipboard the game copies to and pastes from (services::clipboard): X11
 # (and XWayland), Windows and macOS, without arboard's image support.
 arboard = { version = "3.6", default-features = false }
-bytemuck = { version = "1", features = ["derive"] }
+# The audio output (audio::device): ALSA, WASAPI or CoreAudio, its thread
+# at real-time priority (RtKit, over D-Bus, on Linux).
+cpal = { version = "0.18", features = ["realtime-dbus"] }
 dirs = "7"
 image = { version = "0.25", default-features = false, features = ["png"] }
-kira = "0.12"
 notify = "8"
+# Ogg Opus clips (opus.rs): the pages, and libopus (vendored, built with
+# CMake) for the packets.
 ogg = "0.9"
-opus-head-sys = { version = "0.3", default-features = false }
+opusic-sys = "0.7"
 pollster = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 steamworks = { version = "0.13", optional = true }
+# PCM WAV clips (audio::load_clip); Ogg Opus ones decode in opus.rs.
+symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm"] }
 wgpu.workspace = true
 winit = "0.30"
 
-# The player's locale (services::platform).
+# Asks an asset recipe to stop (pipeline): `just` passes SIGTERM on.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The player's locale (services::platform), and the message box the player
+# runtime, which has no console, shows an error in.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
+windows-sys = { version = "0.61", features = ["Win32_Globalization", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
 # What the platform adapters keep of an AccessKit tree, which fails on an
 # inconsistent tree or update: the accessibility tests check theirs with it.
-accesskit_consumer = "0.38"
+accesskit_consumer = "0.39"

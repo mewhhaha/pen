@@ -1,68 +1,145 @@
 # Renderer measurements
 
-Measured on 2026-10-11, Linux, NVIDIA GeForce RTX 2070 SUPER, Vulkan,
-wgpu 30. Native and browser use the same production WGSL.
+Measured on 2026-10-16 on Linux with an NVIDIA GeForce RTX 2070 SUPER
+(driver 615.78, Vulkan), a 16-thread CPU and wgpu 30. Other work was
+light (load average under 6). Native and browser builds use the same production WGSL. The
+FXAA measurements below date from 2026-10-11.
 
-## Shadow compilation and the first Tab frame
-
-Shadow variants are requested only by loaded opaque, lit materials with
-`shadow=true`. Ordinary shader loading and additional shadow/MSAA variants
-compile on loader workers. Explicit pending jobs keep initial loading from
-settling early; a late caster waits for its pipeline. Reloads retain the
-current shader until a replacement succeeds.
-
-The gdev catalog now compiles **11 shadow variants across nine shaders**, down
-from the previous unconditional **26**. An actual-GPU regression exercises
-a noncaster, a late caster, both instanced variants, a changed sample count,
-and reloads with and without a caster.
-
-Two alternating runs with a frozen `game.wasm` measured cold loader settling:
-
-| Run | Installed renderer | Updated renderer |
-| --- | ---: | ---: |
-| 1 | 4,154 ms | 4,660 ms |
-| 2 | 6,160 ms | 4,230 ms |
-
-These timings do **not** establish a startup improvement. Parallel CPU builds
-and the expensive remaining robot shader dominate the spread. Both used
-`__GL_SHADER_DISK_CACHE=0`; catalog geometry stayed equivalent, but subsequent
-asset generation changed vertex packing and tiny atlas antialiasing details.
-
-The reported game frame 3 is the first scripted host frame after loading
-settles. Before the final decal preparation change, that frame cost 80–85 ms
-cold and 29 ms warm. Its painted-decal pipeline compiled synchronously for
-24–27 ms cold (about 1 ms warm). The shared painted-decal variant now prepares
-during scene settling, at the active MSAA count. Newly visible material MSAA
-variants also queue on workers rather than compiling during submission.
-
-After preparation, the cold first Tab frame cost **50.1 ms total / 46.9 ms
-submission**, with the 17.8 ms decal compilation already paid during loading.
-Two warm runs measured **36.1–36.4 ms total / 31.4–32.8 ms submission**. Loader
-settling was 4,395 ms cold; warm runs settled in 747–761 ms. The shader compile
-is removed from Tab, but a roughly 30 ms warm submission cost remains.
-These samples do not establish the cause of that remaining cost. Lower
-shadow counts alone do not remove GPU warmup, texture allocation, or
-unrelated first-frame work.
-
-A synthetic late casting material and both shadow variants became ready in
-6.24 ms, including file loading and polling; pipeline compilation took
-0.36 ms on its worker. This checks readiness, rather than game-scene first
-draw cost. With the frozen guest, the first-gnorp command frame measured
-**1.74 ms submission / 2.37 ms total** in the installed renderer and
-**0.69 ms submission / 1.54 ms total** in the updated renderer. The updated
-command and following three frames stayed below 2.23 ms submission / 3.07 ms
-total, with no new shadow compilation after settling. These small samples
-show no first-caster compile hitch; they do not establish a general frame
-rate improvement.
-
-Reproduce with a compiled, frozen guest and identical assets:
+The load and frame numbers come from pen-render's `render_packet` example.
+It replays the 120 packets that `just packets` records from gdev into
+`dist/packets`. Frame 60 presses Tab, which opens the editor. `--sequence`
+settles on the first packet the way pen settles its first frame: it submits
+until the renderer is quiet and nothing is pending. It then submits each
+later packet once, 16 ms apart, and times each submit. "Before" is a build
+from before the 2026-10-16 changes, with the same mesh parsing. "After" is
+the current renderer. The two builds took turns, run by run.
 
 ```sh
-PEN_FRAME_TIMES=1 PEN_PROFILE_FRAMES=8 PEN_PROFILE_WARMUP=0 \
-  __GL_SHADER_DISK_CACHE=0 pen --game /path/to/frozen-game \
-  --assets /path/to/assets --scene /path/to/main.scene \
-  --headless --mute --frames 8 --script key=Tab
+cargo build --release -p pen-render --example render_packet
+# Cold: no NVIDIA shader disk cache and no wgpu pipeline cache.
+__GL_SHADER_DISK_CACHE=0 RUST_LOG=1 target/release/examples/render_packet --sequence --veil
+# The wgpu pipeline cache alone: run twice with the same directory.
+__GL_SHADER_DISK_CACHE=0 target/release/examples/render_packet --sequence --veil --pipelines /var/tmp/pipelines
 ```
+
+`RUST_LOG` (any value) prints each pipeline compile and how long it took.
+
+## Loading
+
+### Pipelines compile per material need, side by side
+
+A material shader once got all four scene variants (opaque, translucent, and
+the overlay's dimmed and full-strength passes), plus an instanced one when it
+could. Now it gets only those its loaded materials draw with. Each one is a
+job of its own on the loader's threads. A shader's new revision is published
+once its pipelines, including a caster's shadow pipelines, are in.
+
+For gdev's 24 mesh shaders, loading now compiles **39 scene pipelines
+instead of 98**, plus the same 11 shadow pipelines. The robot shader
+dominated cold loading. Its opaque and instanced pipelines took 1.7 s and its
+shadow pipelines another 1.5 s, all one after another on one thread. Now
+they compile in parallel.
+
+The passes around the scene, the decal pipelines and the inset composite
+compile on the loader too, not on the frame's thread. A cold present pass
+took 110–810 ms with FXAA, and it used to stall the first frame and every
+MSAA change.
+
+Settling, in ms (three runs each, alternating):
+
+| | Before | After |
+| --- | ---: | ---: |
+| Cold (`__GL_SHADER_DISK_CACHE=0`) | 3,572 / 5,010 / 3,638 | 1,340 / 1,681 / 1,506 |
+| Warm (driver cache on) | 705 / 744 / 716 | 696 / 683 / 679 |
+
+Warm settling is bounded by streaming textures in and by the veil's 0.6 s
+clear, not by compiling.
+
+### The pipeline cache
+
+On Vulkan, pen keeps a `wgpu::PipelineCache` in `~/.cache/pen/pipelines/`, one
+file per adapter (`wgpu_pipeline_cache_vulkan_<vendor>_<device>`, 1.97 MB for
+gdev). It is written in the background when a burst of compiles ends. With
+NVIDIA's own shader cache off, the first run settled in 3,228 ms and wrote
+the file. The next three settled in **731 / 706 / 707 ms**, as fast as with
+the driver's cache. Two runs without the wgpu cache took 1,615 and 2,837 ms.
+The driver's cache already does this on NVIDIA and Mesa. The wgpu cache helps
+where there is no such cache, or where it has been cleared or evicted. The
+browser keeps its own cache.
+
+### Meshes
+
+Mesh JSON is now parsed with typed serde straight into `f32`/`u32`. The
+`serde_json::Value` tree and the `f64` arrays are gone. `pen_render::pack_mesh`
+also makes a compact binary form, which the renderer reads under the same
+key. For gdev's 73 meshes on one thread:
+
+| | Bytes | Parse |
+| --- | ---: | ---: |
+| JSON through `serde_json::Value` (before) | 59.1 MB | 334–359 ms |
+| JSON, typed | 59.1 MB | 179 ms |
+| Binary (`PMSH`) | 32.7 MB | 8.5 ms |
+
+The loader parses on up to six threads, so the wall-clock saving while
+loading is smaller. Reproduce with
+`cargo test --release -p pen-render --lib -- --ignored --nocapture mesh_parse_time`.
+
+## The first Tab frame
+
+Tab opens the editor. Its first frame used to take about 30 ms to submit in
+earlier measurements inside pen, which were taken on a busy machine. The
+cause is in pen-render. The editor draws the arm reaching to the pointer as
+a **full-screen inset** (0, 0, 1280×720), at twice the resolution and 4×
+MSAA. On its first frame the renderer:
+
+- compiled the inset composite pipeline on the frame's thread, and
+- made the inset's targets with 25% room to spare, rounded to 256: 3328×2048,
+  that is a 4× multisampled `Rgba16Float` colour target (218 MB), a 4×
+  `Depth24PlusStencil8` target (109 MB) and the resolved image (54 MB).
+  About 381 MB was allocated in one frame.
+
+Both are fixed. The composite compiles on the loader when the renderer is
+made. An inset's first targets are the size it draws (2560×1440, about
+206 MB), and only an inset that outgrows them gets targets with room to
+spare.
+
+| Frame 60 submit, ms | Before | After |
+| --- | ---: | ---: |
+| Cold (three runs) | 24.3 / 18.5 / 24.8 | 8.8 / 8.9 / 8.6 |
+| Warm (three runs) | 10.3 / 10.2 / 10.1 | 8.8 / 8.7 / 9.3 |
+
+Timing the phases of that submit shows that what remains, about 7.9 ms, is
+the driver allocating the 206 MB of inset targets. Two fixes would remove it,
+and both are the game's call. The game could size the arm's inset to the
+arm, not the screen. Or the renderer could supersample large insets less,
+which would change how they look.
+
+## Steady-state frames
+
+gdev's frames draw 16–20 draw calls. A frame's working lists are now index
+based and kept from frame to frame:
+
+- placements, batches, items and ready entries, the pass lists, and sprite
+  and decal batches;
+- interned material render states replace the per-batch
+  `format!("{:?}")` key;
+- shader and material lookups go by ID, not by scanning slots;
+- opaque draws are sorted by stencil mark and material, each with its
+  pipeline resolved once, and repeated `set_pipeline` calls are skipped;
+- only solids that changed are meshed again, into reused buffers;
+- post-pass texture views are made once with their targets;
+- fading detail rounds its sampler's level bias to quarters, and drops the
+  bind groups it made once the detail settles;
+- sprite bind groups are cached by texture.
+
+These cut the CPU cost of a submit. The median over 354 frames went from
+0.67 ms to 0.60 ms. With `--robots 40` (1,688 more instances) it went from
+1.10 ms to 0.96 ms, while the GPU took 142 ms a frame.
+
+Per-draw uniforms still keep room for 32 extra vectors (688 bytes, 768 with
+alignment). gdev's `earth.wgsl` and `salt.wgsl` read `draw.extra` from that
+uniform, so moving extras into a storage buffer would change the shader
+interface the game's shaders use.
 
 ## FXAA Quality
 

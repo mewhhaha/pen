@@ -1,7 +1,13 @@
 // Real pen web reload and portable static-host smoke; source bytes stay unchanged.
 import { mkdir, writeFile, stat, utimes } from 'node:fs/promises';
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright-core');
-const url = process.env.PEN_DEVELOPMENT_URL || 'http://127.0.0.1:8045/?dev';
+// ?qualify has the page write the hooks this waits on (aria-busy, data-frame).
+const qualified = address => {
+  const url = new URL(address);
+  url.searchParams.set('qualify', '');
+  return url.href;
+};
+const url = qualified(process.env.PEN_DEVELOPMENT_URL || 'http://127.0.0.1:8045/?dev');
 const changed = process.env.PEN_RELOAD_FILE;
 if (!changed) throw new Error('PEN_RELOAD_FILE must name a watched source asset');
 const shots = process.env.PEN_WEB_SHOTS || 'target/browser-shots';
@@ -50,7 +56,7 @@ try {
   await page.waitForTimeout(1500);
   await page.screenshot({ path: `${shots}/builds-reloaded.png` });
   if (process.env.PEN_STATIC_URL) {
-    await page.goto(process.env.PEN_STATIC_URL, { waitUntil: 'networkidle' });
+    await page.goto(qualified(process.env.PEN_STATIC_URL), { waitUntil: 'networkidle' });
     await page.waitForFunction(() => document.querySelector('canvas')?.getAttribute('aria-busy') === 'false');
     await page.screenshot({ path: `${shots}/subdirectory.png` });
   }

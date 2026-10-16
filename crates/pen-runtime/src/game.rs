@@ -8,10 +8,10 @@ use std::sync::Arc;
 use web_time::Instant;
 
 use anyhow::{Result, bail, ensure};
-use pen_protocol::boundary::{decode_frame, encode_frame, validate_state};
+use pen_protocol::boundary::{decode_frame, decode_into, encode_frame, validate_state, whole};
 use pen_protocol::{Catalog, Frame, RenderFrame, Viewport};
 
-use crate::program::{Backend, Operation, Program};
+use crate::program::{Backend, Operation, Program, Unresponsive};
 use crate::snapshot::SavedState;
 
 const HISTORY_LIMIT: usize = 200;
@@ -89,6 +89,18 @@ pub struct FrameTimings {
     pub packet_bytes: usize,
 }
 
+impl FrameTimings {
+    /// The timings once the host drew the frame: `submit_ms` drawing,
+    /// `total_ms` in all, and what the phases leave unaccounted,
+    /// housekeeping.
+    pub fn completed(mut self, submit_ms: f64, total_ms: f64) -> FrameTimings {
+        self.submit_ms = submit_ms;
+        self.total_ms = total_ms;
+        self.housekeeping_ms = (total_ms - self.wait_ms - self.decode_ms - self.validate_ms - submit_ms).max(0.0);
+        self
+    }
+}
+
 /// The edit history the host keeps for undo: scenes, and which is current.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Edits {
@@ -123,8 +135,11 @@ pub struct GameRuntime<B: Backend> {
     /// Hash each packet, for determinism checks.
     hashing: bool,
     packet_hash: u64,
-    /// The last frame received, when hashing: tests say how two differ.
+    /// Keep a copy of the last frame received: tests say how two differ.
+    keeping: bool,
     received: Option<RenderFrame>,
+    /// A frame the host is done with, for the next to be decoded into.
+    spare: Option<RenderFrame>,
     /// The last frame the runtime drew (or, starting, computed) itself:
     /// starting, loading or reloading, until taken.
     drawn: Option<RenderFrame>,
@@ -185,25 +200,25 @@ pub fn restore_report(response: &[f32]) -> Option<Vec<SectionOutcome>> {
     let [magic, count, rest @ ..] = response else {
         return None;
     };
-    if *magic != REPORT_MAGIC || count.fract() != 0.0 || *count < 0.0 || rest.len() != *count as usize * 4 {
+    if *magic != REPORT_MAGIC || whole(*count).and_then(|count| (count as usize).checked_mul(4)) != Some(rest.len()) {
         return None;
     }
-    Some(
-        rest.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|&[key, fate, saved, version]| SectionOutcome {
-                key: key as u32,
-                fate: fate as u32,
-                saved: saved as u32,
-                version: version as u32,
+    rest.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&[key, fate, saved, version]| {
+            Some(SectionOutcome {
+                key: whole(key)?,
+                fate: whole(fate)?,
+                saved: whole(saved)?,
+                version: whole(version)?,
             })
-            .collect(),
-    )
+        })
+        .collect()
 }
 
 /// What a restore did other than keep each saved section as it was, for the
-/// log (gdev's `describeRestore`), or None if it kept them all or did not say.
+/// log, or None if it kept them all or did not say.
 pub fn describe_restore(outcomes: Option<&[SectionOutcome]>) -> Option<String> {
     let outcomes = outcomes?;
     let changes: Vec<String> = outcomes
@@ -293,7 +308,9 @@ impl<B: Backend> GameRuntime<B> {
             sent: None,
             hashing: false,
             packet_hash: 0,
+            keeping: false,
             received: None,
+            spare: None,
             drawn: Some(first),
         };
         runtime.record().await?;
@@ -321,9 +338,21 @@ impl<B: Backend> GameRuntime<B> {
         self.packet_hash
     }
 
-    /// The last frame received, when hashing.
+    /// Keep a copy of every frame received (`received`).
+    pub fn keep_received(&mut self, enabled: bool) {
+        self.keeping = enabled;
+        self.received = None;
+    }
+
+    /// The last frame received, when keeping them.
     pub fn received(&self) -> Option<&RenderFrame> {
         self.received.as_ref()
+    }
+
+    /// Takes back a frame the host is done with: the next one is decoded
+    /// into its vectors.
+    pub fn recycle(&mut self, frame: RenderFrame) {
+        self.spare = Some(frame);
     }
 
     async fn record(&mut self) -> Result<()> {
@@ -427,28 +456,35 @@ impl<B: Backend> GameRuntime<B> {
 
     /// The frame the game computed for the input sent: decoded, validated
     /// and accepted. The host draws it, then `follow` does what it asked.
+    /// A program that stopped answering rejects the frame as invalid.
     pub async fn receive(&mut self, host: &dyn Host) -> Result<RenderFrame> {
         let waiting = Instant::now();
-        let packet = self.active.program.response().await?;
+        let packet = self
+            .active
+            .program
+            .response()
+            .await
+            .map_err(|error| if error.is::<Unresponsive>() { error.context(InvalidFrame) } else { error })?;
         let returned = Instant::now();
-        let next = decode_frame(&packet, self.active.schema, &self.catalog).map_err(|error| {
+        let mut frame = self.spare.take().unwrap_or_default();
+        let state = decode_into(&packet, self.active.schema, &self.catalog, &mut frame).map_err(|error| {
             let details = match packet.iter().position(|value| !value.is_finite()) {
                 Some(lane) => format!("nonfinite value {} at frame lane {lane}", packet[lane]),
                 None => format!("decoding a {}-lane game frame", packet.len()),
             };
             error.context(details).context(InvalidFrame)
         })?;
-        if !next.state.is_empty() {
+        if !state.is_empty() {
             return Err(anyhow::anyhow!("program frame must keep its state inside the guest").context(InvalidFrame));
         }
         let decoded = Instant::now();
-        host.validate(&next.render).map_err(|error| error.context(InvalidFrame))?;
+        host.validate(&frame).map_err(|error| error.context(InvalidFrame))?;
         self.active.program.accept();
         if self.hashing {
             self.packet_hash = hash_lanes(&packet);
-            {
-                self.received = Some(next.render.clone());
-            }
+        }
+        if self.keeping {
+            self.received = Some(frame.clone());
         }
         let answered = self.active.program.answered().unwrap_or(returned);
         self.last_timings = self.measuring.then(|| FrameTimings {
@@ -459,7 +495,8 @@ impl<B: Backend> GameRuntime<B> {
             packet_bytes: packet.len() * 4,
             ..FrameTimings::default()
         });
-        Ok(next.render)
+        self.active.program.recycle(packet.into_buffer());
+        Ok(frame)
     }
 
     /// The edit history follows any checkpoint, undo or redo a frame asked for.
@@ -506,7 +543,8 @@ impl<B: Backend> GameRuntime<B> {
                 None => "Blot reloaded; game state preserved".to_owned(),
             });
             Ok(ReloadResult::Activated)
-        }).await;
+        })
+        .await;
         result.unwrap_or_else(|error| {
             host.report(&format!("Blot reload rejected: {error:#}"));
             ReloadResult::Rejected
@@ -578,7 +616,10 @@ impl<B: Backend> GameRuntime<B> {
     }
 
     pub async fn scene(&mut self) -> Result<SavedState> {
-        Ok(SavedState { schema: self.active.schema, state: state_request(&mut self.active, Operation::Scene, &[]).await? })
+        Ok(SavedState {
+            schema: self.active.schema,
+            state: state_request(&mut self.active, Operation::Scene, &[]).await?,
+        })
     }
 
     /// Replaces the game's scene with a saved one, keeping the rest of its state.
@@ -605,16 +646,155 @@ mod restore_report_tests {
     use super::*;
 
     #[test]
+    fn housekeeping_is_what_the_phases_leave() {
+        let timings = FrameTimings { wait_ms: 2.0, decode_ms: 1.0, validate_ms: 0.5, ..FrameTimings::default() };
+        let done = timings.completed(3.0, 10.0);
+        assert_eq!((done.submit_ms, done.total_ms, done.housekeeping_ms), (3.0, 10.0, 3.5));
+        assert_eq!(timings.completed(9.0, 10.0).housekeeping_ms, 0.0);
+    }
+
+    #[test]
     fn reports_parse_and_describe_what_was_not_kept() {
         assert_eq!(restore_report(&[5678.0, 26.0, 0.0]), None, "a state is no report");
         assert_eq!(restore_report(&[5680.0, 1.0, 100.0]), None, "a cut-off report is none");
-        let report = restore_report(&[5680.0, 3.0, 0.0, 0.0, 1.0, 1.0, 100.0, 1.0, 1.0, 2.0, 104.0, 4.0, 1.0, 0.0]).unwrap();
+        assert_eq!(restore_report(&[5680.0, 1e30, 100.0]), None, "a count past any report is none");
+        assert_eq!(restore_report(&[5680.0, 1.0, 100.0, -1.0, 1.0, 1.0]), None, "so is a fate that is no number");
+        let report =
+            restore_report(&[5680.0, 3.0, 0.0, 0.0, 1.0, 1.0, 100.0, 1.0, 1.0, 2.0, 104.0, 4.0, 1.0, 0.0]).unwrap();
         assert_eq!(report[1], SectionOutcome { key: 100, fate: 1, saved: 1, version: 2 });
         assert_eq!(
             describe_restore(Some(&report)).as_deref(),
-            Some("kept 1 of 2 saved sections; migrated section 100 from version 1 to 2; dropped section 104 (no longer saved)")
+            Some(
+                "kept 1 of 2 saved sections; migrated section 100 from version 1 to 2; dropped section 104 (no longer saved)"
+            )
         );
         assert_eq!(describe_restore(Some(&report[..1])), None, "all kept");
-        assert_eq!(with_report("loaded", &[5680.0, 1.0, 106.0, 3.0, 0.0, 1.0]), "loaded; kept 0 of 1 saved sections; started section 106 afresh (the state has none)");
+        assert_eq!(
+            with_report("loaded", &[5680.0, 1.0, 106.0, 3.0, 0.0, 1.0]),
+            "loaded; kept 0 of 1 saved sections; started section 106 afresh (the state has none)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod receive_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use pen_protocol::boundary::{DRAW_FLOATS, PACKET_HEADER_FLOATS, PACKET_MAGIC, lanes};
+
+    use super::*;
+    use crate::program::{Response, Unresponsive, response};
+
+    /// What the scripted program answers, and the buffers it took back.
+    #[derive(Default)]
+    struct Script {
+        answers: Vec<Result<Vec<f32>>>,
+        recycled: Vec<Vec<f32>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Scripted(Rc<RefCell<Script>>);
+
+    struct Answering(Rc<RefCell<Script>>, Option<Operation>);
+
+    impl Backend for Scripted {
+        type Module = ();
+        type Program = Answering;
+        async fn start(&self, _: &()) -> Result<Answering> {
+            Ok(Answering(self.0.clone(), None))
+        }
+    }
+
+    impl Program for Answering {
+        fn schema(&self) -> u32 {
+            1
+        }
+        fn scenes(&self) -> bool {
+            false
+        }
+        fn send(&mut self, operation: Operation, _: &[f32]) -> Result<()> {
+            self.1 = Some(operation);
+            Ok(())
+        }
+        async fn response(&mut self) -> Result<Response> {
+            let answer = self.0.borrow_mut().answers.remove(0)?;
+            response(self.1.take().unwrap(), answer)
+        }
+        fn recycle(&mut self, buffer: Vec<f32>) {
+            self.0.borrow_mut().recycled.push(buffer);
+        }
+        fn accept(&mut self) {}
+        fn answered(&self) -> Option<Instant> {
+            None
+        }
+        fn memory_bytes(&self) -> usize {
+            0
+        }
+        async fn close(&mut self) {}
+    }
+
+    struct Viewer;
+
+    impl Host for Viewer {
+        fn viewport(&self) -> Viewport {
+            Viewport { width: 64, height: 64 }
+        }
+        fn validate(&self, _: &RenderFrame) -> Result<()> {
+            Ok(())
+        }
+        fn render(&mut self, _: &RenderFrame, _: &Catalog) -> Result<()> {
+            Ok(())
+        }
+        fn report(&mut self, _: &str) {}
+    }
+
+    /// The runtime's futures never wait on a scripted program.
+    fn ready<T>(future: impl Future<Output = T>) -> T {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(future).poll(&mut context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => unreachable!("a scripted program answers at once"),
+        }
+    }
+
+    /// A Frame response: its echoed operation, then a packet of `draws` draws.
+    fn frame(draws: usize) -> Vec<f32> {
+        let mut packet = vec![0.0; 1 + PACKET_HEADER_FLOATS];
+        packet[0] = Operation::Frame as u8 as f32;
+        packet[1 + lanes::header::MAGIC] = PACKET_MAGIC;
+        packet[1 + lanes::header::SCHEMA] = 1.0;
+        packet[1 + lanes::header::DRAW_COUNT] = draws as f32;
+        packet.extend(std::iter::repeat_n(0.0, draws * DRAW_FLOATS));
+        packet
+    }
+
+    #[test]
+    fn frames_decode_into_recycled_ones_and_stopped_programs_reject_them() {
+        let backend = Scripted::default();
+        let catalog = Catalog { meshes: vec!["m".into()], materials: vec!["x".into()], sounds: Vec::new() };
+        // Create, then the frame that proves the program works.
+        backend.0.borrow_mut().answers = vec![Ok(vec![Operation::Create as u8 as f32]), Ok(frame(0))];
+        let mut runtime = ready(GameRuntime::new(&backend, (), catalog, &mut Viewer, None, None)).unwrap();
+
+        let mut shown = RenderFrame::default();
+        shown.draws.reserve(64);
+        let reserved = shown.draws.capacity();
+        runtime.recycle(shown);
+        backend.0.borrow_mut().answers.push(Ok(frame(2)));
+        runtime.send(&[]).unwrap();
+        let received = ready(runtime.receive(&Viewer)).unwrap();
+        assert_eq!(received.draws.len(), 2);
+        assert_eq!(received.draws.capacity(), reserved, "decoded into the recycled frame");
+        let recycled = backend.0.borrow().recycled.last().map(Vec::len);
+        assert_eq!(recycled, Some(frame(2).len()), "the packet's buffer goes back, echoed operation and all");
+
+        backend.0.borrow_mut().answers.push(Err(anyhow::anyhow!("trapped").context(Unresponsive)));
+        runtime.send(&[]).unwrap();
+        let error = ready(runtime.receive(&Viewer)).unwrap_err();
+        assert!(error.is::<InvalidFrame>() && error.is::<Unresponsive>(), "{error:#}");
+        backend.0.borrow_mut().answers.push(Err(anyhow::anyhow!("trapped")));
+        runtime.send(&[]).unwrap();
+        assert!(!ready(runtime.receive(&Viewer)).unwrap_err().is::<InvalidFrame>(), "other failures stay fatal");
     }
 }

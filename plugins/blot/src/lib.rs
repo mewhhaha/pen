@@ -3,9 +3,12 @@
 //! `blotc serve-project` (blot2's `zig-native/PROJECT_PROTOCOL.md`). Each
 //! session is one compiler process, which keeps the program open between
 //! builds and reuses what did not change; a protocol failure kills it, and
-//! pen opens a new session. The client is plain Rust ([`Session`], over any
-//! [`Child`]), which `cargo test` checks natively against a real compiler;
-//! only the component's bindings (`component.rs`) are Wasm-only.
+//! pen opens a new session. It also lays out the checkout's Blot tests for
+//! pen ([`find_tests`]: `tests/`, `tests/traps/`, `tests/rejected/`). The
+//! client and the layout are plain Rust ([`Session`], over any [`Child`];
+//! [`find_tests`], over any [`Files`]), which `cargo test` checks natively
+//! against a real compiler; only the component's bindings (`component.rs`)
+//! are Wasm-only.
 //!
 //! The compiler runs as the program the checkout grants the plugin under
 //! `blotc`, with only `BLOT_CACHE_DIR` in its environment (the plugin's cache
@@ -47,6 +50,7 @@
 //! standard library's and the prelude.
 mod session;
 mod settings;
+mod suite;
 
 #[cfg(target_arch = "wasm32")]
 mod component;
@@ -55,6 +59,7 @@ pub mod native;
 
 pub use session::{Child, ReadError, Session};
 pub use settings::{CodegenTier, PROGRAM, Settings};
+pub use suite::{Expectation, Files, TestModule, find as find_tests};
 
 /// A program of the checkout's: its root, its entry file (absolute) and its
 /// settings, as JSON text ("{}" when none).

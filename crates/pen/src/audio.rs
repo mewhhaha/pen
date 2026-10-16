@@ -1,45 +1,79 @@
-//! Plays what the game asks for, as gdev's `web/audio.ts` does: each frame's
-//! buses, the voices it keeps playing and the sounds it plays once, mixed by
-//! `mixer.rs` (WebAudio's graph, sample for sample) with the shared reverb of
-//! `reverb.rs`. The same mixer renders video recordings (`record.rs`), so
-//! what is recorded is what plays.
+//! Plays what the game asks for: each frame's buses, the voices it keeps
+//! playing and the sounds it plays once, mixed by `mixer.rs` (WebAudio's
+//! graph, sample for sample) with the shared reverb of `reverb.rs`. The same
+//! mixer renders video recordings (`record.rs`), so what is recorded is what
+//! plays.
 //!
-//! Live, kira is only the output: the mixer runs inside one endless kira
-//! sound on the audio thread, and each frame's mix reaches it over a channel,
-//! landing at the start of its next 128-sample quantum. Clips decode on a
-//! background thread; a voice or sound whose clip is not ready yet is left
-//! out until it is, as the browser leaves it out while decoding.
+//! Live, the mixer runs in the output device's callback (`device.rs`), and
+//! each frame's mix reaches it over a channel, landing at the start of its
+//! next 128-sample quantum. Clips decode on a background thread; a voice or
+//! sound whose clip is not ready yet is left out until it is, as the browser
+//! leaves it out while decoding.
+mod device;
 pub mod mixer;
 mod resample;
 mod reverb;
 
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
+use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
-use kira::sound::static_sound::StaticSoundData;
-use kira::sound::{Sound, SoundData};
-use kira::{AudioManager, AudioManagerSettings, DefaultBackend, Frame};
+use anyhow::{Context, Result, bail, ensure};
 use pen_protocol::{Catalog, RenderFrame};
+use symphonia::core::codecs::CodecParameters;
+use symphonia::core::formats::TrackType;
+use symphonia::core::io::MediaSourceStream;
 
 use mixer::{BusSpec, Clip, Mix, Mixer, QUANTUM, SoundSpec, VoiceSpec};
 
-/// Decodes a clip: Ogg Opus here, everything else with kira's decoders.
-pub fn load_clip(path: &Path) -> Result<StaticSoundData> {
+/// Decodes a clip, in either format the game's sounds come in: Ogg Opus
+/// (`opus.rs`) or PCM WAV.
+pub fn load_clip(path: &Path) -> Result<Clip> {
     let bytes = std::fs::read(path)?;
     if crate::opus::is_ogg_opus(&bytes) {
         return crate::opus::decode(&bytes);
     }
-    Ok(StaticSoundData::from_cursor(std::io::Cursor::new(bytes))?)
+    decode_wav(bytes)
+}
+
+/// A PCM WAV clip, its samples as f32 (an i16 `s` as `s / 32768`, as
+/// WebAudio's decoding gives it).
+fn decode_wav(bytes: Vec<u8>) -> Result<Clip> {
+    let source = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
+    let mut reader = symphonia::default::get_probe()
+        .probe(&Default::default(), source, Default::default(), Default::default())
+        .context("not a WAV or Ogg Opus clip")?;
+    let track = reader.default_track(TrackType::Audio).context("the clip has no audio")?;
+    let id = track.id;
+    let Some(CodecParameters::Audio(parameters)) = &track.codec_params else { bail!("the clip has no audio") };
+    let rate = parameters.sample_rate.context("the clip has no sample rate")?;
+    // The rates a WebAudio buffer may have; at 0 Hz, a clip would resample
+    // to no end.
+    ensure!((3_000..=768_000).contains(&rate), "the clip's sample rate, {rate} Hz, is outside 3 to 768 kHz");
+    let mut decoder = symphonia::default::get_codecs().make_audio_decoder(parameters, &Default::default())?;
+    let mut frames: Vec<[f32; 2]> = Vec::new();
+    let mut samples: Vec<f32> = Vec::new();
+    while let Some(packet) = reader.next_packet()? {
+        if packet.track_id != id {
+            continue;
+        }
+        let buffer = decoder.decode(&packet)?;
+        buffer.copy_to_vec_interleaved(&mut samples);
+        match buffer.num_planes() {
+            1 => frames.extend(samples.iter().map(|&value| [value, value])),
+            2 => frames.extend_from_slice(samples.as_chunks::<2>().0),
+            channels => bail!("clips with {channels} channels are not supported"),
+        }
+    }
+    Ok(Clip::new(frames.into(), f64::from(rate)))
 }
 
 /// A clip, decoded for a mixer at `rate`.
 pub fn decode(path: &Path, rate: f64) -> Result<Arc<Clip>> {
-    let data = load_clip(path)?;
-    Ok(Arc::new(Clip::new(data.frames, f64::from(data.sample_rate))).at_rate(rate))
+    Ok(Arc::new(load_clip(path)?).at_rate(rate))
 }
 
 /// A frame's sound for the mixer, with the decoded clips it plays; voices
@@ -47,7 +81,11 @@ pub fn decode(path: &Path, rate: f64) -> Result<Arc<Clip>> {
 pub fn mix(frame: &RenderFrame, catalog: &Catalog, clips: &HashMap<String, Arc<Clip>>) -> Mix {
     let clip = |index: u32| clips.get(catalog.sound(index)).cloned();
     Mix {
-        buses: frame.buses.iter().map(|bus| BusSpec { gain: bus.gain, lowpass: bus.lowpass, reverb: bus.reverb }).collect(),
+        buses: frame
+            .buses
+            .iter()
+            .map(|bus| BusSpec { gain: bus.gain, lowpass: bus.lowpass, reverb: bus.reverb })
+            .collect(),
         voices: frame
             .voices
             .iter()
@@ -90,7 +128,7 @@ pub fn mix(frame: &RenderFrame, catalog: &Catalog, clips: &HashMap<String, Arc<C
 /// differs (or changes), and clips are decoded again for it.
 const LIKELY_RATE: f64 = 48_000.0;
 
-/// The output's sample rate, as the audio thread finds it, for the decoder.
+/// The output's sample rate, as the device runs, for the decoder.
 #[derive(Clone)]
 struct Rate(Arc<AtomicU64>);
 
@@ -103,10 +141,10 @@ impl Rate {
     }
 }
 
-/// The mixer, as an endless kira sound on the audio thread. Mixes arrive
-/// from `Audio::frame` and go back once applied, so that nothing the frames
-/// allocated is freed on the audio thread.
-struct Output {
+/// The mixer as the output device plays it. Mixes arrive from `Audio::frame`
+/// and go back once applied, so that nothing the frames allocated is freed
+/// on the audio thread.
+struct Live {
     mixer: Mixer,
     rate: Rate,
     mixes: Receiver<Mix>,
@@ -114,44 +152,52 @@ struct Output {
     scratch: [[f32; 2]; QUANTUM],
 }
 
-impl Sound for Output {
-    fn process(&mut self, out: &mut [Frame], dt: f64, _info: &kira::info::Info) {
-        let rate = 1.0 / dt;
+impl Live {
+    fn new(rate: Rate, mixes: Receiver<Mix>, applied: SyncSender<Mix>) -> Live {
+        Live { mixer: Mixer::new(rate.get()), rate, mixes, applied, scratch: [[0.0; 2]; QUANTUM] }
+    }
+
+    /// A device starts playing it at `rate`. At another rate than the
+    /// mixer's, the mixer starts afresh: the frames to come declare what
+    /// plays, and the clips are decoded again for it.
+    fn start(&mut self, rate: f64) {
         if (rate - self.mixer.rate()).abs() > 0.5 {
-            // A new device: the frames to come declare what plays.
             self.mixer = Mixer::new(rate);
             self.rate.set(rate);
         }
+    }
+
+    /// The device's next samples, `channels` interleaved: the mix within
+    /// -1 and 1, both sides averaged on a single channel, and silence on
+    /// any past the first two.
+    fn fill(&mut self, out: &mut [f32], channels: usize) {
+        let channels = channels.max(1);
         while let Ok(mix) = self.mixes.try_recv() {
             self.mixer.apply(&mix);
             let _ = self.applied.try_send(mix);
         }
-        for chunk in out.chunks_mut(QUANTUM) {
-            let scratch = &mut self.scratch[..chunk.len()];
+        for chunk in out.chunks_mut(QUANTUM * channels) {
+            let scratch = &mut self.scratch[..chunk.len() / channels];
             self.mixer.render(scratch);
-            for (frame, &[left, right]) in chunk.iter_mut().zip(scratch.iter()) {
-                *frame = Frame { left, right };
+            for (frame, &[left, right]) in chunk.chunks_exact_mut(channels).zip(scratch.iter()) {
+                let (left, right) = (left.clamp(-1.0, 1.0), right.clamp(-1.0, 1.0));
+                match frame {
+                    [only] => *only = (left + right) / 2.0,
+                    [first, second, rest @ ..] => {
+                        *first = left;
+                        *second = right;
+                        rest.fill(0.0);
+                    }
+                    [] => {}
+                }
             }
         }
-    }
-
-    fn finished(&self) -> bool {
-        false
-    }
-}
-
-impl SoundData for Output {
-    type Error = std::convert::Infallible;
-    type Handle = ();
-
-    fn into_sound(self) -> Result<(Box<dyn Sound>, ()), Self::Error> {
-        Ok((Box::new(self), ()))
     }
 }
 
 pub struct Audio {
     /// The output device, playing the mixer while it lives.
-    _output: AudioManager<DefaultBackend>,
+    _device: device::Device,
     clips: HashMap<String, Arc<Clip>>,
     /// The rate the clips are decoded for, and the output's.
     decoded_at: f64,
@@ -165,31 +211,26 @@ pub struct Audio {
 impl Audio {
     /// Starts the output device and decodes every clip in the catalog.
     pub fn new(assets: PathBuf, catalog: &Catalog) -> Result<Audio> {
-        let mut manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())?;
         let (mixes, receiving) = sync_channel(32);
         let (returning, applied) = sync_channel(64);
         let rate = Rate(Arc::new(AtomicU64::new(LIKELY_RATE.to_bits())));
-        let output = Output {
-            mixer: Mixer::new(LIKELY_RATE),
-            rate: rate.clone(),
-            mixes: receiving,
-            applied: returning,
-            scratch: [[0.0; 2]; QUANTUM],
-        };
-        manager.play(output)?;
+        let device = device::Device::start(Arc::new(Mutex::new(Live::new(rate.clone(), receiving, returning))))?;
+        // The device's own, which the clips are decoded for from the start.
+        let decoded_at = rate.get();
         let (requests, wanted) = channel::<String>();
         let (sender, decoded) = channel();
         let decoder = rate.clone();
         std::thread::Builder::new().name("pen-audio-decode".into()).spawn(move || {
             for key in wanted {
-                let result = decode(&assets.join(&key), decoder.get()).map_err(|error| format!("sound {key}: {error:#}"));
+                let result =
+                    decode(&assets.join(&key), decoder.get()).map_err(|error| format!("sound {key}: {error:#}"));
                 if sender.send((key, result)).is_err() {
                     return;
                 }
             }
         })?;
         let mut audio =
-            Audio { _output: manager, clips: HashMap::new(), decoded_at: LIKELY_RATE, rate, requests, decoded, mixes, applied };
+            Audio { _device: device, clips: HashMap::new(), decoded_at, rate, requests, decoded, mixes, applied };
         audio.preload(catalog);
         Ok(audio)
     }
@@ -246,6 +287,7 @@ impl Audio {
 }
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "test tones and WAV bytes")]
 mod tests {
     use super::*;
     use mixer::{BusSpec, OPEN};
@@ -254,20 +296,20 @@ mod tests {
     /// A device's callback, in samples.
     const CALLBACK: usize = 512;
 
-    /// Plays `frames` (game frames at 60 a second) through the live output as
-    /// a device would: CALLBACK samples at a time, while the frames arrive at
-    /// their own uneven pace, up to 6 ms early or late, and all at once after
-    /// a 120 ms stall at one second.
-    fn live(frames: Vec<Mix>) -> Vec<[f32; 2]> {
+    /// The live output, without a device: what a device's callback asks of
+    /// it is up to the test.
+    fn output() -> (Live, SyncSender<Mix>, Receiver<Mix>) {
         let (mixes, receiving) = sync_channel(32);
         let (returning, applied) = sync_channel(64);
-        let mut output = Output {
-            mixer: Mixer::new(RATE),
-            rate: Rate(Arc::new(AtomicU64::new(RATE.to_bits()))),
-            mixes: receiving,
-            applied: returning,
-            scratch: [[0.0; 2]; QUANTUM],
-        };
+        (Live::new(Rate(Arc::new(AtomicU64::new(RATE.to_bits()))), receiving, returning), mixes, applied)
+    }
+
+    /// Plays `frames` (game frames at 60 a second) through the live output as
+    /// a stereo device would: CALLBACK samples at a time, while the frames
+    /// arrive at their own uneven pace, up to 6 ms early or late, and all at
+    /// once after a 120 ms stall at one second.
+    fn live(frames: Vec<Mix>) -> Vec<[f32; 2]> {
+        let (mut output, mixes, applied) = output();
         let mut random = 7u32;
         let arrivals: Vec<f64> = (0..frames.len())
             .map(|index| {
@@ -276,18 +318,17 @@ mod tests {
                 if (1.0..1.12).contains(&at) { 1.12 } else { at.max(0.0) }
             })
             .collect();
-        let info = kira::info::MockInfoBuilder::new().build();
         let seconds = frames.len() as f64 / 60.0 + 0.5;
         let mut frames = frames.into_iter().zip(arrivals).peekable();
         let mut out = Vec::new();
-        let mut buffer = vec![Frame::ZERO; CALLBACK];
+        let mut buffer = vec![0.0; CALLBACK * 2];
         let mut time = 0.0;
         while time < seconds {
             while let Some((mix, _)) = frames.next_if(|(_, at)| *at <= time) {
                 mixes.try_send(mix).unwrap();
             }
-            output.process(&mut buffer, 1.0 / RATE, &info);
-            out.extend(buffer.iter().map(|frame| [frame.left, frame.right]));
+            output.fill(&mut buffer, 2);
+            out.extend_from_slice(buffer.as_chunks::<2>().0);
             while applied.try_recv().is_ok() {}
             time += CALLBACK as f64 / RATE;
         }
@@ -296,10 +337,10 @@ mod tests {
 
     /// A sine of whole cycles a second, looped without a seam.
     fn sine(frequency: f64, seconds: f64) -> Arc<Clip> {
-        let frames: Arc<[Frame]> = (0..(seconds * RATE) as usize)
+        let frames: Arc<[[f32; 2]]> = (0..(seconds * RATE) as usize)
             .map(|i| {
                 let value = (std::f64::consts::TAU * frequency * i as f64 / RATE).sin() as f32;
-                Frame { left: value, right: value }
+                [value, value]
             })
             .collect();
         Arc::new(Clip::new(frames, RATE))
@@ -341,7 +382,15 @@ mod tests {
                     voices.push(voice(2, &high));
                 }
                 let sounds = if frame % 20 == 0 {
-                    vec![SoundSpec { clip: blip.clone(), bus: 2, gain: 0.5, pan: -0.5, pitch: 1.0, lowpass: 4000.0, reverb: 0.3 }]
+                    vec![SoundSpec {
+                        clip: blip.clone(),
+                        bus: 2,
+                        gain: 0.5,
+                        pan: -0.5,
+                        pitch: 1.0,
+                        lowpass: 4000.0,
+                        reverb: 0.3,
+                    }]
                 } else {
                     Vec::new()
                 };
@@ -354,7 +403,10 @@ mod tests {
             })
             .collect();
         let out = live(frames);
-        let largest = out.windows(2).map(|pair| (pair[1][0] - pair[0][0]).abs().max((pair[1][1] - pair[0][1]).abs())).fold(0.0f32, f32::max);
+        let largest = out
+            .windows(2)
+            .map(|pair| (pair[1][0] - pair[0][0]).abs().max((pair[1][1] - pair[0][1]).abs()))
+            .fold(0.0f32, f32::max);
         let loudest = out.iter().map(|[l, r]| l.abs().max(r.abs())).fold(0.0f32, f32::max);
         // The sines at their loudest move at most about 0.03 a sample each;
         // a gain stepping from 0.8 to 0.2 unglided would jump by 0.4.
@@ -376,7 +428,8 @@ mod tests {
         let clips: HashMap<String, Arc<Clip>> =
             catalog.sounds.iter().map(|key| (key.clone(), decode(&assets.join(key), RATE).unwrap())).collect();
         let schema: u32 = std::fs::read_to_string(packets.join("schema.txt")).unwrap().trim().parse().unwrap();
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(packets.join("output")).unwrap().map(|entry| entry.unwrap().path()).collect();
+        let mut paths: Vec<PathBuf> =
+            std::fs::read_dir(packets.join("output")).unwrap().map(|entry| entry.unwrap().path()).collect();
         paths.sort();
         let frames = paths
             .iter()
@@ -394,13 +447,126 @@ mod tests {
     /// Every clip in an exported bundle decodes.
     #[test]
     fn bundle_clips_decode() {
-        let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist/gdev/assets");
-        let Ok(catalog) = pen_protocol::boundary::read_catalog(&assets) else { return };
+        let Some(bundle) = crate::fixtures::bundle() else { return };
+        let assets = bundle.join("assets");
+        let catalog = pen_protocol::boundary::read_catalog(&assets).unwrap();
         let failed: Vec<String> = catalog
             .sounds
             .iter()
             .filter_map(|key| load_clip(&assets.join(key)).err().map(|error| format!("{key}: {error:#}")))
             .collect();
         assert!(failed.is_empty(), "clips that do not decode: {failed:#?}");
+    }
+
+    /// A voice of a stereo clip whose sides are a sine and a slower one,
+    /// as loud as `gain` makes them.
+    fn stereo_voice(gain: f32) -> Mix {
+        let frames: Arc<[[f32; 2]]> = (0..48_000)
+            .map(|i| {
+                let t = std::f64::consts::TAU * i as f64 / RATE;
+                [(t * 300.0).sin() as f32, (t * 120.0).sin() as f32 * 0.5]
+            })
+            .collect();
+        let voice = VoiceSpec {
+            id: 1,
+            clip: Arc::new(Clip::new(frames, RATE)),
+            bus: 0,
+            gain,
+            pan: 0.2,
+            pitch: 1.0,
+            lowpass: mixer::OPEN,
+            reverb: 0.3,
+            looping: true,
+            start: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+        };
+        Mix { voices: vec![voice], ..Mix::default() }
+    }
+
+    /// Whatever channels a device has, the live output gives it the mix the
+    /// mixer renders, sample for sample, within -1 and 1: both sides on the
+    /// first two, their average on a single one, silence on the rest.
+    #[test]
+    fn live_output_fills_any_channels() {
+        // Loud enough to be cut at 1, over 1000 samples: not a whole number
+        // of quanta.
+        let mut mixer = Mixer::new(RATE);
+        mixer.apply(&stereo_voice(3.0));
+        let mut expected = vec![[0.0f32; 2]; 1000];
+        mixer.render(&mut expected);
+        assert!(expected.iter().any(|[left, _]| left.abs() > 1.0));
+        for channels in [1, 2, 6] {
+            let (mut output, mixes, _applied) = output();
+            mixes.try_send(stereo_voice(3.0)).unwrap();
+            let mut buffer = vec![f32::NAN; 1000 * channels];
+            output.fill(&mut buffer, channels);
+            for (frame, [left, right]) in buffer.chunks_exact(channels).zip(&expected) {
+                let (left, right) = (left.clamp(-1.0, 1.0), right.clamp(-1.0, 1.0));
+                if channels == 1 {
+                    assert_eq!(frame, [(left + right) / 2.0]);
+                } else {
+                    assert_eq!(frame[..2], [left, right]);
+                    assert!(frame[2..].iter().all(|&sample| sample == 0.0), "{frame:?}");
+                }
+            }
+        }
+    }
+
+    /// A device at another rate starts the mixer afresh at it, for the
+    /// frames to come to declare what plays and the clips to be decoded
+    /// again for; one at the same rate plays on.
+    #[test]
+    fn live_output_starts_again_at_a_new_rate() {
+        let (mut output, mixes, _applied) = output();
+        mixes.try_send(stereo_voice(0.5)).unwrap();
+        output.fill(&mut [0.0; 512], 2);
+        output.start(RATE);
+        assert_eq!(output.mixer.playing(), 1);
+        output.start(44_100.0);
+        assert_eq!((output.mixer.rate(), output.rate.get(), output.mixer.playing()), (44_100.0, 44_100.0, 0));
+    }
+
+    /// A 16-bit PCM WAV file of `samples`, interleaved.
+    fn wav(rate: u32, channels: u16, samples: &[i16]) -> Vec<u8> {
+        let size = (samples.len() * 2) as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * u32::from(channels) * 2).to_le_bytes());
+        bytes.extend_from_slice(&(channels * 2).to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&size.to_le_bytes());
+        bytes.extend(samples.iter().flat_map(|sample| sample.to_le_bytes()));
+        bytes
+    }
+
+    /// WAV clips, as the game's sounds come (16-bit PCM), decode at their
+    /// own rate, a sample `s` as `s / 32768`, and a mono one is mono.
+    #[test]
+    fn wav_clips_decode() {
+        let mut samples: Vec<i16> = (0..9_998).map(|i| ((i * 7_919) % 65_536 - 32_768) as i16).collect();
+        samples.extend([i16::MIN, i16::MAX]);
+        let value = |sample: i16| f32::from(sample) / 32_768.0;
+        let mono = decode_wav(wav(22_050, 1, &samples)).unwrap();
+        assert_eq!((mono.rate, mono.mono, mono.frames.len()), (22_050.0, true, 10_000));
+        assert!(mono.frames.iter().zip(&samples).all(|(frame, &sample)| *frame == [value(sample); 2]));
+        assert_eq!(mono.frames[9_998..], [[-1.0; 2], [value(i16::MAX); 2]]);
+        let stereo = decode_wav(wav(44_100, 2, &samples)).unwrap();
+        assert_eq!((stereo.rate, stereo.mono, stereo.frames.len()), (44_100.0, false, 5_000));
+        assert!(
+            stereo
+                .frames
+                .iter()
+                .zip(samples.as_chunks::<2>().0)
+                .all(|(frame, &[left, right])| *frame == [value(left), value(right)])
+        );
+        assert!(decode_wav(b"not a clip".to_vec()).is_err());
     }
 }

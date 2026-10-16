@@ -50,3 +50,30 @@ pub fn find(columns: usize, open: &[bool], start: usize, goal: usize) -> Option<
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A grid from rows of `.` (open) and `#` (blocked).
+    fn grid(rows: &[&str]) -> (usize, Vec<bool>) {
+        (rows[0].len(), rows.iter().flat_map(|row| row.chars().map(|cell| cell == '.')).collect())
+    }
+
+    #[test]
+    fn finds_the_shortest_way_round_walls() {
+        let (columns, open) = grid(&["....", ".##.", "...#", "#..."]);
+        let path = find(columns, &open, 0, 15).unwrap();
+        // Down the left side and along the bottom: 7 cells, each a step from the last.
+        assert_eq!(path.len(), 7);
+        assert_eq!((path[0], path[6]), (0, 15));
+        assert!(path.windows(2).all(|step| step[0].abs_diff(step[1]) == 1 || step[0].abs_diff(step[1]) == columns));
+        assert!(path.iter().all(|cell| open[*cell]));
+        // The same path every time.
+        assert_eq!(find(columns, &open, 0, 15).unwrap(), path);
+        assert_eq!(find(columns, &open, 5, 0), None, "a blocked start");
+        let (columns, open) = grid(&[".#.", ".#.", ".#."]);
+        assert_eq!(find(columns, &open, 0, 2), None, "a wall between");
+        assert_eq!(find(columns, &open, 0, 0), Some(vec![0]));
+    }
+}

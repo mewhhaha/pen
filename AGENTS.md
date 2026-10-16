@@ -8,4 +8,6 @@
 - Run GPU consumers sequentially. `just test` prepares real game/packet
   fixtures before testing; direct Cargo tests need `just packets` first.
 - Generate packet code from `protocol/schema.json` with `just sync-protocol`.
-  Do not hand-edit generated files or format the whole checkout.
+  Do not hand-edit generated files. Keep `cargo fmt --all --check` clean in
+  both workspaces (rustfmt.toml; CI and `just check` run it); packets.rs is
+  generated and skipped.

@@ -1,5 +1,6 @@
 //! A [`Child`] that is a process of this machine's, for running the client
-//! natively (its tests) as pen's `process.child` runs it in the component.
+//! natively (its tests) as pen's `process.child` runs it in the component,
+//! and [`Files`] that are this machine's, as pen's `files` are.
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{ChildStdin, Command, Stdio};
@@ -8,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::{Child, ReadError};
+use crate::{Child, Files, ReadError};
 
 /// How much of its standard error a child keeps.
 const ERROR_TAIL: usize = 64 * 1024;
@@ -146,5 +147,26 @@ impl Drop for NativeChild {
     fn drop(&mut self) {
         let _ = self.process.kill();
         let _ = self.process.wait();
+    }
+}
+
+/// The disk's files, all of them readable.
+pub struct NativeFiles;
+
+impl Files for NativeFiles {
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        std::fs::read(path).map_err(|error| error.to_string())
+    }
+
+    fn read_directory(&mut self, directory: &str) -> Result<Vec<String>, String> {
+        let entries = std::fs::read_dir(directory).map_err(|error| error.to_string())?;
+        let mut names: Vec<String> =
+            entries.flatten().map(|entry| entry.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        Ok(names)
+    }
+
+    fn is_file(&mut self, path: &str) -> bool {
+        Path::new(path).is_file()
     }
 }

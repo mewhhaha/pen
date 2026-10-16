@@ -1,7 +1,13 @@
 # Override with `just gdev=PATH ...`.
 gdev := "../gdev"
 pen := "cargo run --release -q -p pen --"
+# The browser tests' tools, pinned (CI installs them with `just browser-tools`
+# too): pnpm, run through npx, and playwright-core, which picks Chromium.
+pnpm := "npx --yes pnpm@12.8.2"
+playwright := "1.63.0"
 
+# Then removes what earlier installs left in plugins/ and web/ that this one
+# no longer builds, saying what it removes.
 # Install the native CLI, compiler component and browser host.
 install: plugins web-host
   cargo build --release -p pen --features steam
@@ -13,6 +19,10 @@ install: plugins web-host
   cp plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm ~/.local/lib/pen-runtime/plugins/blot.wasm.new
   mv -f ~/.local/lib/pen-runtime/plugins/blot.wasm.new ~/.local/lib/pen-runtime/plugins/blot.wasm
   cp crates/pen-web/pkg/{pen_web.js,pen_web_bg.wasm,guest.js,index.html} ~/.local/lib/pen-runtime/web/
+  find ~/.local/lib/pen-runtime/plugins -mindepth 1 -maxdepth 1 ! -name blot.wasm \
+    -exec echo removing stale {} \; -exec rm -rf {} +
+  find ~/.local/lib/pen-runtime/web -mindepth 1 -maxdepth 1 ! -name pen_web.js ! -name pen_web_bg.wasm ! -name guest.js ! -name index.html \
+    -exec echo removing stale {} \; -exec rm -rf {} +
   cp LICENSE THIRD_PARTY_NOTICES.md ~/.local/lib/pen-runtime/
   ln -sf ~/.local/lib/pen-runtime/pen ~/.local/bin/pen
 
@@ -22,7 +32,9 @@ plugins:
 plugin-tests:
   cd plugins && cargo test
 
+# The browser host `just install` ships, optimized by wasm-opt.
 web-host:
+  @command -v wasm-opt > /dev/null || { echo "web-host: wasm-opt is not on PATH; install binaryen (https://github.com/WebAssembly/binaryen/releases)" >&2; exit 1; }
   sh crates/pen-web/build.sh
 
 dev *args:
@@ -43,8 +55,16 @@ package:
 bench:
   {{pen}} bench --project {{gdev}} --frames 600
 
+# Render dist/packets headlessly; time loading and each frame.
+render-packets *args:
+  cargo run --release -p pen-render --example render_packet -- --sequence --veil {{args}}
+
 visual *args:
   {{pen}} test --project {{gdev}} tests/visual/scenarios.json {{args}}
+
+# Compile times of the release and development engines, first and again.
+compile-time: export
+  cargo run --release -q -p blot-host --example compile_time dist/gdev/game.wasm dist/gdev/game.wasm
 
 blot-tests *args:
   {{pen}} test-blot --project {{gdev}} {{args}}
@@ -55,12 +75,13 @@ browser-tools:
   #!/usr/bin/env bash
   set -euo pipefail
   if [ -n "${PLAYWRIGHT_MODULE:-}" ]; then exit 0; fi
-  if [ ! -f target/browser-tools/node_modules/playwright-core/index.mjs ]; then
-    mkdir -p target/browser-tools
-    printf '{"private":true}\n' > target/browser-tools/package.json
-    pnpm --dir target/browser-tools add playwright-core@latest
+  tools=target/browser-tools
+  if [ "$(node -p "require('./$tools/node_modules/playwright-core/package.json').version" 2>/dev/null)" != "{{playwright}}" ]; then
+    mkdir -p "$tools"
+    [ -f "$tools/package.json" ] || printf '{"private":true}\n' > "$tools/package.json"
+    {{pnpm}} --dir "$tools" add --save-exact "playwright-core@{{playwright}}"
   fi
-  pnpm --dir target/browser-tools exec playwright-core install chromium
+  node "$tools/node_modules/playwright-core/cli.js" install chromium
 
 conformance: browser-tools
   #!/usr/bin/env bash
@@ -74,6 +95,47 @@ conformance: browser-tools
   trap 'kill "$browser_server"' EXIT
   PEN_CONFORMANCE_URL="http://127.0.0.1:$browser_port/qualification.html" node crates/pen-web/tests/conformance.mjs
 
+# The exported game in headless Chromium on the GPU (Vulkan): the game, the
+# backquote console, diagnostics, the timeline, tunables and builds panels,
+# a resize, and the autosave a reload restores, shot into
+# target/browser-shots. PEN_WEB_GPU=software uses SwiftShader, which a full
+# scene can outlast.
+# The browser game, console, panels and autosave, captured.
+browser: browser-tools
+  #!/usr/bin/env bash
+  set -euo pipefail
+  {{pen}} build --web --project {{gdev}} --out dist/web
+  export PLAYWRIGHT_MODULE="${PLAYWRIGHT_MODULE:-$PWD/target/browser-tools/node_modules/playwright-core/index.mjs}"
+  browser_port=${PEN_BROWSER_PORT:-8043}
+  python3 -m http.server --bind 127.0.0.1 --directory dist/web "$browser_port" > target/browser-server.log 2>&1 &
+  browser_server=$!
+  trap 'kill "$browser_server"' EXIT
+  PEN_WEB_URL="http://127.0.0.1:$browser_port/" node crates/pen-web/tests/browser.mjs
+
+# `pen web` in headless Chromium on the GPU (Vulkan): its Bake endpoint and
+# validation, and a touched FILE of the game (its timestamp is restored)
+# reloading the game, dev tools, catalog, shaders and textures; then the
+# static export served from a subdirectory.
+# `pen web`'s reload and Bake, and a static export beneath a directory.
+browser-dev file="src/assets/catalog.json": browser-tools
+  #!/usr/bin/env bash
+  set -euo pipefail
+  {{pen}} build --web --project {{gdev}} --out dist/web
+  export PLAYWRIGHT_MODULE="${PLAYWRIGHT_MODULE:-$PWD/target/browser-tools/node_modules/playwright-core/index.mjs}"
+  dev_port=${PEN_DEVELOPMENT_PORT:-8045}
+  static_port=$((dev_port + 1))
+  {{pen}} web --project {{gdev}} --port "$dev_port" > target/pen-web.log 2>&1 &
+  dev_server=$!
+  python3 -m http.server --bind 127.0.0.1 --directory dist "$static_port" > target/browser-server.log 2>&1 &
+  static_server=$!
+  trap 'kill "$dev_server" "$static_server"' EXIT
+  until curl -fs "http://127.0.0.1:$dev_port/__pen/revision" > /dev/null; do
+    kill -0 "$dev_server" 2> /dev/null || { cat target/pen-web.log; exit 1; }
+    sleep 1
+  done
+  PEN_DEVELOPMENT_URL="http://127.0.0.1:$dev_port/?dev" PEN_RELOAD_FILE="{{gdev}}/{{file}}" \
+    PEN_STATIC_URL="http://127.0.0.1:$static_port/web/" node crates/pen-web/tests/development.mjs
+
 # Game/scene/assets consumed by protocol, renderer and determinism tests.
 export:
   {{pen}} export --project {{gdev}} --out dist/gdev
@@ -86,18 +148,29 @@ packets: export
   rm -rf dist/packets-run
 
 sync-protocol:
-  cargo run -q -p pen-codegen -- --project {{gdev}} --rust crates/pen-protocol/src/packets.rs
+  {{pen}} codegen --project {{gdev}} --rust crates/pen-protocol/src/packets.rs
 
 # Includes the full Blot suite, not only smoke fixtures.
 test: check visual determinism blot-tests conformance
 
+# Clippy lints pen in every combination of its features (the default one
+# and the player runtime's among them) through cargo-hack.
+# Protocol freshness, clippy and the Cargo tests.
+# rustfmt.toml formats both workspaces; packets.rs is generated and skipped.
 check: plugins plugin-tests packets
-  cargo run -q -p pen-codegen -- --project {{gdev}} --rust crates/pen-protocol/src/packets.rs --check
+  {{pen}} codegen --project {{gdev}} --rust crates/pen-protocol/src/packets.rs --check
+  cargo fmt --all --check
+  cd plugins && cargo fmt --all --check
   cargo clippy --workspace --all-targets --features pen/steam -- -D warnings
-  cargo clippy -p pen --all-targets --no-default-features --features steam -- -D warnings
+  cargo hack clippy -p pen --feature-powerset --exclude-features default --all-targets -- -D warnings
   cargo test --workspace -- --test-threads=1
   cargo test --release -p pen-render -- --test-threads=1
-  cargo clippy --manifest-path crates/pen-web/Cargo.toml --target wasm32-unknown-unknown -- -D warnings
+  cargo clippy -p pen-web --target wasm32-unknown-unknown -- -D warnings
+
+# Needs cargo-deny; the policy is deny.toml.
+# Licenses, advisories, bans and sources of both lockfiles.
+deny:
+  for manifest in Cargo.toml plugins/Cargo.toml; do cargo deny --manifest-path "$manifest" check; done
 
 # No Wasm compiler (it loads the game.cwasm its package was precompiled
 # with), Steam, the `dist` profile, and glibc 2.28 and later (every Steam
@@ -120,13 +193,12 @@ install-player: player
   mkdir -p ~/.local/lib/pen-runtime/player
   cp target/x86_64-unknown-linux-gnu/dist/player/* ~/.local/lib/pen-runtime/player/
 
-# As x86_64-pc-windows-gnu, with no Windows SDK or MSVC; libopus builds
-# through packaging/zig's CMake toolchain, which drops the MSVC-only flag
-# opus-head-sys passes. What ships is target/x86_64-pc-windows-gnu/dist/player/.
+# As x86_64-pc-windows-gnu, with no Windows SDK or MSVC: zig compiles
+# libopus (opusic-sys, through CMake) as it links. What ships is
+# target/x86_64-pc-windows-gnu/dist/player/.
 # The Windows player runtime, cross-compiled with zig.
 windows:
-  CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_gnu="{{justfile_directory()}}/packaging/zig/windows-gnu.cmake" \
-    cargo zigbuild --profile dist -p pen --no-default-features --features steam --target x86_64-pc-windows-gnu
+  cargo zigbuild --profile dist -p pen --no-default-features --features steam --target x86_64-pc-windows-gnu
   just stripped target/x86_64-pc-windows-gnu/dist pen.exe steam_api64.dll
 
 # The checkout's game with the player runtimes: dist/linux (Steam Deck

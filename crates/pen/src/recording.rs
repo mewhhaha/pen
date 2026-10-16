@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
-use pen_protocol::boundary::{MAX_STATE_FLOATS, validate_schema, validate_state};
+use pen_protocol::boundary::{MAX_STATE_FLOATS, validate_schema, validate_state, whole};
 
 use crate::game::{Edits, Moment};
 use crate::snapshot::SavedState;
@@ -37,8 +37,13 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+/// A count of lanes, scenes or loads, all bounded far below 2^32.
+fn put_count(out: &mut Vec<u8>, count: usize) {
+    put_u32(out, u32::try_from(count).expect("a count the protocol bounds"));
+}
+
 fn put_lanes(out: &mut Vec<u8>, lanes: &[f32]) {
-    put_u32(out, lanes.len() as u32);
+    put_count(out, lanes.len());
     for lane in lanes {
         out.extend_from_slice(&lane.to_le_bytes());
     }
@@ -54,8 +59,8 @@ fn encode_moment(moment: &Moment) -> Vec<u8> {
     out.extend_from_slice(MAGIC);
     put_u32(&mut out, VERSION);
     put_saved(&mut out, &moment.saved);
-    put_u32(&mut out, moment.edits.scenes.len() as u32);
-    put_u32(&mut out, moment.edits.step.map_or(0, |step| step as u32 + 1));
+    put_count(&mut out, moment.edits.scenes.len());
+    put_count(&mut out, moment.edits.step.map_or(0, |step| step + 1));
     for scene in &moment.edits.scenes {
         put_lanes(&mut out, scene);
     }
@@ -66,7 +71,7 @@ fn encode_frame(recorded: &Recorded) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + recorded.input.len() * 4);
     put_lanes(&mut out, &recorded.input);
     put_u32(&mut out, u32::from(recorded.restored));
-    put_u32(&mut out, recorded.loads.len() as u32);
+    put_count(&mut out, recorded.loads.len());
     for load in &recorded.loads {
         let (kind, saved) = match load {
             Load::Save(saved) => (0, saved),
@@ -169,7 +174,7 @@ pub fn read(path: &Path) -> Result<Recording> {
 /// The viewport a recording's first frame had, in pixels.
 pub fn viewport(path: &Path) -> Result<Option<(u32, u32)>> {
     let recording = read(path)?;
-    Ok(recording.frames.first().map(|frame| (frame.input[1] as u32, frame.input[2] as u32)))
+    Ok(recording.frames.first().and_then(|frame| whole(frame.input[1]).zip(whole(frame.input[2]))))
 }
 
 /// Writes a recording as frames run.
@@ -206,7 +211,7 @@ impl Writer {
     /// Forgets the frames from `position` on: the game went back to it.
     pub fn rewind(&mut self, position: u64) -> Result<()> {
         ensure!(position >= self.first, "cannot rewind before the input recording started");
-        let index = (position - self.first) as usize;
+        let Ok(index) = usize::try_from(position - self.first) else { return Ok(()) };
         let Some(&start) = self.starts.get(index) else { return Ok(()) };
         self.file.flush()?;
         self.file.get_mut().set_len(start)?;

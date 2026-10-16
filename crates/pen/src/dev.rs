@@ -1,20 +1,22 @@
 //! Development reloads: watches the game's compiled program and its asset
-//! directory. A new `game.wasm` produced after each Blot change compiles on a
-//! background thread and then replaces the running build with its state
-//! carried over; changed assets reload in the
-//! renderer and audio.
+//! directory (through `watch`, the session's one file watcher). A new
+//! `game.wasm` produced after each Blot change compiles on a background
+//! thread and then replaces the running build with its state carried over;
+//! changed assets reload in the renderer and audio.
+pub mod watch;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use blot_host::GuestModule;
-use notify::{EventKind, RecursiveMode, Watcher};
+use notify::EventKind;
 use pen_protocol::Catalog;
 use pen_protocol::boundary::read_catalog;
 
-use crate::overlay::{self, Source};
+use crate::devlog::{self, Source};
 
 /// How long assets must be quiet before a reload: long enough to see an
 /// editor's save through, short enough not to notice. game.wasm needs none:
@@ -29,8 +31,8 @@ pub enum Update {
 }
 
 pub struct Dev {
-    _watcher: notify::RecommendedWatcher,
-    events: Receiver<notify::Result<notify::Event>>,
+    _watch: watch::Subscription,
+    events: Receiver<watch::Event>,
     wasm: PathBuf,
     assets: PathBuf,
     wasm_changed: bool,
@@ -50,21 +52,22 @@ fn asset_key(assets: &Path, path: &Path) -> Option<String> {
     if name.starts_with('.') || name.ends_with('~') || name.ends_with(".tmp") || name == "catalog.json" {
         return None;
     }
-    let parts: Vec<String> = relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
+    let parts: Vec<String> =
+        relative.components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect();
     Some(parts.join("/"))
 }
 
 impl Dev {
     pub fn new(game: &Path, assets: &Path) -> Result<Dev> {
         let (sender, events) = channel();
-        let mut watcher = notify::recommended_watcher(sender)?;
+        let watch = watch::subscribe(&[(game, false), (assets, true)], move |event| {
+            let _ = sender.send(event);
+        })?;
         let game = std::fs::canonicalize(game)?;
         let assets = std::fs::canonicalize(assets)?;
-        watcher.watch(&game, RecursiveMode::NonRecursive).with_context(|| format!("watching {}", game.display()))?;
-        watcher.watch(&assets, RecursiveMode::Recursive).with_context(|| format!("watching {}", assets.display()))?;
         eprintln!("dev: reloading {} and {}", game.join("game.wasm").display(), assets.display());
         Ok(Dev {
-            _watcher: watcher,
+            _watch: watch,
             events,
             wasm: game.join("game.wasm"),
             assets,
@@ -87,7 +90,7 @@ impl Dev {
                 // No cache: every edit would leave another compiled copy behind.
                 let module = GuestModule::new(&engine, &bytes, None)?;
                 let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
-                overlay::info(Source::Reload, format!("dev: compiled the new build in {milliseconds:.0} ms"));
+                devlog::info(Source::Reload, format!("dev: compiled the new build in {milliseconds:.0} ms"));
                 Ok((module, catalog))
             })();
             let _ = sender.send(built);
@@ -130,7 +133,7 @@ impl Dev {
                 .filter(|key| self.assets.join(key).is_file())
                 .collect();
             if !keys.is_empty() {
-                overlay::info(Source::Asset, format!("dev: reloading {}", keys.join(", ")));
+                devlog::info(Source::Asset, format!("dev: reloading {}", keys.join(", ")));
                 updates.push(Update::Assets(keys));
             }
         }
@@ -140,7 +143,9 @@ impl Dev {
                     self.compiling = None;
                     match result {
                         Ok((module, catalog)) => updates.push(Update::Build(module, catalog)),
-                        Err(error) => overlay::error(Source::Reload, format!("dev: the new build does not load: {error:#}")),
+                        Err(error) => {
+                            devlog::error(Source::Reload, format!("dev: the new build does not load: {error:#}"))
+                        }
                     }
                     if std::mem::take(&mut self.again) {
                         self.compile(engine);

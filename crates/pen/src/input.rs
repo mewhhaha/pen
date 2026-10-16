@@ -1,7 +1,7 @@
-//! Window input as the game's events, in the browser host's terms (gdev's
-//! `event_pump.ts` and `web/client.ts`): key names as `KeyboardEvent.key`
-//! gives them, pointer positions in window pixels, buttons numbered as
-//! `MouseEvent.button`, and wheel deltas in pixels. Holding the secondary
+//! Window input as the game's events, in the browser host's terms: key
+//! names as `KeyboardEvent.key` gives them, pointer positions in window
+//! pixels, buttons numbered as `MouseEvent.button`, and wheel deltas in
+//! pixels. Holding the secondary
 //! button locks the pointer, so looking around has no screen edge.
 //!
 //! Time travel takes Ctrl+Shift with a key, which the game never sees: P
@@ -10,8 +10,8 @@
 //!
 //! In `pen dev` and `pen run` the dev tools (`devtools`) see window
 //! events before this does (`Session::overlay_event`): the backquote key is
-//! its own, and while one of its panels has the keyboard or the pointer, the
-//! game gets neither.
+//! theirs, the keyboard while one of their nodes has the focus, and the
+//! pointer over their dialogs.
 use pen_protocol::{Frame, GameEvent, Viewport};
 use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
@@ -19,6 +19,12 @@ use winit::window::{CursorGrabMode, Fullscreen, Window};
 
 /// Pixels a wheel notch scrolls, as browsers report `deltaY` for one line.
 pub(crate) const PIXELS_PER_LINE: f32 = 100.0;
+
+/// A number (a position, a delta, a value) as the f32 a game event holds.
+#[allow(clippy::cast_possible_truncation, reason = "narrowing f64 to f32 is the point")]
+pub(crate) fn narrow(value: f64) -> f32 {
+    value as f32
+}
 
 pub use pen_runtime::input::Hotkey;
 
@@ -124,7 +130,7 @@ impl Input {
             WindowEvent::CursorMoved { position, .. } => {
                 // While locked, motion comes from raw device deltas instead.
                 if !self.locked {
-                    self.pointer = (position.x as f32, position.y as f32);
+                    self.pointer = (narrow(position.x), narrow(position.y));
                     let (x, y) = self.pointer;
                     self.pending.push(GameEvent::PointerMove { x, y });
                 }
@@ -150,7 +156,7 @@ impl Input {
             WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => -lines * PIXELS_PER_LINE,
-                    MouseScrollDelta::PixelDelta(pixels) => -pixels.y as f32,
+                    MouseScrollDelta::PixelDelta(pixels) => -narrow(pixels.y),
                 };
                 let (x, y) = self.pointer;
                 self.pending.push(GameEvent::Wheel { x, y, delta });
@@ -167,8 +173,8 @@ impl Input {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
             && self.locked
         {
-            self.pointer.0 += *dx as f32;
-            self.pointer.1 += *dy as f32;
+            self.pointer.0 += narrow(*dx);
+            self.pointer.1 += narrow(*dy);
             let (x, y) = self.pointer;
             self.pending.push(GameEvent::PointerMove { x, y });
         }

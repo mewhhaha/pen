@@ -1,7 +1,8 @@
-//! What the dev tools show in their console: the game's reports, the
-//! Blot compiler's output, new builds, asset reloads and the asset pipeline's
-//! recipe runs. Each line still goes to stderr as before; builds with the
-//! `devtools` feature also keep the last ones for the dev tools to read.
+//! The development log, which the dev tools show in their console: the
+//! game's reports, the Blot compiler's output, new builds, asset reloads,
+//! the asset pipeline's recipe runs and the session's time travel. Each line
+//! goes to stderr; builds with the `devtools` feature (the player runtime
+//! has none) also keep the last ones for the dev tools to read.
 
 /// Where a line came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9,7 +10,7 @@ pub enum Source {
     /// The game runtime's reports (`Host::report`).
     Game,
     /// The Blot compiler watching the checkout (`pen dev`).
-    #[cfg_attr(not(feature = "plugins"), allow(dead_code))]
+    #[cfg_attr(not(feature = "compiler"), allow(dead_code))]
     Build,
     /// New builds of the game: compiled, reloaded or refused.
     Reload,
@@ -40,7 +41,7 @@ pub fn error(source: Source, text: impl Into<String>) {
     say(source, true, text.into());
 }
 
-/// Keeps a line for the overlay that has gone to stderr already.
+/// Keeps a line for the dev tools that has gone to stderr already.
 pub fn note(source: Source, text: impl Into<String>) {
     keep(source, false, text.into());
 }
@@ -57,7 +58,7 @@ mod kept {
 
     use super::{Line, Source};
 
-    /// Lines the overlay can still read; older ones are dropped.
+    /// Lines the dev tools can still read; older ones are dropped.
     const KEEP: usize = 2000;
 
     struct Kept {
@@ -81,7 +82,10 @@ mod kept {
     /// The lines from `serial` on that are still kept, oldest first.
     pub fn since(serial: u64) -> Vec<Line> {
         let kept = KEPT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let skip = kept.lines.front().map_or(0, |first| serial.saturating_sub(first.serial) as usize);
+        let skip = kept
+            .lines
+            .front()
+            .map_or(0, |first| usize::try_from(serial.saturating_sub(first.serial)).unwrap_or(usize::MAX));
         kept.lines.iter().skip(skip).cloned().collect()
     }
 

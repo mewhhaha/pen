@@ -1,13 +1,16 @@
 /// pen's Wasm plugins: components a checkout chooses (its `pen.json`) to do
 /// what is specific to its language or toolchain, so that pen itself only
 /// runs Wasm. A compiler plugin turns a program's sources into a Wasm module,
-/// again and again as they change; an assets plugin makes the virtual modules
-/// a program imports its assets through.
+/// again and again as they change, and says how the checkout's tests build
+/// and what each must do.
 ///
 /// A plugin has no ambient access to the machine. WASI gives it clocks,
-/// randomness and stdout and stderr (which reach pen's log); pen's own
+/// randomness and stdout and stderr (whose lines reach pen's log); pen's own
 /// interfaces below give it what the checkout granted it, and nothing more.
-package pen:plugin@0.1.0;
+/// Each call into a plugin has a deadline (pen.json's `timeout`): past it,
+/// a wait on a program it runs ends as a timeout, and soon after the call
+/// traps.
+package pen:plugin@0.2.0;
 
 /// What plugins and pen exchange.
 interface types {
@@ -72,7 +75,8 @@ interface process {
     variant read-error {
         /// The program closed its output.
         closed,
-        /// Nothing came within the time asked for.
+        /// Nothing came within the time asked for, or before the call's
+        /// deadline.
         timeout,
         other(string),
     }
@@ -82,13 +86,15 @@ interface process {
         write: func(bytes: list<u8>) -> result<_, string>;
         /// Closes its standard input.
         close-input: func();
-        /// Waits for its standard output, up to `timeout-ms` (forever when
-        /// none), and returns what came: at least one byte, at most `max`.
+        /// Waits for its standard output, up to `timeout-ms` (until the
+        /// call's deadline when none), and returns what came: at least one
+        /// byte, at most `max`.
         read: func(max: u32, timeout-ms: option<u32>) -> result<list<u8>, read-error>;
         /// The last 64 KiB of its standard error, as text.
         error-tail: func() -> string;
-        /// Waits up to `timeout-ms` for it to exit; its exit code, or none
-        /// while it still runs (or when a signal stopped it).
+        /// Waits up to `timeout-ms` (until the call's deadline when none)
+        /// for it to exit; its exit code, or none while it still runs (or
+        /// when a signal stopped it).
         wait: func(timeout-ms: option<u32>) -> option<s32>;
         kill: func();
     }
@@ -98,7 +104,8 @@ interface process {
     spawn: func(name: string, args: list<string>, env: list<tuple<string, string>>) -> result<child, string>;
 
     /// A directory of pen's cache that is this plugin's own (it exists), for
-    /// the programs it runs to keep their caches in.
+    /// the programs it runs to keep their caches in. pen removes its files
+    /// that have not changed in weeks, and the oldest when it grows large.
     cache-directory: func() -> string;
 }
 
@@ -130,43 +137,55 @@ interface compiler {
     }
 }
 
-/// The virtual modules a program imports its assets through (its catalog,
-/// words, shaders...), made from the checkout's files. pen asks before each
-/// build and passes them to the compiler as overlays.
-interface assets {
+/// A checkout's tests, as its language lays them out: which files are test
+/// modules, how each builds, and what each of its tests must do. pen builds
+/// each module in a compiler session for its entry (one per worker, kept
+/// from module to module) and runs its tests as Wasm.
+interface tests {
     use types.{overlay, program};
 
-    record generated {
-        /// Each module, at the absolute path the program imports it from.
-        modules: list<overlay>,
-        /// The files (absolute) they were made from, and directories whose
-        /// new or removed files would change them: a change to one makes
-        /// pen ask again.
-        dependencies: list<string>,
+    /// What a module's tests must do.
+    variant expectation {
+        /// Each test returns a report of its checks (an Array F32), and
+        /// passes when none failed. Its lanes: the checks made, the
+        /// failures, then for each failure its check's place (from 1), its
+        /// expected lanes' count and lanes, and its actual lanes' count and
+        /// lanes.
+        checks,
+        /// Each test traps at Wasm `unreachable`, as the language's panic
+        /// stops a program. Returning, or any other trap, fails it.
+        traps,
+        /// The module does not build, and its diagnostics contain this text.
+        /// It is one test, named by the text.
+        rejected(string),
     }
 
-    record generation-error {
-        message: string,
-        /// Inputs read before failure, including missing inputs whose
-        /// creation should retry generation.
-        dependencies: list<string>,
+    record test-module {
+        /// Its file (absolute).
+        path: string,
+        /// The program entry (absolute) it builds as.
+        entry: string,
+        /// What its build lays over the files on disk: the module itself,
+        /// standing in at `entry`, say.
+        overlays: list<overlay>,
+        /// Its tests: the exports whose names start with this that take
+        /// Unit and return an Array F32 (the Blot guest ABI's types).
+        prefix: string,
+        expect: expectation,
     }
 
-    /// The modules for `program`, or why they cannot be made.
-    generate: func(program: program) -> result<generated, generation-error>;
+    /// The test modules to run, in order: those at `paths` (absolute), or
+    /// all of the checkout's when none, less those none of whose tests can
+    /// have a name holding `filter`. `program` is the checkout's main
+    /// program: its root, its entry and the compiler's settings.
+    find: func(program: program, paths: list<string>, filter: option<string>) -> result<list<test-module>, string>;
 }
 
-/// A plugin that compiles programs.
+/// A plugin that compiles programs and lays out their tests.
 world compiler-plugin {
     import log;
     import files;
     import process;
     export compiler;
-}
-
-/// A plugin that makes asset modules.
-world assets-plugin {
-    import log;
-    import files;
-    export assets;
+    export tests;
 }

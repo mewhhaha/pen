@@ -1,5 +1,4 @@
-//! Scripted input, in the steps gdev's browser tooling takes
-//! (`scripts/page.ts`): `wait=N` frames, `key=KEY` taps a key, `down=KEY` /
+//! Scripted input, a step at a time: `wait=N` frames, `key=KEY` taps a key, `down=KEY` /
 //! `up=KEY` hold and release it, `type=TEXT`, `move=X,Y`, `click=X,Y`,
 //! `press=BUTTON` / `release=BUTTON` (left, middle or right),
 //! `drag=X,Y,X,Y`, `wheel=DELTA[,X,Y]`, `shot=NAME` (a PNG in the shots
@@ -12,11 +11,11 @@
 //! It reaches the game as a `UiAction` event, as the window's adapter sends it.
 //!
 //! `tune=NAME=VALUE` sets a live-tunable constant (the checkout's
-//! `src/tunables.json`, `overlay::tunable_id`), as the overlay's Tunables
-//! panel and `/tune` do: a Tune event, in the frame it runs in.
+//! `src/tunables.json`, `tunables::tunable_id`), as the dev tools' `/tune`
+//! does: a Tune event, in the frame it runs in.
 //!
 //! `console=CODE[,ARGUMENT]` sends the game a console command by its number
-//! (the checkout's `commands.ts`), as the console's `/command N [ARG]` does:
+//! (the checkout's `src/commands.blot`), as the console's `/command N [ARG]` does:
 //! `console=3,10` hires ten gnorps in gdev.
 //!
 //! Time travel has steps too: `pause` and `resume` the game, `step[=N]`
@@ -27,9 +26,9 @@
 //! `wait` counts presented frames, a `shot` captures the paused frame), and
 //! input waits for the next frame that runs.
 //!
-//! Coordinates are page pixels of a page 960 wide, as the browser tooling's
-//! 960 x 640 page has them; they scale with the viewport's width, so a
-//! 1920 x 1280 viewport sees them at twice the size.
+//! Coordinates are pixels of a page 960 wide (960 x 640, the window's size
+//! when it opens); they scale with the viewport's width, so a 1920 x 1280
+//! viewport sees them at twice the size.
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -61,7 +60,11 @@ pub enum Step {
     Quit,
     Travel(Travel),
     /// An action on an interface node: its id, the action's code and a value.
-    Ui { node: u32, action: u32, value: f32 },
+    Ui {
+        node: u32,
+        action: u32,
+        value: f32,
+    },
     /// A tunable, by name, and its new value.
     Tune(String, f32),
     /// A console command's number and argument.
@@ -127,10 +130,10 @@ fn ui_step(text: &str) -> Result<Step> {
         None => target.parse(),
     }
     .ok()
-    .filter(|node| (1..=MAX_UI_ID as u32).contains(node))
+    .filter(|&node| (1..=MAX_UI_ID).contains(&(node as usize)))
     .with_context(|| format!("ui takes a node id from 1 to {MAX_UI_ID} (or 0x hex), not {target}"))?;
     let action = match ui_action::NAMES.iter().position(|name| name == action) {
-        Some(code) => code as u32,
+        Some(code) => u32::try_from(code)?,
         None => action.parse().ok().filter(|code| (*code as usize) < ui_action::NAMES.len()).with_context(|| {
             format!("ui takes an action ({} or its number), not {action}", ui_action::NAMES.join(", "))
         })?,
@@ -207,16 +210,13 @@ pub fn parse(arguments: &[String]) -> Result<Vec<Step>> {
             } else {
                 value.parse().with_context(|| format!("step takes frames, not {value}"))?
             })),
-            "rewind" => {
-                Step::Travel(Travel::Rewind(value.parse().with_context(|| format!("rewind takes frames, not {value}"))?))
-            }
+            "rewind" => Step::Travel(Travel::Rewind(
+                value.parse().with_context(|| format!("rewind takes frames, not {value}"))?,
+            )),
             "replay" => {
                 let seconds: f64 = value.parse().with_context(|| format!("replay takes seconds, not {value}"))?;
                 ensure!(seconds > 0.0, "replay takes a positive number of seconds");
                 Step::Travel(Travel::Replay(seconds))
-            }
-            "view" | "over" | "reload" | "storage" => {
-                return Err(anyhow!("{name}= needs the browser tooling (`just drive`)"));
             }
             _ => return Err(anyhow!("unknown script step {word}")),
         });
@@ -345,7 +345,7 @@ impl Script {
             Step::Quit => tick.quit = true,
             Step::Ui { node, action, value } => tick.events.push(GameEvent::UiAction { node, action, value }),
             Step::Tune(name, value) => {
-                tick.events.push(GameEvent::Tune { index: crate::overlay::tunable_id(&name), value });
+                tick.events.push(GameEvent::Tune { index: crate::tunables::tunable_id(&name), value });
             }
             Step::Console(command, argument) => tick.events.push(GameEvent::Console { command, argument }),
             Step::Overlay(line) => tick.overlay.push(line),
@@ -378,10 +378,7 @@ mod tests {
         assert!(frames[2].events.is_empty());
         assert_eq!(
             frames[3].events,
-            [
-                GameEvent::PointerMove { x: 960.0, y: 640.0 },
-                GameEvent::PointerDown { button: 0, x: 960.0, y: 640.0 }
-            ]
+            [GameEvent::PointerMove { x: 960.0, y: 640.0 }, GameEvent::PointerDown { button: 0, x: 960.0, y: 640.0 }]
         );
         assert_eq!(frames[4].events, [GameEvent::PointerUp { button: 0, x: 960.0, y: 640.0 }]);
         assert_eq!(frames[4].shots, ["start"]);
@@ -452,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_browser_only_steps() {
+    fn rejects_unknown_steps() {
         assert!(parse(&["view=0,0,4,0,0.6,24".into()]).is_err());
         assert!(parse(&["press=sideways".into()]).is_err());
         assert_eq!(parse(&["key=KeyA key=Space".into()]).unwrap(), [Step::Key("a".into()), Step::Key(" ".into())]);

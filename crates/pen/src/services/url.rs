@@ -6,16 +6,12 @@ use std::process::{Command, Stdio};
 
 use pen_protocol::{service, url_op};
 
+use pen_runtime::services::openable;
+
 use super::{Answer, Request, Service};
+use crate::input::Input;
 
 pub struct Url;
-
-/// Whether `address` is a web address the browser may be given.
-pub fn openable(address: &str) -> bool {
-    (address.starts_with("https://") || address.starts_with("http://"))
-        && address.len() <= 2048
-        && address.chars().all(|char| !char.is_whitespace() && !char.is_control() && char != '"')
-}
 
 fn command(address: &str) -> Command {
     #[cfg(windows)]
@@ -38,7 +34,7 @@ fn command(address: &str) -> Command {
     }
 }
 
-impl Service for Url {
+impl Service<Input> for Url {
     fn code(&self) -> u32 {
         service::URL
     }
@@ -63,20 +59,5 @@ impl Service for Url {
                 Answer::unavailable()
             }
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_web_addresses_open() {
-        assert!(openable("https://example.com/gdev?from=game"));
-        assert!(openable("http://localhost:8000/?fresh"));
-        assert!(!openable("file:///etc/passwd"));
-        assert!(!openable("https://example.com/a b"));
-        assert!(!openable("javascript:alert(1)"));
-        assert!(!openable("https://example.com/\"&calc"));
     }
 }

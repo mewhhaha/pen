@@ -176,11 +176,15 @@ fn native_assets(value: Option<&Value>, root: &str) -> Result<Option<Value>, Str
         let text = path.as_str().ok_or("nativeAssets root must be a path")?;
         *path = Value::String(resolve(root, checked_path(text, "nativeAssets.roots")?));
     }
-    let imports = assets.get_mut("imports").and_then(Value::as_array_mut).ok_or("nativeAssets.imports must be an array")?;
+    let imports =
+        assets.get_mut("imports").and_then(Value::as_array_mut).ok_or("nativeAssets.imports must be an array")?;
     for import in imports {
         let fields = import.as_object_mut().ok_or("nativeAssets import must be an object")?;
         for field in ["module", "path"] {
-            let path = fields.get(field).and_then(Value::as_str).ok_or_else(|| format!("nativeAssets import needs {field}"))?;
+            let path = fields
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("nativeAssets import needs {field}"))?;
             let path = resolve(root, checked_path(path, field)?);
             fields.insert(field.into(), Value::String(path));
         }

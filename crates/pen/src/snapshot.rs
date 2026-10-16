@@ -1,5 +1,6 @@
-//! Saves on disk: "GDEVSAVE", version 1, schema and length (u32s), then the
-//! state's float32 lanes, all little-endian (gdev's `snapshot.ts`).
+//! Saves on disk, in `pen_runtime::snapshot`'s format (which the browser
+//! host keeps in IndexedDB too): "GDEVSAVE", version 1, schema and length
+//! (u32s), then the state's float32 lanes, all little-endian.
 use std::path::Path;
 
 use anyhow::{Context, Result};

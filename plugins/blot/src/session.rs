@@ -264,7 +264,8 @@ impl<C: Child> Session<C> {
             }
             let mut wasm = reply.payload;
             if self.native_assets {
-                let length = metadata.get("wasmBytes").and_then(Value::as_u64).ok_or("native build has no wasmBytes")?;
+                let length =
+                    metadata.get("wasmBytes").and_then(Value::as_u64).ok_or("native build has no wasmBytes")?;
                 let length = usize::try_from(length).map_err(|_| "native wasmBytes is too large")?;
                 let assets = metadata.get("assets").and_then(Value::as_array).ok_or("native build has no assets")?;
                 // pen's frame protocol names external game assets by catalog
@@ -272,7 +273,9 @@ impl<C: Child> Session<C> {
                 if !assets.is_empty() || length != wasm.len() {
                     return Err("this game's ABI does not accept native content-handle resources".into());
                 }
-                let dependencies = metadata.get("assetDependencies").and_then(Value::as_array)
+                let dependencies = metadata
+                    .get("assetDependencies")
+                    .and_then(Value::as_array)
                     .ok_or("native build has no assetDependencies")?;
                 for dependency in dependencies {
                     let path = dependency.get("path").and_then(Value::as_str).ok_or("asset dependency has no path")?;

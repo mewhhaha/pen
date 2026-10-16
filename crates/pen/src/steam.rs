@@ -57,9 +57,8 @@ enum Step {
 
 fn parse_steps(text: &str) -> Result<Vec<Step>> {
     let named = |value: Option<&str>, word: &str| -> Result<(String, String)> {
-        let (name, number) = value
-            .and_then(|value| value.split_once('='))
-            .with_context(|| format!("{word} takes NAME=VALUE"))?;
+        let (name, number) =
+            value.and_then(|value| value.split_once('=')).with_context(|| format!("{word} takes NAME=VALUE"))?;
         Ok((name.to_owned(), number.to_owned()))
     };
     text.split([' ', ',', '\n'])

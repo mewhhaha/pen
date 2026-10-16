@@ -1,23 +1,34 @@
 //! What a plugin may reach: the imports of `wit/pen-plugin.wit` (`log`,
 //! `files`, `process`) and WASI's clocks, randomness and output, under the
-//! grants its checkout's `pen.json` gives it.
+//! grants its checkout's `pen.json` gives it, within its store's limits and
+//! its calls' deadlines.
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Resource, ResourceTable};
+use wasmtime::{StoreLimits, StoreLimitsBuilder};
+use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
+use wasmtime_wasi::p2::{OutputStream, Pollable, StreamResult};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::bindings::pen::plugin::{files, log, process, types};
 
-/// How much of a child's standard error is kept.
+/// How much of a child's standard error is kept, and the longest line of a
+/// plugin's own output.
 const ERROR_TAIL: usize = 64 * 1024;
+/// The most memory a plugin instance may have, and the most elements a
+/// table of its may.
+const MEMORY: usize = 1 << 30;
+const TABLE_ELEMENTS: usize = 1 << 20;
 
 /// Where a plugin's log lines go.
 pub type Logger = Arc<dyn Fn(Level, &str) + Send + Sync>;
@@ -60,13 +71,122 @@ pub struct State {
     table: ResourceTable,
     grants: Arc<Grants>,
     log: Logger,
+    pub limits: StoreLimits,
+    /// When the call into the plugin under way must end: the host's waits
+    /// end there, and the plugin's code traps `GRACE` later.
+    pub deadline: Option<Instant>,
 }
 
 impl State {
     pub fn new(grants: Arc<Grants>, log: Logger) -> State {
-        // Its output reaches pen's; no files, environment or network.
-        let wasi = WasiCtxBuilder::new().inherit_stdout().inherit_stderr().build();
-        State { wasi, table: ResourceTable::new(), grants, log }
+        // Its output's lines reach pen's log; no files, environment or
+        // network.
+        let wasi = WasiCtxBuilder::new()
+            .stdout(LogOutput::new(log.clone(), Level::Info))
+            .stderr(LogOutput::new(log.clone(), Level::Error))
+            .build();
+        let limits = StoreLimitsBuilder::new().memory_size(MEMORY).table_elements(TABLE_ELEMENTS).build();
+        State { wasi, table: ResourceTable::new(), grants, log, limits, deadline: None }
+    }
+
+    /// How long a wait of up to `timeout_ms` (none: no end) may last: until
+    /// the call's deadline at most, and once past it, until half its grace
+    /// is up (a plugin winding up waits for what it stopped). None when
+    /// nothing ends it.
+    fn bounded(&self, timeout_ms: Option<u32>) -> Option<Duration> {
+        let asked = timeout_ms.map(|milliseconds| Duration::from_millis(milliseconds.into()));
+        let now = Instant::now();
+        let end = match self.deadline {
+            None => return asked,
+            Some(deadline) if now < deadline => deadline,
+            Some(deadline) => deadline + crate::GRACE / 2,
+        };
+        let left = end.saturating_duration_since(now);
+        Some(asked.map_or(left, |asked| asked.min(left)))
+    }
+}
+
+/// A plugin's standard output or error: each line it writes reaches pen's
+/// log at `level`.
+#[derive(Clone)]
+struct LogOutput {
+    log: Logger,
+    level: Level,
+    /// What was written after the last line's end.
+    partial: Arc<Mutex<Vec<u8>>>,
+}
+
+impl LogOutput {
+    fn new(log: Logger, level: Level) -> LogOutput {
+        LogOutput { log, level, partial: Arc::default() }
+    }
+
+    /// Takes `bytes`, logging each line they end; a line longer than
+    /// [`ERROR_TAIL`] is logged in parts.
+    fn take(&self, bytes: &[u8]) {
+        let mut partial = self.partial.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        partial.extend_from_slice(bytes);
+        loop {
+            let end = match partial.iter().position(|byte| *byte == b'\n') {
+                Some(end) => end + 1,
+                None if partial.len() >= ERROR_TAIL => ERROR_TAIL,
+                None => return,
+            };
+            let line: Vec<u8> = partial.drain(..end).collect();
+            let line = String::from_utf8_lossy(&line);
+            (self.log)(self.level, line.trim_end_matches(['\n', '\r']));
+        }
+    }
+}
+
+impl IsTerminal for LogOutput {
+    fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+impl StdoutStream for LogOutput {
+    fn p2_stream(&self) -> Box<dyn OutputStream> {
+        Box::new(self.clone())
+    }
+
+    fn async_stream(&self) -> Box<dyn tokio::io::AsyncWrite + Send + Sync> {
+        Box::new(self.clone())
+    }
+}
+
+#[wasmtime_wasi::async_trait]
+impl Pollable for LogOutput {
+    async fn ready(&mut self) {}
+}
+
+impl OutputStream for LogOutput {
+    fn write(&mut self, bytes: bytes::Bytes) -> StreamResult<()> {
+        self.take(&bytes);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> StreamResult<()> {
+        Ok(())
+    }
+
+    fn check_write(&mut self) -> StreamResult<usize> {
+        Ok(ERROR_TAIL)
+    }
+}
+
+impl tokio::io::AsyncWrite for LogOutput {
+    fn poll_write(self: Pin<&mut Self>, _: &mut TaskContext<'_>, bytes: &[u8]) -> Poll<std::io::Result<usize>> {
+        self.take(bytes);
+        Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -209,6 +329,7 @@ fn runnable(program: &Path) -> Result<PathBuf> {
     let directory = crate::cache_root().join("programs").join(&digest[..16]);
     let unpacked = directory.join(name);
     if unpacked.is_file() {
+        crate::cache::used(&unpacked);
         return Ok(unpacked);
     }
     std::fs::create_dir_all(&directory)?;
@@ -268,10 +389,11 @@ impl process::HostChild for State {
         max: u32,
         timeout_ms: Option<u32>,
     ) -> std::result::Result<Vec<u8>, process::ReadError> {
+        let timeout = self.bounded(timeout_ms);
         let child = self.table.get_mut(&child).map_err(|error| process::ReadError::Other(error.to_string()))?;
         if child.pending.is_empty() {
-            child.pending = match timeout_ms {
-                Some(milliseconds) => match child.output.recv_timeout(Duration::from_millis(milliseconds.into())) {
+            child.pending = match timeout {
+                Some(timeout) => match child.output.recv_timeout(timeout) {
                     Ok(chunk) => chunk,
                     Err(RecvTimeoutError::Timeout) => return Err(process::ReadError::Timeout),
                     Err(RecvTimeoutError::Disconnected) => return Err(process::ReadError::Closed),
@@ -290,8 +412,8 @@ impl process::HostChild for State {
     }
 
     fn wait(&mut self, child: Resource<ChildProcess>, timeout_ms: Option<u32>) -> Option<i32> {
+        let deadline = self.bounded(timeout_ms).map(|timeout| Instant::now() + timeout);
         let child = self.table.get_mut(&child).ok()?;
-        let deadline = timeout_ms.map(|milliseconds| Instant::now() + Duration::from_millis(milliseconds.into()));
         loop {
             match child.child.try_wait() {
                 Ok(Some(status)) => {
@@ -337,4 +459,43 @@ pub fn grants(root: &Path, read: &[String], run: &HashMap<String, String>, cache
     let mut roots = vec![root.to_owned()];
     roots.extend(read.iter().map(|path| resolve(root, path)));
     Ok(Grants { root: root.to_owned(), read: roots, run: programs, cache })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logs_a_plugins_output_by_the_line() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let said = lines.clone();
+        let log: Logger = Arc::new(move |level, line| said.lock().unwrap().push(format!("{level:?} {line}")));
+        let mut output = LogOutput::new(log, Level::Error);
+        output.write(bytes::Bytes::from_static(b"panicked at src/lib.rs:1:\nbad")).unwrap();
+        output.write(bytes::Bytes::from_static(b" input\r\n\n")).unwrap();
+        assert_eq!(*lines.lock().unwrap(), ["Error panicked at src/lib.rs:1:", "Error bad input", "Error "]);
+        // A line without an end is cut where the tail is.
+        output.take(&vec![b'x'; ERROR_TAIL + 1]);
+        assert_eq!(lines.lock().unwrap().len(), 4);
+        assert_eq!(output.partial.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn bounds_waits_by_the_calls_deadline() {
+        let grants = Grants { root: PathBuf::new(), read: Vec::new(), run: HashMap::new(), cache: PathBuf::new() };
+        let mut state = State::new(Arc::new(grants), Arc::new(|_, _| {}));
+        assert_eq!(state.bounded(None), None);
+        assert_eq!(state.bounded(Some(20)), Some(Duration::from_millis(20)));
+        state.deadline = Some(Instant::now() + Duration::from_secs(5));
+        assert!(state.bounded(None).is_some_and(|left| left <= Duration::from_secs(5)));
+        assert_eq!(state.bounded(Some(20)), Some(Duration::from_millis(20)));
+        assert!(state.bounded(Some(u32::MAX)).is_some_and(|left| left <= Duration::from_secs(5)));
+        // Past the deadline, a plugin winding up still waits briefly, well
+        // before its code traps.
+        state.deadline = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(state.bounded(Some(20)), Some(Duration::from_millis(20)));
+        for timeout in [None, Some(u32::MAX)] {
+            assert!(state.bounded(timeout).is_some_and(|left| left < crate::GRACE / 2), "{timeout:?}");
+        }
+    }
 }

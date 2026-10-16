@@ -2,6 +2,7 @@
 use pen_protocol::Solid;
 
 use crate::asset_store::MESH_VERTEX_FLOATS;
+use crate::matrix::narrow;
 
 type Point = [f64; 3];
 
@@ -56,7 +57,11 @@ fn solid_polygons(solid: &Solid) -> Vec<Polygon> {
         .iter()
         .map(|face| {
             let normal = [f64::from(face.normal.x), f64::from(face.normal.y), f64::from(face.normal.z)];
-            Plane { normal: normalize(normal), distance: f64::from(face.distance) / length(normal), material: face.material }
+            Plane {
+                normal: normalize(normal),
+                distance: f64::from(face.distance) / length(normal),
+                material: face.material,
+            }
         })
         .collect();
     let inside = |point: Point| planes.iter().all(|plane| dot(plane.normal, point) <= plane.distance + EPSILON);
@@ -90,7 +95,8 @@ fn solid_polygons(solid: &Solid) -> Vec<Polygon> {
             continue;
         }
         let center = scale(points.iter().copied().fold([0.0; 3], add), 1.0 / points.len() as f64);
-        let u = normalize(cross(plane.normal, if plane.normal[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] }));
+        let u =
+            normalize(cross(plane.normal, if plane.normal[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] }));
         let v = cross(plane.normal, u);
         let angle = |point: Point| {
             let offset = subtract(point, center);
@@ -133,9 +139,20 @@ pub(crate) fn mesh_solids(solids: &[Solid]) -> Vec<SolidBatch> {
             for index in 0..rest.len().saturating_sub(1) {
                 for point in [first, rest[index], rest[index + 1]] {
                     let [u, v] = uv(point, polygon.normal);
-                    let vertex = [point[0], point[1], point[2], polygon.normal[0], polygon.normal[1], polygon.normal[2], u, v, 0.0, 0.0];
+                    let vertex = [
+                        point[0],
+                        point[1],
+                        point[2],
+                        polygon.normal[0],
+                        polygon.normal[1],
+                        polygon.normal[2],
+                        u,
+                        v,
+                        0.0,
+                        0.0,
+                    ];
                     debug_assert_eq!(vertex.len(), MESH_VERTEX_FLOATS);
-                    vertices.extend(vertex.map(|value| value as f32));
+                    vertices.extend(vertex.map(narrow));
                 }
             }
         }

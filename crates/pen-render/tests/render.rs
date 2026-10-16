@@ -13,7 +13,6 @@ use common::*;
 use pen_protocol::*;
 use pen_render::{Renderer, RendererOptions};
 
-
 // Draws its triangle in its material's color, wherever the draw puts it.
 const SHADER: &str = r#"
 struct Scene { view: mat4x4f, projection: mat4x4f };
@@ -41,7 +40,7 @@ fn packed_texture() -> Vec<u8> {
     for level in (0..10).rev() {
         let size = 512usize >> level;
         let packed = deflate(&vec![200; size * size * 4]);
-        bytes.extend((packed.len() as u32).to_le_bytes());
+        bytes.extend(u32::try_from(packed.len()).unwrap().to_le_bytes());
         bytes.extend(packed);
     }
     bytes
@@ -77,9 +76,6 @@ fn assets() -> PathBuf {
     root
 }
 
-
-
-
 #[test]
 fn draws_what_loads_and_reports_what_fails() {
     let Some((device, queue)) = device() else {
@@ -88,9 +84,12 @@ fn draws_what_loads_and_reports_what_fails() {
     };
     let root = assets();
     let catalog = boundary::read_catalog(&root).unwrap();
-    let mut renderer =
-        Renderer::new(device.clone(), queue.clone(), RendererOptions { format: FORMAT, assets: root, veil: Some(0.1) })
-            .unwrap();
+    let mut renderer = Renderer::new(
+        device.clone(),
+        queue.clone(),
+        RendererOptions { format: FORMAT, assets: root, veil: Some(0.1), pipeline_cache: None },
+    )
+    .unwrap();
     renderer.preload(&catalog);
     let mut target = Offscreen::new(&device, 64);
     let draw = |mesh: u32, material: u32, x: f32| {
@@ -163,4 +162,87 @@ fn rejects_invalid_frames() {
     bad.blur = 0.75;
     assert!(pen_render::validate_frame(&bad).is_err());
     assert!(pen_render::validate_frame(&frame(Vec::new())).is_ok());
+}
+
+// A sprite in its color, wherever it is on the screen.
+const SPRITE: &str = r#"
+@group(0) @binding(0) var<uniform> screen: vec4f;
+struct Sprite { rect: vec4f, uv: vec4f, color: vec4f, parameters: vec4f };
+@group(0) @binding(1) var<storage, read> sprites: array<Sprite>;
+struct Corner { @builtin(position) position: vec4f, @location(0) color: vec4f };
+@vertex fn vertex(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: u32) -> Corner {
+  let corner = array<vec2f, 6>(vec2f(0.0, 0.0), vec2f(1.0, 0.0), vec2f(0.0, 1.0), vec2f(0.0, 1.0), vec2f(1.0, 0.0), vec2f(1.0, 1.0))[vertex];
+  let sprite = sprites[index];
+  let pixel = sprite.rect.xy + corner * sprite.rect.zw;
+  return Corner(vec4f(pixel.x / screen.x * 2.0 - 1.0, 1.0 - pixel.y / screen.y * 2.0, 0.0, 1.0), sprite.color);
+}
+@fragment fn fragment(corner: Corner) -> @location(0) vec4f { return corner.color; }
+"#;
+
+#[test]
+fn shared_renderers_load_their_own_assets() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let game = Renderer::new(
+        device.clone(),
+        queue.clone(),
+        RendererOptions { format: FORMAT, assets: assets(), veil: None, pipeline_cache: None },
+    )
+    .unwrap();
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pen-render-shared-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("sprite.wgsl"), SPRITE).unwrap();
+    std::fs::write(root.join("dot.material.json"), br#"{"shader":"sprite.wgsl","color":[1,1,1,1],"lighting":"unlit"}"#)
+        .unwrap();
+    let mut tools = game.share(root).unwrap();
+    let catalog = Catalog { materials: vec!["dot.material.json".into()], ..Default::default() };
+    let sprite = Sprite {
+        x: 16.0,
+        y: 16.0,
+        width: 32.0,
+        height: 32.0,
+        u0: 0.0,
+        v0: 0.0,
+        u1: 1.0,
+        v1: 1.0,
+        color: [1.0, 0.0, 0.0, 1.0],
+        material: 0,
+        parameters: [0.0; 4],
+    };
+    let target = Offscreen::new(&device, 64);
+    let view = target.0.create_view(&Default::default());
+    let started = Instant::now();
+    while !tools.prepare_sprites(&[sprite], &catalog).unwrap() {
+        assert!(started.elapsed() < Duration::from_secs(20), "the sprite's assets load");
+        tools.wait(Duration::from_millis(100));
+    }
+    let ready = |events: Vec<GameEvent>| -> Vec<(String, u64)> {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                GameEvent::AssetReady { key, revision, .. } => Some((key, revision)),
+                _ => None,
+            })
+            .collect()
+    };
+    let loaded = ready(tools.take_events());
+    for key in ["dot.material.json", "sprite.wgsl"] {
+        assert!(loaded.contains(&(key.to_owned(), 1)), "{key}: {loaded:?}");
+    }
+    let mut game = game;
+    assert!(game.take_events().is_empty(), "the game's renderer hears none of its events");
+    // It outlives the renderer whose loader threads it shares.
+    drop(game);
+    tools.reload(&["dot.material.json".to_owned()]);
+    let started = Instant::now();
+    while !ready(tools.take_events()).contains(&("dot.material.json".to_owned(), 2)) {
+        assert!(started.elapsed() < Duration::from_secs(20), "the material loads again");
+        tools.wait(Duration::from_millis(100));
+        tools.prepare_sprites(&[sprite], &catalog).unwrap();
+    }
+    tools.overlay(&[sprite], &catalog, &view, (64, 64)).unwrap();
+    let [r, g, b, _] = middle(&device, &queue, &target.0);
+    assert!(r > 250 && g < 5 && b < 5, "middle pixel {r} {g} {b}");
 }

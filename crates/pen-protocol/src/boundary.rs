@@ -1,16 +1,22 @@
-//! The packets crossing between host and game, as gdev's `boundary.ts` lays
-//! them out: frames in, render packets out. Their layout, the frame encoder
-//! and the render packet decoder are generated from gdev's protocol/schema.json
-//! into packets.rs (`just sync-protocol`); this adds reading the asset catalog.
+//! The packets crossing between host and game: frames in, render packets
+//! out. Their layout, the frame encoder and the render packet decoder are
+//! generated from protocol/schema.json into packets.rs (`just
+//! sync-protocol`); this adds reading the asset catalog, and the numbers
+//! in a packet's lanes.
 use anyhow::{Context, Result, anyhow};
 
 pub use crate::packets::codec::*;
 use crate::protocol::*;
 
+/// The whole number a lane holds (an id, count, index or code point), or
+/// None for a fraction, a negative, a non-finite value or one past u32.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "checked whole and in range")]
+pub fn whole(lane: f32) -> Option<u32> {
+    (lane.fract() == 0.0 && (0.0..4_294_967_296.0).contains(&lane)).then_some(lane as u32)
+}
+
 pub fn parse_catalog(value: &serde_json::Value) -> Result<Catalog> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow!("asset catalog must be an object"))?;
+    let object = value.as_object().ok_or_else(|| anyhow!("asset catalog must be an object"))?;
     let paths = |kind: &str, empty: bool| -> Result<Vec<String>> {
         let entries = object.get(kind).and_then(|entries| entries.as_array());
         let invalid = || anyhow!("asset catalog {kind} must contain relative paths");
@@ -22,10 +28,7 @@ pub fn parse_catalog(value: &serde_json::Value) -> Result<Catalog> {
             .iter()
             .map(|entry| {
                 let path = entry.as_str().ok_or_else(invalid)?;
-                if path.is_empty()
-                    || path.starts_with('/')
-                    || path.split(['/', '\\']).any(|part| part == "..")
-                {
+                if path.is_empty() || path.starts_with('/') || path.split(['/', '\\']).any(|part| part == "..") {
                     return Err(invalid());
                 }
                 Ok(path.to_owned())
@@ -66,11 +69,31 @@ mod tests {
         assert_eq!(
             packet,
             [
-                0.5, 640.0, 480.0, 4.0, 1.0, //
-                1.0, 65.0, 0.0, 0.0, 0.0, //
-                2.0, 0x110100 as f32, 0.0, 0.0, 0.0, //
-                3.0, 2.0, 3.0, 4.0, 0.0, //
-                6.0, 0.0, 1.0, 2.0, -100.0, //
+                0.5,
+                640.0,
+                480.0,
+                4.0,
+                1.0, //
+                1.0,
+                65.0,
+                0.0,
+                0.0,
+                0.0, //
+                2.0,
+                0x110100 as f32,
+                0.0,
+                0.0,
+                0.0, //
+                3.0,
+                2.0,
+                3.0,
+                4.0,
+                0.0, //
+                6.0,
+                0.0,
+                1.0,
+                2.0,
+                -100.0, //
                 7.0,
             ]
         );
@@ -98,6 +121,16 @@ mod tests {
     }
 
     #[test]
+    fn lanes_hold_whole_numbers() {
+        assert_eq!(
+            [0.0, 7.0, 16_777_216.0, 4_294_967_040.0].map(whole),
+            [Some(0), Some(7), Some(16_777_216), Some(4_294_967_040)]
+        );
+        let not = [-1.0, 0.5, 4_294_967_296.0, 1e30, f32::INFINITY, f32::NAN];
+        assert!(not.into_iter().all(|lane| whole(lane).is_none()));
+    }
+
+    #[test]
     fn rejects_truncated_packets() {
         let catalog = Catalog { meshes: vec!["m".into()], materials: vec!["x".into()], sounds: vec![] };
         let mut packet = vec![0.0; PACKET_HEADER_FLOATS];
@@ -119,16 +152,29 @@ mod tests {
         packet.extend((0..PREFERENCE_FLOATS).map(|lane| lane as f32));
         // Material 1's 4 x 3 field, its 2 x 2 patch at column 1, row 1; then
         // an empty patch of material 0's 8 x 8 field.
-        let patches = [vec![1.0, 4.0, 3.0, 1.0, 1.0, 2.0, 2.0, 0.5, 1.5, 2.5, 3.5], vec![0.0, 8.0, 8.0, 8.0, 0.0, 0.0, 8.0]];
+        let patches =
+            [vec![1.0, 4.0, 3.0, 1.0, 1.0, 2.0, 2.0, 0.5, 1.5, 2.5, 3.5], vec![0.0, 8.0, 8.0, 8.0, 0.0, 0.0, 8.0]];
         packet[lanes::header::FIELD_COUNT] = 2.0;
         packet[lanes::header::FIELD_LANES] = patches.iter().map(Vec::len).sum::<usize>() as f32;
         packet.extend(patches.concat());
         let decoded = decode_frame(&packet, 3, &catalog).unwrap();
-        assert_eq!(decoded.render.preferences.as_deref(), Some(&packet[PACKET_HEADER_FLOATS..PACKET_HEADER_FLOATS + PREFERENCE_FLOATS]));
+        assert_eq!(
+            decoded.render.preferences.as_deref(),
+            Some(&packet[PACKET_HEADER_FLOATS..PACKET_HEADER_FLOATS + PREFERENCE_FLOATS])
+        );
         assert_eq!(
             decoded.render.fields,
             [
-                FieldPatch { material: 1, width: 4, height: 3, x: 1, z: 1, columns: 2, rows: 2, values: vec![0.5, 1.5, 2.5, 3.5] },
+                FieldPatch {
+                    material: 1,
+                    width: 4,
+                    height: 3,
+                    x: 1,
+                    z: 1,
+                    columns: 2,
+                    rows: 2,
+                    values: vec![0.5, 1.5, 2.5, 3.5]
+                },
                 FieldPatch { material: 0, width: 8, height: 8, x: 8, z: 0, columns: 0, rows: 8, values: vec![] },
             ]
         );
@@ -140,6 +186,50 @@ mod tests {
         short[lanes::header::FIELD_LANES] -= 1.0;
         short.pop();
         assert!(decode_frame(&short, 3, &catalog).is_err());
+    }
+
+    /// Decoding into a frame that held another replaces all of it, and the
+    /// state comes back where it lies in the packet.
+    #[test]
+    fn decoding_into_a_frame_replaces_what_it_held() {
+        let catalog =
+            Catalog { meshes: vec!["m".into(), "n".into()], materials: vec!["a".into(), "b".into()], sounds: vec![] };
+        let packet = |state: &[f32], extras: &[usize], preferences: bool, field: &[f32]| {
+            let mut packet = vec![0.0; PACKET_HEADER_FLOATS];
+            packet[0] = PACKET_MAGIC;
+            packet[1] = 3.0;
+            packet[lanes::header::STATE_COUNT] = state.len() as f32;
+            packet[lanes::header::DRAW_COUNT] = extras.len() as f32;
+            packet.extend(state);
+            for (index, extra) in extras.iter().enumerate() {
+                let mut draw = vec![index as f32; DRAW_FLOATS];
+                draw[lanes::draw::PARAMETERS] = 0.0;
+                draw[lanes::draw::EXTRA] = *extra as f32;
+                packet.extend(draw);
+            }
+            if preferences {
+                packet[lanes::header::PREFERENCE_COUNT] = PREFERENCE_FLOATS as f32;
+                packet.extend((0..PREFERENCE_FLOATS).map(|lane| lane as f32));
+            }
+            if !field.is_empty() {
+                packet[lanes::header::FIELD_COUNT] = 1.0;
+                packet[lanes::header::FIELD_LANES] = field.len() as f32;
+                packet.extend(field);
+            }
+            packet.extend((0..extras.iter().sum::<usize>() * 4).map(|lane| lane as f32 + 0.5));
+            packet
+        };
+        let first = packet(&[7.0, 8.0], &[0, 2], true, &[1.0, 4.0, 3.0, 1.0, 1.0, 2.0, 2.0, 0.5, 1.5, 2.5, 3.5]);
+        let second = packet(&[], &[1], false, &[]);
+        let mut frame = RenderFrame::default();
+        assert_eq!(decode_into(&first, 3, &catalog, &mut frame).unwrap(), [7.0, 8.0]);
+        assert_eq!(frame, decode_frame(&first, 3, &catalog).unwrap().render);
+        assert_eq!(frame.draws[1].extra.as_ref().map(Vec::len), Some(8));
+        assert!(decode_into(&second, 3, &catalog, &mut frame).unwrap().is_empty());
+        assert_eq!(frame, decode_frame(&second, 3, &catalog).unwrap().render);
+        assert_eq!(frame.draws[0].extra.as_deref(), Some(&[0.5, 1.5, 2.5, 3.5][..]));
+        decode_into(&first, 3, &catalog, &mut frame).unwrap();
+        assert_eq!(frame, decode_frame(&first, 3, &catalog).unwrap().render);
     }
 
     /// The interface's nodes: parents by place, their text one run of code
@@ -166,7 +256,10 @@ mod tests {
             lanes.extend(code_points);
             lanes
         };
-        let nodes = [node(0x40001 as f32, 0.0, ui_role::DIALOG, "Paused", 6, 0), node(0x40100 as f32, 1.0, ui_role::BUTTON, "Go×now", 2, 1)];
+        let nodes = [
+            node(0x40001 as f32, 0.0, ui_role::DIALOG, "Paused", 6, 0),
+            node(0x40100 as f32, 1.0, ui_role::BUTTON, "Go×now", 2, 1),
+        ];
         packet[lanes::header::UI_COUNT] = 2.0;
         packet[lanes::header::UI_LANES] = nodes.iter().map(Vec::len).sum::<usize>() as f32;
         packet.extend(nodes.concat());
@@ -176,8 +269,8 @@ mod tests {
         assert_eq!((ui[0].id, ui[0].parent, ui[0].role), (0x40001, 0, ui_role::DIALOG));
         assert_eq!((ui[1].id, ui[1].parent, ui[1].role, ui[1].checked), (0x40100, 1, ui_role::BUTTON, ui_state::TRUE));
         assert_eq!((ui[1].name_length, ui[1].description_length, ui[1].text_length), (2, 1, 6));
-        let text: String = ui[1].text.iter().map(|code| char::from_u32(*code as u32).unwrap()).collect();
-        assert_eq!(text, "Go×now");
+        let text: Vec<f32> = "Go×now".chars().map(|character| u32::from(character) as f32).collect();
+        assert_eq!(ui[1].text, text);
         assert!(ui[1].focusable && ui[1].actions & (1 << ui_action::ACTIVATE) != 0);
         assert_eq!(ui_role::NAMES[ui[0].role as usize], "dialog");
         // A name longer than the text, and a description past it.
@@ -193,10 +286,9 @@ mod tests {
     #[test]
     fn real_packets_decode() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist");
-        let (Ok(catalog), Ok(schema)) = (
-            read_catalog(&root.join("gdev/assets")),
-            std::fs::read_to_string(root.join("packets/schema.txt")),
-        ) else {
+        let (Ok(catalog), Ok(schema)) =
+            (read_catalog(&root.join("gdev/assets")), std::fs::read_to_string(root.join("packets/schema.txt")))
+        else {
             return;
         };
         let schema: u32 = schema.trim().parse().unwrap();

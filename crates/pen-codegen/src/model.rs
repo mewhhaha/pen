@@ -6,7 +6,7 @@ pub fn s(value: &Value) -> &str {
     value.as_str().unwrap()
 }
 pub fn n(value: &Value) -> usize {
-    value.as_u64().unwrap() as usize
+    usize::try_from(value.as_u64().unwrap()).unwrap()
 }
 pub fn array(value: &Value) -> &[Value] {
     value.as_array().unwrap()
@@ -133,10 +133,7 @@ pub struct Model {
 }
 impl Model {
     pub fn section(&self, name: &str) -> &Section {
-        self.sections
-            .iter()
-            .find(|entry| s(&entry.section["name"]) == name)
-            .unwrap()
+        self.sections.iter().find(|entry| s(&entry.section["name"]) == name).unwrap()
     }
     pub fn events(&self) -> &[Value] {
         array(&self.protocol["input"]["events"])
@@ -150,10 +147,7 @@ pub fn event_fields(event: &Value) -> Vec<(String, Value)> {
         return vec![("value".to_owned(), event["value"].clone())];
     }
     if let Some(fields) = event["fields"].as_object() {
-        return fields
-            .iter()
-            .map(|(name, field)| (name.clone(), field.clone()))
-            .collect();
+        return fields.iter().map(|(name, field)| (name.clone(), field.clone())).collect();
     }
     Vec::new()
 }
@@ -177,12 +171,7 @@ fn layout_fields(fields: &Value) -> Vec<Laid> {
     object(fields)
         .iter()
         .map(|(name, field)| {
-            let laid = Laid {
-                name: name.clone(),
-                offset,
-                lanes: lanes(field),
-                field: field.clone(),
-            };
+            let laid = Laid { name: name.clone(), offset, lanes: lanes(field), field: field.clone() };
             offset += laid.lanes;
             laid
         })
@@ -191,20 +180,13 @@ fn layout_fields(fields: &Value) -> Vec<Laid> {
 fn layout(record: &Value) -> Layout {
     let fields = layout_fields(&record["fields"]);
     let lanes = fields.iter().map(|field| field.lanes).sum();
-    Layout {
-        record: record.clone(),
-        fields,
-        lanes,
-    }
+    Layout { record: record.clone(), fields, lanes }
 }
 pub fn describe(fields: &[Laid]) -> String {
     fields
         .iter()
         .map(|laid| match kind(&laid.field) {
-            "optional" => format!(
-                "{} count and {}{}",
-                laid.name, laid.name, laid.field["count"]
-            ),
+            "optional" => format!("{} count and {}{}", laid.name, laid.name, laid.field["count"]),
             "children" | "tail" => format!("{} count", laid.name),
             _ if laid.lanes == 1 => laid.name.clone(),
             _ => format!("{}{}", laid.name, laid.lanes),
@@ -241,10 +223,7 @@ fn fields(value: &Value, header: bool) -> Result<()> {
 fn validate_bound(value: &Value) -> Result<()> {
     if let Some(expression) = value.as_str() {
         let terms: Vec<_> = expression.split('-').map(str::trim).collect();
-        ensure!(
-            terms.len() <= 2 && terms.iter().all(|term| identifier(term)),
-            "invalid bound {expression}"
-        );
+        ensure!(terms.len() <= 2 && terms.iter().all(|term| identifier(term)), "invalid bound {expression}");
     } else if value.is_object() {
         string(&value["limit"])?;
         integer(&value["value"])?;
@@ -255,16 +234,12 @@ fn validate_bound(value: &Value) -> Result<()> {
 }
 fn identifier(name: &str) -> bool {
     let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+    chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 fn symbol(name: &str) -> bool {
     let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 fn lane(value: &Value, header: bool) -> Result<()> {
@@ -277,10 +252,7 @@ fn lane(value: &Value, header: bool) -> Result<()> {
         "vector" => {
             string(&value["type"]["name"])?;
             strings(&value["type"]["components"])?;
-            ensure!(
-                !array(&value["type"]["components"]).is_empty(),
-                "invalid vector components"
-            );
+            ensure!(!array(&value["type"]["components"]).is_empty(), "invalid vector components");
         }
         "lanes" | "optional" => {
             integer(&value["count"])?;
@@ -314,10 +286,7 @@ fn lane(value: &Value, header: bool) -> Result<()> {
         "present" if header => string(&value["to"])?,
         "size" if header => {
             string(&value["section"])?;
-            ensure!(
-                matches!(value["of"].as_str(), Some("count" | "lanes")),
-                "invalid size lane"
-            );
+            ensure!(matches!(value["of"].as_str(), Some("count" | "lanes")), "invalid size lane");
         }
         other => bail!("unsupported lane kind {other}"),
     }
@@ -326,10 +295,7 @@ fn lane(value: &Value, header: bool) -> Result<()> {
 fn record(value: &Value, variable: bool) -> Result<()> {
     string(&value["name"])?;
     string(&value["constant"])?;
-    ensure!(
-        symbol(s(&value["name"])) && symbol(s(&value["constant"])),
-        "invalid record symbol"
-    );
+    ensure!(symbol(s(&value["name"])) && symbol(s(&value["constant"])), "invalid record symbol");
     if variable {
         fields(&value["head"], false)?;
         let rest = &value["rest"];
@@ -355,11 +321,7 @@ fn check_bounds(owner: &str, fields: &[Laid]) -> Result<()> {
             && let Some(expression) = field.field["max"].as_str()
         {
             for term in expression.split('-').map(str::trim) {
-                ensure!(
-                    seen.contains(term),
-                    "{owner}.{} needs {term} before it",
-                    field.name
-                );
+                ensure!(seen.contains(term), "{owner}.{} needs {term} before it", field.name);
             }
         }
         seen.insert(field.name.as_str());
@@ -385,10 +347,7 @@ pub fn build(protocol: Value) -> Result<Model> {
     }
     for (name, value) in object(&protocol["catalog"]) {
         string(&value["list"])?;
-        ensure!(
-            symbol(name) && symbol(s(&value["list"])),
-            "invalid catalog symbol"
-        );
+        ensure!(symbol(name) && symbol(s(&value["list"])), "invalid catalog symbol");
     }
     validate_bound(&protocol["state"]["max"])?;
     for key in ["message", "schemaMessage"] {
@@ -396,14 +355,8 @@ pub fn build(protocol: Value) -> Result<Model> {
     }
     let input = &protocol["input"];
     strings(&input["lanes"])?;
-    ensure!(
-        array(&input["lanes"]).len() == 4,
-        "input requires four event lanes"
-    );
-    ensure!(
-        input["events"].is_array() && input["keys"].is_object(),
-        "input requires events and keys"
-    );
+    ensure!(array(&input["lanes"]).len() == 4, "input requires four event lanes");
+    ensure!(input["events"].is_array() && input["keys"].is_object(), "input requires events and keys");
     validate_bound(&input["maxEvents"])?;
     integer(&input["maxExtent"])?;
     for value in object(&input["keys"]).values() {
@@ -418,15 +371,9 @@ pub fn build(protocol: Value) -> Result<Model> {
         integer(&event["tag"])?;
         string(&event["name"])?;
         ensure!(symbol(s(&event["name"])), "invalid event name");
-        ensure!(
-            n(&event["tag"]) >= 1 && tags.insert(n(&event["tag"])),
-            "invalid or duplicate event tag"
-        );
+        ensure!(n(&event["tag"]) >= 1 && tags.insert(n(&event["tag"])), "invalid or duplicate event tag");
         ensure!(names.insert(s(&event["name"])), "duplicate event name");
-        ensure!(
-            event["value"].is_null() || event["fields"].is_null(),
-            "event has both value and fields"
-        );
+        ensure!(event["value"].is_null() || event["fields"].is_null(), "event has both value and fields");
         if !event["fields"].is_null() {
             ensure!(event["fields"].is_object(), "event fields require object");
         }
@@ -435,27 +382,17 @@ pub fn build(protocol: Value) -> Result<Model> {
             ensure!(symbol(&name), "invalid event field name");
             string(&field["lane"])?;
             ensure!(
-                array(&input["lanes"]).contains(&field["lane"])
-                    && used.insert(s(&field["lane"]).to_owned()),
+                array(&input["lanes"]).contains(&field["lane"]) && used.insert(s(&field["lane"]).to_owned()),
                 "unknown or duplicate event lane"
             );
+            ensure!(matches!(field["wire"].as_str(), Some("key" | "integer" | "f32")), "invalid event wire type");
             ensure!(
-                matches!(field["wire"].as_str(), Some("key" | "integer" | "f32")),
-                "invalid event wire type"
-            );
-            ensure!(
-                matches!(
-                    field["rust"].as_str(),
-                    Some("f32" | "u32" | "u64" | "String")
-                ),
+                matches!(field["rust"].as_str(), Some("f32" | "u32" | "u64" | "String")),
                 "invalid event Rust type"
             );
             if !field["max"].is_null() {
                 integer(&field["max"])?;
-                ensure!(
-                    field["lane"] == input["lanes"][0],
-                    "only code lane has maximum"
-                );
+                ensure!(field["lane"] == input["lanes"][0], "only code lane has maximum");
             }
         }
         if !event["hosts"].is_null() {
@@ -465,10 +402,7 @@ pub fn build(protocol: Value) -> Result<Model> {
                 ensure!(host["fields"].is_object(), "host fields require object");
                 for field in object(&host["fields"]).values() {
                     ensure!(
-                        matches!(
-                            field["rust"].as_str(),
-                            Some("f32" | "u32" | "u64" | "String")
-                        ),
+                        matches!(field["rust"].as_str(), Some("f32" | "u32" | "u64" | "String")),
                         "invalid host Rust type"
                     );
                 }
@@ -495,10 +429,7 @@ pub fn build(protocol: Value) -> Result<Model> {
     }
     let render = &protocol["render"];
     fields(&render["header"], true)?;
-    ensure!(
-        render["groups"].is_object() && render["sections"].is_array(),
-        "render requires groups and sections"
-    );
+    ensure!(render["groups"].is_object() && render["sections"].is_array(), "render requires groups and sections");
     for group in object(&render["groups"]).values() {
         string(&group["type"])?;
     }
@@ -513,46 +444,24 @@ pub fn build(protocol: Value) -> Result<Model> {
                 Some((group, name)) => (Some(group.to_owned()), name.to_owned()),
                 None => (None, key.clone()),
             };
-            let laid = Laid {
-                name,
-                offset: header_lanes,
-                lanes: lanes(field),
-                field: field.clone(),
-            };
+            let laid = Laid { name, offset: header_lanes, lanes: lanes(field), field: field.clone() };
             header_lanes += laid.lanes;
-            Header {
-                key: key.clone(),
-                group,
-                laid,
-            }
+            Header { key: key.clone(), group, laid }
         })
         .collect();
     ensure!(
-        header.len() >= 2
-            && kind(&header[0].laid.field) == "magic"
-            && kind(&header[1].laid.field) == "schema",
+        header.len() >= 2 && kind(&header[0].laid.field) == "magic" && kind(&header[1].laid.field) == "schema",
         "header must start with magic and schema"
     );
     for entry in &header {
         if let Some(group) = &entry.group {
-            ensure!(
-                render["groups"][group].is_object(),
-                "unknown header group {group}"
-            );
+            ensure!(render["groups"][group].is_object(), "unknown header group {group}");
         }
     }
     for group in object(&render["groups"]).keys() {
-        let members: Vec<_> = header
-            .iter()
-            .filter(|entry| entry.group.as_ref() == Some(group))
-            .collect();
+        let members: Vec<_> = header.iter().filter(|entry| entry.group.as_ref() == Some(group)).collect();
         ensure!(
-            !members.is_empty()
-                && members
-                    .iter()
-                    .filter(|entry| kind(&entry.laid.field) == "present")
-                    .count()
-                    <= 1,
+            !members.is_empty() && members.iter().filter(|entry| kind(&entry.laid.field) == "present").count() <= 1,
             "group needs lanes and at most one presence flag"
         );
     }
@@ -564,36 +473,21 @@ pub fn build(protocol: Value) -> Result<Model> {
         string(&section["name"])?;
         string(&section["kind"])?;
         ensure!(symbol(s(&section["name"])), "invalid section name");
-        ensure!(
-            section_names.insert(s(&section["name"])),
-            "duplicate section"
-        );
-        let mut entry = Section {
-            section: section.clone(),
-            fixed: None,
-            head: Vec::new(),
-            head_lanes: 0,
-            item: None,
-            owner: None,
-        };
+        ensure!(section_names.insert(s(&section["name"])), "duplicate section");
+        let mut entry =
+            Section { section: section.clone(), fixed: None, head: Vec::new(), head_lanes: 0, item: None, owner: None };
         let expected = match kind(section) {
             "lanes" => {
                 validate_bound(&section["max"])?;
                 for key in ["nullable", "apart"] {
-                    ensure!(
-                        section[key].is_null() || section[key].is_boolean(),
-                        "section {key} requires boolean"
-                    );
+                    ensure!(section[key].is_null() || section[key].is_boolean(), "section {key} requires boolean");
                 }
                 if !section["constant"].is_null() {
                     string(&section["constant"])?;
                     integer(&section["max"])?;
                 }
                 if !section["exactly"].is_null() {
-                    ensure!(
-                        section["exactly"]["counts"].is_array(),
-                        "exactly needs counts"
-                    );
+                    ensure!(section["exactly"]["counts"].is_array(), "exactly needs counts");
                     for count in array(&section["exactly"]["counts"]) {
                         integer(count)?;
                     }
@@ -606,9 +500,8 @@ pub fn build(protocol: Value) -> Result<Model> {
                 record(&section["record"], false)?;
                 entry.fixed = Some(layout(&section["record"]));
                 if let Some(owner) = section["owner"].as_str() {
-                    let (name, field) = owner
-                        .split_once('.')
-                        .ok_or_else(|| anyhow::anyhow!("owner requires section.field"))?;
+                    let (name, field) =
+                        owner.split_once('.').ok_or_else(|| anyhow::anyhow!("owner requires section.field"))?;
                     entry.owner = Some((name.to_owned(), field.to_owned()));
                 }
                 (1, 0)
@@ -642,10 +535,7 @@ pub fn build(protocol: Value) -> Result<Model> {
         };
         for layout in entry.fixed.iter().chain(entry.item.iter()) {
             check_bounds(s(&layout.record["name"]), &layout.fields)?;
-            if let Some(old) = records
-                .iter()
-                .find(|old| old.record["name"] == layout.record["name"])
-            {
+            if let Some(old) = records.iter().find(|old| old.record["name"] == layout.record["name"]) {
                 ensure!(old.record == layout.record, "two records have same name");
             } else {
                 records.push(layout.clone());
@@ -653,22 +543,12 @@ pub fn build(protocol: Value) -> Result<Model> {
         }
         let sizes: Vec<_> = header
             .iter()
-            .filter(|entry| {
-                kind(&entry.laid.field) == "size" && entry.laid.field["section"] == section["name"]
-            })
+            .filter(|entry| kind(&entry.laid.field) == "size" && entry.laid.field["section"] == section["name"])
             .collect();
         ensure!(
             sizes.len() == expected.0 + expected.1
-                && sizes
-                    .iter()
-                    .filter(|entry| entry.laid.field["of"] == "count")
-                    .count()
-                    == expected.0
-                && sizes
-                    .iter()
-                    .filter(|entry| entry.laid.field["of"] == "lanes")
-                    .count()
-                    == expected.1,
+                && sizes.iter().filter(|entry| entry.laid.field["of"] == "count").count() == expected.0
+                && sizes.iter().filter(|entry| entry.laid.field["of"] == "lanes").count() == expected.1,
             "section {} needs its size lanes",
             section["name"]
         );
@@ -680,10 +560,7 @@ pub fn build(protocol: Value) -> Result<Model> {
             for field in &layout.fields {
                 let lane = &field.field;
                 if kind(lane) == "reference" {
-                    ensure!(
-                        !protocol["catalog"][s(&lane["to"])].is_null(),
-                        "unknown catalog reference"
-                    );
+                    ensure!(!protocol["catalog"][s(&lane["to"])].is_null(), "unknown catalog reference");
                 }
                 if matches!(kind(lane), "children" | "tail") {
                     let target = sections
@@ -692,8 +569,7 @@ pub fn build(protocol: Value) -> Result<Model> {
                         .ok_or_else(|| anyhow::anyhow!("unknown target section"))?;
                     if kind(lane) == "children" {
                         ensure!(
-                            target.owner
-                                == Some((s(&entry.section["name"]).to_owned(), field.name.clone())),
+                            target.owner == Some((s(&entry.section["name"]).to_owned(), field.name.clone())),
                             "child section has wrong owner"
                         );
                     } else {
@@ -707,9 +583,7 @@ pub fn build(protocol: Value) -> Result<Model> {
                             layout: layout.clone(),
                             field: field.clone(),
                         };
-                        if let Some((_, owners)) =
-                            tails.iter_mut().find(|(section, _)| section == name)
-                        {
+                        if let Some((_, owners)) = tails.iter_mut().find(|(section, _)| section == name) {
                             owners.push(tail);
                         } else {
                             tails.push((name.to_owned(), vec![tail]));
@@ -722,41 +596,20 @@ pub fn build(protocol: Value) -> Result<Model> {
     for entry in &header {
         let lane = &entry.laid.field;
         if kind(lane) == "size" {
-            ensure!(
-                section_names.contains(s(&lane["section"])),
-                "header sizes unknown section"
-            );
+            ensure!(section_names.contains(s(&lane["section"])), "header sizes unknown section");
         }
         if matches!(kind(lane), "present" | "reference") {
-            ensure!(
-                !protocol["catalog"][s(&lane["to"])].is_null(),
-                "header refers to unknown catalog"
-            );
+            ensure!(!protocol["catalog"][s(&lane["to"])].is_null(), "header refers to unknown catalog");
         }
     }
     for (index, entry) in sections.iter().enumerate() {
         if kind(&entry.section) == "trailing" {
-            ensure!(
-                index == sections.len() - 1,
-                "trailing section must come last"
-            );
+            ensure!(index == sections.len() - 1, "trailing section must come last");
         }
     }
     ensure!(
-        sections
-            .iter()
-            .filter(|entry| kind(&entry.section) == "lanes" && entry.section["apart"] == true)
-            .count()
-            == 1,
+        sections.iter().filter(|entry| kind(&entry.section) == "lanes" && entry.section["apart"] == true).count() == 1,
         "protocol requires one state section"
     );
-    Ok(Model {
-        protocol,
-        header,
-        header_lanes,
-        magic,
-        sections,
-        records,
-        tails,
-    })
+    Ok(Model { protocol, header, header_lanes, magic, sections, records, tails })
 }

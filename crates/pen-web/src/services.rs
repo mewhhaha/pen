@@ -1,51 +1,89 @@
-use pen_protocol::{ServiceRequest, clipboard_op, pathfinding_op, platform_op, service, url_op};
-use pen_runtime::services::{Answer, text};
-use wasm_bindgen_futures::JsFuture;
+//! The game's services in a browser, through pen-runtime's registry: what
+//! the game runs on, pathfinding, web addresses (a new tab, as the page's
+//! permissions allow) and the clipboard, whose promises answer a later
+//! frame. Steam is unavailable.
+use std::cell::RefCell;
+use std::rc::Rc;
 
-pub async fn answer(request: &ServiceRequest) -> Answer {
+use pen_protocol::{clipboard_op, service, url_op};
+use pen_runtime::services::{Answer, Pathfinding, Platform, Request, Service, Services, Unavailable, openable};
+use wasm_bindgen_futures::{JsFuture, spawn_local};
+
+/// The browser's services.
+pub fn standard() -> Services {
     let window = web_sys::window().unwrap();
-    match request.service {
-        service::STEAM => Answer::unavailable(),
-        service::PLATFORM => match request.operation {
-            platform_op::OS => Answer::text("web"),
-            platform_op::LOCALE => Answer::text(&window.navigator().language().unwrap_or_else(|| "en".into())),
-            platform_op::DEVICE => Answer::text("browser"),
-            _ => Answer::unknown(),
-        },
-        service::PATHFINDING => {
-            if request.operation != pathfinding_op::FIND { return Answer::unknown(); }
-            let numbers = [request.a, request.b, request.c, request.d];
-            if numbers.iter().any(|n| !n.is_finite() || *n < 0.0 || n.fract() != 0.0) { return Answer::failed(); }
-            let [columns, rows, start, goal] = numbers.map(|n| n as usize);
-            if columns == 0 || columns.checked_mul(rows) != Some(request.values.len()) { return Answer::failed(); }
-            let open: Vec<bool> = request.values.iter().map(|n| *n == 0.0).collect();
-            match pen_runtime::pathfinding::find(columns, &open, start, goal) {
-                Some(path) => Answer { values: path.iter().map(|n| *n as f32).collect(), ..Answer::ok(path.len() as f32) },
-                None => Answer::ok(0.0),
-            }
+    let mut services = Services::new();
+    services.register(Box::new(Unavailable(service::STEAM)));
+    services.register(Box::new(Platform {
+        os: "web".into(),
+        locale: window.navigator().language(),
+        device: "browser".into(),
+        handheld: false,
+    }));
+    services.register(Box::new(Pathfinding));
+    services.register(Box::new(Url));
+    services.register(Box::new(Clipboard::default()));
+    services
+}
+
+/// Opens a web address in a new tab.
+struct Url;
+
+impl Service for Url {
+    fn code(&self) -> u32 {
+        service::URL
+    }
+
+    fn call(&mut self, request: &Request) -> Option<Answer> {
+        if request.operation != url_op::OPEN {
+            return Some(Answer::unknown());
         }
-        service::URL => {
-            if request.operation != url_op::OPEN { return Answer::unknown(); }
-            let address = text(&request.values);
-            if !(address.starts_with("https://") || address.starts_with("http://")) || address.len() > 2048
-                || address.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"') { return Answer::failed(); }
-            match window.open_with_url_and_target_and_features(&address, "_blank", "noopener,noreferrer") {
-                Ok(Some(_)) => Answer::ok(1.0),
-                _ => Answer::unavailable(),
-            }
+        let address = request.text();
+        if !openable(&address) {
+            return Some(Answer::failed());
         }
-        service::CLIPBOARD => {
-            let clipboard = window.navigator().clipboard();
-            match request.operation {
-                clipboard_op::COPY => match JsFuture::from(clipboard.write_text(&text(&request.values))).await {
-                    Ok(_) => Answer::ok(1.0), Err(_) => Answer::unavailable(),
-                },
-                clipboard_op::PASTE => match JsFuture::from(clipboard.read_text()).await {
-                    Ok(value) => Answer::text(&value.as_string().unwrap_or_default()), Err(_) => Answer::unavailable(),
-                },
-                _ => Answer::unknown(),
-            }
-        }
-        _ => Answer::unknown(),
+        let window = web_sys::window().unwrap();
+        Some(match window.open_with_url_and_target_and_features(&address, "_blank", "noopener,noreferrer") {
+            Ok(Some(_)) => Answer::ok(1.0),
+            _ => Answer::unavailable(),
+        })
+    }
+}
+
+/// The page's clipboard, as its permissions allow: each request's promise
+/// answers in a later frame.
+#[derive(Default)]
+struct Clipboard {
+    answered: Rc<RefCell<Vec<(u32, Answer)>>>,
+}
+
+impl Service for Clipboard {
+    fn code(&self) -> u32 {
+        service::CLIPBOARD
+    }
+
+    fn call(&mut self, request: &Request) -> Option<Answer> {
+        let clipboard = web_sys::window().unwrap().navigator().clipboard();
+        let (id, count) = (request.id, request.values.len());
+        let promise = match request.operation {
+            clipboard_op::COPY => clipboard.write_text(&request.text()),
+            clipboard_op::PASTE => clipboard.read_text(),
+            _ => return Some(Answer::unknown()),
+        };
+        let copying = request.operation == clipboard_op::COPY;
+        let answered = self.answered.clone();
+        spawn_local(async move {
+            let answer = match JsFuture::from(promise).await {
+                Ok(_) if copying => Answer::ok(count as f32),
+                Ok(text) => Answer::text(&text.as_string().unwrap_or_default()),
+                Err(_) => Answer::unavailable(),
+            };
+            answered.borrow_mut().push((id, answer));
+        });
+        None
+    }
+
+    fn poll(&mut self) -> Vec<(u32, Answer)> {
+        std::mem::take(&mut *self.answered.borrow_mut())
     }
 }

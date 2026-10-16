@@ -1,17 +1,17 @@
-//! What the game runs on: the operating system, the player's locale and the
-//! device (a Steam Deck, or not), as text the game can show or act on.
-use pen_protocol::{platform_op, service};
-
-use super::{Answer, Request, Service};
-
-pub struct Platform;
+//! What the game runs on here: the operating system, the player's locale and
+//! the device (a Steam Deck, or not), which the platform service
+//! (`pen_runtime::services::Platform`) answers with.
+use pen_runtime::services::Platform;
 
 /// A POSIX locale (`en_US.UTF-8`, `sv_SE`) as a BCP 47 tag (`en-US`), or
 /// None for none (`C`, `POSIX`).
 #[cfg(any(not(windows), test))]
 pub fn bcp47(posix: &str) -> Option<String> {
     let tag = posix.split(['.', '@']).next()?.replace('_', "-");
-    let valid = !tag.is_empty() && tag != "C" && tag != "POSIX" && tag.chars().all(|char| char.is_ascii_alphanumeric() || char == '-');
+    let valid = !tag.is_empty()
+        && tag != "C"
+        && tag != "POSIX"
+        && tag.chars().all(|char| char.is_ascii_alphanumeric() || char == '-');
     valid.then_some(tag)
 }
 
@@ -22,8 +22,10 @@ pub fn locale() -> Option<String> {
         use windows_sys::Win32::Globalization::GetUserDefaultLocaleName;
         let mut name = [0u16; 85];
         // SAFETY: the buffer is LOCALE_NAME_MAX_LENGTH (85) wide characters.
-        let length = unsafe { GetUserDefaultLocaleName(name.as_mut_ptr(), name.len() as i32) };
-        (length > 1).then(|| String::from_utf16_lossy(&name[..length as usize - 1]))
+        let length = unsafe { GetUserDefaultLocaleName(name.as_mut_ptr(), 85) };
+        // The length counts the closing NUL; 0 is a failure.
+        let length = usize::try_from(length).ok().filter(|&length| length > 1)?;
+        Some(String::from_utf16_lossy(&name[..length - 1]))
     }
     #[cfg(not(windows))]
     {
@@ -45,24 +47,14 @@ pub fn steam_deck() -> bool {
     read("board_vendor").trim() == "Valve" && matches!(read("product_name").trim(), "Jupiter" | "Galileo")
 }
 
-impl Service for Platform {
-    fn code(&self) -> u32 {
-        service::PLATFORM
-    }
-
-    fn call(&mut self, request: &Request) -> Option<Answer> {
-        Some(match request.operation {
-            platform_op::OS => Answer::text(std::env::consts::OS),
-            platform_op::LOCALE => match locale() {
-                Some(tag) => Answer::text(&tag),
-                None => Answer::unavailable(),
-            },
-            platform_op::DEVICE => {
-                let deck = steam_deck();
-                Answer { value: if deck { 1.0 } else { 0.0 }, ..Answer::text(if deck { "Steam Deck" } else { "desktop" }) }
-            }
-            _ => Answer::unknown(),
-        })
+/// The platform service for this machine.
+pub fn platform() -> Platform {
+    let deck = steam_deck();
+    Platform {
+        os: std::env::consts::OS.to_owned(),
+        locale: locale(),
+        device: if deck { "Steam Deck" } else { "desktop" }.to_owned(),
+        handheld: deck,
     }
 }
 

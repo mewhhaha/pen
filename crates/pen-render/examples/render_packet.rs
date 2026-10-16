@@ -1,21 +1,28 @@
-//! Renders gdev render packets headlessly and writes each as a PNG.
+//! Renders gdev render packets headlessly and writes each as a PNG; the
+//! measurements in docs/render-performance.md come from it.
 //!
 //! ```text
-//! cargo run -p pen-render --example render_packet -- [options] [packet numbers...]
+//! cargo run --release -p pen-render --example render_packet -- [options] [packet numbers...]
 //!   --assets DIR    asset root holding catalog.json (default dist/gdev/assets)
 //!   --packets DIR   NNNN.f32 packets and schema.txt (default dist/packets)
 //!   --out DIR       where the PNGs go (default target/render_packet)
 //!   --size WxH      output size (default 1280x720)
 //!   --veil          draw the loading veil (0.6 s), as gdev does
 //!   --synthetic     render a made-up frame instead of packets
+//!   --sequence      settle on the first packet, as pen does on its first
+//!                   frame, then submit each later one once, in order, timing
+//!                   each (all packets if none are named)
+//!   --pipelines DIR keep compiled pipelines there between runs (Vulkan)
 //!   --msaa N, --fxaa, --filtering N, --scale S, --blur B, --aberration X,Y
 //!                   override the frames' quality and effects
 //!   --robots N      add an N x N grid of instanced walking robots
 //!   --early         also write the first frame submitted (NNNN-early.png)
 //! ```
 //!
-//! Each frame is submitted repeatedly until its assets have loaded and the
-//! renderer is quiet (or 30 s pass), then read back.
+//! Otherwise each frame is submitted until its assets have loaded and the
+//! renderer is quiet, as pen settles its first frame, then timed over 30
+//! more submits and read back. `RUST_LOG=debug` (any value) also prints the
+//! renderer's pipeline compile times.
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -92,18 +99,47 @@ fn camera(eye: [f32; 3], aspect: f32) -> (Matrix, Matrix) {
         let l = length(v);
         [v[0] / l, v[1] / l, v[2] / l]
     };
-    let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    let cross =
+        |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
     let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     let back = normalize(eye);
     let right = normalize(cross([0.0, 1.0, 0.0], back));
     let up = cross(back, right);
     let view = [
-        right[0], up[0], back[0], 0.0, right[1], up[1], back[1], 0.0, right[2], up[2], back[2], 0.0,
-        -dot(right, eye), -dot(up, eye), -dot(back, eye), 1.0,
+        right[0],
+        up[0],
+        back[0],
+        0.0,
+        right[1],
+        up[1],
+        back[1],
+        0.0,
+        right[2],
+        up[2],
+        back[2],
+        0.0,
+        -dot(right, eye),
+        -dot(up, eye),
+        -dot(back, eye),
+        1.0,
     ];
     let (near, far, f) = (0.1f32, 200.0f32, 1.0 / (0.5f32).tan());
     let projection = [
-        f / aspect, 0.0, 0.0, 0.0, 0.0, f, 0.0, 0.0, 0.0, 0.0, far / (near - far), -1.0, 0.0, 0.0, near * far / (near - far),
+        f / aspect,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        f,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        far / (near - far),
+        -1.0,
+        0.0,
+        0.0,
+        near * far / (near - far),
         0.0,
     ];
     (view, projection)
@@ -111,7 +147,9 @@ fn camera(eye: [f32; 3], aspect: f32) -> (Matrix, Matrix) {
 
 /// A made-up frame: a few meshes on a brush floor under a sky, with a sprite.
 fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
-    let find = |list: &[String], key: &str| list.iter().position(|entry| entry == key).unwrap_or(0) as u32;
+    let find = |list: &[String], key: &str| {
+        list.iter().position(|entry| entry == key).map_or(0, |index| u32::try_from(index).unwrap())
+    };
     let (view, projection) = camera([6.0, 4.0, 8.0], width as f32 / height as f32);
     let translate = |x: f32, y: f32, z: f32| [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, z, 1.0];
     let cube = find(&catalog.meshes, "cube.mesh.json");
@@ -203,7 +241,29 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
 
 const IDENTITY: Matrix = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 
+/// Prints the renderer's log to stderr: warnings, and with RUST_LOG set,
+/// its pipeline compile times.
+struct Stderr;
+
+impl log::Log for Stderr {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        metadata.target().starts_with("pen_render")
+    }
+    fn log(&self, record: &log::Record<'_>) {
+        if self.enabled(record.metadata()) {
+            eprintln!("{}: {}", record.level(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
 fn main() -> Result<()> {
+    log::set_logger(&Stderr).map_err(|_| anyhow::anyhow!("a logger is already set"))?;
+    log::set_max_level(if std::env::var_os("RUST_LOG").is_some() {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Warn
+    });
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut assets = root.join("dist/gdev/assets");
     let mut packets = root.join("dist/packets");
@@ -215,6 +275,8 @@ fn main() -> Result<()> {
     let mut overrides: Vec<Override> = Vec::new();
     let mut robots = 0;
     let mut early = false;
+    let mut sequence = false;
+    let mut pipelines = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -253,6 +315,8 @@ fn main() -> Result<()> {
             }
             "--robots" => robots = args.next().context("--robots N")?.parse()?,
             "--early" => early = true,
+            "--sequence" => sequence = true,
+            "--pipelines" => pipelines = Some(PathBuf::from(args.next().context("--pipelines DIR")?)),
             number => numbers.push(number.parse::<u32>().with_context(|| format!("unknown argument {number}"))?),
         }
     }
@@ -265,7 +329,8 @@ fn main() -> Result<()> {
     let mut frames: Vec<(String, RenderFrame)> = Vec::new();
     // A grid of robots in their walk poses, as the game draws them: one
     // instanced batch for all eight pose materials.
-    let robot_mesh = catalog.meshes.iter().position(|key| key == "robot3d.mesh.json");
+    let robot_mesh =
+        catalog.meshes.iter().position(|key| key == "robot3d.mesh.json").map(|index| u32::try_from(index).unwrap());
     let add_robots = |frame: &mut RenderFrame| {
         let Some(mesh) = robot_mesh else { return };
         for index in 0..robots * robots {
@@ -273,19 +338,22 @@ fn main() -> Result<()> {
             let spread = robots as f32 - 1.0;
             let key = format!("robot.walk_{:02}.material.json", index % 8);
             let Some(material) = catalog.materials.iter().position(|entry| *entry == key) else { continue };
+            let material = u32::try_from(material).unwrap();
             // Six times life size, so they show from the god view.
             let mut transform = IDENTITY.map(|value| value * 6.0);
             transform[15] = 1.0;
             transform[12] = (column - spread / 2.0) * 7.0;
             transform[14] = (row - spread / 2.0) * 7.0 + 10.0;
-            frame.draws.push(Draw { material: material as u32, mesh: mesh as u32, transform, parameters: None, extra: None });
+            frame.draws.push(Draw { material, mesh, transform, parameters: None, extra: None });
         }
     };
     if use_synthetic {
         frames.push(("synthetic".into(), synthetic(&catalog, size)));
     } else {
         let schema = pen_protocol::boundary::validate_schema(std::fs::read_to_string(&schema_path)?.trim().parse()?)?;
-        if numbers.is_empty() {
+        if numbers.is_empty() && sequence {
+            numbers = (0..).take_while(|number| packets.join(format!("{number:04}.f32")).exists()).collect();
+        } else if numbers.is_empty() {
             numbers = vec![0, 30, 59, 60, 90, 119];
         }
         for number in numbers {
@@ -309,7 +377,9 @@ fn main() -> Result<()> {
         ..Default::default()
     }))?;
     eprintln!("adapter: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+    let features = pen_render::optional_features(&adapter);
+    let descriptor = wgpu::DeviceDescriptor { required_features: features, ..Default::default() };
+    let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))?;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("output"),
         size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
@@ -322,31 +392,60 @@ fn main() -> Result<()> {
     });
     let mut target = Offscreen { texture };
     let started = Instant::now();
-    let mut renderer = Renderer::new(device.clone(), queue.clone(), RendererOptions { format: FORMAT, assets, veil })?;
+    let options = RendererOptions { format: FORMAT, assets, veil, pipeline_cache: pipelines };
+    let mut renderer = Renderer::new(device.clone(), queue.clone(), options)?;
     renderer.preload(&catalog);
     std::fs::create_dir_all(&out)?;
-    for (name, frame) in &frames {
+    let report = |renderer: &mut Renderer| {
+        for event in renderer.take_events() {
+            if let GameEvent::AssetFailed { key, kind, message, .. } = event {
+                eprintln!("{kind} {key}: {message}");
+            }
+        }
+    };
+    let settle = |renderer: &mut Renderer, target: &mut Offscreen, name: &str, frame: &RenderFrame| -> Result<()> {
         let begun = Instant::now();
-        let mut last_event = Instant::now();
         let mut submitted = 0;
         loop {
-            renderer.submit(frame, &catalog, &mut target)?;
+            renderer.submit(frame, &catalog, target)?;
+            device.poll(wgpu::PollType::wait_indefinitely())?;
             submitted += 1;
             if early && submitted == 1 {
                 read_back(&device, &queue, &target.texture)?.save(out.join(format!("{name}-early.png")))?;
             }
-            for event in renderer.take_events() {
-                last_event = Instant::now();
-                if let GameEvent::AssetFailed { key, kind, message, .. } = event {
-                    eprintln!("{kind} {key}: {message}");
-                }
-            }
-            let settled = renderer.quiet() && last_event.elapsed() > Duration::from_millis(1500);
-            if (settled && submitted >= 3) || begun.elapsed() > Duration::from_secs(30) {
+            report(renderer);
+            if (renderer.quiet() && renderer.pending() == 0) || begun.elapsed() > Duration::from_secs(60) {
                 break;
             }
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        eprintln!("{name}: settled in {:.0} ms ({submitted} submits)", begun.elapsed().as_secs_f64() * 1000.0);
+        Ok(())
+    };
+    if sequence {
+        let Some(((first_name, first), rest)) = frames.split_first() else { bail!("nothing to render") };
+        settle(&mut renderer, &mut target, first_name, first)?;
+        let mut times = Vec::new();
+        for (name, frame) in rest {
+            let begun = Instant::now();
+            renderer.submit(frame, &catalog, &mut target)?;
+            let submit = begun.elapsed().as_secs_f64() * 1000.0;
+            device.poll(wgpu::PollType::wait_indefinitely())?;
+            let total = begun.elapsed().as_secs_f64() * 1000.0;
+            report(&mut renderer);
+            eprintln!("{name}: submit {submit:.2} ms, with the GPU {total:.2} ms, {:?}", renderer.stats());
+            times.push((total, name));
+            // Frames come a display refresh apart, as in the game.
             std::thread::sleep(Duration::from_millis(16));
         }
+        times.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let slowest: Vec<String> = times.iter().take(5).map(|(total, name)| format!("{name} {total:.2} ms")).collect();
+        eprintln!("slowest: {}", slowest.join(", "));
+        read_back(&device, &queue, &target.texture)?.save(out.join("sequence.png"))?;
+        return Ok(());
+    }
+    for (name, frame) in &frames {
+        settle(&mut renderer, &mut target, name, frame)?;
         // How long a settled frame takes to encode and submit.
         let timed = Instant::now();
         for _ in 0..30 {
@@ -358,10 +457,8 @@ fn main() -> Result<()> {
         let path = out.join(format!("{name}.png"));
         picture.save(&path)?;
         eprintln!(
-            "{}: settled after {} submits in {:.1}s, then {:.2} ms a frame (GPU included), {:?}, {:.1}s in all",
+            "{}: {:.2} ms a frame (GPU included), {:?}, {:.1}s in all",
             path.display(),
-            submitted,
-            begun.elapsed().as_secs_f64(),
             per_frame,
             renderer.stats(),
             started.elapsed().as_secs_f64()

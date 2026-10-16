@@ -82,6 +82,8 @@ pub struct TestOptions {
     pub update: bool,
     /// Only scenarios whose names contain one of these.
     pub only: Vec<String>,
+    /// Draw on a software adapter (`--software`).
+    pub software: bool,
 }
 
 /// How far apart two images are: RMSE and the largest difference, both over
@@ -110,10 +112,10 @@ fn compare(actual: &image::RgbaImage, golden: &image::RgbaImage, diff: &Path) ->
         }
         // Differences in red over a dimmed copy of the golden image.
         let base = (u16::from(g[0]) + u16::from(g[1]) + u16::from(g[2])) / 12;
-        let base = base as u8;
+        let base = u8::try_from(base).expect("765 / 12 fits a byte");
         *d = image::Rgba([base.saturating_add(pixel_largest.saturating_mul(4)), base, base, 255]);
     }
-    let pixels = (actual.width() * actual.height()) as f64;
+    let pixels = f64::from(actual.width()) * f64::from(actual.height());
     let difference = Difference {
         rmse: (squares / (pixels * 3.0)).sqrt() / 255.0,
         largest: f64::from(largest) / 255.0,
@@ -133,16 +135,25 @@ pub struct Game<'a> {
     pub scene: &'a Path,
 }
 
-pub fn run(test: TestOptions, game: Game, engine: wasmtime::Engine, module: GuestModule, catalog: Catalog) -> Result<()> {
+pub fn run(
+    test: TestOptions,
+    game: Game,
+    engine: wasmtime::Engine,
+    module: GuestModule,
+    catalog: Catalog,
+) -> Result<()> {
     let text = std::fs::read_to_string(&test.file).with_context(|| format!("reading {}", test.file.display()))?;
     let file: Scenarios = serde_json::from_str(&text).with_context(|| format!("parsing {}", test.file.display()))?;
     ensure!(file.size.0 > 0 && file.size.1 > 0, "visual size must not be empty");
     ensure!(file.fps.is_finite() && file.fps > 0.0, "visual fps must be finite and positive");
     ensure!((0.0..=1.0).contains(&file.threshold), "visual threshold must be within 0..1");
     ensure!(!file.scenarios.is_empty(), "visual scenarios must not be empty");
-    ensure!(test.only.is_empty() || file.scenarios.keys().any(|name| test.only.iter().any(|only| name.contains(only.as_str()))),
-        "no visual scenario matches --only");
-    let mut gpu = Some(Gpu::headless(file.size, game.assets)?);
+    ensure!(
+        test.only.is_empty()
+            || file.scenarios.keys().any(|name| test.only.iter().any(|only| name.contains(only.as_str()))),
+        "no visual scenario matches --only"
+    );
+    let mut gpu = Some(Gpu::headless(file.size, game.assets, test.software)?);
     let scratch = std::env::temp_dir().join(format!("pen-visual-{}", std::process::id()));
     let (mut passed, mut failed, mut updated) = (0, Vec::new(), 0);
     for (name, scenario) in &file.scenarios {
@@ -218,7 +229,11 @@ pub fn run(test: TestOptions, game: Game, engine: wasmtime::Engine, module: Gues
             let actual = image::open(&actual_path)?.to_rgba8();
             let golden = image::open(&golden_path)?.to_rgba8();
             if actual.dimensions() != golden.dimensions() {
-                failed.push(format!("{label}: {:?} but the golden image is {:?}", actual.dimensions(), golden.dimensions()));
+                failed.push(format!(
+                    "{label}: {:?} but the golden image is {:?}",
+                    actual.dimensions(),
+                    golden.dimensions()
+                ));
                 continue;
             }
             let diff = actual_path.with_extension("diff.png");

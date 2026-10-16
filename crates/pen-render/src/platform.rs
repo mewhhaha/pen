@@ -1,7 +1,8 @@
 // What differs between the native renderer and the one in the browser: where
 // asset bytes come from (files under the asset root, or fetched from under
-// its URL), how images are decoded, the clock, warnings, and how the
-// loader's work runs (threads, or tasks on the page's event loop).
+// its URL), how images are decoded, the clock, and how the loader's work runs
+// (threads, or tasks on the page's event loop). Warnings and timings go to
+// the `log` crate, for the host's logger.
 use anyhow::Result;
 
 use crate::texture::DecodedImage;
@@ -32,10 +33,6 @@ mod imp {
     /// Lets other work run between long steps; threads need not.
     pub async fn yield_now() {}
 
-    pub fn warn(message: &str) {
-        eprintln!("{message}");
-    }
-
     /// Seconds on a monotonic clock, from when it was made.
     pub struct Clock(std::time::Instant);
 
@@ -60,7 +57,12 @@ mod imp {
     use crate::texture::DecodedImage;
 
     fn failed(error: JsValue) -> anyhow::Error {
-        anyhow!(error.as_string().or_else(|| js_sys::JSON::stringify(&error).ok().and_then(|text| text.as_string())).unwrap_or_else(|| format!("{error:?}")))
+        anyhow!(
+            error
+                .as_string()
+                .or_else(|| js_sys::JSON::stringify(&error).ok().and_then(|text| text.as_string()))
+                .unwrap_or_else(|| format!("{error:?}"))
+        )
     }
 
     /// The page's global scope: a window, or a worker's.
@@ -92,9 +94,8 @@ mod imp {
         Ok(Uint8Array::new(&buffer).to_vec())
     }
 
-    /// The browser's own decoder, off the page's thread, as the TS client's
-    /// `decodeTexture` uses it: the image's bytes as they are, unconverted
-    /// and not premultiplied.
+    /// The browser's own decoder, off the page's thread: the image's bytes as
+    /// they are, unconverted and not premultiplied.
     pub async fn decode_image(bytes: Vec<u8>) -> Result<DecodedImage> {
         let parts = Array::of1(&Uint8Array::from(bytes.as_slice()));
         let blob = web_sys::Blob::new_with_u8_array_sequence(&parts).map_err(failed)?;
@@ -134,10 +135,6 @@ mod imp {
         let _ = JsFuture::from(promise).await;
     }
 
-    pub fn warn(message: &str) {
-        web_sys::console::warn_1(&message.into());
-    }
-
     fn milliseconds() -> f64 {
         let performance = js_sys::Reflect::get(&global(), &"performance".into()).unwrap();
         performance.unchecked_into::<web_sys::Performance>().now()
@@ -156,7 +153,7 @@ mod imp {
     }
 }
 
-pub(crate) use imp::{Clock, warn, yield_now};
+pub(crate) use imp::{Clock, yield_now};
 
 pub(crate) async fn read_asset(root: &str, key: &str) -> Result<Vec<u8>> {
     imp::read_asset(root, key).await

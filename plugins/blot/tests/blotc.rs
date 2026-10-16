@@ -11,8 +11,8 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pen_plugin_blot::native::NativeChild;
-use pen_plugin_blot::{Build, Diagnostic, Overlay, Program, Session};
+use pen_plugin_blot::native::{NativeChild, NativeFiles};
+use pen_plugin_blot::{Build, Diagnostic, Expectation, Overlay, Program, Session, find_tests};
 use serde_json::{Value, json};
 
 /// The sibling checkouts: blot2 and gdev.
@@ -162,7 +162,10 @@ fn builds_a_program() {
 #[test]
 fn native_assets_survive_edits_rejections_and_restarts() {
     let project = Project::new(&[
-        ("main.blot", "import * as settings from \"./settings.json\"\nentry const answer = fn () => (settings.value).answer\n"),
+        (
+            "main.blot",
+            "import * as settings from \"./settings.json\"\nentry const answer = fn () => (settings.value).answer\n",
+        ),
         ("settings.json", "{\"answer\":41}"),
     ]);
     let settings = json!({
@@ -268,25 +271,38 @@ fn refuses_a_compiler_it_did_not_expect() {
     assert!(error.contains("not the expected"), "{error}");
 }
 
-/// The sibling gdev checkout's `tests/math.blot`, as pen's `test-blot`
-/// compiles it alone: in place of `src/test_fixture.blot`, with gdev's
-/// packages behind `gdev/`. Skipped without the checkout.
+/// The sibling gdev checkout's `tests/math.blot`, laid out as pen's
+/// `test-blot` has the plugin lay it out, and compiled alone as it says: in
+/// place of `src/test_fixture.blot`, with gdev's compiler settings (its
+/// pen.json's). Skipped without the checkout.
 fn gdev_math() -> Option<(PathBuf, Vec<u8>)> {
     let gdev = std::fs::canonicalize(sibling("gdev")).ok()?;
     let math = gdev.join("tests/math.blot");
-    let Ok(source) = std::fs::read_to_string(&math) else {
-        eprintln!("skipped: no ../gdev/tests/math.blot");
+    let Ok(config) = std::fs::read_to_string(gdev.join("pen.json")) else {
+        eprintln!("skipped: no ../gdev/pen.json");
         return None;
     };
-    let fixture = gdev.join("src/test_fixture.blot").display().to_string();
-    let settings = json!({ "imports": { "gdev/": "packages/" }, "std": std_root() });
+    if !math.is_file() {
+        eprintln!("skipped: no ../gdev/tests/math.blot");
+        return None;
+    }
+    let config: Value = serde_json::from_str(&config).unwrap();
+    let settings = config["compiler"]["settings"].to_string();
+    let root = gdev.display().to_string();
+    let main = Program { root: root.clone(), entry: format!("{root}/src/main.blot"), settings: settings.clone() };
+    let mut modules = find_tests(&main, &[math.display().to_string()], None, &mut NativeFiles).unwrap();
+    let test = modules.pop().unwrap();
+    assert_eq!(
+        (test.entry.as_str(), &test.expect),
+        (format!("{root}/src/test_fixture.blot").as_str(), &Expectation::Checks)
+    );
     let cache = Project::new(&[]);
-    let program = Program { root: gdev.display().to_string(), entry: fixture.clone(), settings: settings.to_string() };
+    let program = Program { root, entry: test.entry, settings };
     let mut session = Session::open(&program, &cache.path("cache"), |_, args, env| {
         NativeChild::spawn(compiler(), args, env, &gdev).map_err(|error| error.to_string())
     })
     .unwrap();
-    let wasm = built(session.build(&[Overlay { path: fixture, contents: Some(source) }]));
+    let wasm = built(session.build(&test.overlays));
     Some((gdev, wasm))
 }
 

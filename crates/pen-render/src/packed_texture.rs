@@ -70,10 +70,7 @@ fn parse_header(bytes: &[u8]) -> Result<PackedHeader> {
     let levels = u32::from(bytes[7]);
     let expected = if kind == "exact" || kind == "raw" { 1 } else { mip_levels(width, height) };
     ensure!(levels == expected, "packed texture level count does not match its kind");
-    ensure!(
-        !((kind == "color" || kind == "cutout") && channels != 4),
-        "packed color texture needs four channels"
-    );
+    ensure!(!((kind == "color" || kind == "cutout") && channels != 4), "packed color texture needs four channels");
     let format = match channels {
         1 => wgpu::TextureFormat::R8Unorm,
         2 => wgpu::TextureFormat::Rg8Unorm,
@@ -109,11 +106,10 @@ impl PackedReader {
 
     /// The next level, or None once every level is read.
     pub fn next_level(&mut self) -> Result<Option<PackedLevel>> {
-        if self.next < 0 {
+        let Ok(level) = u32::try_from(self.next) else {
             ensure!(self.at == self.bytes.len(), "packed texture runs past its last level");
             return Ok(None);
-        }
-        let level = self.next as u32;
+        };
         self.next -= 1;
         let width = level_size(self.header.width, level);
         let height = level_size(self.header.height, level);
@@ -162,7 +158,7 @@ mod tests {
         bytes.extend(1u32.to_le_bytes());
         for level in [vec![7u8], vec![1, 2]] {
             let packed = deflate(&level);
-            bytes.extend((packed.len() as u32).to_le_bytes());
+            bytes.extend(u32::try_from(packed.len()).unwrap().to_le_bytes());
             bytes.extend(packed);
         }
         let mut reader = PackedReader::open(bytes.clone()).unwrap();

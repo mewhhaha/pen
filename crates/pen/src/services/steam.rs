@@ -27,7 +27,7 @@ impl SteamService {
     }
 }
 
-impl Service for SteamService {
+impl Service<crate::input::Input> for SteamService {
     fn code(&self) -> u32 {
         service::STEAM
     }
@@ -51,8 +51,12 @@ impl Service for SteamService {
 
 /// A whole number for an integer stat.
 #[cfg(feature = "steam")]
+#[allow(clippy::cast_possible_truncation, reason = "checked whole and within 2^24")]
 fn whole(value: f32) -> anyhow::Result<i32> {
-    anyhow::ensure!(value.fract() == 0.0 && value.abs() <= 16_777_216.0, "integer stats take whole numbers, not {value}");
+    anyhow::ensure!(
+        value.fract() == 0.0 && value.abs() <= 16_777_216.0,
+        "integer stats take whole numbers, not {value}"
+    );
     Ok(value as i32)
 }
 
@@ -70,9 +74,9 @@ fn answer(steam: &mut crate::steam::Steam, request: &Request) -> Answer {
         steam_op::GET_STAT => steam.stat(&name).map(|value| value as f32).or_else(|_| steam.stat_float(&name)),
         steam_op::SET_PRESENCE => {
             // The key is the text's first `a` code points, the value the rest.
-            let split = (a.max(0.0) as usize).min(request.values.len());
-            let key = super::text(&request.values[..split]);
-            let value = super::text(&request.values[split..]);
+            let split = pen_protocol::boundary::whole(a).map_or(0, |split| split as usize).min(request.values.len());
+            let key = pen_runtime::services::text(&request.values[..split]);
+            let value = pen_runtime::services::text(&request.values[split..]);
             steam.set_presence(&key, &value).map(|()| 0.0)
         }
         steam_op::CLEAR_PRESENCE => {

@@ -1,7 +1,6 @@
 // Material shaders (WGSL assets) and the pipelines they draw with, which the
-// loader's threads compile in the background as the TS compiles them with
-// `createRenderPipelineAsync`, and the renderer's thread on first use as it
-// does with `createRenderPipeline`.
+// loader's threads compile in the background: the variants a shader's loaded
+// materials draw with, for the sample counts frames draw at.
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
@@ -9,6 +8,7 @@ use std::task::{Context, Poll, Waker};
 use anyhow::{Result, bail};
 
 use crate::asset_store::MESH_VERTEX_FLOATS;
+use crate::pipeline_cache::PipelineCache;
 use crate::post::SCENE_FORMAT;
 
 /// What compiling a shader's pipelines needs; cheap to clone, shareable
@@ -20,8 +20,14 @@ pub(crate) struct PipelineContext {
     pub layout: wgpu::PipelineLayout,
     /// The layout every sprite pipeline shares.
     pub sprite_layout: wgpu::PipelineLayout,
+    /// The groups of those layouts.
+    pub scene_group: wgpu::BindGroupLayout,
+    pub draw_group: wgpu::BindGroupLayout,
+    pub sprite_group: wgpu::BindGroupLayout,
     /// The output (swapchain) format sprites blend over.
     pub format: wgpu::TextureFormat,
+    /// Where compiled pipelines are kept between runs, if anywhere.
+    pub cache: PipelineCache,
 }
 
 /// What error scopes caught: Ok once they come back empty, else the
@@ -84,71 +90,101 @@ pub(crate) async fn compile_shader(device: &wgpu::Device, bytes: &[u8]) -> Resul
     }
 }
 
-/// The parameters of the shader's `@vertex fn vertex(...)`, as the TS's
-/// `/@vertex\s+fn\s+vertex\s*\(([^)]*)\)/` finds them.
-fn vertex_inputs<'a>(code: &'a str, name: &str) -> Option<&'a str> {
-    let mut rest = code;
-    while let Some(at) = rest.find("@vertex") {
-        let after = &rest[at + "@vertex".len()..];
-        rest = after;
-        let trimmed = after.trim_start();
-        if trimmed.len() == after.len() {
-            continue;
+/// Each `@vertex fn NAME` in the code (`/@vertex\s+fn\s+NAME\b/`): its
+/// name and the code after it.
+fn vertex_entry_points(code: &str) -> impl Iterator<Item = (&str, &str)> {
+    code.match_indices("@vertex").filter_map(|(at, marker)| {
+        let after = &code[at + marker.len()..];
+        let after_fn = after.trim_start();
+        let named = after_fn.strip_prefix("fn").filter(|_| after_fn.len() < after.len())?;
+        let name = named.trim_start();
+        if name.len() == named.len() {
+            return None;
         }
-        let Some(after_fn) = trimmed.strip_prefix("fn") else { continue };
-        let named = after_fn.trim_start();
-        if named.len() == after_fn.len() {
-            continue;
-        }
-        let Some(after_name) = named.strip_prefix(name) else { continue };
-        let open = after_name.trim_start();
-        let Some(inputs) = open.strip_prefix('(') else { continue };
-        let end = inputs.find(')')?;
-        return Some(&inputs[..end]);
-    }
-    None
+        let end = name.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(name.len());
+        Some((&name[..end], &name[end..]))
+    })
 }
 
-/// Whether a shader draws sprites (its vertex stage takes only builtins),
-/// or None if it has no `vertex` entry point.
+/// Whether a shader draws sprites (its `vertex` entry point takes only
+/// builtins), or None if it has no `vertex` entry point.
 pub(crate) fn draws_sprites(code: &str) -> Option<bool> {
-    let inputs = vertex_inputs(code, "vertex")?;
+    let (_, rest) = vertex_entry_points(code).find(|&(name, _)| name == "vertex")?;
+    let inputs = rest.trim_start().strip_prefix('(')?;
+    let inputs = &inputs[..inputs.find(')')?];
     Some(inputs.split(',').all(|input| input.trim().is_empty() || input.trim().starts_with("@builtin")))
 }
 
-/// Whether it has a `vertex_instanced` entry point
-/// (`/@vertex\s+fn\s+vertex_instanced\b/`).
+/// Whether it has a `vertex_instanced` entry point.
 pub(crate) fn has_instancing(code: &str) -> bool {
-    let mut rest = code;
-    while let Some(at) = rest.find("@vertex") {
-        rest = &rest[at + "@vertex".len()..];
-        let trimmed = rest.trim_start();
-        if trimmed.len() == rest.len() {
-            continue;
-        }
-        let Some(after_fn) = trimmed.strip_prefix("fn") else { continue };
-        let named = after_fn.trim_start();
-        if named.len() == after_fn.len() {
-            continue;
-        }
-        if let Some(after) = named.strip_prefix("vertex_instanced")
-            && !after.starts_with(|c: char| c.is_alphanumeric() || c == '_')
-        {
-            return true;
-        }
-    }
-    false
+    vertex_entry_points(code).any(|(name, _)| name == "vertex_instanced")
 }
 
-/// A shader's pipelines: opaque surfaces, translucent ones blended over them,
-/// and overlays drawn once dimmed where the scene hides them and once at full
-/// strength where it does not.
-#[derive(Clone)]
+/// Which of a shader's pipelines: opaque surfaces (alone, or instanced),
+/// translucent ones blended over them, and overlays drawn once dimmed where
+/// the scene hides them and once at full strength where it does not.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Variants(u8);
+
+const VARIANT_NAMES: [(Variants, &str); 5] = [
+    (Variants::OPAQUE, "opaque"),
+    (Variants::TRANSLUCENT, "translucent"),
+    (Variants::OCCLUDED, "occluded"),
+    (Variants::VISIBLE, "visible"),
+    (Variants::INSTANCED, "instanced"),
+];
+
+impl std::fmt::Debug for Variants {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> =
+            VARIANT_NAMES.iter().filter(|(variant, _)| self.contains(*variant)).map(|(_, name)| *name).collect();
+        write!(formatter, "{}", if names.is_empty() { "none".to_owned() } else { names.join("+") })
+    }
+}
+
+impl Variants {
+    pub const NONE: Variants = Variants(0);
+    pub const OPAQUE: Variants = Variants(1);
+    pub const TRANSLUCENT: Variants = Variants(2);
+    pub const OCCLUDED: Variants = Variants(4);
+    pub const VISIBLE: Variants = Variants(8);
+    pub const INSTANCED: Variants = Variants(16);
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+    pub fn contains(self, other: Variants) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub fn without(self, other: Variants) -> Variants {
+        Variants(self.0 & !other.0)
+    }
+    /// Each variant it has, alone.
+    pub fn each(self) -> impl Iterator<Item = Variants> {
+        VARIANT_NAMES.into_iter().map(|(variant, _)| variant).filter(move |&variant| self.contains(variant))
+    }
+}
+
+impl std::ops::BitOr for Variants {
+    type Output = Variants;
+    fn bitor(self, other: Variants) -> Variants {
+        Variants(self.0 | other.0)
+    }
+}
+
+impl std::ops::BitOrAssign for Variants {
+    fn bitor_assign(&mut self, other: Variants) {
+        self.0 |= other.0;
+    }
+}
+
+/// Some of a shader's pipelines for one sample count.
+#[derive(Clone, Default)]
 pub(crate) struct Pipelines {
-    pub opaque: wgpu::RenderPipeline,
-    pub translucent: wgpu::RenderPipeline,
-    pub occluded: wgpu::RenderPipeline,
-    pub visible: wgpu::RenderPipeline,
+    pub opaque: Option<wgpu::RenderPipeline>,
+    pub translucent: Option<wgpu::RenderPipeline>,
+    pub occluded: Option<wgpu::RenderPipeline>,
+    pub visible: Option<wgpu::RenderPipeline>,
     pub instanced: Option<wgpu::RenderPipeline>,
 }
 
@@ -161,12 +197,32 @@ pub(crate) enum Layer {
 }
 
 impl Pipelines {
-    pub fn layer(&self, layer: Layer) -> &wgpu::RenderPipeline {
-        match layer {
-            Layer::Opaque => &self.opaque,
-            Layer::Translucent => &self.translucent,
-            Layer::Occluded => &self.occluded,
-            Layer::Visible => &self.visible,
+    /// The variants it has.
+    pub fn variants(&self) -> Variants {
+        [
+            (&self.opaque, Variants::OPAQUE),
+            (&self.translucent, Variants::TRANSLUCENT),
+            (&self.occluded, Variants::OCCLUDED),
+            (&self.visible, Variants::VISIBLE),
+            (&self.instanced, Variants::INSTANCED),
+        ]
+        .into_iter()
+        .filter(|(pipeline, _)| pipeline.is_some())
+        .fold(Variants::NONE, |variants, (_, variant)| variants | variant)
+    }
+
+    /// Takes `other`'s pipelines in where it has none.
+    pub fn merge(&mut self, other: Pipelines) {
+        for (mine, theirs) in [
+            (&mut self.opaque, other.opaque),
+            (&mut self.translucent, other.translucent),
+            (&mut self.occluded, other.occluded),
+            (&mut self.visible, other.visible),
+            (&mut self.instanced, other.instanced),
+        ] {
+            if mine.is_none() {
+                *mine = theirs;
+            }
         }
     }
 }
@@ -214,7 +270,7 @@ fn stamping(depth_write: bool) -> wgpu::StencilFaceState {
 }
 
 /// One of a shader's scene pipelines.
-pub(crate) fn variant(
+fn variant_of(
     context: &PipelineContext,
     module: &wgpu::ShaderModule,
     samples: u32,
@@ -263,19 +319,29 @@ pub(crate) fn variant(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: context.cache.get(),
     })
 }
 
-/// A shader's pipelines for `samples` per pixel.
-pub(crate) fn pipelines(context: &PipelineContext, module: &wgpu::ShaderModule, instancing: bool, samples: u32) -> Pipelines {
+/// The `variants` of a shader's pipelines for `samples` per pixel (its
+/// instanced one only if it has a `vertex_instanced` entry point).
+pub(crate) fn pipelines(
+    context: &PipelineContext,
+    module: &wgpu::ShaderModule,
+    instancing: bool,
+    samples: u32,
+    variants: Variants,
+) -> Pipelines {
     use wgpu::{BlendFactor, BlendOperation, CompareFunction};
+    let make = |variant: Variants, depth_write: bool, depth_compare, blend, instanced: bool| {
+        variants
+            .contains(variant)
+            .then(|| variant_of(context, module, samples, depth_write, depth_compare, blend, instanced))
+    };
     Pipelines {
-        opaque: variant(context, module, samples, true, CompareFunction::Less, None, false),
-        translucent: variant(
-            context,
-            module,
-            samples,
+        opaque: make(Variants::OPAQUE, true, CompareFunction::Less, None, false),
+        translucent: make(
+            Variants::TRANSLUCENT,
             false,
             CompareFunction::Less,
             Some(wgpu::BlendComponent {
@@ -286,10 +352,8 @@ pub(crate) fn pipelines(context: &PipelineContext, module: &wgpu::ShaderModule, 
             false,
         ),
         // The blend constant is OCCLUDED_STRENGTH.
-        occluded: variant(
-            context,
-            module,
-            samples,
+        occluded: make(
+            Variants::OCCLUDED,
             false,
             CompareFunction::Greater,
             Some(wgpu::BlendComponent {
@@ -299,13 +363,17 @@ pub(crate) fn pipelines(context: &PipelineContext, module: &wgpu::ShaderModule, 
             }),
             false,
         ),
-        visible: variant(context, module, samples, true, CompareFunction::LessEqual, None, false),
-        instanced: instancing.then(|| variant(context, module, samples, true, CompareFunction::Less, None, true)),
+        visible: make(Variants::VISIBLE, true, CompareFunction::LessEqual, None, false),
+        instanced: if instancing { make(Variants::INSTANCED, true, CompareFunction::Less, None, true) } else { None },
     }
 }
 
 /// A shader's depth-only pipeline into the shadow map.
-pub(crate) fn shadow_pipeline(context: &PipelineContext, module: &wgpu::ShaderModule, instanced: bool) -> wgpu::RenderPipeline {
+pub(crate) fn shadow_pipeline(
+    context: &PipelineContext,
+    module: &wgpu::ShaderModule,
+    instanced: bool,
+) -> wgpu::RenderPipeline {
     let buffers = vertex_buffers(instanced);
     context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("shadow"),
@@ -332,18 +400,8 @@ pub(crate) fn shadow_pipeline(context: &PipelineContext, module: &wgpu::ShaderMo
         multisample: Default::default(),
         fragment: None,
         multiview_mask: None,
-        cache: None,
+        cache: context.cache.get(),
     })
-}
-
-/// A shader's depth-only pipelines into the shadow map, plain and, if it has
-/// a `vertex_instanced` entry point, instanced.
-pub(crate) fn shadow_pipelines(
-    context: &PipelineContext,
-    module: &wgpu::ShaderModule,
-    instancing: bool,
-) -> [Option<wgpu::RenderPipeline>; 2] {
-    [Some(shadow_pipeline(context, module, false)), instancing.then(|| shadow_pipeline(context, module, true))]
 }
 
 /// A sprite shader's pipeline, blending over the output format.
@@ -383,7 +441,7 @@ pub(crate) fn sprite_pipeline(context: &PipelineContext, module: &wgpu::ShaderMo
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: context.cache.get(),
     })
 }
 
@@ -393,12 +451,18 @@ mod tests {
 
     #[test]
     fn sorts_sprite_shaders_from_mesh_shaders() {
-        let sprite = "@vertex fn vertex(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: u32) -> Corner {";
+        let sprite =
+            "@vertex fn vertex(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: u32) -> Corner {";
         let mesh = "@vertex fn vertex(input: VertexInput) -> VertexOutput {";
         assert_eq!(draws_sprites(sprite), Some(true));
         assert_eq!(draws_sprites(mesh), Some(false));
         assert_eq!(draws_sprites("@vertex fn vertex_instanced(input: I) {}"), None);
         assert!(has_instancing("@vertex\nfn vertex_instanced(input: I) {}"));
         assert!(!has_instancing("@vertex fn vertex_instancedx(input: I) {}"));
+        assert!(!has_instancing("@vertexfn vertex_instanced(input: I) {}"));
+        assert_eq!(
+            draws_sprites("@vertex fn vertex_instanced(i: I) {}\n@vertex fn vertex(@builtin(vertex_index) v: u32) {}"),
+            Some(true)
+        );
     }
 }

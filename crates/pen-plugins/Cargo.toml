@@ -3,7 +3,10 @@ name = "pen-plugins"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Hosts pen's Wasm plugins (wit/pen-plugin.wit): compiler and asset components"
+description = "Hosts pen's Wasm plugins (wit/pen-plugin.wit): compiler components"
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow.workspace = true
@@ -11,12 +14,13 @@ anyhow.workspace = true
 # in the builds that compile (pen's `plugins` feature).
 wasmtime = { workspace = true, features = ["component-model", "cranelift"] }
 wasmtime-wasi = { version = "49", default-features = false, features = ["p2"] }
+# A plugin's standard output and error, as streams of wasmtime-wasi's: what
+# their writes carry, and the trait of its asynchronous streams.
+bytes = "1"
+tokio = { version = "1", default-features = false }
 dirs = "7"
 flate2 = "1"
 notify = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-
-[dev-dependencies]
-serde_json = "1"

@@ -48,6 +48,7 @@ fn raster(kind: &str, width: u32, height: u32, motion: f64, samples: u32) -> Vec
                     );
                 }
             }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a coverage in 0..=255")]
             let value = (sum / f64::from(samples * samples) * 255.0).round() as u8;
             pixels.extend([value, value, value, 255]);
         }
@@ -70,18 +71,21 @@ fn uniform(width: u32, height: u32, output: (u32, u32), enabled: bool) -> [f32; 
 }
 
 fn code(mode: &str) -> String {
-    let quality = include_str!("../fxaa.wgsl");
+    let quality = include_str!("../shaders/fxaa.wgsl");
     let mut code = present_shader(1);
     if mode == "legacy" {
         code = code.replace(quality, include_str!("legacy_fxaa.wgsl"));
     } else {
         // Shader iteration needs no relink of the release renderer tests.
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/fxaa.wgsl");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders/fxaa.wgsl");
         code = code.replace(quality, &std::fs::read_to_string(path).unwrap());
         if let Ok(subpixel) = std::env::var("PEN_FXAA_TEST_SUBPIXEL") {
             let value: f32 = subpixel.parse().unwrap();
             assert!((0.0..=1.0).contains(&value));
-            code = code.replace("subpixel_curve * subpixel_curve * 0.25", &format!("subpixel_curve * subpixel_curve * {value:.2}"));
+            code = code.replace(
+                "subpixel_curve * subpixel_curve * 0.25",
+                &format!("subpixel_curve * subpixel_curve * {value:.2}"),
+            );
         }
     }
     code
@@ -96,8 +100,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Self {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
             .expect("FXAA image witnesses require a real or software WebGPU adapter");
         assert!(
@@ -105,10 +108,7 @@ impl Harness {
             "FXAA GPU measurements require TIMESTAMP_QUERY support"
         );
         let info = adapter.get_info();
-        eprintln!(
-            "FXAA adapter: {} {:?} {:?}",
-            info.name, info.backend, info.device_type
-        );
+        eprintln!("FXAA adapter: {} {:?} {:?}", info.name, info.backend, info.device_type);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             required_features: wgpu::Features::TIMESTAMP_QUERY,
             ..Default::default()
@@ -153,24 +153,15 @@ impl Harness {
             ty: wgpu::QueryType::Timestamp,
             count: 128,
         });
-        Self {
-            device,
-            queue,
-            pipelines,
-            timestamps,
-        }
+        Self { device, queue, pipelines, timestamps }
     }
 
     fn read(&self, buffer: &wgpu::Buffer) -> Vec<u8> {
         let (tx, rx) = mpsc::channel();
-        buffer
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                tx.send(result).unwrap();
-            });
-        self.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .unwrap();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         rx.recv().unwrap().unwrap();
         let bytes = buffer.slice(..).get_mapped_range().unwrap().to_vec();
         buffer.unmap();
@@ -198,35 +189,21 @@ impl Harness {
         source_format: wgpu::TextureFormat,
     ) -> (Vec<u8>, Vec<f64>) {
         let device = &self.device;
-        let texture = |size: (u32, u32), format, usage| {
-            super::texture(device, size.0, size.1, usage, 1, format, 1)
-        };
-        let source = texture(
-            size,
-            source_format,
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        );
+        let texture = |size: (u32, u32), format, usage| super::texture(device, size.0, size.1, usage, 1, format, 1);
+        let source = texture(size, source_format, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
         self.queue.write_texture(
             source.as_image_copy(),
             input,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(input.len() as u32 / size.1),
+                bytes_per_row: Some(u32::try_from(input.len()).unwrap() / size.1),
                 rows_per_image: None,
             },
             source.size(),
         );
-        let marks = texture(
-            size,
-            wgpu::TextureFormat::R8Uint,
-            wgpu::TextureUsages::TEXTURE_BINDING,
-        );
+        let marks = texture(size, wgpu::TextureFormat::R8Uint, wgpu::TextureUsages::TEXTURE_BINDING);
         let glow = texture((1, 1), FORMAT, wgpu::TextureUsages::TEXTURE_BINDING);
-        let target = texture(
-            output,
-            FORMAT,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        );
+        let target = texture(output, FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
         let values = uniform(size.0, size.1, output, mode != 0);
         let settings = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -234,8 +211,7 @@ impl Harness {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue
-            .write_buffer(&settings, 0, bytemuck::cast_slice(&values));
+        self.queue.write_buffer(&settings, 0, bytemuck::cast_slice(&values));
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -245,31 +221,19 @@ impl Harness {
             label: None,
             layout: &self.pipelines[mode].get_bind_group_layout(0),
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: settings.as_entire_binding(),
-                },
+                wgpu::BindGroupEntry { binding: 0, resource: settings.as_entire_binding() },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(
-                        &source.create_view(&Default::default()),
-                    ),
+                    resource: wgpu::BindingResource::TextureView(&source.create_view(&Default::default())),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(
-                        &marks.create_view(&Default::default()),
-                    ),
+                    resource: wgpu::BindingResource::TextureView(&marks.create_view(&Default::default())),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
-                    resource: wgpu::BindingResource::TextureView(
-                        &glow.create_view(&Default::default()),
-                    ),
+                    resource: wgpu::BindingResource::TextureView(&glow.create_view(&Default::default())),
                 },
             ],
         });
@@ -330,9 +294,7 @@ impl Harness {
             for pair in bytes.as_chunks::<16>().0 {
                 let start = u64::from_ne_bytes(pair[..8].try_into().unwrap());
                 let end = u64::from_ne_bytes(pair[8..].try_into().unwrap());
-                times.push(
-                    (end - start) as f64 * f64::from(self.queue.get_timestamp_period()) / 1e6,
-                );
+                times.push((end - start) as f64 * f64::from(self.queue.get_timestamp_period()) / 1e6);
             }
         }
         (image, times)
@@ -350,21 +312,13 @@ impl Harness {
             target.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &pixels,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(stride),
-                    rows_per_image: None,
-                },
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride), rows_per_image: None },
             },
             target.size(),
         );
         self.queue.submit([encoder.finish()]);
         let padded = self.read(&pixels);
-        padded
-            .chunks(stride as usize)
-            .flat_map(|row| &row[..(target.width() * 4) as usize])
-            .copied()
-            .collect()
+        padded.chunks(stride as usize).flat_map(|row| &row[..(target.width() * 4) as usize]).copied().collect()
     }
 }
 
@@ -389,14 +343,8 @@ fn hud_witness(gpu: &Harness, root: &Path) {
             "triangle.json",
             r#"{"positions":[-0.8,-0.8,0.5,0.8,-0.8,0.5,0.3,0.8,0.5],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],"indices":[0,1,2]}"#,
         ),
-        (
-            "background.json",
-            r#"{"shader":"background.wgsl","color":[1,1,1,1],"lighting":"unlit"}"#,
-        ),
-        (
-            "hud.json",
-            r#"{"shader":"hud.wgsl","color":[1,1,1,1],"lighting":"unlit"}"#,
-        ),
+        ("background.json", r#"{"shader":"background.wgsl","color":[1,1,1,1],"lighting":"unlit"}"#),
+        ("hud.json", r#"{"shader":"hud.wgsl","color":[1,1,1,1],"lighting":"unlit"}"#),
         (
             "background.wgsl",
             r#"
@@ -433,40 +381,17 @@ struct Sprite { rect: vec4f, uv: vec4f, color: vec4f, parameters: vec4f };
     let mut renderer = crate::Renderer::new(
         gpu.device.clone(),
         gpu.queue.clone(),
-        crate::RendererOptions {
-            format: FORMAT,
-            assets,
-            veil: None,
-        },
+        crate::RendererOptions { format: FORMAT, assets, veil: None, pipeline_cache: None },
     )
     .unwrap();
     renderer.preload(&catalog);
     let mut frame = RenderFrame {
         view: crate::matrix::IDENTITY,
         projection: crate::matrix::IDENTITY,
-        quality: Quality {
-            msaa: 1,
-            scale: 1.0,
-            filtering: 1,
-            ..Default::default()
-        },
-        light_direction: pen_protocol::Vector {
-            x: 0.0,
-            y: 1.0,
-            z: 0.0,
-        },
-        clear: Color {
-            r: 0.1,
-            g: 0.1,
-            b: 0.1,
-            a: 1.0,
-        },
-        draws: vec![Draw {
-            mesh: 0,
-            material: 0,
-            transform: crate::matrix::IDENTITY,
-            ..Default::default()
-        }],
+        quality: Quality { msaa: 1, scale: 1.0, filtering: 1, ..Default::default() },
+        light_direction: pen_protocol::Vector { x: 0.0, y: 1.0, z: 0.0 },
+        clear: Color { r: 0.1, g: 0.1, b: 0.1, a: 1.0 },
+        draws: vec![Draw { mesh: 0, material: 0, transform: crate::matrix::IDENTITY, ..Default::default() }],
         sprites: vec![Sprite {
             x: 12.0,
             y: 16.0,
@@ -478,13 +403,7 @@ struct Sprite { rect: vec4f, uv: vec4f, color: vec4f, parameters: vec4f };
         }],
         ..Default::default()
     };
-    let overlay = [Sprite {
-        x: 70.0,
-        y: 50.0,
-        width: 16.0,
-        height: 16.0,
-        ..frame.sprites[0]
-    }];
+    let overlay = [Sprite { x: 70.0, y: 50.0, width: 16.0, height: 16.0, ..frame.sprites[0] }];
     for (size, scale) in [((WIDTH, HEIGHT), 1.0), ((91, 71), 0.5), ((192, 144), 1.0)] {
         let mut target = Target(super::texture(
             &gpu.device,
@@ -505,70 +424,33 @@ struct Sprite { rect: vec4f, uv: vec4f, color: vec4f, parameters: vec4f };
             {
                 break;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "HUD image assets did not load"
-            );
+            assert!(std::time::Instant::now() < deadline, "HUD image assets did not load");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let mut images = Vec::new();
         for enabled in [false, true] {
             frame.quality.fxaa = enabled;
             renderer.submit(&frame, &catalog, &mut target).unwrap();
-            renderer
-                .overlay(
-                    &overlay,
-                    &catalog,
-                    &target.0.create_view(&Default::default()),
-                    size,
-                )
-                .unwrap();
-            images.push(gpu.read_texture(
-                &target.0,
-                gpu.device.create_command_encoder(&Default::default()),
-            ));
+            renderer.overlay(&overlay, &catalog, &target.0.create_view(&Default::default()), size).unwrap();
+            images.push(gpu.read_texture(&target.0, gpu.device.create_command_encoder(&Default::default())));
         }
-        assert_ne!(
-            images[0], images[1],
-            "scene AA must actually run in HUD witness"
-        );
+        assert_ne!(images[0], images[1], "scene AA must actually run in HUD witness");
         for rect in [(12, 16, 48, 20), (70, 50, 16, 16)] {
             for y in rect.1..rect.1 + rect.3 {
                 for x in rect.0..rect.0 + rect.2 {
                     let at = ((y * size.0 + x) * 4) as usize;
-                    assert_eq!(
-                        &images[0][at..at + 4],
-                        &images[1][at..at + 4],
-                        "HUD/UI changed at {x},{y}"
-                    );
+                    assert_eq!(&images[0][at..at + 4], &images[1][at..at + 4], "HUD/UI changed at {x},{y}");
                 }
             }
         }
-        save(
-            root,
-            &format!("hud-{}x{}-off.png", size.0, size.1),
-            &images[0],
-            size,
-        );
-        save(
-            root,
-            &format!("hud-{}x{}-quality.png", size.0, size.1),
-            &images[1],
-            size,
-        );
+        save(root, &format!("hud-{}x{}-off.png", size.0, size.1), &images[0], size);
+        save(root, &format!("hud-{}x{}-quality.png", size.0, size.1), &images[1], size);
     }
 }
 
 fn save(root: &Path, name: &str, pixels: &[u8], size: (u32, u32)) {
     std::fs::write(root.join(name).with_extension("rgba"), pixels).unwrap();
-    image::save_buffer(
-        root.join(name),
-        pixels,
-        size.0,
-        size.1,
-        image::ColorType::Rgba8,
-    )
-    .unwrap();
+    image::save_buffer(root.join(name), pixels, size.0, size.1, image::ColorType::Rgba8).unwrap();
 }
 
 fn error(image: &[u8], reference: &[u8]) -> f64 {
@@ -602,41 +484,22 @@ fn fxaa_quality_images_motion_resize_and_gpu_cost() {
         let reference = raster(kind, WIDTH, HEIGHT, 0.0, 16);
         std::fs::write(root.join(format!("{kind}-input.rgba")), &input).unwrap();
         save(&root, &format!("{kind}-input.png"), &input, (WIDTH, HEIGHT));
-        save(
-            &root,
-            &format!("{kind}-reference.png"),
-            &reference,
-            (WIDTH, HEIGHT),
-        );
+        save(&root, &format!("{kind}-reference.png"), &reference, (WIDTH, HEIGHT));
         let mut errors = Vec::new();
         let mut changes = Vec::new();
         for (mode, name) in MODES.iter().enumerate() {
             let (image, _) = gpu.draw(&input, (WIDTH, HEIGHT), (WIDTH, HEIGHT), mode, false);
             errors.push(error(&image, &reference));
             changes.push(error(&image, &input));
-            save(
-                &root,
-                &format!("{kind}-{name}.png"),
-                &image,
-                (WIDTH, HEIGHT),
-            );
+            save(&root, &format!("{kind}-{name}.png"), &image, (WIDTH, HEIGHT));
         }
         eprintln!("FXAA {kind} MAE off/legacy/quality: {errors:?}");
         if kind == "diagonal" || kind == "fence" {
-            assert!(
-                errors[2] < errors[0],
-                "quality must reduce supersampled {kind} error"
-            );
-            assert!(
-                errors[2] < errors[1],
-                "quality must improve on legacy {kind} error"
-            );
+            assert!(errors[2] < errors[0], "quality must reduce supersampled {kind} error");
+            assert!(errors[2] < errors[1], "quality must improve on legacy {kind} error");
         }
         if kind == "detail" {
-            assert_eq!(
-                changes[2], 0.0,
-                "quality must preserve low-contrast texture exactly"
-            );
+            assert_eq!(changes[2], 0.0, "quality must preserve low-contrast texture exactly");
             results.insert("detail_change_mae".into(), serde_json::json!(changes));
         }
         results.insert(format!("{kind}_mae"), serde_json::json!(errors));
@@ -655,37 +518,10 @@ fn fxaa_quality_images_motion_resize_and_gpu_cost() {
             }
         }
     }
-    let hdr_off = gpu
-        .draw_format(
-            &hdr,
-            (WIDTH, HEIGHT),
-            (WIDTH, HEIGHT),
-            0,
-            false,
-            SCENE_FORMAT,
-        )
-        .0;
-    let hdr_aa = gpu
-        .draw_format(
-            &hdr,
-            (WIDTH, HEIGHT),
-            (WIDTH, HEIGHT),
-            2,
-            false,
-            SCENE_FORMAT,
-        )
-        .0;
-    assert_eq!(
-        hdr_off, hdr_aa,
-        "FXAA contrast must use the toned display values"
-    );
-    assert!(
-        hdr_aa
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|pixel| (253..=254).contains(&pixel[0]))
-    );
+    let hdr_off = gpu.draw_format(&hdr, (WIDTH, HEIGHT), (WIDTH, HEIGHT), 0, false, SCENE_FORMAT).0;
+    let hdr_aa = gpu.draw_format(&hdr, (WIDTH, HEIGHT), (WIDTH, HEIGHT), 2, false, SCENE_FORMAT).0;
+    assert_eq!(hdr_off, hdr_aa, "FXAA contrast must use the toned display values");
+    assert!(hdr_aa.as_chunks::<4>().0.iter().all(|pixel| (253..=254).contains(&pixel[0])));
 
     // Error in temporal change, relative to independently supersampled motion.
     let mut shimmer = [0.0; 3];
@@ -694,12 +530,8 @@ fn fxaa_quality_images_motion_resize_and_gpu_cost() {
         let motion = f64::from(frame) * 0.17;
         let input = raster("fence", WIDTH, HEIGHT, motion, 1);
         let reference = raster("fence", WIDTH, HEIGHT, motion, 16);
-        let images: Vec<_> = (0..3)
-            .map(|mode| {
-                gpu.draw(&input, (WIDTH, HEIGHT), (WIDTH, HEIGHT), mode, false)
-                    .0
-            })
-            .collect();
+        let images: Vec<_> =
+            (0..3).map(|mode| gpu.draw(&input, (WIDTH, HEIGHT), (WIDTH, HEIGHT), mode, false).0).collect();
         for mode in 0..3 {
             save(&root, &format!("motion-{frame:02}-{}.png", MODES[mode]), &images[mode], (WIDTH, HEIGHT));
         }
@@ -707,21 +539,16 @@ fn fxaa_quality_images_motion_resize_and_gpu_cost() {
         if let Some((last_images, last_reference)) = previous {
             for mode in 0..3 {
                 for pixel in (0..input.len()).step_by(4) {
-                    let change =
-                        f64::from(images[mode][pixel]) - f64::from(last_images[mode][pixel]);
+                    let change = f64::from(images[mode][pixel]) - f64::from(last_images[mode][pixel]);
                     let expected = f64::from(reference[pixel]) - f64::from(last_reference[pixel]);
-                    shimmer[mode] +=
-                        (change - expected).abs() / 255.0 / f64::from(WIDTH * HEIGHT) / 11.0;
+                    shimmer[mode] += (change - expected).abs() / 255.0 / f64::from(WIDTH * HEIGHT) / 11.0;
                 }
             }
         }
         previous = Some((images, reference));
     }
     eprintln!("FXAA temporal residual off/legacy/quality: {shimmer:?}");
-    assert!(
-        shimmer[2] < shimmer[0],
-        "quality must reduce spatial aliasing shimmer in this motion witness"
-    );
+    assert!(shimmer[2] < shimmer[0], "quality must reduce spatial aliasing shimmer in this motion witness");
     results.insert("temporal_mae".into(), serde_json::json!(shimmer));
 
     // Source texels stay separate from output pixels through resizes/scales.
@@ -730,44 +557,22 @@ fn fxaa_quality_images_motion_resize_and_gpu_cost() {
         let (image, _) = gpu.draw(&input, (WIDTH, HEIGHT), output, 2, false);
         assert_eq!(image.len(), (output.0 * output.1 * 4) as usize);
         assert!(image.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 255));
-        assert!(
-            image
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .all(|pixel| (25..=217).contains(&pixel[0]))
-        );
-        save(
-            &root,
-            &format!("resize-{}x{}.png", output.0, output.1),
-            &image,
-            output,
-        );
+        assert!(image.as_chunks::<4>().0.iter().all(|pixel| (25..=217).contains(&pixel[0])));
+        save(&root, &format!("resize-{}x{}.png", output.0, output.1), &image, output);
     }
 
     for size in [(1920, 1080), (2560, 1440)] {
         let input = raster("fence", size.0, size.1, 0.0, 1);
-        let half: Vec<u8> = input.iter().flat_map(|value| {
-            crate::renderer::half_of(f32::from(*value) / 255.0).to_le_bytes()
-        }).collect();
+        let half: Vec<u8> =
+            input.iter().flat_map(|value| crate::renderer::half_of(f32::from(*value) / 255.0).to_le_bytes()).collect();
         for (mode, name) in MODES.iter().enumerate() {
             let (_, mut times) = gpu.draw_format(&half, size, size, mode, true, SCENE_FORMAT);
             times.sort_by(f64::total_cmp);
             let spread = [times[3], times[32], times[60]];
-            eprintln!(
-                "FXAA GPU {}x{} {name} p05/median/p95 ms: {spread:?}",
-                size.0, size.1
-            );
-            results.insert(
-                format!("{}x{}_{name}_gpu_ms", size.0, size.1),
-                serde_json::json!(spread),
-            );
+            eprintln!("FXAA GPU {}x{} {name} p05/median/p95 ms: {spread:?}", size.0, size.1);
+            results.insert(format!("{}x{}_{name}_gpu_ms", size.0, size.1), serde_json::json!(spread));
         }
     }
-    std::fs::write(
-        root.join("results.json"),
-        serde_json::to_vec_pretty(&results).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(root.join("results.json"), serde_json::to_vec_pretty(&results).unwrap()).unwrap();
     eprintln!("FXAA witnesses: {}", root.display());
 }

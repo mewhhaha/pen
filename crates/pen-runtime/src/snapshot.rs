@@ -3,6 +3,8 @@
 use anyhow::{Result, ensure};
 use pen_protocol::boundary::{MAX_STATE_FLOATS, validate_schema, validate_state};
 
+/// The save format's identifier, whatever the game: it keeps the name of the
+/// first game that saved in it, and changing it would orphan every save.
 const MAGIC: &[u8; 8] = b"GDEVSAVE";
 pub const HEADER_BYTES: usize = 20;
 
@@ -19,7 +21,7 @@ pub fn encode(saved: &SavedState) -> Result<Vec<u8>> {
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&1u32.to_le_bytes());
     bytes.extend_from_slice(&saved.schema.to_le_bytes());
-    bytes.extend_from_slice(&(saved.state.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(&u32::try_from(saved.state.len())?.to_le_bytes());
     for value in &saved.state {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
@@ -28,25 +30,16 @@ pub fn encode(saved: &SavedState) -> Result<Vec<u8>> {
 
 pub fn decode(bytes: &[u8]) -> Result<SavedState> {
     ensure!(
-        bytes.len() >= HEADER_BYTES
-            && bytes.len() <= HEADER_BYTES + MAX_STATE_FLOATS * 4
-            && bytes.starts_with(MAGIC),
+        bytes.len() >= HEADER_BYTES && bytes.len() <= HEADER_BYTES + MAX_STATE_FLOATS * 4 && bytes.starts_with(MAGIC),
         "file is not a bounded gdev quicksave"
     );
     let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
     let schema = word(12);
     let length = word(16) as usize;
-    ensure!(
-        word(8) == 1 && bytes.len() == HEADER_BYTES + length * 4,
-        "invalid quicksave version or length"
-    );
+    ensure!(word(8) == 1 && bytes.len() == HEADER_BYTES + length * 4, "invalid quicksave version or length");
     validate_schema(schema as f32)?;
-    let state: Vec<f32> = bytes[HEADER_BYTES..]
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|chunk| f32::from_le_bytes(*chunk))
-        .collect();
+    let state: Vec<f32> =
+        bytes[HEADER_BYTES..].as_chunks::<4>().0.iter().map(|chunk| f32::from_le_bytes(*chunk)).collect();
     validate_state(&state)?;
     Ok(SavedState { schema, state })
 }

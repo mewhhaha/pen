@@ -68,7 +68,7 @@ fn gtex(color: [u8; 4]) -> Vec<u8> {
         let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
         encoder.write_all(&color.repeat(size * size)).unwrap();
         let packed = encoder.finish().unwrap();
-        bytes.extend((packed.len() as u32).to_le_bytes());
+        bytes.extend(u32::try_from(packed.len()).unwrap().to_le_bytes());
         bytes.extend(packed);
     }
     bytes
@@ -85,7 +85,11 @@ fn assets() -> PathBuf {
     write(&root, "tri.mesh.json", mesh(-0.5));
     write(&root, "tinted.wgsl", TINTED);
     write(&root, "paint.png", png([255, 0, 0, 255]));
-    write(&root, "paint.material.json", br#"{"shader":"tinted.wgsl","texture":"paint.png","color":[1,1,1,1],"lighting":"unlit"}"#);
+    write(
+        &root,
+        "paint.material.json",
+        br#"{"shader":"tinted.wgsl","texture":"paint.png","color":[1,1,1,1],"lighting":"unlit"}"#,
+    );
     root
 }
 
@@ -106,9 +110,12 @@ fn reloaded_assets_replace_the_live_ones() {
     };
     let root = assets();
     let catalog = boundary::read_catalog(&root).unwrap();
-    let mut renderer =
-        Renderer::new(device.clone(), queue.clone(), RendererOptions { format: FORMAT, assets: root.clone(), veil: None })
-            .unwrap();
+    let mut renderer = Renderer::new(
+        device.clone(),
+        queue.clone(),
+        RendererOptions { format: FORMAT, assets: root.clone(), veil: None, pipeline_cache: None },
+    )
+    .unwrap();
     renderer.preload(&catalog);
     let mut target = Offscreen::new(&device, 64);
     let draw = Draw { material: 0, mesh: 0, transform: IDENTITY, parameters: None, extra: None };
@@ -129,7 +136,11 @@ fn reloaded_assets_replace_the_live_ones() {
     assert!(near(middle(&device, &queue, &target.0), [0, full, 0]), "green once the texture reloads");
 
     // A new material: its color halves the texture's.
-    write(&root, "paint.material.json", br#"{"shader":"tinted.wgsl","texture":"paint.png","color":[0.5,0.5,0.5,1],"lighting":"unlit"}"#);
+    write(
+        &root,
+        "paint.material.json",
+        br#"{"shader":"tinted.wgsl","texture":"paint.png","color":[0.5,0.5,0.5,1],"lighting":"unlit"}"#,
+    );
     renderer.reload(&keys(&["paint.material.json"]));
     pump(&mut renderer, &frame, &catalog, &mut target, |events| ready(events, "paint.material.json", 2));
     let pixel = middle(&device, &queue, &target.0);
@@ -166,11 +177,18 @@ fn reloaded_assets_replace_the_live_ones() {
 
     // A catalog with another material, ahead of the first, preloaded again.
     write(&root, "white.material.json", br#"{"shader":"tinted.wgsl","color":[1,1,1,1],"lighting":"unlit"}"#);
-    write(&root, "catalog.json", br#"{"meshes":["tri.mesh.json"],"materials":["white.material.json","paint.material.json"]}"#);
+    write(
+        &root,
+        "catalog.json",
+        br#"{"meshes":["tri.mesh.json"],"materials":["white.material.json","paint.material.json"]}"#,
+    );
     let catalog = boundary::read_catalog(&root).unwrap();
     renderer.preload(&catalog);
     pump(&mut renderer, &frame, &catalog, &mut target, |events| ready(events, "white.material.json", 1));
-    assert!(near(middle(&device, &queue, &target.0), [full, full, full]), "white from the new catalog's first material");
+    assert!(
+        near(middle(&device, &queue, &target.0), [full, full, full]),
+        "white from the new catalog's first material"
+    );
     let paint = common::frame(vec![Draw { material: 1, ..draw.clone() }]);
     renderer.submit(&paint, &catalog, &mut target).unwrap();
     assert!(near(middle(&device, &queue, &target.0), [0, 128, 0]), "the old material at its new index");
@@ -178,7 +196,11 @@ fn reloaded_assets_replace_the_live_ones() {
     // The material now names a packed texture, which streams in; then that
     // texture changes too, while the old one may still be streaming.
     write(&root, "paint.gtex", gtex([255, 255, 0, 255]));
-    write(&root, "paint.material.json", br#"{"shader":"tinted.wgsl","texture":"paint.gtex","color":[1,1,1,1],"lighting":"unlit"}"#);
+    write(
+        &root,
+        "paint.material.json",
+        br#"{"shader":"tinted.wgsl","texture":"paint.gtex","color":[1,1,1,1],"lighting":"unlit"}"#,
+    );
     renderer.reload(&keys(&["paint.material.json"]));
     pump(&mut renderer, &paint, &catalog, &mut target, |events| ready(events, "paint.gtex", 1));
     assert!(near(middle(&device, &queue, &target.0), [full, full, 0]), "yellow from the packed texture");

@@ -3,13 +3,8 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 fn doc(text: Option<&str>, indent: &str) -> Vec<String> {
-    text.map(|text| {
-        wrap(text, 96 - indent.len() - 4)
-            .iter()
-            .map(|line| format!("{indent}/// {line}"))
-            .collect()
-    })
-    .unwrap_or_default()
+    text.map(|text| wrap(text, 96 - indent.len() - 4).iter().map(|line| format!("{indent}/// {line}")).collect())
+        .unwrap_or_default()
 }
 fn field_type(model: &Model, field: &Value) -> (String, bool) {
     let ty = match kind(field) {
@@ -23,15 +18,7 @@ fn field_type(model: &Model, field: &Value) -> (String, bool) {
         "tail" => return ("Option<Vec<f32>>".to_owned(), false),
         "children" => {
             return (
-                format!(
-                    "Vec<{}>",
-                    s(&model
-                        .section(s(&field["section"]))
-                        .fixed
-                        .as_ref()
-                        .unwrap()
-                        .record["name"])
-                ),
+                format!("Vec<{}>", s(&model.section(s(&field["section"])).fixed.as_ref().unwrap().record["name"])),
                 false,
             );
         }
@@ -47,12 +34,7 @@ struct Member {
 }
 fn member(model: &Model, laid: &Laid) -> Member {
     let (ty, copy) = field_type(model, &laid.field);
-    Member {
-        name: laid.name.clone(),
-        ty,
-        copy,
-        doc: text(&laid.field, "doc"),
-    }
+    Member { name: laid.name.clone(), ty, copy, doc: text(&laid.field, "doc") }
 }
 fn structure(name: &str, about: Option<&str>, fields: &[Member]) -> Vec<String> {
     let mut out = doc(about, "    ");
@@ -60,9 +42,7 @@ fn structure(name: &str, about: Option<&str>, fields: &[Member]) -> Vec<String> 
     if fields.iter().all(|field| field.copy) {
         copy = "Copy, ";
     }
-    out.push(format!(
-        "    #[derive(Clone, {copy}Debug, Default, PartialEq)]"
-    ));
+    out.push(format!("    #[derive(Clone, {copy}Debug, Default, PartialEq)]"));
     out.push(format!("    pub struct {name} {{"));
     for field in fields {
         out.extend(doc(field.doc.as_deref(), "        "));
@@ -86,86 +66,46 @@ fn emit_record(
     if let Some(field) = extra {
         fields.push(field);
     }
-    out.extend(structure(
-        s(&record["name"]),
-        record["doc"].as_str(),
-        &fields,
-    ));
+    out.extend(structure(s(&record["name"]), record["doc"].as_str(), &fields));
 }
 fn types(model: &Model) -> Vec<String> {
     let protocol = &model.protocol;
     let mut out = "/// The packets' meaning, as hosts see it. Asset references are indices into the\n/// [`Catalog`]; the decoder has checked each one is in range.\npub mod types {\n    /// A column-major 4x4 matrix, as WGSL and the packet lay it out.\n    pub type Matrix = [f32; 16];".lines().map(str::to_owned).collect::<Vec<_>>();
     for enumeration in array(&protocol["enumerations"]) {
         out.extend(doc(enumeration["doc"].as_str(), "    "));
-        out.push(format!(
-            "    pub mod {} {{",
-            s(&enumeration["constant"]).to_lowercase()
-        ));
+        out.push(format!("    pub mod {} {{", s(&enumeration["constant"]).to_lowercase()));
         for (code, value) in array(&enumeration["values"]).iter().enumerate() {
-            out.push(format!(
-                "        pub const {}: u32 = {code};",
-                s(value).to_uppercase()
-            ));
+            out.push(format!("        pub const {}: u32 = {code};", s(value).to_uppercase()));
         }
         out.push("        /// The names of the codes, by code.".to_owned());
         out.push(format!(
             "        pub const NAMES: [&str; {}] = [{}];",
             array(&enumeration["values"]).len(),
-            array(&enumeration["values"])
-                .iter()
-                .map(quote)
-                .collect::<Vec<_>>()
-                .join(", ")
+            array(&enumeration["values"]).iter().map(quote).collect::<Vec<_>>().join(", ")
         ));
         out.push("    }".to_owned());
     }
     for vector in array(&protocol["vectors"]) {
         let fields = array(&vector["components"])
             .iter()
-            .map(|name| Member {
-                name: s(name).to_owned(),
-                ty: "f32".to_owned(),
-                copy: true,
-                doc: None,
-            })
+            .map(|name| Member { name: s(name).to_owned(), ty: "f32".to_owned(), copy: true, doc: None })
             .collect::<Vec<_>>();
-        out.extend(structure(
-            s(&vector["name"]),
-            vector["doc"].as_str(),
-            &fields,
-        ));
+        out.extend(structure(s(&vector["name"]), vector["doc"].as_str(), &fields));
     }
     out.extend(structure(
         "Viewport",
         None,
         &[
-            Member {
-                name: "width".to_owned(),
-                ty: "u32".to_owned(),
-                copy: true,
-                doc: None,
-            },
-            Member {
-                name: "height".to_owned(),
-                ty: "u32".to_owned(),
-                copy: true,
-                doc: None,
-            },
+            Member { name: "width".to_owned(), ty: "u32".to_owned(), copy: true, doc: None },
+            Member { name: "height".to_owned(), ty: "u32".to_owned(), copy: true, doc: None },
         ],
     ));
-    out.extend([
-        "    #[derive(Clone, Debug, PartialEq)]".to_owned(),
-        "    pub enum GameEvent {".to_owned(),
-    ]);
+    out.extend(["    #[derive(Clone, Debug, PartialEq)]".to_owned(), "    pub enum GameEvent {".to_owned()]);
     for event in model.events() {
         for host in hosts(event) {
             let name = s(&host["name"]);
             out.extend(doc(host["doc"].as_str(), "        "));
-            let fields = if host["fields"].is_object() {
-                &host["fields"]
-            } else {
-                &event["fields"]
-            };
+            let fields = if host["fields"].is_object() { &host["fields"] } else { &event["fields"] };
             if fields.is_object() {
                 out.push(format!(
                     "        {name} {{ {} }},",
@@ -199,38 +139,19 @@ fn types(model: &Model) -> Vec<String> {
     ));
     out.push("    impl Catalog {".to_owned());
     for (name, list) in object(&protocol["catalog"]) {
-        out.push(format!(
-            "        pub fn {name}(&self, index: u32) -> &str {{"
-        ));
-        out.push(format!(
-            "            &self.{}[index as usize]",
-            s(&list["list"])
-        ));
+        out.push(format!("        pub fn {name}(&self, index: u32) -> &str {{"));
+        out.push(format!("            &self.{}[index as usize]", s(&list["list"])));
         out.push("        }".to_owned());
     }
     out.push("    }".to_owned());
     let mut emitted = HashSet::new();
     for entry in &model.sections {
         if let Some(layout) = &entry.fixed {
-            emit_record(
-                &mut out,
-                model,
-                &layout.record,
-                &layout.fields,
-                None,
-                &mut emitted,
-            );
+            emit_record(&mut out, model, &layout.record, &layout.fields, None, &mut emitted);
         }
         if kind(&entry.section) == "variable" {
             if let Some(layout) = &entry.item {
-                emit_record(
-                    &mut out,
-                    model,
-                    &layout.record,
-                    &layout.fields,
-                    None,
-                    &mut emitted,
-                );
+                emit_record(&mut out, model, &layout.record, &layout.fields, None, &mut emitted);
             }
             let record = &entry.section["record"];
             let rest = &record["rest"];
@@ -243,12 +164,7 @@ fn types(model: &Model) -> Vec<String> {
                 model,
                 record,
                 &entry.head,
-                Some(Member {
-                    name: s(&rest["name"]).to_owned(),
-                    ty,
-                    copy: false,
-                    doc: text(rest, "doc"),
-                }),
+                Some(Member { name: s(&rest["name"]).to_owned(), ty, copy: false, doc: text(rest, "doc") }),
                 &mut emitted,
             );
         }
@@ -274,17 +190,14 @@ fn types(model: &Model) -> Vec<String> {
             }
             let value = &protocol["render"]["groups"][group];
             let mut ty = s(&value["type"]).to_owned();
-            if model.header.iter().any(|other| {
-                other.group.as_ref() == Some(group) && kind(&other.laid.field) == "present"
-            }) {
+            if model
+                .header
+                .iter()
+                .any(|other| other.group.as_ref() == Some(group) && kind(&other.laid.field) == "present")
+            {
                 ty = format!("Option<{ty}>");
             }
-            frame.push(Member {
-                name: group.clone(),
-                ty,
-                copy: true,
-                doc: text(value, "doc"),
-            });
+            frame.push(Member { name: group.clone(), ty, copy: true, doc: text(value, "doc") });
         } else {
             frame.push(member(model, &entry.laid));
         }
@@ -302,28 +215,13 @@ fn types(model: &Model) -> Vec<String> {
             "lanes" => "Vec<f32>".to_owned(),
             _ => format!("Vec<{}>", s(&section["record"]["name"])),
         };
-        frame.push(Member {
-            name: s(&section["name"]).to_owned(),
-            ty,
-            copy: false,
-            doc: text(section, "doc"),
-        });
+        frame.push(Member { name: s(&section["name"]).to_owned(), ty, copy: false, doc: text(section, "doc") });
     }
-    out.extend(structure(
-        "RenderFrame",
-        protocol["render"]["doc"].as_str(),
-        &frame,
-    ));
+    out.extend(structure("RenderFrame", protocol["render"]["doc"].as_str(), &frame));
     out.push("}".to_owned());
     out
 }
-fn add_constant(
-    out: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-    name: String,
-    value: usize,
-    about: String,
-) {
+fn add_constant(out: &mut Vec<String>, seen: &mut HashSet<String>, name: String, value: usize, about: String) {
     if !seen.insert(name.clone()) {
         return;
     }
@@ -333,10 +231,7 @@ fn add_constant(
 fn offsets(out: &mut Vec<String>, name: &str, fields: &[(String, usize)]) {
     out.push(format!("        pub mod {} {{", snake(name)));
     for (name, offset) in fields {
-        out.push(format!(
-            "            pub const {}: usize = {offset};",
-            upper(name)
-        ));
+        out.push(format!("            pub const {}: usize = {offset};", upper(name)));
     }
     out.push("        }".to_owned());
 }
@@ -344,16 +239,9 @@ fn constants(model: &Model) -> Vec<String> {
     let mut out = Vec::new();
     for limit in array(&model.protocol["limits"]) {
         out.extend(doc(limit["doc"].as_str(), "    "));
-        out.push(format!(
-            "    pub const {}: usize = {};",
-            s(&limit["limit"]),
-            limit["value"]
-        ));
+        out.push(format!("    pub const {}: usize = {};", s(&limit["limit"]), limit["value"]));
     }
-    out.push(format!(
-        "    pub const PACKET_MAGIC: f32 = 0x{:x} as f32;",
-        model.magic
-    ));
+    out.push(format!("    pub const PACKET_MAGIC: f32 = 0x{:x} as f32;", model.magic));
     let header_fields = model
         .header
         .iter()
@@ -363,44 +251,21 @@ fn constants(model: &Model) -> Vec<String> {
             field
         })
         .collect::<Vec<_>>();
-    out.extend(doc(
-        Some(&format!(
-            "The render packet header: {}.",
-            describe(&header_fields)
-        )),
-        "    ",
-    ));
-    out.push(format!(
-        "    pub const PACKET_HEADER_FLOATS: usize = {};",
-        model.header_lanes
-    ));
+    out.extend(doc(Some(&format!("The render packet header: {}.", describe(&header_fields))), "    "));
+    out.push(format!("    pub const PACKET_HEADER_FLOATS: usize = {};", model.header_lanes));
     out.extend([
-        "    /// The input packet header: elapsed, width, height, event count and state count."
-            .to_owned(),
+        "    /// The input packet header: elapsed, width, height, event count and state count.".to_owned(),
         "    pub const FRAME_HEADER_FLOATS: usize = 5;".to_owned(),
         format!(
             "    /// An event: its tag, then {}.",
-            array(&model.protocol["input"]["lanes"])
-                .iter()
-                .map(s)
-                .collect::<Vec<_>>()
-                .join(", ")
+            array(&model.protocol["input"]["lanes"]).iter().map(s).collect::<Vec<_>>().join(", ")
         ),
-        format!(
-            "    pub const EVENT_FLOATS: usize = {};",
-            model.event_lanes()
-        ),
+        format!("    pub const EVENT_FLOATS: usize = {};", model.event_lanes()),
     ]);
     let mut seen = HashSet::new();
     for entry in &model.sections {
         if let Some(layout) = &entry.fixed {
-            add_constant(
-                &mut out,
-                &mut seen,
-                floats(&layout.record),
-                layout.lanes,
-                describe(&layout.fields),
-            );
+            add_constant(&mut out, &mut seen, floats(&layout.record), layout.lanes, describe(&layout.fields));
         }
         if kind(&entry.section) == "variable" {
             let rest = &entry.section["record"]["rest"];
@@ -411,26 +276,10 @@ fn constants(model: &Model) -> Vec<String> {
                 }
                 about.push_str(&format!("{} count", s(&rest["name"])));
             }
-            about.push_str(&format!(
-                ", before a {}'s {}",
-                singular(s(&entry.section["name"])),
-                s(&rest["name"])
-            ));
-            add_constant(
-                &mut out,
-                &mut seen,
-                floats(&entry.section["record"]),
-                entry.head_lanes,
-                about,
-            );
+            about.push_str(&format!(", before a {}'s {}", singular(s(&entry.section["name"])), s(&rest["name"])));
+            add_constant(&mut out, &mut seen, floats(&entry.section["record"]), entry.head_lanes, about);
             if let Some(layout) = &entry.item {
-                add_constant(
-                    &mut out,
-                    &mut seen,
-                    floats(&layout.record),
-                    layout.lanes,
-                    describe(&layout.fields),
-                );
+                add_constant(&mut out, &mut seen, floats(&layout.record), layout.lanes, describe(&layout.fields));
             }
         }
         if kind(&entry.section) == "lanes"
@@ -458,39 +307,23 @@ fn constants(model: &Model) -> Vec<String> {
         offsets(
             &mut out,
             s(&layout.record["name"]),
-            &layout
-                .fields
-                .iter()
-                .map(|field| (field.name.clone(), field.offset))
-                .collect::<Vec<_>>(),
+            &layout.fields.iter().map(|field| (field.name.clone(), field.offset)).collect::<Vec<_>>(),
         );
     }
     for entry in &model.sections {
         if kind(&entry.section) != "variable" {
             continue;
         }
-        let mut fields = entry
-            .head
-            .iter()
-            .map(|field| (field.name.clone(), field.offset))
-            .collect::<Vec<_>>();
+        let mut fields = entry.head.iter().map(|field| (field.name.clone(), field.offset)).collect::<Vec<_>>();
         let rest = &entry.section["record"]["rest"];
         if kind(rest) == "repeat" {
             fields.push((s(&rest["name"]).to_owned(), entry.head_lanes - 1));
         }
         offsets(&mut out, s(&entry.section["record"]["name"]), &fields);
     }
-    out.extend([
-        "    }".to_owned(),
-        "    /// Each event's tag.".to_owned(),
-        "    pub mod event_tags {".to_owned(),
-    ]);
+    out.extend(["    }".to_owned(), "    /// Each event's tag.".to_owned(), "    pub mod event_tags {".to_owned()]);
     for event in model.events() {
-        out.push(format!(
-            "        pub const {}: u32 = {};",
-            upper(s(&event["name"])),
-            event["tag"]
-        ));
+        out.push(format!("        pub const {}: u32 = {};", upper(s(&event["name"])), event["tag"]));
     }
     out.push("    }".to_owned());
     out
@@ -502,10 +335,7 @@ fn input(model: &Model) -> Vec<String> {
     let input = &model.protocol["input"];
     let state = &model.protocol["state"];
     let mut out = Vec::new();
-    lines(
-        &mut out,
-        "    pub fn validate_state(state: &[f32]) -> Result<()> {\n        ensure!(",
-    );
+    lines(&mut out, "    pub fn validate_state(state: &[f32]) -> Result<()> {\n        ensure!(");
     out.push(format!(
         "            state.len() <= {} && state.iter().all(|value| value.is_finite()),",
         s(&state["max"]["limit"])
@@ -525,20 +355,13 @@ fn input(model: &Model) -> Vec<String> {
         "        );\n        Ok(schema as u32)\n    }\n\n    /// The code a key travels as: named keys by their browser names, other single\n    /// UTF-16 code units as themselves (as `charCodeAt(0)` reads them), lowercase\n    /// ASCII letters as their capitals, and anything else as 0.\n    pub fn key_code(key: &str) -> f32 {\n        let named = match key {",
     );
     for (key, code) in object(&input["keys"]) {
-        out.push(format!(
-            "            {} => 0x{:x},",
-            quote(&Value::String(key.clone())),
-            n(code)
-        ));
+        out.push(format!("            {} => 0x{:x},", quote(&Value::String(key.clone())), n(code)));
     }
     lines(
         &mut out,
         "            _ => 0,\n        };\n        if named != 0 {\n            return named as f32;\n        }\n        let mut units = key.encode_utf16();\n        match (units.next(), units.next()) {\n            (Some(code), None) => {\n                if (97..=122).contains(&code) {\n                    (code - 32) as f32\n                } else {\n                    code as f32\n                }\n            }\n            _ => 0.0,\n        }\n    }\n",
     );
-    out.push(format!(
-        "    fn event_record(event: &GameEvent) -> [f32; {}] {{",
-        model.event_lanes()
-    ));
+    out.push(format!("    fn event_record(event: &GameEvent) -> [f32; {}] {{", model.event_lanes()));
     out.push("        match event {".to_owned());
     for event in model.events() {
         for host in hosts(event) {
@@ -551,10 +374,7 @@ fn input(model: &Model) -> Vec<String> {
             } else {
                 let fields = event_fields(event);
                 for (name, field) in &fields {
-                    let lane = 1 + array(&input["lanes"])
-                        .iter()
-                        .position(|lane| lane == &field["lane"])
-                        .unwrap();
+                    let lane = 1 + array(&input["lanes"]).iter().position(|lane| lane == &field["lane"]).unwrap();
                     lanes[lane] = match field["wire"].as_str() {
                         Some("key") => format!("key_code({name})"),
                         _ if field["rust"] == "f32" => format!("*{name}"),
@@ -566,11 +386,7 @@ fn input(model: &Model) -> Vec<String> {
                 } else if !fields.is_empty() {
                     pattern = format!(
                         "GameEvent::{name} {{ {} }}",
-                        fields
-                            .iter()
-                            .map(|(name, _)| name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ")
                     );
                 } else {
                     pattern = format!("GameEvent::{name}");
@@ -580,33 +396,15 @@ fn input(model: &Model) -> Vec<String> {
         }
     }
     lines(&mut out, "        }\n    }\n");
-    out.extend(doc(
-        Some(&format!(
-            "{} Unused event lanes are zero.",
-            input["doc"].as_str().unwrap_or("")
-        )),
-        "    ",
-    ));
+    out.extend(doc(Some(&format!("{} Unused event lanes are zero.", input["doc"].as_str().unwrap_or(""))), "    "));
     lines(
         &mut out,
         "    pub fn encode_frame(frame: &Frame, elapsed: f64, state: &[f32]) -> Result<Vec<f32>> {\n        validate_state(state)?;\n        ensure!(\n            frame.timestamp.is_finite()\n                && elapsed.is_finite()\n                && elapsed >= 0.0",
     );
-    out.push(format!(
-        "                && (1..=0x{:x}).contains(&frame.viewport.width)",
-        n(&input["maxExtent"])
-    ));
-    out.push(format!(
-        "                && (1..=0x{:x}).contains(&frame.viewport.height)",
-        n(&input["maxExtent"])
-    ));
-    out.push(format!(
-        "                && frame.events.len() <= {},",
-        s(&input["maxEvents"]["limit"])
-    ));
-    out.push(format!(
-        "            {}",
-        quote(&input["messages"]["frame"])
-    ));
+    out.push(format!("                && (1..=0x{:x}).contains(&frame.viewport.width)", n(&input["maxExtent"])));
+    out.push(format!("                && (1..=0x{:x}).contains(&frame.viewport.height)", n(&input["maxExtent"])));
+    out.push(format!("                && frame.events.len() <= {},", s(&input["maxEvents"]["limit"])));
+    out.push(format!("            {}", quote(&input["messages"]["frame"])));
     lines(
         &mut out,
         "        );\n        let mut packet = Vec::with_capacity(FRAME_HEADER_FLOATS + frame.events.len() * EVENT_FLOATS + state.len());\n        packet.extend_from_slice(&[\n            elapsed as f32,\n            frame.viewport.width as f32,\n            frame.viewport.height as f32,\n            frame.events.len() as f32,\n            state.len() as f32,\n        ]);\n        for event in &frame.events {\n            packet.extend_from_slice(&event_record(event));\n        }\n        packet.extend_from_slice(state);",
@@ -633,7 +431,9 @@ fn convert(field: &Value, local: &str) -> String {
     }
     local.to_owned()
 }
-fn decode_field(model: &Model, base: &str, laid: &Laid, reader: &str) -> (Vec<String>, String) {
+/// The statements decoding a field and the value they leave; a vector the
+/// field fills is taken from `target`'s, to reuse its allocation.
+fn decode_field(model: &Model, base: &str, laid: &Laid, reader: &str, target: &str) -> (Vec<String>, String) {
     let field = &laid.field;
     let index = at(base, laid.offset);
     let name = &laid.name;
@@ -656,15 +456,9 @@ fn decode_field(model: &Model, base: &str, laid: &Laid, reader: &str) -> (Vec<St
         "matrix" => (vec![], format!("{reader}matrix({index})")),
         "lanes" => (
             vec![],
-            format!(
-                "{reader}packet[{index}..{}].try_into().unwrap()",
-                at(base, laid.offset + n(&field["count"]))
-            ),
+            format!("{reader}packet[{index}..{}].try_into().unwrap()", at(base, laid.offset + n(&field["count"]))),
         ),
-        "count" => (
-            vec![],
-            format!("{reader}count({index}, {})?", bound(&field["max"])),
-        ),
+        "count" => (vec![], format!("{reader}count({index}, {})?", bound(&field["max"]))),
         "flag" => (vec![], format!("{reader}flag({index})?")),
         "reference" => (vec![], format!("{reader}{}_at({index})?", s(&field["to"]))),
         "choice" => {
@@ -681,10 +475,7 @@ fn decode_field(model: &Model, base: &str, laid: &Laid, reader: &str) -> (Vec<St
             (
                 vec![
                     format!("let {name}_count = {reader}count({index}, {count})?;"),
-                    format!(
-                        "ensure!({name}_count == 0 || {name}_count == {count}, {});",
-                        quote(&field["message"])
-                    ),
+                    format!("ensure!({name}_count == 0 || {name}_count == {count}, {});", quote(&field["message"])),
                 ],
                 format!(
                     "({name}_count == {count}).then(|| {reader}packet[{}..{}].try_into().unwrap())",
@@ -696,25 +487,17 @@ fn decode_field(model: &Model, base: &str, laid: &Laid, reader: &str) -> (Vec<St
         "children" => {
             let section = s(&field["section"]);
             let record = &model.section(section).fixed.as_ref().unwrap().record;
+            let child = snake(s(&record["name"]));
             (
                 vec![
-                    format!(
-                        "let {name}_count = {reader}count({index}, {})?;",
-                        bound(&field["max"])
-                    ),
+                    format!("let {name}_count = {reader}count({index}, {})?;", bound(&field["max"])),
                     format!("let {name}_first = {reader}{section}_at;"),
                     format!("{reader}{section}_at += {name}_count * {};", floats(record)),
-                    format!(
-                        "ensure!({reader}{section}_at <= {reader}{section}_end, {});",
-                        quote(&field["over"])
-                    ),
-                    format!("let mut {name} = Vec::with_capacity({name}_count);"),
-                    format!("for item in 0..{name}_count {{"),
-                    format!(
-                        "    {name}.push({reader}{}({name}_first + item * {})?);",
-                        decoder(record),
-                        floats(record)
-                    ),
+                    format!("ensure!({reader}{section}_at <= {reader}{section}_end, {});", quote(&field["over"])),
+                    format!("let mut {name} = std::mem::take(&mut {target}.{name});"),
+                    format!("resize(&mut {name}, {name}_count);"),
+                    format!("for (item, {child}) in {name}.iter_mut().enumerate() {{"),
+                    format!("    {reader}{}({name}_first + item * {}, {child})?;", decoder(record), floats(record)),
                     "}".to_owned(),
                 ],
                 name.clone(),
@@ -725,16 +508,12 @@ fn decode_field(model: &Model, base: &str, laid: &Laid, reader: &str) -> (Vec<St
             (
                 vec![
                     "// Counted with the packet's length.".to_owned(),
-                    format!(
-                        "let {name}_lanes = {} as usize * {};",
-                        lane(0),
-                        field["unit"]
-                    ),
+                    format!("let {name}_lanes = {} as usize * {};", lane(0), field["unit"]),
                     format!("let {name}_first = {reader}{section}_at;"),
                     format!("{reader}{section}_at += {name}_lanes;"),
                 ],
                 format!(
-                    "({name}_lanes != 0).then(|| {reader}packet[{name}_first..{name}_first + {name}_lanes].to_vec())"
+                    "copy_optional(std::mem::take(&mut {target}.{name}), &{reader}packet[{name}_first..{name}_first + {name}_lanes])"
                 ),
             )
         }
@@ -772,10 +551,7 @@ fn render(model: &Model) -> Vec<String> {
         &mut out,
         "    }\n\n    impl Reader<'_> {\n        #[inline]\n        fn count(&self, index: usize, maximum: usize) -> Result<usize> {\n            let value = self.packet[index];\n            if value.fract() != 0.0 || value < 0.0 || value > maximum as f32 {",
     );
-    out.push(format!(
-        "                bail!({});",
-        quote(&messages["count"])
-    ));
+    out.push(format!("                bail!({});", quote(&messages["count"])));
     lines(
         &mut out,
         "            }\n            Ok(value as usize)\n        }\n\n        #[inline]\n        fn flag(&self, index: usize) -> Result<bool> {\n            Ok(self.count(index, 1)? == 1)\n        }\n\n        #[inline]\n        fn matrix(&self, index: usize) -> Matrix {\n            self.packet[index..index + 16].try_into().unwrap()\n        }",
@@ -792,30 +568,31 @@ fn render(model: &Model) -> Vec<String> {
                 s(&list["list"]),
                 quote(&list["empty"])
             ));
+            out.push(format!("            Ok(self.count(index, self.catalog.{}.len() - 1)? as u32)", s(&list["list"])));
+        } else {
             out.push(format!(
-                "            Ok(self.count(index, self.catalog.{}.len() - 1)? as u32)",
+                "            Ok(self.count(index, self.catalog.{}.len().saturating_sub(1))? as u32)",
                 s(&list["list"])
             ));
-        } else {
-            out.push(format!("            Ok(self.count(index, self.catalog.{}.len().saturating_sub(1))? as u32)", s(&list["list"])));
         }
         out.push("        }".to_owned());
     }
     let mut emitted = HashSet::new();
     for entry in &model.sections {
         for layout in entry.fixed.iter().chain(entry.item.iter()) {
-            if !emitted.insert(s(&layout.record["name"])) {
+            let record = s(&layout.record["name"]);
+            if !emitted.insert(record) {
                 continue;
             }
+            let target = snake(record);
             out.push(String::new());
             out.push(format!(
-                "        fn {}(&mut self, lane: usize) -> Result<{}> {{",
+                "        fn {}(&mut self, lane: usize, {target}: &mut {record}) -> Result<()> {{",
                 decoder(&layout.record),
-                s(&layout.record["name"])
             ));
             let mut fields = Vec::new();
             for laid in &layout.fields {
-                let (statements, value) = decode_field(model, "lane", laid, "self.");
+                let (statements, value) = decode_field(model, "lane", laid, "self.", &target);
                 out.extend(statements.iter().map(|line| format!("            {line}")));
                 if value == laid.name {
                     fields.push(laid.name.clone());
@@ -829,11 +606,8 @@ fn render(model: &Model) -> Vec<String> {
                     }
                 }
             }
-            out.push(format!(
-                "            Ok({} {{ {} }})",
-                s(&layout.record["name"]),
-                fields.join(", ")
-            ));
+            out.push(format!("            *{target} = {record} {{ {} }};", fields.join(", ")));
+            out.push("            Ok(())".to_owned());
             out.push("        }".to_owned());
         }
     }
@@ -847,13 +621,10 @@ fn render(model: &Model) -> Vec<String> {
     ));
     lines(
         &mut out,
-        "    pub fn decode_frame(packet: &[f32], schema: u32, catalog: &Catalog) -> Result<Decoded> {\n        ensure!(\n            packet.len() >= PACKET_HEADER_FLOATS && packet[0] == PACKET_MAGIC && packet[1] == schema as f32,",
+        "    pub fn decode_frame(packet: &[f32], schema: u32, catalog: &Catalog) -> Result<Decoded> {\n        let mut render = RenderFrame::default();\n        let state = decode_into(packet, schema, catalog, &mut render)?.to_vec();\n        Ok(Decoded { state, render })\n    }\n\n    /// Decodes a render packet into `frame` as [`decode_frame`] does, reusing the vectors it\n    /// holds, and returns the state lanes the packet carried. After an error, `frame` holds\n    /// some of this packet and some of what it held before.\n    pub fn decode_into<'a>(\n        packet: &'a [f32],\n        schema: u32,\n        catalog: &Catalog,\n        frame: &mut RenderFrame,\n    ) -> Result<&'a [f32]> {\n        ensure!(\n            packet.len() >= PACKET_HEADER_FLOATS && packet[0] == PACKET_MAGIC && packet[1] == schema as f32,",
     );
     out.push(format!("            {}", quote(&messages["header"])));
-    lines(
-        &mut out,
-        "        );\n        let mut reader = Reader {\n            packet,\n            catalog,",
-    );
+    lines(&mut out, "        );\n        let mut reader = Reader {\n            packet,\n            catalog,");
     for entry in &cursors {
         let name = s(&entry.section["name"]);
         out.push(format!("            {name}_at: 0,"));
@@ -861,10 +632,7 @@ fn render(model: &Model) -> Vec<String> {
             out.push(format!("            {name}_end: 0,"));
         }
     }
-    out.extend([
-        "        };".to_owned(),
-        "        // The sections' sizes.".to_owned(),
-    ]);
+    out.extend(["        };".to_owned(), "        // The sections' sizes.".to_owned()]);
     for entry in &model.header {
         let lane = &entry.laid.field;
         if kind(lane) != "size" {
@@ -882,20 +650,14 @@ fn render(model: &Model) -> Vec<String> {
             }
             _ => bound(&section["max"]),
         };
-        out.push(format!(
-            "        let {local} = reader.count({}, {maximum})?;",
-            entry.laid.offset
-        ));
+        out.push(format!("        let {local} = reader.count({}, {maximum})?;", entry.laid.offset));
         if kind(section) == "lanes" && !section["exactly"].is_null() {
             let conditions = array(&section["exactly"]["counts"])
                 .iter()
                 .map(|count| format!("{local} == {count}"))
                 .collect::<Vec<_>>()
                 .join(" || ");
-            out.push(format!(
-                "        ensure!({conditions}, {});",
-                quote(&section["exactly"]["message"])
-            ));
+            out.push(format!("        ensure!({conditions}, {});", quote(&section["exactly"]["message"])));
         }
     }
     out.push("        // Where the sections lie.".to_owned());
@@ -916,35 +678,32 @@ fn render(model: &Model) -> Vec<String> {
         out.push(format!("        let {name}_end = {name}_start + {length};"));
         previous = format!("{name}_end");
     }
+    out.push(format!("        let truncated = {};", quote(&messages["length"])));
     out.push(format!(
-        "        let truncated = {};",
-        quote(&messages["length"])
+        "        ensure!(packet.len() >= {previous} && packet.iter().all(|value| value.is_finite()), truncated);"
     ));
-    out.push(format!("        ensure!(packet.len() >= {previous} && packet.iter().all(|value| value.is_finite()), truncated);"));
     let mut packet_end = previous;
     if let Some(trailing) = trailing {
-        out.push(format!(
-            "        // What the records' tails claim of {trailing}, in order."
-        ));
+        out.push(format!("        // What the records' tails claim of {trailing}, in order."));
         out.push(format!("        let mut {trailing}_lanes = 0;"));
         if let Some((_, owners)) = model.tails.iter().find(|(name, _)| name == trailing) {
             for owner in owners {
+                out.push(format!("        for index in 0..{}_count {{", owner.section));
                 out.push(format!(
-                    "        for index in 0..{}_count {{",
-                    owner.section
+                    "            {trailing}_lanes += reader.count({}_start + index * {} + {}, {})? * {};",
+                    owner.section,
+                    floats(&owner.layout.record),
+                    owner.field.offset,
+                    bound(&owner.field.field["max"]),
+                    owner.field.field["unit"]
                 ));
-                out.push(format!("            {trailing}_lanes += reader.count({}_start + index * {} + {}, {})? * {};", owner.section, floats(&owner.layout.record), owner.field.offset, bound(&owner.field.field["max"]), owner.field.field["unit"]));
                 out.push("        }".to_owned());
             }
         }
-        out.push(format!(
-            "        let {trailing}_end = {trailing}_start + {trailing}_lanes;"
-        ));
+        out.push(format!("        let {trailing}_end = {trailing}_start + {trailing}_lanes;"));
         packet_end = format!("{trailing}_end");
     }
-    out.push(format!(
-        "        ensure!(packet.len() == {packet_end}, truncated);"
-    ));
+    out.push(format!("        ensure!(packet.len() == {packet_end}, truncated);"));
     for entry in &cursors {
         let name = s(&entry.section["name"]);
         out.push(format!("        reader.{name}_at = {name}_start;"));
@@ -960,7 +719,7 @@ fn render(model: &Model) -> Vec<String> {
             continue;
         }
         let local = entry.key.replace('.', "_");
-        let (statements, value) = decode_field(model, "", &entry.laid, "reader.");
+        let (statements, value) = decode_field(model, "", &entry.laid, "reader.", "frame");
         out.extend(statements.iter().map(|line| format!("        {line}")));
         out.push(format!("        let {local} = {value};"));
         header_values.insert(entry.key.as_str(), convert(lane, &local));
@@ -969,25 +728,25 @@ fn render(model: &Model) -> Vec<String> {
     for entry in &model.sections {
         let section = &entry.section;
         let name = s(&section["name"]);
+        let reused = format!("std::mem::take(&mut frame.{name})");
         match kind(section) {
+            // The state is returned where it lies.
+            "lanes" if section["apart"] == true => {}
             "lanes" => {
-                let mut slice = format!("packet[{name}_start..{name}_end].to_vec()");
-                if section["nullable"] == true {
-                    slice = format!("({name}_lanes != 0).then(|| {slice})");
-                }
-                out.push(format!("        let {name} = {slice};"));
+                let copy = if section["nullable"] == true { "copy_optional" } else { "copy" };
+                out.push(format!("        let {name} = {copy}({reused}, &packet[{name}_start..{name}_end]);"));
             }
             "records" => {
                 if entry.owner.is_some() {
                     continue;
                 }
                 let layout = entry.fixed.as_ref().unwrap();
+                let item = snake(s(&layout.record["name"]));
+                out.push(format!("        let mut {name} = {reused};"));
+                out.push(format!("        resize(&mut {name}, {name}_count);"));
+                out.push(format!("        for (index, {item}) in {name}.iter_mut().enumerate() {{"));
                 out.push(format!(
-                    "        let mut {name} = Vec::with_capacity({name}_count);"
-                ));
-                out.push(format!("        for index in 0..{name}_count {{"));
-                out.push(format!(
-                    "            {name}.push(reader.{}({name}_start + index * {})?);",
+                    "            reader.{}({name}_start + index * {}, {item})?;",
                     decoder(&layout.record),
                     floats(&layout.record)
                 ));
@@ -1010,11 +769,11 @@ fn render(model: &Model) -> Vec<String> {
                 let lane = format!("{local}_lane");
                 let after = format!("{local}_end");
                 let first = format!("{rest_name}_first");
-                out.push(format!(
-                    "        let mut {name} = Vec::with_capacity({name}_count);"
-                ));
+                let target = snake(s(&record["name"]));
+                out.push(format!("        let mut {name} = {reused};"));
+                out.push(format!("        resize(&mut {name}, {name}_count);"));
                 out.push(format!("        let mut {lane} = {name}_start;"));
-                out.push(format!("        for _ in 0..{name}_count {{"));
+                out.push(format!("        for {target} in {name}.iter_mut() {{"));
                 out.push(format!(
                     "            ensure!({lane} + {} <= {name}_end, {});",
                     floats(record),
@@ -1022,7 +781,7 @@ fn render(model: &Model) -> Vec<String> {
                 ));
                 let mut fields = Vec::new();
                 for laid in &entry.head {
-                    let (statements, value) = decode_field(model, &lane, laid, "reader.");
+                    let (statements, value) = decode_field(model, &lane, laid, "reader.", &target);
                     out.extend(statements.iter().map(|line| format!("            {line}")));
                     out.push(format!("            let {} = {value};", laid.name));
                     let value = convert(&laid.field, &laid.name);
@@ -1043,44 +802,32 @@ fn render(model: &Model) -> Vec<String> {
                     rest_lanes = format!("{rest_name}_count * {}", floats(&rest["record"]));
                     condition = format!("{rest_name}_count >= {} && ", rest["min"]);
                 } else {
-                    rest_lanes = array(&rest["of"])
-                        .iter()
-                        .map(s)
-                        .collect::<Vec<_>>()
-                        .join(" * ");
+                    rest_lanes = array(&rest["of"]).iter().map(s).collect::<Vec<_>>().join(" * ");
                 }
-                out.push(format!(
-                    "            let {first} = {lane} + {};",
-                    floats(record)
-                ));
+                out.push(format!("            let {first} = {lane} + {};", floats(record)));
                 out.push(format!("            let {after} = {first} + {rest_lanes};"));
                 out.push(format!(
                     "            ensure!({condition}{after} <= {name}_end, {});",
                     quote(&section["messages"]["invalid"])
                 ));
+                let reused = format!("std::mem::take(&mut {target}.{rest_name})");
                 if kind(rest) == "repeat" {
                     let item = entry.item.as_ref().unwrap();
+                    let child = snake(s(&item.record["name"]));
+                    out.push(format!("            let mut {rest_name} = {reused};"));
+                    out.push(format!("            resize(&mut {rest_name}, {rest_name}_count);"));
+                    out.push(format!("            for (item, {child}) in {rest_name}.iter_mut().enumerate() {{"));
                     out.push(format!(
-                        "            let mut {rest_name} = Vec::with_capacity({rest_name}_count);"
-                    ));
-                    out.push(format!("            for item in 0..{rest_name}_count {{"));
-                    out.push(format!(
-                        "                {rest_name}.push(reader.{}({first} + item * {})?);",
+                        "                reader.{}({first} + item * {}, {child})?;",
                         decoder(&item.record),
                         floats(&item.record)
                     ));
                     out.push("            }".to_owned());
                 } else {
-                    out.push(format!(
-                        "            let {rest_name} = packet[{first}..{after}].to_vec();"
-                    ));
+                    out.push(format!("            let {rest_name} = copy({reused}, &packet[{first}..{after}]);"));
                 }
                 fields.push(rest_name.to_owned());
-                out.push(format!(
-                    "            {name}.push({} {{ {} }});",
-                    s(&record["name"]),
-                    fields.join(", ")
-                ));
+                out.push(format!("            *{target} = {} {{ {} }};", s(&record["name"]), fields.join(", ")));
                 out.push(format!("            {lane} = {after};"));
                 out.push("        }".to_owned());
                 out.push(format!(
@@ -1091,7 +838,7 @@ fn render(model: &Model) -> Vec<String> {
             _ => {}
         }
     }
-    out.push("        let render = RenderFrame {".to_owned());
+    out.push("        *frame = RenderFrame {".to_owned());
     let mut groups = HashSet::new();
     for entry in &model.header {
         let lane = &entry.laid.field;
@@ -1102,34 +849,20 @@ fn render(model: &Model) -> Vec<String> {
             if !groups.insert(group) {
                 continue;
             }
-            let members = model
-                .header
-                .iter()
-                .filter(|entry| entry.group.as_ref() == Some(group))
-                .collect::<Vec<_>>();
+            let members = model.header.iter().filter(|entry| entry.group.as_ref() == Some(group)).collect::<Vec<_>>();
             let values = members
                 .iter()
                 .map(|member| {
                     let value = &header_values[member.key.as_str()];
                     if kind(&member.laid.field) == "present" {
-                        return format!(
-                            "{}: ({} - 1) as u32",
-                            member.laid.name,
-                            value.trim_end_matches(" as u32")
-                        );
+                        return format!("{}: ({} - 1) as u32", member.laid.name, value.trim_end_matches(" as u32"));
                     }
                     format!("{}: {value}", member.laid.name)
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut object = format!(
-                "{} {{ {values} }}",
-                s(&protocol["render"]["groups"][group]["type"])
-            );
-            if let Some(presence) = members
-                .iter()
-                .find(|member| kind(&member.laid.field) == "present")
-            {
+            let mut object = format!("{} {{ {values} }}", s(&protocol["render"]["groups"][group]["type"]));
+            if let Some(presence) = members.iter().find(|member| kind(&member.laid.field) == "present") {
                 object = format!(
                     "({} != 0).then(|| {object})",
                     header_values[presence.key.as_str()].trim_end_matches(" as u32")
@@ -1158,19 +891,28 @@ fn render(model: &Model) -> Vec<String> {
         out.push(format!("            {},", s(&section["name"])));
     }
     out.push("        };".to_owned());
-    if state == "state" {
-        out.push("        Ok(Decoded { state, render })".to_owned());
-    } else {
-        out.push(format!("        Ok(Decoded {{ state: {state}, render }})"));
-    }
+    out.push(format!("        Ok(&packet[{state}_start..{state}_end])"));
     out.push("    }".to_owned());
+    // What the decoders above use of these.
+    let decoders = out.join("\n");
+    let mut helpers = Vec::new();
+    if decoders.contains("resize(") {
+        helpers.push("    /// `records`, `count` long. Those it keeps are decoded over in place, their vectors'\n    /// allocations reused.\n    fn resize<T: Default>(records: &mut Vec<T>, count: usize) {\n        records.truncate(count);\n        records.resize_with(count, T::default);\n    }\n");
+    }
+    if decoders.contains("copy(") || decoders.contains("copy_optional(") {
+        helpers.push("    /// `lanes`, in `values`'s allocation.\n    fn copy(mut values: Vec<f32>, lanes: &[f32]) -> Vec<f32> {\n        values.clear();\n        values.extend_from_slice(lanes);\n        values\n    }\n");
+    }
+    if decoders.contains("copy_optional(") {
+        helpers.push("    /// `lanes`, in `values`'s allocation, or None when there are none.\n    fn copy_optional(values: Option<Vec<f32>>, lanes: &[f32]) -> Option<Vec<f32>> {\n        (!lanes.is_empty()).then(|| copy(values.unwrap_or_default(), lanes))\n    }\n");
+    }
+    for helper in helpers {
+        out.push(String::new());
+        lines(&mut out, helper.trim_end());
+    }
     out
 }
 pub fn emit(model: &Model, header: &str) -> String {
-    let mut out = header
-        .lines()
-        .map(|line| format!("// {line}").trim_end().to_owned())
-        .collect::<Vec<_>>();
+    let mut out = header.lines().map(|line| format!("// {line}").trim_end().to_owned()).collect::<Vec<_>>();
     lines(
         &mut out,
         "//! The packets crossing between the host and a game: their types,\n//! constants, the render packet decoder and the input packet encoder.\n",

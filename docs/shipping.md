@@ -19,8 +19,8 @@ package/
    └─ main.scene
 ```
 
-The executable is named after the game (`GAME` in main.rs, which also names
-the data directory), whatever the runtime it copies is called (`pen`,
+The executable is named after the game (pen.json's `game.name`, kept in `game/game.json`,
+which also names the data directory), whatever the runtime it copies is called (`pen`,
 `pen.exe`); the runtime finds `game/` beside itself under any name.
 
 The runtime it ships is the **player runtime**: pen built without the
@@ -201,15 +201,9 @@ were not verified. gdev has no gamepad support, so on the Deck Steam Input's "Ke
 
 `just windows` cross-compiles the player runtime on Linux with
 cargo-zigbuild as `x86_64-pc-windows-gnu`, using zig's MinGW-w64 headers and
-libraries: no Windows SDK, no MSVC and no license to accept. Two fixes make
+libraries: no Windows SDK, no MSVC and no license to accept. One fix makes
 it build:
 
-- opus-head-sys passes MSVC's `/guard:cf` (Control Flow Guard) to CMake for
-  every Windows target, `-gnu` included, and zig's clang driver takes it for
-  a file name. `packaging/zig/windows-gnu.cmake`, which the recipe hands to
-  CMake through `CMAKE_TOOLCHAIN_FILE_x86_64_pc_windows_gnu` (cargo-zigbuild
-  then leaves its own aside), compiles C through a wrapper that drops it and
-  the cmake crate's Rust-style `--target=x86_64-pc-windows-gnu`.
 - The player runtime uses the Windows subsystem, so no console window opens
   with the game (the development build keeps its console).
 

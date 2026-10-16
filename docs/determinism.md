@@ -160,7 +160,7 @@ though its rewinds would not.
 
 | Keys | Action |
 |---|---|
-| Ctrl+Shift+P | Pause or play. A paused window keeps drawing its last frame; its sounds do not play again, and the voices it keeps go on as they were until frames run. |
+| Ctrl+Shift+P | Pause or play. A paused window shows its last frame again without drawing it again (it is redrawn when the window's size changes or assets load); its sounds do not play again, and the voices it keeps go on as they were until frames run. |
 | Ctrl+Shift+period | Step one frame (it repeats while held). |
 | Ctrl+Shift+comma | Step back one frame. |
 | Ctrl+Shift+R | Replay the last 5 s. |
@@ -168,7 +168,7 @@ though its rewinds would not.
 The game never sees these keys. In scripts the same actions are `pause`,
 `resume`, `step[=N]` (N frames, one per script frame), `rewind=N` and
 `replay=SECONDS`. For the dev tools, `Session` has `pause`, `resume`,
-`step_frame`, `rewind_to(frame)`, `replay_recent(seconds)` and `timeline()`
+`step_frames(n)`, `rewind_to(frame)`, `replay_recent(seconds)` and `timeline()`
 (position, the recorded end, the earliest frame reachable, seconds kept,
 paused, replaying). `rewind_to` and `replay_recent` take effect on the next
 step.

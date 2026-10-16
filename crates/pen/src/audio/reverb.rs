@@ -1,6 +1,6 @@
-//! The shared reverb: an impulse response generated exactly as gdev's
-//! `web/mixer.ts` generates the one its ConvolverNode plays, and a
-//! convolution with it that, like the ConvolverNode, adds no latency.
+//! The shared reverb: the impulse response of `pen_runtime::reverb`, which
+//! the browser host's ConvolverNode plays too, and a convolution with it
+//! that, like the ConvolverNode, adds no latency.
 //!
 //! Why a convolution: WebAudio has no algorithmic reverb, but its
 //! ConvolverNode convolves exactly, so the browser and this mixer agree to
@@ -55,6 +55,7 @@ impl Fft {
     fn new(size: usize) -> Fft {
         assert!(size.is_power_of_two() && size >= 2);
         let bits = size.trailing_zeros();
+        #[allow(clippy::cast_possible_truncation, reason = "f32 twiddles")]
         let twiddles = (0..size / 2)
             .map(|k| {
                 let angle = -TAU * k as f64 / size as f64;
@@ -243,7 +244,9 @@ impl Convolver {
         // The tail: what earlier blocks have for this quantum, worked out as
         // the block before this one completed.
         let start = self.played;
-        for ((out, head), tail) in output.iter_mut().zip(&self.head_output).zip(&self.tail_output[start..start + QUANTUM]) {
+        for ((out, head), tail) in
+            output.iter_mut().zip(&self.head_output).zip(&self.tail_output[start..start + QUANTUM])
+        {
             out[0] += head[0] + tail[0];
             out[1] += head[1] + tail[1];
         }
@@ -303,7 +306,13 @@ mod tests {
                 state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
                 let noise = (state >> 8) as f32 / (1 << 24) as f32 - 0.5;
                 // An impulse, then noise, then silence.
-                if i == 0 { [1.0, 0.5] } else if i < 4000 { [noise, -noise * 0.5] } else { [0.0, 0.0] }
+                if i == 0 {
+                    [1.0, 0.5]
+                } else if i < 4000 {
+                    [noise, -noise * 0.5]
+                } else {
+                    [0.0, 0.0]
+                }
             })
             .collect();
         let mut output = Vec::new();
@@ -324,8 +333,8 @@ mod tests {
         assert!((f64::from(output[100][0]) - expected[100][0]).abs() < 1e-5);
     }
 
-    /// The response is the one gdev's web/mixer.ts generates: these numbers
-    /// are pinned in its audio_test.ts too.
+    /// The response is pinned: the browser host's ConvolverNode plays the
+    /// same one, so it must not drift.
     #[test]
     fn impulse_response_is_pinned() {
         let response = impulse_response(48_000.0);
@@ -334,7 +343,12 @@ mod tests {
         assert!((energy - 2.0).abs() < 1e-4, "{energy}");
         // Silent through the predelay, then the noise.
         assert_eq!(response[0][575], 0.0);
-        for (channel, index, expected) in [(0, 600, 4.367_595_5e-4), (1, 600, 6.779_858_4e-4), (0, 24_000, -8.966_267_3e-4), (1, 70_000, 5.950_865_7e-6)] {
+        for (channel, index, expected) in [
+            (0, 600, 4.367_595_5e-4),
+            (1, 600, 6.779_858_4e-4),
+            (0, 24_000, -8.966_267_3e-4),
+            (1, 70_000, 5.950_865_7e-6),
+        ] {
             let value = response[channel][index];
             assert!((value - expected).abs() <= expected.abs() * 1e-5, "{channel} {index}: {value:e}");
         }

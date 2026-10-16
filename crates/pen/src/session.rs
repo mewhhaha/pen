@@ -7,34 +7,52 @@
 //! its input and replay it exactly, pause, step, rewind to any recent frame
 //! and play the last seconds again on a new build (see `timeline`), and
 //! overlap frames: the guest computes the next frame while this one draws
-//! (`Playback::pipeline`, one frame more input latency).
+//! (`Playback::overlap`, `--overlap`: one frame more input latency).
 //!
 //! In a window, the dev tools (`Overlay`) can draw over the game's frames.
-use std::collections::VecDeque;
+//!
+//! Its parts: the GPU and what frames are drawn into (`gpu`), the player's
+//! preferences (`preferences`) and frame measurements (`profile`); the
+//! game's clock (`pen_runtime::clock`) and what was asked of time
+//! (`pen_runtime::transport`) are the runtime's, which the browser shares.
+mod gpu;
+mod preferences;
+mod profile;
+
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use blot_host::GuestModule;
 use pen_protocol::{Catalog, GameEvent, RenderFrame, UiNode, Viewport};
 use pen_render::RenderTarget;
+use pen_runtime::clock::Clock;
+use pen_runtime::devtools::TimelineStatus;
+#[cfg(all(test, feature = "compiler"))]
+use pen_runtime::transport;
+use pen_runtime::transport::{Replaying, Rewind, Transport};
 use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::audio::Audio;
 use crate::dev::{Dev, Update};
-use crate::game::{FrameTimings, GameRuntime, Host, InvalidFrame, Quiet, ReloadResult, hash_lanes};
+use crate::devlog::{self, Source};
+use crate::game::{FrameTimings, GameRuntime, Host, InvalidFrame, Quiet, ReloadResult, Unresponsive, hash_lanes};
 use crate::input::{Hotkey, Input};
-use crate::overlay::{self, Source};
 use crate::record::Recorder;
 use crate::recording;
 use crate::script::{self, Script, Step, Tick, Travel};
 use crate::services::Services;
 use crate::snapshot::{self, SavedState};
-use crate::timeline::{self, KEEP_SECONDS, Load, Recorded, Timeline};
+use crate::timeline::{self, KEEP_SECONDS, Load, REPLAY_SECONDS, Recorded, Timeline};
+#[cfg(feature = "devtools")]
+use gpu::Drawn;
+pub use gpu::Gpu;
+use gpu::{CaptureTarget, Output, Readback, SurfaceTarget, settle, write_overlay_shot, write_png};
+use preferences::Preferences;
+use profile::Profile;
 
 /// Where the game's files are and where the player's are kept.
 pub struct Paths {
@@ -76,350 +94,6 @@ impl Paths {
     }
 }
 
-/// The game's clock: real time, or a steady `1/fps` per frame however long
-/// frames take, for recordings and repeatable headless runs. Paused, real
-/// time stops counting, and a frame stepped is `STEP_SECONDS` long.
-pub struct Clock {
-    kind: ClockKind,
-    /// The last frame's time.
-    last: f64,
-    /// Real time paused at `last`.
-    frozen: bool,
-    /// Real time not counted, while paused.
-    skipped: f64,
-}
-
-enum ClockKind {
-    Real(Instant),
-    Steady { fps: f64, frame: u64 },
-}
-
-/// The game time a frame stepped while paused takes on a real clock.
-const STEP_SECONDS: f64 = 1.0 / 60.0;
-
-impl Clock {
-    fn real() -> Clock {
-        Clock { kind: ClockKind::Real(Instant::now()), last: 0.0, frozen: false, skipped: 0.0 }
-    }
-
-    fn steady(fps: f64) -> Clock {
-        Clock { kind: ClockKind::Steady { fps, frame: 0 }, last: 0.0, frozen: false, skipped: 0.0 }
-    }
-
-    fn is_steady(&self) -> bool {
-        matches!(self.kind, ClockKind::Steady { .. })
-    }
-
-    fn next(&mut self) -> f64 {
-        let timestamp = match &mut self.kind {
-            ClockKind::Real(_) if self.frozen => self.last + STEP_SECONDS,
-            ClockKind::Real(started) => started.elapsed().as_secs_f64() - self.skipped,
-            ClockKind::Steady { fps, frame } => {
-                let timestamp = *frame as f64 / *fps;
-                *frame += 1;
-                timestamp
-            }
-        };
-        self.last = timestamp;
-        timestamp
-    }
-
-    /// The time now, for the next frame's elapsed time to count from.
-    fn now(&self) -> f64 {
-        match &self.kind {
-            ClockKind::Real(started) if !self.frozen => started.elapsed().as_secs_f64() - self.skipped,
-            _ => self.last,
-        }
-    }
-
-    fn pause(&mut self) {
-        self.frozen = true;
-    }
-
-    fn resume(&mut self) {
-        if let ClockKind::Real(started) = &self.kind
-            && self.frozen
-        {
-            self.skipped = started.elapsed().as_secs_f64() - self.last;
-        }
-        self.frozen = false;
-    }
-}
-
-/// The player's preferences, as the game last sent them. The game keeps
-/// them; the host only stores them and plays them back as Preference events
-/// at startup and after every restore.
-pub struct Preferences {
-    path: PathBuf,
-    values: Vec<f32>,
-}
-
-impl Preferences {
-    pub fn load(path: PathBuf) -> Preferences {
-        let values = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<Vec<f32>>(&text).ok())
-            .unwrap_or_default();
-        Preferences { path, values }
-    }
-
-    fn replay(&self, input: &mut Input) {
-        for (index, value) in self.values.iter().enumerate() {
-            input.enqueue(GameEvent::Preference { index: index as f32, value: *value });
-        }
-    }
-
-    fn store(&mut self, values: &[f32]) -> Result<()> {
-        if values == self.values {
-            return Ok(());
-        }
-        self.values = values.to_vec();
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&self.path, serde_json::to_string(values)?)?;
-        Ok(())
-    }
-}
-
-/// What the last frame drawn held, for the dev tools' diagnostics.
-#[cfg(feature = "devtools")]
-#[derive(Clone, Copy, Default)]
-pub struct Drawn {
-    pub meshes: usize,
-    pub brushes: usize,
-}
-
-pub struct Gpu {
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
-    pub renderer: pen_render::Renderer,
-    pub format: wgpu::TextureFormat,
-    pub size: (u32, u32),
-    #[cfg(feature = "devtools")]
-    pub drawn: Drawn,
-    /// The window's swapchain; none when headless.
-    pub surface: Option<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
-    /// Shows frames drawn offscreen in the window, scaled to fit.
-    blitter: Option<wgpu::util::TextureBlitter>,
-    /// A frame size the window does not change (a recording's).
-    pinned: Option<(u32, u32)>,
-    /// The offscreen image frames are captured from.
-    capture: Option<wgpu::Texture>,
-    fault: Fault,
-}
-
-/// An uncaptured GPU error or a lost device, which ends the run as gdev's
-/// desktop host does.
-type Fault = Arc<Mutex<Option<String>>>;
-
-/// The adapter to draw with: the fast one, or with PEN_SOFTWARE=1 (the
-/// `--software` flag) a software one, such as Mesa's lavapipe on Vulkan or
-/// WARP on DX12, as on CI machines without a GPU.
-fn request_adapter(instance: &wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Result<wgpu::Adapter> {
-    let software = std::env::var_os("PEN_SOFTWARE").is_some_and(|value| value != "0");
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        force_fallback_adapter: software,
-        compatible_surface: surface,
-        ..Default::default()
-    }));
-    if software {
-        adapter.context("no software GPU adapter for PEN_SOFTWARE (on Linux: Mesa's lavapipe, in mesa-vulkan-drivers)")
-    } else {
-        adapter.context("no GPU adapter")
-    }
-}
-
-fn open_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue, Fault)> {
-    let info = adapter.get_info();
-    eprintln!("GPU: {} ({:?})", info.name, info.backend);
-    crate::crash::gpu(&info);
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
-    let fault = Fault::default();
-    let uncaptured = fault.clone();
-    device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
-        let trace = if std::env::var_os("PEN_GPU_BACKTRACE").is_some() {
-            format!("\n{}", std::backtrace::Backtrace::force_capture())
-        } else {
-            String::new()
-        };
-        uncaptured.lock().unwrap().get_or_insert_with(|| format!("GPU error: {error}{trace}"));
-    }));
-    let lost = fault.clone();
-    device.set_device_lost_callback(move |reason, message| {
-        if reason != wgpu::DeviceLostReason::Destroyed {
-            lost.lock().unwrap().get_or_insert_with(|| format!("GPU device lost: {message}"));
-        }
-    });
-    Ok((device, queue, fault))
-}
-
-fn renderer(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat, assets: &Path) -> Result<pen_render::Renderer> {
-    pen_render::Renderer::new(
-        device.clone(),
-        queue.clone(),
-        pen_render::RendererOptions { format, assets: assets.to_owned(), veil: Some(0.6) },
-    )
-}
-
-impl Gpu {
-    /// With `pinned`, frames keep that size whatever the window's.
-    pub fn windowed(
-        display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>,
-        window: Arc<Window>,
-        present_mode: wgpu::PresentMode,
-        assets: &Path,
-        pinned: Option<(u32, u32)>,
-    ) -> Result<Gpu> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(display));
-        let surface = instance.create_surface(window.clone())?;
-        let adapter = request_adapter(&instance, Some(&surface))?;
-        let (device, queue, fault) = open_device(&adapter)?;
-        let capabilities = surface.get_capabilities(&adapter);
-        // Like the browser's preferred canvas format: 8 bits and not sRGB,
-        // since the present pass encodes colours itself.
-        let format = [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm]
-            .into_iter()
-            .find(|format| capabilities.formats.contains(format))
-            .or_else(|| capabilities.formats.iter().copied().find(|format| !format.is_srgb()))
-            .unwrap_or_else(|| capabilities.formats[0].remove_srgb_suffix());
-        let size = window.inner_size();
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: if capabilities.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
-                wgpu::CompositeAlphaMode::Opaque
-            } else {
-                capabilities.alpha_modes[0]
-            },
-            view_formats: vec![],
-            color_space: Default::default(),
-        };
-        surface.configure(&device, &config);
-        let renderer = renderer(&device, &queue, format, assets)?;
-        let blitter = wgpu::util::TextureBlitterBuilder::new(&device, format)
-            .sample_type(wgpu::FilterMode::Linear)
-            .build();
-        Ok(Gpu {
-            size: pinned.unwrap_or((config.width, config.height)),
-            surface: Some((surface, config)),
-            blitter: Some(blitter),
-            pinned,
-            device,
-            queue,
-            renderer,
-            format,
-            capture: None,
-            #[cfg(feature = "devtools")]
-            drawn: Drawn::default(),
-            fault,
-        })
-    }
-
-    /// No window: every frame draws offscreen at `size`.
-    pub fn headless(size: (u32, u32), assets: &Path) -> Result<Gpu> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let adapter = request_adapter(&instance, None)?;
-        let (device, queue, fault) = open_device(&adapter)?;
-        let format = wgpu::TextureFormat::Bgra8Unorm;
-        let renderer = renderer(&device, &queue, format, assets)?;
-        Ok(Gpu {
-            device,
-            queue,
-            renderer,
-            format,
-            size,
-            surface: None,
-            blitter: None,
-            pinned: Some(size),
-            capture: None,
-            #[cfg(feature = "devtools")]
-            drawn: Drawn::default(),
-            fault,
-        })
-    }
-
-    pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        self.size = self.pinned.unwrap_or((width, height));
-        if let Some((surface, config)) = &mut self.surface {
-            config.width = width;
-            config.height = height;
-            surface.configure(&self.device, config);
-        }
-    }
-
-    fn take_fault(&self) -> Option<String> {
-        self.fault.lock().unwrap().take()
-    }
-
-    fn capture_texture(&mut self) -> wgpu::Texture {
-        let (width, height) = self.size;
-        if let Some(texture) = &self.capture
-            && (texture.width(), texture.height()) == (width, height)
-        {
-            return texture.clone();
-        }
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("capture"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        self.capture = Some(texture.clone());
-        texture
-    }
-
-    /// The texture's pixels as BGRA (or RGBA for an RGBA format), rows packed.
-    fn read(&self, texture: &wgpu::Texture) -> Result<Vec<u8>> {
-        let (width, height) = (texture.width(), texture.height());
-        let row = (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("capture readback"),
-            size: u64::from(row * height),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-        encoder.copy_texture_to_buffer(
-            texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buffer,
-                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(height) },
-            },
-            texture.size(),
-        );
-        self.queue.submit([encoder.finish()]);
-        let slice = buffer.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::PollType::wait_indefinitely())?;
-        let mapped = slice.get_mapped_range().map_err(|error| anyhow!("reading a frame back: {error:?}"))?;
-        let mut pixels = Vec::with_capacity((width * height * 4) as usize);
-        for y in 0..height {
-            let start = (y * row) as usize;
-            pixels.extend_from_slice(&mapped[start..start + (width * 4) as usize]);
-        }
-        Ok(pixels)
-    }
-
-    fn bgra(&self) -> bool {
-        matches!(self.format, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb)
-    }
-}
-
 /// The dev tools over the window (`crate::devtools`): they see the window's
 /// events before the game, run before each step (acting on the session),
 /// and draw over the window's image after the game's frame and before it is
@@ -440,17 +114,12 @@ pub trait Overlay {
     fn command(&mut self, _line: String) {}
     /// Draws what was laid out last over `target`, an image about to be shown.
     fn paint(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::Texture);
-    /// The pointer is the overlay's (over a panel, or dragging one), so it
-    /// shows even where the game hides it.
+    /// The pointer is the overlay's (over one of its dialogs), so it shows
+    /// even where the game hides it.
     fn wants_pointer(&self) -> bool;
-    /// It shows, with a tree of its own for assistive technology
-    /// (`accessibility`).
-    fn accesskit_shown(&self) -> bool {
-        false
-    }
-    /// Its AccessKit tree from its last layout, once: a whole tree in its
-    /// own ids (its own root tree).
-    fn accesskit_update(&mut self) -> Option<accesskit::TreeUpdate> {
+    /// Its interface for assistive technology from its last layout, a tree
+    /// of its own (`accessibility`); none while it shows none.
+    fn interface(&self) -> Option<&[UiNode]> {
         None
     }
     /// An assistive technology's request for one of its nodes (in its own
@@ -458,102 +127,13 @@ pub trait Overlay {
     fn accesskit_action(&mut self, _request: accesskit::ActionRequest) {}
 }
 
-/// What a frame is presented to: the GPU fields a target needs, borrowed
-/// apart from the renderer that draws into it.
-struct Output<'a> {
-    device: &'a wgpu::Device,
-    queue: &'a wgpu::Queue,
-    surface: Option<&'a (wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
-    size: (u32, u32),
-    blitter: Option<&'a wgpu::util::TextureBlitter>,
-    /// Draws over the swapchain image before it is presented.
-    overlay: Option<&'a mut Box<dyn Overlay>>,
-}
-
-impl Output<'_> {
-    fn acquire(&self) -> Option<wgpu::SurfaceTexture> {
-        let (surface, config) = self.surface?;
-        match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture) | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
-                Some(texture)
-            }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                surface.configure(self.device, config);
-                None
-            }
-            _ => None,
-        }
-    }
-}
-
-/// The window's swapchain image for one frame.
-struct SurfaceTarget<'a> {
-    output: Output<'a>,
-    texture: Option<wgpu::SurfaceTexture>,
-}
-
-impl RenderTarget for SurfaceTarget<'_> {
-    fn size(&self) -> (u32, u32) {
-        self.output.size
-    }
-
-    fn view(&mut self) -> Option<wgpu::TextureView> {
-        let texture = self.output.acquire()?;
-        let view = texture.texture.create_view(&Default::default());
-        self.texture = Some(texture);
-        Some(view)
-    }
-
-    fn present(&mut self) {
-        if let Some(texture) = self.texture.take() {
-            if let Some(overlay) = self.output.overlay.as_deref_mut() {
-                overlay.paint(self.output.device, self.output.queue, &texture.texture);
-            }
-            self.output.queue.present(texture);
-        }
-    }
-}
-
-/// An offscreen image to capture; a windowed run also copies it to the
-/// swapchain so the window shows what is captured.
-struct CaptureTarget<'a> {
-    output: Output<'a>,
-    texture: wgpu::Texture,
-}
-
-impl RenderTarget for CaptureTarget<'_> {
-    fn size(&self) -> (u32, u32) {
-        (self.texture.width(), self.texture.height())
-    }
-
-    fn view(&mut self) -> Option<wgpu::TextureView> {
-        Some(self.texture.create_view(&Default::default()))
-    }
-
-    fn present(&mut self) {
-        let Some(blitter) = self.output.blitter else { return };
-        let Some(swapchain) = self.output.acquire() else { return };
-        let mut encoder = self.output.device.create_command_encoder(&Default::default());
-        blitter.copy(
-            self.output.device,
-            &mut encoder,
-            &self.texture.create_view(&Default::default()),
-            &swapchain.texture.create_view(&Default::default()),
-        );
-        self.output.queue.submit([encoder.finish()]);
-        // Over the window's copy only: what is captured stays the game's.
-        if let Some(overlay) = self.output.overlay.as_deref_mut() {
-            overlay.paint(self.output.device, self.output.queue, &swapchain.texture);
-        }
-        self.output.queue.present(swapchain);
-    }
-}
-
 /// What to keep of the frames drawn during one step.
 #[derive(Default)]
 struct Capture {
     screenshots: Vec<PathBuf>,
     recorder: Option<Recorder>,
+    /// The recording's frames on their way back from the GPU.
+    readback: Readback,
     /// Always draw offscreen (headless).
     offscreen: bool,
     /// Screenshots with the overlay, as the window shows it.
@@ -617,26 +197,26 @@ impl Host for Shell<'_> {
                 write_overlay_shot(gpu, texture, self.overlay.as_deref_mut(), &path)?;
             }
         }
-        if let Some(texture) = texture
-            && (!capture.screenshots.is_empty() || capture.recorder.is_some())
+        if let Some(texture) = &texture
+            && !capture.screenshots.is_empty()
         {
-            let pixels = gpu.read(&texture)?;
-            let (width, height) = (texture.width(), texture.height());
+            let pixels = gpu.read(texture)?;
             for path in capture.screenshots.drain(..) {
-                write_png(&path, &pixels, width, height, gpu.bgra())?;
+                write_png(&path, &pixels, texture.width(), texture.height(), gpu.bgra())?;
             }
-            if let Some(recorder) = &mut capture.recorder {
-                let bgra = if gpu.bgra() { pixels } else { swap_red_blue(pixels) };
-                recorder.frame(&bgra, width, height, frame, catalog)?;
+        }
+        if let Some(texture) = &texture
+            && let Some(recorder) = &mut capture.recorder
+        {
+            recorder.sound(frame, catalog)?;
+            for (pixels, (width, height)) in capture.readback.start(&gpu.device, &gpu.queue, texture)? {
+                recorder.picture(pixels, width, height)?;
             }
         }
         if let Some(audio) = self.audio.as_deref_mut() {
             audio.frame(frame, catalog);
         }
-        if let Some(window) = self.window {
-            let overlay = self.overlay.as_ref().is_some_and(|overlay| overlay.wants_pointer());
-            window.set_cursor_visible(!frame.hide_cursor || overlay);
-        }
+        show_cursor(self.window, frame, self.overlay.as_ref().is_some_and(|overlay| overlay.wants_pointer()));
         if let Some(preferences) = &frame.preferences {
             self.preferences.store(preferences)?;
         }
@@ -646,9 +226,9 @@ impl Host for Shell<'_> {
     fn report(&mut self, message: &str) {
         // The runtime's word on a new build starts "Blot reload".
         match message.strip_prefix("Blot reload") {
-            Some(rest) if rest.starts_with("ed") => overlay::info(Source::Reload, message),
-            Some(_) => overlay::error(Source::Reload, message),
-            None => overlay::info(Source::Game, message),
+            Some(rest) if rest.starts_with("ed") => devlog::info(Source::Reload, message),
+            Some(_) => devlog::error(Source::Reload, message),
+            None => devlog::info(Source::Game, message),
         }
     }
 
@@ -659,143 +239,11 @@ impl Host for Shell<'_> {
     }
 }
 
-fn swap_red_blue(mut pixels: Vec<u8>) -> Vec<u8> {
-    for texel in pixels.as_chunks_mut::<4>().0 {
-        texel.swap(0, 2);
-    }
-    pixels
-}
-
-fn write_png(path: &Path, pixels: &[u8], width: u32, height: u32, bgra: bool) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut rgba = Vec::with_capacity(pixels.len());
-    for texel in pixels.as_chunks::<4>().0 {
-        let [a, b, c, _] = *texel;
-        rgba.extend_from_slice(&if bgra { [c, b, a, 255] } else { [a, b, c, 255] });
-    }
-    image::save_buffer(path, &rgba, width, height, image::ColorType::Rgba8)
-        .with_context(|| format!("writing {}", path.display()))?;
-    eprintln!("wrote {}", path.display());
-    Ok(())
-}
-
-/// Writes the captured `texture` with the overlay drawn over it, as the
-/// window shows it, from a copy: the capture itself stays the game's.
-fn write_overlay_shot(gpu: &Gpu, texture: &wgpu::Texture, overlay: Option<&mut Box<dyn Overlay>>, path: &Path) -> Result<()> {
-    let shot = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("overlay shot"),
-        size: texture.size(),
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: texture.format(),
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    let mut encoder = gpu.device.create_command_encoder(&Default::default());
-    encoder.copy_texture_to_texture(texture.as_image_copy(), shot.as_image_copy(), texture.size());
-    gpu.queue.submit([encoder.finish()]);
-    match overlay {
-        Some(overlay) => overlay.paint(&gpu.device, &gpu.queue, &shot),
-        None => eprintln!("no overlay to draw into {}", path.display()),
-    }
-    let pixels = gpu.read(&shot)?;
-    write_png(path, &pixels, shot.width(), shot.height(), gpu.bgra())
-}
-
-/// Draws `frame` offscreen until the renderer has loaded every asset and
-/// faded in its detail and the veil has cleared, and no load, shader
-/// compile or check is left whose event could reach the game later: from
-/// then on its asset events cannot make two runs differ.
-fn settle(gpu: &mut Gpu, frame: &RenderFrame, catalog: &Catalog) -> Result<()> {
-    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
-    let started = Instant::now();
-    let mut draws = 0;
-    while !gpu.renderer.quiet() || gpu.renderer.pending() > 0 {
-        if started.elapsed() > PATIENCE {
-            eprintln!("settle: assets still loading after {} s; starting anyway", PATIENCE.as_secs());
-            return Ok(());
-        }
-        let texture = gpu.capture_texture();
-        let output = Output {
-            device: &gpu.device,
-            queue: &gpu.queue,
-            surface: None,
-            size: gpu.size,
-            blitter: None,
-            overlay: None,
-        };
-        gpu.renderer.submit(frame, catalog, &mut CaptureTarget { output, texture })?;
-        gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
-        if let Some(fault) = gpu.take_fault() {
-            return Err(anyhow!(fault));
-        }
-        draws += 1;
-        std::thread::sleep(std::time::Duration::from_millis(4));
-    }
-    eprintln!("settled in {:.0} ms ({draws} draws)", started.elapsed().as_secs_f64() * 1000.0);
-    Ok(())
-}
-
-/// PEN_PROFILE_FRAMES: after PEN_PROFILE_WARMUP frames (90), sample this
-/// many, report each phase's median and stop, as gdev's desktop host does.
-pub struct Profile {
-    warmup: usize,
-    wanted: usize,
-    timings: Vec<FrameTimings>,
-    intervals: Vec<f64>,
-    previous: Option<Instant>,
-}
-
-impl Profile {
-    pub fn from_env() -> Result<Option<Profile>> {
-        let Some(wanted) = std::env::var("PEN_PROFILE_FRAMES").ok() else { return Ok(None) };
-        let warmup = std::env::var("PEN_PROFILE_WARMUP").ok().map(|value| value.parse()).transpose()?;
-        Ok(Some(Profile {
-            warmup: warmup.unwrap_or(90),
-            wanted: wanted.parse()?,
-            timings: Vec::new(),
-            intervals: Vec::new(),
-            previous: None,
-        }))
-    }
-
-    /// Records a frame; true once enough have been sampled.
-    fn sample(&mut self, frame: usize, timings: Option<FrameTimings>) -> bool {
-        let now = Instant::now();
-        if frame > self.warmup {
-            if let Some(previous) = self.previous {
-                self.intervals.push((now - previous).as_secs_f64() * 1000.0);
-            }
-            self.timings.extend(timings);
-        }
-        self.previous = Some(now);
-        self.timings.len() >= self.wanted
-    }
-
-    fn report(&self, overlapped: bool) {
-        let median = |mut values: Vec<f64>| {
-            values.sort_by(f64::total_cmp);
-            values.get(values.len() / 2).copied().unwrap_or(0.0)
-        };
-        let phase = |pick: fn(&FrameTimings) -> f64| median(self.timings.iter().map(pick).collect());
-        eprintln!(
-            "profile of {} {}frames (medians, ms): guest {:.2} (waited for {:.2}), decode {:.2}, validate {:.2}, \
-             render+present {:.2}, housekeeping {:.2}, total {:.2}; frame interval {:.2}; packet {:.0} KB",
-            self.timings.len(),
-            if overlapped { "overlapped " } else { "" },
-            phase(|t| t.guest_ms),
-            phase(|t| t.wait_ms),
-            phase(|t| t.decode_ms),
-            phase(|t| t.validate_ms),
-            phase(|t| t.submit_ms),
-            phase(|t| t.housekeeping_ms),
-            phase(|t| t.total_ms),
-            median(self.intervals.clone()),
-            phase(|t| t.packet_bytes as f64) / 1024.0,
-        );
+/// The pointer shows unless the frame hides it, and always while the
+/// overlay wants it.
+fn show_cursor(window: Option<&Window>, frame: &RenderFrame, overlay: bool) {
+    if let Some(window) = window {
+        window.set_cursor_visible(!frame.hide_cursor || overlay);
     }
 }
 
@@ -831,46 +279,23 @@ pub struct Playback {
     /// Keep the last seconds to rewind and replay (`--history`; always
     /// while developing or when a script travels back).
     pub history: bool,
-    /// Compute the next frame while this one draws (`--pipeline`).
-    pub pipeline: bool,
+    /// Compute the next frame while this one draws (`--overlap`).
+    pub overlap: bool,
     /// Write a line per frame: its position, and its input's and packet's
     /// hashes (`--trace`).
     pub trace: Option<PathBuf>,
 }
 
-/// Where the session stands in time, for the dev tools.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TimelineStatus {
-    /// Frames run so far: the next frame's position. What shows is the
-    /// frame before it.
-    pub frame: u64,
-    /// The end of the recorded frames; beyond `frame` when paused after a
-    /// rewind (stepping runs them again).
-    pub latest: u64,
-    /// The earliest frame `rewind_to` reaches; none without a history.
-    pub earliest: Option<u64>,
-    /// Game seconds of history before `frame`.
-    pub seconds: f64,
-    pub paused: bool,
-    /// Recorded frames are playing (a replay).
-    pub replaying: bool,
-    /// A history is kept.
-    pub history: bool,
-    /// Frames overlap (`--pipeline`).
-    pub pipelined: bool,
+/// Overlapping frames (`Playback::overlap`): the guest computes the next
+/// frame while this one draws.
+#[derive(Default)]
+struct Overlap {
+    enabled: bool,
+    /// The frame the guest computes while the last one draws.
+    flight: Option<Planned>,
+    /// A script tick taken early that travels in time, so its frame waits.
+    early: Option<Tick>,
 }
-
-/// What a replay does when its frames run out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Replaying {
-    /// `--replay`: stop (headless) or pause (a window).
-    File,
-    /// `replay_recent`: play on, live.
-    Recent,
-}
-
-/// Seconds Ctrl+Shift+R replays.
-pub const REPLAY_SECONDS: f64 = 5.0;
 
 /// A frame on its way to the game: its input, and what to do with it.
 struct Planned {
@@ -912,23 +337,16 @@ pub struct Session {
     /// when it started and how much game time has passed since.
     pacer: Option<(Instant, f64)>,
     timeline: Timeline,
-    paused: bool,
-    /// A rejected frame paused live playback; a valid reload should play on.
-    resume_after_reload: bool,
-    /// Frames to run while paused.
-    steps: u32,
-    /// Positions to go back (or forward) to once the guest is idle.
-    rewinds: VecDeque<Rewind>,
-    replaying: Option<Replaying>,
+    /// Playing or paused, recorded frames playing, and the time travel and
+    /// input recordings waiting for the guest to be idle.
+    transport: Transport,
     /// A new build waiting for the guest to be idle.
     build: Option<(GuestModule, Catalog)>,
-    pipeline: bool,
-    /// The frame the guest computes while the last one draws.
-    flight: Option<Planned>,
-    /// A script tick taken early that travels in time, so its frame waits.
-    early: Option<Tick>,
+    overlap: Overlap,
     /// The frame last shown, shown again while paused.
     last: Option<RenderFrame>,
+    /// The GPU's still texture holds `last`, drawn.
+    still: bool,
     input_recorder: Option<recording::Writer>,
     trace: Option<BufWriter<File>>,
     /// The renderer's asset events while recorded frames play: the game
@@ -940,16 +358,8 @@ pub struct Session {
     timings: Option<FrameTimings>,
     /// The input recording's file and the frame it starts at.
     recording_input: Option<(PathBuf, u64)>,
-    /// Start (to a file) or stop recording input, once the guest is idle.
-    record_request: Option<Option<PathBuf>>,
     /// A screenshot with the overlay of the last frame (`--overlay-shot`).
     final_overlay_shot: Option<PathBuf>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Rewind {
-    To(u64),
-    Replay(f64),
 }
 
 fn read_optional(path: &Path) -> Option<SavedState> {
@@ -980,11 +390,11 @@ macro_rules! shell {
 fn report(result: Result<()>, done: String) -> bool {
     match result {
         Ok(()) => {
-            overlay::info(Source::Session, done);
+            devlog::info(Source::Session, done);
             true
         }
         Err(error) => {
-            overlay::error(Source::Session, format!("{error:#}"));
+            devlog::error(Source::Session, format!("{error:#}"));
             false
         }
     }
@@ -994,11 +404,8 @@ fn report(result: Result<()>, done: String) -> bool {
 /// returns the state loaded, for the input recording.
 fn load_file(runtime: &mut GameRuntime, host: &mut dyn Host, path: &Path, scene: bool) -> Option<Load> {
     let saved = snapshot::read(path).map_err(|error| eprintln!("{error:#}")).ok()?;
-    let (result, what) = if scene {
-        (runtime.load_scene(host, &saved), "scene ")
-    } else {
-        (runtime.load(host, &saved), "")
-    };
+    let (result, what) =
+        if scene { (runtime.load_scene(host, &saved), "scene ") } else { (runtime.load(host, &saved), "") };
     let load = if scene { Load::Scene(saved) } else { Load::Save(saved) };
     report(result, format!("loaded {what}{}", path.display())).then_some(load)
 }
@@ -1028,23 +435,18 @@ impl Session {
         let recorder = match &options.record {
             Some(path) => Some(Recorder::start(
                 path,
-                gpu.size.0,
-                gpu.size.1,
+                gpu.size,
                 fps.unwrap_or(60.0),
+                gpu.bgra(),
                 (!options.mute).then_some((paths.assets.as_path(), &catalog)),
             )?),
             None => None,
         };
-        let mut capture = Capture {
-            recorder,
-            offscreen: options.headless,
-            screenshots: Vec::new(),
-            overlay_shots: Vec::new(),
-        };
+        let mut capture = Capture { recorder, offscreen: options.headless, ..Capture::default() };
         let mut input = Input::default();
         let mut preferences = Preferences::load(paths.preferences.clone());
         preferences.replay(&mut input);
-        let mut services = Services::standard();
+        let mut services = crate::services::standard();
         let dev = if options.dev { Some(Dev::new(&paths.game, &paths.assets)?) } else { None };
         let mut audio = audio;
         let runtime = {
@@ -1101,30 +503,24 @@ impl Session {
             frames: 0,
             pacer: None,
             timeline,
-            paused: false,
-            resume_after_reload: false,
-            steps: 0,
-            rewinds: VecDeque::new(),
-            replaying: None,
+            transport: Transport::default(),
             build: None,
-            pipeline: false,
-            flight: None,
-            early: None,
+            overlap: Overlap::default(),
             last: first,
+            still: false,
             input_recorder: None,
             trace: None,
             held: Vec::new(),
             overlay: None,
             timings: None,
             recording_input: None,
-            record_request: None,
             final_overlay_shot: None,
         })
     }
 
     /// Sets up what the session does besides playing; before the first step.
     pub fn playback(&mut self, playback: Playback, window: Option<&Window>) -> Result<()> {
-        self.pipeline = playback.pipeline;
+        self.overlap.enabled = playback.overlap;
         if playback.history || playback.replay.is_some() {
             self.timeline.keep_history(Some(KEEP_SECONDS));
         }
@@ -1150,9 +546,9 @@ impl Session {
             if self.options.settle {
                 settle(&mut self.gpu, &shown, self.runtime.catalog())?;
             }
-            self.last = Some(shown);
+            self.show(shown);
             self.services.forget();
-            self.replaying = Some(Replaying::File);
+            self.transport.replay(Replaying::File);
             eprintln!("replaying {frames} frames ({seconds:.1} s of game time) from {}", path.display());
         }
         if let Some(path) = &playback.record_input {
@@ -1166,9 +562,13 @@ impl Session {
     /// Stops the game where it is; the window keeps showing (and drawing)
     /// the last frame.
     pub fn pause(&mut self) {
-        self.resume_after_reload = false;
-        if !self.paused {
-            self.paused = true;
+        let was_playing = self.transport.pause();
+        self.stopped(was_playing);
+    }
+
+    /// The game time stops, if it had not (`was_playing`).
+    fn stopped(&mut self, was_playing: bool) {
+        if was_playing {
             self.clock.pause();
             self.pacer = None;
         }
@@ -1177,40 +577,36 @@ impl Session {
     /// Plays on. After a rewind, play continues live from there, and the
     /// frames that had followed are forgotten; a paused replay plays on.
     pub fn resume(&mut self) {
-        self.resume_after_reload = false;
-        if !self.paused {
+        if !self.transport.resume() {
             return;
         }
-        self.paused = false;
-        self.steps = 0;
-        if self.replaying.is_none() && self.timeline.next().is_some() {
+        if self.transport.replaying().is_none() && self.timeline.next().is_some() {
             self.timeline.go_live();
         }
         self.clock.resume();
         self.pacer = None;
     }
 
-    /// Runs one frame and stays paused (pausing first if need be). Paused
-    /// after a rewind, it runs the next recorded frame again.
-    pub fn step_frame(&mut self) {
-        self.pause();
-        self.steps += 1;
+    /// Runs `frames` frames and stays paused (pausing first if need be).
+    /// Paused after a rewind, it runs the next recorded frames again.
+    pub fn step_frames(&mut self, frames: u32) {
+        let was_playing = self.transport.step(frames);
+        self.stopped(was_playing);
     }
 
     /// Goes to frame `frame` (pausing there) by restoring the nearest
     /// moment before it and running the recorded frames again unseen.
     /// Takes effect on the next step.
     pub fn rewind_to(&mut self, frame: u64) {
-        self.pause();
-        self.steps = 0;
-        self.rewinds.push_back(Rewind::To(frame));
+        let was_playing = self.transport.rewind_to(frame);
+        self.stopped(was_playing);
     }
 
     /// Plays the last `seconds` of recorded input again, on whatever build
     /// runs now (after a hot reload, the new one), then plays on live.
     /// Takes effect on the next step.
     pub fn replay_recent(&mut self, seconds: f64) {
-        self.rewinds.push_back(Rewind::Replay(seconds));
+        self.transport.replay_recent(seconds);
     }
 
     pub fn timeline(&self) -> TimelineStatus {
@@ -1220,10 +616,10 @@ impl Session {
             latest: self.timeline.head().max(frame),
             earliest: self.timeline.earliest(),
             seconds: self.timeline.seconds(),
-            paused: self.paused,
-            replaying: self.replaying.is_some(),
+            paused: self.transport.paused(),
+            replaying: self.transport.replaying().is_some(),
             history: self.timeline.history(),
-            pipelined: self.pipeline,
+            overlapped: self.overlap.enabled,
         }
     }
 
@@ -1231,13 +627,7 @@ impl Session {
     /// The frame `seconds` of game time before `frame`, as far back as the
     /// history reaches.
     pub fn frames_before(&self, frame: u64, seconds: f64) -> u64 {
-        let earliest = self.timeline.earliest().unwrap_or(frame).min(frame);
-        let (mut position, mut time) = (frame, 0.0);
-        while position > earliest && time < seconds {
-            position -= 1;
-            time += self.timeline.recorded(position).map_or(STEP_SECONDS, Recorded::elapsed);
-        }
-        position
+        self.timeline.frames_before(frame, seconds)
     }
 
     #[cfg(feature = "devtools")]
@@ -1251,19 +641,24 @@ impl Session {
         self.overlay.as_mut().is_none_or(|overlay| overlay.window_event(window, event))
     }
 
+    /// A new frame shows; its image is not drawn yet.
+    fn show(&mut self, frame: RenderFrame) {
+        // The next frame decodes into the one this replaces.
+        if let Some(shown) = self.last.replace(frame) {
+            self.runtime.recycle(shown);
+        }
+        self.still = false;
+    }
+
     /// The interface the frame shown declares for assistive technology
     /// (`RenderFrame::ui`, see `accessibility`).
     pub fn interface(&self) -> &[UiNode] {
         self.last.as_ref().map_or(&[], |frame| &frame.ui)
     }
 
-    /// The overlay's part of the accessibility tree: whether it shows, and
-    /// its tree from its last layout, once.
-    pub fn overlay_accesskit(&mut self) -> (bool, Option<accesskit::TreeUpdate>) {
-        match &mut self.overlay {
-            Some(overlay) => (overlay.accesskit_shown(), overlay.accesskit_update()),
-            None => (false, None),
-        }
+    /// The overlay's interface for assistive technology, while it shows one.
+    pub fn overlay_interface(&self) -> Option<&[UiNode]> {
+        self.overlay.as_ref().and_then(|overlay| overlay.interface())
     }
 
     /// An assistive technology's request for one of the overlay's nodes.
@@ -1292,14 +687,14 @@ impl Session {
     }
 
     #[cfg(feature = "devtools")]
-    /// The running game's state, as a quicksave holds it (the overlay's
-    /// Tunables panel reads its tuned values); none while an overlapped
-    /// frame computes, or if the game cannot say.
+    /// The running game's state, as a quicksave holds it (the dev tools
+    /// read the tuned values in it); none while an overlapped frame
+    /// computes, or if the game cannot say.
     pub fn snapshot(&mut self) -> Option<SavedState> {
-        if self.flight.is_some() {
+        if self.overlap.flight.is_some() {
             return None;
         }
-        self.runtime.snapshot().map_err(|error| overlay::error(Source::Session, format!("{error:#}"))).ok()
+        self.runtime.snapshot().map_err(|error| devlog::error(Source::Session, format!("{error:#}"))).ok()
     }
 
     #[cfg(feature = "devtools")]
@@ -1315,7 +710,7 @@ impl Session {
     /// Starts recording the input to `path` (a `.penrec`, from the frame
     /// it then is), or with None stops, once the guest is idle.
     pub fn record_input(&mut self, path: Option<PathBuf>) {
-        self.record_request = Some(path);
+        self.transport.record(path);
     }
 
     #[cfg(feature = "devtools")]
@@ -1341,7 +736,7 @@ impl Session {
             recorder.finish()?;
             if let Some((path, from)) = self.recording_input.take() {
                 let frames = self.timeline.position().saturating_sub(from);
-                overlay::note(Source::Session, format!("recorded {frames} frames of input to {}", path.display()));
+                devlog::note(Source::Session, format!("recorded {frames} frames of input to {}", path.display()));
             }
         }
         Ok(())
@@ -1366,8 +761,8 @@ impl Session {
             self.runtime.restore(&mut Quiet(&shell), &moment)?
         };
         self.runtime.continue_clock(self.clock.now());
-        self.last = Some(shown);
-        overlay::info(Source::Session, format!("recording input to {} from frame {position}", path.display()));
+        self.show(shown);
+        devlog::info(Source::Session, format!("recording input to {} from frame {position}", path.display()));
         self.recording_input = Some((path, position));
         Ok(())
     }
@@ -1378,7 +773,7 @@ impl Session {
         if let Some((path, from)) = &self.recording_input
             && at < *from
         {
-            overlay::info(Source::Session, format!("stopped recording {}: went back before it started", path.display()));
+            devlog::info(Source::Session, format!("stopped recording {}: went back before it started", path.display()));
             self.stop_recording()?;
         }
         if let Some(recorder) = &mut self.input_recorder {
@@ -1389,28 +784,25 @@ impl Session {
 
     /// The frame a rewind queued now starts from.
     fn target(&self) -> u64 {
-        match self.rewinds.back() {
-            Some(Rewind::To(frame)) => *frame,
-            _ => self.timeline.position(),
-        }
+        self.transport.target(self.timeline.position())
     }
 
     fn hotkey(&mut self, hotkey: Hotkey) {
         match hotkey {
-            Hotkey::Pause if self.paused => {
+            Hotkey::Pause if self.transport.paused() => {
                 self.resume();
-                overlay::info(Source::Session, "playing");
+                devlog::info(Source::Session, "playing");
             }
             Hotkey::Pause => {
                 self.pause();
                 let status = self.timeline();
                 let back = if status.history { ", Ctrl+Shift+comma back" } else { "" };
-                overlay::info(
+                devlog::info(
                     Source::Session,
                     format!("paused at frame {} (Ctrl+Shift+period steps{back}, Ctrl+Shift+P plays)", status.frame),
                 );
             }
-            Hotkey::Step => self.step_frame(),
+            Hotkey::Step => self.step_frames(1),
             Hotkey::Back => self.rewind_to(self.target().saturating_sub(1)),
             Hotkey::Replay => self.replay_recent(REPLAY_SECONDS),
         }
@@ -1420,10 +812,7 @@ impl Session {
         match travel {
             Travel::Pause => self.pause(),
             Travel::Resume => self.resume(),
-            Travel::Step(frames) => {
-                self.pause();
-                self.steps += frames;
-            }
+            Travel::Step(frames) => self.step_frames(frames),
             Travel::Rewind(frames) => self.rewind_to(self.target().saturating_sub(frames)),
             Travel::Replay(seconds) => self.replay_recent(seconds),
         }
@@ -1431,7 +820,7 @@ impl Session {
 
     /// Whether the game plays the player's input (not recorded frames).
     fn live(&self) -> bool {
-        self.replaying.is_none() && self.timeline.next().is_none()
+        self.transport.replaying().is_none() && self.timeline.next().is_none()
     }
 
     /// Goes to `target`, paused.
@@ -1441,7 +830,7 @@ impl Session {
         let trace = &mut self.trace;
         // The trace shows the frames run again unseen too: a replay of the
         // input recording runs them as they ran last.
-        let mut unseen = |position: u64, recorded: &Recorded, runtime: &GameRuntime| -> Result<()> {
+        let mut unseen = |position: u64, recorded: &Recorded, runtime: &timeline::Runtime| -> Result<()> {
             if let Some(trace) = trace {
                 writeln!(trace, "{position} {:016x} {:016x}", hash_lanes(&recorded.input), runtime.packet_hash())?;
             }
@@ -1451,7 +840,7 @@ impl Session {
         self.services.forget();
         let position = self.timeline.position();
         self.runtime.continue_clock(self.clock.now());
-        self.last = Some(shown);
+        self.show(shown);
         self.pacer = None;
         // The recording goes back to the moment restored, and on again
         // from there marked as restored.
@@ -1462,7 +851,7 @@ impl Session {
             }
         }
         let ahead = self.timeline.head() - position;
-        overlay::info(
+        devlog::info(
             Source::Session,
             format!(
                 "at frame {position} in {:.0} ms ({ahead} recorded frames ahead: Ctrl+Shift+period runs them, \
@@ -1479,38 +868,36 @@ impl Session {
         let shell = shell!(self, window);
         let (shown, at) = self.timeline.restart(&mut self.runtime, &shell, from)?;
         self.services.forget();
-        self.last = Some(shown);
-        self.replaying.get_or_insert(Replaying::Recent);
-        self.paused = false;
-        self.steps = 0;
+        self.show(shown);
+        self.transport.replay(Replaying::Recent);
         self.clock.resume();
         self.pacer = None;
         self.rewind_recording(at)?;
         let frames = self.timeline.head() - at;
-        overlay::info(Source::Session, format!("replaying {frames} frames from frame {at} on the running build"));
+        devlog::info(Source::Session, format!("replaying {frames} frames from frame {at} on the running build"));
         Ok(())
     }
 
     /// A replay's frames ran out; returns whether the run ends.
     fn replay_ended(&mut self) -> bool {
-        let replaying = self.replaying.take();
+        let replaying = self.transport.replay_ended();
         self.runtime.continue_clock(self.clock.now());
         let position = self.timeline.position();
         match replaying {
             Some(Replaying::File) if self.options.frames == 0 && self.options.headless => {
-                overlay::info(Source::Session, format!("the replay ended at frame {position}"));
+                devlog::info(Source::Session, format!("the replay ended at frame {position}"));
                 true
             }
             Some(Replaying::File) if self.options.frames == 0 => {
                 self.pause();
-                overlay::info(
+                devlog::info(
                     Source::Session,
                     format!("the replay ended at frame {position}; paused (Ctrl+Shift+P plays on, live)"),
                 );
                 false
             }
             Some(_) => {
-                overlay::info(Source::Session, format!("the replay ended at frame {position}; playing live"));
+                devlog::info(Source::Session, format!("the replay ended at frame {position}; playing live"));
                 false
             }
             None => false,
@@ -1559,9 +946,7 @@ impl Session {
         let shell = shell!(self, window);
         self.timeline.prepare(&mut self.runtime, &shell)?;
         self.frames += 1;
-        let last = (self.options.frames != 0 && self.frames >= self.options.frames)
-            || tick.quit
-            || self.script_over();
+        let last = (self.options.frames != 0 && self.frames >= self.options.frames) || tick.quit || self.script_over();
         let viewport = Viewport { width: self.gpu.size.0, height: self.gpu.size.1 };
         let (input, replayed) = match self.timeline.next() {
             Some(recorded) => {
@@ -1571,14 +956,15 @@ impl Session {
                 planned
             }
             None => {
-                let frame = self.input.next_frame(self.clock.next(), viewport);
+                let frame = self.input.next_frame(self.clock.advance(), viewport);
                 (self.runtime.input(&frame)?, None)
             }
         };
         if window.is_some() && (self.clock.is_steady() || replayed.is_some()) {
             self.pace(f64::from(input[0]));
         }
-        let mut shots: Vec<PathBuf> = tick.shots.iter().map(|name| self.paths.shots.join(format!("{name}.png"))).collect();
+        let mut shots: Vec<PathBuf> =
+            tick.shots.iter().map(|name| self.paths.shots.join(format!("{name}.png"))).collect();
         if last && let Some(path) = &self.options.screenshot {
             shots.push(path.clone());
         }
@@ -1599,15 +985,15 @@ impl Session {
     /// nothing this frame does afterwards needs the guest or changes its
     /// state, and the next frame is the player's.
     fn overlaps(&self, planned: &Planned, rendered: &RenderFrame) -> bool {
-        self.pipeline
+        self.overlap.enabled
             && !planned.stop
             && planned.replayed.is_none()
             && planned.saves.is_empty()
             && planned.loads.is_empty()
-            && !self.paused
+            && !self.transport.paused()
             && self.live()
             && self.build.is_none()
-            && self.rewinds.is_empty()
+            && !self.transport.travelling()
             // Its requests' answers go to the next frame, as without overlap.
             && rendered.services.is_empty()
             && !(rendered.checkpoint_requested
@@ -1639,13 +1025,16 @@ impl Session {
         if self.runtime.reload(&mut shell, module, catalog) == ReloadResult::Activated {
             self.timeline.rebuilt();
             if let Some(drawn) = self.runtime.take_drawn() {
-                self.last = Some(drawn);
+                self.show(drawn);
             }
-            if self.resume_after_reload {
+            if self.transport.reloaded() {
                 self.resume();
             }
             if self.timeline.history() {
-                overlay::info(Source::Reload, format!("dev: Ctrl+Shift+R replays the last {REPLAY_SECONDS} s on the new build"));
+                devlog::info(
+                    Source::Reload,
+                    format!("dev: Ctrl+Shift+R replays the last {REPLAY_SECONDS} s on the new build"),
+                );
             }
         }
     }
@@ -1680,9 +1069,7 @@ impl Session {
     /// recording), and the script's shots of it.
     fn present_paused(&mut self, window: Option<&Window>, tick: Tick) -> Result<bool> {
         self.frames += 1;
-        let last = (self.options.frames != 0 && self.frames >= self.options.frames)
-            || tick.quit
-            || self.script_over();
+        let last = (self.options.frames != 0 && self.frames >= self.options.frames) || tick.quit || self.script_over();
         for name in &tick.shots {
             self.capture.screenshots.push(self.paths.shots.join(format!("{name}.png")));
         }
@@ -1696,20 +1083,53 @@ impl Session {
         Ok(!last)
     }
 
+    /// Shows the last frame again and writes the shots waiting for it. Its
+    /// image is drawn once, into the still texture, and copied to the window
+    /// after that, with the overlay drawn over the copy as it changes. It is
+    /// drawn again when the frame's size changes, and while the renderer
+    /// loads or fades in assets (an asset reloaded while paused shows).
     fn present_last(&mut self, window: Option<&Window>) -> Result<()> {
-        if let Some(frame) = self.last.take() {
-            let recorder = self.capture.recorder.take();
-            let mut shell = shell!(self, window);
-            shell.audio = None;
-            let result = shell.render(&frame, self.runtime.catalog());
-            self.capture.recorder = recorder;
-            self.last = Some(frame);
-            result?;
-            if let Some(fault) = self.gpu.take_fault() {
-                return Err(anyhow!(fault));
+        let Some(frame) = &self.last else { return Ok(()) };
+        let gpu = &mut self.gpu;
+        let current = self.still
+            && gpu.still.as_ref().is_some_and(|still| (still.width(), still.height()) == gpu.size)
+            && gpu.renderer.quiet()
+            && gpu.renderer.pending() == 0;
+        let capture = &mut self.capture;
+        let shots = !capture.screenshots.is_empty() || !capture.overlay_shots.is_empty();
+        if current && gpu.surface.is_none() && !shots {
+            return Ok(());
+        }
+        let texture = gpu.still_texture();
+        let output = Output {
+            device: &gpu.device,
+            queue: &gpu.queue,
+            surface: gpu.surface.as_ref(),
+            size: gpu.size,
+            blitter: gpu.blitter.as_ref(),
+            overlay: self.overlay.as_mut(),
+        };
+        let mut target = CaptureTarget { output, texture: texture.clone() };
+        if current {
+            target.present();
+        } else {
+            gpu.renderer.submit(frame, self.runtime.catalog(), &mut target)?;
+            self.still = true;
+        }
+        for path in capture.overlay_shots.drain(..) {
+            write_overlay_shot(gpu, &texture, self.overlay.as_mut(), &path)?;
+        }
+        if !capture.screenshots.is_empty() {
+            let pixels = gpu.read(&texture)?;
+            for path in capture.screenshots.drain(..) {
+                write_png(&path, &pixels, texture.width(), texture.height(), gpu.bgra())?;
             }
         }
-        Ok(())
+        show_cursor(window, frame, self.overlay.as_ref().is_some_and(|overlay| overlay.wants_pointer()));
+        match gpu.take_fault() {
+            Some(fault) => Err(anyhow!(fault)),
+            None => Ok(()),
+        }
     }
 
     /// Invalid guest output never commits its candidate state. Keep the last
@@ -1718,17 +1138,22 @@ impl Session {
         if !self.options.dev || !error.is::<InvalidFrame>() {
             return Err(error);
         }
-        let resume = !self.paused;
-        self.pause();
-        self.resume_after_reload = resume;
-        self.steps = 0;
+        let was_playing = self.transport.reject();
+        self.stopped(was_playing);
         self.timings = None;
         self.input.discard();
         self.input.enqueue(GameEvent::FocusLost);
-        overlay::error(Source::Game, format!(
-            "dev: frame {} rejected: {error:#}\ngame paused; fix the source to reload, or use Play to retry",
-            planned.position,
-        ));
+        // A program stopped at its deadline is gone: a new one restores the last frame's state.
+        if error.is::<Unresponsive>() {
+            self.transport.restore_at(self.timeline.position());
+        }
+        devlog::error(
+            Source::Game,
+            format!(
+                "dev: frame {} rejected: {error:#}\ngame paused; fix the source to reload, or use Play to retry",
+                planned.position,
+            ),
+        );
         self.capture.screenshots.extend(planned.shots);
         self.capture.overlay_shots.extend(planned.overlay_shots);
         self.present_last(window)?;
@@ -1753,10 +1178,10 @@ impl Session {
             if self.dev.is_some() {
                 match &event {
                     GameEvent::AssetReady { key, revision, .. } if *revision > 1 => {
-                        overlay::info(Source::Asset, format!("dev: {key} is in (revision {revision})"));
+                        devlog::info(Source::Asset, format!("dev: {key} is in (revision {revision})"));
                     }
                     GameEvent::AssetFailed { key, message, .. } => {
-                        overlay::error(Source::Asset, format!("dev: {key} failed: {message}"));
+                        devlog::error(Source::Asset, format!("dev: {key} failed: {message}"));
                     }
                     _ => {}
                 }
@@ -1775,45 +1200,40 @@ impl Session {
         for hotkey in self.input.take_hotkeys() {
             self.hotkey(hotkey);
         }
-        let planned = match self.flight.take() {
+        let planned = match self.overlap.flight.take() {
             Some(planned) => planned,
             None => {
                 // The guest is idle: what waited for it happens now.
                 if let Some((module, catalog)) = self.build.take() {
                     self.reload(window, module, catalog);
                 }
-                let tick = match self.early.take() {
+                let tick = match self.overlap.early.take() {
                     Some(tick) => tick,
                     None => self.tick(),
                 };
                 if let Some(travel) = tick.travel {
                     self.travel(travel);
                 }
-                while let Some(rewind) = self.rewinds.pop_front() {
-                    // Of rewinds queued one after another (a held key), the last.
-                    if matches!((rewind, self.rewinds.front()), (Rewind::To(_), Some(Rewind::To(_)))) {
-                        continue;
-                    }
+                while let Some(rewind) = self.transport.next_rewind() {
                     let result = match rewind {
                         Rewind::To(frame) => self.rewind(window, frame),
                         Rewind::Replay(seconds) => self.replay(window, seconds),
                     };
                     if let Err(error) = result {
-                        overlay::error(Source::Session, format!("time travel: {error:#}"));
+                        devlog::error(Source::Session, format!("time travel: {error:#}"));
                     }
                 }
-                if let Some(path) = self.record_request.take()
+                if let Some(path) = self.transport.take_record()
                     && let Err(error) = match path {
                         Some(path) => self.start_recording(window, path),
                         None => self.stop_recording(),
                     }
                 {
-                    overlay::error(Source::Session, format!("recording input: {error:#}"));
+                    devlog::error(Source::Session, format!("recording input: {error:#}"));
                 }
-                if self.paused && self.steps == 0 {
+                if !self.transport.take_frame() {
                     return self.present_paused(window, tick);
                 }
-                self.steps = self.steps.saturating_sub(1);
                 let planned = self.plan(window, tick)?;
                 self.runtime.send(&planned.input)?;
                 planned
@@ -1835,11 +1255,11 @@ impl Session {
             self.ran(planned.position, std::mem::take(&mut planned.input), Vec::new())?;
             let tick = self.tick();
             if tick.travel.is_some() {
-                self.early = Some(tick);
+                self.overlap.early = Some(tick);
             } else {
                 let next = self.plan(window, tick)?;
                 self.runtime.send(&next.input)?;
-                self.flight = Some(next);
+                self.overlap.flight = Some(next);
             }
         }
         let stop = self.complete(window, planned, rendered, overlapped, started)?;
@@ -1910,31 +1330,24 @@ impl Session {
             self.ran(planned.position, planned.input, loads)?;
         }
         let exit = rendered.exit_requested;
-        self.last = Some(self.runtime.take_drawn().unwrap_or(rendered));
+        let shown = self.runtime.take_drawn().unwrap_or(rendered);
+        self.show(shown);
         let mut stop = exit || planned.stop;
-        if self.replaying.is_some() && self.timeline.next().is_none() {
+        if self.transport.replaying().is_some() && self.timeline.next().is_none() {
             stop |= self.replay_ended();
         }
-        // Only while measured (a profile, or the overlay's profiler).
-        self.timings = self.runtime.last_timings().map(|mut timings| {
-            timings.submit_ms = submit_ms;
-            timings.total_ms = started.elapsed().as_secs_f64() * 1000.0;
-            timings.housekeeping_ms =
-                (timings.total_ms - timings.wait_ms - timings.decode_ms - timings.validate_ms - timings.submit_ms)
-                    .max(0.0);
-            timings
-        });
-        if self.frame_times && let Some(timing) = self.timings {
-            eprintln!(
-                "frame {}: guest {:.3} wait {:.3} decode {:.3} validate {:.3} submit {:.3} housekeeping {:.3} total {:.3} ms",
-                self.frames, timing.guest_ms, timing.wait_ms, timing.decode_ms,
-                timing.validate_ms, timing.submit_ms, timing.housekeeping_ms, timing.total_ms,
-            );
+        // Only while measured (a profile, or the dev tools' profiler).
+        let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.timings = self.runtime.last_timings().map(|timings| timings.completed(submit_ms, total_ms));
+        if self.frame_times
+            && let Some(timing) = &self.timings
+        {
+            profile::print(self.frames, timing);
         }
         if let Some(profile) = &mut self.profile
             && profile.sample(self.frames, self.timings)
         {
-            profile.report(self.pipeline);
+            profile.report(self.overlap.enabled);
             return Ok(true);
         }
         Ok(stop)
@@ -1951,12 +1364,15 @@ impl Session {
         if let Some(mut trace) = self.trace.take() {
             trace.flush()?;
         }
-        if let Some(recorder) = self.capture.recorder.take() {
+        if let Some(mut recorder) = self.capture.recorder.take() {
+            for (pixels, (width, height)) in self.capture.readback.finish(&self.gpu.device)? {
+                recorder.picture(pixels, width, height)?;
+            }
             recorder.finish()?;
         }
         Ok(self.gpu)
     }
 }
 
-#[cfg(all(test, feature = "plugins"))]
+#[cfg(all(test, feature = "compiler"))]
 mod recovery_tests;

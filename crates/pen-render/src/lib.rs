@@ -1,13 +1,15 @@
-//! wgpu renderer for gdev render packets: a port of gdev's renderer.ts and
-//! the modules it uses (post.ts, decals.ts, sprites.ts, solids.ts,
-//! mipmaps.ts, matrix.ts, asset_store.ts, asset_files.ts, packed_texture.ts
-//! and texture.ts). See PORTING.md.
+//! wgpu renderer for a game's render packets: lit meshes, instanced batches
+//! and brush solids with shadows, decals, sky and fog, bloom, FXAA, sprites
+//! and insets, over assets that stream in on loader threads. Natively and in
+//! the browser (WebGPU) alike. See ARCHITECTURE.md for how it works.
 mod asset_store;
+mod built_in;
 mod decals;
 mod loader;
 mod matrix;
 mod mipmaps;
 mod packed_texture;
+mod pipeline_cache;
 mod platform;
 mod post;
 mod renderer;
@@ -18,16 +20,27 @@ mod texture;
 
 use pen_protocol::{Catalog, GameEvent, RenderFrame};
 
+pub use asset_store::pack_mesh;
 pub use renderer::validate_frame;
 
 pub struct RendererOptions {
     /// The swapchain format. Like the browser's preferred canvas format it is
-    /// NOT sRGB (e.g. Bgra8Unorm); the present pass encodes as the TS does.
+    /// NOT sRGB (e.g. Bgra8Unorm); the present pass encodes colours itself.
     pub format: wgpu::TextureFormat,
     /// Directory holding catalog.json and every asset key (e.g. dist/gdev/assets).
     pub assets: std::path::PathBuf,
     /// Seconds the loading veil takes to clear (gdev passes 0.6); None for no veil.
     pub veil: Option<f32>,
+    /// A directory to keep compiled pipelines in between runs, which only
+    /// a device with `optional_features` (Vulkan) can; None to compile
+    /// afresh each run. The browser keeps its own.
+    pub pipeline_cache: Option<std::path::PathBuf>,
+}
+
+/// The features the renderer uses when a device has them, of those the
+/// adapter offers: request them with the device.
+pub fn optional_features(adapter: &wgpu::Adapter) -> wgpu::Features {
+    adapter.features() & wgpu::Features::PIPELINE_CACHE
 }
 
 /// Where frames are drawn: a window's surface, or an offscreen texture.
@@ -38,7 +51,7 @@ pub trait RenderTarget {
     fn present(&mut self);
 }
 
-/// What the last frame drew (the TS's `stats()`).
+/// What the last frame drew.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RenderStats {
     pub draw_calls: u32,
@@ -55,14 +68,27 @@ impl Renderer {
         Ok(Self { state: renderer::State::new(device, queue, options)? })
     }
 
-    /// `preload(catalog)`: prefetch every mesh and material (and their textures).
+    /// A renderer of the assets under `assets` sharing this one's device,
+    /// loader threads and pipeline cache, for another program's sprites over
+    /// this one's frames (pen's dev tools): its loads and asset events are
+    /// its own, and it has no veil.
+    pub fn share(&self, assets: std::path::PathBuf) -> anyhow::Result<Renderer> {
+        Ok(Self { state: self.state.sharing(assets)? })
+    }
+
+    /// Prefetches every mesh and material of the catalog (and their textures).
     pub fn preload(&mut self, catalog: &Catalog) {
         self.state.preload(catalog);
     }
 
-    /// `validateFrame` + `submit(frame)`. Asset IDs in the frame are catalog
+    /// Validates `frame` and draws it. Asset IDs in the frame are catalog
     /// indices; resolve them with `catalog.mesh(i)` / `catalog.material(i)`.
-    pub fn submit(&mut self, frame: &RenderFrame, catalog: &Catalog, target: &mut dyn RenderTarget) -> anyhow::Result<()> {
+    pub fn submit(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+    ) -> anyhow::Result<()> {
         self.state.submit(frame, catalog, target)
     }
 
@@ -84,13 +110,13 @@ impl Renderer {
         self.state.overlay(sprites, catalog, output, size)
     }
 
-    /// Asset events the TS passes to `options.event` (AssetReady/AssetFailed);
-    /// the app forwards them to the game.
+    /// Asset events (AssetReady/AssetFailed) since the last call; the app
+    /// forwards them to the game.
     pub fn take_events(&mut self) -> Vec<GameEvent> {
         self.state.take_events()
     }
 
-    /// `reload(keys)`: the files of these asset keys (relative to the asset
+    /// The files of these asset keys (relative to the asset
     /// root) changed. Each asset of theirs that was loaded or asked for loads
     /// again; the old one draws until the new revision is ready, and stays if
     /// it fails. AssetReady/AssetFailed report the new revision.
@@ -103,18 +129,27 @@ impl Renderer {
         self.state.reload_all();
     }
 
-    /// `quiet()`: whether nothing is streaming in or settling, and the veil is gone.
+    /// Blocks until the loader brings something (an asset, a compiled
+    /// pipeline) or `timeout` passes, takes it in, and says whether anything
+    /// came: for waiting on loading without spinning. Texture levels
+    /// streaming in and detail fading in do not end the wait, and in the
+    /// browser it never blocks.
+    pub fn wait(&mut self, timeout: std::time::Duration) -> bool {
+        self.state.wait(timeout)
+    }
+
+    /// Whether nothing is streaming in or settling, and the veil is gone.
     pub fn quiet(&self) -> bool {
         self.state.quiet()
     }
 
-    /// Asset work under way (the TS store's `stats().pending`): loads,
-    /// textures still streaming in, background pipeline compiles.
+    /// Asset work under way: loads, textures still streaming in, background
+    /// pipeline compiles.
     pub fn pending(&self) -> usize {
         self.state.pending()
     }
 
-    /// `stats()`, as a plain struct with the same fields.
+    /// What the last frame drew.
     pub fn stats(&self) -> RenderStats {
         self.state.stats()
     }

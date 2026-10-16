@@ -22,10 +22,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use notify::{EventKind, RecursiveMode, Watcher};
+use notify::EventKind;
 use serde::Deserialize;
 
-use crate::overlay::{self, Source};
+use crate::dev::watch;
+use crate::devlog::{self, Source};
 
 /// How long sources must be quiet before a recipe runs: an editor's save or
 /// a checkout of many files arrives as one change, and starting Blender
@@ -52,7 +53,7 @@ struct Recipe {
 }
 
 enum Message {
-    Changed(notify::Result<notify::Event>),
+    Changed(watch::Event),
     Stop,
 }
 
@@ -61,7 +62,7 @@ enum Message {
 pub struct Pipeline {
     messages: Sender<Message>,
     thread: Option<JoinHandle<()>>,
-    _watcher: notify::RecommendedWatcher,
+    _watch: watch::Subscription,
 }
 
 impl Pipeline {
@@ -94,21 +95,22 @@ impl Pipeline {
 
         let (messages, received) = channel();
         let changes = messages.clone();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = changes.send(Message::Changed(event));
-        })?;
         let patterns: Vec<&str> =
             config.recipes.iter().flat_map(|recipe| &recipe.sources).map(String::as_str).collect();
         let directories = watched(&patterns);
+        let mut roots = Vec::new();
         for (directory, recursive) in &directories {
             let path = root.join(directory);
             if !path.is_dir() {
                 eprintln!("pipeline: {} does not exist; pipeline.json's sources there are not watched", path.display());
                 continue;
             }
-            let mode = if *recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
-            watcher.watch(&path, mode).with_context(|| format!("watching {}", path.display()))?;
+            roots.push((path, *recursive));
         }
+        let roots: Vec<(&Path, bool)> = roots.iter().map(|(path, recursive)| (path.as_path(), *recursive)).collect();
+        let watch = watch::subscribe(&roots, move |event| {
+            let _ = changes.send(Message::Changed(event));
+        })?;
         let available = config.recipes.len() - unavailable.iter().filter(|skip| **skip).count();
         eprintln!("pipeline: rerunning {available} recipes as their sources change ({})", file.display());
 
@@ -125,7 +127,7 @@ impl Pipeline {
         let thread = std::thread::Builder::new()
             .name("pen-pipeline".into())
             .spawn(move || scheduler.run(&directories, received))?;
-        Ok(Some(Pipeline { messages, thread: Some(thread), _watcher: watcher }))
+        Ok(Some(Pipeline { messages, thread: Some(thread), _watch: watch }))
     }
 }
 
@@ -415,12 +417,14 @@ impl Scheduler {
         let name = &self.recipes[running.index].recipe;
         let seconds = running.started.elapsed().as_secs_f64();
         match status {
-            Ok(status) if status.success() => overlay::info(Source::Pipeline, format!("pipeline: {name} done in {seconds:.1} s")),
-            Ok(status) => overlay::error(
+            Ok(status) if status.success() => {
+                devlog::info(Source::Pipeline, format!("pipeline: {name} done in {seconds:.1} s"))
+            }
+            Ok(status) => devlog::error(
                 Source::Pipeline,
                 format!("pipeline: {name} failed ({status}) after {seconds:.1} s; the game keeps the assets it has"),
             ),
-            Err(error) => overlay::error(Source::Pipeline, format!("pipeline: {name}: {error}")),
+            Err(error) => devlog::error(Source::Pipeline, format!("pipeline: {name}: {error}")),
         }
     }
 
@@ -433,7 +437,7 @@ impl Scheduler {
         }
         let Some((index, cause)) = self.pending.pop_first() else { return };
         let name = &self.recipes[index].recipe;
-        overlay::info(Source::Pipeline, format!("pipeline: {cause} changed; running just {name}"));
+        devlog::info(Source::Pipeline, format!("pipeline: {cause} changed; running just {name}"));
         let spawned = Command::new("just")
             .arg(name)
             .current_dir(&self.root)
@@ -458,22 +462,38 @@ impl Scheduler {
         }
     }
 
-    /// Stops a running recipe: just passes SIGTERM on to what it runs.
+    /// Stops a running recipe: just passes SIGTERM on to what it runs, which
+    /// gets a moment to finish before it is killed.
     fn stop(&mut self) {
         let Some(mut running) = self.running.take() else { return };
         eprintln!("pipeline: stopping {}", self.recipes[running.index].recipe);
-        #[cfg(unix)]
-        let _ = Command::new("kill").arg("-TERM").arg(running.child.id().to_string()).status();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = running.child.try_wait() {
-                return;
+        if terminate(&running.child) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if let Ok(Some(_)) = running.child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            std::thread::sleep(Duration::from_millis(20));
         }
         let _ = running.child.kill();
         let _ = running.child.wait();
     }
+}
+
+/// Asks `child` to stop (SIGTERM); whether it was asked.
+#[cfg(unix)]
+fn terminate(child: &Child) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(child.id()) else { return false };
+    // SAFETY: kill only sends a signal; the child is ours and not yet
+    // waited for, so its pid is still its own.
+    unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
+}
+
+/// Elsewhere there is no asking: the child is killed.
+#[cfg(not(unix))]
+fn terminate(_child: &Child) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -549,6 +569,18 @@ mod tests {
         let event = notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).add_path(path.to_owned());
         scheduler.note(&event, Instant::now());
         scheduler.settle();
+    }
+
+    #[test]
+    fn stopping_asks_a_running_recipe_to_end() {
+        let mut pipeline = scheduler(Path::new("/"), &[("slow", &["models/**"])]);
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        pipeline.running = Some(Running { index: 0, child, started: Instant::now(), output: Vec::new() });
+        let started = Instant::now();
+        pipeline.stop();
+        assert!(pipeline.running.is_none());
+        // Asked, it ends at once rather than when killed after a wait.
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
     }
 
     #[test]

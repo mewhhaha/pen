@@ -27,9 +27,14 @@ Three things matter more than block compression, or as much:
   would drop them; check with the game's author first.
 - **Mesh JSON is half the bundle on disk** but deflates 5.6×, and Steam
   compresses depot chunks, so it costs about 9 MB to download and 52 MB of
-  disk. A binary mesh format would shrink both and load faster; it is a
-  compiler/exporter change (`models/export.py`) as much as a runtime
-  one.
+  disk. pen-render now also reads a binary mesh form, which
+  `pen_render::pack_mesh` makes from the JSON and the renderer finds under
+  the same key. For gdev's 73 meshes it is 32.7 MB instead of 59.1 MB, and
+  it parses in 8.5 ms instead of 179 ms
+  ([measurements](render-performance.md#meshes)). Packaging that writes the
+  binary form in place of the JSON needs no exporter change. Quantized
+  positions or a mesh compressor would shrink it further, but the format
+  would then be lossy.
 - **The packed textures do not compress further** (deflated per level
   already), so they are what downloads: 32.6 MB.
 

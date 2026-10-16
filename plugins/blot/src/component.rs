@@ -1,14 +1,16 @@
 //! The component: wit/pen-plugin.wit's `compiler` over [`crate::Session`],
-//! whose compiler runs as pen's `process.child`.
+//! whose compiler runs as pen's `process.child`, and its `tests` over
+//! [`crate::find_tests`], which reads through pen's `files`.
 use std::cell::RefCell;
 
-use crate::{Build, Overlay, Program};
+use crate::{Build, Expectation, Overlay, Program};
 
 wit_bindgen::generate!({ path: "../../wit", world: "compiler-plugin" });
 
 use exports::pen::plugin::compiler::{self, BuildResult, GuestSession};
+use exports::pen::plugin::tests;
 use pen::plugin::log::{self, Level};
-use pen::plugin::{process, types};
+use pen::plugin::{files, process, types};
 
 struct Plugin;
 
@@ -16,6 +18,52 @@ export!(Plugin);
 
 impl compiler::Guest for Plugin {
     type Session = Compiler;
+}
+
+/// The checkout's files, through what pen.json grants the plugin.
+struct Granted;
+
+impl crate::Files for Granted {
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        files::read(path)
+    }
+
+    fn read_directory(&mut self, directory: &str) -> Result<Vec<String>, String> {
+        files::read_directory(directory)
+    }
+
+    fn is_file(&mut self, path: &str) -> bool {
+        files::is_file(path)
+    }
+}
+
+impl tests::Guest for Plugin {
+    fn find(
+        program: types::Program,
+        paths: Vec<String>,
+        filter: Option<String>,
+    ) -> Result<Vec<tests::TestModule>, String> {
+        let program = Program { root: program.root, entry: program.entry, settings: program.settings };
+        let modules = crate::find_tests(&program, &paths, filter.as_deref(), &mut Granted)?;
+        Ok(modules
+            .into_iter()
+            .map(|module| tests::TestModule {
+                path: module.path,
+                entry: module.entry,
+                overlays: module
+                    .overlays
+                    .into_iter()
+                    .map(|overlay| types::Overlay { path: overlay.path, contents: overlay.contents })
+                    .collect(),
+                prefix: module.prefix,
+                expect: match module.expect {
+                    Expectation::Checks => tests::Expectation::Checks,
+                    Expectation::Traps => tests::Expectation::Traps,
+                    Expectation::Rejected(text) => tests::Expectation::Rejected(text),
+                },
+            })
+            .collect())
+    }
 }
 
 /// pen's child process, as the client's.

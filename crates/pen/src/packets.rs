@@ -81,12 +81,12 @@ pub fn run(run: Run) -> Result<usize> {
     let mut sorted = times[warm..].to_vec();
     sorted.sort_by(f64::total_cmp);
     if !sorted.is_empty() {
-        let at = |q: f64| sorted[(q * (sorted.len() - 1) as f64) as usize];
+        let at = |percent: usize| sorted[(sorted.len() - 1) * percent / 100];
         eprintln!(
             "wasmtime: frames {}, after {warm} warm-up: median {:.2} ms, p95 {:.2} ms",
             times.len(),
-            at(0.5),
-            at(0.95)
+            at(50),
+            at(95)
         );
     }
     if let Some(out) = out {

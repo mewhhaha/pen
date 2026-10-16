@@ -148,10 +148,14 @@ pub fn pump(
 
 /// Whether `events` have `key` ready at `revision`.
 pub fn ready(events: &[GameEvent], key: &str, revision: u64) -> bool {
-    events.iter().any(|event| matches!(event, GameEvent::AssetReady { key: k, revision: r, .. } if k == key && *r == revision))
+    events
+        .iter()
+        .any(|event| matches!(event, GameEvent::AssetReady { key: k, revision: r, .. } if k == key && *r == revision))
 }
 
 /// Whether `events` have `key` failing at `revision`.
 pub fn failed(events: &[GameEvent], key: &str, revision: u64) -> bool {
-    events.iter().any(|event| matches!(event, GameEvent::AssetFailed { key: k, revision: r, .. } if k == key && *r == revision))
+    events
+        .iter()
+        .any(|event| matches!(event, GameEvent::AssetFailed { key: k, revision: r, .. } if k == key && *r == revision))
 }

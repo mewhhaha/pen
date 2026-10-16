@@ -1,7 +1,7 @@
-//! gdev's mix, as WebAudio plays it (gdev's `web/mixer.ts` builds the same
-//! graph of nodes): the frame's buses, voices and sounds, sample by sample,
-//! a render quantum (128 samples) at a time. The live output and video
-//! recordings both play this, so they sound alike, and like the browser.
+//! The game's mix, as the browser host's WebAudio graph of nodes plays it:
+//! the frame's buses, voices and sounds, sample by sample, a render quantum
+//! (128 samples) at a time. The live output and video recordings both play
+//! this, so they sound alike, and like the browser.
 //!
 //! Per voice, as its nodes do in the browser: the clip (AudioBufferSourceNode,
 //! linearly interpolated, its pitch a k-rate playbackRate), a lowpass
@@ -14,6 +14,7 @@
 //! master's `reverb`. Values that change glide as setTargetAtTime does, with
 //! AUDIO_GLIDE_MS for its time constant; a frame's changes land at the start
 //! of the next quantum, where the browser's `currentTime` is.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "audio sample math")]
 use std::f64::consts::PI;
 use std::sync::Arc;
 
@@ -31,17 +32,17 @@ pub const LOWPASS_Q_DB: f64 = -3.010_299_956_639_812;
 const GLIDE_SECONDS: f64 = AUDIO_GLIDE_MS as f64 / 1000.0;
 const FADE_SECONDS: f64 = AUDIO_FADE_MS as f64 / 1000.0;
 
-/// A decoded clip: its frames at its own rate, and whether it is mono (both
-/// channels the same), which WebAudio pans with the mono law.
+/// A decoded clip: its frames (left, right) at its own rate, and whether it
+/// is mono (both channels the same), which WebAudio pans with the mono law.
 pub struct Clip {
-    pub frames: Arc<[kira::Frame]>,
+    pub frames: Arc<[[f32; 2]]>,
     pub rate: f64,
     pub mono: bool,
 }
 
 impl Clip {
-    pub fn new(frames: Arc<[kira::Frame]>, rate: f64) -> Clip {
-        let mono = frames.iter().all(|frame| frame.left.to_bits() == frame.right.to_bits());
+    pub fn new(frames: Arc<[[f32; 2]]>, rate: f64) -> Clip {
+        let mono = frames.iter().all(|[left, right]| left.to_bits() == right.to_bits());
         Clip { frames, rate, mono }
     }
 
@@ -52,15 +53,15 @@ impl Clip {
         if (self.rate - rate).abs() < 0.5 || self.frames.is_empty() {
             return self;
         }
-        let channel = |pick: fn(&kira::Frame) -> f32| {
-            let samples: Vec<f32> = self.frames.iter().map(pick).collect();
+        let channel = |index: usize| {
+            let samples: Vec<f32> = self.frames.iter().map(|frame| frame[index]).collect();
             resample(&samples, self.rate, rate)
         };
-        let left = channel(|frame| frame.left);
-        let frames: Arc<[kira::Frame]> = if self.mono {
-            left.into_iter().map(|value| kira::Frame { left: value, right: value }).collect()
+        let left = channel(0);
+        let frames: Arc<[[f32; 2]]> = if self.mono {
+            left.into_iter().map(|value| [value, value]).collect()
         } else {
-            left.into_iter().zip(channel(|frame| frame.right)).map(|(left, right)| kira::Frame { left, right }).collect()
+            left.into_iter().zip(channel(1)).map(|(left, right)| [left, right]).collect()
         };
         Arc::new(Clip { frames, rate, mono: self.mono })
     }
@@ -197,7 +198,13 @@ struct Lowpass {
 
 impl Lowpass {
     fn new(cutoff: f32, rate: f64) -> Lowpass {
-        let mut filter = Lowpass { cutoff: Glide::at(cutoff), computed: f32::NAN, b: [1.0, 0.0, 0.0], a: [0.0, 0.0], state: [[0.0; 4]; 4] };
+        let mut filter = Lowpass {
+            cutoff: Glide::at(cutoff),
+            computed: f32::NAN,
+            b: [1.0, 0.0, 0.0],
+            a: [0.0, 0.0],
+            state: [[0.0; 4]; 4],
+        };
         filter.compute(cutoff, rate);
         filter
     }
@@ -331,7 +338,15 @@ impl Voice {
     }
 
     /// One quantum into its bus's dry and send inputs.
-    fn render(&mut self, now: u64, rate: f64, glide: f64, quantum_glide: f64, dry: &mut [[f32; 2]; QUANTUM], send: &mut [[f32; 2]; QUANTUM]) {
+    fn render(
+        &mut self,
+        now: u64,
+        rate: f64,
+        glide: f64,
+        quantum_glide: f64,
+        dry: &mut [[f32; 2]; QUANTUM],
+        send: &mut [[f32; 2]; QUANTUM],
+    ) {
         if self.ended {
             return;
         }
@@ -360,7 +375,7 @@ impl Voice {
                 index
             };
             let (a, b) = (frames[index], frames[next]);
-            let left = (f64::from(a.left) * (1.0 - fraction) + f64::from(b.left) * fraction) as f32;
+            let left = (f64::from(a[0]) * (1.0 - fraction) + f64::from(b[0]) * fraction) as f32;
             self.position += step;
             self.lowpass.step(glide, rate);
             let fade = self.fade.at(now + i as u64) as f32;
@@ -375,7 +390,7 @@ impl Voice {
                 let x = self.lowpass.run(0, left) * fade * gain;
                 (x * self.gains.0, x * self.gains.1)
             } else {
-                let right = (f64::from(a.right) * (1.0 - fraction) + f64::from(b.right) * fraction) as f32;
+                let right = (f64::from(a[1]) * (1.0 - fraction) + f64::from(b[1]) * fraction) as f32;
                 let l = self.lowpass.run(0, left) * fade * gain;
                 let r = self.lowpass.run(1, right) * fade * gain;
                 if pan <= 0.0 {
@@ -473,7 +488,7 @@ impl Mixer {
 
     /// Voices and sounds playing, those fading out included.
     #[cfg(test)]
-    fn playing(&self) -> usize {
+    pub(super) fn playing(&self) -> usize {
         self.voices.len()
     }
 
@@ -630,10 +645,10 @@ mod tests {
 
     /// A mono sine at `frequency`, `seconds` long, at `RATE`.
     fn sine(frequency: f64, seconds: f64) -> Arc<Clip> {
-        let frames: Arc<[kira::Frame]> = (0..(seconds * RATE) as usize)
+        let frames: Arc<[[f32; 2]]> = (0..(seconds * RATE) as usize)
             .map(|i| {
                 let value = (std::f64::consts::TAU * frequency * i as f64 / RATE).sin() as f32;
-                kira::Frame { left: value, right: value }
+                [value, value]
             })
             .collect();
         Arc::new(Clip::new(frames, RATE))
@@ -669,11 +684,16 @@ mod tests {
     }
 
     fn rms(samples: &[[f32; 2]]) -> f64 {
-        (samples.iter().map(|[l, r]| f64::from(*l).powi(2) + f64::from(*r).powi(2)).sum::<f64>() / (2 * samples.len()) as f64).sqrt()
+        (samples.iter().map(|[l, r]| f64::from(*l).powi(2) + f64::from(*r).powi(2)).sum::<f64>()
+            / (2 * samples.len()) as f64)
+            .sqrt()
     }
 
     fn largest_step(samples: &[[f32; 2]]) -> f32 {
-        samples.windows(2).map(|pair| (pair[1][0] - pair[0][0]).abs().max((pair[1][1] - pair[0][1]).abs())).fold(0.0, f32::max)
+        samples
+            .windows(2)
+            .map(|pair| (pair[1][0] - pair[0][0]).abs().max((pair[1][1] - pair[0][1]).abs()))
+            .fold(0.0, f32::max)
     }
 
     #[test]
@@ -836,17 +856,23 @@ mod tests {
         let mut dry = Mixer::new(RATE);
         let plain = rms(&play(&mut dry, (0..30).map(|_| on_bus(1, 0.0, vec![master, PLAIN])))[4800..]);
         let mut quiet = Mixer::new(RATE);
-        let half = rms(&play(&mut quiet, (0..30).map(|_| on_bus(1, 0.0, vec![master, BusSpec { gain: 0.5, ..PLAIN }])))[4800..]);
+        let half =
+            rms(&play(&mut quiet, (0..30).map(|_| on_bus(1, 0.0, vec![master, BusSpec { gain: 0.5, ..PLAIN }])))
+                [4800..]);
         assert!((half / plain - 0.5).abs() < 0.01, "{half} {plain}");
         let mut dull = Mixer::new(RATE);
-        let filtered = rms(&play(&mut dull, (0..30).map(|_| on_bus(1, 0.0, vec![master, BusSpec { lowpass: 250.0, ..PLAIN }])))[4800..]);
+        let filtered =
+            rms(&play(&mut dull, (0..30).map(|_| on_bus(1, 0.0, vec![master, BusSpec { lowpass: 250.0, ..PLAIN }])))
+                [4800..]);
         assert!(filtered < plain * 0.35, "{filtered} {plain}");
         // A send adds the reverb; a master returning none takes it away.
         let mut wet = Mixer::new(RATE);
         let reverberant = rms(&play(&mut wet, (0..30).map(|_| on_bus(1, 1.0, vec![master, PLAIN])))[4800..]);
         assert!(reverberant > plain * 1.1, "{reverberant} {plain}");
         let mut returned = Mixer::new(RATE);
-        let none = rms(&play(&mut returned, (0..30).map(|_| on_bus(1, 1.0, vec![BusSpec { reverb: 0.0, ..master }, PLAIN])))[4800..]);
+        let none =
+            rms(&play(&mut returned, (0..30).map(|_| on_bus(1, 1.0, vec![BusSpec { reverb: 0.0, ..master }, PLAIN])))
+                [4800..]);
         assert!((none - plain).abs() < 1e-4, "{none} {plain}");
     }
 
@@ -860,19 +886,36 @@ mod tests {
                 spec.reverb = 0.5;
                 spec.pitch = 1.0 + frame as f32 * 0.01;
                 let sounds = if frame % 7 == 0 {
-                    vec![SoundSpec { clip: b.clone(), bus: 2, gain: 0.5, pan: 0.3, pitch: 1.2, lowpass: 3000.0, reverb: 0.3 }]
+                    vec![SoundSpec {
+                        clip: b.clone(),
+                        bus: 2,
+                        gain: 0.5,
+                        pan: 0.3,
+                        pitch: 1.2,
+                        lowpass: 3000.0,
+                        reverb: 0.3,
+                    }]
                 } else {
                     Vec::new()
                 };
-                Mix { voices: vec![spec], sounds, buses: vec![MASTER, PLAIN, BusSpec { gain: 0.7, lowpass: 5000.0, reverb: 0.2 }] }
+                Mix {
+                    voices: vec![spec],
+                    sounds,
+                    buses: vec![MASTER, PLAIN, BusSpec { gain: 0.7, lowpass: 5000.0, reverb: 0.2 }],
+                }
             })
         };
         let first = play(&mut Mixer::new(RATE), frames());
         let second = play(&mut Mixer::new(RATE), frames());
-        assert!(first.iter().zip(&second).all(|(a, b)| a[0].to_bits() == b[0].to_bits() && a[1].to_bits() == b[1].to_bits()));
+        assert!(
+            first
+                .iter()
+                .zip(&second)
+                .all(|(a, b)| a[0].to_bits() == b[0].to_bits() && a[1].to_bits() == b[1].to_bits())
+        );
     }
-    /// The calibration scenario `web/mixer.ts` also plays in Chromium (see
-    /// the report of hill #13): a ramp clip, whose samples are their own
+    /// A calibration scenario, for comparing with WebAudio playing the same
+    /// graph in Chromium: a ramp clip, whose samples are their own
     /// positions, panned hard left with its pitch changing every frame, and a
     /// clip of ones panned hard right with its gain changing every frame, so
     /// the output's channels are the read position and the gain as they go.
@@ -882,7 +925,7 @@ mod tests {
     fn calibrate() {
         let out = std::env::var_os("PEN_CALIBRATE_OUT").expect("PEN_CALIBRATE_OUT is not set");
         let clip = |value: fn(usize) -> f32| {
-            let frames: Arc<[kira::Frame]> = (0..48_000).map(|i| kira::Frame { left: value(i), right: value(i) }).collect();
+            let frames: Arc<[[f32; 2]]> = (0..48_000).map(|i| [value(i), value(i)]).collect();
             Arc::new(Clip::new(frames, RATE))
         };
         let (ramp, ones) = (clip(|i| i as f32 / 48_000.0), clip(|_| 1.0));

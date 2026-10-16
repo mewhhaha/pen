@@ -21,7 +21,10 @@ try {
     if (!localStorage.getItem('pen.preferences')) localStorage.setItem('pen.preferences', JSON.stringify([1,1,0.5,0,0,0,1,1,0,0.8,1,0.6,0,0]));
   });
   page.setDefaultTimeout(60000);
-  await page.goto(process.env.PEN_WEB_URL || 'http://127.0.0.1:8043/', { waitUntil: 'networkidle' });
+  // ?qualify has the page write the hooks this waits on (aria-busy, data-frame).
+  const url = new URL(process.env.PEN_WEB_URL || 'http://127.0.0.1:8043/');
+  url.searchParams.set('qualify', '');
+  await page.goto(url.href, { waitUntil: 'networkidle' });
   console.log('page loaded');
   await page.waitForFunction(() => document.querySelector('#status')?.textContent === '', null, { timeout: 60000 });
   await page.waitForFunction(() => document.querySelector('canvas')?.getAttribute('aria-busy') === 'false', null, { timeout: 120000 });
@@ -67,12 +70,22 @@ try {
   if (!messages.slice(beforeReload).some(message => message.text.includes('resuming the saved state'))) throw new Error('Page reload did not restore the autosave');
   if (preferences !== await page.evaluate(() => localStorage.getItem('pen.preferences'))) throw new Error('Page reload changed saved preferences');
   await page.screenshot({ path: `${shots}/restored.png` });
+  // A dense display: the canvas is backed by device pixels.
+  const dense = await browser.newPage({ viewport: { width: 480, height: 320 }, deviceScaleFactor: 2 });
+  dense.on('console', message => { if (message.type() === 'error') messages.push({ type: 'error', text: `dense: ${message.text()}` }); });
+  dense.on('pageerror', error => messages.push({ type: 'pageerror', text: `dense: ${error}` }));
+  await dense.goto(url.href, { waitUntil: 'networkidle' });
+  await dense.waitForFunction(() => document.querySelector('canvas')?.getAttribute('aria-busy') === 'false', null, { timeout: 120000 });
+  const backing = await dense.evaluate(() => [document.querySelector('canvas').width, document.querySelector('canvas').height]);
+  if (backing[0] !== 960 || backing[1] !== 640) throw new Error(`devicePixelRatio 2 backs a 480x320 canvas with ${backing.join('x')}`);
+  await dense.screenshot({ path: `${shots}/dense.png` });
+  await dense.close();
   const status = await page.locator('#status').textContent();
   await writeFile(`${shots}/evidence.json`, JSON.stringify({ status, messages }, null, 2));
   if (status || messages.some(m => m.type === 'pageerror' || m.type === 'error')) {
     throw new Error(`browser verification failed: ${JSON.stringify({ status, errors: messages.filter(m => m.type === 'error' || m.type === 'pageerror').slice(0, 4) })}`);
   }
-  console.log(`Browser game, Blot console, diagnostics and resize captured in ${shots}`);
+  console.log(`Browser game, Blot console, diagnostics, resize and a dense display captured in ${shots}`);
 } catch (error) {
   const status = await page?.locator('#status').textContent().catch(() => 'unresponsive');
   await writeFile(`${shots}/evidence.json`, JSON.stringify({ status, messages, failure: String(error) }, null, 2));

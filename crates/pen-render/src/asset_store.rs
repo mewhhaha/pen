@@ -5,11 +5,13 @@
 // bring is made into GPU assets on the thread that submits frames.
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use anyhow::{Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use pen_protocol::GameEvent;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::loader::{Job, JobQueue, Priority};
+use crate::shader::Variants;
 
 /// A sprite shader is WGSL like a shader, compiled for the sprite pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -79,7 +81,7 @@ pub(crate) struct Material {
 
 impl Material {
     /// Everything but the instance parameters, which may differ between
-    /// draws that share one instanced batch (the TS's `JSON.stringify(state)`).
+    /// draws that share one instanced batch.
     pub fn state_key(&self) -> String {
         let mut state = self.clone();
         state.instance_parameters = None;
@@ -94,48 +96,157 @@ impl Material {
     pub fn casts_shadow(&self) -> bool {
         self.opaque() && self.lit && self.shadow
     }
+
+    /// Which of its shader's pipelines it draws with: opaque, alone or
+    /// instanced; translucent; or as an overlay, dimmed and at full strength.
+    pub fn variants(&self) -> Variants {
+        if self.overlay {
+            Variants::OCCLUDED | Variants::VISIBLE
+        } else if self.opaque() {
+            Variants::OPAQUE | Variants::INSTANCED
+        } else {
+            Variants::TRANSLUCENT
+        }
+    }
 }
 
+/// The binary mesh's first bytes; mesh JSON starts with `{` or whitespace.
+const MESH_MAGIC: &[u8; 4] = b"PMSH";
+const MESH_VERSION: u8 = 1;
+// Flags: per-vertex shader attributes follow the UVs; indices are 16 bits.
+const MESH_ATTRIBUTES: u8 = 1;
+const MESH_SHORT_INDICES: u8 = 2;
+const MESH_HEADER: usize = 16;
+
+/// A mesh as its JSON has it: flat arrays, three or two numbers a vertex.
+#[derive(Deserialize)]
+struct MeshArrays {
+    positions: Vec<f32>,
+    normals: Vec<f32>,
+    uvs: Vec<f32>,
+    #[serde(default)]
+    attributes: Option<Vec<f32>>,
+    indices: Vec<u32>,
+}
+
+/// A mesh asset: its JSON, or the binary form `pack_mesh` makes of it.
 pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
-    let mesh = json_record(bytes)?;
-    let positions = numbers(mesh.get("positions"), "positions")?;
-    let normals = numbers(mesh.get("normals"), "normals")?;
-    let uvs = numbers(mesh.get("uvs"), "uvs")?;
-    let attributes = match mesh.get("attributes") {
-        None => None,
-        Some(value) => Some(numbers(Some(value), "attributes")?),
-    };
-    let indices = numbers(mesh.get("indices"), "indices")?;
+    if bytes.starts_with(MESH_MAGIC) {
+        return unpack_mesh(bytes);
+    }
+    let arrays: MeshArrays = serde_json::from_slice(bytes).map_err(|error| anyhow!("mesh JSON: {error}"))?;
+    let MeshArrays { positions, normals, uvs, attributes, indices } = arrays;
     let count = positions.len() / 3;
     ensure!(
         positions.len() % 3 == 0
-            && count != 0
             && normals.len() == positions.len()
             && uvs.len() == count * 2
-            && attributes.as_ref().is_none_or(|attributes| attributes.len() == count * 2)
-            && !indices.is_empty()
-            && indices.len() % 3 == 0,
+            && attributes.as_ref().is_none_or(|attributes| attributes.len() == count * 2),
         "mesh requires matching position/normal/UV vertices and triangle indices"
-    );
-    ensure!(
-        indices.iter().all(|&index| index.fract() == 0.0 && index >= 0.0 && index < count as f64),
-        "mesh index is outside its vertex array"
     );
     let mut vertices = Vec::with_capacity(count * MESH_VERTEX_FLOATS);
     for index in 0..count {
-        let normal = &normals[index * 3..index * 3 + 3];
-        ensure!(normal.iter().map(|value| value * value).sum::<f64>().sqrt() >= 1e-8, "mesh normal must be nonzero");
         vertices.extend_from_slice(&positions[index * 3..index * 3 + 3]);
-        vertices.extend_from_slice(normal);
+        vertices.extend_from_slice(&normals[index * 3..index * 3 + 3]);
         vertices.extend_from_slice(&uvs[index * 2..index * 2 + 2]);
         match &attributes {
             Some(attributes) => vertices.extend_from_slice(&attributes[index * 2..index * 2 + 2]),
             None => vertices.extend([0.0, 0.0]),
         }
     }
-    let vertices: Vec<f32> = vertices.into_iter().map(|value| value as f32).collect();
-    ensure!(vertices.iter().all(|value| value.is_finite()), "mesh coordinates exceed float32 range");
-    Ok(Mesh { vertices, indices: indices.into_iter().map(|index| index as u32).collect() })
+    checked_mesh(Mesh { vertices, indices })
+}
+
+/// The mesh, if its vertices and triangles are whole: some vertices, every
+/// index one of them, nonzero normals and coordinates float32 can hold.
+fn checked_mesh(mesh: Mesh) -> Result<Mesh> {
+    let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
+    ensure!(
+        count != 0 && !mesh.indices.is_empty() && mesh.indices.len().is_multiple_of(3),
+        "mesh requires matching position/normal/UV vertices and triangle indices"
+    );
+    ensure!(mesh.indices.iter().all(|&index| (index as usize) < count), "mesh index is outside its vertex array");
+    ensure!(mesh.vertices.iter().all(|value| value.is_finite()), "mesh coordinates exceed float32 range");
+    for vertex in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
+        let normal = &vertex[3..6];
+        let length = normal.iter().map(|&value| f64::from(value) * f64::from(value)).sum::<f64>().sqrt();
+        ensure!(length >= 1e-8, "mesh normal must be nonzero");
+    }
+    Ok(mesh)
+}
+
+/// The compact binary form of a mesh asset (JSON, or already binary), which
+/// the renderer reads in place of its JSON under the same key: "PMSH",
+/// version 1, flags (1: shader attributes, 2: 16-bit indices), two zero
+/// bytes, then the vertex and index counts (u32s), each vertex's position,
+/// normal, UV and, flagged, attributes (f32s), and the indices, all
+/// little-endian.
+pub fn pack_mesh(bytes: &[u8]) -> Result<Vec<u8>> {
+    let mesh = parse_mesh(bytes)?;
+    let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
+    let vertices = mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0;
+    let attributes = vertices.iter().any(|vertex| vertex[8] != 0.0 || vertex[9] != 0.0);
+    let short = count <= usize::from(u16::MAX) + 1;
+    let floats = if attributes { MESH_VERTEX_FLOATS } else { MESH_VERTEX_FLOATS - 2 };
+    let mut packed =
+        Vec::with_capacity(MESH_HEADER + count * floats * 4 + mesh.indices.len() * if short { 2 } else { 4 });
+    packed.extend_from_slice(MESH_MAGIC);
+    packed.extend([
+        MESH_VERSION,
+        if attributes { MESH_ATTRIBUTES } else { 0 } | if short { MESH_SHORT_INDICES } else { 0 },
+        0,
+        0,
+    ]);
+    packed.extend(u32::try_from(count).context("mesh has more vertices than a u32 counts")?.to_le_bytes());
+    packed.extend(u32::try_from(mesh.indices.len()).context("mesh has more indices than a u32 counts")?.to_le_bytes());
+    for vertex in vertices {
+        for value in &vertex[..floats] {
+            packed.extend(value.to_le_bytes());
+        }
+    }
+    for &index in &mesh.indices {
+        if short {
+            packed.extend(u16::try_from(index)?.to_le_bytes());
+        } else {
+            packed.extend(index.to_le_bytes());
+        }
+    }
+    Ok(packed)
+}
+
+fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
+    ensure!(bytes.len() >= MESH_HEADER, "binary mesh ends in its header");
+    ensure!(bytes[4] == MESH_VERSION, "unsupported binary mesh version");
+    let flags = bytes[5];
+    ensure!(flags & !(MESH_ATTRIBUTES | MESH_SHORT_INDICES) == 0, "unsupported binary mesh flags");
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let (count, index_count) = (word(8), word(12));
+    let floats = if flags & MESH_ATTRIBUTES != 0 { MESH_VERTEX_FLOATS } else { MESH_VERTEX_FLOATS - 2 };
+    let index_bytes = if flags & MESH_SHORT_INDICES != 0 { 2 } else { 4 };
+    let vertex_end = count.checked_mul(floats * 4).and_then(|size| size.checked_add(MESH_HEADER));
+    let end = vertex_end.and_then(|end| index_count.checked_mul(index_bytes).and_then(|size| size.checked_add(end)));
+    ensure!(end == Some(bytes.len()), "binary mesh size does not match its counts");
+    let vertex_end = vertex_end.unwrap();
+    let values = bytes[MESH_HEADER..vertex_end].as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value));
+    let vertices = if floats == MESH_VERTEX_FLOATS {
+        values.collect()
+    } else {
+        let values: Vec<f32> = values.collect();
+        let mut vertices = Vec::with_capacity(count * MESH_VERTEX_FLOATS);
+        for vertex in values.chunks_exact(floats) {
+            vertices.extend_from_slice(vertex);
+            vertices.extend([0.0, 0.0]);
+        }
+        vertices
+    };
+    let indices = bytes[vertex_end..]
+        .chunks_exact(index_bytes)
+        .map(|index| match index {
+            [a, b] => u32::from(u16::from_le_bytes([*a, *b])),
+            _ => u32::from_le_bytes(index.try_into().unwrap()),
+        })
+        .collect();
+    checked_mesh(Mesh { vertices, indices })
 }
 
 pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
@@ -156,7 +267,7 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
         value => {
             let parameters = numbers(value, "instanceParameters")?;
             ensure!(
-                parameters.len() == 4 && parameters.iter().all(|&value| (value as f32).is_finite()),
+                parameters.len() == 4 && parameters.iter().all(|&value| value.abs() <= f64::from(f32::MAX)),
                 "material instanceParameters must be four finite float32 values"
             );
             Some([parameters[0], parameters[1], parameters[2], parameters[3]])
@@ -230,10 +341,7 @@ fn json_record(bytes: &[u8]) -> Result<serde_json::Map<String, Value>> {
 fn numbers(value: Option<&Value>, field: &str) -> Result<Vec<f64>> {
     let invalid = || anyhow!("asset {field} must be an array of finite numbers");
     let entries = value.and_then(Value::as_array).ok_or_else(invalid)?;
-    entries
-        .iter()
-        .map(|entry| entry.as_f64().filter(|value| value.is_finite()).ok_or_else(invalid))
-        .collect()
+    entries.iter().map(|entry| entry.as_f64().filter(|value| value.is_finite()).ok_or_else(invalid)).collect()
 }
 
 fn asset_key(value: Option<&Value>, field: &str) -> Result<String> {
@@ -246,7 +354,10 @@ fn asset_key(value: Option<&Value>, field: &str) -> Result<String> {
 /// Asset keys are relative paths that cannot leave the asset root.
 pub(crate) fn validate_asset_key(key: &str) -> Result<()> {
     ensure!(
-        !(key.is_empty() || key.starts_with('/') || key.contains('\\') || key.split('/').any(|part| part.is_empty() || part == "..")),
+        !(key.is_empty()
+            || key.starts_with('/')
+            || key.contains('\\')
+            || key.split('/').any(|part| part.is_empty() || part == "..")),
         "asset key must stay inside assets: {key}"
     );
     Ok(())
@@ -285,7 +396,15 @@ pub(crate) struct AssetStore<T> {
 
 impl<T> AssetStore<T> {
     pub fn new(jobs: JobQueue) -> Self {
-        Self { slots: Vec::new(), ids: Default::default(), queue: VecDeque::new(), ahead: 0, jobs, events: Vec::new(), arrived: 0.0 }
+        Self {
+            slots: Vec::new(),
+            ids: Default::default(),
+            queue: VecDeque::new(),
+            ahead: 0,
+            jobs,
+            events: Vec::new(),
+            arrived: 0.0,
+        }
     }
 
     fn slot_for(&mut self, kind: AssetKind, key: &str) -> Result<usize> {
@@ -294,7 +413,15 @@ impl<T> AssetStore<T> {
         }
         validate_asset_key(key)?;
         let id = self.slots.len();
-        self.slots.push(Slot { kind, key: key.to_owned(), revision: 0, current: None, queued: false, loading: 0, failed: false });
+        self.slots.push(Slot {
+            kind,
+            key: key.to_owned(),
+            revision: 0,
+            current: None,
+            queued: false,
+            loading: 0,
+            failed: false,
+        });
         self.ids[kind as usize].insert(key.to_owned(), id);
         Ok(id)
     }
@@ -329,6 +456,11 @@ impl<T> AssetStore<T> {
             self.load(id, false);
         }
         Ok(id)
+    }
+
+    /// The slot of the asset of `kind` and `key`, if anything asked for it.
+    pub fn id(&self, kind: AssetKind, key: &str) -> Option<usize> {
+        self.ids[kind as usize].get(key).copied()
     }
 
     pub fn current(&self, id: usize) -> Option<&T> {
@@ -398,7 +530,14 @@ impl<T> AssetStore<T> {
     /// reports why it failed. Returns the asset a newer revision replaced,
     /// for the caller to let go of what depends on it.
     #[must_use]
-    pub fn finish(&mut self, id: usize, revision: u64, early: bool, prepared: Result<T, String>, now: f64) -> Option<T> {
+    pub fn finish(
+        &mut self,
+        id: usize,
+        revision: u64,
+        early: bool,
+        prepared: Result<T, String>,
+        now: f64,
+    ) -> Option<T> {
         let mut previous = None;
         let slot = &mut self.slots[id];
         match prepared {
@@ -418,7 +557,11 @@ impl<T> AssetStore<T> {
                 if revision == slot.revision {
                     previous = slot.current.replace(prepared);
                     slot.failed = false;
-                    self.events.push(GameEvent::AssetReady { key: slot.key.clone(), kind: slot.kind.name().to_owned(), revision });
+                    self.events.push(GameEvent::AssetReady {
+                        key: slot.key.clone(),
+                        kind: slot.kind.name().to_owned(),
+                        revision,
+                    });
                     self.arrived = now;
                 }
             }
@@ -438,13 +581,16 @@ mod tests {
 
     #[test]
     fn meshes_and_materials_reject_malformed_assets() {
-        let mesh = br#"{"positions":[0,0,0,1,0,0,0,1,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],"indices":[0,1,2]}"#;
+        let mesh =
+            br#"{"positions":[0,0,0,1,0,0,0,1,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],"indices":[0,1,2]}"#;
         let parsed = parse_mesh(mesh).unwrap();
         assert_eq!(parsed.vertices.len(), 3 * MESH_VERTEX_FLOATS);
         assert_eq!(parsed.indices, [0, 1, 2]);
-        let outside = br#"{"positions":[0,0,0,1,0,0,0,1,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],"indices":[0,1,3]}"#;
+        let outside =
+            br#"{"positions":[0,0,0,1,0,0,0,1,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],"indices":[0,1,3]}"#;
         assert!(parse_mesh(outside).is_err());
         assert!(parse_mesh(b"[]").is_err());
+        assert!(parse_mesh(br#"{"positions":[0,0,0],"normals":[0,0,1],"uvs":[0,0],"indices":[0,0,0.5]}"#).is_err());
 
         let material = parse_material(br#"{"shader":"scene.wgsl","color":[1,1,1,1],"lighting":"lit"}"#).unwrap();
         assert!(material.opaque() && material.shadow && material.lit);
@@ -457,5 +603,65 @@ mod tests {
         assert!(validate_asset_key("a/../b").is_err());
         assert!(validate_asset_key("a//b").is_err());
         assert!(validate_asset_key("a/b.png").is_ok());
+    }
+
+    #[test]
+    fn packed_meshes_read_as_their_json() {
+        let plain =
+            br#"{"positions":[0,0,0,1,0,0,0,1,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],"indices":[0,1,2]}"#;
+        let shaded = br#"{"positions":[0,0,0,1,0,0,0,1,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],
+            "attributes":[0.25,1,0,0,3,-2],"indices":[2,1,0]}"#;
+        for json in [&plain[..], &shaded[..]] {
+            let packed = pack_mesh(json).unwrap();
+            assert!(packed.starts_with(MESH_MAGIC));
+            let (from_json, from_packed) = (parse_mesh(json).unwrap(), parse_mesh(&packed).unwrap());
+            assert_eq!(from_json.vertices, from_packed.vertices);
+            assert_eq!(from_json.indices, from_packed.indices);
+            // Packing is idempotent.
+            assert_eq!(pack_mesh(&packed).unwrap(), packed);
+            assert!(parse_mesh(&packed[..packed.len() - 1]).is_err());
+        }
+        assert_eq!(pack_mesh(plain).unwrap()[5], MESH_SHORT_INDICES);
+        assert_eq!(pack_mesh(shaded).unwrap()[5], MESH_ATTRIBUTES | MESH_SHORT_INDICES);
+        // An index past the vertices, and an unknown version.
+        let mut packed = pack_mesh(plain).unwrap();
+        let last = packed.len() - 2;
+        packed[last] = 3;
+        assert!(parse_mesh(&packed).is_err());
+        let mut packed = pack_mesh(plain).unwrap();
+        packed[4] = 2;
+        assert!(parse_mesh(&packed).is_err());
+    }
+
+    /// How long the game's meshes take to parse (docs/render-performance.md).
+    #[test]
+    #[ignore = "measures dist/gdev/assets; run with --ignored --nocapture in release"]
+    fn mesh_parse_time() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist/gdev/assets");
+        let mut files: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.to_string_lossy().ends_with(".mesh.json"))
+            .collect();
+        files.sort();
+        let meshes: Vec<Vec<u8>> = files.iter().map(|path| std::fs::read(path).unwrap()).collect();
+        let packed: Vec<Vec<u8>> = meshes.iter().map(|mesh| pack_mesh(mesh).unwrap()).collect();
+        for (name, meshes) in [("JSON", &meshes), ("binary", &packed)] {
+            let bytes: usize = meshes.iter().map(Vec::len).sum();
+            let mut best = f64::INFINITY;
+            for _ in 0..5 {
+                let started = std::time::Instant::now();
+                for mesh in meshes {
+                    parse_mesh(mesh).unwrap();
+                }
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+            eprintln!(
+                "{} {name} meshes, {:.1} MB: parsed in {:.1} ms",
+                meshes.len(),
+                bytes as f64 / 1e6,
+                best * 1000.0
+            );
+        }
     }
 }

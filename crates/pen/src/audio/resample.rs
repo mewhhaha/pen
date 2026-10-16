@@ -4,6 +4,12 @@
 //! its kernel tabulated at 32 subsample offsets and interpolated linearly
 //! between them. The browser plays every clip at its context's rate this way,
 //! so the mixer does too, rather than interpolating linearly across rates.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "sample positions and taps"
+)]
 
 use std::f64::consts::PI;
 
@@ -67,7 +73,8 @@ mod tests {
     #[test]
     fn a_tone_resamples_cleanly() {
         let (from, to) = (22_050.0, 48_000.0);
-        let tone: Vec<f32> = (0..22_050).map(|i| (std::f64::consts::TAU * 1000.0 * i as f64 / from).sin() as f32).collect();
+        let tone: Vec<f32> =
+            (0..22_050).map(|i| (std::f64::consts::TAU * 1000.0 * i as f64 / from).sin() as f32).collect();
         let out = resample(&tone, from, to);
         assert_eq!(out.len(), 48_000);
         let worst = (1000..47_000)

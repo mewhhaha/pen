@@ -2,6 +2,9 @@
 //! data directory, beside the saves and preferences, and says where it is:
 //! what panicked where, the backtrace, this build, the system, the GPU the
 //! game drew with and how long its last frames took, for a player to send.
+//! So does an error that stops the player runtime, which players start
+//! without a terminal (and on Windows it shows in a message box too). Only
+//! the latest [`KEEP`] reports stay.
 //!
 //! Shipped runtimes are stripped copies of a build that keeps its symbols
 //! (`just player`, `just windows`), so a backtrace has addresses rather than
@@ -11,14 +14,16 @@
 //! minus the anchor plus `crash::frame`'s address in the unstripped build.
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How many of the latest frame times a report shows.
 const FRAMES: usize = 30;
 /// Reports one run writes at most (a panic can bring others with it).
 const REPORTS: usize = 3;
+/// Reports `crashes/` keeps: the latest, older ones go.
+const KEEP: usize = 20;
 
 static FRAME_MS: [AtomicU32; FRAMES] = [const { AtomicU32::new(0) }; FRAMES];
 static FRAME_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -26,6 +31,14 @@ static WRITTEN: AtomicUsize = AtomicUsize::new(0);
 /// PEN_CRASH_TEST=N: the frame to panic at, to try reports (0: never).
 static CRASH_AT: AtomicUsize = AtomicUsize::new(0);
 static GPU: Mutex<Option<String>> = Mutex::new(None);
+/// Where reports go, once `install` knows.
+static DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+
+/// Where reports go: `crashes/` in the data directory.
+#[cfg(not(feature = "compiler"))]
+fn directory() -> PathBuf {
+    DIRECTORY.get().cloned().unwrap_or_else(|| crate::data_dir().join("crashes"))
+}
 
 /// Writes a report for every panic from now on, into `crashes/` of `data`
 /// (`crate::data_dir` when None, as for saves).
@@ -34,7 +47,7 @@ pub fn install(data: Option<PathBuf>) {
     let crash_at = std::env::var("PEN_CRASH_TEST").ok().and_then(|frame| frame.parse().ok());
     CRASH_AT.store(crash_at.unwrap_or(0), Ordering::Relaxed);
     let data = data.unwrap_or_else(crate::data_dir);
-    let directory = data.join("crashes");
+    let directory = DIRECTORY.get_or_init(|| data.join("crashes")).clone();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         previous(info);
@@ -44,18 +57,59 @@ pub fn install(data: Option<PathBuf>) {
         let backtrace = std::backtrace::Backtrace::force_capture();
         let thread = std::thread::current();
         let panic = Panic {
+            what: "crashed",
             message: info.payload_as_str().unwrap_or("(not a string)"),
-            location: info.location().map(ToString::to_string).unwrap_or_default(),
+            location: info.location().map(ToString::to_string),
             thread: thread.name().unwrap_or("unnamed"),
-            backtrace: &format!("{backtrace:#}"),
+            details: ("backtrace", &format!("{backtrace:#}")),
         };
+        let name = &crate::identity().name;
         match write(&directory, &panic) {
-            Ok(path) => eprintln!("{} crashed. A report is in {}", crate::GAME, path.display()),
+            Ok(path) => eprintln!("{name} crashed. A report is in {}", path.display()),
             Err(error) => {
-                eprintln!("{} crashed, and its report could not be written in {}: {error}", crate::GAME, directory.display())
+                eprintln!("{name} crashed, and its report could not be written in {}: {error}", directory.display())
             }
         }
     }));
+}
+
+/// Says why pen stopped with an error: on stderr, as ever. The player
+/// runtime, which players start without a terminal, writes it to a report
+/// too, and on Windows, where it has no console, shows it in a message box.
+pub fn stopped(error: &anyhow::Error) {
+    eprintln!("Error: {error:?}");
+    #[cfg(not(feature = "compiler"))]
+    {
+        let directory = directory();
+        let said = match write(&directory, &stopping(&format!("{error:?}"))) {
+            Ok(path) => format!("A report is in {}", path.display()),
+            Err(problem) => format!("Its report could not be written in {}: {problem}", directory.display()),
+        };
+        eprintln!("{said}");
+        #[cfg(windows)]
+        message_box(&crate::identity().title, &format!("{} stopped: {error:#}\n\n{said}", crate::identity().name));
+    }
+}
+
+/// A report of an error, as `{error:?}` has it: its words on the first
+/// line, then its causes (and a backtrace, when RUST_BACKTRACE asks).
+#[cfg(any(test, not(feature = "compiler")))]
+fn stopping(error: &str) -> Panic<'_> {
+    let message = error.lines().next().unwrap_or_default();
+    Panic { what: "stopped", message, location: None, thread: "main", details: ("error", error) }
+}
+
+/// Shows `text` in a message box over every window, until it is dismissed.
+#[cfg(all(windows, not(feature = "compiler")))]
+fn message_box(title: &str, text: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MessageBoxW};
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let (text, title) = (wide(text), wide(title));
+    // SAFETY: both are NUL-terminated UTF-16 strings that outlive the call,
+    // and no owner window is fine.
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR | MB_SETFOREGROUND)
+    };
 }
 
 /// The adapter frames are drawn with, for reports.
@@ -78,11 +132,15 @@ pub fn frame(duration: Duration) {
     }
 }
 
+/// What a report is of: a panic, or an error the runtime stopped with.
 struct Panic<'a> {
+    /// What the game did: "crashed" or "stopped".
+    what: &'a str,
     message: &'a str,
-    location: String,
+    location: Option<String>,
     thread: &'a str,
-    backtrace: &'a str,
+    /// The backtrace, or the error's causes, and what to call them.
+    details: (&'a str, &'a str),
 }
 
 fn write(directory: &Path, panic: &Panic) -> std::io::Result<PathBuf> {
@@ -91,18 +149,39 @@ fn write(directory: &Path, panic: &Panic) -> std::io::Result<PathBuf> {
     let stamp = timestamp(now.as_secs()).replace([':', '-'], "");
     let path = directory.join(format!("crash-{stamp}-{}.txt", std::process::id()));
     std::fs::write(&path, report(panic, now.as_secs()))?;
+    prune(directory, KEEP);
     Ok(path)
+}
+
+/// Deletes all but the latest `keep` reports in `directory`: their names
+/// sort by when they were written.
+fn prune(directory: &Path, keep: usize) {
+    let mut reports: Vec<PathBuf> = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("crash-") && name.ends_with(".txt"))
+        })
+        .collect();
+    reports.sort();
+    for old in &reports[..reports.len().saturating_sub(keep)] {
+        let _ = std::fs::remove_file(old);
+    }
 }
 
 fn report(panic: &Panic, now: u64) -> String {
     let mut text = String::new();
-    let features: Vec<&str> =
-        [("compiler", cfg!(feature = "compiler")), ("steam", cfg!(feature = "steam"))]
-            .into_iter()
-            .filter_map(|(name, on)| on.then_some(name))
-            .collect();
-    let _ = writeln!(text, "{} crashed: {}", crate::GAME, panic.message);
-    let _ = writeln!(text, "at {} on thread {}, {}", panic.location, panic.thread, timestamp(now));
+    let features: Vec<&str> = [("compiler", cfg!(feature = "compiler")), ("steam", cfg!(feature = "steam"))]
+        .into_iter()
+        .filter_map(|(name, on)| on.then_some(name))
+        .collect();
+    let _ = writeln!(text, "{} {}: {}", crate::identity().name, panic.what, panic.message);
+    let at = panic.location.as_ref().map(|location| format!("at {location} ")).unwrap_or_default();
+    let _ = writeln!(text, "{at}on thread {}, {}", panic.thread, timestamp(now));
     let _ = writeln!(
         text,
         "pen {}{} ({}, {}-{}, features: {})",
@@ -126,16 +205,14 @@ fn report(panic: &Panic, now: u64) -> String {
         let _ = writeln!(text, "executable loaded at {base:#x}");
     }
     let _ = writeln!(text, "anchor: crash::frame at {:#x}", frame as fn(Duration) as usize);
-    let _ = writeln!(text, "\nbacktrace:\n{}", panic.backtrace);
+    let _ = writeln!(text, "\n{}:\n{}", panic.details.0, panic.details.1);
     text
 }
 
 /// The OS and its version, as far as is cheap to tell.
 fn system() -> String {
     let release = std::fs::read_to_string("/etc/os-release").ok().and_then(|text| {
-        text.lines()
-            .find_map(|line| line.strip_prefix("PRETTY_NAME="))
-            .map(|name| name.trim_matches('"').to_owned())
+        text.lines().find_map(|line| line.strip_prefix("PRETTY_NAME=")).map(|name| name.trim_matches('"').to_owned())
     });
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
     let mut system = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
@@ -166,7 +243,7 @@ fn load_address() -> Option<u64> {
 
 /// `seconds` since 1970 as an ISO 8601 UTC time.
 fn timestamp(seconds: u64) -> String {
-    let days = (seconds / 86_400) as i64;
+    let days = i64::try_from(seconds / 86_400).expect("u64 seconds are fewer than i64::MAX days");
     let time = seconds % 86_400;
     // Howard Hinnant's civil_from_days.
     let z = days + 719_468;
@@ -197,14 +274,48 @@ mod tests {
         for _ in 0..40 {
             frame(Duration::from_micros(8_333));
         }
-        let panic = Panic { message: "boom", location: "src/x.rs:1:2".into(), thread: "main", backtrace: "0: here" };
+        let panic = Panic {
+            what: "crashed",
+            message: "boom",
+            location: Some("src/x.rs:1:2".into()),
+            thread: "main",
+            details: ("backtrace", "0: here"),
+        };
         let text = report(&panic, 0);
-        assert!(text.starts_with("gdev crashed: boom\nat src/x.rs:1:2 on thread main, 1970-01-01T00:00:00Z\n"));
+        let name = &crate::identity().name;
+        assert!(
+            text.starts_with(&format!("{name} crashed: boom\nat src/x.rs:1:2 on thread main, 1970-01-01T00:00:00Z\n"))
+        );
         assert!(text.contains("the last 30 took (ms, oldest first): 8.3 8.3"));
         assert!(text.ends_with("backtrace:\n0: here\n"));
         let directory = std::env::temp_dir().join(format!("pen-crash-test-{}", std::process::id()));
         let path = write(&directory, &panic).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("boom"));
+        std::fs::remove_dir_all(directory).unwrap();
+
+        // An error the runtime stopped with: its words, and its causes.
+        let error = anyhow::anyhow!("no adapter").context("opening the GPU");
+        let details = format!("{error:?}");
+        let text = report(&stopping(&details), 0);
+        assert!(text.starts_with(&format!("{name} stopped: opening the GPU\non thread main, ")), "{text}");
+        assert!(text.contains("error:\nopening the GPU\n\nCaused by:\n    no adapter"), "{text}");
+    }
+
+    #[test]
+    fn only_the_latest_reports_stay() {
+        let directory = std::env::temp_dir().join(format!("pen-crash-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        for day in 10..15 {
+            std::fs::write(directory.join(format!("crash-202610{day}T000000Z-1.txt")), "").unwrap();
+        }
+        std::fs::write(directory.join("notes.txt"), "the player's own").unwrap();
+        prune(&directory, 2);
+        let mut left: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["crash-20261013T000000Z-1.txt", "crash-20261014T000000Z-1.txt", "notes.txt"]);
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

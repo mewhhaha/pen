@@ -6,6 +6,7 @@
 use pen_protocol::{clipboard_op, service};
 
 use super::{Answer, Request, Service};
+use crate::input::Input;
 
 #[derive(Default)]
 pub struct Clipboard {
@@ -25,7 +26,7 @@ impl Clipboard {
     }
 }
 
-impl Service for Clipboard {
+impl Service<Input> for Clipboard {
     fn code(&self) -> u32 {
         service::CLIPBOARD
     }

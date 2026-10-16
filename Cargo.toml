@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/blot-host", "crates/pen", "crates/pen-codegen", "crates/pen-plugins", "crates/pen-protocol", "crates/pen-runtime", "crates/pen-render"]
+members = ["crates/blot-host", "crates/pen", "crates/pen-codegen", "crates/pen-plugins", "crates/pen-protocol", "crates/pen-runtime", "crates/pen-render", "crates/pen-web"]
 # Wasm plugins build apart, for wasm32-wasip2 (plugins/Cargo.toml).
 exclude = ["plugins"]
 
@@ -23,6 +23,21 @@ wgpu = "30"
 # feature that changes the engine's Wasm features or tunables, or a
 # game.cwasm from one would not load in the other.
 wasmtime = { version = "49", default-features = false, features = ["anyhow", "runtime", "std", "gc", "gc-drc", "backtrace"] }
+
+# Every member opts in with `[lints] workspace = true`.
+# An `as` that can change an integer's value (truncate, lose its sign, wrap)
+# is checked: convert with `try_from`, `From`, `cast_signed`/`cast_unsigned`
+# or a clamp instead. Modules dense with deliberate ones (audio samples,
+# pixels, half floats, f64 settings narrowed to f32 GPU lanes) allow them
+# with a reason.
+[workspace.lints.clippy]
+cast_possible_truncation = "warn"
+cast_possible_wrap = "warn"
+cast_sign_loss = "warn"
+# Counts, ids and code points travel as float32 lanes, below 2^24 by the
+# protocol's limits, and frame counts and byte sizes become f64 seconds and
+# megabytes: an integer losing precision in a float is never a fault here.
+cast_precision_loss = "allow"
 
 # What development builds (`cargo run --release`, `just install`) use:
 # quick to rebuild after an edit.
@@ -47,6 +62,23 @@ panic = "abort"
 strip = "none"
 debug = "line-tables-only"
 
+# The browser host (crates/pen-web/build.sh): small, in one unit, and
+# without unwinding: a panic reports through the console hook and stops the
+# host, which nothing catches anyway.
+[profile.web]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
 # Shaders and wasm compilation are slow unoptimized; keep dependencies fast in dev.
 [profile.dev.package."*"]
 opt-level = 2
+debug = false
+
+# Backtraces keep their lines without full debug info, which made target/debug
+# tens of gigabytes and slowed every link.
+[profile.dev]
+debug = "line-tables-only"

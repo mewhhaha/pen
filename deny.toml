@@ -1,0 +1,53 @@
+# cargo-deny: licenses, security advisories, banned crates and sources for
+# the two lockfiles (the runtime workspace, the browser host's included, and
+# plugins/). `just deny` and CI's deny job check each of them with this file.
+
+[graph]
+# What pen builds for: the native runtime and player runtimes, the browser
+# host and the Wasm plugins.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-gnu",
+  "wasm32-unknown-unknown",
+  "wasm32-wasip2",
+]
+# The player runtime ships with Steam.
+all-features = true
+
+[advisories]
+# An unmaintained crate fails the check when pen depends on it directly;
+# deeper ones (paste through steamworks, ttf-parser through winit) are for
+# those crates to replace.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# Permissive licenses, and MPL-2.0, whose terms stay with each file.
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.8
+# One list serves all three lockfiles, which use different subsets of it.
+unused-allowed-license = "allow"
+
+[bans]
+# wgpu, wasmtime and winit pull in several versions of windows-sys and
+# friends; a duplicate is not worth failing the check.
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

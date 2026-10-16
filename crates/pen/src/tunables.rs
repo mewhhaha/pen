@@ -1,10 +1,9 @@
-//! Live-tunable constants (gdev's README, "Tunables"): numbers a designer
-//! changes in the running game without a Blot build. The checkout declares
-//! them once, in `src/tunables.json` (name, default, range, and optionally a
-//! step and a doc line); the game reads that file as it compiles, and this
-//! reads it for the overlay's Tunables panel, its `/tune` command and the
-//! `tune=NAME=VALUE` script step, as gdev's `tunables.ts` does for the
-//! browser. A tunable reaches the game as a `GameEvent::Tune` whose `index`
+//! Live-tunable constants (the checkout's README, "Tunables"): numbers a
+//! designer changes in the running game without a Blot build. The checkout
+//! declares them once, in `src/tunables.json` (name, default, range, and
+//! optionally a step and a doc line); the game reads that file as it
+//! compiles, and this reads it for the `tune=NAME=VALUE` script step, the
+//! dev tools' `tuned` answer and baking, and the browser host's bake. A tunable reaches the game as a `GameEvent::Tune` whose `index`
 //! is the tunable's id, a hash of its name, and what the game holds is game
 //! state, in a saved section this reads back (`tuned_values`). Baking writes
 //! the game's values into the file as defaults, preserving its formatting.
@@ -29,7 +28,7 @@ pub struct Declared {
 }
 
 /// A tunable's id: FNV-1a over its name, folded to the 24 bits a float lane
-/// holds exactly (gdev's `tunableId`).
+/// holds exactly, as the game's build of `tunables.json` gives it.
 pub fn tunable_id(name: &str) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     for byte in name.bytes() {
@@ -51,8 +50,8 @@ fn valid_name(name: &str) -> bool {
         })
 }
 
-/// The tunables `text` declares, checked as gdev's `parseTunables` checks
-/// them; the error says what is wrong.
+/// The tunables `text` declares, checked as the game's build checks them;
+/// the error says what is wrong.
 pub fn parse(text: &str) -> Result<Vec<Declared>, String> {
     let file: serde_json::Value = serde_json::from_str(text).map_err(|error| format!("tunables.json: {error}"))?;
     let Some(list) = file.get("tunables").and_then(|list| list.as_array()) else {
@@ -63,11 +62,14 @@ pub fn parse(text: &str) -> Result<Vec<Declared>, String> {
         let Some(object) = entry.as_object() else {
             return Err(format!("tunables.json: tunable {index} is not an object"));
         };
-        let name = object.get("name").and_then(|name| name.as_str()).filter(|name| valid_name(name)).ok_or_else(|| {
-            format!("tunables.json: tunable {index} needs a name of lowercase words joined by dots")
-        })?;
+        let name =
+            object.get("name").and_then(|name| name.as_str()).filter(|name| valid_name(name)).ok_or_else(|| {
+                format!("tunables.json: tunable {index} needs a name of lowercase words joined by dots")
+            })?;
         let fail = |problem: String| format!("tunables.json: {name}: {problem}");
-        if let Some(key) = object.keys().find(|key| !["name", "default", "min", "max", "step", "doc"].contains(&key.as_str())) {
+        if let Some(key) =
+            object.keys().find(|key| !["name", "default", "min", "max", "step", "doc"].contains(&key.as_str()))
+        {
             return Err(fail(format!("unknown {key}")));
         }
         let number = |key: &str| -> Result<Option<f32>, String> {
@@ -75,7 +77,7 @@ pub fn parse(text: &str) -> Result<Vec<Declared>, String> {
                 None => Ok(None),
                 Some(value) => value
                     .as_f64()
-                    .map(|value| value as f32)
+                    .map(crate::input::narrow)
                     .filter(|value| value.is_finite())
                     .map(Some)
                     .ok_or_else(|| fail(format!("{key} must be a finite number"))),
@@ -118,14 +120,14 @@ pub fn load(root: &Path) -> Result<Vec<Declared>, String> {
     }
 }
 
-/// What a saved state holds for each tunable the host set, by id (gdev's
-/// `tunedValues`): persist.blot's framing, `magic, schema, count`, then
+/// What a saved state holds for each tunable the host set, by id:
+/// persist.blot's framing, `magic, schema, count`, then
 /// each section's `key, version, width, length` and lanes.
 #[cfg(any(feature = "devtools", test))]
 pub use pen_runtime::tunables::tuned_values;
 
 impl Declared {
-    /// The value the game reads (gdev's `tune.value`): as set, or its
+    /// The value the game reads (Ink's `tune.value`): as set, or its
     /// default, within its range.
     pub fn live(&self, tuned: &HashMap<u32, f32>) -> f32 {
         tuned.get(&self.id).copied().unwrap_or(self.default).clamp(self.min, self.max)
@@ -150,7 +152,8 @@ fn bake_text(text: &str, values: &[(String, f32)]) -> Result<(String, Vec<String
     let declared = parse(text).map_err(anyhow::Error::msg)?;
     let mut requested = HashMap::new();
     for (name, value) in values {
-        let tunable = declared.iter().find(|entry| entry.name == *name).with_context(|| format!("no tunable {name}"))?;
+        let tunable =
+            declared.iter().find(|entry| entry.name == *name).with_context(|| format!("no tunable {name}"))?;
         if !value.is_finite() || !(tunable.min..=tunable.max).contains(value) {
             bail!("{name}: {value} is outside {}..{}", tunable.min, tunable.max);
         }
@@ -187,7 +190,11 @@ pub fn bake(root: &Path, values: &[(String, f32)]) -> Result<String> {
     if changed.is_empty() {
         return Ok("nothing to bake: each value is its default already".into());
     }
-    let temporary = path.with_file_name(format!(".tunables.{}-{}.tmp", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+    let temporary = path.with_file_name(format!(
+        ".tunables.{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
+    ));
     let result = (|| {
         std::fs::write(&temporary, baked)?;
         std::fs::rename(&temporary, &path)
@@ -205,7 +212,7 @@ mod tests {
 
     #[test]
     fn ids_match_gdevs() {
-        // gdev's tunables_test.ts asserts the same.
+        // The game's tests/tunables.blot asserts the same.
         assert_eq!(tunable_id("camera.zoom_speed"), 11_175_412);
         assert!(tunable_id("a.much.longer.name_with_digits_123") <= 0x00ff_ffff);
     }
@@ -239,11 +246,12 @@ mod tests {
 
     #[test]
     fn reads_the_tuned_section_of_a_state() {
-        let haul = tunable_id("gnorps.haul_speed") as f32;
+        let id = tunable_id("gnorps.haul_speed");
+        let haul = id as f32;
         let state = [5678.0, 26.0, 2.0, 1.0, 1.0, 0.0, 2.0, 7.0, 8.0, 11.0, 1.0, 0.0, 4.0, haul, 3.5, 99.0, 1.0];
         let tuned = tuned_values(&state);
         assert_eq!(tuned.len(), 2);
-        assert_eq!(tuned[&(haul as u32)], 3.5);
+        assert_eq!(tuned[&id], 3.5);
         let declared =
             Declared { name: "x".into(), id: 99, default: 0.5, min: 0.0, max: 0.75, step: None, doc: String::new() };
         assert_eq!(declared.live(&tuned), 0.75);
@@ -251,6 +259,8 @@ mod tests {
         assert!(tuned_values(&[1.0, 2.0, 3.0]).is_empty());
         // A truncated state reads as far as it goes.
         assert!(tuned_values(&state[..12]).is_empty());
+        // As does one whose counts are past any state.
+        assert!(tuned_values(&[5678.0, 26.0, 1e30, 11.0, 0.0, 0.0, 1e30, haul, 1.0]).is_empty());
     }
 
     #[test]

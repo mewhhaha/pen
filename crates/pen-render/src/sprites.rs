@@ -11,6 +11,8 @@
 // (x, y, width, height in pixels from the top left; u0, v0, u1, v1; RGBA;
 // four values for the shader), and draws six vertices per instance, the
 // instance being the sprite's index. See src/assets/sprite.wgsl.
+use std::collections::HashMap;
+
 use pen_protocol::Sprite;
 
 const SPRITE_FLOATS: usize = 16;
@@ -61,13 +63,15 @@ pub(crate) fn sprite_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayou
     })
 }
 
-/// Consecutive sprites with one shader and texture.
-pub(crate) struct SpriteBatch<'a> {
+/// Consecutive sprites with one shader and texture: `count` of them from
+/// `first` in the drawing order (sprites still loading are left out).
+pub(crate) struct SpriteBatch {
     pub pipeline: wgpu::RenderPipeline,
     pub texture: wgpu::TextureView,
     /// Which texture view and pipeline they are, to batch by.
     pub key: (u64, usize),
-    pub sprites: Vec<&'a Sprite>,
+    pub first: u32,
+    pub count: u32,
 }
 
 pub(crate) struct Sprites {
@@ -76,7 +80,14 @@ pub(crate) struct Sprites {
     sampler: wgpu::Sampler,
     capacity: usize,
     storage: Option<wgpu::Buffer>,
+    data: Vec<f32>,
+    /// Bind groups by texture view, with the draw that last used each.
+    groups: HashMap<u64, (wgpu::BindGroup, u64)>,
+    draws: u64,
 }
+
+// Bind groups no draw has used for this many draws are let go.
+const GROUP_LIFETIME: u64 = 120;
 
 impl Sprites {
     pub fn new(device: &wgpu::Device, layout: wgpu::BindGroupLayout) -> Self {
@@ -98,10 +109,15 @@ impl Sprites {
             }),
             capacity: 0,
             storage: None,
+            data: Vec::new(),
+            groups: HashMap::new(),
+            draws: 0,
         }
     }
 
-    /// Draws `batches`, in order, over `output`, a `size` screen.
+    /// Draws `batches` of `sprites` (by their indices in `order`), in order,
+    /// over `output`, a `size` screen.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         device: &wgpu::Device,
@@ -109,13 +125,22 @@ impl Sprites {
         encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::TextureView,
         size: (u32, u32),
-        batches: &[SpriteBatch<'_>],
+        batches: &[SpriteBatch],
+        sprites: &[Sprite],
+        order: &[u32],
     ) {
-        let count: usize = batches.iter().map(|batch| batch.sprites.len()).sum();
+        let count = order.len();
         if count == 0 {
             return;
         }
+        self.draws += 1;
+        if self.draws.is_multiple_of(GROUP_LIFETIME) {
+            let oldest = self.draws - GROUP_LIFETIME;
+            self.groups.retain(|_, (_, used)| *used >= oldest);
+        }
         if count > self.capacity {
+            // The groups bind the storage buffer this replaces.
+            self.groups.clear();
             self.capacity = count.next_power_of_two();
             self.storage = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("sprites"),
@@ -124,16 +149,15 @@ impl Sprites {
                 mapped_at_creation: false,
             }));
         }
-        let mut data = Vec::with_capacity(count * SPRITE_FLOATS);
-        for batch in batches {
-            for sprite in &batch.sprites {
-                data.extend([sprite.x, sprite.y, sprite.width, sprite.height, sprite.u0, sprite.v0, sprite.u1, sprite.v1]);
-                data.extend(sprite.color);
-                data.extend(sprite.parameters);
-            }
+        let data = &mut self.data;
+        data.clear();
+        for sprite in order.iter().map(|&index| &sprites[index as usize]) {
+            data.extend([sprite.x, sprite.y, sprite.width, sprite.height, sprite.u0, sprite.v0, sprite.u1, sprite.v1]);
+            data.extend(sprite.color);
+            data.extend(sprite.parameters);
         }
         let storage = self.storage.clone().unwrap();
-        queue.write_buffer(&storage, 0, bytemuck::cast_slice(&data));
+        queue.write_buffer(&storage, 0, bytemuck::cast_slice(data));
         queue.write_buffer(&self.screen, 0, bytemuck::cast_slice(&[size.0 as f32, size.1 as f32, 0.0, 0.0]));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("sprites"),
@@ -145,23 +169,28 @@ impl Sprites {
             })],
             ..Default::default()
         });
-        let mut first = 0;
+        let draws = self.draws;
         for batch in batches {
             pass.set_pipeline(&batch.pipeline);
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.screen.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: storage.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&batch.texture) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                ],
+            let (group, used) = self.groups.entry(batch.key.0).or_insert_with(|| {
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: self.screen.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: storage.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&batch.texture),
+                        },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    ],
+                });
+                (group, draws)
             });
-            pass.set_bind_group(0, &group, &[]);
-            let count = batch.sprites.len() as u32;
-            pass.draw(0..6, first..first + count);
-            first += count;
+            *used = draws;
+            pass.set_bind_group(0, &*group, &[]);
+            pass.draw(0..6, batch.first..batch.first + batch.count);
         }
     }
 }

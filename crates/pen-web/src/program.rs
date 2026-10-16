@@ -1,3 +1,6 @@
+//! The browser's WebAssembly backend: a guest's long-lived `main(host)`
+//! runs under JSPI (`guest.js`), suspended at each host call until the next
+//! request. Rust checks the module's `blot:abi` manifest before it runs.
 use anyhow::{Result, anyhow, ensure};
 use js_sys::{Float32Array, Promise, Reflect, Uint8Array};
 use pen_runtime::program::{self, Backend, Operation, Program};
@@ -8,7 +11,7 @@ use web_time::Instant;
 #[wasm_bindgen(raw_module = "./guest.js")]
 extern "C" {
     #[wasm_bindgen(catch, js_name = openGuest)]
-    async fn open_guest(bytes: Uint8Array) -> Result<JsValue, JsValue>;
+    async fn open_guest(bytes: Uint8Array, ownership: bool) -> Result<JsValue, JsValue>;
     type Guest;
     #[wasm_bindgen(method, catch)]
     fn next(this: &Guest, values: &Float32Array) -> Result<Promise, JsValue>;
@@ -17,10 +20,15 @@ extern "C" {
     #[wasm_bindgen(method)]
     fn close(this: &Guest) -> Promise;
 }
-pub fn error(value: JsValue) -> anyhow::Error { anyhow!("{:?}", value) }
+
+/// A JavaScript exception as an error.
+pub fn error(value: JsValue) -> anyhow::Error {
+    anyhow!("{:?}", value)
+}
 
 #[derive(Clone)]
 pub struct BrowserBackend;
+
 pub struct BrowserProgram {
     guest: Guest,
     schema: u32,
@@ -31,20 +39,39 @@ pub struct BrowserProgram {
     answered: Option<Instant>,
     failure: Option<String>,
 }
+
 impl Backend for BrowserBackend {
     type Module = Vec<u8>;
     type Program = BrowserProgram;
+
     async fn start(&self, module: &Vec<u8>) -> Result<BrowserProgram> {
-        let value = open_guest(Uint8Array::from(module.as_slice())).await.map_err(error)?;
+        let abi = pen_runtime::abi::read_abi(module)?;
+        abi.check_game()?;
+        let value = open_guest(Uint8Array::from(module.as_slice()), abi.ownership).await.map_err(error)?;
         let description = Float32Array::new(&Reflect::get(&value, &"description".into()).map_err(error)?).to_vec();
         let (schema, scenes) = program::handshake(&description)?;
-        Ok(BrowserProgram { guest: value.unchecked_into(), schema, scenes, commit: true,
-            pending: None, stopping: false, answered: None, failure: None })
+        Ok(BrowserProgram {
+            guest: value.unchecked_into(),
+            schema,
+            scenes,
+            commit: true,
+            pending: None,
+            stopping: false,
+            answered: None,
+            failure: None,
+        })
     }
 }
+
 impl Program for BrowserProgram {
-    fn schema(&self) -> u32 { self.schema }
-    fn scenes(&self) -> bool { self.scenes }
+    fn schema(&self) -> u32 {
+        self.schema
+    }
+
+    fn scenes(&self) -> bool {
+        self.scenes
+    }
+
     fn send(&mut self, operation: Operation, payload: &[f32]) -> Result<()> {
         ensure!(!self.stopping, "game program is closed");
         ensure!(self.pending.is_none(), "game program already has a request in flight");
@@ -55,20 +82,37 @@ impl Program for BrowserProgram {
         self.commit = false;
         Ok(())
     }
-    async fn response(&mut self) -> Result<Vec<f32>> {
-        let (operation, promise) = self.pending.take().ok_or_else(|| anyhow!("game program has no request in flight"))?;
+
+    async fn response(&mut self) -> Result<program::Response> {
+        let (operation, promise) =
+            self.pending.take().ok_or_else(|| anyhow!("game program has no request in flight"))?;
         let result = JsFuture::from(promise).await.map_err(error);
         self.answered = Some(Instant::now());
         match result {
             Ok(value) => program::response(operation, Float32Array::new(&value).to_vec()),
-            Err(error) => { self.failure = Some(error.to_string()); Err(error) }
+            Err(error) => {
+                self.failure = Some(error.to_string());
+                Err(error)
+            }
         }
     }
-    fn accept(&mut self) { self.commit = true; }
-    fn answered(&self) -> Option<Instant> { self.answered }
-    fn memory_bytes(&self) -> usize { self.guest.memory_bytes() }
+
+    fn accept(&mut self) {
+        self.commit = true;
+    }
+
+    fn answered(&self) -> Option<Instant> {
+        self.answered
+    }
+
+    fn memory_bytes(&self) -> usize {
+        self.guest.memory_bytes()
+    }
+
     async fn close(&mut self) {
-        if self.stopping { return; }
+        if self.stopping {
+            return;
+        }
         self.stopping = true;
         let _ = JsFuture::from(self.guest.close()).await;
     }

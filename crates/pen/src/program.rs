@@ -1,19 +1,26 @@
-//! Drives one long-lived `main(host)` (gdev's `program_runtime.ts`). The
-//! guest runs on its own thread; a pending host call is the frame boundary,
-//! and answering it resumes the guest until it next exchanges a response.
+//! Drives one long-lived `main(host)`, the game's program. The guest runs on
+//! its own thread; a pending host call is the frame boundary, and answering
+//! it resumes the guest until it next exchanges a response.
 #[cfg(feature = "devtools")]
 use std::sync::Arc;
 #[cfg(feature = "devtools")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use blot_host::{Argument, CallbackType, Guest, GuestModule, Parameter, Value, ValueType};
+use blot_host::{Argument, Guest, GuestModule, Overrun, Value};
+use pen_runtime::program::{Response, Unresponsive};
 use wasmtime::Engine;
 
 pub use pen_runtime::program::Operation;
+
+/// How long the host waits for the guest's reply before it gives the game
+/// up. A guest of the development engine traps at its deadline long before
+/// ([`blot_host::DEADLINE`]); one of another engine, whose code spends
+/// nothing checking the time, may loop until this ends the game.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What the guest thread sends back.
 enum Reply {
@@ -30,12 +37,17 @@ pub struct Program {
     replies: Receiver<Reply>,
     thread: Option<JoinHandle<()>>,
     failure: Option<String>,
+    /// The guest thread stopped answering: closing leaves it be.
+    stuck: bool,
     commit: bool,
     stopping: bool,
     /// The operation sent and not yet answered.
     pending: Option<Operation>,
     /// When the guest sent its last packet.
     answered: Option<Instant>,
+    /// A response's buffer, for the next request (and, the guest thread
+    /// keeping it, the response after) to reuse.
+    spare: Vec<f32>,
     /// The guest's linear memory, as of its last host call (for the dev tools).
     #[cfg(feature = "devtools")]
     memory: Arc<AtomicUsize>,
@@ -43,15 +55,7 @@ pub struct Program {
 
 impl Program {
     pub fn start(engine: &Engine, module: &GuestModule) -> Result<Program> {
-        let main = module
-            .abi()
-            .function("main")
-            .ok_or_else(|| anyhow!("game must export main"))?;
-        let host = CallbackType { parameter: ValueType::ArrayF32, result: ValueType::ArrayF32 };
-        ensure!(
-            main.result == ValueType::Unit && main.parameter == Parameter::Callback(host),
-            "game must export main: (Array F32 -> Array F32 ! {{Foreign}}) -> Unit"
-        );
+        module.abi().check_game()?;
         let (request_tx, request_rx) = sync_channel::<Vec<f32>>(1);
         // Replies never block, so the guest can always finish and be joined.
         let (reply_tx, reply_rx): (Sender<Reply>, _) = channel();
@@ -89,15 +93,18 @@ impl Program {
             replies: reply_rx,
             thread: Some(thread),
             failure: None,
+            stuck: false,
             commit: true,
             stopping: false,
             pending: None,
             answered: None,
+            spare: Vec::new(),
             #[cfg(feature = "devtools")]
             memory,
         };
         let description = program.receive().context("game program handshake")?;
         (program.schema, program.scenes) = pen_runtime::program::handshake(&description)?;
+        program.recycle(description);
         Ok(program)
     }
 
@@ -105,21 +112,29 @@ impl Program {
         if let Some(failure) = &self.failure {
             bail!("game program failed: {failure}");
         }
-        match self.replies.recv() {
+        match self.replies.recv_timeout(REPLY_TIMEOUT) {
             Ok(Reply::Packet(packet, sent)) => {
                 self.answered = Some(sent);
                 Ok(packet)
             }
             Ok(Reply::Finished(result)) => {
-                let message = match result {
+                let error = match result {
                     Ok(()) if self.stopping => return Ok(Vec::new()),
-                    Ok(()) => "game main returned before shutdown".to_owned(),
-                    Err(error) => format!("{error:#}"),
+                    Ok(()) => anyhow!("game main returned before shutdown"),
+                    Err(error) => error,
                 };
-                self.failure = Some(message.clone());
-                bail!("game program failed: {message}")
+                self.failure = Some(format!("{error:#}"));
+                let error = error.context("game program failed");
+                // Stopped at its deadline, the program is gone, but a moment
+                // restored starts another.
+                Err(if error.is::<Overrun>() { error.context(Unresponsive) } else { error })
             }
-            Err(_) => {
+            Err(RecvTimeoutError::Timeout) => {
+                self.failure = Some("it stopped answering".into());
+                self.stuck = true;
+                Err(anyhow!("game program sent nothing for {} s", REPLY_TIMEOUT.as_secs()).context(Unresponsive))
+            }
+            Err(RecvTimeoutError::Disconnected) => {
                 self.failure = Some("game thread stopped".into());
                 bail!("game thread stopped")
             }
@@ -130,7 +145,7 @@ impl Program {
     /// echoed operation lane.
     pub fn request(&mut self, operation: Operation, payload: &[f32]) -> Result<Vec<f32>> {
         self.send(operation, payload)?;
-        self.response()
+        Ok(self.response()?.into_lanes())
     }
 
     /// Sends a request without waiting: the guest works on it while the
@@ -138,11 +153,12 @@ impl Program {
     pub fn send(&mut self, operation: Operation, payload: &[f32]) -> Result<()> {
         ensure!(!self.stopping, "game program is closed");
         ensure!(self.pending.is_none(), "game program already has a request in flight");
-        let request = pen_runtime::program::request(self.commit, operation, payload);
         let sender = self.requests.as_ref().ok_or_else(|| anyhow!("game program is closed"))?;
         if let Some(failure) = &self.failure {
             bail!("game program failed: {failure}");
         }
+        let mut request = std::mem::take(&mut self.spare);
+        pen_runtime::program::write_request(&mut request, self.commit, operation, payload);
         sender.send(request).map_err(|_| anyhow!("game thread stopped"))?;
         // A candidate must be accepted by the runtime before a later command
         // commits it; rejection simply keeps the preceding guest-owned state.
@@ -158,9 +174,16 @@ impl Program {
     }
 
     /// Waits for the response to the request in flight.
-    pub fn response(&mut self) -> Result<Vec<f32>> {
+    pub fn response(&mut self) -> Result<Response> {
         let operation = self.pending.take().ok_or_else(|| anyhow!("game program has no request in flight"))?;
         pen_runtime::program::response(operation, self.receive()?)
+    }
+
+    /// Takes back a response's buffer, for the next request to reuse.
+    pub fn recycle(&mut self, buffer: Vec<f32>) {
+        if buffer.capacity() > self.spare.capacity() {
+            self.spare = buffer;
+        }
     }
 
     /// The guest's committed linear-memory bytes, as of its last response.
@@ -173,7 +196,7 @@ impl Program {
         self.commit = true;
     }
 
-    /// Asks the program to stop and waits for its thread.
+    /// Asks the program to stop and waits for its thread (unless it is stuck).
     pub fn close(&mut self) {
         if self.stopping {
             return;
@@ -184,7 +207,9 @@ impl Program {
         {
             let _ = sender.send(vec![0.0, Operation::Stop as u8 as f32]);
         }
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = self.thread.take()
+            && !self.stuck
+        {
             let _ = thread.join();
         }
     }
@@ -201,20 +226,43 @@ pub struct NativeBackend(pub Engine);
 impl pen_runtime::program::Backend for NativeBackend {
     type Module = GuestModule;
     type Program = Program;
-    async fn start(&self, module: &GuestModule) -> Result<Program> { Program::start(&self.0, module) }
+    async fn start(&self, module: &GuestModule) -> Result<Program> {
+        Program::start(&self.0, module)
+    }
 }
 impl pen_runtime::program::Program for Program {
-    fn schema(&self) -> u32 { self.schema }
-    fn scenes(&self) -> bool { self.scenes }
-    fn send(&mut self, operation: Operation, payload: &[f32]) -> Result<()> { self.send(operation, payload) }
-    async fn response(&mut self) -> Result<Vec<f32>> { self.response() }
-    fn accept(&mut self) { self.accept(); }
-    fn answered(&self) -> Option<Instant> { self.answered() }
+    fn schema(&self) -> u32 {
+        self.schema
+    }
+    fn scenes(&self) -> bool {
+        self.scenes
+    }
+    fn send(&mut self, operation: Operation, payload: &[f32]) -> Result<()> {
+        self.send(operation, payload)
+    }
+    async fn response(&mut self) -> Result<Response> {
+        self.response()
+    }
+    fn recycle(&mut self, buffer: Vec<f32>) {
+        self.recycle(buffer);
+    }
+    fn accept(&mut self) {
+        self.accept();
+    }
+    fn answered(&self) -> Option<Instant> {
+        self.answered()
+    }
     fn memory_bytes(&self) -> usize {
         #[cfg(feature = "devtools")]
-        { self.memory_bytes() }
+        {
+            self.memory_bytes()
+        }
         #[cfg(not(feature = "devtools"))]
-        { 0 }
+        {
+            0
+        }
     }
-    async fn close(&mut self) { self.close(); }
+    async fn close(&mut self) {
+        self.close();
+    }
 }

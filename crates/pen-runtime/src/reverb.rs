@@ -1,3 +1,4 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "audio sample math")]
 use std::f64::consts::TAU;
 
 /// The response's length, in seconds.

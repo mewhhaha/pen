@@ -581,11 +581,13 @@ const OPTIONS: [OptionSpec; 43] = [
         value: "STEPS",
         commands: &["", "dev", "run", "bench", "packets"],
         place: Place::Play,
-        about: "scripted input: wait=N key=K down=K up=K type=T move=X,Y click=X,Y press=B release=B \
+        about: "scripted input: wait=N key=K down=K up=K type=T move=X,Y glide=X,Y,FRAMES click=X,Y press=B release=B \
                 drag=X,Y,X,Y wheel=D[,X,Y] shot=NAME save=F load=F quit; ui=ID,ACTION[,VALUE] (an assistive \
                 technology's action on an interface node: focus, blur, activate, increment, decrement, \
                 set_value, expand or collapse); tune=NAME=VALUE (a live-tunable constant of the checkout's \
-                src/tunables.json); overlay=/COMMAND[,ARG...] (a line typed into the dev tools' console)",
+                src/tunables.json); overlay=/COMMAND[,ARG...] (a line typed into the dev tools' console); \
+                glide eases from the last scripted pointer position (initially 0,0) over positive FRAMES, \
+                then continues; move is instant",
     },
     OptionSpec {
         name: "--script-file",

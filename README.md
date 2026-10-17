@@ -339,7 +339,7 @@ pen run --size 1920x1080 --record clip.mp4 --frames 600
   speed while you play and record; `--size` pins the frame size whatever size
   the window gets.
 - `--script` (or `--script-file`) takes the steps
-  with `wait key down up type move click press release drag
+  with `wait key down up type move glide click press release drag
   wheel shot save load`, plus `quit`, `tune=NAME=VALUE` (above),
   `console=CODE[,ARG]` (a console command by number: `console=3,12` hires
   twelve gnorps), `overlay=/COMMAND[,ARG...]` (a line typed into the dev
@@ -347,6 +347,12 @@ pen run --size 1920x1080 --record clip.mp4 --frames 600
   time travel") and `ui=NODE,ACTION[,VALUE]` ("Accessibility"). Coordinates are page pixels of a
   page 960 wide, scaled to the viewport, so scripts land in the same places
   at 1920x1280 (the headless default).
+  `move=X,Y` is instant; `glide=X,Y,FRAMES` uses smoothstep easing from the last
+  scripted pointer position (initially `0,0`) without clicking, over exactly
+  `FRAMES` frames. `FRAMES` must be a positive integer; the next step runs after
+  arrival. At `--fps 60`,
+  `glide=480,270,45` takes 0.75 s. For a smooth drag, use
+  `press=left glide=X,Y,FRAMES release=left`.
 - `--screenshot PNG` writes the last frame; `--frames N` stops after N.
 
 ## Testing

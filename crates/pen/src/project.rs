@@ -157,6 +157,13 @@ pub const RUNTIME: &str = env!("PEN_RUNTIME_COMPATIBILITY");
 #[used]
 static RUNTIME_MARK: &str = concat!("pen-runtime-compatibility=", env!("PEN_RUNTIME_COMPATIBILITY"), "\n");
 
+/// Keeps the mark in the executable. `#[used]` keeps it in the object file,
+/// but MSVC's linker still drops data nothing reads, so the runtime's start
+/// (and `runtime_mark`, for test executables) reads it.
+pub fn keep_mark() {
+    std::hint::black_box(RUNTIME_MARK);
+}
+
 /// What a mark starts with, made here rather than written out: this
 /// executable's bytes then hold it only in its own mark, and nowhere two of
 /// its strings happen to lie side by side.
@@ -177,6 +184,7 @@ fn well_formed(text: &str) -> bool {
 
 /// The compatibility mark of a runtime executable, if it has one.
 fn runtime_mark(executable: &[u8]) -> Result<Option<String>> {
+    keep_mark();
     let prefix = mark_prefix();
     let mut marks = BTreeSet::new();
     for (at, _) in executable.iter().enumerate().filter(|(_, byte)| **byte == prefix[0]) {
@@ -1034,8 +1042,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // The runtime it packages is an x86-64 ELF, and builds compile guests
+    // only for their own architecture.
     #[test]
-    #[cfg(feature = "compiler")]
+    #[cfg(all(feature = "compiler", target_arch = "x86_64"))]
     fn bundles_package_like_checkouts() {
         let root = fixture("bundle");
         // A game built elsewhere: its Wasm (here only a manifest), assets

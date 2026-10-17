@@ -2001,6 +2001,7 @@ fn network(args: &Args) -> Option<Result<()>> {
 }
 
 fn main() -> ExitCode {
+    project::keep_mark();
     startup::begin();
     logger::install();
     let result = run(std::env::args().skip(1));

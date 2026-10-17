@@ -13,9 +13,12 @@
 //!                   frame, then submit each later one once, in order, timing
 //!                   each (all packets if none are named)
 //!   --pipelines DIR keep compiled pipelines there between runs (Vulkan)
-//!   --msaa N, --fxaa, --filtering N, --scale S, --blur B, --aberration X,Y
+//!   --msaa N, --fxaa, --taa, --filtering N, --scale S, --blur B, --aberration X,Y
 //!                   override the frames' quality and effects
 //!   --robots N      add an N x N grid of instanced walking robots
+//!   --untimed       write no GPU timestamps (they are on otherwise)
+//!   --cpu-culling   cull every instanced batch on the CPU
+//!   --gpu-culling N cull batches of at least N instances on the GPU (256)
 //!   --early         also write the first frame submitted (NNNN-early.png)
 //! ```
 //!
@@ -28,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use pen_protocol::*;
-use pen_render::{RenderTarget, Renderer, RendererOptions};
+use pen_render::{Display, RenderTarget, Renderer, RendererOptions};
 
 /// A change to every frame rendered, from the command line.
 type Override = Box<dyn Fn(&mut RenderFrame)>;
@@ -189,6 +192,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
             sky: true,
             effects: true,
             bloom: true,
+            taa: false,
         },
         sky: Sky {
             zenith: vector(0.2, 0.4, 0.8),
@@ -227,6 +231,12 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
         sounds: Vec::new(),
         buses: Vec::new(),
         voices: Vec::new(),
+        poses: Vec::new(),
+        emitters: Vec::new(),
+        extensions: Vec::new(),
+        lights: Vec::new(),
+        listener: Vec::new(),
+        panners: Vec::new(),
         preferences: None,
         load_requested: false,
         save_requested: false,
@@ -274,6 +284,8 @@ fn main() -> Result<()> {
     let mut numbers = Vec::new();
     let mut overrides: Vec<Override> = Vec::new();
     let mut robots = 0;
+    let mut culling = None;
+    let mut timed = true;
     let mut early = false;
     let mut sequence = false;
     let mut pipelines = None;
@@ -295,6 +307,7 @@ fn main() -> Result<()> {
                 overrides.push(Box::new(move |frame| frame.quality.msaa = msaa));
             }
             "--fxaa" => overrides.push(Box::new(|frame| frame.quality.fxaa = true)),
+            "--taa" => overrides.push(Box::new(|frame| frame.quality.taa = true)),
             "--filtering" => {
                 let filtering: u32 = args.next().context("--filtering N")?.parse()?;
                 overrides.push(Box::new(move |frame| frame.quality.filtering = filtering));
@@ -314,6 +327,9 @@ fn main() -> Result<()> {
                 overrides.push(Box::new(move |frame| frame.aberration = Aberration { x, y }));
             }
             "--robots" => robots = args.next().context("--robots N")?.parse()?,
+            "--untimed" => timed = false,
+            "--cpu-culling" => culling = Some(None),
+            "--gpu-culling" => culling = Some(Some(args.next().context("--gpu-culling N")?.parse()?)),
             "--early" => early = true,
             "--sequence" => sequence = true,
             "--pipelines" => pipelines = Some(PathBuf::from(args.next().context("--pipelines DIR")?)),
@@ -392,8 +408,12 @@ fn main() -> Result<()> {
     });
     let mut target = Offscreen { texture };
     let started = Instant::now();
-    let options = RendererOptions { format: FORMAT, assets, veil, pipeline_cache: pipelines };
+    let options = RendererOptions { format: FORMAT, display: Display::SDR, assets, veil, pipeline_cache: pipelines };
     let mut renderer = Renderer::new(device.clone(), queue.clone(), options)?;
+    if let Some(culling) = culling {
+        renderer.gpu_culling(culling);
+    }
+    renderer.time_passes(timed);
     renderer.preload(&catalog);
     std::fs::create_dir_all(&out)?;
     let report = |renderer: &mut Renderer| {

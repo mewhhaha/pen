@@ -75,8 +75,13 @@ pub mod types {
     }
     /// Which service a request is for: Steam's achievements, stats and rich presence, the
     /// system clipboard, the browser for a web address, what the game runs on, a native compute
-    /// library (grid pathfinding), and the host's developer tools (DEVTOOLS_OP_*), which only a
-    /// dev tools program asks of. A host without one answers unavailable.
+    /// library (grid pathfinding), the host's developer tools (DEVTOOLS_OP_*), which only a dev
+    /// tools program asks of, the simulation services both hosts answer alike, bit for bit:
+    /// rigid-body physics, paths over a navmesh, ray and shape queries against colliders, and
+    /// noise and heightfields, the game's actions and their bindings (INPUT_OP_*), the engine's
+    /// preferences (PREFERENCES_OP_*), the player's language (LOCALE_OP_*), the captions of the
+    /// sounds that play (CAPTIONS_OP_*) and the player's consent to crash and performance
+    /// reports (REPORTS_OP_*). A host without one answers unavailable.
     pub mod service {
         pub const STEAM: u32 = 0;
         pub const CLIPBOARD: u32 = 1;
@@ -84,8 +89,17 @@ pub mod types {
         pub const PLATFORM: u32 = 3;
         pub const PATHFINDING: u32 = 4;
         pub const DEVTOOLS: u32 = 5;
+        pub const PHYSICS: u32 = 6;
+        pub const NAVMESH: u32 = 7;
+        pub const SPATIAL: u32 = 8;
+        pub const NOISE: u32 = 9;
+        pub const INPUT: u32 = 10;
+        pub const PREFERENCES: u32 = 11;
+        pub const LOCALE: u32 = 12;
+        pub const CAPTIONS: u32 = 13;
+        pub const REPORTS: u32 = 14;
         /// The names of the codes, by code.
-        pub const NAMES: [&str; 6] = ["steam", "clipboard", "url", "platform", "pathfinding", "devtools"];
+        pub const NAMES: [&str; 15] = ["steam", "clipboard", "url", "platform", "pathfinding", "devtools", "physics", "navmesh", "spatial", "noise", "input", "preferences", "locale", "captions", "reports"];
     }
     /// How a service request went: done; the service is not there (Steam is off, no clipboard,
     /// the browser cannot); it is there but refused or failed; or the host does not know the
@@ -102,7 +116,20 @@ pub mod types {
     /// and set_stat_float set `a`, add_stat adds `a` to an integer stat, and these and get_stat
     /// answer the stat's value. set_presence sets rich presence key (the text's first `a` code
     /// points) to the rest of the text; clear_presence clears every key. status answers ok
-    /// while Steam runs for the game, unavailable otherwise.
+    /// while Steam runs for the game, unavailable otherwise. Steam Input: input_action_set
+    /// activates the action set named by the text on every controller, input_glyph answers the
+    /// path of the glyph image of the first button or stick bound to the action named by the
+    /// text in the active set (a digital action, or an analog one), and input_panel opens
+    /// Steam's binding panel, where the player rebinds them; each answers unavailable without
+    /// Steam Input or a controller. The Workshop's: workshop_publish uploads the player's saved
+    /// scene (the editor's) as an item titled with the text, visible to `a` (0 everyone, 1
+    /// friends, 2 only the player, 3 those with the link), or with `b` 1 as a new version of
+    /// the item whose id is the text's first line, answered later with the item's id as text
+    /// and value 1 when the player must accept the Workshop's agreement; workshop_items answers
+    /// the installed subscribed items' ids as text, a space between them, their count the
+    /// value, and downloads the rest; workshop_subscribe and workshop_unsubscribe take an
+    /// item's id as text and answer once Steam has; workshop_use makes an installed item's
+    /// scene the player's, for the game to load as the editor's scene.
     pub mod steam_op {
         pub const UNLOCK_ACHIEVEMENT: u32 = 0;
         pub const CLEAR_ACHIEVEMENT: u32 = 1;
@@ -113,8 +140,16 @@ pub mod types {
         pub const SET_PRESENCE: u32 = 6;
         pub const CLEAR_PRESENCE: u32 = 7;
         pub const STATUS: u32 = 8;
+        pub const INPUT_ACTION_SET: u32 = 9;
+        pub const INPUT_GLYPH: u32 = 10;
+        pub const INPUT_PANEL: u32 = 11;
+        pub const WORKSHOP_PUBLISH: u32 = 12;
+        pub const WORKSHOP_ITEMS: u32 = 13;
+        pub const WORKSHOP_SUBSCRIBE: u32 = 14;
+        pub const WORKSHOP_UNSUBSCRIBE: u32 = 15;
+        pub const WORKSHOP_USE: u32 = 16;
         /// The names of the codes, by code.
-        pub const NAMES: [&str; 9] = ["unlock_achievement", "clear_achievement", "set_stat", "set_stat_float", "add_stat", "get_stat", "set_presence", "clear_presence", "status"];
+        pub const NAMES: [&str; 17] = ["unlock_achievement", "clear_achievement", "set_stat", "set_stat_float", "add_stat", "get_stat", "set_presence", "clear_presence", "status", "input_action_set", "input_glyph", "input_panel", "workshop_publish", "workshop_items", "workshop_subscribe", "workshop_unsubscribe", "workshop_use"];
     }
     /// The clipboard's operations: copy the text to it, or answer with the text on it.
     pub mod clipboard_op {
@@ -160,7 +195,55 @@ pub mod types {
     /// or a new file when it is empty, or stops a recording. shot saves the window with the dev
     /// tools over it to the text's path, or a new file. tune sets the live-tunable constant
     /// whose id is `a` to `b`, and tuned answers the game's tuned values as id and value pairs.
-    /// bake writes them into the checkout as the defaults.
+    /// bake writes them into the checkout as the defaults, or only the one whose id is `a` when
+    /// `a` is not 0. packets keeps each frame's input and render packets from now on while `a`
+    /// is 1 (the last 120 frames), or forgets them at 0, and answers the frames kept, oldest
+    /// first, each as DEVTOOLS_PACKET's numbers; packet_diff answers how frame `b` differs from
+    /// frame `a`, both kept: for each of DEVTOOLS_PACKET's numbers after position, its count in
+    /// `a`, its count in `b` and how many of its elements differ. state answers the live
+    /// state's sections (`a` below 0), each its key, version, width and length, value the
+    /// state's schema, or up to 256 lanes of section `a` from lane `b` on, value its length;
+    /// with `c` above 0, of the state the history kept `c` seconds of game time back instead.
+    /// state_diff answers, for each section of the live state or the one kept `a` seconds back,
+    /// its key, its length then and now, how many lanes differ and the first that does (-1 for
+    /// none), value the frame compared with. pictures takes a picture of the game's frame each
+    /// time the history could keep a moment, while `a` is 1, into the dev tools' atlas (the
+    /// texture of material `b`: slots of 128 by 80 pixels, 8 to a row, the first 16 for
+    /// pictures), and answers each picture's slot and the frame that shows it, oldest first;
+    /// seek goes to frame `a`, paused. watch pauses the game once lane `b` of the live state's
+    /// section `a` compares with `d` as DEVTOOLS_COMPARE `c` says, `a` -1 stops watching and -2
+    /// only asks; it answers the watch: key, lane, comparison, value, the lane's value now and
+    /// the frame it paused at (-1 for none). profile samples the game's guest while `a` is 1,
+    /// stops at 0 and forgets the samples at 2 (3 only asks), answering how many it has and 1
+    /// while sampling; flame answers them as a flame graph, value the samples: first how many
+    /// functions follow that the samples found running most, each its function index, samples,
+    /// its name's length and code points; then each node (a caller before its callees) as its
+    /// depth, function index, first sample, samples, samples in it alone, its name's length and
+    /// code points. memory answers the game's committed memory in bytes, the most it committed,
+    /// then for each counter the guest exports (guest ABI 3's ownership counters) and the
+    /// host's calls into it, its name's length, code points and value in two 24-bit halves,
+    /// value the number of counters. presets answers the names of the checkout's tunable
+    /// presets, a line each; preset_save saves the game's tuned values as the preset the text
+    /// names, and preset_load tunes each value of that preset. assets answers the game's
+    /// catalog of DEVTOOLS_ASSET `a`, each entry as its DEVTOOLS_ASSET_STATE, its revision, its
+    /// key's length and code points. preview draws catalog asset `b` of kind `a` (a mesh with
+    /// material `c`, a material on mesh `c`) into slot `d` (16 to 63) of the atlas pictures
+    /// named, value 1 once drawn and 0 while its assets load. swap draws catalog asset `b` of
+    /// kind `a` from the asset the text names instead, or its own again when the text is empty,
+    /// until the next build. material answers material `a`'s color and instance parameters (8
+    /// numbers, 0 when it sets none), whether it sets them (two numbers), then its shader's and
+    /// texture's names, each its length and code points; material_set sets number `b` of those
+    /// 8 in the checkout's file to `c`, which then reloads. audit checks the game's interface
+    /// as the last frame showed it and answers its findings: value their count, and for each
+    /// its kind (AUDIT_FINDING_*), the node's id, a measure (a contrast ratio, a size in
+    /// pixels, or 0), its message's length and the message's code points. audio answers the mix
+    /// as it plays: DEVTOOLS_AUDIO's numbers, then DEVTOOLS_BUS's for each bus, the master
+    /// first; peaks and RMS are linear and over what played since the last audio answer. mute
+    /// silences bus `a` while `b` is 1 and solo hears only the soloed buses (and the master's
+    /// own voices) while any is soloed; both are the developer's, never the game's or a
+    /// recording's. export hands the game's state over as a save file named by the text, or a
+    /// new one (the browser downloads it); import loads a save file the player hands over (the
+    /// browser asks for one), or plays an input recording.
     pub mod devtools_op {
         pub const LOG: u32 = 0;
         pub const FRAME: u32 = 1;
@@ -177,8 +260,32 @@ pub mod types {
         pub const TUNE: u32 = 12;
         pub const BAKE: u32 = 13;
         pub const TUNED: u32 = 14;
+        pub const PACKETS: u32 = 15;
+        pub const PACKET_DIFF: u32 = 16;
+        pub const STATE: u32 = 17;
+        pub const STATE_DIFF: u32 = 18;
+        pub const PICTURES: u32 = 19;
+        pub const SEEK: u32 = 20;
+        pub const WATCH: u32 = 21;
+        pub const PROFILE: u32 = 22;
+        pub const FLAME: u32 = 23;
+        pub const MEMORY: u32 = 24;
+        pub const PRESETS: u32 = 25;
+        pub const PRESET_SAVE: u32 = 26;
+        pub const PRESET_LOAD: u32 = 27;
+        pub const ASSETS: u32 = 28;
+        pub const PREVIEW: u32 = 29;
+        pub const SWAP: u32 = 30;
+        pub const MATERIAL: u32 = 31;
+        pub const MATERIAL_SET: u32 = 32;
+        pub const AUDIT: u32 = 33;
+        pub const AUDIO: u32 = 34;
+        pub const MUTE: u32 = 35;
+        pub const SOLO: u32 = 36;
+        pub const EXPORT: u32 = 37;
+        pub const IMPORT: u32 = 38;
         /// The names of the codes, by code.
-        pub const NAMES: [&str; 15] = ["log", "frame", "gpu", "command", "pause", "play", "step", "rewind", "replay", "history", "record", "shot", "tune", "bake", "tuned"];
+        pub const NAMES: [&str; 39] = ["log", "frame", "gpu", "command", "pause", "play", "step", "rewind", "replay", "history", "record", "shot", "tune", "bake", "tuned", "packets", "packet_diff", "state", "state_diff", "pictures", "seek", "watch", "profile", "flame", "memory", "presets", "preset_save", "preset_load", "assets", "preview", "swap", "material", "material_set", "audit", "audio", "mute", "solo", "export", "import"];
     }
     /// Where each number sits in a devtools frame answer: the milliseconds since the frame
     /// before; the game's frame phases in milliseconds (guest, waited for an overlapped guest,
@@ -187,7 +294,11 @@ pub mod types {
     /// calls, instanced ones and instances; the frame's meshes and brushes; the game's memory
     /// in bytes; the frame's width and height in pixels; and the timeline: the next frame's
     /// position, 1 when paused, replaying, keeping history or overlapping frames, and the frame
-    /// an input recording started at, or -1.
+    /// an input recording started at, or -1. Then the renderer's culling: draws and instances
+    /// left out of the camera's view, and casters left out of the shadow maps (once for each
+    /// map); the triangles drawn; the render scale the scene drew at; and the GPU's
+    /// milliseconds over a recent frame's shadow maps, culling, scene, the passes after it,
+    /// sprites and insets, and the whole frame, each -1 where the GPU has no timestamps.
     pub mod devtools_frame {
         pub const INTERVAL: u32 = 0;
         pub const GUEST: u32 = 1;
@@ -212,8 +323,411 @@ pub mod types {
         pub const HISTORY: u32 = 20;
         pub const PIPELINED: u32 = 21;
         pub const RECORDING: u32 = 22;
+        pub const CULLED: u32 = 23;
+        pub const SHADOW_CULLED: u32 = 24;
+        pub const TRIANGLES: u32 = 25;
+        pub const RENDER_SCALE: u32 = 26;
+        pub const GPU_SHADOW: u32 = 27;
+        pub const GPU_CULLING: u32 = 28;
+        pub const GPU_SCENE: u32 = 29;
+        pub const GPU_POST: u32 = 30;
+        pub const GPU_OVERLAY: u32 = 31;
+        pub const GPU_TOTAL: u32 = 32;
         /// The names of the codes, by code.
-        pub const NAMES: [&str; 23] = ["interval", "guest", "wait", "decode", "validate", "submit", "housekeeping", "total", "packet", "draw_calls", "instanced_draw_calls", "instances", "meshes", "brushes", "memory", "width", "height", "position", "paused", "replaying", "history", "pipelined", "recording"];
+        pub const NAMES: [&str; 33] = ["interval", "guest", "wait", "decode", "validate", "submit", "housekeeping", "total", "packet", "draw_calls", "instanced_draw_calls", "instances", "meshes", "brushes", "memory", "width", "height", "position", "paused", "replaying", "history", "pipelined", "recording", "culled", "shadow_culled", "triangles", "render_scale", "gpu_shadow", "gpu_culling", "gpu_scene", "gpu_post", "gpu_overlay", "gpu_total"];
+    }
+    /// Rigid-body physics (rapier), from the world the request sends: step advances it `a`
+    /// steps (1 to 600) of `b` seconds (up to 1) with gravity `c` (metres per second squared
+    /// along y). The values are its bodies, each a kind (PHYSICS_BODY_*), a collider
+    /// (COLLIDER_SHAPE_*'s record: shape, size x y z, position x y z, rotation quaternion x y z
+    /// w), linear velocity x y z, angular velocity x y z (radians a second), friction,
+    /// restitution and density, then its shape's data. The answer's values are each body's
+    /// position x y z, rotation x y z w, linear and angular velocity, 13 values in the
+    /// request's order, then the contacts touching after the last step, 9 values each: the two
+    /// bodies' indices (the lower first), the deepest point x y z, the normal x y z from the
+    /// first to the second, and their distance (negative while they overlap); its value is the
+    /// contacts' count. The world is the request's alone: nothing carries over to the next.
+    pub mod physics_op {
+        pub const STEP: u32 = 0;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 1] = ["step"];
+    }
+    /// How a physics body moves: never; under gravity and contacts; or by its velocity alone,
+    /// pushing what it meets.
+    pub mod physics_body {
+        pub const FIXED: u32 = 0;
+        pub const DYNAMIC: u32 = 1;
+        pub const KINEMATIC: u32 = 2;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 3] = ["fixed", "dynamic", "kinematic"];
+    }
+    /// A collider's shape, and what its size and data mean: a ball of radius x; a cuboid of
+    /// half extents x y z; a capsule and a cylinder of radius x and half height y along their y
+    /// axis; the convex hull of x points, its data x y z each; a heightfield of x columns by y
+    /// rows of samples z metres apart, centred on its position, its data the heights row by row
+    /// from -z, each row from -x; and a triangle mesh of x vertices and y triangles, its data
+    /// the vertices x y z, then each triangle's three vertex indices. Coordinates, sizes,
+    /// heights and speeds lie within a million metres (a second): a request past that fails.
+    pub mod collider_shape {
+        pub const BALL: u32 = 0;
+        pub const CUBOID: u32 = 1;
+        pub const CAPSULE: u32 = 2;
+        pub const CYLINDER: u32 = 3;
+        pub const CONVEX: u32 = 4;
+        pub const HEIGHTFIELD: u32 = 5;
+        pub const TRIMESH: u32 = 6;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 7] = ["ball", "cuboid", "capsule", "cylinder", "convex", "heightfield", "trimesh"];
+    }
+    /// Paths over a navmesh on the ground plane (x, z), triangulated from areas. The values are
+    /// an agent's radius, then areas: each a kind (NAVMESH_AREA_*), a corner count and the
+    /// corners' x z. The ground is walkable where a walkable area covers it and no obstacle
+    /// does. find answers a short way from (`a`, `b`) to (`c`, `d`), its turns kept the radius
+    /// off the corners they round and crossing no navmesh edge narrower than twice it, as x z
+    /// points from start to goal, value their count; a start or goal off the navmesh moves to
+    /// its nearest point, and none answers when the goal cannot be reached. triangles answers
+    /// the walkable triangles, x z of each corner, value their count.
+    pub mod navmesh_op {
+        pub const FIND: u32 = 0;
+        pub const TRIANGLES: u32 = 1;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 2] = ["find", "triangles"];
+    }
+    /// What a navmesh area is: ground to walk on, or something in the way.
+    pub mod navmesh_area {
+        pub const WALKABLE: u32 = 0;
+        pub const OBSTACLE: u32 = 1;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 2] = ["walkable", "obstacle"];
+    }
+    /// Queries against `a` colliders, the request's first values (COLLIDER_SHAPE_*'s records
+    /// with their data). raycast casts the rays that follow (origin x y z, direction x y z) up
+    /// to `b` metres, a ray starting inside a shape hitting it at once while `c` is 1, and
+    /// answers for each the collider it hits first (its index + 1, 0 for none), the distance
+    /// and the surface's normal x y z, value the hits' count. overlap answers the indices of
+    /// the colliders a query collider (the record that follows) touches, in order, value their
+    /// count. nearest answers for each point that follows (x y z) the nearest collider within
+    /// `b` metres (index + 1, 0 for none), the distance (0 inside) and its closest point x y z,
+    /// value how many found one.
+    pub mod spatial_op {
+        pub const RAYCAST: u32 = 0;
+        pub const OVERLAP: u32 = 1;
+        pub const NEAREST: u32 = 2;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 3] = ["raycast", "overlap", "nearest"];
+    }
+    /// Deterministic simplex noise summed in octaves, the same on every host. The values start
+    /// with its frequency (cycles a metre), amplitude, lacunarity (each octave's frequency over
+    /// the last's), gain (each octave's amplitude over the last's) and style (NOISE_STYLE_*);
+    /// `c` is the seed and `d` the octaves (1 to 16). heightfield answers a grid of `a` columns
+    /// by `b` rows of heights, row by row, from the corner x z the next two values give, the
+    /// last its spacing in metres (its rows along +z, its columns along +x). sample answers the
+    /// height at each x z pair that follows. Heights stay within the amplitude; the value is
+    /// their count.
+    pub mod noise_op {
+        pub const HEIGHTFIELD: u32 = 0;
+        pub const SAMPLE: u32 = 1;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 2] = ["heightfield", "sample"];
+    }
+    /// How noise octaves add up: fractal Brownian motion (rolling hills), or ridged (sharp
+    /// crests where the noise crosses zero).
+    pub mod noise_style {
+        pub const FBM: u32 = 0;
+        pub const RIDGED: u32 = 1;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 2] = ["fbm", "ridged"];
+    }
+    /// A gamepad's buttons, in the order of the browser's standard gamepad: the four face
+    /// buttons by where they sit (south is Xbox's A, PlayStation's cross), the shoulder
+    /// buttons, the triggers (analog: their GamepadButton value runs from 0 to 1), select and
+    /// start, the sticks pressed in, the directional pad and the home button.
+    pub mod gamepad_button {
+        pub const SOUTH: u32 = 0;
+        pub const EAST: u32 = 1;
+        pub const WEST: u32 = 2;
+        pub const NORTH: u32 = 3;
+        pub const LEFT_SHOULDER: u32 = 4;
+        pub const RIGHT_SHOULDER: u32 = 5;
+        pub const LEFT_TRIGGER: u32 = 6;
+        pub const RIGHT_TRIGGER: u32 = 7;
+        pub const SELECT: u32 = 8;
+        pub const START: u32 = 9;
+        pub const LEFT_STICK: u32 = 10;
+        pub const RIGHT_STICK: u32 = 11;
+        pub const DPAD_UP: u32 = 12;
+        pub const DPAD_DOWN: u32 = 13;
+        pub const DPAD_LEFT: u32 = 14;
+        pub const DPAD_RIGHT: u32 = 15;
+        pub const HOME: u32 = 16;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 17] = ["south", "east", "west", "north", "left_shoulder", "right_shoulder", "left_trigger", "right_trigger", "select", "start", "left_stick", "right_stick", "dpad_up", "dpad_down", "dpad_left", "dpad_right", "home"];
+    }
+    /// A gamepad's stick axes, in the order of the browser's standard gamepad: from -1 to 1,
+    /// right and down positive.
+    pub mod gamepad_axis {
+        pub const LEFT_X: u32 = 0;
+        pub const LEFT_Y: u32 = 1;
+        pub const RIGHT_X: u32 = 2;
+        pub const RIGHT_Y: u32 = 3;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 4] = ["left_x", "left_y", "right_x", "right_y"];
+    }
+    /// What moved an action (the Action event's device): the keyboard or mouse, a gamepad,
+    /// Steam Input, or a touch screen. A game shows the prompts of the device the player used
+    /// last.
+    pub mod input_device {
+        pub const KEYBOARD: u32 = 0;
+        pub const GAMEPAD: u32 = 1;
+        pub const STEAM: u32 = 2;
+        pub const TOUCH: u32 = 3;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 4] = ["keyboard", "gamepad", "steam", "touch"];
+    }
+    /// What a binding reads: a key (its code, as KeyDown events carry it), a mouse button
+    /// (numbered as PointerDown events number them), a gamepad button (GAMEPAD_BUTTON_*) or a
+    /// gamepad axis (GAMEPAD_AXIS_*). A binding is three numbers: its source, its code and its
+    /// scale, which multiplies what it reads (a key or button reads 1 held, an axis -1 to 1),
+    /// so -1 makes a key push an axis action the other way and an axis bound with -1 reads its
+    /// other half.
+    pub mod input_source {
+        pub const KEY: u32 = 0;
+        pub const MOUSE: u32 = 1;
+        pub const PAD_BUTTON: u32 = 2;
+        pub const PAD_AXIS: u32 = 3;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 4] = ["key", "mouse", "pad_button", "pad_axis"];
+    }
+    /// The input service's operations, on action `a` (0 to MAX_ACTIONS - 1). declare declares
+    /// it: `b` is 0 for a button (its value 1 while a binding holds it at half or more, else 0)
+    /// or 1 for an axis (its value the bindings' sum, from -1 to 1), its values its name's `c`
+    /// code points and then its default bindings, three numbers each (INPUT_SOURCE_*); it
+    /// answers how many bindings it has, the player's if they rebound it. capture binds slot
+    /// `b` to the next key, mouse button, gamepad button or stick the player presses (Escape
+    /// gives up, answered failed), answering the binding as its values when it comes; cancel
+    /// gives a capture up. bind sets slot `b` to the binding in the values, unbind removes slot
+    /// `b`, reset gives the action its defaults back (every action's when `a` is MAX_ACTIONS),
+    /// and bindings answers its bindings. The host keeps the player's bindings with their
+    /// preferences.
+    pub mod input_op {
+        pub const DECLARE: u32 = 0;
+        pub const CAPTURE: u32 = 1;
+        pub const CANCEL: u32 = 2;
+        pub const BIND: u32 = 3;
+        pub const UNBIND: u32 = 4;
+        pub const RESET: u32 = 5;
+        pub const BINDINGS: u32 = 6;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 7] = ["declare", "capture", "cancel", "bind", "unbind", "reset", "bindings"];
+    }
+    /// Where a touch is (the Touch event's phase): put down, moved, lifted, or taken away by
+    /// the system (a gesture it claimed, the window losing the focus).
+    pub mod touch_phase {
+        pub const START: u32 = 0;
+        pub const MOVE: u32 = 1;
+        pub const END: u32 = 2;
+        pub const CANCEL: u32 = 3;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 4] = ["start", "move", "end", "cancel"];
+    }
+    /// Where each number sits in a devtools packets answer's frame: its position; its input's
+    /// events and lanes; its render packet's lanes; its settings (camera, light, sky, quality
+    /// and the rest, one element whose fields a diff counts); its draws, solids, decals,
+    /// sounds, sprites, insets, field patches, interface nodes, service requests, buses and
+    /// voices; and its requests to save, load, save and load the scene, checkpoint, undo, redo
+    /// and exit, a bit each from 1 up.
+    pub mod devtools_packet {
+        pub const POSITION: u32 = 0;
+        pub const EVENTS: u32 = 1;
+        pub const INPUT: u32 = 2;
+        pub const PACKET: u32 = 3;
+        pub const SETTINGS: u32 = 4;
+        pub const DRAWS: u32 = 5;
+        pub const SOLIDS: u32 = 6;
+        pub const DECALS: u32 = 7;
+        pub const SOUNDS: u32 = 8;
+        pub const SPRITES: u32 = 9;
+        pub const INSETS: u32 = 10;
+        pub const FIELDS: u32 = 11;
+        pub const UI: u32 = 12;
+        pub const SERVICES: u32 = 13;
+        pub const BUSES: u32 = 14;
+        pub const VOICES: u32 = 15;
+        pub const REQUESTS: u32 = 16;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 17] = ["position", "events", "input", "packet", "settings", "draws", "solids", "decals", "sounds", "sprites", "insets", "fields", "ui", "services", "buses", "voices", "requests"];
+    }
+    /// How a devtools watch compares a lane of the game's state with its value: equal to it,
+    /// not equal, below it, above it, or (the value ignored) changed from what the lane held
+    /// when the watch started.
+    pub mod devtools_compare {
+        pub const EQUAL: u32 = 0;
+        pub const UNEQUAL: u32 = 1;
+        pub const BELOW: u32 = 2;
+        pub const ABOVE: u32 = 3;
+        pub const CHANGES: u32 = 4;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 5] = ["equal", "unequal", "below", "above", "changes"];
+    }
+    /// The kinds of the game's catalog a devtools assets, preview or swap request names.
+    pub mod devtools_asset {
+        pub const MESH: u32 = 0;
+        pub const MATERIAL: u32 = 1;
+        pub const SOUND: u32 = 2;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 3] = ["mesh", "material", "sound"];
+    }
+    /// Where a catalog asset stands in the host: not asked for yet, loading, ready to use, or
+    /// failed to load (its last good revision, if any, still used).
+    pub mod devtools_asset_state {
+        pub const UNUSED: u32 = 0;
+        pub const LOADING: u32 = 1;
+        pub const READY: u32 = 2;
+        pub const FAILED: u32 = 3;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 4] = ["unused", "loading", "ready", "failed"];
+    }
+    /// The engine's own preferences, the same for every game: the player sets them through the
+    /// host (its options, the platform's settings) or a game's settings (the preferences
+    /// service), and the host keeps them. color_filter is a COLOR_FILTER_* the renderer applies
+    /// to the whole picture, filter_strength how much of it (0 to 1), text_scale how much
+    /// larger the game draws its text (1 to 2) and reduced_motion 1 when the player wants as
+    /// little motion as can be (camera flights, shakes, slides and flashes left out). They
+    /// reach the game as Preference events at index ENGINE_PREFERENCES plus the preference,
+    /// played back as the game's own are.
+    pub mod engine_preference {
+        pub const COLOR_FILTER: u32 = 0;
+        pub const FILTER_STRENGTH: u32 = 1;
+        pub const TEXT_SCALE: u32 = 2;
+        pub const REDUCED_MOTION: u32 = 3;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 4] = ["color_filter", "filter_strength", "text_scale", "reduced_motion"];
+    }
+    /// A colour filter for colour vision deficiency: none, or the colours shifted so that those
+    /// a player without red (protanopia), green (deuteranopia) or blue (tritanopia) cones
+    /// confuses tell apart again; achromatopsia shows the picture in greys of its luminance.
+    pub mod color_filter {
+        pub const NONE: u32 = 0;
+        pub const PROTANOPIA: u32 = 1;
+        pub const DEUTERANOPIA: u32 = 2;
+        pub const TRITANOPIA: u32 = 3;
+        pub const ACHROMATOPSIA: u32 = 4;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 5] = ["none", "protanopia", "deuteranopia", "tritanopia", "achromatopsia"];
+    }
+    /// The engine's preferences (ENGINE_PREFERENCE_*): set stores preference `a` as `b`, which
+    /// the host applies at once and plays back to the game from then on, and answers the value
+    /// it kept (clamped to the preference's range), or failed for a preference or value it does
+    /// not take.
+    pub mod preferences_op {
+        pub const SET: u32 = 0;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 1] = ["set"];
+    }
+    /// The player's language, from the game's string tables (its text.json, and
+    /// locales/TAG.json for each language). text answers the string whose key is the request's
+    /// text in the player's language, laid out to draw left to right (right-to-left scripts
+    /// reordered and Arabic joined), with `a` as its count when `b` is 1 (choosing the plural
+    /// form and filling {count}); value 1 when it reads right to left, unavailable when no
+    /// table has the key; where the text drawn differs from the text read (right to left), its
+    /// values are the text drawn, a 0, then the text in reading order, unshaped, for assistive
+    /// technology. language answers the language in use as a BCP 47 tag, value 1 for a
+    /// right-to-left one. plural answers the plural category (PLURAL_CATEGORY_*) of count `a`
+    /// in it as its value.
+    pub mod locale_op {
+        pub const TEXT: u32 = 0;
+        pub const LANGUAGE: u32 = 1;
+        pub const PLURAL: u32 = 2;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 3] = ["text", "language", "plural"];
+    }
+    /// The plural categories of Unicode's CLDR, which choose a string's form for a count.
+    pub mod plural_category {
+        pub const ZERO: u32 = 0;
+        pub const ONE: u32 = 1;
+        pub const TWO: u32 = 2;
+        pub const FEW: u32 = 3;
+        pub const MANY: u32 = 4;
+        pub const OTHER: u32 = 5;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 6] = ["zero", "one", "two", "few", "many", "other"];
+    }
+    /// What an accessibility audit found: a node assistive technology cannot name (a control or
+    /// an image without a name), a focus problem (a trap: a modal dialog with nothing to focus,
+    /// or the keyboard unable to leave; a focus on a node the tree leaves out; two focused
+    /// nodes), text whose contrast with what lies behind it is below WCAG's 4.5:1 (3:1 for
+    /// large text), or a control smaller than 24 by 24 pixels.
+    pub mod audit_finding {
+        pub const UNNAMED: u32 = 0;
+        pub const FOCUS: u32 = 1;
+        pub const CONTRAST: u32 = 2;
+        pub const SIZE: u32 = 3;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 4] = ["unnamed", "focus", "contrast", "size"];
+    }
+    /// The captions the game's sounds carry (the assets' captions.json, by sound): text answers
+    /// the caption of clip `a` as text, its value the seconds it shows for, or unavailable when
+    /// the clip has none; active answers the captions showing now, newest first, one a line,
+    /// its value how many.
+    pub mod captions_op {
+        pub const TEXT: u32 = 0;
+        pub const ACTIVE: u32 = 1;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 2] = ["text", "active"];
+    }
+    /// Where each number sits at the start of a devtools audio answer: the output's latency in
+    /// milliseconds, from a frame's sound reaching the mixer to it leaving the speakers (-1
+    /// when the host cannot tell); the sample rate; the device's buffer, in samples a callback,
+    /// as asked for or as the system chose (-1 while unknown); the voices and sounds playing,
+    /// and those of them streamed; how often a stream ran dry so far; and how many buses
+    /// follow.
+    pub mod devtools_audio {
+        pub const LATENCY: u32 = 0;
+        pub const RATE: u32 = 1;
+        pub const BUFFER: u32 = 2;
+        pub const VOICES: u32 = 3;
+        pub const STREAMS: u32 = 4;
+        pub const UNDERRUNS: u32 = 5;
+        pub const BUSES: u32 = 6;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 7] = ["latency", "rate", "buffer", "voices", "streams", "underruns", "buses"];
+    }
+    /// Each bus's numbers in a devtools audio answer: its output's peak and RMS on the left and
+    /// right since the last answer, and its state: 1 when a frame uses it, plus 2 when muted,
+    /// plus 4 when soloed.
+    pub mod devtools_bus {
+        pub const PEAK_LEFT: u32 = 0;
+        pub const PEAK_RIGHT: u32 = 1;
+        pub const RMS_LEFT: u32 = 2;
+        pub const RMS_RIGHT: u32 = 3;
+        pub const STATE: u32 = 4;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 5] = ["peak_left", "peak_right", "rms_left", "rms_right", "state"];
+    }
+    /// How a panner's gain falls with distance, as WebAudio's PannerNode distanceModel: linear
+    /// from 1 at ref_distance to 1 - rolloff at max_distance; inverse, ref_distance /
+    /// (ref_distance + rolloff * (distance - ref_distance)); exponential, (distance /
+    /// ref_distance) ^ -rolloff; nearer than ref_distance is 1.
+    pub mod distance_model {
+        pub const LINEAR: u32 = 0;
+        pub const INVERSE: u32 = 1;
+        pub const EXPONENTIAL: u32 = 2;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 3] = ["linear", "inverse", "exponential"];
+    }
+    /// Crash and performance reports for the game's developer, which the player opts into:
+    /// consent answers what the player agreed to as its value, 1 for crash reports plus 2 for
+    /// performance reports (0 for neither, as before they are asked); set_consent sets it to
+    /// `a`, the same sum; queued answers how many reports wait to be sent. Each answers
+    /// unavailable where nothing could be sent (a package whose developer gave no address for
+    /// reports, a checkout, the browser), so that the game offers no choice with nothing behind
+    /// it.
+    pub mod reports_op {
+        pub const CONSENT: u32 = 0;
+        pub const SET_CONSENT: u32 = 1;
+        pub const QUEUED: u32 = 2;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 3] = ["consent", "set_consent", "queued"];
     }
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Vector {
@@ -274,6 +788,52 @@ pub mod types {
         /// Three of an answer's values, in order, after its ServiceAnswer: the request's id,
         /// then the values; lanes past the answer's length are zero.
         ServiceData { request: u32, a: f32, b: f32, c: f32 },
+        /// A gamepad was connected: its number, and 1 if its buttons and axes are laid out as
+        /// the standard gamepad (GAMEPAD_BUTTON_*, GAMEPAD_AXIS_*), 0 if they come in the
+        /// device's own order.
+        GamepadConnected { pad: u32, standard: u32 },
+        /// A gamepad went away: its held buttons and moved axes came back first.
+        GamepadDisconnected { pad: u32 },
+        /// A gamepad button (GAMEPAD_BUTTON_*) changed: the pad, its value from 0 to 1, and 1
+        /// while it is pressed (at half or more).
+        GamepadButton { button: u32, pad: u32, value: f32, pressed: u32 },
+        /// A gamepad axis (GAMEPAD_AXIS_*) moved: the pad and its value from -1 to 1, past the
+        /// stick's dead zone (inside it, 0).
+        GamepadAxis { axis: u32, pad: u32, value: f32 },
+        /// An action the game declared (the input service) changed: which, its value (a
+        /// button's 1 or 0, an axis from -1 to 1) and the device that moved it
+        /// (INPUT_DEVICE_*).
+        Action { action: u32, value: f32, device: u32 },
+        /// A character of text, typed, composed or committed by an input method, one code point
+        /// an event, in order; or with composing 1, one of the composition's characters after
+        /// its Composition event.
+        TextInput { character: u32, composing: u32 },
+        /// An input method's composition (the text being composed, before it is committed)
+        /// changed: its length in code points, which follow as TextInput events with composing
+        /// 1, and the caret's place in it. A length of 0 ends it.
+        Composition { length: u32, cursor: u32 },
+        /// How far the mouse moved while the pointer is locked, unaccelerated where the
+        /// platform allows: the device's counts natively, CSS pixels in a browser.
+        MouseMotion { dx: f32, dy: f32 },
+        /// A touch on the screen, by number (from 0, reused once lifted), where it is in window
+        /// pixels, and its phase (TOUCH_PHASE_*). The first touch down also moves and presses
+        /// the pointer (button 0), for games that only take the pointer.
+        Touch { id: u32, x: f32, y: f32, phase: u32 },
+        /// Touches dragged together: how far their centre moved, in window pixels, and how many
+        /// there are.
+        Pan { touches: u32, dx: f32, dy: f32 },
+        /// Two touches moved apart or together: their centre, in window pixels, and the factor
+        /// their distance grew by since the last Pinch.
+        Pinch { x: f32, y: f32, scale: f32 },
+        /// In a net session (pen's docs/netplay.md) the events after it, up to the next Player,
+        /// are this player's, numbered from 0 up to the players the game declares; every frame
+        /// lists each player in order, events or none. Outside one there are none, and every
+        /// event is player 0's.
+        Player { index: u32 },
+        /// One of the game's own events, which its pen.json `protocol` declares: its tag there,
+        /// and up to three values. Hosts send them only to a game that declares them, whose
+        /// generated pen/extensions.blot decodes them; pen's own bindings leave them out.
+        Game { event: u32, a: f32, b: f32, c: f32 },
     }
     #[derive(Clone, Debug, PartialEq)]
     pub struct Frame {
@@ -491,8 +1051,117 @@ pub mod types {
         /// Seconds it fades out over once frames leave it out.
         pub fade_out: f32,
     }
+    /// A layer of a skinned draw's pose: clip `clip` of the draw's mesh at `time` seconds,
+    /// counting `weight` among the draw's layers.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Pose {
+        /// The draw it poses: its place in the frame's draws.
+        pub draw: u32,
+        /// Which of the mesh's clips, in the order its file lists them; one the mesh lacks
+        /// counts for nothing.
+        pub clip: u32,
+        /// Seconds into the clip, round it as often as need be.
+        pub time: f32,
+        /// How much it counts among its draw's layers: 0 or more.
+        pub weight: f32,
+    }
+    /// A particle emitter: `rate` particles a second, each living `lifetime` seconds, born in a
+    /// ball round `transform`'s origin and flying from it under gravity and drag, sized and
+    /// colored over their lives.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Emitter {
+        /// Its texture (round soft dots without one) and color, which tint every particle.
+        pub material: u32,
+        /// Where particles are born, and how their velocity turns.
+        pub transform: Matrix,
+        /// What its particles' randomness follows from.
+        pub seed: u32,
+        /// Seconds since it began: particles are born `rate` a second from 0 on, each the same
+        /// whatever the frame rate.
+        pub time: f32,
+        /// Seconds it gives birth for; 0 for as long as frames keep it.
+        pub duration: f32,
+        /// Particles born a second.
+        pub rate: f32,
+        /// Seconds each particle lives.
+        pub lifetime: f32,
+        /// Particles are born anywhere in the ball of this radius round the emitter.
+        pub radius: f32,
+        /// Each particle's velocity at birth, in the emitter's space.
+        pub velocity: Vector,
+        /// A random velocity up to this fast, in any direction, added to each at birth.
+        pub spread: f32,
+        /// Acceleration in world space, units a second a second.
+        pub gravity: Vector,
+        /// How fast velocity fades, a share a second: 0 for none.
+        pub drag: f32,
+        /// Particles' width in world units at birth, changing evenly to `size_end` at death.
+        pub size_start: f32,
+        pub size_end: f32,
+        /// Particles' color at birth, changing evenly to `color_end` at death; alpha fades
+        /// them.
+        pub color_start: Color,
+        pub color_end: Color,
+        /// Particles add their light to what is behind them, rather than covering it.
+        pub additive: bool,
+    }
+    /// A point light, or a spot light shining along `direction` within a cone, lighting what
+    /// lies within `radius` of `position`.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Light {
+        pub position: Vector,
+        /// How far it reaches: its light falls smoothly to nothing there.
+        pub radius: f32,
+        /// Its color times its intensity.
+        pub color: Vector,
+        /// The way a spot light shines, a unit vector; a point light's is ignored.
+        pub direction: Vector,
+        /// The cosine of the half-angle within which a spot light is at full strength.
+        pub inner: f32,
+        /// The cosine of the half-angle of a spot light's cone, where its light ends; -1 for a
+        /// point light, which shines all round.
+        pub outer: f32,
+    }
+    /// A listener: where it is, the way it faces and its up, in world units.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Listener {
+        pub position: Vector,
+        /// The way it faces.
+        pub forward: Vector,
+        /// Its up, which with `forward` tells left from right.
+        pub up: Vector,
+    }
+    /// Where a voice or sound is, as a PannerNode places it: from the listener, equal-power
+    /// panned by its azimuth (in place of its pan), and quieted by its distance model and its
+    /// cone. Positions and orientations glide as gains do (AUDIO_GLIDE_MS); the rest change at
+    /// once. A voice that gains or loses its panner starts afresh, as one whose bus changed; a
+    /// panner that places nothing is ignored, and of two for one voice or sound hosts take the
+    /// first.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Panner {
+        /// The voice it places, by id, or 0 for a sound.
+        pub voice: u32,
+        /// With `voice` 0, the sound it places, by its place in the frame's `sounds`.
+        pub sound: u32,
+        pub position: Vector,
+        /// The way its cone faces; zero for none, heard alike from every side.
+        pub orientation: Vector,
+        /// How its gain falls with distance (DISTANCE_MODEL_*).
+        pub distance_model: u32,
+        /// Within it, distance does not quiet it.
+        pub ref_distance: f32,
+        /// Beyond it, the linear model quiets it no further.
+        pub max_distance: f32,
+        /// How fast distance quiets it.
+        pub rolloff: f32,
+        /// The angle, in degrees, of the cone it is heard whole within.
+        pub cone_inner: f32,
+        /// The angle, in degrees, beyond which it is heard at cone_outer_gain.
+        pub cone_outer: f32,
+        pub cone_outer_gain: f32,
+    }
     /// How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture
-    /// filtering, ambient occlusion, a sky, screen effects and bloom.
+    /// filtering, ambient occlusion, a sky, screen effects, bloom and temporal antialiasing.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Quality {
         /// Samples per pixel: 1 or 4.
@@ -505,6 +1174,9 @@ pub mod types {
         pub sky: bool,
         pub effects: bool,
         pub bloom: bool,
+        /// Temporal antialiasing: each frame's samples move within their pixels and blend with
+        /// the frames before, followed through the camera's motion.
+        pub taa: bool,
     }
     /// The sky's colors and the way toward the sun or moon.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -539,6 +1211,12 @@ pub mod types {
         pub cover: f32,
         pub drift: Drift,
     }
+    /// One of the game's own sections: its tag, from its declaration, and its lanes.
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct Extension {
+        pub tag: u32,
+        pub values: Vec<f32>,
+    }
     /// The game's frame: what to draw and play, and what to do.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct RenderFrame {
@@ -562,7 +1240,8 @@ pub mod types {
         /// other way, on the surfaces whose material asks for it.
         pub aberration: Aberration,
         /// How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture
-        /// filtering, ambient occlusion, a sky, screen effects and bloom.
+        /// filtering, ambient occlusion, a sky, screen effects, bloom and temporal
+        /// antialiasing.
         pub quality: Quality,
         /// The sky's colors and the way toward the sun or moon.
         pub sky: Sky,
@@ -590,8 +1269,8 @@ pub mod types {
         pub sounds: Vec<Sound>,
         pub sprites: Vec<Sprite>,
         pub insets: Vec<Inset>,
-        /// The player's preferences to store, when they changed; the host plays them back as
-        /// Preference events when the game starts.
+        /// The player's preferences to store, when they changed, as many as the game keeps; the
+        /// host plays them back as Preference events when the game starts.
         pub preferences: Option<Vec<f32>>,
         /// Patches of the values the host keeps for some materials.
         pub fields: Vec<FieldPatch>,
@@ -609,11 +1288,35 @@ pub mod types {
         /// The voices the game keeps playing, every frame, whole: hosts start, fade out and
         /// glide them by id.
         pub voices: Vec<Voice>,
+        /// The layers of skinned draws' poses: each samples one of its draw's mesh's clips at a
+        /// time, and a draw's layers blend by their weights. A draw is posed when it has
+        /// layers, its mesh a skin and its material's shader a `vertex_skinned` entry point;
+        /// the host works out its joints' matrices and draws it alone.
+        pub poses: Vec<Pose>,
+        /// Particle emitters, which hosts simulate on the GPU from each emitter's own clock and
+        /// seed: every particle's path follows from them, so a frame's particles depend on that
+        /// frame's emitters alone.
+        pub emitters: Vec<Emitter>,
+        /// Point and spot lights beside the sun. The renderer sorts them into clusters of the
+        /// view, which the shaders of lit materials read (pen-render's lights.wgsl).
+        pub lights: Vec<Light>,
+        /// Where the panners are heard from, as WebAudio's AudioListener: none, the camera
+        /// (`view`'s eye, facing where it looks, its up the view's), or one listener.
+        pub listener: Vec<Listener>,
+        /// Voices and sounds heard from somewhere in the world, as WebAudio's PannerNode
+        /// (equal-power panning) places them relative to the listener; the rest play as they
+        /// are.
+        pub panners: Vec<Panner>,
+        /// The game's own sections, which its pen.json `protocol` declares, after the rest of
+        /// the packet: a marker, their count, then each one's tag, length and values. A packet
+        /// without any ends before the marker.
+        pub extensions: Vec<Extension>,
     }
 }
 
 /// The packets' layout: constants, the input packet encoder and the render
-/// packet decoder.
+/// packet decoder; and the packets' canonical walks, which tests compare across
+/// languages.
 pub mod codec {
     use anyhow::{Result, bail, ensure};
 
@@ -667,7 +1370,40 @@ pub mod codec {
     /// A lowpass cutoff, in Hz, at or above which a filter is open; hosts also leave one open
     /// at or above half their sample rate.
     pub const AUDIO_OPEN: usize = 24000;
+    /// The most pose layers one frame may have.
+    pub const MAX_POSES: usize = 65536;
+    /// The most particle emitters one frame may have.
+    pub const MAX_EMITTERS: usize = 1024;
+    /// The most particles one emitter has alive at once (its rate times its lifetime, rounded
+    /// up); hosts leave out the rest.
+    pub const MAX_PARTICLES: usize = 65536;
+    /// The most of a game's own sections one frame may carry.
+    pub const MAX_EXTENSIONS: usize = 64;
+    /// A game's own sections and events are numbered from 1 to this.
+    pub const MAX_EXTENSION_TAG: usize = 65535;
+    /// The most lanes one of a game's own sections may carry.
+    pub const MAX_EXTENSION_LANES: usize = 1048576;
+    /// Gamepads connected at once that the game hears of: pads are numbered from 0 to one less
+    /// than this.
+    pub const MAX_GAMEPADS: usize = 16;
+    /// Actions a game declares (the input service's declare): they are numbered from 0 to one
+    /// less than this.
+    pub const MAX_ACTIONS: usize = 256;
+    /// Bindings one action holds, its defaults and the player's alike.
+    pub const MAX_ACTION_BINDINGS: usize = 8;
+    /// Touches down at once that the game hears of: they are numbered from 0 to one less than
+    /// this.
+    pub const MAX_TOUCHES: usize = 32;
+    /// The most point and spot lights one frame may have.
+    pub const MAX_LIGHTS: usize = 4096;
+    /// Preference events from this index on carry the engine's preferences
+    /// (ENGINE_PREFERENCE_*); below it, the game's own.
+    pub const ENGINE_PREFERENCES: usize = 64;
+    /// The most panners one frame may declare: one for each voice and sound it may have.
+    pub const MAX_PANNERS: usize = 512;
     pub const PACKET_MAGIC: f32 = 0x474446 as f32;
+    /// The lane that starts a packet's block of the game's own sections.
+    pub const EXTENSIONS_MARKER: f32 = 0x504558 as f32;
     /// The render packet header: magic, schema, state_count, draw_count, solid_count,
     /// solid_lanes, decal_count, sound_count, sprite_count, inset_count, inset_draw_count,
     /// preference_count, save_requested, load_requested, scene_save_requested,
@@ -678,8 +1414,9 @@ pub mod codec {
     /// sky.sun3, sky.night, fog.radius, fog.density, fog.height, shadow.view16,
     /// shadow.projection16, shadow.texel, shadow.texels, blur, quality.bloom, clouds.cover,
     /// clouds.drift2, hide_cursor, field_count, field_lanes, ui_count, ui_lanes, service_count,
-    /// service_lanes, bus_count, voice_count.
-    pub const PACKET_HEADER_FLOATS: usize = 138;
+    /// service_lanes, bus_count, voice_count, pose_count, emitter_count, quality.taa,
+    /// light_count, listener_count, panner_count.
+    pub const PACKET_HEADER_FLOATS: usize = 144;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -700,7 +1437,7 @@ pub mod codec {
     /// light_color3, draws count, pixel_size.
     pub const INSET_FLOATS: usize = 47;
     /// Lanes: preferences lanes.
-    pub const PREFERENCE_FLOATS: usize = 14;
+    pub const PREFERENCE_FLOATS: usize = 256;
     /// Lanes: material, width, height, x, z, columns, rows, before a field's values.
     pub const FIELD_FLOATS: usize = 7;
     /// Lanes: id, parent, role, x, y, width, height, focusable, focused, disabled, hidden,
@@ -714,6 +1451,18 @@ pub mod codec {
     /// Lanes: id, clip, bus, gain, pan, pitch, lowpass, reverb, looping, start, fade_in,
     /// fade_out.
     pub const VOICE_FLOATS: usize = 12;
+    /// Lanes: draw, clip, time, weight.
+    pub const POSE_FLOATS: usize = 4;
+    /// Lanes: material, transform16, seed, time, duration, rate, lifetime, radius, velocity3,
+    /// spread, gravity3, drag, size_start, size_end, color_start4, color_end4, additive.
+    pub const EMITTER_FLOATS: usize = 42;
+    /// Lanes: position3, radius, color3, direction3, inner, outer.
+    pub const LIGHT_FLOATS: usize = 12;
+    /// Lanes: position3, forward3, up3.
+    pub const LISTENER_FLOATS: usize = 9;
+    /// Lanes: voice, sound, position3, orientation3, distance_model, ref_distance,
+    /// max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain.
+    pub const PANNER_FLOATS: usize = 15;
     /// Where each header lane and record field starts; an optional field's lanes
     /// follow its count.
     pub mod lanes {
@@ -777,6 +1526,12 @@ pub mod codec {
             pub const SERVICE_LANES: usize = 135;
             pub const BUS_COUNT: usize = 136;
             pub const VOICE_COUNT: usize = 137;
+            pub const POSE_COUNT: usize = 138;
+            pub const EMITTER_COUNT: usize = 139;
+            pub const QUALITY_TAA: usize = 140;
+            pub const LIGHT_COUNT: usize = 141;
+            pub const LISTENER_COUNT: usize = 142;
+            pub const PANNER_COUNT: usize = 143;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -849,6 +1604,57 @@ pub mod codec {
             pub const FADE_IN: usize = 10;
             pub const FADE_OUT: usize = 11;
         }
+        pub mod pose {
+            pub const DRAW: usize = 0;
+            pub const CLIP: usize = 1;
+            pub const TIME: usize = 2;
+            pub const WEIGHT: usize = 3;
+        }
+        pub mod emitter {
+            pub const MATERIAL: usize = 0;
+            pub const TRANSFORM: usize = 1;
+            pub const SEED: usize = 17;
+            pub const TIME: usize = 18;
+            pub const DURATION: usize = 19;
+            pub const RATE: usize = 20;
+            pub const LIFETIME: usize = 21;
+            pub const RADIUS: usize = 22;
+            pub const VELOCITY: usize = 23;
+            pub const SPREAD: usize = 26;
+            pub const GRAVITY: usize = 27;
+            pub const DRAG: usize = 30;
+            pub const SIZE_START: usize = 31;
+            pub const SIZE_END: usize = 32;
+            pub const COLOR_START: usize = 33;
+            pub const COLOR_END: usize = 37;
+            pub const ADDITIVE: usize = 41;
+        }
+        pub mod light {
+            pub const POSITION: usize = 0;
+            pub const RADIUS: usize = 3;
+            pub const COLOR: usize = 4;
+            pub const DIRECTION: usize = 7;
+            pub const INNER: usize = 10;
+            pub const OUTER: usize = 11;
+        }
+        pub mod listener {
+            pub const POSITION: usize = 0;
+            pub const FORWARD: usize = 3;
+            pub const UP: usize = 6;
+        }
+        pub mod panner {
+            pub const VOICE: usize = 0;
+            pub const SOUND: usize = 1;
+            pub const POSITION: usize = 2;
+            pub const ORIENTATION: usize = 5;
+            pub const DISTANCE_MODEL: usize = 8;
+            pub const REF_DISTANCE: usize = 9;
+            pub const MAX_DISTANCE: usize = 10;
+            pub const ROLLOFF: usize = 11;
+            pub const CONE_INNER: usize = 12;
+            pub const CONE_OUTER: usize = 13;
+            pub const CONE_OUTER_GAIN: usize = 14;
+        }
         pub mod solid {
             pub const FACES: usize = 0;
         }
@@ -914,6 +1720,19 @@ pub mod codec {
         pub const UI_ACTION: u32 = 12;
         pub const SERVICE_ANSWER: u32 = 13;
         pub const SERVICE_DATA: u32 = 14;
+        pub const GAMEPAD_CONNECTED: u32 = 15;
+        pub const GAMEPAD_DISCONNECTED: u32 = 16;
+        pub const GAMEPAD_BUTTON: u32 = 17;
+        pub const GAMEPAD_AXIS: u32 = 18;
+        pub const ACTION: u32 = 19;
+        pub const TEXT_INPUT: u32 = 20;
+        pub const COMPOSITION: u32 = 21;
+        pub const MOUSE_MOTION: u32 = 22;
+        pub const TOUCH: u32 = 23;
+        pub const PAN: u32 = 24;
+        pub const PINCH: u32 = 25;
+        pub const PLAYER: u32 = 26;
+        pub const GAME: u32 = 100;
     }
 
     pub fn validate_state(state: &[f32]) -> Result<()> {
@@ -950,10 +1769,19 @@ pub mod codec {
             "PageDown" => 0x11010a,
             "Home" => 0x11010b,
             "End" => 0x11010c,
+            "Insert" => 0x11010d,
+            "F1" => 0x110201,
             "F2" => 0x110202,
+            "F3" => 0x110203,
+            "F4" => 0x110204,
+            "F5" => 0x110205,
             "F6" => 0x110206,
+            "F7" => 0x110207,
+            "F8" => 0x110208,
             "F9" => 0x110209,
             "F10" => 0x11020a,
+            "F11" => 0x11020b,
+            "F12" => 0x11020c,
             "Shift" => 0x110300,
             "Control" => 0x110301,
             "Alt" => 0x110302,
@@ -993,6 +1821,19 @@ pub mod codec {
             GameEvent::UiAction { node, action, value } => [12.0, *action as f32, *node as f32, *value, 0.0],
             GameEvent::ServiceAnswer { request, status, value, length } => [13.0, *status as f32, *request as f32, *value, *length as f32],
             GameEvent::ServiceData { request, a, b, c } => [14.0, *request as f32, *a, *b, *c],
+            GameEvent::GamepadConnected { pad, standard } => [15.0, *pad as f32, *standard as f32, 0.0, 0.0],
+            GameEvent::GamepadDisconnected { pad } => [16.0, *pad as f32, 0.0, 0.0, 0.0],
+            GameEvent::GamepadButton { button, pad, value, pressed } => [17.0, *button as f32, *pad as f32, *value, *pressed as f32],
+            GameEvent::GamepadAxis { axis, pad, value } => [18.0, *axis as f32, *pad as f32, *value, 0.0],
+            GameEvent::Action { action, value, device } => [19.0, *action as f32, *value, *device as f32, 0.0],
+            GameEvent::TextInput { character, composing } => [20.0, *character as f32, *composing as f32, 0.0, 0.0],
+            GameEvent::Composition { length, cursor } => [21.0, *length as f32, *cursor as f32, 0.0, 0.0],
+            GameEvent::MouseMotion { dx, dy } => [22.0, 0.0, *dx, *dy, 0.0],
+            GameEvent::Touch { id, x, y, phase } => [23.0, *id as f32, *x, *y, *phase as f32],
+            GameEvent::Pan { touches, dx, dy } => [24.0, *touches as f32, *dx, *dy, 0.0],
+            GameEvent::Pinch { x, y, scale } => [25.0, 0.0, *x, *y, *scale],
+            GameEvent::Player { index } => [26.0, *index as f32, 0.0, 0.0, 0.0],
+            GameEvent::Game { event, a, b, c } => [100.0, *event as f32, *a, *b, *c],
         }
     }
 
@@ -1062,12 +1903,14 @@ pub mod codec {
 
         #[inline]
         fn mesh_at(&self, index: usize) -> Result<u32> {
-            Ok(self.count(index, self.catalog.meshes.len().saturating_sub(1))? as u32)
+            ensure!(!self.catalog.meshes.is_empty(), "game drew a mesh with no meshes in the catalog");
+            Ok(self.count(index, self.catalog.meshes.len() - 1)? as u32)
         }
 
         #[inline]
         fn material_at(&self, index: usize) -> Result<u32> {
-            Ok(self.count(index, self.catalog.materials.len().saturating_sub(1))? as u32)
+            ensure!(!self.catalog.materials.is_empty(), "game used a material with no materials in the catalog");
+            Ok(self.count(index, self.catalog.materials.len() - 1)? as u32)
         }
 
         #[inline]
@@ -1184,6 +2027,72 @@ pub mod codec {
             *voice = Voice { id: id as u32, clip, bus: bus as u32, gain, pan, pitch, lowpass, reverb, looping, start, fade_in, fade_out };
             Ok(())
         }
+
+        fn decode_pose(&mut self, lane: usize, pose: &mut Pose) -> Result<()> {
+            let draw = self.count(lane, MAX_DRAWS)?;
+            let clip = self.count(lane + 1, 65535)?;
+            let time = self.packet[lane + 2];
+            let weight = self.packet[lane + 3];
+            *pose = Pose { draw: draw as u32, clip: clip as u32, time, weight };
+            Ok(())
+        }
+
+        fn decode_emitter(&mut self, lane: usize, emitter: &mut Emitter) -> Result<()> {
+            let material = self.material_at(lane)?;
+            let transform = self.matrix(lane + 1);
+            let seed = self.count(lane + 17, 16777215)?;
+            let time = self.packet[lane + 18];
+            let duration = self.packet[lane + 19];
+            let rate = self.packet[lane + 20];
+            let lifetime = self.packet[lane + 21];
+            let radius = self.packet[lane + 22];
+            let velocity = Vector { x: self.packet[lane + 23], y: self.packet[lane + 24], z: self.packet[lane + 25] };
+            let spread = self.packet[lane + 26];
+            let gravity = Vector { x: self.packet[lane + 27], y: self.packet[lane + 28], z: self.packet[lane + 29] };
+            let drag = self.packet[lane + 30];
+            let size_start = self.packet[lane + 31];
+            let size_end = self.packet[lane + 32];
+            let color_start = Color { r: self.packet[lane + 33], g: self.packet[lane + 34], b: self.packet[lane + 35], a: self.packet[lane + 36] };
+            let color_end = Color { r: self.packet[lane + 37], g: self.packet[lane + 38], b: self.packet[lane + 39], a: self.packet[lane + 40] };
+            let additive = self.flag(lane + 41)?;
+            *emitter = Emitter { material, transform, seed: seed as u32, time, duration, rate, lifetime, radius, velocity, spread, gravity, drag, size_start, size_end, color_start, color_end, additive };
+            Ok(())
+        }
+
+        fn decode_light(&mut self, lane: usize, light: &mut Light) -> Result<()> {
+            let position = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
+            let radius = self.packet[lane + 3];
+            let color = Vector { x: self.packet[lane + 4], y: self.packet[lane + 5], z: self.packet[lane + 6] };
+            let direction = Vector { x: self.packet[lane + 7], y: self.packet[lane + 8], z: self.packet[lane + 9] };
+            let inner = self.packet[lane + 10];
+            let outer = self.packet[lane + 11];
+            *light = Light { position, radius, color, direction, inner, outer };
+            Ok(())
+        }
+
+        fn decode_listener(&mut self, lane: usize, listener: &mut Listener) -> Result<()> {
+            let position = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
+            let forward = Vector { x: self.packet[lane + 3], y: self.packet[lane + 4], z: self.packet[lane + 5] };
+            let up = Vector { x: self.packet[lane + 6], y: self.packet[lane + 7], z: self.packet[lane + 8] };
+            *listener = Listener { position, forward, up };
+            Ok(())
+        }
+
+        fn decode_panner(&mut self, lane: usize, panner: &mut Panner) -> Result<()> {
+            let voice = self.count(lane, MAX_VOICE_ID)?;
+            let sound = self.count(lane + 1, 255)?;
+            let position = Vector { x: self.packet[lane + 2], y: self.packet[lane + 3], z: self.packet[lane + 4] };
+            let orientation = Vector { x: self.packet[lane + 5], y: self.packet[lane + 6], z: self.packet[lane + 7] };
+            let distance_model = self.count(lane + 8, 2)?;
+            let ref_distance = self.packet[lane + 9];
+            let max_distance = self.packet[lane + 10];
+            let rolloff = self.packet[lane + 11];
+            let cone_inner = self.packet[lane + 12];
+            let cone_outer = self.packet[lane + 13];
+            let cone_outer_gain = self.packet[lane + 14];
+            *panner = Panner { voice: voice as u32, sound: sound as u32, position, orientation, distance_model: distance_model as u32, ref_distance, max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain };
+            Ok(())
+        }
     }
 
     /// Decodes a render packet. The game's frame: what to draw and play, and what to do. With
@@ -1225,7 +2134,6 @@ pub mod codec {
         let insets_count = reader.count(9, MAX_INSETS)?;
         let inset_draws_count = reader.count(10, MAX_DRAWS)?;
         let preferences_lanes = reader.count(11, PREFERENCE_FLOATS)?;
-        ensure!(preferences_lanes == 0 || preferences_lanes == 14, "game returned partial preferences");
         let fields_count = reader.count(130, MAX_FIELD_PATCHES)?;
         let fields_lanes = reader.count(131, 16805888)?;
         let ui_count = reader.count(132, MAX_UI_NODES)?;
@@ -1234,6 +2142,11 @@ pub mod codec {
         let services_lanes = reader.count(135, 4196352)?;
         let buses_count = reader.count(136, MAX_BUSES)?;
         let voices_count = reader.count(137, MAX_VOICES)?;
+        let poses_count = reader.count(138, MAX_POSES)?;
+        let emitters_count = reader.count(139, MAX_EMITTERS)?;
+        let lights_count = reader.count(141, MAX_LIGHTS)?;
+        let listener_count = reader.count(142, 1)?;
+        let panners_count = reader.count(143, MAX_PANNERS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -1263,9 +2176,19 @@ pub mod codec {
         let buses_end = buses_start + buses_count * BUS_FLOATS;
         let voices_start = buses_end;
         let voices_end = voices_start + voices_count * VOICE_FLOATS;
-        let extras_start = voices_end;
+        let poses_start = voices_end;
+        let poses_end = poses_start + poses_count * POSE_FLOATS;
+        let emitters_start = poses_end;
+        let emitters_end = emitters_start + emitters_count * EMITTER_FLOATS;
+        let lights_start = emitters_end;
+        let lights_end = lights_start + lights_count * LIGHT_FLOATS;
+        let listener_start = lights_end;
+        let listener_end = listener_start + listener_count * LISTENER_FLOATS;
+        let panners_start = listener_end;
+        let panners_end = panners_start + panners_count * PANNER_FLOATS;
+        let extras_start = panners_end;
         let truncated = "game returned a truncated, oversized or nonfinite frame";
-        ensure!(packet.len() >= voices_end && packet.iter().all(|value| value.is_finite()), truncated);
+        ensure!(packet.len() >= panners_end && packet.iter().all(|value| value.is_finite()), truncated);
         // What the records' tails claim of extras, in order.
         let mut extras_lanes = 0;
         for index in 0..draws_count {
@@ -1275,7 +2198,28 @@ pub mod codec {
             extras_lanes += reader.count(inset_draws_start + index * DRAW_FLOATS + 23, MAX_DRAW_EXTRA)? * 4;
         }
         let extras_end = extras_start + extras_lanes;
-        ensure!(packet.len() == extras_end, truncated);
+        // The game's own sections, after the rest: the marker, their count, then each
+        // one's tag, length and values.
+        let mut extensions = std::mem::take(&mut frame.extensions);
+        extensions.clear();
+        let mut extensions_end = extras_end;
+        if packet.len() > extensions_end {
+            // Lanes past the end that are no block are an oversized packet.
+            ensure!(packet.len() >= extensions_end + 2 && packet[extensions_end] == EXTENSIONS_MARKER, truncated);
+            let invalid = "game returned invalid extension sections";
+            let count = reader.count(extensions_end + 1, MAX_EXTENSIONS)?;
+            extensions_end += 2;
+            for _ in 0..count {
+                ensure!(packet.len() >= extensions_end + 2, invalid);
+                let tag = reader.count(extensions_end, MAX_EXTENSION_TAG)?;
+                let length = reader.count(extensions_end + 1, MAX_EXTENSION_LANES)?;
+                let first = extensions_end + 2;
+                ensure!(tag >= 1 && packet.len() >= first + length, invalid);
+                extensions.push(Extension { tag: tag as u32, values: packet[first..first + length].to_vec() });
+                extensions_end = first + length;
+            }
+        }
+        ensure!(packet.len() == extensions_end, truncated);
         reader.inset_draws_at = inset_draws_start;
         reader.inset_draws_end = inset_draws_end;
         reader.extras_at = extras_start;
@@ -1319,6 +2263,7 @@ pub mod codec {
         let clouds_cover = reader.packet[126];
         let clouds_drift = Drift { x: reader.packet[127], z: reader.packet[128] };
         let hide_cursor = reader.flag(129)?;
+        let quality_taa = reader.flag(140)?;
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -1428,7 +2373,7 @@ pub mod codec {
         for service_request in services.iter_mut() {
             ensure!(service_lane + SERVICE_REQUEST_FLOATS <= services_end, "game returned truncated service requests");
             let request = reader.count(service_lane, MAX_SERVICE_ID)?;
-            let service = reader.count(service_lane + 1, 5)?;
+            let service = reader.count(service_lane + 1, 14)?;
             let operation = reader.count(service_lane + 2, MAX_SERVICE_OPERATION)?;
             let a = reader.packet[service_lane + 3];
             let b = reader.packet[service_lane + 4];
@@ -1453,6 +2398,31 @@ pub mod codec {
         for (index, voice) in voices.iter_mut().enumerate() {
             reader.decode_voice(voices_start + index * VOICE_FLOATS, voice)?;
         }
+        let mut poses = std::mem::take(&mut frame.poses);
+        resize(&mut poses, poses_count);
+        for (index, pose) in poses.iter_mut().enumerate() {
+            reader.decode_pose(poses_start + index * POSE_FLOATS, pose)?;
+        }
+        let mut emitters = std::mem::take(&mut frame.emitters);
+        resize(&mut emitters, emitters_count);
+        for (index, emitter) in emitters.iter_mut().enumerate() {
+            reader.decode_emitter(emitters_start + index * EMITTER_FLOATS, emitter)?;
+        }
+        let mut lights = std::mem::take(&mut frame.lights);
+        resize(&mut lights, lights_count);
+        for (index, light) in lights.iter_mut().enumerate() {
+            reader.decode_light(lights_start + index * LIGHT_FLOATS, light)?;
+        }
+        let mut listener = std::mem::take(&mut frame.listener);
+        resize(&mut listener, listener_count);
+        for (index, listener) in listener.iter_mut().enumerate() {
+            reader.decode_listener(listener_start + index * LISTENER_FLOATS, listener)?;
+        }
+        let mut panners = std::mem::take(&mut frame.panners);
+        resize(&mut panners, panners_count);
+        for (index, panner) in panners.iter_mut().enumerate() {
+            reader.decode_panner(panners_start + index * PANNER_FLOATS, panner)?;
+        }
         *frame = RenderFrame {
             save_requested,
             load_requested,
@@ -1469,7 +2439,7 @@ pub mod codec {
             light_direction,
             light_color,
             aberration,
-            quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom },
+            quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa },
             sky: Sky { zenith: sky_zenith, horizon: sky_horizon, ground: sky_ground, sun: sky_sun, night: sky_night },
             fog: Fog { radius: fog_radius, density: fog_density, height: fog_height },
             shadow: Shadow { view: shadow_view, projection: shadow_projection, texel: shadow_texel, texels: shadow_texels as u32 },
@@ -1488,6 +2458,12 @@ pub mod codec {
             services,
             buses,
             voices,
+            poses,
+            emitters,
+            lights,
+            listener,
+            panners,
+            extensions,
         };
         Ok(&packet[state_start..state_end])
     }
@@ -1509,5 +2485,307 @@ pub mod codec {
     /// `lanes`, in `values`'s allocation, or None when there are none.
     fn copy_optional(values: Option<Vec<f32>>, lanes: &[f32]) -> Option<Vec<f32>> {
         (!lanes.is_empty()).then(|| copy(values.unwrap_or_default(), lanes))
+    }
+
+    /// The walk of an input packet's values that pen's tests compare with the game's
+    /// (`pen/protocol_canonical.blot`): elapsed, the viewport's width and height, the events'
+    /// count, each event's tag and then its fields in the schema's order (a key as its code),
+    /// then the state's count and lanes. It lays nothing out as the packet does.
+    pub fn canonical_input(frame: &Frame, elapsed: f64, state: &[f32]) -> Vec<f32> {
+        let viewport = frame.viewport;
+        let mut out = vec![elapsed as f32, viewport.width as f32, viewport.height as f32, frame.events.len() as f32];
+        for event in &frame.events {
+            match event {
+                GameEvent::KeyDown(value) => out.extend([1.0, key_code(value)]),
+                GameEvent::KeyUp(value) => out.extend([2.0, key_code(value)]),
+                GameEvent::PointerDown { button, x, y } => out.extend([3.0, *button as f32, *x, *y]),
+                GameEvent::PointerUp { button, x, y } => out.extend([4.0, *button as f32, *x, *y]),
+                GameEvent::PointerMove { x, y } => out.extend([5.0, *x, *y]),
+                GameEvent::Wheel { x, y, delta } => out.extend([6.0, *x, *y, *delta]),
+                GameEvent::FocusLost => out.push(7.0),
+                GameEvent::AssetReady { .. } => out.push(8.0),
+                GameEvent::AssetFailed { .. } => out.push(8.0),
+                GameEvent::Console { command, argument } => out.extend([9.0, *command, *argument]),
+                GameEvent::Preference { index, value } => out.extend([10.0, *index, *value]),
+                GameEvent::Tune { index, value } => out.extend([11.0, *index as f32, *value]),
+                GameEvent::UiAction { node, action, value } => out.extend([12.0, *node as f32, *action as f32, *value]),
+                GameEvent::ServiceAnswer { request, status, value, length } => out.extend([13.0, *request as f32, *status as f32, *value, *length as f32]),
+                GameEvent::ServiceData { request, a, b, c } => out.extend([14.0, *request as f32, *a, *b, *c]),
+                GameEvent::GamepadConnected { pad, standard } => out.extend([15.0, *pad as f32, *standard as f32]),
+                GameEvent::GamepadDisconnected { pad } => out.extend([16.0, *pad as f32]),
+                GameEvent::GamepadButton { button, pad, value, pressed } => out.extend([17.0, *button as f32, *pad as f32, *value, *pressed as f32]),
+                GameEvent::GamepadAxis { axis, pad, value } => out.extend([18.0, *axis as f32, *pad as f32, *value]),
+                GameEvent::Action { action, value, device } => out.extend([19.0, *action as f32, *value, *device as f32]),
+                GameEvent::TextInput { character, composing } => out.extend([20.0, *character as f32, *composing as f32]),
+                GameEvent::Composition { length, cursor } => out.extend([21.0, *length as f32, *cursor as f32]),
+                GameEvent::MouseMotion { dx, dy } => out.extend([22.0, *dx, *dy]),
+                GameEvent::Touch { id, x, y, phase } => out.extend([23.0, *id as f32, *x, *y, *phase as f32]),
+                GameEvent::Pan { touches, dx, dy } => out.extend([24.0, *touches as f32, *dx, *dy]),
+                GameEvent::Pinch { x, y, scale } => out.extend([25.0, *x, *y, *scale]),
+                GameEvent::Player { index } => out.extend([26.0, *index as f32]),
+                GameEvent::Game { event, a, b, c } => out.extend([100.0, *event as f32, *a, *b, *c]),
+            }
+        }
+        out.push(state.len() as f32);
+        out.extend_from_slice(state);
+        out
+    }
+
+    /// The walk of a render packet's values that pen's tests compare with the game's
+    /// (`pen/protocol_canonical.blot`): the header's values and then the sections, each in the
+    /// schema's order, as described in pen-codegen's canonical.rs. It takes the schema and
+    /// the state, which the frame does not hold, where the packet has them.
+    pub fn canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> Vec<f32> {
+        let mut out = Vec::new();
+        out.extend([
+            schema as f32, f32::from(frame.save_requested), f32::from(frame.load_requested),
+            f32::from(frame.scene_save_requested), f32::from(frame.scene_load_requested),
+            f32::from(frame.checkpoint_requested), f32::from(frame.undo_requested),
+            f32::from(frame.redo_requested), f32::from(frame.exit_requested),
+        ]);
+        out.extend_from_slice(&frame.view);
+        out.extend_from_slice(&frame.projection);
+        out.extend([
+            frame.clear.r, frame.clear.g, frame.clear.b, frame.clear.a, frame.ambient.x, frame.ambient.y,
+            frame.ambient.z, frame.light_direction.x, frame.light_direction.y, frame.light_direction.z,
+            frame.light_color.x, frame.light_color.y, frame.light_color.z, frame.aberration.x,
+            frame.aberration.y, frame.quality.msaa as f32, f32::from(frame.quality.fxaa), frame.quality.scale,
+            frame.quality.filtering as f32, f32::from(frame.quality.occlusion), f32::from(frame.quality.sky),
+            f32::from(frame.quality.effects), f32::from(frame.quality.bloom), f32::from(frame.quality.taa),
+            frame.sky.zenith.x, frame.sky.zenith.y, frame.sky.zenith.z, frame.sky.horizon.x, frame.sky.horizon.y,
+            frame.sky.horizon.z, frame.sky.ground.x, frame.sky.ground.y, frame.sky.ground.z, frame.sky.sun.x,
+            frame.sky.sun.y, frame.sky.sun.z, frame.sky.night, frame.fog.radius, frame.fog.density,
+            frame.fog.height,
+        ]);
+        out.extend_from_slice(&frame.shadow.view);
+        out.extend_from_slice(&frame.shadow.projection);
+        out.extend([
+            frame.shadow.texel, frame.shadow.texels as f32, frame.blur, frame.clouds.cover, frame.clouds.drift.x,
+            frame.clouds.drift.z, f32::from(frame.hide_cursor), state.len() as f32,
+        ]);
+        out.extend_from_slice(state);
+        out.push(frame.draws.len() as f32);
+        for draw in &frame.draws {
+            canonical_draw(&mut out, draw);
+        }
+        out.push(frame.solids.len() as f32);
+        for solid in &frame.solids {
+            canonical_solid(&mut out, solid);
+        }
+        out.push(frame.decals.len() as f32);
+        for decal in &frame.decals {
+            canonical_decal(&mut out, decal);
+        }
+        out.push(frame.sounds.len() as f32);
+        for sound in &frame.sounds {
+            canonical_sound(&mut out, sound);
+        }
+        out.push(frame.sprites.len() as f32);
+        for sprite in &frame.sprites {
+            canonical_sprite(&mut out, sprite);
+        }
+        out.push(frame.insets.len() as f32);
+        for inset in &frame.insets {
+            canonical_inset(&mut out, inset);
+        }
+        match &frame.preferences {
+            Some(values) => {
+                out.extend([1.0, values.len() as f32]);
+                out.extend_from_slice(values);
+            }
+            None => out.push(0.0),
+        }
+        out.push(frame.fields.len() as f32);
+        for field_patch in &frame.fields {
+            canonical_field_patch(&mut out, field_patch);
+        }
+        out.push(frame.ui.len() as f32);
+        for ui_node in &frame.ui {
+            canonical_ui_node(&mut out, ui_node);
+        }
+        out.push(frame.services.len() as f32);
+        for service_request in &frame.services {
+            canonical_service_request(&mut out, service_request);
+        }
+        out.push(frame.buses.len() as f32);
+        for bus in &frame.buses {
+            canonical_bus(&mut out, bus);
+        }
+        out.push(frame.voices.len() as f32);
+        for voice in &frame.voices {
+            canonical_voice(&mut out, voice);
+        }
+        out.push(frame.poses.len() as f32);
+        for pose in &frame.poses {
+            canonical_pose(&mut out, pose);
+        }
+        out.push(frame.emitters.len() as f32);
+        for emitter in &frame.emitters {
+            canonical_emitter(&mut out, emitter);
+        }
+        out.push(frame.lights.len() as f32);
+        for light in &frame.lights {
+            canonical_light(&mut out, light);
+        }
+        out.push(frame.listener.len() as f32);
+        for listener in &frame.listener {
+            canonical_listener(&mut out, listener);
+        }
+        out.push(frame.panners.len() as f32);
+        for panner in &frame.panners {
+            canonical_panner(&mut out, panner);
+        }
+        out
+    }
+
+    fn canonical_draw(out: &mut Vec<f32>, draw: &Draw) {
+        out.extend([draw.mesh as f32, draw.material as f32]);
+        out.extend_from_slice(&draw.transform);
+        match &draw.parameters {
+            Some(values) => {
+                out.push(1.0);
+                out.extend_from_slice(values);
+            }
+            None => out.push(0.0),
+        }
+        match &draw.extra {
+            Some(values) => {
+                out.extend([1.0, values.len() as f32]);
+                out.extend_from_slice(values);
+            }
+            None => out.push(0.0),
+        }
+    }
+
+    fn canonical_solid_face(out: &mut Vec<f32>, solid_face: &SolidFace) {
+        out.extend([
+            solid_face.normal.x, solid_face.normal.y, solid_face.normal.z, solid_face.distance,
+            solid_face.material as f32,
+        ]);
+    }
+
+    fn canonical_solid(out: &mut Vec<f32>, solid: &Solid) {
+        out.push(solid.faces.len() as f32);
+        for solid_face in &solid.faces {
+            canonical_solid_face(out, solid_face);
+        }
+    }
+
+    fn canonical_decal(out: &mut Vec<f32>, decal: &Decal) {
+        out.push(decal.material as f32);
+        out.extend_from_slice(&decal.transform);
+        out.push(decal.opacity);
+    }
+
+    fn canonical_sound(out: &mut Vec<f32>, sound: &Sound) {
+        out.extend([
+            sound.clip as f32, sound.bus as f32, sound.gain, sound.pan, sound.pitch, sound.lowpass, sound.reverb,
+        ]);
+    }
+
+    fn canonical_sprite(out: &mut Vec<f32>, sprite: &Sprite) {
+        out.extend([
+            sprite.x, sprite.y, sprite.width, sprite.height, sprite.u0, sprite.v0, sprite.u1, sprite.v1,
+        ]);
+        out.extend_from_slice(&sprite.color);
+        out.push(sprite.material as f32);
+        out.extend_from_slice(&sprite.parameters);
+    }
+
+    fn canonical_inset(out: &mut Vec<f32>, inset: &Inset) {
+        out.extend([inset.x, inset.y, inset.width, inset.height]);
+        out.extend_from_slice(&inset.view);
+        out.extend_from_slice(&inset.projection);
+        out.extend([
+            inset.ambient.x, inset.ambient.y, inset.ambient.z, inset.light_direction.x, inset.light_direction.y,
+            inset.light_direction.z, inset.light_color.x, inset.light_color.y, inset.light_color.z,
+            inset.draws.len() as f32,
+        ]);
+        for draw in &inset.draws {
+            canonical_draw(out, draw);
+        }
+        out.push(inset.pixel_size);
+    }
+
+    fn canonical_field_patch(out: &mut Vec<f32>, field_patch: &FieldPatch) {
+        out.extend([
+            field_patch.material as f32, field_patch.width as f32, field_patch.height as f32,
+            field_patch.x as f32, field_patch.z as f32, field_patch.columns as f32, field_patch.rows as f32,
+            field_patch.values.len() as f32,
+        ]);
+        out.extend_from_slice(&field_patch.values);
+    }
+
+    fn canonical_ui_node(out: &mut Vec<f32>, ui_node: &UiNode) {
+        out.extend([
+            ui_node.id as f32, ui_node.parent as f32, ui_node.role as f32, ui_node.x, ui_node.y, ui_node.width,
+            ui_node.height, f32::from(ui_node.focusable), f32::from(ui_node.focused),
+            f32::from(ui_node.disabled), f32::from(ui_node.hidden), f32::from(ui_node.modal),
+            ui_node.checked as f32, ui_node.expanded as f32, ui_node.selected as f32, ui_node.live as f32,
+            ui_node.value, ui_node.minimum, ui_node.maximum, ui_node.step, ui_node.actions as f32,
+            ui_node.text_length as f32, ui_node.name_length as f32, ui_node.description_length as f32,
+            ui_node.text.len() as f32,
+        ]);
+        out.extend_from_slice(&ui_node.text);
+    }
+
+    fn canonical_service_request(out: &mut Vec<f32>, service_request: &ServiceRequest) {
+        out.extend([
+            service_request.request as f32, service_request.service as f32, service_request.operation as f32,
+            service_request.a, service_request.b, service_request.c, service_request.d,
+            service_request.value_count as f32, service_request.values.len() as f32,
+        ]);
+        out.extend_from_slice(&service_request.values);
+    }
+
+    fn canonical_bus(out: &mut Vec<f32>, bus: &Bus) {
+        out.extend([bus.gain, bus.lowpass, bus.reverb]);
+    }
+
+    fn canonical_voice(out: &mut Vec<f32>, voice: &Voice) {
+        out.extend([
+            voice.id as f32, voice.clip as f32, voice.bus as f32, voice.gain, voice.pan, voice.pitch,
+            voice.lowpass, voice.reverb, f32::from(voice.looping), voice.start, voice.fade_in, voice.fade_out,
+        ]);
+    }
+
+    fn canonical_pose(out: &mut Vec<f32>, pose: &Pose) {
+        out.extend([pose.draw as f32, pose.clip as f32, pose.time, pose.weight]);
+    }
+
+    fn canonical_emitter(out: &mut Vec<f32>, emitter: &Emitter) {
+        out.push(emitter.material as f32);
+        out.extend_from_slice(&emitter.transform);
+        out.extend([
+            emitter.seed as f32, emitter.time, emitter.duration, emitter.rate, emitter.lifetime, emitter.radius,
+            emitter.velocity.x, emitter.velocity.y, emitter.velocity.z, emitter.spread, emitter.gravity.x,
+            emitter.gravity.y, emitter.gravity.z, emitter.drag, emitter.size_start, emitter.size_end,
+            emitter.color_start.r, emitter.color_start.g, emitter.color_start.b, emitter.color_start.a,
+            emitter.color_end.r, emitter.color_end.g, emitter.color_end.b, emitter.color_end.a,
+            f32::from(emitter.additive),
+        ]);
+    }
+
+    fn canonical_light(out: &mut Vec<f32>, light: &Light) {
+        out.extend([
+            light.position.x, light.position.y, light.position.z, light.radius, light.color.x, light.color.y,
+            light.color.z, light.direction.x, light.direction.y, light.direction.z, light.inner, light.outer,
+        ]);
+    }
+
+    fn canonical_listener(out: &mut Vec<f32>, listener: &Listener) {
+        out.extend([
+            listener.position.x, listener.position.y, listener.position.z, listener.forward.x,
+            listener.forward.y, listener.forward.z, listener.up.x, listener.up.y, listener.up.z,
+        ]);
+    }
+
+    fn canonical_panner(out: &mut Vec<f32>, panner: &Panner) {
+        out.extend([
+            panner.voice as f32, panner.sound as f32, panner.position.x, panner.position.y, panner.position.z,
+            panner.orientation.x, panner.orientation.y, panner.orientation.z, panner.distance_model as f32,
+            panner.ref_distance, panner.max_distance, panner.rolloff, panner.cone_inner, panner.cone_outer,
+            panner.cone_outer_gain,
+        ]);
     }
 }

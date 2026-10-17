@@ -4,14 +4,18 @@
 //! reruns a recipe when its sources change. The recipe writes into
 //! `src/assets`, which dev.rs then reloads in the running game.
 //!
-//! Recipes run one at a time, in the order the file lists them, so a recipe
-//! that reads another's output is listed after it and runs after it when
-//! both are due. Several write the same files (the buildings' palette), and
-//! Blender runs are heavy, so nothing runs side by side. A change that
-//! arrives while a recipe runs queues it again. A file counts as changed only
-//! when its content does, so rewriting an identical output does not set off
-//! the recipes that read it, and saving without an edit does nothing. A
-//! failed recipe is reported and the game keeps the assets it has.
+//! Recipes run one at a time, each after the recipes whose outputs it reads
+//! (asset_graph.rs orders them) and otherwise in the order the file lists
+//! them, so one that reads another's output runs after it when both are due.
+//! Several write the same files (the buildings' palette), and Blender runs
+//! are heavy, so nothing runs side by side. A change that arrives while a
+//! recipe runs queues it again. A file counts as changed only when its
+//! content does, so rewriting an identical output does not set off the
+//! recipes that read it, and saving without an edit does nothing. A failed
+//! recipe is reported and the game keeps the assets it has. A recipe that
+//! declares its outputs goes through the pipeline's cache: sources it has
+//! built before (an edit undone, another checkout's work) bring their
+//! outputs back without running it, and what it builds is kept.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hasher};
 use std::io::{BufRead, BufReader, Read};
@@ -23,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use notify::EventKind;
-use serde::Deserialize;
 
+use crate::asset_graph::{Cache, Graph, Step as Recipe};
 use crate::dev::watch;
 use crate::devlog::{self, Source};
 
@@ -34,23 +38,6 @@ use crate::devlog::{self, Source};
 const DEBOUNCE: Duration = Duration::from_millis(250);
 /// How often a running recipe is checked on.
 const TICK: Duration = Duration::from_millis(50);
-
-#[derive(Deserialize)]
-struct Config {
-    recipes: Vec<Recipe>,
-}
-
-/// One of the Justfile's recipes, `just NAME`, and the files it builds from.
-#[derive(Deserialize)]
-struct Recipe {
-    recipe: String,
-    /// Globs relative to the checkout: `*` and `?` within a name, `**` for
-    /// any number of directories.
-    sources: Vec<String>,
-    /// Programs the recipe runs that may not be installed, such as Blender.
-    #[serde(default)]
-    requires: Vec<String>,
-}
 
 enum Message {
     Changed(watch::Event),
@@ -84,19 +71,25 @@ impl Pipeline {
 
     fn new(root: &Path, file: &Path) -> Result<Option<Pipeline>> {
         let text = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        let config: Config = serde_json::from_str(&text).with_context(|| format!("reading {}", file.display()))?;
+        let root = std::fs::canonicalize(root)?;
+        let graph = Graph::parse(&root, &text).with_context(|| format!("reading {}", file.display()))?;
         if !installed("just") {
             eprintln!("pipeline: just is not installed, so assets do not rebuild as their sources change");
             return Ok(None);
         }
-        let root = std::fs::canonicalize(root)?;
-        warn_unknown(&root, &config.recipes);
-        let unavailable = unavailable(&config.recipes);
+        warn_unknown(&root, &graph.steps);
+        let unavailable = unavailable(&graph.steps);
+        let cache = crate::asset_graph::default_cache()
+            .map(|directory| Cache::open(&directory))
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!("pipeline: not caching what recipes build: {error:#}");
+                None
+            });
 
         let (messages, received) = channel();
         let changes = messages.clone();
-        let patterns: Vec<&str> =
-            config.recipes.iter().flat_map(|recipe| &recipe.sources).map(String::as_str).collect();
+        let patterns: Vec<&str> = graph.steps.iter().flat_map(|recipe| &recipe.sources).map(String::as_str).collect();
         let directories = watched(&patterns);
         let mut roots = Vec::new();
         for (directory, recursive) in &directories {
@@ -111,12 +104,13 @@ impl Pipeline {
         let watch = watch::subscribe(&roots, move |event| {
             let _ = changes.send(Message::Changed(event));
         })?;
-        let available = config.recipes.len() - unavailable.iter().filter(|skip| **skip).count();
+        let available = graph.steps.len() - unavailable.iter().filter(|skip| **skip).count();
         eprintln!("pipeline: rerunning {available} recipes as their sources change ({})", file.display());
 
         let scheduler = Scheduler {
             root,
-            recipes: config.recipes,
+            graph,
+            cache,
             unavailable,
             seen: HashMap::new(),
             touched: BTreeSet::new(),
@@ -150,7 +144,7 @@ fn warn_unknown(root: &Path, recipes: &[Recipe]) {
     }
     let summary = String::from_utf8_lossy(&output.stdout);
     let known: BTreeSet<&str> = summary.split_whitespace().collect();
-    for recipe in recipes.iter().filter(|recipe| !known.contains(recipe.recipe.as_str())) {
+    for recipe in recipes.iter().filter(|recipe| recipe.builtin.is_none() && !known.contains(recipe.recipe.as_str())) {
         eprintln!("pipeline: the Justfile has no recipe {}", recipe.recipe);
     }
 }
@@ -172,7 +166,7 @@ fn unavailable(recipes: &[Recipe]) -> Vec<bool> {
 }
 
 /// Whether `program` is on the PATH, as `which` finds it.
-fn installed(program: &str) -> bool {
+pub(crate) fn installed(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else { return false };
     std::env::split_paths(&path).any(|directory| {
         let candidate = directory.join(program);
@@ -189,7 +183,7 @@ fn installed(program: &str) -> bool {
 }
 
 /// Whether `path` (relative, `/`-separated) matches `pattern`.
-fn matches(pattern: &str, path: &str) -> bool {
+pub(crate) fn matches(pattern: &str, path: &str) -> bool {
     let pattern: Vec<&str> = pattern.split('/').collect();
     let path: Vec<&str> = path.split('/').collect();
     matches_parts(&pattern, &path)
@@ -218,7 +212,7 @@ fn matches_name(pattern: &[u8], name: &[u8]) -> bool {
 /// The directories to watch for these globs, relative to the checkout, and
 /// whether to watch below them: each glob's directory before its first
 /// wildcard, leaving out any that a recursive watch already covers.
-fn watched(patterns: &[&str]) -> Vec<(String, bool)> {
+pub(crate) fn watched(patterns: &[&str]) -> Vec<(String, bool)> {
     let mut directories: BTreeMap<String, bool> = BTreeMap::new();
     for pattern in patterns {
         let parts: Vec<&str> = pattern.split('/').collect();
@@ -246,7 +240,7 @@ fn watched(patterns: &[&str]) -> Vec<(String, bool)> {
 
 /// Editors' and tools' temporaries and caches, which are never sources:
 /// hidden files, backups, Python's bytecode and Blender's `.blend1`.
-fn temporary(path: &str) -> bool {
+pub(crate) fn temporary(path: &str) -> bool {
     path.split('/').any(|part| part.starts_with('.') || part == "__pycache__")
         || [".tmp", ".swp", ".pyc", ".blend1", ".part", "~"].iter().any(|suffix| path.ends_with(suffix))
 }
@@ -290,7 +284,11 @@ struct Running {
 
 struct Scheduler {
     root: PathBuf,
-    recipes: Vec<Recipe>,
+    /// The recipes, in the order they run.
+    graph: Graph,
+    /// What recipes built, by their sources; None when the cache cannot be
+    /// opened.
+    cache: Option<Cache>,
     /// Recipes skipped because a program they need is not installed.
     unavailable: Vec<bool>,
     /// The content of each source file as last seen, by path relative to
@@ -299,8 +297,8 @@ struct Scheduler {
     /// Sources with events since they were last looked at.
     touched: BTreeSet<String>,
     touched_at: Option<Instant>,
-    /// Recipes due, by their place in the file, with the change that made
-    /// each due.
+    /// Recipes due, by their place in the graph's order, with the change
+    /// that made each due.
     pending: BTreeMap<usize, String>,
     running: Option<Running>,
 }
@@ -325,7 +323,7 @@ impl Scheduler {
     }
 
     fn source(&self, path: &str) -> bool {
-        !temporary(path) && self.recipes.iter().any(|recipe| recipe.sources.iter().any(|glob| matches(glob, path)))
+        !temporary(path) && self.graph.steps.iter().any(|recipe| recipe.sources.iter().any(|glob| matches(glob, path)))
     }
 
     /// The content of every source there is now, to tell later edits from
@@ -391,7 +389,7 @@ impl Scheduler {
             if before == content {
                 continue;
             }
-            for (index, recipe) in self.recipes.iter().enumerate() {
+            for (index, recipe) in self.graph.steps.iter().enumerate() {
                 if !self.unavailable[index] && recipe.sources.iter().any(|glob| matches(glob, &path)) {
                     self.pending.entry(index).or_insert_with(|| path.clone());
                 }
@@ -414,11 +412,12 @@ impl Scheduler {
         while Instant::now() < deadline && !running.output.iter().all(JoinHandle::is_finished) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        let name = &self.recipes[running.index].recipe;
+        let name = &self.graph.steps[running.index].recipe;
         let seconds = running.started.elapsed().as_secs_f64();
         match status {
             Ok(status) if status.success() => {
-                devlog::info(Source::Pipeline, format!("pipeline: {name} done in {seconds:.1} s"))
+                devlog::info(Source::Pipeline, format!("pipeline: {name} done in {seconds:.1} s"));
+                self.keep(running.index, seconds);
             }
             Ok(status) => devlog::error(
                 Source::Pipeline,
@@ -436,15 +435,27 @@ impl Scheduler {
             return;
         }
         let Some((index, cause)) = self.pending.pop_first() else { return };
-        let name = &self.recipes[index].recipe;
-        devlog::info(Source::Pipeline, format!("pipeline: {cause} changed; running just {name}"));
-        let spawned = Command::new("just")
-            .arg(name)
-            .current_dir(&self.root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
+        if self.restore(index, &cause) {
+            return;
+        }
+        let name = &self.graph.steps[index].recipe;
+        // A built-in step runs in a pen of its own, which keeps what it
+        // builds, so it can be stopped as a recipe is.
+        let mut command = match self.graph.steps[index].builtin {
+            Some(_) => {
+                let mut command = Command::new(std::env::current_exe().unwrap_or_else(|_| "pen".into()));
+                command.args(["assets", "--only", name, "--project"]).arg(&self.root);
+                command
+            }
+            None => {
+                let mut command = Command::new("just");
+                command.arg(name);
+                command
+            }
+        };
+        devlog::info(Source::Pipeline, format!("pipeline: {cause} changed; running {name}"));
+        let spawned =
+            command.current_dir(&self.root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn();
         match spawned {
             Ok(mut child) => {
                 let output = [
@@ -458,7 +469,49 @@ impl Scheduler {
                     output: output.into_iter().flatten().collect(),
                 });
             }
-            Err(error) => eprintln!("pipeline: cannot run just {name}: {error}"),
+            Err(error) => eprintln!("pipeline: cannot run {name}: {error}"),
+        }
+    }
+
+    /// Brings back what the recipe built before from the same sources, if
+    /// the cache has it; whether it did, so the recipe need not run.
+    fn restore(&mut self, index: usize, cause: &str) -> bool {
+        let recipe = &self.graph.steps[index];
+        let Some(cache) = &self.cache else { return false };
+        if recipe.outputs.is_empty() {
+            return false;
+        }
+        let restored = self.graph.key(index).and_then(|key| match cache.lookup(&key)? {
+            Some(record) => cache.restore(&self.graph, index, &record).map(Some),
+            None => Ok(None),
+        });
+        match restored {
+            Ok(Some(count)) => {
+                let name = &recipe.recipe;
+                devlog::info(
+                    Source::Pipeline,
+                    format!("pipeline: {cause} changed; {name} restored {count} outputs from the cache"),
+                );
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                eprintln!("pipeline: {}: the cache: {error:#}", recipe.recipe);
+                false
+            }
+        }
+    }
+
+    /// Keeps what a recipe that ran built, by the sources it built from.
+    fn keep(&self, index: usize, seconds: f64) {
+        let recipe = &self.graph.steps[index];
+        let Some(cache) = &self.cache else { return };
+        // A built-in step's own pen kept it.
+        if recipe.outputs.is_empty() || recipe.builtin.is_some() {
+            return;
+        }
+        if let Err(error) = self.graph.key(index).and_then(|key| cache.record(&self.graph, index, &key, seconds)) {
+            eprintln!("pipeline: {}: not cached: {error:#}", recipe.recipe);
         }
     }
 
@@ -466,7 +519,7 @@ impl Scheduler {
     /// gets a moment to finish before it is killed.
     fn stop(&mut self) {
         let Some(mut running) = self.running.take() else { return };
-        eprintln!("pipeline: stopping {}", self.recipes[running.index].recipe);
+        eprintln!("pipeline: stopping {}", self.graph.steps[running.index].recipe);
         if terminate(&running.child) {
             let deadline = Instant::now() + Duration::from_secs(3);
             while Instant::now() < deadline {
@@ -550,13 +603,17 @@ mod tests {
             .map(|(name, sources)| Recipe {
                 recipe: name.to_string(),
                 sources: sources.iter().map(|glob| glob.to_string()).collect(),
+                outputs: Vec::new(),
                 requires: Vec::new(),
+                builtin: None,
+                options: serde_json::Value::Null,
             })
             .collect();
         Scheduler {
             root: root.to_owned(),
             unavailable: vec![false; recipes.len()],
-            recipes,
+            graph: Graph { root: root.to_owned(), inputs: vec![Vec::new(); recipes.len()], steps: recipes },
+            cache: None,
             seen: HashMap::new(),
             touched: BTreeSet::new(),
             touched_at: None,
@@ -581,6 +638,32 @@ mod tests {
         assert!(pipeline.running.is_none());
         // Asked, it ends at once rather than when killed after a wait.
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn recipes_built_before_come_back_from_the_cache() {
+        if !installed("just") {
+            return;
+        }
+        let root = crate::store::scratch("pipeline-cache");
+        std::fs::write(root.join("Justfile"), "copy:\n  cp source.txt out.txt\n").unwrap();
+        let text = r#"{"recipes": [{"recipe": "copy", "sources": ["source.txt"], "outputs": ["out.txt"]}]}"#;
+        std::fs::write(root.join("source.txt"), "salt").unwrap();
+        let mut pipeline = scheduler(&root, &[]);
+        pipeline.graph = Graph::parse(&root, text).unwrap();
+        pipeline.unavailable = vec![false];
+        pipeline.cache = Some(Cache::open(&root.join("cache")).unwrap());
+        // Nothing cached yet: the recipe must run, and what it built is kept.
+        assert!(!pipeline.restore(0, "source.txt"));
+        Command::new("just").arg("copy").current_dir(&root).status().unwrap();
+        pipeline.keep(0, 0.1);
+        // Its output lost and the same sources again: back without running.
+        std::fs::write(root.join("out.txt"), "pepper").unwrap();
+        assert!(pipeline.restore(0, "source.txt"));
+        assert_eq!(std::fs::read_to_string(root.join("out.txt")).unwrap(), "salt");
+        std::fs::write(root.join("source.txt"), "rock").unwrap();
+        assert!(!pipeline.restore(0, "source.txt"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1,0 +1,6 @@
+// The game's entry: pen runs `main`, giving it the host. Everything else is
+// in ./game, which tests import (a module with an entry cannot be).
+import * as program from "pen/program"
+import { game } from "./game"
+
+entry const main = fn host => program.run game host

@@ -1,7 +1,9 @@
 //! Steam as a service: achievements, stats and rich presence, through the
-//! runtime's Steam client (`crate::steam`). Without one (a runtime built
-//! without the `steam` feature, or Steam off) every request is answered
-//! unavailable, and the game plays on.
+//! runtime's Steam client (`crate::steam`), Steam Input's action sets,
+//! glyphs and binding panel (`crate::steam_input`), which also moves the
+//! game's actions each frame, and the Workshop (`crate::workshop`). Without
+//! one (a runtime built without the `steam` feature, or Steam off) every
+//! request is answered unavailable, and the game plays on.
 use pen_protocol::service;
 
 use super::{Answer, Request, Service};
@@ -9,6 +11,11 @@ use super::{Answer, Request, Service};
 pub struct SteamService {
     #[cfg(feature = "steam")]
     steam: Option<crate::steam::Steam>,
+    /// The game's actions, which Steam Input moves.
+    #[cfg(feature = "steam")]
+    actions: Option<pen_runtime::actions::Shared>,
+    #[cfg(feature = "steam")]
+    workshop: Option<crate::workshop::Workshop<crate::workshop::Steamworks>>,
 }
 
 impl SteamService {
@@ -17,13 +24,29 @@ impl SteamService {
         SteamService {
             #[cfg(feature = "steam")]
             steam: None,
+            #[cfg(feature = "steam")]
+            actions: None,
+            #[cfg(feature = "steam")]
+            workshop: None,
         }
     }
 
-    /// The client `Steam::init` connected, if any.
+    /// The client `Steam::init` connected, if any, and the session's actions.
     #[cfg(feature = "steam")]
-    pub fn new(steam: Option<crate::steam::Steam>) -> SteamService {
-        SteamService { steam }
+    pub fn new(steam: Option<crate::steam::Steam>, actions: pen_runtime::actions::Shared) -> SteamService {
+        SteamService { steam, actions: Some(actions), workshop: None }
+    }
+
+    /// The Workshop, with Steam: it publishes `scene`, the player's (what
+    /// the editor saves), and puts subscribed items' scenes there.
+    #[cfg(feature = "steam")]
+    pub fn with_workshop(mut self, scene: std::path::PathBuf) -> SteamService {
+        use crate::workshop::{Steamworks, Workshop, staging};
+        self.workshop = self
+            .steam
+            .as_ref()
+            .map(|steam| Workshop::new(Steamworks::new(steam.client()), scene.clone(), staging(&scene)));
+        self
     }
 }
 
@@ -34,6 +57,12 @@ impl Service<crate::input::Input> for SteamService {
 
     fn call(&mut self, request: &Request) -> Option<Answer> {
         #[cfg(feature = "steam")]
+        if crate::workshop::handles(request.operation)
+            && let Some(workshop) = &mut self.workshop
+        {
+            return workshop.call(request);
+        }
+        #[cfg(feature = "steam")]
         if let Some(steam) = &mut self.steam {
             return Some(answer(steam, request));
         }
@@ -41,10 +70,19 @@ impl Service<crate::input::Input> for SteamService {
         Some(Answer::unavailable())
     }
 
+    /// The Workshop's answers, once Steam has called back.
+    #[cfg(feature = "steam")]
+    fn poll(&mut self) -> Vec<(u32, Answer)> {
+        self.workshop.as_mut().map(crate::workshop::Workshop::poll).unwrap_or_default()
+    }
+
     #[cfg(feature = "steam")]
     fn frame(&mut self, input: &mut crate::input::Input) {
         if let Some(steam) = &mut self.steam {
             steam.frame(input);
+            if let (Some(steam_input), Some(actions)) = (&mut steam.input, &self.actions) {
+                steam_input.frame(&mut actions.borrow_mut());
+            }
         }
     }
 }
@@ -84,6 +122,14 @@ fn answer(steam: &mut crate::steam::Steam, request: &Request) -> Answer {
             Ok(0.0)
         }
         steam_op::STATUS => Ok(1.0),
+        steam_op::INPUT_ACTION_SET | steam_op::INPUT_GLYPH | steam_op::INPUT_PANEL => {
+            let Some(input) = &mut steam.input else { return Answer::unavailable() };
+            return match request.operation {
+                steam_op::INPUT_ACTION_SET => input.activate_set(&name),
+                steam_op::INPUT_GLYPH => input.glyph(&name),
+                _ => input.panel(),
+            };
+        }
         _ => return Answer::unknown(),
     };
     match result {

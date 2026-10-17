@@ -61,6 +61,7 @@ fn request_adapter(
         compatible_surface: surface,
         ..Default::default()
     }));
+    crate::startup::mark("GPU adapter found");
     if software {
         adapter.context("no software GPU adapter for PEN_SOFTWARE (on Linux: Mesa's lavapipe, in mesa-vulkan-drivers)")
     } else {
@@ -75,6 +76,7 @@ fn open_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue, Fa
     let descriptor =
         wgpu::DeviceDescriptor { required_features: pen_render::optional_features(adapter), ..Default::default() };
     let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))?;
+    crate::startup::mark("GPU device open");
     let fault = Fault::default();
     let uncaptured = fault.clone();
     device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
@@ -98,6 +100,7 @@ fn renderer(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     format: wgpu::TextureFormat,
+    display: pen_render::Display,
     assets: &Path,
 ) -> Result<pen_render::Renderer> {
     pen_render::Renderer::new(
@@ -105,6 +108,7 @@ fn renderer(
         queue.clone(),
         pen_render::RendererOptions {
             format,
+            display,
             assets: assets.to_owned(),
             veil: Some(0.6),
             // Compiled pipelines, kept per adapter between runs.
@@ -115,7 +119,8 @@ fn renderer(
 
 impl Gpu {
     /// With `pinned`, frames keep that size whatever the window's;
-    /// `software` draws on a software adapter.
+    /// `software` draws on a software adapter; `hdr` shows HDR on a display
+    /// and surface that can.
     pub fn windowed(
         display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>,
         window: Arc<Window>,
@@ -123,6 +128,7 @@ impl Gpu {
         assets: &Path,
         pinned: Option<(u32, u32)>,
         software: bool,
+        hdr: bool,
     ) -> Result<Gpu> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(display));
         let surface = instance.create_surface(window.clone())?;
@@ -130,12 +136,11 @@ impl Gpu {
         let (device, queue, fault) = open_device(&adapter)?;
         let capabilities = surface.get_capabilities(&adapter);
         // Like the browser's preferred canvas format: 8 bits and not sRGB,
-        // since the present pass encodes colours itself.
-        let format = [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm]
-            .into_iter()
-            .find(|format| capabilities.formats.contains(format))
-            .or_else(|| capabilities.formats.iter().copied().find(|format| !format.is_srgb()))
-            .unwrap_or_else(|| capabilities.formats[0].remove_srgb_suffix());
+        // since the present pass encodes colours itself; or an HDR one.
+        let (format, shown) = pen_render::choose_surface(&capabilities, &surface.display_hdr_info(&adapter), hdr);
+        if shown.is_hdr() {
+            eprintln!("HDR: {:?} on {format:?}, {:.1}x SDR white", shown.color_space, shown.headroom);
+        }
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -150,10 +155,11 @@ impl Gpu {
                 capabilities.alpha_modes[0]
             },
             view_formats: vec![],
-            color_space: Default::default(),
+            color_space: shown.color_space,
         };
         surface.configure(&device, &config);
-        let renderer = renderer(&device, &queue, format, assets)?;
+        let renderer = renderer(&device, &queue, format, shown, assets)?;
+        crate::startup::mark("GPU ready");
         let blitter =
             wgpu::util::TextureBlitterBuilder::new(&device, format).sample_type(wgpu::FilterMode::Linear).build();
         Ok(Gpu {
@@ -179,7 +185,8 @@ impl Gpu {
         let adapter = request_adapter(&instance, None, software)?;
         let (device, queue, fault) = open_device(&adapter)?;
         let format = wgpu::TextureFormat::Bgra8Unorm;
-        let renderer = renderer(&device, &queue, format, assets)?;
+        let renderer = renderer(&device, &queue, format, pen_render::Display::SDR, assets)?;
+        crate::startup::mark("GPU ready");
         Ok(Gpu {
             device,
             queue,
@@ -537,11 +544,15 @@ pub(super) fn write_overlay_shot(
 /// then on its asset events cannot make two runs differ.
 pub(super) fn settle(gpu: &mut Gpu, frame: &RenderFrame, catalog: &Catalog) -> Result<()> {
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+    // A software adapter (lavapipe, WARP) compiles each pipeline on the CPU,
+    // seconds apiece, on CI machines of two or four cores.
+    let software = gpu.device.adapter_info().device_type == wgpu::DeviceType::Cpu;
+    let patience = if software { PATIENCE * 10 } else { PATIENCE };
     let started = Instant::now();
     let mut draws = 0;
     while !gpu.renderer.quiet() || gpu.renderer.pending() > 0 {
-        if started.elapsed() > PATIENCE {
-            eprintln!("settle: assets still loading after {} s; starting anyway", PATIENCE.as_secs());
+        if started.elapsed() > patience {
+            eprintln!("settle: assets still loading after {} s; starting anyway", patience.as_secs());
             return Ok(());
         }
         let texture = gpu.capture_texture();
@@ -554,6 +565,7 @@ pub(super) fn settle(gpu: &mut Gpu, frame: &RenderFrame, catalog: &Catalog) -> R
             overlay: None,
         };
         gpu.renderer.submit(frame, catalog, &mut CaptureTarget { output, texture })?;
+        crate::startup::drawn(&gpu.renderer);
         gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
         if let Some(fault) = gpu.take_fault() {
             return Err(anyhow!(fault));
@@ -564,5 +576,6 @@ pub(super) fn settle(gpu: &mut Gpu, frame: &RenderFrame, catalog: &Catalog) -> R
         gpu.renderer.wait(std::time::Duration::from_millis(16));
     }
     eprintln!("settled in {:.0} ms ({draws} draws)", started.elapsed().as_secs_f64() * 1000.0);
+    crate::startup::mark("settled");
     Ok(())
 }

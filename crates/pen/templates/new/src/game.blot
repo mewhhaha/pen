@@ -1,0 +1,73 @@
+// A cube that turns: the right arrow turns it faster, the left one slower.
+// pen/ holds the bindings `pen codegen` generates: the packets (protocol,
+// types), the program loop (program) and a frame to start from (frame).
+import * as frame from "pen/frame"
+import * as protocol from "pen/protocol"
+import * as types from "pen/types"
+import { meshes, materials } from "./assets/catalog.json"
+
+// The version of the state `save` makes. Change it when the state's lanes
+// change: pen then starts afresh rather than restore a state it would misread.
+const schema = 1
+
+// Everything a frame depends on besides its input.
+type World is data = #World { angle: F32, speed: F32 }
+
+const create = fn () => #World { angle: 0.0, speed: 1.0 }
+
+// The world as lanes, for quicksaves, time travel and reloads, and back.
+const save = fn (world: World) => #[world.angle, world.speed]
+const restore = fn (state: Array F32) => #World { angle: state[0], speed: state[1] }
+
+// Radians a second each arrow press adds or takes away.
+const nudge = 0.5
+
+const vec4 = fn x => fn y => fn z => fn w => #types.Vec4 { x, y, z, w }
+
+// Column-major, as the packet carries matrices.
+const turned = fn (angle: F32) => do:
+  let c = F32.cos angle
+  let s = F32.sin angle
+  return #types.Mat4 { x: vec4 c 0.0 (0.0 - s) 0.0, y: vec4 0.0 1.0 0.0 0.0, z: vec4 s 0.0 c 0.0, w: vec4 0.0 0.0 0.0 1.0 }
+
+const moved = fn (x: F32) => fn (y: F32) => fn (z: F32) =>
+  #types.Mat4 { x: vec4 1.0 0.0 0.0 0.0, y: vec4 0.0 1.0 0.0 0.0, z: vec4 0.0 0.0 1.0 0.0, w: vec4 x y z 1.0 }
+
+// A perspective seeing `focal` (1 over the tangent of half the vertical field
+// of view) at `aspect`, into WebGPU's depth of 0 to 1.
+const perspective = fn (focal: F32) => fn (aspect: F32) => do:
+  let near = 0.1
+  let far = 100.0
+  return #types.Mat4 {
+    x: vec4 (focal / aspect) 0.0 0.0 0.0,
+    y: vec4 0.0 focal 0.0 0.0,
+    z: vec4 0.0 0.0 (0.0 - far / (far - near)) (-1.0),
+    w: vec4 0.0 0.0 (0.0 - near * far / (far - near)) 0.0,
+  }
+
+// What the world looks like: the cube, five units in front of the eye.
+const view = fn (world: World) => fn (input: protocol.Input) => do:
+  let drawn = frame.blank schema
+  drawn.view := moved 0.0 0.0 (-5.0)
+  drawn.projection := perspective 2.0 (input.width / input.height)
+  drawn.clear := #types.Color { r: 0.08, g: 0.1, b: 0.14, a: 1.0 }
+  drawn.light_direction := #types.Vector { x: -0.4, y: -1.0, z: -0.6 }
+  drawn.draws := #[
+    #types.Draw { mesh: meshes.cube, material: materials.cube, transform: turned world.angle, parameters: #Nothing, extra: #[] },
+  ]
+  return drawn
+
+// One frame: the arrows pressed change the speed, and the cube turns on.
+const step = fn (world: World) => fn (input: protocol.Input) => do:
+  let speed = world.speed
+  for event in input.events:
+    if let #protocol.KeyDown code = event:
+      if code == protocol.key_arrow_right:
+        speed := self + nudge
+      if code == protocol.key_arrow_left:
+        speed := self - nudge
+  let next = #World { angle: world.angle + speed * input.elapsed, speed }
+  return (next, view next input)
+
+// The game, as pen/program's `run` serves it.
+const game = { schema, create, step, save, restore }

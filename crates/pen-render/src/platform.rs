@@ -34,6 +34,7 @@ mod imp {
     pub async fn yield_now() {}
 
     /// Seconds on a monotonic clock, from when it was made.
+    #[derive(Clone, Copy)]
     pub struct Clock(std::time::Instant);
 
     impl Clock {
@@ -141,6 +142,7 @@ mod imp {
     }
 
     /// Seconds on the page's monotonic clock, from when it was made.
+    #[derive(Clone, Copy)]
     pub struct Clock(f64);
 
     impl Clock {

@@ -4,24 +4,35 @@
 //! this, so they sound alike, and like the browser.
 //!
 //! Per voice, as its nodes do in the browser: the clip (AudioBufferSourceNode,
-//! linearly interpolated, its pitch a k-rate playbackRate), a lowpass
-//! (BiquadFilterNode, Butterworth), its fade (a GainNode ramped linearly), its
-//! gain (a GainNode), its pan (StereoPannerNode, mono or stereo as the clip
-//! is), then into its bus, and its reverb send (a GainNode) into the bus's
-//! send. A bus filters and scales both alike, passes the first to the master
-//! and the second, with `reverb` of the first, to the shared reverb
-//! (ConvolverNode, `reverb.rs`), which returns into the master at the
-//! master's `reverb`. Values that change glide as setTargetAtTime does, with
+//! linearly interpolated, its pitch a k-rate playbackRate; a long clip
+//! streams, `stream.rs`, sample for sample as it would decoded whole), a
+//! lowpass (BiquadFilterNode, Butterworth), its fade (a GainNode ramped
+//! linearly), its gain (a GainNode), its pan (StereoPannerNode, mono or
+//! stereo as the clip is), or for a voice the frame places in the world its
+//! PannerNode (equal-power, `pen_runtime::panner`, placed in the listener's
+//! frame and heard from WebAudio's default listener), then into its bus, and
+//! its reverb send (a GainNode) into the bus's send. A bus filters and
+//! scales both alike, passes the first to the master and the second, with
+//! `reverb` of the first, to the shared reverb (ConvolverNode, `reverb.rs`),
+//! which returns into the master at the master's `reverb`. Values that change glide as setTargetAtTime does, with
 //! AUDIO_GLIDE_MS for its time constant; a frame's changes land at the start
 //! of the next quantum, where the browser's `currentTime` is.
+//!
+//! For the dev tools, the mixer meters each bus's output (the master's after
+//! the reverb's return), and the developer may mute and solo buses
+//! (`pen_runtime::mix::Monitor`): their gains glide to 0 as a frame's would.
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "audio sample math")]
 use std::f64::consts::PI;
 use std::sync::Arc;
 
 use pen_protocol::boundary::{AUDIO_FADE_MS, AUDIO_GLIDE_MS, AUDIO_OPEN, MAX_BUSES};
+use pen_runtime::mix::{Meter, Monitor};
+use pen_runtime::panner::{DEFAULT_EAR, Pan, Placement, Vec3, azimuth, equal_power};
 
-use super::resample::resample;
+use super::resample::{Resampler, resample};
 use super::reverb::Convolver;
+use super::source::Encoded;
+use super::stream::{Reader, Streams};
 
 /// WebAudio's render quantum.
 pub const QUANTUM: usize = 128;
@@ -34,22 +45,49 @@ const FADE_SECONDS: f64 = AUDIO_FADE_MS as f64 / 1000.0;
 
 /// A decoded clip: its frames (left, right) at its own rate, and whether it
 /// is mono (both channels the same), which WebAudio pans with the mono law.
+/// One that streams has no frames, but its bytes, decoded as it plays.
 pub struct Clip {
     pub frames: Arc<[[f32; 2]]>,
     pub rate: f64,
     pub mono: bool,
+    pub streamed: Option<Arc<Encoded>>,
 }
 
 impl Clip {
     pub fn new(frames: Arc<[[f32; 2]]>, rate: f64) -> Clip {
         let mono = frames.iter().all(|[left, right]| left.to_bits() == right.to_bits());
-        Clip { frames, rate, mono }
+        Clip { frames, rate, mono, streamed: None }
+    }
+
+    /// A clip that streams from its bytes, at their rate.
+    pub fn streamed(encoded: Encoded) -> Clip {
+        Clip {
+            frames: Arc::new([]),
+            rate: encoded.rate,
+            mono: encoded.channels == 1,
+            streamed: Some(Arc::new(encoded)),
+        }
+    }
+
+    /// How many frames it lasts at its rate.
+    pub fn len(&self) -> usize {
+        match &self.streamed {
+            Some(encoded) if (encoded.rate - self.rate).abs() >= 0.5 => {
+                Resampler::new(encoded.rate, self.rate).length(encoded.frames)
+            }
+            Some(encoded) => encoded.frames,
+            None => self.frames.len(),
+        }
     }
 
     /// The clip at `rate`, resampled as the browser's decoding resamples it
     /// (`resample.rs`), or as it is if it is at that rate already. The mixer
     /// plays a clip at any rate, but one at its own as the browser does.
     pub fn at_rate(self: Arc<Clip>, rate: f64) -> Arc<Clip> {
+        if let Some(encoded) = &self.streamed {
+            // Streamed, it is resampled as it plays.
+            return Arc::new(Clip { frames: Arc::new([]), rate, mono: self.mono, streamed: Some(encoded.clone()) });
+        }
         if (self.rate - rate).abs() < 0.5 || self.frames.is_empty() {
             return self;
         }
@@ -63,7 +101,7 @@ impl Clip {
         } else {
             left.into_iter().zip(channel(1)).map(|(left, right)| [left, right]).collect()
         };
-        Arc::new(Clip { frames, rate, mono: self.mono })
+        Arc::new(Clip { frames, rate, mono: self.mono, streamed: None })
     }
 }
 
@@ -95,6 +133,8 @@ pub struct VoiceSpec {
     pub start: f32,
     pub fade_in: f32,
     pub fade_out: f32,
+    /// Where the frame places it, if it does.
+    pub panner: Option<Placement>,
 }
 
 /// A sound to play once.
@@ -107,6 +147,7 @@ pub struct SoundSpec {
     pub pitch: f32,
     pub lowpass: f32,
     pub reverb: f32,
+    pub panner: Option<Placement>,
 }
 
 /// One frame's sound: its buses, voices and sounds.
@@ -267,6 +308,70 @@ fn mono_gains(pan: f32) -> (f32, f32) {
     (x.cos(), x.sin())
 }
 
+/// Three values gliding together: a position or a direction.
+fn glides(value: Vec3) -> [Glide; 3] {
+    value.map(Glide::at)
+}
+
+fn glide_to(glides: &mut [Glide; 3], target: Vec3) {
+    for (glide, value) in glides.iter_mut().zip(target) {
+        glide.set(value);
+    }
+}
+
+fn next(glides: &mut [Glide; 3], step: f64) -> Vec3 {
+    [glides[0].next(step), glides[1].next(step), glides[2].next(step)]
+}
+
+/// A voice's PannerNode: its settings, which change at once, its position
+/// and orientation in the listener's frame, which glide, and the pan and
+/// gain worked out for where it was last. While it moves, they are worked
+/// out again every sample, as Chrome does while a panner's values are
+/// automated.
+struct Spatial {
+    placement: Placement,
+    position: [Glide; 3],
+    orientation: [Glide; 3],
+    /// What `pan` and `gain` are for.
+    placed: Option<(Vec3, Vec3)>,
+    pan: Pan,
+    gain: f32,
+}
+
+impl Spatial {
+    fn new(placement: Placement) -> Spatial {
+        Spatial {
+            placement,
+            position: glides(placement.position),
+            orientation: glides(placement.orientation),
+            placed: None,
+            pan: Pan { left: 1.0, right: 1.0, rightward: false },
+            gain: 1.0,
+        }
+    }
+
+    fn set(&mut self, placement: Placement) {
+        glide_to(&mut self.position, placement.position);
+        glide_to(&mut self.orientation, placement.orientation);
+        if placement != self.placement {
+            self.placement = placement;
+            self.placed = None;
+        }
+    }
+
+    /// This sample's pan and gain, then a step on.
+    fn next(&mut self, step: f64, mono: bool) -> (Pan, f32) {
+        let position = next(&mut self.position, step);
+        let orientation = next(&mut self.orientation, step);
+        if self.placed != Some((position, orientation)) {
+            self.placed = Some((position, orientation));
+            self.pan = equal_power(azimuth(position, &DEFAULT_EAR), mono);
+            self.gain = self.placement.gain(position, orientation, &DEFAULT_EAR);
+        }
+        (self.pan, self.gain)
+    }
+}
+
 struct Voice {
     /// None for a sound played once, or a voice its id has moved on from.
     id: Option<u32>,
@@ -288,15 +393,33 @@ struct Voice {
     seen: bool,
     /// The pan its gains are for, and they.
     panned: f32,
-    gains: (f32, f32),
+    gains: Pan,
+    /// Its PannerNode, in place of its pan, if the frame placed it as it
+    /// started.
+    spatial: Option<Spatial>,
+    /// A streamed clip's frames, until it ends, and where in them the voice
+    /// started (`first`, a frame of its clip) and how often it went round.
+    stream: Option<Reader>,
+    first: usize,
+    passes: u64,
 }
 
 impl Voice {
     /// Starts at sample `now`, at the values of `sound`, `start` seconds
-    /// into its clip.
-    fn new(id: Option<u32>, sound: &SoundSpec, looping: bool, start: f32, fade_in: f32, now: u64, rate: f64) -> Voice {
-        let SoundSpec { ref clip, bus, gain, pan, pitch, lowpass, reverb } = *sound;
-        let length = clip.frames.len() as f64;
+    /// into its clip, its stream from `streams` if it streams.
+    #[allow(clippy::too_many_arguments, reason = "a voice's start")]
+    fn new(
+        id: Option<u32>,
+        sound: &SoundSpec,
+        looping: bool,
+        start: f32,
+        fade_in: f32,
+        now: u64,
+        rate: f64,
+        streams: &mut Streams,
+    ) -> Voice {
+        let SoundSpec { ref clip, bus, gain, pan, pitch, lowpass, reverb, panner } = *sound;
+        let length = clip.len() as f64;
         let offset = f64::from(start) * clip.rate;
         let position = if looping && length > 0.0 { offset.rem_euclid(length) } else { offset.max(0.0) };
         let fade = if fade_in > 0.0 {
@@ -304,9 +427,15 @@ impl Voice {
         } else {
             Ramp::hold(1.0)
         };
+        let first = position as usize;
+        let stream = match &clip.streamed {
+            Some(encoded) if position < length => streams.open(encoded, clip.rate, first),
+            _ => None,
+        };
         Voice {
             id,
-            ended: position >= length,
+            // A clip that streams but finds no stream free plays nothing.
+            ended: position >= length || (clip.streamed.is_some() && stream.is_none()),
             clip: clip.clone(),
             bus,
             position,
@@ -321,7 +450,11 @@ impl Voice {
             leaving: false,
             seen: true,
             panned: f32::NAN,
-            gains: (1.0, 1.0),
+            gains: Pan { left: 1.0, right: 1.0, rightward: false },
+            spatial: panner.map(Spatial::new),
+            stream,
+            first,
+            passes: 0,
         }
     }
 
@@ -350,18 +483,30 @@ impl Voice {
         if self.ended {
             return;
         }
+        // A stream not begun yet is waited for.
+        if let Some(stream) = &mut self.stream {
+            if !stream.begun() {
+                return;
+            }
+            stream.begin(self.looping);
+        }
         let frames = &self.clip.frames;
-        let length = frames.len();
+        let length = self.clip.len();
         let end = length as f64;
         // playbackRate is k-rate: its value at the quantum's start.
         let step = f64::from(self.pitch.next(quantum_glide)) * self.clip.rate / rate;
         let mono = self.clip.mono;
+        // Frame `index` of a streamed clip, by its place in the stream.
+        let (first, whole) = (self.first as u64, length as u64);
         for i in 0..QUANTUM {
             if self.position >= end {
                 if self.looping && length > 0 {
+                    self.passes += (self.position / end) as u64;
                     self.position %= end;
                 } else {
                     self.ended = true;
+                    // Done with its stream: another voice may have it.
+                    self.stream = None;
                     return;
                 }
             }
@@ -374,7 +519,13 @@ impl Voice {
             } else {
                 index
             };
-            let (a, b) = (frames[index], frames[next]);
+            let (a, b) = match &mut self.stream {
+                Some(stream) => {
+                    let at = self.passes * whole + index as u64 - first;
+                    (stream.frame(at), stream.frame(at + u64::from(next != index)))
+                }
+                None => (frames[index], frames[next]),
+            };
             let left = (f64::from(a[0]) * (1.0 - fraction) + f64::from(b[0]) * fraction) as f32;
             self.position += step;
             self.lowpass.step(glide, rate);
@@ -382,33 +533,44 @@ impl Voice {
             let gain = self.gain.next(glide);
             let pan = self.pan.next(glide);
             let reverb = self.send.next(glide);
-            if pan.to_bits() != self.panned.to_bits() {
-                self.panned = pan;
-                self.gains = if mono { mono_gains(pan) } else { pan_gains(pan) };
-            }
+            let (pan, gain) = match &mut self.spatial {
+                Some(spatial) => {
+                    let (pan, placed) = spatial.next(glide, mono);
+                    (pan, gain * placed)
+                }
+                None => {
+                    if pan.to_bits() != self.panned.to_bits() {
+                        self.panned = pan;
+                        let (left, right) = if mono { mono_gains(pan) } else { pan_gains(pan) };
+                        self.gains = Pan { left, right, rightward: pan > 0.0 };
+                    }
+                    (self.gains, gain)
+                }
+            };
             let (out_left, out_right) = if mono {
                 let x = self.lowpass.run(0, left) * fade * gain;
-                (x * self.gains.0, x * self.gains.1)
+                (x * pan.left, x * pan.right)
             } else {
                 let right = (f64::from(a[1]) * (1.0 - fraction) + f64::from(b[1]) * fraction) as f32;
                 let l = self.lowpass.run(0, left) * fade * gain;
                 let r = self.lowpass.run(1, right) * fade * gain;
-                if pan <= 0.0 {
-                    (l + r * self.gains.0, r * self.gains.1)
-                } else {
-                    (l * self.gains.0, r + l * self.gains.1)
-                }
+                if pan.rightward { (l * pan.left, r + l * pan.right) } else { (l + r * pan.left, r * pan.right) }
             };
             dry[i][0] += out_left;
             dry[i][1] += out_right;
             send[i][0] += out_left * reverb;
             send[i][1] += out_right * reverb;
         }
+        if let Some(stream) = &mut self.stream {
+            stream.end(self.passes * whole + self.position as u64 - first);
+        }
     }
 }
 
 struct Bus {
     active: bool,
+    /// Its gain as the frame has it, before the developer's mute and solo.
+    level: f32,
     gain: Glide,
     reverb: Glide,
     /// Channels 0 and 1 filter the dry input, 2 and 3 the send.
@@ -421,6 +583,7 @@ impl Bus {
     fn new(rate: f64) -> Bus {
         Bus {
             active: false,
+            level: 1.0,
             gain: Glide::at(1.0),
             reverb: Glide::at(0.0),
             lowpass: Lowpass::new(OPEN, rate),
@@ -429,16 +592,19 @@ impl Bus {
         }
     }
 
-    /// Starts it at `spec` at once, as a new bus's nodes do.
-    fn start(&mut self, spec: BusSpec, rate: f64) {
+    /// Starts it at `spec` at once, as a new bus's nodes do, silent if it
+    /// is not `audible`.
+    fn start(&mut self, spec: BusSpec, rate: f64, audible: bool) {
         self.active = true;
-        self.gain = Glide::at(spec.gain);
+        self.level = spec.gain;
+        self.gain = Glide::at(if audible { spec.gain } else { 0.0 });
         self.reverb = Glide::at(spec.reverb);
         self.lowpass = Lowpass::new(cutoff(spec.lowpass, rate), rate);
     }
 
-    fn glide_to(&mut self, spec: BusSpec, rate: f64) {
-        self.gain.set(spec.gain);
+    fn glide_to(&mut self, spec: BusSpec, rate: f64, audible: bool) {
+        self.level = spec.gain;
+        self.gain.set(if audible { spec.gain } else { 0.0 });
         self.reverb.set(spec.reverb);
         self.lowpass.cutoff.set(cutoff(spec.lowpass, rate));
     }
@@ -460,12 +626,28 @@ pub struct Mixer {
     out: [[f32; 2]; QUANTUM],
     /// How much of `out` has been handed out.
     taken: usize,
+    /// Each bus's output since the meters were last taken.
+    meters: [Meter; MAX_BUSES],
+    monitor: Monitor,
+    streams: Streams,
 }
 
 impl Mixer {
+    /// A mixer whose streams decode on its own thread, before each quantum:
+    /// for recordings and tests, which render faster than time passes.
     pub fn new(rate: f64) -> Mixer {
+        Mixer::with_streams(rate, Streams::offline())
+    }
+
+    /// A mixer for the output device, whose streams decode on a thread of
+    /// their own.
+    pub fn live(rate: f64) -> Mixer {
+        Mixer::with_streams(rate, Streams::live())
+    }
+
+    fn with_streams(rate: f64, streams: Streams) -> Mixer {
         let mut buses: Vec<Bus> = (0..MAX_BUSES).map(|_| Bus::new(rate)).collect();
-        buses[0].start(MASTER, rate);
+        buses[0].start(MASTER, rate, true);
         Mixer {
             rate,
             glide: 1.0 - (-1.0 / (GLIDE_SECONDS * rate)).exp(),
@@ -479,6 +661,9 @@ impl Mixer {
             reverb_out: [[0.0; 2]; QUANTUM],
             out: [[0.0; 2]; QUANTUM],
             taken: QUANTUM,
+            meters: [Meter::default(); MAX_BUSES],
+            monitor: Monitor::default(),
+            streams,
         }
     }
 
@@ -487,17 +672,46 @@ impl Mixer {
     }
 
     /// Voices and sounds playing, those fading out included.
-    #[cfg(test)]
-    pub(super) fn playing(&self) -> usize {
+    pub fn playing(&self) -> usize {
         self.voices.len()
+    }
+
+    /// Those of them streaming their clip.
+    pub fn streaming(&self) -> usize {
+        self.voices.iter().filter(|voice| voice.stream.is_some()).count()
+    }
+
+    /// How often a stream ran dry so far.
+    pub fn underruns(&self) -> u64 {
+        self.streams.underruns()
+    }
+
+    /// The developer's mute and solo, from the next quantum on: the buses
+    /// they silence or bring back glide there.
+    pub fn set_monitor(&mut self, monitor: Monitor) {
+        if monitor == self.monitor {
+            return;
+        }
+        self.monitor = monitor;
+        for (index, bus) in self.buses.iter_mut().enumerate().filter(|(_, bus)| bus.active) {
+            bus.gain.set(if monitor.audible(index) { bus.level } else { 0.0 });
+        }
+    }
+
+    /// Each bus's meter since the last time, and which buses are in use;
+    /// the meters start again.
+    pub fn take_meters(&mut self) -> ([Meter; MAX_BUSES], [bool; MAX_BUSES]) {
+        let used = std::array::from_fn(|index| self.buses[index].active);
+        (std::mem::take(&mut self.meters), used)
     }
 
     /// Bus `index`, and those before it, started plain if they are new, as
     /// the browser makes them.
     fn bus(&mut self, index: usize) -> usize {
         let index = index.min(MAX_BUSES - 1);
-        for bus in self.buses[..=index].iter_mut().filter(|bus| !bus.active) {
-            bus.start(PLAIN, self.rate);
+        let monitor = self.monitor;
+        for (at, bus) in self.buses[..=index].iter_mut().enumerate().filter(|(_, bus)| !bus.active) {
+            bus.start(PLAIN, self.rate, monitor.audible(at));
         }
         index
     }
@@ -509,10 +723,11 @@ impl Mixer {
         let (now, rate) = (self.now, self.rate);
         for (index, bus) in self.buses.iter_mut().enumerate() {
             let spec = mix.buses.get(index).copied();
+            let audible = self.monitor.audible(index);
             match (spec, bus.active) {
-                (Some(spec), true) => bus.glide_to(spec, rate),
-                (Some(spec), false) => bus.start(spec, rate),
-                (None, true) => bus.glide_to(if index == 0 { MASTER } else { PLAIN }, rate),
+                (Some(spec), true) => bus.glide_to(spec, rate, audible),
+                (Some(spec), false) => bus.start(spec, rate, audible),
+                (None, true) => bus.glide_to(if index == 0 { MASTER } else { PLAIN }, rate, audible),
                 (None, false) => {}
             }
         }
@@ -528,8 +743,14 @@ impl Mixer {
                     // A second voice with an id this frame already has.
                     continue;
                 }
-                if Arc::ptr_eq(&voice.clip, &spec.clip) && voice.bus == bus {
+                if Arc::ptr_eq(&voice.clip, &spec.clip)
+                    && voice.bus == bus
+                    && voice.spatial.is_some() == spec.panner.is_some()
+                {
                     voice.seen = true;
+                    if let (Some(spatial), Some(placement)) = (&mut voice.spatial, spec.panner) {
+                        spatial.set(placement);
+                    }
                     voice.gain.set(spec.gain);
                     voice.pan.set(spec.pan.clamp(-1.0, 1.0));
                     voice.pitch.set(spec.pitch.max(0.0));
@@ -545,7 +766,8 @@ impl Mixer {
                     }
                     continue;
                 }
-                // Another clip or bus: the old fades out as the new starts.
+                // Another clip or bus, or placed or no longer: the old
+                // fades out as the new starts.
                 voice.id = None;
                 voice.fade_out = spec.fade_out;
                 voice.leave(now, rate);
@@ -558,8 +780,10 @@ impl Mixer {
                 pitch: spec.pitch,
                 lowpass: spec.lowpass,
                 reverb: spec.reverb,
+                panner: spec.panner,
             };
-            let mut voice = Voice::new(Some(spec.id), &sound, spec.looping, spec.start, spec.fade_in, now, rate);
+            let mut voice =
+                Voice::new(Some(spec.id), &sound, spec.looping, spec.start, spec.fade_in, now, rate, &mut self.streams);
             voice.fade_out = spec.fade_out;
             self.voices.push(voice);
         }
@@ -570,13 +794,15 @@ impl Mixer {
         }
         for sound in &mix.sounds {
             let bus = self.bus(sound.bus);
-            self.voices.push(Voice::new(None, &SoundSpec { bus, ..sound.clone() }, false, 0.0, 0.0, now, rate));
+            let sound = SoundSpec { bus, ..sound.clone() };
+            self.voices.push(Voice::new(None, &sound, false, 0.0, 0.0, now, rate, &mut self.streams));
         }
     }
 
     /// The next quantum, into `out`.
     fn quantum(&mut self) {
         let (now, rate, glide) = (self.now, self.rate, self.glide);
+        self.streams.pump();
         for bus in self.buses.iter_mut().filter(|bus| bus.active) {
             bus.dry = [[0.0; 2]; QUANTUM];
             bus.send = [[0.0; 2]; QUANTUM];
@@ -591,7 +817,7 @@ impl Mixer {
         let (master, buses) = self.buses.split_first_mut().expect("a master bus");
         self.master_in = master.dry;
         self.reverb_in = master.send;
-        for bus in buses.iter_mut().filter(|bus| bus.active) {
+        for (bus, meter) in buses.iter_mut().zip(&mut self.meters[1..]).filter(|(bus, _)| bus.active) {
             for i in 0..QUANTUM {
                 bus.lowpass.step(glide, rate);
                 let gain = bus.gain.next(glide);
@@ -602,6 +828,7 @@ impl Mixer {
                 let right = bus.lowpass.run(1, dry_right) * gain;
                 let wet_left = bus.lowpass.run(2, send_left) * gain;
                 let wet_right = bus.lowpass.run(3, send_right) * gain;
+                meter.add([left, right]);
                 self.master_in[i][0] += left;
                 self.master_in[i][1] += right;
                 self.reverb_in[i][0] += wet_left + left * reverb;
@@ -617,6 +844,7 @@ impl Mixer {
             let left = self.master_in[i][0] + self.reverb_out[i][0] * back;
             let right = self.master_in[i][1] + self.reverb_out[i][1] * back;
             self.out[i] = [master.lowpass.run(0, left) * gain, master.lowpass.run(1, right) * gain];
+            self.meters[0].add(self.out[i]);
         }
         self.now = end;
     }
@@ -639,6 +867,8 @@ impl Mixer {
 
 #[cfg(test)]
 mod tests {
+    use pen_runtime::panner::Ear;
+
     use super::*;
 
     const RATE: f64 = 48_000.0;
@@ -668,6 +898,7 @@ mod tests {
             start: 0.0,
             fade_in: 0.0,
             fade_out: 0.0,
+            panner: None,
         }
     }
 
@@ -894,6 +1125,7 @@ mod tests {
                         pitch: 1.2,
                         lowpass: 3000.0,
                         reverb: 0.3,
+                        panner: None,
                     }]
                 } else {
                     Vec::new()
@@ -914,6 +1146,206 @@ mod tests {
                 .all(|(a, b)| a[0].to_bits() == b[0].to_bits() && a[1].to_bits() == b[1].to_bits())
         );
     }
+    /// Each bus's meter is its output's peak and RMS since the last
+    /// reading; muting a bus silences it (gliding there) and soloing one
+    /// silences the others but the master.
+    #[test]
+    fn buses_are_metered_muted_and_soloed() {
+        let (low, high) = (sine(200.0, 1.0), sine(900.0, 1.0));
+        let frame = || {
+            let mut first = voice(1, &low);
+            first.bus = 1;
+            let mut second = voice(2, &high);
+            second.bus = 2;
+            let mut master = voice(3, &low);
+            master.gain = 0.5;
+            Mix {
+                voices: vec![first, second, master],
+                buses: vec![BusSpec { reverb: 0.0, ..MASTER }, PLAIN, PLAIN],
+                ..Mix::default()
+            }
+        };
+        let mut mixer = Mixer::new(RATE);
+        play(&mut mixer, (0..10).map(|_| frame()));
+        let (meters, used) = mixer.take_meters();
+        assert_eq!(used[..4], [true, true, true, false]);
+        // A mono sine in the middle: 1/√2 a side at its peak, half that RMS.
+        for bus in [1, 2] {
+            assert!((meters[bus].peak[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3, "{:?}", meters[bus]);
+            assert!((meters[bus].rms()[1] - 0.5).abs() < 0.01, "{:?}", meters[bus]);
+        }
+        assert!(meters[0].peak[0] > 1.0 && meters[3].samples == 0);
+        let level = |mixer: &mut Mixer, bus: usize| {
+            mixer.take_meters();
+            play(mixer, (0..10).map(|_| frame()));
+            mixer.take_meters().0[bus].rms()[0]
+        };
+        mixer.set_monitor(Monitor { muted: 0b10, soloed: 0 });
+        play(&mut mixer, (0..10).map(|_| frame()));
+        assert!(level(&mut mixer, 1) < 1e-4);
+        assert!((level(&mut mixer, 2) - 0.5).abs() < 0.01);
+        // Soloing 1 brings back none but 1 and the master's own voice, and
+        // 1 is still muted.
+        mixer.set_monitor(Monitor { muted: 0b10, soloed: 0b10 });
+        play(&mut mixer, (0..10).map(|_| frame()));
+        assert!(level(&mut mixer, 2) < 1e-4);
+        let master = level(&mut mixer, 0);
+        assert!((master - 0.25).abs() < 0.01, "{master}");
+        mixer.set_monitor(Monitor { muted: 0, soloed: 0b10 });
+        play(&mut mixer, (0..10).map(|_| frame()));
+        assert!((level(&mut mixer, 1) - 0.5).abs() < 0.01);
+        // Unmuted and unsoloed, everything is back, without a click.
+        mixer.set_monitor(Monitor::default());
+        let out = play(&mut mixer, (0..10).map(|_| frame()));
+        assert!(largest_step(&out) < 0.2, "{}", largest_step(&out));
+        assert!((level(&mut mixer, 2) - 0.5).abs() < 0.01);
+    }
+
+    /// A placed voice from where a frame puts it, with WebAudio's defaults
+    /// otherwise: an inverse model, ref 1, rolloff 1, no cone.
+    fn placed(position: Vec3) -> Placement {
+        Placement::new(&pen_protocol::Panner {
+            position: pen_protocol::Vector { x: position[0], y: position[1], z: position[2] },
+            distance_model: pen_protocol::distance_model::INVERSE,
+            ref_distance: 1.0,
+            max_distance: 10_000.0,
+            rolloff: 1.0,
+            cone_inner: 360.0,
+            cone_outer: 360.0,
+            ..pen_protocol::Panner::default()
+        })
+    }
+
+    /// A placed voice pans by where it is around the listener and quiets
+    /// with distance, in place of its own pan; one that loses its place
+    /// starts afresh, unplaced.
+    #[test]
+    fn placed_voices_pan_by_azimuth() {
+        let clip = sine(300.0, 1.0);
+        let level = |position: Vec3, pan: f32| {
+            let mut spec = voice(1, &clip);
+            spec.pan = pan;
+            spec.panner = Some(placed(position));
+            let out =
+                play(&mut Mixer::new(RATE), (0..10).map(|_| Mix { voices: vec![spec.clone()], ..Mix::default() }));
+            let side = |index: usize| {
+                (out[2400..].iter().map(|frame| f64::from(frame[index]).powi(2)).sum::<f64>()
+                    / (out.len() - 2400) as f64)
+                    .sqrt()
+            };
+            (side(0), side(1))
+        };
+        // Ahead, at the reference distance: -3 dB a side, as a mono pan in
+        // the middle, whatever its own pan says.
+        let (left, right) = level([0.0, 0.0, -1.0], 0.9);
+        let middle = 0.5;
+        assert!((left - middle).abs() < 0.01 && (right - middle).abs() < 0.01, "{left} {right}");
+        // To the right, all on the right; to the left behind, all on the
+        // left; four units off, a quarter as loud.
+        let (left, right) = level([1.0, 0.0, 0.0], 0.0);
+        assert!(left < 1e-3 && (right - middle * 2f64.sqrt()).abs() < 0.01, "{left} {right}");
+        let (left, right) = level([-4.0, 0.0, 0.0], 0.0);
+        assert!(right < 1e-3 && (left - middle * 2f64.sqrt() / 4.0).abs() < 0.01, "{left} {right}");
+        // Losing its place, it starts afresh, the old fading out.
+        let mut mixer = Mixer::new(RATE);
+        let mut spec = voice(1, &clip);
+        spec.panner = Some(placed([1.0, 0.0, 0.0]));
+        play(&mut mixer, [Mix { voices: vec![spec.clone()], ..Mix::default() }]);
+        spec.panner = None;
+        play(&mut mixer, [Mix { voices: vec![spec], ..Mix::default() }]);
+        assert_eq!(mixer.playing(), 2);
+        assert!(mixer.voices.iter().any(|voice| voice.spatial.is_none() && voice.id == Some(1)));
+    }
+
+    /// A source jumping across, and a listener turning, every frame glide
+    /// as gains do: no clicks.
+    #[test]
+    fn placed_voices_move_without_clicks() {
+        let clip = sine(330.0, 1.0);
+        let frames = (0..120).map(|frame| {
+            let side = if frame % 2 == 0 { 3.0 } else { -3.0 };
+            let turn = if frame % 3 == 0 { 0.0 } else { 1.0f32 };
+            let ear = Ear { position: [0.0; 3], forward: [turn.sin(), 0.0, -turn.cos()], up: [0.0, 1.0, 0.0] };
+            let mut spec = voice(1, &clip);
+            spec.panner = Some(placed([side, 0.0, -1.0]).heard_from(&ear));
+            Mix { voices: vec![spec], ..Mix::default() }
+        });
+        let out = play(&mut Mixer::new(RATE), frames);
+        assert!(largest_step(&out) < 0.05, "{}", largest_step(&out));
+    }
+
+    /// The panner scenarios Chromium's WebAudio rendered (testdata/panner.mjs:
+    /// a source of constant samples through a PannerNode, it and the
+    /// listener moving and turning every frame, placed in the listener's
+    /// frame as the browser host places it), played by the mixer: the same
+    /// samples, to within float rounding of the glides.
+    #[test]
+    fn panning_matches_chromium() {
+        let scenarios: serde_json::Value = serde_json::from_str(include_str!("testdata/panner.json")).unwrap();
+        let chromium: Vec<f32> = include_bytes!("testdata/panner.f32")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
+            .collect();
+        let number = |value: &serde_json::Value| value.as_f64().unwrap() as f32;
+        let vector = |value: &serde_json::Value| [number(&value[0]), number(&value[1]), number(&value[2])];
+        let keep = scenarios["keep"].as_u64().unwrap() as usize;
+        let mut expected = chromium.as_chunks::<2>().0.iter();
+        for scenario in scenarios["scenarios"].as_array().unwrap() {
+            let source: Vec<f32> = scenario["source"].as_array().unwrap().iter().map(number).collect();
+            let frame = [source[0], *source.last().unwrap()];
+            let clip = Arc::new(Clip::new(vec![frame; 48_000].into(), RATE));
+            let settings = &scenario["panner"];
+            let model = ["linear", "inverse", "exponential"]
+                .iter()
+                .position(|name| settings["distanceModel"] == *name)
+                .unwrap();
+            let frames = scenario["frames"].as_array().unwrap().iter().map(|state| {
+                let [x, y, z] = vector(&state["position"]);
+                let [ox, oy, oz] = vector(&state["orientation"]);
+                let mut spec = voice(1, &clip);
+                let listener = &state["listener"];
+                let ear = Ear {
+                    position: vector(&listener["position"]),
+                    forward: vector(&listener["forward"]),
+                    up: vector(&listener["up"]),
+                };
+                spec.panner = Some(
+                    Placement::new(&pen_protocol::Panner {
+                        position: pen_protocol::Vector { x, y, z },
+                        orientation: pen_protocol::Vector { x: ox, y: oy, z: oz },
+                        distance_model: model as u32,
+                        ref_distance: number(&settings["refDistance"]),
+                        max_distance: number(&settings["maxDistance"]),
+                        rolloff: number(&settings["rolloffFactor"]),
+                        cone_inner: number(&settings["coneInnerAngle"]),
+                        cone_outer: number(&settings["coneOuterAngle"]),
+                        cone_outer_gain: number(&settings["coneOuterGain"]),
+                        ..pen_protocol::Panner::default()
+                    })
+                    .heard_from(&ear),
+                );
+                Mix { voices: vec![spec], ..Mix::default() }
+            });
+            let out = play(&mut Mixer::new(RATE), frames);
+            let mut worst = 0.0f32;
+            for (index, frame) in out.iter().step_by(keep).enumerate() {
+                let [left, right] = *expected.next().unwrap();
+                let error = (frame[0] - left).abs().max((frame[1] - right).abs());
+                assert!(
+                    error < 1e-5,
+                    "{}: sample {}: {frame:?}, Chromium [{left}, {right}]",
+                    scenario["name"],
+                    index * keep
+                );
+                worst = worst.max(error);
+            }
+            eprintln!("{}: largest difference from Chromium {worst:e}", scenario["name"]);
+        }
+        assert!(expected.next().is_none());
+    }
+
     /// A calibration scenario, for comparing with WebAudio playing the same
     /// graph in Chromium: a ramp clip, whose samples are their own
     /// positions, panned hard left with its pitch changing every frame, and a

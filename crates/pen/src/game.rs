@@ -6,7 +6,7 @@ use crate::snapshot::{self, SavedState};
 use anyhow::Result;
 use blot_host::GuestModule;
 use pen_protocol::{Catalog, RenderFrame};
-pub use pen_runtime::game::{Edits, FrameTimings, Host, InvalidFrame, Moment, Quiet, ReloadResult, hash_lanes};
+pub use pen_runtime::game::{FrameTimings, Host, InvalidFrame, Moment, Quiet, ReloadResult, hash_lanes};
 pub use pen_runtime::program::Unresponsive;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
@@ -70,8 +70,14 @@ impl GameRuntime {
     pub fn save(&mut self, path: &Path) -> Result<()> {
         snapshot::write(path, &self.snapshot()?)
     }
-    pub fn save_scene(&mut self, path: &Path) -> Result<()> {
-        snapshot::write(path, &pollster::block_on(self.0.scene())?)
+    /// A save of the player's own, stamped and backed up (`saves`).
+    pub fn save_kept(&mut self, path: &Path) -> Result<()> {
+        crate::saves::write(path, &self.snapshot()?)
+    }
+    /// `kept`: the player's own scene, stamped and backed up (`saves`).
+    pub fn save_scene(&mut self, path: &Path, kept: bool) -> Result<()> {
+        let scene = pollster::block_on(self.0.scene())?;
+        if kept { crate::saves::write(path, &scene) } else { snapshot::write(path, &scene) }
     }
 }
 

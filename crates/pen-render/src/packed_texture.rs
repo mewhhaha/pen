@@ -40,6 +40,11 @@ pub(crate) fn level_size(size: u32, level: u32) -> u32 {
     (size >> level).max(1)
 }
 
+/// The name of a packed texture's kind byte.
+pub(crate) fn kind_name(kind: u8) -> Option<&'static str> {
+    KINDS.get(usize::from(kind)).copied()
+}
+
 pub(crate) fn is_packed_texture(bytes: &[u8]) -> bool {
     bytes.starts_with(b"GTEX")
 }

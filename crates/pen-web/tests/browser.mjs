@@ -1,19 +1,16 @@
 // Headless browser verification. Set PLAYWRIGHT_MODULE to its ES-module entry
-// and PEN_WEB_URL / PEN_WEB_SHOTS to an exported game's URL and output directory.
+// and PEN_WEB_URL / PEN_WEB_SHOTS to an exported game's URL and output
+// directory; launch.mjs says how to pick the browser and what to take away.
 import { mkdir, writeFile } from 'node:fs/promises';
-const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || 'playwright-core');
+import { hide, launch } from './launch.mjs';
 const shots = process.env.PEN_WEB_SHOTS || 'target/browser-shots';
 await mkdir(shots, { recursive: true });
-let args = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-vulkan=native', '--use-angle=vulkan', '--disable-vulkan-surface'];
-if (process.env.PEN_WEB_GPU === 'software') {
-  args = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-vulkan=swiftshader',
-    '--use-webgpu-adapter=swiftshader', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'];
-}
-const browser = await chromium.launch({ headless: true, args });
+const browser = await launch();
 let page;
 const messages = [];
 try {
   page = await browser.newPage({ viewport: { width: 960, height: 640 } });
+  await hide(page);
   page.on('console', message => { messages.push({ type: message.type(), text: message.text() }); if (message.type() === 'error') console.log(message.text()); });
   page.on('pageerror', error => messages.push({ type: 'pageerror', text: String(error) }));
   // SwiftShader verifies the real shader/host at a bounded software-GPU cost.
@@ -72,6 +69,7 @@ try {
   await page.screenshot({ path: `${shots}/restored.png` });
   // A dense display: the canvas is backed by device pixels.
   const dense = await browser.newPage({ viewport: { width: 480, height: 320 }, deviceScaleFactor: 2 });
+  await hide(dense);
   dense.on('console', message => { if (message.type() === 'error') messages.push({ type: 'error', text: `dense: ${message.text()}` }); });
   dense.on('pageerror', error => messages.push({ type: 'pageerror', text: `dense: ${error}` }));
   await dense.goto(url.href, { waitUntil: 'networkidle' });

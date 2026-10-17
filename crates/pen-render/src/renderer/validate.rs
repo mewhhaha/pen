@@ -10,6 +10,7 @@ use crate::matrix::narrow;
 pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
     validate_matrix(&frame.view)?;
     validate_matrix(&frame.projection)?;
+    crate::lights::validate(&frame.lights)?;
     for patch in &frame.fields {
         let most = u32::try_from(MAX_FIELD)?;
         ensure!(
@@ -62,6 +63,37 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
         validate_matrix(&decal.transform)?;
         determinant_of(&decal.transform)?;
         ensure!(decal.opacity >= 0.0 && decal.opacity <= 1.0, "decal opacity must be within 0..1");
+    }
+    for pose in &frame.poses {
+        ensure!((pose.draw as usize) < frame.draws.len(), "a pose layer must name one of the frame's draws");
+        ensure!(
+            pose.time.is_finite() && pose.weight.is_finite() && pose.weight >= 0.0,
+            "a pose layer needs a finite time and a finite weight of 0 or more"
+        );
+    }
+    for emitter in &frame.emitters {
+        validate_matrix(&emitter.transform)?;
+        let colors = [&emitter.color_start, &emitter.color_end]
+            .into_iter()
+            .flat_map(|color| [color.r, color.g, color.b, color.a]);
+        let gravity = [emitter.gravity.x, emitter.gravity.y, emitter.gravity.z];
+        let velocity = [emitter.velocity.x, emitter.velocity.y, emitter.velocity.z];
+        ensure!(
+            [
+                emitter.rate,
+                emitter.lifetime,
+                emitter.radius,
+                emitter.spread,
+                emitter.drag,
+                emitter.size_start,
+                emitter.size_end
+            ]
+            .into_iter()
+            .chain(colors)
+            .all(|value| value.is_finite() && value >= 0.0)
+                && [emitter.time, emitter.duration].into_iter().chain(gravity).chain(velocity).all(f32::is_finite),
+            "an emitter needs finite values, and rates, lifetimes, sizes and colors of 0 or more"
+        );
     }
     for solid in &frame.solids {
         for face in &solid.faces {

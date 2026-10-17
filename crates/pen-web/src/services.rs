@@ -1,7 +1,8 @@
 //! The game's services in a browser, through pen-runtime's registry: what
-//! the game runs on, pathfinding, web addresses (a new tab, as the page's
+//! the game runs on, pathfinding, the simulation services (`pen_simulation`,
+//! the same bits as native), web addresses (a new tab, as the page's
 //! permissions allow) and the clipboard, whose promises answer a later
-//! frame. Steam is unavailable.
+//! frame. Steam and reports to the developer are unavailable.
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -23,6 +24,17 @@ pub fn standard() -> Services {
     services.register(Box::new(Pathfinding));
     services.register(Box::new(Url));
     services.register(Box::new(Clipboard::default()));
+    pen_simulation::register(&mut services);
+    // Reports go only from a native package whose developer takes them.
+    services.register(Box::new(Unavailable(service::REPORTS)));
+    services
+}
+
+/// The browser's services, and the engine's preferences as the page keeps
+/// them.
+pub fn with_preferences(preferences: pen_runtime::engine_preferences::PreferencesService) -> Services {
+    let mut services = standard();
+    services.register(Box::new(preferences));
     services
 }
 

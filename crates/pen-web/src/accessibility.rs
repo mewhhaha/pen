@@ -15,6 +15,9 @@ pub struct Accessibility {
     last: Vec<UiNode>,
     tools: bool,
     input: Rc<RefCell<Input>>,
+    /// The captions' live region, while the game's sounds carry captions,
+    /// and what it says.
+    captions: Option<(Element, String)>,
 }
 impl Accessibility {
     pub fn new(input: Rc<RefCell<Input>>) -> Result<Self> {
@@ -27,7 +30,33 @@ impl Accessibility {
         .map_err(error)?;
         root.set_attribute("aria-label", "Game interface").map_err(error)?;
         document.body().unwrap().append_child(&root).map_err(error)?;
-        Ok(Self { root, last: Vec::new(), tools: false, input })
+        Ok(Self { root, last: Vec::new(), tools: false, input, captions: None })
+    }
+    /// The captions showing, a line each, in a polite live region after the
+    /// interface; none when the game's sounds carry none.
+    pub fn captions(&mut self, text: Option<&str>) -> Result<()> {
+        let Some(text) = text else {
+            if let Some((element, _)) = self.captions.take() {
+                element.remove();
+            }
+            return Ok(());
+        };
+        if self.captions.is_none() {
+            let document = web_sys::window().unwrap().document().unwrap();
+            let element = document.create_element("div").map_err(error)?;
+            for (key, value) in [("role", "status"), ("aria-live", "polite"), ("aria-label", "Captions")] {
+                element.set_attribute(key, value).map_err(error)?;
+            }
+            self.root.after_with_node_1(&element).map_err(error)?;
+            self.captions = Some((element, String::new()));
+        }
+        if let Some((element, shown)) = &mut self.captions
+            && shown != text
+        {
+            element.set_text_content(Some(text));
+            text.clone_into(shown);
+        }
+        Ok(())
     }
     /// Shows `nodes`, the dev tools' interface when `tools`, else the game's.
     pub fn update(&mut self, nodes: &[UiNode], tools: bool) -> Result<()> {

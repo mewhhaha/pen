@@ -1,0 +1,5 @@
+{
+  "meshes": ["box.mesh.json", "ball.mesh.json"],
+  "materials": ["ball.material.json", "floor.material.json", "wall.material.json", "marker.material.json"],
+  "sounds": ["bounce.wav"]
+}

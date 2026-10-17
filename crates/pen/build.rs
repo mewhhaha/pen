@@ -41,12 +41,27 @@ fn compatibility() -> String {
     let mut files = Vec::new();
     collect(&host, &mut files);
     files.sort();
+    // The same mark on every system that builds the same source: paths
+    // with `/`, and text without the `\r` a Windows checkout may add.
     for file in files {
-        hash.write(file.strip_prefix(&host).unwrap_or(&file).to_string_lossy().as_bytes());
-        hash.write(&std::fs::read(&file).unwrap_or_default());
+        let relative = file.strip_prefix(&host).unwrap_or(&file);
+        let parts: Vec<_> = relative.components().map(|part| part.as_os_str().to_string_lossy()).collect();
+        hash.write(parts.join("/").as_bytes());
+        hash.write(&unix_lines(&std::fs::read(&file).unwrap_or_default()));
     }
-    hash.write(&std::fs::read(&abi).unwrap_or_default());
+    hash.write(&unix_lines(&std::fs::read(&abi).unwrap_or_default()));
     format!("wasmtime {wasmtime}, engine {:016x}", hash.0)
+}
+
+/// `bytes` with each `\r\n` as `\n`.
+fn unix_lines(bytes: &[u8]) -> Vec<u8> {
+    let mut lines = Vec::with_capacity(bytes.len());
+    for (at, &byte) in bytes.iter().enumerate() {
+        if byte != b'\r' || bytes.get(at + 1) != Some(&b'\n') {
+            lines.push(byte);
+        }
+    }
+    lines
 }
 
 /// Every file under `directory` but build output.

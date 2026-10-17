@@ -1,0 +1,33 @@
+{
+  "game": { "name": "bounce", "title": "Bounce" },
+  "plugins": {
+    "blot": {
+      "read": ["../../../blot2/std"],
+      "run": { "blotc": "../../../blot2/generated/compiler/blotc.gz" }
+    }
+  },
+  "compiler": {
+    "plugin": "blot",
+    "settings": {
+      "std": "../../../blot2/std",
+      "imports": { "pen/": "pen/" },
+      "nativeAssets": { "roots": ["src"] }
+    }
+  },
+  "protocol": {
+    "events": {
+      "Kick": {
+        "tag": 1,
+        "doc": "Pushes the ball: adds to its velocity along x and z, in units a second.",
+        "fields": { "x": "f32", "z": "f32" }
+      }
+    },
+    "sections": {
+      "Score": {
+        "tag": 1,
+        "doc": "How the ball is doing, every frame: how often it has hit a wall, and how fast it goes.",
+        "fields": { "bounces": "integer", "speed": "f32" }
+      }
+    }
+  }
+}

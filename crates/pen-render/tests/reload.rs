@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use common::*;
 use pen_protocol::*;
-use pen_render::{Renderer, RendererOptions};
+use pen_render::{Display, Renderer, RendererOptions};
 
 // Its triangle in its material's color times the texture's middle texel.
 const TINTED: &str = r#"
@@ -113,7 +113,13 @@ fn reloaded_assets_replace_the_live_ones() {
     let mut renderer = Renderer::new(
         device.clone(),
         queue.clone(),
-        RendererOptions { format: FORMAT, assets: root.clone(), veil: None, pipeline_cache: None },
+        RendererOptions {
+            format: FORMAT,
+            display: Display::SDR,
+            assets: root.clone(),
+            veil: None,
+            pipeline_cache: None,
+        },
     )
     .unwrap();
     renderer.preload(&catalog);

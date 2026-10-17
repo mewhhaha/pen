@@ -1,9 +1,14 @@
 //! The browser's WebAssembly backend: a guest's long-lived `main(host)`
 //! runs under JSPI (`guest.js`), suspended at each host call until the next
-//! request. Rust checks the module's `blot:abi` manifest before it runs.
+//! request. Rust checks the module's `blot:abi` manifest before it runs, and
+//! describes a trap's Wasm frames with the module's symbols, as native pen
+//! does.
+use std::rc::Rc;
+
 use anyhow::{Result, anyhow, ensure};
 use js_sys::{Float32Array, Promise, Reflect, Uint8Array};
 use pen_runtime::program::{self, Backend, Operation, Program};
+use pen_runtime::symbols::{Symbols, js_frames};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_time::Instant;
@@ -26,6 +31,18 @@ pub fn error(value: JsValue) -> anyhow::Error {
     anyhow!("{:?}", value)
 }
 
+/// A guest's failure as an error: the exception's message, and the Wasm
+/// frames of its stack described by the module's symbols.
+fn failure(value: JsValue, symbols: &Symbols) -> anyhow::Error {
+    let stack = Reflect::get(&value, &"stack".into()).ok().and_then(|stack| stack.as_string());
+    let frames = stack.as_deref().map(js_frames).unwrap_or_default();
+    let error = match value.dyn_ref::<js_sys::Error>() {
+        Some(exception) => anyhow!("{}", String::from(exception.to_string())),
+        None => error(value),
+    };
+    if frames.is_empty() { error } else { error.context(symbols.backtrace(&frames)) }
+}
+
 #[derive(Clone)]
 pub struct BrowserBackend;
 
@@ -38,6 +55,7 @@ pub struct BrowserProgram {
     stopping: bool,
     answered: Option<Instant>,
     failure: Option<String>,
+    symbols: Rc<Symbols>,
 }
 
 impl Backend for BrowserBackend {
@@ -46,8 +64,12 @@ impl Backend for BrowserBackend {
 
     async fn start(&self, module: &Vec<u8>) -> Result<BrowserProgram> {
         let abi = pen_runtime::abi::read_abi(module)?;
+        abi.check_hostable()?;
         abi.check_game()?;
-        let value = open_guest(Uint8Array::from(module.as_slice()), abi.ownership).await.map_err(error)?;
+        let symbols = Rc::new(Symbols::read(module));
+        let value = open_guest(Uint8Array::from(module.as_slice()), abi.ownership)
+            .await
+            .map_err(|value| failure(value, &symbols))?;
         let description = Float32Array::new(&Reflect::get(&value, &"description".into()).map_err(error)?).to_vec();
         let (schema, scenes) = program::handshake(&description)?;
         Ok(BrowserProgram {
@@ -59,6 +81,7 @@ impl Backend for BrowserBackend {
             stopping: false,
             answered: None,
             failure: None,
+            symbols,
         })
     }
 }
@@ -86,12 +109,12 @@ impl Program for BrowserProgram {
     async fn response(&mut self) -> Result<program::Response> {
         let (operation, promise) =
             self.pending.take().ok_or_else(|| anyhow!("game program has no request in flight"))?;
-        let result = JsFuture::from(promise).await.map_err(error);
+        let result = JsFuture::from(promise).await.map_err(|value| failure(value, &self.symbols));
         self.answered = Some(Instant::now());
         match result {
             Ok(value) => program::response(operation, Float32Array::new(&value).to_vec()),
             Err(error) => {
-                self.failure = Some(error.to_string());
+                self.failure = Some(format!("{error:#}"));
                 Err(error)
             }
         }

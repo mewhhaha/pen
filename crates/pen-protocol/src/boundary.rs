@@ -15,15 +15,15 @@ pub fn whole(lane: f32) -> Option<u32> {
     (lane.fract() == 0.0 && (0.0..4_294_967_296.0).contains(&lane)).then_some(lane as u32)
 }
 
+/// A game's catalog: its `meshes` and `materials`, and `sounds` if it has
+/// any, each a list of relative paths, which may be empty (a game that
+/// draws only sprites has no meshes).
 pub fn parse_catalog(value: &serde_json::Value) -> Result<Catalog> {
     let object = value.as_object().ok_or_else(|| anyhow!("asset catalog must be an object"))?;
-    let paths = |kind: &str, empty: bool| -> Result<Vec<String>> {
+    let paths = |kind: &str| -> Result<Vec<String>> {
         let entries = object.get(kind).and_then(|entries| entries.as_array());
         let invalid = || anyhow!("asset catalog {kind} must contain relative paths");
         let entries = entries.ok_or_else(invalid)?;
-        if entries.is_empty() && !empty {
-            return Err(invalid());
-        }
         entries
             .iter()
             .map(|entry| {
@@ -36,9 +36,9 @@ pub fn parse_catalog(value: &serde_json::Value) -> Result<Catalog> {
             .collect()
     };
     Ok(Catalog {
-        meshes: paths("meshes", false)?,
-        materials: paths("materials", false)?,
-        sounds: if object.contains_key("sounds") { paths("sounds", true)? } else { Vec::new() },
+        meshes: paths("meshes")?,
+        materials: paths("materials")?,
+        sounds: if object.contains_key("sounds") { paths("sounds")? } else { Vec::new() },
     })
 }
 
@@ -52,6 +52,24 @@ pub fn read_catalog(assets: &std::path::Path) -> Result<Catalog> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalogs_list_relative_paths_or_none() {
+        let parse = |text: &str| parse_catalog(&serde_json::from_str(text).unwrap());
+        let sprites = parse(r#"{"meshes": [], "materials": ["ui.material.json"]}"#).unwrap();
+        assert_eq!((sprites.meshes.len(), sprites.materials.len(), sprites.sounds.len()), (0, 1, 0));
+        assert!(parse(r#"{"meshes": [], "materials": [], "sounds": []}"#).is_ok());
+        for wrong in [
+            r#"{"materials": []}"#,
+            r#"{"meshes": "cube.mesh.json", "materials": []}"#,
+            r#"{"meshes": ["../cube.mesh.json"], "materials": []}"#,
+            r#"{"meshes": ["/cube.mesh.json"], "materials": []}"#,
+            r#"{"meshes": [""], "materials": []}"#,
+            r#"[]"#,
+        ] {
+            assert!(parse(wrong).is_err(), "{wrong}");
+        }
+    }
 
     #[test]
     fn frames_encode_as_the_browser_host_does() {
@@ -188,6 +206,40 @@ mod tests {
         assert!(decode_frame(&short, 3, &catalog).is_err());
     }
 
+    /// Pose layers and particle emitters follow the voices, each in its
+    /// record's lanes; a material the catalog lacks is refused.
+    #[test]
+    fn poses_and_emitters_follow_the_voices() {
+        let catalog = Catalog { meshes: vec!["m".into()], materials: vec!["a".into(), "b".into()], sounds: vec![] };
+        let mut packet = vec![0.0; PACKET_HEADER_FLOATS];
+        packet[0] = PACKET_MAGIC;
+        packet[1] = 3.0;
+        packet[lanes::header::POSE_COUNT] = 2.0;
+        packet[lanes::header::EMITTER_COUNT] = 1.0;
+        packet.extend([0.0, 1.0, 0.25, 1.0, 0.0, 0.0, 0.5, 0.5]);
+        let mut emitter = vec![0.0; EMITTER_FLOATS];
+        emitter[lanes::emitter::MATERIAL] = 1.0;
+        emitter[lanes::emitter::TRANSFORM..lanes::emitter::TRANSFORM + 16]
+            .copy_from_slice(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 3.0, 4.0, 1.0]);
+        emitter[lanes::emitter::SEED] = 9.0;
+        emitter[lanes::emitter::RATE] = 30.0;
+        emitter[lanes::emitter::GRAVITY + 1] = -9.8;
+        emitter[lanes::emitter::COLOR_END + 3] = 0.5;
+        emitter[lanes::emitter::ADDITIVE] = 1.0;
+        packet.extend(&emitter);
+        let render = decode_frame(&packet, 3, &catalog).unwrap().render;
+        assert_eq!(
+            render.poses,
+            [Pose { draw: 0, clip: 1, time: 0.25, weight: 1.0 }, Pose { draw: 0, clip: 0, time: 0.5, weight: 0.5 }]
+        );
+        let decoded = &render.emitters[0];
+        assert_eq!((decoded.material, decoded.seed, decoded.rate, decoded.additive), (1, 9, 30.0, true));
+        assert_eq!((decoded.transform[12], decoded.gravity.y, decoded.color_end.a), (2.0, -9.8, 0.5));
+        let mut unknown = packet.clone();
+        unknown[PACKET_HEADER_FLOATS + 8 + lanes::emitter::MATERIAL] = 2.0;
+        assert!(decode_frame(&unknown, 3, &catalog).is_err());
+    }
+
     /// Decoding into a frame that held another replaces all of it, and the
     /// state comes back where it lies in the packet.
     #[test]
@@ -302,5 +354,50 @@ mod tests {
             let decoded = decode_frame(&lanes, schema, &catalog).unwrap();
             assert!(!decoded.render.draws.is_empty(), "{} has no draws", path.display());
         }
+    }
+
+    /// The game's own sections come after everything else, the draws'
+    /// extra lanes included, and a packet without them ends before them.
+    #[test]
+    fn the_games_own_sections_follow_the_packet() {
+        let catalog = Catalog { meshes: vec!["m".into()], materials: vec!["x".into()], sounds: vec![] };
+        let mut packet = vec![0.0; PACKET_HEADER_FLOATS];
+        packet[0] = PACKET_MAGIC;
+        packet[1] = 3.0;
+        packet[lanes::header::DRAW_COUNT] = 1.0;
+        let mut draw = vec![0.0; DRAW_FLOATS];
+        draw[lanes::draw::TRANSFORM] = 1.0;
+        draw[lanes::draw::EXTRA] = 2.0;
+        packet.extend(draw);
+        packet.extend((0..8).map(|lane| lane as f32));
+        let plain = packet.clone();
+        packet.extend([EXTENSIONS_MARKER, 2.0, 1.0, 2.0, 1.5, 2.5, 7.0, 0.0]);
+        let mut frame = decode_frame(&packet, 3, &catalog).unwrap().render;
+        assert_eq!(frame.draws[0].extra.as_ref().map(Vec::len), Some(8));
+        assert_eq!(
+            frame.extensions,
+            [Extension { tag: 1, values: vec![1.5, 2.5] }, Extension { tag: 7, values: vec![] }]
+        );
+        // One without them leaves none behind.
+        decode_into(&plain, 3, &catalog, &mut frame).unwrap();
+        assert!(frame.extensions.is_empty());
+        let block = PACKET_HEADER_FLOATS + DRAW_FLOATS + 8;
+        let changed = |at: usize, value: f32| {
+            let mut changed = packet.clone();
+            changed[block + at] = value;
+            decode_frame(&changed, 3, &catalog).map(|decoded| decoded.render)
+        };
+        let invalid = "game returned invalid extension sections";
+        // Lanes that are no block make an oversized packet, as they did.
+        let oversized = "game returned a truncated, oversized or nonfinite frame";
+        assert_eq!(changed(0, 1.0).unwrap_err().to_string(), oversized, "the marker");
+        assert_eq!(changed(2, 0.0).unwrap_err().to_string(), invalid, "tag 0");
+        assert!(changed(2, MAX_EXTENSION_TAG as f32 + 1.0).is_err(), "a tag past the most");
+        assert!(changed(1, MAX_EXTENSIONS as f32 + 1.0).is_err(), "too many sections");
+        assert!(changed(1, 3.0).is_err(), "a section the packet lacks");
+        assert!(changed(3, 3.0).is_err(), "lanes the packet lacks");
+        let mut longer = packet.clone();
+        longer.push(0.0);
+        assert!(decode_frame(&longer, 3, &catalog).is_err(), "lanes after the last section");
     }
 }

@@ -6,15 +6,21 @@
 // brighter than white spills light round it (`bloom`). A last pass adds the
 // bloom, rolls the highlights off into white (`toned`), applies FXAA, splits
 // the colors of the surfaces whose material asks for the frame's aberration,
-// and scales the image to the screen.
+// and scales the image to the screen. The passes after the scene draw as a
+// render graph (graph.rs), made again when the targets' size or the passes
+// change.
 //
 // `${...}` in the WGSL marks where a value is put in.
 use std::collections::HashMap;
 
-use pen_protocol::{Quality, RenderFrame};
+use pen_protocol::{Matrix, Quality, RenderFrame};
 
 use crate::built_in::{BuiltIn, BuiltIns};
+use crate::downlevel::{DepthCopy, MARKS_FORMAT, Marks};
+use crate::graph::{Binding, Graph, GraphBuilder, Handle, Spec, Target};
 use crate::matrix::{invert, multiply};
+use crate::packed_texture::level_size;
+use crate::renderer::GpuTimer;
 use crate::shader::PipelineContext;
 
 /// The scene's format: floating point, so its light can go past white.
@@ -37,7 +43,7 @@ fn depth_texture(samples: u32) -> &'static str {
 // smooth edges against the sky.
 const ATMOSPHERE_SHADER: &str = include_str!("shaders/atmosphere.wgsl");
 
-fn atmosphere_shader(samples: u32) -> String {
+pub(crate) fn atmosphere_shader(samples: u32) -> String {
     ATMOSPHERE_SHADER
         .replace("${depth_texture}", depth_texture(samples))
         .replace("${fullscreen}", FULLSCREEN)
@@ -66,7 +72,7 @@ fn kernel() -> String {
 // surface the depth buffer shows to be filled, within a world-space radius.
 const OCCLUSION_SHADER: &str = include_str!("shaders/occlusion.wgsl");
 
-fn occlusion_shader(samples: u32) -> String {
+pub(crate) fn occlusion_shader(samples: u32) -> String {
     OCCLUSION_SHADER
         .replace("${depth_texture}", depth_texture(samples))
         .replace("${fullscreen}", FULLSCREEN)
@@ -75,11 +81,13 @@ fn occlusion_shader(samples: u32) -> String {
 
 const PRESENT_SHADER: &str = include_str!("shaders/present.wgsl");
 
-fn present_shader(samples: u32) -> String {
+pub(crate) fn present_shader(samples: u32, display: &crate::Display) -> String {
+    // An HDR display's highlights roll off toward its peak, not white.
+    let toned = if display.is_hdr() { crate::display::toned_wgsl(display.encoded_peak()) } else { TONED_WGSL.into() };
     PRESENT_SHADER
         .replace("${marks_texture}", if samples > 1 { "texture_multisampled_2d<u32>" } else { "texture_2d<u32>" })
         .replace("${fullscreen}", FULLSCREEN)
-        .replace("${tonedWgsl}", TONED_WGSL)
+        .replace("${tonedWgsl}", &toned)
         .replace("${fxaa}", include_str!("shaders/fxaa.wgsl"))
 }
 
@@ -95,7 +103,7 @@ const BLOOM_VERTEX: &str = include_str!("shaders/bloom_vertex.wgsl");
 
 const BLOOM_DOWN_SHADER: &str = include_str!("shaders/bloom_down.wgsl");
 
-fn bloom_down_shader(first: bool) -> String {
+pub(crate) fn bloom_down_shader(first: bool) -> String {
     BLOOM_DOWN_SHADER
         .replace("${bloomVertex}", BLOOM_VERTEX)
         .replace("${weight}", if first { "1.0 / (1.0 + brightness(color))" } else { "1.0" })
@@ -104,7 +112,7 @@ fn bloom_down_shader(first: bool) -> String {
 
 const BLOOM_UP_SHADER: &str = include_str!("shaders/bloom_up.wgsl");
 
-fn bloom_up_shader() -> String {
+pub(crate) fn bloom_up_shader() -> String {
     BLOOM_UP_SHADER.replace("${bloomVertex}", BLOOM_VERTEX)
 }
 
@@ -123,13 +131,13 @@ const OCCLUSION_BIAS: f32 = 0.04;
 
 // The atmosphere pass's uniform: the camera, the sky the game worked out, the
 // fog and how far ambient occlusion darkens.
-fn atmosphere_of(frame: &RenderFrame, quality: &Quality, width: u32, height: u32) -> [f32; 56] {
+fn atmosphere_of(frame: &RenderFrame, projection: &Matrix, quality: &Quality, width: u32, height: u32) -> [f32; 56] {
     let camera = invert(&frame.view);
     let sky = &frame.sky;
     let clear = &frame.clear;
     let light = &frame.light_color;
     let mut data = [0.0; 56];
-    data[..16].copy_from_slice(&invert(&multiply(&frame.projection, &frame.view)));
+    data[..16].copy_from_slice(&invert(&multiply(projection, &frame.view)));
     data[16..].copy_from_slice(&[
         camera[12],
         camera[13],
@@ -175,21 +183,7 @@ fn atmosphere_of(frame: &RenderFrame, quality: &Quality, width: u32, height: u32
     data
 }
 
-struct BloomLevel {
-    view: wgpu::TextureView,
-    down: wgpu::BindGroup,
-    up: Option<wgpu::BindGroup>,
-}
-
-struct Groups {
-    occlusion: Option<wgpu::BindGroup>,
-    atmosphere: Option<wgpu::BindGroup>,
-    /// Each bloom level's pass down from the one above, then up into it.
-    bloom: Vec<BloomLevel>,
-    present: wgpu::BindGroup,
-}
-
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 struct TargetsKey {
     width: u32,
     height: u32,
@@ -197,9 +191,11 @@ struct TargetsKey {
     occluding: bool,
     atmosphere: bool,
     levels: u32,
+    taa: bool,
 }
 
-/// The textures the passes draw into, as they view them.
+/// The scene's attachments, as the passes view them, and the graph of the
+/// passes after the scene.
 struct Targets {
     key: TargetsKey,
     /// Depth, and the stencil marks of surfaces the aberration splits; and
@@ -210,11 +206,11 @@ struct Targets {
     multisampled: Option<wgpu::TextureView>,
     /// The resolved scene.
     scene: wgpu::TextureView,
-    /// Ambient occlusion, when it is on.
-    occlusion: Option<wgpu::TextureView>,
-    /// Sky and fog over the scene, when there are any.
-    composed: Option<wgpu::TextureView>,
-    groups: Groups,
+    /// The graph of the passes after the scene; with TAA, one for each
+    /// history texture it reads, turn about.
+    graphs: Vec<Graph>,
+    /// The stencil's marks copied out, where it cannot be sampled.
+    marks: Option<wgpu::TextureView>,
 }
 
 /// The attachments of one frame's scene passes, from `Post::begin`.
@@ -259,17 +255,17 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
     let (code, target, blend) = match which {
         BuiltIn::Occlusion(samples) => (occlusion_shader(samples), wgpu::TextureFormat::R8Unorm, None),
         BuiltIn::Atmosphere(samples) => (atmosphere_shader(samples), SCENE_FORMAT, None),
-        BuiltIn::Present(samples) => (present_shader(samples), context.format, None),
+        BuiltIn::Taa(samples) => (crate::taa::shader(samples), SCENE_FORMAT, None),
+        BuiltIn::Present(samples) => (present_shader(samples, &context.display), context.format, None),
         BuiltIn::BloomDown { first } => (bloom_down_shader(first), SCENE_FORMAT, None),
         // Each level up is added onto the one above.
         BuiltIn::BloomUp => (bloom_up_shader(), SCENE_FORMAT, Some(wgpu::BlendState { color: add, alpha: add })),
-        BuiltIn::Decal { .. } | BuiltIn::Composite => unreachable!("not a pass around the scene: {which:?}"),
+        BuiltIn::Decal { .. } | BuiltIn::Composite | BuiltIn::Particles { .. } => {
+            unreachable!("not a pass around the scene: {which:?}")
+        }
     };
     let label = format!("{which:?}");
-    let module = context.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(&label),
-        source: wgpu::ShaderSource::Wgsl(code.into()),
-    });
+    let module = crate::downlevel::shader_module(&context.device, Some(&label), &code);
     context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(&label),
         layout: None,
@@ -302,9 +298,18 @@ pub(crate) struct Post {
     unoccluded: wgpu::Texture,
     unbloomed: wgpu::Texture,
     targets: Option<Targets>,
+    /// What copies the marks, where the stencil cannot be sampled, and the
+    /// depth, where it cannot be read as it is (downlevel.rs).
+    marks: Option<Marks>,
+    depth_copy: Option<DepthCopy>,
     /// The begun frame's quality and output size.
     quality: Option<Quality>,
     size: (u32, u32),
+    /// With TAA: frames jittered so far, the begun frame's jittered
+    /// projection, and what the history remembers.
+    jitters: u64,
+    jittered: Option<(Matrix, (f64, f64))>,
+    memory: crate::taa::Memory,
 }
 
 fn texture(
@@ -363,9 +368,25 @@ impl Post {
             unoccluded: single(wgpu::TextureFormat::R8Unorm, 255),
             unbloomed: single(SCENE_FORMAT, 0),
             targets: None,
+            marks: None,
+            depth_copy: crate::downlevel::limited(device).then(|| DepthCopy::new(device)),
             quality: None,
             size: (1, 1),
+            jitters: 0,
+            jittered: None,
+            memory: Default::default(),
         }
+    }
+
+    /// The passes after the scene that the last frame drew, in order.
+    pub fn passes(&self) -> Vec<&'static str> {
+        self.targets.as_ref().map(|targets| targets.graphs[0].names()).unwrap_or_default()
+    }
+
+    /// The begun frame's projection, jittered within its pixels, when TAA is
+    /// on: the scene draws with it.
+    pub fn jittered(&self) -> Option<Matrix> {
+        self.jittered.map(|(projection, _)| projection)
     }
 
     fn uniform(&mut self, name: &'static str, size: u64) -> wgpu::Buffer {
@@ -381,18 +402,6 @@ impl Post {
                 })
             })
             .clone()
-    }
-
-    fn group(&self, from: &wgpu::RenderPipeline, resources: &[wgpu::BindingResource<'_>]) -> wgpu::BindGroup {
-        let entries: Vec<_> = (0..)
-            .zip(resources)
-            .map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource: resource.clone() })
-            .collect();
-        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &from.get_bind_group_layout(0),
-            entries: &entries,
-        })
     }
 
     /// Prepares the attachments for `frame` drawn with `quality` on an
@@ -426,7 +435,8 @@ impl Post {
         } else {
             0
         };
-        let key = TargetsKey { width, height, samples, occluding, atmosphere, levels };
+        let taa = quality.taa;
+        let key = TargetsKey { width, height, samples, occluding, atmosphere, levels, taa };
         if self.targets.as_ref().is_none_or(|targets| targets.key != key) {
             self.targets = None;
             let attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
@@ -443,101 +453,51 @@ impl Post {
             let multisampled =
                 (samples > 1).then(|| texture(device, width, height, attachment, samples, SCENE_FORMAT, 1));
             let scene = texture(device, width, height, sampled, 1, SCENE_FORMAT, 1);
-            let occlusion =
-                occluding.then(|| texture(device, width, height, sampled, 1, wgpu::TextureFormat::R8Unorm, 1));
-            let composed = atmosphere.then(|| texture(device, width, height, sampled, 1, SCENE_FORMAT, 1));
-            let bloom = (levels > 0).then(|| texture(device, half.0, half.1, sampled, 1, SCENE_FORMAT, levels));
-            let lit = composed.as_ref().unwrap_or(&scene).create_view(&Default::default());
-            let level = |index: u32| {
-                bloom.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor {
-                    base_mip_level: index,
-                    mip_level_count: Some(1),
+            // The depth that ambient occlusion and the sky and fog read: a
+            // copy where the device cannot read it as it is.
+            let read_depth = match &mut self.depth_copy {
+                Some(copy) => copy.target(device, (width, height)),
+                None => depth_only(),
+            };
+            // The stencil's marks, copied where it cannot be sampled.
+            let copied = crate::downlevel::limited(device)
+                .then(|| texture(device, width, height, sampled, 1, MARKS_FORMAT, 1).create_view(&Default::default()));
+            let marks = copied.clone().unwrap_or_else(|| {
+                depth.create_view(&wgpu::TextureViewDescriptor {
+                    aspect: wgpu::TextureAspect::StencilOnly,
                     ..Default::default()
                 })
-            };
-            let occlusion_group = if occluding {
-                let pipeline = built_ins.get(BuiltIn::Occlusion(samples)).clone();
-                let uniform = self.uniform("occlusion", 160);
-                Some(self.group(
-                    &pipeline,
-                    &[uniform.as_entire_binding(), wgpu::BindingResource::TextureView(&depth_only())],
-                ))
-            } else {
-                None
-            };
-            let atmosphere_group = if atmosphere {
-                let pipeline = built_ins.get(BuiltIn::Atmosphere(samples)).clone();
-                let uniform = self.uniform("atmosphere", 224);
-                let occlusion_view = occlusion.as_ref().unwrap_or(&self.unoccluded).create_view(&Default::default());
-                Some(self.group(
-                    &pipeline,
-                    &[
-                        uniform.as_entire_binding(),
-                        wgpu::BindingResource::TextureView(&scene.create_view(&Default::default())),
-                        wgpu::BindingResource::TextureView(&depth_only()),
-                        wgpu::BindingResource::TextureView(&occlusion_view),
-                        wgpu::BindingResource::Sampler(&self.sampler),
-                    ],
-                ))
-            } else {
-                None
-            };
-            let mut bloom_levels = Vec::new();
-            for index in 0..levels {
-                let down_pipeline = built_ins.get(BuiltIn::BloomDown { first: index == 0 }).clone();
-                let from = if index == 0 { lit.clone() } else { level(index - 1) };
-                let down = self.group(
-                    &down_pipeline,
-                    &[wgpu::BindingResource::TextureView(&from), wgpu::BindingResource::Sampler(&self.sampler)],
-                );
-                let up = if index + 1 < levels {
-                    let up_pipeline = built_ins.get(BuiltIn::BloomUp).clone();
-                    Some(self.group(
-                        &up_pipeline,
-                        &[
-                            wgpu::BindingResource::TextureView(&level(index + 1)),
-                            wgpu::BindingResource::Sampler(&self.sampler),
-                        ],
-                    ))
-                } else {
-                    None
-                };
-                bloom_levels.push(BloomLevel { view: level(index), down, up });
-            }
-            let present_pipeline = built_ins.get(BuiltIn::Present(samples)).clone();
-            let present_uniform = self.uniform("present", 64);
-            let marks = depth.create_view(&wgpu::TextureViewDescriptor {
-                aspect: wgpu::TextureAspect::StencilOnly,
-                ..Default::default()
             });
-            let glow = if bloom.is_some() { level(0) } else { self.unbloomed.create_view(&Default::default()) };
-            let present = self.group(
-                &present_pipeline,
-                &[
-                    present_uniform.as_entire_binding(),
-                    wgpu::BindingResource::TextureView(&lit),
-                    wgpu::BindingResource::Sampler(&self.sampler),
-                    wgpu::BindingResource::TextureView(&marks),
-                    wgpu::BindingResource::TextureView(&glow),
-                ],
-            );
             let view = |texture: &wgpu::Texture| texture.create_view(&Default::default());
+            // With TAA, a graph for each history texture read, sharing the
+            // rest; a new history starts afresh.
+            self.memory = Default::default();
+            let histories = taa.then(|| [0, 1].map(|_| crate::taa::history(device, width, height, SCENE_FORMAT)));
+            let mut graphs: Vec<Graph> = Vec::new();
+            for read in 0..if taa { 2 } else { 1 } {
+                let history = histories.as_ref().map(|textures| [view(&textures[read]), view(&textures[1 - read])]);
+                let graph = self
+                    .graph(built_ins, key, read_depth.clone(), view(&scene), marks.clone(), history, graphs.first())
+                    .expect("the passes after the scene read only what earlier ones draw");
+                log::debug!("passes after the scene: {:?}, {} textures", graph.names(), graph.allocations());
+                graphs.push(graph);
+            }
             self.targets = Some(Targets {
                 key,
                 depth: view(&depth),
                 depth_only: depth_only(),
                 multisampled: multisampled.as_ref().map(view),
                 scene: view(&scene),
-                occlusion: occlusion.as_ref().map(view),
-                composed: composed.as_ref().map(view),
-                groups: Groups {
-                    occlusion: occlusion_group,
-                    atmosphere: atmosphere_group,
-                    bloom: bloom_levels,
-                    present,
-                },
+                graphs,
+                marks: copied,
             });
         }
+        // The scene's samples move within their pixels from frame to frame.
+        self.jittered = taa.then(|| {
+            self.jitters += 1;
+            let offset = crate::taa::jitter(self.jitters);
+            (crate::taa::jittered(&frame.projection, offset, (width, height)), offset)
+        });
         let current = self.targets.as_ref().unwrap();
         SceneTargets {
             size: (current.key.width, current.key.height),
@@ -548,6 +508,88 @@ impl Post {
         }
     }
 
+    /// The passes after the scene for frames of `key`, reading the scene's
+    /// depth, its picture and its stencil marks, and ending on the output.
+    /// With TAA, `history` is the texture it reads and the one it draws.
+    #[allow(clippy::too_many_arguments, reason = "the scene's views, each its own")]
+    fn graph(
+        &mut self,
+        built_ins: &mut BuiltIns,
+        key: TargetsKey,
+        depth: wgpu::TextureView,
+        scene: wgpu::TextureView,
+        marks: wgpu::TextureView,
+        history: Option<[wgpu::TextureView; 2]>,
+        sharing: Option<&Graph>,
+    ) -> anyhow::Result<Graph> {
+        let TargetsKey { width, height, samples, occluding, atmosphere, levels, .. } = key;
+        let full = |format: wgpu::TextureFormat| Spec { width, height, format };
+        let sampler = Binding::Sampler(self.sampler.clone());
+        let mut graph = GraphBuilder::default();
+        let depth = graph.import("depth", depth);
+        let scene = graph.import("scene", scene);
+        let marks = graph.import("marks", marks);
+        let occlusion = if occluding {
+            let occlusion = graph.texture("occlusion", full(wgpu::TextureFormat::R8Unorm));
+            let uniform = Binding::Uniform(self.uniform("occlusion", 160));
+            let bindings = vec![uniform, Binding::Texture(depth)];
+            graph.pass("occlusion", BuiltIn::Occlusion(samples), bindings, Target::Texture(occlusion), false);
+            occlusion
+        } else {
+            graph.import("unoccluded", self.unoccluded.create_view(&Default::default()))
+        };
+        let mut lit = scene;
+        if atmosphere {
+            let composed = graph.texture("composed", full(SCENE_FORMAT));
+            let uniform = Binding::Uniform(self.uniform("atmosphere", 224));
+            let bindings = vec![
+                uniform,
+                Binding::Texture(scene),
+                Binding::Texture(depth),
+                Binding::Texture(occlusion),
+                sampler.clone(),
+            ];
+            graph.pass("atmosphere", BuiltIn::Atmosphere(samples), bindings, Target::Texture(composed), false);
+            lit = composed;
+        }
+        // TAA blends the lit picture into the history, which the passes
+        // after it read.
+        if let Some([read, drawn]) = history {
+            let (read, drawn) = (graph.import("history", read), graph.import("history", drawn));
+            let uniform = Binding::Uniform(self.uniform("taa", 160));
+            let bindings =
+                vec![uniform, Binding::Texture(lit), Binding::Texture(read), Binding::Texture(depth), sampler.clone()];
+            graph.pass("taa", BuiltIn::Taa(samples), bindings, Target::Texture(drawn), false);
+            lit = drawn;
+        }
+        // Bloom halves the picture level by level, then adds each level onto
+        // the one above, back up to half the scene's size.
+        let half = (width.div_ceil(2), height.div_ceil(2));
+        let bloom: Vec<Handle> = (0..levels)
+            .map(|level| {
+                let size = (level_size(half.0, level), level_size(half.1, level));
+                graph.texture("bloom", Spec { width: size.0, height: size.1, format: SCENE_FORMAT })
+            })
+            .collect();
+        for (index, &level) in bloom.iter().enumerate() {
+            let (first, from) = if index == 0 { (true, lit) } else { (false, bloom[index - 1]) };
+            let bindings = vec![Binding::Texture(from), sampler.clone()];
+            graph.pass("bloom down", BuiltIn::BloomDown { first }, bindings, Target::Texture(level), false);
+        }
+        for pair in bloom.windows(2).rev() {
+            let bindings = vec![Binding::Texture(pair[1]), sampler.clone()];
+            graph.pass("bloom up", BuiltIn::BloomUp, bindings, Target::Texture(pair[0]), true);
+        }
+        let glow = match bloom.first() {
+            Some(&level) => level,
+            None => graph.import("unbloomed", self.unbloomed.create_view(&Default::default())),
+        };
+        let uniform = Binding::Uniform(self.uniform("present", 64));
+        let bindings = vec![uniform, Binding::Texture(lit), sampler, Binding::Texture(marks), Binding::Texture(glow)];
+        graph.pass("present", BuiltIn::Present(samples), bindings, Target::Output, false);
+        graph.compile(&self.device, built_ins, sharing)
+    }
+
     /// Encodes the passes after the scene, ending on `output`.
     pub fn finish(
         &mut self,
@@ -555,40 +597,18 @@ impl Post {
         encoder: &mut wgpu::CommandEncoder,
         frame: &RenderFrame,
         output: &wgpu::TextureView,
+        timer: &GpuTimer,
     ) {
         let quality = self.quality.expect("Post::begin comes first");
         let size = self.size;
-        let samples = self.targets.as_ref().unwrap().key.samples;
-        let (width, height) = {
-            let key = &self.targets.as_ref().unwrap().key;
-            (key.width, key.height)
-        };
-        let draw = |encoder: &mut wgpu::CommandEncoder,
-                    pipeline: &wgpu::RenderPipeline,
-                    group: &wgpu::BindGroup,
-                    view: &wgpu::TextureView,
-                    add: bool| {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if add { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::BLACK) },
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, group, &[]);
-            pass.draw(0..3, 0..1);
-        };
-        if self.targets.as_ref().unwrap().groups.occlusion.is_some() {
+        let TargetsKey { width, height, occluding, atmosphere, levels, taa, .. } = self.targets.as_ref().unwrap().key;
+        // What the scene drew with.
+        let (projection, offset) = self.jittered.unwrap_or((frame.projection, (0.0, 0.0)));
+        if occluding {
             let uniform = self.uniform("occlusion", 160);
             let mut data = [0.0f32; 40];
-            data[..16].copy_from_slice(&frame.projection);
-            data[16..32].copy_from_slice(&invert(&frame.projection));
+            data[..16].copy_from_slice(&projection);
+            data[16..32].copy_from_slice(&invert(&projection));
             data[32..].copy_from_slice(&[
                 OCCLUSION_RADIUS,
                 OCCLUSION_POWER,
@@ -600,41 +620,18 @@ impl Post {
                 0.0,
             ]);
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
-            let pipeline = built_ins.get(BuiltIn::Occlusion(samples));
-            let targets = self.targets.as_ref().unwrap();
-            draw(
-                encoder,
-                pipeline,
-                targets.groups.occlusion.as_ref().unwrap(),
-                targets.occlusion.as_ref().unwrap(),
-                false,
-            );
         }
-        if self.targets.as_ref().unwrap().groups.atmosphere.is_some() {
+        if atmosphere {
             let uniform = self.uniform("atmosphere", 224);
-            self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&atmosphere_of(frame, &quality, width, height)));
-            let pipeline = built_ins.get(BuiltIn::Atmosphere(samples));
-            let targets = self.targets.as_ref().unwrap();
-            draw(
-                encoder,
-                pipeline,
-                targets.groups.atmosphere.as_ref().unwrap(),
-                targets.composed.as_ref().unwrap(),
-                false,
-            );
+            let data = atmosphere_of(frame, &projection, &quality, width, height);
+            self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
-        let levels = self.targets.as_ref().unwrap().groups.bloom.len();
-        for index in 0..levels {
-            let pipeline = built_ins.get(BuiltIn::BloomDown { first: index == 0 });
-            let level = &self.targets.as_ref().unwrap().groups.bloom[index];
-            draw(encoder, pipeline, &level.down, &level.view, false);
-        }
-        if levels > 1 {
-            let pipeline = built_ins.get(BuiltIn::BloomUp);
-            for index in (0..levels - 1).rev() {
-                let level = &self.targets.as_ref().unwrap().groups.bloom[index];
-                draw(encoder, pipeline, level.up.as_ref().unwrap(), &level.view, true);
-            }
+        // The graph reading the history this frame reads.
+        let graph = if taa { self.memory.read() } else { 0 };
+        if taa {
+            let uniform = self.uniform("taa", 160);
+            let data = self.memory.uniform(&frame.view, &frame.projection, (&projection, offset), (width, height));
+            self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
         let uniform = self.uniform("present", 64);
         let (output_width, output_height) = (size.0 as f32, size.1 as f32);
@@ -661,11 +658,21 @@ impl Post {
                 0.0f32,
             ]),
         );
-        let pipeline = built_ins.get(BuiltIn::Present(samples));
-        draw(encoder, pipeline, &self.targets.as_ref().unwrap().groups.present, output, false);
+        // Where the device cannot sample the stencil or read the depth as it
+        // is, copies of them first (downlevel.rs).
+        if let Some(marks) = &self.targets.as_ref().unwrap().marks {
+            let copier = self.marks.get_or_insert_with(|| Marks::new(&self.device));
+            copier.copy(encoder, marks, &self.targets.as_ref().unwrap().depth);
+        }
+        let key = self.targets.as_ref().unwrap().key;
+        if let Some(copy) = &self.depth_copy
+            && (key.occluding || key.atmosphere || key.taa)
+        {
+            copy.copy(&self.device, encoder, &self.targets.as_ref().unwrap().depth_only);
+        }
+        self.targets.as_ref().unwrap().graphs[graph].execute(encoder, built_ins, output, timer);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,10 +683,16 @@ mod tests {
             atmosphere_shader(1),
             atmosphere_shader(4),
             occlusion_shader(4),
-            present_shader(1),
+            present_shader(1, &crate::Display::SDR),
+            present_shader(
+                4,
+                &crate::Display { color_space: wgpu::SurfaceColorSpace::ExtendedSrgb, ..crate::Display::SDR },
+            ),
             bloom_down_shader(true),
             bloom_down_shader(false),
             bloom_up_shader(),
+            crate::taa::shader(1),
+            crate::taa::shader(4),
         ] {
             assert!(!code.contains("${"), "{code}");
         }

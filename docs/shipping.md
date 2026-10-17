@@ -43,6 +43,11 @@ checkout) refuses in it and says to use a full build.
   is found beside it or in cargo's `steamworks-sys` build output.
 - `just ship` builds both player runtimes and packages the checkout's game
   for each, in `dist/linux` and `dist/windows`.
+- `pen build --game DIR` packages a bundle compiled already (`pen export`'s,
+  or a package's `game/`) instead of a checkout: no checkout, compiler
+  plugin or Blot compiler needed, only a pen with Cranelift for the
+  runtime's architecture. CI packages the game job's bundle this way for the
+  Windows player, and on a Mac for the macOS one.
 
 ### A CPU baseline for game.cwasm
 
@@ -152,6 +157,135 @@ asset loader, the audio callback) ends the game with a crash report
 instead of leaving it running without that thread. The guest's own code is
 Cranelift's either way: the profiles only change the host around it.
 
+## Store builds: Steam and itch.io
+
+`pen build --steam` and `pen build --itch` (`publish.rs`) make a store build
+of the package they build, from sections of the checkout's `pen.json`:
+
+```json
+"steam": {"app": 1234560, "depots": {"linux": 1234561, "windows": 1234562}, "branch": "beta"},
+"itch": {"target": "studio/gdev", "channels": {"web": "html5"}}
+```
+
+- `--steam` writes steamcmd's build scripts in `steam/` beside the package:
+  `depot_build_<depot>.vdf` maps the whole package into the depot of its
+  platform (from its runtime's header: Linux, Windows, or a macOS
+  application bundle), and `app_build_<app>.vdf` names every depot that has
+  a script there, so `just ship --steam` (`dist/linux` and `dist/windows`)
+  makes one build of both in `dist/steam/`. `branch` sets the build live on
+  that branch once uploaded; `default` is refused, as Steamworks wants a
+  person to set the default branch live, and so is app 480 (Spacewar).
+- `--itch` pushes with butler to the platform's channel (`linux`,
+  `windows`, `osx`, `html5` for `--web`; `channels` renames them):
+  `butler push DIR studio/gdev:linux --if-changed`. butler uploads a patch
+  against the channel's last build, not the package again, and nothing when
+  it is unchanged.
+- `--label TEXT` is the build's description on Steam and its version
+  (`--userversion`) on itch.io.
+
+Without `--upload` nothing is uploaded: each prints the command it would
+run. `--upload` runs it, and only with credentials in the environment:
+steamcmd as `STEAM_BUILD_USER`, the build account steamcmd has logged in as
+before (pen never logs in or sees a password: steamcmd keeps the login of
+the account's first interactive one, with Steam Guard), and butler with
+`BUTLER_API_KEY`. `PEN_STEAMCMD` and `PEN_BUTLER` name the tools when they
+are not on `PATH`. The tests run stand-ins that note their arguments, never
+steamcmd or butler; nothing here was uploaded, and the scripts have not met
+a real app.
+
+## Release checks
+
+### Signing the Windows player
+
+`scripts/sign-windows.sh EXE...` signs Windows executables with
+Authenticode through osslsigncode, timestamped, and checks each signature,
+when `WINDOWS_CERTIFICATE` holds a code-signing certificate (a `.pfx` file,
+or its base64 as a CI secret) and `WINDOWS_CERTIFICATE_PASSWORD` its
+password; without one it says so and leaves the file unsigned. `just ship`
+signs the Windows player before packaging it, and CI's player job signs it
+before uploading it when the `WINDOWS_CERTIFICATE` and
+`WINDOWS_CERTIFICATE_PASSWORD` secrets are set. Tried here with a
+self-signed certificate (osslsigncode 2.9 built from source, no timestamp):
+signed, verified against that certificate, and refused with a wrong password
+or without the certificate to check against. The owner's step: buy an OV or
+EV code-signing certificate and set the two secrets (an EV certificate on a
+hardware token or in a cloud HSM needs that service's signing tool instead).
+
+### Reproducible packages
+
+The same checkout, runtime and options make the same package, byte for
+byte. Its files hold nothing of when or where they were built (no paths, no
+times, assets in catalog order); with `SOURCE_DATE_EPOCH` set (seconds since
+1970, the convention of reproducible-builds.org) `pen build` gives every
+file and directory that modification time, so an archive of the package is
+the same bytes too (`reproducible.rs`). `just reproducible`
+(`scripts/reproducible.sh`) builds the package twice, each with caches of
+its own (the Blot program and `game.cwasm` compiled from nothing both
+times), and fails unless every file, mode and time is the same; CI's game
+job runs it.
+
+### Budgets
+
+| What | Budget | Measured (2026-10-17) |
+|---|---|---|
+| Linux player runtime (`just player`, stripped) | 19 MB | 17.15 MB |
+| Windows player runtime (`just windows`, stripped) | 15 MB | 13.66 MB |
+| The packaged game (`game/`) | 110 MB | 85.65 MB |
+| Cold start to the first frame, this machine's GPU (`just cold-start`) | 8 s | 5.4 s (warm 1.6 s) |
+| Cold start to the first frame, lavapipe (CI, one run) | 180 s | about 68 s, warm alike |
+
+The times are medians of five runs of the `.2.28` player package on the RTX
+2070 Super, and single runs on lavapipe, both while other builds kept the
+machine's load average near 40 on its 16 threads, so an idle machine is
+faster. Cold, most of the time is the GPU driver compiling pipelines pen has
+not cached yet; lavapipe compiles them on the CPU every time.
+
+`just size-budget` (`scripts/size-budget.sh FILE MB...`) fails when a
+player runtime outgrows its budget, which CI's player job checks after
+building them; the game job checks the packaged game. A change that needs
+more raises the budget in the same change, saying why.
+
+The player budgets went from 16 and 13 MB to 19 and 15 MB when the
+simulation services (rapier, parry, nalgebra, spade), gamepads (gilrs),
+compressed textures, localization and netplay joined the runtime: about
+4.3 MB on each player. Leaving the simulation services out behind a feature
+would win back most of it, for games that don't call them.
+
+`just cold-start` (`scripts/cold-start.sh EXE MS [RUNS]`) starts a
+package's runtime headless five times as a player's first run does, with
+none of pen's caches (no compiled GPU pipelines), and times it from start to
+exit after its first frame, which headless is drawn once every asset it asks
+for has loaded; the median must be within the budget. It times five warm
+starts too (the caches the first left), for comparison. CI's game job runs
+it on lavapipe with a budget of its own. With a runtime that marks its
+phases (`PEN_STARTUP=1`), the first run's are shown.
+
+## Graphics presets
+
+A game can declare graphics presets beside its assets, in
+`src/presets.json`, which `pen build` ships as `game/presets.json`: its
+preferences' lanes by name, and the values of some of them for each tier
+(`presets.rs`; gdev's sets anti-aliasing, render scale, texture filtering,
+shadows, ambient occlusion and bloom). While the player has no stored
+preferences (the first run, until they change a setting and the game sends
+its preferences to be kept), the host puts the GPU it opened in a tier and
+plays that tier's preset to the game as Preference events, as it plays
+stored preferences:
+
+| Tier | Adapters |
+|---|---|
+| software | lavapipe, llvmpipe, WARP, SwiftShader (the CPU) |
+| handheld | the Steam Deck (SteamOS says so, or its APU's name, VanGogh) |
+| low | Intel's UHD and Iris integrated graphics, virtual GPUs |
+| medium | Apple silicon, AMD's integrated Radeons, Intel Arc, anything unknown |
+| high | discrete GPUs |
+
+A tier the file leaves out takes the next lower one's. Headless runs keep
+the game's own defaults, so that tests and golden images draw alike on
+every machine, unless `PEN_GRAPHICS_TIER` asks: `auto` for the GPU's tier,
+or a tier's name (also in a window, to try one). The browser host does not
+pick presets yet.
+
 ## Platforms
 
 ### Linux and the Steam Deck
@@ -190,7 +324,11 @@ at run time by winit and wgpu, not linked.
 
 Verified here: the final `.2.28` player package loads its x86-64-v2 guest and
 renders headlessly on the host and installed soldier/sniper containers, with
-identical PNGs. Container-only library probes use glibc 2.31; GPU execution
+identical PNGs. `just slr [PACKAGE]` (scripts/slr.sh) repeats that check: in
+each container the runtime first starts with the container's own libraries,
+then plays 40 frames with the host's graphics, and every run's last frame
+must be the same image; pressure-vessel's copies of the runtimes go into its
+output directory, not Steam's. Container-only library probes use glibc 2.31; GPU execution
 imports the host's graphics stack and glibc 2.44. The symbol requirement remains
 2.28, but an actual glibc 2.28 installation was not exercised. See
 [local qualification](qualification.md). A real Steam Deck and Steam Input
@@ -215,8 +353,15 @@ which `pen build` ships beside it. Steam's import library is MSVC's
 …/pen.exe` precompiles `game.cwasm` for Windows from Linux (Cranelift
 cross-compiles within an architecture).
 
-Not verified: there is no Windows machine or wine here, so the bar was "it
-builds and packages". On first run on Windows, check the DX12 and Vulkan
+Not verified here: there is no Windows machine or wine, so the bar was "it
+builds and packages". CI is the route to a real run ([ci.md](ci.md)): the
+`windows` job builds the player with MSVC on `windows-latest` and runs the
+renderer's GPU tests on WARP, and `windows-smoke` plays the shipped package
+(this cross-built runtime, packaged from the game job's bundle) for 30
+frames headless on WARP, uploads its last frame, and compares its packets
+with Linux's bit for bit. A headless run or a command such as `packets` that stops with an error
+writes its crash report without the message box, which nobody would
+dismiss there. On first run on Windows, check the DX12 and Vulkan
 adapters, audio (WASAPI through cpal), saves in `%APPDATA%\gdev`, a crash
 report, and the Steam overlay. An MSVC build (`x86_64-pc-windows-msvc`)
 works the usual way on a Windows machine or a `windows-latest` CI runner;
@@ -225,7 +370,22 @@ CRT and SDK under Microsoft's license, so it is not set up here.
 
 ### macOS
 
-Not built: there is no macOS SDK here. What it takes:
+`pen build` makes an application bundle when the runtime is a Mach-O
+executable (or `--target` names an Apple triple): `gdev.app/Contents/` with
+`Info.plist` (`--bundle-id ID` names it, `pen.NAME` by default; it asks for
+the display's full resolution and macOS 11), the runtime and Steam's
+library in `MacOS/`, and the game in `Resources/game`, where the runtime
+looks for it (`app_bundle.rs`). `scripts/macos-sign.sh APP` signs it with
+the hardened runtime and `packaging/macos/entitlements.plist`, and
+notarizes and staples it with the owner's credentials, or signs it ad hoc
+without them. CI's `macos` job builds pen and the player on `macos-14`,
+runs the renderer tests on Metal, and with the game job's bundle packages,
+signs, plays and uploads the app ([ci.md](ci.md)). None of it has run yet:
+there is no Mac here, and hosted runs were not started. The layout was
+checked here by packaging for `x86_64-apple-darwin` from Linux and playing
+from `Contents/MacOS`.
+
+What it took, and what is still to try on a Mac:
 
 - A Mac with Xcode or the Command Line Tools (or osxcross with an SDK
   extracted from Xcode, under Apple's license), and the targets
@@ -238,17 +398,19 @@ Not built: there is no macOS SDK here. What it takes:
   this target is disabled") unless the development build enables wasmtime's
   `all-arch` feature; packaging on the Mac itself avoids that. (Intel macOS
   precompiles from Linux today.)
-- An app bundle: `Contents/MacOS/gdev`, `Info.plist`, an icon. Data files in
-  `Contents/MacOS` break code signing, so the game belongs in
-  `Contents/Resources/game`, and the runtime's `packaged_game()` (main.rs)
-  must also look there.
+- An app bundle: `Contents/MacOS/gdev`, `Info.plist`. Data files in
+  `Contents/MacOS` break code signing, so the game is in
+  `Contents/Resources/game`, where `packaged_game()` looks too. It has no
+  icon yet (`CFBundleIconFile` and an `.icns` in `Resources`).
 - Signing with a Developer ID, the hardened runtime and notarization.
   Loading `game.cwasm` maps machine code as executable at run time: wasmtime
   writes it to read-write memory and `mprotect`s it read-execute, without
   `MAP_JIT` (wasmtime issue 11989), so under the hardened runtime it needs
   the entitlement `com.apple.security.cs.allow-unsigned-executable-memory`;
-  `allow-jit` alone covers only `MAP_JIT` memory. Try it before relying on
-  it.
+  `allow-jit` alone covers only `MAP_JIT` memory. The entitlements file
+  has it, and the two the Steam overlay's injected library needs
+  (`disable-library-validation`, `allow-dyld-environment-variables`). Try
+  them before relying on them.
 
 ## Crash reports
 
@@ -300,6 +462,40 @@ the panic machinery, then `pen::play` at `main.rs` with `crash::frame`
 inlined into it. Shipping the symbol table instead would cost 1.8 MB (12.01
 against 10.23 MB) and give names without lines.
 
+### Opt-in reports to the developer
+
+Crash and performance reports can reach the game's developer, and only
+when both have said so (`reports.rs`):
+
+- The developer gives an address: `pen.json`'s `"reports": {"endpoint":
+  "https://..."}` (https, or http to this machine for a test server), which
+  `pen build` ships as `game/reports.json`. Without it nothing is ever
+  sent, and the reports service answers the game unavailable, so that it
+  offers no choice with nothing behind it. A checkout's runs, `pen
+  export`'s bundles and the browser have none.
+- The player agrees, to crash reports, to performance reports or to both,
+  through the game, which asks the reports service (`REPORTS_OP_CONSENT`,
+  `SET_CONSENT`, `QUEUED`). Their choice is kept in
+  `reports/consent.json` in the data directory; until they make one, it is
+  neither.
+
+With consent, each crash report is copied into the local queue,
+`reports/queue/` in the data directory, with the player's home directory
+taken out of its paths, and a packaged game that ends queues a performance
+report: its frame times (median, 95th and 99th percentiles and the worst,
+from a histogram every frame adds to), the GPU, the system and pen's
+version; nothing that names the player. When a packaged game starts, a
+thread of its own sends what is queued, of the kinds the player agreed to,
+one POST each through the system's curl (Windows 10 and later, macOS,
+SteamOS and desktop Linux have it, so pen links no HTTP client), with
+`X-Pen-Report` and `X-Pen-Game` headers; a report that went is deleted, and
+one that did not waits for the next start. The queue keeps the latest 20.
+`PEN_REPORTS=off` sends nothing whatever was agreed, and the tests send
+nothing (they post to a stand-in, and the curl transport refuses in them).
+gdev asks on its settings' About page: a Reports row of none, crash
+reports, or crash and performance reports, or "Not collected" where the
+service is unavailable (gdev's `src/reports.blot`).
+
 ## Steam
 
 `steam.rs` (the `steam` feature) starts Steam for a packaged game in a
@@ -329,9 +525,46 @@ PEN_STEAM_DEBUG="list unlock=ACH_WIN_ONE_GAME add=NumGames=1 show=NumGames" pen 
 ```
 
 Steps: `list`, `unlock=NAME`, `clear=NAME`, `stat=NAME=N`, `statf=NAME=X`,
-`add=NAME=N`, `show=NAME`, `reset`. Without a Steam client it prints
-`Steam is off: …` and that there is nothing to do; that is all that could be
-tried here, since Steam does not run on this machine.
+`add=NAME=N`, `show=NAME`, `reset`, `overlay` (whether the overlay has
+hooked the window) and `cloud` (whether Steam Cloud is on for the account
+and the app, its files, and a file written, read back and deleted through
+it); a last line counts the steps that failed. Without a Steam client it
+prints `Steam is off: …` and that there is nothing to do; that is all that
+could be tried here, since Steam does not run on this machine.
+
+`just steam-smoke APP_ID [PACKAGE] [--achievement NAME] [--stat NAME]`
+(scripts/steam-smoke.sh) is the live check, for the game's own app: it
+refuses 480, copies the package (default `dist/linux`) with
+`steam_appid.txt` beside its runtime, needs the Steam client already
+running (it never starts it), plays 15 s in a window, since the overlay
+hooks a window, and passes when Steam started the game as that app, every
+step (achievements, stats, overlay, cloud) passed, and the game's own Steam
+service requests were answered rather than `unavailable`. `--dry-run`
+prints what it would run. It has not run: it needs the owner's app ID.
+
+### Workshop
+
+`workshop.rs` lets players publish the levels they build in the game's
+editor and play the ones they subscribe to, through the Steam service's
+workshop operations (`protocol/schema.json`, SteamOperation):
+
+| Operation | What it does |
+|---|---|
+| `workshop_publish` | Uploads the player's saved scene (`main.scene` in the data directory, what the editor saves) as a new item titled with the text, visible to `a` (0 everyone, 1 friends, 2 only the player, 3 those with the link); with `b` 1, as a new version of the item whose id is the text's first line. Answered once Steam has it, with the item's id as text (ids do not fit a float lane) and value 1 when the player must accept the Workshop's legal agreement |
+| `workshop_items` | The installed subscribed items' ids, a space between them, their count the value; the others start downloading |
+| `workshop_subscribe`, `workshop_unsubscribe` | An item's id as text; answered once Steam has |
+| `workshop_use` | Makes an installed item's scene the player's, for the game to load as the editor's scene (Ctrl+R in gdev), which a recording keeps like any load |
+
+Before uploading, pen refuses what Steam would: an empty or long title (128
+characters) or description (8000), an empty content folder, a preview that
+is no PNG, JPEG or GIF or is past 1 MB. Uploads are staged in
+`workshop-uploads/` in the data directory until Steam has them (keep it out
+of Auto-Cloud). The logic is generic over a `Ugc` trait and tested without
+Steam (`cargo test -p pen workshop`); `Steamworks` drives `steamworks::UGC`
+and compiles with the `steam` feature. It has never run against a live
+Steam client: that needs the game's own app ID with the Workshop enabled on
+its Steamworks page (not Spacewar's), and gdev does not ask for these
+operations yet.
 
 ### Steam Auto-Cloud
 
@@ -344,6 +577,21 @@ Saves and preferences live in the platform data directory, `gdev/` under it
 | `main.scene` | the player's edited scene |
 | `preferences.json` | settings |
 | `crashes/` | crash reports: do not sync |
+| `backups/` | the last five versions of each save: do not sync |
+| `reports/` | the player's consent to reports, and their queue: do not sync |
+
+The quick save and the player's scene are written stamped (save format
+version 2: when, and the identities of the saves each replaced), and each
+write keeps its bytes as `backups/NAME.1.EXT`, the older ones moving down to
+`.5` (`saves.rs`). When the game starts, each is compared with this device's
+last write: a save another device wrote that went on from it (the ordinary
+case with Steam Cloud) is taken in quietly; an older one of this device's
+own, or one that forked from an older save on another device (both played
+since they last synced, and Steam's conflict dialog kept the other), plays,
+since the player or Steam chose it, but is said in the log, and this
+device's own last save is kept as `backups/NAME.2.EXT`. Either way the save
+that came is kept among the backups before anything can overwrite it, so a
+conflict resolved the wrong way loses nothing. Version 1 saves still load.
 
 Auto-Cloud settings on the app's Steamworks Cloud page (no code needed),
 one root path per file pattern:
@@ -371,7 +619,8 @@ own name, so that it cannot collide with another game's `gdev`.
 
 ## CI
 
-The workflow builds native and browser hosts, runs strict Clippy and tests on
+[ci.md](ci.md) has every job, what it proves and what the owner sets. In
+short: the workflow builds native and browser hosts, runs strict Clippy and tests on
 Mesa lavapipe, and cross-builds Linux (glibc 2.28) and Windows players. The game
 job checks out sibling repositories at `GDEV_REF` and `BLOT2_REF`, builds blotc
 with Zig, checks out Ink at `INK_REF`, compiles the plugin, then runs the full Blot suite, deterministic

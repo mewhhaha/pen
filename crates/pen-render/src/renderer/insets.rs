@@ -5,6 +5,7 @@
 // requested block size and nearest sampling.
 use pen_protocol::RenderFrame;
 
+use super::timing::Span;
 use super::{
     Drawing, Floats, INSET_SAMPLES, InsetScene, InsetTargets, ReadyEntry, SCENE_BYTES, State, extent, heavens,
     lighting, overlay_pipeline, uniform_buffer,
@@ -135,24 +136,7 @@ impl State {
             }
             if self.inset_scenes[index].is_none() {
                 let uniform = uniform_buffer(&self.device, "inset scene", SCENE_BYTES);
-                let device = self.device.clone();
-                let scene_layout = self.context.scene_group.clone();
-                let resources = self.shadow_resources();
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("inset scene"),
-                    layout: &scene_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&resources.stand_in),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Sampler(&resources.sampler),
-                        },
-                    ],
-                });
+                let group = self.unshadowed_scene(&uniform);
                 self.inset_scenes[index] = Some(InsetScene { uniform, group });
             }
             let mut data = Floats::<80>::new();
@@ -200,6 +184,7 @@ impl State {
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("inset"),
+                    timestamp_writes: self.timer.pass(Span::Overlay),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &targets.color,
                         depth_slice: None,
@@ -225,17 +210,20 @@ impl State {
                 pass.set_viewport(0.0, 0.0, drawn.0 as f32, drawn.1 as f32, 0.0, 1.0);
                 pass.set_scissor_rect(0, 0, drawn.0, drawn.1);
                 pass.set_bind_group(0, &self.inset_scenes[index].as_ref().unwrap().group, &[]);
+                // The frame's lights are clustered for its own camera.
+                pass.set_bind_group(2, self.clusters.empty(), &[]);
                 for entry in ready {
                     if drawing.items[entry.item].inset() != Some(index) {
                         continue;
                     }
                     pass.set_pipeline(&entry.pipeline);
                     pass.set_bind_group(1, &entry.group, &[entry.offset]);
-                    drawing.draw(&mut pass, entry, Some(stats));
+                    drawing.draw(&mut pass, entry, 0, Some(stats));
                 }
             }
             let mut laid = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("inset composite"),
+                timestamp_writes: self.timer.pass(Span::Overlay),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: output,
                     depth_slice: None,

@@ -2,7 +2,7 @@ use crate::model::*;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-fn comment(text: Option<&str>) -> Vec<String> {
+pub(crate) fn comment(text: Option<&str>) -> Vec<String> {
     text.map(|text| wrap(text, 78).iter().map(|line| format!("// {line}")).collect()).unwrap_or_default()
 }
 fn count(record: &Value) -> String {
@@ -14,7 +14,7 @@ fn bound_blot(value: &Value) -> String {
     }
     value.to_string()
 }
-fn chunk(lanes: &[String], width: usize) -> Vec<String> {
+pub(crate) fn chunk(lanes: &[String], width: usize) -> Vec<String> {
     let mut result = Vec::new();
     let mut line = String::new();
     for lane in lanes {
@@ -119,6 +119,9 @@ fn constants(model: &Model) -> Vec<String> {
         "const frame_header_floats = 5".to_owned(),
         format!("const event_floats = {}", model.event_lanes()),
     ]);
+    if let Some(extensions) = model.extensions() {
+        out.push(format!("const extensions_marker = {}.0", n(&extensions["marker"])));
+    }
     let mut seen = HashSet::new();
     for entry in &model.sections {
         let mut values = Vec::new();
@@ -168,6 +171,14 @@ fn constants(model: &Model) -> Vec<String> {
     for event in model.events() {
         out.push(format!("const {}_tag = {}", snake(s(&event["name"])), event["tag"]));
     }
+    out.push(String::new());
+    out.extend(comment(Some(
+        "The codes KeyDown and KeyUp carry for named keys; a key that types a character carries its code point, \
+         a letter its capital's.",
+    )));
+    for (key, code) in object(&model.protocol["input"]["keys"]) {
+        out.push(format!("const key_{} = {}", snake(key), code));
+    }
     out
 }
 fn input(model: &Model) -> Vec<String> {
@@ -181,7 +192,7 @@ fn input(model: &Model) -> Vec<String> {
         }
         "U32"
     };
-    for event in model.events() {
+    for event in model.core_events() {
         let name = s(&event["name"]);
         let fields = event_fields(event);
         if !event["value"].is_null() {
@@ -209,7 +220,7 @@ fn input(model: &Model) -> Vec<String> {
     out.push("const decode_event = fn (values: Array F32) => fn (start: U32) => do:".to_owned());
     out.push(format!(
         "  let tag = lanes.integer values[start] {}",
-        model.events().iter().map(|event| n(&event["tag"])).max().unwrap()
+        model.core_events().iter().map(|event| n(&event["tag"])).max().unwrap_or(0)
     ));
     for (index, lane) in input_lanes.iter().enumerate() {
         if index == 0 {
@@ -219,7 +230,7 @@ fn input(model: &Model) -> Vec<String> {
         }
     }
     out.push("  return case tag of".to_owned());
-    for event in model.events() {
+    for event in model.core_events() {
         let fields = event_fields(event);
         let name = s(&event["name"]);
         out.push(format!("    {} => do:", event["tag"]));
@@ -494,6 +505,27 @@ fn render(model: &Model) -> Vec<String> {
     out.push("    ...array.flatten #[".to_owned());
     out.extend(chunks.iter().map(|line| format!("      {line},")));
     out.extend(["    ],".to_owned(), "  ]".to_owned()]);
+    if let Some(extensions) = model.extensions() {
+        out.push(String::new());
+        out.extend(comment(Some(
+            "The lanes of the game's own sections, to follow encode_render's: none without any, else the \
+             marker, their count, then each one's tag, length and values. A game's generated \
+             pen/extensions.blot makes them from its declarations.",
+        )));
+        out.push("const encode_extensions = fn (extensions: Array types.Extension) => do:".to_owned());
+        out.push("  if extensions.is_empty:".to_owned());
+        out.push("    return #[]".to_owned());
+        out.push(format!("  use lanes.require (extensions.length <= {})", bound_blot(&extensions["max"])));
+        out.push("  return array.flatten #[".to_owned());
+        out.push("    #[protocol.extensions_marker, from extensions.length],".to_owned());
+        // A spread inside a comprehension's arrays is past blotc's evaluator
+        // (`constant_expression`), so each one's lanes are concatenated.
+        out.push(
+            "    array.flatten #[array.concat #[from extension.tag, from extension.values.length] extension.values | extension <- extensions],"
+                .to_owned(),
+        );
+        out.push("  ]".to_owned());
+    }
     out
 }
 fn field_type(model: &Model, field: &Value) -> String {
@@ -590,6 +622,14 @@ fn types(model: &Model) -> Vec<String> {
         fields.push(format!("{}: Array {ty}", s(&entry.section["name"])));
     }
     structure(&mut out, "RenderFrame", fields);
+    if model.extensions().is_some() {
+        out.push(String::new());
+        out.extend(comment(Some(
+            "One of the game's own sections (its pen.json `protocol`): its tag and lanes. They travel after the \
+             render packet, which RenderFrame leaves them out of: protocol_render's encode_extensions lays them out.",
+        )));
+        out.push("type Extension is data = #Extension { tag: U32, values: Array F32 }".to_owned());
+    }
     out
 }
 
@@ -647,6 +687,10 @@ import * as types from "./types""#
     let mut wire_types = top.clone();
     wire_types.extend(types(model));
     wire_types.push(String::new());
+    let canonical = crate::canonical::blot(model, &top);
+    let program = crate::program::program(&top);
+    let frame = crate::program::frame(model, &top);
+    let check = crate::program::check(&top);
     let mut numeric = top;
     numeric.extend(NUMERIC.lines().map(str::to_owned));
     numeric.push(String::new());
@@ -655,5 +699,9 @@ import * as types from "./types""#
         ("protocol_render.blot", render_source.join("\n")),
         ("types.blot", wire_types.join("\n")),
         ("lanes.blot", numeric.join("\n")),
+        ("protocol_canonical.blot", canonical),
+        ("program.blot", program),
+        ("frame.blot", frame),
+        ("check.blot", check),
     ]
 }

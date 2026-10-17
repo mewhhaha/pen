@@ -10,6 +10,8 @@ use pen_protocol::GameEvent;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::animation::{Clip, JointJson, NodeJson, Rig, RigJson, read_rig, write_rig};
+use crate::culling::Sphere;
 use crate::loader::{Job, JobQueue, Priority};
 use crate::shader::Variants;
 
@@ -27,6 +29,11 @@ impl AssetKind {
     const ALL: [AssetKind; 5] =
         [AssetKind::Mesh, AssetKind::Material, AssetKind::Shader, AssetKind::SpriteShader, AssetKind::Texture];
 
+    /// The kind called `name`, as [`AssetKind::name`] says them.
+    pub fn named(name: &str) -> Option<AssetKind> {
+        AssetKind::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             AssetKind::Mesh => "mesh",
@@ -40,8 +47,37 @@ impl AssetKind {
 
 pub(crate) struct Mesh {
     pub vertices: Vec<f32>,
+    /// Its triangles, then each simpler level of detail's.
     pub indices: Vec<u32>,
+    /// A sphere holding its vertices, which frames cull its draws by.
+    pub bounds: Sphere,
+    /// Its levels of detail, the whole mesh first: simpler triangles over
+    /// the same vertices, for draws far enough away that the difference is
+    /// smaller than a pixel.
+    pub lods: Vec<Lod>,
+    /// A skinned mesh's joints and weights and its rig.
+    pub skin: Option<Skin>,
 }
+
+/// Up to four joints (indices into the rig's joints) per vertex, and how
+/// much each moves it; the weights of a vertex add up to 1.
+pub(crate) struct Skin {
+    pub joints: Vec<[u16; 4]>,
+    pub weights: Vec<[f32; 4]>,
+    pub rig: Rig,
+}
+
+/// A level of detail: its triangles' indices in the mesh's index array, and
+/// how far (in the mesh's units) its surface may stray from the whole mesh's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Lod {
+    pub first: u32,
+    pub count: u32,
+    pub error: f32,
+}
+
+/// The most levels of detail a mesh has, the whole mesh among them.
+pub(crate) const MAX_LODS: usize = 4;
 
 // position3, normal3, UV2, optional shader attributes2 (location 8).
 pub(crate) const MESH_VERTEX_FLOATS: usize = 10;
@@ -97,13 +133,14 @@ impl Material {
         self.opaque() && self.lit && self.shadow
     }
 
-    /// Which of its shader's pipelines it draws with: opaque, alone or
-    /// instanced; translucent; or as an overlay, dimmed and at full strength.
+    /// Which of its shader's pipelines it draws with: opaque, alone,
+    /// instanced or skinned; translucent; or as an overlay, dimmed and at
+    /// full strength.
     pub fn variants(&self) -> Variants {
         if self.overlay {
             Variants::OCCLUDED | Variants::VISIBLE
         } else if self.opaque() {
-            Variants::OPAQUE | Variants::INSTANCED
+            Variants::OPAQUE | Variants::INSTANCED | Variants::SKINNED
         } else {
             Variants::TRANSLUCENT
         }
@@ -113,12 +150,19 @@ impl Material {
 /// The binary mesh's first bytes; mesh JSON starts with `{` or whitespace.
 const MESH_MAGIC: &[u8; 4] = b"PMSH";
 const MESH_VERSION: u8 = 1;
-// Flags: per-vertex shader attributes follow the UVs; indices are 16 bits.
+// Flags: per-vertex shader attributes follow the UVs; indices are 16 bits;
+// simpler levels of detail follow the indices.
 const MESH_ATTRIBUTES: u8 = 1;
 const MESH_SHORT_INDICES: u8 = 2;
+// Flags: a skin follows the indices (and any levels of detail), each
+// vertex's joints (four u16s) and weights (four f32s), then its rig
+// (`animation::write_rig`); simpler levels of detail follow the indices.
+const MESH_SKIN: u8 = 4;
+const MESH_LODS: u8 = 8;
 const MESH_HEADER: usize = 16;
 
-/// A mesh as its JSON has it: flat arrays, three or two numbers a vertex.
+/// A mesh as its JSON has it: flat arrays, three or two numbers a vertex,
+/// and any simpler levels of detail over the same vertices.
 #[derive(Deserialize)]
 struct MeshArrays {
     positions: Vec<f32>,
@@ -126,6 +170,25 @@ struct MeshArrays {
     uvs: Vec<f32>,
     #[serde(default)]
     attributes: Option<Vec<f32>>,
+    indices: Vec<u32>,
+    /// A skinned mesh's four joints and weights per vertex, and its rig.
+    #[serde(default)]
+    joints: Option<Vec<u16>>,
+    #[serde(default)]
+    weights: Option<Vec<f32>>,
+    #[serde(default)]
+    skeleton: Option<Vec<NodeJson>>,
+    #[serde(default)]
+    skin: Option<Vec<JointJson>>,
+    #[serde(default)]
+    clips: Option<Vec<Clip>>,
+    #[serde(default)]
+    lods: Vec<LodArrays>,
+}
+
+#[derive(Deserialize)]
+struct LodArrays {
+    error: f32,
     indices: Vec<u32>,
 }
 
@@ -135,7 +198,8 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
         return unpack_mesh(bytes);
     }
     let arrays: MeshArrays = serde_json::from_slice(bytes).map_err(|error| anyhow!("mesh JSON: {error}"))?;
-    let MeshArrays { positions, normals, uvs, attributes, indices } = arrays;
+    let MeshArrays { positions, normals, uvs, attributes, indices, lods, joints, weights, skeleton, skin, clips } =
+        arrays;
     let count = positions.len() / 3;
     ensure!(
         positions.len() % 3 == 0
@@ -154,17 +218,79 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
             None => vertices.extend([0.0, 0.0]),
         }
     }
-    checked_mesh(Mesh { vertices, indices })
+    let skin = match (joints, weights, skeleton, skin) {
+        (None, None, None, None) => None,
+        (Some(joints), Some(weights), Some(skeleton), Some(skin)) => {
+            ensure!(
+                joints.len() == count * 4 && weights.len() == count * 4,
+                "a skinned mesh needs four joints and weights a vertex"
+            );
+            let rig = Rig::from_json(RigJson { skeleton, skin, clips: clips.unwrap_or_default() })?;
+            Some(Skin { joints: joints.as_chunks::<4>().0.to_vec(), weights: weights.as_chunks::<4>().0.to_vec(), rig })
+        }
+        _ => bail!("a skinned mesh needs joints, weights, a skeleton and a skin"),
+    };
+    let lods: Vec<(f32, Vec<u32>)> = lods.into_iter().map(|lod| (lod.error, lod.indices)).collect();
+    checked_mesh(vertices, indices, &lods, skin)
+}
+
+/// A mesh file's bounds (JSON or packed): its vertices' least and greatest
+/// coordinates.
+pub fn mesh_bounds(bytes: &[u8]) -> Result<([f32; 3], [f32; 3])> {
+    let mesh = parse_mesh(bytes)?;
+    let mut bounds = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for vertex in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
+        for (axis, &coordinate) in vertex[..3].iter().enumerate() {
+            bounds.0[axis] = bounds.0[axis].min(coordinate);
+            bounds.1[axis] = bounds.1[axis].max(coordinate);
+        }
+    }
+    Ok(bounds)
+}
+
+/// The whole mesh's level of detail, then each of `simpler`'s (its error
+/// and indices), their indices after the mesh's in `indices`.
+fn levels(indices: &mut Vec<u32>, simpler: &[(f32, Vec<u32>)]) -> Result<Vec<Lod>> {
+    let count = |indices: &[u32]| u32::try_from(indices.len()).context("mesh has more indices than a u32 counts");
+    let mut lods = vec![Lod { first: 0, count: count(indices)?, error: 0.0 }];
+    for (error, lod) in simpler {
+        lods.push(Lod { first: count(indices)?, count: count(lod)?, error: *error });
+        indices.extend_from_slice(lod);
+    }
+    count(indices)?;
+    Ok(lods)
 }
 
 /// The mesh, if its vertices and triangles are whole: some vertices, every
-/// index one of them, nonzero normals and coordinates float32 can hold.
-fn checked_mesh(mesh: Mesh) -> Result<Mesh> {
-    let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
+/// index one of them, nonzero normals and coordinates float32 can hold; if
+/// its simpler levels of detail (their errors and indices) are triangles of
+/// its vertices too, at most `MAX_LODS` in all, their errors finite and
+/// growing; and if a skin's joints are its rig's and each vertex's weights
+/// add up to something.
+pub(crate) fn checked_mesh(
+    vertices: Vec<f32>,
+    mut indices: Vec<u32>,
+    simpler: &[(f32, Vec<u32>)],
+    skin: Option<Skin>,
+) -> Result<Mesh> {
     ensure!(
-        count != 0 && !mesh.indices.is_empty() && mesh.indices.len().is_multiple_of(3),
+        !indices.is_empty() && indices.len().is_multiple_of(3),
         "mesh requires matching position/normal/UV vertices and triangle indices"
     );
+    ensure!(simpler.len() < MAX_LODS, "mesh has more than {} simpler levels of detail", MAX_LODS - 1);
+    let mut least = 0.0;
+    for (error, lod) in simpler {
+        ensure!(
+            error.is_finite() && *error >= least && !lod.is_empty() && lod.len().is_multiple_of(3),
+            "mesh level of detail requires triangles and a finite error no smaller than the last's"
+        );
+        least = *error;
+    }
+    let lods = levels(&mut indices, simpler)?;
+    let bounds = Sphere::around(&vertices, MESH_VERTEX_FLOATS);
+    let mut mesh = Mesh { vertices, indices, bounds, lods, skin };
+    let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
+    ensure!(count != 0, "mesh requires matching position/normal/UV vertices and triangle indices");
     ensure!(mesh.indices.iter().all(|&index| (index as usize) < count), "mesh index is outside its vertex array");
     ensure!(mesh.vertices.iter().all(|value| value.is_finite()), "mesh coordinates exceed float32 range");
     for vertex in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
@@ -172,44 +298,97 @@ fn checked_mesh(mesh: Mesh) -> Result<Mesh> {
         let length = normal.iter().map(|&value| f64::from(value) * f64::from(value)).sum::<f64>().sqrt();
         ensure!(length >= 1e-8, "mesh normal must be nonzero");
     }
+    if let Some(skin) = &mut mesh.skin {
+        let joints = skin.rig.joints.len();
+        ensure!(
+            skin.joints.iter().flatten().all(|&joint| usize::from(joint) < joints),
+            "a vertex's joint must be one of its skin's"
+        );
+        // Each vertex's weights, made to add up to 1 if they are not near it
+        // (so that packing a mesh again changes nothing).
+        for weights in &mut skin.weights {
+            let total: f32 = weights.iter().sum();
+            ensure!(
+                weights.iter().all(|weight| weight.is_finite() && *weight >= 0.0) && total > 0.0,
+                "a vertex's weights must be finite, not negative, and some of them more than 0"
+            );
+            if (total - 1.0).abs() > 1e-5 {
+                for weight in weights.iter_mut() {
+                    *weight /= total;
+                }
+            }
+        }
+    }
     Ok(mesh)
 }
 
 /// The compact binary form of a mesh asset (JSON, or already binary), which
 /// the renderer reads in place of its JSON under the same key: "PMSH",
-/// version 1, flags (1: shader attributes, 2: 16-bit indices), two zero
-/// bytes, then the vertex and index counts (u32s), each vertex's position,
-/// normal, UV and, flagged, attributes (f32s), and the indices, all
-/// little-endian.
+/// version 1, flags (1: shader attributes, 2: 16-bit indices, 4: a skin,
+/// 8: simpler levels of detail), two zero bytes, then the vertex and index
+/// counts (u32s), each vertex's position, normal, UV and, flagged,
+/// attributes (f32s), and the indices; flagged, then the count of simpler
+/// levels (u32), each one's index count (u32) and error (f32), and their
+/// indices; flagged, a skinned mesh's each vertex's joints (u16s) and
+/// weights (f32s) and its rig. All little-endian.
 pub fn pack_mesh(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mesh = parse_mesh(bytes)?;
+    pack(&parse_mesh(bytes)?)
+}
+
+pub(crate) fn pack(mesh: &Mesh) -> Result<Vec<u8>> {
     let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
     let vertices = mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0;
     let attributes = vertices.iter().any(|vertex| vertex[8] != 0.0 || vertex[9] != 0.0);
     let short = count <= usize::from(u16::MAX) + 1;
+    let lods = mesh.lods.len() > 1;
     let floats = if attributes { MESH_VERTEX_FLOATS } else { MESH_VERTEX_FLOATS - 2 };
     let mut packed =
         Vec::with_capacity(MESH_HEADER + count * floats * 4 + mesh.indices.len() * if short { 2 } else { 4 });
     packed.extend_from_slice(MESH_MAGIC);
     packed.extend([
         MESH_VERSION,
-        if attributes { MESH_ATTRIBUTES } else { 0 } | if short { MESH_SHORT_INDICES } else { 0 },
+        if attributes { MESH_ATTRIBUTES } else { 0 }
+            | if short { MESH_SHORT_INDICES } else { 0 }
+            | if mesh.skin.is_some() { MESH_SKIN } else { 0 }
+            | if lods { MESH_LODS } else { 0 },
         0,
         0,
     ]);
     packed.extend(u32::try_from(count).context("mesh has more vertices than a u32 counts")?.to_le_bytes());
-    packed.extend(u32::try_from(mesh.indices.len()).context("mesh has more indices than a u32 counts")?.to_le_bytes());
+    packed.extend(mesh.lods[0].count.to_le_bytes());
     for vertex in vertices {
         for value in &vertex[..floats] {
             packed.extend(value.to_le_bytes());
         }
     }
-    for &index in &mesh.indices {
-        if short {
-            packed.extend(u16::try_from(index)?.to_le_bytes());
-        } else {
-            packed.extend(index.to_le_bytes());
+    let write = |packed: &mut Vec<u8>, indices: &[u32]| -> Result<()> {
+        for &index in indices {
+            if short {
+                packed.extend(u16::try_from(index)?.to_le_bytes());
+            } else {
+                packed.extend(index.to_le_bytes());
+            }
         }
+        Ok(())
+    };
+    let whole = mesh.lods[0];
+    write(&mut packed, &mesh.indices[whole.first as usize..(whole.first + whole.count) as usize])?;
+    if lods {
+        packed.extend(u32::try_from(mesh.lods.len() - 1)?.to_le_bytes());
+        for lod in &mesh.lods[1..] {
+            packed.extend(lod.count.to_le_bytes());
+            packed.extend(lod.error.to_le_bytes());
+        }
+        for lod in &mesh.lods[1..] {
+            write(&mut packed, &mesh.indices[lod.first as usize..(lod.first + lod.count) as usize])?;
+        }
+    }
+    if let Some(skin) = &mesh.skin {
+        for (joints, weights) in skin.joints.iter().zip(&skin.weights) {
+            packed.extend(joints.iter().flat_map(|joint| joint.to_le_bytes()));
+            packed.extend(weights.iter().flat_map(|weight| weight.to_le_bytes()));
+        }
+        write_rig(&skin.rig, &mut packed);
     }
     Ok(packed)
 }
@@ -218,15 +397,21 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
     ensure!(bytes.len() >= MESH_HEADER, "binary mesh ends in its header");
     ensure!(bytes[4] == MESH_VERSION, "unsupported binary mesh version");
     let flags = bytes[5];
-    ensure!(flags & !(MESH_ATTRIBUTES | MESH_SHORT_INDICES) == 0, "unsupported binary mesh flags");
-    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-    let (count, index_count) = (word(8), word(12));
+    ensure!(
+        flags & !(MESH_ATTRIBUTES | MESH_SHORT_INDICES | MESH_SKIN | MESH_LODS) == 0,
+        "unsupported binary mesh flags"
+    );
+    let word = |at: usize| -> Result<usize> {
+        let word = bytes.get(at..at + 4).context("binary mesh size does not match its counts")?;
+        Ok(u32::from_le_bytes(word.try_into().unwrap()) as usize)
+    };
+    let (count, index_count) = (word(8)?, word(12)?);
     let floats = if flags & MESH_ATTRIBUTES != 0 { MESH_VERTEX_FLOATS } else { MESH_VERTEX_FLOATS - 2 };
     let index_bytes = if flags & MESH_SHORT_INDICES != 0 { 2 } else { 4 };
     let vertex_end = count.checked_mul(floats * 4).and_then(|size| size.checked_add(MESH_HEADER));
     let end = vertex_end.and_then(|end| index_count.checked_mul(index_bytes).and_then(|size| size.checked_add(end)));
-    ensure!(end == Some(bytes.len()), "binary mesh size does not match its counts");
-    let vertex_end = vertex_end.unwrap();
+    let (Some(vertex_end), Some(end)) = (vertex_end, end) else { bail!("binary mesh size does not match its counts") };
+    ensure!(end <= bytes.len(), "binary mesh size does not match its counts");
     let values = bytes[MESH_HEADER..vertex_end].as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value));
     let vertices = if floats == MESH_VERTEX_FLOATS {
         values.collect()
@@ -239,14 +424,51 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
         }
         vertices
     };
-    let indices = bytes[vertex_end..]
-        .chunks_exact(index_bytes)
-        .map(|index| match index {
-            [a, b] => u32::from(u16::from_le_bytes([*a, *b])),
-            _ => u32::from_le_bytes(index.try_into().unwrap()),
-        })
-        .collect();
-    checked_mesh(Mesh { vertices, indices })
+    let read_indices = |from: usize, to: usize| -> Vec<u32> {
+        bytes[from..to]
+            .chunks_exact(index_bytes)
+            .map(|index| match index {
+                [a, b] => u32::from(u16::from_le_bytes([*a, *b])),
+                _ => u32::from_le_bytes(index.try_into().unwrap()),
+            })
+            .collect()
+    };
+    let indices = read_indices(vertex_end, end);
+    // Any simpler levels of detail, then any skin.
+    let mut simpler = Vec::new();
+    let mut at = end;
+    if flags & MESH_LODS != 0 {
+        let levels = word(end)?;
+        ensure!(levels < MAX_LODS, "mesh has more than {} simpler levels of detail", MAX_LODS - 1);
+        at = end + 4 + levels * 8;
+        for level in 0..levels {
+            let table = end + 4 + level * 8;
+            let lod_count = word(table)?;
+            let error =
+                f32::from_le_bytes(bytes.get(table + 4..table + 8).context("binary mesh ends early")?.try_into()?);
+            let to = lod_count.checked_mul(index_bytes).and_then(|size| size.checked_add(at));
+            let to = to.filter(|&to| to <= bytes.len()).context("binary mesh size does not match its counts")?;
+            simpler.push((error, read_indices(at, to)));
+            at = to;
+        }
+    }
+    // A skin's joints and weights, 24 bytes a vertex, then its rig.
+    let skin = if flags & MESH_SKIN != 0 {
+        let skin_end = count.checked_mul(24).and_then(|size| size.checked_add(at));
+        let skin_end = skin_end.filter(|&skin_end| skin_end <= bytes.len()).context("binary mesh ends in its skin")?;
+        let (mut joints, mut weights) = (Vec::with_capacity(count), Vec::with_capacity(count));
+        for vertex in bytes[at..skin_end].as_chunks::<24>().0 {
+            let half = |at: usize| u16::from_le_bytes([vertex[at], vertex[at + 1]]);
+            let float = |at: usize| f32::from_le_bytes(vertex[at..at + 4].try_into().unwrap());
+            joints.push([half(0), half(2), half(4), half(6)]);
+            weights.push([float(8), float(12), float(16), float(20)]);
+        }
+        Some(Skin { joints, weights, rig: read_rig(&bytes[skin_end..])? })
+    } else {
+        ensure!(at == bytes.len(), "binary mesh size does not match its counts");
+        None
+    };
+    checked_mesh(vertices, indices, &simpler, skin)
 }
 
 pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
@@ -352,7 +574,7 @@ fn asset_key(value: Option<&Value>, field: &str) -> Result<String> {
 }
 
 /// Asset keys are relative paths that cannot leave the asset root.
-pub(crate) fn validate_asset_key(key: &str) -> Result<()> {
+pub fn validate_asset_key(key: &str) -> Result<()> {
     ensure!(
         !(key.is_empty()
             || key.starts_with('/')
@@ -490,6 +712,24 @@ impl<T> AssetStore<T> {
         slot.current.is_none() && !slot.failed && (slot.queued || slot.loading > 0 || slot.revision == 0)
     }
 
+    /// Where the asset of `kind` and `key` stands, as the dev tools say it
+    /// (`pen_protocol::devtools_asset_state`), and its revision.
+    pub fn standing(&self, kind: AssetKind, key: &str) -> (u32, u64) {
+        use pen_protocol::devtools_asset_state::{FAILED, LOADING, READY, UNUSED};
+        let Some(&id) = self.ids[kind as usize].get(key) else { return (UNUSED, 0) };
+        let slot = &self.slots[id];
+        let state = if slot.current.is_some() {
+            READY
+        } else if slot.failed {
+            FAILED
+        } else if slot.revision == 0 && !slot.queued {
+            UNUSED
+        } else {
+            LOADING
+        };
+        (state, slot.revision)
+    }
+
     /// Loads under way (prefetches still queued aside).
     pub fn in_flight(&self) -> usize {
         self.slots.iter().map(|slot| slot.loading as usize).sum()
@@ -505,7 +745,9 @@ impl<T> AssetStore<T> {
     /// file when its turn comes. Each keeps what it has until its new
     /// revision is ready, and keeps it if that fails.
     pub fn reload(&mut self, keys: &[String]) {
-        let changed: HashSet<&str> = keys.iter().map(String::as_str).collect();
+        // A KTX2 variant's file stands for the texture's key.
+        let variants: Vec<String> = keys.iter().filter_map(|key| pen_texture::ktx2::variant_of(key)).collect();
+        let changed: HashSet<&str> = keys.iter().chain(&variants).map(String::as_str).collect();
         for key in changed {
             for kind in AssetKind::ALL {
                 let Some(&id) = self.ids[kind as usize].get(key) else { continue };
@@ -631,6 +873,118 @@ mod tests {
         let mut packed = pack_mesh(plain).unwrap();
         packed[4] = 2;
         assert!(parse_mesh(&packed).is_err());
+    }
+
+    /// A triangle bound to the arm rig's two joints: JSON and its binary
+    /// form read alike, rig and all.
+    pub(crate) fn skinned_triangle() -> String {
+        let rig = serde_json::to_value(crate::animation::tests::arm().json()).unwrap();
+        let mut mesh: serde_json::Map<String, Value> = serde_json::from_str(
+            r#"{"positions":[0,0,0,1,0,0,0,2,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],"indices":[0,1,2],
+                "joints":[0,0,0,0, 0,1,0,0, 1,0,0,0],"weights":[1,0,0,0, 1,1,0,0, 1,0,0,0]}"#,
+        )
+        .unwrap();
+        mesh.extend(rig.as_object().unwrap().clone());
+        serde_json::to_string(&mesh).unwrap()
+    }
+
+    #[test]
+    fn skinned_meshes_pack_with_their_rig() {
+        let json = skinned_triangle();
+        let parsed = parse_mesh(json.as_bytes()).unwrap();
+        let skin = parsed.skin.as_ref().unwrap();
+        assert_eq!(skin.joints[1], [0, 1, 0, 0]);
+        assert_eq!(skin.weights[1], [0.5, 0.5, 0.0, 0.0], "weights are made to add up to 1");
+        assert_eq!(skin.rig.clips.len(), 2);
+        let packed = pack_mesh(json.as_bytes()).unwrap();
+        assert_eq!(packed[5] & MESH_SKIN, MESH_SKIN);
+        let unpacked = parse_mesh(&packed).unwrap();
+        let unpacked_skin = unpacked.skin.as_ref().unwrap();
+        assert_eq!((&unpacked_skin.joints, &unpacked_skin.weights), (&skin.joints, &skin.weights));
+        assert_eq!(unpacked_skin.rig, skin.rig);
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
+        assert!(parse_mesh(&packed[..packed.len() - 3]).is_err());
+
+        // A joint past the skin, half a skin, and weights that add to 0.
+        let mut broken: Value = serde_json::from_str(&json).unwrap();
+        broken["joints"][0] = 2.into();
+        assert!(parse_mesh(broken.to_string().as_bytes()).is_err());
+        let mut broken: Value = serde_json::from_str(&json).unwrap();
+        broken.as_object_mut().unwrap().remove("skin");
+        assert!(parse_mesh(broken.to_string().as_bytes()).is_err());
+        let mut broken: Value = serde_json::from_str(&json).unwrap();
+        broken["weights"][0] = 0.into();
+        assert!(parse_mesh(broken.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_meshs_bounds_hold_its_vertices() {
+        let mesh =
+            br#"{"positions":[0,-2,0,1,0,3,0,1,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],"indices":[0,1,2]}"#;
+        let bounds = ([0.0, -2.0, 0.0], [1.0, 1.0, 3.0]);
+        assert_eq!(mesh_bounds(mesh).unwrap(), bounds);
+        assert_eq!(mesh_bounds(&pack_mesh(mesh).unwrap()).unwrap(), bounds);
+        assert!(mesh_bounds(b"{}").is_err());
+    }
+
+    /// A skin follows the levels of detail in the binary form, and both read
+    /// back as they were.
+    #[test]
+    fn skins_and_levels_of_detail_pack_together() {
+        let rig = serde_json::to_value(crate::animation::tests::arm().json()).unwrap();
+        let mut mesh: serde_json::Map<String, Value> = serde_json::from_str(
+            r#"{"positions":[0,0,0,1,0,0,1,1,0,0,1,0],"normals":[0,0,1,0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,1,1,0,1],
+                "indices":[0,1,2,0,2,3],"lods":[{"error":0.5,"indices":[0,1,2]}],
+                "joints":[0,0,0,0, 0,1,0,0, 1,0,0,0, 1,0,0,0],"weights":[1,0,0,0, 1,1,0,0, 1,0,0,0, 1,0,0,0]}"#,
+        )
+        .unwrap();
+        mesh.extend(rig.as_object().unwrap().clone());
+        let json = serde_json::to_string(&mesh).unwrap();
+        let parsed = parse_mesh(json.as_bytes()).unwrap();
+        let packed = pack_mesh(json.as_bytes()).unwrap();
+        assert_eq!(packed[5], MESH_SHORT_INDICES | MESH_SKIN | MESH_LODS);
+        let unpacked = parse_mesh(&packed).unwrap();
+        assert_eq!((&unpacked.indices, &unpacked.lods), (&parsed.indices, &parsed.lods));
+        let (skin, unpacked_skin) = (parsed.skin.as_ref().unwrap(), unpacked.skin.as_ref().unwrap());
+        assert_eq!((&unpacked_skin.joints, &unpacked_skin.weights), (&skin.joints, &skin.weights));
+        assert_eq!(unpacked_skin.rig, skin.rig);
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
+        assert!(parse_mesh(&packed[..packed.len() - 3]).is_err());
+    }
+
+    #[test]
+    fn levels_of_detail_follow_the_mesh_and_pack_with_it() {
+        let quad = br#"{"positions":[0,0,0,1,0,0,1,1,0,0,1,0],"normals":[0,0,1,0,0,1,0,0,1,0,0,1],
+            "uvs":[0,0,1,0,1,1,0,1],"indices":[0,1,2,0,2,3],"lods":[{"error":0.5,"indices":[0,1,2]}]}"#;
+        let mesh = parse_mesh(quad).unwrap();
+        assert_eq!(mesh.indices, [0, 1, 2, 0, 2, 3, 0, 1, 2]);
+        assert_eq!(mesh.lods, [Lod { first: 0, count: 6, error: 0.0 }, Lod { first: 6, count: 3, error: 0.5 }]);
+        assert_eq!(mesh.bounds.center, [0.5, 0.5, 0.0]);
+        let packed = pack_mesh(quad).unwrap();
+        assert_eq!(packed[5], MESH_SHORT_INDICES | MESH_LODS);
+        let unpacked = parse_mesh(&packed).unwrap();
+        assert_eq!((unpacked.indices, unpacked.lods), (mesh.indices, mesh.lods));
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
+        assert!(parse_mesh(&packed[..packed.len() - 2]).is_err());
+        let mut longer = packed.clone();
+        longer.extend([0, 0]);
+        assert!(parse_mesh(&longer).is_err());
+        // A level's indices must be triangles of the mesh's vertices, and
+        // its error no smaller than the last's.
+        let bad = |lods: &str| {
+            let json = format!(
+                r#"{{"positions":[0,0,0,1,0,0,1,1,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,1,1],
+                "indices":[0,1,2],"lods":{lods}}}"#
+            );
+            parse_mesh(json.as_bytes()).is_err()
+        };
+        assert!(bad(r#"[{"error":0.1,"indices":[0,1,3]}]"#));
+        assert!(bad(r#"[{"error":0.1,"indices":[0,1]}]"#));
+        assert!(bad(r#"[{"error":0.2,"indices":[0,1,2]},{"error":0.1,"indices":[0,1,2]}]"#));
+        assert!(bad(r#"[{"error":-1,"indices":[0,1,2]}]"#));
+        let four = r#"{"error":1,"indices":[0,1,2]}"#;
+        assert!(bad(&format!("[{four},{four},{four},{four}]")));
+        assert!(!bad(&format!("[{four},{four},{four}]")));
     }
 
     /// How long the game's meshes take to parse (docs/render-performance.md).

@@ -14,7 +14,7 @@
 //! minus the anchor plus `crash::frame`'s address in the unstripped build.
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +31,9 @@ static WRITTEN: AtomicUsize = AtomicUsize::new(0);
 /// PEN_CRASH_TEST=N: the frame to panic at, to try reports (0: never).
 static CRASH_AT: AtomicUsize = AtomicUsize::new(0);
 static GPU: Mutex<Option<String>> = Mutex::new(None);
+/// Whether nobody is there to dismiss a message box: a headless run, as on
+/// a CI machine, where one would wait forever.
+static UNATTENDED: AtomicBool = AtomicBool::new(false);
 /// Where reports go, once `install` knows.
 static DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
 
@@ -73,6 +76,13 @@ pub fn install(data: Option<PathBuf>) {
     }));
 }
 
+/// Says that this run is unattended (headless, or a command such as
+/// `packets`): a stopping error goes to stderr and its report, not to a
+/// message box.
+pub fn unattended() {
+    UNATTENDED.store(true, Ordering::Relaxed);
+}
+
 /// Says why pen stopped with an error: on stderr, as ever. The player
 /// runtime, which players start without a terminal, writes it to a report
 /// too, and on Windows, where it has no console, shows it in a message box.
@@ -87,7 +97,9 @@ pub fn stopped(error: &anyhow::Error) {
         };
         eprintln!("{said}");
         #[cfg(windows)]
-        message_box(&crate::identity().title, &format!("{} stopped: {error:#}\n\n{said}", crate::identity().name));
+        if !UNATTENDED.load(Ordering::Relaxed) {
+            message_box(&crate::identity().title, &format!("{} stopped: {error:#}\n\n{said}", crate::identity().name));
+        }
     }
 }
 
@@ -123,10 +135,16 @@ pub fn gpu(info: &wgpu::AdapterInfo) {
     }
 }
 
+/// The adapter frames are drawn with, as reports say it, once one is open.
+pub fn gpu_description() -> Option<String> {
+    GPU.try_lock().ok().and_then(|gpu| gpu.clone())
+}
+
 /// Notes how long a frame took; cheap enough for every frame.
 pub fn frame(duration: Duration) {
     let index = FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
     FRAME_MS[index % FRAMES].store((duration.as_secs_f32() * 1000.0).to_bits(), Ordering::Relaxed);
+    crate::reports::frame(duration);
     if index + 1 == CRASH_AT.load(Ordering::Relaxed) {
         panic!("PEN_CRASH_TEST: a crash at frame {}, as asked", index + 1);
     }
@@ -150,6 +168,7 @@ fn write(directory: &Path, panic: &Panic) -> std::io::Result<PathBuf> {
     let path = directory.join(format!("crash-{stamp}-{}.txt", std::process::id()));
     std::fs::write(&path, report(panic, now.as_secs()))?;
     prune(directory, KEEP);
+    crate::reports::crashed(&path);
     Ok(path)
 }
 
@@ -175,13 +194,27 @@ fn prune(directory: &Path, keep: usize) {
 
 fn report(panic: &Panic, now: u64) -> String {
     let mut text = String::new();
+    let _ = writeln!(text, "{} {}: {}", crate::identity().name, panic.what, panic.message);
+    let at = panic.location.as_ref().map(|location| format!("at {location} ")).unwrap_or_default();
+    let _ = writeln!(text, "{at}on thread {}, {}", panic.thread, timestamp(now));
+    text.push_str(&about());
+    if let Some(base) = load_address() {
+        let _ = writeln!(text, "executable loaded at {base:#x}");
+    }
+    let _ = writeln!(text, "anchor: crash::frame at {:#x}", frame as fn(Duration) as usize);
+    let _ = writeln!(text, "\n{}:\n{}", panic.details.0, panic.details.1);
+    text
+}
+
+/// What a report says of the build, the system and the run: pen's version,
+/// the system, the command line, the GPU and the last frames' times, a
+/// line each (bug reports share it).
+pub fn about() -> String {
+    let mut text = String::new();
     let features: Vec<&str> = [("compiler", cfg!(feature = "compiler")), ("steam", cfg!(feature = "steam"))]
         .into_iter()
         .filter_map(|(name, on)| on.then_some(name))
         .collect();
-    let _ = writeln!(text, "{} {}: {}", crate::identity().name, panic.what, panic.message);
-    let at = panic.location.as_ref().map(|location| format!("at {location} ")).unwrap_or_default();
-    let _ = writeln!(text, "{at}on thread {}, {}", panic.thread, timestamp(now));
     let _ = writeln!(
         text,
         "pen {}{} ({}, {}-{}, features: {})",
@@ -201,16 +234,16 @@ fn report(panic: &Panic, now: u64) -> String {
         .map(|index| format!("{:.1}", f32::from_bits(FRAME_MS[index % FRAMES].load(Ordering::Relaxed))))
         .collect();
     let _ = writeln!(text, "frames: {count}; the last {} took (ms, oldest first): {}", recent.len(), recent.join(" "));
-    if let Some(base) = load_address() {
-        let _ = writeln!(text, "executable loaded at {base:#x}");
-    }
-    let _ = writeln!(text, "anchor: crash::frame at {:#x}", frame as fn(Duration) as usize);
-    let _ = writeln!(text, "\n{}:\n{}", panic.details.0, panic.details.1);
     text
 }
 
+/// Now, as `2026-10-10T23:31:39Z`.
+pub fn now() -> String {
+    timestamp(SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+}
+
 /// The OS and its version, as far as is cheap to tell.
-fn system() -> String {
+pub(crate) fn system() -> String {
     let release = std::fs::read_to_string("/etc/os-release").ok().and_then(|text| {
         text.lines().find_map(|line| line.strip_prefix("PRETTY_NAME=")).map(|name| name.trim_matches('"').to_owned())
     });
@@ -242,7 +275,7 @@ fn load_address() -> Option<u64> {
 }
 
 /// `seconds` since 1970 as an ISO 8601 UTC time.
-fn timestamp(seconds: u64) -> String {
+pub(crate) fn timestamp(seconds: u64) -> String {
     let days = i64::try_from(seconds / 86_400).expect("u64 seconds are fewer than i64::MAX days");
     let time = seconds % 86_400;
     // Howard Hinnant's civil_from_days.

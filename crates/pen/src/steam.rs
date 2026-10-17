@@ -22,8 +22,16 @@
 //! Steps: `list` (every achievement and whether it is unlocked),
 //! `unlock=NAME`, `clear=NAME`, `stat=NAME=N` (an integer stat),
 //! `statf=NAME=X` (a float stat), `add=NAME=N` (to an integer stat),
-//! `show=NAME` (a stat's value) and `reset` (every stat and achievement).
+//! `show=NAME` (a stat's value), `reset` (every stat and achievement),
+//! `overlay` (whether the overlay has hooked the window; it fails headless)
+//! and `cloud` (whether Steam Cloud is on for the account and the app, the
+//! files it holds, and a file written, read back and deleted through it).
+//! A last line counts the steps that failed, for `scripts/steam-smoke.sh`.
 //! Without a running Steam client the game plays on without Steam.
+//!
+//! Steam Input (`steam_input`) reads the game's actions from the
+//! controllers Steam configures; `PEN_STEAM_INPUT_MANIFEST` names a local
+//! action manifest to use instead of the app's, while developing.
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -31,6 +39,7 @@ use pen_protocol::GameEvent;
 use steamworks::{CallbackResult, Client};
 
 use crate::input::Input;
+use crate::steam_input::{SteamInput, Steamworks};
 
 /// How often changed stats are stored with Steam, which rate-limits it.
 const STORE_INTERVAL: Duration = Duration::from_secs(60);
@@ -53,6 +62,8 @@ enum Step {
     Add(String, i32),
     Show(String),
     Reset,
+    Overlay,
+    Cloud,
 }
 
 fn parse_steps(text: &str) -> Result<Vec<Step>> {
@@ -72,6 +83,8 @@ fn parse_steps(text: &str) -> Result<Vec<Step>> {
             Ok(match key {
                 "list" => Step::List,
                 "reset" => Step::Reset,
+                "overlay" => Step::Overlay,
+                "cloud" => Step::Cloud,
                 "unlock" => Step::Unlock(name()?),
                 "clear" => Step::Clear(name()?),
                 "show" => Step::Show(name()?),
@@ -90,6 +103,10 @@ fn parse_steps(text: &str) -> Result<Vec<Step>> {
         .collect()
 }
 
+fn on(enabled: bool) -> &'static str {
+    if enabled { "on" } else { "off" }
+}
+
 /// The error for a call Steam refused, about `what`.
 fn refused(what: String) -> impl FnOnce(()) -> anyhow::Error {
     move |()| anyhow!("Steam has no {what} (or not the player's stats yet)")
@@ -106,6 +123,8 @@ pub struct Steam {
     urgent: bool,
     stored: Instant,
     debug: Vec<Step>,
+    /// Steam Input, once it started.
+    pub input: Option<SteamInput<Steamworks>>,
 }
 
 impl Steam {
@@ -141,7 +160,25 @@ impl Steam {
             eprintln!("PEN_STEAM_DEBUG: waiting for the player's stats");
         }
         let now = Instant::now();
-        Some(Steam { client, received: false, started: now, unstored: false, urgent: false, stored: now, debug })
+        let input = client.input();
+        let input = if input.init(false) {
+            if let Ok(manifest) = std::env::var("PEN_STEAM_INPUT_MANIFEST")
+                && !input.set_input_action_manifest_file_path(&manifest)
+            {
+                eprintln!("Steam Input: the action manifest {manifest} did not load");
+            }
+            Some(SteamInput::new(Steamworks(input)))
+        } else {
+            eprintln!("Steam Input is off");
+            None
+        };
+        Some(Steam { client, received: false, started: now, unstored: false, urgent: false, stored: now, debug, input })
+    }
+
+    /// The Steam client, for the parts of Steam with modules of their own
+    /// (`crate::workshop`).
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     /// Pumps Steam's callbacks once a frame and stores changes when due.
@@ -274,7 +311,47 @@ impl Steam {
         self.stored = Instant::now();
     }
 
+    /// Whether the Steam overlay is there, hooked into the window's swapchain.
+    fn overlay(&self) -> Result<()> {
+        if !self.client.utils().is_overlay_enabled() {
+            bail!("the Steam overlay is not enabled (not yet hooked into a window, or turned off for the game)");
+        }
+        Ok(())
+    }
+
+    /// Steam Cloud for the player and the game: whether it is on, the files
+    /// it holds, and a small file written, read back and deleted through it
+    /// (which needs a byte quota on the app's Steam Cloud settings).
+    fn cloud(&self) -> Result<()> {
+        use std::io::{Read, Write};
+        let storage = self.client.remote_storage();
+        let (account, app) = (storage.is_cloud_enabled_for_account(), storage.is_cloud_enabled_for_app());
+        eprintln!("PEN_STEAM_DEBUG: cloud is {} for the account, {} for the app", on(account), on(app));
+        for file in storage.files() {
+            eprintln!("PEN_STEAM_DEBUG: cloud holds {} ({} bytes)", file.name, file.size);
+        }
+        if !(account && app) {
+            bail!("Steam Cloud is off");
+        }
+        const PROBE: &str = "pen-cloud-check.txt";
+        let written = format!("pen {} checked Steam Cloud\n", env!("CARGO_PKG_VERSION"));
+        storage.file(PROBE).write().write_all(written.as_bytes()).context("writing a file to Steam Cloud")?;
+        let mut read = String::new();
+        storage.file(PROBE).read().read_to_string(&mut read).context("reading it back from Steam Cloud")?;
+        let deleted = storage.file(PROBE).delete();
+        if read != written {
+            bail!("Steam Cloud gave back {read:?}, not the {written:?} written");
+        }
+        if !deleted {
+            bail!("Steam Cloud did not delete {PROBE}");
+        }
+        eprintln!("PEN_STEAM_DEBUG: cloud wrote, read back and deleted {PROBE}");
+        Ok(())
+    }
+
     fn run_debug(&mut self) {
+        let steps = self.debug.len();
+        let mut failed = 0;
         for step in std::mem::take(&mut self.debug) {
             let result = match &step {
                 Step::List => self.achievements().map(|achievements| {
@@ -302,11 +379,15 @@ impl Steam {
                 Step::Reset => {
                     self.reset(true).map(|()| eprintln!("PEN_STEAM_DEBUG: reset every stat and achievement"))
                 }
+                Step::Overlay => self.overlay().map(|()| eprintln!("PEN_STEAM_DEBUG: the overlay is enabled")),
+                Step::Cloud => self.cloud(),
             };
             if let Err(error) = result {
+                failed += 1;
                 eprintln!("PEN_STEAM_DEBUG: {error:#}");
             }
         }
+        eprintln!("PEN_STEAM_DEBUG: {steps} steps, {failed} failed");
     }
 }
 
@@ -327,6 +408,8 @@ mod tests {
     fn debug_steps() {
         let steps = parse_steps("list unlock=ACH_WIN_ONE_GAME,add=NumGames=2 statf=FeetTraveled=1.5 reset").unwrap();
         assert_eq!(steps.len(), 5);
+        let checks = parse_steps("overlay cloud").unwrap();
+        assert!(matches!(checks[..], [Step::Overlay, Step::Cloud]));
         assert!(matches!(&steps[2], Step::Add(name, 2) if name == "NumGames"));
         assert!(matches!(&steps[3], Step::StatFloat(name, value) if name == "FeetTraveled" && *value == 1.5));
         assert!(parse_steps("unlock").is_err());

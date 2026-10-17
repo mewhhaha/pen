@@ -10,14 +10,15 @@ use pen_protocol::{Catalog, GameEvent};
 use wgpu::util::DeviceExt;
 
 use super::{
-    Checking, GpuAsset, INSET_SAMPLES, MaterialAsset, MeshAsset, PendingTexture, ShaderAsset, Staged, State,
+    Checking, GpuAsset, INSET_SAMPLES, MaterialAsset, MeshAsset, MeshSkin, PendingTexture, ShaderAsset, Staged, State,
     TextureAsset, extent,
 };
 use crate::asset_store::AssetKind;
+use crate::built_in::BuiltIn;
 use crate::loader::{Job, JobQueue, LevelMessage, Loaded, Message, Priority};
 use crate::mipmaps::Mipmapper;
 use crate::packed_texture::{PackedLevel, mip_levels, texel_bytes};
-use crate::shader::{self, Pipelines, Variants};
+use crate::shader::{self, Pipelines, Stage, Variants};
 
 // How long (seconds) detail takes to settle once a finer level arrives.
 const SHARPENING: f64 = 0.12;
@@ -26,9 +27,11 @@ const SHARPENING: f64 = 0.12;
 const SHOWN_LEVELS: u32 = 8;
 
 impl ShaderAsset {
-    /// `variants` as it has them: instanced only with `vertex_instanced`.
+    /// `variants` as it has them: instanced only with `vertex_instanced`,
+    /// skinned only with `vertex_skinned`.
     pub(super) fn own(&self, variants: Variants) -> Variants {
-        if self.instancing { variants } else { variants.without(Variants::INSTANCED) }
+        let variants = if self.instancing { variants } else { variants.without(Variants::INSTANCED) };
+        if self.skinning { variants } else { variants.without(Variants::SKINNED) }
     }
 
     /// Background compiles under way.
@@ -48,9 +51,10 @@ impl ShaderAsset {
         let missing = missing.without(*compiling);
         *compiling |= missing;
         for variant in missing.each() {
-            let (revision, module, instancing) = (self.revision, self.module.clone(), self.instancing);
+            let (revision, module) = (self.revision, self.module.clone());
+            let (instancing, skinning) = (self.instancing, self.skinning);
             jobs.push(
-                Job::Compile { slot, revision, samples, variants: variant, module, instancing },
+                Job::Compile { slot, revision, samples, variants: variant, module, instancing, skinning },
                 Priority::Urgent,
             );
         }
@@ -59,14 +63,19 @@ impl ShaderAsset {
     /// Compiles its depth-only pipelines in the background, unless they are
     /// there or on their way.
     pub(super) fn request_shadow(&mut self, jobs: &JobQueue, slot: usize) {
-        for instanced in [false, true] {
-            let index = usize::from(instanced);
-            if (instanced && !self.instancing) || self.shadow[index].is_some() || self.shadow_compiling[index] {
+        for stage in Stage::ALL {
+            let index = stage as usize;
+            let lacks = match stage {
+                Stage::Plain => false,
+                Stage::Instanced => !self.instancing,
+                Stage::Skinned => !self.skinning,
+            };
+            if lacks || self.shadow[index].is_some() || self.shadow_compiling[index] {
                 continue;
             }
             self.shadow_compiling[index] = true;
             let (revision, module) = (self.revision, self.module.clone());
-            jobs.push(Job::Shadow { slot, revision, module, instanced }, Priority::Urgent);
+            jobs.push(Job::Shadow { slot, revision, module, stage }, Priority::Urgent);
         }
     }
 
@@ -77,27 +86,34 @@ impl ShaderAsset {
     }
 }
 
-pub(super) fn texture_views(texture: &wgpu::Texture, finest: u32) -> (wgpu::TextureView, wgpu::TextureView) {
+pub(super) fn texture_views(
+    device: &wgpu::Device,
+    texture: &wgpu::Texture,
+    finest: u32,
+) -> (wgpu::TextureView, wgpu::TextureView) {
     let levels = |format: Option<wgpu::TextureFormat>| wgpu::TextureViewDescriptor {
         format,
         base_mip_level: finest,
         mip_level_count: Some(texture.mip_level_count() - finest),
         ..Default::default()
     };
-    let linear = match texture.format() {
-        wgpu::TextureFormat::Rgba8UnormSrgb => wgpu::TextureFormat::Rgba8Unorm,
-        format => format,
-    };
+    let linear = crate::downlevel::linear_format(device, texture.format());
     (texture.create_view(&levels(None)), texture.create_view(&levels(Some(linear))))
 }
 
 /// A texture with all its levels there.
-pub(super) fn whole(texture: wgpu::Texture, view_id: u64) -> TextureAsset {
-    let (view, linear) = texture_views(&texture, 0);
+pub(super) fn whole(device: &wgpu::Device, texture: wgpu::Texture, view_id: u64) -> TextureAsset {
+    let (view, linear) = texture_views(device, &texture, 0);
     TextureAsset { texture, view, linear, view_id, resident: 0, shown: 0.0, seen: false, stream: None }
 }
 
+/// Writes `level`, whole blocks of the texture's format (texels, for an
+/// uncompressed one): a level smaller than a block is still a whole block.
 pub(super) fn upload_level(queue: &wgpu::Queue, texture: &wgpu::Texture, level: &PackedLevel) {
+    let format = texture.format();
+    let (block_width, block_height) = format.block_dimensions();
+    let block_bytes = format.block_copy_size(None).unwrap_or(4);
+    let (columns, rows) = (level.width.div_ceil(block_width), level.height.div_ceil(block_height));
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -108,10 +124,10 @@ pub(super) fn upload_level(queue: &wgpu::Queue, texture: &wgpu::Texture, level: 
         &level.pixels,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(level.width * texel_bytes(texture.format())),
-            rows_per_image: Some(level.height),
+            bytes_per_row: Some(columns * block_bytes),
+            rows_per_image: Some(rows),
         },
-        extent(level.width, level.height),
+        extent(columns * block_width, rows * block_height),
     );
 }
 
@@ -139,11 +155,7 @@ pub(super) fn texture_from(
             | wgpu::TextureUsages::COPY_DST
             | if levels > 1 { wgpu::TextureUsages::RENDER_ATTACHMENT } else { wgpu::TextureUsages::empty() },
         // Reinterpret the same allocation as linear data for object-space normals.
-        view_formats: if format == wgpu::TextureFormat::Rgba8UnormSrgb {
-            &[wgpu::TextureFormat::Rgba8Unorm]
-        } else {
-            &[]
-        },
+        view_formats: &crate::downlevel::view_formats(device, format),
     });
     queue.write_texture(
         texture.as_image_copy(),
@@ -166,6 +178,11 @@ impl State {
     /// ahead of need, behind whatever a frame asks for, so nothing pops in
     /// when first drawn.
     pub fn preload(&mut self, catalog: &Catalog) {
+        // A scene's own assets first: the rest waits for them.
+        if self.scene.iter().any(|&slot| self.assets.loading(slot)) {
+            self.deferred = Some(catalog.clone());
+            return;
+        }
         self.preloading = true;
         for key in &catalog.meshes {
             if let Err(error) = self.assets.prefetch(AssetKind::Mesh, key) {
@@ -177,6 +194,31 @@ impl State {
                 self.reject(AssetKind::Material, key, error);
             }
         }
+    }
+
+    /// Loads a scene's assets now, ahead of the frames that draw them, all
+    /// side by side: `(kind, key)` pairs, kinds named as `AssetKind::name`
+    /// says (a material's shader and textures among them, so they need not
+    /// wait for it). The catalog's preload waits until they are in.
+    pub fn preload_scene(&mut self, assets: &[(String, String)], samples: u32) {
+        // The first frame takes its sample count at once (`quality`): the
+        // scene's shaders and the passes round it compile for it now.
+        if samples > 0 && self.frames == 0 {
+            self.samples_now = samples;
+            self.built_ins.prepare(BuiltIn::all(samples));
+        }
+        for (kind, key) in assets {
+            let Some(kind) = AssetKind::named(kind) else { continue };
+            match self.assets.get(kind, key) {
+                Ok(slot) => self.scene.push(slot),
+                Err(error) => self.reject(kind, key, error),
+            }
+        }
+    }
+
+    /// Has first loads take what `prefetch` read and decoded ahead.
+    pub fn warm(&mut self, prefetch: crate::prefetch::Prefetch) {
+        *self.loader.prefetch.lock().unwrap() = Some(prefetch);
     }
 
     /// Reports an asset that cannot even be asked for.
@@ -249,14 +291,15 @@ impl State {
                 self.compiled_out(slot, revision, failure, now);
             }
             Message::BuiltIn { which, result } => self.built_ins.arrived(which, result),
+            Message::Culling(result) => self.culling.arrived(result),
             // Taken in with the others' levels.
             Message::Level => {}
-            Message::Shadow { slot, revision, instanced, result } => {
+            Message::Shadow { slot, revision, stage, result } => {
                 let failure = self.compiled(slot, revision, |shader| {
-                    shader.shadow_compiling[usize::from(instanced)] = false;
+                    shader.shadow_compiling[stage as usize] = false;
                     match result {
                         Ok(pipeline) => {
-                            shader.shadow[usize::from(instanced)] = Some(pipeline);
+                            shader.shadow[stage as usize] = Some(pipeline);
                             None
                         }
                         Err(message) => Some(message),
@@ -330,6 +373,12 @@ impl State {
             self.retire(previous);
         }
         self.receive_levels(now);
+        // The scene's assets are in: the rest of the catalog may come.
+        if self.deferred.is_some() && !self.scene.iter().any(|&slot| self.assets.loading(slot)) {
+            self.scene.clear();
+            let catalog = self.deferred.take().unwrap();
+            self.preload(&catalog);
+        }
     }
 
     /// Waits up to `timeout` for the loader to bring something (a load, a
@@ -368,15 +417,29 @@ impl State {
                 if vertex_bytes.len().max(index_bytes.len()) as u64 > device.limits().max_buffer_size {
                     return Err("mesh exceeds device buffer size".into());
                 }
-                let count = u32::try_from(mesh.indices.len()).map_err(|_| "mesh has more indices than a u32 counts")?;
                 let buffer = |bytes: &[u8], usage: wgpu::BufferUsages| {
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytes, usage })
                 };
+                // A skinned mesh's joints and weights, beside its vertices
+                // (`shader::SKIN_VERTEX_BYTES` a vertex).
+                let skin_bytes: Option<Vec<u8>> = mesh.skin.as_ref().map(|skin| {
+                    let mut bytes = Vec::with_capacity(skin.joints.len() * 24);
+                    for (joints, weights) in skin.joints.iter().zip(&skin.weights) {
+                        bytes.extend_from_slice(bytemuck::cast_slice(joints));
+                        bytes.extend_from_slice(bytemuck::cast_slice(weights));
+                    }
+                    bytes
+                });
                 let (asset, check) = shader::scoped(&device, || {
                     GpuAsset::Mesh(MeshAsset {
                         vertices: buffer(vertex_bytes, wgpu::BufferUsages::VERTEX),
                         indices: buffer(index_bytes, wgpu::BufferUsages::INDEX),
-                        count,
+                        bounds: mesh.bounds,
+                        lods: mesh.lods.clone(),
+                        skin: mesh.skin.zip(skin_bytes).map(|(skin, bytes)| MeshSkin {
+                            vertices: buffer(&bytes, wgpu::BufferUsages::VERTEX),
+                            rig: Arc::new(skin.rig),
+                        }),
                     })
                 });
                 Ok(Some((asset, Some(check))))
@@ -415,7 +478,7 @@ impl State {
                 let state = *self.states.entry(material.state_key()).or_insert(next);
                 Ok(Some((GpuAsset::Material(Arc::new(MaterialAsset { material, state })), None)))
             }
-            Loaded::Shader { module, instancing } => {
+            Loaded::Shader { module, instancing, skinning, margin, cascaded } => {
                 // What the materials naming it draw with compiles now, for
                 // the sample count frames draw with, each pipeline on a
                 // thread of its own; other variants and counts when a
@@ -428,12 +491,15 @@ impl State {
                     revision,
                     module,
                     instancing,
+                    skinning,
+                    cascaded,
+                    margin,
                     needs,
                     made: HashMap::new(),
                     compiling: HashMap::new(),
                     failed: HashMap::new(),
                     shadow: Default::default(),
-                    shadow_compiling: [false; 2],
+                    shadow_compiling: [false; 3],
                 };
                 let (jobs, samples) = (&self.loader.jobs, self.samples_now);
                 shader.request(jobs, slot, samples, needs);
@@ -467,7 +533,7 @@ impl State {
                     )
                 });
                 let texture = texture.map_err(|error| format!("{error:#}"))?;
-                Ok(Some((GpuAsset::Texture(whole(texture, id)), Some(check))))
+                Ok(Some((GpuAsset::Texture(whole(&device, texture, id)), Some(check))))
             }
             Loaded::Packed { header, levels } => {
                 let limit = device.limits().max_texture_dimension_2d;
@@ -484,11 +550,7 @@ impl State {
                         format: header.format,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                         // Reinterpret the same allocation as linear data for normal maps.
-                        view_formats: if header.format == wgpu::TextureFormat::Rgba8UnormSrgb {
-                            &[wgpu::TextureFormat::Rgba8Unorm]
-                        } else {
-                            &[]
-                        },
+                        view_formats: &crate::downlevel::view_formats(&device, header.format),
                     })
                 });
                 let check = match shader::settled(&mut check) {
@@ -561,7 +623,7 @@ impl State {
                     self.retire(previous);
                 }
                 Ok(()) => {
-                    let (view, linear) = texture_views(&pending.texture, pending.finest);
+                    let (view, linear) = texture_views(&self.device, &pending.texture, pending.finest);
                     let asset = TextureAsset {
                         texture: pending.texture,
                         view,
@@ -607,7 +669,7 @@ impl State {
                     match levels.try_recv() {
                         Ok(LevelMessage::Level(level)) => {
                             upload_level(&self.queue, &texture.texture, &level);
-                            (texture.view, texture.linear) = texture_views(&texture.texture, level.level);
+                            (texture.view, texture.linear) = texture_views(&self.device, &texture.texture, level.level);
                             texture.resident = level.level;
                             new_views = true;
                             // A level nobody saw the coarser one before needs
@@ -751,6 +813,7 @@ mod shadow_tests {
             queue,
             RendererOptions {
                 format: wgpu::TextureFormat::Bgra8Unorm,
+                display: crate::Display::SDR,
                 assets: root.clone(),
                 veil: None,
                 pipeline_cache: None,
@@ -787,7 +850,9 @@ mod shadow_tests {
         if shader(&state, shader_slot).shadow_compiling.contains(&true) {
             assert!(state.shader(&crate::asset_store::parse_material(lit).unwrap()).unwrap().is_none());
         }
-        pump(&mut state, |state| shader(state, shader_slot).shadow.iter().all(Option::is_some));
+        // Plain and instanced; a shader without `vertex_skinned` has no skinned one.
+        pump(&mut state, |state| shader(state, shader_slot).shadow[..2].iter().all(Option::is_some));
+        assert!(shader(&state, shader_slot).shadow[2].is_none());
         assert_eq!(state.pending(), 0);
         eprintln!(
             "late caster material and both shadow variants ready: {:.2} ms",

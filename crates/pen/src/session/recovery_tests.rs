@@ -159,6 +159,7 @@ fn start(engine: &wasmtime::Engine, gpu: Gpu, directory: &Path, module: GuestMod
             record: None,
             fps: Some(60.0),
             mute: true,
+            audio_buffer: None,
             dev,
             script: Vec::new(),
             headless: true,

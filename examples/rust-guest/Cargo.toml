@@ -1,0 +1,32 @@
+[package]
+name = "rust-guest"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Gather, a tiny pen game written in Rust: pen's guest boundary is not Blot's alone"
+
+# A workspace of its own: pen's does not build it (it is a game, built for
+# wasm32-unknown-unknown, with a tool that bundles it, and a mod).
+[workspace]
+members = ["sticky"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The packets' layout and key codes, as pen's hosts have them.
+pen-protocol = { path = "../../crates/pen-protocol" }
+
+# The bundle tool (src/bin/bundle.rs) runs where the game is built.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow = "1"
+serde_json = "1"
+wasm-encoder = { version = "0.258", features = ["wasmparser"] }
+wasmparser = "0.258"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

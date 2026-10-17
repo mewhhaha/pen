@@ -1,0 +1,10 @@
+# What a screen reader announces as tests/atspi/probe.py moves through the game
+# (one line per focus change: name, role, states, value, description).
+gdev, frame
+Continue, button
+Settings, button
+Anti-aliasing, spin button, 2
+Fog, slider, 1
+Continue, button
+gdev, frame
+Hire five gnorps, button, Costs 34 salt; you have 0 salt

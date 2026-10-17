@@ -1,118 +1,107 @@
-# Texture compression (KTX2, BC7): what it would take
+# Texture compression (KTX2: BC7, ASTC, ETC2)
 
-An investigation, not implemented. Numbers are for the bundle `pen build`
-packaged on 2026-10-11 (game/assets, 108.4 MB), measured with a script that
-reads every `.gtex` header and PNG size.
+pen ships compressed textures as KTX2 files, one per format family a GPU
+samples directly, and the renderer reads the family its device has. The
+asset pipeline encodes them with `pen texture`; nothing is transcoded at
+load time.
 
-## Where the bytes are
+## Files
 
-| | On disk | Deflated again (≈ download) | GPU memory |
-|---|---|---|---|
-| Mesh JSON (`*.mesh.json`, 57 meshes) | 52.3 MB | 9.3 MB | (vertex buffers) |
-| `.gtex`, block-compressible kinds (10 files) | 25.3 MB | 25.2 MB | 39.4 MB |
-| `.gtex`, `exact`/`raw` kinds (24 files) | 7.5 MB | 7.4 MB | 104.3 MB |
-| PNG referenced by a material (14 files) | 10.1 MB | ≈ 9.8 MB | 26.7 MB |
-| PNG referenced by nothing (29 files) | 11.2 MB | ≈ 10.8 MB | none (never loaded) |
-| Sounds, shaders, materials, scene | ≈ 2 MB | | |
+A material names `name.ktx2`. Beside it, `pen texture IMAGE` writes:
 
-Three things matter more than block compression, or as much:
+| File | Format | Sampled directly by |
+| --- | --- | --- |
+| `name.bc7.ktx2` | BC7 (`VK_FORMAT_BC7_SRGB_BLOCK`, or `_UNORM` for data) | desktop GPUs: NVIDIA, AMD (the Steam Deck), Intel, Apple silicon; WebGPU's `texture-compression-bc` |
+| `name.astc.ktx2` | ASTC 4x4 LDR | Apple GPUs, most phones; `texture-compression-astc` |
+| `name.etc2.ktx2` | ETC2 RGBA8 (EAC alpha) | OpenGL ES 3 class phones; `texture-compression-etc2` |
+| `name.rgba.ktx2` | RGBA8, uncompressed | every GPU |
 
-- **Unused files ship.** `pen build` copies all of `src/assets`. The 29
-  `gnorp_*.png` captures (8 of them 5120×3808) are named by no material,
-  mesh, scene or source file, and the 21 `gnorp_*.gtex` atlases (exact
-  palette indices, oct normals and palettes, 7 MB) by nothing either; the
-  README calls their impostor renderer "previous". About 18 MB of the 108 MB
-  look like sources for `scripts/prepare_robot_atlases.py`. Packaging only
-  what the catalog's meshes and materials reach (and what the program names)
-  would drop them; check with the game's author first.
-- **Mesh JSON is half the bundle on disk** but deflates 5.6×, and Steam
-  compresses depot chunks, so it costs about 9 MB to download and 52 MB of
-  disk. pen-render now also reads a binary mesh form, which
-  `pen_render::pack_mesh` makes from the JSON and the renderer finds under
-  the same key. For gdev's 73 meshes it is 32.7 MB instead of 59.1 MB, and
-  it parses in 8.5 ms instead of 179 ms
-  ([measurements](render-performance.md#meshes)). Packaging that writes the
-  binary form in place of the JSON needs no exporter change. Quantized
-  positions or a mesh compressor would shrink it further, but the format
-  would then be lossy.
-- **The packed textures do not compress further** (deflated per level
-  already), so they are what downloads: 32.6 MB.
+Each file is a standard KTX2 container (`pen-texture`'s `ktx2`): the
+format's `VkFormat`, a data format descriptor, `KTXwriter`, and every mip level
+down to 1 x 1 stored smallest first, each deflated on its own (supercompression
+scheme 3, ZLIB). The renderer also reads uncompressed (scheme 0) files, so
+`name.ktx2` itself may be any single KTX2 file in one of these formats, written
+by any tool. A colour texture is sRGB; `pen texture --linear` writes UNORM
+for data such as normal maps (the renderer's linear view reads either).
 
-## What block compression would buy
+WebGPU requires a block-compressed texture's size to be a multiple of 4. An
+image that is not keeps plain RGBA in every family's file, which every GPU
+reads.
 
-Block-compressed texels are what the GPU samples directly: BC7 is 1 byte a
-texel for RGBA (4× smaller than `rgba8unorm`), BC5 1 byte for two channels
-(2× smaller than `rg8unorm`), BC4 half a byte for one (2× smaller than
-`r8unorm`).
+## Choosing at load
 
-- **The 10 compressible `.gtex` files** (`color`, `cutout`, `normals`:
-  the crater, salt, notice buildings, phone coaster, god hand): GPU memory
-  39.4 → 10.6 MB. On disk, BC7 data deflates by perhaps 5–15%, so about
-  25.3 → 9–10 MB, which is also the download saving (about 16 MB).
-- **The 14 referenced PNGs**: GPU 26.7 → 6.7 MB (with the mip chain the
-  renderer makes for them now); on disk 10.1 → about 6 MB, but lossy where
-  the PNG was exact. The three 1254×1254 RGB PNGs (blueprint paper and
-  details, salt surface, 10 MB together) are line art and fine noise, where
-  BC7 artifacts would show first.
+`pen_render::optional_features(adapter)` asks for
+`TEXTURE_COMPRESSION_BC`, `_ASTC` and `_ETC2` where the adapter has them; both
+hosts request them with the device. For a texture key ending in `.ktx2` the
+loader tries, in order, the variants the device samples (BC7, then ASTC,
+then ETC2), then `name.rgba.ktx2`, then `name.ktx2`, and reads the first one
+there (`compressed.rs`). A file whose format the device cannot sample fails
+to load, as any broken texture does: it draws as the checker and raises
+`AssetFailed`.
+
+Levels then stream in exactly as packed textures (`.gtex`) do: the smallest
+first, the texture showing once its levels up to 128 texels across are in,
+each finer level fading in. Uploads use the format's block geometry (rows of
+4 x 4 blocks, 16 bytes each; a level smaller than a block is one block).
+Hot reload of `name.bc7.ktx2` (or any variant) reloads `name.ktx2`.
+
+## Encoding
+
+`pen texture IMAGE [--out name.ktx2] [--linear] [--flat]` reads a PNG,
+works out the mip chain (`pen-texture`'s `mips`: box filtered, odd sizes
+weighted so nothing shifts, colour averaged in linear light weighted by
+alpha) and encodes every family with pen-texture's own encoders, pure Rust:
+
+- **BC7**: mode 6 for every block, mode 5 in its four rotations, and the
+  best two of the 64 two-subset partitions in mode 1 (opaque) or 7 (alpha),
+  each fitted along the principal axis with two least-squares refits and
+  every p-bit tried.
+- **ETC2 RGBA8**: EAC alpha (all 16 tables, two multipliers and bases);
+  colour in individual and differential modes (both flips, all tables, never
+  overflowing into another mode), planar mode for gradients, and T and H
+  modes for blocks of two unrelated colours.
+- **ASTC 4x4**: one-colour blocks as void-extent blocks (exact); otherwise
+  one partition, RGBA endpoints with 8 weight levels and 192-level endpoints
+  (trits), or for opaque blocks RGB endpoints with 16 weight levels, the
+  closer kept. Endpoints are ordered so the decoder never applies blue
+  contraction.
+
+Every encoder is checked block by block against an independent decoder
+(`texture2ddecoder`) in the tests. On a 1024 x 1024 test image of gradients,
+hard shapes, noise and varying alpha, level 0 decodes at 47.6 dB PSNR (BC7),
+42.6 dB (ETC2) and 44.5 dB (ASTC). Encoding it with all its levels into all
+four files takes 3.7 s on four threads (BC7 1.8 s, ETC2 1.0 s, ASTC 0.24 s,
+RGBA's deflate 0.3 s), measured on a busy machine. That belongs in the asset
+pipeline: gdev's Justfile has `just ktx2 IMAGE`.
+
+## What it buys gdev, and what is left
+
+Measured on the bundle `pen build` packaged on 2026-10-11 (game/assets,
+108.4 MB):
+
+- **The 10 block-compressible `.gtex` files** (`color`, `cutout`,
+  `normals`: the crater, salt, notice buildings, phone coaster, god hand):
+  GPU memory 39.4 → 10.6 MB with BC7, and about 16 MB less to download.
+- **The 14 PNGs materials name**: GPU 26.7 → 6.7 MB.
 - **The `exact` and `raw` kinds cannot be compressed**: palette indices,
   palettes, two-channel oct normals, the font's distance field and packed
-  positions must come back bit for bit. They are 104 MB of GPU memory (the
-  seven 2560×1904 gnorp poses), and also look unused (above).
+  positions must come back bit for bit (104 MB of GPU memory, mostly the
+  gnorp poses, which look unused).
+- **Unused files ship.** `pen build` copies all of `src/assets`: 29
+  `gnorp_*.png` captures and 21 `gnorp_*.gtex` atlases are named by nothing
+  (about 18 MB); check with the game's author first.
 
-So for the shipping game: about 16–20 MB less to download and 50 MB less GPU
-memory. Removing the unused files is worth as much on disk and needs no
-renderer change.
+Left, each the game's or the owner's call:
 
-## What it takes
-
-### Format: extend `.gtex` rather than adopt KTX2
-
-`.gtex` already has what block compression needs: every mip level worked out
-offline (a compressed texture cannot be rendered into, so the renderers'
-GPU mip generation in `mipmaps.rs` does not apply), stored
-smallest first so a texture streams in, each level deflated on its own.
-KTX2 also orders levels smallest first, and brings standard tools (`toktx`,
-`basisu`) and Basis Universal (UASTC or ETC1S, transcoded at load to BC7 on
-desktop, ASTC/ETC2 on mobile). gdev targets desktops, where every GPU has BC
-(Vulkan `textureCompressionBC` on NVIDIA, AMD including the Steam Deck,
-Intel; D3D12; Metal on Apple silicon), so transcoding buys nothing and costs
-a transcoder in both renderers (C++ to wasm in the browser) and a zstd
-decoder in the browser. The smaller change:
-
-- `.gtex` version 3: a format byte beside channels and kind, `bc7`, `bc5` or
-  `bc4` (or none), with each level's payload the blocks of that level
-  (levels under 4×4 still one block), still deflated per level.
-- `color` and `cutout` become `bc7-rgba-unorm-srgb`, 4-channel `data` and
-  `normals` `bc7-rgba-unorm`, 2-channel `normals`/`data` `bc5-rg-unorm`,
-  1-channel `data` `bc4-r-unorm`. `exact` and `raw` stay as they are.
-- Base sizes must be multiples of 4 (WebGPU requires it for BC); every
-  current compressible texture is.
-
-### Encoding (gdev's `models/gtex.py`)
-
-`gtex.py` computes the levels with numpy and deflates them. It would encode
-each level after averaging it, with an encoder Python can call: the
-`basisu` or Compressonator command line per level, or (simplest to keep
-deterministic) a small Rust tool in this repository using the `intel_tex_2`
-crate (ISPC BC7/BC5/BC4 kernels, prebuilt, no ISPC needed) that reads an
-uncompressed `.gtex` and writes the compressed one. PNG textures would go
-through the same writer instead of shipping as PNG. Encoding is slow at high
-BC7 quality (seconds per 1024² texture), so it belongs in the asset export,
-not in `pen build`.
-
-### Shared renderer
-
-`pen-render` owns parsing, upload and mip streaming for native and browser
-hosts. A compressed `.gtex` format would carry block dimensions, bytes per
-block and mip sizes. Adapter format features determine support; retain RGBA
-fallbacks for adapters without BC7. Upload and copy row strides must use block
-geometry rather than a fixed four bytes per pixel. Native/browser witnesses
-should check decoding and reload behavior against independent images.
-
-### Effort
-
-Roughly: the `.gtex` v3 format and a Rust encoder tool, a day; both
-the shared renderer's parsing and upload, a day with image witnesses; re-exporting textures and
-checking how BC7 looks on the blueprint line art and the normal maps, a day.
-Dropping the unused assets from packages is an hour once the game's author
-confirms them.
+- Re-exporting gdev's textures as KTX2 and pointing its materials at them.
+  BC7 is lossy: the three 1254 x 1254 line-art PNGs (blueprint paper and
+  details, salt surface) should be looked at first, and as 1254 is not a
+  multiple of 4 they need resizing to compress at all. The golden images
+  change.
+- `models/gtex.py`'s packed `color`/`normals` textures could write KTX2
+  through `pen texture` instead; `exact` and `raw` stay `.gtex`.
+- BC5 for two-channel normals and BC4 for one-channel data (half of BC7's
+  size) need their own encoders and family files.
+- Basis Universal (one file transcoded at load) was not chosen: it needs a
+  transcoder in both hosts and buys nothing on desktops, which all sample
+  BC7.

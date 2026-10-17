@@ -1,0 +1,13 @@
+[package]
+name = "sticky-arrows"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "A pen mod: an arrow key stays held once tapped, until it is tapped again"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pen-protocol = { path = "../../../crates/pen-protocol" }

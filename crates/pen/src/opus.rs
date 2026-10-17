@@ -1,22 +1,27 @@
 //! Ogg Opus clips (RFC 7845), as the game's music comes. Decoding uses the
 //! reference libopus (opusic-sys: vendored, built with CMake), in floating
-//! point.
+//! point, a packet at a time ([`OpusSource`]): a clip decodes whole by
+//! running it to the end, or streams as it plays (`audio::stream`).
 use std::io::Cursor;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use opusic_sys as sys;
 
-use crate::audio::mixer::Clip;
+use crate::audio::source::Source;
 
 /// Opus always decodes at 48 kHz here; the mixer resamples it to the
 /// device's rate.
-const RATE: i32 = 48_000;
+pub const RATE: i32 = 48_000;
 /// The longest Opus packet: 120 ms.
 const MAX_PACKET_SAMPLES: usize = 5760;
 
 /// libopus's decoder state, freed on drop.
 struct Decoder(*mut sys::OpusDecoder);
+
+// SAFETY: the decoder state is plain memory that libopus only touches
+// through the calls below, which take `&mut self`: one thread at a time.
+unsafe impl Send for Decoder {}
 
 impl Decoder {
     fn new(channels: usize) -> Result<Decoder> {
@@ -51,7 +56,39 @@ pub fn is_ogg_opus(bytes: &[u8]) -> bool {
     bytes.starts_with(b"OggS") && bytes.windows(8).take(256).any(|window| window == b"OpusHead")
 }
 
-pub fn decode(bytes: &[u8]) -> Result<Clip> {
+/// What an Ogg Opus stream's head and last page say of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Head {
+    pub channels: usize,
+    pub pre_skip: usize,
+    /// The output gain, linear.
+    pub gain: f32,
+    /// The samples it holds past the pre-skip, by its last page's granule
+    /// position.
+    pub frames: usize,
+}
+
+/// The granule position of the stream's last page that has one: the
+/// samples it holds, the pre-skip included.
+fn last_granule(bytes: &[u8]) -> Option<u64> {
+    let mut at = 0;
+    let mut last = None;
+    while let Some(header) = bytes.get(at..at + 27) {
+        if !header.starts_with(b"OggS") {
+            break;
+        }
+        let segments = usize::from(header[26]);
+        let table = bytes.get(at + 27..at + 27 + segments)?;
+        let granule = u64::from_le_bytes(header[6..14].try_into().ok()?);
+        if granule != u64::MAX {
+            last = Some(granule);
+        }
+        at += 27 + segments + table.iter().map(|&size| usize::from(size)).sum::<usize>();
+    }
+    last
+}
+
+pub fn head(bytes: &[u8]) -> Result<Head> {
     let mut reader = ogg::PacketReader::new(Cursor::new(bytes));
     let head = reader.read_packet()?.context("empty Ogg stream")?;
     ensure!(head.data.len() >= 19 && head.data.starts_with(b"OpusHead"), "not an Ogg Opus stream");
@@ -61,39 +98,101 @@ pub fn decode(bytes: &[u8]) -> Result<Clip> {
     let pre_skip = usize::from(u16::from_le_bytes([head.data[10], head.data[11]]));
     // Output gain in Q7.8 dB.
     let gain_db = f32::from(i16::from_le_bytes([head.data[16], head.data[17]])) / 256.0;
-    let gain = 10f32.powf(gain_db / 20.0);
-    let tags = reader.read_packet()?.context("Ogg Opus stream has no tags")?;
-    ensure!(tags.data.starts_with(b"OpusTags"), "Ogg Opus stream has no tags");
-
-    let mut decoder = Decoder::new(channels)?;
-    let mut pcm = vec![0f32; MAX_PACKET_SAMPLES * channels];
-    let mut samples: Vec<f32> = Vec::new();
-    let mut end_granule = None;
-    while let Some(packet) = reader.read_packet()? {
-        let count = decoder.decode(&packet.data, &mut pcm, channels)?;
-        samples.extend_from_slice(&pcm[..count * channels]);
-        if packet.last_in_stream() {
-            end_granule = Some(usize::try_from(packet.absgp_page()).unwrap_or(usize::MAX));
-        }
-    }
-    let decoded = samples.len() / channels;
-    // The last page's granule position counts the samples the stream holds,
-    // including the pre-skip; anything decoded past it is padding.
-    let end = end_granule.map_or(decoded, |granule| granule.min(decoded));
-    if pre_skip >= end {
+    let granule = last_granule(bytes).context("Ogg Opus stream has no granule position")?;
+    let total = usize::try_from(granule).unwrap_or(usize::MAX);
+    if pre_skip >= total {
         bail!("Ogg Opus stream is shorter than its pre-skip");
     }
-    let frames: Arc<[[f32; 2]]> = (pre_skip..end)
-        .map(|index| [samples[index * channels] * gain, samples[index * channels + channels - 1] * gain])
-        .collect();
-    Ok(Clip::new(frames, f64::from(RATE)))
+    Ok(Head { channels, pre_skip, gain: 10f32.powf(gain_db / 20.0), frames: total - pre_skip })
+}
+
+/// An Ogg Opus stream decoded a packet at a time: its pre-skip left out,
+/// and nothing past the samples its last page says it holds.
+pub struct OpusSource {
+    reader: ogg::PacketReader<Cursor<Arc<[u8]>>>,
+    decoder: Decoder,
+    head: Head,
+    pcm: Vec<f32>,
+    /// Pre-skip samples still to leave out.
+    skip: usize,
+    /// Samples still to give.
+    left: usize,
+}
+
+impl OpusSource {
+    pub fn new(bytes: Arc<[u8]>) -> Result<OpusSource> {
+        let head = head(&bytes)?;
+        let mut reader = ogg::PacketReader::new(Cursor::new(bytes));
+        reader.read_packet()?.context("empty Ogg stream")?;
+        let tags = reader.read_packet()?.context("Ogg Opus stream has no tags")?;
+        ensure!(tags.data.starts_with(b"OpusTags"), "Ogg Opus stream has no tags");
+        Ok(OpusSource {
+            reader,
+            decoder: Decoder::new(head.channels)?,
+            pcm: vec![0f32; MAX_PACKET_SAMPLES * head.channels],
+            skip: head.pre_skip,
+            left: head.frames,
+            head,
+        })
+    }
+}
+
+impl Source for OpusSource {
+    fn next(&mut self, out: &mut Vec<[f32; 2]>) -> Result<bool> {
+        let channels = self.head.channels;
+        while self.left > 0 {
+            let Some(packet) = self.reader.read_packet()? else { return Ok(false) };
+            let count = self.decoder.decode(&packet.data, &mut self.pcm, channels)?;
+            let skipped = self.skip.min(count);
+            self.skip -= skipped;
+            let given = (count - skipped).min(self.left);
+            self.left -= given;
+            let gain = self.head.gain;
+            out.extend(
+                self.pcm[skipped * channels..(skipped + given) * channels]
+                    .chunks_exact(channels)
+                    .map(|frame| [frame[0] * gain, frame[channels - 1] * gain]),
+            );
+            if given > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+/// A whole clip, decoded.
+#[cfg(test)]
+pub fn decode(bytes: &[u8]) -> Result<crate::audio::mixer::Clip> {
+    let mut source = OpusSource::new(bytes.into())?;
+    let mut frames = Vec::new();
+    while source.next(&mut frames)? {}
+    Ok(crate::audio::mixer::Clip::new(frames.into(), f64::from(RATE)))
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::audio::source::Source;
+
     /// A quarter second of Ogg Opus (64 kb/s, as ffmpeg's libopus encodes
     /// it): a 440 Hz sine at 0.5 on the left, 660 Hz at 0.25 on the right.
     const TONE: &[u8] = include_bytes!("audio/testdata/tone.opus");
+
+    /// Its head says how long it is before decoding anything, and it
+    /// decodes a packet at a time to just that long.
+    #[test]
+    fn opus_streams_a_packet_at_a_time() {
+        let head = super::head(TONE).unwrap();
+        assert_eq!((head.channels, head.frames), (2, 12_000));
+        let mut source = super::OpusSource::new(TONE.into()).unwrap();
+        let mut frames = Vec::new();
+        let mut packets = 0;
+        while source.next(&mut frames).unwrap() {
+            packets += 1;
+        }
+        assert!(packets > 10, "{packets}");
+        assert_eq!(frames.len(), head.frames);
+    }
 
     /// The stream decodes at 48 kHz to exactly as long as it says (its
     /// pre-skip and end padding cut), and to the sines it was made of, to

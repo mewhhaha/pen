@@ -9,7 +9,10 @@
 //!
 //! A guest of the development engine that runs past its [`DEADLINE`] without
 //! returning or calling the host traps with an [`Overrun`]; time it spends
-//! blocked in a callback does not count.
+//! blocked in a callback does not count. A [`Probe`] shows the dev tools its
+//! memory, ownership counters and, sampled, where it spends its time.
+mod probe;
+
 use std::any::Any;
 use std::fmt;
 use std::path::Path;
@@ -18,10 +21,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use pen_runtime::memory_image::{Captured, MemoryImage, PAGE};
+use pen_runtime::symbols::{Frame, Symbols};
 use wasmtime::{
-    AsContext, AsContextMut, Caller, Engine, ExternRef, FuncType, Instance, Linker, Memory, Module, Store, Trap,
-    TypedFunc, Val, ValType,
+    AsContext, AsContextMut, Caller, Engine, ExternRef, FuncType, Global, Instance, Linker, Memory, Module, Store,
+    Trap, TypedFunc, UpdateDeadline, Val, ValType, WasmBacktrace,
 };
+
+pub use probe::{Probe, Profile, Seen, function_name};
 
 /// The host import module every capability adapter comes from.
 pub const HOST_MODULE: &str = "blot:host/1";
@@ -39,11 +46,69 @@ fn wasm_type(value: ValueType) -> ValType {
     }
 }
 
-/// A compiled guest module and its manifest, ready to instantiate many times.
+/// A compiled guest module, its manifest and its debug information, ready
+/// to instantiate many times.
 #[derive(Clone)]
 pub struct GuestModule {
     module: Module,
     abi: Arc<GuestAbi>,
+    symbols: Arc<Symbols>,
+    /// The exported mutable globals an image of an instance keeps, or why
+    /// one cannot ([`Guest::capture`]).
+    imaged: Arc<Result<Vec<String>, String>>,
+}
+
+/// The mutable globals an image keeps: all of the module's, when it
+/// exports them all, by their export names.
+fn imaged_globals(wasm: &[u8]) -> Result<Vec<String>, String> {
+    let mut mutable = Vec::new();
+    let mut exported = std::collections::HashMap::new();
+    let mut imported = 0;
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|error| error.to_string())? {
+            wasmparser::Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    if let wasmparser::TypeRef::Global(_) = import.map_err(|error| error.to_string())?.ty {
+                        imported += 1;
+                    }
+                }
+            }
+            wasmparser::Payload::GlobalSection(section) => {
+                for (index, global) in section.into_iter().enumerate() {
+                    let global = global.map_err(|error| error.to_string())?;
+                    if global.ty.mutable {
+                        if !matches!(
+                            global.ty.content_type,
+                            wasmparser::ValType::I32
+                                | wasmparser::ValType::I64
+                                | wasmparser::ValType::F32
+                                | wasmparser::ValType::F64
+                        ) {
+                            return Err(format!("its mutable global {index} holds a reference"));
+                        }
+                        mutable.push(imported + u32::try_from(index).map_err(|error| error.to_string())?);
+                    }
+                }
+            }
+            wasmparser::Payload::ExportSection(section) => {
+                for export in section {
+                    let export = export.map_err(|error| error.to_string())?;
+                    if export.kind == wasmparser::ExternalKind::Global {
+                        exported.entry(export.index).or_insert_with(|| export.name.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let hidden = mutable.iter().filter(|index| !exported.contains_key(index)).count();
+    if hidden > 0 {
+        return Err(format!(
+            "{hidden} of its {} mutable globals are not exported, out of the host's reach",
+            mutable.len()
+        ));
+    }
+    Ok(mutable.iter().map(|index| exported[index].clone()).collect())
 }
 
 impl GuestModule {
@@ -54,7 +119,8 @@ impl GuestModule {
         let abi = Arc::new(read_abi(wasm)?);
         let module = compile(engine, wasm, cache)?;
         validate_module(&module, &abi)?;
-        Ok(GuestModule { module, abi })
+        let imaged = Arc::new(imaged_globals(wasm));
+        Ok(GuestModule { module, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
     }
 
     /// Like [`GuestModule::new`], but first tries `precompiled`, the output
@@ -77,7 +143,8 @@ impl GuestModule {
         match unsafe { Module::deserialize(engine, precompiled) } {
             Ok(module) => {
                 validate_module(&module, &abi)?;
-                Ok(GuestModule { module, abi })
+                let imaged = Arc::new(imaged_globals(wasm));
+                Ok(GuestModule { module, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
             }
             Err(_) if COMPILER => GuestModule::new(engine, wasm, cache),
             Err(error) => Err(anyhow::Error::from(error).context(
@@ -90,6 +157,12 @@ impl GuestModule {
 
     pub fn abi(&self) -> &GuestAbi {
         &self.abi
+    }
+
+    /// Its function names and source positions, which describe its traps
+    /// (and are there for profiles).
+    pub fn symbols(&self) -> &Symbols {
+        &self.symbols
     }
 }
 
@@ -220,6 +293,7 @@ fn prune(directory: &Path, now: std::time::SystemTime) -> std::io::Result<()> {
 }
 
 fn validate_module(module: &Module, abi: &GuestAbi) -> Result<()> {
+    abi.check_hostable()?;
     let adapters: Vec<String> = abi.callbacks().into_iter().map(CallbackType::import_name).collect();
     for import in module.imports() {
         ensure!(
@@ -328,10 +402,11 @@ struct Arena {
 const OWNERSHIP_ENTER: &str = "blot:ownership_enter";
 const OWNERSHIP_LEAVE: &str = "blot:ownership_leave";
 
-/// `blot:ownership_leave`'s outcomes. (2, teardown, releases the module's
-/// roots before the instance is discarded; dropping the store does as much.)
+/// `blot:ownership_leave`'s outcomes: a call returned or failed, or (idle)
+/// the instance is torn down, releasing the module's roots.
 const LEFT_NORMALLY: i32 = 0;
 const LEFT_FAILING: i32 = 1;
+const TEARDOWN: i32 = 2;
 
 #[derive(Clone)]
 struct Ownership {
@@ -350,10 +425,27 @@ struct State {
     memory: Option<Arc<AtomicUsize>>,
     /// When the guest last started running (again), its deadline counting from then.
     resumed: Option<Instant>,
-    /// Its deadline in epoch ticks, when not [`DEADLINE_TICKS`].
-    deadline: Option<u64>,
+    /// Its deadline, when not [`DEADLINE`].
+    deadline: Option<Duration>,
+    /// What the dev tools see of it, and the counters it exports for them.
+    probe: Option<Arc<Probe>>,
+    counters: Vec<Global>,
+    /// Its module's symbols, which name the functions a profile samples.
+    symbols: Arc<Symbols>,
     /// The last array passed in, its buffer reused for the next array out.
     spare: Vec<u32>,
+    /// Torn down ([`Guest::dispose`]): it takes no more calls.
+    disposed: bool,
+    /// What a sandboxed guest may use ([`Guest::sandboxed`]).
+    limits: Option<wasmtime::StoreLimits>,
+}
+
+/// What a sandboxed guest ([`Guest::sandboxed`]) may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Linear memory, in bytes: growing past it fails (`memory.grow`
+    /// answers -1), and a module that starts with more does not start.
+    pub memory: usize,
 }
 
 /// Why a guest stopped: it ran this long without returning or calling the
@@ -371,13 +463,39 @@ impl fmt::Display for Overrun {
     }
 }
 
+/// Epoch ticks of [`dev_engine`] in `time`, at least one.
+fn ticks(time: Duration) -> u64 {
+    let tick = DEADLINE / DEADLINE_TICKS;
+    u64::try_from(time.as_nanos().div_ceil(tick.as_nanos())).unwrap_or(u64::MAX).max(1)
+}
+
 /// Starts the guest's deadline afresh (for an engine that has one): it is
-/// about to run (again), and only the time it runs counts.
+/// about to run (again), and only the time it runs counts. A sampled guest
+/// looks at the next tick.
 fn resume(mut store: impl AsContextMut<Data = State>) {
     let mut store = store.as_context_mut();
-    let ticks = store.data().deadline.unwrap_or(u64::from(DEADLINE_TICKS));
+    let sampled = store.data().probe.as_ref().is_some_and(|probe| probe.sampling().is_some());
+    let ticks = if sampled { 1 } else { ticks(store.data().deadline.unwrap_or(DEADLINE)) };
     store.set_epoch_deadline(ticks);
     store.data_mut().resumed = Some(Instant::now());
+}
+
+/// At the guest's epoch deadline: samples it while its probe samples, then
+/// interrupts it once it has run past its deadline, which counts time
+/// rather than ticks (a profile ticks the engine faster), else looks again
+/// at the next tick (sampled) or when its deadline will be due.
+fn deadline_reached(mut store: wasmtime::StoreContextMut<'_, State>) -> wasmtime::Result<UpdateDeadline> {
+    let profile = store.data().probe.as_ref().and_then(|probe| probe.sampling());
+    if let Some(profile) = &profile {
+        profile.sample(&WasmBacktrace::capture(&store), &store.data().symbols);
+    }
+    let state = store.data_mut();
+    let ran = state.resumed.map_or(Duration::ZERO, |resumed| resumed.elapsed());
+    Ok(match state.deadline.unwrap_or(DEADLINE).checked_sub(ran).filter(|left| !left.is_zero()) {
+        Some(_) if profile.is_some() => UpdateDeadline::Continue(1),
+        Some(left) => UpdateDeadline::Continue(ticks(left)),
+        None => UpdateDeadline::Interrupt,
+    })
 }
 
 /// `error`, marked as an [`Overrun`] when the guest's deadline stopped it.
@@ -393,11 +511,37 @@ pub struct Guest {
     store: Store<State>,
     instance: Instance,
     abi: Arc<GuestAbi>,
+    symbols: Arc<Symbols>,
+    imaged: Arc<Result<Vec<String>, String>>,
+}
+
+/// An idle instance's state ([`Guest::capture`]): its memory and its
+/// mutable globals.
+#[derive(Clone, Debug, Default)]
+pub struct GuestImage {
+    pub memory: MemoryImage,
+    globals: Vec<(String, Val)>,
 }
 
 impl Guest {
     pub fn new(engine: &Engine, module: &GuestModule) -> Result<Guest> {
-        let mut store = Store::new(engine, State::default());
+        Guest::start(engine, module, None)
+    }
+
+    /// An instance that may use only so much (mods'). Its imports are only
+    /// the callbacks its manifest declares, as every guest's are.
+    pub fn sandboxed(engine: &Engine, module: &GuestModule, limits: Limits) -> Result<Guest> {
+        Guest::start(engine, module, Some(limits))
+    }
+
+    fn start(engine: &Engine, module: &GuestModule, limits: Option<Limits>) -> Result<Guest> {
+        let mut store = Store::new(engine, State { symbols: module.symbols.clone(), ..State::default() });
+        store.epoch_deadline_callback(deadline_reached);
+        if let Some(limits) = limits {
+            let limits = wasmtime::StoreLimitsBuilder::new().memory_size(limits.memory).instances(1).build();
+            store.data_mut().limits = Some(limits);
+            store.limiter(|state| state.limits.as_mut().expect("a sandbox's limits"));
+        }
         // Instantiating runs the module's start function, if it has one.
         resume(&mut store);
         let mut linker = Linker::new(engine);
@@ -427,7 +571,13 @@ impl Guest {
             let leave = instance.get_typed_func::<i32, ()>(&mut store, OWNERSHIP_LEAVE)?;
             store.data_mut().ownership = Some(Ownership { enter, leave });
         }
-        Ok(Guest { store, instance, abi: module.abi.clone() })
+        Ok(Guest {
+            store,
+            instance,
+            abi: module.abi.clone(),
+            symbols: module.symbols.clone(),
+            imaged: module.imaged.clone(),
+        })
     }
 
     pub fn abi(&self) -> &GuestAbi {
@@ -437,9 +587,18 @@ impl Guest {
     /// Lets the guest run up to `deadline` at a time instead of [`DEADLINE`],
     /// on [`dev_engine`], to within a fiftieth of [`DEADLINE`].
     pub fn set_deadline(&mut self, deadline: Duration) {
-        let tick = DEADLINE / DEADLINE_TICKS;
-        let ticks = u64::try_from(deadline.as_nanos() / tick.as_nanos()).unwrap_or(u64::MAX);
-        self.store.data_mut().deadline = Some(ticks.max(1));
+        self.store.data_mut().deadline = Some(deadline);
+    }
+
+    /// Shows `probe` what the guest does from now on: its memory and the
+    /// ownership counters it exports, as of each of its host calls, and the
+    /// calls into it; and samples it into the profile attached to it.
+    pub fn probe(&mut self, probe: Arc<Probe>) {
+        let counters = self.counter_globals();
+        probe.counters_named(counters.iter().map(|(name, _)| name.trim_start_matches("blot:").to_owned()).collect());
+        let state = self.store.data_mut();
+        state.counters = counters.into_iter().map(|(_, global)| global).collect();
+        state.probe = Some(probe);
     }
 
     /// Committed linear-memory bytes, including temporary allocation capacity.
@@ -461,10 +620,14 @@ impl Guest {
     /// this invocation, and the guest's arena is reset before and after it
     /// (and, under ABI 3, ownership entered before it and left after).
     pub fn call(&mut self, name: &str, argument: impl Into<Argument>) -> Result<Value> {
+        ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
         let function =
             self.abi.function(name).ok_or_else(|| anyhow!("unknown_export: unknown function export {name}"))?.clone();
         let argument = argument.into();
         let result = self.begin_and_run(&function, argument).map_err(|error| overran(self.store.data(), error));
+        if let Some(probe) = &self.store.data().probe {
+            probe.called(result.is_err());
+        }
         let finish = self.finish(if result.is_ok() { LEFT_NORMALLY } else { LEFT_FAILING });
         let result = result?;
         finish?;
@@ -510,7 +673,7 @@ impl Guest {
             .get_func(&mut self.store, name)
             .ok_or_else(|| anyhow!("validated function export {name} disappeared"))?;
         let mut results = [Val::I32(0)];
-        func.call(&mut self.store, &[parameter], &mut results)?;
+        func.call(&mut self.store, &[parameter], &mut results).map_err(|error| symbolize(error, &self.symbols))?;
         let arena = self.store.data().arena.clone();
         from_wasm(&mut self.store, arena.as_ref(), function.result, &results[0])
     }
@@ -532,8 +695,87 @@ impl Guest {
         Ok(left?)
     }
 
+    /// Tears the instance down, as Blot's adapter disposes of one: an ABI 3
+    /// guest leaves ownership for good (outcome 2), releasing its module's
+    /// roots and draining what it was destroying, and its arena is reset.
+    /// Afterwards it takes no calls or reads, but its store stays to be
+    /// looked at ([`Guest::ownership`], [`Guest::memory_bytes`]). Disposing
+    /// again does nothing.
+    pub fn dispose(&mut self) -> Result<()> {
+        if std::mem::replace(&mut self.store.data_mut().disposed, true) {
+            return Ok(());
+        }
+        resume(&mut self.store);
+        if let Some(ownership) = self.store.data().ownership.clone() {
+            ownership.leave.call(&mut self.store, TEARDOWN).map_err(|error| symbolize(error, &self.symbols))?;
+            if let Some(arena) = self.store.data().arena.clone() {
+                arena.reset.call(&mut self.store, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// An image of the instance between calls: its memory (`blot:memory`)
+    /// and its mutable globals, sharing the pages `previous` has unchanged.
+    /// Restored ([`Guest::restore`]), the instance is as it was, for a
+    /// module whose state is all there: one that exports every mutable
+    /// global (others are refused). A long-lived `main(host)` is never
+    /// between calls while it runs, so it cannot be imaged.
+    pub fn capture(&mut self, previous: Option<&GuestImage>) -> Result<(GuestImage, Captured)> {
+        ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
+        let names = self.imaged.as_ref().as_ref().map_err(|why| anyhow!("this guest cannot be imaged: {why}"))?;
+        let memory = self.instance.get_memory(&mut self.store, "blot:memory");
+        let bytes = memory.map(|memory| memory.data(&self.store)).unwrap_or_default();
+        let (memory, captured) = MemoryImage::capture(bytes, previous.map(|previous| &previous.memory));
+        let mut globals = Vec::with_capacity(names.len());
+        for name in names {
+            let global = self.instance.get_global(&mut self.store, name).context("an imaged global disappeared")?;
+            globals.push((name.clone(), global.get(&mut self.store)));
+        }
+        Ok((GuestImage { memory, globals }, captured))
+    }
+
+    /// Puts the instance back as `image` found it, growing its memory if
+    /// it has less (memory never shrinks: what lies past the image is
+    /// zeroed). Returns the pages written.
+    pub fn restore(&mut self, image: &GuestImage) -> Result<usize> {
+        ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
+        let mut written = 0;
+        if let Some(memory) = self.instance.get_memory(&mut self.store, "blot:memory") {
+            let missing = image.memory.len().saturating_sub(memory.data_size(&self.store));
+            if missing > 0 {
+                memory.grow(&mut self.store, u64::try_from(missing.div_ceil(PAGE))?)?;
+            }
+            written = image.memory.restore(memory.data_mut(&mut self.store));
+        }
+        for (name, value) in &image.globals {
+            let global = self.instance.get_global(&mut self.store, name).context("an imaged global disappeared")?;
+            global.set(&mut self.store, *value)?;
+        }
+        Ok(written)
+    }
+
+    /// The ownership counters the guest exports, as they stand.
+    pub fn ownership(&mut self) -> OwnershipCounters {
+        let counters = self.runtime_counters();
+        let counter = |name: &str| counters.iter().find(|(counter, _)| counter == name).map(|(_, value)| *value);
+        OwnershipCounters {
+            roots: counter("blot:rc_roots"),
+            leases: counter("blot:rc_leases"),
+            host_refs: counter("blot:rc_host_refs"),
+            retains: counter("blot:rc_retains"),
+            releases: counter("blot:rc_releases"),
+            destroyed: counter("blot:rc_destroyed"),
+            cycle_passes: counter("blot:cycle_passes"),
+            cycle_vertices: counter("blot:cycle_vertices"),
+            cycle_edges: counter("blot:cycle_edges"),
+            cycle_bytes: counter("blot:cycle_bytes"),
+        }
+    }
+
     /// Reads an exported scalar constant.
     pub fn read(&mut self, name: &str) -> Result<Value> {
+        ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
         let constant = self
             .abi
             .constants
@@ -548,6 +790,70 @@ impl Guest {
         let value = global.get(&mut self.store);
         from_wasm(&mut self.store, None, constant.value, &value)
     }
+
+    /// The guest runtime's own counters: its exported `blot:` 32-bit integer
+    /// globals (under ABI 3 its reference counts' retains and releases, and
+    /// its cycle collector's passes and the objects, edges and bytes they
+    /// visited), by name, as unsigned numbers that wrap at 2^32. Empty for a
+    /// guest that keeps none.
+    pub fn runtime_counters(&mut self) -> Vec<(String, u32)> {
+        let globals = self.counter_globals();
+        globals.into_iter().filter_map(|(name, global)| Some((name, counter(global.get(&mut self.store))?))).collect()
+    }
+
+    /// The globals behind [`Guest::runtime_counters`], which
+    /// [`Guest::ownership`] and a [`Probe`] read too: the guest's exported
+    /// `blot:` globals that are not ABI constants, by name.
+    fn counter_globals(&mut self) -> Vec<(String, Global)> {
+        let globals: Vec<(String, Global)> = self
+            .instance
+            .exports(&mut self.store)
+            .filter(|export| export.name().starts_with("blot:"))
+            .filter_map(|export| Some((export.name().to_owned(), export.into_global()?)))
+            .collect();
+        globals
+            .into_iter()
+            .filter(|(name, _)| self.abi.constants.iter().all(|constant| constant.name != *name))
+            .collect()
+    }
+}
+
+/// A trap with its backtrace described by the module's symbols (names, and
+/// source positions when it has a source map) in place of wasmtime's, as the
+/// browser host describes one; any other error as it is.
+fn symbolize(error: wasmtime::Error, symbols: &Symbols) -> anyhow::Error {
+    let frames = error.downcast_ref::<WasmBacktrace>().map(|backtrace| {
+        let frames = backtrace.frames().iter();
+        frames.map(|frame| Frame { function: frame.func_index(), offset: frame.module_offset() }).collect::<Vec<_>>()
+    });
+    match (error.downcast_ref::<Trap>(), frames) {
+        (Some(trap), Some(frames)) => anyhow::Error::new(*trap).context(symbols.backtrace(&frames)),
+        _ => error.into(),
+    }
+}
+
+/// What an ABI 3 guest's runtime counts of the memory it owns, through the
+/// globals Blot exports beside its ownership hooks (`blot:rc_*`, and
+/// `blot:cycle_*` with cycle collection); each is None when the module does
+/// not export it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OwnershipCounters {
+    /// Live roots and leases: zero again after each call returns, and after
+    /// teardown, unless something leaks.
+    pub roots: Option<u32>,
+    pub leases: Option<u32>,
+    /// Host references (callbacks) the guest holds.
+    pub host_refs: Option<u32>,
+    /// Running totals: references retained and released, objects destroyed.
+    pub retains: Option<u32>,
+    pub releases: Option<u32>,
+    pub destroyed: Option<u32>,
+    /// Cycle collection's running totals: passes, the vertices and edges
+    /// they walked, and the bytes they reclaimed.
+    pub cycle_passes: Option<u32>,
+    pub cycle_vertices: Option<u32>,
+    pub cycle_edges: Option<u32>,
+    pub cycle_bytes: Option<u32>,
 }
 
 fn invoke_import(
@@ -572,6 +878,13 @@ fn invoke_import(
     if let (Some(gauge), Some(arena)) = (&caller.data().memory, &arena) {
         gauge.store(arena.memory.data_size(&caller), Ordering::Relaxed);
     }
+    if let Some(probe) = caller.data().probe.clone() {
+        let memory = arena.as_ref().map_or(0, |arena| arena.memory.data_size(&caller));
+        let counters = std::mem::take(&mut caller.data_mut().counters);
+        let values = counters.iter().map(|global| counter(global.get(&mut caller)).map_or(0, u64::from));
+        probe.called_host(memory, values);
+        caller.data_mut().counters = counters;
+    }
     let argument = from_wasm(&mut caller, arena.as_ref(), signature.parameter, &params[1])?;
     let mut callback = caller
         .data_mut()
@@ -593,6 +906,16 @@ fn invoke_import(
     );
     results[0] = to_wasm(&mut caller, arena.as_ref(), result)?;
     Ok(())
+}
+
+/// A counter global's value, unsigned and wrapping at 2^32 as the guest's
+/// 32-bit counters do; None for a global of another type.
+fn counter(value: Val) -> Option<u32> {
+    match value {
+        Val::I32(value) => Some(value.cast_unsigned()),
+        Val::I64(value) => u32::try_from(value.cast_unsigned() & u64::from(u32::MAX)).ok(),
+        _ => None,
+    }
 }
 
 /// The byte address of an array header at `pointer` holding `length` words,
@@ -808,12 +1131,13 @@ fn host_triple() -> String {
 pub fn dev_engine() -> Result<Engine> {
     #[cfg(feature = "compiler")]
     {
-        static ENGINE: std::sync::Mutex<Option<Engine>> = std::sync::Mutex::new(None);
-        let mut engine = ENGINE.lock().unwrap();
+        let mut engine = DEV_ENGINE.lock().unwrap();
         if engine.is_none() {
             let mut config = config(inlining(false));
             config.enable_incremental_compilation(Arc::new(MemoryCache::new(DEV_CACHE_BYTES)))?;
             config.epoch_interruption(true);
+            // A profile's samples need whole stacks (and traps show them).
+            config.wasm_backtrace_max_frames(std::num::NonZeroUsize::new(BACKTRACE_FRAMES));
             *engine = Some(ticking(Engine::new(&config)?, DEADLINE)?);
         }
         Ok(engine.clone().unwrap())
@@ -821,6 +1145,29 @@ pub fn dev_engine() -> Result<Engine> {
     #[cfg(not(feature = "compiler"))]
     bail!(NO_COMPILER)
 }
+
+/// Whether `engine` is [`dev_engine`], whose guests check its epoch and so
+/// can be sampled ([`Profile`]); asking never makes one.
+pub fn samples(engine: &Engine) -> bool {
+    #[cfg(feature = "compiler")]
+    {
+        DEV_ENGINE.lock().unwrap().as_ref().is_some_and(|dev| Engine::same(dev, engine))
+    }
+    #[cfg(not(feature = "compiler"))]
+    {
+        let _ = engine;
+        false
+    }
+}
+
+/// The most frames of a guest's stack [`dev_engine`] keeps for a trap's
+/// backtrace and a profile's sample.
+#[cfg(feature = "compiler")]
+const BACKTRACE_FRAMES: usize = 512;
+
+/// The one [`dev_engine`], once made.
+#[cfg(feature = "compiler")]
+static DEV_ENGINE: std::sync::Mutex<Option<Engine>> = std::sync::Mutex::new(None);
 
 /// What [`dev_engine`]'s cache keeps of compiled functions, at most twice
 /// over. Compiling gdev's game and dev tools puts about 3.7 MB in it.
@@ -945,6 +1292,7 @@ mod tests {
         let engine = ticking(Engine::new(&config).unwrap(), deadline).unwrap();
         let module = GuestModule::new(&engine, &looping_guest(), None).unwrap();
         let mut guest = Guest::new(&engine, &module).unwrap();
+        guest.set_deadline(deadline);
         let started = Instant::now();
         let error = guest.call("spin", Value::Unit).unwrap_err();
         let overrun = error.downcast_ref::<Overrun>().expect("an overrun");
@@ -964,10 +1312,98 @@ mod tests {
         assert!(guest.call("spin", Value::Unit).unwrap_err().is::<Overrun>());
     }
 
+    /// `looping_guest` with a counter: `main` adds one to its exported global
+    /// `blot:rc_retains` before each of its host calls, and `spin` calls
+    /// function 3, which never returns.
+    #[cfg(feature = "compiler")]
+    fn probed_guest() -> Vec<u8> {
+        let abi =
+            [&[0x02, 0x02][..], &name("spin"), &[0x00, 0x00], &name("main"), &[0x04, 0x01, 0x01, 0x01, 0x00]].concat();
+        let forever = [0x03, 0x40, 0x0c, 0x00, 0x0b, 0x41, 0x00, 0x0b];
+        // retains += 1, then call the host with 1 and drop its answer.
+        let call_host = [0x23, 0x00, 0x41, 0x01, 0x6a, 0x24, 0x00, 0x20, 0x00, 0x41, 0x01, 0x10, 0x00, 0x1a];
+        let spin = [0x00, 0x10, 0x03, 0x41, 0x00, 0x0b];
+        let main = [&[0x00][..], &call_host, &call_host, &call_host, &forever].concat();
+        let inner = [0x00, 0x03, 0x40, 0x0c, 0x00, 0x0b, 0x0b];
+        let mut code = vec![0x03];
+        for body in [&spin[..], &main, &inner] {
+            code.push(u8::try_from(body.len()).unwrap());
+            code.extend(body);
+        }
+        [
+            &b"\0asm\x01\0\0\0"[..],
+            &section(0, &[&name(pen_runtime::abi::ABI_SECTION)[..], &abi].concat()),
+            // (externref, i32) -> i32, i32 -> i32, externref -> i32, () -> ()
+            &section(
+                1,
+                &[
+                    0x04, 0x60, 0x02, 0x6f, 0x7f, 0x01, 0x7f, 0x60, 0x01, 0x7f, 0x01, 0x7f, 0x60, 0x01, 0x6f, 0x01,
+                    0x7f, 0x60, 0x00, 0x00,
+                ],
+            ),
+            &section(2, &[&[0x01][..], &name(HOST_MODULE), &name("call_u32_u32"), &[0x00, 0x00]].concat()),
+            &section(3, &[0x03, 0x01, 0x02, 0x03]),
+            // A mutable i32, from 0.
+            &section(6, &[0x01, 0x7f, 0x01, 0x41, 0x00, 0x0b]),
+            &section(
+                7,
+                &[
+                    &[0x03][..],
+                    &name("spin"),
+                    &[0x00, 0x01],
+                    &name("main"),
+                    &[0x00, 0x02],
+                    &name("blot:rc_retains"),
+                    &[0x03, 0x00],
+                ]
+                .concat(),
+            ),
+            &section(10, &code),
+        ]
+        .concat()
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn probes_count_calls_read_counters_and_sample_stacks() {
+        let deadline = Duration::from_millis(100);
+        let mut config = config(false);
+        config.epoch_interruption(true);
+        let engine = ticking(Engine::new(&config).unwrap(), deadline).unwrap();
+        let module = GuestModule::new(&engine, &probed_guest(), None).unwrap();
+        let mut guest = Guest::new(&engine, &module).unwrap();
+        guest.set_deadline(deadline);
+        let probe = Probe::new();
+        guest.probe(probe.clone());
+        assert_eq!(probe.seen().counters, [("rc_retains".to_owned(), 0)]);
+        let callback = Box::new(|value: Value| -> Result<Value> { Ok(value) });
+        assert!(guest.call("main", Argument::Callback(callback)).unwrap_err().is::<Overrun>());
+        let seen = probe.seen();
+        assert_eq!(seen.counters, [("rc_retains".to_owned(), 3)], "as of its last host call");
+        assert_eq!((seen.calls, seen.failed, seen.callbacks), (1, 1, 3));
+        assert!(seen.memory == 0 && seen.peak == 0, "it has no arena");
+        // Sampled, `spin` is found in function 3 every time.
+        let profile = Profile::new();
+        profile.start(&engine).unwrap();
+        probe.attach(Some(profile.clone()));
+        let started = Instant::now();
+        assert!(guest.call("spin", Value::Unit).unwrap_err().is::<Overrun>());
+        assert!(started.elapsed() < deadline * 5, "the profile's ticks do not hasten its deadline either");
+        profile.stop();
+        let stacks = profile.stacks();
+        assert!(profile.samples() >= 10, "{stacks:?}");
+        assert!(stacks.iter().all(|(stack, _)| stack == &[1, 3]), "{stacks:?}");
+        assert_eq!(profile.name(3), "function 3");
+        profile.clear();
+        assert_eq!(profile.samples(), 0);
+        assert!(samples(&dev_engine().unwrap()) && !samples(&engine));
+    }
+
     /// An ABI 3 guest exporting `ok: Unit -> U32`, which returns the
     /// constant `log`, and `fail: Unit -> Unit`, which traps. Its ownership
     /// hooks append to `log`: entering a 1, leaving 2 plus the outcome. With
-    /// `hooks` false it leaves them out of its exports.
+    /// `hooks` false it leaves them out of its exports; with them, it also
+    /// exports `log` as a runtime counter, `blot:cycle_passes`.
     #[cfg(feature = "compiler")]
     fn ownership_guest(hooks: bool) -> Vec<u8> {
         let abi = [
@@ -983,9 +1419,13 @@ mod tests {
         .concat();
         let mut exports = vec![[name("ok"), vec![0x00, 2]].concat(), [name("fail"), vec![0x00, 3]].concat()];
         exports.push([name("log"), vec![0x03, 0]].concat());
+        // The log again as an ownership counter, to read after teardown.
+        exports.push([name("blot:rc_destroyed"), vec![0x03, 0]].concat());
         if hooks {
             exports.push([name(OWNERSHIP_ENTER), vec![0x00, 0]].concat());
             exports.push([name(OWNERSHIP_LEAVE), vec![0x00, 1]].concat());
+            // The same global again, as one of the runtime's counters.
+            exports.push([name("blot:cycle_passes"), vec![0x03, 0]].concat());
         }
         // log = log * 10 + 1, and log = log * 10 + 2 + outcome.
         let enter = [0x00, 0x23, 0x00, 0x41, 10, 0x6c, 0x41, 1, 0x6a, 0x24, 0x00, 0x0b];
@@ -1023,8 +1463,235 @@ mod tests {
         assert!(guest.call("fail", Value::Unit).is_err());
         assert_eq!(guest.read("log").unwrap(), Value::U32(1213), "left failing after a trap");
         assert_eq!(guest.call("ok", Value::Unit).unwrap(), Value::U32(12131), "and runs again");
+        assert_eq!(guest.ownership().destroyed, Some(121312));
+        let counters = [("blot:rc_destroyed".to_owned(), 121_312), ("blot:cycle_passes".to_owned(), 121_312)];
+        assert_eq!(guest.runtime_counters(), counters);
+        assert_eq!(guest.ownership().roots, None, "a counter the module does not export");
+        guest.dispose().unwrap();
+        assert_eq!(guest.ownership().destroyed, Some(1213124), "torn down once, idle");
+        guest.dispose().unwrap();
+        assert_eq!(guest.ownership().destroyed, Some(1213124), "and only once");
+        let refused = format!("{:#}", guest.call("ok", Value::Unit).unwrap_err());
+        assert!(refused.contains("disposed_guest"), "{refused}");
+        assert!(guest.read("log").is_err());
+        // An ABI 2 guest has no hooks to call.
+        let module = GuestModule::new(&engine, &looping_guest(), None).unwrap();
+        let mut guest = Guest::new(&engine, &module).unwrap();
+        guest.dispose().unwrap();
+        assert!(guest.call("spin", Value::Unit).is_err());
         let error = GuestModule::new(&engine, &ownership_guest(false), None).err().unwrap();
         assert!(format!("{error:#}").contains("missing ownership export"), "{error:#}");
+    }
+
+    /// A source map's base64 VLQ field.
+    #[cfg(feature = "compiler")]
+    fn vlq(value: i64) -> String {
+        const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut rest = if value < 0 { (-value << 1) | 1 } else { value << 1 };
+        let mut text = String::new();
+        loop {
+            let digit = usize::try_from(rest & 0x1f).unwrap();
+            rest >>= 5;
+            text.push(char::from(DIGITS[digit | if rest > 0 { 0x20 } else { 0 }]));
+            if rest == 0 {
+                return text;
+            }
+        }
+    }
+
+    /// Standard base64.
+    #[cfg(feature = "compiler")]
+    fn base64(bytes: &[u8]) -> String {
+        const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut text = String::new();
+        for chunk in bytes.chunks(3) {
+            let word = chunk.iter().enumerate().fold(0u32, |word, (at, byte)| word | u32::from(*byte) << (16 - 8 * at));
+            for at in 0..4 {
+                let digit = usize::try_from((word >> (18 - 6 * at)) & 63).unwrap();
+                text.push(if at <= chunk.len() { char::from(DIGITS[digit]) } else { '=' });
+            }
+        }
+        text
+    }
+
+    /// A guest exporting `fail: Unit -> Unit`, which calls a function that
+    /// traps, with a name section naming both and a source map placing the
+    /// call at src/game.blot:3:1 and the trap at 7:3. Without `debug` it has
+    /// neither.
+    #[cfg(feature = "compiler")]
+    fn trapping_guest(debug: bool) -> Vec<u8> {
+        let abi = [&[0x02, 0x01][..], &name("fail"), &[0x00, 0x00, 0x00]].concat();
+        let fail = [0x00, 0x10, 0x01, 0x41, 0x00, 0x0b];
+        let explode = [0x00, 0x00, 0x0b];
+        let code =
+            [&[0x02, u8::try_from(fail.len()).unwrap()][..], &fail, &[u8::try_from(explode.len()).unwrap()], &explode]
+                .concat();
+        let before_code = [
+            &b"\0asm\x01\0\0\0"[..],
+            &section(0, &[&name(pen_runtime::abi::ABI_SECTION)[..], &abi].concat()),
+            // (i32) -> i32, () -> ()
+            &section(1, &[0x02, 0x60, 0x01, 0x7f, 0x01, 0x7f, 0x60, 0x00, 0x00]),
+            &section(3, &[0x02, 0x00, 0x01]),
+            &section(7, &[&[0x01][..], &name("fail"), &[0x00, 0x00]].concat()),
+        ]
+        .concat();
+        let mut module = [before_code.clone(), section(10, &code)].concat();
+        if debug {
+            // The code section's contents start after its id and size.
+            let call = before_code.len() + 2 + 2 + 1;
+            let trap = before_code.len() + 2 + 2 + fail.len() + 1 + 1;
+            let call = i64::try_from(call).unwrap();
+            let trap = i64::try_from(trap).unwrap();
+            let mappings = format!(
+                "{}{}{}{},{}{}{}{}",
+                vlq(call),
+                vlq(0),
+                vlq(2),
+                vlq(0),
+                vlq(trap - call),
+                vlq(0),
+                vlq(4),
+                vlq(2)
+            );
+            let map = format!(r#"{{"version":3,"sources":["src/game.blot"],"names":[],"mappings":"{mappings}"}}"#);
+            let url = format!("data:application/json;base64,{}", base64(map.as_bytes()));
+            let functions = [&[0x02, 0x00][..], &name("game.fail"), &[0x01], &name("game.explode")].concat();
+            let names = [&[0x01, u8::try_from(functions.len()).unwrap()][..], &functions].concat();
+            let url_name = [&[u8::try_from(url.len()).unwrap(), 0x01][..], url.as_bytes()].concat();
+            let source_map = [&name(pen_runtime::symbols::SOURCE_MAP_SECTION)[..], &url_name].concat();
+            module.extend(section(0, &[&name(pen_runtime::symbols::NAME_SECTION)[..], &names].concat()));
+            module.push(0);
+            module.extend(leb(source_map.len()));
+            module.extend(source_map);
+        }
+        module
+    }
+
+    /// An unsigned LEB128.
+    #[cfg(feature = "compiler")]
+    fn leb(mut value: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = u8::try_from(value & 0x7f).unwrap();
+            value >>= 7;
+            if value == 0 {
+                bytes.push(byte);
+                return bytes;
+            }
+            bytes.push(byte | 0x80);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn traps_name_their_functions_and_source_lines() {
+        let engine = Engine::new(&config(false)).unwrap();
+        let module = GuestModule::new(&engine, &trapping_guest(true), None).unwrap();
+        assert!(module.symbols().problems.is_empty(), "{:?}", module.symbols().problems);
+        let mut guest = Guest::new(&engine, &module).unwrap();
+        let error = guest.call("fail", Value::Unit).unwrap_err();
+        assert_eq!(error.downcast_ref::<Trap>(), Some(&Trap::UnreachableCodeReached), "{error:#}");
+        let text = format!("{error:#}");
+        let explode = text.find("game.explode\n                at src/game.blot:7:3");
+        let fail = text.find("game.fail\n                at src/game.blot:3:1");
+        assert!(explode.is_some_and(|explode| fail.is_some_and(|fail| explode < fail)), "{text}");
+        // Without debug information, frames go by index (and exports by name).
+        let module = GuestModule::new(&engine, &trapping_guest(false), None).unwrap();
+        let mut guest = Guest::new(&engine, &module).unwrap();
+        let text = format!("{:#}", guest.call("fail", Value::Unit).unwrap_err());
+        assert!(text.contains("<wasm function 1>") && text.contains(" - fail") && !text.contains(" at "), "{text}");
+    }
+
+    /// A guest exporting `grow: U32 -> U32`, which grows its memory (one
+    /// page to start) by that many pages and returns what `memory.grow`
+    /// does.
+    #[cfg(feature = "compiler")]
+    fn growing_guest() -> Vec<u8> {
+        let abi = [&[0x02, 0x01][..], &name("grow"), &[0x01, 0x01, 0x00]].concat();
+        let grow = [0x00, 0x20, 0x00, 0x40, 0x00, 0x0b];
+        [
+            &b"\0asm\x01\0\0\0"[..],
+            &section(0, &[&name(pen_runtime::abi::ABI_SECTION)[..], &abi].concat()),
+            &section(1, &[0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]),
+            &section(3, &[0x01, 0x00]),
+            &section(5, &[0x01, 0x00, 0x01]),
+            &section(7, &[&[0x01][..], &name("grow"), &[0x00, 0x00]].concat()),
+            &section(10, &[&[0x01, u8::try_from(grow.len()).unwrap()][..], &grow].concat()),
+        ]
+        .concat()
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn sandboxes_keep_guests_to_their_memory() {
+        let engine = engine().unwrap();
+        let module = GuestModule::new(&engine, &growing_guest(), None).unwrap();
+        let mut sandboxed = Guest::sandboxed(&engine, &module, Limits { memory: 3 << 16 }).unwrap();
+        assert_eq!(sandboxed.call("grow", Value::U32(2)).unwrap(), Value::U32(1), "up to three pages");
+        assert_eq!(sandboxed.call("grow", Value::U32(1)).unwrap(), Value::U32(u32::MAX), "and no more");
+        let mut free = Guest::new(&engine, &module).unwrap();
+        assert_eq!(free.call("grow", Value::U32(16)).unwrap(), Value::U32(1));
+        assert!(Guest::sandboxed(&engine, &module, Limits { memory: 0 }).is_err(), "too little to start");
+    }
+
+    /// A guest exporting `bump: U32 -> U32`, which adds to a global and
+    /// keeps the sum at byte 60 of its memory too. With `hidden`, it has a
+    /// mutable global it does not export.
+    #[cfg(feature = "compiler")]
+    fn bumping_guest(hidden: bool) -> Vec<u8> {
+        let abi = [&[0x02, 0x01][..], &name("bump"), &[0x01, 0x01, 0x00]].concat();
+        let bump =
+            [0x00, 0x23, 0x00, 0x20, 0x00, 0x6a, 0x24, 0x00, 0x41, 60, 0x23, 0x00, 0x36, 0x02, 0x00, 0x23, 0x00, 0x0b];
+        let globals: &[u8] = if hidden {
+            &[0x02, 0x7f, 0x01, 0x41, 0x00, 0x0b, 0x7f, 0x01, 0x41, 0x00, 0x0b]
+        } else {
+            &[0x01, 0x7f, 0x01, 0x41, 0x00, 0x0b]
+        };
+        let exports = [
+            &[0x03][..],
+            &name("bump"),
+            &[0x00, 0x00],
+            &name("blot:memory"),
+            &[0x02, 0x00],
+            &name("sum"),
+            &[0x03, 0x00],
+        ]
+        .concat();
+        [
+            &b"\0asm\x01\0\0\0"[..],
+            &section(0, &[&name(pen_runtime::abi::ABI_SECTION)[..], &abi].concat()),
+            &section(1, &[0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]),
+            &section(3, &[0x01, 0x00]),
+            &section(5, &[0x01, 0x00, 0x01]),
+            &section(6, globals),
+            &section(7, &exports),
+            &section(10, &[&[0x01, u8::try_from(bump.len()).unwrap()][..], &bump].concat()),
+        ]
+        .concat()
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn images_put_idle_guests_back() {
+        let engine = engine().unwrap();
+        let module = GuestModule::new(&engine, &bumping_guest(false), None).unwrap();
+        let mut guest = Guest::new(&engine, &module).unwrap();
+        assert_eq!(guest.call("bump", Value::U32(5)).unwrap(), Value::U32(5));
+        let (five, captured) = guest.capture(None).unwrap();
+        assert_eq!((captured.copied, five.memory.len()), (1, PAGE));
+        assert_eq!(guest.call("bump", Value::U32(7)).unwrap(), Value::U32(12));
+        let (twelve, captured) = guest.capture(Some(&five)).unwrap();
+        assert_eq!((captured.copied, captured.shared), (1, 0), "the one page changed");
+        let (again, captured) = guest.capture(Some(&twelve)).unwrap();
+        assert_eq!((captured.copied, captured.shared, again.memory.unshared(&twelve.memory)), (0, 1, 0), "nothing did");
+        assert_eq!(guest.restore(&five).unwrap(), 1);
+        assert_eq!(guest.call("bump", Value::U32(1)).unwrap(), Value::U32(6), "the global came back");
+        assert_eq!(guest.restore(&five).unwrap(), 1, "and the memory: byte 60 differed");
+        // A guest whose state hides in a global the host cannot read.
+        let module = GuestModule::new(&engine, &bumping_guest(true), None).unwrap();
+        let mut guest = Guest::new(&engine, &module).unwrap();
+        let refused = format!("{:#}", guest.capture(None).unwrap_err());
+        assert!(refused.contains("1 of its 2 mutable globals are not exported"), "{refused}");
     }
 
     #[test]

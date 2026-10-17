@@ -13,7 +13,8 @@
 
 use std::f64::consts::PI;
 
-const TAPS: usize = 32;
+/// Input samples each output sample reads.
+pub const TAPS: usize = 32;
 const OFFSETS: usize = 32;
 
 /// The kernel at each of OFFSETS + 1 subsample offsets.
@@ -37,32 +38,56 @@ fn kernels(ratio: f64) -> Vec<[f32; TAPS]> {
         .collect()
 }
 
+/// Chrome's resampler for one ratio: its kernels, and each output sample
+/// worked out from the input samples around it.
+pub struct Resampler {
+    ratio: f64,
+    kernels: Vec<[f32; TAPS]>,
+}
+
+impl Resampler {
+    /// From `from` samples a second to `to`.
+    pub fn new(from: f64, to: f64) -> Resampler {
+        let ratio = from / to;
+        Resampler { ratio, kernels: kernels(ratio) }
+    }
+
+    /// How long `input` samples last at the new rate: whole samples,
+    /// truncated.
+    pub fn length(&self, input: usize) -> usize {
+        (input as f64 / self.ratio) as usize
+    }
+
+    /// The input samples output `j` reads: TAPS of them from this one.
+    pub fn first(&self, j: usize) -> i64 {
+        (j as f64 * self.ratio).floor() as i64 - (TAPS / 2) as i64
+    }
+
+    /// Output sample `j`, from the input as `at` gives it (0 outside it).
+    pub fn sample(&self, j: usize, at: impl Fn(i64) -> f32) -> f32 {
+        let position = j as f64 * self.ratio;
+        let base = position.floor();
+        let offset = (position - base) * OFFSETS as f64;
+        let which = (offset as usize).min(OFFSETS - 1);
+        let blend = offset - which as f64;
+        let (first, second) = (&self.kernels[which], &self.kernels[which + 1]);
+        let start = self.first(j);
+        let (mut sum1, mut sum2) = (0.0f32, 0.0f32);
+        for i in 0..TAPS {
+            let x = at(start + i as i64);
+            sum1 += x * first[i];
+            sum2 += x * second[i];
+        }
+        ((1.0 - blend) * f64::from(sum1) + blend * f64::from(sum2)) as f32
+    }
+}
+
 /// `input` at `from` samples a second, at `to`: as long as it lasts there,
 /// whole samples (`len * to / from`, truncated).
 pub fn resample(input: &[f32], from: f64, to: f64) -> Vec<f32> {
-    let ratio = from / to;
-    let length = (input.len() as f64 / ratio) as usize;
-    let kernels = kernels(ratio);
-    let half = (TAPS / 2) as i64;
+    let resampler = Resampler::new(from, to);
     let at = |index: i64| if index >= 0 && (index as usize) < input.len() { input[index as usize] } else { 0.0 };
-    (0..length)
-        .map(|j| {
-            let position = j as f64 * ratio;
-            let base = position.floor();
-            let offset = (position - base) * OFFSETS as f64;
-            let which = (offset as usize).min(OFFSETS - 1);
-            let blend = offset - which as f64;
-            let (first, second) = (&kernels[which], &kernels[which + 1]);
-            let start = base as i64 - half;
-            let (mut sum1, mut sum2) = (0.0f32, 0.0f32);
-            for i in 0..TAPS {
-                let x = at(start + i as i64);
-                sum1 += x * first[i];
-                sum2 += x * second[i];
-            }
-            ((1.0 - blend) * f64::from(sum1) + blend * f64::from(sum2)) as f32
-        })
-        .collect()
+    (0..resampler.length(input.len())).map(|j| resampler.sample(j, at)).collect()
 }
 
 #[cfg(test)]

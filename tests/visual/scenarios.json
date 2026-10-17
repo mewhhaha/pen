@@ -2,6 +2,7 @@
   "size": [960, 640],
   "fps": 60,
   "threshold": 0.01,
+  "software_threshold": 0.015,
   "scenarios": {
     "editor": {
       "about": "the level editor the game starts in",

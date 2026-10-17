@@ -128,3 +128,12 @@ pub use kept::since;
 
 #[cfg(not(feature = "devtools"))]
 fn keep(_source: Source, _error: bool, _text: String) {}
+
+/// The lines still kept, oldest first (none in a runtime without the dev
+/// tools, which keeps none), for bug reports.
+pub fn recent() -> Vec<String> {
+    #[cfg(feature = "devtools")]
+    return since(0).into_iter().map(|line| line.text).collect();
+    #[cfg(not(feature = "devtools"))]
+    Vec::new()
+}

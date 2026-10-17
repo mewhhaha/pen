@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  What the hardened runtime must allow the player runtime (scripts/macos-sign.sh).
+  allow-unsigned-executable-memory: wasmtime maps game.cwasm's machine code
+  read-write, then makes it executable, without MAP_JIT (wasmtime issue
+  11989), which allow-jit alone does not cover.
+  disable-library-validation and allow-dyld-environment-variables: the Steam
+  overlay, which Steam injects into the game as a library of its own.
+  None of this has run on a Mac yet; docs/platforms.md says what to check.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<key>com.apple.security.cs.allow-dyld-environment-variables</key>
+	<true/>
+</dict>
+</plist>

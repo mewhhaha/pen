@@ -1,0 +1,23 @@
+[package]
+name = "pen-texture"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "KTX2 textures for pen: the container, block encoders and MSDF font atlases"
+
+[lints]
+workspace = true
+
+[features]
+# What the asset pipeline needs beside reading: the block encoders, mip
+# chains and font atlases. The renderer only reads.
+tools = ["dep:skrifa"]
+
+[dependencies]
+anyhow.workspace = true
+flate2 = "1"
+skrifa = { version = "0.48", optional = true }
+
+[dev-dependencies]
+# An independent decoder, to check what the encoders write.
+texture2ddecoder = "0.1.2"

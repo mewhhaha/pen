@@ -345,6 +345,7 @@ mod tests {
                     start: 0.0,
                     fade_in: 0.1,
                     fade_out: 0.2,
+                    panner: None,
                 };
                 let sounds = if frame % 9 == 0 {
                     vec![SoundSpec {
@@ -355,6 +356,7 @@ mod tests {
                         pitch: 1.5,
                         lowpass: 3000.0,
                         reverb: 0.2,
+                        panner: None,
                     }]
                 } else {
                     Vec::new()

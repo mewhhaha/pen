@@ -1,0 +1,2 @@
+Tab: Settings -> Exit -> Continue -> Settings
+no findings

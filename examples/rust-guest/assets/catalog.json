@@ -1,0 +1,5 @@
+{
+  "meshes": ["quad.mesh.json"],
+  "materials": ["fill.material.json"],
+  "sounds": []
+}

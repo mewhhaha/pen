@@ -4,9 +4,11 @@
 mod accessibility;
 mod audio;
 mod development;
+mod files;
 mod input;
 mod preferences;
 mod program;
+mod replay;
 mod run;
 mod saves;
 mod screen;
@@ -18,6 +20,7 @@ use js_sys::Uint8Array;
 use pen_protocol::{Catalog, GameEvent, RenderFrame, Viewport, service, service_status};
 use pen_runtime::devtools::{Log, log_source};
 use pen_runtime::game::Host;
+use pen_runtime::saved::{SAVED_TYPES_FILE, SavedTypes};
 use pen_runtime::snapshot::{self, SavedState};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -41,14 +44,19 @@ pub async fn fetch(path: &str) -> Result<Vec<u8>> {
 }
 
 /// Names the page after the game, as its `game.json` (`pen build --web`
-/// writes it) titles it.
-async fn title(manifest: String, canvas: HtmlCanvasElement) {
-    let Ok(bytes) = fetch(&manifest).await else { return };
-    let Ok(game) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
-    if let Some(title) = game.get("title").and_then(|title| title.as_str()).filter(|title| !title.is_empty()) {
-        web_sys::window().unwrap().document().unwrap().set_title(title);
-        let _ = canvas.set_attribute("aria-label", title);
+/// writes it) titles it; returns its name, which the files the page hands
+/// the player are named after.
+async fn manifest(manifest: &str, canvas: &HtmlCanvasElement) -> String {
+    let game = fetch(manifest).await.ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let field = |key: &str| {
+        let value = game.as_ref()?.get(key)?.as_str()?;
+        (!value.is_empty()).then(|| value.to_owned())
+    };
+    if let Some(title) = field("title") {
+        web_sys::window().unwrap().document().unwrap().set_title(&title);
+        let _ = canvas.set_attribute("aria-label", &title);
     }
+    field("name").unwrap_or_else(|| "game".to_owned())
 }
 
 fn failed(error: impl std::fmt::Display) -> JsValue {
@@ -60,6 +68,7 @@ fn failed(error: impl std::fmt::Display) -> JsValue {
 struct Starting<'a> {
     viewport: Viewport,
     log: &'a mut Log,
+    saved_types: Option<&'a SavedTypes>,
 }
 
 impl Host for Starting<'_> {
@@ -78,12 +87,17 @@ impl Host for Starting<'_> {
     fn report(&mut self, message: &str) {
         run::say(self.log, log_source::GAME, false, message);
     }
+
+    fn saved_types(&self) -> Option<SavedTypes> {
+        self.saved_types.cloned()
+    }
 }
 
 /// Starts the game on `canvas`. `options` may name the files (`game`,
 /// `devtools`, `catalog`, `scene`, `manifest` and the `assets` directory),
 /// all relative to the page for portable exports, and set `development`
-/// (served by `pen web`) and `qualify` (the browser harnesses' hooks).
+/// (served by `pen web`) and `qualify` (the browser harnesses' hooks). A
+/// recording the page's link names (`#replay=` or `?replay=`) plays first.
 #[wasm_bindgen]
 pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(|info| web_sys::console::error_1(&info.to_string().into())));
@@ -95,7 +109,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     };
     let flag =
         |key: &str| js_sys::Reflect::get(&options, &key.into()).ok().and_then(|value| value.as_bool()).unwrap_or(false);
-    spawn_local(title(path("manifest", "game.json"), canvas.clone()));
+    let name = manifest(&path("manifest", "game.json"), &canvas).await;
     let game = fetch(&path("game", "game.wasm")).await.map_err(failed)?;
     let catalog: serde_json::Value =
         serde_json::from_slice(&fetch(&path("catalog", "catalog.json")).await.map_err(failed)?).map_err(failed)?;
@@ -103,14 +117,33 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     let scene = fetch(&path("scene", "scene.bin")).await.ok().and_then(|bytes| snapshot::decode(&bytes).ok());
     let devtools = fetch(&path("devtools", "devtools.wasm")).await.ok();
     let assets = path("assets", "assets");
-    let options = Options { development: flag("development"), qualify: flag("qualify") };
+    let saved_types = fetch(&format!("{assets}/{SAVED_TYPES_FILE}")).await.ok().and_then(|bytes| {
+        let parsed = std::str::from_utf8(&bytes).map_err(anyhow::Error::from).and_then(SavedTypes::parse);
+        parsed.map_err(|error| web_sys::console::error_1(&format!("{SAVED_TYPES_FILE}: {error:#}").into())).ok()
+    });
+    // The sounds' captions, if the assets have any.
+    let captions = match fetch(&format!("{assets}/captions.json")).await {
+        Ok(bytes) => pen_runtime::captions::Captions::parse(&String::from_utf8_lossy(&bytes)).unwrap_or_else(|error| {
+            web_sys::console::warn_1(&format!("{error:#}").into());
+            Default::default()
+        }),
+        Err(_) => Default::default(),
+    };
+    let options = Options {
+        development: flag("development"),
+        qualify: flag("qualify"),
+        name,
+        replay: replay::linked(),
+        saved_types: saved_types.clone(),
+        captions,
+    };
     let mut screen = Screen::new(canvas.clone(), assets.clone()).await.map_err(failed)?;
     screen.renderer.preload(&catalog);
     let mut log = Log::new(run::LOG_LINES);
     log.push(log_source::SESSION, false, "pen browser host ready");
     let viewport = screen.viewport();
     let started = {
-        let mut host = Starting { viewport, log: &mut log };
+        let mut host = Starting { viewport, log: &mut log, saved_types: saved_types.as_ref() };
         Runtime::new(&BrowserBackend, game, catalog.clone(), &mut host, saves::read("pen.autosave").await, scene).await
     };
     let runtime = started.map_err(failed)?;
@@ -201,9 +234,23 @@ pub async fn qualify_platform() -> Result<String, JsValue> {
         };
         anyhow::ensure!(status(2) == Some(service_status::UNAVAILABLE), "browser Steam must be unavailable");
         anyhow::ensure!(status(3) == Some(service_status::UNKNOWN), "unregistered browser service must be unknown");
+        pen_simulation::conformance::check(&mut services::standard()).map_err(anyhow::Error::msg)?;
         audio::qualify().await?;
-        Ok::<_, anyhow::Error>("IndexedDB snapshot, pathfinding, service statuses and WebAudio graph passed".to_owned())
+        Ok::<_, anyhow::Error>(
+            "IndexedDB snapshot, pathfinding, simulation services, service statuses and WebAudio graph passed"
+                .to_owned(),
+        )
     }
     .await;
     result.map_err(failed)
+}
+
+/// The simulation services' answers to fixed requests, here in wasm32, as
+/// their digest: the same bits as native's, or an error saying what
+/// differs. Needs no page, so node runs it too (tests/services.mjs).
+#[wasm_bindgen]
+pub fn qualify_services() -> Result<String, JsValue> {
+    let mut services = pen_runtime::services::Services::<()>::new();
+    pen_simulation::register(&mut services);
+    pen_simulation::conformance::check(&mut services).map_err(failed)
 }

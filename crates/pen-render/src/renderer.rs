@@ -7,15 +7,25 @@
 // Here are the renderer's state and the types its parts share. The parts:
 // assets arriving from the loader (assets.rs), what a frame's draws bind
 // (materials.rs), how its draws batch (batching.rs), the sun's shadows
-// (shadows.rs), insets (insets.rs), fields (fields.rs), the loading veil
-// (veil.rs), checking a frame (validate.rs) and drawing it (frame.rs).
+// (shadows.rs), insets (insets.rs), fields (fields.rs), skinned draws'
+// poses (skinning.rs), particles (particles.rs), the loading veil (veil.rs),
+// checking a frame (validate.rs) and drawing it (frame.rs), and timing its
+// passes on the GPU (timing.rs).
 mod assets;
 mod batching;
+mod cascades;
 mod fields;
 mod frame;
+mod gpu_culling;
 mod insets;
+mod inspect;
 mod materials;
+mod particles;
+mod readback;
+mod resolution;
 mod shadows;
+mod skinning;
+mod timing;
 mod validate;
 mod veil;
 
@@ -27,8 +37,9 @@ use anyhow::Result;
 use pen_protocol::boundary::MAX_DRAW_EXTRA;
 use pen_protocol::{GameEvent, Matrix, Sky, Solid, Vector};
 
-use crate::asset_store::{AssetStore, Material};
+use crate::asset_store::{AssetStore, Lod, MAX_LODS, Material};
 use crate::built_in::{BuiltIn, BuiltIns};
+use crate::culling::{Detail, MAX_VIEWS, Sphere, Views};
 use crate::decals::{DecalBatch, Decals};
 use crate::loader::{LevelMessage, Loader};
 use crate::matrix::invert;
@@ -40,10 +51,15 @@ use crate::shader::{self, PipelineContext, Pipelines, Variants};
 use crate::solids::SolidBatch;
 use crate::sprites::{SpriteBatch, Sprites, sprite_group_layout};
 use crate::{RenderStats, RendererOptions};
+use cascades::{Cascade, MAX_CASCADES};
 
 #[cfg(test)]
 pub(crate) use fields::half_of;
+pub(crate) use gpu_culling::pipeline as culling_pipeline;
+use gpu_culling::{GpuBatch, GpuCulling};
 pub(crate) use insets::composite_pipeline;
+pub(crate) use particles::pipeline as particle_pipeline;
+pub(crate) use timing::{GpuTimer, Span};
 pub use validate::validate_frame;
 
 use assets::{texture_from, whole};
@@ -54,8 +70,10 @@ const INSET_SAMPLES: u32 = 4;
 // The scene uniform: view, projection, ambient, light direction and color,
 // the light's view-projection, the shadow settings, the sky's colors
 // overhead, at the horizon and below it, and where the eye is (see
-// scene.wgsl).
-const SCENE_BYTES: u64 = 320;
+// scene.wgsl); then the shadow maps' count and band, view-projections and
+// texels (shadows.rs). Shaders may declare only its first part.
+const SCENE_FLOATS: usize = 80 + 4 + 16 * MAX_CASCADES + 4 * MAX_CASCADES;
+const SCENE_BYTES: u64 = SCENE_FLOATS as u64 * 4;
 
 // A draw's uniform: model and normal matrices, color, settings, the four
 // parameters, then up to 32 extra vectors (see pen-protocol's Draw).
@@ -63,8 +81,19 @@ const DRAW_BYTES: u64 = 176 + MAX_DRAW_EXTRA as u64 * 16;
 
 pub(crate) struct MeshAsset {
     vertices: wgpu::Buffer,
+    /// Its triangles, then each simpler level of detail's.
     indices: wgpu::Buffer,
-    count: u32,
+    /// A sphere holding its vertices.
+    bounds: Sphere,
+    /// Its levels of detail, the whole mesh first.
+    lods: Vec<Lod>,
+    /// A skinned mesh's joints and weights, and its rig.
+    skin: Option<MeshSkin>,
+}
+
+pub(crate) struct MeshSkin {
+    vertices: wgpu::Buffer,
+    rig: Arc<crate::animation::Rig>,
 }
 
 pub(crate) struct MaterialAsset {
@@ -80,6 +109,13 @@ pub(crate) struct ShaderAsset {
     module: wgpu::ShaderModule,
     /// Whether it has a `vertex_instanced` entry point.
     instancing: bool,
+    /// Whether it has a `vertex_skinned` entry point.
+    skinning: bool,
+    /// Whether it reads the cascaded shadow maps (`shadow_cascades`).
+    cascaded: bool,
+    /// How far its vertex stage moves vertices from where their mesh puts
+    /// them, if it says: its draws are culled by their bounds grown by it.
+    margin: Option<f32>,
     /// The variants its loaded materials draw with.
     needs: Variants,
     /// Its pipelines by samples per pixel, compiled in the background.
@@ -88,10 +124,11 @@ pub(crate) struct ShaderAsset {
     /// samples per pixel.
     compiling: HashMap<u32, Variants>,
     failed: HashMap<u32, Variants>,
-    /// Its depth-only pipelines into the shadow map, plain and instanced,
-    /// compiled in the background when a loaded material casts shadows.
-    shadow: [Option<wgpu::RenderPipeline>; 2],
-    shadow_compiling: [bool; 2],
+    /// Its depth-only pipelines into the shadow map, plain, instanced and
+    /// skinned (by `Stage`), compiled in the background when a loaded
+    /// material casts shadows.
+    shadow: [Option<wgpu::RenderPipeline>; 3],
+    shadow_compiling: [bool; 3],
 }
 
 /// A shader's new revision, published once what its materials draw with has
@@ -166,15 +203,16 @@ struct Veil {
     clearing: Option<f64>,
 }
 
-// The shadow map and what draws into it, made when shadows are first on.
-// The shadow pass binds a stand-in map, as it renders into the real one.
+// The shadow maps and what draws into them, made when shadows are first on:
+// each pass's scene uniform and bind group, which binds a stand-in map, as
+// it renders into the real ones.
 struct Shadows {
-    uniform: wgpu::Buffer,
+    uniforms: Vec<wgpu::Buffer>,
+    groups: Vec<wgpu::BindGroup>,
     sampler: wgpu::Sampler,
-    stand_in: wgpu::TextureView,
-    group: wgpu::BindGroup,
-    map: Option<(wgpu::Texture, wgpu::TextureView)>,
-    /// Which map `map` is, to know when the scene's bind group must change.
+    stand_in: shadows::ShadowMaps,
+    maps: Option<shadows::ShadowMaps>,
+    /// Which maps `maps` are, to know when the scene's bind group must change.
     map_id: u64,
 }
 
@@ -238,25 +276,53 @@ enum Source {
     World,
 }
 
-/// Something drawn with one draw call.
+/// Something drawn with one draw call (in each view that sees it).
 #[derive(Clone, Copy)]
 struct Item {
     material: u32,
     source: Source,
     shape: Shape,
+    /// The views that see it, a bit each (`Views::mask`), the camera's
+    /// first; none, and it is left out of every pass.
+    views: u8,
+    /// The level of detail it draws its mesh at, the whole mesh 0.
+    lod: u8,
 }
 
 /// Where a frame's draw goes: alone, left out this frame, or into a batch,
-/// with the parameters it takes if it has none of its own.
+/// with the parameters it takes if it has none of its own; how its mesh and
+/// material go (`Scratch::choices`); and, unless the GPU culls its batch,
+/// the views that see it and the level of detail it draws at.
 #[derive(Clone, Copy)]
 struct Placement {
     batch: u32,
+    choice: u32,
     parameters: [f32; 4],
+    views: u8,
+    lod: u8,
 }
 
-/// The batch a mesh and material's draws join, and the parameters a draw
-/// without its own takes.
-type BatchChoice = (usize, [f32; 4]);
+/// How a mesh and material's draws go this frame: alone or into a batch; the
+/// sphere they are culled by, in the mesh's space grown by its shader's
+/// margin, if they are; whether they cast shadows; and the errors of the
+/// mesh's levels of detail.
+#[derive(Clone, Copy)]
+struct Choice {
+    batch: Batching,
+    bounds: Option<Sphere>,
+    casts: bool,
+    errors: [f32; MAX_LODS],
+    levels: u8,
+}
+
+#[derive(Clone, Copy)]
+enum Batching {
+    Alone,
+    /// Into this batch, with the parameters a draw without its own takes.
+    Into(usize, [f32; 4]),
+    /// Into a batch whose instanced pipeline is still compiling: left out.
+    Waiting,
+}
 
 const ALONE: u32 = u32::MAX;
 
@@ -266,9 +332,18 @@ struct InstanceBatch {
     mesh: usize,
     material: u32,
     pipeline: wgpu::RenderPipeline,
-    /// Its instances in the instance buffer.
-    first: u32,
+    /// Its draws' sphere and whether they cast (`Choice`), and how many there are.
+    bounds: Option<Sphere>,
+    casts: bool,
     count: u32,
+    /// Culled on the GPU: where its draws lie; its instances, whole, in the
+    /// instance buffer from `first`, `written` of them so far.
+    gpu: Option<GpuBatch>,
+    first: u32,
+    written: u32,
+    /// Culled here: its instances each view sees at each level of detail,
+    /// in the instance buffer, the first and how many.
+    ranges: [[(u32, u32); MAX_LODS]; MAX_VIEWS],
 }
 
 struct ReadyEntry {
@@ -283,14 +358,21 @@ struct ReadyEntry {
     /// translucent, or an overlay's dimmed pass and its full-strength one.
     pipeline: wgpu::RenderPipeline,
     visible: Option<wgpu::RenderPipeline>,
+    /// A posed draw's joint matrices: where they lie in the frame's.
+    skin: Option<u32>,
 }
 
 /// What a frame works out, kept between frames so that drawing the next
 /// reuses its memory.
 #[derive(Default)]
 struct Scratch {
-    /// Each mesh and material's batch and parameters, if they batch.
-    choices: HashMap<(u32, u32), Option<BatchChoice>>,
+    /// The views the frame draws: the camera's, then the shadow maps'; and
+    /// what picks levels of detail.
+    views: Views,
+    detail: Detail,
+    /// How each mesh and material's draws go, and which of those is each's.
+    choices: Vec<Choice>,
+    chosen: HashMap<(u32, u32), u32>,
     /// Batches of materials with instance parameters, by mesh and render state.
     parameter_batches: HashMap<(u32, u32), usize>,
     placements: Vec<Placement>,
@@ -311,6 +393,12 @@ struct Scratch {
     decal_order: Vec<u32>,
     /// The insets drawn, and how many pixels across and down each draws.
     insets: Vec<(usize, (u32, u32))>,
+    /// The frame's pose layers by the draw they pose: draw `d`'s are
+    /// `pose_order[pose_first[d]..pose_first[d + 1]]` (none without poses).
+    pose_first: Vec<u32>,
+    pose_order: Vec<u32>,
+    /// The frame's emitters ready to draw, in order.
+    emitters: Vec<particles::Ready>,
 }
 
 /// What drawing an item reads.
@@ -320,6 +408,9 @@ struct Drawing<'a> {
     batches: &'a [InstanceBatch],
     solids: &'a [SolidMesh],
     instances: &'a wgpu::Buffer,
+    /// The frame's joint matrices, for posed draws.
+    skin: Option<&'a wgpu::BindGroup>,
+    culling: &'a GpuCulling,
 }
 
 /// Floats for a uniform buffer, gathered on the stack.
@@ -348,13 +439,13 @@ impl<const N: usize> Floats<N> {
 
 /// The light a scene is lit by: ambient, and the light's direction and
 /// color.
-fn lighting(floats: &mut Floats<80>, ambient: &Vector, direction: &Vector, color: &Vector) {
+fn lighting<const N: usize>(floats: &mut Floats<N>, ambient: &Vector, direction: &Vector, color: &Vector) {
     floats.extend(vector(ambient)).extend(vector(direction)).extend(vector(color));
 }
 
 /// The sky the scene sits under, which lights it from all round and which
 /// glossy surfaces mirror, and where the eye is, seen by `view`.
-fn heavens(floats: &mut Floats<80>, sky: &Sky, view: &Matrix) {
+fn heavens<const N: usize>(floats: &mut Floats<N>, sky: &Sky, view: &Matrix) {
     let eye = invert(view);
     floats.extend(vector(&sky.zenith)).extend(vector(&sky.horizon)).extend(vector(&sky.ground));
     floats.extend([eye[12], eye[13], eye[14], 1.0]);
@@ -368,10 +459,7 @@ fn vector(v: &Vector) -> [f32; 4] {
 /// shader implies.
 fn overlay_pipeline(context: &PipelineContext, code: &str, label: &str) -> wgpu::RenderPipeline {
     let device = &context.device;
-    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(code.replace("${tonedWgsl}", TONED_WGSL).into()),
-    });
+    let module = crate::downlevel::shader_module(device, Some(label), &code.replace("${tonedWgsl}", TONED_WGSL));
     let premultiplied = wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::One,
         dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
@@ -437,6 +525,8 @@ pub(crate) struct State {
     mipmaps: Mipmapper,
     decals: Option<Decals>,
     sprites: Option<Sprites>,
+    // The colour filter the whole picture draws through (filter.rs).
+    pub(crate) filter: crate::filter::Filter,
     inset_scenes: Vec<Option<InsetScene>>,
     inset_targets: Vec<Option<InsetTargets>>,
     inset_sampler: wgpu::Sampler,
@@ -445,7 +535,15 @@ pub(crate) struct State {
     // The scene uniform, the shadow map and its comparison sampler.
     scene_uniform: wgpu::Buffer,
     shadows: Option<Shadows>,
-    scene_group: Option<(wgpu::BindGroup, u64)>,
+    // The frame's point and spot lights, sorted into clusters of its view.
+    clusters: crate::lights::Clusters,
+    // Where frames for an HDR surface that needs decoding draw, shared with
+    // the renderers drawing over this one's frames.
+    screen: crate::display::SharedScreen,
+    // The scene's bind group, and the maps and the layer it binds.
+    scene_group: Option<(wgpu::BindGroup, (u64, usize))>,
+    // The frame's shadow maps, nearest first, and how many.
+    cascades: ([Cascade; MAX_CASCADES], usize),
     stride: u64,
     capacity: usize,
     draw_uniform: wgpu::Buffer,
@@ -457,6 +555,14 @@ pub(crate) struct State {
     instance_buffer: wgpu::Buffer,
     instance_data: Vec<f32>,
     last_stats: RenderStats,
+    // Timestamps around the frame's passes, where the device has them, and
+    // whether the host wants them.
+    timer: timing::GpuTimer,
+    timing: bool,
+    // Instances of large batches culled on the GPU.
+    culling: GpuCulling,
+    // The share of the frame's render scale drawn at, to hold a frame budget.
+    resolution: resolution::Resolution,
     // Samplers by how many levels off the finest they keep, in quarters.
     samplers: HashMap<i32, wgpu::Sampler>,
     white: TextureAsset,
@@ -480,6 +586,10 @@ pub(crate) struct State {
     last_time: Option<f64>,
     // Whether the catalog is being loaded ahead of need.
     preloading: bool,
+    // The slots a scene asked for first (`preload_scene`), and the catalog
+    // to load ahead of need once they are in.
+    scene: Vec<usize>,
+    deferred: Option<pen_protocol::Catalog>,
     // Shaders the preload has sorted and asked for: one whose vertex stage
     // takes only builtins draws sprites; one that takes vertex attributes
     // draws meshes.
@@ -491,6 +601,9 @@ pub(crate) struct State {
     // Whether something this frame draws is still on its way.
     waiting: bool,
     scratch: Scratch,
+    // Posed draws' joint matrices, and the frame's particles.
+    skinning: skinning::Skinning,
+    particles: Option<particles::Particles>,
     // Interned material render states (`MaterialAsset::state`).
     states: HashMap<String, u32>,
     // The frame the catalog's mesh and material keys were last checked in.
@@ -534,6 +647,17 @@ impl State {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
+                // Every shadow map, the game's last (shadows.rs).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let texture_entry = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
@@ -571,9 +695,18 @@ impl State {
                 texture_entry(4, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
             ],
         });
+        let lights_group = crate::lights::group_layout(&device);
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("scene"),
-            bind_group_layouts: &[Some(&scene_group), Some(&draw_group)],
+            bind_group_layouts: &[Some(&scene_group), Some(&draw_group), Some(&lights_group)],
+            immediate_size: 0,
+        });
+        let skin_group = skinning::group_layout(&device);
+        let skinned_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("skinned"),
+            // The lights stay group 2, as in every mesh pipeline; the joints
+            // come after them, the fourth and last group WebGPU allows.
+            bind_group_layouts: &[Some(&scene_group), Some(&draw_group), Some(&lights_group), Some(&skin_group)],
             immediate_size: 0,
         });
         let sprite_group = sprite_group_layout(&device);
@@ -585,15 +718,22 @@ impl State {
         let context = PipelineContext {
             device: device.clone(),
             layout,
+            skinned_layout,
             sprite_layout,
             scene_group,
             draw_group,
+            skin_group,
+            lights_group,
             sprite_group,
-            format: options.format,
+            format: options.display.drawing_format(options.format),
+            display: options.display,
             cache: PipelineCache::open(&device, options.pipeline_cache.as_deref()),
         };
+        let screen = crate::display::Screen::new(&device, options.display, options.format);
         let loader = Loader::new(options.assets, context.clone())?;
-        let mut state = Self::with(device, queue, context, loader, options.veil)?;
+        let screen = crate::display::SharedScreen::new(screen);
+        let mut state = Self::with(device, queue, context, loader, options.veil, screen)?;
+        state.request_culling();
         // What frames draw with at any quality, ahead of the first.
         state.built_ins.prepare([
             BuiltIn::BloomDown { first: true },
@@ -608,7 +748,8 @@ impl State {
     /// threads and pipeline cache, with its own loads and events.
     pub fn sharing(&self, assets: std::path::PathBuf) -> Result<Self> {
         let loader = self.loader.sharing(assets, self.context.clone());
-        Self::with(self.device.clone(), self.queue.clone(), self.context.clone(), loader, None)
+        let (device, queue, context) = (self.device.clone(), self.queue.clone(), self.context.clone());
+        Self::with(device, queue, context, loader, None, self.screen.clone())
     }
 
     fn with(
@@ -617,6 +758,7 @@ impl State {
         context: PipelineContext,
         loader: Loader,
         veil: Option<f32>,
+        screen: crate::display::SharedScreen,
     ) -> Result<Self> {
         let assets = AssetStore::new(loader.jobs.clone());
         let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
@@ -625,7 +767,7 @@ impl State {
         let mut built_in = |id: u64, size: (u32, u32), pixels: &[u8]| -> Result<TextureAsset> {
             let texture =
                 texture_from(&device, &queue, &mut mipmaps, size, pixels, wgpu::TextureFormat::Rgba8UnormSrgb, false)?;
-            Ok(whole(texture, id))
+            Ok(whole(&device, texture, id))
         };
         let white = built_in(1, (1, 1), &[255, 255, 255, 255])?;
         let flat_normal = built_in(2, (1, 1), &[128, 128, 255, 255])?;
@@ -653,6 +795,7 @@ impl State {
             mipmaps,
             decals: None,
             sprites: None,
+            filter: crate::filter::Filter::default(),
             inset_scenes: Vec::new(),
             inset_targets: Vec::new(),
             inset_sampler: linear_sampler(wgpu::FilterMode::Linear),
@@ -660,21 +803,23 @@ impl State {
             veil,
             scene_uniform: uniform_buffer(&device, "scene", SCENE_BYTES),
             shadows: None,
+            clusters: crate::lights::Clusters::new(&device, &context.lights_group),
+            screen,
             scene_group: None,
+            cascades: ([Cascade { projection: crate::matrix::IDENTITY, texel: 0.0 }; MAX_CASCADES], 0),
             stride,
             capacity: 1,
             draw_uniform: uniform_buffer(&device, "draws", stride),
             uniform_data: vec![0.0; (stride / 4) as usize],
             groups: HashMap::new(),
             instance_capacity: 1,
-            instance_buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("instances"),
-                size: 80,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
+            instance_buffer: batching::instance_buffer(&device, 1),
             instance_data: vec![0.0; 20],
             last_stats: RenderStats::default(),
+            timer: timing::GpuTimer::new(&device, &queue),
+            timing: false,
+            culling: GpuCulling::new(&device, &queue),
+            resolution: resolution::Resolution::new(),
             samplers: HashMap::new(),
             white,
             flat_normal,
@@ -690,11 +835,15 @@ impl State {
             fading: Vec::new(),
             last_time: None,
             preloading: false,
+            scene: Vec::new(),
+            deferred: None,
             sorted: HashSet::new(),
             solids: Vec::new(),
             solid_meshes: Vec::new(),
             waiting: false,
             scratch: Scratch::default(),
+            skinning: skinning::Skinning::new(&device),
+            particles: None,
             states: HashMap::new(),
             checks: 0,
             checked_meshes: Vec::new(),
@@ -720,6 +869,18 @@ impl State {
         self.last_stats
     }
 
+    pub fn gpu_culling(&mut self, from: Option<u32>) {
+        self.culling.from = from;
+    }
+
+    pub fn frame_budget(&mut self, milliseconds: Option<f32>) {
+        self.resolution.set_budget(milliseconds);
+    }
+
+    pub fn time_passes(&mut self, timing: bool) {
+        self.timing = timing;
+    }
+
     pub fn take_events(&mut self) -> Vec<GameEvent> {
         std::mem::take(&mut self.assets.events)
     }
@@ -736,16 +897,24 @@ impl State {
                 _ => 0,
             })
             .sum::<usize>();
+        // A catalog waiting on a scene's assets is work to come.
         self.assets.in_flight()
+            + usize::from(self.deferred.is_some())
             + self.pending.len()
             + self.checking.len()
             + self.streaming.len()
             + compiling
             + self.built_ins.compiling()
+            + usize::from(self.culling.compiling())
     }
 
     /// Whether nothing is streaming in or settling, and the veil is gone.
     pub fn quiet(&self) -> bool {
         self.streaming.is_empty() && self.fading.is_empty() && self.veil.is_none()
+    }
+
+    /// Whether something the last frame draws is still on its way.
+    pub fn waiting(&self) -> bool {
+        self.waiting
     }
 }

@@ -127,6 +127,9 @@ pub struct Timeline {
     restored_next: bool,
     /// Where the running program was last started from a restore.
     fresh: Option<u64>,
+    /// Keep a moment at every position from here on, not only every
+    /// `MOMENT_INTERVAL` (netplay: where frames may run on a prediction).
+    dense: Option<u64>,
 }
 
 impl Default for Timeline {
@@ -141,6 +144,7 @@ impl Default for Timeline {
             keep: Some(KEEP_SECONDS),
             restored_next: false,
             fresh: None,
+            dense: None,
         }
     }
 }
@@ -194,6 +198,11 @@ impl Timeline {
         self.moments.keys().copied()
     }
 
+    /// The latest moment kept at or before `position`, and where it is.
+    pub fn moment_before(&self, position: u64) -> Option<(u64, &Moment)> {
+        self.moments.range(..=position).next_back().map(|(at, kept)| (*at, &kept.moment))
+    }
+
     /// The history as a recording: the earliest moment and every frame
     /// recorded from it on.
     pub fn recording(&self) -> Option<Recording> {
@@ -229,8 +238,41 @@ impl Timeline {
         self.history
             && match self.moments.get(&self.cursor) {
                 Some(kept) => kept.build != self.build,
-                None => self.moments.is_empty() || self.cursor.is_multiple_of(MOMENT_INTERVAL),
+                None => {
+                    self.moments.is_empty()
+                        || self.cursor.is_multiple_of(MOMENT_INTERVAL)
+                        || self.dense.is_some_and(|from| self.cursor >= from)
+                }
             }
+    }
+
+    /// Keeps a moment before every frame from `from` on (None: every
+    /// `MOMENT_INTERVAL` frames again), so a rewind to one of them runs no
+    /// frame again before it.
+    pub fn moments_from(&mut self, from: Option<u64>) {
+        self.dense = from;
+    }
+
+    /// Gives a frame that ran its input again (netplay: what it ran on, a
+    /// prediction that may have proved wrong), for a rewind to the head to
+    /// run it and the frames after it again. When the input changed, the
+    /// moments after it, which followed the old input, go. Either way the
+    /// frame loses its `restored` mark: peers restore at frames of their
+    /// own, so a net session's game keeps all of itself in its state, and
+    /// the run again need not restore there. Returns whether the input
+    /// changed.
+    pub fn amend(&mut self, position: u64, input: Vec<f32>) -> bool {
+        let Some(index) = position.checked_sub(self.base).and_then(|index| usize::try_from(index).ok()) else {
+            return false;
+        };
+        let Some(recorded) = self.frames.get_mut(index).filter(|_| position < self.cursor) else { return false };
+        recorded.restored = false;
+        if recorded.input == input {
+            return false;
+        }
+        recorded.input = input;
+        self.moments.retain(|at, _| *at <= position);
+        true
     }
 
     pub fn keep_moment(&mut self, moment: Moment) {
@@ -285,13 +327,29 @@ impl Timeline {
     /// Plays a recording: its frames wait to run from its start, which the
     /// caller restores.
     pub fn load(&mut self, recording: Recording) {
+        self.load_at(recording, 0);
+    }
+
+    /// Plays a recording whose start is at `position` of the run it came
+    /// from (a spectator joining a stream late), counting frames from there.
+    pub fn load_at(&mut self, recording: Recording, position: u64) {
         self.frames = recording.frames.into();
-        self.base = 0;
-        self.cursor = 0;
+        self.base = position;
+        self.cursor = position;
         self.restored_next = false;
-        self.fresh = Some(0);
+        self.fresh = Some(position);
         self.moments.clear();
-        self.moments.insert(0, Kept { build: self.build, moment: recording.start });
+        self.moments.insert(position, Kept { build: self.build, moment: recording.start });
+    }
+
+    /// More recorded frames, after the head, to play (a stream's).
+    pub fn extend(&mut self, frames: impl IntoIterator<Item = Recorded>) {
+        self.frames.extend(frames);
+    }
+
+    /// The latest moment kept at or before `position`, and where it is.
+    pub fn moment_at(&self, position: u64) -> Option<(u64, &Moment)> {
+        self.moments.range(..=position).next_back().map(|(at, kept)| (*at, &kept.moment))
     }
 
     /// The position `seconds` of game time before the end of the record.

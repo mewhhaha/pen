@@ -12,6 +12,7 @@ use pen_protocol::boundary::{decode_frame, decode_into, encode_frame, validate_s
 use pen_protocol::{Catalog, Frame, RenderFrame, Viewport};
 
 use crate::program::{Backend, Operation, Program, Unresponsive};
+use crate::saved::{SavedTypes, declared_resets};
 use crate::snapshot::SavedState;
 
 const HISTORY_LIMIT: usize = 200;
@@ -28,6 +29,12 @@ pub trait Host {
     /// reload): replay the player's preferences, over whatever ones the
     /// restored state held, and drop what was held for the world replaced.
     fn restored(&mut self) {}
+    /// The saved types the game declares (`saved.json` beside its catalog,
+    /// saved.rs), which migrate what its own code cannot. Asked only when a
+    /// restore reset a section.
+    fn saved_types(&self) -> Option<SavedTypes> {
+        None
+    }
 }
 
 /// A host that draws, plays and says nothing: frames run again to reach a
@@ -49,6 +56,10 @@ impl Host for Quiet<'_> {
     }
 
     fn report(&mut self, _message: &str) {}
+
+    fn saved_types(&self) -> Option<SavedTypes> {
+        self.0.saved_types()
+    }
 }
 
 /// What became of a new build of the game.
@@ -135,6 +146,8 @@ pub struct GameRuntime<B: Backend> {
     /// Hash each packet, for determinism checks.
     hashing: bool,
     packet_hash: u64,
+    /// The last packet's length in lanes.
+    packet_lanes: usize,
     /// Keep a copy of the last frame received: tests say how two differ.
     keeping: bool,
     received: Option<RenderFrame>,
@@ -158,6 +171,49 @@ async fn state_request<P: Program>(game: &mut Game<P>, operation: Operation, pay
     Ok(state)
 }
 
+/// Restores `state` into `game`, a new program of `module`. When the game
+/// resets a section for want of a migration and the host's declared saved
+/// types give one, the state is migrated (saved.rs) and restored again in
+/// another program of `module`, which takes `game`'s place. Returns the
+/// game's answer, its report marking the sections the host migrated.
+async fn restore<B: Backend>(
+    engine: &B,
+    module: &B::Module,
+    game: &mut Game<B::Program>,
+    state: &[f32],
+    host: &dyn Host,
+) -> Result<Vec<f32>> {
+    let answer = state_request(game, Operation::Restore, state).await?;
+    let Some(outcomes) = restore_report(&answer) else { return Ok(answer) };
+    if outcomes.iter().all(|outcome| outcome.fate != RESET) {
+        return Ok(answer);
+    }
+    let Some(types) = host.saved_types() else { return Ok(answer) };
+    let targets = declared_resets(&types, &outcomes);
+    if targets.is_empty() {
+        return Ok(answer);
+    }
+    let (migrated, keys) = crate::saved::migrate(state, &types, &targets)?;
+    let mut fresh = open_game(engine, module).await?;
+    let mut answer = state_request(&mut fresh, Operation::Restore, &migrated).await?;
+    let mut replaced = std::mem::replace(game, fresh);
+    replaced.program.close().await;
+    // The report, from the second restore, says it kept those sections.
+    if let Some(records) = answer.get_mut(2..) {
+        for record in records.as_chunks_mut::<4>().0 {
+            let key = whole(record[0]);
+            let original = outcomes.iter().find(|outcome| Some(outcome.key) == key && keys.contains(&outcome.key));
+            if let Some(original) = original
+                && whole(record[1]) == Some(0)
+            {
+                record[1] = DECLARED as f32;
+                record[2] = original.saved as f32;
+            }
+        }
+    }
+    Ok(answer)
+}
+
 fn validation_frame(host: &dyn Host) -> Frame {
     Frame { timestamp: 0.0, viewport: host.viewport(), events: Vec::new() }
 }
@@ -179,7 +235,9 @@ fn ms(duration: std::time::Duration) -> f64 {
 /// What a restore or scene load made of one saved section (gdev's
 /// `packages/persist.blot` Fate, by code): 0 kept as saved, 1 migrated from
 /// another version, 2 reset for want of a migration, 3 started afresh because
-/// the state lacked it, 4 dropped because the build no longer saves it.
+/// the state lacked it, 4 dropped because the build no longer saves it; and
+/// the host's own, [`DECLARED`]: migrated by the game's declared saved
+/// types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SectionOutcome {
     /// The section's key, its saved type's from build to build.
@@ -192,6 +250,11 @@ pub struct SectionOutcome {
 }
 
 const REPORT_MAGIC: f32 = 5680.0;
+/// A section's fate when the game reset it for want of a migration.
+pub const RESET: u32 = 2;
+/// A section's fate when the host migrated it as the game's saved types
+/// declare (saved.rs), after the game could not.
+pub const DECLARED: u32 = 5;
 
 /// The report a restore or scene load answers with: `5680, count`, then
 /// `key, fate, saved, version` per section. None for any other answer, as
@@ -229,6 +292,9 @@ pub fn describe_restore(outcomes: Option<&[SectionOutcome]>) -> Option<String> {
             2 => Some(format!("reset section {key} (version {saved} has no migration to {version})")),
             3 => Some(format!("started section {key} afresh (the state has none)")),
             4 => Some(format!("dropped section {key} (no longer saved)")),
+            DECLARED => {
+                Some(format!("migrated section {key} from version {saved} to {version} as saved.json declares"))
+            }
             _ => Some(format!("section {key}: unknown fate {fate}")),
         })
         .collect();
@@ -279,7 +345,7 @@ impl<B: Backend> GameRuntime<B> {
         }
         match initial_save.filter(|saved| saved.schema == active.schema) {
             Some(saved) => {
-                let restored = state_request(&mut active, Operation::Restore, &saved.state).await?;
+                let restored = restore(engine, &module, &mut active, &saved.state, host).await?;
                 host.report(&with_report("resuming the saved state", &restored));
             }
             None => {
@@ -308,6 +374,7 @@ impl<B: Backend> GameRuntime<B> {
             sent: None,
             hashing: false,
             packet_hash: 0,
+            packet_lanes: 0,
             keeping: false,
             received: None,
             spare: None,
@@ -336,6 +403,11 @@ impl<B: Backend> GameRuntime<B> {
     /// The hash of the last packet received, when hashing.
     pub fn packet_hash(&self) -> u64 {
         self.packet_hash
+    }
+
+    /// The last packet received's length in lanes.
+    pub fn packet_lanes(&self) -> usize {
+        self.packet_lanes
     }
 
     /// Keep a copy of every frame received (`received`).
@@ -390,7 +462,7 @@ impl<B: Backend> GameRuntime<B> {
         commit: bool,
     ) -> Result<(RenderFrame, Vec<f32>)> {
         let mut candidate = open_game(&self.engine, &self.module).await?;
-        let mut answer = state_request(&mut candidate, Operation::Restore, state).await?;
+        let mut answer = restore(&self.engine, &self.module, &mut candidate, state, host).await?;
         if let Some(scene) = scene {
             answer = state_request(&mut candidate, Operation::LoadScene, scene).await?;
         }
@@ -483,6 +555,7 @@ impl<B: Backend> GameRuntime<B> {
         if self.hashing {
             self.packet_hash = hash_lanes(&packet);
         }
+        self.packet_lanes = packet.len();
         if self.keeping {
             self.received = Some(frame.clone());
         }
@@ -527,7 +600,7 @@ impl<B: Backend> GameRuntime<B> {
             // The new build keeps what it can of each saved section and says
             // what it migrated or started over.
             let state = state_request(&mut self.active, Operation::Snapshot, &[]).await?;
-            let restored = state_request(&mut prepared, Operation::Restore, &state).await?;
+            let restored = restore(&self.engine, &module, &mut prepared, &state, host).await?;
             let rendered = evaluate(&mut prepared, &catalog, host).await?;
             host.render(&rendered, &catalog)?;
             prepared.program.accept();
@@ -559,6 +632,17 @@ impl<B: Backend> GameRuntime<B> {
 
     pub fn catalog(&self) -> &Catalog {
         &self.catalog
+    }
+
+    /// The catalog, for the dev tools to draw an entry from another asset
+    /// until the next build.
+    pub fn catalog_mut(&mut self) -> &mut Catalog {
+        &mut self.catalog
+    }
+
+    /// The running program, for a host to look into it.
+    pub fn program(&self) -> &B::Program {
+        &self.active.program
     }
 
     /// The running program's linear memory, in bytes.
@@ -796,5 +880,142 @@ mod receive_tests {
         backend.0.borrow_mut().answers.push(Err(anyhow::anyhow!("trapped")));
         runtime.send(&[]).unwrap();
         assert!(!ready(runtime.receive(&Viewer)).unwrap_err().is::<InvalidFrame>(), "other failures stay fatal");
+    }
+}
+
+#[cfg(test)]
+mod saved_types_tests {
+    use pen_protocol::boundary::{PACKET_HEADER_FLOATS, PACKET_MAGIC, lanes};
+
+    use super::*;
+    use crate::program::{Response, response};
+    use crate::saved::STATE_MAGIC;
+
+    /// A game saved as ink's persist saves one: the entities, and section
+    /// 100, `points` (version 1) or `points, bonus` (version 2, which has no
+    /// migration from 1). Each module is a build: its version.
+    #[derive(Clone)]
+    struct Builds;
+
+    struct Persisting {
+        version: u32,
+        state: Vec<f32>,
+        answer: Option<(Operation, Vec<f32>)>,
+    }
+
+    fn state(version: u32, record: &[f32]) -> Vec<f32> {
+        let mut state = vec![STATE_MAGIC, 1.0, 2.0, 0.0, 1.0, 0.0, 1.0, 1.0];
+        state.extend([100.0, version as f32, 0.0, record.len() as f32]);
+        state.extend_from_slice(record);
+        state
+    }
+
+    impl Backend for Builds {
+        type Module = u32;
+        type Program = Persisting;
+        async fn start(&self, version: &u32) -> Result<Persisting> {
+            Ok(Persisting { version: *version, state: Vec::new(), answer: None })
+        }
+    }
+
+    impl Program for Persisting {
+        fn schema(&self) -> u32 {
+            1
+        }
+        fn scenes(&self) -> bool {
+            false
+        }
+        fn send(&mut self, operation: Operation, payload: &[f32]) -> Result<()> {
+            let lanes = match operation {
+                Operation::Create => {
+                    self.state = if self.version == 1 { state(1, &[42.0]) } else { state(2, &[0.0, 0.25]) };
+                    Vec::new()
+                }
+                Operation::Snapshot => self.state.clone(),
+                Operation::Restore => {
+                    let saved = whole(payload[9]).unwrap();
+                    let fate = if saved == self.version { 0.0 } else { 2.0 };
+                    self.state = if fate == 0.0 { payload.to_vec() } else { state(2, &[0.0, 0.25]) };
+                    vec![5680.0, 2.0, 0.0, 0.0, 1.0, 1.0, 100.0, fate, saved as f32, self.version as f32]
+                }
+                _ => {
+                    let mut packet = vec![0.0; PACKET_HEADER_FLOATS];
+                    packet[lanes::header::MAGIC] = PACKET_MAGIC;
+                    packet[lanes::header::SCHEMA] = 1.0;
+                    packet
+                }
+            };
+            self.answer = Some((operation, [&[operation as u8 as f32][..], &lanes].concat()));
+            Ok(())
+        }
+        async fn response(&mut self) -> Result<Response> {
+            let (operation, answer) = self.answer.take().unwrap();
+            response(operation, answer)
+        }
+        fn accept(&mut self) {}
+        fn answered(&self) -> Option<Instant> {
+            None
+        }
+        fn memory_bytes(&self) -> usize {
+            0
+        }
+        async fn close(&mut self) {}
+    }
+
+    struct Viewer {
+        declared: Option<SavedTypes>,
+        reports: Vec<String>,
+    }
+
+    impl Host for Viewer {
+        fn viewport(&self) -> Viewport {
+            Viewport { width: 64, height: 64 }
+        }
+        fn validate(&self, _: &RenderFrame) -> Result<()> {
+            Ok(())
+        }
+        fn render(&mut self, _: &RenderFrame, _: &Catalog) -> Result<()> {
+            Ok(())
+        }
+        fn report(&mut self, message: &str) {
+            self.reports.push(message.to_owned());
+        }
+        fn saved_types(&self) -> Option<SavedTypes> {
+            self.declared.clone()
+        }
+    }
+
+    fn ready<T>(future: impl Future<Output = T>) -> T {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::pin!(future).poll(&mut context) {
+            std::task::Poll::Ready(value) => value,
+            std::task::Poll::Pending => unreachable!("these programs answer at once"),
+        }
+    }
+
+    const DECLARED: &str = r#"{"types": {"score": {"key": 100, "kind": "resource", "versions": {
+        "1": [{"name": "points", "type": "f32"}],
+        "2": [{"name": "points", "type": "f32"}, {"name": "bonus", "type": "f32", "default": 0.5}]}}}}"#;
+
+    fn reload(declared: Option<SavedTypes>) -> (Viewer, Vec<f32>) {
+        let catalog = Catalog { meshes: vec!["m".into()], materials: vec!["x".into()], sounds: Vec::new() };
+        let mut viewer = Viewer { declared, reports: Vec::new() };
+        let builds = Builds;
+        let mut runtime = ready(GameRuntime::new(&builds, 1, catalog.clone(), &mut viewer, None, None)).unwrap();
+        assert_eq!(ready(runtime.reload(&mut viewer, 2, catalog)), ReloadResult::Activated);
+        let saved = ready(runtime.snapshot()).unwrap();
+        (viewer, saved.state)
+    }
+
+    #[test]
+    fn reloads_migrate_what_the_game_cannot_as_declared() {
+        let (viewer, state) = reload(Some(SavedTypes::parse(DECLARED).unwrap()));
+        assert_eq!(state[8..], [100.0, 2.0, 0.0, 2.0, 42.0, 0.5], "the points kept, the bonus its default");
+        let reported = viewer.reports.last().unwrap();
+        assert!(reported.contains("migrated section 100 from version 1 to 2 as saved.json declares"), "{reported}");
+        // Without the declaration the game resets the section.
+        let (viewer, state) = reload(None);
+        assert_eq!(state[8..], [100.0, 2.0, 0.0, 2.0, 0.0, 0.25]);
+        assert!(viewer.reports.last().unwrap().contains("reset section 100"), "{:?}", viewer.reports);
     }
 }

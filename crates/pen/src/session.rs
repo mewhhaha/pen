@@ -12,9 +12,12 @@
 //! In a window, the dev tools (`Overlay`) can draw over the game's frames.
 //!
 //! Its parts: the GPU and what frames are drawn into (`gpu`), the player's
-//! preferences (`preferences`) and frame measurements (`profile`); the
-//! game's clock (`pen_runtime::clock`) and what was asked of time
-//! (`pen_runtime::transport`) are the runtime's, which the browser shares.
+//! preferences (`preferences`), action bindings (`bindings`), accessibility
+//! audits (`audit`) and frame measurements (`profile`); the game's clock
+//! (`pen_runtime::clock`) and what was asked of time (`pen_runtime::transport`)
+//! are the runtime's, which the browser shares.
+mod audit;
+mod bindings;
 mod gpu;
 mod preferences;
 mod profile;
@@ -28,8 +31,10 @@ use anyhow::{Context, Result, anyhow};
 use blot_host::GuestModule;
 use pen_protocol::{Catalog, GameEvent, RenderFrame, UiNode, Viewport};
 use pen_render::RenderTarget;
+use pen_runtime::captions::{self, Captions, CaptionsService};
 use pen_runtime::clock::Clock;
 use pen_runtime::devtools::TimelineStatus;
+use pen_runtime::saved::SavedTypes;
 #[cfg(all(test, feature = "compiler"))]
 use pen_runtime::transport;
 use pen_runtime::transport::{Replaying, Rewind, Transport};
@@ -37,6 +42,7 @@ use winit::event::WindowEvent;
 use winit::window::Window;
 
 use crate::audio::Audio;
+use crate::bugreport;
 use crate::dev::{Dev, Update};
 use crate::devlog::{self, Source};
 use crate::game::{FrameTimings, GameRuntime, Host, InvalidFrame, Quiet, ReloadResult, Unresponsive, hash_lanes};
@@ -63,6 +69,8 @@ pub struct Paths {
     pub scene: PathBuf,
     pub bundled_scene: PathBuf,
     pub preferences: PathBuf,
+    /// The game's actions and the player's bindings (`bindings`).
+    pub bindings: PathBuf,
     /// Where `shot=NAME` steps write their PNGs.
     pub shots: PathBuf,
 }
@@ -84,6 +92,7 @@ impl Paths {
             scene: scene.unwrap_or_else(|| data.join("main.scene")),
             quicksave: data.join("quicksave.bin"),
             preferences: data.join("preferences.json"),
+            bindings: data.join("bindings.json"),
             shots: shots.unwrap_or_else(|| PathBuf::from("shots")),
             game,
         }
@@ -91,6 +100,13 @@ impl Paths {
 
     pub fn scene_to_read(&self) -> &Path {
         if self.scene.exists() { &self.scene } else { &self.bundled_scene }
+    }
+
+    /// Whether `path` is one of the player's own saves in the data
+    /// directory, the quick save and their scene, which are stamped and
+    /// backed up (`saves`).
+    fn kept(&self, path: &Path) -> bool {
+        path == self.quicksave || path == self.quicksave.with_file_name("main.scene")
     }
 }
 
@@ -125,6 +141,13 @@ pub trait Overlay {
     /// An assistive technology's request for one of its nodes (in its own
     /// tree's terms), for its next layout.
     fn accesskit_action(&mut self, _request: accesskit::ActionRequest) {}
+    /// Whether it wants a picture of the frame at `position` (the timeline's).
+    fn wants_picture(&self, _position: u64) -> bool {
+        false
+    }
+    /// The frame at `position`, drawn offscreen into `texture`, for its
+    /// pictures.
+    fn picture(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue, _texture: &wgpu::Texture, _position: u64) {}
 }
 
 /// What to keep of the frames drawn during one step.
@@ -138,6 +161,10 @@ struct Capture {
     offscreen: bool,
     /// Screenshots with the overlay, as the window shows it.
     overlay_shots: Vec<PathBuf>,
+    /// The overlay's picture of the frame at this position.
+    picture: Option<u64>,
+    /// Frames the accessibility audit reads back (`audit`).
+    audits: audit::Audits,
 }
 
 /// Everything the game runtime may touch while a frame runs.
@@ -150,6 +177,8 @@ struct Shell<'a> {
     services: &'a mut Services,
     capture: &'a mut Capture,
     overlay: Option<&'a mut Box<dyn Overlay>>,
+    /// The game's assets, beside which it declares its saved types.
+    assets: &'a Path,
 }
 
 impl Host for Shell<'_> {
@@ -162,11 +191,15 @@ impl Host for Shell<'_> {
     }
 
     fn render(&mut self, frame: &RenderFrame, catalog: &Catalog) -> Result<()> {
+        self.preferences.apply(&mut self.gpu.renderer)?;
         let capture = &mut *self.capture;
+        let audited = capture.audits.due(&frame.ui);
         let offscreen = capture.offscreen
             || !capture.screenshots.is_empty()
             || capture.recorder.is_some()
-            || !capture.overlay_shots.is_empty();
+            || !capture.overlay_shots.is_empty()
+            || capture.picture.is_some()
+            || audited;
         let texture = offscreen.then(|| self.gpu.capture_texture());
         let gpu = &mut *self.gpu;
         #[cfg(feature = "devtools")]
@@ -192,10 +225,19 @@ impl Host for Shell<'_> {
                 target.present();
             }
         }
+        if let Some(texture) = texture.as_ref().filter(|_| audited) {
+            capture.audits.capture(gpu, texture, &frame.ui)?;
+        }
+        crate::startup::drawn(&gpu.renderer);
         if let Some(texture) = &texture {
             for path in capture.overlay_shots.drain(..) {
                 write_overlay_shot(gpu, texture, self.overlay.as_deref_mut(), &path)?;
             }
+        }
+        if let (Some(position), Some(texture), Some(overlay)) =
+            (capture.picture.take(), &texture, self.overlay.as_deref_mut())
+        {
+            overlay.picture(&gpu.device, &gpu.queue, texture, position);
         }
         if let Some(texture) = &texture
             && !capture.screenshots.is_empty()
@@ -216,7 +258,9 @@ impl Host for Shell<'_> {
         if let Some(audio) = self.audio.as_deref_mut() {
             audio.frame(frame, catalog);
         }
+        self.services.rendered(frame, catalog);
         show_cursor(self.window, frame, self.overlay.as_ref().is_some_and(|overlay| overlay.wants_pointer()));
+        self.input.text_field(self.window, &frame.ui);
         if let Some(preferences) = &frame.preferences {
             self.preferences.store(preferences)?;
         }
@@ -237,6 +281,24 @@ impl Host for Shell<'_> {
         // The answers waiting were for the world that asked.
         self.services.forget();
     }
+
+    fn saved_types(&self) -> Option<SavedTypes> {
+        let path = self.assets.join(pen_runtime::saved::SAVED_TYPES_FILE);
+        let text = std::fs::read_to_string(&path).ok()?;
+        SavedTypes::parse(&text)
+            .map_err(|error| devlog::error(Source::Game, format!("{}: {error:#}", path.display())))
+            .ok()
+    }
+}
+
+/// The assets' captions (`captions.json`), none if they have none; a file
+/// that does not read is reported and gives none.
+fn load_captions(assets: &Path) -> Captions {
+    let Ok(json) = std::fs::read_to_string(assets.join("captions.json")) else { return Captions::default() };
+    Captions::parse(&json).unwrap_or_else(|error| {
+        devlog::error(Source::Asset, format!("{error:#}"));
+        Captions::default()
+    })
 }
 
 /// The pointer shows unless the frame hides it, and always while the
@@ -258,6 +320,9 @@ pub struct Options {
     /// Steady game time: this many frames per game second.
     pub fps: Option<f64>,
     pub mute: bool,
+    /// The audio device's buffer, in samples (`--audio-buffer`); none for
+    /// the system's.
+    pub audio_buffer: Option<u32>,
     /// Reload the game and its assets when their files change.
     pub dev: bool,
     pub script: Vec<Step>,
@@ -284,6 +349,12 @@ pub struct Playback {
     /// Write a line per frame: its position, and its input's and packet's
     /// hashes (`--trace`).
     pub trace: Option<PathBuf>,
+    /// Play as one peer of a net session (`--net`, `crate::net`).
+    pub net: Option<crate::net::Spec>,
+    /// Stream the final frames to viewers on this address (`--broadcast`).
+    pub stream: Option<String>,
+    /// Play the stream at this address as it comes (`--spectate`).
+    pub spectate: Option<String>,
 }
 
 /// Overlapping frames (`Playback::overlap`): the guest computes the next
@@ -322,9 +393,13 @@ pub struct Session {
     audio: Option<Audio>,
     pub input: Input,
     preferences: Preferences,
+    /// The game's actions, which live frames' events move (`bindings`).
+    pub actions: pen_runtime::actions::Shared,
     /// What the game asks of the platform and native libraries: called for
     /// live frames only, their answers the next live frame's input.
     pub services: Services,
+    /// The captions of what plays, shared with the captions service.
+    captions: captions::Shared,
     clock: Clock,
     script: Option<Script>,
     capture: Capture,
@@ -360,6 +435,26 @@ pub struct Session {
     recording_input: Option<(PathBuf, u64)>,
     /// A screenshot with the overlay of the last frame (`--overlay-shot`).
     final_overlay_shot: Option<PathBuf>,
+    /// Mods beside the game (`--mod`): they see each live frame's input
+    /// and add to it.
+    mods: Option<crate::mods::Mods>,
+    /// The last frames' packets, while the dev tools look at them.
+    #[cfg(feature = "devtools")]
+    packets: pen_runtime::inspect::Packets,
+    /// The profile the game's guest is sampled into, while profiled.
+    #[cfg(feature = "devtools")]
+    sampling: Option<std::sync::Arc<blot_host::Profile>>,
+    /// A net session this peer plays in (`crate::net`).
+    net: Option<crate::net::Net>,
+    /// Viewers this session streams to, and a stream it plays (`crate::spectate`).
+    stream: Option<crate::spectate::Stream>,
+    watch: Option<crate::spectate::Watch>,
+}
+
+/// How much game time a history keeps: enough to rewind, and a bug
+/// report's worth.
+fn history_seconds() -> f64 {
+    KEEP_SECONDS.max(bugreport::SECONDS)
 }
 
 fn read_optional(path: &Path) -> Option<SavedState> {
@@ -382,6 +477,7 @@ macro_rules! shell {
             services: &mut $session.services,
             capture: &mut $session.capture,
             overlay: $session.overlay.as_mut(),
+            assets: &$session.paths.assets,
         }
     };
 }
@@ -420,12 +516,21 @@ impl Session {
         mut gpu: Gpu,
         window: Option<&Window>,
     ) -> Result<Session> {
+        // What the scene draws first loads first, side by side, while the
+        // program starts; the rest of the catalog streams in behind it.
+        let first = crate::scene_assets::read(&paths.assets, paths.scene_to_read()).unwrap_or_default();
+        if let Some(prefetch) = crate::scene_assets::warmed(&paths.assets) {
+            gpu.renderer.warm(prefetch);
+        }
+        gpu.renderer.preload_scene(&first.assets, first.samples);
         gpu.renderer.preload(&catalog);
         // Headless runs and recordings play the sound into the recording, not the speakers.
         let audio = if options.mute || options.headless || options.record.is_some() {
             None
         } else {
-            Audio::new(paths.assets.clone(), &catalog).map_err(|error| eprintln!("audio is off: {error:#}")).ok()
+            Audio::new(paths.assets.clone(), &catalog, &first.sounds, options.audio_buffer)
+                .map_err(|error| eprintln!("audio is off: {error:#}"))
+                .ok()
         };
         let fps = options.fps.or((options.headless || options.record.is_some()).then_some(60.0));
         let clock = match fps {
@@ -442,11 +547,25 @@ impl Session {
             )?),
             None => None,
         };
-        let mut capture = Capture { recorder, offscreen: options.headless, ..Capture::default() };
+        let mut capture =
+            Capture { recorder, offscreen: options.headless, audits: audit::Audits::from_env()?, ..Capture::default() };
         let mut input = Input::default();
         let mut preferences = Preferences::load(paths.preferences.clone());
+        if preferences.untouched() {
+            let adapter = gpu.device.adapter_info();
+            preferences.preset(crate::presets::first_run(&paths.assets, &adapter, options.headless));
+        }
         preferences.replay(&mut input);
         let mut services = crate::services::standard();
+        let actions = bindings::load(&paths.bindings);
+        services.register(Box::new(pen_runtime::actions::InputService(actions.clone())));
+        services.register(Box::new(preferences.service()));
+        if let Some(locale) = crate::services::locale::service(&paths.assets) {
+            services.register(Box::new(locale));
+        }
+        let captions = Captions::shared(load_captions(&paths.assets));
+        services.register(Box::new(CaptionsService(captions.clone())));
+        crate::saves::check_all([&paths.quicksave, &paths.scene].into_iter().filter(|path| paths.kept(path)));
         let dev = if options.dev { Some(Dev::new(&paths.game, &paths.assets)?) } else { None };
         let mut audio = audio;
         let runtime = {
@@ -459,6 +578,7 @@ impl Session {
                 services: &mut services,
                 capture: &mut capture,
                 overlay: None,
+                assets: &paths.assets,
             };
             GameRuntime::new(
                 &engine,
@@ -470,6 +590,7 @@ impl Session {
             )?
         };
         let mut runtime = runtime;
+        crate::startup::mark("game's first frame");
         let first = runtime.take_drawn();
         if let Some(frame) = &first
             && options.settle
@@ -481,8 +602,9 @@ impl Session {
         runtime.measure_frames(profile.is_some() || frame_times);
         let script = (!options.script.is_empty()).then(|| Script::new(options.script.clone()));
         let mut timeline = Timeline::default();
-        if options.dev || script::travels_back(&options.script) {
-            timeline.keep_history(Some(KEEP_SECONDS));
+        // A window keeps one for Ctrl+Shift+B's bug reports too.
+        if options.dev || script::travels_back(&options.script) || !options.headless {
+            timeline.keep_history(Some(history_seconds()));
         }
         Ok(Session {
             options,
@@ -493,7 +615,9 @@ impl Session {
             audio,
             input,
             preferences,
+            actions,
             services,
+            captions,
             clock,
             script,
             capture,
@@ -515,6 +639,14 @@ impl Session {
             timings: None,
             recording_input: None,
             final_overlay_shot: None,
+            mods: None,
+            #[cfg(feature = "devtools")]
+            packets: pen_runtime::inspect::Packets::default(),
+            #[cfg(feature = "devtools")]
+            sampling: None,
+            net: None,
+            stream: None,
+            watch: None,
         })
     }
 
@@ -522,7 +654,7 @@ impl Session {
     pub fn playback(&mut self, playback: Playback, window: Option<&Window>) -> Result<()> {
         self.overlap.enabled = playback.overlap;
         if playback.history || playback.replay.is_some() {
-            self.timeline.keep_history(Some(KEEP_SECONDS));
+            self.timeline.keep_history(Some(history_seconds()));
         }
         if let Some(path) = &playback.trace {
             if let Some(parent) = path.parent() {
@@ -551,6 +683,15 @@ impl Session {
             self.transport.replay(Replaying::File);
             eprintln!("replaying {frames} frames ({seconds:.1} s of game time) from {}", path.display());
         }
+        if let Some(spec) = &playback.net {
+            self.start_net(spec)?;
+        }
+        if let Some(address) = &playback.stream {
+            self.start_stream(address)?;
+        }
+        if let Some(address) = &playback.spectate {
+            self.start_watch(address, window)?;
+        }
         if let Some(path) = &playback.record_input {
             let moment = self.runtime.moment()?;
             self.input_recorder = Some(recording::Writer::create(path, self.timeline.position(), &moment)?);
@@ -562,6 +703,9 @@ impl Session {
     /// Stops the game where it is; the window keeps showing (and drawing)
     /// the last frame.
     pub fn pause(&mut self) {
+        if self.travel_refused() {
+            return;
+        }
         let was_playing = self.transport.pause();
         self.stopped(was_playing);
     }
@@ -590,6 +734,9 @@ impl Session {
     /// Runs `frames` frames and stays paused (pausing first if need be).
     /// Paused after a rewind, it runs the next recorded frames again.
     pub fn step_frames(&mut self, frames: u32) {
+        if self.travel_refused() {
+            return;
+        }
         let was_playing = self.transport.step(frames);
         self.stopped(was_playing);
     }
@@ -598,6 +745,9 @@ impl Session {
     /// moment before it and running the recorded frames again unseen.
     /// Takes effect on the next step.
     pub fn rewind_to(&mut self, frame: u64) {
+        if self.travel_refused() {
+            return;
+        }
         let was_playing = self.transport.rewind_to(frame);
         self.stopped(was_playing);
     }
@@ -606,6 +756,9 @@ impl Session {
     /// runs now (after a hot reload, the new one), then plays on live.
     /// Takes effect on the next step.
     pub fn replay_recent(&mut self, seconds: f64) {
+        if self.travel_refused() {
+            return;
+        }
         self.transport.replay_recent(seconds);
     }
 
@@ -636,6 +789,10 @@ impl Session {
         self.overlay = Some(overlay);
     }
 
+    pub fn set_mods(&mut self, mods: crate::mods::Mods) {
+        self.mods = Some(mods);
+    }
+
     /// A window event, for the overlay first: whether the game gets it too.
     pub fn overlay_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
         self.overlay.as_mut().is_none_or(|overlay| overlay.window_event(window, event))
@@ -654,6 +811,14 @@ impl Session {
     /// (`RenderFrame::ui`, see `accessibility`).
     pub fn interface(&self) -> &[UiNode] {
         self.last.as_ref().map_or(&[], |frame| &frame.ui)
+    }
+
+    /// The accessibility audit of the last frame read back for it (or of the
+    /// interface now, without its pixels), and the next frame read back.
+    #[cfg(feature = "devtools")]
+    pub fn audit(&mut self) -> Vec<pen_runtime::audit::Finding> {
+        let ui = self.interface().to_vec();
+        self.capture.audits.ask(&ui)
     }
 
     /// The overlay's interface for assistive technology, while it shows one.
@@ -680,6 +845,19 @@ impl Session {
         self.timings
     }
 
+    /// The captions of the sounds playing now, newest first, a line each;
+    /// none when the game's sounds carry none.
+    pub fn captions(&self) -> Option<String> {
+        let state = captions::lock(&self.captions);
+        (!state.captions.is_empty()).then(|| state.text())
+    }
+
+    /// The sound playing, unless the session is silent.
+    #[cfg(feature = "devtools")]
+    pub fn audio(&mut self) -> Option<&mut Audio> {
+        self.audio.as_mut()
+    }
+
     #[cfg(feature = "devtools")]
     /// The game's linear memory, in bytes.
     pub fn guest_memory(&self) -> usize {
@@ -702,7 +880,7 @@ impl Session {
     /// from the start.
     pub fn keep_history(&mut self) {
         if !self.timeline.history() {
-            self.timeline.keep_history(Some(KEEP_SECONDS));
+            self.timeline.keep_history(Some(history_seconds()));
         }
     }
 
@@ -724,6 +902,46 @@ impl Session {
     /// shows it (screenshots and recordings never have it).
     pub fn overlay_shot(&mut self, path: PathBuf) {
         self.capture.overlay_shots.push(path);
+    }
+
+    #[cfg(feature = "devtools")]
+    /// The last frames' packets, kept while the dev tools look at them.
+    pub fn packets(&mut self) -> &mut pen_runtime::inspect::Packets {
+        &mut self.packets
+    }
+
+    #[cfg(feature = "devtools")]
+    /// The state the history kept `seconds` of game time back, at the
+    /// latest moment by then, and the frame it was kept at.
+    pub fn kept_state(&self, seconds: f64) -> Option<(u64, SavedState)> {
+        let position = self.timeline.frames_before(self.timeline.position(), seconds);
+        self.timeline.moment_before(position).map(|(at, moment)| (at, moment.saved.clone()))
+    }
+
+    #[cfg(feature = "devtools")]
+    /// The profile the game's guest is sampled into from the next frame
+    /// on, and the engine it runs on (whose epoch a profile ticks).
+    pub fn profile(&mut self) -> (&mut Option<std::sync::Arc<blot_host::Profile>>, &wasmtime::Engine) {
+        (&mut self.sampling, &self.engine)
+    }
+
+    #[cfg(feature = "devtools")]
+    /// What the game's guest showed its probe: its memory and counters.
+    pub fn guest_seen(&self) -> blot_host::Seen {
+        self.runtime.program().probe().seen()
+    }
+
+    #[cfg(feature = "devtools")]
+    /// The game's catalog, for the dev tools to draw an entry from another
+    /// asset until the next build.
+    pub fn catalog_mut(&mut self) -> &mut Catalog {
+        self.runtime.catalog_mut()
+    }
+
+    #[cfg(feature = "devtools")]
+    /// The game's assets directory.
+    pub fn assets(&self) -> &Path {
+        &self.paths.assets
     }
 
     /// The same of the last frame (`--frames`), as `--screenshot` writes it.
@@ -815,6 +1033,28 @@ impl Session {
             Travel::Step(frames) => self.step_frames(frames),
             Travel::Rewind(frames) => self.rewind_to(self.target().saturating_sub(frames)),
             Travel::Replay(seconds) => self.replay_recent(seconds),
+        }
+    }
+
+    /// Writes a bug report (`bugreport`): the history, the state now and
+    /// the log, to `path`, or (empty) to `reports/` in the data directory.
+    fn bug_report(&mut self, path: PathBuf) {
+        let written = self.runtime.snapshot().and_then(|state| {
+            let capture = bugreport::Capture {
+                recording: self.timeline.recording(),
+                state,
+                game: &self.paths.game,
+                position: self.timeline.position(),
+            };
+            let data = self.paths.quicksave.parent().unwrap_or(Path::new("."));
+            bugreport::write(&capture, (!path.as_os_str().is_empty()).then_some(path), data)
+        });
+        match written {
+            Ok(path) => devlog::info(
+                Source::Session,
+                format!("bug report written to {} (`pen report FILE` says what it holds)", path.display()),
+            ),
+            Err(error) => devlog::error(Source::Session, format!("bug report: {error:#}")),
         }
     }
 
@@ -944,9 +1184,15 @@ impl Session {
     /// and restores where a replayed run was restored.
     fn plan(&mut self, window: Option<&Window>, tick: Tick) -> Result<Planned> {
         let shell = shell!(self, window);
+        if let Some(net) = &mut self.net {
+            net.play.prepare(&mut self.timeline);
+        }
         self.timeline.prepare(&mut self.runtime, &shell)?;
         self.frames += 1;
-        let last = (self.options.frames != 0 && self.frames >= self.options.frames) || tick.quit || self.script_over();
+        let last = (self.options.frames != 0 && self.frames >= self.options.frames)
+            || tick.quit
+            || self.script_over()
+            || self.watched_to_the_end();
         let viewport = Viewport { width: self.gpu.size.0, height: self.gpu.size.1 };
         let (input, replayed) = match self.timeline.next() {
             Some(recorded) => {
@@ -956,11 +1202,22 @@ impl Session {
                 planned
             }
             None => {
-                let frame = self.input.next_frame(self.clock.advance(), viewport);
-                (self.runtime.input(&frame)?, None)
+                let mut frame = self.input.next_frame(self.clock.advance(), viewport);
+                self.actions.borrow_mut().map(&mut frame.events);
+                let mut input = match &mut self.net {
+                    // Every player's input, as far as it is known.
+                    Some(net) => net.play.frame(self.timeline.position(), &frame.events, viewport)?,
+                    None => self.runtime.input(&frame)?,
+                };
+                if let Some(mods) = &mut self.mods {
+                    mods.frame(&mut input);
+                }
+                (input, None)
             }
         };
-        if window.is_some() && (self.clock.is_steady() || replayed.is_some()) {
+        // Headless on the AT-SPI bus, too: assistive technology keeps up.
+        let paced = window.is_some() || crate::accessibility::paces_headless();
+        if paced && (self.clock.is_steady() || replayed.is_some()) {
             self.pace(f64::from(input[0]));
         }
         let mut shots: Vec<PathBuf> =
@@ -968,7 +1225,8 @@ impl Session {
         if last && let Some(path) = &self.options.screenshot {
             shots.push(path.clone());
         }
-        let overlay_shots = self.final_overlay_shot.iter().filter(|_| last).cloned().collect();
+        let named = tick.overlay_shots.iter().map(|name| self.paths.shots.join(format!("{name}.png")));
+        let overlay_shots = named.chain(self.final_overlay_shot.iter().filter(|_| last).cloned()).collect();
         Ok(Planned {
             position: self.timeline.position(),
             input,
@@ -986,6 +1244,7 @@ impl Session {
     /// state, and the next frame is the player's.
     fn overlaps(&self, planned: &Planned, rendered: &RenderFrame) -> bool {
         self.overlap.enabled
+            && self.net.is_none()
             && !planned.stop
             && planned.replayed.is_none()
             && planned.saves.is_empty()
@@ -1017,10 +1276,18 @@ impl Session {
             recorder.frame(&recorded)?;
         }
         self.timeline.ran(recorded);
+        if let Some(net) = &mut self.net {
+            net.play.ran(self.runtime.packet_hash());
+        }
+        self.stream_final();
         Ok(())
     }
 
     fn reload(&mut self, window: Option<&Window>, module: GuestModule, catalog: Catalog) {
+        if self.net.is_some() {
+            devlog::error(Source::Reload, "net: the new build waits; the peers play the build they started with");
+            return;
+        }
         let mut shell = shell!(self, window);
         if self.runtime.reload(&mut shell, module, catalog) == ReloadResult::Activated {
             self.timeline.rebuilt();
@@ -1051,11 +1318,14 @@ impl Session {
                 Update::Build(module, catalog) => {
                     self.gpu.renderer.preload(&catalog);
                     if let Some(audio) = &mut self.audio {
-                        audio.preload(&catalog);
+                        audio.preload(&catalog, &[]);
                     }
                     self.build = Some((module, catalog));
                 }
                 Update::Assets(keys) => {
+                    if keys.iter().any(|key| key == "captions.json") {
+                        captions::lock(&self.captions).captions = load_captions(&self.paths.assets);
+                    }
                     self.gpu.renderer.reload(&keys);
                     if let Some(audio) = &mut self.audio {
                         audio.reload(&keys);
@@ -1072,6 +1342,9 @@ impl Session {
         let last = (self.options.frames != 0 && self.frames >= self.options.frames) || tick.quit || self.script_over();
         for name in &tick.shots {
             self.capture.screenshots.push(self.paths.shots.join(format!("{name}.png")));
+        }
+        for name in &tick.overlay_shots {
+            self.capture.overlay_shots.push(self.paths.shots.join(format!("{name}.png")));
         }
         if last && let Some(path) = &self.options.screenshot {
             self.capture.screenshots.push(path.clone());
@@ -1171,6 +1444,9 @@ impl Session {
             overlay.update(self, window);
             self.overlay = Some(overlay);
         }
+        // The guest running now (a rewind or reload starts another) is sampled while profiled.
+        #[cfg(feature = "devtools")]
+        self.runtime.program().probe().attach(self.sampling.clone());
         let started = Instant::now();
         self.poll_dev();
         for event in self.gpu.renderer.take_events() {
@@ -1188,7 +1464,9 @@ impl Session {
             }
             self.held.push(event);
         }
+        self.input.poll_gamepads();
         self.services.frame(&mut self.input);
+        bindings::keep(&self.actions, &self.paths.bindings);
         if self.live() {
             for event in self.held.drain(..) {
                 self.input.enqueue(event);
@@ -1203,14 +1481,27 @@ impl Session {
         let planned = match self.overlap.flight.take() {
             Some(planned) => planned,
             None => {
+                if !self.net_turn(window)? {
+                    return Ok(true);
+                }
+                if let Some(going) = self.watch_turn(window)? {
+                    return Ok(going);
+                }
                 // The guest is idle: what waited for it happens now.
                 if let Some((module, catalog)) = self.build.take() {
                     self.reload(window, module, catalog);
                 }
-                let tick = match self.overlap.early.take() {
+                let mut tick = match self.overlap.early.take() {
                     Some(tick) => tick,
                     None => self.tick(),
                 };
+                let mut reports = std::mem::take(&mut tick.reports);
+                if self.input.take_report() {
+                    reports.push(PathBuf::new());
+                }
+                for path in reports {
+                    self.bug_report(path);
+                }
                 if let Some(travel) = tick.travel {
                     self.travel(travel);
                 }
@@ -1247,6 +1538,8 @@ impl Session {
             Ok(rendered) => rendered,
             Err(error) => return self.reject_frame(window, planned, error),
         };
+        #[cfg(feature = "devtools")]
+        self.packets.ran(planned.position, &planned.input, self.runtime.packet_lanes(), &rendered);
         let overlapped = self.overlaps(&planned, &rendered);
         let mut planned = planned;
         if overlapped {
@@ -1278,6 +1571,10 @@ impl Session {
     ) -> Result<bool> {
         self.capture.screenshots.extend(planned.shots);
         self.capture.overlay_shots.extend(planned.overlay_shots);
+        // Tagged with the position that shows it, as the timeline counts.
+        if self.overlay.as_ref().is_some_and(|overlay| overlay.wants_picture(planned.position + 1)) {
+            self.capture.picture = Some(planned.position + 1);
+        }
         let submitting = Instant::now();
         let mut loads = Vec::new();
         let submit_ms;
@@ -1305,22 +1602,37 @@ impl Session {
                 }
                 None => {
                     let paths = &self.paths;
-                    if rendered.scene_save_requested {
-                        report(self.runtime.save_scene(&paths.scene), format!("saved scene {}", paths.scene.display()));
+                    let local = self.net.is_none();
+                    if !local && (rendered.scene_load_requested || rendered.load_requested || !planned.loads.is_empty())
+                    {
+                        devlog::error(
+                            Source::Session,
+                            "net: loads are off in a net session (they read this peer's files)",
+                        );
                     }
-                    if rendered.scene_load_requested {
+                    if rendered.scene_save_requested {
+                        let kept = paths.kept(&paths.scene);
+                        report(
+                            self.runtime.save_scene(&paths.scene, kept),
+                            format!("saved scene {}", paths.scene.display()),
+                        );
+                    }
+                    if rendered.scene_load_requested && local {
                         loads.extend(load_file(&mut self.runtime, &mut shell, paths.scene_to_read(), true));
                     }
                     if rendered.save_requested {
-                        report(self.runtime.save(&paths.quicksave), format!("saved {}", paths.quicksave.display()));
+                        report(
+                            self.runtime.save_kept(&paths.quicksave),
+                            format!("saved {}", paths.quicksave.display()),
+                        );
                     }
-                    if rendered.load_requested {
+                    if rendered.load_requested && local {
                         loads.extend(load_file(&mut self.runtime, &mut shell, &paths.quicksave, false));
                     }
                     for path in &planned.saves {
                         report(self.runtime.save(path), format!("saved {}", path.display()));
                     }
-                    for path in &planned.loads {
+                    for path in planned.loads.iter().filter(|_| local) {
                         loads.extend(load_file(&mut self.runtime, &mut shell, path, false));
                     }
                 }
@@ -1333,7 +1645,10 @@ impl Session {
         let shown = self.runtime.take_drawn().unwrap_or(rendered);
         self.show(shown);
         let mut stop = exit || planned.stop;
-        if self.transport.replaying().is_some() && self.timeline.next().is_none() {
+        if self.transport.replaying().is_some()
+            && self.timeline.next().is_none()
+            && self.watch.as_ref().is_none_or(crate::spectate::Watch::ended)
+        {
             stop |= self.replay_ended();
         }
         // Only while measured (a profile, or the dev tools' profiler).
@@ -1356,8 +1671,11 @@ impl Session {
     /// Stops the game and finishes any recording; the GPU, with its loaded
     /// assets, can start another session.
     pub fn finish(mut self) -> Result<Gpu> {
+        self.finish_net()?;
+        self.finish_stream();
         self.runtime.close();
         self.services.report();
+        bindings::keep(&self.actions, &self.paths.bindings);
         if let Some(recorder) = self.input_recorder.take() {
             recorder.finish()?;
         }
@@ -1373,6 +1691,9 @@ impl Session {
         Ok(self.gpu)
     }
 }
+
+mod net;
+mod spectate;
 
 #[cfg(all(test, feature = "compiler"))]
 mod recovery_tests;

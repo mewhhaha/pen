@@ -22,7 +22,9 @@ and what breaks it.
   accessibility layer, `ui=` script steps), assets ready or failed (these
   carry no key, only that one happened), and the answers to the game's
   service requests (ServiceAnswer and ServiceData: Steam, the clipboard,
-  the platform, pathfinding; see the README's "Services").
+  the platform, pathfinding, the simulation services; see the README's
+  "Services"), and in a net session the Player events that say whose the
+  events after them are ([netplay.md](netplay.md)).
 
 Nothing else reaches the game: no wall clock, no host randomness, and no
 file except the states a load reads (below).
@@ -73,6 +75,11 @@ loaded.
   world it replaced: after a load, undo or reload the game asks again, with
   the same ids, for what it still waits on (timed by its fixed steps, a
   second later).
+- **Services that keep nothing.** The simulation services (physics,
+  navmesh, spatial queries, noise) answer each request from what it
+  carries alone, so the same question has the same answer whenever it is
+  asked, live or after a restore, and on every host: native and the
+  browser compute the same bits (`pen_simulation::conformance`).
 - **Loads from the recording.** A recording keeps every state a frame loaded
   (a quicksave from F9 or `load=FILE`, the editor's scene from Ctrl+R), and a
   replay loads those rather than the files. A replay writes no saves.
@@ -153,7 +160,7 @@ though its rewinds would not.
 | `--record-input FILE` | Writes the session's moment at the start, then each frame's input, flags and loaded states (`.penrec`, see `crates/pen/src/recording.rs`). Frames are written as they run, and a rewind cuts the file back. |
 | `--replay FILE` | Restores the recording's moment and plays its frames in place of the player's input and clock. Headless, the run ends with the recording. In a window it pauses there, and Ctrl+Shift+P then plays on, live. The window or image takes the recording's size unless `--size` says otherwise. |
 | `--trace FILE` | One line per frame that runs: its number, then the FNV-1a hashes of its input and packet. Frames a rewind runs unseen are included, so the last line for each frame describes the final timeline. |
-| `--history` | Keeps the last 10 s (always on in `pen dev`, in replays, and in scripts that rewind or replay). |
+| `--history` | Keeps the last 30 s (always on in a window, in `pen dev`, in replays, and in scripts that rewind, replay or write a bug report). |
 | `--overlap` | Overlapped frames (below). |
 
 **Time travel**, in a window:
@@ -188,7 +195,7 @@ recording starts, as a replay of it is, so the replay gives the packets the
 session did, rewinds within it included.
 
 **Edit and replay.** In `pen dev`, pause when something goes wrong
-(Ctrl+Shift+P), so the moment stays in the 10 s history while you edit.
+(Ctrl+Shift+P), so the moment stays in the 30 s history while you edit.
 Save the Blot fix. When the reload is in, press Ctrl+Shift+R: the last 5 s
 of input play again on the new build, starting from the state before them,
 and then the game plays on live. Moments from before the reload are still

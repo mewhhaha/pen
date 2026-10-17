@@ -16,8 +16,17 @@
 //! node under the root as a subtree with ids of its own (`OVERLAY_TREE`), and
 //! has the focus while one of its widgets has the keyboard.
 //!
+//! When the game's sounds carry captions (`pen_runtime::captions`), the
+//! host adds a status node of its own after the game's, a polite live
+//! region whose value is the captions showing, newest first.
+//!
 //! PEN_A11Y_DUMP=FILE writes the tree as text to FILE (from the start of the
-//! run) whenever it changes, in a window or headless.
+//! run) whenever it changes, in a window or headless. PEN_A11Y_ATSPI=1 puts
+//! a headless run's tree on the AT-SPI bus, as a window's is (`platform`).
+mod platform;
+#[cfg(test)]
+mod snapshots;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs::File;
@@ -36,11 +45,15 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
 use crate::session::Session;
+use platform::Platform;
+pub use platform::bus_wanted as paces_headless;
 
 /// The root: the window.
 const ROOT: NodeId = NodeId(0);
 /// The dev tools' graft node, which their program's tree hangs from.
 const GRAFT: NodeId = NodeId(1);
+/// The captions' live region.
+const CAPTIONS: NodeId = NodeId(2);
 /// Game nodes' ids (1 to MAX_UI_ID) are offset by this, away from the
 /// host's own nodes.
 const GAME: u64 = 1 << 32;
@@ -70,6 +83,8 @@ struct Interface {
     /// The dev tools show (their tree hangs from the graft node), and
     /// whether one of its widgets has the keyboard.
     overlay: Option<bool>,
+    /// The captions showing, a line each, when the game's sounds have any.
+    captions: Option<String>,
 }
 
 fn game_node(id: u32) -> NodeId {
@@ -297,6 +312,16 @@ fn build(interface: &Interface, grafted: bool) -> TreeUpdate {
         }
         nodes.push((id, made));
     }
+    if let Some(captions) = &interface.captions {
+        root.push_child(CAPTIONS);
+        let mut node = Node::new(Role::Status);
+        node.set_label("Captions");
+        node.set_live(Live::Polite);
+        if !captions.is_empty() {
+            node.set_value(captions.as_str());
+        }
+        nodes.push((CAPTIONS, node));
+    }
     if let Some(focused) = interface.overlay {
         root.push_child(GRAFT);
         let mut graft = Node::new(Role::GenericContainer);
@@ -344,7 +369,7 @@ fn game_event(ui: &[UiNode], request: &ActionRequest) -> Option<GameEvent> {
 /// The dev tools program's interface as a tree of its own, as their
 /// subtree: its nodes under a group, the focus on its focused node.
 fn program_tree(ui: &[UiNode]) -> TreeUpdate {
-    let mut update = build(&Interface { ui: ui.to_vec(), scale: [1.0, 1.0], overlay: None }, false);
+    let mut update = build(&Interface { ui: ui.to_vec(), scale: [1.0, 1.0], overlay: None, captions: None }, false);
     if let Some((_, root)) = update.nodes.iter_mut().find(|(id, _)| *id == ROOT) {
         root.set_role(Role::Group);
         root.set_label("Dev tools");
@@ -394,6 +419,12 @@ fn describe(update: &TreeUpdate) -> String {
         stack.extend(node.children().iter().rev().map(|child| (*child, depth + 1)));
     }
     text
+}
+
+/// The tree of a game's interface alone, as text (`describe`).
+#[cfg(test)]
+fn describe_ui(ui: &[UiNode]) -> String {
+    describe(&tree(&Interface { ui: ui.to_vec(), scale: [1.0, 1.0], overlay: None, captions: None }))
 }
 
 fn line(text: &mut String, id: NodeId, node: &Node, depth: usize, focused: bool) {
@@ -624,8 +655,8 @@ impl Dump {
 /// The game's interface (and the dev tools') for assistive technology:
 /// the window's AccessKit adapter, and the PEN_A11Y_DUMP file.
 pub struct Accessibility {
-    /// None headless.
-    adapter: Option<accesskit_winit::Adapter>,
+    /// None headless, unless on the AT-SPI bus.
+    adapter: Option<Platform>,
     shared: Arc<Mutex<Shared>>,
     /// What the tree was last built from.
     current: Option<Arc<Interface>>,
@@ -652,25 +683,33 @@ impl Accessibility {
     pub fn windowed(event_loop: &ActiveEventLoop, window: &Window) -> Result<Accessibility> {
         let mut accessibility = Accessibility::new(Dump::from_env()?);
         let shared = &accessibility.shared;
-        accessibility.adapter = Some(accesskit_winit::Adapter::with_direct_handlers(
+        accessibility.adapter = Some(Platform::Window(accesskit_winit::Adapter::with_direct_handlers(
             event_loop,
             window,
             Activation(shared.clone()),
             Requests(shared.clone()),
             Deactivation,
-        ));
+        )));
         Ok(accessibility)
     }
 
-    /// Headless: only PEN_A11Y_DUMP's file, if asked for.
+    /// Headless: PEN_A11Y_DUMP's file and the AT-SPI bus (PEN_A11Y_ATSPI),
+    /// if asked for.
     pub fn headless() -> Result<Option<Accessibility>> {
-        Ok(Dump::from_env()?.map(|dump| Accessibility::new(Some(dump))))
+        let dump = Dump::from_env()?;
+        if dump.is_none() && !platform::bus_wanted() {
+            return Ok(None);
+        }
+        let mut accessibility = Accessibility::new(dump);
+        let shared = &accessibility.shared;
+        accessibility.adapter = platform::bus(Activation(shared.clone()), Requests(shared.clone()), Deactivation);
+        Ok(Some(accessibility))
     }
 
     /// Every window event, before anything else handles it.
     pub fn window_event(&mut self, window: &Window, event: &WindowEvent) {
         if let Some(adapter) = &mut self.adapter {
-            adapter.process_event(window, event);
+            adapter.window_event(window, event);
         }
     }
 
@@ -682,8 +721,7 @@ impl Accessibility {
         let previous = self.current.as_deref();
         let scale = match window.map(Window::inner_size) {
             Some(size) if size.width > 0 && size.height > 0 => {
-                let (width, height) = session.gpu.size;
-                [f64::from(size.width) / f64::from(width.max(1)), f64::from(size.height) / f64::from(height.max(1))]
+                pen_runtime::scale::frame_to_window((size.width, size.height), session.gpu.size)
             }
             // Minimized, the window shows nothing.
             Some(_) => previous.map_or([1.0, 1.0], |previous| previous.scale),
@@ -696,10 +734,12 @@ impl Accessibility {
             self.program = program.map(<[UiNode]>::to_vec);
         }
         let ui = session.interface();
-        let changed =
-            previous.is_none_or(|previous| previous.scale != scale || previous.overlay != overlay || previous.ui != ui);
+        let captions = session.captions();
+        let changed = previous.is_none_or(|previous| {
+            previous.scale != scale || previous.overlay != overlay || previous.ui != ui || previous.captions != captions
+        });
         if changed {
-            let interface = Arc::new(Interface { ui: ui.to_vec(), scale, overlay });
+            let interface = Arc::new(Interface { ui: ui.to_vec(), scale, overlay, captions });
             lock(&self.shared).latest = Some(interface.clone());
             if let Some(dump) = &mut self.dump {
                 dump.write(session.timeline().frame.saturating_sub(1), tree(&interface));
@@ -712,6 +752,9 @@ impl Accessibility {
             self.sent.stale |= shared.activated;
             std::mem::take(&mut shared.requests)
         };
+        if let (Some(adapter), None) = (&mut self.adapter, window) {
+            adapter.frame_size(session.gpu.size);
+        }
         if let (Some(adapter), Some(interface)) = (&mut self.adapter, &self.current) {
             let program = self.program.as_deref().map(|ui| (ui, program_changed));
             sync(&mut self.sent, &self.shared, interface, program, &mut |update| adapter.update_if_active(update));
@@ -746,7 +789,22 @@ mod tests {
     }
 
     fn interface(ui: Vec<UiNode>) -> Interface {
-        Interface { ui, scale: [1.0, 1.0], overlay: None }
+        Interface { ui, scale: [1.0, 1.0], overlay: None, captions: None }
+    }
+
+    /// With captions, the host's live region follows the game's nodes, its
+    /// value the captions showing.
+    #[test]
+    fn captions_are_a_live_region() {
+        let update = tree(&Interface { captions: Some("A till rings\nWind blows".into()), ..interface(menu()) });
+        assert_eq!(children(&update, ROOT).last(), Some(&CAPTIONS));
+        let captions = find(&update, CAPTIONS);
+        assert_eq!((captions.role(), captions.live()), (Role::Status, Some(Live::Polite)));
+        assert_eq!((captions.label(), captions.value()), (Some("Captions"), Some("A till rings\nWind blows")));
+        // None showing, it is there and says nothing; without captions, it is not.
+        let quiet = tree(&Interface { captions: Some(String::new()), ..interface(menu()) });
+        assert_eq!(find(&quiet, CAPTIONS).value(), None);
+        assert!(!children(&tree(&interface(menu())), ROOT).contains(&CAPTIONS));
     }
 
     fn find(update: &TreeUpdate, id: NodeId) -> &Node {

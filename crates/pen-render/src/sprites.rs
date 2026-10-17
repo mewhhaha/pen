@@ -10,12 +10,18 @@
 // where Sprite is { rect: vec4f, uv: vec4f, color: vec4f, parameters: vec4f }
 // (x, y, width, height in pixels from the top left; u0, v0, u1, v1; RGBA;
 // four values for the shader), and draws six vertices per instance, the
-// instance being the sprite's index. See src/assets/sprite.wgsl.
+// instance being the sprite's index. See src/assets/sprite.wgsl. A device
+// without storage buffers reads them from a uniform array a window of them
+// at a time instead (downlevel.rs).
 use std::collections::HashMap;
 
 use pen_protocol::Sprite;
 
+use crate::downlevel::{Window, array_binding, array_usage};
+
 const SPRITE_FLOATS: usize = 16;
+#[allow(clippy::cast_possible_truncation, reason = "16 floats")]
+const SPRITE_BYTES: u32 = SPRITE_FLOATS as u32 * 4;
 
 /// The bind group layout every sprite pipeline shares.
 pub(crate) fn sprite_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
@@ -36,11 +42,7 @@ pub(crate) fn sprite_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayou
             wgpu::BindGroupLayoutEntry {
                 binding: 1,
                 visibility: both,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
+                ty: array_binding(Window::of(device, SPRITE_BYTES)),
                 count: None,
             },
             wgpu::BindGroupLayoutEntry {
@@ -78,6 +80,8 @@ pub(crate) struct Sprites {
     layout: wgpu::BindGroupLayout,
     screen: wgpu::Buffer,
     sampler: wgpu::Sampler,
+    /// How the sprites are bound where there are no storage buffers.
+    window: Option<Window>,
     capacity: usize,
     storage: Option<wgpu::Buffer>,
     data: Vec<f32>,
@@ -107,6 +111,7 @@ impl Sprites {
                 address_mode_v: wgpu::AddressMode::Repeat,
                 ..Default::default()
             }),
+            window: Window::of(device, SPRITE_BYTES),
             capacity: 0,
             storage: None,
             data: Vec::new(),
@@ -128,6 +133,7 @@ impl Sprites {
         batches: &[SpriteBatch],
         sprites: &[Sprite],
         order: &[u32],
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         let count = order.len();
         if count == 0 {
@@ -142,10 +148,11 @@ impl Sprites {
             // The groups bind the storage buffer this replaces.
             self.groups.clear();
             self.capacity = count.next_power_of_two();
+            let room = self.window.map_or(self.capacity, |window| window.room(self.capacity));
             self.storage = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("sprites"),
-                size: (self.capacity * SPRITE_FLOATS * 4) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                size: (room * SPRITE_FLOATS * 4) as u64,
+                usage: array_usage(self.window),
                 mapped_at_creation: false,
             }));
         }
@@ -161,6 +168,7 @@ impl Sprites {
         queue.write_buffer(&self.screen, 0, bytemuck::cast_slice(&[size.0 as f32, size.1 as f32, 0.0, 0.0]));
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("sprites"),
+            timestamp_writes: timestamps,
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output,
                 depth_slice: None,
@@ -169,7 +177,7 @@ impl Sprites {
             })],
             ..Default::default()
         });
-        let draws = self.draws;
+        let (draws, window) = (self.draws, self.window);
         for batch in batches {
             pass.set_pipeline(&batch.pipeline);
             let (group, used) = self.groups.entry(batch.key.0).or_insert_with(|| {
@@ -178,7 +186,14 @@ impl Sprites {
                     layout: &self.layout,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: self.screen.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: storage.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &storage,
+                                offset: 0,
+                                size: window.and_then(|window| wgpu::BufferSize::new(window.bytes())),
+                            }),
+                        },
                         wgpu::BindGroupEntry {
                             binding: 2,
                             resource: wgpu::BindingResource::TextureView(&batch.texture),
@@ -189,8 +204,19 @@ impl Sprites {
                 (group, draws)
             });
             *used = draws;
-            pass.set_bind_group(0, &*group, &[]);
-            pass.draw(0..6, batch.first..batch.first + batch.count);
+            let instances = batch.first..batch.first + batch.count;
+            match window {
+                None => {
+                    pass.set_bind_group(0, &*group, &[]);
+                    pass.draw(0..6, instances);
+                }
+                Some(window) => {
+                    for (offset, instances) in window.draws(instances) {
+                        pass.set_bind_group(0, &*group, &[offset]);
+                        pass.draw(0..6, instances);
+                    }
+                }
+            }
         }
     }
 }

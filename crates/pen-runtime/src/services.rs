@@ -12,7 +12,9 @@
 //! (`pen_protocol::service`); a request for a code nobody registered is
 //! answered `unknown`, and one a service cannot do here `unavailable`. The
 //! answers both hosts give alike live here: grid pathfinding, what the game
-//! runs on ([`Platform`]) and which web addresses may be opened.
+//! runs on ([`Platform`]) and which web addresses may be opened; the
+//! simulation services (physics, navmesh, spatial queries and noise) are
+//! pen-simulation's.
 //!
 //! A service answers at once, or later: [`Service::call`] returns None and
 //! [`Service::poll`] hands the answer over when it is ready (a dialog
@@ -20,7 +22,9 @@
 //! the next live frame, and a restore (a load, undo, reload or time travel)
 //! drops those waiting: they were for the world it replaced.
 use pen_protocol::boundary::{MAX_SERVICE_DATA, whole};
-use pen_protocol::{GameEvent, ServiceRequest, pathfinding_op, platform_op, service, service_status};
+use pen_protocol::{
+    Catalog, GameEvent, RenderFrame, ServiceRequest, pathfinding_op, platform_op, service, service_status,
+};
 
 /// A request as a service sees it.
 pub struct Request<'a> {
@@ -123,6 +127,13 @@ pub trait Service<Input = ()> {
 
     /// Once a frame, before the game's.
     fn frame(&mut self, _input: &mut Input) {}
+
+    /// A frame the host shows (live or replayed), with the catalog it
+    /// names: what a service follows of what plays (captions).
+    fn rendered(&mut self, _frame: &RenderFrame, _catalog: &Catalog) {}
+
+    /// The game's world was replaced (a load, undo, reload or time travel).
+    fn restored(&mut self) {}
 }
 
 /// The services a host answers with, and the answers waiting for the next
@@ -146,16 +157,23 @@ impl<Input> Default for Services<Input> {
 fn describe(request: &ServiceRequest) -> String {
     let name = |names: &[&str], code: u32| names.get(code as usize).map_or(code.to_string(), |name| (*name).to_owned());
     let operations: &[&str] = match request.service {
+        service::CAPTIONS => &pen_protocol::captions_op::NAMES,
         service::STEAM => &pen_protocol::steam_op::NAMES,
         service::CLIPBOARD => &pen_protocol::clipboard_op::NAMES,
         service::URL => &pen_protocol::url_op::NAMES,
         service::PLATFORM => &pen_protocol::platform_op::NAMES,
         service::PATHFINDING => &pen_protocol::pathfinding_op::NAMES,
+        service::PHYSICS => &pen_protocol::physics_op::NAMES,
+        service::NAVMESH => &pen_protocol::navmesh_op::NAMES,
+        service::SPATIAL => &pen_protocol::spatial_op::NAMES,
+        service::NOISE => &pen_protocol::noise_op::NAMES,
         _ => &[],
     };
     let shown = if request.service == service::PATHFINDING {
         let blocked = request.values.iter().filter(|value| **value != 0.0).count();
         format!("{} cells, {blocked} blocked", request.values.len())
+    } else if matches!(request.service, service::PHYSICS | service::NAVMESH | service::SPATIAL | service::NOISE) {
+        format!("{} values", request.values.len())
     } else {
         let text = text(&request.values);
         let text =
@@ -239,6 +257,16 @@ impl<Input> Services<Input> {
     /// the answers for the one that asked are dropped.
     pub fn forget(&mut self) {
         self.answers.clear();
+        for registered in &mut self.services {
+            registered.restored();
+        }
+    }
+
+    /// A frame the host shows, for the services that follow what plays.
+    pub fn rendered(&mut self, frame: &RenderFrame, catalog: &Catalog) {
+        for registered in &mut self.services {
+            registered.rendered(frame, catalog);
+        }
     }
 
     /// How many requests a session answered, once it ends.

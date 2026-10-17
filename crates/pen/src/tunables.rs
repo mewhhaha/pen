@@ -7,6 +7,8 @@
 //! is the tunable's id, a hash of its name, and what the game holds is game
 //! state, in a saved section this reads back (`tuned_values`). Baking writes
 //! the game's values into the file as defaults, preserving its formatting.
+//! Presets are named sets of values in `src/tunable_presets.json`, which the
+//! dev tools save from the game and tune it to.
 // The player runtime (no `devtools`) only names tunables, for scripts.
 #![cfg_attr(not(feature = "devtools"), allow(dead_code))]
 use std::collections::HashMap;
@@ -190,20 +192,101 @@ pub fn bake(root: &Path, values: &[(String, f32)]) -> Result<String> {
     if changed.is_empty() {
         return Ok("nothing to bake: each value is its default already".into());
     }
+    replace_file(&path, &baked).with_context(|| format!("baking {}", path.display()))?;
+    Ok(changed.join("\n"))
+}
+
+/// Writes `contents` over the file at `path` in one rename, so a watcher
+/// never sees it half written.
+pub fn replace_file(path: &Path, contents: &str) -> Result<()> {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("file");
     let temporary = path.with_file_name(format!(
-        ".tunables.{}-{}.tmp",
+        ".{name}.{}-{}.tmp",
         std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
     ));
     let result = (|| {
-        std::fs::write(&temporary, baked)?;
-        std::fs::rename(&temporary, &path)
+        std::fs::write(&temporary, contents)?;
+        std::fs::rename(&temporary, path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
-    result.with_context(|| format!("baking {}", path.display()))?;
-    Ok(changed.join("\n"))
+    Ok(result?)
+}
+
+/// The checkout's presets file.
+pub fn presets_path(root: &Path) -> PathBuf {
+    root.join("src").join("tunable_presets.json")
+}
+
+/// A preset: tunable names and values.
+pub type Preset = std::collections::BTreeMap<String, f32>;
+
+const PRESETS_ABOUT: &str = "Named sets of live-tunable values (README, \"Tunables\"): the dev tools' Tunables \
+     panel saves the game's values as a preset (/preset save NAME) and tunes the game to one (/preset NAME). \
+     Each maps tunable names (src/tunables.json) to values.";
+
+/// The presets `text` holds, by name.
+pub fn parse_presets(text: &str) -> Result<std::collections::BTreeMap<String, Preset>, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct File {
+        #[serde(default)]
+        #[allow(dead_code, reason = "a word for whoever reads the file")]
+        about: String,
+        presets: std::collections::BTreeMap<String, Preset>,
+    }
+    serde_json::from_str::<File>(text)
+        .map(|file| file.presets)
+        .map_err(|error| format!("tunable_presets.json: {error}"))
+}
+
+/// The checkout's presets: none without the file, or why they do not load.
+pub fn load_presets(root: &Path) -> Result<std::collections::BTreeMap<String, Preset>, String> {
+    match std::fs::read_to_string(presets_path(root)) {
+        Ok(text) => parse_presets(&text),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(error) => Err(format!("{}: {error}", presets_path(root).display())),
+    }
+}
+
+/// Whether `name` will do as a preset's: a line of at most 64 characters.
+pub fn valid_preset_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.chars().count() <= 64 && !name.chars().any(char::is_control)
+}
+
+/// Saves `values` as preset `name` (replacing one so named), keeping the
+/// others.
+pub fn save_preset(root: &Path, name: &str, values: Preset) -> Result<()> {
+    if !valid_preset_name(name) {
+        bail!("a preset's name is a line of at most 64 characters");
+    }
+    #[derive(serde::Serialize)]
+    struct File<'a> {
+        about: &'a str,
+        presets: &'a std::collections::BTreeMap<String, Preset>,
+    }
+    let mut presets = load_presets(root).map_err(anyhow::Error::msg)?;
+    presets.insert(name.trim().to_owned(), values);
+    // Each value as its float32 writes it shortest.
+    let file = File { about: PRESETS_ABOUT, presets: &presets };
+    let path = presets_path(root);
+    replace_file(&path, &format!("{}\n", serde_json::to_string_pretty(&file)?))
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// What tuning the game to `preset` sends: each tunable's id and value,
+/// held in its range; a name `declared` lacks is refused.
+pub fn preset_tunes(declared: &[Declared], preset: &Preset) -> Result<Vec<(u32, f32)>, String> {
+    preset
+        .iter()
+        .map(|(name, value)| match declared.iter().find(|tunable| tunable.name == *name) {
+            Some(tunable) if value.is_finite() => Ok((tunable.id, value.clamp(tunable.min, tunable.max))),
+            Some(_) => Err(format!("{name}: {value} is not a number")),
+            None => Err(format!("no tunable {name}; src/tunables.json declares them")),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -261,6 +344,34 @@ mod tests {
         assert!(tuned_values(&state[..12]).is_empty());
         // As does one whose counts are past any state.
         assert!(tuned_values(&[5678.0, 26.0, 1e30, 11.0, 0.0, 0.0, 1e30, haul, 1.0]).is_empty());
+    }
+
+    #[test]
+    fn saves_presets_and_tunes_to_them() {
+        let root = std::env::temp_dir().join(format!("pen-presets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        assert!(load_presets(&root).unwrap().is_empty(), "no file, no presets");
+        let fast = Preset::from([("camera.zoom".to_owned(), 3.5), ("speed".to_owned(), 9.0)]);
+        save_preset(&root, "fast", fast.clone()).unwrap();
+        save_preset(&root, " slow ", Preset::from([("speed".to_owned(), 1.0)])).unwrap();
+        let presets = load_presets(&root).unwrap();
+        assert_eq!(presets.keys().collect::<Vec<_>>(), ["fast", "slow"]);
+        assert!(std::fs::read_to_string(presets_path(&root)).unwrap().contains("\"camera.zoom\": 3.5,"));
+        assert_eq!(presets["fast"], fast);
+        assert!(save_preset(&root, "", Preset::new()).is_err());
+        assert!(save_preset(&root, "two\nlines", Preset::new()).is_err());
+        let declared = parse(
+            r#"{ "tunables": [{ "name": "camera.zoom", "default": 1, "min": 0, "max": 4 },
+                { "name": "speed", "default": 2, "min": 0, "max": 8 }] }"#,
+        )
+        .unwrap();
+        let tunes = preset_tunes(&declared, &presets["fast"]).unwrap();
+        assert_eq!(tunes, [(tunable_id("camera.zoom"), 3.5), (tunable_id("speed"), 8.0)], "held in its range");
+        let stale = Preset::from([("gone".to_owned(), 1.0)]);
+        assert!(preset_tunes(&declared, &stale).unwrap_err().contains("no tunable gone"));
+        assert!(parse_presets(r#"{ "presets": {}, "extra": 1 }"#).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

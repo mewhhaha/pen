@@ -11,7 +11,7 @@ mod common;
 
 use common::*;
 use pen_protocol::*;
-use pen_render::{Renderer, RendererOptions};
+use pen_render::{Display, Renderer, RendererOptions};
 
 // Draws its triangle in its material's color, wherever the draw puts it.
 const SHADER: &str = r#"
@@ -87,7 +87,7 @@ fn draws_what_loads_and_reports_what_fails() {
     let mut renderer = Renderer::new(
         device.clone(),
         queue.clone(),
-        RendererOptions { format: FORMAT, assets: root, veil: Some(0.1), pipeline_cache: None },
+        RendererOptions { format: FORMAT, display: Display::SDR, assets: root, veil: Some(0.1), pipeline_cache: None },
     )
     .unwrap();
     renderer.preload(&catalog);
@@ -188,7 +188,7 @@ fn shared_renderers_load_their_own_assets() {
     let game = Renderer::new(
         device.clone(),
         queue.clone(),
-        RendererOptions { format: FORMAT, assets: assets(), veil: None, pipeline_cache: None },
+        RendererOptions { format: FORMAT, display: Display::SDR, assets: assets(), veil: None, pipeline_cache: None },
     )
     .unwrap();
     let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pen-render-shared-{}", std::process::id()));

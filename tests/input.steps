@@ -1,0 +1,16 @@
+# Input from the devices a keyboard and mouse leave out, for recording and
+# replaying (docs/input.md): into play, a gamepad plugged in (its south
+# button, a trigger half pressed, the left stick past and back inside its
+# dead zone), the rock struck twice with a touch (the first touch drives the
+# pointer, so it strikes as a click does), two touches spreading (a pan and
+# a pinch), an input method's composition and commit, typed text, the locked
+# mouse's motion, and the pad pulled out. With a bindings.json in the data
+# directory declaring actions (jump on space or the south button, move.x on
+# the left stick), the session maps them to Action events too.
+wait=30 key=Tab wait=40
+pad=connect wait=2 pad=south wait=2 pad=south,0 pad=right_trigger,0.5 wait=2 pad=right_trigger,0
+pad=left_x,0.9 wait=5 pad=left_x,0.1 wait=5
+touch=1,470,150 lift=1 wait=20 touch=1,470,152 lift=1 wait=20
+touch=1,300,400 touch=2,500,400 touch=1,260,400 touch=2,540,400 touch=1,240,420 touch=2,560,420 lift=1 lift=2 wait=10
+compose=かん,1 compose=かんじ commit=漢字 wait=2 type=gnorp key=Space wait=2
+motion=12,-4 motion=3,1 wait=2 pad=disconnect wait=30

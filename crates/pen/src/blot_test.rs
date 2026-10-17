@@ -18,7 +18,10 @@
 //!   compiler's diagnostics contain the text the plugin gives.
 //!
 //! Up to `--jobs` modules compile at once, each running its tests once
-//! compiled, and the modules print in order.
+//! compiled, and the modules print in order. Up to `--jobs` tests run at
+//! once too, over all the modules, a module's own in parallel: gdev's codec
+//! module is many tests of minutes each, nearly all of it in the guest
+//! runtime's cycle collector (docs/testing.md, "Blot tests' speed").
 //!
 //! The tests take no capability, so nothing a test runs calls the host.
 //! Should a module also export a function that takes one (`main(host)`),
@@ -27,7 +30,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -46,6 +49,9 @@ pub struct Options {
     /// How many modules compile at once; about half the cores, at most 8,
     /// when None.
     pub jobs: Option<usize>,
+    /// How long one test may run before it fails as stuck; [`TEST_DEADLINE`]
+    /// when None.
+    pub deadline: Option<Duration>,
 }
 
 /// What a module's tests must do.
@@ -96,10 +102,15 @@ impl Module {
     }
 }
 
+/// How long a test runs before its line says how long it took.
+const SLOW_TEST: Duration = Duration::from_secs(1);
+
 /// How long one test may run before it fails as stuck: a test plays many
 /// frames without calling the host, so far past a game's
-/// [`blot_host::DEADLINE`].
-const TEST_DEADLINE: Duration = Duration::from_secs(120);
+/// [`blot_host::DEADLINE`]. gdev's codec tests take minutes each (their
+/// world's cycle collection), more on a busy machine, and the deadline counts
+/// the time they wait for a core; `--deadline` sets another.
+const TEST_DEADLINE: Duration = Duration::from_secs(600);
 
 /// Runs the modules, up to `jobs` compiling at once, and prints each one's
 /// tests' outcomes in order; fails when a module does not compile (or one
@@ -122,6 +133,8 @@ pub fn run(checkout: &Path, options: Options) -> Result<()> {
         .map(|test| Module::new(checkout, test))
         .collect();
     ensure!(!modules.is_empty() || filter.is_some(), "{} has no test modules", checkout.display());
+    // As many tests run at once as modules compile, however few the modules.
+    let slots = Slots::new(jobs).deadline(options.deadline.unwrap_or(TEST_DEADLINE));
     let jobs = jobs.min(modules.len()).max(1);
     // The modules share much of their code; the development engine
     // compiles each function it has seen only once.
@@ -133,7 +146,7 @@ pub fn run(checkout: &Path, options: Options) -> Result<()> {
         &modules,
         jobs,
         || None,
-        |session, module| run_module(session, &plugins, &engine, module, filter),
+        |session, module| run_module(session, &plugins, &engine, module, filter, &slots),
         |module, ran| {
             eprintln!("{}", module_lines(module, &ran, filter).join("\n"));
             let tally = &mut tallies[module.kind as usize];
@@ -271,6 +284,7 @@ fn run_module(
     engine: &Engine,
     module: &Module,
     filter: Option<&str>,
+    slots: &Slots,
 ) -> Ran {
     let entry = Path::new(&module.test.entry);
     if session.as_ref().is_none_or(|builder| builder.entry() != entry) {
@@ -286,7 +300,7 @@ fn run_module(
     let tests = match &module.test.expect {
         Expectation::Rejected(rejects) => Ok(rejection(rejects, compiled)),
         Expectation::Checks | Expectation::Traps => {
-            compiled.and_then(|wasm| run_tests(engine, &wasm, module.kind, &module.test.prefix, filter))
+            compiled.and_then(|wasm| run_tests(engine, &wasm, module.kind, &module.test.prefix, filter, slots))
         }
     };
     Ran { tests, build }
@@ -308,7 +322,17 @@ fn module_lines(module: &Module, ran: &Ran, filter: Option<&str>) -> Vec<String>
         let prefix = &module.test.prefix;
         lines.push(format!("  no {prefix}… entries{}", if filter.is_some() { " match" } else { "" }));
     }
-    lines.extend(tests.tests.iter().flat_map(|(name, outcome)| describe(name, outcome)));
+    for ((name, outcome), timing) in tests.tests.iter().zip(&tests.times) {
+        let mut described = describe(name, outcome);
+        // A test that takes a second or more says how long, and how often
+        // the guest runtime collected cycles meanwhile.
+        if timing.took >= SLOW_TEST {
+            let collections =
+                timing.cycle_passes.map(|passes| format!("; {passes} cycle collections")).unwrap_or_default();
+            described[0].push_str(&format!(" ({:.1} s{collections})", timing.took.as_secs_f64()));
+        }
+        lines.extend(described);
+    }
     let passed = tests.tests.iter().filter(|(_, outcome)| outcome.passed()).count();
     let build = format!("build {:.1} s", ran.build.as_secs_f64());
     let times = match module.kind {
@@ -380,6 +404,8 @@ struct Tests {
     /// The exports named as tests that are not Unit to Array F32, and what
     /// they are.
     skipped: Vec<String>,
+    /// How long each test ran, in the same order.
+    times: Vec<Timing>,
     /// Compiling the Wasm, and running the tests.
     compile: Duration,
     run: Duration,
@@ -435,32 +461,73 @@ fn rejection(rejects: &str, compiled: Result<Vec<u8>>) -> Tests {
     Tests {
         tests: vec![(rejects.to_owned(), outcome)],
         skipped: Vec::new(),
+        times: vec![Timing::default()],
         compile: Duration::ZERO,
         run: Duration::ZERO,
     }
 }
 
-/// Compiles `wasm` and runs its tests, the entries named with `prefix`,
-/// whose names contain `filter`, each in an instance of its own, on a
-/// thread with the stack a guest needs; each must do what `kind` says.
-fn run_tests(engine: &Engine, wasm: &[u8], kind: Kind, prefix: &str, filter: Option<&str>) -> Result<Tests> {
-    std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .name("pen-test".into())
-            .stack_size(blot_host::GUEST_STACK_BYTES + (8 << 20))
-            .spawn_scoped(scope, || run_tests_here(engine, wasm, kind, prefix, filter))?
-            .join()
-            .map_err(|_| anyhow!("the test thread panicked"))?
-    })
+/// Tests running at once, over every module, and how long each may: each
+/// holds a slot while it runs, so a module of many slow tests spreads over
+/// the cores (gdev's codec tests each build a world of 10,000 gnorps) without
+/// the modules' workers multiplying them.
+pub struct Slots {
+    count: usize,
+    free: Mutex<usize>,
+    freed: Condvar,
+    deadline: Duration,
 }
 
-fn run_tests_here(engine: &Engine, wasm: &[u8], kind: Kind, prefix: &str, filter: Option<&str>) -> Result<Tests> {
+impl Slots {
+    pub fn new(count: usize) -> Slots {
+        let count = count.max(1);
+        Slots { count, free: Mutex::new(count), freed: Condvar::new(), deadline: TEST_DEADLINE }
+    }
+
+    /// Each test may run this long before it fails as stuck.
+    pub fn deadline(self, deadline: Duration) -> Slots {
+        Slots { deadline, ..self }
+    }
+
+    /// Runs `work` once a slot is free.
+    fn hold<T>(&self, work: impl FnOnce() -> T) -> T {
+        /// Gives the slot back, however `work` ends.
+        struct Held<'a>(&'a Slots);
+        impl Drop for Held<'_> {
+            fn drop(&mut self) {
+                *self.0.free.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+                self.0.freed.notify_one();
+            }
+        }
+        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap_or_else(PoisonError::into_inner);
+        }
+        *free -= 1;
+        drop(free);
+        let _held = Held(self);
+        work()
+    }
+}
+
+/// Compiles `wasm` and runs its tests, the entries named with `prefix`,
+/// whose names contain `filter`, each in an instance of its own, on a
+/// thread with the stack a guest needs, as many at once as `slots` lets;
+/// each must do what `kind` says.
+fn run_tests(
+    engine: &Engine,
+    wasm: &[u8],
+    kind: Kind,
+    prefix: &str,
+    filter: Option<&str>,
+    slots: &Slots,
+) -> Result<Tests> {
     let started = Instant::now();
     let module = GuestModule::new(engine, wasm, None)?;
     let compile = started.elapsed();
     let started = Instant::now();
-    let mut tests = Vec::new();
     let mut skipped = Vec::new();
+    let mut runnable = Vec::new();
     let entries = module.abi().functions.iter().filter(|function| {
         function.name.starts_with(prefix) && filter.is_none_or(|filter| function.name.contains(filter))
     });
@@ -469,17 +536,70 @@ fn run_tests_here(engine: &Engine, wasm: &[u8], kind: Kind, prefix: &str, filter
             skipped.push(format!("{}: it is {}, not Unit -> Array F32", function.name, signature(function)));
             continue;
         }
-        let called = Guest::new(engine, &module).and_then(|mut guest| {
-            guest.set_deadline(TEST_DEADLINE);
-            guest.call(&function.name, Value::Unit)
-        });
-        let outcome = match kind {
-            Kind::Traps => trapped(called),
-            Kind::Checks | Kind::Rejected => reported(called),
-        };
-        tests.push((function.name.clone(), outcome));
+        runnable.push(function.name.clone());
     }
-    Ok(Tests { tests, skipped, compile, run: started.elapsed() })
+    let next = AtomicUsize::new(0);
+    let ran: Mutex<Vec<Option<(Outcome, Timing)>>> = Mutex::new(runnable.iter().map(|_| None).collect());
+    std::thread::scope(|scope| -> Result<()> {
+        let workers = (0..slots.count.min(runnable.len()))
+            .map(|_| {
+                std::thread::Builder::new()
+                    .name("pen-test".into())
+                    .stack_size(blot_host::GUEST_STACK_BYTES + (8 << 20))
+                    .spawn_scoped(scope, || {
+                        loop {
+                            let index = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(name) = runnable.get(index) else { break };
+                            let outcome = slots.hold(|| run_test(engine, &module, kind, name, slots.deadline));
+                            ran.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(outcome);
+                        }
+                    })
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        for worker in workers {
+            worker.join().map_err(|_| anyhow!("a test thread panicked"))?;
+        }
+        Ok(())
+    })?;
+    let ran = ran.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let (tests, times) = runnable
+        .into_iter()
+        .zip(ran)
+        .map(|(name, ran)| {
+            let (outcome, time) = ran.expect("every test ran");
+            ((name, outcome), time)
+        })
+        .unzip();
+    Ok(Tests { tests, skipped, times, compile, run: started.elapsed() })
+}
+
+/// How long a test ran, and how many passes the guest runtime's cycle
+/// collector made meanwhile (when its guest counts them).
+#[derive(Clone, Copy, Debug, Default)]
+struct Timing {
+    took: Duration,
+    cycle_passes: Option<u32>,
+}
+
+/// Runs the test `name` in an instance of its own: its outcome, and how
+/// long it took.
+fn run_test(engine: &Engine, module: &GuestModule, kind: Kind, name: &str, deadline: Duration) -> (Outcome, Timing) {
+    let running = Instant::now();
+    let mut cycle_passes = None;
+    let called = Guest::new(engine, module).and_then(|mut guest| {
+        guest.set_deadline(deadline);
+        let called = guest.call(name, Value::Unit);
+        cycle_passes = guest
+            .runtime_counters()
+            .into_iter()
+            .find_map(|(counter, value)| (counter == "blot:cycle_passes").then_some(value));
+        called
+    });
+    let outcome = match kind {
+        Kind::Traps => trapped(called),
+        Kind::Checks | Kind::Rejected => reported(called),
+    };
+    (outcome, Timing { took: running.elapsed(), cycle_passes })
 }
 
 /// A test's outcome by the report it returned.

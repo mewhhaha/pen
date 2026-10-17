@@ -1,0 +1,19 @@
+{
+  "size": [480, 320],
+  "fps": 60,
+  "threshold": 0.01,
+  "scenarios": {
+    "start": {
+      "about": "the ball at rest in the middle of the yard",
+      "script": "wait=10 shot=start"
+    },
+    "rolled": {
+      "about": "the right arrow held for 45 frames, then let go",
+      "script": "down=ArrowRight wait=45 up=ArrowRight wait=15 shot=rolled"
+    },
+    "kicked": {
+      "about": "a Kick (the game's own event) sends it off three walls, a marker for each",
+      "script": "wait=5 game=Kick,9,4 wait=100 shot=kicked"
+    }
+  }
+}

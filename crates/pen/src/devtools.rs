@@ -22,7 +22,16 @@
 //! with its state carried over; its state is kept in the checkout's
 //! `.pen/devtools.state` between windowed sessions. A checkout without the
 //! program runs without dev tools.
-use std::collections::VecDeque;
+//!
+//! The host draws pictures of the game's frames and previews of its assets
+//! into an atlas texture of the dev tools' (`pictures`), samples the game's
+//! guest for their profiler and reads its memory and ownership counters
+//! (`blot_host::Probe`), keeps its packets and states for their inspectors
+//! (`pen_runtime::inspect`), and edits tunable presets and materials in the
+//! checkout for them (`tunables`, `materials`).
+mod pictures;
+
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,10 +40,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use blot_host::GuestModule;
-use pen_protocol::{Catalog, Frame, GameEvent, RenderFrame, UiNode, Viewport, service};
+use pen_protocol::{Catalog, Frame, GameEvent, RenderFrame, UiNode, Viewport, devtools_asset, service};
 use pen_runtime::devtools::{
     self as tools, FrameReport, LogLine, Routing, TimelineStatus, button_bit, inside_dialog, log_answer,
 };
+use pen_runtime::inspect::{self, Packets};
+use pen_runtime::mix::AudioReport;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
@@ -45,7 +56,7 @@ use crate::game::{GameRuntime, Host};
 use crate::services::Answer;
 use crate::session::{Gpu, Overlay, Session};
 use crate::snapshot::{self, SavedState};
-use crate::tunables;
+use crate::{materials, tunables};
 
 /// The program's build, beside the game's.
 pub const PROGRAM: &str = "devtools.wasm";
@@ -66,6 +77,8 @@ pub struct Settings {
     pub open: bool,
     /// Keep the program's state for the next session (windowed runs).
     pub keep: bool,
+    /// Answer remote dev tools here too (`--devtools-listen`).
+    pub listen: Option<String>,
 }
 
 /// Whether to show the console from the start: `--overlay`, or PEN_OVERLAY
@@ -138,6 +151,12 @@ pub struct Devtools {
     /// Headless: a shot waits for its sprites' assets, since nothing else
     /// draws them before.
     headless: bool,
+    /// Pictures of the game's frames and previews of its assets.
+    atlas: pictures::Atlas,
+    /// The catalog entries a swap draws from another asset: their own keys.
+    swapped: HashMap<(u32, u32), String>,
+    /// Remote dev tools it answers too (`crate::remote`).
+    remote: Option<crate::remote::Remote>,
 }
 
 /// The date and time `since` the Unix epoch, in UTC, as a file name sorts
@@ -273,6 +292,9 @@ impl Devtools {
             baking: None,
             trouble: None,
             headless: window.is_none(),
+            atlas: pictures::Atlas::new(gpu.format),
+            swapped: HashMap::new(),
+            remote: settings.listen.as_deref().map(crate::remote::Remote::listen).transpose()?,
         };
         if settings.open {
             devtools.typed.push_back(tap("`").to_vec());
@@ -382,20 +404,26 @@ impl Devtools {
                 return;
             }
         };
+        let mut reloads = Vec::new();
+        let mut host = Answering {
+            session: &mut *session,
+            adapter: &self.adapter,
+            project: &self.project,
+            baking: &mut self.baking,
+            atlas: &mut self.atlas,
+            swapped: &mut self.swapped,
+            reloads: &mut reloads,
+        };
         for request in &rendered.services {
             let answer = if request.service == service::DEVTOOLS {
-                let mut host = Answering {
-                    session: &mut *session,
-                    adapter: &self.adapter,
-                    project: &self.project,
-                    baking: &mut self.baking,
-                };
                 pollster::block_on(self.service.answer(request, &mut host, interval))
             } else {
                 Answer::unknown()
             };
             self.answers.extend(answer.events(request.request));
         }
+        pollster::block_on(self.service.follow(&mut host));
+        self.reloaded(&reloads);
         // Keys held when it took the keyboard would never come up for the
         // game: it lets go of them, as when the window loses focus.
         if self.routing.laid_out(&rendered.ui) {
@@ -406,6 +434,39 @@ impl Devtools {
             self.trouble(format!("devtools: its sprites do not draw: {error:#}"));
         }
         self.frame = Some(rendered);
+    }
+
+    /// Asset files edited for the dev tools: their renderer loads them again,
+    /// and a material's previews are drawn again from its new file.
+    fn reloaded(&mut self, reloads: &[String]) {
+        if reloads.is_empty() {
+            return;
+        }
+        self.renderer.reload(reloads);
+        for key in reloads {
+            if let Some(index) = self.catalog.materials.iter().position(|material| material == key) {
+                self.atlas.changed(u32::try_from(index).unwrap_or(u32::MAX));
+            }
+        }
+    }
+
+    /// Answers the remote dev tools' requests since the last frame, as its
+    /// own program's are, and looks at each one's watch.
+    fn serve_remote(&mut self, session: &mut Session) {
+        let Some(remote) = &mut self.remote else { return };
+        let mut reloads = Vec::new();
+        let mut host = Answering {
+            session,
+            adapter: &self.adapter,
+            project: &self.project,
+            baking: &mut self.baking,
+            atlas: &mut self.atlas,
+            swapped: &mut self.swapped,
+            reloads: &mut reloads,
+        };
+        remote.serve(|service, request, interval| pollster::block_on(service.answer(request, &mut host, interval)));
+        remote.follow(|service| pollster::block_on(service.follow(&mut host)));
+        self.reloaded(&reloads);
     }
 
     /// A window event as the program reads it: every key (repeats too), the
@@ -455,12 +516,16 @@ impl Devtools {
 
 /// The session as the dev tools service's host: what it reports, and what
 /// it does for them, with the dev tools' own part (the adapter's name, the
-/// checkout files are named in, a bake under way).
+/// checkout files are named in, a bake under way, their atlas, the entries
+/// swapped and the asset files edited, for their renderer to reload).
 struct Answering<'a> {
     session: &'a mut Session,
     adapter: &'a str,
     project: &'a Path,
     baking: &'a mut Option<Receiver<Result<String, String>>>,
+    atlas: &'a mut pictures::Atlas,
+    swapped: &'a mut HashMap<(u32, u32), String>,
+    reloads: &'a mut Vec<String>,
 }
 
 impl Answering<'_> {
@@ -469,6 +534,72 @@ impl Answering<'_> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
         new_file(&self.project.join(".pen").join(directory), extension, now)
     }
+
+    /// Writes the game's tuned values (or only tunable `only`'s) into the
+    /// checkout as the defaults, on a thread of its own (Rust number-token
+    /// edits); the log says how it went.
+    fn start_bake(&mut self, only: Option<u32>) -> Answer {
+        if self.baking.is_some() {
+            return Answer::unavailable();
+        }
+        let declared = match tunables::load(self.project) {
+            Ok(declared) => declared,
+            Err(problem) => {
+                devlog::error(Source::Session, format!("bake: {problem}"));
+                return Answer::failed();
+            }
+        };
+        let Some(saved) = self.session.snapshot() else { return Answer::unavailable() };
+        let tuned = tunables::tuned_values(&saved.state);
+        let values: Vec<(String, f32)> = declared
+            .iter()
+            .filter(|tunable| tuned.contains_key(&tunable.id) && only.is_none_or(|id| id == tunable.id))
+            .map(|tunable| (tunable.name.clone(), tunable.live(&tuned)))
+            .collect();
+        if values.is_empty() {
+            devlog::info(Source::Session, "bake: nothing to bake; each value is its default");
+            return Answer::ok(0.0);
+        }
+        let (sender, receiver) = channel();
+        let root = self.project.to_owned();
+        let spawned = std::thread::Builder::new().name("pen-bake".into()).spawn(move || {
+            let _ = sender.send(tunables::bake(&root, &values).map_err(|error| format!("{error:#}")));
+        });
+        match spawned {
+            Ok(_) => {
+                *self.baking = Some(receiver);
+                Answer::ok(0.0)
+            }
+            Err(error) => {
+                devlog::error(Source::Session, format!("bake: {error}"));
+                Answer::failed()
+            }
+        }
+    }
+
+    /// The game's catalog entries of DevtoolsAsset `kind`.
+    fn entries(&mut self, kind: u32) -> Option<&mut Vec<String>> {
+        let catalog = self.session.catalog_mut();
+        match kind {
+            devtools_asset::MESH => Some(&mut catalog.meshes),
+            devtools_asset::MATERIAL => Some(&mut catalog.materials),
+            devtools_asset::SOUND => Some(&mut catalog.sounds),
+            _ => None,
+        }
+    }
+
+    /// Material `index`'s key and file in the game's assets.
+    fn material_file(&mut self, index: u32) -> Option<(String, PathBuf)> {
+        let key = self.session.catalog_mut().materials.get(index as usize)?.clone();
+        let path = self.session.assets().join(&key);
+        Some((key, path))
+    }
+}
+
+/// A failure the log tells of, answered as failed.
+fn failed(what: &str, problem: impl std::fmt::Display) -> Answer {
+    devlog::error(Source::Session, format!("{what}: {problem}"));
+    Answer::failed()
 }
 
 impl tools::Host for Answering<'_> {
@@ -504,11 +635,17 @@ impl tools::Host for Answering<'_> {
             memory: session.guest_memory(),
             size: session.gpu.size,
             recording: session.input_recording().map(|(_, from)| from),
+            culled: stats.culled,
+            shadow_culled: stats.shadow_culled,
+            triangles: stats.triangles,
+            scale: stats.scale,
+            gpu: stats.gpu.map(|gpu| [gpu.shadow, gpu.culling, gpu.scene, gpu.post, gpu.overlay, gpu.total]),
         }
     }
 
     fn measure_frames(&mut self, enabled: bool) {
         self.session.measure_frames(enabled);
+        self.session.gpu.renderer.time_passes(enabled);
     }
 
     fn gpu(&self) -> String {
@@ -552,6 +689,10 @@ impl tools::Host for Answering<'_> {
         Answer::ok(0.0)
     }
 
+    fn audit(&mut self) -> Answer {
+        pen_runtime::audit::answer(&self.session.audit())
+    }
+
     fn shot(&mut self, path: Option<String>) -> Answer {
         let path = path.map_or_else(|| self.new_file("shots", "png"), PathBuf::from);
         devlog::info(Source::Session, format!("a shot with the dev tools to {}", path.display()));
@@ -559,49 +700,185 @@ impl tools::Host for Answering<'_> {
         Answer::ok(0.0)
     }
 
+    fn audio(&mut self) -> Option<AudioReport> {
+        self.session.audio().map(crate::audio::Audio::report)
+    }
+
+    fn monitor(&mut self, bus: usize, mute: bool, on: bool) -> bool {
+        self.session.audio().map(|audio| audio.monitor(bus, mute, on)).is_some()
+    }
+
     async fn snapshot(&mut self) -> Option<SavedState> {
         self.session.snapshot()
     }
 
-    /// Writes the game's tuned values into the checkout as the defaults, on
-    /// a thread of its own (Rust number-token edits); the log says how it went.
     async fn bake(&mut self) -> Answer {
-        if self.baking.is_some() {
+        self.start_bake(None)
+    }
+
+    async fn bake_one(&mut self, id: u32) -> Answer {
+        self.start_bake(Some(id))
+    }
+
+    fn say(&mut self, line: &str) {
+        devlog::info(Source::Session, line);
+    }
+
+    fn packets(&mut self) -> Option<&mut Packets> {
+        Some(self.session.packets())
+    }
+
+    fn kept_state(&self, seconds: f64) -> Option<(u64, SavedState)> {
+        self.session.kept_state(seconds)
+    }
+
+    fn pictures(&mut self, taking: bool, atlas: Option<u32>) -> Answer {
+        self.atlas.pictures(atlas, taking)
+    }
+
+    /// Samples the game's guest at about a millisecond of its running time;
+    /// only the development engine's guests can be (`pen dev`).
+    fn profile(&mut self, operation: u32) -> Answer {
+        let (profile, engine) = self.session.profile();
+        if !blot_host::samples(engine) {
             return Answer::unavailable();
         }
+        match operation {
+            1 => {
+                let started = profile.get_or_insert_with(blot_host::Profile::new).start(engine);
+                if let Err(error) = started {
+                    return failed("profile", error);
+                }
+            }
+            0 => profile.iter().for_each(|profile| profile.stop()),
+            2 => profile.iter().for_each(|profile| profile.clear()),
+            _ => {}
+        }
+        let (samples, sampling) =
+            profile.as_ref().map_or((0, false), |profile| (profile.samples(), profile.sampling()));
+        Answer { values: vec![samples as f32, f32::from(u8::from(sampling))], ..Answer::ok(samples as f32) }
+    }
+
+    fn flame(&mut self) -> Answer {
+        let (profile, _) = self.session.profile();
+        let Some(profile) = profile.clone() else { return Answer::ok(0.0) };
+        let stacks = profile.stacks();
+        inspect::flame(stacks.iter().map(|(stack, samples)| (stack.as_slice(), *samples)), |index| profile.name(index))
+    }
+
+    fn memory(&mut self) -> Answer {
+        let seen = self.session.guest_seen();
+        let mut counters = seen.counters.clone();
+        counters.extend([
+            ("calls to the host".to_owned(), seen.callbacks),
+            ("calls into the guest".to_owned(), seen.calls),
+            ("calls that failed".to_owned(), seen.failed),
+        ]);
+        inspect::memory_answer(seen.memory, seen.peak, &counters)
+    }
+
+    fn presets(&mut self) -> Answer {
+        match tunables::load_presets(self.project) {
+            Ok(presets) => Answer::text(&presets.keys().cloned().collect::<Vec<_>>().join("\n")),
+            Err(problem) => failed("presets", problem),
+        }
+    }
+
+    /// Every tunable at the value the game reads.
+    async fn save_preset(&mut self, name: &str) -> Answer {
         let declared = match tunables::load(self.project) {
             Ok(declared) => declared,
-            Err(problem) => {
-                devlog::error(Source::Session, format!("bake: {problem}"));
-                return Answer::failed();
-            }
+            Err(problem) => return failed("preset", problem),
         };
         let Some(saved) = self.session.snapshot() else { return Answer::unavailable() };
         let tuned = tunables::tuned_values(&saved.state);
-        let values: Vec<(String, f32)> = declared
-            .iter()
-            .filter(|tunable| tuned.contains_key(&tunable.id))
-            .map(|tunable| (tunable.name.clone(), tunable.live(&tuned)))
-            .collect();
-        if values.is_empty() {
-            devlog::info(Source::Session, "bake: nothing to bake; each value is its default");
-            return Answer::ok(0.0);
-        }
-        let (sender, receiver) = channel();
-        let root = self.project.to_owned();
-        let spawned = std::thread::Builder::new().name("pen-bake".into()).spawn(move || {
-            let _ = sender.send(tunables::bake(&root, &values).map_err(|error| format!("{error:#}")));
-        });
-        match spawned {
-            Ok(_) => {
-                *self.baking = Some(receiver);
-                Answer::ok(0.0)
+        let values = declared.iter().map(|tunable| (tunable.name.clone(), tunable.live(&tuned))).collect();
+        match tunables::save_preset(self.project, name, values) {
+            Ok(()) => {
+                let path = tunables::presets_path(self.project);
+                devlog::info(Source::Session, format!("preset {}: saved in {}", name.trim(), path.display()));
+                Answer::ok(declared.len() as f32)
             }
-            Err(error) => {
-                devlog::error(Source::Session, format!("bake: {error}"));
-                Answer::failed()
-            }
+            Err(error) => failed("preset", format!("{error:#}")),
         }
+    }
+
+    fn preset(&mut self, name: &str) -> Result<Vec<(u32, f32)>, Answer> {
+        let presets = tunables::load_presets(self.project).map_err(|problem| failed("preset", problem))?;
+        let preset = presets.get(name.trim()).ok_or_else(|| failed("preset", format!("there is no preset {name}")))?;
+        let declared = tunables::load(self.project).map_err(|problem| failed("preset", problem))?;
+        let tunes = tunables::preset_tunes(&declared, preset).map_err(|problem| failed("preset", problem))?;
+        devlog::info(Source::Session, format!("preset {}: tuned {} values", name.trim(), tunes.len()));
+        Ok(tunes)
+    }
+
+    fn assets(&mut self, kind: u32) -> Answer {
+        let Some(entries) = self.entries(kind).map(|entries| entries.clone()) else { return Answer::failed() };
+        let mut values = Vec::new();
+        for key in &entries {
+            let (state, revision) = self.session.gpu.renderer.standing(kind, key);
+            let name = pen_runtime::services::code_points(key);
+            values.extend([state as f32, revision as f32, name.len() as f32]);
+            values.extend(name);
+        }
+        Answer { values, ..Answer::ok(entries.len() as f32) }
+    }
+
+    fn preview(&mut self, kind: u32, index: u32, other: u32, slot: u32) -> Answer {
+        self.atlas.preview(kind, index, other, slot)
+    }
+
+    /// Until the next build; an empty key swaps the entry's own back.
+    fn swap(&mut self, kind: u32, index: u32, key: &str) -> Answer {
+        let assets = self.session.assets().to_owned();
+        if !key.is_empty() && (pen_render::validate_asset_key(key).is_err() || !assets.join(key).is_file()) {
+            return failed("swap", format!("there is no asset {key} in {}", assets.display()));
+        }
+        let Some(entry) = self.entries(kind).and_then(|entries| entries.get(index as usize).cloned()) else {
+            return Answer::failed();
+        };
+        let own = self.swapped.entry((kind, index)).or_insert(entry).clone();
+        let drawn = if key.is_empty() { own.clone() } else { key.to_owned() };
+        if let Some(entry) = self.entries(kind).and_then(|entries| entries.get_mut(index as usize)) {
+            entry.clone_from(&drawn);
+        }
+        if drawn == own {
+            self.swapped.remove(&(kind, index));
+            devlog::info(Source::Asset, format!("swap: {own} is its own again"));
+        } else {
+            devlog::info(Source::Asset, format!("swap: {own} draws from {drawn} until the next build"));
+        }
+        Answer::ok(0.0)
+    }
+
+    fn material(&mut self, index: u32) -> Answer {
+        let Some((key, path)) = self.material_file(index) else { return Answer::failed() };
+        let numbers = match std::fs::read_to_string(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| materials::numbers(&text))
+        {
+            Ok(numbers) => numbers,
+            Err(error) => return failed(&key, format!("{error:#}")),
+        };
+        let mut values = numbers.values.to_vec();
+        values.extend([f32::from(u8::from(numbers.color)), f32::from(u8::from(numbers.parameters))]);
+        for text in [&numbers.shader, &numbers.texture] {
+            let codes = pen_runtime::services::code_points(text);
+            values.push(codes.len() as f32);
+            values.extend(codes);
+        }
+        Answer { values, ..Answer::ok(0.0) }
+    }
+
+    /// In the checkout's file, which both renderers then load again.
+    fn set_material(&mut self, index: u32, field: u32, value: f32) -> Answer {
+        let Some((key, path)) = self.material_file(index) else { return Answer::failed() };
+        if let Err(error) = materials::write(&path, field as usize, value) {
+            return failed(&key, format!("{error:#}"));
+        }
+        self.session.gpu.renderer.reload(std::slice::from_ref(&key));
+        self.reloads.push(key);
+        Answer::ok(0.0)
     }
 }
 
@@ -669,6 +946,11 @@ impl Overlay for Devtools {
         let now = Instant::now();
         let interval = self.previous.replace(now).map_or(0.0, |previous| (now - previous).as_secs_f64() * 1000.0);
         self.run(session, interval);
+        self.serve_remote(session);
+        let gpu = (&session.gpu.device, &session.gpu.queue);
+        if let Err(error) = self.atlas.draw_previews(&mut self.renderer, &self.catalog, session.assets(), gpu) {
+            self.trouble(format!("devtools: a preview: {error:#}"));
+        }
     }
 
     fn command(&mut self, line: String) {
@@ -705,6 +987,17 @@ impl Overlay for Devtools {
 
     fn wants_pointer(&self) -> bool {
         self.runtime.is_some() && self.routing.over
+    }
+
+    fn wants_picture(&self, position: u64) -> bool {
+        self.atlas.wants_picture(position)
+    }
+
+    fn picture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture, position: u64) {
+        let taken = self.atlas.picture(&mut self.renderer, &self.catalog, (device, queue), texture, position);
+        if let Err(error) = taken {
+            self.trouble(format!("devtools: a picture of frame {position}: {error:#}"));
+        }
     }
 
     fn interface(&self) -> Option<&[UiNode]> {

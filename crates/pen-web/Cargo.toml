@@ -19,6 +19,7 @@ anyhow.workspace = true
 pen-protocol.workspace = true
 pen-runtime.workspace = true
 pen-render.workspace = true
+pen-simulation.workspace = true
 futures-channel = "0.3"
 js-sys = "0.3.106"
 serde_json = "1"
@@ -26,5 +27,6 @@ serde_json = "1"
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 web-time = "1"
-web-sys = { version = "0.3.106", features = ["HtmlCanvasElement", "DomRect", "console", "Window", "Document", "Element", "EventTarget", "Event", "KeyboardEvent", "MouseEvent", "WheelEvent", "Response", "Request", "RequestInit", "Headers", "Storage", "Location", "IdbFactory", "IdbDatabase", "IdbOpenDbRequest", "IdbRequest", "IdbObjectStore", "IdbTransaction", "IdbTransactionMode", "DomException", "Performance", "Navigator", "Clipboard", "CssStyleDeclaration", "HtmlElement", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioParam", "GainNode", "StereoPannerNode", "BiquadFilterNode", "BiquadFilterType", "ConvolverNode", "AudioScheduledSourceNode", "MediaQueryList", "UrlSearchParams", "Url", "EventSource", "MessageEvent"] }
-wgpu.workspace = true
+web-sys = { version = "0.3.106", features = ["HtmlCanvasElement", "DomRect", "console", "Window", "Document", "Element", "EventTarget", "Event", "KeyboardEvent", "MouseEvent", "WheelEvent", "Response", "Request", "RequestInit", "Headers", "Storage", "Location", "IdbFactory", "IdbDatabase", "IdbOpenDbRequest", "IdbRequest", "IdbObjectStore", "IdbTransaction", "IdbTransactionMode", "DomException", "Performance", "Navigator", "Clipboard", "CssStyleDeclaration", "HtmlElement", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioParam", "GainNode", "StereoPannerNode", "BiquadFilterNode", "BiquadFilterType", "ConvolverNode", "AudioScheduledSourceNode", "MediaQueryList", "UrlSearchParams", "Url", "EventSource", "MessageEvent", "PointerEvent", "InputEvent", "CompositionEvent", "HtmlTextAreaElement", "Gamepad", "GamepadButton", "GamepadMappingType", "PannerNode", "PanningModelType", "DistanceModelType", "AnalyserNode", "ChannelSplitterNode", "AudioContextOptions", "HtmlAudioElement", "HtmlMediaElement", "MediaElementAudioSourceNode", "Blob", "BlobPropertyBag", "DragEvent", "DataTransfer", "File", "FileList", "HtmlAnchorElement", "HtmlInputElement"] }
+# WebGPU, and WebGL2 through wgpu's GL backend where the browser has none.
+wgpu = { workspace = true, features = ["webgl"] }

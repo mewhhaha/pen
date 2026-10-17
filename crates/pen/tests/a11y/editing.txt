@@ -1,0 +1,22 @@
+Window "gdev" <- focus
+  Toolbar #327680 "Level editor"
+    Button #327681 "Edit the level" description="Tab" toggled=true actions=focus,activate
+    Button #327696 "Brushes" description="Esc" toggled=true actions=focus,activate
+    Button #327697 "Vertices" description="V" toggled=false actions=focus,activate
+    Button #327698 "Clipper" description="C" toggled=false actions=focus,activate
+    Button #327699 "Rotate" description="E" toggled=false actions=focus,activate
+    SpinButton #327682 "Grid" value="0.5 m" description="[ and ]" number=0.5 range=0.0625..4 step=0.5 actions=focus,increment,decrement,set_value
+    Button #327683 "Material" value="1 of 6" description="M" actions=focus,activate
+    Button #327712 "Delete" description="X" disabled actions=focus,activate
+    Button #327713 "Duplicate" description="Ctrl+D" disabled actions=focus,activate
+    Button #327714 "Undo" description="U" actions=focus,activate
+    Button #327715 "Redo" description="Shift+U" actions=focus,activate
+    Button #327716 "Turn" description="R" disabled actions=focus,activate
+    Button #327717 "Look at the selection" description="F" disabled actions=focus,activate
+    Button #327719 "Save the scene" description="Ctrl+S" actions=focus,activate
+    Button #327720 "Revert the scene" description="Ctrl+R" actions=focus,activate
+    Button #327721 "Quicksave" description="F6" actions=focus,activate
+    Button #327722 "Quickload" description="F9" actions=focus,activate
+  Status #327684 "Selection" value="Nothing selected" live=polite
+  ListBox #327685 "Brushes"
+    ListBoxOption #328704 "Brush 0" value="120 × 0.5 × 120 m, at 0, -0.25, 0" selected=false at=93.45268,98.45791 size=773.0946x3.3584595 actions=focus,activate

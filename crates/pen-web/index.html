@@ -7,11 +7,48 @@
 <canvas id="game" tabindex="0" aria-label="Game"></canvas><div id="status" role="status">Starting…</div>
 <script type="module">
 import init, { start } from './pen_web.js';
+
+// A static export's service worker (`pen build --web` writes it) serves the
+// game's files precompressed, keeps them for offline play and serves them
+// cross-origin isolated. The first visit waits briefly for it to take over;
+// a browser without JSPI, which needs the isolation to run the game in
+// workers, then loads the page again through it, once. A development page
+// drops the worker an export may have left at its address, and loads again
+// without it if it came through it.
+async function serviceWorker(development) {
+  if (!('serviceWorker' in navigator)) return;
+  try {
+    if (development) {
+      if (await (await navigator.serviceWorker.getRegistration())?.unregister() && navigator.serviceWorker.controller) {
+        location.reload();
+        await new Promise(() => {});
+      }
+      return;
+    }
+    await navigator.serviceWorker.register('service-worker.js');
+    if (!navigator.serviceWorker.controller) {
+      await Promise.race([
+        new Promise(resolve => navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true })),
+        new Promise(resolve => setTimeout(resolve, 3000)),
+      ]);
+    }
+    const jspi = WebAssembly.Suspending && WebAssembly.promising;
+    if (!jspi && !crossOriginIsolated && navigator.serviceWorker.controller && !sessionStorage.getItem('pen.isolating')) {
+      sessionStorage.setItem('pen.isolating', '1');
+      location.reload();
+      await new Promise(() => {});
+    }
+  } catch (error) {
+    console.warn(`service worker: ${error}`);
+  }
+}
+
 try {
-  await init();
-  const canvas = document.querySelector('canvas');
   // ?dev: served by `pen web`. ?qualify: the browser harnesses' hooks.
   const query = new URL(location.href).searchParams;
+  await serviceWorker(query.has('dev'));
+  await init();
+  const canvas = document.querySelector('canvas');
   await start(canvas, { development: query.has('dev'), qualify: query.has('qualify') });
   canvas.focus();
 } catch (error) { document.querySelector('#status').textContent = String(error); }

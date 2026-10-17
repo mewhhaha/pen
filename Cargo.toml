@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/blot-host", "crates/pen", "crates/pen-codegen", "crates/pen-plugins", "crates/pen-protocol", "crates/pen-runtime", "crates/pen-render", "crates/pen-web"]
+members = ["crates/blot-host", "crates/pen", "crates/pen-codegen", "crates/pen-gltf", "crates/pen-plugins", "crates/pen-protocol", "crates/pen-runtime", "crates/pen-render", "crates/pen-simulation", "crates/pen-texture", "crates/pen-web"]
 # Wasm plugins build apart, for wasm32-wasip2 (plugins/Cargo.toml).
 exclude = ["plugins"]
 
@@ -11,11 +11,14 @@ license = "MIT"
 [workspace.dependencies]
 anyhow = "1"
 pen-codegen = { path = "crates/pen-codegen" }
+pen-gltf = { path = "crates/pen-gltf" }
 blot-host = { path = "crates/blot-host", default-features = false }
 pen-plugins = { path = "crates/pen-plugins" }
 pen-runtime = { path = "crates/pen-runtime" }
 pen-protocol = { path = "crates/pen-protocol" }
 pen-render = { path = "crates/pen-render" }
+pen-simulation = { path = "crates/pen-simulation" }
+pen-texture = { path = "crates/pen-texture" }
 wgpu = "30"
 # What running a precompiled guest needs (externref lives on the GC heap;
 # `backtrace` names guest functions in traps). blot-host's `compiler`

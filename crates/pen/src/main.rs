@@ -4,39 +4,79 @@
 // its console.
 #![cfg_attr(all(windows, not(feature = "compiler")), windows_subsystem = "windows")]
 mod accessibility;
+mod app_bundle;
+mod asset_graph;
+mod asset_lint;
+mod atlas;
 mod audio;
+mod bench;
 #[cfg(feature = "compiler")]
 mod blot_test;
+mod bugreport;
+#[cfg(all(test, feature = "compiler"))]
+mod codec_round_trip;
 mod crash;
+mod delta;
 mod dev;
 mod devlog;
 #[cfg(feature = "devtools")]
 mod devtools;
+mod diverge;
 #[cfg(test)]
 mod fixtures;
+mod fuzz;
 mod game;
+mod gamepad;
+#[cfg(feature = "compiler")]
+mod gltf;
 mod input;
 mod logger;
+mod loudness;
+mod materials;
+mod mods;
+mod net;
+#[cfg(feature = "compiler")]
+mod new;
 mod opus;
 mod packets;
+mod patch;
 mod pipeline;
 #[cfg(feature = "compiler")]
 mod plugin_build;
+mod presets;
 mod program;
 mod project;
+mod publish;
+#[cfg(feature = "compiler")]
+mod push;
 mod record;
 mod recording;
+#[cfg(feature = "devtools")]
+mod remote;
+mod reports;
+mod reproducible;
+mod review;
+mod saves;
+mod scene_assets;
 mod script;
 mod services;
 mod session;
 mod snapshot;
+mod spectate;
 mod staging;
+mod startup;
 #[cfg(feature = "steam")]
 mod steam;
+mod steam_input;
+mod store;
+#[cfg(feature = "compiler")]
+mod textures;
 mod timeline;
 mod tunables;
 mod visual;
 mod web;
+mod web_export;
+mod workshop;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -81,8 +121,8 @@ fn cache_dir() -> Option<PathBuf> {
 
 /// What pen keeps in its cache directory, which `pen clean` deletes:
 /// compiled games, compiled plugins, what plugins run and keep, the GPU's
-/// compiled pipelines, and tests' scratch files.
-const CACHES: [&str; 6] = ["wasm", "components", "programs", "plugins", "pipelines", "tmp"];
+/// compiled pipelines, what asset steps built, and tests' scratch files.
+const CACHES: [&str; 7] = ["wasm", "components", "programs", "plugins", "pipelines", "assets", "tmp"];
 
 /// `pen clean`: deletes pen's caches, and nothing else there.
 fn clean() -> Result<()> {
@@ -140,6 +180,7 @@ fn load_module(engine: &wasmtime::Engine, game: &Path, cache: bool) -> Result<Gu
         (None, _) => GuestModule::new(engine, &wasm, cache.as_deref())?,
     };
     eprintln!("game module ready in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+    startup::mark("program loaded");
     Ok(module)
 }
 
@@ -154,11 +195,14 @@ struct Pending {
     present_mode: wgpu::PresentMode,
     size: Option<(u32, u32)>,
     software: bool,
+    /// Dynamic resolution's frame budget (`--frame-budget`).
+    frame_budget: Option<f32>,
     /// The dev tools, in `dev` and `run`.
     #[cfg(feature = "devtools")]
     devtools: Option<devtools::Settings>,
     /// Write the last frame with the dev tools (`--overlay-shot`).
     overlay_shot: Option<PathBuf>,
+    mods: Option<mods::Mods>,
 }
 
 struct App {
@@ -187,16 +231,24 @@ impl App {
         window.set_visible(true);
         // A recording's frames keep its size, however the window turns out.
         let pinned = pending.size.filter(|_| pending.options.record.is_some());
-        let gpu = Gpu::windowed(
+        let mut gpu = Gpu::windowed(
             Box::new(event_loop.owned_display_handle()),
             window.clone(),
             pending.present_mode,
             &pending.paths.assets,
             pinned,
             pending.software,
+            // Captured frames are read back as 8 bits, so HDR is for play alone.
+            std::env::var_os("PEN_HDR").is_some_and(|value| value == "1")
+                && pending.options.record.is_none()
+                && pending.options.screenshot.is_none()
+                && pending.options.script.is_empty(),
         )?;
+        gpu.renderer.frame_budget(pending.frame_budget);
         #[cfg(feature = "devtools")]
         let (assets, catalog) = (pending.paths.assets.clone(), pending.catalog.clone());
+        #[cfg(feature = "steam")]
+        let scene = pending.paths.scene.clone();
         let mut session = Session::start(
             pending.options,
             pending.paths,
@@ -207,10 +259,17 @@ impl App {
             Some(&window),
         )?;
         session.playback(pending.playback, Some(&window))?;
+        if let Some(size) = pinned {
+            session.input.pin(size);
+        }
+        // A window reads the player's gamepads; a headless run's are its script's.
+        session.input.open_gamepads();
         // The game's achievements, stats and rich presence go through its
         // services; the session pumps Steam's callbacks each frame.
         #[cfg(feature = "steam")]
-        session.services.register(Box::new(services::steam::SteamService::new(self.steam.take())));
+        session.services.register(Box::new(
+            services::steam::SteamService::new(self.steam.take(), session.actions.clone()).with_workshop(scene),
+        ));
         #[cfg(feature = "devtools")]
         if let Some(settings) = pending.devtools {
             let devtools = devtools::Devtools::new(Some(&window), &session.gpu, catalog, &assets, settings)?;
@@ -218,6 +277,9 @@ impl App {
         }
         if let Some(path) = pending.overlay_shot {
             session.overlay_shot_at_end(path);
+        }
+        if let Some(mods) = pending.mods {
+            session.set_mods(mods);
         }
         window.request_redraw();
         self.session = Some(session);
@@ -301,11 +363,10 @@ fn env_flag(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| value != "0")
 }
 
-/// The packaged game beside the executable, if there is one.
+/// The packaged game beside the executable (or in its macOS application
+/// bundle), if there is one.
 fn packaged_game() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let directory = exe.parent()?.join("game");
-    directory.join("game.wasm").exists().then_some(directory)
+    app_bundle::packaged_game(&std::env::current_exe().ok()?)
 }
 
 /// A command: its name, the words it takes besides options (`[WORD]`
@@ -340,7 +401,7 @@ struct OptionSpec {
     about: &'static str,
 }
 
-const COMMANDS: [CommandSpec; 12] = [
+const COMMANDS: [CommandSpec; 26] = [
     CommandSpec {
         name: "dev",
         operands: "",
@@ -364,7 +425,21 @@ const COMMANDS: [CommandSpec; 12] = [
                 `game` says), precompiled for the runtime's platform and a CPU baseline, with the assets its \
                 catalog reaches, mesh JSON in binary",
     },
-    CommandSpec { name: "check", operands: "", checkout: true, about: "compile the game and the dev tools" },
+    CommandSpec {
+        name: "check",
+        operands: "",
+        checkout: true,
+        about: "compile the game and the dev tools, and lint the assets: files the runtime would refuse or that \
+                are missing, unused, oversized or without the mip levels they need (pen.json's assets.lints)",
+    },
+    CommandSpec {
+        name: "assets",
+        operands: "",
+        checkout: true,
+        about: "bring the assets pipeline.json's steps make up to date with their sources: a step runs when its \
+                sources changed, unless the asset cache holds what it built from the same sources before, which \
+                is copied back",
+    },
     CommandSpec {
         name: "codegen",
         operands: "",
@@ -381,7 +456,7 @@ const COMMANDS: [CommandSpec; 12] = [
         name: "test",
         operands: "[FILE]",
         checkout: true,
-        about: "golden-image tests (default tests/visual/scenarios.json)",
+        about: "golden-image tests (default tests/visual/scenarios.json), and a page reviewing their shots",
     },
     CommandSpec { name: "bench", operands: "", checkout: true, about: "guest time per frame, without rendering" },
     CommandSpec {
@@ -400,22 +475,195 @@ const COMMANDS: [CommandSpec; 12] = [
                 must not compile, with diagnostics holding its `// rejects: TEXT`",
     },
     CommandSpec {
+        name: "gltf",
+        operands: "FILE",
+        checkout: false,
+        about: "import a glTF file (.gltf or .glb) as assets: a mesh JSON for each primitive (skinned ones with \
+                their rig and the file's animations as clips), its materials and their images, and \
+                NAME.import.json listing them; an asset recipe's work",
+    },
+    CommandSpec {
+        name: "diverge",
+        operands: "RECORDING",
+        checkout: true,
+        about: "play an input recording (.penrec) on this build and on another (--against), without rendering, \
+                and say where they first differ: the frame, its packet's fields and the state's lanes, by saved \
+                section; fails if they differ (for `git bisect run`)",
+    },
+    CommandSpec {
+        name: "fuzz",
+        operands: "",
+        checkout: true,
+        about: "random input against the game's invariants, without rendering: each run plays steps a seed \
+                makes up (keys, chords, clicks, drags, the wheel, console commands, tunables, actions on its \
+                interface's nodes) and checks that the game does not trap, its packets are valid and its state \
+                finite; a run that breaks one is cut down to the steps that still do, written as a script \
+                (--script-file plays one back with the same checks)",
+    },
+    CommandSpec {
+        name: "report",
+        operands: "FILE",
+        checkout: false,
+        about: "what a bug report (.penbug: Ctrl+Shift+B in a window, or a script's report step) holds: its \
+                build, system and GPU, the end of its log and its recording of the last 30 s, which `--replay \
+                FILE` plays; --out DIR unpacks it",
+    },
+    CommandSpec {
+        name: "new",
+        operands: "DIR",
+        checkout: false,
+        about: "a game to start from in the new directory DIR, named after it: pen.json, a Blot program that \
+                turns a cube, its assets, a test and pen's generated bindings; it compiles and runs as it is",
+    },
+    CommandSpec {
+        name: "texture",
+        operands: "IMAGE",
+        checkout: false,
+        about: "a PNG as KTX2 files a GPU samples directly, one per format family (name.bc7.ktx2, \
+                name.astc.ktx2, name.etc2.ktx2, name.rgba.ktx2), every mip level worked out; a material \
+                names name.ktx2 and the renderer reads the family its device has",
+    },
+    CommandSpec {
+        name: "font",
+        operands: "FONT",
+        checkout: false,
+        about: "a TrueType or OpenType font's multi-channel signed distance field atlas (KTX2, RGBA8 read as \
+                data) and its glyphs' metrics in ems (the same name's .json), for text sharp at any size",
+    },
+    CommandSpec {
+        name: "patch",
+        operands: "OLD NEW",
+        checkout: false,
+        about: "a patch from one package version to another (--out FILE): package folders, or versions in the \
+                store pen build keeps them in (a version's digest or its start; --store, by default the \
+                checkout's .pen/store)",
+    },
+    CommandSpec {
+        name: "apply",
+        operands: "PATCH [DIR]",
+        checkout: false,
+        about: "apply a patch to the package in DIR (by default the one beside this executable): only to the \
+                version it was made from, every file checked, the new version built beside the old one and \
+                then swapped in",
+    },
+    CommandSpec {
+        name: "loudness",
+        operands: "FILE [FILE...]",
+        checkout: false,
+        about: "each WAV or Ogg Opus clip's loudness (EBU R128, LUFS), true peak (dBTP) and length; with \
+                --normalize, each brought to its target loudness as far as its true peak allows: a WAV's \
+                samples scaled, an Opus file's output gain set",
+    },
+    CommandSpec {
         name: "clean",
         operands: "",
         checkout: false,
         about: "delete pen's caches in the platform cache directory: compiled games, plugins and GPU \
                 pipelines, and what plugins run and keep",
     },
+    CommandSpec {
+        name: "serve",
+        operands: "",
+        checkout: false,
+        about: "receive packages that `pen push` sends (on a Steam Deck, say), each into a directory of its \
+                name, only the files that changed; it listens on 127.0.0.1:7811 unless --listen says where, \
+                and takes pushes with its token only",
+    },
+    CommandSpec {
+        name: "push",
+        operands: "ADDRESS",
+        checkout: false,
+        about: "send a package (default .pen/package) to `pen serve` at ADDRESS (port 7811 unless given): \
+                only the files the server lacks, checked by their SHA-256",
+    },
+    CommandSpec {
+        name: "remote",
+        operands: "ADDRESS [REQUEST...]",
+        checkout: false,
+        about: "ask a game run with --devtools-listen (port 7812 unless given) one dev tools request, an \
+                operation of protocol/schema.json's DevtoolsOperation and up to four numbers (default \
+                frame), and print the answer",
+    },
 ];
 
 /// Playing: a packaged game, `dev` and `run`.
 const PLAY: &[&str] = &["", "dev", "run"];
 /// Every command that works on a checkout.
-const CHECKOUT: &[&str] =
-    &["dev", "web", "run", "build", "check", "codegen", "export", "test", "bench", "packets", "test-blot"];
+const CHECKOUT: &[&str] = &[
+    "dev",
+    "web",
+    "run",
+    "build",
+    "check",
+    "assets",
+    "codegen",
+    "export",
+    "test",
+    "bench",
+    "packets",
+    "test-blot",
+    "diverge",
+    "fuzz",
+];
 
-const OPTIONS: [OptionSpec; 43] = [
+const OPTIONS: [OptionSpec; 100] = [
     OptionSpec { name: "--help", value: "", commands: &[], place: Place::Prose, about: "this" },
+    OptionSpec {
+        name: "--out",
+        value: "FILE",
+        commands: &["texture", "font"],
+        place: Place::Command,
+        about: "the .ktx2 key to write (default IMAGE's or FONT's name with .ktx2)",
+    },
+    OptionSpec {
+        name: "--linear",
+        value: "",
+        commands: &["texture"],
+        place: Place::Command,
+        about: "its texels are data (normals, masks), not sRGB colour",
+    },
+    OptionSpec {
+        name: "--flat",
+        value: "",
+        commands: &["texture"],
+        place: Place::Command,
+        about: "the full size alone, no smaller mip levels",
+    },
+    OptionSpec {
+        name: "--em",
+        value: "N",
+        commands: &["font"],
+        place: Place::Command,
+        about: "pixels per em the glyphs are drawn at (default 48)",
+    },
+    OptionSpec {
+        name: "--range",
+        value: "N",
+        commands: &["font"],
+        place: Place::Command,
+        about: "pixels of distance either side of an edge the field holds (default 4)",
+    },
+    OptionSpec {
+        name: "--width",
+        value: "N",
+        commands: &["font"],
+        place: Place::Command,
+        about: "the atlas's width in pixels; its height is the power of two that fits (default 512)",
+    },
+    OptionSpec {
+        name: "--weight",
+        value: "N",
+        commands: &["font"],
+        place: Place::Command,
+        about: "a variable font's weight (its wght axis)",
+    },
+    OptionSpec {
+        name: "--chars",
+        value: "TEXT",
+        commands: &["font"],
+        place: Place::Command,
+        about: "the characters to draw (default the printable ASCII ones)",
+    },
     OptionSpec { name: "--version", value: "", commands: &[], place: Place::Prose, about: "pen's version" },
     OptionSpec { name: "--project", value: "DIR", commands: CHECKOUT, place: Place::Prose, about: "the checkout" },
     OptionSpec {
@@ -428,7 +676,7 @@ const OPTIONS: [OptionSpec; 43] = [
     OptionSpec {
         name: "--port",
         value: "N",
-        commands: &["web"],
+        commands: &["web", "test"],
         place: Place::Command,
         about: "listen on port N (default the first free one from 8000 to 8015)",
     },
@@ -462,11 +710,57 @@ const OPTIONS: [OptionSpec; 43] = [
         about: "the CPU game.cwasm is compiled for: a Cranelift preset, or native (default x86-64-v2 on x86-64)",
     },
     OptionSpec {
+        name: "--bundle-id",
+        value: "ID",
+        commands: &["build"],
+        place: Place::Command,
+        about: "a macOS runtime's application bundle identifier (default pen.NAME)",
+    },
+    OptionSpec {
         name: "--web",
         value: "",
         commands: &["build"],
         place: Place::Command,
         about: "the Rust browser host and the game as static files instead",
+    },
+    OptionSpec {
+        name: "--steam",
+        value: "",
+        commands: &["build"],
+        place: Place::Command,
+        about: "also write steamcmd's app and depot build scripts for the package in steam/ beside it, from \
+                pen.json's \"steam\" section ({\"app\": ID, \"depots\": {\"linux\": ID, \"windows\": ID}, \
+                \"branch\": NAME}), and say the steamcmd run that uploads them",
+    },
+    OptionSpec {
+        name: "--itch",
+        value: "",
+        commands: &["build"],
+        place: Place::Command,
+        about: "also say the butler push of the package to itch.io, from pen.json's \"itch\" section \
+                ({\"target\": \"user/game\"}): to its platform's channel, as a patch",
+    },
+    OptionSpec {
+        name: "--upload",
+        value: "",
+        commands: &["build"],
+        place: Place::Command,
+        about: "run those uploads: steamcmd as STEAM_BUILD_USER (logged in before), butler with \
+                BUTLER_API_KEY; without it, nothing is uploaded",
+    },
+    OptionSpec {
+        name: "--label",
+        value: "TEXT",
+        commands: &["build"],
+        place: Place::Command,
+        about: "the build's description on Steam and version on itch.io",
+    },
+    OptionSpec {
+        name: "--zip",
+        value: "FILE",
+        commands: &["build"],
+        place: Place::Command,
+        about: "with --web, also the site as a ZIP to upload (itch.io's limits are checked)",
     },
     OptionSpec {
         name: "--check",
@@ -476,6 +770,28 @@ const OPTIONS: [OptionSpec; 43] = [
         about: "check the generated code instead of writing it",
     },
     OptionSpec {
+        name: "--check",
+        value: "",
+        commands: &["assets"],
+        place: Place::Command,
+        about: "build nothing: say which steps' outputs differ from what the cache built from their sources, and \
+                fail if any do",
+    },
+    OptionSpec {
+        name: "--only",
+        value: "STEP",
+        commands: &["assets"],
+        place: Place::Command,
+        about: "only this step (again for more)",
+    },
+    OptionSpec {
+        name: "--cache",
+        value: "DIR",
+        commands: &["assets"],
+        place: Place::Command,
+        about: "the asset cache (default PEN_ASSET_CACHE, else assets/ in pen's cache directory)",
+    },
+    OptionSpec {
         name: "--rust",
         value: "FILE",
         commands: &["codegen"],
@@ -483,12 +799,79 @@ const OPTIONS: [OptionSpec; 43] = [
         about: "where the Rust protocol code goes",
     },
     OptionSpec { name: "--out", value: "DIR", commands: &["export"], place: Place::Command, about: "where (required)" },
+    OptionSpec { name: "--out", value: "FILE", commands: &["patch"], place: Place::Command, about: "where (required)" },
+    OptionSpec {
+        name: "--store",
+        value: "DIR",
+        commands: &["build", "patch"],
+        place: Place::Command,
+        about: "the store of package versions (default .pen/store in the checkout)",
+    },
+    OptionSpec {
+        name: "--out",
+        value: "DIR",
+        commands: &["gltf"],
+        place: Place::Command,
+        about: "the asset directory written into (default src/assets)",
+    },
+    OptionSpec {
+        name: "--name",
+        value: "NAME",
+        commands: &["gltf"],
+        place: Place::Command,
+        about: "what the assets' names start with (default the file's name)",
+    },
+    OptionSpec {
+        name: "--shader",
+        value: "KEY",
+        commands: &["gltf"],
+        place: Place::Command,
+        about: "the shader the materials name (default scene.wgsl)",
+    },
+    OptionSpec {
+        name: "--vat",
+        value: "FPS",
+        commands: &["gltf"],
+        place: Place::Command,
+        about: "also bake each skinned primitive's clips into a vertex-animation texture, FPS frames a second, \
+                with a material drawing with it",
+    },
+    OptionSpec {
+        name: "--vat-shader",
+        value: "KEY",
+        commands: &["gltf"],
+        place: Place::Command,
+        about: "the shader those materials name (default vat.wgsl)",
+    },
+    OptionSpec {
+        name: "--blot",
+        value: "DIR",
+        commands: &["new"],
+        place: Place::Command,
+        about: "the Blot checkout (blot2) it builds with (default PEN_BLOT, else a blot2 beside DIR or a \
+                directory above it)",
+    },
     OptionSpec {
         name: "--update",
         value: "",
         commands: &["test"],
         place: Place::Command,
         about: "write the shots as the golden images",
+    },
+    OptionSpec {
+        name: "--review",
+        value: "",
+        commands: &["test"],
+        place: Place::Command,
+        about: "serve the review page every run writes (OUT/review.html: each shot beside its golden image and \
+                their difference), with buttons that accept a shot as its golden image, until stopped",
+    },
+    OptionSpec {
+        name: "--last",
+        value: "",
+        commands: &["test"],
+        place: Place::Command,
+        about: "with --review, serve the last run's page instead of running (no GPU)",
     },
     OptionSpec {
         name: "--only",
@@ -523,9 +906,120 @@ const OPTIONS: [OptionSpec; 43] = [
         value: "N",
         commands: &["test-blot"],
         place: Place::Command,
-        about: "modules compiled at once, each worker in one compiler session (default half the cores, at most 8)",
+        about: "modules compiled at once, each worker in one compiler session, and tests run at once (default half \
+                the cores, at most 8)",
+    },
+    OptionSpec {
+        name: "--runs",
+        value: "N",
+        commands: &["bench"],
+        place: Place::Command,
+        about: "run the frames N times, keeping each metric's best (default 1)",
+    },
+    OptionSpec {
+        name: "--json",
+        value: "",
+        commands: &["bench"],
+        place: Place::Command,
+        about: "print the results on stdout as JSON, for --compare",
+    },
+    OptionSpec {
+        name: "--compare",
+        value: "FILE",
+        commands: &["bench"],
+        place: Place::Command,
+        about: "compare with another build's --json results (again for the best of several), and fail when a \
+                metric is slower than its threshold",
+    },
+    OptionSpec {
+        name: "--threshold",
+        value: "PCT",
+        commands: &["bench"],
+        place: Place::Command,
+        about: "how much slower every metric may get, in percent (default each its own: the median and mean 10, \
+                p95 and snapshots 20, loading 25)",
+    },
+    OptionSpec {
+        name: "--against",
+        value: "DIR",
+        commands: &["diverge"],
+        place: Place::Command,
+        about: "the other build: a game bundle (`pen export`'s, or a package's game/), as of the recording's \
+                commit",
+    },
+    OptionSpec {
+        name: "--seed",
+        value: "N",
+        commands: &["fuzz"],
+        place: Place::Command,
+        about: "the first run's seed; each run after takes the next (default 1)",
+    },
+    OptionSpec {
+        name: "--runs",
+        value: "N",
+        commands: &["fuzz"],
+        place: Place::Command,
+        about: "how many (default 10)",
+    },
+    OptionSpec {
+        name: "--out",
+        value: "DIR",
+        commands: &["fuzz"],
+        place: Place::Command,
+        about: "where the scripts of runs that break the game go (default .pen/fuzz)",
+    },
+    OptionSpec {
+        name: "--out",
+        value: "DIR",
+        commands: &["report"],
+        place: Place::Command,
+        about: "unpack its files there (report.txt, log.txt, recording.penrec, state.bin)",
+    },
+    OptionSpec {
+        name: "--deadline",
+        value: "SECONDS",
+        commands: &["test-blot"],
+        place: Place::Command,
+        about: "how long one test may run before it fails as stuck (default 600; the time it waits for a core \
+                counts)",
+    },
+    OptionSpec {
+        name: "--normalize",
+        value: "",
+        commands: &["loudness"],
+        place: Place::Command,
+        about: "bring each clip to its target loudness, rewriting it",
+    },
+    OptionSpec {
+        name: "--lufs",
+        value: "N",
+        commands: &["loudness"],
+        place: Place::Command,
+        about: "the target loudness (default -23, EBU R128's, or the targets file's)",
+    },
+    OptionSpec {
+        name: "--ceiling",
+        value: "N",
+        commands: &["loudness"],
+        place: Place::Command,
+        about: "the highest true peak, in dBTP, normalizing may take a clip to (default -1)",
+    },
+    OptionSpec {
+        name: "--targets",
+        value: "FILE",
+        commands: &["loudness"],
+        place: Place::Command,
+        about: "targets as JSON: {\"target\": LUFS, \"peak\": dBTP, \"sounds\": {\"NAME\": LUFS}}",
     },
     OptionSpec { name: "--mute", value: "", commands: PLAY, place: Place::Play, about: "no sound" },
+    OptionSpec {
+        name: "--audio-buffer",
+        value: "N",
+        commands: PLAY,
+        place: Place::Play,
+        about: "the audio device's buffer, N samples within what it takes (default the system's; smaller plays \
+                sooner, at more risk of gaps)",
+    },
     OptionSpec {
         name: "--headless",
         value: "",
@@ -551,9 +1045,10 @@ const OPTIONS: [OptionSpec; 43] = [
     OptionSpec {
         name: "--frames",
         value: "N",
-        commands: &["", "dev", "run", "bench", "packets"],
+        commands: &["", "dev", "run", "bench", "packets", "fuzz"],
         place: Place::Play,
-        about: "stop after N frames (bench: default 600; packets: default 120, or as long as the script lasts)",
+        about: "stop after N frames (bench: default 600; packets: default 120, or as long as the script lasts; \
+                fuzz: each run's, default 600)",
     },
     OptionSpec {
         name: "--screenshot",
@@ -579,18 +1074,21 @@ const OPTIONS: [OptionSpec; 43] = [
     OptionSpec {
         name: "--script",
         value: "STEPS",
-        commands: &["", "dev", "run", "bench", "packets"],
+        commands: &["", "dev", "run", "bench", "packets", "fuzz"],
         place: Place::Play,
         about: "scripted input: wait=N key=K down=K up=K type=T move=X,Y click=X,Y press=B release=B \
                 drag=X,Y,X,Y wheel=D[,X,Y] shot=NAME save=F load=F quit; ui=ID,ACTION[,VALUE] (an assistive \
                 technology's action on an interface node: focus, blur, activate, increment, decrement, \
                 set_value, expand or collapse); tune=NAME=VALUE (a live-tunable constant of the checkout's \
-                src/tunables.json); overlay=/COMMAND[,ARG...] (a line typed into the dev tools' console)",
+                src/tunables.json); overlay=/COMMAND[,ARG...] (a line typed into the dev tools' console); \
+                pad=connect|disconnect|BUTTON[,VALUE]|AXIS,VALUE (a gamepad); touch=ID,X,Y lift=ID (a touch \
+                screen); motion=DX,DY (the locked mouse); compose=TEXT[,CURSOR] commit=TEXT (an input method); \
+                overlay-shot=NAME (a shot with the dev tools over it)",
     },
     OptionSpec {
         name: "--script-file",
         value: "FILE",
-        commands: &["", "dev", "run", "bench", "packets"],
+        commands: &["", "dev", "run", "bench", "packets", "fuzz"],
         place: Place::Play,
         about: "the same, from a file (lines starting with # are comments)",
     },
@@ -611,25 +1109,42 @@ const OPTIONS: [OptionSpec; 43] = [
     },
     OptionSpec { name: "--no-settle", value: "", commands: PLAY, place: Place::Play, about: "start the clock at once" },
     OptionSpec {
+        name: "--mod",
+        value: "DIR",
+        commands: &["", "dev", "run", "packets"],
+        place: Place::Play,
+        about: "a mod beside the game, again for more: DIR's mod.json and mod.wasm, run in a sandbox with the \
+                capabilities its manifest asks for (docs/mods.md)",
+    },
+    OptionSpec {
         name: "--game",
         value: "DIR",
-        commands: &["", "test", "bench", "packets"],
+        commands: &["", "build", "test", "bench", "packets", "diverge", "fuzz"],
         place: Place::Play,
-        about: "a game bundle (`pen export`'s, or a package's game/) instead of the checkout's",
+        about: "a game bundle (`pen export`'s, a package's game/, or one built in another language) instead of \
+                the checkout's",
     },
     OptionSpec {
         name: "--assets",
         value: "DIR",
-        commands: &["", "test", "bench", "packets"],
+        commands: &["", "test", "bench", "packets", "diverge", "fuzz"],
         place: Place::Play,
         about: "the bundle's assets from elsewhere",
     },
     OptionSpec {
         name: "--scene",
         value: "FILE",
-        commands: &["", "test", "bench", "packets"],
+        commands: &["", "test", "bench", "packets", "diverge", "fuzz"],
         place: Place::Play,
         about: "the bundle's scene from elsewhere, which the editor saves to",
+    },
+    OptionSpec {
+        name: "--frame-budget",
+        value: "MS",
+        commands: PLAY,
+        place: Place::Play,
+        about: "dynamic resolution: lower the scene's render scale (to half at most) while the GPU takes \
+                longer than MS milliseconds a frame, and raise it again when it takes well under",
     },
     OptionSpec {
         name: "--software",
@@ -658,7 +1173,7 @@ const OPTIONS: [OptionSpec; 43] = [
         value: "",
         commands: PLAY,
         place: Place::Play,
-        about: "keep the last 10 s to rewind and replay (always in dev and replays)",
+        about: "keep the last 30 s to rewind, replay and report (always in a window, dev and replays)",
     },
     OptionSpec {
         name: "--overlap",
@@ -675,6 +1190,27 @@ const OPTIONS: [OptionSpec; 43] = [
         about: "a line per frame: its number, and its input's and packet's hashes",
     },
     OptionSpec {
+        name: "--broadcast",
+        value: "ADDRESS",
+        commands: PLAY,
+        place: Place::Play,
+        about: "stream the final frames to viewers on ADDRESS (HOST:PORT), over WebSockets",
+    },
+    OptionSpec {
+        name: "--spectate",
+        value: "ADDRESS",
+        commands: PLAY,
+        place: Place::Play,
+        about: "watch the stream at ADDRESS (HOST:PORT or ws://...) as it comes, as a replay plays",
+    },
+    OptionSpec {
+        name: "--net",
+        value: "PLAYER:ADDRESS,...",
+        commands: PLAY,
+        place: Place::Play,
+        about: "play as PLAYER (from 0) of a net session, every player's UDP address in order (docs/netplay.md)",
+    },
+    OptionSpec {
         name: "--overlay",
         value: "",
         commands: &["dev", "run"],
@@ -688,14 +1224,86 @@ const OPTIONS: [OptionSpec; 43] = [
         place: Place::Play,
         about: "write the last frame with the dev tools over it (headless too)",
     },
+    OptionSpec {
+        name: "--devtools-listen",
+        value: "ADDRESS",
+        commands: PLAY,
+        place: Place::Play,
+        about: "answer remote dev tools (`pen remote`) at ADDRESS, such as 127.0.0.1:7812",
+    },
+    OptionSpec {
+        name: "--listen",
+        value: "ADDRESS",
+        commands: &["serve"],
+        place: Place::Command,
+        about: "where to listen (default 127.0.0.1:7811; 0.0.0.0:7811 takes pushes from the network)",
+    },
+    OptionSpec {
+        name: "--dir",
+        value: "DIR",
+        commands: &["serve"],
+        place: Place::Command,
+        about: "where packages go (default the data directory's pushed/)",
+    },
+    OptionSpec {
+        name: "--token",
+        value: "TEXT",
+        commands: &["serve", "push"],
+        place: Place::Command,
+        about: "the server's token, which a push must give (or PEN_PUSH_TOKEN; serve makes one up and says it)",
+    },
+    OptionSpec {
+        name: "--allow-run",
+        value: "",
+        commands: &["serve"],
+        place: Place::Command,
+        about: "start what a push asks to (after stopping what it started before)",
+    },
+    OptionSpec {
+        name: "--package",
+        value: "DIR",
+        commands: &["push"],
+        place: Place::Command,
+        about: "the package to send (default .pen/package)",
+    },
+    OptionSpec {
+        name: "--name",
+        value: "NAME",
+        commands: &["push"],
+        place: Place::Command,
+        about: "its name on the server (default the game's, from the package's game/game.json)",
+    },
+    OptionSpec {
+        name: "--run",
+        value: "FILE",
+        commands: &["push"],
+        place: Place::Command,
+        about: "start this file of the package there once it is in place (the server must --allow-run)",
+    },
+    OptionSpec {
+        name: "--text",
+        value: "TEXT",
+        commands: &["remote"],
+        place: Place::Command,
+        about: "the request's text (a file's path, a preset's name)",
+    },
+    OptionSpec {
+        name: "--follow",
+        value: "",
+        commands: &["remote"],
+        place: Place::Command,
+        about: "with log: print the log as it grows",
+    },
 ];
 
 /// Every variable of the environment pen reads, and what it does.
-const ENVIRONMENT: [(&str, &str); 19] = [
+const ENVIRONMENT: [(&str, &str); 36] = [
     ("PEN_PRESENT_MODE=MODE", "auto-vsync (the default), auto-no-vsync, fifo, fifo-relaxed, immediate or mailbox"),
     ("PEN_SOFTWARE=1", "as --software"),
+    ("PEN_HDR=1", "HDR output where the display and surface can (not while recording or taking shots)"),
     ("PEN_OVERLAY=1", "as --overlay"),
     ("PEN_SMOKE_FRAMES=N", "as --frames N"),
+    ("PEN_AUDIO_BUFFER=N", "as --audio-buffer N"),
     (
         "PEN_PROFILE_FRAMES=N",
         "after PEN_PROFILE_WARMUP=N frames (default 90), time N frames' phases, say each one's median and stop",
@@ -708,18 +1316,49 @@ const ENVIRONMENT: [(&str, &str); 19] = [
         "RUST_LOG=LEVEL",
         "more of the libraries' log on stderr: debug, or per crate (pen_render=debug); warnings always show",
     ),
+    (
+        "PEN_STARTUP=1",
+        "when each phase of starting is reached: the program loaded, the GPU ready, the game's first frame, the \
+         first frame drawn whole and settling",
+    ),
     ("PEN_GPU_BACKTRACE=1", "where a GPU validation error came from"),
     ("PEN_SERVICES_LOG=1", "a line for each request the game makes of its services"),
     (
         "PEN_A11Y_DUMP=FILE",
         "the game's interface as assistive technology sees it, written to FILE whenever it changes (headless too)",
     ),
+    ("PEN_A11Y_ATSPI=1", "headless, the game's interface on the AT-SPI bus, at the game's pace (Linux; tests/atspi)"),
+    (
+        "PEN_A11Y_AUDIT=FILE",
+        "the accessibility audit of the game's interface and its pixels, written to FILE whenever it changes",
+    ),
+    ("PEN_LOCALE=TAG", "the language the game's string tables show in (default the system's locale)"),
+    (
+        "PEN_COLOR_FILTER=NAME[:STRENGTH]",
+        "a colour filter for this run: protanopia, deuteranopia, tritanopia or achromatopsia; simulate-NAME shows what a player with it sees",
+    ),
+    ("PEN_TEXT_SCALE=N", "the engine's text scale for this run, 1 to 2"),
+    ("PEN_REDUCED_MOTION=1", "the engine's reduced motion for this run"),
     ("PEN_RECORD_PCM=FILE", "a recording's sound as mixed, before it is encoded (f32 stereo at 48 kHz)"),
     ("PEN_STEAM=1", "Steam outside a package (pen built with Steam)"),
     ("PEN_STEAM_DEBUG=STEPS", "achievement and stat steps to run against Steam (see steam.rs)"),
     ("PEN_STEAM_APP_ID=ID", "relaunch through Steam when started outside it"),
+    ("STEAM_BUILD_USER=NAME", "build --steam --upload: the Steamworks account steamcmd logged in as before"),
+    ("PEN_STEAMCMD=EXE, PEN_BUTLER=EXE", "build --upload: steamcmd and butler, if not on PATH"),
+    ("BUTLER_API_KEY=KEY", "build --itch --upload: butler's itch.io API key"),
+    (
+        "PEN_GRAPHICS_TIER=TIER",
+        "the graphics preset for a player without stored preferences: auto (from the GPU, and in headless runs \
+         too), software, handheld, low, medium or high",
+    ),
     ("PEN_CRASH_TEST=N", "panic at frame N, to try crash reports"),
+    ("PEN_REPORTS=off", "send no crash or performance reports, whatever the player agreed to"),
     ("PEN_PLUGINS=DIR", "where pen's own plugins are (default plugins/ beside pen)"),
+    (
+        "PEN_ASSET_CACHE=DIR",
+        "what asset steps built, by their sources (default assets/ in pen's cache directory); share one between \
+         checkouts and CI runs",
+    ),
     (
         "PEN_WEB_HOST=DIR",
         "a built browser host, for web and build --web (default web/ beside pen, else built from this repository)",
@@ -730,6 +1369,12 @@ const ENVIRONMENT: [(&str, &str); 19] = [
          (dev and the dev tools)",
     ),
     ("PEN_BUILD=TEXT", "while building pen: a label for its crash reports"),
+    ("PEN_PUSH_TOKEN=TEXT", "as --token, for pen serve and pen push"),
+    (
+        "SOURCE_DATE_EPOCH=SECONDS",
+        "build: every file and directory of the package takes this modification time, so that an archive \
+         of it is reproducible too",
+    ),
 ];
 
 /// A line of the usage: `head`, then `about` from column 22, wrapped at 100.
@@ -812,6 +1457,8 @@ fn usage() -> String {
         "\ntime travel: Ctrl+Shift+P pauses and plays, Ctrl+Shift+period steps a frame, Ctrl+Shift+comma\n\
          steps back, Ctrl+Shift+R replays the last 5 s (after a reload, on the new build); in scripts,\n\
          pause resume step[=N] rewind=N replay=SECONDS.\n\n\
+         bug reports: Ctrl+Shift+B in a window (a script's report[=FILE]) writes the last 30 s of input,\n\
+         the state, the log and the system to a .penbug in reports/ of the data directory (pen report).\n\n\
          dev tools (dev and run): the checkout's own program for them (devtools/main.blot) runs beside the\n\
          game and draws over it: its console on the backquote key (/help lists what it does), and its\n\
          diagnostics; a checkout without one runs without dev tools.\n\n\
@@ -884,7 +1531,9 @@ impl Args {
             args.command = spec.name;
         }
         while let Some(word) = words.next() {
-            if !word.starts_with('-') {
+            // A negative number is an operand (`pen remote ADDRESS state -1`).
+            let negative = word.strip_prefix('-').is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+            if !word.starts_with('-') || negative {
                 args.operands.push(word);
                 continue;
             }
@@ -906,14 +1555,10 @@ impl Args {
         }
         let spec = COMMANDS.iter().find(|spec| spec.name == args.command);
         let operands = spec.map_or("", |spec| spec.operands);
-        let most = if operands.is_empty() {
-            0
-        } else if operands.ends_with("...]") {
-            usize::MAX
-        } else {
-            1
-        };
-        let least = usize::from(!operands.is_empty() && !operands.starts_with('['));
+        // Each word one operand, those in brackets optional, `...]` any number.
+        let words: Vec<&str> = operands.split_whitespace().collect();
+        let most = if operands.ends_with("...]") { usize::MAX } else { words.len() };
+        let least = words.iter().filter(|word| !word.starts_with('[')).count();
         if let Some(extra) = args.operands.get(most) {
             bail!(
                 "{} takes {}, not {extra}",
@@ -993,6 +1638,15 @@ fn size(text: &str) -> Result<(u32, u32)> {
         bail!("--size must not be empty");
     }
     Ok(size)
+}
+
+/// The mods `--mod` names, if any.
+fn load_mods(args: &Args) -> Result<Option<mods::Mods>> {
+    let directories: Vec<PathBuf> = args.values("--mod").into_iter().map(PathBuf::from).collect();
+    if directories.is_empty() {
+        return Ok(None);
+    }
+    mods::Mods::load(&directories).map(Some)
 }
 
 /// Where a game's program, assets and scene come from.
@@ -1093,12 +1747,34 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
     // A frame lasts 1/fps, and a recording's sound fps times a second.
     let fps: Option<f64> = args.number("--fps")?;
     ensure!(fps.is_none_or(|fps| fps.is_finite() && fps > 0.0), "--fps takes a positive number");
+    let frame_budget: Option<f32> = args.number("--frame-budget")?;
+    ensure!(
+        frame_budget.is_none_or(|budget| budget.is_finite() && budget > 0.0),
+        "--frame-budget takes a positive number of milliseconds"
+    );
+    let net = args.value("--net").map(|spec| net::Spec::parse(&spec)).transpose()?;
+    let spectating = args.value("--spectate").is_some();
+    if let Some(spec) = &net {
+        net::check_players(identity().players, spec.addresses.len())?;
+        ensure!(args.path("--replay").is_none(), "a net session plays its players' input, not a recording's");
+    }
+    ensure!(
+        args.value("--spectate").is_none() || (net.is_none() && args.path("--replay").is_none()),
+        "--spectate plays a stream's input, not a net session's or a recording's"
+    );
+    // A net session's frames are a steady 1/60 s each, the host's.
+    let fps = fps.or(net.as_ref().map(|_| 60.0));
     let options = Options {
-        frames: frames.or(smoke).unwrap_or(if shot && script.is_empty() { 120 } else { 0 }),
+        // A viewer plays until the stream ends.
+        frames: frames.or(smoke).unwrap_or(if shot && script.is_empty() && !spectating { 120 } else { 0 }),
         screenshot,
         record,
         fps,
         mute: args.flag("--mute"),
+        audio_buffer: match args.number("--audio-buffer")? {
+            Some(samples) => Some(samples),
+            None => std::env::var("PEN_AUDIO_BUFFER").ok().map(|samples| samples.parse()).transpose()?,
+        },
         dev,
         script,
         headless,
@@ -1110,9 +1786,17 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
         history: args.flag("--history"),
         overlap: args.flag("--overlap"),
         trace: args.path("--trace"),
+        net,
+        stream: args.value("--broadcast"),
+        spectate: args.value("--spectate"),
     };
-    if headless && options.frames == 0 && options.script.is_empty() && playback.replay.is_none() {
-        bail!("--headless needs --frames N, a --script or a --replay to know when to stop");
+    if headless
+        && options.frames == 0
+        && options.script.is_empty()
+        && playback.replay.is_none()
+        && playback.spectate.is_none()
+    {
+        bail!("--headless needs --frames N, a --script, a --replay or a --spectate to know when to stop");
     }
     // A replay draws at the size it was recorded at, unless told otherwise.
     let recorded_size = match &playback.replay {
@@ -1127,31 +1811,48 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
         args.path("--shots"),
         args.path("--data"),
     );
+    // What the scene draws first is read while the program loads and the GPU opens.
+    scene_assets::warm_up(&paths.assets, paths.scene_to_read());
     // Development recompiles after every edit, reusing unchanged functions.
     let engine = if dev { blot_host::dev_engine()? } else { blot_host::engine()? };
     let module = load_module(&engine, &game.directory, !dev)?;
     let catalog = read_catalog(&paths.assets)?;
+    let mods = load_mods(args)?;
+    // A packaged game has no dev tools program, but may answer remote ones.
+    let listen = args.value("--devtools-listen");
+    #[cfg(not(feature = "devtools"))]
+    if listen.is_some() {
+        bail!("this pen has no dev tools (it was built without the devtools feature)");
+    }
     #[cfg(feature = "devtools")]
     let devtools = |keep: bool| {
-        checkout.map(|root| devtools::Settings {
-            project: root.to_owned(),
+        let root = checkout.map(Path::to_owned).or_else(|| listen.is_some().then(|| game.directory.clone()))?;
+        Some(devtools::Settings {
+            project: root,
             build: game.directory.clone(),
             open: devtools::requested(args.flag("--overlay")),
-            keep,
+            keep: keep && checkout.is_some(),
+            listen: listen.clone(),
         })
     };
 
     if headless {
-        let gpu = Gpu::headless(size.unwrap_or((1920, 1280)), &paths.assets, software)?;
+        let mut gpu = Gpu::headless(size.unwrap_or((1920, 1280)), &paths.assets, software)?;
+        gpu.renderer.frame_budget(frame_budget);
         #[cfg(feature = "devtools")]
         let (assets, devtools_catalog) = (paths.assets.clone(), catalog.clone());
         let mut session = Session::start(options, paths, engine, module, catalog, gpu, None)?;
         session.playback(playback, None)?;
+        if let Some(mods) = mods {
+            session.set_mods(mods);
+        }
         #[cfg(feature = "devtools")]
-        if let Some(settings) = devtools(false).filter(|_| overlay_asked) {
+        if let Some(settings) = devtools(false).filter(|_| overlay_asked || listen.is_some()) {
             let mut devtools = devtools::Devtools::new(None, &session.gpu, devtools_catalog, &assets, settings)?;
             // Headless, the program's build is waited for: what it shows is the point.
-            devtools.start_now()?;
+            if overlay_asked {
+                devtools.start_now()?;
+            }
             session.set_overlay(Box::new(devtools));
         }
         if let Some(path) = overlay_shot {
@@ -1192,9 +1893,11 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
             present_mode: present_mode()?,
             size,
             software,
+            frame_budget,
             #[cfg(feature = "devtools")]
             devtools: devtools(true),
             overlay_shot,
+            mods,
         }),
         window: None,
         session: None,
@@ -1212,9 +1915,97 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
     }
 }
 
+/// `pen new DIR`.
+#[cfg(feature = "compiler")]
+fn new_game(args: &Args) -> Result<()> {
+    let root = new::create(Path::new(&args.operands[0]), args.path("--blot"))?;
+    println!(
+        "made {} in {}: `pen dev` there plays it as you edit it, `pen test-blot` runs its tests",
+        project::Project::find(Some(root.clone()))?.identity.name,
+        root.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "compiler"))]
+fn new_game(_: &Args) -> Result<()> {
+    bail!("this player runtime makes no games; use a full pen build")
+}
+
+/// The commands that work over the network, which need no checkout: none
+/// for another command.
+fn network(args: &Args) -> Option<Result<()>> {
+    #[cfg(feature = "compiler")]
+    let token = || args.value("--token").or_else(|| std::env::var("PEN_PUSH_TOKEN").ok());
+    match args.command {
+        #[cfg(feature = "compiler")]
+        "serve" => Some((|| {
+            let token = token().unwrap_or_else(|| {
+                let made = push::new_token();
+                eprintln!("serve: the token is {made} (pen push --token {made})");
+                made
+            });
+            let serve = push::Serve {
+                listen: args.value("--listen").unwrap_or_else(|| format!("127.0.0.1:{}", push::PORT)),
+                token,
+                directory: args.path("--dir").unwrap_or_else(|| data_dir().join("pushed")),
+                allow_run: args.flag("--allow-run"),
+            };
+            let listener =
+                std::net::TcpListener::bind(&serve.listen).with_context(|| format!("listening on {}", serve.listen))?;
+            eprintln!("serve: packages pushed to {} go in {}", listener.local_addr()?, serve.directory.display());
+            push::Server::default().serve(&serve, &listener, || false)
+        })()),
+        #[cfg(feature = "compiler")]
+        "push" => Some((|| {
+            let token = token().context("pen push needs the server's token: --token TEXT or PEN_PUSH_TOKEN")?;
+            let package = args.path("--package").unwrap_or_else(|| PathBuf::from(".pen/package"));
+            let name = match args.value("--name") {
+                Some(name) => name,
+                None => project::bundle_identity(&package.join("game"))
+                    .map(|identity| identity.name)
+                    .with_context(|| format!("{} is not a package (pen build makes one)", package.display()))?,
+            };
+            let started = Instant::now();
+            let done = push::push(&push::Push {
+                address: &args.operands[0],
+                token: &token,
+                package: &package,
+                name: &name,
+                run: args.value("--run").as_deref(),
+            })?;
+            eprintln!(
+                "push: {} of {} files ({:.1} MB) to {} in {:.1} s{}",
+                done.sent,
+                done.files,
+                done.bytes as f64 / 1e6,
+                done.at,
+                started.elapsed().as_secs_f64(),
+                done.started.map(|run| format!("; started {run}")).unwrap_or_default()
+            );
+            Ok(())
+        })()),
+        #[cfg(not(feature = "compiler"))]
+        "serve" | "push" => Some(Err(anyhow!("this player runtime neither serves nor pushes packages"))),
+        #[cfg(feature = "devtools")]
+        "remote" => Some(remote::command(
+            &args.operands[0],
+            &args.operands[1..],
+            args.value("--text").as_deref(),
+            args.flag("--follow"),
+        )),
+        #[cfg(not(feature = "devtools"))]
+        "remote" => Some(Err(anyhow!("this pen has no dev tools to ask a game remotely"))),
+        _ => None,
+    }
+}
+
 fn main() -> ExitCode {
+    startup::begin();
     logger::install();
-    match run(std::env::args().skip(1)) {
+    let result = run(std::env::args().skip(1));
+    reports::finish();
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             crash::stopped(&error);
@@ -1223,22 +2014,130 @@ fn main() -> ExitCode {
     }
 }
 
+/// The tag and lanes of the game's own event `name`, as the `pen.json` of
+/// the checkout at `root` declares it, for `game=` steps.
+fn game_event(root: Option<&Path>, name: &str, values: &[f32]) -> Result<(u32, Vec<f32>)> {
+    #[cfg(feature = "compiler")]
+    if let Some(root) = root {
+        let declarations = pen_codegen::extensions::Declarations::of_checkout(root)?;
+        let event = declarations
+            .event(name)
+            .with_context(|| format!("{} declares no event {name}", root.join("pen.json").display()))?;
+        return Ok((event.tag, event.lanes(values)?));
+    }
+    let _ = (root, values);
+    bail!("only a checkout's pen.json names the game's events: give {name}'s tag")
+}
+
+/// One of the game's own sections, as `pen packets` writes it: by its
+/// declaration in the `pen.json` of the checkout at `root` (its name and
+/// records) when it has one, else by its tag and lanes.
+fn section_describer(root: Option<&Path>) -> Result<impl Fn(&pen_protocol::Extension) -> serde_json::Value> {
+    #[cfg(feature = "compiler")]
+    let declarations = match root {
+        Some(root) => pen_codegen::extensions::Declarations::of_checkout(root)?,
+        None => pen_codegen::extensions::Declarations::default(),
+    };
+    #[cfg(not(feature = "compiler"))]
+    let _ = root;
+    Ok(move |extension: &pen_protocol::Extension| {
+        #[cfg(feature = "compiler")]
+        if let Ok(described) = declarations.describe(extension.tag, &extension.values) {
+            return described;
+        }
+        serde_json::json!({ "tag": extension.tag, "values": extension.values })
+    })
+}
+
+/// `pen texture` and `pen font`, which need no checkout.
+#[cfg(feature = "compiler")]
+fn asset_tool(args: &Args) -> Result<()> {
+    let source = PathBuf::from(&args.operands[0]);
+    if args.command == "texture" {
+        return textures::texture(&source, args.path("--out"), args.flag("--linear"), !args.flag("--flat"));
+    }
+    let options = textures::FontOptions {
+        em: args.number("--em")?.unwrap_or(48.0),
+        range: args.number("--range")?.unwrap_or(4.0),
+        width: args.number("--width")?.unwrap_or(512),
+        weight: args.number("--weight")?,
+        chars: args.value("--chars"),
+    };
+    textures::font(&source, args.path("--out"), options)
+}
+
+#[cfg(not(feature = "compiler"))]
+fn asset_tool(args: &Args) -> Result<()> {
+    bail!("this player runtime has no {} tool", args.command)
+}
+
 fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
-    let args = Args::parse(words)?;
+    let mut args = Args::parse(words)?;
     if args.flag("--help") {
         println!("{}", usage());
         return Ok(());
     }
     if args.flag("--version") {
-        println!("pen {} (game runtime: {})", env!("CARGO_PKG_VERSION"), project::RUNTIME);
+        #[cfg(feature = "compiler")]
+        let plugins = format!(", plugins: {}@{}", pen_plugins::api::PACKAGE, pen_plugins::api::VERSION);
+        #[cfg(not(feature = "compiler"))]
+        let plugins = "";
+        println!("pen {} (game runtime: {}{plugins})", env!("CARGO_PKG_VERSION"), project::RUNTIME);
         return Ok(());
     }
     if args.command == "clean" {
         return clean();
     }
+    if args.command == "gltf" {
+        return import_gltf(&args);
+    }
+    if args.command == "report" {
+        return bugreport::open(Path::new(&args.operands[0]), args.path("--out").as_deref());
+    }
+    if args.command == "new" {
+        return new_game(&args);
+    }
+    if let "texture" | "font" = args.command {
+        return asset_tool(&args);
+    }
+    if let Some(network) = network(&args) {
+        return network;
+    }
+    if args.command == "patch" {
+        let store = args.path("--store").or_else(|| {
+            let directory = std::env::current_dir().ok()?;
+            Some(Project::around(&directory)?.join(".pen/store"))
+        });
+        let out = args.path("--out").context("patch needs --out FILE")?;
+        let made = patch::make(Path::new(&args.operands[0]), Path::new(&args.operands[1]), store.as_deref(), &out)?;
+        eprintln!("patch {}: {made}", out.display());
+        return Ok(());
+    }
+    if args.command == "apply" {
+        let package = match args.operands.get(1) {
+            Some(directory) => PathBuf::from(directory),
+            None => packaged_game()
+                .and_then(|game| game.parent().map(Path::to_owned))
+                .context("there is no package beside this executable: apply PATCH DIR")?,
+        };
+        let version = patch::apply(Path::new(&args.operands[0]), &package)?;
+        eprintln!("{} is now version {version}", package.display());
+        return Ok(());
+    }
+    // Sound files, anywhere: no checkout.
+    if args.command == "loudness" {
+        let files: Vec<PathBuf> = args.operands.iter().map(PathBuf::from).collect();
+        let options = loudness::Options {
+            normalize: args.flag("--normalize"),
+            target: args.number("--lufs")?,
+            peak: args.number("--ceiling")?,
+            targets: args.path("--targets"),
+        };
+        return loudness::run(&files, &options);
+    }
     // The checkout, for its commands but those given a game bundle instead.
-    let bundled =
-        args.command.is_empty() || (["test", "bench", "packets"].contains(&args.command) && args.flag("--game"));
+    let bundled = args.command.is_empty()
+        || (["build", "test", "bench", "packets", "diverge", "fuzz"].contains(&args.command) && args.flag("--game"));
     let (project, bundle) = if bundled {
         let directory = bundle_directory(&args)?;
         let _ = IDENTITY.set(project::bundle_identity(&directory)?);
@@ -1248,7 +2147,16 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         let _ = IDENTITY.set(project.identity.clone());
         (Some(project), None)
     };
+    let root = project.as_ref().map(|project| project.root.clone());
+    script::name_game_events(&mut args.script, &|name, values| game_event(root.as_deref(), name, values))?;
     crash::install(args.path("--data"));
+    // Only a player's windowed game has someone to show an error to.
+    if args.flag("--headless") || !args.command.is_empty() {
+        crash::unattended();
+    }
+    if let (true, Some(directory)) = (args.command.is_empty(), &bundle) {
+        reports::install(directory, args.path("--data").unwrap_or_else(data_dir));
+    }
     let software = args.flag("--software") || env_flag("PEN_SOFTWARE");
     // Every command but playing a package has its checkout, or its bundle.
     let checkout = || project.as_ref().context("no checkout");
@@ -1274,7 +2182,19 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         "check" => {
             let project = checkout()?;
             project.compile(&project.native())?;
-            project.compile_devtools(&project.native())
+            project::check_saved_types(&project.assets())?;
+            project.compile_devtools(&project.native())?;
+            let wasm = std::fs::read(project.native().join("game.wasm"))?;
+            asset_lint::check(&project.root, &project.assets(), &wasm)
+        }
+        "assets" => {
+            let project = checkout()?;
+            let cache = match args.path("--cache") {
+                Some(directory) => directory,
+                None => asset_graph::default_cache().context("this system has no cache directory: pass --cache DIR")?,
+            };
+            let options = asset_graph::Options { cache, check: args.flag("--check"), only: args.values("--only") };
+            asset_graph::summarize(&asset_graph::run(&project.root, &options)?, options.check)
         }
         #[cfg(feature = "compiler")]
         "codegen" => pen_codegen::generate(&checkout()?.root, args.path("--rust").as_deref(), args.flag("--check")),
@@ -1296,40 +2216,76 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             play(&args, Game::checkout(project), false, false, Some(&project.root), software)
         }
         "build" => {
-            let project = checkout()?;
-            if args.flag("--web") {
-                let out = args.path("--out").unwrap_or_else(|| project.root.join(".pen/web-export"));
-                return project::export_web(project, &out);
-            }
-            let out = args.path("--out").unwrap_or_else(|| project.root.join(".pen/package"));
             let options = project::PackageOptions {
                 runtime: args.path("--runtime"),
                 target: args.value("--target"),
                 cpu: args.value("--cpu"),
+                bundle_id: args.value("--bundle-id"),
+                store: args.path("--store"),
             };
-            project::package(project, &out, options)
+            // A bundle compiled already packages as it is, for another platform's runtime.
+            if let Some(bundle) = &bundle {
+                ensure!(!args.flag("--web"), "pen build --web exports a checkout, not --game");
+                ensure!(!args.flag("--zip"), "--zip goes with --web");
+                let out = args.path("--out").context("pen build --game needs --out DIR")?;
+                return project::package(project::GameSource::Bundle(bundle), &out, options);
+            }
+            let project = checkout()?;
+            let stores = publish::Request {
+                steam: args.flag("--steam"),
+                itch: args.flag("--itch"),
+                upload: args.flag("--upload"),
+                label: args.value("--label"),
+            }
+            .plan(project)?;
+            let web = args.flag("--web");
+            let out = if web {
+                let out = args.path("--out").unwrap_or_else(|| project.root.join(".pen/web-export"));
+                project::export_web(project, &out, args.path("--zip").as_deref())?;
+                out
+            } else {
+                ensure!(!args.flag("--zip"), "--zip goes with --web");
+                let out = args.path("--out").unwrap_or_else(|| project.root.join(".pen/package"));
+                project::package(project::GameSource::Checkout(project), &out, options)?;
+                out
+            };
+            match stores {
+                Some(stores) => stores.publish(project, &out, web),
+                None => Ok(()),
+            }
         }
         "test" => {
-            if let Some(project) = &project {
-                project.compile(&project.native())?;
-            }
-            let game = game(project.as_ref());
             let root = match &project {
                 Some(project) => project.root.clone(),
                 None => std::env::current_dir()?,
             };
             let file =
                 args.operands.first().map(PathBuf::from).unwrap_or_else(|| root.join("tests/visual/scenarios.json"));
+            let golden =
+                args.path("--golden").unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join("golden"));
+            let out = args.path("--out").unwrap_or_else(|| root.join(".pen/visual"));
+            let review = args.flag("--review").then(|| args.number("--port")).transpose()?;
+            // The last run's review again: nothing runs, nothing draws.
+            if args.flag("--last") {
+                let port = review.context("--last is for --review")?;
+                return review::serve(&out, &golden, review::last(&out)?, port);
+            }
+            if let Some(project) = &project {
+                project.compile(&project.native())?;
+            }
+            let game = game(project.as_ref());
             let engine = blot_host::engine()?;
             let module = load_module(&engine, &game.directory, true)?;
             let catalog = read_catalog(&game.assets)?;
             let test = visual::TestOptions {
-                golden: args.path("--golden").unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join("golden")),
-                out: args.path("--out").unwrap_or_else(|| root.join(".pen/visual")),
+                checkout: project.as_ref().map(|project| project.root.clone()),
+                golden,
+                out,
                 file,
                 update: args.flag("--update"),
                 only: args.values("--only"),
                 software,
+                review,
             };
             let scene = game.scene_to_start();
             let visual_game = visual::Game { directory: &game.directory, assets: &game.assets, scene: &scene };
@@ -1341,38 +2297,132 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             }
             let game = game(project.as_ref());
             let engine = blot_host::engine()?;
-            let module = load_module(&engine, &game.directory, true)?;
+            let bench = command == "bench";
+            // A bench times loading the module, so not from the cache.
+            let loading = Instant::now();
+            let module = load_module(&engine, &game.directory, !bench)?;
+            let load_ms = loading.elapsed().as_secs_f64() * 1000.0;
             let frames: Option<usize> = args.number("--frames")?;
-            let steps = args.script.clone();
-            let out = (command == "packets").then(|| PathBuf::from(&args.operands[0]));
-            let frames = match (command, steps.is_empty()) {
+            let out = (!bench).then(|| PathBuf::from(&args.operands[0]));
+            let frames = match (command, args.script.is_empty()) {
                 ("bench", _) => Some(frames.unwrap_or(600)),
                 (_, true) => Some(frames.unwrap_or(120)),
                 _ => frames,
             };
-            packets::run(packets::Run {
-                module: &module,
-                engine: &engine,
-                assets: game.assets.clone(),
-                scene: game.scene_to_start(),
-                viewport: Viewport { width: 1280, height: 720 },
-                out,
+            let describe = section_describer(root.as_deref())?;
+            let run = |out: Option<PathBuf>| {
+                packets::run(packets::Run {
+                    module: &module,
+                    engine: &engine,
+                    assets: game.assets.clone(),
+                    scene: game.scene_to_start(),
+                    viewport: Viewport { width: 1280, height: 720 },
+                    out,
+                    frames,
+                    steps: args.script.clone(),
+                    mods: load_mods(&args)?,
+                    snapshots: bench,
+                    describe: &describe,
+                })
+            };
+            if !bench {
+                return run(out).map(drop);
+            }
+            let runs: usize = args.number("--runs")?.unwrap_or(1);
+            ensure!(runs > 0, "--runs takes 1 or more");
+            let measured = (0..runs).map(|_| run(None)).collect::<Result<Vec<_>>>()?;
+            let wasm = std::fs::read(game.directory.join("game.wasm"))?;
+            let results = bench::results(&wasm, load_ms, &measured)?;
+            if args.flag("--json") {
+                println!("{}", serde_json::to_string_pretty(&results)?);
+            }
+            let bases: Vec<PathBuf> = args.values("--compare").into_iter().map(PathBuf::from).collect();
+            ensure!(!bases.is_empty() || args.value("--threshold").is_none(), "--threshold is for --compare");
+            if bases.is_empty() { Ok(()) } else { bench::check(&bases, &results, args.number("--threshold")?) }
+        }
+        "diverge" => {
+            if let Some(project) = &project {
+                project.compile(&project.native())?;
+            }
+            let game = game(project.as_ref());
+            let against = args.path("--against").context("diverge needs --against DIR, the build to compare with")?;
+            let reference = diverge::Bundle { assets: against.join("assets"), directory: against };
+            let this = diverge::Bundle { directory: game.directory, assets: game.assets };
+            diverge::run(Path::new(&args.operands[0]), &this, &reference)
+        }
+        "fuzz" => {
+            if let Some(project) = &project {
+                project.compile(&project.native())?;
+            }
+            let game = game(project.as_ref());
+            let fuzzed = fuzz::Game::load(blot_host::engine()?, &game.directory, &game.assets, &game.scene_to_start())?;
+            let frames: usize = args.number("--frames")?.unwrap_or(600);
+            // A script given (one a run was cut down to): the same checks on it.
+            if !args.script.is_empty() {
+                return match fuzz::check(&fuzzed, args.script.clone(), frames)? {
+                    Some(broken) => {
+                        bail!(
+                            "the script breaks \"{}\" at frame {}: {}",
+                            broken.invariant,
+                            broken.frame,
+                            broken.message
+                        )
+                    }
+                    None => {
+                        eprintln!("fuzz: the script broke nothing in {frames} frames");
+                        Ok(())
+                    }
+                };
+            }
+            let tunables = match &project {
+                Some(project) => tunables::load(&project.root).unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let root = project.as_ref().map(|project| project.root.clone());
+            let options = fuzz::Options {
+                seed: args.number("--seed")?.unwrap_or(1),
+                runs: args.number("--runs")?.unwrap_or(10),
                 frames,
-                steps,
-            })
-            .map(drop)
+                out: args.path("--out").unwrap_or_else(|| root.unwrap_or_default().join(".pen/fuzz")),
+                vocabulary: fuzz::Vocabulary {
+                    tunables: tunables.into_iter().map(|tunable| (tunable.name, tunable.min, tunable.max)).collect(),
+                },
+            };
+            fuzz::run(&fuzzed, &options, None).map(drop)
         }
         #[cfg(feature = "compiler")]
         "test-blot" => {
             let project = checkout()?;
             let files = args.operands.iter().map(PathBuf::from).collect();
-            let options = blot_test::Options { files, filter: args.value("--filter"), jobs: args.number("--jobs")? };
+            let deadline = args.number::<u64>("--deadline")?.map(std::time::Duration::from_secs);
+            let options =
+                blot_test::Options { files, filter: args.value("--filter"), jobs: args.number("--jobs")?, deadline };
             blot_test::run(&project.root, options)
         }
         #[cfg(not(feature = "compiler"))]
         "test-blot" => bail!("this pen has no plugins, which compile a checkout's Blot tests"),
-        other => unreachable!("Args::parse takes only known commands, not {other}"),
+        other => unreachable!("Args::parse takes only known commands, and run the rest earlier, not {other}"),
     }
+}
+
+/// `pen gltf FILE`: the file's assets into `--out` (gltf.rs).
+#[cfg(feature = "compiler")]
+fn import_gltf(args: &Args) -> Result<()> {
+    let options = pen_gltf::Options {
+        name: args.value("--name"),
+        shader: args.value("--shader").unwrap_or_else(|| "scene.wgsl".to_owned()),
+        vat: args.number("--vat")?.map(|fps| pen_gltf::VatOptions {
+            fps,
+            shader: args.value("--vat-shader").unwrap_or_else(|| "vat.wgsl".to_owned()),
+        }),
+    };
+    let out = args.path("--out").unwrap_or_else(|| PathBuf::from("src/assets"));
+    gltf::import(Path::new(&args.operands[0]), &out, &options)
+}
+
+#[cfg(not(feature = "compiler"))]
+fn import_gltf(_: &Args) -> Result<()> {
+    bail!("this player runtime has no asset importer")
 }
 
 #[cfg(test)]
@@ -1403,29 +2453,49 @@ mod tests {
         assert_eq!(parse("test scenarios.json --only rock --only menu").unwrap().values("--only"), ["rock", "menu"]);
         assert_eq!(parse("test-blot a.blot b.blot --jobs 2").unwrap().operands, ["a.blot", "b.blot"]);
         assert_eq!(parse("packets out --frames 5").unwrap().operands, ["out"]);
+        let args = parse("gltf models/a.glb --vat 30 --out assets").unwrap();
+        assert_eq!(
+            (args.operands.as_slice(), args.number::<f32>("--vat").unwrap()),
+            (&["models/a.glb".to_owned()][..], Some(30.0))
+        );
+        assert!(parse("gltf").is_err() && parse("gltf a.glb --frames 3").is_err());
+        assert_eq!(parse("patch v1 v2 --out up.penpatch").unwrap().operands, ["v1", "v2"]);
+        assert_eq!(parse("apply up.penpatch").unwrap().operands, ["up.penpatch"]);
         assert!(parse("--version").unwrap().flag("--version"));
         assert!(parse("clean").is_ok());
+        let args = parse("push deck.local:7811 --token t --run gdev").unwrap();
+        assert_eq!(
+            (args.operands.as_slice(), args.value("--run").as_deref()),
+            (&["deck.local:7811".to_owned()][..], Some("gdev"))
+        );
+        assert_eq!(parse("remote 127.0.0.1 watch 100 3 3 5").unwrap().operands.len(), 6);
+        assert_eq!(parse("remote 127.0.0.1 state -1").unwrap().operands[2], "-1");
+        assert!(parse("serve --listen 0.0.0.0:7811 --allow-run").unwrap().flag("--allow-run"));
+        assert!(parse("run --devtools-listen 127.0.0.1:7812").is_ok());
     }
 
     #[test]
     fn mistakes_are_refused_with_what_was_meant() {
         assert_eq!(
             error("tset"),
-            "unknown command tset (did you mean test?); the commands are dev, web, run, build, check, codegen, export, test, bench, packets, test-blot and clean (pen --help)"
+            "unknown command tset (did you mean test?); the commands are dev, web, run, build, check, assets, codegen, export, test, bench, packets, test-blot, gltf, diverge, fuzz, report, new, texture, font, patch, apply, loudness, clean, serve, push and remote (pen --help)"
         );
         assert_eq!(error("run --frame 300"), "pen run has no option --frame (did you mean --frames?) (pen --help)");
-        assert_eq!(error("run --port 8000"), "--port is for pen web, not pen run");
+        assert_eq!(error("run --port 8000"), "--port is for pen web and pen test, not pen run");
         assert_eq!(
             error("build --frames 3"),
-            "--frames is for pen, pen dev, pen run, pen bench and pen packets, not pen build"
+            "--frames is for pen, pen dev, pen run, pen bench, pen packets and pen fuzz, not pen build"
         );
-        assert_eq!(error("--steam"), "pen has no option --steam (pen --help)");
+        assert_eq!(error("--steam"), "--steam is for pen build, not pen");
+        assert_eq!(error("--stem"), "pen has no option --stem (pen --help)");
         assert_eq!(error("dev --overlay=1"), "--overlay takes no value");
         assert_eq!(error("run --frames"), "--frames takes a value: --frames N");
         assert_eq!(error("build --out --web"), "--out takes a value: --out DIR");
         assert_eq!(error("run extra"), "pen run takes no operands, not extra");
         assert_eq!(error("test a.json b.json"), "pen test takes [FILE] and options, not b.json");
         assert_eq!(error("packets"), "pen packets needs DIR");
+        assert_eq!(error("patch v1"), "pen patch needs OLD NEW");
+        assert_eq!(error("apply a b c"), "pen apply takes PATCH [DIR] and options, not c");
         assert_eq!(error("-x"), "pen has no option -x (pen --help)");
         assert_eq!(error("run --script bogus=1"), "unknown script step bogus=1");
         let args = parse("run --frames many").unwrap();
@@ -1463,10 +2533,19 @@ mod tests {
             "PEN_FRAME_TIMES",
             "PEN_RECORD_PCM",
             "PEN_PLUGINS",
+            "PEN_ASSET_CACHE",
+            "PEN_STARTUP",
             "PEN_WEB_HOST",
             "PEN_STEAM_APP_ID",
             "PEN_CRASH_TEST",
             "BLOT_INLINING",
+            "STEAM_BUILD_USER",
+            "PEN_STEAMCMD",
+            "PEN_BUTLER",
+            "BUTLER_API_KEY",
+            "PEN_GRAPHICS_TIER",
+            "SOURCE_DATE_EPOCH",
+            "PEN_REPORTS",
         ] {
             assert!(text.contains(name), "{name}");
         }

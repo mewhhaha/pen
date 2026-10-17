@@ -225,7 +225,7 @@ fn describes_outcomes() {
 #[test]
 fn runs_tests_that_must_trap() {
     let engine = blot_host::engine().unwrap();
-    let tests = run_tests(&engine, &trapping_sample(), Kind::Traps, "test_", None).unwrap();
+    let tests = run_tests(&engine, &trapping_sample(), Kind::Traps, "test_", None, &Slots::new(4)).unwrap();
     assert_eq!(tests.tests.len(), 6);
     let outcome = |name: &str| &tests.tests.iter().find(|(test, _)| test == name).unwrap().1;
     // Trapping at `unreachable`, as `@panic` does, passes.
@@ -260,7 +260,7 @@ fn runs_tests_that_must_trap() {
         assert!(lines[1].starts_with(&format!("    wasm trap: {trap}")), "{}", lines[1]);
     }
     // Where a test must not trap, `unreachable` fails it.
-    let checks = run_tests(&engine, &trapping_sample(), Kind::Checks, "test_", Some("panics")).unwrap();
+    let checks = run_tests(&engine, &trapping_sample(), Kind::Checks, "test_", Some("panics"), &Slots::new(4)).unwrap();
     let Outcome::Broken(trap) = &checks.tests[0].1 else { panic!("{:?}", checks.tests) };
     assert!(trap.starts_with("wasm trap: wasm `unreachable`"), "{trap}");
 }
@@ -317,6 +317,28 @@ fn tallies_modules_by_what_the_plugin_expects() {
 }
 
 #[test]
+fn slots_bound_how_many_tests_run_at_once() {
+    let slots = Slots::new(2);
+    let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        for _ in 0..6 {
+            scope.spawn(|| {
+                slots.hold(|| {
+                    most.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                });
+            });
+        }
+    });
+    assert_eq!(most.load(Ordering::SeqCst), 2);
+    // A slot comes back when its work panics.
+    let one = Slots::new(1);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| one.hold(|| panic!("a test")))).is_err());
+    assert_eq!(one.hold(|| 7), 7);
+}
+
+#[test]
 fn hands_results_over_in_order() {
     let items: Vec<u64> = (0..12).collect();
     let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
@@ -347,7 +369,7 @@ fn hands_results_over_in_order() {
 #[test]
 fn runs_a_modules_tests() {
     let engine = blot_host::engine().unwrap();
-    let tests = run_tests(&engine, &sample(), Kind::Checks, "test_", None).unwrap();
+    let tests = run_tests(&engine, &sample(), Kind::Checks, "test_", None, &Slots::new(4)).unwrap();
     let names: Vec<&str> = tests.tests.iter().map(|(name, _)| name.as_str()).collect();
     // Only `test_…` entries, Unit to Array F32, in the module's order.
     assert_eq!(names, ["test_passes", "test_fails", "test_traps", "test_malformed"]);
@@ -362,10 +384,10 @@ fn runs_a_modules_tests() {
     assert!(malformed.starts_with("its report is malformed (it ends within failure 1's expected"), "{malformed}");
     assert!(malformed.ends_with("[1, 1, 1, 5]"), "{malformed}");
 
-    let filtered = run_tests(&engine, &sample(), Kind::Checks, "test_", Some("fail")).unwrap();
+    let filtered = run_tests(&engine, &sample(), Kind::Checks, "test_", Some("fail"), &Slots::new(4)).unwrap();
     assert_eq!(filtered.tests.len(), 1);
     assert_eq!(filtered.tests[0].0, "test_fails");
-    assert!(run_tests(&engine, b"\0asm\x01\0\0\0", Kind::Checks, "test_", None).is_err());
+    assert!(run_tests(&engine, b"\0asm\x01\0\0\0", Kind::Checks, "test_", None, &Slots::new(4)).is_err());
 }
 
 #[test]
@@ -388,7 +410,7 @@ fn runs_the_checkouts_pilot() {
     let mut builder = Builder::new(plugins, Path::new(&test.entry));
     let wasm = build_test_module(&mut builder, &test).unwrap();
     let engine = blot_host::dev_engine().unwrap();
-    let tests = run_tests(&engine, &wasm, Kind::Checks, &test.prefix, None).unwrap();
+    let tests = run_tests(&engine, &wasm, Kind::Checks, &test.prefix, None, &Slots::new(4)).unwrap();
     assert!(!tests.tests.is_empty());
     for (name, outcome) in &tests.tests {
         assert!(outcome.passed(), "{}", describe(name, outcome).join("\n"));

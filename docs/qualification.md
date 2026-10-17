@@ -47,3 +47,18 @@ Reproduce with `just test`, `just ship`, and the browser harness commands in
 `target/fxaa`, `target/browser-conformance`, `target/browser-shots`,
 `dist/determinism`, and `~/.cache/pen/qualification`. Retired source snapshots
 are archived in `~/.cache/pen/retired-typescript-20261011`.
+
+## 2026-10-16: reach and CI
+
+Checked on the same machine, headless, for the CI work in [ci.md](ci.md):
+
+| Check | Result |
+|---|---|
+| lavapipe (Mesa 26.2.4, unpacked into a scratch directory, `VK_DRIVER_FILES` naming it) | The six golden scenarios run; against the GPU's shots of the same build its frames differ by 0.08 to 1.21% RMSE (texture filtering on the rock; zoomed is the most), hence a software threshold of 1.5%; the suite took 64 minutes and 99 CPU-minutes on a machine loaded by other builds, its first settle 4.5 minutes, past the old 60 s patience |
+| `just determinism` on lavapipe | Passed: the 831-frame script twice and overlapped, its recording replayed, 460 time-travel frames run again and the final timeline replayed, all the same packets. Each of the six runs settled in 64 to 127 s, every one past the old 60 s patience, after which it would have started with assets still loading. It took 1 h 46 min on the loaded machine at about one frame a second, so its runs now draw at 960x640 rather than 1920x1280 (the packets are compared, not pixels; the GPU gives the same results at either size) |
+| Goldens against gdev 33643cc | brush, editor and menu pass; play, struck and zoomed fail on the GPU too (RMSE 2.64, 3.12, 1.89%; the base pen gives the same): the baselines predate gdev's newer play-mode interface and need inspecting and recording again |
+| `pen build --game` | Packaged `dist/gdev` for a Windows player (cross-built with zig), a Linux one and, as a layout check, an `x86_64-apple-darwin` app bundle; the Linux package's 367 conformance frames equal the checkout's bit for bit |
+| `just slr` | A glibc 2.28 player package: host, soldier and sniper drew the same last frame; alone in each container it started on the container's glibc 2.31 |
+| Apple and Android targets | pen (full and player) passes Clippy for `aarch64-apple-darwin` and the player for `x86_64-apple-darwin`; the portable crates for `aarch64-linux-android`, with zig standing in for the platforms' C compilers |
+| Display scale | In a nested headless sway at 1.5 the 960x640 window drew 1440x960 frames, and through its Xwayland with `WINIT_X11_SCALE_FACTOR=1.25`, frames 1200 wide ([display-scale.md](display-scale.md)) |
+

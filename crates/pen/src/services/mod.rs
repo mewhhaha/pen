@@ -11,9 +11,10 @@
 //! The registry ([`Services`], pen-runtime's, which the browser shares)
 //! has one service per code (`pen_protocol::service`): Steam's
 //! achievements, stats and rich presence, the clipboard, opening a web
-//! address, what the game runs on, and grid pathfinding. A request for a
-//! code nobody registered is answered `unknown`; one a service cannot do
-//! here (Steam is off) `unavailable`.
+//! address, what the game runs on, grid pathfinding, and the simulation
+//! services (`pen_simulation`: physics, navmesh paths, spatial queries and
+//! noise). A request for a code nobody registered is answered `unknown`;
+//! one a service cannot do here (Steam is off) `unavailable`.
 //!
 //! Linking a native library as a service: implement [`Service`] (its code,
 //! and an answer for each request, from the request's operation, four
@@ -34,6 +35,7 @@
 use crate::input::Input;
 
 pub mod clipboard;
+pub mod locale;
 pub mod platform;
 pub mod steam;
 pub mod url;
@@ -51,8 +53,9 @@ pub use pen_runtime::services::Service;
 pub type Services = pen_runtime::services::Services<Input>;
 
 /// The runtime's own: Steam (unavailable until [`steam::SteamService`] with
-/// a client replaces it), the clipboard, web addresses, the platform and
-/// pathfinding.
+/// a client replaces it), the clipboard, web addresses, the platform,
+/// pathfinding, the simulation services (`pen_simulation`) and the
+/// player's consent to reports (`crate::reports`).
 pub fn standard() -> Services {
     let mut services = Services::new();
     services.register(Box::new(steam::SteamService::off()));
@@ -60,6 +63,8 @@ pub fn standard() -> Services {
     services.register(Box::new(url::Url));
     services.register(Box::new(platform::platform()));
     services.register(Box::new(pen_runtime::services::Pathfinding));
+    pen_simulation::register(&mut services);
+    services.register(Box::new(crate::reports::Reports::new()));
     services
 }
 
@@ -97,6 +102,13 @@ mod tests {
             value: 0.0,
             length: 0
         }));
+    }
+
+    /// The simulation services answer native pen's requests with the bits
+    /// every host must give (the browser checks the same digest).
+    #[test]
+    fn the_simulation_services_answer_as_every_host_does() {
+        pen_simulation::conformance::check(&mut standard()).unwrap();
     }
 }
 
@@ -197,7 +209,17 @@ mod replay {
         let Some(directory) = bundle() else { return };
         let calls = Rc::new(Cell::new(0));
         let mut services = Services::new();
-        for code in [service::STEAM, service::CLIPBOARD, service::URL, service::PLATFORM, service::PATHFINDING] {
+        let codes = [
+            service::STEAM,
+            service::CLIPBOARD,
+            service::URL,
+            service::PLATFORM,
+            service::PATHFINDING,
+            service::PREFERENCES,
+            service::LOCALE,
+            service::REPORTS,
+        ];
+        for code in codes {
             services.register(Box::new(Fake { code, calls: calls.clone() }));
         }
         let mut live = start(&directory);
@@ -205,7 +227,7 @@ mod replay {
         let (inputs, packets) = play(&mut live, &mut services);
         live.close();
         // The platform's three questions, Steam's status, its stat and its
-        // presence at least, each asked once.
+        // presence at least, and its words, each asked once.
         let asked = calls.get();
         assert!(asked >= 6, "{asked} calls");
         assert_eq!(u64::from(asked), services.calls());

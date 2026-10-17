@@ -1,0 +1,1 @@
+size: listitem #0x50400 "Brush 0" is 773x3 pixels, smaller than 24x24

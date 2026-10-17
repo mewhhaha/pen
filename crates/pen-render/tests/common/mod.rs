@@ -15,6 +15,18 @@ pub fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     pollster::block_on(adapter.request_device(&Default::default())).ok()
 }
 
+/// A headless device with the features the renderer uses where the adapter
+/// has them (timestamps among them).
+pub fn featured_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+    let features = pen_render::optional_features(&adapter);
+    pollster::block_on(
+        adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() }),
+    )
+    .ok()
+}
+
 /// A frame of these draws seen through identity matrices, every effect off.
 pub fn frame(draws: Vec<Draw>) -> RenderFrame {
     let zero = Vector::default();
@@ -33,6 +45,7 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
             sky: false,
             effects: false,
             bloom: false,
+            taa: false,
         },
         sky: Sky { zenith: zero, horizon: zero, ground: zero, sun: Vector { x: 0.0, y: 1.0, z: 0.0 }, night: 0.0 },
         fog: Fog { radius: 0.0, density: 0.0, height: 1.0 },
@@ -53,6 +66,12 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
         sounds: Vec::new(),
         buses: Vec::new(),
         voices: Vec::new(),
+        poses: Vec::new(),
+        emitters: Vec::new(),
+        extensions: Vec::new(),
+        lights: Vec::new(),
+        listener: Vec::new(),
+        panners: Vec::new(),
         preferences: None,
         load_requested: false,
         save_requested: false,
@@ -158,4 +177,33 @@ pub fn failed(events: &[GameEvent], key: &str, revision: u64) -> bool {
     events
         .iter()
         .any(|event| matches!(event, GameEvent::AssetFailed { key: k, revision: r, .. } if k == key && *r == revision))
+}
+
+/// The output's pixels, as RGBA, row by row.
+pub fn pixels(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<[u8; 4]> {
+    let (width, height) = (texture.width(), texture.height());
+    let row = (width * 4).next_multiple_of(256);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: u64::from(row * height),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None },
+        },
+        wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+    );
+    queue.submit([encoder.finish()]);
+    buffer.slice(..).map_async(wgpu::MapMode::Read, |result| result.unwrap());
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
+    bytes
+        .chunks(row as usize)
+        .flat_map(|line| line[..(width * 4) as usize].as_chunks::<4>().0.iter().map(|&[b, g, r, a]| [r, g, b, a]))
+        .collect()
 }

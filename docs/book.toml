@@ -1,0 +1,15 @@
+[book]
+title = "pen"
+description = "A native and browser runtime for games compiled to WebAssembly: making a game, and how pen runs it."
+language = "en"
+# The chapters are this directory's Markdown files; SUMMARY.md orders them.
+src = "."
+
+[build]
+build-dir = "book"
+# A chapter SUMMARY.md names but nobody wrote is an error, not an empty page.
+create-missing = false
+
+[output.html]
+# Links to files outside the book (the repository's README, the WIT) are
+# left as they are.

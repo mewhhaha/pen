@@ -1,0 +1,13 @@
+Window "gdev"
+  Dialog #262146 "Settings" modal at=0,0 size=960x640
+    TabList #262150 "Sections" at=204.44443,131.2 size=551.1112x33.777786
+      Tab #262160 "Graphics" selected=false at=204.44443,131.2 size=110.22223x33.77778 actions=focus,activate
+      Tab #262161 "Audio" selected=false at=314.66666,131.2 size=110.22223x33.77778 actions=focus,activate
+      Tab #262162 "Controls" selected=false at=424.8889,131.2 size=110.22223x33.77778 actions=focus,activate
+      Tab #262163 "Accessibility" selected=true at=535.1111,131.2 size=110.22223x33.77778 actions=focus,activate
+      Tab #262164 "About" selected=false at=645.3334,131.2 size=110.22223x33.77778 actions=focus,activate
+    TabPanel #262179 "Accessibility" at=204.44443,179.2 size=551.1111x135.1111
+      SpinButton #262752 "Colour filter" value="Off" number=0 range=0..4 step=1 at=204.44443,179.2 size=551.11115x33.77778 actions=focus,increment,decrement,set_value <- focus
+      SpinButton #262753 "Text size" value="100%" number=0 range=0..4 step=1 at=204.44443,212.97778 size=551.11115x33.77778 actions=focus,increment,decrement,set_value
+      Switch #262754 "Reduced motion" toggled=false at=204.44443,246.75555 size=551.11115x33.77778 actions=focus,activate
+      Button #262755 "Back" at=204.44443,280.53333 size=551.11115x33.77778 actions=focus,activate

@@ -1,0 +1,6 @@
+// pen runs `main`, giving it the host; pen/extensions' `run` serves the game
+// with its own events and sections (pen.json's `protocol`) beside pen's.
+import * as extensions from "pen/extensions"
+import { game } from "./game"
+
+entry const main = fn host => extensions.run game host

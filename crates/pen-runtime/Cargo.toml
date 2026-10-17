@@ -10,4 +10,10 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 pen-protocol.workspace = true
+# Source maps (symbols.rs), already pen-protocol's, and the player's action
+# bindings, kept with their preferences (actions).
+# Deflates the recordings that links carry (recording::fragment).
+miniz_oxide = "0.8"
+serde_json = "1"
+unicode-bidi = "0.3"
 web-time = "1"

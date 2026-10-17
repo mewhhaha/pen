@@ -1,3 +1,4 @@
 target/
 /dist
 crates/pen-web/pkg/
+/docs/book/

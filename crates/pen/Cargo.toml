@@ -3,7 +3,7 @@ name = "pen"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Native runtime for gdev: winit window, wgpu renderer, wasmtime guest"
+description = "Native runtime for games compiled to Wasm: winit window, wgpu renderer, wasmtime guest"
 
 [lints]
 workspace = true
@@ -16,11 +16,13 @@ path = "src/main.rs"
 default = ["compiler", "devtools"]
 # Everything that builds a checkout: Cranelift, which compiles game.wasm;
 # the Wasm plugins (`pen-plugins`, wit/pen-plugin.wit) its pen.json chooses
-# to compile its programs; and the protocol generator. Every command but
-# playing a packaged game needs it. Without it (`--no-default-features`)
-# this is the player runtime `pen build` ships: it only loads the
-# game.cwasm the package was precompiled with.
-compiler = ["blot-host/compiler", "dep:pen-codegen", "dep:pen-plugins"]
+# to compile its programs; the protocol generator; the glTF importer; the
+# texture and font tools; the mesh simplifier, which gives packages' large
+# meshes levels of detail; and Brotli for browser exports. Every command but playing a packaged game
+# needs it. Without it (`--no-default-features`) this is the player runtime
+# `pen build` ships: it only loads the game.cwasm the package was
+# precompiled with.
+compiler = ["blot-host/compiler", "dep:pen-codegen", "dep:pen-gltf", "dep:pen-plugins", "dep:pen-texture", "pen-render/simplify", "dep:brotli"]
 steam = ["dep:steamworks"]
 # The dev tools: the checkout's own Blot program for its console and
 # diagnostics, compiled through its plugins and run beside the game in
@@ -33,9 +35,14 @@ blot-host.workspace = true
 log = { version = "0.4", features = ["std"] }
 pen-plugins = { workspace = true, optional = true }
 pen-codegen = { workspace = true, optional = true }
+# Imports glTF files as assets (`pen gltf`), for asset recipes.
+pen-gltf = { workspace = true, optional = true }
+# The asset pipeline's texture tools: `pen texture` and `pen font`.
+pen-texture = { workspace = true, optional = true, features = ["tools"] }
 pen-protocol.workspace = true
 pen-runtime.workspace = true
 pen-render.workspace = true
+pen-simulation.workspace = true
 wasmtime.workspace = true
 # The game's interface (and the dev tools') for assistive technology:
 # AT-SPI on Linux, UI Automation on Windows, NSAccessibility on macOS. The
@@ -45,11 +52,22 @@ accesskit_winit = "0.34"
 # The clipboard the game copies to and pastes from (services::clipboard): X11
 # (and XWayland), Windows and macOS, without arboard's image support.
 arboard = { version = "3.6", default-features = false }
+# A browser export's precompressed Brotli copies (web_export).
+brotli = { version = "9", optional = true }
 # The audio output (audio::device): ALSA, WASAPI or CoreAudio, its thread
 # at real-time priority (RtKit, over D-Bus, on Linux).
 cpal = { version = "0.18", features = ["realtime-dbus"] }
 dirs = "7"
+# The player's gamepads (gamepad): evdev through udev on Linux, Windows.Gaming.Input
+# on Windows; pen-runtime's dead zone replaces its filters, and force
+# feedback is off.
+gilrs = "0.11"
+# Patches between package versions are deflated (patch.rs), and so are a
+# browser export's gzip copies and its ZIP (web_export).
+flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Which asset keys the game's program names (project.rs).
+memchr = "2"
 notify = "8"
 # Ogg Opus clips (opus.rs): the pages, and libopus (vendored, built with
 # CMake) for the packets.
@@ -57,7 +75,17 @@ ogg = "0.9"
 opusic-sys = "0.7"
 pollster = "1"
 serde = { version = "1", features = ["derive"] }
+# The WebSocket handshake's accept key (spectate::websocket), and nothing else.
+sha1_smol = "1"
 serde_json = { version = "1", features = ["raw_value"] }
+# WGSL parsed and validated by `pen check`'s asset lints, as wgpu does
+# (the same naga wgpu builds).
+naga = { version = "30", features = ["wgsl-in"] }
+# Digests of asset files (the asset cache's keys and the content-addressed
+# store's names, store.rs), and of the files `pen push` sends and `pen
+# serve` keeps (as blot-host keys its compiled modules), and a browser
+# export's version.
+sha2 = "0.10"
 steamworks = { version = "0.13", optional = true }
 # PCM WAV clips (audio::load_clip); Ogg Opus ones decode in opus.rs.
 symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm"] }
@@ -67,6 +95,11 @@ winit = "0.30"
 # Asks an asset recipe to stop (pipeline): `just` passes SIGTERM on.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# AT-SPI without a window, for headless runs an assistive technology reads
+# (PEN_A11Y_ATSPI); accesskit_winit's own adapter, on the same executor.
+[target.'cfg(target_os = "linux")'.dependencies]
+accesskit_unix = "0.24"
 
 # The player's locale (services::platform), and the message box the player
 # runtime, which has no console, shows an error in.

@@ -1,0 +1,122 @@
+# Guest time per commit: `pen bench` on this commit and on the one it is
+# measured against (a pull request's base, else the commit before), built
+# and run on the same runner, so the runner's own speed cancels out. The
+# commit's run compares itself with the base's (`pen bench --compare`) and
+# fails the job when a metric is slower than its threshold; both results are
+# kept as an artifact named for the commit. Like CI's game job, it needs the
+# sibling checkouts' repository and revision variables and CHECKOUTS_TOKEN.
+name: Bench
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  ZIG_VERSION: 0.17.0
+  # Each bench keeps each metric's best of this many runs of 600 frames.
+  BENCH_RUNS: "5"
+
+jobs:
+  bench:
+    name: Guest time against the base commit
+    if: ${{ vars.GDEV_REPOSITORY != '' && vars.BLOT2_REPOSITORY != '' && vars.GDEV_REF != '' && vars.BLOT2_REF != '' && vars.INK_REPOSITORY != '' && vars.INK_REF != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: pen
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pen
+          # The base commit is built from this clone too.
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.GDEV_REPOSITORY }}
+          ref: ${{ vars.GDEV_REF }}
+          token: ${{ secrets.CHECKOUTS_TOKEN }}
+          path: gdev
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.BLOT2_REPOSITORY }}
+          ref: ${{ vars.BLOT2_REF }}
+          token: ${{ secrets.CHECKOUTS_TOKEN }}
+          path: blot2
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.INK_REPOSITORY }}
+          ref: ${{ vars.INK_REF }}
+          token: ${{ secrets.CHECKOUTS_TOKEN }}
+          path: ink
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config cmake libasound2-dev libdbus-1-dev
+      - name: Rust (rust-toolchain.toml)
+        run: rustup toolchain install --profile minimal
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pen
+      - name: Native compiler and component
+        run: |
+          cd ../blot2/zig-native
+          zig build install compiler-identity -Doptimize=fast
+          mkdir -p ../generated/compiler
+          gzip -c zig-out/bin/blotc > ../generated/compiler/blotc.gz
+          cd ../../pen
+          just plugins
+      - name: The base commit
+        env:
+          PULL_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSHED_OVER: ${{ github.event.before }}
+        run: |
+          base=${PULL_BASE:-$PUSHED_OVER}
+          # A new branch, or a manual run: the commit before.
+          if [ -z "$base" ] || [ "$base" = 0000000000000000000000000000000000000000 ] || ! git cat-file -e "$base^{commit}"; then
+            base=$(git rev-parse HEAD^)
+          fi
+          echo "BASE=$base" >> "$GITHUB_ENV"
+          echo "benching $(git rev-parse HEAD) against $base"
+      - name: This commit's pen, and the game
+        run: |
+          cargo build --release -p pen
+          mkdir -p ../bench
+          cp target/release/pen ../bench/pen-head
+          ../bench/pen-head export --project ../gdev --out ../bench/game
+      - name: The base commit's pen
+        run: |
+          git worktree add --detach ../base "$BASE"
+          cd ../base
+          # The same target directory: only pen's own crates build again.
+          CARGO_TARGET_DIR=../pen/target cargo build --release -p pen
+          cp ../pen/target/release/pen ../bench/pen-base
+      - name: Bench and compare
+        run: |
+          cd ../bench
+          # A base from before `pen bench --json` (or one that cannot run
+          # this game) leaves nothing to compare with.
+          if ! ./pen-base bench --game game --runs "$BENCH_RUNS" --json > base.json; then
+            echo "::notice::the base commit's pen could not bench this game as JSON; nothing to compare"
+            rm -f base.json
+            ./pen-head bench --game game --runs "$BENCH_RUNS" --json > head.json
+            exit 0
+          fi
+          ./pen-head bench --game game --runs "$BENCH_RUNS" --json --compare base.json > head.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ github.sha }}
+          path: bench/*.json
+          if-no-files-found: ignore

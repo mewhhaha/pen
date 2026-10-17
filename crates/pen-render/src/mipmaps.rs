@@ -17,10 +17,7 @@ impl Mipmapper {
     pub fn new(device: &wgpu::Device, cache: PipelineCache) -> Self {
         Self {
             cache,
-            module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("mipmaps"),
-                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
-            }),
+            module: crate::downlevel::shader_module(device, Some("mipmaps"), SHADER),
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,

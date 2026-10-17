@@ -1,5 +1,5 @@
 // The renderer's own pipelines, beside its materials' shaders: the passes
-// around the scene (post.rs), decals and the inset composite. They compile on
+// around the scene (post.rs), decals, particles and the inset composite. They compile on
 // the loader's threads ahead of need, for the sample count frames draw at,
 // and on the frame's thread only when a frame needs one before it is there.
 // A pipeline made first is the one kept: bind groups are made from its
@@ -15,6 +15,8 @@ pub(crate) enum BuiltIn {
     Occlusion(u32),
     /// Sky and fog over a scene of this many samples.
     Atmosphere(u32),
+    /// Temporal antialiasing, reading the depth of such a scene (taa.rs).
+    Taa(u32),
     /// The last pass onto the output, reading the stencil of such a scene.
     Present(u32),
     BloomDown {
@@ -27,14 +29,20 @@ pub(crate) enum BuiltIn {
     },
     /// An inset's image laid over the output.
     Composite,
+    /// Particles into a scene of this many samples, added or covering.
+    Particles {
+        samples: u32,
+        additive: bool,
+    },
 }
 
 impl BuiltIn {
     /// Every one a frame drawn with `samples` per pixel may draw with.
-    pub fn all(samples: u32) -> [BuiltIn; 9] {
+    pub fn all(samples: u32) -> [BuiltIn; 10] {
         [
             BuiltIn::Occlusion(samples),
             BuiltIn::Atmosphere(samples),
+            BuiltIn::Taa(samples),
             BuiltIn::Present(samples),
             BuiltIn::BloomDown { first: true },
             BuiltIn::BloomDown { first: false },
@@ -50,6 +58,7 @@ impl BuiltIn {
         let pipeline = match self {
             BuiltIn::Decal { samples, paint } => crate::decals::pipeline(context, samples, paint),
             BuiltIn::Composite => crate::renderer::composite_pipeline(context),
+            BuiltIn::Particles { samples, additive } => crate::renderer::particle_pipeline(context, samples, additive),
             _ => crate::post::pipeline(context, self),
         };
         log::debug!("{self:?} pipeline: {:.2} ms", clock.now() * 1000.0);

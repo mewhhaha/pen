@@ -247,7 +247,7 @@ impl State {
         // and the passes around the scene, have compiled their pipelines for
         // it in the background; until then the frame keeps the count it had.
         // The first frame takes its count at once: nothing compiled before.
-        self.samples_now = frame.quality.msaa;
+        self.samples_now = crate::downlevel::samples(&self.device, frame.quality.msaa);
         if self.frames == 1 {
             self.samples_shown = self.samples_now;
         }

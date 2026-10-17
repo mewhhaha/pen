@@ -59,8 +59,26 @@ bench:
 render-packets *args:
   cargo run --release -p pen-render --example render_packet -- --sequence --veil {{args}}
 
+# The game headless with its interface on a private AT-SPI bus, worked by an
+# AT-SPI client as a screen reader works it (tests/atspi); uses the GPU.
+atspi out="target/atspi":
+  cargo build --release -q -p pen
+  tests/atspi/run.sh target/release/pen {{gdev}} {{out}}
+
 visual *args:
   {{pen}} test --project {{gdev}} tests/visual/scenarios.json {{args}}
+
+# Gather, the game in Rust (examples/rust-guest), and its sticky-arrows mod:
+# tested, built for wasm32, bundled into dist/rust-guest and
+# dist/mods/sticky-arrows, and played headlessly with the mod (on the GPU).
+rust-guest *args:
+  cd examples/rust-guest && cargo test --workspace \
+    && cargo build --release --workspace --lib --target wasm32-unknown-unknown \
+    && cargo run --release --bin bundle -- target/wasm32-unknown-unknown/release/rust_guest.wasm ../../dist/rust-guest
+  mkdir -p dist/mods/sticky-arrows
+  cp examples/rust-guest/target/wasm32-unknown-unknown/release/sticky_arrows.wasm dist/mods/sticky-arrows/mod.wasm
+  cp examples/rust-guest/sticky/mod.json dist/mods/sticky-arrows/mod.json
+  {{pen}} --game dist/rust-guest --mod dist/mods/sticky-arrows --headless --frames 120 {{args}}
 
 # Compile times of the release and development engines, first and again.
 compile-time: export
@@ -68,6 +86,11 @@ compile-time: export
 
 blot-tests *args:
   {{pen}} test-blot --project {{gdev}} {{args}}
+
+# Random input against the game's invariants; failures are cut down to
+# scripts in ../gdev/.pen/fuzz (docs/testing.md).
+fuzz *args:
+  {{pen}} fuzz --project {{gdev}} {{args}}
 
 # Cache browser tools outside the source tree; an existing module can be supplied.
 [private]
@@ -81,7 +104,7 @@ browser-tools:
     [ -f "$tools/package.json" ] || printf '{"private":true}\n' > "$tools/package.json"
     {{pnpm}} --dir "$tools" add --save-exact "playwright-core@{{playwright}}"
   fi
-  node "$tools/node_modules/playwright-core/cli.js" install chromium
+  node "$tools/node_modules/playwright-core/cli.js" install "${PEN_WEB_BROWSER:-chromium}"
 
 conformance: browser-tools
   #!/usr/bin/env bash
@@ -135,6 +158,43 @@ browser-dev file="src/assets/catalog.json": browser-tools
   done
   PEN_DEVELOPMENT_URL="http://127.0.0.1:$dev_port/?dev" PEN_RELOAD_FILE="{{gdev}}/{{file}}" \
     PEN_STATIC_URL="http://127.0.0.1:$static_port/web/" node crates/pen-web/tests/development.mjs
+
+# `pen web` in headless Chromium on the GPU: keys and their text, an input
+# method, the locked mouse, touches with their pans and pinches, a gamepad
+# and a declared action, as the events the game was sent, and Ctrl+Shift+R
+# bringing them again (docs/input.md).
+# The browser host's input, recorded and replayed.
+browser-input: browser-tools
+  #!/usr/bin/env bash
+  set -euo pipefail
+  export PLAYWRIGHT_MODULE="${PLAYWRIGHT_MODULE:-$PWD/target/browser-tools/node_modules/playwright-core/index.mjs}"
+  port=${PEN_INPUT_PORT:-8047}
+  {{pen}} web --project {{gdev}} --port "$port" > target/pen-web-input.log 2>&1 &
+  server=$!
+  trap 'kill "$server"' EXIT
+  until curl -fs "http://127.0.0.1:$port/__pen/revision" > /dev/null; do
+    kill -0 "$server" 2> /dev/null || { cat target/pen-web-input.log; exit 1; }
+    sleep 1
+  done
+  PEN_INPUT_URL="http://127.0.0.1:$port/?dev" node crates/pen-web/tests/input.mjs
+
+# The browser build to upload to itch.io (or any static host): dist/web,
+# precompressed and with its service worker, and dist/web.zip, checked
+# against itch.io's limits (docs/web-export.md says how to upload it).
+itch:
+  {{pen}} build --web --project {{gdev}} --out dist/web --zip dist/web.zip
+
+# The export as hosts serve it, in a headless browser on the GPU: the service
+# worker, Brotli copies and offline play (export.mjs); recordings and saves
+# as files and links (files.mjs). PEN_WEB_WITHOUT=jspi,webgpu takes those
+# away and PEN_WEB_BROWSER=firefox runs Firefox (crates/pen-web/tests/launch.mjs).
+browser-files: browser-tools
+  #!/usr/bin/env bash
+  set -euo pipefail
+  {{pen}} build --web --project {{gdev}} --out dist/web
+  export PLAYWRIGHT_MODULE="${PLAYWRIGHT_MODULE:-$PWD/target/browser-tools/node_modules/playwright-core/index.mjs}"
+  PEN_WEB_SITE=dist/web node crates/pen-web/tests/export.mjs
+  PEN_WEB_SITE=dist/web node crates/pen-web/tests/files.mjs
 
 # Game/scene/assets consumed by protocol, renderer and determinism tests.
 export:
@@ -202,11 +262,55 @@ windows:
   just stripped target/x86_64-pc-windows-gnu/dist pen.exe steam_api64.dll
 
 # The checkout's game with the player runtimes: dist/linux (Steam Deck
-# included) and dist/windows.
+# included) and dist/windows, the Windows player signed when
+# WINDOWS_CERTIFICATE is set (scripts/sign-windows.sh). ARGS go to both
+# builds: --steam and --itch write and show their uploads (docs/shipping.md).
 # Shippable folders for Linux and Windows.
-ship: player windows
-  {{pen}} build --project {{gdev}} --runtime target/x86_64-unknown-linux-gnu/dist/player/pen --out dist/linux
-  {{pen}} build --project {{gdev}} --runtime target/x86_64-pc-windows-gnu/dist/player/pen.exe --out dist/windows
+ship *args: player windows
+  scripts/sign-windows.sh target/x86_64-pc-windows-gnu/dist/player/pen.exe
+  {{pen}} build --project {{gdev}} --runtime target/x86_64-unknown-linux-gnu/dist/player/pen --out dist/linux {{args}}
+  {{pen}} build --project {{gdev}} --runtime target/x86_64-pc-windows-gnu/dist/player/pen.exe --out dist/windows {{args}}
+
+# The player runtimes `just player` and `just windows` built, against their
+# budgets in MB (docs/shipping.md, "Budgets"), as CI checks them.
+# What ships, against its size budget.
+size-budget linux="19" windows="15":
+  scripts/size-budget.sh target/x86_64-unknown-linux-gnu/dist/player/pen {{linux}} target/x86_64-pc-windows-gnu/dist/player/pen.exe {{windows}}
+
+# Builds the checkout's package twice, with caches of its own each, into
+# target/reproducible, and fails unless they are the same bytes.
+# Two builds of the package must be the same bytes.
+reproducible *args:
+  cargo build --release -q -p pen
+  scripts/reproducible.sh target/release/pen {{gdev}} target/reproducible {{args}}
+
+# A package's runtime from a cold start (no caches) to its first frame,
+# headless; the median of five runs against BUDGET ms. Runs on the GPU.
+# Time to the first frame, against its budget.
+cold-start exe="dist/package/gdev" budget="8000":
+  scripts/cold-start.sh {{exe}} {{budget}}
+
+# Two peers of a net session over UDP on the loopback, and a viewer that
+# joins a broadcast late, through the binary and headless (tests/net.sh).
+# Runs on the GPU; ports 7461, 7462 and 7471 must be free.
+# Net sessions and spectating end to end.
+net: export
+  cargo build --release -q -p pen
+  tests/net.sh target/release/pen dist/gdev target/net
+
+# soldier and sniper, the containers Steam runs native Linux games in, play
+# the Linux package (`just ship`'s dist/linux) as the host does: the same
+# last frame from each (scripts/slr.sh). Nothing starts Steam.
+# The Linux package in the Steam Linux Runtime containers.
+slr package="dist/linux" out="target/slr":
+  scripts/slr.sh {{package}} {{out}}
+
+# APP is the game's own Steamworks app, never 480; the Steam client must be
+# running, logged in, and nothing starts it (scripts/steam-smoke.sh, which
+# takes the package and --achievement and --stat names to try).
+# Achievements, stats, overlay and Steam Cloud against live Steam.
+steam-smoke app *args:
+  scripts/steam-smoke.sh {{app}} {{args}}
 
 # DIR keeps the unstripped build, whose symbols and line tables resolve its
 # crash reports (keep one per release); the copy without them ships.
@@ -239,7 +343,9 @@ determinism: export
   cargo test -q -p pen contract
   out=dist/determinism
   rm -rf "$out" && mkdir -p "$out"
-  play() { name=$1; shift; {{pen}} run --project {{gdev}} --headless --data "$out/data-$name" --trace "$out/$name.trace" "$@" 2>"$out/$name.log" || { cat "$out/$name.log"; exit 1; }; }
+  # At the scripts' page size: packets are compared, not pixels, and lavapipe
+  # (CI's software adapter) draws a quarter of the default size's.
+  play() { name=$1; shift; {{pen}} run --project {{gdev}} --headless --size 960x640 --data "$out/data-$name" --trace "$out/$name.trace" "$@" 2>"$out/$name.log" || { cat "$out/$name.log"; exit 1; }; }
   packets() { cut -d' ' -f1,3 "$1"; }
   play first --script-file tests/determinism.steps --record-input "$out/first.penrec"
   frames=$(wc -l < "$out/first.trace")
@@ -272,3 +378,31 @@ determinism: export
   final() { awk '{ last[$1] = $0; end = $1 } END { for (frame in last) if (frame + 0 <= end) print last[frame] }' "$1" | sort -n; }
   cmp <(final "$out/travel.trace") <(sort -n "$out/travel-replay.trace")
   echo "its recording replayed: the packets of its final timeline"
+
+# The example games and a game `pen new` makes, compiled and run headless:
+# each example's bindings fresh, its Blot tests and its golden images; a
+# run of bounce through `pen packets`, its Kick event sent and its Score
+# sections read back by name; and the new game's tests and a frame of it.
+# Needs blot2 beside this checkout.
+# The examples and a new game, tested and run headless.
+examples:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  for example in examples/*/; do
+    # rust-guest is a Rust game, not a checkout (`just rust-guest`).
+    [ -f "$example/pen.json" ] || continue
+    {{pen}} codegen --check --project "$example"
+    {{pen}} test-blot --project "$example"
+    {{pen}} test --project "$example" "$example/tests/visual/scenarios.json"
+  done
+  {{pen}} packets target/examples/bounce --project examples/bounce --script "wait=5 game=Kick,9,4 wait=60"
+  grep -q '"bounces":1' target/examples/bounce/extensions.jsonl
+  rm -rf target/examples/new
+  {{pen}} new target/examples/new --blot ../blot2
+  {{pen}} test-blot --project target/examples/new
+  {{pen}} run --project target/examples/new --headless --frames 30 --screenshot target/examples/new.png
+
+# Needs mdbook (0.5); the book is docs/, its contents docs/SUMMARY.md.
+# The docs as a site, in docs/book.
+docs:
+  mdbook build docs

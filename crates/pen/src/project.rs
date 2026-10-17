@@ -10,11 +10,23 @@ use serde::{Deserialize, Serialize};
 
 /// Who a game is: `name` names its data directory (saves, preferences and
 /// crash reports) and the executable `pen build` ships it as; `title` is its
-/// window's, which assistive technology reads too.
+/// window's, which assistive technology reads too. `players` is how many
+/// players it takes, each its own peer in a net session (docs/netplay.md):
+/// all the netcode a game declares.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Identity {
     pub name: String,
     pub title: String,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub players: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn is_one(players: &u32) -> bool {
+    *players == 1
 }
 
 impl Identity {
@@ -24,12 +36,13 @@ impl Identity {
             name.chars().map(|character| if file_name_character(character) { character } else { '-' }).collect();
         let name = name.trim_start_matches('.').trim_end_matches([' ', '.']);
         let name = if name.is_empty() { "game" } else { name };
-        Identity { name: name.to_owned(), title: name.to_owned() }
+        Identity { name: name.to_owned(), title: name.to_owned(), players: 1 }
     }
 
     /// The `game` block of a checkout's `pen.json`, `{"name": "gdev",
-    /// "title": "gdev — Blot 3D"}`, either of which may be left out: the
-    /// name is then the checkout directory's, and the title the name.
+    /// "title": "gdev — Blot 3D", "players": 2}`, any of which may be left
+    /// out: the name is then the checkout directory's, the title the name,
+    /// and the players one.
     fn of_checkout(root: &Path) -> Result<Identity> {
         let file = root.join("pen.json");
         let reading = || format!("reading {}", file.display());
@@ -45,17 +58,24 @@ impl Identity {
         let directory = root.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
         let mut identity = Identity::named(&directory);
         if let Some(name) = field("name")? {
-            identity = Identity { title: name.clone(), name };
+            identity = Identity { title: name.clone(), name, players: 1 };
             identity.check().with_context(|| format!("{}: game.name", file.display()))?;
         }
         if let Some(title) = field("title")? {
             identity.title = title;
         }
+        if let Some(players) = config.get("game").and_then(|game| game.get("players")) {
+            identity.players = players
+                .as_u64()
+                .and_then(|players| u32::try_from(players).ok())
+                .filter(|players| (1..=32).contains(players))
+                .with_context(|| format!("{}: game.players must be a whole number from 1 to 32", file.display()))?;
+        }
         Ok(identity)
     }
 
     /// A name that is a file name on every platform.
-    fn check(&self) -> Result<()> {
+    pub(crate) fn check(&self) -> Result<()> {
         let name = &self.name;
         let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&name.to_ascii_uppercase().as_str())
             || ["COM", "LPT"].iter().any(|device| {
@@ -220,6 +240,16 @@ impl Project {
         self.root.join("src/main.scene")
     }
 
+    /// Ships the game's graphics presets (`crate::presets`), its
+    /// `src/presets.json`, into the bundle `game`, if it has them.
+    fn copy_presets(&self, game: &Path) -> Result<()> {
+        let presets = self.root.join("src/presets.json");
+        if presets.is_file() {
+            std::fs::copy(&presets, game.join("presets.json")).context("copying src/presets.json")?;
+        }
+        Ok(())
+    }
+
     /// Where `dev` and `run` keep the compiled program.
     pub fn native(&self) -> PathBuf {
         self.root.join(".pen/runtime")
@@ -359,7 +389,7 @@ impl Watcher {
 
 /// Every file under `directory`, as asset keys: relative, `/` between
 /// directories.
-fn asset_keys(directory: &Path) -> Result<Vec<String>> {
+pub(crate) fn asset_keys(directory: &Path) -> Result<Vec<String>> {
     fn walk(directory: &Path, prefix: &str, keys: &mut Vec<String>) -> Result<()> {
         for entry in std::fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))? {
             let entry = entry?;
@@ -393,16 +423,20 @@ fn strings<'a>(value: &'a serde_json::Value, each: &mut impl FnMut(&'a str)) {
 }
 
 /// Of `keys` (in `assets`), those a game uses: `catalog.json`, what it
-/// names, and what those name in turn (a material's shader and textures).
+/// names, and what those name in turn (a material's shader and textures),
+/// and its sounds' captions (`captions.json`).
 /// To be safe it keeps any file of a kind it does not know, and any `game`'s
 /// Wasm names; without a catalog, all of them.
-fn used_assets(assets: &Path, keys: &[String], game: &[u8]) -> BTreeSet<String> {
+pub(crate) fn used_assets(assets: &Path, keys: &[String], game: &[u8]) -> BTreeSet<String> {
     let known: HashSet<&str> = keys.iter().map(String::as_str).collect();
     if !known.contains("catalog.json") {
         return keys.iter().cloned().collect();
     }
     let mut used = BTreeSet::new();
     let mut pending = vec!["catalog.json".to_owned()];
+    if known.contains("captions.json") {
+        pending.push("captions.json".to_owned());
+    }
     while let Some(key) = pending.pop() {
         // Meshes are numbers only, and the bulk of the assets.
         if !used.insert(key.clone()) || !key.ends_with(".json") || key.ends_with(".mesh.json") {
@@ -417,11 +451,17 @@ fn used_assets(assets: &Path, keys: &[String], game: &[u8]) -> BTreeSet<String> 
             });
         }
     }
-    let named = |key: &str| game.windows(key.len()).any(|window| window == key.as_bytes());
+    // A substring search per key: the program is megabytes, the keys hundreds.
+    let named = |key: &str| memchr::memmem::find(game, key.as_bytes()).is_some();
     for key in keys {
         if !NAMED_KINDS.iter().any(|kind| key.ends_with(kind)) || named(key) {
             used.insert(key.clone());
         }
+    }
+    // The saved types the game declares, which the runtime reads beside the
+    // catalog to migrate old saves.
+    if known.contains(pen_runtime::saved::SAVED_TYPES_FILE) {
+        used.insert(pen_runtime::saved::SAVED_TYPES_FILE.to_owned());
     }
     used
 }
@@ -451,7 +491,8 @@ impl std::fmt::Display for Shipped {
 
 /// Copies the assets the game in `wasm` uses from `from` to `to`, its mesh
 /// JSON in the renderer's binary form ([`pen_render::pack_mesh`]), which
-/// loads faster and is a fraction of the size.
+/// loads faster and is a fraction of the size, with simpler levels of detail
+/// for large meshes where pen has the compiler.
 fn ship_assets(from: &Path, to: &Path, wasm: &[u8]) -> Result<Shipped> {
     let keys = asset_keys(from)?;
     let used = used_assets(from, &keys, wasm);
@@ -464,8 +505,15 @@ fn ship_assets(from: &Path, to: &Path, wasm: &[u8]) -> Result<Shipped> {
         }
         let target = to.join(key);
         std::fs::create_dir_all(target.parent().context("an asset has no directory")?)?;
+        #[cfg(feature = "compiler")]
+        let pack = pen_render::pack_mesh_with_lods;
+        #[cfg(not(feature = "compiler"))]
+        let pack = pen_render::pack_mesh;
         let packed = if key.ends_with(".mesh.json") {
-            match pen_render::pack_mesh(&std::fs::read(&source)?) {
+            let mesh = std::fs::read(&source)?;
+            match pack(&mesh) {
+                // A package's game/, packaged again, has them packed already.
+                Err(_) if mesh.starts_with(b"PMSH") => None,
                 Ok(packed) => Some(packed),
                 Err(error) => {
                     eprintln!("shipping {key} as it is: {error:#}");
@@ -503,6 +551,71 @@ pub struct PackageOptions {
     /// The CPU game.cwasm is compiled for: a Cranelift preset, or `native`
     /// (see blot_host::portable_engine; x86-64-v2 by default).
     pub cpu: Option<String>,
+    /// A macOS application bundle's identifier (`app_bundle`).
+    pub bundle_id: Option<String>,
+    /// The store package versions are kept in, for patches between them
+    /// (patch.rs); by default the checkout's `.pen/store`.
+    pub store: Option<PathBuf>,
+}
+
+/// Where `pen build` takes the game from.
+pub enum GameSource<'a> {
+    /// A checkout, whose program compiles now.
+    Checkout(&'a Project),
+    /// A bundle compiled already (`pen build --game DIR`): `pen export`'s, a
+    /// package's `game/`, or a game built in another language: its
+    /// `game.wasm`, `assets/`, optional `main.scene` and `game.json`, as
+    /// `pen --game` plays it. What a machine without the checkout or its
+    /// compiler plugin packages for the runtime it has, as CI does for
+    /// Windows and macOS.
+    Bundle(&'a Path),
+}
+
+impl GameSource<'_> {
+    fn identity(&self) -> Result<Identity> {
+        match self {
+            GameSource::Checkout(project) => Ok(project.identity.clone()),
+            GameSource::Bundle(directory) => bundle_identity(directory),
+        }
+    }
+
+    /// Writes game.wasm into `game` and returns it.
+    fn compile(&self, game: &Path) -> Result<Vec<u8>> {
+        let wasm = game.join("game.wasm");
+        match self {
+            GameSource::Checkout(project) => project.compile(game)?,
+            GameSource::Bundle(directory) => {
+                let from = directory.join("game.wasm");
+                std::fs::copy(&from, &wasm).with_context(|| format!("copying {}", from.display()))?;
+            }
+        }
+        Ok(std::fs::read(wasm)?)
+    }
+
+    fn assets(&self) -> PathBuf {
+        match self {
+            GameSource::Checkout(project) => project.assets(),
+            GameSource::Bundle(directory) => directory.join("assets"),
+        }
+    }
+
+    /// The starting scene's file, which a game without scenes leaves out: it
+    /// starts from what its program creates.
+    fn scene(&self) -> PathBuf {
+        match self {
+            GameSource::Checkout(project) => project.scene(),
+            GameSource::Bundle(directory) => directory.join("main.scene"),
+        }
+    }
+
+    /// The checkout, or the bundle's directory: where a package stages and
+    /// its versions are kept by default (`.pen/store`).
+    fn root(&self) -> &Path {
+        match self {
+            GameSource::Checkout(project) => &project.root,
+            GameSource::Bundle(directory) => directory,
+        }
+    }
 }
 
 /// The runtime `pen build` ships by default.
@@ -520,7 +633,7 @@ fn default_runtime() -> Result<PathBuf> {
 }
 
 /// The Rust target an executable was built for, from its header.
-fn executable_target(header: &[u8]) -> Option<&'static str> {
+pub(crate) fn executable_target(header: &[u8]) -> Option<&'static str> {
     let u16_at = |at: usize| Some(u16::from_le_bytes(header.get(at..at + 2)?.try_into().ok()?));
     let u32_at = |at: usize| Some(u32::from_le_bytes(header.get(at..at + 4)?.try_into().ok()?));
     if header.starts_with(b"\x7fELF") {
@@ -618,13 +731,14 @@ pub(crate) fn size_of(path: &Path) -> u64 {
 /// the game: its compiled program, precompiled for the runtime's platform
 /// and a CPU baseline players' machines have, the assets it uses, its
 /// starting scene and its manifest.
-pub fn package(project: &Project, out: &Path, options: PackageOptions) -> Result<()> {
-    let staging = crate::staging::Staging::new(&project.root, out)?;
-    package_into(project, &staging.directory, out, options)?;
+pub fn package(source: GameSource, out: &Path, options: PackageOptions) -> Result<()> {
+    let staging = crate::staging::Staging::new(source.root(), out)?;
+    package_into(source, &staging.directory, out, options)?;
+    crate::reproducible::settle_times(&staging.directory)?;
     staging.publish()
 }
 
-fn package_into(project: &Project, out: &Path, destination: &Path, options: PackageOptions) -> Result<()> {
+fn package_into(source: GameSource, out: &Path, destination: &Path, options: PackageOptions) -> Result<()> {
     let runtime = match options.runtime {
         Some(runtime) => runtime,
         None => default_runtime()?,
@@ -641,22 +755,52 @@ fn package_into(project: &Project, out: &Path, destination: &Path, options: Pack
     let steam = steam_library(&runtime, &runtime_bytes, &target)?;
     let engine = blot_host::portable_engine(Some(&target), options.cpu.as_deref())?;
 
-    let game = out.join("game");
-    std::fs::create_dir_all(&game)?;
-    project.compile(&game)?;
-    let wasm = std::fs::read(game.join("game.wasm"))?;
-    let assets = ship_assets(&project.assets(), &game.join("assets"), &wasm)?;
-    std::fs::copy(project.scene(), game.join("main.scene"))?;
-    std::fs::write(game.join("game.cwasm"), blot_host::precompile(&engine, &wasm)?)?;
-    Manifest { game: project.identity.clone(), runtime: Some(RUNTIME.to_owned()) }.write(&game)?;
+    let identity = source.identity()?;
+    let name = identity.name.clone();
     // Named after the game, whatever the runtime is called.
-    let name = &project.identity.name;
-    let executable = if target.contains("windows") { format!("{name}.exe") } else { name.clone() };
-    std::fs::copy(&runtime, out.join(executable))?;
-    if let Some(library) = &steam {
-        std::fs::copy(library, out.join(library.file_name().unwrap()))?;
+    let layout = crate::app_bundle::Layout::new(out, &identity, &target, options.bundle_id.as_deref())?;
+    layout.create()?;
+    let game = &layout.game;
+    let wasm = source.compile(game)?;
+    let assets = ship_assets(&source.assets(), &game.join("assets"), &wasm)?;
+    let scene = source.scene();
+    if scene.is_file() {
+        std::fs::copy(&scene, game.join("main.scene"))?;
     }
-    notices(out)?;
+    crate::services::locale::ship_tables(&source.assets(), game)?;
+    match &source {
+        GameSource::Checkout(project) => {
+            project.copy_presets(game)?;
+            crate::reports::ship_config(&project.root, game)?;
+        }
+        // A bundle carries both already, as `pen export` writes it.
+        GameSource::Bundle(directory) => {
+            for file in ["presets.json", "reports.json"] {
+                let from = directory.join(file);
+                if from.is_file() {
+                    std::fs::copy(&from, game.join(file)).with_context(|| format!("copying {}", from.display()))?;
+                }
+            }
+        }
+    }
+    match crate::scene_assets::write(&wasm, &source.assets(), &scene, &game.join("assets")) {
+        Ok(()) => {}
+        // A bundle built elsewhere need not run here: its first frame then
+        // loads its assets as it goes.
+        Err(error) if matches!(source, GameSource::Bundle(_)) => {
+            eprintln!("not working out what the bundle draws first: {error:#}");
+        }
+        Err(error) => return Err(error),
+    }
+    std::fs::write(game.join("game.cwasm"), blot_host::precompile(&engine, &wasm)?)?;
+    Manifest { game: identity, runtime: Some(RUNTIME.to_owned()) }.write(game)?;
+    std::fs::copy(&runtime, &layout.executable)?;
+    if let Some(library) = &steam {
+        std::fs::copy(library, layout.libraries.join(library.file_name().unwrap()))?;
+    }
+    notices(&layout.notices)?;
+    let store = options.store.unwrap_or_else(|| source.root().join(".pen/store"));
+    let version = crate::patch::record(out, &name, &store)?;
     let megabytes = |path: &Path| size_of(path) as f64 / 1e6;
     let x86_64 = target.starts_with("x86_64");
     let cpu = options.cpu.as_deref().unwrap_or(if x86_64 { blot_host::PORTABLE_X86_64 } else { "baseline" });
@@ -669,6 +813,7 @@ fn package_into(project: &Project, out: &Path, destination: &Path, options: Pack
         megabytes(&game.join("game.cwasm")),
         megabytes(out),
     );
+    eprintln!("version {version}, kept in {} (pen patch makes patches between versions)", store.display());
     Ok(())
 }
 
@@ -693,8 +838,9 @@ pub fn web_host(out: &Path) -> Result<()> {
 }
 
 /// The browser front end, guest programs, the assets the game uses and its
-/// manifest as a complete static site.
-pub fn export_web(project: &Project, out: &Path) -> Result<()> {
+/// manifest as a complete static site, ready to host (`web_export`): its
+/// files precompressed and a service worker; and, given `zip`, as a ZIP.
+pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>) -> Result<()> {
     let staging = crate::staging::Staging::new(&project.root, out)?;
     let site = &staging.directory;
     project.compile(site)?;
@@ -702,14 +848,37 @@ pub fn export_web(project: &Project, out: &Path) -> Result<()> {
     let wasm = std::fs::read(site.join("game.wasm"))?;
     let assets = ship_assets(&project.assets(), &site.join("assets"), &wasm)?;
     std::fs::copy(project.assets().join("catalog.json"), site.join("catalog.json"))?;
+    let saved = site.join("assets").join(pen_runtime::saved::SAVED_TYPES_FILE);
+    if !saved.is_file() {
+        std::fs::write(&saved, pen_runtime::saved::NO_SAVED_TYPES)?;
+    }
+    crate::scene_assets::write(&wasm, &project.assets(), &project.scene(), &site.join("assets"))?;
     if project.scene().is_file() {
         std::fs::copy(project.scene(), site.join("scene.bin"))?;
     }
     Manifest { game: project.identity.clone(), runtime: None }.write(site)?;
     web_host(site)?;
     notices(site)?;
-    eprintln!("exported {}: {assets}; {:.1} MB in all", out.display(), size_of(site) as f64 / 1e6);
-    staging.publish()
+    let hosting = crate::web_export::prepare(site)?;
+    eprintln!("exported {}: {assets}; {hosting}; {:.1} MB in all", out.display(), size_of(site) as f64 / 1e6);
+    crate::reproducible::settle_times(site)?;
+    staging.publish()?;
+    if let Some(zip) = zip {
+        crate::web_export::zip(out, zip)?;
+    }
+    Ok(())
+}
+
+/// Checks the saved types the game declares beside its catalog, if it
+/// declares any: each type's versions must migrate to every later one
+/// (docs/saved-types.md).
+pub fn check_saved_types(assets: &Path) -> Result<()> {
+    let path = assets.join(pen_runtime::saved::SAVED_TYPES_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else { return Ok(()) };
+    let types = pen_runtime::saved::SavedTypes::parse(&text).with_context(|| format!("reading {}", path.display()))?;
+    pen_runtime::saved::check(&types).with_context(|| format!("{}", path.display()))?;
+    eprintln!("{}: {} saved types declared", path.display(), types.types.len());
+    Ok(())
 }
 
 /// A compiled bundle for tests and packet tools, without a player executable.
@@ -717,12 +886,27 @@ pub fn export_bundle(project: &Project, out: &Path) -> Result<()> {
     let staging = crate::staging::Staging::new(&project.root, out)?;
     project.compile(&staging.directory)?;
     copy_tree(&project.assets(), &staging.directory.join("assets"))?;
-    std::fs::copy(project.scene(), staging.directory.join("main.scene"))?;
+    copy_scene(project, &staging.directory.join("main.scene"))?;
+    crate::services::locale::ship_tables(&project.assets(), &staging.directory)?;
+    project.copy_presets(&staging.directory)?;
+    crate::reports::ship_config(&project.root, &staging.directory)?;
+    let wasm = std::fs::read(staging.directory.join("game.wasm"))?;
+    crate::scene_assets::write(&wasm, &project.assets(), &project.scene(), &staging.directory.join("assets"))?;
     Manifest { game: project.identity.clone(), runtime: None }.write(&staging.directory)?;
     staging.publish()
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+/// The checkout's starting scene to `to`, if it has one: a game without
+/// scenes starts from what its program creates.
+fn copy_scene(project: &Project, to: &Path) -> Result<()> {
+    let scene = project.scene();
+    if scene.is_file() {
+        std::fs::copy(&scene, to).with_context(|| format!("copying {}", scene.display()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
         let entry = entry?;
@@ -810,7 +994,14 @@ mod tests {
         let identity = Identity::of_checkout(&root).unwrap();
         assert_eq!((identity.name.as_str(), identity.title.as_str()), ("gdev", "gdev — Blot 3D"));
         std::fs::write(root.join("pen.json"), r#"{"game": {"title": "Salt"}}"#).unwrap();
-        assert_eq!(Identity::of_checkout(&root).unwrap(), Identity { name: "salt game".into(), title: "Salt".into() });
+        let salt = Identity { name: "salt game".into(), title: "Salt".into(), players: 1 };
+        assert_eq!(Identity::of_checkout(&root).unwrap(), salt);
+        std::fs::write(root.join("pen.json"), r#"{"game": {"players": 4}}"#).unwrap();
+        assert_eq!(Identity::of_checkout(&root).unwrap().players, 4);
+        for players in ["0", "33", "2.5", r#""2""#] {
+            std::fs::write(root.join("pen.json"), format!(r#"{{"game": {{"players": {players}}}}}"#)).unwrap();
+            assert!(Identity::of_checkout(&root).is_err(), "{players}");
+        }
         for name in [r#""../up""#, r#""a/b""#, r#""""#, r#"".hidden""#, r#""CON""#, r#""lpt1""#, "3"] {
             std::fs::write(root.join("pen.json"), format!(r#"{{"game": {{"name": {name}}}}}"#)).unwrap();
             assert!(Identity::of_checkout(&root).is_err(), "{name}");
@@ -827,14 +1018,61 @@ mod tests {
         std::fs::create_dir_all(&bundle).unwrap();
         // Without a manifest, after the directory.
         assert_eq!(bundle_identity(&bundle).unwrap(), Identity::named("gdev"));
-        let manifest =
-            Manifest { game: Identity { name: "salt".into(), title: "Salt!".into() }, runtime: Some(RUNTIME.into()) };
+        let salt = Identity { name: "salt".into(), title: "Salt!".into(), players: 1 };
+        let manifest = Manifest { game: salt, runtime: Some(RUNTIME.into()) };
         manifest.write(&bundle).unwrap();
+        assert!(!std::fs::read_to_string(bundle.join("game.json")).unwrap().contains("players"), "one goes unsaid");
         let read = Manifest::read(&bundle).unwrap().unwrap();
         assert_eq!((read.game, read.runtime.as_deref()), (manifest.game.clone(), Some(RUNTIME)));
         assert_eq!(bundle_identity(&bundle).unwrap(), manifest.game);
+        // A game of two players says so, and its package keeps it.
+        let pair = Manifest { game: Identity { players: 2, ..manifest.game.clone() }, runtime: None };
+        pair.write(&bundle).unwrap();
+        assert_eq!(bundle_identity(&bundle).unwrap().players, 2);
         std::fs::write(bundle.join("game.json"), r#"{"name": "../x", "title": "x"}"#).unwrap();
         assert!(bundle_identity(&bundle).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn bundles_package_like_checkouts() {
+        let root = fixture("bundle");
+        // A game built elsewhere: its Wasm (here only a manifest), assets
+        // and name, without a scene.
+        let bundle = root.join("built");
+        std::fs::create_dir_all(bundle.join("assets")).unwrap();
+        let catalog = r#"{"meshes": ["quad.mesh.json"], "materials": ["fill.material.json"]}"#;
+        std::fs::write(bundle.join("assets/catalog.json"), catalog).unwrap();
+        let mesh = r#"{"positions": [0,0,0, 1,0,0, 0,1,0], "normals": [0,0,1, 0,0,1, 0,0,1], "uvs": [0,0, 1,0, 0,1], "indices": [0,1,2]}"#;
+        std::fs::write(bundle.join("assets/quad.mesh.json"), mesh).unwrap();
+        std::fs::write(bundle.join("assets/fill.material.json"), r#"{"shader": "fill.wgsl"}"#).unwrap();
+        std::fs::write(bundle.join("assets/fill.wgsl"), "").unwrap();
+        let wasm = [&b"\0asm\x01\0\0\0\0\x0c\x08blot:abi"[..], &[2, 0, 0]].concat();
+        std::fs::write(bundle.join("game.wasm"), &wasm).unwrap();
+        Manifest { game: Identity::named("gather"), runtime: None }.write(&bundle).unwrap();
+        // A runtime: an x86-64 ELF header and this pen's mark.
+        let mut runtime = vec![0u8; 64];
+        runtime[..4].copy_from_slice(b"\x7fELF");
+        runtime[18..20].copy_from_slice(&0x3eu16.to_le_bytes());
+        runtime.extend([mark_prefix(), RUNTIME.as_bytes().to_vec(), b"\n".to_vec()].concat());
+        std::fs::write(root.join("player"), &runtime).unwrap();
+        let options = PackageOptions {
+            runtime: Some(root.join("player")),
+            target: None,
+            cpu: None,
+            bundle_id: None,
+            store: None,
+        };
+        let out = root.join("dist/package");
+        package(GameSource::Bundle(&bundle), &out, options).unwrap();
+        assert_eq!(std::fs::read(out.join("gather")).unwrap(), runtime, "the runtime, named after the game");
+        assert_eq!(std::fs::read(out.join("game/game.wasm")).unwrap(), wasm);
+        assert!(out.join("game/game.cwasm").is_file() && !out.join("game/main.scene").exists());
+        let manifest = Manifest::read(&out.join("game")).unwrap().unwrap();
+        assert_eq!((manifest.game.name.as_str(), manifest.runtime.as_deref()), ("gather", Some(RUNTIME)));
+        assert!(std::fs::read(out.join("game/assets/quad.mesh.json")).unwrap().starts_with(b"PMSH"));
+        assert!(out.join("game/assets/fill.wgsl").is_file());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -845,35 +1083,48 @@ mod tests {
         std::fs::create_dir_all(assets.join("sky")).unwrap();
         let catalog = r#"{"meshes": ["cube.mesh.json"], "materials": ["rock.material.json"], "sounds": ["hit.wav"]}"#;
         std::fs::write(assets.join("catalog.json"), catalog).unwrap();
+        std::fs::write(assets.join("captions.json"), r#"{"hit.wav": "A thud"}"#).unwrap();
         let mesh = r#"{"positions": [0,0,0, 1,0,0, 0,1,0], "normals": [0,0,1, 0,0,1, 0,0,1], "uvs": [0,0, 1,0, 0,1], "indices": [0,1,2]}"#;
         std::fs::write(assets.join("cube.mesh.json"), mesh).unwrap();
         std::fs::write(assets.join("unused.mesh.json"), mesh).unwrap();
         let material =
             r#"{"shader": "scene.wgsl", "texture": "sky/rock.png", "normalTexture": null, "color": [1,1,1,1]}"#;
         std::fs::write(assets.join("rock.material.json"), material).unwrap();
-        for file in ["scene.wgsl", "sky/rock.png", "hit.wav", "unused.wgsl", "unused.png", "notes.txt", "named.gtex"] {
+        for file in [
+            "scene.wgsl",
+            "sky/rock.png",
+            "hit.wav",
+            "unused.wgsl",
+            "unused.png",
+            "notes.txt",
+            "named.gtex",
+            "saved.json",
+        ] {
             std::fs::write(assets.join(file), file).unwrap();
         }
         let keys = asset_keys(&assets).unwrap();
-        assert_eq!(keys.len(), 11);
+        assert_eq!(keys.len(), 13);
         let used = used_assets(&assets, &keys, b"\0asm...named.gtex...");
         let expected = [
+            "captions.json",
             "catalog.json",
             "cube.mesh.json",
             "hit.wav",
             "named.gtex",
             "notes.txt",
             "rock.material.json",
+            "saved.json",
             "scene.wgsl",
             "sky/rock.png",
         ];
         assert_eq!(used.iter().map(String::as_str).collect::<Vec<_>>(), expected);
         // Without a catalog, nothing is left out.
-        assert_eq!(used_assets(&assets, &keys[1..], b"").len(), keys.len() - 1);
+        let uncatalogued: Vec<String> = keys.iter().filter(|key| *key != "catalog.json").cloned().collect();
+        assert_eq!(used_assets(&assets, &uncatalogued, b"").len(), keys.len() - 1);
 
         let out = root.join("out");
         let shipped = ship_assets(&assets, &out, b"").unwrap();
-        assert_eq!((shipped.files, shipped.of, shipped.meshes), (7, 11, 1));
+        assert_eq!((shipped.files, shipped.of, shipped.meshes), (9, 13, 1));
         assert!(std::fs::read(out.join("cube.mesh.json")).unwrap().starts_with(b"PMSH"));
         assert_eq!(std::fs::read_to_string(out.join("sky/rock.png")).unwrap(), "sky/rock.png");
         assert!(!out.join("unused.mesh.json").exists() && !out.join("named.gtex").exists());

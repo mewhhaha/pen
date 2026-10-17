@@ -72,7 +72,7 @@ fn uniform(width: u32, height: u32, output: (u32, u32), enabled: bool) -> [f32; 
 
 fn code(mode: &str) -> String {
     let quality = include_str!("../shaders/fxaa.wgsl");
-    let mut code = present_shader(1);
+    let mut code = present_shader(1, &crate::Display::SDR);
     if mode == "legacy" {
         code = code.replace(quality, include_str!("legacy_fxaa.wgsl"));
     } else {
@@ -381,7 +381,13 @@ struct Sprite { rect: vec4f, uv: vec4f, color: vec4f, parameters: vec4f };
     let mut renderer = crate::Renderer::new(
         gpu.device.clone(),
         gpu.queue.clone(),
-        crate::RendererOptions { format: FORMAT, assets, veil: None, pipeline_cache: None },
+        crate::RendererOptions {
+            format: FORMAT,
+            display: crate::Display::SDR,
+            assets,
+            veil: None,
+            pipeline_cache: None,
+        },
     )
     .unwrap();
     renderer.preload(&catalog);

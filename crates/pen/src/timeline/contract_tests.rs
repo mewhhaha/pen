@@ -17,12 +17,15 @@ use pen_protocol::boundary::read_catalog;
 use pen_protocol::{Catalog, Frame, UiNode, Viewport, service};
 
 use super::*;
+use crate::diverge::difference;
 use crate::fixtures::bundle;
 use crate::game::hash_lanes;
 use crate::input::Input;
 use crate::script::{self, Script};
 use crate::services::{Answer, Request, Service, Services};
 use crate::snapshot;
+
+mod input;
 
 const VIEWPORT: Viewport = Viewport { width: 960, height: 640 };
 
@@ -123,67 +126,6 @@ impl Pass {
             panic!("{context}: the state after frame {position} differs from the first time");
         }
     }
-}
-
-/// The entries of `lines` (a `{:#?}` form) indented `indent` spaces: a
-/// struct's fields or a list's elements, each with what is nested in it.
-fn entries<'a>(lines: &[&'a str], indent: usize) -> Vec<Vec<&'a str>> {
-    let mut found: Vec<Vec<&str>> = Vec::new();
-    for &line in lines {
-        let depth = line.len() - line.trim_start().len();
-        if depth == indent && !line.trim_start().starts_with(['}', ']', ')']) {
-            found.push(vec![line]);
-        } else if depth > indent
-            && let Some(last) = found.last_mut()
-        {
-            last.push(line);
-        }
-    }
-    found
-}
-
-/// Where two `{:#?}` forms first differ: the line in each, after the
-/// lines that enclose it.
-fn first_difference(was: &[&str], now: &[&str]) -> String {
-    let at = was.iter().zip(now).position(|(a, b)| a != b).unwrap_or(was.len().min(now.len()));
-    let depth = |line: &str| line.len() - line.trim_start().len();
-    let line = |lines: &[&str]| lines.get(at).map_or("(none)", |line| line.trim()).to_owned();
-    let mut path = Vec::new();
-    let mut inside = was.get(at).map_or(usize::MAX, |line| depth(line));
-    for enclosing in was[..at.min(was.len())].iter().rev() {
-        if depth(enclosing) < inside {
-            inside = depth(enclosing);
-            path.push(enclosing.trim().trim_end_matches(['{', '[', '(']).trim());
-        }
-    }
-    path.reverse();
-    format!("{} > {}\n  again: {}", path.join(" > "), line(was), line(now))
-}
-
-/// How two frames differ: each field that does, and in it the first
-/// line that does (for a list, of the first element that does).
-fn difference(first: &RenderFrame, again: &RenderFrame) -> String {
-    let (first, again) = (format!("{first:#?}"), format!("{again:#?}"));
-    let (first, again): (Vec<&str>, Vec<&str>) = (first.lines().collect(), again.lines().collect());
-    let mut said = Vec::new();
-    for (was, now) in entries(&first, 4).iter().zip(entries(&again, 4)) {
-        if *was == now {
-            continue;
-        }
-        let name = was[0].trim().split(':').next().unwrap_or_default();
-        let (was_items, now_items) = (entries(&was[1..], 8), entries(&now[1..], 8));
-        if was_items.len() == now_items.len()
-            && let Some(at) = was_items.iter().zip(&now_items).position(|(a, b)| a != b)
-        {
-            said.push(format!("{name}[{at}]: {}", first_difference(&was_items[at], &now_items[at])));
-            continue;
-        }
-        if was_items.len() != now_items.len() {
-            said.push(format!("{name}: {} entries, {} again", was_items.len(), now_items.len()));
-        }
-        said.push(first_difference(was, &now));
-    }
-    said.join("\n")
 }
 
 /// A game as a session runs it, minus the GPU: frames from a script,

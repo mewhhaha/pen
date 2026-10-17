@@ -141,6 +141,144 @@ alignment). gdev's `earth.wgsl` and `salt.wgsl` read `draw.extra` from that
 uniform, so moving extras into a storage buffer would change the shader
 interface the game's shaders use.
 
+## Culling, levels of detail and the GPU's passes
+
+Measured on 2026-10-17 on the same machine, under other work (load average
+15 to 50, so CPU times are noisy; GPU times come from timestamps). "Before"
+is 52a55af's renderer with gdev 33643cc's assets; "after" is this renderer
+with gdev's shaders declaring their bounds margins and reading the cascaded
+shadow maps.
+
+### Timing the GPU's passes
+
+With `TIMESTAMP_QUERY` (most native adapters, and WebGPU's
+`timestamp-query`), every pass writes a timestamp as it begins and ends.
+They are resolved into a buffer that is mapped a few frames later, so
+reading them never waits on the GPU, and summed by part: shadow maps,
+culling, scene, the passes after it, and sprites and insets, with the whole
+frame from its first pass to its last (`RenderStats::gpu`, the dev tools'
+diagnostics at high, `render_packet`'s output).
+
+### The gnorps' shader
+
+Timing the passes showed `render_packet --robots 40` (1,600 gnorps) taking
+**149 ms** of GPU time a frame, half in the shadow pass and half in the
+scene, though the gnorp has only 382 triangles. `robot3d.wgsl` kept its 32
+sampled poses as `const` arrays and indexed them per vertex; naga (and other
+WGSL compilers) copy a `const` array into each invocation that indexes it at
+run time. Generating them as `var<private>` arrays instead
+(`gdev/scripts/build_robot_mesh.py`) gives the same pixels and takes the
+frame to **1.7 ms**.
+
+### Culling
+
+A shader that declares `bounds_margin` has its draws tested against the
+camera's view and each shadow map's (pen-render's ARCHITECTURE.md, "Culling
+and levels of detail"). gdev declares it for its plain shaders, the salt
+(0.5) and the gnorps (0.25: their poses reach 0.24 past the rest pose's
+sphere, measured over every sampled pose). The six golden scenarios stay
+pixel-identical with culling on.
+
+| `--robots 40`, 1280x720 | Before | Culled |
+| --- | ---: | ---: |
+| Instances drawn by the camera (before Tab, after) | 1,600 | 548, 492 |
+| Casters left out of the two shadow maps | 0 | 2,903 |
+| GPU, shadow / scene / whole frame (ms) | 74.0 / 74.6 / 149.3 | 0.10 / 0.55 / 1.30 |
+
+(The "before" column has the gnorps' old shader; with the new shader alone,
+nothing culled and one shadow map, the frame took 1.72 ms.)
+
+### Batches culled on the GPU
+
+Batches of 256 instances or more are culled by a compute pass into indirect
+draws. For the 1,600 gnorps it takes 0.006 ms of GPU time and keeps exactly
+what the CPU keeps (548 instances before Tab, 492 after, frame for frame).
+At gdev's scale the CPU's culling is as cheap (a few microseconds a
+thousand instances), so the two differ by less than the noise; the GPU's
+path is for batches of many thousands, whose instances the CPU then writes
+once instead of once per view and level.
+
+### Levels of detail
+
+`pen build` packs meshes of 256 triangles or more with up to three simpler
+levels (meshopt-rs): 30 of gdev's 73 meshes get them, the assets grow 2%
+(32.7 to 33.3 MB of meshes) and packing takes 4.2 s more. Reproduce with
+`cargo test --release -p pen-render --features simplify --lib -- --ignored
+--nocapture game_mesh_levels`. Some of them:
+
+| Mesh | Triangles at each level (error, mesh units) |
+| --- | --- |
+| crater | 102,342; 7,357 (0.65); 892 (2.6); 128 (10.4) |
+| rock_menhir | 61,464; 2,282 (0.005) |
+| phone_handset | 31,906; 1,474 (0.004); 268 (0.016); 56 (0.066) |
+| god_hand_left | 13,228; 794 (0.015); 166 (0.059); 20 (0.235) |
+| robot3d | 382; 200 (0.006); 134 (0.025) |
+
+A level is drawn where its error spans at most a pixel. With the packaged
+assets, `--robots 40` draws 19 calls instead of 17 (two gnorp levels) and
+the scene pass takes 0.295 ms instead of 0.451 (shadows 0.040 instead of
+0.051). Levels apply only to shaders that declare their bounds, as only
+their meshes' positions are where they draw; gdev's god hand, grass and
+blueprints keep their whole meshes.
+
+### Cascaded shadows
+
+gdev's lit shaders read pen's nearer shadow map (`shadow_cascades`). In
+gdev's play view at 1920x1280 the shadow passes took 1.10 ms with the
+game's map alone, 1.99 ms with one nearer map and 2.99 ms with two: gdev's
+largest casters (the 102,342-triangle crater and the rocks) reach into every
+map, so each costs about as much as the game's. pen fits one. The golden
+scenarios change by 0.09 to 0.18% RMSE (under 0.06% of pixels visibly):
+shadow edges near the camera are crisper and grazing facets of the rock
+shadow themselves.
+
+### Dynamic resolution
+
+`pen run --frame-budget MS` (and `Renderer::frame_budget`) lowers the
+scene's render scale while the GPU takes longer than the budget. In gdev's
+play view at 1920x1280, `--frame-budget 0.4` (more than this GPU can do) took
+the scale to 50% within half a second: the scene pass from 1.91 to 1.30 ms
+and the passes after it from 1.16 to 0.39 ms, the shadows unchanged at 3.0
+(two nearer maps then).
+
+### Before and after
+
+`render_packet --sequence --veil` over the 119 packets of `just packets`, at
+1280x720, three to six alternating rounds each (the range of their
+medians), on a machine other work kept busy.
+"Before" is 52a55af's `render_packet` with gdev 33643cc's assets; "after" is
+this renderer with the export's assets (`pen export`, whole meshes), and
+with the package's (`pen build`, levels of detail). Wall times are from a
+submit to the GPU finishing it, with pass timestamps off (`--untimed`); GPU
+times are the timestamps of separate timed runs.
+
+| | Before | After | After, levels of detail |
+| --- | ---: | ---: | ---: |
+| Submit (CPU), ms | 0.93-1.14 | 1.01-1.23 | 1.05-1.11 |
+| Submit to GPU done, ms | 2.40-2.75 | 2.70-2.94 | 2.68-2.82 |
+| GPU: shadow / scene / post / whole, ms | | 0.07 / 0.44 / 0.46 / 1.07 | 0.05 / 0.29 / 0.46 / 0.89 |
+| `--robots 40`: submit (CPU), ms | 1.27-1.32 | 1.29-1.53 | 1.29-1.52 |
+| `--robots 40`: submit to GPU done, ms | 139.2-139.4 | 3.15-4.65 | 3.18-3.88 |
+| `--robots 40`: GPU shadow / cull / scene / whole, ms | 74.0 / - / 74.6 / 149.3 | 0.10 / 0.007 / 0.55 / 1.30 | 0.08 / 0.007 / 0.36 / 1.07 |
+| `--robots 40`: gnorps drawn (culled), shadow casters left out | 1,600 (0), 0 | 548 or 492 (1,052 or 1,108), 2,903 | the same |
+
+The same renderer with the old assets (no bounds declared, so nothing
+culled, and no nearer shadow map) took 1.04-1.15 ms to submit and 2.64-2.79
+to finish: its own work is within the noise of these runs. Pass timestamps,
+when on, cost about 0.3 ms of wall time a frame here (consecutive passes no
+longer overlap), so only the dev tools' timing (diagnostics at medium and
+high), a frame budget or `render_packet` turn them on. The nearer shadow
+map adds about 0.04 ms of GPU time to these frames, and reading it in the
+lit shaders about 0.09 ms of the scene's.
+
+The browser host's wasm grows from 751,808 to 821,933 bytes (301,579 to
+340,599 gzipped): culling, cascades, timestamps, dynamic resolution and the
+WebGPU bindings for compute passes, indirect draws and query sets they use.
+The simplifier stays out of it (the `simplify` feature is pen's). In
+headless Chromium on the GPU, the exported game draws with WebGPU's
+`timestamp-query`, the nearer shadow map and the culling pipeline compiled,
+with no console or validation errors.
+
 ## FXAA Quality
 
 The old directional blur is replaced by the

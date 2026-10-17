@@ -113,7 +113,17 @@ pub struct GuestAbi {
     /// it calls after copying the result out (outcome 0) or after a failure
     /// (1), before `blot:reset`.
     pub ownership: bool,
+    /// Blot's structured tasks (guest-abi.md, "Structured task
+    /// extension"): the `blot:tasks` section's descriptor count. pen does
+    /// not host them yet ([`GuestAbi::check_hostable`]).
+    pub tasks: Option<u32>,
+    /// Functions whose callback is `concurrent` (manifest tag 13): tasks
+    /// may suspend in it side by side.
+    pub concurrent: Vec<String>,
 }
+
+/// The custom section a task module declares its task descriptors in.
+pub const TASKS_SECTION: &str = "blot:tasks";
 
 /// What a game's `main` takes: the host, which answers each frame's
 /// request with the next frame's input.
@@ -148,6 +158,25 @@ impl GuestAbi {
         })
     }
 
+    /// Checks pen can host the module: it uses no ABI extension pen does
+    /// not implement. Blot's structured tasks need a host that keeps
+    /// several suspended Wasm stacks of one instance, which wasmtime's core
+    /// API does not (docs/services-as-tasks.md).
+    pub fn check_hostable(&self) -> Result<()> {
+        if let Some(descriptors) = self.tasks {
+            bail!(
+                "unsupported_abi: the module uses Blot's structured tasks ({TASKS_SECTION}, {descriptors} \
+                 descriptors{}), which pen does not host yet (docs/services-as-tasks.md)",
+                if self.concurrent.is_empty() {
+                    String::new()
+                } else {
+                    format!("; concurrent callbacks for {}", self.concurrent.join(", "))
+                }
+            );
+        }
+        Ok(())
+    }
+
     /// Checks the module is a game: it exports `main`, which takes the host
     /// ([`GAME_HOST`]) and runs until the host stops it.
     pub fn check_game(&self) -> Result<()> {
@@ -160,13 +189,13 @@ impl GuestAbi {
     }
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
+pub(crate) struct Reader<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) at: usize,
 }
 
 impl Reader<'_> {
-    fn byte(&mut self) -> Result<u8> {
+    pub(crate) fn byte(&mut self) -> Result<u8> {
         let byte = *self.bytes.get(self.at).ok_or_else(|| anyhow!("invalid_abi: truncated manifest"))?;
         self.at += 1;
         Ok(byte)
@@ -174,12 +203,18 @@ impl Reader<'_> {
 
     /// A canonical unsigned LEB128 u32.
     fn u32(&mut self) -> Result<u32> {
+        self.leb(true)
+    }
+
+    /// An unsigned LEB128 u32, canonical or (as Wasm's own framing may be)
+    /// padded.
+    pub(crate) fn leb(&mut self, canonical: bool) -> Result<u32> {
         let mut value = 0u64;
         for index in 0..5 {
             let byte = self.byte()?;
             value |= u64::from(byte & 0x7f) << (index * 7);
             if byte & 0x80 == 0 {
-                ensure!(index == 0 || byte != 0, "invalid_abi: non-canonical LEB128");
+                ensure!(!canonical || index == 0 || byte != 0, "invalid_abi: non-canonical LEB128");
                 return u32::try_from(value).map_err(|_| anyhow!("invalid_abi: LEB128 exceeds u32"));
             }
         }
@@ -188,6 +223,11 @@ impl Reader<'_> {
 
     fn name(&mut self) -> Result<String> {
         let length = self.u32()? as usize;
+        self.text(length)
+    }
+
+    /// `length` bytes of UTF-8.
+    pub(crate) fn text(&mut self, length: usize) -> Result<String> {
         let end = self.at.checked_add(length).filter(|end| *end <= self.bytes.len());
         let end = end.ok_or_else(|| anyhow!("invalid_abi: truncated name"))?;
         let name =
@@ -207,7 +247,11 @@ pub fn parse_abi(payload: &[u8]) -> Result<GuestAbi> {
     for _ in 0..reader.u32()? {
         let name = reader.name()?;
         let tag = reader.byte()?;
-        let parameter = if tag == 4 {
+        // 13: a concurrent callback, valid only beside a task section.
+        if tag == 13 {
+            abi.concurrent.push(name.clone());
+        }
+        let parameter = if tag == 4 || tag == 13 {
             Parameter::Callback(CallbackType {
                 parameter: ValueType::from_tag(reader.byte()?)?,
                 result: ValueType::from_tag(reader.byte()?)?,
@@ -230,26 +274,67 @@ pub fn parse_abi(payload: &[u8]) -> Result<GuestAbi> {
     Ok(abi)
 }
 
-/// Finds the single `blot:abi` custom section in a module's bytes.
-pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
+/// A module's sections, in order: each one's id and contents.
+pub fn sections(wasm: &[u8]) -> Result<Vec<(u8, &[u8])>> {
     ensure!(wasm.len() >= 8 && wasm[..4] == *b"\0asm", "not a Wasm module");
     let mut reader = Reader { bytes: wasm, at: 8 };
-    let mut found = None;
+    let mut sections = Vec::new();
     while reader.at < wasm.len() {
         let id = reader.byte()?;
-        let size = reader.u32()? as usize;
+        let size = reader.leb(false)? as usize;
         let end = reader.at.checked_add(size).filter(|end| *end <= wasm.len());
         let end = end.ok_or_else(|| anyhow!("truncated Wasm section"))?;
-        if id == 0 {
-            let mut section = Reader { bytes: &wasm[..end], at: reader.at };
-            if section.name()? == ABI_SECTION {
-                ensure!(found.is_none(), "invalid_abi: more than one {ABI_SECTION} section");
-                found = Some(parse_abi(&wasm[section.at..end])?);
-            }
-        }
+        sections.push((id, &wasm[reader.at..end]));
         reader.at = end;
     }
-    found.ok_or_else(|| anyhow!("invalid_abi: missing {ABI_SECTION} section"))
+    Ok(sections)
+}
+
+/// A module's custom sections, in order: each one's name and payload.
+pub fn custom_sections(wasm: &[u8]) -> Result<Vec<(String, &[u8])>> {
+    let mut custom = Vec::new();
+    for (id, contents) in sections(wasm)? {
+        if id == 0 {
+            let mut section = Reader { bytes: contents, at: 0 };
+            let length = section.leb(false)? as usize;
+            let name = section.text(length)?;
+            custom.push((name, &contents[section.at..]));
+        }
+    }
+    Ok(custom)
+}
+
+/// Finds the single `blot:abi` custom section in a module's bytes, and the
+/// task extension's section beside it, if it has one.
+pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
+    let mut found = None;
+    let mut tasks = None;
+    for (name, payload) in custom_sections(wasm)? {
+        if name == ABI_SECTION {
+            ensure!(found.is_none(), "invalid_abi: more than one {ABI_SECTION} section");
+            found = Some(parse_abi(payload)?);
+        } else if name == TASKS_SECTION {
+            ensure!(tasks.is_none(), "invalid_abi: more than one {TASKS_SECTION} section");
+            tasks = Some(parse_tasks(payload)?);
+        }
+    }
+    let mut abi = found.ok_or_else(|| anyhow!("invalid_abi: missing {ABI_SECTION} section"))?;
+    ensure!(tasks.is_none() || abi.ownership, "invalid_abi: tasks need ABI 3's ownership");
+    ensure!(tasks.is_some() || abi.concurrent.is_empty(), "invalid_abi: concurrent callbacks need {TASKS_SECTION}");
+    abi.tasks = tasks;
+    Ok(abi)
+}
+
+/// A `blot:tasks` section's payload: version 2, then the descriptor count
+/// (at most 4096), and nothing after.
+fn parse_tasks(payload: &[u8]) -> Result<u32> {
+    let mut reader = Reader { bytes: payload, at: 0 };
+    let version = reader.u32()?;
+    ensure!(version == 2, "invalid_abi: unsupported task contract {version}");
+    let count = reader.u32()?;
+    ensure!(count <= 4096, "invalid_abi: {count} task descriptors (at most 4096)");
+    ensure!(reader.at == payload.len(), "invalid_abi: trailing task section bytes");
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -271,6 +356,32 @@ mod tests {
         assert!(parse_abi(&[0x02, 0x00, 0x00, 0x00]).is_err());
         assert_eq!(parse_abi(&[0x03, 0x00, 0x00]).unwrap(), GuestAbi { ownership: true, ..GuestAbi::default() });
         assert!(parse_abi(&[0x04, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn task_modules_are_read_and_refused() {
+        let section = |name: &str, payload: &[u8]| {
+            let contents = [&[u8::try_from(name.len()).unwrap()][..], name.as_bytes(), payload].concat();
+            [vec![0, u8::try_from(contents.len()).unwrap()], contents].concat()
+        };
+        // main: (Array F32 -> Array F32, concurrent) -> Unit, ABI 3.
+        let manifest = [0x03, 0x01, 0x04, b'm', b'a', b'i', b'n', 13, 0x06, 0x06, 0x00, 0x00];
+        let module = |sections: &[Vec<u8>]| [b"\0asm\x01\0\0\0".to_vec(), sections.concat()].concat();
+        let abi = read_abi(&module(&[section(ABI_SECTION, &manifest), section(TASKS_SECTION, &[2, 3])])).unwrap();
+        assert_eq!((abi.tasks, abi.concurrent.as_slice()), (Some(3), &["main".to_owned()][..]));
+        assert!(abi.check_game().is_ok(), "its main still takes the host");
+        let refused = format!("{:#}", abi.check_hostable().unwrap_err());
+        assert!(
+            refused.contains("structured tasks (blot:tasks, 3 descriptors; concurrent callbacks for main)"),
+            "{refused}"
+        );
+        let error = |sections: &[Vec<u8>]| format!("{:#}", read_abi(&module(sections)).unwrap_err());
+        assert!(error(&[section(ABI_SECTION, &manifest)]).contains("concurrent callbacks need blot:tasks"));
+        let mut version_2 = manifest;
+        version_2[0] = 2;
+        assert!(error(&[section(ABI_SECTION, &version_2), section(TASKS_SECTION, &[2, 3])]).contains("ownership"));
+        assert!(error(&[section(ABI_SECTION, &manifest), section(TASKS_SECTION, &[1, 3])]).contains("contract 1"));
+        assert!(GuestAbi::default().check_hostable().is_ok());
     }
 
     #[test]

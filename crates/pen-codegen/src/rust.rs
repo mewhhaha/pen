@@ -217,6 +217,22 @@ fn types(model: &Model) -> Vec<String> {
         };
         frame.push(Member { name: s(&section["name"]).to_owned(), ty, copy: false, doc: text(section, "doc") });
     }
+    if let Some(extensions) = model.extensions() {
+        out.extend(structure(
+            "Extension",
+            Some("One of the game's own sections: its tag, from its declaration, and its lanes."),
+            &[
+                Member { name: "tag".to_owned(), ty: "u32".to_owned(), copy: true, doc: None },
+                Member { name: "values".to_owned(), ty: "Vec<f32>".to_owned(), copy: false, doc: None },
+            ],
+        ));
+        frame.push(Member {
+            name: "extensions".to_owned(),
+            ty: "Vec<Extension>".to_owned(),
+            copy: false,
+            doc: text(extensions, "doc"),
+        });
+    }
     out.extend(structure("RenderFrame", protocol["render"]["doc"].as_str(), &frame));
     out.push("}".to_owned());
     out
@@ -242,6 +258,10 @@ fn constants(model: &Model) -> Vec<String> {
         out.push(format!("    pub const {}: usize = {};", s(&limit["limit"]), limit["value"]));
     }
     out.push(format!("    pub const PACKET_MAGIC: f32 = 0x{:x} as f32;", model.magic));
+    if let Some(extensions) = model.extensions() {
+        out.push("    /// The lane that starts a packet's block of the game's own sections.".to_owned());
+        out.push(format!("    pub const EXTENSIONS_MARKER: f32 = 0x{:x} as f32;", n(&extensions["marker"])));
+    }
     let header_fields = model
         .header
         .iter()
@@ -703,6 +723,19 @@ fn render(model: &Model) -> Vec<String> {
         out.push(format!("        let {trailing}_end = {trailing}_start + {trailing}_lanes;"));
         packet_end = format!("{trailing}_end");
     }
+    if let Some(extensions) = model.extensions() {
+        lines(
+            &mut out,
+            &format!(
+                "        // The game's own sections, after the rest: the marker, their count, then each\n        // one's tag, length and values.\n        let mut extensions = std::mem::take(&mut frame.extensions);\n        extensions.clear();\n        let mut extensions_end = {packet_end};\n        if packet.len() > extensions_end {{\n            // Lanes past the end that are no block are an oversized packet.\n            ensure!(packet.len() >= extensions_end + 2 && packet[extensions_end] == EXTENSIONS_MARKER, truncated);\n            let invalid = {};\n            let count = reader.count(extensions_end + 1, {})?;\n            extensions_end += 2;\n            for _ in 0..count {{\n                ensure!(packet.len() >= extensions_end + 2, invalid);\n                let tag = reader.count(extensions_end, {})?;\n                let length = reader.count(extensions_end + 1, {})?;\n                let first = extensions_end + 2;\n                ensure!(tag >= 1 && packet.len() >= first + length, invalid);\n                extensions.push(Extension {{ tag: tag as u32, values: packet[first..first + length].to_vec() }});\n                extensions_end = first + length;\n            }}\n        }}",
+                quote(&extensions["message"]),
+                bound(&extensions["max"]),
+                bound(&extensions["tag"]),
+                bound(&extensions["lanes"]),
+            ),
+        );
+        packet_end = "extensions_end".to_owned();
+    }
     out.push(format!("        ensure!(packet.len() == {packet_end}, truncated);"));
     for entry in &cursors {
         let name = s(&entry.section["name"]);
@@ -890,6 +923,9 @@ fn render(model: &Model) -> Vec<String> {
         }
         out.push(format!("            {},", s(&section["name"])));
     }
+    if model.extensions().is_some() {
+        out.push("            extensions,".to_owned());
+    }
     out.push("        };".to_owned());
     out.push(format!("        Ok(&packet[{state}_start..{state}_end])"));
     out.push("    }".to_owned());
@@ -921,13 +957,15 @@ pub fn emit(model: &Model, header: &str) -> String {
     out.push(String::new());
     lines(
         &mut out,
-        "/// The packets' layout: constants, the input packet encoder and the render\n/// packet decoder.\npub mod codec {\n    use anyhow::{Result, bail, ensure};\n\n    use super::types::*;\n",
+        "/// The packets' layout: constants, the input packet encoder and the render\n/// packet decoder; and the packets' canonical walks, which tests compare across\n/// languages.\npub mod codec {\n    use anyhow::{Result, bail, ensure};\n\n    use super::types::*;\n",
     );
     out.extend(constants(model));
     out.push(String::new());
     out.extend(input(model));
     out.push(String::new());
     out.extend(render(model));
+    out.push(String::new());
+    out.extend(crate::canonical::rust(model));
     out.extend(["}".to_owned(), String::new()]);
     out.join("\n")
 }

@@ -1,10 +1,12 @@
 {
   "catalog": {
     "mesh": {
-      "list": "meshes"
+      "list": "meshes",
+      "empty": "game drew a mesh with no meshes in the catalog"
     },
     "material": {
-      "list": "materials"
+      "list": "materials",
+      "empty": "game used a material with no materials in the catalog"
     },
     "sound": {
       "list": "sounds",
@@ -171,6 +173,71 @@
       "limit": "AUDIO_OPEN",
       "value": 24000,
       "doc": "A lowpass cutoff, in Hz, at or above which a filter is open; hosts also leave one open at or above half their sample rate."
+    },
+    {
+      "limit": "MAX_POSES",
+      "value": 65536,
+      "doc": "The most pose layers one frame may have."
+    },
+    {
+      "limit": "MAX_EMITTERS",
+      "value": 1024,
+      "doc": "The most particle emitters one frame may have."
+    },
+    {
+      "limit": "MAX_PARTICLES",
+      "value": 65536,
+      "doc": "The most particles one emitter has alive at once (its rate times its lifetime, rounded up); hosts leave out the rest."
+    },
+    {
+      "limit": "MAX_EXTENSIONS",
+      "value": 64,
+      "doc": "The most of a game's own sections one frame may carry."
+    },
+    {
+      "limit": "MAX_EXTENSION_TAG",
+      "value": 65535,
+      "doc": "A game's own sections and events are numbered from 1 to this."
+    },
+    {
+      "limit": "MAX_EXTENSION_LANES",
+      "value": 1048576,
+      "doc": "The most lanes one of a game's own sections may carry."
+    },
+    {
+      "limit": "MAX_GAMEPADS",
+      "value": 16,
+      "doc": "Gamepads connected at once that the game hears of: pads are numbered from 0 to one less than this."
+    },
+    {
+      "limit": "MAX_ACTIONS",
+      "value": 256,
+      "doc": "Actions a game declares (the input service's declare): they are numbered from 0 to one less than this."
+    },
+    {
+      "limit": "MAX_ACTION_BINDINGS",
+      "value": 8,
+      "doc": "Bindings one action holds, its defaults and the player's alike."
+    },
+    {
+      "limit": "MAX_TOUCHES",
+      "value": 32,
+      "doc": "Touches down at once that the game hears of: they are numbered from 0 to one less than this."
+    },
+    {
+      "limit": "MAX_LIGHTS",
+      "value": 4096,
+      "doc": "The most point and spot lights one frame may have."
+    },
+    {
+      "limit": "ENGINE_PREFERENCES",
+      "value": 64,
+      "doc": "Preference events from this index on carry the engine's preferences (ENGINE_PREFERENCE_*); below it, the game's own."
+    },
+    {
+      "limit": "MAX_PANNERS",
+      "value": 512,
+      "doc": "The most panners one frame may declare: one for each voice and sound it may have."
     }
   ],
   "enumerations": [
@@ -250,9 +317,18 @@
         "url",
         "platform",
         "pathfinding",
-        "devtools"
+        "devtools",
+        "physics",
+        "navmesh",
+        "spatial",
+        "noise",
+        "input",
+        "preferences",
+        "locale",
+        "captions",
+        "reports"
       ],
-      "doc": "Which service a request is for: Steam's achievements, stats and rich presence, the system clipboard, the browser for a web address, what the game runs on, a native compute library (grid pathfinding), and the host's developer tools (DEVTOOLS_OP_*), which only a dev tools program asks of. A host without one answers unavailable."
+      "doc": "Which service a request is for: Steam's achievements, stats and rich presence, the system clipboard, the browser for a web address, what the game runs on, a native compute library (grid pathfinding), the host's developer tools (DEVTOOLS_OP_*), which only a dev tools program asks of, the simulation services both hosts answer alike, bit for bit: rigid-body physics, paths over a navmesh, ray and shape queries against colliders, and noise and heightfields, the game's actions and their bindings (INPUT_OP_*), the engine's preferences (PREFERENCES_OP_*), the player's language (LOCALE_OP_*), the captions of the sounds that play (CAPTIONS_OP_*) and the player's consent to crash and performance reports (REPORTS_OP_*). A host without one answers unavailable."
     },
     {
       "name": "ServiceStatus",
@@ -277,9 +353,17 @@
         "get_stat",
         "set_presence",
         "clear_presence",
-        "status"
+        "status",
+        "input_action_set",
+        "input_glyph",
+        "input_panel",
+        "workshop_publish",
+        "workshop_items",
+        "workshop_subscribe",
+        "workshop_unsubscribe",
+        "workshop_use"
       ],
-      "doc": "Steam's operations. Achievements and stats go by their API names (the text); set_stat and set_stat_float set `a`, add_stat adds `a` to an integer stat, and these and get_stat answer the stat's value. set_presence sets rich presence key (the text's first `a` code points) to the rest of the text; clear_presence clears every key. status answers ok while Steam runs for the game, unavailable otherwise."
+      "doc": "Steam's operations. Achievements and stats go by their API names (the text); set_stat and set_stat_float set `a`, add_stat adds `a` to an integer stat, and these and get_stat answer the stat's value. set_presence sets rich presence key (the text's first `a` code points) to the rest of the text; clear_presence clears every key. status answers ok while Steam runs for the game, unavailable otherwise. Steam Input: input_action_set activates the action set named by the text on every controller, input_glyph answers the path of the glyph image of the first button or stick bound to the action named by the text in the active set (a digital action, or an analog one), and input_panel opens Steam's binding panel, where the player rebinds them; each answers unavailable without Steam Input or a controller. The Workshop's: workshop_publish uploads the player's saved scene (the editor's) as an item titled with the text, visible to `a` (0 everyone, 1 friends, 2 only the player, 3 those with the link), or with `b` 1 as a new version of the item whose id is the text's first line, answered later with the item's id as text and value 1 when the player must accept the Workshop's agreement; workshop_items answers the installed subscribed items' ids as text, a space between them, their count the value, and downloads the rest; workshop_subscribe and workshop_unsubscribe take an item's id as text and answer once Steam has; workshop_use makes an installed item's scene the player's, for the game to load as the editor's scene."
     },
     {
       "name": "ClipboardOperation",
@@ -334,9 +418,33 @@
         "shot",
         "tune",
         "bake",
-        "tuned"
+        "tuned",
+        "packets",
+        "packet_diff",
+        "state",
+        "state_diff",
+        "pictures",
+        "seek",
+        "watch",
+        "profile",
+        "flame",
+        "memory",
+        "presets",
+        "preset_save",
+        "preset_load",
+        "assets",
+        "preview",
+        "swap",
+        "material",
+        "material_set",
+        "audit",
+        "audio",
+        "mute",
+        "solo",
+        "export",
+        "import"
       ],
-      "doc": "The host's developer tools. log answers the log's lines from serial `a` on, value the serial after the last, each line as its source (0 game, 1 build, 2 reload, 3 asset, 4 pipeline, 5 session), 1 if an error, its length and its code points. frame answers the last frame's numbers in DEVTOOLS_FRAME's order, timing the game's frames while `a` is 1. gpu answers the graphics adapter's name. command sends the game console command `a` with argument `b`. pause and play stop and start the game's clock; step runs `a` frames and stays paused; rewind goes back `a` seconds of game time, paused; replay plays the last `a` seconds again, then live; history keeps the past to travel in (unavailable answers what needs it while none is kept). record starts recording the input to the text's path, or a new file when it is empty, or stops a recording. shot saves the window with the dev tools over it to the text's path, or a new file. tune sets the live-tunable constant whose id is `a` to `b`, and tuned answers the game's tuned values as id and value pairs. bake writes them into the checkout as the defaults."
+      "doc": "The host's developer tools. log answers the log's lines from serial `a` on, value the serial after the last, each line as its source (0 game, 1 build, 2 reload, 3 asset, 4 pipeline, 5 session), 1 if an error, its length and its code points. frame answers the last frame's numbers in DEVTOOLS_FRAME's order, timing the game's frames while `a` is 1. gpu answers the graphics adapter's name. command sends the game console command `a` with argument `b`. pause and play stop and start the game's clock; step runs `a` frames and stays paused; rewind goes back `a` seconds of game time, paused; replay plays the last `a` seconds again, then live; history keeps the past to travel in (unavailable answers what needs it while none is kept). record starts recording the input to the text's path, or a new file when it is empty, or stops a recording. shot saves the window with the dev tools over it to the text's path, or a new file. tune sets the live-tunable constant whose id is `a` to `b`, and tuned answers the game's tuned values as id and value pairs. bake writes them into the checkout as the defaults, or only the one whose id is `a` when `a` is not 0. packets keeps each frame's input and render packets from now on while `a` is 1 (the last 120 frames), or forgets them at 0, and answers the frames kept, oldest first, each as DEVTOOLS_PACKET's numbers; packet_diff answers how frame `b` differs from frame `a`, both kept: for each of DEVTOOLS_PACKET's numbers after position, its count in `a`, its count in `b` and how many of its elements differ. state answers the live state's sections (`a` below 0), each its key, version, width and length, value the state's schema, or up to 256 lanes of section `a` from lane `b` on, value its length; with `c` above 0, of the state the history kept `c` seconds of game time back instead. state_diff answers, for each section of the live state or the one kept `a` seconds back, its key, its length then and now, how many lanes differ and the first that does (-1 for none), value the frame compared with. pictures takes a picture of the game's frame each time the history could keep a moment, while `a` is 1, into the dev tools' atlas (the texture of material `b`: slots of 128 by 80 pixels, 8 to a row, the first 16 for pictures), and answers each picture's slot and the frame that shows it, oldest first; seek goes to frame `a`, paused. watch pauses the game once lane `b` of the live state's section `a` compares with `d` as DEVTOOLS_COMPARE `c` says, `a` -1 stops watching and -2 only asks; it answers the watch: key, lane, comparison, value, the lane's value now and the frame it paused at (-1 for none). profile samples the game's guest while `a` is 1, stops at 0 and forgets the samples at 2 (3 only asks), answering how many it has and 1 while sampling; flame answers them as a flame graph, value the samples: first how many functions follow that the samples found running most, each its function index, samples, its name's length and code points; then each node (a caller before its callees) as its depth, function index, first sample, samples, samples in it alone, its name's length and code points. memory answers the game's committed memory in bytes, the most it committed, then for each counter the guest exports (guest ABI 3's ownership counters) and the host's calls into it, its name's length, code points and value in two 24-bit halves, value the number of counters. presets answers the names of the checkout's tunable presets, a line each; preset_save saves the game's tuned values as the preset the text names, and preset_load tunes each value of that preset. assets answers the game's catalog of DEVTOOLS_ASSET `a`, each entry as its DEVTOOLS_ASSET_STATE, its revision, its key's length and code points. preview draws catalog asset `b` of kind `a` (a mesh with material `c`, a material on mesh `c`) into slot `d` (16 to 63) of the atlas pictures named, value 1 once drawn and 0 while its assets load. swap draws catalog asset `b` of kind `a` from the asset the text names instead, or its own again when the text is empty, until the next build. material answers material `a`'s color and instance parameters (8 numbers, 0 when it sets none), whether it sets them (two numbers), then its shader's and texture's names, each its length and code points; material_set sets number `b` of those 8 in the checkout's file to `c`, which then reloads. audit checks the game's interface as the last frame showed it and answers its findings: value their count, and for each its kind (AUDIT_FINDING_*), the node's id, a measure (a contrast ratio, a size in pixels, or 0), its message's length and the message's code points. audio answers the mix as it plays: DEVTOOLS_AUDIO's numbers, then DEVTOOLS_BUS's for each bus, the master first; peaks and RMS are linear and over what played since the last audio answer. mute silences bus `a` while `b` is 1 and solo hears only the soloed buses (and the master's own voices) while any is soloed; both are the developer's, never the game's or a recording's. export hands the game's state over as a save file named by the text, or a new one (the browser downloads it); import loads a save file the player hands over (the browser asks for one), or plays an input recording."
     },
     {
       "name": "DevtoolsFrame",
@@ -364,9 +472,356 @@
         "replaying",
         "history",
         "pipelined",
-        "recording"
+        "recording",
+        "culled",
+        "shadow_culled",
+        "triangles",
+        "render_scale",
+        "gpu_shadow",
+        "gpu_culling",
+        "gpu_scene",
+        "gpu_post",
+        "gpu_overlay",
+        "gpu_total"
       ],
-      "doc": "Where each number sits in a devtools frame answer: the milliseconds since the frame before; the game's frame phases in milliseconds (guest, waited for an overlapped guest, packet decode, validation, render and present, housekeeping, and their total), each -1 when the frame was not timed or did not run; its packet's bytes; the renderer's draw calls, instanced ones and instances; the frame's meshes and brushes; the game's memory in bytes; the frame's width and height in pixels; and the timeline: the next frame's position, 1 when paused, replaying, keeping history or overlapping frames, and the frame an input recording started at, or -1."
+      "doc": "Where each number sits in a devtools frame answer: the milliseconds since the frame before; the game's frame phases in milliseconds (guest, waited for an overlapped guest, packet decode, validation, render and present, housekeeping, and their total), each -1 when the frame was not timed or did not run; its packet's bytes; the renderer's draw calls, instanced ones and instances; the frame's meshes and brushes; the game's memory in bytes; the frame's width and height in pixels; and the timeline: the next frame's position, 1 when paused, replaying, keeping history or overlapping frames, and the frame an input recording started at, or -1. Then the renderer's culling: draws and instances left out of the camera's view, and casters left out of the shadow maps (once for each map); the triangles drawn; the render scale the scene drew at; and the GPU's milliseconds over a recent frame's shadow maps, culling, scene, the passes after it, sprites and insets, and the whole frame, each -1 where the GPU has no timestamps."
+    },
+    {
+      "name": "PhysicsOperation",
+      "constant": "PHYSICS_OP",
+      "values": [
+        "step"
+      ],
+      "doc": "Rigid-body physics (rapier), from the world the request sends: step advances it `a` steps (1 to 600) of `b` seconds (up to 1) with gravity `c` (metres per second squared along y). The values are its bodies, each a kind (PHYSICS_BODY_*), a collider (COLLIDER_SHAPE_*'s record: shape, size x y z, position x y z, rotation quaternion x y z w), linear velocity x y z, angular velocity x y z (radians a second), friction, restitution and density, then its shape's data. The answer's values are each body's position x y z, rotation x y z w, linear and angular velocity, 13 values in the request's order, then the contacts touching after the last step, 9 values each: the two bodies' indices (the lower first), the deepest point x y z, the normal x y z from the first to the second, and their distance (negative while they overlap); its value is the contacts' count. The world is the request's alone: nothing carries over to the next."
+    },
+    {
+      "name": "PhysicsBody",
+      "constant": "PHYSICS_BODY",
+      "values": [
+        "fixed",
+        "dynamic",
+        "kinematic"
+      ],
+      "doc": "How a physics body moves: never; under gravity and contacts; or by its velocity alone, pushing what it meets."
+    },
+    {
+      "name": "ColliderShape",
+      "constant": "COLLIDER_SHAPE",
+      "values": [
+        "ball",
+        "cuboid",
+        "capsule",
+        "cylinder",
+        "convex",
+        "heightfield",
+        "trimesh"
+      ],
+      "doc": "A collider's shape, and what its size and data mean: a ball of radius x; a cuboid of half extents x y z; a capsule and a cylinder of radius x and half height y along their y axis; the convex hull of x points, its data x y z each; a heightfield of x columns by y rows of samples z metres apart, centred on its position, its data the heights row by row from -z, each row from -x; and a triangle mesh of x vertices and y triangles, its data the vertices x y z, then each triangle's three vertex indices. Coordinates, sizes, heights and speeds lie within a million metres (a second): a request past that fails."
+    },
+    {
+      "name": "NavmeshOperation",
+      "constant": "NAVMESH_OP",
+      "values": [
+        "find",
+        "triangles"
+      ],
+      "doc": "Paths over a navmesh on the ground plane (x, z), triangulated from areas. The values are an agent's radius, then areas: each a kind (NAVMESH_AREA_*), a corner count and the corners' x z. The ground is walkable where a walkable area covers it and no obstacle does. find answers a short way from (`a`, `b`) to (`c`, `d`), its turns kept the radius off the corners they round and crossing no navmesh edge narrower than twice it, as x z points from start to goal, value their count; a start or goal off the navmesh moves to its nearest point, and none answers when the goal cannot be reached. triangles answers the walkable triangles, x z of each corner, value their count."
+    },
+    {
+      "name": "NavmeshArea",
+      "constant": "NAVMESH_AREA",
+      "values": [
+        "walkable",
+        "obstacle"
+      ],
+      "doc": "What a navmesh area is: ground to walk on, or something in the way."
+    },
+    {
+      "name": "SpatialOperation",
+      "constant": "SPATIAL_OP",
+      "values": [
+        "raycast",
+        "overlap",
+        "nearest"
+      ],
+      "doc": "Queries against `a` colliders, the request's first values (COLLIDER_SHAPE_*'s records with their data). raycast casts the rays that follow (origin x y z, direction x y z) up to `b` metres, a ray starting inside a shape hitting it at once while `c` is 1, and answers for each the collider it hits first (its index + 1, 0 for none), the distance and the surface's normal x y z, value the hits' count. overlap answers the indices of the colliders a query collider (the record that follows) touches, in order, value their count. nearest answers for each point that follows (x y z) the nearest collider within `b` metres (index + 1, 0 for none), the distance (0 inside) and its closest point x y z, value how many found one."
+    },
+    {
+      "name": "NoiseOperation",
+      "constant": "NOISE_OP",
+      "values": [
+        "heightfield",
+        "sample"
+      ],
+      "doc": "Deterministic simplex noise summed in octaves, the same on every host. The values start with its frequency (cycles a metre), amplitude, lacunarity (each octave's frequency over the last's), gain (each octave's amplitude over the last's) and style (NOISE_STYLE_*); `c` is the seed and `d` the octaves (1 to 16). heightfield answers a grid of `a` columns by `b` rows of heights, row by row, from the corner x z the next two values give, the last its spacing in metres (its rows along +z, its columns along +x). sample answers the height at each x z pair that follows. Heights stay within the amplitude; the value is their count."
+    },
+    {
+      "name": "NoiseStyle",
+      "constant": "NOISE_STYLE",
+      "values": [
+        "fbm",
+        "ridged"
+      ],
+      "doc": "How noise octaves add up: fractal Brownian motion (rolling hills), or ridged (sharp crests where the noise crosses zero)."
+    },
+    {
+      "name": "GamepadButton",
+      "constant": "GAMEPAD_BUTTON",
+      "values": [
+        "south",
+        "east",
+        "west",
+        "north",
+        "left_shoulder",
+        "right_shoulder",
+        "left_trigger",
+        "right_trigger",
+        "select",
+        "start",
+        "left_stick",
+        "right_stick",
+        "dpad_up",
+        "dpad_down",
+        "dpad_left",
+        "dpad_right",
+        "home"
+      ],
+      "doc": "A gamepad's buttons, in the order of the browser's standard gamepad: the four face buttons by where they sit (south is Xbox's A, PlayStation's cross), the shoulder buttons, the triggers (analog: their GamepadButton value runs from 0 to 1), select and start, the sticks pressed in, the directional pad and the home button."
+    },
+    {
+      "name": "GamepadAxis",
+      "constant": "GAMEPAD_AXIS",
+      "values": [
+        "left_x",
+        "left_y",
+        "right_x",
+        "right_y"
+      ],
+      "doc": "A gamepad's stick axes, in the order of the browser's standard gamepad: from -1 to 1, right and down positive."
+    },
+    {
+      "name": "InputDevice",
+      "constant": "INPUT_DEVICE",
+      "values": [
+        "keyboard",
+        "gamepad",
+        "steam",
+        "touch"
+      ],
+      "doc": "What moved an action (the Action event's device): the keyboard or mouse, a gamepad, Steam Input, or a touch screen. A game shows the prompts of the device the player used last."
+    },
+    {
+      "name": "InputSource",
+      "constant": "INPUT_SOURCE",
+      "values": [
+        "key",
+        "mouse",
+        "pad_button",
+        "pad_axis"
+      ],
+      "doc": "What a binding reads: a key (its code, as KeyDown events carry it), a mouse button (numbered as PointerDown events number them), a gamepad button (GAMEPAD_BUTTON_*) or a gamepad axis (GAMEPAD_AXIS_*). A binding is three numbers: its source, its code and its scale, which multiplies what it reads (a key or button reads 1 held, an axis -1 to 1), so -1 makes a key push an axis action the other way and an axis bound with -1 reads its other half."
+    },
+    {
+      "name": "InputOperation",
+      "constant": "INPUT_OP",
+      "values": [
+        "declare",
+        "capture",
+        "cancel",
+        "bind",
+        "unbind",
+        "reset",
+        "bindings"
+      ],
+      "doc": "The input service's operations, on action `a` (0 to MAX_ACTIONS - 1). declare declares it: `b` is 0 for a button (its value 1 while a binding holds it at half or more, else 0) or 1 for an axis (its value the bindings' sum, from -1 to 1), its values its name's `c` code points and then its default bindings, three numbers each (INPUT_SOURCE_*); it answers how many bindings it has, the player's if they rebound it. capture binds slot `b` to the next key, mouse button, gamepad button or stick the player presses (Escape gives up, answered failed), answering the binding as its values when it comes; cancel gives a capture up. bind sets slot `b` to the binding in the values, unbind removes slot `b`, reset gives the action its defaults back (every action's when `a` is MAX_ACTIONS), and bindings answers its bindings. The host keeps the player's bindings with their preferences."
+    },
+    {
+      "name": "TouchPhase",
+      "constant": "TOUCH_PHASE",
+      "values": [
+        "start",
+        "move",
+        "end",
+        "cancel"
+      ],
+      "doc": "Where a touch is (the Touch event's phase): put down, moved, lifted, or taken away by the system (a gesture it claimed, the window losing the focus)."
+    },
+    {
+      "name": "DevtoolsPacket",
+      "constant": "DEVTOOLS_PACKET",
+      "values": [
+        "position",
+        "events",
+        "input",
+        "packet",
+        "settings",
+        "draws",
+        "solids",
+        "decals",
+        "sounds",
+        "sprites",
+        "insets",
+        "fields",
+        "ui",
+        "services",
+        "buses",
+        "voices",
+        "requests"
+      ],
+      "doc": "Where each number sits in a devtools packets answer's frame: its position; its input's events and lanes; its render packet's lanes; its settings (camera, light, sky, quality and the rest, one element whose fields a diff counts); its draws, solids, decals, sounds, sprites, insets, field patches, interface nodes, service requests, buses and voices; and its requests to save, load, save and load the scene, checkpoint, undo, redo and exit, a bit each from 1 up."
+    },
+    {
+      "name": "DevtoolsCompare",
+      "constant": "DEVTOOLS_COMPARE",
+      "values": [
+        "equal",
+        "unequal",
+        "below",
+        "above",
+        "changes"
+      ],
+      "doc": "How a devtools watch compares a lane of the game's state with its value: equal to it, not equal, below it, above it, or (the value ignored) changed from what the lane held when the watch started."
+    },
+    {
+      "name": "DevtoolsAsset",
+      "constant": "DEVTOOLS_ASSET",
+      "values": [
+        "mesh",
+        "material",
+        "sound"
+      ],
+      "doc": "The kinds of the game's catalog a devtools assets, preview or swap request names."
+    },
+    {
+      "name": "DevtoolsAssetState",
+      "constant": "DEVTOOLS_ASSET_STATE",
+      "values": [
+        "unused",
+        "loading",
+        "ready",
+        "failed"
+      ],
+      "doc": "Where a catalog asset stands in the host: not asked for yet, loading, ready to use, or failed to load (its last good revision, if any, still used)."
+    },
+    {
+      "name": "EnginePreference",
+      "constant": "ENGINE_PREFERENCE",
+      "values": [
+        "color_filter",
+        "filter_strength",
+        "text_scale",
+        "reduced_motion"
+      ],
+      "doc": "The engine's own preferences, the same for every game: the player sets them through the host (its options, the platform's settings) or a game's settings (the preferences service), and the host keeps them. color_filter is a COLOR_FILTER_* the renderer applies to the whole picture, filter_strength how much of it (0 to 1), text_scale how much larger the game draws its text (1 to 2) and reduced_motion 1 when the player wants as little motion as can be (camera flights, shakes, slides and flashes left out). They reach the game as Preference events at index ENGINE_PREFERENCES plus the preference, played back as the game's own are."
+    },
+    {
+      "name": "ColorFilter",
+      "constant": "COLOR_FILTER",
+      "values": [
+        "none",
+        "protanopia",
+        "deuteranopia",
+        "tritanopia",
+        "achromatopsia"
+      ],
+      "doc": "A colour filter for colour vision deficiency: none, or the colours shifted so that those a player without red (protanopia), green (deuteranopia) or blue (tritanopia) cones confuses tell apart again; achromatopsia shows the picture in greys of its luminance."
+    },
+    {
+      "name": "PreferencesOperation",
+      "constant": "PREFERENCES_OP",
+      "values": [
+        "set"
+      ],
+      "doc": "The engine's preferences (ENGINE_PREFERENCE_*): set stores preference `a` as `b`, which the host applies at once and plays back to the game from then on, and answers the value it kept (clamped to the preference's range), or failed for a preference or value it does not take."
+    },
+    {
+      "name": "LocaleOperation",
+      "constant": "LOCALE_OP",
+      "values": [
+        "text",
+        "language",
+        "plural"
+      ],
+      "doc": "The player's language, from the game's string tables (its text.json, and locales/TAG.json for each language). text answers the string whose key is the request's text in the player's language, laid out to draw left to right (right-to-left scripts reordered and Arabic joined), with `a` as its count when `b` is 1 (choosing the plural form and filling {count}); value 1 when it reads right to left, unavailable when no table has the key; where the text drawn differs from the text read (right to left), its values are the text drawn, a 0, then the text in reading order, unshaped, for assistive technology. language answers the language in use as a BCP 47 tag, value 1 for a right-to-left one. plural answers the plural category (PLURAL_CATEGORY_*) of count `a` in it as its value."
+    },
+    {
+      "name": "PluralCategory",
+      "constant": "PLURAL_CATEGORY",
+      "values": [
+        "zero",
+        "one",
+        "two",
+        "few",
+        "many",
+        "other"
+      ],
+      "doc": "The plural categories of Unicode's CLDR, which choose a string's form for a count."
+    },
+    {
+      "name": "AuditFinding",
+      "constant": "AUDIT_FINDING",
+      "values": [
+        "unnamed",
+        "focus",
+        "contrast",
+        "size"
+      ],
+      "doc": "What an accessibility audit found: a node assistive technology cannot name (a control or an image without a name), a focus problem (a trap: a modal dialog with nothing to focus, or the keyboard unable to leave; a focus on a node the tree leaves out; two focused nodes), text whose contrast with what lies behind it is below WCAG's 4.5:1 (3:1 for large text), or a control smaller than 24 by 24 pixels."
+    },
+    {
+      "name": "CaptionsOperation",
+      "constant": "CAPTIONS_OP",
+      "values": [
+        "text",
+        "active"
+      ],
+      "doc": "The captions the game's sounds carry (the assets' captions.json, by sound): text answers the caption of clip `a` as text, its value the seconds it shows for, or unavailable when the clip has none; active answers the captions showing now, newest first, one a line, its value how many."
+    },
+    {
+      "name": "DevtoolsAudio",
+      "constant": "DEVTOOLS_AUDIO",
+      "values": [
+        "latency",
+        "rate",
+        "buffer",
+        "voices",
+        "streams",
+        "underruns",
+        "buses"
+      ],
+      "doc": "Where each number sits at the start of a devtools audio answer: the output's latency in milliseconds, from a frame's sound reaching the mixer to it leaving the speakers (-1 when the host cannot tell); the sample rate; the device's buffer, in samples a callback, as asked for or as the system chose (-1 while unknown); the voices and sounds playing, and those of them streamed; how often a stream ran dry so far; and how many buses follow."
+    },
+    {
+      "name": "DevtoolsBus",
+      "constant": "DEVTOOLS_BUS",
+      "values": [
+        "peak_left",
+        "peak_right",
+        "rms_left",
+        "rms_right",
+        "state"
+      ],
+      "doc": "Each bus's numbers in a devtools audio answer: its output's peak and RMS on the left and right since the last answer, and its state: 1 when a frame uses it, plus 2 when muted, plus 4 when soloed."
+    },
+    {
+      "name": "DistanceModel",
+      "constant": "DISTANCE_MODEL",
+      "values": [
+        "linear",
+        "inverse",
+        "exponential"
+      ],
+      "doc": "How a panner's gain falls with distance, as WebAudio's PannerNode distanceModel: linear from 1 at ref_distance to 1 - rolloff at max_distance; inverse, ref_distance / (ref_distance + rolloff * (distance - ref_distance)); exponential, (distance / ref_distance) ^ -rolloff; nearer than ref_distance is 1."
+    },
+    {
+      "name": "ReportsOperation",
+      "constant": "REPORTS_OP",
+      "values": [
+        "consent",
+        "set_consent",
+        "queued"
+      ],
+      "doc": "Crash and performance reports for the game's developer, which the player opts into: consent answers what the player agreed to as its value, 1 for crash reports plus 2 for performance reports (0 for neither, as before they are asked); set_consent sets it to `a`, the same sum; queued answers how many reports wait to be sent. Each answers unavailable where nothing could be sent (a package whose developer gave no address for reports, a checkout, the browser), so that the game offers no choice with nothing behind it."
     }
   ],
   "input": {
@@ -401,10 +856,19 @@
       "PageDown": 1114378,
       "Home": 1114379,
       "End": 1114380,
+      "Insert": 1114381,
+      "F1": 1114625,
       "F2": 1114626,
+      "F3": 1114627,
+      "F4": 1114628,
+      "F5": 1114629,
       "F6": 1114630,
+      "F7": 1114631,
+      "F8": 1114632,
       "F9": 1114633,
       "F10": 1114634,
+      "F11": 1114635,
+      "F12": 1114636,
       "Shift": 1114880,
       "Control": 1114881,
       "Alt": 1114882,
@@ -718,6 +1182,312 @@
             "rust": "f32"
           }
         }
+      },
+      {
+        "tag": 15,
+        "name": "GamepadConnected",
+        "doc": "A gamepad was connected: its number, and 1 if its buttons and axes are laid out as the standard gamepad (GAMEPAD_BUTTON_*, GAMEPAD_AXIS_*), 0 if they come in the device's own order.",
+        "fields": {
+          "pad": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 15,
+            "ts": "number",
+            "rust": "u32"
+          },
+          "standard": {
+            "lane": "x",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          }
+        }
+      },
+      {
+        "tag": 16,
+        "name": "GamepadDisconnected",
+        "doc": "A gamepad went away: its held buttons and moved axes came back first.",
+        "fields": {
+          "pad": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 15,
+            "ts": "number",
+            "rust": "u32"
+          }
+        }
+      },
+      {
+        "tag": 17,
+        "name": "GamepadButton",
+        "doc": "A gamepad button (GAMEPAD_BUTTON_*) changed: the pad, its value from 0 to 1, and 1 while it is pressed (at half or more).",
+        "fields": {
+          "button": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 31,
+            "ts": "number",
+            "rust": "u32"
+          },
+          "pad": {
+            "lane": "x",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          },
+          "value": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "pressed": {
+            "lane": "delta",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          }
+        }
+      },
+      {
+        "tag": 18,
+        "name": "GamepadAxis",
+        "doc": "A gamepad axis (GAMEPAD_AXIS_*) moved: the pad and its value from -1 to 1, past the stick's dead zone (inside it, 0).",
+        "fields": {
+          "axis": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 15,
+            "ts": "number",
+            "rust": "u32"
+          },
+          "pad": {
+            "lane": "x",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          },
+          "value": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 19,
+        "name": "Action",
+        "doc": "An action the game declared (the input service) changed: which, its value (a button's 1 or 0, an axis from -1 to 1) and the device that moved it (INPUT_DEVICE_*).",
+        "fields": {
+          "action": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 255,
+            "ts": "number",
+            "rust": "u32"
+          },
+          "value": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "device": {
+            "lane": "y",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          }
+        }
+      },
+      {
+        "tag": 20,
+        "name": "TextInput",
+        "doc": "A character of text, typed, composed or committed by an input method, one code point an event, in order; or with composing 1, one of the composition's characters after its Composition event.",
+        "fields": {
+          "character": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 1114111,
+            "ts": "number",
+            "rust": "u32"
+          },
+          "composing": {
+            "lane": "x",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          }
+        }
+      },
+      {
+        "tag": 21,
+        "name": "Composition",
+        "doc": "An input method's composition (the text being composed, before it is committed) changed: its length in code points, which follow as TextInput events with composing 1, and the caret's place in it. A length of 0 ends it.",
+        "fields": {
+          "length": {
+            "lane": "code",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          },
+          "cursor": {
+            "lane": "x",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          }
+        }
+      },
+      {
+        "tag": 22,
+        "name": "MouseMotion",
+        "doc": "How far the mouse moved while the pointer is locked, unaccelerated where the platform allows: the device's counts natively, CSS pixels in a browser.",
+        "fields": {
+          "dx": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "dy": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 23,
+        "name": "Touch",
+        "doc": "A touch on the screen, by number (from 0, reused once lifted), where it is in window pixels, and its phase (TOUCH_PHASE_*). The first touch down also moves and presses the pointer (button 0), for games that only take the pointer.",
+        "fields": {
+          "id": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 31,
+            "ts": "number",
+            "rust": "u32"
+          },
+          "x": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "y": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "phase": {
+            "lane": "delta",
+            "wire": "integer",
+            "ts": "number",
+            "rust": "u32"
+          }
+        }
+      },
+      {
+        "tag": 24,
+        "name": "Pan",
+        "doc": "Touches dragged together: how far their centre moved, in window pixels, and how many there are.",
+        "fields": {
+          "touches": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 31,
+            "ts": "number",
+            "rust": "u32"
+          },
+          "dx": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "dy": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 25,
+        "name": "Pinch",
+        "doc": "Two touches moved apart or together: their centre, in window pixels, and the factor their distance grew by since the last Pinch.",
+        "fields": {
+          "x": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "y": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "scale": {
+            "lane": "delta",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
+      },
+      {
+        "tag": 26,
+        "name": "Player",
+        "doc": "In a net session (pen's docs/netplay.md) the events after it, up to the next Player, are this player's, numbered from 0 up to the players the game declares; every frame lists each player in order, events or none. Outside one there are none, and every event is player 0's.",
+        "fields": {
+          "index": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 255,
+            "ts": "number",
+            "rust": "u32"
+          }
+        }
+      },
+      {
+        "tag": 100,
+        "name": "Game",
+        "doc": "One of the game's own events, which its pen.json `protocol` declares: its tag there, and up to three values. Hosts send them only to a game that declares them, whose generated pen/extensions.blot decodes them; pen's own bindings leave them out.",
+        "game": true,
+        "fields": {
+          "event": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 65535,
+            "ts": "number",
+            "rust": "u32"
+          },
+          "a": {
+            "lane": "x",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "b": {
+            "lane": "y",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          },
+          "c": {
+            "lane": "delta",
+            "wire": "f32",
+            "ts": "number",
+            "rust": "f32"
+          }
+        }
       }
     ]
   },
@@ -731,7 +1501,7 @@
     "groups": {
       "quality": {
         "type": "Quality",
-        "doc": "How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture filtering, ambient occlusion, a sky, screen effects and bloom."
+        "doc": "How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture filtering, ambient occlusion, a sky, screen effects, bloom and temporal antialiasing."
       },
       "sky": {
         "type": "Sky",
@@ -850,7 +1620,13 @@
             "b",
             "a"
           ]
-        }
+        },
+        "default": [
+          0,
+          0,
+          0,
+          1
+        ]
       },
       "ambient": {
         "kind": "vector",
@@ -861,7 +1637,12 @@
             "y",
             "z"
           ]
-        }
+        },
+        "default": [
+          0.2,
+          0.2,
+          0.2
+        ]
       },
       "light_direction": {
         "kind": "vector",
@@ -872,7 +1653,12 @@
             "y",
             "z"
           ]
-        }
+        },
+        "default": [
+          0,
+          -1,
+          0
+        ]
       },
       "light_color": {
         "kind": "vector",
@@ -883,7 +1669,12 @@
             "y",
             "z"
           ]
-        }
+        },
+        "default": [
+          1,
+          1,
+          1
+        ]
       },
       "aberration": {
         "kind": "vector",
@@ -908,12 +1699,14 @@
         "kind": "flag"
       },
       "quality.scale": {
-        "kind": "f32"
+        "kind": "f32",
+        "default": 1
       },
       "quality.filtering": {
         "kind": "count",
         "max": 16,
-        "doc": "0 linear, 1 trilinear, otherwise anisotropic samples."
+        "doc": "0 linear, 1 trilinear, otherwise anisotropic samples.",
+        "default": 1
       },
       "quality.occlusion": {
         "kind": "flag"
@@ -1057,6 +1850,35 @@
       "voice_count": {
         "kind": "size",
         "section": "voices",
+        "of": "count"
+      },
+      "pose_count": {
+        "kind": "size",
+        "section": "poses",
+        "of": "count"
+      },
+      "emitter_count": {
+        "kind": "size",
+        "section": "emitters",
+        "of": "count"
+      },
+      "quality.taa": {
+        "kind": "flag",
+        "doc": "Temporal antialiasing: each frame's samples move within their pixels and blend with the frames before, followed through the camera's motion."
+      },
+      "light_count": {
+        "kind": "size",
+        "section": "lights",
+        "of": "count"
+      },
+      "listener_count": {
+        "kind": "size",
+        "section": "listener",
+        "of": "count"
+      },
+      "panner_count": {
+        "kind": "size",
+        "section": "panners",
         "of": "count"
       }
     },
@@ -1416,15 +2238,8 @@
         "kind": "lanes",
         "name": "preferences",
         "constant": "PREFERENCE",
-        "doc": "The player's preferences to store, when they changed; the host plays them back as Preference events when the game starts.",
-        "max": 14,
-        "exactly": {
-          "counts": [
-            0,
-            14
-          ],
-          "message": "game returned partial preferences"
-        },
+        "doc": "The player's preferences to store, when they changed, as many as the game keeps; the host plays them back as Preference events when the game starts.",
+        "max": 256,
         "nullable": true
       },
       {
@@ -1651,7 +2466,7 @@
             },
             "service": {
               "kind": "count",
-              "max": 5
+              "max": 14
             },
             "operation": {
               "kind": "count",
@@ -1791,9 +2606,380 @@
         }
       },
       {
+        "kind": "records",
+        "name": "poses",
+        "doc": "The layers of skinned draws' poses: each samples one of its draw's mesh's clips at a time, and a draw's layers blend by their weights. A draw is posed when it has layers, its mesh a skin and its material's shader a `vertex_skinned` entry point; the host works out its joints' matrices and draws it alone.",
+        "record": {
+          "name": "Pose",
+          "constant": "POSE",
+          "fields": {
+            "draw": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_DRAWS",
+                "value": 100000
+              },
+              "doc": "The draw it poses: its place in the frame's draws."
+            },
+            "clip": {
+              "kind": "count",
+              "max": 65535,
+              "doc": "Which of the mesh's clips, in the order its file lists them; one the mesh lacks counts for nothing."
+            },
+            "time": {
+              "kind": "f32",
+              "doc": "Seconds into the clip, round it as often as need be."
+            },
+            "weight": {
+              "kind": "f32",
+              "doc": "How much it counts among its draw's layers: 0 or more."
+            }
+          },
+          "doc": "A layer of a skinned draw's pose: clip `clip` of the draw's mesh at `time` seconds, counting `weight` among the draw's layers."
+        },
+        "max": {
+          "limit": "MAX_POSES",
+          "value": 65536,
+          "doc": "The most pose layers one frame may have."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "emitters",
+        "doc": "Particle emitters, which hosts simulate on the GPU from each emitter's own clock and seed: every particle's path follows from them, so a frame's particles depend on that frame's emitters alone.",
+        "record": {
+          "name": "Emitter",
+          "constant": "EMITTER",
+          "fields": {
+            "material": {
+              "kind": "reference",
+              "to": "material",
+              "doc": "Its texture (round soft dots without one) and color, which tint every particle."
+            },
+            "transform": {
+              "kind": "matrix",
+              "doc": "Where particles are born, and how their velocity turns."
+            },
+            "seed": {
+              "kind": "count",
+              "max": 16777215,
+              "doc": "What its particles' randomness follows from."
+            },
+            "time": {
+              "kind": "f32",
+              "doc": "Seconds since it began: particles are born `rate` a second from 0 on, each the same whatever the frame rate."
+            },
+            "duration": {
+              "kind": "f32",
+              "doc": "Seconds it gives birth for; 0 for as long as frames keep it."
+            },
+            "rate": {
+              "kind": "f32",
+              "doc": "Particles born a second."
+            },
+            "lifetime": {
+              "kind": "f32",
+              "doc": "Seconds each particle lives."
+            },
+            "radius": {
+              "kind": "f32",
+              "doc": "Particles are born anywhere in the ball of this radius round the emitter."
+            },
+            "velocity": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "Each particle's velocity at birth, in the emitter's space."
+            },
+            "spread": {
+              "kind": "f32",
+              "doc": "A random velocity up to this fast, in any direction, added to each at birth."
+            },
+            "gravity": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "Acceleration in world space, units a second a second."
+            },
+            "drag": {
+              "kind": "f32",
+              "doc": "How fast velocity fades, a share a second: 0 for none."
+            },
+            "size_start": {
+              "kind": "f32",
+              "doc": "Particles' width in world units at birth, changing evenly to `size_end` at death."
+            },
+            "size_end": {
+              "kind": "f32"
+            },
+            "color_start": {
+              "kind": "vector",
+              "type": {
+                "name": "Color",
+                "components": [
+                  "r",
+                  "g",
+                  "b",
+                  "a"
+                ]
+              },
+              "doc": "Particles' color at birth, changing evenly to `color_end` at death; alpha fades them."
+            },
+            "color_end": {
+              "kind": "vector",
+              "type": {
+                "name": "Color",
+                "components": [
+                  "r",
+                  "g",
+                  "b",
+                  "a"
+                ]
+              }
+            },
+            "additive": {
+              "kind": "flag",
+              "doc": "Particles add their light to what is behind them, rather than covering it."
+            }
+          },
+          "doc": "A particle emitter: `rate` particles a second, each living `lifetime` seconds, born in a ball round `transform`'s origin and flying from it under gravity and drag, sized and colored over their lives."
+        },
+        "max": {
+          "limit": "MAX_EMITTERS",
+          "value": 1024,
+          "doc": "The most particle emitters one frame may have."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "lights",
+        "doc": "Point and spot lights beside the sun. The renderer sorts them into clusters of the view, which the shaders of lit materials read (pen-render's lights.wgsl).",
+        "record": {
+          "name": "Light",
+          "constant": "LIGHT",
+          "fields": {
+            "position": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              }
+            },
+            "radius": {
+              "kind": "f32",
+              "doc": "How far it reaches: its light falls smoothly to nothing there."
+            },
+            "color": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "Its color times its intensity."
+            },
+            "direction": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "The way a spot light shines, a unit vector; a point light's is ignored."
+            },
+            "inner": {
+              "kind": "f32",
+              "doc": "The cosine of the half-angle within which a spot light is at full strength."
+            },
+            "outer": {
+              "kind": "f32",
+              "doc": "The cosine of the half-angle of a spot light's cone, where its light ends; -1 for a point light, which shines all round."
+            }
+          },
+          "doc": "A point light, or a spot light shining along `direction` within a cone, lighting what lies within `radius` of `position`."
+        },
+        "max": {
+          "limit": "MAX_LIGHTS",
+          "value": 4096,
+          "doc": "The most point and spot lights one frame may have."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "listener",
+        "doc": "Where the panners are heard from, as WebAudio's AudioListener: none, the camera (`view`'s eye, facing where it looks, its up the view's), or one listener.",
+        "record": {
+          "name": "Listener",
+          "constant": "LISTENER",
+          "fields": {
+            "position": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              }
+            },
+            "forward": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "The way it faces."
+            },
+            "up": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "Its up, which with `forward` tells left from right."
+            }
+          },
+          "doc": "A listener: where it is, the way it faces and its up, in world units."
+        },
+        "max": 1
+      },
+      {
+        "kind": "records",
+        "name": "panners",
+        "doc": "Voices and sounds heard from somewhere in the world, as WebAudio's PannerNode (equal-power panning) places them relative to the listener; the rest play as they are.",
+        "record": {
+          "name": "Panner",
+          "constant": "PANNER",
+          "fields": {
+            "voice": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_VOICE_ID",
+                "value": 16777215,
+                "doc": "Voice ids are whole numbers from 1 to this, the wire's exact-integer range."
+              },
+              "doc": "The voice it places, by id, or 0 for a sound."
+            },
+            "sound": {
+              "kind": "count",
+              "max": 255,
+              "doc": "With `voice` 0, the sound it places, by its place in the frame's `sounds`."
+            },
+            "position": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              }
+            },
+            "orientation": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "The way its cone faces; zero for none, heard alike from every side."
+            },
+            "distance_model": {
+              "kind": "count",
+              "max": 2,
+              "doc": "How its gain falls with distance (DISTANCE_MODEL_*)."
+            },
+            "ref_distance": {
+              "kind": "f32",
+              "doc": "Within it, distance does not quiet it."
+            },
+            "max_distance": {
+              "kind": "f32",
+              "doc": "Beyond it, the linear model quiets it no further."
+            },
+            "rolloff": {
+              "kind": "f32",
+              "doc": "How fast distance quiets it."
+            },
+            "cone_inner": {
+              "kind": "f32",
+              "doc": "The angle, in degrees, of the cone it is heard whole within."
+            },
+            "cone_outer": {
+              "kind": "f32",
+              "doc": "The angle, in degrees, beyond which it is heard at cone_outer_gain."
+            },
+            "cone_outer_gain": {
+              "kind": "f32"
+            }
+          },
+          "doc": "Where a voice or sound is, as a PannerNode places it: from the listener, equal-power panned by its azimuth (in place of its pan), and quieted by its distance model and its cone. Positions and orientations glide as gains do (AUDIO_GLIDE_MS); the rest change at once. A voice that gains or loses its panner starts afresh, as one whose bus changed; a panner that places nothing is ignored, and of two for one voice or sound hosts take the first."
+        },
+        "max": {
+          "limit": "MAX_PANNERS",
+          "value": 512,
+          "doc": "The most panners one frame may declare: one for each voice and sound it may have."
+        }
+      },
+      {
         "kind": "trailing",
         "name": "extras"
       }
-    ]
+    ],
+    "extensions": {
+      "doc": "The game's own sections, which its pen.json `protocol` declares, after the rest of the packet: a marker, their count, then each one's tag, length and values. A packet without any ends before the marker.",
+      "marker": 5260632,
+      "max": {
+        "limit": "MAX_EXTENSIONS",
+        "value": 64,
+        "doc": "The most of a game's own sections one frame may carry."
+      },
+      "tag": {
+        "limit": "MAX_EXTENSION_TAG",
+        "value": 65535,
+        "doc": "A game's own sections and events are numbered from 1 to this."
+      },
+      "lanes": {
+        "limit": "MAX_EXTENSION_LANES",
+        "value": 1048576,
+        "doc": "The most lanes one of a game's own sections may carry."
+      },
+      "message": "game returned invalid extension sections"
+    }
   }
 }

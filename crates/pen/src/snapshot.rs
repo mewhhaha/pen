@@ -14,12 +14,17 @@ pub fn read(path: &Path) -> Result<SavedState> {
 
 /// Writes through a temporary file, so a crash never leaves half a save.
 pub fn write(path: &Path, saved: &SavedState) -> Result<()> {
-    let bytes = encode(saved)?;
+    replace(path, &encode(saved)?)
+}
+
+/// Replaces `path` with `bytes` through a temporary file beside it, so a
+/// crash leaves the old file or the new one, never half of either.
+pub fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    let result = std::fs::write(&temporary, &bytes).and_then(|()| std::fs::rename(&temporary, path));
+    let result = std::fs::write(&temporary, bytes).and_then(|()| std::fs::rename(&temporary, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }

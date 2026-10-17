@@ -1,8 +1,17 @@
 //! Window input as the game's events, in the browser host's terms: key
-//! names as `KeyboardEvent.key` gives them, pointer positions in window
-//! pixels, buttons numbered as `MouseEvent.button`, and wheel deltas in
-//! pixels. Holding the secondary
-//! button locks the pointer, so looking around has no screen edge.
+//! names as `KeyboardEvent.key` gives them, pointer positions in the
+//! physical pixels of the frame the game draws (the window's, or a pinned
+//! frame's stretched over it; `pen_runtime::scale`), buttons numbered as
+//! `MouseEvent.button`, and wheel deltas in logical pixels, as a browser's
+//! CSS pixels. Holding the secondary
+//! button locks the pointer, so looking around has no screen edge; while it
+//! is locked, the mouse's raw motion comes as MouseMotion events too.
+//!
+//! Text comes as TextInput events, typed or from an input method (IME),
+//! whose composition comes as Composition events; the input method is on
+//! only while a text box has the focus (`text_field`). Touches, and the
+//! pans and pinches they make, and gamepads (`crate::gamepad`) go through
+//! pen-runtime's `touch` and `gamepad`, which the browser shares.
 //!
 //! Time travel takes Ctrl+Shift with a key, which the game never sees: P
 //! pauses and resumes, period steps a frame, comma steps a frame back, and
@@ -12,10 +21,14 @@
 //! events before this does (`Session::overlay_event`): the backquote key is
 //! theirs, the keyboard while one of their nodes has the focus, and the
 //! pointer over their dialogs.
-use pen_protocol::{Frame, GameEvent, Viewport};
-use winit::event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use pen_protocol::{Frame, GameEvent, UiNode, Viewport, touch_phase};
+use pen_runtime::{text, touch::Touches};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{DeviceEvent, ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window};
+
+use crate::gamepad::Pads;
 
 /// Pixels a wheel notch scrolls, as browsers report `deltaY` for one line.
 pub(crate) const PIXELS_PER_LINE: f32 = 100.0;
@@ -37,6 +50,29 @@ pub struct Input {
     hotkeys: Vec<Hotkey>,
     /// Hotkeys held down, whose release the game must not see either.
     held: Vec<KeyCode>,
+    /// The size frames keep whatever the window's (a recording's), which
+    /// pointer positions are mapped onto.
+    pinned: Option<(u32, u32)>,
+    /// Ctrl+Shift+B asked for a bug report (`bugreport`).
+    report: bool,
+    touches: Touches,
+    /// The window's gamepads, once `open_gamepads` found any way to read them.
+    pads: Option<Pads>,
+    /// The focused text box the input method composes over, while one has
+    /// the focus, in window pixels.
+    text_box: Option<(f32, f32, f32, f32)>,
+    /// An input method is composing.
+    composing: bool,
+}
+
+/// winit's touch phase as the protocol's.
+fn phase(phase: TouchPhase) -> u32 {
+    match phase {
+        TouchPhase::Started => touch_phase::START,
+        TouchPhase::Moved => touch_phase::MOVE,
+        TouchPhase::Ended => touch_phase::END,
+        TouchPhase::Cancelled => touch_phase::CANCEL,
+    }
 }
 
 fn hotkey(code: KeyCode) -> Option<Hotkey> {
@@ -79,6 +115,23 @@ impl Input {
         self.pending.push(event);
     }
 
+    /// Frames keep `size` however large the window is.
+    pub fn pin(&mut self, size: (u32, u32)) {
+        self.pinned = Some(size);
+    }
+
+    /// A position in the window's pixels on the frame the game draws.
+    fn on_frame(&self, window: &Window, x: f64, y: f64) -> (f32, f32) {
+        let (x, y) = match self.pinned {
+            Some(frame) => {
+                let shown = window.inner_size();
+                pen_runtime::scale::to_frame((x, y), (f64::from(shown.width), f64::from(shown.height)), frame)
+            }
+            None => (x, y),
+        };
+        (narrow(x), narrow(y))
+    }
+
     pub fn window_event(&mut self, window: &Window, event: &WindowEvent) {
         match event {
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
@@ -91,6 +144,13 @@ impl Input {
                         && !self.modifiers.super_key();
                     // A key held since before the chord is the game's, repeats and all.
                     let ours = !event.repeat || self.held.contains(&code);
+                    if pressed && chord && !event.repeat && code == KeyCode::KeyB {
+                        self.report = true;
+                        if !self.held.contains(&code) {
+                            self.held.push(code);
+                        }
+                        return;
+                    }
                     if pressed
                         && chord
                         && ours
@@ -110,27 +170,40 @@ impl Input {
                         return;
                     }
                 }
-                if event.repeat && event.state == ElementState::Pressed {
-                    return;
-                }
                 // The window's own key, as F11 is the browser's: the game never sees it.
                 if event.logical_key == Key::Named(NamedKey::F11) {
-                    if event.state == ElementState::Pressed {
+                    if event.state == ElementState::Pressed && !event.repeat {
                         let fullscreen = window.fullscreen().is_none().then_some(Fullscreen::Borderless(None));
                         window.set_fullscreen(fullscreen);
                     }
                     return;
                 }
-                let Some(name) = key_name(&event.logical_key) else { return };
-                self.pending.push(match event.state {
-                    ElementState::Pressed => GameEvent::KeyDown(name),
-                    ElementState::Released => GameEvent::KeyUp(name),
-                });
+                // The key's text follows it, repeating while it is held, as a
+                // text box expects; with Ctrl or the logo key held, a key is a
+                // shortcut, and while an input method composes, it is the
+                // input method's.
+                let typed = event
+                    .text
+                    .as_ref()
+                    .filter(|_| !self.composing && !self.modifiers.control_key() && !self.modifiers.super_key());
+                if event.state == ElementState::Pressed && !event.repeat {
+                    if let Some(name) = key_name(&event.logical_key) {
+                        self.pending.push(GameEvent::KeyDown(name));
+                    }
+                } else if event.state == ElementState::Released {
+                    if let Some(name) = key_name(&event.logical_key) {
+                        self.pending.push(GameEvent::KeyUp(name));
+                    }
+                    return;
+                }
+                if let Some(typed) = typed {
+                    text::commit(typed, &mut self.pending);
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 // While locked, motion comes from raw device deltas instead.
                 if !self.locked {
-                    self.pointer = (narrow(position.x), narrow(position.y));
+                    self.pointer = self.on_frame(window, position.x, position.y);
                     let (x, y) = self.pointer;
                     self.pending.push(GameEvent::PointerMove { x, y });
                 }
@@ -156,16 +229,82 @@ impl Input {
             WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => -lines * PIXELS_PER_LINE,
-                    MouseScrollDelta::PixelDelta(pixels) => -narrow(pixels.y),
+                    // Physical pixels, which a browser would give in CSS pixels.
+                    MouseScrollDelta::PixelDelta(pixels) => {
+                        -narrow(pen_runtime::scale::wheel_pixels(pixels.y, window.scale_factor()))
+                    }
                 };
                 let (x, y) = self.pointer;
                 self.pending.push(GameEvent::Wheel { x, y, delta });
             }
             WindowEvent::Focused(false) => {
                 self.lock(window, false);
+                self.touches.cancel(&mut self.pending);
                 self.pending.push(GameEvent::FocusLost);
             }
+            WindowEvent::Touch(touch) => {
+                // On the frame, as the pointer the first touch drives.
+                let (x, y) = self.on_frame(window, touch.location.x, touch.location.y);
+                self.touches.touch(touch.id, phase(touch.phase), x, y, &mut self.pending);
+            }
+            WindowEvent::Ime(ime) => self.ime(ime),
             _ => {}
+        }
+    }
+
+    /// An input method's composition and what it commits.
+    fn ime(&mut self, ime: &Ime) {
+        match ime {
+            Ime::Preedit(composed, cursor) => {
+                if !(composed.is_empty() && !self.composing) {
+                    let cursor = cursor.map(|(start, _)| text::characters_before_byte(composed, start));
+                    text::compose(composed, cursor, &mut self.pending);
+                }
+                self.composing = !composed.is_empty();
+            }
+            Ime::Commit(committed) => {
+                if self.composing {
+                    text::compose("", None, &mut self.pending);
+                    self.composing = false;
+                }
+                text::commit(committed, &mut self.pending);
+            }
+            Ime::Disabled if self.composing => {
+                text::compose("", None, &mut self.pending);
+                self.composing = false;
+            }
+            Ime::Enabled | Ime::Disabled => {}
+        }
+    }
+
+    /// The game's interface: the input method is on while one of its text
+    /// boxes has the focus, composing over it. The dev tools' console types
+    /// keys, which an input method would take.
+    pub fn text_field(&mut self, window: Option<&Window>, ui: &[UiNode]) {
+        let text_box = text::text_box(ui);
+        if text_box == self.text_box {
+            return;
+        }
+        if let Some(window) = window {
+            if text_box.is_some() != self.text_box.is_some() {
+                window.set_ime_allowed(text_box.is_some());
+            }
+            if let Some((x, y, width, height)) = text_box {
+                window.set_ime_cursor_area(PhysicalPosition::new(x, y), PhysicalSize::new(width, height));
+            }
+        }
+        self.text_box = text_box;
+    }
+
+    /// Reads the window's gamepads from now on.
+    pub fn open_gamepads(&mut self) {
+        self.pads = Pads::open();
+    }
+
+    /// What the gamepads did since the last frame.
+    pub fn poll_gamepads(&mut self) {
+        if let Some(pads) = &mut self.pads {
+            pads.poll(&mut self.pending);
         }
     }
 
@@ -173,8 +312,10 @@ impl Input {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
             && self.locked
         {
-            self.pointer.0 += narrow(*dx);
-            self.pointer.1 += narrow(*dy);
+            let (dx, dy) = (narrow(*dx), narrow(*dy));
+            self.pending.push(GameEvent::MouseMotion { dx, dy });
+            self.pointer.0 += dx;
+            self.pointer.1 += dy;
             let (x, y) = self.pointer;
             self.pending.push(GameEvent::PointerMove { x, y });
         }
@@ -208,5 +349,10 @@ impl Input {
     /// The time travel keys pressed since the last call.
     pub fn take_hotkeys(&mut self) -> Vec<Hotkey> {
         std::mem::take(&mut self.hotkeys)
+    }
+
+    /// Whether Ctrl+Shift+B asked for a bug report since the last call.
+    pub fn take_report(&mut self) -> bool {
+        std::mem::take(&mut self.report)
     }
 }

@@ -51,6 +51,10 @@ pub struct Program {
     /// The guest's linear memory, as of its last host call (for the dev tools).
     #[cfg(feature = "devtools")]
     memory: Arc<AtomicUsize>,
+    /// What the dev tools see of the guest: its memory, its ownership
+    /// counters, and samples of it while profiled.
+    #[cfg(feature = "devtools")]
+    probe: Arc<blot_host::Probe>,
 }
 
 impl Program {
@@ -65,6 +69,10 @@ impl Program {
         let memory = Arc::new(AtomicUsize::new(0));
         #[cfg(feature = "devtools")]
         let gauge = memory.clone();
+        #[cfg(feature = "devtools")]
+        let probe = blot_host::Probe::new();
+        #[cfg(feature = "devtools")]
+        let probing = probe.clone();
         let thread = std::thread::Builder::new()
             .name("pen-guest".into())
             .stack_size(blot_host::GUEST_STACK_BYTES + (8 << 20))
@@ -73,7 +81,10 @@ impl Program {
                 let result = (|| -> Result<()> {
                     let mut guest = Guest::new(&engine, &module)?;
                     #[cfg(feature = "devtools")]
-                    guest.track_memory(gauge);
+                    {
+                        guest.track_memory(gauge);
+                        guest.probe(probing);
+                    }
                     let callback = Box::new(move |packet: Value| -> Result<Value> {
                         reply_tx
                             .send(Reply::Packet(packet.into_f32_array()?, Instant::now()))
@@ -82,7 +93,8 @@ impl Program {
                         Ok(Value::ArrayF32(request))
                     });
                     guest.call("main", Argument::Callback(callback))?;
-                    Ok(())
+                    // Torn down as Blot's adapter disposes of an instance.
+                    guest.dispose()
                 })();
                 let _ = finished_tx.send(Reply::Finished(result));
             })?;
@@ -101,6 +113,8 @@ impl Program {
             spare: Vec::new(),
             #[cfg(feature = "devtools")]
             memory,
+            #[cfg(feature = "devtools")]
+            probe,
         };
         let description = program.receive().context("game program handshake")?;
         (program.schema, program.scenes) = pen_runtime::program::handshake(&description)?;
@@ -190,6 +204,12 @@ impl Program {
     #[cfg(feature = "devtools")]
     pub fn memory_bytes(&self) -> usize {
         self.memory.load(Ordering::Relaxed)
+    }
+
+    /// What the dev tools see of the guest.
+    #[cfg(feature = "devtools")]
+    pub fn probe(&self) -> &Arc<blot_host::Probe> {
+        &self.probe
     }
 
     pub fn accept(&mut self) {

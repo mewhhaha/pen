@@ -23,7 +23,17 @@ bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 sha2 = { version = "0.10", optional = true }
 pen-runtime.workspace = true
 wasmtime.workspace = true
+# Reads which globals a module exports (images); wasmtime's own version.
+wasmparser = { version = "0.258", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The memory_images example plays a game's frames.
+pen-protocol.workspace = true
 
 [[example]]
 name = "compile_time"
+required-features = ["compiler"]
+
+[[example]]
+name = "memory_images"
 required-features = ["compiler"]

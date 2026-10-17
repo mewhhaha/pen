@@ -41,6 +41,7 @@ use serde::Deserialize;
 use wasmtime::component::{HasSelf, Linker, ResourceAny};
 use wasmtime::{Engine, Store};
 
+pub mod api;
 pub mod cache;
 mod host;
 mod watch;
@@ -92,6 +93,14 @@ pub struct Config {
     pub compiler: Option<Choice>,
     /// The game's name and title, which pen reads for itself.
     pub game: Option<serde_json::Value>,
+    /// The game's own events and render sections, which `pen codegen`
+    /// and pen's tools read (pen-codegen's `extensions`).
+    pub protocol: Option<serde_json::Value>,
+    /// Its store builds and where reports go, which `pen build` reads for
+    /// itself (the pen crate's `publish` and `reports`).
+    pub steam: Option<serde_json::Value>,
+    pub itch: Option<serde_json::Value>,
+    pub reports: Option<serde_json::Value>,
 }
 
 /// One plugin's component and grants.
@@ -258,6 +267,7 @@ impl Plugins {
         let loading = || -> Result<bindings::CompilerPluginPre<host::State>> {
             let bytes = std::fs::read(&path)?;
             let component = cache::component(&self.engine, &bytes)?;
+            api::check(name, &self.engine, &component)?;
             let mut linker = Linker::<host::State>::new(&self.engine);
             wasmtime_wasi::p2::add_to_linker_sync(&mut linker)?;
             bindings::CompilerPlugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)?;

@@ -6,21 +6,62 @@ use pen_protocol::boundary::MAX_DRAW_EXTRA;
 use pen_protocol::{Catalog, Draw, Matrix, RenderFrame, Solid, Sprite};
 use wgpu::util::DeviceExt;
 
+use super::cascades::{Cascade, MAX_CASCADES};
 use super::frame::stencil;
+use super::skinning::Posed;
 use super::validate::normal_matrix;
 use super::{
-    ALONE, GpuAsset, INSET_SAMPLES, InstanceBatch, Item, LEFT_OUT, Placement, ReadyEntry, Scratch, Shape, SolidMesh,
-    Source, State, uniform_buffer,
+    ALONE, Batching, Choice, GpuAsset, INSET_SAMPLES, InstanceBatch, Item, LEFT_OUT, Placement, ReadyEntry, Scratch,
+    Shape, SolidMesh, Source, State, uniform_buffer,
 };
+use crate::RenderStats;
 use crate::asset_store::AssetKind;
+use crate::asset_store::MAX_LODS;
+use crate::culling::{ALL_VIEWS, CAMERA, Detail, Frustum, MAX_VIEWS, Sphere, Views, stretch};
 use crate::decals::DecalBatch;
 use crate::matrix::{IDENTITY, narrow};
 use crate::shader::Variants;
 use crate::solids::{SolidBatch, mesh_solids};
 use crate::sprites::SpriteBatch;
 
+/// The views `frame` draws: the camera's, then its shadow maps', `cascades`.
+fn views(frame: &RenderFrame, (maps, count): &([Cascade; MAX_CASCADES], usize)) -> Views {
+    let mut views = Views::new(Frustum::of(&frame.projection, &frame.view));
+    for map in &maps[..*count] {
+        views.push(Frustum::of(&map.projection, &frame.shadow.view));
+    }
+    views
+}
+
+/// Which `views` see `draw` (a bit each; a non-caster only the camera's)
+/// and at which level of detail the camera has it drawn, if its shader
+/// declares its bounds; otherwise every view, whole. Counts into `stats`
+/// what it leaves out.
+fn seen(choice: &Choice, draw: &Draw, views: &Views, detail: &Detail, stats: &mut RenderStats) -> (u8, u8) {
+    let every = if choice.casts { views.all() } else { CAMERA };
+    let Some(bounds) = choice.bounds else { return (every, 0) };
+    let placed = bounds.placed(&draw.transform, 0.0);
+    let seen = views.mask(&placed) & every;
+    stats.culled += u32::from(seen & CAMERA == 0);
+    stats.shadow_culled += (every & !seen & !CAMERA).count_ones();
+    let level = detail.level(&placed, stretch(&draw.transform), &choice.errors[..usize::from(choice.levels)]);
+    (seen, u8::try_from(level).expect("at most MAX_LODS"))
+}
+
+/// A buffer of `capacity` instances, which batches draw from and the GPU
+/// culls from.
+pub(super) fn instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("instances"),
+        size: capacity as u64 * 80,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
 impl Scratch {
     pub(super) fn clear(&mut self) {
+        self.chosen.clear();
         self.choices.clear();
         self.parameter_batches.clear();
         self.placements.clear();
@@ -37,6 +78,7 @@ impl Scratch {
         self.decals.clear();
         self.decal_order.clear();
         self.insets.clear();
+        self.emitters.clear();
     }
 }
 
@@ -87,6 +129,7 @@ impl State {
         let named = frame.solids.iter().flat_map(|solid| solid.faces.iter().map(|face| face.material));
         let named = named
             .chain(frame.decals.iter().map(|decal| decal.material))
+            .chain(frame.emitters.iter().map(|emitter| emitter.material))
             .chain(frame.sprites.iter().map(|sprite| sprite.material))
             .chain(frame.fields.iter().map(|patch| patch.material));
         for material in named {
@@ -95,27 +138,85 @@ impl State {
         Ok(())
     }
 
-    /// Places the frame's draws, alone or in instanced batches, writes the
-    /// batches' instances and lists what the frame draws: mesh draws, then
-    /// one draw per batch and per solid batch in world space, then the
-    /// insets' draws.
+    /// Places the frame's draws, alone or in instanced batches, culls them
+    /// (a batch of many instances on the GPU, the rest here: each draw into
+    /// the views that see it, at the level of detail the camera picks for
+    /// it), writes the batches' instances and lists what the frame draws:
+    /// mesh draws, then one draw per batch and per solid batch in world
+    /// space, then the insets' draws. The scene is `height` pixels high.
+    /// Counts what culling here left out.
     pub(super) fn batch(
         &mut self,
         frame: &RenderFrame,
         catalog: &Catalog,
         samples: u32,
+        height: f32,
         scratch: &mut Scratch,
+        stats: &mut RenderStats,
     ) -> Result<()> {
-        for draw in &frame.draws {
-            let placement = self.place(draw, catalog, samples, scratch)?;
+        scratch.views = views(frame, &self.cascades);
+        scratch.detail = Detail::new(&frame.projection, &frame.view, height);
+        self.culling.begin(scratch.views, scratch.detail);
+        scratch.group_poses(frame);
+        for (index, draw) in frame.draws.iter().enumerate() {
+            // A posed draw has joint matrices of its own: drawn alone.
+            let posed = scratch.posed(index);
+            let placement = self.place(draw, catalog, samples, scratch, posed)?;
             scratch.placements.push(placement);
         }
-        // Each batch's instances together, in the order of their draws.
+        // Batches of many instances cull on the GPU: their instances go first
+        // in the buffer, whole, once each.
         let mut instance_count = 0;
         for batch in &mut scratch.batches {
-            batch.first = instance_count;
-            instance_count += batch.count;
-            batch.count = 0;
+            let (Some(bounds), Some(GpuAsset::Mesh(mesh))) = (batch.bounds, self.assets.current(batch.mesh)) else {
+                continue;
+            };
+            if !self.culling.takes(batch.count) {
+                continue;
+            }
+            let views = if batch.casts { scratch.views.all() } else { CAMERA };
+            batch.gpu = self.culling.add(&bounds, &mesh.lods, instance_count, batch.count, views);
+            if batch.gpu.is_some() {
+                batch.first = instance_count;
+                instance_count += batch.count;
+            }
+        }
+        // The rest cull here, but posed draws: their joints move their
+        // vertices past their mesh's bounds, so every view they may be in
+        // draws them, whole.
+        for (index, draw) in frame.draws.iter().enumerate() {
+            let posed = scratch.posed(index);
+            let placement = &mut scratch.placements[index];
+            if placement.batch == LEFT_OUT {
+                continue;
+            }
+            let batch = scratch.batches.get_mut(placement.batch as usize);
+            if batch.as_ref().is_some_and(|batch| batch.gpu.is_some()) {
+                continue;
+            }
+            let choice = &scratch.choices[placement.choice as usize];
+            (placement.views, placement.lod) = if posed {
+                (if choice.casts { scratch.views.all() } else { CAMERA }, 0)
+            } else {
+                seen(choice, draw, &scratch.views, &scratch.detail, stats)
+            };
+            if let Some(batch) = batch {
+                for (view, ranges) in batch.ranges.iter_mut().enumerate() {
+                    ranges[usize::from(placement.lod)].1 += u32::from(placement.views & (1 << view) != 0);
+                }
+            }
+        }
+        // Each view's instances of each batch culled here together, at each
+        // level, in the order of their draws: the camera's, then the first
+        // shadow map's, and so on, after those the GPU culls.
+        for view in 0..scratch.views.count() {
+            for batch in scratch.batches.iter_mut().filter(|batch| batch.gpu.is_none()) {
+                for range in &mut batch.ranges[view] {
+                    let count = range.1;
+                    *range = (instance_count, 0);
+                    instance_count += count;
+                }
+            }
         }
         let instance_count = instance_count as usize;
         if instance_count > self.instance_capacity {
@@ -124,20 +225,29 @@ impl State {
                 self.instance_capacity as u64 * 80 <= self.device.limits().max_buffer_size,
                 "instance list exceeds device buffer size"
             );
-            self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("instances"),
-                size: self.instance_capacity as u64 * 80,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            self.instance_buffer = instance_buffer(&self.device, self.instance_capacity);
             self.instance_data = vec![0.0; self.instance_capacity * 20];
         }
         for (draw, placement) in frame.draws.iter().zip(&scratch.placements) {
             let Some(batch) = scratch.batches.get_mut(placement.batch as usize) else { continue };
-            let at = (batch.first + batch.count) as usize * 20;
-            batch.count += 1;
-            self.instance_data[at..at + 16].copy_from_slice(&draw.transform);
-            self.instance_data[at + 16..at + 20].copy_from_slice(&draw.parameters.unwrap_or(placement.parameters));
+            let parameters = draw.parameters.unwrap_or(placement.parameters);
+            let mut write = |at: u32| {
+                let at = at as usize * 20;
+                self.instance_data[at..at + 16].copy_from_slice(&draw.transform);
+                self.instance_data[at + 16..at + 20].copy_from_slice(&parameters);
+            };
+            if batch.gpu.is_some() {
+                write(batch.first + batch.written);
+                batch.written += 1;
+                continue;
+            }
+            for view in 0..MAX_VIEWS {
+                if placement.views & (1 << view) != 0 {
+                    let (first, count) = &mut batch.ranges[view][usize::from(placement.lod)];
+                    write(*first + *count);
+                    *count += 1;
+                }
+            }
         }
         for (index, (draw, placement)) in frame.draws.iter().zip(&scratch.placements).enumerate() {
             if placement.batch == ALONE {
@@ -145,14 +255,36 @@ impl State {
                     material: draw.material,
                     source: Source::Draw(index),
                     shape: Shape::Mesh(draw.mesh),
+                    views: placement.views,
+                    lod: placement.lod,
                 });
             }
         }
         for (index, batch) in scratch.batches.iter().enumerate() {
-            scratch.items.push(Item { material: batch.material, source: Source::World, shape: Shape::Batch(index) });
+            // One the GPU culls may be drawn in every view it is allowed.
+            let views = match batch.gpu {
+                Some(_) if batch.casts => scratch.views.all(),
+                Some(_) => CAMERA,
+                None => (0..MAX_VIEWS)
+                    .filter(|&view| batch.ranges[view].iter().any(|range| range.1 > 0))
+                    .fold(0, |views, view| views | 1 << view),
+            };
+            scratch.items.push(Item {
+                material: batch.material,
+                source: Source::World,
+                shape: Shape::Batch(index),
+                views,
+                lod: 0,
+            });
         }
         for (index, solid) in self.solid_meshes.iter().enumerate() {
-            scratch.items.push(Item { material: solid.material, source: Source::World, shape: Shape::Solid(index) });
+            scratch.items.push(Item {
+                material: solid.material,
+                source: Source::World,
+                shape: Shape::Solid(index),
+                views: ALL_VIEWS,
+                lod: 0,
+            });
         }
         for (inset, drawn) in frame.insets.iter().enumerate() {
             for (index, draw) in drawn.draws.iter().enumerate() {
@@ -160,6 +292,8 @@ impl State {
                     material: draw.material,
                     source: Source::Inset(inset, index),
                     shape: Shape::Mesh(draw.mesh),
+                    views: ALL_VIEWS,
+                    lod: 0,
                 });
             }
         }
@@ -184,76 +318,103 @@ impl State {
         Ok(())
     }
 
-    /// Where `draw` goes this frame. An opaque material whose shader can
-    /// instance it joins a batch of its mesh and material, or, with instance
-    /// parameters, of its mesh and render state: only the parameters may
-    /// differ, which lets animation poses share one draw.
+    /// Where `draw` goes this frame: alone or into a batch, or left out. An
+    /// opaque material whose shader can instance it joins a batch of its
+    /// mesh and material, or, with instance parameters, of its mesh and
+    /// render state: only the parameters may differ, which lets animation
+    /// poses share one draw. Which views see it is worked out after.
     pub(super) fn place(
         &mut self,
         draw: &Draw,
         catalog: &Catalog,
         samples: u32,
         scratch: &mut Scratch,
+        alone: bool,
     ) -> Result<Placement> {
-        let alone = Placement { batch: ALONE, parameters: [0.0; 4] };
-        // Its own uniform data: drawn alone.
-        if draw.extra.as_ref().is_some_and(|extra| !extra.is_empty()) {
-            return Ok(alone);
-        }
-        let choice = match scratch.choices.get(&(draw.mesh, draw.material)) {
-            Some(choice) => *choice,
+        let choice = match scratch.chosen.get(&(draw.mesh, draw.material)) {
+            Some(&choice) => choice,
             None => {
-                let material = self.material(catalog, draw.material)?;
-                let shader = match &material {
-                    Some(material) => self.shader(&material.material)?,
-                    None => None,
-                };
-                let mesh = self.resolve(AssetKind::Mesh, catalog.mesh(draw.mesh))?;
-                let mesh_loaded = matches!(self.assets.current(mesh), Some(GpuAsset::Mesh(_)));
-                let instancing = shader.is_some_and(
-                    |slot| matches!(self.assets.current(slot), Some(GpuAsset::Shader(shader)) if shader.instancing),
-                );
-                let choice = match (material, shader) {
-                    (Some(material), Some(shader)) if material.material.opaque() && instancing && mesh_loaded => {
-                        let key = material.material.instance_parameters.map(|_| (draw.mesh, material.state));
-                        let batch = match key.and_then(|key| scratch.parameter_batches.get(&key).copied()) {
-                            Some(batch) => batch,
-                            None => {
-                                // Left out until its instanced pipeline is there.
-                                if !self.ensure_variants(shader, samples, Variants::INSTANCED) {
-                                    return Ok(Placement { batch: LEFT_OUT, ..alone });
-                                }
-                                let pipeline = self.pipelines(shader, samples).instanced.clone().unwrap();
-                                scratch.batches.push(InstanceBatch {
-                                    mesh,
-                                    material: draw.material,
-                                    pipeline,
-                                    first: 0,
-                                    count: 0,
-                                });
-                                if let Some(key) = key {
-                                    scratch.parameter_batches.insert(key, scratch.batches.len() - 1);
-                                }
-                                scratch.batches.len() - 1
-                            }
-                        };
-                        let parameters =
-                            material.material.instance_parameters.map_or([0.0; 4], |values| values.map(narrow));
-                        Some((batch, parameters))
-                    }
-                    _ => None,
-                };
-                scratch.choices.insert((draw.mesh, draw.material), choice);
-                choice
+                let choice = self.choose(draw, catalog, samples, scratch)?;
+                scratch.choices.push(choice);
+                let index = u32::try_from(scratch.choices.len() - 1)?;
+                scratch.chosen.insert((draw.mesh, draw.material), index);
+                index
             }
         };
-        Ok(match choice {
-            Some((batch, parameters)) => {
+        let placement = Placement { batch: ALONE, choice, parameters: [0.0; 4], views: 0, lod: 0 };
+        // A draw with its own uniform data draws alone, as one its caller
+        // says must.
+        if alone || draw.extra.as_ref().is_some_and(|extra| !extra.is_empty()) {
+            return Ok(placement);
+        }
+        Ok(match scratch.choices[choice as usize].batch {
+            Batching::Into(batch, parameters) => {
                 scratch.batches[batch].count += 1;
-                Placement { batch: u32::try_from(batch)?, parameters }
+                Placement { batch: u32::try_from(batch)?, parameters, ..placement }
             }
-            None => alone,
+            Batching::Waiting => Placement { batch: LEFT_OUT, ..placement },
+            Batching::Alone => placement,
         })
+    }
+
+    /// How a mesh and material's draws go this frame (see `place`).
+    fn choose(&mut self, draw: &Draw, catalog: &Catalog, samples: u32, scratch: &mut Scratch) -> Result<Choice> {
+        let material = self.material(catalog, draw.material)?;
+        let shader = match &material {
+            Some(material) => self.shader(&material.material)?,
+            None => None,
+        };
+        let mesh = self.resolve(AssetKind::Mesh, catalog.mesh(draw.mesh))?;
+        let mut errors = [0.0; MAX_LODS];
+        let (sphere, levels) = match self.assets.current(mesh) {
+            Some(GpuAsset::Mesh(mesh)) => {
+                for (error, lod) in errors.iter_mut().zip(&mesh.lods) {
+                    *error = lod.error;
+                }
+                (Some(mesh.bounds), mesh.lods.len().clamp(1, MAX_LODS))
+            }
+            _ => (None, 1),
+        };
+        let (instancing, margin) = match shader.and_then(|slot| self.assets.current(slot)) {
+            Some(GpuAsset::Shader(shader)) => (shader.instancing, shader.margin),
+            _ => (false, None),
+        };
+        // The mesh's sphere grown by its shader's margin; without one, it is
+        // never culled, nor drawn simpler.
+        let bounds = sphere.zip(margin).map(|(sphere, margin)| Sphere { radius: sphere.radius + margin, ..sphere });
+        let casts = material.as_ref().is_some_and(|material| material.material.casts_shadow());
+        let batch = match (material, shader) {
+            (Some(material), Some(shader)) if material.material.opaque() && instancing && sphere.is_some() => {
+                let parameters = material.material.instance_parameters.map_or([0.0; 4], |values| values.map(narrow));
+                let key = material.material.instance_parameters.map(|_| (draw.mesh, material.state));
+                match key.and_then(|key| scratch.parameter_batches.get(&key).copied()) {
+                    Some(batch) => Batching::Into(batch, parameters),
+                    // Left out until its instanced pipeline is there.
+                    None if !self.ensure_variants(shader, samples, Variants::INSTANCED) => Batching::Waiting,
+                    None => {
+                        let pipeline = self.pipelines(shader, samples).instanced.clone().unwrap();
+                        scratch.batches.push(InstanceBatch {
+                            mesh,
+                            material: draw.material,
+                            pipeline,
+                            bounds,
+                            casts,
+                            count: 0,
+                            gpu: None,
+                            first: 0,
+                            written: 0,
+                            ranges: Default::default(),
+                        });
+                        if let Some(key) = key {
+                            scratch.parameter_batches.insert(key, scratch.batches.len() - 1);
+                        }
+                        Batching::Into(scratch.batches.len() - 1, parameters)
+                    }
+                }
+            }
+            _ => Batching::Alone,
+        };
+        Ok(Choice { batch, bounds, casts, errors, levels: u8::try_from(levels)? })
     }
 
     /// Resolves each item's assets and writes its uniforms once.
@@ -266,11 +427,13 @@ impl State {
     ) -> Result<()> {
         let item_count = scratch.items.len();
         let floats = (self.stride / 4) as usize;
+        self.skinning.begin();
         for index in 0..item_count {
             let item = scratch.items[index];
             let Some(entry) = self.ready_entry(frame, catalog, scratch, index, item, samples)? else { continue };
             scratch.ready.push(entry);
         }
+        self.skinning.upload(&self.device, &self.queue, &self.context.skin_group);
         if item_count > 0 {
             self.queue.write_buffer(
                 &self.draw_uniform,
@@ -298,6 +461,14 @@ impl State {
         let Some((textures, normal_setting, outline_setting)) = self.dress(&material.material, field)? else {
             return Ok(None);
         };
+        if item.views == 0 {
+            // Out of every view: what it draws with still loads and
+            // compiles, so that it shows as soon as it comes into view.
+            if matches!(item.shape, Shape::Mesh(_)) {
+                self.ensure_variants(shader, samples, material.material.variants().without(Variants::INSTANCED));
+            }
+            return Ok(None);
+        }
         let group = self.draw_group(textures);
         let floats = (self.stride / 4) as usize;
         let data = &mut self.uniform_data[index * floats..(index + 1) * floats];
@@ -335,7 +506,8 @@ impl State {
             }
             (None, Shape::Batch(batch)) => (Some(scratch.batches[batch].pipeline.clone()), None),
             (None, _) => {
-                if !self.ensure_variants(shader, samples, m.variants().without(Variants::INSTANCED)) {
+                if !self.ensure_variants(shader, samples, m.variants().without(Variants::INSTANCED | Variants::SKINNED))
+                {
                     return Ok(None);
                 }
                 let made = self.pipelines(shader, samples);
@@ -352,10 +524,25 @@ impl State {
             Shape::Mesh(mesh) => Some(self.resolve(AssetKind::Mesh, catalog.mesh(mesh))?),
             _ => None,
         };
-        let pipeline = pipeline.expect("an ensured variant is compiled");
+        let mut pipeline = pipeline.expect("an ensured variant is compiled");
+        // A posed draw of a skinned mesh draws skinned, its joint matrices
+        // laid out for it.
+        let mut skin = None;
+        if let (Source::Draw(draw), Some(mesh)) = (item.source, mesh)
+            && scratch.posed(draw)
+        {
+            match self.pose_draw(frame, scratch, draw, (mesh, m, shader), samples) {
+                Posed::Unskinned => {}
+                Posed::Waiting => return Ok(None),
+                Posed::Ready(skinned, at) => {
+                    pipeline = skinned;
+                    skin = Some(at);
+                }
+            }
+        }
         let offset =
             u32::try_from(index as u64 * self.stride).context("draw uniforms lie past a dynamic offset's reach")?;
-        Ok(Some(ReadyEntry { item: index, offset, group, material, shader, mesh, pipeline, visible }))
+        Ok(Some(ReadyEntry { item: index, offset, group, material, shader, mesh, pipeline, visible, skin }))
     }
 
     /// Sorts what is ready into the scene's passes: opaque surfaces by
@@ -367,7 +554,8 @@ impl State {
         let items = &scratch.items;
         let ready = &scratch.ready;
         for (index, entry) in ready.iter().enumerate() {
-            if items[entry.item].inset().is_some() {
+            let item = &items[entry.item];
+            if item.inset().is_some() || item.views & CAMERA == 0 {
                 continue;
             }
             let m = &entry.material.material;
@@ -395,18 +583,26 @@ impl State {
             let (a, b) = (items[ready[a].item].transform(frame), items[ready[b].item].transform(frame));
             depth_of(a).total_cmp(&depth_of(b))
         });
-        // Lit, opaque surfaces cast shadows, unless their material says not.
+        // Lit, opaque surfaces cast shadows, unless their material says not:
+        // those a shadow map sees, whether the camera does or not, sorted
+        // like the opaque ones.
         if shadowed {
-            for &index in &scratch.opaque {
-                let entry = &ready[index];
-                let instanced = matches!(items[entry.item].shape, Shape::Batch(_));
-                if entry.material.material.casts_shadow()
+            for (index, entry) in ready.iter().enumerate() {
+                let item = &items[entry.item];
+                let stage = entry.stage(items) as usize;
+                if item.inset().is_none()
+                    && item.views & !CAMERA != 0
+                    && entry.material.material.casts_shadow()
                     && matches!(self.assets.current(entry.shader), Some(GpuAsset::Shader(shader))
-                        if shader.shadow[instanced as usize].is_some())
+                        if shader.shadow[stage].is_some())
                 {
                     scratch.casters.push(index);
                 }
             }
+            scratch.casters.sort_by_key(|&index| {
+                let item = &items[ready[index].item];
+                (item.material, matches!(item.shape, Shape::Batch(_)))
+            });
         }
     }
 

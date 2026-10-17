@@ -11,12 +11,15 @@ use js_sys::Promise;
 use pen_protocol::{Catalog, Frame, GameEvent, RenderFrame, Viewport};
 use pen_runtime::clock::Clock;
 use pen_runtime::devtools::{self, FrameReport, Log, TimelineStatus, log_source};
-use pen_runtime::game::{FrameTimings, GameRuntime, Host, InvalidFrame, ReloadResult, hash_lanes};
+use pen_runtime::game::{FrameTimings, GameRuntime, Host, InvalidFrame, Quiet, ReloadResult, hash_lanes};
 use pen_runtime::input::Hotkey;
 use pen_runtime::program::Unresponsive;
+use pen_runtime::recording;
+use pen_runtime::saved::SavedTypes;
 use pen_runtime::services::{Answer, Services};
-use pen_runtime::snapshot::SavedState;
-use pen_runtime::timeline::{self, KEEP_SECONDS, Load, REPLAY_SECONDS, Recorded, Timeline};
+use pen_runtime::snapshot::{self, SavedState};
+use pen_runtime::text::text_box;
+use pen_runtime::timeline::{self, KEEP_SECONDS, Load, REPLAY_SECONDS, Recorded, Recording, Timeline};
 use pen_runtime::transport::{Replaying, Rewind, Transport};
 use pen_runtime::tunables::tuned_values;
 use wasm_bindgen::{JsCast, prelude::*};
@@ -27,9 +30,11 @@ use web_time::Instant;
 use crate::accessibility::Accessibility;
 use crate::audio::Audio;
 use crate::development::{Development, Update};
+use crate::files::{self, Arrival, Files};
 use crate::input::Input;
 use crate::preferences::Preferences;
 use crate::program::{BrowserBackend, error};
+use crate::replay::{self, Recorder};
 use crate::saves;
 use crate::screen::Screen;
 use crate::tools::Tools;
@@ -76,6 +81,7 @@ pub struct Shell<'a> {
     preferences: &'a mut Preferences,
     services: &'a mut Services,
     log: &'a mut Log,
+    saved_types: Option<&'a SavedTypes>,
 }
 
 impl Host for Shell<'_> {
@@ -109,6 +115,10 @@ impl Host for Shell<'_> {
         // The answers waiting were for the world that asked.
         self.services.forget();
     }
+
+    fn saved_types(&self) -> Option<SavedTypes> {
+        self.saved_types.cloned()
+    }
 }
 
 /// Everything the game's runtime may touch, borrowed from the page's fields
@@ -121,29 +131,58 @@ macro_rules! shell {
             preferences: &mut $browser.preferences,
             services: &mut $browser.services,
             log: &mut $browser.log,
+            saved_types: $browser.saved_types.as_ref(),
         }
     };
 }
 
 /// What the browser harnesses wait on (`?qualify`), of the last frame the
-/// GPU finished: its position, its quality, the assets still loading and
-/// whether any are.
+/// GPU finished: its position, its quality, the assets still loading,
+/// whether any are, and its packet's hash (which a replay must match).
+/// `data-events` holds the input events of the frames that ran, recorded or
+/// live, the latest `EVENT_HOOKS`, each as its five lanes (tag, code, x, y,
+/// delta); assets' and services' are left out.
 pub struct Hooks {
     canvas: HtmlCanvasElement,
     /// The frame drawn last, written once the GPU has finished it.
-    drawn: Option<[String; 4]>,
-    written: [String; 4],
+    drawn: Option<[String; 5]>,
+    written: [String; 5],
+    events: std::collections::VecDeque<[f32; 5]>,
 }
 
+/// The input events `data-events` keeps.
+const EVENT_HOOKS: usize = 512;
+
 impl Hooks {
-    const NAMES: [&str; 4] = ["data-frame", "data-quality", "data-pending", "aria-busy"];
+    const NAMES: [&str; 5] = ["data-frame", "data-quality", "data-pending", "aria-busy", "data-packet"];
 
     pub fn new(canvas: HtmlCanvasElement) -> Hooks {
-        Hooks { canvas, drawn: None, written: Default::default() }
+        Hooks { canvas, drawn: None, written: Default::default(), events: Default::default() }
+    }
+
+    /// A frame ran with `input`, an encoded frame.
+    fn ran(&mut self, input: &[f32]) -> Result<()> {
+        use pen_protocol::boundary::{EVENT_FLOATS, FRAME_HEADER_FLOATS, event_tags};
+        let count = pen_protocol::boundary::whole(input[3]).unwrap_or(0) as usize;
+        let before = self.events.len();
+        for event in input[FRAME_HEADER_FLOATS..].as_chunks::<EVENT_FLOATS>().0.iter().take(count) {
+            let tag = pen_protocol::boundary::whole(event[0]).unwrap_or(0);
+            if ![event_tags::ASSET_CHANGED, event_tags::SERVICE_ANSWER, event_tags::SERVICE_DATA].contains(&tag) {
+                self.events.push_back(*event);
+            }
+        }
+        if self.events.len() == before {
+            return Ok(());
+        }
+        while self.events.len() > EVENT_HOOKS {
+            self.events.pop_front();
+        }
+        let json = serde_json::to_string(&self.events).map_err(anyhow::Error::from)?;
+        self.canvas.set_attribute("data-events", &json).map_err(error)
     }
 
     /// `drawn` was just submitted, so the frame before it is finished.
-    fn drawn(&mut self, drawn: [String; 4]) -> Result<()> {
+    fn drawn(&mut self, drawn: [String; 5]) -> Result<()> {
         let Some(finished) = self.drawn.replace(drawn) else { return Ok(()) };
         for ((name, value), written) in Hooks::NAMES.iter().zip(finished).zip(&mut self.written) {
             if value != *written {
@@ -188,6 +227,15 @@ pub struct Options {
     pub development: bool,
     /// Write the hooks the browser harnesses read (`Hooks`).
     pub qualify: bool,
+    /// The saved types the game declares (`assets/saved.json`), which
+    /// migrate what its own code cannot.
+    pub saved_types: Option<SavedTypes>,
+    /// The captions the game's sounds carry (the assets' captions.json).
+    pub captions: pen_runtime::captions::Captions,
+    /// The game's name, which the files it hands the player are named after.
+    pub name: String,
+    /// Where the page's link has a recording to play (`replay::linked`).
+    pub replay: Option<String>,
 }
 
 pub struct Browser {
@@ -197,9 +245,13 @@ pub struct Browser {
     input: Rc<RefCell<Input>>,
     audio: Audio,
     accessibility: Accessibility,
+    /// The captions of what plays, shared with the captions service.
+    captions: pen_runtime::captions::Shared,
     tools: Option<Tools>,
     services: Services,
     preferences: Preferences,
+    /// The game's actions, which live frames' events move.
+    actions: pen_runtime::actions::Shared,
     /// The game's next live frame's events.
     events: Vec<GameEvent>,
     /// The renderer's asset events while recorded frames play: the game
@@ -225,6 +277,18 @@ pub struct Browser {
     cursor_hidden: bool,
     /// The last animation frame's time.
     previous: Option<f64>,
+    saved_types: Option<SavedTypes>,
+    /// Files the player hands the page (saves, recordings), and the word on
+    /// files handed over.
+    files: Files,
+    /// The game's name, for the files it hands over.
+    name: String,
+    /// A save the player handed the page, loaded with the next live frame.
+    importing: Option<(String, SavedState)>,
+    /// The input recording being made (`/record`).
+    recorder: Option<Recorder>,
+    /// The recording the page's link names, played first.
+    linked: Option<String>,
 }
 
 impl Browser {
@@ -238,11 +302,18 @@ impl Browser {
         options: Options,
     ) -> Result<Browser> {
         let preferences = Preferences::load();
+        let actions = Rc::new(RefCell::new(crate::preferences::load_bindings()));
+        let mut services = crate::services::with_preferences(preferences.service());
+        services.register(Box::new(pen_runtime::actions::InputService(actions.clone())));
         let mut timeline = Timeline::default();
         if options.development {
             timeline.keep_history(Some(KEEP_SECONDS));
         }
         let hooks = options.qualify.then(|| Hooks::new(screen.canvas.element.clone()));
+        let captions = options.captions.shared();
+        let mut services = crate::services::standard();
+        services.register(Box::new(pen_runtime::captions::CaptionsService(captions.clone())));
+        game.hash_packets(options.qualify);
         Ok(Browser {
             shown: game.take_drawn().unwrap_or_default(),
             catalog: game.catalog().clone(),
@@ -252,9 +323,11 @@ impl Browser {
             input,
             audio,
             tools,
-            services: crate::services::standard(),
+            services,
+            captions,
             events: preferences.events().collect(),
             preferences,
+            actions,
             held: Vec::new(),
             timeline,
             transport: Transport::default(),
@@ -268,6 +341,12 @@ impl Browser {
             status: true,
             cursor_hidden: false,
             previous: None,
+            saved_types: options.saved_types,
+            files: Files::install(),
+            name: options.name,
+            importing: None,
+            recorder: None,
+            linked: options.replay,
         })
     }
 
@@ -287,6 +366,7 @@ impl Browser {
         let interval = self.previous.replace(timestamp).map_or(0.0, |previous| (timestamp - previous) * 1000.0);
         self.screen.fit();
         self.read_mail();
+        self.input.borrow_mut().poll_gamepads();
         let hotkeys = self.take_input();
         self.run_tools(timestamp, interval).await;
         let started = Instant::now();
@@ -297,6 +377,7 @@ impl Browser {
         let ran = self.step().await?;
         let submitting = Instant::now();
         let overlay = self.tools.as_ref().and_then(|tools| tools.frame.as_ref());
+        self.preferences.apply(&mut self.screen.renderer);
         self.screen.draw(&self.shown, overlay, &self.catalog).await?;
         // The dev tools' assets are their own; the game never hears of them.
         let _ = self.screen.overlay.take_events();
@@ -304,6 +385,7 @@ impl Browser {
             self.timings = self.game.last_timings().map(|timings| timings.completed(ms(submitting), ms(started)));
         }
         self.present()?;
+        crate::preferences::keep_bindings(&self.actions);
         self.autosave(timestamp).await;
         Ok(ran != Some(true))
     }
@@ -410,6 +492,13 @@ impl Browser {
         if let Some(update) = self.development.as_ref().and_then(Development::take_update) {
             self.reload(update).await;
         }
+        self.arrivals().await;
+        if let Some(path) = self.transport.take_record() {
+            match path {
+                Some(_) => self.start_recording().await,
+                None => self.stop_recording(),
+            }
+        }
         while let Some(rewind) = self.transport.next_rewind() {
             let result = match rewind {
                 Rewind::To(frame) => self.rewind(frame).await,
@@ -434,14 +523,18 @@ impl Browser {
                 (recorded.input.clone(), Some(recorded.loads.clone()))
             }
             None => {
-                let frame = Frame {
+                let mut frame = Frame {
                     timestamp: self.clock.advance(),
                     viewport: self.screen.viewport(),
                     events: std::mem::take(&mut self.events),
                 };
+                self.actions.borrow_mut().map(&mut frame.events);
                 (self.game.input(&frame)?, None)
             }
         };
+        if let Some(hooks) = &mut self.hooks {
+            hooks.ran(&input)?;
+        }
         self.game.send(&input)?;
         let received = {
             let shell = shell!(self);
@@ -457,6 +550,7 @@ impl Browser {
     /// asked to exit.
     async fn complete(&mut self, input: Vec<f32>, replayed: Option<Vec<Load>>, rendered: RenderFrame) -> Result<bool> {
         self.audio.submit(&rendered, &self.catalog).await;
+        self.services.rendered(&rendered, &self.catalog);
         if let Some(values) = &rendered.preferences {
             self.preferences.store(values);
         }
@@ -494,9 +588,15 @@ impl Browser {
                 if rendered.load_requested {
                     loads.extend(self.load("pen.quicksave", false).await);
                 }
+                if let Some((name, saved)) = self.importing.take() {
+                    loads.extend(self.load_state(&name, saved, false).await);
+                }
             }
         }
         let recorded = Recorded { input, loads, restored: self.timeline.restored_here() };
+        if let Some(recorder) = &mut self.recorder {
+            recorder.frame(&recorded);
+        }
         self.timeline.ran(recorded);
         self.autosave.changed = true;
         let exit = rendered.exit_requested;
@@ -555,6 +655,12 @@ impl Browser {
             say(&mut self.log, log_source::SESSION, true, format!("there is no {name} to load"));
             return None;
         };
+        self.load_state(name, saved, scene).await
+    }
+
+    /// Loads `saved`, a quicksave or (with `scene`) the editor's scene that
+    /// `name` held; returns the state loaded, for the history.
+    async fn load_state(&mut self, name: &str, saved: SavedState, scene: bool) -> Option<Load> {
         let loaded = {
             let mut shell = shell!(self);
             if scene {
@@ -578,7 +684,7 @@ impl Browser {
     /// Goes to `target`, paused.
     async fn rewind(&mut self, target: u64) -> Result<()> {
         let started = Instant::now();
-        let (shown, _) = {
+        let (shown, at) = {
             let shell = shell!(self);
             let mut unseen = |_: u64, _: &Recorded, _: &Runtime| Ok(());
             self.timeline.rewind(&mut self.game, &shell, target, &mut unseen).await?
@@ -586,6 +692,7 @@ impl Browser {
         self.services.forget();
         self.game.continue_clock(self.clock.now());
         self.show(shown);
+        self.rewind_recording(at, self.timeline.position());
         self.pacer = None;
         self.autosave.changed = true;
         let position = self.timeline.position();
@@ -608,6 +715,7 @@ impl Browser {
         };
         self.services.forget();
         self.show(shown);
+        self.rewind_recording(at, at);
         self.transport.replay(Replaying::Recent);
         self.clock.resume();
         self.pacer = None;
@@ -622,12 +730,171 @@ impl Browser {
         Ok(())
     }
 
-    /// The replay's frames ran out: play goes on live.
+    /// The replay's frames ran out: play goes on live, or after a recording
+    /// played from a file or a link, pauses there.
     fn replay_ended(&mut self) {
-        self.transport.replay_ended();
+        let replayed = self.transport.replay_ended();
         self.game.continue_clock(self.clock.now());
         let position = self.timeline.position();
-        say(&mut self.log, log_source::SESSION, false, format!("the replay ended at frame {position}; playing live"));
+        let said = if replayed == Some(Replaying::File) {
+            devtools::Host::pause(self);
+            format!("the replay ended at frame {position}; paused (Ctrl+Shift+P plays on, live)")
+        } else {
+            format!("the replay ended at frame {position}; playing live")
+        };
+        say(&mut self.log, log_source::SESSION, false, said);
+    }
+
+    /// Files the player handed the page, and the word on those handed over:
+    /// a recording (the page's link's first) plays, and a save loads with
+    /// the next live frame.
+    async fn arrivals(&mut self) {
+        if let Some(source) = self.linked.take() {
+            match replay::fetch(&source).await {
+                Ok((recording, name)) => self.play(recording, &name).await,
+                Err(error) => say(&mut self.log, log_source::SESSION, true, format!("replay: {error:#}")),
+            }
+        }
+        for arrival in self.files.take() {
+            match arrival {
+                Arrival::Note { error, text } => say(&mut self.log, log_source::SESSION, error, text),
+                Arrival::File { name, bytes } if recording::is_recording(&bytes) => match recording::decode(&bytes) {
+                    Ok(decoded) => self.play(decoded.recording, &name).await,
+                    Err(error) => say(&mut self.log, log_source::SESSION, true, format!("{name}: {error:#}")),
+                },
+                Arrival::File { name, bytes } => match snapshot::decode(&bytes) {
+                    Ok(saved) => {
+                        // It is the quicksave from now on, as a save from this page would be.
+                        let kept = saved.clone();
+                        spawn_local(async move {
+                            if let Err(error) = saves::write("pen.quicksave", &kept).await {
+                                web_sys::console::warn_1(&format!("keeping the imported save: {error:#}").into());
+                            }
+                        });
+                        self.importing = Some((name, saved));
+                    }
+                    Err(_) => {
+                        let said = format!("{name} is neither a save nor an input recording");
+                        say(&mut self.log, log_source::SESSION, true, said);
+                    }
+                },
+            }
+        }
+    }
+
+    /// Plays `recording` (from `name`) in place of the player's input, from
+    /// its start; it pauses where it ends.
+    async fn play(&mut self, recording: Recording, name: &str) {
+        if self.recorder.take().is_some() {
+            say(&mut self.log, log_source::SESSION, false, "stopped recording input: a replay starts");
+        }
+        // Its frames were laid out on its viewport, whatever the page's size.
+        self.screen.pin(recording::viewport(&recording));
+        let restored = {
+            let shell = shell!(self);
+            self.game.restore(&mut Quiet(&shell), &recording.start).await
+        };
+        let shown = match restored {
+            Ok(shown) => shown,
+            Err(error) => {
+                self.screen.pin(None);
+                say(&mut self.log, log_source::SESSION, true, format!("replaying {name}: {error:#}"));
+                return;
+            }
+        };
+        let frames = recording.frames.len();
+        let seconds: f64 = recording.frames.iter().map(Recorded::elapsed).sum();
+        self.timeline.keep_history(Some(KEEP_SECONDS));
+        self.timeline.load(recording);
+        self.services.forget();
+        self.show(shown);
+        self.transport.replay_ended();
+        self.transport.replay(Replaying::File);
+        self.pacer = None;
+        self.autosave.changed = true;
+        let said = format!("replaying {frames} frames ({seconds:.1} s of game time) from {name}");
+        say(&mut self.log, log_source::SESSION, false, said);
+    }
+
+    /// Records the input from here (`/record`). A replay starts by
+    /// restoring the recording's moment, so the game is restored from it
+    /// here too, as native pen does: what it keeps outside its state then
+    /// starts over in both alike.
+    async fn start_recording(&mut self) {
+        self.stop_recording();
+        let position = self.timeline.position();
+        let started = async {
+            let moment = self.game.moment().await?;
+            let shell = shell!(self);
+            let shown = if self.timeline.history() {
+                // Rewinds after it then restore from no earlier than its start.
+                self.timeline.keep_moment(moment.clone());
+                self.timeline.restart(&mut self.game, &shell, position).await?.0
+            } else {
+                self.game.restore(&mut Quiet(&shell), &moment).await?
+            };
+            Ok::<_, anyhow::Error>((moment, shown))
+        }
+        .await;
+        match started {
+            Ok((moment, shown)) => {
+                self.game.continue_clock(self.clock.now());
+                self.show(shown);
+                self.recorder = Some(Recorder::new(position, moment));
+                say(&mut self.log, log_source::SESSION, false, format!("recording input from frame {position}"));
+            }
+            Err(error) => say(&mut self.log, log_source::SESSION, true, format!("recording input: {error:#}")),
+        }
+    }
+
+    /// Stops the recording being made, if one is, and hands it to the
+    /// player: as a `.penrec` download and as a link that plays it, which
+    /// goes on the clipboard (and the browser's console).
+    fn stop_recording(&mut self) {
+        let Some(recorder) = self.recorder.take() else { return };
+        let frames = recorder.frames();
+        let bytes = recorder.finish();
+        let name = files::named(&self.name, "penrec");
+        if let Err(error) = files::download(&name, &bytes, "application/octet-stream") {
+            say(&mut self.log, log_source::SESSION, true, format!("handing over {name}: {error:#}"));
+        }
+        let link = replay::link(&bytes);
+        web_sys::console::log_1(&format!("a link that replays {name}: {link}").into());
+        say(
+            &mut self.log,
+            log_source::SESSION,
+            false,
+            format!(
+                "recorded {frames} frames of input as {name} ({} KB; a link to it is {} KB)",
+                bytes.len() / 1000,
+                link.len() / 1000
+            ),
+        );
+        let files = self.files.clone();
+        let copying = web_sys::window().unwrap().navigator().clipboard().write_text(&link);
+        spawn_local(async move {
+            match JsFuture::from(copying).await {
+                Ok(_) => files.note(false, "the link that replays it is on the clipboard"),
+                Err(_) => files.note(false, "the link that replays it is in the browser's console"),
+            }
+        });
+    }
+
+    /// The game went back to `at` and ran on to `position` (unseen): the
+    /// input recording goes back too, or stops if it started later.
+    fn rewind_recording(&mut self, at: u64, position: u64) {
+        let Some(recorder) = &mut self.recorder else { return };
+        if at < recorder.first {
+            self.recorder = None;
+            say(&mut self.log, log_source::SESSION, false, "stopped recording input: went back before it started");
+            return;
+        }
+        recorder.rewind(at);
+        for frame in at..position {
+            if let Some(recorded) = self.timeline.recorded(frame) {
+                recorder.frame(recorded);
+            }
+        }
     }
 
     /// A new build from `pen web`, taken while the game is idle.
@@ -678,6 +945,13 @@ impl Browser {
             Some(frame) => self.accessibility.update(&frame.ui, true)?,
             None => self.accessibility.update(&self.shown.ui, false)?,
         }
+        // The game's text box; the dev tools' console types keys, which an
+        // input method would take.
+        self.input.borrow_mut().text_field(text_box(&self.shown.ui));
+        let captions = pen_runtime::captions::lock(&self.captions);
+        let showing = (!captions.captions.is_empty()).then(|| captions.text());
+        drop(captions);
+        self.accessibility.captions(showing.as_deref())?;
         let hidden = self.shown.hide_cursor && !self.tools.as_ref().is_some_and(Tools::wants_pointer);
         if hidden != self.cursor_hidden {
             self.cursor_hidden = hidden;
@@ -691,6 +965,7 @@ impl Browser {
                 format!("msaa={} scale={}", quality.msaa, quality.scale),
                 format!("game={} tools={}", self.screen.renderer.pending(), self.screen.overlay.pending()),
                 self.screen.busy().to_string(),
+                format!("{:016x}", self.game.packet_hash()),
             ])?;
         }
         if std::mem::take(&mut self.status)
@@ -770,12 +1045,18 @@ impl devtools::Host for Browser {
             brushes: self.shown.solids.len(),
             memory: self.game.memory_bytes(),
             size: (viewport.width, viewport.height),
-            recording: None,
+            recording: self.recorder.as_ref().map(|recorder| recorder.first),
+            culled: stats.culled,
+            shadow_culled: stats.shadow_culled,
+            triangles: stats.triangles,
+            scale: stats.scale,
+            gpu: stats.gpu.map(|gpu| [gpu.shadow, gpu.culling, gpu.scene, gpu.post, gpu.overlay, gpu.total]),
         }
     }
 
     fn measure_frames(&mut self, enabled: bool) {
         self.game.measure_frames(enabled);
+        self.screen.renderer.time_passes(enabled);
     }
 
     fn gpu(&self) -> String {
@@ -800,6 +1081,10 @@ impl devtools::Host for Browser {
         if self.transport.replaying().is_none() && self.timeline.next().is_some() {
             self.timeline.go_live();
         }
+        // Live play lays out on the page's size again.
+        if self.transport.replaying().is_none() {
+            self.screen.pin(None);
+        }
         self.clock.resume();
         self.pacer = None;
     }
@@ -821,6 +1106,53 @@ impl devtools::Host for Browser {
     fn keep_history(&mut self) {
         if !self.timeline.history() {
             self.timeline.keep_history(Some(KEEP_SECONDS));
+        }
+    }
+
+    fn audio(&mut self) -> Option<pen_runtime::mix::AudioReport> {
+        self.audio.report()
+    }
+
+    fn monitor(&mut self, bus: usize, mute: bool, on: bool) -> bool {
+        self.audio.monitor(bus, mute, on)
+    }
+
+    /// Starts recording the page's input, or stops and hands the recording
+    /// over (a download and a link); a file name is the browser's to give.
+    fn record(&mut self, _path: Option<String>) -> Answer {
+        self.transport.record(self.recorder.is_none().then(std::path::PathBuf::new));
+        Answer::ok(0.0)
+    }
+
+    /// Hands the game's state to the player as a save file (`path` names it).
+    async fn export_save(&mut self, path: Option<String>) -> Answer {
+        let Some(saved) = devtools::Host::snapshot(self).await else { return Answer::failed() };
+        let name = path
+            .as_deref()
+            .map(files::base_name)
+            .filter(|name| !name.is_empty())
+            .map_or_else(|| files::named(&self.name, "save"), str::to_owned);
+        match snapshot::encode(&saved).and_then(|bytes| files::download(&name, &bytes, "application/octet-stream")) {
+            Ok(()) => {
+                say(&mut self.log, log_source::SESSION, false, format!("exported the game's state as {name}"));
+                Answer::text(&name)
+            }
+            Err(error) => {
+                say(&mut self.log, log_source::SESSION, true, format!("exporting the game's state: {error:#}"));
+                Answer::failed()
+            }
+        }
+    }
+
+    /// Asks the player for a save (or a recording, which plays), which
+    /// loads with the next live frame once chosen; the browser asks.
+    fn import_save(&mut self, _path: Option<String>) -> Answer {
+        match self.files.choose(".save,.bin,.penrec") {
+            Ok(()) => Answer::text("choose a save or a recording"),
+            Err(error) => {
+                say(&mut self.log, log_source::SESSION, true, format!("importing a save: {error:#}"));
+                Answer::failed()
+            }
         }
     }
 

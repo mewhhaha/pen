@@ -130,20 +130,20 @@ pub fn serve(project: Project, port: Option<u16>) -> Result<()> {
 /// An HTTP request: its method, its path without the query, its headers
 /// and its body.
 #[derive(Debug, Default)]
-struct Request {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Request {
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value.as_str())
     }
 }
 
-fn read_request(socket: &mut impl Read) -> Result<Request> {
+pub(crate) fn read_request(socket: &mut impl Read) -> Result<Request> {
     let mut bytes = Vec::new();
     let end = loop {
         if let Some(at) = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
@@ -179,19 +179,19 @@ fn read_request(socket: &mut impl Read) -> Result<Request> {
 
 /// A response: its status line's code and reason, its type and its body.
 #[derive(Debug)]
-struct Reply {
-    status: &'static str,
-    content_type: &'static str,
-    body: Vec<u8>,
+pub(crate) struct Reply {
+    pub(crate) status: &'static str,
+    pub(crate) content_type: &'static str,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Reply {
-    fn text(status: &'static str, text: impl Into<String>) -> Reply {
+    pub(crate) fn text(status: &'static str, text: impl Into<String>) -> Reply {
         Reply { status, content_type: "text/plain; charset=utf-8", body: text.into().into_bytes() }
     }
 }
 
-fn respond(socket: &mut TcpStream, reply: &Reply) -> Result<()> {
+pub(crate) fn respond(socket: &mut TcpStream, reply: &Reply) -> Result<()> {
     write!(
         socket,
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nConnection: close\r\n\r\n",
@@ -203,7 +203,7 @@ fn respond(socket: &mut TcpStream, reply: &Reply) -> Result<()> {
     Ok(())
 }
 
-fn decode_path(path: &str) -> Result<PathBuf> {
+pub(crate) fn decode_path(path: &str) -> Result<PathBuf> {
     let mut bytes = Vec::new();
     let mut input = path.bytes();
     while let Some(byte) = input.next() {
@@ -261,12 +261,20 @@ fn route(site: &Site, request: &Request, revision: u64) -> Reply {
     } else if relative.as_os_str().is_empty() {
         site.out.join("index.html")
     } else {
-        site.out.join(relative)
+        site.out.join(&relative)
     };
     // Symlinked files must stay inside the served roots.
     let served =
         file.canonicalize().ok().filter(|file| file.starts_with(&site.out) || file.starts_with(site.root.join("src")));
     let Some(body) = served.as_ref().and_then(|file| std::fs::read(file).ok()) else {
+        // A game that declares no saved types, as the page asks whatever.
+        if relative == Path::new("assets").join(pen_runtime::saved::SAVED_TYPES_FILE) {
+            return Reply {
+                status: "200 OK",
+                content_type: "application/json",
+                body: pen_runtime::saved::NO_SAVED_TYPES.into(),
+            };
+        }
         return Reply::text("404 Not Found", "file unavailable");
     };
     let content_type = match served.as_ref().and_then(|file| file.extension()).and_then(|extension| extension.to_str())
@@ -378,6 +386,9 @@ mod tests {
         assert_eq!(answer(&get("/scene.bin")).2, "scene");
         assert_eq!(answer(&get("/__pen/revision")).2, "7");
         assert_eq!(answer(&get("/missing.js")).0, "404 Not Found");
+        // A game without saved types: the page asks whatever.
+        let saved = ("200 OK", "application/json", pen_runtime::saved::NO_SAVED_TYPES.into());
+        assert_eq!(answer(&get("/assets/saved.json")), saved);
         assert_eq!(answer(&get("/../src/main.blot")).0, "400 Bad Request");
         // The checkout's sources are not served, not even through a link.
         assert_eq!(answer(&get("/escape.json")).0, "404 Not Found");

@@ -8,67 +8,51 @@
 //! each frame's mix reaches it over a channel, landing at the start of its
 //! next 128-sample quantum. Clips decode on a background thread; a voice or
 //! sound whose clip is not ready yet is left out until it is, as the browser
-//! leaves it out while decoding.
+//! leaves it out while decoding. A clip longer than STREAM_SECONDS keeps
+//! only its bytes and decodes as it plays (`stream.rs`).
+//!
+//! For the dev tools ([`Audio::report`], [`Audio::monitor`]) the device's
+//! callback also measures how late the output plays, and the mixer meters
+//! its buses and takes the developer's mute and solo, all through
+//! [`Shared`].
 mod device;
 pub mod mixer;
 mod resample;
 mod reverb;
+pub mod source;
+mod stream;
 
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail, ensure};
-use pen_protocol::{Catalog, RenderFrame};
-use symphonia::core::codecs::CodecParameters;
-use symphonia::core::formats::TrackType;
-use symphonia::core::io::MediaSourceStream;
-
+use anyhow::Result;
 use mixer::{BusSpec, Clip, Mix, Mixer, QUANTUM, SoundSpec, VoiceSpec};
+use pen_protocol::boundary::MAX_BUSES;
+use pen_protocol::{Catalog, RenderFrame};
+use pen_runtime::mix::{Meter, Monitor};
+use pen_runtime::panner::Placements;
+use source::Encoded;
 
-/// Decodes a clip, in either format the game's sounds come in: Ogg Opus
-/// (`opus.rs`) or PCM WAV.
+/// Loads a clip, in either format the game's sounds come in: Ogg Opus
+/// (`opus.rs`) or PCM WAV. One longer than STREAM_SECONDS streams, as in
+/// the browser (`pen_runtime::clip`); the rest decode whole.
 pub fn load_clip(path: &Path) -> Result<Clip> {
     let bytes = std::fs::read(path)?;
-    if crate::opus::is_ogg_opus(&bytes) {
-        return crate::opus::decode(&bytes);
+    let streams = pen_runtime::clip::streams(&bytes);
+    let encoded = Encoded::new(bytes.into())?;
+    if streams {
+        return Ok(Clip::streamed(encoded));
     }
-    decode_wav(bytes)
+    encoded.decode()
 }
 
-/// A PCM WAV clip, its samples as f32 (an i16 `s` as `s / 32768`, as
-/// WebAudio's decoding gives it).
+/// A PCM WAV clip, decoded whole.
+#[cfg(test)]
 fn decode_wav(bytes: Vec<u8>) -> Result<Clip> {
-    let source = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
-    let mut reader = symphonia::default::get_probe()
-        .probe(&Default::default(), source, Default::default(), Default::default())
-        .context("not a WAV or Ogg Opus clip")?;
-    let track = reader.default_track(TrackType::Audio).context("the clip has no audio")?;
-    let id = track.id;
-    let Some(CodecParameters::Audio(parameters)) = &track.codec_params else { bail!("the clip has no audio") };
-    let rate = parameters.sample_rate.context("the clip has no sample rate")?;
-    // The rates a WebAudio buffer may have; at 0 Hz, a clip would resample
-    // to no end.
-    ensure!((3_000..=768_000).contains(&rate), "the clip's sample rate, {rate} Hz, is outside 3 to 768 kHz");
-    let mut decoder = symphonia::default::get_codecs().make_audio_decoder(parameters, &Default::default())?;
-    let mut frames: Vec<[f32; 2]> = Vec::new();
-    let mut samples: Vec<f32> = Vec::new();
-    while let Some(packet) = reader.next_packet()? {
-        if packet.track_id != id {
-            continue;
-        }
-        let buffer = decoder.decode(&packet)?;
-        buffer.copy_to_vec_interleaved(&mut samples);
-        match buffer.num_planes() {
-            1 => frames.extend(samples.iter().map(|&value| [value, value])),
-            2 => frames.extend_from_slice(samples.as_chunks::<2>().0),
-            channels => bail!("clips with {channels} channels are not supported"),
-        }
-    }
-    Ok(Clip::new(frames.into(), f64::from(rate)))
+    Encoded::new(bytes.into())?.decode()
 }
 
 /// A clip, decoded for a mixer at `rate`.
@@ -80,6 +64,7 @@ pub fn decode(path: &Path, rate: f64) -> Result<Arc<Clip>> {
 /// and sounds whose clip is not among them are left out.
 pub fn mix(frame: &RenderFrame, catalog: &Catalog, clips: &HashMap<String, Arc<Clip>>) -> Mix {
     let clip = |index: u32| clips.get(catalog.sound(index)).cloned();
+    let placements = Placements::of(frame);
     Mix {
         buses: frame
             .buses
@@ -103,13 +88,15 @@ pub fn mix(frame: &RenderFrame, catalog: &Catalog, clips: &HashMap<String, Arc<C
                     start: voice.start,
                     fade_in: voice.fade_in,
                     fade_out: voice.fade_out,
+                    panner: placements.voice(voice.id),
                 })
             })
             .collect(),
         sounds: frame
             .sounds
             .iter()
-            .filter_map(|sound| {
+            .enumerate()
+            .filter_map(|(index, sound)| {
                 Some(SoundSpec {
                     clip: clip(sound.clip)?,
                     bus: sound.bus as usize,
@@ -118,6 +105,7 @@ pub fn mix(frame: &RenderFrame, catalog: &Catalog, clips: &HashMap<String, Arc<C
                     pitch: sound.pitch,
                     lowpass: sound.lowpass,
                     reverb: sound.reverb,
+                    panner: placements.sound(index),
                 })
             })
             .collect(),
@@ -141,6 +129,44 @@ impl Rate {
     }
 }
 
+/// How late the output plays: from a frame's mix reaching the mixer to its
+/// first sample leaving the device, on average. The mix waits for the next
+/// callback (half a callback on average) and the next quantum within it
+/// (half a quantum), and the callback's samples play `ahead` after it is
+/// called, as the device says. Averaged over callbacks, as devices jitter.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Latency {
+    /// Seconds; none until a callback said when its samples play.
+    pub seconds: Option<f64>,
+}
+
+impl Latency {
+    /// A callback of `frames` samples at `rate`, whose first plays `ahead`
+    /// seconds after it was called, if the device says.
+    pub fn measure(&mut self, ahead: Option<f64>, frames: usize, rate: f64) {
+        let Some(ahead) = ahead else { return };
+        let latency = ahead + (frames as f64 + QUANTUM as f64) / 2.0 / rate;
+        self.seconds = Some(self.seconds.map_or(latency, |seconds| seconds + (latency - seconds) * 0.05));
+    }
+}
+
+/// What the audio thread and the game's share besides the mixes: the
+/// developer's mute and solo, the buses' meters and how the output plays.
+#[derive(Default)]
+#[cfg_attr(not(feature = "devtools"), allow(dead_code, reason = "the dev tools read it"))]
+pub struct Shared {
+    /// `Monitor::bits`.
+    monitor: AtomicU64,
+    meters: Mutex<([Meter; MAX_BUSES], [bool; MAX_BUSES])>,
+    /// The latency's seconds as f64 bits, 0 until measured.
+    latency: AtomicU64,
+    /// Samples per callback, as the device last asked for them.
+    callback: AtomicU32,
+    playing: AtomicUsize,
+    streaming: AtomicUsize,
+    underruns: AtomicU64,
+}
+
 /// The mixer as the output device plays it. Mixes arrive from `Audio::frame`
 /// and go back once applied, so that nothing the frames allocated is freed
 /// on the audio thread.
@@ -150,11 +176,34 @@ struct Live {
     mixes: Receiver<Mix>,
     applied: SyncSender<Mix>,
     scratch: [[f32; 2]; QUANTUM],
+    shared: Arc<Shared>,
+    /// Meters not yet handed over (the game's side held them).
+    meters: [Meter; MAX_BUSES],
+    latency: Latency,
 }
 
 impl Live {
-    fn new(rate: Rate, mixes: Receiver<Mix>, applied: SyncSender<Mix>) -> Live {
-        Live { mixer: Mixer::new(rate.get()), rate, mixes, applied, scratch: [[0.0; 2]; QUANTUM] }
+    fn new(rate: Rate, mixes: Receiver<Mix>, applied: SyncSender<Mix>, shared: Arc<Shared>) -> Live {
+        Live {
+            mixer: Mixer::live(rate.get()),
+            rate,
+            mixes,
+            applied,
+            scratch: [[0.0; 2]; QUANTUM],
+            shared,
+            meters: [Meter::default(); MAX_BUSES],
+            latency: Latency::default(),
+        }
+    }
+
+    /// The device's callback was called for `frames` samples that play
+    /// `ahead` seconds from now, if it says.
+    fn played(&mut self, ahead: Option<f64>, frames: usize) {
+        self.latency.measure(ahead, frames, self.mixer.rate());
+        if let Some(seconds) = self.latency.seconds {
+            self.shared.latency.store(seconds.to_bits(), Ordering::Relaxed);
+        }
+        self.shared.callback.store(u32::try_from(frames).unwrap_or(u32::MAX), Ordering::Relaxed);
     }
 
     /// A device starts playing it at `rate`. At another rate than the
@@ -162,7 +211,7 @@ impl Live {
     /// plays, and the clips are decoded again for it.
     fn start(&mut self, rate: f64) {
         if (rate - self.mixer.rate()).abs() > 0.5 {
-            self.mixer = Mixer::new(rate);
+            self.mixer = Mixer::live(rate);
             self.rate.set(rate);
         }
     }
@@ -172,6 +221,7 @@ impl Live {
     /// any past the first two.
     fn fill(&mut self, out: &mut [f32], channels: usize) {
         let channels = channels.max(1);
+        self.mixer.set_monitor(Monitor::from_bits(self.shared.monitor.load(Ordering::Relaxed)));
         while let Ok(mix) = self.mixes.try_recv() {
             self.mixer.apply(&mix);
             let _ = self.applied.try_send(mix);
@@ -192,6 +242,20 @@ impl Live {
                 }
             }
         }
+        let (meters, used) = self.mixer.take_meters();
+        for (kept, meter) in self.meters.iter_mut().zip(&meters) {
+            kept.merge(meter);
+        }
+        if let Ok(mut shared) = self.shared.meters.try_lock() {
+            for (shared, kept) in shared.0.iter_mut().zip(&mut self.meters) {
+                shared.merge(kept);
+                *kept = Meter::default();
+            }
+            shared.1 = used;
+        }
+        self.shared.playing.store(self.mixer.playing(), Ordering::Relaxed);
+        self.shared.streaming.store(self.mixer.streaming(), Ordering::Relaxed);
+        self.shared.underruns.store(self.mixer.underruns(), Ordering::Relaxed);
     }
 }
 
@@ -206,15 +270,24 @@ pub struct Audio {
     decoded: Receiver<(String, Result<Arc<Clip>, String>)>,
     mixes: SyncSender<Mix>,
     applied: Receiver<Mix>,
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code, reason = "the dev tools read it"))]
+    shared: Arc<Shared>,
+    /// The device's buffer asked for, in samples (`--audio-buffer`).
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code, reason = "the dev tools read it"))]
+    buffer: Option<u32>,
 }
 
 impl Audio {
-    /// Starts the output device and decodes every clip in the catalog.
-    pub fn new(assets: PathBuf, catalog: &Catalog) -> Result<Audio> {
+    /// Starts the output device, with a buffer of `buffer` samples if asked
+    /// for (within what it takes), and decodes every clip in the catalog,
+    /// those in `first` first.
+    pub fn new(assets: PathBuf, catalog: &Catalog, first: &[String], buffer: Option<u32>) -> Result<Audio> {
         let (mixes, receiving) = sync_channel(32);
         let (returning, applied) = sync_channel(64);
         let rate = Rate(Arc::new(AtomicU64::new(LIKELY_RATE.to_bits())));
-        let device = device::Device::start(Arc::new(Mutex::new(Live::new(rate.clone(), receiving, returning))))?;
+        let shared = Arc::new(Shared::default());
+        let live = Live::new(rate.clone(), receiving, returning, shared.clone());
+        let device = device::Device::start(Arc::new(Mutex::new(live)), buffer)?;
         // The device's own, which the clips are decoded for from the start.
         let decoded_at = rate.get();
         let (requests, wanted) = channel::<String>();
@@ -229,16 +302,31 @@ impl Audio {
                 }
             }
         })?;
-        let mut audio =
-            Audio { _device: device, clips: HashMap::new(), decoded_at, rate, requests, decoded, mixes, applied };
-        audio.preload(catalog);
+        let mut audio = Audio {
+            _device: device,
+            clips: HashMap::new(),
+            decoded_at,
+            rate,
+            requests,
+            decoded,
+            mixes,
+            applied,
+            shared,
+            buffer,
+        };
+        // What the scene plays first decodes first.
+        for key in first.iter().filter(|key| catalog.sounds.contains(key)) {
+            let _ = audio.requests.send(key.clone());
+        }
+        audio.preload(catalog, first);
         Ok(audio)
     }
 
-    /// Decodes the catalog's clips that are not decoded yet.
-    pub fn preload(&mut self, catalog: &Catalog) {
+    /// Decodes the catalog's clips that are not decoded yet, but those in
+    /// `asked` (asked for already).
+    pub fn preload(&mut self, catalog: &Catalog, asked: &[String]) {
         for key in &catalog.sounds {
-            if !self.clips.contains_key(key) {
+            if !self.clips.contains_key(key) && !asked.contains(key) {
                 let _ = self.requests.send(key.clone());
             }
         }
@@ -276,6 +364,35 @@ impl Audio {
         while self.applied.try_recv().is_ok() {}
     }
 
+    /// The mix as it plays, for the dev tools; its meters start again.
+    #[cfg(feature = "devtools")]
+    pub fn report(&mut self) -> pen_runtime::mix::AudioReport {
+        let monitor = Monitor::from_bits(self.shared.monitor.load(Ordering::Relaxed));
+        let (meters, used) = {
+            let mut shared = self.shared.meters.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (std::mem::take(&mut shared.0), shared.1)
+        };
+        let latency = f64::from_bits(self.shared.latency.load(Ordering::Relaxed));
+        let callback = self.shared.callback.load(Ordering::Relaxed);
+        pen_runtime::mix::AudioReport {
+            rate: self.rate.get(),
+            buffer: self.buffer.or((callback > 0).then_some(callback)),
+            voices: self.shared.playing.load(Ordering::Relaxed),
+            streams: self.shared.streaming.load(Ordering::Relaxed),
+            underruns: self.shared.underruns.load(Ordering::Relaxed),
+            buses: pen_runtime::mix::AudioReport::buses(&meters, &used, monitor),
+            latency_ms: (latency > 0.0).then_some(latency * 1000.0),
+        }
+    }
+
+    /// The developer mutes (`mute`) or solos bus `bus`, or stops.
+    #[cfg(feature = "devtools")]
+    pub fn monitor(&mut self, bus: usize, mute: bool, on: bool) {
+        let mut monitor = Monitor::from_bits(self.shared.monitor.load(Ordering::Relaxed));
+        monitor.set(bus, mute, on);
+        self.shared.monitor.store(monitor.bits(), Ordering::Relaxed);
+    }
+
     pub fn frame(&mut self, frame: &RenderFrame, catalog: &Catalog) {
         self.receive();
         // A full queue means the audio thread is stalled; the next frame
@@ -301,7 +418,8 @@ mod tests {
     fn output() -> (Live, SyncSender<Mix>, Receiver<Mix>) {
         let (mixes, receiving) = sync_channel(32);
         let (returning, applied) = sync_channel(64);
-        (Live::new(Rate(Arc::new(AtomicU64::new(RATE.to_bits()))), receiving, returning), mixes, applied)
+        let rate = Rate(Arc::new(AtomicU64::new(RATE.to_bits())));
+        (Live::new(rate, receiving, returning, Arc::new(Shared::default())), mixes, applied)
     }
 
     /// Plays `frames` (game frames at 60 a second) through the live output as
@@ -365,6 +483,7 @@ mod tests {
             start: 0.0,
             fade_in: 0.3,
             fade_out: 0.5,
+            panner: None,
         };
         let frames: Vec<Mix> = (0..240u32)
             .map(|frame| {
@@ -390,6 +509,7 @@ mod tests {
                         pitch: 1.0,
                         lowpass: 4000.0,
                         reverb: 0.3,
+                        panner: None,
                     }]
                 } else {
                     Vec::new()
@@ -444,18 +564,89 @@ mod tests {
         std::fs::write(&out, bytes).unwrap();
     }
 
-    /// Every clip in an exported bundle decodes.
+    /// Every clip in an exported bundle decodes, those that stream too, to
+    /// as long as their headers say.
     #[test]
     fn bundle_clips_decode() {
         let Some(bundle) = crate::fixtures::bundle() else { return };
         let assets = bundle.join("assets");
         let catalog = pen_protocol::boundary::read_catalog(&assets).unwrap();
+        let decode = |key: &String| -> Result<()> {
+            let clip = load_clip(&assets.join(key))?;
+            if let Some(encoded) = &clip.streamed {
+                let whole = encoded.decode()?;
+                anyhow::ensure!(
+                    whole.frames.len() == encoded.frames,
+                    "{} frames, not {}",
+                    whole.frames.len(),
+                    encoded.frames
+                );
+            }
+            Ok(())
+        };
         let failed: Vec<String> = catalog
             .sounds
             .iter()
-            .filter_map(|key| load_clip(&assets.join(key)).err().map(|error| format!("{key}: {error:#}")))
+            .filter_map(|key| decode(key).err().map(|error| format!("{key}: {error:#}")))
             .collect();
         assert!(failed.is_empty(), "clips that do not decode: {failed:#?}");
+    }
+
+    /// A clip played streamed, at another rate, from a start, round and
+    /// round with its pitch changing, and played to its end, is sample for
+    /// sample the clip played decoded whole; streamed, it keeps only its
+    /// bytes.
+    #[test]
+    fn streams_play_what_whole_clips_play() {
+        let samples: Vec<i16> = (0..2 * 33_075)
+            .map(|i| ((i as f64 * 0.0131).sin() * 9000.0 + (i as f64 * 0.17).sin() * 3000.0) as i16)
+            .collect();
+        let clips = [
+            wav(22_050, 2, &samples),
+            wav(48_000, 1, &samples[..40_000]),
+            include_bytes!("audio/testdata/tone.opus").to_vec(),
+        ];
+        for bytes in clips {
+            // The header both hosts decide by agrees with the decoders'.
+            let header = pen_runtime::clip::header(&bytes).unwrap();
+            let encoded = Encoded::new(bytes.into()).unwrap();
+            assert_eq!((header.frames as usize, f64::from(header.rate)), (encoded.frames, encoded.rate));
+            let whole = Arc::new(encoded.decode().unwrap()).at_rate(RATE);
+            let streamed = Arc::new(Clip::streamed(encoded)).at_rate(RATE);
+            assert!(streamed.frames.is_empty() && streamed.len() == whole.frames.len());
+            let play = |clip: &Arc<Clip>| {
+                let mut mixer = Mixer::new(RATE);
+                let mut out = Vec::new();
+                for frame in 0..150u32 {
+                    let looping = frame < 120;
+                    let voice = VoiceSpec {
+                        id: 1,
+                        clip: clip.clone(),
+                        bus: 0,
+                        gain: 0.8,
+                        pan: 0.3,
+                        pitch: 1.0 + 0.3 * (frame as f32 / 9.0).sin(),
+                        lowpass: mixer::OPEN,
+                        reverb: 0.0,
+                        looping,
+                        start: 0.37,
+                        fade_in: 0.0,
+                        fade_out: 0.0,
+                        panner: None,
+                    };
+                    mixer.apply(&Mix { voices: vec![voice], ..Mix::default() });
+                    let mut chunk = vec![[0.0f32; 2]; 800];
+                    mixer.render(&mut chunk);
+                    out.extend(chunk);
+                }
+                (out, mixer.underruns())
+            };
+            let ((whole, _), (streamed, underruns)) = (play(&whole), play(&streamed));
+            assert_eq!(underruns, 0);
+            assert!(whole.iter().any(|[left, _]| left.abs() > 0.1));
+            let first = whole.iter().zip(&streamed).position(|(a, b)| a != b);
+            assert_eq!(first, None, "streamed differs from sample {first:?}");
+        }
     }
 
     /// A voice of a stereo clip whose sides are a sine and a slower one,
@@ -480,6 +671,7 @@ mod tests {
             start: 0.0,
             fade_in: 0.0,
             fade_out: 0.0,
+            panner: None,
         };
         Mix { voices: vec![voice], ..Mix::default() }
     }
@@ -525,6 +717,79 @@ mod tests {
         assert_eq!(output.mixer.playing(), 1);
         output.start(44_100.0);
         assert_eq!((output.mixer.rate(), output.rate.get(), output.mixer.playing()), (44_100.0, 44_100.0, 0));
+    }
+
+    /// The live output hands its meters over to the game's side, takes the
+    /// developer's mute from it, and says how late it plays.
+    #[test]
+    fn live_output_meters_mutes_and_times() {
+        let (mut output, mixes, _applied) = output();
+        let shared = output.shared.clone();
+        mixes.try_send(stereo_voice(0.5)).unwrap();
+        let mut buffer = vec![0.0; 1024];
+        output.played(Some(0.010), 512);
+        output.fill(&mut buffer, 2);
+        let meters = shared.meters.lock().unwrap().0;
+        assert_eq!(meters[0].samples, 512);
+        assert!(meters[0].peak[0] > 0.1);
+        // 10 ms ahead, then half a callback and half a quantum on average.
+        let latency = f64::from_bits(shared.latency.load(Ordering::Relaxed));
+        assert!((latency - (0.010 + 320.0 / RATE)).abs() < 1e-9, "{latency}");
+        assert_eq!(shared.callback.load(Ordering::Relaxed), 512);
+        // Muting the master silences the output once its gain has glided.
+        shared.monitor.store(Monitor { muted: 1, soloed: 0 }.bits(), Ordering::Relaxed);
+        for _ in 0..20 {
+            output.fill(&mut buffer, 2);
+        }
+        assert!(buffer.iter().all(|sample| sample.abs() < 1e-4));
+    }
+
+    /// Latency is averaged over callbacks, and unknown until a device says.
+    #[test]
+    fn latency_averages_callbacks() {
+        let mut latency = Latency::default();
+        latency.measure(None, 512, RATE);
+        assert_eq!(latency.seconds, None);
+        latency.measure(Some(0.02), 832, RATE);
+        assert!((latency.seconds.unwrap() - 0.03).abs() < 1e-12);
+        latency.measure(Some(0.04), 832, RATE);
+        assert!((latency.seconds.unwrap() - 0.031).abs() < 1e-12);
+    }
+
+    /// Played live as a device would, in time, a streamed clip's voice
+    /// waits for its stream to begin and then never runs dry: the
+    /// streamer's thread keeps ahead of it.
+    #[test]
+    fn live_streams_keep_ahead() {
+        let samples: Vec<i16> = (0..48_000 * 3).map(|i| ((i as f64 * 0.05).sin() * 8000.0) as i16).collect();
+        let clip = Arc::new(Clip::streamed(Encoded::new(wav(48_000, 1, &samples).into()).unwrap()));
+        let (mut output, mixes, _applied) = output();
+        let voice = VoiceSpec {
+            id: 1,
+            clip,
+            bus: 0,
+            gain: 1.0,
+            pan: 0.0,
+            pitch: 1.5,
+            lowpass: mixer::OPEN,
+            reverb: 0.0,
+            looping: true,
+            start: 2.5,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            panner: None,
+        };
+        mixes.try_send(Mix { voices: vec![voice], ..Mix::default() }).unwrap();
+        let mut buffer = vec![0.0; CALLBACK * 2];
+        let mut heard = 0;
+        for _ in 0..60 {
+            output.fill(&mut buffer, 2);
+            heard += buffer.iter().filter(|sample| sample.abs() > 1e-3).count();
+            std::thread::sleep(std::time::Duration::from_secs_f64(CALLBACK as f64 / RATE));
+        }
+        assert_eq!(output.mixer.underruns(), 0);
+        assert_eq!(output.mixer.streaming(), 1);
+        assert!(heard > 50_000, "{heard}");
     }
 
     /// A 16-bit PCM WAV file of `samples`, interleaved.

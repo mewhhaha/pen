@@ -1,0 +1,4 @@
+{
+  "name": "sticky-arrows",
+  "capabilities": ["observe", "input"]
+}

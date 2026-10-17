@@ -14,9 +14,11 @@ use anyhow::Result;
 
 use crate::asset_store::{AssetKind, Material, Mesh, parse_material, parse_mesh, validate_asset_key};
 use crate::built_in::BuiltIn;
-use crate::packed_texture::{PackedHeader, PackedLevel, PackedReader, is_packed_texture};
+use crate::compressed::{self, LevelReader};
+use crate::packed_texture::{PackedHeader, PackedLevel};
 use crate::platform;
-use crate::shader::{self, PipelineContext, Pipelines, Variants};
+use crate::prefetch::{Prefetch, Prepared};
+use crate::shader::{self, PipelineContext, Pipelines, Stage, Variants};
 use crate::texture::DecodedImage;
 
 pub(crate) enum Job {
@@ -39,16 +41,19 @@ pub(crate) enum Job {
         variants: Variants,
         module: wgpu::ShaderModule,
         instancing: bool,
+        skinning: bool,
     },
-    /// Compile a depth-only pipeline, plain or instanced, once a loaded
-    /// material can cast shadows.
+    /// Compile a depth-only pipeline, plain, instanced or skinned, once a
+    /// loaded material can cast shadows.
     Shadow {
         slot: usize,
         revision: u64,
         module: wgpu::ShaderModule,
-        instanced: bool,
+        stage: Stage,
     },
     BuiltIn(BuiltIn),
+    /// Compile the pipeline that culls instances on the GPU.
+    Culling,
     /// Write the pipeline cache to its file.
     Persist,
 }
@@ -82,13 +87,14 @@ pub(crate) enum Message {
     Shadow {
         slot: usize,
         revision: u64,
-        instanced: bool,
+        stage: Stage,
         result: Result<wgpu::RenderPipeline, String>,
     },
     BuiltIn {
         which: BuiltIn,
         result: Result<wgpu::RenderPipeline, String>,
     },
+    Culling(Result<wgpu::ComputePipeline, String>),
     /// A packed texture's level went down its stream.
     Level,
 }
@@ -100,6 +106,11 @@ pub(crate) enum Loaded {
     Shader {
         module: wgpu::ShaderModule,
         instancing: bool,
+        skinning: bool,
+        /// Its `bounds_margin`, if it declares one.
+        margin: Option<f32>,
+        /// Whether it reads the cascaded shadow maps.
+        cascaded: bool,
     },
     SpriteShader(wgpu::RenderPipeline),
     Image(DecodedImage),
@@ -261,6 +272,9 @@ pub(crate) struct Worker {
     /// before its shader loads.
     needs: Arc<Mutex<Needs>>,
     results: Sender<Message>,
+    /// Assets read and decoded before the renderer was made, for their
+    /// first loads.
+    prefetch: Arc<Mutex<Option<Prefetch>>>,
 }
 
 /// What a material needs of its shader: which variants, and whether it
@@ -303,6 +317,7 @@ pub(crate) struct Loader {
     pub jobs: JobQueue,
     pub results: Receiver<Message>,
     pub needs: Arc<Mutex<Needs>>,
+    pub prefetch: Arc<Mutex<Option<Prefetch>>>,
     closed: Arc<AtomicBool>,
 }
 
@@ -323,14 +338,16 @@ impl Loader {
         let (sender, results) = channel();
         let closed = Arc::new(AtomicBool::new(false));
         let needs = Arc::new(Mutex::new(Needs::default()));
+        let prefetch = Arc::new(Mutex::new(None));
         let worker = Worker {
             root: root.to_string_lossy().into(),
             context,
             closed: closed.clone(),
             needs: needs.clone(),
             results: sender,
+            prefetch: prefetch.clone(),
         };
-        (worker, move |jobs| Loader { jobs, results, needs, closed })
+        (worker, move |jobs| Loader { jobs, results, needs, prefetch, closed })
     }
 }
 
@@ -352,6 +369,17 @@ impl Worker {
         platform::read_asset(&self.root, key).await
     }
 
+    /// The first of `keys` there is, or why the last is not.
+    async fn read_first(&self, keys: &[String]) -> Result<Vec<u8>> {
+        let (last, rest) = keys.split_last().expect("a key to read");
+        for key in rest {
+            if let Ok(bytes) = self.read(key).await {
+                return Ok(bytes);
+            }
+        }
+        self.read(last).await
+    }
+
     async fn run(&self, job: Job) {
         if self.closed.load(Ordering::Relaxed) {
             return;
@@ -366,20 +394,23 @@ impl Worker {
                     self.send(Message::Sorted { key, sprite });
                 }
             }
-            Job::Compile { slot, revision, samples, variants, module, instancing } => {
-                let result = self.compile(&module, instancing, samples, variants).await;
+            Job::Compile { slot, revision, samples, variants, module, instancing, skinning } => {
+                let result = self.compile(&module, instancing, skinning, samples, variants).await;
                 self.send(Message::Compiled { slot, revision, samples, variants, result });
             }
-            Job::Shadow { slot, revision, module, instanced } => {
+            Job::Shadow { slot, revision, module, stage } => {
                 let clock = platform::Clock::new();
-                let result =
-                    shader::checked(device, || shader::shadow_pipeline(&self.context, &module, instanced)).await;
-                log::debug!("shadow pipeline: slot {slot}, instanced {instanced}, {:.2} ms", clock.now() * 1000.0);
-                self.send(Message::Shadow { slot, revision, instanced, result });
+                let result = shader::checked(device, || shader::shadow_pipeline(&self.context, &module, stage)).await;
+                log::debug!("shadow pipeline: slot {slot}, {stage:?}, {:.2} ms", clock.now() * 1000.0);
+                self.send(Message::Shadow { slot, revision, stage, result });
             }
             Job::BuiltIn(which) => {
                 let result = shader::checked(device, || which.compile(&self.context)).await;
                 self.send(Message::BuiltIn { which, result });
+            }
+            Job::Culling => {
+                let result = shader::checked(device, || crate::renderer::culling_pipeline(&self.context)).await;
+                self.send(Message::Culling(result));
             }
             Job::Persist => self.context.cache.save(),
         }
@@ -389,16 +420,34 @@ impl Worker {
         &self,
         module: &wgpu::ShaderModule,
         instancing: bool,
+        skinning: bool,
         samples: u32,
         variants: Variants,
     ) -> Result<Pipelines, String> {
         let clock = platform::Clock::new();
         let result = shader::checked(&self.context.device, || {
-            shader::pipelines(&self.context, module, instancing, samples, variants)
+            shader::pipelines(&self.context, module, instancing, skinning, samples, variants)
         })
         .await;
         log::debug!("pipelines {variants:?} at {samples} samples: {:.2} ms", clock.now() * 1000.0);
         result
+    }
+
+    /// A material whose keys stay in the asset root, its need of its shader
+    /// noted.
+    fn material(&self, key: &str, material: Result<Material>) -> Result<Material> {
+        let material = material.and_then(|material| {
+            validate_asset_key(&material.shader)?;
+            for key in [&material.texture, &material.normal_texture, &material.layer_texture].into_iter().flatten() {
+                validate_asset_key(key)?;
+            }
+            Ok(material)
+        });
+        if let Ok(material) = &material {
+            let need = Need { variants: material.variants(), shadow: material.casts_shadow() };
+            self.needs.lock().unwrap().set(key, &material.shader, need);
+        }
+        material
     }
 
     async fn load(&self, slot: usize, kind: AssetKind, key: &str, revision: u64, early: bool) {
@@ -408,27 +457,48 @@ impl Worker {
             early,
             result: result.map_err(|error| format!("{error:#}")),
         };
-        let bytes = match self.read(key).await {
-            Ok(bytes) => bytes,
-            Err(error) => return self.send(loaded(Err(error))),
+        // An asset's first load takes what was read and decoded ahead.
+        let prepared = if revision == 1 {
+            self.prefetch.lock().unwrap().as_ref().and_then(|prefetch| prefetch.take(kind, key))
+        } else {
+            None
+        };
+        let bytes = match prepared {
+            Some(Prepared::Bytes(bytes)) => bytes,
+            Some(Prepared::Mesh(mesh)) => return self.send(loaded(Ok(Loaded::Mesh(*mesh)))),
+            Some(Prepared::Material(material)) => {
+                return self.send(loaded(self.material(key, Ok(material)).map(Loaded::Material)));
+            }
+            Some(Prepared::Image(image)) => return self.send(loaded(Ok(Loaded::Image(image)))),
+            Some(Prepared::Packed(header, levels)) => {
+                let (sender, receiver) = channel();
+                self.send(loaded(Ok(Loaded::Packed { header, levels: receiver })));
+                for level in levels.into_iter().map(LevelMessage::Level).chain([LevelMessage::Done]) {
+                    if sender.send(level).is_err() {
+                        return;
+                    }
+                    self.send(Message::Level);
+                }
+                return;
+            }
+            None => {
+                // A KTX2 texture's variant the device samples, if there is one.
+                let bytes = if kind == AssetKind::Texture {
+                    self.read_first(&compressed::candidates(key, self.context.device.features())).await
+                } else {
+                    self.read(key).await
+                };
+                match bytes {
+                    Ok(bytes) => bytes,
+                    Err(error) => return self.send(loaded(Err(error))),
+                }
+            }
         };
         let device = &self.context.device;
         match kind {
             AssetKind::Mesh => self.send(loaded(parse_mesh(&bytes).map(Loaded::Mesh))),
             AssetKind::Material => {
-                let material = parse_material(&bytes).and_then(|material| {
-                    validate_asset_key(&material.shader)?;
-                    for key in
-                        [&material.texture, &material.normal_texture, &material.layer_texture].into_iter().flatten()
-                    {
-                        validate_asset_key(key)?;
-                    }
-                    Ok(material)
-                });
-                if let Ok(material) = &material {
-                    let need = Need { variants: material.variants(), shadow: material.casts_shadow() };
-                    self.needs.lock().unwrap().set(key, &material.shader, need);
-                }
+                let material = self.material(key, parse_material(&bytes));
                 self.send(loaded(material.map(Loaded::Material)));
             }
             AssetKind::SpriteShader => {
@@ -443,21 +513,25 @@ impl Worker {
             AssetKind::Shader => {
                 let shader = shader::compile_shader(device, &bytes).await.map(|(module, code)| {
                     let instancing = shader::has_instancing(&code);
-                    Loaded::Shader { module, instancing }
+                    // A WebGL2-class device has no storage buffers for the
+                    // joints: its posed draws draw in their bind pose.
+                    let skinning = shader::has_skinning(&code) && !crate::downlevel::limited(device);
+                    let cascaded = code.contains("shadow_cascades");
+                    Loaded::Shader { module, instancing, skinning, margin: shader::bounds_margin(&code), cascaded }
                 });
                 self.send(loaded(shader));
             }
             AssetKind::Texture => {
-                if !is_packed_texture(&bytes) {
+                if !compressed::has_levels(&bytes) {
                     // An image, whole, its smaller levels drawn from it.
                     return self.send(loaded(platform::decode_image(bytes).await.map(Loaded::Image)));
                 }
-                let mut reader = match PackedReader::open(bytes) {
+                let mut reader = match LevelReader::open(bytes, device.features()) {
                     Ok(reader) => reader,
                     Err(error) => return self.send(loaded(Err(error))),
                 };
                 let (levels, receiver) = channel();
-                self.send(loaded(Ok(Loaded::Packed { header: reader.header, levels: receiver })));
+                self.send(loaded(Ok(Loaded::Packed { header: reader.header(), levels: receiver })));
                 // Each level, smallest first, as soon as it is inflated, until
                 // the texture is done with or the renderer closes.
                 loop {

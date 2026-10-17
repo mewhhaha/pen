@@ -1,0 +1,5 @@
+{
+  "shader": "lit.wgsl",
+  "color": [0.95, 0.75, 0.2, 1],
+  "lighting": "lit"
+}

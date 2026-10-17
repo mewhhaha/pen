@@ -138,6 +138,18 @@ impl Model {
     pub fn events(&self) -> &[Value] {
         array(&self.protocol["input"]["events"])
     }
+    /// The events pen's own Blot bindings decode: all but the one that
+    /// carries a game's own events (`"game": true`), which only the
+    /// bindings a checkout's declarations make decode.
+    pub fn core_events(&self) -> Vec<&Value> {
+        self.events().iter().filter(|event| event["game"] != true).collect()
+    }
+    /// The block of a game's own render sections after the packet, if the
+    /// schema has one.
+    pub fn extensions(&self) -> Option<&Value> {
+        let extensions = &self.protocol["render"]["extensions"];
+        extensions.is_object().then_some(extensions)
+    }
     pub fn event_lanes(&self) -> usize {
         1 + array(&self.protocol["input"]["lanes"]).len()
     }
@@ -242,6 +254,29 @@ fn symbol(name: &str) -> bool {
     chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
+/// A header lane's `default`, the value a blank frame gives it: a boolean
+/// for a flag, a number for an f32 or a count, and a number per component
+/// for a vector.
+fn default(value: &Value) -> Result<()> {
+    let default = &value["default"];
+    if default.is_null() {
+        return Ok(());
+    }
+    let number = |value: &Value| value.as_f64().is_some_and(|number| number.abs() <= f64::from(f32::MAX));
+    match kind(value) {
+        "flag" => ensure!(default.is_boolean(), "a flag's default is a boolean"),
+        "f32" => ensure!(number(default), "an f32's default is a number"),
+        "count" => integer(default)?,
+        "vector" => ensure!(
+            default.as_array().is_some_and(
+                |values| values.len() == array(&value["type"]["components"]).len() && values.iter().all(number)
+            ),
+            "a vector's default has a number per component"
+        ),
+        other => bail!("a {other} lane has no default"),
+    }
+    Ok(())
+}
 fn lane(value: &Value, header: bool) -> Result<()> {
     string(&value["kind"])?;
     if !value["doc"].is_null() {
@@ -289,6 +324,9 @@ fn lane(value: &Value, header: bool) -> Result<()> {
             ensure!(matches!(value["of"].as_str(), Some("count" | "lanes")), "invalid size lane");
         }
         other => bail!("unsupported lane kind {other}"),
+    }
+    if header {
+        default(value)?;
     }
     Ok(())
 }
@@ -367,10 +405,18 @@ pub fn build(protocol: Value) -> Result<Model> {
     }
     let mut tags = HashSet::new();
     let mut names = HashSet::new();
+    let mut game_events = 0;
     for event in array(&input["events"]) {
         integer(&event["tag"])?;
         string(&event["name"])?;
         ensure!(symbol(s(&event["name"])), "invalid event name");
+        if !event["game"].is_null() {
+            ensure!(event["game"].is_boolean(), "an event's game flag is a boolean");
+            if event["game"] == true {
+                game_events += 1;
+                ensure!(event["fields"].is_object() && event["hosts"].is_null(), "the game event has fields");
+            }
+        }
         ensure!(n(&event["tag"]) >= 1 && tags.insert(n(&event["tag"])), "invalid or duplicate event tag");
         ensure!(names.insert(s(&event["name"])), "duplicate event name");
         ensure!(event["value"].is_null() || event["fields"].is_null(), "event has both value and fields");
@@ -410,6 +456,7 @@ pub fn build(protocol: Value) -> Result<Model> {
         }
     }
     ensure!(!tags.is_empty(), "input requires events");
+    ensure!(game_events <= 1, "at most one event carries the game's own");
     let mut enumerations = HashSet::new();
     for value in array(&protocol["enumerations"]) {
         string(&value["name"])?;
@@ -435,6 +482,20 @@ pub fn build(protocol: Value) -> Result<Model> {
     }
     for key in ["header", "count", "length"] {
         string(&render["messages"][key])?;
+    }
+    let extensions = &render["extensions"];
+    if !extensions.is_null() {
+        ensure!(extensions.is_object(), "render extensions require an object");
+        integer(&extensions["marker"])?;
+        ensure!(n(&extensions["marker"]) < 1 << 24, "the extensions marker is a whole float32");
+        for key in ["max", "tag", "lanes"] {
+            ensure!(extensions[key].is_object(), "render extensions require a {key} limit");
+            validate_bound(&extensions[key])?;
+        }
+        string(&extensions["message"])?;
+        if !extensions["doc"].is_null() {
+            string(&extensions["doc"])?;
+        }
     }
     let mut header_lanes = 0;
     let header: Vec<_> = object(&render["header"])

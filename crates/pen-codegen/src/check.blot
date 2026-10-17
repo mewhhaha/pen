@@ -1,0 +1,54 @@
+//
+// Checks for a game's Blot tests, which `pen test-blot` runs: each test, an
+// `entry const test_...` taking Unit, returns `report` of the checks it
+// makes, in pen's report format (wit/pen-plugin.wit's `checks`).
+//
+//   entry const test_a_frame_moves_the_ball = fn () => check.report #[
+//     check.near 0.001 #[1.5] #[ball.x],
+//     check.holds (ball.bounces == 0),
+//   ]
+//
+// Blot has no text at run time, so a check has no label: a failure names
+// the test, the check's place in it (from 1), and what it expected against
+// what came.
+import * as array from "std/array"
+
+// A check's outcome: whether it passed, what it expected and what came.
+type Check is data = #Check { passed: Bool, expected: Array F32, actual: Array F32 }
+
+// Whether every lane of `actual` is `expected`'s to within `tolerance`.
+const agree = fn (tolerance: F32) => fn (expected: Array F32) => fn (actual: Array F32) => do:
+  if expected.length != actual.length:
+    return #False
+  for index in 0 .. expected.length:
+    if Bool.not (expected[index] == actual[index] || abs (expected[index] - actual[index]) <= tolerance):
+      return #False
+  return #True
+
+// `actual` is `expected`, lane for lane.
+const equal = fn (expected: Array F32) => fn (actual: Array F32) =>
+  #Check { passed: agree 0.0 expected actual, expected, actual }
+
+// `actual` is `expected` to within `tolerance` in every lane.
+const near = fn (tolerance: F32) => fn (expected: Array F32) => fn (actual: Array F32) =>
+  #Check { passed: agree tolerance expected actual, expected, actual }
+
+// `condition` holds.
+const holds = fn (condition: Bool) =>
+  #Check { passed: condition, expected: #[1.0], actual: #[if condition then 1.0 else 0.0] }
+
+// The report pen reads: the checks made, how many failed, then each
+// failure's place (from 1), its expected lanes' count and lanes, and its
+// actual lanes' count and lanes.
+const report = fn (checks: Array Check) => do:
+  let failed = 0
+  let failures = #[]
+  for index in 0 .. checks.length:
+    let made = checks[index]
+    if Bool.not made.passed:
+      failed := self + 1
+      failures := array.concat self (array.flatten #[
+        #[U32.to_f32 (index + 1), U32.to_f32 made.expected.length], made.expected,
+        #[U32.to_f32 made.actual.length], made.actual,
+      ])
+  return array.concat #[U32.to_f32 checks.length, U32.to_f32 failed] failures

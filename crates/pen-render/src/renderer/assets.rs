@@ -851,9 +851,12 @@ mod shadow_tests {
             assert!(state.shader(&crate::asset_store::parse_material(lit).unwrap()).unwrap().is_none());
         }
         // Plain and instanced; a shader without `vertex_skinned` has no skinned one.
-        pump(&mut state, |state| shader(state, shader_slot).shadow[..2].iter().all(Option::is_some));
+        // Other background work may still finish after them on a slow device
+        // (WARP): wait for it too, which must not need the frame thread.
+        pump(&mut state, |state| {
+            shader(state, shader_slot).shadow[..2].iter().all(Option::is_some) && state.pending() == 0
+        });
         assert!(shader(&state, shader_slot).shadow[2].is_none());
-        assert_eq!(state.pending(), 0);
         eprintln!(
             "late caster material and both shadow variants ready: {:.2} ms",
             caster_started.elapsed().as_secs_f64() * 1000.0

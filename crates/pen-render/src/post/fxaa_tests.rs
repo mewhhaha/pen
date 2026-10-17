@@ -95,7 +95,9 @@ struct Harness {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipelines: Vec<wgpu::RenderPipeline>,
-    timestamps: wgpu::QuerySet,
+    /// Absent on adapters without timestamps (Metal on CI's virtual Macs):
+    /// the images are still witnessed, the GPU cost is not measured.
+    timestamps: Option<wgpu::QuerySet>,
 }
 
 impl Harness {
@@ -103,14 +105,11 @@ impl Harness {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
             .expect("FXAA image witnesses require a real or software WebGPU adapter");
-        assert!(
-            adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY),
-            "FXAA GPU measurements require TIMESTAMP_QUERY support"
-        );
+        let timed = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let info = adapter.get_info();
         eprintln!("FXAA adapter: {} {:?} {:?}", info.name, info.backend, info.device_type);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features: wgpu::Features::TIMESTAMP_QUERY,
+            required_features: if timed { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() },
             ..Default::default()
         }))
         .expect("FXAA GPU device creation failed");
@@ -148,10 +147,12 @@ impl Harness {
                 })
             })
             .collect();
-        let timestamps = device.create_query_set(&wgpu::QuerySetDescriptor {
-            label: Some("FXAA measurements"),
-            ty: wgpu::QueryType::Timestamp,
-            count: 128,
+        let timestamps = timed.then(|| {
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("FXAA measurements"),
+                ty: wgpu::QueryType::Timestamp,
+                count: 128,
+            })
         });
         Self { device, queue, pipelines, timestamps }
     }
@@ -248,7 +249,7 @@ impl Harness {
             if measure && index >= 16 {
                 let query = (index - 16) * 2;
                 timestamp_writes = Some(wgpu::RenderPassTimestampWrites {
-                    query_set: &self.timestamps,
+                    query_set: self.timestamps.as_ref().expect("measured on an adapter with timestamps"),
                     beginning_of_pass_write_index: Some(query),
                     end_of_pass_write_index: Some(query + 1),
                 });
@@ -284,7 +285,12 @@ impl Harness {
             mapped_at_creation: false,
         });
         if measure {
-            encoder.resolve_query_set(&self.timestamps, 0..128, &resolve, 0);
+            encoder.resolve_query_set(
+                self.timestamps.as_ref().expect("measured on an adapter with timestamps"),
+                0..128,
+                &resolve,
+                0,
+            );
             encoder.copy_buffer_to_buffer(&resolve, 0, &query_read, 0, 1024);
         }
         let image = self.read_texture(&target, encoder);
@@ -567,7 +573,10 @@ fn fxaa_quality_images_motion_resize_and_gpu_cost() {
         save(&root, &format!("resize-{}x{}.png", output.0, output.1), &image, output);
     }
 
-    for size in [(1920, 1080), (2560, 1440)] {
+    if gpu.timestamps.is_none() {
+        eprintln!("FXAA GPU cost not measured: the adapter has no TIMESTAMP_QUERY");
+    }
+    for size in [(1920, 1080), (2560, 1440)].into_iter().filter(|_| gpu.timestamps.is_some()) {
         let input = raster("fence", size.0, size.1, 0.0, 1);
         let half: Vec<u8> =
             input.iter().flat_map(|value| crate::renderer::half_of(f32::from(*value) / 255.0).to_le_bytes()).collect();

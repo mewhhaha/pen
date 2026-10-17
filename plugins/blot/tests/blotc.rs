@@ -58,6 +58,21 @@ fn compiler() -> &'static Path {
     })
 }
 
+/// Whether blot2's compiler and standard library are here. Without the
+/// sibling checkout (CI's Linux job has none) a test skips, saying why; with
+/// PEN_REQUIRE_FIXTURES=1 (CI's game job, which checks blot2 out) it fails.
+fn present() -> bool {
+    let compiler =
+        std::env::var_os("BLOT_TEST_COMPILER").is_some() || sibling("blot2/generated/compiler/blotc.gz").is_file();
+    if compiler && sibling("blot2/std").is_dir() {
+        return true;
+    }
+    let required = std::env::var_os("PEN_REQUIRE_FIXTURES").is_some_and(|value| !value.is_empty() && value != "0");
+    assert!(!required, "no ../blot2 compiler and std, and PEN_REQUIRE_FIXTURES is set");
+    eprintln!("skipped: no ../blot2 compiler and std");
+    false
+}
+
 /// blot2's standard library.
 fn std_root() -> String {
     std::fs::canonicalize(sibling("blot2/std")).unwrap().display().to_string()
@@ -135,6 +150,9 @@ fn rejected(build: Result<Build, String>) -> Vec<Diagnostic> {
 
 #[test]
 fn says_hello_opens_and_closes() {
+    if !present() {
+        return;
+    }
     let project = Project::new(&[("main.blot", MAIN), ("lib.blot", LIB)]);
     let mut session = project.open(json!({ "std": std_root() })).unwrap();
     assert_eq!(session.identity().len(), 64);
@@ -147,6 +165,9 @@ fn says_hello_opens_and_closes() {
 
 #[test]
 fn builds_a_program() {
+    if !present() {
+        return;
+    }
     let project = Project::new(&[("main.blot", MAIN), ("lib.blot", LIB)]);
     let mut session = project.open(json!({ "std": std_root() })).unwrap();
     built(session.build(&[]));
@@ -161,6 +182,9 @@ fn builds_a_program() {
 
 #[test]
 fn native_assets_survive_edits_rejections_and_restarts() {
+    if !present() {
+        return;
+    }
     let project = Project::new(&[
         (
             "main.blot",
@@ -191,6 +215,9 @@ fn native_assets_survive_edits_rejections_and_restarts() {
 
 #[test]
 fn rejects_a_type_error_where_it_is() {
+    if !present() {
+        return;
+    }
     let main =
         "import * as lib from \"./lib\"\n\nconst wrong: Bool = lib.base\n\nentry const answer = fn () => wrong\n";
     let project = Project::new(&[("main.blot", main), ("lib.blot", LIB)]);
@@ -213,6 +240,9 @@ fn rejects_a_type_error_where_it_is() {
 
 #[test]
 fn builds_overlays_over_the_files_for_one_build() {
+    if !present() {
+        return;
+    }
     let project = Project::new(&[("main.blot", MAIN), ("lib.blot", LIB)]);
     let mut session = project.open(json!({ "std": std_root() })).unwrap();
     let on_disk = built(session.build(&[]));
@@ -234,6 +264,9 @@ fn builds_overlays_over_the_files_for_one_build() {
 
 #[test]
 fn an_overlay_without_contents_hides_a_file() {
+    if !present() {
+        return;
+    }
     let project = Project::new(&[("main.blot", MAIN), ("lib.blot", LIB)]);
     let mut session = project.open(json!({ "std": std_root() })).unwrap();
     let hidden = Overlay { path: project.path("lib.blot"), contents: None };
@@ -248,6 +281,9 @@ fn an_overlay_without_contents_hides_a_file() {
 
 #[test]
 fn a_killed_compiler_fails_and_stays_failed() {
+    if !present() {
+        return;
+    }
     let project = Project::new(&[("main.blot", MAIN), ("lib.blot", LIB)]);
     let mut id = None;
     let mut session = open(&project.root, &project.path("main.blot"), json!({ "std": std_root() }), &mut id).unwrap();
@@ -265,6 +301,9 @@ fn a_killed_compiler_fails_and_stays_failed() {
 
 #[test]
 fn refuses_a_compiler_it_did_not_expect() {
+    if !present() {
+        return;
+    }
     let project = Project::new(&[("main.blot", MAIN), ("lib.blot", LIB)]);
     let identity = "0".repeat(64);
     let error = project.open(json!({ "std": std_root(), "expectedIdentity": identity })).err().unwrap();
@@ -276,6 +315,9 @@ fn refuses_a_compiler_it_did_not_expect() {
 /// place of `src/test_fixture.blot`, with gdev's compiler settings (its
 /// pen.json's). Skipped without the checkout.
 fn gdev_math() -> Option<(PathBuf, Vec<u8>)> {
+    if !present() {
+        return None;
+    }
     let gdev = std::fs::canonicalize(sibling("gdev")).ok()?;
     let math = gdev.join("tests/math.blot");
     let Ok(config) = std::fs::read_to_string(gdev.join("pen.json")) else {

@@ -314,10 +314,11 @@ older versions.
 
 Its shared libraries are `libsteam_api.so` (found through the RUNPATH
 `$ORIGIN`, beside it), `libasound.so.2` and `libdbus-1.so.3` (audio: cpal's
-ALSA backend, and rtkit for a real-time audio thread), and glibc's own
+ALSA backend, and rtkit for a real-time audio thread), `libudev.so.1`
+(gamepads, through gilrs), and glibc's own
 (`libc`, `libm`, `libpthread`, `libdl`, `ld-linux-x86-64`), all in the
 Steam Linux Runtime and on SteamOS. Linking passes
-`--allow-shlib-undefined` because this machine's libasound and libdbus were
+`--allow-shlib-undefined` because this machine's libasound, libdbus and libudev were
 themselves built against glibc 2.44; the player's system has its own
 builds. The window system (X11, Wayland, xkbcommon) and Vulkan are loaded
 at run time by winit and wgpu, not linked.

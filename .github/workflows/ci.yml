@@ -37,12 +37,13 @@ jobs:
         if: ${{ vars.GDEV_REPOSITORY == '' || vars.BLOT2_REPOSITORY == '' || vars.GDEV_REF == '' || vars.BLOT2_REF == '' || vars.INK_REPOSITORY == '' || vars.INK_REF == '' }}
         run: echo "::warning title=Game tests skipped::Set the GDEV_REPOSITORY, GDEV_REF, BLOT2_REPOSITORY, BLOT2_REF, INK_REPOSITORY and INK_REF repository variables and the CHECKOUTS_TOKEN secret to run them."
       - name: System libraries
-        # ALSA and D-Bus for audio (cpal), CMake for libopus, lavapipe for
-        # the GPU tests, ffmpeg for the recording tests.
+        # ALSA and D-Bus for audio (cpal), udev for gamepads (gilrs), CMake
+        # for libopus, lavapipe for the GPU tests, ffmpeg for the recording
+        # tests.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config cmake libasound2-dev libdbus-1-dev mesa-vulkan-drivers ffmpeg
+            pkg-config cmake libasound2-dev libdbus-1-dev libudev-dev mesa-vulkan-drivers ffmpeg
       - name: Rust (rust-toolchain.toml)
         run: |
           rustup toolchain install --profile minimal
@@ -135,7 +136,7 @@ jobs:
       - name: System libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config cmake libasound2-dev libdbus-1-dev
+          sudo apt-get install -y --no-install-recommends pkg-config cmake libasound2-dev libdbus-1-dev libudev-dev
       - name: Rust (rust-toolchain.toml)
         run: |
           rustup toolchain install --profile minimal
@@ -272,7 +273,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config cmake libasound2-dev libdbus-1-dev mesa-vulkan-drivers ffmpeg
+            pkg-config cmake libasound2-dev libdbus-1-dev libudev-dev mesa-vulkan-drivers ffmpeg
       - name: Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
       - uses: mlugg/setup-zig@v2

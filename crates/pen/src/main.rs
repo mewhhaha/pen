@@ -1076,14 +1076,15 @@ const OPTIONS: [OptionSpec; 100] = [
         value: "STEPS",
         commands: &["", "dev", "run", "bench", "packets", "fuzz"],
         place: Place::Play,
-        about: "scripted input: wait=N key=K down=K up=K type=T move=X,Y click=X,Y press=B release=B \
+        about: "scripted input: wait=N key=K down=K up=K type=T move=X,Y glide=X,Y,FRAMES click=X,Y press=B release=B \
                 drag=X,Y,X,Y wheel=D[,X,Y] shot=NAME save=F load=F quit; ui=ID,ACTION[,VALUE] (an assistive \
                 technology's action on an interface node: focus, blur, activate, increment, decrement, \
                 set_value, expand or collapse); tune=NAME=VALUE (a live-tunable constant of the checkout's \
                 src/tunables.json); overlay=/COMMAND[,ARG...] (a line typed into the dev tools' console); \
                 pad=connect|disconnect|BUTTON[,VALUE]|AXIS,VALUE (a gamepad); touch=ID,X,Y lift=ID (a touch \
                 screen); motion=DX,DY (the locked mouse); compose=TEXT[,CURSOR] commit=TEXT (an input method); \
-                overlay-shot=NAME (a shot with the dev tools over it)",
+                overlay-shot=NAME (a shot with the dev tools over it); glide eases from the last scripted pointer \
+                position (initially 0,0) over positive FRAMES, then continues; move is instant",
     },
     OptionSpec {
         name: "--script-file",

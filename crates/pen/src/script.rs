@@ -1,9 +1,13 @@
 //! Scripted input, a step at a time: `wait=N` frames, `key=KEY` taps a key, `down=KEY` /
-//! `up=KEY` hold and release it, `type=TEXT`, `move=X,Y`, `click=X,Y`,
+//! `up=KEY` hold and release it, `type=TEXT`, `move=X,Y`, `glide=X,Y,FRAMES`, `click=X,Y`,
 //! `press=BUTTON` / `release=BUTTON` (left, middle or right),
 //! `drag=X,Y,X,Y`, `wheel=DELTA[,X,Y]`, `shot=NAME` (a PNG in the shots
 //! directory), `overlay-shot=NAME` (the same with the dev tools over it),
 //! `save=FILE` / `load=FILE` (quicksaves), and `quit`.
+//!
+//! `glide` eases from the current scripted pointer position to its destination
+//! over a positive number of frames, then runs the next step. It only moves:
+//! `press=left glide=600,300,45 release=left` makes a smooth drag. `move` is instant.
 //!
 //! `ui=ID,ACTION[,VALUE]` does what assistive technology does to a node of
 //! the game's interface (see `accessibility`): ID is the node's id, decimal
@@ -74,6 +78,11 @@ pub enum Step {
     Up(String),
     Type(String),
     Move(f32, f32),
+    Glide {
+        x: f32,
+        y: f32,
+        frames: u32,
+    },
     Click(f32, f32),
     Press(u32),
     Release(u32),
@@ -280,6 +289,15 @@ pub fn parse(arguments: &[String]) -> Result<Vec<Step>> {
                 let at = numbers(value, 2, "move")?;
                 Step::Move(at[0], at[1])
             }
+            "glide" => {
+                let usage =
+                    || format!("glide takes X,Y,FRAMES with finite coordinates and positive whole frames, not {value}");
+                let (position, frames) = value.rsplit_once(',').with_context(usage)?;
+                let at = numbers(position, 2, "glide")?;
+                let frames = frames.trim().parse::<u32>().ok().filter(|frames| *frames > 0).with_context(usage)?;
+                ensure!(at.iter().all(|number| number.is_finite()), usage());
+                Step::Glide { x: at[0], y: at[1], frames }
+            }
             "click" => {
                 let at = numbers(value, 2, "click")?;
                 Step::Click(at[0], at[1])
@@ -400,7 +418,7 @@ pub struct Tick {
 }
 
 /// Plays steps one frame at a time: each input step takes a frame, a tap
-/// or click releases on the next, and a drag moves over several.
+/// or click releases on the next, and a glide or drag moves over several.
 pub struct Script {
     steps: VecDeque<Step>,
     /// Frames of events already worked out, from the next frame on.
@@ -416,6 +434,15 @@ pub struct Script {
     touches: Touches,
     /// An input method's composition is open (a commit ends it).
     composing: bool,
+    glide: Option<Glide>,
+}
+
+/// Work out one position per frame, without queuing a duration's worth of events.
+struct Glide {
+    from: (f32, f32),
+    to: (f32, f32),
+    frames: u32,
+    elapsed: u32,
 }
 
 /// A key pressed: its KeyDown, and the character it types, if it types one.
@@ -439,11 +466,12 @@ impl Script {
             touched: Vec::new(),
             touches: Touches::default(),
             composing: false,
+            glide: None,
         }
     }
 
     pub fn done(&self) -> bool {
-        self.steps.is_empty() && self.queued.is_empty() && self.waiting == 0
+        self.steps.is_empty() && self.queued.is_empty() && self.waiting == 0 && self.glide.is_none()
     }
 
     /// Whether every step has been taken, though the last may still play out.
@@ -464,10 +492,29 @@ impl Script {
         self.queued[frame].push(event);
     }
 
+    fn advance_glide(&mut self) -> Option<GameEvent> {
+        let glide = self.glide.as_mut()?;
+        glide.elapsed += 1;
+        let t = glide.elapsed as f32 / glide.frames as f32;
+        let eased = t * t * (3.0 - 2.0 * t);
+        self.pointer =
+            (glide.from.0 * (1.0 - eased) + glide.to.0 * eased, glide.from.1 * (1.0 - eased) + glide.to.1 * eased);
+        if glide.elapsed == glide.frames {
+            self.pointer = glide.to;
+            self.glide = None;
+        }
+        let (x, y) = self.pointer;
+        Some(GameEvent::PointerMove { x, y })
+    }
+
     pub fn tick(&mut self, viewport: Viewport) -> Tick {
         let scale = viewport.width as f32 / PAGE_WIDTH;
         let mut tick = Tick { events: self.queued.pop_front().unwrap_or_default(), ..Tick::default() };
         if !self.queued.is_empty() {
+            return tick;
+        }
+        if let Some(event) = self.advance_glide() {
+            tick.events.push(event);
             return tick;
         }
         if self.waiting > 0 {
@@ -501,6 +548,10 @@ impl Script {
                 self.pointer = at(x, y);
                 let (x, y) = self.pointer;
                 tick.events.push(GameEvent::PointerMove { x, y });
+            }
+            Step::Glide { x, y, frames } => {
+                self.glide = Some(Glide { from: self.pointer, to: at(x, y), frames, elapsed: 0 });
+                tick.events.extend(self.advance_glide());
             }
             Step::Click(x, y) => {
                 self.pointer = at(x, y);
@@ -633,6 +684,89 @@ mod tests {
         assert_eq!(frames[4].events, [GameEvent::PointerUp { button: 0, x: 960.0, y: 640.0 }]);
         assert_eq!(frames[4].shots, ["start"]);
         assert!(frames[5].quit && script.done());
+    }
+
+    #[test]
+    fn parses_glides_with_positive_whole_frame_counts() {
+        assert_eq!(parse(&["glide=-12.5,320,45".into()]).unwrap(), [Step::Glide { x: -12.5, y: 320.0, frames: 45 }]);
+        for wrong in [
+            "glide=1,2",
+            "glide=1,2,0",
+            "glide=1,2,-1",
+            "glide=1,2,1.5",
+            "glide=1,2,NaN",
+            "glide=NaN,2,30",
+            "glide=1,inf,30",
+            "glide=1,2,4294967296",
+            "glide=1,2,3,4",
+        ] {
+            assert!(parse(&[wrong.into()]).is_err(), "{wrong}");
+        }
+    }
+
+    #[test]
+    fn glides_ease_over_exact_frames_and_release_after_arrival() {
+        let mut script =
+            Script::new(parse(&["move=100,200 press=left glide=500,400,4 release=left shot=arrived".into()]).unwrap());
+        assert_eq!(script.tick(VIEW).events, [GameEvent::PointerMove { x: 200.0, y: 400.0 }]);
+        assert_eq!(script.tick(VIEW).events, [GameEvent::PointerDown { button: 0, x: 200.0, y: 400.0 }]);
+        // Smaller distances at the ends, a larger one through the middle.
+        for (x, y) in [(325.0, 462.5), (600.0, 600.0), (875.0, 737.5), (1000.0, 800.0)] {
+            let frame = script.tick(VIEW);
+            assert_eq!(frame.events, [GameEvent::PointerMove { x, y }]);
+            assert!(frame.shots.is_empty());
+            assert!(!script.done());
+        }
+        assert_eq!(script.tick(VIEW).events, [GameEvent::PointerUp { button: 0, x: 1000.0, y: 800.0 }]);
+        assert_eq!(script.tick(VIEW).shots, ["arrived"]);
+        assert!(script.done());
+    }
+
+    #[test]
+    fn glides_follow_clicks_wheels_and_other_glides() {
+        let mut script = Script::new(
+            parse(&["click=100,200 glide=200,300,2 wheel=1,300,400 glide=500,600,2 glide=500,600,1".into()]).unwrap(),
+        );
+        script.tick(VIEW);
+        assert_eq!(
+            script.tick(VIEW).events,
+            [GameEvent::PointerUp { button: 0, x: 200.0, y: 400.0 }, GameEvent::PointerMove { x: 300.0, y: 500.0 }]
+        );
+        assert_eq!(script.tick(VIEW).events, [GameEvent::PointerMove { x: 400.0, y: 600.0 }]);
+        assert_eq!(script.tick(VIEW).events, [GameEvent::Wheel { delta: 1.0, x: 600.0, y: 800.0 }]);
+        assert_eq!(script.tick(VIEW).events, [GameEvent::PointerMove { x: 800.0, y: 1000.0 }]);
+        assert_eq!(script.tick(VIEW).events, [GameEvent::PointerMove { x: 1000.0, y: 1200.0 }]);
+        assert!(!script.done());
+        assert_eq!(script.tick(VIEW).events, [GameEvent::PointerMove { x: 1000.0, y: 1200.0 }]);
+        assert!(script.done());
+    }
+
+    #[test]
+    fn a_final_glide_finishes_only_when_it_reaches_its_destination() {
+        for viewport in [VIEW, Viewport { width: 960, height: 640 }] {
+            let mut script = Script::new(parse(&["glide=480,320,2".into()]).unwrap());
+            assert_eq!(
+                script.tick(viewport).events,
+                [GameEvent::PointerMove { x: viewport.width as f32 * 0.25, y: viewport.height as f32 * 0.25 }]
+            );
+            assert!(!script.done());
+            assert_eq!(
+                script.tick(viewport).events,
+                [GameEvent::PointerMove { x: viewport.width as f32 * 0.5, y: viewport.height as f32 * 0.5 }]
+            );
+            assert!(script.done());
+            assert!(script.tick(viewport).events.is_empty());
+        }
+    }
+
+    #[test]
+    fn glides_between_distant_offscreen_positions_without_overflowing() {
+        let viewport = Viewport { width: 960, height: 640 };
+        let mut script = Script::new(parse(&["move=-3e38,0 glide=3e38,0,2".into()]).unwrap());
+        script.tick(viewport);
+        assert_eq!(script.tick(viewport).events, [GameEvent::PointerMove { x: 0.0, y: 0.0 }]);
+        assert_eq!(script.tick(viewport).events, [GameEvent::PointerMove { x: 3e38, y: 0.0 }]);
+        assert!(script.done());
     }
 
     #[test]

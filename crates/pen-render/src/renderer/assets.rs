@@ -86,24 +86,26 @@ impl ShaderAsset {
     }
 }
 
-pub(super) fn texture_views(
-    device: &wgpu::Device,
-    texture: &wgpu::Texture,
-    finest: u32,
-) -> (wgpu::TextureView, wgpu::TextureView) {
+pub(super) fn texture_views(texture: &wgpu::Texture, finest: u32) -> (wgpu::TextureView, wgpu::TextureView) {
     let levels = |format: Option<wgpu::TextureFormat>| wgpu::TextureViewDescriptor {
         format,
         base_mip_level: finest,
         mip_level_count: Some(texture.mip_level_count() - finest),
         ..Default::default()
     };
-    let linear = crate::downlevel::linear_format(device, texture.format());
+    let linear = texture.format().remove_srgb_suffix();
     (texture.create_view(&levels(None)), texture.create_view(&levels(Some(linear))))
 }
 
+/// The formats a texture of `format` is also viewed in: an sRGB colour texture
+/// (a compressed one too) is read as linear data too (normal maps).
+fn view_formats(format: wgpu::TextureFormat) -> Vec<wgpu::TextureFormat> {
+    if format.is_srgb() { vec![format.remove_srgb_suffix()] } else { Vec::new() }
+}
+
 /// A texture with all its levels there.
-pub(super) fn whole(device: &wgpu::Device, texture: wgpu::Texture, view_id: u64) -> TextureAsset {
-    let (view, linear) = texture_views(device, &texture, 0);
+pub(super) fn whole(texture: wgpu::Texture, view_id: u64) -> TextureAsset {
+    let (view, linear) = texture_views(&texture, 0);
     TextureAsset { texture, view, linear, view_id, resident: 0, shown: 0.0, seen: false, stream: None }
 }
 
@@ -155,7 +157,7 @@ pub(super) fn texture_from(
             | wgpu::TextureUsages::COPY_DST
             | if levels > 1 { wgpu::TextureUsages::RENDER_ATTACHMENT } else { wgpu::TextureUsages::empty() },
         // Reinterpret the same allocation as linear data for object-space normals.
-        view_formats: &crate::downlevel::view_formats(device, format),
+        view_formats: &view_formats(format),
     });
     queue.write_texture(
         texture.as_image_copy(),
@@ -533,7 +535,7 @@ impl State {
                     )
                 });
                 let texture = texture.map_err(|error| format!("{error:#}"))?;
-                Ok(Some((GpuAsset::Texture(whole(&device, texture, id)), Some(check))))
+                Ok(Some((GpuAsset::Texture(whole(texture, id)), Some(check))))
             }
             Loaded::Packed { header, levels } => {
                 let limit = device.limits().max_texture_dimension_2d;
@@ -550,7 +552,7 @@ impl State {
                         format: header.format,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                         // Reinterpret the same allocation as linear data for normal maps.
-                        view_formats: &crate::downlevel::view_formats(&device, header.format),
+                        view_formats: &view_formats(header.format),
                     })
                 });
                 let check = match shader::settled(&mut check) {
@@ -623,7 +625,7 @@ impl State {
                     self.retire(previous);
                 }
                 Ok(()) => {
-                    let (view, linear) = texture_views(&self.device, &pending.texture, pending.finest);
+                    let (view, linear) = texture_views(&pending.texture, pending.finest);
                     let asset = TextureAsset {
                         texture: pending.texture,
                         view,
@@ -669,7 +671,7 @@ impl State {
                     match levels.try_recv() {
                         Ok(LevelMessage::Level(level)) => {
                             upload_level(&self.queue, &texture.texture, &level);
-                            (texture.view, texture.linear) = texture_views(&self.device, &texture.texture, level.level);
+                            (texture.view, texture.linear) = texture_views(&texture.texture, level.level);
                             texture.resident = level.level;
                             new_views = true;
                             // A level nobody saw the coarser one before needs

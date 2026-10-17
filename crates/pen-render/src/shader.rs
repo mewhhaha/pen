@@ -86,7 +86,13 @@ pub(crate) fn settled(check: &mut Check) -> Option<Result<(), String>> {
 /// A WGSL module, or the compiler's errors.
 pub(crate) async fn compile_shader(device: &wgpu::Device, bytes: &[u8]) -> Result<(wgpu::ShaderModule, String)> {
     let code = std::str::from_utf8(bytes)?.to_owned();
-    let module = checked(device, || crate::downlevel::shader_module(device, None, &code)).await;
+    let module = checked(device, || {
+        device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(code.as_str().into()),
+        })
+    })
+    .await;
     match module {
         Ok(module) => Ok((module, code)),
         Err(message) => bail!(message),

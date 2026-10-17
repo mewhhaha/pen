@@ -1,10 +1,9 @@
-//! The canvas on WebGPU, or on WebGL2 where the browser has no WebGPU: the
-//! game's renderer, and the dev tools' sharing its device, drawing into the
-//! canvas's surface.
+//! The canvas on WebGPU: the game's renderer, and the dev tools' sharing its
+//! device, drawing into the canvas's surface.
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result};
 use futures_channel::oneshot;
 use pen_protocol::{Catalog, RenderFrame, Viewport};
 use pen_render::{Display, RenderTarget, Renderer, RendererOptions};
@@ -77,7 +76,7 @@ impl RenderTarget for Canvas {
 }
 
 pub struct Screen {
-    /// The graphics adapter's name, and whether it is WebGPU's or WebGL2's.
+    /// The graphics adapter's name.
     pub adapter: String,
     pub renderer: Renderer,
     /// The dev tools' sprites, over the game's frame.
@@ -85,56 +84,33 @@ pub struct Screen {
     pub canvas: Canvas,
     /// The GPU finished the last frame submitted: the next waits for it.
     in_flight: Option<oneshot::Receiver<()>>,
-    /// Drawing through WebGL2, wgpu's GL backend.
-    webgl: bool,
 }
 
 impl Screen {
     pub async fn new(element: HtmlCanvasElement, assets: String) -> Result<Self> {
         let veil = Some(0.6);
-        // WebGPU if the browser can give an adapter, else WebGL2. That is
-        // settled before the canvas has a context: one asked for "webgpu"
-        // cannot give "webgl2".
-        let instance = wgpu::util::new_instance_with_webgpu_detection(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU | wgpu::Backends::GL,
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::BROWSER_WEBGPU,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
-        })
-        .await;
-        let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(element.clone()))?;
+        });
+        let no_webgpu = "this browser has no WebGPU, which the game draws with";
+        let surface = instance.create_surface(wgpu::SurfaceTarget::Canvas(element.clone())).context(no_webgpu)?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 ..Default::default()
             })
-            .await?;
+            .await
+            .context(no_webgpu)?;
         let info = adapter.get_info();
-        let webgl = info.backend == wgpu::Backend::Gl;
-        let descriptor = if webgl {
-            // The scene draws in floating point, and decals read a float
-            // copy of its depth (pen-render's downlevel.rs).
-            for format in [wgpu::TextureFormat::Rgba16Float, wgpu::TextureFormat::R32Float] {
-                let usages = adapter.get_texture_format_features(format).allowed_usages;
-                ensure!(
-                    usages.contains(wgpu::TextureUsages::RENDER_ATTACHMENT),
-                    "this browser's WebGL2 cannot draw into {format:?} textures (EXT_color_buffer_float), and it has \
-                     no WebGPU"
-                );
-            }
-            // WebGL2 meets few of WebGPU's default limits: what it has. It
-            // has no storage buffers, which pen-render draws without.
-            wgpu::DeviceDescriptor { required_limits: adapter.limits(), ..Default::default() }
-        } else {
-            wgpu::DeviceDescriptor::default()
-        };
         // With the texture compression the adapter offers, and timestamps,
         // which time the GPU's passes for the dev tools, where it has them.
         let descriptor =
-            wgpu::DeviceDescriptor { required_features: pen_render::optional_features(&adapter), ..descriptor };
+            wgpu::DeviceDescriptor { required_features: pen_render::optional_features(&adapter), ..Default::default() };
         let (device, queue) = adapter.request_device(&descriptor).await?;
-        let api = if webgl { "WebGL2" } else { "WebGPU" };
         // The API first: the diagnostics cut long names short.
-        let name = if info.name.is_empty() { api.to_owned() } else { format!("{api}: {}", info.name) };
+        let name = if info.name.is_empty() { "WebGPU".to_owned() } else { format!("WebGPU: {}", info.name) };
         // Once each: an error a frame repeats would otherwise flood the console.
         let reported = Mutex::new(HashSet::new());
         device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
@@ -179,7 +155,7 @@ impl Screen {
         let renderer = Renderer::new(device.clone(), queue.clone(), options)?;
         let overlay = renderer.share(assets.into())?;
         let canvas = Canvas { element, queue, surface, config, device, frame: None, pinned: None };
-        Ok(Self { adapter: name, renderer, overlay, canvas, in_flight: None, webgl })
+        Ok(Self { adapter: name, renderer, overlay, canvas, in_flight: None })
     }
 
     /// Follows the canvas's size and the display's density: the backing
@@ -205,9 +181,7 @@ impl Screen {
     /// Draws the game's frame and the dev tools' over it. One frame is in
     /// flight: the GPU draws it while the next is computed, and the next
     /// waits for it before it is submitted, which bounds the queue on slow
-    /// adapters (frame callbacks alone put no brake on WebGPU). WebGL2 bounds
-    /// its own, and tells of work done only when polled after the page's
-    /// task has ended: nothing waits on it there.
+    /// adapters (frame callbacks alone put no brake on WebGPU).
     pub async fn draw(&mut self, game: &RenderFrame, overlay: Option<&RenderFrame>, catalog: &Catalog) -> Result<()> {
         if let Some(previous) = self.in_flight.take() {
             let _ = previous.await;
@@ -223,9 +197,6 @@ impl Screen {
         }
         if let Some(frame) = self.canvas.frame.take() {
             self.canvas.queue.present(frame);
-        }
-        if self.webgl {
-            return Ok(());
         }
         let (done, finished) = oneshot::channel();
         self.canvas.queue.on_submitted_work_done(move || {

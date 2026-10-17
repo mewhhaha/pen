@@ -5,13 +5,10 @@
 // axis and faded toward its ends, a lit material's texture darkens it and an
 // unlit one's paints over it. Only surfaces whose material takes decals are
 // touched: the scene pass marks them in the stencil (DECAL_MARK), and the
-// decal pass tests for the mark. A device without storage buffers reads the
-// decals from a uniform array a window of them at a time, and the depth from
-// a copy (downlevel.rs).
+// decal pass tests for the mark.
 use pen_protocol::RenderFrame;
 
 use crate::built_in::{BuiltIn, BuiltIns};
-use crate::downlevel::{DepthCopy, Window, array_usage};
 use crate::matrix::{invert, multiply, narrow};
 use crate::post::SCENE_FORMAT;
 use crate::shader::PipelineContext;
@@ -20,12 +17,10 @@ use crate::shader::PipelineContext;
 pub(crate) const DECAL_MARK: u32 = 2;
 // Model and inverse matrices, then color times opacity, per decal.
 const DECAL_FLOATS: usize = 36;
-#[allow(clippy::cast_possible_truncation, reason = "36 floats")]
-const DECAL_BYTES: u32 = DECAL_FLOATS as u32 * 4;
 
 const SHADER: &str = include_str!("shaders/decals.wgsl");
 
-pub(crate) fn shader(samples: u32) -> String {
+fn shader(samples: u32) -> String {
     SHADER.replace("${depth_texture}", if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" })
 }
 
@@ -49,7 +44,10 @@ pub(crate) struct DecalBatch {
 pub(crate) fn pipeline(context: &PipelineContext, samples: u32, paint: bool) -> wgpu::RenderPipeline {
     use wgpu::{BlendComponent, BlendFactor, BlendOperation};
     let device = &context.device;
-    let module = crate::downlevel::shader_module(device, Some("decals"), &shader(samples));
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("decals"),
+        source: wgpu::ShaderSource::Wgsl(shader(samples).into()),
+    });
     let keep = wgpu::StencilFaceState {
         compare: wgpu::CompareFunction::Equal,
         pass_op: wgpu::StencilOperation::Keep,
@@ -114,10 +112,6 @@ pub(crate) fn pipeline(context: &PipelineContext, samples: u32, paint: bool) -> 
 pub(crate) struct Decals {
     view_uniform: wgpu::Buffer,
     sampler: wgpu::Sampler,
-    /// How the decals are bound, and the depth they read, where there are
-    /// no storage buffers.
-    window: Option<Window>,
-    depth_copy: Option<DepthCopy>,
     capacity: usize,
     storage: Option<wgpu::Buffer>,
     data: Vec<f32>,
@@ -137,37 +131,15 @@ impl Decals {
                 min_filter: wgpu::FilterMode::Linear,
                 ..Default::default()
             }),
-            window: Window::of(device, DECAL_BYTES),
-            depth_copy: crate::downlevel::limited(device).then(|| DepthCopy::new(device)),
             capacity: 0,
             storage: None,
             data: Vec::new(),
         }
     }
 
-    /// The depth decals read, `depth` being a `size` scene's depth alone:
-    /// that view, or on a device that cannot read it while it is attached, a
-    /// copy of it made now.
-    pub fn depth(
-        &mut self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        depth: &wgpu::TextureView,
-        size: (u32, u32),
-    ) -> wgpu::TextureView {
-        match &mut self.depth_copy {
-            Some(copy) => {
-                let target = copy.target(device, size);
-                copy.copy(device, encoder, depth);
-                target
-            }
-            None => depth.clone(),
-        }
-    }
-
     /// Draws `batches` of the frame's decals (by their indices in `order`)
     /// into `pass`, whose depth and stencil are read-only and whose depth
-    /// `depth` holds (from `depth()`), for a frame of `frame`'s view.
+    /// `depth` also views, for a frame of `frame`'s view.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
@@ -188,11 +160,10 @@ impl Decals {
         }
         if count > self.capacity {
             self.capacity = count.next_power_of_two();
-            let room = self.window.map_or(self.capacity, |window| window.room(self.capacity));
             self.storage = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("decals"),
-                size: (room * DECAL_FLOATS * 4) as u64,
-                usage: array_usage(self.window),
+                size: (self.capacity * DECAL_FLOATS * 4) as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
         }
@@ -218,40 +189,19 @@ impl Decals {
         for batch in batches {
             let selected = built_ins.get(BuiltIn::Decal { samples, paint: batch.paint });
             pass.set_pipeline(selected);
-            let group = |offset: u32| {
-                let decals = wgpu::BufferBinding {
-                    buffer: &storage,
-                    offset: u64::from(offset),
-                    size: self.window.and_then(|window| wgpu::BufferSize::new(window.bytes())),
-                };
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &selected.get_bind_group_layout(0),
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: self.view_uniform.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Buffer(decals) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth) },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&batch.texture),
-                        },
-                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    ],
-                })
-            };
-            let instances = batch.first..batch.first + batch.count;
-            match self.window {
-                None => {
-                    pass.set_bind_group(0, &group(0), &[]);
-                    pass.draw(0..36, instances);
-                }
-                Some(window) => {
-                    for (offset, instances) in window.draws(instances) {
-                        pass.set_bind_group(0, &group(offset), &[]);
-                        pass.draw(0..36, instances);
-                    }
-                }
-            }
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &selected.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.view_uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: storage.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&batch.texture) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..36, batch.first..batch.first + batch.count);
         }
     }
 }

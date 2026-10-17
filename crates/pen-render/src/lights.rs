@@ -197,9 +197,6 @@ pub(crate) fn validate(lights: &[Light]) -> Result<()> {
 /// The layout of group 2 of every mesh pipeline: the grid, the lights, each
 /// cluster's range and the lights' indices.
 pub(crate) fn group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    // A WebGL2-class device has no storage buffers: the grid alone, of no
-    // lights, which shaders reading the lights cannot draw with there.
-    let limited = crate::downlevel::limited(device);
     let storage = |binding: u32| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -226,7 +223,7 @@ pub(crate) fn group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             storage(1),
             storage(2),
             storage(3),
-        ][..if limited { 1 } else { 4 }],
+        ],
     })
 }
 
@@ -254,13 +251,10 @@ fn grid(lights: u32, slicing: &Slicing, size: (u32, u32)) -> [u32; 12] {
 }
 
 fn storage(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
-    // Never bound where the device has no storage buffers.
-    let storage =
-        if crate::downlevel::limited(device) { wgpu::BufferUsages::empty() } else { wgpu::BufferUsages::STORAGE };
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size: bytes.max(16),
-        usage: storage | wgpu::BufferUsages::COPY_DST,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
 }
@@ -315,20 +309,14 @@ impl Clusters {
             wgpu::BindGroupEntry { binding: 2, resource: ranges.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: indices.as_entire_binding() },
         ];
-        // The grid alone where the layout has no storage buffers.
-        let bound = if crate::downlevel::limited(device) { 1 } else { entries.len() };
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("lights"),
-            layout,
-            entries: &entries[..bound],
-        })
+        device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("lights"), layout, entries: &entries })
     }
 
     /// Sorts `frame`'s lights into the clusters of its view, on a picture
     /// of `size` pixels.
     pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &RenderFrame, size: (u32, u32)) {
         let count = u32::try_from(frame.lights.len()).unwrap_or(u32::MAX);
-        if count == 0 || crate::downlevel::limited(device) {
+        if count == 0 {
             queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&[0u32; 12]));
             return;
         }

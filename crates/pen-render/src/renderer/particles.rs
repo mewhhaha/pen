@@ -81,7 +81,10 @@ pub(crate) fn living(emitter: &Emitter) -> Option<Living> {
 pub(crate) fn pipeline(context: &PipelineContext, samples: u32, additive: bool) -> wgpu::RenderPipeline {
     use wgpu::{BlendComponent, BlendFactor, BlendOperation};
     let device = &context.device;
-    let module = crate::downlevel::shader_module(device, Some("particles"), QUADS);
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("particles"),
+        source: wgpu::ShaderSource::Wgsl(QUADS.into()),
+    });
     let color = BlendComponent {
         src_factor: BlendFactor::One,
         dst_factor: if additive { BlendFactor::One } else { BlendFactor::OneMinusSrcAlpha },
@@ -232,9 +235,7 @@ impl State {
             particles.group = None;
             particles.total = 0;
         }
-        // A WebGL2-class device has neither compute shaders nor storage
-        // buffers to simulate particles with: it draws none.
-        if frame.emitters.is_empty() || crate::downlevel::limited(&self.device) {
+        if frame.emitters.is_empty() {
             return Ok(());
         }
         if self.particles.is_none() {

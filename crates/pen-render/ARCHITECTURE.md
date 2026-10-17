@@ -1,8 +1,8 @@
 # How pen-render works
 
 pen-render draws a game's render packets (`pen_protocol::RenderFrame`) with
-wgpu. It runs natively (Vulkan, DX12, Metal) and in the browser (WebGPU, or
-WebGL2 where there is none) from the same code. The host owns the window, the device and the frame loop. It
+wgpu. It runs natively (Vulkan, DX12, Metal) and in the browser (WebGPU) from
+the same code. The host owns the window, the device and the frame loop. It
 calls `Renderer::submit` once per frame, and calls `Renderer::overlay` to draw
 another program's sprites, such as pen's dev tools, over a finished frame.
 [Measurements](../../docs/render-performance.md) cover load times, frame
@@ -357,33 +357,6 @@ magnification.
 WGSL lives in `src/shaders/`. A `${name}` in a template is filled in with
 `str::replace`, for example the sample count or the shared `toned` function.
 Material shaders are assets, read from the asset root.
-
-## WebGL2
-
-A device without storage buffers is taken to be WebGL2-class (wgpu's GL
-backend in a browser without WebGPU), and `downlevel.rs` draws on it:
-
-- Shaders are rewritten in naga's IR and handed to wgpu as such. Each
-  read-only storage array (`var<storage, read> X: array<T>`: sprites, decals)
-  becomes a uniform array of as many elements as one uniform binding holds,
-  at most 64 KiB. Sprites and decals are drawn a window of that many at a
-  time, bound at offsets the device's alignment allows, the instances
-  counted from the window's start. A depth texture a shader only reads with
-  `textureLoad`, which GLSL ES 3.0 cannot, becomes a float texture over the
-  same depth view.
-- Multisampled textures cannot be sampled: the scene draws with one sample
-  a pixel. Insets keep 4, as nothing samples theirs before they resolve.
-- A depth-stencil attachment cannot be read while attached, so decals read
-  a copy of the depth (R32Float); and a stencil cannot be sampled, so a
-  stencil-tested pass copies the aberration's marks into an R8Uint texture
-  the present pass reads.
-- A texture cannot be viewed in another format, so an sRGB texture's linear
-  view reads it decoded (a PNG normal map would be off; packed normal maps
-  are linear already).
-
-Natively, a device asked for `wgpu::Limits::downlevel_webgl2_defaults()`
-takes the same path, which `tests/downlevel.rs` compares with the storage
-buffer path on the same packet, and on wgpu's GL backend where there is one.
 
 ## Logging
 

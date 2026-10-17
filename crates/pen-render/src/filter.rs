@@ -230,7 +230,10 @@ impl Pass {
                 },
             ],
         });
-        let module = crate::downlevel::shader_module(device, Some("colour filter"), SHADER);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("colour filter"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("colour filter"),
             bind_group_layouts: &[Some(&layout)],

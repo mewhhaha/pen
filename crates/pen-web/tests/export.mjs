@@ -33,8 +33,6 @@ async function settled(page) {
     controlled: Boolean(navigator.serviceWorker?.controller),
     isolated: crossOriginIsolated,
     jspi: typeof WebAssembly.Suspending === 'function',
-    // A canvas drawn through WebGPU has no WebGL2 context to give.
-    graphics: document.querySelector('canvas').getContext('webgl2') ? 'WebGL2' : 'WebGPU',
     caches: await Promise.all((await caches.keys()).map(async name => [name, (await (await caches.open(name)).keys()).length])),
   }));
 }
@@ -76,7 +74,7 @@ for (const encoded of [true, false]) {
     console.log(`${host}: the service worker took the first visit over (${brotli.length} Brotli copies fetched), `
       + `and a visit with the host gone played from its cache (${offline.caches.map(([, count]) => count).join('+')} files kept)`
       + `${offline.isolated ? ', cross-origin isolated' : ''}${offline.jspi ? '' : ', the game in workers (no JSPI)'}`
-      + `, drawn through ${offline.graphics} in ${browserName}`);
+      + ` in ${browserName}`);
   } catch (error) {
     evidence.push({ host, failure: String(error), messages, requests: server.requests });
     throw error;

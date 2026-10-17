@@ -54,7 +54,7 @@ impl State {
                     view_formats: &[],
                 });
                 let id = self.view_id();
-                let field = whole(&self.device, texture, id);
+                let field = whole(texture, id);
                 match found {
                     Some(index) => {
                         let old = std::mem::replace(&mut self.fields[index].1, field);

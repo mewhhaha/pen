@@ -26,9 +26,7 @@ log = "0.4"
 pollster = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# The naga IR a limited device's shaders are rewritten in (downlevel.rs).
-naga = { version = "30", features = ["wgsl-in"] }
-wgpu = { workspace = true, features = ["naga-ir"] }
+wgpu.workspace = true
 
 # Natively, asset files are read and decoded on loader threads.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -60,5 +58,3 @@ web-sys = { version = "0.3.106", features = [
 # The asset pipeline's encoders and MSDF atlases, for what the tests draw.
 pen-texture = { workspace = true, features = ["tools"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-# Translating the shaders as wgpu's WebGL2 backend does.
-naga = { version = "30", features = ["glsl-out"] }

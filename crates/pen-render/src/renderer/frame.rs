@@ -397,7 +397,6 @@ impl State {
         }
         if layered {
             let decals = self.decals.get_or_insert_with(|| Decals::new(&device));
-            let depth = decals.depth(&device, &mut encoder, &targets.depth_only, targets.size);
             {
                 let mut decal_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("decals"),
@@ -418,7 +417,7 @@ impl State {
                     frame,
                     &scratch.decals,
                     &scratch.decal_order,
-                    &depth,
+                    &targets.depth_only,
                     samples,
                     targets.size,
                 );

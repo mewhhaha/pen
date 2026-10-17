@@ -278,8 +278,7 @@ endpoint. The dev tools' `/export` and `/import` move saves as files, and
 `/record` makes a link that replays the input (`#replay=` or
 `?replay=FILE.penrec`; a recording dropped onto the page plays too).
 
-The host requires WebGPU or WebGL2 (where it draws with one sample a pixel),
-a secure context (HTTPS or localhost), and either WebAssembly JSPI or a
+The host requires WebGPU, a secure context (HTTPS or localhost), and either WebAssembly JSPI or a
 cross-origin isolated page, where it runs the game's programs in workers. `just install` includes it; `PEN_WEB_HOST=DIR` selects another build.
 The server answers only to its own loopback address and port, and Bake takes
 only JSON posted from its own page.

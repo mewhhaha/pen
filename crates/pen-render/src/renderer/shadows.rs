@@ -23,17 +23,9 @@ pub(super) struct ShadowMaps {
     texture: wgpu::Texture,
     layers: Vec<wgpu::TextureView>,
     all: wgpu::TextureView,
-    /// What binding 1 reads on a WebGL2-class device (`depth_array`).
-    flat: Option<wgpu::TextureView>,
 }
 
 fn depth_array(device: &wgpu::Device, label: &str, texels: u32, layers: u32) -> ShadowMaps {
-    // GL (WebGL2) fixes a texture's kind when it is made, from its layers: an
-    // array of one would be a 2D texture its array view cannot read, and a
-    // layer of an array cannot be read as a 2D texture there, so binding 1
-    // reads a flat stand-in instead (shaders reading the maps read binding 3).
-    let limited = crate::downlevel::limited(device);
-    let layers = if limited { layers.max(2) } else { layers };
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d { width: texels, height: texels, depth_or_array_layers: layers },
@@ -57,20 +49,7 @@ fn depth_array(device: &wgpu::Device, label: &str, texels: u32, layers: u32) -> 
         dimension: Some(wgpu::TextureViewDimension::D2Array),
         ..Default::default()
     });
-    let flat = limited.then(|| {
-        let flat = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("flat shadow stand-in"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        flat.create_view(&Default::default())
-    });
-    ShadowMaps { texture, layers, all, flat }
+    ShadowMaps { texture, layers, all }
 }
 
 /// A scene bind group: its uniform, the game's map (`game`, else the first
@@ -90,9 +69,7 @@ fn scene_group(
             wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(
-                    maps.flat.as_ref().unwrap_or_else(|| game.unwrap_or(&maps.layers[0])),
-                ),
+                resource: wgpu::BindingResource::TextureView(game.unwrap_or(&maps.layers[0])),
             },
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&maps.all) },

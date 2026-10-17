@@ -182,11 +182,12 @@ impl Screen {
         if !display.decodes() {
             return Screen { display, pipeline: None, uniform: None, picture: None };
         }
-        let module = crate::downlevel::shader_module(
-            device,
-            Some("decode"),
-            &DECODE.replace("${fullscreen}", include_str!("shaders/fullscreen.wgsl")),
-        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("decode"),
+            source: wgpu::ShaderSource::Wgsl(
+                DECODE.replace("${fullscreen}", include_str!("shaders/fullscreen.wgsl")).into(),
+            ),
+        });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("decode"),
             layout: None,

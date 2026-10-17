@@ -186,8 +186,8 @@ itch:
 
 # The export as hosts serve it, in a headless browser on the GPU: the service
 # worker, Brotli copies and offline play (export.mjs); recordings and saves
-# as files and links (files.mjs). PEN_WEB_WITHOUT=jspi,webgpu takes those
-# away and PEN_WEB_BROWSER=firefox runs Firefox (crates/pen-web/tests/launch.mjs).
+# as files and links (files.mjs). PEN_WEB_WITHOUT=jspi takes JSPI away and
+# PEN_WEB_BROWSER=firefox runs Firefox (crates/pen-web/tests/launch.mjs).
 browser-files: browser-tools
   #!/usr/bin/env bash
   set -euo pipefail

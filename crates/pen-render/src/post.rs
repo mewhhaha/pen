@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use pen_protocol::{Matrix, Quality, RenderFrame};
 
 use crate::built_in::{BuiltIn, BuiltIns};
-use crate::downlevel::{DepthCopy, MARKS_FORMAT, Marks};
 use crate::graph::{Binding, Graph, GraphBuilder, Handle, Spec, Target};
 use crate::matrix::{invert, multiply};
 use crate::packed_texture::level_size;
@@ -209,8 +208,6 @@ struct Targets {
     /// The graph of the passes after the scene; with TAA, one for each
     /// history texture it reads, turn about.
     graphs: Vec<Graph>,
-    /// The stencil's marks copied out, where it cannot be sampled.
-    marks: Option<wgpu::TextureView>,
 }
 
 /// The attachments of one frame's scene passes, from `Post::begin`.
@@ -265,7 +262,10 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
         }
     };
     let label = format!("{which:?}");
-    let module = crate::downlevel::shader_module(&context.device, Some(&label), &code);
+    let module = context.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(&label),
+        source: wgpu::ShaderSource::Wgsl(code.into()),
+    });
     context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(&label),
         layout: None,
@@ -298,10 +298,6 @@ pub(crate) struct Post {
     unoccluded: wgpu::Texture,
     unbloomed: wgpu::Texture,
     targets: Option<Targets>,
-    /// What copies the marks, where the stencil cannot be sampled, and the
-    /// depth, where it cannot be read as it is (downlevel.rs).
-    marks: Option<Marks>,
-    depth_copy: Option<DepthCopy>,
     /// The begun frame's quality and output size.
     quality: Option<Quality>,
     size: (u32, u32),
@@ -368,8 +364,6 @@ impl Post {
             unoccluded: single(wgpu::TextureFormat::R8Unorm, 255),
             unbloomed: single(SCENE_FORMAT, 0),
             targets: None,
-            marks: None,
-            depth_copy: crate::downlevel::limited(device).then(|| DepthCopy::new(device)),
             quality: None,
             size: (1, 1),
             jitters: 0,
@@ -453,20 +447,9 @@ impl Post {
             let multisampled =
                 (samples > 1).then(|| texture(device, width, height, attachment, samples, SCENE_FORMAT, 1));
             let scene = texture(device, width, height, sampled, 1, SCENE_FORMAT, 1);
-            // The depth that ambient occlusion and the sky and fog read: a
-            // copy where the device cannot read it as it is.
-            let read_depth = match &mut self.depth_copy {
-                Some(copy) => copy.target(device, (width, height)),
-                None => depth_only(),
-            };
-            // The stencil's marks, copied where it cannot be sampled.
-            let copied = crate::downlevel::limited(device)
-                .then(|| texture(device, width, height, sampled, 1, MARKS_FORMAT, 1).create_view(&Default::default()));
-            let marks = copied.clone().unwrap_or_else(|| {
-                depth.create_view(&wgpu::TextureViewDescriptor {
-                    aspect: wgpu::TextureAspect::StencilOnly,
-                    ..Default::default()
-                })
+            let marks = depth.create_view(&wgpu::TextureViewDescriptor {
+                aspect: wgpu::TextureAspect::StencilOnly,
+                ..Default::default()
             });
             let view = |texture: &wgpu::Texture| texture.create_view(&Default::default());
             // With TAA, a graph for each history texture read, sharing the
@@ -477,7 +460,7 @@ impl Post {
             for read in 0..if taa { 2 } else { 1 } {
                 let history = histories.as_ref().map(|textures| [view(&textures[read]), view(&textures[1 - read])]);
                 let graph = self
-                    .graph(built_ins, key, read_depth.clone(), view(&scene), marks.clone(), history, graphs.first())
+                    .graph(built_ins, key, depth_only(), view(&scene), marks.clone(), history, graphs.first())
                     .expect("the passes after the scene read only what earlier ones draw");
                 log::debug!("passes after the scene: {:?}, {} textures", graph.names(), graph.allocations());
                 graphs.push(graph);
@@ -489,7 +472,6 @@ impl Post {
                 multisampled: multisampled.as_ref().map(view),
                 scene: view(&scene),
                 graphs,
-                marks: copied,
             });
         }
         // The scene's samples move within their pixels from frame to frame.
@@ -658,18 +640,6 @@ impl Post {
                 0.0f32,
             ]),
         );
-        // Where the device cannot sample the stencil or read the depth as it
-        // is, copies of them first (downlevel.rs).
-        if let Some(marks) = &self.targets.as_ref().unwrap().marks {
-            let copier = self.marks.get_or_insert_with(|| Marks::new(&self.device));
-            copier.copy(encoder, marks, &self.targets.as_ref().unwrap().depth);
-        }
-        let key = self.targets.as_ref().unwrap().key;
-        if let Some(copy) = &self.depth_copy
-            && (key.occluding || key.atmosphere || key.taa)
-        {
-            copy.copy(&self.device, encoder, &self.targets.as_ref().unwrap().depth_only);
-        }
         self.targets.as_ref().unwrap().graphs[graph].execute(encoder, built_ins, output, timer);
     }
 }

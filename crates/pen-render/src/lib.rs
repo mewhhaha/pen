@@ -2,8 +2,8 @@
 //! and brush solids with shadows and clustered point and spot lights, decals,
 //! sky and fog, bloom, FXAA and TAA, SDR or HDR output, sprites (MSDF text
 //! among them) and insets, over assets (KTX2 compressed textures among them)
-//! that stream in on loader threads. Natively and in the browser (WebGPU, or
-//! WebGL2) alike. See ARCHITECTURE.md for how it works.
+//! that stream in on loader threads. Natively and in the browser (WebGPU)
+//! alike. See ARCHITECTURE.md for how it works.
 pub mod animation;
 mod asset_store;
 mod built_in;
@@ -11,7 +11,6 @@ mod compressed;
 mod culling;
 mod decals;
 mod display;
-mod downlevel;
 mod filter;
 mod graph;
 mod inspect;

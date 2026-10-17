@@ -459,7 +459,10 @@ fn vector(v: &Vector) -> [f32; 4] {
 /// shader implies.
 fn overlay_pipeline(context: &PipelineContext, code: &str, label: &str) -> wgpu::RenderPipeline {
     let device = &context.device;
-    let module = crate::downlevel::shader_module(device, Some(label), &code.replace("${tonedWgsl}", TONED_WGSL));
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(code.replace("${tonedWgsl}", TONED_WGSL).into()),
+    });
     let premultiplied = wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::One,
         dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
@@ -767,7 +770,7 @@ impl State {
         let mut built_in = |id: u64, size: (u32, u32), pixels: &[u8]| -> Result<TextureAsset> {
             let texture =
                 texture_from(&device, &queue, &mut mipmaps, size, pixels, wgpu::TextureFormat::Rgba8UnormSrgb, false)?;
-            Ok(whole(&device, texture, id))
+            Ok(whole(texture, id))
         };
         let white = built_in(1, (1, 1), &[255, 255, 255, 255])?;
         let flat_normal = built_in(2, (1, 1), &[128, 128, 255, 255])?;

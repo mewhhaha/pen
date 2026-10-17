@@ -49,7 +49,7 @@ pub(crate) fn pipeline(context: &PipelineContext) -> wgpu::ComputePipeline {
 }
 
 /// Whether the device can cull on the GPU: compute shaders, and storage
-/// buffers enough (a WebGL2 device has neither).
+/// buffers enough.
 fn supported(device: &wgpu::Device) -> bool {
     let limits = device.limits();
     limits.max_compute_workgroups_per_dimension > 0
@@ -198,7 +198,7 @@ impl GpuCulling {
 
     /// Whether its pipeline is compiling.
     pub fn compiling(&self) -> bool {
-        // A device that cannot cull on the GPU (WebGL2-class) never asks.
+        // A device that cannot cull on the GPU never asks.
         self.supported && self.requested && self.pipeline.is_none() && !self.failed
     }
 

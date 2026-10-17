@@ -15,12 +15,8 @@ use crate::asset_store::Material;
 use crate::shader::{Stage, Variants};
 
 /// Group 3 of a skinned pipeline (after the lights): the draw's joint matrices, read by its
-/// vertices, at a dynamic offset into the frame's. Empty on a WebGL2-class
-/// device, which has no storage buffers and draws nothing skinned.
+/// vertices, at a dynamic offset into the frame's.
 pub(super) fn group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-    if crate::downlevel::limited(device) {
-        return device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("skin"), entries: &[] });
-    }
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("skin"),
         entries: &[wgpu::BindGroupLayoutEntry {
@@ -144,7 +140,7 @@ impl Skinning {
     /// Writes the frame's palettes for its draws to bind; the bind group,
     /// if any draw is posed.
     pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) {
-        if self.data.is_empty() || crate::downlevel::limited(device) {
+        if self.data.is_empty() {
             return;
         }
         // Room for the last palette's whole binding past its offset.

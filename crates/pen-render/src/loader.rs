@@ -513,9 +513,7 @@ impl Worker {
             AssetKind::Shader => {
                 let shader = shader::compile_shader(device, &bytes).await.map(|(module, code)| {
                     let instancing = shader::has_instancing(&code);
-                    // A WebGL2-class device has no storage buffers for the
-                    // joints: its posed draws draw in their bind pose.
-                    let skinning = shader::has_skinning(&code) && !crate::downlevel::limited(device);
+                    let skinning = shader::has_skinning(&code);
                     let cascaded = code.contains("shadow_cascades");
                     Loaded::Shader { module, instancing, skinning, margin: shader::bounds_margin(&code), cascaded }
                 });

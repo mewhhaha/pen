@@ -2,21 +2,8 @@
 
 `pen-web` is the browser front end: Rust input, frame scheduling, WebAudio,
 platform services, IndexedDB saves and the game's Blot dev tools, drawn through
-`pen-render` on WebGPU, or on WebGL2 where the browser has no WebGPU.
-
-A browser without WebGPU (no `navigator.gpu`, or no adapter from it, as in
-Firefox on Linux) draws through WebGL2 with wgpu's GL backend. The choice is
-made before the canvas has a context, and the diagnostics name the adapter
-"WebGL2: …" (or "WebGPU: …"). The device asks for the limits the adapter
-has, which include no storage buffers: pen-render then draws sprites and
-decals from uniform arrays, a window of them at a time, copies the depth and
-the stencil's marks where its passes read them, and draws the scene with one
-sample a pixel, FXAA still smoothing it (`crates/pen-render/src/downlevel.rs`).
-The host is larger for it: 2.8 MB (1.1 MB gzipped) against 0.8 MB with
-WebGPU alone, as wgpu's GL backend and naga come with it. The scene draws in
-floating point, so WebGL2 needs `EXT_color_buffer_float`, which desktop
-browsers have; without it the page says so. WebGL2 bounds its own queue, so
-frames do not wait there for the GPU to finish the one before.
+`pen-render` on WebGPU. A browser without WebGPU cannot run the game: the
+page says so.
 
 `pen-runtime` contains what native pen and the browser share: request
 validation and the frame protocol, the guest ABI manifest, transactional
@@ -68,7 +55,7 @@ with the export's file list and version (a hash of its files) filled in. With
 `--zip FILE` it also writes the site as a ZIP to upload, and warns where
 itch.io would refuse it (over 1000 files, 500 MB, 200 MB a file or 240
 characters a path). gdev's export: 482 files, 126 of 229 precompressed (39.4
-MB of them as 10.1 MB of Brotli, the host's 2.9 MB Wasm as 0.8 MB), a 76.4
+MB of them as 10.1 MB of Brotli, the host's 2.6 MB Wasm as 0.8 MB), a 76.4
 MB ZIP, made in 40 s with Brotli on four threads.
 
 The service worker (registered by `index.html`, except on `?dev` pages, which
@@ -194,10 +181,9 @@ against a fresh export and a running `pen web`.
 
 `tests/launch.mjs` opens the browser for the harnesses: `PEN_WEB_BROWSER`
 picks Chromium (the default) or Firefox (`just browser-tools` fetches it with
-`PEN_WEB_BROWSER=firefox`), and `PEN_WEB_WITHOUT=jspi,webgpu` takes those away
-from pages (deleting `WebAssembly.Suspending` and `Navigator.prototype.gpu`
-before their scripts run, and in Firefox through its preferences), as browsers
-without them are. `tests/serve.mjs` serves an export as hosts do: plainly, as
+`PEN_WEB_BROWSER=firefox`), and `PEN_WEB_WITHOUT=jspi` takes JSPI away from
+pages (deleting `WebAssembly.Suspending` before their scripts run, and in
+Firefox through its preferences), as browsers without it are. `tests/serve.mjs` serves an export as hosts do: plainly, as
 itch.io does (`.br` files with `Content-Encoding: br`), cross-origin isolated,
 or gone (offline). `tests/export.mjs` checks the service worker takes the first
 visit over, fetches the Brotli copies only where the host decodes them, and

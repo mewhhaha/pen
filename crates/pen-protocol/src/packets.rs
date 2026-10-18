@@ -830,6 +830,11 @@ pub mod types {
         /// lists each player in order, events or none. Outside one there are none, and every
         /// event is player 0's.
         Player { index: u32 },
+        /// The host session started, once after creating the game or restoring its initial save
+        /// and before live frames. restored is 1 when the initial save matched the game's state
+        /// schema and was restored, otherwise 0. Reloads, loads, rewinds and replays do not
+        /// send it; it is not recorded as input.
+        SessionStarted { restored: u32 },
         /// One of the game's own events, which its pen.json `protocol` declares: its tag there,
         /// and up to three values. Hosts send them only to a game that declares them, whose
         /// generated pen/extensions.blot decodes them; pen's own bindings leave them out.
@@ -1732,6 +1737,7 @@ pub mod codec {
         pub const PAN: u32 = 24;
         pub const PINCH: u32 = 25;
         pub const PLAYER: u32 = 26;
+        pub const SESSION_STARTED: u32 = 27;
         pub const GAME: u32 = 100;
     }
 
@@ -1833,6 +1839,7 @@ pub mod codec {
             GameEvent::Pan { touches, dx, dy } => [24.0, *touches as f32, *dx, *dy, 0.0],
             GameEvent::Pinch { x, y, scale } => [25.0, 0.0, *x, *y, *scale],
             GameEvent::Player { index } => [26.0, *index as f32, 0.0, 0.0, 0.0],
+            GameEvent::SessionStarted { restored } => [27.0, *restored as f32, 0.0, 0.0, 0.0],
             GameEvent::Game { event, a, b, c } => [100.0, *event as f32, *a, *b, *c],
         }
     }
@@ -2523,6 +2530,7 @@ pub mod codec {
                 GameEvent::Pan { touches, dx, dy } => out.extend([24.0, *touches as f32, *dx, *dy]),
                 GameEvent::Pinch { x, y, scale } => out.extend([25.0, *x, *y, *scale]),
                 GameEvent::Player { index } => out.extend([26.0, *index as f32]),
+                GameEvent::SessionStarted { restored } => out.extend([27.0, *restored as f32]),
                 GameEvent::Game { event, a, b, c } => out.extend([100.0, *event as f32, *a, *b, *c]),
             }
         }

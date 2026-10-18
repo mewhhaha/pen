@@ -45,11 +45,11 @@ const MAX_INTEGER: u32 = 16_777_215;
 const CASES: u64 = 2000;
 const SEED: u64 = 0x5eed_c0de_ca5e_0000;
 /// GameEvent's variants, which `variant` numbers.
-const VARIANTS: usize = 28;
+const VARIANTS: usize = 29;
 /// The first of them, which pen's own bindings decode: all but Game, the
 /// game's own events, which only a checkout that declares them decodes (its
 /// pen/extensions.blot), so the random frames leave it out.
-const CORE_VARIANTS: usize = 27;
+const CORE_VARIANTS: usize = 28;
 
 #[test]
 fn input_packets_mean_the_same_to_rust_and_blot() {
@@ -450,7 +450,8 @@ fn variant(event: &GameEvent) -> usize {
         GameEvent::Pan { .. } => 24,
         GameEvent::Pinch { .. } => 25,
         GameEvent::Player { .. } => 26,
-        GameEvent::Game { .. } => 27,
+        GameEvent::SessionStarted { .. } => 27,
+        GameEvent::Game { .. } => 28,
     }
 }
 
@@ -506,7 +507,8 @@ fn random_event(rng: &mut Rng) -> GameEvent {
         23 => GameEvent::Touch { id: rng.whole(31), x: rng.number(), y: rng.number(), phase: integer(rng) },
         24 => GameEvent::Pan { touches: rng.whole(31), dx: rng.number(), dy: rng.number() },
         25 => GameEvent::Pinch { x: rng.number(), y: rng.number(), scale: rng.number() },
-        _ => GameEvent::Player { index: rng.whole(255) },
+        26 => GameEvent::Player { index: rng.whole(255) },
+        _ => GameEvent::SessionStarted { restored: rng.whole(1) },
     }
 }
 

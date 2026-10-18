@@ -496,15 +496,21 @@ impl State {
             let count = values.len().min(MAX_DRAW_EXTRA * 4);
             extra[..count].copy_from_slice(&values[..count]);
         }
-        // Insets retain material blending, with their own sample count.
+        // Insets preserve authored coverage, separately from scene sky alpha.
         let (pipeline, visible) = match (item.inset(), item.shape) {
             (Some(_), _) => {
-                let variant = if m.opaque() { Variants::OPAQUE } else { Variants::TRANSLUCENT };
+                let mut variant = Variants::INSET;
+                if !m.opaque() {
+                    variant = Variants::INSET_BLENDED;
+                }
                 if !self.ensure_variants(shader, INSET_SAMPLES, variant) {
                     return Ok(None);
                 }
                 let made = self.pipelines(shader, INSET_SAMPLES);
-                let pipeline = if m.opaque() { made.opaque.clone() } else { made.translucent.clone() };
+                let mut pipeline = made.inset.clone();
+                if !m.opaque() {
+                    pipeline = made.inset_blended.clone();
+                }
                 (pipeline, None)
             }
             (None, Shape::Batch(batch)) => (Some(scratch.batches[batch].pipeline.clone()), None),

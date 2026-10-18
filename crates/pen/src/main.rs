@@ -1083,8 +1083,9 @@ const OPTIONS: [OptionSpec; 100] = [
                 src/tunables.json); overlay=/COMMAND[,ARG...] (a line typed into the dev tools' console); \
                 pad=connect|disconnect|BUTTON[,VALUE]|AXIS,VALUE (a gamepad); touch=ID,X,Y lift=ID (a touch \
                 screen); motion=DX,DY (the locked mouse); compose=TEXT[,CURSOR] commit=TEXT (an input method); \
-                overlay-shot=NAME (a shot with the dev tools over it); glide eases from the last scripted pointer \
-                position (initially 0,0) over positive FRAMES, then continues; move is instant",
+                overlay-shot=NAME (a shot with the dev tools over it); \
+                glide eases from the last scripted pointer position (initially 0,0) over positive FRAMES, \
+                then continues; move is instant",
     },
     OptionSpec {
         name: "--script-file",

@@ -1,7 +1,7 @@
 // A frame drawn: what it draws worked out (batching.rs), then encoded: the
 // shadow pass, the scene's passes (opaque surfaces, decals over them,
 // translucent surfaces and overlays), the passes after the scene (post.rs),
-// sprites, insets and the veil. And another program's sprites drawn over a
+// insets, sprites and the veil. And another program's sprites drawn over a
 // finished frame.
 use std::collections::HashSet;
 
@@ -371,7 +371,8 @@ impl State {
             r: f64::from(frame.clear.r),
             g: f64::from(frame.clear.g),
             b: f64::from(frame.clear.b),
-            a: f64::from(frame.clear.a),
+            // Scene alpha stores the remaining background, independently of frame alpha.
+            a: 1.0,
         };
         {
             let mut first = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -438,6 +439,9 @@ impl State {
             draw_layers(&mut last, &later[1..], &mut stats);
         }
         self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &output, &self.timer);
+        if let Some(composite) = &composite {
+            self.draw_insets(&mut encoder, &output, &drawing, &scratch.insets, ready, composite, &mut stats);
+        }
         if !scratch.sprites.is_empty() {
             let layout = self.context.sprite_group.clone();
             let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&device, layout));
@@ -453,9 +457,6 @@ impl State {
                 &scratch.sprite_order,
                 self.timer.pass(Span::Overlay),
             );
-        }
-        if let Some(composite) = &composite {
-            self.draw_insets(&mut encoder, &output, &drawing, &scratch.insets, ready, composite, &mut stats);
         }
         self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
         if filtered.is_some() {

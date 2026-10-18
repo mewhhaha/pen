@@ -195,6 +195,90 @@ fn save_grey(name: &str, values: &[f64], width: u32, height: u32, zoom: u32) {
     image.save(shots().join(name)).unwrap();
 }
 
+// Transparent draws do not write depth. Their coverage must still replace
+// the clear color with sky, including with MSAA and overlapping surfaces.
+#[test]
+fn transparent_surfaces_keep_the_sky_behind_them() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mesh = br#"{"positions":[-1,-1,0.5, 1,-1,0.5, -1,1,0.5, 1,1,0.5],"normals":[0,0,1,0,0,1,0,0,1,0,0,1],
+                    "uvs":[0,0,1,0,0,1,1,1],"indices":[0,1,2,2,1,3]}"#;
+    let root = assets(
+        "transparent-sky",
+        &[
+            (
+                "catalog.json",
+                br#"{"meshes":["quad.mesh.json"],"materials":["glass.material.json","solid.material.json","inset.material.json"]}"#,
+            ),
+            ("quad.mesh.json", mesh),
+            ("inset.material.json", br#"{"shader":"flat.wgsl","color":[0,0.8,0,1],"lighting":"unlit"}"#),
+            ("flat.wgsl", FLAT.as_bytes()),
+            ("glass.wgsl", FLAT.replace("return draw.color;", "return vec4f(draw.color.rgb, 0.5);").as_bytes()),
+            ("low-alpha.wgsl", FLAT.replace("return draw.color;", "return vec4f(draw.color.rgb, 0.1);").as_bytes()),
+            ("glass.material.json", br#"{"shader":"glass.wgsl","color":[0,0.8,0,1],"lighting":"unlit","blend":true}"#),
+            ("solid.material.json", br#"{"shader":"low-alpha.wgsl","color":[0,0.8,0,1],"lighting":"unlit"}"#),
+        ],
+    );
+    let catalog = boundary::read_catalog(&root).unwrap();
+    let mut renderer = renderer(&device, &queue, root, FORMAT, Display::SDR);
+    let mut target = Target::new(&device, 16, 16, FORMAT);
+    let glass = Draw { mesh: 0, material: 0, transform: IDENTITY, parameters: None, extra: None };
+    let mut frame = frame(vec![glass.clone()]);
+    // A nonzero clear color checks that it is removed before sky is added.
+    frame.clear = Color { r: 0.35, g: 0.1, b: 0.2, a: 0.3 };
+    frame.quality.sky = true;
+    let sky = Vector { x: 0.0, y: 0.2, z: 0.0 };
+    frame.sky.zenith = sky;
+    frame.sky.horizon = sky;
+    frame.sky.ground = sky;
+    frame.light_color = Vector::default();
+    let check = |target: &Target, label: &str, expected: f32| {
+        let actual = middle(&device, &queue, &target.0);
+        assert!(actual[0] <= 1 && actual[2] <= 1, "{label}: leaked clear color {actual:?}");
+        assert!(
+            (f32::from(actual[1]) / 255.0 - expected).abs() < 0.01,
+            "{label}: {actual:?}, expected green {expected}"
+        );
+    };
+    for samples in [1, 4] {
+        frame.quality.msaa = samples;
+        frame.draws = vec![glass.clone()];
+        settle(&mut renderer, &frame, &catalog, &mut target, 1);
+        check(&target, "one translucent surface", 0.5);
+        frame.draws.push(glass.clone());
+        settle(&mut renderer, &frame, &catalog, &mut target, 2);
+        check(&target, "overlapping translucent surfaces", 0.65);
+        frame.draws = vec![Draw { material: 1, ..glass.clone() }];
+        settle(&mut renderer, &frame, &catalog, &mut target, 1);
+        check(&target, "opaque ignores shader alpha", 0.8);
+    }
+    // Insets retain their separate authored coverage: an opaque mesh with
+    // alpha 1 must cover the sky, and empty pixels must leave it untouched.
+    frame.draws.clear();
+    let mut inset_draw = Draw { material: 2, ..glass };
+    inset_draw.transform[0] = 0.5;
+    inset_draw.transform[5] = 0.5;
+    frame.insets = vec![Inset {
+        width: 16.0,
+        height: 16.0,
+        view: IDENTITY,
+        projection: IDENTITY,
+        draws: vec![inset_draw],
+        ..Inset::default()
+    }];
+    settle(&mut renderer, &frame, &catalog, &mut target, 1);
+    check(&target, "opaque inset", 0.8);
+    // The existing inset policy uses authored fragment alpha as coverage,
+    // even for its opaque pipeline. Preserve that behavior exactly.
+    frame.insets[0].draws[0].material = 1;
+    settle(&mut renderer, &frame, &catalog, &mut target, 1);
+    check(&target, "authored inset coverage", 0.27986);
+    let corner = pixels(&device, &queue, &target.0)[0];
+    assert!((f32::from(corner[1]) / 255.0 - 0.2).abs() < 0.01, "empty inset corner: {corner:?}");
+}
+
 // The edge the TAA test draws: green where y > 0.37 x + 0.11 in clip space.
 fn covered(x: f64, y: f64) -> bool {
     y > 0.37 * x + 0.11

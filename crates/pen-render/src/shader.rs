@@ -194,13 +194,15 @@ pub(crate) fn bounds_margin(code: &str) -> Option<f32> {
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Variants(u8);
 
-const VARIANT_NAMES: [(Variants, &str); 6] = [
+const VARIANT_NAMES: [(Variants, &str); 8] = [
     (Variants::OPAQUE, "opaque"),
     (Variants::TRANSLUCENT, "translucent"),
     (Variants::OCCLUDED, "occluded"),
     (Variants::VISIBLE, "visible"),
     (Variants::INSTANCED, "instanced"),
     (Variants::SKINNED, "skinned"),
+    (Variants::INSET, "inset"),
+    (Variants::INSET_BLENDED, "inset_blended"),
 ];
 
 impl std::fmt::Debug for Variants {
@@ -219,6 +221,8 @@ impl Variants {
     pub const VISIBLE: Variants = Variants(8);
     pub const INSTANCED: Variants = Variants(16);
     pub const SKINNED: Variants = Variants(32);
+    pub const INSET: Variants = Variants(64);
+    pub const INSET_BLENDED: Variants = Variants(128);
 
     pub fn is_empty(self) -> bool {
         self.0 == 0
@@ -257,6 +261,8 @@ pub(crate) struct Pipelines {
     pub visible: Option<wgpu::RenderPipeline>,
     pub instanced: Option<wgpu::RenderPipeline>,
     pub skinned: Option<wgpu::RenderPipeline>,
+    pub inset: Option<wgpu::RenderPipeline>,
+    pub inset_blended: Option<wgpu::RenderPipeline>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -277,6 +283,8 @@ impl Pipelines {
             (&self.visible, Variants::VISIBLE),
             (&self.instanced, Variants::INSTANCED),
             (&self.skinned, Variants::SKINNED),
+            (&self.inset, Variants::INSET),
+            (&self.inset_blended, Variants::INSET_BLENDED),
         ]
         .into_iter()
         .filter(|(pipeline, _)| pipeline.is_some())
@@ -292,6 +300,8 @@ impl Pipelines {
             (&mut self.visible, other.visible),
             (&mut self.instanced, other.instanced),
             (&mut self.skinned, other.skinned),
+            (&mut self.inset, other.inset),
+            (&mut self.inset_blended, other.inset_blended),
         ] {
             if mine.is_none() {
                 *mine = theirs;
@@ -363,7 +373,7 @@ fn variant_of(
     samples: u32,
     depth_write: bool,
     depth_compare: wgpu::CompareFunction,
-    blend: Option<wgpu::BlendComponent>,
+    blend: Option<wgpu::BlendState>,
     stage: Stage,
 ) -> wgpu::RenderPipeline {
     let buffers = vertex_buffers(stage);
@@ -401,13 +411,7 @@ fn variant_of(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: SCENE_FORMAT,
-                blend: blend.map(|component| {
-                    let mut alpha = component;
-                    if component.src_factor == wgpu::BlendFactor::SrcAlpha {
-                        alpha.src_factor = wgpu::BlendFactor::One;
-                    }
-                    wgpu::BlendState { color: component, alpha }
-                }),
+                blend,
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),
@@ -428,13 +432,33 @@ pub(crate) fn pipelines(
     variants: Variants,
 ) -> Pipelines {
     use wgpu::{BlendFactor, BlendOperation, CompareFunction};
-    let make = |variant: Variants, depth_write: bool, depth_compare, blend, stage: Stage| {
-        variants
-            .contains(variant)
-            .then(|| variant_of(context, module, samples, depth_write, depth_compare, blend, stage))
-    };
+    let make =
+        |variant: Variants, depth_write: bool, depth_compare, blend: Option<wgpu::BlendComponent>, stage: Stage| {
+            if !variants.contains(variant) {
+                return None;
+            }
+            // Scene alpha tracks the remaining clear color. Insets retain their
+            // authored alpha for coverage when composited over the finished frame.
+            let blending = if variant == Variants::INSET {
+                None
+            } else if variant == Variants::INSET_BLENDED {
+                Some(wgpu::BlendState::ALPHA_BLENDING)
+            } else {
+                Some(wgpu::BlendState {
+                    color: blend.unwrap_or(wgpu::BlendComponent::REPLACE),
+                    alpha: wgpu::BlendComponent {
+                        src_factor: BlendFactor::Zero,
+                        dst_factor: blend.map_or(BlendFactor::Zero, |component| component.dst_factor),
+                        operation: BlendOperation::Add,
+                    },
+                })
+            };
+            Some(variant_of(context, module, samples, depth_write, depth_compare, blending, stage))
+        };
     Pipelines {
         opaque: make(Variants::OPAQUE, true, CompareFunction::Less, None, Stage::Plain),
+        inset: make(Variants::INSET, true, CompareFunction::Less, None, Stage::Plain),
+        inset_blended: make(Variants::INSET_BLENDED, false, CompareFunction::Less, None, Stage::Plain),
         translucent: make(
             Variants::TRANSLUCENT,
             false,

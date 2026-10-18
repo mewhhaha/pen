@@ -9,7 +9,7 @@ use web_time::Instant;
 
 use anyhow::{Result, bail, ensure};
 use pen_protocol::boundary::{decode_frame, decode_into, encode_frame, validate_state, whole};
-use pen_protocol::{Catalog, Frame, RenderFrame, Viewport};
+use pen_protocol::{Catalog, Frame, GameEvent, RenderFrame, Viewport};
 
 use crate::program::{Backend, Operation, Program, Unresponsive};
 use crate::saved::{SavedTypes, declared_resets};
@@ -221,7 +221,16 @@ fn validation_frame(host: &dyn Host) -> Frame {
 /// A frame for checking a program: it runs, but is not accepted until the
 /// caller does so.
 async fn evaluate<P: Program>(game: &mut Game<P>, catalog: &Catalog, host: &dyn Host) -> Result<RenderFrame> {
-    let packet = game.program.request(Operation::Frame, &encode_frame(&validation_frame(host), 0.0, &[])?).await?;
+    evaluate_with_frame(game, catalog, host, &validation_frame(host)).await
+}
+
+async fn evaluate_with_frame<P: Program>(
+    game: &mut Game<P>,
+    catalog: &Catalog,
+    host: &dyn Host,
+    frame: &Frame,
+) -> Result<RenderFrame> {
+    let packet = game.program.request(Operation::Frame, &encode_frame(frame, 0.0, &[])?).await?;
     let next = decode_frame(&packet, game.schema, catalog)?;
     ensure!(next.state.is_empty(), "program frame must keep its state inside the guest");
     host.validate(&next.render)?;
@@ -343,7 +352,9 @@ impl<B: Backend> GameRuntime<B> {
         {
             host.report("quicksave state schema changed; starting fresh");
         }
-        match initial_save.filter(|saved| saved.schema == active.schema) {
+        let initial_save = initial_save.filter(|saved| saved.schema == active.schema);
+        let restored = u32::from(initial_save.is_some());
+        match initial_save {
             Some(saved) => {
                 let restored = restore(engine, &module, &mut active, &saved.state, host).await?;
                 host.report(&with_report("resuming the saved state", &restored));
@@ -360,7 +371,9 @@ impl<B: Backend> GameRuntime<B> {
                 }
             }
         }
-        let first = evaluate(&mut active, &catalog, host).await?;
+        let mut first_input = validation_frame(host);
+        first_input.events.push(GameEvent::SessionStarted { restored });
+        let first = evaluate_with_frame(&mut active, &catalog, host, &first_input).await?;
         active.program.accept();
         let mut runtime = GameRuntime {
             engine: engine.clone(),
@@ -775,12 +788,24 @@ mod receive_tests {
     struct Script {
         answers: Vec<Result<Vec<f32>>>,
         recycled: Vec<Vec<f32>>,
+        requests: Vec<(Operation, Vec<f32>)>,
     }
 
     #[derive(Clone, Default)]
     struct Scripted(Rc<RefCell<Script>>);
 
     struct Answering(Rc<RefCell<Script>>, Option<Operation>);
+
+    impl Scripted {
+        fn answer(&self, operations: &[Operation]) {
+            self.0.borrow_mut().answers.extend(operations.iter().map(|operation| {
+                if *operation == Operation::Frame {
+                    return Ok(frame(0));
+                }
+                Ok(vec![*operation as u8 as f32])
+            }));
+        }
+    }
 
     impl Backend for Scripted {
         type Module = ();
@@ -797,7 +822,8 @@ mod receive_tests {
         fn scenes(&self) -> bool {
             false
         }
-        fn send(&mut self, operation: Operation, _: &[f32]) -> Result<()> {
+        fn send(&mut self, operation: Operation, payload: &[f32]) -> Result<()> {
+            self.0.borrow_mut().requests.push((operation, payload.to_vec()));
             self.1 = Some(operation);
             Ok(())
         }
@@ -880,6 +906,86 @@ mod receive_tests {
         backend.0.borrow_mut().answers.push(Err(anyhow::anyhow!("trapped")));
         runtime.send(&[]).unwrap();
         assert!(!ready(runtime.receive(&Viewer)).unwrap_err().is::<InvalidFrame>(), "other failures stay fatal");
+    }
+
+    #[test]
+    fn session_started_follows_initial_restore_or_creation_and_scene_setup() {
+        use Operation::{Create, Frame, LoadScene, Restore};
+        let cases = [
+            (None, None, &[Create, Frame][..], 0),
+            (None, Some(1), &[Create, LoadScene, Frame], 0),
+            (None, Some(2), &[Create, Frame], 0),
+            (Some(1), Some(1), &[Restore, Frame], 1),
+            (Some(2), Some(1), &[Create, LoadScene, Frame], 0),
+        ];
+        for (save_schema, scene_schema, operations, restored) in cases {
+            let backend = Scripted::default();
+            backend.answer(operations);
+            let saved = |schema| SavedState { schema, state: vec![42.0] };
+            let runtime = ready(GameRuntime::new(
+                &backend,
+                (),
+                Catalog::default(),
+                &mut Viewer,
+                save_schema.map(saved),
+                scene_schema.map(saved),
+            ))
+            .unwrap();
+            let script = backend.0.borrow();
+            assert_eq!(script.requests.iter().map(|(operation, _)| *operation).collect::<Vec<_>>(), operations);
+            assert_eq!(
+                script.requests.last().unwrap().1,
+                [0.0, 64.0, 64.0, 1.0, 0.0, 27.0, restored as f32, 0.0, 0.0, 0.0],
+                "save {save_schema:?}, scene {scene_schema:?}"
+            );
+            assert!(runtime.drawn.is_some(), "startup evaluation was accepted");
+        }
+    }
+
+    #[test]
+    fn session_started_is_absent_from_live_input_recordings_and_state_replacements() {
+        use crate::timeline::{Recorded, Timeline};
+        use Operation::{Create, Frame, LoadScene, Restore, Snapshot};
+        let backend = Scripted::default();
+        backend.answer(&[Create, Frame]);
+        let catalog = Catalog::default();
+        let mut runtime = ready(GameRuntime::new(&backend, (), catalog.clone(), &mut Viewer, None, None)).unwrap();
+        backend.0.borrow_mut().requests.clear();
+        let moment = Moment { saved: SavedState { schema: 1, state: vec![42.0] }, edits: Edits::default() };
+
+        backend.answer(&[Snapshot, Restore, Frame]);
+        assert_eq!(ready(runtime.reload(&mut Viewer, (), catalog)), ReloadResult::Activated);
+        backend.answer(&[Restore, Frame]);
+        ready(runtime.load(&mut Viewer, &moment.saved)).unwrap(); // F9 takes this path too.
+        backend.answer(&[Snapshot, Restore, LoadScene, Frame]);
+        ready(runtime.load_scene(&mut Viewer, &moment.saved)).unwrap();
+        backend.answer(&[Restore, Frame]);
+        ready(runtime.restore(&mut Viewer, &moment)).unwrap();
+        backend.answer(&[Snapshot, Restore, Frame]);
+        ready(runtime.reroot(&Viewer)).unwrap();
+
+        let mut timeline = Timeline::default();
+        timeline.keep_history(None);
+        timeline.keep_moment(moment);
+        let input = runtime.input(&validation_frame(&Viewer)).unwrap();
+        backend.answer(&[Frame]);
+        runtime.send(&input).unwrap();
+        ready(runtime.receive(&Viewer)).unwrap();
+        timeline.ran(Recorded { input, ..Recorded::default() });
+        assert_eq!(timeline.recording().unwrap().frames[0].input, [0.0, 64.0, 64.0, 0.0, 0.0]);
+
+        backend.answer(&[Restore, Frame, Frame]);
+        ready(timeline.rewind(&mut runtime, &Viewer, 1, &mut |_, _, _| Ok(()))).unwrap();
+        backend.answer(&[Restore, Frame]);
+        ready(timeline.restart(&mut runtime, &Viewer, 0)).unwrap();
+
+        let script = backend.0.borrow();
+        assert!(script.answers.is_empty(), "all lifecycle evaluations ran");
+        let frames = script.requests.iter().filter(|(operation, _)| *operation == Frame).collect::<Vec<_>>();
+        assert_eq!(frames.len(), 9, "reload, load, scene, restore, reroot, live, rewind validation/replay, restart");
+        for (_, input) in frames {
+            assert_eq!(input, &[0.0, 64.0, 64.0, 0.0, 0.0], "only startup carries SessionStarted");
+        }
     }
 }
 

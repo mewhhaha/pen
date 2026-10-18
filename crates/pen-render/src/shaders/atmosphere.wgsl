@@ -159,7 +159,9 @@ fn mist_beyond_arena(start: vec3f, end: vec3f) -> f32 {
 
 @fragment fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
   let pixel = vec2i(position.xy);
-  let color = textureLoad(scene_color, pixel, 0).rgb;
+  let scene = textureLoad(scene_color, pixel, 0);
+  let remaining = scene.a;
+  let color = scene.rgb - remaining * atmosphere.clear.rgb;
   var empty = 0.0;
   var nearest = 1.0;
   for (var sample = 0; sample < ${samples}; sample++) {
@@ -175,15 +177,15 @@ fn mist_beyond_arena(start: vec3f, end: vec3f) -> f32 {
   let with_sky = atmosphere.camera.w > 0.5;
   let background = select(atmosphere.clear.rgb, sky(direction, true), with_sky);
   if (empty > 0.999) {
-    return vec4f(background, 1.0);
+    return vec4f(color + remaining * background, 1.0);
   }
-  // The resolved color mixes the scene with the clear color it left; take
-  // the scene's part, mist it, then add the sky where the clear color was.
-  let surface = (color - empty * atmosphere.clear.rgb) / (1.0 - empty) *
+  // Depth counts opaque coverage; alpha also accounts for translucent
+  // surfaces and particles covering the background without writing depth.
+  let surface = color / (1.0 - empty) *
     mix(1.0, occlusion(position.xy), atmosphere.fog.w);
   let point = unproject(position.xy, nearest);
   let mist = select(atmosphere.clear.rgb, sky(direction, false), with_sky);
   let thickness = mist_beyond_arena(camera, point) * atmosphere.fog.y;
   let misted = mix(surface * cloud_shadow(point), mist, 1.0 - exp(-thickness));
-  return vec4f(mix(misted, background, empty), 1.0);
+  return vec4f(misted * (1.0 - empty) + remaining * background, 1.0);
 }

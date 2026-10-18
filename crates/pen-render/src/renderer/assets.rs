@@ -511,10 +511,10 @@ impl State {
                 // Insets draw with 4 samples a pixel: their pipeline compiles
                 // in the background now, so an inset first shown never waits
                 // on it.
-                // Their draws take the opaque or translucent pipeline alone.
-                let inset_needs =
-                    needs.without(Variants::INSTANCED | Variants::OCCLUDED | Variants::VISIBLE | Variants::SKINNED);
-                let inset_needs = if inset_needs.is_empty() { Variants::OPAQUE } else { inset_needs };
+                let mut inset_needs = Variants::INSET;
+                if needs.contains(Variants::TRANSLUCENT) {
+                    inset_needs |= Variants::INSET_BLENDED;
+                }
                 shader.request(jobs, slot, INSET_SAMPLES, inset_needs);
                 let staged = Staged { shader, early, samples, failure: None };
                 // A revision this one overtook is let go.

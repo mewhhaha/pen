@@ -1457,6 +1457,20 @@
         }
       },
       {
+        "tag": 27,
+        "name": "SessionStarted",
+        "doc": "The host session started, once after creating the game or restoring its initial save and before live frames. restored is 1 when the initial save matched the game's state schema and was restored, otherwise 0. Reloads, loads, rewinds and replays do not send it; it is not recorded as input.",
+        "fields": {
+          "restored": {
+            "lane": "code",
+            "wire": "integer",
+            "max": 1,
+            "ts": "number",
+            "rust": "u32"
+          }
+        }
+      },
+      {
         "tag": 100,
         "name": "Game",
         "doc": "One of the game's own events, which its pen.json `protocol` declares: its tag there, and up to three values. Hosts send them only to a game that declares them, whose generated pen/extensions.blot decodes them; pen's own bindings leave them out.",

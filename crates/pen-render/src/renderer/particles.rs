@@ -118,7 +118,7 @@ pub(crate) fn pipeline(context: &PipelineContext, samples: u32, additive: bool) 
                     color,
                     alpha: BlendComponent {
                         src_factor: BlendFactor::Zero,
-                        dst_factor: BlendFactor::One,
+                        dst_factor: color.dst_factor,
                         operation: BlendOperation::Add,
                     },
                 }),

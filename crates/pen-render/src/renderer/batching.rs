@@ -325,13 +325,16 @@ impl State {
             let count = values.len().min(MAX_DRAW_EXTRA * 4);
             extra[..count].copy_from_slice(&values[..count]);
         }
-        // Insets draw opaque, with their own sample count.
+        // Insets retain material blending, with their own sample count.
         let (pipeline, visible) = match (item.inset(), item.shape) {
             (Some(_), _) => {
-                if !self.ensure_variants(shader, INSET_SAMPLES, Variants::OPAQUE) {
+                let variant = if m.opaque() { Variants::OPAQUE } else { Variants::TRANSLUCENT };
+                if !self.ensure_variants(shader, INSET_SAMPLES, variant) {
                     return Ok(None);
                 }
-                (self.pipelines(shader, INSET_SAMPLES).opaque.clone(), None)
+                let made = self.pipelines(shader, INSET_SAMPLES);
+                let pipeline = if m.opaque() { made.opaque.clone() } else { made.translucent.clone() };
+                (pipeline, None)
             }
             (None, Shape::Batch(batch)) => (Some(scratch.batches[batch].pipeline.clone()), None),
             (None, _) => {

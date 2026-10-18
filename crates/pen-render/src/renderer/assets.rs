@@ -443,7 +443,8 @@ impl State {
                 // Insets draw with 4 samples a pixel: their pipeline compiles
                 // in the background now, so an inset first shown never waits
                 // on it.
-                shader.request(jobs, slot, INSET_SAMPLES, Variants::OPAQUE);
+                let inset_needs = needs.without(Variants::INSTANCED | Variants::OCCLUDED | Variants::VISIBLE);
+                shader.request(jobs, slot, INSET_SAMPLES, inset_needs);
                 let staged = Staged { shader, early, samples, failure: None };
                 // A revision this one overtook is let go.
                 if let Some(Staged { shader, early, .. }) = self.staging.insert(slot, staged) {

@@ -314,7 +314,13 @@ fn variant_of(
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: SCENE_FORMAT,
-                blend: blend.map(|component| wgpu::BlendState { color: component, alpha: component }),
+                blend: blend.map(|component| {
+                    let mut alpha = component;
+                    if component.src_factor == wgpu::BlendFactor::SrcAlpha {
+                        alpha.src_factor = wgpu::BlendFactor::One;
+                    }
+                    wgpu::BlendState { color: component, alpha }
+                }),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
         }),

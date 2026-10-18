@@ -152,6 +152,68 @@ fn renderer_moves_between_threads() {
 }
 
 #[test]
+fn translucent_insets_preserve_coverage_and_draw_order() {
+    let (device, queue) = device().expect("the inset regression needs a headless GPU");
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("pen-render-inset-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("flat.wgsl"), SHADER).unwrap();
+    std::fs::write(
+        root.join("tri.mesh.json"),
+        br#"{"positions":[-1,-1,0.5, 1,-1,0.5, 0,1,0.5],"normals":[0,0,1,0,0,1,0,0,1],
+             "uvs":[0,0,1,0,0.5,1],"indices":[0,1,2]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("green.material.json"),
+        br#"{"shader":"flat.wgsl","color":[0,0.4,0,0.5],"lighting":"unlit","blend":true}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("blue.material.json"),
+        br#"{"shader":"flat.wgsl","color":[0,0,0.4,0.5],"lighting":"unlit","blend":true}"#,
+    )
+    .unwrap();
+    let catalog = Catalog {
+        meshes: vec!["tri.mesh.json".into()],
+        materials: vec!["green.material.json".into(), "blue.material.json".into()],
+        ..Default::default()
+    };
+    let mut renderer = Renderer::new(
+        device.clone(),
+        queue.clone(),
+        RendererOptions { format: FORMAT, assets: root, veil: None, pipeline_cache: None },
+    )
+    .unwrap();
+    renderer.preload(&catalog);
+    let mut target = Offscreen::new(&device, 64);
+    let mut shown = frame(Vec::new());
+    shown.clear.r = 0.8;
+    shown.insets.push(Inset {
+        x: 0.0,
+        y: 0.0,
+        width: 64.0,
+        height: 64.0,
+        pixel_size: 0.0,
+        view: IDENTITY,
+        projection: IDENTITY,
+        ambient: Vector::default(),
+        light_direction: shown.light_direction,
+        light_color: shown.light_color,
+        draws: (0..2)
+            .map(|material| Draw { mesh: 0, material, transform: IDENTITY, parameters: None, extra: None })
+            .collect(),
+    });
+    pump(&mut renderer, &shown, &catalog, &mut target, |events| {
+        ready(events, "flat.wgsl", 1)
+            && ready(events, "green.material.json", 1)
+            && ready(events, "blue.material.json", 1)
+    });
+    // Half blue over half green over red: 0.2 red, 0.1 green, 0.2 blue.
+    let [r, g, b, _] = middle(&device, &queue, &target.0);
+    assert!((48..=54).contains(&r) && (23..=29).contains(&g) && (48..=54).contains(&b), "inset pixel {r} {g} {b}");
+}
+
+#[test]
 fn rejects_invalid_frames() {
     let mut bad = frame(Vec::new());
     bad.light_direction = Vector::default();

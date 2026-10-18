@@ -26,6 +26,10 @@ __GL_SHADER_DISK_CACHE=0 target/release/examples/render_packet --sequence --veil
 
 ## Loading
 
+Inset meshes honor their material's alpha and blend setting. Blended draws
+compose in their supplied order over transparent inset targets, with coverage
+preserved for the final screen composite; opaque draws retain depth writes.
+
 ### Pipelines compile per material need, side by side
 
 A material shader once got all four scene variants (opaque, translucent, and

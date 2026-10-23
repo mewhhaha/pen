@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pair Wasmtime inlining budgets on identical deterministic game frames.
+"""Pair Wasmtime budgets or two Wasm modules on deterministic game frames.
 
 Build the memory_images example first. Frame timers exclude module compilation;
 OS CPU/RSS cover the whole process, including compilation. Each sample starts a
@@ -24,6 +24,7 @@ def digest(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("wasm", type=Path)
+    parser.add_argument("--baseline", type=Path, help="alternate with this module and require identical traces and snapshots")
     parser.add_argument("--executable", type=Path, default=Path("target/release/examples/memory_images"))
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--runs", type=int, default=7)
@@ -42,10 +43,12 @@ def main():
     except (ValueError, AssertionError):
         parser.error("--budgets requires unique U32 integers and/or default")
     wasm, executable, out = args.wasm.resolve(), args.executable.resolve(), args.out.resolve()
+    variants = [("baseline", args.baseline.resolve()), ("candidate", wasm)] if args.baseline else [("candidate", wasm)]
     out.mkdir(parents=True, exist_ok=False)
     report = {
         "started_at": datetime.now(timezone.utc).isoformat(),
         "wasm_sha256": digest(wasm), "executable_sha256": digest(executable),
+        "modules": {name: {"path": str(path), "sha256": digest(path)} for name, path in variants},
         "platform": platform.platform(), "affinity": sorted(os.sched_getaffinity(0)),
         "load_start": os.getloadavg(), "frames": args.frames, "warmup": args.warmup,
         "budgets": budgets, "runs": args.runs, "samples": [],
@@ -60,9 +63,12 @@ def main():
         order = budgets[run % len(budgets):] + budgets[:run % len(budgets)]
         if run // len(budgets) % 2:
             order.reverse()
-        for budget in order:
-            label = f"{run}-{budget if budget is not None else 'default'}"
-            command = [str(executable), str(wasm), str(args.frames)]
+        variant_order = variants if run % 2 == 0 else list(reversed(variants))
+        schedule = [(budget, name, path) for budget in order for name, path in variant_order]
+        for budget, variant, module in schedule:
+            prefix = f"{run}-{variant}" if args.baseline else str(run)
+            label = f"{prefix}-{budget if budget is not None else 'default'}"
+            command = [str(executable), str(module), str(args.frames)]
             if budget is not None:
                 command.append(str(budget))
             started = time.monotonic()
@@ -84,7 +90,7 @@ def main():
             if identity != expected:
                 raise RuntimeError(f"{label}: packet trace or final snapshot differs")
             measured = sorted(timings[args.warmup:])
-            row = {"run": run, "inline_budget": budget, "wall_seconds": time.monotonic() - started,
+            row = {"run": run, "variant": variant, "inline_budget": budget, "wall_seconds": time.monotonic() - started,
                    "cpu_seconds": usage.ru_utime + usage.ru_stime, "peak_rss_kib": usage.ru_maxrss,
                    **data, "p50_ms": statistics.median(measured) / 1e6,
                    "p95_ms": measured[int((len(measured) - 1) * .95)] / 1e6,
@@ -93,6 +99,8 @@ def main():
             (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps({key: value for key, value in row.items() if key != "frame_ns"}), flush=True)
     assert digest(wasm) == report["wasm_sha256"] and digest(executable) == report["executable_sha256"]
+    for name, path in variants:
+        assert digest(path) == report["modules"][name]["sha256"]
 
 
 if __name__ == "__main__":

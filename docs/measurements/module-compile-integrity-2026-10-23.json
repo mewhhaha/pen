@@ -1,0 +1,727 @@
+{
+  "started_at": "2026-10-23T07:55:51.813435+00:00",
+  "wasm_sha256": "b597c6c13c0c9199333122f11ff19e46abd34203d4193fe3d18c34837498d46e",
+  "executable_sha256": "422cc5f834019687c63d0a96c83b5ec39f4fd74f25663226e37f4afef0ba7105",
+  "wasm_bytes": 2241523,
+  "platform": "Linux-6.18.55-x86_64-with-glibc2.41",
+  "cpu_count": 5,
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "load_start": [
+    2.01025390625,
+    2.49462890625,
+    2.49853515625
+  ],
+  "rayon_num_threads": null,
+  "inline_budget": null,
+  "samples": [
+    {
+      "engine": "plain",
+      "inlining": true,
+      "run": 0,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 3.178160279000167,
+      "user_seconds": 9.696959,
+      "system_seconds": 1.356352,
+      "peak_rss_kib": 2572860,
+      "exit_code": 0,
+      "reported_module_ms": 3074
+    },
+    {
+      "engine": "plain",
+      "inlining": false,
+      "run": 0,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.5845099139996819,
+      "user_seconds": 2.007142,
+      "system_seconds": 0.068349,
+      "peak_rss_kib": 98420,
+      "exit_code": 0,
+      "reported_module_ms": 576
+    },
+    {
+      "engine": "incremental",
+      "inlining": true,
+      "run": 0,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 3.1944451919998755,
+      "user_seconds": 9.789484,
+      "system_seconds": 1.208089,
+      "peak_rss_kib": 2422600,
+      "exit_code": 0,
+      "reported_module_ms": 3092
+    },
+    {
+      "engine": "incremental",
+      "inlining": false,
+      "run": 0,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.5559148679999453,
+      "user_seconds": 1.901494,
+      "system_seconds": 0.063457,
+      "peak_rss_kib": 104884,
+      "exit_code": 0,
+      "reported_module_ms": 550
+    },
+    {
+      "engine": "incremental",
+      "inlining": false,
+      "run": 1,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.5651569080000627,
+      "user_seconds": 1.997144,
+      "system_seconds": 0.06683,
+      "peak_rss_kib": 101360,
+      "exit_code": 0,
+      "reported_module_ms": 558
+    },
+    {
+      "engine": "incremental",
+      "inlining": true,
+      "run": 1,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 2.960122831999797,
+      "user_seconds": 9.014938,
+      "system_seconds": 1.070174,
+      "peak_rss_kib": 2419248,
+      "exit_code": 0,
+      "reported_module_ms": 2861
+    },
+    {
+      "engine": "plain",
+      "inlining": false,
+      "run": 1,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.5629647609998756,
+      "user_seconds": 1.9916260000000001,
+      "system_seconds": 0.062162999999999996,
+      "peak_rss_kib": 96232,
+      "exit_code": 0,
+      "reported_module_ms": 555
+    },
+    {
+      "engine": "plain",
+      "inlining": true,
+      "run": 1,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 3.284130346999973,
+      "user_seconds": 9.586139,
+      "system_seconds": 1.3670529999999999,
+      "peak_rss_kib": 2576036,
+      "exit_code": 0,
+      "reported_module_ms": 3162
+    },
+    {
+      "engine": "plain",
+      "inlining": true,
+      "run": 2,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 3.3442202920000454,
+      "user_seconds": 9.962505,
+      "system_seconds": 1.3629660000000001,
+      "peak_rss_kib": 2571576,
+      "exit_code": 0,
+      "reported_module_ms": 3242
+    },
+    {
+      "engine": "plain",
+      "inlining": false,
+      "run": 2,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.5738322400002289,
+      "user_seconds": 1.98996,
+      "system_seconds": 0.09288099999999999,
+      "peak_rss_kib": 95820,
+      "exit_code": 0,
+      "reported_module_ms": 567
+    },
+    {
+      "engine": "incremental",
+      "inlining": true,
+      "run": 2,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 2.995738043000074,
+      "user_seconds": 9.271474,
+      "system_seconds": 1.020672,
+      "peak_rss_kib": 2421356,
+      "exit_code": 0,
+      "reported_module_ms": 2898
+    },
+    {
+      "engine": "incremental",
+      "inlining": false,
+      "run": 2,
+      "phase": "compile",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.5655270610000116,
+      "user_seconds": 1.94735,
+      "system_seconds": 0.103105,
+      "peak_rss_kib": 100944,
+      "exit_code": 0,
+      "reported_module_ms": 559
+    },
+    {
+      "engine": "plain",
+      "inlining": true,
+      "run": 0,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline1-0",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 3.3135103589997925,
+      "user_seconds": 10.097766,
+      "system_seconds": 1.238929,
+      "peak_rss_kib": 2575128,
+      "exit_code": 0,
+      "reported_module_ms": 3167
+    },
+    {
+      "engine": "plain",
+      "inlining": true,
+      "run": 0,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline1-0",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.038260366000031354,
+      "user_seconds": 0.029633,
+      "system_seconds": 0.008314,
+      "peak_rss_kib": 35972,
+      "exit_code": 0,
+      "reported_module_ms": 35
+    },
+    {
+      "engine": "plain",
+      "inlining": true,
+      "run": 1,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline1-1",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 3.4703052250001747,
+      "user_seconds": 10.273404,
+      "system_seconds": 1.3052489999999999,
+      "peak_rss_kib": 2573808,
+      "exit_code": 0,
+      "reported_module_ms": 3324
+    },
+    {
+      "engine": "plain",
+      "inlining": true,
+      "run": 1,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline1-1",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.032268584000121336,
+      "user_seconds": 0.011793,
+      "system_seconds": 0.020079,
+      "peak_rss_kib": 36092,
+      "exit_code": 0,
+      "reported_module_ms": 29
+    },
+    {
+      "engine": "plain",
+      "inlining": true,
+      "run": 2,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline1-2",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 3.34358840699997,
+      "user_seconds": 9.944425,
+      "system_seconds": 1.188057,
+      "peak_rss_kib": 2572108,
+      "exit_code": 0,
+      "reported_module_ms": 3182
+    },
+    {
+      "engine": "plain",
+      "inlining": true,
+      "run": 2,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline1-2",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.0342097869997815,
+      "user_seconds": 0.010969999999999999,
+      "system_seconds": 0.022927,
+      "peak_rss_kib": 35752,
+      "exit_code": 0,
+      "reported_module_ms": 31
+    },
+    {
+      "engine": "plain",
+      "inlining": false,
+      "run": 0,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline0-0",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.650398025999948,
+      "user_seconds": 2.2770799999999998,
+      "system_seconds": 0.058924,
+      "peak_rss_kib": 94004,
+      "exit_code": 0,
+      "reported_module_ms": 642
+    },
+    {
+      "engine": "plain",
+      "inlining": false,
+      "run": 0,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline0-0",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.012114454999846203,
+      "user_seconds": 0.007697,
+      "system_seconds": 0.003848,
+      "peak_rss_kib": 23000,
+      "exit_code": 0,
+      "reported_module_ms": 9
+    },
+    {
+      "engine": "plain",
+      "inlining": false,
+      "run": 1,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline0-1",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.6335643780003011,
+      "user_seconds": 2.258411,
+      "system_seconds": 0.050767,
+      "peak_rss_kib": 96188,
+      "exit_code": 0,
+      "reported_module_ms": 625
+    },
+    {
+      "engine": "plain",
+      "inlining": false,
+      "run": 1,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline0-1",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.012268512999980885,
+      "user_seconds": 0.0,
+      "system_seconds": 0.011944,
+      "peak_rss_kib": 23000,
+      "exit_code": 0,
+      "reported_module_ms": 10
+    },
+    {
+      "engine": "plain",
+      "inlining": false,
+      "run": 2,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline0-2",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.6073483649997797,
+      "user_seconds": 2.150243,
+      "system_seconds": 0.057321,
+      "peak_rss_kib": 94304,
+      "exit_code": 0,
+      "reported_module_ms": 601
+    },
+    {
+      "engine": "plain",
+      "inlining": false,
+      "run": 2,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "plain",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-plain-inline0-2",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.011789034000230458,
+      "user_seconds": 0.007533,
+      "system_seconds": 0.004001,
+      "peak_rss_kib": 23000,
+      "exit_code": 0,
+      "reported_module_ms": 9
+    },
+    {
+      "engine": "incremental",
+      "inlining": true,
+      "run": 0,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline1-0",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 3.23964001899958,
+      "user_seconds": 9.763444,
+      "system_seconds": 1.233492,
+      "peak_rss_kib": 2419376,
+      "exit_code": 0,
+      "reported_module_ms": 3126
+    },
+    {
+      "engine": "incremental",
+      "inlining": true,
+      "run": 0,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline1-0",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.03457808000030127,
+      "user_seconds": 0.016874,
+      "system_seconds": 0.016940999999999998,
+      "peak_rss_kib": 41644,
+      "exit_code": 0,
+      "reported_module_ms": 31
+    },
+    {
+      "engine": "incremental",
+      "inlining": true,
+      "run": 1,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline1-1",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 3.341725036999833,
+      "user_seconds": 10.000763,
+      "system_seconds": 1.138276,
+      "peak_rss_kib": 2421080,
+      "exit_code": 0,
+      "reported_module_ms": 3217
+    },
+    {
+      "engine": "incremental",
+      "inlining": true,
+      "run": 1,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline1-1",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.02987118200007899,
+      "user_seconds": 0.018222,
+      "system_seconds": 0.011042,
+      "peak_rss_kib": 41940,
+      "exit_code": 0,
+      "reported_module_ms": 26
+    },
+    {
+      "engine": "incremental",
+      "inlining": true,
+      "run": 2,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline1-2",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 3.089946598000097,
+      "user_seconds": 9.438559,
+      "system_seconds": 1.107068,
+      "peak_rss_kib": 2425824,
+      "exit_code": 0,
+      "reported_module_ms": 2956
+    },
+    {
+      "engine": "incremental",
+      "inlining": true,
+      "run": 2,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline1-2",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.031248124000285316,
+      "user_seconds": 0.017308,
+      "system_seconds": 0.013361999999999999,
+      "peak_rss_kib": 41884,
+      "exit_code": 0,
+      "reported_module_ms": 28
+    },
+    {
+      "engine": "incremental",
+      "inlining": false,
+      "run": 0,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline0-0",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.5504314029999477,
+      "user_seconds": 1.89977,
+      "system_seconds": 0.072671,
+      "peak_rss_kib": 100624,
+      "exit_code": 0,
+      "reported_module_ms": 544
+    },
+    {
+      "engine": "incremental",
+      "inlining": false,
+      "run": 0,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline0-0",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.01344605899976159,
+      "user_seconds": 0.012992,
+      "system_seconds": 0.0,
+      "peak_rss_kib": 23000,
+      "exit_code": 0,
+      "reported_module_ms": 10
+    },
+    {
+      "engine": "incremental",
+      "inlining": false,
+      "run": 1,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline0-1",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.6025772490002055,
+      "user_seconds": 2.0246,
+      "system_seconds": 0.08329,
+      "peak_rss_kib": 99100,
+      "exit_code": 0,
+      "reported_module_ms": 596
+    },
+    {
+      "engine": "incremental",
+      "inlining": false,
+      "run": 1,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline0-1",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.011348272999839537,
+      "user_seconds": 0.007207,
+      "system_seconds": 0.0036599999999999996,
+      "peak_rss_kib": 23000,
+      "exit_code": 0,
+      "reported_module_ms": 8
+    },
+    {
+      "engine": "incremental",
+      "inlining": false,
+      "run": 2,
+      "phase": "cache-populate",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline0-2",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.5810304670003461,
+      "user_seconds": 2.044102,
+      "system_seconds": 0.072068,
+      "peak_rss_kib": 102224,
+      "exit_code": 0,
+      "reported_module_ms": 574
+    },
+    {
+      "engine": "incremental",
+      "inlining": false,
+      "run": 2,
+      "phase": "cache-load",
+      "command": [
+        "/workspace/pen/target/release/examples/compile_time",
+        "--engine",
+        "incremental",
+        "--cache",
+        "/workspace/dist/blot-finish-20261023/host-integrity/cache-incremental-inline0-2",
+        "/workspace/.finish-backup-20261023/candidate-game.wasm"
+      ],
+      "wall_seconds": 0.012714972000139824,
+      "user_seconds": 0.0028499999999999997,
+      "system_seconds": 0.009287,
+      "peak_rss_kib": 23000,
+      "exit_code": 0,
+      "reported_module_ms": 9
+    }
+  ],
+  "cpu.max": "400000 100000",
+  "memory.max": "34359738368",
+  "load_end": [
+    2.64990234375,
+    2.6103515625,
+    2.53955078125
+  ]
+}

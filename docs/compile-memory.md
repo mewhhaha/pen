@@ -197,10 +197,49 @@ long-edit-session cache-growth test.
 Warm export still spends about 3.3 seconds and reaches about 2.4 GiB with the
 new compiler. Inspection finds that scene discovery opens the game with
 `GuestModule::new(..., None)`, bypassing the host's validated disk cache. Warm
-packet startup uses that cache and takes about 0.1 seconds. Routing scene
-discovery through the same bounded cache is the next separate experiment.
+packet startup uses that cache and takes about 0.1 seconds. The following
+comparison qualifies cache reuse for scene discovery.
 
 The [raw report](measurements/application-startup-2026-10-23.json.gz) pins
 compiler, host, profiler, plugin, source and asset bytes and includes individual
 process samples and timestamped output. Its uncompressed SHA-256 is
 `2b85da38dcf998abea198f9b3cd4f64eb1b2379fd72bbbadec7ef1beff1a1a47`.
+
+### Reusing the module cache during export
+
+Scene discovery now uses the same `pen/wasm` cache as packet/game loading. The
+cache still binds entries to exact Wasm bytes and engine compatibility,
+validates the complete payload before deserialization, bounds entries and total
+retention, and falls back to compilation when unavailable. Guest instances and
+scene execution remain fresh.
+
+Three alternating pairs compare the old and new **Pen executables**, using the
+same numeric Blot compiler, project and assets for both.
+
+| Phase               | Before wall seconds | After wall seconds | Before CPU seconds | After CPU seconds |
+| ------------------- | ------------------: | -----------------: | -----------------: | ----------------: |
+| Export, cold cache  |               6.845 |              6.721 |             14.340 |            14.440 |
+| Export, warm cache  |               3.440 |              0.169 |             10.857 |             0.142 |
+| Packets, cold cache |               3.308 |              3.439 |             10.300 |            10.749 |
+| Packets, warm cache |               0.114 |              0.110 |              0.110 |             0.107 |
+
+Warm export's median maximum RSS falls from 2,471.0 to 105.4 MiB. Its median
+paired wall-time ratio is 0.050. The other phases retain their existing paths;
+the table preserves their measured variation. These three pairs do not supply a
+p95 guarantee. Export now retains one additional native artifact on disk inside
+the existing eight-entry/64-MiB-per-entry bounds.
+
+All 341 files in each of the twelve cold/warm, before/after bundles have
+identical bytes. Packet/schema witnesses also match. A deliberately corrupted
+module-cache payload is rejected and regenerated; the next warm export succeeds.
+Replacing the isolated module-cache directory with a regular file also falls
+back successfully. All three recovery exports preserve every bundle byte.
+
+The [paired report](measurements/export-cache-paired-2026-10-23.json.gz) pins
+both host executables and the common inputs. The
+[recovery report](measurements/export-cache-recovery-2026-10-23.json.gz) pins
+the checker and every exported file. Reproduce the second check with
+`scripts/check-export-cache.py --campaign CAMPAIGN --project PROJECT --out NEW_DIR`
+(and the same `PEN_PLUGINS` directory, when needed). It modifies only the
+completed profiler campaign's isolated module cache; it refuses artifacts
+outside that directory.

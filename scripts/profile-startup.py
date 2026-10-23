@@ -138,6 +138,7 @@ def main():
     parser.add_argument("--baseline-project", type=Path, required=True)
     parser.add_argument("--candidate-project", type=Path, required=True)
     parser.add_argument("--pen", type=Path, default=Path("target/release/pen"))
+    parser.add_argument("--baseline-pen", type=Path, help="compare this host against --pen using the respective projects")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--frames", type=int, default=120)
@@ -149,6 +150,8 @@ def main():
     pen, out = args.pen.resolve(), args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     projects = {"baseline": args.baseline_project.resolve(), "candidate": args.candidate_project.resolve()}
+    hosts = {"baseline": args.baseline_pen.resolve() if args.baseline_pen else pen, "candidate": pen}
+    host_pins = {str(path): digest(path) for path in hosts.values()}
     # Project::written identifies .pen and target as generated output. Git
     # metadata is not an input; all actual sources and assets remain pinned.
     ignored_project_roots = (".git", ".pen", "target")
@@ -164,7 +167,7 @@ def main():
     plugin_pins = {str(p): digest(p) for p in sorted(Path(plugin_root).glob("*.wasm"))} if plugin_root else {}
     report = {"started_at": datetime.now(timezone.utc).isoformat(), "pen_sha256": digest(pen), "script_sha256": digest(Path(__file__)),
               "platform": platform.platform(), "load_start": os.getloadavg(), "source_pins": pins, "interval_ms": args.interval_ms,
-              "compiler_pins": compiler_pins, "library_pins": library_pins, "plugin_pins": plugin_pins,
+              "compiler_pins": compiler_pins, "library_pins": library_pins, "plugin_pins": plugin_pins, "host_pins": host_pins,
               "affinity": sorted(os.sched_getaffinity(0)), "cpu_count": os.cpu_count(),
               "environment": {key: os.environ.get(key) for key in ("BLOT_INLINING", "RAYON_NUM_THREADS")},
               "scope": __doc__, "ignored_project_roots": ignored_project_roots, "runs": args.runs, "frames": args.frames, "samples": []}
@@ -176,16 +179,17 @@ def main():
     expected_packets = None
     for run in range(args.runs):
         for variant in (["baseline", "candidate"] if run % 2 == 0 else ["candidate", "baseline"]):
+            variant_pen = hosts[variant]
             root = out / f"{run}-{variant}"
             root.mkdir()
             export_env = dict(os.environ, XDG_CACHE_HOME=str(root / "export-cache"))
             runtime_env = dict(os.environ, XDG_CACHE_HOME=str(root / "runtime-cache"))
             cold, warm = root / "bundle-cold", root / "bundle-warm"
             phases = [
-                ("export-cold", [str(pen), "export", "--project", str(projects[variant]), "--out", str(cold)], export_env),
-                ("export-warm", [str(pen), "export", "--project", str(projects[variant]), "--out", str(warm)], export_env),
-                ("packets-cold", [str(pen), "packets", str(root / "packets-cold-output"), "--game", str(cold), "--frames", str(args.frames)], runtime_env),
-                ("packets-warm", [str(pen), "packets", str(root / "packets-warm-output"), "--game", str(cold), "--frames", str(args.frames)], runtime_env),
+                ("export-cold", [str(variant_pen), "export", "--project", str(projects[variant]), "--out", str(cold)], export_env),
+                ("export-warm", [str(variant_pen), "export", "--project", str(projects[variant]), "--out", str(warm)], export_env),
+                ("packets-cold", [str(variant_pen), "packets", str(root / "packets-cold-output"), "--game", str(cold), "--frames", str(args.frames)], runtime_env),
+                ("packets-warm", [str(variant_pen), "packets", str(root / "packets-warm-output"), "--game", str(cold), "--frames", str(args.frames)], runtime_env),
             ]
             for phase, command, environment in phases:
                 result = measure(command, environment, root / phase, args.interval_ms / 1000, args.timeout_seconds)
@@ -213,7 +217,7 @@ def main():
             raise RuntimeError(f"Project changed during profiling: {name}")
     if digest(pen) != report["pen_sha256"]:
         raise RuntimeError("Pen executable changed during profiling")
-    for path, expected in {**compiler_pins, **plugin_pins}.items():
+    for path, expected in {**compiler_pins, **plugin_pins, **host_pins}.items():
         if digest(Path(path)) != expected:
             raise RuntimeError(f"Executable changed during profiling: {path}")
     for path, expected in library_pins.items():

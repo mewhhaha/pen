@@ -25,7 +25,7 @@ impl Uploads {
         if words.len() > self.previous.len() {
             self.ranges.push(0..words.len());
         } else {
-            for (instance, values) in words.chunks_exact(LANES).enumerate() {
+            for (instance, values) in words.as_chunks::<LANES>().0.iter().enumerate() {
                 let start = instance * LANES;
                 let end = start + LANES;
                 if values == &self.previous[start..end] {

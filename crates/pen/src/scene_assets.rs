@@ -150,7 +150,9 @@ impl Needs<'_> {
 pub fn compute(wasm: &[u8], assets: &Path, scene: &Path, frames: usize) -> Result<SceneAssets> {
     let catalog = read_catalog(assets)?;
     let engine = blot_host::engine()?;
-    let module = GuestModule::new(&engine, wasm, None).context("compiling the game to see what it draws first")?;
+    let cache = crate::cache_dir().map(|directory| directory.join("wasm"));
+    let module =
+        GuestModule::new(&engine, wasm, cache.as_deref()).context("compiling the game to see what it draws first")?;
     let mut program = Program::start(&engine, &module)?;
     program.request(Operation::Create, &[])?;
     program.accept();

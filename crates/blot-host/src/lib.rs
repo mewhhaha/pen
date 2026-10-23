@@ -235,12 +235,11 @@ fn compile(_engine: &Engine, _wasm: &[u8], _cache: Option<&Path>) -> Result<Modu
 
 #[cfg(feature = "compiler")]
 fn compile_cached(engine: &Engine, wasm: &[u8], directory: &Path) -> Result<Module> {
-    let path = directory.join(format!("{}.cwasm", cache_key(engine, wasm)));
+    let key = cache_key(engine, wasm);
+    let path = directory.join(format!("{key}.cwasm"));
     if path.exists() {
-        // SAFETY: the file is one this function wrote from these exact bytes
-        // with a compatible engine; wasmtime still checks its header.
-        match unsafe { Module::deserialize_file(engine, &path) } {
-            Ok(module) => {
+        match read_cached_module(engine, &path, &key) {
+            Some(module) => {
                 // Its modification time says when it was last used, for `prune`.
                 let _ = std::fs::File::options()
                     .write(true)
@@ -248,7 +247,7 @@ fn compile_cached(engine: &Engine, wasm: &[u8], directory: &Path) -> Result<Modu
                     .and_then(|file| file.set_modified(std::time::SystemTime::now()));
                 return Ok(module);
             }
-            Err(_) => {
+            None => {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -256,14 +255,87 @@ fn compile_cached(engine: &Engine, wasm: &[u8], directory: &Path) -> Result<Modu
     let module = Module::new(engine, wasm)?;
     // A cache that cannot be written only costs the next launch a compile.
     let _ = (|| -> Result<()> {
+        let serialized = module.serialize()?;
+        if serialized.len() > CACHE_MODULE_BYTES {
+            return Ok(());
+        }
         std::fs::create_dir_all(directory)?;
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&temporary, module.serialize()?)?;
-        std::fs::rename(&temporary, &path)?;
+        static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
+        let temporary =
+            path.with_extension(format!("{}-{}.tmp", std::process::id(), NEXT_WRITE.fetch_add(1, Ordering::Relaxed)));
+        write_cache_file(&temporary, &key, &serialized)?;
+        if let Err(error) = std::fs::rename(&temporary, &path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
         prune(directory, std::time::SystemTime::now())?;
         Ok(())
     })();
     Ok(module)
+}
+
+/// This local cache contains native executable code. The directory is trusted;
+/// the envelope detects accidental corruption and misplaced/stale artifacts,
+/// not an attacker who can replace both the bytes and their checksum.
+#[cfg(feature = "compiler")]
+const CACHE_MAGIC: &[u8] = b"PENCWASM\x01";
+#[cfg(feature = "compiler")]
+const CACHE_HEADER_BYTES: usize = CACHE_MAGIC.len() + 64 + 32;
+/// Optional disk entries above this size decline caching, without limiting
+/// which modules can compile. With CACHE_ENTRIES this bounds retained disk data.
+#[cfg(feature = "compiler")]
+const CACHE_MODULE_BYTES: usize = 64 << 20;
+
+#[cfg(feature = "compiler")]
+fn write_cache_file(path: &Path, key: &str, serialized: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    // A colliding temporary file belongs to another writer. Only remove a
+    // failed partial file after create_new has established our ownership.
+    let mut file = std::fs::File::options().write(true).create_new(true).open(path)?;
+    let written = (|| {
+        file.write_all(&cache_header(key, serialized))?;
+        file.write_all(serialized)
+    })();
+    if written.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    written
+}
+
+#[cfg(feature = "compiler")]
+fn cache_header(key: &str, serialized: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    [CACHE_MAGIC, key.as_bytes(), &Sha256::digest(serialized)].concat()
+}
+
+#[cfg(feature = "compiler")]
+fn checked_cache_bytes<'a>(bytes: &'a [u8], key: &str) -> Option<&'a [u8]> {
+    if key.len() != 64 || bytes.len() < CACHE_HEADER_BYTES || bytes.len() - CACHE_HEADER_BYTES > CACHE_MODULE_BYTES {
+        return None;
+    }
+    let (header, serialized) = bytes.split_at(CACHE_HEADER_BYTES);
+    if header != cache_header(key, serialized) {
+        return None;
+    }
+    Some(serialized)
+}
+
+#[cfg(feature = "compiler")]
+fn read_cached_module(engine: &Engine, path: &Path, key: &str) -> Option<Module> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let limit = u64::try_from(CACHE_HEADER_BYTES + CACHE_MODULE_BYTES).ok()?;
+    if file.metadata().ok()?.len() > limit {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).ok()?;
+    let serialized = checked_cache_bytes(&bytes, key)?;
+    // SAFETY: only this trusted local cache writes these native artifacts. The
+    // exact source/engine key and payload checksum were checked before handing
+    // an immutable owned byte buffer to Wasmtime; no reopen can race that check.
+    unsafe { Module::deserialize(engine, serialized) }.ok()
 }
 
 /// The module cache's name for `wasm` compiled by `engine`: SHA-256 over the
@@ -306,9 +378,13 @@ fn prune(directory: &Path, now: std::time::SystemTime) -> std::io::Result<()> {
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
-        let used = entry.metadata()?.modified()?;
+        let metadata = entry.metadata()?;
+        let used = metadata.modified()?;
         let unused = now.duration_since(used).unwrap_or_default();
         match path.extension().and_then(|extension| extension.to_str()) {
+            Some("cwasm") if metadata.len() > u64::try_from(CACHE_MODULE_BYTES + CACHE_HEADER_BYTES).unwrap() => {
+                let _ = std::fs::remove_file(&path);
+            }
             Some("cwasm") => entries.push((used, unused, path)),
             Some("tmp") if unused > Duration::from_secs(60 * 60) => {
                 let _ = std::fs::remove_file(&path);
@@ -1280,8 +1356,9 @@ const BACKTRACE_FRAMES: usize = 512;
 #[cfg(feature = "compiler")]
 static DEV_ENGINE: std::sync::Mutex<Option<Engine>> = std::sync::Mutex::new(None);
 
-/// What [`dev_engine`]'s cache keeps of compiled functions, at most twice
-/// over. Compiling gdev's game and dev tools puts about 3.7 MB in it.
+/// What one generation of [`dev_engine`]'s cache keeps of compiled functions.
+/// Both generations together retain at most twice this many key/value bytes;
+/// allocator overhead and the compiler's active scratch are separate.
 #[cfg(feature = "compiler")]
 const DEV_CACHE_BYTES: usize = 32 << 20;
 
@@ -1312,16 +1389,25 @@ impl MemoryCache {
 
 #[cfg(feature = "compiler")]
 impl Generations {
-    fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) {
-        if self.bytes >= self.limit {
+    fn insert(&mut self, key: Vec<u8>, value: Vec<u8>) -> bool {
+        let Some(size) = key.len().checked_add(value.len()) else {
+            return false;
+        };
+        if self.limit == 0 || size > self.limit {
+            return false;
+        }
+        let replaced = self.newer.get(&key).map_or(0, |value| key.len() + value.len());
+        if self.bytes - replaced > self.limit - size {
             self.older = std::mem::take(&mut self.newer);
             self.bytes = 0;
         }
+        self.older.remove(&key);
         let (key_bytes, value_bytes) = (key.len(), value.len());
         if let Some(replaced) = self.newer.insert(key, value) {
             self.bytes -= key_bytes + replaced.len();
         }
         self.bytes += key_bytes + value_bytes;
+        true
     }
 }
 
@@ -1338,8 +1424,7 @@ impl wasmtime::CacheStore for MemoryCache {
     }
 
     fn insert(&self, key: &[u8], value: Vec<u8>) -> bool {
-        self.0.lock().unwrap().insert(key.to_vec(), value);
-        true
+        self.0.lock().unwrap().insert(key.to_vec(), value)
     }
 }
 
@@ -1820,7 +1905,117 @@ mod tests {
         assert!(store.get(b"b").is_none(), "dropped with its generation");
         assert!(store.get(b"a").is_some() && store.get(b"e").is_some());
         let generations = cache.0.lock().unwrap();
-        assert!(generations.bytes <= 10 + 5 && generations.newer.len() + generations.older.len() <= 4);
+        assert!(generations.bytes <= 10 && generations.newer.len() + generations.older.len() <= 4);
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn development_cache_rejects_oversized_entries_and_bounds_each_generation() {
+        let cache = MemoryCache::new(10);
+        let store: &dyn wasmtime::CacheStore = &cache;
+        assert!(store.insert(b"a", vec![1; 9]));
+        assert!(!store.insert(b"oversized", vec![2; 10]));
+        assert_eq!(store.get(b"a").unwrap().as_ref(), &[1; 9]);
+        assert!(store.get(b"oversized").is_none());
+        for index in 0..128u8 {
+            assert!(store.insert(&[index], vec![index; 6]));
+            assert_eq!(store.get(&[index]).unwrap().as_ref(), &[index; 6]);
+            let generations = cache.0.lock().unwrap();
+            let size = |entries: &std::collections::HashMap<Vec<u8>, Vec<u8>>| {
+                entries.iter().map(|(key, value)| key.len() + value.len()).sum::<usize>()
+            };
+            assert_eq!(generations.bytes, size(&generations.newer));
+            assert!(generations.bytes <= 10 && size(&generations.older) <= 10);
+        }
+        assert!(store.get(b"a").is_none(), "eviction falls back to compilation");
+        let disabled = MemoryCache::new(0);
+        let disabled: &dyn wasmtime::CacheStore = &disabled;
+        assert!(!disabled.insert(b"", vec![]));
+        assert!(disabled.get(b"").is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn development_cache_replacement_uses_its_existing_space() {
+        let cache = MemoryCache::new(10);
+        let store: &dyn wasmtime::CacheStore = &cache;
+        assert!(store.insert(b"a", vec![1; 4]));
+        assert!(store.insert(b"b", vec![2; 4]));
+        assert!(store.insert(b"a", vec![3; 4]));
+        assert_eq!(store.get(b"a").unwrap().as_ref(), &[3; 4]);
+        assert_eq!(store.get(b"b").unwrap().as_ref(), &[2; 4]);
+        let generations = cache.0.lock().unwrap();
+        assert!(generations.older.is_empty());
+        assert_eq!(generations.bytes, 10);
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn module_cache_checks_complete_payload_and_exact_key_before_loading() {
+        let key = "a".repeat(64);
+        let payload = b"a serialized module is opaque to the envelope";
+        let bytes = [cache_header(&key, payload), payload.to_vec()].concat();
+        assert_eq!(checked_cache_bytes(&bytes, &key), Some(&payload[..]));
+        assert!(checked_cache_bytes(&bytes, &"b".repeat(64)).is_none());
+        for length in 0..bytes.len() {
+            assert!(checked_cache_bytes(&bytes[..length], &key).is_none());
+        }
+        for index in 0..bytes.len() {
+            let mut corrupt = bytes.clone();
+            corrupt[index] ^= 1;
+            assert!(checked_cache_bytes(&corrupt, &key).is_none());
+        }
+        let mut extended = bytes.clone();
+        extended.push(0);
+        assert!(checked_cache_bytes(&extended, &key).is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn module_cache_does_not_remove_another_writers_temporary_file() {
+        let path = std::env::temp_dir().join(format!("pen-cache-collision-{}", std::process::id()));
+        std::fs::write(&path, b"another writer's partial bytes").unwrap();
+        let key = "a".repeat(64);
+        assert_eq!(write_cache_file(&path, &key, b"payload").unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"another writer's partial bytes");
+        std::fs::remove_file(&path).unwrap();
+        write_cache_file(&path, &key, b"payload").unwrap();
+        assert_eq!(checked_cache_bytes(&std::fs::read(&path).unwrap(), &key), Some(&b"payload"[..]));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn module_cache_recovers_from_corruption_old_formats_and_wrong_artifacts() {
+        static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+        let directory = std::env::temp_dir().join(format!(
+            "pen-module-cache-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        let engine = engine().unwrap();
+        let wasm = looping_guest();
+        let key = cache_key(&engine, &wasm);
+        let path = directory.join(format!("{key}.cwasm"));
+        GuestModule::new(&engine, &wasm, Some(&directory)).unwrap();
+        let valid = std::fs::read(&path).unwrap();
+        let payload = checked_cache_bytes(&valid, &key).unwrap();
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        let wrong = [cache_header(&"b".repeat(64), payload), payload.to_vec()].concat();
+        for rejected in [vec![], payload.to_vec(), corrupt, wrong, valid[..valid.len() / 2].to_vec()] {
+            std::fs::write(&path, rejected).unwrap();
+            assert!(read_cached_module(&engine, &path, &key).is_none());
+            GuestModule::new(&engine, &wasm, Some(&directory)).unwrap();
+            assert!(read_cached_module(&engine, &path, &key).is_some());
+        }
+        let oversized = std::fs::File::options().write(true).open(&path).unwrap();
+        oversized.set_len(u64::try_from(CACHE_HEADER_BYTES + CACHE_MODULE_BYTES + 1).unwrap()).unwrap();
+        assert!(read_cached_module(&engine, &path, &key).is_none());
+        drop(oversized);
+        GuestModule::new(&engine, &wasm, Some(&directory)).unwrap();
+        assert!(read_cached_module(&engine, &path, &key).is_some());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1849,8 +2044,16 @@ mod tests {
         let abandoned = file("a.1234.tmp", day);
         let writing = file("b.1234.tmp", Duration::ZERO);
         let other = file("notes.txt", day * 30);
+        let oversized = file("oversized.cwasm", Duration::ZERO);
+        std::fs::File::options()
+            .write(true)
+            .open(&oversized)
+            .unwrap()
+            .set_len(u64::try_from(CACHE_MODULE_BYTES + CACHE_HEADER_BYTES + 1).unwrap())
+            .unwrap();
         prune(&directory, now).unwrap();
         assert!(!stale.exists() && used.exists() && !abandoned.exists() && writing.exists() && other.exists());
+        assert!(!oversized.exists(), "oversized legacy entries do not evade the disk bound");
         let recent: Vec<_> = (0..CACHE_ENTRIES)
             .map(|age| file(&format!("{age}.cwasm"), day * u32::try_from(age).unwrap() / 4))
             .collect();
@@ -1864,5 +2067,25 @@ mod tests {
         GuestModule::new(&engine, &wasm, Some(&directory)).unwrap();
         assert_eq!(module.abi().functions.len(), 2);
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn bounded_inlining_artifacts_require_matching_runtime_configuration() {
+        let normal = Engine::new(&config(true)).unwrap();
+        let mut bounded = config(true);
+        // SAFETY: the pinned Wasmtime 49 setting only bounds inline expansion.
+        unsafe {
+            bounded.cranelift_flag_set("wasmtime_inlining_sum_size_threshold", "128");
+        }
+        let bounded = Engine::new(&bounded).unwrap();
+        let compiled = wasmtime::Module::new(&bounded, looping_guest()).unwrap();
+        let artifact = compiled.serialize().unwrap();
+        // SAFETY: these bytes were just serialized by the same Wasmtime build.
+        let mismatch = unsafe { wasmtime::Module::deserialize(&normal, &artifact) }.unwrap_err();
+        assert!(mismatch.to_string().contains("function inlining sum-size threshold"));
+        // SAFETY: the producer and consumer use the identical configuration.
+        let loaded = unsafe { wasmtime::Module::deserialize(&bounded, &artifact) }.unwrap();
+        assert_eq!(loaded.exports().count(), compiled.exports().count());
     }
 }

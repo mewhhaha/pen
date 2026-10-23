@@ -57,11 +57,15 @@ impl GameRuntime {
         follow(host: &mut dyn Host, frame: &RenderFrame) -> Result<()>;
         reload(host: &mut dyn Host, module: GuestModule, catalog: Catalog) -> ReloadResult;
         snapshot() -> Result<SavedState>;
-        shared_snapshot() -> Result<std::sync::Arc<SavedState>>;
         moment() -> Result<Moment>;
         restore(host: &mut dyn Host, moment: &Moment) -> Result<RenderFrame>;
         load(host: &mut dyn Host, saved: &SavedState) -> Result<()>;
         load_scene(host: &mut dyn Host, saved: &SavedState) -> Result<()>;
+    }
+
+    #[cfg(feature = "devtools")]
+    blocking! {
+        shared_snapshot() -> Result<std::sync::Arc<SavedState>>;
     }
 
     pub fn close(&mut self) {

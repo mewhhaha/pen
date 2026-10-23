@@ -266,10 +266,10 @@ fn start(mut context: impl AsContextMut<Data = State>, id: u32) -> Result<()> {
     }
     activate(context.as_context_mut(), prior)?;
     let task = state(&context).task(id)?;
-    if task.cancel || task.failure.is_some() {
-        if let Err(error) = discard(context.as_context_mut(), id) {
-            failed(context.as_context_mut(), id, format!("{error:#}"))?;
-        }
+    if (task.cancel || task.failure.is_some())
+        && let Err(error) = discard(context.as_context_mut(), id)
+    {
+        failed(context.as_context_mut(), id, format!("{error:#}"))?;
     }
     let mut scope = context.as_context_mut();
     let runtime = scope.data_mut().tasks.as_mut().unwrap();
@@ -456,7 +456,9 @@ fn invoke(mut caller: Caller<'_, State>, name: &str, arguments: &[Val], results:
                 );
             }
             let entries: Vec<_> = bytes[input..input + count * 8]
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .map(|pair| {
                     (
                         u32::from_le_bytes(pair[..4].try_into().unwrap()),

@@ -179,6 +179,8 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
     };
     RenderFrame {
         hide_cursor: false,
+        loading: false,
+        show_captions: false,
         ambient: vector(0.25, 0.27, 0.3),
         aberration: Aberration { x: 0.0, y: 0.0 },
         blur: 0.0,

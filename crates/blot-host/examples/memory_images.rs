@@ -19,6 +19,7 @@ use pen_protocol::boundary::encode_frame;
 use pen_protocol::{Frame, GameEvent, Viewport};
 use pen_runtime::memory_image::{MemoryImage, PAGE};
 use pen_runtime::program::{Operation, request};
+use sha2::{Digest, Sha256};
 use wasmtime::{Caller, Engine, ExternRef, Linker, Module, Rooted, Store};
 
 /// Frames between the moments the timeline keeps (pen-runtime's).
@@ -49,6 +50,7 @@ struct Driver {
     /// When each response came, for the second run.
     answered: Vec<(Option<Operation>, Instant)>,
     imaging: bool,
+    trace: Sha256,
 }
 
 fn exchange(mut caller: Caller<'_, Driver>, pointer: i32) -> Result<i32> {
@@ -64,6 +66,10 @@ fn exchange(mut caller: Caller<'_, Driver>, pointer: i32) -> Result<i32> {
         .map(|chunk| f32::from_le_bytes(*chunk))
         .collect();
     let driver = caller.data_mut();
+    driver.trace.update(u64::try_from(lanes.len())?.to_le_bytes());
+    for lane in &lanes {
+        driver.trace.update(lane.to_bits().to_le_bytes());
+    }
     let sent = driver.sent;
     let took = driver.sent_at.map(|sent| now - sent);
     driver.answered.push((sent, now));
@@ -175,10 +181,20 @@ fn largest(values: &[Duration]) -> f64 {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let path = args.next().context("usage: memory_images GAME.wasm [FRAMES]")?;
+    let path = args.next().context("usage: memory_images GAME.wasm [FRAMES] [INLINE_BUDGET]")?;
     let frames: usize = args.next().map(|frames| frames.parse()).transpose()?.unwrap_or(600);
+    let inline_budget: Option<u32> = args.next().map(|budget| budget.parse()).transpose()?;
     let wasm = std::fs::read(&path).with_context(|| format!("reading {path}"))?;
-    let engine = blot_host::engine()?;
+    let mut engine = blot_host::engine()?;
+    if let Some(budget) = inline_budget {
+        let mut config = engine.config().clone();
+        // SAFETY: this Wasmtime 49 option changes only the expansion limit,
+        // without changing ISA features or memory-safety checks.
+        unsafe {
+            config.cranelift_flag_set("wasmtime_inlining_sum_size_threshold", &budget.to_string());
+        }
+        engine = Engine::new(&config)?;
+    }
     let module = Module::new(&engine, &wasm)?;
     let viewport = Viewport { width: 1280, height: 720 };
     let input = |index: usize| {
@@ -197,6 +213,12 @@ fn main() -> Result<()> {
     }
     let (mut played, _) = run(&engine, &module, driver)?;
     ensure!(!played.copied.is_empty() && !played.state.is_empty(), "the game played no frames");
+    let trace: String = played.trace.clone().finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut state = Sha256::new();
+    for lane in &played.state {
+        state.update(lane.to_bits().to_le_bytes());
+    }
+    let state: String = state.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
 
     // Today's restore: a new program, its handshake, the Restore and a frame.
     let mut fresh = Driver::default();
@@ -213,6 +235,7 @@ fn main() -> Result<()> {
     let first = at(Some(Operation::Frame));
 
     let pages = played.memory_bytes / PAGE;
+    let frame_ns: Vec<_> = played.frames.iter().map(Duration::as_nanos).collect();
     let mean = |values: &[usize]| values.iter().sum::<usize>() as f64 / values.len().max(1) as f64;
     let (written, restoring) = played.restored.unwrap_or_default();
     println!("{path}: {frames} frames; memory {:.1} MB ({pages} pages)", played.memory_bytes as f64 / 1e6);
@@ -255,5 +278,8 @@ fn main() -> Result<()> {
         MOMENT_INTERVAL - 1,
         median(&mut played.frames) * (MOMENT_INTERVAL - 1) as f64,
     );
+    // Host image capture and hashing occur outside these guest intervals.
+    // Preserve every raw interval so different inlining limits can be paired.
+    println!("bench: {{\"trace\":\"{trace}\",\"snapshot\":\"{state}\",\"frame_ns\":{frame_ns:?}}}");
     Ok(())
 }

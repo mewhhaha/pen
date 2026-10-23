@@ -483,7 +483,8 @@ impl State {
                     &mut encoder,
                     &output,
                     &scratch.sprites,
-                    cursor as u32..end as u32,
+                    u32::try_from(cursor).expect("bounded sprite count")
+                        ..u32::try_from(end).expect("bounded sprite count"),
                     self.timer.pass(Span::Overlay),
                 );
                 cursor = end;
@@ -509,7 +510,8 @@ impl State {
                 &mut encoder,
                 &output,
                 &scratch.sprites,
-                cursor as u32..scratch.sprite_order.len() as u32,
+                u32::try_from(cursor).expect("bounded sprite count")
+                    ..u32::try_from(scratch.sprite_order.len()).expect("bounded sprite count"),
                 self.timer.pass(Span::Overlay),
             );
         }

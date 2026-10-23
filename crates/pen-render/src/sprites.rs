@@ -170,7 +170,14 @@ impl Sprites {
     ) {
         self.set_scene(None);
         self.prepare(device, queue, size, sprites, order);
-        self.draw_prepared(device, encoder, output, batches, 0..order.len() as u32, timestamps);
+        self.draw_prepared(
+            device,
+            encoder,
+            output,
+            batches,
+            0..u32::try_from(order.len()).expect("bounded sprite count"),
+            timestamps,
+        );
     }
 
     /// Upload once, then draw ranges between the frame's 3D UI layers.

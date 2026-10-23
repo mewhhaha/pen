@@ -842,7 +842,10 @@ mod shadow_tests {
         pump(&mut state, |state| shader(state, shader_slot).made.get(&4).is_some_and(|made| made.instanced.is_some()));
         assert!(state.ensure_variants(shader_slot, 4, Variants::INSTANCED));
         pump(&mut state, |state| shader(state, shader_slot).made[&4].opaque.is_some());
-        assert_eq!(shader(&state, shader_slot).made[&4].variants(), Variants::OPAQUE | Variants::INSTANCED);
+        assert_eq!(
+            shader(&state, shader_slot).made[&4].variants(),
+            Variants::OPAQUE | Variants::INSTANCED | Variants::INSET
+        );
 
         // A caster arriving after its shared shader asks for background work.
         let caster_started = Instant::now();

@@ -8,8 +8,7 @@ fn fixture() -> Result<Vec<u8>> {
     static BYTES: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
     BYTES
         .get_or_init(|| compile_fixture().map_err(|error| format!("{error:#}")))
-        .as_ref()
-        .map(Clone::clone)
+        .clone()
         .map_err(|error| anyhow::anyhow!("{error}"))
 }
 fn compile_fixture() -> Result<Vec<u8>> {
@@ -97,7 +96,7 @@ fn copied_worker_batches_are_bounded_ordered_and_reusable() -> Result<()> {
     for _ in 0..3 {
         let results = pool.run((0..32).map(Value::U32).collect())?;
         for (index, value) in results.into_iter().enumerate() {
-            assert_eq!(value.unwrap(), Value::U32(index as u32 * 2 + 42));
+            assert_eq!(value.unwrap(), Value::U32(u32::try_from(index)? * 2 + 42));
         }
     }
     assert!(pool.run(vec![Value::U32(0); 33]).is_err());

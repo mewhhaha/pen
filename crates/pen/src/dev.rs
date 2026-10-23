@@ -92,7 +92,10 @@ impl Dev {
                 let catalog = read_catalog(&assets)?;
                 // No cache: every edit would leave another compiled copy behind.
                 let module = match trace {
+                    #[cfg(feature = "compiler")]
                     Some(trace) => GuestModule::traced(&engine, &bytes, None, trace)?,
+                    #[cfg(not(feature = "compiler"))]
+                    Some(_) => anyhow::bail!("system tracing requires compiler support"),
                     None => GuestModule::new(&engine, &bytes, None)?,
                 };
                 let milliseconds = started.elapsed().as_secs_f64() * 1000.0;

@@ -74,6 +74,7 @@ impl SystemTrace {
     }
 
     /// Freeze one polling window so pagination cannot mix samples from different frames.
+    #[allow(clippy::cast_possible_truncation, reason = "diagnostic timings use float32 wire values")]
     pub fn systems(&self, enabled: bool, first: usize) -> (usize, Vec<f32>) {
         self.enabled.store(enabled, Ordering::Relaxed);
         let mut live = self.live.lock().unwrap();
@@ -133,7 +134,7 @@ impl SystemTrace {
         let allocations = counts.allocations.wrapping_sub(span.counts.allocations);
         if let Some(stage) = STAGES.iter().position(|stage| *stage == span.category) {
             let mut live = self.live.lock().unwrap();
-            let key = (stage as u32, span.id, span.name.clone());
+            let key = (u32::try_from(stage).expect("bounded stage table"), span.id, span.name.clone());
             ensure!(live.totals.contains_key(&key) || live.totals.len() < 4096, "too many live systems");
             let total = live.totals.entry(key).or_default();
             if self.enabled.load(Ordering::Relaxed) {

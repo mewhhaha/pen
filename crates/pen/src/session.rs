@@ -409,6 +409,7 @@ pub struct Session {
     paths: Paths,
     engine: wasmtime::Engine,
     pub gpu: Gpu,
+    #[cfg(feature = "devtools")]
     pub system_trace: Option<std::sync::Arc<blot_host::SystemTrace>>,
     runtime: GameRuntime,
     state_adapter: Arc<dyn StateAdapter>,
@@ -588,6 +589,7 @@ impl Session {
         let captions = Captions::shared(load_captions(&paths.assets));
         services.register(Box::new(CaptionsService(captions.clone())));
         crate::saves::check_all([&paths.quicksave, &paths.scene].into_iter().filter(|path| paths.kept(path)));
+        #[cfg(feature = "devtools")]
         let system_trace = module.system_trace();
         let dev = if options.dev { Some(Dev::new(&paths.game, &paths.assets, module.system_trace())?) } else { None };
         let mut audio = audio;
@@ -631,6 +633,7 @@ impl Session {
             timeline.keep_history(Some(history_seconds()));
         }
         Ok(Session {
+            #[cfg(feature = "devtools")]
             system_trace,
             options,
             paths,
@@ -898,6 +901,7 @@ impl Session {
 
     /// The running game's shared state; unavailable during an overlapped frame
     /// or when the guest cannot serialize it.
+    #[cfg(feature = "devtools")]
     pub fn snapshot(&mut self) -> Option<Arc<SavedState>> {
         if self.overlap.flight.is_some() {
             return None;

@@ -5,7 +5,7 @@
 //! compiles, and this reads it for the `tune=NAME=VALUE` script step, the
 //! dev tools' `tuned` answer and baking, and the browser host's bake. A tunable reaches the game as a `GameEvent::Tune` whose `index`
 //! is the tunable's id, a hash of its name, and what the game holds is game
-//! state, in a saved section this reads back (`tuned_values`). Baking writes
+//! state, read through the selected state adapter. Baking writes
 //! the game's values into the file as defaults, preserving its formatting.
 //! Presets are named sets of values in `src/tunable_presets.json`, which the
 //! dev tools save from the game and tune it to.
@@ -121,12 +121,6 @@ pub fn load(root: &Path) -> Result<Vec<Declared>, String> {
         Err(error) => Err(format!("{}: {error}", path(root).display())),
     }
 }
-
-/// What a saved state holds for each tunable the host set, by id:
-/// persist.blot's framing, `magic, schema, count`, then
-/// each section's `key, version, width, length` and lanes.
-#[cfg(any(feature = "devtools", test))]
-pub use pen_runtime::tunables::tuned_values;
 
 impl Declared {
     /// The value the game reads (Ink's `tune.value`): as set, or its
@@ -328,22 +322,11 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_tuned_section_of_a_state() {
-        let id = tunable_id("gnorps.haul_speed");
-        let haul = id as f32;
-        let state = [5678.0, 26.0, 2.0, 1.0, 1.0, 0.0, 2.0, 7.0, 8.0, 11.0, 1.0, 0.0, 4.0, haul, 3.5, 99.0, 1.0];
-        let tuned = tuned_values(&state);
-        assert_eq!(tuned.len(), 2);
-        assert_eq!(tuned[&id], 3.5);
+    fn live_values_use_defaults_and_clamp_overrides() {
         let declared =
             Declared { name: "x".into(), id: 99, default: 0.5, min: 0.0, max: 0.75, step: None, doc: String::new() };
-        assert_eq!(declared.live(&tuned), 0.75);
+        assert_eq!(declared.live(&HashMap::from([(99, 1.0)])), 0.75);
         assert_eq!(declared.live(&HashMap::new()), 0.5);
-        assert!(tuned_values(&[1.0, 2.0, 3.0]).is_empty());
-        // A truncated state reads as far as it goes.
-        assert!(tuned_values(&state[..12]).is_empty());
-        // As does one whose counts are past any state.
-        assert!(tuned_values(&[5678.0, 26.0, 1e30, 11.0, 0.0, 0.0, 1e30, haul, 1.0]).is_empty());
     }
 
     #[test]

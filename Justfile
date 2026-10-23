@@ -18,10 +18,10 @@ install: plugins web-host
   mv -f ~/.local/lib/pen-runtime/libsteam_api.so.new ~/.local/lib/pen-runtime/libsteam_api.so
   cp plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm ~/.local/lib/pen-runtime/plugins/blot.wasm.new
   mv -f ~/.local/lib/pen-runtime/plugins/blot.wasm.new ~/.local/lib/pen-runtime/plugins/blot.wasm
-  cp crates/pen-web/pkg/{pen_web.js,pen_web_bg.wasm,guest.js,index.html} ~/.local/lib/pen-runtime/web/
+  cp crates/pen-web/pkg/{pen_web.js,pen_web_bg.wasm,guest.js,structured.js,index.html} ~/.local/lib/pen-runtime/web/
   find ~/.local/lib/pen-runtime/plugins -mindepth 1 -maxdepth 1 ! -name blot.wasm \
     -exec echo removing stale {} \; -exec rm -rf {} +
-  find ~/.local/lib/pen-runtime/web -mindepth 1 -maxdepth 1 ! -name pen_web.js ! -name pen_web_bg.wasm ! -name guest.js ! -name index.html \
+  find ~/.local/lib/pen-runtime/web -mindepth 1 -maxdepth 1 ! -name pen_web.js ! -name pen_web_bg.wasm ! -name guest.js ! -name structured.js ! -name index.html \
     -exec echo removing stale {} \; -exec rm -rf {} +
   cp LICENSE THIRD_PARTY_NOTICES.md ~/.local/lib/pen-runtime/
   ln -sf ~/.local/lib/pen-runtime/pen ~/.local/bin/pen

@@ -85,13 +85,38 @@ await start(canvas, {
 });
 ```
 
+Sound captions appear only when the game sets `show_captions`, following its
+saved accessibility choice. Disabled or empty captions have no text box or live
+region. The caption service remains available for game-owned presentation.
+
+Games can set the frame's `loading` flag to draw their startup sprites above
+the renderer's cover while the scene loads. `RendererReady` arrives once those
+resources settle; the game's own presentation decides when to reveal the menu.
+This path is shared with native Pen, so exports need no HTML loading overlay.
+
+The canvas receives `data-ready="true"` once a complete startup frame has left
+its GPU queue: streaming, pending assets and the renderer's veil have finished.
+This one-shot signal is available without `qualify`, so a page can finish its own
+loading presentation without packet hashing or event instrumentation.
+
 The canvas is backed by device pixels: its CSS size times the display's
 `devicePixelRatio`, followed as the page moves between screens or zooms. The
 game lays out on those pixels and draws its scene at its quality scale of
 them, as native pen does with a window's physical size. Pointer positions
-are in the same pixels. One frame is in flight: the GPU draws it while the
-next is computed, and the next waits for it before it is submitted, which
-bounds the queue on slow adapters.
+are in the same pixels. At most two frames are in flight: the GPU draws them
+while the next is computed. Waiting for the oldest only when both slots are
+occupied bounds the queue without serializing every frame on a GPU completion
+notification (which Firefox can deliver late). After all asynchronous work and
+any GPU wait, drawing starts in the next animation callback, with no awaits
+between acquiring the canvas texture and submitting it. This keeps presentation
+aligned with the browser repaint even when guests run in workers.
+
+Frame diagnostics count those GPU-backpressure and repaint waits as `pace`,
+separate from `render`, canvas `acquire` and `present` call durations. The
+render phase includes both the game and developer overlay. The CPU summary
+excludes surface calls and explicit pacing; GPU pass timestamps stay separate.
+These host timings are wall-clock durations, so driver stalls inside command
+submission still count as rendering.
 
 Time travel works as natively: a history keeps each frame's input and a
 moment every 30 frames, a rewind restores the nearest moment and runs the
@@ -157,6 +182,14 @@ and `data-events`, the input events of the last frames that ran, recorded or
 live (each its five lanes; assets' and services' left out). The harnesses
 add the flag to the URLs they are given.
 
+In qualification mode, `data-devtools-request` accepts one JSON command with
+`operation`, optional numeric `a`–`d`, and optional JSON `text`.
+`data-devtools-answer` carries its status, number, values and decoded text.
+`tests/semantic.mjs` uses this hook to exercise the real browser host's typed
+inspection, transition watches, save restores and reloads against the native
+fixture. See [semantic inspection](../../docs/semantic-inspection.md) for the
+fixture export and commands; both JSPI and worker guests are covered.
+
 `tests/conformance.mjs` compares every native `pen packets` output byte with
 the browser guest and exercises snapshot storage, pathfinding, unavailable
 services and WebAudio. Serve the exported game, set `PEN_PACKETS` to the packet
@@ -164,6 +197,11 @@ directory and `PEN_CONFORMANCE_URL` to `qualification.html` beside the export;
 the harness supplies that blank page. `PLAYWRIGHT_MODULE` can point to the
 installed Playwright ES module. `tests/browser.mjs` captures the actual game,
 Blot panels and resize; `PEN_WEB_URL` and `PEN_WEB_SHOTS` select its URL/output.
+`tests/pacing.mjs` delays guest replies to check that canvas submission stays
+inside repaint, then holds GPU completion notifications to verify the two-frame
+bound, resume, pause and resize. `PEN_WEB_SITE` selects its export; `PEN_WEB_HOST`
+can override the host files while testing a new build. Run it with both browser
+engines and with `PEN_WEB_WITHOUT=jspi` for the worker path.
 `tests/fxaa.mjs` executes renderer shader witnesses on browser WebGPU.
 It fetches native raw RGBA outputs and asserts all twelve agree within one LSB.
 Full game captures use native Vulkan by default; set `PEN_WEB_GPU=software`

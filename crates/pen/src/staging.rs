@@ -39,6 +39,11 @@ impl Staging {
         for checkout in
             std::iter::once(root.as_path()).chain(destination.ancestors().filter(|path| path.join(".git").exists()))
         {
+            // The application's own build directories may sit in a parent
+            // dotfiles/monorepo checkout; they were already checked against root.
+            if checkout != root && root.starts_with(checkout) && destination.starts_with(&root) {
+                continue;
+            }
             if let Ok(relative) = destination.strip_prefix(checkout) {
                 let first = relative.components().next();
                 ensure!(
@@ -87,6 +92,24 @@ impl Drop for Staging {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn nested_checkouts_can_build_without_allowing_parent_sources() {
+        let outer = crate::project::temporary_dir()
+            .unwrap()
+            .join("dist")
+            .join(format!("nested-staging-{}", std::process::id()));
+        let root = outer.join("src/game");
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        assert!(Staging::new(&root, &root.join(".pen/web")).is_ok());
+        assert!(Staging::new(&root, &root.join("src/output")).is_err());
+        assert!(Staging::new(&root, &outer.join("src/other/output")).is_err());
+        let build = Staging::new(&root, &outer.join("dist/game"));
+        assert!(build.is_ok(), "{:?}", build.err());
+        drop(build);
+        std::fs::remove_dir_all(outer).unwrap();
+    }
+
     #[test]
     fn failed_build_preserves_output_and_success_replaces_it() {
         let root = crate::project::temporary_dir().unwrap().join(format!("staging-{}", std::process::id()));

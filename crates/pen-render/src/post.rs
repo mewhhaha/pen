@@ -216,7 +216,7 @@ pub(crate) struct SceneTargets {
     pub depth: wgpu::TextureView,
     /// The depth alone, for passes that read it while it stays attached.
     pub depth_only: wgpu::TextureView,
-    scene: wgpu::TextureView,
+    pub scene: wgpu::TextureView,
     multisampled: Option<wgpu::TextureView>,
 }
 

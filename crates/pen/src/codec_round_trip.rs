@@ -45,11 +45,11 @@ const MAX_INTEGER: u32 = 16_777_215;
 const CASES: u64 = 2000;
 const SEED: u64 = 0x5eed_c0de_ca5e_0000;
 /// GameEvent's variants, which `variant` numbers.
-const VARIANTS: usize = 29;
+const VARIANTS: usize = 30;
 /// The first of them, which pen's own bindings decode: all but Game, the
 /// game's own events, which only a checkout that declares them decodes (its
 /// pen/extensions.blot), so the random frames leave it out.
-const CORE_VARIANTS: usize = 28;
+const CORE_VARIANTS: usize = 29;
 
 #[test]
 fn input_packets_mean_the_same_to_rust_and_blot() {
@@ -451,7 +451,8 @@ fn variant(event: &GameEvent) -> usize {
         GameEvent::Pinch { .. } => 25,
         GameEvent::Player { .. } => 26,
         GameEvent::SessionStarted { .. } => 27,
-        GameEvent::Game { .. } => 28,
+        GameEvent::RendererReady => 28,
+        GameEvent::Game { .. } => 29,
     }
 }
 
@@ -508,7 +509,8 @@ fn random_event(rng: &mut Rng) -> GameEvent {
         24 => GameEvent::Pan { touches: rng.whole(31), dx: rng.number(), dy: rng.number() },
         25 => GameEvent::Pinch { x: rng.number(), y: rng.number(), scale: rng.number() },
         26 => GameEvent::Player { index: rng.whole(255) },
-        _ => GameEvent::SessionStarted { restored: rng.whole(1) },
+        27 => GameEvent::SessionStarted { restored: rng.whole(1) },
+        _ => GameEvent::RendererReady,
     }
 }
 
@@ -567,7 +569,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
     let state = rng.numbers(count);
     let sounds = if catalog.sounds.is_empty() { 0 } else { rng.count(12) };
     let voices = if catalog.sounds.is_empty() { 0 } else { rng.count(12) };
-    let frame = RenderFrame {
+    let mut frame = RenderFrame {
         save_requested: rng.flag(),
         load_requested: rng.flag(),
         scene_save_requested: rng.flag(),
@@ -607,6 +609,8 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
         blur: rng.number(),
         clouds: Clouds { cover: rng.number(), drift: Drift { x: rng.number(), z: rng.number() } },
         hide_cursor: rng.flag(),
+        loading: rng.flag(),
+        show_captions: rng.flag(),
         draws: {
             let count = rng.count(12);
             rng.list(count, |rng| random_draw(rng, catalog))
@@ -670,6 +674,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                     rng.list(count, |rng| random_draw(rng, catalog))
                 },
                 pixel_size: rng.number(),
+                after_sprites: 0,
             })
         },
         // As many as the game keeps; none at all reads back as none.
@@ -828,6 +833,9 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             })
         },
     };
+    for inset in &mut frame.insets {
+        inset.after_sprites = rng.whole(u32::try_from(frame.sprites.len()).unwrap());
+    }
     (frame, schema, state)
 }
 

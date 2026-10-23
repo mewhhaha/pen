@@ -41,6 +41,8 @@ pub struct Settings {
     pub codegen_tier: Option<CodegenTier>,
     /// Semantic workers (1 to 16); the compiler works serially when none.
     pub semantic_workers: Option<u32>,
+    /// Explicit inference/evidence work limit; absent uses the compiler default.
+    pub inference_budget: Option<u32>,
     /// The only compiler identity (64 lowercase hex digits) to accept.
     pub expected_identity: Option<String>,
     /// Native readers owned by blotc. Paths are resolved against the project.
@@ -55,7 +57,7 @@ impl Settings {
         let Value::Object(fields) = value else {
             return Err("the settings are not a JSON object".into());
         };
-        const KNOWN: [&str; 9] = [
+        const KNOWN: [&str; 10] = [
             "program",
             "imports",
             "std",
@@ -63,6 +65,7 @@ impl Settings {
             "dependencies",
             "codegenTier",
             "semanticWorkers",
+            "inferenceBudget",
             "expectedIdentity",
             "nativeAssets",
         ];
@@ -101,6 +104,13 @@ impl Settings {
                 _ => return Err("the settings' `semanticWorkers` is not a whole number from 1 to 16".into()),
             },
         };
+        let inference_budget = match fields.get("inferenceBudget") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                Some(n) if n > 0 => Some(n),
+                _ => return Err("the settings' `inferenceBudget` is not a positive U32".into()),
+            },
+        };
         let expected_identity = match fields.get("expectedIdentity") {
             None | Some(Value::Null) => None,
             Some(Value::String(identity)) if is_identity(identity) => Some(identity.clone()),
@@ -114,6 +124,7 @@ impl Settings {
             dependencies: path("dependencies")?,
             codegen_tier,
             semantic_workers,
+            inference_budget,
             expected_identity,
             native_assets: native_assets(fields.get("nativeAssets"), root)?,
         })
@@ -124,6 +135,9 @@ impl Settings {
         let mut args = vec!["serve-project".to_string()];
         if let Some(workers) = self.semantic_workers {
             args.extend(["--semantic-workers".to_string(), workers.to_string()]);
+        }
+        if let Some(budget) = self.inference_budget {
+            args.extend(["--inference-budget".to_string(), budget.to_string()]);
         }
         args
     }
@@ -279,6 +293,15 @@ pub(crate) fn parent(path: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn inference_budget_is_explicit_positive_and_passed_to_the_compiler() {
+        let settings = Settings::parse(r#"{"inferenceBudget":20000000}"#, "/project").unwrap();
+        assert_eq!(settings.args(), ["serve-project", "--inference-budget", "20000000"]);
+        for invalid in ["0", "-1", "1.5", "4294967296", "true"] {
+            assert!(Settings::parse(&format!(r#"{{"inferenceBudget":{invalid}}}"#), "/project").is_err());
+        }
+    }
 
     #[test]
     fn resolves_relative_paths_against_the_root() {

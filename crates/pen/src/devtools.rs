@@ -550,7 +550,9 @@ impl Answering<'_> {
             }
         };
         let Some(saved) = self.session.snapshot() else { return Answer::unavailable() };
-        let tuned = tunables::tuned_values(&saved.state);
+        let Some(tuned) = self.session.state_adapter().tuned_values(&saved.state) else {
+            return Answer::unavailable();
+        };
         let values: Vec<(String, f32)> = declared
             .iter()
             .filter(|tunable| tuned.contains_key(&tunable.id) && only.is_none_or(|id| id == tunable.id))
@@ -603,6 +605,10 @@ fn failed(what: &str, problem: impl std::fmt::Display) -> Answer {
 }
 
 impl tools::Host for Answering<'_> {
+    fn state_adapter(&self) -> std::sync::Arc<dyn pen_runtime::state::StateAdapter> {
+        self.session.state_adapter()
+    }
+
     fn timeline(&self) -> TimelineStatus {
         self.session.timeline()
     }
@@ -708,7 +714,7 @@ impl tools::Host for Answering<'_> {
         self.session.audio().map(|audio| audio.monitor(bus, mute, on)).is_some()
     }
 
-    async fn snapshot(&mut self) -> Option<SavedState> {
+    async fn snapshot(&mut self) -> Option<std::sync::Arc<SavedState>> {
         self.session.snapshot()
     }
 
@@ -726,6 +732,10 @@ impl tools::Host for Answering<'_> {
 
     fn packets(&mut self) -> Option<&mut Packets> {
         Some(self.session.packets())
+    }
+
+    fn observations(&mut self) -> Option<&mut pen_runtime::semantic::Observations> {
+        self.session.observations()
     }
 
     fn kept_state(&self, seconds: f64) -> Option<(u64, SavedState)> {
@@ -766,6 +776,12 @@ impl tools::Host for Answering<'_> {
         inspect::flame(stacks.iter().map(|(stack, samples)| (stack.as_slice(), *samples)), |index| profile.name(index))
     }
 
+    fn systems(&mut self, enabled: bool, first: usize) -> Answer {
+        let Some(trace) = &self.session.system_trace else { return Answer::unavailable() };
+        let (count, values) = trace.systems(enabled, first);
+        Answer { values, ..Answer::ok(count as f32) }
+    }
+
     fn memory(&mut self) -> Answer {
         let seen = self.session.guest_seen();
         let mut counters = seen.counters.clone();
@@ -791,7 +807,9 @@ impl tools::Host for Answering<'_> {
             Err(problem) => return failed("preset", problem),
         };
         let Some(saved) = self.session.snapshot() else { return Answer::unavailable() };
-        let tuned = tunables::tuned_values(&saved.state);
+        let Some(tuned) = self.session.state_adapter().tuned_values(&saved.state) else {
+            return Answer::unavailable();
+        };
         let values = declared.iter().map(|tunable| (tunable.name.clone(), tunable.live(&tuned))).collect();
         match tunables::save_preset(self.project, name, values) {
             Ok(()) => {

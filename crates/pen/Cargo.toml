@@ -41,6 +41,7 @@ pen-gltf = { workspace = true, optional = true }
 pen-texture = { workspace = true, optional = true, features = ["tools"] }
 pen-protocol.workspace = true
 pen-runtime.workspace = true
+pen-ink.workspace = true
 pen-render.workspace = true
 pen-simulation.workspace = true
 wasmtime.workspace = true

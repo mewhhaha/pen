@@ -144,11 +144,24 @@ fn clean() -> Result<()> {
 
 /// The game's module: `game.cwasm` when the package precompiled it for this
 /// runtime, else `game.wasm` compiled now (and cached).
-fn load_module(engine: &wasmtime::Engine, game: &Path, cache: bool) -> Result<GuestModule> {
+fn load_module(engine: &wasmtime::Engine, game: &Path, cache: bool, measure_systems: bool) -> Result<GuestModule> {
     let path = game.join("game.wasm");
     let wasm = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
     let cache = if cache { cache_dir().map(|directory| directory.join("wasm")) } else { None };
     let started = Instant::now();
+    #[cfg(feature = "compiler")]
+    if let Some(path) = std::env::var_os("PEN_TRACE_SYSTEMS") {
+        let limit =
+            std::env::var("PEN_TRACE_LIMIT").ok().map(|value| value.parse::<u64>()).transpose()?.unwrap_or(1_000_000);
+        let trace = blot_host::SystemTrace::create(Path::new(&path), limit)?;
+        eprintln!("system trace: {} (up to {limit} events; summary on exit)", Path::new(&path).display());
+        return GuestModule::traced(engine, &wasm, cache.as_deref(), trace);
+    }
+    #[cfg(feature = "compiler")]
+    if measure_systems && blot_host::read_abi(&wasm)?.function("main_trace").is_some() {
+        return GuestModule::traced(engine, &wasm, cache.as_deref(), blot_host::SystemTrace::live());
+    }
+    let _ = measure_systems;
     let cwasm = game.join("game.cwasm");
     let precompiled = std::fs::read(&cwasm).ok();
     // The runtime the package says it precompiled game.cwasm for, when not this one.
@@ -1299,11 +1312,16 @@ const OPTIONS: [OptionSpec; 100] = [
 ];
 
 /// Every variable of the environment pen reads, and what it does.
-const ENVIRONMENT: [(&str, &str); 36] = [
+const ENVIRONMENT: [(&str, &str); 38] = [
     ("PEN_PRESENT_MODE=MODE", "auto-vsync (the default), auto-no-vsync, fifo, fifo-relaxed, immediate or mailbox"),
     ("PEN_SOFTWARE=1", "as --software"),
     ("PEN_HDR=1", "HDR output where the display and surface can (not while recording or taking shots)"),
     ("PEN_OVERLAY=1", "as --overlay"),
+    (
+        "PEN_TRACE_SYSTEMS=FILE",
+        "capture per-system CPU time and allocation traffic to Chrome/Perfetto JSON and a .summary.json (native development runtime)",
+    ),
+    ("PEN_TRACE_LIMIT=N", "maximum timeline events in a system trace (default 1000000); summaries keep counting"),
     ("PEN_SMOKE_FRAMES=N", "as --frames N"),
     ("PEN_AUDIO_BUFFER=N", "as --audio-buffer N"),
     (
@@ -1817,7 +1835,7 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
     scene_assets::warm_up(&paths.assets, paths.scene_to_read());
     // Development recompiles after every edit, reusing unchanged functions.
     let engine = if dev { blot_host::dev_engine()? } else { blot_host::engine()? };
-    let module = load_module(&engine, &game.directory, !dev)?;
+    let module = load_module(&engine, &game.directory, !dev, checkout.is_some())?;
     let catalog = read_catalog(&paths.assets)?;
     let mods = load_mods(args)?;
     // A packaged game has no dev tools program, but may answer remote ones.
@@ -2278,7 +2296,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             }
             let game = game(project.as_ref());
             let engine = blot_host::engine()?;
-            let module = load_module(&engine, &game.directory, true)?;
+            let module = load_module(&engine, &game.directory, true, false)?;
             let catalog = read_catalog(&game.assets)?;
             let test = visual::TestOptions {
                 checkout: project.as_ref().map(|project| project.root.clone()),
@@ -2303,7 +2321,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             let bench = command == "bench";
             // A bench times loading the module, so not from the cache.
             let loading = Instant::now();
-            let module = load_module(&engine, &game.directory, !bench)?;
+            let module = load_module(&engine, &game.directory, !bench, false)?;
             let load_ms = loading.elapsed().as_secs_f64() * 1000.0;
             let frames: Option<usize> = args.number("--frames")?;
             let out = (!bench).then(|| PathBuf::from(&args.operands[0]));

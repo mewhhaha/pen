@@ -284,6 +284,224 @@ fn input(model: &Model) -> Vec<String> {
     out.extend("  let state_start = frame_header_floats + event_count * event_floats\n  use lanes.require (values.length == state_start + state_count)\n  return #Input {\n    state: array.slice state_start state_count values,\n    elapsed, width, height,\n    events: array.generate event_count (fn index => decode_event values (frame_header_floats + index * event_floats)),\n  }".lines().map(str::to_owned));
     out
 }
+// Emit writes in the frame function itself: passing its mutable output to a
+// per-record helper would introduce aliases and defeat unique-array reuse.
+fn direct_fields(out: &mut Vec<String>, fields: &[Laid], variable: &str, indent: &str) {
+    for field in fields {
+        let (locals, values) = encode(&field.field, &field_path(variable, field), &field.name);
+        out.extend(locals.iter().map(|line| format!("{indent}{line}")));
+        for (lane, value) in values.iter().enumerate() {
+            let offset = field.offset + lane;
+            out.push(format!("{indent}encoded[at + {offset}] := {value}"));
+        }
+    }
+}
+
+fn direct_records(out: &mut Vec<String>, entry: &Section, body: impl Fn(&mut Vec<String>, &str, &str)) {
+    let variable = singular(s(&entry.section["name"]));
+    if let Some((owners, children)) = &entry.owner {
+        let owner = singular(owners);
+        out.push(format!("  for {owner} in packet.{owners}:"));
+        out.push(format!("    for {variable} in {owner}.{children}:"));
+        body(out, &variable, "      ");
+    } else {
+        let section = s(&entry.section["name"]);
+        let values = if section == "draws" { "draws".to_owned() } else { format!("packet.{section}") };
+        out.push(format!("  for {variable} in {values}:"));
+        if section == "draws" {
+            out.push(format!("    let extra = extra_of {variable}"));
+        }
+        body(out, &variable, "    ");
+    }
+}
+
+fn render_direct(model: &Model) -> Vec<String> {
+    let mut out = vec![String::new(),
+        "// Count first, then write every lane into one uniquely owned buffer.".to_owned(),
+        "const draw_metadata = fn (draw: types.Draw) => (draw.mesh, draw.material)".to_owned(),
+        "const draw_transform = fn (draw: types.Draw) => do:".to_owned(),
+        "  let #types.Mat4 { x, y, z, w } = draw.transform".to_owned(),
+        "  return (x.x, x.y, x.z, x.w, y.x, y.y, y.z, y.w, z.x, z.y, z.z, z.w, w.x, w.y, w.z, w.w)".to_owned(),
+        "const draw_parameters = fn (draw: types.Draw) => case draw.parameters of".to_owned(),
+        "  #Some p => (4.0, p.x, p.y, p.z, p.w)".to_owned(),
+        "  #Nothing => (0.0, 0.0, 0.0, 0.0, 0.0)".to_owned(),
+        "const encode_render = fn (packet: types.RenderFrame) =>".to_owned(),
+        "  encode_render_draws packet packet.draws draw_metadata draw_transform draw_parameters encode_draw_extra".to_owned(),
+        String::new(),
+        "// Adapters supply scalar projections without constructing nominal wire copies.".to_owned(),
+        "const encode_render_draws = fn (packet: types.RenderFrame) => fn (draws: Array d) => fn (metadata_of: d -> (U32, U32)) => fn (matrix_of: d -> (F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32)) => fn (parameters_of: d -> (F32, F32, F32, F32, F32)) => fn (extra_of: d -> Array F32) => do:".to_owned()];
+    let mut counts = HashMap::new();
+    let mut lengths = HashMap::new();
+    let mut sizes = vec!["protocol.packet_header_floats".to_owned()];
+    for entry in &model.sections {
+        let name = s(&entry.section["name"]);
+        if kind(&entry.section) == "trailing" {
+            continue;
+        }
+        let count = if name == "draws" {
+            "draws.length".to_owned()
+        } else if let Some((owners, children)) = &entry.owner {
+            let count = format!("{name}_count");
+            out.push(format!("  let {count} = 0"));
+            let owner = singular(owners);
+            out.push(format!("  for {owner} in packet.{owners}:"));
+            out.push(format!("    {count} := self + {owner}.{children}.length"));
+            count
+        } else {
+            format!("packet.{name}.length")
+        };
+        counts.insert(name, count.clone());
+        let length = match kind(&entry.section) {
+            "lanes" => count,
+            "records" => format!("{count} * {}", entry.fixed.as_ref().unwrap().lanes),
+            "variable" => {
+                let length = format!("{name}_lanes");
+                out.push(format!("  let {length} = 0"));
+                let rest = &entry.section["record"]["rest"];
+                let rest_name = s(&rest["name"]);
+                let width = entry.item.as_ref().map_or(1, |item| item.lanes);
+                direct_records(&mut out, entry, |out, variable, indent| {
+                    out.push(format!(
+                        "{indent}{length} := self + {} + {variable}.{rest_name}.length * {width}",
+                        entry.head_lanes
+                    ));
+                });
+                length
+            }
+            _ => unreachable!(),
+        };
+        sizes.push(length.clone());
+        lengths.insert(name, length);
+    }
+    for (name, owners) in &model.tails {
+        let length = format!("{name}_lanes");
+        out.push(format!("  let {length} = 0"));
+        for owner in owners {
+            let entry = model.section(&owner.section);
+            direct_records(&mut out, entry, |out, variable, indent| {
+                if owner.section == "draws" {
+                    out.push(format!("{indent}{length} := self + extra.length"));
+                } else {
+                    let path = field_path(variable, &owner.field);
+                    let max = bound_blot(&owner.field.field["max"]);
+                    out.push(format!("{indent}{length} := self + min {path}.length {max} * 4"));
+                }
+            });
+        }
+        sizes.push(length);
+    }
+    out.push(format!("  let encoded = @array.fill ({}) 0.0", sizes.join(" + ")));
+    out.push("  let at = 0".to_owned());
+    for entry in &model.header {
+        let field = &entry.laid;
+        let lane = &field.field;
+        let values = match kind(lane) {
+            "magic" => vec!["protocol.packet_magic".to_owned()],
+            "schema" => vec!["from packet.schema".to_owned()],
+            "size" => {
+                let section = s(&lane["section"]);
+                vec![format!("from {}", if lane["of"] == "lanes" { &lengths[section] } else { &counts[section] })]
+            }
+            _ => {
+                let prefix = entry.group.as_ref().map_or(String::new(), |group| format!("{group}."));
+                let path = format!("packet.{prefix}{}", field.name);
+                let (locals, values) = encode(lane, &path, &entry.key.replace('.', "_"));
+                out.extend(locals.iter().map(|line| format!("  {line}")));
+                values
+            }
+        };
+        for (index, value) in values.iter().enumerate() {
+            out.push(format!("  encoded[{}] := {value}", field.offset + index));
+        }
+    }
+    out.push("  at := protocol.packet_header_floats".to_owned());
+    for entry in &model.sections {
+        let name = s(&entry.section["name"]);
+        match kind(&entry.section) {
+            "lanes" => {
+                out.push(format!("  for value in packet.{name}:"));
+                out.push("    encoded[at] := value".to_owned());
+                out.push("    at := self + 1".to_owned());
+            }
+            "records" => {
+                let layout = entry.fixed.as_ref().unwrap();
+                direct_records(&mut out, entry, |out, variable, indent| {
+                    if name == "draws" {
+                        out.push(format!("{indent}let (mesh, material) = metadata_of {variable}"));
+                        let matrix: Vec<_> = (0..16).map(|i| format!("m{i}")).collect();
+                        out.push(format!("{indent}let ({}) = matrix_of {variable}", matrix.join(", ")));
+                        out.push(format!("{indent}let (present, p0, p1, p2, p3) = parameters_of {variable}"));
+                        for field in &layout.fields {
+                            let values = match kind(&field.field) {
+                                "reference" => vec![format!("U32.to_f32 {}", field.name)],
+                                "matrix" => matrix.clone(),
+                                "optional" => {
+                                    vec!["present".into(), "p0".into(), "p1".into(), "p2".into(), "p3".into()]
+                                }
+                                "tail" => vec!["from (extra.length / 4)".into()],
+                                _ => unreachable!(),
+                            };
+                            for (lane, value) in values.iter().enumerate() {
+                                out.push(format!("{indent}encoded[at + {}] := {value}", field.offset + lane));
+                            }
+                        }
+                    } else {
+                        direct_fields(out, &layout.fields, variable, indent);
+                    }
+                    out.push(format!("{indent}at := self + {}", layout.lanes));
+                });
+            }
+            "variable" => {
+                let rest = &entry.section["record"]["rest"];
+                let rest_name = s(&rest["name"]);
+                direct_records(&mut out, entry, |out, variable, indent| {
+                    direct_fields(out, &entry.head, variable, indent);
+                    if let Some(layout) = &entry.item {
+                        out.push(format!(
+                            "{indent}encoded[at + {}] := from {variable}.{rest_name}.length",
+                            entry.head_lanes - 1
+                        ));
+                        out.push(format!("{indent}at := self + {}", entry.head_lanes));
+                        let item = singular(rest_name);
+                        out.push(format!("{indent}for {item} in {variable}.{rest_name}:"));
+                        direct_fields(out, &layout.fields, &item, &format!("{indent}  "));
+                        out.push(format!("{indent}  at := self + {}", layout.lanes));
+                    } else {
+                        out.push(format!("{indent}at := self + {}", entry.head_lanes));
+                        out.push(format!("{indent}for value in {variable}.{rest_name}:"));
+                        out.push(format!("{indent}  encoded[at] := value"));
+                        out.push(format!("{indent}  at := self + 1"));
+                    }
+                });
+            }
+            "trailing" => {
+                if let Some((_, owners)) = model.tails.iter().find(|(section, _)| section == name) {
+                    for owner in owners {
+                        direct_records(&mut out, model.section(&owner.section), |out, variable, indent| {
+                            if owner.section == "draws" {
+                                out.push(format!("{indent}for value in extra:"));
+                                out.push(format!("{indent}  encoded[at] := value"));
+                                out.push(format!("{indent}  at := self + 1"));
+                            } else {
+                                let path = field_path(variable, &owner.field);
+                                let max = bound_blot(&owner.field.field["max"]);
+                                out.push(format!("{indent}for index in 0 .. min {path}.length {max}:"));
+                                for (lane, component) in ["x", "y", "z", "w"].iter().enumerate() {
+                                    out.push(format!("{indent}  encoded[at + {lane}] := {path}[index].{component}"));
+                                }
+                                out.push(format!("{indent}  at := self + 4"));
+                            }
+                        });
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    out.push("  return encoded".to_owned());
+    out
+}
+
 fn render(model: &Model) -> Vec<String> {
     let mut out = Vec::new();
     let mut emitted = HashSet::new();
@@ -402,109 +620,7 @@ fn render(model: &Model) -> Vec<String> {
     if !tail_encoders.is_empty() {
         out.extend([String::new(), "const vec4_lanes = fn (v: types.Vec4) => #[v.x, v.y, v.z, v.w]".to_owned()]);
     }
-    let section_names = model
-        .sections
-        .iter()
-        .filter(|entry| kind(&entry.section) != "trailing" && entry.owner.is_none())
-        .map(|entry| s(&entry.section["name"]))
-        .collect::<Vec<_>>()
-        .join(", ");
-    out.push(String::new());
-    out.extend(comment(Some(&format!("The render packet from `packet`, a record of the header's values by their names in protocol/schema.json (grouped ones in a record of their group: `quality.msaa`), and of the sections: {section_names}. Its records use Pen's wire types."))));
-    out.push("const encode_render = fn (packet: types.RenderFrame) => do:".to_owned());
-    let mut sections = HashMap::new();
-    let mut lengths = HashMap::new();
-    for entry in &model.sections {
-        let section = &entry.section;
-        let name = s(&section["name"]);
-        if kind(section) == "trailing" {
-            continue;
-        }
-        if let Some((owner_section, owner_field)) = &entry.owner {
-            out.push(format!(
-                "  let {name} = array.flatten #[{}.{} | {} <- packet.{owner_section}]",
-                singular(owner_section),
-                owner_field,
-                singular(owner_section)
-            ));
-            sections.insert(name, name.to_owned());
-            continue;
-        }
-        sections.insert(name, format!("packet.{name}"));
-        if kind(section) == "variable" {
-            out.push(format!(
-                "  let {name}_encoded = #[{} {} | {} <- packet.{name}]",
-                encoder(&section["record"]),
-                singular(name),
-                singular(name)
-            ));
-            out.push(format!(
-                "  let {name}_lanes = array.fold_left (fn total => fn record => total + record.length) 0 {name}_encoded"
-            ));
-            lengths.insert(name, format!("{name}_lanes"));
-        }
-    }
-    let mut lets = Vec::new();
-    let mut header = Vec::new();
-    for entry in &model.header {
-        let lane = &entry.laid.field;
-        match kind(lane) {
-            "magic" => header.push("protocol.packet_magic".to_owned()),
-            "schema" => header.push("from packet.schema".to_owned()),
-            "size" => {
-                let name = s(&lane["section"]);
-                let mut value = format!("{}.length", sections[name]);
-                if lane["of"] == "lanes"
-                    && let Some(length) = lengths.get(name)
-                {
-                    value.clone_from(length);
-                }
-                header.push(format!("from {value}"));
-            }
-            _ => {
-                let mut group = String::new();
-                if let Some(name) = &entry.group {
-                    group = format!("{name}.");
-                }
-                let path = format!("packet.{group}{}", entry.laid.name);
-                let (local, values) = encode(lane, &path, &entry.key.replace('.', "_"));
-                lets.extend(local);
-                header.extend(values);
-            }
-        }
-    }
-    out.extend(lets.iter().map(|line| format!("  {line}")));
-    out.extend(["  return array.flatten #[".to_owned(), "    #[".to_owned()]);
-    out.extend(chunk(&header, 72).iter().map(|line| format!("      {line},")));
-    out.push("    ],".to_owned());
-    let mut chunks = Vec::new();
-    for entry in &model.sections {
-        let section = &entry.section;
-        let name = s(&section["name"]);
-        match kind(section) {
-            "lanes" => chunks.push(format!("#[packet.{name}]")),
-            "records" => {
-                let item = singular(name);
-                chunks.push(format!("#[{} {item} | {item} <- {}]", encoder(&section["record"]), sections[name]));
-            }
-            "variable" => chunks.push(format!("{name}_encoded")),
-            _ => {
-                if let Some((_, owners)) = model.tails.iter().find(|(section, _)| section == name) {
-                    for owner in owners {
-                        let item = singular(&owner.section);
-                        chunks.push(format!(
-                            "#[{} {item} | {item} <- {}]",
-                            tail_encoders[&format!("{}.{}", s(&owner.layout.record["name"]), owner.field.name)],
-                            sections[owner.section.as_str()]
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    out.push("    ...array.flatten #[".to_owned());
-    out.extend(chunks.iter().map(|line| format!("      {line},")));
-    out.extend(["    ],".to_owned(), "  ]".to_owned()]);
+    out.extend(render_direct(model));
     if let Some(extensions) = model.extensions() {
         out.push(String::new());
         out.extend(comment(Some(

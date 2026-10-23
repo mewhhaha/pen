@@ -15,5 +15,6 @@ pen-protocol.workspace = true
 # Deflates the recordings that links carry (recording::fragment).
 miniz_oxide = "0.8"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 unicode-bidi = "0.3"
 web-time = "1"

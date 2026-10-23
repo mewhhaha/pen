@@ -194,6 +194,7 @@ fn translucent_insets_preserve_coverage_and_draw_order() {
         width: 64.0,
         height: 64.0,
         pixel_size: 0.0,
+        after_sprites: 0,
         view: IDENTITY,
         projection: IDENTITY,
         ambient: Vector::default(),

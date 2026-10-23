@@ -62,6 +62,11 @@ hot reload: a new build restores the old one's state, so a world must come
 back whole from what it saved. The state schema says when it cannot: pen
 restores no state saved under another schema.
 
+The state payload and restore response are opaque by default. Optional
+[state adapters](state-adapters.md) provide format-specific tooling; an Ink
+application opts in through `src/assets/saved.json`. Pen does not infer Ink
+from a save's contents.
+
 `pen/program.blot`, which `pen codegen` writes, is all of this in Blot:
 `serve` takes a record of `schema`, `create`, `frame`, `save` and `restore`,
 and `run` takes `step` in place of `frame`, with the packets decoded and
@@ -125,20 +130,17 @@ Taken away by this work:
 - **A catalog needed a mesh and a material.** Either list may be empty now;
   a frame that names an entry of an empty list is refused.
 
+- **Save tooling assumed Ink's layout.** Numeric inspection, tunable
+  readback, restore reports and declared migration fallback now live behind
+  an explicit state adapter. `pen-ink` supplies the Ink implementation;
+  ordinary snapshots and semantic observations need no adapter.
+
 Still there, for another lane or another day:
 
 - **The dev tools are the checkout's own program.** pen draws none of its
   own; gdev's are a Blot program built on Ink and gdev's font, so a new game
   has no console, diagnostics or timeline panel until it writes or borrows
   one. Time travel's keys, scripts and `pen packets` work without them.
-- **Live tunables' values are read from Ink's save format.** Setting one
-  (`tune=`, `/tune`) works for any game that takes Tune events; the dev
-  tools' tunables panel reads the values back out of the game's state as
-  Ink's `persist.blot` frames it (section 11) before baking them into
-  `src/tunables.json`.
-- **Restore reports are Ink's.** A restore's answer is logged as what it kept,
-  migrated or dropped when it is `persist.blot`'s report (5680, then four
-  numbers a section); any other answer is fine and says nothing.
 - **Numbers that spell gdev.** The render packet's magic is 0x474446 ("GDF"),
   the program's 0x474450 ("GDP"), and a save file starts `GDEVSAVE`. They
   are only numbers, and changing them would break every save and build.

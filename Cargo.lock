@@ -569,9 +569,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "pen-plugins",
  "pen-protocol",
  "pen-runtime",
+ "serde_json",
  "sha2",
+ "wasm-encoder",
  "wasmparser",
  "wasmtime",
 ]
@@ -3114,6 +3117,7 @@ dependencies = [
  "opusic-sys",
  "pen-codegen",
  "pen-gltf",
+ "pen-ink",
  "pen-plugins",
  "pen-protocol",
  "pen-render",
@@ -3158,6 +3162,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pen-ink"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pen-protocol",
+ "pen-runtime",
+ "serde_json",
+ "web-time",
+]
+
+[[package]]
 name = "pen-plugins"
 version = "0.1.0"
 dependencies = [
@@ -3180,6 +3195,7 @@ name = "pen-protocol"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "serde",
  "serde_json",
 ]
 
@@ -3212,6 +3228,7 @@ dependencies = [
  "anyhow",
  "miniz_oxide 0.8.9",
  "pen-protocol",
+ "serde",
  "serde_json",
  "unicode-bidi",
  "web-time",
@@ -3244,6 +3261,7 @@ dependencies = [
  "anyhow",
  "futures-channel",
  "js-sys",
+ "pen-ink",
  "pen-protocol",
  "pen-render",
  "pen-runtime",

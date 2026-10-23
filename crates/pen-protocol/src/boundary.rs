@@ -387,11 +387,14 @@ mod tests {
             changed[block + at] = value;
             decode_frame(&changed, 3, &catalog).map(|decoded| decoded.render)
         };
-        let invalid = "game returned invalid extension sections";
         // Lanes that are no block make an oversized packet, as they did.
         let oversized = "game returned a truncated, oversized or nonfinite frame";
-        assert_eq!(changed(0, 1.0).unwrap_err().to_string(), oversized, "the marker");
-        assert_eq!(changed(2, 0.0).unwrap_err().to_string(), invalid, "tag 0");
+        assert_eq!(changed(0, 1.0).unwrap_err().root_cause().to_string(), oversized, "the marker");
+        assert_eq!(
+            changed(2, 0.0).unwrap_err().root_cause().to_string(),
+            "invalid development provenance",
+            "tag 0 requires provenance"
+        );
         assert!(changed(2, MAX_EXTENSION_TAG as f32 + 1.0).is_err(), "a tag past the most");
         assert!(changed(1, MAX_EXTENSIONS as f32 + 1.0).is_err(), "too many sections");
         assert!(changed(1, 3.0).is_err(), "a section the packet lacks");

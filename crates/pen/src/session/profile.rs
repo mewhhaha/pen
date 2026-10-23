@@ -50,14 +50,17 @@ impl Profile {
         let phase = |pick: fn(&FrameTimings) -> f64| median(self.timings.iter().map(pick).collect());
         eprintln!(
             "profile of {} {}frames (medians, ms): guest {:.2} (waited for {:.2}), decode {:.2}, validate {:.2}, \
-             render+present {:.2}, housekeeping {:.2}, total {:.2}; frame interval {:.2}; packet {:.0} KB",
+             render {:.2}, acquire {:.2}, present {:.2}, pace {:.2}, housekeeping {:.2}, total {:.2}; frame interval {:.2}; packet {:.0} KB",
             self.timings.len(),
             if overlapped { "overlapped " } else { "" },
             phase(|t| t.guest_ms),
             phase(|t| t.wait_ms),
             phase(|t| t.decode_ms),
             phase(|t| t.validate_ms),
-            phase(|t| t.submit_ms),
+            phase(|t| t.draw.render_ms),
+            phase(|t| t.draw.acquire_ms),
+            phase(|t| t.draw.present_ms),
+            phase(|t| t.draw.pace_ms),
             phase(|t| t.housekeeping_ms),
             phase(|t| t.total_ms),
             median(self.intervals.clone()),
@@ -67,16 +70,24 @@ impl Profile {
 }
 
 /// PEN_FRAME_TIMES: frame `frame`'s timings, a line on stderr.
-pub(super) fn print(frame: usize, timing: &FrameTimings) {
+pub(super) fn print(frame: usize, timing: &FrameTimings, stats: pen_render::RenderStats) {
     eprintln!(
-        "frame {frame}: guest {:.3} wait {:.3} decode {:.3} validate {:.3} submit {:.3} housekeeping {:.3} total {:.3} ms",
+        "frame {frame}: guest {:.3} wait {:.3} decode {:.3} validate {:.3} render {:.3} acquire {:.3} present {:.3} pace {:.3} housekeeping {:.3} total {:.3} ms uploads {} {} fields {} {} {}",
         timing.guest_ms,
         timing.wait_ms,
         timing.decode_ms,
         timing.validate_ms,
-        timing.submit_ms,
+        timing.draw.render_ms,
+        timing.draw.acquire_ms,
+        timing.draw.present_ms,
+        timing.draw.pace_ms,
         timing.housekeeping_ms,
         timing.total_ms,
+        stats.instance_upload_bytes,
+        stats.instance_upload_calls,
+        stats.field_upload_bytes,
+        stats.field_upload_calls,
+        stats.field_input_texels,
     );
 }
 

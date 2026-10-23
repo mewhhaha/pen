@@ -1,9 +1,9 @@
-# Declared saved types: typed save-state migrations
+# Ink adapter: declared save-state migrations
 
-A game can declare its saved types' layouts, version by version, as typed
+A game using the optional [Ink state adapter](state-adapters.md) can declare its saved types' layouts, version by version, as typed
 fields, in `saved.json` beside its asset catalog. When the game restores a
 state and has to reset a section because the section's saved version has no
-`migrate` in the game's code, pen migrates that section by the declaration
+`migrate` in the game's code, the Ink adapter migrates that section by the declaration
 and restores again: each field of the build's version takes the lanes of the
 saved field of the same name (or the name it `was`), a field the saved
 version lacks takes its default, and a field the build dropped goes. The game
@@ -18,6 +18,7 @@ codec's new `version` keeps saves, quicksaves and a reload's running state. A ch
 
 ```json
 {
+  "format": "ink-persist-v1",
   "types": {
     "achievements": {
       "key": 119,
@@ -46,6 +47,8 @@ codec's new `version` keeps saves, quicksaves and a reload's running state. A ch
 }
 ```
 
+- `format` explicitly selects the Ink adapter; it is required even for
+  existing declarations. Without an adapter, Pen leaves state uninterpreted.
 - `key` is the codec's key, `kind` how ink's `persist` saves the type:
   `resource`, `snapshotted resource`, `component` or `snapshotted component`.
 - Each version lists its fields in lane order. A field's `type` is `f32`,
@@ -58,7 +61,7 @@ codec's new `version` keeps saves, quicksaves and a reload's running state. A ch
 
 ## What pen does
 
-The save format is ink's `persist.blot` (gdev's README, "Saved state"): a
+The adapter understands Ink's `persist.blot` (gdev's README, "Saved state"): a
 state is `magic, schema, section_count`, then per saved type `key, version,
 width, length` and its lanes. A resource's lanes are one value; a snapshotted
 resource's `current_count`, the current value and the previous; a component's
@@ -68,7 +71,7 @@ a snapshotted component's current records, then as many previous ones.
 1. The game restores the state, as ever, and says what it made of each
    section (the restore report).
 2. If it reset a section (fate 2, no migration in its code) and `saved.json`
-   declares both the saved version and the build's, pen rewrites that section
+   declares both the saved version and the build's, the adapter rewrites that section
    (its version, width, length and every value or record), leaves every other
    section as it was, and restores the result in a new program of the same
    build. Only sections the game could not read move: its own code wins.
@@ -77,16 +80,16 @@ a snapshotted component's current records, then as many previous ones.
 
 This runs wherever a state meets a build: starting from a saved state, loads,
 undo and redo, rewinds and reloads (`GameRuntime`'s restores, in pen-runtime,
-so the browser does the same). Native pen reads
-`saved.json` from the asset directory when a restore needs it, so an edit
+through the selected adapter, so the browser does the same). Native pen reads
+`saved.json` from the asset directory at restore/tooling boundaries, so an edit
 counts at the next reload; the browser reads it when the page starts. `pen
 build` and `pen build --web` ship it with the assets.
 
 ## Verified
 
-- `pen_runtime::saved`'s tests: declarations, typed fields, renames,
+- `pen_ink::saved`'s tests: declarations, typed fields, renames,
   defaults, all four kinds of section, and that only declared resets move.
-- `game::saved_types_tests`: a reload through `GameRuntime::reload` from a
+- `pen_ink::runtime_tests`: a reload through `GameRuntime::reload` from a
   build saving `points` (version 1) to one saving `points, bonus` (version 2)
   with no migration: declared, the points survive and the bonus takes its
   default, and the reload says so; undeclared, the section resets.

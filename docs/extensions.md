@@ -47,6 +47,10 @@ Both travel in generic carriers that are part of pen's protocol:
   Hosts read them into `RenderFrame::extensions` (a tag and its lanes) and
   check only their bounds: at most 64 sections a frame, a million lanes each.
 
+Reserved tag 0 carries optional [development provenance](packet-diagnostics.md).
+It has tighter bounds and is consumed by the host's diagnostics. It is not an
+application section and does not appear in `RenderFrame::extensions`.
+
 Nothing in pen's types or decoders depends on a game's declarations, so a
 game adds, renames or drops them without pen changing, and gdev and Ink,
 which declare none, build as they did.

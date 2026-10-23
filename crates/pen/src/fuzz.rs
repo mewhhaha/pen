@@ -237,7 +237,7 @@ pub struct Game {
 
 impl Game {
     pub fn load(engine: wasmtime::Engine, directory: &Path, assets: &Path, scene: &Path) -> Result<Game> {
-        let module = crate::load_module(&engine, directory, true)?;
+        let module = crate::load_module(&engine, directory, true, false)?;
         let catalog = read_catalog(assets)?;
         Ok(Game { engine, module, catalog, scene: snapshot::read(scene).ok() })
     }

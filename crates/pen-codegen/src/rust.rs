@@ -634,14 +634,14 @@ fn render(model: &Model) -> Vec<String> {
     out.extend(["    }".to_owned(), String::new()]);
     out.extend(doc(
         Some(&format!(
-            "Decodes a render packet. {} With several faults, it reports the first in lane order.",
+            "Decodes a render packet. {} Failures include the earliest trustworthy structural context.",
             protocol["render"]["doc"].as_str().unwrap_or("")
         )),
         "    ",
     ));
     lines(
         &mut out,
-        "    pub fn decode_frame(packet: &[f32], schema: u32, catalog: &Catalog) -> Result<Decoded> {\n        let mut render = RenderFrame::default();\n        let state = decode_into(packet, schema, catalog, &mut render)?.to_vec();\n        Ok(Decoded { state, render })\n    }\n\n    /// Decodes a render packet into `frame` as [`decode_frame`] does, reusing the vectors it\n    /// holds, and returns the state lanes the packet carried. After an error, `frame` holds\n    /// some of this packet and some of what it held before.\n    pub fn decode_into<'a>(\n        packet: &'a [f32],\n        schema: u32,\n        catalog: &Catalog,\n        frame: &mut RenderFrame,\n    ) -> Result<&'a [f32]> {\n        ensure!(\n            packet.len() >= PACKET_HEADER_FLOATS && packet[0] == PACKET_MAGIC && packet[1] == schema as f32,",
+        "    pub fn decode_frame(packet: &[f32], schema: u32, catalog: &Catalog) -> Result<Decoded> {\n        let mut render = RenderFrame::default();\n        let state = decode_into(packet, schema, catalog, &mut render)?.to_vec();\n        Ok(Decoded { state, render })\n    }\n\n    /// Decodes a render packet into `frame` as [`decode_frame`] does, reusing the vectors it\n    /// holds, and returns the state lanes the packet carried. After an error, `frame` holds\n    /// some of this packet and some of what it held before.\n    pub fn decode_into<'a>(\n        packet: &'a [f32],\n        schema: u32,\n        catalog: &Catalog,\n        frame: &mut RenderFrame,\n    ) -> Result<&'a [f32]> {\n        decode_raw(packet, schema, catalog, frame).map_err(|error| error.context(explain_frame(packet, schema, catalog)))\n    }\n\n    pub(crate) fn decode_raw<'a>(packet: &'a [f32], schema: u32, catalog: &Catalog, frame: &mut RenderFrame) -> Result<&'a [f32]> {\n        ensure!(\n            packet.len() >= PACKET_HEADER_FLOATS && packet[0] == PACKET_MAGIC && packet[1] == schema as f32,",
     );
     out.push(format!("            {}", quote(&messages["header"])));
     lines(&mut out, "        );\n        let mut reader = Reader {\n            packet,\n            catalog,");
@@ -727,7 +727,7 @@ fn render(model: &Model) -> Vec<String> {
         lines(
             &mut out,
             &format!(
-                "        // The game's own sections, after the rest: the marker, their count, then each\n        // one's tag, length and values.\n        let mut extensions = std::mem::take(&mut frame.extensions);\n        extensions.clear();\n        let mut extensions_end = {packet_end};\n        if packet.len() > extensions_end {{\n            // Lanes past the end that are no block are an oversized packet.\n            ensure!(packet.len() >= extensions_end + 2 && packet[extensions_end] == EXTENSIONS_MARKER, truncated);\n            let invalid = {};\n            let count = reader.count(extensions_end + 1, {})?;\n            extensions_end += 2;\n            for _ in 0..count {{\n                ensure!(packet.len() >= extensions_end + 2, invalid);\n                let tag = reader.count(extensions_end, {})?;\n                let length = reader.count(extensions_end + 1, {})?;\n                let first = extensions_end + 2;\n                ensure!(tag >= 1 && packet.len() >= first + length, invalid);\n                extensions.push(Extension {{ tag: tag as u32, values: packet[first..first + length].to_vec() }});\n                extensions_end = first + length;\n            }}\n        }}",
+                "        // The game's own sections, after the rest: the marker, their count, then each\n        // one's tag, length and values.\n        let mut extensions = std::mem::take(&mut frame.extensions);\n        extensions.clear();\n        let mut extensions_end = {packet_end};\n        let mut provenance_seen = false;\n        if packet.len() > extensions_end {{\n            // Lanes past the end that are no block are an oversized packet.\n            ensure!(packet.len() >= extensions_end + 2 && packet[extensions_end] == EXTENSIONS_MARKER, truncated);\n            let invalid = {};\n            let count = reader.count(extensions_end + 1, {})?;\n            extensions_end += 2;\n            for _ in 0..count {{\n                ensure!(packet.len() >= extensions_end + 2, invalid);\n                let tag = reader.count(extensions_end, {})?;\n                let length = reader.count(extensions_end + 1, {})?;\n                let first = extensions_end + 2;\n                ensure!(packet.len() >= first + length, invalid);\n                if tag == PROVENANCE_TAG {{\n                    ensure!(!provenance_seen, \"duplicate development provenance\");\n                    provenance_seen = true;\n                    crate::diagnostic::read_provenance(&packet[first..first + length], {packet_end}).map_err(|_| anyhow::anyhow!(\"invalid development provenance\"))?;\n                }} else {{\n                    extensions.push(Extension {{ tag: tag as u32, values: packet[first..first + length].to_vec() }});\n                }}\n                extensions_end = first + length;\n            }}\n        }}",
                 quote(&extensions["message"]),
                 bound(&extensions["max"]),
                 bound(&extensions["tag"]),
@@ -964,6 +964,8 @@ pub fn emit(model: &Model, header: &str) -> String {
     out.extend(input(model));
     out.push(String::new());
     out.extend(render(model));
+    out.push(String::new());
+    out.extend(crate::diagnostic::emit(model));
     out.push(String::new());
     out.extend(crate::canonical::rust(model));
     out.extend(["}".to_owned(), String::new()]);

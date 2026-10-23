@@ -8,12 +8,12 @@ use std::sync::Arc;
 use web_time::Instant;
 
 use anyhow::{Result, bail, ensure};
-use pen_protocol::boundary::{decode_frame, decode_into, encode_frame, validate_state, whole};
+use pen_protocol::boundary::{decode_frame, decode_into, encode_frame, validate_state};
 use pen_protocol::{Catalog, Frame, GameEvent, RenderFrame, Viewport};
 
 use crate::program::{Backend, Operation, Program, Unresponsive};
-use crate::saved::{SavedTypes, declared_resets};
 use crate::snapshot::SavedState;
+use crate::state::{self, StateAdapter};
 
 const HISTORY_LIMIT: usize = 200;
 
@@ -29,11 +29,9 @@ pub trait Host {
     /// reload): replay the player's preferences, over whatever ones the
     /// restored state held, and drop what was held for the world replaced.
     fn restored(&mut self) {}
-    /// The saved types the game declares (`saved.json` beside its catalog,
-    /// saved.rs), which migrate what its own code cannot. Asked only when a
-    /// restore reset a section.
-    fn saved_types(&self) -> Option<SavedTypes> {
-        None
+    /// Optional format-specific tooling; ordinary saves need no adapter.
+    fn state_adapter(&self) -> Arc<dyn StateAdapter> {
+        state::opaque()
     }
 }
 
@@ -57,8 +55,8 @@ impl Host for Quiet<'_> {
 
     fn report(&mut self, _message: &str) {}
 
-    fn saved_types(&self) -> Option<SavedTypes> {
-        self.0.saved_types()
+    fn state_adapter(&self) -> Arc<dyn StateAdapter> {
+        self.0.state_adapter()
     }
 }
 
@@ -84,7 +82,29 @@ impl std::fmt::Display for InvalidFrame {
     }
 }
 
-/// CPU wall times, in milliseconds. Guest includes simulation, render prep and bridge.
+/// Non-overlapping host drawing phases, in wall-clock milliseconds.
+/// These are call durations, not GPU execution times or thread CPU time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrawTimings {
+    /// Rendering, uploads, queue submission and overlays, excluding the phases below.
+    /// Driver stalls inside queue submission still count here.
+    pub render_ms: f64,
+    /// Acquiring a surface image, including any wait for it to become available.
+    pub acquire_ms: f64,
+    /// Presenting the surface image, including any wait inside that call.
+    pub present_ms: f64,
+    /// Explicit browser waits for GPU backpressure and the next repaint.
+    /// Native event-loop pacing happens outside the measured frame.
+    pub pace_ms: f64,
+}
+
+impl DrawTimings {
+    pub fn total_ms(self) -> f64 {
+        self.render_ms + self.acquire_ms + self.present_ms + self.pace_ms
+    }
+}
+
+/// Host wall times, in milliseconds. Guest includes simulation, render prep and bridge.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FrameTimings {
     /// From sending the frame's input to the guest sending its packet.
@@ -94,20 +114,20 @@ pub struct FrameTimings {
     pub wait_ms: f64,
     pub decode_ms: f64,
     pub validate_ms: f64,
-    pub submit_ms: f64,
+    pub draw: DrawTimings,
     pub housekeeping_ms: f64,
     pub total_ms: f64,
     pub packet_bytes: usize,
 }
 
 impl FrameTimings {
-    /// The timings once the host drew the frame: `submit_ms` drawing,
+    /// The timings once the host drew the frame: `draw` drawing and waiting,
     /// `total_ms` in all, and what the phases leave unaccounted,
     /// housekeeping.
-    pub fn completed(mut self, submit_ms: f64, total_ms: f64) -> FrameTimings {
-        self.submit_ms = submit_ms;
+    pub fn completed(mut self, draw: DrawTimings, total_ms: f64) -> FrameTimings {
+        self.draw = draw;
         self.total_ms = total_ms;
-        self.housekeeping_ms = (total_ms - self.wait_ms - self.decode_ms - self.validate_ms - submit_ms).max(0.0);
+        self.housekeeping_ms = (total_ms - self.wait_ms - self.decode_ms - self.validate_ms - draw.total_ms()).max(0.0);
         self
     }
 }
@@ -137,6 +157,7 @@ pub struct GameRuntime<B: Backend> {
     module: B::Module,
     catalog: Catalog,
     active: Game<B::Program>,
+    snapshot: Option<Arc<SavedState>>,
     edits: Edits,
     previous_timestamp: Option<f64>,
     measuring: bool,
@@ -171,47 +192,25 @@ async fn state_request<P: Program>(game: &mut Game<P>, operation: Operation, pay
     Ok(state)
 }
 
-/// Restores `state` into `game`, a new program of `module`. When the game
-/// resets a section for want of a migration and the host's declared saved
-/// types give one, the state is migrated (saved.rs) and restored again in
-/// another program of `module`, which takes `game`'s place. Returns the
-/// game's answer, its report marking the sections the host migrated.
+/// The guest restores first. An explicit adapter may propose one migration
+/// retry in a fresh instance; the runtime never decodes either payload.
 async fn restore<B: Backend>(
     engine: &B,
     module: &B::Module,
     game: &mut Game<B::Program>,
     state: &[f32],
     host: &dyn Host,
-) -> Result<Vec<f32>> {
+) -> Result<Option<String>> {
+    let adapter = host.state_adapter();
+    adapter.validate()?;
     let answer = state_request(game, Operation::Restore, state).await?;
-    let Some(outcomes) = restore_report(&answer) else { return Ok(answer) };
-    if outcomes.iter().all(|outcome| outcome.fate != RESET) {
-        return Ok(answer);
-    }
-    let Some(types) = host.saved_types() else { return Ok(answer) };
-    let targets = declared_resets(&types, &outcomes);
-    if targets.is_empty() {
-        return Ok(answer);
-    }
-    let (migrated, keys) = crate::saved::migrate(state, &types, &targets)?;
+    let Some(migration) = adapter.migrate(state, &answer)? else { return Ok(adapter.report(&answer)) };
+    validate_state(migration.state())?;
     let mut fresh = open_game(engine, module).await?;
-    let mut answer = state_request(&mut fresh, Operation::Restore, &migrated).await?;
+    let answer = state_request(&mut fresh, Operation::Restore, migration.state()).await?;
     let mut replaced = std::mem::replace(game, fresh);
     replaced.program.close().await;
-    // The report, from the second restore, says it kept those sections.
-    if let Some(records) = answer.get_mut(2..) {
-        for record in records.as_chunks_mut::<4>().0 {
-            let key = whole(record[0]);
-            let original = outcomes.iter().find(|outcome| Some(outcome.key) == key && keys.contains(&outcome.key));
-            if let Some(original) = original
-                && whole(record[1]) == Some(0)
-            {
-                record[1] = DECLARED as f32;
-                record[2] = original.saved as f32;
-            }
-        }
-    }
-    Ok(answer)
+    Ok(migration.report(&answer))
 }
 
 fn validation_frame(host: &dyn Host) -> Frame {
@@ -241,86 +240,9 @@ fn ms(duration: std::time::Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
-/// What a restore or scene load made of one saved section (gdev's
-/// `packages/persist.blot` Fate, by code): 0 kept as saved, 1 migrated from
-/// another version, 2 reset for want of a migration, 3 started afresh because
-/// the state lacked it, 4 dropped because the build no longer saves it; and
-/// the host's own, [`DECLARED`]: migrated by the game's declared saved
-/// types.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SectionOutcome {
-    /// The section's key, its saved type's from build to build.
-    pub key: u32,
-    pub fate: u32,
-    /// The version the state saved it with; 0 when the state lacked it.
-    pub saved: u32,
-    /// The build's version; 0 for a section the build does not read.
-    pub version: u32,
-}
-
-const REPORT_MAGIC: f32 = 5680.0;
-/// A section's fate when the game reset it for want of a migration.
-pub const RESET: u32 = 2;
-/// A section's fate when the host migrated it as the game's saved types
-/// declare (saved.rs), after the game could not.
-pub const DECLARED: u32 = 5;
-
-/// The report a restore or scene load answers with: `5680, count`, then
-/// `key, fate, saved, version` per section. None for any other answer, as
-/// from a game whose restore answers with its state.
-pub fn restore_report(response: &[f32]) -> Option<Vec<SectionOutcome>> {
-    let [magic, count, rest @ ..] = response else {
-        return None;
-    };
-    if *magic != REPORT_MAGIC || whole(*count).and_then(|count| (count as usize).checked_mul(4)) != Some(rest.len()) {
-        return None;
-    }
-    rest.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&[key, fate, saved, version]| {
-            Some(SectionOutcome {
-                key: whole(key)?,
-                fate: whole(fate)?,
-                saved: whole(saved)?,
-                version: whole(version)?,
-            })
-        })
-        .collect()
-}
-
-/// What a restore did other than keep each saved section as it was, for the
-/// log, or None if it kept them all or did not say.
-pub fn describe_restore(outcomes: Option<&[SectionOutcome]>) -> Option<String> {
-    let outcomes = outcomes?;
-    let changes: Vec<String> = outcomes
-        .iter()
-        .filter_map(|&SectionOutcome { key, fate, saved, version }| match fate {
-            0 => None,
-            1 => Some(format!("migrated section {key} from version {saved} to {version}")),
-            2 => Some(format!("reset section {key} (version {saved} has no migration to {version})")),
-            3 => Some(format!("started section {key} afresh (the state has none)")),
-            4 => Some(format!("dropped section {key} (no longer saved)")),
-            DECLARED => {
-                Some(format!("migrated section {key} from version {saved} to {version} as saved.json declares"))
-            }
-            _ => Some(format!("section {key}: unknown fate {fate}")),
-        })
-        .collect();
-    if changes.is_empty() {
-        return None;
-    }
-    let read = outcomes.iter().filter(|outcome| outcome.fate != 4).count();
-    let kept = outcomes.iter().filter(|outcome| outcome.fate == 0).count();
-    let mut parts = vec![format!("kept {kept} of {read} saved sections")];
-    parts.extend(changes);
-    Some(parts.join("; "))
-}
-
-/// `message`, then what the restore answering `response` did not keep as it
-/// was, if anything.
-fn with_report(message: &str, response: &[f32]) -> String {
-    match describe_restore(restore_report(response).as_deref()) {
+/// Append an adapter's description, if it supplied one.
+fn with_report(message: &str, report: Option<&str>) -> String {
+    match report {
         Some(changes) => format!("{message}; {changes}"),
         None => message.to_owned(),
     }
@@ -346,6 +268,7 @@ impl<B: Backend> GameRuntime<B> {
         initial_save: Option<SavedState>,
         initial_scene: Option<SavedState>,
     ) -> Result<GameRuntime<B>> {
+        host.state_adapter().validate()?;
         let mut active = open_game(engine, &module).await?;
         if let Some(saved) = &initial_save
             && saved.schema != active.schema
@@ -357,14 +280,17 @@ impl<B: Backend> GameRuntime<B> {
         match initial_save {
             Some(saved) => {
                 let restored = restore(engine, &module, &mut active, &saved.state, host).await?;
-                host.report(&with_report("resuming the saved state", &restored));
+                host.report(&with_report("resuming the saved state", restored.as_deref()));
             }
             None => {
                 state_request(&mut active, Operation::Create, &[]).await?;
                 if let Some(scene) = initial_scene {
                     if scene.schema == active.schema {
                         let loaded = state_request(&mut active, Operation::LoadScene, &scene.state).await?;
-                        host.report(&with_report("loaded the saved scene", &loaded));
+                        host.report(&with_report(
+                            "loaded the saved scene",
+                            host.state_adapter().report(&loaded).as_deref(),
+                        ));
                     } else {
                         host.report("scene state schema changed; seeding from source");
                     }
@@ -380,6 +306,7 @@ impl<B: Backend> GameRuntime<B> {
             module,
             catalog,
             active,
+            snapshot: None,
             edits: Edits::default(),
             previous_timestamp: None,
             measuring: false,
@@ -473,11 +400,12 @@ impl<B: Backend> GameRuntime<B> {
         scene: Option<&[f32]>,
         show: bool,
         commit: bool,
-    ) -> Result<(RenderFrame, Vec<f32>)> {
+    ) -> Result<(RenderFrame, Option<String>)> {
         let mut candidate = open_game(&self.engine, &self.module).await?;
         let mut answer = restore(&self.engine, &self.module, &mut candidate, state, host).await?;
         if let Some(scene) = scene {
-            answer = state_request(&mut candidate, Operation::LoadScene, scene).await?;
+            let response = state_request(&mut candidate, Operation::LoadScene, scene).await?;
+            answer = host.state_adapter().report(&response);
         }
         let rendered = evaluate(&mut candidate, &self.catalog, host).await?;
         if show {
@@ -487,6 +415,7 @@ impl<B: Backend> GameRuntime<B> {
             candidate.program.accept();
         }
         let mut previous = std::mem::replace(&mut self.active, candidate);
+        self.snapshot = None;
         self.previous_timestamp = None;
         previous.program.close().await;
         host.restored();
@@ -552,19 +481,15 @@ impl<B: Backend> GameRuntime<B> {
             .map_err(|error| if error.is::<Unresponsive>() { error.context(InvalidFrame) } else { error })?;
         let returned = Instant::now();
         let mut frame = self.spare.take().unwrap_or_default();
-        let state = decode_into(&packet, self.active.schema, &self.catalog, &mut frame).map_err(|error| {
-            let details = match packet.iter().position(|value| !value.is_finite()) {
-                Some(lane) => format!("nonfinite value {} at frame lane {lane}", packet[lane]),
-                None => format!("decoding a {}-lane game frame", packet.len()),
-            };
-            error.context(details).context(InvalidFrame)
-        })?;
+        let state = decode_into(&packet, self.active.schema, &self.catalog, &mut frame)
+            .map_err(|error| error.context(InvalidFrame))?;
         if !state.is_empty() {
             return Err(anyhow::anyhow!("program frame must keep its state inside the guest").context(InvalidFrame));
         }
         let decoded = Instant::now();
         host.validate(&frame).map_err(|error| error.context(InvalidFrame))?;
         self.active.program.accept();
+        self.snapshot = None;
         if self.hashing {
             self.packet_hash = hash_lanes(&packet);
         }
@@ -603,6 +528,7 @@ impl<B: Backend> GameRuntime<B> {
     /// draws a frame before it replaces the old one.
     pub async fn reload(&mut self, host: &mut dyn Host, module: B::Module, catalog: Catalog) -> ReloadResult {
         let result: Result<ReloadResult> = (async {
+            host.state_adapter().validate()?;
             let mut prepared = open_game(&self.engine, &module).await?;
             if prepared.schema != self.active.schema {
                 host.report(
@@ -618,13 +544,14 @@ impl<B: Backend> GameRuntime<B> {
             host.render(&rendered, &catalog)?;
             prepared.program.accept();
             let mut previous = std::mem::replace(&mut self.active, prepared);
+            self.snapshot = None;
             self.module = module;
             self.catalog = catalog;
             self.previous_timestamp = None;
             self.drawn = Some(rendered);
             previous.program.close().await;
             host.restored();
-            host.report(&match describe_restore(restore_report(&restored).as_deref()) {
+            host.report(&match restored {
                 Some(changes) => format!("Blot reloaded; {changes}"),
                 None => "Blot reloaded; game state preserved".to_owned(),
             });
@@ -665,10 +592,22 @@ impl<B: Backend> GameRuntime<B> {
 
     /// The running state, as a save holds it.
     pub async fn snapshot(&mut self) -> Result<SavedState> {
-        Ok(SavedState {
+        Ok(self.shared_snapshot().await?.as_ref().clone())
+    }
+
+    /// One guest serialization per accepted state revision. Tooling shares
+    /// the allocation; save owners can request an owned copy with `snapshot`.
+    /// Like all guest requests, call only when no frame is in flight.
+    pub async fn shared_snapshot(&mut self) -> Result<Arc<SavedState>> {
+        if let Some(saved) = &self.snapshot {
+            return Ok(saved.clone());
+        }
+        let saved = Arc::new(SavedState {
             schema: self.active.schema,
             state: state_request(&mut self.active, Operation::Snapshot, &[]).await?,
-        })
+        });
+        self.snapshot = Some(saved.clone());
+        Ok(saved)
     }
 
     /// The running state and edit history, to come back to.
@@ -705,7 +644,7 @@ impl<B: Backend> GameRuntime<B> {
             bail!("save file state schema changed; cannot load this quicksave");
         }
         let (rendered, answer) = self.replace_state(host, &saved.state, None, true, true).await?;
-        if let Some(changes) = describe_restore(restore_report(&answer).as_deref()) {
+        if let Some(changes) = answer {
             host.report(&format!("loaded the save; {changes}"));
         }
         self.drawn = Some(rendered);
@@ -726,7 +665,7 @@ impl<B: Backend> GameRuntime<B> {
         }
         let state = state_request(&mut self.active, Operation::Snapshot, &[]).await?;
         let (rendered, answer) = self.replace_state(host, &state, Some(&scene.state), true, true).await?;
-        if let Some(changes) = describe_restore(restore_report(&answer).as_deref()) {
+        if let Some(changes) = answer {
             host.report(&format!("loaded the scene; {changes}"));
         }
         self.drawn = Some(rendered);
@@ -739,37 +678,19 @@ impl<B: Backend> GameRuntime<B> {
 }
 
 #[cfg(test)]
-mod restore_report_tests {
+mod timing_tests {
     use super::*;
 
     #[test]
     fn housekeeping_is_what_the_phases_leave() {
         let timings = FrameTimings { wait_ms: 2.0, decode_ms: 1.0, validate_ms: 0.5, ..FrameTimings::default() };
-        let done = timings.completed(3.0, 10.0);
-        assert_eq!((done.submit_ms, done.total_ms, done.housekeeping_ms), (3.0, 10.0, 3.5));
-        assert_eq!(timings.completed(9.0, 10.0).housekeeping_ms, 0.0);
-    }
-
-    #[test]
-    fn reports_parse_and_describe_what_was_not_kept() {
-        assert_eq!(restore_report(&[5678.0, 26.0, 0.0]), None, "a state is no report");
-        assert_eq!(restore_report(&[5680.0, 1.0, 100.0]), None, "a cut-off report is none");
-        assert_eq!(restore_report(&[5680.0, 1e30, 100.0]), None, "a count past any report is none");
-        assert_eq!(restore_report(&[5680.0, 1.0, 100.0, -1.0, 1.0, 1.0]), None, "so is a fate that is no number");
-        let report =
-            restore_report(&[5680.0, 3.0, 0.0, 0.0, 1.0, 1.0, 100.0, 1.0, 1.0, 2.0, 104.0, 4.0, 1.0, 0.0]).unwrap();
-        assert_eq!(report[1], SectionOutcome { key: 100, fate: 1, saved: 1, version: 2 });
-        assert_eq!(
-            describe_restore(Some(&report)).as_deref(),
-            Some(
-                "kept 1 of 2 saved sections; migrated section 100 from version 1 to 2; dropped section 104 (no longer saved)"
-            )
-        );
-        assert_eq!(describe_restore(Some(&report[..1])), None, "all kept");
-        assert_eq!(
-            with_report("loaded", &[5680.0, 1.0, 106.0, 3.0, 0.0, 1.0]),
-            "loaded; kept 0 of 1 saved sections; started section 106 afresh (the state has none)"
-        );
+        let draw = DrawTimings { render_ms: 1.5, acquire_ms: 0.25, present_ms: 0.25, pace_ms: 1.0 };
+        let done = timings.completed(draw, 10.0);
+        assert_eq!((done.draw.total_ms(), done.total_ms, done.housekeeping_ms), (3.0, 10.0, 3.5));
+        // Increasing an explicit wait must not inflate rendering or housekeeping.
+        let delayed = timings.completed(DrawTimings { pace_ms: 101.0, ..draw }, 110.0);
+        assert_eq!((delayed.draw.render_ms, delayed.housekeeping_ms), (done.draw.render_ms, done.housekeeping_ms));
+        assert_eq!(timings.completed(DrawTimings { render_ms: 9.0, ..draw }, 10.0).housekeeping_ms, 0.0);
     }
 }
 
@@ -880,6 +801,67 @@ mod receive_tests {
     }
 
     #[test]
+    fn invalid_adapter_rejects_restore_and_reload_without_losing_cached_state() {
+        struct Misconfigured;
+        impl Host for Misconfigured {
+            fn viewport(&self) -> Viewport {
+                Viewer.viewport()
+            }
+            fn validate(&self, frame: &RenderFrame) -> Result<()> {
+                Viewer.validate(frame)
+            }
+            fn render(&mut self, _: &RenderFrame, _: &Catalog) -> Result<()> {
+                Ok(())
+            }
+            fn report(&mut self, _: &str) {}
+            fn state_adapter(&self) -> Arc<dyn StateAdapter> {
+                crate::state::invalid("saved.json: unknown format".into())
+            }
+        }
+        let backend = Scripted::default();
+        assert!(ready(GameRuntime::new(&backend, (), Catalog::default(), &mut Misconfigured, None, None)).is_err());
+        assert!(backend.0.borrow().requests.is_empty());
+        backend.answer(&[Operation::Create, Operation::Frame, Operation::Snapshot]);
+        let mut runtime = ready(GameRuntime::new(&backend, (), Catalog::default(), &mut Viewer, None, None)).unwrap();
+        let saved = ready(runtime.shared_snapshot()).unwrap();
+        backend.0.borrow_mut().requests.clear();
+        assert!(ready(runtime.load(&mut Misconfigured, &saved)).is_err());
+        assert_eq!(ready(runtime.reload(&mut Misconfigured, (), Catalog::default())), ReloadResult::Rejected);
+        assert!(backend.0.borrow().requests.is_empty());
+        assert!(Arc::ptr_eq(&saved, &ready(runtime.shared_snapshot()).unwrap()));
+    }
+
+    #[test]
+    fn tooling_shares_one_snapshot_until_an_accepted_frame_or_restore() {
+        use Operation::{Create, Frame, Restore, Snapshot};
+        let backend = Scripted::default();
+        backend.answer(&[Create, Frame, Snapshot]);
+        let mut runtime = ready(GameRuntime::new(&backend, (), Catalog::default(), &mut Viewer, None, None)).unwrap();
+        let first = ready(runtime.shared_snapshot()).unwrap();
+        let again = ready(runtime.shared_snapshot()).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(backend.0.borrow().requests.iter().filter(|(op, _)| *op == Snapshot).count(), 1);
+        // No timestamp advance is required: zero-delta frames can change state.
+        backend.answer(&[Frame, Snapshot]);
+        runtime.send(&[]).unwrap();
+        ready(runtime.receive(&Viewer)).unwrap();
+        let next = ready(runtime.shared_snapshot()).unwrap();
+        assert!(!Arc::ptr_eq(&first, &next));
+        // A rejected frame does not change the accepted state.
+        backend.0.borrow_mut().answers.push(Err(anyhow::anyhow!("rejected")));
+        runtime.send(&[]).unwrap();
+        assert!(ready(runtime.receive(&Viewer)).is_err());
+        assert!(Arc::ptr_eq(&next, &ready(runtime.shared_snapshot()).unwrap()));
+        backend.answer(&[Restore, Frame, Snapshot]);
+        ready(runtime.load(&mut Viewer, &first)).unwrap();
+        let restored = ready(runtime.shared_snapshot()).unwrap();
+        assert!(!Arc::ptr_eq(&next, &restored));
+        backend.answer(&[Snapshot, Restore, Frame, Snapshot]);
+        assert_eq!(ready(runtime.reload(&mut Viewer, (), Catalog::default())), ReloadResult::Activated);
+        assert!(!Arc::ptr_eq(&restored, &ready(runtime.shared_snapshot()).unwrap()));
+    }
+
+    #[test]
     fn frames_decode_into_recycled_ones_and_stopped_programs_reject_them() {
         let backend = Scripted::default();
         let catalog = Catalog { meshes: vec!["m".into()], materials: vec!["x".into()], sounds: Vec::new() };
@@ -986,142 +968,5 @@ mod receive_tests {
         for (_, input) in frames {
             assert_eq!(input, &[0.0, 64.0, 64.0, 0.0, 0.0], "only startup carries SessionStarted");
         }
-    }
-}
-
-#[cfg(test)]
-mod saved_types_tests {
-    use pen_protocol::boundary::{PACKET_HEADER_FLOATS, PACKET_MAGIC, lanes};
-
-    use super::*;
-    use crate::program::{Response, response};
-    use crate::saved::STATE_MAGIC;
-
-    /// A game saved as ink's persist saves one: the entities, and section
-    /// 100, `points` (version 1) or `points, bonus` (version 2, which has no
-    /// migration from 1). Each module is a build: its version.
-    #[derive(Clone)]
-    struct Builds;
-
-    struct Persisting {
-        version: u32,
-        state: Vec<f32>,
-        answer: Option<(Operation, Vec<f32>)>,
-    }
-
-    fn state(version: u32, record: &[f32]) -> Vec<f32> {
-        let mut state = vec![STATE_MAGIC, 1.0, 2.0, 0.0, 1.0, 0.0, 1.0, 1.0];
-        state.extend([100.0, version as f32, 0.0, record.len() as f32]);
-        state.extend_from_slice(record);
-        state
-    }
-
-    impl Backend for Builds {
-        type Module = u32;
-        type Program = Persisting;
-        async fn start(&self, version: &u32) -> Result<Persisting> {
-            Ok(Persisting { version: *version, state: Vec::new(), answer: None })
-        }
-    }
-
-    impl Program for Persisting {
-        fn schema(&self) -> u32 {
-            1
-        }
-        fn scenes(&self) -> bool {
-            false
-        }
-        fn send(&mut self, operation: Operation, payload: &[f32]) -> Result<()> {
-            let lanes = match operation {
-                Operation::Create => {
-                    self.state = if self.version == 1 { state(1, &[42.0]) } else { state(2, &[0.0, 0.25]) };
-                    Vec::new()
-                }
-                Operation::Snapshot => self.state.clone(),
-                Operation::Restore => {
-                    let saved = whole(payload[9]).unwrap();
-                    let fate = if saved == self.version { 0.0 } else { 2.0 };
-                    self.state = if fate == 0.0 { payload.to_vec() } else { state(2, &[0.0, 0.25]) };
-                    vec![5680.0, 2.0, 0.0, 0.0, 1.0, 1.0, 100.0, fate, saved as f32, self.version as f32]
-                }
-                _ => {
-                    let mut packet = vec![0.0; PACKET_HEADER_FLOATS];
-                    packet[lanes::header::MAGIC] = PACKET_MAGIC;
-                    packet[lanes::header::SCHEMA] = 1.0;
-                    packet
-                }
-            };
-            self.answer = Some((operation, [&[operation as u8 as f32][..], &lanes].concat()));
-            Ok(())
-        }
-        async fn response(&mut self) -> Result<Response> {
-            let (operation, answer) = self.answer.take().unwrap();
-            response(operation, answer)
-        }
-        fn accept(&mut self) {}
-        fn answered(&self) -> Option<Instant> {
-            None
-        }
-        fn memory_bytes(&self) -> usize {
-            0
-        }
-        async fn close(&mut self) {}
-    }
-
-    struct Viewer {
-        declared: Option<SavedTypes>,
-        reports: Vec<String>,
-    }
-
-    impl Host for Viewer {
-        fn viewport(&self) -> Viewport {
-            Viewport { width: 64, height: 64 }
-        }
-        fn validate(&self, _: &RenderFrame) -> Result<()> {
-            Ok(())
-        }
-        fn render(&mut self, _: &RenderFrame, _: &Catalog) -> Result<()> {
-            Ok(())
-        }
-        fn report(&mut self, message: &str) {
-            self.reports.push(message.to_owned());
-        }
-        fn saved_types(&self) -> Option<SavedTypes> {
-            self.declared.clone()
-        }
-    }
-
-    fn ready<T>(future: impl Future<Output = T>) -> T {
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        match std::pin::pin!(future).poll(&mut context) {
-            std::task::Poll::Ready(value) => value,
-            std::task::Poll::Pending => unreachable!("these programs answer at once"),
-        }
-    }
-
-    const DECLARED: &str = r#"{"types": {"score": {"key": 100, "kind": "resource", "versions": {
-        "1": [{"name": "points", "type": "f32"}],
-        "2": [{"name": "points", "type": "f32"}, {"name": "bonus", "type": "f32", "default": 0.5}]}}}}"#;
-
-    fn reload(declared: Option<SavedTypes>) -> (Viewer, Vec<f32>) {
-        let catalog = Catalog { meshes: vec!["m".into()], materials: vec!["x".into()], sounds: Vec::new() };
-        let mut viewer = Viewer { declared, reports: Vec::new() };
-        let builds = Builds;
-        let mut runtime = ready(GameRuntime::new(&builds, 1, catalog.clone(), &mut viewer, None, None)).unwrap();
-        assert_eq!(ready(runtime.reload(&mut viewer, 2, catalog)), ReloadResult::Activated);
-        let saved = ready(runtime.snapshot()).unwrap();
-        (viewer, saved.state)
-    }
-
-    #[test]
-    fn reloads_migrate_what_the_game_cannot_as_declared() {
-        let (viewer, state) = reload(Some(SavedTypes::parse(DECLARED).unwrap()));
-        assert_eq!(state[8..], [100.0, 2.0, 0.0, 2.0, 42.0, 0.5], "the points kept, the bonus its default");
-        let reported = viewer.reports.last().unwrap();
-        assert!(reported.contains("migrated section 100 from version 1 to 2 as saved.json declares"), "{reported}");
-        // Without the declaration the game resets the section.
-        let (viewer, state) = reload(None);
-        assert_eq!(state[8..], [100.0, 2.0, 0.0, 2.0, 0.0, 0.25]);
-        assert!(viewer.reports.last().unwrap().contains("reset section 100"), "{:?}", viewer.reports);
     }
 }

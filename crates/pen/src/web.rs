@@ -268,11 +268,11 @@ fn route(site: &Site, request: &Request, revision: u64) -> Reply {
         file.canonicalize().ok().filter(|file| file.starts_with(&site.out) || file.starts_with(site.root.join("src")));
     let Some(body) = served.as_ref().and_then(|file| std::fs::read(file).ok()) else {
         // A game that declares no saved types, as the page asks whatever.
-        if relative == Path::new("assets").join(pen_runtime::saved::SAVED_TYPES_FILE) {
+        if relative == Path::new("assets").join(pen_runtime::state::CONFIG_FILE) {
             return Reply {
                 status: "200 OK",
                 content_type: "application/json",
-                body: pen_runtime::saved::NO_SAVED_TYPES.into(),
+                body: pen_runtime::state::OPAQUE_CONFIG.into(),
             };
         }
         return Reply::text("404 Not Found", "file unavailable");
@@ -387,7 +387,7 @@ mod tests {
         assert_eq!(answer(&get("/__pen/revision")).2, "7");
         assert_eq!(answer(&get("/missing.js")).0, "404 Not Found");
         // A game without saved types: the page asks whatever.
-        let saved = ("200 OK", "application/json", pen_runtime::saved::NO_SAVED_TYPES.into());
+        let saved = ("200 OK", "application/json", pen_runtime::state::OPAQUE_CONFIG.into());
         assert_eq!(answer(&get("/assets/saved.json")), saved);
         assert_eq!(answer(&get("/../src/main.blot")).0, "400 Bad Request");
         // The checkout's sources are not served, not even through a link.

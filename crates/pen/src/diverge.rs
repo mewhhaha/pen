@@ -6,7 +6,9 @@
 //! determinism.md); this says where, and how, another build departs from
 //! it. It fails when they diverge, so `git bisect run` can find the commit
 //! that changed what the game does.
+use pen_runtime::state::{Section, StateAdapter};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use pen_protocol::boundary::{read_catalog, whole};
@@ -21,9 +23,13 @@ use crate::timeline::{self, Recorded, Recording, Timeline};
 const SHOWN_LANES: usize = 8;
 
 /// A host that draws nothing: the frames are only compared.
-struct Null(Viewport);
+struct Null(Viewport, Arc<dyn StateAdapter>);
 
 impl Host for Null {
+    fn state_adapter(&self) -> Arc<dyn StateAdapter> {
+        self.1.clone()
+    }
+
     fn viewport(&self) -> Viewport {
         self.0
     }
@@ -62,7 +68,7 @@ struct Replay {
 
 impl Replay {
     fn start(engine: &wasmtime::Engine, bundle: &Bundle, recording: &Recording, host: Null) -> Result<Replay> {
-        let module = crate::load_module(engine, &bundle.directory, true)?;
+        let module = crate::load_module(engine, &bundle.directory, true, false)?;
         let catalog = read_catalog(&bundle.assets)?;
         let mut host = host;
         let mut runtime = GameRuntime::new(engine, module, catalog, &mut host, None, None)?;
@@ -109,9 +115,19 @@ pub fn run(path: &Path, this: &Bundle, reference: &Bundle) -> Result<()> {
         reference.directory.display()
     );
     let engine = blot_host::engine()?;
-    let mut theirs = Replay::start(&engine, reference, &recording, Null(viewport))
-        .with_context(|| format!("the reference build ({}) cannot replay it", reference.directory.display()))?;
-    let mut ours = match Replay::start(&engine, this, &recording, Null(viewport)) {
+    let mut theirs = Replay::start(
+        &engine,
+        reference,
+        &recording,
+        Null(viewport, crate::session::load_state_adapter(&reference.assets)),
+    )
+    .with_context(|| format!("the reference build ({}) cannot replay it", reference.directory.display()))?;
+    let mut ours = match Replay::start(
+        &engine,
+        this,
+        &recording,
+        Null(viewport, crate::session::load_state_adapter(&this.assets)),
+    ) {
         Ok(replay) => replay,
         Err(error) => bail!("the builds diverge at the start: this build cannot replay the recording: {error:#}"),
     };
@@ -136,7 +152,13 @@ pub fn run(path: &Path, this: &Bundle, reference: &Bundle) -> Result<()> {
             eprintln!("its packet is the same");
         }
         if states {
-            eprintln!("the state after it:\n{}", indent(&state_difference(&expected.state, &got.state).join("\n")));
+            eprintln!(
+                "the state after it:\n{}",
+                indent(
+                    &state_difference(&expected.state, &got.state, theirs.host.1.as_ref(), ours.host.1.as_ref())
+                        .join("\n")
+                )
+            );
         } else {
             eprintln!("the state after it is the same");
         }
@@ -211,53 +233,15 @@ pub fn difference(first: &RenderFrame, again: &RenderFrame) -> String {
     said.join("\n")
 }
 
-/// A saved section of a state, as gdev's `ink/persist` lays them out
-/// (gdev's README, "Saved state"): `key, version, width, length`, then its
-/// lanes; a component's are `width + 1` lanes per entity, a flag first.
-#[derive(Debug, PartialEq)]
-struct Section<'a> {
-    key: u32,
-    version: u32,
-    width: u32,
-    lanes: &'a [f32],
-}
-
-/// A state's `magic, schema, count`, then its sections; None when it is
-/// not laid out so.
-fn sections(state: &[f32]) -> Option<(&[f32], Vec<Section<'_>>)> {
-    let (head, mut rest) = state.split_at_checked(3)?;
-    let count = whole(head[2])?;
-    let mut found = Vec::new();
-    for _ in 0..count {
-        let (header, after) = rest.split_at_checked(4)?;
-        let length = usize::try_from(whole(header[3])?).ok()?;
-        let (lanes, after) = after.split_at_checked(length)?;
-        found.push(Section { key: whole(header[0])?, version: whole(header[1])?, width: whole(header[2])?, lanes });
-        rest = after;
-    }
-    rest.is_empty().then_some((head, found))
-}
-
-/// Lane `offset` of a section `width` wide: an entity's flag or lane in a
-/// component's records, else the lane.
-fn place(width: u32, offset: usize) -> String {
-    let Ok(stride) = usize::try_from(width) else { return format!("lane {offset}") };
-    if stride == 0 {
-        return format!("lane {offset}");
-    }
-    let (entity, within) = (offset / (stride + 1), offset % (stride + 1));
-    if within == 0 { format!("entity {entity}'s flag") } else { format!("entity {entity} lane {}", within - 1) }
-}
-
-/// The lanes of `was` and `now` that differ, `width` laid out, a few named
-/// and the rest counted.
-fn lane_differences(width: u32, was: &[f32], now: &[f32]) -> String {
+/// Differing lanes, named by the adapter when available: a few shown and
+/// the rest counted.
+fn lane_differences(was: &[f32], now: &[f32], label: impl Fn(usize) -> String) -> String {
     let differing: Vec<usize> =
         (0..was.len().min(now.len())).filter(|&lane| was[lane].to_bits() != now[lane].to_bits()).collect();
     let mut said: Vec<String> = differing
         .iter()
         .take(SHOWN_LANES)
-        .map(|&lane| format!("{}: {} -> {}", place(width, lane), was[lane], now[lane]))
+        .map(|&lane| format!("{}: {} -> {}", label(lane), was[lane], now[lane]))
         .collect();
     if differing.len() > SHOWN_LANES {
         said.push(format!("and {} more", differing.len() - SHOWN_LANES));
@@ -270,19 +254,20 @@ fn lane_differences(width: u32, was: &[f32], now: &[f32]) -> String {
 
 /// How two states differ, a line per section that does (or per lane, for
 /// a state not laid out in sections).
-fn state_difference(was: &SavedState, now: &SavedState) -> Vec<String> {
+fn state_difference(
+    was: &SavedState,
+    now: &SavedState,
+    before: &dyn StateAdapter,
+    after: &dyn StateAdapter,
+) -> Vec<String> {
     let mut said = Vec::new();
     if was.schema != now.schema {
         said.push(format!("state schema {} -> {}", was.schema, now.schema));
     }
-    let (Some((was_head, was_sections)), Some((now_head, now_sections))) = (sections(&was.state), sections(&now.state))
-    else {
-        said.push(lane_differences(0, &was.state, &now.state));
+    let (Some(was_sections), Some(now_sections)) = (before.sections(&was.state), after.sections(&now.state)) else {
+        said.push(lane_differences(&was.state, &now.state, |lane| format!("lane {lane}")));
         return said;
     };
-    if was_head[..2] != now_head[..2] {
-        said.push(format!("header {:?} -> {:?}", &was_head[..2], &now_head[..2]));
-    }
     for section in &was_sections {
         let Some(other) = now_sections.iter().find(|other| other.key == section.key) else {
             said.push(format!("section {}: only in the reference's", section.key));
@@ -294,7 +279,7 @@ fn state_difference(was: &SavedState, now: &SavedState) -> Vec<String> {
                 section.key, section.version, section.width, other.version, other.width
             ));
         } else if section.lanes != other.lanes {
-            let lanes = lane_differences(section.width, section.lanes, other.lanes);
+            let lanes = lane_differences(section.lanes, other.lanes, |lane| before.lane_label(section, lane));
             said.push(format!("section {} (version {}): {lanes}", section.key, section.version));
         }
     }
@@ -304,6 +289,10 @@ fn state_difference(was: &SavedState, now: &SavedState) -> Vec<String> {
     let order = |sections: &[Section]| sections.iter().map(|section| section.key).collect::<Vec<_>>();
     if said.is_empty() && order(&was_sections) != order(&now_sections) {
         said.push(format!("sections in another order: {:?} -> {:?}", order(&was_sections), order(&now_sections)));
+    }
+    // Adapters can omit headers or other opaque lanes; never hide a raw difference.
+    if said.is_empty() && was.state.iter().map(|v| v.to_bits()).ne(now.state.iter().map(|v| v.to_bits())) {
+        said.push(lane_differences(&was.state, &now.state, |lane| format!("lane {lane}")));
     }
     said
 }
@@ -322,16 +311,8 @@ mod tests {
         SavedState { schema: 26, state: lanes }
     }
 
-    #[test]
-    fn states_split_into_their_sections() {
-        let saved = state(&[(1, 1, 0, &[7.0]), (102, 3, 2, &[1.0, 0.5, 0.25, 0.0, 0.0, 0.0])]);
-        let (head, found) = sections(&saved.state).unwrap();
-        assert_eq!(head, [5678.0, 26.0, 2.0]);
-        assert_eq!(found[1], Section { key: 102, version: 3, width: 2, lanes: &[1.0, 0.5, 0.25, 0.0, 0.0, 0.0] });
-        // Not laid out in sections: a count past the end, or lanes left over.
-        assert!(sections(&[5678.0, 26.0, 2.0, 1.0, 1.0, 0.0, 1.0, 7.0]).is_none());
-        assert!(sections(&[5678.0, 26.0, 0.0, 1.0]).is_none());
-        assert!(sections(&[1.0]).is_none());
+    fn state_difference(was: &SavedState, now: &SavedState) -> Vec<String> {
+        super::state_difference(was, now, &pen_ink::Ink::default(), &pen_ink::Ink::default())
     }
 
     #[test]
@@ -369,9 +350,9 @@ mod tests {
     fn a_build_agrees_with_itself() {
         let Some(directory) = crate::fixtures::bundle() else { return };
         let engine = blot_host::engine().unwrap();
-        let module = crate::load_module(&engine, &directory, true).unwrap();
+        let module = crate::load_module(&engine, &directory, true, false).unwrap();
         let viewport = Viewport { width: 960, height: 640 };
-        let mut host = Null(viewport);
+        let mut host = Null(viewport, crate::session::load_state_adapter(&directory.join("assets")));
         let catalog = read_catalog(&directory.join("assets")).unwrap();
         let mut runtime = GameRuntime::new(&engine, module, catalog, &mut host, None, None).unwrap();
         let start = runtime.moment().unwrap();

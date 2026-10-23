@@ -32,6 +32,9 @@
 //! }
 //! ```
 //!
+//! - `inferenceBudget`: positive U32 work limit for module inference and
+//!   associated evidence, passed to `blotc --inference-budget`; absent uses
+//!   the compiler default.
 //! - `program`: the name the compiler is granted under (`blotc`).
 //! - `imports`: import prefixes, each ending in `/`, and the directories
 //!   behind them.

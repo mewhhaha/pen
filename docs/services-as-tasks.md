@@ -1,88 +1,72 @@
 # Services as Blot tasks
 
-**Status: blocked on blot2's task ABI.** pen reads a task module's manifest and
-refuses it with the reason; it cannot host one natively. This page says why,
-what the design must keep, and exactly what pen needs from blot2.
+Pen hosts **synchronous structured tasks natively** and **cooperative structured
+tasks in the browser**. These paths preserve Blot's task contexts and ownership;
+neither path adds CPU parallelism or persisted Wasm stacks.
 
-## Today
+## Supported boundary
 
-A game reaches a service (Steam, the clipboard, pathfinding...) through its
-render packet: a request with an id, a service and an operation, answered once
-as `ServiceAnswer` and `ServiceData` input events in a later frame
-(`pen_runtime::services`). The game keeps the ids of requests in flight in its
-state and looks for their answers in each frame's events. Because answers are
-input, recordings hold them, and replays, rewinds and reloads repeat exactly.
+- Native `blot-host` admits ABI 3 task modules without concurrent callbacks.
+  It validates the version-2 task manifest, every import/export signature and
+  descriptor, executes children in spawn order at joins/drains/scope exits,
+  cancels unstarted work, releases unused results and drains failures. Handles
+  are bounded, monotonic identities. Array results move through the compiler's
+  adapters. Newer resource ABIs remain outside native admission.
+- The browser uses Blot's bundled upstream adapter for task modules. JSPI runs
+  their stacks cooperatively. Without JSPI, the existing isolated worker uses
+  the synchronous adapter and the SharedArrayBuffer frame exchange.
+- The game's frame callback remains serial. `main` with a concurrent callback
+  is refused by the browser program boundary; services need a separate recorded
+  request/answer channel. Native admission refuses all concurrent callbacks.
+- Memory images refuse task instances: their host contexts are not part of
+  linear memory. Game save/load still requires ordinary saved data and a fresh
+  instance. A suspended Wasm stack must never masquerade as saved state.
 
-## The goal
+The reference adapter is generated from `crates/pen-web/structured-source.ts`
+by `deno run -A scripts/bundle-structured.ts`; `--check` detects drift. It ships
+as `structured.js`, including Blot's third-party notice.
 
-Game code that reads as it means:
+`blot_host::workers::Workers` is a separate opt-in CPU experiment for independent
+value entries. It shares compiled code but creates a fresh Wasm instance per job,
+copies every input/result, and returns answers in submission order. Limits are
+eight workers, 32 jobs per batch, 16,384 input/output lanes, and 64 MiB of linear
+memory per instance. Worker stacks include the configured guest stack allowance.
+Jobs cannot receive callback capabilities. Execution deadlines depend on the
+supplied engine; this API does not provide cooperative cancellation of a running
+job. It is not connected to game scheduling or the structured-task ABI.
 
-```blot
-// In a concurrent task: the path arrives some frames later, and the task
-// resumes with it; other tasks and the frame loop run meanwhile.
-use path <- pathfinding.route grid from to
-```
+Ink's opt-in `task_queue` now implements the explicit cross-frame state machine:
+world epochs, ordered publication, saved request/result/continuation values,
+cancellation and bounded logical timelines. `services/typed` validates domain
+answers over the existing service protocol. These mechanisms do not change Pen's
+native admission rules or make persisted Wasm stacks possible.
 
-Blot has the pieces: structured tasks (`spawn`, `join`, `cancel`, groups) and
-`concurrent` callbacks, in which tasks suspend side by side (guest-abi.md,
-"Structured task extension"; the manifest's callback tag 13 beside a
-`blot:tasks` section).
+## Evidence
 
-## What the design must keep
+`cargo test -p blot-host --test structured_tasks` compiles the actual Blot
+fixture (select its compiler with `BLOTC`). It exercises collection, nested
+scopes, cancellation before execution, unjoined results, owned array results,
+repeated failure/reuse and zero live ownership counters after calls/teardown.
+The existing native host/ABI tests and browser ownership tests also exercise
+legacy modules. The gdev modernization harness exercises task-bearing game
+exchanges through JSPI and the isolated worker, including traps and restart.
+This is an initial conformance set, not exhaustive malformed-module/OOM proof.
 
-1. **Determinism.** An answer may reach a task only at a frame boundary, in
-   an order fixed by the requests (not by when services finish), and as input
-   a recording keeps. A replay settles the same calls with the same answers in
-   the same frames and calls no service.
-2. **Time travel and reload.** pen restores a moment by starting a new program
-   from the game's snapshot, and moves the state into a new build the same
-   way. A suspended task is a Wasm stack, not state: no snapshot holds it. So
-   either a task awaiting a service is part of what the game saves (its
-   request, re-issued on restore by the game, as gdev re-issues pathfinding
-   today) or tasks may not wait across frames. The language should make the
-   choice explicit; silently losing in-flight tasks on every rewind would make
-   rewinds diverge.
-3. **Both hosts.** The browser keeps one suspended Wasm stack per JSPI
-   `promising` call, so concurrent callbacks work there. wasmtime does not: a
-   core module's call (`Func::call_async`) holds its store for the whole call,
-   so one instance has at most one suspended stack. Concurrent calls into one
-   store exist only for components (`Store::run_concurrent`). Native pen today
-   runs `main` on its own thread and blocks it in the host call: one stack.
+## Cross-frame services remain separate
 
-## What pen needs from blot2
+The existing service protocol submits requests with IDs and returns answers as
+recorded input events at frame boundaries. Replay calls no service. A saved
+request can be re-issued after restore; a suspended stack cannot.
 
-1. **A lowering a single-stack host can run.** Either
-   - tasks scheduled inside the guest: a concurrent callback records its
-     request and yields to the guest's own scheduler (Wasm stack switching,
-     which wasmtime has behind `Config::wasm_stack_switching` on x86-64 Linux,
-     or state machines), and the host sees one call per frame; or
-   - frame-gated concurrent callbacks: the requests a frame's tasks made
-     leave in that frame's response, their answers arrive in a later request,
-     and the compiler resumes the waiting tasks from it. That is pen's service
-     protocol with task syntax over it, and needs no new host machinery.
-2. **A host-neutral specification of `blot:task/1`** (the twelve imports, the
-   task context exports, resource journals moving between tasks) with
-   conformance modules and expected traces. Today `compiler/task_guest.ts`,
-   `task_runtime.ts` and `resource_journal.ts` are the specification.
-3. **What a snapshot keeps of a task** (point 2 above).
+For task-shaped service calls across frames, keep these requirements:
 
-## What pen has built
+1. Deliver answers at a recorded frame boundary in deterministic request order.
+2. Save an explicit continuation/request record, or finish tasks within a frame.
+3. Close the old world's task lifetime before replacing/reloading that world.
+4. Keep worker inputs/results copied or serialized; never share guest pointers.
 
-- `pen_runtime::abi` reads the task extension: the `blot:tasks` section
-  (version 2, its descriptor count, at most 4096) and concurrent callbacks
-  (tag 13), refusing them without ABI 3's ownership or without the section, as
-  the reference adapter does. `GuestAbi::check_hostable` refuses a task module
-  in both hosts with the reason and this page, before anything runs:
-  `unsupported_abi: the module uses Blot's structured tasks (blot:tasks, 3
-  descriptors; concurrent callbacks for main), which pen does not host yet`.
-  Tested by `task_modules_are_read_and_refused`.
-- The determinism half already exists: services answer as recorded input,
-  in request order, at frame boundaries, and the same protocol would carry a
-  frame-gated lowering unchanged.
-
-## What is left
-
-Hosting tasks natively once blot2 chooses a lowering: with guest-side
-scheduling, nothing beyond the manifest (pen runs one call per frame as it
-does); with host-side suspension, a wasmtime embedding that keeps several
-stacks per instance, which wasmtime's core API does not offer.
+The native embedding still cannot hold several suspended core-Wasm calls into
+one Wasmtime store. The next architectural experiment is explicit, saved state
+machines over frame-gated service answers. A compiler lowering or a qualified
+stack-switching implementation would be required for general source-level
+suspension. The synchronous host does not imply that this problem is solved.

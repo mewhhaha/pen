@@ -64,7 +64,13 @@ impl Backend for BrowserBackend {
 
     async fn start(&self, module: &Vec<u8>) -> Result<BrowserProgram> {
         let abi = pen_runtime::abi::read_abi(module)?;
-        abi.check_hostable()?;
+        // The browser adapter hosts cooperative task scopes. The frame
+        // exchange remains serial; concurrent service capabilities need their
+        // own recorded request/answer boundary rather than sharing this one.
+        ensure!(
+            !abi.concurrent.iter().any(|name| name == "main"),
+            "unsupported_abi: the game frame callback must be serial"
+        );
         abi.check_game()?;
         let symbols = Rc::new(Symbols::read(module));
         let value = open_guest(Uint8Array::from(module.as_slice()), abi.ownership)

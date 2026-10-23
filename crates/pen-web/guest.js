@@ -8,8 +8,16 @@
 // thread, suspended at each host call. Without it, a cross-origin isolated
 // page runs the guest in a worker (this module again), which blocks at each
 // host call on a SharedArrayBuffer until the page sends the next request.
+import { openStructured, runStructuredSync } from './structured.js';
+
+async function hasTasks(bytes) {
+  const module = await WebAssembly.compile(bytes);
+  return WebAssembly.Module.customSections(module, 'blot:tasks').length !== 0;
+}
 export async function openGuest(bytes, ownership) {
-  if (WebAssembly.Suspending && WebAssembly.promising) return openSuspending(bytes, ownership);
+  if (WebAssembly.Suspending && WebAssembly.promising) {
+    return await hasTasks(bytes) ? openStructured(bytes) : openSuspending(bytes, ownership);
+  }
   if (globalThis.crossOriginIsolated && typeof SharedArrayBuffer === 'function') return openWorker(bytes, ownership);
   throw new Error('This browser needs WebAssembly JS Promise Integration (JSPI), or a cross-origin isolated page '
     + '(COOP and COEP headers; on itch.io, "SharedArrayBuffer support") to run the game in a worker.');
@@ -207,10 +215,8 @@ function serveWorker() {
     const capability = Object.freeze({});
     let exports;
     let guest;
-    const exchange = (reference, pointer) => {
-      if (reference !== capability) throw new Error('stale guest capability');
-      const packet = guest.read(pointer);
-      postMessage({ packet, memory: exports['blot:memory'].buffer.byteLength }, [packet.buffer]);
+    const exchangeValues = (packet, memory) => {
+      postMessage({ packet, memory }, [packet.buffer]);
       let values;
       for (;;) {
         Atomics.wait(signals, READY, 0);
@@ -222,15 +228,25 @@ function serveWorker() {
         if (offset + count >= values.length) break;
         postMessage({ more: true });
       }
-      return guest.write(values);
+      return values;
+    };
+    const exchange = (reference, pointer) => {
+      if (reference !== capability) throw new Error('stale guest capability');
+      return guest.write(exchangeValues(guest.read(pointer), exports['blot:memory'].buffer.byteLength));
     };
     let outcome = 0;
+    let structured = false;
     try {
-      exports = await instantiate(bytes, ownership, exchange);
-      guest = arrays(exports);
-      if (ownership) exports['blot:ownership_enter']();
-      exports['blot:reset'](0);
-      exports.main(capability);
+      structured = await hasTasks(bytes);
+      if (structured) {
+        await runStructuredSync(bytes, exchangeValues);
+      } else {
+        exports = await instantiate(bytes, ownership, exchange);
+        guest = arrays(exports);
+        if (ownership) exports['blot:ownership_enter']();
+        exports['blot:reset'](0);
+        exports.main(capability);
+      }
       if (!Atomics.load(signals, STOPPING)) throw new Error('game main returned before shutdown');
     } catch (error) {
       if (!Atomics.load(signals, STOPPING)) {
@@ -238,6 +254,10 @@ function serveWorker() {
         return;
       }
       outcome = 1;
+    }
+    if (structured) {
+      postMessage({ closed: outcome });
+      return;
     }
     if (ownership) exports['blot:ownership_leave'](outcome);
     exports['blot:reset'](0);

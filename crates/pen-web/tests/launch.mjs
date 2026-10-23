@@ -14,7 +14,7 @@ for (const name of without) {
 // `gpu`: whether pages draw (with WebGPU).
 export async function launch({ gpu = true } = {}) {
   if (browserName === 'firefox') {
-    const firefoxUserPrefs = {};
+    const firefoxUserPrefs = gpu ? { 'dom.webgpu.enabled': true, 'dom.webgpu.force-enabled': true } : {};
     if (without.has('jspi')) firefoxUserPrefs['javascript.options.wasm_js_promise_integration'] = false;
     return playwright.firefox.launch({ headless: true, firefoxUserPrefs });
   }

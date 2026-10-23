@@ -133,7 +133,9 @@ console says why.
 An invalid game frame pauses `pen dev` at its last accepted state instead of
 closing it. The window, dev tools and watcher keep running; a valid reload
 resumes playback unless you paused it yourself. Decode errors identify the
-packet length or the first nonfinite lane. Play can retry the running build.
+protocol field, item, lane and rejected value, with optional application
+provenance ([packet diagnostics](docs/packet-diagnostics.md)). Play can retry
+the running build.
 
 In `pen dev` a guest that runs 5 s without answering the host is stopped, and
 that frame is rejected the same way: the game pauses at the last frame it
@@ -149,7 +151,7 @@ The state survives most edits. gdev saves it in keyed, versioned sections, one
 per saved type (gdev's README, "Saved state"). A new build keeps each section
 saved with its type's current version, migrates one saved with another
 version through the type's `migrate`, starts afresh a type the state lacks or
-cannot migrate, and drops sections no type reads any more. The runtime reports
+cannot migrate, and drops sections no type reads any more. With gdev's explicit Ink state adapter, the runtime reports
 what it did not simply keep:
 
 ```
@@ -290,6 +292,33 @@ pen-runtime exactly as native pen does. Its canvas is backed by device pixels
 (`devicePixelRatio`), the export's `game.json` titles the page, and saves are
 written off the frame's path.
 
+### System traces
+
+`PEN_TRACE_SYSTEMS=/tmp/systems.json pen dev` records a native game's
+`main_trace` entrypoint. Ink's `ink/pen/host.run_traced` provides this entrypoint's
+observer protocol; it takes the same host capability as `main`. Rebuild Blot
+and the game with the optional `blot:allocation` export before capturing.
+Normal runs retain the original module and entrypoint.
+
+Exit normally to finish the Chrome/Perfetto JSON and its adjacent
+`systems.summary.json`. Spans carry stage, system name/id, frame, elapsed
+microseconds, allocation requests and requested bytes. The summary has calls,
+total/mean/max time, total/mean bytes, allocation count and aborted calls.
+Reloaded guests share the capture and get separate timeline tracks.
+`PEN_TRACE_LIMIT=N` bounds timeline events (default 1,000,000); aggregate counts
+continue, and the report records how many events were omitted.
+
+Measurements cover guest work, excluding host waiting and GPU execution.
+Requested bytes include allocator reuse and are not live memory or heap
+capacity. Begin-marker bridge setup is excluded from a system's measurement;
+the remaining observer overhead and development engine still affect timings.
+Enclosing `Guest` command spans include tracing overhead and overlap the
+systems inside them. This capture is supported by the native host.
+
+After `just export`, compare every packet and the final saved world with and
+without tracing using
+`PEN_TRACE_FIXTURE=dist/gdev/game.wasm cargo test -p blot-host --test system_trace -- --ignored`.
+
 ### The dev tools
 
 The dev tools are the checkout's own: a second Blot program beside the game
@@ -352,6 +381,11 @@ Beside the console, `/timeline`, `/tunables` and `/builds` open its panels
 with reset and Bake, and the build and reload output. Time travel also works
 from the console (`/pause`, `/play`, `/step`, `/rewind`, `/replay`,
 `/history`, `/record`) and its keys ("Recording, replay and time travel").
+
+Applications can also publish typed fields, stable object identities and
+decision reasons through the opt-in [semantic inspection service](docs/semantic-inspection.md).
+Both hosts support named diffs and transition watches on the existing timeline;
+the application supplies its inspector UI.
 
 The same dialog has the inspectors (gdev's `devtools/pages.blot`), whose
 numbers the host works out alike for every host (`pen_runtime::inspect`):
@@ -678,9 +712,10 @@ rewinds unchanged. A trap names its frames and, given a source map, their
 files and lines ([docs/source-maps.md](docs/source-maps.md)). Mods are extra
 guests beside the game, each in a sandbox with the capabilities its manifest
 asks for, adding to the player's input (`--mod DIR`,
-[docs/mods.md](docs/mods.md)). A game can declare its saved types' layouts
-in `saved.json` beside its catalog, and pen migrates a section the game's
-own code cannot ([docs/saved-types.md](docs/saved-types.md)).
+[docs/mods.md](docs/mods.md)). State is opaque by default. An explicit
+[state adapter](docs/state-adapters.md) adds format-specific tooling. Ink
+applications can declare saved types in `saved.json` beside the catalog for
+migration fallback ([docs/saved-types.md](docs/saved-types.md)).
 [docs/guest-abi-next.md](docs/guest-abi-next.md) says which of blot2's guest
 ABI pen hosts and what it needs next.
 

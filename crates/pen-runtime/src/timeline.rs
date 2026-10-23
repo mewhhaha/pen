@@ -90,7 +90,7 @@ async fn run_unseen<B: Backend>(
     runtime: &mut GameRuntime<B>,
     host: &dyn Host,
     recorded: &Recorded,
-) -> Result<RenderFrame> {
+) -> Result<(RenderFrame, bool)> {
     let mut quiet = Quiet(host);
     runtime.send(&recorded.input)?;
     let rendered = runtime.receive(&quiet).await?;
@@ -98,7 +98,9 @@ async fn run_unseen<B: Backend>(
     for load in &recorded.loads {
         apply(runtime, &mut quiet, load).await?;
     }
-    Ok(runtime.take_drawn().unwrap_or(rendered))
+    let replacement = runtime.take_drawn();
+    let replaced = replacement.is_some();
+    Ok((replacement.unwrap_or(rendered), replaced))
 }
 
 /// Told of each frame a rewind runs unseen: its position and input, and
@@ -112,6 +114,8 @@ struct Kept {
 }
 
 pub struct Timeline {
+    /// Optional development observations indexed by this timeline's positions.
+    pub observations: crate::semantic::Observations,
     /// Frames from position `base` on.
     frames: VecDeque<Recorded>,
     base: u64,
@@ -135,6 +139,7 @@ pub struct Timeline {
 impl Default for Timeline {
     fn default() -> Timeline {
         Timeline {
+            observations: crate::semantic::Observations::default(),
             frames: VecDeque::new(),
             base: 0,
             moments: BTreeMap::new(),
@@ -159,6 +164,17 @@ impl Timeline {
 
     pub fn history(&self) -> bool {
         self.history
+    }
+
+    /// The accepted output at the next position, before `ran` advances it.
+    pub fn observe(&mut self, frame: &RenderFrame, replaced: bool) {
+        if !self.observations.enabled() {
+            return;
+        }
+        self.observations.ran(self.cursor + 1, frame, replaced || self.restored_here());
+        if let Some(earliest) = self.earliest() {
+            self.observations.retain_from(earliest);
+        }
     }
 
     /// The next frame to run; frames before it have run.
@@ -314,6 +330,7 @@ impl Timeline {
 
     /// The recorded future is dropped: play continues live from the cursor.
     pub fn go_live(&mut self) {
+        self.observations.branch(self.cursor);
         self.restored_next = self.restored_here();
         self.frames.truncate(self.index(self.cursor));
         self.moments.retain(|position, _| *position <= self.cursor);
@@ -321,6 +338,7 @@ impl Timeline {
 
     /// A new build of the game runs from here on.
     pub fn rebuilt(&mut self) {
+        self.observations.invalidate("build_changed");
         self.build += 1;
     }
 
@@ -333,6 +351,7 @@ impl Timeline {
     /// Plays a recording whose start is at `position` of the run it came
     /// from (a spectator joining a stream late), counting frames from there.
     pub fn load_at(&mut self, recording: Recording, position: u64) {
+        self.observations.invalidate("recording_replaced");
         self.frames = recording.frames.into();
         self.base = position;
         self.cursor = position;
@@ -385,6 +404,7 @@ impl Timeline {
             let end = self.index(at);
             self.frames.drain(..end);
             self.base = at;
+            self.observations.retain_from(at);
         }
     }
 
@@ -435,7 +455,9 @@ impl Timeline {
         while self.cursor < target {
             self.prepare(runtime, host).await?;
             let recorded = self.frames[self.index(self.cursor)].clone();
-            shown = run_unseen(runtime, host, &recorded).await?;
+            let (frame, replaced) = run_unseen(runtime, host, &recorded).await?;
+            shown = frame;
+            self.observations.replayed(self.cursor + 1, &shown, recorded.restored || replaced);
             unseen(self.cursor, &recorded, runtime)?;
             self.ran(recorded);
         }

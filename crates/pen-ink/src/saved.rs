@@ -6,7 +6,7 @@
 //! A state is the save format of ink's `persist.blot` (gdev's README,
 //! "Saved state"): `magic, schema, section_count`, then per saved type `key,
 //! version, width, length` and its lanes. Restoring, the game says what it
-//! made of each section (the restore report, `game.rs`); a section it had
+//! made of each section (the restore report, `report.rs`); a section it had
 //! to reset, saved with a version its `migrate` does not read, is the host's
 //! to migrate when both versions are declared: each field of the build's
 //! version takes the lanes of the saved field of its name (or the name it
@@ -19,13 +19,6 @@ use pen_protocol::boundary::whole;
 
 /// What a state starts with (ink's `persist.magic`).
 pub const STATE_MAGIC: f32 = 5678.0;
-/// The file a game declares its saved types in, beside its catalog.
-pub const SAVED_TYPES_FILE: &str = "saved.json";
-/// That file for a game that declares none, as the browser host is served
-/// it: the page asks for the file whatever, and a missing one would be an
-/// error in its console.
-pub const NO_SAVED_TYPES: &str = "{\"types\": {}}\n";
-
 /// How a saved type's section holds its values (ink's persist layers).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -276,9 +269,10 @@ fn migrate_section(saved: &SavedType, section: &Section, lanes: &[f32], to: u32)
 /// `state` with the sections `targets` names (key and the build's version)
 /// brought to those versions by their declarations; the keys it migrated.
 pub fn migrate(state: &[f32], types: &SavedTypes, targets: &[(u32, u32)]) -> Result<(Vec<f32>, Vec<u32>)> {
+    let sections = sections(state)?;
     let mut migrated = state[..3].to_vec();
     let mut keys = Vec::new();
-    for section in sections(state)? {
+    for section in sections {
         let lanes = &state[section.start + 4..section.start + 4 + section.length];
         let target = targets.iter().find(|(key, _)| *key == section.key).map(|(_, version)| *version);
         let declared = types.types.get(&section.key);
@@ -302,10 +296,10 @@ pub fn migrate(state: &[f32], types: &SavedTypes, targets: &[(u32, u32)]) -> Res
 
 /// The sections a restore reset for want of a migration that `types`
 /// declares the way to: their keys and the build's versions.
-pub fn declared_resets(types: &SavedTypes, outcomes: &[crate::game::SectionOutcome]) -> Vec<(u32, u32)> {
+pub fn declared_resets(types: &SavedTypes, outcomes: &[crate::report::SectionOutcome]) -> Vec<(u32, u32)> {
     outcomes
         .iter()
-        .filter(|outcome| outcome.fate == crate::game::RESET)
+        .filter(|outcome| outcome.fate == crate::report::RESET)
         .filter(|outcome| {
             types.types.get(&outcome.key).is_some_and(|saved| saved.conversion(outcome.saved, outcome.version).is_ok())
         })
@@ -329,7 +323,7 @@ pub fn check(types: &SavedTypes) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game::SectionOutcome;
+    use crate::report::SectionOutcome;
 
     const DECLARED: &str = r#"{"types": {
         "score": {"key": 100, "kind": "resource", "versions": {
@@ -358,7 +352,7 @@ mod tests {
         assert_eq!(types.types[&101].kind, Kind::SnapshottedResource);
         assert_eq!(types.types[&100].versions[&2][1].default, [0.5]);
         assert!(check(&types).is_ok());
-        assert!(SavedTypes::parse(NO_SAVED_TYPES).unwrap().types.is_empty());
+        assert!(SavedTypes::parse(r#"{"types":{}}"#).unwrap().types.is_empty());
         let retyped = r#"{"types": {"t": {"key": 7, "kind": "resource", "versions": {
             "1": [{"name": "a", "type": "f32"}], "2": [{"name": "a", "type": "vec2"}]}}}}"#;
         let error = format!("{:#}", check(&SavedTypes::parse(retyped).unwrap()).unwrap_err());
@@ -397,10 +391,10 @@ mod tests {
         let types = SavedTypes::parse(DECLARED).unwrap();
         let outcome = |key, fate, saved, version| SectionOutcome { key, fate, saved, version };
         let outcomes = [
-            outcome(100, crate::game::RESET, 1, 2),
+            outcome(100, crate::report::RESET, 1, 2),
             outcome(101, 1, 1, 2),
-            outcome(102, crate::game::RESET, 3, 5),
-            outcome(104, crate::game::RESET, 1, 2),
+            outcome(102, crate::report::RESET, 3, 5),
+            outcome(104, crate::report::RESET, 1, 2),
         ];
         assert_eq!(
             declared_resets(&types, &outcomes),

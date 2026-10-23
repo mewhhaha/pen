@@ -213,6 +213,11 @@ impl Input {
                 let mouse: MouseEvent = event.unchecked_into();
                 let mut state = state.borrow_mut();
                 let (x, y) = state.pointer;
+                // Letterboxed pages can receive window clicks outside the game.
+                // Releases still reach it so a drag cannot leave a button held.
+                if down && (x < 0.0 || y < 0.0 || x >= element.width() as f32 || y >= element.height() as f32) {
+                    return;
+                }
                 let Ok(button) = u32::try_from(mouse.button()) else { return };
                 if button == 2 {
                     if down {
@@ -260,7 +265,8 @@ impl Input {
             wheel.prevent_default();
             let mut state = state.borrow_mut();
             let (x, y) = state.pointer;
-            let mut delta = -wheel.delta_y() as f32;
+            // DOM deltas already point down, as the game protocol expects.
+            let mut delta = wheel.delta_y() as f32;
             if wheel.delta_mode() == 1 {
                 delta *= 100.0;
             }

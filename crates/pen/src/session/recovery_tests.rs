@@ -79,6 +79,16 @@ fn guest(engine: &wasmtime::Engine, bad: &[f32], reject_after: i32, red: f32) ->
 }
 
 fn guest_bytes(bad: &[f32], reject_after: i32, red: f32, trap: bool) -> Vec<u8> {
+    guest_bytes_with_restore_fault(bad, reject_after, red, trap, false)
+}
+
+fn guest_bytes_with_restore_fault(
+    bad: &[f32],
+    reject_after: i32,
+    red: f32,
+    trap: bool,
+    restore_fault: bool,
+) -> Vec<u8> {
     // Memory: request, frame count, rejected candidate, state, candidate, reply.
     let mut main = store(20, integer(HANDSHAKE));
     main.extend(exchange());
@@ -92,7 +102,18 @@ fn guest_bytes(bad: &[f32], reject_after: i32, red: f32, trap: bool) -> Vec<u8> 
         (1, CREATE, store(16, integer(40))),
         (3, SNAPSHOT, [integer(SNAPSHOT + 8), load(12), vec![0xb2, 0x38, 2, 0]].concat()),
         // A reload must receive precisely the last accepted live state.
-        (4, RESTORE, [request(12), integer(42), vec![0x47, 0x04, 0x40, 0x00, 0x0b], store(16, integer(42))].concat()),
+        (
+            4,
+            RESTORE,
+            [
+                request(12),
+                integer(42),
+                vec![0x47, 0x04, 0x40, 0x00, 0x0b],
+                store(16, integer(42)),
+                store(24, integer(i32::from(restore_fault))),
+            ]
+            .concat(),
+        ),
     ] {
         main.extend(
             [
@@ -116,23 +137,23 @@ fn guest_bytes(bad: &[f32], reject_after: i32, red: f32, trap: bool) -> Vec<u8> 
     if trap {
         failure.push(0x00); // unreachable: a terminated guest is a fatal error.
     }
+    let mut reject = [load(4), integer(reject_after), vec![0x4e]].concat();
+    if restore_fault {
+        reject.extend(load(24));
+        reject.push(0x72); // or: a restored instance rejects its first frame.
+    }
     main.extend(
-        [
-            load(4),
-            integer(reject_after),
-            vec![0x4e, 0x04, 0x40],
-            failure,
-            store(8, integer(1)),
-            store(20, integer(BAD)),
-            vec![0x0b],
-        ]
-        .concat(),
+        [reject, vec![0x04, 0x40], failure, store(8, integer(1)), store(20, integer(BAD)), vec![0x0b]].concat(),
     );
     main.extend(exchange());
     main.extend([0x0c, 0, 0x0b]);
     main.extend(integer(0));
     main.push(0x0b);
-    let good = [vec![2.0], packet(red)].concat();
+    let mut good = packet(red);
+    if restore_fault {
+        good[pen_protocol::boundary::lanes::header::LOAD_REQUESTED] = 1.0;
+    }
+    let good = [vec![2.0], good].concat();
     let bad = [vec![2.0], bad.to_vec()].concat();
     program(
         main,
@@ -163,7 +184,8 @@ fn start(engine: &wasmtime::Engine, gpu: Gpu, directory: &Path, module: GuestMod
             dev,
             script: Vec::new(),
             headless: true,
-            settle: false,
+            // The preserved-frame assertion observes the scene after startup fades.
+            settle: true,
         },
         Paths::new(
             directory.to_owned(),
@@ -198,8 +220,32 @@ fn malformed_native_frames_pause_recover_and_never_commit() {
     oversized.push(0.0);
     let mut nonfinite = packet(1.0);
     nonfinite[52] = f32::NAN;
+    // The browser runs these exact guest binaries, including their commit-lane
+    // assertions, and compares its diagnostic with the native decoder's.
+    if let Some(path) = std::env::var_os("PEN_DIAGNOSTIC_FIXTURES") {
+        let path = PathBuf::from(path);
+        std::fs::create_dir_all(&path).unwrap();
+        let mut expected = Vec::new();
+        for (name, bad) in [("truncated", &truncated), ("oversized", &oversized), ("nonfinite", &nonfinite)] {
+            std::fs::write(path.join(format!("{name}.wasm")), guest_bytes(bad, 3, 1.0, false)).unwrap();
+            expected.push(serde_json::json!({"name": name, "diagnostic": format!("{:#}", decode_frame(bad, 1, &catalog()).err().unwrap())}));
+        }
+        std::fs::write(path.join("good.wasm"), guest_bytes(&nonfinite, i32::MAX, 0.0, false)).unwrap();
+        std::fs::write(path.join("startup.wasm"), guest_bytes(&nonfinite, 1, 1.0, false)).unwrap();
+        std::fs::write(
+            path.join("restore.wasm"),
+            guest_bytes_with_restore_fault(&nonfinite, i32::MAX, 1.0, false, true),
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("quicksave.bin"),
+            pen_runtime::snapshot::encode(&pen_runtime::snapshot::SavedState { schema: 1, state: vec![42.0] }).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(path.join("recovery.json"), serde_json::to_vec(&expected).unwrap()).unwrap();
+    }
     for bad in [&truncated, &oversized, &nonfinite] {
-        assert_eq!(decode_frame(bad, 1, &catalog()).err().unwrap().to_string(), DECODER_ERROR);
+        assert_eq!(decode_frame(bad, 1, &catalog()).err().unwrap().root_cause().to_string(), DECODER_ERROR);
         for overlap in [false, true] {
             let shot = directory.join("shots/rejected.png");
             if shot.exists() {
@@ -278,9 +324,9 @@ fn malformed_native_frames_pause_recover_and_never_commit() {
         assert_eq!(error.root_cause().to_string(), DECODER_ERROR);
         let diagnostic = format!("{error:#}");
         if bad[52].is_nan() {
-            assert!(diagnostic.contains("nonfinite value NaN at frame lane 52"));
+            assert!(diagnostic.contains("header.clear.r at frame lane 52: expected a finite float32, got NaN"));
         } else {
-            assert!(diagnostic.contains(&format!("decoding a {}-lane game frame", bad.len())));
+            assert!(error.downcast_ref::<pen_protocol::diagnostic::FrameDiagnostic>().is_some());
         }
         assert!(!session.transport.paused());
         assert_eq!(session.runtime.snapshot().unwrap().state, [42.0]);

@@ -2,7 +2,7 @@
 use crate::input::Input;
 use crate::program::error;
 use anyhow::Result;
-use pen_protocol::{GameEvent, UiNode, ui_action, ui_role};
+use pen_protocol::{GameEvent, UiNode, ui_action, ui_role, ui_state};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::{JsCast, closure::Closure};
@@ -92,10 +92,13 @@ impl Accessibility {
             if node.live > 0 {
                 element.set_attribute("aria-live", "polite").map_err(error)?;
             }
-            if node.checked > 0 {
-                element
-                    .set_attribute("aria-checked", if node.checked == 1 { "true" } else { "false" })
-                    .map_err(error)?;
+            if node.checked != ui_state::NONE {
+                let checked = match node.checked {
+                    ui_state::TRUE => "true",
+                    ui_state::MIXED => "mixed",
+                    _ => "false",
+                };
+                element.set_attribute("aria-checked", checked).map_err(error)?;
             }
             if node.focusable {
                 element.set_attribute("tabindex", "-1").map_err(error)?;

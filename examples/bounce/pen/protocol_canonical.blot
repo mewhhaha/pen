@@ -36,6 +36,8 @@ const canonical_event = fn (event: protocol.Event) => case event of
   #protocol.Pan { touches, dx, dy } => #[24.0, U32.to_f32 touches, dx, dy]
   #protocol.Pinch { x, y, scale } => #[25.0, x, y, scale]
   #protocol.Player { index } => #[26.0, U32.to_f32 index]
+  #protocol.SessionStarted { restored } => #[27.0, U32.to_f32 restored]
+  #protocol.RendererReady => #[28.0]
 
 // The input's walk, as pen-protocol's canonical_input makes it: elapsed, the
 // viewport's width and height, the events' count and walks, then the state's
@@ -227,11 +229,12 @@ const inset_from = fn (canonical: Array F32) => fn (at: U32) => do:
   let (light_color, light_color_end) = vector_from canonical light_direction_end
   let (draws, draws_end) = draw_list_from canonical light_color_end
   let (pixel_size, pixel_size_end) = f32_from canonical draws_end
+  let (after_sprites, after_sprites_end) = u32_from canonical pixel_size_end
   let built = #types.Inset {
     x, y, width, height, view, projection, ambient, light_direction, light_color, draws,
-    pixel_size,
+    pixel_size, after_sprites,
   }
-  return (built, pixel_size_end)
+  return (built, after_sprites_end)
 
 const inset_list_from = fn (canonical: Array F32) => fn (at: U32) => do:
   let count = lanes.integer canonical[at] lanes.max_integer
@@ -558,7 +561,9 @@ const render_from_canonical = fn (canonical: Array F32) => do:
   let (blur, blur_end) = f32_from canonical shadow_end
   let (clouds, clouds_end) = clouds_from canonical blur_end
   let (hide_cursor, hide_cursor_end) = bool_from canonical clouds_end
-  let (state, state_end) = floats_from canonical hide_cursor_end
+  let (loading, loading_end) = bool_from canonical hide_cursor_end
+  let (show_captions, show_captions_end) = bool_from canonical loading_end
+  let (state, state_end) = floats_from canonical show_captions_end
   let (draws, draws_end) = draw_list_from canonical state_end
   let (solids, solids_end) = solid_list_from canonical draws_end
   let (decals, decals_end) = decal_list_from canonical solids_end
@@ -582,7 +587,7 @@ const render_from_canonical = fn (canonical: Array F32) => do:
     scene_load_requested, checkpoint_requested, undo_requested, redo_requested,
     exit_requested, view, projection, clear, ambient, light_direction,
     light_color, aberration, quality, sky, fog, shadow, blur, clouds,
-    hide_cursor, state, draws, solids, decals, sounds, sprites, insets,
-    preferences, fields, ui, services, buses, voices, poses, emitters, lights,
-    listener, panners,
+    hide_cursor, loading, show_captions, state, draws, solids, decals, sounds,
+    sprites, insets, preferences, fields, ui, services, buses, voices, poses,
+    emitters, lights, listener, panners,
   }

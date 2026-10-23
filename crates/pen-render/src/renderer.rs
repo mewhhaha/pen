@@ -19,6 +19,7 @@ mod frame;
 mod gpu_culling;
 mod insets;
 mod inspect;
+mod instance_upload;
 mod materials;
 mod particles;
 mod readback;
@@ -557,6 +558,7 @@ pub(crate) struct State {
     instance_capacity: usize,
     instance_buffer: wgpu::Buffer,
     instance_data: Vec<f32>,
+    instance_uploads: instance_upload::Uploads,
     last_stats: RenderStats,
     // Timestamps around the frame's passes, where the device has them, and
     // whether the host wants them.
@@ -574,7 +576,7 @@ pub(crate) struct State {
     checker: TextureAsset,
     // The fields the game keeps values in, by material key, as half floats
     // its draws read at binding 3; a new one reads zero until patches arrive.
-    fields: Vec<(String, TextureAsset)>,
+    fields: Vec<(String, TextureAsset, fields::FieldShadow)>,
     field_ids: HashMap<String, usize>,
     next_view_id: u64,
     // Packed textures still bringing their first levels; published textures
@@ -617,6 +619,8 @@ pub(crate) struct State {
     // the pipeline cache is written.
     busy: bool,
     frames: u64,
+    loading_seen: bool,
+    ready_sent: bool,
 }
 
 impl State {
@@ -818,6 +822,7 @@ impl State {
             instance_capacity: 1,
             instance_buffer: batching::instance_buffer(&device, 1),
             instance_data: vec![0.0; 20],
+            instance_uploads: instance_upload::Uploads::default(),
             last_stats: RenderStats::default(),
             timer: timing::GpuTimer::new(&device, &queue),
             timing: false,
@@ -853,6 +858,8 @@ impl State {
             checked_materials: Vec::new(),
             busy: false,
             frames: 0,
+            loading_seen: false,
+            ready_sent: false,
             context,
             device,
             queue,
@@ -885,7 +892,13 @@ impl State {
     }
 
     pub fn take_events(&mut self) -> Vec<GameEvent> {
-        std::mem::take(&mut self.assets.events)
+        let mut events = std::mem::take(&mut self.assets.events);
+        // Only applications requesting a startup overlay receive this event.
+        if self.loading_seen && !self.ready_sent && self.quiet() && self.pending() == 0 {
+            self.ready_sent = true;
+            events.push(GameEvent::RendererReady);
+        }
+        events
     }
 
     /// Work under way for assets: loads, textures streaming in or waiting

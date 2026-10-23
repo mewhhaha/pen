@@ -23,10 +23,12 @@ const KEPT: f64 = 0.75;
 /// simple as the simplifier makes it within its error (a quarter percent,
 /// one percent and four percent of the mesh's size), kept if it leaves out a
 /// quarter of the last kept one's triangles. A mesh of fewer than 256
-/// triangles, or one that has levels already, is packed as it is.
+/// triangles, an explicit JSON `lods` list (including empty), or an already
+/// packed mesh is preserved as authored. Shader-deformed meshes can declare an
+/// empty list when undeformed-space error cannot bound their visible surface.
 pub fn pack_mesh_with_lods(bytes: &[u8]) -> Result<Vec<u8>> {
     let mesh = parse_mesh(bytes)?;
-    if mesh.lods.len() > 1 || mesh.lods[0].count as usize / 3 < LEAST_TRIANGLES {
+    if mesh.authored_lods || mesh.lods.len() > 1 || mesh.lods[0].count as usize / 3 < LEAST_TRIANGLES {
         return pack(&mesh);
     }
     pack(&simplified(mesh)?)
@@ -68,7 +70,7 @@ mod tests {
     use super::*;
 
     /// A bumpy grid of `side` x `side` quads, as mesh JSON.
-    fn grid(side: u32) -> Vec<u8> {
+    pub(super) fn grid(side: u32) -> Vec<u8> {
         let (mut positions, mut normals, mut uvs, mut indices) = (vec![], vec![], vec![], vec![]);
         for z in 0..=side {
             for x in 0..=side {
@@ -143,5 +145,31 @@ mod tests {
             packed as f64 / 1e6,
             seconds
         );
+    }
+}
+
+#[cfg(test)]
+mod authored_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_empty_detail_list_and_repacked_binary_preserve_triangles_and_bounds() {
+        let json = super::tests::grid(40);
+        let plain = parse_mesh(&json).unwrap();
+        assert!(plain.indices.len() / 3 > LEAST_TRIANGLES);
+        let mut authored: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        authored["lods"] = serde_json::json!([]);
+        let packed = pack_mesh_with_lods(&serde_json::to_vec(&authored).unwrap()).unwrap();
+        let kept = parse_mesh(&packed).unwrap();
+        assert_eq!(kept.lods.len(), 1);
+        assert_eq!(kept.indices, plain.indices);
+        assert_eq!(kept.vertices, plain.vertices);
+        assert_eq!(kept.bounds.center, plain.bounds.center);
+        assert_eq!(kept.bounds.radius, plain.bounds.radius);
+        assert_eq!(pack_mesh_with_lods(&packed).unwrap(), packed);
+        // A packed, unsimplified asset is authoritative even if its original
+        // JSON did not opt out. Repackaging must not invent new geometry.
+        let raw = crate::asset_store::pack(&plain).unwrap();
+        assert_eq!(pack_mesh_with_lods(&raw).unwrap(), raw);
     }
 }

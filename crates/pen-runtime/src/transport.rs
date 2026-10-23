@@ -81,6 +81,13 @@ impl Transport {
         paused
     }
 
+    /// A development breakpoint stops exactly here, cancelling queued steps.
+    pub fn breakpoint(&mut self) -> bool {
+        let was_playing = self.pause();
+        self.run = Run::Paused { steps: 0, resume_after_reload: false };
+        was_playing
+    }
+
     /// Runs `frames` more frames one at a time and stays paused (pausing
     /// first); whether it was playing.
     pub fn step(&mut self, frames: u32) -> bool {
@@ -215,6 +222,18 @@ mod tests {
         transport.step(5);
         assert!(transport.resume() && !transport.resume());
         assert_eq!(transport.run(), Run::Playing);
+    }
+
+    #[test]
+    fn a_breakpoint_cancels_steps_and_does_not_resume_on_reload() {
+        let mut transport = Transport::default();
+        assert!(transport.step(5));
+        assert!(transport.take_frame());
+        assert!(!transport.breakpoint());
+        assert!(!transport.take_frame() && !transport.reloaded());
+        transport.resume();
+        assert!(transport.breakpoint());
+        assert_eq!(transport.run(), PAUSED);
     }
 
     #[test]

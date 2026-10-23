@@ -55,6 +55,9 @@ pub(crate) struct Mesh {
     /// the same vertices, for draws far enough away that the difference is
     /// smaller than a pixel.
     pub lods: Vec<Lod>,
+    /// An explicit JSON list (even empty), or an already packed mesh.
+    /// Shipping must preserve its authored detail instead of simplifying it.
+    pub authored_lods: bool,
     /// A skinned mesh's joints and weights and its rig.
     pub skin: Option<Skin>,
 }
@@ -183,7 +186,7 @@ struct MeshArrays {
     #[serde(default)]
     clips: Option<Vec<Clip>>,
     #[serde(default)]
-    lods: Vec<LodArrays>,
+    lods: Option<Vec<LodArrays>>,
 }
 
 #[derive(Deserialize)]
@@ -230,8 +233,11 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
         }
         _ => bail!("a skinned mesh needs joints, weights, a skeleton and a skin"),
     };
-    let lods: Vec<(f32, Vec<u32>)> = lods.into_iter().map(|lod| (lod.error, lod.indices)).collect();
-    checked_mesh(vertices, indices, &lods, skin)
+    let authored_lods = lods.is_some();
+    let lods: Vec<(f32, Vec<u32>)> = lods.unwrap_or_default().into_iter().map(|lod| (lod.error, lod.indices)).collect();
+    let mut mesh = checked_mesh(vertices, indices, &lods, skin)?;
+    mesh.authored_lods = authored_lods;
+    Ok(mesh)
 }
 
 /// A mesh file's bounds (JSON or packed): its vertices' least and greatest
@@ -288,7 +294,7 @@ pub(crate) fn checked_mesh(
     }
     let lods = levels(&mut indices, simpler)?;
     let bounds = Sphere::around(&vertices, MESH_VERTEX_FLOATS);
-    let mut mesh = Mesh { vertices, indices, bounds, lods, skin };
+    let mut mesh = Mesh { vertices, indices, bounds, lods, authored_lods: !simpler.is_empty(), skin };
     let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
     ensure!(count != 0, "mesh requires matching position/normal/UV vertices and triangle indices");
     ensure!(mesh.indices.iter().all(|&index| (index as usize) < count), "mesh index is outside its vertex array");
@@ -468,7 +474,9 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
         ensure!(at == bytes.len(), "binary mesh size does not match its counts");
         None
     };
-    checked_mesh(vertices, indices, &simpler, skin)
+    let mut mesh = checked_mesh(vertices, indices, &simpler, skin)?;
+    mesh.authored_lods = true;
+    Ok(mesh)
 }
 
 pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {

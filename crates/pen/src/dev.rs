@@ -41,6 +41,7 @@ pub struct Dev {
     compiling: Option<Receiver<Result<(GuestModule, Catalog)>>>,
     /// Another change arrived while compiling.
     again: bool,
+    trace: Option<std::sync::Arc<blot_host::SystemTrace>>,
 }
 
 /// An asset key for a changed file, or None for files that are not assets.
@@ -58,7 +59,7 @@ fn asset_key(assets: &Path, path: &Path) -> Option<String> {
 }
 
 impl Dev {
-    pub fn new(game: &Path, assets: &Path) -> Result<Dev> {
+    pub fn new(game: &Path, assets: &Path, trace: Option<std::sync::Arc<blot_host::SystemTrace>>) -> Result<Dev> {
         let (sender, events) = channel();
         let watch = watch::subscribe(&[(game, false), (assets, true)], move |event| {
             let _ = sender.send(event);
@@ -76,6 +77,7 @@ impl Dev {
             changed_keys: BTreeSet::new(),
             compiling: None,
             again: false,
+            trace,
         })
     }
 
@@ -83,12 +85,16 @@ impl Dev {
         let (sender, result) = channel();
         let (engine, wasm, assets) = (engine.clone(), self.wasm.clone(), self.assets.clone());
         let started = Instant::now();
+        let trace = self.trace.clone();
         let spawned = std::thread::Builder::new().name("pen-dev-compile".into()).spawn(move || {
             let built = (|| {
                 let bytes = std::fs::read(&wasm)?;
                 let catalog = read_catalog(&assets)?;
                 // No cache: every edit would leave another compiled copy behind.
-                let module = GuestModule::new(&engine, &bytes, None)?;
+                let module = match trace {
+                    Some(trace) => GuestModule::traced(&engine, &bytes, None, trace)?,
+                    None => GuestModule::new(&engine, &bytes, None)?,
+                };
                 let milliseconds = started.elapsed().as_secs_f64() * 1000.0;
                 devlog::info(Source::Reload, format!("dev: compiled the new build in {milliseconds:.0} ms"));
                 Ok((module, catalog))
@@ -127,10 +133,12 @@ impl Dev {
         if self.assets_changed.is_some_and(|at| now - at >= DEBOUNCE) {
             self.assets_changed = None;
             // Files gone again were editors' and tools' temporaries; a
-            // deleted asset keeps its last version until it comes back.
+            // deleted asset keeps its last version until it comes back. The
+            // optional state declaration must also reload when removed, so its
+            // cached adapter returns to opaque state handling.
             let keys: Vec<String> = std::mem::take(&mut self.changed_keys)
                 .into_iter()
-                .filter(|key| self.assets.join(key).is_file())
+                .filter(|key| key == pen_runtime::state::CONFIG_FILE || self.assets.join(key).is_file())
                 .collect();
             if !keys.is_empty() {
                 devlog::info(Source::Asset, format!("dev: reloading {}", keys.join(", ")));
@@ -179,5 +187,22 @@ mod tests {
         assert_eq!(asset_key(root, Path::new("/game/assets/.rock.wgsl.swp")), None);
         assert_eq!(asset_key(root, Path::new("/game/assets/catalog.json")), None);
         assert_eq!(asset_key(root, Path::new("/elsewhere/rock.wgsl")), None);
+    }
+
+    #[test]
+    fn deleting_the_optional_state_declaration_still_delivers_a_reload() {
+        let root = std::env::temp_dir().join(format!("pen-state-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut dev = Dev::new(&root, &root, None).unwrap();
+        // A settled watcher batch after both files were removed. No filesystem
+        // timing is needed: this exercises the same delivery path as real edits.
+        dev.changed_keys = BTreeSet::from([pen_runtime::state::CONFIG_FILE.into(), "removed.png".into()]);
+        dev.assets_changed = Some(Instant::now() - DEBOUNCE);
+        let updates = dev.poll(&wasmtime::Engine::default());
+        assert_eq!(updates.len(), 1);
+        let Update::Assets(keys) = &updates[0] else { panic!("expected asset reload") };
+        assert_eq!(keys, &[pen_runtime::state::CONFIG_FILE]);
+        drop(dev);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

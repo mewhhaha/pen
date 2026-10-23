@@ -94,6 +94,13 @@ pub struct RenderStats {
     pub draw_calls: u32,
     pub instanced_draw_calls: u32,
     pub instances: u32,
+    /// Instance bytes and queue writes submitted this frame; unchanged runs stay on the GPU.
+    pub instance_upload_bytes: u64,
+    pub instance_upload_calls: u32,
+    /// Source bytes passed to field texture writes, queue calls and incoming samples.
+    pub field_upload_bytes: u64,
+    pub field_upload_calls: u32,
+    pub field_input_texels: u64,
     /// Triangles drawn in the camera's view, levels of detail counted as
     /// drawn.
     pub triangles: u64,

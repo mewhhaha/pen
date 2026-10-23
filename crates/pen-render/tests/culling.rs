@@ -143,6 +143,24 @@ fn culls_on(device: &wgpu::Device, queue: &wgpu::Queue, gpu: bool) {
     let [r, g, b, _] = middle(device, queue, &target.0);
     assert!(r < 2 && b < 2 && g > 200, "middle pixel {r} {g} {b}");
 
+    assert_eq!(stats.instance_upload_bytes, 0, "an unchanged settled scene needs no instance writes");
+    let mut moved = frame.clone();
+    moved.draws[0].transform[12] = 0.9;
+    renderer.submit(&moved, &catalog, &mut target).unwrap();
+    assert!(renderer.stats().instance_upload_bytes > 0, "a moved instance reaches the GPU");
+    let [_, green, _, _] = middle(device, queue, &target.0);
+    assert!(green < 2, "the old centre instance must disappear: {green}, GPU culling {gpu}");
+    moved.draws.reverse();
+    settle(&mut renderer, &moved, &mut target);
+    let [_, green, _, _] = middle(device, queue, &target.0);
+    assert!(green < 2, "reordered instances keep their transforms");
+    // Replacing a larger GPU buffer must republish every live instance.
+    moved.draws = vec![at(0.0, false); 64];
+    renderer.submit(&moved, &catalog, &mut target).unwrap();
+    assert_eq!(renderer.stats().instance_upload_bytes, 64 * 80);
+    let [_, green, _, _] = middle(device, queue, &target.0);
+    assert!(green > 200, "grown instance storage is populated: {green}");
+
     // With shadows, the camera looking 10 to the right of the shadow map: the
     // one at 0 only casts, the one at 10 only shows, and the one at 30 does
     // neither; alone or instanced alike.

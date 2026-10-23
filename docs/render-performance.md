@@ -1,5 +1,27 @@
 # Renderer measurements
 
+## Reading the live diagnostics
+
+The host's former `SUBMIT` phase is split into non-overlapping wall-clock
+durations in the diagnostics, remote `frame` response, `PEN_FRAME_TIMES` and
+`PEN_PROFILE_FRAMES`:
+
+- `RENDER`: preparation, uploads, command encoding, queue submission and the
+  developer overlay, excluding the surface calls and explicit waits below.
+- `ACQUIRE`: the call acquiring a surface image, including any wait for one.
+- `PRESENT`: the call presenting that image, including any wait inside it.
+- `PACE`: browser waits for GPU backpressure and the next repaint. Native
+  event-loop pacing happens outside the measured frame, so this is zero there.
+
+Headless native frames have no surface to acquire or present, so those phases
+are zero. Audio, input and screenshot/readback work are in housekeeping.
+The CPU summary excludes acquisition, presentation and explicit pacing; the
+phase bars and host total retain them. Untimed or unadvanced frames report -1.
+These are elapsed call durations, not thread CPU time: driver stalls inside
+queue submission still count as rendering. GPU pass timestamps remain separate
+and can overlap host work. The renderer-only benchmark figures below have their
+original measurement scope.
+
 Measured on 2026-10-16 on Linux with an NVIDIA GeForce RTX 2070 SUPER
 (driver 615.78, Vulkan), a 16-thread CPU and wgpu 30. Other work was
 light (load average under 6). Native and browser builds use the same production WGSL. The
@@ -203,6 +225,11 @@ path is for batches of many thousands, whose instances the CPU then writes
 once instead of once per view and level.
 
 ### Levels of detail
+
+An explicit mesh JSON `lods` list is authoritative, including an empty list.
+Use `"lods": []` for shader-deformed geometry whose undeformed-space error does
+not bound its visible shape. Already packed binary meshes are also preserved
+when packaged again. Omitting the JSON member permits automatic simplification.
 
 `pen build` packs meshes of 256 triangles or more with up to three simpler
 levels (meshopt-rs): 30 of gdev's 73 meshes get them, the assets grow 2%

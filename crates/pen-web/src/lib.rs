@@ -20,8 +20,9 @@ use js_sys::Uint8Array;
 use pen_protocol::{Catalog, GameEvent, RenderFrame, Viewport, service, service_status};
 use pen_runtime::devtools::{Log, log_source};
 use pen_runtime::game::Host;
-use pen_runtime::saved::{SAVED_TYPES_FILE, SavedTypes};
 use pen_runtime::snapshot::{self, SavedState};
+use pen_runtime::state::{self, CONFIG_FILE, StateAdapter};
+use std::sync::Arc;
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{HtmlCanvasElement, Response};
@@ -43,6 +44,31 @@ pub async fn fetch(path: &str) -> Result<Vec<u8>> {
     Ok(Uint8Array::new(&bytes).to_vec())
 }
 
+/// Missing optional declarations are opaque; all other failures stay visible.
+pub(crate) async fn load_state_adapter(assets: &str) -> Arc<dyn StateAdapter> {
+    let path = format!("{assets}/{CONFIG_FILE}");
+    let loaded: Result<Arc<dyn StateAdapter>> = async {
+        let response: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str(&path))
+            .await
+            .map_err(error)?
+            .dyn_into()
+            .map_err(error)?;
+        if response.status() == 404 {
+            return Ok(state::opaque());
+        }
+        anyhow::ensure!(response.ok(), "HTTP {}", response.status());
+        let bytes = JsFuture::from(response.array_buffer().map_err(error)?).await.map_err(error)?;
+        let bytes = Uint8Array::new(&bytes).to_vec();
+        pen_ink::adapter(std::str::from_utf8(&bytes)?)
+    }
+    .await;
+    loaded.unwrap_or_else(|error| {
+        let message = format!("{path}: {error:#}");
+        web_sys::console::error_1(&message.clone().into());
+        state::invalid(message)
+    })
+}
+
 /// Names the page after the game, as its `game.json` (`pen build --web`
 /// writes it) titles it; returns its name, which the files the page hands
 /// the player are named after.
@@ -60,7 +86,7 @@ async fn manifest(manifest: &str, canvas: &HtmlCanvasElement) -> String {
 }
 
 fn failed(error: impl std::fmt::Display) -> JsValue {
-    JsValue::from_str(&error.to_string())
+    JsValue::from_str(&format!("{error:#}"))
 }
 
 /// What the game's runtime needs while it starts: the viewport, checks,
@@ -68,7 +94,7 @@ fn failed(error: impl std::fmt::Display) -> JsValue {
 struct Starting<'a> {
     viewport: Viewport,
     log: &'a mut Log,
-    saved_types: Option<&'a SavedTypes>,
+    state_adapter: &'a Arc<dyn StateAdapter>,
 }
 
 impl Host for Starting<'_> {
@@ -88,8 +114,8 @@ impl Host for Starting<'_> {
         run::say(self.log, log_source::GAME, false, message);
     }
 
-    fn saved_types(&self) -> Option<SavedTypes> {
-        self.saved_types.cloned()
+    fn state_adapter(&self) -> Arc<dyn StateAdapter> {
+        self.state_adapter.clone()
     }
 }
 
@@ -117,10 +143,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     let scene = fetch(&path("scene", "scene.bin")).await.ok().and_then(|bytes| snapshot::decode(&bytes).ok());
     let devtools = fetch(&path("devtools", "devtools.wasm")).await.ok();
     let assets = path("assets", "assets");
-    let saved_types = fetch(&format!("{assets}/{SAVED_TYPES_FILE}")).await.ok().and_then(|bytes| {
-        let parsed = std::str::from_utf8(&bytes).map_err(anyhow::Error::from).and_then(SavedTypes::parse);
-        parsed.map_err(|error| web_sys::console::error_1(&format!("{SAVED_TYPES_FILE}: {error:#}").into())).ok()
-    });
+    let state_adapter = load_state_adapter(&assets).await;
     // The sounds' captions, if the assets have any.
     let captions = match fetch(&format!("{assets}/captions.json")).await {
         Ok(bytes) => pen_runtime::captions::Captions::parse(&String::from_utf8_lossy(&bytes)).unwrap_or_else(|error| {
@@ -134,7 +157,8 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         qualify: flag("qualify"),
         name,
         replay: replay::linked(),
-        saved_types: saved_types.clone(),
+        state_adapter: state_adapter.clone(),
+        assets: assets.clone(),
         captions,
     };
     let mut screen = Screen::new(canvas.clone(), assets.clone()).await.map_err(failed)?;
@@ -143,7 +167,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     log.push(log_source::SESSION, false, "pen browser host ready");
     let viewport = screen.viewport();
     let started = {
-        let mut host = Starting { viewport, log: &mut log, saved_types: saved_types.as_ref() };
+        let mut host = Starting { viewport, log: &mut log, state_adapter: &state_adapter };
         Runtime::new(&BrowserBackend, game, catalog.clone(), &mut host, saves::read("pen.autosave").await, scene).await
     };
     let runtime = started.map_err(failed)?;
@@ -159,7 +183,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     let browser = Browser::new(runtime, tools, screen, input, audio, log, options).map_err(failed)?;
     spawn_local(async move {
         if let Err(error) = browser.run().await {
-            web_sys::console::error_1(&error.to_string().into());
+            web_sys::console::error_1(&format!("{error:#}").into());
             if let Some(element) = web_sys::window().unwrap().document().unwrap().get_element_by_id("status") {
                 element.set_text_content(Some(&format!("{error:#}")));
             }
@@ -253,4 +277,15 @@ pub fn qualify_services() -> Result<String, JsValue> {
     let mut services = pen_runtime::services::Services::<()>::new();
     pen_simulation::register(&mut services);
     pen_simulation::conformance::check(&mut services).map_err(failed)
+}
+
+/// Checks the host boundary with the same binary fixtures as the native tests.
+#[wasm_bindgen]
+pub fn qualify_frame(packet: &[f32], schema: u32, catalog: &str) -> Result<String, JsValue> {
+    let catalog = serde_json::from_str(catalog).map_err(failed)?;
+    let catalog = pen_protocol::boundary::parse_catalog(&catalog).map_err(failed)?;
+    Ok(match pen_protocol::boundary::decode_frame(packet, schema, &catalog) {
+        Ok(_) => String::new(),
+        Err(error) => format!("{error:#}"),
+    })
 }

@@ -92,7 +92,7 @@ impl Program {
                         let request = request_rx.recv().map_err(|_| anyhow!("host closed"))?;
                         Ok(Value::ArrayF32(request))
                     });
-                    guest.call("main", Argument::Callback(callback))?;
+                    guest.call(module.main_entry(), Argument::Callback(callback))?;
                     // Torn down as Blot's adapter disposes of an instance.
                     guest.dispose()
                 })();

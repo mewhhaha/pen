@@ -18,7 +18,8 @@ use crate::inspect::{self, Packets, Watch};
 use crate::mix::AudioReport;
 use crate::services::{Answer, code_points, text};
 use crate::snapshot::SavedState;
-use crate::tunables::tuned_values;
+use crate::state::{self, StateAdapter};
+use std::sync::Arc;
 
 /// The most values a log answer carries; the program asks again for the rest.
 pub const LOG_VALUES: usize = 12_000;
@@ -214,7 +215,11 @@ pub trait Host {
         Answer::unavailable()
     }
     /// The game's state, as a save holds it; none when it cannot say now.
-    async fn snapshot(&mut self) -> Option<SavedState>;
+    async fn snapshot(&mut self) -> Option<Arc<SavedState>>;
+    /// The same explicit format adapter used by save restoration.
+    fn state_adapter(&self) -> Arc<dyn StateAdapter> {
+        state::opaque()
+    }
     /// Writes the game's tuned values into its source as the defaults.
     async fn bake(&mut self) -> Answer;
     /// Writes only tunable `id`'s value into its source as its default.
@@ -225,6 +230,10 @@ pub trait Host {
     fn say(&mut self, _line: &str) {}
     /// The last frames' packets, for a host that keeps them.
     fn packets(&mut self) -> Option<&mut Packets> {
+        None
+    }
+    /// Application semantic observations, owned by the existing timeline.
+    fn observations(&mut self) -> Option<&mut crate::semantic::Observations> {
         None
     }
     /// The state the history kept `seconds` of game time back (at the
@@ -242,6 +251,10 @@ pub trait Host {
     /// samples (2), or only asks (anything else); answers how many there
     /// are and whether it samples.
     fn profile(&mut self, _operation: u32) -> Answer {
+        Answer::unavailable()
+    }
+    /// Bounded live system timing rows; unavailable without the measured entry.
+    fn systems(&mut self, _enabled: bool, _first: usize) -> Answer {
         Answer::unavailable()
     }
     /// The samples as a flame graph (`crate::inspect::flame`).
@@ -308,6 +321,13 @@ impl Devtools {
     /// Does what a devtools request asks, or answers what it asks about.
     /// `interval` is the time since the dev tools' last frame, in ms.
     pub async fn answer(&mut self, request: &ServiceRequest, host: &mut impl Host, interval: f64) -> Answer {
+        if matches!(
+            request.operation,
+            devtools_op::TUNED | devtools_op::STATE | devtools_op::STATE_DIFF | devtools_op::WATCH | devtools_op::BAKE
+        ) && let Err(error) = host.state_adapter().validate()
+        {
+            return crate::semantic::failed(&format!("state_adapter: {error:#}"));
+        }
         let (a, b) = (request.a, request.b);
         let status = host.timeline();
         let path = || Some(text(&request.values)).filter(|path| !path.is_empty());
@@ -355,7 +375,10 @@ impl Devtools {
             },
             devtools_op::TUNED => match host.snapshot().await {
                 Some(saved) => {
-                    let mut tuned: Vec<(u32, f32)> = tuned_values(&saved.state).into_iter().collect();
+                    let Some(tuned) = host.state_adapter().tuned_values(&saved.state) else {
+                        return Answer::unavailable();
+                    };
+                    let mut tuned: Vec<(u32, f32)> = tuned.into_iter().collect();
                     tuned.sort_by_key(|(id, _)| *id);
                     let values = tuned.into_iter().flat_map(|(id, value)| [id as f32, value]).collect();
                     Answer { values, ..Answer::ok(0.0) }
@@ -380,22 +403,27 @@ impl Devtools {
             },
             devtools_op::STATE => {
                 let state = if request.c > 0.0 {
-                    host.kept_state(f64::from(request.c)).map(|(_, saved)| saved)
+                    host.kept_state(f64::from(request.c)).map(|(_, saved)| Arc::new(saved))
                 } else {
                     host.snapshot().await
                 };
-                match (state, whole(a)) {
-                    (Some(saved), None) => inspect::sections_answer(saved.schema, &saved.state),
-                    (Some(saved), Some(key)) => {
-                        inspect::lanes_answer(&saved.state, key, whole(b).map_or(0, |from| from as usize))
-                    }
-                    (None, _) => Answer::unavailable(),
+                let Some(saved) = state else { return Answer::unavailable() };
+                let adapter = host.state_adapter();
+                let Some(sections) = adapter.sections(&saved.state) else { return Answer::unavailable() };
+                match whole(a) {
+                    None => inspect::sections_answer(saved.schema, &sections),
+                    Some(key) => inspect::lanes_answer(&sections, key, whole(b).map_or(0, |from| from as usize)),
                 }
             }
             devtools_op::STATE_DIFF => match host.kept_state(f64::from(a.max(0.0))) {
                 Some((frame, then)) => match host.snapshot().await {
                     Some(now) => {
-                        Answer { values: inspect::state_diff(&then.state, &now.state), ..Answer::ok(frame as f32) }
+                        let adapter = host.state_adapter();
+                        let (Some(then), Some(now)) = (adapter.sections(&then.state), adapter.sections(&now.state))
+                        else {
+                            return Answer::unavailable();
+                        };
+                        Answer { values: inspect::state_diff(&then, &now), ..Answer::ok(frame as f32) }
                     }
                     None => Answer::unavailable(),
                 },
@@ -404,26 +432,56 @@ impl Devtools {
             devtools_op::PICTURES => host.pictures(a == 1.0, whole(b)),
             devtools_op::SEEK if !status.history => Answer::unavailable(),
             devtools_op::SEEK => match whole(a) {
-                Some(frame) => {
+                Some(frame)
+                    if status.earliest.is_some_and(|first| u64::from(frame) >= first)
+                        && u64::from(frame) <= status.latest =>
+                {
                     host.rewind_to(u64::from(frame));
                     Answer::ok(0.0)
                 }
-                None => Answer::failed(),
+                _ => crate::semantic::failed("outside_retained_history"),
             },
+            devtools_op::SEMANTIC => {
+                use crate::semantic::{self, Request};
+                let Ok(request) = semantic::request(&request.values) else {
+                    return semantic::failed("invalid_semantic_request");
+                };
+                if host.observations().is_none() {
+                    return semantic::unavailable("unsupported_host");
+                }
+                if let Request::Seek { position } = request {
+                    let Some(position) = semantic::position(&position) else {
+                        return semantic::failed("invalid_position");
+                    };
+                    if !status.history
+                        || !status.earliest.is_some_and(|first| position >= first)
+                        || position > status.latest
+                    {
+                        return semantic::unavailable("outside_retained_history");
+                    }
+                    host.rewind_to(position);
+                    return Answer::ok(0.0);
+                }
+                let keeping = matches!(request, Request::Capture { tag: Some(_) });
+                let Some(observations) = host.observations() else { return semantic::unavailable("unsupported_host") };
+                let answer = observations.answer(request);
+                if keeping && answer.status == pen_protocol::service_status::OK {
+                    host.keep_history();
+                }
+                answer
+            }
             devtools_op::WATCH => {
                 if a == -1.0 {
                     self.watch = None;
                 } else if let (Some(key), Some(lane), Some(compare)) = (whole(a), whole(b), whole(request.c)) {
-                    self.watch = Some(Watch::new(key, lane, compare, request.d));
-                    self.watched = None;
-                    // It starts from the lane as it is now.
-                    if let Some(saved) = host.snapshot().await
-                        && let Some(watch) = &mut self.watch
-                    {
-                        watch.look(&saved.state, status.frame);
-                        watch.paused = None;
-                        self.watched = Some(status.frame);
-                    }
+                    let Some(saved) = host.snapshot().await else { return Answer::unavailable() };
+                    let adapter = host.state_adapter();
+                    let Some(sections) = adapter.sections(&saved.state) else { return Answer::unavailable() };
+                    let mut watch = Watch::new(key, lane, compare, request.d);
+                    watch.look(inspect::lane(&sections, key, lane), status.frame);
+                    watch.paused = None;
+                    self.watch = Some(watch);
+                    self.watched = Some(status.frame);
                 } else if a != -2.0 {
                     return Answer::failed();
                 }
@@ -433,6 +491,10 @@ impl Devtools {
             devtools_op::PROFILE => match whole(a) {
                 Some(operation) => host.profile(operation),
                 None => Answer::failed(),
+            },
+            devtools_op::SYSTEMS => match (a, whole(b)) {
+                (0.0 | 1.0, Some(first)) => host.systems(a == 1.0, first as usize),
+                _ => Answer::failed(),
             },
             devtools_op::FLAME => host.flame(),
             devtools_op::MEMORY => host.memory(),
@@ -503,7 +565,9 @@ impl Devtools {
         }
         let Some(saved) = host.snapshot().await else { return };
         self.watched = Some(status.frame);
-        if watch.look(&saved.state, status.frame) {
+        let adapter = host.state_adapter();
+        let now = adapter.sections(&saved.state).and_then(|sections| inspect::lane(&sections, watch.key, watch.lane));
+        if watch.look(now, status.frame) {
             host.pause();
             let shown = status.frame.saturating_sub(1);
             let compare = devtools_compare::NAMES.get(watch.compare as usize).copied().unwrap_or("?");
@@ -535,7 +599,10 @@ impl Devtools {
         set(devtools_frame::WAIT, phase(|t| t.wait_ms));
         set(devtools_frame::DECODE, phase(|t| t.decode_ms));
         set(devtools_frame::VALIDATE, phase(|t| t.validate_ms));
-        set(devtools_frame::SUBMIT, phase(|t| t.submit_ms));
+        set(devtools_frame::RENDER, phase(|t| t.draw.render_ms));
+        set(devtools_frame::ACQUIRE, phase(|t| t.draw.acquire_ms));
+        set(devtools_frame::PRESENT, phase(|t| t.draw.present_ms));
+        set(devtools_frame::PACE, phase(|t| t.draw.pace_ms));
         set(devtools_frame::HOUSEKEEPING, phase(|t| t.housekeeping_ms));
         set(devtools_frame::TOTAL, phase(|t| t.total_ms));
         set(devtools_frame::PACKET, timings.map_or(-1.0, |t| t.packet_bytes as f64));
@@ -713,13 +780,31 @@ mod tests {
         events: Vec<GameEvent>,
         measuring: bool,
         state: Vec<f32>,
+        opaque: bool,
         packets: Packets,
+        observations: crate::semantic::Observations,
         said: Vec<String>,
         /// The mix's mute and solo, when the host has sound.
         mixing: Option<crate::mix::Monitor>,
     }
 
+    // Deliberately not Ink framing: the entire payload is one section,
+    // with tunables in adjacent pairs when requested by that test.
+    struct TestState;
+    impl StateAdapter for TestState {
+        fn sections<'a>(&self, state: &'a [f32]) -> Option<Vec<crate::state::Section<'a>>> {
+            Some(vec![crate::state::Section { key: 20, version: 1, width: 0, lanes: state }])
+        }
+        fn tuned_values(&self, state: &[f32]) -> Option<std::collections::HashMap<u32, f32>> {
+            state.as_chunks::<2>().0.iter().map(|&[id, value]| Some((whole(id)?, value))).collect()
+        }
+    }
+
     impl Host for Recorder {
+        fn state_adapter(&self) -> Arc<dyn StateAdapter> {
+            if self.opaque { state::opaque() } else { Arc::new(TestState) }
+        }
+
         fn timeline(&self) -> TimelineStatus {
             self.status.unwrap_or(TimelineStatus {
                 frame: 100,
@@ -740,7 +825,11 @@ mod tests {
             Answer::ok(from as f32)
         }
         fn report(&self) -> FrameReport {
-            let timings = FrameTimings { guest_ms: 2.0, ..FrameTimings::default() };
+            let timings = FrameTimings {
+                guest_ms: 2.0,
+                draw: crate::game::DrawTimings { render_ms: 1.0, acquire_ms: 0.25, present_ms: 0.5, pace_ms: 8.0 },
+                ..FrameTimings::default()
+            };
             FrameReport {
                 timings: Some(timings),
                 size: (64, 48),
@@ -789,8 +878,8 @@ mod tests {
         fn monitor(&mut self, bus: usize, mute: bool, on: bool) -> bool {
             self.mixing.as_mut().map(|monitor| monitor.set(bus, mute, on)).is_some()
         }
-        async fn snapshot(&mut self) -> Option<SavedState> {
-            Some(SavedState { schema: 1, state: self.state.clone() })
+        async fn snapshot(&mut self) -> Option<Arc<SavedState>> {
+            Some(Arc::new(SavedState { schema: 1, state: self.state.clone() }))
         }
         async fn bake(&mut self) -> Answer {
             Answer::failed()
@@ -801,9 +890,11 @@ mod tests {
         fn packets(&mut self) -> Option<&mut Packets> {
             Some(&mut self.packets)
         }
+        fn observations(&mut self) -> Option<&mut crate::semantic::Observations> {
+            Some(&mut self.observations)
+        }
         fn kept_state(&self, seconds: f64) -> Option<(u64, SavedState)> {
-            (seconds <= 1.0)
-                .then(|| (40, SavedState { schema: 1, state: vec![5678.0, 1.0, 1.0, 20.0, 1.0, 0.0, 1.0, 1.0] }))
+            (seconds <= 1.0).then(|| (40, SavedState { schema: 1, state: vec![1.0] }))
         }
         fn preset(&mut self, name: &str) -> Result<Vec<(u32, f32)>, Answer> {
             if name == "fast" { Ok(vec![(4, 2.0), (9, 0.5)]) } else { Err(Answer::failed()) }
@@ -845,7 +936,19 @@ mod tests {
 
     /// A state with one section, key 20, whose lane 1 is `value`.
     fn watched(value: f32) -> Vec<f32> {
-        vec![5678.0, 1.0, 1.0, 20.0, 1.0, 0.0, 2.0, 0.0, value]
+        vec![0.0, value]
+    }
+
+    #[test]
+    fn opaque_state_disables_format_tools_but_still_delivers_tune_events() {
+        let (mut tools, mut host) =
+            (Devtools::default(), Recorder { opaque: true, state: watched(2.0), ..Recorder::default() });
+        for op in [devtools_op::STATE, devtools_op::STATE_DIFF, devtools_op::TUNED, devtools_op::WATCH] {
+            assert_eq!(ask(&mut tools, &mut host, op, 0.0, ""), Answer::unavailable());
+        }
+        assert!(tools.watch.is_none());
+        assert_eq!(ask(&mut tools, &mut host, devtools_op::TUNE, 9.0, ""), Answer::ok(0.0));
+        assert!(matches!(host.events[..], [GameEvent::Tune { index: 9, .. }]));
     }
 
     #[test]
@@ -902,6 +1005,35 @@ mod tests {
     }
 
     #[test]
+    fn semantic_capture_and_seeks_use_the_existing_host_without_game_events() {
+        let (mut devtools, mut host) = (Devtools::default(), Recorder::default());
+        let capture = ask(&mut devtools, &mut host, devtools_op::SEMANTIC, 0.0, r#"{"op":"capture","tag":42}"#);
+        assert_eq!(capture.status, pen_protocol::service_status::OK);
+        assert!(host.observations.enabled());
+        assert_eq!(host.asked, ["history"]);
+        let seek = ask(&mut devtools, &mut host, devtools_op::SEMANTIC, 0.0, r#"{"op":"seek","position":"55"}"#);
+        assert_eq!(seek.status, pen_protocol::service_status::OK);
+        assert_eq!(host.asked, ["history", "rewind 55"]);
+        for position in ["39", "101", "18446744073709551615"] {
+            let text = format!(r#"{{"op":"seek","position":"{position}"}}"#);
+            assert_eq!(
+                ask(&mut devtools, &mut host, devtools_op::SEMANTIC, 0.0, &text).status,
+                pen_protocol::service_status::UNAVAILABLE
+            );
+        }
+        assert_eq!(
+            ask(&mut devtools, &mut host, devtools_op::SEEK, 101.0, "").status,
+            pen_protocol::service_status::FAILED
+        );
+        assert_eq!(
+            ask(&mut devtools, &mut host, devtools_op::SEMANTIC, 0.0, r#"{"op":"capture","tag":0}"#).status,
+            pen_protocol::service_status::FAILED
+        );
+        assert_eq!(host.asked, ["history", "rewind 55"]);
+        assert!(host.events.is_empty(), "observations never become simulation input");
+    }
+
+    #[test]
     fn time_travel_goes_by_game_time_and_needs_a_history() {
         let (mut devtools, mut host) = (Devtools::default(), Recorder::default());
         ask(&mut devtools, &mut host, devtools_op::STEP, 0.0, "");
@@ -925,6 +1057,14 @@ mod tests {
         assert!(host.measuring);
         let at = |answer: &Answer, code: u32| answer.values[code as usize];
         assert_eq!(at(&frame, devtools_frame::GUEST), 2.0);
+        for (code, expected) in [
+            (devtools_frame::RENDER, 1.0),
+            (devtools_frame::ACQUIRE, 0.25),
+            (devtools_frame::PRESENT, 0.5),
+            (devtools_frame::PACE, 8.0),
+        ] {
+            assert_eq!(at(&frame, code), expected);
+        }
         assert_eq!(at(&frame, devtools_frame::INTERVAL), 16.5);
         assert_eq!((at(&frame, devtools_frame::WIDTH), at(&frame, devtools_frame::POSITION)), (64.0, 100.0));
         assert_eq!(at(&frame, devtools_frame::RECORDING), 7.0);
@@ -933,6 +1073,9 @@ mod tests {
         // The game did not run since: no timings again.
         let again = ask(&mut devtools, &mut host, devtools_op::FRAME, 1.0, "");
         assert_eq!(at(&again, devtools_frame::GUEST), -1.0);
+        for code in [devtools_frame::RENDER, devtools_frame::ACQUIRE, devtools_frame::PRESENT, devtools_frame::PACE] {
+            assert_eq!(at(&again, code), -1.0);
+        }
         ask(&mut devtools, &mut host, devtools_op::FRAME, 0.0, "");
         assert!(!host.measuring);
     }
@@ -986,7 +1129,7 @@ mod tests {
         ask(&mut devtools, &mut host, devtools_op::TUNE, 3.0, "");
         assert!(matches!(host.events[..], [GameEvent::Tune { index: 3, .. }]));
         // A state with one section: the tuned values, 9 = 0.5 and 4 = 2.
-        host.state = vec![5678.0, 0.0, 1.0, 11.0, 0.0, 0.0, 4.0, 9.0, 0.5, 4.0, 2.0];
+        host.state = vec![9.0, 0.5, 4.0, 2.0];
         let tuned = ask(&mut devtools, &mut host, devtools_op::TUNED, 0.0, "");
         assert_eq!(tuned.values, [4.0, 2.0, 9.0, 0.5]);
         assert_eq!(ask(&mut devtools, &mut host, devtools_op::GPU, 0.0, ""), Answer::text("test adapter"));

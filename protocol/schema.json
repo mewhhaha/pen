@@ -57,6 +57,10 @@
     }
   ],
   "limits": [
+    { "limit": "PROVENANCE_TAG", "value": 0, "doc": "Reserved extension tag for optional development provenance; game section tags start at 1." },
+    { "limit": "MAX_PROVENANCE_LANES", "value": 16384, "doc": "The most UTF-8 JSON bytes, each encoded as one float32 lane, in a frame's provenance." },
+    { "limit": "MAX_PROVENANCE_ENTRIES", "value": 64, "doc": "The most source/object associations in one frame; no history is retained by the decoder." },
+    { "limit": "MAX_PROVENANCE_TEXT", "value": 256, "doc": "The most UTF-8 bytes in a provenance object ID, system label or source filename." },
     {
       "limit": "MAX_STATE_FLOATS",
       "value": 16777215,
@@ -442,9 +446,11 @@
         "mute",
         "solo",
         "export",
-        "import"
+        "import",
+        "systems",
+        "semantic"
       ],
-      "doc": "The host's developer tools. log answers the log's lines from serial `a` on, value the serial after the last, each line as its source (0 game, 1 build, 2 reload, 3 asset, 4 pipeline, 5 session), 1 if an error, its length and its code points. frame answers the last frame's numbers in DEVTOOLS_FRAME's order, timing the game's frames while `a` is 1. gpu answers the graphics adapter's name. command sends the game console command `a` with argument `b`. pause and play stop and start the game's clock; step runs `a` frames and stays paused; rewind goes back `a` seconds of game time, paused; replay plays the last `a` seconds again, then live; history keeps the past to travel in (unavailable answers what needs it while none is kept). record starts recording the input to the text's path, or a new file when it is empty, or stops a recording. shot saves the window with the dev tools over it to the text's path, or a new file. tune sets the live-tunable constant whose id is `a` to `b`, and tuned answers the game's tuned values as id and value pairs. bake writes them into the checkout as the defaults, or only the one whose id is `a` when `a` is not 0. packets keeps each frame's input and render packets from now on while `a` is 1 (the last 120 frames), or forgets them at 0, and answers the frames kept, oldest first, each as DEVTOOLS_PACKET's numbers; packet_diff answers how frame `b` differs from frame `a`, both kept: for each of DEVTOOLS_PACKET's numbers after position, its count in `a`, its count in `b` and how many of its elements differ. state answers the live state's sections (`a` below 0), each its key, version, width and length, value the state's schema, or up to 256 lanes of section `a` from lane `b` on, value its length; with `c` above 0, of the state the history kept `c` seconds of game time back instead. state_diff answers, for each section of the live state or the one kept `a` seconds back, its key, its length then and now, how many lanes differ and the first that does (-1 for none), value the frame compared with. pictures takes a picture of the game's frame each time the history could keep a moment, while `a` is 1, into the dev tools' atlas (the texture of material `b`: slots of 128 by 80 pixels, 8 to a row, the first 16 for pictures), and answers each picture's slot and the frame that shows it, oldest first; seek goes to frame `a`, paused. watch pauses the game once lane `b` of the live state's section `a` compares with `d` as DEVTOOLS_COMPARE `c` says, `a` -1 stops watching and -2 only asks; it answers the watch: key, lane, comparison, value, the lane's value now and the frame it paused at (-1 for none). profile samples the game's guest while `a` is 1, stops at 0 and forgets the samples at 2 (3 only asks), answering how many it has and 1 while sampling; flame answers them as a flame graph, value the samples: first how many functions follow that the samples found running most, each its function index, samples, its name's length and code points; then each node (a caller before its callees) as its depth, function index, first sample, samples, samples in it alone, its name's length and code points. memory answers the game's committed memory in bytes, the most it committed, then for each counter the guest exports (guest ABI 3's ownership counters) and the host's calls into it, its name's length, code points and value in two 24-bit halves, value the number of counters. presets answers the names of the checkout's tunable presets, a line each; preset_save saves the game's tuned values as the preset the text names, and preset_load tunes each value of that preset. assets answers the game's catalog of DEVTOOLS_ASSET `a`, each entry as its DEVTOOLS_ASSET_STATE, its revision, its key's length and code points. preview draws catalog asset `b` of kind `a` (a mesh with material `c`, a material on mesh `c`) into slot `d` (16 to 63) of the atlas pictures named, value 1 once drawn and 0 while its assets load. swap draws catalog asset `b` of kind `a` from the asset the text names instead, or its own again when the text is empty, until the next build. material answers material `a`'s color and instance parameters (8 numbers, 0 when it sets none), whether it sets them (two numbers), then its shader's and texture's names, each its length and code points; material_set sets number `b` of those 8 in the checkout's file to `c`, which then reloads. audit checks the game's interface as the last frame showed it and answers its findings: value their count, and for each its kind (AUDIT_FINDING_*), the node's id, a measure (a contrast ratio, a size in pixels, or 0), its message's length and the message's code points. audio answers the mix as it plays: DEVTOOLS_AUDIO's numbers, then DEVTOOLS_BUS's for each bus, the master first; peaks and RMS are linear and over what played since the last audio answer. mute silences bus `a` while `b` is 1 and solo hears only the soloed buses (and the master's own voices) while any is soloed; both are the developer's, never the game's or a recording's. export hands the game's state over as a save file named by the text, or a new one (the browser downloads it); import loads a save file the player hands over (the browser asks for one), or plays an input recording."
+      "doc": "The host's developer tools. log answers the log's lines from serial `a` on, value the serial after the last, each line as its source (0 game, 1 build, 2 reload, 3 asset, 4 pipeline, 5 session), 1 if an error, its length and its code points. frame answers the last frame's numbers in DEVTOOLS_FRAME's order, timing the game's frames while `a` is 1. gpu answers the graphics adapter's name. command sends the game console command `a` with argument `b`. pause and play stop and start the game's clock; step runs `a` frames and stays paused; rewind goes back `a` seconds of game time, paused; replay plays the last `a` seconds again, then live; history keeps the past to travel in (unavailable answers what needs it while none is kept). record starts recording the input to the text's path, or a new file when it is empty, or stops a recording. shot saves the window with the dev tools over it to the text's path, or a new file. tune sets the live-tunable constant whose id is `a` to `b`, and tuned answers the game's tuned values as id and value pairs. bake writes them into the checkout as the defaults, or only the one whose id is `a` when `a` is not 0. packets keeps each frame's input and render packets from now on while `a` is 1 (the last 120 frames), or forgets them at 0, and answers the frames kept, oldest first, each as DEVTOOLS_PACKET's numbers; packet_diff answers how frame `b` differs from frame `a`, both kept: for each of DEVTOOLS_PACKET's numbers after position, its count in `a`, its count in `b` and how many of its elements differ. state answers the live state's sections (`a` below 0), each its key, version, width and length, value the state's schema, or up to 256 lanes of section `a` from lane `b` on, value its length; with `c` above 0, of the state the history kept `c` seconds of game time back instead. state_diff answers, for each section of the live state or the one kept `a` seconds back, its key, its length then and now, how many lanes differ and the first that does (-1 for none), value the frame compared with. pictures takes a picture of the game's frame each time the history could keep a moment, while `a` is 1, into the dev tools' atlas (the texture of material `b`: slots of 128 by 80 pixels, 8 to a row, the first 16 for pictures), and answers each picture's slot and the frame that shows it, oldest first; seek goes to frame `a`, paused. watch pauses the game once lane `b` of the live state's section `a` compares with `d` as DEVTOOLS_COMPARE `c` says, `a` -1 stops watching and -2 only asks; it answers the watch: key, lane, comparison, value, the lane's value now and the frame it paused at (-1 for none). profile samples the game's guest while `a` is 1, stops at 0 and forgets the samples at 2 (3 only asks), answering how many it has and 1 while sampling; flame answers them as a flame graph, value the samples: first how many functions follow that the samples found running most, each its function index, samples, its name's length and code points; then each node (a caller before its callees) as its depth, function index, first sample, samples, samples in it alone, its name's length and code points. memory answers the game's committed memory in bytes, the most it committed, then for each counter the guest exports (guest ABI 3's ownership counters) and the host's calls into it, its name's length, code points and value in two 24-bit halves, value the number of counters. presets answers the names of the checkout's tunable presets, a line each; preset_save saves the game's tuned values as the preset the text names, and preset_load tunes each value of that preset. assets answers the game's catalog of DEVTOOLS_ASSET `a`, each entry as its DEVTOOLS_ASSET_STATE, its revision, its key's length and code points. preview draws catalog asset `b` of kind `a` (a mesh with material `c`, a material on mesh `c`) into slot `d` (16 to 63) of the atlas pictures named, value 1 once drawn and 0 while its assets load. swap draws catalog asset `b` of kind `a` from the asset the text names instead, or its own again when the text is empty, until the next build. material answers material `a`'s color and instance parameters (8 numbers, 0 when it sets none), whether it sets them (two numbers), then its shader's and texture's names, each its length and code points; material_set sets number `b` of those 8 in the checkout's file to `c`, which then reloads. audit checks the game's interface as the last frame showed it and answers its findings: value their count, and for each its kind (AUDIT_FINDING_*), the node's id, a measure (a contrast ratio, a size in pixels, or 0), its message's length and the message's code points. audio answers the mix as it plays: DEVTOOLS_AUDIO's numbers, then DEVTOOLS_BUS's for each bus, the master first; peaks and RMS are linear and over what played since the last audio answer. mute silences bus `a` while `b` is 1 and solo hears only the soloed buses (and the master's own voices) while any is soloed; both are the developer's, never the game's or a recording's. export hands the game's state over as a save file named by the text, or a new one (the browser downloads it); import loads a save file the player hands over (the browser asks for one), or plays an input recording. systems measures named game systems while a is 1, stops at 0, and answers a bounded page starting at row b (64 rows maximum). Row zero refreshes the snapshot; subsequent pages read that same snapshot. Value is the total system count. Each row contains stage (Start through Settle, 0-6), id, calls since the previous snapshot, mean milliseconds, maximum milliseconds, execution mode (0 sequential), name length and code points. Uncalled systems have -1 timings. Unsupported hosts answer unavailable. semantic exchanges bounded JSON text for opt-in application descriptors, decoded object values, decision events, watches and exact timeline seeks; see docs/semantic-inspection.md for version 1, limits, pagination and explicit unavailable reasons."
     },
     {
       "name": "DevtoolsFrame",
@@ -455,7 +461,10 @@
         "wait",
         "decode",
         "validate",
-        "submit",
+        "render",
+        "acquire",
+        "present",
+        "pace",
         "housekeeping",
         "total",
         "packet",
@@ -484,7 +493,7 @@
         "gpu_overlay",
         "gpu_total"
       ],
-      "doc": "Where each number sits in a devtools frame answer: the milliseconds since the frame before; the game's frame phases in milliseconds (guest, waited for an overlapped guest, packet decode, validation, render and present, housekeeping, and their total), each -1 when the frame was not timed or did not run; its packet's bytes; the renderer's draw calls, instanced ones and instances; the frame's meshes and brushes; the game's memory in bytes; the frame's width and height in pixels; and the timeline: the next frame's position, 1 when paused, replaying, keeping history or overlapping frames, and the frame an input recording started at, or -1. Then the renderer's culling: draws and instances left out of the camera's view, and casters left out of the shadow maps (once for each map); the triangles drawn; the render scale the scene drew at; and the GPU's milliseconds over a recent frame's shadow maps, culling, scene, the passes after it, sprites and insets, and the whole frame, each -1 where the GPU has no timestamps."
+      "doc": "Where each number sits in a devtools frame answer: the milliseconds since the frame before; the game's frame phases in milliseconds (guest, waited for an overlapped guest, packet decode, validation, rendering, surface acquisition, presentation, explicit pacing waits, housekeeping, and their total), each -1 when the frame was not timed or did not run. Drawing phases do not overlap: render covers preparation, uploads, command encoding, queue submission and the developer overlay, excluding acquire and present calls; acquire and present include any waits inside those calls. Pace covers browser GPU backpressure and repaint waits (zero natively, whose event-loop pacing is outside the measured frame). These are wall-clock call durations, not thread CPU time; driver stalls inside queue submission remain in render. Housekeeping includes audio, input and capture work. Then its packet's bytes; the renderer's draw calls, instanced ones and instances; the frame's meshes and brushes; the game's memory in bytes; the frame's width and height in pixels; and the timeline: the next frame's position, 1 when paused, replaying, keeping history or overlapping frames, and the frame an input recording started at, or -1. Then the renderer's culling: draws and instances left out of the camera's view, and casters left out of the shadow maps (once for each map); the triangles drawn; the render scale the scene drew at; and the GPU's milliseconds over a recent frame's shadow maps, culling, scene, the passes after it, sprites and insets, and the whole frame, each -1 where the GPU has no timestamps."
     },
     {
       "name": "PhysicsOperation",
@@ -1471,6 +1480,11 @@
         }
       },
       {
+        "tag": 28,
+        "name": "RendererReady",
+        "doc": "Once during an opted-in loading presentation after its scene, assets, pipelines and texture fades are ready. Delivered as a normal event so game-owned loading presentations can finish deterministically."
+      },
+      {
         "tag": 100,
         "name": "Game",
         "doc": "One of the game's own events, which its pen.json `protocol` declares: its tag there, and up to three values. Hosts send them only to a game that declares them, whose generated pen/extensions.blot decodes them; pen's own bindings leave them out.",
@@ -1894,6 +1908,14 @@
         "kind": "size",
         "section": "panners",
         "of": "count"
+      },
+      "loading": {
+        "kind": "flag",
+        "doc": "The frame sprites are an application loading screen: draw them above the startup veil even while scene pipelines compile. Scene assets continue loading underneath."
+      },
+      "show_captions": {
+        "kind": "flag",
+        "doc": "Show sound captions when the player has enabled them in the game's accessibility settings. Off by default; the game owns and saves the choice."
       }
     },
     "sections": [
@@ -2196,6 +2218,11 @@
             "pixel_size": {
               "kind": "f32",
               "doc": "Block size in screen pixels, or zero for a smooth image."
+            },
+            "after_sprites": {
+              "kind": "count",
+              "max": { "limit": "MAX_SPRITES", "value": 65536 },
+              "doc": "Composite after this many frame sprites; zero draws below all sprites."
             }
           },
           "doc": "A small 3D view over the screen, in the rectangle at (x, y)."
@@ -2976,7 +3003,7 @@
       }
     ],
     "extensions": {
-      "doc": "The game's own sections, which its pen.json `protocol` declares, after the rest of the packet: a marker, their count, then each one's tag, length and values. A packet without any ends before the marker.",
+    "doc": "The game's own sections, which its pen.json `protocol` declares, after the rest of the packet: a marker, their count, then each one's tag, length and values. A packet without any ends before the marker. Tag 0 is reserved for one optional development provenance block: at most MAX_PROVENANCE_LANES UTF-8 JSON bytes as float32 lanes, version 1 with entries of first/end packet lane ranges and optional object, system, source (file/start/end UTF-8 byte span). See docs/packet-diagnostics.md. Hosts consume this metadata without retaining it in the rendered frame; release games omit it.",
       "marker": 5260632,
       "max": {
         "limit": "MAX_EXTENSIONS",

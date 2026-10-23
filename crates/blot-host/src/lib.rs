@@ -12,6 +12,12 @@
 //! blocked in a callback does not count. A [`Probe`] shows the dev tools its
 //! memory, ownership counters and, sampled, where it spends its time.
 mod probe;
+mod system_trace;
+mod tasks;
+#[cfg(feature = "compiler")]
+mod trace_instrument;
+pub mod workers;
+pub use system_trace::SystemTrace;
 
 use std::any::Any;
 use std::fmt;
@@ -51,6 +57,7 @@ fn wasm_type(value: ValueType) -> ValType {
 #[derive(Clone)]
 pub struct GuestModule {
     module: Module,
+    trace: Option<Arc<SystemTrace>>,
     abi: Arc<GuestAbi>,
     symbols: Arc<Symbols>,
     /// The exported mutable globals an image of an instance keeps, or why
@@ -120,7 +127,33 @@ impl GuestModule {
         let module = compile(engine, wasm, cache)?;
         validate_module(&module, &abi)?;
         let imaged = Arc::new(imaged_globals(wasm));
-        Ok(GuestModule { module, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
+        Ok(GuestModule { module, trace: None, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
+    }
+
+    /// Instruments allocation traffic and selects the game's explicit tracing
+    /// entrypoint. The original bytes and normal entry remain unchanged.
+    #[cfg(feature = "compiler")]
+    pub fn traced(engine: &Engine, wasm: &[u8], cache: Option<&Path>, trace: Arc<SystemTrace>) -> Result<GuestModule> {
+        let mut module = if trace.records_allocations() {
+            Self::new(engine, &trace_instrument::instrument(wasm)?, cache)?
+        } else {
+            Self::new(engine, wasm, cache)?
+        };
+        let entry = module.abi.function("main_trace").context("system tracing needs a main_trace entrypoint")?;
+        ensure!(
+            entry.parameter == Parameter::Callback(pen_runtime::abi::GAME_HOST) && entry.result == ValueType::Unit,
+            "main_trace must have the same signature as main"
+        );
+        module.trace = Some(trace);
+        Ok(module)
+    }
+
+    pub fn system_trace(&self) -> Option<Arc<SystemTrace>> {
+        self.trace.clone()
+    }
+
+    pub fn main_entry(&self) -> &'static str {
+        if self.trace.is_some() { "main_trace" } else { "main" }
     }
 
     /// Like [`GuestModule::new`], but first tries `precompiled`, the output
@@ -144,7 +177,7 @@ impl GuestModule {
             Ok(module) => {
                 validate_module(&module, &abi)?;
                 let imaged = Arc::new(imaged_globals(wasm));
-                Ok(GuestModule { module, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
+                Ok(GuestModule { module, trace: None, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
             }
             Err(_) if COMPILER => GuestModule::new(engine, wasm, cache),
             Err(error) => Err(anyhow::Error::from(error).context(
@@ -294,10 +327,14 @@ fn prune(directory: &Path, now: std::time::SystemTime) -> std::io::Result<()> {
 
 fn validate_module(module: &Module, abi: &GuestAbi) -> Result<()> {
     abi.check_hostable()?;
+    if let Some(count) = abi.tasks {
+        tasks::validate(module, count)?;
+    }
     let adapters: Vec<String> = abi.callbacks().into_iter().map(CallbackType::import_name).collect();
     for import in module.imports() {
         ensure!(
-            import.module() == HOST_MODULE && adapters.iter().any(|name| name == import.name()),
+            (import.module() == HOST_MODULE && adapters.iter().any(|name| name == import.name()))
+                || (abi.tasks.is_some() && import.module() == tasks::MODULE),
             "invalid_abi: unexpected import {}::{}",
             import.module(),
             import.name()
@@ -416,6 +453,8 @@ struct Ownership {
 
 #[derive(Default)]
 struct State {
+    tasks: Option<tasks::Tasks>,
+    tracing: Option<system_trace::Tracing>,
     active: Option<Active>,
     arena: Option<Arena>,
     ownership: Option<Ownership>,
@@ -545,6 +584,9 @@ impl Guest {
         // Instantiating runs the module's start function, if it has one.
         resume(&mut store);
         let mut linker = Linker::new(engine);
+        if module.abi.tasks.is_some() {
+            tasks::link(&mut linker)?;
+        }
         for signature in module.abi.callbacks() {
             let ty = FuncType::new(
                 engine,
@@ -557,7 +599,7 @@ impl Guest {
         }
         let instance =
             linker.instantiate(&mut store, &module.module).map_err(|error| overran(store.data(), error.into()))?;
-        if module.abi.uses_arrays() {
+        if module.abi.uses_arrays() || module.abi.tasks.is_some() {
             let memory = instance
                 .get_memory(&mut store, "blot:memory")
                 .ok_or_else(|| anyhow!("invalid_abi: missing array arena exports"))?;
@@ -570,6 +612,21 @@ impl Guest {
             let enter = instance.get_typed_func::<(), ()>(&mut store, OWNERSHIP_ENTER)?;
             let leave = instance.get_typed_func::<i32, ()>(&mut store, OWNERSHIP_LEAVE)?;
             store.data_mut().ownership = Some(Ownership { enter, leave });
+        }
+        if let Some(count) = module.abi.tasks {
+            tasks::install(&mut store, instance, count)?;
+        }
+        if let Some(trace) = &module.trace {
+            let globals = if trace.records_allocations() {
+                let bytes = instance.get_global(&mut store, "pen:trace_bytes").context("missing trace byte counter")?;
+                let allocations = instance
+                    .get_global(&mut store, "pen:trace_allocations")
+                    .context("missing trace allocation counter")?;
+                Some([bytes, allocations])
+            } else {
+                None
+            };
+            store.data_mut().tracing = Some(system_trace::Tracing::new(trace.clone(), globals));
         }
         Ok(Guest {
             store,
@@ -625,12 +682,21 @@ impl Guest {
             self.abi.function(name).ok_or_else(|| anyhow!("unknown_export: unknown function export {name}"))?.clone();
         let argument = argument.into();
         let result = self.begin_and_run(&function, argument).map_err(|error| overran(self.store.data(), error));
+        let trace_finish = if let Some(mut tracing) = self.store.data_mut().tracing.take() {
+            let counts = tracing.counts(&mut self.store);
+            let aborted = tracing.abort(Instant::now(), counts);
+            self.store.data_mut().tracing = Some(tracing);
+            aborted
+        } else {
+            Ok(())
+        };
         if let Some(probe) = &self.store.data().probe {
             probe.called(result.is_err());
         }
         let finish = self.finish(if result.is_ok() { LEFT_NORMALLY } else { LEFT_FAILING });
         let result = result?;
         finish?;
+        trace_finish?;
         Ok(result)
     }
 
@@ -641,6 +707,7 @@ impl Guest {
             ownership.enter.call(&mut self.store, ())?;
             self.store.data_mut().entered = true;
         }
+        tasks::begin(&mut self.store)?;
         if let Some(arena) = self.store.data().arena.clone() {
             arena.reset.call(&mut self.store, 0)?;
         }
@@ -681,17 +748,19 @@ impl Guest {
     /// Ends a call: leaves ownership with `outcome` if it entered, then
     /// resets the arena, both attempted even when one fails.
     fn finish(&mut self, outcome: i32) -> Result<()> {
+        let task_result = tasks::finish(&mut self.store, outcome != LEFT_NORMALLY);
         self.store.data_mut().active = None;
         resume(&mut self.store);
         let mut left = Ok(());
         if std::mem::take(&mut self.store.data_mut().entered)
             && let Some(ownership) = self.store.data().ownership.clone()
         {
-            left = ownership.leave.call(&mut self.store, outcome);
+            left = ownership.leave.call(&mut self.store, if task_result.is_err() { LEFT_FAILING } else { outcome });
         }
         if let Some(arena) = self.store.data().arena.clone() {
             arena.reset.call(&mut self.store, 0)?;
         }
+        task_result?;
         Ok(left?)
     }
 
@@ -706,13 +775,20 @@ impl Guest {
             return Ok(());
         }
         resume(&mut self.store);
+        let tasks = tasks::dispose(&mut self.store);
+        let mut left = Ok(());
         if let Some(ownership) = self.store.data().ownership.clone() {
-            ownership.leave.call(&mut self.store, TEARDOWN).map_err(|error| symbolize(error, &self.symbols))?;
+            left = ownership.leave.call(&mut self.store, TEARDOWN).map_err(|error| symbolize(error, &self.symbols));
             if let Some(arena) = self.store.data().arena.clone() {
-                arena.reset.call(&mut self.store, 0)?;
+                let reset = arena.reset.call(&mut self.store, 0);
+                tasks?;
+                left?;
+                reset?;
+                return Ok(());
             }
         }
-        Ok(())
+        tasks?;
+        left
     }
 
     /// An image of the instance between calls: its memory (`blot:memory`)
@@ -722,6 +798,7 @@ impl Guest {
     /// global (others are refused). A long-lived `main(host)` is never
     /// between calls while it runs, so it cannot be imaged.
     pub fn capture(&mut self, previous: Option<&GuestImage>) -> Result<(GuestImage, Captured)> {
+        ensure!(self.abi.tasks.is_none(), "task contexts are host state and cannot be memory-imaged");
         ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
         let names = self.imaged.as_ref().as_ref().map_err(|why| anyhow!("this guest cannot be imaged: {why}"))?;
         let memory = self.instance.get_memory(&mut self.store, "blot:memory");
@@ -739,6 +816,7 @@ impl Guest {
     /// it has less (memory never shrinks: what lies past the image is
     /// zeroed). Returns the pages written.
     pub fn restore(&mut self, image: &GuestImage) -> Result<usize> {
+        ensure!(self.abi.tasks.is_none(), "task contexts are host state and cannot be memory-imaged");
         ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
         let mut written = 0;
         if let Some(memory) = self.instance.get_memory(&mut self.store, "blot:memory") {
@@ -875,6 +953,30 @@ fn invoke_import(
     };
     ensure!(expected == signature, "capability_signature: host call signature does not match its capability");
     let arena = caller.data().arena.clone();
+    let observed = caller.data().tracing.as_ref().map(|_| Instant::now());
+    let argument = from_wasm(&mut caller, arena.as_ref(), signature.parameter, &params[1])?;
+    if let Some(mut tracing) = caller.data_mut().tracing.take() {
+        let counts = tracing.counts(&mut caller);
+        let now = observed.unwrap();
+        let marked = match &argument {
+            Value::ArrayF32(packet) => tracing.marker(packet, now, counts),
+            _ => Ok(false),
+        };
+        caller.data_mut().tracing = Some(tracing);
+        if marked? {
+            let begin = matches!(&argument, Value::ArrayF32(packet) if packet[1] == 1.0);
+            results[0] = to_wasm(&mut caller, arena.as_ref(), Value::ArrayF32(Vec::new()))?;
+            let mut tracing = caller.data_mut().tracing.take().unwrap();
+            let counts = tracing.counts(&mut caller);
+            tracing.resume_marker(begin, Instant::now(), counts);
+            caller.data_mut().tracing = Some(tracing);
+            return Ok(());
+        }
+        let mut tracing = caller.data_mut().tracing.take().unwrap();
+        let finished = tracing.finish_command(now, counts);
+        caller.data_mut().tracing = Some(tracing);
+        finished?;
+    }
     if let (Some(gauge), Some(arena)) = (&caller.data().memory, &arena) {
         gauge.store(arena.memory.data_size(&caller), Ordering::Relaxed);
     }
@@ -885,7 +987,6 @@ fn invoke_import(
         probe.called_host(memory, values);
         caller.data_mut().counters = counters;
     }
-    let argument = from_wasm(&mut caller, arena.as_ref(), signature.parameter, &params[1])?;
     let mut callback = caller
         .data_mut()
         .active
@@ -904,7 +1005,17 @@ fn invoke_import(
         result.kind(),
         signature.result
     );
+    let command = match &result {
+        Value::ArrayF32(packet) if caller.data().tracing.is_some() && packet.len() >= 2 => Some([packet[0], packet[1]]),
+        _ => None,
+    };
     results[0] = to_wasm(&mut caller, arena.as_ref(), result)?;
+    if let Some(command) = command {
+        let mut tracing = caller.data_mut().tracing.take().unwrap();
+        let counts = tracing.counts(&mut caller);
+        tracing.resume_command(&command, Instant::now(), counts);
+        caller.data_mut().tracing = Some(tracing);
+    }
     Ok(())
 }
 

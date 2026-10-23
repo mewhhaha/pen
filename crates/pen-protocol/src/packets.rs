@@ -243,7 +243,16 @@ pub mod types {
     /// own voices) while any is soloed; both are the developer's, never the game's or a
     /// recording's. export hands the game's state over as a save file named by the text, or a
     /// new one (the browser downloads it); import loads a save file the player hands over (the
-    /// browser asks for one), or plays an input recording.
+    /// browser asks for one), or plays an input recording. systems measures named game systems
+    /// while a is 1, stops at 0, and answers a bounded page starting at row b (64 rows
+    /// maximum). Row zero refreshes the snapshot; subsequent pages read that same snapshot.
+    /// Value is the total system count. Each row contains stage (Start through Settle, 0-6),
+    /// id, calls since the previous snapshot, mean milliseconds, maximum milliseconds,
+    /// execution mode (0 sequential), name length and code points. Uncalled systems have -1
+    /// timings. Unsupported hosts answer unavailable. semantic exchanges bounded JSON text for
+    /// opt-in application descriptors, decoded object values, decision events, watches and
+    /// exact timeline seeks; see docs/semantic-inspection.md for version 1, limits, pagination
+    /// and explicit unavailable reasons.
     pub mod devtools_op {
         pub const LOG: u32 = 0;
         pub const FRAME: u32 = 1;
@@ -284,57 +293,69 @@ pub mod types {
         pub const SOLO: u32 = 36;
         pub const EXPORT: u32 = 37;
         pub const IMPORT: u32 = 38;
+        pub const SYSTEMS: u32 = 39;
+        pub const SEMANTIC: u32 = 40;
         /// The names of the codes, by code.
-        pub const NAMES: [&str; 39] = ["log", "frame", "gpu", "command", "pause", "play", "step", "rewind", "replay", "history", "record", "shot", "tune", "bake", "tuned", "packets", "packet_diff", "state", "state_diff", "pictures", "seek", "watch", "profile", "flame", "memory", "presets", "preset_save", "preset_load", "assets", "preview", "swap", "material", "material_set", "audit", "audio", "mute", "solo", "export", "import"];
+        pub const NAMES: [&str; 41] = ["log", "frame", "gpu", "command", "pause", "play", "step", "rewind", "replay", "history", "record", "shot", "tune", "bake", "tuned", "packets", "packet_diff", "state", "state_diff", "pictures", "seek", "watch", "profile", "flame", "memory", "presets", "preset_save", "preset_load", "assets", "preview", "swap", "material", "material_set", "audit", "audio", "mute", "solo", "export", "import", "systems", "semantic"];
     }
     /// Where each number sits in a devtools frame answer: the milliseconds since the frame
     /// before; the game's frame phases in milliseconds (guest, waited for an overlapped guest,
-    /// packet decode, validation, render and present, housekeeping, and their total), each -1
-    /// when the frame was not timed or did not run; its packet's bytes; the renderer's draw
-    /// calls, instanced ones and instances; the frame's meshes and brushes; the game's memory
-    /// in bytes; the frame's width and height in pixels; and the timeline: the next frame's
-    /// position, 1 when paused, replaying, keeping history or overlapping frames, and the frame
-    /// an input recording started at, or -1. Then the renderer's culling: draws and instances
-    /// left out of the camera's view, and casters left out of the shadow maps (once for each
-    /// map); the triangles drawn; the render scale the scene drew at; and the GPU's
-    /// milliseconds over a recent frame's shadow maps, culling, scene, the passes after it,
-    /// sprites and insets, and the whole frame, each -1 where the GPU has no timestamps.
+    /// packet decode, validation, rendering, surface acquisition, presentation, explicit pacing
+    /// waits, housekeeping, and their total), each -1 when the frame was not timed or did not
+    /// run. Drawing phases do not overlap: render covers preparation, uploads, command
+    /// encoding, queue submission and the developer overlay, excluding acquire and present
+    /// calls; acquire and present include any waits inside those calls. Pace covers browser GPU
+    /// backpressure and repaint waits (zero natively, whose event-loop pacing is outside the
+    /// measured frame). These are wall-clock call durations, not thread CPU time; driver stalls
+    /// inside queue submission remain in render. Housekeeping includes audio, input and capture
+    /// work. Then its packet's bytes; the renderer's draw calls, instanced ones and instances;
+    /// the frame's meshes and brushes; the game's memory in bytes; the frame's width and height
+    /// in pixels; and the timeline: the next frame's position, 1 when paused, replaying,
+    /// keeping history or overlapping frames, and the frame an input recording started at, or
+    /// -1. Then the renderer's culling: draws and instances left out of the camera's view, and
+    /// casters left out of the shadow maps (once for each map); the triangles drawn; the render
+    /// scale the scene drew at; and the GPU's milliseconds over a recent frame's shadow maps,
+    /// culling, scene, the passes after it, sprites and insets, and the whole frame, each -1
+    /// where the GPU has no timestamps.
     pub mod devtools_frame {
         pub const INTERVAL: u32 = 0;
         pub const GUEST: u32 = 1;
         pub const WAIT: u32 = 2;
         pub const DECODE: u32 = 3;
         pub const VALIDATE: u32 = 4;
-        pub const SUBMIT: u32 = 5;
-        pub const HOUSEKEEPING: u32 = 6;
-        pub const TOTAL: u32 = 7;
-        pub const PACKET: u32 = 8;
-        pub const DRAW_CALLS: u32 = 9;
-        pub const INSTANCED_DRAW_CALLS: u32 = 10;
-        pub const INSTANCES: u32 = 11;
-        pub const MESHES: u32 = 12;
-        pub const BRUSHES: u32 = 13;
-        pub const MEMORY: u32 = 14;
-        pub const WIDTH: u32 = 15;
-        pub const HEIGHT: u32 = 16;
-        pub const POSITION: u32 = 17;
-        pub const PAUSED: u32 = 18;
-        pub const REPLAYING: u32 = 19;
-        pub const HISTORY: u32 = 20;
-        pub const PIPELINED: u32 = 21;
-        pub const RECORDING: u32 = 22;
-        pub const CULLED: u32 = 23;
-        pub const SHADOW_CULLED: u32 = 24;
-        pub const TRIANGLES: u32 = 25;
-        pub const RENDER_SCALE: u32 = 26;
-        pub const GPU_SHADOW: u32 = 27;
-        pub const GPU_CULLING: u32 = 28;
-        pub const GPU_SCENE: u32 = 29;
-        pub const GPU_POST: u32 = 30;
-        pub const GPU_OVERLAY: u32 = 31;
-        pub const GPU_TOTAL: u32 = 32;
+        pub const RENDER: u32 = 5;
+        pub const ACQUIRE: u32 = 6;
+        pub const PRESENT: u32 = 7;
+        pub const PACE: u32 = 8;
+        pub const HOUSEKEEPING: u32 = 9;
+        pub const TOTAL: u32 = 10;
+        pub const PACKET: u32 = 11;
+        pub const DRAW_CALLS: u32 = 12;
+        pub const INSTANCED_DRAW_CALLS: u32 = 13;
+        pub const INSTANCES: u32 = 14;
+        pub const MESHES: u32 = 15;
+        pub const BRUSHES: u32 = 16;
+        pub const MEMORY: u32 = 17;
+        pub const WIDTH: u32 = 18;
+        pub const HEIGHT: u32 = 19;
+        pub const POSITION: u32 = 20;
+        pub const PAUSED: u32 = 21;
+        pub const REPLAYING: u32 = 22;
+        pub const HISTORY: u32 = 23;
+        pub const PIPELINED: u32 = 24;
+        pub const RECORDING: u32 = 25;
+        pub const CULLED: u32 = 26;
+        pub const SHADOW_CULLED: u32 = 27;
+        pub const TRIANGLES: u32 = 28;
+        pub const RENDER_SCALE: u32 = 29;
+        pub const GPU_SHADOW: u32 = 30;
+        pub const GPU_CULLING: u32 = 31;
+        pub const GPU_SCENE: u32 = 32;
+        pub const GPU_POST: u32 = 33;
+        pub const GPU_OVERLAY: u32 = 34;
+        pub const GPU_TOTAL: u32 = 35;
         /// The names of the codes, by code.
-        pub const NAMES: [&str; 33] = ["interval", "guest", "wait", "decode", "validate", "submit", "housekeeping", "total", "packet", "draw_calls", "instanced_draw_calls", "instances", "meshes", "brushes", "memory", "width", "height", "position", "paused", "replaying", "history", "pipelined", "recording", "culled", "shadow_culled", "triangles", "render_scale", "gpu_shadow", "gpu_culling", "gpu_scene", "gpu_post", "gpu_overlay", "gpu_total"];
+        pub const NAMES: [&str; 36] = ["interval", "guest", "wait", "decode", "validate", "render", "acquire", "present", "pace", "housekeeping", "total", "packet", "draw_calls", "instanced_draw_calls", "instances", "meshes", "brushes", "memory", "width", "height", "position", "paused", "replaying", "history", "pipelined", "recording", "culled", "shadow_culled", "triangles", "render_scale", "gpu_shadow", "gpu_culling", "gpu_scene", "gpu_post", "gpu_overlay", "gpu_total"];
     }
     /// Rigid-body physics (rapier), from the world the request sends: step advances it `a`
     /// steps (1 to 600) of `b` seconds (up to 1) with gravity `c` (metres per second squared
@@ -835,6 +856,10 @@ pub mod types {
         /// schema and was restored, otherwise 0. Reloads, loads, rewinds and replays do not
         /// send it; it is not recorded as input.
         SessionStarted { restored: u32 },
+        /// Once during an opted-in loading presentation after its scene, assets, pipelines and
+        /// texture fades are ready. Delivered as a normal event so game-owned loading
+        /// presentations can finish deterministically.
+        RendererReady,
         /// One of the game's own events, which its pen.json `protocol` declares: its tag there,
         /// and up to three values. Hosts send them only to a game that declares them, whose
         /// generated pen/extensions.blot decodes them; pen's own bindings leave them out.
@@ -942,6 +967,8 @@ pub mod types {
         pub draws: Vec<Draw>,
         /// Block size in screen pixels, or zero for a smooth image.
         pub pixel_size: f32,
+        /// Composite after this many frame sprites; zero draws below all sprites.
+        pub after_sprites: u32,
     }
     /// A patch of a field: a `width` x `height` grid of values the host keeps for `material`,
     /// which every draw of it reads as a texture at binding 3 (red, half-float). The patch's
@@ -1262,6 +1289,12 @@ pub mod types {
         pub clouds: Clouds,
         /// The frame supplies its own cursor and asks the host to hide the system one.
         pub hide_cursor: bool,
+        /// The frame sprites are an application loading screen: draw them above the startup
+        /// veil even while scene pipelines compile. Scene assets continue loading underneath.
+        pub loading: bool,
+        /// Show sound captions when the player has enabled them in the game's accessibility
+        /// settings. Off by default; the game owns and saves the choice.
+        pub show_captions: bool,
         pub draws: Vec<Draw>,
         /// Convex solids: the points behind every face plane (normal · p <= distance).
         pub solids: Vec<Solid>,
@@ -1314,7 +1347,12 @@ pub mod types {
         pub panners: Vec<Panner>,
         /// The game's own sections, which its pen.json `protocol` declares, after the rest of
         /// the packet: a marker, their count, then each one's tag, length and values. A packet
-        /// without any ends before the marker.
+        /// without any ends before the marker. Tag 0 is reserved for one optional development
+        /// provenance block: at most MAX_PROVENANCE_LANES UTF-8 JSON bytes as float32 lanes,
+        /// version 1 with entries of first/end packet lane ranges and optional object, system,
+        /// source (file/start/end UTF-8 byte span). See docs/packet-diagnostics.md. Hosts
+        /// consume this metadata without retaining it in the rendered frame; release games omit
+        /// it.
         pub extensions: Vec<Extension>,
     }
 }
@@ -1327,6 +1365,15 @@ pub mod codec {
 
     use super::types::*;
 
+    /// Reserved extension tag for optional development provenance; game section tags start at
+    /// 1.
+    pub const PROVENANCE_TAG: usize = 0;
+    /// The most UTF-8 JSON bytes, each encoded as one float32 lane, in a frame's provenance.
+    pub const MAX_PROVENANCE_LANES: usize = 16384;
+    /// The most source/object associations in one frame; no history is retained by the decoder.
+    pub const MAX_PROVENANCE_ENTRIES: usize = 64;
+    /// The most UTF-8 bytes in a provenance object ID, system label or source filename.
+    pub const MAX_PROVENANCE_TEXT: usize = 256;
     /// Counts travel in float32 lanes: the wire format's exact-integer range, not a runtime
     /// memory budget.
     pub const MAX_STATE_FLOATS: usize = 16777215;
@@ -1420,8 +1467,8 @@ pub mod codec {
     /// shadow.projection16, shadow.texel, shadow.texels, blur, quality.bloom, clouds.cover,
     /// clouds.drift2, hide_cursor, field_count, field_lanes, ui_count, ui_lanes, service_count,
     /// service_lanes, bus_count, voice_count, pose_count, emitter_count, quality.taa,
-    /// light_count, listener_count, panner_count.
-    pub const PACKET_HEADER_FLOATS: usize = 144;
+    /// light_count, listener_count, panner_count, loading, show_captions.
+    pub const PACKET_HEADER_FLOATS: usize = 146;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -1439,8 +1486,8 @@ pub mod codec {
     /// Lanes: x, y, width, height, u0, v0, u1, v1, color4, material, parameters4.
     pub const SPRITE_FLOATS: usize = 17;
     /// Lanes: x, y, width, height, view16, projection16, ambient3, light_direction3,
-    /// light_color3, draws count, pixel_size.
-    pub const INSET_FLOATS: usize = 47;
+    /// light_color3, draws count, pixel_size, after_sprites.
+    pub const INSET_FLOATS: usize = 48;
     /// Lanes: preferences lanes.
     pub const PREFERENCE_FLOATS: usize = 256;
     /// Lanes: material, width, height, x, z, columns, rows, before a field's values.
@@ -1537,6 +1584,8 @@ pub mod codec {
             pub const LIGHT_COUNT: usize = 141;
             pub const LISTENER_COUNT: usize = 142;
             pub const PANNER_COUNT: usize = 143;
+            pub const LOADING: usize = 144;
+            pub const SHOW_CAPTIONS: usize = 145;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -1589,6 +1638,7 @@ pub mod codec {
             pub const LIGHT_COLOR: usize = 42;
             pub const DRAWS: usize = 45;
             pub const PIXEL_SIZE: usize = 46;
+            pub const AFTER_SPRITES: usize = 47;
         }
         pub mod bus {
             pub const GAIN: usize = 0;
@@ -1738,6 +1788,7 @@ pub mod codec {
         pub const PINCH: u32 = 25;
         pub const PLAYER: u32 = 26;
         pub const SESSION_STARTED: u32 = 27;
+        pub const RENDERER_READY: u32 = 28;
         pub const GAME: u32 = 100;
     }
 
@@ -1840,6 +1891,7 @@ pub mod codec {
             GameEvent::Pinch { x, y, scale } => [25.0, 0.0, *x, *y, *scale],
             GameEvent::Player { index } => [26.0, *index as f32, 0.0, 0.0, 0.0],
             GameEvent::SessionStarted { restored } => [27.0, *restored as f32, 0.0, 0.0, 0.0],
+            GameEvent::RendererReady => [28.0, 0.0, 0.0, 0.0, 0.0],
             GameEvent::Game { event, a, b, c } => [100.0, *event as f32, *a, *b, *c],
         }
     }
@@ -2006,7 +2058,8 @@ pub mod codec {
                 self.decode_draw(draws_first + item * DRAW_FLOATS, draw)?;
             }
             let pixel_size = self.packet[lane + 46];
-            *inset = Inset { x, y, width, height, view, projection, ambient, light_direction, light_color, draws, pixel_size };
+            let after_sprites = self.count(lane + 47, MAX_SPRITES)?;
+            *inset = Inset { x, y, width, height, view, projection, ambient, light_direction, light_color, draws, pixel_size, after_sprites: after_sprites as u32 };
             Ok(())
         }
 
@@ -2102,8 +2155,8 @@ pub mod codec {
         }
     }
 
-    /// Decodes a render packet. The game's frame: what to draw and play, and what to do. With
-    /// several faults, it reports the first in lane order.
+    /// Decodes a render packet. The game's frame: what to draw and play, and what to do.
+    /// Failures include the earliest trustworthy structural context.
     pub fn decode_frame(packet: &[f32], schema: u32, catalog: &Catalog) -> Result<Decoded> {
         let mut render = RenderFrame::default();
         let state = decode_into(packet, schema, catalog, &mut render)?.to_vec();
@@ -2119,6 +2172,10 @@ pub mod codec {
         catalog: &Catalog,
         frame: &mut RenderFrame,
     ) -> Result<&'a [f32]> {
+        decode_raw(packet, schema, catalog, frame).map_err(|error| error.context(explain_frame(packet, schema, catalog)))
+    }
+
+    pub(crate) fn decode_raw<'a>(packet: &'a [f32], schema: u32, catalog: &Catalog, frame: &mut RenderFrame) -> Result<&'a [f32]> {
         ensure!(
             packet.len() >= PACKET_HEADER_FLOATS && packet[0] == PACKET_MAGIC && packet[1] == schema as f32,
             "game returned an invalid frame header or state schema"
@@ -2210,6 +2267,7 @@ pub mod codec {
         let mut extensions = std::mem::take(&mut frame.extensions);
         extensions.clear();
         let mut extensions_end = extras_end;
+        let mut provenance_seen = false;
         if packet.len() > extensions_end {
             // Lanes past the end that are no block are an oversized packet.
             ensure!(packet.len() >= extensions_end + 2 && packet[extensions_end] == EXTENSIONS_MARKER, truncated);
@@ -2221,8 +2279,14 @@ pub mod codec {
                 let tag = reader.count(extensions_end, MAX_EXTENSION_TAG)?;
                 let length = reader.count(extensions_end + 1, MAX_EXTENSION_LANES)?;
                 let first = extensions_end + 2;
-                ensure!(tag >= 1 && packet.len() >= first + length, invalid);
-                extensions.push(Extension { tag: tag as u32, values: packet[first..first + length].to_vec() });
+                ensure!(packet.len() >= first + length, invalid);
+                if tag == PROVENANCE_TAG {
+                    ensure!(!provenance_seen, "duplicate development provenance");
+                    provenance_seen = true;
+                    crate::diagnostic::read_provenance(&packet[first..first + length], extras_end).map_err(|_| anyhow::anyhow!("invalid development provenance"))?;
+                } else {
+                    extensions.push(Extension { tag: tag as u32, values: packet[first..first + length].to_vec() });
+                }
                 extensions_end = first + length;
             }
         }
@@ -2271,6 +2335,8 @@ pub mod codec {
         let clouds_drift = Drift { x: reader.packet[127], z: reader.packet[128] };
         let hide_cursor = reader.flag(129)?;
         let quality_taa = reader.flag(140)?;
+        let loading = reader.flag(144)?;
+        let show_captions = reader.flag(145)?;
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -2453,6 +2519,8 @@ pub mod codec {
             blur,
             clouds: Clouds { cover: clouds_cover, drift: clouds_drift },
             hide_cursor,
+            loading,
+            show_captions,
             draws,
             solids,
             decals,
@@ -2494,6 +2562,523 @@ pub mod codec {
         (!lanes.is_empty()).then(|| copy(values.unwrap_or_default(), lanes))
     }
 
+    use crate::diagnostic::{Actual, Check, FrameDiagnostic, Inspector, Location};
+    #[allow(unused_variables)]
+    fn inspect_draw(d: &Inspector<'_>, catalog: &Catalog, base: usize, path: &Location, extras_cursor: &mut usize) -> Check {
+        d.reference(&path.field("mesh"), base, catalog.meshes.len(), true)?;
+        d.reference(&path.field("material"), base + 1, catalog.materials.len(), true)?;
+        d.values(&path.field("transform"), base + 2, 16, &[])?;
+        let count = d.count(&path.field("parameters").field("count"), base + 18, 4)?;
+        if count != 0 && count != 4 { return Err(path.field("parameters").field("count").error(base + 18, "0 or 4", Actual::Value(count as f32))); }
+        d.values(&path.field("parameters"), base + 18 + 1, 4, &[])?;
+        let count = d.count(&path.field("extra"), base + 23, MAX_DRAW_EXTRA)?;
+        let end = d.end(&path.field("extra"), *extras_cursor, count, 4)?;
+        d.values(&path.field("extra"), *extras_cursor, end - *extras_cursor, &[])?;
+        *extras_cursor = end;
+        Ok(())
+    }
+    #[allow(unused_variables)]
+    fn inspect_solid_face(d: &Inspector<'_>, catalog: &Catalog, base: usize, path: &Location, extras_cursor: &mut usize) -> Check {
+        d.values(&path.field("normal"), base, 3, &["x","y","z"])?;
+        d.finite(&path.field("distance"), base + 3)?;
+        d.reference(&path.field("material"), base + 4, catalog.materials.len(), true)?;
+        Ok(())
+    }
+    #[allow(unused_variables)]
+    pub(crate) fn inspect_frame(packet: &[f32], schema: u32, catalog: &Catalog) -> Check {
+        let d = &Inspector { packet };
+        let header = Location::section("header");
+        d.equal(&header.field("magic"), 0, PACKET_MAGIC)?;
+        d.equal(&header.field("schema"), 1, schema as f32)?;
+        let state_lanes = d.count(&header.field("state_count"), 2, MAX_STATE_FLOATS)?;
+        let draws_count = d.count(&header.field("draw_count"), 3, MAX_DRAWS)?;
+        let solids_count = d.count(&header.field("solid_count"), 4, MAX_SOLIDS)?;
+        let solids_lanes = d.count(&header.field("solid_lanes"), 5, 32100000)?;
+        let decals_count = d.count(&header.field("decal_count"), 6, MAX_DECALS)?;
+        let sounds_count = d.count(&header.field("sound_count"), 7, MAX_SOUNDS)?;
+        let sprites_count = d.count(&header.field("sprite_count"), 8, MAX_SPRITES)?;
+        let insets_count = d.count(&header.field("inset_count"), 9, MAX_INSETS)?;
+        let inset_draws_count = d.count(&header.field("inset_draw_count"), 10, MAX_DRAWS)?;
+        let preferences_lanes = d.count(&header.field("preference_count"), 11, 256)?;
+        let fields_count = d.count(&header.field("field_count"), 130, MAX_FIELD_PATCHES)?;
+        let fields_lanes = d.count(&header.field("field_lanes"), 131, 16805888)?;
+        let ui_count = d.count(&header.field("ui_count"), 132, MAX_UI_NODES)?;
+        let ui_lanes = d.count(&header.field("ui_lanes"), 133, 4292608)?;
+        let services_count = d.count(&header.field("service_count"), 134, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = d.count(&header.field("service_lanes"), 135, 4196352)?;
+        let buses_count = d.count(&header.field("bus_count"), 136, MAX_BUSES)?;
+        let voices_count = d.count(&header.field("voice_count"), 137, MAX_VOICES)?;
+        let poses_count = d.count(&header.field("pose_count"), 138, MAX_POSES)?;
+        let emitters_count = d.count(&header.field("emitter_count"), 139, MAX_EMITTERS)?;
+        let lights_count = d.count(&header.field("light_count"), 141, MAX_LIGHTS)?;
+        let listener_count = d.count(&header.field("listener_count"), 142, 1)?;
+        let panners_count = d.count(&header.field("panner_count"), 143, MAX_PANNERS)?;
+        let state_start = PACKET_HEADER_FLOATS;
+        let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
+        let draws_start = state_end;
+        let draws_end = d.end(&Location::section("draws"), draws_start, draws_count, DRAW_FLOATS)?;
+        let solids_start = draws_end;
+        let solids_end = d.end(&Location::section("solids"), solids_start, solids_lanes, 1)?;
+        let decals_start = solids_end;
+        let decals_end = d.end(&Location::section("decals"), decals_start, decals_count, DECAL_FLOATS)?;
+        let sounds_start = decals_end;
+        let sounds_end = d.end(&Location::section("sounds"), sounds_start, sounds_count, SOUND_FLOATS)?;
+        let sprites_start = sounds_end;
+        let sprites_end = d.end(&Location::section("sprites"), sprites_start, sprites_count, SPRITE_FLOATS)?;
+        let insets_start = sprites_end;
+        let insets_end = d.end(&Location::section("insets"), insets_start, insets_count, INSET_FLOATS)?;
+        let inset_draws_start = insets_end;
+        let inset_draws_end = d.end(&Location::section("inset_draws"), inset_draws_start, inset_draws_count, DRAW_FLOATS)?;
+        let mut inset_draws_cursor = inset_draws_start;
+        let preferences_start = inset_draws_end;
+        let preferences_end = d.end(&Location::section("preferences"), preferences_start, preferences_lanes, 1)?;
+        let fields_start = preferences_end;
+        let fields_end = d.end(&Location::section("fields"), fields_start, fields_lanes, 1)?;
+        let ui_start = fields_end;
+        let ui_end = d.end(&Location::section("ui"), ui_start, ui_lanes, 1)?;
+        let services_start = ui_end;
+        let services_end = d.end(&Location::section("services"), services_start, services_lanes, 1)?;
+        let buses_start = services_end;
+        let buses_end = d.end(&Location::section("buses"), buses_start, buses_count, BUS_FLOATS)?;
+        let voices_start = buses_end;
+        let voices_end = d.end(&Location::section("voices"), voices_start, voices_count, VOICE_FLOATS)?;
+        let poses_start = voices_end;
+        let poses_end = d.end(&Location::section("poses"), poses_start, poses_count, POSE_FLOATS)?;
+        let emitters_start = poses_end;
+        let emitters_end = d.end(&Location::section("emitters"), emitters_start, emitters_count, EMITTER_FLOATS)?;
+        let lights_start = emitters_end;
+        let lights_end = d.end(&Location::section("lights"), lights_start, lights_count, LIGHT_FLOATS)?;
+        let listener_start = lights_end;
+        let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
+        let panners_start = listener_end;
+        let panners_end = d.end(&Location::section("panners"), panners_start, panners_count, PANNER_FLOATS)?;
+        let extras_start = panners_end;
+        let extras_cursor = &mut { extras_start };
+        d.count(&header.field("save_requested"), 12, 1)?;
+        d.count(&header.field("load_requested"), 13, 1)?;
+        d.count(&header.field("scene_save_requested"), 14, 1)?;
+        d.count(&header.field("scene_load_requested"), 15, 1)?;
+        d.count(&header.field("checkpoint_requested"), 16, 1)?;
+        d.count(&header.field("undo_requested"), 17, 1)?;
+        d.count(&header.field("redo_requested"), 18, 1)?;
+        d.count(&header.field("exit_requested"), 19, 1)?;
+        d.values(&header.field("view"), 20, 16, &[])?;
+        d.values(&header.field("projection"), 36, 16, &[])?;
+        d.values(&header.field("clear"), 52, 4, &["r","g","b","a"])?;
+        d.values(&header.field("ambient"), 56, 3, &["x","y","z"])?;
+        d.values(&header.field("light_direction"), 59, 3, &["x","y","z"])?;
+        d.values(&header.field("light_color"), 62, 3, &["x","y","z"])?;
+        d.values(&header.field("aberration"), 65, 2, &["x","y"])?;
+        d.finite(&header.field("quality.msaa"), 67)?;
+        d.count(&header.field("quality.fxaa"), 68, 1)?;
+        d.finite(&header.field("quality.scale"), 69)?;
+        let _ = d.count(&header.field("quality.filtering"), 70, 16)?;
+        d.count(&header.field("quality.occlusion"), 71, 1)?;
+        d.count(&header.field("quality.sky"), 72, 1)?;
+        d.count(&header.field("quality.effects"), 73, 1)?;
+        d.values(&header.field("sky.zenith"), 74, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.horizon"), 77, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.ground"), 80, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.sun"), 83, 3, &["x","y","z"])?;
+        d.finite(&header.field("sky.night"), 86)?;
+        d.finite(&header.field("fog.radius"), 87)?;
+        d.finite(&header.field("fog.density"), 88)?;
+        d.finite(&header.field("fog.height"), 89)?;
+        d.values(&header.field("shadow.view"), 90, 16, &[])?;
+        d.values(&header.field("shadow.projection"), 106, 16, &[])?;
+        d.finite(&header.field("shadow.texel"), 122)?;
+        let _ = d.count(&header.field("shadow.texels"), 123, 8192)?;
+        d.finite(&header.field("blur"), 124)?;
+        d.count(&header.field("quality.bloom"), 125, 1)?;
+        d.finite(&header.field("clouds.cover"), 126)?;
+        d.values(&header.field("clouds.drift"), 127, 2, &["x","z"])?;
+        d.count(&header.field("hide_cursor"), 129, 1)?;
+        d.count(&header.field("quality.taa"), 140, 1)?;
+        d.count(&header.field("loading"), 144, 1)?;
+        d.count(&header.field("show_captions"), 145, 1)?;
+        d.values(&Location::section("state"), state_start, state_lanes, &[])?;
+        let mut base = draws_start;
+        for item in 0..draws_count {
+            let path = &Location::section("draws").index(item);
+            d.reference(&path.field("mesh"), base, catalog.meshes.len(), true)?;
+            d.reference(&path.field("material"), base + 1, catalog.materials.len(), true)?;
+            d.values(&path.field("transform"), base + 2, 16, &[])?;
+            let count = d.count(&path.field("parameters").field("count"), base + 18, 4)?;
+            if count != 0 && count != 4 { return Err(path.field("parameters").field("count").error(base + 18, "0 or 4", Actual::Value(count as f32))); }
+            d.values(&path.field("parameters"), base + 18 + 1, 4, &[])?;
+            let count = d.count(&path.field("extra"), base + 23, MAX_DRAW_EXTRA)?;
+            let end = d.end(&path.field("extra"), *extras_cursor, count, 4)?;
+            d.values(&path.field("extra"), *extras_cursor, end - *extras_cursor, &[])?;
+            *extras_cursor = end;
+            base += DRAW_FLOATS;
+        }
+        d.exhausted(&Location::section("draws"), base, draws_end)?;
+        let mut base = solids_start;
+        for item in 0..solids_count {
+            let path = &Location::section("solids").index(item);
+            d.within(path, base, d.end(path, base, 1, 1)?, solids_end)?;
+            let faces_count = d.count(&path.field("faces.count"), base, MAX_SOLID_FACES)?;
+            if faces_count < 4 { return Err(path.field("faces.count").error(base, "at least 4", Actual::Value(faces_count as f32))); }
+            let first = base + 1;
+            let end = d.end(&path.field("faces"), first, faces_count, SOLID_FACE_FLOATS)?;
+            d.within(&path.field("faces"), first, end, solids_end)?;
+            for child in 0..faces_count {
+                inspect_solid_face(d, catalog, first + child * SOLID_FACE_FLOATS, &path.field("faces").index(child), extras_cursor)?;
+            }
+            base = end;
+        }
+        d.exhausted(&Location::section("solids"), base, solids_end)?;
+        let mut base = decals_start;
+        for item in 0..decals_count {
+            let path = &Location::section("decals").index(item);
+            d.reference(&path.field("material"), base, catalog.materials.len(), true)?;
+            d.values(&path.field("transform"), base + 1, 16, &[])?;
+            d.finite(&path.field("opacity"), base + 17)?;
+            base += DECAL_FLOATS;
+        }
+        d.exhausted(&Location::section("decals"), base, decals_end)?;
+        let mut base = sounds_start;
+        for item in 0..sounds_count {
+            let path = &Location::section("sounds").index(item);
+            d.reference(&path.field("clip"), base, catalog.sounds.len(), true)?;
+            let bus = d.count(&path.field("bus"), base + 1, 15)?;
+            d.finite(&path.field("gain"), base + 2)?;
+            d.finite(&path.field("pan"), base + 3)?;
+            d.finite(&path.field("pitch"), base + 4)?;
+            d.finite(&path.field("lowpass"), base + 5)?;
+            d.finite(&path.field("reverb"), base + 6)?;
+            base += SOUND_FLOATS;
+        }
+        d.exhausted(&Location::section("sounds"), base, sounds_end)?;
+        let mut base = sprites_start;
+        for item in 0..sprites_count {
+            let path = &Location::section("sprites").index(item);
+            d.finite(&path.field("x"), base)?;
+            d.finite(&path.field("y"), base + 1)?;
+            d.finite(&path.field("width"), base + 2)?;
+            d.finite(&path.field("height"), base + 3)?;
+            d.finite(&path.field("u0"), base + 4)?;
+            d.finite(&path.field("v0"), base + 5)?;
+            d.finite(&path.field("u1"), base + 6)?;
+            d.finite(&path.field("v1"), base + 7)?;
+            d.values(&path.field("color"), base + 8, 4, &[])?;
+            d.reference(&path.field("material"), base + 12, catalog.materials.len(), true)?;
+            d.values(&path.field("parameters"), base + 13, 4, &[])?;
+            base += SPRITE_FLOATS;
+        }
+        d.exhausted(&Location::section("sprites"), base, sprites_end)?;
+        let mut base = insets_start;
+        for item in 0..insets_count {
+            let path = &Location::section("insets").index(item);
+            d.finite(&path.field("x"), base)?;
+            d.finite(&path.field("y"), base + 1)?;
+            d.finite(&path.field("width"), base + 2)?;
+            d.finite(&path.field("height"), base + 3)?;
+            d.values(&path.field("view"), base + 4, 16, &[])?;
+            d.values(&path.field("projection"), base + 20, 16, &[])?;
+            d.values(&path.field("ambient"), base + 36, 3, &["x","y","z"])?;
+            d.values(&path.field("light_direction"), base + 39, 3, &["x","y","z"])?;
+            d.values(&path.field("light_color"), base + 42, 3, &["x","y","z"])?;
+            let count = d.count(&path.field("draws"), base + 45, MAX_DRAWS)?;
+            let end = d.end(&path.field("draws"), inset_draws_cursor, count, DRAW_FLOATS)?;
+            d.within(&path.field("draws"), inset_draws_cursor, end, inset_draws_end)?;
+            for child in 0..count {
+                inspect_draw(d, catalog, inset_draws_cursor, &path.field("draws").index(child), extras_cursor)?;
+                inset_draws_cursor += DRAW_FLOATS;
+            }
+            d.finite(&path.field("pixel_size"), base + 46)?;
+            let after_sprites = d.count(&path.field("after_sprites"), base + 47, MAX_SPRITES)?;
+            base += INSET_FLOATS;
+        }
+        d.exhausted(&Location::section("insets"), base, insets_end)?;
+        d.exhausted(&Location::section("inset_draws"), inset_draws_cursor, inset_draws_end)?;
+        d.values(&Location::section("preferences"), preferences_start, preferences_lanes, &[])?;
+        let mut base = fields_start;
+        for item in 0..fields_count {
+            let path = &Location::section("fields").index(item);
+            d.within(path, base, d.end(path, base, 1, 7)?, fields_end)?;
+            d.reference(&path.field("material"), base, catalog.materials.len(), true)?;
+            let width = d.count(&path.field("width"), base + 1, MAX_FIELD)?;
+            let height = d.count(&path.field("height"), base + 2, MAX_FIELD)?;
+            let x = d.count(&path.field("x"), base + 3, width)?;
+            let z = d.count(&path.field("z"), base + 4, height)?;
+            let columns = d.count(&path.field("columns"), base + 5, width - x)?;
+            let rows = d.count(&path.field("rows"), base + 6, height - z)?;
+            let first = base + 7;
+            let end = d.end(&path.field("values"), first, columns * rows, 1)?;
+            d.within(&path.field("values"), first, end, fields_end)?;
+            d.values(&path.field("values"), first, end - first, &[])?;
+            base = end;
+        }
+        d.exhausted(&Location::section("fields"), base, fields_end)?;
+        let mut base = ui_start;
+        for item in 0..ui_count {
+            let path = &Location::section("ui").index(item);
+            d.within(path, base, d.end(path, base, 1, 24)?, ui_end)?;
+            let id = d.count(&path.field("id"), base, MAX_UI_ID)?;
+            let parent = d.count(&path.field("parent"), base + 1, MAX_UI_NODES)?;
+            let role = d.count(&path.field("role"), base + 2, 23)?;
+            d.finite(&path.field("x"), base + 3)?;
+            d.finite(&path.field("y"), base + 4)?;
+            d.finite(&path.field("width"), base + 5)?;
+            d.finite(&path.field("height"), base + 6)?;
+            d.count(&path.field("focusable"), base + 7, 1)?;
+            d.count(&path.field("focused"), base + 8, 1)?;
+            d.count(&path.field("disabled"), base + 9, 1)?;
+            d.count(&path.field("hidden"), base + 10, 1)?;
+            d.count(&path.field("modal"), base + 11, 1)?;
+            let checked = d.count(&path.field("checked"), base + 12, 3)?;
+            let expanded = d.count(&path.field("expanded"), base + 13, 2)?;
+            let selected = d.count(&path.field("selected"), base + 14, 2)?;
+            let live = d.count(&path.field("live"), base + 15, 2)?;
+            d.finite(&path.field("value"), base + 16)?;
+            d.finite(&path.field("minimum"), base + 17)?;
+            d.finite(&path.field("maximum"), base + 18)?;
+            d.finite(&path.field("step"), base + 19)?;
+            let actions = d.count(&path.field("actions"), base + 20, 255)?;
+            let text_length = d.count(&path.field("text_length"), base + 21, MAX_UI_TEXT)?;
+            let name_length = d.count(&path.field("name_length"), base + 22, text_length)?;
+            let description_length = d.count(&path.field("description_length"), base + 23, text_length - name_length)?;
+            let first = base + 24;
+            let end = d.end(&path.field("text"), first, text_length, 1)?;
+            d.within(&path.field("text"), first, end, ui_end)?;
+            d.values(&path.field("text"), first, end - first, &[])?;
+            base = end;
+        }
+        d.exhausted(&Location::section("ui"), base, ui_end)?;
+        let mut base = services_start;
+        for item in 0..services_count {
+            let path = &Location::section("services").index(item);
+            d.within(path, base, d.end(path, base, 1, 8)?, services_end)?;
+            let request = d.count(&path.field("request"), base, MAX_SERVICE_ID)?;
+            let service = d.count(&path.field("service"), base + 1, 14)?;
+            let operation = d.count(&path.field("operation"), base + 2, MAX_SERVICE_OPERATION)?;
+            d.finite(&path.field("a"), base + 3)?;
+            d.finite(&path.field("b"), base + 4)?;
+            d.finite(&path.field("c"), base + 5)?;
+            d.finite(&path.field("d"), base + 6)?;
+            let value_count = d.count(&path.field("value_count"), base + 7, MAX_SERVICE_DATA)?;
+            let first = base + 8;
+            let end = d.end(&path.field("values"), first, value_count, 1)?;
+            d.within(&path.field("values"), first, end, services_end)?;
+            d.values(&path.field("values"), first, end - first, &[])?;
+            base = end;
+        }
+        d.exhausted(&Location::section("services"), base, services_end)?;
+        let mut base = buses_start;
+        for item in 0..buses_count {
+            let path = &Location::section("buses").index(item);
+            d.finite(&path.field("gain"), base)?;
+            d.finite(&path.field("lowpass"), base + 1)?;
+            d.finite(&path.field("reverb"), base + 2)?;
+            base += BUS_FLOATS;
+        }
+        d.exhausted(&Location::section("buses"), base, buses_end)?;
+        let mut base = voices_start;
+        for item in 0..voices_count {
+            let path = &Location::section("voices").index(item);
+            let id = d.count(&path.field("id"), base, MAX_VOICE_ID)?;
+            d.reference(&path.field("clip"), base + 1, catalog.sounds.len(), true)?;
+            let bus = d.count(&path.field("bus"), base + 2, 15)?;
+            d.finite(&path.field("gain"), base + 3)?;
+            d.finite(&path.field("pan"), base + 4)?;
+            d.finite(&path.field("pitch"), base + 5)?;
+            d.finite(&path.field("lowpass"), base + 6)?;
+            d.finite(&path.field("reverb"), base + 7)?;
+            d.count(&path.field("looping"), base + 8, 1)?;
+            d.finite(&path.field("start"), base + 9)?;
+            d.finite(&path.field("fade_in"), base + 10)?;
+            d.finite(&path.field("fade_out"), base + 11)?;
+            base += VOICE_FLOATS;
+        }
+        d.exhausted(&Location::section("voices"), base, voices_end)?;
+        let mut base = poses_start;
+        for item in 0..poses_count {
+            let path = &Location::section("poses").index(item);
+            let draw = d.count(&path.field("draw"), base, MAX_DRAWS)?;
+            let clip = d.count(&path.field("clip"), base + 1, 65535)?;
+            d.finite(&path.field("time"), base + 2)?;
+            d.finite(&path.field("weight"), base + 3)?;
+            base += POSE_FLOATS;
+        }
+        d.exhausted(&Location::section("poses"), base, poses_end)?;
+        let mut base = emitters_start;
+        for item in 0..emitters_count {
+            let path = &Location::section("emitters").index(item);
+            d.reference(&path.field("material"), base, catalog.materials.len(), true)?;
+            d.values(&path.field("transform"), base + 1, 16, &[])?;
+            let seed = d.count(&path.field("seed"), base + 17, 16777215)?;
+            d.finite(&path.field("time"), base + 18)?;
+            d.finite(&path.field("duration"), base + 19)?;
+            d.finite(&path.field("rate"), base + 20)?;
+            d.finite(&path.field("lifetime"), base + 21)?;
+            d.finite(&path.field("radius"), base + 22)?;
+            d.values(&path.field("velocity"), base + 23, 3, &["x","y","z"])?;
+            d.finite(&path.field("spread"), base + 26)?;
+            d.values(&path.field("gravity"), base + 27, 3, &["x","y","z"])?;
+            d.finite(&path.field("drag"), base + 30)?;
+            d.finite(&path.field("size_start"), base + 31)?;
+            d.finite(&path.field("size_end"), base + 32)?;
+            d.values(&path.field("color_start"), base + 33, 4, &["r","g","b","a"])?;
+            d.values(&path.field("color_end"), base + 37, 4, &["r","g","b","a"])?;
+            d.count(&path.field("additive"), base + 41, 1)?;
+            base += EMITTER_FLOATS;
+        }
+        d.exhausted(&Location::section("emitters"), base, emitters_end)?;
+        let mut base = lights_start;
+        for item in 0..lights_count {
+            let path = &Location::section("lights").index(item);
+            d.values(&path.field("position"), base, 3, &["x","y","z"])?;
+            d.finite(&path.field("radius"), base + 3)?;
+            d.values(&path.field("color"), base + 4, 3, &["x","y","z"])?;
+            d.values(&path.field("direction"), base + 7, 3, &["x","y","z"])?;
+            d.finite(&path.field("inner"), base + 10)?;
+            d.finite(&path.field("outer"), base + 11)?;
+            base += LIGHT_FLOATS;
+        }
+        d.exhausted(&Location::section("lights"), base, lights_end)?;
+        let mut base = listener_start;
+        for item in 0..listener_count {
+            let path = &Location::section("listener").index(item);
+            d.values(&path.field("position"), base, 3, &["x","y","z"])?;
+            d.values(&path.field("forward"), base + 3, 3, &["x","y","z"])?;
+            d.values(&path.field("up"), base + 6, 3, &["x","y","z"])?;
+            base += LISTENER_FLOATS;
+        }
+        d.exhausted(&Location::section("listener"), base, listener_end)?;
+        let mut base = panners_start;
+        for item in 0..panners_count {
+            let path = &Location::section("panners").index(item);
+            let voice = d.count(&path.field("voice"), base, MAX_VOICE_ID)?;
+            let sound = d.count(&path.field("sound"), base + 1, 255)?;
+            d.values(&path.field("position"), base + 2, 3, &["x","y","z"])?;
+            d.values(&path.field("orientation"), base + 5, 3, &["x","y","z"])?;
+            let distance_model = d.count(&path.field("distance_model"), base + 8, 2)?;
+            d.finite(&path.field("ref_distance"), base + 9)?;
+            d.finite(&path.field("max_distance"), base + 10)?;
+            d.finite(&path.field("rolloff"), base + 11)?;
+            d.finite(&path.field("cone_inner"), base + 12)?;
+            d.finite(&path.field("cone_outer"), base + 13)?;
+            d.finite(&path.field("cone_outer_gain"), base + 14)?;
+            base += PANNER_FLOATS;
+        }
+        d.exhausted(&Location::section("panners"), base, panners_end)?;
+        inspect_extensions(d, *extras_cursor)?;
+        Ok(())
+    }
+    #[cold]
+    fn explain_frame(packet: &[f32], schema: u32, catalog: &Catalog) -> FrameDiagnostic {
+        let mut diagnostic = inspect_frame(packet, schema, catalog).err().unwrap_or_else(|| Location::section("packet").error(0, "a valid render packet (structural context unavailable)", Actual::Length(packet.len())));
+        if diagnostic.section != "extensions" && let Ok(start) = provenance_start(packet, schema) {
+            diagnostic.origin = crate::diagnostic::origin(packet, start, diagnostic.lane).map(Box::new);
+        }
+        diagnostic
+    }
+    #[allow(unused_variables, unused_mut)]
+    fn provenance_start(packet: &[f32], schema: u32) -> Check<usize> {
+        let d = &Inspector { packet };
+        let header = Location::section("header");
+        d.equal(&header.field("magic"), 0, PACKET_MAGIC)?;
+        d.equal(&header.field("schema"), 1, schema as f32)?;
+        let state_lanes = d.count(&header.field("state_count"), 2, MAX_STATE_FLOATS)?;
+        let draws_count = d.count(&header.field("draw_count"), 3, MAX_DRAWS)?;
+        let solids_count = d.count(&header.field("solid_count"), 4, MAX_SOLIDS)?;
+        let solids_lanes = d.count(&header.field("solid_lanes"), 5, 32100000)?;
+        let decals_count = d.count(&header.field("decal_count"), 6, MAX_DECALS)?;
+        let sounds_count = d.count(&header.field("sound_count"), 7, MAX_SOUNDS)?;
+        let sprites_count = d.count(&header.field("sprite_count"), 8, MAX_SPRITES)?;
+        let insets_count = d.count(&header.field("inset_count"), 9, MAX_INSETS)?;
+        let inset_draws_count = d.count(&header.field("inset_draw_count"), 10, MAX_DRAWS)?;
+        let preferences_lanes = d.count(&header.field("preference_count"), 11, 256)?;
+        let fields_count = d.count(&header.field("field_count"), 130, MAX_FIELD_PATCHES)?;
+        let fields_lanes = d.count(&header.field("field_lanes"), 131, 16805888)?;
+        let ui_count = d.count(&header.field("ui_count"), 132, MAX_UI_NODES)?;
+        let ui_lanes = d.count(&header.field("ui_lanes"), 133, 4292608)?;
+        let services_count = d.count(&header.field("service_count"), 134, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = d.count(&header.field("service_lanes"), 135, 4196352)?;
+        let buses_count = d.count(&header.field("bus_count"), 136, MAX_BUSES)?;
+        let voices_count = d.count(&header.field("voice_count"), 137, MAX_VOICES)?;
+        let poses_count = d.count(&header.field("pose_count"), 138, MAX_POSES)?;
+        let emitters_count = d.count(&header.field("emitter_count"), 139, MAX_EMITTERS)?;
+        let lights_count = d.count(&header.field("light_count"), 141, MAX_LIGHTS)?;
+        let listener_count = d.count(&header.field("listener_count"), 142, 1)?;
+        let panners_count = d.count(&header.field("panner_count"), 143, MAX_PANNERS)?;
+        let state_start = PACKET_HEADER_FLOATS;
+        let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
+        let draws_start = state_end;
+        let draws_end = d.end(&Location::section("draws"), draws_start, draws_count, DRAW_FLOATS)?;
+        let solids_start = draws_end;
+        let solids_end = d.end(&Location::section("solids"), solids_start, solids_lanes, 1)?;
+        let decals_start = solids_end;
+        let decals_end = d.end(&Location::section("decals"), decals_start, decals_count, DECAL_FLOATS)?;
+        let sounds_start = decals_end;
+        let sounds_end = d.end(&Location::section("sounds"), sounds_start, sounds_count, SOUND_FLOATS)?;
+        let sprites_start = sounds_end;
+        let sprites_end = d.end(&Location::section("sprites"), sprites_start, sprites_count, SPRITE_FLOATS)?;
+        let insets_start = sprites_end;
+        let insets_end = d.end(&Location::section("insets"), insets_start, insets_count, INSET_FLOATS)?;
+        let inset_draws_start = insets_end;
+        let inset_draws_end = d.end(&Location::section("inset_draws"), inset_draws_start, inset_draws_count, DRAW_FLOATS)?;
+        let mut inset_draws_cursor = inset_draws_start;
+        let preferences_start = inset_draws_end;
+        let preferences_end = d.end(&Location::section("preferences"), preferences_start, preferences_lanes, 1)?;
+        let fields_start = preferences_end;
+        let fields_end = d.end(&Location::section("fields"), fields_start, fields_lanes, 1)?;
+        let ui_start = fields_end;
+        let ui_end = d.end(&Location::section("ui"), ui_start, ui_lanes, 1)?;
+        let services_start = ui_end;
+        let services_end = d.end(&Location::section("services"), services_start, services_lanes, 1)?;
+        let buses_start = services_end;
+        let buses_end = d.end(&Location::section("buses"), buses_start, buses_count, BUS_FLOATS)?;
+        let voices_start = buses_end;
+        let voices_end = d.end(&Location::section("voices"), voices_start, voices_count, VOICE_FLOATS)?;
+        let poses_start = voices_end;
+        let poses_end = d.end(&Location::section("poses"), poses_start, poses_count, POSE_FLOATS)?;
+        let emitters_start = poses_end;
+        let emitters_end = d.end(&Location::section("emitters"), emitters_start, emitters_count, EMITTER_FLOATS)?;
+        let lights_start = emitters_end;
+        let lights_end = d.end(&Location::section("lights"), lights_start, lights_count, LIGHT_FLOATS)?;
+        let listener_start = lights_end;
+        let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
+        let panners_start = listener_end;
+        let panners_end = d.end(&Location::section("panners"), panners_start, panners_count, PANNER_FLOATS)?;
+        let extras_start = panners_end;
+        let mut end = extras_start;
+        for item in 0..draws_count {
+            let count = d.count(&Location::section("draws").index(item).field("extra"), draws_start + item * DRAW_FLOATS + 23, MAX_DRAW_EXTRA)?;
+            end = d.end(&Location::section("extras"), end, count, 4)?;
+        }
+        for item in 0..inset_draws_count {
+            let count = d.count(&Location::section("inset_draws").index(item).field("extra"), inset_draws_start + item * DRAW_FLOATS + 23, MAX_DRAW_EXTRA)?;
+            end = d.end(&Location::section("extras"), end, count, 4)?;
+        }
+        Ok(end)
+    }
+    fn inspect_extensions(d: &Inspector<'_>, mut at: usize) -> Check {
+        let start = at;
+        let path = &Location::section("extensions");
+        let mut provenance_seen = false;
+        if at < d.packet.len() {
+            d.equal(&path.field("marker"), at, EXTENSIONS_MARKER)?;
+            let count = d.count(&path.field("count"), at + 1, MAX_EXTENSIONS)?;
+            at += 2;
+            for item in 0..count {
+                let path = &path.index(item);
+                let tag = d.count(&path.field("tag"), at, MAX_EXTENSION_TAG)?;
+                let length = d.count(&path.field("length"), at + 1, if tag == PROVENANCE_TAG { MAX_PROVENANCE_LANES } else { MAX_EXTENSION_LANES })?;
+                d.values(&path.field("values"), at + 2, length, &[])?;
+                if tag == PROVENANCE_TAG {
+                    if provenance_seen || crate::diagnostic::read_provenance(&d.packet[at + 2..at + 2 + length], start).is_err() {
+                        return Err(path.field("provenance").error(at + 2, "one bounded version-1 provenance JSON object", Actual::Length(length)));
+                    }
+                    provenance_seen = true;
+                }
+                at = d.end(path, at + 2, length, 1)?;
+            }
+        }
+        d.exhausted(path, at, d.packet.len())
+    }
+
     /// The walk of an input packet's values that pen's tests compare with the game's
     /// (`pen/protocol_canonical.blot`): elapsed, the viewport's width and height, the events'
     /// count, each event's tag and then its fields in the schema's order (a key as its code),
@@ -2531,6 +3116,7 @@ pub mod codec {
                 GameEvent::Pinch { x, y, scale } => out.extend([25.0, *x, *y, *scale]),
                 GameEvent::Player { index } => out.extend([26.0, *index as f32]),
                 GameEvent::SessionStarted { restored } => out.extend([27.0, *restored as f32]),
+                GameEvent::RendererReady => out.push(28.0),
                 GameEvent::Game { event, a, b, c } => out.extend([100.0, *event as f32, *a, *b, *c]),
             }
         }
@@ -2569,7 +3155,8 @@ pub mod codec {
         out.extend_from_slice(&frame.shadow.projection);
         out.extend([
             frame.shadow.texel, frame.shadow.texels as f32, frame.blur, frame.clouds.cover, frame.clouds.drift.x,
-            frame.clouds.drift.z, f32::from(frame.hide_cursor), state.len() as f32,
+            frame.clouds.drift.z, f32::from(frame.hide_cursor), f32::from(frame.loading),
+            f32::from(frame.show_captions), state.len() as f32,
         ]);
         out.extend_from_slice(state);
         out.push(frame.draws.len() as f32);
@@ -2712,7 +3299,7 @@ pub mod codec {
         for draw in &inset.draws {
             canonical_draw(out, draw);
         }
-        out.push(inset.pixel_size);
+        out.extend([inset.pixel_size, inset.after_sprites as f32]);
     }
 
     fn canonical_field_patch(out: &mut Vec<f32>, field_patch: &FieldPatch) {

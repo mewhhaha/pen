@@ -1,13 +1,12 @@
-//! The page's frame loop. Each animation frame runs the dev tools, carries
+//! The page's frame loop. Each iteration runs the dev tools, carries
 //! out what was asked of time (pauses, steps, rewinds and replays, through
 //! pen-runtime's timeline and transport, as native pen does), runs the
-//! game's frame, recorded or live, and draws. Saves and the development
-//! endpoints keep off the frame's path.
+//! game's frame, recorded or live, then draws in the next repaint callback.
+//! Saves and development endpoints keep off the frame's path.
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use anyhow::Result;
-use js_sys::Promise;
 use pen_protocol::{Catalog, Frame, GameEvent, RenderFrame, Viewport};
 use pen_runtime::clock::Clock;
 use pen_runtime::devtools::{self, FrameReport, Log, TimelineStatus, log_source};
@@ -15,14 +14,13 @@ use pen_runtime::game::{FrameTimings, GameRuntime, Host, InvalidFrame, Quiet, Re
 use pen_runtime::input::Hotkey;
 use pen_runtime::program::Unresponsive;
 use pen_runtime::recording;
-use pen_runtime::saved::SavedTypes;
 use pen_runtime::services::{Answer, Services};
 use pen_runtime::snapshot::{self, SavedState};
+use pen_runtime::state::StateAdapter;
 use pen_runtime::text::text_box;
 use pen_runtime::timeline::{self, KEEP_SECONDS, Load, REPLAY_SECONDS, Recorded, Recording, Timeline};
 use pen_runtime::transport::{Replaying, Rewind, Transport};
-use pen_runtime::tunables::tuned_values;
-use wasm_bindgen::{JsCast, prelude::*};
+use std::sync::Arc;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::HtmlCanvasElement;
 use web_time::Instant;
@@ -36,7 +34,7 @@ use crate::preferences::Preferences;
 use crate::program::{BrowserBackend, error};
 use crate::replay::{self, Recorder};
 use crate::saves;
-use crate::screen::Screen;
+use crate::screen::{FRAMES_IN_FLIGHT, Screen};
 use crate::tools::Tools;
 
 pub type Runtime = GameRuntime<BrowserBackend>;
@@ -57,19 +55,6 @@ pub fn say(log: &mut Log, source: u32, error: bool, text: impl Into<String>) {
     log.push(source, error, text);
 }
 
-/// The page's next animation frame: its time, in seconds.
-async fn next_frame() -> Result<f64> {
-    let promise = Promise::new(&mut |resolve, reject| {
-        let callback = Closure::once_into_js(move |time: f64| {
-            let _ = resolve.call1(&JsValue::NULL, &time.into());
-        });
-        if let Err(error) = web_sys::window().unwrap().request_animation_frame(callback.unchecked_ref()) {
-            let _ = reject.call1(&JsValue::NULL, &error);
-        }
-    });
-    Ok(JsFuture::from(promise).await.map_err(error)?.as_f64().unwrap_or_default() / 1000.0)
-}
-
 fn ms(since: Instant) -> f64 {
     since.elapsed().as_secs_f64() * 1000.0
 }
@@ -81,7 +66,7 @@ pub struct Shell<'a> {
     preferences: &'a mut Preferences,
     services: &'a mut Services,
     log: &'a mut Log,
-    saved_types: Option<&'a SavedTypes>,
+    state_adapter: &'a Arc<dyn StateAdapter>,
 }
 
 impl Host for Shell<'_> {
@@ -116,8 +101,8 @@ impl Host for Shell<'_> {
         self.services.forget();
     }
 
-    fn saved_types(&self) -> Option<SavedTypes> {
-        self.saved_types.cloned()
+    fn state_adapter(&self) -> Arc<dyn StateAdapter> {
+        self.state_adapter.clone()
     }
 }
 
@@ -131,7 +116,7 @@ macro_rules! shell {
             preferences: &mut $browser.preferences,
             services: &mut $browser.services,
             log: &mut $browser.log,
-            saved_types: $browser.saved_types.as_ref(),
+            state_adapter: &$browser.state_adapter,
         }
     };
 }
@@ -144,8 +129,8 @@ macro_rules! shell {
 /// delta); assets' and services' are left out.
 pub struct Hooks {
     canvas: HtmlCanvasElement,
-    /// The frame drawn last, written once the GPU has finished it.
-    drawn: Option<[String; 5]>,
+    /// Submitted frames, written once their GPU queue slot is released.
+    drawn: std::collections::VecDeque<[String; 5]>,
     written: [String; 5],
     events: std::collections::VecDeque<[f32; 5]>,
 }
@@ -157,7 +142,7 @@ impl Hooks {
     const NAMES: [&str; 5] = ["data-frame", "data-quality", "data-pending", "aria-busy", "data-packet"];
 
     pub fn new(canvas: HtmlCanvasElement) -> Hooks {
-        Hooks { canvas, drawn: None, written: Default::default(), events: Default::default() }
+        Hooks { canvas, drawn: Default::default(), written: Default::default(), events: Default::default() }
     }
 
     /// A frame ran with `input`, an encoded frame.
@@ -181,9 +166,13 @@ impl Hooks {
         self.canvas.set_attribute("data-events", &json).map_err(error)
     }
 
-    /// `drawn` was just submitted, so the frame before it is finished.
+    /// `drawn` was just submitted; the frame that freed its queue slot finished.
     fn drawn(&mut self, drawn: [String; 5]) -> Result<()> {
-        let Some(finished) = self.drawn.replace(drawn) else { return Ok(()) };
+        self.drawn.push_back(drawn);
+        if self.drawn.len() <= FRAMES_IN_FLIGHT {
+            return Ok(());
+        }
+        let finished = self.drawn.pop_front().unwrap();
         for ((name, value), written) in Hooks::NAMES.iter().zip(finished).zip(&mut self.written) {
             if value != *written {
                 self.canvas.set_attribute(name, &value).map_err(error)?;
@@ -227,9 +216,9 @@ pub struct Options {
     pub development: bool,
     /// Write the hooks the browser harnesses read (`Hooks`).
     pub qualify: bool,
-    /// The saved types the game declares (`assets/saved.json`), which
-    /// migrate what its own code cannot.
-    pub saved_types: Option<SavedTypes>,
+    /// The explicit state adapter selected by `assets/saved.json`.
+    pub state_adapter: Arc<dyn StateAdapter>,
+    pub assets: String,
     /// The captions the game's sounds carry (the assets' captions.json).
     pub captions: pen_runtime::captions::Captions,
     /// The game's name, which the files it hands the player are named after.
@@ -274,10 +263,15 @@ pub struct Browser {
     /// The page's status line still says something (it clears once the
     /// game shows).
     status: bool,
+    /// Keep a rejected frame's explanation visible until a valid frame replaces it.
+    rejected: bool,
+    /// Consecutive complete frames; readiness is published after one leaves the GPU queue.
+    ready_frames: usize,
     cursor_hidden: bool,
     /// The last animation frame's time.
     previous: Option<f64>,
-    saved_types: Option<SavedTypes>,
+    state_adapter: Arc<dyn StateAdapter>,
+    assets: String,
     /// Files the player hands the page (saves, recordings), and the word on
     /// files handed over.
     files: Files,
@@ -339,9 +333,12 @@ impl Browser {
             hooks,
             autosave: Autosave::default(),
             status: true,
+            rejected: false,
+            ready_frames: 0,
             cursor_hidden: false,
             previous: None,
-            saved_types: options.saved_types,
+            state_adapter: options.state_adapter,
+            assets: options.assets,
             files: Files::install(),
             name: options.name,
             importing: None,
@@ -352,42 +349,44 @@ impl Browser {
 
     /// Runs the game until it asks to exit.
     pub async fn run(mut self) -> Result<()> {
+        let mut timestamp = web_sys::window().unwrap().performance().unwrap().now() / 1000.0;
         loop {
-            let timestamp = next_frame().await?;
-            if !self.frame(timestamp).await? {
+            let (running, presented) = self.frame(timestamp).await?;
+            timestamp = presented;
+            if !running {
                 break;
             }
         }
         self.finish().await
     }
 
-    /// One animation frame; whether to go on.
-    async fn frame(&mut self, timestamp: f64) -> Result<bool> {
+    /// Compute a frame, then draw at repaint; whether to go on and when it drew.
+    async fn frame(&mut self, timestamp: f64) -> Result<(bool, f64)> {
         let interval = self.previous.replace(timestamp).map_or(0.0, |previous| (timestamp - previous) * 1000.0);
         self.screen.fit();
         self.read_mail();
         self.input.borrow_mut().poll_gamepads();
         let hotkeys = self.take_input();
         self.run_tools(timestamp, interval).await;
+        self.qualification_request().await?;
         let started = Instant::now();
         for hotkey in hotkeys {
             self.hotkey(hotkey);
         }
         self.take_answers();
         let ran = self.step().await?;
-        let submitting = Instant::now();
         let overlay = self.tools.as_ref().and_then(|tools| tools.frame.as_ref());
         self.preferences.apply(&mut self.screen.renderer);
-        self.screen.draw(&self.shown, overlay, &self.catalog).await?;
+        let (presented, draw_timings) = self.screen.draw(&self.shown, overlay, &self.catalog).await?;
         // The dev tools' assets are their own; the game never hears of them.
         let _ = self.screen.overlay.take_events();
         if ran.is_some() {
-            self.timings = self.game.last_timings().map(|timings| timings.completed(ms(submitting), ms(started)));
+            self.timings = self.game.last_timings().map(|timings| timings.completed(draw_timings, ms(started)));
         }
         self.present()?;
         crate::preferences::keep_bindings(&self.actions);
-        self.autosave(timestamp).await;
-        Ok(ran != Some(true))
+        self.autosave(presented).await;
+        Ok((ran != Some(true), presented))
     }
 
     /// The input since the last frame: the game's events, which the dev
@@ -416,6 +415,40 @@ impl Browser {
             tools.frame(self, timestamp, interval).await;
             self.tools = Some(tools);
         }
+    }
+
+    /// Headless harnesses exercise the real devtools host without a second
+    /// guest/UI fixture. No command input is read outside qualification mode.
+    async fn qualification_request(&mut self) -> Result<()> {
+        let Some(hooks) = &self.hooks else { return Ok(()) };
+        let canvas = hooks.canvas.clone();
+        let Some(text) = canvas.get_attribute("data-devtools-request") else { return Ok(()) };
+        canvas.remove_attribute("data-devtools-request").map_err(error)?;
+        let json: serde_json::Value = serde_json::from_str(&text)?;
+        let operation = json
+            .get("operation")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("qualification request needs an operation"))?;
+        let number =
+            |key| json.get(key).and_then(|value| serde_json::from_value::<f32>(value.clone()).ok()).unwrap_or(0.0);
+        let values =
+            json.get("text").map_or_else(Vec::new, |value| pen_runtime::services::code_points(&value.to_string()));
+        let request = pen_protocol::ServiceRequest {
+            request: 1,
+            service: pen_protocol::service::DEVTOOLS,
+            operation,
+            a: number("a"),
+            b: number("b"),
+            c: number("c"),
+            d: number("d"),
+            value_count: u32::try_from(values.len()).map_err(anyhow::Error::from)?,
+            values,
+        };
+        let answer = devtools::Devtools::default().answer(&request, self, 0.0).await;
+        let reply = serde_json::json!({"status":answer.status,"value":answer.value,"text":pen_runtime::services::text(&answer.values),"values":answer.values});
+        canvas.set_attribute("data-devtools-answer", &reply.to_string()).map_err(error)?;
+        Ok(())
     }
 
     /// What the development endpoints said, into the log.
@@ -597,11 +630,19 @@ impl Browser {
         if let Some(recorder) = &mut self.recorder {
             recorder.frame(&recorded);
         }
+        let exit = rendered.exit_requested;
+        let replacement = self.game.take_drawn();
+        let replaced = replacement.is_some();
+        let shown = replacement.unwrap_or(rendered);
+        self.timeline.observe(&shown, replaced);
         self.timeline.ran(recorded);
         self.autosave.changed = true;
-        let exit = rendered.exit_requested;
-        let shown = self.game.take_drawn().unwrap_or(rendered);
         self.show(shown);
+        if let Some(position) = self.timeline.observations.take_break() {
+            let was_playing = self.transport.breakpoint();
+            self.stopped(was_playing);
+            say(&mut self.log, log_source::SESSION, false, format!("semantic watch: paused at position {position}"));
+        }
         if self.transport.replaying().is_some() && self.timeline.next().is_none() {
             self.replay_ended();
         }
@@ -627,12 +668,20 @@ impl Browser {
         let said = format!(
             "dev: frame {position} rejected: {error:#}\ngame paused; fix the source to reload, or use Play to retry"
         );
+        self.rejected = true;
+        self.status = false;
+        if let Some(status) = web_sys::window().unwrap().document().unwrap().get_element_by_id("status") {
+            status.set_text_content(Some(&said));
+        }
         say(&mut self.log, log_source::GAME, true, said);
         Ok(())
     }
 
     /// A new frame shows; the one it replaces is decoded into next.
     fn show(&mut self, frame: RenderFrame) {
+        if std::mem::take(&mut self.rejected) {
+            self.status = true;
+        }
         let shown = std::mem::replace(&mut self.shown, frame);
         self.game.recycle(shown);
     }
@@ -671,10 +720,17 @@ impl Browser {
         };
         match loaded {
             Ok(()) => {
+                self.status = true;
                 say(&mut self.log, log_source::SESSION, false, format!("loaded {name}"));
                 Some(if scene { Load::Scene(saved) } else { Load::Save(saved) })
             }
             Err(error) => {
+                if error.downcast_ref::<pen_protocol::diagnostic::FrameDiagnostic>().is_some() {
+                    self.status = false;
+                    if let Some(status) = web_sys::window().unwrap().document().unwrap().get_element_by_id("status") {
+                        status.set_text_content(Some(&format!("could not load {name}: {error:#}")));
+                    }
+                }
                 say(&mut self.log, log_source::SESSION, true, format!("{error:#}"));
                 None
             }
@@ -899,6 +955,7 @@ impl Browser {
 
     /// A new build from `pen web`, taken while the game is idle.
     async fn reload(&mut self, update: Update) {
+        self.state_adapter = crate::load_state_adapter(&self.assets).await;
         let catalog = update.catalog.unwrap_or_else(|| self.catalog.clone());
         if let Some(module) = update.game {
             let result = {
@@ -906,6 +963,7 @@ impl Browser {
                 self.game.reload(&mut shell, module, catalog.clone()).await
             };
             if result == ReloadResult::Activated {
+                self.status = true;
                 self.catalog = catalog;
                 self.timeline.rebuilt();
                 self.autosave.changed = true;
@@ -949,7 +1007,7 @@ impl Browser {
         // input method would take.
         self.input.borrow_mut().text_field(text_box(&self.shown.ui));
         let captions = pen_runtime::captions::lock(&self.captions);
-        let showing = (!captions.captions.is_empty()).then(|| captions.text());
+        let showing = captions.visible(self.shown.show_captions);
         drop(captions);
         self.accessibility.captions(showing.as_deref())?;
         let hidden = self.shown.hide_cursor && !self.tools.as_ref().is_some_and(Tools::wants_pointer);
@@ -957,6 +1015,14 @@ impl Browser {
             self.cursor_hidden = hidden;
             let cursor = if hidden { "none" } else { "auto" };
             self.screen.canvas.element.style().set_property("cursor", cursor).map_err(error)?;
+        }
+        // This one-shot production signal lets a page cover startup without
+        // enabling qualification's packet hashing and event instrumentation.
+        if self.ready_frames <= FRAMES_IN_FLIGHT {
+            self.ready_frames = if self.screen.busy() { 0 } else { self.ready_frames + 1 };
+            if self.ready_frames > FRAMES_IN_FLIGHT {
+                self.screen.canvas.element.set_attribute("data-ready", "true").map_err(error)?;
+            }
         }
         if let Some(hooks) = &mut self.hooks {
             let quality = self.shown.quality;
@@ -1011,6 +1077,14 @@ impl Browser {
 }
 
 impl devtools::Host for Browser {
+    fn state_adapter(&self) -> Arc<dyn StateAdapter> {
+        self.state_adapter.clone()
+    }
+
+    fn observations(&mut self) -> Option<&mut pen_runtime::semantic::Observations> {
+        Some(&mut self.timeline.observations)
+    }
+
     fn timeline(&self) -> TimelineStatus {
         let frame = self.timeline.position();
         TimelineStatus {
@@ -1156,8 +1230,8 @@ impl devtools::Host for Browser {
         }
     }
 
-    async fn snapshot(&mut self) -> Option<SavedState> {
-        match self.game.snapshot().await {
+    async fn snapshot(&mut self) -> Option<Arc<SavedState>> {
+        match self.game.shared_snapshot().await {
             Ok(saved) => Some(saved),
             Err(error) => {
                 say(&mut self.log, log_source::SESSION, true, format!("{error:#}"));
@@ -1173,7 +1247,8 @@ impl devtools::Host for Browser {
             return Answer::unavailable();
         }
         let Some(saved) = devtools::Host::snapshot(self).await else { return Answer::unavailable() };
-        let tuned: Vec<(u32, f32)> = tuned_values(&saved.state).into_iter().collect();
+        let Some(tuned) = self.state_adapter.tuned_values(&saved.state) else { return Answer::unavailable() };
+        let tuned: Vec<(u32, f32)> = tuned.into_iter().collect();
         if tuned.is_empty() {
             say(&mut self.log, log_source::SESSION, false, "bake: nothing to bake; each value is its default");
             return Answer::ok(0.0);

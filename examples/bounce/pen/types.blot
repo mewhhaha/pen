@@ -84,6 +84,7 @@ type Inset is data = #Inset {
   light_color: Vector,
   draws: Array Draw,
   pixel_size: F32,
+  after_sprites: U32,
 }
 
 type Bus is data = #Bus {
@@ -280,6 +281,8 @@ type RenderFrame is data = #RenderFrame {
   blur: F32,
   clouds: Clouds,
   hide_cursor: Bool,
+  loading: Bool,
+  show_captions: Bool,
   state: Array F32,
   draws: Array Draw,
   solids: Array Solid,

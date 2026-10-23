@@ -227,6 +227,7 @@ impl State {
             );
             self.instance_buffer = instance_buffer(&self.device, self.instance_capacity);
             self.instance_data = vec![0.0; self.instance_capacity * 20];
+            self.instance_uploads.invalidate();
         }
         for (draw, placement) in frame.draws.iter().zip(&scratch.placements) {
             let Some(batch) = scratch.batches.get_mut(placement.batch as usize) else { continue };
@@ -298,11 +299,16 @@ impl State {
             }
         }
         if instance_count > 0 {
-            self.queue.write_buffer(
-                &self.instance_buffer,
-                0,
-                bytemuck::cast_slice(&self.instance_data[..instance_count * 20]),
-            );
+            let current = &self.instance_data[..instance_count * 20];
+            for range in self.instance_uploads.changed(current) {
+                self.queue.write_buffer(
+                    &self.instance_buffer,
+                    range.start as u64 * 4,
+                    bytemuck::cast_slice(&current[range.clone()]),
+                );
+                stats.instance_upload_bytes += range.len() as u64 * 4;
+                stats.instance_upload_calls += 1;
+            }
         }
         let item_count = scratch.items.len();
         if item_count > self.capacity {

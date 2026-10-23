@@ -216,8 +216,12 @@ impl State {
     ) -> Result<()> {
         validate_frame(frame)?;
         self.check_names(frame, catalog)?;
+        let (mut field_upload_bytes, mut field_upload_calls, mut field_input_texels) = (0, 0, 0);
         for patch in &frame.fields {
-            self.write_field(catalog.material(patch.material), patch);
+            let (bytes, calls) = self.write_field(catalog.material(patch.material), patch);
+            field_upload_bytes += bytes;
+            field_upload_calls += calls;
+            field_input_texels += patch.values.len() as u64;
         }
 
         // What the loader brought, and resources the GPU is done with.
@@ -225,6 +229,10 @@ impl State {
         let now = self.now();
         self.receive(now);
         self.frames += 1;
+        self.loading_seen = frame.loading;
+        if !frame.loading {
+            self.ready_sent = false;
+        }
         self.waiting = false;
         if self.frames.is_multiple_of(GROUP_LIFETIME) {
             let oldest = self.frames - GROUP_LIFETIME;
@@ -249,7 +257,8 @@ impl State {
         // The render scale, less what holding a frame budget takes off it.
         let timed = self.timer.fresh();
         let scale = frame.quality.scale * self.resolution.factor(timed);
-        let mut stats = RenderStats::default();
+        let mut stats =
+            RenderStats { field_upload_bytes, field_upload_calls, field_input_texels, ..Default::default() };
         // Only depth-writing objects can be regrouped freely. Transparent
         // objects retain their global back-to-front order.
         #[allow(clippy::cast_precision_loss, reason = "pixels")]
@@ -265,7 +274,7 @@ impl State {
         self.prepare_particles(frame, catalog, samples, scratch)?;
         self.sort_passes(frame, scratch, shadowed);
         let ready = &scratch.ready;
-        // Until they are ready, only the veil draws.
+        // Until they are ready, draw the cover and any opted-in startup sprites.
         if covered && !self.built_ins.ready(BuiltIn::all(samples)) {
             self.waiting = true;
             self.last_stats = RenderStats::default();
@@ -273,6 +282,21 @@ impl State {
             let output = self.screen.view(&self.device, &self.queue, &surface, target.size());
             let mut encoder = self.device.create_command_encoder(&Default::default());
             self.cover(&mut encoder, &output, frame, now, target.size(), true);
+            if frame.loading && !scratch.sprites.is_empty() {
+                let layout = self.context.sprite_group.clone();
+                let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&self.device, layout));
+                sprites.draw(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &output,
+                    target.size(),
+                    &scratch.sprites,
+                    &frame.sprites,
+                    &scratch.sprite_order,
+                    None,
+                );
+            }
             self.screen.decode(&mut encoder, &surface);
             self.queue.submit([encoder.finish()]);
             target.present();
@@ -439,26 +463,59 @@ impl State {
             draw_layers(&mut last, &later[1..], &mut stats);
         }
         self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &output, &self.timer);
-        if let Some(composite) = &composite {
-            self.draw_insets(&mut encoder, &output, &drawing, &scratch.insets, ready, composite, &mut stats);
-        }
         if !scratch.sprites.is_empty() {
             let layout = self.context.sprite_group.clone();
             let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&device, layout));
-            let size = (output_width, output_height);
-            sprites.draw(
+            sprites.set_scene(Some(targets.scene.clone()));
+            sprites.prepare(&device, &self.queue, (output_width, output_height), &frame.sprites, &scratch.sprite_order);
+        }
+        // Stable order within each layer; sprites under a modal are drawn
+        // before its backdrop and 3D icons, then the modal's own text follows.
+        scratch.insets.sort_by_key(|&(index, _)| frame.insets[index].after_sprites);
+        let mut cursor = 0;
+        for layer in 0..scratch.insets.len() {
+            let index = scratch.insets[layer].0;
+            let boundary = frame.insets[index].after_sprites;
+            let end = scratch.sprite_order.partition_point(|&index| index < boundary);
+            if end > cursor {
+                self.sprites.as_mut().unwrap().draw_prepared(
+                    &device,
+                    &mut encoder,
+                    &output,
+                    &scratch.sprites,
+                    cursor as u32..end as u32,
+                    self.timer.pass(Span::Overlay),
+                );
+                cursor = end;
+            }
+            if let Some(composite) = &composite {
+                self.draw_insets(
+                    &mut encoder,
+                    &output,
+                    &drawing,
+                    &scratch.insets[layer..layer + 1],
+                    ready,
+                    composite,
+                    &mut stats,
+                );
+            }
+        }
+        if frame.loading {
+            self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
+        }
+        if cursor < scratch.sprite_order.len() {
+            self.sprites.as_mut().unwrap().draw_prepared(
                 &device,
-                &self.queue,
                 &mut encoder,
                 &output,
-                size,
                 &scratch.sprites,
-                &frame.sprites,
-                &scratch.sprite_order,
+                cursor as u32..scratch.sprite_order.len() as u32,
                 self.timer.pass(Span::Overlay),
             );
         }
-        self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
+        if !frame.loading {
+            self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
+        }
         if filtered.is_some() {
             self.filter.finish(&mut encoder, &screen);
         }

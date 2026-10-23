@@ -171,6 +171,16 @@ impl State {
     pub fn text(&self) -> String {
         self.track.active(self.now()).join("\n")
     }
+
+    /// Host presentation follows the game's saved accessibility choice.
+    /// Empty or disabled captions have no visible box or live region.
+    pub fn visible(&self, enabled: bool) -> Option<String> {
+        if !enabled {
+            return None;
+        }
+        let text = self.text();
+        (!text.is_empty()).then_some(text)
+    }
 }
 
 pub type Shared = Arc<Mutex<State>>;
@@ -267,6 +277,18 @@ mod tests {
         track.frame(&frame(vec![], vec![]), &catalog, &captions, 7.0);
         track.frame(&frame(vec![], vec![voice(7, 1)]), &catalog, &captions, 8.0);
         assert_eq!(track.active(8.0), ["Wind blows"]);
+    }
+
+    /// Host presentation is off until the game opts in.
+    #[test]
+    fn host_captions_require_opt_in_and_nonempty_text() {
+        let mut state = State { captions: Captions::parse(JSON).unwrap(), ..State::default() };
+        assert_eq!(state.visible(true), None);
+        let frame = RenderFrame { sounds: vec![Sound { clip: 0, ..Sound::default() }], ..RenderFrame::default() };
+        state.frame(&frame, &catalog());
+        assert_eq!(state.visible(false), None);
+        assert_eq!(state.visible(true).as_deref(), Some("A till rings"));
+        assert_eq!(state.visible(false), None);
     }
 
     /// The service answers a clip's caption and those showing.

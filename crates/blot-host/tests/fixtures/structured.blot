@@ -1,0 +1,51 @@
+const many = fn (value: U32) => @array.generate 100 (fn (i: U32) => @u32.add i value)
+const twice = fn value => @u32.add value value
+entry const collected = fn (value: U32) => @task.scope (fn group => do:
+  let a = *(twice value)
+  let b = *(twice 21)
+  let (left, right) = |(a, b)|
+  return @u32.add left right)
+entry const nested = fn (value: U32) => @task.scope (fn group => do:
+  let child = @task.spawn group (fn () => @task.scope (fn inner => do:
+    let a = @task.spawn inner (fn () => @u32.add value 1)
+    return |a|))
+  return |child|)
+entry const cancelled = fn (value: U32) => @task.scope (fn group => do:
+  let child = @task.spawn group (fn () -> U32 => @u32.div value 0)
+  @task.cancel child
+  return value)
+entry const unjoined = fn (value: U32) => @task.scope (fn group => do:
+  let child = @task.spawn group (fn () => many value)
+  return value)
+entry const captured = fn (values: Array U32) => @task.scope (fn group => do:
+  let child = @task.spawn group (fn () => values)
+  return |child|)
+entry const failing = fn (value: U32) => @task.scope (fn group => do:
+  let a = @task.spawn group (fn () => @u32.div value 0)
+  let b = @task.spawn group (fn () => many value)
+  let (a, b) = |(a, b)|
+  return a)
+entry const partitioned = fn (owner: unique (Array U32)) => do:
+  let (owner, result) = @task.split owner ((0, 2), (2, 4)) (fn views => do:
+    let (left, right) = views
+    return @task.scope (fn group => do:
+      let a = @task.spawn group (fn () => do:
+        @task.write left 0 (@u32.add (@task.read left 0) 1)
+        return @task.read left 0)
+      let b = @task.spawn group (fn () => do:
+        @task.write right 0 (@u32.add (@task.read right 0) 2)
+        return @task.read right 0)
+      let (a, b) = |(a, b)|
+      return @u32.add a b))
+  return result
+const allocate = fn (count: U32) -> Array U32 => @array.generate count (fn (i: U32) => @u32.add i 1)
+entry const large_result = fn (count: U32) => @task.scope (fn group => do:
+  let child = @task.spawn group (fn () => allocate count)
+  return |child|)
+entry const repeated = fn (count: U32) => @task.scope (fn group => do:
+  let sum = 0
+  for index in 0 .. count:
+    let child = @task.spawn group (fn () => @u32.add index 1)
+    let value = |child|
+    sum := @u32.add self value
+  return sum)

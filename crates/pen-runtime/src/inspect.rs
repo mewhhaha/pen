@@ -17,7 +17,7 @@ pub const KEPT_FRAMES: usize = 120;
 /// The most lanes of a section one state answer carries.
 pub const STATE_LANES: usize = 256;
 
-const STATE_MAGIC: f32 = 5678.0;
+use crate::state::Section;
 /// Lanes before an input packet's events: elapsed time, viewport width and
 /// height, the event count and the state's length.
 const INPUT_HEADER: usize = 5;
@@ -200,47 +200,10 @@ impl Packets {
     }
 }
 
-/// A section of a saved state (Ink's persist.blot framing: `magic, schema,
-/// count`, then each section's `key, version, width, length` and lanes).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Section<'a> {
-    pub key: u32,
-    pub version: u32,
-    pub width: u32,
-    pub lanes: &'a [f32],
-}
-
-/// The sections of a saved state, as far as they are whole.
-pub fn sections(state: &[f32]) -> Vec<Section<'_>> {
-    let mut found = Vec::new();
-    if state.len() < 3 || state[0] != STATE_MAGIC {
-        return found;
-    }
-    let Some(count) = whole(state[2]) else { return found };
-    let mut offset = 3;
-    for _ in 0..count {
-        let Some(&[key, version, width, length]) =
-            state.get(offset..offset + 4).and_then(|header| <&[f32; 4]>::try_from(header).ok())
-        else {
-            break;
-        };
-        let start = offset + 4;
-        let (Some(key), Some(version), Some(width), Some(length)) =
-            (whole(key), whole(version), whole(width), whole(length))
-        else {
-            break;
-        };
-        let Some(lanes) = start.checked_add(length as usize).and_then(|end| state.get(start..end)) else { break };
-        found.push(Section { key, version, width, lanes });
-        offset = start + lanes.len();
-    }
-    found
-}
-
 /// The answer listing a state's sections: each its key, version, width and
 /// length; the value is the state's schema.
-pub fn sections_answer(schema: u32, state: &[f32]) -> Answer {
-    let values = sections(state)
+pub fn sections_answer(schema: u32, sections: &[Section<'_>]) -> Answer {
+    let values = sections
         .iter()
         .flat_map(|section| {
             [section.key as f32, section.version as f32, section.width as f32, section.lanes.len() as f32]
@@ -252,8 +215,8 @@ pub fn sections_answer(schema: u32, state: &[f32]) -> Answer {
 /// The answer with section `key`'s lanes from `from` on, as many as one
 /// carries; the value is its length. Unavailable for a section the state
 /// lacks.
-pub fn lanes_answer(state: &[f32], key: u32, from: usize) -> Answer {
-    match sections(state).into_iter().find(|section| section.key == key) {
+pub fn lanes_answer(sections: &[Section<'_>], key: u32, from: usize) -> Answer {
+    match sections.iter().find(|section| section.key == key) {
         Some(section) => {
             let values = section.lanes.iter().skip(from).take(STATE_LANES).copied().collect();
             Answer { values, ..Answer::ok(section.lanes.len() as f32) }
@@ -270,9 +233,8 @@ fn lanes_of<'a>(sections: &[Section<'a>], key: u32) -> &'a [f32] {
 /// How state `now` differs from state `then`: for each section of either,
 /// in `now`'s order and then `then`'s, its key, its length then and now,
 /// how many lanes differ and the first that does (-1 for none).
-pub fn state_diff(then: &[f32], now: &[f32]) -> Vec<f32> {
-    let (then, now) = (sections(then), sections(now));
-    let keys = now.iter().chain(&then).map(|section| section.key);
+pub fn state_diff(then: &[Section<'_>], now: &[Section<'_>]) -> Vec<f32> {
+    let keys = now.iter().chain(then).map(|section| section.key);
     let mut seen = Vec::new();
     let mut values = Vec::new();
     for key in keys {
@@ -280,7 +242,7 @@ pub fn state_diff(then: &[f32], now: &[f32]) -> Vec<f32> {
             continue;
         }
         seen.push(key);
-        let (before, after) = (lanes_of(&then, key), lanes_of(&now, key));
+        let (before, after) = (lanes_of(then, key), lanes_of(now, key));
         // Bit for bit: NaN is not in a state, and -0 differs from 0 there.
         let differs = |at: usize| before.get(at).map(|lane| lane.to_bits()) != after.get(at).map(|lane| lane.to_bits());
         let longest = before.len().max(after.len());
@@ -292,8 +254,8 @@ pub fn state_diff(then: &[f32], now: &[f32]) -> Vec<f32> {
 }
 
 /// The lane `lane` of section `key`, if the state has it.
-pub fn lane(state: &[f32], key: u32, lane: u32) -> Option<f32> {
-    lanes_of(&sections(state), key).get(lane as usize).copied()
+pub fn lane(sections: &[Section<'_>], key: u32, lane: u32) -> Option<f32> {
+    lanes_of(sections, key).get(lane as usize).copied()
 }
 
 /// A watch on a lane of the game's state: it pauses the game once the lane
@@ -334,8 +296,8 @@ impl Watch {
 
     /// Looks at the state after the frame before `position`: whether the
     /// game should pause there, the watch having just come to hold.
-    pub fn look(&mut self, state: &[f32], position: u64) -> bool {
-        let Some(now) = lane(state, self.key, self.lane) else {
+    pub fn look(&mut self, now: Option<f32>, position: u64) -> bool {
+        let Some(now) = now else {
             self.now = None;
             self.held = false;
             return false;
@@ -490,28 +452,16 @@ mod tests {
     use super::*;
     use pen_protocol::Draw;
 
-    /// A state of sections given as (key, lanes), version 1, width 0.
-    fn state(sections: &[(u32, &[f32])]) -> Vec<f32> {
-        let mut state = vec![STATE_MAGIC, 3.0, sections.len() as f32];
-        for (key, lanes) in sections {
-            state.extend([*key as f32, 1.0, 0.0, lanes.len() as f32]);
-            state.extend_from_slice(lanes);
-        }
-        state
+    fn state<'a>(sections: &[(u32, &'a [f32])]) -> Vec<Section<'a>> {
+        sections.iter().map(|(key, lanes)| Section { key: *key, version: 1, width: 0, lanes }).collect()
     }
 
     #[test]
-    fn reads_a_states_sections_and_their_lanes() {
+    fn reads_sections_supplied_by_an_adapter() {
         let saved = state(&[(0, &[1.0, 1.0]), (11, &[4.0, 2.0, 9.0, 0.5])]);
-        let found = sections(&saved);
-        assert_eq!(found.len(), 2);
-        assert_eq!((found[1].key, found[1].lanes), (11, &[4.0, 2.0, 9.0, 0.5][..]));
         assert_eq!(sections_answer(3, &saved).values, [0.0, 1.0, 0.0, 2.0, 11.0, 1.0, 0.0, 4.0]);
         assert_eq!(lanes_answer(&saved, 11, 1), Answer { values: vec![2.0, 9.0, 0.5], ..Answer::ok(4.0) });
         assert_eq!(lanes_answer(&saved, 7, 0), Answer::unavailable());
-        // A section cut short, or another magic, reads as far as it is whole.
-        assert_eq!(sections(&saved[..saved.len() - 1]).len(), 1);
-        assert!(sections(&[5679.0, 3.0, 0.0]).is_empty());
     }
 
     #[test]
@@ -531,19 +481,18 @@ mod tests {
 
     #[test]
     fn a_watch_pauses_once_as_its_lane_comes_to_hold() {
-        let at = |value: f32| state(&[(20, &[0.0, value])]);
         let mut watch = Watch::new(20, 1, devtools_compare::ABOVE, 5.0);
-        assert!(!watch.look(&at(1.0), 10));
-        assert!(watch.look(&at(6.0), 11), "it came to hold");
-        assert!(!watch.look(&at(7.0), 12), "it held already");
-        assert!(!watch.look(&at(2.0), 13));
-        assert!(watch.look(&at(9.0), 14), "and again");
+        assert!(!watch.look(Some(1.0), 10));
+        assert!(watch.look(Some(6.0), 11), "it came to hold");
+        assert!(!watch.look(Some(7.0), 12), "it held already");
+        assert!(!watch.look(Some(2.0), 13));
+        assert!(watch.look(Some(9.0), 14), "and again");
         assert_eq!(watch.values(), [20.0, 1.0, 3.0, 5.0, 9.0, 14.0]);
         let mut changes = Watch::new(20, 1, devtools_compare::CHANGES, 0.0);
-        assert!(!changes.look(&at(1.0), 1) && !changes.look(&at(1.0), 2));
-        assert!(changes.look(&at(2.0), 3), "it changed from where it started");
+        assert!(!changes.look(Some(1.0), 1) && !changes.look(Some(1.0), 2));
+        assert!(changes.look(Some(2.0), 3), "it changed from where it started");
         let mut missing = Watch::new(99, 0, devtools_compare::EQUAL, 0.0);
-        assert!(!missing.look(&at(0.0), 1));
+        assert!(!missing.look(None, 1));
         assert_eq!(missing.values()[4], -1.0);
     }
 

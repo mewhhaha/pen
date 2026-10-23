@@ -11,6 +11,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow};
 use pen_protocol::{Catalog, RenderFrame};
 use pen_render::RenderTarget;
+use pen_runtime::game::DrawTimings;
 use winit::window::Window;
 
 use super::Overlay;
@@ -29,6 +30,7 @@ pub struct Gpu {
     pub renderer: pen_render::Renderer,
     pub format: wgpu::TextureFormat,
     pub size: (u32, u32),
+    pub draw_timings: DrawTimings,
     #[cfg(feature = "devtools")]
     pub drawn: Drawn,
     /// The window's swapchain; none when headless.
@@ -164,6 +166,7 @@ impl Gpu {
             wgpu::util::TextureBlitterBuilder::new(&device, format).sample_type(wgpu::FilterMode::Linear).build();
         Ok(Gpu {
             size: pinned.unwrap_or((config.width, config.height)),
+            draw_timings: DrawTimings::default(),
             surface: Some((surface, config)),
             blitter: Some(blitter),
             pinned,
@@ -193,6 +196,7 @@ impl Gpu {
             renderer,
             format,
             size,
+            draw_timings: DrawTimings::default(),
             surface: None,
             blitter: None,
             pinned: Some(size),
@@ -413,12 +417,16 @@ pub(super) struct Output<'a> {
     pub(super) blitter: Option<&'a wgpu::util::TextureBlitter>,
     /// Draws over the swapchain image before it is presented.
     pub(super) overlay: Option<&'a mut Box<dyn Overlay>>,
+    pub(super) timings: &'a mut DrawTimings,
 }
 
 impl Output<'_> {
-    fn acquire(&self) -> Option<wgpu::SurfaceTexture> {
+    fn acquire(&mut self) -> Option<wgpu::SurfaceTexture> {
         let (surface, config) = self.surface?;
-        match surface.get_current_texture() {
+        let started = Instant::now();
+        let acquired = surface.get_current_texture();
+        self.timings.acquire_ms += started.elapsed().as_secs_f64() * 1000.0;
+        match acquired {
             wgpu::CurrentSurfaceTexture::Success(texture) | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
                 Some(texture)
             }
@@ -428,6 +436,12 @@ impl Output<'_> {
             }
             _ => None,
         }
+    }
+
+    fn present(&mut self, texture: wgpu::SurfaceTexture) {
+        let started = Instant::now();
+        self.queue.present(texture);
+        self.timings.present_ms += started.elapsed().as_secs_f64() * 1000.0;
     }
 }
 
@@ -454,7 +468,7 @@ impl RenderTarget for SurfaceTarget<'_> {
             if let Some(overlay) = self.output.overlay.as_deref_mut() {
                 overlay.paint(self.output.device, self.output.queue, &texture.texture);
             }
-            self.output.queue.present(texture);
+            self.output.present(texture);
         }
     }
 }
@@ -490,7 +504,7 @@ impl RenderTarget for CaptureTarget<'_> {
         if let Some(overlay) = self.output.overlay.as_deref_mut() {
             overlay.paint(self.output.device, self.output.queue, &swapchain.texture);
         }
-        self.output.queue.present(swapchain);
+        self.output.present(swapchain);
     }
 }
 
@@ -563,6 +577,7 @@ pub(super) fn settle(gpu: &mut Gpu, frame: &RenderFrame, catalog: &Catalog) -> R
             size: gpu.size,
             blitter: None,
             overlay: None,
+            timings: &mut DrawTimings::default(),
         };
         gpu.renderer.submit(frame, catalog, &mut CaptureTarget { output, texture })?;
         crate::startup::drawn(&gpu.renderer);

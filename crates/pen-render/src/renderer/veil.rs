@@ -1,16 +1,12 @@
-// The loading veil: the frame's sky, from its horizon up, with a short arc
-// of light turning round the middle, over the first frames until what they
-// draw has loaded; then it clears.
+// The procedural loading veil covers the first frames until their assets
+// are ready, then clears smoothly.
 use pen_protocol::RenderFrame;
 
 use super::{State, Veil, overlay_pipeline, uniform_buffer, vector};
 use crate::matrix::narrow;
 use crate::shader::PipelineContext;
 
-// The loading veil: the frame's sky, from its horizon up, with a short arc
-// of light turning round the middle. It is small, so it compiles at once,
-// and lies over the first frames until what they draw has loaded, then
-// clears.
+// Flowing contours and a faceted light, with no assets to load.
 const VEIL_SHADER: &str = include_str!("../shaders/veil.wgsl");
 
 // How long (seconds) the veil waits on loads that bring nothing before it
@@ -59,7 +55,7 @@ impl State {
         let mut data = Vec::with_capacity(12);
         data.extend(vector(&frame.sky.zenith));
         data.extend(vector(&frame.sky.horizon));
-        data.extend([narrow(now - rose), narrow(left), width as f32 / height.max(1) as f32, 0.0]);
+        data.extend([narrow(now - rose), narrow(left), width as f32 / height.max(1) as f32, f32::from(frame.loading)]);
         self.queue.write_buffer(&veil.uniform, 0, bytemuck::cast_slice(&data));
         let mut covering = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("veil"),

@@ -466,10 +466,10 @@ pub(crate) fn used_assets(assets: &Path, keys: &[String], game: &[u8]) -> BTreeS
             used.insert(key.clone());
         }
     }
-    // The saved types the game declares, which the runtime reads beside the
+    // The optional state adapter declaration, which the host reads beside the
     // catalog to migrate old saves.
-    if known.contains(pen_runtime::saved::SAVED_TYPES_FILE) {
-        used.insert(pen_runtime::saved::SAVED_TYPES_FILE.to_owned());
+    if known.contains(pen_runtime::state::CONFIG_FILE) {
+        used.insert(pen_runtime::state::CONFIG_FILE.to_owned());
     }
     used
 }
@@ -833,7 +833,7 @@ pub fn web_host(out: &Path) -> Result<()> {
         beside.join("pen_web_bg.wasm").is_file().then_some(beside)
     });
     if let Some(host) = host {
-        for file in ["pen_web.js", "pen_web_bg.wasm", "guest.js", "index.html"] {
+        for file in ["pen_web.js", "pen_web_bg.wasm", "guest.js", "structured.js", "index.html"] {
             std::fs::copy(host.join(file), out.join(file)).with_context(|| format!("copying browser host {file}"))?;
         }
     } else {
@@ -856,9 +856,9 @@ pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>) -> Result<(
     let wasm = std::fs::read(site.join("game.wasm"))?;
     let assets = ship_assets(&project.assets(), &site.join("assets"), &wasm)?;
     std::fs::copy(project.assets().join("catalog.json"), site.join("catalog.json"))?;
-    let saved = site.join("assets").join(pen_runtime::saved::SAVED_TYPES_FILE);
+    let saved = site.join("assets").join(pen_runtime::state::CONFIG_FILE);
     if !saved.is_file() {
-        std::fs::write(&saved, pen_runtime::saved::NO_SAVED_TYPES)?;
+        std::fs::write(&saved, pen_runtime::state::OPAQUE_CONFIG)?;
     }
     crate::scene_assets::write(&wasm, &project.assets(), &project.scene(), &site.join("assets"))?;
     if project.scene().is_file() {
@@ -877,15 +877,13 @@ pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>) -> Result<(
     Ok(())
 }
 
-/// Checks the saved types the game declares beside its catalog, if it
-/// declares any: each type's versions must migrate to every later one
-/// (docs/saved-types.md).
+/// Checks the explicit state adapter declaration beside the asset catalog,
+/// including any adapter-owned migration layouts (docs/state-adapters.md).
 pub fn check_saved_types(assets: &Path) -> Result<()> {
-    let path = assets.join(pen_runtime::saved::SAVED_TYPES_FILE);
+    let path = assets.join(pen_runtime::state::CONFIG_FILE);
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(()) };
-    let types = pen_runtime::saved::SavedTypes::parse(&text).with_context(|| format!("reading {}", path.display()))?;
-    pen_runtime::saved::check(&types).with_context(|| format!("{}", path.display()))?;
-    eprintln!("{}: {} saved types declared", path.display(), types.types.len());
+    pen_ink::adapter(&text).with_context(|| format!("reading {}", path.display()))?;
+    eprintln!("{}: state adapter checked", path.display());
     Ok(())
 }
 

@@ -32,6 +32,8 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
     let zero = Vector::default();
     RenderFrame {
         hide_cursor: false,
+        loading: false,
+        show_captions: false,
         ambient: zero,
         aberration: Aberration { x: 0.0, y: 0.0 },
         blur: 0.0,

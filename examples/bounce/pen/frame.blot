@@ -66,6 +66,8 @@ const blank = fn (schema: U32) => #types.RenderFrame {
     drift: #types.Drift { x: 0.0, z: 0.0 },
   },
   hide_cursor: #False,
+  loading: #False,
+  show_captions: #False,
   state: #[],
   draws: #[],
   solids: #[],

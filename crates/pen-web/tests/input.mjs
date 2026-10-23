@@ -16,7 +16,7 @@ await mkdir(shots, { recursive: true });
 
 // Tags (protocol/schema.json) and codes the checks read.
 const tag = {
-  KeyDown: 1, PointerDown: 3, PointerUp: 4, PointerMove: 5, GamepadConnected: 15, GamepadDisconnected: 16,
+  KeyDown: 1, PointerDown: 3, PointerUp: 4, PointerMove: 5, Wheel: 6, GamepadConnected: 15, GamepadDisconnected: 16,
   GamepadButton: 17, GamepadAxis: 18, Action: 19, TextInput: 20, Composition: 21, MouseMotion: 22, Touch: 23,
   Pan: 24, Pinch: 25,
 };
@@ -81,6 +81,15 @@ try {
   await expect('jump, pressed by space', [tag.Action, 0, 1, KEYBOARD, 0]);
   await expect('typed text', [tag.TextInput, 'h'.codePointAt(0), 0, 0, 0]);
   await expect('typed text', [tag.TextInput, 'i'.codePointAt(0), 0, 0, 0]);
+
+  // DOM wheel deltas already use the game's downward-positive convention.
+  await page.mouse.move(400, 300);
+  await page.mouse.wheel(0, 120);
+  await expect('downward wheel pixels', [tag.Wheel, 0, 400, 300, 120]);
+  await page.mouse.wheel(0, -120);
+  await expect('upward wheel pixels', [tag.Wheel, 0, 400, 300, -120]);
+  await page.locator('canvas').dispatchEvent('wheel', { deltaY: 3, deltaMode: 1 });
+  await expect('downward wheel lines', [tag.Wheel, 0, 400, 300, 300]);
 
   // The locked mouse's motion.
   await page.evaluate(() => { window.__locked = true; });

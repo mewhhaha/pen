@@ -12,7 +12,7 @@ workspace = true
 default = ["compiler"]
 # Cranelift, to compile Wasm. Without it only modules precompiled by a build
 # with it (`pen build`) load, and the runtime is several MB smaller.
-compiler = ["wasmtime/cranelift", "wasmtime/incremental-cache", "wasmtime/parallel-compilation", "dep:sha2"]
+compiler = ["wasmtime/cranelift", "wasmtime/incremental-cache", "wasmtime/parallel-compilation", "dep:sha2", "dep:wasm-encoder"]
 
 [dependencies]
 anyhow.workspace = true
@@ -26,7 +26,12 @@ wasmtime.workspace = true
 # Reads which globals a module exports (images); wasmtime's own version.
 wasmparser = { version = "0.258", default-features = false, features = ["std"] }
 
+wasm-encoder = { version = "0.258", features = ["wasmparser"], optional = true }
+serde_json = "1"
+
 [dev-dependencies]
+# Numeric probes and fixture generation compile through the checkout's plugin.
+pen-plugins.workspace = true
 # The memory_images example plays a game's frames.
 pen-protocol.workspace = true
 
@@ -36,4 +41,16 @@ required-features = ["compiler"]
 
 [[example]]
 name = "memory_images"
+required-features = ["compiler"]
+
+[[example]]
+name = "evaluate"
+required-features = ["compiler"]
+
+[[example]]
+name = "compare"
+required-features = ["compiler"]
+
+[[example]]
+name = "compare_workers"
 required-features = ["compiler"]

@@ -1,13 +1,36 @@
 //! The canvas on WebGPU: the game's renderer, and the dev tools' sharing its
 //! device, drawing into the canvas's surface.
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use futures_channel::oneshot;
+use js_sys::Promise;
 use pen_protocol::{Catalog, RenderFrame, Viewport};
 use pen_render::{Display, RenderTarget, Renderer, RendererOptions};
+use pen_runtime::game::DrawTimings;
+use wasm_bindgen::{JsCast, prelude::*};
+use wasm_bindgen_futures::JsFuture;
 use web_sys::HtmlCanvasElement;
+use web_time::Instant;
+
+use crate::program::error;
+
+/// Keep submission bounded without making each frame wait for its predecessor.
+pub const FRAMES_IN_FLIGHT: usize = 2;
+
+/// Resume immediately before the browser repaints, after all asynchronous work.
+async fn next_frame() -> Result<f64> {
+    let promise = Promise::new(&mut |resolve, reject| {
+        let callback = Closure::once_into_js(move |time: f64| {
+            let _ = resolve.call1(&JsValue::NULL, &time.into());
+        });
+        if let Err(error) = web_sys::window().unwrap().request_animation_frame(callback.unchecked_ref()) {
+            let _ = reject.call1(&JsValue::NULL, &error);
+        }
+    });
+    Ok(JsFuture::from(promise).await.map_err(error)?.as_f64().unwrap_or_default() / 1000.0)
+}
 
 /// The canvas's surface, configured to the canvas's backing size.
 pub struct Canvas {
@@ -19,6 +42,7 @@ pub struct Canvas {
     frame: Option<wgpu::SurfaceTexture>,
     /// A backing size kept whatever the canvas shows (a replay's).
     pinned: Option<(u32, u32)>,
+    timings: DrawTimings,
 }
 
 /// The backing size for `element`: its CSS size in device pixels (the
@@ -59,7 +83,10 @@ impl RenderTarget for Canvas {
     }
 
     fn view(&mut self) -> Option<wgpu::TextureView> {
-        let texture = match self.surface.get_current_texture() {
+        let started = Instant::now();
+        let acquired = self.surface.get_current_texture();
+        self.timings.acquire_ms += started.elapsed().as_secs_f64() * 1000.0;
+        let texture = match acquired {
             wgpu::CurrentSurfaceTexture::Success(texture) | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
             _ => {
                 self.surface.configure(&self.device, &self.config);
@@ -82,8 +109,8 @@ pub struct Screen {
     /// The dev tools' sprites, over the game's frame.
     pub overlay: Renderer,
     pub canvas: Canvas,
-    /// The GPU finished the last frame submitted: the next waits for it.
-    in_flight: Option<oneshot::Receiver<()>>,
+    /// Completion fences in submission order, at most FRAMES_IN_FLIGHT.
+    in_flight: VecDeque<oneshot::Receiver<()>>,
 }
 
 impl Screen {
@@ -154,8 +181,17 @@ impl Screen {
         };
         let renderer = Renderer::new(device.clone(), queue.clone(), options)?;
         let overlay = renderer.share(assets.into())?;
-        let canvas = Canvas { element, queue, surface, config, device, frame: None, pinned: None };
-        Ok(Self { adapter: name, renderer, overlay, canvas, in_flight: None })
+        let canvas = Canvas {
+            element,
+            queue,
+            surface,
+            config,
+            device,
+            frame: None,
+            pinned: None,
+            timings: DrawTimings::default(),
+        };
+        Ok(Self { adapter: name, renderer, overlay, canvas, in_flight: VecDeque::new() })
     }
 
     /// Follows the canvas's size and the display's density: the backing
@@ -178,14 +214,23 @@ impl Screen {
         Viewport { width: self.canvas.element.width().max(1), height: self.canvas.element.height().max(1) }
     }
 
-    /// Draws the game's frame and the dev tools' over it. One frame is in
-    /// flight: the GPU draws it while the next is computed, and the next
-    /// waits for it before it is submitted, which bounds the queue on slow
-    /// adapters (frame callbacks alone put no brake on WebGPU).
-    pub async fn draw(&mut self, game: &RenderFrame, overlay: Option<&RenderFrame>, catalog: &Catalog) -> Result<()> {
-        if let Some(previous) = self.in_flight.take() {
-            let _ = previous.await;
+    /// Draws in the browser's repaint callback, after guest work and GPU
+    /// backpressure have finished. Two submissions may be in flight; a
+    /// slow completion notification cannot serialize every frame.
+    pub async fn draw(
+        &mut self,
+        game: &RenderFrame,
+        overlay: Option<&RenderFrame>,
+        catalog: &Catalog,
+    ) -> Result<(f64, DrawTimings)> {
+        self.canvas.timings = DrawTimings::default();
+        let pacing = Instant::now();
+        if self.in_flight.len() == FRAMES_IN_FLIGHT {
+            let _ = self.in_flight.pop_front().unwrap().await;
         }
+        let timestamp = next_frame().await?;
+        self.canvas.timings.pace_ms = pacing.elapsed().as_secs_f64() * 1000.0;
+        let rendering = Instant::now();
         self.canvas.fit();
         self.renderer.submit(game, catalog, &mut self.canvas)?;
         if let Some(overlay) = overlay {
@@ -196,14 +241,19 @@ impl Screen {
             }
         }
         if let Some(frame) = self.canvas.frame.take() {
+            let started = Instant::now();
             self.canvas.queue.present(frame);
+            self.canvas.timings.present_ms += started.elapsed().as_secs_f64() * 1000.0;
         }
         let (done, finished) = oneshot::channel();
         self.canvas.queue.on_submitted_work_done(move || {
             let _ = done.send(());
         });
-        self.in_flight = Some(finished);
-        Ok(())
+        self.in_flight.push_back(finished);
+        let timings = &mut self.canvas.timings;
+        timings.render_ms =
+            (rendering.elapsed().as_secs_f64() * 1000.0 - timings.acquire_ms - timings.present_ms).max(0.0);
+        Ok((timestamp, *timings))
     }
 
     /// Whether assets are still loading, streaming in or fading in.

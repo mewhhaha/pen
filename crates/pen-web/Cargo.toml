@@ -18,6 +18,7 @@ crate-type = ["cdylib"]
 anyhow.workspace = true
 pen-protocol.workspace = true
 pen-runtime.workspace = true
+pen-ink.workspace = true
 pen-render.workspace = true
 pen-simulation.workspace = true
 futures-channel = "0.3"

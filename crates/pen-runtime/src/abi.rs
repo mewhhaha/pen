@@ -114,8 +114,7 @@ pub struct GuestAbi {
     /// (1), before `blot:reset`.
     pub ownership: bool,
     /// Blot's structured tasks (guest-abi.md, "Structured task
-    /// extension"): the `blot:tasks` section's descriptor count. pen does
-    /// not host them yet ([`GuestAbi::check_hostable`]).
+    /// extension"): the `blot:tasks` section's descriptor count.
     pub tasks: Option<u32>,
     /// Functions whose callback is `concurrent` (manifest tag 13): tasks
     /// may suspend in it side by side.
@@ -158,20 +157,17 @@ impl GuestAbi {
         })
     }
 
-    /// Checks pen can host the module: it uses no ABI extension pen does
-    /// not implement. Blot's structured tasks need a host that keeps
-    /// several suspended Wasm stacks of one instance, which wasmtime's core
-    /// API does not (docs/services-as-tasks.md).
+    /// Checks native admission. Pure task scopes run synchronously; concurrent
+    /// callbacks require suspended sibling stacks, which this embedding does
+    /// not supply (docs/services-as-tasks.md).
     pub fn check_hostable(&self) -> Result<()> {
-        if let Some(descriptors) = self.tasks {
+        if let Some(descriptors) = self.tasks
+            && !self.concurrent.is_empty()
+        {
             bail!(
                 "unsupported_abi: the module uses Blot's structured tasks ({TASKS_SECTION}, {descriptors} \
-                 descriptors{}), which pen does not host yet (docs/services-as-tasks.md)",
-                if self.concurrent.is_empty() {
-                    String::new()
-                } else {
-                    format!("; concurrent callbacks for {}", self.concurrent.join(", "))
-                }
+                 descriptors; concurrent callbacks for {}), which require suspended sibling stacks; native pen currently hosts synchronous tasks (docs/services-as-tasks.md)",
+                self.concurrent.join(", ")
             );
         }
         Ok(())

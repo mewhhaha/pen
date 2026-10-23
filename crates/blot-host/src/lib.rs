@@ -1957,4 +1957,24 @@ mod tests {
         assert_eq!(module.abi().functions.len(), 2);
         std::fs::remove_dir_all(&directory).unwrap();
     }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn bounded_inlining_artifacts_require_matching_runtime_configuration() {
+        let normal = Engine::new(&config(true)).unwrap();
+        let mut bounded = config(true);
+        // SAFETY: the pinned Wasmtime 49 setting only bounds inline expansion.
+        unsafe {
+            bounded.cranelift_flag_set("wasmtime_inlining_sum_size_threshold", "128");
+        }
+        let bounded = Engine::new(&bounded).unwrap();
+        let compiled = wasmtime::Module::new(&bounded, looping_guest()).unwrap();
+        let artifact = compiled.serialize().unwrap();
+        // SAFETY: these bytes were just serialized by the same Wasmtime build.
+        let mismatch = unsafe { wasmtime::Module::deserialize(&normal, &artifact) }.unwrap_err();
+        assert!(mismatch.to_string().contains("function inlining sum-size threshold"));
+        // SAFETY: the producer and consumer use the identical configuration.
+        let loaded = unsafe { wasmtime::Module::deserialize(&bounded, &artifact) }.unwrap();
+        assert_eq!(loaded.exports().count(), compiled.exports().count());
+    }
 }

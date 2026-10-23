@@ -75,7 +75,7 @@ in 12–13 ms and peak at 22.5 MiB. Reading, hashing and safely deserializing an
 owned buffer costs more than mapping an unchecked file. This remains far below
 the measured cold compilation cost; no zero-overhead claim is made.
 
-The twelve host tests cover the generation bound, replacement/promotion,
+The fourteen host tests cover the generation bound, replacement/promotion,
 complete-payload byte flips and truncations, wrong keys, old formats, actual
 recompilation after corruption, oversized entries, pruning, and existing guest
 ownership, traps, probes, snapshots and deadline behavior. A focused writer
@@ -90,7 +90,36 @@ peak RSS. The development engine with inlining explicitly enabled measures
 0.790 s wall, 2.450 s CPU and 606.1 MiB. These are again three-process medians.
 The much smaller default development path remains available.
 
-These results qualify compilation cost only. Production settings remain
-unchanged pending paired guest-frame timings and bit-exact packet/snapshot
-checks. The next check compares guest frame distributions and exact output traces before
-choosing a production policy.
+The follow-up [guest-frame report](measurements/guest-runtime-inline-budgets-2026-10-23.json)
+contains seven alternating rounds per configuration, 600 frames per process,
+and 100 warmup frames excluded from the frame distributions. All 21 executions
+produce the same complete packet trace and final snapshot. The per-frame timers
+exclude compilation; process RSS and CPU include compilation and execution.
+
+| Inline threshold | Median frame ms | p95 frame ms | Process peak RSS MiB |
+| --- | ---: | ---: | ---: |
+| Default (2000) | 0.4600 | 0.6685 | 2,513.6 |
+| 128 | 0.5419 | 0.7771 | 778.3 |
+| 256 | 0.5074 | 0.7042 | 891.4 |
+
+Each table cell is the median of the seven process summaries. The median of
+paired frame-time ratios is 1.136 for threshold 128 and 1.092 for threshold 256;
+that differs from dividing independent medians. Both lose enough runtime
+performance to reject as production defaults. The shorter three-pair,
+180-frame pilot understated this loss. Tail samples are noisy; raw chronological
+frame durations and every process summary are retained.
+
+There is also a packaging constraint: an artifact compiled with threshold 128
+is rejected by a runtime expecting threshold 2000. The pinned Wasmtime 49 API
+only exposes this threshold through a compiler setting; the compiler-free
+player cannot set it through that API. A regression test verifies rejection of
+the mismatch and successful loading by a matching engine. Artifact headers must
+not be patched to bypass the compatibility check.
+
+Production settings remain unchanged. The experiment identifies a real
+compile-time/memory tradeoff, not an accepted release optimization. Reproduce:
+
+```sh
+cargo build --release -p blot-host --example memory_images
+python3 scripts/profile-runtime.py /path/to/game.wasm --out target/frame-profile
+```

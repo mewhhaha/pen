@@ -249,6 +249,44 @@ fn builds_a_test_module_as_its_entry() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+#[test]
+fn library_tests_compile_relative_helpers_without_a_game() {
+    let Some((component, compiler, std)) = parts() else {
+        eprintln!("skipped: no Blot plugin component or blot2 checkout");
+        return;
+    };
+    let root = checkout(&component, &compiler, &std);
+    std::fs::remove_file(root.join("main.blot")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(root.join("tests/helper.blot"), "const value: F32 = 42.0\n").unwrap();
+    std::fs::write(
+        root.join("tests/check.blot"),
+        "import * as helper from \"./helper\"\nentry const test_answer = fn () => #[helper.value]\n",
+    )
+    .unwrap();
+    // An unrelated fixture must not get compiled as a standalone test.
+    std::fs::write(root.join("tests/not-a-test.blot"), "not valid Blot").unwrap();
+    let config_path = root.join("pen.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["compiler"]["settings"]["tests"] = serde_json::json!({
+        "entry": "tests/.fixture.blot", "files": ["tests/check.blot"]
+    });
+    std::fs::write(config_path, config.to_string()).unwrap();
+    let (plugins, _) = plugins(&root);
+    let modules = plugins.tests(&root.join("src/main.blot"), &[], None).unwrap();
+    assert_eq!(modules.len(), 1);
+    assert_eq!(Path::new(&modules[0].entry), root.join("tests/.fixture.blot"));
+    assert!(!root.join("tests/.fixture.blot").exists());
+    let mut builder = Builder::new(plugins, Path::new(&modules[0].entry));
+    match builder.build(&modules[0].overlays) {
+        Outcome::Built(built) => assert_eq!(&built.wasm[..4], b"\0asm"),
+        Outcome::Rejected(diagnostics) => panic!("relative helper did not compile: {diagnostics:?}"),
+        Outcome::Failed(error) => panic!("relative helper did not compile: {error}"),
+    }
+    let _ = builder.close();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[cfg(unix)]
 #[test]
 fn stops_a_compiler_that_hangs_at_the_calls_deadline() {

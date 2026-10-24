@@ -47,6 +47,47 @@ pub struct Settings {
     pub expected_identity: Option<String>,
     /// Native readers owned by blotc. Paths are resolved against the project.
     pub native_assets: Option<Value>,
+    /// Test layout, independent of a game entry.
+    pub tests: TestSettings,
+}
+
+/// Optional test layout. Paths are absolute, resolved against the checkout.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TestSettings {
+    /// A shared virtual entry: relative imports resolve beside this file.
+    pub entry: Option<String>,
+    /// The default modules; explicit CLI files override this list.
+    pub files: Option<Vec<String>>,
+}
+
+impl TestSettings {
+    fn parse(value: Option<&Value>, root: &str) -> Result<Self, String> {
+        let fields = match value {
+            None | Some(Value::Null) => return Ok(Self::default()),
+            Some(Value::Object(fields)) => fields,
+            _ => return Err("the settings' `tests` is not an object".into()),
+        };
+        if let Some(unknown) = fields.keys().find(|key| !["entry", "files"].contains(&key.as_str())) {
+            return Err(format!("tests has no `{unknown}` (it has entry, files)"));
+        }
+        let path = |value: &Value, name: &str| -> Result<String, String> {
+            let path = value.as_str().ok_or_else(|| format!("{name} must be a path"))?;
+            Ok(resolve(root, checked_path(path, name)?))
+        };
+        let entry = fields.get("entry").map(|value| path(value, "tests.entry")).transpose()?;
+        let files = fields
+            .get("files")
+            .map(|value| {
+                value
+                    .as_array()
+                    .ok_or_else(|| "tests.files must be an array of paths".to_owned())?
+                    .iter()
+                    .map(|value| path(value, "tests.files"))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        Ok(Self { entry, files })
+    }
 }
 
 impl Settings {
@@ -57,7 +98,7 @@ impl Settings {
         let Value::Object(fields) = value else {
             return Err("the settings are not a JSON object".into());
         };
-        const KNOWN: [&str; 10] = [
+        const KNOWN: [&str; 11] = [
             "program",
             "imports",
             "std",
@@ -68,6 +109,7 @@ impl Settings {
             "inferenceBudget",
             "expectedIdentity",
             "nativeAssets",
+            "tests",
         ];
         if let Some(unknown) = fields.keys().find(|key| !KNOWN.contains(&key.as_str())) {
             return Err(format!("the settings have no `{unknown}` (they have {})", KNOWN.join(", ")));
@@ -127,6 +169,7 @@ impl Settings {
             inference_budget,
             expected_identity,
             native_assets: native_assets(fields.get("nativeAssets"), root)?,
+            tests: TestSettings::parse(fields.get("tests"), root)?,
         })
     }
 
@@ -377,6 +420,11 @@ mod tests {
             (r#"{"semanticWorkers": 17}"#, "`semanticWorkers`"),
             (r#"{"expectedIdentity": "ABC"}"#, "`expectedIdentity`"),
             (r#"{"program": ""}"#, "`program`"),
+            (r#"{"tests": []}"#, "`tests` is not an object"),
+            (r#"{"tests": {"entries": []}}"#, "no `entries`"),
+            (r#"{"tests": {"entry": ""}}"#, "`tests.entry` is not a path"),
+            (r#"{"tests": {"files": "tests/a.blot"}}"#, "tests.files must be an array"),
+            (r#"{"tests": {"files": [2]}}"#, "tests.files must be a path"),
         ] {
             let error = Settings::parse(json, "/p").unwrap_err();
             assert!(error.contains(refusal), "{json}: {error}");

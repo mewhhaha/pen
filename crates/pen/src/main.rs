@@ -2171,7 +2171,11 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         let _ = IDENTITY.set(project::bundle_identity(&directory)?);
         (None, Some(directory))
     } else {
-        let project = Project::find(args.path("--project"))?;
+        let project = if args.command == "test-blot" && !args.flag("--session") {
+            Project::find_tests(args.path("--project"))?
+        } else {
+            Project::find(args.path("--project"))?
+        };
         let _ = IDENTITY.set(project.identity.clone());
         (Some(project), None)
     };

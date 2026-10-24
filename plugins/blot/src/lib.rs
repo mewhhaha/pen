@@ -48,6 +48,10 @@
 //! - `semanticWorkers`: 1 to 16 workers for semantic jobs; serial without.
 //! - `expectedIdentity`: the only compiler identity to accept, from its
 //!   hello.
+//! - `tests`: optional `entry` (a virtual file shared by test modules) and
+//!   `files` (the default module paths, overridden by explicit CLI files).
+//!   For libraries, `{"entry":"tests/test_fixture.blot"}` keeps relative
+//!   imports beside the tests; the virtual file need not exist on disk.
 //!
 //! A session watches the entry's directory, every import's directory, the
 //! standard library's and the prelude.
@@ -61,7 +65,7 @@ mod component;
 pub mod native;
 
 pub use session::{Child, ReadError, Session};
-pub use settings::{CodegenTier, PROGRAM, Settings};
+pub use settings::{CodegenTier, PROGRAM, Settings, TestSettings};
 pub use suite::{Expectation, Files, TestModule, find as find_tests};
 
 /// A program of the checkout's: its root, its entry file (absolute) and its

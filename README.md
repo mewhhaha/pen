@@ -221,6 +221,25 @@ A checkout selects its compiler in `pen.json`:
 }
 ```
 
+Ordinary `pen test-blot` also accepts a library with only `pen.json`, without
+`src/main.blot`, assets or a renderer. The Blot plugin's compiler settings can
+supply a test layout:
+
+```json
+"tests": {
+  "entry": "tests/test_fixture.blot",
+  "files": ["tests/math.blot", "tests/ui.blot"]
+}
+```
+
+`entry` is a shared virtual file, not a file to create: each test module's
+source stands there, so `./check` resolves to `tests/check.blot`. Keeping one
+entry lets workers reuse compiler sessions across modules. `files` is the
+ordered default suite; explicit CLI files override it and `--filter` still
+applies. Omit either field to retain its game default: an entry beside
+`src/main.blot`, and discovery in `tests/`, `tests/traps/` and
+`tests/rejected/`. `--session` scenarios still require a game checkout.
+
 Plugins receive clocks, randomness and log lines (their stdout and stderr)
 through WASI; files and subprocesses require the grants in `pen.json`. Each
 instance's memory is capped at 1 GiB, and each call into a plugin has a

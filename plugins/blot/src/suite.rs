@@ -11,9 +11,13 @@
 //!   compiler's diagnostics must contain the text of its `// rejects: TEXT`
 //!   line, among the comment lines it opens with.
 //!
+//! `settings.tests.entry` overrides the shared virtual entry, and
+//! `settings.tests.files` overrides discovery when no CLI paths are given.
+//! A library can keep relative imports beside its tests without a game entry.
+//!
 //! Never the other directories under `tests/`: `tests/blocked/` (tests
 //! waiting on compiler fixes), and the modules the tests import.
-use crate::settings::{parent, resolve};
+use crate::settings::{Settings, parent, resolve};
 use crate::{Overlay, Program};
 
 /// Where the test modules are, in the checkout.
@@ -78,12 +82,17 @@ pub fn find(
     filter: Option<&str>,
     files: &mut impl Files,
 ) -> Result<Vec<TestModule>, String> {
+    let settings = Settings::parse(&program.settings, &program.root)?;
     let paths = if paths.is_empty() {
-        modules(&program.root, files)?
+        match settings.tests.files {
+            Some(paths) => paths,
+            None => modules(&program.root, files)?,
+        }
     } else {
         paths.iter().map(|path| resolve(&program.root, path)).collect()
     };
-    let entry = resolve(&parent(&resolve(&program.root, &program.entry)), FIXTURE);
+    let entry =
+        settings.tests.entry.unwrap_or_else(|| resolve(&parent(&resolve(&program.root, &program.entry)), FIXTURE));
     let mut found = Vec::new();
     for path in paths {
         let source = files.read(&path).map_err(|error| format!("reading {path}: {error}"))?;
@@ -256,6 +265,31 @@ mod tests {
         assert_eq!(paths(&find(&program(), &[], None, &mut only).unwrap()), ["a.blot"]);
         let error = find(&program(), &[], None, &mut checkout(&[])).unwrap_err();
         assert!(error.starts_with("reading /gdev/tests: "), "{error}");
+    }
+
+    #[test]
+    fn library_layout_selects_modules_and_preserves_a_shared_entry() {
+        let mut program = program();
+        program.settings = r#"{"tests": {
+            "entry": "tests/.fixture.blot",
+            "files": ["tests/b.blot", "tests/a.blot"]
+        }}"#
+        .into();
+        let mut files = layout();
+        let modules = find(&program, &[], None, &mut files).unwrap();
+        assert_eq!(paths(&modules), ["b.blot", "a.blot"]);
+        for module in &modules {
+            assert_eq!(module.entry, "/gdev/tests/.fixture.blot");
+            assert_eq!(module.overlays, [Overlay { path: module.entry.clone(), contents: Some(TEST.into()) }]);
+        }
+        let given = ["tests/traps/c.blot".to_owned()];
+        let modules = find(&program, &given, Some("test_d"), &mut files).unwrap();
+        assert_eq!(paths(&modules), ["traps/c.blot"]);
+        assert_eq!(modules[0].expect, Expectation::Traps);
+        assert!(find(&program, &given, Some("missing"), &mut files).unwrap().is_empty());
+        // An explicit empty suite is not the discovery default.
+        program.settings = r#"{"tests":{"files":[]}}"#.into();
+        assert!(find(&program, &[], None, &mut files).unwrap().is_empty());
     }
 
     #[test]

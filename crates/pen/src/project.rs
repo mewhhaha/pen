@@ -213,21 +213,34 @@ pub struct Project {
 impl Project {
     /// The checkout at `root`, or the one the current directory is in.
     pub fn find(root: Option<PathBuf>) -> Result<Project> {
+        Self::find_in(root, true)
+    }
+
+    /// A test checkout needs only pen.json; its plugin owns the test layout.
+    pub fn find_tests(root: Option<PathBuf>) -> Result<Project> {
+        Self::find_in(root, false)
+    }
+
+    fn find_in(root: Option<PathBuf>, require_game: bool) -> Result<Project> {
         let start = match root {
             Some(root) => root,
             None => std::env::current_dir()?,
         };
         let start = std::fs::canonicalize(&start).with_context(|| format!("{} does not exist", start.display()))?;
-        match Project::around(&start) {
+        let root = start.ancestors().find(|directory| {
+            directory.join("pen.json").is_file() && (!require_game || directory.join("src/main.blot").is_file())
+        });
+        match root {
             Some(root) => Ok(Project {
-                identity: Identity::of_checkout(&root)?,
-                root,
+                identity: Identity::of_checkout(root)?,
+                root: root.to_owned(),
                 #[cfg(feature = "compiler")]
                 plugins: std::sync::OnceLock::new(),
             }),
             None => bail!(
-                "{} is not inside a checkout (a directory with pen.json and src/main.blot); pass --project DIR",
-                start.display()
+                "{} is not inside a checkout (a directory with {}); pass --project DIR",
+                start.display(),
+                if require_game { "pen.json and src/main.blot" } else { "pen.json" }
             ),
         }
     }
@@ -986,6 +999,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         directory
+    }
+
+    #[test]
+    fn library_tests_find_configuration_without_a_game_entry() {
+        let root = fixture("library-tests");
+        std::fs::create_dir_all(root.join("tests")).unwrap();
+        std::fs::write(root.join("pen.json"), "{}").unwrap();
+        let found = Project::find_tests(Some(root.join("tests"))).unwrap();
+        assert_eq!(found.root, root.canonicalize().unwrap());
+        assert!(Project::find(Some(root.clone())).is_err());
+        // Game commands and session scenarios still need an actual game.
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.blot"), "").unwrap();
+        assert_eq!(Project::find(Some(root.clone())).unwrap().root, found.root);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

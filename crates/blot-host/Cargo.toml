@@ -54,3 +54,7 @@ required-features = ["compiler"]
 [[example]]
 name = "compare_workers"
 required-features = ["compiler"]
+
+[[example]]
+name = "compare_worker_batches"
+required-features = ["compiler"]

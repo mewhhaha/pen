@@ -77,6 +77,7 @@ impl SystemTrace {
     #[allow(clippy::cast_possible_truncation, reason = "diagnostic timings use float32 wire values")]
     pub fn systems(&self, enabled: bool, first: usize) -> (usize, Vec<f32>) {
         self.enabled.store(enabled, Ordering::Relaxed);
+        let allocation_counts = self.records_allocations();
         let mut live = self.live.lock().unwrap();
         if !enabled {
             for total in live.totals.values_mut() {
@@ -100,6 +101,16 @@ impl SystemTrace {
                 mean as f32,
                 peak as f32,
                 0.0,
+                if allocation_counts && total.calls > 0 {
+                    (total.bytes as f64 / total.calls as f64) as f32
+                } else {
+                    -1.0
+                },
+                if allocation_counts && total.calls > 0 {
+                    (total.allocations as f64 / total.calls as f64) as f32
+                } else {
+                    -1.0
+                },
                 name.chars().count() as f32,
             ]);
             values.extend(name.chars().map(|c| u32::from(c) as f32));
@@ -141,6 +152,8 @@ impl SystemTrace {
                 total.calls += 1;
                 total.micros += micros;
                 total.max_micros = total.max_micros.max(micros);
+                total.bytes = total.bytes.saturating_add(bytes);
+                total.allocations = total.allocations.saturating_add(allocations);
             }
         }
         let mut output = self.output.lock().unwrap();
@@ -397,6 +410,28 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
     #[test]
+    fn live_allocation_rows_report_requested_traffic_and_reset_each_window() {
+        let (path, trace, mut tracing) = capture(100);
+        trace.systems(true, 0);
+        let at = trace.started;
+        tracing.resume_command(&[1.0, 2.0], at, Counts::default());
+        tracing.marker(&[MAGIC, 1.0, 4.0, 7.0, 65.0], at, Counts { bytes: 100, allocations: 3 }).unwrap();
+        tracing
+            .marker(&[MAGIC, 0.0, 4.0, 7.0], at + Duration::from_micros(10), Counts { bytes: 260, allocations: 8 })
+            .unwrap();
+        tracing.finish_command(at + Duration::from_micros(11), Counts { bytes: 260, allocations: 8 }).unwrap();
+        let (count, values) = trace.systems(true, 0);
+        assert_eq!(count, 1);
+        assert_eq!(&values[6..9], &[160.0, 5.0, 1.0]);
+        let (_, idle) = trace.systems(true, 0);
+        assert_eq!(&idle[6..9], &[-1.0, -1.0, 1.0]);
+        drop(tracing);
+        drop(trace);
+        let _ = std::fs::remove_file(path.with_extension("summary.json"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn live_windows_are_bounded_paged_and_stop_accumulating_when_closed() {
         let capture = SystemTrace::live();
         let at = capture.started;
@@ -415,7 +450,7 @@ mod tests {
         }
         let (count, first) = capture.systems(true, 0);
         assert_eq!(count, 130);
-        assert_eq!(&first[..7], &[4.0, 0.0, 0.0, -1.0, -1.0, 0.0, 8.0]);
+        assert_eq!(&first[..9], &[4.0, 0.0, 0.0, -1.0, -1.0, 0.0, -1.0, -1.0, 8.0]);
         for id in 0..130 {
             record(id, 200);
             record(id, 400);
@@ -427,7 +462,7 @@ mod tests {
         assert_eq!(&second[..6], &[4.0, 64.0, 2.0, 0.3, 0.4, 0.0]);
         let (_, third) = capture.systems(true, 128);
         assert_eq!(third[1], 128.0);
-        assert_eq!(third.len(), 34); // two headers plus ten characters each
+        assert_eq!(third.len(), 38); // two headers plus ten characters each
         capture.systems(false, 0);
         record(0, 3000);
         let (_, first) = capture.systems(true, 0);

@@ -47,7 +47,7 @@ fn expected() -> PathBuf {
 /// The editor, the pause menu over it and Tab round it, and Settings'
 /// Accessibility page (F2, then three sections on) and Tab round that, with
 /// a snapshot of each.
-const STEPS: &str = "wait=30 shot=editing key=Escape wait=40 shot=paused \
+const STEPS: &str = "wait=100 console=7,0 wait=20 key=Tab wait=30 shot=editing key=Escape wait=40 shot=paused \
                      key=Tab wait=2 key=Tab wait=2 key=Tab wait=2 key=Tab wait=2 shot=paused-keys \
                      key=Escape wait=20 key=F2 wait=20 key=PageDown key=PageDown key=PageDown wait=20 shot=access \
                      key=Tab wait=2 key=Tab wait=2 key=Tab wait=2 key=Tab wait=2 key=Tab wait=2 key=Tab wait=2 \
@@ -108,7 +108,11 @@ fn the_games_tree_and_audit_match_their_snapshots() {
         let tick = script.tick(VIEWPORT);
         let tabbed =
             tick.events.iter().any(|event| matches!(event, pen_protocol::GameEvent::KeyDown(key) if key == "Tab"));
-        let input = runtime.input(&Frame { timestamp: time, viewport: VIEWPORT, events: tick.events }).unwrap();
+        let mut events = tick.events;
+        if time == 0.0 {
+            events.insert(0, pen_protocol::GameEvent::RendererReady);
+        }
+        let input = runtime.input(&Frame { timestamp: time, viewport: VIEWPORT, events }).unwrap();
         time += 1.0 / 60.0;
         runtime.send(&input).unwrap();
         let rendered = runtime.receive(&Null).unwrap();

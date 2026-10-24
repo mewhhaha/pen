@@ -10,7 +10,7 @@
 # tests/rewind.steps rewinds into: the keyboard focus going to the build bar
 # (which rises as it does), the station's card opening, and the pause menu
 # flying up, its second row focused and it flying back down.
-wait=30 key=Tab wait=40
+wait=100 console=7,0 wait=40
 ui=0x20001,activate wait=20 ui=0x20011,activate wait=10 ui=0x20001,collapse wait=10
 key=F10 wait=2 key=Tab wait=2 key=Enter wait=20 key=Escape wait=2 key=Escape wait=10
 click=470,150 wait=20 click=470,152 wait=20 click=471,150 wait=30

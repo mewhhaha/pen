@@ -1045,6 +1045,62 @@ impl Drop for Devtools {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pen_protocol::devtools_op;
+
+    #[test]
+    #[ignore = "requires PEN_DEVTOOLS_FIXTURE and PEN_DEVTOOLS_ASSETS"]
+    fn native_overlay_runtime_keeps_sampling() {
+        let wasm = std::fs::read(std::env::var_os("PEN_DEVTOOLS_FIXTURE").unwrap()).unwrap();
+        let assets = PathBuf::from(std::env::var_os("PEN_DEVTOOLS_ASSETS").unwrap());
+        let catalog = pen_protocol::boundary::read_catalog(&assets).unwrap();
+        let engine = blot_host::engine().unwrap();
+        let module = GuestModule::new(&engine, &wasm, None).unwrap();
+        let viewport = Viewport { width: 960, height: 640 };
+        let mut shell = Shell { viewport };
+        let mut runtime = GameRuntime::new(&engine, module, catalog, &mut shell, None, None).unwrap();
+        let mut typed = VecDeque::from(typed_line("/systems", false));
+        let mut events = Vec::new();
+        let mut counts = [0, 0];
+        for index in 0..24 {
+            if let Some(keys) = typed.pop_front() {
+                events.extend(keys);
+            }
+            let frame = Frame { timestamp: f64::from(index) * 1.5, viewport, events };
+            let input = runtime.input(&frame).unwrap();
+            runtime.send(&input).unwrap();
+            let frame = runtime.receive(&shell).unwrap();
+            events = Vec::new();
+            for asked in frame.services {
+                let answer = if asked.service == service::DEVTOOLS && asked.operation == devtools_op::SYSTEMS {
+                    let first = usize::try_from(pen_protocol::boundary::whole(asked.b).unwrap()).unwrap();
+                    assert!(first == 0 || first == 64);
+                    counts[usize::from(first != 0)] += 1;
+                    let mut values = Vec::new();
+                    for id in first..(first + 64).min(68) {
+                        let active = counts[0] > 1;
+                        values.extend([
+                            5.0,
+                            id as f32,
+                            if active { 5.0 } else { 0.0 },
+                            if active { 0.25 } else { -1.0 },
+                            0.8,
+                            0.0,
+                            if active { 2048.0 } else { -1.0 },
+                            if active { 3.0 } else { -1.0 },
+                            1.0,
+                            82.0,
+                        ]);
+                    }
+                    Answer { values, ..Answer::ok(68.0) }
+                } else {
+                    Answer::ok(0.0)
+                };
+                events.extend(answer.events(asked.request));
+            }
+        }
+        runtime.close();
+        assert!(counts[0] >= 4 && counts[1] >= 4, "sampling stopped: {counts:?}");
+    }
 
     #[test]
     fn types_a_line_after_opening_the_console() {

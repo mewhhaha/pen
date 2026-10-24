@@ -278,6 +278,11 @@ fn play(
         }
         let tick = script.tick(VIEWPORT);
         let mut events = tick.events;
+        // This host has no asynchronous renderer. Readiness is still a real
+        // input so replay and reduction leave the game's loading gate.
+        if index == 0 {
+            events.insert(0, pen_protocol::GameEvent::RendererReady);
+        }
         services.frame(&mut Input::default());
         events.extend(services.take_answers());
         let frame = Frame { timestamp: index as f64 / 60.0, viewport: VIEWPORT, events };

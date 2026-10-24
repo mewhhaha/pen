@@ -113,7 +113,7 @@ conformance: browser-tools
   {{pen}} packets target/browser-conformance --project {{gdev}} --script-file tests/conformance.steps
   export PLAYWRIGHT_MODULE="${PLAYWRIGHT_MODULE:-$PWD/target/browser-tools/node_modules/playwright-core/index.mjs}"
   browser_port=${PEN_CONFORMANCE_PORT:-8046}
-  python3 -m http.server --bind 127.0.0.1 --directory dist/web "$browser_port" > target/browser-server.log 2>&1 &
+  node crates/pen-web/tests/serve.mjs dist/web "$browser_port" --isolated > target/browser-server.log 2>&1 &
   browser_server=$!
   trap 'kill "$browser_server"' EXIT
   PEN_CONFORMANCE_URL="http://127.0.0.1:$browser_port/qualification.html" node crates/pen-web/tests/conformance.mjs

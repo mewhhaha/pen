@@ -2,4 +2,5 @@ Window "gdev"
   Dialog #262145 "Paused" modal at=0,0 size=960x640
     Button #262400 "Continue" at=311.1111,204.79999 size=337.77777x49.77778 actions=focus,activate <- focus
     Button #262401 "Settings" at=311.1111,254.57776 size=337.77777x49.77778 actions=focus,activate
-    Button #262402 "Exit" at=311.1111,304.35553 size=337.77777x49.77778 actions=focus,activate
+    Button #262402 "Main menu" at=311.1111,304.35553 size=337.77777x49.77778 actions=focus,activate
+    Button #262403 "Exit" at=311.1111,354.13333 size=337.77777x49.77778 actions=focus,activate

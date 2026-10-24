@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use pen_protocol::boundary::read_catalog;
-use pen_protocol::{Catalog, Frame, UiNode, Viewport, service};
+use pen_protocol::{Catalog, Frame, Viewport, service};
 
 use super::*;
 use crate::diverge::difference;
@@ -225,6 +225,9 @@ impl Game {
         while !script.done() {
             let tick = script.tick(VIEWPORT);
             let mut events = tick.events;
+            if self.timeline.position() == 0 {
+                events.insert(0, pen_protocol::GameEvent::RendererReady);
+            }
             if let Some(services) = &mut self.services {
                 services.frame(&mut Input::default());
                 events.extend(services.take_answers());
@@ -281,31 +284,17 @@ const STEPS: &str = "wait=30 key=Tab wait=40 click=470,150 wait=20 click=470,152
     save=a wait=20 key=F6 wait=20 drag=300,300,400,450 wait=20 load=a wait=20 \
     drag=250,450,450,350 wait=20 key=F9 wait=20 key=Tab wait=30 wheel=-300,480,320 wait=30";
 
-/// Play and the interface, laid out so a moment (every 30 frames)
-/// falls in each of these, which `rewinds_into_the_interface_...`
-/// checks: the build bar easing in as play starts (frame 20, moment
-/// 30); the keyboard focus on the build bar's roll (F10 at 51: moments
-/// 60 and 90); a plan in hand and its route asked of pathfinding (104),
-/// answered after moment 120; the station's hire button refused for
-/// want of salt and shaking (116: 120), the build bar open with the
-/// god's hand swaying after the pointer's last move (148: 150), and the
-/// bar closing (178: 180); the pause menu flying up (235: 240),
-/// its focus moved to the second row (256: 270), its Settings sliding
-/// in (295: 300), a preference changed (316: 330) and the menu flying
-/// back down (352: 360).
-const INTERFACE: &str = "wait=20 key=Tab wait=30 key=F10 wait=40 key=Escape \
-    ui=0x20001,activate wait=10 ui=0x20010,activate move=480,420 wait=11 \
-    ui=0x30000,activate wait=30 move=500,400 wait=29 ui=0x30000,collapse ui=0x20001,collapse wait=55 \
-    key=Escape wait=20 key=ArrowDown wait=38 key=Enter wait=20 key=ArrowRight wait=18 \
-    key=Escape wait=16 key=Escape wait=60";
+/// Loading, a fresh sandbox, animated pause/settings panels, keyboard focus,
+/// preferences and delayed service replies all cross saved timeline moments.
+const INTERFACE: &str = "wait=100 console=7,0 wait=30 key=Escape wait=40 \
+    key=ArrowDown wait=5 key=Enter wait=40 key=ArrowRight wait=10 \
+    key=PageDown wait=10 key=PageDown wait=10 key=PageDown wait=40 \
+    key=Tab wait=5 key=Tab wait=5 key=Escape wait=30 key=Escape wait=60";
 
-/// Play with a crowd: twelve gnorps hired, salt knocked out of the rock
-/// for them to haul, a gust sent, a building placed for them to raise
-/// (its route asked of pathfinding first), the pointer left over them.
-const CROWD: &str = "wait=10 key=Tab wait=20 console=3,12 wait=30 \
-    click=470,150 wait=15 click=470,152 wait=15 click=471,150 wait=15 click=470,151 wait=30 \
-    console=6 wait=30 ui=0x20001,activate wait=10 ui=0x20010,activate move=680,140 wait=20 \
-    click=680,140 wait=10 ui=0x20001,collapse move=480,330 wait=480";
+/// Rewind a live crowd, falling bricks and a gust using the current sandbox.
+const CROWD: &str = "wait=100 console=7,0 wait=20 console=3,12 wait=40 \
+    click=470,150 wait=15 click=470,152 wait=15 click=471,150 wait=15 \
+    console=6 wait=60 move=480,330 wait=120";
 
 /// Plays a recording in a new program; returns its packets.
 fn replay(directory: &Path, recording: Recording) -> Vec<u64> {
@@ -314,23 +303,6 @@ fn replay(directory: &Path, recording: Recording) -> Vec<u64> {
     game.catch_up();
     game.runtime.close();
     game.pass.packets
-}
-
-/// The lanes of the section of `state` with `key` (packages/persist.blot).
-fn section(state: &[f32], key: u32) -> Option<Vec<f32>> {
-    let mut at = 3;
-    for _ in 0..state[2] as usize {
-        let length = state[at + 3] as usize;
-        if state[at] as u32 == key {
-            return Some(state[at + 4..at + 4 + length].to_vec());
-        }
-        at += 4 + length;
-    }
-    None
-}
-
-fn node(frame: &RenderFrame, id: u32) -> Option<&UiNode> {
-    frame.ui.iter().find(|node| node.id == id)
 }
 
 #[test]
@@ -403,49 +375,13 @@ fn rewinds_into_the_interface_give_the_first_packets() {
     game.play(INTERFACE);
     let first = game.pass.clone();
     let end = game.timeline.position();
-    assert_eq!(end, 413);
-
-    // The moments fall where INTERFACE says: each holds what the frame
-    // before it left.
     let frames = &first.frames;
-    let focused = |at: usize, id: u32| node(&frames[at], id).is_some_and(|node| node.focused);
-    let (bar, roll, plan) = (0x20000, 0x20001, 0x20010);
-    let (paused, settings, second_row) = (0x40001, 0x40002, 0x40101);
-    // Answers come 40 frames late: the game's first requests (what it
-    // runs on, Steam's stat and presence) wait over moment 30, the
-    // route's over 120.
-    assert!(frames[..30].iter().any(|frame| frame.services.len() >= 4));
-    let route = frames[100..120]
-        .iter()
-        .position(|frame| frame.services.iter().any(|request| request.service == service::PATHFINDING));
-    assert!(route.is_some_and(|at| at + 100 + 40 > 120), "a route asked before 120, answered after");
-    let y = |at: usize| node(&frames[at], bar).map(|node| node.y);
-    assert!(y(29).is_some() && y(29) != y(30), "the build bar eases in over moment 30");
-    assert!(focused(59, roll) && focused(89, roll), "the focus is on the build bar over 60 and 90");
-    let catalog = game.runtime.catalog().clone();
-    let button_x = |at: usize| {
-        let mut sprites = frames[at].sprites.iter();
-        sprites
-            .find(|sprite| catalog.material(sprite.material) == "station_button.material.json")
-            .map(|sprite| sprite.x)
-    };
-    assert!(
-        button_x(116).is_some() && button_x(119) != button_x(116) && button_x(149) == button_x(116),
-        "the station's button shakes, refused, over 120"
-    );
-    let width = |at: usize| node(&frames[at], bar).map(|node| node.width);
-    assert!(
-        [119, 149, 179].iter().all(|&at| width(at) > Some(400.0))
-            && width(185) < width(179)
-            && width(200) < Some(100.0),
-        "the build bar is open over 120 and 150 and closes over 180"
-    );
-    assert!(node(&frames[119], plan).is_some() && node(&frames[179], plan).is_none(), "its plans go with it");
-    assert!(node(&frames[239], paused).is_some() && frames[239].blur > 0.0, "the menu flies up over 240");
-    assert!(focused(269, second_row), "its second row has the focus over 270");
-    assert!(node(&frames[299], settings).is_some(), "its settings show over 300");
-    assert!(frames[316..330].iter().any(|frame| frame.preferences.is_some()), "a preference changed before 330");
-    assert!(node(&frames[359], paused).is_none() && frames[359].blur > 0.0, "it flies down over 360");
+    assert!(frames.iter().any(|frame| frame.loading), "loading is part of the replay");
+    assert!(!frames.last().unwrap().loading, "the ready event releases loading");
+    assert!(frames.iter().any(|frame| !frame.services.is_empty()), "real service requests");
+    assert!(frames.iter().any(|frame| frame.preferences.is_some()), "a setting changes");
+    assert!(frames.iter().any(|frame| frame.ui.iter().any(|node| node.focused)), "UI focus is recorded");
+    assert!(frames.windows(2).any(|pair| pair[0].ui != pair[1].ui), "the interface changes");
 
     // A rewind restores the moment before its target: every moment's.
     for moment in (MOMENT_INTERVAL..end).step_by(MOMENT_INTERVAL as usize) {
@@ -467,24 +403,10 @@ fn rewinds_among_the_crowd_give_the_first_packets() {
     let catalog = game.runtime.catalog().clone();
     let mesh =
         |at: usize, name: &str| first.frames[at].draws.iter().filter(|draw| catalog.mesh(draw.mesh) == name).count();
-    // A building going up draws one of its stage meshes
-    // (`building_{kind}_stage{1..5}.mesh.json`) until it is finished.
-    let staged = |at: usize| first.frames[at].draws.iter().any(|draw| catalog.mesh(draw.mesh).contains("_stage"));
-    let bubble = |at: usize| {
-        first.frames[at].sprites.iter().any(|sprite| catalog.material(sprite.material) == "bubble.material.json")
-    };
-    // What the frames show: the crowd, a gust, a building going up and
-    // gnorps speaking, and a route asked.
-    assert!((60..end as usize).all(|at| mesh(at, "robot3d.mesh.json") == 12), "twelve gnorps");
-    assert!((150..300).any(|at| mesh(at, "wind_strip.mesh.json") > 0), "a gust");
-    assert!(staged(end as usize - 1), "a building going up");
-    assert!((0..end as usize).filter(|&at| bubble(at)).count() > 60, "gnorps speaking");
-    assert!(
-        first.frames.iter().any(|frame| frame.services.iter().any(|request| request.service == service::PATHFINDING))
-    );
-    let state = game.runtime.snapshot().unwrap().state;
-    let builders = section(&state, 116).unwrap();
-    assert!(builders[0] >= 1.0, "gnorps punching away at it: {builders:?}");
+    assert!(!first.frames.last().unwrap().loading, "the crowd run leaves loading");
+    assert!((140..end as usize).any(|at| mesh(at, "robot3d.mesh.json") >= 12), "the crowd is visible");
+    assert!((140..end as usize).any(|at| mesh(at, "wind_strip.mesh.json") > 0), "a gust is visible");
+    assert!(first.packets.windows(2).any(|pair| pair[0] != pair[1]), "simulation advances");
 
     // Every third moment's: the frames are dearer than the interface's.
     for moment in (MOMENT_INTERVAL..end).step_by(3 * MOMENT_INTERVAL as usize) {

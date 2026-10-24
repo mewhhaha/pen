@@ -15,6 +15,7 @@ for (const name of names) {
 const browser = await launch({ gpu: false });
 const messages = [];
 let stage = 'opening qualification page';
+let evidence = {};
 let timer;
 const started = performance.now();
 try {
@@ -70,12 +71,17 @@ try {
     const actual = Buffer.from(received[index], 'base64');
     if (!expected.equals(actual)) mismatches.push(names[index]);
   }
-  await writeFile(`${directory}/browser.snapshot`, Buffer.from(snapshot, 'base64'));
-  await writeFile(`${directory}/browser-conformance.json`, JSON.stringify({ frames: received.length, mismatches, platform, browser: browserName, guests, elapsed_ms: performance.now() - started, messages }, null, 2));
+  const state = Buffer.from(snapshot, 'base64');
+  const nativeState = await readFile(`${directory}/native.snapshot`);
+  const snapshotEqual = nativeState.equals(state);
+  await writeFile(`${directory}/browser.snapshot`, state);
+  evidence = { frames: received.length, mismatches, snapshotEqual, snapshotBytes: state.length, platform, browser: browserName, guests };
+  await writeFile(`${directory}/browser-conformance.json`, JSON.stringify({ ...evidence, elapsed_ms: performance.now() - started, messages }, null, 2));
   if (mismatches.length) throw new Error(`Native/browser packets differ: ${mismatches.join(', ')}`);
-  console.log(`${received.length} native/browser packets agree bit-for-bit (${browserName}, guests through ${guests}); browser snapshot saved.`);
+  if (!snapshotEqual) throw new Error('Native/browser final snapshots differ');
+  console.log(`${received.length} native/browser packets agree bit-for-bit (${browserName}, guests through ${guests}); final snapshots agree bit-for-bit.`);
   console.log(platform);
 } catch (error) {
-  await writeFile(`${directory}/browser-conformance.json`, JSON.stringify({ failure: String(error), stage, elapsed_ms: performance.now() - started, messages }, null, 2));
+  await writeFile(`${directory}/browser-conformance.json`, JSON.stringify({ ...evidence, failure: String(error), stage, elapsed_ms: performance.now() - started, messages }, null, 2));
   throw error;
 } finally { clearTimeout(timer); await browser.close(); }

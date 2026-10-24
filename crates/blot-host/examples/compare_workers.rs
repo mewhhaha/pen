@@ -48,6 +48,28 @@ fn main() -> Result<()> {
             x[5]
         })
         .collect();
+    // Keep timing diagnostics out of the paired performance samples.
+    let mut timelines = vec![];
+    for pool in &mut pools {
+        pool.set_tracing(true);
+        let values: Vec<_> =
+            pool.run(inputs.clone())?.into_iter().collect::<Result<_, _>>().map_err(|error| anyhow::anyhow!(error))?;
+        ensure!(reference.as_ref() == Some(&values), "tracing changed worker results");
+        timelines.push(
+            pool.timings()
+                .iter()
+                .map(|timing| {
+                    json!({
+                        "job": timing.job, "worker": timing.worker,
+                        "submittedMs": timing.submitted.as_secs_f64() * 1000.0,
+                        "startedMs": timing.started.as_secs_f64() * 1000.0,
+                        "finishedMs": timing.finished.as_secs_f64() * 1000.0,
+                        "succeeded": timing.succeeded,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
     for pool in &mut pools {
         pool.close()?;
     }
@@ -55,6 +77,8 @@ fn main() -> Result<()> {
         &args[3],
         serde_json::to_vec_pretty(&json!({"host":"Pen isolated Wasmtime worker instances",
         "wasm":wasm,"entry":args[1], "size":size,"jobs":32,"workers":[1,4],"samplesMs":samples,"medianMs":median,
+        "timelines":timelines,"timelineIncludes":"separate traced batch, not included in paired samples; queue wait and fresh instance execution/teardown",
+        "timingContext":std::env::var("PEN_BENCH_CONTEXT").unwrap_or_else(|_| "not recorded".into()),
         "ratio":median[1]/median[0],"includes":"fresh instance, copied input/output, work, teardown; excludes shared module compilation"}))?,
     )?;
     Ok(())

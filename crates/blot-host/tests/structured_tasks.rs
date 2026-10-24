@@ -95,14 +95,30 @@ fn copied_worker_batches_are_bounded_ordered_and_reusable() -> Result<()> {
     let mut pool = blot_host::workers::Workers::new(&engine, &module, "collected", 4)?;
     for _ in 0..3 {
         let results = pool.run((0..32).map(Value::U32).collect())?;
+        assert!(pool.timings().is_empty());
         for (index, value) in results.into_iter().enumerate() {
             assert_eq!(value.unwrap(), Value::U32(u32::try_from(index)? * 2 + 42));
         }
     }
     assert!(pool.run(vec![Value::U32(0); 33]).is_err());
     assert!(pool.run(vec![Value::ArrayU32(vec![0; 16_385])]).is_err());
+    pool.set_tracing(true);
     assert!(pool.run(vec![Value::ArrayU32(vec![0])])?[0].is_err());
+    assert_eq!(pool.timings().len(), 1);
+    assert!(!pool.timings()[0].succeeded);
+    let results = pool.run((0..32).map(Value::U32).collect())?;
+    assert_eq!(pool.timings().len(), 32);
+    for (index, timing) in pool.timings().iter().enumerate() {
+        assert_eq!(timing.job, index);
+        assert!(timing.worker < 4);
+        assert!(timing.submitted <= timing.started && timing.started <= timing.finished);
+        assert!(timing.succeeded);
+        assert_eq!(results[index].as_ref().unwrap(), &Value::U32(u32::try_from(index)? * 2 + 42));
+    }
     assert_eq!(pool.run(vec![Value::U32(1)])?[0].as_ref().unwrap(), &Value::U32(44));
+    assert_eq!(pool.timings().len(), 1);
+    pool.set_tracing(false);
+    assert!(pool.timings().is_empty());
     assert!(pool.run(vec![])?.is_empty());
     pool.close()?;
     pool.close()?;

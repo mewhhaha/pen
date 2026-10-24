@@ -248,11 +248,13 @@ pub mod types {
     /// maximum). Row zero refreshes the snapshot; subsequent pages read that same snapshot.
     /// Value is the total system count. Each row contains stage (Start through Settle, 0-6),
     /// id, calls since the previous snapshot, mean milliseconds, maximum milliseconds,
-    /// execution mode (0 sequential), name length and code points. Uncalled systems have -1
-    /// timings. Unsupported hosts answer unavailable. semantic exchanges bounded JSON text for
-    /// opt-in application descriptors, decoded object values, decision events, watches and
-    /// exact timeline seeks; see docs/semantic-inspection.md for version 1, limits, pagination
-    /// and explicit unavailable reasons.
+    /// execution mode (0 sequential), mean requested allocation bytes per call, mean allocation
+    /// count per call, name length and code points. Uncalled systems have -1 timings;
+    /// allocation means are -1 without allocation instrumentation or calls. Unsupported hosts
+    /// answer unavailable. semantic exchanges bounded JSON text for opt-in application
+    /// descriptors, decoded object values, decision events, watches and exact timeline seeks;
+    /// see docs/semantic-inspection.md for version 1, limits, pagination and explicit
+    /// unavailable reasons.
     pub mod devtools_op {
         pub const LOG: u32 = 0;
         pub const FRAME: u32 = 1;

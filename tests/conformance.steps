@@ -1,7 +1,7 @@
 # Input replayed on wasmtime and V8 by `just conformance`: the editor, play,
 # strikes on the rock, the interface's actions and keyboard focus, a drag, a
 # tunable, the wheel and the menu.
-wait=30 key=Tab wait=40
+wait=100 console=7,0 wait=40
 click=470,150 wait=20 click=470,152 wait=20 click=471,150 wait=30
 ui=0x20001,activate wait=20 ui=0x20011,activate wait=10 key=F10 key=Tab wait=4 key=Escape key=Escape wait=10
 drag=300,500,600,450 tune=camera.zoom_speed=0.002 wheel=-300,480,320 wait=40

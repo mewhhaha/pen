@@ -20,7 +20,15 @@ pub fn missing(what: &str) {
 
 /// The exported game (`dist/gdev`), if it is there.
 pub fn bundle() -> Option<PathBuf> {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist/gdev");
+    let override_path = std::env::var_os("PEN_TEST_BUNDLE");
+    let directory = override_path
+        .as_ref()
+        .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist/gdev"), PathBuf::from);
+    assert!(
+        override_path.is_none() || directory.join("game.wasm").is_file(),
+        "PEN_TEST_BUNDLE has no game.wasm: {}",
+        directory.display()
+    );
     if directory.join("game.wasm").is_file() {
         return Some(directory);
     }

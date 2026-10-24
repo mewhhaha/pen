@@ -2178,6 +2178,9 @@ function readGuestAbi(module) {
     const state = new Uint8Array(ownership[0]);
     if (state.length !== 3 || state[0] !== 1 && state[0] !== 2 || state[1] > state[0] || state[2] > 7 || state[1] !== 0 !== (state[2] === 0) || version >= 3 !== (state[0] === 2 && state[1] === 2)) throw new GuestError("invalid_abi", "Invalid ownership section");
     if (state[2] !== 1) {
+      if (actualExports.some((entry) => entry.name === "blot:allocation")) {
+        declare("blot:allocation", "function");
+      }
       for (const counter of [
         "leases",
         "retains",

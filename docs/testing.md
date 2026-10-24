@@ -190,3 +190,13 @@ of slow tests takes about as long as its slowest few rather than all of them
 in turn; the deadline a test may run is 600 s (it was 120 s), and
 `--deadline SECONDS` sets another, since the time a test waits for a core
 counts.
+
+Set `PEN_TEST_BUNDLE` to an isolated `pen export` directory when qualifying
+concurrent work. An explicitly selected missing bundle fails, even without
+`PEN_REQUIRE_FIXTURES`; it never falls back to a stale `dist/gdev`.
+
+The native/browser conformance fixture compares every rendered packet and the
+final save file byte for byte. `pen packets` writes `native.snapshot` using the
+same snapshot container as the browser; this witness is outside benchmark timing
+samples. `just conformance` serves isolated responses so `PEN_WEB_WITHOUT=jspi`
+can exercise the worker fallback as well.

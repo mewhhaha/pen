@@ -80,6 +80,10 @@ checkout (or with `--project DIR`):
 | `pen serve`, `pen push ADDRESS` | Receive packages pushed over the network (a Steam Deck's end), and push one there ("Pushing to another machine") |
 | `pen remote ADDRESS [REQUEST...]` | Ask a game run with `--devtools-listen` one dev tools request ("Remote dev tools") |
 
+CPU captures send the normal session-start and renderer-ready events. With no
+script they observe the game's authored startup; use `--script` or
+`--script-file` to select the gameplay workload being measured.
+
 Without a command, `pen` plays a packaged game: `game/` beside the
 executable, or `--game DIR`. `pen --help` lists every option and environment
 variable; a mistyped command or option is refused, with the nearest name.
@@ -301,7 +305,9 @@ and the game with the optional `blot:allocation` export before capturing.
 Normal runs retain the original module and entrypoint.
 
 Exit normally to finish the Chrome/Perfetto JSON and its adjacent
-`systems.summary.json`. Spans carry stage, system name/id, frame, elapsed
+`systems.summary.json`. With this capture enabled, `/systems` also shows mean requested KiB and allocation count per call. Timing-only windows show allocation traffic as unavailable. These counts include reused arena blocks and exclude headers/size-class rounding; they are traffic, not live memory.
+
+Spans carry stage, system name/id, frame, elapsed
 microseconds, allocation requests and requested bytes. The summary has calls,
 total/mean/max time, total/mean bytes, allocation count and aborted calls.
 Reloaded guests share the capture and get separate timeline tracks.

@@ -35,6 +35,14 @@ Jobs cannot receive callback capabilities. Execution deadlines depend on the
 supplied engine; this API does not provide cooperative cancellation of a running
 job. It is not connected to game scheduling or the structured-task ABI.
 
+`Workers::set_tracing(true)` records submission, execution start and completion
+for the latest accepted batch, including worker index and success/failure.
+`timings()` returns at most 32 records in input order. Tracing is off by default;
+disabling it clears the history and avoids per-job clock reads. These host times
+are diagnostics, never simulation inputs or saved continuations. The
+`compare_workers` example captures a separate traced batch after its performance
+samples, so tracing overhead does not enter the paired timing comparison.
+
 Ink's opt-in `task_queue` now implements the explicit cross-frame state machine:
 world epochs, ordered publication, saved request/result/continuation values,
 cancellation and bounded logical timelines. `services/typed` validates domain

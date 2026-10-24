@@ -185,12 +185,16 @@ mod replay {
     /// page, which shows what the platform service answered. Returns each
     /// frame's input and packet hash.
     fn play(runtime: &mut GameRuntime, services: &mut Services) -> (Vec<Vec<f32>>, Vec<u64>) {
-        let steps = "wait=30 key=F2 wait=5 key=PageDown wait=2 key=PageDown wait=2 key=PageDown wait=30";
+        let steps =
+            "wait=100 console=7,0 wait=30 key=F2 wait=5 key=PageDown wait=2 key=PageDown wait=2 key=PageDown wait=30";
         let mut script = Script::new(script::parse(&[steps.to_owned()]).unwrap());
         let (mut inputs, mut packets) = (Vec::new(), Vec::new());
         let mut time = 0.0;
         while !script.done() {
             let mut events = script.tick(VIEWPORT).events;
+            if inputs.is_empty() {
+                events.insert(0, pen_protocol::GameEvent::RendererReady);
+            }
             events.extend(services.take_answers());
             let input = runtime.input(&Frame { timestamp: time, viewport: VIEWPORT, events }).unwrap();
             time += 1.0 / 60.0;

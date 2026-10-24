@@ -1,2 +1,2 @@
-Tab: Settings -> Exit -> Continue -> Settings
+Tab: Settings -> Main menu -> Exit -> Continue
 no findings

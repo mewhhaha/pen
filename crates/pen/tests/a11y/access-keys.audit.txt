@@ -1,2 +1,2 @@
-Tab: Text size -> Reduced motion -> Back -> Accessibility -> Colour filter -> Text size -> Reduced motion
+Tab: Text size -> Reduced motion -> Sound captions -> Back -> Accessibility -> Colour filter -> Text size
 no findings

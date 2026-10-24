@@ -44,8 +44,34 @@ fn tracing_preserves_every_packet_and_snapshot() {
     let path = std::env::temp_dir().join(format!("pen-game-trace-{}.json", std::process::id()));
     let trace = SystemTrace::create(&path, 100_000).unwrap();
     let traced = GuestModule::traced(&engine, &wasm, None, trace.clone()).unwrap();
+    trace.systems(true, 0);
     let actual = run(&engine, &traced);
     assert_eq!(actual, expected, "profiling must preserve the wire packets and final saved world");
+    let (total, mut values) = trace.systems(true, 0);
+    let mut observed = 0;
+    let mut measured = 0;
+    let mut allocated = 0.0;
+    loop {
+        let mut at = 0;
+        while at < values.len() {
+            assert!(at + 9 <= values.len());
+            let length = usize::try_from(pen_protocol::boundary::whole(values[at + 8]).unwrap()).unwrap();
+            assert!(at + 9 + length <= values.len());
+            if values[at + 2] > 0.0 {
+                measured += 1;
+                assert!(values[at + 3] >= 0.0 && values[at + 6] >= 0.0 && values[at + 7] >= 0.0);
+                allocated += values[at + 6];
+            }
+            observed += 1;
+            at += 9 + length;
+        }
+        if observed == total {
+            break;
+        }
+        values = trace.systems(true, observed).1;
+        assert!(!values.is_empty(), "live timing pagination stopped before all systems");
+    }
+    assert!(measured > 10 && allocated > 0.0, "actual game must populate live timing and allocation rows");
     drop(traced);
     drop(trace);
     let capture: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();

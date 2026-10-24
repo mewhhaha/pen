@@ -46,10 +46,13 @@ fn main() -> Result<()> {
             }
             for index in order {
                 let start = Instant::now();
+                let mut last = Vec::new();
                 for _ in 0..50 {
-                    guest.call(names[index], Value::U32(size))?;
+                    last = guest.call(names[index], Value::U32(size))?.into_f32_array()?;
                 }
                 samples[index].push(start.elapsed().as_secs_f64() * 1000.0 / 50.0);
+                let bits: Vec<_> = last.iter().map(|value| value.to_bits()).collect();
+                ensure!(reference.as_ref() == Some(&bits), "{}: output changed during timing", names[index]);
             }
         }
         let medians: Vec<_> = samples

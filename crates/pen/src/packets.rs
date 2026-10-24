@@ -8,7 +8,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use blot_host::GuestModule;
 use pen_protocol::boundary::{decode_frame, encode_frame, read_catalog};
-use pen_protocol::{Extension, Frame, Viewport};
+use pen_protocol::{Extension, Frame, GameEvent, Viewport};
 use pen_runtime::timeline::MOMENT_INTERVAL;
 
 use crate::program::{Operation, Program};
@@ -72,8 +72,9 @@ pub fn run(mut run: Run) -> Result<Measured> {
         let _ = std::fs::remove_file(out.join("extensions.jsonl"));
         std::fs::write(out.join("schema.txt"), program.schema.to_string())?;
     }
-    // Without steps, the editor and back again, to show its interface.
-    let steps = if run.steps.is_empty() { script::parse(&["wait=60 key=Tab".into()])? } else { run.steps };
+    // Default captures observe the authored startup. A workload supplies its
+    // own game-specific controls instead of the host guessing an editor key.
+    let steps = if run.steps.is_empty() { script::parse(&["wait=120".into()])? } else { run.steps };
     let scripted = run.frames.is_none();
     let mut script = Script::new(steps);
     let mut times = Vec::new();
@@ -89,7 +90,13 @@ pub fn run(mut run: Run) -> Result<Measured> {
         if scripted && script.done() {
             break;
         }
-        let events = script.tick(run.viewport).events;
+        let mut events = script.tick(run.viewport).events;
+        // No renderer loads asynchronously here. Record the same readiness
+        // event a real host sends so captures can leave the loading screen.
+        if index == 0 {
+            events.insert(0, GameEvent::RendererReady);
+            events.insert(0, GameEvent::SessionStarted { restored: 0 });
+        }
         let frame = Frame { timestamp: index as f64 / 60.0, viewport: run.viewport, events };
         let elapsed = if index == 0 { 0.0 } else { 1.0 / 60.0 };
         let mut input = encode_frame(&frame, elapsed, &[])?;
@@ -132,8 +139,62 @@ pub fn run(mut run: Run) -> Result<Measured> {
         );
     }
     if let Some(out) = out {
-        eprintln!("wrote {} frames' inputs and packets to {}", times.len(), out.display());
+        // Compare hidden simulation state as well as presentation packets.
+        // This final witness is outside the frame/snapshot timing samples.
+        let state = program.request(Operation::Snapshot, &[])?;
+        program.accept();
+        snapshot::write(&out.join("native.snapshot"), &snapshot::SavedState { schema: program.schema, state })?;
+        eprintln!("wrote {} frames' inputs, packets and final snapshot to {}", times.len(), out.display());
     }
     program.close();
     Ok(Measured { frames: times, snapshots })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_capture_leaves_loading_and_reaches_the_scripted_scene() {
+        let Some(bundle) = crate::fixtures::bundle() else { return };
+        let engine = blot_host::engine().unwrap();
+        let wasm = std::fs::read(bundle.join("game.wasm")).unwrap();
+        let cache = std::env::temp_dir().join("pen-test-wasm");
+        let module = GuestModule::new(&engine, &wasm, Some(&cache)).unwrap();
+        let mut guest = Program::start(&engine, &module).unwrap();
+        let schema = guest.schema;
+        guest.close();
+        let assets = bundle.join("assets");
+        let catalog = read_catalog(&assets).unwrap();
+        let out = std::env::temp_dir().join(format!("pen-packets-loading-{}", std::process::id()));
+        let measured = run(Run {
+            module: &module,
+            engine: &engine,
+            assets,
+            scene: bundle.join("main.scene"),
+            viewport: Viewport { width: 960, height: 640 },
+            out: Some(out.clone()),
+            frames: Some(110),
+            steps: script::parse(&["wait=100 console=7,0 wait=10".into()]).unwrap(),
+            mods: None,
+            snapshots: false,
+            describe: &|_| serde_json::Value::Null,
+        })
+        .unwrap();
+        let read = |index: usize| {
+            let bytes = std::fs::read(out.join("output").join(format!("{index:05}.f32"))).unwrap();
+            let (words, remainder) = bytes.as_chunks::<4>();
+            assert!(remainder.is_empty());
+            let lanes: Vec<f32> = words.iter().copied().map(f32::from_le_bytes).collect();
+            decode_frame(&lanes, schema, &catalog).unwrap().render
+        };
+        assert!(read(0).loading, "capture includes startup");
+        let played = read(measured.frames.len() - 1);
+        assert!(!played.loading, "readiness releases the game's loading gate");
+        assert!(!played.draws.is_empty(), "the scripted level draws its world");
+        let saved = snapshot::read(&out.join("native.snapshot")).unwrap();
+        assert_eq!(saved.schema, schema);
+        assert!(!saved.state.is_empty(), "the final witness uses the shared disk save format");
+        std::fs::remove_dir_all(out).unwrap();
+    }
 }

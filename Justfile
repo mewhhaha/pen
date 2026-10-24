@@ -208,7 +208,7 @@ packets: export
   rm -rf dist/packets-run
 
 sync-protocol:
-  {{pen}} codegen --project {{gdev}} --rust crates/pen-protocol/src/packets.rs
+  cargo run --release -q -p pen-codegen -- --project {{gdev}} --rust crates/pen-protocol/src/packets.rs
 
 # Includes the full Blot suite, not only smoke fixtures.
 test: check visual determinism blot-tests conformance

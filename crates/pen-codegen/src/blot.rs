@@ -807,6 +807,7 @@ import * as types from "./types""#
     let program = crate::program::program(&top);
     let frame = crate::program::frame(model, &top);
     let check = crate::program::check(&top);
+    let testing = crate::program::testing(&top);
     let mut numeric = top;
     numeric.extend(NUMERIC.lines().map(str::to_owned));
     numeric.push(String::new());
@@ -819,5 +820,6 @@ import * as types from "./types""#
         ("program.blot", program),
         ("frame.blot", frame),
         ("check.blot", check),
+        ("test.blot", testing),
     ]
 }

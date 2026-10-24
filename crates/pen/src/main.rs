@@ -619,7 +619,7 @@ const CHECKOUT: &[&str] = &[
     "fuzz",
 ];
 
-const OPTIONS: [OptionSpec; 100] = [
+const OPTIONS: [OptionSpec; 101] = [
     OptionSpec { name: "--help", value: "", commands: &[], place: Place::Prose, about: "this" },
     OptionSpec {
         name: "--out",
@@ -867,7 +867,7 @@ const OPTIONS: [OptionSpec; 100] = [
     OptionSpec {
         name: "--update",
         value: "",
-        commands: &["test"],
+        commands: &["test", "test-blot"],
         place: Place::Command,
         about: "write the shots as the golden images",
     },
@@ -896,16 +896,23 @@ const OPTIONS: [OptionSpec; 100] = [
     OptionSpec {
         name: "--golden",
         value: "DIR",
-        commands: &["test"],
+        commands: &["test", "test-blot"],
         place: Place::Command,
-        about: "the golden images (default golden/ beside FILE)",
+        about: "the golden images (default golden/ beside FILE; tests/scenarios/golden for --session)",
     },
     OptionSpec {
         name: "--out",
         value: "DIR",
-        commands: &["test"],
+        commands: &["test", "test-blot"],
         place: Place::Command,
-        about: "where shots and differences go (default .pen/visual)",
+        about: "where shots and differences go (default .pen/visual; .pen/session-tests for --session)",
+    },
+    OptionSpec {
+        name: "--session",
+        value: "",
+        commands: &["test-blot"],
+        place: Place::Command,
+        about: "run Blot driver tests against isolated native headless sessions, sequentially (explicit test files required)",
     },
     OptionSpec {
         name: "--filter",
@@ -1164,7 +1171,7 @@ const OPTIONS: [OptionSpec; 100] = [
     OptionSpec {
         name: "--software",
         value: "",
-        commands: &["", "dev", "run", "test"],
+        commands: &["", "dev", "run", "test", "test-blot"],
         place: Place::Play,
         about: "draw on a software GPU adapter (lavapipe, WARP), as PEN_SOFTWARE=1 does",
     },
@@ -2416,8 +2423,31 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             let project = checkout()?;
             let files = args.operands.iter().map(PathBuf::from).collect();
             let deadline = args.number::<u64>("--deadline")?.map(std::time::Duration::from_secs);
-            let options =
-                blot_test::Options { files, filter: args.value("--filter"), jobs: args.number("--jobs")?, deadline };
+            let session = if args.flag("--session") {
+                ensure!(!args.operands.is_empty(), "--session requires explicit Blot scenario files");
+                Some(blot_test::SessionOptions {
+                    out: args.path("--out"),
+                    golden: args.path("--golden"),
+                    update: args.flag("--update"),
+                    software: args.flag("--software") || std::env::var_os("PEN_SOFTWARE").is_some_and(|v| v == "1"),
+                })
+            } else {
+                ensure!(
+                    !args.flag("--update")
+                        && !args.flag("--software")
+                        && args.path("--out").is_none()
+                        && args.path("--golden").is_none(),
+                    "--out, --golden, --update and --software need --session for test-blot"
+                );
+                None
+            };
+            let options = blot_test::Options {
+                files,
+                filter: args.value("--filter"),
+                jobs: args.number("--jobs")?,
+                deadline,
+                session,
+            };
             blot_test::run(&project.root, options)
         }
         #[cfg(not(feature = "compiler"))]

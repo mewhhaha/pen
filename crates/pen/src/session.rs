@@ -21,6 +21,8 @@ mod bindings;
 mod gpu;
 mod preferences;
 mod profile;
+#[cfg(feature = "compiler")]
+mod testing;
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -536,8 +538,22 @@ impl Session {
         engine: wasmtime::Engine,
         module: GuestModule,
         catalog: Catalog,
+        gpu: Gpu,
+        window: Option<&Window>,
+    ) -> Result<Session> {
+        Self::with_services(options, paths, engine, module, catalog, gpu, window, crate::services::standard())
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "startup dependencies plus the selected service registry")]
+    fn with_services(
+        options: Options,
+        paths: Paths,
+        engine: wasmtime::Engine,
+        module: GuestModule,
+        catalog: Catalog,
         mut gpu: Gpu,
         window: Option<&Window>,
+        mut services: Services,
     ) -> Result<Session> {
         // What the scene draws first loads first, side by side, while the
         // program starts; the rest of the catalog streams in behind it.
@@ -579,7 +595,6 @@ impl Session {
             preferences.preset(crate::presets::first_run(&paths.assets, &adapter, options.headless));
         }
         preferences.replay(&mut input);
-        let mut services = crate::services::standard();
         let actions = bindings::load(&paths.bindings);
         services.register(Box::new(pen_runtime::actions::InputService(actions.clone())));
         services.register(Box::new(preferences.service()));

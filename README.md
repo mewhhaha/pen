@@ -532,6 +532,11 @@ crates and sources of all three lockfiles against `deny.toml`
   out (for Blot: ordinary tests, expected traps and rejected programs) through
   real compiler sessions. The migration run passed 482 tests
   across 55 modules, including the new dev tools panels.
+- **Blot session scenarios:** `pen test-blot --session FILE.blot` gives a separate
+  test guest control of a real native headless session: initial saves, UI
+  selectors and pointer input, fixed steps, state assertions and screenshot
+  comparisons. Runs retain saves, input replays and action traces. See
+  [the scenario API](docs/testing.md#blot-scenarios-driving-native-sessions).
 - **Browser:** the harnesses in `crates/pen-web/tests/` exercise the real JSPI
   host and WebGPU shaders in headless Chromium. FXAA witnesses agree with native
   output within one 8-bit channel step. See the browser README for commands.

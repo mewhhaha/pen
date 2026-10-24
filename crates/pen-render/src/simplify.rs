@@ -28,7 +28,11 @@ const KEPT: f64 = 0.75;
 /// empty list when undeformed-space error cannot bound their visible surface.
 pub fn pack_mesh_with_lods(bytes: &[u8]) -> Result<Vec<u8>> {
     let mesh = parse_mesh(bytes)?;
-    if mesh.authored_lods || mesh.lods.len() > 1 || mesh.lods[0].count as usize / 3 < LEAST_TRIANGLES {
+    if mesh.instances.is_some()
+        || mesh.authored_lods
+        || mesh.lods.len() > 1
+        || mesh.lods[0].count as usize / 3 < LEAST_TRIANGLES
+    {
         return pack(&mesh);
     }
     pack(&simplified(mesh)?)

@@ -103,7 +103,7 @@ fn parent(index: usize, node: &UiNode) -> Option<usize> {
 
 /// Which nodes the tree has: those not hidden nor under a node it leaves
 /// out, the first with each id.
-fn included(ui: &[UiNode]) -> Vec<bool> {
+pub(crate) fn included(ui: &[UiNode]) -> Vec<bool> {
     let mut ids = HashSet::with_capacity(ui.len());
     let mut included: Vec<bool> = Vec::with_capacity(ui.len());
     for (index, node) in ui.iter().enumerate() {
@@ -126,7 +126,7 @@ fn decode(points: &[f32]) -> String {
 }
 
 /// A node's name, description and value text.
-fn texts(node: &UiNode) -> [String; 3] {
+pub(crate) fn texts(node: &UiNode) -> [String; 3] {
     let text = &node.text;
     let name = (node.name_length as usize).min(text.len());
     let description = name.saturating_add(node.description_length as usize).min(text.len());

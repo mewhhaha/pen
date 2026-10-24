@@ -8,6 +8,22 @@
 pub mod types {
     /// A column-major 4x4 matrix, as WGSL and the packet lay it out.
     pub type Matrix = [f32; 16];
+    /// Version-1 native session test commands. Available only to a separate test guest in pen
+    /// test-blot --session.
+    pub mod test_driver_op {
+        pub const LAUNCH: u32 = 0;
+        pub const STEP: u32 = 1;
+        pub const CLICK: u32 = 2;
+        pub const VISIBLE: u32 = 3;
+        pub const HIDDEN: u32 = 4;
+        pub const PRESS: u32 = 5;
+        pub const SNAPSHOT: u32 = 6;
+        pub const EQUAL: u32 = 7;
+        pub const SCREENSHOT: u32 = 8;
+        pub const FINISH: u32 = 9;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 10] = ["launch", "step", "click", "visible", "hidden", "press", "snapshot", "equal", "screenshot", "finish"];
+    }
     /// What an interface node is; hosts expose it with the matching role. A textbox's value
     /// text is the text in it; a log is a list of messages whose newest lines a screen reader
     /// may announce.

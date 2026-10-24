@@ -184,7 +184,9 @@ impl Skinning {
 impl ReadyEntry {
     /// How its vertices come: skinned, instanced or plain.
     pub(super) fn stage(&self, items: &[Item]) -> Stage {
-        if self.skin.is_some() {
+        if self.persistent {
+            Stage::Persistent
+        } else if self.skin.is_some() {
             Stage::Skinned
         } else if matches!(items[self.item].shape, Shape::Batch(_)) {
             Stage::Instanced

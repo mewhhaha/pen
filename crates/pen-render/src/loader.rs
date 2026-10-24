@@ -42,6 +42,7 @@ pub(crate) enum Job {
         module: wgpu::ShaderModule,
         instancing: bool,
         skinning: bool,
+        persistent: bool,
     },
     /// Compile a depth-only pipeline, plain, instanced or skinned, once a
     /// loaded material can cast shadows.
@@ -107,6 +108,7 @@ pub(crate) enum Loaded {
         module: wgpu::ShaderModule,
         instancing: bool,
         skinning: bool,
+        persistent: bool,
         /// Its `bounds_margin`, if it declares one.
         margin: Option<f32>,
         /// Whether it reads the cascaded shadow maps.
@@ -394,8 +396,8 @@ impl Worker {
                     self.send(Message::Sorted { key, sprite });
                 }
             }
-            Job::Compile { slot, revision, samples, variants, module, instancing, skinning } => {
-                let result = self.compile(&module, instancing, skinning, samples, variants).await;
+            Job::Compile { slot, revision, samples, variants, module, instancing, skinning, persistent } => {
+                let result = self.compile(&module, instancing, skinning, persistent, samples, variants).await;
                 self.send(Message::Compiled { slot, revision, samples, variants, result });
             }
             Job::Shadow { slot, revision, module, stage } => {
@@ -421,12 +423,13 @@ impl Worker {
         module: &wgpu::ShaderModule,
         instancing: bool,
         skinning: bool,
+        persistent: bool,
         samples: u32,
         variants: Variants,
     ) -> Result<Pipelines, String> {
         let clock = platform::Clock::new();
         let result = shader::checked(&self.context.device, || {
-            shader::pipelines(&self.context, module, instancing, skinning, samples, variants)
+            shader::pipelines(&self.context, module, instancing, skinning, persistent, samples, variants)
         })
         .await;
         log::debug!("pipelines {variants:?} at {samples} samples: {:.2} ms", clock.now() * 1000.0);
@@ -514,8 +517,16 @@ impl Worker {
                 let shader = shader::compile_shader(device, &bytes).await.map(|(module, code)| {
                     let instancing = shader::has_instancing(&code);
                     let skinning = shader::has_skinning(&code);
+                    let persistent = shader::has_persistent(&code);
                     let cascaded = code.contains("shadow_cascades");
-                    Loaded::Shader { module, instancing, skinning, margin: shader::bounds_margin(&code), cascaded }
+                    Loaded::Shader {
+                        module,
+                        instancing,
+                        skinning,
+                        persistent,
+                        margin: shader::bounds_margin(&code),
+                        cascaded,
+                    }
                 });
                 self.send(loaded(shader));
             }

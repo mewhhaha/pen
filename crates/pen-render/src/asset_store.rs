@@ -15,6 +15,9 @@ use crate::culling::Sphere;
 use crate::loader::{Job, JobQueue, Priority};
 use crate::shader::Variants;
 
+mod instances;
+pub(crate) use instances::MeshInstances;
+
 /// A sprite shader is WGSL like a shader, compiled for the sprite pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AssetKind {
@@ -60,6 +63,8 @@ pub(crate) struct Mesh {
     pub authored_lods: bool,
     /// A skinned mesh's joints and weights and its rig.
     pub skin: Option<Skin>,
+    /// Immutable, shader-owned records for repeated geometry.
+    pub instances: Option<MeshInstances>,
 }
 
 /// Up to four joints (indices into the rig's joints) per vertex, and how
@@ -143,7 +148,7 @@ impl Material {
         if self.overlay {
             Variants::OCCLUDED | Variants::VISIBLE
         } else if self.opaque() {
-            Variants::OPAQUE | Variants::INSTANCED | Variants::SKINNED
+            Variants::OPAQUE | Variants::INSTANCED | Variants::SKINNED | Variants::PERSISTENT
         } else {
             Variants::TRANSLUCENT
         }
@@ -162,6 +167,7 @@ const MESH_SHORT_INDICES: u8 = 2;
 // (`animation::write_rig`); simpler levels of detail follow the indices.
 const MESH_SKIN: u8 = 4;
 const MESH_LODS: u8 = 8;
+const MESH_INSTANCES: u8 = 16;
 const MESH_HEADER: usize = 16;
 
 /// A mesh as its JSON has it: flat arrays, three or two numbers a vertex,
@@ -187,6 +193,8 @@ struct MeshArrays {
     clips: Option<Vec<Clip>>,
     #[serde(default)]
     lods: Option<Vec<LodArrays>>,
+    #[serde(default)]
+    instances: Option<MeshInstances>,
 }
 
 #[derive(Deserialize)]
@@ -201,8 +209,20 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
         return unpack_mesh(bytes);
     }
     let arrays: MeshArrays = serde_json::from_slice(bytes).map_err(|error| anyhow!("mesh JSON: {error}"))?;
-    let MeshArrays { positions, normals, uvs, attributes, indices, lods, joints, weights, skeleton, skin, clips } =
-        arrays;
+    let MeshArrays {
+        positions,
+        normals,
+        uvs,
+        attributes,
+        indices,
+        lods,
+        joints,
+        weights,
+        skeleton,
+        skin,
+        clips,
+        instances,
+    } = arrays;
     let count = positions.len() / 3;
     ensure!(
         positions.len() % 3 == 0
@@ -237,6 +257,7 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
     let lods: Vec<(f32, Vec<u32>)> = lods.unwrap_or_default().into_iter().map(|lod| (lod.error, lod.indices)).collect();
     let mut mesh = checked_mesh(vertices, indices, &lods, skin)?;
     mesh.authored_lods = authored_lods;
+    mesh.set_instances(instances)?;
     Ok(mesh)
 }
 
@@ -244,6 +265,9 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
 /// coordinates.
 pub fn mesh_bounds(bytes: &[u8]) -> Result<([f32; 3], [f32; 3])> {
     let mesh = parse_mesh(bytes)?;
+    if let Some(instances) = &mesh.instances {
+        return Ok((instances.min, instances.max));
+    }
     let mut bounds = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
     for vertex in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
         for (axis, &coordinate) in vertex[..3].iter().enumerate() {
@@ -294,7 +318,7 @@ pub(crate) fn checked_mesh(
     }
     let lods = levels(&mut indices, simpler)?;
     let bounds = Sphere::around(&vertices, MESH_VERTEX_FLOATS);
-    let mut mesh = Mesh { vertices, indices, bounds, lods, authored_lods: !simpler.is_empty(), skin };
+    let mut mesh = Mesh { vertices, indices, bounds, lods, authored_lods: !simpler.is_empty(), skin, instances: None };
     let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
     ensure!(count != 0, "mesh requires matching position/normal/UV vertices and triangle indices");
     ensure!(mesh.indices.iter().all(|&index| (index as usize) < count), "mesh index is outside its vertex array");
@@ -331,12 +355,13 @@ pub(crate) fn checked_mesh(
 /// The compact binary form of a mesh asset (JSON, or already binary), which
 /// the renderer reads in place of its JSON under the same key: "PMSH",
 /// version 1, flags (1: shader attributes, 2: 16-bit indices, 4: a skin,
-/// 8: simpler levels of detail), two zero bytes, then the vertex and index
+/// 8: simpler levels of detail, 16: persistent instances), two zero bytes, then the vertex and index
 /// counts (u32s), each vertex's position, normal, UV and, flagged,
 /// attributes (f32s), and the indices; flagged, then the count of simpler
 /// levels (u32), each one's index count (u32) and error (f32), and their
 /// indices; flagged, a skinned mesh's each vertex's joints (u16s) and
-/// weights (f32s) and its rig. All little-endian.
+/// weights (f32s) and its rig; or persistent instance count, min/max bounds,
+/// and 20 f32s per record. All little-endian.
 pub fn pack_mesh(bytes: &[u8]) -> Result<Vec<u8>> {
     pack(&parse_mesh(bytes)?)
 }
@@ -356,7 +381,8 @@ pub(crate) fn pack(mesh: &Mesh) -> Result<Vec<u8>> {
         if attributes { MESH_ATTRIBUTES } else { 0 }
             | if short { MESH_SHORT_INDICES } else { 0 }
             | if mesh.skin.is_some() { MESH_SKIN } else { 0 }
-            | if lods { MESH_LODS } else { 0 },
+            | if lods { MESH_LODS } else { 0 }
+            | if mesh.instances.is_some() { MESH_INSTANCES } else { 0 },
         0,
         0,
     ]);
@@ -396,6 +422,9 @@ pub(crate) fn pack(mesh: &Mesh) -> Result<Vec<u8>> {
         }
         write_rig(&skin.rig, &mut packed);
     }
+    if let Some(instances) = &mesh.instances {
+        instances.write(&mut packed)?;
+    }
     Ok(packed)
 }
 
@@ -404,8 +433,12 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
     ensure!(bytes[4] == MESH_VERSION, "unsupported binary mesh version");
     let flags = bytes[5];
     ensure!(
-        flags & !(MESH_ATTRIBUTES | MESH_SHORT_INDICES | MESH_SKIN | MESH_LODS) == 0,
+        flags & !(MESH_ATTRIBUTES | MESH_SHORT_INDICES | MESH_SKIN | MESH_LODS | MESH_INSTANCES) == 0,
         "unsupported binary mesh flags"
+    );
+    ensure!(
+        flags & (MESH_SKIN | MESH_INSTANCES) != (MESH_SKIN | MESH_INSTANCES),
+        "a mesh cannot have both a skin and persistent instances"
     );
     let word = |at: usize| -> Result<usize> {
         let word = bytes.get(at..at + 4).context("binary mesh size does not match its counts")?;
@@ -471,11 +504,14 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
         }
         Some(Skin { joints, weights, rig: read_rig(&bytes[skin_end..])? })
     } else {
-        ensure!(at == bytes.len(), "binary mesh size does not match its counts");
+        ensure!(flags & MESH_INSTANCES != 0 || at == bytes.len(), "binary mesh size does not match its counts");
         None
     };
     let mut mesh = checked_mesh(vertices, indices, &simpler, skin)?;
     mesh.authored_lods = true;
+    if flags & MESH_INSTANCES != 0 {
+        mesh.set_instances(Some(MeshInstances::read(&bytes[at..])?))?;
+    }
     Ok(mesh)
 }
 

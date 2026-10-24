@@ -111,13 +111,13 @@ pub struct TestOptions {
 
 /// How far apart two images are: RMSE and the largest difference, both over
 /// the colour channels in 0..1, and the share of pixels that differ visibly.
-struct Difference {
-    rmse: f64,
+pub(crate) struct Difference {
+    pub(crate) rmse: f64,
     largest: f64,
     changed: f64,
 }
 
-fn compare(actual: &image::RgbaImage, golden: &image::RgbaImage, diff: &Path) -> Result<Difference> {
+pub(crate) fn compare(actual: &image::RgbaImage, golden: &image::RgbaImage, diff: &Path) -> Result<Difference> {
     let mut squares = 0.0f64;
     let mut largest = 0u8;
     let mut changed = 0usize;

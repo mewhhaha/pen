@@ -7,6 +7,93 @@ property tests between the Rust and Blot codecs, bug reports, and benchmarks
 compared from commit to commit. None of them needs a window; only the golden
 images and recording a session need the GPU.
 
+## Blot scenarios driving native sessions
+
+`pen test-blot --session FILE.blot` runs a separate Blot test guest against a
+real, isolated native game session, including the GPU. No desktop window opens.
+Explicit files are required; ordinary `pen test-blot` remains the CPU test suite.
+Session scenarios run sequentially, regardless of `--jobs`.
+
+```sh
+pen codegen --project ../gdev
+pen test-blot --project ../gdev --session tests/scenarios/continue.blot
+```
+
+The generated `pen/test` module supplies the driver API. A scenario entry takes
+`Array F32 -> Array F32 ! { Foreign }` and returns the ordinary check report via
+`test.run`. The test and game have separate Wasm instances and stacks. The driver
+is only admitted in this test mode; games receive their usual frame capability.
+
+```blot
+import * as test from "pen/test"
+import * as fixtures from "test/scenario_fixtures"
+
+entry const test_continue = fn (driver: Array F32 -> Array F32 ! { Foreign }) =>
+  test.run driver $ fn session => do:
+    use test.launch session (fixtures.colony ()) 960 640
+    use test.expect_visible session (test.button "Continue")
+    use test.click session (test.button "Continue")
+    use test.expect_hidden session (test.button "Continue")
+    use saved <- test.snapshot session
+    use test.equal session "stored salt" #[31.0] (fixtures.inventory saved)
+    use test.expect_screenshot session "continued" 0.01
+    break ()
+```
+
+The example's `fixtures` is application code: `colony` returns
+`#test.Save { schema, state }`, using the game's ordinary save encoder;
+`inventory` decodes or inspects a returned save. Pen does not interpret its
+payload. gdev's `tests/scenarios/continue.blot` is a complete runnable example,
+including its fixture and state reader.
+
+| Operation | Behaviour |
+| --- | --- |
+| `launch session save width height` | Restores the save at startup in a fresh data directory; one game per test. Viewport sides are 64–2048 pixels. |
+| `step session ticks` | Advances exactly that many game frames at 60 Hz. |
+| `button name`, `dialog name`, `named role name` | Exact accessible-role/name selectors; hidden subtrees are excluded and multiple visible matches fail. |
+| `click session selector` | Waits for an enabled, onscreen target whose bounds are stable, then sends pointer move/down/up input on successive frames. It does not call the UI activation action. |
+| `click_within session selector ticks` | The same click with an explicit wait limit. |
+| `expect_visible`, `expect_hidden` | Assert the selector's visible-tree presence or absence, advancing up to 300 ticks. |
+| `press session key` | Sends key down/up on successive frames, using Pen key names such as `Escape`. |
+| `snapshot session` | Returns the current `Save`; no simulation frame advances. |
+| `equal session label expected actual` | Compares finite numeric arrays exactly; failure includes the label and both values. |
+| `screenshot session name` | Captures the current frame without advancing simulation. |
+| `expect_screenshot session name tolerance` | Captures and compares RGB RMSE (normalized to 0–1) with its golden. |
+
+Each step/wait is limited to 3,600 ticks. `--deadline SECONDS` bounds the test's
+wall time (default 600 seconds); renderer loading has its own bounded settling
+wait. Asset work settles with simulation time frozen before input advances.
+Assets' normal readiness events still enter the game through recorded input.
+GPU/driver calls cannot be forcibly interrupted by the Blot deadline.
+
+Steam, clipboard and URL services report unavailable. The platform service is
+fixed to the test platform and `en-US`; simulation, locale, preferences, captions
+and input bindings use the normal implementations with isolated data. Session
+tests never read the player's save or preferences.
+
+Every invocation creates a unique run directory below `.pen/session-tests`
+(`--out DIR` overrides the parent). It contains the compiled game bundle and,
+per scenario, `initial.bin`, `state.bin`, `input.penrec`, `ui.json`, screenshots
+and `trace.json`. The trace records actions, ticks, assertions and failures.
+Failures also attempt `failure.png`; artifact errors are reported rather than
+discarded. The recording can be replayed against the retained game bundle:
+
+```sh
+pen --game RUN/game --headless --data RUN/replay-data \
+  --replay RUN/MODULE/TEST/input.penrec
+```
+
+Goldens live beneath `tests/scenarios/golden/MODULE/TEST` (`--golden DIR` overrides
+the root). Module directories combine the filename and a hash of its project
+relative path, avoiding collisions between equal filenames. Missing goldens
+fail and leave the actual image for inspection. After reviewing it, use the same
+command with `--update` to write the baseline. `--software` selects a software
+GPU; maintain suitable baselines/tolerances for the chosen renderer.
+
+The first driver is native only. The API does not yet provide browser execution,
+arbitrary service mocks, custom per-test clocks, world-object locators or a trace
+viewer. State assertions already work through application-owned snapshot readers.
+
 ## Reviewing golden images
 
 Every `pen test` run writes `.pen/visual/review.html` (or `--out DIR`'s): each

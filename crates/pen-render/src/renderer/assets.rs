@@ -10,8 +10,8 @@ use pen_protocol::{Catalog, GameEvent};
 use wgpu::util::DeviceExt;
 
 use super::{
-    Checking, GpuAsset, INSET_SAMPLES, MaterialAsset, MeshAsset, MeshSkin, PendingTexture, ShaderAsset, Staged, State,
-    TextureAsset, extent,
+    Checking, GpuAsset, INSET_SAMPLES, MaterialAsset, MeshAsset, MeshInstanceBuffer, MeshSkin, PendingTexture,
+    ShaderAsset, Staged, State, TextureAsset, extent,
 };
 use crate::asset_store::AssetKind;
 use crate::built_in::BuiltIn;
@@ -31,7 +31,8 @@ impl ShaderAsset {
     /// skinned only with `vertex_skinned`.
     pub(super) fn own(&self, variants: Variants) -> Variants {
         let variants = if self.instancing { variants } else { variants.without(Variants::INSTANCED) };
-        if self.skinning { variants } else { variants.without(Variants::SKINNED) }
+        let variants = if self.skinning { variants } else { variants.without(Variants::SKINNED) };
+        if self.persistent { variants } else { variants.without(Variants::PERSISTENT | Variants::INSET_PERSISTENT) }
     }
 
     /// Background compiles under way.
@@ -52,9 +53,9 @@ impl ShaderAsset {
         *compiling |= missing;
         for variant in missing.each() {
             let (revision, module) = (self.revision, self.module.clone());
-            let (instancing, skinning) = (self.instancing, self.skinning);
+            let (instancing, skinning, persistent) = (self.instancing, self.skinning, self.persistent);
             jobs.push(
-                Job::Compile { slot, revision, samples, variants: variant, module, instancing, skinning },
+                Job::Compile { slot, revision, samples, variants: variant, module, instancing, skinning, persistent },
                 Priority::Urgent,
             );
         }
@@ -69,6 +70,7 @@ impl ShaderAsset {
                 Stage::Plain => false,
                 Stage::Instanced => !self.instancing,
                 Stage::Skinned => !self.skinning,
+                Stage::Persistent => !self.persistent,
             };
             if lacks || self.shadow[index].is_some() || self.shadow_compiling[index] {
                 continue;
@@ -416,7 +418,11 @@ impl State {
             Loaded::Mesh(mesh) => {
                 let vertex_bytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
                 let index_bytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
-                if vertex_bytes.len().max(index_bytes.len()) as u64 > device.limits().max_buffer_size {
+                let instance_bytes: &[u8] =
+                    mesh.instances.as_ref().map_or(&[], |instances| bytemuck::cast_slice(&instances.data));
+                if vertex_bytes.len().max(index_bytes.len()).max(instance_bytes.len()) as u64
+                    > device.limits().max_buffer_size
+                {
                     return Err("mesh exceeds device buffer size".into());
                 }
                 let buffer = |bytes: &[u8], usage: wgpu::BufferUsages| {
@@ -438,6 +444,10 @@ impl State {
                         indices: buffer(index_bytes, wgpu::BufferUsages::INDEX),
                         bounds: mesh.bounds,
                         lods: mesh.lods.clone(),
+                        instances: mesh.instances.as_ref().map(|instances| MeshInstanceBuffer {
+                            buffer: buffer(instance_bytes, wgpu::BufferUsages::VERTEX),
+                            count: instances.count(),
+                        }),
                         skin: mesh.skin.zip(skin_bytes).map(|(skin, bytes)| MeshSkin {
                             vertices: buffer(&bytes, wgpu::BufferUsages::VERTEX),
                             rig: Arc::new(skin.rig),
@@ -480,7 +490,7 @@ impl State {
                 let state = *self.states.entry(material.state_key()).or_insert(next);
                 Ok(Some((GpuAsset::Material(Arc::new(MaterialAsset { material, state })), None)))
             }
-            Loaded::Shader { module, instancing, skinning, margin, cascaded } => {
+            Loaded::Shader { module, instancing, skinning, persistent, margin, cascaded } => {
                 // What the materials naming it draw with compiles now, for
                 // the sample count frames draw with, each pipeline on a
                 // thread of its own; other variants and counts when a
@@ -494,6 +504,7 @@ impl State {
                     module,
                     instancing,
                     skinning,
+                    persistent,
                     cascaded,
                     margin,
                     needs,
@@ -501,7 +512,7 @@ impl State {
                     compiling: HashMap::new(),
                     failed: HashMap::new(),
                     shadow: Default::default(),
-                    shadow_compiling: [false; 3],
+                    shadow_compiling: [false; 4],
                 };
                 let (jobs, samples) = (&self.loader.jobs, self.samples_now);
                 shader.request(jobs, slot, samples, needs);
@@ -511,7 +522,7 @@ impl State {
                 // Insets draw with 4 samples a pixel: their pipeline compiles
                 // in the background now, so an inset first shown never waits
                 // on it.
-                let mut inset_needs = Variants::INSET;
+                let mut inset_needs = Variants::INSET | Variants::INSET_PERSISTENT;
                 if needs.contains(Variants::TRANSLUCENT) {
                     inset_needs |= Variants::INSET_BLENDED;
                 }

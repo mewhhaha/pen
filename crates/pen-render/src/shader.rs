@@ -129,6 +129,11 @@ pub(crate) fn has_instancing(code: &str) -> bool {
     vertex_entry_points(code).any(|(name, _)| name == "vertex_instanced")
 }
 
+/// Whether it consumes mesh-owned persistent instance records.
+pub(crate) fn has_persistent(code: &str) -> bool {
+    vertex_entry_points(code).any(|(name, _)| name == "vertex_persistent")
+}
+
 /// Whether it has a `vertex_skinned` entry point, which takes a skinned
 /// mesh's joints and weights (locations 9 and 10) and its joint matrices
 /// (group 2).
@@ -143,16 +148,18 @@ pub(crate) enum Stage {
     Plain,
     Instanced,
     Skinned,
+    Persistent,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 3] = [Stage::Plain, Stage::Instanced, Stage::Skinned];
+    pub const ALL: [Stage; 4] = [Stage::Plain, Stage::Instanced, Stage::Skinned, Stage::Persistent];
 
     fn entry_point(self) -> &'static str {
         match self {
             Stage::Plain => "vertex",
             Stage::Instanced => "vertex_instanced",
             Stage::Skinned => "vertex_skinned",
+            Stage::Persistent => "vertex_persistent",
         }
     }
 
@@ -192,9 +199,11 @@ pub(crate) fn bounds_margin(code: &str) -> Option<f32> {
 /// drawn once dimmed where the scene hides them and once at full strength
 /// where it does not.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct Variants(u8);
+pub(crate) struct Variants(u16);
 
-const VARIANT_NAMES: [(Variants, &str); 8] = [
+const VARIANT_NAMES: [(Variants, &str); 10] = [
+    (Variants::PERSISTENT, "persistent"),
+    (Variants::INSET_PERSISTENT, "inset_persistent"),
     (Variants::OPAQUE, "opaque"),
     (Variants::TRANSLUCENT, "translucent"),
     (Variants::OCCLUDED, "occluded"),
@@ -214,6 +223,8 @@ impl std::fmt::Debug for Variants {
 }
 
 impl Variants {
+    pub const PERSISTENT: Variants = Variants(256);
+    pub const INSET_PERSISTENT: Variants = Variants(512);
     pub const NONE: Variants = Variants(0);
     pub const OPAQUE: Variants = Variants(1);
     pub const TRANSLUCENT: Variants = Variants(2);
@@ -260,6 +271,8 @@ pub(crate) struct Pipelines {
     pub occluded: Option<wgpu::RenderPipeline>,
     pub visible: Option<wgpu::RenderPipeline>,
     pub instanced: Option<wgpu::RenderPipeline>,
+    pub persistent: Option<wgpu::RenderPipeline>,
+    pub inset_persistent: Option<wgpu::RenderPipeline>,
     pub skinned: Option<wgpu::RenderPipeline>,
     pub inset: Option<wgpu::RenderPipeline>,
     pub inset_blended: Option<wgpu::RenderPipeline>,
@@ -282,6 +295,8 @@ impl Pipelines {
             (&self.occluded, Variants::OCCLUDED),
             (&self.visible, Variants::VISIBLE),
             (&self.instanced, Variants::INSTANCED),
+            (&self.persistent, Variants::PERSISTENT),
+            (&self.inset_persistent, Variants::INSET_PERSISTENT),
             (&self.skinned, Variants::SKINNED),
             (&self.inset, Variants::INSET),
             (&self.inset_blended, Variants::INSET_BLENDED),
@@ -299,6 +314,8 @@ impl Pipelines {
             (&mut self.occluded, other.occluded),
             (&mut self.visible, other.visible),
             (&mut self.instanced, other.instanced),
+            (&mut self.persistent, other.persistent),
+            (&mut self.inset_persistent, other.inset_persistent),
             (&mut self.skinned, other.skinned),
             (&mut self.inset, other.inset),
             (&mut self.inset_blended, other.inset_blended),
@@ -342,7 +359,7 @@ fn vertex_buffers(stage: Stage) -> Vec<Option<wgpu::VertexBufferLayout<'static>>
     })];
     match stage {
         Stage::Plain => {}
-        Stage::Instanced => buffers.push(Some(wgpu::VertexBufferLayout {
+        Stage::Instanced | Stage::Persistent => buffers.push(Some(wgpu::VertexBufferLayout {
             array_stride: 80,
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &INSTANCE_ATTRIBUTES,
@@ -428,6 +445,7 @@ pub(crate) fn pipelines(
     module: &wgpu::ShaderModule,
     instancing: bool,
     skinning: bool,
+    persistent: bool,
     samples: u32,
     variants: Variants,
 ) -> Pipelines {
@@ -439,7 +457,7 @@ pub(crate) fn pipelines(
             }
             // Scene alpha tracks the remaining clear color. Insets retain their
             // authored alpha for coverage when composited over the finished frame.
-            let blending = if variant == Variants::INSET {
+            let blending = if variant == Variants::INSET || variant == Variants::INSET_PERSISTENT {
                 None
             } else if variant == Variants::INSET_BLENDED {
                 Some(wgpu::BlendState::ALPHA_BLENDING)
@@ -456,6 +474,16 @@ pub(crate) fn pipelines(
             Some(variant_of(context, module, samples, depth_write, depth_compare, blending, stage))
         };
     Pipelines {
+        persistent: if persistent {
+            make(Variants::PERSISTENT, true, CompareFunction::Less, None, Stage::Persistent)
+        } else {
+            None
+        },
+        inset_persistent: if persistent {
+            make(Variants::INSET_PERSISTENT, true, CompareFunction::Less, None, Stage::Persistent)
+        } else {
+            None
+        },
         opaque: make(Variants::OPAQUE, true, CompareFunction::Less, None, Stage::Plain),
         inset: make(Variants::INSET, true, CompareFunction::Less, None, Stage::Plain),
         inset_blended: make(Variants::INSET_BLENDED, false, CompareFunction::Less, None, Stage::Plain),

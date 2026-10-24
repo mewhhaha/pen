@@ -56,10 +56,20 @@ impl Drawing<'_> {
                 let lod = mesh.lods.get(usize::from(item.lod)).unwrap_or(&mesh.lods[0]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(lod.first..lod.first + lod.count, 0, 0..1);
+                let count = if let Some(instances) = &mesh.instances {
+                    pass.set_vertex_buffer(1, instances.buffer.slice(..));
+                    instances.count
+                } else {
+                    1
+                };
+                pass.draw_indexed(lod.first..lod.first + lod.count, 0, 0..count);
                 if let Some(stats) = stats {
                     stats.draw_calls += 1;
-                    stats.triangles += u64::from(lod.count / 3);
+                    stats.triangles += u64::from(lod.count / 3) * u64::from(count);
+                    if mesh.instances.is_some() {
+                        stats.instanced_draw_calls += 1;
+                        stats.instances += count;
+                    }
                 }
             }
             Shape::Batch(index) => {

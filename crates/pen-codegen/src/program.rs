@@ -14,6 +14,11 @@ pub const PROGRAM_VERSION: u32 = 1;
 const PROGRAM: &str = include_str!("program.blot");
 const CHECK: &str = include_str!("check.blot");
 
+/// The session driver's library uses operation codes generated from the schema.
+pub fn testing(header: &[String]) -> String {
+    under(header, include_str!("testing.blot"))
+}
+
 fn under(header: &[String], body: &str) -> String {
     let mut out = header.to_vec();
     out.extend(body.lines().map(str::to_owned));

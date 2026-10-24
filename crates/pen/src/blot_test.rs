@@ -23,9 +23,11 @@
 //! module is many tests of minutes each, nearly all of it in the guest
 //! runtime's cycle collector (docs/testing.md, "Blot tests' speed").
 //!
-//! The tests take no capability, so nothing a test runs calls the host.
-//! Should a module also export a function that takes one (`main(host)`),
-//! blot-host links its adapter as it does for the game, and no test calls it.
+//! Ordinary tests take no capability. With `--session`, tests receive the
+//! pen/test driver capability and control a separate headless game session.
+//! These GPU scenarios compile and run sequentially.
+mod session;
+pub use session::Options as SessionOptions;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,6 +44,7 @@ use wasmtime::{Engine, Trap};
 const ENTRY: &str = "src/main.blot";
 
 pub struct Options {
+    pub session: Option<SessionOptions>,
     /// The modules to run; every one of the checkout's when empty.
     pub files: Vec<PathBuf>,
     /// Only the tests whose names contain this.
@@ -121,7 +124,7 @@ pub fn run(checkout: &Path, options: Options) -> Result<()> {
         "this pen is a player runtime, built without the Wasm compiler: it cannot run a checkout's \
          tests (use a full build, `just install`)"
     );
-    let jobs = options.jobs.unwrap_or_else(default_jobs);
+    let jobs = if options.session.is_some() { 1 } else { options.jobs.unwrap_or_else(default_jobs) };
     ensure!(jobs > 0, "--jobs is how many modules compile at once: 1 or more");
     let plugins = test_plugins(checkout)?;
     let checkout = plugins.root();
@@ -133,6 +136,7 @@ pub fn run(checkout: &Path, options: Options) -> Result<()> {
         .map(|test| Module::new(checkout, test))
         .collect();
     ensure!(!modules.is_empty() || filter.is_some(), "{} has no test modules", checkout.display());
+    let session = options.session.map(|options| session::Prepared::new(checkout, options)).transpose()?;
     // As many tests run at once as modules compile, however few the modules.
     let slots = Slots::new(jobs).deadline(options.deadline.unwrap_or(TEST_DEADLINE));
     let jobs = jobs.min(modules.len()).max(1);
@@ -146,7 +150,7 @@ pub fn run(checkout: &Path, options: Options) -> Result<()> {
         &modules,
         jobs,
         || None,
-        |session, module| run_module(session, &plugins, &engine, module, filter, &slots),
+        |builder, module| run_module(builder, &plugins, &engine, module, filter, &slots, session.as_ref()),
         |module, ran| {
             eprintln!("{}", module_lines(module, &ran, filter).join("\n"));
             let tally = &mut tallies[module.kind as usize];
@@ -285,6 +289,7 @@ fn run_module(
     module: &Module,
     filter: Option<&str>,
     slots: &Slots,
+    session_tests: Option<&session::Prepared>,
 ) -> Ran {
     let entry = Path::new(&module.test.entry);
     if session.as_ref().is_none_or(|builder| builder.entry() != entry) {
@@ -300,7 +305,10 @@ fn run_module(
     let tests = match &module.test.expect {
         Expectation::Rejected(rejects) => Ok(rejection(rejects, compiled)),
         Expectation::Checks | Expectation::Traps => {
-            compiled.and_then(|wasm| run_tests(engine, &wasm, module.kind, &module.test.prefix, filter, slots))
+            let run = session_tests.map(|prepared| prepared.module(Path::new(&module.test.path)));
+            compiled.and_then(|wasm| {
+                run_tests_with_session(engine, &wasm, module.kind, &module.test.prefix, filter, slots, run.as_ref())
+            })
         }
     };
     Ran { tests, build }
@@ -514,6 +522,7 @@ impl Slots {
 /// whose names contain `filter`, each in an instance of its own, on a
 /// thread with the stack a guest needs, as many at once as `slots` lets;
 /// each must do what `kind` says.
+#[cfg(test)]
 fn run_tests(
     engine: &Engine,
     wasm: &[u8],
@@ -521,6 +530,18 @@ fn run_tests(
     prefix: &str,
     filter: Option<&str>,
     slots: &Slots,
+) -> Result<Tests> {
+    run_tests_with_session(engine, wasm, kind, prefix, filter, slots, None)
+}
+
+fn run_tests_with_session(
+    engine: &Engine,
+    wasm: &[u8],
+    kind: Kind,
+    prefix: &str,
+    filter: Option<&str>,
+    slots: &Slots,
+    session: Option<&session::Run<'_>>,
 ) -> Result<Tests> {
     let started = Instant::now();
     let module = GuestModule::new(engine, wasm, None)?;
@@ -532,12 +553,21 @@ fn run_tests(
         function.name.starts_with(prefix) && filter.is_none_or(|filter| function.name.contains(filter))
     });
     for function in entries {
-        if function.parameter != Parameter::Value(ValueType::Unit) || function.result != ValueType::ArrayF32 {
+        if session.is_some() {
+            ensure!(
+                kind == Kind::Checks
+                    && function.parameter == Parameter::Callback(pen_runtime::abi::GAME_HOST)
+                    && function.result == ValueType::ArrayF32,
+                "{}: session tests take the driver (Array F32 -> Array F32 ! {{ Foreign }}) and return Array F32 through pen/test.run",
+                function.name
+            );
+        } else if function.parameter != Parameter::Value(ValueType::Unit) || function.result != ValueType::ArrayF32 {
             skipped.push(format!("{}: it is {}, not Unit -> Array F32", function.name, signature(function)));
             continue;
         }
         runnable.push(function.name.clone());
     }
+    ensure!(session.is_none() || !runnable.is_empty(), "no runnable session tests match");
     let next = AtomicUsize::new(0);
     let ran: Mutex<Vec<Option<(Outcome, Timing)>>> = Mutex::new(runnable.iter().map(|_| None).collect());
     std::thread::scope(|scope| -> Result<()> {
@@ -550,7 +580,16 @@ fn run_tests(
                         loop {
                             let index = next.fetch_add(1, Ordering::Relaxed);
                             let Some(name) = runnable.get(index) else { break };
-                            let outcome = slots.hold(|| run_test(engine, &module, kind, name, slots.deadline));
+                            let outcome = slots.hold(|| match session {
+                                Some(run) => {
+                                    let started = Instant::now();
+                                    (
+                                        reported(run.call(engine, &module, name, slots.deadline)),
+                                        Timing { took: started.elapsed(), cycle_passes: None },
+                                    )
+                                }
+                                None => run_test(engine, &module, kind, name, slots.deadline),
+                            });
                             ran.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(outcome);
                         }
                     })

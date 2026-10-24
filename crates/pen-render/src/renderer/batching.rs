@@ -389,8 +389,12 @@ impl State {
         // never culled, nor drawn simpler.
         let bounds = sphere.zip(margin).map(|(sphere, margin)| Sphere { radius: sphere.radius + margin, ..sphere });
         let casts = material.as_ref().is_some_and(|material| material.material.casts_shadow());
+        // Mesh-owned records must never enter a frame's transform batches.
+        let persistent = matches!(self.assets.current(mesh), Some(GpuAsset::Mesh(mesh)) if mesh.instances.is_some());
         let batch = match (material, shader) {
-            (Some(material), Some(shader)) if material.material.opaque() && instancing && sphere.is_some() => {
+            (Some(material), Some(shader))
+                if material.material.opaque() && instancing && sphere.is_some() && !persistent =>
+            {
                 let parameters = material.material.instance_parameters.map_or([0.0; 4], |values| values.map(narrow));
                 let key = material.material.instance_parameters.map(|_| (draw.mesh, material.state));
                 match key.and_then(|key| scratch.parameter_batches.get(&key).copied()) {
@@ -463,6 +467,22 @@ impl State {
     ) -> Result<Option<ReadyEntry>> {
         let Some(material) = self.material(catalog, item.material)? else { return Ok(None) };
         let Some(shader) = self.shader(&material.material)? else { return Ok(None) };
+        let mesh = match item.shape {
+            Shape::Mesh(mesh) => Some(self.resolve(AssetKind::Mesh, catalog.mesh(mesh))?),
+            _ => None,
+        };
+        let persistent = matches!(mesh.and_then(|slot| self.assets.current(slot)), Some(GpuAsset::Mesh(mesh)) if mesh.instances.is_some());
+        if persistent {
+            ensure!(material.material.opaque(), "persistent mesh instances require an opaque material");
+            ensure!(
+                matches!(self.assets.current(shader), Some(GpuAsset::Shader(shader)) if shader.persistent),
+                "persistent mesh instances require a vertex_persistent shader entry point"
+            );
+            ensure!(
+                !matches!(item.source, Source::Draw(draw) if scratch.posed(draw)),
+                "persistent mesh instances cannot be posed"
+            );
+        }
         let field = self.field_ids.get(catalog.material(item.material)).copied();
         let Some((textures, normal_setting, outline_setting)) = self.dress(&material.material, field)? else {
             return Ok(None);
@@ -503,41 +523,51 @@ impl State {
             extra[..count].copy_from_slice(&values[..count]);
         }
         // Insets preserve authored coverage, separately from scene sky alpha.
-        let (pipeline, visible) = match (item.inset(), item.shape) {
-            (Some(_), _) => {
-                let mut variant = Variants::INSET;
-                if !m.opaque() {
-                    variant = Variants::INSET_BLENDED;
-                }
-                if !self.ensure_variants(shader, INSET_SAMPLES, variant) {
-                    return Ok(None);
-                }
-                let made = self.pipelines(shader, INSET_SAMPLES);
-                let mut pipeline = made.inset.clone();
-                if !m.opaque() {
-                    pipeline = made.inset_blended.clone();
-                }
-                (pipeline, None)
+        let (pipeline, visible) = if persistent {
+            let inset = item.inset().is_some();
+            let samples = if inset { INSET_SAMPLES } else { samples };
+            let variant = if inset { Variants::INSET_PERSISTENT } else { Variants::PERSISTENT };
+            if !self.ensure_variants(shader, samples, variant) {
+                return Ok(None);
             }
-            (None, Shape::Batch(batch)) => (Some(scratch.batches[batch].pipeline.clone()), None),
-            (None, _) => {
-                if !self.ensure_variants(shader, samples, m.variants().without(Variants::INSTANCED | Variants::SKINNED))
-                {
-                    return Ok(None);
+            let made = self.pipelines(shader, samples);
+            (if inset { made.inset_persistent.clone() } else { made.persistent.clone() }, None)
+        } else {
+            match (item.inset(), item.shape) {
+                (Some(_), _) => {
+                    let mut variant = Variants::INSET;
+                    if !m.opaque() {
+                        variant = Variants::INSET_BLENDED;
+                    }
+                    if !self.ensure_variants(shader, INSET_SAMPLES, variant) {
+                        return Ok(None);
+                    }
+                    let made = self.pipelines(shader, INSET_SAMPLES);
+                    let mut pipeline = made.inset.clone();
+                    if !m.opaque() {
+                        pipeline = made.inset_blended.clone();
+                    }
+                    (pipeline, None)
                 }
-                let made = self.pipelines(shader, samples);
-                if m.overlay {
-                    (made.occluded.clone(), made.visible.clone())
-                } else if m.opaque() {
-                    (made.opaque.clone(), None)
-                } else {
-                    (made.translucent.clone(), None)
+                (None, Shape::Batch(batch)) => (Some(scratch.batches[batch].pipeline.clone()), None),
+                (None, _) => {
+                    if !self.ensure_variants(
+                        shader,
+                        samples,
+                        m.variants().without(Variants::INSTANCED | Variants::SKINNED),
+                    ) {
+                        return Ok(None);
+                    }
+                    let made = self.pipelines(shader, samples);
+                    if m.overlay {
+                        (made.occluded.clone(), made.visible.clone())
+                    } else if m.opaque() {
+                        (made.opaque.clone(), None)
+                    } else {
+                        (made.translucent.clone(), None)
+                    }
                 }
             }
-        };
-        let mesh = match item.shape {
-            Shape::Mesh(mesh) => Some(self.resolve(AssetKind::Mesh, catalog.mesh(mesh))?),
-            _ => None,
         };
         let mut pipeline = pipeline.expect("an ensured variant is compiled");
         // A posed draw of a skinned mesh draws skinned, its joint matrices
@@ -557,7 +587,7 @@ impl State {
         }
         let offset =
             u32::try_from(index as u64 * self.stride).context("draw uniforms lie past a dynamic offset's reach")?;
-        Ok(Some(ReadyEntry { item: index, offset, group, material, shader, mesh, pipeline, visible, skin }))
+        Ok(Some(ReadyEntry { item: index, offset, group, material, shader, mesh, pipeline, visible, skin, persistent }))
     }
 
     /// Sorts what is ready into the scene's passes: opaque surfaces by

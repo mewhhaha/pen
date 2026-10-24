@@ -57,6 +57,11 @@ vec3f`, `@location(2) uv: vec2f` and, when the mesh has `attributes`,
   the same mesh and material share one instanced draw: its instance's model
   matrix comes as `@location(3)` to `@location(6)` (four columns) and its
   parameters as `@location(7)`.
+- `@vertex fn vertex_persistent` draws a mesh's immutable `instances` records.
+  Each record supplies five `vec4f`s at locations 3–7. Their meaning belongs
+  to the shader; `draw.model`, parameters and extra vectors still describe
+  the whole draw. This entry is separate from `vertex_instanced`, so the same
+  material can also draw ordinary meshes without treating records as matrices.
 - A shader whose `vertex` takes only builtins (`vertex_index`,
   `instance_index`) draws sprites instead: group 0 is then the screen's size
   (a `vec4f` uniform at binding 0), the frame's sprites (a storage array at
@@ -67,3 +72,29 @@ Projections map depth into WebGPU's 0 to 1. pen compiles only the pipelines
 the loaded materials draw with, on background threads; a shader that does
 not compile is reported (an `AssetFailed` event, and the log) and its draws
 are left out, never the frame.
+
+## Persistent mesh instances
+
+A mesh JSON can add `"instances": {"data": [...], "min": [x, y, z],
+"max": [x, y, z]}`. `data` contains one or more records of exactly 20 finite
+numbers. `min` and `max` must enclose **all reconstructed geometry** in mesh
+space. Pen culls the aggregate bounds, grown by the shader's `bounds_margin`,
+and applies the draw transform to the whole patch. It does not cull individual
+records. Split large patches into separate mesh assets when finer culling matters.
+
+Records are uploaded with the asset, retained on the GPU, and replaced on hot
+reload. A frame sends one ordinary mesh draw; there are no per-record packet
+entries or frame uploads. Frame instance-upload counters exclude asset loading.
+The renderer's instance and triangle counts include the repeated geometry.
+
+Persistent meshes require an opaque material and `vertex_persistent`; they
+support scene, inset and shadow passes, but cannot have a skin or a posed draw.
+Automatic export simplification leaves these meshes alone; authored LOD errors
+must bound the reconstructed geometry. The template's vertex attributes remain
+available at the ordinary locations, including `vertex_index` and `instance_index`
+builtins when declared.
+
+In packed PMSH version 1, flag 16 appends the instance count (`u32`), bounds
+(six `f32`s, minimum then maximum), and 20 `f32`s per record after indices and
+any LODs. All are little-endian. Flag 16 cannot coexist with skin flag 4. Older
+hosts reject this flag; rebuild native and browser hosts when adopting it.

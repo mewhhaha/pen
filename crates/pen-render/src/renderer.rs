@@ -90,6 +90,12 @@ pub(crate) struct MeshAsset {
     lods: Vec<Lod>,
     /// A skinned mesh's joints and weights, and its rig.
     skin: Option<MeshSkin>,
+    instances: Option<MeshInstanceBuffer>,
+}
+
+pub(crate) struct MeshInstanceBuffer {
+    buffer: wgpu::Buffer,
+    count: u32,
 }
 
 pub(crate) struct MeshSkin {
@@ -112,6 +118,8 @@ pub(crate) struct ShaderAsset {
     instancing: bool,
     /// Whether it has a `vertex_skinned` entry point.
     skinning: bool,
+    /// Mesh-owned records, consumed by `vertex_persistent`.
+    persistent: bool,
     /// Whether it reads the cascaded shadow maps (`shadow_cascades`).
     cascaded: bool,
     /// How far its vertex stage moves vertices from where their mesh puts
@@ -128,8 +136,8 @@ pub(crate) struct ShaderAsset {
     /// Its depth-only pipelines into the shadow map, plain, instanced and
     /// skinned (by `Stage`), compiled in the background when a loaded
     /// material casts shadows.
-    shadow: [Option<wgpu::RenderPipeline>; 3],
-    shadow_compiling: [bool; 3],
+    shadow: [Option<wgpu::RenderPipeline>; 4],
+    shadow_compiling: [bool; 4],
 }
 
 /// A shader's new revision, published once what its materials draw with has
@@ -361,6 +369,7 @@ struct ReadyEntry {
     visible: Option<wgpu::RenderPipeline>,
     /// A posed draw's joint matrices: where they lie in the frame's.
     skin: Option<u32>,
+    persistent: bool,
 }
 
 /// What a frame works out, kept between frames so that drawing the next

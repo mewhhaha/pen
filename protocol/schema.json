@@ -246,6 +246,12 @@
   ],
   "enumerations": [
     {
+      "name": "TestDriverOp",
+      "constant": "TEST_DRIVER_OP",
+      "doc": "Version-1 native session test commands. Available only to a separate test guest in pen test-blot --session.",
+      "values": ["launch", "step", "click", "visible", "hidden", "press", "snapshot", "equal", "screenshot", "finish"]
+    },
+    {
       "name": "UiRole",
       "constant": "UI_ROLE",
       "values": [

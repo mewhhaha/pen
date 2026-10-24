@@ -101,6 +101,19 @@ const engine_preferences = 64
 // have.
 const max_panners = 512
 
+// Version-1 native session test commands. Available only to a separate test
+// guest in pen test-blot --session.
+const test_driver_op_launch = 0
+const test_driver_op_step = 1
+const test_driver_op_click = 2
+const test_driver_op_visible = 3
+const test_driver_op_hidden = 4
+const test_driver_op_press = 5
+const test_driver_op_snapshot = 6
+const test_driver_op_equal = 7
+const test_driver_op_screenshot = 8
+const test_driver_op_finish = 9
+
 // What an interface node is; hosts expose it with the matching role. A textbox's
 // value text is the text in it; a log is a list of messages whose newest lines a
 // screen reader may announce.
@@ -325,7 +338,9 @@ const pathfinding_op_find = 0
 // subsequent pages read that same snapshot. Value is the total system count.
 // Each row contains stage (Start through Settle, 0-6), id, calls since the
 // previous snapshot, mean milliseconds, maximum milliseconds, execution mode (0
-// sequential), name length and code points. Uncalled systems have -1 timings.
+// sequential), mean requested allocation bytes per call, mean allocation count
+// per call, name length and code points. Uncalled systems have -1 timings;
+// allocation means are -1 without allocation instrumentation or calls.
 // Unsupported hosts answer unavailable. semantic exchanges bounded JSON text for
 // opt-in application descriptors, decoded object values, decision events,
 // watches and exact timeline seeks; see docs/semantic-inspection.md for version

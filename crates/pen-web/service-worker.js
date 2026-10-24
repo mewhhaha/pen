@@ -79,7 +79,7 @@ async function brotli(path) {
 
 const types = {
   html: 'text/html; charset=utf-8', js: 'text/javascript', wasm: 'application/wasm', json: 'application/json',
-  png: 'image/png', ogg: 'audio/ogg', wav: 'audio/wav', md: 'text/markdown; charset=utf-8',
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', ogg: 'audio/ogg', wav: 'audio/wav', md: 'text/markdown; charset=utf-8',
 };
 
 function type(path) {

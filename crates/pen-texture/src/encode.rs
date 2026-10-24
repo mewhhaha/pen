@@ -51,12 +51,14 @@ pub fn encode(rgba: &[u8], width: u32, height: u32, kind: Kind, family: Family, 
     write(&levels, width, height, kind, family, threads())
 }
 
-/// Every family's file, in `Family::ALL` order, encoded side by side from
-/// one mip chain.
+/// Supported families in `Family::ALL` order, encoded from one mip chain.
+/// Dimensions outside whole blocks need only the universal RGBA fallback.
 pub fn encode_all(rgba: &[u8], width: u32, height: u32, kind: Kind, mipmaps: bool) -> Result<Vec<(Family, Vec<u8>)>> {
     let levels = levels(rgba, width, height, kind, mipmaps)?;
     let threads = threads();
-    Family::ALL.iter().map(|&family| Ok((family, write(&levels, width, height, kind, family, threads)?))).collect()
+    let families: &[_] =
+        if width.is_multiple_of(4) && height.is_multiple_of(4) { &Family::ALL } else { &[Family::Rgba] };
+    families.iter().map(|&family| Ok((family, write(&levels, width, height, kind, family, threads)?))).collect()
 }
 
 /// The image's levels, the full size first: the image alone, or its whole
@@ -465,6 +467,12 @@ pub(crate) mod tests {
             assert_eq!(levels[0].data, image);
             assert_eq!(levels[1].data.len(), 3 * 4 * 4);
         }
+        let files = encode_all(&image, 6, 8, Kind::Data, true).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, Family::Rgba);
+        let (header, levels) = read(files.into_iter().next().unwrap().1);
+        assert_eq!((header.format, header.levels), (Format::Rgba8Unorm, 4));
+        assert_eq!(levels[0].data, image);
     }
 
     #[test]

@@ -15,6 +15,7 @@ mod blot_test;
 mod bugreport;
 #[cfg(all(test, feature = "compiler"))]
 mod codec_round_trip;
+mod compiled;
 mod crash;
 mod delta;
 mod dev;
@@ -184,6 +185,7 @@ fn load_module(engine: &wasmtime::Engine, game: &Path, cache: bool, measure_syst
         // SAFETY: game.cwasm ships in the same package as this executable,
         // written by `pen build`.
         (Some(precompiled), None) => unsafe {
+            let precompiled = compiled::decode(&precompiled).with_context(|| format!("reading {}", cwasm.display()))?;
             GuestModule::with_precompiled(engine, &wasm, &precompiled, cache.as_deref())?
         },
         (None, _) if !blot_host::COMPILER => {

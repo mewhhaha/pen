@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
 use super::Mesh;
+use super::layout::{INSTANCE_FLOATS, Instances};
 use crate::culling::Sphere;
 
 /// Five vec4s at shader locations 3..7. Their meaning belongs to the shader.
@@ -24,7 +25,7 @@ fn unit_scale() -> f32 {
 
 impl MeshInstances {
     pub fn count(&self) -> u32 {
-        u32::try_from(self.data.len() / 20).expect("validated instance count")
+        u32::try_from(self.data.len() / INSTANCE_FLOATS).expect("validated instance count")
     }
 
     pub(super) fn write(&self, bytes: &mut Vec<u8>) -> Result<()> {
@@ -35,13 +36,12 @@ impl MeshInstances {
         Ok(())
     }
 
-    pub(super) fn read(bytes: &[u8]) -> Result<Self> {
-        let header = bytes.get(..28).context("binary mesh ends in its instance header")?;
-        let count = u32::from_le_bytes(header[..4].try_into()?) as usize;
-        let end = count.checked_mul(80).and_then(|size| size.checked_add(28));
-        ensure!(end == Some(bytes.len()), "binary mesh instance size does not match its count");
-        let values: Vec<f32> = bytes[4..].as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)).collect();
-        Ok(Self { min: values[..3].try_into()?, max: values[3..6].try_into()?, data: values[6..].to_vec(), scale: 1.0 })
+    pub(super) fn read(bytes: &[u8], layout: &Instances) -> Result<Self> {
+        let values =
+            |bytes: &[u8]| bytes.as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)).collect::<Vec<_>>();
+        let bounds = values(&bytes[layout.bounds.clone()]);
+        let data = values(&bytes[layout.records.range()]);
+        Ok(Self { min: bounds[..3].try_into()?, max: bounds[3..].try_into()?, data, scale: 1.0 })
     }
 }
 
@@ -50,10 +50,11 @@ impl Mesh {
         if let Some(instances) = &mut instances {
             ensure!(self.skin.is_none(), "a mesh cannot have both a skin and persistent instances");
             ensure!(
-                !instances.data.is_empty() && instances.data.len().is_multiple_of(20),
+                !instances.data.is_empty() && instances.data.len().is_multiple_of(INSTANCE_FLOATS),
                 "mesh instances require 20 floats per record"
             );
-            u32::try_from(instances.data.len() / 20).context("mesh has more instances than a u32 counts")?;
+            u32::try_from(instances.data.len() / INSTANCE_FLOATS)
+                .context("mesh has more instances than a u32 counts")?;
             ensure!(
                 instances.scale.is_finite() && instances.scale > 0.0,
                 "mesh instance scale must be finite and positive"

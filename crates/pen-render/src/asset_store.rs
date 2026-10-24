@@ -16,6 +16,7 @@ use crate::loader::{Job, JobQueue, Priority};
 use crate::shader::Variants;
 
 mod instances;
+mod layout;
 mod packed;
 pub(crate) use instances::MeshInstances;
 
@@ -436,89 +437,40 @@ fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
 fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
     let decoded = packed::decode(bytes)?;
     let bytes = decoded.as_ref();
-    ensure!(bytes.len() >= MESH_HEADER, "binary mesh ends in its header");
-    ensure!(bytes[4] == MESH_VERSION, "unsupported binary mesh version");
-    let flags = bytes[5];
-    ensure!(
-        flags & !(MESH_ATTRIBUTES | MESH_SHORT_INDICES | MESH_SKIN | MESH_LODS | MESH_INSTANCES) == 0,
-        "unsupported binary mesh flags"
-    );
-    ensure!(
-        flags & (MESH_SKIN | MESH_INSTANCES) != (MESH_SKIN | MESH_INSTANCES),
-        "a mesh cannot have both a skin and persistent instances"
-    );
-    let word = |at: usize| -> Result<usize> {
-        let word = bytes.get(at..at + 4).context("binary mesh size does not match its counts")?;
-        Ok(u32::from_le_bytes(word.try_into().unwrap()) as usize)
-    };
-    let (count, index_count) = (word(8)?, word(12)?);
-    let floats = if flags & MESH_ATTRIBUTES != 0 { MESH_VERTEX_FLOATS } else { MESH_VERTEX_FLOATS - 2 };
-    let index_bytes = if flags & MESH_SHORT_INDICES != 0 { 2 } else { 4 };
-    let vertex_end = count.checked_mul(floats * 4).and_then(|size| size.checked_add(MESH_HEADER));
-    let end = vertex_end.and_then(|end| index_count.checked_mul(index_bytes).and_then(|size| size.checked_add(end)));
-    let (Some(vertex_end), Some(end)) = (vertex_end, end) else { bail!("binary mesh size does not match its counts") };
-    ensure!(end <= bytes.len(), "binary mesh size does not match its counts");
-    let values = bytes[MESH_HEADER..vertex_end].as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value));
-    let vertices = if floats == MESH_VERTEX_FLOATS {
-        values.collect()
-    } else {
-        let values: Vec<f32> = values.collect();
-        let mut vertices = Vec::with_capacity(count * MESH_VERTEX_FLOATS);
-        for vertex in values.chunks_exact(floats) {
-            vertices.extend_from_slice(vertex);
+    let layout = layout::Layout::read(bytes)?;
+    let mut vertices = Vec::with_capacity(layout.vertices.count * MESH_VERTEX_FLOATS);
+    for vertex in bytes[layout.vertices.range()].chunks_exact(layout.vertices.stride) {
+        vertices.extend(vertex.as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)));
+        if layout.vertices.stride < MESH_VERTEX_FLOATS * 4 {
             vertices.extend([0.0, 0.0]);
         }
-        vertices
-    };
-    let read_indices = |from: usize, to: usize| -> Vec<u32> {
-        bytes[from..to]
-            .chunks_exact(index_bytes)
+    }
+    let read_indices = |block: &layout::Block| -> Vec<u32> {
+        bytes[block.range()]
+            .chunks_exact(block.stride)
             .map(|index| match index {
                 [a, b] => u32::from(u16::from_le_bytes([*a, *b])),
-                _ => u32::from_le_bytes(index.try_into().unwrap()),
+                _ => u32::from_le_bytes(index.try_into().expect("checked index width")),
             })
             .collect()
     };
-    let indices = read_indices(vertex_end, end);
-    // Any simpler levels of detail, then any skin.
-    let mut simpler = Vec::new();
-    let mut at = end;
-    if flags & MESH_LODS != 0 {
-        let levels = word(end)?;
-        ensure!(levels < MAX_LODS, "mesh has more than {} simpler levels of detail", MAX_LODS - 1);
-        at = end + 4 + levels * 8;
-        for level in 0..levels {
-            let table = end + 4 + level * 8;
-            let lod_count = word(table)?;
-            let error =
-                f32::from_le_bytes(bytes.get(table + 4..table + 8).context("binary mesh ends early")?.try_into()?);
-            let to = lod_count.checked_mul(index_bytes).and_then(|size| size.checked_add(at));
-            let to = to.filter(|&to| to <= bytes.len()).context("binary mesh size does not match its counts")?;
-            simpler.push((error, read_indices(at, to)));
-            at = to;
-        }
-    }
-    // A skin's joints and weights, 24 bytes a vertex, then its rig.
-    let skin = if flags & MESH_SKIN != 0 {
-        let skin_end = count.checked_mul(24).and_then(|size| size.checked_add(at));
-        let skin_end = skin_end.filter(|&skin_end| skin_end <= bytes.len()).context("binary mesh ends in its skin")?;
-        let (mut joints, mut weights) = (Vec::with_capacity(count), Vec::with_capacity(count));
-        for vertex in bytes[at..skin_end].as_chunks::<24>().0 {
+    let indices = read_indices(&layout.indices);
+    let simpler: Vec<_> = layout.lods.iter().map(|(error, block)| (*error, read_indices(block))).collect();
+    let skin = if let Some((records, rig)) = &layout.skin {
+        let (mut joints, mut weights) = (Vec::with_capacity(records.count), Vec::with_capacity(records.count));
+        for vertex in bytes[records.range()].chunks_exact(records.stride) {
             let half = |at: usize| u16::from_le_bytes([vertex[at], vertex[at + 1]]);
             let float = |at: usize| f32::from_le_bytes(vertex[at..at + 4].try_into().unwrap());
             joints.push([half(0), half(2), half(4), half(6)]);
             weights.push([float(8), float(12), float(16), float(20)]);
         }
-        Some(Skin { joints, weights, rig: read_rig(&bytes[skin_end..])? })
+        Some(Skin { joints, weights, rig: read_rig(&bytes[rig.clone()])? })
     } else {
-        ensure!(flags & MESH_INSTANCES != 0 || at == bytes.len(), "binary mesh size does not match its counts");
         None
     };
     let mut mesh = checked_mesh(vertices, indices, &simpler, skin)?;
     mesh.authored_lods = true;
-    if flags & MESH_INSTANCES != 0 {
-        mesh.set_instances(Some(MeshInstances::read(&bytes[at..])?))?;
-    }
+    mesh.set_instances(layout.instances.as_ref().map(|layout| MeshInstances::read(bytes, layout)).transpose()?)?;
     Ok(mesh)
 }
 

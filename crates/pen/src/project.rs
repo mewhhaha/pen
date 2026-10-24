@@ -560,6 +560,34 @@ fn ship_assets(from: &Path, to: &Path, wasm: &[u8]) -> Result<Shipped> {
     Ok(shipped)
 }
 
+/// Shared preparation for native packages and static browser exports.
+/// Platform-specific metadata, native code and hosting files follow this.
+struct PreparedGame {
+    wasm: Vec<u8>,
+    assets: Shipped,
+}
+
+fn prepare_game(source: &GameSource<'_>, game: &Path, optimize: bool) -> Result<PreparedGame> {
+    source.compile(game)?;
+    let wasm = shipping_wasm(&game.join("game.wasm"), optimize)?;
+    let from = source.assets();
+    let assets = ship_assets(&from, &game.join("assets"), &wasm)?;
+    let scene = source.scene();
+    if scene.is_file() {
+        std::fs::copy(&scene, game.join("main.scene"))?;
+    }
+    match crate::scene_assets::write(&wasm, &from, &scene, &game.join("assets")) {
+        Ok(()) => {}
+        // A bundle built elsewhere need not implement this host's scene
+        // analysis. Its first frame then loads assets as it goes.
+        Err(error) if matches!(source, GameSource::Bundle(_)) => {
+            eprintln!("not working out what the bundle draws first: {error:#}");
+        }
+        Err(error) => return Err(error),
+    }
+    Ok(PreparedGame { wasm, assets })
+}
+
 /// What `pen build` ships.
 pub struct PackageOptions {
     /// Optimize shipping Wasm before native precompilation.
@@ -601,8 +629,8 @@ impl GameSource<'_> {
         }
     }
 
-    /// Writes game.wasm into `game` and returns it.
-    fn compile(&self, game: &Path) -> Result<Vec<u8>> {
+    /// Writes game.wasm into `game`.
+    fn compile(&self, game: &Path) -> Result<()> {
         let wasm = game.join("game.wasm");
         match self {
             GameSource::Checkout(project) => project.compile(game)?,
@@ -611,7 +639,7 @@ impl GameSource<'_> {
                 std::fs::copy(&from, &wasm).with_context(|| format!("copying {}", from.display()))?;
             }
         }
-        Ok(std::fs::read(wasm)?)
+        Ok(())
     }
 
     fn assets(&self) -> PathBuf {
@@ -786,13 +814,7 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
     let layout = crate::app_bundle::Layout::new(out, &identity, &target, options.bundle_id.as_deref())?;
     layout.create()?;
     let game = &layout.game;
-    source.compile(game)?;
-    let wasm = shipping_wasm(&game.join("game.wasm"), options.optimize)?;
-    let assets = ship_assets(&source.assets(), &game.join("assets"), &wasm)?;
-    let scene = source.scene();
-    if scene.is_file() {
-        std::fs::copy(&scene, game.join("main.scene"))?;
-    }
+    let PreparedGame { wasm, assets } = prepare_game(&source, game, options.optimize)?;
     crate::services::locale::ship_tables(&source.assets(), game)?;
     match &source {
         GameSource::Checkout(project) => {
@@ -809,16 +831,8 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
             }
         }
     }
-    match crate::scene_assets::write(&wasm, &source.assets(), &scene, &game.join("assets")) {
-        Ok(()) => {}
-        // A bundle built elsewhere need not run here: its first frame then
-        // loads its assets as it goes.
-        Err(error) if matches!(source, GameSource::Bundle(_)) => {
-            eprintln!("not working out what the bundle draws first: {error:#}");
-        }
-        Err(error) => return Err(error),
-    }
-    std::fs::write(game.join("game.cwasm"), blot_host::precompile(&engine, &wasm)?)?;
+    let precompiled = blot_host::precompile(&engine, &wasm)?;
+    std::fs::write(game.join("game.cwasm"), crate::compiled::encode(&precompiled)?)?;
     Manifest { game: identity, runtime: Some(RUNTIME.to_owned()) }.write(game)?;
     std::fs::copy(&runtime, &layout.executable)?;
     if let Some(library) = &steam {
@@ -869,21 +883,18 @@ pub fn web_host(out: &Path) -> Result<()> {
 pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: bool) -> Result<()> {
     let staging = crate::staging::Staging::new(&project.root, out)?;
     let site = &staging.directory;
-    project.compile(site)?;
+    let PreparedGame { assets, .. } = prepare_game(&GameSource::Checkout(project), site, optimize)?;
     project.compile_devtools(site)?;
-    let wasm = shipping_wasm(&site.join("game.wasm"), optimize)?;
     if site.join("devtools.wasm").is_file() {
         shipping_wasm(&site.join("devtools.wasm"), optimize)?;
     }
-    let assets = ship_assets(&project.assets(), &site.join("assets"), &wasm)?;
     std::fs::copy(project.assets().join("catalog.json"), site.join("catalog.json"))?;
     let saved = site.join("assets").join(pen_runtime::state::CONFIG_FILE);
     if !saved.is_file() {
         std::fs::write(&saved, pen_runtime::state::OPAQUE_CONFIG)?;
     }
-    crate::scene_assets::write(&wasm, &project.assets(), &project.scene(), &site.join("assets"))?;
-    if project.scene().is_file() {
-        std::fs::copy(project.scene(), site.join("scene.bin"))?;
+    if site.join("main.scene").is_file() {
+        std::fs::rename(site.join("main.scene"), site.join("scene.bin"))?;
     }
     Manifest { game: project.identity.clone(), runtime: None }.write(site)?;
     web_host(site)?;
@@ -1141,6 +1152,8 @@ mod tests {
         assert!(out.join("game/game.cwasm").is_file() && !out.join("game/main.scene").exists());
         let manifest = Manifest::read(&out.join("game")).unwrap().unwrap();
         assert_eq!((manifest.game.name.as_str(), manifest.runtime.as_deref()), ("gather", Some(RUNTIME)));
+        // Exercise the player's decompression and Wasmtime loading path.
+        crate::load_module(&blot_host::engine().unwrap(), &out.join("game"), false, false).unwrap();
         assert!(std::fs::read(out.join("game/assets/quad.mesh.json")).unwrap().starts_with(b"PMSH"));
         assert!(out.join("game/assets/fill.wgsl").is_file());
         std::fs::remove_dir_all(root).unwrap();

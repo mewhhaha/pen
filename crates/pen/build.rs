@@ -18,16 +18,25 @@ fn main() {
 /// wasmtime features. Any change to blot-host or the ABI manifest parser
 /// counts, which is cautious: a player built before it may run a guest
 /// differently too, or refuse its ABI version. The packed mesh codec also
-/// counts: a player must be able to read the assets this packager writes.
+/// counts, as does compiled-game storage: a player must be able to read
+/// the files this packager writes.
 fn compatibility() -> String {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
     let workspace = manifest.join("../..");
     let host = manifest.join("../blot-host");
     let abi = manifest.join("../pen-runtime/src/abi.rs");
     let packed_mesh = manifest.join("../pen-render/src/asset_store/packed.rs");
-    for path in
-        [workspace.join("Cargo.lock"), workspace.join("Cargo.toml"), host.clone(), abi.clone(), packed_mesh.clone()]
-    {
+    let mesh_layout = manifest.join("../pen-render/src/asset_store/layout.rs");
+    let compiled = manifest.join("src/compiled.rs");
+    for path in [
+        workspace.join("Cargo.lock"),
+        workspace.join("Cargo.toml"),
+        host.clone(),
+        abi.clone(),
+        packed_mesh.clone(),
+        mesh_layout.clone(),
+        compiled.clone(),
+    ] {
         println!("cargo:rerun-if-changed={}", path.display());
     }
     println!("cargo:rerun-if-changed=build.rs");
@@ -55,6 +64,8 @@ fn compatibility() -> String {
     }
     hash.write(&unix_lines(&std::fs::read(&abi).unwrap_or_default()));
     hash.write(&unix_lines(&std::fs::read(&packed_mesh).expect("packed mesh codec exists")));
+    hash.write(&unix_lines(&std::fs::read(&mesh_layout).expect("mesh layout exists")));
+    hash.write(&unix_lines(&std::fs::read(&compiled).expect("compiled game codec exists")));
     format!("wasmtime {wasmtime}, engine {:016x}", hash.0)
 }
 

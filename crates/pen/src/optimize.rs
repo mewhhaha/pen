@@ -86,12 +86,14 @@ fn optimize(path: &Path, source: &[u8], custom: &[(String, &[u8])], scratch: &Pa
     let symbols = Symbols::read(&optimized);
     ensure!(symbols.problems.is_empty(), "optimized debug metadata is invalid: {:?}", symbols.problems);
     ensure!(!mapped || symbols.has_source_map(), "wasm-opt lost the source map");
-    // Also check that the rewritten exports still satisfy the ABI and can be
-    // compiled by this host; the game itself is never run during this check.
-    let engine = blot_host::engine()?;
-    blot_host::GuestModule::new(&engine, &optimized, None)?;
     let marker = stamp(settings, &optimized);
     optimized = replace_custom(&optimized, MARK, Some(marker.as_bytes()))?;
+    // Validate the final stamped bytes through the same cache used by the
+    // startup-scene analysis, so it reuses this compilation. No guest code
+    // runs during validation; target-specific precompilation stays separate.
+    let engine = blot_host::engine()?;
+    let cache = crate::cache_dir().map(|directory| directory.join("wasm"));
+    blot_host::GuestModule::new(&engine, &optimized, cache.as_deref())?;
     std::fs::write(&output, &optimized)?;
     std::fs::rename(&output, path)?;
     eprintln!(

@@ -93,6 +93,9 @@ steamworks = { version = "0.13", optional = true }
 symphonia = { version = "0.6", default-features = false, features = ["wav", "pcm"] }
 wgpu.workspace = true
 winit = "0.30"
+# Lossless storage for the package's precompiled guest. No dictionaries or
+# legacy codecs; the player only links the decoder it calls.
+zstd = { version = "0.13.3", default-features = false }
 
 # Asks an asset recipe to stop (pipeline): `just` passes SIGTERM on.
 [target.'cfg(unix)'.dependencies]

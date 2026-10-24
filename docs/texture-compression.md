@@ -25,8 +25,9 @@ by any tool. A colour texture is sRGB; `pen texture --linear` writes UNORM
 for data such as normal maps (the renderer's linear view reads either).
 
 WebGPU requires a block-compressed texture's size to be a multiple of 4. An
-image that is not keeps plain RGBA in every family's file, which every GPU
-reads.
+image that is not emits only `name.rgba.ktx2`, which every GPU reads.
+Re-encoding removes any old BC7, ASTC and ETC2 variants after writing the
+fallback, so changing an image's dimensions cannot leave stale preferred files.
 
 ## Choosing at load
 
@@ -50,7 +51,7 @@ Hot reload of `name.bc7.ktx2` (or any variant) reloads `name.ktx2`.
 `pen texture IMAGE [--out name.ktx2] [--linear] [--flat]` reads a PNG,
 works out the mip chain (`pen-texture`'s `mips`: box filtered, odd sizes
 weighted so nothing shifts, colour averaged in linear light weighted by
-alpha) and encodes every family with pen-texture's own encoders, pure Rust:
+alpha) and encodes the supported families with pen-texture's own encoders, pure Rust:
 
 - **BC7**: mode 6 for every block, mode 5 in its four rotations, and the
   best two of the 64 two-subset partitions in mode 1 (opaque) or 7 (alpha),

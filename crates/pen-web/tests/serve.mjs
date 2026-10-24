@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 const types = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
-  '.json': 'application/json', '.png': 'image/png', '.ogg': 'audio/ogg', '.wav': 'audio/wav', '.wgsl': 'text/plain',
+  '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.ogg': 'audio/ogg', '.wav': 'audio/wav', '.wgsl': 'text/plain',
   '.md': 'text/markdown', '.txt': 'text/plain',
 };
 

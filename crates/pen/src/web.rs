@@ -284,6 +284,7 @@ fn route(site: &Site, request: &Request, revision: u64) -> Reply {
         Some("wasm") => "application/wasm",
         Some("json") => "application/json",
         Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
         Some("ogg") => "audio/ogg",
         Some("wav") => "audio/wav",
         _ => "application/octet-stream",

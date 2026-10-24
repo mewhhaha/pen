@@ -13,7 +13,7 @@ package/
 ├─ gdev (gdev.exe)        the player runtime, named after the game
 ├─ libsteam_api.so        (steam_api64.dll, libsteam_api.dylib) when built with Steam
 └─ game/
-   ├─ game.cwasm          the Blot program, compiled to machine code ahead of time
+   ├─ game.cwasm          ahead-of-time machine code, stored as one Zstd frame
    ├─ game.wasm           its Wasm, for the guest ABI manifest
    ├─ assets/
    └─ main.scene
@@ -29,6 +29,14 @@ loads the `game.cwasm` its package was precompiled with, and is less than
 half the size of the development build (10.2 against 23.9 MB). Everything that compiles a checkout
 (`dev`, `run`, `build`, `test`, `bench` and `packets` on a
 checkout) refuses in it and says to use a full build.
+
+The packager compresses `game.cwasm` losslessly with Zstd level 19, including
+its expanded size and checksum. The player decompresses it in memory before
+Wasmtime loads it; it does not write an expanded copy to the player's disk.
+Decoded code and execution are unchanged. Loading rejects corrupt or trailing
+data and expanded modules over 256 MiB. Development compilation caches retain
+their existing format. The runtime compatibility mark includes this storage
+codec, so packaging requires a player that can read it.
 
 - `just player` builds it for Linux (below) and `just windows` for Windows,
   each with the `dist` profile into `target/<target>/dist/`, then puts a
@@ -53,7 +61,9 @@ checkout) refuses in it and says to use a full build.
 ### Shipping Wasm optimization
 
 Native and web `pen build` run Binaryen's `wasm-opt -O3` on staged guest
-modules before precompilation or web compression. Install `wasm-opt` on
+modules before precompilation or web compression. Both use one preparation
+stage for the game Wasm, packed assets, starting scene and startup asset list.
+Install `wasm-opt` on
 `PATH` (version 133 is tested); `--no-optimize` keeps the compiler's output
 for comparisons. Development runs and `pen export` keep that output too.
 
@@ -63,6 +73,9 @@ Pen validates the result before replacing the staged Wasm. External source
 maps require `--no-optimize`. A versioned content stamp avoids optimizing an
 unchanged package again. Precompilation and cache identities use the final
 Wasm, so its native code always belongs to the optimized module.
+Validation and startup-scene analysis use the same compiled-module cache,
+keyed by the final stamped Wasm. Target-specific native precompilation remains
+separate, since its CPU settings can differ from the build machine's.
 
 ### A CPU baseline for game.cwasm
 

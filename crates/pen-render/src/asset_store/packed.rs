@@ -10,7 +10,8 @@ use anyhow::{Context, Result, ensure};
 use flate2::{Compression, Decompress, FlushDecompress, Status, write::ZlibEncoder};
 
 use super::{
-    MAX_LODS, MESH_ATTRIBUTES, MESH_HEADER, MESH_INSTANCES, MESH_LODS, MESH_MAGIC, MESH_SHORT_INDICES, MESH_SKIN,
+    MESH_HEADER, MESH_MAGIC,
+    layout::{Layout, word},
 };
 
 const VERSION: u8 = 2;
@@ -21,14 +22,14 @@ pub(super) fn encode(mut raw: Vec<u8>) -> Result<Vec<u8>> {
     if raw.len() > MAX_EXPANDED {
         return Ok(raw);
     }
-    let blocks = blocks(&raw)?;
+    let layout = Layout::read(&raw)?;
     let mut scratch = Vec::new();
-    transpose(&mut raw, &blocks, &mut scratch, false);
+    transpose(&mut raw, &layout, &mut scratch, false);
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
     encoder.write_all(&raw)?;
     let compressed = encoder.finish()?;
     if compressed.len() + MESH_HEADER >= raw.len() {
-        transpose(&mut raw, &blocks, &mut scratch, true);
+        transpose(&mut raw, &layout, &mut scratch, true);
         return Ok(raw);
     }
     let mut out = Vec::with_capacity(MESH_HEADER + compressed.len());
@@ -64,65 +65,14 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
     );
     raw.truncate(length);
     ensure!(&raw[..4] == MESH_MAGIC && raw[4] == 1 && raw[5] == bytes[5], "invalid compressed mesh contents");
-    let blocks = blocks(&raw)?;
-    transpose(&mut raw, &blocks, &mut Vec::new(), true);
+    let layout = Layout::read(&raw)?;
+    transpose(&mut raw, &layout, &mut Vec::new(), true);
     Ok(Cow::Owned(raw))
 }
 
-struct Block {
-    start: usize,
-    count: usize,
-    stride: usize,
-}
-
-fn word(bytes: &[u8], at: usize) -> Result<usize> {
-    let value = bytes.get(at..at + 4).context("binary mesh ends in its counts")?;
-    Ok(u32::from_le_bytes(value.try_into()?) as usize)
-}
-
-/// Count tables and bounds are left in place, so the inverse can find each
-/// block without decoding its contents. A skin's variable-size rig stays as is.
-fn blocks(bytes: &[u8]) -> Result<Vec<Block>> {
-    ensure!(bytes.len() >= MESH_HEADER, "binary mesh ends in its header");
-    let flags = bytes[5];
-    ensure!(flags & MESH_SKIN == 0 || flags & MESH_INSTANCES == 0, "mesh has both skin and instances");
-    let vertices = word(bytes, 8)?;
-    let indices = word(bytes, 12)?;
-    let index_bytes = if flags & MESH_SHORT_INDICES != 0 { 2 } else { 4 };
-    let mut blocks = Vec::new();
-    let mut at = MESH_HEADER;
-    let mut add = |at: &mut usize, count: usize, stride: usize| -> Result<()> {
-        let end = count.checked_mul(stride).and_then(|size| at.checked_add(size));
-        let end = end.filter(|&end| end <= bytes.len()).context("binary mesh size does not match its counts")?;
-        blocks.push(Block { start: *at, count, stride });
-        *at = end;
-        Ok(())
-    };
-    add(&mut at, vertices, if flags & MESH_ATTRIBUTES != 0 { 40 } else { 32 })?;
-    add(&mut at, indices, index_bytes)?;
-    if flags & MESH_LODS != 0 {
-        let levels = word(bytes, at)?;
-        ensure!(levels < MAX_LODS, "binary mesh has too many levels of detail");
-        let table = at + 4;
-        at = table + levels * 8;
-        for level in 0..levels {
-            add(&mut at, word(bytes, table + level * 8)?, index_bytes)?;
-        }
-    }
-    if flags & MESH_SKIN != 0 {
-        add(&mut at, vertices, 24)?;
-    } else if flags & MESH_INSTANCES != 0 {
-        let count = word(bytes, at)?;
-        at += 28;
-        add(&mut at, count, 80)?;
-    }
-    ensure!(flags & MESH_SKIN != 0 || at == bytes.len(), "binary mesh has trailing bytes");
-    Ok(blocks)
-}
-
-fn transpose(bytes: &mut [u8], blocks: &[Block], scratch: &mut Vec<u8>, inverse: bool) {
-    for block in blocks {
-        let data = &mut bytes[block.start..block.start + block.count * block.stride];
+fn transpose(bytes: &mut [u8], layout: &Layout, scratch: &mut Vec<u8>, inverse: bool) {
+    for block in layout.blocks() {
+        let data = &mut bytes[block.range()];
         scratch.clear();
         scratch.extend_from_slice(data);
         for column in 0..block.stride {
@@ -166,8 +116,10 @@ mod tests {
     fn rejects_truncation_corruption_trailers_and_false_expanded_sizes() {
         let raw = pack_uncompressed(&parse_mesh(skinned_triangle().as_bytes()).unwrap()).unwrap();
         let packed = encode(raw.clone()).unwrap();
-        for end in 0..packed.len() {
-            assert!(parse_mesh(&packed[..end]).is_err(), "truncated at {end}");
+        for bytes in [&raw, &packed] {
+            for end in 0..bytes.len() {
+                assert!(parse_mesh(&bytes[..end]).is_err(), "version {} truncated at {end}", bytes[4]);
+            }
         }
         let mut extra = packed.clone();
         extra.push(0);

@@ -82,6 +82,13 @@ space. Pen culls the aggregate bounds, grown by the shader's `bounds_margin`,
 and applies the draw transform to the whole patch. It does not cull individual
 records. Split large patches into separate mesh assets when finer culling matters.
 
+An optional positive finite `"scale"` (default 1) multiplies JSON record values
+once on load. For example, integer records with `"scale": 0.000244140625`
+use a 1/4096-unit grid. Bounds remain in mesh units. The asset author chooses
+precision; Pen's packed files and GPU buffers hold the expanded float32 values.
+This can make both source assets and compressed packages smaller without
+changing the shader layout or the number of instances.
+
 Records are uploaded with the asset, retained on the GPU, and replaced on hot
 reload. A frame sends one ordinary mesh draw; there are no per-record packet
 entries or frame uploads. Frame instance-upload counters exclude asset loading.
@@ -98,3 +105,14 @@ In packed PMSH version 1, flag 16 appends the instance count (`u32`), bounds
 (six `f32`s, minimum then maximum), and 20 `f32`s per record after indices and
 any LODs. All are little-endian. Flag 16 cannot coexist with skin flag 4. Older
 hosts reject this flag; rebuild native and browser hosts when adopting it.
+
+Packaging writes PMSH version 2 when it is smaller: it groups corresponding
+bytes of vertex, index, skin and instance records, then compresses with zlib.
+Its 16-byte header is `PMSH`, version 2, the mesh flags, two zero bytes, the
+expanded version-1 byte count (`u32`), and four zero bytes. The zlib payload
+contains the complete shuffled version-1 file; count tables, bounds and the
+skin's rig remain in place. Loaders reverse the shuffle before parsing, with
+every float and index unchanged. Compressed meshes may expand to at most
+256 MiB. Larger or incompressible meshes keep version 1. Native and browser
+hosts read both; rebuild the hosts to ship version 2. Runtime compatibility
+checks include the mesh codec so packaging cannot pair it with an older player.

@@ -139,6 +139,7 @@ pub fn run(checkout: &Path, options: Options) -> Result<()> {
     let session = options.session.map(|options| session::Prepared::new(checkout, options)).transpose()?;
     // As many tests run at once as modules compile, however few the modules.
     let slots = Slots::new(jobs).deadline(options.deadline.unwrap_or(TEST_DEADLINE));
+    let native_jobs = jobs;
     let jobs = jobs.min(modules.len()).max(1);
     // The modules share much of their code; the development engine
     // compiles each function it has seen only once.
@@ -190,6 +191,33 @@ pub fn run(checkout: &Path, options: Options) -> Result<()> {
     );
     if !failed.is_empty() {
         bail!("tests failed:\n  {}", failed.join("\n  "));
+    }
+    // Explicit Blot files are a focused run. A full suite also runs the
+    // checkout's independently authored native reference checks.
+    if options.files.is_empty()
+        && session.is_none()
+        && let Some(native) = &plugins.config().tests
+    {
+        for manifest in &native.rust {
+            let manifest =
+                checkout.join(manifest).canonicalize().with_context(|| format!("native test manifest {manifest}"))?;
+            ensure!(manifest.starts_with(checkout), "native test manifest must be inside the checkout");
+            let mut command = std::process::Command::new("cargo");
+            command
+                .args(["test", "--locked", "--manifest-path"])
+                .arg(&manifest)
+                .current_dir(checkout)
+                .env("PEN_EXECUTABLE", std::env::current_exe()?)
+                .env("PEN_TEST_PROJECT", checkout)
+                .env("PEN_TEST_DEADLINE_SECONDS", options.deadline.unwrap_or(TEST_DEADLINE).as_secs().to_string());
+            command.arg("--");
+            if let Some(filter) = filter {
+                command.arg(filter);
+            }
+            command.arg(format!("--test-threads={native_jobs}"));
+            let status = command.status().context("starting native reference tests with Cargo")?;
+            ensure!(status.success(), "native tests {} failed: {status}", manifest.display());
+        }
     }
     Ok(())
 }

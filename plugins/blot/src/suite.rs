@@ -118,8 +118,29 @@ pub fn find(
                 }
             },
         };
+        // A module may keep expected panics beside its ordinary checks.
+        // Pen runs each export in a fresh instance, including after a trap.
+        let inline_traps = kind(&path) == Kind::Checks
+            && source.lines().any(|line| {
+                line.trim_start().strip_prefix("entry const ").is_some_and(|name| name.starts_with("trap_"))
+            });
         let overlays = vec![Overlay { path: entry.clone(), contents: Some(source) }];
-        found.push(TestModule { path, entry: entry.clone(), overlays, prefix: PREFIX.to_owned(), expect });
+        found.push(TestModule {
+            path: path.clone(),
+            entry: entry.clone(),
+            overlays: overlays.clone(),
+            prefix: PREFIX.to_owned(),
+            expect,
+        });
+        if inline_traps {
+            found.push(TestModule {
+                path,
+                entry: entry.clone(),
+                overlays,
+                prefix: "trap_".to_owned(),
+                expect: Expectation::Traps,
+            });
+        }
     }
     Ok(found)
 }
@@ -290,6 +311,21 @@ mod tests {
         // An explicit empty suite is not the discovery default.
         program.settings = r#"{"tests":{"files":[]}}"#.into();
         assert!(find(&program, &[], None, &mut files).unwrap().is_empty());
+    }
+
+    #[test]
+    fn expected_panics_can_share_the_check_fixture() {
+        let mut files = checkout(&[(
+            "tests/a.blot",
+            "entry const test_ok = fn () => #[1.0,0.0]\nentry const trap_bad = fn () => @panic \"bad\"\n",
+        )]);
+        let found = find(&program(), &[], None, &mut files).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].expect, Expectation::Checks);
+        assert_eq!(found[1].expect, Expectation::Traps);
+        assert_eq!(found[1].prefix, "trap_");
+        assert_eq!(found[0].entry, found[1].entry);
+        assert_eq!(found[0].overlays, found[1].overlays);
     }
 
     #[test]

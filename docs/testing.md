@@ -287,3 +287,34 @@ final save file byte for byte. `pen packets` writes `native.snapshot` using the
 same snapshot container as the browser; this witness is outside benchmark timing
 samples. `just conformance` serves isolated responses so `PEN_WEB_WITHOUT=jspi`
 can exercise the worker fallback as well.
+
+## Library checkouts and native references
+
+`pen test-blot` also works in a library checkout with `pen.json` and no game
+entry. The Blot plugin accepts `compiler.settings.tests.entry` and an explicit
+`files` list. A check fixture can additionally export `trap_` functions (Unit to
+Array F32); only an unreachable trap passes. A source beginning with
+`// rejects: TEXT` passes when compilation fails with that diagnostic.
+
+An optional top-level `tests` object names native Rust reference suites:
+
+```json
+{ "tests": { "rust": ["tools/native/Cargo.toml"] } }
+```
+
+After the Blot suite succeeds, Pen runs those Cargo tests. `--filter` applies to
+both suites and `--jobs` controls Rust test threads as well. Explicit Blot file
+operands and `--session` run only Blot tests. Pen supplies `PEN_EXECUTABLE`,
+`PEN_TEST_PROJECT` and `PEN_TEST_DEADLINE_SECONDS` to native suites; the suite
+owns its assertions and uses the deadline for guest execution.
+
+A checkout can expose development tools through the same native toolchain:
+
+```json
+{ "tools": { "ink": { "manifest": "tools/native/Cargo.toml", "bin": "ink-tools" } } }
+```
+
+`pen tool ink -- generate tools/generate.json` invokes that Cargo binary.
+Arguments after `--` are forwarded verbatim. Cargo manifests must resolve inside
+the checkout. Tool code owns domain policy; Pen owns dispatch and reports a
+nonzero exit as failure. Tools receive `PEN_EXECUTABLE` and `PEN_PROJECT`.

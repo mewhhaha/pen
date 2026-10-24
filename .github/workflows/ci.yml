@@ -18,10 +18,11 @@ env:
   CARGO_TERM_COLOR: always
   # zig as cargo-zigbuild runs it; the version the Justfile recipes were tried with.
   ZIG_VERSION: 0.17.0
-  # binaryen, whose wasm-opt crates/pen-web/build.sh runs, and its release
-  # tarball's checksum.
+  # Binaryen for the browser host and shipping guest optimization.
   BINARYEN_VERSION: "133"
   BINARYEN_SHA256: 2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489
+  BINARYEN_MACOS_SHA256: ad66da82ac13f163e424b1643f16c6dfcccc98b5966296b43e52d3cab04f84a8
+  BINARYEN_MACOS_X86_SHA256: 13a9b90be775c6389ce3d1f879cb8627bea56708ba8c122983941d53a8199b95
   # mdBook, which builds the docs site, and its release tarball's checksum.
   MDBOOK_VERSION: "0.5.4"
   MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
@@ -88,7 +89,9 @@ jobs:
         # itself ask for the software one.
         env:
           PEN_SOFTWARE: "1"
-        run: cargo test --workspace -- --test-threads=1
+        run: |
+          cargo test --workspace -- --test-threads=1
+          cargo test -p pen optimize:: -- --include-ignored
       - name: Renderer tests in release
         env:
           PEN_SOFTWARE: "1"
@@ -399,6 +402,14 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: binaryen
+        run: |
+          cd "$RUNNER_TEMP"
+          archive=binaryen-version_$BINARYEN_VERSION-x86_64-linux.tar.gz
+          curl -fsSLO "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$archive"
+          echo "$BINARYEN_SHA256  $archive" | sha256sum -c
+          tar -xzf "$archive"
+          echo "$RUNNER_TEMP/binaryen-version_$BINARYEN_VERSION/bin" >> "$GITHUB_PATH"
       - name: System libraries
         # pen's own, and lavapipe for the Linux package's smoke.
         run: |
@@ -485,6 +496,19 @@ jobs:
       WGPU_BACKEND: metal
     steps:
       - uses: actions/checkout@v4
+      - name: binaryen
+        run: |
+          cd "$RUNNER_TEMP"
+          case "$(uname -m)" in
+            arm64) checksum=$BINARYEN_MACOS_SHA256 ;;
+            x86_64) checksum=$BINARYEN_MACOS_X86_SHA256 ;;
+            *) exit 1 ;;
+          esac
+          archive=binaryen-version_$BINARYEN_VERSION-$(uname -m)-macos.tar.gz
+          curl -fsSLO "https://github.com/WebAssembly/binaryen/releases/download/version_$BINARYEN_VERSION/$archive"
+          echo "$checksum  $archive" | shasum -a 256 -c
+          tar -xzf "$archive"
+          echo "$RUNNER_TEMP/binaryen-version_$BINARYEN_VERSION/bin" >> "$GITHUB_PATH"
       - name: Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@v2

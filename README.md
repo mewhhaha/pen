@@ -46,7 +46,8 @@ The crates:
 
 `just install` builds the development runtime with Steam and installs it as
 `~/.local/bin/pen`, a link to `~/.local/lib/pen-runtime/pen` beside Steam's
-library. It needs binaryen's `wasm-opt` on `PATH` (a release from
+library. It also installs the smaller shipping player in `player/`; this needs
+zig and cargo-zigbuild, as `just player` does. It needs binaryen's `wasm-opt` on `PATH` (a release from
 https://github.com/WebAssembly/binaryen/releases; version 133 is tested) to
 optimize the browser host it installs, and it removes plugins and browser host
 files that earlier installs left and this one no longer builds. In a gdev
@@ -830,15 +831,17 @@ It ships the **player runtime**: pen built without its default `compiler`
 and `devtools` features (`--no-default-features --features steam`), so without
 Cranelift or the dev tools. It only loads the `game.cwasm` its package was
 precompiled with, and refuses every command that compiles a checkout.
-`pen build` ships the runtime in `player/` beside itself, else itself (and
-says so); `--runtime EXE` ships another. `game.cwasm` is compiled for the
+`pen build` ships the runtime in `player/` beside itself. If it is missing,
+it asks for `just install-player`; `--runtime EXE` explicitly ships another.
+`just install` installs both runtimes. `game.cwasm` is compiled for the
 runtime's platform (read from its executable header, or `--target TRIPLE`)
 and for a CPU baseline (`--cpu PRESET`, default `x86-64-v2`), not the
 packaging machine's CPU.
 
 `pen build` ships only the assets the catalog reaches: what it names, and the
 shaders and textures its materials name. Mesh JSON ships in the renderer's
-binary form. On 2026-10-15 that came to 215 of 266 files, 72.5 of 117.0 MB.
+binary form, with lossless byte shuffling and zlib compression when smaller.
+Both native and browser hosts restore the original mesh values at load time.
 It refuses a runtime built from another pen (different wasmtime or
 blot-host): rebuild it with `just install-player`. `pen build --game DIR`
 packages a bundle compiled already (`pen export`'s) without the checkout,

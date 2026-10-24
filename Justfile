@@ -8,8 +8,8 @@ playwright := "1.63.0"
 
 # Then removes what earlier installs left in plugins/ and web/ that this one
 # no longer builds, saying what it removes.
-# Install the native CLI, compiler component and browser host.
-install: plugins web-host
+# Install the native CLI, compiler component, browser host and shipping player.
+install: plugins web-host install-player
   cargo build --release -p pen --features steam
   mkdir -p ~/.local/lib/pen-runtime/plugins ~/.local/lib/pen-runtime/web
   cp target/release/pen ~/.local/lib/pen-runtime/pen.new
@@ -49,8 +49,8 @@ run *args:
 headless *args:
   {{pen}} run --project {{gdev}} --headless {{args}}
 
-package:
-  {{pen}} build --project {{gdev}} --out dist/package
+package: player
+  {{pen}} build --project {{gdev}} --runtime target/x86_64-unknown-linux-gnu/dist/player/pen --out dist/package
 
 bench:
   {{pen}} bench --project {{gdev}} --frames 600
@@ -251,7 +251,9 @@ player:
 # Installs `just player`'s runtime for `pen build`.
 install-player: player
   mkdir -p ~/.local/lib/pen-runtime/player
-  cp target/x86_64-unknown-linux-gnu/dist/player/* ~/.local/lib/pen-runtime/player/
+  cp target/x86_64-unknown-linux-gnu/dist/player/pen ~/.local/lib/pen-runtime/player/pen.new
+  mv -f ~/.local/lib/pen-runtime/player/pen.new ~/.local/lib/pen-runtime/player/pen
+  cp target/x86_64-unknown-linux-gnu/dist/player/{libsteam_api.so,LICENSE,THIRD_PARTY_NOTICES.md} ~/.local/lib/pen-runtime/player/
 
 # As x86_64-pc-windows-gnu, with no Windows SDK or MSVC: zig compiles
 # libopus (opusic-sys, through CMake) as it links. What ships is

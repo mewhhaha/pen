@@ -101,6 +101,25 @@ pub struct Config {
     pub steam: Option<serde_json::Value>,
     pub itch: Option<serde_json::Value>,
     pub reports: Option<serde_json::Value>,
+    /// Native reference suites, run by `pen test-blot` after the Blot checks.
+    pub tests: Option<NativeTests>,
+    /// Checkout-owned Rust tools, invoked with `pen tool NAME -- ARGS`.
+    #[serde(default)]
+    pub tools: BTreeMap<String, NativeTool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTool {
+    pub manifest: String,
+    pub bin: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTests {
+    /// Root-relative Cargo manifests. Each suite owns its Rust assertions.
+    pub rust: Vec<String>,
 }
 
 /// One plugin's component and grants.
@@ -295,10 +314,16 @@ impl Plugins {
 
     /// Opens a compiler session for the program whose entry is `entry`.
     pub fn compiler(&self, entry: &Path) -> Result<Compiler> {
+        self.compiler_with_settings(entry, self.chosen()?.settings.as_ref())
+    }
+
+    /// A developer tool can override the compiler settings for a fixture.
+    /// Plugin selection and process/file grants still come from pen.json.
+    pub fn compiler_with_settings(&self, entry: &Path, settings: Option<&serde_json::Value>) -> Result<Compiler> {
         let choice = self.chosen()?;
         let name = choice.plugin.clone();
         let (mut store, plugin) = self.start(&name)?;
-        let program = program(&self.root, entry, &choice.settings);
+        let program = program(&self.root, entry, &settings.cloned());
         let timeout = self.timeout(&name);
         let session =
             within(&mut store, timeout, |store| plugin.pen_plugin_compiler().session().call_open(store, &program))

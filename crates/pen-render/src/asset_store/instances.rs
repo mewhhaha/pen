@@ -10,8 +10,16 @@ use crate::culling::Sphere;
 #[derive(Deserialize)]
 pub(crate) struct MeshInstances {
     pub data: Vec<f32>,
+    /// JSON records can use fixed-point integers. Bounds stay in mesh units;
+    /// binary files and GPU records always contain the expanded values.
+    #[serde(default = "unit_scale")]
+    pub scale: f32,
     pub min: [f32; 3],
     pub max: [f32; 3],
+}
+
+fn unit_scale() -> f32 {
+    1.0
 }
 
 impl MeshInstances {
@@ -33,19 +41,29 @@ impl MeshInstances {
         let end = count.checked_mul(80).and_then(|size| size.checked_add(28));
         ensure!(end == Some(bytes.len()), "binary mesh instance size does not match its count");
         let values: Vec<f32> = bytes[4..].as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)).collect();
-        Ok(Self { min: values[..3].try_into()?, max: values[3..6].try_into()?, data: values[6..].to_vec() })
+        Ok(Self { min: values[..3].try_into()?, max: values[3..6].try_into()?, data: values[6..].to_vec(), scale: 1.0 })
     }
 }
 
 impl Mesh {
-    pub(super) fn set_instances(&mut self, instances: Option<MeshInstances>) -> Result<()> {
-        if let Some(instances) = &instances {
+    pub(super) fn set_instances(&mut self, mut instances: Option<MeshInstances>) -> Result<()> {
+        if let Some(instances) = &mut instances {
             ensure!(self.skin.is_none(), "a mesh cannot have both a skin and persistent instances");
             ensure!(
                 !instances.data.is_empty() && instances.data.len().is_multiple_of(20),
                 "mesh instances require 20 floats per record"
             );
             u32::try_from(instances.data.len() / 20).context("mesh has more instances than a u32 counts")?;
+            ensure!(
+                instances.scale.is_finite() && instances.scale > 0.0,
+                "mesh instance scale must be finite and positive"
+            );
+            if instances.scale != 1.0 {
+                for value in &mut instances.data {
+                    *value *= instances.scale;
+                }
+                instances.scale = 1.0;
+            }
             ensure!(instances.data.iter().all(|v| v.is_finite()), "mesh instance data must be finite");
             ensure!(
                 (0..3).all(|axis| instances.min[axis].is_finite()
@@ -89,6 +107,28 @@ mod tests {
     }
 
     #[test]
+    fn fixed_point_records_expand_once_without_scaling_bounds() {
+        let mut source = fixture();
+        source["instances"]["data"] = json!((-20..20).collect::<Vec<_>>());
+        source["instances"]["scale"] = json!(1.0 / 4096.0);
+        let json = serde_json::to_vec(&source).unwrap();
+        let packed = pack_mesh(&json).unwrap();
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
+        for bytes in [&json, &packed] {
+            let instance = parse_mesh(bytes).unwrap().instances.unwrap();
+            assert_eq!(instance.scale, 1.0);
+            assert_eq!(instance.data, (-20..20).map(|n| n as f32 / 4096.0).collect::<Vec<_>>());
+            assert_eq!((instance.min, instance.max), ([-1., -2., -3.], [1., 2., 3.]));
+        }
+        for scale in [0.0, -1.0, 1e100] {
+            source["instances"]["scale"] = json!(scale);
+            assert!(parse_mesh(&serde_json::to_vec(&source).unwrap()).is_err());
+        }
+        source["instances"]["scale"] = json!(f32::MAX);
+        assert!(parse_mesh(&serde_json::to_vec(&source).unwrap()).is_err());
+    }
+
+    #[test]
     fn rejects_incomplete_records_bounds_and_binary_trailers() {
         let mut malformed = fixture();
         malformed["instances"]["data"] = json!([1.]);
@@ -112,7 +152,8 @@ mod tests {
 
     #[test]
     fn rejects_nonfinite_records_in_binary() {
-        let mut bytes = pack_mesh(&serde_json::to_vec(&fixture()).unwrap()).unwrap();
+        let mesh = parse_mesh(&serde_json::to_vec(&fixture()).unwrap()).unwrap();
+        let mut bytes = super::super::pack_uncompressed(&mesh).unwrap();
         let end = bytes.len();
         bytes[end - 4..].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(parse_mesh(&bytes).is_err());

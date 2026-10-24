@@ -22,7 +22,7 @@ default = ["compiler", "devtools"]
 # needs it. Without it (`--no-default-features`) this is the player runtime
 # `pen build` ships: it only loads the game.cwasm the package was
 # precompiled with.
-compiler = ["blot-host/compiler", "dep:pen-codegen", "dep:pen-gltf", "dep:pen-plugins", "dep:pen-texture", "pen-render/simplify", "dep:brotli"]
+compiler = ["blot-host/compiler", "dep:pen-codegen", "dep:pen-gltf", "dep:pen-plugins", "dep:pen-texture", "pen-render/simplify", "dep:brotli", "dep:base64"]
 steam = ["dep:steamworks"]
 # The dev tools: the checkout's own Blot program for its console and
 # diagnostics, compiled through its plugins and run beside the game in
@@ -30,6 +30,7 @@ steam = ["dep:steamworks"]
 devtools = ["compiler"]
 
 [dependencies]
+base64 = { version = "0.22", optional = true }
 anyhow.workspace = true
 blot-host.workspace = true
 log = { version = "0.4", features = ["std"] }

@@ -37,6 +37,8 @@ mod mods;
 mod net;
 #[cfg(feature = "compiler")]
 mod new;
+#[cfg(feature = "compiler")]
+mod optimize;
 mod opus;
 mod packets;
 mod patch;
@@ -414,7 +416,13 @@ struct OptionSpec {
     about: &'static str,
 }
 
-const COMMANDS: [CommandSpec; 26] = [
+const COMMANDS: [CommandSpec; 27] = [
+    CommandSpec {
+        name: "tool",
+        operands: "NAME [ARGS...]",
+        checkout: true,
+        about: "run a checkout-owned Rust tool from pen.json; put its arguments after --",
+    },
     CommandSpec {
         name: "dev",
         operands: "",
@@ -603,6 +611,7 @@ const COMMANDS: [CommandSpec; 26] = [
 const PLAY: &[&str] = &["", "dev", "run"];
 /// Every command that works on a checkout.
 const CHECKOUT: &[&str] = &[
+    "tool",
     "dev",
     "web",
     "run",
@@ -619,7 +628,7 @@ const CHECKOUT: &[&str] = &[
     "fuzz",
 ];
 
-const OPTIONS: [OptionSpec; 101] = [
+const OPTIONS: [OptionSpec; 102] = [
     OptionSpec { name: "--help", value: "", commands: &[], place: Place::Prose, about: "this" },
     OptionSpec {
         name: "--out",
@@ -705,8 +714,15 @@ const OPTIONS: [OptionSpec; 101] = [
         value: "EXE",
         commands: &["build"],
         place: Place::Command,
-        about: "the runtime to ship (default player/ beside this executable, else this one); it must be \
+        about: "the runtime to ship (default player/ beside this executable); it must be \
                 built from the same pen",
+    },
+    OptionSpec {
+        name: "--no-optimize",
+        value: "",
+        commands: &["build"],
+        place: Place::Command,
+        about: "keep the compiler's Wasm unchanged (build normally runs wasm-opt -O3 before shipping)",
     },
     OptionSpec {
         name: "--target",
@@ -1558,6 +1574,10 @@ impl Args {
             args.command = spec.name;
         }
         while let Some(word) = words.next() {
+            if args.command == "tool" && word == "--" {
+                args.operands.extend(words);
+                break;
+            }
             // A negative number is an operand (`pen remote ADDRESS state -1`).
             let negative = word.strip_prefix('-').is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
             if !word.starts_with('-') || negative {
@@ -2171,7 +2191,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         let _ = IDENTITY.set(project::bundle_identity(&directory)?);
         (None, Some(directory))
     } else {
-        let project = if args.command == "test-blot" && !args.flag("--session") {
+        let project = if args.command == "tool" || (args.command == "test-blot" && !args.flag("--session")) {
             Project::find_tests(args.path("--project"))?
         } else {
             Project::find(args.path("--project"))?
@@ -2249,6 +2269,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         }
         "build" => {
             let options = project::PackageOptions {
+                optimize: !args.flag("--no-optimize"),
                 runtime: args.path("--runtime"),
                 target: args.value("--target"),
                 cpu: args.value("--cpu"),
@@ -2273,7 +2294,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             let web = args.flag("--web");
             let out = if web {
                 let out = args.path("--out").unwrap_or_else(|| project.root.join(".pen/web-export"));
-                project::export_web(project, &out, args.path("--zip").as_deref())?;
+                project::export_web(project, &out, args.path("--zip").as_deref(), options.optimize)?;
                 out
             } else {
                 ensure!(!args.flag("--zip"), "--zip goes with --web");
@@ -2423,6 +2444,33 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             fuzz::run(&fuzzed, &options, None).map(drop)
         }
         #[cfg(feature = "compiler")]
+        "tool" => {
+            let project = checkout()?;
+            let plugins =
+                pen_plugins::Plugins::load(&project.root, Arc::new(|level, text| eprintln!("{level:?}: {text}")))?
+                    .context("pen tool needs a pen.json")?;
+            let name = &args.operands[0];
+            let tool = plugins.config().tools.get(name).with_context(|| format!("no tool {name} in pen.json"))?;
+            let manifest = project.root.join(&tool.manifest).canonicalize().context("tool manifest")?;
+            ensure!(manifest.starts_with(&project.root), "tool manifest must be inside the checkout");
+            let status = std::process::Command::new("cargo")
+                .args(["run", "--quiet", "--locked", "--manifest-path"])
+                .arg(&manifest)
+                .arg("--bin")
+                .arg(&tool.bin)
+                .arg("--")
+                .args(&args.operands[1..])
+                .current_dir(&project.root)
+                .env("PEN_EXECUTABLE", std::env::current_exe()?)
+                .env("PEN_PROJECT", &project.root)
+                .status()
+                .context("starting checkout tool with Cargo")?;
+            ensure!(status.success(), "tool {name} failed: {status}");
+            Ok(())
+        }
+        #[cfg(not(feature = "compiler"))]
+        "tool" => bail!("this pen has no checkout tools; use a full build"),
+        #[cfg(feature = "compiler")]
         "test-blot" => {
             let project = checkout()?;
             let files = args.operands.iter().map(PathBuf::from).collect();
@@ -2490,6 +2538,16 @@ mod tests {
 
     fn error(line: &str) -> String {
         format!("{:#}", parse(line).unwrap_err())
+    }
+
+    #[test]
+    fn checkout_tools_forward_arguments_after_the_separator_verbatim() {
+        let args = parse("tool ink --project ../ink -- generate config.json --write --project ../gdev").unwrap();
+        assert_eq!(args.command, "tool");
+        assert_eq!(args.value("--project").as_deref(), Some("../ink"));
+        assert_eq!(args.operands, ["ink", "generate", "config.json", "--write", "--project", "../gdev"]);
+        assert!(parse("tool").is_err());
+        assert!(parse("tool ink --unknown").is_err());
     }
 
     #[test]

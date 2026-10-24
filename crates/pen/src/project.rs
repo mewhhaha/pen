@@ -562,9 +562,10 @@ fn ship_assets(from: &Path, to: &Path, wasm: &[u8]) -> Result<Shipped> {
 
 /// What `pen build` ships.
 pub struct PackageOptions {
+    /// Optimize shipping Wasm before native precompilation.
+    pub optimize: bool,
     /// The runtime to ship. By default the player runtime (no compiler)
-    /// that `just install-player` installs beside this executable, in
-    /// `player/`, else this executable.
+    /// that `just install` installs beside this executable, in `player/`.
     pub runtime: Option<PathBuf>,
     /// The Rust target the runtime was built for, when its executable header
     /// does not say. cargo-zigbuild's glibc suffix (`.2.28`) may be left on.
@@ -641,16 +642,19 @@ impl GameSource<'_> {
 
 /// The runtime `pen build` ships by default.
 fn default_runtime() -> Result<PathBuf> {
-    let exe = std::env::current_exe()?;
+    installed_player(&std::env::current_exe()?)
+}
+
+fn installed_player(exe: &Path) -> Result<PathBuf> {
     let player = exe.with_file_name("player").join(exe.file_name().context("the executable has no name")?);
     if player.is_file() {
         return Ok(player);
     }
-    eprintln!(
-        "shipping this pen, which includes the Wasm compiler; `just install-player` installs the smaller \
-         player runtime `pen build` ships instead"
-    );
-    Ok(exe)
+    bail!(
+        "the player runtime is missing at {}: run `just install-player` in Pen's checkout, \
+         or pass --runtime EXE to choose the runtime to ship",
+        player.display()
+    )
 }
 
 /// The Rust target an executable was built for, from its header.
@@ -782,7 +786,8 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
     let layout = crate::app_bundle::Layout::new(out, &identity, &target, options.bundle_id.as_deref())?;
     layout.create()?;
     let game = &layout.game;
-    let wasm = source.compile(game)?;
+    source.compile(game)?;
+    let wasm = shipping_wasm(&game.join("game.wasm"), options.optimize)?;
     let assets = ship_assets(&source.assets(), &game.join("assets"), &wasm)?;
     let scene = source.scene();
     if scene.is_file() {
@@ -861,12 +866,15 @@ pub fn web_host(out: &Path) -> Result<()> {
 /// The browser front end, guest programs, the assets the game uses and its
 /// manifest as a complete static site, ready to host (`web_export`): its
 /// files precompressed and a service worker; and, given `zip`, as a ZIP.
-pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>) -> Result<()> {
+pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: bool) -> Result<()> {
     let staging = crate::staging::Staging::new(&project.root, out)?;
     let site = &staging.directory;
     project.compile(site)?;
     project.compile_devtools(site)?;
-    let wasm = std::fs::read(site.join("game.wasm"))?;
+    let wasm = shipping_wasm(&site.join("game.wasm"), optimize)?;
+    if site.join("devtools.wasm").is_file() {
+        shipping_wasm(&site.join("devtools.wasm"), optimize)?;
+    }
     let assets = ship_assets(&project.assets(), &site.join("assets"), &wasm)?;
     std::fs::copy(project.assets().join("catalog.json"), site.join("catalog.json"))?;
     let saved = site.join("assets").join(pen_runtime::state::CONFIG_FILE);
@@ -888,6 +896,16 @@ pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>) -> Result<(
         crate::web_export::zip(out, zip)?;
     }
     Ok(())
+}
+
+fn shipping_wasm(path: &Path, optimize: bool) -> Result<Vec<u8>> {
+    if optimize {
+        #[cfg(feature = "compiler")]
+        crate::optimize::file(path)?;
+        #[cfg(not(feature = "compiler"))]
+        bail!("shipping optimization needs a full pen build");
+    }
+    Ok(std::fs::read(path)?)
 }
 
 /// Checks the explicit state adapter declaration beside the asset catalog,
@@ -1002,6 +1020,21 @@ mod tests {
     }
 
     #[test]
+    fn default_shipping_requires_the_installed_player() {
+        let root = fixture("default-player");
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join("pen");
+        std::fs::write(&exe, b"development runtime").unwrap();
+        let error = installed_player(&exe).unwrap_err().to_string();
+        assert!(error.contains("just install-player") && error.contains("--runtime"));
+        let player = root.join("player/pen");
+        std::fs::create_dir_all(player.parent().unwrap()).unwrap();
+        std::fs::write(&player, b"player runtime").unwrap();
+        assert_eq!(installed_player(&exe).unwrap(), player);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn library_tests_find_configuration_without_a_game_entry() {
         let root = fixture("library-tests");
         std::fs::create_dir_all(root.join("tests")).unwrap();
@@ -1094,13 +1127,14 @@ mod tests {
         runtime.extend([mark_prefix(), RUNTIME.as_bytes().to_vec(), b"\n".to_vec()].concat());
         std::fs::write(root.join("player"), &runtime).unwrap();
         let options = PackageOptions {
+            optimize: false,
             runtime: Some(root.join("player")),
             target: None,
             cpu: None,
             bundle_id: None,
             store: None,
         };
-        let out = root.join("dist/package");
+        let out = bundle.join("dist/package");
         package(GameSource::Bundle(&bundle), &out, options).unwrap();
         assert_eq!(std::fs::read(out.join("gather")).unwrap(), runtime, "the runtime, named after the game");
         assert_eq!(std::fs::read(out.join("game/game.wasm")).unwrap(), wasm);

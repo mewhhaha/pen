@@ -16,6 +16,7 @@ use crate::loader::{Job, JobQueue, Priority};
 use crate::shader::Variants;
 
 mod instances;
+mod packed;
 pub(crate) use instances::MeshInstances;
 
 /// A sprite shader is WGSL like a shader, compiled for the sprite pass.
@@ -354,7 +355,7 @@ pub(crate) fn checked_mesh(
 
 /// The compact binary form of a mesh asset (JSON, or already binary), which
 /// the renderer reads in place of its JSON under the same key: "PMSH",
-/// version 1, flags (1: shader attributes, 2: 16-bit indices, 4: a skin,
+/// version 1 (or its losslessly compressed version-2 wrapper), flags (1: shader attributes, 2: 16-bit indices, 4: a skin,
 /// 8: simpler levels of detail, 16: persistent instances), two zero bytes, then the vertex and index
 /// counts (u32s), each vertex's position, normal, UV and, flagged,
 /// attributes (f32s), and the indices; flagged, then the count of simpler
@@ -367,6 +368,10 @@ pub fn pack_mesh(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn pack(mesh: &Mesh) -> Result<Vec<u8>> {
+    packed::encode(pack_uncompressed(mesh)?)
+}
+
+fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
     let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
     let vertices = mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0;
     let attributes = vertices.iter().any(|vertex| vertex[8] != 0.0 || vertex[9] != 0.0);
@@ -429,6 +434,8 @@ pub(crate) fn pack(mesh: &Mesh) -> Result<Vec<u8>> {
 }
 
 fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
+    let decoded = packed::decode(bytes)?;
+    let bytes = decoded.as_ref();
     ensure!(bytes.len() >= MESH_HEADER, "binary mesh ends in its header");
     ensure!(bytes[4] == MESH_VERSION, "unsupported binary mesh version");
     let flags = bytes[5];
@@ -910,12 +917,12 @@ mod tests {
         assert_eq!(pack_mesh(plain).unwrap()[5], MESH_SHORT_INDICES);
         assert_eq!(pack_mesh(shaded).unwrap()[5], MESH_ATTRIBUTES | MESH_SHORT_INDICES);
         // An index past the vertices, and an unknown version.
-        let mut packed = pack_mesh(plain).unwrap();
+        let mut packed = pack_uncompressed(&parse_mesh(plain).unwrap()).unwrap();
         let last = packed.len() - 2;
         packed[last] = 3;
         assert!(parse_mesh(&packed).is_err());
         let mut packed = pack_mesh(plain).unwrap();
-        packed[4] = 2;
+        packed[4] = 255;
         assert!(parse_mesh(&packed).is_err());
     }
 

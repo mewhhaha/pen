@@ -33,9 +33,10 @@ checkout) refuses in it and says to use a full build.
 - `just player` builds it for Linux (below) and `just windows` for Windows,
   each with the `dist` profile into `target/<target>/dist/`, then puts a
   stripped copy and Steam's library in `dist/player/`: that is what ships.
-  `just install-player` installs the Linux one beside `just install`'s pen,
+  `just install` includes `just install-player`, which installs the Linux one beside the CLI,
   in `~/.local/lib/pen-runtime/player/`, where `pen build` looks for the
-  runtime to ship. Without one there it ships itself, and says so.
+  runtime to ship. Without one there packaging fails with the install command;
+  shipping a development runtime requires an explicit `--runtime EXE`.
 - `pen build --runtime EXE` ships another runtime. Its platform comes from
   its executable header (ELF, PE or Mach-O, and the machine), and
   `game.cwasm` is compiled for that platform; `--target TRIPLE` overrides it
@@ -48,6 +49,20 @@ checkout) refuses in it and says to use a full build.
   plugin or Blot compiler needed, only a pen with Cranelift for the
   runtime's architecture. CI packages the game job's bundle this way for the
   Windows player, and on a Mac for the macOS one.
+
+### Shipping Wasm optimization
+
+Native and web `pen build` run Binaryen's `wasm-opt -O3` on staged guest
+modules before precompilation or web compression. Install `wasm-opt` on
+`PATH` (version 133 is tested); `--no-optimize` keeps the compiler's output
+for comparisons. Development runs and `pen export` keep that output too.
+
+Optimization preserves the guest ABI and Blot metadata, retains function
+names, and regenerates embedded source maps for the rewritten instructions.
+Pen validates the result before replacing the staged Wasm. External source
+maps require `--no-optimize`. A versioned content stamp avoids optimizing an
+unchanged package again. Precompilation and cache identities use the final
+Wasm, so its native code always belongs to the optimized module.
 
 ### A CPU baseline for game.cwasm
 

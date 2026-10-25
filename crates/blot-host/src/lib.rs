@@ -11,7 +11,11 @@
 //! returning or calling the host traps with an [`Overrun`]; time it spends
 //! blocked in a callback does not count. A [`Probe`] shows the dev tools its
 //! memory, ownership counters and, sampled, where it spends its time.
+mod native;
 mod probe;
+pub use native::native_fingerprint;
+#[cfg(feature = "compiler")]
+pub use native::native_metadata;
 mod system_trace;
 mod tasks;
 #[cfg(feature = "compiler")]
@@ -67,6 +71,7 @@ pub struct GuestModule {
 
 /// The mutable globals an image keeps: all of the module's, when it
 /// exports them all, by their export names.
+#[cfg(feature = "compiler")]
 fn imaged_globals(wasm: &[u8]) -> Result<Vec<String>, String> {
     let mut mutable = Vec::new();
     let mut exported = std::collections::HashMap::new();
@@ -123,11 +128,19 @@ impl GuestModule {
     /// for these bytes and this engine's configuration. Fails without the
     /// `compiler` feature.
     pub fn new(engine: &Engine, wasm: &[u8], cache: Option<&Path>) -> Result<GuestModule> {
-        let abi = Arc::new(read_abi(wasm)?);
-        let module = compile(engine, wasm, cache)?;
-        validate_module(&module, &abi)?;
-        let imaged = Arc::new(imaged_globals(wasm));
-        Ok(GuestModule { module, trace: None, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
+        #[cfg(feature = "compiler")]
+        {
+            let abi = Arc::new(read_abi(wasm)?);
+            let module = compile(engine, wasm, cache)?;
+            validate_module(&module, &abi)?;
+            let imaged = Arc::new(imaged_globals(wasm));
+            Ok(GuestModule { module, trace: None, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
+        }
+        #[cfg(not(feature = "compiler"))]
+        {
+            let _ = (engine, wasm, cache);
+            bail!(NO_COMPILER)
+        }
     }
 
     /// Instruments allocation traffic and selects the game's explicit tracing
@@ -154,38 +167,6 @@ impl GuestModule {
 
     pub fn main_entry(&self) -> &'static str {
         if self.trace.is_some() { "main_trace" } else { "main" }
-    }
-
-    /// Like [`GuestModule::new`], but first tries `precompiled`, the output
-    /// of [`precompile`] shipped beside the module. One made for another
-    /// engine, or for CPU features this machine lacks, is compiled again, or
-    /// refused without the `compiler` feature.
-    ///
-    /// # Safety
-    ///
-    /// `precompiled` runs as native code: it must come from [`precompile`],
-    /// as trusted as the executable itself.
-    pub unsafe fn with_precompiled(
-        engine: &Engine,
-        wasm: &[u8],
-        precompiled: &[u8],
-        cache: Option<&Path>,
-    ) -> Result<GuestModule> {
-        let abi = Arc::new(read_abi(wasm)?);
-        // SAFETY: the caller vouches for the bytes; wasmtime checks they suit this engine.
-        match unsafe { Module::deserialize(engine, precompiled) } {
-            Ok(module) => {
-                validate_module(&module, &abi)?;
-                let imaged = Arc::new(imaged_globals(wasm));
-                Ok(GuestModule { module, trace: None, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
-            }
-            Err(_) if COMPILER => GuestModule::new(engine, wasm, cache),
-            Err(error) => Err(anyhow::Error::from(error).context(
-                "the precompiled game does not suit this runtime (it was made by another pen \
-                 version, or for CPU features this machine lacks), and this runtime has no \
-                 compiler to compile it again",
-            )),
-        }
     }
 
     pub fn abi(&self) -> &GuestAbi {
@@ -226,11 +207,6 @@ fn compile(engine: &Engine, wasm: &[u8], cache: Option<&Path>) -> Result<Module>
         Some(directory) => compile_cached(engine, wasm, directory),
         None => Ok(Module::new(engine, wasm)?),
     }
-}
-
-#[cfg(not(feature = "compiler"))]
-fn compile(_engine: &Engine, _wasm: &[u8], _cache: Option<&Path>) -> Result<Module> {
-    bail!(NO_COMPILER)
 }
 
 #[cfg(feature = "compiler")]
@@ -1435,6 +1411,13 @@ pub const GUEST_STACK_BYTES: usize = 8 << 20;
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "compiler"))]
+    #[test]
+    fn runtime_rejects_wasm_before_parsing_it() {
+        let error = GuestModule::new(&engine().unwrap(), b"not Wasm", None).err().unwrap();
+        assert!(error.to_string().contains("without a Wasm compiler"), "{error:#}");
+    }
+
     /// A Wasm section: its id, then its contents' size.
     #[cfg(feature = "compiler")]
     fn section(id: u8, contents: &[u8]) -> Vec<u8> {
@@ -1796,6 +1779,43 @@ mod tests {
         let mut guest = Guest::new(&engine, &module).unwrap();
         let text = format!("{:#}", guest.call("fail", Value::Unit).unwrap_err());
         assert!(text.contains("<wasm function 1>") && text.contains(" - fail") && !text.contains(" at "), "{text}");
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn native_packages_preserve_traps_state_and_build_identity() {
+        let engine = Engine::new(&config(false)).unwrap();
+        let wasm = trapping_guest(true);
+        let metadata = native_metadata(&wasm).unwrap();
+        assert_eq!(native_fingerprint(&metadata).unwrap(), pen_runtime::net::wire::hash_bytes(&wasm));
+        let code = precompile(&engine, &wasm).unwrap();
+        // SAFETY: freshly precompiled with this engine from the same Wasm.
+        let module = unsafe { GuestModule::from_native(&engine, &metadata, &code) }.unwrap();
+        let mut guest = Guest::new(&engine, &module).unwrap();
+        let error = format!("{:#}", guest.call("fail", Value::Unit).unwrap_err());
+        assert!(error.contains("game.explode") && error.contains("src/game.blot:7:3"), "{error}");
+        for hidden in [false, true] {
+            let wasm = bumping_guest(hidden);
+            let metadata = native_metadata(&wasm).unwrap();
+            let code = precompile(&engine, &wasm).unwrap();
+            // SAFETY: freshly precompiled from this metadata's Wasm.
+            let module = unsafe { GuestModule::from_native(&engine, &metadata, &code) }.unwrap();
+            let mut guest = Guest::new(&engine, &module).unwrap();
+            assert_eq!(guest.call("bump", Value::U32(5)).unwrap(), Value::U32(5));
+            if hidden {
+                assert!(guest.capture(None).is_err());
+            } else {
+                let (saved, _) = guest.capture(None).unwrap();
+                guest.call("bump", Value::U32(7)).unwrap();
+                guest.restore(&saved).unwrap();
+                assert_eq!(guest.call("bump", Value::U32(1)).unwrap(), Value::U32(6));
+            }
+            let mut invalid: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+            invalid["version"] = 99.into();
+            assert!(
+                unsafe { GuestModule::from_native(&engine, &serde_json::to_vec(&invalid).unwrap(), &code) }.is_err()
+            );
+        }
     }
 
     /// A guest exporting `grow: U32 -> U32`, which grows its memory (one

@@ -5,14 +5,11 @@
 //! registry; the browser host checks it in wasm32
 //! (pen-web's `qualify_services`, which crates/pen-web/tests/services.mjs
 //! runs under node and `just conformance` in headless Chromium).
-use pen_protocol::{
-    GameEvent, ServiceRequest, collider_shape, navmesh_area, navmesh_op, noise_op, physics_body, physics_op, service,
-    spatial_op,
-};
-use pen_runtime::services::{Request, Service, Services};
+use pen_protocol::{GameEvent, ServiceRequest, noise_op, service};
+use pen_runtime::services::Services;
 
 /// The digest every host's answers to [`requests`] must have.
-pub const EXPECTED: u64 = 0x18bd_afd0_943f_14cf;
+pub const EXPECTED: u64 = 0x25b2_9823_ddf7_d625;
 
 /// FNV-1a over 32-bit words.
 fn fnv(hash: u64, word: u32) -> u64 {
@@ -50,143 +47,9 @@ fn request(id: u32, service: u32, operation: u32, numbers: [f32; 4], values: Vec
     }
 }
 
-/// A collider record: shape, size, position and rotation.
-fn collider(shape: u32, size: [f32; 3], position: [f32; 3], rotation: [f32; 4]) -> Vec<f32> {
-    [&[shape as f32][..], &size, &position, &rotation].concat()
-}
-
-/// A body: its kind, collider record, velocities and material, then its
-/// shape's data.
-fn body(kind: u32, collider: Vec<f32>, velocity: [f32; 6], material: [f32; 3], data: &[f32]) -> Vec<f32> {
-    [&[kind as f32][..], &collider, &velocity, &material, data].concat()
-}
-
-/// A navmesh area: its kind and corners.
-fn area(kind: u32, corners: &[[f32; 2]]) -> Vec<f32> {
-    [vec![kind as f32, corners.len() as f32], corners.iter().flatten().copied().collect()].concat()
-}
-
-/// An eighth of a turn about y, and none, as quaternions.
-const TILTED: [f32; 4] = [0.0, 0.382_683_43, 0.0, 0.923_879_5];
-const UPRIGHT: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
-
-/// The fixed requests: noise as a heightfield and at points, bodies falling
-/// onto that heightfield, rays, an overlap and nearest points against
-/// colliders of every shape, and navmesh ways and triangles.
+/// Fixed noise requests, without bundled physics or navigation.
 pub fn requests() -> Vec<ServiceRequest> {
-    // 17 by 17 heights a metre apart, which the physics and rays below
-    // stand on as a heightfield.
     let hills = vec![0.08, 2.5, 2.0, 0.5, 0.0, -8.0, -8.0, 1.0];
-    let ground = {
-        let asked =
-            Request { id: 0, operation: noise_op::HEIGHTFIELD, numbers: [17.0, 17.0, 2024.0, 5.0], values: &hills };
-        Service::<()>::call(&mut crate::Noise, &asked).map(|answer| answer.values).unwrap_or_default()
-    };
-    let field =
-        |position: [f32; 3]| (collider(collider_shape::HEIGHTFIELD, [17.0, 17.0, 1.0], position, UPRIGHT), &ground);
-    let tetrahedron = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-    let pyramid = [-1.0, 0.0, -1.0, 1.0, 0.0, -1.0, 1.0, 0.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.5, 0.0];
-    let pyramid_faces = [0.0, 1.0, 4.0, 1.0, 2.0, 4.0, 2.0, 3.0, 4.0, 3.0, 0.0, 4.0, 0.0, 2.0, 1.0, 0.0, 3.0, 2.0];
-    let still = [0.0; 6];
-    let material = [0.6, 0.1, 1.0];
-
-    let (ground_collider, ground_heights) = field([0.0, 0.0, 0.0]);
-    let bodies = [
-        body(physics_body::FIXED, ground_collider, still, [0.8, 0.0, 1.0], ground_heights),
-        body(
-            physics_body::DYNAMIC,
-            collider(collider_shape::CUBOID, [0.5, 0.5, 0.5], [0.0, 4.0, 0.0], UPRIGHT),
-            still,
-            material,
-            &[],
-        ),
-        body(
-            physics_body::DYNAMIC,
-            collider(collider_shape::CUBOID, [0.5, 0.5, 0.5], [0.1, 5.2, 0.0], TILTED),
-            still,
-            material,
-            &[],
-        ),
-        body(
-            physics_body::DYNAMIC,
-            collider(collider_shape::BALL, [0.4, 0.0, 0.0], [2.0, 6.0, 1.0], UPRIGHT),
-            [-1.0, 0.0, 0.0, 0.0, 0.0, 3.0],
-            [0.4, 0.6, 2.0],
-            &[],
-        ),
-        body(
-            physics_body::DYNAMIC,
-            collider(collider_shape::CAPSULE, [0.3, 0.6, 0.0], [-2.0, 5.0, -1.0], TILTED),
-            [0.5, 0.0, 0.5, 1.0, 0.0, 0.0],
-            material,
-            &[],
-        ),
-        body(
-            physics_body::DYNAMIC,
-            collider(collider_shape::CYLINDER, [0.5, 0.3, 0.0], [1.0, 7.0, -2.0], UPRIGHT),
-            still,
-            material,
-            &[],
-        ),
-        body(
-            physics_body::DYNAMIC,
-            collider(collider_shape::CONVEX, [4.0, 0.0, 0.0], [-1.0, 8.0, 2.0], TILTED),
-            still,
-            material,
-            &tetrahedron,
-        ),
-        body(
-            physics_body::KINEMATIC,
-            collider(collider_shape::CUBOID, [1.0, 0.2, 1.0], [-4.0, 3.0, 0.0], UPRIGHT),
-            [1.5, 0.0, 0.0, 0.0, 0.5, 0.0],
-            material,
-            &[],
-        ),
-        body(
-            physics_body::FIXED,
-            collider(collider_shape::TRIMESH, [5.0, 6.0, 0.0], [3.0, 2.0, 3.0], UPRIGHT),
-            still,
-            material,
-            &[&pyramid[..], &pyramid_faces].concat(),
-        ),
-    ]
-    .concat();
-
-    let (field_collider, field_heights) = field([0.0, -1.0, 0.0]);
-    let colliders = [
-        collider(collider_shape::CUBOID, [1.0, 2.0, 0.5], [4.0, 1.0, 0.0], TILTED),
-        collider(collider_shape::BALL, [1.5, 0.0, 0.0], [-4.0, 2.0, 1.0], UPRIGHT),
-        [
-            collider(collider_shape::TRIMESH, [5.0, 6.0, 0.0], [0.0, 1.0, 4.0], TILTED),
-            pyramid.to_vec(),
-            pyramid_faces.to_vec(),
-        ]
-        .concat(),
-        [field_collider, field_heights.clone()].concat(),
-        collider(collider_shape::CYLINDER, [0.7, 1.5, 0.0], [0.0, 1.5, -4.0], UPRIGHT),
-    ]
-    .concat();
-    // Rays down, a little aslant, from a 4 by 4 grid over the colliders.
-    let rays: Vec<f32> = (0..16u8)
-        .flat_map(|ray| {
-            let (column, row) = (f32::from(ray % 4), f32::from(ray / 4));
-            [column * 3.0 - 4.5, 8.0, row * 3.0 - 4.5, 0.2, -1.0, -0.1]
-        })
-        .collect();
-    let probe = collider(collider_shape::CAPSULE, [2.2, 3.0, 0.0], [2.0, 1.0, -2.0], TILTED);
-    let points = [5.0, 1.0, 1.0, -4.0, 2.5, 1.0, 0.0, 5.0, 4.0, 0.3, 3.0, -0.2, 9.0, 9.0, 9.0];
-
-    let floor = [
-        vec![0.3],
-        area(navmesh_area::WALKABLE, &[[0.0, 0.0], [20.0, 0.0], [20.0, 12.0], [0.0, 12.0]]),
-        area(navmesh_area::OBSTACLE, &[[4.0, 2.0], [6.0, 2.0], [6.0, 8.0], [10.0, 8.0], [10.0, 10.0], [4.0, 10.0]]),
-        area(navmesh_area::OBSTACLE, &[[12.0, 1.0], [15.0, 5.0], [11.0, 6.0]]),
-        area(navmesh_area::OBSTACLE, &[[16.5, 7.0], [18.0, 8.5], [16.5, 10.0], [15.0, 8.5]]),
-        // An obstacle reaching out past the floor's edge, and overlapping another.
-        area(navmesh_area::OBSTACLE, &[[8.0, -1.0], [9.0, -1.0], [9.0, 3.0], [8.0, 3.0]]),
-        area(navmesh_area::OBSTACLE, &[[5.0, 7.0], [7.0, 7.0], [7.0, 9.0], [5.0, 9.0]]),
-    ]
-    .concat();
 
     vec![
         request(1, service::NOISE, noise_op::HEIGHTFIELD, [17.0, 17.0, 2024.0, 5.0], hills),
@@ -197,13 +60,6 @@ pub fn requests() -> Vec<ServiceRequest> {
             [0.0, 0.0, 99.0, 7.0],
             vec![0.03, 10.0, 2.1, 0.45, 1.0, 0.0, 0.0, -3.25, 7.5, 12345.678, -98765.4, 0.5, 0.25, -1000.0, 1000.0],
         ),
-        request(3, service::PHYSICS, physics_op::STEP, [120.0, 1.0 / 60.0, -9.81, 0.0], bodies),
-        request(4, service::SPATIAL, spatial_op::RAYCAST, [5.0, 20.0, 1.0, 0.0], [colliders.clone(), rays].concat()),
-        request(5, service::SPATIAL, spatial_op::OVERLAP, [5.0, 0.0, 0.0, 0.0], [colliders.clone(), probe].concat()),
-        request(6, service::SPATIAL, spatial_op::NEAREST, [5.0, 6.0, 0.0, 0.0], [colliders, points.to_vec()].concat()),
-        request(7, service::NAVMESH, navmesh_op::FIND, [1.0, 1.0, 19.0, 11.0], floor.clone()),
-        request(8, service::NAVMESH, navmesh_op::FIND, [2.0, 9.0, 13.0, 3.0], floor.clone()),
-        request(9, service::NAVMESH, navmesh_op::TRIANGLES, [0.0; 4], floor),
     ]
 }
 
@@ -228,7 +84,7 @@ pub fn check<Input>(services: &mut Services<Input>) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use pen_protocol::service_status;
-    use pen_runtime::services::Answer;
+    use pen_runtime::services::{Answer, Request, Service};
 
     use super::*;
 
@@ -241,48 +97,26 @@ mod tests {
     /// reads these answers back into records.
     #[test]
     fn the_answers_gdevs_blot_test_reads() {
-        // A ball resting on a slab, one step.
-        let slab =
-            [0.0, 1.0, 5.0, 0.5, 5.0, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 1.0];
-        let ball =
-            [1.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 1.0];
-        let answer = ask(&mut crate::Physics, physics_op::STEP, [1.0, 1.0 / 60.0, -9.81, 0.0], &[slab, ball].concat());
-        let mut values = vec![0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        values.extend([0.0, 0.499_982_48, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        values.extend([0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(answer, Answer { values, ..Answer::ok(1.0) });
-
-        // A box at x 5 and a ball at x 10: a ray along +x, a ball between
-        // them touching both, and the nearest to a point past the ball.
-        let colliders = [
-            [1.0, 1.0, 1.0, 1.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-            [0.0, 1.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        ]
-        .concat();
-        let ray = [colliders.clone(), vec![0.0, 0.0, 0.0, 2.0, 0.0, 0.0]].concat();
-        let answer = ask(&mut crate::Spatial, spatial_op::RAYCAST, [2.0, 100.0, 1.0, 0.0], &ray);
-        assert_eq!(answer, Answer { values: vec![1.0, 4.0, -1.0, 0.0, 0.0], ..Answer::ok(1.0) });
-        let probe = [colliders.clone(), vec![0.0, 2.6, 0.0, 0.0, 7.5, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]].concat();
-        let answer = ask(&mut crate::Spatial, spatial_op::OVERLAP, [2.0, 0.0, 0.0, 0.0], &probe);
-        assert_eq!(answer, Answer { values: vec![0.0, 1.0], ..Answer::ok(2.0) });
-        let point = [colliders, vec![12.0, 0.0, 0.0]].concat();
-        let answer = ask(&mut crate::Spatial, spatial_op::NEAREST, [2.0, 10.0, 0.0, 0.0], &point);
-        assert_eq!(answer, Answer { values: vec![2.0, 1.0, 11.0, 0.0, 0.0], ..Answer::ok(1.0) });
-
-        // A 10 by 10 floor with a block in its middle: to a goal inside the
-        // block, which moves to the block's edge.
-        let floor = [
-            vec![0.0, 4.0, 0.0, 0.0, 10.0, 0.0, 10.0, 10.0, 0.0, 10.0],
-            vec![1.0, 4.0, 3.0, 3.0, 7.0, 3.0, 7.0, 7.0, 3.0, 7.0],
-        ]
-        .concat();
-        let answer = ask(&mut crate::Navmesh, navmesh_op::FIND, [1.0, 5.0, 4.0, 5.0], &[vec![0.0], floor].concat());
-        assert_eq!(answer, Answer { values: vec![1.0, 5.0, 3.0, 5.0], ..Answer::ok(2.0) });
-
         // Five octaves of hills, seed 7, at one point.
         let hills = [0.1, 8.0, 2.0, 0.5, 0.0, -0.5, 6.0];
         let answer = ask(&mut crate::Noise, noise_op::SAMPLE, [0.0, 0.0, 7.0, 5.0], &hills);
         assert_eq!(answer, Answer { values: vec![-2.375_610_6], ..Answer::ok(1.0) });
+    }
+
+    #[test]
+    fn removed_simulation_services_report_unknown() {
+        let mut services: Services = Services::new();
+        crate::register(&mut services);
+        services.answer(&[
+            request(1, service::PHYSICS, 0, [0.0; 4], vec![]),
+            request(2, service::SPATIAL, 0, [0.0; 4], vec![]),
+            request(3, service::NAVMESH, 0, [0.0; 4], vec![]),
+            request(4, service::PATHFINDING, 0, [0.0; 4], vec![]),
+        ]);
+        let events = services.take_answers();
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().all(|event| matches!(event,
+            GameEvent::ServiceAnswer { status, length: 0, .. } if *status == service_status::UNKNOWN)));
     }
 
     /// A game's mistakes reach the host as requests: the fixed ones cut
@@ -294,11 +128,7 @@ mod tests {
         crate::register(&mut services);
         let odd = [0.0, -1.0, 0.5, 3.0, 7.0, 1e6, -1e6, 1e30, -1e30, 1e-30, 65536.0];
         let mut asked = 0;
-        for mut request in requests() {
-            // One step is enough to reach every body's handling.
-            if request.service == service::PHYSICS {
-                request.a = 1.0;
-            }
+        for request in requests() {
             let length = request.values.len();
             let mut broken = Vec::new();
             for cut in [0, 1, 11, length / 2, length.saturating_sub(1)] {
@@ -366,12 +196,12 @@ mod tests {
             .collect();
         println!("{statuses:?} digest {:#018x}", digest(&events));
         assert!(statuses.iter().all(|(_, status, _)| *status == service_status::OK), "{statuses:?}");
-        assert_eq!(statuses.len(), 9);
+        assert_eq!(statuses.len(), 2);
         let mut again: Services = Services::new();
         crate::register(&mut again);
         assert_eq!(
             check(&mut again),
-            Ok(format!("simulation services: 9 answers in {} events, digest {EXPECTED:#018x}", events.len()))
+            Ok(format!("simulation services: 2 answers in {} events, digest {EXPECTED:#018x}", events.len()))
         );
     }
 }

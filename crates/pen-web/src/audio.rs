@@ -361,6 +361,15 @@ impl Audio {
         spawn_local(async move {
             let result = async {
                 let bytes = crate::fetch(&path).await?;
+                if path.ends_with(".sound") {
+                    let recipe = pen_runtime::sound_recipe::Recipe::parse(&bytes)?;
+                    let samples = recipe.render()?;
+                    let buffer =
+                        context.create_buffer(1, u32::try_from(samples.len())?, recipe.rate as f32).map_err(error)?;
+                    buffer.copy_to_channel(&samples, 0).map_err(error)?;
+                    clips.borrow_mut().insert(id, Loaded::Buffer(buffer));
+                    return Ok(());
+                }
                 if pen_runtime::clip::streams(&bytes) {
                     clips.borrow_mut().insert(id, streamed(&bytes)?);
                     return Ok(());

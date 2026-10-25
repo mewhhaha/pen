@@ -1,6 +1,6 @@
 // The browser host's simulation services, in wasm32 under node: the built
 // host (crates/pen-web/build.sh's pkg, or the directory given) answers fixed
-// requests to physics, navmesh, spatial queries and noise, and its answers
+// requests to noise, and its answers
 // must have the digest native pen's have (pen_simulation::conformance).
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';

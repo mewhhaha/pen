@@ -97,7 +97,7 @@
     },
     {
       "limit": "MAX_INSETS",
-      "value": 16
+      "value": 64
     },
     {
       "limit": "MAX_FIELD_PATCHES",

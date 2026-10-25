@@ -22,7 +22,7 @@ and what breaks it.
   accessibility layer, `ui=` script steps), assets ready or failed (these
   carry no key, only that one happened), and the answers to the game's
   service requests (ServiceAnswer and ServiceData: Steam, the clipboard,
-  the platform, pathfinding, the simulation services; see the README's
+  the platform and noise; see the README's
   "Services"), and in a net session the Player events that say whose the
   events after them are ([netplay.md](netplay.md)).
 
@@ -75,8 +75,7 @@ loaded.
   world it replaced: after a load, undo or reload the game asks again, with
   the same ids, for what it still waits on (timed by its fixed steps, a
   second later).
-- **Services that keep nothing.** The simulation services (physics,
-  navmesh, spatial queries, noise) answer each request from what it
+- **Services that keep nothing.** The navigation and noise services answer each request from what it
   carries alone, so the same question has the same answer whenever it is
   asked, live or after a restore, and on every host: native and the
   browser compute the same bits (`pen_simulation::conformance`).

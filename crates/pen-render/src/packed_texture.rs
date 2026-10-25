@@ -8,6 +8,8 @@
 // up to the full size, as WebGPU sizes them: its deflated byte count (u32),
 // then its deflated pixels. "exact" (colour) and "raw" (linear data) have
 // the full size alone: neither may be averaged.
+// Version 3 replaces the stored levels with a bounded image graph and JPEG
+// source; texture_recipe reconstructs the levels once when opening it.
 use std::io::Read;
 
 use anyhow::{Result, bail, ensure};
@@ -60,7 +62,7 @@ pub(crate) fn texel_bytes(format: wgpu::TextureFormat) -> u32 {
 
 fn parse_header(bytes: &[u8]) -> Result<PackedHeader> {
     ensure!(is_packed_texture(bytes), "packed texture requires a GTEX header");
-    ensure!(bytes[4] == 2, "unsupported packed texture version");
+    ensure!([2, 3].contains(&bytes[4]), "unsupported packed texture version");
     let channels = bytes[5];
     let Some(&kind) = KINDS.get(bytes[6] as usize) else {
         bail!("unsupported packed texture format");
@@ -93,13 +95,19 @@ pub(crate) struct PackedReader {
     pub header: PackedHeader,
     /// The next level to read; it counts down to 0, then past it.
     next: i64,
+    generated: Option<std::vec::IntoIter<PackedLevel>>,
 }
 
 impl PackedReader {
     pub fn open(bytes: Vec<u8>) -> Result<Self> {
         ensure!(bytes.len() >= 16, "packed texture requires a GTEX header");
         let header = parse_header(&bytes[..16])?;
-        Ok(Self { bytes, at: 16, header, next: i64::from(header.levels) - 1 })
+        let generated = if bytes[4] == 3 {
+            Some(crate::texture_recipe::generate(&bytes[16..], header, bytes[6])?.into_iter())
+        } else {
+            None
+        };
+        Ok(Self { bytes, at: 16, header, next: i64::from(header.levels) - 1, generated })
     }
 
     fn read(&mut self, count: usize) -> Result<&[u8]> {
@@ -111,6 +119,9 @@ impl PackedReader {
 
     /// The next level, or None once every level is read.
     pub fn next_level(&mut self) -> Result<Option<PackedLevel>> {
+        if let Some(levels) = &mut self.generated {
+            return Ok(levels.next());
+        }
         let Ok(level) = u32::try_from(self.next) else {
             ensure!(self.at == self.bytes.len(), "packed texture runs past its last level");
             return Ok(None);

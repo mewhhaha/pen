@@ -245,24 +245,19 @@ pub async fn qualify_platform() -> Result<String, JsValue> {
         let unknown = pen_protocol::ServiceRequest { request: 3, service: 999, ..Default::default() };
         services.answer(&[path, steam, unknown]);
         let answers = services.take_answers();
-        let path = pen_runtime::services::Answer {
-            values: vec![0.0, 1.0, 4.0, 5.0],
-            ..pen_runtime::services::Answer::ok(4.0)
-        };
-        anyhow::ensure!(answers[..3] == path.events(1)[..], "browser pathfinding failed");
         let status = |request: u32| {
             answers.iter().find_map(|event| match event {
                 GameEvent::ServiceAnswer { request: answered, status, .. } if *answered == request => Some(*status),
                 _ => None,
             })
         };
+        anyhow::ensure!(status(1) == Some(service_status::UNKNOWN), "host navigation must be unregistered");
         anyhow::ensure!(status(2) == Some(service_status::UNAVAILABLE), "browser Steam must be unavailable");
         anyhow::ensure!(status(3) == Some(service_status::UNKNOWN), "unregistered browser service must be unknown");
         pen_simulation::conformance::check(&mut services::standard()).map_err(anyhow::Error::msg)?;
         audio::qualify().await?;
         Ok::<_, anyhow::Error>(
-            "IndexedDB snapshot, pathfinding, simulation services, service statuses and WebAudio graph passed"
-                .to_owned(),
+            "IndexedDB snapshot, noise, retired navigation, service statuses and WebAudio graph passed".to_owned(),
         )
     }
     .await;

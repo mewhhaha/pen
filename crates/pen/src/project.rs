@@ -1,8 +1,12 @@
 //! A checkout as a project the binary develops, runs and packages: its
 //! programs compile through the Wasm plugins its `pen.json` chooses
 //! (`plugin_build`), and its assets and scene are used in place.
+#[cfg(feature = "compiler")]
 use std::collections::{BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(feature = "compiler", test))]
+use std::path::PathBuf;
+#[cfg(feature = "compiler")]
 use std::process::Command;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -43,6 +47,7 @@ impl Identity {
     /// "title": "gdev — Blot 3D", "players": 2}`, any of which may be left
     /// out: the name is then the checkout directory's, the title the name,
     /// and the players one.
+    #[cfg(feature = "compiler")]
     fn of_checkout(root: &Path) -> Result<Identity> {
         let file = root.join("pen.json");
         let reading = || format!("reading {}", file.display());
@@ -126,6 +131,7 @@ impl Manifest {
         Ok(Some(manifest))
     }
 
+    #[cfg(feature = "compiler")]
     pub fn write(&self, directory: &Path) -> Result<()> {
         std::fs::write(directory.join("game.json"), serde_json::to_string_pretty(self)? + "\n")?;
         Ok(())
@@ -167,11 +173,13 @@ pub fn keep_mark() {
 /// What a mark starts with, made here rather than written out: this
 /// executable's bytes then hold it only in its own mark, and nowhere two of
 /// its strings happen to lie side by side.
+#[cfg(feature = "compiler")]
 fn mark_prefix() -> Vec<u8> {
     b"=ytilibitapmoc-emitnur-nep".iter().rev().copied().collect()
 }
 
 /// Whether `text` is a mark as build.rs makes them.
+#[cfg(feature = "compiler")]
 fn well_formed(text: &str) -> bool {
     let Some((version, hash)) = text.strip_prefix("wasmtime ").and_then(|rest| rest.split_once(", engine ")) else {
         return false;
@@ -183,6 +191,7 @@ fn well_formed(text: &str) -> bool {
 }
 
 /// The compatibility mark of a runtime executable, if it has one.
+#[cfg(feature = "compiler")]
 fn runtime_mark(executable: &[u8]) -> Result<Option<String>> {
     keep_mark();
     let prefix = mark_prefix();
@@ -202,6 +211,7 @@ fn runtime_mark(executable: &[u8]) -> Result<Option<String>> {
     Ok(marks.pop_first())
 }
 
+#[cfg(feature = "compiler")]
 pub struct Project {
     pub root: PathBuf,
     pub identity: Identity,
@@ -210,6 +220,7 @@ pub struct Project {
     plugins: std::sync::OnceLock<Option<std::sync::Arc<pen_plugins::Plugins>>>,
 }
 
+#[cfg(feature = "compiler")]
 impl Project {
     /// The checkout at `root`, or the one the current directory is in.
     pub fn find(root: Option<PathBuf>) -> Result<Project> {
@@ -387,17 +398,20 @@ pub(crate) fn temporary_dir() -> Result<PathBuf> {
 /// Says once, while waiting for a game that does not compile yet, that its
 /// next edit is awaited.
 #[cfg(feature = "compiler")]
+#[cfg(feature = "compiler")]
 fn overlay_waiting() {
     static SAID: std::sync::Once = std::sync::Once::new();
     SAID.call_once(|| crate::devlog::info(crate::devlog::Source::Build, "waiting for an edit that compiles"));
 }
 
 /// Plugin build workers; dropping them joins their explicit shutdown.
+#[cfg(feature = "compiler")]
 pub struct Watcher {
     #[cfg(feature = "compiler")]
     plugin: Option<(pen_plugins::Watching, std::sync::mpsc::Receiver<bool>)>,
 }
 
+#[cfg(feature = "compiler")]
 impl Watcher {
     pub fn wait(&mut self) -> Result<bool> {
         #[cfg(feature = "compiler")]
@@ -410,6 +424,7 @@ impl Watcher {
 
 /// Every file under `directory`, as asset keys: relative, `/` between
 /// directories.
+#[cfg(feature = "compiler")]
 pub(crate) fn asset_keys(directory: &Path) -> Result<Vec<String>> {
     fn walk(directory: &Path, prefix: &str, keys: &mut Vec<String>) -> Result<()> {
         for entry in std::fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))? {
@@ -431,9 +446,11 @@ pub(crate) fn asset_keys(directory: &Path) -> Result<Vec<String>> {
 
 /// Kinds of asset the renderer and audio load only when the catalog, or a
 /// material it names, names them.
-const NAMED_KINDS: [&str; 8] = [".json", ".wgsl", ".png", ".jpg", ".jpeg", ".gtex", ".wav", ".ogg"];
+#[cfg(feature = "compiler")]
+const NAMED_KINDS: [&str; 9] = [".json", ".wgsl", ".png", ".jpg", ".jpeg", ".gtex", ".wav", ".ogg", ".sound"];
 
 /// Every string in a JSON value.
+#[cfg(feature = "compiler")]
 fn strings<'a>(value: &'a serde_json::Value, each: &mut impl FnMut(&'a str)) {
     match value {
         serde_json::Value::String(text) => each(text),
@@ -448,6 +465,7 @@ fn strings<'a>(value: &'a serde_json::Value, each: &mut impl FnMut(&'a str)) {
 /// and its sounds' captions (`captions.json`).
 /// To be safe it keeps any file of a kind it does not know, and any `game`'s
 /// Wasm names; without a catalog, all of them.
+#[cfg(feature = "compiler")]
 pub(crate) fn used_assets(assets: &Path, keys: &[String], game: &[u8]) -> BTreeSet<String> {
     let known: HashSet<&str> = keys.iter().map(String::as_str).collect();
     if !known.contains("catalog.json") {
@@ -488,6 +506,7 @@ pub(crate) fn used_assets(assets: &Path, keys: &[String], game: &[u8]) -> BTreeS
 }
 
 /// What [`ship_assets`] shipped, for a package's summary.
+#[cfg(feature = "compiler")]
 struct Shipped {
     files: usize,
     of: usize,
@@ -496,6 +515,7 @@ struct Shipped {
     meshes: usize,
 }
 
+#[cfg(feature = "compiler")]
 impl std::fmt::Display for Shipped {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
@@ -514,6 +534,7 @@ impl std::fmt::Display for Shipped {
 /// JSON in the renderer's binary form ([`pen_render::pack_mesh`]), which
 /// loads faster and is a fraction of the size, with simpler levels of detail
 /// for large meshes where pen has the compiler.
+#[cfg(feature = "compiler")]
 fn ship_assets(from: &Path, to: &Path, wasm: &[u8]) -> Result<Shipped> {
     let keys = asset_keys(from)?;
     let used = used_assets(from, &keys, wasm);
@@ -562,11 +583,13 @@ fn ship_assets(from: &Path, to: &Path, wasm: &[u8]) -> Result<Shipped> {
 
 /// Shared preparation for native packages and static browser exports.
 /// Platform-specific metadata, native code and hosting files follow this.
+#[cfg(feature = "compiler")]
 struct PreparedGame {
     wasm: Vec<u8>,
     assets: Shipped,
 }
 
+#[cfg(feature = "compiler")]
 fn prepare_game(source: &GameSource<'_>, game: &Path, optimize: bool) -> Result<PreparedGame> {
     source.compile(game)?;
     let wasm = shipping_wasm(&game.join("game.wasm"), optimize)?;
@@ -589,6 +612,7 @@ fn prepare_game(source: &GameSource<'_>, game: &Path, optimize: bool) -> Result<
 }
 
 /// What `pen build` ships.
+#[cfg(feature = "compiler")]
 pub struct PackageOptions {
     /// Optimize shipping Wasm before native precompilation.
     pub optimize: bool,
@@ -609,6 +633,7 @@ pub struct PackageOptions {
 }
 
 /// Where `pen build` takes the game from.
+#[cfg(feature = "compiler")]
 pub enum GameSource<'a> {
     /// A checkout, whose program compiles now.
     Checkout(&'a Project),
@@ -621,6 +646,7 @@ pub enum GameSource<'a> {
     Bundle(&'a Path),
 }
 
+#[cfg(feature = "compiler")]
 impl GameSource<'_> {
     fn identity(&self) -> Result<Identity> {
         match self {
@@ -669,10 +695,12 @@ impl GameSource<'_> {
 }
 
 /// The runtime `pen build` ships by default.
+#[cfg(feature = "compiler")]
 fn default_runtime() -> Result<PathBuf> {
     installed_player(&std::env::current_exe()?)
 }
 
+#[cfg(feature = "compiler")]
 fn installed_player(exe: &Path) -> Result<PathBuf> {
     let player = exe.with_file_name("player").join(exe.file_name().context("the executable has no name")?);
     if player.is_file() {
@@ -686,6 +714,7 @@ fn installed_player(exe: &Path) -> Result<PathBuf> {
 }
 
 /// The Rust target an executable was built for, from its header.
+#[cfg(feature = "compiler")]
 pub(crate) fn executable_target(header: &[u8]) -> Option<&'static str> {
     let u16_at = |at: usize| Some(u16::from_le_bytes(header.get(at..at + 2)?.try_into().ok()?));
     let u32_at = |at: usize| Some(u32::from_le_bytes(header.get(at..at + 4)?.try_into().ok()?));
@@ -716,6 +745,7 @@ pub(crate) fn executable_target(header: &[u8]) -> Option<&'static str> {
 
 /// The Steam library `runtime` (for `target`) links, if it was built with
 /// Steam: beside it, or where cargo's steamworks-sys build put it.
+#[cfg(feature = "compiler")]
 fn steam_library(runtime: &Path, bytes: &[u8], target: &str) -> Result<Option<PathBuf>> {
     // A function every runtime built with Steam imports, put together here
     // so that this executable's own bytes do not hold the name.
@@ -748,6 +778,7 @@ fn steam_library(runtime: &Path, bytes: &[u8], target: &str) -> Result<Option<Pa
 
 /// Refuses to ship a runtime that would refuse the game.cwasm this pen
 /// precompiles.
+#[cfg(feature = "compiler")]
 fn check_runtime(runtime: &Path, bytes: &[u8]) -> Result<()> {
     match runtime_mark(bytes)? {
         Some(mark) if mark == RUNTIME => Ok(()),
@@ -764,12 +795,14 @@ fn check_runtime(runtime: &Path, bytes: &[u8]) -> Result<()> {
     }
 }
 
+#[cfg(feature = "compiler")]
 fn notices(out: &Path) -> Result<()> {
     std::fs::write(out.join("LICENSE"), include_str!("../../../LICENSE"))?;
     std::fs::write(out.join("THIRD_PARTY_NOTICES.md"), include_str!("../../../THIRD_PARTY_NOTICES.md"))?;
     Ok(())
 }
 
+#[cfg(feature = "compiler")]
 pub(crate) fn size_of(path: &Path) -> u64 {
     match std::fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => {
@@ -780,10 +813,23 @@ pub(crate) fn size_of(path: &Path) -> u64 {
     }
 }
 
+/// Identity of the original Wasm, including native packages which omit it.
+pub(crate) fn game_fingerprint(directory: &Path) -> Result<u64> {
+    if directory.join("game.meta").is_file() {
+        blot_host::native_fingerprint(&std::fs::read(directory.join("game.meta"))?)
+    } else {
+        #[cfg(feature = "compiler")]
+        return Ok(pen_runtime::net::wire::hash_bytes(&std::fs::read(directory.join("game.wasm"))?));
+        #[cfg(not(feature = "compiler"))]
+        bail!("game.meta is missing; package the game again with `pen build`")
+    }
+}
+
 /// A shippable folder: the runtime, the libraries it needs beside it, and
 /// the game: its compiled program, precompiled for the runtime's platform
 /// and a CPU baseline players' machines have, the assets it uses, its
 /// starting scene and its manifest.
+#[cfg(feature = "compiler")]
 pub fn package(source: GameSource, out: &Path, options: PackageOptions) -> Result<()> {
     let staging = crate::staging::Staging::new(source.root(), out)?;
     package_into(source, &staging.directory, out, options)?;
@@ -791,6 +837,7 @@ pub fn package(source: GameSource, out: &Path, options: PackageOptions) -> Resul
     staging.publish()
 }
 
+#[cfg(feature = "compiler")]
 fn package_into(source: GameSource, out: &Path, destination: &Path, options: PackageOptions) -> Result<()> {
     let runtime = match options.runtime {
         Some(runtime) => runtime,
@@ -833,6 +880,8 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
     }
     let precompiled = blot_host::precompile(&engine, &wasm)?;
     std::fs::write(game.join("game.cwasm"), crate::compiled::encode(&precompiled)?)?;
+    std::fs::write(game.join("game.meta"), blot_host::native_metadata(&wasm)?)?;
+    std::fs::remove_file(game.join("game.wasm"))?;
     Manifest { game: identity, runtime: Some(RUNTIME.to_owned()) }.write(game)?;
     std::fs::copy(&runtime, &layout.executable)?;
     if let Some(library) = &steam {
@@ -859,6 +908,7 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
 
 /// The browser host's files, into `out`: PEN_WEB_HOST's, those `just
 /// install` put beside this executable, else built from this repository.
+#[cfg(feature = "compiler")]
 pub fn web_host(out: &Path) -> Result<()> {
     let host = std::env::var_os("PEN_WEB_HOST").map(PathBuf::from).or_else(|| {
         let beside = std::env::current_exe().ok()?.parent()?.join("web");
@@ -880,6 +930,7 @@ pub fn web_host(out: &Path) -> Result<()> {
 /// The browser front end, guest programs, the assets the game uses and its
 /// manifest as a complete static site, ready to host (`web_export`): its
 /// files precompressed and a service worker; and, given `zip`, as a ZIP.
+#[cfg(feature = "compiler")]
 pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: bool) -> Result<()> {
     let staging = crate::staging::Staging::new(&project.root, out)?;
     let site = &staging.directory;
@@ -909,6 +960,7 @@ pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: b
     Ok(())
 }
 
+#[cfg(feature = "compiler")]
 fn shipping_wasm(path: &Path, optimize: bool) -> Result<Vec<u8>> {
     if optimize {
         #[cfg(feature = "compiler")]
@@ -921,6 +973,7 @@ fn shipping_wasm(path: &Path, optimize: bool) -> Result<Vec<u8>> {
 
 /// Checks the explicit state adapter declaration beside the asset catalog,
 /// including any adapter-owned migration layouts (docs/state-adapters.md).
+#[cfg(feature = "compiler")]
 pub fn check_saved_types(assets: &Path) -> Result<()> {
     let path = assets.join(pen_runtime::state::CONFIG_FILE);
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(()) };
@@ -930,6 +983,7 @@ pub fn check_saved_types(assets: &Path) -> Result<()> {
 }
 
 /// A compiled bundle for tests and packet tools, without a player executable.
+#[cfg(feature = "compiler")]
 pub fn export_bundle(project: &Project, out: &Path) -> Result<()> {
     let staging = crate::staging::Staging::new(&project.root, out)?;
     project.compile(&staging.directory)?;
@@ -946,6 +1000,7 @@ pub fn export_bundle(project: &Project, out: &Path) -> Result<()> {
 
 /// The checkout's starting scene to `to`, if it has one: a game without
 /// scenes starts from what its program creates.
+#[cfg(feature = "compiler")]
 fn copy_scene(project: &Project, to: &Path) -> Result<()> {
     let scene = project.scene();
     if scene.is_file() {
@@ -954,6 +1009,7 @@ fn copy_scene(project: &Project, to: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "compiler", test))]
 pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
@@ -968,7 +1024,7 @@ pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compiler"))]
 mod tests {
     use super::*;
 
@@ -1148,7 +1204,8 @@ mod tests {
         let out = bundle.join("dist/package");
         package(GameSource::Bundle(&bundle), &out, options).unwrap();
         assert_eq!(std::fs::read(out.join("gather")).unwrap(), runtime, "the runtime, named after the game");
-        assert_eq!(std::fs::read(out.join("game/game.wasm")).unwrap(), wasm);
+        assert!(!out.join("game/game.wasm").exists());
+        assert_eq!(std::fs::read(out.join("game/game.meta")).unwrap(), blot_host::native_metadata(&wasm).unwrap());
         assert!(out.join("game/game.cwasm").is_file() && !out.join("game/main.scene").exists());
         let manifest = Manifest::read(&out.join("game")).unwrap().unwrap();
         assert_eq!((manifest.game.name.as_str(), manifest.runtime.as_deref()), ("gather", Some(RUNTIME)));

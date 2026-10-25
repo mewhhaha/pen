@@ -27,6 +27,9 @@ pollster = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 wgpu.workspace = true
+# Recipe textures reconstruct their channels from an embedded painting on
+# either host. Ordinary browser images still use the page's decoder.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 
 # Natively, asset files are read and decoded on loader threads.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

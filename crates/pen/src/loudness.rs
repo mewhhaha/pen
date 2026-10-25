@@ -173,6 +173,16 @@ pub struct Measurement {
 
 /// A clip's file, measured.
 pub fn measure(bytes: &[u8]) -> Result<Measurement> {
+    if bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{') {
+        let recipe = pen_runtime::sound_recipe::Recipe::parse(bytes)?;
+        let channels = vec![recipe.render()?.into_iter().map(f64::from).collect::<Vec<_>>()];
+        let rate = f64::from(recipe.rate);
+        return Ok(Measurement {
+            lufs: integrated(&channels, rate),
+            true_peak_db: decibels(true_peak(&channels, rate)),
+            seconds: channels[0].len() as f64 / rate,
+        });
+    }
     let encoded = Encoded::new(bytes.to_vec().into())?;
     let clip = encoded.decode()?;
     let channels: Vec<Vec<f64>> =
@@ -371,6 +381,8 @@ pub fn run(files: &[PathBuf], options: &Options) -> Result<()> {
                     let linear = 10f64.powf(db / 20.0);
                     let normalized = if crate::opus::is_ogg_opus(&bytes) {
                         regain_opus(&bytes, db)?
+                    } else if path.to_string_lossy().ends_with(".sound") {
+                        pen_runtime::sound_recipe::Recipe::parse(&bytes)?.scaled(linear)?
                     } else {
                         scale_wav(&bytes, linear)?
                     };

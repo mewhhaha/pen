@@ -11,8 +11,10 @@ use anyhow::{Result, bail, ensure};
 
 /// The block a match must cover at least. Small enough to find the unchanged
 /// stretches between a mesh's edits, large enough that the index stays small.
+#[cfg(any(feature = "compiler", test))]
 const BLOCK: usize = 64;
 /// The same, as the checksum weighs it.
+#[cfg(any(feature = "compiler", test))]
 const BLOCK_WEIGHT: u32 = 64;
 
 const COPY: u8 = 0;
@@ -21,11 +23,13 @@ const INSERT: u8 = 1;
 /// A checksum of a window that slides a byte at a time (Adler-32's sums,
 /// unreduced).
 #[derive(Clone, Copy)]
+#[cfg(any(feature = "compiler", test))]
 struct Rolling {
     a: u32,
     b: u32,
 }
 
+#[cfg(any(feature = "compiler", test))]
 impl Rolling {
     fn of(window: &[u8]) -> Rolling {
         let mut rolling = Rolling { a: 0, b: 0 };
@@ -48,6 +52,7 @@ impl Rolling {
     }
 }
 
+#[cfg(any(feature = "compiler", test))]
 fn number(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = value.to_le_bytes()[0] & 0x7f;
@@ -74,6 +79,7 @@ fn read_number(bytes: &[u8], at: &mut usize) -> Result<u64> {
 }
 
 /// The delta that makes `new` from `old`.
+#[cfg(any(feature = "compiler", test))]
 pub fn diff(old: &[u8], new: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     // Old blocks by checksum; the first of equal ones is kept.
@@ -122,6 +128,7 @@ pub fn diff(old: &[u8], new: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(any(feature = "compiler", test))]
 fn insert(out: &mut Vec<u8>, bytes: &[u8]) {
     if bytes.is_empty() {
         return;

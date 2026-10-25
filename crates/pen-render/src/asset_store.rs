@@ -18,6 +18,8 @@ use crate::shader::Variants;
 mod instances;
 mod layout;
 mod packed;
+mod precision;
+mod recipe;
 pub(crate) use instances::MeshInstances;
 
 /// A sprite shader is WGSL like a shader, compiled for the sprite pass.
@@ -67,6 +69,8 @@ pub(crate) struct Mesh {
     pub skin: Option<Skin>,
     /// Immutable, shader-owned records for repeated geometry.
     pub instances: Option<MeshInstances>,
+    /// Opt-in fractional precision for shipping positions and normals.
+    pub precision: Option<u8>,
 }
 
 /// Up to four joints (indices into the rig's joints) per vertex, and how
@@ -176,6 +180,8 @@ const MESH_HEADER: usize = 16;
 /// and any simpler levels of detail over the same vertices.
 #[derive(Deserialize)]
 struct MeshArrays {
+    #[serde(default)]
+    precision: Option<u8>,
     positions: Vec<f32>,
     normals: Vec<f32>,
     uvs: Vec<f32>,
@@ -207,11 +213,15 @@ struct LodArrays {
 
 /// A mesh asset: its JSON, or the binary form `pack_mesh` makes of it.
 pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
+    if bytes.starts_with(b"PMRP") {
+        return parse_mesh(&packed::decode_recipe(bytes)?);
+    }
     if bytes.starts_with(MESH_MAGIC) {
         return unpack_mesh(bytes);
     }
     let arrays: MeshArrays = serde_json::from_slice(bytes).map_err(|error| anyhow!("mesh JSON: {error}"))?;
     let MeshArrays {
+        precision,
         positions,
         normals,
         uvs,
@@ -258,6 +268,10 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
     let authored_lods = lods.is_some();
     let lods: Vec<(f32, Vec<u32>)> = lods.unwrap_or_default().into_iter().map(|lod| (lod.error, lod.indices)).collect();
     let mut mesh = checked_mesh(vertices, indices, &lods, skin)?;
+    if let Some(bits) = precision {
+        ensure!((16..=23).contains(&bits), "mesh precision must be 16..23 fraction bits");
+    }
+    mesh.precision = precision;
     mesh.authored_lods = authored_lods;
     mesh.set_instances(instances)?;
     Ok(mesh)
@@ -320,7 +334,16 @@ pub(crate) fn checked_mesh(
     }
     let lods = levels(&mut indices, simpler)?;
     let bounds = Sphere::around(&vertices, MESH_VERTEX_FLOATS);
-    let mut mesh = Mesh { vertices, indices, bounds, lods, authored_lods: !simpler.is_empty(), skin, instances: None };
+    let mut mesh = Mesh {
+        vertices,
+        indices,
+        bounds,
+        lods,
+        authored_lods: !simpler.is_empty(),
+        skin,
+        instances: None,
+        precision: None,
+    };
     let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
     ensure!(count != 0, "mesh requires matching position/normal/UV vertices and triangle indices");
     ensure!(mesh.indices.iter().all(|&index| (index as usize) < count), "mesh index is outside its vertex array");
@@ -369,7 +392,14 @@ pub fn pack_mesh(bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub(crate) fn pack(mesh: &Mesh) -> Result<Vec<u8>> {
-    packed::encode(pack_uncompressed(mesh)?)
+    if mesh.instances.as_ref().is_some_and(|instances| instances.recipe.is_some()) {
+        return packed::encode_recipe(mesh);
+    }
+    let raw = pack_uncompressed(mesh)?;
+    let Some(bits) = mesh.precision.filter(|&bits| bits < 23) else { return packed::encode(raw) };
+    let full = packed::encode(raw.clone())?;
+    let smaller = packed::encode(precision::reduce(raw, bits)?)?;
+    Ok(if smaller.len() < full.len() { smaller } else { full })
 }
 
 fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {

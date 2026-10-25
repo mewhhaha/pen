@@ -10,7 +10,10 @@ use crate::culling::Sphere;
 /// Bounds enclose all instances in mesh space, before shader deformation.
 #[derive(Deserialize)]
 pub(crate) struct MeshInstances {
+    #[serde(default)]
     pub data: Vec<f32>,
+    #[serde(default)]
+    pub(super) recipe: Option<Box<super::recipe::Recipe>>,
     /// JSON records can use fixed-point integers. Bounds stay in mesh units;
     /// binary files and GPU records always contain the expanded values.
     #[serde(default = "unit_scale")]
@@ -41,13 +44,20 @@ impl MeshInstances {
             |bytes: &[u8]| bytes.as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)).collect::<Vec<_>>();
         let bounds = values(&bytes[layout.bounds.clone()]);
         let data = values(&bytes[layout.records.range()]);
-        Ok(Self { min: bounds[..3].try_into()?, max: bounds[3..].try_into()?, data, scale: 1.0 })
+        Ok(Self { min: bounds[..3].try_into()?, max: bounds[3..].try_into()?, data, scale: 1.0, recipe: None })
     }
 }
 
 impl Mesh {
     pub(super) fn set_instances(&mut self, mut instances: Option<MeshInstances>) -> Result<()> {
         if let Some(instances) = &mut instances {
+            if let Some(recipe) = &instances.recipe {
+                ensure!(
+                    instances.data.is_empty() && instances.scale == 1.0,
+                    "instance recipe cannot also have data or a scale"
+                );
+                instances.data = recipe.generate()?;
+            }
             ensure!(self.skin.is_none(), "a mesh cannot have both a skin and persistent instances");
             ensure!(
                 !instances.data.is_empty() && instances.data.len().is_multiple_of(INSTANCE_FLOATS),

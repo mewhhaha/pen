@@ -11,9 +11,7 @@
 //! The registry ([`Services`], pen-runtime's, which the browser shares)
 //! has one service per code (`pen_protocol::service`): Steam's
 //! achievements, stats and rich presence, the clipboard, opening a web
-//! address, what the game runs on, grid pathfinding, and the simulation
-//! services (`pen_simulation`: physics, navmesh paths, spatial queries and
-//! noise). A request for a code nobody registered is answered `unknown`;
+//! address, what the game runs on, and noise (`pen_simulation`). A request for a code nobody registered is answered `unknown`;
 //! one a service cannot do here (Steam is off) `unavailable`.
 //!
 //! Linking a native library as a service: implement [`Service`] (its code,
@@ -21,8 +19,7 @@
 //! numbers and values) and register it ([`Services::register`]); give it a
 //! code in `protocol/schema.json` (`Service`, and its operations'
 //! enumeration), regenerate (`just sync-protocol`), and add the request to
-//! `packages/services.blot`. `pen_runtime::services::Pathfinding` is the
-//! example.
+//! `packages/services.blot`. `pen_simulation::Noise` is one example.
 //!
 //! A service answers at once, or later: [`Service::call`] returns None and
 //! [`Service::poll`] hands the answer over when it is ready (a dialog
@@ -54,7 +51,7 @@ pub type Services = pen_runtime::services::Services<Input>;
 
 /// The runtime's own: Steam (unavailable until [`steam::SteamService`] with
 /// a client replaces it), the clipboard, web addresses, the platform,
-/// pathfinding, the simulation services (`pen_simulation`) and the
+/// noise (`pen_simulation`) and the
 /// player's consent to reports (`crate::reports`).
 pub fn standard() -> Services {
     let mut services = Services::new();
@@ -62,7 +59,6 @@ pub fn standard() -> Services {
     services.register(Box::new(clipboard::Clipboard::default()));
     services.register(Box::new(url::Url));
     services.register(Box::new(platform::platform()));
-    services.register(Box::new(pen_runtime::services::Pathfinding));
     pen_simulation::register(&mut services);
     services.register(Box::new(crate::reports::Reports::new()));
     services
@@ -102,6 +98,23 @@ mod tests {
             value: 0.0,
             length: 0
         }));
+    }
+
+    #[test]
+    fn navigation_and_physics_are_guest_owned() {
+        let mut services = standard();
+        for code in [service::PATHFINDING, service::NAVMESH, service::PHYSICS, service::SPATIAL] {
+            services.answer(&[request(code, code, vec![])]);
+            assert_eq!(
+                services.take_answers(),
+                vec![GameEvent::ServiceAnswer {
+                    request: code,
+                    status: service_status::UNKNOWN,
+                    value: 0.0,
+                    length: 0,
+                }]
+            );
+        }
     }
 
     /// The simulation services answer native pen's requests with the bits

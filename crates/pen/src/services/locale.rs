@@ -9,6 +9,7 @@ use pen_runtime::locale::{LocaleService, Locales};
 /// Copies the string tables beside `assets` (a checkout's `src/`) into
 /// `into`, beside the bundle's own assets, for a package or bundle to
 /// answer from: `text.json`, and `locales/` when there is one.
+#[cfg(feature = "compiler")]
 pub fn ship_tables(assets: &Path, into: &Path) -> std::io::Result<()> {
     let Some(root) = assets.parent() else { return Ok(()) };
     if !root.join("text.json").is_file() {

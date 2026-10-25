@@ -28,6 +28,11 @@ fn compatibility() -> String {
     let packed_mesh = manifest.join("../pen-render/src/asset_store/packed.rs");
     let mesh_layout = manifest.join("../pen-render/src/asset_store/layout.rs");
     let compiled = manifest.join("src/compiled.rs");
+    let texture = manifest.join("../pen-render/src/packed_texture.rs");
+    let texture_recipe = manifest.join("../pen-render/src/texture_recipe.rs");
+    let sound_recipe = manifest.join("../pen-runtime/src/sound_recipe.rs");
+    let instance_recipe = manifest.join("../pen-render/src/asset_store/recipe.rs");
+    let simulation = manifest.join("../pen-simulation/src/lib.rs");
     for path in [
         workspace.join("Cargo.lock"),
         workspace.join("Cargo.toml"),
@@ -36,6 +41,11 @@ fn compatibility() -> String {
         packed_mesh.clone(),
         mesh_layout.clone(),
         compiled.clone(),
+        texture.clone(),
+        texture_recipe.clone(),
+        sound_recipe.clone(),
+        instance_recipe.clone(),
+        simulation.clone(),
     ] {
         println!("cargo:rerun-if-changed={}", path.display());
     }
@@ -66,6 +76,9 @@ fn compatibility() -> String {
     hash.write(&unix_lines(&std::fs::read(&packed_mesh).expect("packed mesh codec exists")));
     hash.write(&unix_lines(&std::fs::read(&mesh_layout).expect("mesh layout exists")));
     hash.write(&unix_lines(&std::fs::read(&compiled).expect("compiled game codec exists")));
+    for file in [texture, texture_recipe, sound_recipe, instance_recipe, simulation] {
+        hash.write(&unix_lines(&std::fs::read(file).expect("asset decoder exists")));
+    }
     format!("wasmtime {wasmtime}, engine {:016x}", hash.0)
 }
 

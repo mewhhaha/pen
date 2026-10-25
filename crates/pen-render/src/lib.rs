@@ -31,6 +31,7 @@ mod solids;
 mod sprites;
 mod taa;
 mod texture;
+mod texture_recipe;
 
 use pen_protocol::{Catalog, GameEvent, RenderFrame};
 

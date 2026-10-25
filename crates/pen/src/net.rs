@@ -102,9 +102,8 @@ impl Net {
     /// Starts the peer `spec` names, for the game build `wasm`, starting
     /// from `start` in a window of size `viewport` (the session's, if this
     /// is the host).
-    pub fn start(spec: &Spec, link: Box<dyn Link>, wasm: &[u8], start: &Moment, viewport: Viewport) -> Result<Net> {
+    pub fn start(spec: &Spec, link: Box<dyn Link>, build: u64, start: &Moment, viewport: Viewport) -> Result<Net> {
         let settings = Settings::new(spec.addresses.len(), spec.player, viewport);
-        let build = pen_runtime::net::wire::hash_bytes(wasm);
         // The host's nonce: this run's, not an earlier one's on the same port.
         let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let seed = [since.as_nanos().to_le_bytes().as_slice(), &std::process::id().to_le_bytes()].concat();

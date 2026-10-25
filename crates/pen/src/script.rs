@@ -475,12 +475,14 @@ impl Script {
     }
 
     /// Whether every step has been taken, though the last may still play out.
+    #[cfg(feature = "compiler")]
     pub fn idle(&self) -> bool {
         self.steps.is_empty()
     }
 
     /// Adds a step after the others: input fuzzing makes them up as it goes,
     /// each in time for the frame that takes it.
+    #[cfg(feature = "compiler")]
     pub fn push(&mut self, step: Step) {
         self.steps.push_back(step);
     }

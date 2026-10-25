@@ -17,6 +17,7 @@ pub enum Source {
     /// Asset files reloading, and the renderer's word on them.
     Asset,
     /// The checkout's asset recipes (`pipeline.json`).
+    #[cfg(feature = "compiler")]
     Pipeline,
     /// The session: time travel, input recordings, saves and loads.
     Session,

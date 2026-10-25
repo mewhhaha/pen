@@ -115,6 +115,7 @@ impl Config {
 
 /// `pen build`'s copy of the checkout's `"reports"` section, as
 /// `game/reports.json`, when it has one.
+#[cfg(feature = "compiler")]
 pub fn ship_config(root: &Path, game: &Path) -> Result<()> {
     let file = root.join("pen.json");
     let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;

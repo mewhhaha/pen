@@ -17,23 +17,34 @@
 //! program has made its first frame; and has the sounds decoded first. The
 //! rest of the catalog streams in once they are in. Without the file, or
 //! for another scene, it loads as before.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+#[cfg(any(feature = "compiler", test))]
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+#[cfg(feature = "compiler")]
 use anyhow::{Context, Result};
+#[cfg(feature = "compiler")]
 use blot_host::GuestModule;
+#[cfg(feature = "compiler")]
 use pen_protocol::boundary::{decode_frame, encode_frame, read_catalog};
-use pen_protocol::{Catalog, Draw, Frame, RenderFrame, Viewport};
+#[cfg(any(feature = "compiler", test))]
+use pen_protocol::{Catalog, Draw, RenderFrame};
+#[cfg(feature = "compiler")]
+use pen_protocol::{Frame, Viewport};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "compiler")]
 use crate::program::{Operation, Program};
+#[cfg(feature = "compiler")]
 use crate::snapshot;
 
 /// The file, in the asset directory.
 pub const FILE: &str = "scenes.json";
 /// A second of frames: the menu or editor a player first sees, and the
 /// loading veil's time over it.
+#[cfg(feature = "compiler")]
 pub const FRAMES: usize = 60;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -58,6 +69,7 @@ pub struct SceneAssets {
 
 /// Collects what frames need, each once, in order.
 #[derive(Default)]
+#[cfg(any(feature = "compiler", test))]
 struct Needs<'a> {
     catalog: Option<&'a Catalog>,
     seen: HashSet<(String, String)>,
@@ -65,6 +77,7 @@ struct Needs<'a> {
     sprites: HashSet<u32>,
 }
 
+#[cfg(any(feature = "compiler", test))]
 impl Needs<'_> {
     fn add(&mut self, kind: &str, key: &str) {
         if self.seen.insert((kind.to_owned(), key.to_owned())) {
@@ -147,6 +160,7 @@ impl Needs<'_> {
 
 /// What the first `frames` frames of the program in `wasm` draw, starting
 /// from `scene` (when it is one), with the assets in `assets`.
+#[cfg(feature = "compiler")]
 pub fn compute(wasm: &[u8], assets: &Path, scene: &Path, frames: usize) -> Result<SceneAssets> {
     let catalog = read_catalog(assets)?;
     let engine = blot_host::engine()?;
@@ -179,6 +193,7 @@ pub fn compute(wasm: &[u8], assets: &Path, scene: &Path, frames: usize) -> Resul
 
 /// Works out what the scene draws first and writes it into `out`, the
 /// shipped asset directory, saying how much of the catalog that is.
+#[cfg(feature = "compiler")]
 pub fn write(wasm: &[u8], assets: &Path, scene: &Path, out: &Path) -> Result<()> {
     let name = scene.file_name().context("the scene has no file name")?.to_string_lossy().into_owned();
     let found = compute(wasm, assets, scene, FRAMES)?;

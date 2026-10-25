@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 
 const MAX_BYTES: usize = 256 * 1024 * 1024;
 
+#[cfg(any(feature = "compiler", test))]
 pub fn encode(bytes: &[u8]) -> Result<Vec<u8>> {
     ensure!((1..=MAX_BYTES).contains(&bytes.len()), "precompiled game exceeds its size limit");
     let mut compressor = zstd::bulk::Compressor::new(19)?;

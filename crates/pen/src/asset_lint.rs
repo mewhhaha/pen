@@ -233,6 +233,9 @@ fn inspect(key: &str, bytes: &[u8]) -> Inspected {
     if lower.ends_with(".material.json") {
         return fine(pen_render::inspect_material(bytes).map(drop));
     }
+    if lower.ends_with(".sound") {
+        return fine(pen_runtime::sound_recipe::Recipe::parse(bytes).and_then(|recipe| recipe.render()).map(drop));
+    }
     if lower.ends_with(".json") {
         return fine(serde_json::from_slice::<serde_json::Value>(bytes).map(drop).map_err(Into::into));
     }

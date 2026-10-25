@@ -17,11 +17,12 @@ impl Session {
     /// Joins the net session `spec` names: its frames keep moments to roll
     /// back to, and every packet's hash is compared with the peers'.
     pub(super) fn start_net(&mut self, spec: &Spec) -> Result<()> {
-        let wasm = std::fs::read(self.paths.game.join("game.wasm")).context("reading the game for the net session")?;
+        let build =
+            crate::project::game_fingerprint(&self.paths.game).context("reading the game for the net session")?;
         let moment = self.runtime.moment()?;
         let viewport = Viewport { width: self.gpu.size.0, height: self.gpu.size.1 };
         let link = Box::new(Udp::bind(spec)?);
-        self.net = Some(Net::start(spec, link, &wasm, &moment, viewport)?);
+        self.net = Some(Net::start(spec, link, build, &moment, viewport)?);
         self.timeline.keep_history(Some(KEEP_SECONDS));
         self.runtime.hash_packets(true);
         self.overlap.enabled = false;

@@ -66,7 +66,9 @@ fn simplified(mesh: Mesh) -> Result<Mesh> {
         }
     }
     let whole = whole.to_vec();
-    checked_mesh(mesh.vertices, whole, &simpler, mesh.skin)
+    let mut reduced = checked_mesh(mesh.vertices, whole, &simpler, mesh.skin)?;
+    reduced.precision = mesh.precision;
+    Ok(reduced)
 }
 
 #[cfg(test)]

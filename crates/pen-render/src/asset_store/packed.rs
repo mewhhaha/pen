@@ -18,6 +18,49 @@ const VERSION: u8 = 2;
 // Bound allocations before trusting a compressed asset's claimed length.
 const MAX_EXPANDED: usize = 256 * 1024 * 1024;
 
+pub(super) fn encode_recipe(mesh: &super::Mesh) -> Result<Vec<u8>> {
+    ensure!(mesh.lods.len() == 1, "instance recipe meshes cannot have extra LODs");
+    let instances = mesh.instances.as_ref().context("missing instance recipe")?;
+    let component = |start: usize, count: usize| {
+        mesh.vertices
+            .as_chunks::<{ super::MESH_VERTEX_FLOATS }>()
+            .0
+            .iter()
+            .flat_map(|v| v[start..start + count].iter().copied())
+            .collect::<Vec<_>>()
+    };
+    let json = serde_json::to_vec(&serde_json::json!({
+        "positions":component(0,3),"normals":component(3,3),"uvs":component(6,2),"attributes":component(8,2),
+        "indices":mesh.indices,"lods":[],
+        "instances":{"recipe":instances.recipe,"min":instances.min,"max":instances.max}
+    }))?;
+    ensure!(json.len() <= 64 * 1024 * 1024, "instance recipe JSON exceeds its size limit");
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(&json)?;
+    let mut out = b"PMRP".to_vec();
+    out.extend(u32::try_from(json.len())?.to_le_bytes());
+    out.extend(encoder.finish()?);
+    Ok(out)
+}
+
+pub(super) fn decode_recipe(bytes: &[u8]) -> Result<Vec<u8>> {
+    ensure!(bytes.len() >= 8, "instance recipe header ends early");
+    let length = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;
+    ensure!((2..=64 * 1024 * 1024).contains(&length), "instance recipe expands beyond its size limit");
+    let mut out = vec![0; length + 1];
+    let mut decoder = Decompress::new(true);
+    let status = decoder.decompress(&bytes[8..], &mut out, FlushDecompress::Finish)?;
+    ensure!(
+        status == Status::StreamEnd
+            && decoder.total_out() == length as u64
+            && decoder.total_in() == (bytes.len() - 8) as u64,
+        "compressed instance recipe is truncated or has trailing data"
+    );
+    out.truncate(length);
+    ensure!(out.starts_with(b"{"), "instance recipe must contain mesh JSON");
+    Ok(out)
+}
+
 pub(super) fn encode(mut raw: Vec<u8>) -> Result<Vec<u8>> {
     if raw.len() > MAX_EXPANDED {
         return Ok(raw);

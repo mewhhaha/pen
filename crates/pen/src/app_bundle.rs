@@ -15,16 +15,20 @@
 //! `scripts/macos-sign.sh`'s, with the owner's Developer ID.
 use std::path::{Path, PathBuf};
 
+#[cfg(any(feature = "compiler", test))]
 use anyhow::{Result, ensure};
 
+#[cfg(any(feature = "compiler", test))]
 use crate::project::Identity;
 
 /// The oldest macOS the bundle says it runs on: Big Sur, the first with
 /// Apple silicon, and Rust's own minimum there.
+#[cfg(any(feature = "compiler", test))]
 const MINIMUM_MACOS: &str = "11.0";
 
 /// The paths `pen build` writes a package's parts to.
 #[derive(Debug, PartialEq)]
+#[cfg(any(feature = "compiler", test))]
 pub struct Layout {
     /// The runtime, named after the game.
     pub executable: PathBuf,
@@ -38,6 +42,7 @@ pub struct Layout {
     pub info: Option<(PathBuf, String)>,
 }
 
+#[cfg(any(feature = "compiler", test))]
 impl Layout {
     /// The layout under `out` of a package of `identity` for `target`
     /// (a Rust triple). `bundle_id` is a macOS bundle's CFBundleIdentifier,
@@ -79,6 +84,7 @@ impl Layout {
 
 /// A bundle identifier: `given`, which must be one (letters, digits, `-`
 /// and `.`, as Apple allows), else `pen.` and the game's name made one.
+#[cfg(any(feature = "compiler", test))]
 pub fn bundle_identifier(name: &str, given: Option<&str>) -> Result<String> {
     let allowed = |character: char| character.is_ascii_alphanumeric() || character == '-' || character == '.';
     if let Some(given) = given {
@@ -93,6 +99,7 @@ pub fn bundle_identifier(name: &str, given: Option<&str>) -> Result<String> {
 }
 
 /// `text` safe in an XML element.
+#[cfg(any(feature = "compiler", test))]
 fn escaped(text: &str) -> String {
     text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -101,6 +108,7 @@ fn escaped(text: &str) -> String {
 /// that it is an application and a game, the oldest system it runs on, and
 /// that it draws at the display's full resolution (without this, a Retina
 /// display would show it scaled up from half).
+#[cfg(any(feature = "compiler", test))]
 fn info_plist(identity: &Identity, identifier: &str) -> String {
     let name = escaped(&identity.name);
     let title = escaped(&identity.title);
@@ -146,7 +154,7 @@ pub fn packaged_game(exe: &Path) -> Option<PathBuf> {
     let beside = exe.parent()?;
     [beside.join("game"), beside.join("../Resources/game")]
         .into_iter()
-        .find(|directory| directory.join("game.wasm").exists())
+        .find(|directory| directory.join("game.wasm").is_file() || directory.join("game.meta").is_file())
 }
 
 #[cfg(test)]

@@ -57,6 +57,10 @@ fn main() -> Result<()> {
                 let lanes = lanes
                     .iter()
                     .map(|lane| {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            reason = "guest input lanes are f32; overflow is rejected below"
+                        )]
                         let value = lane.as_f64().context("numeric lane")? as f32;
                         ensure!(value.is_finite(), "nonfinite input");
                         Ok(value)

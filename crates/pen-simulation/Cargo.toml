@@ -3,7 +3,7 @@ name = "pen-simulation"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Deterministic simulation services both hosts answer alike: physics, navmesh paths, spatial queries and noise"
+description = "Deterministic noise service shared by both hosts"
 
 [lints]
 workspace = true
@@ -11,8 +11,3 @@ workspace = true
 [dependencies]
 pen-protocol.workspace = true
 pen-runtime.workspace = true
-# `enhanced-determinism` computes with libm and without SIMD (glam's scalar
-# math), so x86_64 and wasm32 give the same bits.
-rapier3d = { version = "0.36", default-features = false, features = ["dim3", "f32", "std", "enhanced-determinism"] }
-# Constrained Delaunay triangulation, with exact predicates, for navmeshes.
-spade = "2.15"

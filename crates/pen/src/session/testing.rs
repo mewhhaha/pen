@@ -22,7 +22,6 @@ impl Session {
             device: "test".into(),
             handheld: false,
         }));
-        services.register(Box::new(pen_runtime::services::Pathfinding));
         pen_simulation::register(&mut services);
         Self::with_services(options, paths, engine, module, catalog, gpu, None, services)
     }

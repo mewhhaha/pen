@@ -28,13 +28,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::store::{Digest, Store, digest_file, write_atomically};
+use crate::store::{Digest, write_atomically};
+#[cfg(any(feature = "compiler", test))]
+use crate::store::{Store, digest_file};
 
 /// Where a package's file list is, from its root.
 pub const MANIFEST: &str = "game/files.json";
 const MAGIC: &[u8; 8] = b"PENPATCH";
 const FORMAT: u32 = 1;
 /// The store's records of package versions.
+#[cfg(any(feature = "compiler", test))]
 const VERSIONS: &str = "packages";
 
 /// One file of a package.
@@ -68,6 +71,7 @@ impl Manifest {
     }
 
     /// The manifest of the package at `root` as its files are now.
+    #[cfg(any(feature = "compiler", test))]
     pub fn of_directory(root: &Path, game: &str) -> Result<Manifest> {
         let mut files = Vec::new();
         for path in package_files(root)? {
@@ -96,12 +100,14 @@ impl Manifest {
         write_atomically(&root.join(MANIFEST), |file| Ok(file.write_all(&text)?))
     }
 
+    #[cfg(any(feature = "compiler", test))]
     fn total(&self) -> u64 {
         self.files.iter().map(|entry| entry.size).sum()
     }
 }
 
 /// Every file under `root` but the manifest, relative and sorted.
+#[cfg(any(feature = "compiler", test))]
 fn package_files(root: &Path) -> Result<Vec<String>> {
     fn walk(root: &Path, directory: &Path, files: &mut Vec<String>) -> Result<()> {
         for entry in std::fs::read_dir(directory).with_context(|| format!("reading {}", directory.display()))? {
@@ -128,12 +134,14 @@ fn package_files(root: &Path) -> Result<Vec<String>> {
 }
 
 #[cfg(unix)]
+#[cfg(any(feature = "compiler", test))]
 fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
+#[cfg(any(feature = "compiler", test))]
 fn executable(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "exe")
 }
@@ -166,6 +174,7 @@ fn checked_path(path: &str) -> Result<&str> {
 
 /// Writes the package's manifest and keeps the package in the store, saying
 /// so; returns its version.
+#[cfg(any(feature = "compiler", test))]
 pub fn record(root: &Path, game: &str, store: &Path) -> Result<Digest> {
     let manifest = Manifest::of_directory(root, game)?;
     manifest.write(root)?;
@@ -181,11 +190,13 @@ pub fn record(root: &Path, game: &str, store: &Path) -> Result<Digest> {
 
 /// A version to patch from or to: a package folder, or a version in the
 /// store (its digest, or the start of it).
+#[cfg(any(feature = "compiler", test))]
 enum Version {
     Directory(PathBuf, Manifest),
     Stored(Manifest),
 }
 
+#[cfg(any(feature = "compiler", test))]
 impl Version {
     fn find(name: &Path, store: Option<&Store>) -> Result<Version> {
         if name.is_dir() {
@@ -244,6 +255,7 @@ struct Header {
     files: Vec<Make>,
 }
 
+#[cfg(any(feature = "compiler", test))]
 fn deflate(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
     encoder.write_all(bytes)?;
@@ -258,6 +270,7 @@ fn inflate(bytes: &[u8], limit: u64) -> Result<Vec<u8>> {
 }
 
 /// What a patch holds, for its summary.
+#[cfg(any(feature = "compiler", test))]
 pub struct Made {
     pub kept: usize,
     pub copied: usize,
@@ -268,6 +281,7 @@ pub struct Made {
     pub of: u64,
 }
 
+#[cfg(any(feature = "compiler", test))]
 impl std::fmt::Display for Made {
     fn fmt(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
@@ -285,6 +299,7 @@ impl std::fmt::Display for Made {
 }
 
 /// Writes the patch from version `old` to version `new` to `out`.
+#[cfg(any(feature = "compiler", test))]
 pub fn make(old: &Path, new: &Path, store: Option<&Path>, out: &Path) -> Result<Made> {
     let store = store.filter(|store| store.is_dir()).map(Store::open).transpose()?;
     let old = Version::find(old, store.as_ref())?;

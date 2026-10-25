@@ -1,5 +1,5 @@
 //! The game's services in a browser, through pen-runtime's registry: what
-//! the game runs on, pathfinding, the simulation services (`pen_simulation`,
+//! the game runs on, noise (`pen_simulation`,
 //! the same bits as native), web addresses (a new tab, as the page's
 //! permissions allow) and the clipboard, whose promises answer a later
 //! frame. Steam and reports to the developer are unavailable.
@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use pen_protocol::{clipboard_op, service, url_op};
-use pen_runtime::services::{Answer, Pathfinding, Platform, Request, Service, Services, Unavailable, openable};
+use pen_runtime::services::{Answer, Platform, Request, Service, Services, Unavailable, openable};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 /// The browser's services.
@@ -21,7 +21,6 @@ pub fn standard() -> Services {
         device: "browser".into(),
         handheld: false,
     }));
-    services.register(Box::new(Pathfinding));
     services.register(Box::new(Url));
     services.register(Box::new(Clipboard::default()));
     pen_simulation::register(&mut services);

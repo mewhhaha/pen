@@ -13,16 +13,20 @@ name = "pen"
 path = "src/main.rs"
 
 [features]
-default = ["compiler", "devtools"]
+default = ["compiler", "devtools", "gles"]
+# Optional OpenGL fallback. Shipping players use Vulkan, Metal or DX12;
+# development builds retain GL for inspecting older machines.
+gles = ["wgpu/gles"]
 # Everything that builds a checkout: Cranelift, which compiles game.wasm;
 # the Wasm plugins (`pen-plugins`, wit/pen-plugin.wit) its pen.json chooses
 # to compile its programs; the protocol generator; the glTF importer; the
 # texture and font tools; the mesh simplifier, which gives packages' large
-# meshes levels of detail; and Brotli for browser exports. Every command but playing a packaged game
-# needs it. Without it (`--no-default-features`) this is the player runtime
+# meshes levels of detail; and Brotli for browser exports. Development commands
+# need it. Playback and applying package updates work without it.
+# Without it (`--no-default-features`) this is the player runtime
 # `pen build` ships: it only loads the game.cwasm the package was
-# precompiled with.
-compiler = ["blot-host/compiler", "dep:pen-codegen", "dep:pen-gltf", "dep:pen-plugins", "dep:pen-texture", "pen-render/simplify", "dep:brotli", "dep:base64"]
+# precompiled with, alongside game.meta.
+compiler = ["blot-host/compiler", "dep:pen-codegen", "dep:pen-gltf", "dep:pen-plugins", "dep:pen-texture", "pen-render/simplify", "dep:brotli", "dep:base64", "dep:notify", "dep:memchr", "dep:naga"]
 steam = ["dep:steamworks"]
 # The dev tools: the checkout's own Blot program for its console and
 # diagnostics, compiled through its plugins and run beside the game in
@@ -69,8 +73,8 @@ gilrs = "0.11"
 flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Which asset keys the game's program names (project.rs).
-memchr = "2"
-notify = "8"
+memchr = { version = "2", optional = true }
+notify = { version = "8", optional = true }
 # Ogg Opus clips (opus.rs): the pages, and libopus (vendored, built with
 # CMake) for the packets.
 ogg = "0.9"
@@ -82,7 +86,7 @@ sha1_smol = "1"
 serde_json = { version = "1", features = ["raw_value"] }
 # WGSL parsed and validated by `pen check`'s asset lints, as wgpu does
 # (the same naga wgpu builds).
-naga = { version = "30", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in"], optional = true }
 # Digests of asset files (the asset cache's keys and the content-addressed
 # store's names, store.rs), and of the files `pen push` sends and `pen
 # serve` keeps (as blot-host keys its compiled modules), and a browser

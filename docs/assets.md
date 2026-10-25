@@ -6,6 +6,54 @@ what they built, the atlases the pipeline packs, the lints `pen check` runs,
 the store of package versions and the patches between them, and the scene
 manifests that let a game start with only what it shows first.
 
+## Recipes evaluated at load time
+
+Games can ship seeds and image-processing graphs instead of expanded assets.
+Both hosts use the same Rust decoders, then upload ordinary textures and instance
+records. Recipes run once during loading; frame packets and shaders keep their
+existing interfaces. The formulas and constants belong to the game's asset
+generator. Pen supplies bounded operations, with no game-specific terrain,
+materials or planting rules.
+
+* **GTEX v3** keeps the usual 16-byte GTEX header, followed by a little-endian
+  U32 JSON length, a `nodes` image graph, and an embedded JPEG painting. Operations
+  include seamless tiling, powers, per-channel scale/offset, luminance, periodic
+  Gaussian blur, difference, absolute value, channel joining and height-to-normal
+  conversion. The final image gets color, data or normal-aware mipmaps. Limits
+  are 32 nodes, power-of-two output dimensions up to 1M pixels, source images up
+  to 16M pixels, and a bounded total filter workload. Color alpha is independent
+  data, so zero gloss does not erase RGB. Existing baked GTEX v2 files still load.
+* **Instance recipes** occupy `instances.recipe` in a mesh JSON, alongside the
+  usual aggregate `min`/`max` bounds. Version 1 contains a U32 `seed`,
+  `random_draws`, row `stride`, flattened `inputs`, lookup `tables`, scalar `nodes`
+  and 20 `output` node indices. Inputs encode the authored planting mask; arithmetic,
+  selection, rounding, lookup and explicit bit-mixing nodes reconstruct records.
+  Random nodes address Python-compatible integer-seeded MT19937 samples. References
+  must point backward. The decoder bounds records, nodes, random draws, tables and
+  total work, and rejects nonfinite results. Recipe meshes have one base LOD.
+  Packaging preserves the graph as `PMRP`, a U32 expanded JSON length and one zlib
+  stream, rather than baking the generated records back into the package.
+
+`pen check` evaluates recipes as part of asset validation. Runtime compatibility
+marks include these decoders, preventing an older shipping player from receiving
+new asset formats. Recipes trade smaller files for temporary loading memory and
+CPU work; compare cold startup and real GPU output before adopting them.
+
+## Shipping mesh precision
+
+Mesh JSON can opt into smaller shipping coordinates with `"precision": 16`.
+Values from 16 through 23 retain that many fraction bits in positions and
+normals (23 is full float32 precision). At 16, rounding error is at most
+about 0.000763% per non-subnormal component, plus subnormal rounding.
+Position extrema remain exact, preserving the authored bounding box. UVs,
+shader attributes, triangle indices, skinning and instance records stay exact.
+Authoring files and development rendering keep the original coordinates.
+Packaging rounds once before the existing byte-plane compressor and keeps the
+full-precision version when it is smaller. The packed format and GPU layout
+are unchanged; a packed mesh can be repackaged without further rounding.
+Choose precision per asset and inspect its shipping render, especially for
+geometry that shaders deform or interpret as data.
+
 ## The pipeline as a graph
 
 `pipeline.json` lists steps. Each is a Justfile recipe (`just NAME`) or one

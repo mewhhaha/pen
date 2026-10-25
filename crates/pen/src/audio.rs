@@ -41,6 +41,11 @@ use source::Encoded;
 /// the browser (`pen_runtime::clip`); the rest decode whole.
 pub fn load_clip(path: &Path) -> Result<Clip> {
     let bytes = std::fs::read(path)?;
+    if path.to_string_lossy().ends_with(".sound") {
+        let recipe = pen_runtime::sound_recipe::Recipe::parse(&bytes)?;
+        let samples = recipe.render()?;
+        return Ok(Clip::new(samples.into_iter().map(|v| [v, v]).collect(), f64::from(recipe.rate)));
+    }
     let streams = pen_runtime::clip::streams(&bytes);
     let encoded = Encoded::new(bytes.into())?;
     if streams {
@@ -335,6 +340,7 @@ impl Audio {
     /// Clips that changed on disk, decoded afresh; each plays its old
     /// version until then, and voices playing it start again with the new
     /// one, crossfading.
+    #[cfg(feature = "compiler")]
     pub fn reload(&mut self, keys: &[String]) {
         for key in keys {
             if self.clips.contains_key(key) {

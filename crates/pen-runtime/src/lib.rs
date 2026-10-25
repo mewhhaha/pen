@@ -26,6 +26,7 @@ pub mod scale;
 pub mod semantic;
 pub mod services;
 pub mod snapshot;
+pub mod sound_recipe;
 pub mod state;
 pub mod symbols;
 pub mod text;

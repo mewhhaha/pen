@@ -113,8 +113,8 @@ fn summary(capture: &Capture, log_lines: usize) -> String {
     let mut text = String::new();
     let identity = crate::identity();
     let _ = writeln!(text, "{} ({}) bug report, {}", identity.name, identity.title, crate::crash::now());
-    let game = std::fs::read(capture.game.join("game.wasm"))
-        .map_or_else(|_| "unknown".to_owned(), |wasm| crate::bench::fingerprint(&wasm));
+    let game = crate::project::game_fingerprint(capture.game)
+        .map_or_else(|_| "unknown".to_owned(), |hash| format!("{hash:016x}"));
     let _ = writeln!(text, "game.wasm {game}, state schema {}, at frame {}", capture.state.schema, capture.position);
     match &capture.recording {
         Some(recording) => {
@@ -178,6 +178,7 @@ fn prune(directory: &Path) {
 }
 
 /// `pen report FILE`: what a report holds; with `out`, unpacks it there.
+#[cfg(any(feature = "compiler", test))]
 pub fn open(path: &Path, out: Option<&Path>) -> Result<()> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     ensure!(is_report(&bytes), "{} is not a pen bug report", path.display());

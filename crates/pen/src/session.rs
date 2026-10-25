@@ -46,6 +46,7 @@ use winit::window::Window;
 
 use crate::audio::Audio;
 use crate::bugreport;
+#[cfg(feature = "compiler")]
 use crate::dev::{Dev, Update};
 use crate::devlog::{self, Source};
 use crate::game::{FrameTimings, GameRuntime, Host, InvalidFrame, Quiet, ReloadResult, Unresponsive, hash_lanes};
@@ -409,6 +410,7 @@ struct Planned {
 pub struct Session {
     options: Options,
     paths: Paths,
+    #[cfg(feature = "compiler")]
     engine: wasmtime::Engine,
     pub gpu: Gpu,
     #[cfg(feature = "devtools")]
@@ -428,6 +430,7 @@ pub struct Session {
     clock: Clock,
     script: Option<Script>,
     capture: Capture,
+    #[cfg(feature = "compiler")]
     dev: Option<Dev>,
     profile: Option<Profile>,
     frame_times: bool,
@@ -606,6 +609,7 @@ impl Session {
         crate::saves::check_all([&paths.quicksave, &paths.scene].into_iter().filter(|path| paths.kept(path)));
         #[cfg(feature = "devtools")]
         let system_trace = module.system_trace();
+        #[cfg(feature = "compiler")]
         let dev = if options.dev { Some(Dev::new(&paths.game, &paths.assets, module.system_trace())?) } else { None };
         let mut audio = audio;
         let state_adapter = load_state_adapter(&paths.assets);
@@ -652,6 +656,7 @@ impl Session {
             system_trace,
             options,
             paths,
+            #[cfg(feature = "compiler")]
             engine,
             gpu,
             runtime,
@@ -665,6 +670,7 @@ impl Session {
             clock,
             script,
             capture,
+            #[cfg(feature = "compiler")]
             dev,
             profile,
             frame_times,
@@ -1364,6 +1370,7 @@ impl Session {
 
     /// Takes reloads as they come: assets at once, a new build when the
     /// guest is idle.
+    #[cfg(feature = "compiler")]
     fn poll_dev(&mut self) {
         let updates = match &mut self.dev {
             Some(dev) => dev.poll(&self.engine),
@@ -1508,9 +1515,11 @@ impl Session {
         #[cfg(feature = "devtools")]
         self.runtime.program().probe().attach(self.sampling.clone());
         let started = Instant::now();
+        #[cfg(feature = "compiler")]
         self.poll_dev();
         for event in self.gpu.renderer.take_events() {
             // While developing, say when a reloaded asset is in (or why not).
+            #[cfg(feature = "compiler")]
             if self.dev.is_some() {
                 match &event {
                     GameEvent::AssetReady { key, revision, .. } if *revision > 1 => {

@@ -11,13 +11,13 @@ use std::ops::{Deref, DerefMut};
 use anyhow::Result;
 use pen_protocol::RenderFrame;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compiler"))]
 use crate::game::Moment;
 use crate::game::{GameRuntime, Host};
 use crate::program::NativeBackend;
-#[cfg(test)]
+#[cfg(all(test, feature = "compiler"))]
 use crate::snapshot::SavedState;
-#[cfg(test)]
+#[cfg(all(test, feature = "compiler"))]
 use pen_runtime::timeline::MOMENT_INTERVAL;
 pub use pen_runtime::timeline::{KEEP_SECONDS, Load, REPLAY_SECONDS, Recorded, Recording};
 
@@ -81,5 +81,5 @@ impl DerefMut for Timeline {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compiler"))]
 mod contract_tests;

@@ -14,7 +14,7 @@ package/
 ├─ libsteam_api.so        (steam_api64.dll, libsteam_api.dylib) when built with Steam
 └─ game/
    ├─ game.cwasm          ahead-of-time machine code, stored as one Zstd frame
-   ├─ game.wasm           its Wasm, for the guest ABI manifest
+   ├─ game.meta           ABI, symbols, snapshot globals and original Wasm fingerprint
    ├─ assets/
    └─ main.scene
 ```
@@ -23,12 +23,26 @@ The executable is named after the game (pen.json's `game.name`, kept in `game/ga
 which also names the data directory), whatever the runtime it copies is called (`pen`,
 `pen.exe`); the runtime finds `game/` beside itself under any name.
 
+Native packages omit executable Wasm: the initialized memory and instructions
+already live in the precompiled artifact. `game.meta` retains source-map offsets
+from that original module, so traps and snapshots work as before. Net sessions
+and bug reports use its original Wasm fingerprint. An incompatible native package
+must be rebuilt; development exports and browser exports still carry `game.wasm`.
+
+Shipping players include Vulkan, Metal and DX12 for their supported platforms.
+The optional `gles` Cargo feature adds OpenGL; default development builds enable
+it, while `just player` and `just windows` omit it. Linux players therefore need
+Vulkan. This preserves the accessibility, input and audio facilities.
+
 The runtime it ships is the **player runtime**: pen built without the
 `compiler` feature (`--no-default-features`), so without Cranelift. It only
-loads the `game.cwasm` its package was precompiled with, and is less than
-half the size of the development build (10.2 against 23.9 MB). Everything that compiles a checkout
-(`dev`, `run`, `build`, `test`, `bench` and `packets` on a
-checkout) refuses in it and says to use a full build.
+loads the `game.meta` and `game.cwasm` its package was precompiled with, and is less than
+half the size of the development build in the original comparison (10.2 against
+23.9 MB; current measurements are below). Development commands, asset-building tools and file watching are excluded
+at compile time. The player exposes playback and `apply` for package updates;
+the full Pen CLI keeps all development and inspection commands. Older packages
+without `game.meta` must be packaged again; there is no legacy Wasm/precompiled
+loading fallback. Development checkouts still compile `game.wasm`.
 
 The packager compresses `game.cwasm` losslessly with Zstd level 19, including
 its expanded size and checksum. The player decompresses it in memory before
@@ -96,17 +110,17 @@ features) against the runtime's. The player runtime refuses what does not
 match, with the reason:
 
 ```
-Error: …/game/game.cwasm is missing, and this runtime has no compiler: it plays games packaged by `pen build`
+Error: …/game/game.meta is missing; package the game again with `pen build`
 
-Error: the precompiled game does not suit this runtime (it was made by another pen version, or for CPU features this machine lacks), and this runtime has no compiler to compile it again
+Error: the precompiled game does not suit this runtime; package it again with `pen build`
 Caused by:
     0: compilation settings of module incompatible with native host
     1: compilation setting "has_avx512dq" is enabled, but not available on the host
 ```
 
 (The second is a `game.cwasm` compiled with `--cpu x86-64-v4` on this Zen 2,
-which has no AVX-512.) A development build still compiles `game.wasm` again
-when `game.cwasm` does not suit it.
+which has no AVX-512.) A development bundle that includes `game.wasm` can still
+compile it again when `game.cwasm` does not suit it. A native-only package cannot.
 
 For the two builds to agree, the workspace's wasmtime dependency has only
 the features running a precompiled guest needs (`runtime`, `std`, `gc`,
@@ -131,7 +145,24 @@ few percent are within the noise:
 
 ## Sizes
 
-The runtime, with Steam, on Linux:
+The next cleanup on 2026-10-25 removes development commands and file watching
+from the player, removes host navigation (Spade/Robust), and drops the legacy
+Wasm/precompiled loading path. With the same optimization profile, the Linux
+player falls from 15.35 to 14.24 MB; the browser host from 1.86 to 1.78 MB.
+The same frozen gdev bundle packages to 39.44 MB (previously 40.55 MB), and
+its web export to 30.09 MB (previously 30.22 MB). Native game code and metadata
+are byte-identical, as are title, gameplay and restored-save screenshots.
+A 120-frame native/browser run also agrees on every packet and its final state.
+
+After removing Rapier on 2026-10-25, the Linux shipping player is 15.35 MB,
+down from 17.38 MB with the same optimization profile. The browser host's Wasm
+is 1.86 MB, down from 3.24 MB. On a controlled gdev asset snapshot, building
+grass recipes and opt-in coordinate precision bring the native package from
+43.94 to 40.55 MB (29.10 MB as tar + Zstd level 10), and the web export from
+33.95 to 30.22 MB including its precompressed variants. The native game's
+precompiled code is unchanged. These totals exclude unrelated gameplay edits.
+
+Earlier runtime measurements, with Steam, on Linux:
 
 | | Size |
 |---|---|
@@ -273,11 +304,13 @@ player runtime outgrows its budget, which CI's player job checks after
 building them; the game job checks the packaged game. A change that needs
 more raises the budget in the same change, saying why.
 
-The player budgets went from 16 and 13 MB to 19 and 15 MB when the
-simulation services (rapier, parry, nalgebra, spade), gamepads (gilrs),
-compressed textures, localization and netplay joined the runtime: about
-4.3 MB on each player. Leaving the simulation services out behind a feature
-would win back most of it, for games that don't call them.
+The player budgets historically went from 16 and 13 MB to 19 and 15 MB
+when simulation services, gamepads, compressed textures, localization and
+netplay joined the runtime. Rapier and its collider-query implementation have
+since been removed from both hosts, as have Spade and host navigation. Physics
+and navigation belong to guest libraries or plugins; their former service IDs
+now receive `unknown`. Noise remains available. The shipping optimization
+profile is unchanged.
 
 `just cold-start` (`scripts/cold-start.sh EXE MS [RUNS]`) starts a
 package's runtime headless five times as a player's first run does, with

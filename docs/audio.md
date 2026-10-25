@@ -7,6 +7,27 @@ nodes. README's "Sound" describes the graph. This page covers what sits on
 top of it: sounds placed in the world, streamed music, the output's latency,
 the dev tools' meters, loudness and captions.
 
+## Synthesized clips
+
+A catalog sound can be a `.sound` JSON recipe. `pen_sound: 1`, `rate`, `frames`,
+`crossfade`, `seed`, `peak` and `nodes` describe a mono loop. Nodes supply constants,
+normalized loop time, seeded noise, addition, subtraction, multiplication, sine,
+exponential and one-pole lowpass filters. References point to earlier nodes; the
+last node is the output. The decoder generates the crossfade tail, blends it into
+the beginning at equal power, then normalizes to `peak`. All timing, filter
+parameters and seeds belong to the game.
+
+The shared renderer runs once when the sound loads, on the native loader thread
+or into a browser AudioBuffer. It does no synthesis in the audio callback.
+Recipes are bounded to 60 seconds, 48 kHz, 128 nodes and 64 million node evaluations;
+invalid references, coefficients and nonfinite values are rejected. `pen check`
+validates them, and `pen loudness --normalize` changes only their peak. Existing
+captions, buses, looping, spatialization and save formats remain unchanged.
+
+For authored music, Ogg Opus usually offers a better loading-time tradeoff than
+reconstructing a score at runtime. A Blot catalog import currently names
+`wind.sound` as `sounds.wind_sound`.
+
 ## Sounds placed in the world
 
 A render packet may place voices and sounds in the world (`panners`) and say

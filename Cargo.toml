@@ -20,7 +20,7 @@ pen-protocol = { path = "crates/pen-protocol" }
 pen-render = { path = "crates/pen-render" }
 pen-simulation = { path = "crates/pen-simulation" }
 pen-texture = { path = "crates/pen-texture" }
-wgpu = "30"
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl", "webgpu"] }
 # What running a precompiled guest needs (externref lives on the GC heap;
 # `backtrace` names guest functions in traps). blot-host's `compiler`
 # feature adds Cranelift. Builds with and without it must agree on every

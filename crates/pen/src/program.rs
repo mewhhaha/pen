@@ -157,6 +157,7 @@ impl Program {
 
     /// Sends `operation` with `payload` and returns the response after its
     /// echoed operation lane.
+    #[cfg(feature = "compiler")]
     pub fn request(&mut self, operation: Operation, payload: &[f32]) -> Result<Vec<f32>> {
         self.send(operation, payload)?;
         Ok(self.response()?.into_lanes())

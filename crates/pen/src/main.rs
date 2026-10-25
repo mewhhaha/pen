@@ -5,10 +5,14 @@
 #![cfg_attr(all(windows, not(feature = "compiler")), windows_subsystem = "windows")]
 mod accessibility;
 mod app_bundle;
+#[cfg(feature = "compiler")]
 mod asset_graph;
+#[cfg(feature = "compiler")]
 mod asset_lint;
+#[cfg(feature = "compiler")]
 mod atlas;
 mod audio;
+#[cfg(feature = "compiler")]
 mod bench;
 #[cfg(feature = "compiler")]
 mod blot_test;
@@ -18,13 +22,16 @@ mod codec_round_trip;
 mod compiled;
 mod crash;
 mod delta;
+#[cfg(feature = "compiler")]
 mod dev;
 mod devlog;
 #[cfg(feature = "devtools")]
 mod devtools;
+#[cfg(feature = "compiler")]
 mod diverge;
 #[cfg(test)]
 mod fixtures;
+#[cfg(feature = "compiler")]
 mod fuzz;
 mod game;
 mod gamepad;
@@ -32,7 +39,9 @@ mod gamepad;
 mod gltf;
 mod input;
 mod logger;
+#[cfg(feature = "compiler")]
 mod loudness;
+#[cfg(feature = "devtools")]
 mod materials;
 mod mods;
 mod net;
@@ -41,14 +50,17 @@ mod new;
 #[cfg(feature = "compiler")]
 mod optimize;
 mod opus;
+#[cfg(feature = "compiler")]
 mod packets;
 mod patch;
+#[cfg(feature = "compiler")]
 mod pipeline;
 #[cfg(feature = "compiler")]
 mod plugin_build;
 mod presets;
 mod program;
 mod project;
+#[cfg(feature = "compiler")]
 mod publish;
 #[cfg(feature = "compiler")]
 mod push;
@@ -57,7 +69,9 @@ mod recording;
 #[cfg(feature = "devtools")]
 mod remote;
 mod reports;
+#[cfg(feature = "compiler")]
 mod reproducible;
+#[cfg(feature = "compiler")]
 mod review;
 mod saves;
 mod scene_assets;
@@ -66,6 +80,7 @@ mod services;
 mod session;
 mod snapshot;
 mod spectate;
+#[cfg(feature = "compiler")]
 mod staging;
 mod startup;
 #[cfg(feature = "steam")]
@@ -76,8 +91,11 @@ mod store;
 mod textures;
 mod timeline;
 mod tunables;
+#[cfg(feature = "compiler")]
 mod visual;
+#[cfg(feature = "compiler")]
 mod web;
+#[cfg(feature = "compiler")]
 mod web_export;
 mod workshop;
 
@@ -88,15 +106,19 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use blot_host::GuestModule;
+use pen_protocol::Catalog;
+#[cfg(feature = "compiler")]
+use pen_protocol::Viewport;
 use pen_protocol::boundary::read_catalog;
-use pen_protocol::{Catalog, Viewport};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-use crate::project::{Identity, Project};
+use crate::project::Identity;
+#[cfg(feature = "compiler")]
+use crate::project::Project;
 use crate::session::{Gpu, Options, Paths, Playback, Session};
 
 static IDENTITY: OnceLock<Identity> = OnceLock::new();
@@ -118,6 +140,7 @@ fn data_dir() -> PathBuf {
 }
 
 /// pen's caches, in the platform cache directory.
+#[cfg(feature = "compiler")]
 fn cache_dir() -> Option<PathBuf> {
     dirs::cache_dir().map(|directory| directory.join("pen"))
 }
@@ -125,9 +148,11 @@ fn cache_dir() -> Option<PathBuf> {
 /// What pen keeps in its cache directory, which `pen clean` deletes:
 /// compiled games, compiled plugins, what plugins run and keep, the GPU's
 /// compiled pipelines, what asset steps built, and tests' scratch files.
+#[cfg(feature = "compiler")]
 const CACHES: [&str; 7] = ["wasm", "components", "programs", "plugins", "pipelines", "assets", "tmp"];
 
 /// `pen clean`: deletes pen's caches, and nothing else there.
+#[cfg(feature = "compiler")]
 fn clean() -> Result<()> {
     let root = cache_dir().context("this system has no cache directory")?;
     let mut freed = 0;
@@ -148,57 +173,54 @@ fn clean() -> Result<()> {
 /// The game's module: `game.cwasm` when the package precompiled it for this
 /// runtime, else `game.wasm` compiled now (and cached).
 fn load_module(engine: &wasmtime::Engine, game: &Path, cache: bool, measure_systems: bool) -> Result<GuestModule> {
-    let path = game.join("game.wasm");
-    let wasm = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-    let cache = if cache { cache_dir().map(|directory| directory.join("wasm")) } else { None };
-    let started = Instant::now();
-    #[cfg(feature = "compiler")]
-    if let Some(path) = std::env::var_os("PEN_TRACE_SYSTEMS") {
-        let limit =
-            std::env::var("PEN_TRACE_LIMIT").ok().map(|value| value.parse::<u64>()).transpose()?.unwrap_or(1_000_000);
-        let trace = blot_host::SystemTrace::create(Path::new(&path), limit)?;
-        eprintln!("system trace: {} (up to {limit} events; summary on exit)", Path::new(&path).display());
-        return GuestModule::traced(engine, &wasm, cache.as_deref(), trace);
+    let metadata = game.join("game.meta");
+    if metadata.is_file() {
+        let started = Instant::now();
+        let manifest = project::Manifest::read(game)?.context("native game is missing its manifest")?;
+        ensure!(
+            manifest.runtime.as_deref() == Some(project::RUNTIME),
+            "this native game was built for another runtime; package it again with `pen build`"
+        );
+        let metadata = std::fs::read(&metadata)?;
+        let compiled = compiled::decode(&std::fs::read(game.join("game.cwasm"))?)?;
+        // SAFETY: both files ship with this executable and are written by `pen build`.
+        let module = unsafe { GuestModule::from_native(engine, &metadata, &compiled) }?;
+        eprintln!("game module ready in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+        startup::mark("program loaded");
+        return Ok(module);
+    }
+    #[cfg(not(feature = "compiler"))]
+    {
+        let _ = (cache, measure_systems);
+        bail!("{} is missing; package the game again with `pen build`", metadata.display())
     }
     #[cfg(feature = "compiler")]
-    if measure_systems && blot_host::read_abi(&wasm)?.function("main_trace").is_some() {
-        return GuestModule::traced(engine, &wasm, cache.as_deref(), blot_host::SystemTrace::live());
+    {
+        let path = game.join("game.wasm");
+        let wasm = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let cache = if cache { cache_dir().map(|directory| directory.join("wasm")) } else { None };
+        let started = Instant::now();
+        #[cfg(feature = "compiler")]
+        if let Some(path) = std::env::var_os("PEN_TRACE_SYSTEMS") {
+            let limit = std::env::var("PEN_TRACE_LIMIT")
+                .ok()
+                .map(|value| value.parse::<u64>())
+                .transpose()?
+                .unwrap_or(1_000_000);
+            let trace = blot_host::SystemTrace::create(Path::new(&path), limit)?;
+            eprintln!("system trace: {} (up to {limit} events; summary on exit)", Path::new(&path).display());
+            return GuestModule::traced(engine, &wasm, cache.as_deref(), trace);
+        }
+        #[cfg(feature = "compiler")]
+        if measure_systems && blot_host::read_abi(&wasm)?.function("main_trace").is_some() {
+            return GuestModule::traced(engine, &wasm, cache.as_deref(), blot_host::SystemTrace::live());
+        }
+        let _ = measure_systems;
+        let module = GuestModule::new(engine, &wasm, cache.as_deref())?;
+        eprintln!("game module ready in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+        startup::mark("program loaded");
+        Ok(module)
     }
-    let _ = measure_systems;
-    let cwasm = game.join("game.cwasm");
-    let precompiled = std::fs::read(&cwasm).ok();
-    // The runtime the package says it precompiled game.cwasm for, when not this one.
-    let foreign = project::Manifest::read(game)?
-        .and_then(|manifest| manifest.runtime)
-        .filter(|runtime| runtime != project::RUNTIME);
-    let module = match (precompiled, foreign) {
-        (Some(_), Some(runtime)) if !blot_host::COMPILER => bail!(
-            "{} was precompiled for a pen runtime of {runtime}, and this one is {}: package the game again \
-             with `pen build`",
-            cwasm.display(),
-            project::RUNTIME
-        ),
-        (Some(_), Some(runtime)) => {
-            eprintln!("{} was precompiled for another pen ({runtime}); compiling game.wasm", cwasm.display());
-            GuestModule::new(engine, &wasm, cache.as_deref())?
-        }
-        // SAFETY: game.cwasm ships in the same package as this executable,
-        // written by `pen build`.
-        (Some(precompiled), None) => unsafe {
-            let precompiled = compiled::decode(&precompiled).with_context(|| format!("reading {}", cwasm.display()))?;
-            GuestModule::with_precompiled(engine, &wasm, &precompiled, cache.as_deref())?
-        },
-        (None, _) if !blot_host::COMPILER => {
-            bail!(
-                "{} is missing, and this runtime has no compiler: it plays games packaged by `pen build`",
-                cwasm.display()
-            )
-        }
-        (None, _) => GuestModule::new(engine, &wasm, cache.as_deref())?,
-    };
-    eprintln!("game module ready in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
-    startup::mark("program loaded");
-    Ok(module)
 }
 
 /// What the window needs to start a session once it exists.
@@ -392,6 +414,7 @@ fn packaged_game() -> Option<PathBuf> {
 struct CommandSpec {
     name: &'static str,
     operands: &'static str,
+    #[cfg(feature = "compiler")]
     checkout: bool,
     about: &'static str,
 }
@@ -418,7 +441,8 @@ struct OptionSpec {
     about: &'static str,
 }
 
-const COMMANDS: [CommandSpec; 27] = [
+#[cfg(feature = "compiler")]
+const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "tool",
         operands: "NAME [ARGS...]",
@@ -608,6 +632,10 @@ const COMMANDS: [CommandSpec; 27] = [
                 frame), and print the answer",
     },
 ];
+
+#[cfg(not(feature = "compiler"))]
+const COMMANDS: &[CommandSpec] =
+    &[CommandSpec { name: "apply", operands: "PATCH [DIR]", about: "apply a package update" }];
 
 /// Playing: a packaged game, `dev` and `run`.
 const PLAY: &[&str] = &["", "dev", "run"];
@@ -1337,6 +1365,7 @@ const OPTIONS: [OptionSpec; 102] = [
 ];
 
 /// Every variable of the environment pen reads, and what it does.
+#[cfg(feature = "compiler")]
 const ENVIRONMENT: [(&str, &str); 38] = [
     ("PEN_PRESENT_MODE=MODE", "auto-vsync (the default), auto-no-vsync, fifo, fifo-relaxed, immediate or mailbox"),
     ("PEN_SOFTWARE=1", "as --software"),
@@ -1461,6 +1490,7 @@ fn listed(names: &[String]) -> String {
     }
 }
 
+#[cfg(feature = "compiler")]
 fn usage() -> String {
     let mut text = String::from(
         "usage: pen [COMMAND] [OPTIONS]  (pen --help: this; pen --version)\n\n\
@@ -1518,6 +1548,23 @@ fn usage() -> String {
          package keeps them in game/game.json. A panic, or an error that stops a package's runtime, writes\n\
          a crash report to crashes/ in the data directory (or --data DIR).",
     );
+    text
+}
+
+#[cfg(not(feature = "compiler"))]
+fn usage() -> String {
+    let mut text = String::from(
+        "usage: GAME [OPTIONS]\n\nPlays game/ beside this executable, or --game DIR.\nDevelopment commands require the full pen CLI.\n\n",
+    );
+    for command in COMMANDS {
+        entry(&mut text, &format!("  {} {}", command.name, command.operands), command.about);
+    }
+    text.push_str("\nPlayback options:\n");
+    for option in OPTIONS.iter().filter(|option| {
+        option.commands.is_empty() || (option.place != Place::Command && option.commands.contains(&""))
+    }) {
+        entry(&mut text, format!("  {} {}", option.name, option.value).trim_end(), option.about);
+    }
     text
 }
 
@@ -1718,10 +1765,12 @@ impl Game {
     }
 
     /// A checkout's game, compiled into its `.pen/runtime`.
+    #[cfg(feature = "compiler")]
     fn checkout(project: &Project) -> Game {
         Game { directory: project.native(), assets: project.assets(), scene: Some(project.scene()) }
     }
 
+    #[cfg(feature = "compiler")]
     fn scene_to_start(&self) -> PathBuf {
         self.scene.clone().unwrap_or_else(|| self.directory.join("main.scene"))
     }
@@ -1733,6 +1782,7 @@ fn bundle_directory(args: &Args) -> Result<PathBuf> {
     if let Some(directory) = args.path("--game").or_else(packaged_game) {
         return Ok(directory);
     }
+    #[cfg(feature = "compiler")]
     match std::env::current_dir().ok().and_then(|directory| Project::around(&directory)) {
         Some(root) => bail!(
             "there is no packaged game here: in the checkout at {}, `pen dev` or `pen run` plays its game \
@@ -1744,10 +1794,13 @@ fn bundle_directory(args: &Args) -> Result<PathBuf> {
              package) or --game DIR; in a checkout, `pen dev` or `pen run` (pen --help)"
         ),
     }
+    #[cfg(not(feature = "compiler"))]
+    bail!("there is no game/ folder beside this player; pass --game DIR or package with `pen build`")
 }
 
 /// Says which of a script's `tune=` steps name no tunable of the checkout's
 /// `src/tunables.json`: the game would take them and change nothing.
+#[cfg(feature = "compiler")]
 fn check_tunes(steps: &[script::Step], root: &Path) {
     let names: Vec<&str> = steps
         .iter()
@@ -1779,6 +1832,7 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
     let overlay_shot = args.path("--overlay-shot");
     let record = args.path("--record");
     let script = args.script.clone();
+    #[cfg(feature = "compiler")]
     if let Some(root) = checkout {
         check_tunes(&script, root);
     }
@@ -1976,13 +2030,9 @@ fn new_game(args: &Args) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "compiler"))]
-fn new_game(_: &Args) -> Result<()> {
-    bail!("this player runtime makes no games; use a full pen build")
-}
-
 /// The commands that work over the network, which need no checkout: none
 /// for another command.
+#[cfg(feature = "compiler")]
 fn network(args: &Args) -> Option<Result<()>> {
     #[cfg(feature = "compiler")]
     let token = || args.value("--token").or_else(|| std::env::var("PEN_PUSH_TOKEN").ok());
@@ -2082,6 +2132,7 @@ fn game_event(root: Option<&Path>, name: &str, values: &[f32]) -> Result<(u32, V
 /// One of the game's own sections, as `pen packets` writes it: by its
 /// declaration in the `pen.json` of the checkout at `root` (its name and
 /// records) when it has one, else by its tag and lanes.
+#[cfg(feature = "compiler")]
 fn section_describer(root: Option<&Path>) -> Result<impl Fn(&pen_protocol::Extension) -> serde_json::Value> {
     #[cfg(feature = "compiler")]
     let declarations = match root {
@@ -2116,11 +2167,44 @@ fn asset_tool(args: &Args) -> Result<()> {
     textures::font(&source, args.path("--out"), options)
 }
 
+/// Shipping entrypoint: playback and applying a package update. Development
+/// commands are compiled only into the CLI.
 #[cfg(not(feature = "compiler"))]
-fn asset_tool(args: &Args) -> Result<()> {
-    bail!("this player runtime has no {} tool", args.command)
+fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
+    let mut args = Args::parse(words)?;
+    if args.flag("--help") {
+        println!("{}", usage());
+        return Ok(());
+    }
+    if args.flag("--version") {
+        println!("pen {} (game runtime: {})", env!("CARGO_PKG_VERSION"), project::RUNTIME);
+        return Ok(());
+    }
+    if args.command == "apply" {
+        let package = args
+            .operands
+            .get(1)
+            .map(PathBuf::from)
+            .or_else(|| packaged_game().and_then(|game| game.parent().map(Path::to_owned)))
+            .context("there is no package beside this executable: apply PATCH DIR")?;
+        let version = patch::apply(Path::new(&args.operands[0]), &package)?;
+        eprintln!("{} is now version {version}", package.display());
+        return Ok(());
+    }
+    ensure!(args.command.is_empty(), "{} is a development command; use the full pen CLI", args.command);
+    let directory = bundle_directory(&args)?;
+    let _ = IDENTITY.set(project::bundle_identity(&directory)?);
+    script::name_game_events(&mut args.script, &|name, values| game_event(None, name, values))?;
+    crash::install(args.path("--data"));
+    if args.flag("--headless") {
+        crash::unattended();
+    }
+    reports::install(&directory, args.path("--data").unwrap_or_else(data_dir));
+    let software = args.flag("--software") || env_flag("PEN_SOFTWARE");
+    play(&args, Game::bundle(&args, directory), false, packaged_game().is_some(), None, software)
 }
 
+#[cfg(feature = "compiler")]
 fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
     let mut args = Args::parse(words)?;
     if args.flag("--help") {
@@ -2386,8 +2470,8 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             let runs: usize = args.number("--runs")?.unwrap_or(1);
             ensure!(runs > 0, "--runs takes 1 or more");
             let measured = (0..runs).map(|_| run(None)).collect::<Result<Vec<_>>>()?;
-            let wasm = std::fs::read(game.directory.join("game.wasm"))?;
-            let results = bench::results(&wasm, load_ms, &measured)?;
+            let mut results = bench::results(&[], load_ms, &measured)?;
+            results.game = format!("{:016x}", project::game_fingerprint(&game.directory)?);
             if args.flag("--json") {
                 println!("{}", serde_json::to_string_pretty(&results)?);
             }
@@ -2525,12 +2609,7 @@ fn import_gltf(args: &Args) -> Result<()> {
     gltf::import(Path::new(&args.operands[0]), &out, &options)
 }
 
-#[cfg(not(feature = "compiler"))]
-fn import_gltf(_: &Args) -> Result<()> {
-    bail!("this player runtime has no asset importer")
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "compiler"))]
 mod tests {
     use super::*;
 
@@ -2672,5 +2751,32 @@ mod tests {
         assert_eq!(distance("", "abc"), 3);
         assert_eq!(suggestion("--frame", ["--fps", "--frames"].into_iter()), " (did you mean --frames?)");
         assert_eq!(suggestion("--bogus", ["--fps", "--frames"].into_iter()), "");
+    }
+}
+
+#[cfg(all(test, not(feature = "compiler")))]
+mod player_tests {
+    use super::*;
+
+    #[test]
+    fn player_accepts_playback_and_updates_but_no_development_commands() {
+        for command in ["assets", "dev", "web", "build", "loudness", "fuzz", "patch"] {
+            assert!(Args::parse([command.to_owned()]).is_err(), "{command}");
+        }
+        assert!(Args::parse(["apply".into(), "update.penpatch".into()]).is_ok());
+        assert!(Args::parse(["--headless".into(), "--frames".into(), "1".into()]).is_ok());
+        assert!(!usage().contains("asset recipes"));
+    }
+
+    #[test]
+    fn player_requires_current_native_metadata() {
+        let root = project::temporary_dir().unwrap().join(format!("player-legacy-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("game.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(root.join("game.cwasm"), b"old artifact must not be read").unwrap();
+        let error = load_module(&blot_host::engine().unwrap(), &root, false, false).err().unwrap();
+        assert!(error.to_string().contains("game.meta"), "{error:#}");
+        assert!(error.to_string().contains("pen build"), "{error:#}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

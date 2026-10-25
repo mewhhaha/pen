@@ -1403,7 +1403,7 @@ pub mod codec {
     pub const MAX_DECALS: usize = 4096;
     pub const MAX_SOUNDS: usize = 256;
     pub const MAX_SPRITES: usize = 65536;
-    pub const MAX_INSETS: usize = 16;
+    pub const MAX_INSETS: usize = 64;
     pub const MAX_FIELD_PATCHES: usize = 4096;
     /// The widest or tallest field.
     pub const MAX_FIELD: usize = 4096;

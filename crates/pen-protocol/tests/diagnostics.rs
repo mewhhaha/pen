@@ -175,3 +175,21 @@ fn every_truncation_and_hostile_numeric_mutation_is_safe() {
         }
     }
 }
+
+#[test]
+fn populated_shop_and_stash_frames_accept_more_than_sixteen_model_views() {
+    for count in [17, 32, MAX_INSETS] {
+        let mut packet = fixtures::blank();
+        packet[lanes::header::INSET_COUNT] = count as f32;
+        packet.resize(PACKET_HEADER_FLOATS + INSET_FLOATS * count, 0.0);
+        let decoded = decode_frame(&packet, 1, &fixtures::catalog()).unwrap();
+        assert_eq!(decoded.render.insets.len(), count);
+        let mut reused = pen_protocol::RenderFrame::default();
+        decode_into(&packet, 1, &fixtures::catalog(), &mut reused).unwrap();
+        assert_eq!(reused.insets.len(), count);
+    }
+    let mut packet = fixtures::blank();
+    packet[lanes::header::INSET_COUNT] = MAX_INSETS as f32 + 1.0;
+    let error = decode_frame(&packet, 1, &fixtures::catalog()).err().unwrap();
+    assert_eq!(error.downcast_ref::<FrameDiagnostic>().unwrap().path, "header.inset_count");
+}

@@ -10,12 +10,20 @@
 //! by their digests (a step's outputs, a package version's files). Writes
 //! go through `tmp/` and are renamed into place, so a reader never sees half
 //! a file, and two writers of the same blob write the same bytes.
+#[cfg(any(feature = "compiler", test))]
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(feature = "compiler", test))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+#[cfg(any(feature = "compiler", test))]
+use std::time::Duration;
+use std::time::SystemTime;
 
-use anyhow::{Context, Result, bail, ensure};
+#[cfg(any(feature = "compiler", test))]
+use anyhow::bail;
+use anyhow::{Context, Result, ensure};
+#[cfg(any(feature = "compiler", test))]
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest as _, Sha256};
@@ -68,12 +76,14 @@ impl<'de> Deserialize<'de> for Digest {
 }
 
 /// The digest and size of a file's content, read in pieces.
+#[cfg(any(feature = "compiler", test))]
 pub fn digest_file(path: &Path) -> Result<(Digest, u64)> {
     let file = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     hash_into(file, std::io::sink()).with_context(|| format!("reading {}", path.display()))
 }
 
 /// Copies `from` into `to`, hashing what passes.
+#[cfg(any(feature = "compiler", test))]
 fn hash_into(mut from: impl Read, mut to: impl Write) -> std::io::Result<(Digest, u64)> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0; 1 << 16];
@@ -102,6 +112,7 @@ fn unique(prefix: &str) -> String {
 
 /// Renames `from` to `to`; another writer having put the same blob there
 /// first (Windows will not rename over it) is as good.
+#[cfg(any(feature = "compiler", test))]
 fn rename_into(from: &Path, to: &Path) -> Result<()> {
     match std::fs::rename(from, to) {
         Ok(()) => Ok(()),
@@ -131,10 +142,12 @@ pub fn write_atomically(to: &Path, write: impl FnOnce(&mut std::fs::File) -> Res
     }
 }
 
+#[cfg(any(feature = "compiler", test))]
 pub struct Store {
     root: PathBuf,
 }
 
+#[cfg(any(feature = "compiler", test))]
 impl Store {
     /// The store in `root`, made if it is not there.
     pub fn open(root: &Path) -> Result<Store> {
@@ -340,6 +353,7 @@ impl Store {
 }
 
 /// Every digest a record names: its strings of 64 hex digits.
+#[cfg(any(feature = "compiler", test))]
 fn digests(value: &serde_json::Value, found: &mut std::collections::HashSet<String>) {
     match value {
         serde_json::Value::String(text) if Digest::parse(text).is_ok() => {

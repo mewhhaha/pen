@@ -3,4 +3,4 @@
 import * as program from "pen/program"
 import { game } from "./game"
 
-entry const main = fn host => program.run game host
+entry const main = func host => return program.run game host

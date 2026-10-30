@@ -21,7 +21,7 @@ const evidence = [];
 async function settled(page) {
   for (let attempt = 0; ; attempt++) {
     try {
-      await page.waitForFunction(() => document.querySelector('#status')?.textContent === ''
+      await page.waitForFunction(() => document.querySelector('$status')?.textContent === ''
         && document.querySelector('canvas')?.getAttribute('aria-busy') === 'false', null, { timeout: 120000 });
       break;
     } catch (error) {

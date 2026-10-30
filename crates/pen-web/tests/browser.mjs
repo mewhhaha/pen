@@ -23,7 +23,7 @@ try {
   url.searchParams.set('qualify', '');
   await page.goto(url.href, { waitUntil: 'networkidle' });
   console.log('page loaded');
-  await page.waitForFunction(() => document.querySelector('#status')?.textContent === '', null, { timeout: 60000 });
+  await page.waitForFunction(() => document.querySelector('$status')?.textContent === '', null, { timeout: 60000 });
   await page.waitForFunction(() => document.querySelector('canvas')?.getAttribute('aria-busy') === 'false', null, { timeout: 120000 });
   console.log('renderer settled');
   await page.screenshot({ path: `${shots}/game.png` });
@@ -78,14 +78,14 @@ try {
   if (backing[0] !== 960 || backing[1] !== 640) throw new Error(`devicePixelRatio 2 backs a 480x320 canvas with ${backing.join('x')}`);
   await dense.screenshot({ path: `${shots}/dense.png` });
   await dense.close();
-  const status = await page.locator('#status').textContent();
+  const status = await page.locator('$status').textContent();
   await writeFile(`${shots}/evidence.json`, JSON.stringify({ status, messages }, null, 2));
   if (status || messages.some(m => m.type === 'pageerror' || m.type === 'error')) {
     throw new Error(`browser verification failed: ${JSON.stringify({ status, errors: messages.filter(m => m.type === 'error' || m.type === 'pageerror').slice(0, 4) })}`);
   }
   console.log(`Browser game, Blot console, diagnostics, resize and a dense display captured in ${shots}`);
 } catch (error) {
-  const status = await page?.locator('#status').textContent().catch(() => 'unresponsive');
+  const status = await page?.locator('$status').textContent().catch(() => 'unresponsive');
   await writeFile(`${shots}/evidence.json`, JSON.stringify({ status, messages, failure: String(error) }, null, 2));
   await page?.screenshot({ path: `${shots}/failure.png`, timeout: 10000 }).catch(() => {});
   throw error;

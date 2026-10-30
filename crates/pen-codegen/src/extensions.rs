@@ -266,7 +266,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
     let snake = |name: &str| crate::model::snake(name);
     let mut out = header.to_vec();
     out.extend(
-        "//\n// The game's own events and render sections, which its pen.json declares\n// under `protocol`, beside pen's. Its `main` serves it with `run` here.\nimport * as array from \"std/array\"\nimport * as lanes from \"./lanes\"\nimport * as program from \"./program\"\nimport * as protocol from \"./protocol\"\nimport * as render from \"./protocol_render\"\nimport * as types from \"./types\""
+        "//\n// The game's own events and render sections, which its pen.json declares\n// under `protocol`, beside pen's. Its owner-aware host serves these packets.\nimport * as array from \"std/array\"\nimport * as lanes from \"./lanes\"\nimport * as protocol from \"./protocol\"\nimport * as types from \"./types\""
             .lines()
             .map(str::to_owned),
     );
@@ -283,10 +283,10 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
         }
     }
     out.push("type Event is data =".to_owned());
-    out.push("  | #Pen protocol.Event".to_owned());
+    out.push("  | $Pen protocol.Event".to_owned());
     for event in &declarations.events {
         if event.fields.is_empty() {
-            out.push(format!("  | #{}", event.name));
+            out.push(format!("  | ${}", event.name));
         } else {
             let fields = event
                 .fields
@@ -294,12 +294,12 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
                 .map(|(name, kind)| format!("{name}: {}", kind.blot_type()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            out.push(format!("  | #{} {{ {fields} }}", event.name));
+            out.push(format!("  | ${} {{ {fields} }}", event.name));
         }
     }
     out.push(String::new());
     out.push(
-        "type Input is data = #Input { elapsed: F32, width: F32, height: F32, events: Array Event, state: Array F32 }"
+        "type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: &[Event], state: &[F32] }"
             .to_owned(),
     );
     out.push(String::new());
@@ -307,9 +307,9 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
         "An event's lanes from `start`: one of pen's, or one of the game's, which travels as pen's Game event: \
          its tag, then its values in the lanes after, those it has no field for zero.",
     ));
-    out.push("const decode_event = fn (values: Array F32) => fn (start: U32) => do:".to_owned());
+    out.push("const decode_event = func (values: Array F32) => return func (start: U32) => return do:".to_owned());
     out.push("  if values[start] != U32.to_f32 protocol.game_tag:".to_owned());
-    out.push("    return #Pen (protocol.decode_event values start)".to_owned());
+    out.push("    return $Pen (protocol.decode_event values start)".to_owned());
     out.push("  let tag = lanes.integer values[start + 1] protocol.max_extension_tag".to_owned());
     out.push("  let lanes_after = #[values[start + 2], values[start + 3], values[start + 4]]".to_owned());
     out.push("  return case tag of".to_owned());
@@ -333,16 +333,16 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             })
             .collect::<Vec<_>>();
         if fields.is_empty() {
-            out.push(format!("      return #{}", event.name));
+            out.push(format!("      return ${}", event.name));
         } else {
-            out.push(format!("      return #{} {{ {} }}", event.name, fields.join(", ")));
+            out.push(format!("      return ${} {{ {} }}", event.name, fields.join(", ")));
         }
     }
     out.push("    _ => @panic \"unknown game event\"".to_owned());
     out.push(String::new());
-    out.extend(comment("The input packet, as protocol.decode_input reads it, with the game's own events."));
+    out.extend(comment("The input packet, as protocol.decode_input_into reads it, with the game's own events."));
     out.extend(
-        "const decode_input = fn (values: Array F32) => do:\n  use lanes.require (values.length >= protocol.frame_header_floats)\n  use lanes.finite values\n  let elapsed = values[0]\n  use lanes.require (elapsed >= 0.0)\n  let width = values[1]\n  let height = values[2]\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)\n  let event_count = lanes.integer values[3] protocol.max_events\n  let state_count = lanes.integer values[4] protocol.max_state_floats\n  let state_start = protocol.frame_header_floats + event_count * protocol.event_floats\n  use lanes.require (values.length == state_start + state_count)\n  return #Input {\n    state: array.slice state_start state_count values,\n    elapsed, width, height,\n    events: array.generate event_count (fn index => decode_event values (protocol.frame_header_floats + index * protocol.event_floats)),\n  }"
+        "const decode_input_into = func (values: Array F32) -> (events: ResizeArray Event) => return do:\n  use lanes.require (values.length >= protocol.frame_header_floats)\n  use lanes.finite values\n  let elapsed = values[0]\n  use lanes.require (elapsed >= 0.0)\n  let width = values[1]\n  let height = values[2]\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)\n  let event_count = lanes.integer values[3] protocol.max_events\n  let state_count = lanes.integer values[4] protocol.max_state_floats\n  let state_start = protocol.frame_header_floats + event_count * protocol.event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (protocol.frame_header_floats + index * protocol.event_floats))\n  return $Input {\n    state: &values[state_start..state_start + state_count],\n    elapsed, width, height,\n    events: &events[0..events.length],\n  }"
             .lines()
             .map(str::to_owned),
     );
@@ -359,7 +359,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             .map(|(name, kind)| format!("{name}: {}", kind.blot_type()))
             .collect::<Vec<_>>()
             .join(", ");
-        out.push(format!("type {} is data = #{} {{ {fields} }}", section.name, section.name));
+        out.push(format!("type {} is data = ${} {{ {fields} }}", section.name, section.name));
         out.push(format!("const {name}_floats = {}", section.fields.len()));
         let lanes = section
             .fields
@@ -372,31 +372,11 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         out.extend(comment(&format!("The section of these {}s, for the frame's extensions.", section.name)));
-        out.push(format!("const encode_{name} = fn (records: Array {}) => #types.Extension {{", section.name));
+        out.push(format!("const encode_{name} = func (records: Array {}) => return $types.Extension {{", section.name));
         out.push(format!("  tag: {name}_tag,"));
-        out.push(format!("  values: array.flatten #[#[{lanes}] | record <- records],"));
+        out.push(format!("  values: #[lane | record <- records, lane <- #[{lanes}]],"));
         out.push("}".to_owned());
     }
-    out.push(String::new());
-    out.extend(comment(
-        "One frame through pen's packets with the game's own: `step` takes a world and the input, and returns \
-         the next world, the frame to draw and the game's sections (each from its encode_ function).",
-    ));
-    out.extend(
-        "const step_packets = fn step => fn world => fn (payload: Array F32) => do:\n  let (next, drawn, extensions) = step world (decode_input payload)\n  return (next, array.concat (render.encode_render drawn) (render.encode_extensions extensions))"
-            .lines()
-            .map(str::to_owned),
-    );
-    out.push(String::new());
-    out.extend(comment(
-        "program.run with the game's own events and sections: `game` has program.run's schema, create, save \
-         and restore, and step_packets' `step`.",
-    ));
-    out.extend(
-        "const run = fn game => fn host => program.serve {\n  schema: game.schema,\n  create: game.create,\n  frame: step_packets game.step,\n  save: game.save,\n  restore: game.restore,\n} host"
-            .lines()
-            .map(str::to_owned),
-    );
     out.push(String::new());
     out.join("\n")
 }
@@ -481,14 +461,13 @@ mod tests {
         let source = emit(&declarations(), &["// header".to_owned()]);
         for expected in [
             "const kick_tag = 1",
-            "  | #Pen protocol.Event",
-            "  | #Kick { x: F32, z: F32 }",
-            "  | #Reset",
-            "    1 => do:\n      use lanes.require (lanes_after[2] == 0.0)\n      return #Kick { x: lanes_after[0], z: lanes_after[1] }",
-            "return #Hire { count: lanes.integer lanes_after[0] lanes.max_integer, skilled: lanes.integer lanes_after[1] 1 == 1, pay: lanes_after[2] }",
-            "type Score is data = #Score { points: U32, multiplier: F32, over: Bool }",
-            "  values: array.flatten #[#[from record.points, record.multiplier, lanes.bit record.over] | record <- records],",
-            "const run = fn game => fn host => program.serve {",
+            "  | $Pen protocol.Event",
+            "  | $Kick { x: F32, z: F32 }",
+            "  | $Reset",
+            "    1 => do:\n      use lanes.require (lanes_after[2] == 0.0)\n      return $Kick { x: lanes_after[0], z: lanes_after[1] }",
+            "return $Hire { count: lanes.integer lanes_after[0] lanes.max_integer, skilled: lanes.integer lanes_after[1] 1 == 1, pay: lanes_after[2] }",
+            "type Score is data = $Score { points: U32, multiplier: F32, over: Bool }",
+            "  values: #[lane | record <- records, lane <- #[from record.points, record.multiplier, lanes.bit record.over]],",
         ] {
             assert!(source.contains(expected), "missing {expected:?} in\n{source}");
         }

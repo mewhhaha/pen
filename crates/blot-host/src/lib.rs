@@ -20,6 +20,7 @@ mod system_trace;
 mod tasks;
 #[cfg(feature = "compiler")]
 mod trace_instrument;
+pub mod worker_sessions;
 pub mod workers;
 pub use system_trace::SystemTrace;
 

@@ -562,9 +562,7 @@ pub(crate) mod tests {
     fn javascript_stacks_give_their_wasm_frames() {
         // As V8 (node 24, crates/pen-web/tests/guest.mjs) gives it, then an
         // unnamed frame and a JavaScript one.
-        let v8 = "RuntimeError: unreachable\n    at game.explode (wasm://wasm/18c8452e:wasm-function[6]:0x140)\n    \
-                  at game.main (wasm://wasm/18c8452e:wasm-function[1]:0xfe)\n    \
-                  at wasm://wasm/18c8452e:wasm-function[12]:0x1a2b\n    at async next (http://localhost/guest.js:40:5)";
+        let v8 = "RuntimeError: unreachable\n    at game.explode (wasm://wasm/18c8452e:wasm-function[6]:0x140)\n    \\n                  at game.main (wasm://wasm/18c8452e:wasm-function[1]:0xfe)\n    \\n                  at wasm://wasm/18c8452e:wasm-function[12]:0x1a2b\n    at async next (http://localhost/guest.js:40:5)";
         assert_eq!(
             js_frames(v8),
             [
@@ -573,8 +571,7 @@ pub(crate) mod tests {
                 Frame { function: 12, offset: Some(0x1a2b) }
             ]
         );
-        let firefox = "game.update@http://localhost/pen_web.js line 2 > WebAssembly.instantiate:wasm-function[3]:0x42\n\
-                       next@http://localhost/guest.js:40:5";
+        let firefox = "game.update@http://localhost/pen_web.js line 2 > WebAssembly.instantiate:wasm-function[3]:0x42\n\\n                       next@http://localhost/guest.js:40:5";
         assert_eq!(js_frames(firefox), [Frame { function: 3, offset: Some(0x42) }]);
         assert_eq!(js_frames("at wasm-function[9]"), [Frame { function: 9, offset: None }]);
     }

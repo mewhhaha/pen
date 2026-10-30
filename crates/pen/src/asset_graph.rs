@@ -554,8 +554,7 @@ mod tests {
                 {"recipe": "first", "sources": ["a.txt"], "outputs": ["out/palette.txt", "out/first.txt"]},
                 {"recipe": "second", "sources": ["b.txt"], "outputs": ["out/palette.txt"]}
             ]}"#,
-            "first:\n  mkdir -p out\n  echo first > out/palette.txt\n  cp a.txt out/first.txt\n\n\
-             second:\n  mkdir -p out\n  echo second > out/palette.txt\n",
+            "first:\n  mkdir -p out\n  echo first > out/palette.txt\n  cp a.txt out/first.txt\n\n\\n             second:\n  mkdir -p out\n  echo second > out/palette.txt\n",
         );
         std::fs::write(root.join("a.txt"), "a").unwrap();
         std::fs::write(root.join("b.txt"), "b").unwrap();
@@ -582,8 +581,7 @@ mod tests {
                 {"recipe": "shout", "sources": ["models/*.txt"], "outputs": ["out/shout.txt"]},
                 {"recipe": "twice", "sources": ["out/shout.txt"], "outputs": ["out/twice.txt"]}
             ]}"#,
-            "shout:\n  mkdir -p out\n  tr a-z A-Z < models/word.txt > out/shout.txt\n  echo ran >> runs.log\n\n\
-             twice:\n  cat out/shout.txt out/shout.txt > out/twice.txt\n  echo ran >> runs.log\n",
+            "shout:\n  mkdir -p out\n  tr a-z A-Z < models/word.txt > out/shout.txt\n  echo ran >> runs.log\n\n\\n             twice:\n  cat out/shout.txt out/shout.txt > out/twice.txt\n  echo ran >> runs.log\n",
         );
         std::fs::create_dir_all(root.join("models")).unwrap();
         std::fs::write(root.join("models/word.txt"), "salt\n").unwrap();

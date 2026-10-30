@@ -123,6 +123,8 @@ pub(crate) struct Material {
     pub overlay: bool,
     /// The frame's aberration splits this material's colors on screen.
     pub aberration: bool,
+    /// Sprite pass over the processed scene, before camera effects and UI.
+    pub scene_filter: bool,
     /// The frame's decals lie on this material's surfaces.
     pub decals: bool,
     /// A lit, opaque material casts a shadow unless this is false.
@@ -558,6 +560,7 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
     let overlay = flag("overlay", false)?;
     let blend = flag("blend", false)?;
     let aberration = flag("aberration", false)?;
+    let scene_filter = flag("scene_filter", false)?;
     let decals = flag("decals", false)?;
     let shadow = flag("shadow", true)?;
     let alpha_cutoff = match material.get("alphaCutoff") {
@@ -580,6 +583,7 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
         alpha_cutoff,
         overlay,
         aberration,
+        scene_filter,
         decals,
         shadow,
     })

@@ -5,8 +5,8 @@ import * as protocol from "pen/protocol"
 import * as protocol_render from "pen/protocol_render"
 
 // An input packet, decoded as the game decodes one, then walked.
-entry const input_round_trip = fn (lanes: Array F32) => canonical.canonical_input (protocol.decode_input lanes)
+entry const input_round_trip = func (lanes: Array F32) => return canonical.canonical_input (protocol.decode_input lanes)
 
 // A render frame's walk, read back into the record the game encodes, then
 // encoded as the game encodes one.
-entry const render_round_trip = fn (lanes: Array F32) => protocol_render.encode_render (canonical.render_from_canonical lanes)
+entry const render_round_trip = func (lanes: Array F32) => return protocol_render.encode_render (canonical.render_from_canonical lanes)

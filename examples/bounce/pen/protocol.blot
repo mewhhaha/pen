@@ -29,7 +29,7 @@ const max_solid_faces = 64
 const max_decals = 4096
 const max_sounds = 256
 const max_sprites = 65536
-const max_insets = 16
+const max_insets = 64
 const max_field_patches = 4096
 // The widest or tallest field.
 const max_field = 4096
@@ -100,6 +100,8 @@ const engine_preferences = 64
 // The most panners one frame may declare: one for each voice and sound it may
 // have.
 const max_panners = 512
+const max_instances = 100000
+const max_instance_removals = 100000
 
 // Version-1 native session test commands. Available only to a separate test
 // guest in pen test-blot --session.
@@ -769,7 +771,7 @@ const reports_op_queued = 2
 
 // Sizes in lanes.
 const packet_magic = 4670534.0
-const packet_header_floats = 146
+const packet_header_floats = 151
 const frame_header_floats = 5
 const event_floats = 5
 const extensions_marker = 5260632.0
@@ -791,6 +793,8 @@ const emitter_floats = 42
 const light_floats = 12
 const listener_floats = 9
 const panner_floats = 15
+const instance_floats = 26
+const instance_removal_floats = 2
 
 // Where each header lane and record field starts.
 const header_magic_lane = 0
@@ -860,6 +864,11 @@ const header_listener_count_lane = 142
 const header_panner_count_lane = 143
 const header_loading_lane = 144
 const header_show_captions_lane = 145
+const header_retained_enabled_lane = 146
+const header_retained_reset_lane = 147
+const header_retained_after_lane = 148
+const header_instance_count_lane = 149
+const header_instance_removal_count_lane = 150
 const draw_mesh_lane = 0
 const draw_material_lane = 1
 const draw_transform_lane = 2
@@ -957,6 +966,15 @@ const panner_rolloff_lane = 11
 const panner_cone_inner_lane = 12
 const panner_cone_outer_lane = 13
 const panner_cone_outer_gain_lane = 14
+const instance_id_low_lane = 0
+const instance_id_high_lane = 1
+const instance_order_lane = 2
+const instance_mesh_lane = 3
+const instance_material_lane = 4
+const instance_transform_lane = 5
+const instance_parameters_lane = 21
+const instance_removal_id_low_lane = 0
+const instance_removal_id_high_lane = 1
 const solid_faces_lane = 0
 const field_patch_material_lane = 0
 const field_patch_width_lane = 1
@@ -1064,40 +1082,40 @@ const key_meta = 1114883
 
 // The events the host sends, as their lanes hold them.
 type Event is data =
-  | #KeyDown U32
-  | #KeyUp U32
-  | #PointerDown { button: U32, x: F32, y: F32 }
-  | #PointerUp { button: U32, x: F32, y: F32 }
-  | #PointerMove { x: F32, y: F32 }
-  | #Wheel { x: F32, y: F32, delta: F32 }
-  | #FocusLost
-  | #AssetChanged
-  | #Console { command: U32, argument: U32 }
-  | #Preference { index: U32, value: F32 }
-  | #Tune { index: U32, value: F32 }
-  | #UiAction { node: U32, action: U32, value: F32 }
-  | #ServiceAnswer { request: U32, status: U32, value: F32, length: U32 }
-  | #ServiceData { request: U32, a: F32, b: F32, c: F32 }
-  | #GamepadConnected { pad: U32, standard: U32 }
-  | #GamepadDisconnected { pad: U32 }
-  | #GamepadButton { button: U32, pad: U32, value: F32, pressed: U32 }
-  | #GamepadAxis { axis: U32, pad: U32, value: F32 }
-  | #Action { action: U32, value: F32, device: U32 }
-  | #TextInput { character: U32, composing: U32 }
-  | #Composition { length: U32, cursor: U32 }
-  | #MouseMotion { dx: F32, dy: F32 }
-  | #Touch { id: U32, x: F32, y: F32, phase: U32 }
-  | #Pan { touches: U32, dx: F32, dy: F32 }
-  | #Pinch { x: F32, y: F32, scale: F32 }
-  | #Player { index: U32 }
-  | #SessionStarted { restored: U32 }
-  | #RendererReady
+  | $KeyDown U32
+  | $KeyUp U32
+  | $PointerDown { button: U32, x: F32, y: F32 }
+  | $PointerUp { button: U32, x: F32, y: F32 }
+  | $PointerMove { x: F32, y: F32 }
+  | $Wheel { x: F32, y: F32, delta: F32 }
+  | $FocusLost
+  | $AssetChanged
+  | $Console { command: U32, argument: U32 }
+  | $Preference { index: U32, value: F32 }
+  | $Tune { index: U32, value: F32 }
+  | $UiAction { node: U32, action: U32, value: F32 }
+  | $ServiceAnswer { request: U32, status: U32, value: F32, length: U32 }
+  | $ServiceData { request: U32, a: F32, b: F32, c: F32 }
+  | $GamepadConnected { pad: U32, standard: U32 }
+  | $GamepadDisconnected { pad: U32 }
+  | $GamepadButton { button: U32, pad: U32, value: F32, pressed: U32 }
+  | $GamepadAxis { axis: U32, pad: U32, value: F32 }
+  | $Action { action: U32, value: F32, device: U32 }
+  | $TextInput { character: U32, composing: U32 }
+  | $Composition { length: U32, cursor: U32 }
+  | $MouseMotion { dx: F32, dy: F32 }
+  | $Touch { id: U32, x: F32, y: F32, phase: U32 }
+  | $Pan { touches: U32, dx: F32, dy: F32 }
+  | $Pinch { x: F32, y: F32, scale: F32 }
+  | $Player { index: U32 }
+  | $SessionStarted { restored: U32 }
+  | $RendererReady
 
-type Input is data = #Input { elapsed: F32, width: F32, height: F32, events: Array Event, state: Array F32 }
+type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: &[Event], state: &[F32] }
 
 // An event's lanes from `start`: its tag, then code, x, y, delta. The code lane
 // holds a whole number; lanes an event does not use are zero.
-const decode_event = fn (values: Array F32) => fn (start: U32) => do:
+const decode_event = func (values: Array F32) => return func (start: U32) => return do:
   let tag = lanes.integer values[start] 28
   let code = lanes.integer values[start + 1] lanes.max_integer
   let x = values[start + 2]
@@ -1108,129 +1126,129 @@ const decode_event = fn (values: Array F32) => fn (start: U32) => do:
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #KeyDown code
+      return $KeyDown code
     2 => do:
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #KeyUp code
+      return $KeyUp code
     3 => do:
       use lanes.require (code <= 7)
       use lanes.require (delta == 0.0)
-      return #PointerDown { button: code, x, y }
+      return $PointerDown { button: code, x, y }
     4 => do:
       use lanes.require (code <= 7)
       use lanes.require (delta == 0.0)
-      return #PointerUp { button: code, x, y }
+      return $PointerUp { button: code, x, y }
     5 => do:
       use lanes.require (code == 0)
       use lanes.require (delta == 0.0)
-      return #PointerMove { x, y }
+      return $PointerMove { x, y }
     6 => do:
       use lanes.require (code == 0)
-      return #Wheel { x, y, delta }
+      return $Wheel { x, y, delta }
     7 => do:
       use lanes.require (code == 0)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #FocusLost
+      return $FocusLost
     8 => do:
       use lanes.require (code == 0)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #AssetChanged
+      return $AssetChanged
     9 => do:
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #Console { command: code, argument: lanes.integer x lanes.max_integer }
+      return $Console { command: code, argument: lanes.integer x lanes.max_integer }
     10 => do:
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #Preference { index: code, value: x }
+      return $Preference { index: code, value: x }
     11 => do:
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #Tune { index: code, value: x }
+      return $Tune { index: code, value: x }
     12 => do:
       use lanes.require (code <= 7)
       use lanes.require (delta == 0.0)
-      return #UiAction { node: lanes.integer x lanes.max_integer, action: code, value: y }
+      return $UiAction { node: lanes.integer x lanes.max_integer, action: code, value: y }
     13 => do:
       use lanes.require (code <= 3)
-      return #ServiceAnswer { request: lanes.integer x lanes.max_integer, status: code, value: y, length: lanes.integer delta lanes.max_integer }
+      return $ServiceAnswer { request: lanes.integer x lanes.max_integer, status: code, value: y, length: lanes.integer delta lanes.max_integer }
     14 => do:
-      return #ServiceData { request: code, a: x, b: y, c: delta }
+      return $ServiceData { request: code, a: x, b: y, c: delta }
     15 => do:
       use lanes.require (code <= 15)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #GamepadConnected { pad: code, standard: lanes.integer x lanes.max_integer }
+      return $GamepadConnected { pad: code, standard: lanes.integer x lanes.max_integer }
     16 => do:
       use lanes.require (code <= 15)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #GamepadDisconnected { pad: code }
+      return $GamepadDisconnected { pad: code }
     17 => do:
       use lanes.require (code <= 31)
-      return #GamepadButton { button: code, pad: lanes.integer x lanes.max_integer, value: y, pressed: lanes.integer delta lanes.max_integer }
+      return $GamepadButton { button: code, pad: lanes.integer x lanes.max_integer, value: y, pressed: lanes.integer delta lanes.max_integer }
     18 => do:
       use lanes.require (code <= 15)
       use lanes.require (delta == 0.0)
-      return #GamepadAxis { axis: code, pad: lanes.integer x lanes.max_integer, value: y }
+      return $GamepadAxis { axis: code, pad: lanes.integer x lanes.max_integer, value: y }
     19 => do:
       use lanes.require (code <= 255)
       use lanes.require (delta == 0.0)
-      return #Action { action: code, value: x, device: lanes.integer y lanes.max_integer }
+      return $Action { action: code, value: x, device: lanes.integer y lanes.max_integer }
     20 => do:
       use lanes.require (code <= 1114111)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #TextInput { character: code, composing: lanes.integer x lanes.max_integer }
+      return $TextInput { character: code, composing: lanes.integer x lanes.max_integer }
     21 => do:
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #Composition { length: code, cursor: lanes.integer x lanes.max_integer }
+      return $Composition { length: code, cursor: lanes.integer x lanes.max_integer }
     22 => do:
       use lanes.require (code == 0)
       use lanes.require (delta == 0.0)
-      return #MouseMotion { dx: x, dy: y }
+      return $MouseMotion { dx: x, dy: y }
     23 => do:
       use lanes.require (code <= 31)
-      return #Touch { id: code, x, y, phase: lanes.integer delta lanes.max_integer }
+      return $Touch { id: code, x, y, phase: lanes.integer delta lanes.max_integer }
     24 => do:
       use lanes.require (code <= 31)
       use lanes.require (delta == 0.0)
-      return #Pan { touches: code, dx: x, dy: y }
+      return $Pan { touches: code, dx: x, dy: y }
     25 => do:
       use lanes.require (code == 0)
-      return #Pinch { x, y, scale: delta }
+      return $Pinch { x, y, scale: delta }
     26 => do:
       use lanes.require (code <= 255)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #Player { index: code }
+      return $Player { index: code }
     27 => do:
       use lanes.require (code <= 1)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #SessionStarted { restored: code }
+      return $SessionStarted { restored: code }
     28 => do:
       use lanes.require (code == 0)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
-      return #RendererReady
+      return $RendererReady
     _ => @panic "invalid input event tag"
 
 // The input packet: the seconds since the last frame, the viewport's width and
 // height, the event and state counts, the events and the state. Anything else
 // traps.
-const decode_input = fn (values: Array F32) => do:
+const decode_input_into = func (values: Array F32) -> (events: ResizeArray Event) => return do:
   use lanes.require (values.length >= frame_header_floats)
   use lanes.finite values
   let elapsed = values[0]
@@ -1243,8 +1261,11 @@ const decode_input = fn (values: Array F32) => do:
   let state_count = lanes.integer values[4] max_state_floats
   let state_start = frame_header_floats + event_count * event_floats
   use lanes.require (values.length == state_start + state_count)
-  return #Input {
-    state: array.slice state_start state_count values,
+  @storage.truncate events 0
+  for index in 0 .. event_count:
+    @storage.push events (decode_event values (frame_header_floats + index * event_floats))
+  return $Input {
+    state: &values[state_start..state_start + state_count],
     elapsed, width, height,
-    events: array.generate event_count (fn index => decode_event values (frame_header_floats + index * event_floats)),
+    events: &events[0..events.length],
   }

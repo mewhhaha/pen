@@ -1056,13 +1056,7 @@ mod tests {
         assert_eq!(
             text,
             format!("Window \"{}\"\n", crate::identity().title)
-                + "\x20 Dialog #10 \"Paused\" modal at=100,50 size=400x300\n\
-             \x20   Heading #11 \"Paused\"\n\
-             \x20   Button #12 \"Resume\" at=120,80 size=200x40 actions=focus,activate <- focus\n\
-             \x20   Slider #13 \"Volume\" value=\"80%\" number=0.8 range=0..1 step=0.1 \
-             actions=focus,increment,decrement,set_value\n\
-             \x20   CheckBox #16 \"Music\" toggled=true actions=activate\n\
-             \x20 GenericContainer (the dev tools)\n"
+                + "\x20 Dialog #10 \"Paused\" modal at=100,50 size=400x300\n\\n             \x20   Heading #11 \"Paused\"\n\\n             \x20   Button #12 \"Resume\" at=120,80 size=200x40 actions=focus,activate <- focus\n\\n             \x20   Slider #13 \"Volume\" value=\"80%\" number=0.8 range=0..1 step=0.1 \\n             actions=focus,increment,decrement,set_value\n\\n             \x20   CheckBox #16 \"Music\" toggled=true actions=activate\n\\n             \x20 GenericContainer (the dev tools)\n"
         );
     }
 

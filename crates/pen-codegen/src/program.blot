@@ -1,121 +1,71 @@
-//
-// A game program as pen runs it (pen-runtime's program.rs). Its entry,
-// `main`, takes the host: a callback that answers each response the program
-// gives with the host's next request. A request is whether the host kept
-// what the program did for the last one (1) or not (0), the operation, then
-// its payload; a response is the operation, then what it made. The world
-// stays in the program: only creating, saving and restoring send its state
-// across.
-import * as array from "std/array"
 import * as lanes from "./lanes"
 import * as protocol from "./protocol"
-import * as render from "./protocol_render"
 
-// What a program says first: this number, its protocol's version, its state
-// schema and whether it keeps scenes apart from its state (1) or not (0).
-const handshake_magic = ${MAGIC}.0
-const program_version = ${VERSION}.0
-
-// The host's requests, by their operation numbers.
-type Command is data =
-  | #Stop
-  | #Create
-  | #Frame (Array F32)
-  | #Snapshot
-  | #Restore (Array F32)
-  | #Scene
-  | #LoadScene (Array F32)
-  | #Hello
-
-const decode_command = fn (request: Array F32) => do:
-  use lanes.require (request.length >= 2)
-  let payload = array.slice 2 (request.length - 2) request
-  return case lanes.integer request[1] 7 of
-    0 => #Stop
-    1 => #Create
-    2 => #Frame payload
-    3 => #Snapshot
-    4 => #Restore payload
-    5 => #Scene
-    6 => #LoadScene payload
-    _ => #Hello
-
-const Command.code = fn (command: Command) => case command of
-  #Stop => 0.0
-  #Create => 1.0
-  #Frame _ => 2.0
-  #Snapshot => 3.0
-  #Restore _ => 4.0
-  #Scene => 5.0
-  #LoadScene _ => 6.0
-  #Hello => 7.0
-
-// A state pen takes: a bounded array of finite values.
-const valid_state = fn (state: Array F32) => do:
-  if state.length > protocol.max_state_floats:
-    return #False
-  return array.all is_finite state
-
-// What `command` makes of the world, if any: the next world and the
-// response's lanes after its operation.
-const execute = fn game => fn world => fn (command: Command) => do:
-  return case command of
-    #Hello => (world, #[handshake_magic, program_version, U32.to_f32 game.schema, 0.0])
-    #Create => do:
-      let created = game.create ()
-      return (#Some created, game.save created)
-    #Restore state => (#Some (game.restore state), #[])
-    #LoadScene state => (#Some (game.restore state), #[])
-    _ => do:
-      let #Some current = world else:
-        return @panic "a game is created or restored before anything else"
-      return case command of
-        #Frame payload => do:
-          let (next, packet) = game.frame current payload
-          return (#Some next, packet)
-        _ => (world, game.save current)
-
-// Serves `game` to the host until it stops the program. `game` is a record:
-// `schema`, the version of its saved state (pen restores only states saved
-// with the same one); `create`, a new world, from Unit; `frame`, the next
-// world and the render packet's lanes, from a world and the input packet's
-// lanes; `save`, a world's state; and `restore`, the world a state `save`
-// made stands for. Its scenes are its states. A world the host does not
-// keep is dropped, and the last one kept goes on.
-const serve = fn game => fn (host: Array F32 -> Array F32 ! { Foreign }) => do:
-  let world = #Nothing
-  let request = #[1.0, 7.0]
+// Version 2: request[0] acknowledges renderer publication only. Simulation
+// mutations already happened and are never rolled back or silently repeated.
+const magic: F32 = ${MAGIC}.0
+const version: F32 = ${VERSION}.0
+const stop: U32 = 0
+const create: U32 = 1
+const frame: U32 = 2
+const snapshot: U32 = 3
+const restore: U32 = 4
+const scene: U32 = 5
+const load_scene: U32 = 6
+const append = func values -> (destination: ResizeArray F32) => return do:
+  let count = values.length
+  for i in 0 .. count:
+    @storage.push destination values[i]
+const valid_state = func values => return do:
+  if values.length > protocol.max_state_floats:
+    return false
+  for value in values:
+    if Bool.not (is_finite value):
+      return false
+  return true
+// Caller owns both named packet buffers for the entire invocation. Foreign
+// returns a copied temporary which is consumed within the iteration; only the
+// buffers and scalar initialized flag survive the backedge, never a new owner.
+// execute access operation payload outgoing writes response lanes AFTER the
+// echoed operation. acknowledge access published repairs presentation caches.
+const run = func execute -> acknowledge -> access -> (schema: U32) -> (scenes: Bool) -> (incoming: ResizeArray F32) -> (outgoing: ResizeArray F32) -> (host: Array F32 -> Array F32 ! { Foreign }) : Unit ! { Foreign } => return do:
+  @storage.truncate incoming 0
+  @storage.truncate outgoing 0
+  append #[magic, version, U32.to_f32 schema, lanes.bit scenes] outgoing
+  let initialized = false
   for ever:
-    let command = decode_command request
-    if let #Stop = command:
+    use following <- host (@storage.freeze (@storage.copy outgoing))
+    lanes.require (following.length >= 2)
+    let published = lanes.integer following[0] 1 == 1
+    acknowledge access published
+    @storage.truncate incoming 0
+    append following incoming
+    let operation = lanes.integer incoming[1] 6
+    if operation == stop:
       return ()
-    let (candidate, response) = execute game world command
-    let valid = case command of
-      #Frame _ => #True
-      _ => valid_state response
-    let outgoing = case valid, command of
-      #False, _ => #[-1.0]
-      #True, #Hello => response
-      #True, _ => #[command.code, ...response]
-    use following <- host outgoing
-    if valid && following[0] == 1.0:
-      world := candidate
-    request := following
+    lanes.require (initialized or operation == create or operation == restore)
+    lanes.require (scenes or (operation != scene and operation != load_scene))
+    @storage.truncate outgoing 0
+    @storage.push outgoing (U32.to_f32 operation)
+    execute access operation (&incoming[2..incoming.length]) outgoing
+    if operation == create or operation == restore:
+      initialized := true
+    // Invalid non-render output poisons this invocation; no partial mutation is
+    // presented as a rolled-back world. Recover in a fresh guest from a snapshot.
+    if operation != frame:
+      lanes.require (valid_state outgoing)
 
-// One frame through pen's packets: the input decoded for `step`, which
-// returns the next world and the frame to draw, encoded.
-const step_packets = fn step => fn world => fn (payload: Array F32) => do:
-  let (next, drawn) = step world (protocol.decode_input payload)
-  return (next, render.encode_render drawn)
-
-// `serve` with pen's packets: `game` has `step` in place of `frame`, taking
-// a world and the frame's input (protocol.Input) and returning the next
-// world and the frame to draw (types.RenderFrame; frame.blank draws
-// nothing).
-const run = fn game => fn host => serve {
-  schema: game.schema,
-  create: game.create,
-  frame: step_packets game.step,
-  save: game.save,
-  restore: game.restore,
-} host
+// game is a compile-known policy, not a stored runtime callback object. Each
+// operation mutates independently named pools through access and appends only
+// its response lanes to outgoing. Snapshots and restores remain explicit.
+const execute = func game -> access -> operation -> payload -> outgoing => return do:
+  case operation of
+    1 => game.create access outgoing
+    2 => game.frame access payload outgoing
+    3 => game.save access outgoing
+    4 => game.restore access payload outgoing
+    5 => game.scene access outgoing
+    6 => game.load_scene access payload outgoing
+    _ => @panic "invalid game operation"
+const serve = func game -> access -> incoming -> outgoing -> host => return
+  run (execute game) game.acknowledge access game.schema game.scenes incoming outgoing host

@@ -731,10 +731,11 @@ impl State {
             let first = u32::try_from(order.len())?;
             order.push(u32::try_from(index)?);
             match batches.last_mut() {
-                Some(last) if last.key == key => last.count += 1,
+                Some(last) if last.key == key && last.scene_filter == material.material.scene_filter => last.count += 1,
                 _ => batches.push(SpriteBatch {
                     pipeline: pipeline.clone(),
                     texture: texture.view.clone(),
+                    scene_filter: material.material.scene_filter,
                     key,
                     first,
                     count: 1,

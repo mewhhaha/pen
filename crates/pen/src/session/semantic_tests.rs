@@ -182,7 +182,7 @@ fn guest(observed: bool) -> Vec<u8> {
     program(
         main,
         &[
-            (HANDSHAKE, &[4670544.0, 1.0, 1.0, 0.0]),
+            (HANDSHAKE, &[4670544.0, 2.0, 1.0, 0.0]),
             (CREATE, &create),
             (SNAPSHOT, &snapshot),
             (RESTORE, &[4.0, 0.0]),

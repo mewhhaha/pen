@@ -71,13 +71,13 @@ once there are none):
 ```blot
 import * as extensions from "pen/extensions"
 
-entry const main = fn host => extensions.run game host
+entry const main = func host => return extensions.run game host
 
-const step = fn (world: World) => fn (input: extensions.Input) => do:
+const step = func (world: World) => return func (input: extensions.Input) => return do:
   let taken = array.fold_left take world input.events
   ...
-  let score = extensions.encode_score #[#extensions.Score { bounces: next.bounces, speed }]
-  return (next, view next hit input, #[score])
+  let score = extensions.encode_score #[$extensions.Score { bounces: next.bounces, speed }]
+  break (next, view next hit input, #[score])
 ```
 
 ## In pen's tools

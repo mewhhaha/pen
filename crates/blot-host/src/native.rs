@@ -45,7 +45,7 @@ pub fn native_metadata(wasm: &[u8]) -> Result<Vec<u8>> {
         }
     }
     Ok(serde_json::to_vec(&Metadata {
-        version: 1,
+        version: 2,
         fingerprint: pen_runtime::net::wire::hash_bytes(wasm),
         sections,
         globals: imaged_globals(wasm),
@@ -55,7 +55,7 @@ pub fn native_metadata(wasm: &[u8]) -> Result<Vec<u8>> {
 /// The original Wasm's identity, shared by native and browser net sessions.
 pub fn native_fingerprint(metadata: &[u8]) -> Result<u64> {
     let metadata: Metadata = serde_json::from_slice(metadata)?;
-    ensure!(metadata.version == 1, "unsupported native metadata version");
+    ensure!(metadata.version == 2, "unsupported native metadata version; package it again with `pen build`");
     Ok(metadata.fingerprint)
 }
 
@@ -69,7 +69,7 @@ impl GuestModule {
     pub unsafe fn from_native(engine: &Engine, metadata: &[u8], precompiled: &[u8]) -> Result<Self> {
         ensure!(metadata.len() <= 32 * 1024 * 1024, "native metadata exceeds its size limit");
         let metadata: Metadata = serde_json::from_slice(metadata).context("reading native game metadata")?;
-        ensure!(metadata.version == 1, "unsupported native metadata version");
+        ensure!(metadata.version == 2, "unsupported native metadata version; package it again with `pen build`");
         let abi = Arc::new(read_abi(&metadata.sections)?);
         // SAFETY: the caller vouches for the artifact; Wasmtime checks compatibility.
         let module = unsafe { Module::deserialize(engine, precompiled) }

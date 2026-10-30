@@ -89,10 +89,7 @@ pub fn page(shots: &[Shot], threshold: f64) -> String {
     let mut html = String::from(STYLE);
     let _ = write!(
         html,
-        "<h1>Golden images</h1>\n<p>{} shots, {failing} not passing (RMSE threshold {:.2}%). \
-         <label><input type=checkbox id=failing{}> only those not passing</label></p>\n<p id=offline hidden>Opened \
-         as a file: <code>pen test --review</code> serves this page with buttons that accept a shot as its golden \
-         image, or <code>pen test --update --only SCENARIO</code> accepts a scenario's.</p>\n",
+        "<h1>Golden images</h1>\n<p>{} shots, {failing} not passing (RMSE threshold {:.2}%). \\n         <label><input type=checkbox id=failing{}> only those not passing</label></p>\n<p id=offline hidden>Opened \\n         as a file: <code>pen test --review</code> serves this page with buttons that accept a shot as its golden \\n         image, or <code>pen test --update --only SCENARIO</code> accepts a scenario's.</p>\n",
         shots.len(),
         threshold * 100.0,
         if failing > 0 { " checked" } else { "" }
@@ -115,11 +112,7 @@ pub fn page(shots: &[Shot], threshold: f64) -> String {
         };
         let _ = write!(
             html,
-            "<section class=\"shot {status}\" data-id=\"{id}\">\n<h2>{id} <span class=status>{label}</span></h2>\n\
-             <p>{about}<br>{summary}</p>\n<div class=images>\n<figure>{golden}<figcaption>golden</figcaption></figure>\n\
-             <figure><a href=\"{scenario}/{stem}.png\"><img src=\"{scenario}/{stem}.png\" alt=\"shot\"></a>\
-             <figcaption>this run</figcaption></figure>\n<figure>{diff}<figcaption>difference, 4x</figcaption></figure>\n\
-             </div>\n<button class=accept>Accept as the golden image</button>\n</section>\n",
+            "<section class=\"shot {status}\" data-id=\"{id}\">\n<h2>{id} <span class=status>{label}</span></h2>\n\\n             <p>{about}<br>{summary}</p>\n<div class=images>\n<figure>{golden}<figcaption>golden</figcaption></figure>\n\\n             <figure><a href=\"{scenario}/{stem}.png\"><img src=\"{scenario}/{stem}.png\" alt=\"shot\"></a>\\n             <figcaption>this run</figcaption></figure>\n<figure>{diff}<figcaption>difference, 4x</figcaption></figure>\n\\n             </div>\n<button class=accept>Accept as the golden image</button>\n</section>\n",
             status = if matches!(shot.status, Status::Passed | Status::Updated) { "passing" } else { "failing" },
             label = shot.status.label(),
             about = escape(&shot.about),

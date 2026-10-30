@@ -436,7 +436,7 @@ fn runs_the_checkouts_pilot() {
     }
     // A module that does not compile, in the same session, fails with the
     // compiler's diagnostics, placed in the module.
-    let source = "entry const test_broken = fn () => missing_name\n";
+    let source = "entry const test_broken = func () => return missing_name\n";
     let broken = TestModule {
         path: root.join("tests/broken.blot").display().to_string(),
         overlays: vec![pen_plugins::Overlay { path: test.entry.clone(), contents: Some(source.into()) }],

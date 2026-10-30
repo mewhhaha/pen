@@ -6,36 +6,36 @@ import * as protocol from "pen/protocol"
 import { game } from "./game"
 
 // A tenth of a second of a 640 x 480 frame, with `events`.
-const input = fn (events: Array extensions.Event) =>
-  #extensions.Input { elapsed: 0.1, width: 640.0, height: 480.0, events, state: #[] }
+const input = func (events: Array extensions.Event) => return
+  $extensions.Input { elapsed: 0.1, width: 640.0, height: 480.0, events, state: #[] }
 
-const key = fn (code: U32) => #extensions.Pen (#protocol.KeyDown code)
+const key = func (code: U32) => return $extensions.Pen ($protocol.KeyDown code)
 
 // The world after one frame of `events` from `state`.
-const after = fn (state: Array F32) => fn (events: Array extensions.Event) => do:
+const after = func (state: Array F32) => return func (events: Array extensions.Event) => return do:
   let (world, _, _) = game.step (game.restore state) (input events)
   return game.save world
 
-entry const test_a_kick_sets_it_rolling = fn () => check.report #[
+entry const test_a_kick_sets_it_rolling = func () => return check.report #[
   // x, z, vx, vz, bounces, held: 3 a second, less 3% drag, for a tenth.
-  check.near 0.0001 #[0.291, 0.0, 2.91, 0.0, 0.0, 0.0] (after (game.save (game.create ())) #[#extensions.Kick { x: 3.0, z: 0.0 }]),
+  check.near 0.0001 #[0.291, 0.0, 2.91, 0.0, 0.0, 0.0] (after (game.save (game.create ())) #[$extensions.Kick { x: 3.0, z: 0.0 }]),
 ]
 
-entry const test_it_bounces_off_a_wall = fn () => check.report #[
+entry const test_it_bounces_off_a_wall = func () => return check.report #[
   // From 3.4 at 2 a second it reaches past the wall at 3.5 and comes back.
   check.near 0.0001 #[3.406, 0.0, -1.94, 0.0, 1.0, 0.0] (after #[3.4, 0.0, 2.0, 0.0, 0.0, 0.0] #[]),
 ]
 
-entry const test_a_held_arrow_pushes_it = fn () => do:
+entry const test_a_held_arrow_pushes_it = func () => return do:
   let held = after (game.save (game.create ())) #[key protocol.key_arrow_up]
-  let let_go = after held #[#extensions.Pen (#protocol.KeyUp protocol.key_arrow_up)]
+  let let_go = after held #[$extensions.Pen ($protocol.KeyUp protocol.key_arrow_up)]
   return check.report #[
     // Up pushes toward -z: 6 a second, each second, for a tenth.
     check.near 0.0001 #[0.0, -0.0582, 0.0, -0.582, 0.0, 4.0] held,
     check.near 0.0001 #[0.0, 0.0] #[let_go[5], let_go[2]],
   ]
 
-entry const test_its_score_says_how_it_is_doing = fn () => do:
+entry const test_its_score_says_how_it_is_doing = func () => return do:
   let (_, _, sections) = game.step (game.restore #[3.4, 0.0, 2.0, 0.0, 4.0, 0.0]) (input #[])
   return check.report #[
     check.equal #[1.0] #[U32.to_f32 sections.length],
@@ -43,6 +43,6 @@ entry const test_its_score_says_how_it_is_doing = fn () => do:
     check.near 0.0001 #[5.0, 1.94] sections[0].values,
   ]
 
-entry const test_a_saved_world_comes_back = fn () => do:
-  let saved = after (game.save (game.create ())) #[key protocol.key_arrow_left, #extensions.Kick { x: 1.0, z: -2.0 }]
+entry const test_a_saved_world_comes_back = func () => return do:
+  let saved = after (game.save (game.create ())) #[key protocol.key_arrow_left, $extensions.Kick { x: 1.0, z: -2.0 }]
   return check.report #[check.equal saved (game.save (game.restore saved))]

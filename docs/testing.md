@@ -28,8 +28,8 @@ is only admitted in this test mode; games receive their usual frame capability.
 import * as test from "pen/test"
 import * as fixtures from "test/scenario_fixtures"
 
-entry const test_continue = fn (driver: Array F32 -> Array F32 ! { Foreign }) =>
-  test.run driver $ fn session => do:
+entry const test_continue = func (driver: Array F32 -> Array F32 ! { Foreign }) => return
+  test.run driver $ func session => return do:
     use test.launch session (fixtures.colony ()) 960 640
     use test.expect_visible session (test.button "Continue")
     use test.click session (test.button "Continue")

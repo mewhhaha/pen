@@ -25,6 +25,7 @@ fn marked(uv: vec2f) -> bool {
 fn fetch(uv: vec2f) -> vec3f {
   let light = textureSampleLevel(source, source_sampler, uv, 0.0).rgb +
     textureSampleLevel(glow, source_sampler, uv, 0.0).rgb * present.bloom.x;
+  if (present.source.w > 0.5) { return light; }
   return toned(light);
 }
 

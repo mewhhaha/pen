@@ -78,3 +78,37 @@ one Wasmtime store. The next architectural experiment is explicit, saved state
 machines over frame-gated service answers. A compiler lowering or a qualified
 stack-switching implementation would be required for general source-level
 suspension. The synchronous host does not imply that this problem is solved.
+
+## Prepared numeric worker sessions
+
+`blot_host::worker_sessions::Workers` retains isolated guests inside a callback
+service entry. Construct it with an engine, module, entry and 1–8 workers;
+`configure(revision, context)` supplies finite F32 context once, then
+`run_prepared(inputs)` submits up to 32 jobs without resending it. Context,
+individual input and output are limited to 16,384 lanes; each guest has a
+64 MiB memory limit. The application owns the pool and immutable context.
+The service ABI is `(Array F32 -> Array F32 ! { Foreign }) -> Unit`.
+
+A service first calls its host with `[-4670546]`. The host returns `[1, context…]`
+to prepare, `[2, input…]` to run a job, or `[0]` to stop. Responses are `[1]` for
+prepared context and `[2, output…]` for a job. Reusing the current revision
+requires identical context bits, including signed zeros. A new revision replaces
+it; old revision numbers are not remembered. `reset` clears configuration; the
+next configured batch prepares workers again. Old worker data stays retained
+until replaced or closed. No guest pointers or live ECS worlds cross threads.
+
+Results retain submission order. Traps, malformed responses and early guest
+exit fail the affected job, discard that guest, and recreate it for subsequent
+jobs. Direct Rust batches return per-job Results. `call(Value)` is an optional
+client callback using -4670547 configure/reset/run commands and the existing
+-4670545 batch framing; it rejects a failed batch as a whole. Ink's optional
+`pen/worker_session` adapter supplies both ends of this protocol; Pen has no Ink
+or game dependency. Nothing automatically makes application schedules parallel.
+
+`stats` reports starts, prepared contexts, copied context lanes, successful jobs,
+and each worker's last observed committed guest memory. `close` joins workers
+and is idempotent; Drop also closes. Service code must terminate its jobs and
+honor stop: this API has no per-job timeout. Context setup, scheduling overhead,
+serialization and extra worker memory belong in application measurements.
+The standalone `worker_sessions` host tests cover ordering, validation, traps,
+early exits, restart, reset and stable memory over repeated batches.

@@ -22,7 +22,7 @@ mod guest;
 /// What a program says first (ink's `program.blot`): this magic number, its
 /// protocol version, its state schema and whether it keeps scenes.
 pub const HANDSHAKE_MAGIC: f32 = 4670544.0;
-pub const PROGRAM_VERSION: f32 = 1.0;
+pub const PROGRAM_VERSION: f32 = 2.0;
 /// The game's state schema: the layout of [`World::lanes`].
 pub const SCHEMA: f32 = 1.0;
 
@@ -244,8 +244,8 @@ fn direction(code: f32) -> u32 {
 
 /// The program: answers the host's requests until it says stop, as ink's
 /// `program.run` does. Each request after the first says whether the host
-/// accepted the world the last one made (its first lane); until it does,
-/// the world stays as it was, so a frame the host rejects changes nothing.
+/// published the preceding output (its first lane). Version 2 advances live
+/// simulation before output publication; rejection never rolls it back.
 /// `exchange` sends a response and waits for the next request.
 pub fn run(mut exchange: impl FnMut(&[f32]) -> Vec<f32>) {
     let mut world: Option<World> = None;
@@ -272,11 +272,10 @@ pub fn run(mut exchange: impl FnMut(&[f32]) -> Vec<f32>) {
             _ => (world, REFUSED.to_vec()),
         };
         let accepted = response != REFUSED;
-        let following = exchange(&response);
-        if accepted && following.first() == Some(&1.0) {
+        if accepted {
             world = candidate;
         }
-        request = following;
+        request = exchange(&response);
     }
 }
 
@@ -327,15 +326,17 @@ mod tests {
     }
 
     #[test]
-    fn rejected_frames_change_nothing() {
+    fn rejected_frames_keep_live_simulation_mutations() {
         let right = input(0.5, vec![GameEvent::KeyDown("d".into())]);
         let responses = converse(vec![
             request(true, CREATE, &[]),
             request(true, FRAME, &right),
-            // The host rejects that frame: the world is as created.
+            // Reject presentation; the explicit snapshot still observes the step.
             request(false, SNAPSHOT, &[]),
         ]);
-        assert_eq!(World::from_lanes(&responses[3][1..]), Some(World::new()));
+        let live = World::from_lanes(&responses[3][1..]).unwrap();
+        assert!(live.x > World::new().x);
+        assert_eq!(live.held, RIGHT);
     }
 
     #[test]

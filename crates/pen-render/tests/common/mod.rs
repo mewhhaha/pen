@@ -31,6 +31,11 @@ pub fn featured_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 pub fn frame(draws: Vec<Draw>) -> RenderFrame {
     let zero = Vector::default();
     RenderFrame {
+        retained_enabled: false,
+        retained_reset: false,
+        retained_after: 0,
+        instances: Vec::new(),
+        instance_removals: Vec::new(),
         hide_cursor: false,
         loading: false,
         show_captions: false,

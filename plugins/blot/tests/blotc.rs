@@ -124,7 +124,7 @@ fn open(root: &Path, entry: &str, settings: Value, id: &mut Option<u32>) -> Resu
     })
 }
 
-const MAIN: &str = "import * as lib from \"./lib\"\n\nentry const answer = fn () => lib.base + 1\n";
+const MAIN: &str = "import * as lib from \"./lib\"\n\nentry const answer = func () => return lib.base + 1\n";
 const LIB: &str = "const base: U32 = 41\n";
 
 /// What a build made, which must be a module.
@@ -188,7 +188,7 @@ fn native_assets_survive_edits_rejections_and_restarts() {
     let project = Project::new(&[
         (
             "main.blot",
-            "import * as settings from \"./settings.json\"\nentry const answer = fn () => (settings.value).answer\n",
+            "import * as settings from \"./settings.json\"\nentry const answer = func () => return (settings.value).answer\n",
         ),
         ("settings.json", "{\"answer\":41}"),
     ]);
@@ -218,8 +218,7 @@ fn rejects_a_type_error_where_it_is() {
     if !present() {
         return;
     }
-    let main =
-        "import * as lib from \"./lib\"\n\nconst wrong: Bool = lib.base\n\nentry const answer = fn () => wrong\n";
+    let main = "import * as lib from \"./lib\"\n\nconst wrong: Bool = lib.base\n\nentry const answer = func () => return wrong\n";
     let project = Project::new(&[("main.blot", main), ("lib.blot", LIB)]);
     let mut session = project.open(json!({ "std": std_root() })).unwrap();
     let diagnostics = rejected(session.build(&[]));
@@ -253,7 +252,7 @@ fn builds_overlays_over_the_files_for_one_build() {
     // The next build reads the disk again.
     assert_eq!(built(session.build(&[])), on_disk);
     // An overlay can be a file that is not on disk, by a path from the root.
-    let main = "import * as extra from \"./extra\"\n\nentry const answer = fn () => extra.base\n";
+    let main = "import * as extra from \"./extra\"\n\nentry const answer = func () => return extra.base\n";
     let virtual_files = [
         Overlay { path: "main.blot".into(), contents: Some(main.into()) },
         Overlay { path: "extra.blot".into(), contents: Some("const base: U32 = 7\n".into()) },

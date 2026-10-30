@@ -72,7 +72,7 @@ pub enum ReloadResult {
     Incompatible,
 }
 
-/// Output rejected before accepting the guest's candidate state.
+/// Output rejected before renderer publication. Simulation already advanced.
 #[derive(Debug)]
 pub struct InvalidFrame;
 
@@ -150,6 +150,8 @@ pub struct Moment {
 struct Game<P: Program> {
     program: P,
     schema: u32,
+    instances: crate::instances::Scene,
+    pending_instances: Option<crate::instances::Scene>,
 }
 
 pub struct GameRuntime<B: Backend> {
@@ -182,13 +184,23 @@ pub struct GameRuntime<B: Backend> {
 async fn open_game<B: Backend>(engine: &B, module: &B::Module) -> Result<Game<B::Program>> {
     let program = engine.start(module).await?;
     let schema = program.schema();
-    Ok(Game { program, schema })
+    Ok(Game { program, schema, instances: Default::default(), pending_instances: None })
+}
+
+impl<P: Program> Game<P> {
+    fn accept(&mut self) {
+        self.program.accept();
+        if let Some(scene) = self.pending_instances.take() {
+            self.instances = scene;
+        }
+    }
 }
 
 async fn state_request<P: Program>(game: &mut Game<P>, operation: Operation, payload: &[f32]) -> Result<Vec<f32>> {
+    game.pending_instances = None;
     let state = game.program.request(operation, payload).await?;
     validate_state(&state)?;
-    game.program.accept();
+    game.accept();
     Ok(state)
 }
 
@@ -230,9 +242,12 @@ async fn evaluate_with_frame<P: Program>(
     frame: &Frame,
 ) -> Result<RenderFrame> {
     let packet = game.program.request(Operation::Frame, &encode_frame(frame, 0.0, &[])?).await?;
-    let next = decode_frame(&packet, game.schema, catalog)?;
+    let mut next = decode_frame(&packet, game.schema, catalog)?;
     ensure!(next.state.is_empty(), "program frame must keep its state inside the guest");
+    game.pending_instances = None;
+    let scene = game.instances.resolve(&mut next.render)?;
     host.validate(&next.render)?;
+    game.pending_instances = Some(scene);
     Ok(next.render)
 }
 
@@ -300,7 +315,7 @@ impl<B: Backend> GameRuntime<B> {
         let mut first_input = validation_frame(host);
         first_input.events.push(GameEvent::SessionStarted { restored });
         let first = evaluate_with_frame(&mut active, &catalog, host, &first_input).await?;
-        active.program.accept();
+        active.accept();
         let mut runtime = GameRuntime {
             engine: engine.clone(),
             module,
@@ -389,9 +404,10 @@ impl<B: Backend> GameRuntime<B> {
 
     /// Restores are validated in another program instance, so malformed
     /// saves and traps cannot poison the running one. The program draws a
-    /// frame to prove it works; `commit` keeps what that frame did to the
-    /// state (as loads and undo always have), and without it the next
-    /// request starts from exactly the restored state. Also returns what the
+    /// frame to prove it works. Keeping that validation frame preserves its
+    /// mutations (loads/undo); exact moment restore explicitly restores the
+    /// checkpoint again after validation. Renderer rejection never rolls back
+    /// a live simulation. Also returns what the
     /// restore (or the scene load) answered: what it made of each section.
     async fn replace_state(
         &mut self,
@@ -412,7 +428,15 @@ impl<B: Backend> GameRuntime<B> {
             host.render(&rendered, &self.catalog)?;
         }
         if commit {
-            candidate.program.accept();
+            candidate.accept();
+        } else {
+            // Version 2 has no implicit candidate rollback. Netplay/time travel
+            // require an explicit second Restore so the next input begins at
+            // exactly the checkpoint, without the validation frame's mutations.
+            restore(&self.engine, &self.module, &mut candidate, state, host).await?;
+            if let Some(scene) = scene {
+                state_request(&mut candidate, Operation::LoadScene, scene).await?;
+            }
         }
         let mut previous = std::mem::replace(&mut self.active, candidate);
         self.snapshot = None;
@@ -464,8 +488,13 @@ impl<B: Backend> GameRuntime<B> {
     /// Starts the game on a frame's input (an `input`, or one recorded
     /// earlier); `receive` takes the result.
     pub fn send(&mut self, input: &[f32]) -> Result<()> {
+        self.active.program.send(Operation::Frame, input)?;
         self.sent = Some(Instant::now());
-        self.active.program.send(Operation::Frame, input)
+        // Sending authorizes mutation even if decoding/rendering later rejects
+        // its output. Never return a stale pre-frame checkpoint from the cache.
+        self.snapshot = None;
+        self.active.pending_instances = None;
+        Ok(())
     }
 
     /// The frame the game computed for the input sent: decoded, validated
@@ -486,9 +515,11 @@ impl<B: Backend> GameRuntime<B> {
         if !state.is_empty() {
             return Err(anyhow::anyhow!("program frame must keep its state inside the guest").context(InvalidFrame));
         }
+        let scene = self.active.instances.resolve(&mut frame).map_err(|error| error.context(InvalidFrame))?;
         let decoded = Instant::now();
         host.validate(&frame).map_err(|error| error.context(InvalidFrame))?;
-        self.active.program.accept();
+        self.active.pending_instances = Some(scene);
+        self.active.accept();
         self.snapshot = None;
         if self.hashing {
             self.packet_hash = hash_lanes(&packet);
@@ -542,7 +573,7 @@ impl<B: Backend> GameRuntime<B> {
             let restored = restore(&self.engine, &module, &mut prepared, &state, host).await?;
             let rendered = evaluate(&mut prepared, &catalog, host).await?;
             host.render(&rendered, &catalog)?;
-            prepared.program.accept();
+            prepared.accept();
             let mut previous = std::mem::replace(&mut self.active, prepared);
             self.snapshot = None;
             self.module = module;
@@ -595,7 +626,7 @@ impl<B: Backend> GameRuntime<B> {
         Ok(self.shared_snapshot().await?.as_ref().clone())
     }
 
-    /// One guest serialization per accepted state revision. Tooling shares
+    /// One guest serialization per live state revision. Tooling shares
     /// the allocation; save owners can request an owned copy with `snapshot`.
     /// Like all guest requests, call only when no frame is in flight.
     pub async fn shared_snapshot(&mut self) -> Result<Arc<SavedState>> {
@@ -832,7 +863,7 @@ mod receive_tests {
     }
 
     #[test]
-    fn tooling_shares_one_snapshot_until_an_accepted_frame_or_restore() {
+    fn tooling_shares_one_snapshot_until_a_sent_frame_or_restore() {
         use Operation::{Create, Frame, Restore, Snapshot};
         let backend = Scripted::default();
         backend.answer(&[Create, Frame, Snapshot]);
@@ -847,11 +878,13 @@ mod receive_tests {
         ready(runtime.receive(&Viewer)).unwrap();
         let next = ready(runtime.shared_snapshot()).unwrap();
         assert!(!Arc::ptr_eq(&first, &next));
-        // A rejected frame does not change the accepted state.
+        // Rejection does not roll back mutation. An explicit Snapshot must
+        // re-read the guest; it cannot reuse the pre-frame accepted checkpoint.
         backend.0.borrow_mut().answers.push(Err(anyhow::anyhow!("rejected")));
         runtime.send(&[]).unwrap();
         assert!(ready(runtime.receive(&Viewer)).is_err());
-        assert!(Arc::ptr_eq(&next, &ready(runtime.shared_snapshot()).unwrap()));
+        backend.answer(&[Snapshot]);
+        assert!(!Arc::ptr_eq(&next, &ready(runtime.shared_snapshot()).unwrap()));
         backend.answer(&[Restore, Frame, Snapshot]);
         ready(runtime.load(&mut Viewer, &first)).unwrap();
         let restored = ready(runtime.shared_snapshot()).unwrap();

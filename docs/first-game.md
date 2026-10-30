@@ -63,7 +63,7 @@ same script gives the same pixels every time.
 import * as program from "pen/program"
 import { game } from "./game"
 
-entry const main = fn host => program.run game host
+entry const main = func host => return program.run game host
 ```
 
 pen runs `main` with the host, and `pen/program`'s `run` answers the host
@@ -89,32 +89,32 @@ const game = { schema, create, step, save, restore }
 `step` reads the arrows from the events:
 
 ```blot
-const step = fn (world: World) => fn (input: protocol.Input) => do:
+const step = func (world: World) => return func (input: protocol.Input) => return do:
   let speed = world.speed
   for event in input.events:
-    if let #protocol.KeyDown code = event:
+    if let $protocol.KeyDown code = event:
       if code == protocol.key_arrow_right:
         speed := self + nudge
       if code == protocol.key_arrow_left:
         speed := self - nudge
-  let next = #World { angle: world.angle + speed * input.elapsed, speed }
-  return (next, view next input)
+  let next = $World { angle: world.angle + speed * input.elapsed, speed }
+  break (next, view next input)
 ```
 
 and `view` makes the frame, starting from `frame.blank`, a frame that
 draws nothing, and setting the camera, the light and the draws:
 
 ```blot
-const view = fn (world: World) => fn (input: protocol.Input) => do:
+const view = func (world: World) => return func (input: protocol.Input) => return do:
   let drawn = frame.blank schema
   drawn.view := moved 0.0 0.0 (-5.0)
   drawn.projection := perspective 2.0 (input.width / input.height)
-  drawn.clear := #types.Color { r: 0.08, g: 0.1, b: 0.14, a: 1.0 }
-  drawn.light_direction := #types.Vector { x: -0.4, y: -1.0, z: -0.6 }
+  drawn.clear := $types.Color { r: 0.08, g: 0.1, b: 0.14, a: 1.0 }
+  drawn.light_direction := $types.Vector { x: -0.4, y: -1.0, z: -0.6 }
   drawn.draws := #[
-    #types.Draw { mesh: meshes.cube, material: materials.cube, transform: turned world.angle, parameters: #Nothing, extra: #[] },
+    $types.Draw { mesh: meshes.cube, material: materials.cube, transform: turned world.angle, parameters: $Nothing, extra: #[] },
   ]
-  return drawn
+  break drawn
 ```
 
 Matrices are column-major (`x`, `y`, `z`, `w` are columns), as WGSL reads
@@ -129,8 +129,8 @@ list and save.
 
 ```blot
   drawn.draws := #[
-    #types.Draw { mesh: meshes.cube, material: materials.cube, transform: turned world.angle, parameters: #Nothing, extra: #[] },
-    #types.Draw { mesh: meshes.cube, material: materials.cube, transform: moved 2.6 0.0 (-3.0), parameters: #Nothing, extra: #[] },
+    $types.Draw { mesh: meshes.cube, material: materials.cube, transform: turned world.angle, parameters: $Nothing, extra: #[] },
+    $types.Draw { mesh: meshes.cube, material: materials.cube, transform: moved 2.6 0.0 (-3.0), parameters: $Nothing, extra: #[] },
   ]
 ```
 

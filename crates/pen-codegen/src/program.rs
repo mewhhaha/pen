@@ -9,7 +9,7 @@ use serde_json::Value;
 /// What a game program says first (pen-runtime's `HANDSHAKE_MAGIC`), and
 /// the version of the program protocol it speaks (`PROGRAM_VERSION`).
 pub const PROGRAM_MAGIC: u32 = 4_670_544;
-pub const PROGRAM_VERSION: u32 = 1;
+pub const PROGRAM_VERSION: u32 = 2;
 
 const PROGRAM: &str = include_str!("program.blot");
 const CHECK: &str = include_str!("check.blot");
@@ -57,8 +57,8 @@ fn blank(field: &Value) -> String {
         float(value.as_f64().unwrap_or(0.0))
     };
     match kind(field) {
-        "flag" if default == true => "#True".to_owned(),
-        "flag" => "#False".to_owned(),
+        "flag" if default == true => "true".to_owned(),
+        "flag" => "false".to_owned(),
         "f32" => number(None),
         "count" => default.as_u64().unwrap_or(0).to_string(),
         "choice" => field["otherwise"].to_string(),
@@ -70,7 +70,7 @@ fn blank(field: &Value) -> String {
                 .map(|(index, component)| format!("{}: {}", s(component), number(Some(index))))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("#types.{} {{ {components} }}", s(&field["type"]["name"]))
+            format!("$types.{} {{ {components} }}", s(&field["type"]["name"]))
         }
         _ => "0".to_owned(),
     }
@@ -81,7 +81,7 @@ fn blank(field: &Value) -> String {
 pub fn frame(model: &Model, header: &[String]) -> String {
     let mut out = header.to_vec();
     out.extend(
-        "//\n// A frame to start from: one that draws, plays and asks nothing, lit from\n// above. A game sets what it needs (`frame.draws := #[...]`) and leaves the\n// rest.\nimport * as types from \"./types\"\n\nconst identity = #types.Mat4 {\n  x: #types.Vec4 { x: 1.0, y: 0.0, z: 0.0, w: 0.0 },\n  y: #types.Vec4 { x: 0.0, y: 1.0, z: 0.0, w: 0.0 },\n  z: #types.Vec4 { x: 0.0, y: 0.0, z: 1.0, w: 0.0 },\n  w: #types.Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },\n}\n\n// A frame of state `schema` that draws nothing.\nconst blank = fn (schema: U32) => #types.RenderFrame {"
+        "//\n// A frame to start from: one that draws, plays and asks nothing, lit from\n// above. A game sets what it needs (`frame.draws := #[...]`) and leaves the\n// rest.\nimport * as types from \"./types\"\n\nconst identity = $types.Mat4 {\n  x: $types.Vec4 { x: 1.0, y: 0.0, z: 0.0, w: 0.0 },\n  y: $types.Vec4 { x: 0.0, y: 1.0, z: 0.0, w: 0.0 },\n  z: $types.Vec4 { x: 0.0, y: 0.0, z: 1.0, w: 0.0 },\n  w: $types.Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },\n}\n\n// A frame of state `schema` that draws nothing.\nconst blank = func (schema: U32) => return $types.RenderFrame {"
             .lines()
             .map(str::to_owned),
     );
@@ -96,7 +96,7 @@ pub fn frame(model: &Model, header: &[String]) -> String {
                 Some(group) => {
                     groups.push(group);
                     let ty = s(&model.protocol["render"]["groups"][group]["type"]);
-                    out.push(format!("  {group}: #types.{ty} {{"));
+                    out.push(format!("  {group}: $types.{ty} {{"));
                     for member in model.header.iter().filter(|member| member.group.as_ref() == Some(group)) {
                         out.push(format!("    {}: {},", member.laid.name, blank(&member.laid.field)));
                     }
@@ -106,6 +106,12 @@ pub fn frame(model: &Model, header: &[String]) -> String {
             },
         }
     }
+    // A header contains fixed data only; source groups are separate borrowed
+    // views for encode_render_views. Never allocate an owning RenderFrame.
+    let header_start = out.iter().position(|line| line.starts_with("const blank =")).unwrap();
+    let mut header = out[header_start..].to_vec();
+    header[0] = "const header = func (schema: U32): types.RenderHeader => return {".to_owned();
+    header.push("}".to_owned());
     for entry in &model.sections {
         if kind(&entry.section) == "trailing" || entry.owner.is_some() {
             continue;
@@ -113,6 +119,8 @@ pub fn frame(model: &Model, header: &[String]) -> String {
         out.push(format!("  {}: #[],", s(&entry.section["name"])));
     }
     out.push("}".to_owned());
+    out.push(String::new());
+    out.extend(header);
     out.push(String::new());
     out.join("\n")
 }

@@ -2,3 +2,6 @@ target/
 /dist
 crates/pen-web/pkg/
 /docs/book/
+
+# Local packet captures and session state.
+/.pen/

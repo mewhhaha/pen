@@ -86,6 +86,7 @@ pub(crate) struct SpriteBatch {
     pub key: (u64, usize),
     pub first: u32,
     pub count: u32,
+    pub scene_filter: bool,
 }
 
 pub(crate) struct Sprites {
@@ -93,6 +94,7 @@ pub(crate) struct Sprites {
     screen: wgpu::Buffer,
     sampler: wgpu::Sampler,
     scene: Option<wgpu::TextureView>,
+    filtered: Option<[wgpu::TextureView; 2]>,
     white: wgpu::TextureView,
     capacity: usize,
     storage: Option<wgpu::Buffer>,
@@ -124,6 +126,7 @@ impl Sprites {
                 ..Default::default()
             }),
             scene: None,
+            filtered: None,
             white: device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some("sprite scene fallback"),
@@ -151,6 +154,39 @@ impl Sprites {
             self.scene = scene;
             self.groups.clear();
         }
+    }
+
+    /// Ping-pong targets keep each scene filter's input immutable. The
+    /// original image is copied first, preserving alpha and partial rectangles.
+    pub fn filter_targets(
+        &mut self,
+        device: &wgpu::Device,
+        size: (u32, u32),
+        format: wgpu::TextureFormat,
+    ) -> [wgpu::TextureView; 2] {
+        if self.filtered.as_ref().is_none_or(|views| {
+            let texture = views[0].texture();
+            (texture.width(), texture.height()) != size || texture.format() != format
+        }) {
+            self.filtered = Some(std::array::from_fn(|_| {
+                device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some("scene filter"),
+                        size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format,
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING
+                            | wgpu::TextureUsages::COPY_SRC
+                            | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    })
+                    .create_view(&Default::default())
+            }));
+        }
+        self.filtered.as_ref().unwrap().clone()
     }
 
     /// Draws `batches` of `sprites` (by their indices in `order`), in order,
@@ -239,6 +275,20 @@ impl Sprites {
         range: std::ops::Range<u32>,
         timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
+        self.draw_pass(device, encoder, output, batches, range, timestamps, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_pass(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::TextureView,
+        batches: &[SpriteBatch],
+        range: std::ops::Range<u32>,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+        scene_filter: bool,
+    ) {
         if range.is_empty() {
             return;
         }
@@ -256,6 +306,9 @@ impl Sprites {
         });
         let draws = self.draws;
         for batch in batches {
+            if batch.scene_filter != scene_filter {
+                continue;
+            }
             let first = batch.first.max(range.start);
             let end = (batch.first + batch.count).min(range.end);
             if first >= end {

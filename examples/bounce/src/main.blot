@@ -3,4 +3,4 @@
 import * as extensions from "pen/extensions"
 import { game } from "./game"
 
-entry const main = fn host => extensions.run game host
+entry const main = func host => return extensions.run game host

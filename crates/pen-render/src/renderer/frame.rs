@@ -472,12 +472,67 @@ impl State {
             particles::draw(&mut last, &scratch.emitters);
             draw_layers(&mut last, &later[1..], &mut stats);
         }
-        self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &output, &self.timer);
+        let has_filters = scratch.sprites.iter().any(|batch| batch.scene_filter);
+        if has_filters {
+            let layout = self.context.sprite_group.clone();
+            let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&device, layout));
+            let images = sprites.filter_targets(&device, (output_width, output_height), self.context.format);
+            self.post.as_mut().unwrap().finish_base(
+                &mut self.built_ins,
+                &mut encoder,
+                frame,
+                &images[0],
+                &self.timer,
+                true,
+            );
+            sprites.prepare(&device, &self.queue, (output_width, output_height), &frame.sprites, &scratch.sprite_order);
+            let mut current = 0;
+            // Each sprite is a pass, even if adjacent filters share a material.
+            for batch in scratch.sprites.iter().filter(|batch| batch.scene_filter) {
+                for index in batch.first..batch.first + batch.count {
+                    let next = 1 - current;
+                    encoder.copy_texture_to_texture(
+                        images[current].texture().as_image_copy(),
+                        images[next].texture().as_image_copy(),
+                        wgpu::Extent3d { width: output_width, height: output_height, depth_or_array_layers: 1 },
+                    );
+                    sprites.set_scene(Some(images[current].clone()));
+                    sprites.draw_pass(
+                        &device,
+                        &mut encoder,
+                        &images[next],
+                        std::slice::from_ref(batch),
+                        index..index + 1,
+                        self.timer.pass(Span::Post),
+                        true,
+                    );
+                    current = next;
+                }
+            }
+            self.post.as_mut().unwrap().finish_filtered(
+                &mut self.built_ins,
+                &mut encoder,
+                frame,
+                &images[current],
+                &output,
+                self.timer.pass(Span::Post),
+            );
+        } else {
+            self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &output, &self.timer);
+        }
         if !scratch.sprites.is_empty() {
             let layout = self.context.sprite_group.clone();
             let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&device, layout));
             sprites.set_scene(Some(targets.scene.clone()));
-            sprites.prepare(&device, &self.queue, (output_width, output_height), &frame.sprites, &scratch.sprite_order);
+            if !has_filters {
+                sprites.prepare(
+                    &device,
+                    &self.queue,
+                    (output_width, output_height),
+                    &frame.sprites,
+                    &scratch.sprite_order,
+                );
+            }
         }
         // Stable order within each layer; sprites under a modal are drawn
         // before its backdrop and 3D icons, then the modal's own text follows.

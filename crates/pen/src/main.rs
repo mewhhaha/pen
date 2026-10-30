@@ -1493,10 +1493,7 @@ fn listed(names: &[String]) -> String {
 #[cfg(feature = "compiler")]
 fn usage() -> String {
     let mut text = String::from(
-        "usage: pen [COMMAND] [OPTIONS]  (pen --help: this; pen --version)\n\n\
-         without a command, pen plays a packaged game: game/ beside the executable (a `pen build` package),\n\
-         or --game DIR.\n\n\
-         commands, in a checkout (a directory with pen.json and src/main.blot; or --project DIR):\n",
+        "usage: pen [COMMAND] [OPTIONS]  (pen --help: this; pen --version)\n\n\\n         without a command, pen plays a packaged game: game/ beside the executable (a `pen build` package),\n\\n         or --game DIR.\n\n\\n         commands, in a checkout (a directory with pen.json and src/main.blot; or --project DIR):\n",
     );
     let command = |text: &mut String, spec: &CommandSpec| {
         let head = format!("  {} {}", spec.name, spec.operands);
@@ -1529,24 +1526,13 @@ fn usage() -> String {
         entry(&mut text, format!("  {} {}", option.name, option.value).trim_end(), &about);
     }
     text.push_str(
-        "\ntime travel: Ctrl+Shift+P pauses and plays, Ctrl+Shift+period steps a frame, Ctrl+Shift+comma\n\
-         steps back, Ctrl+Shift+R replays the last 5 s (after a reload, on the new build); in scripts,\n\
-         pause resume step[=N] rewind=N replay=SECONDS.\n\n\
-         bug reports: Ctrl+Shift+B in a window (a script's report[=FILE]) writes the last 30 s of input,\n\
-         the state, the log and the system to a .penbug in reports/ of the data directory (pen report).\n\n\
-         dev tools (dev and run): the checkout's own program for them (devtools/main.blot) runs beside the\n\
-         game and draws over it: its console on the backquote key (/help lists what it does), and its\n\
-         diagnostics; a checkout without one runs without dev tools.\n\n\
-         environment:\n",
+        "\ntime travel: Ctrl+Shift+P pauses and plays, Ctrl+Shift+period steps a frame, Ctrl+Shift+comma\n\\n         steps back, Ctrl+Shift+R replays the last 5 s (after a reload, on the new build); in scripts,\n\\n         pause resume step[=N] rewind=N replay=SECONDS.\n\n\\n         bug reports: Ctrl+Shift+B in a window (a script's report[=FILE]) writes the last 30 s of input,\n\\n         the state, the log and the system to a .penbug in reports/ of the data directory (pen report).\n\n\\n         dev tools (dev and run): the checkout's own program for them (devtools/main.blot) runs beside the\n\\n         game and draws over it: its console on the backquote key (/help lists what it does), and its\n\\n         diagnostics; a checkout without one runs without dev tools.\n\n\\n         environment:\n",
     );
     for (name, about) in ENVIRONMENT {
         entry(&mut text, &format!("  {name}"), about);
     }
     text.push_str(
-        "\nthe game's name (its data directory, and its executable in a package) and title come from the\n\
-         checkout's pen.json, {\"game\": {\"name\": \"...\", \"title\": \"...\"}}, else its directory's name; a\n\
-         package keeps them in game/game.json. A panic, or an error that stops a package's runtime, writes\n\
-         a crash report to crashes/ in the data directory (or --data DIR).",
+        "\nthe game's name (its data directory, and its executable in a package) and title come from the\n\\n         checkout's pen.json, {\"game\": {\"name\": \"...\", \"title\": \"...\"}}, else its directory's name; a\n\\n         package keeps them in game/game.json. A panic, or an error that stops a package's runtime, writes\n\\n         a crash report to crashes/ in the data directory (or --data DIR).",
     );
     text
 }

@@ -39,7 +39,7 @@ pub struct Program {
     failure: Option<String>,
     /// The guest thread stopped answering: closing leaves it be.
     stuck: bool,
-    commit: bool,
+    published: bool,
     stopping: bool,
     /// The operation sent and not yet answered.
     pending: Option<Operation>,
@@ -106,7 +106,7 @@ impl Program {
             thread: Some(thread),
             failure: None,
             stuck: false,
-            commit: true,
+            published: true,
             stopping: false,
             pending: None,
             answered: None,
@@ -173,11 +173,11 @@ impl Program {
             bail!("game program failed: {failure}");
         }
         let mut request = std::mem::take(&mut self.spare);
-        pen_runtime::program::write_request(&mut request, self.commit, operation, payload);
+        pen_runtime::program::write_request(&mut request, self.published, operation, payload);
         sender.send(request).map_err(|_| anyhow!("game thread stopped"))?;
-        // A candidate must be accepted by the runtime before a later command
-        // commits it; rejection simply keeps the preceding guest-owned state.
-        self.commit = false;
+        // Acknowledge publication of the preceding output. The guest has already
+        // mutated simulation; a rejection cannot roll it back or retry a step.
+        self.published = false;
         self.pending = Some(operation);
         Ok(())
     }
@@ -214,7 +214,7 @@ impl Program {
     }
 
     pub fn accept(&mut self) {
-        self.commit = true;
+        self.published = true;
     }
 
     /// Asks the program to stop and waits for its thread (unless it is stuck).

@@ -30,19 +30,19 @@ const up = 4
 const down = 8
 const all = 15
 
-type World is data = #World { x: F32, z: F32, vx: F32, vz: F32, bounces: U32, held: U32 }
+type World is data = $World { x: F32, z: F32, vx: F32, vz: F32, bounces: U32, held: U32 }
 
-const create = fn () => #World { x: 0.0, z: 0.0, vx: 0.0, vz: 0.0, bounces: 0, held: 0 }
+const create = func () => return $World { x: 0.0, z: 0.0, vx: 0.0, vz: 0.0, bounces: 0, held: 0 }
 
 // The world as lanes, for quicksaves, time travel and reloads, and back.
-const save = fn (world: World) =>
+const save = func (world: World) => return
   #[world.x, world.z, world.vx, world.vz, U32.to_f32 world.bounces, U32.to_f32 world.held]
-const restore = fn (state: Array F32) => #World {
+const restore = func (state: Array F32) => return $World {
   x: state[0], z: state[1], vx: state[2], vz: state[3], bounces: F32.to_u32 state[4], held: F32.to_u32 state[5],
 }
 
 // The arrow a key is, as its bit; 0 for any other key.
-const arrow = fn (code: U32) => do:
+const arrow = func (code: U32) => return do:
   if code == protocol.key_arrow_left:
     return left
   if code == protocol.key_arrow_right:
@@ -54,21 +54,21 @@ const arrow = fn (code: U32) => do:
   return 0
 
 // What an event does to the world: an arrow held or let go, a kick.
-const take = fn (world: World) => fn (event: extensions.Event) => do:
+const take = func (world: World) => return func (event: extensions.Event) => return do:
   let next = world
-  if let #extensions.Kick { x, z } = event:
+  if let $extensions.Kick { x, z } = event:
     next.vx := self + x
     next.vz := self + z
-  if let #extensions.Pen (#protocol.KeyDown code) = event:
+  if let $extensions.Pen ($protocol.KeyDown code) = event:
     next.held := self | arrow code
-  if let #extensions.Pen (#protocol.KeyUp code) = event:
+  if let $extensions.Pen ($protocol.KeyUp code) = event:
     next.held := self & (all ^ arrow code)
-  if let #extensions.Pen #protocol.FocusLost = event:
+  if let $extensions.Pen $protocol.FocusLost = event:
     next.held := 0
   return next
 
 // How much the held arrows `positive` and `negative` push along their axis.
-const pushed = fn (held: U32) => fn (positive: U32) => fn (negative: U32) => do:
+const pushed = func (held: U32) => return func (positive: U32) => return func (negative: U32) => return do:
   let force = 0.0
   if (held & positive) != 0:
     force := self + push
@@ -78,51 +78,51 @@ const pushed = fn (held: U32) => fn (positive: U32) => fn (negative: U32) => do:
 
 // The ball `seconds` later: pushed by the arrows held, slowed by drag and
 // turned back by the walls; and whether it hit one.
-const roll = fn (world: World) => fn (seconds: F32) => do:
+const roll = func (world: World) => return func (seconds: F32) => return do:
   let slowed = 1.0 - drag * seconds
   let vx = (world.vx + pushed world.held right left * seconds) * slowed
   let vz = (world.vz + pushed world.held down up * seconds) * slowed
   let x = world.x + vx * seconds
   let z = world.z + vz * seconds
   let edge = yard - radius
-  let hit = #False
+  let hit = $False
   if x > edge:
     x := edge + edge - self
     vx := 0.0 - F32.abs vx
-    hit := #True
+    hit := $True
   if x < 0.0 - edge:
     x := 0.0 - edge - edge - self
     vx := F32.abs vx
-    hit := #True
+    hit := $True
   if z > edge:
     z := edge + edge - self
     vz := 0.0 - F32.abs vz
-    hit := #True
+    hit := $True
   if z < 0.0 - edge:
     z := 0.0 - edge - edge - self
     vz := F32.abs vz
-    hit := #True
+    hit := $True
   let bounces = world.bounces
   if hit:
     bounces := self + 1
-  return (#World { x, z, vx, vz, bounces, held: world.held }, hit)
+  return ($World { x, z, vx, vz, bounces, held: world.held }, hit)
 
-const vec4 = fn x => fn y => fn z => fn w => #types.Vec4 { x, y, z, w }
+const vec4 = func x => return func y => return func z => return func w => return $types.Vec4 { x, y, z, w }
 
 // A mesh stretched by (sx, sy, sz), then moved to (x, y, z); column-major,
 // as the packet carries matrices.
-const placed = fn (x: F32) => fn (y: F32) => fn (z: F32) => fn (sx: F32) => fn (sy: F32) => fn (sz: F32) =>
-  #types.Mat4 { x: vec4 sx 0.0 0.0 0.0, y: vec4 0.0 sy 0.0 0.0, z: vec4 0.0 0.0 sz 0.0, w: vec4 x y z 1.0 }
+const placed = func (x: F32) => return func (y: F32) => return func (z: F32) => return func (sx: F32) => return func (sy: F32) => return func (sz: F32) => return
+  $types.Mat4 { x: vec4 sx 0.0 0.0 0.0, y: vec4 0.0 sy 0.0 0.0, z: vec4 0.0 0.0 sz 0.0, w: vec4 x y z 1.0 }
 
-const draw = fn (mesh: U32) => fn (material: U32) => fn (transform: types.Mat4) =>
-  #types.Draw { mesh, material, transform, parameters: #Nothing, extra: #[] }
+const draw = func (mesh: U32) => return func (material: U32) => return func (transform: types.Mat4) => return
+  $types.Draw { mesh, material, transform, parameters: $Nothing, extra: #[] }
 
 // The eye at `eye`, looking at `target`, the sky up.
-const look_at = fn (eye: Vec3) => fn (target: Vec3) => do:
+const look_at = func (eye: Vec3) => return func (target: Vec3) => return do:
   let forward = (target - eye).normalized
-  let side = (forward.cross (#Vec3 { x: 0.0, y: 1.0, z: 0.0 })).normalized
+  let side = (forward.cross ($Vec3 { x: 0.0, y: 1.0, z: 0.0 })).normalized
   let above = side.cross forward
-  return #types.Mat4 {
+  return $types.Mat4 {
     x: vec4 side.x above.x (0.0 - forward.x) 0.0,
     y: vec4 side.y above.y (0.0 - forward.y) 0.0,
     z: vec4 side.z above.z (0.0 - forward.z) 0.0,
@@ -131,10 +131,10 @@ const look_at = fn (eye: Vec3) => fn (target: Vec3) => do:
 
 // A perspective seeing `focal` (1 over the tangent of half the vertical field
 // of view) at `aspect`, into WebGPU's depth of 0 to 1.
-const perspective = fn (focal: F32) => fn (aspect: F32) => do:
+const perspective = func (focal: F32) => return func (aspect: F32) => return do:
   let near = 0.1
   let far = 100.0
-  return #types.Mat4 {
+  return $types.Mat4 {
     x: vec4 (focal / aspect) 0.0 0.0 0.0,
     y: vec4 0.0 focal 0.0 0.0,
     z: vec4 0.0 0.0 (0.0 - far / (far - near)) (-1.0),
@@ -142,7 +142,7 @@ const perspective = fn (focal: F32) => fn (aspect: F32) => do:
   }
 
 // From above the near wall, down over the yard.
-const camera = look_at (#Vec3 { x: 0.0, y: 7.5, z: 7.0 }) (#Vec3 { x: 0.0, y: -0.5, z: 0.6 })
+const camera = look_at ($Vec3 { x: 0.0, y: 7.5, z: 7.0 }) ($Vec3 { x: 0.0, y: -0.5, z: 0.6 })
 
 // The floor and the four walls round it.
 const wall = yard + 0.15
@@ -155,33 +155,33 @@ const yard_draws = #[
 ]
 
 // A marker on the far wall for each bounce, sixteen at most.
-const markers = fn (bounces: U32) =>
+const markers = func (bounces: U32) => return
   #[draw meshes.box materials.marker (placed (U32.to_f32 index * 0.5 - 3.75) 0.35 (0.0 - wall) 0.15 0.15 0.15)
     | index <- array.generate (min bounces 16) identity]
 
 // What the world looks like, and the blip of a bounce.
-const view = fn (world: World) => fn (hit: Bool) => fn (input: extensions.Input) => do:
+const view = func (world: World) => return func (hit: Bool) => return func (input: extensions.Input) => return do:
   let drawn = frame.blank schema
   drawn.view := camera
   drawn.projection := perspective 1.8 (input.width / input.height)
-  drawn.clear := #types.Color { r: 0.55, g: 0.7, b: 0.85, a: 1.0 }
-  drawn.ambient := #types.Vector { x: 0.3, y: 0.32, z: 0.36 }
-  drawn.light_direction := #types.Vector { x: -0.35, y: -1.0, z: -0.5 }
+  drawn.clear := $types.Color { r: 0.55, g: 0.7, b: 0.85, a: 1.0 }
+  drawn.ambient := $types.Vector { x: 0.3, y: 0.32, z: 0.36 }
+  drawn.light_direction := $types.Vector { x: -0.35, y: -1.0, z: -0.5 }
   let ball = draw meshes.ball materials.ball (placed world.x 0.0 world.z radius radius radius)
   drawn.draws := array.concat #[ball, ...yard_draws] (markers world.bounces)
   if hit:
     drawn.sounds := #[
-      #types.Sound { clip: sounds.bounce, bus: 0, gain: 0.5, pan: world.x / yard, pitch: 1.0, lowpass: 24000.0, reverb: 0.0 },
+      $types.Sound { clip: sounds.bounce, bus: 0, gain: 0.5, pan: world.x / yard, pitch: 1.0, lowpass: 24000.0, reverb: 0.0 },
     ]
   return drawn
 
 // One frame: the events, then the ball rolls on (a tenth of a second at
 // most), then how it looks and its Score.
-const step = fn (world: World) => fn (input: extensions.Input) => do:
+const step = func (world: World) => return func (input: extensions.Input) => return do:
   let taken = array.fold_left take world input.events
   let (next, hit) = roll taken (min input.elapsed 0.1)
   let speed = F32.sqrt (next.vx * next.vx + next.vz * next.vz)
-  let score = extensions.encode_score #[#extensions.Score { bounces: next.bounces, speed }]
+  let score = extensions.encode_score #[$extensions.Score { bounces: next.bounces, speed }]
   return (next, view next hit input, #[score])
 
 // The game, as pen/extensions' `run` serves it.

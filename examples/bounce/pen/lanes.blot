@@ -4,20 +4,20 @@ import * as array from "std/array"
 
 const max_integer = 16777215
 
-const require = fn (condition: Bool) => do:
+const require = func (condition: Bool) => return do:
   if condition:
     return ()
   return @panic "invalid Pen numeric packet"
 
-const finite = fn (values: Array F32) => require (array.all is_finite values)
+const finite = func (values: Array F32) => return require (array.all is_finite values)
 
-const integer = fn (value: F32) => fn (maximum: U32) => do:
+const integer = func (value: F32) => return func (maximum: U32) => return do:
   let number = F32.to_u32 value
   use require (value == U32.to_f32 number)
   use require (number <= maximum)
   return number
 
-const bit = fn (value: Bool) => do:
+const bit = func (value: Bool) => return do:
   if value:
     return 1.0
   return 0.0

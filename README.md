@@ -691,6 +691,20 @@ save, load or exit. A game's own events and render sections, which its
 `just sync-protocol` regenerates it, and `just check` fails while it is
 stale.
 
+A frame may retain ordinary mesh instances between accepted frames. Set
+`retained_enabled`, send a full `retained_reset` on the first frame, then send
+only `instances` updates and `instance_removals`. Identities use two exact
+16-bit words. Instances sort by `(order, identity)` and are inserted at
+`retained_after` in the immediate draw list; pose indices refer to immediate
+draws and are adjusted by the runtime. Retained draws have no extra uniform
+vectors. The combined draw count is bounded by `MAX_DRAWS`.
+
+The shared native/browser game runtime prepares each delta transactionally and
+publishes it only when the frame is validated and accepted. Rejected frames
+leave the cache unchanged. Disabling retention clears it. Restore, reload and
+rewind replace the guest/cache together, so the next retained frame must reset.
+Downstream renderers and frame inspection receive complete ordinary draw lists.
+
 ### Services
 
 The game reaches the platform and native libraries through one boundary,

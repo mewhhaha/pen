@@ -1,5 +1,5 @@
 // Source of structured.js. Rebuild with scripts/bundle-structured.ts.
-// The upstream adapter owns task contexts, cancellation and resource journals.
+// The adapter retains one serial Foreign invocation; all numeric crossings copy.
 import { instantiateGuest } from "../../../blot2/compiler/guest.ts";
 
 const signature = { parameter: "Array F32", result: "Array F32" } as const;
@@ -54,7 +54,7 @@ export async function openStructured(bytes: Uint8Array) {
         try {
           await done;
         } catch { /* The failed request reports the trap. */ }
-        // callAsync drains all children before settling. No live stack is retired.
+        // The Foreign invocation has settled before its instance is disposed.
         guest.dispose();
       },
     };
@@ -66,7 +66,7 @@ export async function openStructured(bytes: Uint8Array) {
 }
 
 // Worker fallback: its frame callback blocks on the existing SAB transport.
-// Pure child tasks execute cooperatively, synchronously in this instance.
+// Worker batches run in isolated instances, never as child language tasks.
 export async function runStructuredSync(
   bytes: Uint8Array,
   exchange: (values: Float32Array, memory: number) => Float32Array,

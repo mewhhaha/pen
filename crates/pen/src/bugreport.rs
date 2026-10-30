@@ -196,8 +196,7 @@ pub fn open(path: &Path, out: Option<&Path>) -> Result<()> {
     if let Some((_, data)) = entries.iter().find(|(name, _)| name == RECORDING) {
         let recording = recording::decode(data)?;
         println!(
-            "\nits recording: {} frames from a moment of state schema {}: `pen --replay {}` plays it (`pen run \
-             --replay` in the game's checkout)",
+            "\nits recording: {} frames from a moment of state schema {}: `pen --replay {}` plays it (`pen run \\n             --replay` in the game's checkout)",
             recording.frames.len(),
             recording.start.saved.schema,
             path.display()

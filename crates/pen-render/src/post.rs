@@ -201,6 +201,7 @@ struct Targets {
     /// the depth alone.
     depth: wgpu::TextureView,
     depth_only: wgpu::TextureView,
+    marks: wgpu::TextureView,
     /// The scene's samples, resolved into `scene`.
     multisampled: Option<wgpu::TextureView>,
     /// The resolved scene.
@@ -289,6 +290,12 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
     })
 }
 
+struct FilteredPresent {
+    source: wgpu::TextureView,
+    marks: wgpu::TextureView,
+    group: wgpu::BindGroup,
+}
+
 pub(crate) struct Post {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -298,6 +305,7 @@ pub(crate) struct Post {
     unoccluded: wgpu::Texture,
     unbloomed: wgpu::Texture,
     targets: Option<Targets>,
+    filtered_present: Option<FilteredPresent>,
     /// The begun frame's quality and output size.
     quality: Option<Quality>,
     size: (u32, u32),
@@ -364,6 +372,7 @@ impl Post {
             unoccluded: single(wgpu::TextureFormat::R8Unorm, 255),
             unbloomed: single(SCENE_FORMAT, 0),
             targets: None,
+            filtered_present: None,
             quality: None,
             size: (1, 1),
             jitters: 0,
@@ -471,6 +480,7 @@ impl Post {
                 depth_only: depth_only(),
                 multisampled: multisampled.as_ref().map(view),
                 scene: view(&scene),
+                marks,
                 graphs,
             });
         }
@@ -572,7 +582,7 @@ impl Post {
         graph.compile(&self.device, built_ins, sharing)
     }
 
-    /// Encodes the passes after the scene, ending on `output`.
+    /// Encodes the ordinary path without additional targets or passes.
     pub fn finish(
         &mut self,
         built_ins: &mut BuiltIns,
@@ -580,6 +590,20 @@ impl Post {
         frame: &RenderFrame,
         output: &wgpu::TextureView,
         timer: &GpuTimer,
+    ) {
+        self.finish_base(built_ins, encoder, frame, output, timer, false);
+    }
+
+    /// With scene filters, defer camera effects until their output is ready.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_base(
+        &mut self,
+        built_ins: &mut BuiltIns,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+        output: &wgpu::TextureView,
+        timer: &GpuTimer,
+        filtered: bool,
     ) {
         let quality = self.quality.expect("Post::begin comes first");
         let size = self.size;
@@ -623,15 +647,15 @@ impl Post {
             bytemuck::cast_slice(&[
                 1.0 / output_width,
                 1.0 / output_height,
-                if quality.effects { frame.blur } else { 0.0 },
+                if quality.effects && !filtered { frame.blur } else { 0.0 },
                 0.0,
                 1.0 / width as f32,
                 1.0 / height as f32,
                 if quality.fxaa { 1.0 } else { 0.0 },
                 0.0,
                 // Screen heights, as texture coordinates.
-                if quality.effects { frame.aberration.x * output_height / output_width } else { 0.0 },
-                if quality.effects { frame.aberration.y } else { 0.0 },
+                if quality.effects && !filtered { frame.aberration.x * output_height / output_width } else { 0.0 },
+                if quality.effects && !filtered { frame.aberration.y } else { 0.0 },
                 width as f32,
                 height as f32,
                 if levels > 0 { BLOOM_STRENGTH } else { 0.0 },
@@ -641,6 +665,78 @@ impl Post {
             ]),
         );
         self.targets.as_ref().unwrap().graphs[graph].execute(encoder, built_ins, output, timer);
+    }
+    /// Apply blur and stencil-masked aberration to the styled image, before UI.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_filtered(
+        &mut self,
+        built_ins: &mut BuiltIns,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+        source: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+        timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
+        let uniform = self.uniform("filtered present", 64);
+        let targets = self.targets.as_ref().unwrap();
+        let key = targets.key;
+        let marks = targets.marks.clone();
+        let pipeline = built_ins.get(BuiltIn::Present(key.samples));
+        let quality = self.quality.unwrap();
+        let (width, height) = (self.size.0 as f32, self.size.1 as f32);
+        self.queue.write_buffer(
+            &uniform,
+            0,
+            bytemuck::cast_slice(&[
+                1.0 / width,
+                1.0 / height,
+                if quality.effects { frame.blur } else { 0.0 },
+                0.0,
+                1.0 / width,
+                1.0 / height,
+                0.0,
+                1.0,
+                if quality.effects { frame.aberration.x * height / width } else { 0.0 },
+                if quality.effects { frame.aberration.y } else { 0.0 },
+                key.width as f32,
+                key.height as f32,
+                0.0,
+                0.0,
+                0.0,
+                0.0f32,
+            ]),
+        );
+        if self.filtered_present.as_ref().is_none_or(|kept| kept.source != *source || kept.marks != marks) {
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("filtered present"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(source) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&marks) },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&self.unbloomed.create_view(&Default::default())),
+                    },
+                ],
+            });
+            self.filtered_present = Some(FilteredPresent { source: source.clone(), marks, group });
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("filtered camera effects"),
+            timestamp_writes: timestamps,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: output,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.filtered_present.as_ref().unwrap().group, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 #[cfg(test)]

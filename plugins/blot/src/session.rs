@@ -182,6 +182,9 @@ impl<C: Child> Session<C> {
         if let Some(tier) = settings.codegen_tier {
             open["codegenTier"] = json!(tier.name());
         }
+        if let Some(storage) = &settings.storage {
+            open["storage"] = storage.clone();
+        }
         let open = self.request(open, &[])?;
         let reply = self.exchange(open, deadline)?;
         let epoch = reply.metadata.get("epoch").and_then(Value::as_str).unwrap_or("");

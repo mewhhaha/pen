@@ -9,9 +9,9 @@ use anyhow::{Result, anyhow, bail, ensure};
 
 /// The custom section the manifest is in.
 pub const ABI_SECTION: &str = "blot:abi";
-/// The manifest versions this reads: 2, and 3, whose guests also track what
-/// they own across each call (see [`GuestAbi::ownership`]).
-pub const ABI_VERSIONS: std::ops::RangeInclusive<u32> = 2..=3;
+/// ABI 8 identifies data-stack storage, including scalar-only modules.
+/// Earlier profiles remain readable only during the compiler cutover.
+pub const ABI_VERSIONS: [u32; 3] = [2, 3, 8];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ValueType {
@@ -108,6 +108,9 @@ pub struct GuestConstant {
 pub struct GuestAbi {
     pub functions: Vec<GuestFunction>,
     pub constants: Vec<GuestConstant>,
+    /// ABI 8: named data-stack owners and copied numeric packets, with no
+    /// counted ownership hooks, resource adapters or language tasks.
+    pub data_stacks: bool,
     /// ABI 3: the module exports `blot:ownership_enter`, which a host calls
     /// before each call's inputs, and `blot:ownership_leave(outcome)`, which
     /// it calls after copying the result out (outcome 0) or after a failure
@@ -238,11 +241,12 @@ pub fn parse_abi(payload: &[u8]) -> Result<GuestAbi> {
     let mut reader = Reader { bytes: payload, at: 0 };
     let version = reader.u32()?;
     ensure!(ABI_VERSIONS.contains(&version), "invalid_abi: unsupported ABI version {version}");
-    let mut abi = GuestAbi { ownership: version == 3, ..GuestAbi::default() };
+    let mut abi = GuestAbi { ownership: version == 3, data_stacks: version == 8, ..GuestAbi::default() };
     let mut names = std::collections::HashSet::new();
     for _ in 0..reader.u32()? {
         let name = reader.name()?;
         let tag = reader.byte()?;
+        ensure!(version != 8 || tag != 13, "invalid_abi: data-stack ABI does not support language tasks");
         // 13: a concurrent callback, valid only beside a task section.
         if tag == 13 {
             abi.concurrent.push(name.clone());
@@ -305,7 +309,11 @@ pub fn custom_sections(wasm: &[u8]) -> Result<Vec<(String, &[u8])>> {
 pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     let mut found = None;
     let mut tasks = None;
+    let mut counted_section = false;
     for (name, payload) in custom_sections(wasm)? {
+        if matches!(name.as_str(), "blot:ownership" | "blot:cycles" | "blot:memory-profile" | "blot:cleanup_data") {
+            counted_section = true;
+        }
         if name == ABI_SECTION {
             ensure!(found.is_none(), "invalid_abi: more than one {ABI_SECTION} section");
             found = Some(parse_abi(payload)?);
@@ -315,6 +323,10 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
         }
     }
     let mut abi = found.ok_or_else(|| anyhow!("invalid_abi: missing {ABI_SECTION} section"))?;
+    ensure!(
+        !abi.data_stacks || !counted_section,
+        "invalid_abi: data-stack ABI cannot declare counted runtime sections"
+    );
     ensure!(tasks.is_none() || abi.ownership, "invalid_abi: tasks need ABI 3's ownership");
     ensure!(tasks.is_some() || abi.concurrent.is_empty(), "invalid_abi: concurrent callbacks need {TASKS_SECTION}");
     abi.tasks = tasks;
@@ -352,6 +364,7 @@ mod tests {
         assert!(parse_abi(&[0x02, 0x00, 0x00, 0x00]).is_err());
         assert_eq!(parse_abi(&[0x03, 0x00, 0x00]).unwrap(), GuestAbi { ownership: true, ..GuestAbi::default() });
         assert!(parse_abi(&[0x04, 0x00, 0x00]).is_err());
+        assert_eq!(parse_abi(&[0x08, 0x00, 0x00]).unwrap(), GuestAbi { data_stacks: true, ..GuestAbi::default() });
     }
 
     #[test]
@@ -378,6 +391,10 @@ mod tests {
         assert!(error(&[section(ABI_SECTION, &version_2), section(TASKS_SECTION, &[2, 3])]).contains("ownership"));
         assert!(error(&[section(ABI_SECTION, &manifest), section(TASKS_SECTION, &[1, 3])]).contains("contract 1"));
         assert!(GuestAbi::default().check_hostable().is_ok());
+        let stack = section(ABI_SECTION, &[8, 0, 0]);
+        assert!(read_abi(&module(std::slice::from_ref(&stack))).unwrap().data_stacks);
+        assert!(error(&[stack.clone(), section("blot:ownership", &[1, 0, 1])]).contains("counted runtime"));
+        assert!(error(&[stack, section(TASKS_SECTION, &[2, 0])]).contains("ownership"));
     }
 
     #[test]

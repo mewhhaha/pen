@@ -12,8 +12,8 @@ use pen_runtime::timeline::{Recorded, Recording};
 /// Where the page's link has a recording, if it has one.
 pub fn linked() -> Option<String> {
     let location = web_sys::window().unwrap().location();
-    if let Some(data) = location.hash().ok()?.strip_prefix("#replay=").filter(|data| !data.is_empty()) {
-        return Some(format!("#replay={data}"));
+    if let Some(data) = location.hash().ok()?.strip_prefix("$replay=").filter(|data| !data.is_empty()) {
+        return Some(format!("$replay={data}"));
     }
     let query = web_sys::UrlSearchParams::new_with_str(&location.search().ok()?).ok()?;
     query.get("replay").filter(|url| !url.is_empty())
@@ -21,7 +21,7 @@ pub fn linked() -> Option<String> {
 
 /// The recording `source` (what [`linked`] found) holds, and a name for it.
 pub async fn fetch(source: &str) -> Result<(Recording, String)> {
-    let (bytes, name) = match source.strip_prefix("#replay=") {
+    let (bytes, name) = match source.strip_prefix("$replay=") {
         Some(data) => (recording::from_fragment(data)?, "the link".to_owned()),
         None => (crate::fetch(source).await?, source.to_owned()),
     };

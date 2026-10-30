@@ -175,8 +175,7 @@ mod tests {
         assert_eq!(scripts.depot, root.join("steam/depot_build_1234561.vdf"));
         let depot = std::fs::read_to_string(&scripts.depot).unwrap();
         let expected = format!(
-            "\"DepotBuild\"\n{{\n\t\"DepotID\" \"1234561\"\n\t\"ContentRoot\" \"{}\"\n\t\"FileMapping\"\n\t{{\n\t\t\
-             \"LocalPath\" \"*\"\n\t\t\"DepotPath\" \".\"\n\t\t\"Recursive\" \"1\"\n\t}}\n}}\n",
+            "\"DepotBuild\"\n{{\n\t\"DepotID\" \"1234561\"\n\t\"ContentRoot\" \"{}\"\n\t\"FileMapping\"\n\t{{\n\t\t\\n             \"LocalPath\" \"*\"\n\t\t\"DepotPath\" \".\"\n\t\t\"Recursive\" \"1\"\n\t}}\n}}\n",
             root.join("linux").display()
         );
         assert_eq!(depot, expected);
@@ -200,7 +199,7 @@ mod tests {
         for (text, why) in [
             (r#"{"app": 480, "depots": {"linux": 481}}"#, "Spacewar"),
             (r#"{"app": 1234560, "depots": {"linux": 1}, "branch": "Default"}"#, "default branch"),
-            (r#"{"app": 1234560, "depots": {"linux": 1}, "branch": "a\"b"}"#, "not a branch"),
+            (r#"{\"app\": 1234560, \"depots\": {\"linux\": 1}, \"branch\": \"a\"b\"}"#, "not a branch"),
             (r#"{"app": 1234560, "depots": {"android": 1}}"#, "not linux"),
             (r#"{"app": 1234560, "depots": {"linux": 0}}"#, "not 0"),
         ] {

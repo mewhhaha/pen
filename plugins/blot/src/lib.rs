@@ -35,6 +35,12 @@
 //! - `inferenceBudget`: positive U32 work limit for module inference and
 //!   associated evidence, passed to `blotc --inference-budget`; absent uses
 //!   the compiler default.
+//! - `storage`: optional object of `temporaryBytes`, `growerBytes`,
+//!   `persistentBytes`, `transportBytes` and `ownerCapacity`, forwarded to the
+//!   project-open request. Byte budgets must be positive U32 multiples of 16;
+//!   owner capacity must be positive U32. Omitted fields use compiler defaults.
+//!   Grower budgets apply to each simultaneously live growable region; they
+//!   are not a single shared application allowance.
 //! - `program`: the name the compiler is granted under (`blotc`).
 //! - `imports`: import prefixes, each ending in `/`, and the directories
 //!   behind them.

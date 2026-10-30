@@ -93,7 +93,7 @@ mod tests {
     fn packet_contract_layout() {
         let model = model::build(schema()).unwrap();
         assert_eq!(model.magic, 0x474446);
-        assert_eq!(model.header_lanes, 146);
+        assert_eq!(model.header_lanes, 151);
         assert_eq!(model.event_lanes(), 5);
         assert_eq!(model.section("draws").fixed.as_ref().unwrap().lanes, 24);
         assert_eq!(model.section("insets").fixed.as_ref().unwrap().lanes, 48);
@@ -117,14 +117,14 @@ mod tests {
             for import in source.lines().filter(|line| line.starts_with("import ")) {
                 let path = import.split('"').nth(1).unwrap();
                 assert!(
-                    ["std/array", "./lanes", "./protocol", "./protocol_render", "./types"].contains(&path),
+                    ["std/array", "std/simd", "./lanes", "./protocol", "./protocol_render", "./types"].contains(&path),
                     "external binding dependency: {path}"
                 );
             }
         }
         let render = &sources.iter().find(|(name, _)| *name == "protocol_render.blot").unwrap().1;
-        assert!(render.contains("fn (packet: types.RenderFrame)"));
-        assert!(render.contains("fn (draw: types.Draw)"));
+        assert!(render.contains("func (packet: types.RenderFrame)"));
+        assert!(render.contains("func (draw: types.Draw)"));
         assert!(render.contains("draw.transform"));
         assert!(render.contains("inset.ambient.x"));
         assert!(render.contains("packet.clear.r"));
@@ -148,8 +148,8 @@ mod tests {
         );
         let sources = blot::emit(&model, HEADER);
         let canonical = &sources.iter().find(|(name, _)| *name == "protocol_canonical.blot").unwrap().1;
-        assert!(canonical.contains("const canonical_input = fn (input: protocol.Input) => do:"));
-        assert!(canonical.contains("const render_from_canonical = fn (canonical: Array F32) => do:"));
+        assert!(canonical.contains("const canonical_input = func (input: protocol.Input) => return do:"));
+        assert!(canonical.contains("const render_from_canonical = func (canonical: Array F32) => return do:"));
         // Blot reads back every field of the record the game encodes, in its order.
         let types = &sources.iter().find(|(name, _)| *name == "types.blot").unwrap().1;
         let fields = |source: &str, opening: &str| -> Vec<String> {
@@ -159,8 +159,8 @@ mod tests {
                 .filter(|field| !field.is_empty())
                 .collect()
         };
-        let read = fields(canonical, "return #types.RenderFrame {");
-        assert_eq!(read, fields(types, "type RenderFrame is data = #RenderFrame {"));
+        let read = fields(canonical, "return $types.RenderFrame {");
+        assert_eq!(read, fields(types, "type RenderFrame is data = $RenderFrame {"));
         assert_eq!(read[..2], ["schema", "save_requested"]);
         // Each record's walk follows its fields; a group's sits where its first lane does.
         assert!(rust.contains(

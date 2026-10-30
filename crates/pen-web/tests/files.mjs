@@ -37,7 +37,7 @@ async function open(url, viewport) {
   page.on('pageerror', error => messages.push({ type: 'pageerror', text: String(error) }));
   // The page's module runs until the game has started: wait for that below.
   await page.goto(url, { waitUntil: 'commit' });
-  await page.waitForFunction(() => document.querySelector('#status')?.textContent === ''
+  await page.waitForFunction(() => document.querySelector('$status')?.textContent === ''
     && document.querySelector('canvas')?.getAttribute('aria-busy') === 'false', null, { timeout: 120000 });
   return page;
 }

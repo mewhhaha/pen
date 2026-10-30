@@ -43,6 +43,8 @@ pub struct Settings {
     pub semantic_workers: Option<u32>,
     /// Explicit inference/evidence work limit; absent uses the compiler default.
     pub inference_budget: Option<u32>,
+    /// Explicit scoped-storage budgets; absent fields use compiler defaults.
+    pub storage: Option<Value>,
     /// The only compiler identity (64 lowercase hex digits) to accept.
     pub expected_identity: Option<String>,
     /// Native readers owned by blotc. Paths are resolved against the project.
@@ -90,6 +92,33 @@ impl TestSettings {
     }
 }
 
+/// Keep the public object's spelling and optional fields intact: blotc owns
+/// defaults and includes the resolved budget values in its retained identity.
+fn storage(value: Option<&Value>) -> Result<Option<Value>, String> {
+    let fields = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(fields)) => fields,
+        _ => return Err("the settings' `storage` is not an object".into()),
+    };
+    const BYTES: [&str; 4] = ["temporaryBytes", "growerBytes", "persistentBytes", "transportBytes"];
+    for (key, value) in fields {
+        if !BYTES.contains(&key.as_str()) && key != "ownerCapacity" {
+            return Err(format!(
+                "storage has no `{key}` (it has temporaryBytes, growerBytes, persistentBytes, transportBytes, ownerCapacity)"
+            ));
+        }
+        let number = value
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| format!("storage.{key} is not a positive U32"))?;
+        if BYTES.contains(&key.as_str()) && number % 16 != 0 {
+            return Err(format!("storage.{key} is not aligned to 16 bytes"));
+        }
+    }
+    Ok(value.cloned())
+}
+
 impl Settings {
     /// Reads `json` (a program's settings, "{}" for none), resolving the
     /// relative paths in it against `root`.
@@ -98,7 +127,7 @@ impl Settings {
         let Value::Object(fields) = value else {
             return Err("the settings are not a JSON object".into());
         };
-        const KNOWN: [&str; 11] = [
+        const KNOWN: [&str; 12] = [
             "program",
             "imports",
             "std",
@@ -107,6 +136,7 @@ impl Settings {
             "codegenTier",
             "semanticWorkers",
             "inferenceBudget",
+            "storage",
             "expectedIdentity",
             "nativeAssets",
             "tests",
@@ -167,6 +197,7 @@ impl Settings {
             codegen_tier,
             semantic_workers,
             inference_budget,
+            storage: storage(fields.get("storage"))?,
             expected_identity,
             native_assets: native_assets(fields.get("nativeAssets"), root)?,
             tests: TestSettings::parse(fields.get("tests"), root)?,
@@ -336,6 +367,32 @@ pub(crate) fn parent(path: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn storage_budgets_preserve_optional_fields_and_reject_invalid_units() {
+        let settings = Settings::parse(
+            r#"{"storage":{"temporaryBytes":2097152,"persistentBytes":262144,"ownerCapacity":4096}}"#,
+            "/project",
+        )
+        .unwrap();
+        assert_eq!(
+            settings.storage,
+            Some(json!({"temporaryBytes":2097152,"persistentBytes":262144,"ownerCapacity":4096}))
+        );
+        assert_eq!(settings.args(), ["serve-project"]);
+        assert_eq!(Settings::parse("{}", "/project").unwrap().storage, None);
+        for value in [
+            r#"{"unknown":16}"#,
+            r#"{"growerBytes":0}"#,
+            r#"{"growerBytes":17}"#,
+            r#"{"transportBytes":4294967296}"#,
+            r#"{"ownerCapacity":0}"#,
+            r#"{"ownerCapacity":1.5}"#,
+            "[]",
+        ] {
+            assert!(Settings::parse(&format!("{{\"storage\":{value}}}"), "/project").is_err(), "{value}");
+        }
+    }
 
     #[test]
     fn inference_budget_is_explicit_positive_and_passed_to_the_compiler() {

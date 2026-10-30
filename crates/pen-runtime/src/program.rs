@@ -19,7 +19,7 @@ pub enum Operation {
 /// What a program says first: this magic number (0x474450), its protocol
 /// version, its state schema and whether it keeps scenes.
 pub const HANDSHAKE_MAGIC: f32 = 4670544.0;
-pub const PROGRAM_VERSION: f32 = 1.0;
+pub const PROGRAM_VERSION: f32 = 2.0;
 
 /// What a program answers in place of a state it refused.
 const REFUSED_STATE: [f32; 1] = [-1.0];
@@ -35,20 +35,21 @@ pub fn handshake(description: &[f32]) -> Result<(u32, bool)> {
     Ok((validate_schema(description[2])?, description[3] == 1.0))
 }
 
-/// A request: whether the program keeps what it did for the last one (the
-/// host accepted it), the operation, then the payload. Written over
+/// A request: whether the host published the preceding output, the operation,
+/// then the payload. Version 2 never uses this acknowledgement to roll back
+/// simulation. Written over
 /// `packet`, reusing its allocation.
-pub fn write_request(packet: &mut Vec<f32>, commit: bool, operation: Operation, payload: &[f32]) {
+pub fn write_request(packet: &mut Vec<f32>, published: bool, operation: Operation, payload: &[f32]) {
     packet.clear();
     packet.reserve(payload.len() + 2);
-    packet.push(if commit { 1.0 } else { 0.0 });
+    packet.push(if published { 1.0 } else { 0.0 });
     packet.push(operation as u8 as f32);
     packet.extend_from_slice(payload);
 }
 
-pub fn request(commit: bool, operation: Operation, payload: &[f32]) -> Vec<f32> {
+pub fn request(published: bool, operation: Operation, payload: &[f32]) -> Vec<f32> {
     let mut packet = Vec::new();
-    write_request(&mut packet, commit, operation, payload);
+    write_request(&mut packet, published, operation, payload);
     packet
 }
 
@@ -118,6 +119,7 @@ pub trait Program {
     }
     /// Takes back a response's buffer, for the next request to reuse.
     fn recycle(&mut self, _buffer: Vec<f32>) {}
+    /// Acknowledge output publication; simulation mutation is already complete.
     fn accept(&mut self);
     fn answered(&self) -> Option<Instant>;
     fn memory_bytes(&self) -> usize;
@@ -129,9 +131,9 @@ mod tests {
     use super::*;
     #[test]
     fn program_boundary_rejects_invalid_handshake_and_responses() {
-        assert_eq!(handshake(&[HANDSHAKE_MAGIC, 1.0, 5.0, 1.0]).unwrap(), (5, true));
-        assert!(handshake(&[HANDSHAKE_MAGIC, 2.0, 5.0, 1.0]).is_err());
-        assert!(handshake(&[HANDSHAKE_MAGIC, 1.0, 5.5, 1.0]).is_err());
+        assert_eq!(handshake(&[HANDSHAKE_MAGIC, PROGRAM_VERSION, 5.0, 1.0]).unwrap(), (5, true));
+        assert!(handshake(&[HANDSHAKE_MAGIC, 1.0, 5.0, 1.0]).is_err());
+        assert!(handshake(&[HANDSHAKE_MAGIC, PROGRAM_VERSION, 5.5, 1.0]).is_err());
         assert_eq!(request(false, Operation::Frame, &[8.0]), [0.0, 2.0, 8.0]);
         let mut packet = vec![9.0; 10];
         write_request(&mut packet, true, Operation::Snapshot, &[]);

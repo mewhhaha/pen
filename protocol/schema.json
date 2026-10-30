@@ -57,10 +57,26 @@
     }
   ],
   "limits": [
-    { "limit": "PROVENANCE_TAG", "value": 0, "doc": "Reserved extension tag for optional development provenance; game section tags start at 1." },
-    { "limit": "MAX_PROVENANCE_LANES", "value": 16384, "doc": "The most UTF-8 JSON bytes, each encoded as one float32 lane, in a frame's provenance." },
-    { "limit": "MAX_PROVENANCE_ENTRIES", "value": 64, "doc": "The most source/object associations in one frame; no history is retained by the decoder." },
-    { "limit": "MAX_PROVENANCE_TEXT", "value": 256, "doc": "The most UTF-8 bytes in a provenance object ID, system label or source filename." },
+    {
+      "limit": "PROVENANCE_TAG",
+      "value": 0,
+      "doc": "Reserved extension tag for optional development provenance; game section tags start at 1."
+    },
+    {
+      "limit": "MAX_PROVENANCE_LANES",
+      "value": 16384,
+      "doc": "The most UTF-8 JSON bytes, each encoded as one float32 lane, in a frame's provenance."
+    },
+    {
+      "limit": "MAX_PROVENANCE_ENTRIES",
+      "value": 64,
+      "doc": "The most source/object associations in one frame; no history is retained by the decoder."
+    },
+    {
+      "limit": "MAX_PROVENANCE_TEXT",
+      "value": 256,
+      "doc": "The most UTF-8 bytes in a provenance object ID, system label or source filename."
+    },
     {
       "limit": "MAX_STATE_FLOATS",
       "value": 16777215,
@@ -242,6 +258,14 @@
       "limit": "MAX_PANNERS",
       "value": 512,
       "doc": "The most panners one frame may declare: one for each voice and sound it may have."
+    },
+    {
+      "limit": "MAX_INSTANCES",
+      "value": 100000
+    },
+    {
+      "limit": "MAX_INSTANCE_REMOVALS",
+      "value": 100000
     }
   ],
   "enumerations": [
@@ -249,7 +273,18 @@
       "name": "TestDriverOp",
       "constant": "TEST_DRIVER_OP",
       "doc": "Version-1 native session test commands. Available only to a separate test guest in pen test-blot --session.",
-      "values": ["launch", "step", "click", "visible", "hidden", "press", "snapshot", "equal", "screenshot", "finish"]
+      "values": [
+        "launch",
+        "step",
+        "click",
+        "visible",
+        "hidden",
+        "press",
+        "snapshot",
+        "equal",
+        "screenshot",
+        "finish"
+      ]
     },
     {
       "name": "UiRole",
@@ -1922,6 +1957,28 @@
       "show_captions": {
         "kind": "flag",
         "doc": "Show sound captions when the player has enabled them in the game's accessibility settings. Off by default; the game owns and saves the choice."
+      },
+      "retained_enabled": {
+        "kind": "flag",
+        "doc": "Resolve persistent scene instances, inserting them before immediate draw retained_after."
+      },
+      "retained_reset": {
+        "kind": "flag",
+        "doc": "Replace the persistent instance scene. Required on its first frame."
+      },
+      "retained_after": {
+        "kind": "count",
+        "max": 100000
+      },
+      "instance_count": {
+        "kind": "size",
+        "section": "instances",
+        "of": "count"
+      },
+      "instance_removal_count": {
+        "kind": "size",
+        "section": "instance_removals",
+        "of": "count"
       }
     },
     "sections": [
@@ -2227,7 +2284,10 @@
             },
             "after_sprites": {
               "kind": "count",
-              "max": { "limit": "MAX_SPRITES", "value": 65536 },
+              "max": {
+                "limit": "MAX_SPRITES",
+                "value": 65536
+              },
               "doc": "Composite after this many frame sprites; zero draws below all sprites."
             }
           },
@@ -3004,12 +3064,77 @@
         }
       },
       {
+        "kind": "records",
+        "name": "instances",
+        "record": {
+          "name": "Instance",
+          "constant": "INSTANCE",
+          "fields": {
+            "id_low": {
+              "kind": "count",
+              "max": 65535
+            },
+            "id_high": {
+              "kind": "count",
+              "max": 65535
+            },
+            "order": {
+              "kind": "count",
+              "max": 16777215
+            },
+            "mesh": {
+              "kind": "reference",
+              "to": "mesh"
+            },
+            "material": {
+              "kind": "reference",
+              "to": "material"
+            },
+            "transform": {
+              "kind": "matrix"
+            },
+            "parameters": {
+              "kind": "optional",
+              "count": 4,
+              "message": "draw parameters must contain zero or four lanes",
+              "doc": "Optional four shader values, overriding the material's instance defaults."
+            }
+          }
+        },
+        "max": {
+          "limit": "MAX_INSTANCES",
+          "value": 100000
+        }
+      },
+      {
+        "kind": "records",
+        "name": "instance_removals",
+        "record": {
+          "name": "InstanceRemoval",
+          "constant": "INSTANCE_REMOVAL",
+          "fields": {
+            "id_low": {
+              "kind": "count",
+              "max": 65535
+            },
+            "id_high": {
+              "kind": "count",
+              "max": 65535
+            }
+          }
+        },
+        "max": {
+          "limit": "MAX_INSTANCE_REMOVALS",
+          "value": 100000
+        }
+      },
+      {
         "kind": "trailing",
         "name": "extras"
       }
     ],
     "extensions": {
-    "doc": "The game's own sections, which its pen.json `protocol` declares, after the rest of the packet: a marker, their count, then each one's tag, length and values. A packet without any ends before the marker. Tag 0 is reserved for one optional development provenance block: at most MAX_PROVENANCE_LANES UTF-8 JSON bytes as float32 lanes, version 1 with entries of first/end packet lane ranges and optional object, system, source (file/start/end UTF-8 byte span). See docs/packet-diagnostics.md. Hosts consume this metadata without retaining it in the rendered frame; release games omit it.",
+      "doc": "The game's own sections, which its pen.json `protocol` declares, after the rest of the packet: a marker, their count, then each one's tag, length and values. A packet without any ends before the marker. Tag 0 is reserved for one optional development provenance block: at most MAX_PROVENANCE_LANES UTF-8 JSON bytes as float32 lanes, version 1 with entries of first/end packet lane ranges and optional object, system, source (file/start/end UTF-8 byte span). See docs/packet-diagnostics.md. Hosts consume this metadata without retaining it in the rendered frame; release games omit it.",
       "marker": 5260632,
       "max": {
         "limit": "MAX_EXTENSIONS",

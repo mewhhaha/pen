@@ -50,7 +50,7 @@ pub struct BrowserProgram {
     guest: Guest,
     schema: u32,
     scenes: bool,
-    commit: bool,
+    published: bool,
     pending: Option<(Operation, Promise)>,
     stopping: bool,
     answered: Option<Instant>,
@@ -64,9 +64,8 @@ impl Backend for BrowserBackend {
 
     async fn start(&self, module: &Vec<u8>) -> Result<BrowserProgram> {
         let abi = pen_runtime::abi::read_abi(module)?;
-        // The browser adapter hosts cooperative task scopes. The frame
-        // exchange remains serial; concurrent service capabilities need their
-        // own recorded request/answer boundary rather than sharing this one.
+        // The mutable application exchange is serial. Isolated worker services
+        // copy their own data and never share this invocation or its pools.
         ensure!(
             !abi.concurrent.iter().any(|name| name == "main"),
             "unsupported_abi: the game frame callback must be serial"
@@ -82,7 +81,7 @@ impl Backend for BrowserBackend {
             guest: value.unchecked_into(),
             schema,
             scenes,
-            commit: true,
+            published: true,
             pending: None,
             stopping: false,
             answered: None,
@@ -105,10 +104,10 @@ impl Program for BrowserProgram {
         ensure!(!self.stopping, "game program is closed");
         ensure!(self.pending.is_none(), "game program already has a request in flight");
         ensure!(self.failure.is_none(), "game program failed: {:?}", self.failure);
-        let packet = program::request(self.commit, operation, payload);
+        let packet = program::request(self.published, operation, payload);
         let promise = self.guest.next(&Float32Array::from(packet.as_slice())).map_err(error)?;
         self.pending = Some((operation, promise));
-        self.commit = false;
+        self.published = false;
         Ok(())
     }
 
@@ -127,7 +126,7 @@ impl Program for BrowserProgram {
     }
 
     fn accept(&mut self) {
-        self.commit = true;
+        self.published = true;
     }
 
     fn answered(&self) -> Option<Instant> {

@@ -131,7 +131,7 @@ mod tests {
         };
         let mut covered: std::collections::HashSet<char> = (32u8..127).map(char::from).collect();
         for line in font.lines() {
-            if let Some((code, _)) = line.trim().split_once(" => #metrics.Glyph")
+            if let Some((code, _)) = line.trim().split_once(" => $metrics.Glyph")
                 && let Some(character) = code.parse::<u32>().ok().and_then(char::from_u32)
             {
                 covered.insert(character);

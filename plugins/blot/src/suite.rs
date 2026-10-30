@@ -244,8 +244,8 @@ mod tests {
         Program { root: "/gdev".into(), entry: "/gdev/src/main.blot".into(), settings: "{}".into() }
     }
 
-    const SAYS: &str = "// rejects: what test_d says\nentry const test_d = fn () => 0\n";
-    const TEST: &str = "entry const test_d = fn () => 0\n";
+    const SAYS: &str = "// rejects: what test_d says\nentry const test_d = func () => return 0\n";
+    const TEST: &str = "entry const test_d = func () => return 0\n";
 
     fn layout() -> Memory {
         checkout(&[
@@ -317,7 +317,7 @@ mod tests {
     fn expected_panics_can_share_the_check_fixture() {
         let mut files = checkout(&[(
             "tests/a.blot",
-            "entry const test_ok = fn () => #[1.0,0.0]\nentry const trap_bad = fn () => @panic \"bad\"\n",
+            "entry const test_ok = func () => return #[1.0,0.0]\nentry const trap_bad = func () => return @panic \"bad\"\n",
         )]);
         let found = find(&program(), &[], None, &mut files).unwrap();
         assert_eq!(found.len(), 2);
@@ -343,7 +343,7 @@ mod tests {
         // not compile is named for its file.
         let mut files = checkout(&[
             ("tests/a.blot", TEST),
-            ("tests/b.blot", "entry const test_e = fn () => 0\n"),
+            ("tests/b.blot", "entry const test_e = func () => return 0\n"),
             ("tests/rejected/twice.blot", SAYS),
         ]);
         assert_eq!(paths(&find(&program(), &[], Some("test_d"), &mut files).unwrap()), ["a.blot"]);

@@ -46,7 +46,7 @@ try {
     await page.route('**/diagnostics.html', route => route.fulfill({
       contentType: 'text/html',
       headers: { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' },
-      body: `<!doctype html><style>canvas{width:160px;height:120px}#status{white-space:pre-wrap}</style><canvas tabindex="0"></canvas><div id="status">Starting</div><script type="module">
+      body: `<!doctype html><style>canvas{width:160px;height:120px}$status{white-space:pre-wrap}</style><canvas tabindex="0"></canvas><div id="status">Starting</div><script type="module">
         import init,{start} from './pen_web.js';
         try {
           await init();
@@ -72,25 +72,25 @@ try {
       </script>`,
     }));
     await page.goto(`${server.url}diagnostics.html`);
-    await page.waitForFunction(expected => document.querySelector('#status').textContent.includes(expected), test.diagnostic, { timeout: 120000 });
+    await page.waitForFunction(expected => document.querySelector('$status').textContent.includes(expected), test.diagnostic, { timeout: 120000 });
     if (development) {
-      assert.match(await page.locator('#status').textContent(), /game paused/);
+      assert.match(await page.locator('$status').textContent(), /game paused/);
       // Establish the development watcher's baseline before publishing a replacement.
       while (revisionsRead === 0) await page.waitForTimeout(100);
       const position = await page.locator('canvas').getAttribute('data-frame');
       await page.waitForTimeout(100);
       assert.equal(await page.locator('canvas').getAttribute('data-frame'), position, 'rejected frame stays paused');
       revision = 2;
-      await page.waitForFunction(() => document.querySelector('#status').textContent === '' && Number(document.querySelector('canvas').dataset.frame) >= 3, null, { timeout: 120000 });
+      await page.waitForFunction(() => document.querySelector('$status').textContent === '' && Number(document.querySelector('canvas').dataset.frame) >= 3, null, { timeout: 120000 });
       // The replacement's Restore traps unless it receives the last accepted
       // state, 42. The original traps if its rejected candidate was committed.
       results.push({ recovery: test.name, resumed: true });
     } else {
       if (test.name === 'restore') {
-        assert.match(await page.locator('#status').textContent(), /could not load pen.quicksave/);
+        assert.match(await page.locator('$status').textContent(), /could not load pen.quicksave/);
         const frame = await page.locator('canvas').getAttribute('data-frame');
         await page.waitForFunction(previous => document.querySelector('canvas').dataset.frame !== previous, frame);
-        assert.match(await page.locator('#status').textContent(), /could not load pen.quicksave/, 'accepted menu frames do not hide a failed Continue');
+        assert.match(await page.locator('$status').textContent(), /could not load pen.quicksave/, 'accepted menu frames do not hide a failed Continue');
       }
       results.push({ [test.name]: 'full structural error visible' });
     }

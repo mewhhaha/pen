@@ -71,9 +71,9 @@ fn packet(red: f32) -> Vec<f32> {
     packet
 }
 
-/// State and candidate are separate, just like a compiled Blot program.
-/// Every host request checks the actual commit lane. A rejected frame
-/// being accepted traps before Snapshot can return the preceding state.
+/// Mutable state advances independently of output publication. Every request
+/// still checks that malformed output was not acknowledged as published; a
+/// following Snapshot observes the already advanced live simulation.
 fn guest(engine: &wasmtime::Engine, bad: &[f32], reject_after: i32, red: f32) -> GuestModule {
     GuestModule::new(engine, &guest_bytes(bad, reject_after, red, false), None).unwrap()
 }
@@ -94,22 +94,23 @@ fn guest_bytes_with_restore_fault(
     main.extend(exchange());
     main.extend([0x03, 0x40]); // loop
     main.extend([load(8), request(4), vec![0x71, 0x04, 0x40, 0x00, 0x0b]].concat());
-    main.extend([request(4), vec![0x04, 0x40], store(12, load(16)), vec![0x0b]].concat());
+    main.extend(store(12, load(16))); // publish live mutation regardless of renderer acknowledgement
     main.extend(store(8, integer(0)));
     main.extend(store(16, load(12)));
     main.extend([request(8), vec![0x45, 0x04, 0x40], integer(0), vec![0x0f, 0x0b]].concat());
     for (operation, reply, action) in [
         (1, CREATE, store(16, integer(40))),
         (3, SNAPSHOT, [integer(SNAPSHOT + 8), load(12), vec![0xb2, 0x38, 2, 0]].concat()),
-        // A reload must receive precisely the last accepted live state.
+        // A reload receives an explicit current live checkpoint, including a
+        // rejected frame's simulation mutations.
         (
             4,
             RESTORE,
             [
                 request(12),
                 integer(42),
-                vec![0x47, 0x04, 0x40, 0x00, 0x0b],
-                store(16, integer(42)),
+                vec![0x48, 0x04, 0x40, 0x00, 0x0b],
+                store(16, request(12)),
                 store(24, integer(i32::from(restore_fault))),
             ]
             .concat(),
@@ -158,7 +159,7 @@ fn guest_bytes_with_restore_fault(
     program(
         main,
         &[
-            (HANDSHAKE, &[4670544.0, 1.0, 1.0, 0.0]),
+            (HANDSHAKE, &[4670544.0, 2.0, 1.0, 0.0]),
             (CREATE, &[1.0, 40.0]),
             (SNAPSHOT, &[3.0, 0.0]),
             (RESTORE, &[4.0, 42.0]),
@@ -204,7 +205,7 @@ fn start(engine: &wasmtime::Engine, gpu: Gpu, directory: &Path, module: GuestMod
 }
 
 #[test]
-fn malformed_native_frames_pause_recover_and_never_commit() {
+fn malformed_native_frames_pause_without_rolling_back_simulation() {
     let directory = PathBuf::from("/var/tmp").join(format!(
         "pen-frame-recovery-{}-{}",
         std::process::id(),
@@ -220,8 +221,8 @@ fn malformed_native_frames_pause_recover_and_never_commit() {
     oversized.push(0.0);
     let mut nonfinite = packet(1.0);
     nonfinite[52] = f32::NAN;
-    // The browser runs these exact guest binaries, including their commit-lane
-    // assertions, and compares its diagnostic with the native decoder's.
+    // The browser runs these exact version-2 guest binaries, including their
+    // publication acknowledgements, and compares native decoder diagnostics.
     if let Some(path) = std::env::var_os("PEN_DIAGNOSTIC_FIXTURES") {
         let path = PathBuf::from(path);
         std::fs::create_dir_all(&path).unwrap();
@@ -278,7 +279,7 @@ fn malformed_native_frames_pause_recover_and_never_commit() {
             assert_eq!(session.timeline.position(), 1);
             assert_eq!(session.timeline.head(), 1);
             assert_eq!(session.last.as_ref().unwrap().clear.r, 1.0);
-            assert_eq!(session.runtime.snapshot().unwrap().state, [42.0]);
+            assert_eq!(session.runtime.snapshot().unwrap().state, [43.0]);
             assert!(shot.exists());
             let captured = image::open(&shot).unwrap().into_rgba8();
             assert_eq!(captured.dimensions(), (32, 24));
@@ -301,7 +302,7 @@ fn malformed_native_frames_pause_recover_and_never_commit() {
             session.build = Some((guest(&engine, bad, 1, 0.0), catalog()));
             assert!(session.step(None).unwrap());
             assert_eq!(session.transport.run(), REJECTED);
-            assert_eq!(session.runtime.snapshot().unwrap().state, [42.0]);
+            assert_eq!(session.runtime.snapshot().unwrap().state, [43.0]);
             assert_eq!(session.last.as_ref().unwrap().clear.r, 1.0);
             session.build = Some((guest(&engine, bad, i32::MAX, 0.0), catalog()));
             assert!(session.step(None).unwrap());
@@ -329,7 +330,7 @@ fn malformed_native_frames_pause_recover_and_never_commit() {
             assert!(error.downcast_ref::<pen_protocol::diagnostic::FrameDiagnostic>().is_some());
         }
         assert!(!session.transport.paused());
-        assert_eq!(session.runtime.snapshot().unwrap().state, [42.0]);
+        assert_eq!(session.runtime.snapshot().unwrap().state, [43.0]);
         gpu = session.finish().unwrap();
     }
 
@@ -340,7 +341,7 @@ fn malformed_native_frames_pause_recover_and_never_commit() {
     session.step_frames(1);
     assert!(session.step(None).unwrap());
     assert_eq!(session.transport.run(), Run::Paused { steps: 0, resume_after_reload: false });
-    assert_eq!(session.runtime.snapshot().unwrap().state, [42.0]);
+    assert_eq!(session.runtime.snapshot().unwrap().state, [43.0]);
     // Exercise the real development watcher while redraws keep the app alive.
     std::fs::write(
         directory.join("assets/catalog.json"),

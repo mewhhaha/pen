@@ -11,6 +11,7 @@ pub mod game;
 pub mod gamepad;
 pub mod input;
 pub mod inspect;
+mod instances;
 pub mod locale;
 pub mod memory_image;
 pub mod mix;

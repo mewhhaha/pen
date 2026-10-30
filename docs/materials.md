@@ -50,14 +50,14 @@ A mesh's vertex is `@location(0) position: vec3f`, `@location(1) normal:
 vec3f`, `@location(2) uv: vec2f` and, when the mesh has `attributes`,
 `@location(8) attributes: vec2f`.
 
-- `@vertex fn vertex` and `@fragment fn fragment` draw the material. The
+- `@vertex func vertex` and `@fragment func fragment` draw the material. The
   fragment's colour is linear and may pass 1: the frame is drawn into a
   floating-point target that the present pass tones down to the screen.
-- `@vertex fn vertex_instanced`, if the shader has one, lets opaque draws of
+- `@vertex func vertex_instanced`, if the shader has one, lets opaque draws of
   the same mesh and material share one instanced draw: its instance's model
   matrix comes as `@location(3)` to `@location(6)` (four columns) and its
   parameters as `@location(7)`.
-- `@vertex fn vertex_persistent` draws a mesh's immutable `instances` records.
+- `@vertex func vertex_persistent` draws a mesh's immutable `instances` records.
   Each record supplies five `vec4f`s at locations 3–7. Their meaning belongs
   to the shader; `draw.model`, parameters and extra vectors still describe
   the whole draw. This entry is separate from `vertex_instanced`, so the same
@@ -66,7 +66,16 @@ vec3f`, `@location(2) uv: vec2f` and, when the mesh has `attributes`,
   `instance_index`) draws sprites instead: group 0 is then the screen's size
   (a `vec4f` uniform at binding 0), the frame's sprites (a storage array at
   1: each one's rectangle, texture coordinates, colour and parameters), the
-  material's texture (2) and a sampler (3).
+  material's texture (2), a sampler (3), and the raw resolved scene (4).
+- A sprite material with `"scene_filter": true` runs before UI. Binding 4
+  instead reads the preceding filter's image, initially the scene after
+  atmosphere/occlusion, TAA, bloom, tone mapping and FXAA. Write those display
+  values directly; do not tone-map again. Each sprite runs as a separate pass
+  in submission order, preserving uncovered pixels and alpha blending. The
+  host applies radial blur and stencil-masked chromatic aberration afterwards;
+  UI/insets and accessibility color filters retain their usual order. Target
+  textures are reused across frames; with no active filters, no extra pass or
+  target allocation occurs. Standalone overlays/loading do not run scene filters.
 
 Projections map depth into WebGPU's 0 to 1. pen compiles only the pipelines
 the loaded materials draw with, on background threads; a shader that does

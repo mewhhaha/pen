@@ -354,15 +354,15 @@ fn blot_zero(field: &Value) -> String {
     match kind(field) {
         "f32" => "0.0".to_owned(),
         "count" | "reference" | "choice" | "present" | "schema" => "0".to_owned(),
-        "flag" => "#False".to_owned(),
+        "flag" => "false".to_owned(),
         "vector" => format!(
-            "#types.{} {{ {} }}",
+            "$types.{} {{ {} }}",
             s(&field["type"]["name"]),
             array(&field["type"]["components"]).iter().map(|c| format!("{}: 0.0", s(c))).collect::<Vec<_>>().join(", ")
         ),
-        "matrix" => "#types.Mat4 { x: types.zero4, y: types.zero4, z: types.zero4, w: types.zero4 }".to_owned(),
+        "matrix" => "$types.Mat4 { x: types.zero4, y: types.zero4, z: types.zero4, w: types.zero4 }".to_owned(),
         "lanes" => "types.zero4".to_owned(),
-        "optional" => "#Nothing".to_owned(),
+        "optional" => "$Nothing".to_owned(),
         _ => "#[]".to_owned(),
     }
 }
@@ -381,11 +381,11 @@ fn blot_reads(reads: &[(String, String)], start: &str, indent: &str) -> (Vec<Str
 
 /// `#types.Name { fields }`, in lines no longer than the others.
 fn blot_record(name: &str, fields: &[String], indent: &str, end: &str) -> Vec<String> {
-    let one = format!("{indent}return (#types.{name} {{ {} }}, {end})", fields.join(", "));
+    let one = format!("{indent}return ($types.{name} {{ {} }}, {end})", fields.join(", "));
     if one.len() <= 100 {
         return vec![one];
     }
-    let mut lines = vec![format!("{indent}let built = #types.{name} {{")];
+    let mut lines = vec![format!("{indent}let built = $types.{name} {{")];
     lines.extend(chunk(fields, 96 - indent.len()).iter().map(|line| format!("{indent}  {line},")));
     lines.push(format!("{indent}}}"));
     lines.push(format!("{indent}return (built, {end})"));
@@ -407,15 +407,17 @@ fn blot_record_readers(model: &Model, record: &Value, fields: &[Laid]) -> Vec<St
         };
         reads.push((s(&rest["name"]).to_owned(), read));
     }
-    let mut out =
-        vec![String::new(), format!("const {reader}_from = fn (canonical: Array F32) => fn (at: U32) => do:")];
+    let mut out = vec![
+        String::new(),
+        format!("const {reader}_from = func (canonical: Array F32) => return func (at: U32) => return do:"),
+    ];
     let (lines, end) = blot_reads(&reads, "at", "  ");
     out.extend(lines);
     let names: Vec<String> = reads.iter().map(|(name, _)| name.clone()).collect();
     out.extend(blot_record(name, &names, "  ", &end));
     out.extend([
         String::new(),
-        format!("const {reader}_list_from = fn (canonical: Array F32) => fn (at: U32) => do:"),
+        format!("const {reader}_list_from = func (canonical: Array F32) => return func (at: U32) => return do:"),
         "  let count = lanes.integer canonical[at] lanes.max_integer".to_owned(),
         "  let items = #[]".to_owned(),
         "  let next = at + 1".to_owned(),
@@ -430,45 +432,45 @@ fn blot_record_readers(model: &Model, record: &Value, fields: &[Laid]) -> Vec<St
 
 const BLOT_READERS: &str = r#"// Each reader takes the walk and where a value starts in it, and returns the
 // value and where the next one starts. Counts and flags must be whole.
-const f32_from = fn (canonical: Array F32) => fn (at: U32) => (canonical[at], at + 1)
+const f32_from = func (canonical: Array F32) => return func (at: U32) => return (canonical[at], at + 1)
 
-const u32_from = fn (canonical: Array F32) => fn (at: U32) => (lanes.integer canonical[at] lanes.max_integer, at + 1)
+const u32_from = func (canonical: Array F32) => return func (at: U32) => return (lanes.integer canonical[at] lanes.max_integer, at + 1)
 
-const bool_from = fn (canonical: Array F32) => fn (at: U32) => (lanes.integer canonical[at] 1 == 1, at + 1)
+const bool_from = func (canonical: Array F32) => return func (at: U32) => return (lanes.integer canonical[at] 1 == 1, at + 1)
 
-const vec4_at = fn (canonical: Array F32) => fn (at: U32) =>
-  #types.Vec4 { x: canonical[at], y: canonical[at + 1], z: canonical[at + 2], w: canonical[at + 3] }
+const vec4_at = func (canonical: Array F32) => return func (at: U32) => return
+  $types.Vec4 { x: canonical[at], y: canonical[at + 1], z: canonical[at + 2], w: canonical[at + 3] }
 
-const vec4_from = fn (canonical: Array F32) => fn (at: U32) => (vec4_at canonical at, at + 4)
+const vec4_from = func (canonical: Array F32) => return func (at: U32) => return (vec4_at canonical at, at + 4)
 
 // A matrix's columns, x first.
-const mat4_from = fn (canonical: Array F32) => fn (at: U32) => do:
+const mat4_from = func (canonical: Array F32) => return func (at: U32) => return do:
   let x = vec4_at canonical at
   let y = vec4_at canonical (at + 4)
   let z = vec4_at canonical (at + 8)
   let w = vec4_at canonical (at + 12)
-  return (#types.Mat4 { x, y, z, w }, at + 16)
+  return ($types.Mat4 { x, y, z, w }, at + 16)
 
-const maybe_vec4_from = fn (canonical: Array F32) => fn (at: U32) => do:
+const maybe_vec4_from = func (canonical: Array F32) => return func (at: U32) => return do:
   if lanes.integer canonical[at] 1 == 1:
-    return (#Some (vec4_at canonical (at + 1)), at + 5)
-  return (#Nothing, at + 1)
+    return ($Some (vec4_at canonical (at + 1)), at + 5)
+  return ($Nothing, at + 1)
 
-const floats_from = fn (canonical: Array F32) => fn (at: U32) => do:
+const floats_from = func (canonical: Array F32) => return func (at: U32) => return do:
   let count = lanes.integer canonical[at] lanes.max_integer
   return (array.slice (at + 1) count canonical, at + 1 + count)
 
-const maybe_floats_from = fn (canonical: Array F32) => fn (at: U32) => do:
+const maybe_floats_from = func (canonical: Array F32) => return func (at: U32) => return do:
   if lanes.integer canonical[at] 1 == 1:
     return floats_from canonical (at + 1)
   return (#[], at + 1)
 
 // A tail: 0, or 1, its lanes' count and its lanes, four to a Vec4.
-const maybe_vec4s_from = fn (canonical: Array F32) => fn (at: U32) => do:
+const maybe_vec4s_from = func (canonical: Array F32) => return func (at: U32) => return do:
   if lanes.integer canonical[at] 1 == 1:
     let count = lanes.integer canonical[at + 1] lanes.max_integer
     use lanes.require (count % 4 == 0)
-    return (array.generate (count / 4) (fn index => vec4_at canonical (at + 2 + index * 4)), at + 2 + count)
+    return (array.generate (count / 4) (func index => return vec4_at canonical (at + 2 + index * 4)), at + 2 + count)
   return (#[], at + 1)"#;
 
 /// The game's `pen/protocol_canonical.blot`: the input walk, and the render
@@ -486,7 +488,7 @@ pub fn blot(model: &Model, top: &[String]) -> String {
         String::new(),
     ]);
     out.extend(comment(Some("An event's walk: its tag, then its fields in the schema's order.")));
-    out.push("const canonical_event = fn (event: protocol.Event) => case event of".to_owned());
+    out.push("const canonical_event = func (event: protocol.Event) => return case event of".to_owned());
     for event in model.core_events() {
         let name = s(&event["name"]);
         let fields = event_fields(event);
@@ -496,13 +498,13 @@ pub fn blot(model: &Model, top: &[String]) -> String {
         let mut lanes = vec![format!("{}.0", event["tag"])];
         let pattern = if !event["value"].is_null() {
             lanes.push(value("value", &event["value"]));
-            format!("#protocol.{name} value")
+            format!("$protocol.{name} value")
         } else if !fields.is_empty() {
             lanes.extend(fields.iter().map(|(name, field)| value(name, field)));
             let names = fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", ");
-            format!("#protocol.{name} {{ {names} }}")
+            format!("$protocol.{name} {{ {names} }}")
         } else {
-            format!("#protocol.{name}")
+            format!("$protocol.{name}")
         };
         out.push(format!("  {pattern} => #[{}]", lanes.join(", ")));
     }
@@ -511,7 +513,7 @@ pub fn blot(model: &Model, top: &[String]) -> String {
         "The input's walk, as pen-protocol's canonical_input makes it: elapsed, the viewport's width and height, the events' count and walks, then the state's count and lanes.",
     )));
     out.extend(
-        "const canonical_input = fn (input: protocol.Input) => do:\n  let #protocol.Input { elapsed, width, height, events, state } = input\n  return array.flatten #[\n    #[elapsed, width, height, U32.to_f32 events.length],\n    array.flatten #[canonical_event event | event <- events],\n    #[U32.to_f32 state.length],\n    state,\n  ]"
+        "const canonical_input = func (input: protocol.Input) => return do:\n  let $protocol.Input { elapsed, width, height, events, state } = input\n  let output: GrowArray F32 = #[elapsed, width, height, U32.to_f32 events.length]\n  for event in events:\n    array.append_into output (canonical_event event)\n  output.push (U32.to_f32 state.length)\n  array.append_into output state\n  return @storage.freeze output"
             .lines()
             .map(str::to_owned),
     );
@@ -527,9 +529,12 @@ pub fn blot(model: &Model, top: &[String]) -> String {
             })
             .collect();
         out.push(String::new());
-        out.push(format!("const {}_from = fn (canonical: Array F32) => fn (at: U32) =>", snake(s(&vector["name"]))));
         out.push(format!(
-            "  (#types.{} {{ {} }}, at + {})",
+            "const {}_from = func (canonical: Array F32) => return func (at: U32) => return",
+            snake(s(&vector["name"]))
+        ));
+        out.push(format!(
+            "  ($types.{} {{ {} }}, at + {})",
             s(&vector["name"]),
             components.join(", "),
             components.len()
@@ -582,7 +587,10 @@ pub fn blot(model: &Model, top: &[String]) -> String {
         let reads: Vec<(String, String)> =
             lanes.iter().map(|laid| (laid.name.clone(), blot_reader(model, &laid.field))).collect();
         out.push(String::new());
-        out.push(format!("const {}_from = fn (canonical: Array F32) => fn (at: U32) => do:", snake(ty)));
+        out.push(format!(
+            "const {}_from = func (canonical: Array F32) => return func (at: U32) => return do:",
+            snake(ty)
+        ));
         let Some(present) = presence(&lanes) else {
             let (lines, end) = blot_reads(&reads, "at", "  ");
             out.extend(lines);
@@ -626,11 +634,11 @@ pub fn blot(model: &Model, top: &[String]) -> String {
     out.extend(comment(Some(
         "The record the game encodes, from the render walk pen-protocol's canonical_render makes of a frame, its schema and its state. Anything else traps.",
     )));
-    out.push("const render_from_canonical = fn (canonical: Array F32) => do:".to_owned());
+    out.push("const render_from_canonical = func (canonical: Array F32) => return do:".to_owned());
     let (lines, end) = blot_reads(&reads, "0", "  ");
     out.extend(lines);
     out.push(format!("  use lanes.require ({end} == canonical.length)"));
-    out.push("  return #types.RenderFrame {".to_owned());
+    out.push("  return $types.RenderFrame {".to_owned());
     let names: Vec<String> = reads.iter().map(|(name, _)| name.clone()).collect();
     out.extend(chunk(&names, 76).iter().map(|line| format!("    {line},")));
     out.push("  }".to_owned());

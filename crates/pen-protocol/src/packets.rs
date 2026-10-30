@@ -1210,6 +1210,22 @@ pub mod types {
         pub cone_outer: f32,
         pub cone_outer_gain: f32,
     }
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Instance {
+        pub id_low: u32,
+        pub id_high: u32,
+        pub order: u32,
+        pub mesh: u32,
+        pub material: u32,
+        pub transform: Matrix,
+        /// Optional four shader values, overriding the material's instance defaults.
+        pub parameters: Option<[f32; 4]>,
+    }
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct InstanceRemoval {
+        pub id_low: u32,
+        pub id_high: u32,
+    }
     /// How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture
     /// filtering, ambient occlusion, a sky, screen effects, bloom and temporal antialiasing.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1313,6 +1329,12 @@ pub mod types {
         /// Show sound captions when the player has enabled them in the game's accessibility
         /// settings. Off by default; the game owns and saves the choice.
         pub show_captions: bool,
+        /// Resolve persistent scene instances, inserting them before immediate draw
+        /// retained_after.
+        pub retained_enabled: bool,
+        /// Replace the persistent instance scene. Required on its first frame.
+        pub retained_reset: bool,
+        pub retained_after: u32,
         pub draws: Vec<Draw>,
         /// Convex solids: the points behind every face plane (normal · p <= distance).
         pub solids: Vec<Solid>,
@@ -1363,6 +1385,8 @@ pub mod types {
         /// (equal-power panning) places them relative to the listener; the rest play as they
         /// are.
         pub panners: Vec<Panner>,
+        pub instances: Vec<Instance>,
+        pub instance_removals: Vec<InstanceRemoval>,
         /// The game's own sections, which its pen.json `protocol` declares, after the rest of
         /// the packet: a marker, their count, then each one's tag, length and values. A packet
         /// without any ends before the marker. Tag 0 is reserved for one optional development
@@ -1471,6 +1495,8 @@ pub mod codec {
     pub const ENGINE_PREFERENCES: usize = 64;
     /// The most panners one frame may declare: one for each voice and sound it may have.
     pub const MAX_PANNERS: usize = 512;
+    pub const MAX_INSTANCES: usize = 100000;
+    pub const MAX_INSTANCE_REMOVALS: usize = 100000;
     pub const PACKET_MAGIC: f32 = 0x474446 as f32;
     /// The lane that starts a packet's block of the game's own sections.
     pub const EXTENSIONS_MARKER: f32 = 0x504558 as f32;
@@ -1485,8 +1511,9 @@ pub mod codec {
     /// shadow.projection16, shadow.texel, shadow.texels, blur, quality.bloom, clouds.cover,
     /// clouds.drift2, hide_cursor, field_count, field_lanes, ui_count, ui_lanes, service_count,
     /// service_lanes, bus_count, voice_count, pose_count, emitter_count, quality.taa,
-    /// light_count, listener_count, panner_count, loading, show_captions.
-    pub const PACKET_HEADER_FLOATS: usize = 146;
+    /// light_count, listener_count, panner_count, loading, show_captions, retained_enabled,
+    /// retained_reset, retained_after, instance_count, instance_removal_count.
+    pub const PACKET_HEADER_FLOATS: usize = 151;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -1533,6 +1560,11 @@ pub mod codec {
     /// Lanes: voice, sound, position3, orientation3, distance_model, ref_distance,
     /// max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain.
     pub const PANNER_FLOATS: usize = 15;
+    /// Lanes: id_low, id_high, order, mesh, material, transform16, parameters count and
+    /// parameters4.
+    pub const INSTANCE_FLOATS: usize = 26;
+    /// Lanes: id_low, id_high.
+    pub const INSTANCE_REMOVAL_FLOATS: usize = 2;
     /// Where each header lane and record field starts; an optional field's lanes
     /// follow its count.
     pub mod lanes {
@@ -1604,6 +1636,11 @@ pub mod codec {
             pub const PANNER_COUNT: usize = 143;
             pub const LOADING: usize = 144;
             pub const SHOW_CAPTIONS: usize = 145;
+            pub const RETAINED_ENABLED: usize = 146;
+            pub const RETAINED_RESET: usize = 147;
+            pub const RETAINED_AFTER: usize = 148;
+            pub const INSTANCE_COUNT: usize = 149;
+            pub const INSTANCE_REMOVAL_COUNT: usize = 150;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -1727,6 +1764,19 @@ pub mod codec {
             pub const CONE_INNER: usize = 12;
             pub const CONE_OUTER: usize = 13;
             pub const CONE_OUTER_GAIN: usize = 14;
+        }
+        pub mod instance {
+            pub const ID_LOW: usize = 0;
+            pub const ID_HIGH: usize = 1;
+            pub const ORDER: usize = 2;
+            pub const MESH: usize = 3;
+            pub const MATERIAL: usize = 4;
+            pub const TRANSFORM: usize = 5;
+            pub const PARAMETERS: usize = 21;
+        }
+        pub mod instance_removal {
+            pub const ID_LOW: usize = 0;
+            pub const ID_HIGH: usize = 1;
         }
         pub mod solid {
             pub const FACES: usize = 0;
@@ -2171,6 +2221,27 @@ pub mod codec {
             *panner = Panner { voice: voice as u32, sound: sound as u32, position, orientation, distance_model: distance_model as u32, ref_distance, max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain };
             Ok(())
         }
+
+        fn decode_instance(&mut self, lane: usize, instance: &mut Instance) -> Result<()> {
+            let id_low = self.count(lane, 65535)?;
+            let id_high = self.count(lane + 1, 65535)?;
+            let order = self.count(lane + 2, 16777215)?;
+            let mesh = self.mesh_at(lane + 3)?;
+            let material = self.material_at(lane + 4)?;
+            let transform = self.matrix(lane + 5);
+            let parameters_count = self.count(lane + 21, 4)?;
+            ensure!(parameters_count == 0 || parameters_count == 4, "draw parameters must contain zero or four lanes");
+            let parameters = (parameters_count == 4).then(|| self.packet[lane + 22..lane + 26].try_into().unwrap());
+            *instance = Instance { id_low: id_low as u32, id_high: id_high as u32, order: order as u32, mesh, material, transform, parameters };
+            Ok(())
+        }
+
+        fn decode_instance_removal(&mut self, lane: usize, instance_removal: &mut InstanceRemoval) -> Result<()> {
+            let id_low = self.count(lane, 65535)?;
+            let id_high = self.count(lane + 1, 65535)?;
+            *instance_removal = InstanceRemoval { id_low: id_low as u32, id_high: id_high as u32 };
+            Ok(())
+        }
     }
 
     /// Decodes a render packet. The game's frame: what to draw and play, and what to do.
@@ -2229,6 +2300,8 @@ pub mod codec {
         let lights_count = reader.count(141, MAX_LIGHTS)?;
         let listener_count = reader.count(142, 1)?;
         let panners_count = reader.count(143, MAX_PANNERS)?;
+        let instances_count = reader.count(149, MAX_INSTANCES)?;
+        let instance_removals_count = reader.count(150, MAX_INSTANCE_REMOVALS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -2268,9 +2341,13 @@ pub mod codec {
         let listener_end = listener_start + listener_count * LISTENER_FLOATS;
         let panners_start = listener_end;
         let panners_end = panners_start + panners_count * PANNER_FLOATS;
-        let extras_start = panners_end;
+        let instances_start = panners_end;
+        let instances_end = instances_start + instances_count * INSTANCE_FLOATS;
+        let instance_removals_start = instances_end;
+        let instance_removals_end = instance_removals_start + instance_removals_count * INSTANCE_REMOVAL_FLOATS;
+        let extras_start = instance_removals_end;
         let truncated = "game returned a truncated, oversized or nonfinite frame";
-        ensure!(packet.len() >= panners_end && packet.iter().all(|value| value.is_finite()), truncated);
+        ensure!(packet.len() >= instance_removals_end && packet.iter().all(|value| value.is_finite()), truncated);
         // What the records' tails claim of extras, in order.
         let mut extras_lanes = 0;
         for index in 0..draws_count {
@@ -2355,6 +2432,9 @@ pub mod codec {
         let quality_taa = reader.flag(140)?;
         let loading = reader.flag(144)?;
         let show_captions = reader.flag(145)?;
+        let retained_enabled = reader.flag(146)?;
+        let retained_reset = reader.flag(147)?;
+        let retained_after = reader.count(148, 100000)?;
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -2514,6 +2594,16 @@ pub mod codec {
         for (index, panner) in panners.iter_mut().enumerate() {
             reader.decode_panner(panners_start + index * PANNER_FLOATS, panner)?;
         }
+        let mut instances = std::mem::take(&mut frame.instances);
+        resize(&mut instances, instances_count);
+        for (index, instance) in instances.iter_mut().enumerate() {
+            reader.decode_instance(instances_start + index * INSTANCE_FLOATS, instance)?;
+        }
+        let mut instance_removals = std::mem::take(&mut frame.instance_removals);
+        resize(&mut instance_removals, instance_removals_count);
+        for (index, instance_removal) in instance_removals.iter_mut().enumerate() {
+            reader.decode_instance_removal(instance_removals_start + index * INSTANCE_REMOVAL_FLOATS, instance_removal)?;
+        }
         *frame = RenderFrame {
             save_requested,
             load_requested,
@@ -2539,6 +2629,9 @@ pub mod codec {
             hide_cursor,
             loading,
             show_captions,
+            retained_enabled,
+            retained_reset,
+            retained_after: retained_after as u32,
             draws,
             solids,
             decals,
@@ -2556,6 +2649,8 @@ pub mod codec {
             lights,
             listener,
             panners,
+            instances,
+            instance_removals,
             extensions,
         };
         Ok(&packet[state_start..state_end])
@@ -2631,6 +2726,8 @@ pub mod codec {
         let lights_count = d.count(&header.field("light_count"), 141, MAX_LIGHTS)?;
         let listener_count = d.count(&header.field("listener_count"), 142, 1)?;
         let panners_count = d.count(&header.field("panner_count"), 143, MAX_PANNERS)?;
+        let instances_count = d.count(&header.field("instance_count"), 149, MAX_INSTANCES)?;
+        let instance_removals_count = d.count(&header.field("instance_removal_count"), 150, MAX_INSTANCE_REMOVALS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -2670,7 +2767,11 @@ pub mod codec {
         let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
         let panners_start = listener_end;
         let panners_end = d.end(&Location::section("panners"), panners_start, panners_count, PANNER_FLOATS)?;
-        let extras_start = panners_end;
+        let instances_start = panners_end;
+        let instances_end = d.end(&Location::section("instances"), instances_start, instances_count, INSTANCE_FLOATS)?;
+        let instance_removals_start = instances_end;
+        let instance_removals_end = d.end(&Location::section("instance_removals"), instance_removals_start, instance_removals_count, INSTANCE_REMOVAL_FLOATS)?;
+        let extras_start = instance_removals_end;
         let extras_cursor = &mut { extras_start };
         d.count(&header.field("save_requested"), 12, 1)?;
         d.count(&header.field("load_requested"), 13, 1)?;
@@ -2714,6 +2815,9 @@ pub mod codec {
         d.count(&header.field("quality.taa"), 140, 1)?;
         d.count(&header.field("loading"), 144, 1)?;
         d.count(&header.field("show_captions"), 145, 1)?;
+        d.count(&header.field("retained_enabled"), 146, 1)?;
+        d.count(&header.field("retained_reset"), 147, 1)?;
+        let _ = d.count(&header.field("retained_after"), 148, 100000)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -2981,6 +3085,29 @@ pub mod codec {
             base += PANNER_FLOATS;
         }
         d.exhausted(&Location::section("panners"), base, panners_end)?;
+        let mut base = instances_start;
+        for item in 0..instances_count {
+            let path = &Location::section("instances").index(item);
+            let id_low = d.count(&path.field("id_low"), base, 65535)?;
+            let id_high = d.count(&path.field("id_high"), base + 1, 65535)?;
+            let order = d.count(&path.field("order"), base + 2, 16777215)?;
+            d.reference(&path.field("mesh"), base + 3, catalog.meshes.len(), true)?;
+            d.reference(&path.field("material"), base + 4, catalog.materials.len(), true)?;
+            d.values(&path.field("transform"), base + 5, 16, &[])?;
+            let count = d.count(&path.field("parameters").field("count"), base + 21, 4)?;
+            if count != 0 && count != 4 { return Err(path.field("parameters").field("count").error(base + 21, "0 or 4", Actual::Value(count as f32))); }
+            d.values(&path.field("parameters"), base + 21 + 1, 4, &[])?;
+            base += INSTANCE_FLOATS;
+        }
+        d.exhausted(&Location::section("instances"), base, instances_end)?;
+        let mut base = instance_removals_start;
+        for item in 0..instance_removals_count {
+            let path = &Location::section("instance_removals").index(item);
+            let id_low = d.count(&path.field("id_low"), base, 65535)?;
+            let id_high = d.count(&path.field("id_high"), base + 1, 65535)?;
+            base += INSTANCE_REMOVAL_FLOATS;
+        }
+        d.exhausted(&Location::section("instance_removals"), base, instance_removals_end)?;
         inspect_extensions(d, *extras_cursor)?;
         Ok(())
     }
@@ -3021,6 +3148,8 @@ pub mod codec {
         let lights_count = d.count(&header.field("light_count"), 141, MAX_LIGHTS)?;
         let listener_count = d.count(&header.field("listener_count"), 142, 1)?;
         let panners_count = d.count(&header.field("panner_count"), 143, MAX_PANNERS)?;
+        let instances_count = d.count(&header.field("instance_count"), 149, MAX_INSTANCES)?;
+        let instance_removals_count = d.count(&header.field("instance_removal_count"), 150, MAX_INSTANCE_REMOVALS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3060,7 +3189,11 @@ pub mod codec {
         let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
         let panners_start = listener_end;
         let panners_end = d.end(&Location::section("panners"), panners_start, panners_count, PANNER_FLOATS)?;
-        let extras_start = panners_end;
+        let instances_start = panners_end;
+        let instances_end = d.end(&Location::section("instances"), instances_start, instances_count, INSTANCE_FLOATS)?;
+        let instance_removals_start = instances_end;
+        let instance_removals_end = d.end(&Location::section("instance_removals"), instance_removals_start, instance_removals_count, INSTANCE_REMOVAL_FLOATS)?;
+        let extras_start = instance_removals_end;
         let mut end = extras_start;
         for item in 0..draws_count {
             let count = d.count(&Location::section("draws").index(item).field("extra"), draws_start + item * DRAW_FLOATS + 23, MAX_DRAW_EXTRA)?;
@@ -3174,7 +3307,8 @@ pub mod codec {
         out.extend([
             frame.shadow.texel, frame.shadow.texels as f32, frame.blur, frame.clouds.cover, frame.clouds.drift.x,
             frame.clouds.drift.z, f32::from(frame.hide_cursor), f32::from(frame.loading),
-            f32::from(frame.show_captions), state.len() as f32,
+            f32::from(frame.show_captions), f32::from(frame.retained_enabled), f32::from(frame.retained_reset),
+            frame.retained_after as f32, state.len() as f32,
         ]);
         out.extend_from_slice(state);
         out.push(frame.draws.len() as f32);
@@ -3247,6 +3381,14 @@ pub mod codec {
         out.push(frame.panners.len() as f32);
         for panner in &frame.panners {
             canonical_panner(&mut out, panner);
+        }
+        out.push(frame.instances.len() as f32);
+        for instance in &frame.instances {
+            canonical_instance(&mut out, instance);
+        }
+        out.push(frame.instance_removals.len() as f32);
+        for instance_removal in &frame.instance_removals {
+            canonical_instance_removal(&mut out, instance_removal);
         }
         out
     }
@@ -3400,5 +3542,24 @@ pub mod codec {
             panner.ref_distance, panner.max_distance, panner.rolloff, panner.cone_inner, panner.cone_outer,
             panner.cone_outer_gain,
         ]);
+    }
+
+    fn canonical_instance(out: &mut Vec<f32>, instance: &Instance) {
+        out.extend([
+            instance.id_low as f32, instance.id_high as f32, instance.order as f32, instance.mesh as f32,
+            instance.material as f32,
+        ]);
+        out.extend_from_slice(&instance.transform);
+        match &instance.parameters {
+            Some(values) => {
+                out.push(1.0);
+                out.extend_from_slice(values);
+            }
+            None => out.push(0.0),
+        }
+    }
+
+    fn canonical_instance_removal(out: &mut Vec<f32>, instance_removal: &InstanceRemoval) {
+        out.extend([instance_removal.id_low as f32, instance_removal.id_high as f32]);
     }
 }

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use pen_plugins::{BuildResult, Builder, Expectation, Level, Outcome, Overlay, Plugins};
 
-const MAIN: &str = "import * as lib from \"./lib\"\n\nentry const answer = fn () => lib.base + 1\n";
+const MAIN: &str = "import * as lib from \"./lib\"\n\nentry const answer = func () => return lib.base + 1\n";
 const LIB: &str = "const base: U32 = 41\n";
 
 fn repository() -> PathBuf {
@@ -90,8 +90,7 @@ fn builds_and_rejects_through_the_blot_plugin() {
     assert_eq!(&wasm[..4], b"\0asm");
     // An overlay that does not type checks is the program's failure, not
     // the compiler's: the session goes on.
-    let wrong =
-        "import * as lib from \"./lib\"\n\nconst wrong: Bool = lib.base\n\nentry const answer = fn () => wrong\n";
+    let wrong = "import * as lib from \"./lib\"\n\nconst wrong: Bool = lib.base\n\nentry const answer = func () => return wrong\n";
     let overlay = Overlay { path: entry.display().to_string(), contents: Some(wrong.into()) };
     let BuildResult::Rejected(diagnostics) = session.build(&[overlay]).unwrap() else { panic!("the overlay rejects") };
     assert_eq!(diagnostics[0].file, entry.display().to_string());
@@ -187,9 +186,9 @@ fn lays_out_the_checkouts_tests() {
     let root = empty();
     for (file, source) in [
         ("src/main.blot", MAIN),
-        ("tests/b.blot", "entry const test_b = fn () => 0\n"),
-        ("tests/a.blot", "entry const test_a = fn () => 0\n"),
-        ("tests/traps/t.blot", "entry const test_t = fn () => 0\n"),
+        ("tests/b.blot", "entry const test_b = func () => return 0\n"),
+        ("tests/a.blot", "entry const test_a = func () => return 0\n"),
+        ("tests/traps/t.blot", "entry const test_t = func () => return 0\n"),
         ("tests/rejected/r.blot", "// rejects: type_mismatch\nconst a: Bool = 1\n"),
         ("tests/support/check.blot", "const a = 1\n"),
     ] {
@@ -207,7 +206,7 @@ fn lays_out_the_checkouts_tests() {
     let fixture = root.join("src/test_fixture.blot").display().to_string();
     assert!(modules.iter().all(|module| module.entry == fixture && module.prefix == "test_"));
     assert_eq!(modules[0].overlays[0].path, fixture);
-    assert_eq!(modules[0].overlays[0].contents.as_deref(), Some("entry const test_a = fn () => 0\n"));
+    assert_eq!(modules[0].overlays[0].contents.as_deref(), Some("entry const test_a = func () => return 0\n"));
     assert!(matches!(modules[2].expect, Expectation::Traps));
     assert!(matches!(&modules[3].expect, Expectation::Rejected(text) if text == "type_mismatch"));
     // Given modules, and a filter.
@@ -221,7 +220,7 @@ fn lays_out_the_checkouts_tests() {
     assert!(error.contains("tests/rejected/r.blot must not compile"), "{error}");
     // Modules outside what the checkout grants are not read.
     let outside = root.with_extension("outside.blot");
-    std::fs::write(&outside, "entry const test_o = fn () => 0\n").unwrap();
+    std::fs::write(&outside, "entry const test_o = func () => return 0\n").unwrap();
     let error = plugins.tests(&entry, std::slice::from_ref(&outside), None).unwrap_err().to_string();
     let _ = std::fs::remove_file(&outside);
     assert!(error.contains("outside what pen.json lets this plugin read"), "{error}");
@@ -236,7 +235,7 @@ fn builds_a_test_module_as_its_entry() {
     };
     let root = checkout(&component, &compiler, &std);
     std::fs::create_dir_all(root.join("tests")).unwrap();
-    let test = "import * as lib from \"./lib\"\n\nentry const test_base = fn () => lib.base\n";
+    let test = "import * as lib from \"./lib\"\n\nentry const test_base = func () => return lib.base\n";
     std::fs::write(root.join("tests/base.blot"), test).unwrap();
     let (plugins, _) = plugins(&root);
     let modules = plugins.tests(&root.join("main.blot"), &[], None).unwrap();
@@ -261,7 +260,7 @@ fn library_tests_compile_relative_helpers_without_a_game() {
     std::fs::write(root.join("tests/helper.blot"), "const value: F32 = 42.0\n").unwrap();
     std::fs::write(
         root.join("tests/check.blot"),
-        "import * as helper from \"./helper\"\nentry const test_answer = fn () => #[helper.value]\n",
+        "import * as helper from \"./helper\"\nentry const test_answer = func () => return #[helper.value]\n",
     )
     .unwrap();
     // An unrelated fixture must not get compiled as a standalone test.

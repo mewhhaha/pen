@@ -7,11 +7,12 @@ Wasm module or frame has completed during this migration. Compiler and source
 integration have advanced through many concrete proof boundaries; passing small
 guests, protocol tests or Rust builds does not establish a working game.
 
-Keep the sibling `../blot2`, `../ink` and `../gdev` checkouts at the corresponding
-handoff commits. Read their `CONTINUE.md` files and Blot's
-`tasks/STORAGE_REWRITE.md` before continuing. Root coordinates the requested
-commit/push of all four repositories to `main`; this document does not establish
-that a push has happened. Preserve all existing render, assets and runtime work.
+Keep the sibling `../blot2`, `../ink` and `../gdev` checkouts at the
+corresponding handoff commits. Read their `CONTINUE.md` files and Blot's
+`tasks/STORAGE_REWRITE.md` before continuing. The owner requests continuous
+checked commits and pushes to `main` across all four repositories. Verify push
+success; a local commit is not a remote checkpoint. Preserve all existing
+render, assets and runtime work.
 
 ## Contracts to preserve
 
@@ -20,13 +21,14 @@ that a push has happened. Preserve all existing render, assets and runtime work.
   Do not restore immutable/COW/RC semantics or language-task support. Data job
   queues and copied-buffer workers remain intentional application features.
 - Pen/native host packages report **0.1.0**, the compiler-plugin integration
-  reports **0.2.0**, and `Cargo.lock` pins Wasmtime **49.0.3**. Rebuild these on a
-  new machine; a pre-existing `pen` on `PATH` may use another ABI or generator.
+  reports **0.2.0**, and `Cargo.lock` pins Wasmtime **49.0.3**. Rebuild these on
+  a new machine; a pre-existing `pen` on `PATH` may use another ABI or
+  generator.
 - Program/session protocol is **2**, distinct from the guest ABI. A presentation
   rejection does not automatically roll simulation back. Keep renderer
   transactions and explicit Snapshot/Restore, including netplay restore/replay.
-  A retry must not silently advance simulation twice. A trapped session may
-  need recreation from an explicit checkpoint; partial mutations are possible.
+  A retry must not silently advance simulation twice. A trapped session may need
+  recreation from an explicit checkpoint; partial mutations are possible.
 - Guest output is encoded while invocation-local frame/payload owners remain
   alive. The host receives independent numeric packet copies. No guest borrowed
   descriptor or frame access bundle may escape through a host packet/worker.
@@ -60,11 +62,13 @@ current code before treating them as the migration contract.
 3. Regenerate/check the protocol through `just sync-protocol` and the documented
    `pen codegen --check` route. Use the new binary's generated bindings in Gdev.
 4. Resume the exact Gdev main compile frontier from its handoff. Record the
-   compiler's **configured hello identity**, executable SHA-256, project settings
-   and resulting Wasm hash. The raw build fingerprint differs when the project
-   overrides the compiler inference budget. Rebuild Pen after host/ABI changes.
-5. Once main compiles, obtain a real session start and frame headlessly, preserving
-   packet diagnostics. Then test native and browser acknowledgement/recovery.
+   compiler's **configured hello identity**, executable SHA-256, project
+   settings and resulting Wasm hash. The raw build fingerprint differs when the
+   project overrides the compiler inference budget. Rebuild Pen after host/ABI
+   changes.
+5. Once main compiles, obtain a real session start and frame headlessly,
+   preserving packet diagnostics. Then test native and browser
+   acknowledgement/recovery.
 
 ## Pending integration and qualification
 
@@ -82,11 +86,12 @@ exhaustive build/test loop after every source annotation.
   host/runtime/codegen tests. Follow `just packets` before Cargo tests requiring
   real packet fixtures. Full `just check`/`just test` remain pending until the
   game fixture can actually be built; GPU consumers run sequentially.
-- The latest sibling compiler handoff gate is not a full pass: smoke wire-contract
-  execution reported 3 passes / 1 failure. The native fixture lifetime findings
-  were subsequently fixed; handoff Zig lint now reports zero findings across
-  553 production files and its additional fixture file. Consult Blot's handoff
-  for the remaining smoke failure and the next required validation scope.
+- The latest sibling compiler handoff gate is not a full pass: smoke
+  wire-contract execution reported 3 passes / 1 failure. The native fixture
+  lifetime findings were subsequently fixed; handoff Zig lint now reports zero
+  findings across 553 production files and its additional fixture file. Consult
+  Blot's handoff for the remaining smoke failure and the next required
+  validation scope.
 
 Native headless GPU verification can use a locally installed Vulkan software
 adapter. SwiftShader is optional: point `VK_ICD_FILENAMES` at **your own**

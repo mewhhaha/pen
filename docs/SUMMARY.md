@@ -22,13 +22,14 @@
 
 # Inside pen
 
+- [Tools and runtime reference](reference.md)
 - [Plugins and their API](plugins.md)
 - [Determinism](determinism.md)
 - [Net sessions and spectating](netplay.md)
 - [Guest symbols and source maps](source-maps.md)
-- [The guest ABI after 3](guest-abi-next.md)
+- [Guest ABI and owned storage](guest-abi-next.md)
 - [Instant rewind](instant-rewind.md)
-- [Services as Blot tasks](services-as-tasks.md)
+- [Services and copied-buffer workers](services-as-tasks.md)
 - [Display scale](display-scale.md)
 - [Render performance](render-performance.md)
 - [Shipping](shipping.md)

@@ -39,9 +39,8 @@ render, assets and runtime work.
 
 The render generator's concrete header/projection/count batch previously passed
 10 focused tests and regeneration reproducibility. This is historical evidence,
-not qualification of the final combined candidate. Some older documentation
-still describes ABI 2/3 and automatic rollback; audit those statements against
-current code before treating them as the migration contract.
+not qualification of the final combined candidate. Historical results do not
+qualify the current compiler and guest together.
 
 ## Resume on another machine
 
@@ -86,12 +85,11 @@ exhaustive build/test loop after every source annotation.
   host/runtime/codegen tests. Follow `just packets` before Cargo tests requiring
   real packet fixtures. Full `just check`/`just test` remain pending until the
   game fixture can actually be built; GPU consumers run sequentially.
-- The latest sibling compiler handoff gate is not a full pass: smoke
-  wire-contract execution reported 3 passes / 1 failure. The native fixture
-  lifetime findings were subsequently fixed; handoff Zig lint now reports zero
-  findings across 553 production files and its additional fixture file. Consult
-  Blot's handoff for the remaining smoke failure and the next required
-  validation scope.
+- Current sibling compiler qualification, remaining lint findings and the exact
+  main-build frontier are recorded in
+  [Blot's continuation](../blot2/CONTINUE.md). Native Pen and its plugin build
+  successfully; Gdev `pen codegen --check` passes. These checks do not qualify a
+  real frame.
 
 Native headless GPU verification can use a locally installed Vulkan software
 adapter. SwiftShader is optional: point `VK_ICD_FILENAMES` at **your own**

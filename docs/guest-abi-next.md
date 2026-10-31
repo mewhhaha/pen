@@ -37,7 +37,7 @@ See [the game contract](game-contract.md),
 
 ## Qualification
 
-The first required milestone is one real Gdev frame in Pen. Current main Wasm,
-frame execution, native/browser acknowledgements, recovery and full host
-qualification remain pending. Small protocol fixtures or historical test passes
-must not be reported as that milestone.
+One real Gdev frame passed native Pen on 2026-10-31; the exact candidate and
+inspected image are linked from [CONTINUE.md](../CONTINUE.md). Broader gameplay,
+native/browser recovery and release qualification remain pending. Small protocol
+fixtures qualify their own candidates and do not requalify a later game build.

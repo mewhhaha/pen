@@ -14,19 +14,19 @@ const encode_draw = func (draw: types.Draw) => return do:
     $Some value => (4.0, value)
     $Nothing => (0.0, types.zero4)
   return #[
-    from draw.mesh, from draw.material, transform_x.x, transform_x.y,
-    transform_x.z, transform_x.w, transform_y.x, transform_y.y, transform_y.z,
-    transform_y.w, transform_z.x, transform_z.y, transform_z.z, transform_z.w,
-    transform_w.x, transform_w.y, transform_w.z, transform_w.w, parameters_count,
-    parameters.x, parameters.y, parameters.z, parameters.w,
-    from (min draw.extra.length protocol.max_draw_extra),
+    U32.to_f32 (draw.mesh), U32.to_f32 (draw.material), transform_x.x,
+    transform_x.y, transform_x.z, transform_x.w, transform_y.x, transform_y.y,
+    transform_y.z, transform_y.w, transform_z.x, transform_z.y, transform_z.z,
+    transform_z.w, transform_w.x, transform_w.y, transform_w.z, transform_w.w,
+    parameters_count, parameters.x, parameters.y, parameters.z, parameters.w,
+    U32.to_f32 (min draw.extra.length protocol.max_draw_extra),
   ]
 
 // Solid: its faces' count, then each of them.
 const encode_solid = func (solid: types.Solid) => return do:
   let faces = solid.faces
   let encoded = @array.fill (protocol.solid_floats + faces.length * protocol.solid_face_floats) 0.0
-  encoded[0] := from faces.length
+  encoded[0] := U32.to_f32 faces.length
   for index in 0 .. faces.length:
     let face = faces[index]
     let start = protocol.solid_floats + index * protocol.solid_face_floats
@@ -34,7 +34,7 @@ const encode_solid = func (solid: types.Solid) => return do:
     encoded[start + 1] := face.normal.y
     encoded[start + 2] := face.normal.z
     encoded[start + 3] := face.distance
-    encoded[start + 4] := from face.material
+    encoded[start + 4] := U32.to_f32 (face.material)
   return encoded
 
 // Decal: `material`'s texture laid onto the surfaces inside the box, the cube
@@ -43,7 +43,7 @@ const encode_solid = func (solid: types.Solid) => return do:
 const encode_decal = func (decal: types.Decal) => return do:
   let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = decal.transform
   return #[
-    from decal.material, transform_x.x, transform_x.y, transform_x.z,
+    U32.to_f32 (decal.material), transform_x.x, transform_x.y, transform_x.z,
     transform_x.w, transform_y.x, transform_y.y, transform_y.z, transform_y.w,
     transform_z.x, transform_z.y, transform_z.z, transform_z.w, transform_w.x,
     transform_w.y, transform_w.z, transform_w.w, decal.opacity,
@@ -53,8 +53,8 @@ const encode_decal = func (decal: types.Decal) => return do:
 // and reverb send given, all worked out by the game.
 const encode_sound = func (sound: types.Sound) => return do:
   return #[
-    from sound.clip, from sound.bus, sound.gain, sound.pan, sound.pitch,
-    sound.lowpass, sound.reverb,
+    U32.to_f32 (sound.clip), U32.to_f32 (sound.bus), sound.gain, sound.pan,
+    sound.pitch, sound.lowpass, sound.reverb,
   ]
 
 // Sprite: A rectangle over the screen, in pixels from its top left, drawn by its
@@ -63,7 +63,7 @@ const encode_sprite = func (sprite: types.Sprite) => return do:
   return #[
     sprite.x, sprite.y, sprite.width, sprite.height, sprite.u0, sprite.v0,
     sprite.u1, sprite.v1, sprite.color.x, sprite.color.y, sprite.color.z,
-    sprite.color.w, from sprite.material, sprite.parameters.x,
+    sprite.color.w, U32.to_f32 (sprite.material), sprite.parameters.x,
     sprite.parameters.y, sprite.parameters.z, sprite.parameters.w,
   ]
 
@@ -81,16 +81,17 @@ const encode_inset = func (inset: types.Inset) => return do:
     projection_w.y, projection_w.z, projection_w.w, inset.ambient.x,
     inset.ambient.y, inset.ambient.z, inset.light_direction.x,
     inset.light_direction.y, inset.light_direction.z, inset.light_color.x,
-    inset.light_color.y, inset.light_color.z, from inset.draws.length,
-    inset.pixel_size, from inset.after_sprites,
+    inset.light_color.y, inset.light_color.z, U32.to_f32 (inset.draws.length),
+    inset.pixel_size, U32.to_f32 (inset.after_sprites),
   ]
 
 // FieldPatch: its material, width, height, x, z, columns, rows, then its values.
 const encode_field_patch = func (field_patch: types.FieldPatch) => return do:
   return array.concat #[
-    from field_patch.material, from field_patch.width, from field_patch.height,
-    from field_patch.x, from field_patch.z, from field_patch.columns,
-    from field_patch.rows,
+    U32.to_f32 (field_patch.material), U32.to_f32 (field_patch.width),
+    U32.to_f32 (field_patch.height), U32.to_f32 (field_patch.x),
+    U32.to_f32 (field_patch.z), U32.to_f32 (field_patch.columns),
+    U32.to_f32 (field_patch.rows),
   ] field_patch.values
 
 // UiNode: its id, parent, role, x, y, width, height, focusable, focused,
@@ -99,23 +100,25 @@ const encode_field_patch = func (field_patch: types.FieldPatch) => return do:
 // text.
 const encode_ui_node = func (ui_node: types.UiNode) => return do:
   return array.concat #[
-    from ui_node.id, from ui_node.parent, from ui_node.role, ui_node.x,
-    ui_node.y, ui_node.width, ui_node.height, lanes.bit ui_node.focusable,
-    lanes.bit ui_node.focused, lanes.bit ui_node.disabled,
-    lanes.bit ui_node.hidden, lanes.bit ui_node.modal, from ui_node.checked,
-    from ui_node.expanded, from ui_node.selected, from ui_node.live,
-    ui_node.value, ui_node.minimum, ui_node.maximum, ui_node.step,
-    from ui_node.actions, from ui_node.text_length, from ui_node.name_length,
-    from ui_node.description_length,
+    U32.to_f32 (ui_node.id), U32.to_f32 (ui_node.parent),
+    U32.to_f32 (ui_node.role), ui_node.x, ui_node.y, ui_node.width,
+    ui_node.height, lanes.bit ui_node.focusable, lanes.bit ui_node.focused,
+    lanes.bit ui_node.disabled, lanes.bit ui_node.hidden,
+    lanes.bit ui_node.modal, U32.to_f32 (ui_node.checked),
+    U32.to_f32 (ui_node.expanded), U32.to_f32 (ui_node.selected),
+    U32.to_f32 (ui_node.live), ui_node.value, ui_node.minimum, ui_node.maximum,
+    ui_node.step, U32.to_f32 (ui_node.actions), U32.to_f32 (ui_node.text_length),
+    U32.to_f32 (ui_node.name_length), U32.to_f32 (ui_node.description_length),
   ] ui_node.text
 
 // ServiceRequest: its request, service, operation, a, b, c, d, value_count, then
 // its values.
 const encode_service_request = func (service_request: types.ServiceRequest) => return do:
   return array.concat #[
-    from service_request.request, from service_request.service,
-    from service_request.operation, service_request.a, service_request.b,
-    service_request.c, service_request.d, from service_request.value_count,
+    U32.to_f32 (service_request.request), U32.to_f32 (service_request.service),
+    U32.to_f32 (service_request.operation), service_request.a, service_request.b,
+    service_request.c, service_request.d,
+    U32.to_f32 (service_request.value_count),
   ] service_request.values
 
 // Bus: A bus: the voices and sounds on it mix through its lowpass and gain into
@@ -136,16 +139,16 @@ const encode_bus = func (bu: types.Bus) => return do:
 // does not loop plays once and is then silent for as long as frames keep it.
 const encode_voice = func (voice: types.Voice) => return do:
   return #[
-    from voice.id, from voice.clip, from voice.bus, voice.gain, voice.pan,
-    voice.pitch, voice.lowpass, voice.reverb, lanes.bit voice.looping,
-    voice.start, voice.fade_in, voice.fade_out,
+    U32.to_f32 (voice.id), U32.to_f32 (voice.clip), U32.to_f32 (voice.bus),
+    voice.gain, voice.pan, voice.pitch, voice.lowpass, voice.reverb,
+    lanes.bit voice.looping, voice.start, voice.fade_in, voice.fade_out,
   ]
 
 // Pose: A layer of a skinned draw's pose: clip `clip` of the draw's mesh at
 // `time` seconds, counting `weight` among the draw's layers.
 const encode_pose = func (pose: types.Pose) => return do:
   return #[
-    from pose.draw, from pose.clip, pose.time, pose.weight,
+    U32.to_f32 (pose.draw), U32.to_f32 (pose.clip), pose.time, pose.weight,
   ]
 
 // Emitter: A particle emitter: `rate` particles a second, each living `lifetime`
@@ -154,14 +157,14 @@ const encode_pose = func (pose: types.Pose) => return do:
 const encode_emitter = func (emitter: types.Emitter) => return do:
   let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = emitter.transform
   return #[
-    from emitter.material, transform_x.x, transform_x.y, transform_x.z,
+    U32.to_f32 (emitter.material), transform_x.x, transform_x.y, transform_x.z,
     transform_x.w, transform_y.x, transform_y.y, transform_y.z, transform_y.w,
     transform_z.x, transform_z.y, transform_z.z, transform_z.w, transform_w.x,
-    transform_w.y, transform_w.z, transform_w.w, from emitter.seed, emitter.time,
-    emitter.duration, emitter.rate, emitter.lifetime, emitter.radius,
-    emitter.velocity.x, emitter.velocity.y, emitter.velocity.z, emitter.spread,
-    emitter.gravity.x, emitter.gravity.y, emitter.gravity.z, emitter.drag,
-    emitter.size_start, emitter.size_end, emitter.color_start.r,
+    transform_w.y, transform_w.z, transform_w.w, U32.to_f32 (emitter.seed),
+    emitter.time, emitter.duration, emitter.rate, emitter.lifetime,
+    emitter.radius, emitter.velocity.x, emitter.velocity.y, emitter.velocity.z,
+    emitter.spread, emitter.gravity.x, emitter.gravity.y, emitter.gravity.z,
+    emitter.drag, emitter.size_start, emitter.size_end, emitter.color_start.r,
     emitter.color_start.g, emitter.color_start.b, emitter.color_start.a,
     emitter.color_end.r, emitter.color_end.g, emitter.color_end.b,
     emitter.color_end.a, lanes.bit emitter.additive,
@@ -193,11 +196,11 @@ const encode_listener = func (listener: types.Listener) => return do:
 // is ignored, and of two for one voice or sound hosts take the first.
 const encode_panner = func (panner: types.Panner) => return do:
   return #[
-    from panner.voice, from panner.sound, panner.position.x, panner.position.y,
-    panner.position.z, panner.orientation.x, panner.orientation.y,
-    panner.orientation.z, from panner.distance_model, panner.ref_distance,
-    panner.max_distance, panner.rolloff, panner.cone_inner, panner.cone_outer,
-    panner.cone_outer_gain,
+    U32.to_f32 (panner.voice), U32.to_f32 (panner.sound), panner.position.x,
+    panner.position.y, panner.position.z, panner.orientation.x,
+    panner.orientation.y, panner.orientation.z,
+    U32.to_f32 (panner.distance_model), panner.ref_distance, panner.max_distance,
+    panner.rolloff, panner.cone_inner, panner.cone_outer, panner.cone_outer_gain,
   ]
 
 // A Instance's lanes.
@@ -207,18 +210,19 @@ const encode_instance = func (instance: types.Instance) => return do:
     $Some value => (4.0, value)
     $Nothing => (0.0, types.zero4)
   return #[
-    from instance.id_low, from instance.id_high, from instance.order,
-    from instance.mesh, from instance.material, transform_x.x, transform_x.y,
-    transform_x.z, transform_x.w, transform_y.x, transform_y.y, transform_y.z,
-    transform_y.w, transform_z.x, transform_z.y, transform_z.z, transform_z.w,
-    transform_w.x, transform_w.y, transform_w.z, transform_w.w, parameters_count,
-    parameters.x, parameters.y, parameters.z, parameters.w,
+    U32.to_f32 (instance.id_low), U32.to_f32 (instance.id_high),
+    U32.to_f32 (instance.order), U32.to_f32 (instance.mesh),
+    U32.to_f32 (instance.material), transform_x.x, transform_x.y, transform_x.z,
+    transform_x.w, transform_y.x, transform_y.y, transform_y.z, transform_y.w,
+    transform_z.x, transform_z.y, transform_z.z, transform_z.w, transform_w.x,
+    transform_w.y, transform_w.z, transform_w.w, parameters_count, parameters.x,
+    parameters.y, parameters.z, parameters.w,
   ]
 
 // A InstanceRemoval's lanes.
 const encode_instance_removal = func (instance_removal: types.InstanceRemoval) => return do:
   return #[
-    from instance_removal.id_low, from instance_removal.id_high,
+    U32.to_f32 (instance_removal.id_low), U32.to_f32 (instance_removal.id_high),
   ]
 
 // A Draw's extra, at most protocol.max_draw_extra of them, for the packet's last
@@ -229,646 +233,86 @@ const encode_draw_extra = func (draw: types.Draw) => return do:
 
 const vec4_lanes = func (v: types.Vec4) => return #[v.x, v.y, v.z, v.w]
 
-// Count first, then write every lane into one uniquely owned buffer.
-const draw_metadata = func (draw: types.Draw) => return (draw.mesh, draw.material)
-const draw_transform = func (draw: types.Draw) => return do:
-  let $types.Mat4 { x, y, z, w } = draw.transform
-  return (x.x, x.y, x.z, x.w, y.x, y.y, y.z, y.w, z.x, z.y, z.z, z.w, w.x, w.y, w.z, w.w)
-const draw_parameters = func (draw: types.Draw) => return case draw.parameters of
-  $Some p => (4.0, p.x, p.y, p.z, p.w)
-  $Nothing => (0.0, 0.0, 0.0, 0.0, 0.0)
-const encode_render = func (packet: types.RenderFrame) => return
-  encode_render_draws packet packet.draws draw_metadata draw_transform draw_parameters encode_draw_extra
-
-// Adapters supply scalar projections without constructing nominal wire copies.
-const encode_render_draws = func (packet: types.RenderFrame) => return func (draws: Array d) => return func (metadata_of: d -> (U32, U32)) => return func (matrix_of: d -> (F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32)) => return func (parameters_of: d -> (F32, F32, F32, F32, F32)) => return func (extra_of: d -> Array F32) => return do:
-  let solids_lanes = 0
-  for solid in packet.solids:
-    solids_lanes := self + 1 + solid.faces.length * 5
-  let inset_draws_count = 0
-  for inset in packet.insets:
-    inset_draws_count := self + inset.draws.length
-  let fields_lanes = 0
-  for field in packet.fields:
-    fields_lanes := self + 7 + field.values.length * 1
-  let ui_lanes = 0
-  for ui in packet.ui:
-    ui_lanes := self + 24 + ui.text.length * 1
-  let services_lanes = 0
-  for service in packet.services:
-    services_lanes := self + 8 + service.values.length * 1
-  let extras_lanes = 0
-  for draw in draws:
-    let extra = extra_of draw
-    extras_lanes := self + extra.length
-  for inset in packet.insets:
-    for inset_draw in inset.draws:
-      extras_lanes := self + min inset_draw.extra.length protocol.max_draw_extra * 4
-  let encoded = @array.fill (protocol.packet_header_floats + packet.state.length + draws.length * 24 + solids_lanes + packet.decals.length * 18 + packet.sounds.length * 7 + packet.sprites.length * 17 + packet.insets.length * 48 + inset_draws_count * 24 + packet.preferences.length + fields_lanes + ui_lanes + services_lanes + packet.buses.length * 3 + packet.voices.length * 12 + packet.poses.length * 4 + packet.emitters.length * 42 + packet.lights.length * 12 + packet.listener.length * 9 + packet.panners.length * 15 + packet.instances.length * 26 + packet.instance_removals.length * 2 + extras_lanes) 0.0
-  let at = 0
-  encoded[0] := protocol.packet_magic
-  encoded[1] := from packet.schema
-  encoded[2] := from packet.state.length
-  encoded[3] := from draws.length
-  encoded[4] := from packet.solids.length
-  encoded[5] := from solids_lanes
-  encoded[6] := from packet.decals.length
-  encoded[7] := from packet.sounds.length
-  encoded[8] := from packet.sprites.length
-  encoded[9] := from packet.insets.length
-  encoded[10] := from inset_draws_count
-  encoded[11] := from packet.preferences.length
-  encoded[12] := lanes.bit packet.save_requested
-  encoded[13] := lanes.bit packet.load_requested
-  encoded[14] := lanes.bit packet.scene_save_requested
-  encoded[15] := lanes.bit packet.scene_load_requested
-  encoded[16] := lanes.bit packet.checkpoint_requested
-  encoded[17] := lanes.bit packet.undo_requested
-  encoded[18] := lanes.bit packet.redo_requested
-  encoded[19] := lanes.bit packet.exit_requested
-  let $types.Mat4 { x: view_x, y: view_y, z: view_z, w: view_w } = packet.view
-  encoded[20] := view_x.x
-  encoded[21] := view_x.y
-  encoded[22] := view_x.z
-  encoded[23] := view_x.w
-  encoded[24] := view_y.x
-  encoded[25] := view_y.y
-  encoded[26] := view_y.z
-  encoded[27] := view_y.w
-  encoded[28] := view_z.x
-  encoded[29] := view_z.y
-  encoded[30] := view_z.z
-  encoded[31] := view_z.w
-  encoded[32] := view_w.x
-  encoded[33] := view_w.y
-  encoded[34] := view_w.z
-  encoded[35] := view_w.w
-  let $types.Mat4 { x: projection_x, y: projection_y, z: projection_z, w: projection_w } = packet.projection
-  encoded[36] := projection_x.x
-  encoded[37] := projection_x.y
-  encoded[38] := projection_x.z
-  encoded[39] := projection_x.w
-  encoded[40] := projection_y.x
-  encoded[41] := projection_y.y
-  encoded[42] := projection_y.z
-  encoded[43] := projection_y.w
-  encoded[44] := projection_z.x
-  encoded[45] := projection_z.y
-  encoded[46] := projection_z.z
-  encoded[47] := projection_z.w
-  encoded[48] := projection_w.x
-  encoded[49] := projection_w.y
-  encoded[50] := projection_w.z
-  encoded[51] := projection_w.w
-  encoded[52] := packet.clear.r
-  encoded[53] := packet.clear.g
-  encoded[54] := packet.clear.b
-  encoded[55] := packet.clear.a
-  encoded[56] := packet.ambient.x
-  encoded[57] := packet.ambient.y
-  encoded[58] := packet.ambient.z
-  encoded[59] := packet.light_direction.x
-  encoded[60] := packet.light_direction.y
-  encoded[61] := packet.light_direction.z
-  encoded[62] := packet.light_color.x
-  encoded[63] := packet.light_color.y
-  encoded[64] := packet.light_color.z
-  encoded[65] := packet.aberration.x
-  encoded[66] := packet.aberration.y
-  encoded[67] := from packet.quality.msaa
-  encoded[68] := lanes.bit packet.quality.fxaa
-  encoded[69] := packet.quality.scale
-  encoded[70] := from packet.quality.filtering
-  encoded[71] := lanes.bit packet.quality.occlusion
-  encoded[72] := lanes.bit packet.quality.sky
-  encoded[73] := lanes.bit packet.quality.effects
-  encoded[74] := packet.sky.zenith.x
-  encoded[75] := packet.sky.zenith.y
-  encoded[76] := packet.sky.zenith.z
-  encoded[77] := packet.sky.horizon.x
-  encoded[78] := packet.sky.horizon.y
-  encoded[79] := packet.sky.horizon.z
-  encoded[80] := packet.sky.ground.x
-  encoded[81] := packet.sky.ground.y
-  encoded[82] := packet.sky.ground.z
-  encoded[83] := packet.sky.sun.x
-  encoded[84] := packet.sky.sun.y
-  encoded[85] := packet.sky.sun.z
-  encoded[86] := packet.sky.night
-  encoded[87] := packet.fog.radius
-  encoded[88] := packet.fog.density
-  encoded[89] := packet.fog.height
-  let $types.Mat4 { x: shadow_view_x, y: shadow_view_y, z: shadow_view_z, w: shadow_view_w } = packet.shadow.view
-  encoded[90] := shadow_view_x.x
-  encoded[91] := shadow_view_x.y
-  encoded[92] := shadow_view_x.z
-  encoded[93] := shadow_view_x.w
-  encoded[94] := shadow_view_y.x
-  encoded[95] := shadow_view_y.y
-  encoded[96] := shadow_view_y.z
-  encoded[97] := shadow_view_y.w
-  encoded[98] := shadow_view_z.x
-  encoded[99] := shadow_view_z.y
-  encoded[100] := shadow_view_z.z
-  encoded[101] := shadow_view_z.w
-  encoded[102] := shadow_view_w.x
-  encoded[103] := shadow_view_w.y
-  encoded[104] := shadow_view_w.z
-  encoded[105] := shadow_view_w.w
-  let $types.Mat4 { x: shadow_projection_x, y: shadow_projection_y, z: shadow_projection_z, w: shadow_projection_w } = packet.shadow.projection
-  encoded[106] := shadow_projection_x.x
-  encoded[107] := shadow_projection_x.y
-  encoded[108] := shadow_projection_x.z
-  encoded[109] := shadow_projection_x.w
-  encoded[110] := shadow_projection_y.x
-  encoded[111] := shadow_projection_y.y
-  encoded[112] := shadow_projection_y.z
-  encoded[113] := shadow_projection_y.w
-  encoded[114] := shadow_projection_z.x
-  encoded[115] := shadow_projection_z.y
-  encoded[116] := shadow_projection_z.z
-  encoded[117] := shadow_projection_z.w
-  encoded[118] := shadow_projection_w.x
-  encoded[119] := shadow_projection_w.y
-  encoded[120] := shadow_projection_w.z
-  encoded[121] := shadow_projection_w.w
-  encoded[122] := packet.shadow.texel
-  encoded[123] := from packet.shadow.texels
-  encoded[124] := packet.blur
-  encoded[125] := lanes.bit packet.quality.bloom
-  encoded[126] := packet.clouds.cover
-  encoded[127] := packet.clouds.drift.x
-  encoded[128] := packet.clouds.drift.z
-  encoded[129] := lanes.bit packet.hide_cursor
-  encoded[130] := from packet.fields.length
-  encoded[131] := from fields_lanes
-  encoded[132] := from packet.ui.length
-  encoded[133] := from ui_lanes
-  encoded[134] := from packet.services.length
-  encoded[135] := from services_lanes
-  encoded[136] := from packet.buses.length
-  encoded[137] := from packet.voices.length
-  encoded[138] := from packet.poses.length
-  encoded[139] := from packet.emitters.length
-  encoded[140] := lanes.bit packet.quality.taa
-  encoded[141] := from packet.lights.length
-  encoded[142] := from packet.listener.length
-  encoded[143] := from packet.panners.length
-  encoded[144] := lanes.bit packet.loading
-  encoded[145] := lanes.bit packet.show_captions
-  encoded[146] := lanes.bit packet.retained_enabled
-  encoded[147] := lanes.bit packet.retained_reset
-  encoded[148] := from packet.retained_after
-  encoded[149] := from packet.instances.length
-  encoded[150] := from packet.instance_removals.length
-  at := protocol.packet_header_floats
-  for value in packet.state:
-    encoded[at] := value
-    at := self + 1
-  for draw in draws:
-    let extra = extra_of draw
-    let (mesh, material) = metadata_of draw
-    let (m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15) = matrix_of draw
-    let (present, p0, p1, p2, p3) = parameters_of draw
-    encoded[at + 0] := U32.to_f32 mesh
-    encoded[at + 1] := U32.to_f32 material
-    encoded[at + 2] := m0
-    encoded[at + 3] := m1
-    encoded[at + 4] := m2
-    encoded[at + 5] := m3
-    encoded[at + 6] := m4
-    encoded[at + 7] := m5
-    encoded[at + 8] := m6
-    encoded[at + 9] := m7
-    encoded[at + 10] := m8
-    encoded[at + 11] := m9
-    encoded[at + 12] := m10
-    encoded[at + 13] := m11
-    encoded[at + 14] := m12
-    encoded[at + 15] := m13
-    encoded[at + 16] := m14
-    encoded[at + 17] := m15
-    encoded[at + 18] := present
-    encoded[at + 19] := p0
-    encoded[at + 20] := p1
-    encoded[at + 21] := p2
-    encoded[at + 22] := p3
-    encoded[at + 23] := from (extra.length / 4)
-    at := self + 24
-  for solid in packet.solids:
-    encoded[at + 0] := from solid.faces.length
-    at := self + 1
-    for face in solid.faces:
-      encoded[at + 0] := face.normal.x
-      encoded[at + 1] := face.normal.y
-      encoded[at + 2] := face.normal.z
-      encoded[at + 3] := face.distance
-      encoded[at + 4] := from face.material
-      at := self + 5
-  for decal in packet.decals:
-    encoded[at + 0] := from decal.material
-    let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = decal.transform
-    encoded[at + 1] := transform_x.x
-    encoded[at + 2] := transform_x.y
-    encoded[at + 3] := transform_x.z
-    encoded[at + 4] := transform_x.w
-    encoded[at + 5] := transform_y.x
-    encoded[at + 6] := transform_y.y
-    encoded[at + 7] := transform_y.z
-    encoded[at + 8] := transform_y.w
-    encoded[at + 9] := transform_z.x
-    encoded[at + 10] := transform_z.y
-    encoded[at + 11] := transform_z.z
-    encoded[at + 12] := transform_z.w
-    encoded[at + 13] := transform_w.x
-    encoded[at + 14] := transform_w.y
-    encoded[at + 15] := transform_w.z
-    encoded[at + 16] := transform_w.w
-    encoded[at + 17] := decal.opacity
-    at := self + 18
-  for sound in packet.sounds:
-    encoded[at + 0] := from sound.clip
-    encoded[at + 1] := from sound.bus
-    encoded[at + 2] := sound.gain
-    encoded[at + 3] := sound.pan
-    encoded[at + 4] := sound.pitch
-    encoded[at + 5] := sound.lowpass
-    encoded[at + 6] := sound.reverb
-    at := self + 7
-  for sprite in packet.sprites:
-    encoded[at + 0] := sprite.x
-    encoded[at + 1] := sprite.y
-    encoded[at + 2] := sprite.width
-    encoded[at + 3] := sprite.height
-    encoded[at + 4] := sprite.u0
-    encoded[at + 5] := sprite.v0
-    encoded[at + 6] := sprite.u1
-    encoded[at + 7] := sprite.v1
-    encoded[at + 8] := sprite.color.x
-    encoded[at + 9] := sprite.color.y
-    encoded[at + 10] := sprite.color.z
-    encoded[at + 11] := sprite.color.w
-    encoded[at + 12] := from sprite.material
-    encoded[at + 13] := sprite.parameters.x
-    encoded[at + 14] := sprite.parameters.y
-    encoded[at + 15] := sprite.parameters.z
-    encoded[at + 16] := sprite.parameters.w
-    at := self + 17
-  for inset in packet.insets:
-    encoded[at + 0] := inset.x
-    encoded[at + 1] := inset.y
-    encoded[at + 2] := inset.width
-    encoded[at + 3] := inset.height
-    let $types.Mat4 { x: view_x, y: view_y, z: view_z, w: view_w } = inset.view
-    encoded[at + 4] := view_x.x
-    encoded[at + 5] := view_x.y
-    encoded[at + 6] := view_x.z
-    encoded[at + 7] := view_x.w
-    encoded[at + 8] := view_y.x
-    encoded[at + 9] := view_y.y
-    encoded[at + 10] := view_y.z
-    encoded[at + 11] := view_y.w
-    encoded[at + 12] := view_z.x
-    encoded[at + 13] := view_z.y
-    encoded[at + 14] := view_z.z
-    encoded[at + 15] := view_z.w
-    encoded[at + 16] := view_w.x
-    encoded[at + 17] := view_w.y
-    encoded[at + 18] := view_w.z
-    encoded[at + 19] := view_w.w
-    let $types.Mat4 { x: projection_x, y: projection_y, z: projection_z, w: projection_w } = inset.projection
-    encoded[at + 20] := projection_x.x
-    encoded[at + 21] := projection_x.y
-    encoded[at + 22] := projection_x.z
-    encoded[at + 23] := projection_x.w
-    encoded[at + 24] := projection_y.x
-    encoded[at + 25] := projection_y.y
-    encoded[at + 26] := projection_y.z
-    encoded[at + 27] := projection_y.w
-    encoded[at + 28] := projection_z.x
-    encoded[at + 29] := projection_z.y
-    encoded[at + 30] := projection_z.z
-    encoded[at + 31] := projection_z.w
-    encoded[at + 32] := projection_w.x
-    encoded[at + 33] := projection_w.y
-    encoded[at + 34] := projection_w.z
-    encoded[at + 35] := projection_w.w
-    encoded[at + 36] := inset.ambient.x
-    encoded[at + 37] := inset.ambient.y
-    encoded[at + 38] := inset.ambient.z
-    encoded[at + 39] := inset.light_direction.x
-    encoded[at + 40] := inset.light_direction.y
-    encoded[at + 41] := inset.light_direction.z
-    encoded[at + 42] := inset.light_color.x
-    encoded[at + 43] := inset.light_color.y
-    encoded[at + 44] := inset.light_color.z
-    encoded[at + 45] := from inset.draws.length
-    encoded[at + 46] := inset.pixel_size
-    encoded[at + 47] := from inset.after_sprites
-    at := self + 48
-  for inset in packet.insets:
-    for inset_draw in inset.draws:
-      encoded[at + 0] := from inset_draw.mesh
-      encoded[at + 1] := from inset_draw.material
-      let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = inset_draw.transform
-      encoded[at + 2] := transform_x.x
-      encoded[at + 3] := transform_x.y
-      encoded[at + 4] := transform_x.z
-      encoded[at + 5] := transform_x.w
-      encoded[at + 6] := transform_y.x
-      encoded[at + 7] := transform_y.y
-      encoded[at + 8] := transform_y.z
-      encoded[at + 9] := transform_y.w
-      encoded[at + 10] := transform_z.x
-      encoded[at + 11] := transform_z.y
-      encoded[at + 12] := transform_z.z
-      encoded[at + 13] := transform_z.w
-      encoded[at + 14] := transform_w.x
-      encoded[at + 15] := transform_w.y
-      encoded[at + 16] := transform_w.z
-      encoded[at + 17] := transform_w.w
-      let (parameters_count, parameters) = case inset_draw.parameters of
-        $Some value => (4.0, value)
-        $Nothing => (0.0, types.zero4)
-      encoded[at + 18] := parameters_count
-      encoded[at + 19] := parameters.x
-      encoded[at + 20] := parameters.y
-      encoded[at + 21] := parameters.z
-      encoded[at + 22] := parameters.w
-      encoded[at + 23] := from (min inset_draw.extra.length protocol.max_draw_extra)
-      at := self + 24
-  for value in packet.preferences:
-    encoded[at] := value
-    at := self + 1
-  for field in packet.fields:
-    encoded[at + 0] := from field.material
-    encoded[at + 1] := from field.width
-    encoded[at + 2] := from field.height
-    encoded[at + 3] := from field.x
-    encoded[at + 4] := from field.z
-    encoded[at + 5] := from field.columns
-    encoded[at + 6] := from field.rows
-    at := self + 7
-    for value in field.values:
-      encoded[at] := value
-      at := self + 1
-  for ui in packet.ui:
-    encoded[at + 0] := from ui.id
-    encoded[at + 1] := from ui.parent
-    encoded[at + 2] := from ui.role
-    encoded[at + 3] := ui.x
-    encoded[at + 4] := ui.y
-    encoded[at + 5] := ui.width
-    encoded[at + 6] := ui.height
-    encoded[at + 7] := lanes.bit ui.focusable
-    encoded[at + 8] := lanes.bit ui.focused
-    encoded[at + 9] := lanes.bit ui.disabled
-    encoded[at + 10] := lanes.bit ui.hidden
-    encoded[at + 11] := lanes.bit ui.modal
-    encoded[at + 12] := from ui.checked
-    encoded[at + 13] := from ui.expanded
-    encoded[at + 14] := from ui.selected
-    encoded[at + 15] := from ui.live
-    encoded[at + 16] := ui.value
-    encoded[at + 17] := ui.minimum
-    encoded[at + 18] := ui.maximum
-    encoded[at + 19] := ui.step
-    encoded[at + 20] := from ui.actions
-    encoded[at + 21] := from ui.text_length
-    encoded[at + 22] := from ui.name_length
-    encoded[at + 23] := from ui.description_length
-    at := self + 24
-    for value in ui.text:
-      encoded[at] := value
-      at := self + 1
-  for service in packet.services:
-    encoded[at + 0] := from service.request
-    encoded[at + 1] := from service.service
-    encoded[at + 2] := from service.operation
-    encoded[at + 3] := service.a
-    encoded[at + 4] := service.b
-    encoded[at + 5] := service.c
-    encoded[at + 6] := service.d
-    encoded[at + 7] := from service.value_count
-    at := self + 8
-    for value in service.values:
-      encoded[at] := value
-      at := self + 1
-  for buse in packet.buses:
-    encoded[at + 0] := buse.gain
-    encoded[at + 1] := buse.lowpass
-    encoded[at + 2] := buse.reverb
-    at := self + 3
-  for voice in packet.voices:
-    encoded[at + 0] := from voice.id
-    encoded[at + 1] := from voice.clip
-    encoded[at + 2] := from voice.bus
-    encoded[at + 3] := voice.gain
-    encoded[at + 4] := voice.pan
-    encoded[at + 5] := voice.pitch
-    encoded[at + 6] := voice.lowpass
-    encoded[at + 7] := voice.reverb
-    encoded[at + 8] := lanes.bit voice.looping
-    encoded[at + 9] := voice.start
-    encoded[at + 10] := voice.fade_in
-    encoded[at + 11] := voice.fade_out
-    at := self + 12
-  for pose in packet.poses:
-    encoded[at + 0] := from pose.draw
-    encoded[at + 1] := from pose.clip
-    encoded[at + 2] := pose.time
-    encoded[at + 3] := pose.weight
-    at := self + 4
-  for emitter in packet.emitters:
-    encoded[at + 0] := from emitter.material
-    let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = emitter.transform
-    encoded[at + 1] := transform_x.x
-    encoded[at + 2] := transform_x.y
-    encoded[at + 3] := transform_x.z
-    encoded[at + 4] := transform_x.w
-    encoded[at + 5] := transform_y.x
-    encoded[at + 6] := transform_y.y
-    encoded[at + 7] := transform_y.z
-    encoded[at + 8] := transform_y.w
-    encoded[at + 9] := transform_z.x
-    encoded[at + 10] := transform_z.y
-    encoded[at + 11] := transform_z.z
-    encoded[at + 12] := transform_z.w
-    encoded[at + 13] := transform_w.x
-    encoded[at + 14] := transform_w.y
-    encoded[at + 15] := transform_w.z
-    encoded[at + 16] := transform_w.w
-    encoded[at + 17] := from emitter.seed
-    encoded[at + 18] := emitter.time
-    encoded[at + 19] := emitter.duration
-    encoded[at + 20] := emitter.rate
-    encoded[at + 21] := emitter.lifetime
-    encoded[at + 22] := emitter.radius
-    encoded[at + 23] := emitter.velocity.x
-    encoded[at + 24] := emitter.velocity.y
-    encoded[at + 25] := emitter.velocity.z
-    encoded[at + 26] := emitter.spread
-    encoded[at + 27] := emitter.gravity.x
-    encoded[at + 28] := emitter.gravity.y
-    encoded[at + 29] := emitter.gravity.z
-    encoded[at + 30] := emitter.drag
-    encoded[at + 31] := emitter.size_start
-    encoded[at + 32] := emitter.size_end
-    encoded[at + 33] := emitter.color_start.r
-    encoded[at + 34] := emitter.color_start.g
-    encoded[at + 35] := emitter.color_start.b
-    encoded[at + 36] := emitter.color_start.a
-    encoded[at + 37] := emitter.color_end.r
-    encoded[at + 38] := emitter.color_end.g
-    encoded[at + 39] := emitter.color_end.b
-    encoded[at + 40] := emitter.color_end.a
-    encoded[at + 41] := lanes.bit emitter.additive
-    at := self + 42
-  for light in packet.lights:
-    encoded[at + 0] := light.position.x
-    encoded[at + 1] := light.position.y
-    encoded[at + 2] := light.position.z
-    encoded[at + 3] := light.radius
-    encoded[at + 4] := light.color.x
-    encoded[at + 5] := light.color.y
-    encoded[at + 6] := light.color.z
-    encoded[at + 7] := light.direction.x
-    encoded[at + 8] := light.direction.y
-    encoded[at + 9] := light.direction.z
-    encoded[at + 10] := light.inner
-    encoded[at + 11] := light.outer
-    at := self + 12
-  for listener in packet.listener:
-    encoded[at + 0] := listener.position.x
-    encoded[at + 1] := listener.position.y
-    encoded[at + 2] := listener.position.z
-    encoded[at + 3] := listener.forward.x
-    encoded[at + 4] := listener.forward.y
-    encoded[at + 5] := listener.forward.z
-    encoded[at + 6] := listener.up.x
-    encoded[at + 7] := listener.up.y
-    encoded[at + 8] := listener.up.z
-    at := self + 9
-  for panner in packet.panners:
-    encoded[at + 0] := from panner.voice
-    encoded[at + 1] := from panner.sound
-    encoded[at + 2] := panner.position.x
-    encoded[at + 3] := panner.position.y
-    encoded[at + 4] := panner.position.z
-    encoded[at + 5] := panner.orientation.x
-    encoded[at + 6] := panner.orientation.y
-    encoded[at + 7] := panner.orientation.z
-    encoded[at + 8] := from panner.distance_model
-    encoded[at + 9] := panner.ref_distance
-    encoded[at + 10] := panner.max_distance
-    encoded[at + 11] := panner.rolloff
-    encoded[at + 12] := panner.cone_inner
-    encoded[at + 13] := panner.cone_outer
-    encoded[at + 14] := panner.cone_outer_gain
-    at := self + 15
-  for instance in packet.instances:
-    encoded[at + 0] := from instance.id_low
-    encoded[at + 1] := from instance.id_high
-    encoded[at + 2] := from instance.order
-    encoded[at + 3] := from instance.mesh
-    encoded[at + 4] := from instance.material
-    let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = instance.transform
-    encoded[at + 5] := transform_x.x
-    encoded[at + 6] := transform_x.y
-    encoded[at + 7] := transform_x.z
-    encoded[at + 8] := transform_x.w
-    encoded[at + 9] := transform_y.x
-    encoded[at + 10] := transform_y.y
-    encoded[at + 11] := transform_y.z
-    encoded[at + 12] := transform_y.w
-    encoded[at + 13] := transform_z.x
-    encoded[at + 14] := transform_z.y
-    encoded[at + 15] := transform_z.z
-    encoded[at + 16] := transform_z.w
-    encoded[at + 17] := transform_w.x
-    encoded[at + 18] := transform_w.y
-    encoded[at + 19] := transform_w.z
-    encoded[at + 20] := transform_w.w
-    let (parameters_count, parameters) = case instance.parameters of
-      $Some value => (4.0, value)
-      $Nothing => (0.0, types.zero4)
-    encoded[at + 21] := parameters_count
-    encoded[at + 22] := parameters.x
-    encoded[at + 23] := parameters.y
-    encoded[at + 24] := parameters.z
-    encoded[at + 25] := parameters.w
-    at := self + 26
-  for instance_removal in packet.instance_removals:
-    encoded[at + 0] := from instance_removal.id_low
-    encoded[at + 1] := from instance_removal.id_high
-    at := self + 2
-  for draw in draws:
-    let extra = extra_of draw
-    for value in extra:
-      encoded[at] := value
-      at := self + 1
-  for inset in packet.insets:
-    for inset_draw in inset.draws:
-      for index in 0 .. min inset_draw.extra.length protocol.max_draw_extra:
-        encoded[at + 0] := (inset_draw.extra.at index).x
-        encoded[at + 1] := (inset_draw.extra.at index).y
-        encoded[at + 2] := (inset_draw.extra.at index).z
-        encoded[at + 3] := (inset_draw.extra.at index).w
-        at := self + 4
-  return encoded
-
 // Borrowed source groups, known scalar projections, caller-owned output.
-const encode_render_views = func packet -> collections -> project -> context -> (encoded: ResizeArray F32) => return do:
+const encode_render_views = func (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: ResizeArray F32) => return do:
   let draws = collections.draws
-  let metadata_of = func draw => return project.draw_metadata context draw
-  let matrix_of = func draw => return project.draw_transform context draw
-  let parameters_of = func draw => return project.draw_parameters context draw
-  let extra_of = func draw => return project.draw_extra context draw
-  let solids_lanes = 0
+  let metadata_of = func draw: (U32, U32) => return project.draw_metadata context draw
+  let matrix_of = func draw: (F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32) => return project.draw_transform context draw
+  let parameters_of = func draw: (F32, F32, F32, F32, F32) => return project.draw_parameters context draw
+  let extra_of = func draw: Array F32 => return project.draw_extra context draw
+  let source_state_count: U32 = collections.state.length
+  let source_draws_count: U32 = draws.length
+  let source_solids_count: U32 = collections.solids.length
+  let source_decals_count: U32 = collections.decals.length
+  let source_sounds_count: U32 = collections.sounds.length
+  let source_sprites_count: U32 = collections.sprites.length
+  let source_insets_count: U32 = collections.insets.length
+  let source_preferences_count: U32 = collections.preferences.length
+  let source_fields_count: U32 = collections.fields.length
+  let source_ui_count: U32 = collections.ui.length
+  let source_services_count: U32 = collections.services.length
+  let source_buses_count: U32 = collections.buses.length
+  let source_voices_count: U32 = collections.voices.length
+  let source_poses_count: U32 = collections.poses.length
+  let source_emitters_count: U32 = collections.emitters.length
+  let source_lights_count: U32 = collections.lights.length
+  let source_listener_count: U32 = collections.listener.length
+  let source_panners_count: U32 = collections.panners.length
+  let source_instances_count: U32 = collections.instances.length
+  let source_instance_removals_count: U32 = collections.instance_removals.length
+  let solids_lanes: U32 = 0
   for source_solid in collections.solids:
     let solid = project.solid context source_solid
-    solids_lanes := self + 1 + solid.faces.length * 5
-  let inset_draws_count = 0
+    let view_solid_faces_count: U32 = solid.faces.length
+    solids_lanes := self + 1 + view_solid_faces_count * 5
+  let inset_draws_count: U32 = 0
   for source_inset in collections.insets:
     let inset = project.inset context source_inset
-    inset_draws_count := self + inset.draws.length
-  let fields_lanes = 0
+    let view_inset_draws_count: U32 = inset.draws.length
+    inset_draws_count := self + view_inset_draws_count
+  let fields_lanes: U32 = 0
   for source_field in collections.fields:
     let field = project.field context source_field
-    fields_lanes := self + 7 + field.values.length * 1
-  let ui_lanes = 0
+    let view_field_values_count: U32 = field.values.length
+    fields_lanes := self + 7 + view_field_values_count * 1
+  let ui_lanes: U32 = 0
   for source_ui in collections.ui:
     let ui = project.ui context source_ui
-    ui_lanes := self + 24 + ui.text.length * 1
-  let services_lanes = 0
+    let view_ui_text_count: U32 = ui.text.length
+    ui_lanes := self + 24 + view_ui_text_count * 1
+  let services_lanes: U32 = 0
   for source_service in collections.services:
     let service = project.service context source_service
-    services_lanes := self + 8 + service.values.length * 1
-  let extras_lanes = 0
+    let view_service_values_count: U32 = service.values.length
+    services_lanes := self + 8 + view_service_values_count * 1
+  let extras_lanes: U32 = 0
   for draw in draws:
     let extra = extra_of draw
-    extras_lanes := self + extra.length
+    let extra_count: U32 = extra.length
+    extras_lanes := self + extra_count
   for source_inset in collections.insets:
     let inset = project.inset context source_inset
+    let view_inset_draws_count: U32 = inset.draws.length
     for source_inset_draw in inset.draws:
       let inset_draw = project.inset_draw context source_inset_draw
-      extras_lanes := self + min inset_draw.extra.length protocol.max_draw_extra * 4
+      let view_inset_draw_extra_count: U32 = inset_draw.extra.length
+      extras_lanes := self + min view_inset_draw_extra_count protocol.max_draw_extra * 4
   @storage.truncate encoded 0
-  for 0 .. (protocol.packet_header_floats + collections.state.length + draws.length * 24 + solids_lanes + collections.decals.length * 18 + collections.sounds.length * 7 + collections.sprites.length * 17 + collections.insets.length * 48 + inset_draws_count * 24 + collections.preferences.length + fields_lanes + ui_lanes + services_lanes + collections.buses.length * 3 + collections.voices.length * 12 + collections.poses.length * 4 + collections.emitters.length * 42 + collections.lights.length * 12 + collections.listener.length * 9 + collections.panners.length * 15 + collections.instances.length * 26 + collections.instance_removals.length * 2 + extras_lanes):
+  for 0 .. (protocol.packet_header_floats + source_state_count + source_draws_count * 24 + solids_lanes + source_decals_count * 18 + source_sounds_count * 7 + source_sprites_count * 17 + source_insets_count * 48 + inset_draws_count * 24 + source_preferences_count + fields_lanes + ui_lanes + services_lanes + source_buses_count * 3 + source_voices_count * 12 + source_poses_count * 4 + source_emitters_count * 42 + source_lights_count * 12 + source_listener_count * 9 + source_panners_count * 15 + source_instances_count * 26 + source_instance_removals_count * 2 + extras_lanes):
     @storage.push encoded 0.0
-  let at = 0
+  let at: U32 = 0
   encoded[0] := protocol.packet_magic
-  encoded[1] := from packet.schema
-  encoded[2] := from collections.state.length
-  encoded[3] := from draws.length
-  encoded[4] := from collections.solids.length
-  encoded[5] := from solids_lanes
-  encoded[6] := from collections.decals.length
-  encoded[7] := from collections.sounds.length
-  encoded[8] := from collections.sprites.length
-  encoded[9] := from collections.insets.length
-  encoded[10] := from inset_draws_count
-  encoded[11] := from collections.preferences.length
+  encoded[1] := U32.to_f32 packet.schema
+  encoded[2] := U32.to_f32 source_state_count
+  encoded[3] := U32.to_f32 source_draws_count
+  encoded[4] := U32.to_f32 source_solids_count
+  encoded[5] := U32.to_f32 solids_lanes
+  encoded[6] := U32.to_f32 source_decals_count
+  encoded[7] := U32.to_f32 source_sounds_count
+  encoded[8] := U32.to_f32 source_sprites_count
+  encoded[9] := U32.to_f32 source_insets_count
+  encoded[10] := U32.to_f32 inset_draws_count
+  encoded[11] := U32.to_f32 source_preferences_count
   encoded[12] := lanes.bit packet.save_requested
   encoded[13] := lanes.bit packet.load_requested
   encoded[14] := lanes.bit packet.scene_save_requested
@@ -926,10 +370,10 @@ const encode_render_views = func packet -> collections -> project -> context -> 
   encoded[64] := packet.light_color.z
   encoded[65] := packet.aberration.x
   encoded[66] := packet.aberration.y
-  encoded[67] := from packet.quality.msaa
+  encoded[67] := U32.to_f32 (packet.quality.msaa)
   encoded[68] := lanes.bit packet.quality.fxaa
   encoded[69] := packet.quality.scale
-  encoded[70] := from packet.quality.filtering
+  encoded[70] := U32.to_f32 (packet.quality.filtering)
   encoded[71] := lanes.bit packet.quality.occlusion
   encoded[72] := lanes.bit packet.quality.sky
   encoded[73] := lanes.bit packet.quality.effects
@@ -984,40 +428,41 @@ const encode_render_views = func packet -> collections -> project -> context -> 
   encoded[120] := shadow_projection_w.z
   encoded[121] := shadow_projection_w.w
   encoded[122] := packet.shadow.texel
-  encoded[123] := from packet.shadow.texels
+  encoded[123] := U32.to_f32 (packet.shadow.texels)
   encoded[124] := packet.blur
   encoded[125] := lanes.bit packet.quality.bloom
   encoded[126] := packet.clouds.cover
   encoded[127] := packet.clouds.drift.x
   encoded[128] := packet.clouds.drift.z
   encoded[129] := lanes.bit packet.hide_cursor
-  encoded[130] := from collections.fields.length
-  encoded[131] := from fields_lanes
-  encoded[132] := from collections.ui.length
-  encoded[133] := from ui_lanes
-  encoded[134] := from collections.services.length
-  encoded[135] := from services_lanes
-  encoded[136] := from collections.buses.length
-  encoded[137] := from collections.voices.length
-  encoded[138] := from collections.poses.length
-  encoded[139] := from collections.emitters.length
+  encoded[130] := U32.to_f32 source_fields_count
+  encoded[131] := U32.to_f32 fields_lanes
+  encoded[132] := U32.to_f32 source_ui_count
+  encoded[133] := U32.to_f32 ui_lanes
+  encoded[134] := U32.to_f32 source_services_count
+  encoded[135] := U32.to_f32 services_lanes
+  encoded[136] := U32.to_f32 source_buses_count
+  encoded[137] := U32.to_f32 source_voices_count
+  encoded[138] := U32.to_f32 source_poses_count
+  encoded[139] := U32.to_f32 source_emitters_count
   encoded[140] := lanes.bit packet.quality.taa
-  encoded[141] := from collections.lights.length
-  encoded[142] := from collections.listener.length
-  encoded[143] := from collections.panners.length
+  encoded[141] := U32.to_f32 source_lights_count
+  encoded[142] := U32.to_f32 source_listener_count
+  encoded[143] := U32.to_f32 source_panners_count
   encoded[144] := lanes.bit packet.loading
   encoded[145] := lanes.bit packet.show_captions
   encoded[146] := lanes.bit packet.retained_enabled
   encoded[147] := lanes.bit packet.retained_reset
-  encoded[148] := from packet.retained_after
-  encoded[149] := from collections.instances.length
-  encoded[150] := from collections.instance_removals.length
+  encoded[148] := U32.to_f32 (packet.retained_after)
+  encoded[149] := U32.to_f32 source_instances_count
+  encoded[150] := U32.to_f32 source_instance_removals_count
   at := protocol.packet_header_floats
   for value in collections.state:
     encoded[at] := value
     at := self + 1
   for draw in draws:
     let extra = extra_of draw
+    let extra_count: U32 = extra.length
     let (mesh, material) = metadata_of draw
     let (m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15) = matrix_of draw
     let (present, p0, p1, p2, p3) = parameters_of draw
@@ -1044,22 +489,23 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 20] := p1
     encoded[at + 21] := p2
     encoded[at + 22] := p3
-    encoded[at + 23] := from (extra.length / 4)
+    encoded[at + 23] := U32.to_f32 (extra_count / 4)
     at := self + 24
   for source_solid in collections.solids:
     let solid = project.solid context source_solid
-    encoded[at + 0] := from solid.faces.length
+    let view_solid_faces_count: U32 = solid.faces.length
+    encoded[at + 0] := U32.to_f32 view_solid_faces_count
     at := self + 1
     for face in solid.faces:
       encoded[at + 0] := face.normal.x
       encoded[at + 1] := face.normal.y
       encoded[at + 2] := face.normal.z
       encoded[at + 3] := face.distance
-      encoded[at + 4] := from face.material
+      encoded[at + 4] := U32.to_f32 (face.material)
       at := self + 5
   for source_decal in collections.decals:
-    let decal = project.decal context source_decal
-    encoded[at + 0] := from decal.material
+    let decal: types.Decal = project.decal context source_decal
+    encoded[at + 0] := U32.to_f32 (decal.material)
     let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = decal.transform
     encoded[at + 1] := transform_x.x
     encoded[at + 2] := transform_x.y
@@ -1080,9 +526,9 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 17] := decal.opacity
     at := self + 18
   for source_sound in collections.sounds:
-    let sound = project.sound context source_sound
-    encoded[at + 0] := from sound.clip
-    encoded[at + 1] := from sound.bus
+    let sound: types.Sound = project.sound context source_sound
+    encoded[at + 0] := U32.to_f32 (sound.clip)
+    encoded[at + 1] := U32.to_f32 (sound.bus)
     encoded[at + 2] := sound.gain
     encoded[at + 3] := sound.pan
     encoded[at + 4] := sound.pitch
@@ -1090,7 +536,7 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 6] := sound.reverb
     at := self + 7
   for source_sprite in collections.sprites:
-    let sprite = project.sprite context source_sprite
+    let sprite: types.Sprite = project.sprite context source_sprite
     encoded[at + 0] := sprite.x
     encoded[at + 1] := sprite.y
     encoded[at + 2] := sprite.width
@@ -1103,7 +549,7 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 9] := sprite.color.y
     encoded[at + 10] := sprite.color.z
     encoded[at + 11] := sprite.color.w
-    encoded[at + 12] := from sprite.material
+    encoded[at + 12] := U32.to_f32 (sprite.material)
     encoded[at + 13] := sprite.parameters.x
     encoded[at + 14] := sprite.parameters.y
     encoded[at + 15] := sprite.parameters.z
@@ -1111,6 +557,7 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     at := self + 17
   for source_inset in collections.insets:
     let inset = project.inset context source_inset
+    let view_inset_draws_count: U32 = inset.draws.length
     encoded[at + 0] := inset.x
     encoded[at + 1] := inset.y
     encoded[at + 2] := inset.width
@@ -1158,16 +605,18 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 42] := inset.light_color.x
     encoded[at + 43] := inset.light_color.y
     encoded[at + 44] := inset.light_color.z
-    encoded[at + 45] := from inset.draws.length
+    encoded[at + 45] := U32.to_f32 (view_inset_draws_count)
     encoded[at + 46] := inset.pixel_size
-    encoded[at + 47] := from inset.after_sprites
+    encoded[at + 47] := U32.to_f32 (inset.after_sprites)
     at := self + 48
   for source_inset in collections.insets:
     let inset = project.inset context source_inset
+    let view_inset_draws_count: U32 = inset.draws.length
     for source_inset_draw in inset.draws:
       let inset_draw = project.inset_draw context source_inset_draw
-      encoded[at + 0] := from inset_draw.mesh
-      encoded[at + 1] := from inset_draw.material
+      let view_inset_draw_extra_count: U32 = inset_draw.extra.length
+      encoded[at + 0] := U32.to_f32 (inset_draw.mesh)
+      encoded[at + 1] := U32.to_f32 (inset_draw.material)
       let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = inset_draw.transform
       encoded[at + 2] := transform_x.x
       encoded[at + 3] := transform_x.y
@@ -1193,29 +642,31 @@ const encode_render_views = func packet -> collections -> project -> context -> 
       encoded[at + 20] := parameters.y
       encoded[at + 21] := parameters.z
       encoded[at + 22] := parameters.w
-      encoded[at + 23] := from (min inset_draw.extra.length protocol.max_draw_extra)
+      encoded[at + 23] := U32.to_f32 (min view_inset_draw_extra_count protocol.max_draw_extra)
       at := self + 24
   for value in collections.preferences:
     encoded[at] := value
     at := self + 1
   for source_field in collections.fields:
     let field = project.field context source_field
-    encoded[at + 0] := from field.material
-    encoded[at + 1] := from field.width
-    encoded[at + 2] := from field.height
-    encoded[at + 3] := from field.x
-    encoded[at + 4] := from field.z
-    encoded[at + 5] := from field.columns
-    encoded[at + 6] := from field.rows
+    let view_field_values_count: U32 = field.values.length
+    encoded[at + 0] := U32.to_f32 (field.material)
+    encoded[at + 1] := U32.to_f32 (field.width)
+    encoded[at + 2] := U32.to_f32 (field.height)
+    encoded[at + 3] := U32.to_f32 (field.x)
+    encoded[at + 4] := U32.to_f32 (field.z)
+    encoded[at + 5] := U32.to_f32 (field.columns)
+    encoded[at + 6] := U32.to_f32 (field.rows)
     at := self + 7
     for value in field.values:
       encoded[at] := value
       at := self + 1
   for source_ui in collections.ui:
     let ui = project.ui context source_ui
-    encoded[at + 0] := from ui.id
-    encoded[at + 1] := from ui.parent
-    encoded[at + 2] := from ui.role
+    let view_ui_text_count: U32 = ui.text.length
+    encoded[at + 0] := U32.to_f32 (ui.id)
+    encoded[at + 1] := U32.to_f32 (ui.parent)
+    encoded[at + 2] := U32.to_f32 (ui.role)
     encoded[at + 3] := ui.x
     encoded[at + 4] := ui.y
     encoded[at + 5] := ui.width
@@ -1225,47 +676,48 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 9] := lanes.bit ui.disabled
     encoded[at + 10] := lanes.bit ui.hidden
     encoded[at + 11] := lanes.bit ui.modal
-    encoded[at + 12] := from ui.checked
-    encoded[at + 13] := from ui.expanded
-    encoded[at + 14] := from ui.selected
-    encoded[at + 15] := from ui.live
+    encoded[at + 12] := U32.to_f32 (ui.checked)
+    encoded[at + 13] := U32.to_f32 (ui.expanded)
+    encoded[at + 14] := U32.to_f32 (ui.selected)
+    encoded[at + 15] := U32.to_f32 (ui.live)
     encoded[at + 16] := ui.value
     encoded[at + 17] := ui.minimum
     encoded[at + 18] := ui.maximum
     encoded[at + 19] := ui.step
-    encoded[at + 20] := from ui.actions
-    encoded[at + 21] := from ui.text_length
-    encoded[at + 22] := from ui.name_length
-    encoded[at + 23] := from ui.description_length
+    encoded[at + 20] := U32.to_f32 (ui.actions)
+    encoded[at + 21] := U32.to_f32 (ui.text_length)
+    encoded[at + 22] := U32.to_f32 (ui.name_length)
+    encoded[at + 23] := U32.to_f32 (ui.description_length)
     at := self + 24
     for value in ui.text:
       encoded[at] := value
       at := self + 1
   for source_service in collections.services:
     let service = project.service context source_service
-    encoded[at + 0] := from service.request
-    encoded[at + 1] := from service.service
-    encoded[at + 2] := from service.operation
+    let view_service_values_count: U32 = service.values.length
+    encoded[at + 0] := U32.to_f32 (service.request)
+    encoded[at + 1] := U32.to_f32 (service.service)
+    encoded[at + 2] := U32.to_f32 (service.operation)
     encoded[at + 3] := service.a
     encoded[at + 4] := service.b
     encoded[at + 5] := service.c
     encoded[at + 6] := service.d
-    encoded[at + 7] := from service.value_count
+    encoded[at + 7] := U32.to_f32 (service.value_count)
     at := self + 8
     for value in service.values:
       encoded[at] := value
       at := self + 1
   for source_buse in collections.buses:
-    let buse = project.buse context source_buse
+    let buse: types.Bus = project.buse context source_buse
     encoded[at + 0] := buse.gain
     encoded[at + 1] := buse.lowpass
     encoded[at + 2] := buse.reverb
     at := self + 3
   for source_voice in collections.voices:
-    let voice = project.voice context source_voice
-    encoded[at + 0] := from voice.id
-    encoded[at + 1] := from voice.clip
-    encoded[at + 2] := from voice.bus
+    let voice: types.Voice = project.voice context source_voice
+    encoded[at + 0] := U32.to_f32 (voice.id)
+    encoded[at + 1] := U32.to_f32 (voice.clip)
+    encoded[at + 2] := U32.to_f32 (voice.bus)
     encoded[at + 3] := voice.gain
     encoded[at + 4] := voice.pan
     encoded[at + 5] := voice.pitch
@@ -1277,15 +729,15 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 11] := voice.fade_out
     at := self + 12
   for source_pose in collections.poses:
-    let pose = project.pose context source_pose
-    encoded[at + 0] := from pose.draw
-    encoded[at + 1] := from pose.clip
+    let pose: types.Pose = project.pose context source_pose
+    encoded[at + 0] := U32.to_f32 (pose.draw)
+    encoded[at + 1] := U32.to_f32 (pose.clip)
     encoded[at + 2] := pose.time
     encoded[at + 3] := pose.weight
     at := self + 4
   for source_emitter in collections.emitters:
-    let emitter = project.emitter context source_emitter
-    encoded[at + 0] := from emitter.material
+    let emitter: types.Emitter = project.emitter context source_emitter
+    encoded[at + 0] := U32.to_f32 (emitter.material)
     let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = emitter.transform
     encoded[at + 1] := transform_x.x
     encoded[at + 2] := transform_x.y
@@ -1303,7 +755,7 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 14] := transform_w.y
     encoded[at + 15] := transform_w.z
     encoded[at + 16] := transform_w.w
-    encoded[at + 17] := from emitter.seed
+    encoded[at + 17] := U32.to_f32 (emitter.seed)
     encoded[at + 18] := emitter.time
     encoded[at + 19] := emitter.duration
     encoded[at + 20] := emitter.rate
@@ -1330,7 +782,7 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 41] := lanes.bit emitter.additive
     at := self + 42
   for source_light in collections.lights:
-    let light = project.light context source_light
+    let light: types.Light = project.light context source_light
     encoded[at + 0] := light.position.x
     encoded[at + 1] := light.position.y
     encoded[at + 2] := light.position.z
@@ -1345,7 +797,7 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 11] := light.outer
     at := self + 12
   for source_listener in collections.listener:
-    let listener = project.listener context source_listener
+    let listener: types.Listener = project.listener context source_listener
     encoded[at + 0] := listener.position.x
     encoded[at + 1] := listener.position.y
     encoded[at + 2] := listener.position.z
@@ -1357,16 +809,16 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 8] := listener.up.z
     at := self + 9
   for source_panner in collections.panners:
-    let panner = project.panner context source_panner
-    encoded[at + 0] := from panner.voice
-    encoded[at + 1] := from panner.sound
+    let panner: types.Panner = project.panner context source_panner
+    encoded[at + 0] := U32.to_f32 (panner.voice)
+    encoded[at + 1] := U32.to_f32 (panner.sound)
     encoded[at + 2] := panner.position.x
     encoded[at + 3] := panner.position.y
     encoded[at + 4] := panner.position.z
     encoded[at + 5] := panner.orientation.x
     encoded[at + 6] := panner.orientation.y
     encoded[at + 7] := panner.orientation.z
-    encoded[at + 8] := from panner.distance_model
+    encoded[at + 8] := U32.to_f32 (panner.distance_model)
     encoded[at + 9] := panner.ref_distance
     encoded[at + 10] := panner.max_distance
     encoded[at + 11] := panner.rolloff
@@ -1375,12 +827,12 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 14] := panner.cone_outer_gain
     at := self + 15
   for source_instance in collections.instances:
-    let instance = project.instance context source_instance
-    encoded[at + 0] := from instance.id_low
-    encoded[at + 1] := from instance.id_high
-    encoded[at + 2] := from instance.order
-    encoded[at + 3] := from instance.mesh
-    encoded[at + 4] := from instance.material
+    let instance: types.Instance = project.instance context source_instance
+    encoded[at + 0] := U32.to_f32 (instance.id_low)
+    encoded[at + 1] := U32.to_f32 (instance.id_high)
+    encoded[at + 2] := U32.to_f32 (instance.order)
+    encoded[at + 3] := U32.to_f32 (instance.mesh)
+    encoded[at + 4] := U32.to_f32 (instance.material)
     let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = instance.transform
     encoded[at + 5] := transform_x.x
     encoded[at + 6] := transform_x.y
@@ -1408,20 +860,23 @@ const encode_render_views = func packet -> collections -> project -> context -> 
     encoded[at + 25] := parameters.w
     at := self + 26
   for source_instance_removal in collections.instance_removals:
-    let instance_removal = project.instance_removal context source_instance_removal
-    encoded[at + 0] := from instance_removal.id_low
-    encoded[at + 1] := from instance_removal.id_high
+    let instance_removal: types.InstanceRemoval = project.instance_removal context source_instance_removal
+    encoded[at + 0] := U32.to_f32 (instance_removal.id_low)
+    encoded[at + 1] := U32.to_f32 (instance_removal.id_high)
     at := self + 2
   for draw in draws:
     let extra = extra_of draw
+    let extra_count: U32 = extra.length
     for value in extra:
       encoded[at] := value
       at := self + 1
   for source_inset in collections.insets:
     let inset = project.inset context source_inset
+    let view_inset_draws_count: U32 = inset.draws.length
     for source_inset_draw in inset.draws:
       let inset_draw = project.inset_draw context source_inset_draw
-      for index in 0 .. min inset_draw.extra.length protocol.max_draw_extra:
+      let view_inset_draw_extra_count: U32 = inset_draw.extra.length
+      for index in 0 .. min view_inset_draw_extra_count protocol.max_draw_extra:
         encoded[at + 0] := (inset_draw.extra.at index).x
         encoded[at + 1] := (inset_draw.extra.at index).y
         encoded[at + 2] := (inset_draw.extra.at index).z
@@ -1429,16 +884,196 @@ const encode_render_views = func packet -> collections -> project -> context -> 
         at := self + 4
   return ()
 
-// The lanes of the game's own sections, to follow encode_render's: none without
-// any, else the marker, their count, then each one's tag, length and values. A
-// game's generated pen/extensions.blot makes them from its declarations.
-const encode_extensions = func (extensions: Array types.Extension) => return do:
-  if extensions.is_empty:
-    return #[]
-  use lanes.require (extensions.length <= protocol.max_extensions)
-  let output: GrowArray F32 = #[protocol.extensions_marker, from extensions.length]
-  for extension in extensions:
-    output.push (from extension.tag)
-    output.push (from extension.values.length)
-    array.append_into output extension.values
-  return @storage.freeze output
+// Flat mesh draws (no parameters/extras) and sounds, into a caller-owned packet.
+type MeshDraw = { mesh: U32, material: U32, transform: types.Mat4 }
+const encode_mesh_frame = func (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: ResizeArray F32) => return do:
+  @storage.truncate encoded 0
+  for 0 .. (protocol.packet_header_floats + draws.length * 24 + sounds.length * 7):
+    @storage.push encoded 0.0
+  encoded[0] := protocol.packet_magic
+  encoded[1] := U32.to_f32 packet.schema
+  encoded[2] := 0.0
+  encoded[3] := U32.to_f32 draws.length
+  encoded[4] := 0.0
+  encoded[5] := 0.0
+  encoded[6] := 0.0
+  encoded[7] := U32.to_f32 sounds.length
+  encoded[8] := 0.0
+  encoded[9] := 0.0
+  encoded[10] := 0.0
+  encoded[11] := 0.0
+  encoded[12] := lanes.bit packet.save_requested
+  encoded[13] := lanes.bit packet.load_requested
+  encoded[14] := lanes.bit packet.scene_save_requested
+  encoded[15] := lanes.bit packet.scene_load_requested
+  encoded[16] := lanes.bit packet.checkpoint_requested
+  encoded[17] := lanes.bit packet.undo_requested
+  encoded[18] := lanes.bit packet.redo_requested
+  encoded[19] := lanes.bit packet.exit_requested
+  let $types.Mat4 { x: view_x, y: view_y, z: view_z, w: view_w } = packet.view
+  encoded[20] := view_x.x
+  encoded[21] := view_x.y
+  encoded[22] := view_x.z
+  encoded[23] := view_x.w
+  encoded[24] := view_y.x
+  encoded[25] := view_y.y
+  encoded[26] := view_y.z
+  encoded[27] := view_y.w
+  encoded[28] := view_z.x
+  encoded[29] := view_z.y
+  encoded[30] := view_z.z
+  encoded[31] := view_z.w
+  encoded[32] := view_w.x
+  encoded[33] := view_w.y
+  encoded[34] := view_w.z
+  encoded[35] := view_w.w
+  let $types.Mat4 { x: projection_x, y: projection_y, z: projection_z, w: projection_w } = packet.projection
+  encoded[36] := projection_x.x
+  encoded[37] := projection_x.y
+  encoded[38] := projection_x.z
+  encoded[39] := projection_x.w
+  encoded[40] := projection_y.x
+  encoded[41] := projection_y.y
+  encoded[42] := projection_y.z
+  encoded[43] := projection_y.w
+  encoded[44] := projection_z.x
+  encoded[45] := projection_z.y
+  encoded[46] := projection_z.z
+  encoded[47] := projection_z.w
+  encoded[48] := projection_w.x
+  encoded[49] := projection_w.y
+  encoded[50] := projection_w.z
+  encoded[51] := projection_w.w
+  encoded[52] := packet.clear.r
+  encoded[53] := packet.clear.g
+  encoded[54] := packet.clear.b
+  encoded[55] := packet.clear.a
+  encoded[56] := packet.ambient.x
+  encoded[57] := packet.ambient.y
+  encoded[58] := packet.ambient.z
+  encoded[59] := packet.light_direction.x
+  encoded[60] := packet.light_direction.y
+  encoded[61] := packet.light_direction.z
+  encoded[62] := packet.light_color.x
+  encoded[63] := packet.light_color.y
+  encoded[64] := packet.light_color.z
+  encoded[65] := packet.aberration.x
+  encoded[66] := packet.aberration.y
+  encoded[67] := U32.to_f32 (packet.quality.msaa)
+  encoded[68] := lanes.bit packet.quality.fxaa
+  encoded[69] := packet.quality.scale
+  encoded[70] := U32.to_f32 (packet.quality.filtering)
+  encoded[71] := lanes.bit packet.quality.occlusion
+  encoded[72] := lanes.bit packet.quality.sky
+  encoded[73] := lanes.bit packet.quality.effects
+  encoded[74] := packet.sky.zenith.x
+  encoded[75] := packet.sky.zenith.y
+  encoded[76] := packet.sky.zenith.z
+  encoded[77] := packet.sky.horizon.x
+  encoded[78] := packet.sky.horizon.y
+  encoded[79] := packet.sky.horizon.z
+  encoded[80] := packet.sky.ground.x
+  encoded[81] := packet.sky.ground.y
+  encoded[82] := packet.sky.ground.z
+  encoded[83] := packet.sky.sun.x
+  encoded[84] := packet.sky.sun.y
+  encoded[85] := packet.sky.sun.z
+  encoded[86] := packet.sky.night
+  encoded[87] := packet.fog.radius
+  encoded[88] := packet.fog.density
+  encoded[89] := packet.fog.height
+  let $types.Mat4 { x: shadow_view_x, y: shadow_view_y, z: shadow_view_z, w: shadow_view_w } = packet.shadow.view
+  encoded[90] := shadow_view_x.x
+  encoded[91] := shadow_view_x.y
+  encoded[92] := shadow_view_x.z
+  encoded[93] := shadow_view_x.w
+  encoded[94] := shadow_view_y.x
+  encoded[95] := shadow_view_y.y
+  encoded[96] := shadow_view_y.z
+  encoded[97] := shadow_view_y.w
+  encoded[98] := shadow_view_z.x
+  encoded[99] := shadow_view_z.y
+  encoded[100] := shadow_view_z.z
+  encoded[101] := shadow_view_z.w
+  encoded[102] := shadow_view_w.x
+  encoded[103] := shadow_view_w.y
+  encoded[104] := shadow_view_w.z
+  encoded[105] := shadow_view_w.w
+  let $types.Mat4 { x: shadow_projection_x, y: shadow_projection_y, z: shadow_projection_z, w: shadow_projection_w } = packet.shadow.projection
+  encoded[106] := shadow_projection_x.x
+  encoded[107] := shadow_projection_x.y
+  encoded[108] := shadow_projection_x.z
+  encoded[109] := shadow_projection_x.w
+  encoded[110] := shadow_projection_y.x
+  encoded[111] := shadow_projection_y.y
+  encoded[112] := shadow_projection_y.z
+  encoded[113] := shadow_projection_y.w
+  encoded[114] := shadow_projection_z.x
+  encoded[115] := shadow_projection_z.y
+  encoded[116] := shadow_projection_z.z
+  encoded[117] := shadow_projection_z.w
+  encoded[118] := shadow_projection_w.x
+  encoded[119] := shadow_projection_w.y
+  encoded[120] := shadow_projection_w.z
+  encoded[121] := shadow_projection_w.w
+  encoded[122] := packet.shadow.texel
+  encoded[123] := U32.to_f32 (packet.shadow.texels)
+  encoded[124] := packet.blur
+  encoded[125] := lanes.bit packet.quality.bloom
+  encoded[126] := packet.clouds.cover
+  encoded[127] := packet.clouds.drift.x
+  encoded[128] := packet.clouds.drift.z
+  encoded[129] := lanes.bit packet.hide_cursor
+  encoded[130] := 0.0
+  encoded[131] := 0.0
+  encoded[132] := 0.0
+  encoded[133] := 0.0
+  encoded[134] := 0.0
+  encoded[135] := 0.0
+  encoded[136] := 0.0
+  encoded[137] := 0.0
+  encoded[138] := 0.0
+  encoded[139] := 0.0
+  encoded[140] := lanes.bit packet.quality.taa
+  encoded[141] := 0.0
+  encoded[142] := 0.0
+  encoded[143] := 0.0
+  encoded[144] := lanes.bit packet.loading
+  encoded[145] := lanes.bit packet.show_captions
+  encoded[146] := lanes.bit packet.retained_enabled
+  encoded[147] := lanes.bit packet.retained_reset
+  encoded[148] := U32.to_f32 (packet.retained_after)
+  encoded[149] := 0.0
+  encoded[150] := 0.0
+  let at: U32 = protocol.packet_header_floats
+  for draw in draws:
+    encoded[at + 0] := U32.to_f32 (draw.mesh)
+    encoded[at + 1] := U32.to_f32 (draw.material)
+    let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = draw.transform
+    encoded[at + 2] := transform_x.x
+    encoded[at + 3] := transform_x.y
+    encoded[at + 4] := transform_x.z
+    encoded[at + 5] := transform_x.w
+    encoded[at + 6] := transform_y.x
+    encoded[at + 7] := transform_y.y
+    encoded[at + 8] := transform_y.z
+    encoded[at + 9] := transform_y.w
+    encoded[at + 10] := transform_z.x
+    encoded[at + 11] := transform_z.y
+    encoded[at + 12] := transform_z.z
+    encoded[at + 13] := transform_z.w
+    encoded[at + 14] := transform_w.x
+    encoded[at + 15] := transform_w.y
+    encoded[at + 16] := transform_w.z
+    encoded[at + 17] := transform_w.w
+    at := self + 24
+  for sound in sounds:
+    encoded[at + 0] := U32.to_f32 (sound.clip)
+    encoded[at + 1] := U32.to_f32 (sound.bus)
+    encoded[at + 2] := sound.gain
+    encoded[at + 3] := sound.pan
+    encoded[at + 4] := sound.pitch
+    encoded[at + 5] := sound.lowpass
+    encoded[at + 6] := sound.reverb
+    at := self + 7
+  return ()

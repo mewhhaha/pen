@@ -332,146 +332,199 @@ pub fn rust(model: &Model) -> Vec<String> {
     out
 }
 
-/// The Blot function reading a value of `field`'s kind back from the walk.
-fn blot_reader(model: &Model, field: &Value) -> String {
-    match kind(field) {
-        "f32" => "f32_from".to_owned(),
-        "count" | "reference" | "choice" | "present" | "schema" => "u32_from".to_owned(),
-        "flag" => "bool_from".to_owned(),
-        "vector" => format!("{}_from", snake(s(&field["type"]["name"]))),
-        "matrix" => "mat4_from".to_owned(),
-        "lanes" => "vec4_from".to_owned(),
-        "optional" => "maybe_vec4_from".to_owned(),
-        "tail" => "maybe_vec4s_from".to_owned(),
-        "children" => format!("{}_list_from", snake(s(&section_record(model, s(&field["section"]))["name"]))),
-        _ => unreachable!(),
+/// Copy a fixed-width canonical value into its schema-defined packet offset.
+fn stream_field(out: &mut Vec<String>, field: &Laid, indent: &str) {
+    let offset = field.offset;
+    match kind(&field.field) {
+        "optional" => {
+            let width = n(&field.field["count"]);
+            out.push(format!("{indent}let present = lanes.integer canonical[at] 1"));
+            out.push(format!("{indent}at := at + 1"));
+            out.push(format!("{indent}if present == 1:"));
+            out.push(format!("{indent}  destination[base + {offset}] := {width}.0"));
+            for index in 0..width {
+                out.push(format!("{indent}  destination[base + {}] := canonical[at + {index}]", offset + index + 1));
+            }
+            out.push(format!("{indent}  at := at + {width}"));
+        }
+        "tail" => {
+            let unit = n(&field.field["unit"]);
+            out.push(format!("{indent}let present = lanes.integer canonical[at] 1"));
+            out.push(format!("{indent}at := at + 1"));
+            out.push(format!("{indent}if present == 1:"));
+            out.push(format!("{indent}  let count = lanes.integer canonical[at] lanes.max_integer"));
+            out.push(format!("{indent}  lanes.require (count % {unit} == 0)"));
+            out.push(format!("{indent}  at := at + 1"));
+            out.push(format!("{indent}  destination[base + {offset}] := U32.to_f32 (count / {unit})"));
+            out.push(format!("{indent}  for index in 0 .. count:"));
+            out.push(format!("{indent}    @storage.push extras canonical[at + index]"));
+            out.push(format!("{indent}  at := at + count"));
+        }
+        "children" => {
+            // The schema currently has one child-record section, inset_draws.
+            let child = snake(&singular(s(&field.field["section"])));
+            out.push(format!("{indent}let count = lanes.integer canonical[at] lanes.max_integer"));
+            out.push(format!("{indent}at := at + 1"));
+            out.push(format!("{indent}destination[base + {offset}] := U32.to_f32 count"));
+            out.push(format!("{indent}for 0 .. count:"));
+            out.push(format!("{indent}  at := {child}_into canonical at children children extras"));
+        }
+        _ => {
+            for index in 0..field.lanes {
+                out.push(format!("{indent}destination[base + {}] := canonical[at + {index}]", offset + index));
+            }
+            out.push(format!("{indent}at := at + {}", field.lanes));
+        }
     }
 }
 
-/// A Blot value of `field`'s kind that is all zeros, for a group that is not
-/// there.
-fn blot_zero(field: &Value) -> String {
-    match kind(field) {
-        "f32" => "0.0".to_owned(),
-        "count" | "reference" | "choice" | "present" | "schema" => "0".to_owned(),
-        "flag" => "false".to_owned(),
-        "vector" => format!(
-            "$types.{} {{ {} }}",
-            s(&field["type"]["name"]),
-            array(&field["type"]["components"]).iter().map(|c| format!("{}: 0.0", s(c))).collect::<Vec<_>>().join(", ")
-        ),
-        "matrix" => "$types.Mat4 { x: types.zero4, y: types.zero4, z: types.zero4, w: types.zero4 }".to_owned(),
-        "lanes" => "types.zero4".to_owned(),
-        "optional" => "$Nothing".to_owned(),
-        _ => "#[]".to_owned(),
-    }
-}
-
-/// `let (name, name_end) = reader canonical at` for each value, reading on
-/// from `start`; returns the lines and where the last one ends.
-fn blot_reads(reads: &[(String, String)], start: &str, indent: &str) -> (Vec<String>, String) {
-    let mut lines = Vec::new();
-    let mut at = start.to_owned();
-    for (name, reader) in reads {
-        lines.push(format!("{indent}let ({name}, {name}_end) = {reader} canonical {at}"));
-        at = format!("{name}_end");
-    }
-    (lines, at)
-}
-
-/// `#types.Name { fields }`, in lines no longer than the others.
-fn blot_record(name: &str, fields: &[String], indent: &str, end: &str) -> Vec<String> {
-    let one = format!("{indent}return ($types.{name} {{ {} }}, {end})", fields.join(", "));
-    if one.len() <= 100 {
-        return vec![one];
-    }
-    let mut lines = vec![format!("{indent}let built = $types.{name} {{")];
-    lines.extend(chunk(fields, 96 - indent.len()).iter().map(|line| format!("{indent}  {line},")));
-    lines.push(format!("{indent}}}"));
-    lines.push(format!("{indent}return (built, {end})"));
-    lines
-}
-
-/// The readers of a record's values and of a list of them.
-fn blot_record_readers(model: &Model, record: &Value, fields: &[Laid]) -> Vec<String> {
-    let name = s(&record["name"]);
-    let reader = snake(name);
-    let mut reads: Vec<(String, String)> =
-        fields.iter().map(|laid| (laid.name.clone(), blot_reader(model, &laid.field))).collect();
-    let rest = &record["rest"];
-    if rest.is_object() {
-        let read = if kind(rest) == "repeat" {
-            format!("{}_list_from", snake(s(&rest["record"]["name"])))
-        } else {
-            "floats_from".to_owned()
-        };
-        reads.push((s(&rest["name"]).to_owned(), read));
-    }
+fn stream_record(entry: &Section) -> Vec<String> {
+    let name = singular(s(&entry.section["name"]));
+    let (fields, width) =
+        entry.fixed.as_ref().map_or((&entry.head, entry.head_lanes), |layout| (&layout.fields, layout.lanes));
     let mut out = vec![
         String::new(),
-        format!("const {reader}_from = func (canonical: Array F32) => return func (at: U32) => return do:"),
+        format!(
+            "const {name}_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:"
+        ),
+        "  let at = start".to_owned(),
+        "  let base = destination.length".to_owned(),
+        format!("  for 0 .. {width}:"),
+        "    @storage.push destination 0.0".to_owned(),
     ];
-    let (lines, end) = blot_reads(&reads, "at", "  ");
-    out.extend(lines);
-    let names: Vec<String> = reads.iter().map(|(name, _)| name.clone()).collect();
-    out.extend(blot_record(name, &names, "  ", &end));
-    out.extend([
-        String::new(),
-        format!("const {reader}_list_from = func (canonical: Array F32) => return func (at: U32) => return do:"),
-        "  let count = lanes.integer canonical[at] lanes.max_integer".to_owned(),
-        "  let items = #[]".to_owned(),
-        "  let next = at + 1".to_owned(),
-        "  for 0 .. count:".to_owned(),
-        format!("    let (item, item_end) = {reader}_from canonical next"),
-        "    items := array.push item self".to_owned(),
-        "    next := item_end".to_owned(),
-        "  return (items, next)".to_owned(),
-    ]);
+    for field in fields {
+        stream_field(&mut out, field, "  ");
+    }
+    if kind(&entry.section) == "variable" {
+        out.push("  let count = lanes.integer canonical[at] lanes.max_integer".to_owned());
+        out.push("  at := at + 1".to_owned());
+        if entry.item.is_some() {
+            out.push(format!("  destination[base + {}] := U32.to_f32 count", width - 1));
+        }
+        out.push("  for 0 .. count:".to_owned());
+        if let Some(layout) = &entry.item {
+            out.push("    let base = destination.length".to_owned());
+            out.push(format!("    for 0 .. {}:", layout.lanes));
+            out.push("      @storage.push destination 0.0".to_owned());
+            for field in &layout.fields {
+                stream_field(&mut out, field, "    ");
+            }
+        } else {
+            out.push("    @storage.push destination canonical[at]".to_owned());
+            out.push("    at := at + 1".to_owned());
+        }
+    }
+    out.push("  return at".to_owned());
     out
 }
 
-const BLOT_READERS: &str = r#"// Each reader takes the walk and where a value starts in it, and returns the
-// value and where the next one starts. Counts and flags must be whole.
-const f32_from = func (canonical: Array F32) => return func (at: U32) => return (canonical[at], at + 1)
+fn stream_header(out: &mut Vec<String>, field: &Laid, indent: &str) {
+    for index in 0..field.lanes {
+        let value = if kind(&field.field) == "present" {
+            // Canonical optional groups use a separate presence flag and zero-based reference.
+            "canonical[at] + 1.0".to_owned()
+        } else {
+            format!("canonical[at + {index}]")
+        };
+        out.push(format!("{indent}output[{}] := {value}", field.offset + index));
+    }
+    out.push(format!("{indent}at := at + {}", field.lanes));
+}
 
-const u32_from = func (canonical: Array F32) => return func (at: U32) => return (lanes.integer canonical[at] lanes.max_integer, at + 1)
-
-const bool_from = func (canonical: Array F32) => return func (at: U32) => return (lanes.integer canonical[at] 1 == 1, at + 1)
-
-const vec4_at = func (canonical: Array F32) => return func (at: U32) => return
-  $types.Vec4 { x: canonical[at], y: canonical[at + 1], z: canonical[at + 2], w: canonical[at + 3] }
-
-const vec4_from = func (canonical: Array F32) => return func (at: U32) => return (vec4_at canonical at, at + 4)
-
-// A matrix's columns, x first.
-const mat4_from = func (canonical: Array F32) => return func (at: U32) => return do:
-  let x = vec4_at canonical at
-  let y = vec4_at canonical (at + 4)
-  let z = vec4_at canonical (at + 8)
-  let w = vec4_at canonical (at + 12)
-  return ($types.Mat4 { x, y, z, w }, at + 16)
-
-const maybe_vec4_from = func (canonical: Array F32) => return func (at: U32) => return do:
-  if lanes.integer canonical[at] 1 == 1:
-    return ($Some (vec4_at canonical (at + 1)), at + 5)
-  return ($Nothing, at + 1)
-
-const floats_from = func (canonical: Array F32) => return func (at: U32) => return do:
-  let count = lanes.integer canonical[at] lanes.max_integer
-  return (array.slice (at + 1) count canonical, at + 1 + count)
-
-const maybe_floats_from = func (canonical: Array F32) => return func (at: U32) => return do:
-  if lanes.integer canonical[at] 1 == 1:
-    return floats_from canonical (at + 1)
-  return (#[], at + 1)
-
-// A tail: 0, or 1, its lanes' count and its lanes, four to a Vec4.
-const maybe_vec4s_from = func (canonical: Array F32) => return func (at: U32) => return do:
-  if lanes.integer canonical[at] 1 == 1:
-    let count = lanes.integer canonical[at + 1] lanes.max_integer
-    use lanes.require (count % 4 == 0)
-    return (array.generate (count / 4) (func index => return vec4_at canonical (at + 2 + index * 4)), at + 2 + count)
-  return (#[], at + 1)"#;
+/// Decode a canonical walk into flat packet lanes. Deferred child records and
+/// tail lanes have separate owners so no nested owner/borrow escapes a reader.
+fn render_stream(model: &Model) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in &model.sections {
+        if matches!(kind(&entry.section), "records" | "variable") {
+            out.extend(stream_record(entry));
+        }
+    }
+    out.extend([String::new(),
+        "// Canonical render values streamed into named packet, inset-draw and extra pools.".to_owned(),
+        "const render_packet_from_canonical = func (canonical: Array F32) -> (output: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32) => return do:".to_owned(),
+        "  lanes.finite canonical".to_owned(),
+        "  @storage.truncate output 0".to_owned(),
+        "  @storage.truncate children 0".to_owned(),
+        "  @storage.truncate extras 0".to_owned(),
+        "  for 0 .. protocol.packet_header_floats:".to_owned(),
+        "    @storage.push output 0.0".to_owned(),
+        "  output[0] := protocol.packet_magic".to_owned(),
+        "  let at: U32 = 0".to_owned()]);
+    for member in members(model) {
+        match member {
+            Member::Lane(field) => stream_header(&mut out, field, "  "),
+            Member::Group(group) => {
+                let fields = group_lanes(model, group);
+                let indent = if presence(&fields).is_some() {
+                    out.push("  let present = lanes.integer canonical[at] 1".to_owned());
+                    out.push("  at := at + 1".to_owned());
+                    out.push("  if present == 1:".to_owned());
+                    "    "
+                } else {
+                    "  "
+                };
+                for field in fields {
+                    stream_header(&mut out, field, indent);
+                }
+            }
+            Member::Section(_) => {}
+        }
+    }
+    for entry in &model.sections {
+        let name = s(&entry.section["name"]);
+        out.push(format!("  let {name}_start: U32 = output.length"));
+        match kind(&entry.section) {
+            "trailing" => {
+                out.push("  for value in extras:".to_owned());
+                out.push("    @storage.push output value".to_owned());
+            }
+            _ if entry.owner.is_some() => {
+                let width = entry.fixed.as_ref().unwrap().lanes;
+                out.push(format!("  let {name}_count: U32 = children.length / {width}"));
+                out.push("  for value in children:".to_owned());
+                out.push("    @storage.push output value".to_owned());
+            }
+            "lanes" => {
+                out.push(format!("  let {name}_count: U32 = 0"));
+                let indent = if entry.section["nullable"] == true {
+                    out.push("  let present = lanes.integer canonical[at] 1".to_owned());
+                    out.push("  at := at + 1".to_owned());
+                    out.push("  if present == 1:".to_owned());
+                    "    "
+                } else {
+                    "  "
+                };
+                out.push(format!("{indent}{name}_count := lanes.integer canonical[at] lanes.max_integer"));
+                out.push(format!("{indent}at := at + 1"));
+                out.push(format!("{indent}for index in 0 .. {name}_count:"));
+                out.push(format!("{indent}  @storage.push output canonical[at + index]"));
+                out.push(format!("{indent}at := at + {name}_count"));
+            }
+            _ => {
+                out.push(format!("  let {name}_count = lanes.integer canonical[at] lanes.max_integer"));
+                out.push("  at := at + 1".to_owned());
+                out.push(format!("  for 0 .. {name}_count:"));
+                let record = singular(name);
+                out.push(format!("    at := {record}_into canonical at output children extras"));
+            }
+        }
+        for header in &model.header {
+            let field = &header.laid;
+            if kind(&field.field) == "size" && s(&field.field["section"]) == name {
+                let count = if field.field["of"] == "count" {
+                    format!("{name}_count")
+                } else {
+                    format!("(output.length - {name}_start)")
+                };
+                out.push(format!("  output[{}] := U32.to_f32 {count}", field.offset));
+            }
+        }
+    }
+    out.push("  lanes.require (at == canonical.length)".to_owned());
+    out.push("  return ()".to_owned());
+    out
+}
 
 /// The game's `pen/protocol_canonical.blot`: the input walk, and the render
 /// walk read back into the record the game encodes.
@@ -484,7 +537,6 @@ pub fn blot(model: &Model, top: &[String]) -> String {
         "import * as array from \"std/array\"".to_owned(),
         "import * as lanes from \"./lanes\"".to_owned(),
         "import * as protocol from \"./protocol\"".to_owned(),
-        "import * as types from \"./types\"".to_owned(),
         String::new(),
     ]);
     out.extend(comment(Some("An event's walk: its tag, then its fields in the schema's order.")));
@@ -518,130 +570,7 @@ pub fn blot(model: &Model, top: &[String]) -> String {
             .map(str::to_owned),
     );
     out.push(String::new());
-    out.extend(BLOT_READERS.lines().map(str::to_owned));
-    for vector in array(&model.protocol["vectors"]) {
-        let components: Vec<_> = array(&vector["components"])
-            .iter()
-            .enumerate()
-            .map(|(offset, component)| match offset {
-                0 => format!("{}: canonical[at]", s(component)),
-                _ => format!("{}: canonical[at + {offset}]", s(component)),
-            })
-            .collect();
-        out.push(String::new());
-        out.push(format!(
-            "const {}_from = func (canonical: Array F32) => return func (at: U32) => return",
-            snake(s(&vector["name"]))
-        ));
-        out.push(format!(
-            "  ($types.{} {{ {} }}, at + {})",
-            s(&vector["name"]),
-            components.join(", "),
-            components.len()
-        ));
-    }
-    // Records, each after those it holds.
-    let mut records: Vec<(&Value, Vec<Laid>)> = Vec::new();
-    for entry in &model.sections {
-        for layout in entry.fixed.iter().chain(entry.item.iter()) {
-            records.push((&layout.record, layout.fields.clone()));
-        }
-        if kind(&entry.section) == "variable" {
-            records.push((&entry.section["record"], entry.head.clone()));
-        }
-    }
-    let mut emitted = HashSet::new();
-    fn emit<'a>(
-        model: &'a Model,
-        records: &[(&'a Value, Vec<Laid>)],
-        index: usize,
-        emitted: &mut HashSet<&'a str>,
-        out: &mut Vec<String>,
-    ) {
-        let (record, fields) = &records[index];
-        if !emitted.insert(s(&record["name"])) {
-            return;
-        }
-        let mut held: Vec<&str> = fields
-            .iter()
-            .filter(|laid| kind(&laid.field) == "children")
-            .map(|laid| s(&section_record(model, s(&laid.field["section"]))["name"]))
-            .collect();
-        if record["rest"]["kind"] == "repeat" {
-            held.push(s(&record["rest"]["record"]["name"]));
-        }
-        for name in held {
-            if let Some(child) = records.iter().position(|(other, _)| s(&other["name"]) == name) {
-                emit(model, records, child, emitted, out);
-            }
-        }
-        out.extend(blot_record_readers(model, record, fields));
-    }
-    for index in 0..records.len() {
-        emit(model, &records, index, &mut emitted, &mut out);
-    }
-    // Groups.
-    for group in object(&model.protocol["render"]["groups"]).keys() {
-        let lanes = group_lanes(model, group);
-        let ty = s(&model.protocol["render"]["groups"][group]["type"]);
-        let reads: Vec<(String, String)> =
-            lanes.iter().map(|laid| (laid.name.clone(), blot_reader(model, &laid.field))).collect();
-        out.push(String::new());
-        out.push(format!(
-            "const {}_from = func (canonical: Array F32) => return func (at: U32) => return do:",
-            snake(ty)
-        ));
-        let Some(present) = presence(&lanes) else {
-            let (lines, end) = blot_reads(&reads, "at", "  ");
-            out.extend(lines);
-            let names: Vec<String> = reads.iter().map(|(name, _)| name.clone()).collect();
-            out.extend(blot_record(ty, &names, "  ", &end));
-            continue;
-        };
-        // 0 when the group is not there, else 1 and its values; its presence lane
-        // holds the index plus one, 0 meaning none.
-        out.push("  if lanes.integer canonical[at] 1 == 1:".to_owned());
-        let (lines, end) = blot_reads(&reads, "(at + 1)", "    ");
-        out.extend(lines);
-        let mut names: Vec<String> = reads.iter().map(|(name, _)| name.clone()).collect();
-        names[present] = format!("{}: {} + 1", names[present], names[present]);
-        out.extend(blot_record(ty, &names, "    ", &end));
-        let zeros: Vec<String> =
-            lanes.iter().map(|laid| format!("{}: {}", laid.name, blot_zero(&laid.field))).collect();
-        out.extend(blot_record(ty, &zeros, "  ", "at + 1"));
-    }
-    // The frame.
-    let mut reads = Vec::new();
-    for member in members(model) {
-        match member {
-            Member::Lane(laid) => reads.push((laid.name.clone(), blot_reader(model, &laid.field))),
-            Member::Group(group) => {
-                let ty = s(&model.protocol["render"]["groups"][group]["type"]);
-                reads.push((group.to_owned(), format!("{}_from", snake(ty))));
-            }
-            Member::Section(entry) => {
-                let section = &entry.section;
-                let reader = match kind(section) {
-                    "lanes" if section["nullable"] == true => "maybe_floats_from".to_owned(),
-                    "lanes" => "floats_from".to_owned(),
-                    _ => format!("{}_list_from", snake(s(&section["record"]["name"]))),
-                };
-                reads.push((s(&section["name"]).to_owned(), reader));
-            }
-        }
-    }
-    out.push(String::new());
-    out.extend(comment(Some(
-        "The record the game encodes, from the render walk pen-protocol's canonical_render makes of a frame, its schema and its state. Anything else traps.",
-    )));
-    out.push("const render_from_canonical = func (canonical: Array F32) => return do:".to_owned());
-    let (lines, end) = blot_reads(&reads, "0", "  ");
-    out.extend(lines);
-    out.push(format!("  use lanes.require ({end} == canonical.length)"));
-    out.push("  return $types.RenderFrame {".to_owned());
-    let names: Vec<String> = reads.iter().map(|(name, _)| name.clone()).collect();
-    out.extend(chunk(&names, 76).iter().map(|line| format!("    {line},")));
-    out.push("  }".to_owned());
+    out.extend(render_stream(model));
     out.push(String::new());
     out.join("\n")
 }

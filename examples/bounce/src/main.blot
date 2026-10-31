@@ -1,6 +1,4 @@
-// pen runs `main`, giving it the host; pen/extensions' `run` serves the game
-// with its own events and sections (pen.json's `protocol`) beside pen's.
-import * as extensions from "pen/extensions"
-import { game } from "./game"
+// Each invocation owns its state and packet pools until the host stops it.
+import { run } from "./game"
 
-entry const main = func host => return extensions.run game host
+entry const main = func host => return run host

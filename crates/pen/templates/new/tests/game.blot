@@ -5,18 +5,20 @@ import * as check from "pen/check"
 import * as protocol from "pen/protocol"
 import { game } from "./game"
 
+const empty_state: Array F32 = #[]
+
 // Half a second of a 640 x 480 frame, with `events`.
 const input = func (events: Array protocol.Event) => return
-  $protocol.Input { elapsed: 0.5, width: 640.0, height: 480.0, events, state: #[] }
+  $protocol.Input { elapsed: 0.5, width: 640.0, height: 480.0, events: &events[0..events.length], state: &empty_state[0..0] }
 
 entry const test_the_cube_turns_at_its_speed = func () => return do:
-  let (world, _) = game.step (game.create ()) (input #[])
+  let world = game.step (game.create ()) (input #[])
   return check.report #[check.near 0.0001 #[0.5, 1.0] #[world.angle, world.speed]]
 
 entry const test_the_right_arrow_turns_it_faster = func () => return do:
-  let (world, _) = game.step (game.create ()) (input #[$protocol.KeyDown protocol.key_arrow_right])
+  let world = game.step (game.create ()) (input #[$protocol.KeyDown protocol.key_arrow_right])
   return check.report #[check.near 0.0001 #[0.75, 1.5] #[world.angle, world.speed]]
 
 entry const test_a_saved_world_comes_back = func () => return do:
-  let (world, _) = game.step (game.create ()) (input #[$protocol.KeyDown protocol.key_arrow_left])
+  let world = game.step (game.create ()) (input #[$protocol.KeyDown protocol.key_arrow_left])
   return check.report #[check.equal (game.save world) (game.save (game.restore (game.save world)))]

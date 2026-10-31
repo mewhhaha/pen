@@ -1115,12 +1115,12 @@ type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: &[E
 
 // An event's lanes from `start`: its tag, then code, x, y, delta. The code lane
 // holds a whole number; lanes an event does not use are zero.
-const decode_event = func (values: Array F32) => return func (start: U32) => return do:
-  let tag = lanes.integer values[start] 28
-  let code = lanes.integer values[start + 1] lanes.max_integer
-  let x = values[start + 2]
-  let y = values[start + 3]
-  let delta = values[start + 4]
+const decode_event = func values => return func (start: U32) => return do:
+  let tag = lanes.integer (values.at (start)) 28
+  let code = lanes.integer (values.at (start + 1)) lanes.max_integer
+  let x = (values.at (start + 2))
+  let y = (values.at (start + 3))
+  let delta = (values.at (start + 4))
   return case tag of
     1 => do:
       use lanes.require (x == 0.0)
@@ -1248,24 +1248,24 @@ const decode_event = func (values: Array F32) => return func (start: U32) => ret
 // The input packet: the seconds since the last frame, the viewport's width and
 // height, the event and state counts, the events and the state. Anything else
 // traps.
-const decode_input_into = func (values: Array F32) -> (events: ResizeArray Event) => return do:
+const decode_input_into = func values -> (events: ResizeArray Event) => return do:
   use lanes.require (values.length >= frame_header_floats)
   use lanes.finite values
-  let elapsed = values[0]
+  let elapsed = (values.at (0))
   use lanes.require (elapsed >= 0.0)
-  let width = values[1]
-  let height = values[2]
+  let width = (values.at (1))
+  let height = (values.at (2))
   use lanes.require (width > 0.0)
   use lanes.require (height > 0.0)
-  let event_count = lanes.integer values[3] max_events
-  let state_count = lanes.integer values[4] max_state_floats
+  let event_count = lanes.integer (values.at (3)) max_events
+  let state_count = lanes.integer (values.at (4)) max_state_floats
   let state_start = frame_header_floats + event_count * event_floats
   use lanes.require (values.length == state_start + state_count)
   @storage.truncate events 0
   for index in 0 .. event_count:
     @storage.push events (decode_event values (frame_header_floats + index * event_floats))
   return $Input {
-    state: &values[state_start..state_start + state_count],
+    state: values.view state_start (state_start + state_count),
     elapsed, width, height,
     events: &events[0..events.length],
   }

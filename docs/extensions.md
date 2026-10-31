@@ -61,24 +61,28 @@ With declarations, `pen codegen` writes `pen/extensions.blot` (and removes it
 once there are none):
 
 - `Event`, pen's events (`#Pen protocol.Event`) and the game's (`#Kick { x,
-  z }`), and `Input`, whose events are those; `decode_input` reads it.
+  z }`), and `Input`, whose events are borrowed views; `decode_input_into` fills a
+  caller-owned `ResizeArray Event` and returns that borrowed input.
 - For each section, its record type (`Score`), its tag (`score_tag`) and
-  `encode_score`, which makes a list of records the `types.Extension` the
-  frame carries.
-- `run`, which serves the game as `pen/program`'s does, with the game's
-  `step` returning a third thing: the frame's sections.
+  `append_score`, which appends its tag, payload length and record lanes to
+  a caller-owned `ResizeArray F32` extension packet.
+The game supplies its own named-owner adapter to `pen/program.run`. During a
+frame it decodes the borrowed request, updates its world pool, fills draw/sound
+pools and writes the render packet before appending extension framing and lanes.
+`examples/bounce/src/game.blot` is a complete implementation. It computes a Score
+section directly as flat numeric lanes:
 
 ```blot
-import * as extensions from "pen/extensions"
-
-entry const main = func host => return extensions.run game host
-
-const step = func (world: World) => return func (input: extensions.Input) => return do:
-  let taken = array.fold_left take world input.events
-  ...
-  let score = extensions.encode_score #[$extensions.Score { bounces: next.bounces, speed }]
-  break (next, view next hit input, #[score])
+const score = func (world: World) => return do:
+  let packet: ResizeArray F32 = #[protocol.extensions_marker, 1.0]
+  extensions.append_score #[$extensions.Score {
+    bounces: world.bounces, speed: F32.sqrt (world.vx * world.vx + world.vz * world.vz),
+  }] packet
+  return @storage.freeze packet
 ```
+
+The marker, section count, tag and lane count precede the two Score values.
+Append this to the render response while the packet's named owner is alive.
 
 ## In pen's tools
 

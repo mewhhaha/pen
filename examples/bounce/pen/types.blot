@@ -33,7 +33,7 @@ type Draw is data = $Draw {
   material: U32,
   transform: Mat4,
   parameters: Maybe Vec4,
-  extra: Array Vec4,
+  extra: &[Vec4],
 }
 
 type SolidFace is data = $SolidFace {
@@ -82,7 +82,7 @@ type Inset is data = $Inset {
   ambient: Vector,
   light_direction: Vector,
   light_color: Vector,
-  draws: Array Draw,
+  draws: &[Draw],
   pixel_size: F32,
   after_sprites: U32,
 }
@@ -180,7 +180,7 @@ type InstanceRemoval is data = $InstanceRemoval {
 }
 
 type Solid is data = $Solid {
-  faces: Array SolidFace,
+  faces: &[SolidFace],
 }
 
 type FieldPatch is data = $FieldPatch {
@@ -191,7 +191,7 @@ type FieldPatch is data = $FieldPatch {
   z: U32,
   columns: U32,
   rows: U32,
-  values: Array F32,
+  values: &[F32],
 }
 
 type UiNode is data = $UiNode {
@@ -219,7 +219,7 @@ type UiNode is data = $UiNode {
   text_length: U32,
   name_length: U32,
   description_length: U32,
-  text: Array F32,
+  text: &[F32],
 }
 
 type ServiceRequest is data = $ServiceRequest {
@@ -231,7 +231,7 @@ type ServiceRequest is data = $ServiceRequest {
   c: F32,
   d: F32,
   value_count: U32,
-  values: Array F32,
+  values: &[F32],
 }
 
 type Quality is data = $Quality {
@@ -272,7 +272,7 @@ type Clouds is data = $Clouds {
   drift: Drift,
 }
 
-type RenderFrame is data = $RenderFrame {
+type RenderHeader = {
   schema: U32,
   save_requested: Bool,
   load_requested: Bool,
@@ -301,29 +301,4 @@ type RenderFrame is data = $RenderFrame {
   retained_enabled: Bool,
   retained_reset: Bool,
   retained_after: U32,
-  state: Array F32,
-  draws: Array Draw,
-  solids: Array Solid,
-  decals: Array Decal,
-  sounds: Array Sound,
-  sprites: Array Sprite,
-  insets: Array Inset,
-  preferences: Array F32,
-  fields: Array FieldPatch,
-  ui: Array UiNode,
-  services: Array ServiceRequest,
-  buses: Array Bus,
-  voices: Array Voice,
-  poses: Array Pose,
-  emitters: Array Emitter,
-  lights: Array Light,
-  listener: Array Listener,
-  panners: Array Panner,
-  instances: Array Instance,
-  instance_removals: Array InstanceRemoval,
 }
-
-// One of the game's own sections (its pen.json `protocol`): its tag and lanes.
-// They travel after the render packet, which RenderFrame leaves them out of:
-// protocol_render's encode_extensions lays them out.
-type Extension is data = $Extension { tag: U32, values: Array F32 }

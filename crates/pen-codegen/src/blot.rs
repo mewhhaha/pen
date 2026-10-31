@@ -217,16 +217,16 @@ fn input(model: &Model) -> Vec<String> {
         String::new(),
     ]);
     out.extend(comment(Some(&format!("An event's lanes from `start`: its tag, then {}. The {} lane holds a whole number; lanes an event does not use are zero.", input_lanes.iter().map(s).collect::<Vec<_>>().join(", "), s(&input_lanes[0])))));
-    out.push("const decode_event = func (values: Array F32) => return func (start: U32) => return do:".to_owned());
+    out.push("const decode_event = func values => return func (start: U32) => return do:".to_owned());
     out.push(format!(
-        "  let tag = lanes.integer values[start] {}",
+        "  let tag = lanes.integer (values.at (start)) {}",
         model.core_events().iter().map(|event| n(&event["tag"])).max().unwrap_or(0)
     ));
     for (index, lane) in input_lanes.iter().enumerate() {
         if index == 0 {
-            out.push(format!("  let {} = lanes.integer values[start + 1] lanes.max_integer", s(lane)));
+            out.push(format!("  let {} = lanes.integer (values.at (start + 1)) lanes.max_integer", s(lane)));
         } else {
-            out.push(format!("  let {} = values[start + {}]", s(lane), index + 1));
+            out.push(format!("  let {} = (values.at (start + {}))", s(lane), index + 1));
         }
     }
     out.push("  return case tag of".to_owned());
@@ -275,17 +275,19 @@ fn input(model: &Model) -> Vec<String> {
     out.push(format!("    _ => @panic {}", quote(&input["messages"]["tag"])));
     out.push(String::new());
     out.extend(comment(Some("The input packet: the seconds since the last frame, the viewport's width and height, the event and state counts, the events and the state. Anything else traps.")));
-    out.extend("const decode_input_into = func (values: Array F32) -> (events: ResizeArray Event) => return do:\n  use lanes.require (values.length >= frame_header_floats)\n  use lanes.finite values\n  let elapsed = values[0]\n  use lanes.require (elapsed >= 0.0)\n  let width = values[1]\n  let height = values[2]\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)".lines().map(str::to_owned));
-    out.push(format!("  let event_count = lanes.integer values[3] {}", s(&input["maxEvents"]["limit"]).to_lowercase()));
+    out.extend("const decode_input_into = func values -> (events: ResizeArray Event) => return do:\n  use lanes.require (values.length >= frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)".lines().map(str::to_owned));
     out.push(format!(
-        "  let state_count = lanes.integer values[4] {}",
+        "  let event_count = lanes.integer (values.at (3)) {}",
+        s(&input["maxEvents"]["limit"]).to_lowercase()
+    ));
+    out.push(format!(
+        "  let state_count = lanes.integer (values.at (4)) {}",
         s(&model.protocol["state"]["max"]["limit"]).to_lowercase()
     ));
-    out.extend("  let state_start = frame_header_floats + event_count * event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (frame_header_floats + index * event_floats))\n  return $Input {\n    state: &values[state_start..state_start + state_count],\n    elapsed, width, height,\n    events: &events[0..events.length],\n  }".lines().map(str::to_owned));
+    out.extend("  let state_start = frame_header_floats + event_count * event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (frame_header_floats + index * event_floats))\n  return $Input {\n    state: values.view state_start (state_start + state_count),\n    elapsed, width, height,\n    events: &events[0..events.length],\n  }".lines().map(str::to_owned));
     out
 }
-// Emit writes in the frame function itself: passing its mutable output to a
-// per-record helper would introduce aliases and defeat unique-array reuse.
+// Emit schema offsets directly into the named packet destination.
 fn direct_fields(out: &mut Vec<String>, fields: &[Laid], variable: &str, indent: &str) {
     for field in fields {
         let (locals, values) = encode(&field.field, &field_path(variable, field), &field.name);
@@ -315,21 +317,8 @@ fn direct_records(out: &mut Vec<String>, entry: &Section, body: impl Fn(&mut Vec
     }
 }
 
-fn render_direct(model: &Model) -> Vec<String> {
-    let mut out = vec![String::new(),
-        "// Count first, then write every lane into one uniquely owned buffer.".to_owned(),
-        "const draw_metadata = func (draw: types.Draw) => return (draw.mesh, draw.material)".to_owned(),
-        "const draw_transform = func (draw: types.Draw) => return do:".to_owned(),
-        "  let $types.Mat4 { x, y, z, w } = draw.transform".to_owned(),
-        "  return (x.x, x.y, x.z, x.w, y.x, y.y, y.z, y.w, z.x, z.y, z.z, z.w, w.x, w.y, w.z, w.w)".to_owned(),
-        "const draw_parameters = func (draw: types.Draw) => return case draw.parameters of".to_owned(),
-        "  $Some p => (4.0, p.x, p.y, p.z, p.w)".to_owned(),
-        "  $Nothing => (0.0, 0.0, 0.0, 0.0, 0.0)".to_owned(),
-        "const encode_render = func (packet: types.RenderFrame) => return".to_owned(),
-        "  encode_render_draws packet packet.draws draw_metadata draw_transform draw_parameters encode_draw_extra".to_owned(),
-        String::new(),
-        "// Adapters supply scalar projections without constructing nominal wire copies.".to_owned(),
-        "const encode_render_draws = func (packet: types.RenderFrame) => return func (draws: Array d) => return func (metadata_of: d -> (U32, U32)) => return func (matrix_of: d -> (F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32)) => return func (parameters_of: d -> (F32, F32, F32, F32, F32)) => return func (extra_of: d -> Array F32) => return do:".to_owned()];
+fn render_layout(model: &Model) -> Vec<String> {
+    let mut out = Vec::new();
     let mut counts = HashMap::new();
     let mut lengths = HashMap::new();
     let mut sizes = vec!["protocol.packet_header_floats".to_owned()];
@@ -506,10 +495,10 @@ fn render_direct(model: &Model) -> Vec<String> {
 
 // Derive the flat view encoder from the same layout walk as the nominal API.
 // Only the source projection and destination ownership differ; offsets, group
-// order, counts and tail framing stay defined by render_direct/model.
+// order, counts and tail framing stay defined by render_layout/model.
 fn render_views(model: &Model) -> Vec<String> {
-    let direct = render_direct(model);
-    let body = direct.iter().position(|line| line.starts_with("const encode_render_draws =")).unwrap() + 1;
+    let direct = render_layout(model);
+    let body = 0;
     let mut out = vec![String::new(),
         "// Borrowed source groups, known scalar projections, caller-owned output.".to_owned(),
         "const encode_render_views = func (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: ResizeArray F32) => return do:".to_owned(),
@@ -624,6 +613,53 @@ fn render_views(model: &Model) -> Vec<String> {
         }
         out.push(line);
     }
+    out
+}
+
+// Small games keep flat mesh and sound pools without owning nested wire records.
+// This encoder shares the schema's header and record layouts with the full view path.
+fn render_meshes(model: &Model) -> Vec<String> {
+    let draws = model.section("draws").fixed.as_ref().unwrap();
+    let sounds = model.section("sounds").fixed.as_ref().unwrap();
+    let mut out = vec![String::new(),
+        "// Flat mesh draws (no parameters/extras) and sounds, into a caller-owned packet.".to_owned(),
+        "type MeshDraw = { mesh: U32, material: U32, transform: types.Mat4 }".to_owned(),
+        "const encode_mesh_frame = func (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: ResizeArray F32) => return do:".to_owned(),
+        "  @storage.truncate encoded 0".to_owned(),
+        format!("  for 0 .. (protocol.packet_header_floats + draws.length * {} + sounds.length * {}):", draws.lanes, sounds.lanes),
+        "    @storage.push encoded 0.0".to_owned()];
+    for entry in &model.header {
+        let field = &entry.laid;
+        let values = match kind(&field.field) {
+            "magic" => vec!["protocol.packet_magic".to_owned()],
+            "schema" => vec!["U32.to_f32 packet.schema".to_owned()],
+            "size" => vec![match (s(&field.field["section"]), s(&field.field["of"])) {
+                ("draws", "count") => "U32.to_f32 draws.length".to_owned(),
+                ("sounds", "count") => "U32.to_f32 sounds.length".to_owned(),
+                _ => "0.0".to_owned(),
+            }],
+            _ => {
+                let prefix = entry.group.as_ref().map_or(String::new(), |group| format!("{group}."));
+                let (locals, values) =
+                    encode(&field.field, &format!("packet.{prefix}{}", field.name), &entry.key.replace('.', "_"));
+                out.extend(locals.iter().map(|line| format!("  {line}")));
+                values
+            }
+        };
+        for (index, value) in values.iter().enumerate() {
+            out.push(format!("  encoded[{}] := {value}", field.offset + index));
+        }
+    }
+    out.push("  let at: U32 = protocol.packet_header_floats".to_owned());
+    out.push("  for draw in draws:".to_owned());
+    let mesh_fields: Vec<_> =
+        draws.fields.iter().filter(|field| !matches!(kind(&field.field), "optional" | "tail")).cloned().collect();
+    direct_fields(&mut out, &mesh_fields, "draw", "    ");
+    out.push(format!("    at := self + {}", draws.lanes));
+    out.push("  for sound in sounds:".to_owned());
+    direct_fields(&mut out, &sounds.fields, "sound", "    ");
+    out.push(format!("    at := self + {}", sounds.lanes));
+    out.push("  return ()".to_owned());
     out
 }
 
@@ -751,28 +787,9 @@ fn render(model: &Model) -> Vec<String> {
             "const vec4_lanes = func (v: types.Vec4) => return #[v.x, v.y, v.z, v.w]".to_owned(),
         ]);
     }
-    out.extend(render_direct(model));
     out.extend(render_views(model));
-    if let Some(extensions) = model.extensions() {
-        out.push(String::new());
-        out.extend(comment(Some(
-            "The lanes of the game's own sections, to follow encode_render's: none without any, else the \
-             marker, their count, then each one's tag, length and values. A game's generated \
-             pen/extensions.blot makes them from its declarations.",
-        )));
-        out.push("const encode_extensions = func (extensions: Array types.Extension) => return do:".to_owned());
-        out.push("  if extensions.is_empty:".to_owned());
-        out.push("    return #[]".to_owned());
-        out.push(format!("  use lanes.require (extensions.length <= {})", bound_blot(&extensions["max"])));
-        out.extend([
-            "  let output: GrowArray F32 = #[protocol.extensions_marker, U32.to_f32 extensions.length]".to_owned(),
-            "  for extension in extensions:".to_owned(),
-            "    output.push (U32.to_f32 extension.tag)".to_owned(),
-            "    output.push (U32.to_f32 extension.values.length)".to_owned(),
-            "    array.append_into output extension.values".to_owned(),
-            "  return @storage.freeze output".to_owned(),
-        ]);
-    }
+    out.extend(render_meshes(model));
+
     out
 }
 fn field_type(model: &Model, field: &Value) -> String {
@@ -784,8 +801,8 @@ fn field_type(model: &Model, field: &Value) -> String {
         "matrix" => "Mat4".to_owned(),
         "lanes" => "Vec4".to_owned(),
         "optional" => "Maybe Vec4".to_owned(),
-        "tail" => "Array Vec4".to_owned(),
-        "children" => format!("Array {}", s(&model.section(s(&field["section"])).section["record"]["name"])),
+        "tail" => "&[Vec4]".to_owned(),
+        "children" => format!("&[{}]", s(&model.section(s(&field["section"])).section["record"]["name"])),
         _ => unreachable!(),
     }
 }
@@ -829,7 +846,7 @@ fn types(model: &Model) -> Vec<String> {
         if kind(rest) == "repeat" {
             ty = s(&rest["record"]["name"]);
         }
-        fields.push(format!("{}: Array {ty}", s(&rest["name"])));
+        fields.push(format!("{}: &[{ty}]", s(&rest["name"])));
         structure(&mut out, s(&record["name"]), fields);
     }
     for (group, value) in object(&model.protocol["render"]["groups"]) {
@@ -864,25 +881,7 @@ fn types(model: &Model) -> Vec<String> {
     out.push("type RenderHeader = {".to_owned());
     out.extend(fields.iter().map(|field| format!("  {field},")));
     out.push("}".to_owned());
-    for entry in &model.sections {
-        if kind(&entry.section) == "trailing" || entry.owner.is_some() {
-            continue;
-        }
-        let mut ty = "F32";
-        if kind(&entry.section) != "lanes" {
-            ty = s(&entry.section["record"]["name"]);
-        }
-        fields.push(format!("{}: Array {ty}", s(&entry.section["name"])));
-    }
-    structure(&mut out, "RenderFrame", fields);
-    if model.extensions().is_some() {
-        out.push(String::new());
-        out.extend(comment(Some(
-            "One of the game's own sections (its pen.json `protocol`): its tag and lanes. They travel after the \
-             render packet, which RenderFrame leaves them out of: protocol_render's encode_extensions lays them out.",
-        )));
-        out.push("type Extension is data = $Extension { tag: U32, values: Array F32 }".to_owned());
-    }
+
     out
 }
 
@@ -895,7 +894,7 @@ const require = func (condition: Bool) => return do:
     return ()
   return @panic "invalid Pen numeric packet"
 
-const finite = func (values: Array F32) => return require (array.all is_finite values)
+const finite = func values => return require (array.all is_finite values)
 
 const integer = func (value: F32) => return func (maximum: U32) => return do:
   let number = F32.to_u32 value

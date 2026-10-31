@@ -123,7 +123,7 @@ mod tests {
             }
         }
         let render = &sources.iter().find(|(name, _)| *name == "protocol_render.blot").unwrap().1;
-        assert!(render.contains("func (packet: types.RenderFrame)"));
+        assert!(render.contains("func (packet: types.RenderHeader)"));
         assert!(render.contains("func (draw: types.Draw)"));
         assert!(render.contains("draw.transform"));
         assert!(render.contains("inset.ambient.x"));
@@ -132,8 +132,9 @@ mod tests {
         let types = &sources.iter().find(|(name, _)| *name == "types.blot").unwrap().1;
         assert!(types.contains("transform: Mat4"));
         assert!(types.contains("parameters: Maybe Vec4"));
-        assert!(types.contains("draws: Array Draw"));
-        assert!(types.contains("state: Array F32"));
+        assert!(types.contains("draws: &[Draw]"));
+        assert!(types.contains("type RenderHeader ="));
+        assert!(!types.contains("RenderFrame"));
         // Only tests import the canonical walks; no binding the game uses does.
         assert!(sources.iter().all(|(_, source)| !source.contains("./protocol_canonical")));
     }
@@ -149,19 +150,19 @@ mod tests {
         let sources = blot::emit(&model, HEADER);
         let canonical = &sources.iter().find(|(name, _)| *name == "protocol_canonical.blot").unwrap().1;
         assert!(canonical.contains("const canonical_input = func (input: protocol.Input) => return do:"));
-        assert!(canonical.contains("const render_from_canonical = func (canonical: Array F32) => return do:"));
-        // Blot reads back every field of the record the game encodes, in its order.
-        let types = &sources.iter().find(|(name, _)| *name == "types.blot").unwrap().1;
-        let fields = |source: &str, opening: &str| -> Vec<String> {
-            let body = source.split(opening).nth(1).unwrap().split('}').next().unwrap();
-            body.split([',', '\n'])
-                .map(|field| field.split(':').next().unwrap().trim().to_owned())
-                .filter(|field| !field.is_empty())
-                .collect()
-        };
-        let read = fields(canonical, "return $types.RenderFrame {");
-        assert_eq!(read, fields(types, "type RenderFrame is data = $RenderFrame {"));
-        assert_eq!(read[..2], ["schema", "save_requested"]);
+        assert!(canonical.contains("const render_packet_from_canonical = func (canonical: Array F32)"));
+        // Every header lane and section is emitted into one named packet owner.
+        for header in &model.header {
+            let offset = header.laid.offset;
+            assert!(canonical.contains(&format!("output[{offset}] :=")), "missing {}", header.key);
+        }
+        for section in &model.sections {
+            let name = model::s(&section.section["name"]);
+            assert!(canonical.contains(&format!("let {name}_start:")), "missing {name}");
+        }
+        assert!(!canonical.contains("RenderFrame"));
+        assert!(canonical.contains("@storage.push extras canonical[at + index]"));
+        assert!(canonical.contains("inset_draw_into canonical at children children extras"));
         // Each record's walk follows its fields; a group's sits where its first lane does.
         assert!(rust.contains(
             "out.extend([draw.mesh as f32, draw.material as f32]);\n        out.extend_from_slice(&draw.transform);"
@@ -184,11 +185,10 @@ mod tests {
         assert!(rust.contains(" sky.environment as f32,\n"));
         let sources = blot::emit(&model, HEADER);
         let canonical = &sources.iter().find(|(name, _)| *name == "protocol_canonical.blot").unwrap().1;
-        assert!(canonical.contains(
-            "  if lanes.integer canonical[at] 1 == 1:\n    let (zenith, zenith_end) = vector_from canonical (at + 1)"
-        ));
-        assert!(canonical.contains("environment: environment + 1"));
-        assert!(canonical.contains("night: 0.0, environment: 0"));
+        assert!(canonical.contains("  if present == 1:"));
+        let environment = model.header.iter().find(|field| field.key == "sky.environment").unwrap().laid.offset;
+        assert!(canonical.contains(&format!("    output[{environment}] := canonical[at] + 1.0")));
+        assert!(canonical.contains("    @storage.push output 0.0"));
     }
 
     #[test]

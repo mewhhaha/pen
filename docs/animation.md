@@ -135,8 +135,9 @@ in front of empty depth).
 
 ## Games
 
-A Blot game declares them in ink's `render.RenderFrame`: its `poses`
-(`render.Pose`) and `emitters` (`render.Emitter`, with `matrix` for the
-transform and `math.Vec4` colors), which `lib/pen/host.blot` turns into the
-packet's. gdev's sprout (`src/assets/sprout.import.json`) is imported and
+A Blot game appends poses and emitters to Ink's named `render.FrameAccess`
+pools: `poses` holds `render.Pose` and `emitters` holds `render.Emitter`
+(with `matrix` for the transform and `math.Vec4` colors). `render.finish`
+borrows these pools in a `render.RenderFrame`; `lib/pen/host.blot` encodes
+them before their owners close. gdev's sprout (`src/assets/sprout.import.json`) is imported and
 ready to draw, skinned or baked; the game does not draw it yet.

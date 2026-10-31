@@ -76,9 +76,10 @@ marker-like numbers in arbitrary payloads.
 Rust guests and adapters can construct `Provenance` and call
 `Provenance::extension(packet_end)` to validate and encode it. Other languages
 can append this reserved extension to their encoded development packets.
-In Blot, `types.Extension` with `protocol.provenance_tag` and the UTF-8 bytes
-as `values` can travel through `protocol_render.encode_extensions`, alongside
-any application sections. Older hosts reject tag 0; omit it when targeting
+In Blot, append `protocol.provenance_tag`, the JSON byte count, and one numeric
+lane per UTF-8 byte to a named extension packet owner. The packet starts with
+`protocol.extensions_marker` and the total number of provenance and application
+sections ([extension framing](extensions.md)). Older hosts reject tag 0; omit it when targeting
 those hosts.
 Pen consumes it without adding it to the rendered frame or retaining an
 identity map. Each error uses only its packet's metadata, so a reload, reused

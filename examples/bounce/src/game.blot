@@ -9,6 +9,8 @@ import * as extensions from "pen/extensions"
 import * as frame from "pen/frame"
 import * as protocol from "pen/protocol"
 import * as types from "pen/types"
+import * as program from "pen/program"
+import * as codec from "pen/protocol_render"
 import { Vec3 } from "std/vector"
 import { meshes, materials, sounds } from "./assets/catalog.json"
 
@@ -37,8 +39,8 @@ const create = func () => return $World { x: 0.0, z: 0.0, vx: 0.0, vz: 0.0, boun
 // The world as lanes, for quicksaves, time travel and reloads, and back.
 const save = func (world: World) => return
   #[world.x, world.z, world.vx, world.vz, U32.to_f32 world.bounces, U32.to_f32 world.held]
-const restore = func (state: Array F32) => return $World {
-  x: state[0], z: state[1], vx: state[2], vz: state[3], bounces: F32.to_u32 state[4], held: F32.to_u32 state[5],
+const restore = func state => return $World {
+  x: (state.at 0), z: (state.at 1), vx: (state.at 2), vz: (state.at 3), bounces: F32.to_u32 (state.at 4), held: F32.to_u32 (state.at 5),
 }
 
 // The arrow a key is, as its bit; 0 for any other key.
@@ -85,23 +87,23 @@ const roll = func (world: World) => return func (seconds: F32) => return do:
   let x = world.x + vx * seconds
   let z = world.z + vz * seconds
   let edge = yard - radius
-  let hit = $False
+  let hit = false
   if x > edge:
     x := edge + edge - self
     vx := 0.0 - F32.abs vx
-    hit := $True
+    hit := true
   if x < 0.0 - edge:
     x := 0.0 - edge - edge - self
     vx := F32.abs vx
-    hit := $True
+    hit := true
   if z > edge:
     z := edge + edge - self
     vz := 0.0 - F32.abs vz
-    hit := $True
+    hit := true
   if z < 0.0 - edge:
     z := 0.0 - edge - edge - self
     vz := F32.abs vz
-    hit := $True
+    hit := true
   let bounces = world.bounces
   if hit:
     bounces := self + 1
@@ -115,7 +117,7 @@ const placed = func (x: F32) => return func (y: F32) => return func (z: F32) => 
   $types.Mat4 { x: vec4 sx 0.0 0.0 0.0, y: vec4 0.0 sy 0.0 0.0, z: vec4 0.0 0.0 sz 0.0, w: vec4 x y z 1.0 }
 
 const draw = func (mesh: U32) => return func (material: U32) => return func (transform: types.Mat4) => return
-  $types.Draw { mesh, material, transform, parameters: $Nothing, extra: #[] }
+  { mesh, material, transform }
 
 // The eye at `eye`, looking at `target`, the sky up.
 const look_at = func (eye: Vec3) => return func (target: Vec3) => return do:
@@ -160,29 +162,79 @@ const markers = func (bounces: U32) => return
     | index <- array.generate (min bounces 16) identity]
 
 // What the world looks like, and the blip of a bounce.
-const view = func (world: World) => return func (hit: Bool) => return func (input: extensions.Input) => return do:
-  let drawn = frame.blank schema
+const view = func (world: World) -> (hit: Bool) -> (input: extensions.Input) -> (draws: ResizeArray codec.MeshDraw) -> (sounds_out: ResizeArray types.Sound) => return do:
+  @storage.truncate draws 0
+  @storage.truncate sounds_out 0
+  let drawn = frame.header schema
   drawn.view := camera
   drawn.projection := perspective 1.8 (input.width / input.height)
   drawn.clear := $types.Color { r: 0.55, g: 0.7, b: 0.85, a: 1.0 }
   drawn.ambient := $types.Vector { x: 0.3, y: 0.32, z: 0.36 }
   drawn.light_direction := $types.Vector { x: -0.35, y: -1.0, z: -0.5 }
   let ball = draw meshes.ball materials.ball (placed world.x 0.0 world.z radius radius radius)
-  drawn.draws := array.concat #[ball, ...yard_draws] (markers world.bounces)
+  @storage.push draws ball
+  for item in yard_draws:
+    @storage.push draws item
+  for item in markers world.bounces:
+    @storage.push draws item
   if hit:
-    drawn.sounds := #[
-      $types.Sound { clip: sounds.bounce, bus: 0, gain: 0.5, pan: world.x / yard, pitch: 1.0, lowpass: 24000.0, reverb: 0.0 },
-    ]
+    @storage.push sounds_out ($types.Sound { clip: sounds.bounce, bus: 0, gain: 0.5, pan: world.x / yard, pitch: 1.0, lowpass: 24000.0, reverb: 0.0 })
   return drawn
 
 // One frame: the events, then the ball rolls on (a tenth of a second at
 // most), then how it looks and its Score.
 const step = func (world: World) => return func (input: extensions.Input) => return do:
-  let taken = array.fold_left take world input.events
+  let taken = world
+  for event in input.events:
+    taken := take taken event
   let (next, hit) = roll taken (min input.elapsed 0.1)
-  let speed = F32.sqrt (next.vx * next.vx + next.vz * next.vz)
-  let score = extensions.encode_score #[$extensions.Score { bounces: next.bounces, speed }]
-  return (next, view next hit input, #[score])
+  return (next, hit)
 
-// The game, as pen/extensions' `run` serves it.
+// One Score section, encoded after the render packet with its fixed framing.
+const score = func (world: World) => return do:
+  let packet: ResizeArray F32 = #[protocol.extensions_marker, 1.0]
+  extensions.append_score #[$extensions.Score {
+    bounces: world.bounces, speed: F32.sqrt (world.vx * world.vx + world.vz * world.vz),
+  }] packet
+  return @storage.freeze packet
+
+// Compile-known callbacks operate on one named world pool. Presentation rejection
+// needs no cache repair here; it never rolls simulation back.
+const acknowledge = func access -> published => return ()
+const execute = func access -> operation -> payload -> outgoing => return do:
+  let world = access.world
+  let events = access.events
+  let draws = access.draws
+  let sounds: ResizeArray types.Sound = access.sounds
+  let rendered: ResizeArray F32 = access.rendered
+  case operation of
+    1 => do:
+      world[0] := create ()
+      program.append (save world[0]) outgoing
+    2 => do:
+      let input = extensions.decode_input_into payload events
+      let (next, hit) = step world[0] input
+      world[0] := next
+      let header = view next hit input draws sounds
+      codec.encode_mesh_frame header (&draws[0..draws.length]) (&sounds[0..sounds.length]) rendered
+      program.append rendered outgoing
+      program.append (score next) outgoing
+    3 => program.append (save world[0]) outgoing
+    4 => do:
+      world[0] := restore payload
+      program.append (save world[0]) outgoing
+    _ => @panic "scenes are not supported"
+
+const run = func host => return do:
+  let world: Array World = #[create ()]
+  let events: ResizeArray extensions.Event = #[]
+  let draws: ResizeArray codec.MeshDraw = #[]
+  let sounds: ResizeArray types.Sound = #[]
+  let rendered: ResizeArray F32 = #[]
+  let incoming: ResizeArray F32 = #[]
+  let outgoing: ResizeArray F32 = #[]
+  let access = {world, events, draws, sounds, rendered}
+  use program.run execute acknowledge access schema false incoming outgoing host
+  return ()
+
 const game = { schema, create, step, save, restore }

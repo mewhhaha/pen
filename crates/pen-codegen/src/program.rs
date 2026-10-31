@@ -1,5 +1,5 @@
 //! The Blot a game needs besides its packets' codecs: the program loop pen
-//! runs it through (`program.blot`), a frame that draws nothing for it to
+//! runs it through (`program.blot`), a fixed render header for it to
 //! start from (`frame.blot`) and the checks its tests report to `pen
 //! test-blot` (`check.blot`), so that a game builds on pen's bindings
 //! alone.
@@ -76,12 +76,11 @@ fn blank(field: &Value) -> String {
     }
 }
 
-/// `frame.blot`: the identity matrix, and `blank`, a frame that draws,
-/// plays and asks nothing, with the header's defaults.
+/// `frame.blot`: the identity matrix and a fixed header with schema defaults.
 pub fn frame(model: &Model, header: &[String]) -> String {
     let mut out = header.to_vec();
     out.extend(
-        "//\n// A frame to start from: one that draws, plays and asks nothing, lit from\n// above. A game sets what it needs (`frame.draws := #[...]`) and leaves the\n// rest.\nimport * as types from \"./types\"\n\nconst identity = $types.Mat4 {\n  x: $types.Vec4 { x: 1.0, y: 0.0, z: 0.0, w: 0.0 },\n  y: $types.Vec4 { x: 0.0, y: 1.0, z: 0.0, w: 0.0 },\n  z: $types.Vec4 { x: 0.0, y: 0.0, z: 1.0, w: 0.0 },\n  w: $types.Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },\n}\n\n// A frame of state `schema` that draws nothing.\nconst blank = func (schema: U32) => return $types.RenderFrame {"
+        "//\n// A frame to start from: one that draws, plays and asks nothing, lit from\n// above. A game fills separate named source pools and encodes them with this header.\nimport * as types from \"./types\"\n\nconst identity = $types.Mat4 {\n  x: $types.Vec4 { x: 1.0, y: 0.0, z: 0.0, w: 0.0 },\n  y: $types.Vec4 { x: 0.0, y: 1.0, z: 0.0, w: 0.0 },\n  z: $types.Vec4 { x: 0.0, y: 0.0, z: 1.0, w: 0.0 },\n  w: $types.Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },\n}\n\n// Fixed render defaults for state `schema`; collections have separate owners.\nconst header = func (schema: U32): types.RenderHeader => return {"
             .lines()
             .map(str::to_owned),
     );
@@ -106,21 +105,7 @@ pub fn frame(model: &Model, header: &[String]) -> String {
             },
         }
     }
-    // A header contains fixed data only; source groups are separate borrowed
-    // views for encode_render_views. Never allocate an owning RenderFrame.
-    let header_start = out.iter().position(|line| line.starts_with("const blank =")).unwrap();
-    let mut header = out[header_start..].to_vec();
-    header[0] = "const header = func (schema: U32): types.RenderHeader => return {".to_owned();
-    header.push("}".to_owned());
-    for entry in &model.sections {
-        if kind(&entry.section) == "trailing" || entry.owner.is_some() {
-            continue;
-        }
-        out.push(format!("  {}: #[],", s(&entry.section["name"])));
-    }
     out.push("}".to_owned());
-    out.push(String::new());
-    out.extend(header);
     out.push(String::new());
     out.join("\n")
 }

@@ -1,0 +1,19 @@
+// Copied worker jobs use isolated invocations and ordinary owned storage.
+entry const collected = func (value: U32) => return @u32.add (@u32.add value value) 42
+entry const incremented = func (value: U32) => return @u32.add value 1
+entry const captured = func (values: Array U32) => return @storage.copy values
+entry const partitioned = func (owner: Array U32) => return do:
+  owner[0] := @u32.add owner[0] 1
+  owner[2] := @u32.add owner[2] 2
+  return @u32.add owner[0] owner[2]
+entry const failing = func (value: U32) => return @u32.div value 0
+entry const large_result = func (count: U32) => return do:
+  let output: GrowArray U32 = #[]
+  for i in 0 .. count:
+    @storage.push output (@u32.add i 1)
+  return @storage.freeze output
+entry const repeated = func (count: U32) => return do:
+  let sum = 0
+  for index in 0 .. count:
+    sum := @u32.add self (@u32.add index 1)
+  return sum

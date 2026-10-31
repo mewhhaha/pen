@@ -17,7 +17,7 @@ const load_scene: U32 = 6
 const append = func values -> (destination: ResizeArray F32) => return do:
   let count = values.length
   for i in 0 .. count:
-    @storage.push destination values[i]
+    @storage.push destination (values.at i)
 const valid_state = func values => return do:
   if values.length > protocol.max_state_floats:
     return false

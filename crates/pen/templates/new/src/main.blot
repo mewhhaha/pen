@@ -1,6 +1,4 @@
-// The game's entry: pen runs `main`, giving it the host. Everything else is
-// in ./game, which tests import (a module with an entry cannot be).
-import * as program from "pen/program"
-import { game } from "./game"
+// Each invocation owns its state and packet pools until the host stops it.
+import { run } from "./game"
 
-entry const main = func host => return program.run game host
+entry const main = func host => return run host

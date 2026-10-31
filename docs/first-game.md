@@ -57,39 +57,33 @@ same script gives the same pixels every time.
 
 ## Read it
 
-`src/main.blot` is three lines:
+`src/main.blot` calls the game's invocation-scoped adapter:
 
 ```blot
-import * as program from "pen/program"
-import { game } from "./game"
+import { run } from "./game"
 
-entry const main = func host => return program.run game host
+entry const main = func host => return run host
 ```
 
-pen runs `main` with the host, and `pen/program`'s `run` answers the host
-for as long as the game runs: it creates the game, steps it once a frame,
-and saves and restores it when pen asks (for quicksaves, time travel and
-reloads). The game is a record of five things, at the end of
-`src/game.blot`:
+`run` creates named world, event, draw, sound and numeric packet pools once.
+`program.run` handles session version 2, calling the game's `execute` function
+for create, frame, snapshot and restore requests. `execute` updates the world
+pool and encodes the response before the next host call. Renderer rejection
+keeps that simulation state; restoring an earlier state is an explicit request.
+
+- `World` contains the cube's angle and speed. `create` makes its initial value.
+- `step` reads a borrowed `protocol.Input` and returns the next `World`.
+- `save` copies the world into numeric lanes; `restore` reads those lanes back.
+  `schema` versions that layout.
+- `view` fills a caller-owned draw pool and returns the fixed render header.
+  `codec.encode_mesh_frame` encodes that header, flat mesh draws and sounds into
+  the named packet pool. More complex renderers use `encode_render_views` with
+  borrowed source pools and known projections.
+
+The cube's step reads the arrows from the events:
 
 ```blot
-const game = { schema, create, step, save, restore }
-```
-
-- `World` is everything a frame depends on besides its input, here the
-  cube's angle and speed. `create` makes the first one.
-- `step` takes the world and the frame's input (`protocol.Input`: the
-  seconds since the last frame, the viewport's size and the events) and
-  returns the next world and the frame to draw.
-- `save` turns the world into numbers (an `Array F32`), and `restore` turns
-  them back. `schema` is the version of that layout: change it when the
-  layout changes, and pen starts afresh instead of restoring a state it
-  would misread.
-
-`step` reads the arrows from the events:
-
-```blot
-const step = func (world: World) => return func (input: protocol.Input) => return do:
+const step = func (world: World) -> (input: protocol.Input) => return do:
   let speed = world.speed
   for event in input.events:
     if let $protocol.KeyDown code = event:
@@ -97,24 +91,15 @@ const step = func (world: World) => return func (input: protocol.Input) => retur
         speed := self + nudge
       if code == protocol.key_arrow_left:
         speed := self - nudge
-  let next = $World { angle: world.angle + speed * input.elapsed, speed }
-  break (next, view next input)
+  return $World { angle: world.angle + speed * input.elapsed, speed }
 ```
 
-and `view` makes the frame, starting from `frame.blank`, a frame that
-draws nothing, and setting the camera, the light and the draws:
+`view` starts from `frame.header schema`, sets the camera and light, clears its
+`ResizeArray codec.MeshDraw` parameter, and appends the cube's mesh draw:
 
 ```blot
-const view = func (world: World) => return func (input: protocol.Input) => return do:
-  let drawn = frame.blank schema
-  drawn.view := moved 0.0 0.0 (-5.0)
-  drawn.projection := perspective 2.0 (input.width / input.height)
-  drawn.clear := $types.Color { r: 0.08, g: 0.1, b: 0.14, a: 1.0 }
-  drawn.light_direction := $types.Vector { x: -0.4, y: -1.0, z: -0.6 }
-  drawn.draws := #[
-    $types.Draw { mesh: meshes.cube, material: materials.cube, transform: turned world.angle, parameters: $Nothing, extra: #[] },
-  ]
-  break drawn
+  @storage.truncate draws 0
+  @storage.push draws { mesh: meshes.cube, material: materials.cube, transform: turned world.angle }
 ```
 
 Matrices are column-major (`x`, `y`, `z`, `w` are columns), as WGSL reads
@@ -124,14 +109,11 @@ file it lists becomes a name for its index.
 
 ## Change it
 
-Put a second cube beside the first, standing still: add a draw to `view`'s
-list and save.
+Put a second cube beside the first, standing still: append another draw in
+`view`, after the existing cube, and save.
 
 ```blot
-  drawn.draws := #[
-    $types.Draw { mesh: meshes.cube, material: materials.cube, transform: turned world.angle, parameters: $Nothing, extra: #[] },
-    $types.Draw { mesh: meshes.cube, material: materials.cube, transform: moved 2.6 0.0 (-3.0), parameters: $Nothing, extra: #[] },
-  ]
+  @storage.push draws { mesh: meshes.cube, material: materials.cube, transform: moved 2.6 0.0 (-3.0) }
 ```
 
 Give it a colour of its own. A material is a JSON file naming its shader,

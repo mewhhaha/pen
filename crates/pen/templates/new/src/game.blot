@@ -4,6 +4,8 @@
 import * as frame from "pen/frame"
 import * as protocol from "pen/protocol"
 import * as types from "pen/types"
+import * as program from "pen/program"
+import * as codec from "pen/protocol_render"
 import { meshes, materials } from "./assets/catalog.json"
 
 // The version of the state `save` makes. Change it when the state's lanes
@@ -17,7 +19,7 @@ const create = func () => return $World { angle: 0.0, speed: 1.0 }
 
 // The world as lanes, for quicksaves, time travel and reloads, and back.
 const save = func (world: World) => return #[world.angle, world.speed]
-const restore = func (state: Array F32) => return $World { angle: state[0], speed: state[1] }
+const restore = func state => return $World { angle: (state.at 0), speed: (state.at 1) }
 
 // Radians a second each arrow press adds or takes away.
 const nudge = 0.5
@@ -46,15 +48,14 @@ const perspective = func (focal: F32) => return func (aspect: F32) => return do:
   }
 
 // What the world looks like: the cube, five units in front of the eye.
-const view = func (world: World) => return func (input: protocol.Input) => return do:
-  let drawn = frame.blank schema
+const view = func (world: World) -> (input: protocol.Input) -> (draws: ResizeArray codec.MeshDraw) => return do:
+  @storage.truncate draws 0
+  let drawn = frame.header schema
   drawn.view := moved 0.0 0.0 (-5.0)
   drawn.projection := perspective 2.0 (input.width / input.height)
   drawn.clear := $types.Color { r: 0.08, g: 0.1, b: 0.14, a: 1.0 }
   drawn.light_direction := $types.Vector { x: -0.4, y: -1.0, z: -0.6 }
-  drawn.draws := #[
-    $types.Draw { mesh: meshes.cube, material: materials.cube, transform: turned world.angle, parameters: $Nothing, extra: #[] },
-  ]
+  @storage.push draws { mesh: meshes.cube, material: materials.cube, transform: turned world.angle }
   return drawn
 
 // One frame: the arrows pressed change the speed, and the cube turns on.
@@ -67,7 +68,44 @@ const step = func (world: World) => return func (input: protocol.Input) => retur
       if code == protocol.key_arrow_left:
         speed := self - nudge
   let next = $World { angle: world.angle + speed * input.elapsed, speed }
-  return (next, view next input)
+  return next
 
-// The game, as pen/program's `run` serves it.
+// Compile-known callbacks operate on one named world pool. Presentation rejection
+// needs no cache repair here; it never rolls simulation back.
+const acknowledge = func access -> published => return ()
+const execute = func access -> operation -> payload -> outgoing => return do:
+  let world = access.world
+  let events = access.events
+  let draws = access.draws
+  let sounds: ResizeArray types.Sound = access.sounds
+  let rendered: ResizeArray F32 = access.rendered
+  case operation of
+    1 => do:
+      world[0] := create ()
+      program.append (save world[0]) outgoing
+    2 => do:
+      let input = protocol.decode_input_into payload events
+      let next = step world[0] input
+      world[0] := next
+      let header = view next input draws
+      codec.encode_mesh_frame header (&draws[0..draws.length]) (&sounds[0..sounds.length]) rendered
+      program.append rendered outgoing
+    3 => program.append (save world[0]) outgoing
+    4 => do:
+      world[0] := restore payload
+      program.append (save world[0]) outgoing
+    _ => @panic "scenes are not supported"
+
+const run = func host => return do:
+  let world: Array World = #[create ()]
+  let events: ResizeArray protocol.Event = #[]
+  let draws: ResizeArray codec.MeshDraw = #[]
+  let sounds: ResizeArray types.Sound = #[]
+  let rendered: ResizeArray F32 = #[]
+  let incoming: ResizeArray F32 = #[]
+  let outgoing: ResizeArray F32 = #[]
+  let access = {world, events, draws, sounds, rendered}
+  use program.run execute acknowledge access schema false incoming outgoing host
+  return ()
+
 const game = { schema, create, step, save, restore }

@@ -97,8 +97,9 @@ checkout as Blot (`pen/protocol.blot`, `pen/types.blot`,
   sections. Header flags ask pen to save, load, record a checkpoint for undo, or
   stop.
 
-`pen/frame.blot`'s `blank` is a frame that draws, plays and asks nothing, lit
-from above; a game sets what it uses. Keys arrive as codes: `pen/protocol.blot`
+`pen/frame.blot`'s `header` supplies fixed render defaults, lit from above.
+A game supplies borrowed source pools to `encode_render_views`, or flat mesh
+draws and sounds to `encode_mesh_frame`, and a named output packet owner. Keys arrive as codes: `pen/protocol.blot`
 names the named ones (`key_arrow_left`, `key_f1`...), and a key that types a
 character carries its code point (a letter, its capital's).
 

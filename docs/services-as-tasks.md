@@ -73,3 +73,11 @@ overhead, serialization and extra worker memory belong in application
 measurements. The standalone `worker_sessions` host tests cover ordering,
 validation, traps, early exits, restart, reset and stable memory over repeated
 batches.
+
+The retired language-task conformance fixture and adapter-admission tests have
+been removed. `owned_storage` retains the useful numeric results, copied-array
+round trips, bounds/trap recovery, 20 reuse cycles, 1,000,000-element capacity
+probe and 128/5,000-iteration workloads. Five thousand ordinary iterations now
+complete; the old task scheduler's admission limit no longer applies. The
+1 MiB sandbox still rejects a module whose planned storage exceeds it. Copied
+worker tests retain 32-job batches, submission order, tracing and lane limits.

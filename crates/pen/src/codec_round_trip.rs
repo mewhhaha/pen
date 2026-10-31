@@ -6,11 +6,11 @@
 //! the bit:
 //!
 //! - input: Rust encodes a random frame (`encode_frame`), the game's Blot
-//!   decodes it (`decode_input`) and walks what it got, which must be Rust's
+//!   decodes it into a named event pool (`decode_input_into`) and walks what it got, which must be Rust's
 //!   walk of the frame (`canonical_input`);
 //! - render: Rust walks a random frame (`canonical_render`), Blot reads the
-//!   walk back into the record the game encodes (`render_from_canonical`)
-//!   and encodes it (`encode_render`), and Rust decodes that packet
+//!   walk directly into named packet, child-draw and extra-lane pools
+//!   (`render_packet_from_canonical`), and Rust decodes that packet
 //!   (`decode_frame`) into the frame it walked, to the bit.
 //!
 //! The Blot side (codec_round_trip.blot) compiles through the sibling
@@ -35,8 +35,8 @@ use pen_protocol::boundary::{
 };
 use pen_protocol::{
     Aberration, Bus, Catalog, Clouds, Color, Decal, Draw, Drift, Emitter, FieldPatch, Fog, Frame, GameEvent, Inset,
-    Light, Listener, Panner, Pose, Quality, RenderFrame, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite,
-    UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
+    Instance, InstanceRemoval, Light, Listener, Panner, Pose, Quality, RenderFrame, ServiceRequest, Shadow, Sky, Solid,
+    SolidFace, Sound, Sprite, UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
 };
 
 const HARNESS: &str = include_str!("codec_round_trip.blot");
@@ -69,7 +69,7 @@ fn input_packets_mean_the_same_to_rust_and_blot() {
                 .unwrap_or_else(|error| failed(format!("pen-protocol refused the random frame: {error:#}")));
             let expected = canonical_input(&frame, elapsed, &state);
             let actual = call(guest, "input_round_trip", packet)
-                .unwrap_or_else(|error| failed(format!("the game's decode_input failed: {error:#}\n{frame:#?}")));
+                .unwrap_or_else(|error| failed(format!("the game's decode_input_into failed: {error:#}\n{frame:#?}")));
             if let Some(lane) = first_difference(&expected, &actual) {
                 failed(format!(
                     "the game's walk of the packet differs from Rust's walk of the frame at lane {lane}, {}:\n{}\n{frame:#?}",
@@ -107,8 +107,9 @@ fn render_packets_mean_the_same_to_rust_and_blot() {
                 *count += usize::from(held);
             }
             let walk = canonical_render(&frame, schema, &state);
-            let packet = call(guest, "render_round_trip", walk.clone())
-                .unwrap_or_else(|error| failed(format!("the game's encode_render failed: {error:#}\n{frame:#?}")));
+            let packet = call(guest, "render_round_trip", walk.clone()).unwrap_or_else(|error| {
+                failed(format!("the game's canonical packet writer failed: {error:#}\n{frame:#?}"))
+            });
             let decoded = decode_frame(&packet, schema, &catalog).unwrap_or_else(|error| {
                 failed(format!("pen-protocol refused the game's packet: {error:#}\n{catalog:?}\n{frame:#?}"))
             });
@@ -832,15 +833,35 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 additive: rng.flag(),
             })
         },
+        retained_enabled: rng.flag(),
+        retained_reset: rng.flag(),
+        retained_after: 0,
+        instances: {
+            let count = rng.count(12);
+            rng.list(count, |rng| Instance {
+                id_low: rng.whole(65535),
+                id_high: rng.whole(65535),
+                order: rng.whole(MAX_INTEGER),
+                mesh: rng.pick(catalog.meshes.len()),
+                material: material(rng),
+                transform: rng.lanes(),
+                parameters: rng.flag().then(|| rng.lanes()),
+            })
+        },
+        instance_removals: {
+            let count = rng.count(12);
+            rng.list(count, |rng| InstanceRemoval { id_low: rng.whole(65535), id_high: rng.whole(65535) })
+        },
     };
     for inset in &mut frame.insets {
         inset.after_sprites = rng.whole(u32::try_from(frame.sprites.len()).unwrap());
     }
+    frame.retained_after = rng.whole(u32::try_from(frame.draws.len()).unwrap());
     (frame, schema, state)
 }
 
 /// What `sections` reports of a frame, in its order.
-const SECTIONS: [&str; 21] = [
+const SECTIONS: [&str; 23] = [
     "draws",
     "draw parameters",
     "draw extras",
@@ -862,6 +883,8 @@ const SECTIONS: [&str; 21] = [
     "lights",
     "listener",
     "panners",
+    "retained instances",
+    "instance removals",
 ];
 
 /// Which of `SECTIONS` a frame holds any of.
@@ -889,5 +912,7 @@ fn sections(frame: &RenderFrame) -> [bool; SECTIONS.len()] {
         !frame.lights.is_empty(),
         !frame.listener.is_empty(),
         !frame.panners.is_empty(),
+        !frame.instances.is_empty(),
+        !frame.instance_removals.is_empty(),
     ]
 }

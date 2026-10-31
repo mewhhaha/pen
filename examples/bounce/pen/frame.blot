@@ -2,8 +2,7 @@
 // edit the schema and run `pen codegen`, not this file.
 //
 // A frame to start from: one that draws, plays and asks nothing, lit from
-// above. A game sets what it needs (`frame.draws := #[...]`) and leaves the
-// rest.
+// above. A game fills separate named source pools and encodes them with this header.
 import * as types from "./types"
 
 const identity = $types.Mat4 {
@@ -13,87 +12,8 @@ const identity = $types.Mat4 {
   w: $types.Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },
 }
 
-// A frame of state `schema` that draws nothing.
-const blank = func (schema: U32) => return $types.RenderFrame {
-  schema,
-  save_requested: false,
-  load_requested: false,
-  scene_save_requested: false,
-  scene_load_requested: false,
-  checkpoint_requested: false,
-  undo_requested: false,
-  redo_requested: false,
-  exit_requested: false,
-  view: identity,
-  projection: identity,
-  clear: $types.Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
-  ambient: $types.Vector { x: 0.2, y: 0.2, z: 0.2 },
-  light_direction: $types.Vector { x: 0.0, y: (-1.0), z: 0.0 },
-  light_color: $types.Vector { x: 1.0, y: 1.0, z: 1.0 },
-  aberration: $types.Aberration { x: 0.0, y: 0.0 },
-  quality: $types.Quality {
-    msaa: 1,
-    fxaa: false,
-    scale: 1.0,
-    filtering: 1,
-    occlusion: false,
-    sky: false,
-    effects: false,
-    bloom: false,
-    taa: false,
-  },
-  sky: $types.Sky {
-    zenith: $types.Vector { x: 0.0, y: 0.0, z: 0.0 },
-    horizon: $types.Vector { x: 0.0, y: 0.0, z: 0.0 },
-    ground: $types.Vector { x: 0.0, y: 0.0, z: 0.0 },
-    sun: $types.Vector { x: 0.0, y: 0.0, z: 0.0 },
-    night: 0.0,
-  },
-  fog: $types.Fog {
-    radius: 0.0,
-    density: 0.0,
-    height: 0.0,
-  },
-  shadow: $types.Shadow {
-    view: identity,
-    projection: identity,
-    texel: 0.0,
-    texels: 0,
-  },
-  blur: 0.0,
-  clouds: $types.Clouds {
-    cover: 0.0,
-    drift: $types.Drift { x: 0.0, z: 0.0 },
-  },
-  hide_cursor: false,
-  loading: false,
-  show_captions: false,
-  retained_enabled: false,
-  retained_reset: false,
-  retained_after: 0,
-  state: #[],
-  draws: #[],
-  solids: #[],
-  decals: #[],
-  sounds: #[],
-  sprites: #[],
-  insets: #[],
-  preferences: #[],
-  fields: #[],
-  ui: #[],
-  services: #[],
-  buses: #[],
-  voices: #[],
-  poses: #[],
-  emitters: #[],
-  lights: #[],
-  listener: #[],
-  panners: #[],
-  instances: #[],
-  instance_removals: #[],
-}
-
-const header = func (schema: U32) => return {
+// Fixed render defaults for state `schema`; collections have separate owners.
+const header = func (schema: U32): types.RenderHeader => return {
   schema,
   save_requested: false,
   load_requested: false,

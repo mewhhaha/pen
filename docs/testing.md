@@ -96,6 +96,21 @@ arbitrary service mocks, custom per-test clocks, world-object locators or a
 trace viewer. State assertions already work through application-owned snapshot
 readers.
 
+## CPU example qualification
+
+After building `pen-codegen`, run the scaffold and Bounce without a GPU:
+
+```sh
+cargo build --release -p pen-codegen
+deno run --no-config --no-lock -A scripts/check-examples.ts
+```
+
+`BLOTC` and `PEN_CODEGEN` can select matching local candidates. The checker
+compiles both real entries and their existing numeric tests, requires ABI 8,
+and checks create/frame/rejected-presentation/snapshot/restore exchanges using
+copied numeric callbacks. The generated scaffold lives under `target/`; neither
+this check nor the compiler opens a desktop window.
+
 ## Reviewing golden images
 
 Every `pen test` run writes `.pen/visual/review.html` (or `--out DIR`'s): each
@@ -178,21 +193,23 @@ and checks that rewinds give the same packets are not fuzzed yet.
 ## The Rust and Blot codecs agree
 
 pen-codegen generates the Rust codecs (`encode_frame`, `decode_frame`) and the
-game's Blot ones (`decode_input`, `encode_render`) from `protocol/schema.json`.
+game's Blot codecs (`decode_input_into`, `encode_render_views`) from `protocol/schema.json`.
 A round trip through one side's encoder and decoder could not catch the two
 sides laying a field out differently, so the test compares values across
 languages through a canonical walk, also generated: every field in schema order,
 arrays as a count and their elements, options as a flag and the value, events as
 their tag and fields. Rust gets `canonical_input` and `canonical_render` (in
-`packets.rs`), Blot `canonical_input` and `render_from_canonical`
+`packets.rs`), Blot `canonical_input` and `render_packet_from_canonical`
 (`pen/protocol_canonical.blot`, which only tests import).
 
 `cargo test -p pen codec_round_trip` compiles a harness
 (`crates/pen/src/codec_round_trip.blot`) with the checkout's compiler, then for
 2000 seeded random frames each way checks that Rust's `encode_frame` read by the
-game's `decode_input` walks as Rust walks the frame, and that a random render
-frame built by the game from its walk, encoded by the game and decoded by Rust
-is the frame. A failure names the seed (`PEN_CODEC_SEED`, `PEN_CODEC_CASES` run
+game's `decode_input_into` walks as Rust walks the frame, and that the canonical
+render writer streams its walk into packet lanes which Rust decodes as the same
+frame. The writer uses named packet, child-draw and extra-lane pools, covering
+nested inset draws, optional payloads and retained instances without nested
+owning records. A failure names the seed (`PEN_CODEC_SEED`, `PEN_CODEC_CASES` run
 one alone), the lane and the field. Swapping two lanes in either side's encoder,
 decoder or walk fails it.
 

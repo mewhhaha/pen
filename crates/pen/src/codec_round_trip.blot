@@ -1,12 +1,15 @@
-// The game's side of pen's codec round trip (codec_round_trip.rs). It
-// imports only a checkout's generated bindings, so any checkout compiles it.
+// The game's side of Pen's exact cross-language packet properties.
 import * as canonical from "pen/protocol_canonical"
 import * as protocol from "pen/protocol"
-import * as protocol_render from "pen/protocol_render"
 
-// An input packet, decoded as the game decodes one, then walked.
-entry const input_round_trip = func (lanes: Array F32) => return canonical.canonical_input (protocol.decode_input lanes)
+entry const input_round_trip = func (lanes: Array F32) => return do:
+  let events: ResizeArray protocol.Event = #[]
+  let input = protocol.decode_input_into lanes events
+  return canonical.canonical_input input
 
-// A render frame's walk, read back into the record the game encodes, then
-// encoded as the game encodes one.
-entry const render_round_trip = func (lanes: Array F32) => return protocol_render.encode_render (canonical.render_from_canonical lanes)
+entry const render_round_trip = func (lanes: Array F32) => return do:
+  let output: ResizeArray F32 = #[]
+  let children: ResizeArray F32 = #[]
+  let extras: ResizeArray F32 = #[]
+  canonical.render_packet_from_canonical lanes output children extras
+  return @storage.freeze output

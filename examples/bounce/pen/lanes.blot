@@ -9,7 +9,7 @@ const require = func (condition: Bool) => return do:
     return ()
   return @panic "invalid Pen numeric packet"
 
-const finite = func (values: Array F32) => return require (array.all is_finite values)
+const finite = func values => return require (array.all is_finite values)
 
 const integer = func (value: F32) => return func (maximum: U32) => return do:
   let number = F32.to_u32 value

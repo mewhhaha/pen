@@ -16,8 +16,11 @@ Declare an application extension tag in `pen.json` (for example 42). In a
 development build, put one version-1 observation in that extension's `values`:
 UTF-8 JSON bytes, each represented exactly as one float32 lane. No reserved tag
 or game-specific Rust code is needed. `semantic::Observation::extension` is a
-Rust producer helper; Blot can use generated `types.Extension` and
-`protocol_render.encode_extensions` after encoding its frame.
+Rust producer helper. In Blot, declare a section with an integer `byte` field
+and call its generated `append_<section>` writer with the byte rows and a named
+numeric destination. Write the extension marker and total section count once
+after the render packet, then append each section
+([extension framing](extensions.md)).
 
 ```json
 {

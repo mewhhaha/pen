@@ -1,24 +1,28 @@
 entry const service = func (host: Array F32 -> Array F32 ! { Foreign }) : Unit ! { Foreign } => return do:
   let prepared = 0.0
-  let response = #[@f32.neg 4670546.0]
-  for 0 .. 0xFFFFFFFF:
-    use request <- host response
-    if @f32.eq (@array.get request 0) 0.0:
+  let response: ResizeArray F32 = #[@f32.neg 4670546.0]
+  for ever:
+    use request <- host (@storage.freeze (@storage.copy response))
+    if @f32.eq request[0] 0.0:
       return ()
-    if @f32.eq (@array.get request 0) 1.0:
-      if @u32.lt (@array.length request) 2:
+    if @f32.eq request[0] 1.0:
+      if @u32.lt request.length 2:
         return @panic "empty context"
-      prepared := @array.get request 1
-      response := #[1.0]
+      prepared := request[1]
+      @storage.truncate response 0
+      @storage.push response 1.0
     else:
-      if @f32.eq (@array.get request 1) (@f32.neg 1.0):
+      if @f32.eq request[1] (@f32.neg 1.0):
         return @panic "failed job"
-      if @f32.eq (@array.get request 1) (@f32.neg 2.0):
+      if @f32.eq request[1] (@f32.neg 2.0):
         return ()
-      if @f32.eq (@array.get request 1) (@f32.neg 3.0):
-        response := #[99.0]
+      if @f32.eq request[1] (@f32.neg 3.0):
+        @storage.truncate response 0
+        @storage.push response 99.0
       else:
-        response := #[2.0, @f32.add prepared (@array.get request 1)]
+        @storage.truncate response 0
+        @storage.push response 2.0
+        @storage.push response (@f32.add prepared request[1])
   return ()
 entry const bad_handshake = func (host: Array F32 -> Array F32 ! { Foreign }) : Unit ! { Foreign } => return do:
   use _ <- host #[0.0]

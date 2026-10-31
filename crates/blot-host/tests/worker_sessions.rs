@@ -18,6 +18,8 @@ fn module() -> GuestModule {
                 .arg("build")
                 .arg(root.join("tests/fixtures/worker_sessions.blot"))
                 .arg(&output)
+                .arg("--prelude")
+                .arg(root.join("../../../blot2/std/prelude.blot"))
                 .output()
                 .unwrap();
             assert!(

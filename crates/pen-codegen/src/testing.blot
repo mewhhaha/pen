@@ -4,13 +4,20 @@ import * as array from "std/array"
 import * as protocol from "./protocol"
 
 type Save is data = $Save { schema: U32, state: Array F32 }
-type Selector is data = $Selector { role: U32, name: Array U32 }
+type Selector is data = $Selector { role: U32, name: &[U32] }
 
-const button = func name => return $Selector { role: protocol.ui_role_button, name }
-const dialog = func name => return $Selector { role: protocol.ui_role_dialog, name }
-const named = func role -> name => return $Selector { role, name }
+const named = func role -> name => return $Selector { role, name: name.view 0 name.length }
+const button = func name => return named protocol.ui_role_button name
+const dialog = func name => return named protocol.ui_role_dialog name
 
-const text = func (value: Array U32) => return array.concat #[from value.length] (array.map U32.to_f32 value)
+// Read borrowed text before producing the copied numeric host packet.
+const text = func value => return do:
+  let length: U32 = value.length
+  let at: U32 -> U32 = value.at
+  let packet: GrowArray F32 = #[U32.to_f32 length]
+  for i in 0 .. length:
+    packet.push (U32.to_f32 (at i))
+  return @storage.freeze packet
 const call = func (driver: Array F32 -> Array F32 ! { Foreign }) -> op -> values => return
   driver (array.concat #[1.0, from op] values)
 
@@ -49,13 +56,19 @@ const snapshot = func driver => return do:
   use values <- call driver protocol.test_driver_op_snapshot #[]
   break $Save { schema: F32.to_u32 values[0], state: array.slice 1 (values.length - 1) values }
 
-const equal = func driver -> label -> (expected: Array F32) -> (actual: Array F32) => return do:
+const equal = func driver -> label -> expected -> actual => return do:
+  let expected_length: U32 = expected.length
+  let actual_length: U32 = actual.length
+  let expected_at: U32 -> F32 = expected.at
+  let actual_at: U32 -> F32 = actual.at
   let packet: GrowArray F32 = #[]
   array.append_into packet (text label)
-  packet.push (from expected.length)
-  array.append_into packet expected
-  packet.push (from actual.length)
-  array.append_into packet actual
+  packet.push (U32.to_f32 expected_length)
+  for i in 0 .. expected_length:
+    packet.push (expected_at i)
+  packet.push (U32.to_f32 actual_length)
+  for i in 0 .. actual_length:
+    packet.push (actual_at i)
   use call driver protocol.test_driver_op_equal (@storage.freeze packet)
   break ()
 

@@ -25,6 +25,10 @@ The generated `pen/test` module supplies the driver API. A scenario entry takes
 driver is only admitted in this test mode; games receive their usual frame
 capability.
 
+Selectors borrow their text until the driver call serializes it. Text and
+equality inputs accept read-only fixed, growing, resizable or borrowed
+collections; only copied numeric packets cross into the session host.
+
 ```blot
 import * as test from "pen/test"
 import * as fixtures from "test/scenario_fixtures"
@@ -106,9 +110,10 @@ deno run --no-config --no-lock -A scripts/check-examples.ts
 ```
 
 `BLOTC` and `PEN_CODEGEN` can select matching local candidates. The checker
-compiles both real entries and their existing numeric tests, requires ABI 8,
+compiles both real entries and every numeric test module, requires ABI 8,
 and checks create/frame/rejected-presentation/snapshot/restore exchanges using
-copied numeric callbacks. The generated scaffold lives under `target/`; neither
+copied numeric callbacks. It also checks borrowed diagnostic inputs and exact
+selector/equality packet lanes. The generated scaffold lives under `target/`; neither
 this check nor the compiler opens a desktop window.
 
 ## Reviewing golden images

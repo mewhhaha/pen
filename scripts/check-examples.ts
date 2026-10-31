@@ -28,26 +28,24 @@ const generated = await new Deno.Command(
 ).output();
 if (!generated.success) throw Error("scaffold code generation failed");
 const paths: Record<string, string> = {};
+const testPaths: string[] = [];
 for (
-  const [name, project, test] of [[
+  const [name, project] of [[
     "bounce",
     resolve(root, "examples/bounce"),
-    "bounce.blot",
-  ], ["new", scaffold, "game.blot"]]
+  ], ["new", scaffold]]
 ) {
-  for (const kind of ["tests", "main"]) {
+  const tests: string[] = [];
+  for await (const entry of Deno.readDir(resolve(project, "tests"))) {
+    if (entry.isFile && entry.name.endsWith(".blot")) tests.push(entry.name);
+  }
+  tests.sort();
+  for (const test of [...tests, null]) {
     const fixture = resolve(project, "src/test_fixture.blot");
-    if (kind === "tests") {
-      await Deno.writeTextFile(
-        fixture,
-        await Deno.readTextFile(resolve(project, "tests", test)),
-        { createNew: true },
-      );
-    }
     const compiler = await createZigProjectCompiler({
       executable: Deno.env.get("BLOTC") ??
         resolve(blot, "zig-native/zig-out-dev/bin/blotc"),
-      entry: kind === "tests" ? fixture : resolve(project, "src/main.blot"),
+      entry: test ? fixture : resolve(project, "src/main.blot"),
       prelude: resolve(blot, "std/prelude.blot"),
       stdRoot: resolve(blot, "std"),
       imports: { "pen/": resolve(project, "pen") + "/" },
@@ -55,18 +53,29 @@ for (
       cacheDirectory: false,
     });
     try {
-      const result = await compiler.build();
+      const result = await compiler.build(
+        test
+          ? {
+            sources: {
+              [fixture]: await Deno.readTextFile(
+                resolve(project, "tests", test),
+              ),
+            },
+          }
+          : undefined,
+      );
       if (!result.success) throw Error(JSON.stringify(result.diagnostics));
-      const path = resolve(work, name + "-" + kind + ".wasm");
+      const key = name + "-" + (test ? "tests-" + test : "main");
+      const path = resolve(work, key + ".wasm");
       await Deno.writeFile(path, result.bytes);
-      paths[name + "-" + kind] = path;
+      paths[key] = path;
+      if (test) testPaths.push(path);
     } finally {
       await compiler.dispose();
-      if (kind === "tests") await Deno.remove(fixture);
     }
   }
 }
-for (const path of [paths["bounce-tests"], paths["new-tests"]]) {
+for (const path of testPaths) {
   const guest = await instantiateGuest(await Deno.readFile(path));
   if (guest.abi.version !== 8) throw Error("wrong ABI " + guest.abi.version);
   let count = 0;
@@ -81,6 +90,36 @@ for (const path of [paths["bounce-tests"], paths["new-tests"]]) {
     count++;
   }
   if (!count) throw Error("no test exports");
+  if (
+    guest.abi.functions.some((fn) => fn.name === "exercise_readonly_session")
+  ) {
+    const packets: number[][] = [];
+    const host = guest.capability({
+      parameter: "Array F32",
+      result: "Array F32",
+      call: (packet: Float32Array) => {
+        packets.push([...packet]);
+        return new Float32Array();
+      },
+    });
+    guest.call("exercise_readonly_session", host);
+    const expected = [[1, 3, 3, 300, 2, 66, 67], [
+      1,
+      7,
+      1,
+      65,
+      2,
+      2,
+      3,
+      2,
+      2,
+      3,
+    ]];
+    if (JSON.stringify(packets) !== JSON.stringify(expected)) {
+      throw Error("readonly session packets " + JSON.stringify(packets));
+    }
+    console.log("readonly selector/equality: copied session packets passed");
+  }
   guest.dispose();
 }
 for (

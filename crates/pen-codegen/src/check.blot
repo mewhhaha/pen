@@ -2,25 +2,30 @@ import * as simd from "std/simd"
 
 // A fixed diagnostic row, safe inside Array Check. Every assertion compares
 // complete inputs; diagnostics retain only the first mismatch and both lengths.
+// Inputs are readonly collections: fixed, growing, resizable or borrowed.
 // lane is zero-based. An absent lane has value zero and is identified by length.
 type Check is data = $Check {
   passed: Bool, lane: U32, expected_length: U32, actual_length: U32,
   expected_low: F32, expected_high: F32, actual_low: F32, actual_high: F32,
 }
-const near = func (tolerance: F32) -> (expected: Array F32) -> (actual: Array F32) => return do:
-  let passed = expected.length == actual.length
-  let lane = min expected.length actual.length
+const near = func (tolerance: F32) -> expected -> actual => return do:
+  let expected_length: U32 = expected.length
+  let actual_length: U32 = actual.length
+  let expected_at: U32 -> F32 = expected.at
+  let actual_at: U32 -> F32 = actual.at
+  let passed = expected_length == actual_length
+  let lane = min expected_length actual_length
   let found = false
-  for i in 0 .. min expected.length actual.length:
-    let exact = expected[i] == actual[i]
-    if Bool.not (exact or abs (expected[i] - actual[i]) <= tolerance):
+  for i in 0 .. min expected_length actual_length:
+    let exact = (expected_at i) == (actual_at i)
+    if Bool.not (exact or abs ((expected_at i) - (actual_at i)) <= tolerance):
       passed := false
       if Bool.not found:
         lane := i
         found := true
-  return $Check {passed, lane, expected_length: expected.length, actual_length: actual.length,
-    expected_low: if lane < expected.length then expected[lane] else 0.0, expected_high: 0.0,
-    actual_low: if lane < actual.length then actual[lane] else 0.0, actual_high: 0.0}
+  return $Check {passed, lane, expected_length: expected_length, actual_length: actual_length,
+    expected_low: if lane < expected_length then (expected_at lane) else 0.0, expected_high: 0.0,
+    actual_low: if lane < actual_length then (actual_at lane) else 0.0, actual_high: 0.0}
 const equal = func expected -> actual => return near 0.0 expected actual
 const same = func tolerance -> expected -> actual => return (near tolerance expected actual).passed
 const holds = func (condition: Bool) => return $Check {
@@ -34,37 +39,45 @@ const within = func (low: F32) -> (high: F32) -> (value: F32) => return $Check {
 }
 // Unsigned lanes compare all 32 bits. Two exact 16-bit halves preserve a failed
 // identity in the F32 host report without rounding the original word.
-const words = func (expected: Array U32) -> (actual: Array U32) => return do:
-  let passed = expected.length == actual.length
-  let lane = min expected.length actual.length
+const words = func expected -> actual => return do:
+  let expected_length: U32 = expected.length
+  let actual_length: U32 = actual.length
+  let expected_at: U32 -> U32 = expected.at
+  let actual_at: U32 -> U32 = actual.at
+  let passed = expected_length == actual_length
+  let lane = min expected_length actual_length
   let found = false
-  for i in 0 .. min expected.length actual.length:
-    if expected[i] != actual[i]:
+  for i in 0 .. min expected_length actual_length:
+    if (expected_at i) != (actual_at i):
       passed := false
       if Bool.not found:
         lane := i
         found := true
-  let wanted = if lane < expected.length then expected[lane] else 0
-  let received = if lane < actual.length then actual[lane] else 0
-  return $Check {passed, lane, expected_length: expected.length, actual_length: actual.length,
+  let wanted = if lane < expected_length then (expected_at lane) else 0
+  let received = if lane < actual_length then (actual_at lane) else 0
+  return $Check {passed, lane, expected_length: expected_length, actual_length: actual_length,
     expected_low: U32.to_f32 (wanted & 65535), expected_high: U32.to_f32 (wanted >> 16),
     actual_low: U32.to_f32 (received & 65535), actual_high: U32.to_f32 (received >> 16)}
 const word = func (value: F32) => return do:
   let (bits, _, _, _) = simd.f32_bits (value, 0.0, 0.0, 0.0)
   return bits
-const bits = func (expected: Array F32) -> (actual: Array F32) => return do:
-  let passed = expected.length == actual.length
-  let lane = min expected.length actual.length
+const bits = func expected -> actual => return do:
+  let expected_length: U32 = expected.length
+  let actual_length: U32 = actual.length
+  let expected_at: U32 -> F32 = expected.at
+  let actual_at: U32 -> F32 = actual.at
+  let passed = expected_length == actual_length
+  let lane = min expected_length actual_length
   let found = false
-  for i in 0 .. min expected.length actual.length:
-    if word expected[i] != word actual[i]:
+  for i in 0 .. min expected_length actual_length:
+    if word (expected_at i) != word (actual_at i):
       passed := false
       if Bool.not found:
         lane := i
         found := true
-  let wanted = if lane < expected.length then word expected[lane] else 0
-  let received = if lane < actual.length then word actual[lane] else 0
-  return $Check {passed, lane, expected_length: expected.length, actual_length: actual.length,
+  let wanted = if lane < expected_length then word (expected_at lane) else 0
+  let received = if lane < actual_length then word (actual_at lane) else 0
+  return $Check {passed, lane, expected_length: expected_length, actual_length: actual_length,
     expected_low: U32.to_f32 (wanted & 65535), expected_high: U32.to_f32 (wanted >> 16),
     actual_low: U32.to_f32 (received & 65535), actual_high: U32.to_f32 (received >> 16)}
 // Pen's standard numeric protocol: check count, failure count, then position,

@@ -6,8 +6,9 @@
 - The owner requests continuous checkpoints to `main`: commit and push coherent,
   checked batches as work progresses. Verify each push and report failures.
 - Read `CONTINUE.md` and `../blot2/CONTINUE.md` first. The owned-storage rewrite
-  is unfinished; first obtain one real Gdev frame through the native host.
-  Historical tests and old installed binaries do not qualify this candidate.
+  is unfinished; one real Gdev frame now passes through the native host with an
+  inspected PNG. Continue remaining host/fixture qualification. Preserve exact
+  candidate identities; old installed binaries do not qualify later changes.
 - Use the existing sibling Blot, Ink and Gdev checkouts. Build the matching
   compiler, native host and compiler plugin with the pinned Rust toolchain.
   `just install` also builds browser/player/Steam packaging; it is optional for

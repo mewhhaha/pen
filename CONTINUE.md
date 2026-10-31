@@ -2,16 +2,14 @@
 
 ## Status at handoff
 
-The immediate milestone remains **one real Gdev frame in Pen**. No real Gdev
-Wasm module or frame has completed during this migration. Compiler and source
-integration now includes machine helper extraction: the real update stage passes
-both V8 and this host's Wasmtime validator within existing limits. The latest native
-attempt stopped in a generic integer-to-F32 packet conversion. The generator
-now emits explicit `U32.to_f32` for the remaining schema/count/tag/integer lanes;
-all ten generator tests, Rust formatting, regeneration and native
-`pen codegen --check` pass. Rust packet output is unchanged. Resume from
-[Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier).
-Stage validation, small guests and Rust builds do not establish a working game.
+One real Gdev main frame now passes through native Pen. The 2026-10-31 run
+completed all runner checks and an inspected 640×480 PNG of the game's startup
+letter board. See [the exact candidate and screenshot](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json)
+and [Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier).
+The full module validates in V8 and this host's Wasmtime within existing limits.
+Broader gameplay, host/browser recovery and release qualification remain pending.
+Generated integer conversions, all ten generator tests, Rust formatting and
+native binding freshness passed; packet layout and Rust output are unchanged.
 
 Keep the sibling `../blot2`, `../ink` and `../gdev` checkouts at the
 corresponding handoff commits. Read their `CONTINUE.md` files and Blot's

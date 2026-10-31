@@ -397,10 +397,10 @@ fn render_direct(model: &Model) -> Vec<String> {
         let lane = &field.field;
         let values = match kind(lane) {
             "magic" => vec!["protocol.packet_magic".to_owned()],
-            "schema" => vec!["from packet.schema".to_owned()],
+            "schema" => vec!["U32.to_f32 packet.schema".to_owned()],
             "size" => {
                 let section = s(&lane["section"]);
-                vec![format!("from {}", if lane["of"] == "lanes" { &lengths[section] } else { &counts[section] })]
+                vec![format!("U32.to_f32 {}", if lane["of"] == "lanes" { &lengths[section] } else { &counts[section] })]
             }
             _ => {
                 let prefix = entry.group.as_ref().map_or(String::new(), |group| format!("{group}."));
@@ -438,7 +438,7 @@ fn render_direct(model: &Model) -> Vec<String> {
                                 "optional" => {
                                     vec!["present".into(), "p0".into(), "p1".into(), "p2".into(), "p3".into()]
                                 }
-                                "tail" => vec!["from (extra.length / 4)".into()],
+                                "tail" => vec!["U32.to_f32 (extra.length / 4)".into()],
                                 _ => unreachable!(),
                             };
                             for (lane, value) in values.iter().enumerate() {
@@ -458,7 +458,7 @@ fn render_direct(model: &Model) -> Vec<String> {
                     direct_fields(out, &entry.head, variable, indent);
                     if let Some(layout) = &entry.item {
                         out.push(format!(
-                            "{indent}encoded[at + {}] := from {variable}.{rest_name}.length",
+                            "{indent}encoded[at + {}] := U32.to_f32 {variable}.{rest_name}.length",
                             entry.head_lanes - 1
                         ));
                         out.push(format!("{indent}at := self + {}", entry.head_lanes));
@@ -676,7 +676,7 @@ fn render(model: &Model) -> Vec<String> {
                     lane += 1;
                 }
             }
-            lines.push(format!("encoded[{lane}] := from {rest_name}.length"));
+            lines.push(format!("encoded[{lane}] := U32.to_f32 {rest_name}.length"));
             let mut writes = Vec::new();
             let mut offset = 0;
             for laid in &item.fields {
@@ -765,10 +765,10 @@ fn render(model: &Model) -> Vec<String> {
         out.push("    return #[]".to_owned());
         out.push(format!("  use lanes.require (extensions.length <= {})", bound_blot(&extensions["max"])));
         out.extend([
-            "  let output: GrowArray F32 = #[protocol.extensions_marker, from extensions.length]".to_owned(),
+            "  let output: GrowArray F32 = #[protocol.extensions_marker, U32.to_f32 extensions.length]".to_owned(),
             "  for extension in extensions:".to_owned(),
-            "    output.push (from extension.tag)".to_owned(),
-            "    output.push (from extension.values.length)".to_owned(),
+            "    output.push (U32.to_f32 extension.tag)".to_owned(),
+            "    output.push (U32.to_f32 extension.values.length)".to_owned(),
             "    array.append_into output extension.values".to_owned(),
             "  return @storage.freeze output".to_owned(),
         ]);

@@ -5,11 +5,13 @@
 The immediate milestone remains **one real Gdev frame in Pen**. No real Gdev
 Wasm module or frame has completed during this migration. Compiler and source
 integration now includes machine helper extraction: the real update stage passes
-both V8 and this host's Wasmtime validator within existing limits. A full native
-headless attempt is running. Resume it from
-[Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier) before
-starting another compile. Stage validation, small guests and Rust builds do not
-establish a working game.
+both V8 and this host's Wasmtime validator within existing limits. The latest native
+attempt stopped in a generic integer-to-F32 packet conversion. The generator
+now emits explicit `U32.to_f32` for the remaining schema/count/tag/integer lanes;
+all ten generator tests, Rust formatting, regeneration and native
+`pen codegen --check` pass. Rust packet output is unchanged. Resume from
+[Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier).
+Stage validation, small guests and Rust builds do not establish a working game.
 
 Keep the sibling `../blot2`, `../ink` and `../gdev` checkouts at the
 corresponding handoff commits. Read their `CONTINUE.md` files and Blot's

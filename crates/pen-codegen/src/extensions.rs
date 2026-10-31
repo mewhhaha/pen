@@ -366,7 +366,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             .iter()
             .map(|(field, kind)| match kind {
                 FieldKind::F32 => format!("record.{field}"),
-                FieldKind::Integer => format!("from record.{field}"),
+                FieldKind::Integer => format!("U32.to_f32 record.{field}"),
                 FieldKind::Flag => format!("lanes.bit record.{field}"),
             })
             .collect::<Vec<_>>()
@@ -467,7 +467,7 @@ mod tests {
             "    1 => do:\n      use lanes.require (lanes_after[2] == 0.0)\n      return $Kick { x: lanes_after[0], z: lanes_after[1] }",
             "return $Hire { count: lanes.integer lanes_after[0] lanes.max_integer, skilled: lanes.integer lanes_after[1] 1 == 1, pay: lanes_after[2] }",
             "type Score is data = $Score { points: U32, multiplier: F32, over: Bool }",
-            "  values: #[lane | record <- records, lane <- #[from record.points, record.multiplier, lanes.bit record.over]],",
+            "  values: #[lane | record <- records, lane <- #[U32.to_f32 record.points, record.multiplier, lanes.bit record.over]],",
         ] {
             assert!(source.contains(expected), "missing {expected:?} in\n{source}");
         }

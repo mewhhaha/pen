@@ -5,9 +5,10 @@ renderer, audio, services, compiler plugins and development tools. Game logic
 lives in applications such as [Gdev](../gdev/README.md); reusable game systems
 live in [Ink](../ink/README.md).
 
-The owned-storage integration is **unfinished**. First compile real Gdev and
-render one headless frame with the matching sibling Blot compiler and Pen host.
-Read [CONTINUE.md](CONTINUE.md) and [AGENTS.md](AGENTS.md) before resuming.
+The owned-storage integration is **unfinished**. One real Gdev main frame has
+passed native Pen with an inspected screenshot. Recheck later compiler/library
+changes and continue fixture/browser/recovery qualification. Read
+[CONTINUE.md](CONTINUE.md) and [AGENTS.md](AGENTS.md) for exact evidence.
 
 This is a greenfield project. Breaking changes are welcome; remove superseded
 implementations and APIs rather than maintaining legacy compatibility.

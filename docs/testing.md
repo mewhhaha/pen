@@ -206,8 +206,10 @@ their tag and fields. Rust gets `canonical_input` and `canonical_render` (in
 (`crates/pen/src/codec_round_trip.blot`) with the checkout's compiler, then for
 2000 seeded random frames each way checks that Rust's `encode_frame` read by the
 game's `decode_input_into` walks as Rust walks the frame, and that the canonical
-render writer streams its walk into packet lanes which Rust decodes as the same
-frame. The writer uses named packet, child-draw and extra-lane pools, covering
+render writer streams its walk into packet lanes. A test-only flat packet
+projection bridge passes the same values through production `encode_render_views`;
+the two packets must agree to the bit, and Rust decodes the production packet
+as the same frame. The writer uses named packet, child-draw and extra-lane pools, covering
 nested inset draws, optional payloads and retained instances without nested
 owning records. A failure names the seed (`PEN_CODEC_SEED`, `PEN_CODEC_CASES` run
 one alone), the lane and the field. Swapping two lanes in either side's encoder,

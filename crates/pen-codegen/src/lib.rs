@@ -1,4 +1,5 @@
 mod blot;
+mod bridge;
 mod canonical;
 mod diagnostic;
 pub mod extensions;

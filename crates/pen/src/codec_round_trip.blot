@@ -1,15 +1,25 @@
 // The game's side of Pen's exact cross-language packet properties.
 import * as canonical from "pen/protocol_canonical"
 import * as protocol from "pen/protocol"
+import * as views from "pen/protocol_views_test"
 
 entry const input_round_trip = func (lanes: Array F32) => return do:
   let events: ResizeArray protocol.Event = #[]
   let input = protocol.decode_input_into lanes events
   return canonical.canonical_input input
 
-entry const render_round_trip = func (lanes: Array F32) => return do:
+const render_packet = func (lanes: Array F32) => return do:
   let output: ResizeArray F32 = #[]
   let children: ResizeArray F32 = #[]
   let extras: ResizeArray F32 = #[]
   canonical.render_packet_from_canonical lanes output children extras
   return @storage.freeze output
+
+entry const render_stream_round_trip = func lanes => return render_packet lanes
+
+// The same canonical inputs also pass through the actual production encoder.
+entry const render_round_trip = func lanes => return do:
+  let packet = render_packet lanes
+  let destination: ResizeArray F32 = #[]
+  views.reencode_views packet destination
+  return @storage.freeze destination

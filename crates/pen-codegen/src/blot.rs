@@ -940,6 +940,7 @@ import * as types from "./types""#
     wire_types.extend(types(model));
     wire_types.push(String::new());
     let canonical = crate::canonical::blot(model, &top);
+    let bridge = crate::bridge::emit(model, &top);
     let program = crate::program::program(&top);
     let frame = crate::program::frame(model, &top);
     let check = crate::program::check(&top);
@@ -953,6 +954,7 @@ import * as types from "./types""#
         ("types.blot", wire_types.join("\n")),
         ("lanes.blot", numeric.join("\n")),
         ("protocol_canonical.blot", canonical),
+        ("protocol_views_test.blot", bridge),
         ("program.blot", program),
         ("frame.blot", frame),
         ("check.blot", check),

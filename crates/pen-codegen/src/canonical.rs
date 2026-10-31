@@ -3,7 +3,7 @@
 //! Rust and the Blot codecs make of the same values (pen's
 //! `codec_round_trip`). Rust gets `canonical_input` and `canonical_render`
 //! beside the codecs; the game's `pen/protocol_canonical.blot`, which only
-//! tests import, gets the same input walk and the render walk's inverse.
+//! tests import, gets the same input walk and a flat render packet writer.
 //!
 //! The walk of a value, by its kind:
 //!
@@ -527,7 +527,7 @@ fn render_stream(model: &Model) -> Vec<String> {
 }
 
 /// The game's `pen/protocol_canonical.blot`: the input walk, and the render
-/// walk read back into the record the game encodes.
+/// walk streamed into independently named packet, child-draw and extra pools.
 pub fn blot(model: &Model, top: &[String]) -> String {
     let mut out = top.to_vec();
     out.extend([

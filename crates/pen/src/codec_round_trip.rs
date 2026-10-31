@@ -10,7 +10,9 @@
 //!   walk of the frame (`canonical_input`);
 //! - render: Rust walks a random frame (`canonical_render`), Blot reads the
 //!   walk directly into named packet, child-draw and extra-lane pools
-//!   (`render_packet_from_canonical`), and Rust decodes that packet
+//!   (`render_packet_from_canonical`), then projects those flat lanes through
+//!   the actual production `encode_render_views`. Both packets must agree to
+//!   the bit, and Rust decodes the production packet
 //!   (`decode_frame`) into the frame it walked, to the bit.
 //!
 //! The Blot side (codec_round_trip.blot) compiles through the sibling
@@ -110,6 +112,14 @@ fn render_packets_mean_the_same_to_rust_and_blot() {
             let packet = call(guest, "render_round_trip", walk.clone()).unwrap_or_else(|error| {
                 failed(format!("the game's canonical packet writer failed: {error:#}\n{frame:#?}"))
             });
+            let streamed = call(guest, "render_stream_round_trip", walk.clone())
+                .unwrap_or_else(|error| failed(format!("the canonical stream writer failed: {error:#}\n{frame:#?}")));
+            if let Some(lane) = first_difference(&streamed, &packet) {
+                failed(format!(
+                    "production encode_render_views differs from the canonical stream at lane {lane}:\n{}",
+                    around(("stream", &streamed), ("production", &packet), lane)
+                ));
+            }
             let decoded = decode_frame(&packet, schema, &catalog).unwrap_or_else(|error| {
                 failed(format!("pen-protocol refused the game's packet: {error:#}\n{catalog:?}\n{frame:#?}"))
             });

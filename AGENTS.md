@@ -5,10 +5,12 @@
   behavior.
 - The owner requests continuous checkpoints to `main`: commit and push coherent,
   checked batches as work progresses. Verify each push and report failures.
-- Read `CONTINUE.md` and `../blot2/CONTINUE.md` first. The owned-storage rewrite
-  is unfinished; one real Gdev frame now passes through the native host with an
-  inspected PNG. Continue remaining host/fixture qualification. Preserve exact
-  candidate identities; old installed binaries do not qualify later changes.
+- Active source/generator migration is checkpointed, and the current reviewed
+  compiler and host pass one real Gdev frame with an inspected PNG. Use
+  `CONTINUE.md` for exact identities and remaining original-export/backend
+  qualification; source inventory success is not whole-runtime qualification.
+- Read `CONTINUE.md` and `../blot2/CONTINUE.md` first. Preserve exact candidate
+  identities; installed binaries qualify only the revisions actually tested.
 - Use the existing sibling Blot, Ink and Gdev checkouts. Build the matching
   compiler, native host and compiler plugin with the pinned Rust toolchain.
   `just install` also builds browser/player/Steam packaging; it is optional for

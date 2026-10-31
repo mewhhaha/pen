@@ -8,10 +8,13 @@ remove superseded APIs and implementations rather than keeping compatibility
 paths. Commit coherent checked batches continuously to `main` and verify remote
 hashes. Environment publication requires a separate explicit request.
 
-One actual Gdev main frame passed native Pen with an inspected 640×480 PNG.
-[The exact record](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json)
-qualifies its historical candidate. Current compiler/library changes require a
-fresh frame. Broader gameplay, browser, recovery and release gates remain open.
+Actual Gdev main passes one native frame with the current reviewed compiler and
+rebuilt host. All six checks pass; the inspected 640×480 PNG and guest trace
+match the original frame byte for byte. The
+[current exact result](../blot2/tasks/storage-handoff-evidence/2026-10-31-migrated-frame.json)
+records compiler/host/Wasm/source identities and the Mesa driver. Broader
+gameplay, browser, recovery and release gates remain open. Recheck actual
+integration after semantic changes.
 
 The generator now emits borrowed frame/header records, known projections and
 named packet writers. Owning RenderFrame/Extension compatibility wrappers are

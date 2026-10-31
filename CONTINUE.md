@@ -4,12 +4,14 @@
 
 One real Gdev main frame now passes through native Pen. The 2026-10-31 run
 completed all runner checks and an inspected 640×480 PNG of the game's startup
-letter board. See [the exact candidate and screenshot](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json)
+letter board. See
+[the exact candidate and screenshot](../blot2/tasks/storage-handoff-evidence/2026-10-31-first-frame.json)
 and [Blot's shared continuation](../blot2/CONTINUE.md#current-cloud-frontier).
 The full module validates in V8 and this host's Wasmtime within existing limits.
-Broader gameplay, host/browser recovery and release qualification remain pending.
-Generated integer conversions, all ten generator tests, Rust formatting and
-native binding freshness passed; packet layout and Rust output are unchanged.
+Broader gameplay, host/browser recovery and release qualification remain
+pending. Generated integer conversions, all ten generator tests, Rust formatting
+and native binding freshness passed; packet layout and Rust output are
+unchanged.
 
 Keep the sibling `../blot2`, `../ink` and `../gdev` checkouts at the
 corresponding handoff commits. Read their `CONTINUE.md` files and Blot's
@@ -17,6 +19,18 @@ corresponding handoff commits. Read their `CONTINUE.md` files and Blot's
 checked commits and pushes to `main` across all four repositories. Verify push
 success; a local commit is not a remote checkpoint. Preserve all existing
 render, assets and runtime work.
+
+## Current fixture migration
+
+The checked generator retires owning RenderFrame/Extension wrappers in favor of
+borrowed records and named packet destinations. Bounce and new-game scaffolds
+run eight original game tests with eleven assertions; owned-storage and copied
+worker-session fixtures pass. Plugins pass nineteen unit and nine compiler
+integration checks. Canonical stream properties cover 2,000 input and 2,000
+render frames; a separate production-encoder bridge is being qualified to retain
+the original `encode_render_views` coverage. Sibling bindings must be
+regenerated whenever the generator changes. GPU/browser/full-host gates remain
+separate from these CPU results.
 
 ## Contracts to preserve
 

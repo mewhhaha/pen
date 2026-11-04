@@ -1,4 +1,4 @@
-// ../blot2/compiler/cleanup_data.ts
+// ../blot2/host/cleanup_data.ts
 var keys = "id,tag,floating,reference,child,row_words,leaf_words,children,fields,variants,name";
 var tags = /* @__PURE__ */ new Set([
   "unit",
@@ -82,10 +82,15 @@ function readDataSchemas(module) {
     if (node.tag === "record") {
       children = node.fields.map((field) => field.child);
     } else if (node.tag === "product") children = node.children;
-    else if (node.tag === "nominal" && node.variants.length === 1) {
-      children = [
-        node.variants[0].child
-      ];
+    else if (node.tag === "nominal" && node.variants.length <= 4) {
+      let words2 = 0;
+      for (const variant of node.variants) {
+        words2 = Math.max(words2, packedWords(variant.child, active, depth + 1));
+      }
+      if (node.variants.length > 1) words2++;
+      active.delete(id);
+      if (words2 > 16) fail();
+      return words2;
     } else fail();
     if (children.length === 0 || children.length > 16) fail();
     let words = 0;
@@ -219,6 +224,27 @@ function copyData(memory, nodes, root, word) {
     }
     return copy(node.id, load(address), depth);
   }
+  function packedWidth(id, active2, depth) {
+    if (depth >= 16 || active2.has(id)) fail();
+    const node = nodes.get(id);
+    if (!node.reference) return 1;
+    active2.add(id);
+    let words = 0;
+    if (node.tag === "nominal") {
+      for (const variant of node.variants) {
+        words = Math.max(words, packedWidth(variant.child, active2, depth + 1));
+      }
+      if (node.variants.length > 1) words++;
+    } else {
+      const children = node.tag === "record" ? node.fields.map((field) => field.child) : node.children;
+      for (const child of children) {
+        words += packedWidth(child, active2, depth + 1);
+      }
+    }
+    active2.delete(id);
+    if (words === 0 || words > 16) fail();
+    return words;
+  }
   function packed(node, position, depth) {
     if (--budget < 0 || depth >= 128) {
       throw new Error("Cleanup data copy limit");
@@ -229,11 +255,32 @@ function copyData(memory, nodes, root, word) {
       return value;
     }
     if (node.tag === "nominal") {
-      const variant = node.variants[0];
+      const start = position.address;
+      let variant = node.variants[0];
+      let end;
+      if (node.variants.length > 1) {
+        const tag = load(position.address);
+        position.address += 4;
+        const selected = node.variants.find((item) => item.tag === tag);
+        if (!selected) {
+          throw new Error("Cleanup packed constructor differs from its schema");
+        }
+        variant = selected;
+        end = start + packedWidth(node.id, /* @__PURE__ */ new Set(), 0) * 4;
+      }
+      const value = packed(nodes.get(variant.child), position, depth + 1);
+      if (end !== void 0) {
+        while (position.address < end) {
+          if (load(position.address) !== 0) {
+            throw new Error("Cleanup packed padding is not canonical");
+          }
+          position.address += 4;
+        }
+      }
       return Object.freeze({
         family: node.name,
         tag: variant.tag,
-        value: packed(nodes.get(variant.child), position, depth + 1)
+        value
       });
     }
     if (node.tag === "record") {
@@ -368,7 +415,7 @@ function copyData(memory, nodes, root, word) {
   return copy(root, word, 0);
 }
 
-// ../blot2/compiler/resource_journal.ts
+// ../blot2/host/resource_journal.ts
 var ResourceTokens = class {
   #next = 1;
   #live = 0;
@@ -641,7 +688,7 @@ var ResourceJournal = class {
   }
 };
 
-// ../blot2/compiler/task_runtime.ts
+// ../blot2/host/task_runtime.ts
 var TaskError = class extends Error {
   code;
   constructor(code, message) {
@@ -1158,7 +1205,7 @@ var TaskRuntime = class {
   }
 };
 
-// ../blot2/compiler/task_guest.ts
+// ../blot2/host/task_guest.ts
 var taskImports = [
   [
     "open",
@@ -1788,7 +1835,7 @@ var TaskGuest = class {
   }
 };
 
-// ../blot2/compiler/guest.ts
+// ../blot2/host/guest.ts
 var littleEndian = new Uint8Array(new Uint32Array([
   1
 ]).buffer)[0] === 1;
@@ -1983,9 +2030,10 @@ function readGuestAbi(module) {
   }
   const reader = new AbiReader(new Uint8Array(sections[0]));
   const version = reader.count();
-  if (version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7) {
+  if (version !== 2 && version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== 8) {
     throw new GuestError("invalid_abi", `Unsupported guest ABI version ${version}`);
   }
+  const countedOwnership = version >= 3 && version <= 7;
   reader.owners = version === 6;
   reader.structured = version === 7;
   let publicOwners = reader.owners;
@@ -2010,7 +2058,7 @@ function readGuestAbi(module) {
     }
     exports.set(name, kind);
   };
-  if (version >= 3) {
+  if (countedOwnership) {
     declare("blot:ownership_enter", "function");
     declare("blot:ownership_leave", "function");
     declare("blot:rc_roots", "global");
@@ -2022,7 +2070,7 @@ function readGuestAbi(module) {
   }
   if (taskSections.length === 1) {
     const feature = new AbiReader(new Uint8Array(taskSections[0]));
-    if (version < 3 || feature.byte() !== 2) {
+    if (!countedOwnership || feature.byte() !== 2) {
       throw new GuestError("invalid_abi", "Unsupported task ownership contract");
     }
     reader.tasks = true;
@@ -2034,14 +2082,14 @@ function readGuestAbi(module) {
     for (const name of taskExports(taskCount)) declare(name, "function");
   }
   let resources = 0;
-  if (version >= 4) {
+  if (version >= 4 && version <= 7) {
     resources = reader.count();
     if (resources === 0 && version < 6 || resources > 4096) {
       throw new GuestError("invalid_abi", "Invalid resource adapter count");
     }
   }
   let transfer = version === 5;
-  if (version >= 6) {
+  if (version === 6 || version === 7) {
     const flags = reader.byte();
     let limit = 1;
     if (version === 7) limit = 3;
@@ -2061,6 +2109,9 @@ function readGuestAbi(module) {
     const name = reader.name();
     declare(name, "function");
     const parameter = reader.parameter();
+    if (version === 8 && typeof parameter !== "string" && (parameter.kind !== "callback" || parameter.concurrent || parameter.lifetime !== void 0 || parameter.dataSchema !== void 0)) {
+      throw new GuestError("invalid_abi", "Data-stack ABI accepts only Foreign callbacks");
+    }
     if (typeof parameter !== "string" && parameter.kind !== "owner") {
       signatures.add(importKey(parameter));
       if (parameter.lifetime === "owned") {
@@ -2141,7 +2192,7 @@ function readGuestAbi(module) {
     declare("blot:allocate", "function");
     declare("blot:reset", "function");
   }
-  if (version >= 3 && (signatures.size !== 0 || taskCount !== void 0)) {
+  if (countedOwnership && (signatures.size !== 0 || taskCount !== void 0)) {
     declare("blot:rc_host_refs", "global");
   }
   if (resources !== 0) {
@@ -2171,12 +2222,15 @@ function readGuestAbi(module) {
   }
   const actualExports = WebAssembly.Module.exports(module);
   const ownership = WebAssembly.Module.customSections(module, "blot:ownership");
+  if (version === 8 && ownership.length !== 0) {
+    throw new GuestError("invalid_abi", "Data-stack ABI cannot declare counted ownership");
+  }
   if (ownership.length > 1) {
     throw new GuestError("invalid_abi", "Duplicate ownership section");
   }
   if (ownership.length === 1) {
     const state = new Uint8Array(ownership[0]);
-    if (state.length !== 3 || state[0] !== 1 && state[0] !== 2 || state[1] > state[0] || state[2] > 7 || state[1] !== 0 !== (state[2] === 0) || version >= 3 !== (state[0] === 2 && state[1] === 2)) throw new GuestError("invalid_abi", "Invalid ownership section");
+    if (state.length !== 3 || state[0] !== 1 && state[0] !== 2 || state[1] > state[0] || state[2] > 7 || state[1] !== 0 !== (state[2] === 0) || countedOwnership !== (state[0] === 2 && state[1] === 2)) throw new GuestError("invalid_abi", "Invalid ownership section");
     if (state[2] !== 1) {
       if (actualExports.some((entry) => entry.name === "blot:allocation")) {
         declare("blot:allocation", "function");
@@ -2209,8 +2263,21 @@ function readGuestAbi(module) {
       declare(`blot:cycle_${counter}`, "global");
     }
   }
-  if (version >= 3 && ownership.length !== 1) {
+  if (countedOwnership && ownership.length !== 1) {
     throw new GuestError("invalid_abi", "Missing root ownership section");
+  }
+  const memoryProfile = WebAssembly.Module.customSections(module, "blot:memory-profile");
+  if (version === 8 && memoryProfile.length !== 0) {
+    throw new GuestError("invalid_abi", "Data-stack ABI cannot declare a counted memory profile");
+  }
+  if (memoryProfile.length > 1) {
+    throw new GuestError("invalid_abi", "Duplicate memory profile section");
+  }
+  if (memoryProfile.length === 1) {
+    for (let word = 0; word < 8; word++) {
+      declare(`blot:profile_identity_${word}`, "global");
+    }
+    if (!exports.has("blot:memory")) declare("blot:memory", "memory");
   }
   if (actualExports.length !== exports.size || actualExports.some((entry) => exports.get(entry.name) !== entry.kind)) {
     throw new GuestError("invalid_abi", "Wasm exports differ from blot:abi");
@@ -2248,7 +2315,7 @@ function readGuestAbi(module) {
       resourceAdapterCount: resources
     });
   }
-  if (version >= 6) {
+  if (version === 6 || version === 7) {
     Object.assign(result, {
       resourceTransfer: transfer,
       publicOwners
@@ -2942,7 +3009,7 @@ async function instantiateGuest(bytes, options = {}) {
     resources = rootResources;
   }
   let ownership;
-  if (abi.version >= 3) {
+  if (abi.version >= 3 && abi.version <= 7) {
     const enter = instance.exports["blot:ownership_enter"];
     const leave = instance.exports["blot:ownership_leave"];
     if (typeof enter !== "function" || typeof leave !== "function") {
@@ -3015,7 +3082,8 @@ async function instantiateGuest(bytes, options = {}) {
   const memory = instance.exports["blot:memory"];
   const allocate = instance.exports["blot:allocate"];
   const reset = instance.exports["blot:reset"];
-  if (memory !== void 0 && (allocate !== void 0 || reset !== void 0 || abi.taskDescriptorCount === void 0)) {
+  const profiling = WebAssembly.Module.customSections(module, "blot:memory-profile").length === 1;
+  if (memory !== void 0 && (allocate !== void 0 || reset !== void 0 || abi.taskDescriptorCount === void 0 && !profiling)) {
     if (!(memory instanceof WebAssembly.Memory) || typeof allocate !== "function" || typeof reset !== "function") {
       throw new GuestError("invalid_abi", "Missing array arena exports");
     }

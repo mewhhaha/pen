@@ -2,8 +2,8 @@
 // Build pen-codegen first. BLOTC and PEN_CODEGEN may select matching candidates.
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createZigProjectCompiler } from "../../blot2/compiler/zig_project_client.ts";
-import { instantiateGuest } from "../../blot2/compiler/guest.ts";
+import { createZigProjectCompiler } from "../../blot2/host/zig_project_client.ts";
+import { instantiateGuest } from "../../blot2/host/guest.ts";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const blot = resolve(root, "../blot2");
 await Deno.mkdir(resolve(root, "target"), { recursive: true });
@@ -44,7 +44,7 @@ for (
     const fixture = resolve(project, "src/test_fixture.blot");
     const compiler = await createZigProjectCompiler({
       executable: Deno.env.get("BLOTC") ??
-        resolve(blot, "zig-native/zig-out-dev/bin/blotc"),
+        resolve(blot, "compiler/zig-out-dev/bin/blotc"),
       entry: test ? fixture : resolve(project, "src/main.blot"),
       prelude: resolve(blot, "std/prelude.blot"),
       stdRoot: resolve(blot, "std"),

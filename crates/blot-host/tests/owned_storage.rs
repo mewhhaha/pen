@@ -15,7 +15,7 @@ fn compile_fixture() -> Result<Vec<u8>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let compiler = std::env::var_os("BLOTC")
         .map(PathBuf::from)
-        .unwrap_or_else(|| root.join("../../../blot2/zig-native/zig-out-dev/bin/blotc"));
+        .unwrap_or_else(|| root.join("../../../blot2/compiler/zig-out-dev/bin/blotc"));
     let output = root.join("../../target/owned-storage.wasm");
     let result = Command::new(compiler)
         .args(["build"])

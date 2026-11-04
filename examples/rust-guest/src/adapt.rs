@@ -1,4 +1,4 @@
-//! Gives a module the guest ABI's shape (blot2's `compiler/guest-abi.md`)
+//! Gives a module the guest ABI's shape (blot2's `docs/host/guest-abi.md`)
 //! when its language cannot name `externref`, as Rust cannot: what a game's
 //! `main` takes is the host as an opaque reference.
 //!

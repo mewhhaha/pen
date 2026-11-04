@@ -1,6 +1,6 @@
 //! pen's Blot compiler plugin: a component of wit/pen-plugin.wit's
 //! `compiler-plugin` world that compiles a program with the Blot compiler,
-//! `blotc serve-project` (blot2's `zig-native/PROJECT_PROTOCOL.md`). Each
+//! `blotc serve-project` (blot2's `docs/compiler/PROJECT_PROTOCOL.md`). Each
 //! session is one compiler process, which keeps the program open between
 //! builds and reuses what did not change; a protocol failure kills it, and
 //! pen opens a new session. It also lays out the checkout's Blot tests for

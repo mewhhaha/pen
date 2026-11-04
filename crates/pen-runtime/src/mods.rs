@@ -2,7 +2,7 @@
 //! of its own and with only the capabilities its manifest asks for
 //! (docs/mods.md). A mod is a directory holding `mod.json`, its manifest,
 //! and `mod.wasm`, a module of the guest ABI (blot2's
-//! `compiler/guest-abi.md`) exporting `frame: Array F32 -> Array F32` and
+//! `docs/host/guest-abi.md`) exporting `frame: Array F32 -> Array F32` and
 //! importing nothing: it reaches nothing but what each call hands it.
 //!
 //! Each frame the player plays live, the host calls every mod with the

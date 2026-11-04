@@ -1,6 +1,6 @@
 // Source of structured.js. Rebuild with scripts/bundle-structured.ts.
 // The adapter retains one serial Foreign invocation; all numeric crossings copy.
-import { instantiateGuest } from "../../../blot2/compiler/guest.ts";
+import { instantiateGuest } from "../../../blot2/host/guest.ts";
 
 const signature = { parameter: "Array F32", result: "Array F32" } as const;
 

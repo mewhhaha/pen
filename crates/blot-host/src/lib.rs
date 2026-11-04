@@ -1,5 +1,5 @@
 //! Runs Blot guest programs on wasmtime, following Blot's guest ABI 2
-//! (`blot2/compiler/guest-abi.md`): scalars and copied numeric arrays cross
+//! (`blot2/docs/host/guest-abi.md`): scalars and copied numeric arrays cross
 //! the boundary, and an entrypoint may take one host callback.
 //!
 //! The JavaScript adapter needs JSPI to suspend a guest inside a host

@@ -71,7 +71,7 @@ jobs:
           workspaces: pen
       - name: Native compiler and component
         run: |
-          cd ../blot2/zig-native
+          cd ../blot2/compiler
           zig build install compiler-identity -Doptimize=fast
           mkdir -p ../generated/compiler
           gzip -c zig-out/bin/blotc > ../generated/compiler/blotc.gz

@@ -1,6 +1,6 @@
 //! A session with `blotc serve-project`: one compiler process, opened on one
 //! program and asked to build it again and again (blot2's
-//! `zig-native/PROJECT_PROTOCOL.md`, version 1, whose reference client is
+//! `docs/compiler/PROJECT_PROTOCOL.md`, version 1, whose reference client is
 //! `compiler/zig_project_client.ts`).
 use std::collections::HashSet;
 use std::time::{Duration, Instant};

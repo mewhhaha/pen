@@ -1,8 +1,8 @@
-//! Blot's guest ABI manifest (`blot2/compiler/guest-abi.md`): the
+//! Blot's guest ABI manifest (`blot2/docs/host/guest-abi.md`): the
 //! `blot:abi` custom section a guest module declares its exports in, and
 //! the entry a game must have. Native pen (blot-host) and the browser read
 //! it alike, before a module runs. ABI 3's ownership hooks are specified in
-//! `blot2/zig-native/SHARED_OWNERSHIP.md`.
+//! `blot2/docs/compiler/SHARED_OWNERSHIP.md`.
 use std::fmt;
 
 use anyhow::{Result, anyhow, bail, ensure};

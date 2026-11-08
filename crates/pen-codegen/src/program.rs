@@ -80,7 +80,7 @@ fn blank(field: &Value) -> String {
 pub fn frame(model: &Model, header: &[String]) -> String {
     let mut out = header.to_vec();
     out.extend(
-        "//\n// A frame to start from: one that draws, plays and asks nothing, lit from\n// above. A game fills separate named source pools and encodes them with this header.\nimport * as types from \"./types\"\n\nconst identity = $types.Mat4 {\n  x: $types.Vec4 { x: 1.0, y: 0.0, z: 0.0, w: 0.0 },\n  y: $types.Vec4 { x: 0.0, y: 1.0, z: 0.0, w: 0.0 },\n  z: $types.Vec4 { x: 0.0, y: 0.0, z: 1.0, w: 0.0 },\n  w: $types.Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },\n}\n\n// Fixed render defaults for state `schema`; collections have separate owners.\nconst header = func (schema: U32): types.RenderHeader => return {"
+        "//\n// A frame to start from: one that draws, plays and asks nothing, lit from\n// above. A game fills separate named source pools and encodes them with this header.\nimport * as types from \"./types\"\n\nconst identity = $types.Mat4 {\n  x: $types.Vec4 { x: 1.0, y: 0.0, z: 0.0, w: 0.0 },\n  y: $types.Vec4 { x: 0.0, y: 1.0, z: 0.0, w: 0.0 },\n  z: $types.Vec4 { x: 0.0, y: 0.0, z: 1.0, w: 0.0 },\n  w: $types.Vec4 { x: 0.0, y: 0.0, z: 0.0, w: 1.0 },\n}\n\n// Fixed render defaults for state `schema`; collections have separate owners.\nfunc header (schema: U32): types.RenderHeader => return {"
             .lines()
             .map(str::to_owned),
     );

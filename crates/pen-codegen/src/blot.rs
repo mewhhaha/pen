@@ -84,7 +84,7 @@ fn record(layout: &Layout) -> Vec<String> {
         None => format!("A {name}'s lanes."),
     };
     let mut out = comment(Some(&about));
-    out.push(format!("const {} = func ({variable}: types.{name}) => return do:", encoder(&layout.record)));
+    out.push(format!("func {} ({variable}: types.{name}) => return do:", encoder(&layout.record)));
     let mut lets = Vec::new();
     let mut lanes = Vec::new();
     for laid in &layout.fields {
@@ -217,7 +217,7 @@ fn input(model: &Model) -> Vec<String> {
         String::new(),
     ]);
     out.extend(comment(Some(&format!("An event's lanes from `start`: its tag, then {}. The {} lane holds a whole number; lanes an event does not use are zero.", input_lanes.iter().map(s).collect::<Vec<_>>().join(", "), s(&input_lanes[0])))));
-    out.push("const decode_event = func values => return func (start: U32) => return do:".to_owned());
+    out.push("func decode_event values => return func (start: U32) => return do:".to_owned());
     out.push(format!(
         "  let tag = lanes.integer (values.at (start)) {}",
         model.core_events().iter().map(|event| n(&event["tag"])).max().unwrap_or(0)
@@ -275,7 +275,7 @@ fn input(model: &Model) -> Vec<String> {
     out.push(format!("    _ => @panic {}", quote(&input["messages"]["tag"])));
     out.push(String::new());
     out.extend(comment(Some("The input packet: the seconds since the last frame, the viewport's width and height, the event and state counts, the events and the state. Anything else traps.")));
-    out.extend("const decode_input_into = func values -> (events: ResizeArray Event) => return do:\n  use lanes.require (values.length >= frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)".lines().map(str::to_owned));
+    out.extend("func decode_input_into values -> (events: ResizeArray Event) => return do:\n  use lanes.require (values.length >= frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)".lines().map(str::to_owned));
     out.push(format!(
         "  let event_count = lanes.integer (values.at (3)) {}",
         s(&input["maxEvents"]["limit"]).to_lowercase()
@@ -501,7 +501,7 @@ fn render_views(model: &Model) -> Vec<String> {
     let body = 0;
     let mut out = vec![String::new(),
         "// Borrowed source groups, known scalar projections, caller-owned output.".to_owned(),
-        "const encode_render_views = func (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: ResizeArray F32) => return do:".to_owned(),
+        "func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: ResizeArray F32) => return do:".to_owned(),
         "  let draws = collections.draws".to_owned(),
         "  let metadata_of = func draw: (U32, U32) => return project.draw_metadata context draw".to_owned(),
         "  let matrix_of = func draw: (F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32) => return project.draw_transform context draw".to_owned(),
@@ -624,7 +624,7 @@ fn render_meshes(model: &Model) -> Vec<String> {
     let mut out = vec![String::new(),
         "// Flat mesh draws (no parameters/extras) and sounds, into a caller-owned packet.".to_owned(),
         "type MeshDraw = { mesh: U32, material: U32, transform: types.Mat4 }".to_owned(),
-        "const encode_mesh_frame = func (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: ResizeArray F32) => return do:".to_owned(),
+        "func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: ResizeArray F32) => return do:".to_owned(),
         "  @storage.truncate encoded 0".to_owned(),
         format!("  for 0 .. (protocol.packet_header_floats + draws.length * {} + sounds.length * {}):", draws.lanes, sounds.lanes),
         "    @storage.push encoded 0.0".to_owned()];
@@ -694,7 +694,7 @@ fn render(model: &Model) -> Vec<String> {
                 s(&record["name"]),
                 entry.head.iter().map(|field| field.name.as_str()).collect::<Vec<_>>().join(", ")
             ))));
-            out.push(format!("const {} = func ({name}: types.{}) => return do:", encoder(record), s(&record["name"])));
+            out.push(format!("func {} ({name}: types.{}) => return do:", encoder(record), s(&record["name"])));
             out.extend(lets.iter().map(|line| format!("  {line}")));
             out.push("  return array.concat #[".to_owned());
             out.extend(chunk(&lanes, 76).iter().map(|line| format!("    {line},")));
@@ -738,7 +738,7 @@ fn render(model: &Model) -> Vec<String> {
                 "{}: {head}its {rest_name}' count, then each of them.",
                 s(&record["name"])
             ))));
-            out.push(format!("const {} = func ({name}: types.{}) => return do:", encoder(record), s(&record["name"])));
+            out.push(format!("func {} ({name}: types.{}) => return do:", encoder(record), s(&record["name"])));
             out.push(format!("  let {rest_name} = {name}.{rest_name}"));
             out.push(format!(
                 "  let encoded = @array.fill (protocol.{} + {rest_name}.length * protocol.{}) 0.0",
@@ -771,10 +771,7 @@ fn render(model: &Model) -> Vec<String> {
                 s(&owner.layout.record["name"]),
                 owner.field.name
             ))));
-            out.push(format!(
-                "const {name} = func ({variable}: types.{}) => return do:",
-                s(&owner.layout.record["name"])
-            ));
+            out.push(format!("func {name} ({variable}: types.{}) => return do:", s(&owner.layout.record["name"])));
             out.push(format!("  let kept = min {path}.length {max}"));
             out.push(format!(
                 "  return #[lane | index <- array.generate kept identity, lane <- vec4_lanes {path}[index]]"
@@ -782,10 +779,7 @@ fn render(model: &Model) -> Vec<String> {
         }
     }
     if !tail_encoders.is_empty() {
-        out.extend([
-            String::new(),
-            "const vec4_lanes = func (v: types.Vec4) => return #[v.x, v.y, v.z, v.w]".to_owned(),
-        ]);
+        out.extend([String::new(), "func vec4_lanes (v: types.Vec4) => return #[v.x, v.y, v.z, v.w]".to_owned()]);
     }
     out.extend(render_views(model));
     out.extend(render_meshes(model));
@@ -889,20 +883,20 @@ const NUMERIC: &str = r#"import * as array from "std/array"
 
 const max_integer = 16777215
 
-const require = func (condition: Bool) => return do:
+func require (condition: Bool) => return do:
   if condition:
     return ()
   return @panic "invalid Pen numeric packet"
 
-const finite = func values => return require (array.all is_finite values)
+func finite values => return require (array.all is_finite values)
 
-const integer = func (value: F32) => return func (maximum: U32) => return do:
+func integer (value: F32) => return func (maximum: U32) => return do:
   let number = F32.to_u32 value
   use require (value == U32.to_f32 number)
   use require (number <= maximum)
   return number
 
-const bit = func (value: Bool) => return do:
+func bit (value: Bool) => return do:
   if value:
     return 1.0
   return 0.0"#;

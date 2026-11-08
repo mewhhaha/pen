@@ -122,7 +122,12 @@ pub fn find(
         // Pen runs each export in a fresh instance, including after a trap.
         let inline_traps = kind(&path) == Kind::Checks
             && source.lines().any(|line| {
-                line.trim_start().strip_prefix("entry const ").is_some_and(|name| name.starts_with("trap_"))
+                line.trim_start()
+                    .strip_prefix("entry ")
+                    .and_then(|declaration| {
+                        declaration.strip_prefix("func ").or_else(|| declaration.strip_prefix("const "))
+                    })
+                    .is_some_and(|name| name.starts_with("trap_"))
             });
         let overlays = vec![Overlay { path: entry.clone(), contents: Some(source) }];
         found.push(TestModule {
@@ -244,8 +249,8 @@ mod tests {
         Program { root: "/gdev".into(), entry: "/gdev/src/main.blot".into(), settings: "{}".into() }
     }
 
-    const SAYS: &str = "// rejects: what test_d says\nentry const test_d = func () => return 0\n";
-    const TEST: &str = "entry const test_d = func () => return 0\n";
+    const SAYS: &str = "// rejects: what test_d says\nentry func test_d () => return 0\n";
+    const TEST: &str = "entry func test_d () => return 0\n";
 
     fn layout() -> Memory {
         checkout(&[
@@ -315,17 +320,17 @@ mod tests {
 
     #[test]
     fn expected_panics_can_share_the_check_fixture() {
-        let mut files = checkout(&[(
-            "tests/a.blot",
-            "entry const test_ok = func () => return #[1.0,0.0]\nentry const trap_bad = func () => return @panic \"bad\"\n",
-        )]);
-        let found = find(&program(), &[], None, &mut files).unwrap();
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0].expect, Expectation::Checks);
-        assert_eq!(found[1].expect, Expectation::Traps);
-        assert_eq!(found[1].prefix, "trap_");
-        assert_eq!(found[0].entry, found[1].entry);
-        assert_eq!(found[0].overlays, found[1].overlays);
+        for trap in ["entry func trap_bad () => return @panic \"bad\"", "entry const trap_bad = panic_callback"] {
+            let source = format!("entry func test_ok () => return #[1.0,0.0]\n{trap}\n");
+            let mut files = checkout(&[("tests/a.blot", &source)]);
+            let found = find(&program(), &[], None, &mut files).unwrap();
+            assert_eq!(found.len(), 2);
+            assert_eq!(found[0].expect, Expectation::Checks);
+            assert_eq!(found[1].expect, Expectation::Traps);
+            assert_eq!(found[1].prefix, "trap_");
+            assert_eq!(found[0].entry, found[1].entry);
+            assert_eq!(found[0].overlays, found[1].overlays);
+        }
     }
 
     #[test]
@@ -343,7 +348,7 @@ mod tests {
         // not compile is named for its file.
         let mut files = checkout(&[
             ("tests/a.blot", TEST),
-            ("tests/b.blot", "entry const test_e = func () => return 0\n"),
+            ("tests/b.blot", "entry func test_e () => return 0\n"),
             ("tests/rejected/twice.blot", SAYS),
         ]);
         assert_eq!(paths(&find(&program(), &[], Some("test_d"), &mut files).unwrap()), ["a.blot"]);

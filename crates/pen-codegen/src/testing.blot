@@ -6,57 +6,57 @@ import * as protocol from "./protocol"
 type Save is data = $Save { schema: U32, state: Array F32 }
 type Selector is data = $Selector { role: U32, name: &[U32] }
 
-const named = func role -> name => return $Selector { role, name: name.view 0 name.length }
-const button = func name => return named protocol.ui_role_button name
-const dialog = func name => return named protocol.ui_role_dialog name
+func named role -> name => return $Selector { role, name: name.view 0 name.length }
+func button name => return named protocol.ui_role_button name
+func dialog name => return named protocol.ui_role_dialog name
 
 // Read borrowed text before producing the copied numeric host packet.
-const text = func value => return do:
+func text value => return do:
   let length: U32 = value.length
   let at: U32 -> U32 = value.at
   let packet: GrowArray F32 = #[U32.to_f32 length]
   for i in 0 .. length:
     packet.push (U32.to_f32 (at i))
   return @storage.freeze packet
-const call = func (driver: Array F32 -> Array F32 ! { Foreign }) -> op -> values => return
+func call (driver: Array F32 -> Array F32 ! { Foreign }) -> op -> values => return
   driver (array.concat #[1.0, from op] values)
 
-const run = func driver -> body => return do:
+func run driver -> body => return do:
   use body driver
   break call driver protocol.test_driver_op_finish #[]
 
 // initial.state is the game's ordinary payload, not a saved Wasm stack.
-const launch = func driver -> initial -> width -> height => return do:
+func launch driver -> initial -> width -> height => return do:
   let $Save { schema, state } = initial
   use call driver protocol.test_driver_op_launch
     (array.concat #[from width, from height, from schema, from state.length] state)
   break ()
 
-const step = func driver -> (ticks: U32) => return do:
+func step driver -> (ticks: U32) => return do:
   use call driver protocol.test_driver_op_step #[from ticks]
   break ()
 
-const locate = func driver -> op -> selector -> ticks => return do:
+func locate driver -> op -> selector -> ticks => return do:
   let $Selector { role, name } = selector
   use call driver op (array.concat #[from role, from ticks] (text name))
   break ()
 
 // Waits advance at 60 ticks/second, with a bounded number of ticks.
-const click_within = func driver -> selector -> ticks => return locate driver protocol.test_driver_op_click selector ticks
-const click = func driver -> selector => return click_within driver selector 300
-const expect_visible = func driver -> selector => return locate driver protocol.test_driver_op_visible selector 300
-const expect_hidden = func driver -> selector => return locate driver protocol.test_driver_op_hidden selector 300
+func click_within driver -> selector -> ticks => return locate driver protocol.test_driver_op_click selector ticks
+func click driver -> selector => return click_within driver selector 300
+func expect_visible driver -> selector => return locate driver protocol.test_driver_op_visible selector 300
+func expect_hidden driver -> selector => return locate driver protocol.test_driver_op_hidden selector 300
 
-const press = func driver -> key => return do:
+func press driver -> key => return do:
   use call driver protocol.test_driver_op_press (text key)
   break ()
 
 // Decode or inspect this in the test's own Blot code, using the game's codecs.
-const snapshot = func driver => return do:
+func snapshot driver => return do:
   use values <- call driver protocol.test_driver_op_snapshot #[]
   break $Save { schema: F32.to_u32 values[0], state: array.slice 1 (values.length - 1) values }
 
-const equal = func driver -> label -> expected -> actual => return do:
+func equal driver -> label -> expected -> actual => return do:
   let expected_length: U32 = expected.length
   let actual_length: U32 = actual.length
   let expected_at: U32 -> F32 = expected.at
@@ -72,10 +72,10 @@ const equal = func driver -> label -> expected -> actual => return do:
   use call driver protocol.test_driver_op_equal (@storage.freeze packet)
   break ()
 
-const picture = func driver -> name -> compare -> tolerance => return do:
+func picture driver -> name -> compare -> tolerance => return do:
   use call driver protocol.test_driver_op_screenshot
     (array.concat #[if compare then 1.0 else 0.0, tolerance] (text name))
   break ()
-const screenshot = func driver -> name => return picture driver name false 0.0
+func screenshot driver -> name => return picture driver name false 0.0
 // RGB RMSE is normalized to 0..1. A missing golden fails unless --update is set.
-const expect_screenshot = func driver -> name -> tolerance => return picture driver name true tolerance
+func expect_screenshot driver -> name -> tolerance => return picture driver name true tolerance

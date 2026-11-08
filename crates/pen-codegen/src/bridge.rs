@@ -41,7 +41,7 @@ fn projected(section: &Section, out: &mut Vec<String>) {
     let name = singular(s(&section.section["name"]));
     let (fields, width) =
         section.fixed.as_ref().map_or((&section.head, section.head_lanes), |layout| (&layout.fields, layout.lanes));
-    out.push(format!("const project_{name} = func (context: Context) -> (at: U32) => return do:"));
+    out.push(format!("func project_{name} (context: Context) -> (at: U32) => return do:"));
     out.push("  let packet: Array F32 = context.packet".to_owned());
     let mut values: Vec<_> = fields
         .iter()
@@ -97,8 +97,8 @@ pub fn emit(model: &Model, header: &[String]) -> String {
         "import * as renderer from \"./protocol_render\"".to_owned(),
         String::new(),
         "type Context = {packet: Array F32, draws_start: U32, draws_count: U32, inset_draws_start: U32, inset_draws_count: U32, insets_start: U32, insets_count: U32, extras_start: U32}".to_owned(),
-        "const vec4_at = func (packet: Array F32) -> (at: U32) => return $types.Vec4 {x: packet[at], y: packet[at + 1], z: packet[at + 2], w: packet[at + 3]}".to_owned(),
-        "const extra_start = func (context: Context) -> (at: U32) => return do:".to_owned(),
+        "func vec4_at (packet: Array F32) -> (at: U32) => return $types.Vec4 {x: packet[at], y: packet[at + 1], z: packet[at + 2], w: packet[at + 3]}".to_owned(),
+        "func extra_start (context: Context) -> (at: U32) => return do:".to_owned(),
         "  let packet: Array F32 = context.packet".to_owned(),
         "  let start: U32 = context.extras_start".to_owned(),
     ]);
@@ -114,7 +114,7 @@ pub fn emit(model: &Model, header: &[String]) -> String {
     let insets = model.section("insets").fixed.as_ref().unwrap();
     let children = insets.fields.iter().find(|field| kind(&field.field) == "children").unwrap();
     out.extend([
-        "const child_start = func (context: Context) -> (at: U32) => return do:".to_owned(),
+        "func child_start (context: Context) -> (at: U32) => return do:".to_owned(),
         "  let packet: Array F32 = context.packet".to_owned(),
         "  let start: U32 = context.inset_draws_start".to_owned(),
         format!("  for i in 0 .. ((at - context.insets_start) / {}):", insets.lanes),
@@ -123,16 +123,16 @@ pub fn emit(model: &Model, header: &[String]) -> String {
             insets.lanes, children.offset, draws.lanes
         ),
         "  return start".to_owned(),
-        "const draw_metadata = func (context: Context) -> (at: U32) => return do:".to_owned(),
+        "func draw_metadata (context: Context) -> (at: U32) => return do:".to_owned(),
         "  let packet: Array F32 = context.packet".to_owned(),
         "  return (F32.to_u32 packet[at], F32.to_u32 packet[at + 1])".to_owned(),
-        "const draw_transform = func (context: Context) -> (at: U32) => return do:".to_owned(),
+        "func draw_transform (context: Context) -> (at: U32) => return do:".to_owned(),
         "  let packet: Array F32 = context.packet".to_owned(),
         format!("  return ({})", (2..18).map(|offset| format!("packet[at + {offset}]")).collect::<Vec<_>>().join(", ")),
-        "const draw_parameters = func (context: Context) -> (at: U32) => return do:".to_owned(),
+        "func draw_parameters (context: Context) -> (at: U32) => return do:".to_owned(),
         "  let packet: Array F32 = context.packet".to_owned(),
         "  return (packet[at + 18], packet[at + 19], packet[at + 20], packet[at + 21], packet[at + 22])".to_owned(),
-        "const draw_extra = func (context: Context) -> (at: U32) => return do:".to_owned(),
+        "func draw_extra (context: Context) -> (at: U32) => return do:".to_owned(),
         "  let packet: Array F32 = context.packet".to_owned(),
         format!("  return array.slice (extra_start context at) (F32.to_u32 packet[at + {}] * 4) packet", tail.offset),
     ]);
@@ -141,9 +141,7 @@ pub fn emit(model: &Model, header: &[String]) -> String {
             projected(section, &mut out);
         }
     }
-    out.push(
-        "const reencode_views = func (packet: Array F32) -> (destination: ResizeArray F32) => return do:".to_owned(),
-    );
+    out.push("func reencode_views (packet: Array F32) -> (destination: ResizeArray F32) => return do:".to_owned());
     let mut start = model.header_lanes.to_string();
     for section in &model.sections {
         let name = s(&section.section["name"]);

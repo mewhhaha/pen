@@ -385,7 +385,7 @@ fn stream_record(entry: &Section) -> Vec<String> {
     let mut out = vec![
         String::new(),
         format!(
-            "const {name}_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:"
+            "func {name}_into (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:"
         ),
         "  let at = start".to_owned(),
         "  let base = destination.length".to_owned(),
@@ -442,7 +442,7 @@ fn render_stream(model: &Model) -> Vec<String> {
     }
     out.extend([String::new(),
         "// Canonical render values streamed into named packet, inset-draw and extra pools.".to_owned(),
-        "const render_packet_from_canonical = func (canonical: Array F32) -> (output: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32) => return do:".to_owned(),
+        "func render_packet_from_canonical (canonical: Array F32) -> (output: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32) => return do:".to_owned(),
         "  lanes.finite canonical".to_owned(),
         "  @storage.truncate output 0".to_owned(),
         "  @storage.truncate children 0".to_owned(),
@@ -540,7 +540,7 @@ pub fn blot(model: &Model, top: &[String]) -> String {
         String::new(),
     ]);
     out.extend(comment(Some("An event's walk: its tag, then its fields in the schema's order.")));
-    out.push("const canonical_event = func (event: protocol.Event) => return case event of".to_owned());
+    out.push("func canonical_event (event: protocol.Event) => return case event of".to_owned());
     for event in model.core_events() {
         let name = s(&event["name"]);
         let fields = event_fields(event);
@@ -565,7 +565,7 @@ pub fn blot(model: &Model, top: &[String]) -> String {
         "The input's walk, as pen-protocol's canonical_input makes it: elapsed, the viewport's width and height, the events' count and walks, then the state's count and lanes.",
     )));
     out.extend(
-        "const canonical_input = func (input: protocol.Input) => return do:\n  let $protocol.Input { elapsed, width, height, events, state } = input\n  let output: GrowArray F32 = #[elapsed, width, height, U32.to_f32 events.length]\n  for event in events:\n    array.append_into output (canonical_event event)\n  output.push (U32.to_f32 state.length)\n  array.append_into output state\n  return @storage.freeze output"
+        "func canonical_input (input: protocol.Input) => return do:\n  let $protocol.Input { elapsed, width, height, events, state } = input\n  let output: GrowArray F32 = #[elapsed, width, height, U32.to_f32 events.length]\n  for event in events:\n    array.append_into output (canonical_event event)\n  output.push (U32.to_f32 state.length)\n  array.append_into output state\n  return @storage.freeze output"
             .lines()
             .map(str::to_owned),
     );

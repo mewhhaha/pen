@@ -307,7 +307,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
         "An event's lanes from `start`: one of pen's, or one of the game's, which travels as pen's Game event: \
          its tag, then its values in the lanes after, those it has no field for zero.",
     ));
-    out.push("const decode_event = func values => return func (start: U32) => return do:".to_owned());
+    out.push("func decode_event values => return func (start: U32) => return do:".to_owned());
     out.push("  if (values.at (start)) != U32.to_f32 protocol.game_tag:".to_owned());
     out.push("    return $Pen (protocol.decode_event values start)".to_owned());
     out.push("  let tag = lanes.integer (values.at (start + 1)) protocol.max_extension_tag".to_owned());
@@ -344,7 +344,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
     out.push(String::new());
     out.extend(comment("The input packet, as protocol.decode_input_into reads it, with the game's own events."));
     out.extend(
-        "const decode_input_into = func values -> (events: ResizeArray Event) => return do:\n  use lanes.require (values.length >= protocol.frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)\n  let event_count = lanes.integer (values.at (3)) protocol.max_events\n  let state_count = lanes.integer (values.at (4)) protocol.max_state_floats\n  let state_start = protocol.frame_header_floats + event_count * protocol.event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (protocol.frame_header_floats + index * protocol.event_floats))\n  return $Input {\n    state: values.view state_start (state_start + state_count),\n    elapsed, width, height,\n    events: &events[0..events.length],\n  }"
+        "func decode_input_into values -> (events: ResizeArray Event) => return do:\n  use lanes.require (values.length >= protocol.frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)\n  let event_count = lanes.integer (values.at (3)) protocol.max_events\n  let state_count = lanes.integer (values.at (4)) protocol.max_state_floats\n  let state_start = protocol.frame_header_floats + event_count * protocol.event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (protocol.frame_header_floats + index * protocol.event_floats))\n  return $Input {\n    state: values.view state_start (state_start + state_count),\n    elapsed, width, height,\n    events: &events[0..events.length],\n  }"
             .lines()
             .map(str::to_owned),
     );
@@ -368,7 +368,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             section.name
         )));
         out.push(format!(
-            "const append_{name} = func (records: Array {}) -> (packet: ResizeArray F32) => return do:",
+            "func append_{name} (records: Array {}) -> (packet: ResizeArray F32) => return do:",
             section.name
         ));
         out.push(format!("  @storage.push packet (U32.to_f32 {name}_tag)"));

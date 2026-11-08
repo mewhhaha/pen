@@ -8,6 +8,14 @@ remove superseded APIs and implementations rather than keeping compatibility
 paths. Commit coherent checked batches continuously to `main` and verify remote
 hashes. Environment publication requires a separate explicit request.
 
+The named-function migration now changes the Blot generator templates and test
+entry discovery. Regenerated Gdev bindings and Ink's protocol fixtures preserve
+Rust packet output, schema and wire layout. Ten codegen laws, eight suite laws
+and both generated-output freshness checks pass. This qualifies generation and
+discovery; the new compiler's full release/Main qualification remains pending.
+See [the shared source-migration evidence](../blot2/benchmarks/evidence/qualification/2026-11-08-named-source-migration.json).
+The frame evidence below qualifies its older compiler/host, not this batch.
+
 Actual Gdev main passes one native frame with the current reviewed compiler and
 rebuilt host. All six checks pass; the inspected 640×480 PNG and guest trace
 match the original frame byte for byte. The

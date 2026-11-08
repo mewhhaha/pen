@@ -124,8 +124,8 @@ mod tests {
             }
         }
         let render = &sources.iter().find(|(name, _)| *name == "protocol_render.blot").unwrap().1;
-        assert!(render.contains("func (packet: types.RenderHeader)"));
-        assert!(render.contains("func (draw: types.Draw)"));
+        assert!(render.contains("func encode_render_views (packet: types.RenderHeader)"));
+        assert!(render.contains("func encode_draw (draw: types.Draw)"));
         assert!(render.contains("draw.transform"));
         assert!(render.contains("inset.ambient.x"));
         assert!(render.contains("packet.clear.r"));
@@ -150,8 +150,8 @@ mod tests {
         );
         let sources = blot::emit(&model, HEADER);
         let canonical = &sources.iter().find(|(name, _)| *name == "protocol_canonical.blot").unwrap().1;
-        assert!(canonical.contains("const canonical_input = func (input: protocol.Input) => return do:"));
-        assert!(canonical.contains("const render_packet_from_canonical = func (canonical: Array F32)"));
+        assert!(canonical.contains("func canonical_input (input: protocol.Input) => return do:"));
+        assert!(canonical.contains("func render_packet_from_canonical (canonical: Array F32)"));
         // Every header lane and section is emitted into one named packet owner.
         for header in &model.header {
             let offset = header.laid.offset;

@@ -276,12 +276,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config cmake libasound2-dev libdbus-1-dev libudev-dev mesa-vulkan-drivers ffmpeg
+            pkg-config cmake clang ninja-build libasound2-dev libdbus-1-dev libudev-dev mesa-vulkan-drivers ffmpeg
       - name: Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
       - uses: taiki-e/install-action@v2
         with:
           tool: just
@@ -290,11 +287,11 @@ jobs:
           workspaces: pen
       - name: Native compiler and component
         run: |
-          cd ../blot2/compiler
-          zig build install compiler-identity -Doptimize=fast
-          mkdir -p ../generated/compiler
-          gzip -c zig-out/bin/blotc > ../generated/compiler/blotc.gz
-          cd ../../pen
+          cd ../blot2
+          sh compiler-goose/build.sh --release
+          mkdir -p generated/compiler
+          gzip -c compiler-goose/build/blotc-goose > generated/compiler/blotc.gz
+          cd ../pen
           just plugins
       - name: Protocol freshness and game tests
         env:

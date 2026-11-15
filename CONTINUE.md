@@ -58,8 +58,9 @@ do not imply full GPU/browser qualification.
 
 ## Build and verify
 
-Use Zig 0.17.0 and `-Dllvm=false` for Blot development. Build the native host
-and plugin workspace using the checked-in Rust toolchain:
+Build the Blot compiler in `../blot2` with `deno task build:compiler` (it is
+written in Goose and needs clang, cmake, ninja and Python 3). Build the native
+host and plugin workspace using the checked-in Rust toolchain:
 
 ```sh
 cargo build --release -p pen

@@ -44,7 +44,7 @@ for (
     const fixture = resolve(project, "src/test_fixture.blot");
     const compiler = await createZigProjectCompiler({
       executable: Deno.env.get("BLOTC") ??
-        resolve(blot, "compiler/zig-out-dev/bin/blotc"),
+        resolve(blot, "compiler-goose/build/blotc-goose"),
       entry: test ? fixture : resolve(project, "src/main.blot"),
       prelude: resolve(blot, "std/prelude.blot"),
       stdRoot: resolve(blot, "std"),

@@ -294,7 +294,7 @@ fn direct_fields(out: &mut Vec<String>, fields: &[Laid], variable: &str, indent:
         out.extend(locals.iter().map(|line| format!("{indent}{line}")));
         for (lane, value) in values.iter().enumerate() {
             let offset = field.offset + lane;
-            out.push(format!("{indent}encoded[at + {offset}] := {value}"));
+            out.push(format!("{indent}encoded[at + {offset}] = {value}"));
         }
     }
 }
@@ -311,7 +311,7 @@ fn direct_records(out: &mut Vec<String>, entry: &Section, body: impl Fn(&mut Vec
         let values = if section == "draws" { "draws".to_owned() } else { format!("packet.{section}") };
         out.push(format!("  for {variable} in {values}:"));
         if section == "draws" {
-            out.push(format!("    let extra = extra_of {variable}"));
+            out.push(format!("    let extra: Array F32 = project.draw_extra context {variable}"));
         }
         body(out, &variable, "    ");
     }
@@ -400,7 +400,7 @@ fn render_layout(model: &Model) -> Vec<String> {
             }
         };
         for (index, value) in values.iter().enumerate() {
-            out.push(format!("  encoded[{}] := {value}", field.offset + index));
+            out.push(format!("  encoded[{}] = {value}", field.offset + index));
         }
     }
     out.push("  at := protocol.packet_header_floats".to_owned());
@@ -409,7 +409,7 @@ fn render_layout(model: &Model) -> Vec<String> {
         match kind(&entry.section) {
             "lanes" => {
                 out.push(format!("  for value in packet.{name}:"));
-                out.push("    encoded[at] := value".to_owned());
+                out.push("    encoded[at] = value".to_owned());
                 out.push("    at := self + 1".to_owned());
             }
             "records" => {
@@ -431,7 +431,7 @@ fn render_layout(model: &Model) -> Vec<String> {
                                 _ => unreachable!(),
                             };
                             for (lane, value) in values.iter().enumerate() {
-                                out.push(format!("{indent}encoded[at + {}] := {value}", field.offset + lane));
+                                out.push(format!("{indent}encoded[at + {}] = {value}", field.offset + lane));
                             }
                         }
                     } else {
@@ -447,7 +447,7 @@ fn render_layout(model: &Model) -> Vec<String> {
                     direct_fields(out, &entry.head, variable, indent);
                     if let Some(layout) = &entry.item {
                         out.push(format!(
-                            "{indent}encoded[at + {}] := U32.to_f32 {variable}.{rest_name}.length",
+                            "{indent}encoded[at + {}] = U32.to_f32 {variable}.{rest_name}.length",
                             entry.head_lanes - 1
                         ));
                         out.push(format!("{indent}at := self + {}", entry.head_lanes));
@@ -458,7 +458,7 @@ fn render_layout(model: &Model) -> Vec<String> {
                     } else {
                         out.push(format!("{indent}at := self + {}", entry.head_lanes));
                         out.push(format!("{indent}for value in {variable}.{rest_name}:"));
-                        out.push(format!("{indent}  encoded[at] := value"));
+                        out.push(format!("{indent}  encoded[at] = value"));
                         out.push(format!("{indent}  at := self + 1"));
                     }
                 });
@@ -469,7 +469,7 @@ fn render_layout(model: &Model) -> Vec<String> {
                         direct_records(&mut out, model.section(&owner.section), |out, variable, indent| {
                             if owner.section == "draws" {
                                 out.push(format!("{indent}for value in extra:"));
-                                out.push(format!("{indent}  encoded[at] := value"));
+                                out.push(format!("{indent}  encoded[at] = value"));
                                 out.push(format!("{indent}  at := self + 1"));
                             } else {
                                 let path = field_path(variable, &owner.field);
@@ -477,7 +477,7 @@ fn render_layout(model: &Model) -> Vec<String> {
                                 out.push(format!("{indent}for index in 0 .. min {path}.length {max}:"));
                                 for (lane, component) in ["x", "y", "z", "w"].iter().enumerate() {
                                     out.push(format!(
-                                        "{indent}  encoded[at + {lane}] := ({path}.at index).{component}"
+                                        "{indent}  encoded[at + {lane}] = ({path}.at index).{component}"
                                     ));
                                 }
                                 out.push(format!("{indent}  at := self + 4"));
@@ -505,8 +505,7 @@ fn render_views(model: &Model) -> Vec<String> {
         "  let draws = collections.draws".to_owned(),
         "  let metadata_of = func draw: (U32, U32) => return project.draw_metadata context draw".to_owned(),
         "  let matrix_of = func draw: (F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32) => return project.draw_transform context draw".to_owned(),
-        "  let parameters_of = func draw: (F32, F32, F32, F32, F32) => return project.draw_parameters context draw".to_owned(),
-        "  let extra_of = func draw: Array F32 => return project.draw_extra context draw".to_owned()];
+        "  let parameters_of = func draw: (F32, F32, F32, F32, F32) => return project.draw_parameters context draw".to_owned()];
     // Read each source count through one exact U32 contract. The source
     // collection and its elements remain borrowed/generic.
     for entry in &model.sections {
@@ -573,7 +572,7 @@ fn render_views(model: &Model) -> Vec<String> {
             line = line.replace(&format!("{path}.length"), count);
         }
         line = line.replace("extra.length", "extra_count");
-        if line.trim_start().starts_with("let extra = extra_of ") {
+        if line.trim_start().starts_with("let extra: Array F32 = project.draw_extra ") {
             let indent = &line[..line.len() - line.trim_start().len()];
             out.push(line.clone());
             out.push(format!("{indent}let extra_count: U32 = extra.length"));
@@ -647,7 +646,7 @@ fn render_meshes(model: &Model) -> Vec<String> {
             }
         };
         for (index, value) in values.iter().enumerate() {
-            out.push(format!("  encoded[{}] := {value}", field.offset + index));
+            out.push(format!("  encoded[{}] = {value}", field.offset + index));
         }
     }
     out.push("  let at: U32 = protocol.packet_header_floats".to_owned());

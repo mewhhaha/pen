@@ -341,9 +341,9 @@ fn stream_field(out: &mut Vec<String>, field: &Laid, indent: &str) {
             out.push(format!("{indent}let present = lanes.integer canonical[at] 1"));
             out.push(format!("{indent}at := at + 1"));
             out.push(format!("{indent}if present == 1:"));
-            out.push(format!("{indent}  destination[base + {offset}] := {width}.0"));
+            out.push(format!("{indent}  destination[base + {offset}] = {width}.0"));
             for index in 0..width {
-                out.push(format!("{indent}  destination[base + {}] := canonical[at + {index}]", offset + index + 1));
+                out.push(format!("{indent}  destination[base + {}] = canonical[at + {index}]", offset + index + 1));
             }
             out.push(format!("{indent}  at := at + {width}"));
         }
@@ -355,7 +355,7 @@ fn stream_field(out: &mut Vec<String>, field: &Laid, indent: &str) {
             out.push(format!("{indent}  let count = lanes.integer canonical[at] lanes.max_integer"));
             out.push(format!("{indent}  lanes.require (count % {unit} == 0)"));
             out.push(format!("{indent}  at := at + 1"));
-            out.push(format!("{indent}  destination[base + {offset}] := U32.to_f32 (count / {unit})"));
+            out.push(format!("{indent}  destination[base + {offset}] = U32.to_f32 (count / {unit})"));
             out.push(format!("{indent}  for index in 0 .. count:"));
             out.push(format!("{indent}    @storage.push extras canonical[at + index]"));
             out.push(format!("{indent}  at := at + count"));
@@ -365,13 +365,13 @@ fn stream_field(out: &mut Vec<String>, field: &Laid, indent: &str) {
             let child = snake(&singular(s(&field.field["section"])));
             out.push(format!("{indent}let count = lanes.integer canonical[at] lanes.max_integer"));
             out.push(format!("{indent}at := at + 1"));
-            out.push(format!("{indent}destination[base + {offset}] := U32.to_f32 count"));
+            out.push(format!("{indent}destination[base + {offset}] = U32.to_f32 count"));
             out.push(format!("{indent}for 0 .. count:"));
             out.push(format!("{indent}  at := {child}_into canonical at children children extras"));
         }
         _ => {
             for index in 0..field.lanes {
-                out.push(format!("{indent}destination[base + {}] := canonical[at + {index}]", offset + index));
+                out.push(format!("{indent}destination[base + {}] = canonical[at + {index}]", offset + index));
             }
             out.push(format!("{indent}at := at + {}", field.lanes));
         }
@@ -399,7 +399,7 @@ fn stream_record(entry: &Section) -> Vec<String> {
         out.push("  let count = lanes.integer canonical[at] lanes.max_integer".to_owned());
         out.push("  at := at + 1".to_owned());
         if entry.item.is_some() {
-            out.push(format!("  destination[base + {}] := U32.to_f32 count", width - 1));
+            out.push(format!("  destination[base + {}] = U32.to_f32 count", width - 1));
         }
         out.push("  for 0 .. count:".to_owned());
         if let Some(layout) = &entry.item {
@@ -426,7 +426,7 @@ fn stream_header(out: &mut Vec<String>, field: &Laid, indent: &str) {
         } else {
             format!("canonical[at + {index}]")
         };
-        out.push(format!("{indent}output[{}] := {value}", field.offset + index));
+        out.push(format!("{indent}output[{}] = {value}", field.offset + index));
     }
     out.push(format!("{indent}at := at + {}", field.lanes));
 }
@@ -449,7 +449,7 @@ fn render_stream(model: &Model) -> Vec<String> {
         "  @storage.truncate extras 0".to_owned(),
         "  for 0 .. protocol.packet_header_floats:".to_owned(),
         "    @storage.push output 0.0".to_owned(),
-        "  output[0] := protocol.packet_magic".to_owned(),
+        "  output[0] = protocol.packet_magic".to_owned(),
         "  let at: U32 = 0".to_owned()]);
     for member in members(model) {
         match member {
@@ -517,7 +517,7 @@ fn render_stream(model: &Model) -> Vec<String> {
                 } else {
                     format!("(output.length - {name}_start)")
                 };
-                out.push(format!("  output[{}] := U32.to_f32 {count}", field.offset));
+                out.push(format!("  output[{}] = U32.to_f32 {count}", field.offset));
             }
         }
     }

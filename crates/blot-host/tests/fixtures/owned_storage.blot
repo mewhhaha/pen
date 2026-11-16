@@ -2,10 +2,14 @@
 entry const collected = func (value: U32) => return @u32.add (@u32.add value value) 42
 entry const incremented = func (value: U32) => return @u32.add value 1
 entry const captured = func (values: Array U32) => return @storage.copy values
+// A parameter is borrowed, so the updates go to a copy the function owns.
+// With `own` parameters (the spec, section 10.3) `owner` is taken over and
+// the copy goes.
 entry const partitioned = func (owner: Array U32) => return do:
-  owner[0] := @u32.add owner[0] 1
-  owner[2] := @u32.add owner[2] 2
-  return @u32.add owner[0] owner[2]
+  let mine = @storage.copy owner
+  mine[0] := @u32.add mine[0] 1
+  mine[2] := @u32.add mine[2] 2
+  return @u32.add mine[0] mine[2]
 entry const failing = func (value: U32) => return @u32.div value 0
 entry const large_result = func (count: U32) => return do:
   let output: GrowArray U32 = #[]

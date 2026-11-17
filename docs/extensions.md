@@ -66,9 +66,10 @@ once there are none):
 - For each section, its record type (`Score`), its tag (`score_tag`) and
   `append_score`, which appends its tag, payload length and record lanes to
   a caller-owned `ResizeArray F32` extension packet.
-The game supplies its own named-owner adapter to `pen/program.run`. During a
-frame it decodes the borrowed request, updates its world pool, fills draw/sound
-pools and writes the render packet before appending extension framing and lanes.
+The game supplies its own `execute` to `pen/program.run`, which owns the game's
+world and hands it to `execute` and back. During a frame it decodes the borrowed
+request, updates its world, fills draw/sound pools and writes the render packet
+before appending extension framing and lanes.
 `examples/bounce/src/game.blot` is a complete implementation. It computes a Score
 section directly as flat numeric lanes:
 

@@ -214,9 +214,10 @@ game's `decode_input_into` walks as Rust walks the frame, and that the canonical
 render writer streams its walk into packet lanes. A test-only flat packet
 projection bridge passes the same values through production `encode_render_views`;
 the two packets must agree to the bit, and Rust decodes the production packet
-as the same frame. The writer uses named packet, child-draw and extra-lane pools, covering
-nested inset draws, optional payloads and retained instances without nested
-owning records. A failure names the seed (`PEN_CODEC_SEED`, `PEN_CODEC_CASES` run
+as the same frame. The writer threads one owned value (the packet, the child
+draws, the extra lanes and where it reads next) through a function per record,
+covering nested inset draws, optional payloads and retained instances without
+nested owning records. A failure names the seed (`PEN_CODEC_SEED`, `PEN_CODEC_CASES` run
 one alone), the lane and the field. Swapping two lanes in either side's encoder,
 decoder or walk fails it.
 

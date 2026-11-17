@@ -141,7 +141,7 @@ pub fn emit(model: &Model, header: &[String]) -> String {
             projected(section, &mut out);
         }
     }
-    out.push("func reencode_views (packet: Array F32) -> (destination: ResizeArray F32) => return do:".to_owned());
+    out.push("func reencode_views (packet: Array F32) -> (destination: own ResizeArray F32) => return do:".to_owned());
     let mut start = model.header_lanes.to_string();
     for section in &model.sections {
         let name = s(&section.section["name"]);
@@ -245,8 +245,7 @@ pub fn emit(model: &Model, header: &[String]) -> String {
     }
     out.extend([
         format!("  let project = {{ {} }}", projections.join(", ")),
-        "  renderer.encode_render_views header collections project context destination".to_owned(),
-        "  return ()".to_owned(),
+        "  return renderer.encode_render_views header collections project context destination".to_owned(),
         String::new(),
     ]);
     out.join("\n")

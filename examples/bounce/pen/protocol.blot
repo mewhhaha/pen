@@ -1115,7 +1115,7 @@ type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: &[E
 
 // An event's lanes from `start`: its tag, then code, x, y, delta. The code lane
 // holds a whole number; lanes an event does not use are zero.
-const decode_event = func values => return func (start: U32) => return do:
+func decode_event values => return func (start: U32) => return do:
   let tag = lanes.integer (values.at (start)) 28
   let code = lanes.integer (values.at (start + 1)) lanes.max_integer
   let x = (values.at (start + 2))
@@ -1248,7 +1248,7 @@ const decode_event = func values => return func (start: U32) => return do:
 // The input packet: the seconds since the last frame, the viewport's width and
 // height, the event and state counts, the events and the state. Anything else
 // traps.
-const decode_input_into = func values -> (events: ResizeArray Event) => return do:
+func decode_input_into values -> (events: ResizeArray Event) => return do:
   use lanes.require (values.length >= frame_header_floats)
   use lanes.finite values
   let elapsed = (values.at (0))

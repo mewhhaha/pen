@@ -8,7 +8,7 @@ import * as lanes from "./lanes"
 import * as protocol from "./protocol"
 
 // An event's walk: its tag, then its fields in the schema's order.
-const canonical_event = func (event: protocol.Event) => return case event of
+func canonical_event (event: protocol.Event) => return case event of
   $protocol.KeyDown value => #[1.0, U32.to_f32 value]
   $protocol.KeyUp value => #[2.0, U32.to_f32 value]
   $protocol.PointerDown { button, x, y } => #[3.0, U32.to_f32 button, x, y]
@@ -41,7 +41,7 @@ const canonical_event = func (event: protocol.Event) => return case event of
 // The input's walk, as pen-protocol's canonical_input makes it: elapsed, the
 // viewport's width and height, the events' count and walks, then the state's
 // count and lanes.
-const canonical_input = func (input: protocol.Input) => return do:
+func canonical_input (input: protocol.Input) => return do:
   let $protocol.Input { elapsed, width, height, events, state } = input
   let output: GrowArray F32 = #[elapsed, width, height, U32.to_f32 events.length]
   for event in events:
@@ -51,40 +51,45 @@ const canonical_input = func (input: protocol.Input) => return do:
   return @storage.freeze output
 
 
-const draw_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+// What a walk has made so far: where it reads next, the packet's lanes, and
+// the child records and tail lanes that follow them. A writer takes it over
+// and returns it.
+type Stream = { at: U32, output: ResizeArray F32, children: ResizeArray F32, extras: ResizeArray F32 }
+
+func draw_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 24:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
-  destination[base + 3] := canonical[at + 1]
-  destination[base + 4] := canonical[at + 2]
-  destination[base + 5] := canonical[at + 3]
-  destination[base + 6] := canonical[at + 4]
-  destination[base + 7] := canonical[at + 5]
-  destination[base + 8] := canonical[at + 6]
-  destination[base + 9] := canonical[at + 7]
-  destination[base + 10] := canonical[at + 8]
-  destination[base + 11] := canonical[at + 9]
-  destination[base + 12] := canonical[at + 10]
-  destination[base + 13] := canonical[at + 11]
-  destination[base + 14] := canonical[at + 12]
-  destination[base + 15] := canonical[at + 13]
-  destination[base + 16] := canonical[at + 14]
-  destination[base + 17] := canonical[at + 15]
+  stream.output[base + 2] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 1]
+  stream.output[base + 4] := canonical[at + 2]
+  stream.output[base + 5] := canonical[at + 3]
+  stream.output[base + 6] := canonical[at + 4]
+  stream.output[base + 7] := canonical[at + 5]
+  stream.output[base + 8] := canonical[at + 6]
+  stream.output[base + 9] := canonical[at + 7]
+  stream.output[base + 10] := canonical[at + 8]
+  stream.output[base + 11] := canonical[at + 9]
+  stream.output[base + 12] := canonical[at + 10]
+  stream.output[base + 13] := canonical[at + 11]
+  stream.output[base + 14] := canonical[at + 12]
+  stream.output[base + 15] := canonical[at + 13]
+  stream.output[base + 16] := canonical[at + 14]
+  stream.output[base + 17] := canonical[at + 15]
   at := at + 16
   let present = lanes.integer canonical[at] 1
   at := at + 1
   if present == 1:
-    destination[base + 18] := 4.0
-    destination[base + 19] := canonical[at + 0]
-    destination[base + 20] := canonical[at + 1]
-    destination[base + 21] := canonical[at + 2]
-    destination[base + 22] := canonical[at + 3]
+    stream.output[base + 18] := 4.0
+    stream.output[base + 19] := canonical[at + 0]
+    stream.output[base + 20] := canonical[at + 1]
+    stream.output[base + 21] := canonical[at + 2]
+    stream.output[base + 22] := canonical[at + 3]
     at := at + 4
   let present = lanes.integer canonical[at] 1
   at := at + 1
@@ -92,222 +97,230 @@ const draw_into = func (canonical: Array F32) -> (start: U32) -> (destination: R
     let count = lanes.integer canonical[at] lanes.max_integer
     lanes.require (count % 4 == 0)
     at := at + 1
-    destination[base + 23] := U32.to_f32 (count / 4)
+    stream.output[base + 23] := U32.to_f32 (count / 4)
     for index in 0 .. count:
-      @storage.push extras canonical[at + index]
+      @storage.push stream.extras canonical[at + index]
     at := at + count
-  return at
+  stream.at := at
+  return stream
 
-const solid_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func solid_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 1:
-    @storage.push destination 0.0
+    @storage.push stream.output 0.0
   let count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
-  destination[base + 0] := U32.to_f32 count
+  stream.output[base + 0] := U32.to_f32 count
   for 0 .. count:
-    let base = destination.length
+    let base = stream.output.length
     for 0 .. 5:
-      @storage.push destination 0.0
-    destination[base + 0] := canonical[at + 0]
-    destination[base + 1] := canonical[at + 1]
-    destination[base + 2] := canonical[at + 2]
+      @storage.push stream.output 0.0
+    stream.output[base + 0] := canonical[at + 0]
+    stream.output[base + 1] := canonical[at + 1]
+    stream.output[base + 2] := canonical[at + 2]
     at := at + 3
-    destination[base + 3] := canonical[at + 0]
+    stream.output[base + 3] := canonical[at + 0]
     at := at + 1
-    destination[base + 4] := canonical[at + 0]
+    stream.output[base + 4] := canonical[at + 0]
     at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const decal_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func decal_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 18:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
-  destination[base + 2] := canonical[at + 1]
-  destination[base + 3] := canonical[at + 2]
-  destination[base + 4] := canonical[at + 3]
-  destination[base + 5] := canonical[at + 4]
-  destination[base + 6] := canonical[at + 5]
-  destination[base + 7] := canonical[at + 6]
-  destination[base + 8] := canonical[at + 7]
-  destination[base + 9] := canonical[at + 8]
-  destination[base + 10] := canonical[at + 9]
-  destination[base + 11] := canonical[at + 10]
-  destination[base + 12] := canonical[at + 11]
-  destination[base + 13] := canonical[at + 12]
-  destination[base + 14] := canonical[at + 13]
-  destination[base + 15] := canonical[at + 14]
-  destination[base + 16] := canonical[at + 15]
+  stream.output[base + 1] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 1]
+  stream.output[base + 3] := canonical[at + 2]
+  stream.output[base + 4] := canonical[at + 3]
+  stream.output[base + 5] := canonical[at + 4]
+  stream.output[base + 6] := canonical[at + 5]
+  stream.output[base + 7] := canonical[at + 6]
+  stream.output[base + 8] := canonical[at + 7]
+  stream.output[base + 9] := canonical[at + 8]
+  stream.output[base + 10] := canonical[at + 9]
+  stream.output[base + 11] := canonical[at + 10]
+  stream.output[base + 12] := canonical[at + 11]
+  stream.output[base + 13] := canonical[at + 12]
+  stream.output[base + 14] := canonical[at + 13]
+  stream.output[base + 15] := canonical[at + 14]
+  stream.output[base + 16] := canonical[at + 15]
   at := at + 16
-  destination[base + 17] := canonical[at + 0]
+  stream.output[base + 17] := canonical[at + 0]
   at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const sound_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func sound_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 7:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 0]
   at := at + 1
-  destination[base + 3] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
-  destination[base + 4] := canonical[at + 0]
+  stream.output[base + 4] := canonical[at + 0]
   at := at + 1
-  destination[base + 5] := canonical[at + 0]
+  stream.output[base + 5] := canonical[at + 0]
   at := at + 1
-  destination[base + 6] := canonical[at + 0]
+  stream.output[base + 6] := canonical[at + 0]
   at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const sprite_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func sprite_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 17:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 0]
   at := at + 1
-  destination[base + 3] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
-  destination[base + 4] := canonical[at + 0]
+  stream.output[base + 4] := canonical[at + 0]
   at := at + 1
-  destination[base + 5] := canonical[at + 0]
+  stream.output[base + 5] := canonical[at + 0]
   at := at + 1
-  destination[base + 6] := canonical[at + 0]
+  stream.output[base + 6] := canonical[at + 0]
   at := at + 1
-  destination[base + 7] := canonical[at + 0]
+  stream.output[base + 7] := canonical[at + 0]
   at := at + 1
-  destination[base + 8] := canonical[at + 0]
-  destination[base + 9] := canonical[at + 1]
-  destination[base + 10] := canonical[at + 2]
-  destination[base + 11] := canonical[at + 3]
+  stream.output[base + 8] := canonical[at + 0]
+  stream.output[base + 9] := canonical[at + 1]
+  stream.output[base + 10] := canonical[at + 2]
+  stream.output[base + 11] := canonical[at + 3]
   at := at + 4
-  destination[base + 12] := canonical[at + 0]
+  stream.output[base + 12] := canonical[at + 0]
   at := at + 1
-  destination[base + 13] := canonical[at + 0]
-  destination[base + 14] := canonical[at + 1]
-  destination[base + 15] := canonical[at + 2]
-  destination[base + 16] := canonical[at + 3]
+  stream.output[base + 13] := canonical[at + 0]
+  stream.output[base + 14] := canonical[at + 1]
+  stream.output[base + 15] := canonical[at + 2]
+  stream.output[base + 16] := canonical[at + 3]
   at := at + 4
-  return at
+  stream.at := at
+  return stream
 
-const inset_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func inset_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 48:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 0]
   at := at + 1
-  destination[base + 3] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
-  destination[base + 4] := canonical[at + 0]
-  destination[base + 5] := canonical[at + 1]
-  destination[base + 6] := canonical[at + 2]
-  destination[base + 7] := canonical[at + 3]
-  destination[base + 8] := canonical[at + 4]
-  destination[base + 9] := canonical[at + 5]
-  destination[base + 10] := canonical[at + 6]
-  destination[base + 11] := canonical[at + 7]
-  destination[base + 12] := canonical[at + 8]
-  destination[base + 13] := canonical[at + 9]
-  destination[base + 14] := canonical[at + 10]
-  destination[base + 15] := canonical[at + 11]
-  destination[base + 16] := canonical[at + 12]
-  destination[base + 17] := canonical[at + 13]
-  destination[base + 18] := canonical[at + 14]
-  destination[base + 19] := canonical[at + 15]
+  stream.output[base + 4] := canonical[at + 0]
+  stream.output[base + 5] := canonical[at + 1]
+  stream.output[base + 6] := canonical[at + 2]
+  stream.output[base + 7] := canonical[at + 3]
+  stream.output[base + 8] := canonical[at + 4]
+  stream.output[base + 9] := canonical[at + 5]
+  stream.output[base + 10] := canonical[at + 6]
+  stream.output[base + 11] := canonical[at + 7]
+  stream.output[base + 12] := canonical[at + 8]
+  stream.output[base + 13] := canonical[at + 9]
+  stream.output[base + 14] := canonical[at + 10]
+  stream.output[base + 15] := canonical[at + 11]
+  stream.output[base + 16] := canonical[at + 12]
+  stream.output[base + 17] := canonical[at + 13]
+  stream.output[base + 18] := canonical[at + 14]
+  stream.output[base + 19] := canonical[at + 15]
   at := at + 16
-  destination[base + 20] := canonical[at + 0]
-  destination[base + 21] := canonical[at + 1]
-  destination[base + 22] := canonical[at + 2]
-  destination[base + 23] := canonical[at + 3]
-  destination[base + 24] := canonical[at + 4]
-  destination[base + 25] := canonical[at + 5]
-  destination[base + 26] := canonical[at + 6]
-  destination[base + 27] := canonical[at + 7]
-  destination[base + 28] := canonical[at + 8]
-  destination[base + 29] := canonical[at + 9]
-  destination[base + 30] := canonical[at + 10]
-  destination[base + 31] := canonical[at + 11]
-  destination[base + 32] := canonical[at + 12]
-  destination[base + 33] := canonical[at + 13]
-  destination[base + 34] := canonical[at + 14]
-  destination[base + 35] := canonical[at + 15]
+  stream.output[base + 20] := canonical[at + 0]
+  stream.output[base + 21] := canonical[at + 1]
+  stream.output[base + 22] := canonical[at + 2]
+  stream.output[base + 23] := canonical[at + 3]
+  stream.output[base + 24] := canonical[at + 4]
+  stream.output[base + 25] := canonical[at + 5]
+  stream.output[base + 26] := canonical[at + 6]
+  stream.output[base + 27] := canonical[at + 7]
+  stream.output[base + 28] := canonical[at + 8]
+  stream.output[base + 29] := canonical[at + 9]
+  stream.output[base + 30] := canonical[at + 10]
+  stream.output[base + 31] := canonical[at + 11]
+  stream.output[base + 32] := canonical[at + 12]
+  stream.output[base + 33] := canonical[at + 13]
+  stream.output[base + 34] := canonical[at + 14]
+  stream.output[base + 35] := canonical[at + 15]
   at := at + 16
-  destination[base + 36] := canonical[at + 0]
-  destination[base + 37] := canonical[at + 1]
-  destination[base + 38] := canonical[at + 2]
+  stream.output[base + 36] := canonical[at + 0]
+  stream.output[base + 37] := canonical[at + 1]
+  stream.output[base + 38] := canonical[at + 2]
   at := at + 3
-  destination[base + 39] := canonical[at + 0]
-  destination[base + 40] := canonical[at + 1]
-  destination[base + 41] := canonical[at + 2]
+  stream.output[base + 39] := canonical[at + 0]
+  stream.output[base + 40] := canonical[at + 1]
+  stream.output[base + 41] := canonical[at + 2]
   at := at + 3
-  destination[base + 42] := canonical[at + 0]
-  destination[base + 43] := canonical[at + 1]
-  destination[base + 44] := canonical[at + 2]
+  stream.output[base + 42] := canonical[at + 0]
+  stream.output[base + 43] := canonical[at + 1]
+  stream.output[base + 44] := canonical[at + 2]
   at := at + 3
   let count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
-  destination[base + 45] := U32.to_f32 count
+  stream.output[base + 45] := U32.to_f32 count
+  stream.at := at
   for 0 .. count:
-    at := inset_draw_into canonical at children children extras
-  destination[base + 46] := canonical[at + 0]
+    stream := inset_draw_into canonical stream
+  at := stream.at
+  stream.output[base + 46] := canonical[at + 0]
   at := at + 1
-  destination[base + 47] := canonical[at + 0]
+  stream.output[base + 47] := canonical[at + 0]
   at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const inset_draw_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func inset_draw_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.children.length
   for 0 .. 24:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.children 0.0
+  stream.children[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.children[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
-  destination[base + 3] := canonical[at + 1]
-  destination[base + 4] := canonical[at + 2]
-  destination[base + 5] := canonical[at + 3]
-  destination[base + 6] := canonical[at + 4]
-  destination[base + 7] := canonical[at + 5]
-  destination[base + 8] := canonical[at + 6]
-  destination[base + 9] := canonical[at + 7]
-  destination[base + 10] := canonical[at + 8]
-  destination[base + 11] := canonical[at + 9]
-  destination[base + 12] := canonical[at + 10]
-  destination[base + 13] := canonical[at + 11]
-  destination[base + 14] := canonical[at + 12]
-  destination[base + 15] := canonical[at + 13]
-  destination[base + 16] := canonical[at + 14]
-  destination[base + 17] := canonical[at + 15]
+  stream.children[base + 2] := canonical[at + 0]
+  stream.children[base + 3] := canonical[at + 1]
+  stream.children[base + 4] := canonical[at + 2]
+  stream.children[base + 5] := canonical[at + 3]
+  stream.children[base + 6] := canonical[at + 4]
+  stream.children[base + 7] := canonical[at + 5]
+  stream.children[base + 8] := canonical[at + 6]
+  stream.children[base + 9] := canonical[at + 7]
+  stream.children[base + 10] := canonical[at + 8]
+  stream.children[base + 11] := canonical[at + 9]
+  stream.children[base + 12] := canonical[at + 10]
+  stream.children[base + 13] := canonical[at + 11]
+  stream.children[base + 14] := canonical[at + 12]
+  stream.children[base + 15] := canonical[at + 13]
+  stream.children[base + 16] := canonical[at + 14]
+  stream.children[base + 17] := canonical[at + 15]
   at := at + 16
   let present = lanes.integer canonical[at] 1
   at := at + 1
   if present == 1:
-    destination[base + 18] := 4.0
-    destination[base + 19] := canonical[at + 0]
-    destination[base + 20] := canonical[at + 1]
-    destination[base + 21] := canonical[at + 2]
-    destination[base + 22] := canonical[at + 3]
+    stream.children[base + 18] := 4.0
+    stream.children[base + 19] := canonical[at + 0]
+    stream.children[base + 20] := canonical[at + 1]
+    stream.children[base + 21] := canonical[at + 2]
+    stream.children[base + 22] := canonical[at + 3]
     at := at + 4
   let present = lanes.integer canonical[at] 1
   at := at + 1
@@ -315,614 +328,640 @@ const inset_draw_into = func (canonical: Array F32) -> (start: U32) -> (destinat
     let count = lanes.integer canonical[at] lanes.max_integer
     lanes.require (count % 4 == 0)
     at := at + 1
-    destination[base + 23] := U32.to_f32 (count / 4)
+    stream.children[base + 23] := U32.to_f32 (count / 4)
     for index in 0 .. count:
-      @storage.push extras canonical[at + index]
+      @storage.push stream.extras canonical[at + index]
     at := at + count
-  return at
+  stream.at := at
+  return stream
 
-const field_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func field_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 7:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 0]
   at := at + 1
-  destination[base + 3] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
-  destination[base + 4] := canonical[at + 0]
+  stream.output[base + 4] := canonical[at + 0]
   at := at + 1
-  destination[base + 5] := canonical[at + 0]
+  stream.output[base + 5] := canonical[at + 0]
   at := at + 1
-  destination[base + 6] := canonical[at + 0]
+  stream.output[base + 6] := canonical[at + 0]
   at := at + 1
   let count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
   for 0 .. count:
-    @storage.push destination canonical[at]
+    @storage.push stream.output canonical[at]
     at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const ui_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func ui_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 24:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 0]
   at := at + 1
-  destination[base + 3] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
-  destination[base + 4] := canonical[at + 0]
+  stream.output[base + 4] := canonical[at + 0]
   at := at + 1
-  destination[base + 5] := canonical[at + 0]
+  stream.output[base + 5] := canonical[at + 0]
   at := at + 1
-  destination[base + 6] := canonical[at + 0]
+  stream.output[base + 6] := canonical[at + 0]
   at := at + 1
-  destination[base + 7] := canonical[at + 0]
+  stream.output[base + 7] := canonical[at + 0]
   at := at + 1
-  destination[base + 8] := canonical[at + 0]
+  stream.output[base + 8] := canonical[at + 0]
   at := at + 1
-  destination[base + 9] := canonical[at + 0]
+  stream.output[base + 9] := canonical[at + 0]
   at := at + 1
-  destination[base + 10] := canonical[at + 0]
+  stream.output[base + 10] := canonical[at + 0]
   at := at + 1
-  destination[base + 11] := canonical[at + 0]
+  stream.output[base + 11] := canonical[at + 0]
   at := at + 1
-  destination[base + 12] := canonical[at + 0]
+  stream.output[base + 12] := canonical[at + 0]
   at := at + 1
-  destination[base + 13] := canonical[at + 0]
+  stream.output[base + 13] := canonical[at + 0]
   at := at + 1
-  destination[base + 14] := canonical[at + 0]
+  stream.output[base + 14] := canonical[at + 0]
   at := at + 1
-  destination[base + 15] := canonical[at + 0]
+  stream.output[base + 15] := canonical[at + 0]
   at := at + 1
-  destination[base + 16] := canonical[at + 0]
+  stream.output[base + 16] := canonical[at + 0]
   at := at + 1
-  destination[base + 17] := canonical[at + 0]
+  stream.output[base + 17] := canonical[at + 0]
   at := at + 1
-  destination[base + 18] := canonical[at + 0]
+  stream.output[base + 18] := canonical[at + 0]
   at := at + 1
-  destination[base + 19] := canonical[at + 0]
+  stream.output[base + 19] := canonical[at + 0]
   at := at + 1
-  destination[base + 20] := canonical[at + 0]
+  stream.output[base + 20] := canonical[at + 0]
   at := at + 1
-  destination[base + 21] := canonical[at + 0]
+  stream.output[base + 21] := canonical[at + 0]
   at := at + 1
-  destination[base + 22] := canonical[at + 0]
+  stream.output[base + 22] := canonical[at + 0]
   at := at + 1
-  destination[base + 23] := canonical[at + 0]
+  stream.output[base + 23] := canonical[at + 0]
   at := at + 1
   let count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
   for 0 .. count:
-    @storage.push destination canonical[at]
+    @storage.push stream.output canonical[at]
     at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const service_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func service_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 8:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 0]
   at := at + 1
-  destination[base + 3] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
-  destination[base + 4] := canonical[at + 0]
+  stream.output[base + 4] := canonical[at + 0]
   at := at + 1
-  destination[base + 5] := canonical[at + 0]
+  stream.output[base + 5] := canonical[at + 0]
   at := at + 1
-  destination[base + 6] := canonical[at + 0]
+  stream.output[base + 6] := canonical[at + 0]
   at := at + 1
-  destination[base + 7] := canonical[at + 0]
+  stream.output[base + 7] := canonical[at + 0]
   at := at + 1
   let count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
   for 0 .. count:
-    @storage.push destination canonical[at]
+    @storage.push stream.output canonical[at]
     at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const buse_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func buse_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 3:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 0]
   at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const voice_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func voice_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 12:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 0]
   at := at + 1
-  destination[base + 3] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
-  destination[base + 4] := canonical[at + 0]
+  stream.output[base + 4] := canonical[at + 0]
   at := at + 1
-  destination[base + 5] := canonical[at + 0]
+  stream.output[base + 5] := canonical[at + 0]
   at := at + 1
-  destination[base + 6] := canonical[at + 0]
+  stream.output[base + 6] := canonical[at + 0]
   at := at + 1
-  destination[base + 7] := canonical[at + 0]
+  stream.output[base + 7] := canonical[at + 0]
   at := at + 1
-  destination[base + 8] := canonical[at + 0]
+  stream.output[base + 8] := canonical[at + 0]
   at := at + 1
-  destination[base + 9] := canonical[at + 0]
+  stream.output[base + 9] := canonical[at + 0]
   at := at + 1
-  destination[base + 10] := canonical[at + 0]
+  stream.output[base + 10] := canonical[at + 0]
   at := at + 1
-  destination[base + 11] := canonical[at + 0]
+  stream.output[base + 11] := canonical[at + 0]
   at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const pose_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func pose_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 4:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 0]
   at := at + 1
-  destination[base + 3] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const emitter_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func emitter_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 42:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
-  destination[base + 2] := canonical[at + 1]
-  destination[base + 3] := canonical[at + 2]
-  destination[base + 4] := canonical[at + 3]
-  destination[base + 5] := canonical[at + 4]
-  destination[base + 6] := canonical[at + 5]
-  destination[base + 7] := canonical[at + 6]
-  destination[base + 8] := canonical[at + 7]
-  destination[base + 9] := canonical[at + 8]
-  destination[base + 10] := canonical[at + 9]
-  destination[base + 11] := canonical[at + 10]
-  destination[base + 12] := canonical[at + 11]
-  destination[base + 13] := canonical[at + 12]
-  destination[base + 14] := canonical[at + 13]
-  destination[base + 15] := canonical[at + 14]
-  destination[base + 16] := canonical[at + 15]
+  stream.output[base + 1] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 1]
+  stream.output[base + 3] := canonical[at + 2]
+  stream.output[base + 4] := canonical[at + 3]
+  stream.output[base + 5] := canonical[at + 4]
+  stream.output[base + 6] := canonical[at + 5]
+  stream.output[base + 7] := canonical[at + 6]
+  stream.output[base + 8] := canonical[at + 7]
+  stream.output[base + 9] := canonical[at + 8]
+  stream.output[base + 10] := canonical[at + 9]
+  stream.output[base + 11] := canonical[at + 10]
+  stream.output[base + 12] := canonical[at + 11]
+  stream.output[base + 13] := canonical[at + 12]
+  stream.output[base + 14] := canonical[at + 13]
+  stream.output[base + 15] := canonical[at + 14]
+  stream.output[base + 16] := canonical[at + 15]
   at := at + 16
-  destination[base + 17] := canonical[at + 0]
+  stream.output[base + 17] := canonical[at + 0]
   at := at + 1
-  destination[base + 18] := canonical[at + 0]
+  stream.output[base + 18] := canonical[at + 0]
   at := at + 1
-  destination[base + 19] := canonical[at + 0]
+  stream.output[base + 19] := canonical[at + 0]
   at := at + 1
-  destination[base + 20] := canonical[at + 0]
+  stream.output[base + 20] := canonical[at + 0]
   at := at + 1
-  destination[base + 21] := canonical[at + 0]
+  stream.output[base + 21] := canonical[at + 0]
   at := at + 1
-  destination[base + 22] := canonical[at + 0]
+  stream.output[base + 22] := canonical[at + 0]
   at := at + 1
-  destination[base + 23] := canonical[at + 0]
-  destination[base + 24] := canonical[at + 1]
-  destination[base + 25] := canonical[at + 2]
+  stream.output[base + 23] := canonical[at + 0]
+  stream.output[base + 24] := canonical[at + 1]
+  stream.output[base + 25] := canonical[at + 2]
   at := at + 3
-  destination[base + 26] := canonical[at + 0]
+  stream.output[base + 26] := canonical[at + 0]
   at := at + 1
-  destination[base + 27] := canonical[at + 0]
-  destination[base + 28] := canonical[at + 1]
-  destination[base + 29] := canonical[at + 2]
+  stream.output[base + 27] := canonical[at + 0]
+  stream.output[base + 28] := canonical[at + 1]
+  stream.output[base + 29] := canonical[at + 2]
   at := at + 3
-  destination[base + 30] := canonical[at + 0]
+  stream.output[base + 30] := canonical[at + 0]
   at := at + 1
-  destination[base + 31] := canonical[at + 0]
+  stream.output[base + 31] := canonical[at + 0]
   at := at + 1
-  destination[base + 32] := canonical[at + 0]
+  stream.output[base + 32] := canonical[at + 0]
   at := at + 1
-  destination[base + 33] := canonical[at + 0]
-  destination[base + 34] := canonical[at + 1]
-  destination[base + 35] := canonical[at + 2]
-  destination[base + 36] := canonical[at + 3]
+  stream.output[base + 33] := canonical[at + 0]
+  stream.output[base + 34] := canonical[at + 1]
+  stream.output[base + 35] := canonical[at + 2]
+  stream.output[base + 36] := canonical[at + 3]
   at := at + 4
-  destination[base + 37] := canonical[at + 0]
-  destination[base + 38] := canonical[at + 1]
-  destination[base + 39] := canonical[at + 2]
-  destination[base + 40] := canonical[at + 3]
+  stream.output[base + 37] := canonical[at + 0]
+  stream.output[base + 38] := canonical[at + 1]
+  stream.output[base + 39] := canonical[at + 2]
+  stream.output[base + 40] := canonical[at + 3]
   at := at + 4
-  destination[base + 41] := canonical[at + 0]
+  stream.output[base + 41] := canonical[at + 0]
   at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const light_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func light_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 12:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
-  destination[base + 1] := canonical[at + 1]
-  destination[base + 2] := canonical[at + 2]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 1]
+  stream.output[base + 2] := canonical[at + 2]
   at := at + 3
-  destination[base + 3] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
-  destination[base + 4] := canonical[at + 0]
-  destination[base + 5] := canonical[at + 1]
-  destination[base + 6] := canonical[at + 2]
+  stream.output[base + 4] := canonical[at + 0]
+  stream.output[base + 5] := canonical[at + 1]
+  stream.output[base + 6] := canonical[at + 2]
   at := at + 3
-  destination[base + 7] := canonical[at + 0]
-  destination[base + 8] := canonical[at + 1]
-  destination[base + 9] := canonical[at + 2]
+  stream.output[base + 7] := canonical[at + 0]
+  stream.output[base + 8] := canonical[at + 1]
+  stream.output[base + 9] := canonical[at + 2]
   at := at + 3
-  destination[base + 10] := canonical[at + 0]
+  stream.output[base + 10] := canonical[at + 0]
   at := at + 1
-  destination[base + 11] := canonical[at + 0]
+  stream.output[base + 11] := canonical[at + 0]
   at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const listener_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func listener_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 9:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
-  destination[base + 1] := canonical[at + 1]
-  destination[base + 2] := canonical[at + 2]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 1]
+  stream.output[base + 2] := canonical[at + 2]
   at := at + 3
-  destination[base + 3] := canonical[at + 0]
-  destination[base + 4] := canonical[at + 1]
-  destination[base + 5] := canonical[at + 2]
+  stream.output[base + 3] := canonical[at + 0]
+  stream.output[base + 4] := canonical[at + 1]
+  stream.output[base + 5] := canonical[at + 2]
   at := at + 3
-  destination[base + 6] := canonical[at + 0]
-  destination[base + 7] := canonical[at + 1]
-  destination[base + 8] := canonical[at + 2]
+  stream.output[base + 6] := canonical[at + 0]
+  stream.output[base + 7] := canonical[at + 1]
+  stream.output[base + 8] := canonical[at + 2]
   at := at + 3
-  return at
+  stream.at := at
+  return stream
 
-const panner_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func panner_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 15:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
-  destination[base + 3] := canonical[at + 1]
-  destination[base + 4] := canonical[at + 2]
+  stream.output[base + 2] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 1]
+  stream.output[base + 4] := canonical[at + 2]
   at := at + 3
-  destination[base + 5] := canonical[at + 0]
-  destination[base + 6] := canonical[at + 1]
-  destination[base + 7] := canonical[at + 2]
+  stream.output[base + 5] := canonical[at + 0]
+  stream.output[base + 6] := canonical[at + 1]
+  stream.output[base + 7] := canonical[at + 2]
   at := at + 3
-  destination[base + 8] := canonical[at + 0]
+  stream.output[base + 8] := canonical[at + 0]
   at := at + 1
-  destination[base + 9] := canonical[at + 0]
+  stream.output[base + 9] := canonical[at + 0]
   at := at + 1
-  destination[base + 10] := canonical[at + 0]
+  stream.output[base + 10] := canonical[at + 0]
   at := at + 1
-  destination[base + 11] := canonical[at + 0]
+  stream.output[base + 11] := canonical[at + 0]
   at := at + 1
-  destination[base + 12] := canonical[at + 0]
+  stream.output[base + 12] := canonical[at + 0]
   at := at + 1
-  destination[base + 13] := canonical[at + 0]
+  stream.output[base + 13] := canonical[at + 0]
   at := at + 1
-  destination[base + 14] := canonical[at + 0]
+  stream.output[base + 14] := canonical[at + 0]
   at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-const instance_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func instance_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 26:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  destination[base + 2] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 0]
   at := at + 1
-  destination[base + 3] := canonical[at + 0]
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
-  destination[base + 4] := canonical[at + 0]
+  stream.output[base + 4] := canonical[at + 0]
   at := at + 1
-  destination[base + 5] := canonical[at + 0]
-  destination[base + 6] := canonical[at + 1]
-  destination[base + 7] := canonical[at + 2]
-  destination[base + 8] := canonical[at + 3]
-  destination[base + 9] := canonical[at + 4]
-  destination[base + 10] := canonical[at + 5]
-  destination[base + 11] := canonical[at + 6]
-  destination[base + 12] := canonical[at + 7]
-  destination[base + 13] := canonical[at + 8]
-  destination[base + 14] := canonical[at + 9]
-  destination[base + 15] := canonical[at + 10]
-  destination[base + 16] := canonical[at + 11]
-  destination[base + 17] := canonical[at + 12]
-  destination[base + 18] := canonical[at + 13]
-  destination[base + 19] := canonical[at + 14]
-  destination[base + 20] := canonical[at + 15]
+  stream.output[base + 5] := canonical[at + 0]
+  stream.output[base + 6] := canonical[at + 1]
+  stream.output[base + 7] := canonical[at + 2]
+  stream.output[base + 8] := canonical[at + 3]
+  stream.output[base + 9] := canonical[at + 4]
+  stream.output[base + 10] := canonical[at + 5]
+  stream.output[base + 11] := canonical[at + 6]
+  stream.output[base + 12] := canonical[at + 7]
+  stream.output[base + 13] := canonical[at + 8]
+  stream.output[base + 14] := canonical[at + 9]
+  stream.output[base + 15] := canonical[at + 10]
+  stream.output[base + 16] := canonical[at + 11]
+  stream.output[base + 17] := canonical[at + 12]
+  stream.output[base + 18] := canonical[at + 13]
+  stream.output[base + 19] := canonical[at + 14]
+  stream.output[base + 20] := canonical[at + 15]
   at := at + 16
   let present = lanes.integer canonical[at] 1
   at := at + 1
   if present == 1:
-    destination[base + 21] := 4.0
-    destination[base + 22] := canonical[at + 0]
-    destination[base + 23] := canonical[at + 1]
-    destination[base + 24] := canonical[at + 2]
-    destination[base + 25] := canonical[at + 3]
+    stream.output[base + 21] := 4.0
+    stream.output[base + 22] := canonical[at + 0]
+    stream.output[base + 23] := canonical[at + 1]
+    stream.output[base + 24] := canonical[at + 2]
+    stream.output[base + 25] := canonical[at + 3]
     at := at + 4
-  return at
+  stream.at := at
+  return stream
 
-const instance_removal_into = func (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:
-  let at = start
-  let base = destination.length
+func instance_removal_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+  let at = stream.at
+  let base = stream.output.length
   for 0 .. 2:
-    @storage.push destination 0.0
-  destination[base + 0] := canonical[at + 0]
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
   at := at + 1
-  destination[base + 1] := canonical[at + 0]
+  stream.output[base + 1] := canonical[at + 0]
   at := at + 1
-  return at
+  stream.at := at
+  return stream
 
-// Canonical render values streamed into named packet, inset-draw and extra pools.
-const render_packet_from_canonical = func (canonical: Array F32) -> (output: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32) => return do:
+// Canonical render values streamed into the packet it is given and returns.
+func render_packet_from_canonical (canonical: Array F32) -> (output: own ResizeArray F32): ResizeArray F32 => return do:
   lanes.finite canonical
   @storage.truncate output 0
-  @storage.truncate children 0
-  @storage.truncate extras 0
   for 0 .. protocol.packet_header_floats:
     @storage.push output 0.0
-  output[0] := protocol.packet_magic
+  let children: ResizeArray F32 = #[]
+  let extras: ResizeArray F32 = #[]
+  let stream: Stream = { at: 0, output, children, extras }
+  stream.output[0] := protocol.packet_magic
   let at: U32 = 0
-  output[1] := canonical[at + 0]
+  stream.output[1] := canonical[at + 0]
   at := at + 1
-  output[12] := canonical[at + 0]
+  stream.output[12] := canonical[at + 0]
   at := at + 1
-  output[13] := canonical[at + 0]
+  stream.output[13] := canonical[at + 0]
   at := at + 1
-  output[14] := canonical[at + 0]
+  stream.output[14] := canonical[at + 0]
   at := at + 1
-  output[15] := canonical[at + 0]
+  stream.output[15] := canonical[at + 0]
   at := at + 1
-  output[16] := canonical[at + 0]
+  stream.output[16] := canonical[at + 0]
   at := at + 1
-  output[17] := canonical[at + 0]
+  stream.output[17] := canonical[at + 0]
   at := at + 1
-  output[18] := canonical[at + 0]
+  stream.output[18] := canonical[at + 0]
   at := at + 1
-  output[19] := canonical[at + 0]
+  stream.output[19] := canonical[at + 0]
   at := at + 1
-  output[20] := canonical[at + 0]
-  output[21] := canonical[at + 1]
-  output[22] := canonical[at + 2]
-  output[23] := canonical[at + 3]
-  output[24] := canonical[at + 4]
-  output[25] := canonical[at + 5]
-  output[26] := canonical[at + 6]
-  output[27] := canonical[at + 7]
-  output[28] := canonical[at + 8]
-  output[29] := canonical[at + 9]
-  output[30] := canonical[at + 10]
-  output[31] := canonical[at + 11]
-  output[32] := canonical[at + 12]
-  output[33] := canonical[at + 13]
-  output[34] := canonical[at + 14]
-  output[35] := canonical[at + 15]
+  stream.output[20] := canonical[at + 0]
+  stream.output[21] := canonical[at + 1]
+  stream.output[22] := canonical[at + 2]
+  stream.output[23] := canonical[at + 3]
+  stream.output[24] := canonical[at + 4]
+  stream.output[25] := canonical[at + 5]
+  stream.output[26] := canonical[at + 6]
+  stream.output[27] := canonical[at + 7]
+  stream.output[28] := canonical[at + 8]
+  stream.output[29] := canonical[at + 9]
+  stream.output[30] := canonical[at + 10]
+  stream.output[31] := canonical[at + 11]
+  stream.output[32] := canonical[at + 12]
+  stream.output[33] := canonical[at + 13]
+  stream.output[34] := canonical[at + 14]
+  stream.output[35] := canonical[at + 15]
   at := at + 16
-  output[36] := canonical[at + 0]
-  output[37] := canonical[at + 1]
-  output[38] := canonical[at + 2]
-  output[39] := canonical[at + 3]
-  output[40] := canonical[at + 4]
-  output[41] := canonical[at + 5]
-  output[42] := canonical[at + 6]
-  output[43] := canonical[at + 7]
-  output[44] := canonical[at + 8]
-  output[45] := canonical[at + 9]
-  output[46] := canonical[at + 10]
-  output[47] := canonical[at + 11]
-  output[48] := canonical[at + 12]
-  output[49] := canonical[at + 13]
-  output[50] := canonical[at + 14]
-  output[51] := canonical[at + 15]
+  stream.output[36] := canonical[at + 0]
+  stream.output[37] := canonical[at + 1]
+  stream.output[38] := canonical[at + 2]
+  stream.output[39] := canonical[at + 3]
+  stream.output[40] := canonical[at + 4]
+  stream.output[41] := canonical[at + 5]
+  stream.output[42] := canonical[at + 6]
+  stream.output[43] := canonical[at + 7]
+  stream.output[44] := canonical[at + 8]
+  stream.output[45] := canonical[at + 9]
+  stream.output[46] := canonical[at + 10]
+  stream.output[47] := canonical[at + 11]
+  stream.output[48] := canonical[at + 12]
+  stream.output[49] := canonical[at + 13]
+  stream.output[50] := canonical[at + 14]
+  stream.output[51] := canonical[at + 15]
   at := at + 16
-  output[52] := canonical[at + 0]
-  output[53] := canonical[at + 1]
-  output[54] := canonical[at + 2]
-  output[55] := canonical[at + 3]
+  stream.output[52] := canonical[at + 0]
+  stream.output[53] := canonical[at + 1]
+  stream.output[54] := canonical[at + 2]
+  stream.output[55] := canonical[at + 3]
   at := at + 4
-  output[56] := canonical[at + 0]
-  output[57] := canonical[at + 1]
-  output[58] := canonical[at + 2]
+  stream.output[56] := canonical[at + 0]
+  stream.output[57] := canonical[at + 1]
+  stream.output[58] := canonical[at + 2]
   at := at + 3
-  output[59] := canonical[at + 0]
-  output[60] := canonical[at + 1]
-  output[61] := canonical[at + 2]
+  stream.output[59] := canonical[at + 0]
+  stream.output[60] := canonical[at + 1]
+  stream.output[61] := canonical[at + 2]
   at := at + 3
-  output[62] := canonical[at + 0]
-  output[63] := canonical[at + 1]
-  output[64] := canonical[at + 2]
+  stream.output[62] := canonical[at + 0]
+  stream.output[63] := canonical[at + 1]
+  stream.output[64] := canonical[at + 2]
   at := at + 3
-  output[65] := canonical[at + 0]
-  output[66] := canonical[at + 1]
+  stream.output[65] := canonical[at + 0]
+  stream.output[66] := canonical[at + 1]
   at := at + 2
-  output[67] := canonical[at + 0]
+  stream.output[67] := canonical[at + 0]
   at := at + 1
-  output[68] := canonical[at + 0]
+  stream.output[68] := canonical[at + 0]
   at := at + 1
-  output[69] := canonical[at + 0]
+  stream.output[69] := canonical[at + 0]
   at := at + 1
-  output[70] := canonical[at + 0]
+  stream.output[70] := canonical[at + 0]
   at := at + 1
-  output[71] := canonical[at + 0]
+  stream.output[71] := canonical[at + 0]
   at := at + 1
-  output[72] := canonical[at + 0]
+  stream.output[72] := canonical[at + 0]
   at := at + 1
-  output[73] := canonical[at + 0]
+  stream.output[73] := canonical[at + 0]
   at := at + 1
-  output[125] := canonical[at + 0]
+  stream.output[125] := canonical[at + 0]
   at := at + 1
-  output[140] := canonical[at + 0]
+  stream.output[140] := canonical[at + 0]
   at := at + 1
-  output[74] := canonical[at + 0]
-  output[75] := canonical[at + 1]
-  output[76] := canonical[at + 2]
+  stream.output[74] := canonical[at + 0]
+  stream.output[75] := canonical[at + 1]
+  stream.output[76] := canonical[at + 2]
   at := at + 3
-  output[77] := canonical[at + 0]
-  output[78] := canonical[at + 1]
-  output[79] := canonical[at + 2]
+  stream.output[77] := canonical[at + 0]
+  stream.output[78] := canonical[at + 1]
+  stream.output[79] := canonical[at + 2]
   at := at + 3
-  output[80] := canonical[at + 0]
-  output[81] := canonical[at + 1]
-  output[82] := canonical[at + 2]
+  stream.output[80] := canonical[at + 0]
+  stream.output[81] := canonical[at + 1]
+  stream.output[82] := canonical[at + 2]
   at := at + 3
-  output[83] := canonical[at + 0]
-  output[84] := canonical[at + 1]
-  output[85] := canonical[at + 2]
+  stream.output[83] := canonical[at + 0]
+  stream.output[84] := canonical[at + 1]
+  stream.output[85] := canonical[at + 2]
   at := at + 3
-  output[86] := canonical[at + 0]
+  stream.output[86] := canonical[at + 0]
   at := at + 1
-  output[87] := canonical[at + 0]
+  stream.output[87] := canonical[at + 0]
   at := at + 1
-  output[88] := canonical[at + 0]
+  stream.output[88] := canonical[at + 0]
   at := at + 1
-  output[89] := canonical[at + 0]
+  stream.output[89] := canonical[at + 0]
   at := at + 1
-  output[90] := canonical[at + 0]
-  output[91] := canonical[at + 1]
-  output[92] := canonical[at + 2]
-  output[93] := canonical[at + 3]
-  output[94] := canonical[at + 4]
-  output[95] := canonical[at + 5]
-  output[96] := canonical[at + 6]
-  output[97] := canonical[at + 7]
-  output[98] := canonical[at + 8]
-  output[99] := canonical[at + 9]
-  output[100] := canonical[at + 10]
-  output[101] := canonical[at + 11]
-  output[102] := canonical[at + 12]
-  output[103] := canonical[at + 13]
-  output[104] := canonical[at + 14]
-  output[105] := canonical[at + 15]
+  stream.output[90] := canonical[at + 0]
+  stream.output[91] := canonical[at + 1]
+  stream.output[92] := canonical[at + 2]
+  stream.output[93] := canonical[at + 3]
+  stream.output[94] := canonical[at + 4]
+  stream.output[95] := canonical[at + 5]
+  stream.output[96] := canonical[at + 6]
+  stream.output[97] := canonical[at + 7]
+  stream.output[98] := canonical[at + 8]
+  stream.output[99] := canonical[at + 9]
+  stream.output[100] := canonical[at + 10]
+  stream.output[101] := canonical[at + 11]
+  stream.output[102] := canonical[at + 12]
+  stream.output[103] := canonical[at + 13]
+  stream.output[104] := canonical[at + 14]
+  stream.output[105] := canonical[at + 15]
   at := at + 16
-  output[106] := canonical[at + 0]
-  output[107] := canonical[at + 1]
-  output[108] := canonical[at + 2]
-  output[109] := canonical[at + 3]
-  output[110] := canonical[at + 4]
-  output[111] := canonical[at + 5]
-  output[112] := canonical[at + 6]
-  output[113] := canonical[at + 7]
-  output[114] := canonical[at + 8]
-  output[115] := canonical[at + 9]
-  output[116] := canonical[at + 10]
-  output[117] := canonical[at + 11]
-  output[118] := canonical[at + 12]
-  output[119] := canonical[at + 13]
-  output[120] := canonical[at + 14]
-  output[121] := canonical[at + 15]
+  stream.output[106] := canonical[at + 0]
+  stream.output[107] := canonical[at + 1]
+  stream.output[108] := canonical[at + 2]
+  stream.output[109] := canonical[at + 3]
+  stream.output[110] := canonical[at + 4]
+  stream.output[111] := canonical[at + 5]
+  stream.output[112] := canonical[at + 6]
+  stream.output[113] := canonical[at + 7]
+  stream.output[114] := canonical[at + 8]
+  stream.output[115] := canonical[at + 9]
+  stream.output[116] := canonical[at + 10]
+  stream.output[117] := canonical[at + 11]
+  stream.output[118] := canonical[at + 12]
+  stream.output[119] := canonical[at + 13]
+  stream.output[120] := canonical[at + 14]
+  stream.output[121] := canonical[at + 15]
   at := at + 16
-  output[122] := canonical[at + 0]
+  stream.output[122] := canonical[at + 0]
   at := at + 1
-  output[123] := canonical[at + 0]
+  stream.output[123] := canonical[at + 0]
   at := at + 1
-  output[124] := canonical[at + 0]
+  stream.output[124] := canonical[at + 0]
   at := at + 1
-  output[126] := canonical[at + 0]
+  stream.output[126] := canonical[at + 0]
   at := at + 1
-  output[127] := canonical[at + 0]
-  output[128] := canonical[at + 1]
+  stream.output[127] := canonical[at + 0]
+  stream.output[128] := canonical[at + 1]
   at := at + 2
-  output[129] := canonical[at + 0]
+  stream.output[129] := canonical[at + 0]
   at := at + 1
-  output[144] := canonical[at + 0]
+  stream.output[144] := canonical[at + 0]
   at := at + 1
-  output[145] := canonical[at + 0]
+  stream.output[145] := canonical[at + 0]
   at := at + 1
-  output[146] := canonical[at + 0]
+  stream.output[146] := canonical[at + 0]
   at := at + 1
-  output[147] := canonical[at + 0]
+  stream.output[147] := canonical[at + 0]
   at := at + 1
-  output[148] := canonical[at + 0]
+  stream.output[148] := canonical[at + 0]
   at := at + 1
-  let state_start: U32 = output.length
+  let state_start: U32 = stream.output.length
   let state_count: U32 = 0
   state_count := lanes.integer canonical[at] lanes.max_integer
   at := at + 1
   for index in 0 .. state_count:
-    @storage.push output canonical[at + index]
+    @storage.push stream.output canonical[at + index]
   at := at + state_count
-  output[2] := U32.to_f32 (output.length - state_start)
-  let draws_start: U32 = output.length
+  stream.output[2] := U32.to_f32 (stream.output.length - state_start)
+  let draws_start: U32 = stream.output.length
   let draws_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. draws_count:
-    at := draw_into canonical at output children extras
-  output[3] := U32.to_f32 draws_count
-  let solids_start: U32 = output.length
+    stream := draw_into canonical stream
+  at := stream.at
+  stream.output[3] := U32.to_f32 draws_count
+  let solids_start: U32 = stream.output.length
   let solids_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. solids_count:
-    at := solid_into canonical at output children extras
-  output[4] := U32.to_f32 solids_count
-  output[5] := U32.to_f32 (output.length - solids_start)
-  let decals_start: U32 = output.length
+    stream := solid_into canonical stream
+  at := stream.at
+  stream.output[4] := U32.to_f32 solids_count
+  stream.output[5] := U32.to_f32 (stream.output.length - solids_start)
+  let decals_start: U32 = stream.output.length
   let decals_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. decals_count:
-    at := decal_into canonical at output children extras
-  output[6] := U32.to_f32 decals_count
-  let sounds_start: U32 = output.length
+    stream := decal_into canonical stream
+  at := stream.at
+  stream.output[6] := U32.to_f32 decals_count
+  let sounds_start: U32 = stream.output.length
   let sounds_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. sounds_count:
-    at := sound_into canonical at output children extras
-  output[7] := U32.to_f32 sounds_count
-  let sprites_start: U32 = output.length
+    stream := sound_into canonical stream
+  at := stream.at
+  stream.output[7] := U32.to_f32 sounds_count
+  let sprites_start: U32 = stream.output.length
   let sprites_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. sprites_count:
-    at := sprite_into canonical at output children extras
-  output[8] := U32.to_f32 sprites_count
-  let insets_start: U32 = output.length
+    stream := sprite_into canonical stream
+  at := stream.at
+  stream.output[8] := U32.to_f32 sprites_count
+  let insets_start: U32 = stream.output.length
   let insets_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. insets_count:
-    at := inset_into canonical at output children extras
-  output[9] := U32.to_f32 insets_count
-  let inset_draws_start: U32 = output.length
-  let inset_draws_count: U32 = children.length / 24
-  for value in children:
-    @storage.push output value
-  output[10] := U32.to_f32 inset_draws_count
-  let preferences_start: U32 = output.length
+    stream := inset_into canonical stream
+  at := stream.at
+  stream.output[9] := U32.to_f32 insets_count
+  let inset_draws_start: U32 = stream.output.length
+  let inset_draws_count: U32 = stream.children.length / 24
+  for value in stream.children:
+    @storage.push stream.output value
+  stream.output[10] := U32.to_f32 inset_draws_count
+  let preferences_start: U32 = stream.output.length
   let preferences_count: U32 = 0
   let present = lanes.integer canonical[at] 1
   at := at + 1
@@ -930,86 +969,110 @@ const render_packet_from_canonical = func (canonical: Array F32) -> (output: Res
     preferences_count := lanes.integer canonical[at] lanes.max_integer
     at := at + 1
     for index in 0 .. preferences_count:
-      @storage.push output canonical[at + index]
+      @storage.push stream.output canonical[at + index]
     at := at + preferences_count
-  output[11] := U32.to_f32 (output.length - preferences_start)
-  let fields_start: U32 = output.length
+  stream.output[11] := U32.to_f32 (stream.output.length - preferences_start)
+  let fields_start: U32 = stream.output.length
   let fields_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. fields_count:
-    at := field_into canonical at output children extras
-  output[130] := U32.to_f32 fields_count
-  output[131] := U32.to_f32 (output.length - fields_start)
-  let ui_start: U32 = output.length
+    stream := field_into canonical stream
+  at := stream.at
+  stream.output[130] := U32.to_f32 fields_count
+  stream.output[131] := U32.to_f32 (stream.output.length - fields_start)
+  let ui_start: U32 = stream.output.length
   let ui_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. ui_count:
-    at := ui_into canonical at output children extras
-  output[132] := U32.to_f32 ui_count
-  output[133] := U32.to_f32 (output.length - ui_start)
-  let services_start: U32 = output.length
+    stream := ui_into canonical stream
+  at := stream.at
+  stream.output[132] := U32.to_f32 ui_count
+  stream.output[133] := U32.to_f32 (stream.output.length - ui_start)
+  let services_start: U32 = stream.output.length
   let services_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. services_count:
-    at := service_into canonical at output children extras
-  output[134] := U32.to_f32 services_count
-  output[135] := U32.to_f32 (output.length - services_start)
-  let buses_start: U32 = output.length
+    stream := service_into canonical stream
+  at := stream.at
+  stream.output[134] := U32.to_f32 services_count
+  stream.output[135] := U32.to_f32 (stream.output.length - services_start)
+  let buses_start: U32 = stream.output.length
   let buses_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. buses_count:
-    at := buse_into canonical at output children extras
-  output[136] := U32.to_f32 buses_count
-  let voices_start: U32 = output.length
+    stream := buse_into canonical stream
+  at := stream.at
+  stream.output[136] := U32.to_f32 buses_count
+  let voices_start: U32 = stream.output.length
   let voices_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. voices_count:
-    at := voice_into canonical at output children extras
-  output[137] := U32.to_f32 voices_count
-  let poses_start: U32 = output.length
+    stream := voice_into canonical stream
+  at := stream.at
+  stream.output[137] := U32.to_f32 voices_count
+  let poses_start: U32 = stream.output.length
   let poses_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. poses_count:
-    at := pose_into canonical at output children extras
-  output[138] := U32.to_f32 poses_count
-  let emitters_start: U32 = output.length
+    stream := pose_into canonical stream
+  at := stream.at
+  stream.output[138] := U32.to_f32 poses_count
+  let emitters_start: U32 = stream.output.length
   let emitters_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. emitters_count:
-    at := emitter_into canonical at output children extras
-  output[139] := U32.to_f32 emitters_count
-  let lights_start: U32 = output.length
+    stream := emitter_into canonical stream
+  at := stream.at
+  stream.output[139] := U32.to_f32 emitters_count
+  let lights_start: U32 = stream.output.length
   let lights_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. lights_count:
-    at := light_into canonical at output children extras
-  output[141] := U32.to_f32 lights_count
-  let listener_start: U32 = output.length
+    stream := light_into canonical stream
+  at := stream.at
+  stream.output[141] := U32.to_f32 lights_count
+  let listener_start: U32 = stream.output.length
   let listener_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. listener_count:
-    at := listener_into canonical at output children extras
-  output[142] := U32.to_f32 listener_count
-  let panners_start: U32 = output.length
+    stream := listener_into canonical stream
+  at := stream.at
+  stream.output[142] := U32.to_f32 listener_count
+  let panners_start: U32 = stream.output.length
   let panners_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. panners_count:
-    at := panner_into canonical at output children extras
-  output[143] := U32.to_f32 panners_count
-  let instances_start: U32 = output.length
+    stream := panner_into canonical stream
+  at := stream.at
+  stream.output[143] := U32.to_f32 panners_count
+  let instances_start: U32 = stream.output.length
   let instances_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. instances_count:
-    at := instance_into canonical at output children extras
-  output[149] := U32.to_f32 instances_count
-  let instance_removals_start: U32 = output.length
+    stream := instance_into canonical stream
+  at := stream.at
+  stream.output[149] := U32.to_f32 instances_count
+  let instance_removals_start: U32 = stream.output.length
   let instance_removals_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
+  stream.at := at
   for 0 .. instance_removals_count:
-    at := instance_removal_into canonical at output children extras
-  output[150] := U32.to_f32 instance_removals_count
-  let extras_start: U32 = output.length
-  for value in extras:
-    @storage.push output value
+    stream := instance_removal_into canonical stream
+  at := stream.at
+  stream.output[150] := U32.to_f32 instance_removals_count
+  let extras_start: U32 = stream.output.length
+  for value in stream.extras:
+    @storage.push stream.output value
   lanes.require (at == canonical.length)
-  return ()
+  return stream.output

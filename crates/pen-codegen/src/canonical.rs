@@ -333,7 +333,7 @@ pub fn rust(model: &Model) -> Vec<String> {
 }
 
 /// Copy a fixed-width canonical value into its schema-defined packet offset.
-fn stream_field(out: &mut Vec<String>, field: &Laid, indent: &str) {
+fn stream_field(out: &mut Vec<String>, field: &Laid, pool: &str, indent: &str) {
     let offset = field.offset;
     match kind(&field.field) {
         "optional" => {
@@ -341,9 +341,9 @@ fn stream_field(out: &mut Vec<String>, field: &Laid, indent: &str) {
             out.push(format!("{indent}let present = lanes.integer canonical[at] 1"));
             out.push(format!("{indent}at := at + 1"));
             out.push(format!("{indent}if present == 1:"));
-            out.push(format!("{indent}  destination[base + {offset}] = {width}.0"));
+            out.push(format!("{indent}  stream.{pool}[base + {offset}] := {width}.0"));
             for index in 0..width {
-                out.push(format!("{indent}  destination[base + {}] = canonical[at + {index}]", offset + index + 1));
+                out.push(format!("{indent}  stream.{pool}[base + {}] := canonical[at + {index}]", offset + index + 1));
             }
             out.push(format!("{indent}  at := at + {width}"));
         }
@@ -355,9 +355,9 @@ fn stream_field(out: &mut Vec<String>, field: &Laid, indent: &str) {
             out.push(format!("{indent}  let count = lanes.integer canonical[at] lanes.max_integer"));
             out.push(format!("{indent}  lanes.require (count % {unit} == 0)"));
             out.push(format!("{indent}  at := at + 1"));
-            out.push(format!("{indent}  destination[base + {offset}] = U32.to_f32 (count / {unit})"));
+            out.push(format!("{indent}  stream.{pool}[base + {offset}] := U32.to_f32 (count / {unit})"));
             out.push(format!("{indent}  for index in 0 .. count:"));
-            out.push(format!("{indent}    @storage.push extras canonical[at + index]"));
+            out.push(format!("{indent}    @storage.push stream.extras canonical[at + index]"));
             out.push(format!("{indent}  at := at + count"));
         }
         "children" => {
@@ -365,13 +365,15 @@ fn stream_field(out: &mut Vec<String>, field: &Laid, indent: &str) {
             let child = snake(&singular(s(&field.field["section"])));
             out.push(format!("{indent}let count = lanes.integer canonical[at] lanes.max_integer"));
             out.push(format!("{indent}at := at + 1"));
-            out.push(format!("{indent}destination[base + {offset}] = U32.to_f32 count"));
+            out.push(format!("{indent}stream.{pool}[base + {offset}] := U32.to_f32 count"));
+            out.push(format!("{indent}stream.at := at"));
             out.push(format!("{indent}for 0 .. count:"));
-            out.push(format!("{indent}  at := {child}_into canonical at children children extras"));
+            out.push(format!("{indent}  stream := {child}_into canonical stream"));
+            out.push(format!("{indent}at := stream.at"));
         }
         _ => {
             for index in 0..field.lanes {
-                out.push(format!("{indent}destination[base + {}] = canonical[at + {index}]", offset + index));
+                out.push(format!("{indent}stream.{pool}[base + {}] := canonical[at + {index}]", offset + index));
             }
             out.push(format!("{indent}at := at + {}", field.lanes));
         }
@@ -382,39 +384,40 @@ fn stream_record(entry: &Section) -> Vec<String> {
     let name = singular(s(&entry.section["name"]));
     let (fields, width) =
         entry.fixed.as_ref().map_or((&entry.head, entry.head_lanes), |layout| (&layout.fields, layout.lanes));
+    // A record another record owns is written to the children's pool.
+    let pool = if entry.owner.is_some() { "children" } else { "output" };
     let mut out = vec![
         String::new(),
-        format!(
-            "func {name}_into (canonical: Array F32) -> (start: U32) -> (destination: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32): U32 => return do:"
-        ),
-        "  let at = start".to_owned(),
-        "  let base = destination.length".to_owned(),
+        format!("func {name}_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:"),
+        "  let at = stream.at".to_owned(),
+        format!("  let base = stream.{pool}.length"),
         format!("  for 0 .. {width}:"),
-        "    @storage.push destination 0.0".to_owned(),
+        format!("    @storage.push stream.{pool} 0.0"),
     ];
     for field in fields {
-        stream_field(&mut out, field, "  ");
+        stream_field(&mut out, field, pool, "  ");
     }
     if kind(&entry.section) == "variable" {
         out.push("  let count = lanes.integer canonical[at] lanes.max_integer".to_owned());
         out.push("  at := at + 1".to_owned());
         if entry.item.is_some() {
-            out.push(format!("  destination[base + {}] = U32.to_f32 count", width - 1));
+            out.push(format!("  stream.{pool}[base + {}] := U32.to_f32 count", width - 1));
         }
         out.push("  for 0 .. count:".to_owned());
         if let Some(layout) = &entry.item {
-            out.push("    let base = destination.length".to_owned());
+            out.push(format!("    let base = stream.{pool}.length"));
             out.push(format!("    for 0 .. {}:", layout.lanes));
-            out.push("      @storage.push destination 0.0".to_owned());
+            out.push(format!("      @storage.push stream.{pool} 0.0"));
             for field in &layout.fields {
-                stream_field(&mut out, field, "    ");
+                stream_field(&mut out, field, pool, "    ");
             }
         } else {
-            out.push("    @storage.push destination canonical[at]".to_owned());
+            out.push(format!("    @storage.push stream.{pool} canonical[at]"));
             out.push("    at := at + 1".to_owned());
         }
     }
-    out.push("  return at".to_owned());
+    out.push("  stream.at := at".to_owned());
+    out.push("  return stream".to_owned());
     out
 }
 
@@ -426,7 +429,7 @@ fn stream_header(out: &mut Vec<String>, field: &Laid, indent: &str) {
         } else {
             format!("canonical[at + {index}]")
         };
-        out.push(format!("{indent}output[{}] = {value}", field.offset + index));
+        out.push(format!("{indent}stream.output[{}] := {value}", field.offset + index));
     }
     out.push(format!("{indent}at := at + {}", field.lanes));
 }
@@ -434,22 +437,29 @@ fn stream_header(out: &mut Vec<String>, field: &Laid, indent: &str) {
 /// Decode a canonical walk into flat packet lanes. Deferred child records and
 /// tail lanes have separate owners so no nested owner/borrow escapes a reader.
 fn render_stream(model: &Model) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out = vec![
+        String::new(),
+        "// What a walk has made so far: where it reads next, the packet's lanes, and".to_owned(),
+        "// the child records and tail lanes that follow them. A writer takes it over".to_owned(),
+        "// and returns it.".to_owned(),
+        "type Stream = { at: U32, output: ResizeArray F32, children: ResizeArray F32, extras: ResizeArray F32 }".to_owned(),
+    ];
     for entry in &model.sections {
         if matches!(kind(&entry.section), "records" | "variable") {
             out.extend(stream_record(entry));
         }
     }
     out.extend([String::new(),
-        "// Canonical render values streamed into named packet, inset-draw and extra pools.".to_owned(),
-        "func render_packet_from_canonical (canonical: Array F32) -> (output: ResizeArray F32) -> (children: ResizeArray F32) -> (extras: ResizeArray F32) => return do:".to_owned(),
+        "// Canonical render values streamed into the packet it is given and returns.".to_owned(),
+        "func render_packet_from_canonical (canonical: Array F32) -> (output: own ResizeArray F32): ResizeArray F32 => return do:".to_owned(),
         "  lanes.finite canonical".to_owned(),
         "  @storage.truncate output 0".to_owned(),
-        "  @storage.truncate children 0".to_owned(),
-        "  @storage.truncate extras 0".to_owned(),
         "  for 0 .. protocol.packet_header_floats:".to_owned(),
         "    @storage.push output 0.0".to_owned(),
-        "  output[0] = protocol.packet_magic".to_owned(),
+        "  let children: ResizeArray F32 = #[]".to_owned(),
+        "  let extras: ResizeArray F32 = #[]".to_owned(),
+        "  let stream: Stream = { at: 0, output, children, extras }".to_owned(),
+        "  stream.output[0] := protocol.packet_magic".to_owned(),
         "  let at: U32 = 0".to_owned()]);
     for member in members(model) {
         match member {
@@ -473,17 +483,17 @@ fn render_stream(model: &Model) -> Vec<String> {
     }
     for entry in &model.sections {
         let name = s(&entry.section["name"]);
-        out.push(format!("  let {name}_start: U32 = output.length"));
+        out.push(format!("  let {name}_start: U32 = stream.output.length"));
         match kind(&entry.section) {
             "trailing" => {
-                out.push("  for value in extras:".to_owned());
-                out.push("    @storage.push output value".to_owned());
+                out.push("  for value in stream.extras:".to_owned());
+                out.push("    @storage.push stream.output value".to_owned());
             }
             _ if entry.owner.is_some() => {
                 let width = entry.fixed.as_ref().unwrap().lanes;
-                out.push(format!("  let {name}_count: U32 = children.length / {width}"));
-                out.push("  for value in children:".to_owned());
-                out.push("    @storage.push output value".to_owned());
+                out.push(format!("  let {name}_count: U32 = stream.children.length / {width}"));
+                out.push("  for value in stream.children:".to_owned());
+                out.push("    @storage.push stream.output value".to_owned());
             }
             "lanes" => {
                 out.push(format!("  let {name}_count: U32 = 0"));
@@ -498,15 +508,17 @@ fn render_stream(model: &Model) -> Vec<String> {
                 out.push(format!("{indent}{name}_count := lanes.integer canonical[at] lanes.max_integer"));
                 out.push(format!("{indent}at := at + 1"));
                 out.push(format!("{indent}for index in 0 .. {name}_count:"));
-                out.push(format!("{indent}  @storage.push output canonical[at + index]"));
+                out.push(format!("{indent}  @storage.push stream.output canonical[at + index]"));
                 out.push(format!("{indent}at := at + {name}_count"));
             }
             _ => {
                 out.push(format!("  let {name}_count = lanes.integer canonical[at] lanes.max_integer"));
                 out.push("  at := at + 1".to_owned());
-                out.push(format!("  for 0 .. {name}_count:"));
                 let record = singular(name);
-                out.push(format!("    at := {record}_into canonical at output children extras"));
+                out.push("  stream.at := at".to_owned());
+                out.push(format!("  for 0 .. {name}_count:"));
+                out.push(format!("    stream := {record}_into canonical stream"));
+                out.push("  at := stream.at".to_owned());
             }
         }
         for header in &model.header {
@@ -515,19 +527,19 @@ fn render_stream(model: &Model) -> Vec<String> {
                 let count = if field.field["of"] == "count" {
                     format!("{name}_count")
                 } else {
-                    format!("(output.length - {name}_start)")
+                    format!("(stream.output.length - {name}_start)")
                 };
-                out.push(format!("  output[{}] = U32.to_f32 {count}", field.offset));
+                out.push(format!("  stream.output[{}] := U32.to_f32 {count}", field.offset));
             }
         }
     }
     out.push("  lanes.require (at == canonical.length)".to_owned());
-    out.push("  return ()".to_owned());
+    out.push("  return stream.output".to_owned());
     out
 }
 
 /// The game's `pen/protocol_canonical.blot`: the input walk, and the render
-/// walk streamed into independently named packet, child-draw and extra pools.
+/// walk streamed into a packet, with its child draws and extras gathered beside it.
 pub fn blot(model: &Model, top: &[String]) -> String {
     let mut out = top.to_vec();
     out.extend([

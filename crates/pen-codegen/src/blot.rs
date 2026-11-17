@@ -294,7 +294,7 @@ fn direct_fields(out: &mut Vec<String>, fields: &[Laid], variable: &str, indent:
         out.extend(locals.iter().map(|line| format!("{indent}{line}")));
         for (lane, value) in values.iter().enumerate() {
             let offset = field.offset + lane;
-            out.push(format!("{indent}encoded[at + {offset}] = {value}"));
+            out.push(format!("{indent}encoded[at + {offset}] := {value}"));
         }
     }
 }
@@ -400,7 +400,7 @@ fn render_layout(model: &Model) -> Vec<String> {
             }
         };
         for (index, value) in values.iter().enumerate() {
-            out.push(format!("  encoded[{}] = {value}", field.offset + index));
+            out.push(format!("  encoded[{}] := {value}", field.offset + index));
         }
     }
     out.push("  at := protocol.packet_header_floats".to_owned());
@@ -409,7 +409,7 @@ fn render_layout(model: &Model) -> Vec<String> {
         match kind(&entry.section) {
             "lanes" => {
                 out.push(format!("  for value in packet.{name}:"));
-                out.push("    encoded[at] = value".to_owned());
+                out.push("    encoded[at] := value".to_owned());
                 out.push("    at := self + 1".to_owned());
             }
             "records" => {
@@ -431,7 +431,7 @@ fn render_layout(model: &Model) -> Vec<String> {
                                 _ => unreachable!(),
                             };
                             for (lane, value) in values.iter().enumerate() {
-                                out.push(format!("{indent}encoded[at + {}] = {value}", field.offset + lane));
+                                out.push(format!("{indent}encoded[at + {}] := {value}", field.offset + lane));
                             }
                         }
                     } else {
@@ -447,7 +447,7 @@ fn render_layout(model: &Model) -> Vec<String> {
                     direct_fields(out, &entry.head, variable, indent);
                     if let Some(layout) = &entry.item {
                         out.push(format!(
-                            "{indent}encoded[at + {}] = U32.to_f32 {variable}.{rest_name}.length",
+                            "{indent}encoded[at + {}] := U32.to_f32 {variable}.{rest_name}.length",
                             entry.head_lanes - 1
                         ));
                         out.push(format!("{indent}at := self + {}", entry.head_lanes));
@@ -458,7 +458,7 @@ fn render_layout(model: &Model) -> Vec<String> {
                     } else {
                         out.push(format!("{indent}at := self + {}", entry.head_lanes));
                         out.push(format!("{indent}for value in {variable}.{rest_name}:"));
-                        out.push(format!("{indent}  encoded[at] = value"));
+                        out.push(format!("{indent}  encoded[at] := value"));
                         out.push(format!("{indent}  at := self + 1"));
                     }
                 });
@@ -469,7 +469,7 @@ fn render_layout(model: &Model) -> Vec<String> {
                         direct_records(&mut out, model.section(&owner.section), |out, variable, indent| {
                             if owner.section == "draws" {
                                 out.push(format!("{indent}for value in extra:"));
-                                out.push(format!("{indent}  encoded[at] = value"));
+                                out.push(format!("{indent}  encoded[at] := value"));
                                 out.push(format!("{indent}  at := self + 1"));
                             } else {
                                 let path = field_path(variable, &owner.field);
@@ -477,7 +477,7 @@ fn render_layout(model: &Model) -> Vec<String> {
                                 out.push(format!("{indent}for index in 0 .. min {path}.length {max}:"));
                                 for (lane, component) in ["x", "y", "z", "w"].iter().enumerate() {
                                     out.push(format!(
-                                        "{indent}  encoded[at + {lane}] = ({path}.at index).{component}"
+                                        "{indent}  encoded[at + {lane}] := ({path}.at index).{component}"
                                     ));
                                 }
                                 out.push(format!("{indent}  at := self + 4"));
@@ -500,8 +500,8 @@ fn render_views(model: &Model) -> Vec<String> {
     let direct = render_layout(model);
     let body = 0;
     let mut out = vec![String::new(),
-        "// Borrowed source groups, known scalar projections, caller-owned output.".to_owned(),
-        "func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: ResizeArray F32) => return do:".to_owned(),
+        "// Borrowed source groups, known scalar projections; the output is taken over and returned.".to_owned(),
+        "func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own ResizeArray F32) => return do:".to_owned(),
         "  let draws = collections.draws".to_owned(),
         "  let metadata_of = func draw: (U32, U32) => return project.draw_metadata context draw".to_owned(),
         "  let matrix_of = func draw: (F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32) => return project.draw_transform context draw".to_owned(),
@@ -607,9 +607,6 @@ fn render_views(model: &Model) -> Vec<String> {
             }
             continue;
         }
-        if line == "  return encoded" {
-            line = "  return ()".to_owned();
-        }
         out.push(line);
     }
     out
@@ -621,9 +618,9 @@ fn render_meshes(model: &Model) -> Vec<String> {
     let draws = model.section("draws").fixed.as_ref().unwrap();
     let sounds = model.section("sounds").fixed.as_ref().unwrap();
     let mut out = vec![String::new(),
-        "// Flat mesh draws (no parameters/extras) and sounds, into a caller-owned packet.".to_owned(),
+        "// Flat mesh draws (no parameters/extras) and sounds, into the packet it is given and returns.".to_owned(),
         "type MeshDraw = { mesh: U32, material: U32, transform: types.Mat4 }".to_owned(),
-        "func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: ResizeArray F32) => return do:".to_owned(),
+        "func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: own ResizeArray F32) => return do:".to_owned(),
         "  @storage.truncate encoded 0".to_owned(),
         format!("  for 0 .. (protocol.packet_header_floats + draws.length * {} + sounds.length * {}):", draws.lanes, sounds.lanes),
         "    @storage.push encoded 0.0".to_owned()];
@@ -646,7 +643,7 @@ fn render_meshes(model: &Model) -> Vec<String> {
             }
         };
         for (index, value) in values.iter().enumerate() {
-            out.push(format!("  encoded[{}] = {value}", field.offset + index));
+            out.push(format!("  encoded[{}] := {value}", field.offset + index));
         }
     }
     out.push("  let at: U32 = protocol.packet_header_floats".to_owned());
@@ -658,7 +655,7 @@ fn render_meshes(model: &Model) -> Vec<String> {
     out.push("  for sound in sounds:".to_owned());
     direct_fields(&mut out, &sounds.fields, "sound", "    ");
     out.push(format!("    at := self + {}", sounds.lanes));
-    out.push("  return ()".to_owned());
+    out.push("  return encoded".to_owned());
     out
 }
 

@@ -65,11 +65,13 @@ import { run } from "./game"
 entry const main = func host => return run host
 ```
 
-`run` creates named world, event, draw, sound and numeric packet pools once.
-`program.run` handles session version 2, calling the game's `execute` function
-for create, frame, snapshot and restore requests. `execute` updates the world
-pool and encodes the response before the next host call. Renderer rejection
-keeps that simulation state; restoring an earlier state is an explicit request.
+`run` creates the game's world once: the `World` value and its event, draw,
+sound and numeric packet pools. `program.run` takes it over and handles session
+version 2, calling the game's `execute` function for create, frame, snapshot and
+restore requests. `execute` takes the world over (`access: own Access`), updates
+it, encodes the response and returns it before the next host call. Renderer
+rejection keeps that simulation state; restoring an earlier state is an explicit
+request.
 
 - `World` contains the cube's angle and speed. `create` makes its initial value.
 - `step` reads a borrowed `protocol.Input` and returns the next `World`.
@@ -77,8 +79,10 @@ keeps that simulation state; restoring an earlier state is an explicit request.
   `schema` versions that layout.
 - `view` fills a caller-owned draw pool and returns the fixed render header.
   `codec.encode_mesh_frame` encodes that header, flat mesh draws and sounds into
-  the named packet pool. More complex renderers use `encode_render_views` with
-  borrowed source pools and known projections.
+  the packet buffer it is given and returns it
+  (`access.rendered := codec.encode_mesh_frame header … access.rendered`). More
+  complex renderers use `encode_render_views` with borrowed source pools and
+  known projections; it takes and returns its buffer the same way.
 
 The cube's step reads the arrows from the events:
 

@@ -198,42 +198,42 @@ const score = func (world: World) => return do:
   }] packet
   return @storage.freeze packet
 
-// Compile-known callbacks operate on one named world pool. Presentation rejection
-// needs no cache repair here; it never rolls simulation back.
+// The program loop owns the game's world and hands it to `execute`, which
+// returns it. Presentation rejection needs no cache repair here; it never
+// rolls simulation back.
 const acknowledge = func access -> published => return ()
-const execute = func access -> operation -> payload -> outgoing => return do:
-  let world = access.world
-  let events = access.events
-  let draws = access.draws
-  let sounds: ResizeArray types.Sound = access.sounds
-  let rendered: ResizeArray F32 = access.rendered
+type Access = {
+  world: World, events: ResizeArray extensions.Event, draws: ResizeArray codec.MeshDraw,
+  sounds: ResizeArray types.Sound, rendered: ResizeArray F32,
+}
+const execute = func (access: own Access) -> operation -> payload -> outgoing => return do:
   case operation of
     1 => do:
-      world[0] := create ()
-      program.append (save world[0]) outgoing
+      access.world := create ()
+      program.append (save access.world) outgoing
     2 => do:
-      let input = extensions.decode_input_into payload events
-      let (next, hit) = step world[0] input
-      world[0] := next
-      let header = view next hit input draws sounds
-      codec.encode_mesh_frame header (&draws[0..draws.length]) (&sounds[0..sounds.length]) rendered
-      program.append rendered outgoing
+      let input = extensions.decode_input_into payload access.events
+      let (next, hit) = step access.world input
+      access.world := next
+      let header = view next hit input access.draws access.sounds
+      access.rendered := codec.encode_mesh_frame header (&access.draws[0..access.draws.length]) (&access.sounds[0..access.sounds.length]) access.rendered
+      program.append access.rendered outgoing
       program.append (score next) outgoing
-    3 => program.append (save world[0]) outgoing
+    3 => program.append (save access.world) outgoing
     4 => do:
-      world[0] := restore payload
-      program.append (save world[0]) outgoing
+      access.world := restore payload
+      program.append (save access.world) outgoing
     _ => @panic "scenes are not supported"
+  return access
 
 const run = func host => return do:
-  let world: Array World = #[create ()]
   let events: ResizeArray extensions.Event = #[]
   let draws: ResizeArray codec.MeshDraw = #[]
   let sounds: ResizeArray types.Sound = #[]
   let rendered: ResizeArray F32 = #[]
   let incoming: ResizeArray F32 = #[]
   let outgoing: ResizeArray F32 = #[]
-  let access = {world, events, draws, sounds, rendered}
+  let access: Access = {world: create (), events, draws, sounds, rendered}
   use program.run execute acknowledge access schema false incoming outgoing host
   return ()
 

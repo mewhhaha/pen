@@ -24,6 +24,18 @@ records compiler/host/Wasm/source identities and the Mesa driver. Broader
 gameplay, browser, recovery and release gates remain open. Recheck actual
 integration after semantic changes.
 
+The generated Blot is in the explicit ownership form (17 November 2026): the
+packet encoders (`encode_render_views`, `encode_mesh_frame`) take their buffer
+with `own`, write it with `:=` and return it; the canonical stream threads one
+owned `Stream` value through a function per record; and `program.run` owns the
+game's world and rebinds it round the loop (`access := execute (own access) …`),
+so a game's `execute` takes the world over and returns it. The template and
+`examples/bounce` hold their world as a plain field. No generated file has an `=`
+store. Ten generator tests, the codec round trip (2,000 input and 2,000 render
+frames), the example's seven tests and a scaffolded game's three pass; Gdev's
+packets over 120 frames are byte-identical to before. See
+`../blot2/tasks/MEMORY_MODEL.md`, "The generated encoders".
+
 The generator now emits borrowed frame/header records, known projections and
 named packet writers. Owning RenderFrame/Extension compatibility wrappers are
 removed. The production `encode_render_views` bridge and canonical stream both

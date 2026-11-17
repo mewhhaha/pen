@@ -99,7 +99,8 @@ checkout as Blot (`pen/protocol.blot`, `pen/types.blot`,
 
 `pen/frame.blot`'s `header` supplies fixed render defaults, lit from above.
 A game supplies borrowed source pools to `encode_render_views`, or flat mesh
-draws and sounds to `encode_mesh_frame`, and a named output packet owner. Keys arrive as codes: `pen/protocol.blot`
+draws and sounds to `encode_mesh_frame`, and the output packet buffer, which the
+encoder takes over (`own`) and returns. Keys arrive as codes: `pen/protocol.blot`
 names the named ones (`key_arrow_left`, `key_f1`...), and a key that types a
 character carries its code point (a letter, its capital's).
 

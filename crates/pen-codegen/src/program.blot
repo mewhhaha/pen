@@ -23,12 +23,12 @@ func valid_state values => return do:
     if Bool.not (is_finite value):
       return false
   return true
-// Caller owns both named packet buffers for the entire invocation. Foreign
-// returns a copied temporary which is consumed within the iteration; only the
-// buffers and scalar initialized flag survive the backedge, never a new owner.
-// execute access operation payload outgoing writes response lanes AFTER the
-// echoed operation. acknowledge access published repairs presentation caches.
-func run execute -> acknowledge -> access -> (schema: U32) -> (scenes: Bool) -> (incoming: ResizeArray F32) -> (outgoing: ResizeArray F32) -> (host: Array F32 -> Array F32 ! { Foreign }) : Unit ! { Foreign } => return do:
+// The loop owns the game's world and is lent both packet buffers for the
+// whole invocation. Foreign returns a copied temporary which is consumed
+// within the iteration. `execute access operation payload outgoing` takes the
+// world over, writes its response lanes AFTER the echoed operation, and
+// returns the world. `acknowledge access published` repairs presentation caches.
+func run execute -> acknowledge -> (own access) -> (schema: U32) -> (scenes: Bool) -> (incoming: ResizeArray F32) -> (outgoing: ResizeArray F32) -> (host: Array F32 -> Array F32 ! { Foreign }) : Unit ! { Foreign } => return do:
   @storage.truncate incoming 0
   @storage.truncate outgoing 0
   append #[magic, version, U32.to_f32 schema, lanes.bit scenes] outgoing
@@ -47,7 +47,7 @@ func run execute -> acknowledge -> access -> (schema: U32) -> (scenes: Bool) -> 
     lanes.require (scenes or (operation != scene and operation != load_scene))
     @storage.truncate outgoing 0
     @storage.push outgoing (U32.to_f32 operation)
-    execute access operation (&incoming[2..incoming.length]) outgoing
+    access := execute (own access) operation (&incoming[2..incoming.length]) outgoing
     if operation == create or operation == restore:
       initialized := true
     // Invalid non-render output poisons this invocation; no partial mutation is
@@ -56,16 +56,15 @@ func run execute -> acknowledge -> access -> (schema: U32) -> (scenes: Bool) -> 
       lanes.require (valid_state outgoing)
 
 // game is a compile-known policy, not a stored runtime callback object. Each
-// operation mutates independently named pools through access and appends only
-// its response lanes to outgoing. Snapshots and restores remain explicit.
-func execute game -> access -> operation -> payload -> outgoing => return do:
-  case operation of
-    1 => game.create access outgoing
-    2 => game.frame access payload outgoing
-    3 => game.save access outgoing
-    4 => game.restore access payload outgoing
-    5 => game.scene access outgoing
-    6 => game.load_scene access payload outgoing
-    _ => @panic "invalid game operation"
-func serve game -> access -> incoming -> outgoing -> host => return
+// operation takes the world over, appends only its response lanes to
+// outgoing, and returns the world. Snapshots and restores remain explicit.
+func execute game -> (own access) -> operation -> payload -> outgoing => return case operation of
+  1 => game.create access outgoing
+  2 => game.frame access payload outgoing
+  3 => game.save access outgoing
+  4 => game.restore access payload outgoing
+  5 => game.scene access outgoing
+  6 => game.load_scene access payload outgoing
+  _ => @panic "invalid game operation"
+func serve game -> (own access) -> incoming -> outgoing -> host => return
   run (execute game) game.acknowledge access game.schema game.scenes incoming outgoing host

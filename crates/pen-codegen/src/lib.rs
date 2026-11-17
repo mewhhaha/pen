@@ -152,7 +152,7 @@ mod tests {
         let canonical = &sources.iter().find(|(name, _)| *name == "protocol_canonical.blot").unwrap().1;
         assert!(canonical.contains("func canonical_input (input: protocol.Input) => return do:"));
         assert!(canonical.contains("func render_packet_from_canonical (canonical: Array F32)"));
-        // Every header lane and section is emitted into one named packet owner.
+        // Every header lane and section is emitted into the one packet the walk owns.
         for header in &model.header {
             let offset = header.laid.offset;
             assert!(canonical.contains(&format!("output[{offset}] :=")), "missing {}", header.key);
@@ -162,8 +162,10 @@ mod tests {
             assert!(canonical.contains(&format!("let {name}_start:")), "missing {name}");
         }
         assert!(!canonical.contains("RenderFrame"));
-        assert!(canonical.contains("@storage.push extras canonical[at + index]"));
-        assert!(canonical.contains("inset_draw_into canonical at children children extras"));
+        assert!(canonical.contains("@storage.push stream.extras canonical[at + index]"));
+        // A writer takes the stream over and returns it; a child record goes to its pool.
+        assert!(canonical.contains("stream := inset_draw_into canonical stream"));
+        assert!(canonical.contains("func inset_draw_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:\n  let at = stream.at\n  let base = stream.children.length"));
         // Each record's walk follows its fields; a group's sits where its first lane does.
         assert!(rust.contains(
             "out.extend([draw.mesh as f32, draw.material as f32]);\n        out.extend_from_slice(&draw.transform);"
@@ -188,7 +190,7 @@ mod tests {
         let canonical = &sources.iter().find(|(name, _)| *name == "protocol_canonical.blot").unwrap().1;
         assert!(canonical.contains("  if present == 1:"));
         let environment = model.header.iter().find(|field| field.key == "sky.environment").unwrap().laid.offset;
-        assert!(canonical.contains(&format!("    output[{environment}] := canonical[at] + 1.0")));
+        assert!(canonical.contains(&format!("    stream.output[{environment}] := canonical[at] + 1.0")));
         assert!(canonical.contains("    @storage.push output 0.0"));
     }
 

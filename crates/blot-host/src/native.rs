@@ -24,7 +24,10 @@ pub fn native_metadata(wasm: &[u8]) -> Result<Vec<u8>> {
         let keep = match &payload {
             wasmparser::Payload::ExportSection(_) => true,
             wasmparser::Payload::CustomSection(section) => {
-                matches!(section.name(), "blot:abi" | "blot:tasks" | "name" | "sourceMappingURL")
+                matches!(
+                    section.name(),
+                    "blot:abi" | "blot:tasks" | pen_runtime::abi::INVOCATION_SECTION | "name" | "sourceMappingURL"
+                )
             }
             _ => false,
         };

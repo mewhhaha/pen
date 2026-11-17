@@ -111,6 +111,8 @@ pub struct GuestAbi {
     /// ABI 8: named data-stack owners and copied numeric packets, with no
     /// counted ownership hooks, resource adapters or language tasks.
     pub data_stacks: bool,
+    /// Optional ABI 8 post-invocation hook for scoped owners and callbacks.
+    pub invocation_finish: bool,
     /// ABI 3: the module exports `blot:ownership_enter`, which a host calls
     /// before each call's inputs, and `blot:ownership_leave(outcome)`, which
     /// it calls after copying the result out (outcome 0) or after a failure
@@ -126,6 +128,10 @@ pub struct GuestAbi {
 
 /// The custom section a task module declares its task descriptors in.
 pub const TASKS_SECTION: &str = "blot:tasks";
+
+/// Optional ABI 8 invocation finish extension, version 1.
+pub const INVOCATION_SECTION: &str = "blot:invocation";
+pub const INVOCATION_FINISH: &str = "blot:finish_invocation";
 
 /// What a game's `main` takes: the host, which answers each frame's
 /// request with the next frame's input.
@@ -310,6 +316,7 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     let mut found = None;
     let mut tasks = None;
     let mut counted_section = false;
+    let mut invocation_finish = false;
     for (name, payload) in custom_sections(wasm)? {
         if matches!(name.as_str(), "blot:ownership" | "blot:cycles" | "blot:memory-profile" | "blot:cleanup_data") {
             counted_section = true;
@@ -320,6 +327,9 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
         } else if name == TASKS_SECTION {
             ensure!(tasks.is_none(), "invalid_abi: more than one {TASKS_SECTION} section");
             tasks = Some(parse_tasks(payload)?);
+        } else if name == INVOCATION_SECTION {
+            ensure!(!invocation_finish && payload == [1], "invalid_abi: invalid {INVOCATION_SECTION} section");
+            invocation_finish = true;
         }
     }
     let mut abi = found.ok_or_else(|| anyhow!("invalid_abi: missing {ABI_SECTION} section"))?;
@@ -329,7 +339,9 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     );
     ensure!(tasks.is_none() || abi.ownership, "invalid_abi: tasks need ABI 3's ownership");
     ensure!(tasks.is_some() || abi.concurrent.is_empty(), "invalid_abi: concurrent callbacks need {TASKS_SECTION}");
+    ensure!(!invocation_finish || abi.data_stacks, "invalid_abi: invocation finish requires ABI 8");
     abi.tasks = tasks;
+    abi.invocation_finish = invocation_finish;
     Ok(abi)
 }
 
@@ -348,6 +360,15 @@ fn parse_tasks(payload: &[u8]) -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn section(name: &str, payload: &[u8]) -> Vec<u8> {
+        let contents = [&[u8::try_from(name.len()).unwrap()][..], name.as_bytes(), payload].concat();
+        [vec![0, u8::try_from(contents.len()).unwrap()], contents].concat()
+    }
+
+    fn module(sections: &[Vec<u8>]) -> Vec<u8> {
+        [b"\0asm\x01\0\0\0".to_vec(), sections.concat()].concat()
+    }
 
     #[test]
     fn manifest_test_vectors() {
@@ -369,13 +390,8 @@ mod tests {
 
     #[test]
     fn task_modules_are_read_and_refused() {
-        let section = |name: &str, payload: &[u8]| {
-            let contents = [&[u8::try_from(name.len()).unwrap()][..], name.as_bytes(), payload].concat();
-            [vec![0, u8::try_from(contents.len()).unwrap()], contents].concat()
-        };
         // main: (Array F32 -> Array F32, concurrent) -> Unit, ABI 3.
         let manifest = [0x03, 0x01, 0x04, b'm', b'a', b'i', b'n', 13, 0x06, 0x06, 0x00, 0x00];
-        let module = |sections: &[Vec<u8>]| [b"\0asm\x01\0\0\0".to_vec(), sections.concat()].concat();
         let abi = read_abi(&module(&[section(ABI_SECTION, &manifest), section(TASKS_SECTION, &[2, 3])])).unwrap();
         assert_eq!((abi.tasks, abi.concurrent.as_slice()), (Some(3), &["main".to_owned()][..]));
         assert!(abi.check_game().is_ok(), "its main still takes the host");
@@ -395,6 +411,17 @@ mod tests {
         assert!(read_abi(&module(std::slice::from_ref(&stack))).unwrap().data_stacks);
         assert!(error(&[stack.clone(), section("blot:ownership", &[1, 0, 1])]).contains("counted runtime"));
         assert!(error(&[stack, section(TASKS_SECTION, &[2, 0])]).contains("ownership"));
+    }
+
+    #[test]
+    fn invocation_finish_is_optional_and_requires_abi_8() {
+        let manifest = section(ABI_SECTION, &[8, 0, 0]);
+        let finish = section(INVOCATION_SECTION, &[1]);
+        assert!(!read_abi(&module(std::slice::from_ref(&manifest))).unwrap().invocation_finish);
+        assert!(read_abi(&module(&[manifest.clone(), finish.clone()])).unwrap().invocation_finish);
+        assert!(read_abi(&module(&[manifest.clone(), finish.clone(), finish.clone()])).is_err());
+        assert!(read_abi(&module(&[manifest, section(INVOCATION_SECTION, &[2])])).is_err());
+        assert!(read_abi(&module(&[section(ABI_SECTION, &[2, 0, 0]), finish])).is_err());
     }
 
     #[test]

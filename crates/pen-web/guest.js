@@ -2,7 +2,8 @@
 // Rust owns game requests, validation (the blot:abi manifest included),
 // commits and every platform operation. `ownership` is the manifest's ABI 3
 // flag: main runs between blot:ownership_enter and blot:ownership_leave, and
-// closing tears the instance down (blot:ownership_leave(2)).
+// closing tears the instance down (blot:ownership_leave(2)). ABI 8 modules
+// can declare a separate hook for releasing each invocation on return or failure.
 //
 // With WebAssembly JS Promise Integration (JSPI) the guest runs on the page's
 // thread, suspended at each host call. Without it, a cross-origin isolated
@@ -35,7 +36,42 @@ async function instantiate(bytes, ownership, exchange) {
   const leave = exports['blot:ownership_leave'];
   if (ownership && (typeof enter !== 'function' || enter.length !== 0
     || typeof leave !== 'function' || leave.length !== 1)) throw new Error('missing guest ownership hooks');
+  const invocation = WebAssembly.Module.customSections(module, 'blot:invocation');
+  const finish = exports['blot:finish_invocation'];
+  if (invocation.length !== 0) {
+    const version = new Uint8Array(invocation[0]);
+    if (invocation.length !== 1 || version.length !== 1 || version[0] !== 1
+      || typeof finish !== 'function' || finish.length !== 0) throw new Error('invalid guest invocation finish hook');
+  } else if (finish !== undefined) {
+    throw new Error('undeclared guest invocation finish hook');
+  }
   return exports;
+}
+
+function finishInvocation(exports, ownership, outcome) {
+  try {
+    if (ownership) exports['blot:ownership_leave'](outcome);
+    exports['blot:finish_invocation']?.();
+  } finally {
+    exports['blot:reset'](0);
+  }
+}
+
+// Finish only when the WebAssembly call has settled. A guest suspended on the
+// next frame's input still owns the state and callbacks of this invocation.
+async function runSuspending(exports, ownership, capability, stopped) {
+  let outcome = 1;
+  try {
+    await WebAssembly.promising(exports.main)(capability);
+    if (!stopped()) throw new Error('game main returned before shutdown');
+    outcome = 0;
+  } finally {
+    try {
+      finishInvocation(exports, ownership, outcome);
+    } catch (error) {
+      if (outcome === 0) throw error;
+    }
+  }
 }
 
 // The guest's arrays: the packet at `pointer` copied out, and `values`
@@ -81,9 +117,7 @@ async function openSuspending(bytes, ownership) {
   guest = arrays(exports);
   if (ownership) exports['blot:ownership_enter']();
   exports['blot:reset'](0);
-  const done = WebAssembly.promising(exports.main)(capability).then(() => {
-    if (!stopping) throw new Error('game main returned before shutdown');
-  });
+  const done = runSuspending(exports, ownership, capability, () => stopping);
   void done.catch(error => { failure = error; response.reject(error); });
   const description = await response.promise;
   return {
@@ -99,10 +133,7 @@ async function openSuspending(bytes, ownership) {
       if (stopping) return;
       stopping = true;
       if (!failure) incoming.resolve(new Float32Array([0, 0]));
-      let outcome = 0;
-      try { await done; } catch { outcome = 1; /* Rust reports the failed request. */ }
-      if (ownership) exports['blot:ownership_leave'](outcome);
-      exports['blot:reset'](0);
+      try { await done; } catch { /* Rust reports the failed request. */ }
       // Idle teardown, as Blot's adapter disposes of an instance: the module
       // releases its roots now rather than whenever the instance is collected.
       if (ownership) {
@@ -245,7 +276,18 @@ function serveWorker() {
         guest = arrays(exports);
         if (ownership) exports['blot:ownership_enter']();
         exports['blot:reset'](0);
-        exports.main(capability);
+        let invocationOutcome = 1;
+        try {
+          exports.main(capability);
+          if (!Atomics.load(signals, STOPPING)) throw new Error('game main returned before shutdown');
+          invocationOutcome = 0;
+        } finally {
+          try {
+            finishInvocation(exports, ownership, invocationOutcome);
+          } catch (error) {
+            if (invocationOutcome === 0) throw error;
+          }
+        }
       }
       if (!Atomics.load(signals, STOPPING)) throw new Error('game main returned before shutdown');
     } catch (error) {
@@ -259,8 +301,6 @@ function serveWorker() {
       postMessage({ closed: outcome });
       return;
     }
-    if (ownership) exports['blot:ownership_leave'](outcome);
-    exports['blot:reset'](0);
     // Idle teardown, as Blot's adapter disposes of an instance: the module
     // releases its roots now rather than whenever the instance is collected.
     if (ownership) {

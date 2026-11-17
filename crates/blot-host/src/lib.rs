@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use pen_runtime::abi::INVOCATION_FINISH;
 use pen_runtime::memory_image::{Captured, MemoryImage, PAGE};
 use pen_runtime::symbols::{Frame, Symbols};
 use wasmtime::{
@@ -420,6 +421,19 @@ fn validate_module(module: &Module, abi: &GuestAbi) -> Result<()> {
             );
         }
     }
+    let invocation_finish = module.get_export(INVOCATION_FINISH);
+    ensure!(
+        invocation_finish.is_some() == abi.invocation_finish,
+        "invalid_abi: {INVOCATION_FINISH} must match the invocation finish section"
+    );
+    if let Some(export) = invocation_finish {
+        ensure!(
+            export.func().is_some_and(|ty| ty.params().len() == 0
+                && ty.results().len() == 1
+                && ty.results().next().is_some_and(|result| result.is_i32())),
+            "invalid_abi: invalid {INVOCATION_FINISH} signature"
+        );
+    }
     Ok(())
 }
 
@@ -604,6 +618,8 @@ pub struct Guest {
     instance: Instance,
     abi: Arc<GuestAbi>,
     symbols: Arc<Symbols>,
+    invocation_finish: Option<TypedFunc<(), i32>>,
+    last_reclaimed_owners: Option<u32>,
     imaged: Arc<Result<Vec<String>, String>>,
 }
 
@@ -681,11 +697,18 @@ impl Guest {
             };
             store.data_mut().tracing = Some(system_trace::Tracing::new(trace.clone(), globals));
         }
+        let invocation_finish = if module.abi.invocation_finish {
+            Some(instance.get_typed_func::<(), i32>(&mut store, INVOCATION_FINISH)?)
+        } else {
+            None
+        };
         Ok(Guest {
             store,
             instance,
             abi: module.abi.clone(),
             symbols: module.symbols.clone(),
+            invocation_finish,
+            last_reclaimed_owners: None,
             imaged: module.imaged.clone(),
         })
     }
@@ -717,6 +740,11 @@ impl Guest {
             Some(arena) => arena.memory.data_size(&self.store),
             None => 0,
         }
+    }
+
+    /// Temporary owners measured and reclaimed by the previous ABI 8 invocation.
+    pub fn last_reclaimed_owners(&self) -> Option<u32> {
+        self.last_reclaimed_owners
     }
 
     /// Keeps `gauge` at `memory_bytes`, updated whenever the guest calls the
@@ -798,8 +826,8 @@ impl Guest {
         from_wasm(&mut self.store, arena.as_ref(), function.result, &results[0])
     }
 
-    /// Ends a call: leaves ownership with `outcome` if it entered, then
-    /// resets the arena, both attempted even when one fails.
+    /// Ends a call, releases its temporary guest state, and resets the packet
+    /// arena. The final steps still run if task or invocation cleanup fails.
     fn finish(&mut self, outcome: i32) -> Result<()> {
         let task_result = tasks::finish(&mut self.store, outcome != LEFT_NORMALLY);
         self.store.data_mut().active = None;
@@ -810,11 +838,22 @@ impl Guest {
         {
             left = ownership.leave.call(&mut self.store, if task_result.is_err() { LEFT_FAILING } else { outcome });
         }
+        let invocation = match &self.invocation_finish {
+            Some(finish) => {
+                self.last_reclaimed_owners = None;
+                finish.call(&mut self.store, ()).map(|released| {
+                    self.last_reclaimed_owners = Some(released as u32);
+                })
+            }
+            None => Ok(()),
+        };
         if let Some(arena) = self.store.data().arena.clone() {
             arena.reset.call(&mut self.store, 0)?;
         }
         task_result?;
-        Ok(left?)
+        left?;
+        invocation?;
+        Ok(())
     }
 
     /// Tears the instance down, as Blot's adapter disposes of one: an ABI 3

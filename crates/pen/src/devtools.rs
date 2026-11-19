@@ -535,6 +535,17 @@ impl Answering<'_> {
         new_file(&self.project.join(".pen").join(directory), extension, now)
     }
 
+    /// Console exports are named saves under this project's .pen/exports.
+    fn export_path(&self, name: String) -> anyhow::Result<PathBuf> {
+        let name = Path::new(&name);
+        anyhow::ensure!(name.file_name() == Some(name.as_os_str()), "give a save name without directories");
+        let mut path = self.project.join(".pen/exports").join(name);
+        if path.extension().is_none() {
+            path.set_extension("save");
+        }
+        Ok(path)
+    }
+
     /// Writes the game's tuned values (or only tunable `only`'s) into the
     /// checkout as the defaults, on a thread of its own (Rust number-token
     /// edits); the log says how it went.
@@ -712,6 +723,29 @@ impl tools::Host for Answering<'_> {
 
     fn monitor(&mut self, bus: usize, mute: bool, on: bool) -> bool {
         self.session.audio().map(|audio| audio.monitor(bus, mute, on)).is_some()
+    }
+
+    async fn export_save(&mut self, name: Option<String>) -> Answer {
+        let path = match name.map(|name| self.export_path(name)).transpose() {
+            Ok(path) => path.unwrap_or_else(|| self.new_file("exports", "save")),
+            Err(error) => return failed("export", error),
+        };
+        let answer = Answer::text(&format!("export requested for {}", path.display()));
+        self.session.request_export(path);
+        answer
+    }
+
+    fn import_save(&mut self, name: Option<String>) -> Answer {
+        let Some(name) = name else { return failed("import", "give the name of an exported save") };
+        let path = match self.export_path(name) {
+            Ok(path) => path,
+            Err(error) => return failed("import", error),
+        };
+        let answer = Answer::text(&format!("import requested for {}", path.display()));
+        match self.session.request_import(path) {
+            Ok(()) => answer,
+            Err(error) => failed("import", error),
+        }
     }
 
     async fn snapshot(&mut self) -> Option<std::sync::Arc<SavedState>> {

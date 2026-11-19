@@ -429,6 +429,10 @@ pub struct Session {
     captions: captions::Shared,
     clock: Clock,
     script: Option<Script>,
+    #[cfg(feature = "devtools")]
+    console_exports: Vec<PathBuf>,
+    #[cfg(feature = "devtools")]
+    console_imports: Vec<PathBuf>,
     capture: Capture,
     #[cfg(feature = "compiler")]
     dev: Option<Dev>,
@@ -669,6 +673,10 @@ impl Session {
             captions,
             clock,
             script,
+            #[cfg(feature = "devtools")]
+            console_exports: Vec::new(),
+            #[cfg(feature = "devtools")]
+            console_imports: Vec::new(),
             capture,
             #[cfg(feature = "compiler")]
             dev,
@@ -918,6 +926,26 @@ impl Session {
     /// The adapter selected at startup or the latest configuration/build reload.
     pub fn state_adapter(&self) -> Arc<dyn StateAdapter> {
         self.state_adapter.clone()
+    }
+
+    #[cfg(feature = "devtools")]
+    pub fn request_export(&mut self, path: PathBuf) {
+        self.console_exports.push(path);
+    }
+
+    #[cfg(feature = "devtools")]
+    fn write_console_exports(&mut self) {
+        for path in self.console_exports.drain(..) {
+            report(self.runtime.save(&path), format!("saved {}", path.display()));
+        }
+    }
+
+    #[cfg(feature = "devtools")]
+    pub fn request_import(&mut self, path: PathBuf) -> Result<()> {
+        anyhow::ensure!(self.net.is_none() && self.live(), "import requires a local, live game");
+        anyhow::ensure!(path.is_file(), "save not found at {}", path.display());
+        self.console_imports.push(path);
+        Ok(())
     }
 
     /// The running game's shared state; unavailable during an overlapped frame
@@ -1591,7 +1619,13 @@ impl Session {
                 {
                     devlog::error(Source::Session, format!("recording input: {error:#}"));
                 }
+                #[cfg(feature = "devtools")]
+                if !self.console_imports.is_empty() && self.transport.paused() {
+                    self.step_frames(1);
+                }
                 if !self.transport.take_frame() {
+                    #[cfg(feature = "devtools")]
+                    self.write_console_exports();
                     return self.present_paused(window, tick);
                 }
                 let planned = self.plan(window, tick)?;
@@ -1609,8 +1643,21 @@ impl Session {
         };
         #[cfg(feature = "devtools")]
         self.packets.ran(planned.position, &planned.input, self.runtime.packet_lanes(), &rendered);
-        let overlapped = self.overlaps(&planned, &rendered);
         let mut planned = planned;
+        #[cfg(feature = "devtools")]
+        {
+            // The guest has returned even when this was the last overlapped frame.
+            self.write_console_exports();
+            if !self.console_imports.is_empty() {
+                if planned.replayed.is_none() && self.net.is_none() {
+                    planned.loads.append(&mut self.console_imports);
+                } else {
+                    self.console_imports.clear();
+                    devlog::error(Source::Session, "import requires a local, live game");
+                }
+            }
+        }
+        let overlapped = self.overlaps(&planned, &rendered);
         if overlapped {
             // This frame changes nothing after it draws: the next one goes
             // to the guest now and computes while this one draws.

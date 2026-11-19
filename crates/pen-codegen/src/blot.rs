@@ -590,10 +590,29 @@ fn render_views(model: &Model) -> Vec<String> {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("for ")
             && let Some((variable, source)) = rest.split_once(" in ")
-            && projections.contains(variable)
+            && let Some(collection) = source.strip_suffix(':')
+            && !collection.contains(" .. ")
         {
             let indent = &line[..line.len() - trimmed.len()];
-            out.push(format!("{indent}for source_{variable} in {source}"));
+            // A PoolCursor returns the row and a new cursor on every next().
+            // On large terrain/instance packets those temporaries accumulate
+            // inside this one guest call. Index the already-sized views.
+            let count = if collection == "draws" {
+                "source_draws_count".to_owned()
+            } else if let Some(group) = collection.strip_prefix("collections.") {
+                format!("source_{group}_count")
+            } else if let Some((_, _, count)) = nested_counts.iter().find(|(_, path, _)| path == collection) {
+                count.clone()
+            } else {
+                format!("{collection}.length")
+            };
+            let index = format!("{variable}_index");
+            out.push(format!("{indent}for {index} in 0 .. {count}:"));
+            if !projections.contains(variable) {
+                out.push(format!("{indent}  let {variable} = {collection}[{index}]"));
+                continue;
+            }
+            out.push(format!("{indent}  let source_{variable} = {collection}[{index}]"));
             let projected = model.sections.iter().find(|entry| singular(s(&entry.section["name"])) == variable);
             let fixed = projected
                 .and_then(|entry| entry.fixed.as_ref())

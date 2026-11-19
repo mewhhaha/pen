@@ -260,39 +260,47 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
   let source_instances_count: U32 = collections.instances.length
   let source_instance_removals_count: U32 = collections.instance_removals.length
   let solids_lanes: U32 = 0
-  for source_solid in collections.solids:
+  for solid_index in 0 .. source_solids_count:
+    let source_solid = collections.solids[solid_index]
     let solid = project.solid context source_solid
     let view_solid_faces_count: U32 = solid.faces.length
     solids_lanes := self + 1 + view_solid_faces_count * 5
   let inset_draws_count: U32 = 0
-  for source_inset in collections.insets:
+  for inset_index in 0 .. source_insets_count:
+    let source_inset = collections.insets[inset_index]
     let inset = project.inset context source_inset
     let view_inset_draws_count: U32 = inset.draws.length
     inset_draws_count := self + view_inset_draws_count
   let fields_lanes: U32 = 0
-  for source_field in collections.fields:
+  for field_index in 0 .. source_fields_count:
+    let source_field = collections.fields[field_index]
     let field = project.field context source_field
     let view_field_values_count: U32 = field.values.length
     fields_lanes := self + 7 + view_field_values_count * 1
   let ui_lanes: U32 = 0
-  for source_ui in collections.ui:
+  for ui_index in 0 .. source_ui_count:
+    let source_ui = collections.ui[ui_index]
     let ui = project.ui context source_ui
     let view_ui_text_count: U32 = ui.text.length
     ui_lanes := self + 24 + view_ui_text_count * 1
   let services_lanes: U32 = 0
-  for source_service in collections.services:
+  for service_index in 0 .. source_services_count:
+    let source_service = collections.services[service_index]
     let service = project.service context source_service
     let view_service_values_count: U32 = service.values.length
     services_lanes := self + 8 + view_service_values_count * 1
   let extras_lanes: U32 = 0
-  for draw in draws:
+  for draw_index in 0 .. source_draws_count:
+    let draw = draws[draw_index]
     let extra: Array F32 = project.draw_extra context draw
     let extra_count: U32 = extra.length
     extras_lanes := self + extra_count
-  for source_inset in collections.insets:
+  for inset_index in 0 .. source_insets_count:
+    let source_inset = collections.insets[inset_index]
     let inset = project.inset context source_inset
     let view_inset_draws_count: U32 = inset.draws.length
-    for source_inset_draw in inset.draws:
+    for inset_draw_index in 0 .. view_inset_draws_count:
+      let source_inset_draw = inset.draws[inset_draw_index]
       let inset_draw = project.inset_draw context source_inset_draw
       let view_inset_draw_extra_count: U32 = inset_draw.extra.length
       extras_lanes := self + min view_inset_draw_extra_count protocol.max_draw_extra * 4
@@ -456,10 +464,12 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
   encoded[149] := U32.to_f32 source_instances_count
   encoded[150] := U32.to_f32 source_instance_removals_count
   at := protocol.packet_header_floats
-  for value in collections.state:
+  for value_index in 0 .. source_state_count:
+    let value = collections.state[value_index]
     encoded[at] := value
     at := self + 1
-  for draw in draws:
+  for draw_index in 0 .. source_draws_count:
+    let draw = draws[draw_index]
     let extra: Array F32 = project.draw_extra context draw
     let extra_count: U32 = extra.length
     let (mesh, material) = metadata_of draw
@@ -490,19 +500,22 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 22] := p3
     encoded[at + 23] := U32.to_f32 (extra_count / 4)
     at := self + 24
-  for source_solid in collections.solids:
+  for solid_index in 0 .. source_solids_count:
+    let source_solid = collections.solids[solid_index]
     let solid = project.solid context source_solid
     let view_solid_faces_count: U32 = solid.faces.length
     encoded[at + 0] := U32.to_f32 view_solid_faces_count
     at := self + 1
-    for face in solid.faces:
+    for face_index in 0 .. view_solid_faces_count:
+      let face = solid.faces[face_index]
       encoded[at + 0] := face.normal.x
       encoded[at + 1] := face.normal.y
       encoded[at + 2] := face.normal.z
       encoded[at + 3] := face.distance
       encoded[at + 4] := U32.to_f32 (face.material)
       at := self + 5
-  for source_decal in collections.decals:
+  for decal_index in 0 .. source_decals_count:
+    let source_decal = collections.decals[decal_index]
     let decal: types.Decal = project.decal context source_decal
     encoded[at + 0] := U32.to_f32 (decal.material)
     let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = decal.transform
@@ -524,7 +537,8 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 16] := transform_w.w
     encoded[at + 17] := decal.opacity
     at := self + 18
-  for source_sound in collections.sounds:
+  for sound_index in 0 .. source_sounds_count:
+    let source_sound = collections.sounds[sound_index]
     let sound: types.Sound = project.sound context source_sound
     encoded[at + 0] := U32.to_f32 (sound.clip)
     encoded[at + 1] := U32.to_f32 (sound.bus)
@@ -534,7 +548,8 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 5] := sound.lowpass
     encoded[at + 6] := sound.reverb
     at := self + 7
-  for source_sprite in collections.sprites:
+  for sprite_index in 0 .. source_sprites_count:
+    let source_sprite = collections.sprites[sprite_index]
     let sprite: types.Sprite = project.sprite context source_sprite
     encoded[at + 0] := sprite.x
     encoded[at + 1] := sprite.y
@@ -554,7 +569,8 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 15] := sprite.parameters.z
     encoded[at + 16] := sprite.parameters.w
     at := self + 17
-  for source_inset in collections.insets:
+  for inset_index in 0 .. source_insets_count:
+    let source_inset = collections.insets[inset_index]
     let inset = project.inset context source_inset
     let view_inset_draws_count: U32 = inset.draws.length
     encoded[at + 0] := inset.x
@@ -608,10 +624,12 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 46] := inset.pixel_size
     encoded[at + 47] := U32.to_f32 (inset.after_sprites)
     at := self + 48
-  for source_inset in collections.insets:
+  for inset_index in 0 .. source_insets_count:
+    let source_inset = collections.insets[inset_index]
     let inset = project.inset context source_inset
     let view_inset_draws_count: U32 = inset.draws.length
-    for source_inset_draw in inset.draws:
+    for inset_draw_index in 0 .. view_inset_draws_count:
+      let source_inset_draw = inset.draws[inset_draw_index]
       let inset_draw = project.inset_draw context source_inset_draw
       let view_inset_draw_extra_count: U32 = inset_draw.extra.length
       encoded[at + 0] := U32.to_f32 (inset_draw.mesh)
@@ -643,10 +661,12 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
       encoded[at + 22] := parameters.w
       encoded[at + 23] := U32.to_f32 (min view_inset_draw_extra_count protocol.max_draw_extra)
       at := self + 24
-  for value in collections.preferences:
+  for value_index in 0 .. source_preferences_count:
+    let value = collections.preferences[value_index]
     encoded[at] := value
     at := self + 1
-  for source_field in collections.fields:
+  for field_index in 0 .. source_fields_count:
+    let source_field = collections.fields[field_index]
     let field = project.field context source_field
     let view_field_values_count: U32 = field.values.length
     encoded[at + 0] := U32.to_f32 (field.material)
@@ -657,10 +677,12 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 5] := U32.to_f32 (field.columns)
     encoded[at + 6] := U32.to_f32 (field.rows)
     at := self + 7
-    for value in field.values:
+    for value_index in 0 .. view_field_values_count:
+      let value = field.values[value_index]
       encoded[at] := value
       at := self + 1
-  for source_ui in collections.ui:
+  for ui_index in 0 .. source_ui_count:
+    let source_ui = collections.ui[ui_index]
     let ui = project.ui context source_ui
     let view_ui_text_count: U32 = ui.text.length
     encoded[at + 0] := U32.to_f32 (ui.id)
@@ -688,10 +710,12 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 22] := U32.to_f32 (ui.name_length)
     encoded[at + 23] := U32.to_f32 (ui.description_length)
     at := self + 24
-    for value in ui.text:
+    for value_index in 0 .. view_ui_text_count:
+      let value = ui.text[value_index]
       encoded[at] := value
       at := self + 1
-  for source_service in collections.services:
+  for service_index in 0 .. source_services_count:
+    let source_service = collections.services[service_index]
     let service = project.service context source_service
     let view_service_values_count: U32 = service.values.length
     encoded[at + 0] := U32.to_f32 (service.request)
@@ -703,16 +727,19 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 6] := service.d
     encoded[at + 7] := U32.to_f32 (service.value_count)
     at := self + 8
-    for value in service.values:
+    for value_index in 0 .. view_service_values_count:
+      let value = service.values[value_index]
       encoded[at] := value
       at := self + 1
-  for source_buse in collections.buses:
+  for buse_index in 0 .. source_buses_count:
+    let source_buse = collections.buses[buse_index]
     let buse: types.Bus = project.buse context source_buse
     encoded[at + 0] := buse.gain
     encoded[at + 1] := buse.lowpass
     encoded[at + 2] := buse.reverb
     at := self + 3
-  for source_voice in collections.voices:
+  for voice_index in 0 .. source_voices_count:
+    let source_voice = collections.voices[voice_index]
     let voice: types.Voice = project.voice context source_voice
     encoded[at + 0] := U32.to_f32 (voice.id)
     encoded[at + 1] := U32.to_f32 (voice.clip)
@@ -727,14 +754,16 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 10] := voice.fade_in
     encoded[at + 11] := voice.fade_out
     at := self + 12
-  for source_pose in collections.poses:
+  for pose_index in 0 .. source_poses_count:
+    let source_pose = collections.poses[pose_index]
     let pose: types.Pose = project.pose context source_pose
     encoded[at + 0] := U32.to_f32 (pose.draw)
     encoded[at + 1] := U32.to_f32 (pose.clip)
     encoded[at + 2] := pose.time
     encoded[at + 3] := pose.weight
     at := self + 4
-  for source_emitter in collections.emitters:
+  for emitter_index in 0 .. source_emitters_count:
+    let source_emitter = collections.emitters[emitter_index]
     let emitter: types.Emitter = project.emitter context source_emitter
     encoded[at + 0] := U32.to_f32 (emitter.material)
     let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = emitter.transform
@@ -780,7 +809,8 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 40] := emitter.color_end.a
     encoded[at + 41] := lanes.bit emitter.additive
     at := self + 42
-  for source_light in collections.lights:
+  for light_index in 0 .. source_lights_count:
+    let source_light = collections.lights[light_index]
     let light: types.Light = project.light context source_light
     encoded[at + 0] := light.position.x
     encoded[at + 1] := light.position.y
@@ -795,7 +825,8 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 10] := light.inner
     encoded[at + 11] := light.outer
     at := self + 12
-  for source_listener in collections.listener:
+  for listener_index in 0 .. source_listener_count:
+    let source_listener = collections.listener[listener_index]
     let listener: types.Listener = project.listener context source_listener
     encoded[at + 0] := listener.position.x
     encoded[at + 1] := listener.position.y
@@ -807,7 +838,8 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 7] := listener.up.y
     encoded[at + 8] := listener.up.z
     at := self + 9
-  for source_panner in collections.panners:
+  for panner_index in 0 .. source_panners_count:
+    let source_panner = collections.panners[panner_index]
     let panner: types.Panner = project.panner context source_panner
     encoded[at + 0] := U32.to_f32 (panner.voice)
     encoded[at + 1] := U32.to_f32 (panner.sound)
@@ -825,7 +857,8 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 13] := panner.cone_outer
     encoded[at + 14] := panner.cone_outer_gain
     at := self + 15
-  for source_instance in collections.instances:
+  for instance_index in 0 .. source_instances_count:
+    let source_instance = collections.instances[instance_index]
     let instance: types.Instance = project.instance context source_instance
     encoded[at + 0] := U32.to_f32 (instance.id_low)
     encoded[at + 1] := U32.to_f32 (instance.id_high)
@@ -858,21 +891,26 @@ func encode_render_views (packet: types.RenderHeader) -> collections -> project 
     encoded[at + 24] := parameters.z
     encoded[at + 25] := parameters.w
     at := self + 26
-  for source_instance_removal in collections.instance_removals:
+  for instance_removal_index in 0 .. source_instance_removals_count:
+    let source_instance_removal = collections.instance_removals[instance_removal_index]
     let instance_removal: types.InstanceRemoval = project.instance_removal context source_instance_removal
     encoded[at + 0] := U32.to_f32 (instance_removal.id_low)
     encoded[at + 1] := U32.to_f32 (instance_removal.id_high)
     at := self + 2
-  for draw in draws:
+  for draw_index in 0 .. source_draws_count:
+    let draw = draws[draw_index]
     let extra: Array F32 = project.draw_extra context draw
     let extra_count: U32 = extra.length
-    for value in extra:
+    for value_index in 0 .. extra.length:
+      let value = extra[value_index]
       encoded[at] := value
       at := self + 1
-  for source_inset in collections.insets:
+  for inset_index in 0 .. source_insets_count:
+    let source_inset = collections.insets[inset_index]
     let inset = project.inset context source_inset
     let view_inset_draws_count: U32 = inset.draws.length
-    for source_inset_draw in inset.draws:
+    for inset_draw_index in 0 .. view_inset_draws_count:
+      let source_inset_draw = inset.draws[inset_draw_index]
       let inset_draw = project.inset_draw context source_inset_draw
       let view_inset_draw_extra_count: U32 = inset_draw.extra.length
       for index in 0 .. min view_inset_draw_extra_count protocol.max_draw_extra:

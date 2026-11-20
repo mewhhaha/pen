@@ -29,6 +29,14 @@ pub struct Timing {
     pub finished: Duration,
     pub succeeded: bool,
 }
+
+/// Caller-side measurements for the latest traced batch.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchTiming {
+    pub admission: Duration,
+    pub receive: Duration,
+}
+
 type Answer = (usize, Result<Value, String>, Option<Timing>);
 pub struct Workers {
     send: Option<mpsc::SyncSender<Job>>,
@@ -36,6 +44,7 @@ pub struct Workers {
     threads: Vec<JoinHandle<()>>,
     tracing: bool,
     timings: Vec<Timing>,
+    batch_timing: Option<BatchTiming>,
 }
 fn bounded(value: &Value) -> bool {
     match value {
@@ -52,7 +61,8 @@ impl Workers {
         let (send, jobs) = mpsc::sync_channel::<Job>(MAX_BATCH);
         let jobs = Arc::new(Mutex::new(jobs));
         let (answers, receive) = mpsc::sync_channel::<Answer>(MAX_BATCH);
-        let mut pool = Self { send: Some(send), receive, threads: vec![], tracing: false, timings: vec![] };
+        let mut pool =
+            Self { send: Some(send), receive, threads: vec![], tracing: false, timings: vec![], batch_timing: None };
         for index in 0..count {
             let engine = engine.clone();
             let module = module.clone();
@@ -104,28 +114,40 @@ impl Workers {
         self.tracing = enabled;
         if !enabled {
             self.timings.clear();
+            self.batch_timing = None;
         }
     }
     pub fn timings(&self) -> &[Timing] {
         &self.timings
     }
+    pub fn batch_timing(&self) -> Option<BatchTiming> {
+        self.batch_timing
+    }
     /// A batch is admitted as a whole. All jobs finish before this returns;
     /// outputs and failures retain input order, independent of completion time.
     pub fn run(&mut self, inputs: Vec<Value>) -> Result<Vec<Result<Value, String>>> {
+        self.batch_timing = None;
+        let origin = self.tracing.then(Instant::now);
         ensure!(inputs.len() <= MAX_BATCH, "worker batch exceeds {MAX_BATCH} jobs");
         ensure!(inputs.iter().all(bounded), "worker input exceeds {MAX_LANES} lanes");
         let sender = self.send.as_ref().context("worker pool is closed")?;
         self.timings.clear();
-        let origin = self.tracing.then(Instant::now);
         let count = inputs.len();
         for (index, input) in inputs.into_iter().enumerate() {
             sender
                 .send(Job { index, input, timing: origin.map(|origin| (origin, origin.elapsed())) })
                 .context("worker transport closed")?;
         }
+        let admission = origin.map(|t| t.elapsed());
         let mut results: Vec<_> = (0..count).map(|_| None).collect();
+        let mut receive = Duration::ZERO;
         for _ in 0..count {
-            let (index, result, timing) = self.receive.recv().context("worker transport failed")?;
+            let waiting = self.tracing.then(Instant::now);
+            let answer = self.receive.recv().context("worker transport failed")?;
+            if let Some(waiting) = waiting {
+                receive += waiting.elapsed();
+            }
+            let (index, result, timing) = answer;
             ensure!(index < count && results[index].is_none(), "worker result identity changed");
             results[index] = Some(result);
             if let Some(timing) = timing {
@@ -133,6 +155,7 @@ impl Workers {
             }
         }
         self.timings.sort_unstable_by_key(|timing| timing.job);
+        self.batch_timing = admission.map(|admission| BatchTiming { admission, receive });
         Ok(results.into_iter().map(Option::unwrap).collect())
     }
     pub fn close(&mut self) -> Result<()> {

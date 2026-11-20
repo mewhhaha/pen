@@ -1249,9 +1249,7 @@ fn config(inlining: bool) -> wasmtime::Config {
     config.max_wasm_stack(GUEST_STACK_BYTES);
     // Only checked against max_wasm_stack; guests run synchronously.
     config.async_stack_size(GUEST_STACK_BYTES + (1 << 20));
-    if inlining {
-        config.compiler_inlining(wasmtime::Inlining::Yes);
-    }
+    config.compiler_inlining(if inlining { wasmtime::Inlining::Yes } else { wasmtime::Inlining::No });
     config
 }
 
@@ -2127,6 +2125,21 @@ mod tests {
         GuestModule::new(&engine, &wasm, Some(&directory)).unwrap();
         assert_eq!(module.abi().functions.len(), 2);
         std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn inlining_modes_use_distinct_artifacts() {
+        let wasm = looping_guest();
+        for (producer, consumer) in [(true, false), (false, true)] {
+            let writer = Engine::new(&config(producer)).unwrap();
+            let reader = Engine::new(&config(consumer)).unwrap();
+            assert_ne!(cache_key(&writer, &wasm), cache_key(&reader, &wasm));
+            let artifact = writer.precompile_module(&wasm).unwrap();
+            // SAFETY: the local writer compiled these bytes with this build of Wasmtime.
+            unsafe { wasmtime::Module::deserialize(&writer, &artifact) }.unwrap();
+            assert!(unsafe { wasmtime::Module::deserialize(&reader, &artifact) }.is_err());
+        }
     }
 
     #[test]

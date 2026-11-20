@@ -59,3 +59,7 @@ required-features = ["compiler"]
 [[example]]
 name = "compare_worker_batches"
 required-features = ["compiler"]
+
+[[example]]
+name = "compare_routes"
+required-features = ["compiler"]

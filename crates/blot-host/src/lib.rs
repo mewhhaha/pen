@@ -16,6 +16,7 @@ mod probe;
 pub use native::native_fingerprint;
 #[cfg(feature = "compiler")]
 pub use native::native_metadata;
+pub mod processes;
 mod system_trace;
 mod tasks;
 #[cfg(feature = "compiler")]

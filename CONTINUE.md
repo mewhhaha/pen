@@ -51,6 +51,13 @@ CPU tests. Copied-worker and owned-storage fixtures pass; plugins pass nineteen
 unit and nine compiler integration checks. Atlas CPU tests pass. These results
 do not imply full GPU/browser qualification.
 
+`blot_host::processes::Processes` is an opt-in coordinator for trusted
+ABI 8 programs whose `init` and `step` both return. The caller owns the turn
+allowance, mailbox and linear-memory caps. The native test runs two isolated
+guests on one thread, preserves ticket outcomes across fault and restore, and
+replays admissions and applied events through the same Blot caller. Gdev's
+frame loop does not start these processes automatically.
+
 ## Contracts
 
 - Guest ABI 8 uses owned data stacks and copied numeric host packets. Native and

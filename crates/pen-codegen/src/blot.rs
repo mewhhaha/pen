@@ -299,336 +299,143 @@ fn direct_fields(out: &mut Vec<String>, fields: &[Laid], variable: &str, indent:
     }
 }
 
-fn direct_records(out: &mut Vec<String>, entry: &Section, body: impl Fn(&mut Vec<String>, &str, &str)) {
-    let variable = singular(s(&entry.section["name"]));
-    if let Some((owners, children)) = &entry.owner {
-        let owner = singular(owners);
-        out.push(format!("  for {owner} in packet.{owners}:"));
-        out.push(format!("    for {variable} in {owner}.{children}:"));
-        body(out, &variable, "      ");
-    } else {
-        let section = s(&entry.section["name"]);
-        let values = if section == "draws" { "draws".to_owned() } else { format!("packet.{section}") };
-        out.push(format!("  for {variable} in {values}:"));
-        if section == "draws" {
-            out.push(format!("    let extra: Array F32 = project.draw_extra context {variable}"));
-        }
-        body(out, &variable, "    ");
+// Emit lanes in schema order. Only section lengths that depend on the rows
+// need backpatching; all other header values are known before the first row.
+fn append_fields(out: &mut Vec<String>, fields: &[Laid], row: &str, indent: &str) {
+    for field in fields {
+        let (locals, values) = encode(&field.field, &field_path(row, field), &field.name);
+        out.extend(locals.into_iter().map(|line| format!("{indent}{line}")));
+        out.extend(values.into_iter().map(|value| format!("{indent}@storage.push encoded ({value})")));
     }
 }
 
-fn render_layout(model: &Model) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut counts = HashMap::new();
-    let mut lengths = HashMap::new();
-    let mut sizes = vec!["protocol.packet_header_floats".to_owned()];
-    for entry in &model.sections {
-        let name = s(&entry.section["name"]);
-        if kind(&entry.section) == "trailing" {
-            continue;
+fn render_views(model: &Model) -> Vec<String> {
+    let mut out = vec![String::new(),
+        "func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own ResizeArray F32) => return do:".into(),
+        "  @storage.truncate encoded 0".into(),
+        "  append_render_views packet collections project context encoded".into(),
+        "  return encoded".into(),
+        "func append_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: ResizeArray F32) => return do:".into(),
+        "  let start = encoded.length".into()];
+    for section in &model.sections {
+        if kind(&section.section) != "trailing" && section.owner.is_none() {
+            let name = s(&section.section["name"]);
+            out.push(format!("  let {name}_count: U32 = collections.{name}.length"));
         }
-        let count = if name == "draws" {
-            "draws.length".to_owned()
-        } else if let Some((owners, children)) = &entry.owner {
-            let count = format!("{name}_count");
-            out.push(format!("  let {count} = 0"));
-            let owner = singular(owners);
-            out.push(format!("  for {owner} in packet.{owners}:"));
-            out.push(format!("    {count} := self + {owner}.{children}.length"));
-            count
-        } else {
-            format!("packet.{name}.length")
-        };
-        counts.insert(name, count.clone());
-        let length = match kind(&entry.section) {
-            "lanes" => count,
-            "records" => format!("{count} * {}", entry.fixed.as_ref().unwrap().lanes),
-            "variable" => {
-                let length = format!("{name}_lanes");
-                out.push(format!("  let {length} = 0"));
-                let rest = &entry.section["record"]["rest"];
-                let rest_name = s(&rest["name"]);
-                let width = entry.item.as_ref().map_or(1, |item| item.lanes);
-                direct_records(&mut out, entry, |out, variable, indent| {
-                    out.push(format!(
-                        "{indent}{length} := self + {} + {variable}.{rest_name}.length * {width}",
-                        entry.head_lanes
-                    ));
-                });
-                length
-            }
-            _ => unreachable!(),
-        };
-        sizes.push(length.clone());
-        lengths.insert(name, length);
     }
-    for (name, owners) in &model.tails {
-        let length = format!("{name}_lanes");
-        out.push(format!("  let {length} = 0"));
-        for owner in owners {
-            let entry = model.section(&owner.section);
-            direct_records(&mut out, entry, |out, variable, indent| {
-                if owner.section == "draws" {
-                    out.push(format!("{indent}{length} := self + extra.length"));
-                } else {
-                    let path = field_path(variable, &owner.field);
-                    let max = bound_blot(&owner.field.field["max"]);
-                    out.push(format!("{indent}{length} := self + min {path}.length {max} * 4"));
-                }
-            });
-        }
-        sizes.push(length);
-    }
-    out.push(format!("  let encoded = @array.fill ({}) 0.0", sizes.join(" + ")));
-    out.push("  let at = 0".to_owned());
+    let mut patches = HashMap::new();
     for entry in &model.header {
-        let field = &entry.laid;
-        let lane = &field.field;
-        let values = match kind(lane) {
-            "magic" => vec!["protocol.packet_magic".to_owned()],
-            "schema" => vec!["U32.to_f32 packet.schema".to_owned()],
+        let field = &entry.laid.field;
+        let (locals, values) = match kind(field) {
+            "magic" => (vec![], vec!["protocol.packet_magic".into()]),
+            "schema" => (vec![], vec!["U32.to_f32 packet.schema".into()]),
             "size" => {
-                let section = s(&lane["section"]);
-                vec![format!("U32.to_f32 {}", if lane["of"] == "lanes" { &lengths[section] } else { &counts[section] })]
+                let name = s(&field["section"]);
+                let dynamic = field["of"] == "lanes" || model.section(name).owner.is_some();
+                let value = if dynamic {
+                    patches.insert(name, (entry.laid.offset, s(&field["of"])));
+                    "0.0".into()
+                } else {
+                    format!("U32.to_f32 {name}_count")
+                };
+                (vec![], vec![value])
             }
             _ => {
                 let prefix = entry.group.as_ref().map_or(String::new(), |group| format!("{group}."));
-                let path = format!("packet.{prefix}{}", field.name);
-                let (locals, values) = encode(lane, &path, &entry.key.replace('.', "_"));
-                out.extend(locals.iter().map(|line| format!("  {line}")));
-                values
+                encode(field, &format!("packet.{prefix}{}", entry.laid.name), &entry.key.replace('.', "_"))
             }
         };
-        for (index, value) in values.iter().enumerate() {
-            out.push(format!("  encoded[{}] := {value}", field.offset + index));
-        }
+        out.extend(locals.into_iter().map(|line| format!("  {line}")));
+        out.extend(values.into_iter().map(|value| format!("  @storage.push encoded ({value})")));
     }
-    out.push("  at := protocol.packet_header_floats".to_owned());
-    for entry in &model.sections {
-        let name = s(&entry.section["name"]);
-        match kind(&entry.section) {
-            "lanes" => {
-                out.push(format!("  for value in packet.{name}:"));
-                out.push("    encoded[at] := value".to_owned());
-                out.push("    at := self + 1".to_owned());
+    for section in &model.sections {
+        let name = s(&section.section["name"]);
+        if patches.contains_key(name) {
+            out.push(format!("  let {name}_start = encoded.length"));
+        }
+        if kind(&section.section) == "trailing" {
+            let (_, owners) = model.tails.iter().find(|(tail, _)| tail == name).unwrap();
+            for owner in owners {
+                let section = model.section(&owner.section);
+                let indent = view_rows(&mut out, section);
+                out.push(format!("{indent}project.append_extra context source encoded"));
             }
-            "records" => {
-                let layout = entry.fixed.as_ref().unwrap();
-                direct_records(&mut out, entry, |out, variable, indent| {
-                    if name == "draws" {
-                        out.push(format!("{indent}let (mesh, material) = metadata_of {variable}"));
-                        let matrix: Vec<_> = (0..16).map(|i| format!("m{i}")).collect();
-                        out.push(format!("{indent}let ({}) = matrix_of {variable}", matrix.join(", ")));
-                        out.push(format!("{indent}let (present, p0, p1, p2, p3) = parameters_of {variable}"));
-                        for field in &layout.fields {
-                            let values = match kind(&field.field) {
-                                "reference" => vec![format!("U32.to_f32 {}", field.name)],
-                                "matrix" => matrix.clone(),
-                                "optional" => {
-                                    vec!["present".into(), "p0".into(), "p1".into(), "p2".into(), "p3".into()]
-                                }
-                                "tail" => vec!["U32.to_f32 (extra.length / 4)".into()],
-                                _ => unreachable!(),
-                            };
-                            for (lane, value) in values.iter().enumerate() {
-                                out.push(format!("{indent}encoded[at + {}] := {value}", field.offset + lane));
-                            }
-                        }
-                    } else {
-                        direct_fields(out, &layout.fields, variable, indent);
-                    }
-                    out.push(format!("{indent}at := self + {}", layout.lanes));
-                });
+            continue;
+        }
+        let indent = view_rows(&mut out, section);
+        if kind(&section.section) == "lanes" {
+            out.push(format!("{indent}@storage.push encoded source"));
+        } else if name == "draws" || name == "inset_draws" {
+            out.push(format!("{indent}let (mesh, material) = project.draw_metadata context source"));
+            let matrix = (0..16).map(|i| format!("m{i}")).collect::<Vec<_>>();
+            out.push(format!("{indent}let ({}) = project.draw_transform context source", matrix.join(", ")));
+            out.push(format!("{indent}let (present, p0, p1, p2, p3) = project.draw_parameters context source"));
+            for field in &section.fixed.as_ref().unwrap().fields {
+                let values = match kind(&field.field) {
+                    "reference" => vec![format!("U32.to_f32 {}", field.name)],
+                    "matrix" => matrix.clone(),
+                    "optional" => ["present", "p0", "p1", "p2", "p3"].map(str::to_owned).to_vec(),
+                    "tail" => vec!["U32.to_f32 (project.extra_count context source)".into()],
+                    _ => unreachable!(),
+                };
+                out.extend(values.into_iter().map(|value| format!("{indent}@storage.push encoded ({value})")));
             }
-            "variable" => {
-                let rest = &entry.section["record"]["rest"];
-                let rest_name = s(&rest["name"]);
-                direct_records(&mut out, entry, |out, variable, indent| {
-                    direct_fields(out, &entry.head, variable, indent);
-                    if let Some(layout) = &entry.item {
-                        out.push(format!(
-                            "{indent}encoded[at + {}] := U32.to_f32 {variable}.{rest_name}.length",
-                            entry.head_lanes - 1
-                        ));
-                        out.push(format!("{indent}at := self + {}", entry.head_lanes));
-                        let item = singular(rest_name);
-                        out.push(format!("{indent}for {item} in {variable}.{rest_name}:"));
-                        direct_fields(out, &layout.fields, &item, &format!("{indent}  "));
-                        out.push(format!("{indent}  at := self + {}", layout.lanes));
-                    } else {
-                        out.push(format!("{indent}at := self + {}", entry.head_lanes));
-                        out.push(format!("{indent}for value in {variable}.{rest_name}:"));
-                        out.push(format!("{indent}  encoded[at] := value"));
-                        out.push(format!("{indent}  at := self + 1"));
-                    }
-                });
-            }
-            "trailing" => {
-                if let Some((_, owners)) = model.tails.iter().find(|(section, _)| section == name) {
-                    for owner in owners {
-                        direct_records(&mut out, model.section(&owner.section), |out, variable, indent| {
-                            if owner.section == "draws" {
-                                out.push(format!("{indent}for value in extra:"));
-                                out.push(format!("{indent}  encoded[at] := value"));
-                                out.push(format!("{indent}  at := self + 1"));
-                            } else {
-                                let path = field_path(variable, &owner.field);
-                                let max = bound_blot(&owner.field.field["max"]);
-                                out.push(format!("{indent}for index in 0 .. min {path}.length {max}:"));
-                                for (lane, component) in ["x", "y", "z", "w"].iter().enumerate() {
-                                    out.push(format!(
-                                        "{indent}  encoded[at + {lane}] := ({path}.at index).{component}"
-                                    ));
-                                }
-                                out.push(format!("{indent}  at := self + 4"));
-                            }
-                        });
-                    }
+        } else {
+            let row = singular(name);
+            let nominal = section
+                .fixed
+                .as_ref()
+                .filter(|layout| layout.fields.iter().all(|f| !matches!(kind(&f.field), "children" | "tail")));
+            let annotation = nominal.map_or(String::new(), |l| format!(": types.{}", s(&l.record["name"])));
+            out.push(format!("{indent}let {row}{annotation} = project.{row} context source"));
+            if let Some(layout) = &section.fixed {
+                append_fields(&mut out, &layout.fields, &row, indent);
+            } else {
+                append_fields(&mut out, &section.head, &row, indent);
+                let rest = s(&section.section["record"]["rest"]["name"]);
+                out.push(format!("{indent}let count: U32 = {row}.{rest}.length"));
+                if section.item.is_some() {
+                    out.push(format!("{indent}@storage.push encoded (U32.to_f32 count)"));
+                }
+                out.push(format!("{indent}for i in 0 .. count:"));
+                out.push(format!("{indent}  let item = {row}.{rest}.at i"));
+                if let Some(layout) = &section.item {
+                    append_fields(&mut out, &layout.fields, "item", &format!("{indent}  "));
+                } else {
+                    out.push(format!("{indent}  @storage.push encoded item"));
                 }
             }
-            _ => unreachable!(),
+        }
+        if let Some((offset, unit)) = patches.get(name) {
+            let mut size = format!("(encoded.length - {name}_start)");
+            if *unit == "count" {
+                size.push_str(&format!(" / {}", section.fixed.as_ref().unwrap().lanes));
+            }
+            out.push(format!("  encoded[start + {offset}] = U32.to_f32 ({size})"));
         }
     }
-    out.push("  return encoded".to_owned());
+    out.push("  return ()".into());
     out
 }
 
-// Derive the flat view encoder from the same layout walk as the nominal API.
-// Only the source projection and destination ownership differ; offsets, group
-// order, counts and tail framing stay defined by render_layout/model.
-fn render_views(model: &Model) -> Vec<String> {
-    let direct = render_layout(model);
-    let body = 0;
-    let mut out = vec![String::new(),
-        "// Borrowed source groups, known scalar projections; the output is taken over and returned.".to_owned(),
-        "func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own ResizeArray F32) => return do:".to_owned(),
-        "  let draws = collections.draws".to_owned(),
-        "  let metadata_of = func draw: (U32, U32) => return project.draw_metadata context draw".to_owned(),
-        "  let matrix_of = func draw: (F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32) => return project.draw_transform context draw".to_owned(),
-        "  let parameters_of = func draw: (F32, F32, F32, F32, F32) => return project.draw_parameters context draw".to_owned()];
-    // Read each source count through one exact U32 contract. The source
-    // collection and its elements remain borrowed/generic.
-    for entry in &model.sections {
-        if kind(&entry.section) == "trailing" || entry.owner.is_some() {
-            continue;
-        }
-        let name = s(&entry.section["name"]);
-        let source = if name == "draws" { "draws".to_owned() } else { format!("collections.{name}") };
-        out.push(format!("  let source_{name}_count: U32 = {source}.length"));
+fn view_rows(out: &mut Vec<String>, section: &Section) -> &'static str {
+    if let Some((owners, children)) = &section.owner {
+        out.push(format!("  for parent in 0 .. {owners}_count:"));
+        out.push(format!(
+            "    let children = project.{}_{} context collections.{owners}[parent]",
+            singular(owners),
+            children
+        ));
+        out.push("    let count: U32 = children.length".into());
+        out.push("    for i in 0 .. count:".into());
+        out.push("      let source = children.at i".into());
+        "      "
+    } else {
+        let name = s(&section.section["name"]);
+        out.push(format!("  for i in 0 .. {name}_count:"));
+        out.push(format!("    let source = collections.{name}[i]"));
+        "    "
     }
-    let projections: HashSet<String> = model
-        .sections
-        .iter()
-        .filter(|entry| !matches!(kind(&entry.section), "lanes" | "trailing") && s(&entry.section["name"]) != "draws")
-        .map(|entry| singular(s(&entry.section["name"])))
-        .collect();
-    let mut nested_counts = Vec::new();
-    for entry in &model.sections {
-        let variable = singular(s(&entry.section["name"]));
-        if let Some(layout) = &entry.fixed {
-            for field in &layout.fields {
-                if matches!(kind(&field.field), "tail" | "children") {
-                    nested_counts.push((
-                        variable.clone(),
-                        field_path(&variable, field),
-                        format!("view_{variable}_{}_count", field.name),
-                    ));
-                }
-            }
-        }
-        if kind(&entry.section) == "variable" {
-            let rest = s(&entry.section["record"]["rest"]["name"]);
-            nested_counts.push((
-                variable.clone(),
-                format!("{variable}.{rest}"),
-                format!("view_{variable}_{rest}_count"),
-            ));
-        }
-    }
-    // Longer paths first: draw.extra is a suffix of inset_draw.extra.
-    nested_counts.sort_by_key(|(_, path, _)| std::cmp::Reverse(path.len()));
-    for original in &direct[body..] {
-        let mut line = original.clone();
-        for entry in &model.sections {
-            let name = s(&entry.section["name"]);
-            line = line.replace(&format!("packet.{name}"), &format!("collections.{name}"));
-        }
-        for entry in &model.sections {
-            if kind(&entry.section) == "trailing" || entry.owner.is_some() {
-                continue;
-            }
-            let name = s(&entry.section["name"]);
-            let source = if name == "draws" { "draws".to_owned() } else { format!("collections.{name}") };
-            if name == "draws" {
-                // Do not replace the nested inset.draws.length count.
-                line = line
-                    .replace(" draws.length", " source_draws_count")
-                    .replace("(draws.length", "(source_draws_count");
-            } else {
-                line = line.replace(&format!("{source}.length"), &format!("source_{name}_count"));
-            }
-        }
-        for (_, path, count) in &nested_counts {
-            line = line.replace(&format!("{path}.length"), count);
-        }
-        line = line.replace("extra.length", "extra_count");
-        if line.trim_start().starts_with("let extra: Array F32 = project.draw_extra ") {
-            let indent = &line[..line.len() - line.trim_start().len()];
-            out.push(line.clone());
-            out.push(format!("{indent}let extra_count: U32 = extra.length"));
-            continue;
-        }
-        if line.starts_with("  let ") && line.ends_with(" = 0") {
-            line = line.replace(" = 0", ": U32 = 0");
-        }
-        if let Some(size) = line.strip_prefix("  let encoded = @array.fill (").and_then(|s| s.strip_suffix(") 0.0")) {
-            out.push("  @storage.truncate encoded 0".to_owned());
-            out.push(format!("  for 0 .. ({size}):"));
-            out.push("    @storage.push encoded 0.0".to_owned());
-            continue;
-        }
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("for ")
-            && let Some((variable, source)) = rest.split_once(" in ")
-            && let Some(collection) = source.strip_suffix(':')
-            && !collection.contains(" .. ")
-        {
-            let indent = &line[..line.len() - trimmed.len()];
-            // A PoolCursor returns the row and a new cursor on every next().
-            // On large terrain/instance packets those temporaries accumulate
-            // inside this one guest call. Index the already-sized views.
-            let count = if collection == "draws" {
-                "source_draws_count".to_owned()
-            } else if let Some(group) = collection.strip_prefix("collections.") {
-                format!("source_{group}_count")
-            } else if let Some((_, _, count)) = nested_counts.iter().find(|(_, path, _)| path == collection) {
-                count.clone()
-            } else {
-                format!("{collection}.length")
-            };
-            let index = format!("{variable}_index");
-            out.push(format!("{indent}for {index} in 0 .. {count}:"));
-            if !projections.contains(variable) {
-                out.push(format!("{indent}  let {variable} = {collection}[{index}]"));
-                continue;
-            }
-            out.push(format!("{indent}  let source_{variable} = {collection}[{index}]"));
-            let projected = model.sections.iter().find(|entry| singular(s(&entry.section["name"])) == variable);
-            let fixed = projected
-                .and_then(|entry| entry.fixed.as_ref())
-                .filter(|layout| layout.fields.iter().all(|field| !matches!(kind(&field.field), "tail" | "children")));
-            let annotation = fixed.map_or(String::new(), |layout| format!(": types.{}", s(&layout.record["name"])));
-            out.push(format!("{indent}  let {variable}{annotation} = project.{variable} context source_{variable}"));
-            for (owner, path, count) in &nested_counts {
-                if owner == variable {
-                    out.push(format!("{indent}  let {count}: U32 = {path}.length"));
-                }
-            }
-            continue;
-        }
-        out.push(line);
-    }
-    out
 }
 
 // Small games keep flat mesh and sound pools without owning nested wire records.

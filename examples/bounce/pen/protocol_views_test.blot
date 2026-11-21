@@ -25,6 +25,10 @@ func child_start (context: Context) -> (at: U32) => return do:
   for i in 0 .. ((at - context.insets_start) / 48):
     start := start + F32.to_u32 packet[context.insets_start + i * 48 + 45] * 24
   return start
+func inset_draws (context: Context) -> (at: U32) => return do:
+  let count = F32.to_u32 context.packet[at + 45]
+  let first = child_start context at
+  return array.generate count (func i => return first + i * 24)
 func draw_metadata (context: Context) -> (at: U32) => return do:
   let packet: Array F32 = context.packet
   return (F32.to_u32 packet[at], F32.to_u32 packet[at + 1])
@@ -34,9 +38,12 @@ func draw_transform (context: Context) -> (at: U32) => return do:
 func draw_parameters (context: Context) -> (at: U32) => return do:
   let packet: Array F32 = context.packet
   return (packet[at + 18], packet[at + 19], packet[at + 20], packet[at + 21], packet[at + 22])
-func draw_extra (context: Context) -> (at: U32) => return do:
-  let packet: Array F32 = context.packet
-  return array.slice (extra_start context at) (F32.to_u32 packet[at + 23] * 4) packet
+func extra_count (context: Context) -> (at: U32) => return do:
+  return F32.to_u32 context.packet[at + 23]
+func append_extra (context: Context) -> (at: U32) -> (encoded: ResizeArray F32) => return do:
+  let first = extra_start context at
+  for lane in 0 .. extra_count context at * 4:
+    @storage.push encoded context.packet[first + lane]
 func project_solid (context: Context) -> (at: U32) => return do:
   let packet: Array F32 = context.packet
   return { faces: array.generate (F32.to_u32 packet[at + 0]) (func i => return $types.SolidFace { normal: $types.Vector { x: packet[at + 1 + i * 5 + 0 + 0], y: packet[at + 1 + i * 5 + 0 + 1], z: packet[at + 1 + i * 5 + 0 + 2] }, distance: packet[at + 1 + i * 5 + 3], material: F32.to_u32 packet[at + 1 + i * 5 + 4] }) }
@@ -174,5 +181,5 @@ func reencode_views (packet: Array F32) -> (destination: own ResizeArray F32) =>
   let instances = array.generate instances_count (func i => return instances_start + i * 26)
   let instance_removals = array.generate instance_removals_count (func i => return instance_removals_start + i * 2)
   let collections = { state, draws, solids, decals, sounds, sprites, insets, preferences, fields, ui, services, buses, voices, poses, emitters, lights, listener, panners, instances, instance_removals }
-  let project = { draw_metadata, draw_transform, draw_parameters, draw_extra, solid: project_solid, decal: project_decal, sound: project_sound, sprite: project_sprite, inset: project_inset, inset_draw: project_inset_draw, field: project_field, ui: project_ui, service: project_service, buse: project_buse, voice: project_voice, pose: project_pose, emitter: project_emitter, light: project_light, listener: project_listener, panner: project_panner, instance: project_instance, instance_removal: project_instance_removal }
+  let project = { draw_metadata, draw_transform, draw_parameters, extra_count, append_extra, inset_draws, solid: project_solid, decal: project_decal, sound: project_sound, sprite: project_sprite, inset: project_inset, inset_draw: project_inset_draw, field: project_field, ui: project_ui, service: project_service, buse: project_buse, voice: project_voice, pose: project_pose, emitter: project_emitter, light: project_light, listener: project_listener, panner: project_panner, instance: project_instance, instance_removal: project_instance_removal }
   return renderer.encode_render_views header collections project context destination

@@ -123,6 +123,10 @@ pub fn emit(model: &Model, header: &[String]) -> String {
             insets.lanes, children.offset, draws.lanes
         ),
         "  return start".to_owned(),
+        "func inset_draws (context: Context) -> (at: U32) => return do:".to_owned(),
+        format!("  let count = F32.to_u32 context.packet[at + {}]", children.offset),
+        "  let first = child_start context at".to_owned(),
+        format!("  return array.generate count (func i => return first + i * {})", draws.lanes),
         "func draw_metadata (context: Context) -> (at: U32) => return do:".to_owned(),
         "  let packet: Array F32 = context.packet".to_owned(),
         "  return (F32.to_u32 packet[at], F32.to_u32 packet[at + 1])".to_owned(),
@@ -132,9 +136,12 @@ pub fn emit(model: &Model, header: &[String]) -> String {
         "func draw_parameters (context: Context) -> (at: U32) => return do:".to_owned(),
         "  let packet: Array F32 = context.packet".to_owned(),
         "  return (packet[at + 18], packet[at + 19], packet[at + 20], packet[at + 21], packet[at + 22])".to_owned(),
-        "func draw_extra (context: Context) -> (at: U32) => return do:".to_owned(),
-        "  let packet: Array F32 = context.packet".to_owned(),
-        format!("  return array.slice (extra_start context at) (F32.to_u32 packet[at + {}] * 4) packet", tail.offset),
+        "func extra_count (context: Context) -> (at: U32) => return do:".to_owned(),
+        format!("  return F32.to_u32 context.packet[at + {}]", tail.offset),
+        "func append_extra (context: Context) -> (at: U32) -> (encoded: ResizeArray F32) => return do:".to_owned(),
+        "  let first = extra_start context at".to_owned(),
+        "  for lane in 0 .. extra_count context at * 4:".to_owned(),
+        "    @storage.push encoded context.packet[first + lane]".to_owned(),
     ]);
     for section in &model.sections {
         if matches!(kind(&section.section), "records" | "variable") && s(&section.section["name"]) != "draws" {
@@ -235,7 +242,9 @@ pub fn emit(model: &Model, header: &[String]) -> String {
         "draw_metadata".to_owned(),
         "draw_transform".to_owned(),
         "draw_parameters".to_owned(),
-        "draw_extra".to_owned(),
+        "extra_count".to_owned(),
+        "append_extra".to_owned(),
+        "inset_draws".to_owned(),
     ];
     for section in &model.sections {
         if matches!(kind(&section.section), "records" | "variable") && s(&section.section["name"]) != "draws" {

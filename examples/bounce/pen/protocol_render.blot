@@ -233,693 +233,612 @@ func encode_draw_extra (draw: types.Draw) => return do:
 
 func vec4_lanes (v: types.Vec4) => return #[v.x, v.y, v.z, v.w]
 
-// Borrowed source groups, known scalar projections; the output is taken over and returned.
 func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own ResizeArray F32) => return do:
-  let draws = collections.draws
-  let metadata_of = func draw: (U32, U32) => return project.draw_metadata context draw
-  let matrix_of = func draw: (F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32, F32) => return project.draw_transform context draw
-  let parameters_of = func draw: (F32, F32, F32, F32, F32) => return project.draw_parameters context draw
-  let source_state_count: U32 = collections.state.length
-  let source_draws_count: U32 = draws.length
-  let source_solids_count: U32 = collections.solids.length
-  let source_decals_count: U32 = collections.decals.length
-  let source_sounds_count: U32 = collections.sounds.length
-  let source_sprites_count: U32 = collections.sprites.length
-  let source_insets_count: U32 = collections.insets.length
-  let source_preferences_count: U32 = collections.preferences.length
-  let source_fields_count: U32 = collections.fields.length
-  let source_ui_count: U32 = collections.ui.length
-  let source_services_count: U32 = collections.services.length
-  let source_buses_count: U32 = collections.buses.length
-  let source_voices_count: U32 = collections.voices.length
-  let source_poses_count: U32 = collections.poses.length
-  let source_emitters_count: U32 = collections.emitters.length
-  let source_lights_count: U32 = collections.lights.length
-  let source_listener_count: U32 = collections.listener.length
-  let source_panners_count: U32 = collections.panners.length
-  let source_instances_count: U32 = collections.instances.length
-  let source_instance_removals_count: U32 = collections.instance_removals.length
-  let solids_lanes: U32 = 0
-  for solid_index in 0 .. source_solids_count:
-    let source_solid = collections.solids[solid_index]
-    let solid = project.solid context source_solid
-    let view_solid_faces_count: U32 = solid.faces.length
-    solids_lanes := self + 1 + view_solid_faces_count * 5
-  let inset_draws_count: U32 = 0
-  for inset_index in 0 .. source_insets_count:
-    let source_inset = collections.insets[inset_index]
-    let inset = project.inset context source_inset
-    let view_inset_draws_count: U32 = inset.draws.length
-    inset_draws_count := self + view_inset_draws_count
-  let fields_lanes: U32 = 0
-  for field_index in 0 .. source_fields_count:
-    let source_field = collections.fields[field_index]
-    let field = project.field context source_field
-    let view_field_values_count: U32 = field.values.length
-    fields_lanes := self + 7 + view_field_values_count * 1
-  let ui_lanes: U32 = 0
-  for ui_index in 0 .. source_ui_count:
-    let source_ui = collections.ui[ui_index]
-    let ui = project.ui context source_ui
-    let view_ui_text_count: U32 = ui.text.length
-    ui_lanes := self + 24 + view_ui_text_count * 1
-  let services_lanes: U32 = 0
-  for service_index in 0 .. source_services_count:
-    let source_service = collections.services[service_index]
-    let service = project.service context source_service
-    let view_service_values_count: U32 = service.values.length
-    services_lanes := self + 8 + view_service_values_count * 1
-  let extras_lanes: U32 = 0
-  for draw_index in 0 .. source_draws_count:
-    let draw = draws[draw_index]
-    let extra: Array F32 = project.draw_extra context draw
-    let extra_count: U32 = extra.length
-    extras_lanes := self + extra_count
-  for inset_index in 0 .. source_insets_count:
-    let source_inset = collections.insets[inset_index]
-    let inset = project.inset context source_inset
-    let view_inset_draws_count: U32 = inset.draws.length
-    for inset_draw_index in 0 .. view_inset_draws_count:
-      let source_inset_draw = inset.draws[inset_draw_index]
-      let inset_draw = project.inset_draw context source_inset_draw
-      let view_inset_draw_extra_count: U32 = inset_draw.extra.length
-      extras_lanes := self + min view_inset_draw_extra_count protocol.max_draw_extra * 4
   @storage.truncate encoded 0
-  for 0 .. (protocol.packet_header_floats + source_state_count + source_draws_count * 24 + solids_lanes + source_decals_count * 18 + source_sounds_count * 7 + source_sprites_count * 17 + source_insets_count * 48 + inset_draws_count * 24 + source_preferences_count + fields_lanes + ui_lanes + services_lanes + source_buses_count * 3 + source_voices_count * 12 + source_poses_count * 4 + source_emitters_count * 42 + source_lights_count * 12 + source_listener_count * 9 + source_panners_count * 15 + source_instances_count * 26 + source_instance_removals_count * 2 + extras_lanes):
-    @storage.push encoded 0.0
-  let at: U32 = 0
-  encoded[0] := protocol.packet_magic
-  encoded[1] := U32.to_f32 packet.schema
-  encoded[2] := U32.to_f32 source_state_count
-  encoded[3] := U32.to_f32 source_draws_count
-  encoded[4] := U32.to_f32 source_solids_count
-  encoded[5] := U32.to_f32 solids_lanes
-  encoded[6] := U32.to_f32 source_decals_count
-  encoded[7] := U32.to_f32 source_sounds_count
-  encoded[8] := U32.to_f32 source_sprites_count
-  encoded[9] := U32.to_f32 source_insets_count
-  encoded[10] := U32.to_f32 inset_draws_count
-  encoded[11] := U32.to_f32 source_preferences_count
-  encoded[12] := lanes.bit packet.save_requested
-  encoded[13] := lanes.bit packet.load_requested
-  encoded[14] := lanes.bit packet.scene_save_requested
-  encoded[15] := lanes.bit packet.scene_load_requested
-  encoded[16] := lanes.bit packet.checkpoint_requested
-  encoded[17] := lanes.bit packet.undo_requested
-  encoded[18] := lanes.bit packet.redo_requested
-  encoded[19] := lanes.bit packet.exit_requested
+  append_render_views packet collections project context encoded
+  return encoded
+func append_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: ResizeArray F32) => return do:
+  let start = encoded.length
+  let state_count: U32 = collections.state.length
+  let draws_count: U32 = collections.draws.length
+  let solids_count: U32 = collections.solids.length
+  let decals_count: U32 = collections.decals.length
+  let sounds_count: U32 = collections.sounds.length
+  let sprites_count: U32 = collections.sprites.length
+  let insets_count: U32 = collections.insets.length
+  let preferences_count: U32 = collections.preferences.length
+  let fields_count: U32 = collections.fields.length
+  let ui_count: U32 = collections.ui.length
+  let services_count: U32 = collections.services.length
+  let buses_count: U32 = collections.buses.length
+  let voices_count: U32 = collections.voices.length
+  let poses_count: U32 = collections.poses.length
+  let emitters_count: U32 = collections.emitters.length
+  let lights_count: U32 = collections.lights.length
+  let listener_count: U32 = collections.listener.length
+  let panners_count: U32 = collections.panners.length
+  let instances_count: U32 = collections.instances.length
+  let instance_removals_count: U32 = collections.instance_removals.length
+  @storage.push encoded (protocol.packet_magic)
+  @storage.push encoded (U32.to_f32 packet.schema)
+  @storage.push encoded (0.0)
+  @storage.push encoded (U32.to_f32 draws_count)
+  @storage.push encoded (U32.to_f32 solids_count)
+  @storage.push encoded (0.0)
+  @storage.push encoded (U32.to_f32 decals_count)
+  @storage.push encoded (U32.to_f32 sounds_count)
+  @storage.push encoded (U32.to_f32 sprites_count)
+  @storage.push encoded (U32.to_f32 insets_count)
+  @storage.push encoded (0.0)
+  @storage.push encoded (0.0)
+  @storage.push encoded (lanes.bit packet.save_requested)
+  @storage.push encoded (lanes.bit packet.load_requested)
+  @storage.push encoded (lanes.bit packet.scene_save_requested)
+  @storage.push encoded (lanes.bit packet.scene_load_requested)
+  @storage.push encoded (lanes.bit packet.checkpoint_requested)
+  @storage.push encoded (lanes.bit packet.undo_requested)
+  @storage.push encoded (lanes.bit packet.redo_requested)
+  @storage.push encoded (lanes.bit packet.exit_requested)
   let $types.Mat4 { x: view_x, y: view_y, z: view_z, w: view_w } = packet.view
-  encoded[20] := view_x.x
-  encoded[21] := view_x.y
-  encoded[22] := view_x.z
-  encoded[23] := view_x.w
-  encoded[24] := view_y.x
-  encoded[25] := view_y.y
-  encoded[26] := view_y.z
-  encoded[27] := view_y.w
-  encoded[28] := view_z.x
-  encoded[29] := view_z.y
-  encoded[30] := view_z.z
-  encoded[31] := view_z.w
-  encoded[32] := view_w.x
-  encoded[33] := view_w.y
-  encoded[34] := view_w.z
-  encoded[35] := view_w.w
+  @storage.push encoded (view_x.x)
+  @storage.push encoded (view_x.y)
+  @storage.push encoded (view_x.z)
+  @storage.push encoded (view_x.w)
+  @storage.push encoded (view_y.x)
+  @storage.push encoded (view_y.y)
+  @storage.push encoded (view_y.z)
+  @storage.push encoded (view_y.w)
+  @storage.push encoded (view_z.x)
+  @storage.push encoded (view_z.y)
+  @storage.push encoded (view_z.z)
+  @storage.push encoded (view_z.w)
+  @storage.push encoded (view_w.x)
+  @storage.push encoded (view_w.y)
+  @storage.push encoded (view_w.z)
+  @storage.push encoded (view_w.w)
   let $types.Mat4 { x: projection_x, y: projection_y, z: projection_z, w: projection_w } = packet.projection
-  encoded[36] := projection_x.x
-  encoded[37] := projection_x.y
-  encoded[38] := projection_x.z
-  encoded[39] := projection_x.w
-  encoded[40] := projection_y.x
-  encoded[41] := projection_y.y
-  encoded[42] := projection_y.z
-  encoded[43] := projection_y.w
-  encoded[44] := projection_z.x
-  encoded[45] := projection_z.y
-  encoded[46] := projection_z.z
-  encoded[47] := projection_z.w
-  encoded[48] := projection_w.x
-  encoded[49] := projection_w.y
-  encoded[50] := projection_w.z
-  encoded[51] := projection_w.w
-  encoded[52] := packet.clear.r
-  encoded[53] := packet.clear.g
-  encoded[54] := packet.clear.b
-  encoded[55] := packet.clear.a
-  encoded[56] := packet.ambient.x
-  encoded[57] := packet.ambient.y
-  encoded[58] := packet.ambient.z
-  encoded[59] := packet.light_direction.x
-  encoded[60] := packet.light_direction.y
-  encoded[61] := packet.light_direction.z
-  encoded[62] := packet.light_color.x
-  encoded[63] := packet.light_color.y
-  encoded[64] := packet.light_color.z
-  encoded[65] := packet.aberration.x
-  encoded[66] := packet.aberration.y
-  encoded[67] := U32.to_f32 (packet.quality.msaa)
-  encoded[68] := lanes.bit packet.quality.fxaa
-  encoded[69] := packet.quality.scale
-  encoded[70] := U32.to_f32 (packet.quality.filtering)
-  encoded[71] := lanes.bit packet.quality.occlusion
-  encoded[72] := lanes.bit packet.quality.sky
-  encoded[73] := lanes.bit packet.quality.effects
-  encoded[74] := packet.sky.zenith.x
-  encoded[75] := packet.sky.zenith.y
-  encoded[76] := packet.sky.zenith.z
-  encoded[77] := packet.sky.horizon.x
-  encoded[78] := packet.sky.horizon.y
-  encoded[79] := packet.sky.horizon.z
-  encoded[80] := packet.sky.ground.x
-  encoded[81] := packet.sky.ground.y
-  encoded[82] := packet.sky.ground.z
-  encoded[83] := packet.sky.sun.x
-  encoded[84] := packet.sky.sun.y
-  encoded[85] := packet.sky.sun.z
-  encoded[86] := packet.sky.night
-  encoded[87] := packet.fog.radius
-  encoded[88] := packet.fog.density
-  encoded[89] := packet.fog.height
+  @storage.push encoded (projection_x.x)
+  @storage.push encoded (projection_x.y)
+  @storage.push encoded (projection_x.z)
+  @storage.push encoded (projection_x.w)
+  @storage.push encoded (projection_y.x)
+  @storage.push encoded (projection_y.y)
+  @storage.push encoded (projection_y.z)
+  @storage.push encoded (projection_y.w)
+  @storage.push encoded (projection_z.x)
+  @storage.push encoded (projection_z.y)
+  @storage.push encoded (projection_z.z)
+  @storage.push encoded (projection_z.w)
+  @storage.push encoded (projection_w.x)
+  @storage.push encoded (projection_w.y)
+  @storage.push encoded (projection_w.z)
+  @storage.push encoded (projection_w.w)
+  @storage.push encoded (packet.clear.r)
+  @storage.push encoded (packet.clear.g)
+  @storage.push encoded (packet.clear.b)
+  @storage.push encoded (packet.clear.a)
+  @storage.push encoded (packet.ambient.x)
+  @storage.push encoded (packet.ambient.y)
+  @storage.push encoded (packet.ambient.z)
+  @storage.push encoded (packet.light_direction.x)
+  @storage.push encoded (packet.light_direction.y)
+  @storage.push encoded (packet.light_direction.z)
+  @storage.push encoded (packet.light_color.x)
+  @storage.push encoded (packet.light_color.y)
+  @storage.push encoded (packet.light_color.z)
+  @storage.push encoded (packet.aberration.x)
+  @storage.push encoded (packet.aberration.y)
+  @storage.push encoded (U32.to_f32 (packet.quality.msaa))
+  @storage.push encoded (lanes.bit packet.quality.fxaa)
+  @storage.push encoded (packet.quality.scale)
+  @storage.push encoded (U32.to_f32 (packet.quality.filtering))
+  @storage.push encoded (lanes.bit packet.quality.occlusion)
+  @storage.push encoded (lanes.bit packet.quality.sky)
+  @storage.push encoded (lanes.bit packet.quality.effects)
+  @storage.push encoded (packet.sky.zenith.x)
+  @storage.push encoded (packet.sky.zenith.y)
+  @storage.push encoded (packet.sky.zenith.z)
+  @storage.push encoded (packet.sky.horizon.x)
+  @storage.push encoded (packet.sky.horizon.y)
+  @storage.push encoded (packet.sky.horizon.z)
+  @storage.push encoded (packet.sky.ground.x)
+  @storage.push encoded (packet.sky.ground.y)
+  @storage.push encoded (packet.sky.ground.z)
+  @storage.push encoded (packet.sky.sun.x)
+  @storage.push encoded (packet.sky.sun.y)
+  @storage.push encoded (packet.sky.sun.z)
+  @storage.push encoded (packet.sky.night)
+  @storage.push encoded (packet.fog.radius)
+  @storage.push encoded (packet.fog.density)
+  @storage.push encoded (packet.fog.height)
   let $types.Mat4 { x: shadow_view_x, y: shadow_view_y, z: shadow_view_z, w: shadow_view_w } = packet.shadow.view
-  encoded[90] := shadow_view_x.x
-  encoded[91] := shadow_view_x.y
-  encoded[92] := shadow_view_x.z
-  encoded[93] := shadow_view_x.w
-  encoded[94] := shadow_view_y.x
-  encoded[95] := shadow_view_y.y
-  encoded[96] := shadow_view_y.z
-  encoded[97] := shadow_view_y.w
-  encoded[98] := shadow_view_z.x
-  encoded[99] := shadow_view_z.y
-  encoded[100] := shadow_view_z.z
-  encoded[101] := shadow_view_z.w
-  encoded[102] := shadow_view_w.x
-  encoded[103] := shadow_view_w.y
-  encoded[104] := shadow_view_w.z
-  encoded[105] := shadow_view_w.w
+  @storage.push encoded (shadow_view_x.x)
+  @storage.push encoded (shadow_view_x.y)
+  @storage.push encoded (shadow_view_x.z)
+  @storage.push encoded (shadow_view_x.w)
+  @storage.push encoded (shadow_view_y.x)
+  @storage.push encoded (shadow_view_y.y)
+  @storage.push encoded (shadow_view_y.z)
+  @storage.push encoded (shadow_view_y.w)
+  @storage.push encoded (shadow_view_z.x)
+  @storage.push encoded (shadow_view_z.y)
+  @storage.push encoded (shadow_view_z.z)
+  @storage.push encoded (shadow_view_z.w)
+  @storage.push encoded (shadow_view_w.x)
+  @storage.push encoded (shadow_view_w.y)
+  @storage.push encoded (shadow_view_w.z)
+  @storage.push encoded (shadow_view_w.w)
   let $types.Mat4 { x: shadow_projection_x, y: shadow_projection_y, z: shadow_projection_z, w: shadow_projection_w } = packet.shadow.projection
-  encoded[106] := shadow_projection_x.x
-  encoded[107] := shadow_projection_x.y
-  encoded[108] := shadow_projection_x.z
-  encoded[109] := shadow_projection_x.w
-  encoded[110] := shadow_projection_y.x
-  encoded[111] := shadow_projection_y.y
-  encoded[112] := shadow_projection_y.z
-  encoded[113] := shadow_projection_y.w
-  encoded[114] := shadow_projection_z.x
-  encoded[115] := shadow_projection_z.y
-  encoded[116] := shadow_projection_z.z
-  encoded[117] := shadow_projection_z.w
-  encoded[118] := shadow_projection_w.x
-  encoded[119] := shadow_projection_w.y
-  encoded[120] := shadow_projection_w.z
-  encoded[121] := shadow_projection_w.w
-  encoded[122] := packet.shadow.texel
-  encoded[123] := U32.to_f32 (packet.shadow.texels)
-  encoded[124] := packet.blur
-  encoded[125] := lanes.bit packet.quality.bloom
-  encoded[126] := packet.clouds.cover
-  encoded[127] := packet.clouds.drift.x
-  encoded[128] := packet.clouds.drift.z
-  encoded[129] := lanes.bit packet.hide_cursor
-  encoded[130] := U32.to_f32 source_fields_count
-  encoded[131] := U32.to_f32 fields_lanes
-  encoded[132] := U32.to_f32 source_ui_count
-  encoded[133] := U32.to_f32 ui_lanes
-  encoded[134] := U32.to_f32 source_services_count
-  encoded[135] := U32.to_f32 services_lanes
-  encoded[136] := U32.to_f32 source_buses_count
-  encoded[137] := U32.to_f32 source_voices_count
-  encoded[138] := U32.to_f32 source_poses_count
-  encoded[139] := U32.to_f32 source_emitters_count
-  encoded[140] := lanes.bit packet.quality.taa
-  encoded[141] := U32.to_f32 source_lights_count
-  encoded[142] := U32.to_f32 source_listener_count
-  encoded[143] := U32.to_f32 source_panners_count
-  encoded[144] := lanes.bit packet.loading
-  encoded[145] := lanes.bit packet.show_captions
-  encoded[146] := lanes.bit packet.retained_enabled
-  encoded[147] := lanes.bit packet.retained_reset
-  encoded[148] := U32.to_f32 (packet.retained_after)
-  encoded[149] := U32.to_f32 source_instances_count
-  encoded[150] := U32.to_f32 source_instance_removals_count
-  at := protocol.packet_header_floats
-  for value_index in 0 .. source_state_count:
-    let value = collections.state[value_index]
-    encoded[at] := value
-    at := self + 1
-  for draw_index in 0 .. source_draws_count:
-    let draw = draws[draw_index]
-    let extra: Array F32 = project.draw_extra context draw
-    let extra_count: U32 = extra.length
-    let (mesh, material) = metadata_of draw
-    let (m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15) = matrix_of draw
-    let (present, p0, p1, p2, p3) = parameters_of draw
-    encoded[at + 0] := U32.to_f32 mesh
-    encoded[at + 1] := U32.to_f32 material
-    encoded[at + 2] := m0
-    encoded[at + 3] := m1
-    encoded[at + 4] := m2
-    encoded[at + 5] := m3
-    encoded[at + 6] := m4
-    encoded[at + 7] := m5
-    encoded[at + 8] := m6
-    encoded[at + 9] := m7
-    encoded[at + 10] := m8
-    encoded[at + 11] := m9
-    encoded[at + 12] := m10
-    encoded[at + 13] := m11
-    encoded[at + 14] := m12
-    encoded[at + 15] := m13
-    encoded[at + 16] := m14
-    encoded[at + 17] := m15
-    encoded[at + 18] := present
-    encoded[at + 19] := p0
-    encoded[at + 20] := p1
-    encoded[at + 21] := p2
-    encoded[at + 22] := p3
-    encoded[at + 23] := U32.to_f32 (extra_count / 4)
-    at := self + 24
-  for solid_index in 0 .. source_solids_count:
-    let source_solid = collections.solids[solid_index]
-    let solid = project.solid context source_solid
-    let view_solid_faces_count: U32 = solid.faces.length
-    encoded[at + 0] := U32.to_f32 view_solid_faces_count
-    at := self + 1
-    for face_index in 0 .. view_solid_faces_count:
-      let face = solid.faces[face_index]
-      encoded[at + 0] := face.normal.x
-      encoded[at + 1] := face.normal.y
-      encoded[at + 2] := face.normal.z
-      encoded[at + 3] := face.distance
-      encoded[at + 4] := U32.to_f32 (face.material)
-      at := self + 5
-  for decal_index in 0 .. source_decals_count:
-    let source_decal = collections.decals[decal_index]
-    let decal: types.Decal = project.decal context source_decal
-    encoded[at + 0] := U32.to_f32 (decal.material)
+  @storage.push encoded (shadow_projection_x.x)
+  @storage.push encoded (shadow_projection_x.y)
+  @storage.push encoded (shadow_projection_x.z)
+  @storage.push encoded (shadow_projection_x.w)
+  @storage.push encoded (shadow_projection_y.x)
+  @storage.push encoded (shadow_projection_y.y)
+  @storage.push encoded (shadow_projection_y.z)
+  @storage.push encoded (shadow_projection_y.w)
+  @storage.push encoded (shadow_projection_z.x)
+  @storage.push encoded (shadow_projection_z.y)
+  @storage.push encoded (shadow_projection_z.z)
+  @storage.push encoded (shadow_projection_z.w)
+  @storage.push encoded (shadow_projection_w.x)
+  @storage.push encoded (shadow_projection_w.y)
+  @storage.push encoded (shadow_projection_w.z)
+  @storage.push encoded (shadow_projection_w.w)
+  @storage.push encoded (packet.shadow.texel)
+  @storage.push encoded (U32.to_f32 (packet.shadow.texels))
+  @storage.push encoded (packet.blur)
+  @storage.push encoded (lanes.bit packet.quality.bloom)
+  @storage.push encoded (packet.clouds.cover)
+  @storage.push encoded (packet.clouds.drift.x)
+  @storage.push encoded (packet.clouds.drift.z)
+  @storage.push encoded (lanes.bit packet.hide_cursor)
+  @storage.push encoded (U32.to_f32 fields_count)
+  @storage.push encoded (0.0)
+  @storage.push encoded (U32.to_f32 ui_count)
+  @storage.push encoded (0.0)
+  @storage.push encoded (U32.to_f32 services_count)
+  @storage.push encoded (0.0)
+  @storage.push encoded (U32.to_f32 buses_count)
+  @storage.push encoded (U32.to_f32 voices_count)
+  @storage.push encoded (U32.to_f32 poses_count)
+  @storage.push encoded (U32.to_f32 emitters_count)
+  @storage.push encoded (lanes.bit packet.quality.taa)
+  @storage.push encoded (U32.to_f32 lights_count)
+  @storage.push encoded (U32.to_f32 listener_count)
+  @storage.push encoded (U32.to_f32 panners_count)
+  @storage.push encoded (lanes.bit packet.loading)
+  @storage.push encoded (lanes.bit packet.show_captions)
+  @storage.push encoded (lanes.bit packet.retained_enabled)
+  @storage.push encoded (lanes.bit packet.retained_reset)
+  @storage.push encoded (U32.to_f32 (packet.retained_after))
+  @storage.push encoded (U32.to_f32 instances_count)
+  @storage.push encoded (U32.to_f32 instance_removals_count)
+  let state_start = encoded.length
+  for i in 0 .. state_count:
+    let source = collections.state[i]
+    @storage.push encoded source
+  encoded[start + 2] = U32.to_f32 ((encoded.length - state_start))
+  for i in 0 .. draws_count:
+    let source = collections.draws[i]
+    let (mesh, material) = project.draw_metadata context source
+    let (m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15) = project.draw_transform context source
+    let (present, p0, p1, p2, p3) = project.draw_parameters context source
+    @storage.push encoded (U32.to_f32 mesh)
+    @storage.push encoded (U32.to_f32 material)
+    @storage.push encoded (m0)
+    @storage.push encoded (m1)
+    @storage.push encoded (m2)
+    @storage.push encoded (m3)
+    @storage.push encoded (m4)
+    @storage.push encoded (m5)
+    @storage.push encoded (m6)
+    @storage.push encoded (m7)
+    @storage.push encoded (m8)
+    @storage.push encoded (m9)
+    @storage.push encoded (m10)
+    @storage.push encoded (m11)
+    @storage.push encoded (m12)
+    @storage.push encoded (m13)
+    @storage.push encoded (m14)
+    @storage.push encoded (m15)
+    @storage.push encoded (present)
+    @storage.push encoded (p0)
+    @storage.push encoded (p1)
+    @storage.push encoded (p2)
+    @storage.push encoded (p3)
+    @storage.push encoded (U32.to_f32 (project.extra_count context source))
+  let solids_start = encoded.length
+  for i in 0 .. solids_count:
+    let source = collections.solids[i]
+    let solid = project.solid context source
+    let count: U32 = solid.faces.length
+    @storage.push encoded (U32.to_f32 count)
+    for i in 0 .. count:
+      let item = solid.faces.at i
+      @storage.push encoded (item.normal.x)
+      @storage.push encoded (item.normal.y)
+      @storage.push encoded (item.normal.z)
+      @storage.push encoded (item.distance)
+      @storage.push encoded (U32.to_f32 (item.material))
+  encoded[start + 5] = U32.to_f32 ((encoded.length - solids_start))
+  for i in 0 .. decals_count:
+    let source = collections.decals[i]
+    let decal: types.Decal = project.decal context source
+    @storage.push encoded (U32.to_f32 (decal.material))
     let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = decal.transform
-    encoded[at + 1] := transform_x.x
-    encoded[at + 2] := transform_x.y
-    encoded[at + 3] := transform_x.z
-    encoded[at + 4] := transform_x.w
-    encoded[at + 5] := transform_y.x
-    encoded[at + 6] := transform_y.y
-    encoded[at + 7] := transform_y.z
-    encoded[at + 8] := transform_y.w
-    encoded[at + 9] := transform_z.x
-    encoded[at + 10] := transform_z.y
-    encoded[at + 11] := transform_z.z
-    encoded[at + 12] := transform_z.w
-    encoded[at + 13] := transform_w.x
-    encoded[at + 14] := transform_w.y
-    encoded[at + 15] := transform_w.z
-    encoded[at + 16] := transform_w.w
-    encoded[at + 17] := decal.opacity
-    at := self + 18
-  for sound_index in 0 .. source_sounds_count:
-    let source_sound = collections.sounds[sound_index]
-    let sound: types.Sound = project.sound context source_sound
-    encoded[at + 0] := U32.to_f32 (sound.clip)
-    encoded[at + 1] := U32.to_f32 (sound.bus)
-    encoded[at + 2] := sound.gain
-    encoded[at + 3] := sound.pan
-    encoded[at + 4] := sound.pitch
-    encoded[at + 5] := sound.lowpass
-    encoded[at + 6] := sound.reverb
-    at := self + 7
-  for sprite_index in 0 .. source_sprites_count:
-    let source_sprite = collections.sprites[sprite_index]
-    let sprite: types.Sprite = project.sprite context source_sprite
-    encoded[at + 0] := sprite.x
-    encoded[at + 1] := sprite.y
-    encoded[at + 2] := sprite.width
-    encoded[at + 3] := sprite.height
-    encoded[at + 4] := sprite.u0
-    encoded[at + 5] := sprite.v0
-    encoded[at + 6] := sprite.u1
-    encoded[at + 7] := sprite.v1
-    encoded[at + 8] := sprite.color.x
-    encoded[at + 9] := sprite.color.y
-    encoded[at + 10] := sprite.color.z
-    encoded[at + 11] := sprite.color.w
-    encoded[at + 12] := U32.to_f32 (sprite.material)
-    encoded[at + 13] := sprite.parameters.x
-    encoded[at + 14] := sprite.parameters.y
-    encoded[at + 15] := sprite.parameters.z
-    encoded[at + 16] := sprite.parameters.w
-    at := self + 17
-  for inset_index in 0 .. source_insets_count:
-    let source_inset = collections.insets[inset_index]
-    let inset = project.inset context source_inset
-    let view_inset_draws_count: U32 = inset.draws.length
-    encoded[at + 0] := inset.x
-    encoded[at + 1] := inset.y
-    encoded[at + 2] := inset.width
-    encoded[at + 3] := inset.height
+    @storage.push encoded (transform_x.x)
+    @storage.push encoded (transform_x.y)
+    @storage.push encoded (transform_x.z)
+    @storage.push encoded (transform_x.w)
+    @storage.push encoded (transform_y.x)
+    @storage.push encoded (transform_y.y)
+    @storage.push encoded (transform_y.z)
+    @storage.push encoded (transform_y.w)
+    @storage.push encoded (transform_z.x)
+    @storage.push encoded (transform_z.y)
+    @storage.push encoded (transform_z.z)
+    @storage.push encoded (transform_z.w)
+    @storage.push encoded (transform_w.x)
+    @storage.push encoded (transform_w.y)
+    @storage.push encoded (transform_w.z)
+    @storage.push encoded (transform_w.w)
+    @storage.push encoded (decal.opacity)
+  for i in 0 .. sounds_count:
+    let source = collections.sounds[i]
+    let sound: types.Sound = project.sound context source
+    @storage.push encoded (U32.to_f32 (sound.clip))
+    @storage.push encoded (U32.to_f32 (sound.bus))
+    @storage.push encoded (sound.gain)
+    @storage.push encoded (sound.pan)
+    @storage.push encoded (sound.pitch)
+    @storage.push encoded (sound.lowpass)
+    @storage.push encoded (sound.reverb)
+  for i in 0 .. sprites_count:
+    let source = collections.sprites[i]
+    let sprite: types.Sprite = project.sprite context source
+    @storage.push encoded (sprite.x)
+    @storage.push encoded (sprite.y)
+    @storage.push encoded (sprite.width)
+    @storage.push encoded (sprite.height)
+    @storage.push encoded (sprite.u0)
+    @storage.push encoded (sprite.v0)
+    @storage.push encoded (sprite.u1)
+    @storage.push encoded (sprite.v1)
+    @storage.push encoded (sprite.color.x)
+    @storage.push encoded (sprite.color.y)
+    @storage.push encoded (sprite.color.z)
+    @storage.push encoded (sprite.color.w)
+    @storage.push encoded (U32.to_f32 (sprite.material))
+    @storage.push encoded (sprite.parameters.x)
+    @storage.push encoded (sprite.parameters.y)
+    @storage.push encoded (sprite.parameters.z)
+    @storage.push encoded (sprite.parameters.w)
+  for i in 0 .. insets_count:
+    let source = collections.insets[i]
+    let inset = project.inset context source
+    @storage.push encoded (inset.x)
+    @storage.push encoded (inset.y)
+    @storage.push encoded (inset.width)
+    @storage.push encoded (inset.height)
     let $types.Mat4 { x: view_x, y: view_y, z: view_z, w: view_w } = inset.view
-    encoded[at + 4] := view_x.x
-    encoded[at + 5] := view_x.y
-    encoded[at + 6] := view_x.z
-    encoded[at + 7] := view_x.w
-    encoded[at + 8] := view_y.x
-    encoded[at + 9] := view_y.y
-    encoded[at + 10] := view_y.z
-    encoded[at + 11] := view_y.w
-    encoded[at + 12] := view_z.x
-    encoded[at + 13] := view_z.y
-    encoded[at + 14] := view_z.z
-    encoded[at + 15] := view_z.w
-    encoded[at + 16] := view_w.x
-    encoded[at + 17] := view_w.y
-    encoded[at + 18] := view_w.z
-    encoded[at + 19] := view_w.w
+    @storage.push encoded (view_x.x)
+    @storage.push encoded (view_x.y)
+    @storage.push encoded (view_x.z)
+    @storage.push encoded (view_x.w)
+    @storage.push encoded (view_y.x)
+    @storage.push encoded (view_y.y)
+    @storage.push encoded (view_y.z)
+    @storage.push encoded (view_y.w)
+    @storage.push encoded (view_z.x)
+    @storage.push encoded (view_z.y)
+    @storage.push encoded (view_z.z)
+    @storage.push encoded (view_z.w)
+    @storage.push encoded (view_w.x)
+    @storage.push encoded (view_w.y)
+    @storage.push encoded (view_w.z)
+    @storage.push encoded (view_w.w)
     let $types.Mat4 { x: projection_x, y: projection_y, z: projection_z, w: projection_w } = inset.projection
-    encoded[at + 20] := projection_x.x
-    encoded[at + 21] := projection_x.y
-    encoded[at + 22] := projection_x.z
-    encoded[at + 23] := projection_x.w
-    encoded[at + 24] := projection_y.x
-    encoded[at + 25] := projection_y.y
-    encoded[at + 26] := projection_y.z
-    encoded[at + 27] := projection_y.w
-    encoded[at + 28] := projection_z.x
-    encoded[at + 29] := projection_z.y
-    encoded[at + 30] := projection_z.z
-    encoded[at + 31] := projection_z.w
-    encoded[at + 32] := projection_w.x
-    encoded[at + 33] := projection_w.y
-    encoded[at + 34] := projection_w.z
-    encoded[at + 35] := projection_w.w
-    encoded[at + 36] := inset.ambient.x
-    encoded[at + 37] := inset.ambient.y
-    encoded[at + 38] := inset.ambient.z
-    encoded[at + 39] := inset.light_direction.x
-    encoded[at + 40] := inset.light_direction.y
-    encoded[at + 41] := inset.light_direction.z
-    encoded[at + 42] := inset.light_color.x
-    encoded[at + 43] := inset.light_color.y
-    encoded[at + 44] := inset.light_color.z
-    encoded[at + 45] := U32.to_f32 (view_inset_draws_count)
-    encoded[at + 46] := inset.pixel_size
-    encoded[at + 47] := U32.to_f32 (inset.after_sprites)
-    at := self + 48
-  for inset_index in 0 .. source_insets_count:
-    let source_inset = collections.insets[inset_index]
-    let inset = project.inset context source_inset
-    let view_inset_draws_count: U32 = inset.draws.length
-    for inset_draw_index in 0 .. view_inset_draws_count:
-      let source_inset_draw = inset.draws[inset_draw_index]
-      let inset_draw = project.inset_draw context source_inset_draw
-      let view_inset_draw_extra_count: U32 = inset_draw.extra.length
-      encoded[at + 0] := U32.to_f32 (inset_draw.mesh)
-      encoded[at + 1] := U32.to_f32 (inset_draw.material)
-      let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = inset_draw.transform
-      encoded[at + 2] := transform_x.x
-      encoded[at + 3] := transform_x.y
-      encoded[at + 4] := transform_x.z
-      encoded[at + 5] := transform_x.w
-      encoded[at + 6] := transform_y.x
-      encoded[at + 7] := transform_y.y
-      encoded[at + 8] := transform_y.z
-      encoded[at + 9] := transform_y.w
-      encoded[at + 10] := transform_z.x
-      encoded[at + 11] := transform_z.y
-      encoded[at + 12] := transform_z.z
-      encoded[at + 13] := transform_z.w
-      encoded[at + 14] := transform_w.x
-      encoded[at + 15] := transform_w.y
-      encoded[at + 16] := transform_w.z
-      encoded[at + 17] := transform_w.w
-      let (parameters_count, parameters) = case inset_draw.parameters of
-        $Some value => (4.0, value)
-        $Nothing => (0.0, types.zero4)
-      encoded[at + 18] := parameters_count
-      encoded[at + 19] := parameters.x
-      encoded[at + 20] := parameters.y
-      encoded[at + 21] := parameters.z
-      encoded[at + 22] := parameters.w
-      encoded[at + 23] := U32.to_f32 (min view_inset_draw_extra_count protocol.max_draw_extra)
-      at := self + 24
-  for value_index in 0 .. source_preferences_count:
-    let value = collections.preferences[value_index]
-    encoded[at] := value
-    at := self + 1
-  for field_index in 0 .. source_fields_count:
-    let source_field = collections.fields[field_index]
-    let field = project.field context source_field
-    let view_field_values_count: U32 = field.values.length
-    encoded[at + 0] := U32.to_f32 (field.material)
-    encoded[at + 1] := U32.to_f32 (field.width)
-    encoded[at + 2] := U32.to_f32 (field.height)
-    encoded[at + 3] := U32.to_f32 (field.x)
-    encoded[at + 4] := U32.to_f32 (field.z)
-    encoded[at + 5] := U32.to_f32 (field.columns)
-    encoded[at + 6] := U32.to_f32 (field.rows)
-    at := self + 7
-    for value_index in 0 .. view_field_values_count:
-      let value = field.values[value_index]
-      encoded[at] := value
-      at := self + 1
-  for ui_index in 0 .. source_ui_count:
-    let source_ui = collections.ui[ui_index]
-    let ui = project.ui context source_ui
-    let view_ui_text_count: U32 = ui.text.length
-    encoded[at + 0] := U32.to_f32 (ui.id)
-    encoded[at + 1] := U32.to_f32 (ui.parent)
-    encoded[at + 2] := U32.to_f32 (ui.role)
-    encoded[at + 3] := ui.x
-    encoded[at + 4] := ui.y
-    encoded[at + 5] := ui.width
-    encoded[at + 6] := ui.height
-    encoded[at + 7] := lanes.bit ui.focusable
-    encoded[at + 8] := lanes.bit ui.focused
-    encoded[at + 9] := lanes.bit ui.disabled
-    encoded[at + 10] := lanes.bit ui.hidden
-    encoded[at + 11] := lanes.bit ui.modal
-    encoded[at + 12] := U32.to_f32 (ui.checked)
-    encoded[at + 13] := U32.to_f32 (ui.expanded)
-    encoded[at + 14] := U32.to_f32 (ui.selected)
-    encoded[at + 15] := U32.to_f32 (ui.live)
-    encoded[at + 16] := ui.value
-    encoded[at + 17] := ui.minimum
-    encoded[at + 18] := ui.maximum
-    encoded[at + 19] := ui.step
-    encoded[at + 20] := U32.to_f32 (ui.actions)
-    encoded[at + 21] := U32.to_f32 (ui.text_length)
-    encoded[at + 22] := U32.to_f32 (ui.name_length)
-    encoded[at + 23] := U32.to_f32 (ui.description_length)
-    at := self + 24
-    for value_index in 0 .. view_ui_text_count:
-      let value = ui.text[value_index]
-      encoded[at] := value
-      at := self + 1
-  for service_index in 0 .. source_services_count:
-    let source_service = collections.services[service_index]
-    let service = project.service context source_service
-    let view_service_values_count: U32 = service.values.length
-    encoded[at + 0] := U32.to_f32 (service.request)
-    encoded[at + 1] := U32.to_f32 (service.service)
-    encoded[at + 2] := U32.to_f32 (service.operation)
-    encoded[at + 3] := service.a
-    encoded[at + 4] := service.b
-    encoded[at + 5] := service.c
-    encoded[at + 6] := service.d
-    encoded[at + 7] := U32.to_f32 (service.value_count)
-    at := self + 8
-    for value_index in 0 .. view_service_values_count:
-      let value = service.values[value_index]
-      encoded[at] := value
-      at := self + 1
-  for buse_index in 0 .. source_buses_count:
-    let source_buse = collections.buses[buse_index]
-    let buse: types.Bus = project.buse context source_buse
-    encoded[at + 0] := buse.gain
-    encoded[at + 1] := buse.lowpass
-    encoded[at + 2] := buse.reverb
-    at := self + 3
-  for voice_index in 0 .. source_voices_count:
-    let source_voice = collections.voices[voice_index]
-    let voice: types.Voice = project.voice context source_voice
-    encoded[at + 0] := U32.to_f32 (voice.id)
-    encoded[at + 1] := U32.to_f32 (voice.clip)
-    encoded[at + 2] := U32.to_f32 (voice.bus)
-    encoded[at + 3] := voice.gain
-    encoded[at + 4] := voice.pan
-    encoded[at + 5] := voice.pitch
-    encoded[at + 6] := voice.lowpass
-    encoded[at + 7] := voice.reverb
-    encoded[at + 8] := lanes.bit voice.looping
-    encoded[at + 9] := voice.start
-    encoded[at + 10] := voice.fade_in
-    encoded[at + 11] := voice.fade_out
-    at := self + 12
-  for pose_index in 0 .. source_poses_count:
-    let source_pose = collections.poses[pose_index]
-    let pose: types.Pose = project.pose context source_pose
-    encoded[at + 0] := U32.to_f32 (pose.draw)
-    encoded[at + 1] := U32.to_f32 (pose.clip)
-    encoded[at + 2] := pose.time
-    encoded[at + 3] := pose.weight
-    at := self + 4
-  for emitter_index in 0 .. source_emitters_count:
-    let source_emitter = collections.emitters[emitter_index]
-    let emitter: types.Emitter = project.emitter context source_emitter
-    encoded[at + 0] := U32.to_f32 (emitter.material)
+    @storage.push encoded (projection_x.x)
+    @storage.push encoded (projection_x.y)
+    @storage.push encoded (projection_x.z)
+    @storage.push encoded (projection_x.w)
+    @storage.push encoded (projection_y.x)
+    @storage.push encoded (projection_y.y)
+    @storage.push encoded (projection_y.z)
+    @storage.push encoded (projection_y.w)
+    @storage.push encoded (projection_z.x)
+    @storage.push encoded (projection_z.y)
+    @storage.push encoded (projection_z.z)
+    @storage.push encoded (projection_z.w)
+    @storage.push encoded (projection_w.x)
+    @storage.push encoded (projection_w.y)
+    @storage.push encoded (projection_w.z)
+    @storage.push encoded (projection_w.w)
+    @storage.push encoded (inset.ambient.x)
+    @storage.push encoded (inset.ambient.y)
+    @storage.push encoded (inset.ambient.z)
+    @storage.push encoded (inset.light_direction.x)
+    @storage.push encoded (inset.light_direction.y)
+    @storage.push encoded (inset.light_direction.z)
+    @storage.push encoded (inset.light_color.x)
+    @storage.push encoded (inset.light_color.y)
+    @storage.push encoded (inset.light_color.z)
+    @storage.push encoded (U32.to_f32 (inset.draws.length))
+    @storage.push encoded (inset.pixel_size)
+    @storage.push encoded (U32.to_f32 (inset.after_sprites))
+  let inset_draws_start = encoded.length
+  for parent in 0 .. insets_count:
+    let children = project.inset_draws context collections.insets[parent]
+    let count: U32 = children.length
+    for i in 0 .. count:
+      let source = children.at i
+      let (mesh, material) = project.draw_metadata context source
+      let (m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15) = project.draw_transform context source
+      let (present, p0, p1, p2, p3) = project.draw_parameters context source
+      @storage.push encoded (U32.to_f32 mesh)
+      @storage.push encoded (U32.to_f32 material)
+      @storage.push encoded (m0)
+      @storage.push encoded (m1)
+      @storage.push encoded (m2)
+      @storage.push encoded (m3)
+      @storage.push encoded (m4)
+      @storage.push encoded (m5)
+      @storage.push encoded (m6)
+      @storage.push encoded (m7)
+      @storage.push encoded (m8)
+      @storage.push encoded (m9)
+      @storage.push encoded (m10)
+      @storage.push encoded (m11)
+      @storage.push encoded (m12)
+      @storage.push encoded (m13)
+      @storage.push encoded (m14)
+      @storage.push encoded (m15)
+      @storage.push encoded (present)
+      @storage.push encoded (p0)
+      @storage.push encoded (p1)
+      @storage.push encoded (p2)
+      @storage.push encoded (p3)
+      @storage.push encoded (U32.to_f32 (project.extra_count context source))
+  encoded[start + 10] = U32.to_f32 ((encoded.length - inset_draws_start) / 24)
+  let preferences_start = encoded.length
+  for i in 0 .. preferences_count:
+    let source = collections.preferences[i]
+    @storage.push encoded source
+  encoded[start + 11] = U32.to_f32 ((encoded.length - preferences_start))
+  let fields_start = encoded.length
+  for i in 0 .. fields_count:
+    let source = collections.fields[i]
+    let field = project.field context source
+    @storage.push encoded (U32.to_f32 (field.material))
+    @storage.push encoded (U32.to_f32 (field.width))
+    @storage.push encoded (U32.to_f32 (field.height))
+    @storage.push encoded (U32.to_f32 (field.x))
+    @storage.push encoded (U32.to_f32 (field.z))
+    @storage.push encoded (U32.to_f32 (field.columns))
+    @storage.push encoded (U32.to_f32 (field.rows))
+    let count: U32 = field.values.length
+    for i in 0 .. count:
+      let item = field.values.at i
+      @storage.push encoded item
+  encoded[start + 131] = U32.to_f32 ((encoded.length - fields_start))
+  let ui_start = encoded.length
+  for i in 0 .. ui_count:
+    let source = collections.ui[i]
+    let ui = project.ui context source
+    @storage.push encoded (U32.to_f32 (ui.id))
+    @storage.push encoded (U32.to_f32 (ui.parent))
+    @storage.push encoded (U32.to_f32 (ui.role))
+    @storage.push encoded (ui.x)
+    @storage.push encoded (ui.y)
+    @storage.push encoded (ui.width)
+    @storage.push encoded (ui.height)
+    @storage.push encoded (lanes.bit ui.focusable)
+    @storage.push encoded (lanes.bit ui.focused)
+    @storage.push encoded (lanes.bit ui.disabled)
+    @storage.push encoded (lanes.bit ui.hidden)
+    @storage.push encoded (lanes.bit ui.modal)
+    @storage.push encoded (U32.to_f32 (ui.checked))
+    @storage.push encoded (U32.to_f32 (ui.expanded))
+    @storage.push encoded (U32.to_f32 (ui.selected))
+    @storage.push encoded (U32.to_f32 (ui.live))
+    @storage.push encoded (ui.value)
+    @storage.push encoded (ui.minimum)
+    @storage.push encoded (ui.maximum)
+    @storage.push encoded (ui.step)
+    @storage.push encoded (U32.to_f32 (ui.actions))
+    @storage.push encoded (U32.to_f32 (ui.text_length))
+    @storage.push encoded (U32.to_f32 (ui.name_length))
+    @storage.push encoded (U32.to_f32 (ui.description_length))
+    let count: U32 = ui.text.length
+    for i in 0 .. count:
+      let item = ui.text.at i
+      @storage.push encoded item
+  encoded[start + 133] = U32.to_f32 ((encoded.length - ui_start))
+  let services_start = encoded.length
+  for i in 0 .. services_count:
+    let source = collections.services[i]
+    let service = project.service context source
+    @storage.push encoded (U32.to_f32 (service.request))
+    @storage.push encoded (U32.to_f32 (service.service))
+    @storage.push encoded (U32.to_f32 (service.operation))
+    @storage.push encoded (service.a)
+    @storage.push encoded (service.b)
+    @storage.push encoded (service.c)
+    @storage.push encoded (service.d)
+    @storage.push encoded (U32.to_f32 (service.value_count))
+    let count: U32 = service.values.length
+    for i in 0 .. count:
+      let item = service.values.at i
+      @storage.push encoded item
+  encoded[start + 135] = U32.to_f32 ((encoded.length - services_start))
+  for i in 0 .. buses_count:
+    let source = collections.buses[i]
+    let buse: types.Bus = project.buse context source
+    @storage.push encoded (buse.gain)
+    @storage.push encoded (buse.lowpass)
+    @storage.push encoded (buse.reverb)
+  for i in 0 .. voices_count:
+    let source = collections.voices[i]
+    let voice: types.Voice = project.voice context source
+    @storage.push encoded (U32.to_f32 (voice.id))
+    @storage.push encoded (U32.to_f32 (voice.clip))
+    @storage.push encoded (U32.to_f32 (voice.bus))
+    @storage.push encoded (voice.gain)
+    @storage.push encoded (voice.pan)
+    @storage.push encoded (voice.pitch)
+    @storage.push encoded (voice.lowpass)
+    @storage.push encoded (voice.reverb)
+    @storage.push encoded (lanes.bit voice.looping)
+    @storage.push encoded (voice.start)
+    @storage.push encoded (voice.fade_in)
+    @storage.push encoded (voice.fade_out)
+  for i in 0 .. poses_count:
+    let source = collections.poses[i]
+    let pose: types.Pose = project.pose context source
+    @storage.push encoded (U32.to_f32 (pose.draw))
+    @storage.push encoded (U32.to_f32 (pose.clip))
+    @storage.push encoded (pose.time)
+    @storage.push encoded (pose.weight)
+  for i in 0 .. emitters_count:
+    let source = collections.emitters[i]
+    let emitter: types.Emitter = project.emitter context source
+    @storage.push encoded (U32.to_f32 (emitter.material))
     let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = emitter.transform
-    encoded[at + 1] := transform_x.x
-    encoded[at + 2] := transform_x.y
-    encoded[at + 3] := transform_x.z
-    encoded[at + 4] := transform_x.w
-    encoded[at + 5] := transform_y.x
-    encoded[at + 6] := transform_y.y
-    encoded[at + 7] := transform_y.z
-    encoded[at + 8] := transform_y.w
-    encoded[at + 9] := transform_z.x
-    encoded[at + 10] := transform_z.y
-    encoded[at + 11] := transform_z.z
-    encoded[at + 12] := transform_z.w
-    encoded[at + 13] := transform_w.x
-    encoded[at + 14] := transform_w.y
-    encoded[at + 15] := transform_w.z
-    encoded[at + 16] := transform_w.w
-    encoded[at + 17] := U32.to_f32 (emitter.seed)
-    encoded[at + 18] := emitter.time
-    encoded[at + 19] := emitter.duration
-    encoded[at + 20] := emitter.rate
-    encoded[at + 21] := emitter.lifetime
-    encoded[at + 22] := emitter.radius
-    encoded[at + 23] := emitter.velocity.x
-    encoded[at + 24] := emitter.velocity.y
-    encoded[at + 25] := emitter.velocity.z
-    encoded[at + 26] := emitter.spread
-    encoded[at + 27] := emitter.gravity.x
-    encoded[at + 28] := emitter.gravity.y
-    encoded[at + 29] := emitter.gravity.z
-    encoded[at + 30] := emitter.drag
-    encoded[at + 31] := emitter.size_start
-    encoded[at + 32] := emitter.size_end
-    encoded[at + 33] := emitter.color_start.r
-    encoded[at + 34] := emitter.color_start.g
-    encoded[at + 35] := emitter.color_start.b
-    encoded[at + 36] := emitter.color_start.a
-    encoded[at + 37] := emitter.color_end.r
-    encoded[at + 38] := emitter.color_end.g
-    encoded[at + 39] := emitter.color_end.b
-    encoded[at + 40] := emitter.color_end.a
-    encoded[at + 41] := lanes.bit emitter.additive
-    at := self + 42
-  for light_index in 0 .. source_lights_count:
-    let source_light = collections.lights[light_index]
-    let light: types.Light = project.light context source_light
-    encoded[at + 0] := light.position.x
-    encoded[at + 1] := light.position.y
-    encoded[at + 2] := light.position.z
-    encoded[at + 3] := light.radius
-    encoded[at + 4] := light.color.x
-    encoded[at + 5] := light.color.y
-    encoded[at + 6] := light.color.z
-    encoded[at + 7] := light.direction.x
-    encoded[at + 8] := light.direction.y
-    encoded[at + 9] := light.direction.z
-    encoded[at + 10] := light.inner
-    encoded[at + 11] := light.outer
-    at := self + 12
-  for listener_index in 0 .. source_listener_count:
-    let source_listener = collections.listener[listener_index]
-    let listener: types.Listener = project.listener context source_listener
-    encoded[at + 0] := listener.position.x
-    encoded[at + 1] := listener.position.y
-    encoded[at + 2] := listener.position.z
-    encoded[at + 3] := listener.forward.x
-    encoded[at + 4] := listener.forward.y
-    encoded[at + 5] := listener.forward.z
-    encoded[at + 6] := listener.up.x
-    encoded[at + 7] := listener.up.y
-    encoded[at + 8] := listener.up.z
-    at := self + 9
-  for panner_index in 0 .. source_panners_count:
-    let source_panner = collections.panners[panner_index]
-    let panner: types.Panner = project.panner context source_panner
-    encoded[at + 0] := U32.to_f32 (panner.voice)
-    encoded[at + 1] := U32.to_f32 (panner.sound)
-    encoded[at + 2] := panner.position.x
-    encoded[at + 3] := panner.position.y
-    encoded[at + 4] := panner.position.z
-    encoded[at + 5] := panner.orientation.x
-    encoded[at + 6] := panner.orientation.y
-    encoded[at + 7] := panner.orientation.z
-    encoded[at + 8] := U32.to_f32 (panner.distance_model)
-    encoded[at + 9] := panner.ref_distance
-    encoded[at + 10] := panner.max_distance
-    encoded[at + 11] := panner.rolloff
-    encoded[at + 12] := panner.cone_inner
-    encoded[at + 13] := panner.cone_outer
-    encoded[at + 14] := panner.cone_outer_gain
-    at := self + 15
-  for instance_index in 0 .. source_instances_count:
-    let source_instance = collections.instances[instance_index]
-    let instance: types.Instance = project.instance context source_instance
-    encoded[at + 0] := U32.to_f32 (instance.id_low)
-    encoded[at + 1] := U32.to_f32 (instance.id_high)
-    encoded[at + 2] := U32.to_f32 (instance.order)
-    encoded[at + 3] := U32.to_f32 (instance.mesh)
-    encoded[at + 4] := U32.to_f32 (instance.material)
+    @storage.push encoded (transform_x.x)
+    @storage.push encoded (transform_x.y)
+    @storage.push encoded (transform_x.z)
+    @storage.push encoded (transform_x.w)
+    @storage.push encoded (transform_y.x)
+    @storage.push encoded (transform_y.y)
+    @storage.push encoded (transform_y.z)
+    @storage.push encoded (transform_y.w)
+    @storage.push encoded (transform_z.x)
+    @storage.push encoded (transform_z.y)
+    @storage.push encoded (transform_z.z)
+    @storage.push encoded (transform_z.w)
+    @storage.push encoded (transform_w.x)
+    @storage.push encoded (transform_w.y)
+    @storage.push encoded (transform_w.z)
+    @storage.push encoded (transform_w.w)
+    @storage.push encoded (U32.to_f32 (emitter.seed))
+    @storage.push encoded (emitter.time)
+    @storage.push encoded (emitter.duration)
+    @storage.push encoded (emitter.rate)
+    @storage.push encoded (emitter.lifetime)
+    @storage.push encoded (emitter.radius)
+    @storage.push encoded (emitter.velocity.x)
+    @storage.push encoded (emitter.velocity.y)
+    @storage.push encoded (emitter.velocity.z)
+    @storage.push encoded (emitter.spread)
+    @storage.push encoded (emitter.gravity.x)
+    @storage.push encoded (emitter.gravity.y)
+    @storage.push encoded (emitter.gravity.z)
+    @storage.push encoded (emitter.drag)
+    @storage.push encoded (emitter.size_start)
+    @storage.push encoded (emitter.size_end)
+    @storage.push encoded (emitter.color_start.r)
+    @storage.push encoded (emitter.color_start.g)
+    @storage.push encoded (emitter.color_start.b)
+    @storage.push encoded (emitter.color_start.a)
+    @storage.push encoded (emitter.color_end.r)
+    @storage.push encoded (emitter.color_end.g)
+    @storage.push encoded (emitter.color_end.b)
+    @storage.push encoded (emitter.color_end.a)
+    @storage.push encoded (lanes.bit emitter.additive)
+  for i in 0 .. lights_count:
+    let source = collections.lights[i]
+    let light: types.Light = project.light context source
+    @storage.push encoded (light.position.x)
+    @storage.push encoded (light.position.y)
+    @storage.push encoded (light.position.z)
+    @storage.push encoded (light.radius)
+    @storage.push encoded (light.color.x)
+    @storage.push encoded (light.color.y)
+    @storage.push encoded (light.color.z)
+    @storage.push encoded (light.direction.x)
+    @storage.push encoded (light.direction.y)
+    @storage.push encoded (light.direction.z)
+    @storage.push encoded (light.inner)
+    @storage.push encoded (light.outer)
+  for i in 0 .. listener_count:
+    let source = collections.listener[i]
+    let listener: types.Listener = project.listener context source
+    @storage.push encoded (listener.position.x)
+    @storage.push encoded (listener.position.y)
+    @storage.push encoded (listener.position.z)
+    @storage.push encoded (listener.forward.x)
+    @storage.push encoded (listener.forward.y)
+    @storage.push encoded (listener.forward.z)
+    @storage.push encoded (listener.up.x)
+    @storage.push encoded (listener.up.y)
+    @storage.push encoded (listener.up.z)
+  for i in 0 .. panners_count:
+    let source = collections.panners[i]
+    let panner: types.Panner = project.panner context source
+    @storage.push encoded (U32.to_f32 (panner.voice))
+    @storage.push encoded (U32.to_f32 (panner.sound))
+    @storage.push encoded (panner.position.x)
+    @storage.push encoded (panner.position.y)
+    @storage.push encoded (panner.position.z)
+    @storage.push encoded (panner.orientation.x)
+    @storage.push encoded (panner.orientation.y)
+    @storage.push encoded (panner.orientation.z)
+    @storage.push encoded (U32.to_f32 (panner.distance_model))
+    @storage.push encoded (panner.ref_distance)
+    @storage.push encoded (panner.max_distance)
+    @storage.push encoded (panner.rolloff)
+    @storage.push encoded (panner.cone_inner)
+    @storage.push encoded (panner.cone_outer)
+    @storage.push encoded (panner.cone_outer_gain)
+  for i in 0 .. instances_count:
+    let source = collections.instances[i]
+    let instance: types.Instance = project.instance context source
+    @storage.push encoded (U32.to_f32 (instance.id_low))
+    @storage.push encoded (U32.to_f32 (instance.id_high))
+    @storage.push encoded (U32.to_f32 (instance.order))
+    @storage.push encoded (U32.to_f32 (instance.mesh))
+    @storage.push encoded (U32.to_f32 (instance.material))
     let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = instance.transform
-    encoded[at + 5] := transform_x.x
-    encoded[at + 6] := transform_x.y
-    encoded[at + 7] := transform_x.z
-    encoded[at + 8] := transform_x.w
-    encoded[at + 9] := transform_y.x
-    encoded[at + 10] := transform_y.y
-    encoded[at + 11] := transform_y.z
-    encoded[at + 12] := transform_y.w
-    encoded[at + 13] := transform_z.x
-    encoded[at + 14] := transform_z.y
-    encoded[at + 15] := transform_z.z
-    encoded[at + 16] := transform_z.w
-    encoded[at + 17] := transform_w.x
-    encoded[at + 18] := transform_w.y
-    encoded[at + 19] := transform_w.z
-    encoded[at + 20] := transform_w.w
+    @storage.push encoded (transform_x.x)
+    @storage.push encoded (transform_x.y)
+    @storage.push encoded (transform_x.z)
+    @storage.push encoded (transform_x.w)
+    @storage.push encoded (transform_y.x)
+    @storage.push encoded (transform_y.y)
+    @storage.push encoded (transform_y.z)
+    @storage.push encoded (transform_y.w)
+    @storage.push encoded (transform_z.x)
+    @storage.push encoded (transform_z.y)
+    @storage.push encoded (transform_z.z)
+    @storage.push encoded (transform_z.w)
+    @storage.push encoded (transform_w.x)
+    @storage.push encoded (transform_w.y)
+    @storage.push encoded (transform_w.z)
+    @storage.push encoded (transform_w.w)
     let (parameters_count, parameters) = case instance.parameters of
       $Some value => (4.0, value)
       $Nothing => (0.0, types.zero4)
-    encoded[at + 21] := parameters_count
-    encoded[at + 22] := parameters.x
-    encoded[at + 23] := parameters.y
-    encoded[at + 24] := parameters.z
-    encoded[at + 25] := parameters.w
-    at := self + 26
-  for instance_removal_index in 0 .. source_instance_removals_count:
-    let source_instance_removal = collections.instance_removals[instance_removal_index]
-    let instance_removal: types.InstanceRemoval = project.instance_removal context source_instance_removal
-    encoded[at + 0] := U32.to_f32 (instance_removal.id_low)
-    encoded[at + 1] := U32.to_f32 (instance_removal.id_high)
-    at := self + 2
-  for draw_index in 0 .. source_draws_count:
-    let draw = draws[draw_index]
-    let extra: Array F32 = project.draw_extra context draw
-    let extra_count: U32 = extra.length
-    for value_index in 0 .. extra.length:
-      let value = extra[value_index]
-      encoded[at] := value
-      at := self + 1
-  for inset_index in 0 .. source_insets_count:
-    let source_inset = collections.insets[inset_index]
-    let inset = project.inset context source_inset
-    let view_inset_draws_count: U32 = inset.draws.length
-    for inset_draw_index in 0 .. view_inset_draws_count:
-      let source_inset_draw = inset.draws[inset_draw_index]
-      let inset_draw = project.inset_draw context source_inset_draw
-      let view_inset_draw_extra_count: U32 = inset_draw.extra.length
-      for index in 0 .. min view_inset_draw_extra_count protocol.max_draw_extra:
-        encoded[at + 0] := (inset_draw.extra.at index).x
-        encoded[at + 1] := (inset_draw.extra.at index).y
-        encoded[at + 2] := (inset_draw.extra.at index).z
-        encoded[at + 3] := (inset_draw.extra.at index).w
-        at := self + 4
-  return encoded
+    @storage.push encoded (parameters_count)
+    @storage.push encoded (parameters.x)
+    @storage.push encoded (parameters.y)
+    @storage.push encoded (parameters.z)
+    @storage.push encoded (parameters.w)
+  for i in 0 .. instance_removals_count:
+    let source = collections.instance_removals[i]
+    let instance_removal: types.InstanceRemoval = project.instance_removal context source
+    @storage.push encoded (U32.to_f32 (instance_removal.id_low))
+    @storage.push encoded (U32.to_f32 (instance_removal.id_high))
+  for i in 0 .. draws_count:
+    let source = collections.draws[i]
+    project.append_extra context source encoded
+  for parent in 0 .. insets_count:
+    let children = project.inset_draws context collections.insets[parent]
+    let count: U32 = children.length
+    for i in 0 .. count:
+      let source = children.at i
+      project.append_extra context source encoded
+  return ()
 
 // Flat mesh draws (no parameters/extras) and sounds, into the packet it is given and returns.
 type MeshDraw = { mesh: U32, material: U32, transform: types.Mat4 }

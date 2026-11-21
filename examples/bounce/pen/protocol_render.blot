@@ -8,7 +8,7 @@ import * as protocol from "./protocol"
 import * as types from "./types"
 
 // A Draw's lanes.
-func encode_draw (draw: types.Draw) => return do:
+func encode_draw (draw: types.Draw) =>
   let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = draw.transform
   let (parameters_count, parameters) = case draw.parameters of
     $Some value => (4.0, value)
@@ -23,7 +23,7 @@ func encode_draw (draw: types.Draw) => return do:
   ]
 
 // Solid: its faces' count, then each of them.
-func encode_solid (solid: types.Solid) => return do:
+func encode_solid (solid: types.Solid) =>
   let faces = solid.faces
   let encoded = @array.fill (protocol.solid_floats + faces.length * protocol.solid_face_floats) 0.0
   encoded[0] := U32.to_f32 faces.length
@@ -40,7 +40,7 @@ func encode_solid (solid: types.Solid) => return do:
 // Decal: `material`'s texture laid onto the surfaces inside the box, the cube
 // -1..1 under `transform`, along its y axis, where their material takes decals;
 // `opacity` fades it.
-func encode_decal (decal: types.Decal) => return do:
+func encode_decal (decal: types.Decal) =>
   let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = decal.transform
   return #[
     U32.to_f32 (decal.material), transform_x.x, transform_x.y, transform_x.z,
@@ -51,7 +51,7 @@ func encode_decal (decal: types.Decal) => return do:
 
 // Sound: A sound to play once on a bus at the gain, pan, pitch, lowpass cutoff
 // and reverb send given, all worked out by the game.
-func encode_sound (sound: types.Sound) => return do:
+func encode_sound (sound: types.Sound) =>
   return #[
     U32.to_f32 (sound.clip), U32.to_f32 (sound.bus), sound.gain, sound.pan,
     sound.pitch, sound.lowpass, sound.reverb,
@@ -59,7 +59,7 @@ func encode_sound (sound: types.Sound) => return do:
 
 // Sprite: A rectangle over the screen, in pixels from its top left, drawn by its
 // material's sprite shader, which reads the four `parameters` as it likes.
-func encode_sprite (sprite: types.Sprite) => return do:
+func encode_sprite (sprite: types.Sprite) =>
   return #[
     sprite.x, sprite.y, sprite.width, sprite.height, sprite.u0, sprite.v0,
     sprite.u1, sprite.v1, sprite.color.x, sprite.color.y, sprite.color.z,
@@ -68,7 +68,7 @@ func encode_sprite (sprite: types.Sprite) => return do:
   ]
 
 // Inset: A small 3D view over the screen, in the rectangle at (x, y).
-func encode_inset (inset: types.Inset) => return do:
+func encode_inset (inset: types.Inset) =>
   let $types.Mat4 { x: view_x, y: view_y, z: view_z, w: view_w } = inset.view
   let $types.Mat4 { x: projection_x, y: projection_y, z: projection_z, w: projection_w } = inset.projection
   return #[
@@ -86,7 +86,7 @@ func encode_inset (inset: types.Inset) => return do:
   ]
 
 // FieldPatch: its material, width, height, x, z, columns, rows, then its values.
-func encode_field_patch (field_patch: types.FieldPatch) => return do:
+func encode_field_patch (field_patch: types.FieldPatch) =>
   return array.concat #[
     U32.to_f32 (field_patch.material), U32.to_f32 (field_patch.width),
     U32.to_f32 (field_patch.height), U32.to_f32 (field_patch.x),
@@ -98,7 +98,7 @@ func encode_field_patch (field_patch: types.FieldPatch) => return do:
 // disabled, hidden, modal, checked, expanded, selected, live, value, minimum,
 // maximum, step, actions, text_length, name_length, description_length, then its
 // text.
-func encode_ui_node (ui_node: types.UiNode) => return do:
+func encode_ui_node (ui_node: types.UiNode) =>
   return array.concat #[
     U32.to_f32 (ui_node.id), U32.to_f32 (ui_node.parent),
     U32.to_f32 (ui_node.role), ui_node.x, ui_node.y, ui_node.width,
@@ -113,7 +113,7 @@ func encode_ui_node (ui_node: types.UiNode) => return do:
 
 // ServiceRequest: its request, service, operation, a, b, c, d, value_count, then
 // its values.
-func encode_service_request (service_request: types.ServiceRequest) => return do:
+func encode_service_request (service_request: types.ServiceRequest) =>
   return array.concat #[
     U32.to_f32 (service_request.request), U32.to_f32 (service_request.service),
     U32.to_f32 (service_request.operation), service_request.a, service_request.b,
@@ -125,7 +125,7 @@ func encode_service_request (service_request: types.ServiceRequest) => return do
 // the master, and `reverb` of that goes to the shared reverb, as do their own
 // sends through its lowpass and gain. Bus 0 is the master: everything passes
 // through it last, the reverb's return included.
-func encode_bus (bu: types.Bus) => return do:
+func encode_bus (bu: types.Bus) =>
   return #[
     bu.gain, bu.lowpass, bu.reverb,
   ]
@@ -137,7 +137,7 @@ func encode_bus (bu: types.Bus) => return do:
 // least AUDIO_FADE_MS); start one whose clip or bus changed afresh, the old
 // fading out; and glide the values that change (AUDIO_GLIDE_MS). A voice that
 // does not loop plays once and is then silent for as long as frames keep it.
-func encode_voice (voice: types.Voice) => return do:
+func encode_voice (voice: types.Voice) =>
   return #[
     U32.to_f32 (voice.id), U32.to_f32 (voice.clip), U32.to_f32 (voice.bus),
     voice.gain, voice.pan, voice.pitch, voice.lowpass, voice.reverb,
@@ -146,7 +146,7 @@ func encode_voice (voice: types.Voice) => return do:
 
 // Pose: A layer of a skinned draw's pose: clip `clip` of the draw's mesh at
 // `time` seconds, counting `weight` among the draw's layers.
-func encode_pose (pose: types.Pose) => return do:
+func encode_pose (pose: types.Pose) =>
   return #[
     U32.to_f32 (pose.draw), U32.to_f32 (pose.clip), pose.time, pose.weight,
   ]
@@ -154,7 +154,7 @@ func encode_pose (pose: types.Pose) => return do:
 // Emitter: A particle emitter: `rate` particles a second, each living `lifetime`
 // seconds, born in a ball round `transform`'s origin and flying from it under
 // gravity and drag, sized and colored over their lives.
-func encode_emitter (emitter: types.Emitter) => return do:
+func encode_emitter (emitter: types.Emitter) =>
   let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = emitter.transform
   return #[
     U32.to_f32 (emitter.material), transform_x.x, transform_x.y, transform_x.z,
@@ -172,7 +172,7 @@ func encode_emitter (emitter: types.Emitter) => return do:
 
 // Light: A point light, or a spot light shining along `direction` within a cone,
 // lighting what lies within `radius` of `position`.
-func encode_light (light: types.Light) => return do:
+func encode_light (light: types.Light) =>
   return #[
     light.position.x, light.position.y, light.position.z, light.radius,
     light.color.x, light.color.y, light.color.z, light.direction.x,
@@ -181,7 +181,7 @@ func encode_light (light: types.Light) => return do:
 
 // Listener: A listener: where it is, the way it faces and its up, in world
 // units.
-func encode_listener (listener: types.Listener) => return do:
+func encode_listener (listener: types.Listener) =>
   return #[
     listener.position.x, listener.position.y, listener.position.z,
     listener.forward.x, listener.forward.y, listener.forward.z, listener.up.x,
@@ -194,7 +194,7 @@ func encode_listener (listener: types.Listener) => return do:
 // do (AUDIO_GLIDE_MS); the rest change at once. A voice that gains or loses its
 // panner starts afresh, as one whose bus changed; a panner that places nothing
 // is ignored, and of two for one voice or sound hosts take the first.
-func encode_panner (panner: types.Panner) => return do:
+func encode_panner (panner: types.Panner) =>
   return #[
     U32.to_f32 (panner.voice), U32.to_f32 (panner.sound), panner.position.x,
     panner.position.y, panner.position.z, panner.orientation.x,
@@ -204,7 +204,7 @@ func encode_panner (panner: types.Panner) => return do:
   ]
 
 // A Instance's lanes.
-func encode_instance (instance: types.Instance) => return do:
+func encode_instance (instance: types.Instance) =>
   let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = instance.transform
   let (parameters_count, parameters) = case instance.parameters of
     $Some value => (4.0, value)
@@ -220,24 +220,24 @@ func encode_instance (instance: types.Instance) => return do:
   ]
 
 // A InstanceRemoval's lanes.
-func encode_instance_removal (instance_removal: types.InstanceRemoval) => return do:
+func encode_instance_removal (instance_removal: types.InstanceRemoval) =>
   return #[
     U32.to_f32 (instance_removal.id_low), U32.to_f32 (instance_removal.id_high),
   ]
 
 // A Draw's extra, at most protocol.max_draw_extra of them, for the packet's last
 // section.
-func encode_draw_extra (draw: types.Draw) => return do:
+func encode_draw_extra (draw: types.Draw) =>
   let kept = min draw.extra.length protocol.max_draw_extra
   return #[lane | index <- array.generate kept identity, lane <- vec4_lanes draw.extra[index]]
 
-func vec4_lanes (v: types.Vec4) => return #[v.x, v.y, v.z, v.w]
+func vec4_lanes (v: types.Vec4) => #[v.x, v.y, v.z, v.w]
 
-func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own ResizeArray F32) => return do:
+func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own #[~F32]) =>
   @storage.truncate encoded 0
   append_render_views packet collections project context encoded
   return encoded
-func append_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: ResizeArray F32) => return do:
+func append_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: #[~F32]) =>
   let start = encoded.length
   let state_count: U32 = collections.state.length
   let draws_count: U32 = collections.draws.length
@@ -842,7 +842,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
 
 // Flat mesh draws (no parameters/extras) and sounds, into the packet it is given and returns.
 type MeshDraw = { mesh: U32, material: U32, transform: types.Mat4 }
-func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: own ResizeArray F32) => return do:
+func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: own #[~F32]) =>
   @storage.truncate encoded 0
   for 0 .. (protocol.packet_header_floats + draws.length * 24 + sounds.length * 7):
     @storage.push encoded 0.0

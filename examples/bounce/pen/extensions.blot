@@ -23,20 +23,20 @@ type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: &[E
 // An event's lanes from `start`: one of pen's, or one of the game's, which
 // travels as pen's Game event: its tag, then its values in the lanes after,
 // those it has no field for zero.
-func decode_event values => return func (start: U32) => return do:
+func decode_event values => func (start: U32) =>
   if (values.at (start)) != U32.to_f32 protocol.game_tag:
     return $Pen (protocol.decode_event values start)
   let tag = lanes.integer (values.at (start + 1)) protocol.max_extension_tag
   let lanes_after = #[(values.at (start + 2)), (values.at (start + 3)), (values.at (start + 4))]
-  return case tag of
-    1 => do:
+  case tag of
+    1 =>
       use lanes.require (lanes_after[2] == 0.0)
       return $Kick { x: lanes_after[0], z: lanes_after[1] }
-    _ => @panic "unknown game event"
+    _ => panic "unknown game event"
 
 // The input packet, as protocol.decode_input_into reads it, with the game's own
 // events.
-func decode_input_into values -> (events: ResizeArray Event) => return do:
+func decode_input_into values -> (events: #[~Event]) =>
   use lanes.require (values.length >= protocol.frame_header_floats)
   use lanes.finite values
   let elapsed = (values.at (0))
@@ -63,7 +63,7 @@ func decode_input_into values -> (events: ResizeArray Event) => return do:
 type Score is data = $Score { bounces: U32, speed: F32 }
 const score_floats = 2
 // Append the tag, length and these Scores to a caller-owned extension packet.
-func append_score (records: Array Score) -> (packet: ResizeArray F32) => return do:
+func append_score (records: #[Score]) -> (packet: #[~F32]) =>
   @storage.push packet (U32.to_f32 score_tag)
   @storage.push packet (U32.to_f32 (records.length * score_floats))
   for record in records:

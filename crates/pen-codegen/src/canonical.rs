@@ -388,7 +388,7 @@ fn stream_record(entry: &Section) -> Vec<String> {
     let pool = if entry.owner.is_some() { "children" } else { "output" };
     let mut out = vec![
         String::new(),
-        format!("func {name}_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:"),
+        format!("func {name}_into (canonical: #[F32]) -> (stream: own Stream): Stream =>"),
         "  let at = stream.at".to_owned(),
         format!("  let base = stream.{pool}.length"),
         format!("  for 0 .. {width}:"),
@@ -442,7 +442,7 @@ fn render_stream(model: &Model) -> Vec<String> {
         "// What a walk has made so far: where it reads next, the packet's lanes, and".to_owned(),
         "// the child records and tail lanes that follow them. A writer takes it over".to_owned(),
         "// and returns it.".to_owned(),
-        "type Stream = { at: U32, output: ResizeArray F32, children: ResizeArray F32, extras: ResizeArray F32 }".to_owned(),
+        "type Stream = { at: U32, output: #[~F32], children: #[~F32], extras: #[~F32] }".to_owned(),
     ];
     for entry in &model.sections {
         if matches!(kind(&entry.section), "records" | "variable") {
@@ -451,13 +451,13 @@ fn render_stream(model: &Model) -> Vec<String> {
     }
     out.extend([String::new(),
         "// Canonical render values streamed into the packet it is given and returns.".to_owned(),
-        "func render_packet_from_canonical (canonical: Array F32) -> (output: own ResizeArray F32): ResizeArray F32 => return do:".to_owned(),
+        "func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): #[~F32] =>".to_owned(),
         "  lanes.finite canonical".to_owned(),
         "  @storage.truncate output 0".to_owned(),
         "  for 0 .. protocol.packet_header_floats:".to_owned(),
         "    @storage.push output 0.0".to_owned(),
-        "  let children: ResizeArray F32 = #[]".to_owned(),
-        "  let extras: ResizeArray F32 = #[]".to_owned(),
+        "  let children: #[~F32] = #[]".to_owned(),
+        "  let extras: #[~F32] = #[]".to_owned(),
         "  let stream: Stream = { at: 0, output, children, extras }".to_owned(),
         "  stream.output[0] := protocol.packet_magic".to_owned(),
         "  let at: U32 = 0".to_owned()]);
@@ -552,7 +552,7 @@ pub fn blot(model: &Model, top: &[String]) -> String {
         String::new(),
     ]);
     out.extend(comment(Some("An event's walk: its tag, then its fields in the schema's order.")));
-    out.push("func canonical_event (event: protocol.Event) => return case event of".to_owned());
+    out.push("func canonical_event (event: protocol.Event) => case event of".to_owned());
     for event in model.core_events() {
         let name = s(&event["name"]);
         let fields = event_fields(event);
@@ -577,7 +577,7 @@ pub fn blot(model: &Model, top: &[String]) -> String {
         "The input's walk, as pen-protocol's canonical_input makes it: elapsed, the viewport's width and height, the events' count and walks, then the state's count and lanes.",
     )));
     out.extend(
-        "func canonical_input (input: protocol.Input) => return do:\n  let $protocol.Input { elapsed, width, height, events, state } = input\n  let output: GrowArray F32 = #[elapsed, width, height, U32.to_f32 events.length]\n  for event in events:\n    array.append_into output (canonical_event event)\n  output.push (U32.to_f32 state.length)\n  array.append_into output state\n  return @storage.freeze output"
+        "func canonical_input (input: protocol.Input) =>\n  let $protocol.Input { elapsed, width, height, events, state } = input\n  let output: #[+F32] = #[elapsed, width, height, U32.to_f32 events.length]\n  for event in events:\n    array.append_into output (canonical_event event)\n  output.push (U32.to_f32 state.length)\n  array.append_into output state\n  return seal output"
             .lines()
             .map(str::to_owned),
     );

@@ -14,15 +14,16 @@ const snapshot: U32 = 3
 const restore: U32 = 4
 const scene: U32 = 5
 const load_scene: U32 = 6
-func append values -> (destination: ResizeArray F32) => return do:
+func append values -> (destination: #[~F32]) =>
   let count = values.length
   for i in 0 .. count:
     @storage.push destination (values.at i)
-func valid_state values => return do:
+  return ()
+func valid_state values =>
   if values.length > protocol.max_state_floats:
     return false
   for value in values:
-    if Bool.not (is_finite value):
+    if not (is_finite value):
       return false
   return true
 // The loop owns the game's world and is lent both packet buffers for the
@@ -30,13 +31,13 @@ func valid_state values => return do:
 // within the iteration. `execute access operation payload outgoing` takes the
 // world over, writes its response lanes AFTER the echoed operation, and
 // returns the world. `acknowledge access published` repairs presentation caches.
-func run execute -> acknowledge -> (own access) -> (schema: U32) -> (scenes: Bool) -> (incoming: ResizeArray F32) -> (outgoing: ResizeArray F32) -> (host: Array F32 -> Array F32 ! { Foreign }) : Unit ! { Foreign } => return do:
+func run execute -> acknowledge -> (own access) -> (schema: U32) -> (scenes: Bool) -> (incoming: #[~F32]) -> (outgoing: #[~F32]) -> (host: #[F32] -> #[F32] ! { Foreign }) : Unit ! { Foreign } =>
   @storage.truncate incoming 0
   @storage.truncate outgoing 0
   append #[magic, version, U32.to_f32 schema, lanes.bit scenes] outgoing
   let initialized = false
   for ever:
-    use following <- host (@storage.freeze (@storage.copy outgoing))
+    use following <- host (seal (copy outgoing))
     lanes.require (following.length >= 2)
     let published = lanes.integer following[0] 1 == 1
     acknowledge access published
@@ -60,13 +61,13 @@ func run execute -> acknowledge -> (own access) -> (schema: U32) -> (scenes: Boo
 // game is a compile-known policy, not a stored runtime callback object. Each
 // operation takes the world over, appends only its response lanes to
 // outgoing, and returns the world. Snapshots and restores remain explicit.
-func execute game -> (own access) -> operation -> payload -> outgoing => return case operation of
+func execute game -> (own access) -> operation -> payload -> outgoing => case operation of
   1 => game.create access outgoing
   2 => game.frame access payload outgoing
   3 => game.save access outgoing
   4 => game.restore access payload outgoing
   5 => game.scene access outgoing
   6 => game.load_scene access payload outgoing
-  _ => @panic "invalid game operation"
-func serve game -> (own access) -> incoming -> outgoing -> host => return
-  run (execute game) game.acknowledge access game.schema game.scenes incoming outgoing host
+  _ => panic "invalid game operation"
+func serve game -> (own access) -> incoming -> outgoing -> host =>
+  return run (execute game) game.acknowledge access game.schema game.scenes incoming outgoing host

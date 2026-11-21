@@ -34,17 +34,17 @@ const all = 15
 
 type World is data = $World { x: F32, z: F32, vx: F32, vz: F32, bounces: U32, held: U32 }
 
-const create = func () => return $World { x: 0.0, z: 0.0, vx: 0.0, vz: 0.0, bounces: 0, held: 0 }
+const create = func () => $World { x: 0.0, z: 0.0, vx: 0.0, vz: 0.0, bounces: 0, held: 0 }
 
 // The world as lanes, for quicksaves, time travel and reloads, and back.
 const save = func (world: World) => return
   #[world.x, world.z, world.vx, world.vz, U32.to_f32 world.bounces, U32.to_f32 world.held]
-const restore = func state => return $World {
+const restore = func state => $World {
   x: (state.at 0), z: (state.at 1), vx: (state.at 2), vz: (state.at 3), bounces: F32.to_u32 (state.at 4), held: F32.to_u32 (state.at 5),
 }
 
 // The arrow a key is, as its bit; 0 for any other key.
-const arrow = func (code: U32) => return do:
+const arrow = func (code: U32) =>
   if code == protocol.key_arrow_left:
     return left
   if code == protocol.key_arrow_right:
@@ -56,7 +56,7 @@ const arrow = func (code: U32) => return do:
   return 0
 
 // What an event does to the world: an arrow held or let go, a kick.
-const take = func (world: World) => return func (event: extensions.Event) => return do:
+const take = func (world: World) => func (event: extensions.Event) =>
   let next = world
   if let $extensions.Kick { x, z } = event:
     next.vx := self + x
@@ -70,7 +70,7 @@ const take = func (world: World) => return func (event: extensions.Event) => ret
   return next
 
 // How much the held arrows `positive` and `negative` push along their axis.
-const pushed = func (held: U32) => return func (positive: U32) => return func (negative: U32) => return do:
+const pushed = func (held: U32) => func (positive: U32) => func (negative: U32) =>
   let force = 0.0
   if (held & positive) != 0:
     force := self + push
@@ -80,7 +80,7 @@ const pushed = func (held: U32) => return func (positive: U32) => return func (n
 
 // The ball `seconds` later: pushed by the arrows held, slowed by drag and
 // turned back by the walls; and whether it hit one.
-const roll = func (world: World) => return func (seconds: F32) => return do:
+const roll = func (world: World) => func (seconds: F32) =>
   let slowed = 1.0 - drag * seconds
   let vx = (world.vx + pushed world.held right left * seconds) * slowed
   let vz = (world.vz + pushed world.held down up * seconds) * slowed
@@ -109,18 +109,18 @@ const roll = func (world: World) => return func (seconds: F32) => return do:
     bounces := self + 1
   return ($World { x, z, vx, vz, bounces, held: world.held }, hit)
 
-const vec4 = func x => return func y => return func z => return func w => return $types.Vec4 { x, y, z, w }
+const vec4 = func x => func y => func z => func w => $types.Vec4 { x, y, z, w }
 
 // A mesh stretched by (sx, sy, sz), then moved to (x, y, z); column-major,
 // as the packet carries matrices.
-const placed = func (x: F32) => return func (y: F32) => return func (z: F32) => return func (sx: F32) => return func (sy: F32) => return func (sz: F32) => return
+const placed = func (x: F32) => func (y: F32) => func (z: F32) => func (sx: F32) => func (sy: F32) => func (sz: F32) => return
   $types.Mat4 { x: vec4 sx 0.0 0.0 0.0, y: vec4 0.0 sy 0.0 0.0, z: vec4 0.0 0.0 sz 0.0, w: vec4 x y z 1.0 }
 
-const draw = func (mesh: U32) => return func (material: U32) => return func (transform: types.Mat4) => return
+const draw = func (mesh: U32) => func (material: U32) => func (transform: types.Mat4) => return
   { mesh, material, transform }
 
 // The eye at `eye`, looking at `target`, the sky up.
-const look_at = func (eye: Vec3) => return func (target: Vec3) => return do:
+const look_at = func (eye: Vec3) => func (target: Vec3) =>
   let forward = (target - eye).normalized
   let side = (forward.cross ($Vec3 { x: 0.0, y: 1.0, z: 0.0 })).normalized
   let above = side.cross forward
@@ -133,7 +133,7 @@ const look_at = func (eye: Vec3) => return func (target: Vec3) => return do:
 
 // A perspective seeing `focal` (1 over the tangent of half the vertical field
 // of view) at `aspect`, into WebGPU's depth of 0 to 1.
-const perspective = func (focal: F32) => return func (aspect: F32) => return do:
+const perspective = func (focal: F32) => func (aspect: F32) =>
   let near = 0.1
   let far = 100.0
   return $types.Mat4 {
@@ -162,7 +162,7 @@ const markers = func (bounces: U32) => return
     | index <- array.generate (min bounces 16) identity]
 
 // What the world looks like, and the blip of a bounce.
-const view = func (world: World) -> (hit: Bool) -> (input: extensions.Input) -> (draws: ResizeArray codec.MeshDraw) -> (sounds_out: ResizeArray types.Sound) => return do:
+const view = func (world: World) -> (hit: Bool) -> (input: extensions.Input) -> (draws: #[~codec.MeshDraw]) -> (sounds_out: #[~types.Sound]) =>
   @storage.truncate draws 0
   @storage.truncate sounds_out 0
   let drawn = frame.header schema
@@ -183,7 +183,7 @@ const view = func (world: World) -> (hit: Bool) -> (input: extensions.Input) -> 
 
 // One frame: the events, then the ball rolls on (a tenth of a second at
 // most), then how it looks and its Score.
-const step = func (world: World) => return func (input: extensions.Input) => return do:
+const step = func (world: World) => func (input: extensions.Input) =>
   let taken = world
   for event in input.events:
     taken := take taken event
@@ -191,22 +191,22 @@ const step = func (world: World) => return func (input: extensions.Input) => ret
   return (next, hit)
 
 // One Score section, encoded after the render packet with its fixed framing.
-const score = func (world: World) => return do:
-  let packet: ResizeArray F32 = #[protocol.extensions_marker, 1.0]
+const score = func (world: World) =>
+  let packet: #[~F32] = #[protocol.extensions_marker, 1.0]
   extensions.append_score #[$extensions.Score {
     bounces: world.bounces, speed: F32.sqrt (world.vx * world.vx + world.vz * world.vz),
   }] packet
-  return @storage.freeze packet
+  return seal packet
 
 // The program loop owns the game's world and hands it to `execute`, which
 // returns it. Presentation rejection needs no cache repair here; it never
 // rolls simulation back.
-const acknowledge = func access -> published => return ()
+const acknowledge = func access -> published => ()
 type Access = {
-  world: World, events: ResizeArray extensions.Event, draws: ResizeArray codec.MeshDraw,
-  sounds: ResizeArray types.Sound, rendered: ResizeArray F32,
+  world: World, events: #[~extensions.Event], draws: #[~codec.MeshDraw],
+  sounds: #[~types.Sound], rendered: #[~F32],
 }
-const execute = func (access: own Access) -> operation -> payload -> outgoing => return do:
+const execute = func (access: own Access) -> operation -> payload -> outgoing =>
   case operation of
     1 => do:
       access.world := create ()
@@ -223,16 +223,16 @@ const execute = func (access: own Access) -> operation -> payload -> outgoing =>
     4 => do:
       access.world := restore payload
       program.append (save access.world) outgoing
-    _ => @panic "scenes are not supported"
+    _ => panic "scenes are not supported"
   return access
 
-const run = func host => return do:
-  let events: ResizeArray extensions.Event = #[]
-  let draws: ResizeArray codec.MeshDraw = #[]
-  let sounds: ResizeArray types.Sound = #[]
-  let rendered: ResizeArray F32 = #[]
-  let incoming: ResizeArray F32 = #[]
-  let outgoing: ResizeArray F32 = #[]
+const run = func host =>
+  let events: #[~extensions.Event] = #[]
+  let draws: #[~codec.MeshDraw] = #[]
+  let sounds: #[~types.Sound] = #[]
+  let rendered: #[~F32] = #[]
+  let incoming: #[~F32] = #[]
+  let outgoing: #[~F32] = #[]
   let access: Access = {world: create (), events, draws, sounds, rendered}
   use program.run execute acknowledge access schema false incoming outgoing host
   return ()

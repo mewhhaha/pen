@@ -15,29 +15,29 @@ const schema = 1
 // Everything a frame depends on besides its input.
 type World is data = $World { angle: F32, speed: F32 }
 
-const create = func () => return $World { angle: 0.0, speed: 1.0 }
+const create = func () => $World { angle: 0.0, speed: 1.0 }
 
 // The world as lanes, for quicksaves, time travel and reloads, and back.
-const save = func (world: World) => return #[world.angle, world.speed]
-const restore = func state => return $World { angle: (state.at 0), speed: (state.at 1) }
+const save = func (world: World) => #[world.angle, world.speed]
+const restore = func state => $World { angle: (state.at 0), speed: (state.at 1) }
 
 // Radians a second each arrow press adds or takes away.
 const nudge = 0.5
 
-const vec4 = func x => return func y => return func z => return func w => return $types.Vec4 { x, y, z, w }
+const vec4 = func x => func y => func z => func w => $types.Vec4 { x, y, z, w }
 
 // Column-major, as the packet carries matrices.
-const turned = func (angle: F32) => return do:
+const turned = func (angle: F32) =>
   let c = F32.cos angle
   let s = F32.sin angle
   return $types.Mat4 { x: vec4 c 0.0 (0.0 - s) 0.0, y: vec4 0.0 1.0 0.0 0.0, z: vec4 s 0.0 c 0.0, w: vec4 0.0 0.0 0.0 1.0 }
 
-const moved = func (x: F32) => return func (y: F32) => return func (z: F32) => return
-  $types.Mat4 { x: vec4 1.0 0.0 0.0 0.0, y: vec4 0.0 1.0 0.0 0.0, z: vec4 0.0 0.0 1.0 0.0, w: vec4 x y z 1.0 }
+const moved = func (x: F32) => func (y: F32) => func (z: F32) =>
+  return $types.Mat4 { x: vec4 1.0 0.0 0.0 0.0, y: vec4 0.0 1.0 0.0 0.0, z: vec4 0.0 0.0 1.0 0.0, w: vec4 x y z 1.0 }
 
 // A perspective seeing `focal` (1 over the tangent of half the vertical field
 // of view) at `aspect`, into WebGPU's depth of 0 to 1.
-const perspective = func (focal: F32) => return func (aspect: F32) => return do:
+const perspective = func (focal: F32) => func (aspect: F32) =>
   let near = 0.1
   let far = 100.0
   return $types.Mat4 {
@@ -48,7 +48,7 @@ const perspective = func (focal: F32) => return func (aspect: F32) => return do:
   }
 
 // What the world looks like: the cube, five units in front of the eye.
-const view = func (world: World) -> (input: protocol.Input) -> (draws: ResizeArray codec.MeshDraw) => return do:
+const view = func (world: World) -> (input: protocol.Input) -> (draws: #[~codec.MeshDraw]) =>
   @storage.truncate draws 0
   let drawn = frame.header schema
   drawn.view := moved 0.0 0.0 (-5.0)
@@ -59,7 +59,7 @@ const view = func (world: World) -> (input: protocol.Input) -> (draws: ResizeArr
   return drawn
 
 // One frame: the arrows pressed change the speed, and the cube turns on.
-const step = func (world: World) => return func (input: protocol.Input) => return do:
+const step = func (world: World) => func (input: protocol.Input) =>
   let speed = world.speed
   for event in input.events:
     if let $protocol.KeyDown code = event:
@@ -73,12 +73,12 @@ const step = func (world: World) => return func (input: protocol.Input) => retur
 // The program loop owns the game's world and hands it to `execute`, which
 // returns it. Presentation rejection needs no cache repair here; it never
 // rolls simulation back.
-const acknowledge = func access -> published => return ()
+const acknowledge = func access -> published => ()
 type Access = {
-  world: World, events: ResizeArray protocol.Event, draws: ResizeArray codec.MeshDraw,
-  sounds: ResizeArray types.Sound, rendered: ResizeArray F32,
+  world: World, events: #[~protocol.Event], draws: #[~codec.MeshDraw],
+  sounds: #[~types.Sound], rendered: #[~F32],
 }
-const execute = func (access: own Access) -> operation -> payload -> outgoing => return do:
+const execute = func (access: own Access) -> operation -> payload -> outgoing =>
   case operation of
     1 => do:
       access.world := create ()
@@ -94,16 +94,16 @@ const execute = func (access: own Access) -> operation -> payload -> outgoing =>
     4 => do:
       access.world := restore payload
       program.append (save access.world) outgoing
-    _ => @panic "scenes are not supported"
+    _ => panic "scenes are not supported"
   return access
 
-const run = func host => return do:
-  let events: ResizeArray protocol.Event = #[]
-  let draws: ResizeArray codec.MeshDraw = #[]
-  let sounds: ResizeArray types.Sound = #[]
-  let rendered: ResizeArray F32 = #[]
-  let incoming: ResizeArray F32 = #[]
-  let outgoing: ResizeArray F32 = #[]
+const run = func host =>
+  let events: #[~protocol.Event] = #[]
+  let draws: #[~codec.MeshDraw] = #[]
+  let sounds: #[~types.Sound] = #[]
+  let rendered: #[~F32] = #[]
+  let incoming: #[~F32] = #[]
+  let outgoing: #[~F32] = #[]
   let access: Access = {world: create (), events, draws, sounds, rendered}
   use program.run execute acknowledge access schema false incoming outgoing host
   return ()

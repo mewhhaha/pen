@@ -13,7 +13,7 @@ const identity = $types.Mat4 {
 }
 
 // Fixed render defaults for state `schema`; collections have separate owners.
-func header (schema: U32): types.RenderHeader => return {
+func header (schema: U32): types.RenderHeader => {
   schema,
   save_requested: false,
   load_requested: false,

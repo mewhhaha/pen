@@ -1115,140 +1115,140 @@ type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: &[E
 
 // An event's lanes from `start`: its tag, then code, x, y, delta. The code lane
 // holds a whole number; lanes an event does not use are zero.
-func decode_event values => return func (start: U32) => return do:
+func decode_event values => func (start: U32) =>
   let tag = lanes.integer (values.at (start)) 28
   let code = lanes.integer (values.at (start + 1)) lanes.max_integer
   let x = (values.at (start + 2))
   let y = (values.at (start + 3))
   let delta = (values.at (start + 4))
-  return case tag of
-    1 => do:
+  case tag of
+    1 =>
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $KeyDown code
-    2 => do:
+    2 =>
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $KeyUp code
-    3 => do:
+    3 =>
       use lanes.require (code <= 7)
       use lanes.require (delta == 0.0)
       return $PointerDown { button: code, x, y }
-    4 => do:
+    4 =>
       use lanes.require (code <= 7)
       use lanes.require (delta == 0.0)
       return $PointerUp { button: code, x, y }
-    5 => do:
+    5 =>
       use lanes.require (code == 0)
       use lanes.require (delta == 0.0)
       return $PointerMove { x, y }
-    6 => do:
+    6 =>
       use lanes.require (code == 0)
       return $Wheel { x, y, delta }
-    7 => do:
+    7 =>
       use lanes.require (code == 0)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $FocusLost
-    8 => do:
+    8 =>
       use lanes.require (code == 0)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $AssetChanged
-    9 => do:
+    9 =>
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $Console { command: code, argument: lanes.integer x lanes.max_integer }
-    10 => do:
+    10 =>
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $Preference { index: code, value: x }
-    11 => do:
+    11 =>
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $Tune { index: code, value: x }
-    12 => do:
+    12 =>
       use lanes.require (code <= 7)
       use lanes.require (delta == 0.0)
       return $UiAction { node: lanes.integer x lanes.max_integer, action: code, value: y }
-    13 => do:
+    13 =>
       use lanes.require (code <= 3)
       return $ServiceAnswer { request: lanes.integer x lanes.max_integer, status: code, value: y, length: lanes.integer delta lanes.max_integer }
-    14 => do:
+    14 =>
       return $ServiceData { request: code, a: x, b: y, c: delta }
-    15 => do:
+    15 =>
       use lanes.require (code <= 15)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $GamepadConnected { pad: code, standard: lanes.integer x lanes.max_integer }
-    16 => do:
+    16 =>
       use lanes.require (code <= 15)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $GamepadDisconnected { pad: code }
-    17 => do:
+    17 =>
       use lanes.require (code <= 31)
       return $GamepadButton { button: code, pad: lanes.integer x lanes.max_integer, value: y, pressed: lanes.integer delta lanes.max_integer }
-    18 => do:
+    18 =>
       use lanes.require (code <= 15)
       use lanes.require (delta == 0.0)
       return $GamepadAxis { axis: code, pad: lanes.integer x lanes.max_integer, value: y }
-    19 => do:
+    19 =>
       use lanes.require (code <= 255)
       use lanes.require (delta == 0.0)
       return $Action { action: code, value: x, device: lanes.integer y lanes.max_integer }
-    20 => do:
+    20 =>
       use lanes.require (code <= 1114111)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $TextInput { character: code, composing: lanes.integer x lanes.max_integer }
-    21 => do:
+    21 =>
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $Composition { length: code, cursor: lanes.integer x lanes.max_integer }
-    22 => do:
+    22 =>
       use lanes.require (code == 0)
       use lanes.require (delta == 0.0)
       return $MouseMotion { dx: x, dy: y }
-    23 => do:
+    23 =>
       use lanes.require (code <= 31)
       return $Touch { id: code, x, y, phase: lanes.integer delta lanes.max_integer }
-    24 => do:
+    24 =>
       use lanes.require (code <= 31)
       use lanes.require (delta == 0.0)
       return $Pan { touches: code, dx: x, dy: y }
-    25 => do:
+    25 =>
       use lanes.require (code == 0)
       return $Pinch { x, y, scale: delta }
-    26 => do:
+    26 =>
       use lanes.require (code <= 255)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $Player { index: code }
-    27 => do:
+    27 =>
       use lanes.require (code <= 1)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $SessionStarted { restored: code }
-    28 => do:
+    28 =>
       use lanes.require (code == 0)
       use lanes.require (x == 0.0)
       use lanes.require (y == 0.0)
       use lanes.require (delta == 0.0)
       return $RendererReady
-    _ => @panic "invalid input event tag"
+    _ => panic "invalid input event tag"
 
 // The input packet: the seconds since the last frame, the viewport's width and
 // height, the event and state counts, the events and the state. Anything else
 // traps.
-func decode_input_into values -> (events: ResizeArray Event) => return do:
+func decode_input_into values -> (events: #[~Event]) =>
   use lanes.require (values.length >= frame_header_floats)
   use lanes.finite values
   let elapsed = (values.at (0))

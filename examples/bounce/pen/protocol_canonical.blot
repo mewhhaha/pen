@@ -8,7 +8,7 @@ import * as lanes from "./lanes"
 import * as protocol from "./protocol"
 
 // An event's walk: its tag, then its fields in the schema's order.
-func canonical_event (event: protocol.Event) => return case event of
+func canonical_event (event: protocol.Event) => case event of
   $protocol.KeyDown value => #[1.0, U32.to_f32 value]
   $protocol.KeyUp value => #[2.0, U32.to_f32 value]
   $protocol.PointerDown { button, x, y } => #[3.0, U32.to_f32 button, x, y]
@@ -41,22 +41,22 @@ func canonical_event (event: protocol.Event) => return case event of
 // The input's walk, as pen-protocol's canonical_input makes it: elapsed, the
 // viewport's width and height, the events' count and walks, then the state's
 // count and lanes.
-func canonical_input (input: protocol.Input) => return do:
+func canonical_input (input: protocol.Input) =>
   let $protocol.Input { elapsed, width, height, events, state } = input
-  let output: GrowArray F32 = #[elapsed, width, height, U32.to_f32 events.length]
+  let output: #[+F32] = #[elapsed, width, height, U32.to_f32 events.length]
   for event in events:
     array.append_into output (canonical_event event)
   output.push (U32.to_f32 state.length)
   array.append_into output state
-  return @storage.freeze output
+  return seal output
 
 
 // What a walk has made so far: where it reads next, the packet's lanes, and
 // the child records and tail lanes that follow them. A writer takes it over
 // and returns it.
-type Stream = { at: U32, output: ResizeArray F32, children: ResizeArray F32, extras: ResizeArray F32 }
+type Stream = { at: U32, output: #[~F32], children: #[~F32], extras: #[~F32] }
 
-func draw_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func draw_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 24:
@@ -104,7 +104,7 @@ func draw_into (canonical: Array F32) -> (stream: own Stream): Stream => return 
   stream.at := at
   return stream
 
-func solid_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func solid_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 1:
@@ -127,7 +127,7 @@ func solid_into (canonical: Array F32) -> (stream: own Stream): Stream => return
   stream.at := at
   return stream
 
-func decal_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func decal_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 18:
@@ -156,7 +156,7 @@ func decal_into (canonical: Array F32) -> (stream: own Stream): Stream => return
   stream.at := at
   return stream
 
-func sound_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func sound_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 7:
@@ -178,7 +178,7 @@ func sound_into (canonical: Array F32) -> (stream: own Stream): Stream => return
   stream.at := at
   return stream
 
-func sprite_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func sprite_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 17:
@@ -214,7 +214,7 @@ func sprite_into (canonical: Array F32) -> (stream: own Stream): Stream => retur
   stream.at := at
   return stream
 
-func inset_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func inset_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 48:
@@ -287,7 +287,7 @@ func inset_into (canonical: Array F32) -> (stream: own Stream): Stream => return
   stream.at := at
   return stream
 
-func inset_draw_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func inset_draw_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.children.length
   for 0 .. 24:
@@ -335,7 +335,7 @@ func inset_draw_into (canonical: Array F32) -> (stream: own Stream): Stream => r
   stream.at := at
   return stream
 
-func field_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func field_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 7:
@@ -362,7 +362,7 @@ func field_into (canonical: Array F32) -> (stream: own Stream): Stream => return
   stream.at := at
   return stream
 
-func ui_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func ui_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 24:
@@ -423,7 +423,7 @@ func ui_into (canonical: Array F32) -> (stream: own Stream): Stream => return do
   stream.at := at
   return stream
 
-func service_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func service_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 8:
@@ -452,7 +452,7 @@ func service_into (canonical: Array F32) -> (stream: own Stream): Stream => retu
   stream.at := at
   return stream
 
-func buse_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func buse_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 3:
@@ -466,7 +466,7 @@ func buse_into (canonical: Array F32) -> (stream: own Stream): Stream => return 
   stream.at := at
   return stream
 
-func voice_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func voice_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 12:
@@ -498,7 +498,7 @@ func voice_into (canonical: Array F32) -> (stream: own Stream): Stream => return
   stream.at := at
   return stream
 
-func pose_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func pose_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 4:
@@ -514,7 +514,7 @@ func pose_into (canonical: Array F32) -> (stream: own Stream): Stream => return 
   stream.at := at
   return stream
 
-func emitter_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func emitter_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 42:
@@ -581,7 +581,7 @@ func emitter_into (canonical: Array F32) -> (stream: own Stream): Stream => retu
   stream.at := at
   return stream
 
-func light_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func light_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 12:
@@ -607,7 +607,7 @@ func light_into (canonical: Array F32) -> (stream: own Stream): Stream => return
   stream.at := at
   return stream
 
-func listener_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func listener_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 9:
@@ -627,7 +627,7 @@ func listener_into (canonical: Array F32) -> (stream: own Stream): Stream => ret
   stream.at := at
   return stream
 
-func panner_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func panner_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 15:
@@ -661,7 +661,7 @@ func panner_into (canonical: Array F32) -> (stream: own Stream): Stream => retur
   stream.at := at
   return stream
 
-func instance_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func instance_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 26:
@@ -705,7 +705,7 @@ func instance_into (canonical: Array F32) -> (stream: own Stream): Stream => ret
   stream.at := at
   return stream
 
-func instance_removal_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:
+func instance_removal_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
   for 0 .. 2:
@@ -718,13 +718,13 @@ func instance_removal_into (canonical: Array F32) -> (stream: own Stream): Strea
   return stream
 
 // Canonical render values streamed into the packet it is given and returns.
-func render_packet_from_canonical (canonical: Array F32) -> (output: own ResizeArray F32): ResizeArray F32 => return do:
+func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): #[~F32] =>
   lanes.finite canonical
   @storage.truncate output 0
   for 0 .. protocol.packet_header_floats:
     @storage.push output 0.0
-  let children: ResizeArray F32 = #[]
-  let extras: ResizeArray F32 = #[]
+  let children: #[~F32] = #[]
+  let extras: #[~F32] = #[]
   let stream: Stream = { at: 0, output, children, extras }
   stream.output[0] := protocol.packet_magic
   let at: U32 = 0

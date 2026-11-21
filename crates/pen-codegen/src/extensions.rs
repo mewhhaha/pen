@@ -141,9 +141,9 @@ fn type_name(name: &str) -> bool {
 }
 
 /// Blot's words, which name no field (blot2's grammar.baba), and `self`.
-const KEYWORDS: &str = "as borrow break case cleanup code complete concurrent const data descriptor do effect else \
-                        entry ever exists fn for forall from if import in infix infixl infixr is let many of once \
-                        pack region return row self shared then type unique unpack use where";
+const KEYWORDS: &str = "and as borrow break case cleanup code complete concurrent const copy data descriptor do effect else \
+                        entry ever exists false fn for forall fork freeze from func if import in infix infixl infixr is let many not of once \
+                        or own pack panic region return row seal self shared then true type unique unpack use where with";
 
 /// A Blot value name: lowercase letters, digits and underscores, and not
 /// one of its words.
@@ -307,16 +307,16 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
         "An event's lanes from `start`: one of pen's, or one of the game's, which travels as pen's Game event: \
          its tag, then its values in the lanes after, those it has no field for zero.",
     ));
-    out.push("func decode_event values => return func (start: U32) => return do:".to_owned());
+    out.push("func decode_event values => func (start: U32) =>".to_owned());
     out.push("  if (values.at (start)) != U32.to_f32 protocol.game_tag:".to_owned());
     out.push("    return $Pen (protocol.decode_event values start)".to_owned());
     out.push("  let tag = lanes.integer (values.at (start + 1)) protocol.max_extension_tag".to_owned());
     out.push(
         "  let lanes_after = #[(values.at (start + 2)), (values.at (start + 3)), (values.at (start + 4))]".to_owned(),
     );
-    out.push("  return case tag of".to_owned());
+    out.push("  case tag of".to_owned());
     for event in &declarations.events {
-        out.push(format!("    {} => do:", event.tag));
+        out.push(format!("    {} =>", event.tag));
         for unused in event.fields.len()..EVENT_FIELDS {
             out.push(format!("      use lanes.require (lanes_after[{unused}] == 0.0)"));
         }
@@ -340,11 +340,11 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             out.push(format!("      return ${} {{ {} }}", event.name, fields.join(", ")));
         }
     }
-    out.push("    _ => @panic \"unknown game event\"".to_owned());
+    out.push("    _ => panic \"unknown game event\"".to_owned());
     out.push(String::new());
     out.extend(comment("The input packet, as protocol.decode_input_into reads it, with the game's own events."));
     out.extend(
-        "func decode_input_into values -> (events: ResizeArray Event) => return do:\n  use lanes.require (values.length >= protocol.frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)\n  let event_count = lanes.integer (values.at (3)) protocol.max_events\n  let state_count = lanes.integer (values.at (4)) protocol.max_state_floats\n  let state_start = protocol.frame_header_floats + event_count * protocol.event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (protocol.frame_header_floats + index * protocol.event_floats))\n  return $Input {\n    state: values.view state_start (state_start + state_count),\n    elapsed, width, height,\n    events: &events[0..events.length],\n  }"
+        "func decode_input_into values -> (events: #[~Event]) =>\n  use lanes.require (values.length >= protocol.frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)\n  let event_count = lanes.integer (values.at (3)) protocol.max_events\n  let state_count = lanes.integer (values.at (4)) protocol.max_state_floats\n  let state_start = protocol.frame_header_floats + event_count * protocol.event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (protocol.frame_header_floats + index * protocol.event_floats))\n  return $Input {\n    state: values.view state_start (state_start + state_count),\n    elapsed, width, height,\n    events: &events[0..events.length],\n  }"
             .lines()
             .map(str::to_owned),
     );
@@ -368,7 +368,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             section.name
         )));
         out.push(format!(
-            "func append_{name} (records: Array {}) -> (packet: ResizeArray F32) => return do:",
+            "func append_{name} (records: #[{}]) -> (packet: #[~F32]) =>",
             section.name
         ));
         out.push(format!("  @storage.push packet (U32.to_f32 {name}_tag)"));
@@ -471,7 +471,7 @@ mod tests {
             "  | $Pen protocol.Event",
             "  | $Kick { x: F32, z: F32 }",
             "  | $Reset",
-            "    1 => do:\n      use lanes.require (lanes_after[2] == 0.0)\n      return $Kick { x: lanes_after[0], z: lanes_after[1] }",
+            "    1 =>\n      use lanes.require (lanes_after[2] == 0.0)\n      return $Kick { x: lanes_after[0], z: lanes_after[1] }",
             "return $Hire { count: lanes.integer lanes_after[0] lanes.max_integer, skilled: lanes.integer lanes_after[1] 1 == 1, pay: lanes_after[2] }",
             "type Score is data = $Score { points: U32, multiplier: F32, over: Bool }",
             "    @storage.push packet (U32.to_f32 record.points)\n    @storage.push packet (record.multiplier)\n    @storage.push packet (lanes.bit record.over)",

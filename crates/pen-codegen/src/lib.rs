@@ -150,8 +150,8 @@ mod tests {
         );
         let sources = blot::emit(&model, HEADER);
         let canonical = &sources.iter().find(|(name, _)| *name == "protocol_canonical.blot").unwrap().1;
-        assert!(canonical.contains("func canonical_input (input: protocol.Input) => return do:"));
-        assert!(canonical.contains("func render_packet_from_canonical (canonical: Array F32)"));
+        assert!(canonical.contains("func canonical_input (input: protocol.Input) =>"));
+        assert!(canonical.contains("func render_packet_from_canonical (canonical: #[F32])"));
         // Every header lane and section is emitted into the one packet the walk owns.
         for header in &model.header {
             let offset = header.laid.offset;
@@ -165,7 +165,7 @@ mod tests {
         assert!(canonical.contains("@storage.push stream.extras canonical[at + index]"));
         // A writer takes the stream over and returns it; a child record goes to its pool.
         assert!(canonical.contains("stream := inset_draw_into canonical stream"));
-        assert!(canonical.contains("func inset_draw_into (canonical: Array F32) -> (stream: own Stream): Stream => return do:\n  let at = stream.at\n  let base = stream.children.length"));
+        assert!(canonical.contains("func inset_draw_into (canonical: #[F32]) -> (stream: own Stream): Stream =>\n  let at = stream.at\n  let base = stream.children.length"));
         // Each record's walk follows its fields; a group's sits where its first lane does.
         assert!(rust.contains(
             "out.extend([draw.mesh as f32, draw.material as f32]);\n        out.extend_from_slice(&draw.transform);"

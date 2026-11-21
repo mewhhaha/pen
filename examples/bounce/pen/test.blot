@@ -5,65 +5,65 @@
 import * as array from "std/array"
 import * as protocol from "./protocol"
 
-type Save is data = $Save { schema: U32, state: Array F32 }
+type Save is data = $Save { schema: U32, state: #[F32] }
 type Selector is data = $Selector { role: U32, name: &[U32] }
 
-func named role -> name => return $Selector { role, name: name.view 0 name.length }
-func button name => return named protocol.ui_role_button name
-func dialog name => return named protocol.ui_role_dialog name
+func named role -> name => $Selector { role, name: name.view 0 name.length }
+func button name => named protocol.ui_role_button name
+func dialog name => named protocol.ui_role_dialog name
 
 // Read borrowed text before producing the copied numeric host packet.
-func text value => return do:
+func text value =>
   let length: U32 = value.length
   let at: U32 -> U32 = value.at
-  let packet: GrowArray F32 = #[U32.to_f32 length]
+  let packet: #[+F32] = #[U32.to_f32 length]
   for i in 0 .. length:
     packet.push (U32.to_f32 (at i))
-  return @storage.freeze packet
-func call (driver: Array F32 -> Array F32 ! { Foreign }) -> op -> values => return
+  return seal packet
+func call (driver: #[F32] -> #[F32] ! { Foreign }) -> op -> values => return
   driver (array.concat #[1.0, from op] values)
 
-func run driver -> body => return do:
+func run driver -> body =>
   use body driver
-  break call driver protocol.test_driver_op_finish #[]
+  return call driver protocol.test_driver_op_finish #[]
 
 // initial.state is the game's ordinary payload, not a saved Wasm stack.
-func launch driver -> initial -> width -> height => return do:
+func launch driver -> initial -> width -> height =>
   let $Save { schema, state } = initial
   use call driver protocol.test_driver_op_launch
     (array.concat #[from width, from height, from schema, from state.length] state)
-  break ()
+  return ()
 
-func step driver -> (ticks: U32) => return do:
+func step driver -> (ticks: U32) =>
   use call driver protocol.test_driver_op_step #[from ticks]
-  break ()
+  return ()
 
-func locate driver -> op -> selector -> ticks => return do:
+func locate driver -> op -> selector -> ticks =>
   let $Selector { role, name } = selector
   use call driver op (array.concat #[from role, from ticks] (text name))
-  break ()
+  return ()
 
 // Waits advance at 60 ticks/second, with a bounded number of ticks.
-func click_within driver -> selector -> ticks => return locate driver protocol.test_driver_op_click selector ticks
-func click driver -> selector => return click_within driver selector 300
-func expect_visible driver -> selector => return locate driver protocol.test_driver_op_visible selector 300
-func expect_hidden driver -> selector => return locate driver protocol.test_driver_op_hidden selector 300
+func click_within driver -> selector -> ticks => locate driver protocol.test_driver_op_click selector ticks
+func click driver -> selector => click_within driver selector 300
+func expect_visible driver -> selector => locate driver protocol.test_driver_op_visible selector 300
+func expect_hidden driver -> selector => locate driver protocol.test_driver_op_hidden selector 300
 
-func press driver -> key => return do:
+func press driver -> key =>
   use call driver protocol.test_driver_op_press (text key)
-  break ()
+  return ()
 
 // Decode or inspect this in the test's own Blot code, using the game's codecs.
-func snapshot driver => return do:
+func snapshot driver =>
   use values <- call driver protocol.test_driver_op_snapshot #[]
-  break $Save { schema: F32.to_u32 values[0], state: array.slice 1 (values.length - 1) values }
+  return $Save { schema: F32.to_u32 values[0], state: array.slice 1 (values.length - 1) values }
 
-func equal driver -> label -> expected -> actual => return do:
+func equal driver -> label -> expected -> actual =>
   let expected_length: U32 = expected.length
   let actual_length: U32 = actual.length
   let expected_at: U32 -> F32 = expected.at
   let actual_at: U32 -> F32 = actual.at
-  let packet: GrowArray F32 = #[]
+  let packet: #[+F32] = #[]
   array.append_into packet (text label)
   packet.push (U32.to_f32 expected_length)
   for i in 0 .. expected_length:
@@ -71,13 +71,13 @@ func equal driver -> label -> expected -> actual => return do:
   packet.push (U32.to_f32 actual_length)
   for i in 0 .. actual_length:
     packet.push (actual_at i)
-  use call driver protocol.test_driver_op_equal (@storage.freeze packet)
-  break ()
+  use call driver protocol.test_driver_op_equal (seal packet)
+  return ()
 
-func picture driver -> name -> compare -> tolerance => return do:
+func picture driver -> name -> compare -> tolerance =>
   use call driver protocol.test_driver_op_screenshot
     (array.concat #[if compare then 1.0 else 0.0, tolerance] (text name))
-  break ()
-func screenshot driver -> name => return picture driver name false 0.0
+  return ()
+func screenshot driver -> name => picture driver name false 0.0
 // RGB RMSE is normalized to 0..1. A missing golden fails unless --update is set.
-func expect_screenshot driver -> name -> tolerance => return picture driver name true tolerance
+func expect_screenshot driver -> name -> tolerance => picture driver name true tolerance

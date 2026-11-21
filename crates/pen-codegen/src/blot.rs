@@ -84,7 +84,7 @@ fn record(layout: &Layout) -> Vec<String> {
         None => format!("A {name}'s lanes."),
     };
     let mut out = comment(Some(&about));
-    out.push(format!("func {} ({variable}: types.{name}) => return do:", encoder(&layout.record)));
+    out.push(format!("func {} ({variable}: types.{name}) =>", encoder(&layout.record)));
     let mut lets = Vec::new();
     let mut lanes = Vec::new();
     for laid in &layout.fields {
@@ -217,7 +217,7 @@ fn input(model: &Model) -> Vec<String> {
         String::new(),
     ]);
     out.extend(comment(Some(&format!("An event's lanes from `start`: its tag, then {}. The {} lane holds a whole number; lanes an event does not use are zero.", input_lanes.iter().map(s).collect::<Vec<_>>().join(", "), s(&input_lanes[0])))));
-    out.push("func decode_event values => return func (start: U32) => return do:".to_owned());
+    out.push("func decode_event values => func (start: U32) =>".to_owned());
     out.push(format!(
         "  let tag = lanes.integer (values.at (start)) {}",
         model.core_events().iter().map(|event| n(&event["tag"])).max().unwrap_or(0)
@@ -229,11 +229,11 @@ fn input(model: &Model) -> Vec<String> {
             out.push(format!("  let {} = (values.at (start + {}))", s(lane), index + 1));
         }
     }
-    out.push("  return case tag of".to_owned());
+    out.push("  case tag of".to_owned());
     for event in model.core_events() {
         let fields = event_fields(event);
         let name = s(&event["name"]);
-        out.push(format!("    {} => do:", event["tag"]));
+        out.push(format!("    {} =>", event["tag"]));
         for (index, lane) in input_lanes.iter().enumerate() {
             if let Some((_, field)) = fields.iter().find(|(_, field)| &field["lane"] == lane) {
                 if !field["max"].is_null() && field["wire"] != "f32" {
@@ -272,10 +272,10 @@ fn input(model: &Model) -> Vec<String> {
             out.push(format!("      return ${name}"));
         }
     }
-    out.push(format!("    _ => @panic {}", quote(&input["messages"]["tag"])));
+    out.push(format!("    _ => panic {}", quote(&input["messages"]["tag"])));
     out.push(String::new());
     out.extend(comment(Some("The input packet: the seconds since the last frame, the viewport's width and height, the event and state counts, the events and the state. Anything else traps.")));
-    out.extend("func decode_input_into values -> (events: ResizeArray Event) => return do:\n  use lanes.require (values.length >= frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)".lines().map(str::to_owned));
+    out.extend("func decode_input_into values -> (events: #[~Event]) =>\n  use lanes.require (values.length >= frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)".lines().map(str::to_owned));
     out.push(format!(
         "  let event_count = lanes.integer (values.at (3)) {}",
         s(&input["maxEvents"]["limit"]).to_lowercase()
@@ -311,11 +311,11 @@ fn append_fields(out: &mut Vec<String>, fields: &[Laid], row: &str, indent: &str
 
 fn render_views(model: &Model) -> Vec<String> {
     let mut out = vec![String::new(),
-        "func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own ResizeArray F32) => return do:".into(),
+        "func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own #[~F32]) =>".into(),
         "  @storage.truncate encoded 0".into(),
         "  append_render_views packet collections project context encoded".into(),
         "  return encoded".into(),
-        "func append_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: ResizeArray F32) => return do:".into(),
+        "func append_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: #[~F32]) =>".into(),
         "  let start = encoded.length".into()];
     for section in &model.sections {
         if kind(&section.section) != "trailing" && section.owner.is_none() {
@@ -446,7 +446,7 @@ fn render_meshes(model: &Model) -> Vec<String> {
     let mut out = vec![String::new(),
         "// Flat mesh draws (no parameters/extras) and sounds, into the packet it is given and returns.".to_owned(),
         "type MeshDraw = { mesh: U32, material: U32, transform: types.Mat4 }".to_owned(),
-        "func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: own ResizeArray F32) => return do:".to_owned(),
+        "func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: own #[~F32]) =>".to_owned(),
         "  @storage.truncate encoded 0".to_owned(),
         format!("  for 0 .. (protocol.packet_header_floats + draws.length * {} + sounds.length * {}):", draws.lanes, sounds.lanes),
         "    @storage.push encoded 0.0".to_owned()];
@@ -516,7 +516,7 @@ fn render(model: &Model) -> Vec<String> {
                 s(&record["name"]),
                 entry.head.iter().map(|field| field.name.as_str()).collect::<Vec<_>>().join(", ")
             ))));
-            out.push(format!("func {} ({name}: types.{}) => return do:", encoder(record), s(&record["name"])));
+            out.push(format!("func {} ({name}: types.{}) =>", encoder(record), s(&record["name"])));
             out.extend(lets.iter().map(|line| format!("  {line}")));
             out.push("  return array.concat #[".to_owned());
             out.extend(chunk(&lanes, 76).iter().map(|line| format!("    {line},")));
@@ -560,7 +560,7 @@ fn render(model: &Model) -> Vec<String> {
                 "{}: {head}its {rest_name}' count, then each of them.",
                 s(&record["name"])
             ))));
-            out.push(format!("func {} ({name}: types.{}) => return do:", encoder(record), s(&record["name"])));
+            out.push(format!("func {} ({name}: types.{}) =>", encoder(record), s(&record["name"])));
             out.push(format!("  let {rest_name} = {name}.{rest_name}"));
             out.push(format!(
                 "  let encoded = @array.fill (protocol.{} + {rest_name}.length * protocol.{}) 0.0",
@@ -593,7 +593,7 @@ fn render(model: &Model) -> Vec<String> {
                 s(&owner.layout.record["name"]),
                 owner.field.name
             ))));
-            out.push(format!("func {name} ({variable}: types.{}) => return do:", s(&owner.layout.record["name"])));
+            out.push(format!("func {name} ({variable}: types.{}) =>", s(&owner.layout.record["name"])));
             out.push(format!("  let kept = min {path}.length {max}"));
             out.push(format!(
                 "  return #[lane | index <- array.generate kept identity, lane <- vec4_lanes {path}[index]]"
@@ -601,7 +601,7 @@ fn render(model: &Model) -> Vec<String> {
         }
     }
     if !tail_encoders.is_empty() {
-        out.extend([String::new(), "func vec4_lanes (v: types.Vec4) => return #[v.x, v.y, v.z, v.w]".to_owned()]);
+        out.extend([String::new(), "func vec4_lanes (v: types.Vec4) => #[v.x, v.y, v.z, v.w]".to_owned()]);
     }
     out.extend(render_views(model));
     out.extend(render_meshes(model));
@@ -705,20 +705,20 @@ const NUMERIC: &str = r#"import * as array from "std/array"
 
 const max_integer = 16777215
 
-func require (condition: Bool) => return do:
+func require (condition: Bool) =>
   if condition:
     return ()
-  return @panic "invalid Pen numeric packet"
+  return panic "invalid Pen numeric packet"
 
-func finite values => return require (array.all is_finite values)
+func finite values => require (array.all is_finite values)
 
-func integer (value: F32) => return func (maximum: U32) => return do:
+func integer (value: F32) => func (maximum: U32) =>
   let number = F32.to_u32 value
   use require (value == U32.to_f32 number)
   use require (number <= maximum)
   return number
 
-func bit (value: Bool) => return do:
+func bit (value: Bool) =>
   if value:
     return 1.0
   return 0.0"#;

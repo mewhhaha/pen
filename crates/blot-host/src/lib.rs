@@ -133,6 +133,11 @@ fn imaged_globals(wasm: &[u8]) -> Result<Vec<String>, String> {
     Ok(mutable.iter().map(|index| exported[index].clone()).collect())
 }
 
+/// Whether `engine` permits unmetered `wtime-aot` execution (neither epoch interruption nor fuel).
+fn engine_allows_aot(engine: &Engine) -> bool {
+    !engine.get_epoch_interruption() && !engine.get_consume_fuel()
+}
+
 impl GuestModule {
     /// Compiles `wasm`, reusing a compiled copy from `cache` when one exists
     /// for these bytes and this engine's configuration. Fails without the
@@ -147,12 +152,27 @@ impl GuestModule {
         Self::new_with_aot(engine, wasm, cache, true)
     }
 
+    #[cfg(feature = "compiler")]
+    fn new_wasmtime(engine: &Engine, wasm: &[u8], cache: Option<&Path>) -> Result<GuestModule> {
+        let abi = Arc::new(read_abi(wasm)?);
+        let module = compile(engine, wasm, cache)?;
+        validate_module(&module, &abi)?;
+        let imaged = Arc::new(imaged_globals(wasm));
+        Ok(GuestModule {
+            module: CompiledModule::Wasmtime(module),
+            trace: None,
+            abi,
+            symbols: Arc::new(Symbols::read(wasm)),
+            imaged,
+        })
+    }
+
     fn new_with_aot(engine: &Engine, wasm: &[u8], cache: Option<&Path>, prefer_aot: bool) -> Result<GuestModule> {
         #[cfg(feature = "compiler")]
         {
             let abi = Arc::new(read_abi(wasm)?);
             let use_aot = if prefer_aot { wtime_aot::preferred_for_run() } else { wtime_aot::enabled() };
-            let module = if use_aot && !engine.get_epoch_interruption() && abi.tasks.is_none() {
+            let module = if use_aot && engine_allows_aot(engine) && abi.tasks.is_none() {
                 CompiledModule::WtimeAot(wtime_aot::AotModule::compile(wasm, &abi, cache)?)
             } else {
                 let module = compile(engine, wasm, cache)?;
@@ -181,10 +201,11 @@ impl GuestModule {
     /// entrypoint. The original bytes and normal entry remain unchanged.
     #[cfg(feature = "compiler")]
     pub fn traced(engine: &Engine, wasm: &[u8], cache: Option<&Path>, trace: Arc<SystemTrace>) -> Result<GuestModule> {
+        // System tracing requires Wasmtime's `Tracing` hooks and is never routed to `wtime-aot`.
         let mut module = if trace.records_allocations() {
-            Self::new(engine, &trace_instrument::instrument(wasm)?, cache)?
+            Self::new_wasmtime(engine, &trace_instrument::instrument(wasm)?, cache)?
         } else {
-            Self::new(engine, wasm, cache)?
+            Self::new_wasmtime(engine, wasm, cache)?
         };
         let entry = module.abi.function("main_trace").context("system tracing needs a main_trace entrypoint")?;
         ensure!(
@@ -687,6 +708,10 @@ impl Guest {
     fn start(engine: &Engine, module: &GuestModule, limits: Option<Limits>) -> Result<Guest> {
         match &module.module {
             CompiledModule::WtimeAot(aot) => {
+                ensure!(
+                    engine_allows_aot(engine),
+                    "wtime-aot module cannot be instantiated on an epoch-interrupted or fuel-metered engine"
+                );
                 let guest = wtime_aot::AotGuest::start(aot, module.abi.clone(), module.imaged.clone(), limits)?;
                 Ok(Guest { backend: GuestBackend::WtimeAot(Box::new(guest)), abi: module.abi.clone() })
             }

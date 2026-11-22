@@ -137,17 +137,34 @@ struct AotLibrary {
 unsafe impl Send for AotLibrary {}
 unsafe impl Sync for AotLibrary {}
 
+/// Typed error returned when the current host CPU does not satisfy the required x64 ISA profile
+/// (either during compile-time host feature detection or via `blot_aot_new` trap code `22`).
+#[derive(Debug)]
+pub struct UnsupportedIsaError(pub String);
+
+impl std::fmt::Display for UnsupportedIsaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "unsupported CPU ISA for wtime-aot x64: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnsupportedIsaError {}
+
 impl AotLibrary {
     fn trap_error(&self, code: u8) -> anyhow::Error {
         let mut ptr: *const u8 = std::ptr::null();
         let mut len: usize = 0;
         let ok = unsafe { (self.syms.trap_message)(code, &mut ptr, &mut len) };
-        if ok == 0 && !ptr.is_null() {
+        let msg = if ok == 0 && !ptr.is_null() {
             let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
-            let msg = String::from_utf8_lossy(bytes);
-            anyhow!("wtime-aot trap: {msg}")
+            String::from_utf8_lossy(bytes).into_owned()
         } else {
-            anyhow!("wtime-aot trap (code {code})")
+            format!("code {code}")
+        };
+        if code == 22 {
+            anyhow::Error::new(UnsupportedIsaError(msg))
+        } else {
+            anyhow!("wtime-aot trap: {msg}")
         }
     }
 }
@@ -197,14 +214,31 @@ fn file_sha256_hex(path: &Path) -> Result<String> {
 }
 
 /// Enforces an owner-controlled (`0o700`), symlink-free private cache directory hierarchy.
-/// Fails closed if `path` is a symlink, any ancestor is group/world-writable without the sticky bit,
-/// `chmod(0o700)` fails (e.g. `EPERM` when owned by another UID), or non-owner permission bits remain.
+/// Fails closed if `path` is a symlink (or traverses a non-root symlink), `chmod(0o700)` fails,
+/// non-owner permission bits remain, `path` is not owned by the current effective UID (covering
+/// `euid == 0` / `CAP_FOWNER`), or any ancestor is owned by an untrusted UID (preventing
+/// attacker-owned `0o1777` sticky directory replacement) or writable without the sticky bit.
 #[cfg(feature = "compiler")]
 fn ensure_private_cache_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).with_context(|| format!("creating cache dir {}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let proc_euid = std::fs::metadata("/proc/self").ok().map(|m| m.uid());
+        let mut prefix = PathBuf::new();
+        for comp in path.components() {
+            prefix.push(comp);
+            if let Ok(m) = std::fs::symlink_metadata(&prefix)
+                && m.file_type().is_symlink()
+                && m.uid() != 0
+            {
+                bail!(
+                    "wtime-aot cache hierarchy traverses non-root symlink {} (in {})",
+                    prefix.display(),
+                    path.display()
+                );
+            }
+        }
         let sym = std::fs::symlink_metadata(path).with_context(|| format!("lstat cache dir {}", path.display()))?;
         ensure!(
             !sym.file_type().is_symlink() && sym.file_type().is_dir(),
@@ -225,12 +259,34 @@ fn ensure_private_cache_dir(path: &Path) -> Result<()> {
             "wtime-aot cache directory must be owner-only (0700): {}",
             path.display()
         );
+        let expected_uid = match proc_euid {
+            Some(euid) => {
+                ensure!(
+                    post.uid() == euid,
+                    "wtime-aot cache directory {} owner uid {} does not match effective uid {euid}",
+                    path.display(),
+                    post.uid()
+                );
+                euid
+            }
+            None => post.uid(),
+        };
         let canon = std::fs::canonicalize(path).with_context(|| format!("canonicalizing {}", path.display()))?;
         for anc in canon.ancestors().skip(1) {
-            let mode = std::fs::metadata(anc)
-                .with_context(|| format!("stat cache ancestor {}", anc.display()))?
-                .permissions()
-                .mode();
+            let am = std::fs::symlink_metadata(anc)
+                .with_context(|| format!("lstat cache ancestor {}", anc.display()))?;
+            ensure!(
+                !am.file_type().is_symlink() && am.file_type().is_dir(),
+                "wtime-aot cache ancestor {} is not a real directory",
+                anc.display()
+            );
+            let uid = am.uid();
+            ensure!(
+                uid == 0 || uid == expected_uid,
+                "wtime-aot cache ancestor {} is owned by untrusted uid {uid} (expected 0 or {expected_uid})",
+                anc.display()
+            );
+            let mode = am.permissions().mode();
             ensure!(
                 (mode & 0o022) == 0 || (mode & 0o1000) != 0,
                 "wtime-aot cache ancestor {} is writable without sticky bit",
@@ -241,14 +297,29 @@ fn ensure_private_cache_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Checks that an existing verified `.so` is a non-symlink regular file with no write bits set.
+#[cfg(feature = "compiler")]
+fn is_immutable_regular_file(meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o222 != 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Atomically publishes `bytes` into `verified_dir/<so_sha>.so` with `0o555` permissions via
 /// `rename(&tmp, &dest)` (never `remove_file(&dest)` so there is no missing-file window).
 #[cfg(feature = "compiler")]
 fn publish_immutable_verified_so(verified_dir: &Path, so_sha: &str, bytes: &[u8], seq: u64) -> Result<PathBuf> {
     let dest = verified_dir.join(format!("{so_sha}.so"));
     if let Ok(meta) = std::fs::symlink_metadata(&dest)
-        && !meta.file_type().is_symlink()
-        && meta.file_type().is_file()
+        && is_immutable_regular_file(&meta)
         && file_sha256_hex(&dest).is_ok_and(|actual| actual == so_sha)
     {
         return Ok(dest);
@@ -374,11 +445,32 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-/// Canonical internal cache profile tag matching `wtime-aot --backend x64 --target-cpu`.
-///
-/// NOTE: `x64-v2` / `x64-v3` are internal compiler feature profiles (SSE4.1+POPCNT vs
-/// SSE4.1+POPCNT+ABM/LZCNT+BMI1/TZCNT) for Linux x86-64 SysV LP64 (excluding x32 ILP32),
-/// not full psABI levels.
+#[cfg(feature = "compiler")]
+fn rustc_version_fingerprint(toolchain: &str) -> String {
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(toolchain).cloned() {
+        return hit;
+    }
+    let plus = format!("+{toolchain}");
+    let out = Command::new("rustc")
+        .args([&plus, "-vV"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .or_else(|| Command::new("rustc").arg("-vV").output().ok().filter(|o| o.status.success()));
+    let fp = match out {
+        Some(o) => wasm_sha256_hex(&o.stdout)[..16].to_string(),
+        None => "no-rustc".to_string(),
+    };
+    cache.lock().unwrap_or_else(|p| p.into_inner()).insert(toolchain.to_string(), fp.clone());
+    fp
+}
+
+/// Canonical internal cache profile tag matching `wtime-aot --backend x64 --target-cpu`,
+/// also checking host CPU capability (`SSE4.1 + POPCNT`, plus `ABM/LZCNT + BMI1` for `x64-v3`)
+/// BEFORE cache lookup so unsupported Linux x86-64 LP64 CPUs fail with a typed `UnsupportedIsaError`
+/// while `wasm` & `cache` are still available for default-path fallback.
 #[cfg(feature = "compiler")]
 fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64")))]
@@ -387,24 +479,41 @@ fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
         bail!("wtime-aot --backend x64 is only supported on Linux x86_64 LP64 hosts")
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
-    match target_cpu {
-        "native" => {
-            if std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("bmi1") {
-                Ok("x64-v3")
-            } else {
-                Ok("x64-v2")
+    {
+        if !std::is_x86_feature_detected!("sse4.1") || !std::is_x86_feature_detected!("popcnt") {
+            return Err(anyhow::Error::new(UnsupportedIsaError(
+                "host CPU lacks baseline SSE4.1 + POPCNT required by wtime-aot --backend x64".into(),
+            )));
+        }
+        let tag = match target_cpu {
+            "native" => {
+                if std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("bmi1") {
+                    "x64-v3"
+                } else {
+                    "x64-v2"
+                }
             }
+            "x86-64-v2" | "generic" => "x64-v2",
+            "x86-64-v3" | "x86-64-v4" | "haswell" | "broadwell" | "skylake" | "skylake-avx512" | "cascadelake"
+            | "cooperlake" | "cannonlake" | "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake"
+            | "alderlake" | "raptorlake" | "sapphirerapids" | "emeraldrapids" | "graniterapids" => "x64-v3",
+            other
+                if other
+                    .strip_prefix("znver")
+                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) =>
+            {
+                "x64-v3"
+            }
+            other => bail!(
+                "unsupported PEN_WTIME_AOT_TARGET_CPU={other:?} (expected native, x86-64-v2, generic, x86-64-v3, x86-64-v4, znver<N>, or haswell+)"
+            ),
+        };
+        if tag == "x64-v3" && (!std::is_x86_feature_detected!("lzcnt") || !std::is_x86_feature_detected!("bmi1")) {
+            return Err(anyhow::Error::new(UnsupportedIsaError(format!(
+                "host CPU lacks ABM/LZCNT + BMI1 required by PEN_WTIME_AOT_TARGET_CPU={target_cpu:?}"
+            ))));
         }
-        "x86-64-v2" | "generic" => Ok("x64-v2"),
-        "x86-64-v3" | "x86-64-v4" | "haswell" | "broadwell" | "skylake" | "skylake-avx512" | "cascadelake"
-        | "cooperlake" | "cannonlake" | "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake"
-        | "alderlake" | "raptorlake" | "sapphirerapids" | "emeraldrapids" | "graniterapids" => Ok("x64-v3"),
-        other if other.strip_prefix("znver").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) => {
-            Ok("x64-v3")
-        }
-        other => bail!(
-            "unsupported PEN_WTIME_AOT_TARGET_CPU={other:?} (expected native, x86-64-v2, generic, x86-64-v3, x86-64-v4, znver<N>, or haswell+)"
-        ),
+        Ok(tag)
     }
 }
 
@@ -430,7 +539,7 @@ fn try_load_warm_verified_so(
     }
     let verified_so = verified_dir.join(format!("{rec_so_sha}.so"));
     let sym = std::fs::symlink_metadata(&verified_so).ok()?;
-    if sym.file_type().is_symlink() || !sym.file_type().is_file() {
+    if !is_immutable_regular_file(&sym) {
         return None;
     }
     let canon_verified = std::fs::canonicalize(&verified_so).ok()?;
@@ -495,7 +604,11 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
             } else {
                 sanitize_key_part(&target_cpu)
             };
-            format!("rust-{}-{cpu_tag}", sanitize_key_part(&toolchain))
+            format!(
+                "rust-{}-{cpu_tag}-{}",
+                sanitize_key_part(&toolchain),
+                rustc_version_fingerprint(&toolchain)
+            )
         }
         "x64" => format!("x64-{}", resolved_x64_isa_tag(&target_cpu)?),
         other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
@@ -546,14 +659,16 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
     }
 
     // Mismatch or stale entry under the exclusive lock (no reader can be mid-`dlopen`):
-    // serialize builder artifact removal under `entry/.publish.lock` and unlink `fast_link`.
+    // restrict deletion strictly to `<canon_cache>/<entry>/library.so` (+ sidecar) serialized
+    // under `entry/.publish.lock`, so a corrupt `fast_link` can never unlink `.cache.lock` or `verified/*.so`.
     if let Ok(recorded) = std::fs::read_to_string(&fast_link) {
         let mut lines = recorded.lines();
         if let (Some(_), Some(_), Some(rec_path)) = (lines.next(), lines.next(), lines.next()) {
             let so_path = PathBuf::from(rec_path.trim());
             if let Ok(canon_so) = std::fs::canonicalize(&so_path)
-                && canon_so.starts_with(&canon_cache)
+                && canon_so.file_name() == Some(std::ffi::OsStr::new("library.so"))
                 && let Some(entry_dir) = canon_so.parent()
+                && entry_dir.parent() == Some(canon_cache.as_path())
             {
                 let entry_lock_path = entry_dir.join(".publish.lock");
                 let _entry_lock = std::fs::File::options()
@@ -1599,6 +1714,10 @@ impl AotGuest {
         if std::mem::replace(&mut self.disposed, true) {
             return Ok(());
         }
+        self.with_host_mut(|host| {
+            host.pending_error = None;
+            host.pending_panic = None;
+        });
         let mut left = Ok(());
         if self.abi.ownership {
             left = self.call_export_raw(OWNERSHIP_LEAVE, u64::from(TEARDOWN.cast_unsigned())).map(|_| ());

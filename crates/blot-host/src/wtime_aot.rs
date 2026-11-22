@@ -124,6 +124,8 @@ struct AotLibrary {
     syms: AotSymbols,
     imports: Vec<CallbackType>,
     counter_names: Vec<String>,
+    /// Declared memory 0 `(min_pages, max_pages)` parsed from the Wasm module, if any.
+    memory_limits: Option<(u64, Option<u64>)>,
 }
 
 // SAFETY: loaded C function pointers and immutable metadata are safe to share across threads.
@@ -206,25 +208,34 @@ fn sanitize_key_part(s: &str) -> String {
         .collect()
 }
 
-fn resolved_x64_isa_tag(target_cpu: &str) -> String {
+/// Canonical internal cache profile tag matching `wtime-aot --backend x64 --target-cpu`.
+///
+/// NOTE: `x64-v2` / `x64-v3` are internal compiler feature profiles (SSE4.1+POPCNT vs
+/// SSE4.1+POPCNT+ABM/LZCNT+BMI1/TZCNT), not full psABI levels.
+fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
     match target_cpu {
         "native" => {
             #[cfg(target_arch = "x86_64")]
             {
                 if std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("bmi1") {
-                    "x64-v3".to_string()
+                    Ok("x64-v3")
                 } else {
-                    "x64-v2".to_string()
+                    Ok("x64-v2")
                 }
             }
             #[cfg(not(target_arch = "x86_64"))]
             {
-                "x64-unsupported".to_string()
+                bail!("wtime-aot --backend x64 is only supported on x86_64 hosts")
             }
         }
-        "x86-64-v2" | "generic" => "x64-v2".to_string(),
-        "x86-64-v3" | "x86-64-v4" => "x64-v3".to_string(),
-        other => format!("x64-{}", sanitize_key_part(other)),
+        "x86-64-v2" | "generic" => Ok("x64-v2"),
+        "x86-64-v3" | "x86-64-v4" | "haswell" | "broadwell" | "skylake" | "skylake-avx512" | "cascadelake"
+        | "cooperlake" | "cannonlake" | "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake"
+        | "alderlake" | "raptorlake" | "sapphirerapids" | "emeraldrapids" | "graniterapids" => Ok("x64-v3"),
+        other if other.starts_with("znver") => Ok("x64-v3"),
+        other => bail!(
+            "unsupported PEN_WTIME_AOT_TARGET_CPU={other:?} (expected native, x86-64-v2, generic, x86-64-v3, x86-64-v4, znver*, or haswell+)"
+        ),
     }
 }
 
@@ -261,15 +272,23 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
     let fast_key = match backend.as_str() {
         "c" => format!("{digest}-c-{}-{stamp}", sanitize_key_part(&c_opt)),
         "rust" => format!("{digest}-rust-{}-{stamp}", sanitize_key_part(&toolchain)),
-        "x64" => format!("{digest}-x64-{}-{stamp}", resolved_x64_isa_tag(&target_cpu)),
+        "x64" => format!("{digest}-x64-{}-{stamp}", resolved_x64_isa_tag(&target_cpu)?),
         other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
     };
     let fast_dir = cache_dir.join("by-wasm");
     let fast_link = fast_dir.join(format!("{fast_key}.path"));
     if let Ok(recorded) = std::fs::read_to_string(&fast_link) {
-        let so_path = PathBuf::from(recorded.trim());
-        if so_path.is_file() {
-            return Ok(so_path);
+        let mut lines = recorded.lines();
+        if let (Some(rec_key), Some(rec_path)) = (lines.next(), lines.next())
+            && rec_key == fast_key
+        {
+            let so_path = PathBuf::from(rec_path.trim());
+            if let (Ok(canon_cache), Ok(canon_so)) = (std::fs::canonicalize(&cache_dir), std::fs::canonicalize(&so_path))
+                && canon_so.starts_with(&canon_cache)
+                && canon_so.is_file()
+            {
+                return Ok(canon_so);
+            }
         }
     }
 
@@ -306,7 +325,7 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
     let _ = std::fs::create_dir_all(&fast_dir);
     let tmp_link = fast_dir.join(format!(".{fast_key}.{}.{seq}.tmp", std::process::id()));
     if let Ok(mut file) = std::fs::File::options().write(true).create_new(true).open(&tmp_link) {
-        let written = file.write_all(format!("{}\n", so_path.display()).as_bytes());
+        let written = file.write_all(format!("{fast_key}\n{}\n", so_path.display()).as_bytes());
         drop(file);
         if written.is_err() || std::fs::rename(&tmp_link, &fast_link).is_err() {
             let _ = std::fs::remove_file(&tmp_link);
@@ -339,10 +358,23 @@ fn counter_export_names(_wasm: &[u8], _abi: &GuestAbi) -> Vec<String> {
 }
 
 #[cfg(feature = "compiler")]
-fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<()> {
-    let adapters: Vec<String> = abi.callbacks().into_iter().map(CallbackType::import_name).collect();
+fn wasmparser_val(value: ValueType) -> wasmparser::ValType {
+    match value {
+        ValueType::F32 => wasmparser::ValType::F32,
+        _ => wasmparser::ValType::I32,
+    }
+}
+
+/// Validates every import, entrypoint, constant, arena, ownership, and finish-invocation
+/// Wasm signature before cache lookup or compilation, matching Wasmtime's exact ABI checks.
+/// Returns the declared `(min_pages, max_pages)` of memory 0, if present.
+#[cfg(feature = "compiler")]
+fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<Option<(u64, Option<u64>)>> {
+    let callbacks = abi.callbacks();
     let mut types: Vec<Option<wasmparser::FuncType>> = Vec::new();
     let mut func_type_idxs: Vec<u32> = Vec::new();
+    let mut global_types: Vec<wasmparser::ValType> = Vec::new();
+    let mut memory_limits: Option<(u64, Option<u64>)> = None;
     let mut exports = std::collections::HashMap::new();
 
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
@@ -361,20 +393,51 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<()> {
             wasmparser::Payload::ImportSection(section) => {
                 for import in section.into_imports() {
                     let import = import?;
+                    ensure!(import.module == HOST_MODULE, "invalid_abi: unexpected import {}::{}", import.module, import.name);
+                    let cb = callbacks
+                        .iter()
+                        .copied()
+                        .find(|cb| cb.import_name() == import.name)
+                        .ok_or_else(|| anyhow!("invalid_abi: unexpected import {}::{}", import.module, import.name))?;
+                    let wasmparser::TypeRef::Func(ti) = import.ty else {
+                        bail!("invalid_abi: import {}::{} must be a plain function", import.module, import.name);
+                    };
+                    let fty = types
+                        .get(ti as usize)
+                        .and_then(|o| o.as_ref())
+                        .ok_or_else(|| anyhow!("invalid_abi: import {}::{} has invalid type index {ti}", import.module, import.name))?;
+                    let expected_params = [wasmparser::ValType::EXTERNREF, wasmparser_val(cb.parameter)];
+                    let expected_results = [wasmparser_val(cb.result)];
                     ensure!(
-                        import.module == HOST_MODULE && adapters.iter().any(|name| name == import.name),
-                        "invalid_abi: unexpected import {}::{}",
+                        fty.params() == expected_params && fty.results() == expected_results,
+                        "invalid_abi: import {}::{} signature mismatch (got {:?} -> {:?}, expected {:?} -> {:?})",
                         import.module,
-                        import.name
+                        import.name,
+                        fty.params(),
+                        fty.results(),
+                        expected_params,
+                        expected_results
                     );
-                    if let wasmparser::TypeRef::Func(ti) | wasmparser::TypeRef::FuncExact(ti) = import.ty {
-                        func_type_idxs.push(ti);
-                    }
+                    func_type_idxs.push(ti);
                 }
             }
             wasmparser::Payload::FunctionSection(section) => {
                 for ti in section {
                     func_type_idxs.push(ti?);
+                }
+            }
+            wasmparser::Payload::MemorySection(section) => {
+                for mem in section {
+                    let mem = mem?;
+                    if memory_limits.is_none() {
+                        memory_limits = Some((mem.initial, mem.maximum));
+                    }
+                }
+            }
+            wasmparser::Payload::GlobalSection(section) => {
+                for g in section {
+                    let g = g?;
+                    global_types.push(g.ty.content_type);
                 }
             }
             wasmparser::Payload::ExportSection(section) => {
@@ -387,32 +450,71 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<()> {
         }
     }
 
+    let lookup_func_sig = |fidx: u32| -> Option<&wasmparser::FuncType> {
+        func_type_idxs
+            .get(fidx as usize)
+            .and_then(|&ti| types.get(ti as usize))
+            .and_then(|o| o.as_ref())
+    };
+
     for function in &abi.functions {
+        let Some((wasmparser::ExternalKind::Func, fidx)) = exports.get(&function.name).copied() else {
+            bail!("invalid_abi: missing function export {}", function.name);
+        };
+        let fty = lookup_func_sig(fidx)
+            .ok_or_else(|| anyhow!("invalid_abi: function export {} has invalid type", function.name))?;
+        let expected_param = match function.parameter {
+            Parameter::Callback(_) => wasmparser::ValType::EXTERNREF,
+            Parameter::Value(v) => wasmparser_val(v),
+        };
+        let expected_result = wasmparser_val(function.result);
         ensure!(
-            exports.get(&function.name).is_some_and(|(k, _)| *k == wasmparser::ExternalKind::Func),
-            "invalid_abi: missing function export {}",
+            fty.params() == [expected_param] && fty.results() == [expected_result],
+            "invalid_abi: function export {} signature mismatch",
             function.name
         );
     }
     for constant in &abi.constants {
+        let Some((wasmparser::ExternalKind::Global, gidx)) = exports.get(&constant.name).copied() else {
+            bail!("invalid_abi: missing constant export {}", constant.name);
+        };
+        let expected_ty = wasmparser_val(constant.value);
         ensure!(
-            exports.get(&constant.name).is_some_and(|(k, _)| *k == wasmparser::ExternalKind::Global),
-            "invalid_abi: missing constant export {}",
+            global_types.get(gidx as usize) == Some(&expected_ty),
+            "invalid_abi: constant export {} has wrong global type",
             constant.name
         );
     }
     if abi.uses_arrays() {
-        for name in ["blot:memory", "blot:allocate", "blot:reset"] {
-            ensure!(exports.contains_key(name), "invalid_abi: missing array arena export {name}");
+        ensure!(
+            exports.get("blot:memory").is_some_and(|(k, _)| *k == wasmparser::ExternalKind::Memory),
+            "invalid_abi: missing array arena export blot:memory"
+        );
+        for name in ["blot:allocate", "blot:reset"] {
+            let Some((wasmparser::ExternalKind::Func, fidx)) = exports.get(name).copied() else {
+                bail!("invalid_abi: missing array arena export {name}");
+            };
+            let ok = lookup_func_sig(fidx)
+                .is_some_and(|fty| fty.params() == [wasmparser::ValType::I32] && fty.results() == [wasmparser::ValType::I32]);
+            ensure!(ok, "invalid_abi: invalid {name} signature");
         }
     }
     if abi.ownership {
-        for name in [OWNERSHIP_ENTER, OWNERSHIP_LEAVE] {
-            ensure!(
-                exports.get(name).is_some_and(|(k, _)| *k == wasmparser::ExternalKind::Func),
-                "invalid_abi: missing ownership export {name}"
-            );
-        }
+        let Some((wasmparser::ExternalKind::Func, enter_idx)) = exports.get(OWNERSHIP_ENTER).copied() else {
+            bail!("invalid_abi: missing ownership export {OWNERSHIP_ENTER}");
+        };
+        ensure!(
+            lookup_func_sig(enter_idx).is_some_and(|fty| fty.params().is_empty() && fty.results().is_empty()),
+            "invalid_abi: invalid {OWNERSHIP_ENTER} signature"
+        );
+        let Some((wasmparser::ExternalKind::Func, leave_idx)) = exports.get(OWNERSHIP_LEAVE).copied() else {
+            bail!("invalid_abi: missing ownership export {OWNERSHIP_LEAVE}");
+        };
+        ensure!(
+            lookup_func_sig(leave_idx)
+                .is_some_and(|fty| fty.params() == [wasmparser::ValType::I32] && fty.results().is_empty()),
+            "invalid_abi: invalid {OWNERSHIP_LEAVE} signature"
+        );
     }
     let invocation_finish = exports.get(INVOCATION_FINISH).copied();
     ensure!(
@@ -421,26 +523,33 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<()> {
     );
     if let Some((kind, fidx)) = invocation_finish {
         let valid_sig = kind == wasmparser::ExternalKind::Func
-            && func_type_idxs
-                .get(fidx as usize)
-                .and_then(|&ti| types.get(ti as usize))
-                .and_then(|opt| opt.as_ref())
+            && lookup_func_sig(fidx)
                 .is_some_and(|fty| fty.params().is_empty() && fty.results() == [wasmparser::ValType::I32]);
         ensure!(valid_sig, "invalid_abi: invalid {INVOCATION_FINISH} signature");
     }
-    Ok(())
+    Ok(memory_limits)
 }
 
 #[cfg(not(feature = "compiler"))]
-fn validate_aot_wasm(_wasm: &[u8], _abi: &GuestAbi) -> Result<()> {
-    Ok(())
+fn validate_aot_wasm(_wasm: &[u8], _abi: &GuestAbi) -> Result<Option<(u64, Option<u64>)>> {
+    Ok(None)
+}
+
+fn read_aot_str<'a>(ptr: *const u8, len: usize) -> Result<&'a str> {
+    if len == 0 {
+        return Ok("");
+    }
+    ensure!(!ptr.is_null(), "invalid_abi: null string pointer with non-zero length {len}");
+    // SAFETY: caller guarantees `(ptr, len)` is a valid static byte range from the loaded `.so`.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    std::str::from_utf8(bytes).context("invalid_abi: non-UTF-8 string returned by AOT library")
 }
 
 impl AotModule {
     pub fn compile(wasm: &[u8], abi: &GuestAbi, cache: Option<&Path>) -> Result<Self> {
         ensure!(abi.tasks.is_none(), "wtime-aot experimental backend does not support legacy tasks");
         abi.check_hostable()?;
-        validate_aot_wasm(wasm, abi)?;
+        let memory_limits = validate_aot_wasm(wasm, abi)?;
         let so_path = build_or_find_so(wasm, cache)?;
         // SAFETY: `so_path` was built locally by `wtime-aot` from validated Wasm.
         let lib = unsafe { Library::new(&so_path) }
@@ -457,8 +566,8 @@ impl AotModule {
         for idx in 0..n_imports {
             let (mut mp, mut ml, mut np, mut nl) = (std::ptr::null(), 0, std::ptr::null(), 0);
             ensure!(unsafe { import_name_fn(idx, &mut mp, &mut ml, &mut np, &mut nl) } == 0, "bad import index {idx}");
-            let module = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(mp, ml)) };
-            let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(np, nl)) };
+            let module = read_aot_str(mp, ml)?;
+            let name = read_aot_str(np, nl)?;
             ensure!(module == HOST_MODULE, "invalid_abi: unexpected import {module}::{name}");
             let sig = callbacks
                 .iter()
@@ -488,7 +597,7 @@ impl AotModule {
             }
         };
         let counter_names = counter_export_names(wasm, abi);
-        Ok(Self { lib: Arc::new(AotLibrary { _lib: lib, syms, imports, counter_names }) })
+        Ok(Self { lib: Arc::new(AotLibrary { _lib: lib, syms, imports, counter_names, memory_limits }) })
     }
 }
 
@@ -611,7 +720,7 @@ fn aot_to_bits(
     spare: &mut Vec<u32>,
     value: Value,
     allocate: impl FnOnce(i32) -> Result<i32>,
-    mem_mut: impl FnOnce() -> &'static mut [u8],
+    with_mem_mut: impl FnOnce(&mut dyn FnMut(&mut [u8]) -> Result<()>) -> Result<()>,
 ) -> Result<u64> {
     let words: Vec<u32> = match value {
         Value::Unit => return Ok(0),
@@ -625,17 +734,19 @@ fn aot_to_bits(
     ensure!(words.len() < 1_073_741_823, "array byte count exceeds the Wasm32 address range");
     let length = u32::try_from(words.len())?;
     let pointer = allocate(((length + 1) * 4).cast_signed())?;
-    let memory = mem_mut();
-    let address = array_range(memory.len(), pointer, words.len())?;
-    memory[address..address + 4].copy_from_slice(&length.to_le_bytes());
-    let body = &mut memory[address + 4..address + 4 + words.len() * 4];
-    if cfg!(target_endian = "little") {
-        body.copy_from_slice(bytemuck::cast_slice(&words));
-    } else {
-        for (chunk, word) in body.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
-            *chunk = word.to_le_bytes();
+    with_mem_mut(&mut |memory: &mut [u8]| {
+        let address = array_range(memory.len(), pointer, words.len())?;
+        memory[address..address + 4].copy_from_slice(&length.to_le_bytes());
+        let body = &mut memory[address + 4..address + 4 + words.len() * 4];
+        if cfg!(target_endian = "little") {
+            body.copy_from_slice(bytemuck::cast_slice(&words));
+        } else {
+            for (chunk, word) in body.as_chunks_mut::<4>().0.iter_mut().zip(&words) {
+                *chunk = word.to_le_bytes();
+            }
         }
-    }
+        Ok(())
+    })?;
     *spare = words;
     Ok(u64::from(pointer.cast_unsigned()))
 }
@@ -757,16 +868,17 @@ fn invoke_aot_import(
                 _ => bail!("invalid_abi: missing blot:allocate"),
             }
         },
-        || {
+        |write| {
             let mut p: *mut u8 = std::ptr::null_mut();
             let mut n: usize = 0;
             unsafe { (lib.syms.active_mem_data)(active_call, &mut p, &mut n) };
-            if n == 0 || p.is_null() {
-                &mut []
+            let slice = if n == 0 || p.is_null() {
+                &mut [][..]
             } else {
-                // SAFETY: `active_call` uniquely borrows guest linear memory for this write.
+                // SAFETY: `active_call` uniquely borrows guest linear memory for this scoped write.
                 unsafe { std::slice::from_raw_parts_mut(p, n) }
-            }
+            };
+            write(slice)
         },
     );
     // Short borrow #4: restore `spare` buffer.
@@ -815,6 +927,34 @@ impl AotGuest {
         imaged: Arc<Result<Vec<String>, String>>,
         limits: Option<Limits>,
     ) -> Result<Self> {
+        let limit_pages = match limits {
+            Some(lim) => {
+                let max_allowed_pages = u64::try_from(lim.memory / PAGE).unwrap_or(u64::MAX);
+                if let Some((min_p, max_p)) = module.lib.memory_limits {
+                    let initial_bytes = min_p.saturating_mul(PAGE as u64);
+                    if initial_bytes > lim.memory as u64 {
+                        bail!("memory_limit: guest initial memory ({initial_bytes} B) exceeds limit ({} B)", lim.memory);
+                    }
+                    if max_allowed_pages == 0 {
+                        // Blot ABI v1 reserves `mem_limit_pages == 0` as unlimited; reject growable memories
+                        // BEFORE `blot_aot_new` (so `start` never runs and `memory.grow` cannot bypass a <64 KiB cap).
+                        if max_p != Some(0) {
+                            bail!(
+                                "memory_limit: wtime-aot ABI v1 cannot enforce sub-page limit ({} B) on growable memory",
+                                lim.memory
+                            );
+                        }
+                        1
+                    } else {
+                        max_allowed_pages
+                    }
+                } else {
+                    // Module declares no memory; pass a non-zero page cap safely.
+                    max_allowed_pages.max(1)
+                }
+            }
+            None => 0,
+        };
         let host_ptr = Box::into_raw(Box::new(AotHostBox {
             in_trampoline: AtomicBool::new(false),
             state: UnsafeCell::new(AotHostState {
@@ -827,10 +967,6 @@ impl AotGuest {
                 uses_arrays: abi.uses_arrays(),
             }),
         }));
-        let limit_pages = match limits {
-            Some(lim) => u64::try_from(lim.memory / PAGE).unwrap_or(u64::MAX).max(1),
-            None => 0,
-        };
         let mut trap_code = 0u8;
         let handle = unsafe {
             (module.lib.syms.new)(host_ptr.cast::<c_void>(), Some(host_callback_trampoline), limit_pages, &mut trap_code)
@@ -940,6 +1076,7 @@ impl AotGuest {
 
     fn begin_and_run(&mut self, function: &GuestFunction, argument: Argument) -> Result<Value> {
         let name = &function.name;
+        self.with_host_mut(|host| host.pending_error = None);
         if self.abi.ownership {
             self.call_export_raw(OWNERSHIP_ENTER, 0)?;
             self.entered = true;
@@ -953,6 +1090,7 @@ impl AotGuest {
                 let lib = self.lib.clone();
                 let handle = self.handle.0;
                 let (uses_arrays, mut spare) = self.with_host_mut(|host| (host.uses_arrays, std::mem::take(&mut host.spare)));
+                let mut alloc_host_err = false;
                 let encoded = aot_to_bits(
                     uses_arrays,
                     &mut spare,
@@ -964,22 +1102,33 @@ impl AotGuest {
                         match rc {
                             0 => Ok(ptr_out),
                             1 => Err(lib.trap_error(trap_code)),
-                            2 => Err(anyhow!("host error during blot:allocate")),
+                            2 => {
+                                alloc_host_err = true;
+                                Err(lib.trap_error(trap_code))
+                            }
                             _ => bail!("invalid_abi: missing blot:allocate"),
                         }
                     },
-                    || {
+                    |write| {
                         let mut p: *mut u8 = std::ptr::null_mut();
                         let mut n: usize = 0;
                         unsafe { (lib.syms.mem_data)(handle, &mut p, &mut n) };
-                        if n == 0 || p.is_null() {
-                            &mut []
+                        let slice = if n == 0 || p.is_null() {
+                            &mut [][..]
                         } else {
+                            // SAFETY: `handle` uniquely owns guest linear memory for this scoped write.
                             unsafe { std::slice::from_raw_parts_mut(p, n) }
-                        }
+                        };
+                        write(slice)
                     },
                 );
-                self.with_host_mut(|host| host.spare = spare);
+                let pending = self.with_host_mut(|host| {
+                    host.spare = spare;
+                    if alloc_host_err { host.pending_error.take() } else { None }
+                });
+                if let Some(err) = pending {
+                    return Err(err);
+                }
                 encoded?
             }
             (Parameter::Callback(signature), Argument::Callback(callback)) => {

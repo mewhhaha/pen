@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use libloading::Library;
-use pen_runtime::abi::{CallbackType, GuestAbi, GuestFunction, Parameter, ValueType};
+use pen_runtime::abi::{CallbackType, GuestAbi, GuestFunction, INVOCATION_FINISH, Parameter, ValueType};
 use pen_runtime::memory_image::{Captured, MemoryImage, PAGE};
 use wasmtime::Val;
 
@@ -338,10 +338,109 @@ fn counter_export_names(_wasm: &[u8], _abi: &GuestAbi) -> Vec<String> {
     Vec::new()
 }
 
+#[cfg(feature = "compiler")]
+fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<()> {
+    let adapters: Vec<String> = abi.callbacks().into_iter().map(CallbackType::import_name).collect();
+    let mut types: Vec<Option<wasmparser::FuncType>> = Vec::new();
+    let mut func_type_idxs: Vec<u32> = Vec::new();
+    let mut exports = std::collections::HashMap::new();
+
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload? {
+            wasmparser::Payload::TypeSection(section) => {
+                for group in section {
+                    for st in group?.into_types() {
+                        let fty = match st.composite_type.inner {
+                            wasmparser::CompositeInnerType::Func(f) => Some(f),
+                            _ => None,
+                        };
+                        types.push(fty);
+                    }
+                }
+            }
+            wasmparser::Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    let import = import?;
+                    ensure!(
+                        import.module == HOST_MODULE && adapters.iter().any(|name| name == import.name),
+                        "invalid_abi: unexpected import {}::{}",
+                        import.module,
+                        import.name
+                    );
+                    if let wasmparser::TypeRef::Func(ti) | wasmparser::TypeRef::FuncExact(ti) = import.ty {
+                        func_type_idxs.push(ti);
+                    }
+                }
+            }
+            wasmparser::Payload::FunctionSection(section) => {
+                for ti in section {
+                    func_type_idxs.push(ti?);
+                }
+            }
+            wasmparser::Payload::ExportSection(section) => {
+                for export in section {
+                    let export = export?;
+                    exports.insert(export.name.to_owned(), (export.kind, export.index));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for function in &abi.functions {
+        ensure!(
+            exports.get(&function.name).is_some_and(|(k, _)| *k == wasmparser::ExternalKind::Func),
+            "invalid_abi: missing function export {}",
+            function.name
+        );
+    }
+    for constant in &abi.constants {
+        ensure!(
+            exports.get(&constant.name).is_some_and(|(k, _)| *k == wasmparser::ExternalKind::Global),
+            "invalid_abi: missing constant export {}",
+            constant.name
+        );
+    }
+    if abi.uses_arrays() {
+        for name in ["blot:memory", "blot:allocate", "blot:reset"] {
+            ensure!(exports.contains_key(name), "invalid_abi: missing array arena export {name}");
+        }
+    }
+    if abi.ownership {
+        for name in [OWNERSHIP_ENTER, OWNERSHIP_LEAVE] {
+            ensure!(
+                exports.get(name).is_some_and(|(k, _)| *k == wasmparser::ExternalKind::Func),
+                "invalid_abi: missing ownership export {name}"
+            );
+        }
+    }
+    let invocation_finish = exports.get(INVOCATION_FINISH).copied();
+    ensure!(
+        invocation_finish.is_some() == abi.invocation_finish,
+        "invalid_abi: {INVOCATION_FINISH} must match the invocation finish section"
+    );
+    if let Some((kind, fidx)) = invocation_finish {
+        let valid_sig = kind == wasmparser::ExternalKind::Func
+            && func_type_idxs
+                .get(fidx as usize)
+                .and_then(|&ti| types.get(ti as usize))
+                .and_then(|opt| opt.as_ref())
+                .is_some_and(|fty| fty.params().is_empty() && fty.results() == [wasmparser::ValType::I32]);
+        ensure!(valid_sig, "invalid_abi: invalid {INVOCATION_FINISH} signature");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "compiler"))]
+fn validate_aot_wasm(_wasm: &[u8], _abi: &GuestAbi) -> Result<()> {
+    Ok(())
+}
+
 impl AotModule {
     pub fn compile(wasm: &[u8], abi: &GuestAbi, cache: Option<&Path>) -> Result<Self> {
         ensure!(abi.tasks.is_none(), "wtime-aot experimental backend does not support legacy tasks");
         abi.check_hostable()?;
+        validate_aot_wasm(wasm, abi)?;
         let so_path = build_or_find_so(wasm, cache)?;
         // SAFETY: `so_path` was built locally by `wtime-aot` from validated Wasm.
         let lib = unsafe { Library::new(&so_path) }
@@ -744,6 +843,15 @@ impl AotGuest {
             }
             return Err(module.lib.trap_error(trap_code));
         }
+        if let Some(lim) = limits {
+            let (mut p, mut n) = (std::ptr::null_mut(), 0usize);
+            unsafe { (module.lib.syms.mem_data)(handle, &mut p, &mut n) };
+            if n > lim.memory {
+                unsafe { (module.lib.syms.drop)(handle) };
+                unsafe { drop(Box::from_raw(host_ptr)) };
+                bail!("memory_limit: guest initial memory ({n} B) exceeds limit ({} B)", lim.memory);
+            }
+        }
         Ok(Self {
             lib: module.lib.clone(),
             handle: SendPtr(handle),
@@ -974,18 +1082,18 @@ impl AotGuest {
     pub fn restore(&mut self, image: &GuestImage) -> Result<usize> {
         ensure!(!self.disposed, "disposed_guest: the guest instance is disposed");
         let mut written = 0;
-        if self.abi.uses_arrays() {
-            let current = self.memory_bytes();
+        if !image.memory.is_empty() {
+            let (mut p, mut current) = (std::ptr::null_mut(), 0usize);
+            unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut current) };
             let missing = image.memory.len().saturating_sub(current);
             if missing > 0 {
                 let delta = u64::try_from(missing.div_ceil(PAGE))?;
                 let old = unsafe { (self.lib.syms.mem_grow)(self.handle.0, delta) };
                 ensure!(old >= 0, "failed to grow guest memory during restore");
+                unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut current) };
             }
-            let (mut p, mut n) = (std::ptr::null_mut(), 0usize);
-            unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut n) };
-            if n > 0 && !p.is_null() {
-                let bytes = unsafe { std::slice::from_raw_parts_mut(p, n) };
+            if current > 0 && !p.is_null() {
+                let bytes = unsafe { std::slice::from_raw_parts_mut(p, current) };
                 written = image.memory.restore(bytes);
             }
         }

@@ -152,7 +152,7 @@ impl GuestModule {
         {
             let abi = Arc::new(read_abi(wasm)?);
             let use_aot = if prefer_aot { wtime_aot::preferred_for_run() } else { wtime_aot::enabled() };
-            let module = if use_aot && !samples(engine) && abi.tasks.is_none() {
+            let module = if use_aot && !is_ticking_engine(engine) && abi.tasks.is_none() {
                 CompiledModule::WtimeAot(wtime_aot::AotModule::compile(wasm, &abi, cache)?)
             } else {
                 let module = compile(engine, wasm, cache)?;
@@ -1358,12 +1358,36 @@ fn config(inlining: bool) -> wasmtime::Config {
     config
 }
 
+/// Epoch-ticking engines registered by [`ticking`] (including [`dev_engine`]);
+/// guests compiled for them stay on Wasmtime so deadlines and sampling always work.
+#[cfg(feature = "compiler")]
+static TICKING_ENGINES: std::sync::Mutex<Vec<wasmtime::EngineWeak>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether `engine` was created with epoch ticking (deadlines/sampling), so it
+/// must stay on Wasmtime rather than unmetered AOT.
+#[cfg(feature = "compiler")]
+fn is_ticking_engine(engine: &Engine) -> bool {
+    let mut engines = TICKING_ENGINES.lock().unwrap_or_else(|p| p.into_inner());
+    let mut found = false;
+    engines.retain(|weak| match weak.upgrade() {
+        Some(live) => {
+            if Engine::same(&live, engine) {
+                found = true;
+            }
+            true
+        }
+        None => false,
+    });
+    found || samples(engine)
+}
+
 /// `engine`, its epoch advanced [`DEADLINE_TICKS`] times per `deadline` by a
 /// thread that ends with it, for an engine whose code checks it.
 #[cfg(feature = "compiler")]
 fn ticking(engine: Engine, deadline: Duration) -> Result<Engine> {
     let tick = deadline / DEADLINE_TICKS;
     let weak = engine.weak();
+    TICKING_ENGINES.lock().unwrap_or_else(|p| p.into_inner()).push(engine.weak());
     std::thread::Builder::new().name("blot-deadline".into()).spawn(move || {
         while let Some(engine) = weak.upgrade() {
             engine.increment_epoch();

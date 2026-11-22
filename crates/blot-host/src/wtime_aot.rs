@@ -1,18 +1,21 @@
 //! `wtime-aot` backend for Blot ABI 8 guest modules.
 //!
 //! Used by default for `pen run` builds when `wtime-aot` is available (disable
-//! with `PEN_WTIME_AOT=0`), or everywhere when `PEN_WTIME_AOT=1`. Compiles the
-//! guest Wasm module once via `wtime-aot build --backend c --c-opt auto --blot-cdylib`
-//! (override backend with `PEN_WTIME_AOT_BACKEND=rust|c` and optimization mode
-//! with `PEN_WTIME_AOT_C_OPT=auto|O2|O1|O0`) into a cached shared library, then
-//! loads it with `libloading` and drives the exact same Blot ABI 8 lifecycle,
+//! with `PEN_WTIME_AOT=0`), or for non-`dev_engine` engines when `PEN_WTIME_AOT=1`.
+//! Compiles the guest Wasm module once via `wtime-aot build --backend c --c-opt auto --blot-cdylib`
+//! (override backend with `PEN_WTIME_AOT_BACKEND=c|rust|x64`, C optimization mode
+//! with `PEN_WTIME_AOT_C_OPT=auto|O2|O1|O0`, and x64 target CPU with
+//! `PEN_WTIME_AOT_TARGET_CPU=native|x86-64-v2|x86-64-v3`) into a cached shared library,
+//! then loads it with `libloading` and drives the exact same Blot ABI 8 lifecycle,
 //! arena array copies, host callbacks, and snapshots as Wasmtime.
 
+use std::cell::UnsafeCell;
 use std::ffi::c_void;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use libloading::Library;
@@ -189,15 +192,44 @@ fn bin_stamp(bin: &Path) -> String {
     let Ok(meta) = std::fs::metadata(bin) else {
         return "unknown".to_string();
     };
-    let secs = meta
+    let (secs, nanos) = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_secs());
-    format!("{}-{secs}", meta.len())
+        .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()));
+    format!("{}-{secs}-{nanos}", meta.len())
+}
+
+fn sanitize_key_part(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+fn resolved_x64_isa_tag(target_cpu: &str) -> String {
+    match target_cpu {
+        "native" => {
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("bmi1") {
+                    "x64-v3".to_string()
+                } else {
+                    "x64-v2".to_string()
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                "x64-unsupported".to_string()
+            }
+        }
+        "x86-64-v2" | "generic" => "x64-v2".to_string(),
+        "x86-64-v3" | "x86-64-v4" => "x64-v3".to_string(),
+        other => format!("x64-{}", sanitize_key_part(other)),
+    }
 }
 
 fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
+    static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
     if let Ok(override_so) = std::env::var("PEN_WTIME_AOT_SO")
         && !override_so.is_empty()
     {
@@ -218,14 +250,19 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "stable".to_string());
+    let target_cpu = std::env::var("PEN_WTIME_AOT_TARGET_CPU")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "native".to_string());
 
     let cache_dir = default_cache_dir(cache);
     let digest = wasm_sha256_hex(wasm);
     let stamp = bin_stamp(&bin);
-    let fast_key = if backend == "c" {
-        format!("{digest}-c-{c_opt}-{stamp}")
-    } else {
-        format!("{digest}-{backend}-{toolchain}-{stamp}")
+    let fast_key = match backend.as_str() {
+        "c" => format!("{digest}-c-{}-{stamp}", sanitize_key_part(&c_opt)),
+        "rust" => format!("{digest}-rust-{}-{stamp}", sanitize_key_part(&toolchain)),
+        "x64" => format!("{digest}-x64-{}-{stamp}", resolved_x64_isa_tag(&target_cpu)),
+        other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
     };
     let fast_dir = cache_dir.join("by-wasm");
     let fast_link = fast_dir.join(format!("{fast_key}.path"));
@@ -237,7 +274,8 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
     }
 
     std::fs::create_dir_all(&cache_dir)?;
-    let tmp_wasm = cache_dir.join(format!("input-{}-{}.wasm", digest, std::process::id()));
+    let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_wasm = cache_dir.join(format!("input-{digest}-{}-{seq}.wasm", std::process::id()));
     std::fs::write(&tmp_wasm, wasm)?;
     let mut cmd = Command::new(&bin);
     cmd.args(["build"])
@@ -245,10 +283,17 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
         .args(["--cache"])
         .arg(&cache_dir)
         .args(["--backend", &backend, "--blot-cdylib"]);
-    if backend == "c" {
-        cmd.args(["--c-opt", &c_opt]);
-    } else {
-        cmd.args(["--toolchain", &toolchain]);
+    match backend.as_str() {
+        "c" => {
+            cmd.args(["--c-opt", &c_opt]);
+        }
+        "rust" => {
+            cmd.args(["--toolchain", &toolchain]);
+        }
+        "x64" => {
+            cmd.args(["--target-cpu", &target_cpu]);
+        }
+        _ => unreachable!(),
     }
     let output = cmd.output().with_context(|| format!("running wtime-aot ({})", bin.display()))?;
     let _ = std::fs::remove_file(&tmp_wasm);
@@ -259,7 +304,14 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
     let so_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
     ensure!(so_path.is_file(), "wtime-aot build did not produce {}", so_path.display());
     let _ = std::fs::create_dir_all(&fast_dir);
-    let _ = std::fs::write(&fast_link, format!("{}\n", so_path.display()));
+    let tmp_link = fast_dir.join(format!(".{fast_key}.{}.{seq}.tmp", std::process::id()));
+    if let Ok(mut file) = std::fs::File::options().write(true).create_new(true).open(&tmp_link) {
+        let written = file.write_all(format!("{}\n", so_path.display()).as_bytes());
+        drop(file);
+        if written.is_err() || std::fs::rename(&tmp_link, &fast_link).is_err() {
+            let _ = std::fs::remove_file(&tmp_link);
+        }
+    }
     Ok(so_path)
 }
 
@@ -355,6 +407,28 @@ struct AotHostState {
     uses_arrays: bool,
 }
 
+/// Heap-allocated host context shared with the AOT guest via raw `user_ctx`.
+///
+/// Stored behind a raw pointer in `AotGuest` (never `Box<AotHostState>`) and gated by
+/// `in_trampoline` so `&mut AotHostState` is NEVER live across any guest FFI call or
+/// reentrant callback (`active_allocate`), preventing Stacked/Tree Borrows aliasing UB.
+struct AotHostBox {
+    in_trampoline: AtomicBool,
+    state: UnsafeCell<AotHostState>,
+}
+
+struct SendHostPtr(*mut AotHostBox);
+// SAFETY: `AotHostBox` is owned exclusively by one `AotGuest`, `AotHostState: Send`, and
+// accesses are strictly serialized on the calling thread.
+unsafe impl Send for SendHostPtr {}
+
+struct TrampolineGuard<'a>(&'a AtomicBool);
+impl Drop for TrampolineGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 unsafe extern "C" fn host_callback_trampoline(
     user_ctx: *mut c_void,
     active_call: *mut c_void,
@@ -363,8 +437,17 @@ unsafe extern "C" fn host_callback_trampoline(
     arg_bits: u64,
     res_out: *mut u64,
 ) -> i32 {
-    let state = unsafe { &mut *(user_ctx as *mut AotHostState) };
-    match invoke_aot_import(state, active_call, import_idx, token, arg_bits) {
+    if user_ctx.is_null() {
+        return 1;
+    }
+    // SAFETY: `user_ctx` points to a live `AotHostBox` owned by `AotGuest` for the handle's lifetime.
+    let host_box = unsafe { &*(user_ctx as *const AotHostBox) };
+    if host_box.in_trampoline.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        // Reject nested host callbacks (e.g. from inside `active_allocate`) BEFORE forming `&mut AotHostState`.
+        return 1;
+    }
+    let _guard = TrampolineGuard(&host_box.in_trampoline);
+    match invoke_aot_import(host_box, active_call, import_idx, token, arg_bits) {
         Ok(bits) => {
             if !res_out.is_null() {
                 unsafe { *res_out = bits };
@@ -372,7 +455,8 @@ unsafe extern "C" fn host_callback_trampoline(
             0
         }
         Err(err) => {
-            state.pending_error = Some(err);
+            // SAFETY: `in_trampoline` is held exclusively and no `&mut AotHostState` is currently live.
+            unsafe { (*host_box.state.get()).pending_error = Some(err) };
             1
         }
     }
@@ -458,23 +542,38 @@ fn aot_to_bits(
 }
 
 fn invoke_aot_import(
-    state: &mut AotHostState,
+    host_box: &AotHostBox,
     active_call: *mut c_void,
     import_idx: u32,
     token: u64,
     arg_bits: u64,
 ) -> Result<u64> {
-    let signature = *state
-        .lib
-        .imports
-        .get(import_idx as usize)
-        .ok_or_else(|| anyhow!("unknown import index {import_idx}"))?;
-    let (export, expected) = match &state.active {
-        Some(active) if token != 0 && active.token == token => (active.export.clone(), active.signature),
-        _ => bail!("stale_capability: host call has no active capability reference"),
+    // Short borrow #1: extract metadata and move `spare` out so NO `&mut AotHostState` is live
+    // across any FFI call (`active_mem_data`, `active_get_global`, `callback`, or `active_allocate`).
+    let (signature, export, lib, uses_arrays, memory_gauge, probe, mut spare) = {
+        // SAFETY: `in_trampoline` is exclusively acquired by `host_callback_trampoline`.
+        let state = unsafe { &mut *host_box.state.get() };
+        let signature = *state
+            .lib
+            .imports
+            .get(import_idx as usize)
+            .ok_or_else(|| anyhow!("unknown import index {import_idx}"))?;
+        let (export, expected) = match &state.active {
+            Some(active) if token != 0 && active.token == token => (active.export.clone(), active.signature),
+            _ => bail!("stale_capability: host call has no active capability reference"),
+        };
+        ensure!(expected == signature, "capability_signature: host call signature does not match its capability");
+        (
+            signature,
+            export,
+            state.lib.clone(),
+            state.uses_arrays,
+            state.memory.clone(),
+            state.probe.clone(),
+            std::mem::take(&mut state.spare),
+        )
     };
-    ensure!(expected == signature, "capability_signature: host call signature does not match its capability");
-    let lib = state.lib.clone();
+
     let (mem_ptr, mem_len) = {
         let mut p: *mut u8 = std::ptr::null_mut();
         let mut n: usize = 0;
@@ -486,11 +585,17 @@ fn invoke_aot_import(
     } else {
         unsafe { std::slice::from_raw_parts(mem_ptr, mem_len) }
     };
-    let argument = aot_from_bits(mem_slice, state.uses_arrays, &mut state.spare, signature.parameter, arg_bits)?;
-    if let Some(gauge) = &state.memory {
+    let argument = match aot_from_bits(mem_slice, uses_arrays, &mut spare, signature.parameter, arg_bits) {
+        Ok(arg) => arg,
+        Err(err) => {
+            unsafe { (*host_box.state.get()).spare = spare };
+            return Err(err);
+        }
+    };
+    if let Some(gauge) = &memory_gauge {
         gauge.store(mem_len, Ordering::Relaxed);
     }
-    if let Some(probe) = state.probe.clone() {
+    if let Some(probe) = probe {
         let mut vals = Vec::with_capacity(lib.counter_names.len());
         for name in &lib.counter_names {
             let (mut val, mut kind) = (0u64, 0u8);
@@ -500,25 +605,47 @@ fn invoke_aot_import(
         }
         probe.called_host(mem_len, vals.into_iter());
     }
-    let mut callback = state
-        .active
-        .as_mut()
-        .and_then(|active| active.callback.take())
-        .ok_or_else(|| anyhow!("reentrant_call: cannot reenter an active guest instance"))?;
+
+    // Short borrow #2: take callback out before invoking it.
+    let mut callback = {
+        // SAFETY: `in_trampoline` is exclusively held and no other reference to `state` exists.
+        let state = unsafe { &mut *host_box.state.get() };
+        match state.active.as_mut().and_then(|active| active.callback.take()) {
+            Some(cb) => cb,
+            None => {
+                state.spare = spare;
+                bail!("reentrant_call: cannot reenter an active guest instance");
+            }
+        }
+    };
     let result = callback(argument);
-    if let Some(active) = state.active.as_mut() {
-        active.callback = Some(callback);
+    // Short borrow #3: restore callback immediately after invocation.
+    {
+        let state = unsafe { &mut *host_box.state.get() };
+        if let Some(active) = state.active.as_mut() {
+            active.callback = Some(callback);
+        }
     }
-    let result = result.with_context(|| format!("host_exception: host callback failed during {export}"))?;
-    ensure!(
-        result.kind() == signature.result,
-        "host_result: host callback during {export} returned {}, not {}",
-        result.kind(),
-        signature.result
-    );
-    aot_to_bits(
-        state.uses_arrays,
-        &mut state.spare,
+    let result = match result.with_context(|| format!("host_exception: host callback failed during {export}")) {
+        Ok(val) => val,
+        Err(err) => {
+            unsafe { (*host_box.state.get()).spare = spare };
+            return Err(err);
+        }
+    };
+    if result.kind() != signature.result {
+        unsafe { (*host_box.state.get()).spare = spare };
+        bail!(
+            "host_result: host callback during {export} returned {}, not {}",
+            result.kind(),
+            signature.result
+        );
+    }
+
+    // Zero `&mut AotHostState` references are live during `active_allocate` below.
+    let encoded = aot_to_bits(
+        uses_arrays,
+        &mut spare,
         result,
         |bytes| {
             let mut ptr_out = 0i32;
@@ -542,13 +669,16 @@ fn invoke_aot_import(
                 unsafe { std::slice::from_raw_parts_mut(p, n) }
             }
         },
-    )
+    );
+    // Short borrow #4: restore `spare` buffer.
+    unsafe { (*host_box.state.get()).spare = spare };
+    encoded
 }
 
 pub struct AotGuest {
     lib: Arc<AotLibrary>,
     handle: SendPtr,
-    host: Box<AotHostState>,
+    host: SendHostPtr,
     abi: Arc<GuestAbi>,
     last_reclaimed_owners: Option<u32>,
     imaged: Arc<Result<Vec<String>, String>>,
@@ -562,34 +692,54 @@ impl Drop for AotGuest {
             unsafe { (self.lib.syms.drop)(self.handle.0) };
             self.handle.0 = std::ptr::null_mut();
         }
+        if !self.host.0.is_null() {
+            // SAFETY: handle has been dropped, so no guest callback can ever dereference `self.host.0`.
+            unsafe { drop(Box::from_raw(self.host.0)) };
+            self.host.0 = std::ptr::null_mut();
+        }
     }
 }
 
 impl AotGuest {
+    fn with_host_mut<R>(&mut self, f: impl FnOnce(&mut AotHostState) -> R) -> R {
+        // SAFETY: `self` exclusively owns `self.host.0` and no guest FFI call is active while this
+        // short borrow is held.
+        let host_box = unsafe { &*self.host.0 };
+        debug_assert!(!host_box.in_trampoline.load(Ordering::Acquire));
+        let state = unsafe { &mut *host_box.state.get() };
+        f(state)
+    }
+
     pub fn start(
         module: &AotModule,
         abi: Arc<GuestAbi>,
         imaged: Arc<Result<Vec<String>, String>>,
         limits: Option<Limits>,
     ) -> Result<Self> {
-        let mut host = Box::new(AotHostState {
-            lib: module.lib.clone(),
-            active: None,
-            memory: None,
-            probe: None,
-            spare: Vec::new(),
-            pending_error: None,
-            uses_arrays: abi.uses_arrays(),
-        });
+        let host_ptr = Box::into_raw(Box::new(AotHostBox {
+            in_trampoline: AtomicBool::new(false),
+            state: UnsafeCell::new(AotHostState {
+                lib: module.lib.clone(),
+                active: None,
+                memory: None,
+                probe: None,
+                spare: Vec::new(),
+                pending_error: None,
+                uses_arrays: abi.uses_arrays(),
+            }),
+        }));
         let limit_pages = match limits {
             Some(lim) => u64::try_from(lim.memory / PAGE).unwrap_or(u64::MAX).max(1),
             None => 0,
         };
-        let user_ctx = (&mut *host as *mut AotHostState).cast::<c_void>();
         let mut trap_code = 0u8;
-        let handle = unsafe { (module.lib.syms.new)(user_ctx, Some(host_callback_trampoline), limit_pages, &mut trap_code) };
+        let handle = unsafe {
+            (module.lib.syms.new)(host_ptr.cast::<c_void>(), Some(host_callback_trampoline), limit_pages, &mut trap_code)
+        };
         if handle.is_null() {
-            if let Some(err) = host.pending_error.take() {
+            // SAFETY: `new` returned null, so no handle retains `host_ptr`.
+            let host = unsafe { Box::from_raw(host_ptr) }.state.into_inner();
+            if let Some(err) = host.pending_error {
                 return Err(err);
             }
             return Err(module.lib.trap_error(trap_code));
@@ -597,7 +747,7 @@ impl AotGuest {
         Ok(Self {
             lib: module.lib.clone(),
             handle: SendPtr(handle),
-            host,
+            host: SendHostPtr(host_ptr),
             abi,
             last_reclaimed_owners: None,
             imaged,
@@ -614,7 +764,7 @@ impl AotGuest {
                 .map(|name| name.trim_start_matches("blot:").to_owned())
                 .collect(),
         );
-        self.host.probe = Some(probe);
+        self.with_host_mut(|host| host.probe = Some(probe));
     }
 
     pub fn memory_bytes(&self) -> usize {
@@ -633,7 +783,7 @@ impl AotGuest {
 
     pub fn track_memory(&mut self, gauge: Arc<AtomicUsize>) {
         gauge.store(self.memory_bytes(), Ordering::Relaxed);
-        self.host.memory = Some(gauge);
+        self.with_host_mut(|host| host.memory = Some(gauge));
     }
 
     fn call_export_raw(&mut self, name: &str, arg_bits: u64) -> Result<u64> {
@@ -644,7 +794,9 @@ impl AotGuest {
         };
         match rc {
             0 => Ok(res_out),
-            2 => Err(self.host.pending_error.take().unwrap_or_else(|| self.lib.trap_error(trap_code))),
+            2 => Err(self
+                .with_host_mut(|host| host.pending_error.take())
+                .unwrap_or_else(|| self.lib.trap_error(trap_code))),
             1 => Err(self.lib.trap_error(trap_code)),
             _ => bail!("unknown_export: unknown function export {name}"),
         }
@@ -657,7 +809,9 @@ impl AotGuest {
         match rc {
             0 => Ok(()),
             1 => Err(self.lib.trap_error(trap_code)),
-            2 => Err(self.host.pending_error.take().unwrap_or_else(|| self.lib.trap_error(trap_code))),
+            2 => Err(self
+                .with_host_mut(|host| host.pending_error.take())
+                .unwrap_or_else(|| self.lib.trap_error(trap_code))),
             _ => bail!("invalid_abi: missing blot:reset"),
         }
     }
@@ -667,7 +821,7 @@ impl AotGuest {
         let function =
             self.abi.function(name).ok_or_else(|| anyhow!("unknown_export: unknown function export {name}"))?.clone();
         let result = self.begin_and_run(&function, argument);
-        if let Some(probe) = &self.host.probe {
+        if let Some(probe) = self.with_host_mut(|host| host.probe.clone()) {
             probe.called(result.is_err());
         }
         let finish = self.finish(if result.is_ok() { LEFT_NORMALLY } else { LEFT_FAILING });
@@ -690,9 +844,10 @@ impl AotGuest {
                 ensure!(value.kind() == expected, "invalid_argument: {name} argument must be {expected}, not {}", value.kind());
                 let lib = self.lib.clone();
                 let handle = self.handle.0;
-                aot_to_bits(
-                    self.host.uses_arrays,
-                    &mut self.host.spare,
+                let (uses_arrays, mut spare) = self.with_host_mut(|host| (host.uses_arrays, std::mem::take(&mut host.spare)));
+                let encoded = aot_to_bits(
+                    uses_arrays,
+                    &mut spare,
                     value,
                     |bytes| {
                         let mut ptr_out = 0i32;
@@ -701,6 +856,7 @@ impl AotGuest {
                         match rc {
                             0 => Ok(ptr_out),
                             1 => Err(lib.trap_error(trap_code)),
+                            2 => Err(anyhow!("host error during blot:allocate")),
                             _ => bail!("invalid_abi: missing blot:allocate"),
                         }
                     },
@@ -714,11 +870,15 @@ impl AotGuest {
                             unsafe { std::slice::from_raw_parts_mut(p, n) }
                         }
                     },
-                )?
+                );
+                self.with_host_mut(|host| host.spare = spare);
+                encoded?
             }
             (Parameter::Callback(signature), Argument::Callback(callback)) => {
                 let token = TOKENS.fetch_add(1, Ordering::Relaxed);
-                self.host.active = Some(Active { token, signature, callback: Some(callback), export: name.clone() });
+                self.with_host_mut(|host| {
+                    host.active = Some(Active { token, signature, callback: Some(callback), export: name.clone() });
+                });
                 token
             }
             (Parameter::Callback(_), Argument::Value(_)) => {
@@ -732,11 +892,11 @@ impl AotGuest {
         let (mut p, mut n) = (std::ptr::null_mut(), 0usize);
         unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut n) };
         let mem = if n == 0 || p.is_null() { &[][..] } else { unsafe { std::slice::from_raw_parts(p, n) } };
-        aot_from_bits(mem, self.host.uses_arrays, &mut self.host.spare, function.result, res_bits)
+        self.with_host_mut(|host| aot_from_bits(mem, host.uses_arrays, &mut host.spare, function.result, res_bits))
     }
 
     fn finish(&mut self, outcome: i32) -> Result<()> {
-        self.host.active = None;
+        self.with_host_mut(|host| host.active = None);
         let mut left = Ok(());
         if std::mem::take(&mut self.entered) && self.abi.ownership {
             left = self.call_export_raw(OWNERSHIP_LEAVE, u64::from(outcome.cast_unsigned())).map(|_| ());
@@ -752,7 +912,9 @@ impl AotGuest {
                     Ok(())
                 }
                 1 => Err(self.lib.trap_error(trap_code)),
-                2 => Err(self.host.pending_error.take().unwrap_or_else(|| self.lib.trap_error(trap_code))),
+                2 => Err(self
+                    .with_host_mut(|host| host.pending_error.take())
+                    .unwrap_or_else(|| self.lib.trap_error(trap_code))),
                 _ => bail!("invalid_abi: missing blot:finish_invocation"),
             }
         } else {
@@ -857,7 +1019,7 @@ impl AotGuest {
             unsafe { (self.lib.syms.get_global)(self.handle.0, name.as_ptr(), name.len(), &mut val, &mut kind) } == 0,
             "validated constant export {name} disappeared"
         );
-        aot_from_bits(&[], false, &mut self.host.spare, constant.value, val)
+        self.with_host_mut(|host| aot_from_bits(&[], false, &mut host.spare, constant.value, val))
     }
 
     pub fn runtime_counters(&mut self) -> Vec<(String, u32)> {

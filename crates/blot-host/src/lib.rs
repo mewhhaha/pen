@@ -152,7 +152,7 @@ impl GuestModule {
         {
             let abi = Arc::new(read_abi(wasm)?);
             let use_aot = if prefer_aot { wtime_aot::preferred_for_run() } else { wtime_aot::enabled() };
-            let module = if use_aot && abi.tasks.is_none() {
+            let module = if use_aot && !samples(engine) && abi.tasks.is_none() {
                 CompiledModule::WtimeAot(wtime_aot::AotModule::compile(wasm, &abi, cache)?)
             } else {
                 let module = compile(engine, wasm, cache)?;

@@ -385,8 +385,8 @@ pub(crate) fn ensure_private_cache_dir(path: &Path) -> Result<PathBuf> {
                 canon_existing.parent().is_some(),
                 "refusing to use filesystem root as cache directory"
             );
-            let sym = std::fs::symlink_metadata(&abs_path)
-                .with_context(|| format!("lstat cache dir {}", abs_path.display()))?;
+            let sym = std::fs::symlink_metadata(&existing)
+                .with_context(|| format!("lstat cache dir {}", existing.display()))?;
             ensure!(
                 !sym.file_type().is_symlink() && sym.file_type().is_dir(),
                 "cache path must be a real directory (not a symlink): {}",
@@ -472,7 +472,7 @@ pub(crate) fn ensure_private_cache_dir(path: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Checks that an existing verified `.so` is a non-symlink regular file with no write bits set.
+/// Checks that an existing verified `.so` is a non-symlink regular file owned by `euid` with no write bits set.
 #[cfg(feature = "compiler")]
 fn is_immutable_regular_file(meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
@@ -480,8 +480,11 @@ fn is_immutable_regular_file(meta: &std::fs::Metadata) -> bool {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if meta.permissions().mode() & 0o222 != 0 {
+            return false;
+        }
+        if !current_euid().ok().is_some_and(|euid| meta.uid() == euid) {
             return false;
         }
     }
@@ -686,10 +689,25 @@ fn rustc_version_fingerprint(toolchain: &str) -> String {
     fp
 }
 
+/// Returns true if the current Linux thread has hardware CET shadow stack (`shstk`) enabled,
+/// parsed from `/proc/self/status` `x86_Thread_features:` (zero unsafe, zero syscalls).
+#[cfg(all(feature = "compiler", target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
+fn linux_shstk_enabled() -> bool {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("x86_Thread_features:") {
+            return rest.split_whitespace().any(|tok| tok == "shstk");
+        }
+    }
+    false
+}
+
 /// Canonical internal cache profile tag matching `wtime-aot --backend x64 --target-cpu`,
-/// also checking host platform & CPU capability (`SSE4.1 + POPCNT`, plus `ABM/LZCNT + BMI1` for
-/// `x64-v3`) BEFORE cache lookup so unsupported hosts fail with a typed `X64FallbackError`
-/// while `wasm` & `cache` are still available for default-path fallback.
+/// also checking host platform, CPU capability (`SSE4.1 + POPCNT`, plus `ABM/LZCNT + BMI1` for
+/// `x64-v3`), and calling-thread CET `SHSTK` status BEFORE cache lookup so unsupported hosts fail
+/// with a typed `X64FallbackError` while `wasm` & `cache` are still available for default-path fallback.
 #[cfg(feature = "compiler")]
 fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64")))]
@@ -701,6 +719,11 @@ fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
     {
+        if linux_shstk_enabled() {
+            return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(
+                "calling thread has Linux CET hardware shadow stack (SHSTK) enabled".into(),
+            ))));
+        }
         if !std::is_x86_feature_detected!("sse4.1") || !std::is_x86_feature_detected!("popcnt") {
             return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(
                 "host CPU lacks baseline SSE4.1 + POPCNT required by wtime-aot --backend x64".into(),

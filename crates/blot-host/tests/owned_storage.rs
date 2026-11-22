@@ -103,8 +103,13 @@ fn copied_worker_batches_are_bounded_ordered_and_reusable() -> Result<()> {
 fn owned_capacity_failure_leaves_the_guest_reusable() -> Result<()> {
     let engine = blot_host::engine()?;
     let module = GuestModule::new(&engine, &fixture()?, None)?;
-    // Planned storage exceeds the old 1 MiB sandbox before invocation.
-    assert!(Guest::sandboxed(&engine, &module, blot_host::Limits { memory: 1 << 20 }).is_err());
+    // On-demand linear memory starts at 64 KiB: a 1 MiB sandbox starts cleanly,
+    // runs small calls, rejects allocations past the cap, and stays reusable.
+    let mut sandboxed = Guest::sandboxed(&engine, &module, blot_host::Limits { memory: 1 << 20 })?;
+    assert_eq!(sandboxed.call("collected", Value::U32(1))?, Value::U32(44));
+    assert!(sandboxed.call("large_result", Value::U32(300_000)).is_err());
+    assert_eq!(sandboxed.call("collected", Value::U32(1))?, Value::U32(44));
+    sandboxed.dispose()?;
     let mut guest = Guest::new(&engine, &module)?;
     assert_eq!(guest.call("repeated", Value::U32(128))?, Value::U32(8256));
     assert!(guest.call("large_result", Value::U32(1_000_000)).is_err());

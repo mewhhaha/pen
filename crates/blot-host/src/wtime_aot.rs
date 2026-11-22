@@ -10,14 +10,13 @@
 //! arena array copies, host callbacks, and snapshots as Wasmtime.
 
 use std::any::Any;
-use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use libloading::Library;
@@ -180,27 +179,70 @@ fn default_cache_dir(cache: Option<&Path>) -> PathBuf {
     std::env::temp_dir().join("pen-wtime-aot")
 }
 
+#[cfg(feature = "compiler")]
 fn wasm_sha256_hex(wasm: &[u8]) -> String {
-    #[cfg(feature = "compiler")]
-    {
-        use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(wasm))
-    }
-    #[cfg(not(feature = "compiler"))]
-    {
-        let mut h = 0xcbf29ce484222325u64;
-        for &b in wasm {
-            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
-        }
-        format!("{h:016x}")
-    }
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(wasm))
 }
 
+#[cfg(feature = "compiler")]
 fn file_sha256_hex(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     Ok(wasm_sha256_hex(&bytes))
 }
 
+#[cfg(feature = "compiler")]
+fn ensure_private_cache_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path).with_context(|| format!("creating cache dir {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+        let mode = std::fs::metadata(path)
+            .with_context(|| format!("stat cache dir {}", path.display()))?
+            .permissions()
+            .mode();
+        ensure!(
+            mode & 0o022 == 0,
+            "wtime-aot cache directory must be private (not group/world-writable): {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "compiler")]
+fn publish_immutable_verified_so(verified_dir: &Path, so_sha: &str, bytes: &[u8], seq: u64) -> Result<PathBuf> {
+    let dest = verified_dir.join(format!("{so_sha}.so"));
+    if dest.is_file() && file_sha256_hex(&dest).is_ok_and(|actual| actual == so_sha) {
+        return Ok(dest);
+    }
+    let _ = std::fs::remove_file(&dest);
+    let tmp = verified_dir.join(format!(".{so_sha}.{}.{seq}.tmp", std::process::id()));
+    let mut f = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("creating immutable verified artifact {}", tmp.display()))?;
+    if let Err(err) = f.write_all(bytes) {
+        drop(f);
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    drop(f);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555));
+    }
+    if let Err(err) = std::fs::rename(&tmp, &dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
+    Ok(dest)
+}
+
+#[cfg(feature = "compiler")]
 fn bin_digest(bin: &Path) -> Result<String> {
     type StampKey = (PathBuf, u64, u64, u32);
     static CACHE: OnceLock<Mutex<std::collections::HashMap<StampKey, String>>> = OnceLock::new();
@@ -220,13 +262,16 @@ fn bin_digest(bin: &Path) -> Result<String> {
     Ok(digest)
 }
 
+#[cfg(feature = "compiler")]
 fn sanitize_key_part(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
         .collect()
 }
 
+#[cfg(feature = "compiler")]
 struct RemoveOnDrop(PathBuf);
+#[cfg(feature = "compiler")]
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -236,14 +281,16 @@ impl Drop for RemoveOnDrop {
 /// Canonical internal cache profile tag matching `wtime-aot --backend x64 --target-cpu`.
 ///
 /// NOTE: `x64-v2` / `x64-v3` are internal compiler feature profiles (SSE4.1+POPCNT vs
-/// SSE4.1+POPCNT+ABM/LZCNT+BMI1/TZCNT), not full psABI levels.
+/// SSE4.1+POPCNT+ABM/LZCNT+BMI1/TZCNT) for Linux x86-64 SysV LP64 (excluding x32 ILP32),
+/// not full psABI levels.
+#[cfg(feature = "compiler")]
 fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
-    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64")))]
     {
         let _ = target_cpu;
-        bail!("wtime-aot --backend x64 is only supported on Linux x86_64 hosts")
+        bail!("wtime-aot --backend x64 is only supported on Linux x86_64 LP64 hosts")
     }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
     match target_cpu {
         "native" => {
             if std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("bmi1") {
@@ -265,14 +312,21 @@ fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
     }
 }
 
+#[cfg(not(feature = "compiler"))]
+fn build_or_find_so(_wasm: &[u8], _cache: Option<&Path>) -> Result<PathBuf> {
+    bail!("wtime-aot compilation requires blot-host's `compiler` feature")
+}
+
+#[cfg(feature = "compiler")]
 fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
     static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
     if let Ok(override_so) = std::env::var("PEN_WTIME_AOT_SO")
         && !override_so.is_empty()
     {
+        // Explicit trusted-native-code override; canonicalize so a bare filename can never trigger
+        // `dlopen`'s `LD_LIBRARY_PATH` search.
         let p = PathBuf::from(override_so);
         ensure!(p.is_file(), "PEN_WTIME_AOT_SO does not exist: {}", p.display());
-        // Canonicalize so a bare filename can never trigger `dlopen`'s `LD_LIBRARY_PATH` search.
         return std::fs::canonicalize(&p)
             .with_context(|| format!("canonicalizing PEN_WTIME_AOT_SO {}", p.display()));
     }
@@ -295,6 +349,9 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
         .unwrap_or_else(|| "native".to_string());
 
     let cache_dir = default_cache_dir(cache);
+    ensure_private_cache_dir(&cache_dir)?;
+    let canon_cache = std::fs::canonicalize(&cache_dir)
+        .with_context(|| format!("canonicalizing cache dir {}", cache_dir.display()))?;
     let digest = wasm_sha256_hex(wasm);
     let bin_hash = bin_digest(&bin)?;
     let fast_key = match backend.as_str() {
@@ -303,34 +360,61 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
         "x64" => format!("{digest}-x64-{}-{bin_hash}", resolved_x64_isa_tag(&target_cpu)?),
         other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
     };
-    let fast_dir = cache_dir.join("by-wasm");
+    let fast_dir = canon_cache.join("by-wasm");
+    let verified_dir = canon_cache.join("verified");
+    ensure_private_cache_dir(&fast_dir)?;
+    ensure_private_cache_dir(&verified_dir)?;
+    // Hold an exclusive per-key publication lock across fast-cache lookup, mismatch invalidation,
+    // rebuild, digest verification, and immutable content-addressed staging.
+    let lock_path = fast_dir.join(format!("{fast_key}.lock"));
+    let lock_file = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening cache lock {}", lock_path.display()))?;
+    lock_file.lock().with_context(|| format!("locking {}", lock_path.display()))?;
+
+    let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
     let fast_link = fast_dir.join(format!("{fast_key}.path"));
     if let Ok(recorded) = std::fs::read_to_string(&fast_link) {
         let mut lines = recorded.lines();
         if let (Some(rec_key), Some(rec_so_sha), Some(rec_path)) = (lines.next(), lines.next(), lines.next())
             && rec_key == fast_key
+            && rec_so_sha.len() == 64
+            && rec_so_sha.bytes().all(|b| b.is_ascii_hexdigit())
         {
-            let so_path = PathBuf::from(rec_path.trim());
-            if let (Ok(canon_cache), Ok(canon_so)) = (std::fs::canonicalize(&cache_dir), std::fs::canonicalize(&so_path))
-                && canon_so.starts_with(&canon_cache)
-                && canon_so.is_file()
-                && file_sha256_hex(&canon_so).is_ok_and(|actual| actual == rec_so_sha)
+            let verified_so = verified_dir.join(format!("{rec_so_sha}.so"));
+            if let Ok(canon_verified) = std::fs::canonicalize(&verified_so)
+                && canon_verified.starts_with(&verified_dir)
+                && canon_verified.is_file()
+                && file_sha256_hex(&canon_verified).is_ok_and(|actual| actual == rec_so_sha)
             {
-                return Ok(canon_so);
+                return Ok(canon_verified);
+            }
+            // Digest mismatch or missing verified copy under the publication lock: invalidate
+            // the verified copy, the builder artifact (+ sidecar), and the fast index before rebuilding.
+            let _ = std::fs::remove_file(&verified_so);
+            let so_path = PathBuf::from(rec_path.trim());
+            if let Ok(canon_so) = std::fs::canonicalize(&so_path)
+                && canon_so.starts_with(&canon_cache)
+            {
+                let _ = std::fs::remove_file(&canon_so);
+                let _ = std::fs::remove_file(canon_so.with_extension("so.sha256"));
             }
         }
+        let _ = std::fs::remove_file(&fast_link);
     }
 
-    std::fs::create_dir_all(&cache_dir)?;
-    let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_wasm = cache_dir.join(format!("input-{digest}-{}-{seq}.wasm", std::process::id()));
+    let tmp_wasm = canon_cache.join(format!("input-{digest}-{}-{seq}.wasm", std::process::id()));
     std::fs::write(&tmp_wasm, wasm)?;
     let _cleanup_wasm = RemoveOnDrop(tmp_wasm.clone());
     let mut cmd = Command::new(&bin);
     cmd.args(["build"])
         .arg(&tmp_wasm)
         .args(["--cache"])
-        .arg(&cache_dir)
+        .arg(&canon_cache)
         .args(["--backend", &backend, "--blot-cdylib"]);
     match backend.as_str() {
         "c" => {
@@ -354,17 +438,32 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
     ensure!(so_path.is_file(), "wtime-aot build did not produce {}", so_path.display());
     let canon_so = std::fs::canonicalize(&so_path)
         .with_context(|| format!("canonicalizing built library {}", so_path.display()))?;
-    let so_sha = file_sha256_hex(&canon_so)?;
-    let _ = std::fs::create_dir_all(&fast_dir);
+    ensure!(
+        canon_so.starts_with(&canon_cache),
+        "wtime-aot build produced artifact outside cache root: {}",
+        canon_so.display()
+    );
+    let so_bytes = std::fs::read(&canon_so)
+        .with_context(|| format!("reading built library {}", canon_so.display()))?;
+    let so_sha = wasm_sha256_hex(&so_bytes);
+    let sidecar = canon_so.with_extension("so.sha256");
+    if let Ok(expected_sidecar) = std::fs::read_to_string(&sidecar) {
+        ensure!(
+            expected_sidecar.trim() == so_sha,
+            "built library digest mismatch with sidecar {}",
+            sidecar.display()
+        );
+    }
+    let verified_so = publish_immutable_verified_so(&verified_dir, &so_sha, &so_bytes, seq)?;
     let tmp_link = fast_dir.join(format!(".{fast_key}.{}.{seq}.tmp", std::process::id()));
-    if let Ok(mut file) = std::fs::File::options().write(true).create_new(true).open(&tmp_link) {
-        let written = file.write_all(format!("{fast_key}\n{so_sha}\n{}\n", canon_so.display()).as_bytes());
-        drop(file);
+    if let Ok(mut link_file) = std::fs::File::options().write(true).create_new(true).open(&tmp_link) {
+        let written = link_file.write_all(format!("{fast_key}\n{so_sha}\n{}\n", canon_so.display()).as_bytes());
+        drop(link_file);
         if written.is_err() || std::fs::rename(&tmp_link, &fast_link).is_err() {
             let _ = std::fs::remove_file(&tmp_link);
         }
     }
-    Ok(canon_so)
+    Ok(verified_so)
 }
 
 #[cfg(feature = "compiler")]
@@ -479,9 +578,16 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
             wasmparser::Payload::MemorySection(section) => {
                 for mem in section {
                     let mem = mem?;
-                    if memory_limits.is_none() {
-                        memory_limits = Some((mem.initial, mem.maximum));
-                    }
+                    ensure!(
+                        memory_limits.is_none(),
+                        "invalid_abi: wtime-aot supports at most one linear memory"
+                    );
+                    ensure!(!mem.memory64, "invalid_abi: wtime-aot does not support memory64");
+                    ensure!(
+                        mem.page_size_log2.is_none_or(|p| p == 16),
+                        "invalid_abi: wtime-aot requires standard 64 KiB memory pages"
+                    );
+                    memory_limits = Some((mem.initial, mem.maximum));
                 }
             }
             wasmparser::Payload::GlobalSection(section) => {
@@ -594,12 +700,17 @@ fn validate_aot_wasm(_wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
     })
 }
 
-fn read_aot_str<'a>(ptr: *const u8, len: usize) -> Result<&'a str> {
+/// Decodes a static UTF-8 byte slice returned by an AOT library export.
+///
+/// # Safety
+/// If `len > 0`, `ptr` must point to `len` readable immutable bytes that remain live for the
+/// lifetime of `_lib` (the loaded `libloading::Library`).
+unsafe fn read_aot_str(_lib: &Library, ptr: *const u8, len: usize) -> Result<&str> {
     if len == 0 {
         return Ok("");
     }
     ensure!(!ptr.is_null(), "invalid_abi: null string pointer with non-zero length {len}");
-    // SAFETY: caller guarantees `(ptr, len)` is a valid static byte range from the loaded `.so`.
+    // SAFETY: upheld by caller's contract tying `(ptr, len)` to `_lib`.
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
     std::str::from_utf8(bytes).context("invalid_abi: non-UTF-8 string returned by AOT library")
 }
@@ -610,7 +721,9 @@ impl AotModule {
         abi.check_hostable()?;
         let validated = validate_aot_wasm(wasm, abi)?;
         let so_path = build_or_find_so(wasm, cache)?;
-        // SAFETY: `so_path` was built locally by `wtime-aot` from validated Wasm and digest-verified.
+        // SAFETY: `so_path` is an immutable content-addressed `0o555` artifact inside our private
+        // `0o700` cache (`verified/<sha256>.so`, digest-verified under the publication lock), or
+        // an explicit trusted `PEN_WTIME_AOT_SO` override.
         let lib = unsafe { Library::new(&so_path) }
             .with_context(|| format!("loading wtime-aot library {}", so_path.display()))?;
         let abi_version: FnAbiVersion = *unsafe { lib.get(b"blot_aot_abi_version\0")? };
@@ -621,12 +734,20 @@ impl AotModule {
         let import_name_fn: FnImportName = *unsafe { lib.get(b"blot_aot_import_name\0")? };
         let callbacks = abi.callbacks();
         let n_imports = unsafe { import_count_fn() };
+        if let Some(expected) = &validated.expected_imports {
+            ensure!(
+                n_imports as usize == expected.len(),
+                "invalid_abi: loaded AOT library import count ({n_imports}) does not match validated Wasm ({})",
+                expected.len()
+            );
+        }
+        ensure!(n_imports <= 1024, "invalid_abi: excessive AOT import count {n_imports}");
         let mut imports = Vec::with_capacity(n_imports as usize);
         for idx in 0..n_imports {
             let (mut mp, mut ml, mut np, mut nl) = (std::ptr::null(), 0, std::ptr::null(), 0);
             ensure!(unsafe { import_name_fn(idx, &mut mp, &mut ml, &mut np, &mut nl) } == 0, "bad import index {idx}");
-            let module = read_aot_str(mp, ml)?;
-            let name = read_aot_str(np, nl)?;
+            let module = unsafe { read_aot_str(&lib, mp, ml) }?;
+            let name = unsafe { read_aot_str(&lib, np, nl) }?;
             ensure!(module == HOST_MODULE, "invalid_abi: unexpected import {module}::{name}");
             let sig = callbacks
                 .iter()
@@ -693,25 +814,18 @@ struct AotHostState {
 
 /// Heap-allocated host context shared with the AOT guest via raw `user_ctx`.
 ///
-/// Stored behind a raw pointer in `AotGuest` (never `Box<AotHostState>`) and gated by
-/// `in_trampoline` so `&mut AotHostState` is NEVER live across any guest FFI call or
-/// reentrant callback (`active_allocate`), preventing Stacked/Tree Borrows aliasing UB.
+/// Guarded by a short-locked `Mutex<AotHostState>` that is NEVER held across any guest FFI call,
+/// host callback invocation, or reentrant `active_allocate` call — matching Wasmtime's exact
+/// nested-callback semantics (a guest `blot:allocate` may invoke the restored active callback
+/// during result encoding) with zero `UnsafeCell` aliasing UB.
 struct AotHostBox {
-    in_trampoline: AtomicBool,
-    state: UnsafeCell<AotHostState>,
+    state: Mutex<AotHostState>,
 }
 
 struct SendHostPtr(*mut AotHostBox);
 // SAFETY: `AotHostBox` is owned exclusively by one `AotGuest`, `AotHostState: Send`, and
 // accesses are strictly serialized on the calling thread.
 unsafe impl Send for SendHostPtr {}
-
-struct TrampolineGuard<'a>(&'a AtomicBool);
-impl Drop for TrampolineGuard<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
-    }
-}
 
 unsafe extern "C" fn host_callback_trampoline(
     user_ctx: *mut c_void,
@@ -726,11 +840,6 @@ unsafe extern "C" fn host_callback_trampoline(
     }
     // SAFETY: `user_ctx` points to a live `AotHostBox` owned by `AotGuest` for the handle's lifetime.
     let host_box = unsafe { &*(user_ctx as *const AotHostBox) };
-    if host_box.in_trampoline.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-        // Reject nested host callbacks (e.g. from inside `active_allocate`) BEFORE forming `&mut AotHostState`.
-        return 1;
-    }
-    let _guard = TrampolineGuard(&host_box.in_trampoline);
     match catch_unwind(AssertUnwindSafe(|| invoke_aot_import(host_box, active_call, import_idx, token, arg_bits))) {
         Ok(Ok(bits)) => {
             if !res_out.is_null() {
@@ -739,13 +848,21 @@ unsafe extern "C" fn host_callback_trampoline(
             0
         }
         Ok(Err(err)) => {
-            // SAFETY: `in_trampoline` is held exclusively and no `&mut AotHostState` is currently live.
-            unsafe { (*host_box.state.get()).pending_error = Some(err) };
+            if let Ok(mut state) = host_box.state.lock()
+                && state.pending_panic.is_none()
+                && state.pending_error.is_none()
+            {
+                state.pending_error = Some(err);
+            }
             1
         }
         Err(payload) => {
-            // Never unwind across `extern "C"` / generated native frames; stash payload to resume on host side.
-            unsafe { (*host_box.state.get()).pending_panic = Some(payload) };
+            // Never unwind across `extern "C"` / generated native frames; stash innermost payload to resume on host side.
+            if let Ok(mut state) = host_box.state.lock()
+                && state.pending_panic.is_none()
+            {
+                state.pending_panic = Some(payload);
+            }
             1
         }
     }
@@ -832,6 +949,14 @@ fn aot_to_bits(
     Ok(u64::from(pointer.cast_unsigned()))
 }
 
+fn restore_spare(host_box: &AotHostBox, spare: Vec<u32>) {
+    if let Ok(mut state) = host_box.state.lock()
+        && spare.capacity() > state.spare.capacity()
+    {
+        state.spare = spare;
+    }
+}
+
 fn invoke_aot_import(
     host_box: &AotHostBox,
     active_call: *mut c_void,
@@ -839,11 +964,13 @@ fn invoke_aot_import(
     token: u64,
     arg_bits: u64,
 ) -> Result<u64> {
-    // Short borrow #1: extract metadata and move `spare` out so NO `&mut AotHostState` is live
-    // across any FFI call (`active_mem_data`, `active_get_global`, `callback`, or `active_allocate`).
+    // Short lock #1: extract metadata and move `spare` out so NO lock/reference to `AotHostState`
+    // is held across any FFI call (`active_mem_data`, `active_get_global`, `callback`, or `active_allocate`).
     let (signature, export, lib, uses_arrays, memory_gauge, probe, mut spare) = {
-        // SAFETY: `in_trampoline` is exclusively acquired by `host_callback_trampoline`.
-        let state = unsafe { &mut *host_box.state.get() };
+        let mut state = host_box
+            .state
+            .try_lock()
+            .map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
         let signature = *state
             .lib
             .imports
@@ -879,11 +1006,13 @@ fn invoke_aot_import(
     let argument = match aot_from_bits(mem_slice, uses_arrays, &mut spare, signature.parameter, arg_bits) {
         Ok(arg) => arg,
         Err(err) => {
-            unsafe { (*host_box.state.get()).spare = spare };
+            restore_spare(host_box, spare);
             return Err(err);
         }
     };
-    if let Some(gauge) = &memory_gauge {
+    if uses_arrays
+        && let Some(gauge) = &memory_gauge
+    {
         gauge.store(mem_len, Ordering::Relaxed);
     }
     if let Some(probe) = probe {
@@ -894,25 +1023,33 @@ fn invoke_aot_import(
             let c = if rc == 0 && (kind == 0 || kind == 1) { (val & 0xffff_ffff) as u32 } else { 0 };
             vals.push(u64::from(c));
         }
-        probe.called_host(mem_len, vals.into_iter());
+        probe.called_host(if uses_arrays { mem_len } else { 0 }, vals.into_iter());
     }
 
-    // Short borrow #2: take callback out before invoking it.
+    // Short lock #2: take callback out before invoking it.
     let mut callback = {
-        // SAFETY: `in_trampoline` is exclusively held and no other reference to `state` exists.
-        let state = unsafe { &mut *host_box.state.get() };
+        let mut state = host_box
+            .state
+            .try_lock()
+            .map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
         match state.active.as_mut().and_then(|active| active.callback.take()) {
             Some(cb) => cb,
             None => {
-                state.spare = spare;
+                if spare.capacity() > state.spare.capacity() {
+                    state.spare = spare;
+                }
                 bail!("reentrant_call: cannot reenter an active guest instance");
             }
         }
     };
     let result = callback(argument);
-    // Short borrow #3: restore callback immediately after invocation.
+    // Short lock #3: restore callback immediately after invocation, matching Wasmtime so guest
+    // `blot:allocate` during result encoding may legally invoke the active callback.
     {
-        let state = unsafe { &mut *host_box.state.get() };
+        let mut state = host_box
+            .state
+            .try_lock()
+            .map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
         if let Some(active) = state.active.as_mut() {
             active.callback = Some(callback);
         }
@@ -920,12 +1057,12 @@ fn invoke_aot_import(
     let result = match result.with_context(|| format!("host_exception: host callback failed during {export}")) {
         Ok(val) => val,
         Err(err) => {
-            unsafe { (*host_box.state.get()).spare = spare };
+            restore_spare(host_box, spare);
             return Err(err);
         }
     };
     if result.kind() != signature.result {
-        unsafe { (*host_box.state.get()).spare = spare };
+        restore_spare(host_box, spare);
         bail!(
             "host_result: host callback during {export} returned {}, not {}",
             result.kind(),
@@ -933,7 +1070,7 @@ fn invoke_aot_import(
         );
     }
 
-    // Zero `&mut AotHostState` references are live during `active_allocate` below.
+    // Zero locks are held during `active_allocate` below.
     let encoded = aot_to_bits(
         uses_arrays,
         &mut spare,
@@ -962,8 +1099,8 @@ fn invoke_aot_import(
             write(slice)
         },
     );
-    // Short borrow #4: restore `spare` buffer.
-    unsafe { (*host_box.state.get()).spare = spare };
+    // Short lock #4: restore `spare` buffer.
+    restore_spare(host_box, spare);
     encoded
 }
 
@@ -995,11 +1132,10 @@ impl Drop for AotGuest {
 impl AotGuest {
     fn with_host_mut<R>(&mut self, f: impl FnOnce(&mut AotHostState) -> R) -> R {
         // SAFETY: `self` exclusively owns `self.host.0` and no guest FFI call is active while this
-        // short borrow is held.
+        // short lock is held.
         let host_box = unsafe { &*self.host.0 };
-        debug_assert!(!host_box.in_trampoline.load(Ordering::Acquire));
-        let state = unsafe { &mut *host_box.state.get() };
-        f(state)
+        let mut state = host_box.state.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut state)
     }
 
     pub fn start(
@@ -1037,8 +1173,7 @@ impl AotGuest {
             None => 0,
         };
         let host_ptr = Box::into_raw(Box::new(AotHostBox {
-            in_trampoline: AtomicBool::new(false),
-            state: UnsafeCell::new(AotHostState {
+            state: Mutex::new(AotHostState {
                 lib: module.lib.clone(),
                 active: None,
                 memory: None,
@@ -1055,7 +1190,7 @@ impl AotGuest {
         };
         if handle.is_null() {
             // SAFETY: `new` returned null, so no handle retains `host_ptr`.
-            let host = unsafe { Box::from_raw(host_ptr) }.state.into_inner();
+            let host = unsafe { Box::from_raw(host_ptr) }.state.into_inner().unwrap_or_else(|e| e.into_inner());
             if let Some(payload) = host.pending_panic {
                 resume_unwind(payload);
             }
@@ -1342,6 +1477,29 @@ impl AotGuest {
             !self.lib.has_mut_extern_table,
             "this guest cannot be restored: mutable externref tables are not captured by snapshots"
         );
+        // Preflight EVERY global name and Wasm value kind BEFORE mutating linear memory or any global,
+        // matching Wasmtime's typed `Global::set` rejection without partial state mutation.
+        let mut validated_globals: Vec<(&str, u64)> = Vec::with_capacity(image.globals.len());
+        for (name, value) in &image.globals {
+            let (expected_kind, raw) = match *value {
+                Val::I32(v) => (0u8, u64::from(v.cast_unsigned())),
+                Val::I64(v) => (1u8, v.cast_unsigned()),
+                Val::F32(bits) => (2u8, u64::from(bits)),
+                Val::F64(bits) => (3u8, bits),
+                _ => bail!("unsupported imaged global value"),
+            };
+            let (mut cur_val, mut cur_kind) = (0u64, u8::MAX);
+            ensure!(
+                unsafe { (self.lib.syms.get_global)(self.handle.0, name.as_ptr(), name.len(), &mut cur_val, &mut cur_kind) }
+                    == 0,
+                "an imaged global disappeared: {name}"
+            );
+            ensure!(
+                cur_kind == expected_kind,
+                "imaged global type mismatch for {name}: guest kind {cur_kind}, image kind {expected_kind}"
+            );
+            validated_globals.push((name.as_str(), raw));
+        }
         let mut written = 0;
         if self.lib.has_blot_memory_export {
             let (mut p, mut current) = (std::ptr::null_mut(), 0usize);
@@ -1355,22 +1513,16 @@ impl AotGuest {
             }
             if current > 0 && !p.is_null() {
                 // SAFETY: `handle` uniquely owns guest linear memory; even when `image.memory` is empty
-                // (captured at 0 pages before a later grow), `restore` zeros committed pages beyond it.
+                // (captured at 0 pages before a later grow), `restore` zeros committed pages beyond it
+                // while preserving current page count (`memory.size`), matching `WasmtimeGuest::restore`.
                 let bytes = unsafe { std::slice::from_raw_parts_mut(p, current) };
                 written = image.memory.restore(bytes);
             }
         }
-        for (name, value) in &image.globals {
-            let raw = match *value {
-                Val::I32(v) => u64::from(v.cast_unsigned()),
-                Val::I64(v) => v.cast_unsigned(),
-                Val::F32(bits) => u64::from(bits),
-                Val::F64(bits) => bits,
-                _ => bail!("unsupported imaged global value"),
-            };
+        for (name, raw) in validated_globals {
             ensure!(
                 unsafe { (self.lib.syms.set_global)(self.handle.0, name.as_ptr(), name.len(), raw) } == 0,
-                "an imaged global disappeared: {name}"
+                "imaged global {name} is not writable"
             );
         }
         Ok(written)

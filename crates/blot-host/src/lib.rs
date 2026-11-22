@@ -2294,4 +2294,77 @@ mod tests {
         let loaded = unsafe { wasmtime::Module::deserialize(&bounded, &artifact) }.unwrap();
         assert_eq!(loaded.exports().count(), compiled.exports().count());
     }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn allocator_can_invoke_active_callback_during_result_encoding() {
+        // ABI 2 guest: `run: (U32 -> Array U32 ! {Foreign}) -> U32` whose `blot:allocate`
+        // invokes the restored active host callback once while encoding an array result.
+        let abi = [&[0x02, 0x01][..], &name("run"), &[0x04, 0x01, 0x05, 0x01, 0x00]].concat();
+        // Types: 0=(externref,i32)->i32, 1=(externref)->i32, 2=(i32)->i32
+        let types = [
+            0x03, 0x60, 0x02, 0x6f, 0x7f, 0x01, 0x7f, 0x60, 0x01, 0x6f, 0x01, 0x7f, 0x60, 0x01, 0x7f, 0x01, 0x7f,
+        ];
+        let imports = [&[0x01][..], &name(HOST_MODULE), &name("call_u32_array_u32"), &[0x00, 0x00]].concat();
+        let funcs = [0x03, 0x01, 0x02, 0x02];
+        let memory = [0x01, 0x00, 0x01];
+        // Globals: 0=mut externref (cap), 1=mut i32 (cursor, non-zero), 2=mut i32 (reentry guard)
+        let globals = [
+            0x03, 0x6f, 0x01, 0xd0, 0x6f, 0x0b, 0x7f, 0x01, 0x41, 0x10, 0x0b, 0x7f, 0x01, 0x41, 0x00, 0x0b,
+        ];
+        let exports = [
+            &[0x04][..],
+            &name("run"),
+            &[0x00, 0x01],
+            &name("blot:allocate"),
+            &[0x00, 0x02],
+            &name("blot:reset"),
+            &[0x00, 0x03],
+            &name("blot:memory"),
+            &[0x02, 0x00],
+        ]
+        .concat();
+        // fn 1 (run): local 1 i32; global.set 0(local 0); local 1 = call 0(local 0, 1); load(4) + load(8)
+        let run_body = [
+            0x01, 0x01, 0x7f, 0x20, 0x00, 0x24, 0x00, 0x20, 0x00, 0x41, 0x01, 0x10, 0x00, 0x21, 0x01, 0x20, 0x01,
+            0x28, 0x02, 0x04, 0x20, 0x01, 0x28, 0x02, 0x08, 0x6a, 0x0b,
+        ];
+        // fn 2 (blot:allocate): local 1 i32; if !global2 { global2=1; drop(call 0(global0, 2)); } bump global1
+        let alloc_body = [
+            0x01, 0x01, 0x7f, 0x23, 0x02, 0x45, 0x04, 0x40, 0x41, 0x01, 0x24, 0x02, 0x23, 0x00, 0x41, 0x02, 0x10,
+            0x00, 0x1a, 0x0b, 0x23, 0x01, 0x21, 0x01, 0x20, 0x01, 0x20, 0x00, 0x6a, 0x24, 0x01, 0x20, 0x01, 0x0b,
+        ];
+        // fn 3 (blot:reset): global1 = 16; global2 = 0; return 0
+        let reset_body = [0x00, 0x41, 0x10, 0x24, 0x01, 0x41, 0x00, 0x24, 0x02, 0x41, 0x00, 0x0b];
+        let mut code = vec![0x03];
+        for body in [&run_body[..], &alloc_body[..], &reset_body[..]] {
+            code.push(u8::try_from(body.len()).unwrap());
+            code.extend(body);
+        }
+        let wasm = [
+            &b"\0asm\x01\0\0\0"[..],
+            &section(0, &[&name(pen_runtime::abi::ABI_SECTION)[..], &abi].concat()),
+            &section(1, &types),
+            &section(2, &imports),
+            &section(3, &funcs),
+            &section(5, &memory),
+            &section(6, &globals),
+            &section(7, &exports),
+            &section(10, &code),
+        ]
+        .concat();
+
+        let engine = engine().unwrap();
+        let module = GuestModule::new(&engine, &wasm, None).unwrap();
+        let mut guest = Guest::new(&engine, &module).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        let cb = Box::new(move |arg: Value| -> Result<Value> {
+            let Value::U32(n) = arg else { bail!("expected U32") };
+            seen_cb.lock().unwrap().push(n);
+            Ok(if n == 1 { Value::ArrayU32(vec![10, 20]) } else { Value::ArrayU32(vec![7]) })
+        });
+        assert_eq!(guest.call("run", Argument::Callback(cb)).unwrap(), Value::U32(30));
+        assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+    }
 }

@@ -23,6 +23,7 @@ mod tasks;
 mod trace_instrument;
 pub mod worker_sessions;
 pub mod workers;
+mod wtime_aot;
 pub use system_trace::SystemTrace;
 
 use std::any::Any;
@@ -59,11 +60,17 @@ fn wasm_type(value: ValueType) -> ValType {
     }
 }
 
+#[derive(Clone)]
+enum CompiledModule {
+    Wasmtime(Module),
+    WtimeAot(wtime_aot::AotModule),
+}
+
 /// A compiled guest module, its manifest and its debug information, ready
 /// to instantiate many times.
 #[derive(Clone)]
 pub struct GuestModule {
-    module: Module,
+    module: CompiledModule,
     trace: Option<Arc<SystemTrace>>,
     abi: Arc<GuestAbi>,
     symbols: Arc<Symbols>,
@@ -131,18 +138,42 @@ impl GuestModule {
     /// for these bytes and this engine's configuration. Fails without the
     /// `compiler` feature.
     pub fn new(engine: &Engine, wasm: &[u8], cache: Option<&Path>) -> Result<GuestModule> {
+        Self::new_with_aot(engine, wasm, cache, false)
+    }
+
+    /// Compiles `wasm` for a `pen run` session, preferring `wtime-aot` when
+    /// available (unless `PEN_WTIME_AOT=0`) and falling back to Wasmtime.
+    pub fn new_run(engine: &Engine, wasm: &[u8], cache: Option<&Path>) -> Result<GuestModule> {
+        Self::new_with_aot(engine, wasm, cache, true)
+    }
+
+    fn new_with_aot(engine: &Engine, wasm: &[u8], cache: Option<&Path>, prefer_aot: bool) -> Result<GuestModule> {
         #[cfg(feature = "compiler")]
         {
             let abi = Arc::new(read_abi(wasm)?);
-            let module = compile(engine, wasm, cache)?;
-            validate_module(&module, &abi)?;
+            let use_aot = if prefer_aot { wtime_aot::preferred_for_run() } else { wtime_aot::enabled() };
+            let module = if use_aot && abi.tasks.is_none() {
+                CompiledModule::WtimeAot(wtime_aot::AotModule::compile(wasm, &abi, cache)?)
+            } else {
+                let module = compile(engine, wasm, cache)?;
+                validate_module(&module, &abi)?;
+                CompiledModule::Wasmtime(module)
+            };
             let imaged = Arc::new(imaged_globals(wasm));
             Ok(GuestModule { module, trace: None, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
         }
         #[cfg(not(feature = "compiler"))]
         {
-            let _ = (engine, wasm, cache);
+            let _ = (engine, wasm, cache, prefer_aot);
             bail!(NO_COMPILER)
+        }
+    }
+
+    /// Backend executing this module (`"wtime-aot"` or `"wasmtime"`).
+    pub fn backend_name(&self) -> &'static str {
+        match &self.module {
+            CompiledModule::Wasmtime(_) => "wasmtime",
+            CompiledModule::WtimeAot(_) => "wtime-aot",
         }
     }
 
@@ -613,8 +644,7 @@ fn overran(state: &State, error: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// One instance of a guest module.
-pub struct Guest {
+struct WasmtimeGuest {
     store: Store<State>,
     instance: Instance,
     abi: Arc<GuestAbi>,
@@ -622,6 +652,17 @@ pub struct Guest {
     invocation_finish: Option<TypedFunc<(), i32>>,
     last_reclaimed_owners: Option<u32>,
     imaged: Arc<Result<Vec<String>, String>>,
+}
+
+enum GuestBackend {
+    Wasmtime(Box<WasmtimeGuest>),
+    WtimeAot(Box<wtime_aot::AotGuest>),
+}
+
+/// One instance of a guest module.
+pub struct Guest {
+    backend: GuestBackend,
+    abi: Arc<GuestAbi>,
 }
 
 /// An idle instance's state ([`Guest::capture`]): its memory and its
@@ -644,6 +685,138 @@ impl Guest {
     }
 
     fn start(engine: &Engine, module: &GuestModule, limits: Option<Limits>) -> Result<Guest> {
+        match &module.module {
+            CompiledModule::WtimeAot(aot) => {
+                let guest = wtime_aot::AotGuest::start(aot, module.abi.clone(), module.imaged.clone(), limits)?;
+                Ok(Guest { backend: GuestBackend::WtimeAot(Box::new(guest)), abi: module.abi.clone() })
+            }
+            CompiledModule::Wasmtime(wt_module) => {
+                let guest = WasmtimeGuest::start(engine, wt_module, module, limits)?;
+                Ok(Guest { backend: GuestBackend::Wasmtime(Box::new(guest)), abi: module.abi.clone() })
+            }
+        }
+    }
+
+    pub fn abi(&self) -> &GuestAbi {
+        &self.abi
+    }
+
+    /// Lets the guest run up to `deadline` at a time instead of [`DEADLINE`],
+    /// on [`dev_engine`], to within a fiftieth of [`DEADLINE`].
+    pub fn set_deadline(&mut self, deadline: Duration) {
+        if let GuestBackend::Wasmtime(wt) = &mut self.backend {
+            wt.store.data_mut().deadline = Some(deadline);
+        }
+    }
+
+    /// Shows `probe` what the guest does from now on: its memory and the
+    /// ownership counters it exports, as of each of its host calls, and the
+    /// calls into it; and samples it into the profile attached to it.
+    pub fn probe(&mut self, probe: Arc<Probe>) {
+        match &mut self.backend {
+            GuestBackend::Wasmtime(wt) => wt.probe(probe),
+            GuestBackend::WtimeAot(aot) => aot.probe(probe),
+        }
+    }
+
+    /// Committed linear-memory bytes, including temporary allocation capacity.
+    pub fn memory_bytes(&self) -> usize {
+        match &self.backend {
+            GuestBackend::Wasmtime(wt) => wt.memory_bytes(),
+            GuestBackend::WtimeAot(aot) => aot.memory_bytes(),
+        }
+    }
+
+    /// Temporary owners measured and reclaimed by the previous ABI 8 invocation.
+    pub fn last_reclaimed_owners(&self) -> Option<u32> {
+        match &self.backend {
+            GuestBackend::Wasmtime(wt) => wt.last_reclaimed_owners,
+            GuestBackend::WtimeAot(aot) => aot.last_reclaimed_owners(),
+        }
+    }
+
+    /// Keeps `gauge` at `memory_bytes`, updated whenever the guest calls the
+    /// host, for other threads to read while it runs.
+    pub fn track_memory(&mut self, gauge: Arc<AtomicUsize>) {
+        match &mut self.backend {
+            GuestBackend::Wasmtime(wt) => wt.track_memory(gauge),
+            GuestBackend::WtimeAot(aot) => aot.track_memory(gauge),
+        }
+    }
+
+    /// Calls the entrypoint `name`. A callback argument stays live only for
+    /// this invocation, and the guest's arena is reset before and after it
+    /// (and, under ABI 3, ownership entered before it and left after).
+    pub fn call(&mut self, name: &str, argument: impl Into<Argument>) -> Result<Value> {
+        match &mut self.backend {
+            GuestBackend::Wasmtime(wt) => wt.call(name, argument.into()),
+            GuestBackend::WtimeAot(aot) => aot.call(name, argument.into()),
+        }
+    }
+
+    /// Tears the instance down, as Blot's adapter disposes of one.
+    pub fn dispose(&mut self) -> Result<()> {
+        match &mut self.backend {
+            GuestBackend::Wasmtime(wt) => wt.dispose(),
+            GuestBackend::WtimeAot(aot) => aot.dispose(),
+        }
+    }
+
+    /// An image of the instance between calls: its memory (`blot:memory`)
+    /// and its mutable globals, sharing the pages `previous` has unchanged.
+    pub fn capture(&mut self, previous: Option<&GuestImage>) -> Result<(GuestImage, Captured)> {
+        match &mut self.backend {
+            GuestBackend::Wasmtime(wt) => wt.capture(previous),
+            GuestBackend::WtimeAot(aot) => aot.capture(previous),
+        }
+    }
+
+    /// Puts the instance back as `image` found it, growing its memory if
+    /// it has less. Returns the pages written.
+    pub fn restore(&mut self, image: &GuestImage) -> Result<usize> {
+        match &mut self.backend {
+            GuestBackend::Wasmtime(wt) => wt.restore(image),
+            GuestBackend::WtimeAot(aot) => aot.restore(image),
+        }
+    }
+
+    /// The ownership counters the guest exports, as they stand.
+    pub fn ownership(&mut self) -> OwnershipCounters {
+        let counters = self.runtime_counters();
+        let counter = |name: &str| counters.iter().find(|(counter, _)| counter == name).map(|(_, value)| *value);
+        OwnershipCounters {
+            roots: counter("blot:rc_roots"),
+            leases: counter("blot:rc_leases"),
+            host_refs: counter("blot:rc_host_refs"),
+            retains: counter("blot:rc_retains"),
+            releases: counter("blot:rc_releases"),
+            destroyed: counter("blot:rc_destroyed"),
+            cycle_passes: counter("blot:cycle_passes"),
+            cycle_vertices: counter("blot:cycle_vertices"),
+            cycle_edges: counter("blot:cycle_edges"),
+            cycle_bytes: counter("blot:cycle_bytes"),
+        }
+    }
+
+    /// Reads an exported scalar constant.
+    pub fn read(&mut self, name: &str) -> Result<Value> {
+        match &mut self.backend {
+            GuestBackend::Wasmtime(wt) => wt.read(name),
+            GuestBackend::WtimeAot(aot) => aot.read(name),
+        }
+    }
+
+    /// The guest runtime's own counters.
+    pub fn runtime_counters(&mut self) -> Vec<(String, u32)> {
+        match &mut self.backend {
+            GuestBackend::Wasmtime(wt) => wt.runtime_counters(),
+            GuestBackend::WtimeAot(aot) => aot.runtime_counters(),
+        }
+    }
+}
+
+impl WasmtimeGuest {
+    fn start(engine: &Engine, wt_module: &Module, module: &GuestModule, limits: Option<Limits>) -> Result<Self> {
         let mut store = Store::new(engine, State { symbols: module.symbols.clone(), ..State::default() });
         store.epoch_deadline_callback(deadline_reached);
         if let Some(limits) = limits {
@@ -668,7 +841,7 @@ impl Guest {
             })?;
         }
         let instance =
-            linker.instantiate(&mut store, &module.module).map_err(|error| overran(store.data(), error.into()))?;
+            linker.instantiate(&mut store, wt_module).map_err(|error| overran(store.data(), error.into()))?;
         if module.abi.uses_arrays() || module.abi.tasks.is_some() {
             let memory = instance
                 .get_memory(&mut store, "blot:memory")
@@ -703,7 +876,7 @@ impl Guest {
         } else {
             None
         };
-        Ok(Guest {
+        Ok(WasmtimeGuest {
             store,
             instance,
             abi: module.abi.clone(),
@@ -714,20 +887,7 @@ impl Guest {
         })
     }
 
-    pub fn abi(&self) -> &GuestAbi {
-        &self.abi
-    }
-
-    /// Lets the guest run up to `deadline` at a time instead of [`DEADLINE`],
-    /// on [`dev_engine`], to within a fiftieth of [`DEADLINE`].
-    pub fn set_deadline(&mut self, deadline: Duration) {
-        self.store.data_mut().deadline = Some(deadline);
-    }
-
-    /// Shows `probe` what the guest does from now on: its memory and the
-    /// ownership counters it exports, as of each of its host calls, and the
-    /// calls into it; and samples it into the profile attached to it.
-    pub fn probe(&mut self, probe: Arc<Probe>) {
+    fn probe(&mut self, probe: Arc<Probe>) {
         let counters = self.counter_globals();
         probe.counters_named(counters.iter().map(|(name, _)| name.trim_start_matches("blot:").to_owned()).collect());
         let state = self.store.data_mut();
@@ -735,34 +895,22 @@ impl Guest {
         state.probe = Some(probe);
     }
 
-    /// Committed linear-memory bytes, including temporary allocation capacity.
-    pub fn memory_bytes(&self) -> usize {
+    fn memory_bytes(&self) -> usize {
         match &self.store.data().arena {
             Some(arena) => arena.memory.data_size(&self.store),
             None => 0,
         }
     }
 
-    /// Temporary owners measured and reclaimed by the previous ABI 8 invocation.
-    pub fn last_reclaimed_owners(&self) -> Option<u32> {
-        self.last_reclaimed_owners
-    }
-
-    /// Keeps `gauge` at `memory_bytes`, updated whenever the guest calls the
-    /// host, for other threads to read while it runs.
-    pub fn track_memory(&mut self, gauge: Arc<AtomicUsize>) {
+    fn track_memory(&mut self, gauge: Arc<AtomicUsize>) {
         gauge.store(self.memory_bytes(), Ordering::Relaxed);
         self.store.data_mut().memory = Some(gauge);
     }
 
-    /// Calls the entrypoint `name`. A callback argument stays live only for
-    /// this invocation, and the guest's arena is reset before and after it
-    /// (and, under ABI 3, ownership entered before it and left after).
-    pub fn call(&mut self, name: &str, argument: impl Into<Argument>) -> Result<Value> {
+    fn call(&mut self, name: &str, argument: Argument) -> Result<Value> {
         ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
         let function =
             self.abi.function(name).ok_or_else(|| anyhow!("unknown_export: unknown function export {name}"))?.clone();
-        let argument = argument.into();
         let result = self.begin_and_run(&function, argument).map_err(|error| overran(self.store.data(), error));
         let trace_finish = if let Some(mut tracing) = self.store.data_mut().tracing.take() {
             let counts = tracing.counts(&mut self.store);
@@ -827,8 +975,6 @@ impl Guest {
         from_wasm(&mut self.store, arena.as_ref(), function.result, &results[0])
     }
 
-    /// Ends a call, releases its temporary guest state, and resets the packet
-    /// arena. The final steps still run if task or invocation cleanup fails.
     fn finish(&mut self, outcome: i32) -> Result<()> {
         let task_result = tasks::finish(&mut self.store, outcome != LEFT_NORMALLY);
         self.store.data_mut().active = None;
@@ -857,13 +1003,7 @@ impl Guest {
         Ok(())
     }
 
-    /// Tears the instance down, as Blot's adapter disposes of one: an ABI 3
-    /// guest leaves ownership for good (outcome 2), releasing its module's
-    /// roots and draining what it was destroying, and its arena is reset.
-    /// Afterwards it takes no calls or reads, but its store stays to be
-    /// looked at ([`Guest::ownership`], [`Guest::memory_bytes`]). Disposing
-    /// again does nothing.
-    pub fn dispose(&mut self) -> Result<()> {
+    fn dispose(&mut self) -> Result<()> {
         if std::mem::replace(&mut self.store.data_mut().disposed, true) {
             return Ok(());
         }
@@ -884,13 +1024,7 @@ impl Guest {
         left
     }
 
-    /// An image of the instance between calls: its memory (`blot:memory`)
-    /// and its mutable globals, sharing the pages `previous` has unchanged.
-    /// Restored ([`Guest::restore`]), the instance is as it was, for a
-    /// module whose state is all there: one that exports every mutable
-    /// global (others are refused). A long-lived `main(host)` is never
-    /// between calls while it runs, so it cannot be imaged.
-    pub fn capture(&mut self, previous: Option<&GuestImage>) -> Result<(GuestImage, Captured)> {
+    fn capture(&mut self, previous: Option<&GuestImage>) -> Result<(GuestImage, Captured)> {
         ensure!(self.abi.tasks.is_none(), "task contexts are host state and cannot be memory-imaged");
         ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
         let names = self.imaged.as_ref().as_ref().map_err(|why| anyhow!("this guest cannot be imaged: {why}"))?;
@@ -905,10 +1039,7 @@ impl Guest {
         Ok((GuestImage { memory, globals }, captured))
     }
 
-    /// Puts the instance back as `image` found it, growing its memory if
-    /// it has less (memory never shrinks: what lies past the image is
-    /// zeroed). Returns the pages written.
-    pub fn restore(&mut self, image: &GuestImage) -> Result<usize> {
+    fn restore(&mut self, image: &GuestImage) -> Result<usize> {
         ensure!(self.abi.tasks.is_none(), "task contexts are host state and cannot be memory-imaged");
         ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
         let mut written = 0;
@@ -926,26 +1057,7 @@ impl Guest {
         Ok(written)
     }
 
-    /// The ownership counters the guest exports, as they stand.
-    pub fn ownership(&mut self) -> OwnershipCounters {
-        let counters = self.runtime_counters();
-        let counter = |name: &str| counters.iter().find(|(counter, _)| counter == name).map(|(_, value)| *value);
-        OwnershipCounters {
-            roots: counter("blot:rc_roots"),
-            leases: counter("blot:rc_leases"),
-            host_refs: counter("blot:rc_host_refs"),
-            retains: counter("blot:rc_retains"),
-            releases: counter("blot:rc_releases"),
-            destroyed: counter("blot:rc_destroyed"),
-            cycle_passes: counter("blot:cycle_passes"),
-            cycle_vertices: counter("blot:cycle_vertices"),
-            cycle_edges: counter("blot:cycle_edges"),
-            cycle_bytes: counter("blot:cycle_bytes"),
-        }
-    }
-
-    /// Reads an exported scalar constant.
-    pub fn read(&mut self, name: &str) -> Result<Value> {
+    fn read(&mut self, name: &str) -> Result<Value> {
         ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
         let constant = self
             .abi
@@ -962,19 +1074,11 @@ impl Guest {
         from_wasm(&mut self.store, None, constant.value, &value)
     }
 
-    /// The guest runtime's own counters: its exported `blot:` 32-bit integer
-    /// globals (under ABI 3 its reference counts' retains and releases, and
-    /// its cycle collector's passes and the objects, edges and bytes they
-    /// visited), by name, as unsigned numbers that wrap at 2^32. Empty for a
-    /// guest that keeps none.
-    pub fn runtime_counters(&mut self) -> Vec<(String, u32)> {
+    fn runtime_counters(&mut self) -> Vec<(String, u32)> {
         let globals = self.counter_globals();
         globals.into_iter().filter_map(|(name, global)| Some((name, counter(global.get(&mut self.store))?))).collect()
     }
 
-    /// The globals behind [`Guest::runtime_counters`], which
-    /// [`Guest::ownership`] and a [`Probe`] read too: the guest's exported
-    /// `blot:` globals that are not ABI constants, by name.
     fn counter_globals(&mut self) -> Vec<(String, Global)> {
         let globals: Vec<(String, Global)> = self
             .instance

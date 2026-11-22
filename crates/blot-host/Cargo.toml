@@ -21,6 +21,7 @@ anyhow.workspace = true
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }
 # The compiled-module cache's keys.
 sha2 = { version = "0.10", optional = true }
+libloading = "0.8"
 pen-runtime.workspace = true
 wasmtime.workspace = true
 # Reads which globals a module exports (images); wasmtime's own version.

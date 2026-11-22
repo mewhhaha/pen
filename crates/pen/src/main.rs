@@ -173,6 +173,22 @@ fn clean() -> Result<()> {
 /// The game's module: `game.cwasm` when the package precompiled it for this
 /// runtime, else `game.wasm` compiled now (and cached).
 fn load_module(engine: &wasmtime::Engine, game: &Path, cache: bool, measure_systems: bool) -> Result<GuestModule> {
+    load_module_with(engine, game, cache, measure_systems, false)
+}
+
+/// Like [`load_module`], but prefers `wtime-aot` for `pen run` builds when
+/// available (disable with `PEN_WTIME_AOT=0`).
+fn load_run_module(engine: &wasmtime::Engine, game: &Path, cache: bool, measure_systems: bool) -> Result<GuestModule> {
+    load_module_with(engine, game, cache, measure_systems, true)
+}
+
+fn load_module_with(
+    engine: &wasmtime::Engine,
+    game: &Path,
+    cache: bool,
+    measure_systems: bool,
+    prefer_aot: bool,
+) -> Result<GuestModule> {
     let metadata = game.join("game.meta");
     if metadata.is_file() {
         let started = Instant::now();
@@ -191,7 +207,7 @@ fn load_module(engine: &wasmtime::Engine, game: &Path, cache: bool, measure_syst
     }
     #[cfg(not(feature = "compiler"))]
     {
-        let _ = (cache, measure_systems);
+        let _ = (cache, measure_systems, prefer_aot);
         bail!("{} is missing; package the game again with `pen build`", metadata.display())
     }
     #[cfg(feature = "compiler")]
@@ -216,8 +232,16 @@ fn load_module(engine: &wasmtime::Engine, game: &Path, cache: bool, measure_syst
             return GuestModule::traced(engine, &wasm, cache.as_deref(), blot_host::SystemTrace::live());
         }
         let _ = measure_systems;
-        let module = GuestModule::new(engine, &wasm, cache.as_deref())?;
-        eprintln!("game module ready in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+        let module = if prefer_aot {
+            GuestModule::new_run(engine, &wasm, cache.as_deref())?
+        } else {
+            GuestModule::new(engine, &wasm, cache.as_deref())?
+        };
+        if module.backend_name() == "wtime-aot" {
+            eprintln!("game module ready in {:.0} ms (wtime-aot)", started.elapsed().as_secs_f64() * 1000.0);
+        } else {
+            eprintln!("game module ready in {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+        }
         startup::mark("program loaded");
         Ok(module)
     }
@@ -1904,7 +1928,11 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
     scene_assets::warm_up(&paths.assets, paths.scene_to_read());
     // Development recompiles after every edit, reusing unchanged functions.
     let engine = if dev { blot_host::dev_engine()? } else { blot_host::engine()? };
-    let module = load_module(&engine, &game.directory, !dev, checkout.is_some())?;
+    let module = if !dev {
+        load_run_module(&engine, &game.directory, true, checkout.is_some())?
+    } else {
+        load_module(&engine, &game.directory, false, checkout.is_some())?
+    };
     let catalog = read_catalog(&paths.assets)?;
     let mods = load_mods(args)?;
     // A packaged game has no dev tools program, but may answer remote ones.

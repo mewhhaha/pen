@@ -80,7 +80,7 @@ impl GuestModule {
             .context("the precompiled game does not suit this runtime; package it again with `pen build`")?;
         validate_module(&module, &abi)?;
         Ok(Self {
-            module,
+            module: CompiledModule::Wasmtime(module),
             trace: None,
             abi,
             symbols: Arc::new(Symbols::read(&metadata.sections)),

@@ -566,6 +566,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "libloading",
  "pen-plugins",
  "pen-protocol",
  "pen-runtime",

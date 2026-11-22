@@ -25,6 +25,7 @@ pub mod worker_sessions;
 pub mod workers;
 mod wtime_aot;
 pub use system_trace::SystemTrace;
+pub use wtime_aot::{X64_ADMISSION_REJECTED_EXIT_CODE, X64FallbackError, X64FallbackReason};
 
 use std::any::Any;
 use std::fmt;
@@ -90,8 +91,20 @@ fn imaged_globals(wasm: &[u8]) -> Result<Vec<String>, String> {
         match payload.map_err(|error| error.to_string())? {
             wasmparser::Payload::ImportSection(section) => {
                 for import in section.into_imports() {
-                    if let wasmparser::TypeRef::Global(_) = import.map_err(|error| error.to_string())?.ty {
-                        imported += 1;
+                    match import.map_err(|error| error.to_string())?.ty {
+                        wasmparser::TypeRef::Global(_) => imported += 1,
+                        wasmparser::TypeRef::Table(table_ty) if table_ty.element_type.is_extern_ref() => {
+                            return Err("mutable externref tables are not captured by snapshots".into());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            wasmparser::Payload::TableSection(section) => {
+                for table in section {
+                    let table = table.map_err(|error| error.to_string())?;
+                    if table.ty.element_type.is_extern_ref() {
+                        return Err("mutable externref tables are not captured by snapshots".into());
                     }
                 }
             }
@@ -142,6 +155,11 @@ impl GuestModule {
     /// Compiles `wasm`, reusing a compiled copy from `cache` when one exists
     /// for these bytes and this engine's configuration. Fails without the
     /// `compiler` feature.
+    ///
+    /// When `cache` is `Some`, the cache directory MUST be an owner-private
+    /// (`0o700`) local directory with trusted ancestors; native `.cwasm`/`.so`
+    /// caches fail closed before reading or writing if ownership or ancestor
+    /// permissions cannot be verified.
     pub fn new(engine: &Engine, wasm: &[u8], cache: Option<&Path>) -> Result<GuestModule> {
         Self::new_with_aot(engine, wasm, cache, false)
     }
@@ -149,6 +167,9 @@ impl GuestModule {
     /// Compiles `wasm` for a `pen run` session, selecting `wtime-aot` when
     /// available and permitted by the engine/ABI (unless `PEN_WTIME_AOT=0`),
     /// otherwise compiling with Wasmtime.
+    ///
+    /// When `cache` is `Some`, enforces the same owner-private (`0o700`) cache
+    /// hierarchy trust boundary as [`GuestModule::new`].
     pub fn new_run(engine: &Engine, wasm: &[u8], cache: Option<&Path>) -> Result<GuestModule> {
         Self::new_with_aot(engine, wasm, cache, true)
     }
@@ -267,6 +288,7 @@ fn compile(engine: &Engine, wasm: &[u8], cache: Option<&Path>) -> Result<Module>
 
 #[cfg(feature = "compiler")]
 fn compile_cached(engine: &Engine, wasm: &[u8], directory: &Path) -> Result<Module> {
+    let directory = wtime_aot::ensure_private_cache_dir(directory)?;
     let key = cache_key(engine, wasm);
     let path = directory.join(format!("{key}.cwasm"));
     if path.exists() {
@@ -291,7 +313,6 @@ fn compile_cached(engine: &Engine, wasm: &[u8], directory: &Path) -> Result<Modu
         if serialized.len() > CACHE_MODULE_BYTES {
             return Ok(());
         }
-        std::fs::create_dir_all(directory)?;
         static NEXT_WRITE: AtomicU64 = AtomicU64::new(0);
         let temporary =
             path.with_extension(format!("{}-{}.tmp", std::process::id(), NEXT_WRITE.fetch_add(1, Ordering::Relaxed)));
@@ -300,7 +321,7 @@ fn compile_cached(engine: &Engine, wasm: &[u8], directory: &Path) -> Result<Modu
             let _ = std::fs::remove_file(&temporary);
             return Err(error.into());
         }
-        prune(directory, std::time::SystemTime::now())?;
+        prune(&directory, std::time::SystemTime::now())?;
         Ok(())
     })();
     Ok(module)
@@ -323,7 +344,14 @@ fn write_cache_file(path: &Path, key: &str, serialized: &[u8]) -> std::io::Resul
     use std::io::Write;
     // A colliding temporary file belongs to another writer. Only remove a
     // failed partial file after create_new has established our ownership.
-    let mut file = std::fs::File::options().write(true).create_new(true).open(path)?;
+    let mut opts = std::fs::File::options();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
     let written = (|| {
         file.write_all(&cache_header(key, serialized))?;
         file.write_all(serialized)
@@ -356,17 +384,37 @@ fn checked_cache_bytes<'a>(bytes: &'a [u8], key: &str) -> Option<&'a [u8]> {
 #[cfg(feature = "compiler")]
 fn read_cached_module(engine: &Engine, path: &Path, key: &str) -> Option<Module> {
     use std::io::Read;
+    let sym = std::fs::symlink_metadata(path).ok()?;
+    if sym.file_type().is_symlink() || !sym.file_type().is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let euid = wtime_aot::current_euid().ok()?;
+        if sym.uid() != euid || sym.permissions().mode() & 0o022 != 0 {
+            return None;
+        }
+    }
     let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.dev() != sym.dev() || meta.ino() != sym.ino() {
+            return None;
+        }
+    }
     let limit = u64::try_from(CACHE_HEADER_BYTES + CACHE_MODULE_BYTES).ok()?;
-    if file.metadata().ok()?.len() > limit {
+    if meta.len() > limit {
         return None;
     }
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes).ok()?;
     let serialized = checked_cache_bytes(&bytes, key)?;
-    // SAFETY: only this trusted local cache writes these native artifacts. The
-    // exact source/engine key and payload checksum were checked before handing
-    // an immutable owned byte buffer to Wasmtime; no reopen can race that check.
+    // SAFETY: the parent cache directory passed owner-only `0o700` hierarchy checks, the artifact
+    // is a non-symlink regular file owned by `euid` with no group/other write bits, and the exact
+    // source/engine key and payload checksum were checked before handing an owned buffer to Wasmtime.
     unsafe { Module::deserialize(engine, serialized) }.ok()
 }
 

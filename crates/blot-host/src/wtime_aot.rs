@@ -137,18 +137,45 @@ struct AotLibrary {
 unsafe impl Send for AotLibrary {}
 unsafe impl Sync for AotLibrary {}
 
-/// Typed error returned when the current host CPU does not satisfy the required x64 ISA profile
-/// (either during compile-time host feature detection or via `blot_aot_new` trap code `22`).
-#[derive(Debug)]
-pub struct UnsupportedIsaError(pub String);
+/// Dedicated exit code emitted by `wtime-aot --backend x64` when a Wasm module is cleanly
+/// rejected by x64 admission checks (distinct from exit code `1` for usage/I/O/compiler errors),
+/// so default-path fallback never needs to parse stderr.
+pub const X64_ADMISSION_REJECTED_EXIT_CODE: i32 = 4;
 
-impl std::fmt::Display for UnsupportedIsaError {
+/// Reason why `wtime-aot --backend x64` is not applicable to the current host or module,
+/// enabling clean default-path fallback to `--backend c --c-opt auto` while `wasm` and `cache`
+/// are still in scope (never swallowed when `PEN_WTIME_AOT_BACKEND=x64` is explicitly set).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum X64FallbackReason {
+    /// Host OS, architecture, or pointer width is not Linux x86-64 LP64.
+    UnsupportedPlatform(String),
+    /// Host CPU lacks required x64 ISA features (SSE4.1+POPCNT / ABM+BMI1) or CET SHSTK is active.
+    UnsupportedIsa(String),
+    /// Module was rejected by `wtime-aot --backend x64` admission checks (exit code `4`).
+    AdmissionRejected(String),
+}
+
+/// Typed error returned when `wtime-aot --backend x64` declines a host or module cleanly.
+#[derive(Debug)]
+pub struct X64FallbackError(pub X64FallbackReason);
+
+impl std::fmt::Display for X64FallbackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "unsupported CPU ISA for wtime-aot x64: {}", self.0)
+        match &self.0 {
+            X64FallbackReason::UnsupportedPlatform(msg) => {
+                write!(f, "unsupported host platform for wtime-aot x64: {msg}")
+            }
+            X64FallbackReason::UnsupportedIsa(msg) => {
+                write!(f, "unsupported CPU ISA for wtime-aot x64: {msg}")
+            }
+            X64FallbackReason::AdmissionRejected(msg) => {
+                write!(f, "module rejected by wtime-aot x64 admission: {msg}")
+            }
+        }
     }
 }
 
-impl std::error::Error for UnsupportedIsaError {}
+impl std::error::Error for X64FallbackError {}
 
 impl AotLibrary {
     fn trap_error(&self, code: u8) -> anyhow::Error {
@@ -162,7 +189,7 @@ impl AotLibrary {
             format!("code {code}")
         };
         if code == 22 {
-            anyhow::Error::new(UnsupportedIsaError(msg))
+            anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(msg)))
         } else {
             anyhow!("wtime-aot trap: {msg}")
         }
@@ -213,88 +240,236 @@ fn file_sha256_hex(path: &Path) -> Result<String> {
     Ok(wasm_sha256_hex(&bytes))
 }
 
-/// Enforces an owner-controlled (`0o700`), symlink-free private cache directory hierarchy.
-/// Fails closed if `path` is a symlink (or traverses a non-root symlink), `chmod(0o700)` fails,
-/// non-owner permission bits remain, `path` is not owned by the current effective UID (covering
-/// `euid == 0` / `CAP_FOWNER`), or any ancestor is owned by an untrusted UID (preventing
-/// attacker-owned `0o1777` sticky directory replacement) or writable without the sticky bit.
+/// Returns the current effective UID on Unix, failing closed if unavailable.
+/// On Linux this parses `Uid:` field 2 (`euid`) from `/proc/self/status` so it stays exact
+/// even under `PR_SET_DUMPABLE=0` (where `/proc/self` metadata reports `st_uid == 0`).
+#[cfg(all(feature = "compiler", unix))]
+pub(crate) fn current_euid() -> Result<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status")
+            .context("reading /proc/self/status for effective uid")?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("Uid:") {
+                let euid_str = rest
+                    .split_whitespace()
+                    .nth(1)
+                    .ok_or_else(|| anyhow!("malformed Uid line in /proc/self/status"))?;
+                return euid_str
+                    .parse::<u32>()
+                    .context("parsing effective uid from /proc/self/status");
+            }
+        }
+        bail!("missing Uid line in /proc/self/status")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = Command::new("/usr/bin/id")
+            .arg("-u")
+            .output()
+            .context("running /usr/bin/id -u for effective uid")?;
+        ensure!(out.status.success(), "/usr/bin/id -u failed ({})", out.status);
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u32>()
+            .context("parsing effective uid from /usr/bin/id -u")
+    }
+}
+
+#[cfg(all(feature = "compiler", unix))]
+fn validate_trusted_ancestor(anc: &Path, target: &Path, euid: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let am = std::fs::symlink_metadata(anc)
+        .with_context(|| format!("lstat cache ancestor {}", anc.display()))?;
+    ensure!(
+        !am.file_type().is_symlink() && am.file_type().is_dir(),
+        "cache ancestor {} (for {}) is not a real directory",
+        anc.display(),
+        target.display()
+    );
+    let uid = am.uid();
+    ensure!(
+        uid == 0 || uid == euid,
+        "cache ancestor {} (for {}) is owned by untrusted uid {uid} (expected 0 or {euid})",
+        anc.display(),
+        target.display()
+    );
+    let mode = am.permissions().mode();
+    ensure!(
+        (mode & 0o022) == 0 || (mode & 0o1000) != 0,
+        "cache ancestor {} (for {}) is writable without sticky bit",
+        anc.display(),
+        target.display()
+    );
+    Ok(())
+}
+
+/// Enforces an owner-controlled (`0o700`), symlink-free private cache directory hierarchy
+/// BEFORE performing any directory creation or `chmod`, returning the verified canonical path.
+/// Fails closed if effective UID cannot be determined, `path` contains `..` or targets `/`,
+/// traverses a non-root symlink, has untrusted/non-sticky-writable ancestors, targets a foreign-
+/// owned or pre-existing group/world-writable directory, or fails `0o700` creation/tightening.
 #[cfg(feature = "compiler")]
-fn ensure_private_cache_dir(path: &Path) -> Result<()> {
-    std::fs::create_dir_all(path).with_context(|| format!("creating cache dir {}", path.display()))?;
+pub(crate) fn ensure_private_cache_dir(path: &Path) -> Result<PathBuf> {
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path).with_context(|| format!("creating cache dir {}", path.display()))?;
+        std::fs::canonicalize(path).with_context(|| format!("canonicalizing cache dir {}", path.display()))
+    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let proc_euid = std::fs::metadata("/proc/self").ok().map(|m| m.uid());
-        let mut prefix = PathBuf::new();
-        for comp in path.components() {
-            prefix.push(comp);
-            if let Ok(m) = std::fs::symlink_metadata(&prefix)
-                && m.file_type().is_symlink()
-                && m.uid() != 0
-            {
-                bail!(
-                    "wtime-aot cache hierarchy traverses non-root symlink {} (in {})",
-                    prefix.display(),
-                    path.display()
-                );
-            }
-        }
-        let sym = std::fs::symlink_metadata(path).with_context(|| format!("lstat cache dir {}", path.display()))?;
-        ensure!(
-            !sym.file_type().is_symlink() && sym.file_type().is_dir(),
-            "wtime-aot cache path must be a real directory (not a symlink): {}",
-            path.display()
-        );
-        // Propagate `set_permissions` error: on Unix `chmod` fails with `EPERM` if not owned by euid.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("enforcing owner-only 0700 permissions on {}", path.display()))?;
-        let post = std::fs::symlink_metadata(path).with_context(|| format!("lstat cache dir {}", path.display()))?;
-        ensure!(
-            !post.file_type().is_symlink() && post.file_type().is_dir(),
-            "wtime-aot cache directory changed type during validation: {}",
-            path.display()
-        );
-        ensure!(
-            post.permissions().mode() & 0o077 == 0,
-            "wtime-aot cache directory must be owner-only (0700): {}",
-            path.display()
-        );
-        let expected_uid = match proc_euid {
-            Some(euid) => {
-                ensure!(
-                    post.uid() == euid,
-                    "wtime-aot cache directory {} owner uid {} does not match effective uid {euid}",
-                    path.display(),
-                    post.uid()
-                );
-                euid
-            }
-            None => post.uid(),
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        use std::path::Component;
+        let euid = current_euid()?;
+        let abs_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .with_context(|| format!("resolving current_dir for {}", path.display()))?
+                .join(path)
         };
-        let canon = std::fs::canonicalize(path).with_context(|| format!("canonicalizing {}", path.display()))?;
-        for anc in canon.ancestors().skip(1) {
-            let am = std::fs::symlink_metadata(anc)
-                .with_context(|| format!("lstat cache ancestor {}", anc.display()))?;
+        let mut existing = PathBuf::new();
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        let mut in_missing = false;
+        for comp in abs_path.components() {
+            match comp {
+                Component::CurDir => continue,
+                Component::ParentDir => {
+                    bail!("cache path must not contain '..' components: {}", path.display());
+                }
+                Component::RootDir => {
+                    ensure!(!in_missing, "malformed cache path: {}", path.display());
+                    existing.push(comp.as_os_str());
+                }
+                Component::Prefix(_) => bail!("unsupported path prefix: {}", path.display()),
+                Component::Normal(part) => {
+                    if in_missing {
+                        missing.push(part.to_os_string());
+                        continue;
+                    }
+                    let candidate = existing.join(part);
+                    match std::fs::symlink_metadata(&candidate) {
+                        Ok(m) => {
+                            if m.file_type().is_symlink() {
+                                ensure!(
+                                    m.uid() == 0,
+                                    "cache hierarchy traverses non-root symlink {} (in {})",
+                                    candidate.display(),
+                                    path.display()
+                                );
+                            } else {
+                                ensure!(
+                                    m.file_type().is_dir(),
+                                    "cache path component {} is not a directory",
+                                    candidate.display()
+                                );
+                            }
+                            existing = candidate;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            in_missing = true;
+                            missing.push(part.to_os_string());
+                        }
+                        Err(e) => {
+                            return Err(e).with_context(|| format!("lstat cache component {}", candidate.display()));
+                        }
+                    }
+                }
+            }
+        }
+        ensure!(!existing.as_os_str().is_empty(), "empty cache path: {}", path.display());
+        let canon_existing = std::fs::canonicalize(&existing)
+            .with_context(|| format!("canonicalizing {}", existing.display()))?;
+        if missing.is_empty() {
             ensure!(
-                !am.file_type().is_symlink() && am.file_type().is_dir(),
-                "wtime-aot cache ancestor {} is not a real directory",
-                anc.display()
+                canon_existing.parent().is_some(),
+                "refusing to use filesystem root as cache directory"
             );
-            let uid = am.uid();
+            let sym = std::fs::symlink_metadata(&abs_path)
+                .with_context(|| format!("lstat cache dir {}", abs_path.display()))?;
             ensure!(
-                uid == 0 || uid == expected_uid,
-                "wtime-aot cache ancestor {} is owned by untrusted uid {uid} (expected 0 or {expected_uid})",
-                anc.display()
+                !sym.file_type().is_symlink() && sym.file_type().is_dir(),
+                "cache path must be a real directory (not a symlink): {}",
+                path.display()
             );
-            let mode = am.permissions().mode();
             ensure!(
-                (mode & 0o022) == 0 || (mode & 0o1000) != 0,
-                "wtime-aot cache ancestor {} is writable without sticky bit",
-                anc.display()
+                sym.uid() == euid,
+                "cache directory {} owner uid {} does not match effective uid {euid}",
+                path.display(),
+                sym.uid()
+            );
+            ensure!(
+                sym.permissions().mode() & 0o022 == 0,
+                "refusing pre-existing group/world-writable cache directory {} (mode {:o})",
+                path.display(),
+                sym.permissions().mode() & 0o7777
+            );
+            for anc in canon_existing.ancestors().skip(1) {
+                validate_trusted_ancestor(anc, path, euid)?;
+            }
+            if sym.permissions().mode() & 0o077 != 0 {
+                std::fs::set_permissions(&canon_existing, std::fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("enforcing owner-only 0700 permissions on {}", path.display()))?;
+            }
+            let post = std::fs::symlink_metadata(&canon_existing)
+                .with_context(|| format!("lstat cache dir {}", canon_existing.display()))?;
+            ensure!(
+                !post.file_type().is_symlink()
+                    && post.file_type().is_dir()
+                    && post.uid() == euid
+                    && post.permissions().mode() & 0o077 == 0
+                    && post.dev() == sym.dev()
+                    && post.ino() == sym.ino(),
+                "cache directory failed post-validation identity/mode checks: {}",
+                path.display()
+            );
+            return Ok(canon_existing);
+        }
+
+        for anc in canon_existing.ancestors() {
+            validate_trusted_ancestor(anc, path, euid)?;
+        }
+        let mut cur = canon_existing;
+        for part in missing {
+            cur.push(&part);
+            let mut db = std::fs::DirBuilder::new();
+            db.mode(0o700);
+            match db.create(&cur) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let pre = std::fs::symlink_metadata(&cur)
+                        .with_context(|| format!("lstat cache dir {}", cur.display()))?;
+                    ensure!(
+                        !pre.file_type().is_symlink()
+                            && pre.file_type().is_dir()
+                            && pre.uid() == euid
+                            && pre.permissions().mode() & 0o022 == 0,
+                        "concurrently created cache directory failed ownership/mode checks: {}",
+                        cur.display()
+                    );
+                    if pre.permissions().mode() & 0o077 != 0 {
+                        std::fs::set_permissions(&cur, std::fs::Permissions::from_mode(0o700))
+                            .with_context(|| format!("enforcing 0700 permissions on {}", cur.display()))?;
+                    }
+                }
+                Err(e) => return Err(e).with_context(|| format!("creating cache dir {}", cur.display())),
+            }
+            let post = std::fs::symlink_metadata(&cur)
+                .with_context(|| format!("lstat cache dir {}", cur.display()))?;
+            ensure!(
+                !post.file_type().is_symlink()
+                    && post.file_type().is_dir()
+                    && post.uid() == euid
+                    && post.permissions().mode() & 0o077 == 0,
+                "created cache directory failed 0700 ownership checks: {}",
+                cur.display()
             );
         }
+        let canon_leaf = std::fs::canonicalize(&cur)
+            .with_context(|| format!("canonicalizing created cache dir {}", cur.display()))?;
+        ensure!(canon_leaf == cur, "cache directory changed path during creation: {}", cur.display());
+        Ok(canon_leaf)
     }
-    Ok(())
 }
 
 /// Checks that an existing verified `.so` is a non-symlink regular file with no write bits set.
@@ -351,20 +526,18 @@ fn publish_immutable_verified_so(verified_dir: &Path, so_sha: &str, bytes: &[u8]
     Ok(dest)
 }
 
+#[cfg(all(feature = "compiler", unix))]
+type BinStamp = (u64, u64, u64, i64, i64, i64, i64);
+#[cfg(all(feature = "compiler", not(unix)))]
+type BinStamp = (u64, u64, u32);
+
 #[cfg(feature = "compiler")]
-fn bin_digest(bin: &Path) -> Result<(PathBuf, String)> {
-    let canon = std::fs::canonicalize(bin).with_context(|| format!("canonicalizing wtime-aot binary {}", bin.display()))?;
+fn bin_stamp(canon: &Path) -> Result<BinStamp> {
+    let meta = std::fs::metadata(canon).with_context(|| format!("stat wtime-aot binary {}", canon.display()))?;
     #[cfg(unix)]
-    type StampKey = (PathBuf, u64, u64, u64, i64, i64, i64, i64);
-    #[cfg(not(unix))]
-    type StampKey = (PathBuf, u64, u64, u32);
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<StampKey, String>>> = OnceLock::new();
-    let meta = std::fs::metadata(&canon).with_context(|| format!("stat wtime-aot binary {}", canon.display()))?;
-    #[cfg(unix)]
-    let key = {
+    {
         use std::os::unix::fs::MetadataExt;
-        (
-            canon.clone(),
+        Ok((
             meta.dev(),
             meta.ino(),
             meta.len(),
@@ -372,17 +545,25 @@ fn bin_digest(bin: &Path) -> Result<(PathBuf, String)> {
             meta.mtime_nsec(),
             meta.ctime(),
             meta.ctime_nsec(),
-        )
-    };
+        ))
+    }
     #[cfg(not(unix))]
-    let key = {
+    {
         let (secs, nanos) = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()));
-        (canon.clone(), meta.len(), secs, nanos)
-    };
+        Ok((meta.len(), secs, nanos))
+    }
+}
+
+#[cfg(feature = "compiler")]
+fn bin_digest(bin: &Path) -> Result<(PathBuf, String)> {
+    let canon = std::fs::canonicalize(bin).with_context(|| format!("canonicalizing wtime-aot binary {}", bin.display()))?;
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(PathBuf, BinStamp), String>>> = OnceLock::new();
+    let stamp = bin_stamp(&canon)?;
+    let key = (canon.clone(), stamp);
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(hit) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key).cloned() {
         return Ok((canon, hit));
@@ -390,6 +571,44 @@ fn bin_digest(bin: &Path) -> Result<(PathBuf, String)> {
     let digest = file_sha256_hex(&canon)?;
     cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, digest.clone());
     Ok((canon, digest))
+}
+
+/// Computes a deterministic 16-hex-char fingerprint of the adjacent `wtime-aot/rt` runtime crate
+/// sources when using `--backend rust`, preventing stale Rust fast-cache hits after runtime edits.
+#[cfg(feature = "compiler")]
+fn rt_sources_fingerprint(canon_bin: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let rt_dir = canon_bin
+        .ancestors()
+        .skip(1)
+        .take(4)
+        .map(|anc| anc.join("rt"))
+        .find(|cand| cand.join("Cargo.toml").is_file() && cand.join("src").is_dir());
+    let Some(rt_dir) = rt_dir else {
+        return "no-rt".to_string();
+    };
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut pending = vec![rt_dir.join("Cargo.toml"), rt_dir.join("src")];
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    pending.push(entry.path());
+                }
+            }
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            let rel = path.strip_prefix(&rt_dir).unwrap_or(&path).to_string_lossy().into_owned();
+            files.push((rel, bytes));
+        }
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut hasher = Sha256::new();
+    for (rel, bytes) in files {
+        hasher.update(rel.as_bytes());
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
 #[cfg(feature = "compiler")]
@@ -468,22 +687,24 @@ fn rustc_version_fingerprint(toolchain: &str) -> String {
 }
 
 /// Canonical internal cache profile tag matching `wtime-aot --backend x64 --target-cpu`,
-/// also checking host CPU capability (`SSE4.1 + POPCNT`, plus `ABM/LZCNT + BMI1` for `x64-v3`)
-/// BEFORE cache lookup so unsupported Linux x86-64 LP64 CPUs fail with a typed `UnsupportedIsaError`
+/// also checking host platform & CPU capability (`SSE4.1 + POPCNT`, plus `ABM/LZCNT + BMI1` for
+/// `x64-v3`) BEFORE cache lookup so unsupported hosts fail with a typed `X64FallbackError`
 /// while `wasm` & `cache` are still available for default-path fallback.
 #[cfg(feature = "compiler")]
 fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64")))]
     {
         let _ = target_cpu;
-        bail!("wtime-aot --backend x64 is only supported on Linux x86_64 LP64 hosts")
+        Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedPlatform(
+            "wtime-aot --backend x64 is only supported on Linux x86_64 LP64 hosts".into(),
+        ))))
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
     {
         if !std::is_x86_feature_detected!("sse4.1") || !std::is_x86_feature_detected!("popcnt") {
-            return Err(anyhow::Error::new(UnsupportedIsaError(
+            return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(
                 "host CPU lacks baseline SSE4.1 + POPCNT required by wtime-aot --backend x64".into(),
-            )));
+            ))));
         }
         let tag = match target_cpu {
             "native" => {
@@ -509,9 +730,9 @@ fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
             ),
         };
         if tag == "x64-v3" && (!std::is_x86_feature_detected!("lzcnt") || !std::is_x86_feature_detected!("bmi1")) {
-            return Err(anyhow::Error::new(UnsupportedIsaError(format!(
+            return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(format!(
                 "host CPU lacks ABM/LZCNT + BMI1 required by PEN_WTIME_AOT_TARGET_CPU={target_cpu:?}"
-            ))));
+            )))));
         }
         Ok(tag)
     }
@@ -589,6 +810,14 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
         .unwrap_or_else(|| "native".to_string());
 
     // Validate backend and target/host platform BEFORE touching the filesystem or hashing binaries.
+    let x64_isa = match backend.as_str() {
+        "c" | "rust" => None,
+        "x64" => Some(resolved_x64_isa_tag(&target_cpu)?),
+        other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
+    };
+
+    let bin = resolve_wtime_aot_bin().unwrap_or_else(|| PathBuf::from(DEFAULT_WTIME_AOT_BIN));
+    let (canon_bin, bin_hash) = bin_digest(&bin)?;
     let profile_tag = match backend.as_str() {
         "c" => {
             let cpu_tag = if target_cpu == "native" {
@@ -605,29 +834,26 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
                 sanitize_key_part(&target_cpu)
             };
             format!(
-                "rust-{}-{cpu_tag}-{}",
+                "rust-{}-{cpu_tag}-{}-{}",
                 sanitize_key_part(&toolchain),
-                rustc_version_fingerprint(&toolchain)
+                rustc_version_fingerprint(&toolchain),
+                rt_sources_fingerprint(&canon_bin)
             )
         }
-        "x64" => format!("x64-{}", resolved_x64_isa_tag(&target_cpu)?),
-        other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
+        "x64" => format!("x64-{}", x64_isa.expect("validated above")),
+        _ => unreachable!(),
     };
-
-    let bin = resolve_wtime_aot_bin().unwrap_or_else(|| PathBuf::from(DEFAULT_WTIME_AOT_BIN));
-    let (canon_bin, bin_hash) = bin_digest(&bin)?;
     let cache_dir = default_cache_dir(cache)?;
-    ensure_private_cache_dir(&cache_dir)?;
-    let canon_cache = std::fs::canonicalize(&cache_dir)
-        .with_context(|| format!("canonicalizing cache dir {}", cache_dir.display()))?;
-    let fast_dir = canon_cache.join("by-wasm");
-    let verified_dir = canon_cache.join("verified");
-    ensure_private_cache_dir(&fast_dir)?;
-    ensure_private_cache_dir(&verified_dir)?;
+    let canon_cache = ensure_private_cache_dir(&cache_dir)?;
+    let fast_dir = ensure_private_cache_dir(&canon_cache.join("by-wasm"))?;
+    let verified_dir = ensure_private_cache_dir(&canon_cache.join("verified"))?;
 
     let digest = wasm_sha256_hex(wasm);
     let fast_key = format!("{digest}-{profile_tag}-{bin_hash}");
-    let fast_link = fast_dir.join(format!("{fast_key}.path"));
+    // Hash `fast_key` to a fixed 64-hex-char filename so long profile/toolchain tags never exceed
+    // Linux's 255-byte `NAME_MAX`, while still checking full `fast_key` exactness on line 1.
+    let fast_link_name = wasm_sha256_hex(fast_key.as_bytes());
+    let fast_link = fast_dir.join(format!("{fast_link_name}.path"));
 
     // Single cohesive cache publication RWLock (`canon_cache/.cache.lock`, strictly ordered BEFORE
     // any builder `entry/.publish.lock`): shared lock across warm verification + `dlopen`,
@@ -659,8 +885,8 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
     }
 
     // Mismatch or stale entry under the exclusive lock (no reader can be mid-`dlopen`):
-    // restrict deletion strictly to `<canon_cache>/<entry>/library.so` (+ sidecar) serialized
-    // under `entry/.publish.lock`, so a corrupt `fast_link` can never unlink `.cache.lock` or `verified/*.so`.
+    // restrict deletion strictly to `<canon_cache>/<entry>/library.so` (+ sidecar) and require
+    // successful `entry/.publish.lock` acquisition as a hard prerequisite before unlinking.
     if let Ok(recorded) = std::fs::read_to_string(&fast_link) {
         let mut lines = recorded.lines();
         if let (Some(_), Some(_), Some(rec_path)) = (lines.next(), lines.next(), lines.next()) {
@@ -671,25 +897,30 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
                 && entry_dir.parent() == Some(canon_cache.as_path())
             {
                 let entry_lock_path = entry_dir.join(".publish.lock");
-                let _entry_lock = std::fs::File::options()
+                if let Ok(entry_lock) = std::fs::File::options()
                     .read(true)
                     .write(true)
                     .create(true)
                     .truncate(false)
                     .open(&entry_lock_path)
-                    .ok()
-                    .and_then(|f| f.lock().ok().map(|()| f));
-                let _ = std::fs::remove_file(&canon_so);
-                let _ = std::fs::remove_file(canon_so.with_extension("so.sha256"));
+                    && entry_lock.lock().is_ok()
+                {
+                    let _ = std::fs::remove_file(&canon_so);
+                    let _ = std::fs::remove_file(canon_so.with_extension("so.sha256"));
+                    drop(entry_lock);
+                }
             }
         }
         let _ = std::fs::remove_file(&fast_link);
     }
 
-    // Re-verify the exact canonicalized compiler binary right before invoking it on a cold build.
+    // Capture exact compiler provenance BEFORE invoking it, and re-verify AFTER execution so a
+    // concurrent compiler upgrade can never bind output from a new compiler to an old digest.
+    let pre_stamp = bin_stamp(&canon_bin)?;
     let cold_bin_hash = file_sha256_hex(&canon_bin)?;
     let fast_key = format!("{digest}-{profile_tag}-{cold_bin_hash}");
-    let fast_link = fast_dir.join(format!("{fast_key}.path"));
+    let fast_link_name = wasm_sha256_hex(fast_key.as_bytes());
+    let fast_link = fast_dir.join(format!("{fast_link_name}.path"));
 
     let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_wasm = canon_cache.join(format!("input-{digest}-{}-{seq}.wasm", std::process::id()));
@@ -715,8 +946,20 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
     drop(_cleanup_wasm);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if backend == "x64" && output.status.code() == Some(X64_ADMISSION_REJECTED_EXIT_CODE) {
+            return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::AdmissionRejected(
+                stderr.trim().to_string(),
+            ))));
+        }
         bail!("wtime-aot build failed ({}): {stderr}", output.status);
     }
+    let post_stamp = bin_stamp(&canon_bin)?;
+    let post_bin_hash = file_sha256_hex(&canon_bin)?;
+    ensure!(
+        pre_stamp == post_stamp && cold_bin_hash == post_bin_hash,
+        "wtime-aot compiler binary {} changed during build; refusing to bind artifact to stale provenance",
+        canon_bin.display()
+    );
     let so_path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
     ensure!(so_path.is_file(), "wtime-aot build did not produce {}", so_path.display());
     let canon_so = std::fs::canonicalize(&so_path)
@@ -738,7 +981,7 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
         sidecar.display()
     );
     let verified_so = publish_immutable_verified_so(&verified_dir, &so_sha, &so_bytes, seq)?;
-    let tmp_link = fast_dir.join(format!(".{fast_key}.{}.{seq}.tmp", std::process::id()));
+    let tmp_link = fast_dir.join(format!(".{fast_link_name}.{}.{seq}.tmp", std::process::id()));
     if let Ok(mut link_file) = std::fs::File::options().write(true).create_new(true).open(&tmp_link) {
         let written = link_file.write_all(format!("{fast_key}\n{so_sha}\n{}\n", canon_so.display()).as_bytes());
         drop(link_file);
@@ -870,6 +1113,7 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
                         "invalid_abi: wtime-aot supports at most one linear memory"
                     );
                     ensure!(!mem.memory64, "invalid_abi: wtime-aot does not support memory64");
+                    ensure!(!mem.shared, "invalid_abi: wtime-aot does not support shared memories");
                     ensure!(
                         mem.page_size_log2.is_none_or(|p| p == 16),
                         "invalid_abi: wtime-aot requires standard 64 KiB memory pages"

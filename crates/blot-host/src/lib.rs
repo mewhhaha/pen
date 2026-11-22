@@ -146,8 +146,9 @@ impl GuestModule {
         Self::new_with_aot(engine, wasm, cache, false)
     }
 
-    /// Compiles `wasm` for a `pen run` session, preferring `wtime-aot` when
-    /// available (unless `PEN_WTIME_AOT=0`) and falling back to Wasmtime.
+    /// Compiles `wasm` for a `pen run` session, selecting `wtime-aot` when
+    /// available and permitted by the engine/ABI (unless `PEN_WTIME_AOT=0`),
+    /// otherwise compiling with Wasmtime.
     pub fn new_run(engine: &Engine, wasm: &[u8], cache: Option<&Path>) -> Result<GuestModule> {
         Self::new_with_aot(engine, wasm, cache, true)
     }
@@ -1070,6 +1071,39 @@ impl WasmtimeGuest {
     fn restore(&mut self, image: &GuestImage) -> Result<usize> {
         ensure!(self.abi.tasks.is_none(), "task contexts are host state and cannot be memory-imaged");
         ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
+        // Preflight complete imaged-global schema (exact mutable export set, no duplicates/extras),
+        // destination mutability, and Wasm value types BEFORE growing or mutating linear memory.
+        let allowed = self.imaged.as_ref().as_ref().map_err(|why| anyhow!("this guest cannot be restored: {why}"))?;
+        ensure!(
+            image.globals.len() == allowed.len(),
+            "imaged global schema mismatch: guest expects {} mutable globals, snapshot has {}",
+            allowed.len(),
+            image.globals.len()
+        );
+        let mut seen = std::collections::HashSet::with_capacity(allowed.len());
+        let mut validated: Vec<(Global, Val)> = Vec::with_capacity(image.globals.len());
+        for (name, value) in &image.globals {
+            ensure!(
+                allowed.iter().any(|a| a == name),
+                "imaged global {name} is not a mutable imaged global of this guest"
+            );
+            ensure!(seen.insert(name.as_str()), "duplicate imaged global in snapshot: {name}");
+            let global = self.instance.get_global(&mut self.store, name).context("an imaged global disappeared")?;
+            let ty = global.ty(&self.store);
+            ensure!(
+                ty.mutability() == wasmtime::Mutability::Var,
+                "imaged global {name} is not mutable"
+            );
+            let kind_matches = matches!(
+                (ty.content(), value),
+                (wasmtime::ValType::I32, Val::I32(_))
+                    | (wasmtime::ValType::I64, Val::I64(_))
+                    | (wasmtime::ValType::F32, Val::F32(_))
+                    | (wasmtime::ValType::F64, Val::F64(_))
+            );
+            ensure!(kind_matches, "imaged global type mismatch for {name}");
+            validated.push((global, *value));
+        }
         let mut written = 0;
         if let Some(memory) = self.instance.get_memory(&mut self.store, "blot:memory") {
             let missing = image.memory.len().saturating_sub(memory.data_size(&self.store));
@@ -1078,9 +1112,8 @@ impl WasmtimeGuest {
             }
             written = image.memory.restore(memory.data_mut(&mut self.store));
         }
-        for (name, value) in &image.globals {
-            let global = self.instance.get_global(&mut self.store, name).context("an imaged global disappeared")?;
-            global.set(&mut self.store, *value)?;
+        for (global, value) in validated {
+            global.set(&mut self.store, value)?;
         }
         Ok(written)
     }

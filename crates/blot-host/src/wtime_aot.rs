@@ -157,26 +157,31 @@ pub struct AotModule {
     lib: Arc<AotLibrary>,
 }
 
-fn default_cache_dir(cache: Option<&Path>) -> PathBuf {
+fn default_cache_dir(cache: Option<&Path>) -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("PEN_WTIME_AOT_CACHE")
         && !dir.is_empty()
     {
-        return PathBuf::from(dir);
+        return Ok(PathBuf::from(dir));
     }
     if let Some(cache) = cache {
-        return cache.join("wtime-aot");
+        return Ok(cache.join("wtime-aot"));
     }
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
         && !xdg.is_empty()
     {
-        return PathBuf::from(xdg).join("pen").join("wtime-aot");
+        return Ok(PathBuf::from(xdg).join("pen").join("wtime-aot"));
     }
     if let Ok(home) = std::env::var("HOME")
         && !home.is_empty()
     {
-        return PathBuf::from(home).join(".cache").join("pen").join("wtime-aot");
+        return Ok(PathBuf::from(home).join(".cache").join("pen").join("wtime-aot"));
     }
-    std::env::temp_dir().join("pen-wtime-aot")
+    if let Ok(rt) = std::env::var("XDG_RUNTIME_DIR")
+        && !rt.is_empty()
+    {
+        return Ok(PathBuf::from(rt).join("pen").join("wtime-aot"));
+    }
+    bail!("no owner-private wtime-aot cache directory available (set PEN_WTIME_AOT_CACHE, XDG_CACHE_HOME, HOME, or XDG_RUNTIME_DIR)")
 }
 
 #[cfg(feature = "compiler")]
@@ -191,33 +196,63 @@ fn file_sha256_hex(path: &Path) -> Result<String> {
     Ok(wasm_sha256_hex(&bytes))
 }
 
+/// Enforces an owner-controlled (`0o700`), symlink-free private cache directory hierarchy.
+/// Fails closed if `path` is a symlink, any ancestor is group/world-writable without the sticky bit,
+/// `chmod(0o700)` fails (e.g. `EPERM` when owned by another UID), or non-owner permission bits remain.
 #[cfg(feature = "compiler")]
 fn ensure_private_cache_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).with_context(|| format!("creating cache dir {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
-        let mode = std::fs::metadata(path)
-            .with_context(|| format!("stat cache dir {}", path.display()))?
-            .permissions()
-            .mode();
+        let sym = std::fs::symlink_metadata(path).with_context(|| format!("lstat cache dir {}", path.display()))?;
         ensure!(
-            mode & 0o022 == 0,
-            "wtime-aot cache directory must be private (not group/world-writable): {}",
+            !sym.file_type().is_symlink() && sym.file_type().is_dir(),
+            "wtime-aot cache path must be a real directory (not a symlink): {}",
             path.display()
         );
+        // Propagate `set_permissions` error: on Unix `chmod` fails with `EPERM` if not owned by euid.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("enforcing owner-only 0700 permissions on {}", path.display()))?;
+        let post = std::fs::symlink_metadata(path).with_context(|| format!("lstat cache dir {}", path.display()))?;
+        ensure!(
+            !post.file_type().is_symlink() && post.file_type().is_dir(),
+            "wtime-aot cache directory changed type during validation: {}",
+            path.display()
+        );
+        ensure!(
+            post.permissions().mode() & 0o077 == 0,
+            "wtime-aot cache directory must be owner-only (0700): {}",
+            path.display()
+        );
+        let canon = std::fs::canonicalize(path).with_context(|| format!("canonicalizing {}", path.display()))?;
+        for anc in canon.ancestors().skip(1) {
+            let mode = std::fs::metadata(anc)
+                .with_context(|| format!("stat cache ancestor {}", anc.display()))?
+                .permissions()
+                .mode();
+            ensure!(
+                (mode & 0o022) == 0 || (mode & 0o1000) != 0,
+                "wtime-aot cache ancestor {} is writable without sticky bit",
+                anc.display()
+            );
+        }
     }
     Ok(())
 }
 
+/// Atomically publishes `bytes` into `verified_dir/<so_sha>.so` with `0o555` permissions via
+/// `rename(&tmp, &dest)` (never `remove_file(&dest)` so there is no missing-file window).
 #[cfg(feature = "compiler")]
 fn publish_immutable_verified_so(verified_dir: &Path, so_sha: &str, bytes: &[u8], seq: u64) -> Result<PathBuf> {
     let dest = verified_dir.join(format!("{so_sha}.so"));
-    if dest.is_file() && file_sha256_hex(&dest).is_ok_and(|actual| actual == so_sha) {
+    if let Ok(meta) = std::fs::symlink_metadata(&dest)
+        && !meta.file_type().is_symlink()
+        && meta.file_type().is_file()
+        && file_sha256_hex(&dest).is_ok_and(|actual| actual == so_sha)
+    {
         return Ok(dest);
     }
-    let _ = std::fs::remove_file(&dest);
     let tmp = verified_dir.join(format!(".{so_sha}.{}.{seq}.tmp", std::process::id()));
     let mut f = std::fs::File::options()
         .write(true)
@@ -233,7 +268,10 @@ fn publish_immutable_verified_so(verified_dir: &Path, so_sha: &str, bytes: &[u8]
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555));
+        if let Err(err) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err).with_context(|| format!("marking verified artifact read-only {}", tmp.display()));
+        }
     }
     if let Err(err) = std::fs::rename(&tmp, &dest) {
         let _ = std::fs::remove_file(&tmp);
@@ -243,23 +281,81 @@ fn publish_immutable_verified_so(verified_dir: &Path, so_sha: &str, bytes: &[u8]
 }
 
 #[cfg(feature = "compiler")]
-fn bin_digest(bin: &Path) -> Result<String> {
+fn bin_digest(bin: &Path) -> Result<(PathBuf, String)> {
+    let canon = std::fs::canonicalize(bin).with_context(|| format!("canonicalizing wtime-aot binary {}", bin.display()))?;
+    #[cfg(unix)]
+    type StampKey = (PathBuf, u64, u64, u64, i64, i64, i64, i64);
+    #[cfg(not(unix))]
     type StampKey = (PathBuf, u64, u64, u32);
     static CACHE: OnceLock<Mutex<std::collections::HashMap<StampKey, String>>> = OnceLock::new();
-    let meta = std::fs::metadata(bin).with_context(|| format!("stat wtime-aot binary {}", bin.display()))?;
-    let (secs, nanos) = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()));
-    let key = (bin.to_path_buf(), meta.len(), secs, nanos);
+    let meta = std::fs::metadata(&canon).with_context(|| format!("stat wtime-aot binary {}", canon.display()))?;
+    #[cfg(unix)]
+    let key = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            canon.clone(),
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec(),
+        )
+    };
+    #[cfg(not(unix))]
+    let key = {
+        let (secs, nanos) = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()));
+        (canon.clone(), meta.len(), secs, nanos)
+    };
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     if let Some(hit) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key).cloned() {
-        return Ok(hit);
+        return Ok((canon, hit));
     }
-    let digest = file_sha256_hex(bin)?;
+    let digest = file_sha256_hex(&canon)?;
     cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, digest.clone());
-    Ok(digest)
+    Ok((canon, digest))
+}
+
+#[cfg(feature = "compiler")]
+fn host_cpu_fingerprint() -> &'static str {
+    static FP: OnceLock<String> = OnceLock::new();
+    FP.get_or_init(|| {
+        let mut raw = format!("arch={};", std::env::consts::ARCH);
+        #[cfg(target_os = "linux")]
+        if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+            for line in cpuinfo.lines() {
+                if line.starts_with("model name") || line.starts_with("flags") || line.starts_with("Features") {
+                    raw.push_str(line.trim());
+                    raw.push('\n');
+                }
+                if line.trim().is_empty() && raw.len() > 32 {
+                    break;
+                }
+            }
+        }
+        wasm_sha256_hex(raw.as_bytes())[..16].to_string()
+    })
+}
+
+#[cfg(feature = "compiler")]
+fn c_compiler_fingerprint() -> &'static str {
+    static FP: OnceLock<String> = OnceLock::new();
+    FP.get_or_init(|| {
+        for cc in ["clang", "cc", "gcc"] {
+            if let Ok(out) = Command::new(cc).arg("--version").output()
+                && out.status.success()
+            {
+                let ver = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or(cc).trim().to_string();
+                return wasm_sha256_hex(format!("{cc}:{ver}").as_bytes())[..16].to_string();
+            }
+        }
+        "no-cc".to_string()
+    })
 }
 
 #[cfg(feature = "compiler")]
@@ -313,12 +409,45 @@ fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
 }
 
 #[cfg(not(feature = "compiler"))]
-fn build_or_find_so(_wasm: &[u8], _cache: Option<&Path>) -> Result<PathBuf> {
+fn load_verified_so(_wasm: &[u8], _cache: Option<&Path>) -> Result<Library> {
     bail!("wtime-aot compilation requires blot-host's `compiler` feature")
 }
 
+/// Checks `fast_link` and loads the immutable content-addressed `verified/<sha256>.so` while the
+/// caller holds `canon_cache/.cache.lock` (shared or exclusive), keeping the verified artifact
+/// completely stable across `dlopen`.
 #[cfg(feature = "compiler")]
-fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
+fn try_load_warm_verified_so(
+    fast_link: &Path,
+    fast_key: &str,
+    verified_dir: &Path,
+) -> Option<(PathBuf, Library)> {
+    let recorded = std::fs::read_to_string(fast_link).ok()?;
+    let mut lines = recorded.lines();
+    let (rec_key, rec_so_sha, _rec_path) = (lines.next()?, lines.next()?, lines.next()?);
+    if rec_key != fast_key || rec_so_sha.len() != 64 || !rec_so_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let verified_so = verified_dir.join(format!("{rec_so_sha}.so"));
+    let sym = std::fs::symlink_metadata(&verified_so).ok()?;
+    if sym.file_type().is_symlink() || !sym.file_type().is_file() {
+        return None;
+    }
+    let canon_verified = std::fs::canonicalize(&verified_so).ok()?;
+    if !canon_verified.starts_with(verified_dir) {
+        return None;
+    }
+    if !file_sha256_hex(&canon_verified).is_ok_and(|actual| actual == rec_so_sha) {
+        return None;
+    }
+    // SAFETY: `canon_verified` is an immutable `0o555` content-addressed file inside our owner-only
+    // `0o700` cache whose SHA-256 matches `rec_so_sha` while `.cache.lock` is held across `dlopen`.
+    let lib = unsafe { Library::new(&canon_verified) }.ok()?;
+    Some((canon_verified, lib))
+}
+
+#[cfg(feature = "compiler")]
+fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
     static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
     if let Ok(override_so) = std::env::var("PEN_WTIME_AOT_SO")
         && !override_so.is_empty()
@@ -327,10 +456,12 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
         // `dlopen`'s `LD_LIBRARY_PATH` search.
         let p = PathBuf::from(override_so);
         ensure!(p.is_file(), "PEN_WTIME_AOT_SO does not exist: {}", p.display());
-        return std::fs::canonicalize(&p)
-            .with_context(|| format!("canonicalizing PEN_WTIME_AOT_SO {}", p.display()));
+        let canon = std::fs::canonicalize(&p)
+            .with_context(|| format!("canonicalizing PEN_WTIME_AOT_SO {}", p.display()))?;
+        // SAFETY: explicit operator-supplied trusted native shared library override.
+        return unsafe { Library::new(&canon) }
+            .with_context(|| format!("loading PEN_WTIME_AOT_SO {}", canon.display()));
     }
-    let bin = resolve_wtime_aot_bin().unwrap_or_else(|| PathBuf::from(DEFAULT_WTIME_AOT_BIN));
     let backend = std::env::var("PEN_WTIME_AOT_BACKEND")
         .ok()
         .filter(|s| !s.is_empty())
@@ -348,58 +479,91 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "native".to_string());
 
-    let cache_dir = default_cache_dir(cache);
+    // Validate backend and target/host platform BEFORE touching the filesystem or hashing binaries.
+    let profile_tag = match backend.as_str() {
+        "c" => {
+            let cpu_tag = if target_cpu == "native" {
+                format!("native-{}", host_cpu_fingerprint())
+            } else {
+                sanitize_key_part(&target_cpu)
+            };
+            format!("c-{}-{cpu_tag}-{}", sanitize_key_part(&c_opt), c_compiler_fingerprint())
+        }
+        "rust" => {
+            let cpu_tag = if target_cpu == "native" {
+                format!("native-{}", host_cpu_fingerprint())
+            } else {
+                sanitize_key_part(&target_cpu)
+            };
+            format!("rust-{}-{cpu_tag}", sanitize_key_part(&toolchain))
+        }
+        "x64" => format!("x64-{}", resolved_x64_isa_tag(&target_cpu)?),
+        other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
+    };
+
+    let bin = resolve_wtime_aot_bin().unwrap_or_else(|| PathBuf::from(DEFAULT_WTIME_AOT_BIN));
+    let (canon_bin, bin_hash) = bin_digest(&bin)?;
+    let cache_dir = default_cache_dir(cache)?;
     ensure_private_cache_dir(&cache_dir)?;
     let canon_cache = std::fs::canonicalize(&cache_dir)
         .with_context(|| format!("canonicalizing cache dir {}", cache_dir.display()))?;
-    let digest = wasm_sha256_hex(wasm);
-    let bin_hash = bin_digest(&bin)?;
-    let fast_key = match backend.as_str() {
-        "c" => format!("{digest}-c-{}-{bin_hash}", sanitize_key_part(&c_opt)),
-        "rust" => format!("{digest}-rust-{}-{bin_hash}", sanitize_key_part(&toolchain)),
-        "x64" => format!("{digest}-x64-{}-{bin_hash}", resolved_x64_isa_tag(&target_cpu)?),
-        other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
-    };
     let fast_dir = canon_cache.join("by-wasm");
     let verified_dir = canon_cache.join("verified");
     ensure_private_cache_dir(&fast_dir)?;
     ensure_private_cache_dir(&verified_dir)?;
-    // Hold an exclusive per-key publication lock across fast-cache lookup, mismatch invalidation,
-    // rebuild, digest verification, and immutable content-addressed staging.
-    let lock_path = fast_dir.join(format!("{fast_key}.lock"));
-    let lock_file = std::fs::File::options()
+
+    let digest = wasm_sha256_hex(wasm);
+    let fast_key = format!("{digest}-{profile_tag}-{bin_hash}");
+    let fast_link = fast_dir.join(format!("{fast_key}.path"));
+
+    // Single cohesive cache publication RWLock (`canon_cache/.cache.lock`, strictly ordered BEFORE
+    // any builder `entry/.publish.lock`): shared lock across warm verification + `dlopen`,
+    // exclusive lock across mismatch invalidation, rebuild, immutable staging, and cold `dlopen`.
+    let cache_lock_path = canon_cache.join(".cache.lock");
+    let cache_lock = std::fs::File::options()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("opening cache lock {}", lock_path.display()))?;
-    lock_file.lock().with_context(|| format!("locking {}", lock_path.display()))?;
+        .open(&cache_lock_path)
+        .with_context(|| format!("opening cache lock {}", cache_lock_path.display()))?;
+    cache_lock
+        .lock_shared()
+        .with_context(|| format!("shared-locking {}", cache_lock_path.display()))?;
+    if let Some((_path, lib)) = try_load_warm_verified_so(&fast_link, &fast_key, &verified_dir) {
+        return Ok(lib);
+    }
+    cache_lock
+        .unlock()
+        .with_context(|| format!("unlocking {}", cache_lock_path.display()))?;
 
-    let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
-    let fast_link = fast_dir.join(format!("{fast_key}.path"));
+    // Upgrade to exclusive cache publication lock for repair/build/staging/dlopen.
+    cache_lock
+        .lock()
+        .with_context(|| format!("exclusively locking {}", cache_lock_path.display()))?;
+    if let Some((_path, lib)) = try_load_warm_verified_so(&fast_link, &fast_key, &verified_dir) {
+        return Ok(lib);
+    }
+
+    // Mismatch or stale entry under the exclusive lock (no reader can be mid-`dlopen`):
+    // serialize builder artifact removal under `entry/.publish.lock` and unlink `fast_link`.
     if let Ok(recorded) = std::fs::read_to_string(&fast_link) {
         let mut lines = recorded.lines();
-        if let (Some(rec_key), Some(rec_so_sha), Some(rec_path)) = (lines.next(), lines.next(), lines.next())
-            && rec_key == fast_key
-            && rec_so_sha.len() == 64
-            && rec_so_sha.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            let verified_so = verified_dir.join(format!("{rec_so_sha}.so"));
-            if let Ok(canon_verified) = std::fs::canonicalize(&verified_so)
-                && canon_verified.starts_with(&verified_dir)
-                && canon_verified.is_file()
-                && file_sha256_hex(&canon_verified).is_ok_and(|actual| actual == rec_so_sha)
-            {
-                return Ok(canon_verified);
-            }
-            // Digest mismatch or missing verified copy under the publication lock: invalidate
-            // the verified copy, the builder artifact (+ sidecar), and the fast index before rebuilding.
-            let _ = std::fs::remove_file(&verified_so);
+        if let (Some(_), Some(_), Some(rec_path)) = (lines.next(), lines.next(), lines.next()) {
             let so_path = PathBuf::from(rec_path.trim());
             if let Ok(canon_so) = std::fs::canonicalize(&so_path)
                 && canon_so.starts_with(&canon_cache)
+                && let Some(entry_dir) = canon_so.parent()
             {
+                let entry_lock_path = entry_dir.join(".publish.lock");
+                let _entry_lock = std::fs::File::options()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&entry_lock_path)
+                    .ok()
+                    .and_then(|f| f.lock().ok().map(|()| f));
                 let _ = std::fs::remove_file(&canon_so);
                 let _ = std::fs::remove_file(canon_so.with_extension("so.sha256"));
             }
@@ -407,15 +571,21 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
         let _ = std::fs::remove_file(&fast_link);
     }
 
+    // Re-verify the exact canonicalized compiler binary right before invoking it on a cold build.
+    let cold_bin_hash = file_sha256_hex(&canon_bin)?;
+    let fast_key = format!("{digest}-{profile_tag}-{cold_bin_hash}");
+    let fast_link = fast_dir.join(format!("{fast_key}.path"));
+
+    let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_wasm = canon_cache.join(format!("input-{digest}-{}-{seq}.wasm", std::process::id()));
     std::fs::write(&tmp_wasm, wasm)?;
     let _cleanup_wasm = RemoveOnDrop(tmp_wasm.clone());
-    let mut cmd = Command::new(&bin);
+    let mut cmd = Command::new(&canon_bin);
     cmd.args(["build"])
         .arg(&tmp_wasm)
         .args(["--cache"])
         .arg(&canon_cache)
-        .args(["--backend", &backend, "--blot-cdylib"]);
+        .args(["--backend", &backend, "--blot-cdylib", "--target-cpu", &target_cpu]);
     match backend.as_str() {
         "c" => {
             cmd.args(["--c-opt", &c_opt]);
@@ -423,12 +593,10 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
         "rust" => {
             cmd.args(["--toolchain", &toolchain]);
         }
-        "x64" => {
-            cmd.args(["--target-cpu", &target_cpu]);
-        }
+        "x64" => {}
         _ => unreachable!(),
     }
-    let output = cmd.output().with_context(|| format!("running wtime-aot ({})", bin.display()))?;
+    let output = cmd.output().with_context(|| format!("running wtime-aot ({})", canon_bin.display()))?;
     drop(_cleanup_wasm);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -447,13 +615,13 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
         .with_context(|| format!("reading built library {}", canon_so.display()))?;
     let so_sha = wasm_sha256_hex(&so_bytes);
     let sidecar = canon_so.with_extension("so.sha256");
-    if let Ok(expected_sidecar) = std::fs::read_to_string(&sidecar) {
-        ensure!(
-            expected_sidecar.trim() == so_sha,
-            "built library digest mismatch with sidecar {}",
-            sidecar.display()
-        );
-    }
+    let expected_sidecar = std::fs::read_to_string(&sidecar)
+        .with_context(|| format!("wtime-aot build missing required digest sidecar {}", sidecar.display()))?;
+    ensure!(
+        expected_sidecar.trim() == so_sha,
+        "built library digest mismatch with sidecar {}",
+        sidecar.display()
+    );
     let verified_so = publish_immutable_verified_so(&verified_dir, &so_sha, &so_bytes, seq)?;
     let tmp_link = fast_dir.join(format!(".{fast_key}.{}.{seq}.tmp", std::process::id()));
     if let Ok(mut link_file) = std::fs::File::options().write(true).create_new(true).open(&tmp_link) {
@@ -463,7 +631,11 @@ fn build_or_find_so(wasm: &[u8], cache: Option<&Path>) -> Result<PathBuf> {
             let _ = std::fs::remove_file(&tmp_link);
         }
     }
-    Ok(verified_so)
+    // SAFETY: `verified_so` was just built locally from validated Wasm, digest-verified against
+    // its mandatory builder sidecar, staged immutable (`0o555`) inside our owner-only `0o700`
+    // cache, and `.cache.lock` remains exclusively held across `Library::new`.
+    unsafe { Library::new(&verified_so) }
+        .with_context(|| format!("loading wtime-aot library {}", verified_so.display()))
 }
 
 #[cfg(feature = "compiler")]
@@ -720,12 +892,7 @@ impl AotModule {
         ensure!(abi.tasks.is_none(), "wtime-aot experimental backend does not support legacy tasks");
         abi.check_hostable()?;
         let validated = validate_aot_wasm(wasm, abi)?;
-        let so_path = build_or_find_so(wasm, cache)?;
-        // SAFETY: `so_path` is an immutable content-addressed `0o555` artifact inside our private
-        // `0o700` cache (`verified/<sha256>.so`, digest-verified under the publication lock), or
-        // an explicit trusted `PEN_WTIME_AOT_SO` override.
-        let lib = unsafe { Library::new(&so_path) }
-            .with_context(|| format!("loading wtime-aot library {}", so_path.display()))?;
+        let lib = load_verified_so(wasm, cache)?;
         let abi_version: FnAbiVersion = *unsafe { lib.get(b"blot_aot_abi_version\0")? };
         let version = unsafe { abi_version() };
         ensure!(version == 1, "unsupported wtime-aot blot ABI version {version}");
@@ -1138,6 +1305,14 @@ impl AotGuest {
         f(&mut state)
     }
 
+    /// Instantiates an AOT guest handle.
+    ///
+    /// Signal-stack contract: `wtime-aot` allocates a dedicated 8 MiB guest stack with a 64 KiB
+    /// `PROT_NONE` guard and a 128 KiB signal-safe floor reserve (budgeting up to 2 nested
+    /// `<= 32 KiB` async signal handlers at `AT_MINSIGSTKSZ <= 16 KiB`). Pen installs no custom
+    /// async signal handlers on `pen run` guest threads; embedders installing deeper/heavier
+    /// async handlers or running on CPUs with `AT_MINSIGSTKSZ > 16 KiB` MUST configure
+    /// `SA_ONSTACK` + `sigaltstack` on calling threads.
     pub fn start(
         module: &AotModule,
         abi: Arc<GuestAbi>,
@@ -1477,10 +1652,23 @@ impl AotGuest {
             !self.lib.has_mut_extern_table,
             "this guest cannot be restored: mutable externref tables are not captured by snapshots"
         );
-        // Preflight EVERY global name and Wasm value kind BEFORE mutating linear memory or any global,
-        // matching Wasmtime's typed `Global::set` rejection without partial state mutation.
+        // Preflight complete imaged-global schema (exact mutable export set, no duplicates/extras)
+        // AND Wasm value kinds BEFORE growing or mutating linear memory or any global.
+        let allowed = self.imaged.as_ref().as_ref().map_err(|why| anyhow!("this guest cannot be restored: {why}"))?;
+        ensure!(
+            image.globals.len() == allowed.len(),
+            "imaged global schema mismatch: guest expects {} mutable globals, snapshot has {}",
+            allowed.len(),
+            image.globals.len()
+        );
+        let mut seen = std::collections::HashSet::with_capacity(allowed.len());
         let mut validated_globals: Vec<(&str, u64)> = Vec::with_capacity(image.globals.len());
         for (name, value) in &image.globals {
+            ensure!(
+                allowed.iter().any(|a| a == name),
+                "imaged global {name} is not a mutable imaged global of this guest"
+            );
+            ensure!(seen.insert(name.as_str()), "duplicate imaged global in snapshot: {name}");
             let (expected_kind, raw) = match *value {
                 Val::I32(v) => (0u8, u64::from(v.cast_unsigned())),
                 Val::I64(v) => (1u8, v.cast_unsigned()),

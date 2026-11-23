@@ -67,15 +67,25 @@ fn is_bare_prog_name(s: &str) -> bool {
     !s.is_empty() && !s.contains(std::path::MAIN_SEPARATOR) && !s.contains('/') && s != "." && s != ".."
 }
 
+/// Returns an absolute-only, empty-entry-free `PATH` so subprocess execution resolves bare names
+/// identically to `find_in_path` with zero CWD lookup.
+fn sanitized_path_env() -> Option<std::ffi::OsString> {
+    let raw = std::env::var_os("PATH")?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(&raw)
+        .filter(|d| !d.as_os_str().is_empty() && d.is_absolute())
+        .collect();
+    if dirs.is_empty() {
+        return None;
+    }
+    std::env::join_paths(dirs).ok()
+}
+
 fn find_in_path(name: &str) -> Option<PathBuf> {
     if !is_bare_prog_name(name) {
         return None;
     }
-    let path_var = std::env::var_os("PATH")?;
+    let path_var = sanitized_path_env()?;
     for dir in std::env::split_paths(&path_var) {
-        if dir.as_os_str().is_empty() || !dir.is_absolute() {
-            continue;
-        }
         let candidate = dir.join(name);
         if is_executable_file(&candidate) {
             return Some(candidate);
@@ -778,6 +788,8 @@ fn create_private_temp_file(dir: &Path, prefix: &str, suffix: &str) -> Result<(s
 
 #[cfg(feature = "compiler")]
 const MAX_CAPTURE_BYTES: usize = 16 << 20;
+#[cfg(feature = "compiler")]
+const POST_EXIT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 #[cfg(feature = "compiler")]
 enum PipeCaptureErr {
@@ -790,35 +802,44 @@ fn spawn_bounded_pipe_reader<R: std::io::Read + Send + 'static>(
     mut reader: R,
     limit: usize,
     overflowed: Arc<AtomicBool>,
-) -> mpsc::Receiver<Result<Vec<u8>, PipeCaptureErr>> {
+) -> Result<mpsc::Receiver<Result<Vec<u8>, PipeCaptureErr>>> {
     let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) => {
-                    let _ = tx.send(Ok(out));
-                    return;
-                }
-                Ok(n) => {
-                    if out.len().saturating_add(n) > limit {
-                        overflowed.store(true, Ordering::Release);
-                        drop(reader);
-                        let _ = tx.send(Err(PipeCaptureErr::Overflow));
+    std::thread::Builder::new()
+        .name("pen-aot-pipe".into())
+        .spawn(move || {
+            let mut out = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => {
+                        let _ = tx.send(Ok(out));
                         return;
                     }
-                    out.extend_from_slice(&chunk[..n]);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    let _ = tx.send(Err(PipeCaptureErr::Io(e.to_string())));
-                    return;
+                    Ok(n) => {
+                        let new_len = out.len().saturating_add(n);
+                        if new_len > limit {
+                            overflowed.store(true, Ordering::Release);
+                            drop(reader);
+                            let _ = tx.send(Err(PipeCaptureErr::Overflow));
+                            return;
+                        }
+                        if new_len > out.capacity() {
+                            // Never overshoot `limit` in allocated capacity.
+                            let target = out.capacity().saturating_mul(2).max(new_len).min(limit);
+                            out.reserve_exact(target - out.len());
+                        }
+                        out.extend_from_slice(&chunk[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        let _ = tx.send(Err(PipeCaptureErr::Io(e.to_string())));
+                        return;
+                    }
                 }
             }
-        }
-    });
-    rx
+        })
+        .context("spawning subprocess pipe reader thread")?;
+    Ok(rx)
 }
 
 #[cfg(feature = "compiler")]
@@ -829,10 +850,16 @@ fn recv_bounded_pipe(
 ) -> Result<Vec<u8>> {
     let rem = deadline
         .checked_duration_since(Instant::now())
-        .ok_or_else(|| anyhow!("{label} exceeded host build timeout"))?;
+        .ok_or_else(|| anyhow!("{label} exceeded host build timeout"))?
+        .min(POST_EXIT_DRAIN_GRACE);
     let res = match rx.recv_timeout(rem) {
         Ok(r) => r,
-        Err(RecvTimeoutError::Timeout) => bail!("{label} exceeded host build timeout"),
+        Err(RecvTimeoutError::Timeout) => {
+            if Instant::now() >= deadline {
+                bail!("{label} exceeded host build timeout");
+            }
+            bail!("{label} output pipe did not close after exit (orphaned descendant holding pipe open)");
+        }
         Err(RecvTimeoutError::Disconnected) => bail!("{label} capture reader disconnected"),
     };
     match res {
@@ -843,9 +870,10 @@ fn recv_bounded_pipe(
 }
 
 /// Runs `cmd` in its own Unix process group, capturing stdout/stderr through bounded in-memory
-/// pipes (zero disk amplification, hard `MAX_CAPTURE_BYTES` ceiling with immediate `SIGPIPE` +
-/// process-group kill on overflow, concurrent draining preventing pipe deadlocks, deadline-bounded
-/// `recv_timeout` preventing descendant EOF hangs, and full read-error propagation).
+/// pipes (zero disk amplification, hard `MAX_CAPTURE_BYTES` per-stream ceiling with exact
+/// `reserve_exact` capacity cap and immediate `SIGPIPE` + process-group kill on overflow,
+/// concurrent draining preventing pipe deadlocks, bounded post-exit `recv_timeout` preventing
+/// descendant EOF hangs, and full read-error propagation).
 #[cfg(feature = "compiler")]
 fn run_cmd_output_with_deadline(
     mut cmd: Command,
@@ -862,16 +890,34 @@ fn run_cmd_output_with_deadline(
     let mut child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
     let pid = child.id();
     let overflowed = Arc::new(AtomicBool::new(false));
-    let rx_out = spawn_bounded_pipe_reader(
-        child.stdout.take().ok_or_else(|| anyhow!("missing stdout pipe for {label}"))?,
-        MAX_CAPTURE_BYTES,
-        Arc::clone(&overflowed),
-    );
-    let rx_err = spawn_bounded_pipe_reader(
-        child.stderr.take().ok_or_else(|| anyhow!("missing stderr pipe for {label}"))?,
-        MAX_CAPTURE_BYTES,
-        Arc::clone(&overflowed),
-    );
+    let cleanup_child = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        kill_process_group(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let Some(stdout_pipe) = child.stdout.take() else {
+        cleanup_child(&mut child);
+        bail!("missing stdout pipe for {label}");
+    };
+    let Some(stderr_pipe) = child.stderr.take() else {
+        cleanup_child(&mut child);
+        bail!("missing stderr pipe for {label}");
+    };
+    let rx_out = match spawn_bounded_pipe_reader(stdout_pipe, MAX_CAPTURE_BYTES, Arc::clone(&overflowed)) {
+        Ok(rx) => rx,
+        Err(e) => {
+            cleanup_child(&mut child);
+            return Err(e);
+        }
+    };
+    let rx_err = match spawn_bounded_pipe_reader(stderr_pipe, MAX_CAPTURE_BYTES, Arc::clone(&overflowed)) {
+        Ok(rx) => rx,
+        Err(e) => {
+            cleanup_child(&mut child);
+            return Err(e);
+        }
+    };
     let status = loop {
         if overflowed.load(Ordering::Acquire) {
             #[cfg(unix)]
@@ -1045,7 +1091,10 @@ const SYS_HEADER_PROBE_C: &[u8] = b"#if defined(__linux__) && !defined(_GNU_SOUR
 fn clean_cc_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut cmd = Command::new(program);
     cmd.env_clear();
-    for var in ["PATH", "HOME", "TMPDIR"] {
+    if let Some(path) = sanitized_path_env() {
+        cmd.env("PATH", path);
+    }
+    for var in ["HOME", "TMPDIR"] {
         if let Some(v) = std::env::var_os(var) {
             cmd.env(var, v);
         }
@@ -1057,6 +1106,7 @@ fn clean_cc_cmd(program: impl AsRef<std::ffi::OsStr>) -> Command {
 const LINK_PROBE_C: &[u8] = b"#if defined(__linux__) && !defined(_GNU_SOURCE)\n\
 #define _GNU_SOURCE\n\
 #endif\n\
+#include <math.h>\n\
 #include <stdlib.h>\n\
 #include <string.h>\n\
 #if defined(__linux__)\n\
@@ -1068,12 +1118,26 @@ int wt_cet_probe(size_t n) {\n\
     memset(p, 0, 1);\n\
     int r = memcmp(p, p, 1);\n\
     free(p);\n\
+    volatile float x = (float)n + 0.5f;\n\
+    r += (int)truncf(x);\n\
 #if defined(__linux__)\n\
     pthread_attr_t a;\n\
     if (pthread_getattr_np(pthread_self(), &a) == 0) pthread_attr_destroy(&a);\n\
 #endif\n\
     return r;\n\
 }\n";
+
+#[cfg(feature = "compiler")]
+fn stamp_len(stamp: BinStamp) -> u64 {
+    #[cfg(unix)]
+    {
+        stamp.2
+    }
+    #[cfg(not(unix))]
+    {
+        stamp.0
+    }
+}
 
 #[cfg(feature = "compiler")]
 fn hash_stamp(h: &mut sha2::Sha256, stamp: BinStamp) {
@@ -1097,7 +1161,7 @@ fn hash_stamp(h: &mut sha2::Sha256, stamp: BinStamp) {
 }
 
 /// Resolves an auxiliary toolchain program via `cc -print-prog-name=<prog>` (with `PATH` fallback
-/// when `allow_path_fallback` is true). Never resolves bare or relative names against CWD.
+/// when `allow_path_fallback` is true). Fails closed on non-zero exit or relative non-bare paths.
 #[cfg(feature = "compiler")]
 fn resolve_driver_prog(
     cc_path: &Path,
@@ -1114,24 +1178,34 @@ fn resolve_driver_prog(
         &format!("{} -print-prog-name={prog}", cc_path.display()),
         deadline,
     )?;
-    let mut candidate = if out.status.success() {
-        let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !printed.is_empty() {
-            if is_bare_prog_name(&printed) {
-                if allow_path_fallback { find_in_path(&printed) } else { None }
-            } else {
-                let p = PathBuf::from(&printed);
-                (p.is_absolute() && is_executable_file(&p)).then_some(p)
-            }
+    ensure!(
+        out.status.success(),
+        "{} -print-prog-name={prog} failed ({}): {}",
+        cc_path.display(),
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    ensure!(
+        !printed.is_empty(),
+        "{} -print-prog-name={prog} returned empty output",
+        cc_path.display()
+    );
+    let candidate = if is_bare_prog_name(&printed) {
+        if allow_path_fallback {
+            find_in_path(&printed).or_else(|| find_in_path(prog))
         } else {
-            None
+            return Ok(None);
         }
     } else {
-        None
+        let p = PathBuf::from(&printed);
+        ensure!(
+            p.is_absolute() && is_executable_file(&p),
+            "{} -print-prog-name={prog} returned non-absolute or non-executable path {printed:?}",
+            cc_path.display()
+        );
+        Some(p)
     };
-    if candidate.is_none() && allow_path_fallback {
-        candidate = find_in_path(prog);
-    }
     let Some(cand) = candidate else { return Ok(None) };
     let canon = std::fs::canonicalize(&cand)
         .with_context(|| format!("canonicalizing {prog} {}", cand.display()))?;
@@ -1152,45 +1226,102 @@ fn resolve_driver_linker(
 }
 
 #[cfg(all(feature = "compiler", target_os = "linux"))]
-fn elf64_pt_interp(elf_path: &Path) -> Option<PathBuf> {
-    let mut f = std::fs::File::open(elf_path).ok()?;
-    let mut hdr = Vec::new();
-    (&mut f).take(65536).read_to_end(&mut hdr).ok()?;
-    if hdr.len() < 64 || &hdr[0..4] != b"\x7fELF" || hdr[4] != 2 || hdr[5] != 1 {
-        return None;
+fn elf64_pt_interp(elf_path: &Path) -> Result<Option<PathBuf>> {
+    let mut f = std::fs::File::open(elf_path).with_context(|| format!("opening {}", elf_path.display()))?;
+    let file_len = f.metadata().with_context(|| format!("stat {}", elf_path.display()))?.len();
+    if file_len < 4 {
+        return Ok(None);
     }
-    let e_phoff = usize::try_from(u64::from_le_bytes(hdr[32..40].try_into().ok()?)).ok()?;
-    let e_phentsize = usize::from(u16::from_le_bytes(hdr[54..56].try_into().ok()?));
-    let e_phnum = usize::from(u16::from_le_bytes(hdr[56..58].try_into().ok()?));
-    if e_phentsize < 56 {
-        return None;
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic)
+        .with_context(|| format!("reading {}", elf_path.display()))?;
+    if &magic != b"\x7fELF" {
+        return Ok(None);
     }
+    ensure!(
+        file_len >= 64,
+        "{}: truncated ELF header ({file_len} bytes)",
+        elf_path.display()
+    );
+    f.seek(SeekFrom::Start(0))
+        .with_context(|| format!("seeking {}", elf_path.display()))?;
+    let mut ehdr = [0u8; 64];
+    f.read_exact(&mut ehdr)
+        .with_context(|| format!("reading ELF header {}", elf_path.display()))?;
+    ensure!(
+        ehdr[4] == 2 && ehdr[5] == 1,
+        "{}: unsupported ELF class/endianness ({}, {}) for shared-library tracking",
+        elf_path.display(),
+        ehdr[4],
+        ehdr[5]
+    );
+    let e_phoff = u64::from_le_bytes(ehdr[32..40].try_into().unwrap());
+    let e_phentsize = u64::from(u16::from_le_bytes(ehdr[54..56].try_into().unwrap()));
+    let e_phnum = u64::from(u16::from_le_bytes(ehdr[56..58].try_into().unwrap()));
+    if e_phnum == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        e_phentsize >= 56 && e_phnum <= 4096,
+        "{}: invalid ELF program header table (phentsize={e_phentsize}, phnum={e_phnum})",
+        elf_path.display()
+    );
+    let ph_table_bytes = e_phentsize
+        .checked_mul(e_phnum)
+        .ok_or_else(|| anyhow!("{}: ELF program header size overflow", elf_path.display()))?;
+    let ph_end = e_phoff
+        .checked_add(ph_table_bytes)
+        .ok_or_else(|| anyhow!("{}: ELF program header offset overflow", elf_path.display()))?;
+    ensure!(ph_end <= file_len, "{}: ELF program headers exceed file size", elf_path.display());
+    f.seek(SeekFrom::Start(e_phoff))
+        .with_context(|| format!("seeking phdrs in {}", elf_path.display()))?;
+    let mut phdrs = vec![0u8; usize::try_from(ph_table_bytes)?];
+    f.read_exact(&mut phdrs)
+        .with_context(|| format!("reading phdrs in {}", elf_path.display()))?;
+    const PT_DYNAMIC: u32 = 2;
     const PT_INTERP: u32 = 3;
-    for i in 0..e_phnum {
-        let off = i.checked_mul(e_phentsize).and_then(|d| e_phoff.checked_add(d))?;
-        let ph_end = off.checked_add(56)?;
-        if ph_end > hdr.len() {
-            break;
-        }
-        let p_type = u32::from_le_bytes(hdr[off..off + 4].try_into().ok()?);
-        if p_type != PT_INTERP {
-            continue;
-        }
-        let p_offset = usize::try_from(u64::from_le_bytes(hdr[off + 8..off + 16].try_into().ok()?)).ok()?;
-        let p_filesz = usize::try_from(u64::from_le_bytes(hdr[off + 32..off + 40].try_into().ok()?)).ok()?;
-        let end = p_offset.checked_add(p_filesz)?;
-        if end > hdr.len() {
-            return None;
-        }
-        let raw = &hdr[p_offset..end];
-        let trimmed = raw.split(|&b| b == 0).next().unwrap_or(raw);
-        let s = std::str::from_utf8(trimmed).ok()?;
-        let p = PathBuf::from(s);
-        if p.is_absolute() && is_executable_file(&p) {
-            return Some(p);
+    let stride = usize::try_from(e_phentsize)?;
+    let mut has_dynamic = false;
+    let mut interp_span: Option<(u64, u64)> = None;
+    for i in 0..usize::try_from(e_phnum)? {
+        let off = i * stride;
+        let p_type = u32::from_le_bytes(phdrs[off..off + 4].try_into().unwrap());
+        if p_type == PT_DYNAMIC {
+            has_dynamic = true;
+        } else if p_type == PT_INTERP {
+            let p_offset = u64::from_le_bytes(phdrs[off + 8..off + 16].try_into().unwrap());
+            let p_filesz = u64::from_le_bytes(phdrs[off + 32..off + 40].try_into().unwrap());
+            interp_span = Some((p_offset, p_filesz));
         }
     }
-    None
+    let Some((p_offset, p_filesz)) = interp_span else {
+        ensure!(
+            !has_dynamic,
+            "{}: dynamic ELF has PT_DYNAMIC but no PT_INTERP",
+            elf_path.display()
+        );
+        return Ok(None);
+    };
+    ensure!(
+        p_filesz > 0 && p_filesz <= 4096 && p_offset.checked_add(p_filesz).is_some_and(|e| e <= file_len),
+        "{}: invalid PT_INTERP span ({p_offset}, {p_filesz})",
+        elf_path.display()
+    );
+    f.seek(SeekFrom::Start(p_offset))
+        .with_context(|| format!("seeking PT_INTERP in {}", elf_path.display()))?;
+    let mut raw = vec![0u8; usize::try_from(p_filesz)?];
+    f.read_exact(&mut raw)
+        .with_context(|| format!("reading PT_INTERP in {}", elf_path.display()))?;
+    let trimmed = raw.split(|&b| b == 0).next().unwrap_or(&raw);
+    let s = std::str::from_utf8(trimmed)
+        .map_err(|_| anyhow!("{}: non-UTF-8 PT_INTERP path", elf_path.display()))?;
+    let p = PathBuf::from(s);
+    ensure!(
+        p.is_absolute() && is_executable_file(&p),
+        "{}: PT_INTERP {s:?} is not an absolute executable",
+        elf_path.display()
+    );
+    Ok(Some(p))
 }
 
 #[cfg(feature = "compiler")]
@@ -1202,7 +1333,7 @@ fn probe_dynamic_shared_libs(elf_path: &Path, scratch_dir: &Path, deadline: Inst
     }
     #[cfg(target_os = "linux")]
     {
-        let Some(interp) = elf64_pt_interp(elf_path) else {
+        let Some(interp) = elf64_pt_interp(elf_path)? else {
             return Ok(Vec::new());
         };
         let mut cmd = clean_cc_cmd(&interp);
@@ -1227,7 +1358,11 @@ fn probe_dynamic_shared_libs(elf_path: &Path, scratch_dir: &Path, deadline: Inst
         libs.push((interp, interp_canon, interp_stamp));
         for raw_line in String::from_utf8_lossy(&out.stdout).lines() {
             let line = raw_line.trim();
-            if line.is_empty() || line.starts_with("linux-vdso.") || line.starts_with("linux-gate.") {
+            if line.is_empty()
+                || line.starts_with("linux-vdso.")
+                || line.starts_with("linux-gate.")
+                || line == "statically linked"
+            {
                 continue;
             }
             let rhs = if let Some((_, after)) = line.split_once(" => ") {
@@ -1239,14 +1374,16 @@ fn probe_dynamic_shared_libs(elf_path: &Path, scratch_dir: &Path, deadline: Inst
                 Some(idx) => rhs[..idx].trim(),
                 None => rhs.trim(),
             };
-            ensure!(path_part != "not found", "unresolved shared library for {}: {line}", elf_path.display());
             let p = Path::new(path_part);
-            if p.is_absolute() && p.is_file() {
-                let canon = std::fs::canonicalize(p)
-                    .with_context(|| format!("canonicalizing shared library {}", p.display()))?;
-                let stamp = bin_stamp(&canon)?;
-                libs.push((p.to_path_buf(), canon, stamp));
-            }
+            ensure!(
+                path_part != "not found" && p.is_absolute() && p.is_file(),
+                "unresolved or non-absolute shared library for {}: {line}",
+                elf_path.display()
+            );
+            let canon = std::fs::canonicalize(p)
+                .with_context(|| format!("canonicalizing shared library {}", p.display()))?;
+            let stamp = bin_stamp(&canon)?;
+            libs.push((p.to_path_buf(), canon, stamp));
         }
         libs.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         libs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
@@ -1263,6 +1400,12 @@ fn hash_shared_lib_sample(h: &mut sha2::Sha256, canon: &Path, stamp: BinStamp) -
     hash_stamp(h, stamp);
     let mut f = std::fs::File::open(canon).with_context(|| format!("opening {}", canon.display()))?;
     let total_len = f.metadata().with_context(|| format!("stat {}", canon.display()))?.len();
+    ensure!(
+        total_len == stamp_len(stamp),
+        "shared library {} changed size during fingerprint ({} -> {total_len})",
+        canon.display(),
+        stamp_len(stamp)
+    );
     let mut head = Vec::new();
     (&mut f)
         .take(65536)
@@ -1426,6 +1569,29 @@ fn verify_watched_files(watched: &[WatchedFile]) -> bool {
 }
 
 #[cfg(feature = "compiler")]
+fn extract_linemarker_path(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("# ")?;
+    let (num, after_num) = rest.split_once(' ')?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut chars = after_num.strip_prefix('"')?.chars();
+    let mut path = String::new();
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            return Some(path);
+        }
+        if c == '\\' {
+            let esc = chars.next()?;
+            path.push(esc);
+        } else {
+            path.push(c);
+        }
+    }
+    None
+}
+
+#[cfg(feature = "compiler")]
 fn probe_sys_headers(
     cc_path: &Path,
     target_cpu: &str,
@@ -1438,20 +1604,35 @@ fn probe_sys_headers(
     drop(hdr_file);
     let canon_src = std::fs::canonicalize(&hdr_path)?;
     let mut watched = Vec::new();
+    let mut record_header = |path_str: &str, opt_flag: &str| -> Result<()> {
+        let dep = PathBuf::from(path_str);
+        ensure!(
+            dep.is_absolute() && dep.is_file(),
+            "{} {opt_flag} -H/-E reported non-absolute or missing header: {path_str:?}",
+            cc_path.display()
+        );
+        let canon = std::fs::canonicalize(&dep)
+            .with_context(|| format!("canonicalizing system header {}", dep.display()))?;
+        if canon == canon_src {
+            return Ok(());
+        }
+        let stamp = bin_stamp(&canon)?;
+        watched.push((dep, canon, stamp));
+        Ok(())
+    };
     for opt_flag in ["-O2", "-O0"] {
         let mut cmd = clean_cc_cmd(cc_path);
         cmd.args([opt_flag, "-fPIC", &format!("-march={target_cpu}"), "-H", "-E", "-x", "c"])
-            .arg(&hdr_path)
-            .args(["-o", "/dev/null"]);
+            .arg(&hdr_path);
         let out = run_cmd_output_with_deadline(
             cmd,
             probe_dir,
-            &format!("{} {opt_flag} -H system headers", cc_path.display()),
+            &format!("{} {opt_flag} -H -E system headers", cc_path.display()),
             deadline,
         )?;
         ensure!(
             out.status.success(),
-            "{} {opt_flag} -H system header probe failed: {}",
+            "{} {opt_flag} -H -E system header probe failed: {}",
             cc_path.display(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
@@ -1461,25 +1642,20 @@ fn probe_sys_headers(
             if rest.len() < trimmed.len()
                 && let Some(path_str) = rest.strip_prefix(' ')
             {
-                let dep = PathBuf::from(path_str);
-                ensure!(
-                    dep.is_absolute() && dep.is_file(),
-                    "{} {opt_flag} -H reported non-absolute or missing header: {path_str:?}",
-                    cc_path.display()
-                );
-                let canon = std::fs::canonicalize(&dep)
-                    .with_context(|| format!("canonicalizing system header {}", dep.display()))?;
-                if canon == canon_src {
-                    continue;
-                }
-                let stamp = bin_stamp(&canon)?;
-                watched.push((dep, canon, stamp));
+                record_header(path_str, opt_flag)?;
+            }
+        }
+        for raw_line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(path_str) = extract_linemarker_path(raw_line.trim_end_matches('\r'))
+                && path_str.starts_with('/')
+            {
+                record_header(&path_str, opt_flag)?;
             }
         }
     }
     #[cfg(unix)]
-    ensure!(!watched.is_empty(), "{} -H returned no system headers", cc_path.display());
-    let digest = hash_watched_files(b"sys-headers-v2\0", &mut watched)?;
+    ensure!(!watched.is_empty(), "{} -H -E returned no system headers", cc_path.display());
+    let digest = hash_watched_files(b"sys-headers-v3\0", &mut watched)?;
     Ok((digest, watched))
 }
 
@@ -1507,7 +1683,7 @@ fn probe_link_env_and_cet(
         let _rm_o = RemoveOnDrop(o_path.clone());
         let canon_o = std::fs::canonicalize(&o_path)?;
         let mut c_cmd = clean_cc_cmd(cc_path);
-        c_cmd.args(["-c", "-fPIC"]);
+        c_cmd.args(["-c", "-O0", "-fPIC"]);
         if with_cet {
             c_cmd.arg("-fcf-protection=return");
         }
@@ -1535,6 +1711,8 @@ fn probe_link_env_and_cet(
         l_cmd.arg(&o_path).arg("-o").arg(&so_path);
         #[cfg(target_os = "linux")]
         l_cmd.arg("-pthread");
+        #[cfg(unix)]
+        l_cmd.arg("-lm");
         let l_out = run_cmd_output_with_deadline(
             l_cmd,
             probe_dir,
@@ -1582,7 +1760,8 @@ fn probe_link_env_and_cet(
     let canon_probe_dir = std::fs::canonicalize(probe_dir).ok();
     let mut watched = Vec::new();
     for path in parse_ld_trace_files(&stdout, &stderr) {
-        let Ok(canon) = std::fs::canonicalize(&path) else { continue };
+        let canon = std::fs::canonicalize(&path)
+            .with_context(|| format!("canonicalizing link input {}", path.display()))?;
         if canon == canon_o {
             continue;
         }
@@ -1596,7 +1775,7 @@ fn probe_link_env_and_cet(
     }
     #[cfg(target_os = "linux")]
     ensure!(!watched.is_empty(), "{} -Wl,-t returned no link inputs", cc_path.display());
-    let digest = hash_watched_files(b"link-env-v2\0", &mut watched)?;
+    let digest = hash_watched_files(b"link-env-v3\0", &mut watched)?;
     Ok((has_cet_return, digest, watched))
 }
 
@@ -1609,9 +1788,9 @@ type CcIdentityKey = (
     PathBuf,
     PathBuf,
     BinStamp,
-    Option<(PathBuf, BinStamp)>,
-    Option<(PathBuf, BinStamp)>,
-    Option<(PathBuf, BinStamp)>,
+    Option<WatchedFile>,
+    Option<WatchedFile>,
+    Option<WatchedFile>,
     String,
     String,
 );
@@ -1625,7 +1804,7 @@ struct ResolvedCcIdentity {
     cc1_file: Option<WatchedFile>,
     as_file: Option<WatchedFile>,
     collect2_file: Option<WatchedFile>,
-    lld_key: Option<(PathBuf, BinStamp)>,
+    lld_key: Option<WatchedFile>,
     has_lld: bool,
     linker_path: PathBuf,
     canon_linker: PathBuf,
@@ -1648,17 +1827,15 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
     let host_fp = host_cpu_fingerprint().to_string();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let probe_dir = ensure_private_cache_dir(&canon_cache.join("cc-probe"))?;
-    let lld_found = find_in_path("ld.lld");
-    let lld_key = lld_found
-        .as_ref()
-        .and_then(|p| std::fs::canonicalize(p).ok())
-        .and_then(|c| bin_stamp(&c).ok().map(|s| (c, s)));
+    let lld_key = find_in_path("ld.lld")
+        .and_then(|p| std::fs::canonicalize(&p).ok().map(|c| (p, c)))
+        .and_then(|(p, c)| bin_stamp(&c).ok().map(|s| (p, c, s)));
     let ld_key = find_in_path("ld")
-        .and_then(|p| std::fs::canonicalize(&p).ok())
-        .and_then(|c| bin_stamp(&c).ok().map(|s| (c, s)));
+        .and_then(|p| std::fs::canonicalize(&p).ok().map(|c| (p, c)))
+        .and_then(|(p, c)| bin_stamp(&c).ok().map(|s| (p, c, s)));
     let as_key = find_in_path("as")
-        .and_then(|p| std::fs::canonicalize(&p).ok())
-        .and_then(|c| bin_stamp(&c).ok().map(|s| (c, s)));
+        .and_then(|p| std::fs::canonicalize(&p).ok().map(|c| (p, c)))
+        .and_then(|(p, c)| bin_stamp(&c).ok().map(|s| (p, c, s)));
     let is_sha64 = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
     for cc in ["clang", "cc", "gcc"] {
         let Some(p) = find_in_path(cc) else { continue };
@@ -1684,7 +1861,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
         }
 
         let probe_key_line = format!(
-            "v6|{cc}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{}",
+            "v7|{cc}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}|{}",
             p.display(),
             canon_cc.display(),
             stamp,
@@ -1886,9 +2063,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
         }
         let cc_target = format!("{:x}", h.finalize());
 
-        let has_lld = if lld_key.is_some()
-            && let Some(ref lld_prog) = lld_found
-        {
+        let has_lld = if let Some((ref lld_prog, _, _)) = lld_key {
             let mut lld_cmd = clean_cc_cmd(lld_prog);
             lld_cmd.arg("--version");
             run_cmd_output_with_deadline(lld_cmd, &probe_dir, "probing ld.lld --version", deadline)?
@@ -1948,6 +2123,16 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
         watched_files.extend(link_files);
         watched_files.extend(cc_libs);
         watched_files.extend(ld_libs);
+        #[cfg(target_os = "linux")]
+        {
+            let ld_cache = Path::new("/etc/ld.so.cache");
+            if ld_cache.is_file()
+                && let Ok(canon) = std::fs::canonicalize(ld_cache)
+                && let Ok(st) = bin_stamp(&canon)
+            {
+                watched_files.push((ld_cache.to_path_buf(), canon, st));
+            }
+        }
         if let Some(ref f) = cc1_file {
             watched_files.push(f.clone());
         }
@@ -1965,6 +2150,10 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
             (!s.is_empty() && !s.contains('|') && !s.contains('\t') && !s.contains('\n') && !s.contains('\r'))
                 .then_some(s)
         }
+        let clean_opt_watched = |opt: &Option<WatchedFile>| -> bool {
+            opt.as_ref()
+                .is_none_or(|(o, c, _)| clean_path_str(o).is_some() && clean_path_str(c).is_some())
+        };
         let format_watched = |(orig, canon, st): &WatchedFile| -> Option<String> {
             Some(format!("{}\t{}\t{st:?}", clean_path_str(orig)?, clean_path_str(canon)?))
         };
@@ -1978,6 +2167,9 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
             && (!cfg!(unix) || !watched_files.is_empty())
             && clean_path_str(&p).is_some()
             && clean_path_str(&canon_cc).is_some()
+            && clean_opt_watched(&lld_key)
+            && clean_opt_watched(&ld_key)
+            && clean_opt_watched(&as_key)
             && let (Some(l_orig), Some(l_canon)) = (clean_path_str(&linker_path), clean_path_str(&canon_linker))
             && let (Some(cc1_str), Some(as_str), Some(collect2_str)) =
                 (format_opt(&cc1_file), format_opt(&as_file), format_opt(&collect2_file))
@@ -2088,7 +2280,10 @@ fn rustc_identity(
         // Execute `proxy_path` directly (NOT canonicalized) so rustup preserves `argv[0] = "rustc"`.
         let mut cmd = Command::new(&proxy_path);
         cmd.env_clear();
-        for var in ["PATH", "HOME", "RUSTUP_HOME", "CARGO_HOME"] {
+        if let Some(path) = sanitized_path_env() {
+            cmd.env("PATH", path);
+        }
+        for var in ["HOME", "RUSTUP_HOME", "CARGO_HOME"] {
             if let Some(v) = std::env::var_os(var) {
                 cmd.env(var, v);
             }
@@ -2380,7 +2575,14 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
     );
     let deadline = Instant::now() + build_timeout()?;
     let x64_isa = match backend.as_str() {
-        "c" | "rust" => None,
+        "c" => {
+            ensure!(
+                matches!(c_opt.as_str(), "auto" | "O2" | "O1" | "O0"),
+                "unsupported PEN_WTIME_AOT_C_OPT={c_opt:?} (expected auto, O2, O1, or O0)"
+            );
+            None
+        }
+        "rust" => None,
         "x64" => Some(resolved_x64_isa_tag(target_cpu)?),
         other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
     };
@@ -2527,10 +2729,16 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
     let time_limit_arg = format!("{:.3}", remaining.as_secs_f64().max(0.001));
 
     let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp_wasm = canon_cache.join(format!("input-{digest}-{}-{seq}.wasm", std::process::id()));
-    std::fs::write(&tmp_wasm, wasm)?;
+    let (mut wasm_file, tmp_wasm) = create_private_temp_file(&canon_cache, &format!("input-{digest}"), ".wasm")?;
     let _cleanup_wasm = RemoveOnDrop(tmp_wasm.clone());
+    wasm_file.write_all(wasm)?;
+    drop(wasm_file);
     let mut cmd = Command::new(&canon_bin);
+    if let Some(path) = sanitized_path_env() {
+        cmd.env("PATH", path);
+    } else {
+        cmd.env_remove("PATH");
+    }
     // Keep `wtime-aot` and all compiler/linker children inside Pen's single process group so a
     // host timeout kills the entire build tree atomically.
     cmd.env("WTIME_AOT_INHERIT_PGID", "1")
@@ -2635,8 +2843,8 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
             post_canon_cc.display()
         );
         let post_lld_key = find_in_path("ld.lld")
-            .and_then(|p| std::fs::canonicalize(&p).ok())
-            .and_then(|c| bin_stamp(&c).ok().map(|s| (c, s)));
+            .and_then(|p| std::fs::canonicalize(&p).ok().map(|c| (p, c)))
+            .and_then(|(p, c)| bin_stamp(&c).ok().map(|s| (p, c, s)));
         ensure!(
             post_lld_key == pre_cc.lld_key,
             "linker ld.lld changed on PATH during build; refusing to bind artifact to stale provenance"

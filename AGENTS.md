@@ -21,6 +21,11 @@
   escape through host or worker packets. Language tasks are retired; isolated
   host workers and data queues remain.
 - Verify headlessly; do not open windows on the owner's desktop.
+- A build into a separate `CARGO_TARGET_DIR` does not make the Blot compiler
+  plugin the CLI and the codec tests look for: run `just plugins` (that is,
+  `cd plugins && cargo build --release --target wasm32-wasip2`), which writes
+  `plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm`, a path they find
+  beside the checkout.
 - Never start Steam with app 480 or accept Microsoft's cargo-xwin license.
 - Preserve unrelated work in sibling checkouts.
 - Keep large artifacts in `~/.cache/pen` or `/var/tmp`; `/tmp` is RAM-backed.

@@ -240,27 +240,37 @@ fn file_sha256_hex(path: &Path) -> Result<String> {
     Ok(wasm_sha256_hex(&bytes))
 }
 
+/// Reads the calling thread's Linux proc status (`/proc/thread-self/status`, falling back to
+/// `/proc/self/status` only when `/proc/thread-self/status` returns `NotFound`).
+#[cfg(all(feature = "compiler", target_os = "linux"))]
+fn read_thread_proc_status() -> std::io::Result<String> {
+    match std::fs::read_to_string("/proc/thread-self/status") {
+        Ok(s) => Ok(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::read_to_string("/proc/self/status"),
+        Err(e) => Err(e),
+    }
+}
+
 /// Returns the current effective UID on Unix, failing closed if unavailable.
-/// On Linux this parses `Uid:` field 2 (`euid`) from `/proc/self/status` so it stays exact
-/// even under `PR_SET_DUMPABLE=0` (where `/proc/self` metadata reports `st_uid == 0`).
+/// On Linux this parses `Uid:` field 2 (`euid`) from `/proc/thread-self/status` so it stays exact
+/// for the calling thread even under `PR_SET_DUMPABLE=0` (where `/proc/self` reports `st_uid == 0`).
 #[cfg(all(feature = "compiler", unix))]
 pub(crate) fn current_euid() -> Result<u32> {
     #[cfg(target_os = "linux")]
     {
-        let status = std::fs::read_to_string("/proc/self/status")
-            .context("reading /proc/self/status for effective uid")?;
+        let status = read_thread_proc_status().context("reading /proc/thread-self/status for effective uid")?;
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("Uid:") {
                 let euid_str = rest
                     .split_whitespace()
                     .nth(1)
-                    .ok_or_else(|| anyhow!("malformed Uid line in /proc/self/status"))?;
+                    .ok_or_else(|| anyhow!("malformed Uid line in proc status"))?;
                 return euid_str
                     .parse::<u32>()
-                    .context("parsing effective uid from /proc/self/status");
+                    .context("parsing effective uid from proc status");
             }
         }
-        bail!("missing Uid line in /proc/self/status")
+        bail!("missing Uid line in proc status")
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -689,11 +699,11 @@ fn rustc_version_fingerprint(toolchain: &str) -> String {
     fp
 }
 
-/// Returns true if the current Linux thread has hardware CET shadow stack (`shstk`) enabled,
-/// parsed from `/proc/self/status` `x86_Thread_features:` (zero unsafe, zero syscalls).
+/// Returns true if the current calling Linux thread has hardware CET shadow stack (`shstk`)
+/// enabled, parsed from `/proc/thread-self/status` `x86_Thread_features:` (zero unsafe, zero syscalls).
 #[cfg(all(feature = "compiler", target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
 fn linux_shstk_enabled() -> bool {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+    let Ok(status) = read_thread_proc_status() else {
         return false;
     };
     for line in status.lines() {
@@ -705,9 +715,10 @@ fn linux_shstk_enabled() -> bool {
 }
 
 /// Canonical internal cache profile tag matching `wtime-aot --backend x64 --target-cpu`,
-/// also checking host platform, CPU capability (`SSE4.1 + POPCNT`, plus `ABM/LZCNT + BMI1` for
-/// `x64-v3`), and calling-thread CET `SHSTK` status BEFORE cache lookup so unsupported hosts fail
-/// with a typed `X64FallbackError` while `wasm` & `cache` are still available for default-path fallback.
+/// validating `target_cpu` syntax FIRST and then checking host platform, calling-thread CET
+/// `SHSTK` status, and CPU capability (`SSE4.1 + POPCNT`, plus `ABM/LZCNT + BMI1` for `x64-v3`)
+/// BEFORE cache lookup so unsupported hosts fail with a typed `X64FallbackError` while `wasm` &
+/// `cache` are still available for default-path fallback (and bad CPU names always fail loudly).
 #[cfg(feature = "compiler")]
 fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64")))]
@@ -719,16 +730,8 @@ fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
     {
-        if linux_shstk_enabled() {
-            return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(
-                "calling thread has Linux CET hardware shadow stack (SHSTK) enabled".into(),
-            ))));
-        }
-        if !std::is_x86_feature_detected!("sse4.1") || !std::is_x86_feature_detected!("popcnt") {
-            return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(
-                "host CPU lacks baseline SSE4.1 + POPCNT required by wtime-aot --backend x64".into(),
-            ))));
-        }
+        // Validate `target_cpu` syntax BEFORE host ISA/SHSTK checks so an invalid CPU name never
+        // turns into a fallback-eligible `UnsupportedIsa` error.
         let tag = match target_cpu {
             "native" => {
                 if std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("bmi1") {
@@ -752,6 +755,16 @@ fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
                 "unsupported PEN_WTIME_AOT_TARGET_CPU={other:?} (expected native, x86-64-v2, generic, x86-64-v3, x86-64-v4, znver<N>, or haswell+)"
             ),
         };
+        if linux_shstk_enabled() {
+            return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(
+                "calling thread has Linux CET hardware shadow stack (SHSTK) enabled".into(),
+            ))));
+        }
+        if !std::is_x86_feature_detected!("sse4.1") || !std::is_x86_feature_detected!("popcnt") {
+            return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(
+                "host CPU lacks baseline SSE4.1 + POPCNT required by wtime-aot --backend x64".into(),
+            ))));
+        }
         if tag == "x64-v3" && (!std::is_x86_feature_detected!("lzcnt") || !std::is_x86_feature_detected!("bmi1")) {
             return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(format!(
                 "host CPU lacks ABM/LZCNT + BMI1 required by PEN_WTIME_AOT_TARGET_CPU={target_cpu:?}"

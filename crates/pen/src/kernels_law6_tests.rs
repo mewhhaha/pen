@@ -178,14 +178,15 @@ const q1_oz: F32 = 0.5
 const q1_tx: F32 = 5.0
 const q1_tz: F32 = 0.5
 
-func build_world_ground (storage: navigation.Storage): navigation.Stored =>
+func build_world_ground (storage: own navigation.Storage): (navigation.Stored, navigation.Storage) =>
   let boxes: #[navigation.Box] = #[
     navigation.box_of 0.45 (math.vec3 (-0.5) 0.0 (-3.0), math.vec3 0.5 2.0 3.0),
   ]
   let rounds: #[navigation.Round] = #[
     navigation.round_of 0.45 (math.vec3 0.0 0.0 0.0) 1.3,
   ]
-  return Maybe.unwrap_or navigation.closed_stored (navigation.reuse_into storage navigation.closed_stored (&boxes[0..1]) (&rounds[0..1]) 12.0)
+  let (maybe_stored, next_storage) = navigation.reuse_into storage navigation.closed_stored (&boxes[0..1]) (&rounds[0..1]) 12.0
+  return (Maybe.unwrap_or navigation.closed_stored maybe_stored, next_storage)
 
 func fresh_world () =>
   let f = host.frame_owners ()
@@ -226,54 +227,63 @@ func fresh_world () =>
     semantic_values: f.semantic_values, service_output: f.service_output, encoder_text: f.encoder_text,
   }}
 
-func ensure_ground_and_mesh access =>
+func ensure_ground_and_mesh (own access) =>
   if not access.colony_paths.state[0].ready:
-    let stored = build_world_ground access.g_storage
-    access.g_stored[0] = stored
-    let solids = navigation.read access.g_storage stored
-    colony_paths.prepare access solids derived.initial
-  return ()
+    let (stored, next_storage) = build_world_ground access.g_storage
+    access.g_storage := next_storage
+    access.g_stored[0] := stored
+    let next_cp = do:
+      let solids = navigation.read access.g_storage stored
+      break colony_paths.prepare_access access.colony_paths solids derived.initial
+    access.colony_paths := next_cp
+  return access
 
 func step_world (own access) -> (seconds: F32) =>
-  ensure_ground_and_mesh access
-  let solids = navigation.read access.g_storage access.g_stored[0]
+  access := ensure_ground_and_mesh access
   let n = F32.to_u32 access.sim[0]
-  // On steps >= 5, run colony_paths.toward on both obstacle-blocked queries!
+  // On steps >= 5, run colony_paths.toward_access on both obstacle-blocked queries!
   // On steps < 5, prepare only (giving CAP + CTX upload + RUN_BATCH time to warm).
   if n >= 5:
-    let wp0 = colony_paths.toward access solids 0 (math.vec3 q0_ox 0.0 q0_oz) (math.vec3 q0_tx 0.0 q0_tz)
-    let wp1 = colony_paths.toward access solids 1 (math.vec3 q1_ox 0.0 q1_oz) (math.vec3 q1_tx 0.0 q1_tz)
+    let (wp0, cp1) = do:
+      let solids = navigation.read access.g_storage access.g_stored[0]
+      break colony_paths.toward_access access.colony_paths solids 0 (math.vec3 q0_ox 0.0 q0_oz) (math.vec3 q0_tx 0.0 q0_tz)
+    access.colony_paths := cp1
+    let (wp1, cp2) = do:
+      let solids = navigation.read access.g_storage access.g_stored[0]
+      break colony_paths.toward_access access.colony_paths solids 1 (math.vec3 q1_ox 0.0 q1_oz) (math.vec3 q1_tx 0.0 q1_tz)
+    access.colony_paths := cp2
     if let $Some p0 = wp0:
-      access.sim[1] = p0.x
-      access.sim[2] = p0.z
+      access.sim[1] := p0.x
+      access.sim[2] := p0.z
     if let $Some p1 = wp1:
-      access.sim[3] = p1.x
-      access.sim[4] = p1.z
-  access.sim[0] = U32.to_f32 (n + 1)
+      access.sim[3] := p1.x
+      access.sim[4] := p1.z
+  access.sim[0] := U32.to_f32 (n + 1)
   return access
 
 func handle_event (own access) -> (ctx: app.EventContext) =>
   access.services := services.receive self svc_policy ctx.event
   case ctx.event of
     $events.KeyDown code => do:
-      access.sim[5] = access.sim[5] + U32.to_f32 code
+      access.sim[5] := access.sim[5] + U32.to_f32 code
       // KeyDown 65 triggers canonical high-ID 0x800000 request (Law #6a/b/c).
       if code == 65:
-        let ignored1 = services.ask access.services protocol.service_clipboard protocol.clipboard_op_copy 1.0 0.0 0.0 0.0 #[11.0, 22.0]
-        let ignored2 = services.ask access.services protocol.service_clipboard protocol.clipboard_op_copy 2.0 0.0 0.0 0.0 #[33.0, 44.0]
+        let (_, svc1) = services.ask access.services protocol.service_clipboard protocol.clipboard_op_copy 1.0 0.0 0.0 0.0 #[11.0, 22.0]
+        let (_, svc2) = services.ask svc1 protocol.service_clipboard protocol.clipboard_op_copy 2.0 0.0 0.0 0.0 #[33.0, 44.0]
+        access.services := svc2
     _ => ()
   if let $Some ans = services.answer access.services 8388608:
-    access.sim[6] = ans.value
+    access.sim[6] := ans.value
     let vals = services.values access.services ans.values
     if vals.length > 0:
-      access.sim[7] = vals[0]
+      access.sim[7] := vals[0]
   return access
 
 func present_world (own access) -> (presentation: app.Presentation) =>
   // Put canonical sim values (never ephemeral prewarm counters!) in clear color,
   // and report ephemeral telemetry ONLY in an extension tag when requested so
   // canonical render packets stay 100% identical between Worker ON and Worker OFF!
-  access.frame.settings[0].lighting.clear = math.vec4 (access.sim[1] * 0.01) (access.sim[2] * 0.01) (access.sim[5] * 0.001) 1.0
+  access.frame.settings[0].lighting.clear := math.vec4 (access.sim[1] * 0.01) (access.sim[2] * 0.01) (access.sim[5] * 0.001) 1.0
   // Emit a 1-lane canonical draw reflecting sim state.
   let fv: #[~math.Vec4] = access.frame_vectors
   access.frame.draws.push ($render.Draw {{
@@ -329,7 +339,7 @@ func decode_telemetry (own access) -> (values: #[F32]) =>
 
 func receive_kernels_fn (own access) -> (evs: &[events.Event]) =>
   access.kernel_transport := kernel_transport.receive_events self evs
-  colony_paths.absorb_prewarmed_routes access.colony_paths access.kernel_transport (kernel.id plan_routes) (kernel.binding_hash plan_routes)
+  access.colony_paths := colony_paths.absorb_prewarmed_routes self access.kernel_transport (kernel.id plan_routes) (kernel.binding_hash plan_routes)
   return access
 
 func emit_kernels_fn (own access) -> (canonical_count: U32) -> (admitted: #[~services.Request]) -> (payload_out: #[~F32]) =>
@@ -374,10 +384,10 @@ func init_world (own access) =>
   access := colony_paths.reset_storage access
   return access
 
-func ack_world access -> (published: Bool) =>
-  persist.clear_requests access.requests
-  services.compact access.services access.service_scratch
-  return ()
+func ack_world (own access) -> (published: Bool) =>
+  access.requests := persist.clear_requests self
+  access.services := services.compact self access.service_scratch
+  return access
 
 const stages = app.stages app.no_action app.no_action app.no_action app.no_action app.route_event
   app.no_event handle_event step_world present_world app.no_action
@@ -390,7 +400,7 @@ const application = {{
   scenes: true,
   keep: app.no_keep,
   acknowledge: ack_world,
-  set_viewport: func _ -> _ -> _ => (),
+  set_viewport: func (own access) -> _ -> _ => access,
   receive_kernels: receive_kernels_fn,
   emit_kernels: emit_kernels_fn,
   initialize: init_world,

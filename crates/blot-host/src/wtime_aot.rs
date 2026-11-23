@@ -2572,25 +2572,34 @@ fn load_verified_so(_wasm: &[u8], _cache: Option<&Path>) -> Result<Library> {
     bail!("wtime-aot compilation requires blot-host's `compiler` feature")
 }
 
-/// Explicit compilation configuration threaded into `load_verified_so_with_config` so future
-/// default-path fallback (e.g. `x64 -> c --target-cpu native`) never mutates process env vars.
+/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset.
+/// Kept on `"c"` until the frozen `opt-palm` §5.2 CI promotion gate is cleared.
 #[cfg(feature = "compiler")]
-#[derive(Clone, Debug)]
+const DEFAULT_AOT_BACKEND: &str = "c";
+
+/// Explicit compilation configuration threaded into `load_verified_so_with_config` so
+/// default-path fallback (`x64 -> c --c-opt auto --target-cpu native`) never mutates env vars.
+#[cfg(feature = "compiler")]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct AotCompileConfig {
     backend: String,
     c_opt: String,
     toolchain: String,
     target_cpu: String,
+    /// True when `PEN_WTIME_AOT_BACKEND` was explicitly set by the caller (disables fallback).
+    explicit_backend: bool,
 }
 
 #[cfg(feature = "compiler")]
 impl AotCompileConfig {
     fn from_env() -> Self {
+        let explicit = std::env::var("PEN_WTIME_AOT_BACKEND").ok().filter(|s| !s.is_empty());
+        let (backend, explicit_backend) = match explicit {
+            Some(b) => (b, true),
+            None => (DEFAULT_AOT_BACKEND.to_string(), false),
+        };
         Self {
-            backend: std::env::var("PEN_WTIME_AOT_BACKEND")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "c".to_string()),
+            backend,
             c_opt: std::env::var("PEN_WTIME_AOT_C_OPT")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -2603,7 +2612,52 @@ impl AotCompileConfig {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "native".to_string()),
+            explicit_backend,
         }
+    }
+
+    fn x64_fallback_to_c(&self) -> Self {
+        Self {
+            backend: "c".to_string(),
+            c_opt: self.c_opt.clone(),
+            toolchain: self.toolchain.clone(),
+            target_cpu: "native".to_string(),
+            explicit_backend: true,
+        }
+    }
+}
+
+/// Runs `loader` with `cfg`, falling back cleanly to `--backend c --c-opt auto --target-cpu native`
+/// ONLY when `cfg` selected `"x64"` as the implicit default (`!cfg.explicit_backend`) and `loader`
+/// returned a typed [`X64FallbackError`]. Explicit `PEN_WTIME_AOT_BACKEND=x64` and non-fallback
+/// errors (such as exit code `1` compiler/I/O/config failures) always propagate unchanged.
+#[cfg(feature = "compiler")]
+fn load_verified_so_with_fallback<T, F>(wasm: &[u8], cache: Option<&Path>, cfg: &AotCompileConfig, mut loader: F) -> Result<T>
+where
+    F: FnMut(&[u8], Option<&Path>, &AotCompileConfig) -> Result<T>,
+{
+    match loader(wasm, cache, cfg) {
+        Ok(lib) => Ok(lib),
+        Err(err)
+            if cfg.backend == "x64"
+                && !cfg.explicit_backend
+                && err.downcast_ref::<X64FallbackError>().is_some() =>
+        {
+            let fallback_cfg = cfg.x64_fallback_to_c();
+            loader(wasm, cache, &fallback_cfg)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(feature = "compiler")]
+fn classify_build_failure(backend: &str, exit_code: Option<i32>, status_display: &str, stderr: &str) -> anyhow::Error {
+    if backend == "x64" && exit_code == Some(X64_ADMISSION_REJECTED_EXIT_CODE) {
+        anyhow::Error::new(X64FallbackError(X64FallbackReason::AdmissionRejected(
+            stderr.trim().to_string(),
+        )))
+    } else {
+        anyhow!("wtime-aot build failed ({status_display}): {stderr}")
     }
 }
 
@@ -2670,7 +2724,7 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
             .with_context(|| format!("loading PEN_WTIME_AOT_SO {}", canon.display()));
     }
     let cfg = AotCompileConfig::from_env();
-    load_verified_so_with_config(wasm, cache, &cfg)
+    load_verified_so_with_fallback(wasm, cache, &cfg, load_verified_so_with_config)
 }
 
 #[cfg(feature = "compiler")]
@@ -2891,12 +2945,12 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
     drop(_cleanup_wasm);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if backend == "x64" && output.status.code() == Some(X64_ADMISSION_REJECTED_EXIT_CODE) {
-            return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::AdmissionRejected(
-                stderr.trim().to_string(),
-            ))));
-        }
-        bail!("wtime-aot build failed ({}): {stderr}", output.status);
+        return Err(classify_build_failure(
+            backend.as_str(),
+            output.status.code(),
+            &output.status.to_string(),
+            &stderr,
+        ));
     }
     ensure_before_deadline(deadline, "post-build verification")?;
     let post_stamp = bin_stamp(&canon_bin)?;
@@ -4235,5 +4289,229 @@ impl AotGuest {
             }
         }
         out
+    }
+}
+
+#[cfg(all(test, feature = "compiler"))]
+mod tests {
+    use super::*;
+
+    fn test_temp_dir(name: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "blot-host-wtime-aot-{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test temp dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+        }
+        dir
+    }
+
+    fn default_x64_cfg() -> AotCompileConfig {
+        AotCompileConfig {
+            backend: "x64".to_string(),
+            c_opt: "auto".to_string(),
+            toolchain: "stable".to_string(),
+            target_cpu: "x86-64-v3".to_string(),
+            explicit_backend: false,
+        }
+    }
+
+    #[test]
+    fn default_x64_fallback_triggers_on_all_three_fallback_reasons() {
+        let reasons = [
+            X64FallbackReason::UnsupportedPlatform("not linux x86_64".into()),
+            X64FallbackReason::UnsupportedIsa("missing sse4.1".into()),
+            X64FallbackReason::AdmissionRejected("unsupported proposal".into()),
+        ];
+        for reason in reasons {
+            let cfg = default_x64_cfg();
+            let mut seen = Vec::new();
+            let result = load_verified_so_with_fallback(b"wasm", None, &cfg, |_w, _c, cur| {
+                seen.push(cur.clone());
+                if cur.backend == "x64" {
+                    Err(anyhow::Error::new(X64FallbackError(reason.clone())))
+                } else {
+                    Ok(cur.backend.clone())
+                }
+            })
+            .expect("default x64 fallback should recover with c backend");
+            assert_eq!(result, "c");
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].backend, "x64");
+            assert_eq!(seen[1].backend, "c");
+            assert_eq!(seen[1].c_opt, "auto");
+            assert_eq!(seen[1].target_cpu, "native");
+            assert!(seen[1].explicit_backend);
+        }
+    }
+
+    #[test]
+    fn explicit_x64_backend_propagates_fallback_errors_without_fallback() {
+        let reasons = [
+            X64FallbackReason::UnsupportedPlatform("not linux x86_64".into()),
+            X64FallbackReason::UnsupportedIsa("cet shstk enabled".into()),
+            X64FallbackReason::AdmissionRejected("memory64 unsupported".into()),
+        ];
+        for reason in reasons {
+            let mut cfg = default_x64_cfg();
+            cfg.explicit_backend = true;
+            let mut calls = 0usize;
+            let err = load_verified_so_with_fallback(b"wasm", None, &cfg, |_w, _c, _cur| -> Result<()> {
+                calls += 1;
+                Err(anyhow::Error::new(X64FallbackError(reason.clone())))
+            })
+            .expect_err("explicit x64 backend must propagate X64FallbackError");
+            assert_eq!(calls, 1);
+            let typed = err.downcast_ref::<X64FallbackError>().expect("typed X64FallbackError");
+            assert_eq!(typed.0, reason);
+        }
+    }
+
+    #[test]
+    fn non_fallback_error_and_exit_code_1_propagate_even_on_default_x64() {
+        let exit4 = classify_build_failure("x64", Some(X64_ADMISSION_REJECTED_EXIT_CODE), "exit status: 4", "bad op");
+        assert!(matches!(
+            exit4.downcast_ref::<X64FallbackError>(),
+            Some(X64FallbackError(X64FallbackReason::AdmissionRejected(msg))) if msg == "bad op"
+        ));
+
+        let exit1 = classify_build_failure("x64", Some(1), "exit status: 1", "internal compiler error");
+        assert!(exit1.downcast_ref::<X64FallbackError>().is_none());
+
+        let c_exit4 = classify_build_failure("c", Some(X64_ADMISSION_REJECTED_EXIT_CODE), "exit status: 4", "c err");
+        assert!(c_exit4.downcast_ref::<X64FallbackError>().is_none());
+
+        let cfg = default_x64_cfg();
+        let mut calls = 0usize;
+        let err = load_verified_so_with_fallback(b"wasm", None, &cfg, |_w, _c, _cur| -> Result<()> {
+            calls += 1;
+            Err(classify_build_failure("x64", Some(1), "exit status: 1", "compiler io failure"))
+        })
+        .expect_err("exit code 1 must not trigger fallback");
+        assert_eq!(calls, 1);
+        assert!(err.downcast_ref::<X64FallbackError>().is_none());
+        assert!(err.to_string().contains("compiler io failure"));
+    }
+
+    #[test]
+    fn bin_digest_caches_invalidates_on_change_and_ignores_tampered_entries() {
+        let root = test_temp_dir("bin-digest");
+        let cache = ensure_private_cache_dir(&root.join("cache")).expect("private cache");
+        let bin = root.join("fake-wtime-aot");
+        std::fs::write(&bin, b"binary-version-1").expect("write v1");
+        let (canon1, d1) = bin_digest(&bin, &cache).expect("digest v1");
+        assert_eq!(d1, wasm_sha256_hex(b"binary-version-1"));
+
+        let bin_cache_dir = cache.join("bin-digests");
+        let path_hash = wasm_sha256_hex(canon1.as_os_str().as_encoded_bytes());
+        let entry = bin_cache_dir.join(format!("{path_hash}.txt"));
+        assert!(entry.is_file(), "bin-digest entry should be persisted");
+
+        // Second lookup hits cache with exact digest.
+        let (_, d1_again) = bin_digest(&bin, &cache).expect("digest v1 cached");
+        assert_eq!(d1_again, d1);
+
+        // Overwriting the binary with a different length/content must change BinStamp and recompute.
+        std::fs::write(&bin, b"binary-version-2-longer").expect("write v2");
+        let (_, d2) = bin_digest(&bin, &cache).expect("digest v2");
+        assert_eq!(d2, wasm_sha256_hex(b"binary-version-2-longer"));
+        assert_ne!(d2, d1);
+
+        // Corrupting the on-disk entry (oversized or invalid mode) must fail closed and recompute cleanly.
+        let bin3 = root.join("fake-wtime-aot-3");
+        std::fs::write(&bin3, b"binary-version-3").expect("write v3");
+        let canon3 = std::fs::canonicalize(&bin3).expect("canon v3");
+        let entry3 = bin_cache_dir.join(format!("{}.txt", wasm_sha256_hex(canon3.as_os_str().as_encoded_bytes())));
+        std::fs::write(&entry3, vec![b'x'; 16_384]).expect("write oversized entry");
+        let (_, d3) = bin_digest(&bin3, &cache).expect("digest v3 ignores oversized entry");
+        assert_eq!(d3, wasm_sha256_hex(b"binary-version-3"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let bin4 = root.join("fake-wtime-aot-4");
+            std::fs::write(&bin4, b"binary-version-4").expect("write v4");
+            let canon4 = std::fs::canonicalize(&bin4).expect("canon v4");
+            let entry4 = bin_cache_dir.join(format!("{}.txt", wasm_sha256_hex(canon4.as_os_str().as_encoded_bytes())));
+            let st4 = bin_stamp(&canon4).expect("stamp v4");
+            let forged_sha = "0".repeat(64);
+            std::fs::write(&entry4, format!("v1|{}|{st4:?}\n{forged_sha}\n", canon4.display())).expect("write forged");
+            std::fs::set_permissions(&entry4, std::fs::Permissions::from_mode(0o666)).expect("chmod 0666");
+            let (_, d4) = bin_digest(&bin4, &cache).expect("digest v4 ignores world-writable entry");
+            assert_eq!(d4, wasm_sha256_hex(b"binary-version-4"));
+            assert_ne!(d4, forged_sha);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn validate_aot_wasm_rejects_huge_code_section_size_without_overflow_and_matches_imaged_globals() {
+        use wasm_encoder::{
+            CodeSection, ConstExpr, ExportKind, ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
+            Instruction, Module, TypeSection, ValType as EncValType,
+        };
+        let abi = GuestAbi::default();
+
+        // Crafted Wasm with Code section (id=10) claiming size = u32::MAX (0xffff_ffff LEB128).
+        let crafted = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+            0x0a, // Code section id
+            0xff, 0xff, 0xff, 0xff, 0x0f, // size = u32::MAX
+            0x00, // truncated body
+        ];
+        assert!(validate_aot_wasm(&crafted, &abi).is_err());
+        assert!(crate::imaged_globals(&crafted).is_err());
+
+        // Valid module with 2 exported mutable i32 globals (one counter), 1 immutable global, and 1 function body:
+        // verify validate_aot_wasm().imaged matches crate::imaged_globals() verbatim.
+        let mut m = Module::new();
+        let mut types = TypeSection::new();
+        types.ty().function([], []);
+        m.section(&types);
+        let mut funcs = FunctionSection::new();
+        funcs.function(0);
+        m.section(&funcs);
+        let mut globals = GlobalSection::new();
+        globals.global(GlobalType { val_type: EncValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(7));
+        globals.global(GlobalType { val_type: EncValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(0));
+        globals.global(
+            GlobalType { val_type: EncValType::I32, mutable: false, shared: false },
+            &ConstExpr::i32_const(42),
+        );
+        m.section(&globals);
+        let mut exports = ExportSection::new();
+        exports.export("g_mut", ExportKind::Global, 0);
+        exports.export("blot:ctr", ExportKind::Global, 1);
+        m.section(&exports);
+        let mut code = CodeSection::new();
+        let mut body = Function::new([]);
+        body.instruction(&Instruction::Nop);
+        body.instruction(&Instruction::End);
+        code.function(&body);
+        m.section(&code);
+        let valid = m.finish();
+
+        let validated = validate_aot_wasm(&valid, &abi).expect("validate valid module");
+        assert_eq!(validated.imaged, crate::imaged_globals(&valid));
+        assert_eq!(validated.imaged, Ok(vec!["g_mut".to_string(), "blot:ctr".to_string()]));
+        assert_eq!(validated.counter_names, vec!["blot:ctr".to_string()]);
+
+        // Hidden mutable global produces the exact same error string in both paths.
+        let mut hm = Module::new();
+        let mut hglobals = GlobalSection::new();
+        hglobals.global(GlobalType { val_type: EncValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(1));
+        hm.section(&hglobals);
+        let hidden = hm.finish();
+        let v_hidden = validate_aot_wasm(&hidden, &abi).expect("validate hidden");
+        assert_eq!(v_hidden.imaged, crate::imaged_globals(&hidden));
+        assert!(v_hidden.imaged.is_err());
     }
 }

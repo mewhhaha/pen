@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use pen_protocol::{Matrix, Quality, RenderFrame};
 
 use crate::built_in::{BuiltIn, BuiltIns};
+use crate::exposure::Exposure;
+use crate::grade::{self, Lut};
 use crate::graph::{Binding, Graph, GraphBuilder, Handle, Spec, Target};
 use crate::matrix::{invert, multiply};
 use crate::packed_texture::level_size;
@@ -32,6 +34,13 @@ pub(crate) const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16
 pub(crate) const TONED_WGSL: &str = include_str!("shaders/toned.wgsl");
 
 const FULLSCREEN: &str = include_str!("shaders/fullscreen.wgsl");
+
+/// WGSL: the sRGB transfer function and exposure as light (`exposed`), which the
+/// bloom's first pass, the metering and the present pass share.
+pub(crate) const TRANSFER_WGSL: &str = include_str!("shaders/transfer.wgsl");
+
+/// WGSL: the color grade (`grade_apply`), reference of Ink's `color.grade`.
+pub(crate) const GRADE_WGSL: &str = include_str!("shaders/grade.wgsl");
 
 fn depth_texture(samples: u32) -> &'static str {
     if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" }
@@ -86,6 +95,8 @@ pub(crate) fn present_shader(samples: u32, display: &crate::Display) -> String {
     PRESENT_SHADER
         .replace("${marks_texture}", if samples > 1 { "texture_multisampled_2d<u32>" } else { "texture_2d<u32>" })
         .replace("${fullscreen}", FULLSCREEN)
+        .replace("${transfer}", TRANSFER_WGSL)
+        .replace("${grade}", GRADE_WGSL)
         .replace("${tonedWgsl}", &toned)
         .replace("${fxaa}", include_str!("shaders/fxaa.wgsl"))
 }
@@ -103,10 +114,18 @@ const BLOOM_VERTEX: &str = include_str!("shaders/bloom_vertex.wgsl");
 const BLOOM_DOWN_SHADER: &str = include_str!("shaders/bloom_down.wgsl");
 
 pub(crate) fn bloom_down_shader(first: bool) -> String {
+    // The first level sees the picture as the camera exposes it, so what spills is
+    // what is past white on the screen, not in the scene.
+    let exposure = if first {
+        format!("{TRANSFER_WGSL}\n@group(0) @binding(2) var<storage, read> exposure: array<f32, 4>;")
+    } else {
+        String::new()
+    };
     BLOOM_DOWN_SHADER
         .replace("${bloomVertex}", BLOOM_VERTEX)
+        .replace("${exposure}", &exposure)
         .replace("${weight}", if first { "1.0 / (1.0 + brightness(color))" } else { "1.0" })
-        .replace("${past_white}", if first { "color = past_white(color);" } else { "" })
+        .replace("${past_white}", if first { "color = past_white(exposed(color, exposure[0]));" } else { "" })
 }
 
 const BLOOM_UP_SHADER: &str = include_str!("shaders/bloom_up.wgsl");
@@ -314,6 +333,10 @@ pub(crate) struct Post {
     jitters: u64,
     jittered: Option<(Matrix, (f64, f64))>,
     memory: crate::taa::Memory,
+    /// The scene's metering and the exposure it leaves on the GPU.
+    exposure: Exposure,
+    /// The present pass's late bind group: the grade's two tables, and which they are.
+    tables: Option<(([u64; 2], u32), wgpu::BindGroup)>,
 }
 
 fn texture(
@@ -378,7 +401,30 @@ impl Post {
             jitters: 0,
             jittered: None,
             memory: Default::default(),
+            exposure: Exposure::new(device, queue),
+            tables: None,
         }
+    }
+
+    /// The next metered frame takes the exposure its scene asks for at once.
+    pub fn reset_exposure(&mut self) {
+        self.exposure.reset();
+    }
+
+    /// Takes in the exposures read back, and returns the latest one's stops.
+    pub fn exposure_seen(&mut self) -> Option<f32> {
+        self.exposure.take();
+        self.exposure.latest()
+    }
+
+    /// Copies the frame's exposure out for reading back.
+    pub fn exposure_finish(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.exposure.finish(encoder);
+    }
+
+    /// The frame is submitted.
+    pub fn exposure_submitted(&mut self) {
+        self.exposure.submitted();
     }
 
     /// The passes after the scene that the last frame drew, in order.
@@ -554,6 +600,9 @@ impl Post {
             graph.pass("taa", BuiltIn::Taa(samples), bindings, Target::Texture(drawn), false);
             lit = drawn;
         }
+        // Auto exposure meters the lit picture, before the bloom (exposure.rs).
+        graph.hook("meter", lit);
+        let exposure = Binding::Storage(self.exposure.state().clone());
         // Bloom halves the picture level by level, then adds each level onto
         // the one above, back up to half the scene's size.
         let half = (width.div_ceil(2), height.div_ceil(2));
@@ -565,7 +614,10 @@ impl Post {
             .collect();
         for (index, &level) in bloom.iter().enumerate() {
             let (first, from) = if index == 0 { (true, lit) } else { (false, bloom[index - 1]) };
-            let bindings = vec![Binding::Texture(from), sampler.clone()];
+            let mut bindings = vec![Binding::Texture(from), sampler.clone()];
+            if first {
+                bindings.push(exposure.clone());
+            }
             graph.pass("bloom down", BuiltIn::BloomDown { first }, bindings, Target::Texture(level), false);
         }
         for pair in bloom.windows(2).rev() {
@@ -577,9 +629,41 @@ impl Post {
             None => graph.import("unbloomed", self.unbloomed.create_view(&Default::default())),
         };
         let uniform = Binding::Uniform(self.uniform("present", 64));
-        let bindings = vec![uniform, Binding::Texture(lit), sampler, Binding::Texture(marks), Binding::Texture(glow)];
+        let grade = Binding::Uniform(self.uniform("grade", size_of::<grade::GradeUniform>() as u64));
+        let bindings = vec![
+            uniform,
+            Binding::Texture(lit),
+            sampler,
+            Binding::Texture(marks),
+            Binding::Texture(glow),
+            grade,
+            exposure,
+        ];
         graph.pass("present", BuiltIn::Present(samples), bindings, Target::Output, false);
         graph.compile(&self.device, built_ins, sharing)
+    }
+
+    /// The present pass's late bind group (group 1) for these look-up tables, made
+    /// again only when they change.
+    fn tables_group(&mut self, built_ins: &mut BuiltIns, samples: u32, tables: &[Option<Lut>; 2]) -> wgpu::BindGroup {
+        let key = [tables[0].as_ref().map_or(0, |table| table.id), tables[1].as_ref().map_or(0, |table| table.id)];
+        let key = (key, samples);
+        if self.tables.as_ref().is_none_or(|(kept, _)| *kept != key) {
+            let layout = built_ins.get(BuiltIn::Present(samples)).get_bind_group_layout(1);
+            let blank = self.unbloomed.create_view(&Default::default());
+            let view = |table: &Option<Lut>| table.as_ref().map_or_else(|| blank.clone(), |table| table.view.clone());
+            let (a, b) = (view(&tables[0]), view(&tables[1]));
+            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("grade tables"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&a) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&b) },
+                ],
+            });
+            self.tables = Some((key, group));
+        }
+        self.tables.as_ref().unwrap().1.clone()
     }
 
     /// Encodes the ordinary path without additional targets or passes.
@@ -590,8 +674,9 @@ impl Post {
         frame: &RenderFrame,
         output: &wgpu::TextureView,
         timer: &GpuTimer,
+        tables: &[Option<Lut>; 2],
     ) {
-        self.finish_base(built_ins, encoder, frame, output, timer, false);
+        self.finish_base(built_ins, encoder, frame, output, timer, false, tables);
     }
 
     /// With scene filters, defer camera effects until their output is ready.
@@ -604,6 +689,7 @@ impl Post {
         output: &wgpu::TextureView,
         timer: &GpuTimer,
         filtered: bool,
+        tables: &[Option<Lut>; 2],
     ) {
         let quality = self.quality.expect("Post::begin comes first");
         let size = self.size;
@@ -664,7 +750,15 @@ impl Post {
                 0.0f32,
             ]),
         );
-        self.targets.as_ref().unwrap().graphs[graph].execute(encoder, built_ins, output, timer);
+        // The exposure, fixed or metered, and the grade, for the present pass.
+        self.exposure.begin(&frame.exposure);
+        let uniform = self.uniform("grade", size_of::<grade::GradeUniform>() as u64);
+        self.queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&grade::uniform(&frame.grade, tables)));
+        let late = self.tables_group(built_ins, self.targets.as_ref().unwrap().key.samples, tables);
+        let (targets, exposure) = (self.targets.as_ref().unwrap(), &mut self.exposure);
+        targets.graphs[graph].execute(encoder, built_ins, output, timer, &late, &mut |picture, encoder| {
+            exposure.meter(encoder, picture, (width, height));
+        });
     }
     /// Apply blur and stencil-masked aberration to the styled image, before UI.
     #[allow(clippy::too_many_arguments)]
@@ -678,6 +772,8 @@ impl Post {
         timestamps: Option<wgpu::RenderPassTimestampWrites<'_>>,
     ) {
         let uniform = self.uniform("filtered present", 64);
+        let ungraded = self.uniform("ungraded", size_of::<grade::GradeUniform>() as u64);
+        let late = self.tables_group(built_ins, self.targets.as_ref().unwrap().key.samples, &[None, None]);
         let targets = self.targets.as_ref().unwrap();
         let key = targets.key;
         let marks = targets.marks.clone();
@@ -719,6 +815,9 @@ impl Post {
                         binding: 4,
                         resource: wgpu::BindingResource::TextureView(&self.unbloomed.create_view(&Default::default())),
                     },
+                    // Neither is read: the picture is shown already.
+                    wgpu::BindGroupEntry { binding: 5, resource: ungraded.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: self.exposure.state().as_entire_binding() },
                 ],
             });
             self.filtered_present = Some(FilteredPresent { source: source.clone(), marks, group });
@@ -736,6 +835,7 @@ impl Post {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.filtered_present.as_ref().unwrap().group, &[]);
+        pass.set_bind_group(1, &late, &[]);
         pass.draw(0..3, 0..1);
     }
 }

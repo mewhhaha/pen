@@ -132,6 +132,13 @@ impl State {
         self.post.as_ref().map(Post::passes).unwrap_or_default()
     }
 
+    /// Auto exposure takes the exposure its next frame's scene asks for at once.
+    pub fn reset_exposure(&mut self) {
+        if let Some(post) = &mut self.post {
+            post.reset_exposure();
+        }
+    }
+
     /// Starts loading what `sprites` draw with (their materials, shaders and
     /// textures); whether all of it is ready to draw.
     pub fn prepare_sprites(&mut self, sprites: &[Sprite], catalog: &Catalog) -> Result<bool> {
@@ -317,6 +324,7 @@ impl State {
         self.prepare_insets(frame, (output_width, output_height), &mut scratch.insets);
         let composite = (!scratch.insets.is_empty()).then(|| self.built_ins.get(BuiltIn::Composite).clone());
 
+        let tables = self.look_up_tables(frame, catalog)?;
         let quality = pen_protocol::Quality { msaa: samples, scale, ..frame.quality };
         let targets = self.post.as_mut().unwrap().begin(&mut self.built_ins, frame, quality, target.size());
         // With TAA the scene draws through a projection jittered within its
@@ -508,6 +516,7 @@ impl State {
                 &images[0],
                 &self.timer,
                 true,
+                &tables,
             );
             sprites.prepare(&device, &self.queue, (output_width, output_height), &frame.sprites, &scratch.sprite_order);
             let mut current = 0;
@@ -542,7 +551,7 @@ impl State {
                 self.timer.pass(Span::Post),
             );
         } else {
-            self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &output, &self.timer);
+            self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &output, &self.timer, &tables);
         }
         if !scratch.sprites.is_empty() {
             let layout = self.context.sprite_group.clone();
@@ -616,6 +625,7 @@ impl State {
         let drawn = targets.size.0 as f32 / output_width.max(1) as f32;
         stats.scale = drawn;
         stats.gpu = self.timer.latest();
+        stats.exposure = self.post.as_mut().and_then(Post::exposure_seen);
         let kept = self.culling.latest();
         stats.instances += kept.instances;
         stats.triangles += kept.triangles;
@@ -624,7 +634,13 @@ impl State {
         self.last_stats = stats;
         self.timer.resolve(&mut encoder);
         self.culling.finish(&mut encoder);
+        if let Some(post) = &mut self.post {
+            post.exposure_finish(&mut encoder);
+        }
         self.queue.submit([encoder.finish()]);
+        if let Some(post) = &mut self.post {
+            post.exposure_submitted();
+        }
         self.timer.submitted();
         self.culling.submitted();
         self.resolution.submitted(&self.queue, self.timer.timed());

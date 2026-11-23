@@ -17,12 +17,13 @@ mod cascades;
 mod fields;
 mod frame;
 mod gpu_culling;
+mod grading;
 mod insets;
 mod inspect;
 mod instance_upload;
 mod materials;
 mod particles;
-mod readback;
+pub(crate) mod readback;
 mod resolution;
 #[cfg(test)]
 mod shadow_tests;

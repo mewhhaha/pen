@@ -295,11 +295,12 @@ finishing its work.
 
 `post.rs` draws the scene into a floating-point target (`SCENE_FORMAT`),
 multisampled and resolved for MSAA, at the render scale. Then come ambient
-occlusion from its depth, sky, fog and cloud shadows, TAA, and bloom, as a
-render graph (below). Last, the present pass tones highlights into white (or
-toward an HDR display's peak), applies FXAA Quality (`shaders/fxaa.wgsl`),
-splits the colours of surfaces that ask for the frame's aberration, and
-scales the image to the output.
+occlusion from its depth, sky, fog and cloud shadows, TAA, the metering of
+auto exposure, and bloom, as a render graph (below). Last, the present pass
+exposes the light, grades it, tones highlights into white (or toward an HDR
+display's peak), applies FXAA Quality (`shaders/fxaa.wgsl`), splits the colours
+of surfaces that ask for the frame's aberration, and scales the image to the
+output.
 
 ### The sky as light
 
@@ -326,6 +327,88 @@ counts match what the buffer holds. Screen-space occlusion still darkens the
 whole picture after the scene, so sky light and reflections are occluded with
 the rest.
 
+### Exposure and grading
+
+The frame's `exposure` and `grade` (header groups, defaults that change
+nothing) decide how the scene's light is shown. Both work on the light the
+present pass reads, which `display.rs` describes as sRGB-encoded (the scene
+draws as for an SDR screen): the shaders decode it to linear light
+(`shaders/transfer.wgsl`), work there, and encode it again before `toned`, so a
+stop is a doubling of light and the roll-off toward white or an HDR display's
+peak is unchanged. With a fixed exposure of 0 stops and the neutral grade the
+present pass shows exactly what it showed before there was either.
+
+**Exposure** (`exposure.rs`). `exposure.auto` off, `compensation` is a fixed
+exposure in stops (-16 to 16); on, the scene is metered on the GPU and the
+exposure adapts. Metering reads the lit scene, after the sky, fog and TAA and
+before the bloom: the bloom's first pass exposes the picture itself before it
+keeps what is past white (so what spills is what is past white on the screen),
+which makes metering after it circular, and a glow is the scene's light
+spilling, not more of it. Two compute passes run each metered frame, from a
+hook in the render graph (`Graph::hook`: it gives the caller the view of the
+texture it reads, at its place in the order):
+
+- `shaders/meter.wgsl` counts each pixel into one of 256 bins evenly spaced in
+  log2 of its linear luminance over `range_low` to `range_high` (default -10 to
+  6 stops, a sixteenth of a stop a bin); darker and brighter pixels fall in the
+  first and last bins and NaN counts for nothing. A pixel counts for its weight
+  in 1/256ths (all 256, or with `centre` above 0 mixed toward a Gaussian of the
+  distance from the middle), so a 4K picture's counts fit a `u32`. Each
+  workgroup counts in shared memory first.
+- `shaders/adapt.wgsl` (one invocation) takes the average of the bins' log2
+  luminance over the weight between the `low` and `high` percentiles (a bin that
+  straddles one counts for the share inside), so the darkest and brightest
+  pixels are ignored, then the exposure that brings that average to `target`
+  (middle grey, 0.18) plus `compensation`, clamped to `min` and `max`. The
+  exposure moves toward it by `1 - exp(-rate * dt)` of the distance, `rate`
+  being `brighten` going up and `darken` going down (per second), `dt` the game's
+  seconds since the last frame, so any split of time into frames lands in the
+  same place and `dt` 0 (a paused game) holds it. The first frame, `exposure.cut`
+  and `Renderer::reset_exposure()` (for a host that restores or replays) jump to
+  the goal instead.
+
+The exposure lives in a four-float storage buffer (stops, the metered average,
+whether it holds a value, the goal) that the bloom and the present pass read:
+nothing is read back for rendering. A fixed frame writes the buffer from the
+CPU (so switching to auto starts from there). `RenderStats::exposure` is the
+exposure of a recent frame, copied out and mapped a few frames later like the
+GPU timings, for dev overlays and tests. The compute pipelines compile on the
+first metered frame.
+
+**Grade** (`grade.rs`, `shaders/grade.wgsl`). In the present pass, after
+exposure and the bloom, in linear light, in this order: a vignette (`vignette`,
+`vignette_radius`: light times a smoothstep from 1 at the radius to 1 - strength
+at the corner), `exposure` in stops and white balance (`temperature` moves red
+and blue half a stop against each other, `tint` green against both), contrast
+about `pivot` in a log encoding (ACEScc, the S-2014-003 curve on the frame's
+own primaries), ASC CDL (`gain` slope, `lift` offset, power 1 / `gamma`) in
+linear light, saturation and vibrance about the luminance, and the look-up
+tables. Grading before the roll-off, in light and in log, is what makes it right
+for both displays: the grade shapes the scene, then `toned` fits it to the SDR
+screen's white or the HDR display's peak, rather than a table authored for SDR
+white being stretched over highlights it never saw. The same formula is Ink's
+`color.grade` and the f64 reference in this file's tests, term for term.
+Nothing set is the identity (the shader is skipped); evaluated in full with
+neutral settings it agrees with its input to a few parts in 100,000.
+
+A table is a strip texture named by a material (`grade.lut_a`, `lut_b`: 1 plus
+the catalog index; 0 for none): N slices of N by N texels (N 2 to 64), side by
+side, so N * N wide and N tall, blue picking the slice, red running along it and
+green down, texel (r, g, b) of an identity table holding (r, g, b) / (N - 1). It
+holds colors in the grade's log encoding (0 is a thousandth of SDR white, 0.41
+middle grey, 1 more than two hundred times white), read as data (not an sRGB
+picture) at its finest level and sampled trilinearly with texel centres at
+i / (N - 1), eight loads, by the shader (`lut_lookup`). It is 8-bit in an
+ordinary PNG, so its steps are 1/255 of the encoding, about a twentieth of a
+stop; the part of the encoding outside 0 to 1 passes through unchanged, so black
+and the brightest highlights are not clipped. `lut_blend` blends `lut_a` toward
+`lut_b` in log (a zone transition), `lut_weight` is how much of the result
+applies, and a table that has not streamed in yet is left out (the second stands
+in for a missing first). The two tables bind at group 1 of the present pass,
+rebuilt only when they change; the exposure and the grade's uniform are at
+bindings 5 and 6 of group 0. Scene filters (sprite materials with
+`scene_filter`) see the picture after exposure, grade and roll-off, as before.
+
 ### The render graph
 
 The passes after the scene draw as a small render graph (`graph.rs`). Each
@@ -339,7 +422,10 @@ graph again only when the targets' size or the passes change (the
 `TargetsKey`): occlusion, atmosphere, TAA, each bloom level down and up,
 present. The scene's own targets (depth, picture, stencil marks) and TAA's
 history are imported. `Graph::execute` encodes the passes each frame, and
-`Renderer::passes()` lists them.
+`Renderer::passes()` lists them. A hook is a pass that draws nothing: it reads one
+texture and `execute` hands its view to the caller at that place (the metering
+of auto exposure); `passes()` leaves hooks out. A pass may bind a read-only
+storage buffer, and the present pass has a late bind group at group 1.
 
 ### Temporal antialiasing
 
@@ -436,6 +522,13 @@ host installs the logger. The `render_packet` example prints them with
   an analytic edge, clustered lights against every light summed, KTX2
   variants by device features, HDR output in each color space, and MSDF text
   magnified, and writes what it drew to `target/look-shots/`.
+  `tests/exposure_looks.rs` draws a dark room with a bright window with a fixed
+  and with auto exposure, the adaptation over time (rates, frame-rate
+  independence, cuts and resets), and the grade and its look-up tables on SDR
+  and HDR displays (PNGs in the directory `EXPOSURE_SHOTS` names if set); the
+  histogram, trimmed average, adaptation, clamps and cuts are checked against f64
+  references by `exposure.rs`'s tests, and the grade and table sampling by
+  `grade.rs`'s.
   `tests/shadow_looks.rs` draws the sun's soft and contact shadows and the
   spot and point lights' shadows (before and after PNGs, in the directory
   `SHADOW_SHOTS` names if set); the shaders' filters, cascade blending, bias,

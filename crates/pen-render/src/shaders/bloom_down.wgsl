@@ -1,4 +1,5 @@
 ${bloomVertex}
+${exposure}
 const threshold = 1.3;
 const knee = 0.6;
 

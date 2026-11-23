@@ -218,6 +218,26 @@ impl Harness {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        // No grade, and zero stops of exposure: the present pass as it was.
+        let storage = |size: u64, usage: wgpu::BufferUsages| {
+            device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage, mapped_at_creation: false })
+        };
+        let grade = storage(112, wgpu::BufferUsages::UNIFORM);
+        let exposure = storage(16, wgpu::BufferUsages::STORAGE);
+        let tables = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.pipelines[mode].get_bind_group_layout(1),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&glow.create_view(&Default::default())),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&glow.create_view(&Default::default())),
+                },
+            ],
+        });
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.pipelines[mode].get_bind_group_layout(0),
@@ -236,6 +256,8 @@ impl Harness {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(&glow.create_view(&Default::default())),
                 },
+                wgpu::BindGroupEntry { binding: 5, resource: grade.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: exposure.as_entire_binding() },
             ],
         });
         let view = target.create_view(&Default::default());
@@ -270,6 +292,7 @@ impl Harness {
             });
             pass.set_pipeline(&self.pipelines[mode]);
             pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(1, &tables, &[]);
             pass.draw(0..3, 0..1);
         }
         let resolve = device.create_buffer(&wgpu::BufferDescriptor {

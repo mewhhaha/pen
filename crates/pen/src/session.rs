@@ -287,6 +287,8 @@ impl Host for Shell<'_> {
         self.preferences.replay(self.input);
         // The answers waiting were for the world that asked.
         self.services.forget();
+        // And the exposure the screen adapted to was for the moment it replaced.
+        self.gpu.renderer.reset_exposure();
     }
 
     fn state_adapter(&self) -> Arc<dyn StateAdapter> {

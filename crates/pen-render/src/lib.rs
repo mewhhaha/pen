@@ -12,7 +12,9 @@ mod culling;
 mod decals;
 mod display;
 mod environment;
+mod exposure;
 mod filter;
+mod grade;
 mod graph;
 mod inspect;
 mod lights;
@@ -32,6 +34,8 @@ mod simplify;
 mod solids;
 mod sprites;
 mod taa;
+#[cfg(test)]
+mod testing;
 mod texture;
 mod texture_recipe;
 
@@ -127,6 +131,10 @@ pub struct RenderStats {
     /// back), while `Renderer::time_passes` or a frame budget has them timed
     /// and the device has timestamps.
     pub gpu: Option<GpuTimes>,
+    /// The exposure, in stops, that a recent frame was shown with (a few frames
+    /// back): a fixed frame's setting, or where auto exposure had adapted to.
+    /// Read back without waiting for the GPU.
+    pub exposure: Option<f32>,
 }
 
 /// How long the GPU took over a frame's passes, in milliseconds: the shadow
@@ -263,6 +271,14 @@ impl Renderer {
     /// graph's, which leaves out passes nothing reads).
     pub fn passes(&self) -> Vec<&'static str> {
         self.state.passes()
+    }
+
+    /// Makes auto exposure take the exposure the next frame's scene asks for at
+    /// once, rather than adapt from the last one: for a host that restores an
+    /// earlier moment of the game or replays one (a frame's `exposure.cut` does
+    /// the same from the game).
+    pub fn reset_exposure(&mut self) {
+        self.state.reset_exposure();
     }
 
     /// Where the catalog's mesh or material (`pen_protocol::devtools_asset`

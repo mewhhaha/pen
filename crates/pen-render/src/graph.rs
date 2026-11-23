@@ -3,6 +3,10 @@
 // pipelines: it names the textures it reads, as its bind group's bindings,
 // and the one it draws into, or the frame's output.
 //
+// A pass may instead be a hook: it reads one texture and draws nothing, and
+// `execute` hands the texture's view to the caller at that place in the order,
+// to encode compute work on it (the metering of auto exposure, exposure.rs).
+//
 // `plan` checks that every texture is drawn before it is read, leaves out
 // the passes whose pictures nothing reads, and gives each texture the graph
 // makes a lifetime, from the pass that first draws it to the last that reads
@@ -44,6 +48,8 @@ struct Texture {
 #[derive(Clone)]
 pub(crate) enum Binding {
     Uniform(wgpu::Buffer),
+    /// A buffer the shader only reads.
+    Storage(wgpu::Buffer),
     Texture(Handle),
     Sampler(wgpu::Sampler),
 }
@@ -54,11 +60,14 @@ pub(crate) enum Target {
     Texture(Handle),
     /// The frame's output, which `execute` is given.
     Output,
+    /// Nothing: a hook's.
+    Nothing,
 }
 
 struct Pass {
     name: &'static str,
-    pipeline: BuiltIn,
+    /// None for a hook.
+    pipeline: Option<BuiltIn>,
     bindings: Vec<Binding>,
     target: Target,
     /// Whether it draws over what its target holds, blending into it, rather
@@ -108,7 +117,19 @@ impl GraphBuilder {
     /// A pass drawing `pipeline` with `bindings` into `target`, clearing it
     /// first or, `over`, blending over what it holds.
     pub fn pass(&mut self, name: &'static str, pipeline: BuiltIn, bindings: Vec<Binding>, target: Target, over: bool) {
-        self.passes.push(Pass { name, pipeline, bindings, target, over });
+        self.passes.push(Pass { name, pipeline: Some(pipeline), bindings, target, over });
+    }
+
+    /// A hook after the passes before it: `execute` gives its caller `read`'s view
+    /// at this place in the order. It always runs.
+    pub fn hook(&mut self, name: &'static str, read: Handle) {
+        self.passes.push(Pass {
+            name,
+            pipeline: None,
+            bindings: vec![Binding::Texture(read)],
+            target: Target::Nothing,
+            over: false,
+        });
     }
 
     fn imported(&self, handle: Handle) -> bool {
@@ -135,7 +156,7 @@ impl GraphBuilder {
         let mut live = vec![false; self.passes.len()];
         for (index, pass) in self.passes.iter().enumerate().rev() {
             let target = match pass.target {
-                Target::Output => None,
+                Target::Output | Target::Nothing => None,
                 Target::Texture(target) => Some(target),
             };
             if target.is_some_and(|target| !needed[target.0] && !self.imported(target)) {
@@ -157,7 +178,7 @@ impl GraphBuilder {
             let pass = &self.passes[index];
             let target = match pass.target {
                 Target::Texture(target) => Some(target),
-                Target::Output => None,
+                Target::Output | Target::Nothing => None,
             };
             for handle in pass.reads().chain(target) {
                 let span = uses[handle.0].get_or_insert((place, place));
@@ -226,13 +247,27 @@ impl GraphBuilder {
         let mut passes = Vec::with_capacity(plan.passes.len());
         for index in plan.passes {
             let pass = &self.passes[index];
-            let pipeline = built_ins.get(pass.pipeline);
+            let Some(which) = pass.pipeline else {
+                let Some(Binding::Texture(read)) = pass.bindings.first() else {
+                    unreachable!("a hook reads a texture")
+                };
+                passes.push(CompiledPass {
+                    name: pass.name,
+                    pipeline: None,
+                    group: None,
+                    target: None,
+                    over: false,
+                    hook: Some(view(*read).clone()),
+                });
+                continue;
+            };
+            let pipeline = built_ins.get(which);
             let entries: Vec<wgpu::BindGroupEntry<'_>> = (0..)
                 .zip(&pass.bindings)
                 .map(|(binding, resource)| wgpu::BindGroupEntry {
                     binding,
                     resource: match resource {
-                        Binding::Uniform(buffer) => buffer.as_entire_binding(),
+                        Binding::Uniform(buffer) | Binding::Storage(buffer) => buffer.as_entire_binding(),
                         Binding::Texture(handle) => wgpu::BindingResource::TextureView(view(*handle)),
                         Binding::Sampler(sampler) => wgpu::BindingResource::Sampler(sampler),
                     },
@@ -245,9 +280,16 @@ impl GraphBuilder {
             });
             let target = match pass.target {
                 Target::Texture(handle) => Some(view(handle).clone()),
-                Target::Output => None,
+                Target::Output | Target::Nothing => None,
             };
-            passes.push(CompiledPass { name: pass.name, pipeline: pass.pipeline, group, target, over: pass.over });
+            passes.push(CompiledPass {
+                name: pass.name,
+                pipeline: Some(which),
+                group: Some(group),
+                target,
+                over: pass.over,
+                hook: None,
+            });
         }
         Ok(Graph { passes, specs: plan.allocations, allocations: made })
     }
@@ -255,11 +297,13 @@ impl GraphBuilder {
 
 struct CompiledPass {
     name: &'static str,
-    pipeline: BuiltIn,
-    group: wgpu::BindGroup,
+    pipeline: Option<BuiltIn>,
+    group: Option<wgpu::BindGroup>,
     /// None for the output.
     target: Option<wgpu::TextureView>,
     over: bool,
+    /// The texture a hook reads.
+    hook: Option<wgpu::TextureView>,
 }
 
 /// A compiled graph: its passes in order, with their bind groups and the
@@ -272,15 +316,23 @@ pub(crate) struct Graph {
 
 impl Graph {
     /// Encodes every pass, the last ones onto `output`, each timed as one
-    /// of the passes after the scene where `timer` times the frame.
+    /// of the passes after the scene where `timer` times the frame. The
+    /// present pass has `late` at group 1, which changes from frame to frame
+    /// (the grade's tables); a hook is given its texture and the encoder.
     pub fn execute(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         built_ins: &mut BuiltIns,
         output: &wgpu::TextureView,
         timer: &GpuTimer,
+        late: &wgpu::BindGroup,
+        hook: &mut dyn FnMut(&wgpu::TextureView, &mut wgpu::CommandEncoder),
     ) {
         for pass in &self.passes {
+            let (Some(which), Some(group)) = (pass.pipeline, &pass.group) else {
+                hook(pass.hook.as_ref().expect("a hook has its texture"), encoder);
+                continue;
+            };
             let mut drawing = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(pass.name),
                 timestamp_writes: timer.pass(Span::Post),
@@ -295,15 +347,18 @@ impl Graph {
                 })],
                 ..Default::default()
             });
-            drawing.set_pipeline(built_ins.get(pass.pipeline));
-            drawing.set_bind_group(0, &pass.group, &[]);
+            drawing.set_pipeline(built_ins.get(which));
+            drawing.set_bind_group(0, group, &[]);
+            if matches!(which, BuiltIn::Present(_)) {
+                drawing.set_bind_group(1, late, &[]);
+            }
             drawing.draw(0..3, 0..1);
         }
     }
 
-    /// The passes that draw, in order.
+    /// The passes that draw, in order (not the hooks).
     pub fn names(&self) -> Vec<&'static str> {
-        self.passes.iter().map(|pass| pass.name).collect()
+        self.passes.iter().filter(|pass| pass.pipeline.is_some()).map(|pass| pass.name).collect()
     }
 
     /// How many textures it made.

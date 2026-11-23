@@ -138,7 +138,10 @@ impl State {
             .chain(frame.decals.iter().map(|decal| decal.material))
             .chain(frame.emitters.iter().map(|emitter| emitter.material))
             .chain(frame.sprites.iter().map(|sprite| sprite.material))
-            .chain(frame.fields.iter().map(|patch| patch.material));
+            .chain(frame.fields.iter().map(|patch| patch.material))
+            .chain(
+                [frame.grade.lut_a, frame.grade.lut_b].into_iter().filter(|&table| table != 0).map(|table| table - 1),
+            );
         for material in named {
             checked(&catalog.materials, materials, material)?;
         }

@@ -11,7 +11,16 @@ struct Present {
 // The scene's stencil: bit 1 where a surface asks for the frame's aberration.
 @group(0) @binding(3) var marks: ${marks_texture};
 @group(0) @binding(4) var glow: texture_2d<f32>;
+// The color grade, and the exposure in stops that the frame's metering or its
+// fixed setting left in the first lane.
+@group(0) @binding(5) var<uniform> grade: Grade;
+@group(0) @binding(6) var<storage, read> exposure: array<f32, 4>;
+// The grade's look-up tables, or stand-ins while it has none.
+@group(1) @binding(0) var lut_a: texture_2d<f32>;
+@group(1) @binding(1) var lut_b: texture_2d<f32>;
 ${fullscreen}
+${transfer}
+${grade}
 ${tonedWgsl}
 
 fn marked(uv: vec2f) -> bool {
@@ -20,12 +29,17 @@ fn marked(uv: vec2f) -> bool {
   return (textureLoad(marks, pixel, 0).x & 1u) != 0u;
 }
 
-// The picture at uv as the screen shows it: the scene's light and its
-// bloom, toned.
+// The picture at uv as the screen shows it: the scene's light as the camera
+// exposes it and its bloom (drawn from the exposed light), graded, then toned.
+// A picture already shown (a scene filter's) is kept as it is.
 fn fetch(uv: vec2f) -> vec3f {
-  let light = textureSampleLevel(source, source_sampler, uv, 0.0).rgb +
-    textureSampleLevel(glow, source_sampler, uv, 0.0).rgb * present.bloom.x;
-  if (present.source.w > 0.5) { return light; }
+  let scene = textureSampleLevel(source, source_sampler, uv, 0.0).rgb;
+  let bloom = textureSampleLevel(glow, source_sampler, uv, 0.0).rgb * present.bloom.x;
+  if (present.source.w > 0.5) { return scene + bloom; }
+  var light = exposed(scene, exposure[0]) + bloom;
+  if (grade.luts.w > 0.5) {
+    light = srgb_encode(grade_apply(grade, lut_a, lut_b, srgb_decode(light), uv));
+  }
   return toned(light);
 }
 

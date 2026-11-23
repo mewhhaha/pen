@@ -3,7 +3,7 @@
 // their fields.
 use anyhow::{Result, ensure};
 use pen_protocol::boundary::{MAX_DRAW_EXTRA, MAX_FIELD};
-use pen_protocol::{Matrix, RenderFrame, Vector};
+use pen_protocol::{Exposure, Grade, Matrix, RenderFrame, Vector};
 
 use crate::matrix::narrow;
 
@@ -58,6 +58,8 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
         "aberration must be finite and within a screen"
     );
     ensure!(frame.blur >= 0.0 && frame.blur <= 0.5, "blur must be within 0..0.5");
+    validate_exposure(&frame.exposure)?;
+    validate_grade(&frame.grade)?;
     let clear = &frame.clear;
     ensure!(
         [clear.r, clear.g, clear.b, clear.a].iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value)),
@@ -175,4 +177,70 @@ pub(super) fn normal_matrix(matrix: &Matrix) -> Result<[f32; 16]> {
         1.0,
     ]
     .map(narrow))
+}
+
+/// The exposure's settings: finite, within the ranges the schema documents.
+fn validate_exposure(exposure: &Exposure) -> Result<()> {
+    let stops = -crate::exposure::MAX_STOPS..=crate::exposure::MAX_STOPS;
+    ensure!(
+        stops.contains(&exposure.compensation)
+            && stops.contains(&exposure.min)
+            && stops.contains(&exposure.max)
+            && exposure.min <= exposure.max,
+        "exposure compensation and limits must be finite stops within -16..16, the least no more than the most"
+    );
+    ensure!(
+        [exposure.brighten, exposure.darken].iter().all(|rate| (0.0..=1000.0).contains(rate))
+            && (0.0..=1.0e6).contains(&exposure.dt),
+        "exposure speeds must be rates of 0..1000 a second, and its time 0 or more"
+    );
+    ensure!(
+        (0.0..=1.0).contains(&exposure.low)
+            && (0.0..=1.0).contains(&exposure.high)
+            && exposure.low < exposure.high
+            && (0.0..=1.0).contains(&exposure.centre),
+        "exposure percentiles must be within 0..1, the low below the high, and its centre weight within 0..1"
+    );
+    ensure!(
+        (-64.0..=64.0).contains(&exposure.range_low)
+            && (-64.0..=64.0).contains(&exposure.range_high)
+            && exposure.range_high > exposure.range_low
+            && exposure.range_high - exposure.range_low <= 32.0,
+        "the exposure histogram's range must run up by at most 32 stops, within -64..64"
+    );
+    ensure!(
+        exposure.target.is_finite() && exposure.target > 0.0 && exposure.target <= 1.0e4,
+        "the exposure's middle grey must be a positive luminance"
+    );
+    Ok(())
+}
+
+/// The grade's settings: finite, within the ranges the schema documents.
+fn validate_grade(grade: &Grade) -> Result<()> {
+    let within = |value: f32, low: f32, high: f32| (low..=high).contains(&value);
+    ensure!(
+        within(grade.temperature, -1.0, 1.0)
+            && within(grade.tint, -1.0, 1.0)
+            && within(grade.exposure, -8.0, 8.0)
+            && within(grade.contrast, 0.0, 4.0)
+            && within(grade.pivot, 1.0e-4, 1.0e3)
+            && within(grade.saturation, 0.0, 4.0)
+            && within(grade.vibrance, -1.0, 1.0),
+        "the grade's white balance, exposure, contrast, pivot, saturation and vibrance must be within their ranges"
+    );
+    let channels = |vector: &Vector, low: f32, high: f32| {
+        [vector.x, vector.y, vector.z].iter().all(|&value| within(value, low, high))
+    };
+    ensure!(
+        channels(&grade.lift, -0.5, 0.5) && channels(&grade.gamma, 0.1, 4.0) && channels(&grade.gain, 0.0, 8.0),
+        "the grade's lift must be within -0.5..0.5, its gamma within 0.1..4 and its gain within 0..8"
+    );
+    ensure!(
+        within(grade.lut_blend, 0.0, 1.0)
+            && within(grade.lut_weight, 0.0, 1.0)
+            && within(grade.vignette, 0.0, 1.0)
+            && within(grade.vignette_radius, 0.0, 1.0),
+        "the grade's table blend and weight and its vignette must be within 0..1"
+    );
+    Ok(())
 }

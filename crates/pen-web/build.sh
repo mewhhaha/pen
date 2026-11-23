@@ -26,6 +26,8 @@ mkdir -p "$out"
   "$CARGO_TARGET_DIR/wasm32-unknown-unknown/web/pen_web.wasm"
 cp "$here/guest.js" "$out/guest.js"
 cp "$here/structured.js" "$out/structured.js"
+cp "$here/kernels.js" "$out/kernels.js"
+cp "$here/kernel_worker.js" "$out/kernel_worker.js"
 cp "$here/index.html" "$out/index.html"
 # -O1 with the features rustc's wasm32-unknown-unknown enables: -Os and -Oz
 # make a smaller module that compresses worse, so it downloads larger.

@@ -1,9 +1,9 @@
-# Services, data queues and copied-buffer workers
+# Services, data queues, `KernelPool` and isolated `Processes`
 
-This greenfield rewrite retires language tasks, including their scope,
-spawn/join/spark/receive/cancel APIs. Do not add a compatibility facade. Host
-workers and saved application data queues remain separate mechanisms. See
-[CONTINUE.md](../CONTINUE.md) and the [guest ABI](guest-abi-next.md).
+This greenfield rewrite retires language tasks and the legacy `blot_host::workers` /
+`blot_host::worker_sessions` experiments. Host kernels (`entry kernel` + `KernelPool`),
+isolated stateful processes (`entry process` + `Processes`), and frame-gated Pen services
+remain clean, separate mechanisms. See `blot2/tasks/CONCURRENCY_VNEXT.md`.
 
 ## Frame-gated services
 
@@ -12,72 +12,32 @@ boundaries. Replay uses those recorded answers. Save explicit request/result and
 continuation data; a suspended Wasm stack is not saved state. Restore and replay
 must preserve ordering and avoid duplicate simulation advances.
 
-Worker inputs, contexts and results are copied numeric packets. They must not
-contain guest pointers, borrowed views or live ECS access records. Applications
-own worker lifetime, revision identities and deterministic result publication.
-Neither a data queue nor a worker API makes application schedules parallel by
-itself. Qualify these boundaries after the real Gdev frame works.
+Worker inputs, contexts and results are copied numeric packets (`FlatNumeric` or
+`#[U32]`/`#[F32]`). They never contain guest pointers, borrowed views or live ECS
+access records. Applications own revision identities and deterministic result publication.
 
-## Independent numeric workers
+## Warm work-stealing `KernelPool` (`blot_host::kernels`)
 
-`blot_host::workers::Workers` is a separate opt-in CPU experiment for
-independent value entries. It shares compiled code but creates a fresh Wasm
-instance per job, copies every input/result, and returns answers in submission
-order. Limits are eight workers, 32 jobs per batch, 16,384 input/output lanes,
-and 64 MiB of linear memory per instance. Worker stacks include the configured
-guest stack allowance. Jobs cannot receive callback capabilities. Execution
-deadlines depend on the supplied engine; this API does not provide cooperative
-cancellation of a running job. It is not connected to game scheduling or the
-structured-task ABI.
+`blot_host::kernels::KernelPool` executes ABI 8 `entry kernel` modules declared in
+the `blot:kernels` v1 custom section. Workers are warm, persistent Wasmtime `Store`s
+sharing compiled code and reusing prepared context snapshots via `set_context` /
+`clear_context`.
 
-`Workers::set_tracing(true)` records submission, execution start and completion
-for the latest accepted batch, including worker index and success/failure.
-`timings()` returns at most 32 records in input order. Tracing is off by
-default; disabling it clears the history and avoids per-job clock reads. These
-host times are diagnostics, never simulation inputs or saved continuations. The
-`compare_workers` example captures a separate traced batch after its performance
-samples, so tracing overhead does not enter the paired timing comparison.
+- Fixed-output batches (`run_fixed`) write disjointly into a single `DisjointStorage`
+  buffer (`1×` exact peak, zero-copy `Box::into_vec`).
+- Variable-output batches (`run_variable_chunks` at `1×`, `run_variable` at `<= 2×`)
+  use pre-copy Wasm-memory size inspection, deadlock-free frontier eviction, and
+  concurrent bisection on the non-trapping `[0xffffffff]` overflow sentinel.
+- Deadlines require an epoch-interrupted engine (`bounded_engine`, `dev_engine`, or
+  packages built with `pen build --worker-deadlines` shipping `workers.cwasm` +
+  `workers.meta` and verified by compiler-free `pen check-workers`).
 
-## Prepared numeric worker sessions
+## Deterministic isolated `Processes` (`blot_host::processes`)
 
-`blot_host::worker_sessions::Workers` retains isolated guests inside a callback
-service entry. Construct it with an engine, module, entry and 1–8 workers;
-`configure(revision, context)` supplies finite F32 context once, then
-`run_prepared(inputs)` submits up to 32 jobs without resending it. Context,
-individual input and output are limited to 16,384 lanes; each guest has a 64 MiB
-memory limit. The application owns the pool and immutable context. The service
-ABI is `(Array F32 -> Array F32 ! { Foreign }) -> Unit`.
-
-A service first calls its host with `[-4670546]`. The host returns
-`[1, context…]` to prepare, `[2, input…]` to run a job, or `[0]` to stop.
-Responses are `[1]` for prepared context and `[2, output…]` for a job. Reusing
-the current revision requires identical context bits, including signed zeros. A
-new revision replaces it; old revision numbers are not remembered. `reset`
-clears configuration; the next configured batch prepares workers again. Old
-worker data stays retained until replaced or closed. No guest pointers or live
-ECS worlds cross threads.
-
-Results retain submission order. Traps, malformed responses and early guest exit
-fail the affected job, discard that guest, and recreate it for subsequent jobs.
-Direct Rust batches return per-job Results. `call(Value)` is an optional client
-callback using -4670547 configure/reset/run commands and the existing -4670545
-batch framing; it rejects a failed batch as a whole. Ink's optional
-`pen/worker_session` adapter supplies both ends of this protocol; Pen has no Ink
-or game dependency. Nothing automatically makes application schedules parallel.
-
-`stats` reports starts, prepared contexts, copied context lanes, successful
-jobs, and each worker's last observed committed guest memory. `close` joins
-workers and is idempotent; Drop also closes. Service code must terminate its
-jobs and honor stop: this API has no per-job timeout. Context setup, scheduling
-overhead, serialization and extra worker memory belong in application
-measurements. The standalone `worker_sessions` host tests cover ordering,
-validation, traps, early exits, restart, reset and stable memory over repeated
-batches.
-
-The retired language-task conformance fixture and adapter-admission tests have
-been removed. `owned_storage` retains the useful numeric results, copied-array
-round trips, bounds/trap recovery, 20 reuse cycles, 1,000,000-element capacity
-probe and 128/5,000-iteration workloads. Five thousand ordinary iterations now
-complete; the old task scheduler's admission limit no longer applies. The
-1 MiB sandbox still rejects a module whose planned storage exceeds it. Copied
-worker tests retain 32-job batches, submission order, tracing and lane limits.
+`blot_host::processes::Processes` schedules ABI 8 `entry process` actors declared in
+the `blot:processes` v1 custom section. Each admitted endpoint owns an isolated
+Wasmtime `Store` with persistent staged state across turns, bounded by explicit
+`ProcessPolicy` work, memory, mailbox-slot, `mailbox_bytes`, `max_reply_bytes`,
+optional Wasmtime fuel (`FuelPolicy`), and optional wall-clock `deadline` limits.
+`advance_all_parallel` executes independent endpoints concurrently in serial-equivalent
+waves while enforcing Overrun-first precedence and scheduler-wide fencing on overrun.

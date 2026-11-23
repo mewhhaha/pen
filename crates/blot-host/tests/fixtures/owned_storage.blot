@@ -1,5 +1,6 @@
 // Copied worker jobs use isolated invocations and ordinary owned storage.
 entry const collected = func (value: U32) => @u32.add (@u32.add value value) 42
+entry kernel func collected_kernel (value: U32): U32 => return @u32.add (@u32.add value value) 42
 entry const incremented = func (value: U32) => @u32.add value 1
 entry const captured = func (values: #[U32]) => copy values
 // The entry takes its argument over (`own`), so the updates are in place.

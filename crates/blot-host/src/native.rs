@@ -18,15 +18,23 @@ struct Metadata {
 #[cfg(feature = "compiler")]
 pub fn native_metadata(wasm: &[u8]) -> Result<Vec<u8>> {
     read_abi(wasm)?;
+    let shape = pen_runtime::abi::read_memory_shape(wasm)?;
+    validate_memory_shape(&shape)?;
     let mut sections = b"\0asm\x01\0\0\0".to_vec();
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         let payload = payload?;
         let keep = match &payload {
-            wasmparser::Payload::ExportSection(_) => true,
+            wasmparser::Payload::MemorySection(_) | wasmparser::Payload::ExportSection(_) => true,
             wasmparser::Payload::CustomSection(section) => {
                 matches!(
                     section.name(),
-                    "blot:abi" | "blot:tasks" | pen_runtime::abi::INVOCATION_SECTION | "name" | "sourceMappingURL"
+                    "blot:abi"
+                        | "blot:tasks"
+                        | pen_runtime::abi::INVOCATION_SECTION
+                        | pen_runtime::abi::KERNELS_SECTION
+                        | pen_runtime::abi::PROCESSES_SECTION
+                        | "name"
+                        | "sourceMappingURL"
                 )
             }
             _ => false,
@@ -63,6 +71,15 @@ pub fn native_fingerprint(metadata: &[u8]) -> Result<u64> {
 }
 
 impl GuestModule {
+    /// Compiles a standalone ABI 8 (including scalar-only) Wasm module into
+    /// `(metadata, precompiled)` native bytes suitable for [`GuestModule::from_native`].
+    #[cfg(feature = "compiler")]
+    pub fn native_bytes(engine: &Engine, wasm: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+        let metadata = native_metadata(wasm)?;
+        let precompiled = precompile(engine, wasm)?;
+        Ok((metadata, precompiled))
+    }
+
     /// Loads a native package without an executable Wasm copy or a compiler
     /// fallback. Incompatible artifacts require repackaging.
     ///
@@ -74,10 +91,12 @@ impl GuestModule {
         let metadata: Metadata = serde_json::from_slice(metadata).context("reading native game metadata")?;
         ensure!(metadata.version == 2, "unsupported native metadata version; package it again with `pen build`");
         let abi = Arc::new(read_abi(&metadata.sections)?);
+        let shape = pen_runtime::abi::read_memory_shape(&metadata.sections)?;
         // SAFETY: the caller vouches for the artifact; Wasmtime checks compatibility.
         let module = unsafe { Module::deserialize(engine, precompiled) }
             .map_err(anyhow::Error::from)
             .context("the precompiled game does not suit this runtime; package it again with `pen build`")?;
+        validate_native_memory_shape(&module, &abi, &shape)?;
         validate_module(&module, &abi)?;
         Ok(Self {
             module: CompiledModule::Wasmtime(module),

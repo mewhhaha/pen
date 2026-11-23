@@ -1,0 +1,39 @@
+// Minimal Protocol-2 game plus `entry kernel` declarations used to qualify
+// compiler-free `pen check-workers` on both `pen build` and `pen build --worker-deadlines`.
+
+entry kernel func double_fixed (x: U32): U32 => return @u32.mul x 2
+
+entry kernel func spin_forever (x: U32): U32 =>
+  let acc = x
+  for ever:
+    acc := @u32.add acc 1
+  return acc
+
+func build_frame_response (out: #[~F32]): Unit =>
+  @storage.truncate out 0
+  // Response operation echo (2.0 = Frame) followed by 151-float render header.
+  @storage.push out 2.0
+  @storage.push out 4670534.0
+  @storage.push out 1.0
+  for _ in 0..149:
+    @storage.push out 0.0
+  return ()
+
+entry func main (host: #[F32] -> #[F32] ! {Foreign}): Unit ! {Foreign} =>
+  use first <- host #[4670544.0, 2.0, 1.0, 0.0]
+  let req = first
+  let out: #[~F32] = #[]
+  for ever:
+    if req.length < 2:
+      break
+    let op = req[1]
+    if op == 0.0:
+      break
+    if op == 2.0:
+      build_frame_response out
+      use next <- host (seal (@storage.copy out))
+      req := next
+    else:
+      use next <- host #[op, 0.0]
+      req := next
+  return ()

@@ -1,5 +1,9 @@
+#![cfg(feature = "compiler")]
 use anyhow::{Context, Result, ensure};
-use blot_host::{Guest, GuestModule, Value};
+use blot_host::{
+    Guest, GuestModule, Value,
+    kernels::{KernelConfig, KernelError, KernelPool},
+};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -62,40 +66,33 @@ fn owned_calls_preserve_copies_bounds_and_reuse_after_failure() -> Result<()> {
 }
 
 #[test]
-fn copied_worker_batches_are_bounded_ordered_and_reusable() -> Result<()> {
+fn kernel_pool_batches_are_bounded_ordered_and_reusable() -> Result<()> {
     let engine = blot_host::engine()?;
     let module = GuestModule::new(&engine, &fixture()?, None)?;
-    let mut pool = blot_host::workers::Workers::new(&engine, &module, "collected", 4)?;
+    let cfg = KernelConfig {
+        workers: 4,
+        default_chunk_items: 8,
+        max_total_output_bytes: 1024,
+        max_physical_output_bytes: 1024,
+        ..KernelConfig::default()
+    };
+    let mut pool = KernelPool::open(&engine, &module, "collected_kernel", cfg)?;
+    let inputs: Vec<u32> = (0..32).collect();
     for _ in 0..3 {
-        let results = pool.run((0..32).map(Value::U32).collect())?;
-        assert!(pool.timings().is_empty());
+        let results = pool.run_fixed(&inputs)?;
+        assert_eq!(results.len(), 32);
         for (index, value) in results.into_iter().enumerate() {
-            assert_eq!(value.unwrap(), Value::U32(u32::try_from(index)? * 2 + 42));
+            assert_eq!(value, u32::try_from(index)? * 2 + 42);
         }
     }
-    assert!(pool.run(vec![Value::U32(0); 33]).is_err());
-    assert!(pool.run(vec![Value::ArrayU32(vec![0; 16_385])]).is_err());
-    pool.set_tracing(true);
-    assert!(pool.run(vec![Value::ArrayU32(vec![0])])?[0].is_err());
-    assert_eq!(pool.timings().len(), 1);
-    assert!(!pool.timings()[0].succeeded);
-    let results = pool.run((0..32).map(Value::U32).collect())?;
-    assert_eq!(pool.timings().len(), 32);
-    for (index, timing) in pool.timings().iter().enumerate() {
-        assert_eq!(timing.job, index);
-        assert!(timing.worker < 4);
-        assert!(timing.submitted <= timing.started && timing.started <= timing.finished);
-        assert!(timing.succeeded);
-        assert_eq!(results[index].as_ref().unwrap(), &Value::U32(u32::try_from(index)? * 2 + 42));
-    }
-    assert_eq!(pool.run(vec![Value::U32(1)])?[0].as_ref().unwrap(), &Value::U32(44));
-    assert_eq!(pool.timings().len(), 1);
-    pool.set_tracing(false);
-    assert!(pool.timings().is_empty());
-    assert!(pool.run(vec![])?.is_empty());
-    pool.close()?;
-    pool.close()?;
-    assert!(pool.run(vec![Value::U32(0)]).is_err());
+    assert!(matches!(
+        pool.run_fixed(&vec![0u32; 257]),
+        Err(KernelError::OutputBudgetExceeded { .. })
+    ));
+    assert!(pool.run_fixed(&[])?.is_empty());
+    pool.close();
+    pool.close();
+    assert_eq!(pool.run_fixed(&[0]), Err(KernelError::PoolClosed));
     Ok(())
 }
 

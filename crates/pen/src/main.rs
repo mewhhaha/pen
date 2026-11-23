@@ -170,6 +170,110 @@ fn clean() -> Result<()> {
     Ok(())
 }
 
+/// Shared compiler-free packaged worker loader called by BOTH packaged playback
+/// (`play`) and `pen check-workers <package-dir>` (§5.1).
+///
+/// - Ordinary packages (`manifest.worker_deadlines == false`) reuse
+///   `(game_engine, game_module, false)` directly from `game.cwasm`.
+/// - Deadline-bounded packages (`manifest.worker_deadlines == true`) require
+///   BOTH `workers.cwasm` and `workers.meta` on disk, instantiate compiler-free
+///   `bounded_engine(2 ms)` with a live wakeable ticker, and deserialize via
+///   `GuestModule::from_native`.
+fn load_packaged_workers(
+    game_dir: &Path,
+    game_engine: &wasmtime::Engine,
+    game_module: &GuestModule,
+) -> Result<(wasmtime::Engine, GuestModule, bool)> {
+    let Some(manifest) = project::Manifest::read(game_dir)? else {
+        return Ok((game_engine.clone(), game_module.clone(), false));
+    };
+    if !manifest.worker_deadlines {
+        return Ok((game_engine.clone(), game_module.clone(), false));
+    }
+    ensure!(
+        manifest.runtime.as_deref() == Some(project::RUNTIME),
+        "this native game was built for another runtime; package it again with `pen build`"
+    );
+    let workers_meta_path = game_dir.join("workers.meta");
+    let workers_cwasm_path = game_dir.join("workers.cwasm");
+    ensure!(
+        workers_meta_path.is_file() && workers_cwasm_path.is_file(),
+        "game.json sets worker_deadlines: true, but {} or {} is missing; repackage with `pen build --worker-deadlines`",
+        workers_meta_path.display(),
+        workers_cwasm_path.display()
+    );
+    let worker_engine = blot_host::bounded_engine(std::time::Duration::from_millis(2))?;
+    let meta = std::fs::read(&workers_meta_path)
+        .with_context(|| format!("reading {}", workers_meta_path.display()))?;
+    let compiled = compiled::decode(
+        &std::fs::read(&workers_cwasm_path)
+            .with_context(|| format!("reading {}", workers_cwasm_path.display()))?,
+    )?;
+    // SAFETY: both files ship with this executable and are written by `pen build --worker-deadlines`.
+    let worker_module = unsafe { GuestModule::from_native(&worker_engine, &meta, &compiled) }?;
+    Ok((worker_engine, worker_module, true))
+}
+
+/// Compiler-free `pen check-workers <package-dir>` verification subcommand (§5.1).
+fn check_workers(package_dir: &Path) -> Result<()> {
+    let game_dir = if package_dir.join("game.meta").is_file() {
+        package_dir.to_path_buf()
+    } else {
+        package_dir.join("game")
+    };
+    ensure!(
+        game_dir.join("game.meta").is_file() && game_dir.join("game.cwasm").is_file(),
+        "packaged game not found in {} (expected game.meta and game.cwasm)",
+        game_dir.display()
+    );
+    let game_engine = blot_host::engine()?;
+    let game_module = load_module(&game_engine, &game_dir, false, false)?;
+    let (worker_engine, worker_module, has_deadlines) =
+        load_packaged_workers(&game_dir, &game_engine, &game_module)?;
+    if worker_module.abi().kernel("double_fixed").is_some() {
+        let cfg = blot_host::kernels::KernelConfig {
+            workers: 2,
+            deadline: if has_deadlines { Some(std::time::Duration::from_millis(500)) } else { None },
+            ..blot_host::kernels::KernelConfig::default()
+        };
+        let mut pool = blot_host::kernels::KernelPool::open(&worker_engine, &worker_module, "double_fixed", cfg)?;
+        let out = pool.run_fixed(&[1, 2, 3, 4])?;
+        ensure!(out == vec![2, 4, 6, 8], "double_fixed output mismatch: got {out:?}");
+        if !has_deadlines {
+            let bounded_cfg = blot_host::kernels::KernelConfig {
+                workers: 1,
+                deadline: Some(std::time::Duration::from_millis(50)),
+                ..blot_host::kernels::KernelConfig::default()
+            };
+            let err = blot_host::kernels::KernelPool::open(&worker_engine, &worker_module, "double_fixed", bounded_cfg)
+                .err()
+                .context("ordinary package should reject deadline on non-epoch engine")?;
+            ensure!(
+                err == blot_host::kernels::KernelError::DeadlineRequiresBoundedEngine,
+                "expected DeadlineRequiresBoundedEngine, got {err:?}"
+            );
+        }
+    }
+    if has_deadlines && worker_module.abi().kernel("spin_forever").is_some() {
+        let spin_cfg = blot_host::kernels::KernelConfig {
+            workers: 2,
+            deadline: Some(std::time::Duration::from_millis(40)),
+            ..blot_host::kernels::KernelConfig::default()
+        };
+        let mut pool = blot_host::kernels::KernelPool::open(&worker_engine, &worker_module, "spin_forever", spin_cfg)?;
+        let err = pool.run_fixed(&[1, 2]).expect_err("spin_forever must time out on bounded worker engine");
+        ensure!(
+            err == blot_host::kernels::KernelError::Timeout,
+            "expected Timeout for spin_forever, got {err:?}"
+        );
+    }
+    eprintln!(
+        "check-workers OK: worker_deadlines={has_deadlines}, kernels={}",
+        worker_module.abi().kernels.len()
+    );
+    Ok(())
+}
+
 /// The game's module: `game.cwasm` when the package precompiled it for this
 /// runtime, else `game.wasm` compiled now (and cached).
 fn load_module(engine: &wasmtime::Engine, game: &Path, cache: bool, measure_systems: bool) -> Result<GuestModule> {
@@ -655,11 +759,23 @@ const COMMANDS: &[CommandSpec] = &[
                 operation of protocol/schema.json's DevtoolsOperation and up to four numbers (default \
                 frame), and print the answer",
     },
+    CommandSpec {
+        name: "check-workers",
+        operands: "DIR",
+        checkout: false,
+        about: "verify packaged native workers (game.cwasm and optional workers.cwasm) without a Wasm compiler",
+    },
 ];
 
 #[cfg(not(feature = "compiler"))]
-const COMMANDS: &[CommandSpec] =
-    &[CommandSpec { name: "apply", operands: "PATCH [DIR]", about: "apply a package update" }];
+const COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "apply", operands: "PATCH [DIR]", about: "apply a package update" },
+    CommandSpec {
+        name: "check-workers",
+        operands: "DIR",
+        about: "verify packaged native workers (game.cwasm and optional workers.cwasm)",
+    },
+];
 
 /// Playing: a packaged game, `dev` and `run`.
 const PLAY: &[&str] = &["", "dev", "run"];
@@ -682,7 +798,7 @@ const CHECKOUT: &[&str] = &[
     "fuzz",
 ];
 
-const OPTIONS: [OptionSpec; 102] = [
+const OPTIONS: [OptionSpec; 103] = [
     OptionSpec { name: "--help", value: "", commands: &[], place: Place::Prose, about: "this" },
     OptionSpec {
         name: "--out",
@@ -805,6 +921,13 @@ const OPTIONS: [OptionSpec; 102] = [
         commands: &["build"],
         place: Place::Command,
         about: "the Rust browser host and the game as static files instead",
+    },
+    OptionSpec {
+        name: "--worker-deadlines",
+        value: "",
+        commands: &["build"],
+        place: Place::Command,
+        about: "also precompile epoch-interrupted workers.cwasm and workers.meta for deadline-bounded worker pools",
     },
     OptionSpec {
         name: "--steam",
@@ -1933,6 +2056,9 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
     } else {
         load_module(&engine, &game.directory, false, checkout.is_some())?
     };
+    if game.directory.join("game.meta").is_file() {
+        let _packaged_workers = load_packaged_workers(&game.directory, &engine, &module)?;
+    }
     let catalog = read_catalog(&paths.assets)?;
     let mods = load_mods(args)?;
     // A packaged game has no dev tools program, but may answer remote ones.
@@ -2205,6 +2331,9 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         eprintln!("{} is now version {version}", package.display());
         return Ok(());
     }
+    if args.command == "check-workers" {
+        return check_workers(Path::new(&args.operands[0]));
+    }
     ensure!(args.command.is_empty(), "{} is a development command; use the full pen CLI", args.command);
     let directory = bundle_directory(&args)?;
     let _ = IDENTITY.set(project::bundle_identity(&directory)?);
@@ -2235,6 +2364,9 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
     }
     if args.command == "clean" {
         return clean();
+    }
+    if args.command == "check-workers" {
+        return check_workers(Path::new(&args.operands[0]));
     }
     if args.command == "gltf" {
         return import_gltf(&args);
@@ -2375,6 +2507,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
                 cpu: args.value("--cpu"),
                 bundle_id: args.value("--bundle-id"),
                 store: args.path("--store"),
+                worker_deadlines: args.flag("--worker-deadlines"),
             };
             // A bundle compiled already packages as it is, for another platform's runtime.
             if let Some(bundle) = &bundle {

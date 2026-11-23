@@ -11,6 +11,7 @@
 //! returning or calling the host traps with an [`Overrun`]; time it spends
 //! blocked in a callback does not count. A [`Probe`] shows the dev tools its
 //! memory, ownership counters and, sampled, where it spends its time.
+pub mod kernels;
 mod native;
 mod probe;
 pub use native::native_fingerprint;
@@ -21,8 +22,6 @@ mod system_trace;
 mod tasks;
 #[cfg(feature = "compiler")]
 mod trace_instrument;
-pub mod worker_sessions;
-pub mod workers;
 mod wtime_aot;
 pub use system_trace::SystemTrace;
 pub use wtime_aot::{X64_ADMISSION_REJECTED_EXIT_CODE, X64FallbackError, X64FallbackReason};
@@ -30,8 +29,8 @@ pub use wtime_aot::{X64_ADMISSION_REJECTED_EXIT_CODE, X64FallbackError, X64Fallb
 use std::any::Any;
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -39,8 +38,8 @@ use pen_runtime::abi::INVOCATION_FINISH;
 use pen_runtime::memory_image::{Captured, MemoryImage, PAGE};
 use pen_runtime::symbols::{Frame, Symbols};
 use wasmtime::{
-    AsContext, AsContextMut, Caller, Engine, ExternRef, FuncType, Global, Instance, Linker, Memory, Module, Store,
-    Trap, TypedFunc, UpdateDeadline, Val, ValType, WasmBacktrace,
+    AsContext, AsContextMut, Caller, Engine, ExternRef, FuncType, Global, Instance, Linker, Memory, Module,
+    ResourceLimiter, Store, Trap, TypedFunc, UpdateDeadline, Val, ValType, WasmBacktrace,
 };
 
 pub use probe::{Probe, Profile, Seen, function_name};
@@ -48,9 +47,14 @@ pub use probe::{Probe, Profile, Seen, function_name};
 /// The host import module every capability adapter comes from.
 pub const HOST_MODULE: &str = "blot:host/1";
 
+/// Fixed unused Page-0 linear-memory offset written with `1u32` right before a
+/// physical retained-chunk / free-list / `alloc_raw` arena OOM trap.
+pub const ARENA_OOM_OFFSET: usize = 640;
+
 // The manifest is pen-runtime's: the browser reads it too.
 pub use pen_runtime::abi::{
-    CallbackType, GuestAbi, GuestConstant, GuestFunction, Parameter, ValueType, parse_abi, read_abi,
+    CallbackType, DEFAULT_TRANSPORT_BUDGET, GuestAbi, GuestConstant, GuestFunction, KernelManifest, MemoryShape,
+    Parameter, ProcessManifest, ValueType, WireSchema, WireSchemaKind, parse_abi, read_abi, read_memory_shape,
 };
 
 /// The Wasm type a value crosses the boundary as.
@@ -177,7 +181,10 @@ impl GuestModule {
     #[cfg(feature = "compiler")]
     fn new_wasmtime(engine: &Engine, wasm: &[u8], cache: Option<&Path>) -> Result<GuestModule> {
         let abi = Arc::new(read_abi(wasm)?);
+        let shape = read_memory_shape(wasm)?;
+        validate_memory_shape(&shape)?;
         let module = compile(engine, wasm, cache)?;
+        validate_raw_memory_shape(&module, &shape)?;
         validate_module(&module, &abi)?;
         let imaged = Arc::new(imaged_globals(wasm));
         Ok(GuestModule {
@@ -193,11 +200,19 @@ impl GuestModule {
         #[cfg(feature = "compiler")]
         {
             let abi = Arc::new(read_abi(wasm)?);
+            let shape = read_memory_shape(wasm)?;
+            validate_memory_shape(&shape)?;
             let use_aot = if prefer_aot { wtime_aot::preferred_for_run() } else { wtime_aot::enabled() };
-            let module = if use_aot && engine_allows_aot(engine) && abi.tasks.is_none() {
+            let module = if use_aot
+                && engine_allows_aot(engine)
+                && abi.tasks.is_none()
+                && abi.kernels.is_empty()
+                && abi.processes.is_empty()
+            {
                 CompiledModule::WtimeAot(wtime_aot::AotModule::compile(wasm, &abi, cache)?)
             } else {
                 let module = compile(engine, wasm, cache)?;
+                validate_raw_memory_shape(&module, &shape)?;
                 validate_module(&module, &abi)?;
                 CompiledModule::Wasmtime(module)
             };
@@ -209,6 +224,19 @@ impl GuestModule {
             let _ = (engine, wasm, cache, prefer_aot);
             bail!(NO_COMPILER)
         }
+    }
+
+    /// Underlying Wasmtime [`Module`], when not executing via `wtime-aot`.
+    pub fn wasmtime_module(&self) -> Option<&Module> {
+        match &self.module {
+            CompiledModule::Wasmtime(module) => Some(module),
+            CompiledModule::WtimeAot(_) => None,
+        }
+    }
+
+    /// Underlying Wasmtime [`Engine`] this module was compiled/deserialized for.
+    pub fn engine(&self) -> Option<&Engine> {
+        self.wasmtime_module().map(Module::engine)
     }
 
     /// Backend executing this module (`"wtime-aot"` or `"wasmtime"`).
@@ -269,6 +297,8 @@ const NO_COMPILER: &str = "this runtime was built without a Wasm compiler (blot-
 /// ship beside it.
 pub fn precompile(engine: &Engine, wasm: &[u8]) -> Result<Vec<u8>> {
     read_abi(wasm)?;
+    let shape = read_memory_shape(wasm)?;
+    validate_memory_shape(&shape)?;
     #[cfg(feature = "compiler")]
     return Ok(engine.precompile_module(wasm)?);
     #[cfg(not(feature = "compiler"))]
@@ -481,6 +511,73 @@ fn prune(directory: &Path, now: std::time::SystemTime) -> std::io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_memory_shape(shape: &MemoryShape) -> Result<()> {
+    if shape.has_memory {
+        ensure!(!shape.memory64, "invalid_abi: memory64 linear memories are unsupported");
+        ensure!(!shape.shared, "invalid_abi: shared linear memories are unsupported");
+        ensure!(
+            shape.page_size_log2 == 16,
+            "invalid_abi: custom Wasm page size 2^{} is unsupported (expected 64 KiB)",
+            shape.page_size_log2
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_raw_memory_shape(module: &Module, shape: &MemoryShape) -> Result<()> {
+    validate_memory_shape(shape)?;
+    let req = module.resources_required();
+    if !shape.has_memory {
+        ensure!(
+            req.num_memories == 0 && req.max_initial_memory_size.is_none(),
+            "invalid_abi: module memory resources ({}, {:?}) do not match MemorySection (none)",
+            req.num_memories,
+            req.max_initial_memory_size
+        );
+    } else {
+        ensure!(
+            req.num_memories == 1 && req.max_initial_memory_size == Some(shape.initial_pages),
+            "invalid_abi: module memory resources ({}, {:?}) do not match MemorySection (1, Some({}))",
+            req.num_memories,
+            req.max_initial_memory_size,
+            shape.initial_pages
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_native_memory_shape(module: &Module, abi: &GuestAbi, shape: &MemoryShape) -> Result<()> {
+    let req = module.resources_required();
+    if shape.section_present {
+        return validate_raw_memory_shape(module, shape);
+    }
+    if req.num_memories == 0 {
+        ensure!(
+            req.max_initial_memory_size.is_none(),
+            "invalid_abi: module with 0 memories reported initial memory pages"
+        );
+        return Ok(());
+    }
+    // Legacy Metadata v2 boundary: allow missing MemorySection ONLY when the module
+    // has no `blot:kernels`/`blot:processes` and exports `blot:memory` directly.
+    if abi.kernels.is_empty()
+        && abi.processes.is_empty()
+        && req.num_memories == 1
+        && let Some(memory) = module.get_export("blot:memory").and_then(|export| export.memory().cloned())
+    {
+        ensure!(
+            !memory.is_64() && !memory.is_shared() && memory.page_size_log2() == 16,
+            "invalid_abi: legacy exported blot:memory has unsupported memory shape"
+        );
+        return Ok(());
+    }
+    bail!(
+        "native metadata is missing Wasm MemorySection (Section 5) and cannot verify memory shape without a compiler; \
+         repackage with `pen build` (for Pen games) or `GuestModule::native_bytes` / `blot_host::native_metadata` \
+         (for standalone modules)"
+    )
+}
+
 fn validate_module(module: &Module, abi: &GuestAbi) -> Result<()> {
     abi.check_hostable()?;
     if let Some(count) = abi.tasks {
@@ -620,6 +717,79 @@ struct Ownership {
     leave: TypedFunc<i32, ()>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DeadlineMode {
+    Relative(Duration),
+    Absolute(Instant),
+}
+
+/// Always-installed resource limiter tracking linear memory bytes (including
+/// unexported hidden memories) and physical growth failures (`saw_oom`).
+struct MemoryTrackerLimiter {
+    inner: wasmtime::StoreLimits,
+    bytes: usize,
+    pending_grow: Option<usize>,
+    saw_oom: bool,
+}
+
+impl Default for MemoryTrackerLimiter {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl MemoryTrackerLimiter {
+    fn new(limits: Option<Limits>) -> Self {
+        let inner = match limits {
+            Some(limits) => wasmtime::StoreLimitsBuilder::new().memory_size(limits.memory).instances(1).build(),
+            None => wasmtime::StoreLimitsBuilder::new().memory_size(usize::MAX).build(),
+        };
+        Self { inner, bytes: 0, pending_grow: None, saw_oom: false }
+    }
+}
+
+impl ResourceLimiter for MemoryTrackerLimiter {
+    fn memory_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
+        let allowed = self.inner.memory_growing(current, desired, maximum)?;
+        if allowed {
+            self.pending_grow = Some(current);
+            self.bytes = desired;
+        } else {
+            self.pending_grow = None;
+            self.saw_oom = true;
+        }
+        Ok(allowed)
+    }
+
+    fn memory_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        if let Some(prev) = self.pending_grow.take() {
+            self.bytes = prev;
+        }
+        self.saw_oom = true;
+        self.inner.memory_grow_failed(error)
+    }
+
+    fn table_growing(&mut self, current: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
+        self.inner.table_growing(current, desired, maximum)
+    }
+
+    fn table_grow_failed(&mut self, error: wasmtime::Error) -> wasmtime::Result<()> {
+        self.inner.table_grow_failed(error)
+    }
+
+    fn instances(&self) -> usize {
+        self.inner.instances()
+    }
+
+    fn tables(&self) -> usize {
+        self.inner.tables()
+    }
+
+    fn memories(&self) -> usize {
+        self.inner.memories()
+    }
+}
+
 #[derive(Default)]
 struct State {
     tasks: Option<tasks::Tasks>,
@@ -633,8 +803,12 @@ struct State {
     memory: Option<Arc<AtomicUsize>>,
     /// When the guest last started running (again), its deadline counting from then.
     resumed: Option<Instant>,
-    /// Its deadline, when not [`DEADLINE`].
-    deadline: Option<Duration>,
+    /// Explicit relative or absolute deadline mode.
+    deadline_mode: Option<DeadlineMode>,
+    /// When true, `deadline_mode == None` means no relative `DEADLINE` (only `cancel_hook`).
+    no_relative_deadline: bool,
+    /// Optional cooperative/wave cancellation flag checked at epoch interrupts.
+    cancel_hook: Option<Arc<AtomicBool>>,
     /// What the dev tools see of it, and the counters it exports for them.
     probe: Option<Arc<Probe>>,
     counters: Vec<Global>,
@@ -644,8 +818,10 @@ struct State {
     spare: Vec<u32>,
     /// Torn down ([`Guest::dispose`]): it takes no more calls.
     disposed: bool,
-    /// What a sandboxed guest may use ([`Guest::sandboxed`]).
-    limits: Option<wasmtime::StoreLimits>,
+    /// Whether the module declares a linear memory (`resources_required().num_memories > 0`).
+    has_guest_memory: bool,
+    /// Always-installed memory tracker and resource limiter.
+    limiter: MemoryTrackerLimiter,
 }
 
 /// What a sandboxed guest ([`Guest::sandboxed`]) may use.
@@ -683,27 +859,70 @@ fn ticks(time: Duration) -> u64 {
 fn resume(mut store: impl AsContextMut<Data = State>) {
     let mut store = store.as_context_mut();
     let sampled = store.data().probe.as_ref().is_some_and(|probe| probe.sampling().is_some());
-    let ticks = if sampled { 1 } else { ticks(store.data().deadline.unwrap_or(DEADLINE)) };
-    store.set_epoch_deadline(ticks);
+    let mode = store.data().deadline_mode;
+    let no_relative = store.data().no_relative_deadline;
+    let deadline_ticks = match mode {
+        Some(DeadlineMode::Absolute(_)) => 1,
+        _ if no_relative => 1,
+        Some(DeadlineMode::Relative(limit)) => {
+            if sampled {
+                1
+            } else {
+                ticks(limit)
+            }
+        }
+        None => {
+            if sampled {
+                1
+            } else {
+                ticks(DEADLINE)
+            }
+        }
+    };
+    store.set_epoch_deadline(deadline_ticks);
     store.data_mut().resumed = Some(Instant::now());
 }
 
 /// At the guest's epoch deadline: samples it while its probe samples, then
-/// interrupts it once it has run past its deadline, which counts time
-/// rather than ticks (a profile ticks the engine faster), else looks again
-/// at the next tick (sampled) or when its deadline will be due.
+/// interrupts it once it has run past its deadline or its cancel hook fired,
+/// else continues without falsely interrupting unrelated stores sharing an engine.
 fn deadline_reached(mut store: wasmtime::StoreContextMut<'_, State>) -> wasmtime::Result<UpdateDeadline> {
     let profile = store.data().probe.as_ref().and_then(|probe| probe.sampling());
     if let Some(profile) = &profile {
         profile.sample(&WasmBacktrace::capture(&store), &store.data().symbols);
     }
     let state = store.data_mut();
-    let ran = state.resumed.map_or(Duration::ZERO, |resumed| resumed.elapsed());
-    Ok(match state.deadline.unwrap_or(DEADLINE).checked_sub(ran).filter(|left| !left.is_zero()) {
-        Some(_) if profile.is_some() => UpdateDeadline::Continue(1),
-        Some(left) => UpdateDeadline::Continue(ticks(left)),
-        None => UpdateDeadline::Interrupt,
-    })
+    if state.cancel_hook.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Ok(UpdateDeadline::Interrupt);
+    }
+    match state.deadline_mode {
+        Some(DeadlineMode::Absolute(deadline_at)) => {
+            if Instant::now() >= deadline_at {
+                Ok(UpdateDeadline::Interrupt)
+            } else {
+                Ok(UpdateDeadline::Continue(1))
+            }
+        }
+        Some(DeadlineMode::Relative(limit)) => {
+            let ran = state.resumed.map_or(Duration::ZERO, |resumed| resumed.elapsed());
+            Ok(match limit.checked_sub(ran).filter(|left| !left.is_zero()) {
+                Some(_) if profile.is_some() => UpdateDeadline::Continue(1),
+                Some(left) => UpdateDeadline::Continue(ticks(left)),
+                None => UpdateDeadline::Interrupt,
+            })
+        }
+        None => {
+            if state.no_relative_deadline {
+                return Ok(UpdateDeadline::Continue(1));
+            }
+            let ran = state.resumed.map_or(Duration::ZERO, |resumed| resumed.elapsed());
+            Ok(match DEADLINE.checked_sub(ran).filter(|left| !left.is_zero()) {
+                Some(_) if profile.is_some() => UpdateDeadline::Continue(1),
+                Some(left) => UpdateDeadline::Continue(ticks(left)),
+                None => UpdateDeadline::Interrupt,
+            })
+        }
+    }
 }
 
 /// `error`, marked as an [`Overrun`] when the guest's deadline stopped it.
@@ -779,7 +998,10 @@ impl Guest {
     /// on [`dev_engine`], to within a fiftieth of [`DEADLINE`].
     pub fn set_deadline(&mut self, deadline: Duration) {
         match &mut self.backend {
-            GuestBackend::Wasmtime(wt) => wt.store.data_mut().deadline = Some(deadline),
+            GuestBackend::Wasmtime(wt) => {
+                wt.store.data_mut().no_relative_deadline = false;
+                wt.store.data_mut().deadline_mode = Some(DeadlineMode::Relative(deadline));
+            }
             GuestBackend::WtimeAot(_) => {
                 panic!("Guest::set_deadline requires an epoch-interrupted Wasmtime engine (dev_engine), not wtime-aot");
             }
@@ -894,12 +1116,48 @@ impl Guest {
 
 impl WasmtimeGuest {
     fn start(engine: &Engine, wt_module: &Module, module: &GuestModule, limits: Option<Limits>) -> Result<Self> {
-        let mut store = Store::new(engine, State { symbols: module.symbols.clone(), ..State::default() });
+        Self::start_inner(engine, wt_module, module, limits, false, None, None, None)
+    }
+
+    pub(crate) fn start_controlled(
+        engine: &Engine,
+        wt_module: &Module,
+        module: &GuestModule,
+        limits: Option<Limits>,
+        deadline_at: Option<Instant>,
+        cancel_hook: Option<Arc<AtomicBool>>,
+        initial_fuel: Option<u64>,
+    ) -> Result<Self> {
+        Self::start_inner(engine, wt_module, module, limits, true, deadline_at, cancel_hook, initial_fuel)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_inner(
+        engine: &Engine,
+        wt_module: &Module,
+        module: &GuestModule,
+        limits: Option<Limits>,
+        controlled: bool,
+        deadline_at: Option<Instant>,
+        cancel_hook: Option<Arc<AtomicBool>>,
+        initial_fuel: Option<u64>,
+    ) -> Result<Self> {
+        let mut store = Store::new(
+            engine,
+            State {
+                symbols: module.symbols.clone(),
+                has_guest_memory: wt_module.resources_required().num_memories > 0,
+                limiter: MemoryTrackerLimiter::new(limits),
+                no_relative_deadline: controlled,
+                deadline_mode: deadline_at.map(DeadlineMode::Absolute),
+                cancel_hook,
+                ..State::default()
+            },
+        );
         store.epoch_deadline_callback(deadline_reached);
-        if let Some(limits) = limits {
-            let limits = wasmtime::StoreLimitsBuilder::new().memory_size(limits.memory).instances(1).build();
-            store.data_mut().limits = Some(limits);
-            store.limiter(|state| state.limits.as_mut().expect("a sandbox's limits"));
+        store.limiter(|state| &mut state.limiter);
+        if engine.get_consume_fuel() {
+            store.set_fuel(initial_fuel.unwrap_or(u64::MAX))?;
         }
         // Instantiating runs the module's start function, if it has one.
         resume(&mut store);
@@ -964,6 +1222,146 @@ impl WasmtimeGuest {
         })
     }
 
+    pub(crate) fn saw_oom(&self) -> bool {
+        self.store.data().limiter.saw_oom
+    }
+
+    pub(crate) fn clear_saw_oom(&mut self) {
+        self.store.data_mut().limiter.saw_oom = false;
+    }
+
+    pub(crate) fn arena_oom_flag(&self) -> u32 {
+        let Some(arena) = &self.store.data().arena else {
+            return 0;
+        };
+        let data = arena.memory.data(&self.store);
+        if data.len() < ARENA_OOM_OFFSET + 4 {
+            return 0;
+        }
+        u32::from_le_bytes(data[ARENA_OOM_OFFSET..ARENA_OOM_OFFSET + 4].try_into().unwrap())
+    }
+
+    pub(crate) fn has_arena(&self) -> bool {
+        self.store.data().arena.is_some()
+    }
+
+    pub(crate) fn arm_execution(
+        &mut self,
+        deadline_at: Option<Instant>,
+        cancel_hook: Option<Arc<AtomicBool>>,
+        fuel: Option<u64>,
+    ) -> Result<()> {
+        if self.store.engine().get_consume_fuel() {
+            self.store.set_fuel(fuel.unwrap_or(u64::MAX))?;
+        }
+        {
+            let state = self.store.data_mut();
+            state.no_relative_deadline = true;
+            state.deadline_mode = deadline_at.map(DeadlineMode::Absolute);
+            state.cancel_hook = cancel_hook;
+        }
+        resume(&mut self.store);
+        Ok(())
+    }
+
+    pub(crate) fn reset_arena(&mut self) -> Result<()> {
+        if let Some(arena) = self.store.data().arena.clone() {
+            arena.reset.call(&mut self.store, 0).map_err(|error| symbolize(error, &self.symbols))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_words_packet(&mut self, words: &[u32]) -> Result<i32> {
+        let arena = self.store.data().arena.clone().ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
+        ensure!(words.len() < 1_073_741_823, "array byte count exceeds the Wasm32 address range");
+        let length = u32::try_from(words.len())?;
+        let byte_len = (length + 1).checked_mul(4).ok_or_else(|| anyhow!("packet byte count overflow"))?;
+        let pointer = arena
+            .allocate
+            .call(&mut self.store, byte_len.cast_signed())
+            .map_err(|error| symbolize(error, &self.symbols))?;
+        let memory = arena.memory.data_mut(&mut self.store);
+        let address = array_range(memory.len(), pointer, words.len())?;
+        memory[address..address + 4].copy_from_slice(&length.to_le_bytes());
+        let body = &mut memory[address + 4..address + 4 + words.len() * 4];
+        if cfg!(target_endian = "little") {
+            body.copy_from_slice(bytemuck::cast_slice(words));
+        } else {
+            for (chunk, word) in body.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                *chunk = word.to_le_bytes();
+            }
+        }
+        Ok(pointer)
+    }
+
+    pub(crate) fn call_raw(&mut self, name: &str, param: Val) -> Result<Val> {
+        let func = self
+            .instance
+            .get_func(&mut self.store, name)
+            .ok_or_else(|| anyhow!("validated function export {name} disappeared"))?;
+        let mut results = [Val::I32(0)];
+        func.call(&mut self.store, &[param], &mut results).map_err(|error| symbolize(error, &self.symbols))?;
+        Ok(results[0])
+    }
+
+    /// Reads the raw 32-bit header word at `pointer` directly from Wasm linear memory
+    /// BEFORE allocating any host copy (enabling `[0xffffffff]` sentinel and pre-copy size inspection).
+    pub(crate) fn inspect_packet_header(&self, pointer: i32) -> Result<u32> {
+        let arena = self.store.data().arena.as_ref().ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
+        let memory = arena.memory.data(&self.store);
+        let address = array_range(memory.len(), pointer, 0)?;
+        let header = u32::from_le_bytes(memory[address..address + 4].try_into().unwrap());
+        if header != u32::MAX {
+            array_range(memory.len(), pointer, header as usize)?;
+        }
+        Ok(header)
+    }
+
+    /// Copies `expected_words` words directly from Wasm linear memory into `dst` (zero intermediate buffers).
+    pub(crate) fn read_packet_words_into(&self, pointer: i32, expected_words: usize, dst: &mut [u32]) -> Result<()> {
+        ensure!(dst.len() == expected_words, "destination slice length mismatch");
+        let arena = self.store.data().arena.as_ref().ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
+        let memory = arena.memory.data(&self.store);
+        let address = array_range(memory.len(), pointer, expected_words)?;
+        let header = u32::from_le_bytes(memory[address..address + 4].try_into().unwrap()) as usize;
+        ensure!(header == expected_words, "invalid_abi: packet length {header} != expected {expected_words}");
+        let body = &memory[address + 4..address + 4 + expected_words * 4];
+        if cfg!(target_endian = "little") {
+            match bytemuck::try_cast_slice::<u8, u32>(body) {
+                Ok(aligned) => dst.copy_from_slice(aligned),
+                Err(_) => {
+                    for (slot, chunk) in dst.iter_mut().zip(body.as_chunks::<4>().0) {
+                        *slot = u32::from_le_bytes(*chunk);
+                    }
+                }
+            }
+        } else {
+            for (slot, chunk) in dst.iter_mut().zip(body.as_chunks::<4>().0) {
+                *slot = u32::from_le_bytes(*chunk);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_packet_words_vec(&self, pointer: i32, words: usize) -> Result<Vec<u32>> {
+        let mut out = vec![0u32; words];
+        self.read_packet_words_into(pointer, words, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn finish_invocation(&mut self) -> Result<Option<u32>> {
+        match &self.invocation_finish {
+            Some(finish) => {
+                self.last_reclaimed_owners = None;
+                let released = finish.call(&mut self.store, ()).map_err(|error| symbolize(error, &self.symbols))?;
+                let released = released.cast_unsigned();
+                self.last_reclaimed_owners = Some(released);
+                Ok(Some(released))
+            }
+            None => Ok(None),
+        }
+    }
+
     fn probe(&mut self, probe: Arc<Probe>) {
         let counters = self.counter_globals();
         probe.counters_named(counters.iter().map(|(name, _)| name.trim_start_matches("blot:").to_owned()).collect());
@@ -972,9 +1370,10 @@ impl WasmtimeGuest {
         state.probe = Some(probe);
     }
 
-    fn memory_bytes(&self) -> usize {
+    pub(crate) fn memory_bytes(&self) -> usize {
         match &self.store.data().arena {
             Some(arena) => arena.memory.data_size(&self.store),
+            None if self.store.data().has_guest_memory => self.store.data().limiter.bytes,
             None => 0,
         }
     }
@@ -1216,6 +1615,17 @@ fn symbolize(error: wasmtime::Error, symbols: &Symbols) -> anyhow::Error {
     }
 }
 
+pub(crate) fn is_trap_interrupt(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Trap>() == Some(&Trap::Interrupt)
+}
+
+pub(crate) fn is_unrecoverable_trap(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<Trap>(),
+        Some(Trap::Interrupt | Trap::OutOfFuel | Trap::StackOverflow)
+    )
+}
+
 /// What an ABI 3 guest's runtime counts of the memory it owns, through the
 /// globals Blot exports beside its ownership hooks (`blot:rc_*`, and
 /// `blot:cycle_*` with cycle collection); each is None when the module does
@@ -1283,11 +1693,20 @@ fn invoke_import(
         caller.data_mut().tracing = Some(tracing);
         finished?;
     }
-    if let (Some(gauge), Some(arena)) = (&caller.data().memory, &arena) {
-        gauge.store(arena.memory.data_size(&caller), Ordering::Relaxed);
+    if let Some(gauge) = &caller.data().memory {
+        let current = match &arena {
+            Some(a) => a.memory.data_size(&caller),
+            None if caller.data().has_guest_memory => caller.data().limiter.bytes,
+            None => 0,
+        };
+        gauge.store(current, Ordering::Relaxed);
     }
     if let Some(probe) = caller.data().probe.clone() {
-        let memory = arena.as_ref().map_or(0, |arena| arena.memory.data_size(&caller));
+        let memory = match &arena {
+            Some(arena) => arena.memory.data_size(&caller),
+            None if caller.data().has_guest_memory => caller.data().limiter.bytes,
+            None => 0,
+        };
         let counters = std::mem::take(&mut caller.data_mut().counters);
         let values = counters.iter().map(|global| counter(global.get(&mut caller)).map_or(0, u64::from));
         probe.called_host(memory, values);
@@ -1455,6 +1874,7 @@ fn inlining(default: bool) -> bool {
 fn config(inlining: bool) -> wasmtime::Config {
     let mut config = wasmtime::Config::new();
     config.wasm_reference_types(true);
+    config.wasm_simd(true);
     // Guests are core modules. pen's plugins turn wasmtime's component model
     // on in the builds that have them, which would otherwise enable it here
     // too, and a precompiled game records the features it was made with: a
@@ -1467,19 +1887,142 @@ fn config(inlining: bool) -> wasmtime::Config {
     config
 }
 
-/// `engine`, its epoch advanced [`DEADLINE_TICKS`] times per `deadline` by a
-/// thread that ends with it, for an engine whose code checks it.
-#[cfg(feature = "compiler")]
-fn ticking(engine: Engine, deadline: Duration) -> Result<Engine> {
-    let tick = deadline / DEADLINE_TICKS;
+struct TickerState {
+    tick_ns: u64,
+}
+
+struct TickerEntry {
+    weak: wasmtime::EngineWeak,
+    shared: Arc<(Mutex<TickerState>, Condvar)>,
+}
+
+static ENGINE_TICKERS: Mutex<Vec<TickerEntry>> = Mutex::new(Vec::new());
+
+/// Guarantees a single deduplicated, wakeable epoch-ticker thread is running for
+/// `engine` at `tick` (or faster if another caller already tightened it).
+///
+/// Tightening `tick` immediately wakes the sleeping ticker via `Condvar::notify_one()`
+/// rather than waiting out the prior interval. Returns the effective tick duration.
+/// Compiled unconditionally (works in compiler-free player runtimes).
+pub fn ensure_engine_ticker(engine: &Engine, tick: Duration) -> Result<Duration> {
+    let requested_ns = u64::try_from(tick.as_nanos().max(100_000)).unwrap_or(u64::MAX);
+    let mut registry = ENGINE_TICKERS.lock().unwrap();
+    registry.retain(|entry| entry.weak.upgrade().is_some());
+    for entry in registry.iter() {
+        if let Some(existing) = entry.weak.upgrade()
+            && Engine::same(&existing, engine)
+        {
+            let (lock, cvar) = &*entry.shared;
+            let mut state = lock.lock().unwrap();
+            if requested_ns < state.tick_ns {
+                state.tick_ns = requested_ns;
+                cvar.notify_one();
+            }
+            return Ok(Duration::from_nanos(state.tick_ns));
+        }
+    }
+    let shared = Arc::new((Mutex::new(TickerState { tick_ns: requested_ns }), Condvar::new()));
     let weak = engine.weak();
+    let thread_weak = weak.clone();
+    let thread_shared = shared.clone();
     std::thread::Builder::new().name("blot-deadline".into()).spawn(move || {
-        while let Some(engine) = weak.upgrade() {
+        loop {
+            let Some(engine) = thread_weak.upgrade() else {
+                break;
+            };
             engine.increment_epoch();
             drop(engine);
-            std::thread::sleep(tick);
+            let (lock, cvar) = &*thread_shared;
+            let mut state = lock.lock().unwrap();
+            let slept_from = Instant::now();
+            loop {
+                let target = Duration::from_nanos(state.tick_ns);
+                let Some(remaining) = target.checked_sub(slept_from.elapsed()) else {
+                    break;
+                };
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, result) = cvar.wait_timeout(state, remaining).unwrap();
+                state = next;
+                if result.timed_out() {
+                    break;
+                }
+            }
         }
     })?;
+    registry.push(TickerEntry { weak, shared });
+    Ok(Duration::from_nanos(requested_ns))
+}
+
+/// An epoch-interrupted engine suitable for deadline-bounded workers and processes,
+/// available both with and without the `compiler` feature (for deserializing
+/// `workers.cwasm` in shipping players).
+pub fn bounded_engine(tick: Duration) -> Result<Engine> {
+    let mut cfg = config(inlining(true));
+    cfg.epoch_interruption(true);
+    let engine = Engine::new(&cfg)?;
+    ensure_engine_ticker(&engine, tick)?;
+    Ok(engine)
+}
+
+/// A fuel-metered AND epoch-interrupted engine for processes requiring both
+/// deterministic fuel caps and wall-clock deadline preemption.
+pub fn fuel_bounded_engine(tick: Duration) -> Result<Engine> {
+    let mut cfg = config(inlining(true));
+    cfg.consume_fuel(true);
+    cfg.epoch_interruption(true);
+    let engine = Engine::new(&cfg)?;
+    ensure_engine_ticker(&engine, tick)?;
+    Ok(engine)
+}
+
+/// A fuel-metered engine (without epoch interruption) for deterministic fuel-capped processes.
+pub fn fuel_engine() -> Result<Engine> {
+    let mut cfg = config(inlining(true));
+    cfg.consume_fuel(true);
+    Ok(Engine::new(&cfg)?)
+}
+
+/// A portable shipping engine with epoch interruption enabled, used by
+/// `pen build --worker-deadlines` to precompile `workers.cwasm`.
+#[cfg(feature = "compiler")]
+pub fn bounded_portable_engine(target: Option<&str>, cpu: Option<&str>, tick: Duration) -> Result<Engine> {
+    let mut cfg = config(inlining(true));
+    cfg.epoch_interruption(true);
+    if cpu == Some("native") {
+        ensure!(target.is_none(), "`--cpu native` compiles for this machine, not for {}", target.unwrap_or_default());
+        let engine = Engine::new(&cfg)?;
+        ensure_engine_ticker(&engine, tick)?;
+        return Ok(engine);
+    }
+    let triple = target.map_or_else(host_triple, str::to_owned);
+    cfg.target(&triple)?;
+    let preset = cpu.or(triple.starts_with("x86_64").then_some(PORTABLE_X86_64));
+    if let Some(preset) = preset {
+        // SAFETY: this only enables CPU features (which loading checks the
+        // player's CPU has); it leaves the float ABI alone.
+        unsafe {
+            cfg.cranelift_flag_enable(preset);
+        }
+    }
+    let engine = Engine::new(&cfg)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("compiling for {triple} ({})", preset.unwrap_or("baseline")))?;
+    ensure_engine_ticker(&engine, tick)?;
+    Ok(engine)
+}
+
+#[cfg(not(feature = "compiler"))]
+pub fn bounded_portable_engine(_target: Option<&str>, _cpu: Option<&str>, _tick: Duration) -> Result<Engine> {
+    bail!(NO_COMPILER)
+}
+
+/// `engine`, its epoch advanced [`DEADLINE_TICKS`] times per `deadline` by a
+/// deduplicated wakeable ticker thread.
+#[cfg(feature = "compiler")]
+fn ticking(engine: Engine, deadline: Duration) -> Result<Engine> {
+    ensure_engine_ticker(&engine, deadline / DEADLINE_TICKS)?;
     Ok(engine)
 }
 

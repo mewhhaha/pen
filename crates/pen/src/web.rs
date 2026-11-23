@@ -75,7 +75,8 @@ pub fn serve(project: Project, port: Option<u16>) -> Result<()> {
     // assets and scene are served from the checkout.
     let staging = crate::staging::Staging::new(&project.root, &out)?;
     crate::project::web_host(&staging.directory)?;
-    crate::project::Manifest { game: project.identity.clone(), runtime: None }.write(&staging.directory)?;
+    crate::project::Manifest { game: project.identity.clone(), runtime: None, worker_deadlines: false }
+        .write(&staging.directory)?;
     staging.publish()?;
     let _game = project.watch(&out)?;
     let mut devtools = project.build_devtools(&out)?;

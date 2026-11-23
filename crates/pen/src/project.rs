@@ -106,6 +106,10 @@ fn file_name_character(character: char) -> bool {
     character.is_alphanumeric() || " -_+.".contains(character)
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// What a bundle says of itself in its `game.json`: its game, and the
 /// runtime its `game.cwasm` was precompiled for, if it has one.
 #[derive(Debug, Deserialize, Serialize)]
@@ -115,6 +119,9 @@ pub struct Manifest {
     /// [`RUNTIME`] of the pen that precompiled `game.cwasm`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// Whether this package also ships epoch-interrupted `workers.cwasm` + `workers.meta`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub worker_deadlines: bool,
 }
 
 impl Manifest {
@@ -630,6 +637,9 @@ pub struct PackageOptions {
     /// The store package versions are kept in, for patches between them
     /// (patch.rs); by default the checkout's `.pen/store`.
     pub store: Option<PathBuf>,
+    /// Also precompile epoch-interrupted `workers.cwasm` + `workers.meta` for
+    /// deadline-bounded shipping worker pools.
+    pub worker_deadlines: bool,
 }
 
 /// Where `pen build` takes the game from.
@@ -880,9 +890,21 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
     }
     let precompiled = blot_host::precompile(&engine, &wasm)?;
     std::fs::write(game.join("game.cwasm"), crate::compiled::encode(&precompiled)?)?;
-    std::fs::write(game.join("game.meta"), blot_host::native_metadata(&wasm)?)?;
+    let meta = blot_host::native_metadata(&wasm)?;
+    std::fs::write(game.join("game.meta"), &meta)?;
+    if options.worker_deadlines {
+        let worker_engine = blot_host::bounded_portable_engine(
+            Some(&target),
+            options.cpu.as_deref(),
+            std::time::Duration::from_millis(2),
+        )?;
+        let worker_precompiled = blot_host::precompile(&worker_engine, &wasm)?;
+        std::fs::write(game.join("workers.cwasm"), crate::compiled::encode(&worker_precompiled)?)?;
+        std::fs::write(game.join("workers.meta"), &meta)?;
+    }
     std::fs::remove_file(game.join("game.wasm"))?;
-    Manifest { game: identity, runtime: Some(RUNTIME.to_owned()) }.write(game)?;
+    Manifest { game: identity, runtime: Some(RUNTIME.to_owned()), worker_deadlines: options.worker_deadlines }
+        .write(game)?;
     std::fs::copy(&runtime, &layout.executable)?;
     if let Some(library) = &steam {
         std::fs::copy(library, layout.libraries.join(library.file_name().unwrap()))?;
@@ -915,7 +937,15 @@ pub fn web_host(out: &Path) -> Result<()> {
         beside.join("pen_web_bg.wasm").is_file().then_some(beside)
     });
     if let Some(host) = host {
-        for file in ["pen_web.js", "pen_web_bg.wasm", "guest.js", "structured.js", "index.html"] {
+        for file in [
+            "pen_web.js",
+            "pen_web_bg.wasm",
+            "guest.js",
+            "structured.js",
+            "kernels.js",
+            "kernel_worker.js",
+            "index.html",
+        ] {
             std::fs::copy(host.join(file), out.join(file)).with_context(|| format!("copying browser host {file}"))?;
         }
     } else {
@@ -947,7 +977,7 @@ pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: b
     if site.join("main.scene").is_file() {
         std::fs::rename(site.join("main.scene"), site.join("scene.bin"))?;
     }
-    Manifest { game: project.identity.clone(), runtime: None }.write(site)?;
+    Manifest { game: project.identity.clone(), runtime: None, worker_deadlines: false }.write(site)?;
     web_host(site)?;
     notices(site)?;
     let hosting = crate::web_export::prepare(site)?;
@@ -994,7 +1024,7 @@ pub fn export_bundle(project: &Project, out: &Path) -> Result<()> {
     crate::reports::ship_config(&project.root, &staging.directory)?;
     let wasm = std::fs::read(staging.directory.join("game.wasm"))?;
     crate::scene_assets::write(&wasm, &project.assets(), &project.scene(), &staging.directory.join("assets"))?;
-    Manifest { game: project.identity.clone(), runtime: None }.write(&staging.directory)?;
+    Manifest { game: project.identity.clone(), runtime: None, worker_deadlines: false }.write(&staging.directory)?;
     staging.publish()
 }
 
@@ -1153,14 +1183,18 @@ mod tests {
         // Without a manifest, after the directory.
         assert_eq!(bundle_identity(&bundle).unwrap(), Identity::named("gdev"));
         let salt = Identity { name: "salt".into(), title: "Salt!".into(), players: 1 };
-        let manifest = Manifest { game: salt, runtime: Some(RUNTIME.into()) };
+        let manifest = Manifest { game: salt, runtime: Some(RUNTIME.into()), worker_deadlines: false };
         manifest.write(&bundle).unwrap();
         assert!(!std::fs::read_to_string(bundle.join("game.json")).unwrap().contains("players"), "one goes unsaid");
         let read = Manifest::read(&bundle).unwrap().unwrap();
         assert_eq!((read.game, read.runtime.as_deref()), (manifest.game.clone(), Some(RUNTIME)));
         assert_eq!(bundle_identity(&bundle).unwrap(), manifest.game);
         // A game of two players says so, and its package keeps it.
-        let pair = Manifest { game: Identity { players: 2, ..manifest.game.clone() }, runtime: None };
+        let pair = Manifest {
+            game: Identity { players: 2, ..manifest.game.clone() },
+            runtime: None,
+            worker_deadlines: false,
+        };
         pair.write(&bundle).unwrap();
         assert_eq!(bundle_identity(&bundle).unwrap().players, 2);
         std::fs::write(bundle.join("game.json"), r#"{"name": "../x", "title": "x"}"#).unwrap();
@@ -1186,7 +1220,7 @@ mod tests {
         std::fs::write(bundle.join("assets/fill.wgsl"), "").unwrap();
         let wasm = [&b"\0asm\x01\0\0\0\0\x0c\x08blot:abi"[..], &[2, 0, 0]].concat();
         std::fs::write(bundle.join("game.wasm"), &wasm).unwrap();
-        Manifest { game: Identity::named("gather"), runtime: None }.write(&bundle).unwrap();
+        Manifest { game: Identity::named("gather"), runtime: None, worker_deadlines: false }.write(&bundle).unwrap();
         // A runtime: an x86-64 ELF header and this pen's mark.
         let mut runtime = vec![0u8; 64];
         runtime[..4].copy_from_slice(b"\x7fELF");
@@ -1200,6 +1234,7 @@ mod tests {
             cpu: None,
             bundle_id: None,
             store: None,
+            worker_deadlines: false,
         };
         let out = bundle.join("dist/package");
         package(GameSource::Bundle(&bundle), &out, options).unwrap();

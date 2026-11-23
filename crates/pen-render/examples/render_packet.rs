@@ -200,6 +200,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
             effects: true,
             bloom: true,
             taa: false,
+            ssr: 0,
         },
         sky: Sky {
             zenith: vector(0.2, 0.4, 0.8),
@@ -210,6 +211,8 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
             ..Sky::default()
         },
         probe_volume: ProbeVolume::default(),
+        reflection: Default::default(),
+        reflection_probes: Vec::new(),
         probes: Vec::new(),
         fog: Fog { radius: 30.0, density: 0.02, height: 10.0 },
         clouds: Clouds { cover: 0.0, drift: Drift { x: 0.0, z: 0.0 } },

@@ -271,6 +271,9 @@ impl State {
         }
         self.update_solids(&frame.solids);
         self.fit_cascades(frame);
+        // What the frame captures of its reflection probes is culled for with the rest.
+        self.plan_reflections(frame);
+        let reflected = super::reflections::screen_level(frame);
         // The render scale, less what holding a frame budget takes off it.
         let timed = self.timer.fresh();
         let scale = frame.quality.scale * self.resolution.factor(timed);
@@ -281,7 +284,7 @@ impl State {
         #[allow(clippy::cast_precision_loss, reason = "pixels")]
         let height = target.size().1 as f32 * scale;
         self.batch(frame, catalog, samples, height, scratch, &mut stats)?;
-        let shadowed = self.light(frame);
+        let shadowed = self.light(frame) || reflected > 0;
         self.prepare_items(frame, catalog, samples, scratch)?;
         // Decals whose material and texture are ready, by material.
         self.decal_batches(frame, catalog, scratch)?;
@@ -325,14 +328,18 @@ impl State {
         let composite = (!scratch.insets.is_empty()).then(|| self.built_ins.get(BuiltIn::Composite).clone());
 
         let tables = self.look_up_tables(frame, catalog)?;
-        let quality = pen_protocol::Quality { msaa: samples, scale, ..frame.quality };
+        // Screen-space reflections read the history and the noise of TAA.
+        let quality =
+            pen_protocol::Quality { msaa: samples, scale, taa: frame.quality.taa || reflected > 0, ..frame.quality };
         let targets = self.post.as_mut().unwrap().begin(&mut self.built_ins, frame, quality, target.size());
         // With TAA the scene draws through a projection jittered within its
         // pixels: the scene uniform's, after its view.
         if let Some(projection) = self.post.as_ref().unwrap().jittered() {
             self.queue.write_buffer(&self.scene_uniform, 64, bytemuck::cast_slice(&projection));
         }
-        self.prepare_contact(frame, targets.size);
+        self.prepare_screen(reflected);
+        self.prepare_contact(frame, targets.size, reflected > 0);
+        self.write_screen(frame, reflected);
         self.clusters.update(
             &self.device,
             &self.queue,
@@ -357,6 +364,7 @@ impl State {
         } else {
             Vec::new()
         };
+        let capture = self.prepare_capture(frame, scratch, samples);
         let drawing = Drawing {
             assets: &self.assets,
             items: &scratch.items,
@@ -377,6 +385,22 @@ impl State {
                 ready,
             );
         }
+        // The probe's faces, once the shadows they read are drawn, ahead of the
+        // scene that reads the cubes.
+        if let Some(capture) = &capture {
+            super::reflections::draw_capture(
+                capture,
+                &device,
+                &self.queue,
+                &mut encoder,
+                &mut self.environment,
+                &drawing,
+                ready,
+                &scratch.capture_list,
+                self.capture_clusters.group(),
+            );
+        }
+        self.environment.commit_reflections(&self.queue, frame, self.capture.as_ref(), capture.is_some());
         if let Some(particles) = &self.particles {
             particles.simulate(&mut encoder);
         }

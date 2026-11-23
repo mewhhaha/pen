@@ -27,8 +27,16 @@ use crate::sprites::SpriteBatch;
 use pen_protocol::boundary::MAX_CASCADES;
 
 /// The views `frame` draws: the camera's, then its sun shadow maps'
-/// (`cascades`), then the faces of the local lights' maps (`local`).
-fn views(frame: &RenderFrame, (maps, count): &([Cascade; MAX_CASCADES], usize), local: &Selection) -> Views {
+/// (`cascades`), then the faces of the local lights' maps (`local`), then the
+/// view of a reflection probe's capture (`capture`, a view-projection), and
+/// the bit of that one (0 without). Every draw may be in the capture's view,
+/// casters or not.
+fn views(
+    frame: &RenderFrame,
+    (maps, count): &([Cascade; MAX_CASCADES], usize),
+    local: &Selection,
+    capture: Option<&Matrix>,
+) -> (Views, ViewMask) {
     let mut views = Views::new(Frustum::of(&frame.projection, &frame.view));
     for map in &maps[..*count] {
         views.push(Frustum::of(&map.projection, &frame.shadow.view));
@@ -36,20 +44,32 @@ fn views(frame: &RenderFrame, (maps, count): &([Cascade; MAX_CASCADES], usize), 
     for face in &local.faces {
         views.push(Frustum::new(&face.matrix));
     }
-    views
+    let bit = capture.map_or(0, |matrix| {
+        let bit = 1 << views.count();
+        views.push(Frustum::new(matrix));
+        bit
+    });
+    (views, bit)
 }
 
-/// Which `views` see `draw` (a bit each; a non-caster only the camera's)
-/// and at which level of detail the camera has it drawn, if its shader
-/// declares its bounds; otherwise every view, whole. Counts into `stats`
-/// what it leaves out.
-fn seen(choice: &Choice, draw: &Draw, views: &Views, detail: &Detail, stats: &mut RenderStats) -> (ViewMask, u8) {
-    let every = if choice.casts { views.all() } else { CAMERA };
+/// Which `views` see `draw` (a bit each; a non-caster only the camera's,
+/// and the capture's `capture`) and at which level of detail the camera has
+/// it drawn, if its shader declares its bounds; otherwise every view, whole.
+/// Counts into `stats` what it leaves out.
+fn seen(
+    choice: &Choice,
+    draw: &Draw,
+    views: &Views,
+    detail: &Detail,
+    capture: ViewMask,
+    stats: &mut RenderStats,
+) -> (ViewMask, u8) {
+    let every = if choice.casts { views.all() } else { CAMERA | capture };
     let Some(bounds) = choice.bounds else { return (every, 0) };
     let placed = bounds.placed(&draw.transform, 0.0);
     let seen = views.mask(&placed) & every;
     stats.culled += u32::from(seen & CAMERA == 0);
-    stats.shadow_culled += (every & !seen & !CAMERA).count_ones();
+    stats.shadow_culled += (every & !seen & !CAMERA & !capture).count_ones();
     let level = detail.level(&placed, stretch(&draw.transform), &choice.errors[..usize::from(choice.levels)]);
     (seen, u8::try_from(level).expect("at most MAX_LODS"))
 }
@@ -79,6 +99,8 @@ impl Scratch {
         self.overlays.clear();
         self.casters.clear();
         self.contact_casters.clear();
+        self.capture_list.clear();
+        self.capture_bit = 0;
         self.materials.clear();
         self.sprites.clear();
         self.sprite_order.clear();
@@ -164,7 +186,11 @@ impl State {
         scratch: &mut Scratch,
         stats: &mut RenderStats,
     ) -> Result<()> {
-        scratch.views = views(frame, &self.cascades, &self.local);
+        let capture = self.capture.as_ref().map(|step| {
+            let at = &step.probe.position;
+            crate::environment::box_view([at.x, at.y, at.z], step.probe.far)
+        });
+        (scratch.views, scratch.capture_bit) = views(frame, &self.cascades, &self.local, capture.as_ref());
         scratch.detail = Detail::new(&frame.projection, &frame.view, height);
         self.culling.begin(scratch.views, scratch.detail);
         scratch.group_poses(frame);
@@ -184,7 +210,7 @@ impl State {
             if !self.culling.takes(batch.count) {
                 continue;
             }
-            let views = if batch.casts { scratch.views.all() } else { CAMERA };
+            let views = if batch.casts { scratch.views.all() } else { CAMERA | scratch.capture_bit };
             batch.gpu = self.culling.add(&bounds, &mesh.lods, instance_count, batch.count, views);
             if batch.gpu.is_some() {
                 batch.first = instance_count;
@@ -206,9 +232,9 @@ impl State {
             }
             let choice = &scratch.choices[placement.choice as usize];
             (placement.views, placement.lod) = if posed {
-                (if choice.casts { scratch.views.all() } else { CAMERA }, 0)
+                (if choice.casts { scratch.views.all() } else { CAMERA | scratch.capture_bit }, 0)
             } else {
-                seen(choice, draw, &scratch.views, &scratch.detail, stats)
+                seen(choice, draw, &scratch.views, &scratch.detail, scratch.capture_bit, stats)
             };
             if let Some(batch) = batch {
                 for (view, ranges) in batch.ranges.iter_mut().enumerate() {
@@ -275,7 +301,7 @@ impl State {
             // One the GPU culls may be drawn in every view it is allowed.
             let views = match batch.gpu {
                 Some(_) if batch.casts => scratch.views.all(),
-                Some(_) => CAMERA,
+                Some(_) => CAMERA | scratch.capture_bit,
                 None => (0..MAX_VIEWS)
                     .filter(|&view| batch.ranges[view].iter().any(|range| range.1 > 0))
                     .fold(0, |views, view| views | 1 << view),
@@ -610,10 +636,17 @@ impl State {
         let ready = &scratch.ready;
         for (index, entry) in ready.iter().enumerate() {
             let item = &items[entry.item];
-            if item.inset().is_some() || item.views & CAMERA == 0 {
+            if item.inset().is_some() {
                 continue;
             }
             let m = &entry.material.material;
+            // What a reflection probe's capture sees: opaque surfaces.
+            if item.views & scratch.capture_bit != 0 && !m.overlay && m.opaque() {
+                scratch.capture_list.push(index);
+            }
+            if item.views & CAMERA == 0 {
+                continue;
+            }
             if m.overlay {
                 scratch.overlays.push(index);
             } else if m.opaque() {
@@ -622,11 +655,13 @@ impl State {
                 scratch.translucent.push(index);
             }
         }
-        scratch.opaque.sort_by_key(|&index| {
-            let entry = &ready[index];
-            let item = &items[entry.item];
-            (stencil(&entry.material.material), item.material, matches!(item.shape, Shape::Batch(_)))
-        });
+        for list in [&mut scratch.opaque, &mut scratch.capture_list] {
+            list.sort_by_key(|&index| {
+                let entry = &ready[index];
+                let item = &items[entry.item];
+                (stencil(&entry.material.material), item.material, matches!(item.shape, Shape::Batch(_)))
+            });
+        }
         let view = &frame.view;
         let depth_of = |transform: &Matrix| {
             f64::from(view[2]) * f64::from(transform[12])
@@ -651,7 +686,7 @@ impl State {
                     && matches!(self.assets.current(entry.shader), Some(GpuAsset::Shader(shader))
                         if shader.shadow[stage].is_some())
                 {
-                    if item.views & !CAMERA != 0 {
+                    if item.views & !CAMERA & !scratch.capture_bit != 0 {
                         scratch.casters.push(index);
                     }
                     if item.views & CAMERA != 0 {

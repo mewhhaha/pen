@@ -1236,6 +1236,40 @@ pub mod types {
         /// out.
         pub valid: f32,
     }
+    /// A local reflection probe: where it is captured from, the box it lights, and the box its
+    /// surroundings are projected onto.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct ReflectionProbe {
+        /// A number that stays with the probe from frame to frame: its cube is kept under it,
+        /// and it breaks ties.
+        pub id: u32,
+        /// Which state of the surroundings the game wants captured; the host draws the cube
+        /// again when this differs from the capture it holds.
+        pub revision: u32,
+        /// Where boxes overlap, a higher priority takes the surface's reflection before lower
+        /// ones share it; equal priorities blend.
+        pub priority: u32,
+        /// Asks for a new capture: the host draws the cube again when this rises from 0 to 1.
+        pub capture: bool,
+        /// Where the cube is drawn from, in world units.
+        pub position: Vector,
+        /// The middle of the influence box.
+        pub center: Vector,
+        /// Half the influence box's size along x, y and z: surfaces inside it reflect this
+        /// probe.
+        pub extent: Vector,
+        /// How far inside the box's faces the probe fades in, from 0 at a face to 1 at that
+        /// distance; 0 for a hard edge.
+        pub blend: f32,
+        /// The middle of the box the surroundings are taken to be, for box projection.
+        pub parallax_center: Vector,
+        /// Half the size of the box the cube is projected onto, which should hold the room the
+        /// probe sits in; any component 0 or less for no projection (the cube is taken as
+        /// infinitely far).
+        pub parallax_extent: Vector,
+        /// How far the capture sees: the farthest of its draws, in world units.
+        pub far: f32,
+    }
     /// A listener: where it is, the way it faces and its up, in world units.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Listener {
@@ -1307,6 +1341,11 @@ pub mod types {
         /// Temporal antialiasing: each frame's samples move within their pixels and blend with
         /// the frames before, followed through the camera's motion.
         pub taa: bool,
+        /// Screen-space reflections of glossy surfaces: 0 off, 1 low (a short march at a coarse
+        /// step), 2 high (a longer march, finer refinement). They read the last frame's
+        /// resolved picture and the camera's depth, so they need a perspective camera, and they
+        /// turn temporal antialiasing on: its history resolves their noise.
+        pub ssr: u32,
     }
     impl Default for Quality {
         fn default() -> Self {
@@ -1320,6 +1359,7 @@ pub mod types {
                 effects: Default::default(),
                 bloom: Default::default(),
                 taa: Default::default(),
+                ssr: Default::default(),
             }
         }
     }
@@ -1430,6 +1470,15 @@ pub mod types {
     pub struct Clouds {
         pub cover: f32,
         pub drift: Drift,
+    }
+    /// How the host keeps local reflection probes up to date: how many cube faces it may draw
+    /// in one frame.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Reflection {
+        /// The most faces of reflection probe cubes drawn in one frame (6 make a whole probe);
+        /// a probe whose revision changed, or that asks, is drawn again over as many frames as
+        /// that takes. 0 draws none: the probes keep what they held.
+        pub budget: u32,
     }
     /// How the camera exposes the frame: a fixed exposure in stops, or auto exposure that
     /// meters the scene on the GPU and adapts over time, with the limits and the speeds of the
@@ -1639,6 +1688,9 @@ pub mod types {
         /// vibrance, up to two blended look-up tables, and a vignette. The defaults grade
         /// nothing.
         pub grade: Grade,
+        /// How the host keeps local reflection probes up to date: how many cube faces it may
+        /// draw in one frame.
+        pub reflection: Reflection,
         pub draws: Vec<Draw>,
         /// Convex solids: the points behind every face plane (normal · p <= distance).
         pub solids: Vec<Solid>,
@@ -1690,6 +1742,12 @@ pub mod types {
         /// the game has a new bake; none keeps the probes the host holds (while their revision
         /// matches).
         pub probes: Vec<Probe>,
+        /// Local reflection probes: boxes of the world whose glossy reflections the host draws
+        /// from the probe's own point of view, as a cube, and blends by how far inside each box
+        /// a surface is. The host captures a probe when its revision changes (or `capture`
+        /// rises), within `reflection.budget` faces a frame, and keeps MAX_REFLECTION_SLOTS
+        /// cubes, dropping the ones least worth keeping.
+        pub reflection_probes: Vec<ReflectionProbe>,
         /// Where the panners are heard from, as WebAudio's AudioListener: none, the camera
         /// (`view`'s eye, facing where it looks, its up the view's), or one listener.
         pub listener: Vec<Listener>,
@@ -1742,6 +1800,7 @@ pub mod types {
                 retained_after: Default::default(),
                 exposure: Default::default(),
                 grade: Default::default(),
+                reflection: Default::default(),
                 draws: Default::default(),
                 solids: Default::default(),
                 decals: Default::default(),
@@ -1759,6 +1818,7 @@ pub mod types {
                 lights: Default::default(),
                 cascades: Default::default(),
                 probes: Default::default(),
+                reflection_probes: Default::default(),
                 listener: Default::default(),
                 panners: Default::default(),
                 instances: Default::default(),
@@ -1865,6 +1925,9 @@ pub mod codec {
     /// The most light probes one frame may carry (a volume may be larger than a frame's share
     /// only by sending none: see `probe_volume.revision`).
     pub const MAX_PROBES: usize = 16384;
+    /// The most reflection probes one frame may publish; the host keeps the nearest and most
+    /// important few in its cube array (MAX_REFLECTION_SLOTS).
+    pub const MAX_REFLECTION_PROBES: usize = 64;
     /// Preference events from this index on carry the engine's preferences
     /// (ENGINE_PREFERENCE_*); below it, the game's own.
     pub const ENGINE_PREFERENCES: usize = 64;
@@ -1890,15 +1953,16 @@ pub mod codec {
     /// shadow.local_texels, blur, quality.bloom, clouds.cover, clouds.drift2, hide_cursor,
     /// field_count, field_lanes, ui_count, ui_lanes, service_count, service_lanes, bus_count,
     /// voice_count, pose_count, emitter_count, quality.taa, light_count, cascade_count,
-    /// probe_count, listener_count, panner_count, loading, show_captions, retained_enabled,
-    /// retained_reset, retained_after, instance_count, instance_removal_count, exposure.auto,
-    /// exposure.compensation, exposure.min, exposure.max, exposure.brighten, exposure.darken,
-    /// exposure.low, exposure.high, exposure.centre, exposure.range_low, exposure.range_high,
-    /// exposure.target, exposure.dt, exposure.cut, grade.temperature, grade.tint,
-    /// grade.exposure, grade.contrast, grade.pivot, grade.saturation, grade.vibrance,
-    /// grade.lift3, grade.gamma3, grade.gain3, grade.lut_a, grade.lut_b, grade.lut_blend,
-    /// grade.lut_weight, grade.vignette, grade.vignette_radius.
-    pub const PACKET_HEADER_FLOATS: usize = 216;
+    /// probe_count, reflection_probe_count, listener_count, panner_count, loading,
+    /// show_captions, retained_enabled, retained_reset, retained_after, instance_count,
+    /// instance_removal_count, exposure.auto, exposure.compensation, exposure.min,
+    /// exposure.max, exposure.brighten, exposure.darken, exposure.low, exposure.high,
+    /// exposure.centre, exposure.range_low, exposure.range_high, exposure.target, exposure.dt,
+    /// exposure.cut, grade.temperature, grade.tint, grade.exposure, grade.contrast,
+    /// grade.pivot, grade.saturation, grade.vibrance, grade.lift3, grade.gamma3, grade.gain3,
+    /// grade.lut_a, grade.lut_b, grade.lut_blend, grade.lut_weight, grade.vignette,
+    /// grade.vignette_radius, quality.ssr, reflection.budget.
+    pub const PACKET_HEADER_FLOATS: usize = 219;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -1944,6 +2008,9 @@ pub mod codec {
     pub const CASCADE_FLOATS: usize = 18;
     /// Lanes: sh03, sh13, sh23, sh33, sh43, sh53, sh63, sh73, sh83, valid.
     pub const PROBE_FLOATS: usize = 28;
+    /// Lanes: id, revision, priority, capture, position3, center3, extent3, blend,
+    /// parallax_center3, parallax_extent3, far.
+    pub const REFLECTION_PROBE_FLOATS: usize = 21;
     /// Lanes: position3, forward3, up3.
     pub const LISTENER_FLOATS: usize = 9;
     /// Lanes: voice, sound, position3, orientation3, distance_model, ref_distance,
@@ -2043,45 +2110,48 @@ pub mod codec {
             pub const LIGHT_COUNT: usize = 168;
             pub const CASCADE_COUNT: usize = 169;
             pub const PROBE_COUNT: usize = 170;
-            pub const LISTENER_COUNT: usize = 171;
-            pub const PANNER_COUNT: usize = 172;
-            pub const LOADING: usize = 173;
-            pub const SHOW_CAPTIONS: usize = 174;
-            pub const RETAINED_ENABLED: usize = 175;
-            pub const RETAINED_RESET: usize = 176;
-            pub const RETAINED_AFTER: usize = 177;
-            pub const INSTANCE_COUNT: usize = 178;
-            pub const INSTANCE_REMOVAL_COUNT: usize = 179;
-            pub const EXPOSURE_AUTO: usize = 180;
-            pub const EXPOSURE_COMPENSATION: usize = 181;
-            pub const EXPOSURE_MIN: usize = 182;
-            pub const EXPOSURE_MAX: usize = 183;
-            pub const EXPOSURE_BRIGHTEN: usize = 184;
-            pub const EXPOSURE_DARKEN: usize = 185;
-            pub const EXPOSURE_LOW: usize = 186;
-            pub const EXPOSURE_HIGH: usize = 187;
-            pub const EXPOSURE_CENTRE: usize = 188;
-            pub const EXPOSURE_RANGE_LOW: usize = 189;
-            pub const EXPOSURE_RANGE_HIGH: usize = 190;
-            pub const EXPOSURE_TARGET: usize = 191;
-            pub const EXPOSURE_DT: usize = 192;
-            pub const EXPOSURE_CUT: usize = 193;
-            pub const GRADE_TEMPERATURE: usize = 194;
-            pub const GRADE_TINT: usize = 195;
-            pub const GRADE_EXPOSURE: usize = 196;
-            pub const GRADE_CONTRAST: usize = 197;
-            pub const GRADE_PIVOT: usize = 198;
-            pub const GRADE_SATURATION: usize = 199;
-            pub const GRADE_VIBRANCE: usize = 200;
-            pub const GRADE_LIFT: usize = 201;
-            pub const GRADE_GAMMA: usize = 204;
-            pub const GRADE_GAIN: usize = 207;
-            pub const GRADE_LUT_A: usize = 210;
-            pub const GRADE_LUT_B: usize = 211;
-            pub const GRADE_LUT_BLEND: usize = 212;
-            pub const GRADE_LUT_WEIGHT: usize = 213;
-            pub const GRADE_VIGNETTE: usize = 214;
-            pub const GRADE_VIGNETTE_RADIUS: usize = 215;
+            pub const REFLECTION_PROBE_COUNT: usize = 171;
+            pub const LISTENER_COUNT: usize = 172;
+            pub const PANNER_COUNT: usize = 173;
+            pub const LOADING: usize = 174;
+            pub const SHOW_CAPTIONS: usize = 175;
+            pub const RETAINED_ENABLED: usize = 176;
+            pub const RETAINED_RESET: usize = 177;
+            pub const RETAINED_AFTER: usize = 178;
+            pub const INSTANCE_COUNT: usize = 179;
+            pub const INSTANCE_REMOVAL_COUNT: usize = 180;
+            pub const EXPOSURE_AUTO: usize = 181;
+            pub const EXPOSURE_COMPENSATION: usize = 182;
+            pub const EXPOSURE_MIN: usize = 183;
+            pub const EXPOSURE_MAX: usize = 184;
+            pub const EXPOSURE_BRIGHTEN: usize = 185;
+            pub const EXPOSURE_DARKEN: usize = 186;
+            pub const EXPOSURE_LOW: usize = 187;
+            pub const EXPOSURE_HIGH: usize = 188;
+            pub const EXPOSURE_CENTRE: usize = 189;
+            pub const EXPOSURE_RANGE_LOW: usize = 190;
+            pub const EXPOSURE_RANGE_HIGH: usize = 191;
+            pub const EXPOSURE_TARGET: usize = 192;
+            pub const EXPOSURE_DT: usize = 193;
+            pub const EXPOSURE_CUT: usize = 194;
+            pub const GRADE_TEMPERATURE: usize = 195;
+            pub const GRADE_TINT: usize = 196;
+            pub const GRADE_EXPOSURE: usize = 197;
+            pub const GRADE_CONTRAST: usize = 198;
+            pub const GRADE_PIVOT: usize = 199;
+            pub const GRADE_SATURATION: usize = 200;
+            pub const GRADE_VIBRANCE: usize = 201;
+            pub const GRADE_LIFT: usize = 202;
+            pub const GRADE_GAMMA: usize = 205;
+            pub const GRADE_GAIN: usize = 208;
+            pub const GRADE_LUT_A: usize = 211;
+            pub const GRADE_LUT_B: usize = 212;
+            pub const GRADE_LUT_BLEND: usize = 213;
+            pub const GRADE_LUT_WEIGHT: usize = 214;
+            pub const GRADE_VIGNETTE: usize = 215;
+            pub const GRADE_VIGNETTE_RADIUS: usize = 216;
+            pub const QUALITY_SSR: usize = 217;
+            pub const REFLECTION_BUDGET: usize = 218;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -2206,6 +2276,19 @@ pub mod codec {
             pub const SH7: usize = 21;
             pub const SH8: usize = 24;
             pub const VALID: usize = 27;
+        }
+        pub mod reflection_probe {
+            pub const ID: usize = 0;
+            pub const REVISION: usize = 1;
+            pub const PRIORITY: usize = 2;
+            pub const CAPTURE: usize = 3;
+            pub const POSITION: usize = 4;
+            pub const CENTER: usize = 7;
+            pub const EXTENT: usize = 10;
+            pub const BLEND: usize = 13;
+            pub const PARALLAX_CENTER: usize = 14;
+            pub const PARALLAX_EXTENT: usize = 17;
+            pub const FAR: usize = 20;
         }
         pub mod listener {
             pub const POSITION: usize = 0;
@@ -2683,6 +2766,22 @@ pub mod codec {
             Ok(())
         }
 
+        fn decode_reflection_probe(&mut self, lane: usize, reflection_probe: &mut ReflectionProbe) -> Result<()> {
+            let id = self.count(lane, 16777215)?;
+            let revision = self.count(lane + 1, 16777215)?;
+            let priority = self.count(lane + 2, 255)?;
+            let capture = self.flag(lane + 3)?;
+            let position = Vector { x: self.packet[lane + 4], y: self.packet[lane + 5], z: self.packet[lane + 6] };
+            let center = Vector { x: self.packet[lane + 7], y: self.packet[lane + 8], z: self.packet[lane + 9] };
+            let extent = Vector { x: self.packet[lane + 10], y: self.packet[lane + 11], z: self.packet[lane + 12] };
+            let blend = self.packet[lane + 13];
+            let parallax_center = Vector { x: self.packet[lane + 14], y: self.packet[lane + 15], z: self.packet[lane + 16] };
+            let parallax_extent = Vector { x: self.packet[lane + 17], y: self.packet[lane + 18], z: self.packet[lane + 19] };
+            let far = self.packet[lane + 20];
+            *reflection_probe = ReflectionProbe { id: id as u32, revision: revision as u32, priority: priority as u32, capture, position, center, extent, blend, parallax_center, parallax_extent, far };
+            Ok(())
+        }
+
         fn decode_listener(&mut self, lane: usize, listener: &mut Listener) -> Result<()> {
             let position = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
             let forward = Vector { x: self.packet[lane + 3], y: self.packet[lane + 4], z: self.packet[lane + 5] };
@@ -2785,10 +2884,11 @@ pub mod codec {
         let lights_count = reader.count(168, MAX_LIGHTS)?;
         let cascades_count = reader.count(169, MAX_CASCADES)?;
         let probes_count = reader.count(170, MAX_PROBES)?;
-        let listener_count = reader.count(171, 1)?;
-        let panners_count = reader.count(172, MAX_PANNERS)?;
-        let instances_count = reader.count(178, MAX_INSTANCES)?;
-        let instance_removals_count = reader.count(179, MAX_INSTANCE_REMOVALS)?;
+        let reflection_probes_count = reader.count(171, MAX_REFLECTION_PROBES)?;
+        let listener_count = reader.count(172, 1)?;
+        let panners_count = reader.count(173, MAX_PANNERS)?;
+        let instances_count = reader.count(179, MAX_INSTANCES)?;
+        let instance_removals_count = reader.count(180, MAX_INSTANCE_REMOVALS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -2828,7 +2928,9 @@ pub mod codec {
         let cascades_end = cascades_start + cascades_count * CASCADE_FLOATS;
         let probes_start = cascades_end;
         let probes_end = probes_start + probes_count * PROBE_FLOATS;
-        let listener_start = probes_end;
+        let reflection_probes_start = probes_end;
+        let reflection_probes_end = reflection_probes_start + reflection_probes_count * REFLECTION_PROBE_FLOATS;
+        let listener_start = reflection_probes_end;
         let listener_end = listener_start + listener_count * LISTENER_FLOATS;
         let panners_start = listener_end;
         let panners_end = panners_start + panners_count * PANNER_FLOATS;
@@ -2941,41 +3043,43 @@ pub mod codec {
         let clouds_drift = Drift { x: reader.packet[154], z: reader.packet[155] };
         let hide_cursor = reader.flag(156)?;
         let quality_taa = reader.flag(167)?;
-        let loading = reader.flag(173)?;
-        let show_captions = reader.flag(174)?;
-        let retained_enabled = reader.flag(175)?;
-        let retained_reset = reader.flag(176)?;
-        let retained_after = reader.count(177, 100000)?;
-        let exposure_auto = reader.flag(180)?;
-        let exposure_compensation = reader.packet[181];
-        let exposure_min = reader.packet[182];
-        let exposure_max = reader.packet[183];
-        let exposure_brighten = reader.packet[184];
-        let exposure_darken = reader.packet[185];
-        let exposure_low = reader.packet[186];
-        let exposure_high = reader.packet[187];
-        let exposure_centre = reader.packet[188];
-        let exposure_range_low = reader.packet[189];
-        let exposure_range_high = reader.packet[190];
-        let exposure_target = reader.packet[191];
-        let exposure_dt = reader.packet[192];
-        let exposure_cut = reader.flag(193)?;
-        let grade_temperature = reader.packet[194];
-        let grade_tint = reader.packet[195];
-        let grade_exposure = reader.packet[196];
-        let grade_contrast = reader.packet[197];
-        let grade_pivot = reader.packet[198];
-        let grade_saturation = reader.packet[199];
-        let grade_vibrance = reader.packet[200];
-        let grade_lift = Vector { x: reader.packet[201], y: reader.packet[202], z: reader.packet[203] };
-        let grade_gamma = Vector { x: reader.packet[204], y: reader.packet[205], z: reader.packet[206] };
-        let grade_gain = Vector { x: reader.packet[207], y: reader.packet[208], z: reader.packet[209] };
-        let grade_lut_a = reader.count(210, 16777215)?;
-        let grade_lut_b = reader.count(211, 16777215)?;
-        let grade_lut_blend = reader.packet[212];
-        let grade_lut_weight = reader.packet[213];
-        let grade_vignette = reader.packet[214];
-        let grade_vignette_radius = reader.packet[215];
+        let loading = reader.flag(174)?;
+        let show_captions = reader.flag(175)?;
+        let retained_enabled = reader.flag(176)?;
+        let retained_reset = reader.flag(177)?;
+        let retained_after = reader.count(178, 100000)?;
+        let exposure_auto = reader.flag(181)?;
+        let exposure_compensation = reader.packet[182];
+        let exposure_min = reader.packet[183];
+        let exposure_max = reader.packet[184];
+        let exposure_brighten = reader.packet[185];
+        let exposure_darken = reader.packet[186];
+        let exposure_low = reader.packet[187];
+        let exposure_high = reader.packet[188];
+        let exposure_centre = reader.packet[189];
+        let exposure_range_low = reader.packet[190];
+        let exposure_range_high = reader.packet[191];
+        let exposure_target = reader.packet[192];
+        let exposure_dt = reader.packet[193];
+        let exposure_cut = reader.flag(194)?;
+        let grade_temperature = reader.packet[195];
+        let grade_tint = reader.packet[196];
+        let grade_exposure = reader.packet[197];
+        let grade_contrast = reader.packet[198];
+        let grade_pivot = reader.packet[199];
+        let grade_saturation = reader.packet[200];
+        let grade_vibrance = reader.packet[201];
+        let grade_lift = Vector { x: reader.packet[202], y: reader.packet[203], z: reader.packet[204] };
+        let grade_gamma = Vector { x: reader.packet[205], y: reader.packet[206], z: reader.packet[207] };
+        let grade_gain = Vector { x: reader.packet[208], y: reader.packet[209], z: reader.packet[210] };
+        let grade_lut_a = reader.count(211, 16777215)?;
+        let grade_lut_b = reader.count(212, 16777215)?;
+        let grade_lut_blend = reader.packet[213];
+        let grade_lut_weight = reader.packet[214];
+        let grade_vignette = reader.packet[215];
+        let grade_vignette_radius = reader.packet[216];
+        let quality_ssr = reader.count(217, 2)?;
+        let reflection_budget = reader.count(218, 6)?;
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -3135,6 +3239,11 @@ pub mod codec {
         for (index, probe) in probes.iter_mut().enumerate() {
             reader.decode_probe(probes_start + index * PROBE_FLOATS, probe)?;
         }
+        let mut reflection_probes = std::mem::take(&mut frame.reflection_probes);
+        resize(&mut reflection_probes, reflection_probes_count);
+        for (index, reflection_probe) in reflection_probes.iter_mut().enumerate() {
+            reader.decode_reflection_probe(reflection_probes_start + index * REFLECTION_PROBE_FLOATS, reflection_probe)?;
+        }
         let mut listener = std::mem::take(&mut frame.listener);
         resize(&mut listener, listener_count);
         for (index, listener) in listener.iter_mut().enumerate() {
@@ -3171,7 +3280,7 @@ pub mod codec {
             light_direction,
             light_color,
             aberration,
-            quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa },
+            quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa, ssr: quality_ssr as u32 },
             sky: Sky { zenith: sky_zenith, horizon: sky_horizon, ground: sky_ground, sun: sky_sun, night: sky_night, tint: sky_tint, sh0: sky_sh0, sh1: sky_sh1, sh2: sky_sh2, sh3: sky_sh3, sh4: sky_sh4, sh5: sky_sh5, sh6: sky_sh6, sh7: sky_sh7, sh8: sky_sh8 },
             probe_volume: ProbeVolume { revision: probe_volume_revision as u32, nx: probe_volume_nx as u32, ny: probe_volume_ny as u32, nz: probe_volume_nz as u32, spacing: probe_volume_spacing, origin: probe_volume_origin },
             fog: Fog { radius: fog_radius, density: fog_density, height: fog_height },
@@ -3186,6 +3295,7 @@ pub mod codec {
             retained_after: retained_after as u32,
             exposure: Exposure { auto: exposure_auto, compensation: exposure_compensation, min: exposure_min, max: exposure_max, brighten: exposure_brighten, darken: exposure_darken, low: exposure_low, high: exposure_high, centre: exposure_centre, range_low: exposure_range_low, range_high: exposure_range_high, target: exposure_target, dt: exposure_dt, cut: exposure_cut },
             grade: Grade { temperature: grade_temperature, tint: grade_tint, exposure: grade_exposure, contrast: grade_contrast, pivot: grade_pivot, saturation: grade_saturation, vibrance: grade_vibrance, lift: grade_lift, gamma: grade_gamma, gain: grade_gain, lut_a: grade_lut_a as u32, lut_b: grade_lut_b as u32, lut_blend: grade_lut_blend, lut_weight: grade_lut_weight, vignette: grade_vignette, vignette_radius: grade_vignette_radius },
+            reflection: Reflection { budget: reflection_budget as u32 },
             draws,
             solids,
             decals,
@@ -3203,6 +3313,7 @@ pub mod codec {
             lights,
             cascades,
             probes,
+            reflection_probes,
             listener,
             panners,
             instances,
@@ -3282,10 +3393,11 @@ pub mod codec {
         let lights_count = d.count(&header.field("light_count"), 168, MAX_LIGHTS)?;
         let cascades_count = d.count(&header.field("cascade_count"), 169, MAX_CASCADES)?;
         let probes_count = d.count(&header.field("probe_count"), 170, MAX_PROBES)?;
-        let listener_count = d.count(&header.field("listener_count"), 171, 1)?;
-        let panners_count = d.count(&header.field("panner_count"), 172, MAX_PANNERS)?;
-        let instances_count = d.count(&header.field("instance_count"), 178, MAX_INSTANCES)?;
-        let instance_removals_count = d.count(&header.field("instance_removal_count"), 179, MAX_INSTANCE_REMOVALS)?;
+        let reflection_probes_count = d.count(&header.field("reflection_probe_count"), 171, MAX_REFLECTION_PROBES)?;
+        let listener_count = d.count(&header.field("listener_count"), 172, 1)?;
+        let panners_count = d.count(&header.field("panner_count"), 173, MAX_PANNERS)?;
+        let instances_count = d.count(&header.field("instance_count"), 179, MAX_INSTANCES)?;
+        let instance_removals_count = d.count(&header.field("instance_removal_count"), 180, MAX_INSTANCE_REMOVALS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3325,7 +3437,9 @@ pub mod codec {
         let cascades_end = d.end(&Location::section("cascades"), cascades_start, cascades_count, CASCADE_FLOATS)?;
         let probes_start = cascades_end;
         let probes_end = d.end(&Location::section("probes"), probes_start, probes_count, PROBE_FLOATS)?;
-        let listener_start = probes_end;
+        let reflection_probes_start = probes_end;
+        let reflection_probes_end = d.end(&Location::section("reflection_probes"), reflection_probes_start, reflection_probes_count, REFLECTION_PROBE_FLOATS)?;
+        let listener_start = reflection_probes_end;
         let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
         let panners_start = listener_end;
         let panners_end = d.end(&Location::section("panners"), panners_start, panners_count, PANNER_FLOATS)?;
@@ -3395,41 +3509,43 @@ pub mod codec {
         d.values(&header.field("clouds.drift"), 154, 2, &["x","z"])?;
         d.count(&header.field("hide_cursor"), 156, 1)?;
         d.count(&header.field("quality.taa"), 167, 1)?;
-        d.count(&header.field("loading"), 173, 1)?;
-        d.count(&header.field("show_captions"), 174, 1)?;
-        d.count(&header.field("retained_enabled"), 175, 1)?;
-        d.count(&header.field("retained_reset"), 176, 1)?;
-        let _ = d.count(&header.field("retained_after"), 177, 100000)?;
-        d.count(&header.field("exposure.auto"), 180, 1)?;
-        d.finite(&header.field("exposure.compensation"), 181)?;
-        d.finite(&header.field("exposure.min"), 182)?;
-        d.finite(&header.field("exposure.max"), 183)?;
-        d.finite(&header.field("exposure.brighten"), 184)?;
-        d.finite(&header.field("exposure.darken"), 185)?;
-        d.finite(&header.field("exposure.low"), 186)?;
-        d.finite(&header.field("exposure.high"), 187)?;
-        d.finite(&header.field("exposure.centre"), 188)?;
-        d.finite(&header.field("exposure.range_low"), 189)?;
-        d.finite(&header.field("exposure.range_high"), 190)?;
-        d.finite(&header.field("exposure.target"), 191)?;
-        d.finite(&header.field("exposure.dt"), 192)?;
-        d.count(&header.field("exposure.cut"), 193, 1)?;
-        d.finite(&header.field("grade.temperature"), 194)?;
-        d.finite(&header.field("grade.tint"), 195)?;
-        d.finite(&header.field("grade.exposure"), 196)?;
-        d.finite(&header.field("grade.contrast"), 197)?;
-        d.finite(&header.field("grade.pivot"), 198)?;
-        d.finite(&header.field("grade.saturation"), 199)?;
-        d.finite(&header.field("grade.vibrance"), 200)?;
-        d.values(&header.field("grade.lift"), 201, 3, &["x","y","z"])?;
-        d.values(&header.field("grade.gamma"), 204, 3, &["x","y","z"])?;
-        d.values(&header.field("grade.gain"), 207, 3, &["x","y","z"])?;
-        let _ = d.count(&header.field("grade.lut_a"), 210, 16777215)?;
-        let _ = d.count(&header.field("grade.lut_b"), 211, 16777215)?;
-        d.finite(&header.field("grade.lut_blend"), 212)?;
-        d.finite(&header.field("grade.lut_weight"), 213)?;
-        d.finite(&header.field("grade.vignette"), 214)?;
-        d.finite(&header.field("grade.vignette_radius"), 215)?;
+        d.count(&header.field("loading"), 174, 1)?;
+        d.count(&header.field("show_captions"), 175, 1)?;
+        d.count(&header.field("retained_enabled"), 176, 1)?;
+        d.count(&header.field("retained_reset"), 177, 1)?;
+        let _ = d.count(&header.field("retained_after"), 178, 100000)?;
+        d.count(&header.field("exposure.auto"), 181, 1)?;
+        d.finite(&header.field("exposure.compensation"), 182)?;
+        d.finite(&header.field("exposure.min"), 183)?;
+        d.finite(&header.field("exposure.max"), 184)?;
+        d.finite(&header.field("exposure.brighten"), 185)?;
+        d.finite(&header.field("exposure.darken"), 186)?;
+        d.finite(&header.field("exposure.low"), 187)?;
+        d.finite(&header.field("exposure.high"), 188)?;
+        d.finite(&header.field("exposure.centre"), 189)?;
+        d.finite(&header.field("exposure.range_low"), 190)?;
+        d.finite(&header.field("exposure.range_high"), 191)?;
+        d.finite(&header.field("exposure.target"), 192)?;
+        d.finite(&header.field("exposure.dt"), 193)?;
+        d.count(&header.field("exposure.cut"), 194, 1)?;
+        d.finite(&header.field("grade.temperature"), 195)?;
+        d.finite(&header.field("grade.tint"), 196)?;
+        d.finite(&header.field("grade.exposure"), 197)?;
+        d.finite(&header.field("grade.contrast"), 198)?;
+        d.finite(&header.field("grade.pivot"), 199)?;
+        d.finite(&header.field("grade.saturation"), 200)?;
+        d.finite(&header.field("grade.vibrance"), 201)?;
+        d.values(&header.field("grade.lift"), 202, 3, &["x","y","z"])?;
+        d.values(&header.field("grade.gamma"), 205, 3, &["x","y","z"])?;
+        d.values(&header.field("grade.gain"), 208, 3, &["x","y","z"])?;
+        let _ = d.count(&header.field("grade.lut_a"), 211, 16777215)?;
+        let _ = d.count(&header.field("grade.lut_b"), 212, 16777215)?;
+        d.finite(&header.field("grade.lut_blend"), 213)?;
+        d.finite(&header.field("grade.lut_weight"), 214)?;
+        d.finite(&header.field("grade.vignette"), 215)?;
+        d.finite(&header.field("grade.vignette_radius"), 216)?;
+        let _ = d.count(&header.field("quality.ssr"), 217, 2)?;
+        let _ = d.count(&header.field("reflection.budget"), 218, 6)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -3698,6 +3814,23 @@ pub mod codec {
             base += PROBE_FLOATS;
         }
         d.exhausted(&Location::section("probes"), base, probes_end)?;
+        let mut base = reflection_probes_start;
+        for item in 0..reflection_probes_count {
+            let path = &Location::section("reflection_probes").index(item);
+            let id = d.count(&path.field("id"), base, 16777215)?;
+            let revision = d.count(&path.field("revision"), base + 1, 16777215)?;
+            let priority = d.count(&path.field("priority"), base + 2, 255)?;
+            d.count(&path.field("capture"), base + 3, 1)?;
+            d.values(&path.field("position"), base + 4, 3, &["x","y","z"])?;
+            d.values(&path.field("center"), base + 7, 3, &["x","y","z"])?;
+            d.values(&path.field("extent"), base + 10, 3, &["x","y","z"])?;
+            d.finite(&path.field("blend"), base + 13)?;
+            d.values(&path.field("parallax_center"), base + 14, 3, &["x","y","z"])?;
+            d.values(&path.field("parallax_extent"), base + 17, 3, &["x","y","z"])?;
+            d.finite(&path.field("far"), base + 20)?;
+            base += REFLECTION_PROBE_FLOATS;
+        }
+        d.exhausted(&Location::section("reflection_probes"), base, reflection_probes_end)?;
         let mut base = listener_start;
         for item in 0..listener_count {
             let path = &Location::section("listener").index(item);
@@ -3787,10 +3920,11 @@ pub mod codec {
         let lights_count = d.count(&header.field("light_count"), 168, MAX_LIGHTS)?;
         let cascades_count = d.count(&header.field("cascade_count"), 169, MAX_CASCADES)?;
         let probes_count = d.count(&header.field("probe_count"), 170, MAX_PROBES)?;
-        let listener_count = d.count(&header.field("listener_count"), 171, 1)?;
-        let panners_count = d.count(&header.field("panner_count"), 172, MAX_PANNERS)?;
-        let instances_count = d.count(&header.field("instance_count"), 178, MAX_INSTANCES)?;
-        let instance_removals_count = d.count(&header.field("instance_removal_count"), 179, MAX_INSTANCE_REMOVALS)?;
+        let reflection_probes_count = d.count(&header.field("reflection_probe_count"), 171, MAX_REFLECTION_PROBES)?;
+        let listener_count = d.count(&header.field("listener_count"), 172, 1)?;
+        let panners_count = d.count(&header.field("panner_count"), 173, MAX_PANNERS)?;
+        let instances_count = d.count(&header.field("instance_count"), 179, MAX_INSTANCES)?;
+        let instance_removals_count = d.count(&header.field("instance_removal_count"), 180, MAX_INSTANCE_REMOVALS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3830,7 +3964,9 @@ pub mod codec {
         let cascades_end = d.end(&Location::section("cascades"), cascades_start, cascades_count, CASCADE_FLOATS)?;
         let probes_start = cascades_end;
         let probes_end = d.end(&Location::section("probes"), probes_start, probes_count, PROBE_FLOATS)?;
-        let listener_start = probes_end;
+        let reflection_probes_start = probes_end;
+        let reflection_probes_end = d.end(&Location::section("reflection_probes"), reflection_probes_start, reflection_probes_count, REFLECTION_PROBE_FLOATS)?;
+        let listener_start = reflection_probes_end;
         let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
         let panners_start = listener_end;
         let panners_end = d.end(&Location::section("panners"), panners_start, panners_count, PANNER_FLOATS)?;
@@ -3942,18 +4078,18 @@ pub mod codec {
             frame.aberration.y, frame.quality.msaa as f32, f32::from(frame.quality.fxaa), frame.quality.scale,
             frame.quality.filtering as f32, f32::from(frame.quality.occlusion), f32::from(frame.quality.sky),
             f32::from(frame.quality.effects), f32::from(frame.quality.bloom), f32::from(frame.quality.taa),
-            frame.sky.zenith.x, frame.sky.zenith.y, frame.sky.zenith.z, frame.sky.horizon.x, frame.sky.horizon.y,
-            frame.sky.horizon.z, frame.sky.ground.x, frame.sky.ground.y, frame.sky.ground.z, frame.sky.sun.x,
-            frame.sky.sun.y, frame.sky.sun.z, frame.sky.night, frame.sky.tint.x, frame.sky.tint.y,
-            frame.sky.tint.z, frame.sky.sh0.x, frame.sky.sh0.y, frame.sky.sh0.z, frame.sky.sh1.x,
-            frame.sky.sh1.y, frame.sky.sh1.z, frame.sky.sh2.x, frame.sky.sh2.y, frame.sky.sh2.z, frame.sky.sh3.x,
-            frame.sky.sh3.y, frame.sky.sh3.z, frame.sky.sh4.x, frame.sky.sh4.y, frame.sky.sh4.z, frame.sky.sh5.x,
-            frame.sky.sh5.y, frame.sky.sh5.z, frame.sky.sh6.x, frame.sky.sh6.y, frame.sky.sh6.z, frame.sky.sh7.x,
-            frame.sky.sh7.y, frame.sky.sh7.z, frame.sky.sh8.x, frame.sky.sh8.y, frame.sky.sh8.z,
-            frame.probe_volume.revision as f32, frame.probe_volume.nx as f32, frame.probe_volume.ny as f32,
-            frame.probe_volume.nz as f32, frame.probe_volume.spacing, frame.probe_volume.origin.x,
-            frame.probe_volume.origin.y, frame.probe_volume.origin.z, frame.fog.radius, frame.fog.density,
-            frame.fog.height,
+            frame.quality.ssr as f32, frame.sky.zenith.x, frame.sky.zenith.y, frame.sky.zenith.z,
+            frame.sky.horizon.x, frame.sky.horizon.y, frame.sky.horizon.z, frame.sky.ground.x,
+            frame.sky.ground.y, frame.sky.ground.z, frame.sky.sun.x, frame.sky.sun.y, frame.sky.sun.z,
+            frame.sky.night, frame.sky.tint.x, frame.sky.tint.y, frame.sky.tint.z, frame.sky.sh0.x,
+            frame.sky.sh0.y, frame.sky.sh0.z, frame.sky.sh1.x, frame.sky.sh1.y, frame.sky.sh1.z, frame.sky.sh2.x,
+            frame.sky.sh2.y, frame.sky.sh2.z, frame.sky.sh3.x, frame.sky.sh3.y, frame.sky.sh3.z, frame.sky.sh4.x,
+            frame.sky.sh4.y, frame.sky.sh4.z, frame.sky.sh5.x, frame.sky.sh5.y, frame.sky.sh5.z, frame.sky.sh6.x,
+            frame.sky.sh6.y, frame.sky.sh6.z, frame.sky.sh7.x, frame.sky.sh7.y, frame.sky.sh7.z, frame.sky.sh8.x,
+            frame.sky.sh8.y, frame.sky.sh8.z, frame.probe_volume.revision as f32, frame.probe_volume.nx as f32,
+            frame.probe_volume.ny as f32, frame.probe_volume.nz as f32, frame.probe_volume.spacing,
+            frame.probe_volume.origin.x, frame.probe_volume.origin.y, frame.probe_volume.origin.z,
+            frame.fog.radius, frame.fog.density, frame.fog.height,
         ]);
         out.extend_from_slice(&frame.shadow.view);
         out.extend([
@@ -3971,7 +4107,8 @@ pub mod codec {
             frame.grade.lift.y, frame.grade.lift.z, frame.grade.gamma.x, frame.grade.gamma.y,
             frame.grade.gamma.z, frame.grade.gain.x, frame.grade.gain.y, frame.grade.gain.z,
             frame.grade.lut_a as f32, frame.grade.lut_b as f32, frame.grade.lut_blend, frame.grade.lut_weight,
-            frame.grade.vignette, frame.grade.vignette_radius, state.len() as f32,
+            frame.grade.vignette, frame.grade.vignette_radius, frame.reflection.budget as f32,
+            state.len() as f32,
         ]);
         out.extend_from_slice(state);
         out.push(frame.draws.len() as f32);
@@ -4044,6 +4181,10 @@ pub mod codec {
         out.push(frame.probes.len() as f32);
         for probe in &frame.probes {
             canonical_probe(&mut out, probe);
+        }
+        out.push(frame.reflection_probes.len() as f32);
+        for reflection_probe in &frame.reflection_probes {
+            canonical_reflection_probe(&mut out, reflection_probe);
         }
         out.push(frame.listener.len() as f32);
         for listener in &frame.listener {
@@ -4211,6 +4352,19 @@ pub mod codec {
             probe.sh2.y, probe.sh2.z, probe.sh3.x, probe.sh3.y, probe.sh3.z, probe.sh4.x, probe.sh4.y,
             probe.sh4.z, probe.sh5.x, probe.sh5.y, probe.sh5.z, probe.sh6.x, probe.sh6.y, probe.sh6.z,
             probe.sh7.x, probe.sh7.y, probe.sh7.z, probe.sh8.x, probe.sh8.y, probe.sh8.z, probe.valid,
+        ]);
+    }
+
+    fn canonical_reflection_probe(out: &mut Vec<f32>, reflection_probe: &ReflectionProbe) {
+        out.extend([
+            reflection_probe.id as f32, reflection_probe.revision as f32, reflection_probe.priority as f32,
+            f32::from(reflection_probe.capture), reflection_probe.position.x, reflection_probe.position.y,
+            reflection_probe.position.z, reflection_probe.center.x, reflection_probe.center.y,
+            reflection_probe.center.z, reflection_probe.extent.x, reflection_probe.extent.y,
+            reflection_probe.extent.z, reflection_probe.blend, reflection_probe.parallax_center.x,
+            reflection_probe.parallax_center.y, reflection_probe.parallax_center.z,
+            reflection_probe.parallax_extent.x, reflection_probe.parallax_extent.y,
+            reflection_probe.parallax_extent.z, reflection_probe.far,
         ]);
     }
 

@@ -51,6 +51,18 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
         let terms = [probe.sh0, probe.sh1, probe.sh2, probe.sh3, probe.sh4, probe.sh5, probe.sh6, probe.sh7, probe.sh8];
         ensure!(terms.iter().all(finite) && probe.valid.is_finite(), "probe light must contain finite float32 values");
     }
+    for probe in &frame.reflection_probes {
+        let vectors = [probe.position, probe.center, probe.extent, probe.parallax_center, probe.parallax_extent];
+        ensure!(
+            vectors.iter().all(finite) && probe.blend.is_finite() && probe.far.is_finite(),
+            "reflection probes must contain finite float32 values"
+        );
+        ensure!(
+            probe.extent.x >= 0.0 && probe.extent.y >= 0.0 && probe.extent.z >= 0.0 && probe.blend >= 0.0,
+            "a reflection probe's box and blend distance must not be negative"
+        );
+        ensure!(probe.far > 0.0, "a reflection probe must see some distance");
+    }
     ensure!(hypot(&frame.light_direction) >= 1e-8, "light direction must be nonzero");
     let aberration = &frame.aberration;
     ensure!(

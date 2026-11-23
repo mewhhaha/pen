@@ -6,13 +6,19 @@
 // and the split-sum BRDF table, drawn once. The cube is redrawn on the GPU in
 // the frame whose sky colors differ from the last one's, and not otherwise.
 // `ENVIRONMENT_WGSL` is what a material shader adds to read all of it, at
-// group 0 bindings 4 to 7 of every mesh pipeline.
+// group 0 bindings 4 to 8 and 10 to 13 of every mesh pipeline: besides the
+// sky's, the local reflection probes' cubes (reflection_probes.rs) and the
+// screen-space reflections' depth and picture (renderer/screen_reflections.rs).
 use pen_protocol::{Probe, ProbeVolume, RenderFrame, Sky, Vector};
 
 use crate::pipeline_cache::PipelineCache;
 
+mod reflection_probes;
+pub(crate) use reflection_probes::{CaptureTargets, ReflectionProbes, Step, box_view, face_projection, face_view};
+
 /// WGSL a material shader adds to light with the sky: `ambient_light(world,
-/// normal)`, `sky_reflection`, `surface_ambient` and `specular_occlusion`.
+/// normal)`, `sky_reflection(world, normal, view, roughness, f0)`,
+/// `surface_ambient` and `specular_occlusion`.
 pub const ENVIRONMENT_WGSL: &str = include_str!("shaders/environment.wgsl");
 
 const PREFILTER: &str = include_str!("shaders/environment_prefilter.wgsl");
@@ -30,9 +36,14 @@ const SAMPLES: f32 = 128.0;
 const PASS_BYTES: u64 = 64;
 const STRIDE: u64 = 256;
 const PASSES: u64 = 6 * LEVELS as u64;
-/// The uniform `ENVIRONMENT_WGSL` reads: nine coefficients, the tint and the
-/// reflection settings.
-pub(crate) const LIGHT_BYTES: u64 = 16 * 13;
+/// The uniform `ENVIRONMENT_WGSL` reads: nine coefficients, the tint, the
+/// reflection settings, the probe volume's header, and the screen-space
+/// reflections' (floats 52 on).
+pub(crate) const LIGHT_BYTES: u64 = 16 * 28;
+/// The floats of `LIGHT_BYTES`, and where the screen-space reflections' begin.
+pub(crate) const LIGHT_FLOATS: usize = 112;
+pub(crate) const SCREEN_FLOATS: usize = 60;
+const SCREEN_AT: usize = LIGHT_FLOATS - SCREEN_FLOATS;
 /// Floats of one probe on the GPU: nine RGB terms and a validity weight.
 pub(crate) const PROBE_FLOATS: usize = 28;
 /// The most probes the volume buffer holds (`MAX_PROBES`, as one volume).
@@ -47,9 +58,13 @@ pub(crate) struct Environment {
     _table: wgpu::Texture,
     table_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
-    /// The frame's light, and the zeros the shadow passes bind.
+    /// The frame's light, the same without screen-space reflections (what
+    /// the probes' captures are lit by), and the zeros the shadow passes bind.
     light: wgpu::Buffer,
+    capture_light: wgpu::Buffer,
     empty: wgpu::Buffer,
+    /// The local reflection probes' cubes and table.
+    pub(crate) reflections: ReflectionProbes,
     /// The passes' uniforms, in slots with dynamic offsets.
     passes: wgpu::Buffer,
     /// The resident probe volume: every probe's 28 floats, and which bake it
@@ -69,9 +84,11 @@ struct Pipelines {
     table: wgpu::RenderPipeline,
 }
 
-/// The scene group's bindings 4 to 7: the cube, the table, a filtering
-/// sampler and the light.
-pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
+/// The scene group's bindings 4 to 8, 10 and 11: the sky's cube, the table, a
+/// filtering sampler, the light, the diffuse probes, the reflection probes'
+/// cubes and their table. (Bindings 12 and 13, the screen-space
+/// reflections', come from the renderer.)
+pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 7] {
     let texture = |binding: u32, view_dimension: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -111,6 +128,17 @@ pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
             },
             count: None,
         },
+        texture(10, wgpu::TextureViewDimension::CubeArray),
+        wgpu::BindGroupLayoutEntry {
+            binding: 11,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(reflection_probes::TABLE_BYTES),
+            },
+            count: None,
+        },
     ]
 }
 
@@ -126,18 +154,19 @@ fn buffer(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsag
 /// The light uniform of a sky with these coefficients: nine colors, the tint
 /// (w: 1 when the cube is the sky to reflect), the cube's last level, then the
 /// probe volume's origin and spacing and its counts (w: 1 when it is in use).
-pub(crate) fn light_floats(sh: &[Vector; 9], tint: &Vector, reflecting: bool) -> [f32; 52] {
-    let mut floats = [0.0; 52];
+pub(crate) fn light_floats(sh: &[Vector; 9], tint: &Vector, reflecting: bool) -> [f32; LIGHT_FLOATS] {
+    let mut floats = [0.0; LIGHT_FLOATS];
     for (slot, v) in sh.iter().enumerate() {
         floats[slot * 4..slot * 4 + 3].copy_from_slice(&[v.x, v.y, v.z]);
     }
     floats[36..40].copy_from_slice(&[tint.x, tint.y, tint.z, if reflecting { 1.0 } else { 0.0 }]);
     floats[40] = (LEVELS - 1) as f32;
+    floats[41] = (reflection_probes::LEVELS - 1) as f32;
     floats
 }
 
 /// A flat light, `ambient` from every direction, which reflects nothing.
-pub(crate) fn flat_floats(ambient: &Vector) -> [f32; 52] {
+pub(crate) fn flat_floats(ambient: &Vector) -> [f32; LIGHT_FLOATS] {
     // Coefficient 0 of a constant is the constant over the first basis function.
     let scale = 1.0 / 0.282_094_8;
     let zero = Vector { x: 0.0, y: 0.0, z: 0.0 };
@@ -149,7 +178,7 @@ pub(crate) fn flat_floats(ambient: &Vector) -> [f32; 52] {
 /// The sky's coefficients and tint from the frame, or its flat `ambient`
 /// when the game sent none, so a game that knows nothing of them still has
 /// light. `probes` says whether a probe volume is resident for the frame.
-pub(crate) fn sky_floats(sky: &Sky, ambient: &Vector, volume: &ProbeVolume, probes: bool) -> [f32; 52] {
+pub(crate) fn sky_floats(sky: &Sky, ambient: &Vector, volume: &ProbeVolume, probes: bool) -> [f32; LIGHT_FLOATS] {
     let sh = [sky.sh0, sky.sh1, sky.sh2, sky.sh3, sky.sh4, sky.sh5, sky.sh6, sky.sh7, sky.sh8];
     let sent = sh.iter().chain([&sky.tint]).any(|v| v.x != 0.0 || v.y != 0.0 || v.z != 0.0);
     let mut floats = if sent { light_floats(&sh, &sky.tint, true) } else { flat_floats(ambient) };
@@ -222,6 +251,8 @@ impl Environment {
             table_view,
             sampler,
             light: buffer(device, "sky light", LIGHT_BYTES, wgpu::BufferUsages::UNIFORM),
+            capture_light: buffer(device, "capture sky light", LIGHT_BYTES, wgpu::BufferUsages::UNIFORM),
+            reflections: ReflectionProbes::new(device),
             empty: buffer(device, "no sky light", LIGHT_BYTES, wgpu::BufferUsages::UNIFORM),
             passes: buffer(device, "sky passes", STRIDE * PASSES, wgpu::BufferUsages::UNIFORM),
             probe_data: buffer(device, "probes", PROBE_BYTES, wgpu::BufferUsages::STORAGE),
@@ -233,15 +264,50 @@ impl Environment {
         }
     }
 
-    /// The bindings 4 to 7 of a scene group, with `light` as the sky's light.
-    pub fn entries<'a>(&'a self, light: &'a wgpu::Buffer) -> [wgpu::BindGroupEntry<'a>; 5] {
+    /// The bindings 4 to 8, 10 and 11 of a scene group, with `light` as the
+    /// sky's light.
+    pub fn entries<'a>(&'a self, light: &'a wgpu::Buffer) -> [wgpu::BindGroupEntry<'a>; 7] {
+        self.entries_with(light, &self.reflections.table)
+    }
+
+    /// `entries`, with `table` as the reflection probes' (`empty_probes` for none).
+    pub fn entries_with<'a>(
+        &'a self,
+        light: &'a wgpu::Buffer,
+        table: &'a wgpu::Buffer,
+    ) -> [wgpu::BindGroupEntry<'a>; 7] {
         [
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.cube_view) },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.table_view) },
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             wgpu::BindGroupEntry { binding: 7, resource: light.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 8, resource: self.probe_data.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(&self.reflections.cubes_view),
+            },
+            wgpu::BindGroupEntry { binding: 11, resource: table.as_entire_binding() },
         ]
+    }
+
+    /// The table of the reflection probes that hold cubes.
+    pub fn probe_table(&self) -> &wgpu::Buffer {
+        &self.reflections.table
+    }
+
+    /// A table of no probes: what insets and the passes that draw into maps bind.
+    pub fn empty_probes(&self) -> &wgpu::Buffer {
+        &self.reflections.empty_table
+    }
+
+    /// The light the probes' captures are lit by.
+    pub fn capture_light(&self) -> &wgpu::Buffer {
+        &self.capture_light
+    }
+
+    /// Writes the screen-space reflections' part of the frame's light.
+    pub fn set_screen(&self, queue: &wgpu::Queue, floats: &[f32; SCREEN_FLOATS]) {
+        queue.write_buffer(&self.light, (SCREEN_AT * 4) as u64, bytemuck::cast_slice(floats));
     }
 
     /// The frame's light buffer, and the one that holds none.
@@ -286,7 +352,9 @@ impl Environment {
 
     /// Writes the sky's light, and notes whether the cube must be drawn again.
     pub fn set_sky(&mut self, queue: &wgpu::Queue, sky: &Sky, ambient: &Vector, volume: &ProbeVolume, probes: bool) {
-        queue.write_buffer(&self.light, 0, bytemuck::cast_slice(&sky_floats(sky, ambient, volume, probes)));
+        let floats = sky_floats(sky, ambient, volume, probes);
+        queue.write_buffer(&self.light, 0, bytemuck::cast_slice(&floats));
+        queue.write_buffer(&self.capture_light, 0, bytemuck::cast_slice(&floats));
         let wanted = key(sky);
         if self.drawn != Some(wanted) {
             self.drawn = Some(wanted);
@@ -507,9 +575,25 @@ mod gpu {
         probes: (&ProbeVolume, &[Probe]),
         body: &str,
     ) -> Vec<[f32; 4]> {
+        probe_full(device, queue, sky, ambient, probes, None, body)
+    }
+
+    /// `probe_with`, the reflection probes' table (`table_floats`) written too.
+    pub(super) fn probe_full(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sky: &Sky,
+        ambient: &Vector,
+        probes: (&ProbeVolume, &[Probe]),
+        table: Option<&[f32]>,
+        body: &str,
+    ) -> Vec<[f32; 4]> {
         let mut environment = Environment::new(device, PipelineCache::open(device, None));
         let using = environment.set_probes(queue, probes.0, probes.1);
         environment.set_sky(queue, sky, ambient, probes.0, using);
+        if let Some(table) = table {
+            queue.write_buffer(&environment.reflections.table, 0, bytemuck::cast_slice(table));
+        }
         let mut encoder = device.create_command_encoder(&Default::default());
         environment.encode(device, &mut encoder);
         let source = format!(
@@ -534,8 +618,57 @@ fn direction_at(pixel: vec2f) -> vec3f {{
             label: Some("probe"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
-        let layout = device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &layout_entries() });
+        let mut entries = layout_entries().to_vec();
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 12,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        });
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 13,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        });
+        let layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
+        let stand = |format: wgpu::TextureFormat, dimension: wgpu::TextureViewDimension| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: None,
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 2 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor { dimension: Some(dimension), ..Default::default() })
+        };
+        let depth_stand_in = stand(wgpu::TextureFormat::Depth32Float, wgpu::TextureViewDimension::D2Array);
+        let picture_stand_in = {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            texture.create_view(&Default::default())
+        };
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&layout)],
@@ -565,7 +698,18 @@ fn direction_at(pixel: vec2f) -> vec3f {{
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &layout,
-            entries: &environment.entries(environment.light()),
+            entries: &{
+                let mut group = environment.entries(environment.light()).to_vec();
+                group.push(wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(&depth_stand_in),
+                });
+                group.push(wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(&picture_stand_in),
+                });
+                group
+            },
         });
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -830,7 +974,7 @@ fn direction_at(pixel: vec2f) -> vec3f {{
             &sky,
             &Vector::default(),
             "let f0 = vec3f(0.04);
-  let got = sky_reflection(vec3f(0.0, 0.0, 1.0), vec3f(0.0, 0.0, 1.0), 0.5, f0);
+  let got = sky_reflection(vec3f(0.0), vec3f(0.0, 0.0, 1.0), vec3f(0.0, 0.0, 1.0), 0.5, f0);
   let split = sky_brdf(1.0, 0.5);
   return vec4f(got, split.x * 0.04 + split.y);",
         );
@@ -849,7 +993,7 @@ fn direction_at(pixel: vec2f) -> vec3f {{
             &queue,
             &sky,
             &vector(0.2, 0.3, 0.4),
-            "return vec4f(ambient_light(vec3f(0.0), direction), length(sky_reflection(direction, direction, 0.3, vec3f(1.0))));",
+            "return vec4f(ambient_light(vec3f(0.0), direction), length(sky_reflection(vec3f(0.0), direction, direction, 0.3, vec3f(1.0))));",
         );
         for texel in &picture {
             assert!((texel[0] - 0.2).abs() < 1e-4 && (texel[1] - 0.3).abs() < 1e-4 && (texel[2] - 0.4).abs() < 1e-4);
@@ -930,8 +1074,7 @@ fn direction_at(pixel: vec2f) -> vec3f {{
         }
         let c: [f64; 3] = std::array::from_fn(|a| g[a].clamp(0.0, last[a]));
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped into the lattice")]
-        let low: [usize; 3] =
-            std::array::from_fn(|a| (c[a].floor() as usize).min((last[a] - 1.0).max(0.0) as usize));
+        let low: [usize; 3] = std::array::from_fn(|a| (c[a].floor() as usize).min((last[a] - 1.0).max(0.0) as usize));
         let (mut sum, mut weight, mut share, mut total) = ([0.0; 3], 0.0, 0.0, 0.0);
         for corner in 0..8usize {
             let d = [corner & 1, (corner >> 1) & 1, (corner >> 2) & 1];
@@ -1080,6 +1223,185 @@ fn direction_at(pixel: vec2f) -> vec3f {{
                 }
             }
         }
+    }
+
+    // --------------------------------------------------- reflection probes
+
+    use pen_protocol::ReflectionProbe;
+
+    fn v3(a: [f32; 3]) -> Vector {
+        Vector { x: a[0], y: a[1], z: a[2] }
+    }
+
+    fn rp(id: u32, priority: u32, centre: [f32; 3], extent: [f32; 3], blend: f32) -> ReflectionProbe {
+        ReflectionProbe {
+            id,
+            revision: 1,
+            priority,
+            capture: false,
+            position: v3(centre),
+            center: v3(centre),
+            extent: v3(extent),
+            blend,
+            parallax_center: v3(centre),
+            parallax_extent: v3(extent),
+            far: 50.0,
+        }
+    }
+
+    /// The table of `probes` in slot order, ranked as the shader reads them.
+    fn table_of(probes: &[ReflectionProbe]) -> Vec<f32> {
+        let rows: Vec<(usize, usize)> = (0..probes.len()).map(|index| (index, index)).collect();
+        reflection_probes::table_floats(probes, &rows)
+    }
+
+    /// The influence weight, in f64: 0 outside, else the smoothstep of the distance in from the
+    /// nearest face over `blend` (1 for a blend of 0).
+    fn weight_of(probe: &ReflectionProbe, world: [f64; 3]) -> f64 {
+        let (c, e) =
+            ([probe.center.x, probe.center.y, probe.center.z], [probe.extent.x, probe.extent.y, probe.extent.z]);
+        let edge = (0..3).map(|a| f64::from(e[a]) - (world[a] - f64::from(c[a])).abs()).fold(f64::INFINITY, f64::min);
+        if edge <= 0.0 {
+            return 0.0;
+        }
+        let t = if probe.blend > 0.0 { (edge / f64::from(probe.blend)).clamp(0.0, 1.0) } else { 1.0 };
+        t * t * (3.0 - 2.0 * t)
+    }
+
+    /// The coverage of `probes` (best priority first, equal priorities blending), as the shader
+    /// takes it: each priority covers 1 - the product of its misses, of what the higher left.
+    /// At most four probes with a weight count.
+    fn coverage_of(probes: &[ReflectionProbe], world: [f64; 3]) -> f64 {
+        let mut order: Vec<&ReflectionProbe> = probes.iter().collect();
+        order.sort_by_key(|probe| (std::cmp::Reverse(probe.priority), probe.id));
+        let (mut remaining, mut missed, mut weight, mut priority, mut used) = (1.0, 1.0, 0.0, None, 0);
+        for probe in order {
+            let w = weight_of(probe, world);
+            if w <= 0.0 {
+                continue;
+            }
+            if used >= 4 {
+                break;
+            }
+            used += 1;
+            if priority != Some(probe.priority) {
+                if weight > 0.0 {
+                    remaining *= missed;
+                }
+                (missed, weight, priority) = (1.0, 0.0, Some(probe.priority));
+            }
+            weight += w;
+            missed *= 1.0 - w;
+        }
+        if weight > 0.0 {
+            remaining *= missed;
+        }
+        1.0 - remaining
+    }
+
+    fn world_at(x: u32, y: u32) -> [f64; 3] {
+        // At the pixel's middle, as `position` is.
+        let longitude = (f64::from(x) + 0.5) / f64::from(SIDE) * std::f64::consts::TAU;
+        let up = 1.0 - 2.0 * (f64::from(y) + 0.5) / f64::from(SIDE);
+        let ring = (1.0 - up * up).sqrt();
+        [ring * longitude.cos(), up, ring * longitude.sin()]
+    }
+
+    #[test]
+    fn box_projection_lands_where_the_reflected_ray_leaves_the_box() {
+        let Some((device, queue)) = device() else { return };
+        let mut probe = rp(1, 0, [1.0, 0.5, 0.0], [4.0, 2.0, 3.0], 0.0);
+        probe.position = v3([1.5, 0.25, -0.5]);
+        probe.parallax_center = v3([0.0, 0.5, 0.25]);
+        probe.parallax_extent = v3([5.0, 2.5, 4.0]);
+        let table = table_of(&[probe]);
+        // The surface point is inside the box, a different place each pixel's direction.
+        let got = probe_full(
+            &device,
+            &queue,
+            &Sky::default(),
+            &vector(0.0, 0.0, 0.0),
+            (&ProbeVolume::default(), &[]),
+            Some(&table),
+            "return vec4f(box_projected(reflection_probes.probes[0], direction * 0.5 + vec3f(0.2, 0.1, -0.3), direction), 1.0);",
+        );
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let d = world_at(x, y);
+                let world = [d[0] * 0.5 + 0.2, d[1] * 0.5 + 0.1, d[2] * 0.5 - 0.3];
+                let (centre, half): ([f64; 3], [f64; 3]) = ([0.0, 0.5, 0.25], [5.0, 2.5, 4.0]);
+                // The slab method in f64: the nearest face the ray leaves through.
+                let along = (0..3)
+                    .filter(|&a| d[a].abs() > 1e-9)
+                    .map(|a| ((centre[a] + half[a].copysign(d[a])) - world[a]) / d[a])
+                    .fold(f64::INFINITY, f64::min);
+                let hit: [f64; 3] = std::array::from_fn(|a| world[a] + d[a] * along);
+                // The hit is on a face of the box, and no farther along would stay inside.
+                let on_face = (0..3).any(|a| ((hit[a] - centre[a]).abs() - half[a]).abs() < 1e-9);
+                assert!(on_face && (0..3).all(|a| (hit[a] - centre[a]).abs() <= half[a] + 1e-9));
+                let want: [f64; 3] = std::array::from_fn(|a| hit[a] - [1.5, 0.25, -0.5][a]);
+                let at = got[(y * SIDE + x) as usize];
+                for a in 0..3 {
+                    assert!((f64::from(at[a]) - want[a]).abs() < 1e-3, "({x},{y}) axis {a}: {} vs {}", at[a], want[a]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn influence_weights_fade_smoothly_and_combine_by_priority() {
+        let Some((device, queue)) = device() else { return };
+        // Two equal priorities overlapping, a higher one inside them, and one far away.
+        // In the order the table keeps: priority, highest first, then id.
+        let probes = [
+            rp(3, 2, [0.0, 0.0, 0.0], [0.6, 0.6, 0.6], 0.4),
+            rp(4, 1, [9.0, 0.0, 0.0], [1.0, 1.0, 1.0], 0.0),
+            rp(1, 0, [-1.0, 0.0, 0.0], [1.5, 1.5, 1.5], 1.0),
+            rp(2, 0, [1.0, 0.0, 0.0], [1.5, 1.5, 1.5], 0.5),
+        ];
+        let table = table_of(&probes);
+        let got = probe_full(
+            &device,
+            &queue,
+            &Sky::default(),
+            &vector(0.0, 0.0, 0.0),
+            (&ProbeVolume::default(), &[]),
+            Some(&table),
+            "let c = local_reflection(direction * 1.6, direction, 0.5); return vec4f(c.a, reflection_weight(reflection_probes.probes[2], direction * 1.6), reflection_weight(reflection_probes.probes[0], direction * 1.6), 1.0);",
+        );
+        let mut inside = 0;
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let d = world_at(x, y);
+                let world = d.map(|v| v * 1.6);
+                let at = got[(y * SIDE + x) as usize];
+                let want = coverage_of(&probes, world);
+                assert!((f64::from(at[0]) - want).abs() < 2e-4, "coverage at ({x},{y}): {} vs {want}", at[0]);
+                assert!((0.0..=1.0 + 1e-6).contains(&f64::from(at[0])));
+                assert!((f64::from(at[1]) - weight_of(&probes[2], world)).abs() < 2e-4);
+                assert!((f64::from(at[2]) - weight_of(&probes[0], world)).abs() < 2e-4);
+                inside += usize::from(want > 0.0);
+            }
+        }
+        assert!(inside > 40, "the boxes cover some of the sphere");
+    }
+
+    #[test]
+    fn a_weight_is_smooth_across_a_box_and_its_blend() {
+        // Moving a point straight in through a face: the weight rises monotonically from 0 to
+        // 1 over the blend, with no step anywhere (hard edges aside) and a zero slope at both ends.
+        let probe = rp(1, 0, [0.0; 3], [2.0, 2.0, 2.0], 0.8);
+        let mut last = 0.0;
+        let mut biggest_step = 0.0f64;
+        for step in 0..=400 {
+            let x = 2.0 - f64::from(step) * 0.005;
+            let w = weight_of(&probe, [x, 0.0, 0.0]);
+            assert!(w >= last - 1e-12, "monotonic");
+            biggest_step = biggest_step.max(w - last);
+            last = w;
+        }
+        assert_eq!(last, 1.0);
+        assert!(biggest_step < 0.03, "no jump: {biggest_step}");
     }
 }
 

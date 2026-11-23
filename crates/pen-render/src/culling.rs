@@ -12,8 +12,9 @@ use pen_protocol::Matrix;
 use crate::matrix::{multiply, narrow};
 
 /// The most views a frame tests its draws against: the camera's, up to four
-/// sun shadow maps' and up to `MAX_LOCAL_FACES` faces of local lights' maps.
-pub(crate) const MAX_VIEWS: usize = 1 + 4 + crate::local_shadows::MAX_FACES;
+/// sun shadow maps' and up to `MAX_LOCAL_FACES` faces of local lights' maps, and
+/// a reflection probe's capture.
+pub(crate) const MAX_VIEWS: usize = 1 + 4 + crate::local_shadows::MAX_FACES + 1;
 
 /// Which views see something, a bit each, the camera's first.
 pub(crate) type ViewMask = u32;

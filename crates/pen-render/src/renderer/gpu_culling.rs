@@ -28,7 +28,7 @@ const BATCH_WORDS: usize = 16;
 // An indirect draw's arguments, in words.
 const DRAW_WORDS: usize = 5;
 // The shader's `planes` array holds six planes for each of the views.
-const _: () = assert!(MAX_VIEWS == 23, "cull.wgsl's planes array is 6 * MAX_VIEWS");
+const _: () = assert!(MAX_VIEWS == 24, "cull.wgsl's planes array is 6 * MAX_VIEWS");
 
 // The views uniform: four words, the camera's row, six planes a view.
 const UNIFORM_WORDS: usize = 8 + 4 * 6 * MAX_VIEWS;

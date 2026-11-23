@@ -348,6 +348,81 @@ counts match what the buffer holds. Screen-space occlusion still darkens the
 whole picture after the scene, so sky light and reflections are occluded with
 the rest.
 
+### Reflections beyond the sky
+
+`sky_reflection(world, normal, view, roughness, f0)` is the one entry point; it
+takes the prefiltered sky cube, lays the local reflection probes over it where
+the surface is inside their boxes, and lays screen-space reflections over both
+by their confidence. `surface_ambient` calls it, so materials that call
+`surface_ambient` need no change.
+
+**Reflection probes** (`environment/reflection_probes.rs`, `probe_finalise.wgsl`,
+`probe_filter.wgsl`; the packet's `reflection_probes`). A probe is a position, an
+influence box (centre, half size, blend distance), a parallax box, a priority,
+a stable id, a revision and a capture flag. The host keeps `SLOTS` (8) cubes of
+128 texels a face and six GGX levels in one cube array (binding 10, the table of
+probes at 11). Which probes hold slots: priority first, then nearness of the
+box to the camera (a held probe counts as 20% nearer: hysteresis), then id; the
+same inputs always pick the same probes, and a dropped probe's slot goes to
+the best newcomer. A cube is drawn when its probe has none, its revision
+differs from the one it holds, or `capture` rises (not while it stays up), at
+`reflection.budget` faces a frame, one probe at a time (cubeless first, then in
+rank order), and not while assets are loading or a draw it would show is not
+ready. Each face is the frame's own opaque draws seen from the probe by a 90
+degree camera, through the same pipelines at the frame's sample count, lit by
+the sun with the frame's shadow maps, by the lights that reach the probe
+(`Clusters::update_one`: one cluster) and by the sky and the diffuse probes (so
+captures bounce light from other probes' cubes). Culling has one more view for
+it, a box round the probe (`culling.rs`, `MAX_VIEWS` 24), which every draw may be
+in. A pass finishes the face (`probe_finalise.wgsl`: the draw's alpha, the share
+of the sky, is filled with the sky cube times its tint; mirrored, because a
+right-handed camera sees a cube's left and right swapped) into a scratch cube;
+with the sixth face the scratch cube is halved to a texel and filtered into
+the slot's levels (filtered importance sampling from the matching level), in
+the same frame, so the slot keeps the old cube until the new one is whole.
+Limits: the captures use the frame's sun maps, which are fit to the camera, so
+a probe far from it sees the sun unshadowed outside them; no fog or atmosphere,
+particles or translucent surfaces; no contact shadows. Shading
+(`local_reflection`): up to four probes with weight, by priority groups, highest
+first; within a priority the probes blend by their weights, covering
+`1 - product(1 - w)`, which takes that share of what the higher priorities left;
+the sky shows through the rest. A probe's weight is the smoothstep of the
+distance to the nearest face of its box over its blend (1 for a blend of 0).
+Lookups are box-projected onto the parallax box (the ray leaves the box
+at `p + r t`, the lookup is that point minus the capture point); where
+the box does not project (a half size of 0 or less), the direction is used as
+it is. Brightness: a cube keeps, in its alpha, the mean light of the diffuse
+probe lattice (or the sky's, without one) at its position when it was drawn
+(`ambient_mean`, the constant SH term); the shader scales what it shows by
+the mean now over the mean then, clamped to a factor of 4 either way, so a cube
+captured under other light does not glow after the game re-bakes the lattice.
+That scales the ambient share of the cube alone; light from the sun and the
+lights stays as captured, so recapture (`revision`) when they change a lot.
+
+**Screen-space reflections** (`quality.ssr` 1 low, 2 high; `renderer/reflections.rs`,
+`ssr_*` in environment.wgsl). They need TAA and turn it on (the noise and the
+history are TAA's), and a perspective camera. The depth is the camera's
+casters drawn once more depth only (the contact-shadow pass, now two layers of
+one array, this frame's and last frame's: bindings 9 and 12); the colour a ray
+meets is last frame's TAA output at the point's reprojection (binding 13), so
+a hit costs nothing to shade. In the material's own fragment shader, a ray (jittered through the
+GGX lobe by a per-pixel, per-frame noise) is marched in the pixels it crosses,
+linearly (16 or 32 steps at a stride that spans the visible part of the ray) with
+the ray's depth interpolated perspective-correctly, then halved 4 or 6 times
+between the last step in front and the first behind; a hit must lie within
+a thickness (4% of its distance from the eye, plus what a step crosses) of the
+ray. The surface's normal is rebuilt from the depth around the hit, and a hit
+whose normal faces away from the ray is dropped (a back face). Confidence is
+the product of: the screen edge (the hit's distance to the border over 8% of the
+picture), the ray's length against its reach (20 or 40 world units, fading over the last
+40%), roughness (1 to 0.5, gone at 0.8) and history (last frame's depth at the
+reprojected point must be the point's depth within 2 to 6%; else the hit is
+dropped: a disocclusion or a mover). A mover's reflection lags a frame (there are no
+motion vectors of the hit). The result mixes over the probe and sky reflection
+by that confidence; TAA averages the rest. Casters only: a material that does not
+cast shadows is not in the depth, so it is neither hit nor reflecting by march.
+Without `quality.ssr` and probes the output is what it was before.
+
 ### Exposure and grading
 
 The frame's `exposure` and `grade` (header groups, defaults that change

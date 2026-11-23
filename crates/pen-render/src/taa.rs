@@ -71,6 +71,11 @@ pub(crate) struct Memory {
 }
 
 impl Memory {
+    /// The last frame's view-projection, unjittered, if there was one.
+    pub fn previous(&self) -> Option<Matrix> {
+        self.previous
+    }
+
     /// Which history texture this frame reads; it draws into the other.
     pub fn read(&self) -> usize {
         usize::from(self.frames % 2 == 1)

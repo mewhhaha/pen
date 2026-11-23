@@ -88,12 +88,17 @@ each layer's matrix, and `ClusterLight::shadow`); `clustered_surface` and
 `clustered_light` use them, with eight taps over a disk, and `local_shadow(light,
 world, normal, way, distance)` gives a light's visibility alone.
 
-Bindings 4 to 8 are the sky as light. A shader that wants it adds
+Bindings 4 to 8, 10 and 11 are the sky as light and the local reflection probes'
+cubes and table; 12 and 13 are the camera's depth (two layers, this frame's and
+last frame's) and last frame's picture for screen-space reflections. A shader
+that wants them adds
 `pen_render::ENVIRONMENT_WGSL`, which declares them and defines
 `ambient_light(world, normal)` (the light all round, to multiply by albedo; the
 flat `ambient` color's replacement: the game's baked probe volume where it sends
-one, blended into the sky's light past its edge), `sky_reflection(normal, view, roughness,
-f0)`, `surface_ambient(world, normal, view, albedo, metallic, roughness)` for
+one, blended into the sky's light past its edge), `sky_reflection(world, normal, view, roughness,
+f0)` (the prefiltered sky, the reflection probes the surface is inside of, with
+box-projected lookups, and the screen-space march, by confidence: see
+`ARCHITECTURE.md`), `surface_ambient(world, normal, view, albedo, metallic, roughness)` for
 both together, and `specular_occlusion`. A game that sends no coefficients gets
 its flat `ambient` from `ambient_light` and no reflections. The point and spot
 lights of `LIGHTS_WGSL` also have `clustered_surface(world, normal, view,

@@ -71,10 +71,24 @@ pub(super) struct ShadowMaps {
     pub(super) all: wgpu::TextureView,
 }
 
-/// The camera's depth, for contact shadows.
+/// The camera's depth, for contact shadows and screen-space reflections: two
+/// layers, this frame's and last frame's turn about.
 pub(super) struct ContactDepth {
-    view: wgpu::TextureView,
+    layers: [wgpu::TextureView; 2],
+    all: wgpu::TextureView,
     size: (u32, u32),
+}
+
+/// What a scene bind group binds that changes: the maps, the layer of them the
+/// game's binding is, the camera's depth and its layer, and the frame whose
+/// picture screen-space reflections read (0 for none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SceneKey {
+    map: u64,
+    layer: usize,
+    contact: u64,
+    contact_layer: usize,
+    picture: u64,
 }
 
 /// The local lights' faces, and which light's what each layer holds.
@@ -116,6 +130,14 @@ fn depth_array(device: &wgpu::Device, label: &str, texels: u32, layers: u32) -> 
     ShadowMaps { texture, layers, all }
 }
 
+/// What a scene group reads of the screen-space reflections: the camera's
+/// depth, this frame's and last frame's (a 2D array view), and last frame's
+/// picture.
+pub(super) struct Screen<'a> {
+    pub depth: &'a wgpu::TextureView,
+    pub picture: &'a wgpu::TextureView,
+}
+
 /// A scene bind group: its uniform, the game's map (`game`, else the first
 /// layer of `maps`), the comparison sampler, every map and the camera's
 /// depth (`contact`, else the stand-in's first layer).
@@ -128,9 +150,10 @@ fn scene_group(
     game: Option<&wgpu::TextureView>,
     contact: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
-    sky: (&Environment, &wgpu::Buffer),
+    sky: (&Environment, &wgpu::Buffer, &wgpu::Buffer),
+    screen: &Screen<'_>,
 ) -> wgpu::BindGroup {
-    let [cube, table, sky_sampler, light, probes] = sky.0.entries(sky.1);
+    let [cube, table, sky_sampler, light, probes, cubes, reflection_table] = sky.0.entries_with(sky.1, sky.2);
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("scene"),
         layout,
@@ -140,6 +163,10 @@ fn scene_group(
             sky_sampler,
             light,
             probes,
+            cubes,
+            reflection_table,
+            wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(screen.depth) },
+            wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(screen.picture) },
             wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -165,6 +192,18 @@ impl State {
                 ..Default::default()
             });
             let stand_in = depth_array(device, "shadow stand-in", 1, 1);
+            let blank = device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some("no last picture"),
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default());
             // The passes that draw into maps bind the stand-in, as they draw into the real ones.
             let (uniforms, groups) = (0..PASSES)
                 .map(|_| {
@@ -177,7 +216,8 @@ impl State {
                         None,
                         &stand_in.layers[0],
                         &sampler,
-                        (environment, environment.empty()),
+                        (environment, environment.empty(), environment.empty_probes()),
+                        &Screen { depth: &stand_in.all, picture: &blank },
                     );
                     (uniform, group)
                 })
@@ -192,6 +232,9 @@ impl State {
                 contact: None,
                 contact_id: 0,
                 contact_serial: 0,
+                contact_layer: 0,
+                contact_frames: 0,
+                blank,
                 local: None,
             }
         })
@@ -212,7 +255,8 @@ impl State {
             None,
             &resources.stand_in.layers[0],
             &resources.sampler,
-            (&self.environment, light),
+            (&self.environment, light, self.environment.empty_probes()),
+            &Screen { depth: &resources.stand_in.all, picture: &resources.blank },
         )
     }
 
@@ -295,43 +339,78 @@ impl State {
 
     /// The scene's bind group, made again when the maps it reads changed.
     pub(super) fn bind_scene(&mut self, sun: bool, count: usize) {
-        let bound = if sun {
-            let resources = self.shadow_resources();
-            (resources.map_id, count.max(1) - 1, resources.contact_id)
-        } else {
-            (0, 0, self.shadow_resources().contact_id)
+        let picture = self.reflected.as_ref().map_or(0, |(_, _, frame)| *frame);
+        let resources = self.shadow_resources();
+        let bound = SceneKey {
+            map: if sun { resources.map_id } else { 0 },
+            layer: if sun { count.max(1) - 1 } else { 0 },
+            contact: resources.contact_id,
+            contact_layer: resources.contact_layer,
+            picture,
         };
-        if self.scene_group.as_ref().is_none_or(|(_, map)| *map != bound) {
+        if self.scene_group.as_ref().is_none_or(|(_, key)| *key != bound) {
             let resources = self.shadows.as_ref().unwrap();
-            let maps = resources.maps.as_ref().filter(|_| bound.0 != 0);
-            let contact = resources.contact.as_ref().filter(|_| bound.2 != 0);
+            let maps = resources.maps.as_ref().filter(|_| bound.map != 0);
+            let contact = resources.contact.as_ref().filter(|_| bound.contact != 0);
+            let history = self.reflected.as_ref().map(|(view, _, _)| view);
             let group = scene_group(
                 &self.device,
                 &self.context.scene_group,
                 &self.scene_uniform,
                 maps.unwrap_or(&resources.stand_in),
-                maps.map(|maps| &maps.layers[bound.1]),
-                contact.map_or(&resources.stand_in.layers[0], |contact| &contact.view),
+                maps.map(|maps| &maps.layers[bound.layer]),
+                contact.map_or(&resources.stand_in.layers[0], |contact| &contact.layers[bound.contact_layer]),
                 &resources.sampler,
-                (&self.environment, self.environment.light()),
+                (&self.environment, self.environment.light(), self.environment.probe_table()),
+                &Screen {
+                    depth: contact.map_or(&resources.stand_in.all, |contact| &contact.all),
+                    picture: history.unwrap_or(&resources.blank),
+                },
             );
             self.scene_group = Some((group, bound));
         }
     }
 
+    /// The scene bind group the probes' captures draw with: `uniform` as the
+    /// scene, the sun's maps as the frame's are, but lit by the sky without
+    /// screen-space reflections, with no contact depth and none of the
+    /// camera's picture.
+    pub(super) fn capture_scene(&mut self, uniform: &wgpu::Buffer) -> wgpu::BindGroup {
+        let device = self.device.clone();
+        let layout = self.context.scene_group.clone();
+        let (sun, count) = (self.cascades.1 > 0, self.cascades.1);
+        self.shadow_resources();
+        let resources = self.shadows.as_ref().unwrap();
+        let maps = resources.maps.as_ref().filter(|_| sun);
+        scene_group(
+            &device,
+            &layout,
+            uniform,
+            maps.unwrap_or(&resources.stand_in),
+            maps.map(|maps| &maps.layers[count.max(1) - 1]),
+            &resources.stand_in.layers[0],
+            &resources.sampler,
+            (&self.environment, self.environment.capture_light(), self.environment.probe_table()),
+            &Screen { depth: &resources.stand_in.all, picture: &resources.blank },
+        )
+    }
+
     /// Makes (or drops) the camera's depth texture for a scene of `size`
-    /// pixels, as `frame` asks for contact shadows.
-    pub(super) fn prepare_contact(&mut self, frame: &RenderFrame, size: (u32, u32)) {
-        let wanted = self.cascades.1 > 0 && frame.shadow.contact > 0 && frame.projection[11] < -0.5;
+    /// pixels, as `frame` asks for contact shadows (`contact`) or
+    /// screen-space reflections (`reflected`), and turns to its other layer.
+    pub(super) fn prepare_contact(&mut self, frame: &RenderFrame, size: (u32, u32), reflected: bool) {
+        let perspective = frame.projection[11] < -0.5;
+        let wanted = (self.cascades.1 > 0 && frame.shadow.contact > 0 && perspective) || (reflected && perspective);
         let device = self.device.clone();
         let resources = self.shadow_resources();
         if !wanted {
             resources.contact_id = 0;
+            resources.contact_frames = 0;
         } else {
             if resources.contact.as_ref().is_none_or(|contact| contact.size != size) {
                 let texture = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("contact depth"),
-                    size: wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 2 },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -339,11 +418,25 @@ impl State {
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 });
-                let view = texture.create_view(&Default::default());
-                resources.contact = Some(ContactDepth { view, size });
+                let layer = |index: u32| {
+                    texture.create_view(&wgpu::TextureViewDescriptor {
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        base_array_layer: index,
+                        array_layer_count: Some(1),
+                        ..Default::default()
+                    })
+                };
+                let all = texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2Array),
+                    ..Default::default()
+                });
+                resources.contact = Some(ContactDepth { layers: [layer(0), layer(1)], all, size });
                 resources.contact_serial += 1;
+                resources.contact_frames = 0;
             }
             resources.contact_id = resources.contact_serial;
+            resources.contact_layer = 1 - resources.contact_layer;
+            resources.contact_frames += 1;
         }
         let (sun, count) = (self.cascades.1 > 0, self.cascades.1);
         self.bind_scene(sun, count);
@@ -547,7 +640,7 @@ impl State {
                 color_attachments: &[],
                 timestamp_writes: self.timer.pass(Span::Shadow),
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &contact.view,
+                    view: &contact.layers[shadows.contact_layer],
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),

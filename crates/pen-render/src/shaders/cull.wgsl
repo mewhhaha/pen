@@ -49,7 +49,7 @@ struct Cull {
   // The camera's view-projection row that gives a point's w.
   row: vec4f,
   // Six planes a view, pointing in, normals of unit length.
-  planes: array<vec4f, 138>,
+  planes: array<vec4f, 144>,
 };
 
 @group(0) @binding(0) var<uniform> cull: Cull;

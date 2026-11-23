@@ -165,6 +165,20 @@ type Probe is data = $Probe {
   valid: F32,
 }
 
+type ReflectionProbe is data = $ReflectionProbe {
+  id: U32,
+  revision: U32,
+  priority: U32,
+  capture: Bool,
+  position: Vector,
+  center: Vector,
+  extent: Vector,
+  blend: F32,
+  parallax_center: Vector,
+  parallax_extent: Vector,
+  far: F32,
+}
+
 type Listener is data = $Listener {
   position: Vector,
   forward: Vector,
@@ -265,6 +279,7 @@ type Quality is data = $Quality {
   effects: Bool,
   bloom: Bool,
   taa: Bool,
+  ssr: U32,
 }
 
 type Sky is data = $Sky {
@@ -314,6 +329,10 @@ type ProbeVolume is data = $ProbeVolume {
 type Clouds is data = $Clouds {
   cover: F32,
   drift: Drift,
+}
+
+type Reflection is data = $Reflection {
+  budget: U32,
 }
 
 type Exposure is data = $Exposure {
@@ -384,4 +403,5 @@ type RenderHeader = {
   retained_after: U32,
   exposure: Exposure,
   grade: Grade,
+  reflection: Reflection,
 }

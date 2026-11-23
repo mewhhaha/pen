@@ -24,6 +24,7 @@ mod instance_upload;
 mod materials;
 mod particles;
 pub(crate) mod readback;
+mod reflections;
 mod resolution;
 #[cfg(test)]
 mod shadow_tests;
@@ -238,6 +239,12 @@ struct Shadows {
     contact: Option<shadows::ContactDepth>,
     contact_id: u64,
     contact_serial: u64,
+    /// Which of `contact`'s two layers this frame draws (last frame's holds
+    /// the other), and how many frames it has been drawn.
+    contact_layer: usize,
+    contact_frames: u64,
+    /// A picture of one texel to bind where there is no last frame to read.
+    blank: wgpu::TextureView,
     /// The local lights' map faces, and what each holds.
     local: Option<shadows::LocalMaps>,
 }
@@ -399,6 +406,10 @@ struct Scratch {
     /// what picks levels of detail.
     views: Views,
     detail: Detail,
+    /// The bit of the view a reflection probe's capture sees by (0 for none),
+    /// and the ready entries (indices) it draws.
+    capture_bit: ViewMask,
+    capture_list: Vec<usize>,
     /// How each mesh and material's draws go, and which of those is each's.
     choices: Vec<Choice>,
     chosen: HashMap<(u32, u32), u32>,
@@ -573,11 +584,19 @@ pub(crate) struct State {
     shadows: Option<Shadows>,
     // The frame's point and spot lights, sorted into clusters of its view.
     clusters: crate::lights::Clusters,
+    // The lights as a reflection probe's capture sees them, and its faces' scene uniforms.
+    capture_clusters: crate::lights::Clusters,
+    capture_uniforms: Vec<wgpu::Buffer>,
     // Where frames for an HDR surface that needs decoding draw, shared with
     // the renderers drawing over this one's frames.
     screen: crate::display::SharedScreen,
     // The scene's bind group, and the maps, the layer and the contact depth it binds.
-    scene_group: Option<(wgpu::BindGroup, (u64, usize, u64))>,
+    scene_group: Option<(wgpu::BindGroup, shadows::SceneKey)>,
+    // Last frame's resolved picture, which screen-space reflections read, the
+    // view-projection it was seen through and which frame it is for; and this
+    // frame's capture of a reflection probe.
+    reflected: Option<(wgpu::TextureView, Matrix, u64)>,
+    capture: Option<crate::environment::Step>,
     // The frame's sun shadow maps, nearest first, and how many.
     cascades: ([Cascade; MAX_CASCADES], usize),
     // The point and spot lights that cast this frame, and their faces.
@@ -708,6 +727,31 @@ impl State {
                 crate::environment::layout_entries()[2],
                 crate::environment::layout_entries()[3],
                 crate::environment::layout_entries()[4],
+                // The reflection probes' cubes and their table.
+                crate::environment::layout_entries()[5],
+                crate::environment::layout_entries()[6],
+                // The depth of this frame and last, and last frame's picture,
+                // which screen-space reflections read.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
                 // The camera's depth, drawn for contact shadows (shadows.rs).
                 wgpu::BindGroupLayoutEntry {
                     binding: 9,
@@ -866,8 +910,12 @@ impl State {
             scene_uniform: uniform_buffer(&device, "scene", SCENE_BYTES),
             shadows: None,
             clusters: crate::lights::Clusters::new(&device, &context.lights_group),
+            capture_clusters: crate::lights::Clusters::new(&device, &context.lights_group),
+            capture_uniforms: Vec::new(),
             screen,
             scene_group: None,
+            reflected: None,
+            capture: None,
             cascades: ([Cascade::NONE; MAX_CASCADES], 0),
             local: Default::default(),
             stride,

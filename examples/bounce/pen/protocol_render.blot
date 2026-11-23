@@ -202,6 +202,23 @@ func encode_probe (probe: types.Probe) =>
     probe.sh8.x, probe.sh8.y, probe.sh8.z, probe.valid,
   ]
 
+// ReflectionProbe: A local reflection probe: where it is captured from, the box
+// it lights, and the box its surroundings are projected onto.
+func encode_reflection_probe (reflection_probe: types.ReflectionProbe) =>
+  return #[
+    U32.to_f32 (reflection_probe.id), U32.to_f32 (reflection_probe.revision),
+    U32.to_f32 (reflection_probe.priority), lanes.bit reflection_probe.capture,
+    reflection_probe.position.x, reflection_probe.position.y,
+    reflection_probe.position.z, reflection_probe.center.x,
+    reflection_probe.center.y, reflection_probe.center.z,
+    reflection_probe.extent.x, reflection_probe.extent.y,
+    reflection_probe.extent.z, reflection_probe.blend,
+    reflection_probe.parallax_center.x, reflection_probe.parallax_center.y,
+    reflection_probe.parallax_center.z, reflection_probe.parallax_extent.x,
+    reflection_probe.parallax_extent.y, reflection_probe.parallax_extent.z,
+    reflection_probe.far,
+  ]
+
 // Listener: A listener: where it is, the way it faces and its up, in world
 // units.
 func encode_listener (listener: types.Listener) =>
@@ -279,6 +296,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   let lights_count: U32 = collections.lights.length
   let cascades_count: U32 = collections.cascades.length
   let probes_count: U32 = collections.probes.length
+  let reflection_probes_count: U32 = collections.reflection_probes.length
   let listener_count: U32 = collections.listener.length
   let panners_count: U32 = collections.panners.length
   let instances_count: U32 = collections.instances.length
@@ -457,6 +475,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (U32.to_f32 lights_count)
   @storage.push encoded (U32.to_f32 cascades_count)
   @storage.push encoded (U32.to_f32 probes_count)
+  @storage.push encoded (U32.to_f32 reflection_probes_count)
   @storage.push encoded (U32.to_f32 listener_count)
   @storage.push encoded (U32.to_f32 panners_count)
   @storage.push encoded (lanes.bit packet.loading)
@@ -502,6 +521,8 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (packet.grade.lut_weight)
   @storage.push encoded (packet.grade.vignette)
   @storage.push encoded (packet.grade.vignette_radius)
+  @storage.push encoded (U32.to_f32 (packet.quality.ssr))
+  @storage.push encoded (U32.to_f32 (packet.reflection.budget))
   let state_start = encoded.length
   for i in 0 .. state_count:
     let source = collections.state[i]
@@ -906,6 +927,30 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     @storage.push encoded (probe.sh8.y)
     @storage.push encoded (probe.sh8.z)
     @storage.push encoded (probe.valid)
+  for i in 0 .. reflection_probes_count:
+    let source = collections.reflection_probes[i]
+    let reflection_probe: types.ReflectionProbe = project.reflection_probe context source
+    @storage.push encoded (U32.to_f32 (reflection_probe.id))
+    @storage.push encoded (U32.to_f32 (reflection_probe.revision))
+    @storage.push encoded (U32.to_f32 (reflection_probe.priority))
+    @storage.push encoded (lanes.bit reflection_probe.capture)
+    @storage.push encoded (reflection_probe.position.x)
+    @storage.push encoded (reflection_probe.position.y)
+    @storage.push encoded (reflection_probe.position.z)
+    @storage.push encoded (reflection_probe.center.x)
+    @storage.push encoded (reflection_probe.center.y)
+    @storage.push encoded (reflection_probe.center.z)
+    @storage.push encoded (reflection_probe.extent.x)
+    @storage.push encoded (reflection_probe.extent.y)
+    @storage.push encoded (reflection_probe.extent.z)
+    @storage.push encoded (reflection_probe.blend)
+    @storage.push encoded (reflection_probe.parallax_center.x)
+    @storage.push encoded (reflection_probe.parallax_center.y)
+    @storage.push encoded (reflection_probe.parallax_center.z)
+    @storage.push encoded (reflection_probe.parallax_extent.x)
+    @storage.push encoded (reflection_probe.parallax_extent.y)
+    @storage.push encoded (reflection_probe.parallax_extent.z)
+    @storage.push encoded (reflection_probe.far)
   for i in 0 .. listener_count:
     let source = collections.listener[i]
     let listener: types.Listener = project.listener context source
@@ -1003,6 +1048,7 @@ func measure_render_floats collections -> project -> context =>
   let lights_count: U32 = collections.lights.length
   let cascades_count: U32 = collections.cascades.length
   let probes_count: U32 = collections.probes.length
+  let reflection_probes_count: U32 = collections.reflection_probes.length
   let listener_count: U32 = collections.listener.length
   let panners_count: U32 = collections.panners.length
   let instances_count: U32 = collections.instances.length
@@ -1044,6 +1090,7 @@ func measure_render_floats collections -> project -> context =>
   total := self + lights_count * 14
   total := self + cascades_count * 18
   total := self + probes_count * 28
+  total := self + reflection_probes_count * 21
   total := self + listener_count * 9
   total := self + panners_count * 15
   total := self + instances_count * 26
@@ -1241,49 +1288,52 @@ func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (
   encoded[170] := 0.0
   encoded[171] := 0.0
   encoded[172] := 0.0
-  encoded[173] := lanes.bit packet.loading
-  encoded[174] := lanes.bit packet.show_captions
-  encoded[175] := lanes.bit packet.retained_enabled
-  encoded[176] := lanes.bit packet.retained_reset
-  encoded[177] := U32.to_f32 (packet.retained_after)
-  encoded[178] := 0.0
+  encoded[173] := 0.0
+  encoded[174] := lanes.bit packet.loading
+  encoded[175] := lanes.bit packet.show_captions
+  encoded[176] := lanes.bit packet.retained_enabled
+  encoded[177] := lanes.bit packet.retained_reset
+  encoded[178] := U32.to_f32 (packet.retained_after)
   encoded[179] := 0.0
-  encoded[180] := lanes.bit packet.exposure.auto
-  encoded[181] := packet.exposure.compensation
-  encoded[182] := packet.exposure.min
-  encoded[183] := packet.exposure.max
-  encoded[184] := packet.exposure.brighten
-  encoded[185] := packet.exposure.darken
-  encoded[186] := packet.exposure.low
-  encoded[187] := packet.exposure.high
-  encoded[188] := packet.exposure.centre
-  encoded[189] := packet.exposure.range_low
-  encoded[190] := packet.exposure.range_high
-  encoded[191] := packet.exposure.target
-  encoded[192] := packet.exposure.dt
-  encoded[193] := lanes.bit packet.exposure.cut
-  encoded[194] := packet.grade.temperature
-  encoded[195] := packet.grade.tint
-  encoded[196] := packet.grade.exposure
-  encoded[197] := packet.grade.contrast
-  encoded[198] := packet.grade.pivot
-  encoded[199] := packet.grade.saturation
-  encoded[200] := packet.grade.vibrance
-  encoded[201] := packet.grade.lift.x
-  encoded[202] := packet.grade.lift.y
-  encoded[203] := packet.grade.lift.z
-  encoded[204] := packet.grade.gamma.x
-  encoded[205] := packet.grade.gamma.y
-  encoded[206] := packet.grade.gamma.z
-  encoded[207] := packet.grade.gain.x
-  encoded[208] := packet.grade.gain.y
-  encoded[209] := packet.grade.gain.z
-  encoded[210] := U32.to_f32 (packet.grade.lut_a)
-  encoded[211] := U32.to_f32 (packet.grade.lut_b)
-  encoded[212] := packet.grade.lut_blend
-  encoded[213] := packet.grade.lut_weight
-  encoded[214] := packet.grade.vignette
-  encoded[215] := packet.grade.vignette_radius
+  encoded[180] := 0.0
+  encoded[181] := lanes.bit packet.exposure.auto
+  encoded[182] := packet.exposure.compensation
+  encoded[183] := packet.exposure.min
+  encoded[184] := packet.exposure.max
+  encoded[185] := packet.exposure.brighten
+  encoded[186] := packet.exposure.darken
+  encoded[187] := packet.exposure.low
+  encoded[188] := packet.exposure.high
+  encoded[189] := packet.exposure.centre
+  encoded[190] := packet.exposure.range_low
+  encoded[191] := packet.exposure.range_high
+  encoded[192] := packet.exposure.target
+  encoded[193] := packet.exposure.dt
+  encoded[194] := lanes.bit packet.exposure.cut
+  encoded[195] := packet.grade.temperature
+  encoded[196] := packet.grade.tint
+  encoded[197] := packet.grade.exposure
+  encoded[198] := packet.grade.contrast
+  encoded[199] := packet.grade.pivot
+  encoded[200] := packet.grade.saturation
+  encoded[201] := packet.grade.vibrance
+  encoded[202] := packet.grade.lift.x
+  encoded[203] := packet.grade.lift.y
+  encoded[204] := packet.grade.lift.z
+  encoded[205] := packet.grade.gamma.x
+  encoded[206] := packet.grade.gamma.y
+  encoded[207] := packet.grade.gamma.z
+  encoded[208] := packet.grade.gain.x
+  encoded[209] := packet.grade.gain.y
+  encoded[210] := packet.grade.gain.z
+  encoded[211] := U32.to_f32 (packet.grade.lut_a)
+  encoded[212] := U32.to_f32 (packet.grade.lut_b)
+  encoded[213] := packet.grade.lut_blend
+  encoded[214] := packet.grade.lut_weight
+  encoded[215] := packet.grade.vignette
+  encoded[216] := packet.grade.vignette_radius
+  encoded[217] := U32.to_f32 (packet.quality.ssr)
+  encoded[218] := U32.to_f32 (packet.reflection.budget)
   let at: U32 = protocol.packet_header_floats
   for draw in draws:
     encoded[at + 0] := U32.to_f32 (draw.mesh)

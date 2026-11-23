@@ -260,6 +260,11 @@
       "doc": "The most light probes one frame may carry (a volume may be larger than a frame's share only by sending none: see `probe_volume.revision`)."
     },
     {
+      "limit": "MAX_REFLECTION_PROBES",
+      "value": 64,
+      "doc": "The most reflection probes one frame may publish; the host keeps the nearest and most important few in its cube array (MAX_REFLECTION_SLOTS)."
+    },
+    {
       "limit": "ENGINE_PREFERENCES",
       "value": 64,
       "doc": "Preference events from this index on carry the engine's preferences (ENGINE_PREFERENCE_*); below it, the game's own."
@@ -1614,6 +1619,10 @@
         "type": "Clouds",
         "doc": "Clouds over the scene: how much of the sky they cover, 0 for none, and how far the wind has carried them along x and z."
       },
+      "reflection": {
+        "type": "Reflection",
+        "doc": "How the host keeps local reflection probes up to date: how many cube faces it may draw in one frame."
+      },
       "exposure": {
         "type": "Exposure",
         "doc": "How the camera exposes the frame: a fixed exposure in stops, or auto exposure that meters the scene on the GPU and adapts over time, with the limits and the speeds of the adaptation."
@@ -2160,6 +2169,11 @@
         "section": "probes",
         "of": "count"
       },
+      "reflection_probe_count": {
+        "kind": "size",
+        "section": "reflection_probes",
+        "of": "count"
+      },
       "listener_count": {
         "kind": "size",
         "section": "listener",
@@ -2383,6 +2397,16 @@
         "kind": "f32",
         "default": 0.5,
         "doc": "Where the vignette starts, as a share of the way from the middle to a corner (0 to 1)."
+      },
+      "quality.ssr": {
+        "kind": "count",
+        "max": 2,
+        "doc": "Screen-space reflections of glossy surfaces: 0 off, 1 low (a short march at a coarse step), 2 high (a longer march, finer refinement). They read the last frame's resolved picture and the camera's depth, so they need a perspective camera, and they turn temporal antialiasing on: its history resolves their noise."
+      },
+      "reflection.budget": {
+        "kind": "count",
+        "max": 6,
+        "doc": "The most faces of reflection probe cubes drawn in one frame (6 make a whole probe); a probe whose revision changed, or that asks, is drawn again over as many frames as that takes. 0 draws none: the probes keep what they held."
       }
     },
     "sections": [
@@ -3466,6 +3490,90 @@
           "limit": "MAX_PROBES",
           "value": 16384,
           "doc": "The most light probes one frame may carry."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "reflection_probes",
+        "doc": "Local reflection probes: boxes of the world whose glossy reflections the host draws from the probe's own point of view, as a cube, and blends by how far inside each box a surface is. The host captures a probe when its revision changes (or `capture` rises), within `reflection.budget` faces a frame, and keeps MAX_REFLECTION_SLOTS cubes, dropping the ones least worth keeping.",
+        "record": {
+          "name": "ReflectionProbe",
+          "constant": "REFLECTION_PROBE",
+          "fields": {
+            "id": {
+              "kind": "count",
+              "max": 16777215,
+              "doc": "A number that stays with the probe from frame to frame: its cube is kept under it, and it breaks ties."
+            },
+            "revision": {
+              "kind": "count",
+              "max": 16777215,
+              "doc": "Which state of the surroundings the game wants captured; the host draws the cube again when this differs from the capture it holds."
+            },
+            "priority": {
+              "kind": "count",
+              "max": 255,
+              "doc": "Where boxes overlap, a higher priority takes the surface's reflection before lower ones share it; equal priorities blend."
+            },
+            "capture": {
+              "kind": "flag",
+              "doc": "Asks for a new capture: the host draws the cube again when this rises from 0 to 1."
+            },
+            "position": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": ["x", "y", "z"]
+              },
+              "doc": "Where the cube is drawn from, in world units."
+            },
+            "center": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": ["x", "y", "z"]
+              },
+              "doc": "The middle of the influence box."
+            },
+            "extent": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": ["x", "y", "z"]
+              },
+              "doc": "Half the influence box's size along x, y and z: surfaces inside it reflect this probe."
+            },
+            "blend": {
+              "kind": "f32",
+              "doc": "How far inside the box's faces the probe fades in, from 0 at a face to 1 at that distance; 0 for a hard edge."
+            },
+            "parallax_center": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": ["x", "y", "z"]
+              },
+              "doc": "The middle of the box the surroundings are taken to be, for box projection."
+            },
+            "parallax_extent": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": ["x", "y", "z"]
+              },
+              "doc": "Half the size of the box the cube is projected onto, which should hold the room the probe sits in; any component 0 or less for no projection (the cube is taken as infinitely far)."
+            },
+            "far": {
+              "kind": "f32",
+              "doc": "How far the capture sees: the farthest of its draws, in world units."
+            }
+          },
+          "doc": "A local reflection probe: where it is captured from, the box it lights, and the box its surroundings are projected onto."
+        },
+        "max": {
+          "limit": "MAX_REFLECTION_PROBES",
+          "value": 64,
+          "doc": "The most reflection probes one frame may publish."
         }
       },
       {

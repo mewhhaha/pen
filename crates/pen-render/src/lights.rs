@@ -403,8 +403,61 @@ impl Clusters {
             return;
         }
         let assignment = assign(&frame.lights, &frame.view, &frame.projection);
+        let words = grid(count, &assignment.slicing, size);
+        self.upload(device, queue, &frame.lights, shadows, atlas, &assignment, words);
+    }
+
+    /// Puts the lights that reach within `far` of `position` in one cluster
+    /// that every fragment reads, for what is seen from a point all round
+    /// (a reflection probe's capture), not through the frame's camera.
+    pub fn update_one(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        lights: &[Light],
+        (position, far): ([f32; 3], f32),
+        shadows: &Selection,
+        atlas: Option<(&wgpu::TextureView, u64)>,
+    ) {
+        let count = u32::try_from(lights.len()).unwrap_or(u32::MAX);
+        if count == 0 {
+            queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&[0u32; 12]));
+            return;
+        }
+        let reaching: Vec<u32> = (0u32..)
+            .zip(lights)
+            .filter(|(_, light)| {
+                let apart =
+                    [light.position.x - position[0], light.position.y - position[1], light.position.z - position[2]];
+                let distance = (apart[0] * apart[0] + apart[1] * apart[1] + apart[2] * apart[2]).sqrt();
+                distance <= light.radius + far
+            })
+            .map(|(index, _)| index)
+            .take(PER_CLUSTER as usize)
+            .collect();
+        let assignment = Assignment {
+            ranges: vec![[0, u32::try_from(reaching.len()).unwrap_or(0)]],
+            indices: reaching,
+            slicing: Slicing { near: 0.0, far: 0.0, linear: false, scale: 0.0, bias: 0.0 },
+        };
+        // One tile and one slice, whatever the fragment's position.
+        let words = [1, 1, 1, count, 0, 0, 0, 0, 0, 0, 0, 0];
+        self.upload(device, queue, lights, shadows, atlas, &assignment, words);
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "what the buffers are filled from")]
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        lights: &[Light],
+        shadows: &Selection,
+        atlas: Option<(&wgpu::TextureView, u64)>,
+        assignment: &Assignment,
+        words: [u32; 12],
+    ) {
         self.data.clear();
-        for (index, light) in frame.lights.iter().enumerate() {
+        for (index, light) in lights.iter().enumerate() {
             let (p, c, d) = (&light.position, &light.color, &light.direction);
             self.data.extend([p.x, p.y, p.z, light.radius, c.x, c.y, c.z, light.outer, d.x, d.y, d.z, light.inner]);
             // The light's shadow: its first layer (-1 for none), whether it is
@@ -464,7 +517,7 @@ impl Clusters {
             queue.write_buffer(&self.indices, 0, index_bytes);
         }
         queue.write_buffer(&self.ranges, 0, bytemuck::cast_slice(&assignment.ranges));
-        queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&grid(count, &assignment.slicing, size)));
+        queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&words));
     }
 
     /// The frame's lights.

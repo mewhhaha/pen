@@ -53,6 +53,7 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
             effects: false,
             bloom: false,
             taa: false,
+            ssr: 0,
         },
         sky: Sky {
             zenith: zero,
@@ -62,6 +63,8 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
             ..Sky::default()
         },
         probe_volume: ProbeVolume::default(),
+        reflection: Default::default(),
+        reflection_probes: Vec::new(),
         probes: Vec::new(),
         fog: Fog { radius: 0.0, density: 0.0, height: 1.0 },
         clouds: Clouds { cover: 0.0, drift: Drift { x: 0.0, z: 0.0 } },

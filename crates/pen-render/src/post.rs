@@ -242,6 +242,8 @@ struct Targets {
     /// The graph of the passes after the scene; with TAA, one for each
     /// history texture it reads, turn about.
     graphs: Vec<Graph>,
+    /// With TAA, the history textures: the picture each frame resolved to.
+    histories: Option<[wgpu::TextureView; 2]>,
 }
 
 /// The attachments of one frame's scene passes, from `Post::begin`.
@@ -446,6 +448,15 @@ impl Post {
         self.targets.as_ref().map(|targets| targets.graphs[0].names()).unwrap_or_default()
     }
 
+    /// With TAA and a frame before this one: the picture the last frame
+    /// resolved to (what TAA reads as its history, before exposure) and the
+    /// view-projection that frame was seen through, unjittered.
+    pub fn history(&self) -> Option<(wgpu::TextureView, Matrix)> {
+        let histories = self.targets.as_ref()?.histories.as_ref()?;
+        let previous = self.memory.previous()?;
+        Some((histories[self.memory.read()].clone(), previous))
+    }
+
     /// The begun frame's projection, jittered within its pixels, when TAA is
     /// on: the scene draws with it.
     pub fn jittered(&self) -> Option<Matrix> {
@@ -534,8 +545,10 @@ impl Post {
                 log::debug!("passes after the scene: {:?}, {} textures", graph.names(), graph.allocations());
                 graphs.push(graph);
             }
+            let kept = histories.as_ref().map(|textures| [view(&textures[0]), view(&textures[1])]);
             self.targets = Some(Targets {
                 key,
+                histories: kept,
                 depth: view(&depth),
                 depth_only: depth_only(),
                 multisampled: multisampled.as_ref().map(view),

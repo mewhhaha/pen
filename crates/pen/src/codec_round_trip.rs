@@ -38,8 +38,8 @@ use pen_protocol::boundary::{
 use pen_protocol::{
     Aberration, Bus, Cascade, Catalog, Clouds, Color, Decal, Draw, Drift, Emitter, Exposure, FieldPatch, Fog, Frame,
     GameEvent, Grade, Inset, Instance, InstanceRemoval, Light, Listener, Panner, Pose, Probe, ProbeVolume, Quality,
-    RenderFrame, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode, Vector, Viewport, Voice,
-    service, ui_live, ui_role, ui_state,
+    Reflection, ReflectionProbe, RenderFrame, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode,
+    Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
 };
 
 const HARNESS: &str = include_str!("codec_round_trip.blot");
@@ -608,7 +608,9 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             effects: rng.flag(),
             bloom: rng.flag(),
             taa: rng.flag(),
+            ssr: rng.whole(2),
         },
+        reflection: Reflection { budget: rng.whole(6) },
         sky: Sky {
             zenith: rng.vector(),
             horizon: rng.vector(),
@@ -853,6 +855,22 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 sh7: rng.vector(),
                 sh8: rng.vector(),
                 valid: rng.number(),
+            })
+        },
+        reflection_probes: {
+            let count = rng.count(4);
+            rng.list(count, |rng| ReflectionProbe {
+                id: rng.whole(16_777_215),
+                revision: rng.whole(16_777_215),
+                priority: rng.whole(255),
+                capture: rng.flag(),
+                position: rng.vector(),
+                center: rng.vector(),
+                extent: rng.vector(),
+                blend: rng.number(),
+                parallax_center: rng.vector(),
+                parallax_extent: rng.vector(),
+                far: rng.number(),
             })
         },
         lights: {

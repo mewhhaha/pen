@@ -178,6 +178,11 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
         ],
     };
     RenderFrame {
+        retained_enabled: false,
+        retained_reset: false,
+        retained_after: 0,
+        instances: Vec::new(),
+        instance_removals: Vec::new(),
         hide_cursor: false,
         loading: false,
         show_captions: false,
@@ -202,6 +207,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
             ground: vector(0.3, 0.3, 0.3),
             sun: vector(0.4, 0.8, 0.45),
             night: 0.0,
+            ..Sky::default()
         },
         fog: Fog { radius: 30.0, density: 0.02, height: 10.0 },
         clouds: Clouds { cover: 0.0, drift: Drift { x: 0.0, z: 0.0 } },

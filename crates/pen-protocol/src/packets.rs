@@ -1266,6 +1266,46 @@ pub mod types {
         pub sun: Vector,
         /// 1 at full night, when stars show.
         pub night: f32,
+        /// Per-channel scale turning the sky's zenith, horizon and ground colors into the light
+        /// it gives all round (the radiance behind the sh coefficients and glossy reflections);
+        /// 0 for no reflections.
+        pub tint: Vector,
+        /// Coefficient 0 (real spherical harmonic constant, bands 0 to 2) of the sky's diffuse
+        /// light: what a white surface facing each way shows, in linear color, the cosine lobe
+        /// already applied and divided by pi.
+        pub sh0: Vector,
+        /// Coefficient 1 (real spherical harmonic y, bands 0 to 2) of the sky's diffuse light:
+        /// what a white surface facing each way shows, in linear color, the cosine lobe already
+        /// applied and divided by pi.
+        pub sh1: Vector,
+        /// Coefficient 2 (real spherical harmonic z, bands 0 to 2) of the sky's diffuse light:
+        /// what a white surface facing each way shows, in linear color, the cosine lobe already
+        /// applied and divided by pi.
+        pub sh2: Vector,
+        /// Coefficient 3 (real spherical harmonic x, bands 0 to 2) of the sky's diffuse light:
+        /// what a white surface facing each way shows, in linear color, the cosine lobe already
+        /// applied and divided by pi.
+        pub sh3: Vector,
+        /// Coefficient 4 (real spherical harmonic xy, bands 0 to 2) of the sky's diffuse light:
+        /// what a white surface facing each way shows, in linear color, the cosine lobe already
+        /// applied and divided by pi.
+        pub sh4: Vector,
+        /// Coefficient 5 (real spherical harmonic yz, bands 0 to 2) of the sky's diffuse light:
+        /// what a white surface facing each way shows, in linear color, the cosine lobe already
+        /// applied and divided by pi.
+        pub sh5: Vector,
+        /// Coefficient 6 (real spherical harmonic zz, bands 0 to 2) of the sky's diffuse light:
+        /// what a white surface facing each way shows, in linear color, the cosine lobe already
+        /// applied and divided by pi.
+        pub sh6: Vector,
+        /// Coefficient 7 (real spherical harmonic xz, bands 0 to 2) of the sky's diffuse light:
+        /// what a white surface facing each way shows, in linear color, the cosine lobe already
+        /// applied and divided by pi.
+        pub sh7: Vector,
+        /// Coefficient 8 (real spherical harmonic xx_yy, bands 0 to 2) of the sky's diffuse
+        /// light: what a white surface facing each way shows, in linear color, the cosine lobe
+        /// already applied and divided by pi.
+        pub sh8: Vector,
     }
     /// Mist beyond `radius` of the middle; density 0 for none.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1520,13 +1560,15 @@ pub mod codec {
     /// exit_requested, view16, projection16, clear4, ambient3, light_direction3, light_color3,
     /// aberration2, quality.msaa, quality.fxaa, quality.scale, quality.filtering,
     /// quality.occlusion, quality.sky, quality.effects, sky.zenith3, sky.horizon3, sky.ground3,
-    /// sky.sun3, sky.night, fog.radius, fog.density, fog.height, shadow.view16,
-    /// shadow.projection16, shadow.texel, shadow.texels, blur, quality.bloom, clouds.cover,
-    /// clouds.drift2, hide_cursor, field_count, field_lanes, ui_count, ui_lanes, service_count,
-    /// service_lanes, bus_count, voice_count, pose_count, emitter_count, quality.taa,
-    /// light_count, listener_count, panner_count, loading, show_captions, retained_enabled,
-    /// retained_reset, retained_after, instance_count, instance_removal_count.
-    pub const PACKET_HEADER_FLOATS: usize = 151;
+    /// sky.sun3, sky.night, sky.tint3, sky.sh03, sky.sh13, sky.sh23, sky.sh33, sky.sh43,
+    /// sky.sh53, sky.sh63, sky.sh73, sky.sh83, fog.radius, fog.density, fog.height,
+    /// shadow.view16, shadow.projection16, shadow.texel, shadow.texels, blur, quality.bloom,
+    /// clouds.cover, clouds.drift2, hide_cursor, field_count, field_lanes, ui_count, ui_lanes,
+    /// service_count, service_lanes, bus_count, voice_count, pose_count, emitter_count,
+    /// quality.taa, light_count, listener_count, panner_count, loading, show_captions,
+    /// retained_enabled, retained_reset, retained_after, instance_count,
+    /// instance_removal_count.
+    pub const PACKET_HEADER_FLOATS: usize = 181;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -1621,39 +1663,49 @@ pub mod codec {
             pub const SKY_GROUND: usize = 80;
             pub const SKY_SUN: usize = 83;
             pub const SKY_NIGHT: usize = 86;
-            pub const FOG_RADIUS: usize = 87;
-            pub const FOG_DENSITY: usize = 88;
-            pub const FOG_HEIGHT: usize = 89;
-            pub const SHADOW_VIEW: usize = 90;
-            pub const SHADOW_PROJECTION: usize = 106;
-            pub const SHADOW_TEXEL: usize = 122;
-            pub const SHADOW_TEXELS: usize = 123;
-            pub const BLUR: usize = 124;
-            pub const QUALITY_BLOOM: usize = 125;
-            pub const CLOUDS_COVER: usize = 126;
-            pub const CLOUDS_DRIFT: usize = 127;
-            pub const HIDE_CURSOR: usize = 129;
-            pub const FIELD_COUNT: usize = 130;
-            pub const FIELD_LANES: usize = 131;
-            pub const UI_COUNT: usize = 132;
-            pub const UI_LANES: usize = 133;
-            pub const SERVICE_COUNT: usize = 134;
-            pub const SERVICE_LANES: usize = 135;
-            pub const BUS_COUNT: usize = 136;
-            pub const VOICE_COUNT: usize = 137;
-            pub const POSE_COUNT: usize = 138;
-            pub const EMITTER_COUNT: usize = 139;
-            pub const QUALITY_TAA: usize = 140;
-            pub const LIGHT_COUNT: usize = 141;
-            pub const LISTENER_COUNT: usize = 142;
-            pub const PANNER_COUNT: usize = 143;
-            pub const LOADING: usize = 144;
-            pub const SHOW_CAPTIONS: usize = 145;
-            pub const RETAINED_ENABLED: usize = 146;
-            pub const RETAINED_RESET: usize = 147;
-            pub const RETAINED_AFTER: usize = 148;
-            pub const INSTANCE_COUNT: usize = 149;
-            pub const INSTANCE_REMOVAL_COUNT: usize = 150;
+            pub const SKY_TINT: usize = 87;
+            pub const SKY_SH0: usize = 90;
+            pub const SKY_SH1: usize = 93;
+            pub const SKY_SH2: usize = 96;
+            pub const SKY_SH3: usize = 99;
+            pub const SKY_SH4: usize = 102;
+            pub const SKY_SH5: usize = 105;
+            pub const SKY_SH6: usize = 108;
+            pub const SKY_SH7: usize = 111;
+            pub const SKY_SH8: usize = 114;
+            pub const FOG_RADIUS: usize = 117;
+            pub const FOG_DENSITY: usize = 118;
+            pub const FOG_HEIGHT: usize = 119;
+            pub const SHADOW_VIEW: usize = 120;
+            pub const SHADOW_PROJECTION: usize = 136;
+            pub const SHADOW_TEXEL: usize = 152;
+            pub const SHADOW_TEXELS: usize = 153;
+            pub const BLUR: usize = 154;
+            pub const QUALITY_BLOOM: usize = 155;
+            pub const CLOUDS_COVER: usize = 156;
+            pub const CLOUDS_DRIFT: usize = 157;
+            pub const HIDE_CURSOR: usize = 159;
+            pub const FIELD_COUNT: usize = 160;
+            pub const FIELD_LANES: usize = 161;
+            pub const UI_COUNT: usize = 162;
+            pub const UI_LANES: usize = 163;
+            pub const SERVICE_COUNT: usize = 164;
+            pub const SERVICE_LANES: usize = 165;
+            pub const BUS_COUNT: usize = 166;
+            pub const VOICE_COUNT: usize = 167;
+            pub const POSE_COUNT: usize = 168;
+            pub const EMITTER_COUNT: usize = 169;
+            pub const QUALITY_TAA: usize = 170;
+            pub const LIGHT_COUNT: usize = 171;
+            pub const LISTENER_COUNT: usize = 172;
+            pub const PANNER_COUNT: usize = 173;
+            pub const LOADING: usize = 174;
+            pub const SHOW_CAPTIONS: usize = 175;
+            pub const RETAINED_ENABLED: usize = 176;
+            pub const RETAINED_RESET: usize = 177;
+            pub const RETAINED_AFTER: usize = 178;
+            pub const INSTANCE_COUNT: usize = 179;
+            pub const INSTANCE_REMOVAL_COUNT: usize = 180;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -2300,21 +2352,21 @@ pub mod codec {
         let insets_count = reader.count(9, MAX_INSETS)?;
         let inset_draws_count = reader.count(10, MAX_DRAWS)?;
         let preferences_lanes = reader.count(11, PREFERENCE_FLOATS)?;
-        let fields_count = reader.count(130, MAX_FIELD_PATCHES)?;
-        let fields_lanes = reader.count(131, 16805888)?;
-        let ui_count = reader.count(132, MAX_UI_NODES)?;
-        let ui_lanes = reader.count(133, 4292608)?;
-        let services_count = reader.count(134, MAX_SERVICE_REQUESTS)?;
-        let services_lanes = reader.count(135, 4196352)?;
-        let buses_count = reader.count(136, MAX_BUSES)?;
-        let voices_count = reader.count(137, MAX_VOICES)?;
-        let poses_count = reader.count(138, MAX_POSES)?;
-        let emitters_count = reader.count(139, MAX_EMITTERS)?;
-        let lights_count = reader.count(141, MAX_LIGHTS)?;
-        let listener_count = reader.count(142, 1)?;
-        let panners_count = reader.count(143, MAX_PANNERS)?;
-        let instances_count = reader.count(149, MAX_INSTANCES)?;
-        let instance_removals_count = reader.count(150, MAX_INSTANCE_REMOVALS)?;
+        let fields_count = reader.count(160, MAX_FIELD_PATCHES)?;
+        let fields_lanes = reader.count(161, 16805888)?;
+        let ui_count = reader.count(162, MAX_UI_NODES)?;
+        let ui_lanes = reader.count(163, 4292608)?;
+        let services_count = reader.count(164, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = reader.count(165, 4196352)?;
+        let buses_count = reader.count(166, MAX_BUSES)?;
+        let voices_count = reader.count(167, MAX_VOICES)?;
+        let poses_count = reader.count(168, MAX_POSES)?;
+        let emitters_count = reader.count(169, MAX_EMITTERS)?;
+        let lights_count = reader.count(171, MAX_LIGHTS)?;
+        let listener_count = reader.count(172, 1)?;
+        let panners_count = reader.count(173, MAX_PANNERS)?;
+        let instances_count = reader.count(179, MAX_INSTANCES)?;
+        let instance_removals_count = reader.count(180, MAX_INSTANCE_REMOVALS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -2430,24 +2482,34 @@ pub mod codec {
         let sky_ground = Vector { x: reader.packet[80], y: reader.packet[81], z: reader.packet[82] };
         let sky_sun = Vector { x: reader.packet[83], y: reader.packet[84], z: reader.packet[85] };
         let sky_night = reader.packet[86];
-        let fog_radius = reader.packet[87];
-        let fog_density = reader.packet[88];
-        let fog_height = reader.packet[89];
-        let shadow_view = reader.matrix(90);
-        let shadow_projection = reader.matrix(106);
-        let shadow_texel = reader.packet[122];
-        let shadow_texels = reader.count(123, 8192)?;
-        let blur = reader.packet[124];
-        let quality_bloom = reader.flag(125)?;
-        let clouds_cover = reader.packet[126];
-        let clouds_drift = Drift { x: reader.packet[127], z: reader.packet[128] };
-        let hide_cursor = reader.flag(129)?;
-        let quality_taa = reader.flag(140)?;
-        let loading = reader.flag(144)?;
-        let show_captions = reader.flag(145)?;
-        let retained_enabled = reader.flag(146)?;
-        let retained_reset = reader.flag(147)?;
-        let retained_after = reader.count(148, 100000)?;
+        let sky_tint = Vector { x: reader.packet[87], y: reader.packet[88], z: reader.packet[89] };
+        let sky_sh0 = Vector { x: reader.packet[90], y: reader.packet[91], z: reader.packet[92] };
+        let sky_sh1 = Vector { x: reader.packet[93], y: reader.packet[94], z: reader.packet[95] };
+        let sky_sh2 = Vector { x: reader.packet[96], y: reader.packet[97], z: reader.packet[98] };
+        let sky_sh3 = Vector { x: reader.packet[99], y: reader.packet[100], z: reader.packet[101] };
+        let sky_sh4 = Vector { x: reader.packet[102], y: reader.packet[103], z: reader.packet[104] };
+        let sky_sh5 = Vector { x: reader.packet[105], y: reader.packet[106], z: reader.packet[107] };
+        let sky_sh6 = Vector { x: reader.packet[108], y: reader.packet[109], z: reader.packet[110] };
+        let sky_sh7 = Vector { x: reader.packet[111], y: reader.packet[112], z: reader.packet[113] };
+        let sky_sh8 = Vector { x: reader.packet[114], y: reader.packet[115], z: reader.packet[116] };
+        let fog_radius = reader.packet[117];
+        let fog_density = reader.packet[118];
+        let fog_height = reader.packet[119];
+        let shadow_view = reader.matrix(120);
+        let shadow_projection = reader.matrix(136);
+        let shadow_texel = reader.packet[152];
+        let shadow_texels = reader.count(153, 8192)?;
+        let blur = reader.packet[154];
+        let quality_bloom = reader.flag(155)?;
+        let clouds_cover = reader.packet[156];
+        let clouds_drift = Drift { x: reader.packet[157], z: reader.packet[158] };
+        let hide_cursor = reader.flag(159)?;
+        let quality_taa = reader.flag(170)?;
+        let loading = reader.flag(174)?;
+        let show_captions = reader.flag(175)?;
+        let retained_enabled = reader.flag(176)?;
+        let retained_reset = reader.flag(177)?;
+        let retained_after = reader.count(178, 100000)?;
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -2634,7 +2696,7 @@ pub mod codec {
             light_color,
             aberration,
             quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa },
-            sky: Sky { zenith: sky_zenith, horizon: sky_horizon, ground: sky_ground, sun: sky_sun, night: sky_night },
+            sky: Sky { zenith: sky_zenith, horizon: sky_horizon, ground: sky_ground, sun: sky_sun, night: sky_night, tint: sky_tint, sh0: sky_sh0, sh1: sky_sh1, sh2: sky_sh2, sh3: sky_sh3, sh4: sky_sh4, sh5: sky_sh5, sh6: sky_sh6, sh7: sky_sh7, sh8: sky_sh8 },
             fog: Fog { radius: fog_radius, density: fog_density, height: fog_height },
             shadow: Shadow { view: shadow_view, projection: shadow_projection, texel: shadow_texel, texels: shadow_texels as u32 },
             blur,
@@ -2726,21 +2788,21 @@ pub mod codec {
         let insets_count = d.count(&header.field("inset_count"), 9, MAX_INSETS)?;
         let inset_draws_count = d.count(&header.field("inset_draw_count"), 10, MAX_DRAWS)?;
         let preferences_lanes = d.count(&header.field("preference_count"), 11, 256)?;
-        let fields_count = d.count(&header.field("field_count"), 130, MAX_FIELD_PATCHES)?;
-        let fields_lanes = d.count(&header.field("field_lanes"), 131, 16805888)?;
-        let ui_count = d.count(&header.field("ui_count"), 132, MAX_UI_NODES)?;
-        let ui_lanes = d.count(&header.field("ui_lanes"), 133, 4292608)?;
-        let services_count = d.count(&header.field("service_count"), 134, MAX_SERVICE_REQUESTS)?;
-        let services_lanes = d.count(&header.field("service_lanes"), 135, 4196352)?;
-        let buses_count = d.count(&header.field("bus_count"), 136, MAX_BUSES)?;
-        let voices_count = d.count(&header.field("voice_count"), 137, MAX_VOICES)?;
-        let poses_count = d.count(&header.field("pose_count"), 138, MAX_POSES)?;
-        let emitters_count = d.count(&header.field("emitter_count"), 139, MAX_EMITTERS)?;
-        let lights_count = d.count(&header.field("light_count"), 141, MAX_LIGHTS)?;
-        let listener_count = d.count(&header.field("listener_count"), 142, 1)?;
-        let panners_count = d.count(&header.field("panner_count"), 143, MAX_PANNERS)?;
-        let instances_count = d.count(&header.field("instance_count"), 149, MAX_INSTANCES)?;
-        let instance_removals_count = d.count(&header.field("instance_removal_count"), 150, MAX_INSTANCE_REMOVALS)?;
+        let fields_count = d.count(&header.field("field_count"), 160, MAX_FIELD_PATCHES)?;
+        let fields_lanes = d.count(&header.field("field_lanes"), 161, 16805888)?;
+        let ui_count = d.count(&header.field("ui_count"), 162, MAX_UI_NODES)?;
+        let ui_lanes = d.count(&header.field("ui_lanes"), 163, 4292608)?;
+        let services_count = d.count(&header.field("service_count"), 164, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = d.count(&header.field("service_lanes"), 165, 4196352)?;
+        let buses_count = d.count(&header.field("bus_count"), 166, MAX_BUSES)?;
+        let voices_count = d.count(&header.field("voice_count"), 167, MAX_VOICES)?;
+        let poses_count = d.count(&header.field("pose_count"), 168, MAX_POSES)?;
+        let emitters_count = d.count(&header.field("emitter_count"), 169, MAX_EMITTERS)?;
+        let lights_count = d.count(&header.field("light_count"), 171, MAX_LIGHTS)?;
+        let listener_count = d.count(&header.field("listener_count"), 172, 1)?;
+        let panners_count = d.count(&header.field("panner_count"), 173, MAX_PANNERS)?;
+        let instances_count = d.count(&header.field("instance_count"), 179, MAX_INSTANCES)?;
+        let instance_removals_count = d.count(&header.field("instance_removal_count"), 180, MAX_INSTANCE_REMOVALS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -2813,24 +2875,34 @@ pub mod codec {
         d.values(&header.field("sky.ground"), 80, 3, &["x","y","z"])?;
         d.values(&header.field("sky.sun"), 83, 3, &["x","y","z"])?;
         d.finite(&header.field("sky.night"), 86)?;
-        d.finite(&header.field("fog.radius"), 87)?;
-        d.finite(&header.field("fog.density"), 88)?;
-        d.finite(&header.field("fog.height"), 89)?;
-        d.values(&header.field("shadow.view"), 90, 16, &[])?;
-        d.values(&header.field("shadow.projection"), 106, 16, &[])?;
-        d.finite(&header.field("shadow.texel"), 122)?;
-        let _ = d.count(&header.field("shadow.texels"), 123, 8192)?;
-        d.finite(&header.field("blur"), 124)?;
-        d.count(&header.field("quality.bloom"), 125, 1)?;
-        d.finite(&header.field("clouds.cover"), 126)?;
-        d.values(&header.field("clouds.drift"), 127, 2, &["x","z"])?;
-        d.count(&header.field("hide_cursor"), 129, 1)?;
-        d.count(&header.field("quality.taa"), 140, 1)?;
-        d.count(&header.field("loading"), 144, 1)?;
-        d.count(&header.field("show_captions"), 145, 1)?;
-        d.count(&header.field("retained_enabled"), 146, 1)?;
-        d.count(&header.field("retained_reset"), 147, 1)?;
-        let _ = d.count(&header.field("retained_after"), 148, 100000)?;
+        d.values(&header.field("sky.tint"), 87, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.sh0"), 90, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.sh1"), 93, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.sh2"), 96, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.sh3"), 99, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.sh4"), 102, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.sh5"), 105, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.sh6"), 108, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.sh7"), 111, 3, &["x","y","z"])?;
+        d.values(&header.field("sky.sh8"), 114, 3, &["x","y","z"])?;
+        d.finite(&header.field("fog.radius"), 117)?;
+        d.finite(&header.field("fog.density"), 118)?;
+        d.finite(&header.field("fog.height"), 119)?;
+        d.values(&header.field("shadow.view"), 120, 16, &[])?;
+        d.values(&header.field("shadow.projection"), 136, 16, &[])?;
+        d.finite(&header.field("shadow.texel"), 152)?;
+        let _ = d.count(&header.field("shadow.texels"), 153, 8192)?;
+        d.finite(&header.field("blur"), 154)?;
+        d.count(&header.field("quality.bloom"), 155, 1)?;
+        d.finite(&header.field("clouds.cover"), 156)?;
+        d.values(&header.field("clouds.drift"), 157, 2, &["x","z"])?;
+        d.count(&header.field("hide_cursor"), 159, 1)?;
+        d.count(&header.field("quality.taa"), 170, 1)?;
+        d.count(&header.field("loading"), 174, 1)?;
+        d.count(&header.field("show_captions"), 175, 1)?;
+        d.count(&header.field("retained_enabled"), 176, 1)?;
+        d.count(&header.field("retained_reset"), 177, 1)?;
+        let _ = d.count(&header.field("retained_after"), 178, 100000)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -3148,21 +3220,21 @@ pub mod codec {
         let insets_count = d.count(&header.field("inset_count"), 9, MAX_INSETS)?;
         let inset_draws_count = d.count(&header.field("inset_draw_count"), 10, MAX_DRAWS)?;
         let preferences_lanes = d.count(&header.field("preference_count"), 11, 256)?;
-        let fields_count = d.count(&header.field("field_count"), 130, MAX_FIELD_PATCHES)?;
-        let fields_lanes = d.count(&header.field("field_lanes"), 131, 16805888)?;
-        let ui_count = d.count(&header.field("ui_count"), 132, MAX_UI_NODES)?;
-        let ui_lanes = d.count(&header.field("ui_lanes"), 133, 4292608)?;
-        let services_count = d.count(&header.field("service_count"), 134, MAX_SERVICE_REQUESTS)?;
-        let services_lanes = d.count(&header.field("service_lanes"), 135, 4196352)?;
-        let buses_count = d.count(&header.field("bus_count"), 136, MAX_BUSES)?;
-        let voices_count = d.count(&header.field("voice_count"), 137, MAX_VOICES)?;
-        let poses_count = d.count(&header.field("pose_count"), 138, MAX_POSES)?;
-        let emitters_count = d.count(&header.field("emitter_count"), 139, MAX_EMITTERS)?;
-        let lights_count = d.count(&header.field("light_count"), 141, MAX_LIGHTS)?;
-        let listener_count = d.count(&header.field("listener_count"), 142, 1)?;
-        let panners_count = d.count(&header.field("panner_count"), 143, MAX_PANNERS)?;
-        let instances_count = d.count(&header.field("instance_count"), 149, MAX_INSTANCES)?;
-        let instance_removals_count = d.count(&header.field("instance_removal_count"), 150, MAX_INSTANCE_REMOVALS)?;
+        let fields_count = d.count(&header.field("field_count"), 160, MAX_FIELD_PATCHES)?;
+        let fields_lanes = d.count(&header.field("field_lanes"), 161, 16805888)?;
+        let ui_count = d.count(&header.field("ui_count"), 162, MAX_UI_NODES)?;
+        let ui_lanes = d.count(&header.field("ui_lanes"), 163, 4292608)?;
+        let services_count = d.count(&header.field("service_count"), 164, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = d.count(&header.field("service_lanes"), 165, 4196352)?;
+        let buses_count = d.count(&header.field("bus_count"), 166, MAX_BUSES)?;
+        let voices_count = d.count(&header.field("voice_count"), 167, MAX_VOICES)?;
+        let poses_count = d.count(&header.field("pose_count"), 168, MAX_POSES)?;
+        let emitters_count = d.count(&header.field("emitter_count"), 169, MAX_EMITTERS)?;
+        let lights_count = d.count(&header.field("light_count"), 171, MAX_LIGHTS)?;
+        let listener_count = d.count(&header.field("listener_count"), 172, 1)?;
+        let panners_count = d.count(&header.field("panner_count"), 173, MAX_PANNERS)?;
+        let instances_count = d.count(&header.field("instance_count"), 179, MAX_INSTANCES)?;
+        let instance_removals_count = d.count(&header.field("instance_removal_count"), 180, MAX_INSTANCE_REMOVALS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3312,8 +3384,13 @@ pub mod codec {
             f32::from(frame.quality.effects), f32::from(frame.quality.bloom), f32::from(frame.quality.taa),
             frame.sky.zenith.x, frame.sky.zenith.y, frame.sky.zenith.z, frame.sky.horizon.x, frame.sky.horizon.y,
             frame.sky.horizon.z, frame.sky.ground.x, frame.sky.ground.y, frame.sky.ground.z, frame.sky.sun.x,
-            frame.sky.sun.y, frame.sky.sun.z, frame.sky.night, frame.fog.radius, frame.fog.density,
-            frame.fog.height,
+            frame.sky.sun.y, frame.sky.sun.z, frame.sky.night, frame.sky.tint.x, frame.sky.tint.y,
+            frame.sky.tint.z, frame.sky.sh0.x, frame.sky.sh0.y, frame.sky.sh0.z, frame.sky.sh1.x,
+            frame.sky.sh1.y, frame.sky.sh1.z, frame.sky.sh2.x, frame.sky.sh2.y, frame.sky.sh2.z, frame.sky.sh3.x,
+            frame.sky.sh3.y, frame.sky.sh3.z, frame.sky.sh4.x, frame.sky.sh4.y, frame.sky.sh4.z, frame.sky.sh5.x,
+            frame.sky.sh5.y, frame.sky.sh5.z, frame.sky.sh6.x, frame.sky.sh6.y, frame.sky.sh6.z, frame.sky.sh7.x,
+            frame.sky.sh7.y, frame.sky.sh7.z, frame.sky.sh8.x, frame.sky.sh8.y, frame.sky.sh8.z,
+            frame.fog.radius, frame.fog.density, frame.fog.height,
         ]);
         out.extend_from_slice(&frame.shadow.view);
         out.extend_from_slice(&frame.shadow.projection);

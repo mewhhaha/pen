@@ -29,6 +29,23 @@ Group 0, the frame's, the same for every draw:
 | 0 | The scene, a uniform: `view` and `projection` (column-major `mat4x4f`), `ambient`, `light_direction` and `light_color` (`vec4f`, xyz used), `light_view_projection` (the shadow map's), `shadow` (x 1 with a shadow map, y its texel in texture coordinates, z how far off the surface to read it), the sky's `zenith`, `horizon` and `ground` colours, and `eye`, where the camera is. |
 | 1 | The shadow map, `texture_depth_2d`. |
 | 2 | Its `sampler_comparison`. |
+| 3 | Every shadow map, a `texture_depth_2d_array` (`shadow_cascades`). |
+| 4 | The sky's reflection, a `texture_cube<f32>` whose levels are the sky blurred by GGX lobes of growing roughness. |
+| 5 | The split-sum BRDF table, a `texture_2d<f32>`. |
+| 6 | A filtering sampler for both. |
+| 7 | The sky's light, a uniform: nine diffuse spherical-harmonic coefficients, the reflection tint and the cube's last level. |
+
+Bindings 4 to 7 are the sky as light. A shader that wants it adds
+`pen_render::ENVIRONMENT_WGSL`, which declares them and defines
+`ambient_light(world, normal)` (the light all round, to multiply by albedo; the
+flat `ambient` color's replacement), `sky_reflection(normal, view, roughness,
+f0)`, `surface_ambient(world, normal, view, albedo, metallic, roughness)` for
+both together, and `specular_occlusion`. A game that sends no coefficients gets
+its flat `ambient` from `ambient_light` and no reflections. The point and spot
+lights of `LIGHTS_WGSL` also have `clustered_surface(world, normal, view,
+roughness, f0, position, view_z)`, their diffuse sum and GGX highlights. Both
+use the lobe of ink's `lighting.brdf` (GGX with alpha the square of the
+roughness, height-correlated Smith visibility, Schlick Fresnel).
 
 Group 1, the draw's:
 

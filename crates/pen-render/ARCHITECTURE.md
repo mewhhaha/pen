@@ -266,6 +266,27 @@ toward an HDR display's peak), applies FXAA Quality (`shaders/fxaa.wgsl`),
 splits the colours of surfaces that ask for the frame's aberration, and
 scales the image to the output.
 
+### The sky as light
+
+`environment.rs` holds what materials light with from the frame's sky. The game
+works out nine spherical-harmonic coefficients of its sky's diffuse light and a
+tint (`sky.sh0` to `sky.sh8`, `sky.tint`); the renderer writes them into a
+uniform and never computes them. For glossy surfaces it keeps a 64-texel cube
+map of the sky's gradient (the horizon to the zenith or the ground by the square
+root of the height, the game's own sky function), rgba16float with six levels,
+level `n` being the sky convolved with the GGX lobe of roughness `n / 5` by
+importance sampling the gradient itself. The cube is drawn again on the GPU, 36
+small passes at the start of the frame, only when the frame's zenith, horizon or
+ground colors differ from the last frame's bits. The split-sum BRDF table (32 x
+32, scale and bias by cosine and roughness) is drawn once. Both bind at group 0,
+bindings 4 to 7 (`ENVIRONMENT_WGSL`, materials.md); shadow passes bind a zeroed
+light and insets a flat one from their own ambient color, with no reflection.
+`ambient_light(world, normal)` is the only place a material asks for diffuse sky
+light: a per-position source, such as an interpolated irradiance probe grid
+bound beside the cube and read at `world`, takes over inside it. Screen-space
+occlusion still darkens the whole picture after the scene, so sky light and
+reflections are occluded with the rest.
+
 ### The render graph
 
 The passes after the scene draw as a small render graph (`graph.rs`). Each

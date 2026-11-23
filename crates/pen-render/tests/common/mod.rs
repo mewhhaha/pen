@@ -54,7 +54,13 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
             bloom: false,
             taa: false,
         },
-        sky: Sky { zenith: zero, horizon: zero, ground: zero, sun: Vector { x: 0.0, y: 1.0, z: 0.0 }, night: 0.0 },
+        sky: Sky {
+            zenith: zero,
+            horizon: zero,
+            ground: zero,
+            sun: Vector { x: 0.0, y: 1.0, z: 0.0 },
+            ..Sky::default()
+        },
         fog: Fog { radius: 0.0, density: 0.0, height: 1.0 },
         clouds: Clouds { cover: 0.0, drift: Drift { x: 0.0, z: 0.0 } },
         shadow: Shadow { view: IDENTITY, projection: IDENTITY, texel: 0.0, texels: 0 },

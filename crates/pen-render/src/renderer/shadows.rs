@@ -11,6 +11,7 @@ use super::timing::Span;
 use super::{
     Drawing, Floats, GpuAsset, ReadyEntry, SCENE_BYTES, SCENE_FLOATS, Shadows, State, heavens, lighting, uniform_buffer,
 };
+use crate::environment::Environment;
 use crate::matrix::{IDENTITY, multiply};
 
 // The share of a map's width, at its edge, over which a surface fades into
@@ -61,11 +62,17 @@ fn scene_group(
     maps: &ShadowMaps,
     game: Option<&wgpu::TextureView>,
     sampler: &wgpu::Sampler,
+    sky: (&Environment, &wgpu::Buffer),
 ) -> wgpu::BindGroup {
+    let [cube, table, sky_sampler, light] = sky.0.entries(sky.1);
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("scene"),
         layout,
         entries: &[
+            cube,
+            table,
+            sky_sampler,
+            light,
             wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -81,6 +88,7 @@ impl State {
     pub(super) fn shadow_resources(&mut self) -> &mut Shadows {
         let device = &self.device;
         let scene_layout = &self.context.scene_group;
+        let environment = &self.environment;
         self.shadows.get_or_insert_with(|| {
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
                 compare: Some(wgpu::CompareFunction::Less),
@@ -93,7 +101,15 @@ impl State {
             let (uniforms, groups) = (0..MAX_CASCADES)
                 .map(|_| {
                     let uniform = uniform_buffer(device, "shadow scene", SCENE_BYTES);
-                    let group = scene_group(device, scene_layout, &uniform, &stand_in, None, &sampler);
+                    let group = scene_group(
+                        device,
+                        scene_layout,
+                        &uniform,
+                        &stand_in,
+                        None,
+                        &sampler,
+                        (environment, environment.empty()),
+                    );
                     (uniform, group)
                 })
                 .unzip();
@@ -101,12 +117,22 @@ impl State {
         })
     }
 
-    /// A scene bind group for `uniform` that reads no shadow map (an inset's).
-    pub(super) fn unshadowed_scene(&mut self, uniform: &wgpu::Buffer) -> wgpu::BindGroup {
+    /// A scene bind group for `uniform` that reads no shadow map (an inset's),
+    /// lit by the sky light in `light`.
+    pub(super) fn unshadowed_scene(&mut self, uniform: &wgpu::Buffer, light: &wgpu::Buffer) -> wgpu::BindGroup {
         let device = self.device.clone();
         let layout = self.context.scene_group.clone();
-        let resources = self.shadow_resources();
-        scene_group(&device, &layout, uniform, &resources.stand_in, None, &resources.sampler)
+        self.shadow_resources();
+        let resources = self.shadows.as_ref().unwrap();
+        scene_group(
+            &device,
+            &layout,
+            uniform,
+            &resources.stand_in,
+            None,
+            &resources.sampler,
+            (&self.environment, light),
+        )
     }
 
     /// The frame's shadow maps (`cascades`): nearer ones only if a loaded
@@ -145,6 +171,7 @@ impl State {
             scene.extend([texel, map.texel * 1.5, 0.0, 0.0]);
         }
         self.queue.write_buffer(&self.scene_uniform, 0, scene.bytes());
+        self.environment.update(&self.queue, &frame.sky, &frame.ambient);
         // Each shadow pass sees the scene from the light.
         if let Some(sun) = sun {
             let device = self.device.clone();
@@ -181,6 +208,7 @@ impl State {
                 maps.unwrap_or(&resources.stand_in),
                 maps.map(|maps| &maps.layers[bound.1]),
                 &resources.sampler,
+                (&self.environment, self.environment.light()),
             );
             self.scene_group = Some((group, bound));
         }

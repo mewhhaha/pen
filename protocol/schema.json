@@ -1846,6 +1846,126 @@
         "kind": "f32",
         "doc": "1 at full night, when stars show."
       },
+      "sky.tint": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Per-channel scale turning the sky's zenith, horizon and ground colors into the light it gives all round (the radiance behind the sh coefficients and glossy reflections); 0 for no reflections."
+      },
+      "sky.sh0": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Coefficient 0 (real spherical harmonic constant, bands 0 to 2) of the sky's diffuse light: what a white surface facing each way shows, in linear color, the cosine lobe already applied and divided by pi."
+      },
+      "sky.sh1": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Coefficient 1 (real spherical harmonic y, bands 0 to 2) of the sky's diffuse light: what a white surface facing each way shows, in linear color, the cosine lobe already applied and divided by pi."
+      },
+      "sky.sh2": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Coefficient 2 (real spherical harmonic z, bands 0 to 2) of the sky's diffuse light: what a white surface facing each way shows, in linear color, the cosine lobe already applied and divided by pi."
+      },
+      "sky.sh3": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Coefficient 3 (real spherical harmonic x, bands 0 to 2) of the sky's diffuse light: what a white surface facing each way shows, in linear color, the cosine lobe already applied and divided by pi."
+      },
+      "sky.sh4": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Coefficient 4 (real spherical harmonic xy, bands 0 to 2) of the sky's diffuse light: what a white surface facing each way shows, in linear color, the cosine lobe already applied and divided by pi."
+      },
+      "sky.sh5": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Coefficient 5 (real spherical harmonic yz, bands 0 to 2) of the sky's diffuse light: what a white surface facing each way shows, in linear color, the cosine lobe already applied and divided by pi."
+      },
+      "sky.sh6": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Coefficient 6 (real spherical harmonic zz, bands 0 to 2) of the sky's diffuse light: what a white surface facing each way shows, in linear color, the cosine lobe already applied and divided by pi."
+      },
+      "sky.sh7": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Coefficient 7 (real spherical harmonic xz, bands 0 to 2) of the sky's diffuse light: what a white surface facing each way shows, in linear color, the cosine lobe already applied and divided by pi."
+      },
+      "sky.sh8": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Coefficient 8 (real spherical harmonic xx_yy, bands 0 to 2) of the sky's diffuse light: what a white surface facing each way shows, in linear color, the cosine lobe already applied and divided by pi."
+      },
       "fog.radius": {
         "kind": "f32"
       },

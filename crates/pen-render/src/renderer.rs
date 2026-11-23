@@ -42,6 +42,7 @@ use crate::asset_store::{AssetStore, Lod, MAX_LODS, Material};
 use crate::built_in::{BuiltIn, BuiltIns};
 use crate::culling::{Detail, MAX_VIEWS, Sphere, Views};
 use crate::decals::{DecalBatch, Decals};
+use crate::environment::Environment;
 use crate::loader::{LevelMessage, Loader};
 use crate::matrix::invert;
 use crate::mipmaps::Mipmapper;
@@ -232,6 +233,8 @@ struct Shadows {
 // new ones each frame.
 struct InsetScene {
     uniform: wgpu::Buffer,
+    /// Its sky light: its ambient color from every direction.
+    light: wgpu::Buffer,
     group: wgpu::BindGroup,
 }
 
@@ -536,6 +539,8 @@ pub(crate) struct State {
     // Created on first use, so a renderer that never draws needs none.
     post: Option<Post>,
     mipmaps: Mipmapper,
+    /// The sky the scene is lit by: diffuse coefficients, reflection cube and table.
+    environment: Environment,
     decals: Option<Decals>,
     sprites: Option<Sprites>,
     // The colour filter the whole picture draws through (filter.rs).
@@ -674,6 +679,12 @@ impl State {
                     },
                     count: None,
                 },
+                // The sky as light: its reflection cube, the BRDF table, their
+                // sampler and the diffuse coefficients (environment.rs).
+                crate::environment::layout_entries()[0],
+                crate::environment::layout_entries()[1],
+                crate::environment::layout_entries()[2],
+                crate::environment::layout_entries()[3],
             ],
         });
         let texture_entry = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
@@ -808,6 +819,7 @@ impl State {
             samples_now: 1,
             samples_shown: 1,
             post: None,
+            environment: Environment::new(&device, context.cache.clone()),
             mipmaps,
             decals: None,
             sprites: None,

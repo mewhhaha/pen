@@ -11,6 +11,7 @@ mod compressed;
 mod culling;
 mod decals;
 mod display;
+mod environment;
 mod filter;
 mod graph;
 mod inspect;
@@ -37,6 +38,7 @@ use pen_protocol::{Catalog, GameEvent, RenderFrame};
 
 pub use asset_store::{mesh_bounds, pack_mesh, validate_asset_key};
 pub use display::{DEFAULT_HEADROOM, Display, REFERENCE_WHITE_NITS, choose_surface};
+pub use environment::ENVIRONMENT_WGSL;
 pub use filter::ColorFilter;
 pub use inspect::{TextureInfo, inspect_material, inspect_mesh, inspect_texture, shader_draws_sprites};
 pub use lights::LIGHTS_WGSL;

@@ -29,6 +29,13 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
     for vector in [&frame.ambient, &frame.light_color, &frame.light_direction] {
         ensure!(finite(vector), "render lighting must contain finite float32 values");
     }
+    let sky = &frame.sky;
+    for vector in [&sky.zenith, &sky.horizon, &sky.ground, &sky.tint]
+        .into_iter()
+        .chain([&sky.sh0, &sky.sh1, &sky.sh2, &sky.sh3, &sky.sh4, &sky.sh5, &sky.sh6, &sky.sh7, &sky.sh8])
+    {
+        ensure!(finite(vector), "the sky's colors and coefficients must be finite float32 values");
+    }
     ensure!(hypot(&frame.light_direction) >= 1e-8, "light direction must be nonzero");
     let aberration = &frame.aberration;
     ensure!(

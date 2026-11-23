@@ -347,6 +347,36 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (packet.sky.sun.y)
   @storage.push encoded (packet.sky.sun.z)
   @storage.push encoded (packet.sky.night)
+  @storage.push encoded (packet.sky.tint.x)
+  @storage.push encoded (packet.sky.tint.y)
+  @storage.push encoded (packet.sky.tint.z)
+  @storage.push encoded (packet.sky.sh0.x)
+  @storage.push encoded (packet.sky.sh0.y)
+  @storage.push encoded (packet.sky.sh0.z)
+  @storage.push encoded (packet.sky.sh1.x)
+  @storage.push encoded (packet.sky.sh1.y)
+  @storage.push encoded (packet.sky.sh1.z)
+  @storage.push encoded (packet.sky.sh2.x)
+  @storage.push encoded (packet.sky.sh2.y)
+  @storage.push encoded (packet.sky.sh2.z)
+  @storage.push encoded (packet.sky.sh3.x)
+  @storage.push encoded (packet.sky.sh3.y)
+  @storage.push encoded (packet.sky.sh3.z)
+  @storage.push encoded (packet.sky.sh4.x)
+  @storage.push encoded (packet.sky.sh4.y)
+  @storage.push encoded (packet.sky.sh4.z)
+  @storage.push encoded (packet.sky.sh5.x)
+  @storage.push encoded (packet.sky.sh5.y)
+  @storage.push encoded (packet.sky.sh5.z)
+  @storage.push encoded (packet.sky.sh6.x)
+  @storage.push encoded (packet.sky.sh6.y)
+  @storage.push encoded (packet.sky.sh6.z)
+  @storage.push encoded (packet.sky.sh7.x)
+  @storage.push encoded (packet.sky.sh7.y)
+  @storage.push encoded (packet.sky.sh7.z)
+  @storage.push encoded (packet.sky.sh8.x)
+  @storage.push encoded (packet.sky.sh8.y)
+  @storage.push encoded (packet.sky.sh8.z)
   @storage.push encoded (packet.fog.radius)
   @storage.push encoded (packet.fog.density)
   @storage.push encoded (packet.fog.height)
@@ -622,7 +652,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     for i in 0 .. count:
       let item = field.values.at i
       @storage.push encoded item
-  encoded[start + 131] := U32.to_f32 ((encoded.length - fields_start))
+  encoded[start + 161] := U32.to_f32 ((encoded.length - fields_start))
   let ui_start = encoded.length
   for i in 0 .. ui_count:
     let source = collections.ui[i]
@@ -655,7 +685,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     for i in 0 .. count:
       let item = ui.text.at i
       @storage.push encoded item
-  encoded[start + 133] := U32.to_f32 ((encoded.length - ui_start))
+  encoded[start + 163] := U32.to_f32 ((encoded.length - ui_start))
   let services_start = encoded.length
   for i in 0 .. services_count:
     let source = collections.services[i]
@@ -672,7 +702,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     for i in 0 .. count:
       let item = service.values.at i
       @storage.push encoded item
-  encoded[start + 135] := U32.to_f32 ((encoded.length - services_start))
+  encoded[start + 165] := U32.to_f32 ((encoded.length - services_start))
   for i in 0 .. buses_count:
     let source = collections.buses[i]
     let buse: types.Bus = project.buse context source
@@ -1006,72 +1036,102 @@ func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (
   encoded[84] := packet.sky.sun.y
   encoded[85] := packet.sky.sun.z
   encoded[86] := packet.sky.night
-  encoded[87] := packet.fog.radius
-  encoded[88] := packet.fog.density
-  encoded[89] := packet.fog.height
+  encoded[87] := packet.sky.tint.x
+  encoded[88] := packet.sky.tint.y
+  encoded[89] := packet.sky.tint.z
+  encoded[90] := packet.sky.sh0.x
+  encoded[91] := packet.sky.sh0.y
+  encoded[92] := packet.sky.sh0.z
+  encoded[93] := packet.sky.sh1.x
+  encoded[94] := packet.sky.sh1.y
+  encoded[95] := packet.sky.sh1.z
+  encoded[96] := packet.sky.sh2.x
+  encoded[97] := packet.sky.sh2.y
+  encoded[98] := packet.sky.sh2.z
+  encoded[99] := packet.sky.sh3.x
+  encoded[100] := packet.sky.sh3.y
+  encoded[101] := packet.sky.sh3.z
+  encoded[102] := packet.sky.sh4.x
+  encoded[103] := packet.sky.sh4.y
+  encoded[104] := packet.sky.sh4.z
+  encoded[105] := packet.sky.sh5.x
+  encoded[106] := packet.sky.sh5.y
+  encoded[107] := packet.sky.sh5.z
+  encoded[108] := packet.sky.sh6.x
+  encoded[109] := packet.sky.sh6.y
+  encoded[110] := packet.sky.sh6.z
+  encoded[111] := packet.sky.sh7.x
+  encoded[112] := packet.sky.sh7.y
+  encoded[113] := packet.sky.sh7.z
+  encoded[114] := packet.sky.sh8.x
+  encoded[115] := packet.sky.sh8.y
+  encoded[116] := packet.sky.sh8.z
+  encoded[117] := packet.fog.radius
+  encoded[118] := packet.fog.density
+  encoded[119] := packet.fog.height
   let $types.Mat4 { x: shadow_view_x, y: shadow_view_y, z: shadow_view_z, w: shadow_view_w } = packet.shadow.view
-  encoded[90] := shadow_view_x.x
-  encoded[91] := shadow_view_x.y
-  encoded[92] := shadow_view_x.z
-  encoded[93] := shadow_view_x.w
-  encoded[94] := shadow_view_y.x
-  encoded[95] := shadow_view_y.y
-  encoded[96] := shadow_view_y.z
-  encoded[97] := shadow_view_y.w
-  encoded[98] := shadow_view_z.x
-  encoded[99] := shadow_view_z.y
-  encoded[100] := shadow_view_z.z
-  encoded[101] := shadow_view_z.w
-  encoded[102] := shadow_view_w.x
-  encoded[103] := shadow_view_w.y
-  encoded[104] := shadow_view_w.z
-  encoded[105] := shadow_view_w.w
+  encoded[120] := shadow_view_x.x
+  encoded[121] := shadow_view_x.y
+  encoded[122] := shadow_view_x.z
+  encoded[123] := shadow_view_x.w
+  encoded[124] := shadow_view_y.x
+  encoded[125] := shadow_view_y.y
+  encoded[126] := shadow_view_y.z
+  encoded[127] := shadow_view_y.w
+  encoded[128] := shadow_view_z.x
+  encoded[129] := shadow_view_z.y
+  encoded[130] := shadow_view_z.z
+  encoded[131] := shadow_view_z.w
+  encoded[132] := shadow_view_w.x
+  encoded[133] := shadow_view_w.y
+  encoded[134] := shadow_view_w.z
+  encoded[135] := shadow_view_w.w
   let $types.Mat4 { x: shadow_projection_x, y: shadow_projection_y, z: shadow_projection_z, w: shadow_projection_w } = packet.shadow.projection
-  encoded[106] := shadow_projection_x.x
-  encoded[107] := shadow_projection_x.y
-  encoded[108] := shadow_projection_x.z
-  encoded[109] := shadow_projection_x.w
-  encoded[110] := shadow_projection_y.x
-  encoded[111] := shadow_projection_y.y
-  encoded[112] := shadow_projection_y.z
-  encoded[113] := shadow_projection_y.w
-  encoded[114] := shadow_projection_z.x
-  encoded[115] := shadow_projection_z.y
-  encoded[116] := shadow_projection_z.z
-  encoded[117] := shadow_projection_z.w
-  encoded[118] := shadow_projection_w.x
-  encoded[119] := shadow_projection_w.y
-  encoded[120] := shadow_projection_w.z
-  encoded[121] := shadow_projection_w.w
-  encoded[122] := packet.shadow.texel
-  encoded[123] := U32.to_f32 (packet.shadow.texels)
-  encoded[124] := packet.blur
-  encoded[125] := lanes.bit packet.quality.bloom
-  encoded[126] := packet.clouds.cover
-  encoded[127] := packet.clouds.drift.x
-  encoded[128] := packet.clouds.drift.z
-  encoded[129] := lanes.bit packet.hide_cursor
-  encoded[130] := 0.0
-  encoded[131] := 0.0
-  encoded[132] := 0.0
-  encoded[133] := 0.0
-  encoded[134] := 0.0
-  encoded[135] := 0.0
-  encoded[136] := 0.0
-  encoded[137] := 0.0
-  encoded[138] := 0.0
-  encoded[139] := 0.0
-  encoded[140] := lanes.bit packet.quality.taa
-  encoded[141] := 0.0
-  encoded[142] := 0.0
-  encoded[143] := 0.0
-  encoded[144] := lanes.bit packet.loading
-  encoded[145] := lanes.bit packet.show_captions
-  encoded[146] := lanes.bit packet.retained_enabled
-  encoded[147] := lanes.bit packet.retained_reset
-  encoded[148] := U32.to_f32 (packet.retained_after)
-  encoded[149] := 0.0
-  encoded[150] := 0.0
+  encoded[136] := shadow_projection_x.x
+  encoded[137] := shadow_projection_x.y
+  encoded[138] := shadow_projection_x.z
+  encoded[139] := shadow_projection_x.w
+  encoded[140] := shadow_projection_y.x
+  encoded[141] := shadow_projection_y.y
+  encoded[142] := shadow_projection_y.z
+  encoded[143] := shadow_projection_y.w
+  encoded[144] := shadow_projection_z.x
+  encoded[145] := shadow_projection_z.y
+  encoded[146] := shadow_projection_z.z
+  encoded[147] := shadow_projection_z.w
+  encoded[148] := shadow_projection_w.x
+  encoded[149] := shadow_projection_w.y
+  encoded[150] := shadow_projection_w.z
+  encoded[151] := shadow_projection_w.w
+  encoded[152] := packet.shadow.texel
+  encoded[153] := U32.to_f32 (packet.shadow.texels)
+  encoded[154] := packet.blur
+  encoded[155] := lanes.bit packet.quality.bloom
+  encoded[156] := packet.clouds.cover
+  encoded[157] := packet.clouds.drift.x
+  encoded[158] := packet.clouds.drift.z
+  encoded[159] := lanes.bit packet.hide_cursor
+  encoded[160] := 0.0
+  encoded[161] := 0.0
+  encoded[162] := 0.0
+  encoded[163] := 0.0
+  encoded[164] := 0.0
+  encoded[165] := 0.0
+  encoded[166] := 0.0
+  encoded[167] := 0.0
+  encoded[168] := 0.0
+  encoded[169] := 0.0
+  encoded[170] := lanes.bit packet.quality.taa
+  encoded[171] := 0.0
+  encoded[172] := 0.0
+  encoded[173] := 0.0
+  encoded[174] := lanes.bit packet.loading
+  encoded[175] := lanes.bit packet.show_captions
+  encoded[176] := lanes.bit packet.retained_enabled
+  encoded[177] := lanes.bit packet.retained_reset
+  encoded[178] := U32.to_f32 (packet.retained_after)
+  encoded[179] := 0.0
+  encoded[180] := 0.0
   let at: U32 = protocol.packet_header_floats
   for draw in draws:
     encoded[at + 0] := U32.to_f32 (draw.mesh)

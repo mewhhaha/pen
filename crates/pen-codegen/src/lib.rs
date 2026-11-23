@@ -94,7 +94,7 @@ mod tests {
     fn packet_contract_layout() {
         let model = model::build(schema()).unwrap();
         assert_eq!(model.magic, 0x474446);
-        assert_eq!(model.header_lanes, 151);
+        assert_eq!(model.header_lanes, 181);
         assert_eq!(model.event_lanes(), 5);
         assert_eq!(model.section("draws").fixed.as_ref().unwrap().lanes, 24);
         assert_eq!(model.section("insets").fixed.as_ref().unwrap().lanes, 48);

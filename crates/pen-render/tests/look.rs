@@ -1018,3 +1018,179 @@ fn msdf_text_shot() {
     renderer.submit(&frame, &catalog, &mut target).unwrap();
     save_grey("msdf-text.png", &target.greens(&device, &queue), width, height, 1);
 }
+
+// A floor facing up lit by the sky (`ENVIRONMENT_WGSL`) and the frame's lights
+// (`LIGHTS_WGSL`), with a draw's parameters as metallic and roughness; its
+// light's highlight is left out where `${highlights}` is false.
+const GLOSSY: &str = r#"
+struct Scene {
+  view: mat4x4f, projection: mat4x4f, ambient: vec4f, light_direction: vec4f, light_color: vec4f,
+  light_view_projection: mat4x4f, shadow: vec4f, zenith: vec4f, horizon: vec4f, ground: vec4f, eye: vec4f,
+};
+struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f, settings: vec4f, parameters: vec4f };
+@group(0) @binding(0) var<uniform> scene: Scene;
+@group(1) @binding(0) var<uniform> draw: Draw;
+${lights}
+${environment}
+struct Corner {
+  @builtin(position) position: vec4f,
+  @location(0) world: vec3f,
+  @location(1) view_z: f32,
+};
+@vertex fn vertex(@location(0) position: vec3f) -> Corner {
+  let world = draw.model * vec4f(position, 1.0);
+  let seen = scene.view * world;
+  return Corner(scene.projection * seen, world.xyz, seen.z);
+}
+@fragment fn fragment(corner: Corner) -> @location(0) vec4f {
+  let up = vec3f(0.0, 1.0, 0.0);
+  let view = normalize(scene.eye.xyz - corner.world);
+  let albedo = draw.color.rgb;
+  let metallic = draw.parameters.x;
+  let roughness = draw.parameters.y;
+  let f0 = mix(vec3f(0.04), albedo, metallic);
+  var light = surface_ambient(corner.world, up, view, albedo, metallic, roughness);
+  let local = clustered_surface(corner.world, up, view, roughness, f0, corner.position, corner.view_z);
+  light += local.diffuse * albedo * (1.0 - metallic);
+  if (${highlights}) {
+    light += local.specular;
+  }
+  return vec4f(light, 1.0);
+}
+"#;
+
+fn project_to_pixel(view: &Matrix, projection: &Matrix, point: [f32; 3], size: (u32, u32)) -> (f32, f32) {
+    let apply = |m: &Matrix, v: [f32; 4]| -> [f32; 4] {
+        std::array::from_fn(|row| (0..4).map(|k| m[k * 4 + row] * v[k]).sum())
+    };
+    let clip = apply(projection, apply(view, [point[0], point[1], point[2], 1.0]));
+    ((clip[0] / clip[3] * 0.5 + 0.5) * size.0 as f32, (0.5 - clip[1] / clip[3] * 0.5) * size.1 as f32)
+}
+
+#[test]
+fn the_sky_and_lights_light_a_glossy_floor() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let source =
+        GLOSSY.replace("${lights}", pen_render::LIGHTS_WGSL).replace("${environment}", pen_render::ENVIRONMENT_WGSL);
+    let floor = br#"{"positions":[-12,0,-12, 12,0,-12, -12,0,12, 12,0,12],"normals":[0,1,0,0,1,0,0,1,0,0,1,0],
+                     "uvs":[0,0,1,0,0,1,1,1],"indices":[0,2,1,1,2,3]}"#;
+    let root = assets(
+        "glossy",
+        &[
+            (
+                "catalog.json",
+                br#"{"meshes":["floor.mesh.json"],"materials":["with.material.json","without.material.json"]}"#,
+            ),
+            ("floor.mesh.json", floor),
+            ("with.wgsl", source.replace("${highlights}", "true").as_bytes()),
+            ("without.wgsl", source.replace("${highlights}", "false").as_bytes()),
+            ("with.material.json", br#"{"shader":"with.wgsl","color":[0.9,0.9,0.9,1],"lighting":"unlit"}"#),
+            ("without.material.json", br#"{"shader":"without.wgsl","color":[0.9,0.9,0.9,1],"lighting":"unlit"}"#),
+        ],
+    );
+    let catalog = boundary::read_catalog(&root).unwrap();
+    let mut renderer = renderer(&device, &queue, root, FORMAT, Display::SDR);
+    let (width, height) = (320, 180);
+    let mut target = Target::new(&device, width, height, FORMAT);
+    let eye = [0.0, 3.0, 6.0];
+    let (view, projection) = camera(eye, width as f32 / height as f32);
+    let draw = |material, metallic: f32, roughness: f32| Draw {
+        mesh: 0,
+        material,
+        transform: IDENTITY,
+        parameters: Some([metallic, roughness, 0.0, 0.0]),
+        extra: None,
+    };
+    let vector = |x, y, z| Vector { x, y, z };
+    let mut frame = frame(vec![]);
+    (frame.view, frame.projection) = (view, projection);
+    frame.lights = vec![Light {
+        position: vector(0.0, 1.5, 0.0),
+        radius: 12.0,
+        color: vector(1.0, 1.0, 1.0),
+        direction: vector(0.0, -1.0, 0.0),
+        inner: -1.0,
+        outer: -1.0,
+    }];
+    let mut render = |frame: &RenderFrame| {
+        settle(&mut renderer, frame, &catalog, &mut target, 1);
+        target.read(&device, &queue)
+    };
+    // The highlight sits where the eye's mirror image sees the light: on the
+    // floor between them, a quarter of the way from the light to the eye's
+    // foot (heights 1.5 and 3).
+    let spot = project_to_pixel(&view, &projection, [0.0, 0.0, 6.0 * 1.5 / 4.5], (width, height));
+    let brightness =
+        |image: &[u8]| image.chunks(4).map(|t| f32::from(t[0]) + f32::from(t[1]) + f32::from(t[2])).collect::<Vec<_>>();
+    // Without any sky: the lights' highlight against the lights' diffuse.
+    frame.draws = vec![draw(0, 0.0, 0.2)];
+    let lit = brightness(&render(&frame));
+    frame.draws = vec![draw(1, 0.0, 0.2)];
+    let plain = brightness(&render(&frame));
+    let peak = |values: &[f32]| {
+        let (at, value) =
+            values.iter().enumerate().fold((0, 0.0), |best, (i, v)| if *v > best.1 { (i, *v) } else { best });
+        let at = u32::try_from(at).unwrap();
+        ((at % width) as f32, (at / width) as f32, value)
+    };
+    let (px, py, highlight) = peak(&lit);
+    eprintln!(
+        "highlight peak {highlight} at ({px}, {py}); expected near ({}, {}); without: {}",
+        spot.0,
+        spot.1,
+        peak(&plain).2
+    );
+    assert!(lit.iter().zip(&plain).all(|(a, b)| a >= b), "a highlight only adds light");
+    assert!(highlight > peak(&plain).2 * 1.3 + 30.0, "a glossy floor shows the light's highlight");
+    assert!(
+        (px - spot.0).abs() < 14.0 && (py - spot.1).abs() < 14.0,
+        "the highlight lies where the eye mirrors the light"
+    );
+    // A rough floor spreads the same light into a dimmer, wider highlight.
+    frame.draws = vec![draw(0, 0.0, 0.9)];
+    let rough = brightness(&render(&frame));
+    frame.draws = vec![draw(1, 0.0, 0.9)];
+    let rough_plain = brightness(&render(&frame));
+    let rough_extra: f32 = rough.iter().zip(&rough_plain).map(|(a, b)| a - b).fold(0.0, f32::max);
+    let glossy_extra = highlight - peak(&plain).2;
+    assert!(rough_extra < glossy_extra, "roughness dims the peak: {rough_extra} vs {glossy_extra}");
+
+    // The sky: a flat diffuse light lights a matte floor by its color.
+    let base_sky = frame.sky;
+    let flat = |value: f32| {
+        let mut sky = base_sky;
+        sky.sh0 = vector(value / 0.282_094_8, value / 0.282_094_8, value / 0.282_094_8);
+        sky.tint = vector(1.0, 1.0, 1.0);
+        sky
+    };
+    frame.lights = vec![];
+    let mut mean_with = |sky: Sky, metallic, roughness| {
+        frame.sky = sky;
+        frame.draws = vec![draw(1, metallic, roughness)];
+        let image = brightness(&render(&frame));
+        image.iter().sum::<f32>() / image.len() as f32
+    };
+    let dim = mean_with(flat(0.1), 0.0, 1.0);
+    let bright = mean_with(flat(0.4), 0.0, 1.0);
+    assert!(bright > dim * 1.5, "the sky's coefficients light a matte floor: {dim} vs {bright}");
+    // And a metal floor mirrors the sky's colors: a blue zenith and horizon tints it blue.
+    let mut blue = flat(0.0);
+    (blue.zenith, blue.horizon, blue.ground) = (vector(0.1, 0.2, 2.0), vector(0.1, 0.2, 2.0), vector(0.1, 0.2, 2.0));
+    let mut red = flat(0.0);
+    (red.zenith, red.horizon, red.ground) = (vector(2.0, 0.2, 0.1), vector(2.0, 0.2, 0.1), vector(2.0, 0.2, 0.1));
+    let mut mirror = |sky: Sky, channel: usize| {
+        frame.sky = sky;
+        frame.draws = vec![draw(1, 1.0, 0.05)];
+        let image = render(&frame);
+        image.chunks(4).map(|t| f32::from(t[channel])).sum::<f32>() / (width * height) as f32
+    };
+    // BGRA: channel 0 is blue, 2 red.
+    assert!(mirror(blue, 0) > mirror(red, 0) * 1.5, "a metal floor reflects a blue sky");
+    assert!(mirror(red, 2) > mirror(blue, 2) * 1.5, "a metal floor reflects a red sky");
+    // Reflections follow the sky when its colors change from frame to frame.
+    let again = mirror(blue, 0);
+    assert!(again > 0.0);
+}

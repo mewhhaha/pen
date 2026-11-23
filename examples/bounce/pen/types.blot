@@ -252,6 +252,16 @@ type Sky is data = $Sky {
   ground: Vector,
   sun: Vector,
   night: F32,
+  tint: Vector,
+  sh0: Vector,
+  sh1: Vector,
+  sh2: Vector,
+  sh3: Vector,
+  sh4: Vector,
+  sh5: Vector,
+  sh6: Vector,
+  sh7: Vector,
+  sh8: Vector,
 }
 
 type Fog is data = $Fog {

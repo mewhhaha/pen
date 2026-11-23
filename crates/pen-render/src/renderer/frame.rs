@@ -327,6 +327,8 @@ impl State {
         self.clusters.update(&self.device, &self.queue, frame, targets.size);
         let device = self.device.clone();
         let mut encoder = device.create_command_encoder(&Default::default());
+        // The sky's reflection, drawn again if its colors changed.
+        self.environment.encode(&device, &mut encoder);
         // Timestamps around the passes, read back a few frames later, while
         // the host or a frame budget wants them.
         self.timer.begin(self.timing || self.resolution.budgeted());

@@ -136,8 +136,9 @@ impl State {
             }
             if self.inset_scenes[index].is_none() {
                 let uniform = uniform_buffer(&self.device, "inset scene", SCENE_BYTES);
-                let group = self.unshadowed_scene(&uniform);
-                self.inset_scenes[index] = Some(InsetScene { uniform, group });
+                let light = uniform_buffer(&self.device, "inset sky light", crate::environment::LIGHT_BYTES);
+                let group = self.unshadowed_scene(&uniform, &light);
+                self.inset_scenes[index] = Some(InsetScene { uniform, light, group });
             }
             let mut data = Floats::<80>::new();
             data.extend(inset.view).extend(inset.projection);
@@ -146,6 +147,9 @@ impl State {
             heavens(&mut data, &frame.sky, &inset.view);
             let scene = self.inset_scenes[index].as_ref().unwrap();
             self.queue.write_buffer(&scene.uniform, 0, data.bytes());
+            // An inset is lit by its own flat ambient light, with no sky to reflect.
+            let light = crate::environment::flat_floats(&inset.ambient);
+            self.queue.write_buffer(&scene.light, 0, bytemuck::cast_slice(&light));
             let targets = self.inset_targets[index].as_ref().unwrap();
             self.queue.write_buffer(
                 &targets.placement,

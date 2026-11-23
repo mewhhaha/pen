@@ -814,9 +814,9 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   at := at + 1
   stream.output[73] := canonical[at + 0]
   at := at + 1
-  stream.output[125] := canonical[at + 0]
+  stream.output[155] := canonical[at + 0]
   at := at + 1
-  stream.output[140] := canonical[at + 0]
+  stream.output[170] := canonical[at + 0]
   at := at + 1
   stream.output[74] := canonical[at + 0]
   stream.output[75] := canonical[at + 1]
@@ -837,67 +837,107 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   stream.output[86] := canonical[at + 0]
   at := at + 1
   stream.output[87] := canonical[at + 0]
-  at := at + 1
-  stream.output[88] := canonical[at + 0]
-  at := at + 1
-  stream.output[89] := canonical[at + 0]
-  at := at + 1
+  stream.output[88] := canonical[at + 1]
+  stream.output[89] := canonical[at + 2]
+  at := at + 3
   stream.output[90] := canonical[at + 0]
   stream.output[91] := canonical[at + 1]
   stream.output[92] := canonical[at + 2]
-  stream.output[93] := canonical[at + 3]
-  stream.output[94] := canonical[at + 4]
-  stream.output[95] := canonical[at + 5]
-  stream.output[96] := canonical[at + 6]
-  stream.output[97] := canonical[at + 7]
-  stream.output[98] := canonical[at + 8]
-  stream.output[99] := canonical[at + 9]
-  stream.output[100] := canonical[at + 10]
-  stream.output[101] := canonical[at + 11]
-  stream.output[102] := canonical[at + 12]
-  stream.output[103] := canonical[at + 13]
-  stream.output[104] := canonical[at + 14]
-  stream.output[105] := canonical[at + 15]
+  at := at + 3
+  stream.output[93] := canonical[at + 0]
+  stream.output[94] := canonical[at + 1]
+  stream.output[95] := canonical[at + 2]
+  at := at + 3
+  stream.output[96] := canonical[at + 0]
+  stream.output[97] := canonical[at + 1]
+  stream.output[98] := canonical[at + 2]
+  at := at + 3
+  stream.output[99] := canonical[at + 0]
+  stream.output[100] := canonical[at + 1]
+  stream.output[101] := canonical[at + 2]
+  at := at + 3
+  stream.output[102] := canonical[at + 0]
+  stream.output[103] := canonical[at + 1]
+  stream.output[104] := canonical[at + 2]
+  at := at + 3
+  stream.output[105] := canonical[at + 0]
+  stream.output[106] := canonical[at + 1]
+  stream.output[107] := canonical[at + 2]
+  at := at + 3
+  stream.output[108] := canonical[at + 0]
+  stream.output[109] := canonical[at + 1]
+  stream.output[110] := canonical[at + 2]
+  at := at + 3
+  stream.output[111] := canonical[at + 0]
+  stream.output[112] := canonical[at + 1]
+  stream.output[113] := canonical[at + 2]
+  at := at + 3
+  stream.output[114] := canonical[at + 0]
+  stream.output[115] := canonical[at + 1]
+  stream.output[116] := canonical[at + 2]
+  at := at + 3
+  stream.output[117] := canonical[at + 0]
+  at := at + 1
+  stream.output[118] := canonical[at + 0]
+  at := at + 1
+  stream.output[119] := canonical[at + 0]
+  at := at + 1
+  stream.output[120] := canonical[at + 0]
+  stream.output[121] := canonical[at + 1]
+  stream.output[122] := canonical[at + 2]
+  stream.output[123] := canonical[at + 3]
+  stream.output[124] := canonical[at + 4]
+  stream.output[125] := canonical[at + 5]
+  stream.output[126] := canonical[at + 6]
+  stream.output[127] := canonical[at + 7]
+  stream.output[128] := canonical[at + 8]
+  stream.output[129] := canonical[at + 9]
+  stream.output[130] := canonical[at + 10]
+  stream.output[131] := canonical[at + 11]
+  stream.output[132] := canonical[at + 12]
+  stream.output[133] := canonical[at + 13]
+  stream.output[134] := canonical[at + 14]
+  stream.output[135] := canonical[at + 15]
   at := at + 16
-  stream.output[106] := canonical[at + 0]
-  stream.output[107] := canonical[at + 1]
-  stream.output[108] := canonical[at + 2]
-  stream.output[109] := canonical[at + 3]
-  stream.output[110] := canonical[at + 4]
-  stream.output[111] := canonical[at + 5]
-  stream.output[112] := canonical[at + 6]
-  stream.output[113] := canonical[at + 7]
-  stream.output[114] := canonical[at + 8]
-  stream.output[115] := canonical[at + 9]
-  stream.output[116] := canonical[at + 10]
-  stream.output[117] := canonical[at + 11]
-  stream.output[118] := canonical[at + 12]
-  stream.output[119] := canonical[at + 13]
-  stream.output[120] := canonical[at + 14]
-  stream.output[121] := canonical[at + 15]
+  stream.output[136] := canonical[at + 0]
+  stream.output[137] := canonical[at + 1]
+  stream.output[138] := canonical[at + 2]
+  stream.output[139] := canonical[at + 3]
+  stream.output[140] := canonical[at + 4]
+  stream.output[141] := canonical[at + 5]
+  stream.output[142] := canonical[at + 6]
+  stream.output[143] := canonical[at + 7]
+  stream.output[144] := canonical[at + 8]
+  stream.output[145] := canonical[at + 9]
+  stream.output[146] := canonical[at + 10]
+  stream.output[147] := canonical[at + 11]
+  stream.output[148] := canonical[at + 12]
+  stream.output[149] := canonical[at + 13]
+  stream.output[150] := canonical[at + 14]
+  stream.output[151] := canonical[at + 15]
   at := at + 16
-  stream.output[122] := canonical[at + 0]
+  stream.output[152] := canonical[at + 0]
   at := at + 1
-  stream.output[123] := canonical[at + 0]
+  stream.output[153] := canonical[at + 0]
   at := at + 1
-  stream.output[124] := canonical[at + 0]
+  stream.output[154] := canonical[at + 0]
   at := at + 1
-  stream.output[126] := canonical[at + 0]
+  stream.output[156] := canonical[at + 0]
   at := at + 1
-  stream.output[127] := canonical[at + 0]
-  stream.output[128] := canonical[at + 1]
+  stream.output[157] := canonical[at + 0]
+  stream.output[158] := canonical[at + 1]
   at := at + 2
-  stream.output[129] := canonical[at + 0]
+  stream.output[159] := canonical[at + 0]
   at := at + 1
-  stream.output[144] := canonical[at + 0]
+  stream.output[174] := canonical[at + 0]
   at := at + 1
-  stream.output[145] := canonical[at + 0]
+  stream.output[175] := canonical[at + 0]
   at := at + 1
-  stream.output[146] := canonical[at + 0]
+  stream.output[176] := canonical[at + 0]
   at := at + 1
-  stream.output[147] := canonical[at + 0]
+  stream.output[177] := canonical[at + 0]
   at := at + 1
-  stream.output[148] := canonical[at + 0]
+  stream.output[178] := canonical[at + 0]
   at := at + 1
   let state_start: U32 = stream.output.length
   let state_count: U32 = 0
@@ -979,8 +1019,8 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. fields_count:
     stream := field_into canonical stream
   at := stream.at
-  stream.output[130] := U32.to_f32 fields_count
-  stream.output[131] := U32.to_f32 (stream.output.length - fields_start)
+  stream.output[160] := U32.to_f32 fields_count
+  stream.output[161] := U32.to_f32 (stream.output.length - fields_start)
   let ui_start: U32 = stream.output.length
   let ui_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -988,8 +1028,8 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. ui_count:
     stream := ui_into canonical stream
   at := stream.at
-  stream.output[132] := U32.to_f32 ui_count
-  stream.output[133] := U32.to_f32 (stream.output.length - ui_start)
+  stream.output[162] := U32.to_f32 ui_count
+  stream.output[163] := U32.to_f32 (stream.output.length - ui_start)
   let services_start: U32 = stream.output.length
   let services_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -997,8 +1037,8 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. services_count:
     stream := service_into canonical stream
   at := stream.at
-  stream.output[134] := U32.to_f32 services_count
-  stream.output[135] := U32.to_f32 (stream.output.length - services_start)
+  stream.output[164] := U32.to_f32 services_count
+  stream.output[165] := U32.to_f32 (stream.output.length - services_start)
   let buses_start: U32 = stream.output.length
   let buses_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -1006,7 +1046,7 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. buses_count:
     stream := buse_into canonical stream
   at := stream.at
-  stream.output[136] := U32.to_f32 buses_count
+  stream.output[166] := U32.to_f32 buses_count
   let voices_start: U32 = stream.output.length
   let voices_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -1014,7 +1054,7 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. voices_count:
     stream := voice_into canonical stream
   at := stream.at
-  stream.output[137] := U32.to_f32 voices_count
+  stream.output[167] := U32.to_f32 voices_count
   let poses_start: U32 = stream.output.length
   let poses_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -1022,7 +1062,7 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. poses_count:
     stream := pose_into canonical stream
   at := stream.at
-  stream.output[138] := U32.to_f32 poses_count
+  stream.output[168] := U32.to_f32 poses_count
   let emitters_start: U32 = stream.output.length
   let emitters_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -1030,7 +1070,7 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. emitters_count:
     stream := emitter_into canonical stream
   at := stream.at
-  stream.output[139] := U32.to_f32 emitters_count
+  stream.output[169] := U32.to_f32 emitters_count
   let lights_start: U32 = stream.output.length
   let lights_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -1038,7 +1078,7 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. lights_count:
     stream := light_into canonical stream
   at := stream.at
-  stream.output[141] := U32.to_f32 lights_count
+  stream.output[171] := U32.to_f32 lights_count
   let listener_start: U32 = stream.output.length
   let listener_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -1046,7 +1086,7 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. listener_count:
     stream := listener_into canonical stream
   at := stream.at
-  stream.output[142] := U32.to_f32 listener_count
+  stream.output[172] := U32.to_f32 listener_count
   let panners_start: U32 = stream.output.length
   let panners_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -1054,7 +1094,7 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. panners_count:
     stream := panner_into canonical stream
   at := stream.at
-  stream.output[143] := U32.to_f32 panners_count
+  stream.output[173] := U32.to_f32 panners_count
   let instances_start: U32 = stream.output.length
   let instances_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -1062,7 +1102,7 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. instances_count:
     stream := instance_into canonical stream
   at := stream.at
-  stream.output[149] := U32.to_f32 instances_count
+  stream.output[179] := U32.to_f32 instances_count
   let instance_removals_start: U32 = stream.output.length
   let instance_removals_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1
@@ -1070,7 +1110,7 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   for 0 .. instance_removals_count:
     stream := instance_removal_into canonical stream
   at := stream.at
-  stream.output[150] := U32.to_f32 instance_removals_count
+  stream.output[180] := U32.to_f32 instance_removals_count
   let extras_start: U32 = stream.output.length
   for value in stream.extras:
     @storage.push stream.output value

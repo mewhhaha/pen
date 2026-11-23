@@ -41,11 +41,29 @@ fn parse_env_bool(name: &str) -> Option<bool> {
         .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o111) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return Some(candidate);
         }
     }
@@ -809,7 +827,7 @@ fn run_cmd_output_with_deadline(
 /// `GNU_PROPERTY_X86_FEATURE_1_SHSTK`.
 #[cfg(all(feature = "compiler", target_os = "linux", target_arch = "x86_64"))]
 fn elf64_has_x86_shstk_property(elf: &[u8]) -> bool {
-    if elf.len() < 64 || &elf[0..4] != b"\x7fELF" {
+    if elf.len() < 64 || &elf[0..4] != b"\x7fELF" || elf[4] != 2 || elf[5] != 1 {
         return false;
     }
     let Ok(e_phoff) = usize::try_from(u64::from_le_bytes(elf[32..40].try_into().unwrap())) else {
@@ -910,24 +928,84 @@ fn elf64_has_x86_shstk_property(elf: &[u8]) -> bool {
     false
 }
 
-/// Computes the exact same `(cc_ver, full_64_hex_cc_target_digest, has_cet_return, has_stack_clash)`
-/// C compiler identity as `wtime-aot`'s `cgen.rs` + `build.rs`.
+/// Resolves the actual linker binary invoked by the C compiler driver (`ld.lld` when `-fuse-ld=lld`
+/// is used, otherwise `ld` via `cc -print-prog-name=<linker>` with `PATH` fallback) and returns its
+/// canonical path and file stamp.
+#[cfg(feature = "compiler")]
+fn resolve_driver_linker(
+    cc_str: &str,
+    has_lld: bool,
+    scratch_dir: &Path,
+    deadline: Instant,
+) -> Result<(PathBuf, BinStamp)> {
+    let prog = if has_lld { "ld.lld" } else { "ld" };
+    let mut cmd = Command::new(cc_str);
+    cmd.env_clear();
+    for var in ["PATH", "HOME", "TMPDIR"] {
+        if let Some(v) = std::env::var_os(var) {
+            cmd.env(var, v);
+        }
+    }
+    cmd.arg(format!("-print-prog-name={prog}"));
+    let out = run_cmd_output_with_deadline(cmd, scratch_dir, &format!("{cc_str} -print-prog-name={prog}"), deadline)?;
+    let candidate = if out.status.success() {
+        let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !printed.is_empty() {
+            let p = PathBuf::from(&printed);
+            if is_executable_file(&p) {
+                Some(p)
+            } else if p.components().count() == 1 {
+                find_in_path(&printed)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+    .or_else(|| find_in_path(prog))
+    .ok_or_else(|| anyhow!("could not resolve driver linker {prog} for C compiler {cc_str}"))?;
+    let canon = std::fs::canonicalize(&candidate)
+        .with_context(|| format!("canonicalizing linker {}", candidate.display()))?;
+    let stamp = bin_stamp(&canon)?;
+    Ok((canon, stamp))
+}
+
+/// Computes the exact same C compiler & driver-selected linker identity as `wtime-aot`'s `cgen.rs` +
+/// `build.rs`, including SHA-256 digests of BOTH `canon_cc` and `canon_linker`.
 ///
-/// Keyed by `(canon_cc, bin_stamp, lld_stamp, host_cpu_fingerprint, target_cpu)` in BOTH an
-/// in-process `OnceLock` cache AND an owner-private `<canon_cache>/cc-probe/` file so:
-/// 1. Warm fresh-process `pen run` launches spawn ZERO compiler subprocesses (~20 us `stat`+read);
-/// 2. Mid-process or cross-process C toolchain / linker upgrades invalidate immediately;
+/// Keyed by `(cc_name, canon_cc, bin_stamp, lld_key, ld_key, host_cpu_fingerprint, target_cpu)` in
+/// BOTH an in-process `OnceLock` cache AND an owner-private `<canon_cache>/cc-probe/` file (which
+/// also verifies `bin_stamp(&canon_linker) == linker_stamp` on hit) so:
+/// 1. Warm fresh-process `pen run` launches spawn ZERO compiler subprocesses and avoid re-hashing
+///    compiler/linker binaries (~25 us `stat`+read);
+/// 2. Mid-process or cross-process C toolchain or linker upgrades (even same-version rebuilds)
+///    invalidate immediately;
 /// 3. The hashed identity matches `wtime-aot/src/build.rs` 1:1, including link-level SHSTK check.
 #[cfg(feature = "compiler")]
-type CcIdentityKey = (PathBuf, BinStamp, Option<(PathBuf, BinStamp)>, String, String);
+type CcIdentityKey = (
+    &'static str,
+    PathBuf,
+    BinStamp,
+    Option<(PathBuf, BinStamp)>,
+    Option<(PathBuf, BinStamp)>,
+    String,
+    String,
+);
 #[cfg(feature = "compiler")]
-type CcIdentityVal = (String, String, bool, bool);
-#[cfg(feature = "compiler")]
+#[derive(Clone)]
 struct ResolvedCcIdentity {
     cc_name: &'static str,
     canon_cc: PathBuf,
     stamp: BinStamp,
     lld_key: Option<(PathBuf, BinStamp)>,
+    has_lld: bool,
+    canon_linker: PathBuf,
+    linker_stamp: BinStamp,
+    cc_sha256: String,
+    linker_sha256: String,
     cc_ver: String,
     cc_target: String,
     has_cet_return: bool,
@@ -937,38 +1015,41 @@ struct ResolvedCcIdentity {
 #[cfg(feature = "compiler")]
 fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) -> Result<ResolvedCcIdentity> {
     use sha2::{Digest, Sha256};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<CcIdentityKey, CcIdentityVal>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<CcIdentityKey, ResolvedCcIdentity>>> = OnceLock::new();
     let host_fp = host_cpu_fingerprint().to_string();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let probe_dir = ensure_private_cache_dir(&canon_cache.join("cc-probe"))?;
     let lld_key = find_in_path("ld.lld")
         .and_then(|p| std::fs::canonicalize(&p).ok())
         .and_then(|c| bin_stamp(&c).ok().map(|s| (c, s)));
+    let ld_key = find_in_path("ld")
+        .and_then(|p| std::fs::canonicalize(&p).ok())
+        .and_then(|c| bin_stamp(&c).ok().map(|s| (c, s)));
     for cc in ["clang", "cc", "gcc"] {
         let Some(p) = find_in_path(cc) else { continue };
         let Ok(canon_cc) = std::fs::canonicalize(&p) else { continue };
         let Ok(stamp) = bin_stamp(&canon_cc) else { continue };
-        let mem_key = (canon_cc.clone(), stamp, lld_key.clone(), host_fp.clone(), target_cpu.to_string());
-        if let Some((cc_ver, cc_target, has_cet_return, has_stack_clash)) =
-            cache.lock().unwrap_or_else(|p| p.into_inner()).get(&mem_key).cloned()
+        let mem_key = (
+            cc,
+            canon_cc.clone(),
+            stamp,
+            lld_key.clone(),
+            ld_key.clone(),
+            host_fp.clone(),
+            target_cpu.to_string(),
+        );
+        if let Some(hit) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&mem_key).cloned()
+            && bin_stamp(&hit.canon_linker).is_ok_and(|s| s == hit.linker_stamp)
         {
-            return Ok(ResolvedCcIdentity {
-                cc_name: cc,
-                canon_cc,
-                stamp,
-                lld_key: lld_key.clone(),
-                cc_ver,
-                cc_target,
-                has_cet_return,
-                has_stack_clash,
-            });
+            return Ok(hit);
         }
 
         let probe_key_line = format!(
-            "v2|{}|{:?}|{:?}|{}|{}",
+            "v3|{cc}|{}|{:?}|{:?}|{:?}|{}|{}",
             canon_cc.display(),
             stamp,
             lld_key,
+            ld_key,
             host_fp,
             target_cpu
         );
@@ -993,26 +1074,63 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
                 && let Ok(text) = std::fs::read_to_string(&probe_file)
             {
                 let mut lines = text.lines();
-                if let (Some(k), Some(ver), Some(digest), Some(cet), Some(sc)) =
-                    (lines.next(), lines.next(), lines.next(), lines.next(), lines.next())
+                if let (
+                    Some(k),
+                    Some(ver),
+                    Some(digest),
+                    Some(cet),
+                    Some(sc),
+                    Some(cc_sha),
+                    Some(linker_path),
+                    Some(linker_stamp_str),
+                    Some(linker_sha),
+                    Some(has_lld_str),
+                ) = (
+                    lines.next(),
+                    lines.next(),
+                    lines.next(),
+                    lines.next(),
+                    lines.next(),
+                    lines.next(),
+                    lines.next(),
+                    lines.next(),
+                    lines.next(),
+                    lines.next(),
+                )
                     && k == probe_key_line
                     && digest.len() == 64
                     && digest.bytes().all(|b| b.is_ascii_hexdigit())
+                    && cc_sha.len() == 64
+                    && cc_sha.bytes().all(|b| b.is_ascii_hexdigit())
+                    && linker_sha.len() == 64
+                    && linker_sha.bytes().all(|b| b.is_ascii_hexdigit())
                     && (cet == "0" || cet == "1")
                     && (sc == "0" || sc == "1")
+                    && (has_lld_str == "0" || has_lld_str == "1")
+                    && !linker_path.is_empty()
                 {
-                    let id = (ver.to_string(), digest.to_string(), cet == "1", sc == "1");
-                    cache.lock().unwrap_or_else(|p| p.into_inner()).insert(mem_key, id.clone());
-                    return Ok(ResolvedCcIdentity {
-                        cc_name: cc,
-                        canon_cc,
-                        stamp,
-                        lld_key: lld_key.clone(),
-                        cc_ver: id.0,
-                        cc_target: id.1,
-                        has_cet_return: id.2,
-                        has_stack_clash: id.3,
-                    });
+                    let canon_linker = PathBuf::from(linker_path);
+                    if let Ok(cur_linker_stamp) = bin_stamp(&canon_linker)
+                        && format!("{cur_linker_stamp:?}") == linker_stamp_str
+                    {
+                        let resolved = ResolvedCcIdentity {
+                            cc_name: cc,
+                            canon_cc,
+                            stamp,
+                            lld_key: lld_key.clone(),
+                            has_lld: has_lld_str == "1",
+                            canon_linker,
+                            linker_stamp: cur_linker_stamp,
+                            cc_sha256: cc_sha.to_string(),
+                            linker_sha256: linker_sha.to_string(),
+                            cc_ver: ver.to_string(),
+                            cc_target: digest.to_string(),
+                            has_cet_return: cet == "1",
+                            has_stack_clash: sc == "1",
+                        };
+                        cache.lock().unwrap_or_else(|p| p.into_inner()).insert(mem_key, resolved.clone());
+                        return Ok(resolved);
+                    }
                 }
             }
         }
@@ -1085,6 +1203,9 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
         } else {
             false
         };
+        let (canon_linker, linker_stamp) = resolve_driver_linker(&cc_str, has_lld, &probe_dir, deadline)?;
+        let cc_sha256 = file_sha256_hex(&canon_cc)?;
+        let linker_sha256 = file_sha256_hex(&canon_linker)?;
 
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         let has_cet_return = {
@@ -1108,7 +1229,6 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
         };
         #[cfg(all(not(target_os = "linux"), target_arch = "x86_64"))]
         let has_cet_return = {
-            let _ = has_lld;
             let mut cet_cmd = clean_cc();
             cet_cmd.args(["-x", "c", "-c", "-fcf-protection=return", "-o", "/dev/null", "-"]);
             run_cmd_output_with_deadline(cet_cmd, &probe_dir, "probing -fcf-protection=return", deadline)?
@@ -1116,10 +1236,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
                 .success()
         };
         #[cfg(not(target_arch = "x86_64"))]
-        let has_cet_return = {
-            let _ = has_lld;
-            false
-        };
+        let has_cet_return = false;
 
         let has_stack_clash = {
             let mut sc_cmd = clean_cc();
@@ -1129,31 +1246,42 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
                 .success()
         };
 
-        let body = format!(
-            "{probe_key_line}\n{cc_ver}\n{cc_target}\n{}\n{}\n",
-            u8::from(has_cet_return),
-            u8::from(has_stack_clash)
-        );
-        if let Ok((mut tmp_file, tmp)) = create_private_temp_file(&probe_dir, "probe", ".tmp") {
-            let ok = tmp_file.write_all(body.as_bytes()).is_ok();
-            drop(tmp_file);
-            if !ok || std::fs::rename(&tmp, &probe_file).is_err() {
-                let _ = std::fs::remove_file(&tmp);
+        if let Some(linker_str) = canon_linker.to_str()
+            && !linker_str.contains('\n')
+            && !linker_str.contains('\r')
+        {
+            let body = format!(
+                "{probe_key_line}\n{cc_ver}\n{cc_target}\n{}\n{}\n{cc_sha256}\n{linker_str}\n{linker_stamp:?}\n{linker_sha256}\n{}\n",
+                u8::from(has_cet_return),
+                u8::from(has_stack_clash),
+                u8::from(has_lld),
+            );
+            if let Ok((mut tmp_file, tmp)) = create_private_temp_file(&probe_dir, "probe", ".tmp") {
+                let ok = tmp_file.write_all(body.as_bytes()).is_ok();
+                drop(tmp_file);
+                if !ok || std::fs::rename(&tmp, &probe_file).is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
             }
         }
 
-        let id = (cc_ver, cc_target, has_cet_return, has_stack_clash);
-        cache.lock().unwrap_or_else(|p| p.into_inner()).insert(mem_key, id.clone());
-        return Ok(ResolvedCcIdentity {
+        let resolved = ResolvedCcIdentity {
             cc_name: cc,
             canon_cc,
             stamp,
             lld_key: lld_key.clone(),
-            cc_ver: id.0,
-            cc_target: id.1,
-            has_cet_return: id.2,
-            has_stack_clash: id.3,
-        });
+            has_lld,
+            canon_linker,
+            linker_stamp,
+            cc_sha256,
+            linker_sha256,
+            cc_ver,
+            cc_target,
+            has_cet_return,
+            has_stack_clash,
+        };
+        cache.lock().unwrap_or_else(|p| p.into_inner()).insert(mem_key, resolved.clone());
+        return Ok(resolved);
     }
     bail!("no C compiler found (install clang or gcc)")
 }
@@ -1263,7 +1391,7 @@ enum ShstkStatus {
 }
 
 /// Inspects the calling Linux thread's CET hardware shadow-stack (`shstk`) state via
-/// `/proc/thread-self/status` `x86_Thread_features:` (zero unsafe, zero syscalls).
+/// `/proc/thread-self/status` `x86_Thread_features:` (zero unsafe).
 /// Distinguishes confirmed-off from unavailable/indeterminate status so strict CET loaders never
 /// fail opaquely behind a false "off" assumption.
 #[cfg(all(feature = "compiler", target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
@@ -1529,11 +1657,13 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
             }
             let cc_ver_hash = wasm_sha256_hex(cc_id.cc_ver.as_bytes());
             let tag = format!(
-                "c-{}-{}-{}-{}-cet{}-sc{}",
+                "c-{}-{}-{}-{}-{}-{}-cet{}-sc{}",
                 sanitize_key_part(c_opt),
                 sanitize_key_part(target_cpu),
                 cc_ver_hash,
                 cc_id.cc_target,
+                cc_id.cc_sha256,
+                cc_id.linker_sha256,
                 u8::from(cc_id.has_cet_return),
                 u8::from(cc_id.has_stack_clash),
             );
@@ -1712,9 +1842,9 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
                     }
                 }
                 ver_cmd.arg("--version");
-                if run_cmd_output_with_deadline(ver_cmd, &canon_cache, &format!("{cand} --version"), deadline)
-                    .is_ok_and(|o| o.status.success())
-                {
+                let higher_out =
+                    run_cmd_output_with_deadline(ver_cmd, &canon_cache, &format!("{cand} --version"), deadline)?;
+                if higher_out.status.success() {
                     bail!(
                         "higher-precedence C compiler {cand} ({}) appeared on PATH during build (previously selected {cc_name}); refusing to bind artifact to stale provenance",
                         canon_higher.display()
@@ -1727,8 +1857,11 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         let post_canon_cc = std::fs::canonicalize(&post_found)
             .with_context(|| format!("canonicalizing post-build C compiler {}", post_found.display()))?;
         let post_cc_stamp = bin_stamp(&post_canon_cc)?;
+        let post_cc_sha256 = file_sha256_hex(&post_canon_cc)?;
         ensure!(
-            post_canon_cc == pre_cc.canon_cc && pre_cc.stamp == post_cc_stamp,
+            post_canon_cc == pre_cc.canon_cc
+                && pre_cc.stamp == post_cc_stamp
+                && post_cc_sha256 == pre_cc.cc_sha256,
             "C compiler {cc_name} changed during build ({} -> {}); refusing to bind artifact to stale provenance",
             pre_cc.canon_cc.display(),
             post_canon_cc.display()
@@ -1739,6 +1872,17 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         ensure!(
             post_lld_key == pre_cc.lld_key,
             "linker ld.lld changed on PATH during build; refusing to bind artifact to stale provenance"
+        );
+        let (post_canon_linker, post_linker_stamp) =
+            resolve_driver_linker(&post_canon_cc.to_string_lossy(), pre_cc.has_lld, &canon_cache, deadline)?;
+        let post_linker_sha256 = file_sha256_hex(&post_canon_linker)?;
+        ensure!(
+            post_canon_linker == pre_cc.canon_linker
+                && post_linker_stamp == pre_cc.linker_stamp
+                && post_linker_sha256 == pre_cc.linker_sha256,
+            "driver-selected linker changed during build ({} -> {}); refusing to bind artifact to stale provenance",
+            pre_cc.canon_linker.display(),
+            post_canon_linker.display()
         );
     }
     if let Some((ref pre_rust, ref pre_rt_fp)) = resolved_rust {

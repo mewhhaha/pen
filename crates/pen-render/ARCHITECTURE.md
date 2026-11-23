@@ -407,11 +407,19 @@ one array, this frame's and last frame's: bindings 9 and 12); the colour a ray
 meets is last frame's TAA output at the point's reprojection (binding 13), so
 a hit costs nothing to shade. In the material's own fragment shader, a ray (jittered through the
 GGX lobe by a per-pixel, per-frame noise) is marched in the pixels it crosses,
-linearly (16 or 32 steps at a stride that spans the visible part of the ray) with
+linearly (16 or 32 steps at a stride that spans the visible part of the ray, with a start offset turned by noise) with
 the ray's depth interpolated perspective-correctly, then halved 4 or 6 times
 between the last step in front and the first behind; a hit must lie within
-a thickness (4% of its distance from the eye, plus what a step crosses) of the
-ray. The surface's normal is rebuilt from the depth around the hit, and a hit
+a thickness of the ray: 4% of the surface's distance from the eye, plus the depth
+the ray itself crosses in a step, plus how much the surface's depth changed since the
+last step (up to a quarter of its distance). That last term matters: a surface seen at a
+grazing angle (the ceiling from the near floor, a side wall near its corner) changes its
+depth by more than any fixed thickness between two steps of a coarse stride, and without
+it the march missed it in stripes of rows, and left saw-toothed edges where such a
+reflection ends. A hit must also come from in front of the surface (the last sample was
+not already behind it), so a ray that has gone behind a thin occluder does not hit what
+lies deeper. The jitter's far tenth is left out of the GGX lobe, so that a rare sample
+does not meet another wall altogether and leave a speck that TAA cannot average away. The surface's normal is rebuilt from the depth around the hit, and a hit
 whose normal faces away from the ray is dropped (a back face). Confidence is
 the product of: the screen edge (the hit's distance to the border over 8% of the
 picture), the ray's length against its reach (20 or 40 world units, fading over the last

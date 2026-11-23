@@ -304,8 +304,16 @@ impl Scene {
         for (n, c) in materials {
             files.push((
                 format!("{n}.material.json"),
-                format!(r#"{{"shader":"room.wgsl","color":[{},{},{},1],"lighting":"lit"}}"#, c[0], c[1], c[2])
-                    .into_bytes(),
+                // A material named `..._nocast` casts no shadow, so it is not in the depth
+                // the march reads.
+                format!(
+                    r#"{{"shader":"room.wgsl","color":[{},{},{},1],"lighting":"lit","shadow":{}}}"#,
+                    c[0],
+                    c[1],
+                    c[2],
+                    !n.ends_with("_nocast")
+                )
+                .into_bytes(),
             ));
         }
         let borrowed: Vec<(&str, &[u8])> = files.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
@@ -753,17 +761,25 @@ fn rays_that_meet_the_back_of_a_surface_hit_nothing() {
     assert!(red * 50 < crossings, "back faces never reflect: {red} of {crossings}");
 }
 
-#[test]
-fn the_glossy_room_with_the_sky_alone_with_probes_and_with_the_march_too() {
-    let size = (800, 500);
+/// The glossy room with an orange block on its floor, seen from near a corner.
+fn glossy_room(name: &str, size: (u32, u32), ceiling_casts: bool) -> Option<(Scene, RenderFrame)> {
     let mut meshes = room();
     meshes.push(quads(&cuboid([0.6, 0.0, -1.6], [1.8, 1.3, -0.4])));
     let mut materials = WALLS.to_vec();
+    if !ceiling_casts {
+        materials[5].0 = "ceiling_nocast";
+    }
     materials.push(("orange", [0.95, 0.4, 0.05]));
-    let Some(mut scene) = Scene::new("room-shots", &meshes, &materials, size) else { return };
-    let eye = [-0.8, 1.7, 3.3];
-    let mut frame = room_frame(size, eye, [0.3, 0.5, -2.0]);
+    let scene = Scene::new(name, &meshes, &materials, size)?;
+    let mut frame = room_frame(size, [-0.8, 1.7, 3.3], [0.3, 0.5, -2.0]);
     frame.draws.push(draw(6, 7, 0.0, 0.9));
+    Some((scene, frame))
+}
+
+#[test]
+fn the_glossy_room_with_the_sky_alone_with_probes_and_with_the_march_too() {
+    let size = (800, 500);
+    let Some((mut scene, mut frame)) = glossy_room("room-shots", size, true) else { return };
     scene.settle(&frame, 7);
     let sky_only = scene.shoot(&frame, 3);
     scene.save(&sky_only, "room-1-sky-only.png");
@@ -785,4 +801,89 @@ fn the_glossy_room_with_the_sky_alone_with_probes_and_with_the_march_too() {
     );
     assert!(orange(at(&both, size, px, py)), "orange in the mirror");
     assert!(!orange(at(&probes, size, px, py)) && !orange(at(&sky_only, size, px, py)));
+}
+
+/// The mean absolute second difference down each column of `rows`: a smooth gradient has
+/// none, stripes have a great deal.
+fn vertical_curvature(
+    pixels: &[[f32; 3]],
+    width: u32,
+    columns: std::ops::Range<u32>,
+    rows: std::ops::Range<u32>,
+) -> f32 {
+    let (mut sum, mut n) = (0.0, 0u32);
+    for x in columns {
+        for y in rows.start + 1..rows.end - 1 {
+            let at = |y: u32| pixels[(y * width + x) as usize];
+            let (a, b, c) = (at(y - 1), at(y), at(y + 1));
+            sum += (0..3).map(|k| (a[k] - 2.0 * b[k] + c[k]).abs()).sum::<f32>();
+            n += 1;
+        }
+    }
+    sum / n as f32
+}
+
+fn mean_difference(
+    a: &[[f32; 3]],
+    b: &[[f32; 3]],
+    width: u32,
+    columns: std::ops::Range<u32>,
+    rows: std::ops::Range<u32>,
+) -> f32 {
+    let (mut sum, mut n) = (0.0, 0u32);
+    for y in rows {
+        for x in columns.clone() {
+            let (p, q) = (a[(y * width + x) as usize], b[(y * width + x) as usize]);
+            sum += (p[0] - q[0]).abs() + (p[1] - q[1]).abs() + (p[2] - q[2]).abs();
+            n += 1;
+        }
+    }
+    sum / n as f32
+}
+
+// A march with a coarse step (a surface seen at a grazing angle, like the ceiling from the
+// near floor, changes its depth by more than the thickness from one step to the next) once
+// missed hits in stripes across the near floor and left saw-toothed edges where the wall
+// reflections end. The near floor reflecting the ceiling and the far wall must be smooth,
+// and where the march has nothing to hit the probe's reflection must remain.
+#[test]
+fn the_march_leaves_the_near_floor_smooth_and_falls_back_to_the_probe() {
+    let size = (800, 500);
+    // The near floor in the middle of the frame, below the block's reflection, and the
+    // whole width of it.
+    let (middle, wide) = ((250..470, 410..496), (150..650, 400..496));
+    for ceiling_casts in [true, false] {
+        let Some((mut scene, mut frame)) = glossy_room("room-smooth", size, ceiling_casts) else { return };
+        frame.reflection_probes = vec![probe(1, 1)];
+        frame.reflection.budget = 6;
+        scene.settle(&frame, 7);
+        let probes_only = scene.shoot(&frame, 4);
+        frame.quality.ssr = 2;
+        let marched = scene.shoot(&frame, 40);
+        scene.save(&marched, if ceiling_casts { "room-smooth-ssr.png" } else { "room-smooth-no-ceiling-hits.png" });
+        let curvature = vertical_curvature(&marched, size.0, middle.0.clone(), middle.1.clone());
+        let reference = vertical_curvature(&probes_only, size.0, middle.0.clone(), middle.1.clone());
+        let difference = mean_difference(&marched, &probes_only, size.0, middle.0.clone(), middle.1.clone());
+        let across = mean_difference(&marched, &probes_only, size.0, wide.0.clone(), wide.1.clone());
+        eprintln!(
+            "ceiling casts {ceiling_casts}: curvature {curvature:.5} (probes {reference:.5}), difference {difference:.5}, across {across:.5}"
+        );
+        assert!(curvature < reference + 0.0015, "stripes: {curvature} against {reference}");
+        if ceiling_casts {
+            // The march hits the ceiling and the far wall: their own light, to the cube's blur.
+            assert!(difference < 0.06 && across < 0.08, "{difference} {across}");
+        } else {
+            // Nothing to hit but sky past the screen: the probe's reflection, whole.
+            assert!(difference < 0.012 && across < 0.03, "{difference} {across}");
+        }
+        // Edges hold after convergence: a frame later and a jitter's cycle later the floor's
+        // reflections have not moved.
+        let next = scene.shoot(&frame, 1);
+        let later = scene.shoot(&frame, 8);
+        let rows = 300..496;
+        let step = mean_difference(&marched, &next, size.0, 0..size.0, rows.clone());
+        let cycle = mean_difference(&marched, &later, size.0, 0..size.0, rows);
+        eprintln!("floor between frames: {step:.5}, a cycle later {cycle:.5}");
+        assert!(step < 0.004 && cycle < 0.004, "reflection edges shimmer: {step} {cycle}");
+    }
 }

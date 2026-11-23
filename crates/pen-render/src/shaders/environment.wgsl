@@ -400,6 +400,10 @@ fn ssr_march(origin: vec3f, direction: vec3f, pixel_start: vec2f, size: vec2f, l
   let jitter = ssr_noise(pixel_start, 3.0);
   let size_i = vec2i(size);
   var previous = 0.0;
+  // How far the ray was behind the surface at the last sample (negative: in front),
+  // and how far that surface was.
+  var last_behind = -1.0;
+  var last_scene = -1.0;
   for (var i = 0; i < count; i++) {
     // How far along the full segment, as a share of its pixels.
     let s = (f32(i) + 1.0 + jitter) * stride / span;
@@ -408,12 +412,23 @@ fn ssr_march(origin: vec3f, direction: vec3f, pixel_start: vec2f, size: vec2f, l
     }
     let pixel = p0 + delta * s;
     let depth = ssr_depth_at(vec2i(floor(pixel)), layer, size_i);
-    let step_gap = abs(ssr_distance(mix(z0, z1, s)) - ssr_distance(mix(z0, z1, previous)));
+    let ahead = ssr_distance(mix(z0, z1, s));
+    let step_gap = abs(ahead - ssr_distance(mix(z0, z1, previous)));
     if (depth < 1.0) {
-      let ahead = ssr_distance(mix(z0, z1, s));
-      let behind = ahead - ssr_distance(depth);
-      let thick = sky_light.ssr.z * ssr_distance(depth) + step_gap;
-      if (behind > 0.0 && behind < thick) {
+      let scene = ssr_distance(depth);
+      let behind = ahead - scene;
+      // A surface seen at a grazing angle changes its depth a good deal from one
+      // step to the next, so the ray may be well behind it at the first sample
+      // past it; allow that slope (within a quarter of the distance, so that the
+      // jump to a different, nearer surface does not count) as well as the
+      // thickness and the depth the ray itself crosses in a step.
+      var slope = 0.0;
+      if (last_scene > 0.0) {
+        slope = min(abs(scene - last_scene), 0.25 * scene);
+      }
+      let thick = sky_light.ssr.z * scene + step_gap + slope;
+      // The ray must have come from in front of it, not from behind it already.
+      if (behind > 0.0 && behind < thick && last_behind <= 0.0) {
         // Halve between the last step and this one.
         var low = previous;
         var high = s;
@@ -429,6 +444,10 @@ fn ssr_march(origin: vec3f, direction: vec3f, pixel_start: vec2f, size: vec2f, l
         let hit = p0 + delta * high;
         return vec4f(hit, 0.0, 1.0);
       }
+      last_behind = behind;
+      last_scene = scene;
+    } else {
+      last_behind = -1.0;
     }
     previous = s;
   }
@@ -487,7 +506,10 @@ fn screen_reflection(world: vec3f, normal: vec3f, view: vec3f, roughness: f32) -
   var direction = reflect(-view, normal);
   if (roughness > 0.04) {
     let a = roughness * roughness;
-    let u = vec2f(ssr_noise(start, 0.0), ssr_noise(start, 1.0));
+    // The lobe's farthest tenth is left out: one sample in a thousand that far out would
+    // meet a different wall altogether, and be a speck that temporal antialiasing cannot
+    // average away.
+    let u = vec2f(ssr_noise(start, 0.0), 0.9 * ssr_noise(start, 1.0));
     let cos_theta = sqrt((1.0 - u.y) / (1.0 + (a * a - 1.0) * u.y));
     let sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
     let phi = 6.2831853 * u.x;

@@ -1184,6 +1184,22 @@ pub mod types {
         /// The cosine of the half-angle of a spot light's cone, where its light ends; -1 for a
         /// point light, which shines all round.
         pub outer: f32,
+        /// Whether it asks to cast shadows; the host picks which of those do, within
+        /// `shadow.local`.
+        pub shadow: bool,
+        /// A number that stays with the light from frame to frame: it breaks ties between
+        /// equally large casters and names the shadow map the host may keep.
+        pub id: u32,
+    }
+    /// One sun shadow map.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Cascade {
+        /// The map's orthographic window, depth range included, in the light's view.
+        pub projection: Matrix,
+        /// A map texel's width in world units.
+        pub texel: f32,
+        /// How far ahead of the camera, along its view, the slice this map covers ends.
+        pub far: f32,
     }
     /// A diffuse light probe: nine spherical-harmonic RGB terms of the light there, and whether
     /// it is valid.
@@ -1353,10 +1369,29 @@ pub mod types {
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Shadow {
         pub view: Matrix,
-        pub projection: Matrix,
-        /// A map texel's width in world units.
-        pub texel: f32,
+        /// The width of each sun cascade's map in texels; 0 for no sun shadows.
         pub texels: u32,
+        /// How soft the sun's shadows are: 0 hard (one hardware-filtered tap), 1
+        /// percentage-closer filtering over a rotated Poisson disk of a few texels, 2
+        /// percentage-closer soft shadows (a blocker search sets the penumbra from `softness`,
+        /// contact hardening).
+        pub filter: u32,
+        /// The sun's size for soft shadows: the width of the penumbra per unit of distance
+        /// between the receiver and its blocker, about twice the tangent of the sun's angular
+        /// radius. 0 keeps only the filter's own width.
+        pub softness: f32,
+        /// Steps of the screen-space contact shadow march toward the sun along the depth
+        /// buffer; 0 for none. Needs a perspective camera, and draws the casters a second time
+        /// as depth.
+        pub contact: u32,
+        /// How far toward the sun a contact shadow looks, in world units.
+        pub contact_length: f32,
+        /// The most point and spot lights that cast shadows this frame, picked by screen size
+        /// and then by id (a point light costs six map faces, a spot one; at most 18 faces are
+        /// drawn); 0 for none.
+        pub local: u32,
+        /// The width of each local light's map face in texels.
+        pub local_texels: u32,
     }
     /// A lattice of diffuse light probes the game baked: where it is and how big, and the
     /// revision of the probes the host holds.
@@ -1485,6 +1520,10 @@ pub mod types {
         /// Point and spot lights beside the sun. The renderer sorts them into clusters of the
         /// view, which the shaders of lit materials read (pen-render's lights.wgsl).
         pub lights: Vec<Light>,
+        /// The sun's shadow maps, nearest to the camera first. They share the light view
+        /// `shadow.view` and differ in their orthographic windows; the game fits each round its
+        /// slice of the camera's view and moves it in whole texels.
+        pub cascades: Vec<Cascade>,
         /// The light probes of the volume `probe_volume` describes, in index order, sent when
         /// the game has a new bake; none keeps the probes the host holds (while their revision
         /// matches).
@@ -1601,6 +1640,8 @@ pub mod codec {
     pub const MAX_TOUCHES: usize = 32;
     /// The most point and spot lights one frame may have.
     pub const MAX_LIGHTS: usize = 4096;
+    /// The most sun shadow maps one frame may have.
+    pub const MAX_CASCADES: usize = 4;
     /// The most light probes one frame may carry (a volume may be larger than a frame's share
     /// only by sending none: see `probe_volume.revision`).
     pub const MAX_PROBES: usize = 16384;
@@ -1624,13 +1665,14 @@ pub mod codec {
     /// sky.sun3, sky.night, sky.tint3, sky.sh03, sky.sh13, sky.sh23, sky.sh33, sky.sh43,
     /// sky.sh53, sky.sh63, sky.sh73, sky.sh83, probe_volume.revision, probe_volume.nx,
     /// probe_volume.ny, probe_volume.nz, probe_volume.spacing, probe_volume.origin3,
-    /// fog.radius, fog.density, fog.height, shadow.view16, shadow.projection16, shadow.texel,
-    /// shadow.texels, blur, quality.bloom, clouds.cover, clouds.drift2, hide_cursor,
+    /// fog.radius, fog.density, fog.height, shadow.view16, shadow.texels, shadow.filter,
+    /// shadow.softness, shadow.contact, shadow.contact_length, shadow.local,
+    /// shadow.local_texels, blur, quality.bloom, clouds.cover, clouds.drift2, hide_cursor,
     /// field_count, field_lanes, ui_count, ui_lanes, service_count, service_lanes, bus_count,
-    /// voice_count, pose_count, emitter_count, quality.taa, light_count, probe_count,
-    /// listener_count, panner_count, loading, show_captions, retained_enabled, retained_reset,
-    /// retained_after, instance_count, instance_removal_count.
-    pub const PACKET_HEADER_FLOATS: usize = 190;
+    /// voice_count, pose_count, emitter_count, quality.taa, light_count, cascade_count,
+    /// probe_count, listener_count, panner_count, loading, show_captions, retained_enabled,
+    /// retained_reset, retained_after, instance_count, instance_removal_count.
+    pub const PACKET_HEADER_FLOATS: usize = 180;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -1670,8 +1712,10 @@ pub mod codec {
     /// Lanes: material, transform16, seed, time, duration, rate, lifetime, radius, velocity3,
     /// spread, gravity3, drag, size_start, size_end, color_start4, color_end4, additive.
     pub const EMITTER_FLOATS: usize = 42;
-    /// Lanes: position3, radius, color3, direction3, inner, outer.
-    pub const LIGHT_FLOATS: usize = 12;
+    /// Lanes: position3, radius, color3, direction3, inner, outer, shadow, id.
+    pub const LIGHT_FLOATS: usize = 14;
+    /// Lanes: projection16, texel, far.
+    pub const CASCADE_FLOATS: usize = 18;
     /// Lanes: sh03, sh13, sh23, sh33, sh43, sh53, sh63, sh73, sh83, valid.
     pub const PROBE_FLOATS: usize = 28;
     /// Lanes: position3, forward3, up3.
@@ -1747,36 +1791,41 @@ pub mod codec {
             pub const FOG_DENSITY: usize = 126;
             pub const FOG_HEIGHT: usize = 127;
             pub const SHADOW_VIEW: usize = 128;
-            pub const SHADOW_PROJECTION: usize = 144;
-            pub const SHADOW_TEXEL: usize = 160;
-            pub const SHADOW_TEXELS: usize = 161;
-            pub const BLUR: usize = 162;
-            pub const QUALITY_BLOOM: usize = 163;
-            pub const CLOUDS_COVER: usize = 164;
-            pub const CLOUDS_DRIFT: usize = 165;
-            pub const HIDE_CURSOR: usize = 167;
-            pub const FIELD_COUNT: usize = 168;
-            pub const FIELD_LANES: usize = 169;
-            pub const UI_COUNT: usize = 170;
-            pub const UI_LANES: usize = 171;
-            pub const SERVICE_COUNT: usize = 172;
-            pub const SERVICE_LANES: usize = 173;
-            pub const BUS_COUNT: usize = 174;
-            pub const VOICE_COUNT: usize = 175;
-            pub const POSE_COUNT: usize = 176;
-            pub const EMITTER_COUNT: usize = 177;
-            pub const QUALITY_TAA: usize = 178;
-            pub const LIGHT_COUNT: usize = 179;
-            pub const PROBE_COUNT: usize = 180;
-            pub const LISTENER_COUNT: usize = 181;
-            pub const PANNER_COUNT: usize = 182;
-            pub const LOADING: usize = 183;
-            pub const SHOW_CAPTIONS: usize = 184;
-            pub const RETAINED_ENABLED: usize = 185;
-            pub const RETAINED_RESET: usize = 186;
-            pub const RETAINED_AFTER: usize = 187;
-            pub const INSTANCE_COUNT: usize = 188;
-            pub const INSTANCE_REMOVAL_COUNT: usize = 189;
+            pub const SHADOW_TEXELS: usize = 144;
+            pub const SHADOW_FILTER: usize = 145;
+            pub const SHADOW_SOFTNESS: usize = 146;
+            pub const SHADOW_CONTACT: usize = 147;
+            pub const SHADOW_CONTACT_LENGTH: usize = 148;
+            pub const SHADOW_LOCAL: usize = 149;
+            pub const SHADOW_LOCAL_TEXELS: usize = 150;
+            pub const BLUR: usize = 151;
+            pub const QUALITY_BLOOM: usize = 152;
+            pub const CLOUDS_COVER: usize = 153;
+            pub const CLOUDS_DRIFT: usize = 154;
+            pub const HIDE_CURSOR: usize = 156;
+            pub const FIELD_COUNT: usize = 157;
+            pub const FIELD_LANES: usize = 158;
+            pub const UI_COUNT: usize = 159;
+            pub const UI_LANES: usize = 160;
+            pub const SERVICE_COUNT: usize = 161;
+            pub const SERVICE_LANES: usize = 162;
+            pub const BUS_COUNT: usize = 163;
+            pub const VOICE_COUNT: usize = 164;
+            pub const POSE_COUNT: usize = 165;
+            pub const EMITTER_COUNT: usize = 166;
+            pub const QUALITY_TAA: usize = 167;
+            pub const LIGHT_COUNT: usize = 168;
+            pub const CASCADE_COUNT: usize = 169;
+            pub const PROBE_COUNT: usize = 170;
+            pub const LISTENER_COUNT: usize = 171;
+            pub const PANNER_COUNT: usize = 172;
+            pub const LOADING: usize = 173;
+            pub const SHOW_CAPTIONS: usize = 174;
+            pub const RETAINED_ENABLED: usize = 175;
+            pub const RETAINED_RESET: usize = 176;
+            pub const RETAINED_AFTER: usize = 177;
+            pub const INSTANCE_COUNT: usize = 178;
+            pub const INSTANCE_REMOVAL_COUNT: usize = 179;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -1882,6 +1931,13 @@ pub mod codec {
             pub const DIRECTION: usize = 7;
             pub const INNER: usize = 10;
             pub const OUTER: usize = 11;
+            pub const SHADOW: usize = 12;
+            pub const ID: usize = 13;
+        }
+        pub mod cascade {
+            pub const PROJECTION: usize = 0;
+            pub const TEXEL: usize = 16;
+            pub const FAR: usize = 17;
         }
         pub mod probe {
             pub const SH0: usize = 0;
@@ -2342,7 +2398,17 @@ pub mod codec {
             let direction = Vector { x: self.packet[lane + 7], y: self.packet[lane + 8], z: self.packet[lane + 9] };
             let inner = self.packet[lane + 10];
             let outer = self.packet[lane + 11];
-            *light = Light { position, radius, color, direction, inner, outer };
+            let shadow = self.flag(lane + 12)?;
+            let id = self.count(lane + 13, 16777215)?;
+            *light = Light { position, radius, color, direction, inner, outer, shadow, id: id as u32 };
+            Ok(())
+        }
+
+        fn decode_cascade(&mut self, lane: usize, cascade: &mut Cascade) -> Result<()> {
+            let projection = self.matrix(lane);
+            let texel = self.packet[lane + 16];
+            let far = self.packet[lane + 17];
+            *cascade = Cascade { projection, texel, far };
             Ok(())
         }
 
@@ -2450,22 +2516,23 @@ pub mod codec {
         let insets_count = reader.count(9, MAX_INSETS)?;
         let inset_draws_count = reader.count(10, MAX_DRAWS)?;
         let preferences_lanes = reader.count(11, PREFERENCE_FLOATS)?;
-        let fields_count = reader.count(168, MAX_FIELD_PATCHES)?;
-        let fields_lanes = reader.count(169, 16805888)?;
-        let ui_count = reader.count(170, MAX_UI_NODES)?;
-        let ui_lanes = reader.count(171, 4292608)?;
-        let services_count = reader.count(172, MAX_SERVICE_REQUESTS)?;
-        let services_lanes = reader.count(173, 4196352)?;
-        let buses_count = reader.count(174, MAX_BUSES)?;
-        let voices_count = reader.count(175, MAX_VOICES)?;
-        let poses_count = reader.count(176, MAX_POSES)?;
-        let emitters_count = reader.count(177, MAX_EMITTERS)?;
-        let lights_count = reader.count(179, MAX_LIGHTS)?;
-        let probes_count = reader.count(180, MAX_PROBES)?;
-        let listener_count = reader.count(181, 1)?;
-        let panners_count = reader.count(182, MAX_PANNERS)?;
-        let instances_count = reader.count(188, MAX_INSTANCES)?;
-        let instance_removals_count = reader.count(189, MAX_INSTANCE_REMOVALS)?;
+        let fields_count = reader.count(157, MAX_FIELD_PATCHES)?;
+        let fields_lanes = reader.count(158, 16805888)?;
+        let ui_count = reader.count(159, MAX_UI_NODES)?;
+        let ui_lanes = reader.count(160, 4292608)?;
+        let services_count = reader.count(161, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = reader.count(162, 4196352)?;
+        let buses_count = reader.count(163, MAX_BUSES)?;
+        let voices_count = reader.count(164, MAX_VOICES)?;
+        let poses_count = reader.count(165, MAX_POSES)?;
+        let emitters_count = reader.count(166, MAX_EMITTERS)?;
+        let lights_count = reader.count(168, MAX_LIGHTS)?;
+        let cascades_count = reader.count(169, MAX_CASCADES)?;
+        let probes_count = reader.count(170, MAX_PROBES)?;
+        let listener_count = reader.count(171, 1)?;
+        let panners_count = reader.count(172, MAX_PANNERS)?;
+        let instances_count = reader.count(178, MAX_INSTANCES)?;
+        let instance_removals_count = reader.count(179, MAX_INSTANCE_REMOVALS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -2501,7 +2568,9 @@ pub mod codec {
         let emitters_end = emitters_start + emitters_count * EMITTER_FLOATS;
         let lights_start = emitters_end;
         let lights_end = lights_start + lights_count * LIGHT_FLOATS;
-        let probes_start = lights_end;
+        let cascades_start = lights_end;
+        let cascades_end = cascades_start + cascades_count * CASCADE_FLOATS;
+        let probes_start = cascades_end;
         let probes_end = probes_start + probes_count * PROBE_FLOATS;
         let listener_start = probes_end;
         let listener_end = listener_start + listener_count * LISTENER_FLOATS;
@@ -2603,20 +2672,24 @@ pub mod codec {
         let fog_density = reader.packet[126];
         let fog_height = reader.packet[127];
         let shadow_view = reader.matrix(128);
-        let shadow_projection = reader.matrix(144);
-        let shadow_texel = reader.packet[160];
-        let shadow_texels = reader.count(161, 8192)?;
-        let blur = reader.packet[162];
-        let quality_bloom = reader.flag(163)?;
-        let clouds_cover = reader.packet[164];
-        let clouds_drift = Drift { x: reader.packet[165], z: reader.packet[166] };
-        let hide_cursor = reader.flag(167)?;
-        let quality_taa = reader.flag(178)?;
-        let loading = reader.flag(183)?;
-        let show_captions = reader.flag(184)?;
-        let retained_enabled = reader.flag(185)?;
-        let retained_reset = reader.flag(186)?;
-        let retained_after = reader.count(187, 100000)?;
+        let shadow_texels = reader.count(144, 8192)?;
+        let shadow_filter = reader.count(145, 2)?;
+        let shadow_softness = reader.packet[146];
+        let shadow_contact = reader.count(147, 64)?;
+        let shadow_contact_length = reader.packet[148];
+        let shadow_local = reader.count(149, 16)?;
+        let shadow_local_texels = reader.count(150, 4096)?;
+        let blur = reader.packet[151];
+        let quality_bloom = reader.flag(152)?;
+        let clouds_cover = reader.packet[153];
+        let clouds_drift = Drift { x: reader.packet[154], z: reader.packet[155] };
+        let hide_cursor = reader.flag(156)?;
+        let quality_taa = reader.flag(167)?;
+        let loading = reader.flag(173)?;
+        let show_captions = reader.flag(174)?;
+        let retained_enabled = reader.flag(175)?;
+        let retained_reset = reader.flag(176)?;
+        let retained_after = reader.count(177, 100000)?;
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -2766,6 +2839,11 @@ pub mod codec {
         for (index, light) in lights.iter_mut().enumerate() {
             reader.decode_light(lights_start + index * LIGHT_FLOATS, light)?;
         }
+        let mut cascades = std::mem::take(&mut frame.cascades);
+        resize(&mut cascades, cascades_count);
+        for (index, cascade) in cascades.iter_mut().enumerate() {
+            reader.decode_cascade(cascades_start + index * CASCADE_FLOATS, cascade)?;
+        }
         let mut probes = std::mem::take(&mut frame.probes);
         resize(&mut probes, probes_count);
         for (index, probe) in probes.iter_mut().enumerate() {
@@ -2811,7 +2889,7 @@ pub mod codec {
             sky: Sky { zenith: sky_zenith, horizon: sky_horizon, ground: sky_ground, sun: sky_sun, night: sky_night, tint: sky_tint, sh0: sky_sh0, sh1: sky_sh1, sh2: sky_sh2, sh3: sky_sh3, sh4: sky_sh4, sh5: sky_sh5, sh6: sky_sh6, sh7: sky_sh7, sh8: sky_sh8 },
             probe_volume: ProbeVolume { revision: probe_volume_revision as u32, nx: probe_volume_nx as u32, ny: probe_volume_ny as u32, nz: probe_volume_nz as u32, spacing: probe_volume_spacing, origin: probe_volume_origin },
             fog: Fog { radius: fog_radius, density: fog_density, height: fog_height },
-            shadow: Shadow { view: shadow_view, projection: shadow_projection, texel: shadow_texel, texels: shadow_texels as u32 },
+            shadow: Shadow { view: shadow_view, texels: shadow_texels as u32, filter: shadow_filter as u32, softness: shadow_softness, contact: shadow_contact as u32, contact_length: shadow_contact_length, local: shadow_local as u32, local_texels: shadow_local_texels as u32 },
             blur,
             clouds: Clouds { cover: clouds_cover, drift: clouds_drift },
             hide_cursor,
@@ -2835,6 +2913,7 @@ pub mod codec {
             poses,
             emitters,
             lights,
+            cascades,
             probes,
             listener,
             panners,
@@ -2902,22 +2981,23 @@ pub mod codec {
         let insets_count = d.count(&header.field("inset_count"), 9, MAX_INSETS)?;
         let inset_draws_count = d.count(&header.field("inset_draw_count"), 10, MAX_DRAWS)?;
         let preferences_lanes = d.count(&header.field("preference_count"), 11, 256)?;
-        let fields_count = d.count(&header.field("field_count"), 168, MAX_FIELD_PATCHES)?;
-        let fields_lanes = d.count(&header.field("field_lanes"), 169, 16805888)?;
-        let ui_count = d.count(&header.field("ui_count"), 170, MAX_UI_NODES)?;
-        let ui_lanes = d.count(&header.field("ui_lanes"), 171, 4292608)?;
-        let services_count = d.count(&header.field("service_count"), 172, MAX_SERVICE_REQUESTS)?;
-        let services_lanes = d.count(&header.field("service_lanes"), 173, 4196352)?;
-        let buses_count = d.count(&header.field("bus_count"), 174, MAX_BUSES)?;
-        let voices_count = d.count(&header.field("voice_count"), 175, MAX_VOICES)?;
-        let poses_count = d.count(&header.field("pose_count"), 176, MAX_POSES)?;
-        let emitters_count = d.count(&header.field("emitter_count"), 177, MAX_EMITTERS)?;
-        let lights_count = d.count(&header.field("light_count"), 179, MAX_LIGHTS)?;
-        let probes_count = d.count(&header.field("probe_count"), 180, MAX_PROBES)?;
-        let listener_count = d.count(&header.field("listener_count"), 181, 1)?;
-        let panners_count = d.count(&header.field("panner_count"), 182, MAX_PANNERS)?;
-        let instances_count = d.count(&header.field("instance_count"), 188, MAX_INSTANCES)?;
-        let instance_removals_count = d.count(&header.field("instance_removal_count"), 189, MAX_INSTANCE_REMOVALS)?;
+        let fields_count = d.count(&header.field("field_count"), 157, MAX_FIELD_PATCHES)?;
+        let fields_lanes = d.count(&header.field("field_lanes"), 158, 16805888)?;
+        let ui_count = d.count(&header.field("ui_count"), 159, MAX_UI_NODES)?;
+        let ui_lanes = d.count(&header.field("ui_lanes"), 160, 4292608)?;
+        let services_count = d.count(&header.field("service_count"), 161, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = d.count(&header.field("service_lanes"), 162, 4196352)?;
+        let buses_count = d.count(&header.field("bus_count"), 163, MAX_BUSES)?;
+        let voices_count = d.count(&header.field("voice_count"), 164, MAX_VOICES)?;
+        let poses_count = d.count(&header.field("pose_count"), 165, MAX_POSES)?;
+        let emitters_count = d.count(&header.field("emitter_count"), 166, MAX_EMITTERS)?;
+        let lights_count = d.count(&header.field("light_count"), 168, MAX_LIGHTS)?;
+        let cascades_count = d.count(&header.field("cascade_count"), 169, MAX_CASCADES)?;
+        let probes_count = d.count(&header.field("probe_count"), 170, MAX_PROBES)?;
+        let listener_count = d.count(&header.field("listener_count"), 171, 1)?;
+        let panners_count = d.count(&header.field("panner_count"), 172, MAX_PANNERS)?;
+        let instances_count = d.count(&header.field("instance_count"), 178, MAX_INSTANCES)?;
+        let instance_removals_count = d.count(&header.field("instance_removal_count"), 179, MAX_INSTANCE_REMOVALS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -2953,7 +3033,9 @@ pub mod codec {
         let emitters_end = d.end(&Location::section("emitters"), emitters_start, emitters_count, EMITTER_FLOATS)?;
         let lights_start = emitters_end;
         let lights_end = d.end(&Location::section("lights"), lights_start, lights_count, LIGHT_FLOATS)?;
-        let probes_start = lights_end;
+        let cascades_start = lights_end;
+        let cascades_end = d.end(&Location::section("cascades"), cascades_start, cascades_count, CASCADE_FLOATS)?;
+        let probes_start = cascades_end;
         let probes_end = d.end(&Location::section("probes"), probes_start, probes_count, PROBE_FLOATS)?;
         let listener_start = probes_end;
         let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
@@ -3012,20 +3094,24 @@ pub mod codec {
         d.finite(&header.field("fog.density"), 126)?;
         d.finite(&header.field("fog.height"), 127)?;
         d.values(&header.field("shadow.view"), 128, 16, &[])?;
-        d.values(&header.field("shadow.projection"), 144, 16, &[])?;
-        d.finite(&header.field("shadow.texel"), 160)?;
-        let _ = d.count(&header.field("shadow.texels"), 161, 8192)?;
-        d.finite(&header.field("blur"), 162)?;
-        d.count(&header.field("quality.bloom"), 163, 1)?;
-        d.finite(&header.field("clouds.cover"), 164)?;
-        d.values(&header.field("clouds.drift"), 165, 2, &["x","z"])?;
-        d.count(&header.field("hide_cursor"), 167, 1)?;
-        d.count(&header.field("quality.taa"), 178, 1)?;
-        d.count(&header.field("loading"), 183, 1)?;
-        d.count(&header.field("show_captions"), 184, 1)?;
-        d.count(&header.field("retained_enabled"), 185, 1)?;
-        d.count(&header.field("retained_reset"), 186, 1)?;
-        let _ = d.count(&header.field("retained_after"), 187, 100000)?;
+        let _ = d.count(&header.field("shadow.texels"), 144, 8192)?;
+        let _ = d.count(&header.field("shadow.filter"), 145, 2)?;
+        d.finite(&header.field("shadow.softness"), 146)?;
+        let _ = d.count(&header.field("shadow.contact"), 147, 64)?;
+        d.finite(&header.field("shadow.contact_length"), 148)?;
+        let _ = d.count(&header.field("shadow.local"), 149, 16)?;
+        let _ = d.count(&header.field("shadow.local_texels"), 150, 4096)?;
+        d.finite(&header.field("blur"), 151)?;
+        d.count(&header.field("quality.bloom"), 152, 1)?;
+        d.finite(&header.field("clouds.cover"), 153)?;
+        d.values(&header.field("clouds.drift"), 154, 2, &["x","z"])?;
+        d.count(&header.field("hide_cursor"), 156, 1)?;
+        d.count(&header.field("quality.taa"), 167, 1)?;
+        d.count(&header.field("loading"), 173, 1)?;
+        d.count(&header.field("show_captions"), 174, 1)?;
+        d.count(&header.field("retained_enabled"), 175, 1)?;
+        d.count(&header.field("retained_reset"), 176, 1)?;
+        let _ = d.count(&header.field("retained_after"), 177, 100000)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -3264,9 +3350,20 @@ pub mod codec {
             d.values(&path.field("direction"), base + 7, 3, &["x","y","z"])?;
             d.finite(&path.field("inner"), base + 10)?;
             d.finite(&path.field("outer"), base + 11)?;
+            d.count(&path.field("shadow"), base + 12, 1)?;
+            let id = d.count(&path.field("id"), base + 13, 16777215)?;
             base += LIGHT_FLOATS;
         }
         d.exhausted(&Location::section("lights"), base, lights_end)?;
+        let mut base = cascades_start;
+        for item in 0..cascades_count {
+            let path = &Location::section("cascades").index(item);
+            d.values(&path.field("projection"), base, 16, &[])?;
+            d.finite(&path.field("texel"), base + 16)?;
+            d.finite(&path.field("far"), base + 17)?;
+            base += CASCADE_FLOATS;
+        }
+        d.exhausted(&Location::section("cascades"), base, cascades_end)?;
         let mut base = probes_start;
         for item in 0..probes_count {
             let path = &Location::section("probes").index(item);
@@ -3359,22 +3456,23 @@ pub mod codec {
         let insets_count = d.count(&header.field("inset_count"), 9, MAX_INSETS)?;
         let inset_draws_count = d.count(&header.field("inset_draw_count"), 10, MAX_DRAWS)?;
         let preferences_lanes = d.count(&header.field("preference_count"), 11, 256)?;
-        let fields_count = d.count(&header.field("field_count"), 168, MAX_FIELD_PATCHES)?;
-        let fields_lanes = d.count(&header.field("field_lanes"), 169, 16805888)?;
-        let ui_count = d.count(&header.field("ui_count"), 170, MAX_UI_NODES)?;
-        let ui_lanes = d.count(&header.field("ui_lanes"), 171, 4292608)?;
-        let services_count = d.count(&header.field("service_count"), 172, MAX_SERVICE_REQUESTS)?;
-        let services_lanes = d.count(&header.field("service_lanes"), 173, 4196352)?;
-        let buses_count = d.count(&header.field("bus_count"), 174, MAX_BUSES)?;
-        let voices_count = d.count(&header.field("voice_count"), 175, MAX_VOICES)?;
-        let poses_count = d.count(&header.field("pose_count"), 176, MAX_POSES)?;
-        let emitters_count = d.count(&header.field("emitter_count"), 177, MAX_EMITTERS)?;
-        let lights_count = d.count(&header.field("light_count"), 179, MAX_LIGHTS)?;
-        let probes_count = d.count(&header.field("probe_count"), 180, MAX_PROBES)?;
-        let listener_count = d.count(&header.field("listener_count"), 181, 1)?;
-        let panners_count = d.count(&header.field("panner_count"), 182, MAX_PANNERS)?;
-        let instances_count = d.count(&header.field("instance_count"), 188, MAX_INSTANCES)?;
-        let instance_removals_count = d.count(&header.field("instance_removal_count"), 189, MAX_INSTANCE_REMOVALS)?;
+        let fields_count = d.count(&header.field("field_count"), 157, MAX_FIELD_PATCHES)?;
+        let fields_lanes = d.count(&header.field("field_lanes"), 158, 16805888)?;
+        let ui_count = d.count(&header.field("ui_count"), 159, MAX_UI_NODES)?;
+        let ui_lanes = d.count(&header.field("ui_lanes"), 160, 4292608)?;
+        let services_count = d.count(&header.field("service_count"), 161, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = d.count(&header.field("service_lanes"), 162, 4196352)?;
+        let buses_count = d.count(&header.field("bus_count"), 163, MAX_BUSES)?;
+        let voices_count = d.count(&header.field("voice_count"), 164, MAX_VOICES)?;
+        let poses_count = d.count(&header.field("pose_count"), 165, MAX_POSES)?;
+        let emitters_count = d.count(&header.field("emitter_count"), 166, MAX_EMITTERS)?;
+        let lights_count = d.count(&header.field("light_count"), 168, MAX_LIGHTS)?;
+        let cascades_count = d.count(&header.field("cascade_count"), 169, MAX_CASCADES)?;
+        let probes_count = d.count(&header.field("probe_count"), 170, MAX_PROBES)?;
+        let listener_count = d.count(&header.field("listener_count"), 171, 1)?;
+        let panners_count = d.count(&header.field("panner_count"), 172, MAX_PANNERS)?;
+        let instances_count = d.count(&header.field("instance_count"), 178, MAX_INSTANCES)?;
+        let instance_removals_count = d.count(&header.field("instance_removal_count"), 179, MAX_INSTANCE_REMOVALS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3410,7 +3508,9 @@ pub mod codec {
         let emitters_end = d.end(&Location::section("emitters"), emitters_start, emitters_count, EMITTER_FLOATS)?;
         let lights_start = emitters_end;
         let lights_end = d.end(&Location::section("lights"), lights_start, lights_count, LIGHT_FLOATS)?;
-        let probes_start = lights_end;
+        let cascades_start = lights_end;
+        let cascades_end = d.end(&Location::section("cascades"), cascades_start, cascades_count, CASCADE_FLOATS)?;
+        let probes_start = cascades_end;
         let probes_end = d.end(&Location::section("probes"), probes_start, probes_count, PROBE_FLOATS)?;
         let listener_start = probes_end;
         let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
@@ -3538,9 +3638,10 @@ pub mod codec {
             frame.fog.height,
         ]);
         out.extend_from_slice(&frame.shadow.view);
-        out.extend_from_slice(&frame.shadow.projection);
         out.extend([
-            frame.shadow.texel, frame.shadow.texels as f32, frame.blur, frame.clouds.cover, frame.clouds.drift.x,
+            frame.shadow.texels as f32, frame.shadow.filter as f32, frame.shadow.softness,
+            frame.shadow.contact as f32, frame.shadow.contact_length, frame.shadow.local as f32,
+            frame.shadow.local_texels as f32, frame.blur, frame.clouds.cover, frame.clouds.drift.x,
             frame.clouds.drift.z, f32::from(frame.hide_cursor), f32::from(frame.loading),
             f32::from(frame.show_captions), f32::from(frame.retained_enabled), f32::from(frame.retained_reset),
             frame.retained_after as f32, state.len() as f32,
@@ -3608,6 +3709,10 @@ pub mod codec {
         out.push(frame.lights.len() as f32);
         for light in &frame.lights {
             canonical_light(&mut out, light);
+        }
+        out.push(frame.cascades.len() as f32);
+        for cascade in &frame.cascades {
+            canonical_cascade(&mut out, cascade);
         }
         out.push(frame.probes.len() as f32);
         for probe in &frame.probes {
@@ -3764,7 +3869,13 @@ pub mod codec {
         out.extend([
             light.position.x, light.position.y, light.position.z, light.radius, light.color.x, light.color.y,
             light.color.z, light.direction.x, light.direction.y, light.direction.z, light.inner, light.outer,
+            f32::from(light.shadow), light.id as f32,
         ]);
+    }
+
+    fn canonical_cascade(out: &mut Vec<f32>, cascade: &Cascade) {
+        out.extend_from_slice(&cascade.projection);
+        out.extend([cascade.texel, cascade.far]);
     }
 
     fn canonical_probe(out: &mut Vec<f32>, probe: &Probe) {

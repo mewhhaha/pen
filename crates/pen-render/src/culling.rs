@@ -11,15 +11,18 @@ use pen_protocol::Matrix;
 
 use crate::matrix::{multiply, narrow};
 
-/// The most views a frame tests its draws against: the camera's and up to
-/// four shadow maps'.
-pub(crate) const MAX_VIEWS: usize = 5;
+/// The most views a frame tests its draws against: the camera's, up to four
+/// sun shadow maps' and up to `MAX_LOCAL_FACES` faces of local lights' maps.
+pub(crate) const MAX_VIEWS: usize = 1 + 4 + crate::local_shadows::MAX_FACES;
+
+/// Which views see something, a bit each, the camera's first.
+pub(crate) type ViewMask = u32;
 
 /// A draw seen by every view, or not culled.
-pub(crate) const ALL_VIEWS: u8 = (1 << MAX_VIEWS) - 1;
+pub(crate) const ALL_VIEWS: ViewMask = (1 << MAX_VIEWS) - 1;
 
 /// The camera's view, the first.
-pub(crate) const CAMERA: u8 = 1;
+pub(crate) const CAMERA: ViewMask = 1;
 
 /// A sphere holding every vertex of a mesh, in its own space.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -187,7 +190,7 @@ impl Views {
 
     /// Which views (a bit each, the camera's first) may see the sphere; a
     /// view past `count()` sees nothing.
-    pub fn mask(&self, sphere: &Sphere) -> u8 {
+    pub fn mask(&self, sphere: &Sphere) -> ViewMask {
         let mut seen = 0;
         for (index, frustum) in self.frustums[..self.count].iter().enumerate() {
             if frustum.sees(sphere) {
@@ -198,8 +201,8 @@ impl Views {
     }
 
     /// Every view there is.
-    pub fn all(&self) -> u8 {
-        u8::try_from((1u32 << self.count) - 1).expect("MAX_VIEWS fits a byte")
+    pub fn all(&self) -> ViewMask {
+        (1 << self.count) - 1
     }
 }
 
@@ -305,6 +308,6 @@ mod tests {
         assert_eq!(views.mask(&near_origin), 0b10);
         assert_eq!(views.mask(&Sphere { center: [0.0, 0.0, -10.0], radius: 1.0 }), 0b01);
         assert_eq!(views.mask(&Sphere { center: [0.0, 0.0, -0.2], radius: 1.0 }), 0b11);
-        assert_eq!(ALL_VIEWS, 0b11111);
+        assert_eq!(ALL_VIEWS, (1 << MAX_VIEWS) - 1);
     }
 }

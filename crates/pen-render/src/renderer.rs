@@ -24,6 +24,8 @@ mod materials;
 mod particles;
 mod readback;
 mod resolution;
+#[cfg(test)]
+mod shadow_tests;
 mod shadows;
 mod skinning;
 mod timing;
@@ -40,7 +42,7 @@ use pen_protocol::{GameEvent, Matrix, Sky, Solid, Vector};
 
 use crate::asset_store::{AssetStore, Lod, MAX_LODS, Material};
 use crate::built_in::{BuiltIn, BuiltIns};
-use crate::culling::{Detail, MAX_VIEWS, Sphere, Views};
+use crate::culling::{Detail, MAX_VIEWS, Sphere, ViewMask, Views};
 use crate::decals::{DecalBatch, Decals};
 use crate::environment::Environment;
 use crate::loader::{LevelMessage, Loader};
@@ -53,7 +55,8 @@ use crate::shader::{self, PipelineContext, Pipelines, Variants};
 use crate::solids::SolidBatch;
 use crate::sprites::{SpriteBatch, Sprites, sprite_group_layout};
 use crate::{RenderStats, RendererOptions};
-use cascades::{Cascade, MAX_CASCADES};
+use cascades::Cascade;
+use pen_protocol::boundary::MAX_CASCADES;
 
 #[cfg(test)]
 pub(crate) use fields::half_of;
@@ -61,6 +64,7 @@ pub(crate) use gpu_culling::pipeline as culling_pipeline;
 use gpu_culling::{GpuBatch, GpuCulling};
 pub(crate) use insets::composite_pipeline;
 pub(crate) use particles::pipeline as particle_pipeline;
+pub use shadows::SHADOWS_WGSL;
 pub(crate) use timing::{GpuTimer, Span};
 pub use validate::validate_frame;
 
@@ -72,9 +76,10 @@ const INSET_SAMPLES: u32 = 4;
 // The scene uniform: view, projection, ambient, light direction and color,
 // the light's view-projection, the shadow settings, the sky's colors
 // overhead, at the horizon and below it, and where the eye is (see
-// scene.wgsl); then the shadow maps' count and band, view-projections and
-// texels (shadows.rs). Shaders may declare only its first part.
-const SCENE_FLOATS: usize = 80 + 4 + 16 * MAX_CASCADES + 4 * MAX_CASCADES;
+// scene.wgsl); then the shadow maps' count, band, filter and contact steps,
+// view-projections and texels, and the soft shadows' settings (shadows.rs).
+// Shaders may declare only its first part.
+const SCENE_FLOATS: usize = 80 + 4 + 16 * MAX_CASCADES + 4 * MAX_CASCADES + 4;
 const SCENE_BYTES: u64 = SCENE_FLOATS as u64 * 4;
 
 // A draw's uniform: model and normal matrices, color, settings, the four
@@ -217,6 +222,9 @@ struct Veil {
 // each pass's scene uniform and bind group, which binds a stand-in map, as
 // it renders into the real ones.
 struct Shadows {
+    /// One scene uniform and bind group for each pass that draws into a
+    /// map: the sun's maps, then the local lights' faces, then the camera's
+    /// depth for contact shadows.
     uniforms: Vec<wgpu::Buffer>,
     groups: Vec<wgpu::BindGroup>,
     sampler: wgpu::Sampler,
@@ -224,6 +232,13 @@ struct Shadows {
     maps: Option<shadows::ShadowMaps>,
     /// Which maps `maps` are, to know when the scene's bind group must change.
     map_id: u64,
+    /// The camera's depth, drawn for contact shadows when a frame asks, and
+    /// which texture it is.
+    contact: Option<shadows::ContactDepth>,
+    contact_id: u64,
+    contact_serial: u64,
+    /// The local lights' map faces, and what each holds.
+    local: Option<shadows::LocalMaps>,
 }
 
 // Each inset's scene uniform and bind group, and the targets it draws into
@@ -296,7 +311,7 @@ struct Item {
     shape: Shape,
     /// The views that see it, a bit each (`Views::mask`), the camera's
     /// first; none, and it is left out of every pass.
-    views: u8,
+    views: ViewMask,
     /// The level of detail it draws its mesh at, the whole mesh 0.
     lod: u8,
 }
@@ -310,7 +325,7 @@ struct Placement {
     batch: u32,
     choice: u32,
     parameters: [f32; 4],
-    views: u8,
+    views: ViewMask,
     lod: u8,
 }
 
@@ -397,6 +412,8 @@ struct Scratch {
     translucent: Vec<usize>,
     overlays: Vec<usize>,
     casters: Vec<usize>,
+    /// The casters the camera sees, for the depth contact shadows read.
+    contact_casters: Vec<usize>,
     /// The materials a frame draws meshes and solids with.
     materials: Vec<u32>,
     /// Sprites to draw, in batches, and decals.
@@ -558,10 +575,12 @@ pub(crate) struct State {
     // Where frames for an HDR surface that needs decoding draw, shared with
     // the renderers drawing over this one's frames.
     screen: crate::display::SharedScreen,
-    // The scene's bind group, and the maps and the layer it binds.
-    scene_group: Option<(wgpu::BindGroup, (u64, usize))>,
-    // The frame's shadow maps, nearest first, and how many.
+    // The scene's bind group, and the maps, the layer and the contact depth it binds.
+    scene_group: Option<(wgpu::BindGroup, (u64, usize, u64))>,
+    // The frame's sun shadow maps, nearest first, and how many.
     cascades: ([Cascade; MAX_CASCADES], usize),
+    // The point and spot lights that cast this frame, and their faces.
+    local: crate::local_shadows::Selection,
     stride: u64,
     capacity: usize,
     draw_uniform: wgpu::Buffer,
@@ -616,6 +635,8 @@ pub(crate) struct State {
     // Each solid the last frame drew and its triangles by material, and the
     // triangles of all of them by material, remade when the solids change.
     solids: Vec<(Solid, Vec<SolidBatch>)>,
+    // Counts the changes to the solids, for what caches what they cast.
+    solids_revision: u64,
     solid_meshes: Vec<SolidMesh>,
     // Whether something this frame draws is still on its way.
     waiting: bool,
@@ -686,6 +707,17 @@ impl State {
                 crate::environment::layout_entries()[2],
                 crate::environment::layout_entries()[3],
                 crate::environment::layout_entries()[4],
+                // The camera's depth, drawn for contact shadows (shadows.rs).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 9,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let texture_entry = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
@@ -835,7 +867,8 @@ impl State {
             clusters: crate::lights::Clusters::new(&device, &context.lights_group),
             screen,
             scene_group: None,
-            cascades: ([Cascade { projection: crate::matrix::IDENTITY, texel: 0.0 }; MAX_CASCADES], 0),
+            cascades: ([Cascade::NONE; MAX_CASCADES], 0),
+            local: Default::default(),
             stride,
             capacity: 1,
             draw_uniform: uniform_buffer(&device, "draws", stride),
@@ -869,6 +902,7 @@ impl State {
             deferred: None,
             sorted: HashSet::new(),
             solids: Vec::new(),
+            solids_revision: 0,
             solid_meshes: Vec::new(),
             waiting: false,
             scratch: Scratch::default(),

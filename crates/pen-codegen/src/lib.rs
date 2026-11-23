@@ -94,15 +94,18 @@ mod tests {
     fn packet_contract_layout() {
         let model = model::build(schema()).unwrap();
         assert_eq!(model.magic, 0x474446);
-        assert_eq!(model.header_lanes, 190);
+        assert_eq!(model.header_lanes, 180);
         assert_eq!(model.event_lanes(), 5);
         assert_eq!(model.section("draws").fixed.as_ref().unwrap().lanes, 24);
         assert_eq!(model.section("insets").fixed.as_ref().unwrap().lanes, 48);
         assert_eq!(model.section("ui").head_lanes, 24);
         assert_eq!(model.section("poses").fixed.as_ref().unwrap().lanes, 4);
         assert_eq!(model.section("emitters").fixed.as_ref().unwrap().lanes, 42);
-        // Position, reach, color, direction and a spot's two cosines.
-        assert_eq!(model.section("lights").fixed.as_ref().unwrap().lanes, 12);
+        // Position, reach, color, direction, a spot's two cosines, whether it
+        // casts shadows and its id.
+        assert_eq!(model.section("lights").fixed.as_ref().unwrap().lanes, 14);
+        // A sun shadow map's window, its texel and where its slice ends.
+        assert_eq!(model.section("cascades").fixed.as_ref().unwrap().lanes, 18);
         assert_eq!(model.section("listener").fixed.as_ref().unwrap().lanes, 9);
         assert_eq!(model.section("panners").fixed.as_ref().unwrap().lanes, 15);
     }

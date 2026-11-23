@@ -6,7 +6,7 @@ use pen_protocol::boundary::MAX_DRAW_EXTRA;
 use pen_protocol::{Catalog, Draw, Matrix, RenderFrame, Solid, Sprite};
 use wgpu::util::DeviceExt;
 
-use super::cascades::{Cascade, MAX_CASCADES};
+use super::cascades::Cascade;
 use super::frame::stencil;
 use super::skinning::Posed;
 use super::validate::normal_matrix;
@@ -17,18 +17,24 @@ use super::{
 use crate::RenderStats;
 use crate::asset_store::AssetKind;
 use crate::asset_store::MAX_LODS;
-use crate::culling::{ALL_VIEWS, CAMERA, Detail, Frustum, MAX_VIEWS, Sphere, Views, stretch};
+use crate::culling::{ALL_VIEWS, CAMERA, Detail, Frustum, MAX_VIEWS, Sphere, ViewMask, Views, stretch};
 use crate::decals::DecalBatch;
+use crate::local_shadows::Selection;
 use crate::matrix::{IDENTITY, narrow};
 use crate::shader::Variants;
 use crate::solids::{SolidBatch, mesh_solids};
 use crate::sprites::SpriteBatch;
+use pen_protocol::boundary::MAX_CASCADES;
 
-/// The views `frame` draws: the camera's, then its shadow maps', `cascades`.
-fn views(frame: &RenderFrame, (maps, count): &([Cascade; MAX_CASCADES], usize)) -> Views {
+/// The views `frame` draws: the camera's, then its sun shadow maps'
+/// (`cascades`), then the faces of the local lights' maps (`local`).
+fn views(frame: &RenderFrame, (maps, count): &([Cascade; MAX_CASCADES], usize), local: &Selection) -> Views {
     let mut views = Views::new(Frustum::of(&frame.projection, &frame.view));
     for map in &maps[..*count] {
         views.push(Frustum::of(&map.projection, &frame.shadow.view));
+    }
+    for face in &local.faces {
+        views.push(Frustum::new(&face.matrix));
     }
     views
 }
@@ -37,7 +43,7 @@ fn views(frame: &RenderFrame, (maps, count): &([Cascade; MAX_CASCADES], usize)) 
 /// and at which level of detail the camera has it drawn, if its shader
 /// declares its bounds; otherwise every view, whole. Counts into `stats`
 /// what it leaves out.
-fn seen(choice: &Choice, draw: &Draw, views: &Views, detail: &Detail, stats: &mut RenderStats) -> (u8, u8) {
+fn seen(choice: &Choice, draw: &Draw, views: &Views, detail: &Detail, stats: &mut RenderStats) -> (ViewMask, u8) {
     let every = if choice.casts { views.all() } else { CAMERA };
     let Some(bounds) = choice.bounds else { return (every, 0) };
     let placed = bounds.placed(&draw.transform, 0.0);
@@ -72,6 +78,7 @@ impl Scratch {
         self.translucent.clear();
         self.overlays.clear();
         self.casters.clear();
+        self.contact_casters.clear();
         self.materials.clear();
         self.sprites.clear();
         self.sprite_order.clear();
@@ -154,7 +161,7 @@ impl State {
         scratch: &mut Scratch,
         stats: &mut RenderStats,
     ) -> Result<()> {
-        scratch.views = views(frame, &self.cascades);
+        scratch.views = views(frame, &self.cascades, &self.local);
         scratch.detail = Detail::new(&frame.projection, &frame.view, height);
         self.culling.begin(scratch.views, scratch.detail);
         scratch.group_poses(frame);
@@ -636,18 +643,25 @@ impl State {
                 let item = &items[entry.item];
                 let stage = entry.stage(items) as usize;
                 if item.inset().is_none()
-                    && item.views & !CAMERA != 0
+                    && item.views != 0
                     && entry.material.material.casts_shadow()
                     && matches!(self.assets.current(entry.shader), Some(GpuAsset::Shader(shader))
                         if shader.shadow[stage].is_some())
                 {
-                    scratch.casters.push(index);
+                    if item.views & !CAMERA != 0 {
+                        scratch.casters.push(index);
+                    }
+                    if item.views & CAMERA != 0 {
+                        scratch.contact_casters.push(index);
+                    }
                 }
             }
-            scratch.casters.sort_by_key(|&index| {
-                let item = &items[ready[index].item];
-                (item.material, matches!(item.shape, Shape::Batch(_)))
-            });
+            for list in [&mut scratch.casters, &mut scratch.contact_casters] {
+                list.sort_by_key(|&index| {
+                    let item = &items[ready[index].item];
+                    (item.material, matches!(item.shape, Shape::Batch(_)))
+                });
+            }
         }
     }
 
@@ -753,6 +767,7 @@ impl State {
         if unchanged {
             return;
         }
+        self.solids_revision += 1;
         self.solids.truncate(solids.len());
         for (index, solid) in solids.iter().enumerate() {
             match self.solids.get_mut(index) {

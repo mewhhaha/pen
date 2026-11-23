@@ -26,15 +26,67 @@ Group 0, the frame's, the same for every draw:
 
 | Binding | What |
 |---|---|
-| 0 | The scene, a uniform: `view` and `projection` (column-major `mat4x4f`), `ambient`, `light_direction` and `light_color` (`vec4f`, xyz used), `light_view_projection` (the shadow map's), `shadow` (x 1 with a shadow map, y its texel in texture coordinates, z how far off the surface to read it), the sky's `zenith`, `horizon` and `ground` colours, and `eye`, where the camera is. |
-| 1 | The shadow map, `texture_depth_2d`. |
+| 0 | The scene, a uniform: `view` and `projection` (column-major `mat4x4f`), `ambient`, `light_direction` and `light_color` (`vec4f`, xyz used), `light_view_projection` (the farthest sun map's), `shadow` (x 1 with sun shadows, y a map texel in texture coordinates, z how far off the surface the single map reads, in world units), the sky's `zenith`, `horizon` and `ground` colours, `eye`, where the camera is, then the sun's cascades: `cascades` (x how many maps, y the share of a slice over which a map blends into the next, z the filter, 0 hard, 1 PCF, 2 soft, w the contact shadow's steps), `cascade_view_projection` (four `mat4x4f`, world to each map's clip space, nearest first), `cascade_texels` (four `vec4f`: a texel in texture coordinates, a texel in world units, how far ahead of the camera the map's slice ends, its depth range in world units) and `shadow_params` (x the penumbra's width per unit of blocker distance, y how far contact shadows look). |
+| 1 | The farthest sun map, `texture_depth_2d` (what shaders that predate cascades read; they get one hard map). |
 | 2 | Its `sampler_comparison`. |
-| 3 | Every shadow map, a `texture_depth_2d_array` (`shadow_cascades`). |
+| 3 | Every sun map, a `texture_depth_2d_array` (`shadow_cascades`). |
 | 4 | The sky's reflection, a `texture_cube<f32>` whose levels are the sky blurred by GGX lobes of growing roughness. |
 | 5 | The split-sum BRDF table, a `texture_2d<f32>`. |
 | 6 | A filtering sampler for both. |
 | 7 | The sky's light, a uniform: nine diffuse spherical-harmonic coefficients, the reflection tint, the cube's last level and the probe volume's origin, spacing and counts. |
 | 8 | The baked light probes, a read-only storage array of `vec4f`: seven a probe (nine RGB terms and a validity weight). |
+| 9 | The camera's depth from the frame's casters, a `texture_depth_2d` of the scene's size, drawn only when the frame asks for contact shadows. |
+
+## The sun's shadows
+
+The game fits the sun's shadow maps (Ink's `graphics.shadow`): up to four
+cascades along one light view, each an orthographic window round a slice of the
+camera's view whose centre moves in whole texels, so that shadows hold still as
+the camera moves. They come in the render packet's `cascades` section, nearest
+first, with `shadow.texels` (each map's width), `shadow.filter`,
+`shadow.softness`, `shadow.contact` and `shadow.contact_length`. Which side
+fits them is decided by who has the camera, the light and the shadow distance
+policy: the game does, pen draws and validates what it is given. A shader adds
+`pen_render::SHADOWS_WGSL` after declaring `Scene` with every field through
+`shadow_params`; it declares bindings 2, 3 and 9 and gives
+
+- `sun_shadow(world, normal, position)`: the sun's visibility, 1 in the sun and
+  0 in shadow, with `position` the fragment's `@builtin(position)`: the
+  cascades' filtered visibility, blended into the next map over the last
+  `cascades.y` of each slice (and into the sun past the last), and the contact
+  shadow's, whichever the frame asks for. The filter's pattern is fixed per
+  pixel, so temporal antialiasing averages it away rather than shimmering.
+- `sun_visibility(world, normal, spin)`: the cascades alone, with the filter's
+  disk turned by `spin` (cos, sin).
+- `contact_shadow(world, normal, jitter)`: a short march in screen space toward
+  the sun through the depth buffer (binding 9), shadowing what dips just behind
+  what the camera sees; it needs a perspective camera.
+
+The filters: 0 is one hardware-compared tap; 1 averages sixteen taps over a
+rotated Poisson disk of 1.5 texels; 2 (percentage-closer soft shadows) searches
+twelve taps for blockers, averages how far they are from the receiver and
+filters over a disk as wide as `softness` times that distance, so shadows are
+sharp at a caster's foot and soft away from it. Depth is linear (the maps are
+orthographic), so each tap compares against the receiver's own plane, and the
+surface moves along its normal by 1.5 texels at grazing angles to the light:
+no acne on a lit plane at any angle, and no shadow lifted off its caster.
+
+## Local light shadows
+
+A frame's point and spot lights may ask to cast (`Light::shadow`, with a stable
+`id`). The host picks at most `shadow.local` of them each frame: those whose
+reach touches the camera's view, by size on screen (reach over distance), then
+lower id, then earlier index, as far as 18 map faces fit (a spot is one
+perspective face along its cone, a wider-than-160-degree one or a point light a
+cube of six). They share one depth texture array of `shadow.local_texels`
+faces; each face's window reaches a few texels beyond its edge, so the filter
+never leaves it and cube faces show no seams. A light keeps its layers while
+it stays picked, and a face whose casters (and light) did not change since it
+was drawn is not drawn again (`RenderStats::local_shadow_kept`). `LIGHTS_WGSL`
+declares them at group 2 (binding 4 the maps, 5 their comparison sampler, 6
+each layer's matrix, and `ClusterLight::shadow`); `clustered_surface` and
+`clustered_light` use them, with eight taps over a disk, and `local_shadow(light,
+world, normal, way, distance)` gives a light's visibility alone.
 
 Bindings 4 to 8 are the sky as light. A shader that wants it adds
 `pen_render::ENVIRONMENT_WGSL`, which declares them and defines

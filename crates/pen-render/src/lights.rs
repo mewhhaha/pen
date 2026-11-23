@@ -9,6 +9,8 @@
 use anyhow::{Result, ensure};
 use pen_protocol::{Light, Matrix, RenderFrame};
 
+use crate::local_shadows::{MAX_FACES, Selection};
+
 /// Tiles across and down the picture, and slices of depth.
 pub(crate) const TILES: (u32, u32) = (16, 9);
 pub(crate) const SLICES: u32 = 24;
@@ -223,12 +225,32 @@ pub(crate) fn group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             storage(1),
             storage(2),
             storage(3),
+            // The local lights' shadow maps, their comparison sampler and the
+            // matrix of each face (local_shadows.rs).
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                count: None,
+            },
+            storage(6),
         ],
     })
 }
 
 const GRID_BYTES: u64 = 48;
-const LIGHT_FLOATS: usize = 12;
+const FACE_BYTES: u64 = (MAX_FACES * 64) as u64;
+const LIGHT_FLOATS: usize = 16;
 
 /// The grid's uniform: its counts, its scales and whether its slices are
 /// linear.
@@ -260,16 +282,24 @@ fn storage(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
 }
 
 /// The buffers group 2 binds, grown as frames need, and a group without
-/// lights for what another camera sees (insets).
+/// lights for what another camera sees (insets) or a shadow pass draws (it
+/// binds a stand-in atlas, as it draws into the real one).
 pub(crate) struct Clusters {
     layout: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
     lights: wgpu::Buffer,
     ranges: wgpu::Buffer,
     indices: wgpu::Buffer,
+    /// The matrix of each atlas layer's face, as the lights' shadows read it.
+    faces: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+    /// The local lights' shadow maps the group binds, and which texture they are.
+    atlas: wgpu::TextureView,
+    atlas_id: u64,
     group: wgpu::BindGroup,
     empty: wgpu::BindGroup,
     data: Vec<f32>,
+    face_data: Vec<f32>,
 }
 
 impl Clusters {
@@ -283,18 +313,55 @@ impl Clusters {
                 mapped_at_creation: false,
             })
         };
-        let (lights, ranges, indices) = (
+        let (lights, ranges, indices, faces) = (
             storage(device, "lights", 4 * LIGHT_FLOATS as u64),
             storage(device, "light clusters", CLUSTERS as u64 * 8),
             storage(device, "light indices", 4),
+            storage(device, "light shadow faces", FACE_BYTES),
         );
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("local shadows"),
+            compare: Some(wgpu::CompareFunction::Less),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("local shadow stand-in"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let stand_in = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
         let empty_uniform = uniform("no lights");
-        let empty = Self::bind(device, layout, &empty_uniform, &lights, &ranges, &indices);
+        let empty = Self::bind(device, layout, &empty_uniform, &lights, &ranges, &indices, &stand_in, &sampler, &faces);
         let uniform = uniform("light grid");
-        let group = Self::bind(device, layout, &uniform, &lights, &ranges, &indices);
-        Self { layout: layout.clone(), uniform, lights, ranges, indices, group, empty, data: Vec::new() }
+        let group = Self::bind(device, layout, &uniform, &lights, &ranges, &indices, &stand_in, &sampler, &faces);
+        Self {
+            layout: layout.clone(),
+            uniform,
+            lights,
+            ranges,
+            indices,
+            faces,
+            sampler,
+            atlas: stand_in.clone(),
+            atlas_id: 0,
+            group,
+            empty,
+            data: Vec::new(),
+            face_data: vec![0.0; MAX_FACES * 16],
+        }
     }
 
+    #[allow(clippy::too_many_arguments, reason = "the group's resources")]
     fn bind(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
@@ -302,19 +369,34 @@ impl Clusters {
         lights: &wgpu::Buffer,
         ranges: &wgpu::Buffer,
         indices: &wgpu::Buffer,
+        atlas: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+        faces: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         let entries = [
             wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: lights.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: ranges.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: indices.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(atlas) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 6, resource: faces.as_entire_binding() },
         ];
         device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("lights"), layout, entries: &entries })
     }
 
     /// Sorts `frame`'s lights into the clusters of its view, on a picture
-    /// of `size` pixels.
-    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &RenderFrame, size: (u32, u32)) {
+    /// of `size` pixels. The lights `shadows` picked read the maps of
+    /// `atlas` (a view of its layers, and which texture it is).
+    pub fn update(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &RenderFrame,
+        size: (u32, u32),
+        shadows: &Selection,
+        atlas: Option<(&wgpu::TextureView, u64)>,
+    ) {
         let count = u32::try_from(frame.lights.len()).unwrap_or(u32::MAX);
         if count == 0 {
             queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&[0u32; 12]));
@@ -322,9 +404,18 @@ impl Clusters {
         }
         let assignment = assign(&frame.lights, &frame.view, &frame.projection);
         self.data.clear();
-        for light in &frame.lights {
+        for (index, light) in frame.lights.iter().enumerate() {
             let (p, c, d) = (&light.position, &light.color, &light.direction);
             self.data.extend([p.x, p.y, p.z, light.radius, c.x, c.y, c.z, light.outer, d.x, d.y, d.z, light.inner]);
+            // The light's shadow: its first layer (-1 for none), whether it is
+            // a cube, and a face texel's width at unit depth.
+            #[allow(clippy::cast_precision_loss, reason = "at most MAX_FACES")]
+            match shadows.of(index) {
+                Some(caster) => {
+                    self.data.extend([caster.layer as f32, if caster.cube { 1.0 } else { 0.0 }, caster.texel, 0.0])
+                }
+                None => self.data.extend([-1.0, 0.0, 0.0, 0.0]),
+            }
         }
         let light_bytes: &[u8] = bytemuck::cast_slice(&self.data);
         let index_bytes: &[u8] = bytemuck::cast_slice(&assignment.indices);
@@ -338,8 +429,35 @@ impl Clusters {
                 grown = true;
             }
         }
+        if let Some((view, id)) = atlas.filter(|_| !shadows.casters.is_empty())
+            && id != self.atlas_id
+        {
+            self.atlas = view.clone();
+            self.atlas_id = id;
+            grown = true;
+        }
         if grown {
-            self.group = Self::bind(device, &self.layout, &self.uniform, &self.lights, &self.ranges, &self.indices);
+            self.group = Self::bind(
+                device,
+                &self.layout,
+                &self.uniform,
+                &self.lights,
+                &self.ranges,
+                &self.indices,
+                &self.atlas,
+                &self.sampler,
+                &self.faces,
+            );
+        }
+        if !shadows.casters.is_empty() {
+            self.face_data.fill(0.0);
+            for caster in &shadows.casters {
+                for face in 0..caster.faces() {
+                    let at = (caster.layer + face) * 16;
+                    self.face_data[at..at + 16].copy_from_slice(&shadows.faces[caster.first + face].matrix);
+                }
+            }
+            queue.write_buffer(&self.faces, 0, bytemuck::cast_slice(&self.face_data));
         }
         queue.write_buffer(&self.lights, 0, light_bytes);
         if !index_bytes.is_empty() {
@@ -384,6 +502,8 @@ mod tests {
             direction: Vector::default(),
             inner: -1.0,
             outer: -1.0,
+            shadow: false,
+            id: 0,
         }
     }
 

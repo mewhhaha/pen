@@ -324,7 +324,15 @@ impl State {
         if let Some(projection) = self.post.as_ref().unwrap().jittered() {
             self.queue.write_buffer(&self.scene_uniform, 64, bytemuck::cast_slice(&projection));
         }
-        self.clusters.update(&self.device, &self.queue, frame, targets.size);
+        self.prepare_contact(frame, targets.size);
+        self.clusters.update(
+            &self.device,
+            &self.queue,
+            frame,
+            targets.size,
+            &self.local,
+            super::shadows::local_atlas(&self.shadows),
+        );
         let device = self.device.clone();
         let mut encoder = device.create_command_encoder(&Default::default());
         // The sky's reflection, drawn again if its colors changed.
@@ -335,6 +343,12 @@ impl State {
         // Instances of large batches culled on the GPU, before any pass
         // draws them.
         self.culling.dispatch(&mut encoder, &self.timer, &self.instance_buffer);
+        let redraw = if shadowed {
+            let signatures = self.local_signatures(frame, scratch);
+            self.plan_local_shadows(&signatures, &mut stats)
+        } else {
+            Vec::new()
+        };
         let drawing = Drawing {
             assets: &self.assets,
             items: &scratch.items,
@@ -345,7 +359,15 @@ impl State {
             culling: &self.culling,
         };
         if shadowed {
-            self.cast_shadows(&mut encoder, &drawing, &scratch.casters, ready);
+            self.cast_shadows(
+                &mut encoder,
+                &drawing,
+                frame,
+                &scratch.casters,
+                &scratch.contact_casters,
+                &redraw,
+                ready,
+            );
         }
         if let Some(particles) = &self.particles {
             particles.simulate(&mut encoder);

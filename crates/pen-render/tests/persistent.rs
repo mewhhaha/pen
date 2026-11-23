@@ -70,7 +70,8 @@ fn persistent_geometry_survives_culling_movement_and_reload() {
     .unwrap();
     let mut target = Offscreen::new(&device, 64);
     let mut frame = frame(vec![Draw { mesh: 0, material: 0, transform: IDENTITY, parameters: None, extra: None }]);
-    frame.shadow = Shadow { view: IDENTITY, projection: IDENTITY, texel: 1. / 64., texels: 64 };
+    frame.shadow = Shadow { view: IDENTITY, texels: 64, ..Shadow::default() };
+    frame.cascades = vec![Cascade { projection: IDENTITY, texel: 1. / 32., far: 100.0 }];
     pump(&mut renderer, &frame, &catalog, &mut target, |events| {
         ready(events, "grass.wgsl", 1) && ready(events, "grass.mesh.json", 1)
     });

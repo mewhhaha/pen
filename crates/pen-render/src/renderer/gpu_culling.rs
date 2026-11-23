@@ -13,7 +13,7 @@ use super::readback::Readbacks;
 use super::timing::{GpuTimer, Span};
 use super::{MeshAsset, State};
 use crate::asset_store::{Lod, MAX_LODS};
-use crate::culling::{Detail, MAX_VIEWS, Sphere, Views};
+use crate::culling::{Detail, MAX_VIEWS, Sphere, ViewMask, Views};
 use crate::shader::PipelineContext;
 
 pub(crate) const CULL_WGSL: &str = include_str!("../shaders/cull.wgsl");
@@ -27,6 +27,9 @@ const INSTANCE_BYTES: u64 = 80;
 const BATCH_WORDS: usize = 16;
 // An indirect draw's arguments, in words.
 const DRAW_WORDS: usize = 5;
+// The shader's `planes` array holds six planes for each of the views.
+const _: () = assert!(MAX_VIEWS == 23, "cull.wgsl's planes array is 6 * MAX_VIEWS");
+
 // The views uniform: four words, the camera's row, six planes a view.
 const UNIFORM_WORDS: usize = 8 + 4 * 6 * MAX_VIEWS;
 const WORKGROUP: u32 = 64;
@@ -73,7 +76,7 @@ pub(crate) struct GpuBatch {
 #[derive(Clone, Copy, Default)]
 struct Counted {
     count: u32,
-    views: u8,
+    views: ViewMask,
     levels: u32,
     indices: [u32; MAX_LODS],
 }
@@ -236,7 +239,7 @@ impl GpuCulling {
     /// each), drawing its mesh's `lods`; None if its instances, or those it
     /// culls, would pass what a storage buffer binds, and it culls on the
     /// CPU.
-    pub fn add(&mut self, sphere: &Sphere, lods: &[Lod], first: u32, count: u32, views: u8) -> Option<GpuBatch> {
+    pub fn add(&mut self, sphere: &Sphere, lods: &[Lod], first: u32, count: u32, views: ViewMask) -> Option<GpuBatch> {
         let view_count = u32::try_from(self.views.count()).expect("at most MAX_VIEWS");
         let levels = u32::try_from(lods.len().clamp(1, MAX_LODS)).expect("at most MAX_LODS");
         let out = self.out.checked_add(count.checked_mul(view_count * levels)?)?;
@@ -256,7 +259,7 @@ impl GpuCulling {
         self.batch_words.extend(sphere.center.map(float));
         self.batch_words.push(float(sphere.radius));
         self.batch_words.extend(errors.map(float));
-        self.batch_words.extend([first, count, u32::from(views), levels, batch.out, draws, 0, 0]);
+        self.batch_words.extend([first, count, views, levels, batch.out, draws, 0, 0]);
         debug_assert_eq!(self.batch_words.len() % BATCH_WORDS, 0, "a batch is cull.wgsl's Batch");
         for _ in 0..view_count {
             for lod in &lods[..levels as usize] {

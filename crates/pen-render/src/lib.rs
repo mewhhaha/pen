@@ -17,6 +17,7 @@ mod graph;
 mod inspect;
 mod lights;
 mod loader;
+mod local_shadows;
 mod matrix;
 mod mipmaps;
 mod packed_texture;
@@ -48,7 +49,7 @@ pub use prefetch::Prefetch;
 /// distance field atlas (pen-texture's `msdf`), crisp at any scale:
 /// `msdf_coverage(msdf_median(field.rgb), uv, range, size)`.
 pub const MSDF_WGSL: &str = include_str!("shaders/msdf.wgsl");
-pub use renderer::validate_frame;
+pub use renderer::{SHADOWS_WGSL, validate_frame};
 #[cfg(feature = "simplify")]
 pub use simplify::pack_mesh_with_lods;
 
@@ -113,6 +114,12 @@ pub struct RenderStats {
     /// triangles and those culled as a recent frame's, read back.
     pub culled: u32,
     pub shadow_culled: u32,
+    /// The point and spot lights that cast shadows this frame, the map faces
+    /// they own, and how many of those the frame kept from the one before
+    /// (nothing that casts into them moved) rather than drawing again.
+    pub local_shadow_casters: u32,
+    pub local_shadow_faces: u32,
+    pub local_shadow_kept: u32,
     /// The render scale the scene drew at: the frame's, times what dynamic
     /// resolution took off it.
     pub scale: f32,

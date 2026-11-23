@@ -73,9 +73,13 @@ func header (schema: U32): types.RenderHeader => {
   },
   shadow: $types.Shadow {
     view: identity,
-    projection: identity,
-    texel: 0.0,
     texels: 0,
+    filter: 0,
+    softness: 0.0,
+    contact: 0,
+    contact_length: 0.0,
+    local: 0,
+    local_texels: 0,
   },
   blur: 0.0,
   clouds: $types.Clouds {

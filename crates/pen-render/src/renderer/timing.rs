@@ -27,9 +27,10 @@ pub(crate) enum Span {
     Overlay,
 }
 
-// Timestamps a frame can write: a begin and an end for each of 32 passes.
-// Passes past them go untimed.
-const QUERIES: u32 = 64;
+// Timestamps a frame can write: a begin and an end for each of 64 passes (the
+// shadow passes may take 23 of them: four sun maps, 18 local faces and the
+// camera's depth). Passes past them go untimed.
+const QUERIES: u32 = 128;
 
 // Frames whose timestamps may be on their way back at once.
 const READBACKS: usize = 4;

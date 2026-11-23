@@ -31,14 +31,15 @@ use anyhow::Result;
 use blot_host::{Guest, GuestModule, Value};
 use pen_plugins::{Builder, Expectation, Level, Overlay, Plugins, TestModule};
 use pen_protocol::boundary::{
-    MAX_BUSES, MAX_DRAW_EXTRA, MAX_DRAWS, MAX_FIELD, MAX_INSETS, MAX_SERVICE_DATA, MAX_SERVICE_ID,
+    MAX_BUSES, MAX_CASCADES, MAX_DRAW_EXTRA, MAX_DRAWS, MAX_FIELD, MAX_INSETS, MAX_SERVICE_DATA, MAX_SERVICE_ID,
     MAX_SERVICE_OPERATION, MAX_SOLID_FACES, MAX_UI_ID, MAX_UI_NODES, MAX_UI_TEXT, MAX_VOICE_ID, PREFERENCE_FLOATS,
     canonical_input, canonical_render, decode_frame, encode_frame, whole,
 };
 use pen_protocol::{
-    Aberration, Bus, Catalog, Clouds, Color, Decal, Draw, Drift, Emitter, FieldPatch, Fog, Frame, GameEvent, Inset,
-    Instance, InstanceRemoval, Light, Listener, Panner, Pose, Probe, ProbeVolume, Quality, RenderFrame, ServiceRequest,
-    Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
+    Aberration, Bus, Cascade, Catalog, Clouds, Color, Decal, Draw, Drift, Emitter, FieldPatch, Fog, Frame, GameEvent,
+    Inset, Instance, InstanceRemoval, Light, Listener, Panner, Pose, Probe, ProbeVolume, Quality, RenderFrame,
+    ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode, Vector, Viewport, Voice, service, ui_live,
+    ui_role, ui_state,
 };
 
 const HARNESS: &str = include_str!("codec_round_trip.blot");
@@ -634,7 +635,16 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             origin: rng.vector(),
         },
         fog: Fog { radius: rng.number(), density: rng.number(), height: rng.number() },
-        shadow: Shadow { view: rng.lanes(), projection: rng.lanes(), texel: rng.number(), texels: rng.whole(8192) },
+        shadow: Shadow {
+            view: rng.lanes(),
+            texels: rng.whole(8192),
+            filter: rng.whole(2),
+            softness: rng.number(),
+            contact: rng.whole(64),
+            contact_length: rng.number(),
+            local: rng.whole(16),
+            local_texels: rng.whole(4096),
+        },
         blur: rng.number(),
         clouds: Clouds { cover: rng.number(), drift: Drift { x: rng.number(), z: rng.number() } },
         hide_cursor: rng.flag(),
@@ -820,7 +830,13 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 direction: rng.vector(),
                 inner: rng.number(),
                 outer: rng.number(),
+                shadow: rng.flag(),
+                id: rng.whole(16_777_215),
             })
+        },
+        cascades: {
+            let count = rng.count(MAX_CASCADES);
+            rng.list(count, |rng| Cascade { projection: rng.lanes(), texel: rng.number(), far: rng.number() })
         },
         listener: {
             let count = rng.count(1);
@@ -904,7 +920,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
 }
 
 /// What `sections` reports of a frame, in its order.
-const SECTIONS: [&str; 23] = [
+const SECTIONS: [&str; 24] = [
     "draws",
     "draw parameters",
     "draw extras",
@@ -924,6 +940,7 @@ const SECTIONS: [&str; 23] = [
     "poses",
     "emitters",
     "lights",
+    "cascades",
     "listener",
     "panners",
     "retained instances",
@@ -953,6 +970,7 @@ fn sections(frame: &RenderFrame) -> [bool; SECTIONS.len()] {
         !frame.poses.is_empty(),
         !frame.emitters.is_empty(),
         !frame.lights.is_empty(),
+        !frame.cascades.is_empty(),
         !frame.listener.is_empty(),
         !frame.panners.is_empty(),
         !frame.instances.is_empty(),

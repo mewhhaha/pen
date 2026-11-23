@@ -166,7 +166,8 @@ fn culls_on(device: &wgpu::Device, queue: &wgpu::Queue, gpu: bool) {
     // neither; alone or instanced alike.
     let mut shadowed = frame.clone();
     shadowed.view[12] = -10.0;
-    shadowed.shadow = Shadow { view: IDENTITY, projection: IDENTITY, texel: 1.0 / 64.0, texels: 64 };
+    shadowed.shadow = Shadow { view: IDENTITY, texels: 64, ..Shadow::default() };
+    shadowed.cascades = vec![Cascade { projection: IDENTITY, texel: 1.0 / 32.0, far: 100.0 }];
     shadowed.draws = vec![at(0.0, false), at(10.0, false), at(30.0, false), at(0.0, true), at(10.0, true)];
     let stats = settle(&mut renderer, &shadowed, &mut target);
     assert_eq!((stats.instanced_draw_calls, stats.instances), (1, 1), "{gpu}: {stats:?}");

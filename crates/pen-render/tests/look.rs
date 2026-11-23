@@ -613,6 +613,8 @@ fn clustered_lights_match_every_light_summed() {
                 direction: Vector { x: 0.0, y: -1.0, z: 0.0 },
                 inner: if spot { 0.95 } else { -1.0 },
                 outer: if spot { 0.8 } else { -1.0 },
+                shadow: false,
+                id: 0,
             }
         })
         .collect();
@@ -1114,6 +1116,8 @@ fn the_sky_and_lights_light_a_glossy_floor() {
         direction: vector(0.0, -1.0, 0.0),
         inner: -1.0,
         outer: -1.0,
+        shadow: false,
+        id: 0,
     }];
     let mut render = |frame: &RenderFrame| {
         settle(&mut renderer, frame, &catalog, &mut target, 1);

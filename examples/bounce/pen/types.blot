@@ -142,6 +142,14 @@ type Light is data = $Light {
   direction: Vector,
   inner: F32,
   outer: F32,
+  shadow: Bool,
+  id: U32,
+}
+
+type Cascade is data = $Cascade {
+  projection: Mat4,
+  texel: F32,
+  far: F32,
 }
 
 type Probe is data = $Probe {
@@ -285,9 +293,13 @@ type Fog is data = $Fog {
 
 type Shadow is data = $Shadow {
   view: Mat4,
-  projection: Mat4,
-  texel: F32,
   texels: U32,
+  filter: U32,
+  softness: F32,
+  contact: U32,
+  contact_length: F32,
+  local: U32,
+  local_texels: U32,
 }
 
 type ProbeVolume is data = $ProbeVolume {

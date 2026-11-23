@@ -177,6 +177,18 @@ func encode_light (light: types.Light) =>
     light.position.x, light.position.y, light.position.z, light.radius,
     light.color.x, light.color.y, light.color.z, light.direction.x,
     light.direction.y, light.direction.z, light.inner, light.outer,
+    lanes.bit light.shadow, U32.to_f32 (light.id),
+  ]
+
+// Cascade: One sun shadow map.
+func encode_cascade (cascade: types.Cascade) =>
+  let $types.Mat4 { x: projection_x, y: projection_y, z: projection_z, w: projection_w } = cascade.projection
+  return #[
+    projection_x.x, projection_x.y, projection_x.z, projection_x.w,
+    projection_y.x, projection_y.y, projection_y.z, projection_y.w,
+    projection_z.x, projection_z.y, projection_z.z, projection_z.w,
+    projection_w.x, projection_w.y, projection_w.z, projection_w.w,
+    cascade.texel, cascade.far,
   ]
 
 // Probe: A diffuse light probe: nine spherical-harmonic RGB terms of the light
@@ -265,6 +277,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   let poses_count: U32 = collections.poses.length
   let emitters_count: U32 = collections.emitters.length
   let lights_count: U32 = collections.lights.length
+  let cascades_count: U32 = collections.cascades.length
   let probes_count: U32 = collections.probes.length
   let listener_count: U32 = collections.listener.length
   let panners_count: U32 = collections.panners.length
@@ -417,25 +430,13 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (shadow_view_w.y)
   @storage.push encoded (shadow_view_w.z)
   @storage.push encoded (shadow_view_w.w)
-  let $types.Mat4 { x: shadow_projection_x, y: shadow_projection_y, z: shadow_projection_z, w: shadow_projection_w } = packet.shadow.projection
-  @storage.push encoded (shadow_projection_x.x)
-  @storage.push encoded (shadow_projection_x.y)
-  @storage.push encoded (shadow_projection_x.z)
-  @storage.push encoded (shadow_projection_x.w)
-  @storage.push encoded (shadow_projection_y.x)
-  @storage.push encoded (shadow_projection_y.y)
-  @storage.push encoded (shadow_projection_y.z)
-  @storage.push encoded (shadow_projection_y.w)
-  @storage.push encoded (shadow_projection_z.x)
-  @storage.push encoded (shadow_projection_z.y)
-  @storage.push encoded (shadow_projection_z.z)
-  @storage.push encoded (shadow_projection_z.w)
-  @storage.push encoded (shadow_projection_w.x)
-  @storage.push encoded (shadow_projection_w.y)
-  @storage.push encoded (shadow_projection_w.z)
-  @storage.push encoded (shadow_projection_w.w)
-  @storage.push encoded (packet.shadow.texel)
   @storage.push encoded (U32.to_f32 (packet.shadow.texels))
+  @storage.push encoded (U32.to_f32 (packet.shadow.filter))
+  @storage.push encoded (packet.shadow.softness)
+  @storage.push encoded (U32.to_f32 (packet.shadow.contact))
+  @storage.push encoded (packet.shadow.contact_length)
+  @storage.push encoded (U32.to_f32 (packet.shadow.local))
+  @storage.push encoded (U32.to_f32 (packet.shadow.local_texels))
   @storage.push encoded (packet.blur)
   @storage.push encoded (lanes.bit packet.quality.bloom)
   @storage.push encoded (packet.clouds.cover)
@@ -454,6 +455,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (U32.to_f32 emitters_count)
   @storage.push encoded (lanes.bit packet.quality.taa)
   @storage.push encoded (U32.to_f32 lights_count)
+  @storage.push encoded (U32.to_f32 cascades_count)
   @storage.push encoded (U32.to_f32 probes_count)
   @storage.push encoded (U32.to_f32 listener_count)
   @storage.push encoded (U32.to_f32 panners_count)
@@ -673,7 +675,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     for i in 0 .. count:
       let item = field.values.at i
       @storage.push encoded item
-  encoded[start + 169] := U32.to_f32 ((encoded.length - fields_start))
+  encoded[start + 158] := U32.to_f32 ((encoded.length - fields_start))
   let ui_start = encoded.length
   for i in 0 .. ui_count:
     let source = collections.ui[i]
@@ -706,7 +708,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     for i in 0 .. count:
       let item = ui.text.at i
       @storage.push encoded item
-  encoded[start + 171] := U32.to_f32 ((encoded.length - ui_start))
+  encoded[start + 160] := U32.to_f32 ((encoded.length - ui_start))
   let services_start = encoded.length
   for i in 0 .. services_count:
     let source = collections.services[i]
@@ -723,7 +725,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     for i in 0 .. count:
       let item = service.values.at i
       @storage.push encoded item
-  encoded[start + 173] := U32.to_f32 ((encoded.length - services_start))
+  encoded[start + 162] := U32.to_f32 ((encoded.length - services_start))
   for i in 0 .. buses_count:
     let source = collections.buses[i]
     let buse: types.Bus = project.buse context source
@@ -813,6 +815,30 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     @storage.push encoded (light.direction.z)
     @storage.push encoded (light.inner)
     @storage.push encoded (light.outer)
+    @storage.push encoded (lanes.bit light.shadow)
+    @storage.push encoded (U32.to_f32 (light.id))
+  for i in 0 .. cascades_count:
+    let source = collections.cascades[i]
+    let cascade: types.Cascade = project.cascade context source
+    let $types.Mat4 { x: projection_x, y: projection_y, z: projection_z, w: projection_w } = cascade.projection
+    @storage.push encoded (projection_x.x)
+    @storage.push encoded (projection_x.y)
+    @storage.push encoded (projection_x.z)
+    @storage.push encoded (projection_x.w)
+    @storage.push encoded (projection_y.x)
+    @storage.push encoded (projection_y.y)
+    @storage.push encoded (projection_y.z)
+    @storage.push encoded (projection_y.w)
+    @storage.push encoded (projection_z.x)
+    @storage.push encoded (projection_z.y)
+    @storage.push encoded (projection_z.z)
+    @storage.push encoded (projection_z.w)
+    @storage.push encoded (projection_w.x)
+    @storage.push encoded (projection_w.y)
+    @storage.push encoded (projection_w.z)
+    @storage.push encoded (projection_w.w)
+    @storage.push encoded (cascade.texel)
+    @storage.push encoded (cascade.far)
   for i in 0 .. probes_count:
     let source = collections.probes[i]
     let probe: types.Probe = project.probe context source
@@ -939,6 +965,7 @@ func measure_render_floats collections -> project -> context =>
   let poses_count: U32 = collections.poses.length
   let emitters_count: U32 = collections.emitters.length
   let lights_count: U32 = collections.lights.length
+  let cascades_count: U32 = collections.cascades.length
   let probes_count: U32 = collections.probes.length
   let listener_count: U32 = collections.listener.length
   let panners_count: U32 = collections.panners.length
@@ -978,7 +1005,8 @@ func measure_render_floats collections -> project -> context =>
   total := self + voices_count * 12
   total := self + poses_count * 4
   total := self + emitters_count * 42
-  total := self + lights_count * 12
+  total := self + lights_count * 14
+  total := self + cascades_count * 18
   total := self + probes_count * 28
   total := self + listener_count * 9
   total := self + panners_count * 15
@@ -1148,53 +1176,42 @@ func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (
   encoded[141] := shadow_view_w.y
   encoded[142] := shadow_view_w.z
   encoded[143] := shadow_view_w.w
-  let $types.Mat4 { x: shadow_projection_x, y: shadow_projection_y, z: shadow_projection_z, w: shadow_projection_w } = packet.shadow.projection
-  encoded[144] := shadow_projection_x.x
-  encoded[145] := shadow_projection_x.y
-  encoded[146] := shadow_projection_x.z
-  encoded[147] := shadow_projection_x.w
-  encoded[148] := shadow_projection_y.x
-  encoded[149] := shadow_projection_y.y
-  encoded[150] := shadow_projection_y.z
-  encoded[151] := shadow_projection_y.w
-  encoded[152] := shadow_projection_z.x
-  encoded[153] := shadow_projection_z.y
-  encoded[154] := shadow_projection_z.z
-  encoded[155] := shadow_projection_z.w
-  encoded[156] := shadow_projection_w.x
-  encoded[157] := shadow_projection_w.y
-  encoded[158] := shadow_projection_w.z
-  encoded[159] := shadow_projection_w.w
-  encoded[160] := packet.shadow.texel
-  encoded[161] := U32.to_f32 (packet.shadow.texels)
-  encoded[162] := packet.blur
-  encoded[163] := lanes.bit packet.quality.bloom
-  encoded[164] := packet.clouds.cover
-  encoded[165] := packet.clouds.drift.x
-  encoded[166] := packet.clouds.drift.z
-  encoded[167] := lanes.bit packet.hide_cursor
+  encoded[144] := U32.to_f32 (packet.shadow.texels)
+  encoded[145] := U32.to_f32 (packet.shadow.filter)
+  encoded[146] := packet.shadow.softness
+  encoded[147] := U32.to_f32 (packet.shadow.contact)
+  encoded[148] := packet.shadow.contact_length
+  encoded[149] := U32.to_f32 (packet.shadow.local)
+  encoded[150] := U32.to_f32 (packet.shadow.local_texels)
+  encoded[151] := packet.blur
+  encoded[152] := lanes.bit packet.quality.bloom
+  encoded[153] := packet.clouds.cover
+  encoded[154] := packet.clouds.drift.x
+  encoded[155] := packet.clouds.drift.z
+  encoded[156] := lanes.bit packet.hide_cursor
+  encoded[157] := 0.0
+  encoded[158] := 0.0
+  encoded[159] := 0.0
+  encoded[160] := 0.0
+  encoded[161] := 0.0
+  encoded[162] := 0.0
+  encoded[163] := 0.0
+  encoded[164] := 0.0
+  encoded[165] := 0.0
+  encoded[166] := 0.0
+  encoded[167] := lanes.bit packet.quality.taa
   encoded[168] := 0.0
   encoded[169] := 0.0
   encoded[170] := 0.0
   encoded[171] := 0.0
   encoded[172] := 0.0
-  encoded[173] := 0.0
-  encoded[174] := 0.0
-  encoded[175] := 0.0
-  encoded[176] := 0.0
-  encoded[177] := 0.0
-  encoded[178] := lanes.bit packet.quality.taa
+  encoded[173] := lanes.bit packet.loading
+  encoded[174] := lanes.bit packet.show_captions
+  encoded[175] := lanes.bit packet.retained_enabled
+  encoded[176] := lanes.bit packet.retained_reset
+  encoded[177] := U32.to_f32 (packet.retained_after)
+  encoded[178] := 0.0
   encoded[179] := 0.0
-  encoded[180] := 0.0
-  encoded[181] := 0.0
-  encoded[182] := 0.0
-  encoded[183] := lanes.bit packet.loading
-  encoded[184] := lanes.bit packet.show_captions
-  encoded[185] := lanes.bit packet.retained_enabled
-  encoded[186] := lanes.bit packet.retained_reset
-  encoded[187] := U32.to_f32 (packet.retained_after)
-  encoded[188] := 0.0
-  encoded[189] := 0.0
   let at: U32 = protocol.packet_header_floats
   for draw in draws:
     encoded[at + 0] := U32.to_f32 (draw.mesh)

@@ -11,6 +11,7 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
     validate_matrix(&frame.view)?;
     validate_matrix(&frame.projection)?;
     crate::lights::validate(&frame.lights)?;
+    super::cascades::validate(frame)?;
     for patch in &frame.fields {
         let most = u32::try_from(MAX_FIELD)?;
         ensure!(

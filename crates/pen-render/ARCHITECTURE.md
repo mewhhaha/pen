@@ -211,7 +211,8 @@ renderer cannot know where its vertices land (`culling.rs`). The mesh's
 sphere, grown by the margin, is placed by each draw's transform (its radius
 stretched by the transform's longest axis, or the root of its axes' squared
 lengths when it shears) and tested against each view the frame draws: the
-camera's clip volume, and each shadow map's. A draw left out of a view would
+camera's clip volume, each sun map's and each local light face's (at most
+23 views, a bit each in a `u32`). A draw left out of a view would
 put no pixel in it, so what is drawn does not change. A caster only the
 shadow maps see still casts; one no view sees writes no uniforms.
 
@@ -235,18 +236,52 @@ into the stats.
 
 ### Shadows
 
-The game fits its shadow map (`frame.shadow`, binding 1 and the scene
-uniform's `light_view_projection`). Where a loaded shader reads
-`shadow_cascades` (binding 3, a `texture_depth_2d_array`), the renderer also
-fits a nearer map of the same size inside the camera's view (`cascades.rs`;
-the code fits as many as `NEARER` says, and a map costs about as much as the
-game's): a sphere round the stretch of view nearer than the split (a
-practical split between the near plane and how far the game's map reaches), along the game's light and with its depth range, rounded up to a
-sixteenth and moved in whole texels, so their shadows hold still. The maps
-are layers of one array texture, nearest first and the game's last; the
-scene uniform carries their count, view-projections and texels after the
-first 320 bytes, which older shaders need not declare. Each map has its own
-shadow pass, with casters culled to it.
+The game fits the sun's shadow maps and the renderer draws them
+(`cascades.rs`, `shadows.rs`). Up to four cascades (the packet's `cascades`
+section, nearest first) share the frame's light view and differ in their
+orthographic windows: the game (Ink's `graphics.shadow`) fits each round a
+slice of the camera's view, bounding sphere and all, and moves its centre in
+whole texels, so shadows hold still as the camera moves. The game has the
+camera, the light, the shadow distance and the player's quality tier, so it
+fits them; the renderer validates what it is given (orthographic, texels and
+slice ends growing outward) and draws each into a layer of one array texture.
+Where a loaded shader reads `shadow_cascades` (binding 3) every cascade is
+drawn; otherwise only the farthest, at binding 1 as before. The scene uniform
+carries the count, the blend band, the filter, the contact steps, each
+cascade's view-projection, texels (texture and world), slice end and depth
+range, and the soft shadows' settings after its first 320 bytes, which older
+shaders need not declare. Each map has its own shadow pass, with casters
+culled to it.
+
+`shaders/shadows.wgsl` (`SHADOWS_WGSL`) is what materials read them with:
+`sun_shadow` takes the cascade of the fragment's slice of the view, blending
+into the next over the end of the slice, with a hardware tap, a rotated
+Poisson PCF, or soft shadows (PCSS: a blocker search sets the penumbra, so
+contact hardens). Maps are orthographic, so the receiver's own plane gives each
+tap's depth and the bias follows its slope; a normal offset of 1.5 texels
+at grazing angles covers the rest. The filter's pattern is fixed per pixel
+(interleaved gradient noise), so TAA averages it. Shader and reference tests
+live in `renderer/shadow_tests.rs`.
+
+Contact shadows (`shadow.contact` steps) need the camera's depth in a form a
+forward shader can read: the frame's casters are drawn once more, depth only,
+through the camera's jittered projection, into a texture of the scene's size
+(binding 9), before the scene pass; the shader marches a short ray toward the
+sun along it. A frame without them draws nothing extra.
+
+Local lights shadow through `local_shadows.rs`. Lights that ask
+(`Light::shadow`) and whose reach touches the camera's view are ranked by size
+on screen, then id, then index, and taken while `shadow.local` casters and 18
+faces allow: a spot is one perspective face, a point light (or a spot wider
+than 160 degrees) a cube of six, every face's window a few texels wider than
+its edge so a filter never leaves it. Faces are layers of one depth array
+(`shadow.local_texels` wide) bound with the lights at group 2; a light keeps
+its layers while it stays picked, and a face is drawn again only when its
+signature (the light's, and every casting draw's mesh, transform, parameters,
+instance data and revision that the face's view sees) changed. The faces are
+views after the sun's in the same culling, so their casters are culled to
+each. `RenderStats::local_shadow_casters`, `_faces` and `_kept` say what was
+picked and what was kept.
 
 ### Dynamic resolution
 
@@ -338,8 +373,9 @@ pipeline binds the grid uniform, the lights, each cluster's range and the
 light indices; `LIGHTS_WGSL` declares them and `clustered_light(world,
 normal, position, view_z)` sums the lights of a fragment's cluster as a
 diffuse surface's irradiance, each falling smoothly to nothing at its reach.
-Material shaders that do not light with them leave group 2 alone. Insets and
-the shadow pass bind a group of no lights. A frame without lights writes one
+Lights that cast shadows read their maps at binding 4 of the same group, with
+their comparison sampler and each layer's matrix (see Shadows). Material shaders that do not light with them leave group 2 alone. Insets and
+the shadow passes bind a group of no lights and a stand-in atlas. A frame without lights writes one
 48-byte uniform.
 
 ### HDR output
@@ -400,6 +436,11 @@ host installs the logger. The `render_packet` example prints them with
   an analytic edge, clustered lights against every light summed, KTX2
   variants by device features, HDR output in each color space, and MSDF text
   magnified, and writes what it drew to `target/look-shots/`.
+  `tests/shadow_looks.rs` draws the sun's soft and contact shadows and the
+  spot and point lights' shadows (before and after PNGs, in the directory
+  `SHADOW_SHOTS` names if set); the shaders' filters, cascade blending, bias,
+  contact march and local shadow projection are checked against f64 references
+  by `renderer/shadow_tests.rs`.
   Test in release: a Rust 1.99 release-mode miscompile once hid in the
   sampler setup.
 - `cargo run --release -p pen-render --example render_packet` renders

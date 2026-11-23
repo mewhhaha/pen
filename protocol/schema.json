@@ -250,6 +250,11 @@
       "doc": "The most point and spot lights one frame may have."
     },
     {
+      "limit": "MAX_CASCADES",
+      "value": 4,
+      "doc": "The most sun shadow maps one frame may have."
+    },
+    {
       "limit": "MAX_PROBES",
       "value": 16384,
       "doc": "The most light probes one frame may carry (a volume may be larger than a frame's share only by sending none: see `probe_volume.revision`)."
@@ -2021,16 +2026,38 @@
       "shadow.view": {
         "kind": "matrix"
       },
-      "shadow.projection": {
-        "kind": "matrix"
-      },
-      "shadow.texel": {
-        "kind": "f32",
-        "doc": "A map texel's width in world units."
-      },
       "shadow.texels": {
         "kind": "count",
-        "max": 8192
+        "max": 8192,
+        "doc": "The width of each sun cascade's map in texels; 0 for no sun shadows."
+      },
+      "shadow.filter": {
+        "kind": "count",
+        "max": 2,
+        "doc": "How soft the sun's shadows are: 0 hard (one hardware-filtered tap), 1 percentage-closer filtering over a rotated Poisson disk of a few texels, 2 percentage-closer soft shadows (a blocker search sets the penumbra from `softness`, contact hardening)."
+      },
+      "shadow.softness": {
+        "kind": "f32",
+        "doc": "The sun's size for soft shadows: the width of the penumbra per unit of distance between the receiver and its blocker, about twice the tangent of the sun's angular radius. 0 keeps only the filter's own width."
+      },
+      "shadow.contact": {
+        "kind": "count",
+        "max": 64,
+        "doc": "Steps of the screen-space contact shadow march toward the sun along the depth buffer; 0 for none. Needs a perspective camera, and draws the casters a second time as depth."
+      },
+      "shadow.contact_length": {
+        "kind": "f32",
+        "doc": "How far toward the sun a contact shadow looks, in world units."
+      },
+      "shadow.local": {
+        "kind": "count",
+        "max": 16,
+        "doc": "The most point and spot lights that cast shadows this frame, picked by screen size and then by id (a point light costs six map faces, a spot one; at most 18 faces are drawn); 0 for none."
+      },
+      "shadow.local_texels": {
+        "kind": "count",
+        "max": 4096,
+        "doc": "The width of each local light's map face in texels."
       },
       "blur": {
         "kind": "f32",
@@ -2113,6 +2140,11 @@
       "light_count": {
         "kind": "size",
         "section": "lights",
+        "of": "count"
+      },
+      "cascade_count": {
+        "kind": "size",
+        "section": "cascades",
         "of": "count"
       },
       "probe_count": {
@@ -3103,6 +3135,15 @@
             "outer": {
               "kind": "f32",
               "doc": "The cosine of the half-angle of a spot light's cone, where its light ends; -1 for a point light, which shines all round."
+            },
+            "shadow": {
+              "kind": "flag",
+              "doc": "Whether it asks to cast shadows; the host picks which of those do, within `shadow.local`."
+            },
+            "id": {
+              "kind": "count",
+              "max": 16777215,
+              "doc": "A number that stays with the light from frame to frame: it breaks ties between equally large casters and names the shadow map the host may keep."
             }
           },
           "doc": "A point light, or a spot light shining along `direction` within a cone, lighting what lies within `radius` of `position`."
@@ -3111,6 +3152,35 @@
           "limit": "MAX_LIGHTS",
           "value": 4096,
           "doc": "The most point and spot lights one frame may have."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "cascades",
+        "doc": "The sun's shadow maps, nearest to the camera first. They share the light view `shadow.view` and differ in their orthographic windows; the game fits each round its slice of the camera's view and moves it in whole texels.",
+        "record": {
+          "name": "Cascade",
+          "constant": "CASCADE",
+          "fields": {
+            "projection": {
+              "kind": "matrix",
+              "doc": "The map's orthographic window, depth range included, in the light's view."
+            },
+            "texel": {
+              "kind": "f32",
+              "doc": "A map texel's width in world units."
+            },
+            "far": {
+              "kind": "f32",
+              "doc": "How far ahead of the camera, along its view, the slice this map covers ends."
+            }
+          },
+          "doc": "One sun shadow map."
+        },
+        "max": {
+          "limit": "MAX_CASCADES",
+          "value": 4,
+          "doc": "The most sun shadow maps one frame may have."
         }
       },
       {

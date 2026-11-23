@@ -40,10 +40,10 @@ var<private> local_shadow_taps = array<vec2f, 8>(
 // How far a surface is moved along its normal (texels, at a right angle to
 // the light), and toward the light (texels: a base, and more with the slope
 // of the surface to the light), before it reads its map; and the filter's reach.
-const LOCAL_NORMAL_OFFSET: f32 = 1.5;
-const LOCAL_BIAS_BASE: f32 = 1.5;
-const LOCAL_BIAS_SLOPE: f32 = 0.75;
-const LOCAL_FILTER_RADIUS: f32 = 1.5;
+const local_normal_offset: f32 = 1.5;
+const local_bias_base: f32 = 1.5;
+const local_bias_slope: f32 = 0.75;
+const local_filter_radius: f32 = 1.5;
 
 // How much of `light` reaches `world`, a surface facing `normal`, where `way`
 // is the unit vector toward the light and `distance` how far it is: 1 where
@@ -75,7 +75,7 @@ fn local_shadow(light: ClusterLight, world: vec3f, normal: vec3f, way: vec3f, di
   let facing = clamp(dot(normal, way), 0.0, 1.0);
   let sine = sqrt(clamp(1.0 - facing * facing, 0.0, 1.0));
   let tangent = min(sine / max(facing, 0.05), 4.0);
-  let shifted = world + normal * (texel * LOCAL_NORMAL_OFFSET * sine) + way * (texel * (LOCAL_BIAS_BASE + LOCAL_BIAS_SLOPE * tangent));
+  let shifted = world + normal * (texel * local_normal_offset * sine) + way * (texel * (local_bias_base + local_bias_slope * tangent));
   let clip = matrix * vec4f(shifted, 1.0);
   if (clip.w <= 0.0) {
     return 1.0;
@@ -87,7 +87,7 @@ fn local_shadow(light: ClusterLight, world: vec3f, normal: vec3f, way: vec3f, di
   let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
   let angle = 6.2831853 * fract(sin(dot(world, vec3f(12.9898, 78.233, 37.719))) * 43758.5453);
   let spin = vec2f(cos(angle), sin(angle));
-  let step = LOCAL_FILTER_RADIUS / f32(textureDimensions(local_shadows).x);
+  let step = local_filter_radius / f32(textureDimensions(local_shadows).x);
   var lit = 0.0;
   for (var i = 0u; i < 8u; i++) {
     let tap = local_shadow_taps[i];

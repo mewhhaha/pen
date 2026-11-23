@@ -41,18 +41,18 @@ var<private> shadow_taps = array<vec2f, 16>(
   vec2f(0.19984126, 0.78641367), vec2f(0.14383161, -0.14100790));
 
 // The widest filter, in texels, and how far past a map's edge a tap may reach.
-const SUN_MAX_RADIUS: f32 = 12.0;
+const sun_max_radius: f32 = 12.0;
 // How far a surface is moved off along its normal (in texels, at a right
 // angle to the light) before it reads the map, and how much depth a texel of
 // the receiver's slope adds on top of what the plane already gives.
-const SUN_NORMAL_OFFSET: f32 = 1.5;
-const SUN_BIAS_BASE: f32 = 1.0;
-const SUN_BIAS_SLOPE: f32 = 0.75;
-const SUN_MAX_SLOPE: f32 = 6.0;
+const sun_normal_offset: f32 = 1.5;
+const sun_bias_base: f32 = 1.0;
+const sun_bias_slope: f32 = 0.75;
+const sun_max_slope: f32 = 6.0;
 // The widest filter, in texels, hard shadows and plain filtering use.
-const SUN_FILTER_RADIUS: f32 = 1.5;
+const sun_filter_radius: f32 = 1.5;
 // The farthest a blocker is searched for, in world units from the receiver.
-const SUN_BLOCKER_REACH: f32 = 8.0;
+const sun_blocker_reach: f32 = 8.0;
 
 // A pseudo-random number in [0, 1) from a pixel's position: interleaved
 // gradient noise, fixed per pixel, so that the filter's pattern holds still
@@ -89,7 +89,7 @@ fn sun_map_of(map: u32, world: vec3f, normal: vec3f, reach: f32) -> SunMap {
   let toward = -normalize(scene.light_direction.xyz);
   let facing = dot(normal, toward);
   let sine = sqrt(clamp(1.0 - facing * facing, 0.0, 1.0));
-  let shifted = world + normal * (texel.y * SUN_NORMAL_OFFSET * sine);
+  let shifted = world + normal * (texel.y * sun_normal_offset * sine);
   let ndc = (matrix * vec4f(shifted, 1.0)).xyz;
   var result: SunMap;
   result.uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
@@ -105,8 +105,8 @@ fn sun_map_of(map: u32, world: vec3f, normal: vec3f, reach: f32) -> SunMap {
   let deeper = row_z / unit_z;
   let across = dot(normal, deeper);
   let flat_ = min(across, -0.1);
-  let sx = clamp(-dot(normal, row_x / length(row_x)) / flat_, -SUN_MAX_SLOPE, SUN_MAX_SLOPE);
-  let sy = clamp(-dot(normal, row_y / length(row_y)) / flat_, -SUN_MAX_SLOPE, SUN_MAX_SLOPE);
+  let sx = clamp(-dot(normal, row_x / length(row_x)) / flat_, -sun_max_slope, sun_max_slope);
+  let sy = clamp(-dot(normal, row_y / length(row_y)) / flat_, -sun_max_slope, sun_max_slope);
   result.unit = unit_z;
   // The plane's depth change per world unit across: the sign follows from
   // the plane through the receiver, whose normal faces the light.
@@ -120,7 +120,7 @@ fn sun_map_of(map: u32, world: vec3f, normal: vec3f, reach: f32) -> SunMap {
 fn sun_tap_depth(m: SunMap, offset: vec2f) -> f32 {
   let world = offset * m.texel;
   let plane = dot(m.slope, world);
-  let bias = (SUN_BIAS_BASE + SUN_BIAS_SLOPE * (abs(m.slope.x) + abs(m.slope.y)) / m.unit) * m.texel * m.unit;
+  let bias = (sun_bias_base + sun_bias_slope * (abs(m.slope.x) + abs(m.slope.y)) / m.unit) * m.texel * m.unit;
   return m.depth + plane - bias;
 }
 
@@ -142,9 +142,9 @@ fn sun_filtered(map: u32, m: SunMap, radius: f32, spin: vec2f, taps: u32) -> f32
 // next map should answer).
 fn sun_in(map: u32, world: vec3f, normal: vec3f, spin: vec2f) -> vec2f {
   let mode = u32(scene.cascades.z);
-  var reach = SUN_FILTER_RADIUS;
+  var reach = sun_filter_radius;
   if (mode == 2u) {
-    reach = SUN_MAX_RADIUS;
+    reach = sun_max_radius;
   }
   let m = sun_map_of(map, world, normal, reach);
   if (m.inside < 0.0 || m.depth > 1.0 || m.depth < 0.0) {
@@ -154,14 +154,14 @@ fn sun_in(map: u32, world: vec3f, normal: vec3f, spin: vec2f) -> vec2f {
     return vec2f(textureSampleCompareLevel(shadow_cascades, shadow_sampler, m.uv, map, sun_tap_depth(m, vec2f(0.0))), m.inside);
   }
   if (mode == 1u) {
-    return vec2f(sun_filtered(map, m, SUN_FILTER_RADIUS, spin, 16u), m.inside);
+    return vec2f(sun_filtered(map, m, sun_filter_radius, spin, 16u), m.inside);
   }
   // Soft shadows: look for blockers where the penumbra could reach from,
   // average how far they are, and filter as wide as the sun's size makes
   // the penumbra there.
   let softness = scene.shadow_params.x;
   let size = vec2f(textureDimensions(shadow_cascades));
-  let search = clamp(softness * SUN_BLOCKER_REACH * 0.5 / m.texel, 1.0, SUN_MAX_RADIUS - 1.0);
+  let search = clamp(softness * sun_blocker_reach * 0.5 / m.texel, 1.0, sun_max_radius - 1.0);
   var gap = 0.0;
   var blockers = 0.0;
   for (var i = 0u; i < 12u; i++) {
@@ -179,7 +179,7 @@ fn sun_in(map: u32, world: vec3f, normal: vec3f, spin: vec2f) -> vec2f {
     return vec2f(1.0, m.inside);
   }
   let blocked = gap / blockers;
-  let radius = clamp(softness * blocked * 0.5 / m.texel, SUN_FILTER_RADIUS, SUN_MAX_RADIUS);
+  let radius = clamp(softness * blocked * 0.5 / m.texel, sun_filter_radius, sun_max_radius);
   return vec2f(sun_filtered(map, m, radius, spin, 16u), m.inside);
 }
 

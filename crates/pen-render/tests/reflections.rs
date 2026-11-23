@@ -581,7 +581,7 @@ fn mirror_scene(name: &str, size: (u32, u32), box_at: V3) -> Option<Scene> {
     let floor = quads(&[[[-30.0, 0.0, 30.0], [30.0, 0.0, 30.0], [30.0, 0.0, -30.0], [-30.0, 0.0, -30.0]]]);
     let block = quads(&cuboid([box_at[0] - 0.6, 0.0, box_at[2] - 0.6], [box_at[0] + 0.6, 1.2, box_at[2] + 0.6]));
     // A one-sided red table top at height 1.2, seen from above: a ray from below meets its back.
-    let table = quads(&[[[-3.0, 1.2, 1.0], [-3.0, 1.2, -1.0], [-1.0, 1.2, -1.0], [-1.0, 1.2, 1.0]]]);
+    let table = quads(&[[[-3.0, 1.2, -1.0], [-3.0, 1.2, 1.0], [-1.0, 1.2, 1.0], [-1.0, 1.2, -1.0]]]);
     Scene::new(name, &[floor, block, table], &[("floor", [0.9, 0.9, 0.9]), ("red", [0.95, 0.05, 0.05])], size)
 }
 

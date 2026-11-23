@@ -134,13 +134,15 @@ fn toned(value: f64, peak: f64) -> f64 {
 enum Kind {
     Sdr,
     Hdr,
+    /// Extended sRGB reaching a thousand times white, for reading light well past it.
+    Wide,
 }
 
 impl Kind {
     fn format(self) -> wgpu::TextureFormat {
         match self {
             Kind::Sdr => FORMAT,
-            Kind::Hdr => wgpu::TextureFormat::Rgba16Float,
+            Kind::Hdr | Kind::Wide => wgpu::TextureFormat::Rgba16Float,
         }
     }
 
@@ -150,6 +152,9 @@ impl Kind {
             Kind::Hdr => {
                 Display { color_space: wgpu::SurfaceColorSpace::ExtendedSrgb, headroom: 4.0, white_nits: 203.0 }
             }
+            Kind::Wide => {
+                Display { color_space: wgpu::SurfaceColorSpace::ExtendedSrgb, headroom: 1000.0, white_nits: 203.0 }
+            }
         }
     }
 
@@ -157,6 +162,7 @@ impl Kind {
         match self {
             Kind::Sdr => 1.0,
             Kind::Hdr => srgb_encode(4.0),
+            Kind::Wide => srgb_encode(1000.0),
         }
     }
 
@@ -329,7 +335,7 @@ impl Rig {
         let bytes = read(&self.device, &self.queue, &self.target.0);
         match self.kind {
             Kind::Sdr => bytes.chunks(4).map(|texel| [2, 1, 0].map(|i| f64::from(texel[i]) / 255.0)).collect(),
-            Kind::Hdr => bytes
+            Kind::Hdr | Kind::Wide => bytes
                 .chunks(8)
                 .map(|texel| [0, 1, 2].map(|i| half(u16::from_le_bytes([texel[i * 2], texel[i * 2 + 1]]))))
                 .collect(),
@@ -741,4 +747,251 @@ fn look_up_tables_grade_blend_and_weigh_on_sdr_and_hdr_displays() {
         rig.save(&format!("lut-{kind:?}-room-warm.png"), &after);
         assert_ne!(before, after);
     }
+}
+
+// ----------------------------------------------------------------- the bloom
+
+/// The bloom's share of the picture's light, and the most linear light one tap of its
+/// source brings: pen-render's `BLOOM_INTENSITY` and `BLOOM_CEILING`.
+const INTENSITY: f64 = 0.05;
+const CEILING: f64 = 32.0;
+
+/// The light a display's pixel shows, linear: the inverse of the roll-off and the
+/// transfer function (the display is `Kind::Wide`, so nothing near the roll-off's end).
+fn light_of(shown: f64, peak: f64) -> f64 {
+    let d = peak - 0.9;
+    let encoded = if shown > 0.9 { d * d / (peak - shown) - d + 0.9 } else { shown };
+    srgb_decode(encoded)
+}
+
+/// Bilinear sample of `image` (`width` by `height`) at texel coordinates (`x`, `y`), the
+/// centre of texel i being at i + 0.5, clamped to the edge as the renderer's sampler is.
+fn bilinear(image: &[f64], width: usize, height: usize, x: f64, y: f64) -> f64 {
+    let (u, v) = (x - 0.5, y - 0.5);
+    let (i, j) = (u.floor(), v.floor());
+    let (fx, fy) = (u - i, v - j);
+    let at = |i: f64, j: f64| {
+        let (i, j) = ((i.max(0.0) as usize).min(width - 1), (j.max(0.0) as usize).min(height - 1));
+        image[j * width + i]
+    };
+    let top = at(i, j) * (1.0 - fx) + at(i + 1.0, j) * fx;
+    let bottom = at(i, j + 1.0) * (1.0 - fx) + at(i + 1.0, j + 1.0) * fx;
+    top * (1.0 - fy) + bottom * fy
+}
+
+/// The bloom's blur of a grey picture of encoded values, in f64, as the passes make it: the
+/// first level (linear, exposed by nothing, held to the ceiling, Karis-weighted 13 taps), each
+/// next a mip down, then each level's tent added onto the one above. The sum of levels.
+fn blurred(encoded: &[f64], width: usize, height: usize) -> Vec<f64> {
+    let half = (width.div_ceil(2), height.div_ceil(2));
+    let levels = (half.0.min(half.1).ilog2() as usize).saturating_sub(1).clamp(1, 6);
+    let size = |level: usize| ((half.0 >> level).max(1), (half.1 >> level).max(1));
+    let mut pyramid: Vec<Vec<f64>> = Vec::new();
+    for level in 0..levels {
+        let (dw, dh) = size(level);
+        let (source, sw, sh) = if level == 0 {
+            (encoded, width, height)
+        } else {
+            (&pyramid[level - 1][..], size(level - 1).0, size(level - 1).1)
+        };
+        let mut out = vec![0.0; dw * dh];
+        for j in 0..dh {
+            for i in 0..dw {
+                let (cx, cy) = ((i as f64 + 0.5) * sw as f64 / dw as f64, (j as f64 + 0.5) * sh as f64 / dh as f64);
+                let tap = |ox: f64, oy: f64| {
+                    let v = bilinear(source, sw, sh, cx + ox, cy + oy);
+                    if level == 0 { srgb_decode(v).min(CEILING) } else { v }
+                };
+                let weight = |v: f64| if level == 0 { 1.0 / (1.0 + v) } else { 1.0 };
+                let group = |a: f64, b: f64, c: f64, d: f64| {
+                    let w = [a, b, c, d].map(weight);
+                    (a * w[0] + b * w[1] + c * w[2] + d * w[3]) / (w[0] + w[1] + w[2] + w[3])
+                };
+                let (a, b, c) = (tap(-2.0, -2.0), tap(0.0, -2.0), tap(2.0, -2.0));
+                let (d, e, f) = (tap(-2.0, 0.0), tap(0.0, 0.0), tap(2.0, 0.0));
+                let (g, h, k) = (tap(-2.0, 2.0), tap(0.0, 2.0), tap(2.0, 2.0));
+                let (jj, kk, l, m) = (tap(-1.0, -1.0), tap(1.0, -1.0), tap(-1.0, 1.0), tap(1.0, 1.0));
+                out[j * dw + i] = group(jj, kk, l, m) * 0.5
+                    + (group(a, b, d, e) + group(b, c, e, f) + group(d, e, g, h) + group(e, f, h, k)) * 0.125;
+            }
+        }
+        pyramid.push(out);
+    }
+    for level in (0..levels - 1).rev() {
+        let (dw, dh) = size(level);
+        let (sw, sh) = size(level + 1);
+        let lower = pyramid[level + 1].clone();
+        for j in 0..dh {
+            for i in 0..dw {
+                let (cx, cy) = ((i as f64 + 0.5) * sw as f64 / dw as f64, (j as f64 + 0.5) * sh as f64 / dh as f64);
+                let tap = |ox: f64, oy: f64| bilinear(&lower, sw, sh, cx + ox, cy + oy);
+                let tent = tap(0.0, 0.0) * 4.0
+                    + (tap(0.0, -1.0) + tap(-1.0, 0.0) + tap(1.0, 0.0) + tap(0.0, 1.0)) * 2.0
+                    + tap(-1.0, -1.0)
+                    + tap(1.0, -1.0)
+                    + tap(-1.0, 1.0)
+                    + tap(1.0, 1.0);
+                pyramid[level][j * dw + i] += tent / 16.0;
+            }
+        }
+    }
+    let levels = levels as f64;
+    // Resampled to the picture's size by the present pass's bilinear read of level 0.
+    let (hw, hh) = size(0);
+    (0..width * height)
+        .map(|index| {
+            let (x, y) = ((index % width) as f64 + 0.5, (index / width) as f64 + 0.5);
+            bilinear(&pyramid[0], hw, hh, x * hw as f64 / width as f64, y * hh as f64 / height as f64) / levels
+        })
+        .collect()
+}
+
+/// What a picture of these encoded greys shows after the bloom: the light the display
+/// shows, linear, by pixel, and the reference's for the same picture.
+fn bloomed(rig: &mut Rig, rects: &[Rect]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut frame = rig.scene(rects);
+    frame.quality.bloom = true;
+    let shown = rig.show(&frame);
+    let peak = rig.kind.peak();
+    let seen: Vec<f64> = shown.iter().map(|pixel| light_of(pixel[1], peak)).collect();
+    let (width, height) = (WIDTH as usize, HEIGHT as usize);
+    let encoded: Vec<f64> = (0..width * height)
+        .map(|index| {
+            let (x, y) = ((index % width) as f32 + 0.5, (index / width) as f32 + 0.5);
+            let (x, y) = (x / WIDTH as f32 * 2.0 - 1.0, 1.0 - y / HEIGHT as f32 * 2.0);
+            let nearest = rects
+                .iter()
+                .filter(|rect| rect.x.0 <= x && x < rect.x.1 && rect.y.0 <= y && y < rect.y.1)
+                .min_by(|a, b| a.depth.total_cmp(&b.depth))
+                .unwrap();
+            f64::from(nearest.color[0] * nearest.gain)
+        })
+        .collect();
+    let glow = blurred(&encoded, width, height);
+    let wanted = encoded.iter().zip(&glow).map(|(&v, &g)| srgb_decode(v) * (1.0 - INTENSITY) + g * INTENSITY).collect();
+    let lit = encoded.iter().map(|&v| srgb_decode(v)).collect();
+    (seen, wanted, lit)
+}
+
+/// A square of linear light `light` of `side` pixels at the middle of a 384 by 256 picture,
+/// over a background of linear light `ground`.
+fn lamp(light: f64, side: f32, ground: f64) -> Vec<Rect> {
+    let grey = |light: f64| (srgb_encode(light) / 0.5) as f32;
+    let (w, h) = (side / WIDTH as f32, side / HEIGHT as f32);
+    vec![
+        Rect { x: (-1.0, 1.0), y: (-1.0, 1.0), depth: 0.9, color: COLORS[5], gain: grey(ground) },
+        Rect { x: (-w, w), y: (-h, h), depth: 0.5, color: COLORS[5], gain: grey(light) },
+    ]
+}
+
+fn around(index: usize, side: f64) -> f64 {
+    let (x, y) = ((index % WIDTH as usize) as f64 + 0.5 - 192.0, (index / WIDTH as usize) as f64 + 0.5 - 128.0);
+    x.abs().max(y.abs()) - side / 2.0
+}
+
+#[test]
+fn a_very_bright_source_glows_into_a_bounded_neighbourhood_as_the_kernel_says() {
+    let Some(mut rig) = Rig::new("bloom-lamp", Kind::Wide) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let ground = 0.02;
+    let mid_grey = 0.18;
+    for stops in [6.0f64, 7.0, 8.0, 10.0] {
+        let light = mid_grey * 2f64.powf(stops);
+        let (seen, wanted, lit) = bloomed(&mut rig, &lamp(light, 8.0, ground));
+        let name = format!("+{stops} EV over mid-grey");
+        // The glow is what the f64 convolution says, everywhere but on the lamp, whatever its
+        // height: near it, and far from it, where the tent's tails are all that is left.
+        let mut worst: f64 = 0.0;
+        for (index, (&got, &want)) in seen.iter().zip(&wanted).enumerate() {
+            if around(index, 8.0) < 2.0 {
+                continue;
+            }
+            worst = worst.max((got - want).abs() / (0.03 * want + 0.004));
+        }
+        assert!(worst <= 1.0, "{name}: {worst}x the tolerance");
+        // It is bounded: the share of the frame brightened by more than a tenth over the ground
+        // stays small, and far from the lamp the ground is what it was.
+        let brightened = seen.iter().zip(&lit).filter(|(got, was)| **got > **was + 0.1 * 0.2 + 0.0).count();
+        let covered = brightened as f64 / seen.len() as f64;
+        let excess = |distance: f64| {
+            let near: Vec<f64> = seen
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| (around(*index, 8.0) - distance).abs() < 3.0)
+                .map(|(_, value)| value - ground)
+                .collect();
+            near.iter().sum::<f64>() / near.len() as f64
+        };
+        eprintln!(
+            "{name}: covered {covered:.4}, excess at 6 px {:.4}, 40 px {:.4}, 100 px {:.5}",
+            excess(6.0),
+            excess(40.0),
+            excess(100.0)
+        );
+        assert!(covered < 0.02, "{name}: {covered}");
+        assert!(excess(100.0) < excess(6.0) / 10.0 && excess(100.0) < 0.01, "{name}");
+        // Past +7.5 stops the lamp's light is held at the ceiling: more only makes it taller.
+        if stops >= 8.0 {
+            let (capped, ..) = bloomed(&mut rig, &lamp(mid_grey * 2f64.powf(stops + 2.0), 8.0, ground));
+            let (a, b) = (excess_of(&seen, ground, 20.0), excess_of(&capped, ground, 20.0));
+            assert!((a - b).abs() < 0.03 * a.abs() + 0.002, "{name}: {a} {b}");
+        }
+    }
+}
+
+fn excess_of(seen: &[f64], ground: f64, distance: f64) -> f64 {
+    let near: Vec<f64> = seen
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| (around(*index, 8.0) - distance).abs() < 3.0)
+        .map(|(_, value)| value - ground)
+        .collect();
+    near.iter().sum::<f64>() / near.len() as f64
+}
+
+#[test]
+fn bloom_keeps_the_light_of_a_uniform_picture_and_its_total_nearly_whole() {
+    let Some(mut rig) = Rig::new("bloom-mean", Kind::Wide) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    for light in [0.02, 0.18, 1.0, 6.0] {
+        let rects = lamp(light, 1.0, light);
+        let (seen, wanted, lit) = bloomed(&mut rig, &rects);
+        let mean = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+        assert!((mean(&seen) - light).abs() < 0.005 * light + 1e-4, "{light}: {}", mean(&seen));
+        assert!((mean(&wanted) - mean(&lit)).abs() < 1e-9 * light.max(1.0) + 1e-9);
+    }
+    // A lamp's light is spilled, not made: the picture's total light, with the lamp under the
+    // ceiling, changes by only what the Karis weights hold back of its brightest pixels.
+    let (seen, _, lit) = bloomed(&mut rig, &lamp(0.18 * 128.0, 16.0, 0.02));
+    let (outer, inner): (f64, f64) = (seen.iter().sum(), lit.iter().sum());
+    eprintln!("total light with a lamp: {} of {}", outer, inner);
+    assert!((outer / inner - 1.0).abs() < 0.2, "{}", outer / inner);
+}
+
+#[test]
+fn a_single_firefly_does_not_flash_the_frame() {
+    let Some(mut rig) = Rig::new("bloom-firefly", Kind::Wide) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let ground = 0.05;
+    let (seen, wanted, lit) = bloomed(&mut rig, &lamp(1.0e4, 1.0, ground));
+    let mut quiet = 0.0f64;
+    let (mut mean, mut count) = (0.0, 0.0);
+    for (index, ((&got, &was), &want)) in seen.iter().zip(&lit).zip(&wanted).enumerate() {
+        if around(index, 1.0) < 3.0 {
+            continue;
+        }
+        quiet = quiet.max(got - was);
+        mean += got - was;
+        count += 1.0;
+        assert!((got - want).abs() < 0.03 * want + 0.004, "{index}: {got} {want}");
+    }
+    eprintln!("firefly: largest change {quiet:.4}, mean {:.6}", mean / count);
+    assert!(quiet < 0.5 * ground.max(0.1) + 0.2, "{quiet}");
+    assert!(mean / count < 0.002, "{}", mean / count);
 }

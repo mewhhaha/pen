@@ -3,7 +3,7 @@
 // MSAA, at the render scale's size. Ambient occlusion is then worked out from
 // its depth; a sky fills what the scene left empty, the occlusion darkens the
 // rest and fog mists everything beyond the arena. With bloom, what is
-// brighter than white spills light round it (`bloom`). A last pass adds the
+// bright spills a little light round it (`bloom`). A last pass mixes in the
 // bloom, rolls the highlights off into white (`toned`), applies FXAA, splits
 // the colors of the surfaces whose material asks for the frame's aberration,
 // and scales the image to the screen. The passes after the scene draw as a
@@ -101,31 +101,41 @@ pub(crate) fn present_shader(samples: u32, display: &crate::Display) -> String {
         .replace("${fxaa}", include_str!("shaders/fxaa.wgsl"))
 }
 
-// Bloom: the light past white, spilling round where it is. The first pass
-// halves the scene, keeping only what is brighter than `threshold` (eased
-// in over `knee` below it) and weighting each group of taps against the
-// brightest pixels, so lone sparkles do not flicker; each next pass halves
-// the last, a mip down. Then each level, blurred with a tent, is added onto
-// the one above, back up to half the scene's size, which the last pass adds
-// over the scene (after Jorge Jimenez's bloom for Call of Duty: Advanced
-// Warfare: a 13-tap filter down, a 9-tap tent up).
+// Bloom: glare, a small share of the picture's light scattered round where it
+// is, as a convolution of the whole exposed picture, not a threshold added on
+// top. The first pass halves the picture in linear light after exposure, each
+// tap held to `BLOOM_CEILING` and each group of taps weighted against its
+// brightest pixel (Karis), so a lone sparkle weighs as one ordinary pixel; each
+// next pass halves the last, a mip down. Then each level, blurred with a tent, is
+// added onto the one above, back up to half the picture's size. The levels sum
+// to as many pictures as there are levels, so the last pass takes
+// `BLOOM_INTENSITY / levels` of the sum and keeps `1 - BLOOM_INTENSITY` of the
+// picture: the light mixes in linear light and its total, and the mean of a
+// uniform picture, do not change, and a bright window glows into a bounded
+// neighbourhood at any exposure instead of flooding the frame (after Jorge
+// Jimenez's bloom for Call of Duty: Advanced Warfare: a 13-tap filter down, a
+// 9-tap tent up).
 const BLOOM_VERTEX: &str = include_str!("shaders/bloom_vertex.wgsl");
 
 const BLOOM_DOWN_SHADER: &str = include_str!("shaders/bloom_down.wgsl");
 
 pub(crate) fn bloom_down_shader(first: bool) -> String {
-    // The first level sees the picture as the camera exposes it, so what spills is
-    // what is past white on the screen, not in the scene.
-    let exposure = if first {
-        format!("{TRANSFER_WGSL}\n@group(0) @binding(2) var<storage, read> exposure: array<f32, 4>;")
+    // The first level reads the picture as the camera exposes it, in linear light,
+    // each tap held to `BLOOM_CEILING`, so that what spills is the picture's light
+    // as the screen shows it, whatever the exposure.
+    let convert = if first {
+        format!(
+            "{TRANSFER_WGSL}\n@group(0) @binding(2) var<storage, read> exposure: array<f32, 4>;\n\
+             fn convert(color: vec3f) -> vec3f {{\n  \
+               return min(srgb_decode(exposed(color, exposure[0])), vec3f({BLOOM_CEILING:.1}));\n}}"
+        )
     } else {
-        String::new()
+        "fn convert(color: vec3f) -> vec3f { return color; }".to_owned()
     };
     BLOOM_DOWN_SHADER
         .replace("${bloomVertex}", BLOOM_VERTEX)
-        .replace("${exposure}", &exposure)
+        .replace("${exposure}", &convert)
         .replace("${weight}", if first { "1.0 / (1.0 + brightness(color))" } else { "1.0" })
-        .replace("${past_white}", if first { "color = past_white(exposed(color, exposure[0]));" } else { "" })
 }
 
 const BLOOM_UP_SHADER: &str = include_str!("shaders/bloom_up.wgsl");
@@ -134,9 +144,13 @@ pub(crate) fn bloom_up_shader() -> String {
     BLOOM_UP_SHADER.replace("${bloomVertex}", BLOOM_VERTEX)
 }
 
-// How much of the bloom the last pass adds, and how many times at most the
-// scene is halved for it.
-const BLOOM_STRENGTH: f32 = 0.35;
+// The share of the picture's light the bloom scatters, and how many times at
+// most the picture is halved for it.
+const BLOOM_INTENSITY: f32 = 0.05;
+
+/// The most linear light (32 times SDR white, five stops over) one tap of the
+/// bloom's source may bring, so a source of any brightness spills a bounded amount.
+const BLOOM_CEILING: f32 = 32.0;
 const BLOOM_LEVELS: u32 = 6;
 
 const MAX_RENDER_PIXELS: f64 = 3840.0 * 2160.0;
@@ -744,8 +758,8 @@ impl Post {
                 if quality.effects && !filtered { frame.aberration.y } else { 0.0 },
                 width as f32,
                 height as f32,
-                if levels > 0 { BLOOM_STRENGTH } else { 0.0 },
-                0.0,
+                if levels > 0 { BLOOM_INTENSITY / levels as f32 } else { 0.0 },
+                1.0 - BLOOM_INTENSITY,
                 0.0,
                 0.0f32,
             ]),

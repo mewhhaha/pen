@@ -2,7 +2,8 @@ struct Present {
   output: vec4f,
   source: vec4f,
   split: vec4f,
-  // x: how much of the bloom to add.
+  // x: how much of the blur's sum of levels to add, y: how much of the picture
+  // to keep.
   bloom: vec4f,
 };
 @group(0) @binding(0) var<uniform> present: Present;
@@ -34,9 +35,15 @@ fn marked(uv: vec2f) -> bool {
 // A picture already shown (a scene filter's) is kept as it is.
 fn fetch(uv: vec2f) -> vec3f {
   let scene = textureSampleLevel(source, source_sampler, uv, 0.0).rgb;
-  let bloom = textureSampleLevel(glow, source_sampler, uv, 0.0).rgb * present.bloom.x;
-  if (present.source.w > 0.5) { return scene + bloom; }
-  var light = exposed(scene, exposure[0]) + bloom;
+  let glow_light = textureSampleLevel(glow, source_sampler, uv, 0.0).rgb * present.bloom.x;
+  if (present.source.w > 0.5) { return scene; }
+  var light = exposed(scene, exposure[0]);
+  if (present.bloom.x > 0.0) {
+    // Glare is light scattered, so the picture and its blur mix in linear light:
+    // the blur takes `bloom.x` of the picture's light in all, and what it takes,
+    // the picture gives up (`bloom.y`).
+    light = srgb_encode(srgb_decode(light) * present.bloom.y + glow_light);
+  }
   if (grade.luts.w > 0.5) {
     light = srgb_encode(grade_apply(grade, lut_a, lut_b, srgb_decode(light), uv));
   }

@@ -283,6 +283,27 @@ views after the sun's in the same culling, so their casters are culled to
 each. `RenderStats::local_shadow_casters`, `_faces` and `_kept` say what was
 picked and what was kept.
 
+### Bloom
+
+Bloom is glare, a small share of the picture's light scattered round where it
+is, as a convolution of the whole exposed picture rather than a threshold added
+on top (a threshold in exposed space made every pixel past it add all of its
+excess, so under auto exposure a bright window flooded the room). The first
+pass halves the picture after exposure, in linear light, each of its 13 taps
+held to 32 times SDR white (`BLOOM_CEILING`) and each group of four weighted
+`1 / (1 + brightest channel)` (Karis), so a lone 1e4 pixel weighs as one ordinary
+one. Each next pass halves the last; then each level's 9-tap tent is added onto the one
+above. The levels sum to as many blurred pictures as there are levels (up to
+six), so the present pass mixes `BLOOM_INTENSITY / levels` (0.05) of the sum with
+`1 - BLOOM_INTENSITY` of the picture, in linear light: the total light and a
+uniform picture's mean do not change (the Karis weights hold back a little of a
+very bright pixel, and the ceiling clips a source past 32). A source's glow
+reaches about as far as the top level's tent (a few hundred pixels at 720p) and
+falls off with it. `quality.bloom` turns it on, as before; the share and the
+ceiling are constants. Witnesses (`tests/exposure_looks.rs`): the whole chain
+against an f64 convolution for lamps +6 to +10 EV over mid-grey, with the share of the
+frame they brighten under 2%; a uniform picture's mean; and a 1e4 pixel.
+
 ### Dynamic resolution
 
 With a frame budget (`frame_budget`), `resolution.rs` scales the frame's
@@ -342,7 +363,7 @@ present pass shows exactly what it showed before there was either.
 exposure in stops (-16 to 16); on, the scene is metered on the GPU and the
 exposure adapts. Metering reads the lit scene, after the sky, fog and TAA and
 before the bloom: the bloom's first pass exposes the picture itself before it
-keeps what is past white (so what spills is what is past white on the screen),
+blurs it (so what glows is the picture as the screen shows it, whatever the exposure),
 which makes metering after it circular, and a glow is the scene's light
 spilling, not more of it. Two compute passes run each metered frame, from a
 hook in the render graph (`Graph::hook`: it gives the caller the view of the

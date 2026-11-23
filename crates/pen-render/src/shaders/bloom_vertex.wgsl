@@ -13,5 +13,5 @@ struct Corner {
 @group(0) @binding(1) var source_sampler: sampler;
 fn tap(uv: vec2f, x: f32, y: f32) -> vec3f {
   let texel = 1.0 / vec2f(textureDimensions(source));
-  return textureSampleLevel(source, source_sampler, uv + vec2f(x, y) * texel, 0.0).rgb;
+  return convert(textureSampleLevel(source, source_sampler, uv + vec2f(x, y) * texel, 0.0).rgb);
 }

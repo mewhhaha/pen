@@ -1,4 +1,5 @@
 ${bloomVertex}
+fn convert(color: vec3f) -> vec3f { return color; }
 @fragment fn fragment(corner: Corner) -> @location(0) vec4f {
   let uv = corner.uv;
   let color = tap(uv, 0.0, 0.0) * 4.0 +

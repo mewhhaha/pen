@@ -13,7 +13,7 @@
 //!                   frame, then submit each later one once, in order, timing
 //!                   each (all packets if none are named)
 //!   --pipelines DIR keep compiled pipelines there between runs (Vulkan)
-//!   --msaa N, --fxaa, --taa, --filtering N, --scale S, --blur B, --aberration X,Y
+//!   --msaa N, --fxaa, --taa, --bloom, --filtering N, --scale S, --blur B, --aberration X,Y
 //!                   override the frames' quality and effects
 //!   --robots N      add an N x N grid of instanced walking robots
 //!   --untimed       write no GPU timestamps (they are on otherwise)
@@ -321,6 +321,7 @@ fn main() -> Result<()> {
             }
             "--fxaa" => overrides.push(Box::new(|frame| frame.quality.fxaa = true)),
             "--taa" => overrides.push(Box::new(|frame| frame.quality.taa = true)),
+            "--bloom" => overrides.push(Box::new(|frame| frame.quality.bloom = true)),
             "--filtering" => {
                 let filtering: u32 = args.next().context("--filtering N")?.parse()?;
                 overrides.push(Box::new(move |frame| frame.quality.filtering = filtering));

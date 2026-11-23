@@ -332,7 +332,7 @@ func receive_kernels_fn (own access) -> (evs: &[events.Event]) =>
   colony_paths.absorb_prewarmed_routes access.colony_paths access.kernel_transport (kernel.id plan_routes) (kernel.binding_hash plan_routes)
   return access
 
-func emit_kernels_fn (own access) -> (base_floats: U32) -> (canonical_count: U32) -> (admitted: #[~services.Request]) -> (payload_out: #[~F32]) =>
+func emit_kernels_fn (own access) -> (canonical_count: U32) -> (admitted: #[~services.Request]) -> (payload_out: #[~F32]) =>
   if kernel_transport.cap_active access.kernel_transport and access.colony_paths.state[0].ready:
     let kid = kernel.id plan_routes
     let bh = kernel.binding_hash plan_routes
@@ -360,9 +360,11 @@ func emit_kernels_fn (own access) -> (base_floats: U32) -> (canonical_count: U32
       if cnt > 0:
         let (_, next_kt2) = kernel_transport.enqueue_batch access.kernel_transport kid bh gh cnt (&batch[0..batch.length])
         access.kernel_transport := next_kt2
-    access.kernel_transport := host.admit_kernel_requests base_floats canonical_count self admitted
-    for i in 0 .. access.kernel_transport.payload.length:
-      @storage.push payload_out access.kernel_transport.payload[i]
+    if access.kernel_transport.requests.length > 0:
+      let base_floats = host.measure_access access
+      access.kernel_transport := host.admit_kernel_requests base_floats canonical_count self admitted
+      for i in 0 .. access.kernel_transport.payload.length:
+        @storage.push payload_out access.kernel_transport.payload[i]
   return access
 
 func init_world (own access) =>

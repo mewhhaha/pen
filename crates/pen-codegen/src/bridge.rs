@@ -143,9 +143,28 @@ pub fn emit(model: &Model, header: &[String]) -> String {
         "  for lane in 0 .. extra_count context at * 4:".to_owned(),
         "    @storage.push encoded context.packet[first + lane]".to_owned(),
         "  return ()".to_owned(),
+        "func sprite_rect (context: Context) -> (at: U32) =>".to_owned(),
+        "  let packet: #[F32] = context.packet".to_owned(),
+        "  return (packet[at], packet[at + 1], packet[at + 2], packet[at + 3], packet[at + 4], packet[at + 5], packet[at + 6], packet[at + 7], F32.to_u32 packet[at + 12])".to_owned(),
+        "func sprite_color (context: Context) -> (at: U32) =>".to_owned(),
+        "  let packet: #[F32] = context.packet".to_owned(),
+        "  return (packet[at + 8], packet[at + 9], packet[at + 10], packet[at + 11])".to_owned(),
+        "func sprite_parameters (context: Context) -> (at: U32) =>".to_owned(),
+        "  let packet: #[F32] = context.packet".to_owned(),
+        "  return (packet[at + 13], packet[at + 14], packet[at + 15], packet[at + 16])".to_owned(),
+        "func instance_metadata (context: Context) -> (at: U32) =>".to_owned(),
+        "  let packet: #[F32] = context.packet".to_owned(),
+        "  return (F32.to_u32 packet[at], F32.to_u32 packet[at + 1], F32.to_u32 packet[at + 2], F32.to_u32 packet[at + 3], F32.to_u32 packet[at + 4])".to_owned(),
+        "func instance_transform (context: Context) -> (at: U32) =>".to_owned(),
+        "  let packet: #[F32] = context.packet".to_owned(),
+        format!("  return ({})", (5..21).map(|offset| format!("packet[at + {offset}]")).collect::<Vec<_>>().join(", ")),
+        "func instance_parameters (context: Context) -> (at: U32) =>".to_owned(),
+        "  let packet: #[F32] = context.packet".to_owned(),
+        "  return (packet[at + 21], packet[at + 22], packet[at + 23], packet[at + 24], packet[at + 25])".to_owned(),
     ]);
     for section in &model.sections {
-        if matches!(kind(&section.section), "records" | "variable") && s(&section.section["name"]) != "draws" {
+        let name = s(&section.section["name"]);
+        if matches!(kind(&section.section), "records" | "variable") && !matches!(name, "draws" | "sprites" | "instances") {
             projected(section, &mut out);
         }
     }
@@ -246,10 +265,17 @@ pub fn emit(model: &Model, header: &[String]) -> String {
         "extra_count".to_owned(),
         "append_extra".to_owned(),
         "inset_draws".to_owned(),
+        "sprite_rect".to_owned(),
+        "sprite_color".to_owned(),
+        "sprite_parameters".to_owned(),
+        "instance_metadata".to_owned(),
+        "instance_transform".to_owned(),
+        "instance_parameters".to_owned(),
     ];
     for section in &model.sections {
-        if matches!(kind(&section.section), "records" | "variable") && s(&section.section["name"]) != "draws" {
-            let name = singular(s(&section.section["name"]));
+        let name = s(&section.section["name"]);
+        if matches!(kind(&section.section), "records" | "variable") && !matches!(name, "draws" | "sprites" | "instances") {
+            let name = singular(name);
             projections.push(format!("{name}: project_{name}"));
         }
     }

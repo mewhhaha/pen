@@ -495,24 +495,26 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     @storage.push encoded (sound.reverb)
   for i in 0 .. sprites_count:
     let source = collections.sprites[i]
-    let sprite: types.Sprite = project.sprite context source
-    @storage.push encoded (sprite.x)
-    @storage.push encoded (sprite.y)
-    @storage.push encoded (sprite.width)
-    @storage.push encoded (sprite.height)
-    @storage.push encoded (sprite.u0)
-    @storage.push encoded (sprite.v0)
-    @storage.push encoded (sprite.u1)
-    @storage.push encoded (sprite.v1)
-    @storage.push encoded (sprite.color.x)
-    @storage.push encoded (sprite.color.y)
-    @storage.push encoded (sprite.color.z)
-    @storage.push encoded (sprite.color.w)
-    @storage.push encoded (U32.to_f32 (sprite.material))
-    @storage.push encoded (sprite.parameters.x)
-    @storage.push encoded (sprite.parameters.y)
-    @storage.push encoded (sprite.parameters.z)
-    @storage.push encoded (sprite.parameters.w)
+    let (x, y, width, height, u0, v0, u1, v1, material) = project.sprite_rect context source
+    let (c0, c1, c2, c3) = project.sprite_color context source
+    let (p0, p1, p2, p3) = project.sprite_parameters context source
+    @storage.push encoded (x)
+    @storage.push encoded (y)
+    @storage.push encoded (width)
+    @storage.push encoded (height)
+    @storage.push encoded (u0)
+    @storage.push encoded (v0)
+    @storage.push encoded (u1)
+    @storage.push encoded (v1)
+    @storage.push encoded (c0)
+    @storage.push encoded (c1)
+    @storage.push encoded (c2)
+    @storage.push encoded (c3)
+    @storage.push encoded (U32.to_f32 material)
+    @storage.push encoded (p0)
+    @storage.push encoded (p1)
+    @storage.push encoded (p2)
+    @storage.push encoded (p3)
   for i in 0 .. insets_count:
     let source = collections.insets[i]
     let inset = project.inset context source
@@ -792,37 +794,35 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     @storage.push encoded (panner.cone_outer_gain)
   for i in 0 .. instances_count:
     let source = collections.instances[i]
-    let instance: types.Instance = project.instance context source
-    @storage.push encoded (U32.to_f32 (instance.id_low))
-    @storage.push encoded (U32.to_f32 (instance.id_high))
-    @storage.push encoded (U32.to_f32 (instance.order))
-    @storage.push encoded (U32.to_f32 (instance.mesh))
-    @storage.push encoded (U32.to_f32 (instance.material))
-    let $types.Mat4 { x: transform_x, y: transform_y, z: transform_z, w: transform_w } = instance.transform
-    @storage.push encoded (transform_x.x)
-    @storage.push encoded (transform_x.y)
-    @storage.push encoded (transform_x.z)
-    @storage.push encoded (transform_x.w)
-    @storage.push encoded (transform_y.x)
-    @storage.push encoded (transform_y.y)
-    @storage.push encoded (transform_y.z)
-    @storage.push encoded (transform_y.w)
-    @storage.push encoded (transform_z.x)
-    @storage.push encoded (transform_z.y)
-    @storage.push encoded (transform_z.z)
-    @storage.push encoded (transform_z.w)
-    @storage.push encoded (transform_w.x)
-    @storage.push encoded (transform_w.y)
-    @storage.push encoded (transform_w.z)
-    @storage.push encoded (transform_w.w)
-    let (parameters_count, parameters) = case instance.parameters of
-      $Some value => (4.0, value)
-      $Nothing => (0.0, types.zero4)
-    @storage.push encoded (parameters_count)
-    @storage.push encoded (parameters.x)
-    @storage.push encoded (parameters.y)
-    @storage.push encoded (parameters.z)
-    @storage.push encoded (parameters.w)
+    let (id_low, id_high, order, mesh, material) = project.instance_metadata context source
+    let (m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15) = project.instance_transform context source
+    let (present, p0, p1, p2, p3) = project.instance_parameters context source
+    @storage.push encoded (U32.to_f32 id_low)
+    @storage.push encoded (U32.to_f32 id_high)
+    @storage.push encoded (U32.to_f32 order)
+    @storage.push encoded (U32.to_f32 mesh)
+    @storage.push encoded (U32.to_f32 material)
+    @storage.push encoded (m0)
+    @storage.push encoded (m1)
+    @storage.push encoded (m2)
+    @storage.push encoded (m3)
+    @storage.push encoded (m4)
+    @storage.push encoded (m5)
+    @storage.push encoded (m6)
+    @storage.push encoded (m7)
+    @storage.push encoded (m8)
+    @storage.push encoded (m9)
+    @storage.push encoded (m10)
+    @storage.push encoded (m11)
+    @storage.push encoded (m12)
+    @storage.push encoded (m13)
+    @storage.push encoded (m14)
+    @storage.push encoded (m15)
+    @storage.push encoded (present)
+    @storage.push encoded (p0)
+    @storage.push encoded (p1)
+    @storage.push encoded (p2)
+    @storage.push encoded (p3)
   for i in 0 .. instance_removals_count:
     let source = collections.instance_removals[i]
     let instance_removal: types.InstanceRemoval = project.instance_removal context source

@@ -379,6 +379,34 @@ fn render_views(model: &Model) -> Vec<String> {
                 };
                 out.extend(values.into_iter().map(|value| format!("{indent}@storage.push encoded ({value})")));
             }
+        } else if name == "sprites" {
+            out.push(format!("{indent}let (x, y, width, height, u0, v0, u1, v1, material) = project.sprite_rect context source"));
+            out.push(format!("{indent}let (c0, c1, c2, c3) = project.sprite_color context source"));
+            out.push(format!("{indent}let (p0, p1, p2, p3) = project.sprite_parameters context source"));
+            for field in &section.fixed.as_ref().unwrap().fields {
+                let values = match field.name.as_str() {
+                    "x" | "y" | "width" | "height" | "u0" | "v0" | "u1" | "v1" => vec![field.name.clone()],
+                    "material" => vec!["U32.to_f32 material".into()],
+                    "color" => ["c0", "c1", "c2", "c3"].map(str::to_owned).to_vec(),
+                    "parameters" => ["p0", "p1", "p2", "p3"].map(str::to_owned).to_vec(),
+                    _ => unreachable!("unexpected sprite field {}", field.name),
+                };
+                out.extend(values.into_iter().map(|value| format!("{indent}@storage.push encoded ({value})")));
+            }
+        } else if name == "instances" {
+            out.push(format!("{indent}let (id_low, id_high, order, mesh, material) = project.instance_metadata context source"));
+            let matrix = (0..16).map(|i| format!("m{i}")).collect::<Vec<_>>();
+            out.push(format!("{indent}let ({}) = project.instance_transform context source", matrix.join(", ")));
+            out.push(format!("{indent}let (present, p0, p1, p2, p3) = project.instance_parameters context source"));
+            for field in &section.fixed.as_ref().unwrap().fields {
+                let values = match kind(&field.field) {
+                    "count" | "reference" => vec![format!("U32.to_f32 {}", field.name)],
+                    "matrix" => matrix.clone(),
+                    "optional" => ["present", "p0", "p1", "p2", "p3"].map(str::to_owned).to_vec(),
+                    _ => unreachable!("unexpected instance field {}", field.name),
+                };
+                out.extend(values.into_iter().map(|value| format!("{indent}@storage.push encoded ({value})")));
+            }
         } else {
             let row = singular(name);
             let nominal = section

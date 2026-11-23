@@ -1019,8 +1019,10 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
     let host_fp = host_cpu_fingerprint().to_string();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let probe_dir = ensure_private_cache_dir(&canon_cache.join("cc-probe"))?;
-    let lld_key = find_in_path("ld.lld")
-        .and_then(|p| std::fs::canonicalize(&p).ok())
+    let lld_found = find_in_path("ld.lld");
+    let lld_key = lld_found
+        .as_ref()
+        .and_then(|p| std::fs::canonicalize(p).ok())
         .and_then(|c| bin_stamp(&c).ok().map(|s| (c, s)));
     let ld_key = find_in_path("ld")
         .and_then(|p| std::fs::canonicalize(&p).ok())
@@ -1045,7 +1047,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
         }
 
         let probe_key_line = format!(
-            "v3|{cc}|{}|{:?}|{:?}|{:?}|{}|{}",
+            "v4|{cc}|{}|{:?}|{:?}|{:?}|{}|{}",
             canon_cc.display(),
             stamp,
             lld_key,
@@ -1188,8 +1190,12 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
         }
         let cc_target = format!("{:x}", h.finalize());
 
-        let has_lld = if let Some((ref lld_path, _)) = lld_key {
-            let mut lld_cmd = Command::new(lld_path);
+        let has_lld = if lld_key.is_some()
+            && let Some(ref lld_prog) = lld_found
+        {
+            // Invoke the uncanonicalized `ld.lld` path so multicall `/usr/bin/ld.lld -> /usr/bin/lld`
+            // preserves `argv[0] = "ld.lld"` (while `lld_key` stamps the canonical target).
+            let mut lld_cmd = Command::new(lld_prog);
             lld_cmd.env_clear();
             for var in ["PATH", "HOME", "TMPDIR"] {
                 if let Some(v) = std::env::var_os(var) {

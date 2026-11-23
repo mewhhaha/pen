@@ -371,9 +371,10 @@
         "preferences",
         "locale",
         "captions",
-        "reports"
+        "reports",
+        "kernel"
       ],
-      "doc": "Which service a request is for: Steam's achievements, stats and rich presence, the system clipboard, the browser for a web address, what the game runs on, a native compute library (grid pathfinding), the host's developer tools (DEVTOOLS_OP_*), which only a dev tools program asks of, the simulation services both hosts answer alike, bit for bit: rigid-body physics, paths over a navmesh, ray and shape queries against colliders, and noise and heightfields, the game's actions and their bindings (INPUT_OP_*), the engine's preferences (PREFERENCES_OP_*), the player's language (LOCALE_OP_*), the captions of the sounds that play (CAPTIONS_OP_*) and the player's consent to crash and performance reports (REPORTS_OP_*). A host without one answers unavailable."
+      "doc": "Which service a request is for: Steam's achievements, stats and rich presence, the system clipboard, the browser for a web address, what the game runs on, a native compute library (grid pathfinding), the host's developer tools (DEVTOOLS_OP_*), which only a dev tools program asks of, the simulation services both hosts answer alike, bit for bit: rigid-body physics, paths over a navmesh, ray and shape queries against colliders, and noise and heightfields, the game's actions and their bindings (INPUT_OP_*), the engine's preferences (PREFERENCES_OP_*), the player's language (LOCALE_OP_*), the captions of the sounds that play (CAPTIONS_OP_*), the player's consent to crash and performance reports (REPORTS_OP_*), and isolated pure data-parallel batch kernels (KERNEL_OP_*). A host without one answers unavailable."
     },
     {
       "name": "ServiceStatus",
@@ -385,6 +386,17 @@
         "unknown"
       ],
       "doc": "How a service request went: done; the service is not there (Steam is off, no clipboard, the browser cannot); it is there but refused or failed; or the host does not know the service or operation."
+    },
+    {
+      "name": "KernelOperation",
+      "constant": "KERNEL_OP",
+      "values": [
+        "ctx_begin",
+        "ctx_chunk",
+        "ctx_commit",
+        "run_batch"
+      ],
+      "doc": "Isolated entry kernel service operations: ctx_begin, ctx_chunk and ctx_commit upload and verify a kernel's prepared WireCtx under lossless 32-bit (host_epoch, upload_seq) ordering, and run_batch executes a batch of items against the bound kernel and context."
     },
     {
       "name": "SteamOperation",
@@ -2573,7 +2585,7 @@
             },
             "service": {
               "kind": "count",
-              "max": 14
+              "max": 15
             },
             "operation": {
               "kind": "count",

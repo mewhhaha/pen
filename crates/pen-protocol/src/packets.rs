@@ -96,8 +96,9 @@ pub mod types {
     /// rigid-body physics, paths over a navmesh, ray and shape queries against colliders, and
     /// noise and heightfields, the game's actions and their bindings (INPUT_OP_*), the engine's
     /// preferences (PREFERENCES_OP_*), the player's language (LOCALE_OP_*), the captions of the
-    /// sounds that play (CAPTIONS_OP_*) and the player's consent to crash and performance
-    /// reports (REPORTS_OP_*). A host without one answers unavailable.
+    /// sounds that play (CAPTIONS_OP_*), the player's consent to crash and performance reports
+    /// (REPORTS_OP_*), and isolated pure data-parallel batch kernels (KERNEL_OP_*). A host
+    /// without one answers unavailable.
     pub mod service {
         pub const STEAM: u32 = 0;
         pub const CLIPBOARD: u32 = 1;
@@ -114,8 +115,9 @@ pub mod types {
         pub const LOCALE: u32 = 12;
         pub const CAPTIONS: u32 = 13;
         pub const REPORTS: u32 = 14;
+        pub const KERNEL: u32 = 15;
         /// The names of the codes, by code.
-        pub const NAMES: [&str; 15] = ["steam", "clipboard", "url", "platform", "pathfinding", "devtools", "physics", "navmesh", "spatial", "noise", "input", "preferences", "locale", "captions", "reports"];
+        pub const NAMES: [&str; 16] = ["steam", "clipboard", "url", "platform", "pathfinding", "devtools", "physics", "navmesh", "spatial", "noise", "input", "preferences", "locale", "captions", "reports", "kernel"];
     }
     /// How a service request went: done; the service is not there (Steam is off, no clipboard,
     /// the browser cannot); it is there but refused or failed; or the host does not know the
@@ -127,6 +129,17 @@ pub mod types {
         pub const UNKNOWN: u32 = 3;
         /// The names of the codes, by code.
         pub const NAMES: [&str; 4] = ["ok", "unavailable", "failed", "unknown"];
+    }
+    /// Isolated entry kernel service operations: ctx_begin, ctx_chunk and ctx_commit upload and
+    /// verify a kernel's prepared WireCtx under lossless 32-bit (host_epoch, upload_seq)
+    /// ordering, and run_batch executes a batch of items against the bound kernel and context.
+    pub mod kernel_op {
+        pub const CTX_BEGIN: u32 = 0;
+        pub const CTX_CHUNK: u32 = 1;
+        pub const CTX_COMMIT: u32 = 2;
+        pub const RUN_BATCH: u32 = 3;
+        /// The names of the codes, by code.
+        pub const NAMES: [&str; 4] = ["ctx_begin", "ctx_chunk", "ctx_commit", "run_batch"];
     }
     /// Steam's operations. Achievements and stats go by their API names (the text); set_stat
     /// and set_stat_float set `a`, add_stat adds `a` to an integer stat, and these and get_stat
@@ -2544,7 +2557,7 @@ pub mod codec {
         for service_request in services.iter_mut() {
             ensure!(service_lane + SERVICE_REQUEST_FLOATS <= services_end, "game returned truncated service requests");
             let request = reader.count(service_lane, MAX_SERVICE_ID)?;
-            let service = reader.count(service_lane + 1, 14)?;
+            let service = reader.count(service_lane + 1, 15)?;
             let operation = reader.count(service_lane + 2, MAX_SERVICE_OPERATION)?;
             let a = reader.packet[service_lane + 3];
             let b = reader.packet[service_lane + 4];
@@ -2973,7 +2986,7 @@ pub mod codec {
             let path = &Location::section("services").index(item);
             d.within(path, base, d.end(path, base, 1, 8)?, services_end)?;
             let request = d.count(&path.field("request"), base, MAX_SERVICE_ID)?;
-            let service = d.count(&path.field("service"), base + 1, 14)?;
+            let service = d.count(&path.field("service"), base + 1, 15)?;
             let operation = d.count(&path.field("operation"), base + 2, MAX_SERVICE_OPERATION)?;
             d.finite(&path.field("a"), base + 3)?;
             d.finite(&path.field("b"), base + 4)?;

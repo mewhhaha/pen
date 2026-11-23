@@ -54,7 +54,7 @@ impl GameRuntime {
 
     blocking! {
         receive(host: &dyn Host) -> Result<RenderFrame>;
-        follow(host: &mut dyn Host, frame: &RenderFrame) -> Result<()>;
+        follow(host: &mut dyn Host, frame: &RenderFrame) -> Result<bool>;
         reload(host: &mut dyn Host, module: GuestModule, catalog: Catalog) -> ReloadResult;
         snapshot() -> Result<SavedState>;
         moment() -> Result<Moment>;

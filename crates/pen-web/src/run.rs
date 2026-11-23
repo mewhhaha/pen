@@ -238,6 +238,7 @@ pub struct Browser {
     captions: pen_runtime::captions::Shared,
     tools: Option<Tools>,
     services: Services,
+    kernels: Option<crate::kernels::WebKernelService>,
     preferences: Preferences,
     /// The game's actions, which live frames' events move.
     actions: pen_runtime::actions::Shared,
@@ -288,6 +289,7 @@ pub struct Browser {
 impl Browser {
     pub fn new(
         mut game: Runtime,
+        game_wasm: Option<Vec<u8>>,
         tools: Option<Tools>,
         screen: Screen,
         input: Rc<RefCell<Input>>,
@@ -307,6 +309,7 @@ impl Browser {
         let captions = options.captions.shared();
         let mut services = crate::services::standard();
         services.register(Box::new(pen_runtime::captions::CaptionsService(captions.clone())));
+        let kernels = game_wasm.as_deref().and_then(crate::kernels::WebKernelService::maybe_new);
         game.hash_packets(options.qualify);
         Ok(Browser {
             shown: game.take_drawn().unwrap_or_default(),
@@ -318,6 +321,7 @@ impl Browser {
             audio,
             tools,
             services,
+            kernels,
             captions,
             events: preferences.events().collect(),
             preferences,
@@ -360,6 +364,12 @@ impl Browser {
         self.finish().await
     }
 
+    fn fence_kernels(&mut self) {
+        if let Some(kernels) = &mut self.kernels {
+            kernels.fence();
+        }
+    }
+
     /// Compute a frame, then draw at repaint; whether to go on and when it drew.
     async fn frame(&mut self, timestamp: f64) -> Result<(bool, f64)> {
         let interval = self.previous.replace(timestamp).map_or(0.0, |previous| (timestamp - previous) * 1000.0);
@@ -377,13 +387,22 @@ impl Browser {
         let ran = self.step().await?;
         let overlay = self.tools.as_ref().and_then(|tools| tools.frame.as_ref());
         self.preferences.apply(&mut self.screen.renderer);
-        let (presented, draw_timings) = self.screen.draw(&self.shown, overlay, &self.catalog).await?;
+        let (presented, draw_timings) = match self.screen.draw(&self.shown, overlay, &self.catalog).await {
+            Ok(result) => result,
+            Err(err) => {
+                self.fence_kernels();
+                return Err(err);
+            }
+        };
         // The dev tools' assets are their own; the game never hears of them.
         let _ = self.screen.overlay.take_events();
         if ran.is_some() {
             self.timings = self.game.last_timings().map(|timings| timings.completed(draw_timings, ms(started)));
         }
-        self.present()?;
+        if let Err(err) = self.present() {
+            self.fence_kernels();
+            return Err(err);
+        }
         crate::preferences::keep_bindings(&self.actions);
         self.autosave(presented).await;
         Ok((ran != Some(true), presented))
@@ -544,16 +563,19 @@ impl Browser {
         if self.waiting() || !self.transport.take_frame() {
             return Ok(None);
         }
-        {
+        let rerooted = {
             let shell = shell!(self);
-            self.timeline.prepare(&mut self.game, &shell).await?;
+            self.timeline.prepare(&mut self.game, &shell).await?
+        };
+        if rerooted {
+            self.fence_kernels();
         }
         let position = self.timeline.position();
-        let (input, replayed) = match self.timeline.next() {
+        let (input, replayed, cap_events) = match self.timeline.next() {
             Some(recorded) => {
                 // Recorded frames bring their own input.
                 self.events.clear();
-                (recorded.input.clone(), Some(recorded.loads.clone()))
+                (recorded.input.clone(), Some(recorded.loads.clone()), 0usize)
             }
             None => {
                 let mut frame = Frame {
@@ -562,7 +584,12 @@ impl Browser {
                     events: std::mem::take(&mut self.events),
                 };
                 self.actions.borrow_mut().map(&mut frame.events);
-                (self.game.input(&frame)?, None)
+                let mut input = self.game.input(&frame)?;
+                let cap_events = match &mut self.kernels {
+                    Some(kernels) => kernels.join_live_kernels_async(&mut input).await,
+                    None => 0,
+                };
+                (input, None, cap_events)
             }
         };
         if let Some(hooks) = &mut self.hooks {
@@ -574,14 +601,20 @@ impl Browser {
             self.game.receive(&shell).await
         };
         match received {
-            Ok(rendered) => self.complete(input, replayed, rendered).await.map(Some),
+            Ok(rendered) => self.complete(input, cap_events, replayed, rendered).await.map(Some),
             Err(error) => self.reject_frame(position, error).map(|()| None),
         }
     }
 
     /// Does what a frame and the player asked around it; whether the game
     /// asked to exit.
-    async fn complete(&mut self, input: Vec<f32>, replayed: Option<Vec<Load>>, rendered: RenderFrame) -> Result<bool> {
+    async fn complete(
+        &mut self,
+        mut input: Vec<f32>,
+        cap_events: usize,
+        replayed: Option<Vec<Load>>,
+        rendered: RenderFrame,
+    ) -> Result<bool> {
         self.audio.submit(&rendered, &self.catalog).await;
         self.services.rendered(&rendered, &self.catalog);
         if let Some(values) = &rendered.preferences {
@@ -589,13 +622,29 @@ impl Browser {
         }
         // A live frame's requests (a recorded one's answers are in the
         // recording), before an undo or load replaces the world asking.
+        // Pre-dispatch partition: `service::KERNEL` NEVER enters generic `Services::answer`.
         if replayed.is_none() {
-            self.services.answer(&rendered.services);
+            if crate::kernels::has_kernel_requests(&rendered.services) {
+                if let Some(kernels) = &mut self.kernels {
+                    kernels.submit(&rendered.services);
+                }
+                let canonical: Vec<_> = rendered
+                    .services
+                    .iter()
+                    .filter(|req| req.service != pen_protocol::service::KERNEL)
+                    .cloned()
+                    .collect();
+                if !canonical.is_empty() {
+                    self.services.answer(&canonical);
+                }
+            } else {
+                self.services.answer(&rendered.services);
+            }
         }
-        {
+        let mut state_replaced = {
             let mut shell = shell!(self);
-            self.game.follow(&mut shell, &rendered).await?;
-        }
+            self.game.follow(&mut shell, &rendered).await?
+        };
         let mut loads = Vec::new();
         match replayed {
             // The states it loaded, as they were then.
@@ -603,6 +652,7 @@ impl Browser {
                 for load in &recorded {
                     let mut shell = shell!(self);
                     timeline::apply(&mut self.game, &mut shell, load).await?;
+                    state_replaced = true;
                 }
                 loads = recorded;
             }
@@ -612,20 +662,34 @@ impl Browser {
                     self.save("pen.scene", saved, "saved the scene").await;
                 }
                 if rendered.scene_load_requested {
-                    loads.extend(self.load("pen.scene", true).await);
+                    if let Some(load) = self.load("pen.scene", true).await {
+                        loads.push(load);
+                        state_replaced = true;
+                    }
                 }
                 if rendered.save_requested {
                     let saved = self.game.snapshot().await;
                     self.save("pen.quicksave", saved, "saved").await;
                 }
                 if rendered.load_requested {
-                    loads.extend(self.load("pen.quicksave", false).await);
+                    if let Some(load) = self.load("pen.quicksave", false).await {
+                        loads.push(load);
+                        state_replaced = true;
+                    }
                 }
                 if let Some((name, saved)) = self.importing.take() {
-                    loads.extend(self.load_state(&name, saved, false).await);
+                    if let Some(load) = self.load_state(&name, saved, false).await {
+                        loads.push(load);
+                        state_replaced = true;
+                    }
                 }
             }
         }
+        if state_replaced {
+            self.fence_kernels();
+        }
+        // Strip live-only unrecorded `CAP` before constructing `Recorded`!
+        crate::kernels::strip_trailing_events(&mut input, cap_events);
         let recorded = Recorded { input, loads, restored: self.timeline.restored_here() };
         if let Some(recorder) = &mut self.recorder {
             recorder.frame(&recorded);
@@ -653,6 +717,7 @@ impl Browser {
     /// developing, the last valid frame stays and the game pauses until a
     /// new build; otherwise the page stops.
     fn reject_frame(&mut self, position: u64, error: anyhow::Error) -> Result<()> {
+        self.fence_kernels();
         if self.development.is_none() || !error.is::<InvalidFrame>() {
             return Err(error);
         }
@@ -746,6 +811,7 @@ impl Browser {
             self.timeline.rewind(&mut self.game, &shell, target, &mut unseen).await?
         };
         self.services.forget();
+        self.fence_kernels();
         self.game.continue_clock(self.clock.now());
         self.show(shown);
         self.rewind_recording(at, self.timeline.position());
@@ -770,6 +836,7 @@ impl Browser {
             self.timeline.restart(&mut self.game, &shell, from).await?
         };
         self.services.forget();
+        self.fence_kernels();
         self.show(shown);
         self.rewind_recording(at, at);
         self.transport.replay(Replaying::Recent);
@@ -863,6 +930,7 @@ impl Browser {
         self.timeline.keep_history(Some(KEEP_SECONDS));
         self.timeline.load(recording);
         self.services.forget();
+        self.fence_kernels();
         self.show(shown);
         self.transport.replay_ended();
         self.transport.replay(Replaying::File);
@@ -896,6 +964,7 @@ impl Browser {
             Ok((moment, shown)) => {
                 self.game.continue_clock(self.clock.now());
                 self.show(shown);
+                self.fence_kernels();
                 self.recorder = Some(Recorder::new(position, moment));
                 say(&mut self.log, log_source::SESSION, false, format!("recording input from frame {position}"));
             }
@@ -958,11 +1027,17 @@ impl Browser {
         self.state_adapter = crate::load_state_adapter(&self.assets).await;
         let catalog = update.catalog.unwrap_or_else(|| self.catalog.clone());
         if let Some(module) = update.game {
+            let kernel_bytes = module.clone();
             let result = {
                 let mut shell = shell!(self);
                 self.game.reload(&mut shell, module, catalog.clone()).await
             };
             if result == ReloadResult::Activated {
+                if let Some(kernels) = &mut self.kernels {
+                    kernels.reload(&kernel_bytes);
+                } else {
+                    self.kernels = crate::kernels::WebKernelService::maybe_new(&kernel_bytes);
+                }
                 self.status = true;
                 self.catalog = catalog;
                 self.timeline.rebuilt();
@@ -1154,6 +1229,7 @@ impl devtools::Host for Browser {
         }
         if self.transport.replaying().is_none() && self.timeline.next().is_some() {
             self.timeline.go_live();
+            self.fence_kernels();
         }
         // Live play lays out on the page's size again.
         if self.transport.replaying().is_none() {

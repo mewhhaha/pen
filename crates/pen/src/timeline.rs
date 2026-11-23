@@ -41,7 +41,7 @@ impl Timeline {
     /// Before the frame at the cursor runs: keeps a moment when one is due,
     /// and restores the game from its own state where the recorded run was
     /// restored, so the frames after run as they did then.
-    pub fn prepare(&mut self, runtime: &mut GameRuntime, host: &dyn Host) -> Result<()> {
+    pub fn prepare(&mut self, runtime: &mut GameRuntime, host: &dyn Host) -> Result<bool> {
         pollster::block_on(self.0.prepare(&mut **runtime, host))
     }
 

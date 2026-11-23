@@ -167,12 +167,16 @@ fn describe(request: &ServiceRequest) -> String {
         service::NAVMESH => &pen_protocol::navmesh_op::NAMES,
         service::SPATIAL => &pen_protocol::spatial_op::NAMES,
         service::NOISE => &pen_protocol::noise_op::NAMES,
+        service::KERNEL => &pen_protocol::kernel_op::NAMES,
         _ => &[],
     };
     let shown = if request.service == service::PATHFINDING {
         let blocked = request.values.iter().filter(|value| **value != 0.0).count();
         format!("{} cells, {blocked} blocked", request.values.len())
-    } else if matches!(request.service, service::PHYSICS | service::NAVMESH | service::SPATIAL | service::NOISE) {
+    } else if matches!(
+        request.service,
+        service::PHYSICS | service::NAVMESH | service::SPATIAL | service::NOISE | service::KERNEL
+    ) {
         format!("{} values", request.values.len())
     } else {
         let text = text(&request.values);

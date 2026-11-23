@@ -150,6 +150,12 @@ pub fn splice(input: &mut Vec<f32>, events: &[[f32; EVENT_FLOATS]]) -> Result<()
         return Ok(());
     }
     let count = input.get(3).copied().and_then(whole).ok_or_else(|| anyhow!("an input packet without its header"))?;
+    ensure!(
+        (count as usize).saturating_add(events.len()) <= pen_protocol::boundary::MAX_EVENTS,
+        "splicing {} events exceeds MAX_EVENTS ({})",
+        events.len(),
+        pen_protocol::boundary::MAX_EVENTS
+    );
     let end = FRAME_HEADER_FLOATS + count as usize * EVENT_FLOATS;
     ensure!(end <= input.len(), "an input packet shorter than its events");
     input.splice(end..end, events.iter().flatten().copied());
@@ -217,5 +223,16 @@ mod tests {
         splice(&mut spliced, &[key]).unwrap();
         assert_eq!(spliced, input(vec![GameEvent::KeyDown("a".into()), GameEvent::KeyUp("a".into())]));
         assert_eq!(spliced[spliced.len() - 2..], [7.0, 8.0], "the state lanes stay last");
+    }
+
+    #[test]
+    fn splice_enforces_max_events_bound() {
+        let mut packet = vec![0.0; FRAME_HEADER_FLOATS + pen_protocol::boundary::MAX_EVENTS * EVENT_FLOATS];
+        packet[1] = 640.0;
+        packet[2] = 480.0;
+        packet[3] = pen_protocol::boundary::MAX_EVENTS as f32;
+        let key = [event_tags::KEY_UP as f32, 65.0, 0.0, 0.0, 0.0];
+        assert!(splice(&mut packet, &[key]).is_err());
+        assert_eq!(packet[3], pen_protocol::boundary::MAX_EVENTS as f32);
     }
 }

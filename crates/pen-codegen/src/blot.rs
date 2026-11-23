@@ -415,6 +415,54 @@ fn render_views(model: &Model) -> Vec<String> {
         }
     }
     out.push("  return ()".into());
+    out.push(String::new());
+    out.push("func measure_render_floats collections -> project -> context =>".into());
+    out.push("  let total: U32 = protocol.packet_header_floats".into());
+    for section in &model.sections {
+        if kind(&section.section) != "trailing" && section.owner.is_none() {
+            let name = s(&section.section["name"]);
+            out.push(format!("  let {name}_count: U32 = collections.{name}.length"));
+        }
+    }
+    for section in &model.sections {
+        let name = s(&section.section["name"]);
+        if kind(&section.section) == "trailing" {
+            let (_, owners) = model.tails.iter().find(|(tail, _)| tail == name).unwrap();
+            for owner in owners {
+                let owner_section = model.section(&owner.section);
+                let indent = view_rows(&mut out, owner_section);
+                out.push(format!("{indent}total := self + (project.extra_count context source) * 4"));
+            }
+            continue;
+        }
+        if kind(&section.section) == "lanes" {
+            out.push(format!("  total := self + {name}_count"));
+        } else if let Some(layout) = &section.fixed {
+            if let Some((owners, children)) = &section.owner {
+                out.push(format!("  for parent in 0 .. {owners}_count:"));
+                out.push(format!(
+                    "    let children = project.{}_{} context collections.{owners}[parent]",
+                    singular(owners),
+                    children
+                ));
+                out.push(format!("    total := self + children.length * {}", layout.lanes));
+            } else {
+                out.push(format!("  total := self + {name}_count * {}", layout.lanes));
+            }
+        } else {
+            let indent = view_rows(&mut out, section);
+            let row = singular(name);
+            let rest = s(&section.section["record"]["rest"]["name"]);
+            out.push(format!("{indent}let {row} = project.{row} context source"));
+            out.push(format!("{indent}let count: U32 = {row}.{rest}.length"));
+            if let Some(item) = &section.item {
+                out.push(format!("{indent}total := self + {} + count * {}", section.head_lanes, item.lanes));
+            } else {
+                out.push(format!("{indent}total := self + {} + count", section.head_lanes));
+            }
+        }
+    }
+    out.push("  return total".into());
     out
 }
 

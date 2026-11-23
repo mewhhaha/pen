@@ -38,6 +38,7 @@ mod gamepad;
 #[cfg(feature = "compiler")]
 mod gltf;
 mod input;
+mod kernels;
 mod logger;
 #[cfg(feature = "compiler")]
 mod loudness;
@@ -358,6 +359,9 @@ struct Pending {
     paths: Paths,
     engine: wasmtime::Engine,
     module: GuestModule,
+    worker_engine: wasmtime::Engine,
+    worker_module: GuestModule,
+    worker_deadlines: bool,
     catalog: Catalog,
     present_mode: wgpu::PresentMode,
     size: Option<(u32, u32)>,
@@ -425,6 +429,7 @@ impl App {
             gpu,
             Some(&window),
         )?;
+        session.set_worker_module(pending.worker_engine, pending.worker_module, pending.worker_deadlines);
         session.playback(pending.playback, Some(&window))?;
         if let Some(size) = pinned {
             session.input.pin(size);
@@ -2056,9 +2061,11 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
     } else {
         load_module(&engine, &game.directory, false, checkout.is_some())?
     };
-    if game.directory.join("game.meta").is_file() {
-        let _packaged_workers = load_packaged_workers(&game.directory, &engine, &module)?;
-    }
+    let (worker_engine, worker_module, worker_deadlines) = if game.directory.join("game.meta").is_file() {
+        load_packaged_workers(&game.directory, &engine, &module)?
+    } else {
+        (engine.clone(), module.clone(), engine.get_epoch_interruption())
+    };
     let catalog = read_catalog(&paths.assets)?;
     let mods = load_mods(args)?;
     // A packaged game has no dev tools program, but may answer remote ones.
@@ -2085,6 +2092,7 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
         #[cfg(feature = "devtools")]
         let (assets, devtools_catalog) = (paths.assets.clone(), catalog.clone());
         let mut session = Session::start(options, paths, engine, module, catalog, gpu, None)?;
+        session.set_worker_module(worker_engine, worker_module, worker_deadlines);
         session.playback(playback, None)?;
         if let Some(mods) = mods {
             session.set_mods(mods);
@@ -2132,6 +2140,9 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
             paths,
             engine,
             module,
+            worker_engine,
+            worker_module,
+            worker_deadlines,
             catalog,
             present_mode: present_mode()?,
             size,

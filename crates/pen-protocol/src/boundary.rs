@@ -3,10 +3,102 @@
 //! generated from protocol/schema.json into packets.rs (`just
 //! sync-protocol`); this adds reading the asset catalog, and the numbers
 //! in a packet's lanes.
+use std::borrow::Cow;
+
 use anyhow::{Context, Result, anyhow};
 
 pub use crate::packets::codec::*;
 use crate::protocol::*;
+
+/// Normalizes a raw render packet by removing ephemeral `service::KERNEL` (code 15)
+/// requests from `[services_start..services_end)` and updating BOTH header slot 134
+/// (`SERVICE_COUNT`) and header slot 135 (`SERVICE_LANES`). Returns `Cow::Borrowed`
+/// with zero allocations when no `service::KERNEL` record is present.
+pub fn canonical_render_packet(packet: &[f32]) -> Cow<'_, [f32]> {
+    if packet.len() < PACKET_HEADER_FLOATS || packet[lanes::header::MAGIC] != PACKET_MAGIC {
+        return Cow::Borrowed(packet);
+    }
+    let Some(services_count) = whole(packet[lanes::header::SERVICE_COUNT]).map(|v| v as usize) else {
+        return Cow::Borrowed(packet);
+    };
+    let Some(services_lanes) = whole(packet[lanes::header::SERVICE_LANES]).map(|v| v as usize) else {
+        return Cow::Borrowed(packet);
+    };
+    if services_count == 0 || services_lanes == 0 {
+        return Cow::Borrowed(packet);
+    }
+    let count = |slot: usize| whole(packet[slot]).map(|v| v as usize);
+    let services_start = (|| -> Option<usize> {
+        let mut at = PACKET_HEADER_FLOATS;
+        at = at.checked_add(count(lanes::header::STATE_COUNT)?)?;
+        at = at.checked_add(count(lanes::header::DRAW_COUNT)?.checked_mul(DRAW_FLOATS)?)?;
+        at = at.checked_add(count(lanes::header::SOLID_LANES)?)?;
+        at = at.checked_add(count(lanes::header::DECAL_COUNT)?.checked_mul(DECAL_FLOATS)?)?;
+        at = at.checked_add(count(lanes::header::SOUND_COUNT)?.checked_mul(SOUND_FLOATS)?)?;
+        at = at.checked_add(count(lanes::header::SPRITE_COUNT)?.checked_mul(SPRITE_FLOATS)?)?;
+        at = at.checked_add(count(lanes::header::INSET_COUNT)?.checked_mul(INSET_FLOATS)?)?;
+        at = at.checked_add(count(lanes::header::INSET_DRAW_COUNT)?.checked_mul(DRAW_FLOATS)?)?;
+        at = at.checked_add(count(lanes::header::PREFERENCE_COUNT)?)?;
+        at = at.checked_add(count(lanes::header::FIELD_LANES)?)?;
+        at = at.checked_add(count(lanes::header::UI_LANES)?)?;
+        Some(at)
+    })();
+    let Some(services_start) = services_start else {
+        return Cow::Borrowed(packet);
+    };
+    let Some(services_end) = services_start.checked_add(services_lanes) else {
+        return Cow::Borrowed(packet);
+    };
+    if services_end > packet.len() {
+        return Cow::Borrowed(packet);
+    }
+    let mut cursor = services_start;
+    let mut has_kernel = false;
+    for _ in 0..services_count {
+        if cursor + SERVICE_REQUEST_FLOATS > services_end {
+            return Cow::Borrowed(packet);
+        }
+        let Some(service_code) = whole(packet[cursor + lanes::service_request::SERVICE]) else {
+            return Cow::Borrowed(packet);
+        };
+        let Some(value_count) = whole(packet[cursor + lanes::service_request::VALUE_COUNT]).map(|v| v as usize) else {
+            return Cow::Borrowed(packet);
+        };
+        let Some(end) = cursor.checked_add(SERVICE_REQUEST_FLOATS).and_then(|v| v.checked_add(value_count)) else {
+            return Cow::Borrowed(packet);
+        };
+        if end > services_end {
+            return Cow::Borrowed(packet);
+        }
+        if service_code == service::KERNEL {
+            has_kernel = true;
+        }
+        cursor = end;
+    }
+    if cursor != services_end || !has_kernel {
+        return Cow::Borrowed(packet);
+    }
+    let mut out = Vec::with_capacity(packet.len());
+    out.extend_from_slice(&packet[..services_start]);
+    let mut kept_count = 0usize;
+    let mut kept_lanes = 0usize;
+    let mut cursor = services_start;
+    for _ in 0..services_count {
+        let service_code = whole(packet[cursor + lanes::service_request::SERVICE]).unwrap();
+        let value_count = whole(packet[cursor + lanes::service_request::VALUE_COUNT]).unwrap() as usize;
+        let end = cursor + SERVICE_REQUEST_FLOATS + value_count;
+        if service_code != service::KERNEL {
+            out.extend_from_slice(&packet[cursor..end]);
+            kept_count += 1;
+            kept_lanes += end - cursor;
+        }
+        cursor = end;
+    }
+    out.extend_from_slice(&packet[services_end..]);
+    out[lanes::header::SERVICE_COUNT] = kept_count as f32;
+    out[lanes::header::SERVICE_LANES] = kept_lanes as f32;
+    Cow::Owned(out)
+}
 
 /// The whole number a lane holds (an id, count, index or code point), or
 /// None for a fraction, a negative, a non-finite value or one past u32.
@@ -402,5 +494,49 @@ mod tests {
         let mut longer = packet.clone();
         longer.push(0.0);
         assert!(decode_frame(&longer, 3, &catalog).is_err(), "lanes after the last section");
+    }
+
+    #[test]
+    fn canonical_render_packet_strips_only_kernel_services_and_updates_both_header_slots() {
+        let catalog = Catalog { meshes: vec!["m".into()], materials: vec!["x".into()], sounds: vec![] };
+        let req = |id: u32, svc: u32, op: u32, values: &[f32]| -> Vec<f32> {
+            let mut r = vec![0.0; SERVICE_REQUEST_FLOATS];
+            r[lanes::service_request::REQUEST] = id as f32;
+            r[lanes::service_request::SERVICE] = svc as f32;
+            r[lanes::service_request::OPERATION] = op as f32;
+            r[lanes::service_request::VALUE_COUNT] = values.len() as f32;
+            r.extend_from_slice(values);
+            r
+        };
+        let build = |reqs: &[Vec<f32>]| -> Vec<f32> {
+            let mut packet = vec![0.0; PACKET_HEADER_FLOATS];
+            packet[lanes::header::MAGIC] = PACKET_MAGIC;
+            packet[lanes::header::SCHEMA] = 3.0;
+            packet[lanes::header::SERVICE_COUNT] = reqs.len() as f32;
+            packet[lanes::header::SERVICE_LANES] = reqs.iter().map(Vec::len).sum::<usize>() as f32;
+            packet[lanes::header::BUS_COUNT] = 1.0;
+            for r in reqs {
+                packet.extend_from_slice(r);
+            }
+            packet.extend([0.75, 1.0, 0.25]); // 1 bus record after services
+            packet
+        };
+        let platform = req(1, service::PLATFORM, platform_op::OS, &[]);
+        let kernel = req(2, service::KERNEL, kernel_op::RUN_BATCH, &[1.0, 2.0, 3.0, 4.0]);
+        let steam = req(0x800000, service::STEAM, steam_op::STATUS, &[65.0]);
+        let canonical_only = build(&[platform.clone(), steam.clone()]);
+        assert!(matches!(canonical_render_packet(&canonical_only), Cow::Borrowed(_)));
+        let mixed = build(&[platform, kernel, steam]);
+        let normalized = canonical_render_packet(&mixed);
+        assert!(matches!(normalized, Cow::Owned(_)));
+        assert_eq!(normalized.as_ref(), canonical_only.as_slice());
+        assert_eq!(normalized[lanes::header::SERVICE_COUNT], 2.0);
+        assert_eq!(normalized[lanes::header::SERVICE_LANES], (SERVICE_REQUEST_FLOATS * 2 + 1) as f32);
+        let decoded = decode_frame(&normalized, 3, &catalog).unwrap();
+        assert_eq!(decoded.render.services.len(), 2);
+        assert_eq!(decoded.render.services[0].service, service::PLATFORM);
+        assert_eq!(decoded.render.services[1].request, 0x800000);
+        assert_eq!(decoded.render.buses.len(), 1);
+        assert_eq!(decoded.render.buses[0].gain, 0.75);
     }
 }

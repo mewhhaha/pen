@@ -10,7 +10,9 @@ use pen_protocol::{clipboard_op, service, url_op};
 use pen_runtime::services::{Answer, Platform, Request, Service, Services, Unavailable, openable};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-/// The browser's services.
+/// The browser's services. `service::KERNEL` (code 15) is intentionally partitioned
+/// ahead of `Services::answer` and handled by [`crate::kernels::WebKernelService`] so
+/// kernel replies never leak through `take_answers()` before `timeline.prepare`.
 pub fn standard() -> Services {
     let window = web_sys::window().unwrap();
     let mut services = Services::new();

@@ -298,8 +298,9 @@ impl Timeline {
 
     /// Before the frame at the cursor runs: keeps a moment when one is due,
     /// and restores the game from its own state where the recorded run was
-    /// restored, so the frames after run as they did then.
-    pub async fn prepare<B: Backend>(&mut self, runtime: &mut GameRuntime<B>, host: &dyn Host) -> Result<()> {
+    /// restored, so the frames after run as they did then. Returns `Ok(true)`
+    /// iff `runtime.reroot` replaced the active program instance.
+    pub async fn prepare<B: Backend>(&mut self, runtime: &mut GameRuntime<B>, host: &dyn Host) -> Result<bool> {
         if self.wants_moment() {
             let moment = runtime.moment().await?;
             self.keep_moment(moment);
@@ -307,8 +308,9 @@ impl Timeline {
         if self.restored_here() && self.fresh != Some(self.cursor) {
             runtime.reroot(host).await?;
             self.fresh = Some(self.cursor);
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// The frame at the cursor ran: a recorded one again, or a new one.

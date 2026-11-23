@@ -125,6 +125,7 @@ mod tests {
         }
         let render = &sources.iter().find(|(name, _)| *name == "protocol_render.blot").unwrap().1;
         assert!(render.contains("func encode_render_views (packet: types.RenderHeader)"));
+        assert!(render.contains("func measure_render_floats collections -> project -> context =>"));
         assert!(render.contains("func encode_draw (draw: types.Draw)"));
         assert!(render.contains("draw.transform"));
         assert!(render.contains("inset.ambient.x"));

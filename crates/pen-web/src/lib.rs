@@ -6,6 +6,7 @@ mod audio;
 mod development;
 mod files;
 mod input;
+mod kernels;
 mod preferences;
 mod program;
 mod replay;
@@ -166,6 +167,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     let mut log = Log::new(run::LOG_LINES);
     log.push(log_source::SESSION, false, "pen browser host ready");
     let viewport = screen.viewport();
+    let game_wasm_for_kernels = game.clone();
     let started = {
         let mut host = Starting { viewport, log: &mut log, state_adapter: &state_adapter };
         Runtime::new(&BrowserBackend, game, catalog.clone(), &mut host, saves::read("pen.autosave").await, scene).await
@@ -180,7 +182,8 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     };
     let input = input::Input::install(&canvas);
     let audio = audio::Audio::new(&canvas, assets);
-    let browser = Browser::new(runtime, tools, screen, input, audio, log, options).map_err(failed)?;
+    let browser =
+        Browser::new(runtime, Some(game_wasm_for_kernels), tools, screen, input, audio, log, options).map_err(failed)?;
     spawn_local(async move {
         if let Err(error) = browser.run().await {
             web_sys::console::error_1(&format!("{error:#}").into());

@@ -446,13 +446,13 @@ impl<B: Backend> GameRuntime<B> {
         Ok((rendered, answer))
     }
 
-    async fn travel(&mut self, host: &mut dyn Host, forward: bool) -> Result<()> {
+    async fn travel(&mut self, host: &mut dyn Host, forward: bool) -> Result<bool> {
         let to = match (self.edits.step, forward) {
             (Some(step), false) if step > 0 => step - 1,
             (Some(step), true) if step + 1 < self.edits.scenes.len() => step + 1,
             _ => {
                 host.report(if forward { "nothing to redo" } else { "nothing to undo" });
-                return Ok(());
+                return Ok(false);
             }
         };
         let state = state_request(&mut self.active, Operation::Snapshot, &[]).await?;
@@ -465,7 +465,7 @@ impl<B: Backend> GameRuntime<B> {
             format!("undid an edit ({to} more to undo)")
         };
         host.report(&message);
-        Ok(())
+        Ok(true)
     }
 
     /// The input a live frame gives the game: the game time since the last
@@ -522,7 +522,7 @@ impl<B: Backend> GameRuntime<B> {
         self.active.accept();
         self.snapshot = None;
         if self.hashing {
-            self.packet_hash = hash_lanes(&packet);
+            self.packet_hash = hash_lanes(&pen_protocol::canonical_render_packet(&packet));
         }
         self.packet_lanes = packet.len();
         if self.keeping {
@@ -542,17 +542,19 @@ impl<B: Backend> GameRuntime<B> {
     }
 
     /// The edit history follows any checkpoint, undo or redo a frame asked for.
-    pub async fn follow(&mut self, host: &mut dyn Host, rendered: &RenderFrame) -> Result<()> {
+    /// Returns `Ok(true)` iff undo or redo replaced the active game state.
+    pub async fn follow(&mut self, host: &mut dyn Host, rendered: &RenderFrame) -> Result<bool> {
+        let mut replaced = false;
         if rendered.checkpoint_requested {
             self.record().await?;
         }
         if rendered.undo_requested {
-            self.travel(host, false).await?;
+            replaced |= self.travel(host, false).await?;
         }
         if rendered.redo_requested {
-            self.travel(host, true).await?;
+            replaced |= self.travel(host, true).await?;
         }
-        Ok(())
+        Ok(replaced)
     }
 
     /// Moves the running state into a new build: the new program restores a snapshot and

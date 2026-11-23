@@ -395,6 +395,9 @@ struct Overlap {
 struct Planned {
     position: u64,
     input: Vec<f32>,
+    /// Trailing live-only `CAP` events appended to `input` that MUST be stripped
+    /// before recording into `Recorded` / `Timeline` / trace.
+    cap_events: usize,
     /// A recorded frame's loads, which it applies instead of reading files;
     /// None for a live frame.
     replayed: Option<Vec<Load>>,
@@ -425,6 +428,12 @@ pub struct Session {
     /// What the game asks of the platform and native libraries: called for
     /// live frames only, their answers the next live frame's input.
     pub services: Services,
+    /// Native `service::KERNEL` host service (live local sessions with `entry kernel` modules).
+    kernels: Option<crate::kernels::KernelService>,
+    /// Engine used to re-open worker pools on hot reload.
+    worker_engine: wasmtime::Engine,
+    /// Whether `worker_engine` supports epoch deadlines for kernel batches.
+    worker_deadlines: bool,
     /// The captions of what plays, shared with the captions service.
     captions: captions::Shared,
     clock: Clock,
@@ -617,6 +626,9 @@ impl Session {
         let dev = if options.dev { Some(Dev::new(&paths.game, &paths.assets, module.system_trace())?) } else { None };
         let mut audio = audio;
         let state_adapter = load_state_adapter(&paths.assets);
+        let worker_engine = engine.clone();
+        let worker_deadlines = engine.get_epoch_interruption();
+        let kernels = crate::kernels::KernelService::maybe_new(worker_engine.clone(), module.clone(), worker_deadlines);
         let runtime = {
             let mut shell = Shell {
                 gpu: &mut gpu,
@@ -670,6 +682,9 @@ impl Session {
             preferences,
             actions,
             services,
+            kernels,
+            worker_engine,
+            worker_deadlines,
             captions,
             clock,
             script,
@@ -708,6 +723,24 @@ impl Session {
         })
     }
 
+    /// Upgrades the session's kernel worker module (used by packaged `--worker-deadlines` games
+    /// via `load_packaged_workers`).
+    pub fn set_worker_module(&mut self, worker_engine: wasmtime::Engine, worker_module: GuestModule, has_deadlines: bool) {
+        self.worker_engine = worker_engine.clone();
+        self.worker_deadlines = has_deadlines;
+        if let Some(kernels) = &mut self.kernels {
+            kernels.reload(worker_engine, worker_module, has_deadlines);
+        } else {
+            self.kernels = crate::kernels::KernelService::maybe_new(worker_engine, worker_module, has_deadlines);
+        }
+    }
+
+    fn fence_kernels(&mut self) {
+        if let Some(kernels) = &mut self.kernels {
+            kernels.fence();
+        }
+    }
+
     /// Sets up what the session does besides playing; before the first step.
     pub fn playback(&mut self, playback: Playback, window: Option<&Window>) -> Result<()> {
         self.overlap.enabled = playback.overlap;
@@ -738,11 +771,13 @@ impl Session {
             }
             self.show(shown);
             self.services.forget();
+            self.fence_kernels();
             self.transport.replay(Replaying::File);
             eprintln!("replaying {frames} frames ({seconds:.1} s of game time) from {}", path.display());
         }
         if let Some(spec) = &playback.net {
             self.start_net(spec)?;
+            self.fence_kernels();
         }
         if let Some(address) = &playback.stream {
             self.start_stream(address)?;
@@ -784,6 +819,7 @@ impl Session {
         }
         if self.transport.replaying().is_none() && self.timeline.next().is_some() {
             self.timeline.go_live();
+            self.fence_kernels();
         }
         self.clock.resume();
         self.pacer = None;
@@ -1068,6 +1104,7 @@ impl Session {
         };
         self.runtime.continue_clock(self.clock.now());
         self.show(shown);
+        self.fence_kernels();
         devlog::info(Source::Session, format!("recording input to {} from frame {position}", path.display()));
         self.recording_input = Some((path, position));
         Ok(())
@@ -1166,6 +1203,7 @@ impl Session {
         };
         let (shown, at) = self.timeline.rewind(&mut self.runtime, &shell, target, &mut unseen)?;
         self.services.forget();
+        self.fence_kernels();
         let position = self.timeline.position();
         self.runtime.continue_clock(self.clock.now());
         self.show(shown);
@@ -1196,6 +1234,7 @@ impl Session {
         let shell = shell!(self, window);
         let (shown, at) = self.timeline.restart(&mut self.runtime, &shell, from)?;
         self.services.forget();
+        self.fence_kernels();
         self.show(shown);
         self.transport.replay(Replaying::Recent);
         self.clock.resume();
@@ -1271,21 +1310,26 @@ impl Session {
     /// tick's requests. Keeps a moment first when the history wants one,
     /// and restores where a replayed run was restored.
     fn plan(&mut self, window: Option<&Window>, tick: Tick) -> Result<Planned> {
-        let shell = shell!(self, window);
-        if let Some(net) = &mut self.net {
-            net.play.prepare(&mut self.timeline);
+        let rerooted = {
+            let shell = shell!(self, window);
+            if let Some(net) = &mut self.net {
+                net.play.prepare(&mut self.timeline);
+            }
+            self.timeline.prepare(&mut self.runtime, &shell)?
+        };
+        if rerooted {
+            self.fence_kernels();
         }
-        self.timeline.prepare(&mut self.runtime, &shell)?;
         self.frames += 1;
         let last = (self.options.frames != 0 && self.frames >= self.options.frames)
             || tick.quit
             || self.script_over()
             || self.watched_to_the_end();
         let viewport = Viewport { width: self.gpu.size.0, height: self.gpu.size.1 };
-        let (input, replayed) = match self.timeline.next() {
+        let (input, replayed, cap_events) = match self.timeline.next() {
             Some(recorded) => {
                 // Recorded frames bring their own input.
-                let planned = (recorded.input.clone(), Some(recorded.loads.clone()));
+                let planned = (recorded.input.clone(), Some(recorded.loads.clone()), 0usize);
                 self.input.discard();
                 planned
             }
@@ -1300,7 +1344,12 @@ impl Session {
                 if let Some(mods) = &mut self.mods {
                     mods.frame(&mut input);
                 }
-                (input, None)
+                let cap_events = if self.net.is_none() {
+                    self.kernels.as_mut().map_or(0, |kernels| kernels.splice_live_events(&mut input))
+                } else {
+                    0
+                };
+                (input, None, cap_events)
             }
         };
         // Headless on the AT-SPI bus, too: assistive technology keeps up.
@@ -1318,6 +1367,7 @@ impl Session {
         Ok(Planned {
             position: self.timeline.position(),
             input,
+            cap_events,
             replayed,
             shots,
             overlay_shots,
@@ -1355,8 +1405,10 @@ impl Session {
     }
 
     /// A frame ran: into the history, the input recording and the trace.
-    fn ran(&mut self, position: u64, input: Vec<f32>, loads: Vec<Load>) -> Result<()> {
+    fn ran(&mut self, position: u64, mut input: Vec<f32>, cap_events: usize, loads: Vec<Load>) -> Result<()> {
         debug_assert_eq!(position, self.timeline.position());
+        // Strip live-only unrecorded `CAP` before trace, input_recorder, and Timeline::ran!
+        crate::kernels::strip_trailing_events(&mut input, cap_events);
         if let Some(trace) = &mut self.trace {
             writeln!(trace, "{position} {:016x} {:016x}", hash_lanes(&input), self.runtime.packet_hash())?;
         }
@@ -1377,9 +1429,14 @@ impl Session {
             devlog::error(Source::Reload, "net: the new build waits; the peers play the build they started with");
             return;
         }
+        let worker_module = module.clone();
         self.state_adapter = load_state_adapter(&self.paths.assets);
-        let mut shell = shell!(self, window);
-        if self.runtime.reload(&mut shell, module, catalog) == ReloadResult::Activated {
+        let activated = {
+            let mut shell = shell!(self, window);
+            self.runtime.reload(&mut shell, module, catalog) == ReloadResult::Activated
+        };
+        if activated {
+            self.set_worker_module(self.worker_engine.clone(), worker_module, self.worker_deadlines);
             self.timeline.rebuilt();
             if let Some(drawn) = self.runtime.take_drawn() {
                 self.show(drawn);
@@ -1503,6 +1560,7 @@ impl Session {
     /// Invalid guest output never commits its candidate state. Keep the last
     /// valid frame visible and the development watcher running until a fix.
     fn reject_frame(&mut self, window: Option<&Window>, planned: Planned, error: anyhow::Error) -> Result<bool> {
+        self.fence_kernels();
         if !self.options.dev || !error.is::<InvalidFrame>() {
             return Err(error);
         }
@@ -1662,7 +1720,7 @@ impl Session {
             // This frame changes nothing after it draws: the next one goes
             // to the guest now and computes while this one draws.
             self.timeline.observe(&rendered, false);
-            self.ran(planned.position, std::mem::take(&mut planned.input), Vec::new())?;
+            self.ran(planned.position, std::mem::take(&mut planned.input), planned.cap_events, Vec::new())?;
             let tick = self.tick();
             if tick.travel.is_some() {
                 self.overlap.early = Some(tick);
@@ -1692,27 +1750,49 @@ impl Session {
         if self.overlay.as_ref().is_some_and(|overlay| overlay.wants_picture(planned.position + 1)) {
             self.capture.picture = Some(planned.position + 1);
         }
-        let mut loads = Vec::new();
-        let draw_timings;
+        let has_kernels = crate::kernels::has_kernel_requests(&rendered.services);
+        // Submit live local kernel work right before `shell.render` so workers
+        // overlap GPU rendering; strip silently under Netplay (`self.net.is_some()`).
+        if planned.replayed.is_none() && self.net.is_none() && has_kernels
+            && let Some(kernels) = &mut self.kernels
         {
+            kernels.submit(&rendered.services);
+        }
+        let mut loads = Vec::new();
+        let mut state_replaced = false;
+        let render_and_follow = (|| -> Result<pen_runtime::game::DrawTimings> {
             let mut shell = shell!(self, window);
             shell.render(&rendered, self.runtime.catalog())?;
-            draw_timings = shell.gpu.draw_timings;
+            let draw_timings = shell.gpu.draw_timings;
             if let Some(fault) = shell.gpu.take_fault() {
                 return Err(anyhow!(fault));
             }
             // A live frame's requests (a recorded one's answers are in the
             // recording), before an undo or load replaces the world asking.
+            // Pre-dispatch partition: `service::KERNEL` NEVER enters generic `Services::answer`.
             if planned.replayed.is_none() {
-                shell.services.answer(&rendered.services);
+                if has_kernels {
+                    let canonical: Vec<_> = rendered
+                        .services
+                        .iter()
+                        .filter(|req| req.service != pen_protocol::service::KERNEL)
+                        .cloned()
+                        .collect();
+                    if !canonical.is_empty() {
+                        shell.services.answer(&canonical);
+                    }
+                } else {
+                    shell.services.answer(&rendered.services);
+                }
             }
-            self.runtime.follow(&mut shell, &rendered)?;
+            state_replaced |= self.runtime.follow(&mut shell, &rendered)?;
             match &planned.replayed {
                 // The states it loaded, not the files: they may have changed
                 // since. A replay writes no files.
                 Some(recorded) => {
                     for load in recorded {
                         timeline::apply(&mut self.runtime, &mut shell, load)?;
+                        state_replaced = true;
                     }
                     loads.clone_from(recorded);
                 }
@@ -1734,7 +1814,10 @@ impl Session {
                         );
                     }
                     if rendered.scene_load_requested && local {
-                        loads.extend(load_file(&mut self.runtime, &mut shell, paths.scene_to_read(), true));
+                        if let Some(load) = load_file(&mut self.runtime, &mut shell, paths.scene_to_read(), true) {
+                            loads.push(load);
+                            state_replaced = true;
+                        }
                     }
                     if rendered.save_requested {
                         report(
@@ -1743,16 +1826,33 @@ impl Session {
                         );
                     }
                     if rendered.load_requested && local {
-                        loads.extend(load_file(&mut self.runtime, &mut shell, &paths.quicksave, false));
+                        if let Some(load) = load_file(&mut self.runtime, &mut shell, &paths.quicksave, false) {
+                            loads.push(load);
+                            state_replaced = true;
+                        }
                     }
                     for path in &planned.saves {
                         report(self.runtime.save(path), format!("saved {}", path.display()));
                     }
                     for path in planned.loads.iter().filter(|_| local) {
-                        loads.extend(load_file(&mut self.runtime, &mut shell, path, false));
+                        if let Some(load) = load_file(&mut self.runtime, &mut shell, path, false) {
+                            loads.push(load);
+                            state_replaced = true;
+                        }
                     }
                 }
             }
+            Ok(draw_timings)
+        })();
+        let draw_timings = match render_and_follow {
+            Ok(timings) => timings,
+            Err(error) => {
+                self.fence_kernels();
+                return Err(error);
+            }
+        };
+        if state_replaced {
+            self.fence_kernels();
         }
         let exit = rendered.exit_requested;
         let replacement = self.runtime.take_drawn();
@@ -1760,7 +1860,7 @@ impl Session {
         let shown = replacement.unwrap_or(rendered);
         if !overlapped {
             self.timeline.observe(&shown, replaced);
-            self.ran(planned.position, planned.input, loads)?;
+            self.ran(planned.position, planned.input, planned.cap_events, loads)?;
         }
         self.show(shown);
         if let Some(position) = self.timeline.observations.take_break() {

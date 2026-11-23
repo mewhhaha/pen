@@ -10,4 +10,5 @@ pub mod diagnostic;
 mod packets;
 pub mod protocol;
 
+pub use boundary::canonical_render_packet;
 pub use protocol::*;

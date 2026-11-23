@@ -307,7 +307,7 @@ fn validate_trusted_ancestor(anc: &Path, target: &Path, euid: u32) -> Result<()>
     let mode = am.permissions().mode();
     ensure!(
         (mode & 0o022) == 0 || (mode & 0o1000) != 0,
-        "cache ancestor {} (for {}) is writable without sticky bit",
+        "cache ancestor {} (for {}) is writable without sticky bit (remediation: run `chmod 700` or set PEN_WTIME_AOT_CACHE to an owner-private directory)",
         anc.display(),
         target.display()
     );
@@ -645,20 +645,68 @@ fn host_cpu_fingerprint() -> &'static str {
     })
 }
 
+/// Computes the exact same effective `-march=<target_cpu>` compiler target macro fingerprint as
+/// `wtime-aot`'s `cgen::cc_target_fingerprint`, so Pen's warm C fast-cache key cannot alias across
+/// compiler or effective target-ISA changes (with ambient compiler env vars stripped).
 #[cfg(feature = "compiler")]
-fn c_compiler_fingerprint() -> &'static str {
-    static FP: OnceLock<String> = OnceLock::new();
-    FP.get_or_init(|| {
-        for cc in ["clang", "cc", "gcc"] {
-            if let Ok(out) = Command::new(cc).arg("--version").output()
-                && out.status.success()
-            {
-                let ver = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or(cc).trim().to_string();
-                return wasm_sha256_hex(format!("{cc}:{ver}").as_bytes())[..16].to_string();
+fn c_compiler_target_fingerprint(target_cpu: &str) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(target_cpu).cloned() {
+        return Ok(hit);
+    }
+    let clean_cc = |cc: &str| {
+        let mut cmd = Command::new(cc);
+        cmd.env_clear();
+        for var in ["PATH", "HOME", "TMPDIR"] {
+            if let Some(v) = std::env::var_os(var) {
+                cmd.env(var, v);
             }
         }
-        "no-cc".to_string()
-    })
+        cmd
+    };
+    let mut found = None;
+    for cc in ["clang", "cc", "gcc"] {
+        if let Ok(out) = clean_cc(cc).arg("--version").output()
+            && out.status.success()
+        {
+            let ver = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or(cc).trim().to_string();
+            found = Some((cc, ver));
+            break;
+        }
+    }
+    let Some((cc, cc_ver)) = found else {
+        bail!("no C compiler found (install clang or gcc)");
+    };
+    let out = clean_cc(cc)
+        .args([&format!("-march={target_cpu}"), "-dM", "-E", "-x", "c", "-"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .with_context(|| format!("probing {cc} -march={target_cpu}"))?;
+    ensure!(
+        out.status.success(),
+        "{cc} -march={target_cpu} probe failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let mut lines: Vec<&str> = std::str::from_utf8(&out.stdout)
+        .unwrap_or("")
+        .lines()
+        .filter(|l| l.starts_with("#define __"))
+        .collect();
+    lines.sort_unstable();
+    let mut h = Sha256::new();
+    h.update(b"cc-target-v1");
+    h.update(cc_ver.as_bytes());
+    h.update(b"\n");
+    h.update(target_cpu.as_bytes());
+    for l in lines {
+        h.update(l.as_bytes());
+        h.update(b"\n");
+    }
+    let fp = format!("{:x}", h.finalize())[..32].to_string();
+    cache.lock().unwrap_or_else(|p| p.into_inner()).insert(target_cpu.to_string(), fp.clone());
+    Ok(fp)
 }
 
 #[cfg(feature = "compiler")]
@@ -699,72 +747,124 @@ fn rustc_version_fingerprint(toolchain: &str) -> String {
     fp
 }
 
-/// Returns true if the current calling Linux thread has hardware CET shadow stack (`shstk`)
-/// enabled, parsed from `/proc/thread-self/status` `x86_Thread_features:` (zero unsafe, zero syscalls).
 #[cfg(all(feature = "compiler", target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
-fn linux_shstk_enabled() -> bool {
-    let Ok(status) = read_thread_proc_status() else {
-        return false;
+enum ShstkStatus {
+    ConfirmedOff,
+    Enabled,
+    Unknown(String),
+}
+
+/// Inspects the calling Linux thread's CET hardware shadow-stack (`shstk`) state via
+/// `/proc/thread-self/status` `x86_Thread_features:` (zero unsafe, zero syscalls).
+/// Distinguishes confirmed-off from unavailable/indeterminate status so strict CET loaders never
+/// fail opaquely behind a false "off" assumption.
+#[cfg(all(feature = "compiler", target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
+fn linux_shstk_status() -> ShstkStatus {
+    let status = match read_thread_proc_status() {
+        Ok(s) => s,
+        Err(e) => return ShstkStatus::Unknown(format!("cannot read /proc/thread-self/status: {e}")),
     };
     for line in status.lines() {
         if let Some(rest) = line.strip_prefix("x86_Thread_features:") {
-            return rest.split_whitespace().any(|tok| tok == "shstk");
+            return if rest.split_whitespace().any(|tok| tok == "shstk") {
+                ShstkStatus::Enabled
+            } else {
+                ShstkStatus::ConfirmedOff
+            };
         }
     }
-    false
+    // Pre-6.6 kernels omit `x86_Thread_features:`; confirm via `/proc/cpuinfo` that the kernel/CPU
+    // does not expose user CET shadow stacks (`user_shstk` / `shstk`), otherwise fail closed.
+    let cpuinfo = match std::fs::read_to_string("/proc/cpuinfo") {
+        Ok(s) => s,
+        Err(e) => {
+            return ShstkStatus::Unknown(format!(
+                "missing x86_Thread_features in proc status and cannot read /proc/cpuinfo: {e}"
+            ));
+        }
+    };
+    for line in cpuinfo.lines() {
+        if let Some(rest) = line.strip_prefix("flags")
+            && let Some((_, flags)) = rest.split_once(':')
+        {
+            if flags.split_whitespace().any(|f| f == "user_shstk" || f == "shstk") {
+                return ShstkStatus::Unknown(
+                    "CPU/kernel advertises CET shstk but /proc/thread-self/status lacks x86_Thread_features".into(),
+                );
+            }
+            return ShstkStatus::ConfirmedOff;
+        }
+    }
+    ShstkStatus::Unknown("unable to confirm CET shstk status from procfs".into())
+}
+
+/// Validates `--target-cpu` syntax independently of the host OS/architecture so an invalid CPU
+/// name always fails loudly as a configuration error (never triggering platform/ISA fallback).
+#[cfg(feature = "compiler")]
+fn parse_x64_target_cpu_syntax(target_cpu: &str) -> Result<Option<&'static str>> {
+    match target_cpu {
+        "native" => Ok(None),
+        "x86-64-v2" | "generic" => Ok(Some("x64-v2")),
+        "x86-64-v3" | "x86-64-v4" | "haswell" | "broadwell" | "skylake" | "skylake-avx512" | "cascadelake"
+        | "cooperlake" | "cannonlake" | "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake"
+        | "alderlake" | "raptorlake" | "sapphirerapids" | "emeraldrapids" | "graniterapids" => Ok(Some("x64-v3")),
+        other
+            if other
+                .strip_prefix("znver")
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            Ok(Some("x64-v3"))
+        }
+        other => bail!(
+            "unsupported PEN_WTIME_AOT_TARGET_CPU={other:?} (expected native, x86-64-v2, generic, x86-64-v3, x86-64-v4, znver<N>, or haswell+)"
+        ),
+    }
 }
 
 /// Canonical internal cache profile tag matching `wtime-aot --backend x64 --target-cpu`,
-/// validating `target_cpu` syntax FIRST and then checking host platform, calling-thread CET
-/// `SHSTK` status, and CPU capability (`SSE4.1 + POPCNT`, plus `ABM/LZCNT + BMI1` for `x64-v3`)
+/// validating `target_cpu` syntax FIRST (unconditionally across all platforms), then checking host
+/// platform (`Linux x86-64 LP64`), calling-thread CET `SHSTK` status (failing closed when enabled
+/// or indeterminate), and CPU capability (`SSE4.1 + POPCNT`, plus `ABM/LZCNT + BMI1` for `x64-v3`)
 /// BEFORE cache lookup so unsupported hosts fail with a typed `X64FallbackError` while `wasm` &
 /// `cache` are still available for default-path fallback (and bad CPU names always fail loudly).
 #[cfg(feature = "compiler")]
 fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
+    let explicit_tag = parse_x64_target_cpu_syntax(target_cpu)?;
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64")))]
     {
-        let _ = target_cpu;
+        let _ = explicit_tag;
         Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedPlatform(
             "wtime-aot --backend x64 is only supported on Linux x86_64 LP64 hosts".into(),
         ))))
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
     {
-        // Validate `target_cpu` syntax BEFORE host ISA/SHSTK checks so an invalid CPU name never
-        // turns into a fallback-eligible `UnsupportedIsa` error.
-        let tag = match target_cpu {
-            "native" => {
-                if std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("bmi1") {
-                    "x64-v3"
-                } else {
-                    "x64-v2"
-                }
+        match linux_shstk_status() {
+            ShstkStatus::ConfirmedOff => {}
+            ShstkStatus::Enabled => {
+                return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(
+                    "calling thread has Linux CET hardware shadow stack (SHSTK) enabled".into(),
+                ))));
             }
-            "x86-64-v2" | "generic" => "x64-v2",
-            "x86-64-v3" | "x86-64-v4" | "haswell" | "broadwell" | "skylake" | "skylake-avx512" | "cascadelake"
-            | "cooperlake" | "cannonlake" | "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake"
-            | "alderlake" | "raptorlake" | "sapphirerapids" | "emeraldrapids" | "graniterapids" => "x64-v3",
-            other
-                if other
-                    .strip_prefix("znver")
-                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) =>
-            {
-                "x64-v3"
+            ShstkStatus::Unknown(why) => {
+                return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(why))));
             }
-            other => bail!(
-                "unsupported PEN_WTIME_AOT_TARGET_CPU={other:?} (expected native, x86-64-v2, generic, x86-64-v3, x86-64-v4, znver<N>, or haswell+)"
-            ),
-        };
-        if linux_shstk_enabled() {
-            return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(
-                "calling thread has Linux CET hardware shadow stack (SHSTK) enabled".into(),
-            ))));
         }
         if !std::is_x86_feature_detected!("sse4.1") || !std::is_x86_feature_detected!("popcnt") {
             return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(
                 "host CPU lacks baseline SSE4.1 + POPCNT required by wtime-aot --backend x64".into(),
             ))));
         }
+        let tag = match explicit_tag {
+            Some(t) => t,
+            None => {
+                if std::is_x86_feature_detected!("lzcnt") && std::is_x86_feature_detected!("bmi1") {
+                    "x64-v3"
+                } else {
+                    "x64-v2"
+                }
+            }
+        };
         if tag == "x64-v3" && (!std::is_x86_feature_detected!("lzcnt") || !std::is_x86_feature_detected!("bmi1")) {
             return Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(format!(
                 "host CPU lacks ABM/LZCNT + BMI1 required by PEN_WTIME_AOT_TARGET_CPU={target_cpu:?}"
@@ -856,12 +956,12 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
     let (canon_bin, bin_hash) = bin_digest(&bin)?;
     let profile_tag = match backend.as_str() {
         "c" => {
-            let cpu_tag = if target_cpu == "native" {
-                format!("native-{}", host_cpu_fingerprint())
-            } else {
-                sanitize_key_part(&target_cpu)
-            };
-            format!("c-{}-{cpu_tag}-{}", sanitize_key_part(&c_opt), c_compiler_fingerprint())
+            format!(
+                "c-{}-{}-{}",
+                sanitize_key_part(&c_opt),
+                sanitize_key_part(&target_cpu),
+                c_compiler_target_fingerprint(&target_cpu)?
+            )
         }
         "rust" => {
             let cpu_tag = if target_cpu == "native" {

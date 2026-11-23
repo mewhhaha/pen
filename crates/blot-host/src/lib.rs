@@ -2304,6 +2304,11 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("blot-host-cache-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let now = std::time::SystemTime::now();
         let day = Duration::from_secs(24 * 60 * 60);
         let file = |name: &str, age: Duration| {

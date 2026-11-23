@@ -210,3 +210,20 @@ trilinearly between the eight probes round the point lifted a quarter spacing
 along the normal, each weighted by validity and by how much it faces the
 surface, and blends toward the sky's light with the volume's confidence: zero
 outside it, fading in over one cell beyond the outermost probes.
+
+## Look-up tables for the colour grade
+
+The frame's `grade.lut_a` and `lut_b` name a table by a material: 1 plus its
+catalog index, whose `texture` is the table's strip, and 0 for none. A table of
+N slices (N from 2 to 64) is a strip N * N texels wide and N tall: the slice is
+blue, red runs along it and green down, so texel (r, g, b) is at x = b * N + r,
+y = g and an identity table holds (r, g, b) / (N - 1). It is read as data, not as
+a colour picture: an 8-bit PNG key is read raw (the sRGB decoding a colour
+texture gets is not applied), and its colours are in the grade's own log encoding,
+ACEScc (the Academy's S-2014-003 curve, on the frame's own primaries): 0.41 is
+middle grey, 0 a thousandth of SDR white and 1 more than two hundred times it,
+with values outside 0 to 1 passing through unchanged. The material needs a
+shader like any other (it is never drawn), and the host uses the table once its
+finest level has streamed in. Ink's `color.grade` and `color.lut_lookup` evaluate
+the same table on the CPU. A `.cube` file from a grading tool is display-referred,
+so it does not drop in: bake it through the grade's log encoding first.

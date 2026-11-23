@@ -36,6 +36,20 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
     {
         ensure!(finite(vector), "the sky's colors and coefficients must be finite float32 values");
     }
+    let volume = &frame.probe_volume;
+    let probes = [volume.nx, volume.ny, volume.nz].iter().map(|&n| n as usize).product::<usize>();
+    ensure!(
+        frame.probes.is_empty() || (frame.probes.len() == probes && probes <= 16384),
+        "probes must fill the probe volume, at most 16384"
+    );
+    ensure!(
+        probes == 0 || (volume.spacing.is_finite() && volume.spacing > 0.0 && finite(&volume.origin)),
+        "probe volume needs a positive finite spacing and origin"
+    );
+    for probe in &frame.probes {
+        let terms = [probe.sh0, probe.sh1, probe.sh2, probe.sh3, probe.sh4, probe.sh5, probe.sh6, probe.sh7, probe.sh8];
+        ensure!(terms.iter().all(finite) && probe.valid.is_finite(), "probe light must contain finite float32 values");
+    }
     ensure!(hypot(&frame.light_direction) >= 1e-8, "light direction must be nonzero");
     let aberration = &frame.aberration;
     ensure!(

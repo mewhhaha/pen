@@ -179,6 +179,17 @@ func encode_light (light: types.Light) =>
     light.direction.y, light.direction.z, light.inner, light.outer,
   ]
 
+// Probe: A diffuse light probe: nine spherical-harmonic RGB terms of the light
+// there, and whether it is valid.
+func encode_probe (probe: types.Probe) =>
+  return #[
+    probe.sh0.x, probe.sh0.y, probe.sh0.z, probe.sh1.x, probe.sh1.y, probe.sh1.z,
+    probe.sh2.x, probe.sh2.y, probe.sh2.z, probe.sh3.x, probe.sh3.y, probe.sh3.z,
+    probe.sh4.x, probe.sh4.y, probe.sh4.z, probe.sh5.x, probe.sh5.y, probe.sh5.z,
+    probe.sh6.x, probe.sh6.y, probe.sh6.z, probe.sh7.x, probe.sh7.y, probe.sh7.z,
+    probe.sh8.x, probe.sh8.y, probe.sh8.z, probe.valid,
+  ]
+
 // Listener: A listener: where it is, the way it faces and its up, in world
 // units.
 func encode_listener (listener: types.Listener) =>
@@ -254,6 +265,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   let poses_count: U32 = collections.poses.length
   let emitters_count: U32 = collections.emitters.length
   let lights_count: U32 = collections.lights.length
+  let probes_count: U32 = collections.probes.length
   let listener_count: U32 = collections.listener.length
   let panners_count: U32 = collections.panners.length
   let instances_count: U32 = collections.instances.length
@@ -377,6 +389,14 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (packet.sky.sh8.x)
   @storage.push encoded (packet.sky.sh8.y)
   @storage.push encoded (packet.sky.sh8.z)
+  @storage.push encoded (U32.to_f32 (packet.probe_volume.revision))
+  @storage.push encoded (U32.to_f32 (packet.probe_volume.nx))
+  @storage.push encoded (U32.to_f32 (packet.probe_volume.ny))
+  @storage.push encoded (U32.to_f32 (packet.probe_volume.nz))
+  @storage.push encoded (packet.probe_volume.spacing)
+  @storage.push encoded (packet.probe_volume.origin.x)
+  @storage.push encoded (packet.probe_volume.origin.y)
+  @storage.push encoded (packet.probe_volume.origin.z)
   @storage.push encoded (packet.fog.radius)
   @storage.push encoded (packet.fog.density)
   @storage.push encoded (packet.fog.height)
@@ -434,6 +454,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (U32.to_f32 emitters_count)
   @storage.push encoded (lanes.bit packet.quality.taa)
   @storage.push encoded (U32.to_f32 lights_count)
+  @storage.push encoded (U32.to_f32 probes_count)
   @storage.push encoded (U32.to_f32 listener_count)
   @storage.push encoded (U32.to_f32 panners_count)
   @storage.push encoded (lanes.bit packet.loading)
@@ -652,7 +673,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     for i in 0 .. count:
       let item = field.values.at i
       @storage.push encoded item
-  encoded[start + 161] := U32.to_f32 ((encoded.length - fields_start))
+  encoded[start + 169] := U32.to_f32 ((encoded.length - fields_start))
   let ui_start = encoded.length
   for i in 0 .. ui_count:
     let source = collections.ui[i]
@@ -685,7 +706,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     for i in 0 .. count:
       let item = ui.text.at i
       @storage.push encoded item
-  encoded[start + 163] := U32.to_f32 ((encoded.length - ui_start))
+  encoded[start + 171] := U32.to_f32 ((encoded.length - ui_start))
   let services_start = encoded.length
   for i in 0 .. services_count:
     let source = collections.services[i]
@@ -702,7 +723,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     for i in 0 .. count:
       let item = service.values.at i
       @storage.push encoded item
-  encoded[start + 165] := U32.to_f32 ((encoded.length - services_start))
+  encoded[start + 173] := U32.to_f32 ((encoded.length - services_start))
   for i in 0 .. buses_count:
     let source = collections.buses[i]
     let buse: types.Bus = project.buse context source
@@ -792,6 +813,37 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     @storage.push encoded (light.direction.z)
     @storage.push encoded (light.inner)
     @storage.push encoded (light.outer)
+  for i in 0 .. probes_count:
+    let source = collections.probes[i]
+    let probe: types.Probe = project.probe context source
+    @storage.push encoded (probe.sh0.x)
+    @storage.push encoded (probe.sh0.y)
+    @storage.push encoded (probe.sh0.z)
+    @storage.push encoded (probe.sh1.x)
+    @storage.push encoded (probe.sh1.y)
+    @storage.push encoded (probe.sh1.z)
+    @storage.push encoded (probe.sh2.x)
+    @storage.push encoded (probe.sh2.y)
+    @storage.push encoded (probe.sh2.z)
+    @storage.push encoded (probe.sh3.x)
+    @storage.push encoded (probe.sh3.y)
+    @storage.push encoded (probe.sh3.z)
+    @storage.push encoded (probe.sh4.x)
+    @storage.push encoded (probe.sh4.y)
+    @storage.push encoded (probe.sh4.z)
+    @storage.push encoded (probe.sh5.x)
+    @storage.push encoded (probe.sh5.y)
+    @storage.push encoded (probe.sh5.z)
+    @storage.push encoded (probe.sh6.x)
+    @storage.push encoded (probe.sh6.y)
+    @storage.push encoded (probe.sh6.z)
+    @storage.push encoded (probe.sh7.x)
+    @storage.push encoded (probe.sh7.y)
+    @storage.push encoded (probe.sh7.z)
+    @storage.push encoded (probe.sh8.x)
+    @storage.push encoded (probe.sh8.y)
+    @storage.push encoded (probe.sh8.z)
+    @storage.push encoded (probe.valid)
   for i in 0 .. listener_count:
     let source = collections.listener[i]
     let listener: types.Listener = project.listener context source
@@ -887,6 +939,7 @@ func measure_render_floats collections -> project -> context =>
   let poses_count: U32 = collections.poses.length
   let emitters_count: U32 = collections.emitters.length
   let lights_count: U32 = collections.lights.length
+  let probes_count: U32 = collections.probes.length
   let listener_count: U32 = collections.listener.length
   let panners_count: U32 = collections.panners.length
   let instances_count: U32 = collections.instances.length
@@ -926,6 +979,7 @@ func measure_render_floats collections -> project -> context =>
   total := self + poses_count * 4
   total := self + emitters_count * 42
   total := self + lights_count * 12
+  total := self + probes_count * 28
   total := self + listener_count * 9
   total := self + panners_count * 15
   total := self + instances_count * 26
@@ -1066,72 +1120,81 @@ func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (
   encoded[114] := packet.sky.sh8.x
   encoded[115] := packet.sky.sh8.y
   encoded[116] := packet.sky.sh8.z
-  encoded[117] := packet.fog.radius
-  encoded[118] := packet.fog.density
-  encoded[119] := packet.fog.height
+  encoded[117] := U32.to_f32 (packet.probe_volume.revision)
+  encoded[118] := U32.to_f32 (packet.probe_volume.nx)
+  encoded[119] := U32.to_f32 (packet.probe_volume.ny)
+  encoded[120] := U32.to_f32 (packet.probe_volume.nz)
+  encoded[121] := packet.probe_volume.spacing
+  encoded[122] := packet.probe_volume.origin.x
+  encoded[123] := packet.probe_volume.origin.y
+  encoded[124] := packet.probe_volume.origin.z
+  encoded[125] := packet.fog.radius
+  encoded[126] := packet.fog.density
+  encoded[127] := packet.fog.height
   let $types.Mat4 { x: shadow_view_x, y: shadow_view_y, z: shadow_view_z, w: shadow_view_w } = packet.shadow.view
-  encoded[120] := shadow_view_x.x
-  encoded[121] := shadow_view_x.y
-  encoded[122] := shadow_view_x.z
-  encoded[123] := shadow_view_x.w
-  encoded[124] := shadow_view_y.x
-  encoded[125] := shadow_view_y.y
-  encoded[126] := shadow_view_y.z
-  encoded[127] := shadow_view_y.w
-  encoded[128] := shadow_view_z.x
-  encoded[129] := shadow_view_z.y
-  encoded[130] := shadow_view_z.z
-  encoded[131] := shadow_view_z.w
-  encoded[132] := shadow_view_w.x
-  encoded[133] := shadow_view_w.y
-  encoded[134] := shadow_view_w.z
-  encoded[135] := shadow_view_w.w
+  encoded[128] := shadow_view_x.x
+  encoded[129] := shadow_view_x.y
+  encoded[130] := shadow_view_x.z
+  encoded[131] := shadow_view_x.w
+  encoded[132] := shadow_view_y.x
+  encoded[133] := shadow_view_y.y
+  encoded[134] := shadow_view_y.z
+  encoded[135] := shadow_view_y.w
+  encoded[136] := shadow_view_z.x
+  encoded[137] := shadow_view_z.y
+  encoded[138] := shadow_view_z.z
+  encoded[139] := shadow_view_z.w
+  encoded[140] := shadow_view_w.x
+  encoded[141] := shadow_view_w.y
+  encoded[142] := shadow_view_w.z
+  encoded[143] := shadow_view_w.w
   let $types.Mat4 { x: shadow_projection_x, y: shadow_projection_y, z: shadow_projection_z, w: shadow_projection_w } = packet.shadow.projection
-  encoded[136] := shadow_projection_x.x
-  encoded[137] := shadow_projection_x.y
-  encoded[138] := shadow_projection_x.z
-  encoded[139] := shadow_projection_x.w
-  encoded[140] := shadow_projection_y.x
-  encoded[141] := shadow_projection_y.y
-  encoded[142] := shadow_projection_y.z
-  encoded[143] := shadow_projection_y.w
-  encoded[144] := shadow_projection_z.x
-  encoded[145] := shadow_projection_z.y
-  encoded[146] := shadow_projection_z.z
-  encoded[147] := shadow_projection_z.w
-  encoded[148] := shadow_projection_w.x
-  encoded[149] := shadow_projection_w.y
-  encoded[150] := shadow_projection_w.z
-  encoded[151] := shadow_projection_w.w
-  encoded[152] := packet.shadow.texel
-  encoded[153] := U32.to_f32 (packet.shadow.texels)
-  encoded[154] := packet.blur
-  encoded[155] := lanes.bit packet.quality.bloom
-  encoded[156] := packet.clouds.cover
-  encoded[157] := packet.clouds.drift.x
-  encoded[158] := packet.clouds.drift.z
-  encoded[159] := lanes.bit packet.hide_cursor
-  encoded[160] := 0.0
-  encoded[161] := 0.0
-  encoded[162] := 0.0
-  encoded[163] := 0.0
-  encoded[164] := 0.0
-  encoded[165] := 0.0
-  encoded[166] := 0.0
-  encoded[167] := 0.0
+  encoded[144] := shadow_projection_x.x
+  encoded[145] := shadow_projection_x.y
+  encoded[146] := shadow_projection_x.z
+  encoded[147] := shadow_projection_x.w
+  encoded[148] := shadow_projection_y.x
+  encoded[149] := shadow_projection_y.y
+  encoded[150] := shadow_projection_y.z
+  encoded[151] := shadow_projection_y.w
+  encoded[152] := shadow_projection_z.x
+  encoded[153] := shadow_projection_z.y
+  encoded[154] := shadow_projection_z.z
+  encoded[155] := shadow_projection_z.w
+  encoded[156] := shadow_projection_w.x
+  encoded[157] := shadow_projection_w.y
+  encoded[158] := shadow_projection_w.z
+  encoded[159] := shadow_projection_w.w
+  encoded[160] := packet.shadow.texel
+  encoded[161] := U32.to_f32 (packet.shadow.texels)
+  encoded[162] := packet.blur
+  encoded[163] := lanes.bit packet.quality.bloom
+  encoded[164] := packet.clouds.cover
+  encoded[165] := packet.clouds.drift.x
+  encoded[166] := packet.clouds.drift.z
+  encoded[167] := lanes.bit packet.hide_cursor
   encoded[168] := 0.0
   encoded[169] := 0.0
-  encoded[170] := lanes.bit packet.quality.taa
+  encoded[170] := 0.0
   encoded[171] := 0.0
   encoded[172] := 0.0
   encoded[173] := 0.0
-  encoded[174] := lanes.bit packet.loading
-  encoded[175] := lanes.bit packet.show_captions
-  encoded[176] := lanes.bit packet.retained_enabled
-  encoded[177] := lanes.bit packet.retained_reset
-  encoded[178] := U32.to_f32 (packet.retained_after)
+  encoded[174] := 0.0
+  encoded[175] := 0.0
+  encoded[176] := 0.0
+  encoded[177] := 0.0
+  encoded[178] := lanes.bit packet.quality.taa
   encoded[179] := 0.0
   encoded[180] := 0.0
+  encoded[181] := 0.0
+  encoded[182] := 0.0
+  encoded[183] := lanes.bit packet.loading
+  encoded[184] := lanes.bit packet.show_captions
+  encoded[185] := lanes.bit packet.retained_enabled
+  encoded[186] := lanes.bit packet.retained_reset
+  encoded[187] := U32.to_f32 (packet.retained_after)
+  encoded[188] := 0.0
+  encoded[189] := 0.0
   let at: U32 = protocol.packet_header_floats
   for draw in draws:
     encoded[at + 0] := U32.to_f32 (draw.mesh)

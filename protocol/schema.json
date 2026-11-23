@@ -250,6 +250,11 @@
       "doc": "The most point and spot lights one frame may have."
     },
     {
+      "limit": "MAX_PROBES",
+      "value": 16384,
+      "doc": "The most light probes one frame may carry (a volume may be larger than a frame's share only by sending none: see `probe_volume.revision`)."
+    },
+    {
       "limit": "ENGINE_PREFERENCES",
       "value": 64,
       "doc": "Preference events from this index on carry the engine's preferences (ENGINE_PREFERENCE_*); below it, the game's own."
@@ -1596,6 +1601,10 @@
         "type": "Shadow",
         "doc": "The shadow map's view; `texels` 0 for no shadows."
       },
+      "probe_volume": {
+        "type": "ProbeVolume",
+        "doc": "A lattice of diffuse light probes the game baked: where it is and how big, and the revision of the probes the host holds."
+      },
       "clouds": {
         "type": "Clouds",
         "doc": "Clouds over the scene: how much of the sky they cover, 0 for none, and how far the wind has carried them along x and z."
@@ -1966,6 +1975,40 @@
         },
         "doc": "Coefficient 8 (real spherical harmonic xx_yy, bands 0 to 2) of the sky's diffuse light: what a white surface facing each way shows, in linear color, the cosine lobe already applied and divided by pi."
       },
+      "probe_volume.revision": {
+        "kind": "count",
+        "max": 16777215,
+        "doc": "Which bake the probes are: the host keeps the probes it was last sent, and uses them while this matches theirs."
+      },
+      "probe_volume.nx": {
+        "kind": "count",
+        "max": 64,
+        "doc": "Probes along x; 0 for no probe volume."
+      },
+      "probe_volume.ny": {
+        "kind": "count",
+        "max": 64
+      },
+      "probe_volume.nz": {
+        "kind": "count",
+        "max": 64
+      },
+      "probe_volume.spacing": {
+        "kind": "f32",
+        "doc": "The distance between neighbouring probes, in world units."
+      },
+      "probe_volume.origin": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "doc": "Where probe 0 is; probe (z * ny + y) * nx + x lies at origin + (x, y, z) * spacing."
+      },
       "fog.radius": {
         "kind": "f32"
       },
@@ -2070,6 +2113,11 @@
       "light_count": {
         "kind": "size",
         "section": "lights",
+        "of": "count"
+      },
+      "probe_count": {
+        "kind": "size",
+        "section": "probes",
         "of": "count"
       },
       "listener_count": {
@@ -3063,6 +3111,99 @@
           "limit": "MAX_LIGHTS",
           "value": 4096,
           "doc": "The most point and spot lights one frame may have."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "probes",
+        "doc": "The light probes of the volume `probe_volume` describes, in index order, sent when the game has a new bake; none keeps the probes the host holds (while their revision matches).",
+        "record": {
+          "name": "Probe",
+          "constant": "PROBE",
+          "fields": {
+              "sh0": {
+                "kind": "vector",
+                "type": {
+                  "name": "Vector",
+                  "components": ["x", "y", "z"]
+                },
+                "doc": "Term 0 (constant) of the light a white surface facing each way shows here: cosine lobe applied, divided by pi."
+              },
+              "sh1": {
+                "kind": "vector",
+                "type": {
+                  "name": "Vector",
+                  "components": ["x", "y", "z"]
+                },
+                "doc": "Term 1 (y) of the light a white surface facing each way shows here: cosine lobe applied, divided by pi."
+              },
+              "sh2": {
+                "kind": "vector",
+                "type": {
+                  "name": "Vector",
+                  "components": ["x", "y", "z"]
+                },
+                "doc": "Term 2 (z) of the light a white surface facing each way shows here: cosine lobe applied, divided by pi."
+              },
+              "sh3": {
+                "kind": "vector",
+                "type": {
+                  "name": "Vector",
+                  "components": ["x", "y", "z"]
+                },
+                "doc": "Term 3 (x) of the light a white surface facing each way shows here: cosine lobe applied, divided by pi."
+              },
+              "sh4": {
+                "kind": "vector",
+                "type": {
+                  "name": "Vector",
+                  "components": ["x", "y", "z"]
+                },
+                "doc": "Term 4 (xy) of the light a white surface facing each way shows here: cosine lobe applied, divided by pi."
+              },
+              "sh5": {
+                "kind": "vector",
+                "type": {
+                  "name": "Vector",
+                  "components": ["x", "y", "z"]
+                },
+                "doc": "Term 5 (yz) of the light a white surface facing each way shows here: cosine lobe applied, divided by pi."
+              },
+              "sh6": {
+                "kind": "vector",
+                "type": {
+                  "name": "Vector",
+                  "components": ["x", "y", "z"]
+                },
+                "doc": "Term 6 (zz) of the light a white surface facing each way shows here: cosine lobe applied, divided by pi."
+              },
+              "sh7": {
+                "kind": "vector",
+                "type": {
+                  "name": "Vector",
+                  "components": ["x", "y", "z"]
+                },
+                "doc": "Term 7 (xz) of the light a white surface facing each way shows here: cosine lobe applied, divided by pi."
+              },
+              "sh8": {
+                "kind": "vector",
+                "type": {
+                  "name": "Vector",
+                  "components": ["x", "y", "z"]
+                },
+                "doc": "Term 8 (xx_yy) of the light a white surface facing each way shows here: cosine lobe applied, divided by pi."
+              },
+              "valid": {
+                "kind": "f32",
+                "doc": "1 for a probe in open space, 0 for one inside geometry, whose light the host leaves out."
+              }
+          },
+          "doc": "A diffuse light probe: nine spherical-harmonic RGB terms of the light there, and whether it is valid."
+        },
+        "max": {
+          "limit": "MAX_PROBES",
+          "value": 16384,
+          "doc": "The most light probes one frame may carry."
         }
       },
       {

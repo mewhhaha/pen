@@ -61,6 +61,8 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
             sun: Vector { x: 0.0, y: 1.0, z: 0.0 },
             ..Sky::default()
         },
+        probe_volume: ProbeVolume::default(),
+        probes: Vec::new(),
         fog: Fog { radius: 0.0, density: 0.0, height: 1.0 },
         clouds: Clouds { cover: 0.0, drift: Drift { x: 0.0, z: 0.0 } },
         shadow: Shadow { view: IDENTITY, projection: IDENTITY, texel: 0.0, texels: 0 },

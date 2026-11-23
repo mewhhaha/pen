@@ -58,6 +58,14 @@ func header (schema: U32): types.RenderHeader => {
     sh7: $types.Vector { x: 0.0, y: 0.0, z: 0.0 },
     sh8: $types.Vector { x: 0.0, y: 0.0, z: 0.0 },
   },
+  probe_volume: $types.ProbeVolume {
+    revision: 0,
+    nx: 0,
+    ny: 0,
+    nz: 0,
+    spacing: 0.0,
+    origin: $types.Vector { x: 0.0, y: 0.0, z: 0.0 },
+  },
   fog: $types.Fog {
     radius: 0.0,
     density: 0.0,

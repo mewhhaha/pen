@@ -144,6 +144,19 @@ type Light is data = $Light {
   outer: F32,
 }
 
+type Probe is data = $Probe {
+  sh0: Vector,
+  sh1: Vector,
+  sh2: Vector,
+  sh3: Vector,
+  sh4: Vector,
+  sh5: Vector,
+  sh6: Vector,
+  sh7: Vector,
+  sh8: Vector,
+  valid: F32,
+}
+
 type Listener is data = $Listener {
   position: Vector,
   forward: Vector,
@@ -277,6 +290,15 @@ type Shadow is data = $Shadow {
   texels: U32,
 }
 
+type ProbeVolume is data = $ProbeVolume {
+  revision: U32,
+  nx: U32,
+  ny: U32,
+  nz: U32,
+  spacing: F32,
+  origin: Vector,
+}
+
 type Clouds is data = $Clouds {
   cover: F32,
   drift: Drift,
@@ -301,6 +323,7 @@ type RenderHeader = {
   aberration: Aberration,
   quality: Quality,
   sky: Sky,
+  probe_volume: ProbeVolume,
   fog: Fog,
   shadow: Shadow,
   blur: F32,

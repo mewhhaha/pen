@@ -33,12 +33,14 @@ Group 0, the frame's, the same for every draw:
 | 4 | The sky's reflection, a `texture_cube<f32>` whose levels are the sky blurred by GGX lobes of growing roughness. |
 | 5 | The split-sum BRDF table, a `texture_2d<f32>`. |
 | 6 | A filtering sampler for both. |
-| 7 | The sky's light, a uniform: nine diffuse spherical-harmonic coefficients, the reflection tint and the cube's last level. |
+| 7 | The sky's light, a uniform: nine diffuse spherical-harmonic coefficients, the reflection tint, the cube's last level and the probe volume's origin, spacing and counts. |
+| 8 | The baked light probes, a read-only storage array of `vec4f`: seven a probe (nine RGB terms and a validity weight). |
 
-Bindings 4 to 7 are the sky as light. A shader that wants it adds
+Bindings 4 to 8 are the sky as light. A shader that wants it adds
 `pen_render::ENVIRONMENT_WGSL`, which declares them and defines
 `ambient_light(world, normal)` (the light all round, to multiply by albedo; the
-flat `ambient` color's replacement), `sky_reflection(normal, view, roughness,
+flat `ambient` color's replacement: the game's baked probe volume where it sends
+one, blended into the sky's light past its edge), `sky_reflection(normal, view, roughness,
 f0)`, `surface_ambient(world, normal, view, albedo, metallic, roughness)` for
 both together, and `specular_occlusion`. A game that sends no coefficients gets
 its flat `ambient` from `ambient_light` and no reflections. The point and spot
@@ -142,3 +144,17 @@ every float and index unchanged. Compressed meshes may expand to at most
 256 MiB. Larger or incompressible meshes keep version 1. Native and browser
 hosts read both; rebuild the hosts to ship version 2. Runtime compatibility
 checks include the mesh codec so packaging cannot pair it with an older player.
+
+## Probe volumes
+
+A game that bakes light probes (ink's `probes`) sends the volume with its frame:
+`probe_volume` (revision, counts, spacing, origin) and, when the bake changed, the
+`probes` section (28 lanes each: nine RGB spherical-harmonic terms, then 1 for a
+probe in open space or 0 for one inside geometry). The host keeps the probes
+it was last sent and uses them while `probe_volume.revision` and the counts
+match, so a frame without the section costs nothing; one that sends it
+replaces them (at most 16384, filling the volume). `ambient_light` interpolates
+trilinearly between the eight probes round the point lifted a quarter spacing
+along the normal, each weighted by validity and by how much it faces the
+surface, and blends toward the sky's light with the volume's confidence: zero
+outside it, fading in over one cell beyond the outermost probes.

@@ -64,7 +64,7 @@ fn scene_group(
     sampler: &wgpu::Sampler,
     sky: (&Environment, &wgpu::Buffer),
 ) -> wgpu::BindGroup {
-    let [cube, table, sky_sampler, light] = sky.0.entries(sky.1);
+    let [cube, table, sky_sampler, light, probes] = sky.0.entries(sky.1);
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("scene"),
         layout,
@@ -73,6 +73,7 @@ fn scene_group(
             table,
             sky_sampler,
             light,
+            probes,
             wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -171,7 +172,7 @@ impl State {
             scene.extend([texel, map.texel * 1.5, 0.0, 0.0]);
         }
         self.queue.write_buffer(&self.scene_uniform, 0, scene.bytes());
-        self.environment.update(&self.queue, &frame.sky, &frame.ambient);
+        self.environment.update(&self.queue, frame);
         // Each shadow pass sees the scene from the light.
         if let Some(sun) = sun {
             let device = self.device.clone();

@@ -209,6 +209,8 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
             night: 0.0,
             ..Sky::default()
         },
+        probe_volume: ProbeVolume::default(),
+        probes: Vec::new(),
         fog: Fog { radius: 30.0, density: 0.02, height: 10.0 },
         clouds: Clouds { cover: 0.0, drift: Drift { x: 0.0, z: 0.0 } },
         shadow: Shadow { view: IDENTITY, projection: IDENTITY, texel: 0.0, texels: 0 },

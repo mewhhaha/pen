@@ -1194,3 +1194,156 @@ fn the_sky_and_lights_light_a_glossy_floor() {
     let again = mirror(blue, 0);
     assert!(again > 0.0);
 }
+
+// Surfaces lit only by the sky's light all round (`ambient_light`), as their
+// material's color: a view of global illumination alone.
+const GALLERY: &str = r#"
+struct Scene { view: mat4x4f, projection: mat4x4f };
+struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f };
+@group(0) @binding(0) var<uniform> scene: Scene;
+@group(1) @binding(0) var<uniform> draw: Draw;
+${environment}
+struct Corner {
+  @builtin(position) position: vec4f,
+  @location(0) world: vec3f,
+  @location(1) normal: vec3f,
+};
+@vertex fn vertex(@location(0) position: vec3f, @location(1) normal: vec3f) -> Corner {
+  let world = draw.model * vec4f(position, 1.0);
+  return Corner(scene.projection * scene.view * world, world.xyz, normal);
+}
+@fragment fn fragment(corner: Corner) -> @location(0) vec4f {
+  let light = ambient_light(corner.world, normalize(corner.normal));
+  return vec4f(draw.color.rgb * light * 1.4, 1.0);
+}
+"#;
+
+/// A quad of corners `a`, `b`, `c`, `d` in order, wound to face `normal`.
+fn quad(corners: [[f32; 3]; 4], normal: [f32; 3]) -> String {
+    let edge = |p: [f32; 3], q: [f32; 3]| [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
+    let (e1, e2) = (edge(corners[0], corners[1]), edge(corners[0], corners[2]));
+    let cross = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+    let facing = cross[0] * normal[0] + cross[1] * normal[1] + cross[2] * normal[2] > 0.0;
+    let indices = if facing { "[0,1,2,1,3,2]" } else { "[0,2,1,1,2,3]" };
+    let positions: Vec<f32> = corners.iter().flatten().copied().collect();
+    let normals: Vec<f32> = (0..4).flat_map(|_| normal).collect();
+    format!(r#"{{"positions":{positions:?},"normals":{normals:?},"uvs":[0,0,1,0,0,1,1,1],"indices":{indices}}}"#)
+}
+
+// With PEN_PROBE_ROOM=gallery.json (ink's `INK_PROBE_DUMP`), draws a room open
+// to the front, its right wall red, lit by the sky alone: first by the flat
+// sky light, then through the baked probe volume, to target/look-shots.
+#[test]
+#[allow(clippy::cast_possible_truncation, reason = "JSON numbers to f32 and u32")]
+fn probe_room_shots() {
+    let Some(path) = std::env::var_os("PEN_PROBE_ROOM") else { return };
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let dump: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let floats =
+        |key: &str| -> Vec<f32> { dump[key].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect() };
+    let (values, sky_terms) = (floats("values"), floats("sky"));
+    let origin = floats("origin");
+    let counts: Vec<u32> = dump["counts"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let source = GALLERY.replace("${environment}", pen_render::ENVIRONMENT_WGSL);
+    let meshes = [
+        ("floor", quad([[-3.0, 0.0, -3.0], [3.0, 0.0, -3.0], [-3.0, 0.0, 4.0], [3.0, 0.0, 4.0]], [0.0, 1.0, 0.0])),
+        ("ceiling", quad([[-3.0, 3.5, -3.0], [3.0, 3.5, -3.0], [-3.0, 3.5, 4.0], [3.0, 3.5, 4.0]], [0.0, -1.0, 0.0])),
+        ("back", quad([[-3.0, 0.0, -3.0], [3.0, 0.0, -3.0], [-3.0, 3.5, -3.0], [3.0, 3.5, -3.0]], [0.0, 0.0, 1.0])),
+        ("left", quad([[-3.0, 0.0, -3.0], [-3.0, 0.0, 4.0], [-3.0, 3.5, -3.0], [-3.0, 3.5, 4.0]], [1.0, 0.0, 0.0])),
+        ("right", quad([[3.0, 0.0, -3.0], [3.0, 0.0, 4.0], [3.0, 3.5, -3.0], [3.0, 3.5, 4.0]], [-1.0, 0.0, 0.0])),
+    ];
+    let mut files: Vec<(String, Vec<u8>)> = vec![
+        (
+            "catalog.json".into(),
+            br#"{"meshes":["floor.mesh.json","ceiling.mesh.json","back.mesh.json","left.mesh.json","right.mesh.json"],"materials":["white.material.json","red.material.json"]}"#.to_vec(),
+        ),
+        ("gallery.wgsl".into(), source.into_bytes()),
+        ("white.material.json".into(), br#"{"shader":"gallery.wgsl","color":[0.75,0.75,0.72,1],"lighting":"unlit"}"#.to_vec()),
+        ("red.material.json".into(), br#"{"shader":"gallery.wgsl","color":[0.85,0.08,0.06,1],"lighting":"unlit"}"#.to_vec()),
+    ];
+    for (name, json) in &meshes {
+        files.push((format!("{name}.mesh.json"), json.clone().into_bytes()));
+    }
+    let borrowed: Vec<(&str, &[u8])> = files.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+    let root = assets("room", &borrowed);
+    let catalog = boundary::read_catalog(&root).unwrap();
+    let mut renderer = renderer(&device, &queue, root, FORMAT, Display::SDR);
+    let (width, height) = (640, 400);
+    let mut target = Target::new(&device, width, height, FORMAT);
+    let (view, projection) = camera([0.0, 2.4, 8.0], width as f32 / height as f32);
+    let draw = |mesh, material| Draw { mesh, material, transform: IDENTITY, parameters: None, extra: None };
+    let mut frame = frame(vec![draw(0, 0), draw(1, 0), draw(2, 0), draw(3, 0), draw(4, 1)]);
+    (frame.view, frame.projection) = (view, projection);
+    frame.light_color = Vector::default();
+    let vector = |a: &[f32]| Vector { x: a[0], y: a[1], z: a[2] };
+    frame.sky.sh0 = vector(&sky_terms[0..3]);
+    frame.sky.sh1 = vector(&sky_terms[3..6]);
+    frame.sky.sh2 = vector(&sky_terms[6..9]);
+    frame.sky.sh3 = vector(&sky_terms[9..12]);
+    frame.sky.sh4 = vector(&sky_terms[12..15]);
+    frame.sky.sh5 = vector(&sky_terms[15..18]);
+    frame.sky.sh6 = vector(&sky_terms[18..21]);
+    frame.sky.sh7 = vector(&sky_terms[21..24]);
+    frame.sky.sh8 = vector(&sky_terms[24..27]);
+    frame.sky.tint = Vector { x: 1.0, y: 1.0, z: 1.0 };
+    let mut shoot = |frame: &RenderFrame, name: &str| {
+        settle(&mut renderer, frame, &catalog, &mut target, 5);
+        let pixels = target.read(&device, &queue);
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            let at = ((y * width + x) * 4) as usize;
+            image::Rgba([pixels[at + 2], pixels[at + 1], pixels[at], 255])
+        });
+        image.save(shots().join(name)).unwrap();
+        pixels
+    };
+    let flat = shoot(&frame, "probe-room-sky-only.png");
+    let probes: Vec<Probe> = values
+        .chunks(28)
+        .map(|p| Probe {
+            sh0: vector(&p[0..3]),
+            sh1: vector(&p[3..6]),
+            sh2: vector(&p[6..9]),
+            sh3: vector(&p[9..12]),
+            sh4: vector(&p[12..15]),
+            sh5: vector(&p[15..18]),
+            sh6: vector(&p[18..21]),
+            sh7: vector(&p[21..24]),
+            sh8: vector(&p[24..27]),
+            valid: p[27],
+        })
+        .collect();
+    frame.probe_volume = ProbeVolume {
+        revision: 1,
+        nx: counts[0],
+        ny: counts[1],
+        nz: counts[2],
+        spacing: dump["spacing"].as_f64().unwrap() as f32,
+        origin: vector(&origin),
+    };
+    frame.probes = probes;
+    let lit = shoot(&frame, "probe-room-probes.png");
+    // The next frame sends no probes and keeps them: the picture is the same.
+    frame.probes = Vec::new();
+    let kept = shoot(&frame, "probe-room-probes-kept.png");
+    assert_eq!(lit, kept, "a frame that sends no probes uses the ones the host holds");
+    // The floor by the red wall (bottom right of the room) turns red; without
+    // probes it is as grey as the rest.
+    let at = |pixels: &[u8], x: u32, y: u32| {
+        let i = ((y * width + x) * 4) as usize;
+        [f32::from(pixels[i + 2]), f32::from(pixels[i + 1]), f32::from(pixels[i])]
+    };
+    let mut changed = 0;
+    for y in 0..height {
+        for x in 0..width {
+            let (a, b) = (at(&flat, x, y), at(&lit, x, y));
+            if (a[0] - b[0]).abs() + (a[1] - b[1]).abs() + (a[2] - b[2]).abs() > 12.0 {
+                changed += 1;
+            }
+        }
+    }
+    eprintln!("{changed} pixels differ with probes");
+    assert!(changed > 5000, "the probes should change the lighting of the room");
+}

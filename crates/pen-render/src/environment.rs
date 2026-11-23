@@ -7,7 +7,7 @@
 // the frame whose sky colors differ from the last one's, and not otherwise.
 // `ENVIRONMENT_WGSL` is what a material shader adds to read all of it, at
 // group 0 bindings 4 to 7 of every mesh pipeline.
-use pen_protocol::{Sky, Vector};
+use pen_protocol::{Probe, ProbeVolume, RenderFrame, Sky, Vector};
 
 use crate::pipeline_cache::PipelineCache;
 
@@ -32,7 +32,12 @@ const STRIDE: u64 = 256;
 const PASSES: u64 = 6 * LEVELS as u64;
 /// The uniform `ENVIRONMENT_WGSL` reads: nine coefficients, the tint and the
 /// reflection settings.
-pub(crate) const LIGHT_BYTES: u64 = 16 * 11;
+pub(crate) const LIGHT_BYTES: u64 = 16 * 13;
+/// Floats of one probe on the GPU: nine RGB terms and a validity weight.
+pub(crate) const PROBE_FLOATS: usize = 28;
+/// The most probes the volume buffer holds (`MAX_PROBES`, as one volume).
+const MAX_PROBES: usize = 16384;
+const PROBE_BYTES: u64 = (MAX_PROBES * PROBE_FLOATS * 4) as u64;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 pub(crate) struct Environment {
@@ -47,6 +52,10 @@ pub(crate) struct Environment {
     empty: wgpu::Buffer,
     /// The passes' uniforms, in slots with dynamic offsets.
     passes: wgpu::Buffer,
+    /// The resident probe volume: every probe's 28 floats, and which bake it
+    /// is (revision and counts).
+    probe_data: wgpu::Buffer,
+    resident: Option<(u32, [u32; 3])>,
     /// The sky colors the cube holds, or is to hold once encoded.
     drawn: Option<[u32; 9]>,
     stale: bool,
@@ -62,7 +71,7 @@ struct Pipelines {
 
 /// The scene group's bindings 4 to 7: the cube, the table, a filtering
 /// sampler and the light.
-pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
+pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 5] {
     let texture = |binding: u32, view_dimension: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -92,6 +101,16 @@ pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 4] {
             },
             count: None,
         },
+        wgpu::BindGroupLayoutEntry {
+            binding: 8,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(16),
+            },
+            count: None,
+        },
     ]
 }
 
@@ -105,9 +124,10 @@ fn buffer(device: &wgpu::Device, label: &str, size: u64, usage: wgpu::BufferUsag
 }
 
 /// The light uniform of a sky with these coefficients: nine colors, the tint
-/// (w: 1 when the cube is the sky to reflect), and the cube's last level.
-pub(crate) fn light_floats(sh: &[Vector; 9], tint: &Vector, reflecting: bool) -> [f32; 44] {
-    let mut floats = [0.0; 44];
+/// (w: 1 when the cube is the sky to reflect), the cube's last level, then the
+/// probe volume's origin and spacing and its counts (w: 1 when it is in use).
+pub(crate) fn light_floats(sh: &[Vector; 9], tint: &Vector, reflecting: bool) -> [f32; 52] {
+    let mut floats = [0.0; 52];
     for (slot, v) in sh.iter().enumerate() {
         floats[slot * 4..slot * 4 + 3].copy_from_slice(&[v.x, v.y, v.z]);
     }
@@ -117,7 +137,7 @@ pub(crate) fn light_floats(sh: &[Vector; 9], tint: &Vector, reflecting: bool) ->
 }
 
 /// A flat light, `ambient` from every direction, which reflects nothing.
-pub(crate) fn flat_floats(ambient: &Vector) -> [f32; 44] {
+pub(crate) fn flat_floats(ambient: &Vector) -> [f32; 52] {
     // Coefficient 0 of a constant is the constant over the first basis function.
     let scale = 1.0 / 0.282_094_8;
     let zero = Vector { x: 0.0, y: 0.0, z: 0.0 };
@@ -128,14 +148,16 @@ pub(crate) fn flat_floats(ambient: &Vector) -> [f32; 44] {
 
 /// The sky's coefficients and tint from the frame, or its flat `ambient`
 /// when the game sent none, so a game that knows nothing of them still has
-/// light.
-pub(crate) fn sky_floats(sky: &Sky, ambient: &Vector) -> [f32; 44] {
+/// light. `probes` says whether a probe volume is resident for the frame.
+pub(crate) fn sky_floats(sky: &Sky, ambient: &Vector, volume: &ProbeVolume, probes: bool) -> [f32; 52] {
     let sh = [sky.sh0, sky.sh1, sky.sh2, sky.sh3, sky.sh4, sky.sh5, sky.sh6, sky.sh7, sky.sh8];
     let sent = sh.iter().chain([&sky.tint]).any(|v| v.x != 0.0 || v.y != 0.0 || v.z != 0.0);
-    if !sent {
-        return flat_floats(ambient);
+    let mut floats = if sent { light_floats(&sh, &sky.tint, true) } else { flat_floats(ambient) };
+    if probes {
+        floats[44..48].copy_from_slice(&[volume.origin.x, volume.origin.y, volume.origin.z, volume.spacing]);
+        floats[48..52].copy_from_slice(&[volume.nx as f32, volume.ny as f32, volume.nz as f32, 1.0]);
     }
-    light_floats(&sh, &sky.tint, true)
+    floats
 }
 
 fn clear(view: &wgpu::TextureView) -> wgpu::RenderPassColorAttachment<'_> {
@@ -202,6 +224,8 @@ impl Environment {
             light: buffer(device, "sky light", LIGHT_BYTES, wgpu::BufferUsages::UNIFORM),
             empty: buffer(device, "no sky light", LIGHT_BYTES, wgpu::BufferUsages::UNIFORM),
             passes: buffer(device, "sky passes", STRIDE * PASSES, wgpu::BufferUsages::UNIFORM),
+            probe_data: buffer(device, "probes", PROBE_BYTES, wgpu::BufferUsages::STORAGE),
+            resident: None,
             drawn: None,
             stale: false,
             table_drawn: false,
@@ -210,12 +234,13 @@ impl Environment {
     }
 
     /// The bindings 4 to 7 of a scene group, with `light` as the sky's light.
-    pub fn entries<'a>(&'a self, light: &'a wgpu::Buffer) -> [wgpu::BindGroupEntry<'a>; 4] {
+    pub fn entries<'a>(&'a self, light: &'a wgpu::Buffer) -> [wgpu::BindGroupEntry<'a>; 5] {
         [
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.cube_view) },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.table_view) },
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             wgpu::BindGroupEntry { binding: 7, resource: light.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: self.probe_data.as_entire_binding() },
         ]
     }
 
@@ -230,8 +255,38 @@ impl Environment {
 
     /// Takes the frame's sky: writes its light, and notes whether the cube
     /// must be drawn again.
-    pub fn update(&mut self, queue: &wgpu::Queue, sky: &Sky, ambient: &Vector) {
-        queue.write_buffer(&self.light, 0, bytemuck::cast_slice(&sky_floats(sky, ambient)));
+    pub fn update(&mut self, queue: &wgpu::Queue, frame: &RenderFrame) {
+        let volume = &frame.probe_volume;
+        let using = self.set_probes(queue, volume, &frame.probes);
+        self.set_sky(queue, &frame.sky, &frame.ambient, volume, using);
+    }
+
+    /// Takes the frame's probes: those sent replace the resident ones; none
+    /// keeps them while the revision and counts are the same. Whether the
+    /// volume is in use this frame.
+    pub fn set_probes(&mut self, queue: &wgpu::Queue, volume: &ProbeVolume, probes: &[Probe]) -> bool {
+        let counts = [volume.nx, volume.ny, volume.nz];
+        let total = counts.iter().map(|&n| n as usize).product::<usize>();
+        let fits = total > 0 && total <= MAX_PROBES;
+        if fits && probes.len() == total {
+            let mut floats = Vec::with_capacity(total * PROBE_FLOATS);
+            for probe in probes {
+                for v in
+                    [probe.sh0, probe.sh1, probe.sh2, probe.sh3, probe.sh4, probe.sh5, probe.sh6, probe.sh7, probe.sh8]
+                {
+                    floats.extend([v.x, v.y, v.z]);
+                }
+                floats.push(probe.valid);
+            }
+            queue.write_buffer(&self.probe_data, 0, bytemuck::cast_slice(&floats));
+            self.resident = Some((volume.revision, counts));
+        }
+        fits && self.resident == Some((volume.revision, counts))
+    }
+
+    /// Writes the sky's light, and notes whether the cube must be drawn again.
+    pub fn set_sky(&mut self, queue: &wgpu::Queue, sky: &Sky, ambient: &Vector, volume: &ProbeVolume, probes: bool) {
+        queue.write_buffer(&self.light, 0, bytemuck::cast_slice(&sky_floats(sky, ambient, volume, probes)));
         let wanted = key(sky);
         if self.drawn != Some(wanted) {
             self.drawn = Some(wanted);
@@ -393,7 +448,7 @@ mod tests {
     fn a_game_that_sends_no_coefficients_gets_the_flat_ambient() {
         let sky = Sky::default();
         let ambient = Vector { x: 0.5, y: 0.5, z: 0.5 };
-        assert_eq!(sky_floats(&sky, &ambient), flat_floats(&ambient));
+        assert_eq!(sky_floats(&sky, &ambient, &ProbeVolume::default(), false), flat_floats(&ambient));
     }
 }
 
@@ -440,8 +495,21 @@ mod gpu {
     /// scene group's bindings 4 to 7 with `sky`'s light, and
     /// `ENVIRONMENT_WGSL`. The pixels' RGBA, row by row.
     fn probe(device: &wgpu::Device, queue: &wgpu::Queue, sky: &Sky, ambient: &Vector, body: &str) -> Vec<[f32; 4]> {
+        probe_with(device, queue, sky, ambient, (&ProbeVolume::default(), &[]), body)
+    }
+
+    /// `probe` with a probe volume and its probes uploaded.
+    fn probe_with(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sky: &Sky,
+        ambient: &Vector,
+        probes: (&ProbeVolume, &[Probe]),
+        body: &str,
+    ) -> Vec<[f32; 4]> {
         let mut environment = Environment::new(device, PipelineCache::open(device, None));
-        environment.update(queue, sky, ambient);
+        let using = environment.set_probes(queue, probes.0, probes.1);
+        environment.set_sky(queue, sky, ambient, probes.0, using);
         let mut encoder = device.create_command_encoder(&Default::default());
         environment.encode(device, &mut encoder);
         let source = format!(
@@ -787,5 +855,241 @@ fn direction_at(pixel: vec2f) -> vec3f {{
             assert!((texel[0] - 0.2).abs() < 1e-4 && (texel[1] - 0.3).abs() < 1e-4 && (texel[2] - 0.4).abs() < 1e-4);
             assert_eq!(texel[3], 0.0);
         }
+    }
+
+    const VOLUME: ([f32; 3], f32, [u32; 3]) = ([-1.0, 0.5, 2.0], 1.5, [4, 3, 3]);
+
+    fn volume() -> ProbeVolume {
+        let (origin, spacing, counts) = VOLUME;
+        ProbeVolume {
+            revision: 3,
+            nx: counts[0],
+            ny: counts[1],
+            nz: counts[2],
+            spacing,
+            origin: vector(origin[0], origin[1], origin[2]),
+        }
+    }
+
+    /// 36 probes of deterministic made-up light; every seventh is invalid.
+    fn made_probes() -> Vec<Probe> {
+        let mut seed = 7u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1u32 << 24) as f32
+        };
+        (0..36)
+            .map(|index| {
+                let mut term = |scale: f32| vector(next() * scale, next() * scale, next() * scale);
+                Probe {
+                    sh0: term(1.0),
+                    sh1: term(0.3),
+                    sh2: term(0.3),
+                    sh3: term(0.3),
+                    sh4: term(0.1),
+                    sh5: term(0.1),
+                    sh6: term(0.1),
+                    sh7: term(0.1),
+                    sh8: term(0.1),
+                    valid: if index % 7 == 3 { 0.0 } else { 1.0 },
+                }
+            })
+            .collect()
+    }
+
+    fn eval(probe: &Probe, n: &[f64; 3]) -> [f64; 3] {
+        let (x, y, z) = (n[0], n[1], n[2]);
+        let basis = [
+            0.282_094_791_8,
+            0.488_602_511_9 * y,
+            0.488_602_511_9 * z,
+            0.488_602_511_9 * x,
+            1.092_548_430_6 * x * y,
+            1.092_548_430_6 * y * z,
+            0.315_391_565_3 * (3.0 * z * z - 1.0),
+            1.092_548_430_6 * x * z,
+            0.546_274_215_3 * (x * x - y * y),
+        ];
+        let terms = [probe.sh0, probe.sh1, probe.sh2, probe.sh3, probe.sh4, probe.sh5, probe.sh6, probe.sh7, probe.sh8];
+        std::array::from_fn(|c| {
+            terms.iter().zip(basis).map(|(t, b)| f64::from([t.x, t.y, t.z][c]) * b).sum::<f64>().max(0.0)
+        })
+    }
+
+    /// The probe volume's light and confidence at `world` facing `n`, in f64:
+    /// the CPU interpolation `ink/probes.sample` does (bias a quarter spacing).
+    fn interpolate(probes: &[Probe], world: [f64; 3], n: [f64; 3]) -> [f64; 4] {
+        let (origin, spacing, counts) = VOLUME;
+        let (spacing, origin) = (f64::from(spacing), origin.map(f64::from));
+        let g: [f64; 3] = std::array::from_fn(|a| (world[a] + n[a] * 0.25 * spacing - origin[a]) / spacing);
+        let last: [f64; 3] = std::array::from_fn(|a| f64::from(counts[a]) - 1.0);
+        let edge = (0..3).map(|a| g[a].min(last[a] - g[a])).fold(f64::INFINITY, f64::min);
+        let reach = (edge + 1.0).clamp(0.0, 1.0);
+        if reach <= 0.0 {
+            return [0.0; 4];
+        }
+        let c: [f64; 3] = std::array::from_fn(|a| g[a].clamp(0.0, last[a]));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped into the lattice")]
+        let low: [usize; 3] =
+            std::array::from_fn(|a| (c[a].floor() as usize).min((last[a] - 1.0).max(0.0) as usize));
+        let (mut sum, mut weight, mut share, mut total) = ([0.0; 3], 0.0, 0.0, 0.0);
+        for corner in 0..8usize {
+            let d = [corner & 1, (corner >> 1) & 1, (corner >> 2) & 1];
+            let tri: f64 = (0..3)
+                .map(|a| {
+                    let f = c[a] - low[a] as f64;
+                    if d[a] == 1 { f } else { 1.0 - f }
+                })
+                .product();
+            if tri <= 0.0 {
+                continue;
+            }
+            let at: [usize; 3] = std::array::from_fn(|a| (low[a] + d[a]).min(counts[a] as usize - 1));
+            let index = (at[2] * counts[1] as usize + at[1]) * counts[0] as usize + at[0];
+            let probe = &probes[index];
+            total += tri;
+            share += tri * f64::from(probe.valid);
+            if probe.valid > 0.0 {
+                let toward: [f64; 3] = std::array::from_fn(|a| origin[a] + at[a] as f64 * spacing - world[a]);
+                let gap = toward.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let facing =
+                    if gap < 1e-4 { 1.0 } else { 0.5 + 0.5 * (0..3).map(|a| toward[a] * n[a]).sum::<f64>() / gap };
+                let w = tri * f64::from(probe.valid) * (facing * facing).max(0.02);
+                let light = eval(probe, &n);
+                for ch in 0..3 {
+                    sum[ch] += w * light[ch];
+                }
+                weight += w;
+            }
+        }
+        if weight <= 1e-6 || total <= 0.0 {
+            return [0.0; 4];
+        }
+        [sum[0] / weight, sum[1] / weight, sum[2] / weight, reach * reach * (3.0 - 2.0 * reach) * share / total]
+    }
+
+    #[test]
+    fn the_shader_samples_the_probe_volume_as_the_cpu_interpolation_does() {
+        let Some((device, queue)) = device() else { return };
+        let probes = made_probes();
+        let volume = volume();
+        let sky = sky(colors(), [vector(0.0, 0.0, 0.0); 9], vector(1.0, 1.0, 1.0));
+        // Pixels spread over, round and beyond the lattice (x -2 to 5, y -0.5 to 4.5, z 1 to 6).
+        let picture = probe_with(
+            &device,
+            &queue,
+            &sky,
+            &Vector::default(),
+            (&volume, &probes),
+            "let world = vec3f(position.x / 16.0 * 7.0 - 2.0, position.y / 16.0 * 5.0 - 0.5,
+    f32((u32(position.x) * 7u + u32(position.y) * 3u) % 16u) / 16.0 * 5.0 + 1.0);
+  return probe_ambient(world, direction);",
+        );
+        let mut inside = 0;
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let world = [
+                    (f64::from(x) + 0.5) / 16.0 * 7.0 - 2.0,
+                    (f64::from(y) + 0.5) / 16.0 * 5.0 - 0.5,
+                    f64::from((x * 7 + y * 3) % 16) / 16.0 * 5.0 + 1.0,
+                ];
+                let want = interpolate(&probes, world, direction_at(x, y));
+                let got = picture[(y * SIDE + x) as usize];
+                inside += usize::from(want[3] > 0.5);
+                for c in 0..4 {
+                    assert!(
+                        (f64::from(got[c]) - want[c]).abs() < 2e-4,
+                        "pixel ({x}, {y}) channel {c}: {} vs {}",
+                        got[c],
+                        want[c]
+                    );
+                }
+            }
+        }
+        assert!(inside > 40, "the pixels should mostly land in the volume: {inside}");
+    }
+
+    #[test]
+    fn a_probe_is_sampled_exactly_at_its_centre_and_an_invalid_one_gives_nothing() {
+        let Some((device, queue)) = device() else { return };
+        let probes = made_probes();
+        let volume = volume();
+        let sky = sky(colors(), [vector(0.0, 0.0, 0.0); 9], vector(1.0, 1.0, 1.0));
+        // Pixel (x, y) is probe (x + 16 y) % 36 at its centre; the lookup is lifted
+        // by the bias, so ask where the lifted point lands on the probe.
+        let picture = probe_with(
+            &device,
+            &queue,
+            &sky,
+            &Vector::default(),
+            (&volume, &probes),
+            "let index = (u32(position.x) + 16u * u32(position.y)) % 36u;
+  let at = vec3u(index % 4u, (index / 4u) % 3u, index / 12u);
+  let world = sky_light.probe_origin.xyz + vec3f(at) * sky_light.probe_origin.w - direction * (0.25 * sky_light.probe_origin.w);
+  return probe_ambient(world, direction);",
+        );
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                let index = ((x + 16 * y) % 36) as usize;
+                let probe = &probes[index];
+                let got = picture[(y * SIDE + x) as usize];
+                let n = direction_at(x, y);
+                if probe.valid == 0.0 {
+                    // Its neighbours may still weigh in a little (the lift moved off its centre).
+                    continue;
+                }
+                // The lifted point is off the centre by a quarter cell, so this is the
+                // interpolation's own answer, close to but not exactly the probe's.
+                let reference = interpolate(
+                    &probes,
+                    {
+                        let (origin, spacing, _) = VOLUME;
+                        let at = [index % 4, (index / 4) % 3, index / 12];
+                        std::array::from_fn(|a| {
+                            f64::from(origin[a]) + at[a] as f64 * f64::from(spacing) - n[a] * 0.25 * f64::from(spacing)
+                        })
+                    },
+                    n,
+                );
+                for c in 0..3 {
+                    assert!((f64::from(got[c]) - reference[c]).abs() < 2e-4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cpu_interpolation_is_exact_at_probe_centres() {
+        let probes = made_probes();
+        for (index, probe) in probes.iter().enumerate() {
+            let (origin, spacing, _) = VOLUME;
+            let at = [index % 4, (index / 4) % 3, index / 12];
+            let world: [f64; 3] = std::array::from_fn(|a| f64::from(origin[a]) + at[a] as f64 * f64::from(spacing));
+            // With no lift the sample sits on the probe; the lift is part of the lookup, so
+            // undo it to land on the centre.
+            let n = [0.0, 1.0, 0.0];
+            let lifted_back: [f64; 3] = std::array::from_fn(|a| world[a] - n[a] * 0.25 * f64::from(spacing));
+            let got = interpolate(&probes, lifted_back, n);
+            if probe.valid == 0.0 {
+                assert!(got[3] < 1.0);
+            } else {
+                // Only the centre probe has trilinear weight: its own light, in full.
+                let want = eval(probe, &n);
+                for c in 0..3 {
+                    assert!((got[c] - want[c]).abs() < 1e-5, "probe {index}");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod template {
+    #[test]
+    fn the_new_game_template_carries_the_current_environment_block() {
+        let template = include_str!("../../pen/templates/new/src/assets/lit.wgsl");
+        let begin = template.find("// BEGIN environment\n").expect("a begin marker") + "// BEGIN environment\n".len();
+        let end = template.find("// END environment").expect("an end marker");
+        assert_eq!(&template[begin..end], super::ENVIRONMENT_WGSL, "copy shaders/environment.wgsl into lit.wgsl");
     }
 }

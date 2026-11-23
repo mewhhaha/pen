@@ -94,7 +94,7 @@ mod tests {
     fn packet_contract_layout() {
         let model = model::build(schema()).unwrap();
         assert_eq!(model.magic, 0x474446);
-        assert_eq!(model.header_lanes, 181);
+        assert_eq!(model.header_lanes, 190);
         assert_eq!(model.event_lanes(), 5);
         assert_eq!(model.section("draws").fixed.as_ref().unwrap().lanes, 24);
         assert_eq!(model.section("insets").fixed.as_ref().unwrap().lanes, 48);
@@ -185,7 +185,8 @@ mod tests {
         assert!(rust.contains("pub sky: Option<Sky>,"));
         assert!(rust.contains("        match &frame.sky {\n            Some(sky) => {\n"));
         assert!(rust.contains("                    1.0, sky.zenith.x,"));
-        assert!(rust.contains("            None => out.push(0.0),\n        }\n        out.extend([frame.fog.radius,"));
+        assert!(rust.contains("            None => out.push(0.0),\n        }\n        out.extend(["));
+        assert!(rust.contains("frame.probe_volume.revision as f32"));
         assert!(rust.contains(" sky.environment as f32,\n"));
         let sources = blot::emit(&model, HEADER);
         let canonical = &sources.iter().find(|(name, _)| *name == "protocol_canonical.blot").unwrap().1;

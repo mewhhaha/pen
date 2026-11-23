@@ -282,10 +282,14 @@ ground colors differ from the last frame's bits. The split-sum BRDF table (32 x
 bindings 4 to 7 (`ENVIRONMENT_WGSL`, materials.md); shadow passes bind a zeroed
 light and insets a flat one from their own ambient color, with no reflection.
 `ambient_light(world, normal)` is the only place a material asks for diffuse sky
-light: a per-position source, such as an interpolated irradiance probe grid
-bound beside the cube and read at `world`, takes over inside it. Screen-space
-occlusion still darkens the whole picture after the scene, so sky light and
-reflections are occluded with the rest.
+light. Where the frame has a probe volume (the game's baked grid of SH light
+probes, `probe_volume` and the `probes` section) it interpolates the grid and
+blends toward the sky's light past its edge (materials.md); the resident
+probes live in one storage buffer (`MAX_PROBES` probes, bound at 8), uploaded
+only when a frame sends them, and are used while the frame's revision and
+counts match what the buffer holds. Screen-space occlusion still darkens the
+whole picture after the scene, so sky light and reflections are occluded with
+the rest.
 
 ### The render graph
 

@@ -37,8 +37,8 @@ use pen_protocol::boundary::{
 };
 use pen_protocol::{
     Aberration, Bus, Catalog, Clouds, Color, Decal, Draw, Drift, Emitter, FieldPatch, Fog, Frame, GameEvent, Inset,
-    Instance, InstanceRemoval, Light, Listener, Panner, Pose, Quality, RenderFrame, ServiceRequest, Shadow, Sky, Solid,
-    SolidFace, Sound, Sprite, UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
+    Instance, InstanceRemoval, Light, Listener, Panner, Pose, Probe, ProbeVolume, Quality, RenderFrame, ServiceRequest,
+    Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
 };
 
 const HARNESS: &str = include_str!("codec_round_trip.blot");
@@ -625,6 +625,14 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             sh7: rng.vector(),
             sh8: rng.vector(),
         },
+        probe_volume: ProbeVolume {
+            revision: rng.whole(16_777_215),
+            nx: rng.whole(64),
+            ny: rng.whole(64),
+            nz: rng.whole(64),
+            spacing: rng.number(),
+            origin: rng.vector(),
+        },
         fog: Fog { radius: rng.number(), density: rng.number(), height: rng.number() },
         shadow: Shadow { view: rng.lanes(), projection: rng.lanes(), texel: rng.number(), texels: rng.whole(8192) },
         blur: rng.number(),
@@ -788,6 +796,21 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             fade_in: rng.number(),
             fade_out: rng.number(),
         }),
+        probes: {
+            let count = rng.count(4);
+            rng.list(count, |rng| Probe {
+                sh0: rng.vector(),
+                sh1: rng.vector(),
+                sh2: rng.vector(),
+                sh3: rng.vector(),
+                sh4: rng.vector(),
+                sh5: rng.vector(),
+                sh6: rng.vector(),
+                sh7: rng.vector(),
+                sh8: rng.vector(),
+                valid: rng.number(),
+            })
+        },
         lights: {
             let count = rng.count(8);
             rng.list(count, |rng| Light {

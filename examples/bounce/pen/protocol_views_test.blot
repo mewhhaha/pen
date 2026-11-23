@@ -102,6 +102,9 @@ func project_emitter (context: Context) -> (at: U32) =>
 func project_light (context: Context) -> (at: U32) =>
   let packet: #[F32] = context.packet
   return $types.Light { position: $types.Vector { x: packet[at + 0 + 0], y: packet[at + 0 + 1], z: packet[at + 0 + 2] }, radius: packet[at + 3], color: $types.Vector { x: packet[at + 4 + 0], y: packet[at + 4 + 1], z: packet[at + 4 + 2] }, direction: $types.Vector { x: packet[at + 7 + 0], y: packet[at + 7 + 1], z: packet[at + 7 + 2] }, inner: packet[at + 10], outer: packet[at + 11] }
+func project_probe (context: Context) -> (at: U32) =>
+  let packet: #[F32] = context.packet
+  return $types.Probe { sh0: $types.Vector { x: packet[at + 0 + 0], y: packet[at + 0 + 1], z: packet[at + 0 + 2] }, sh1: $types.Vector { x: packet[at + 3 + 0], y: packet[at + 3 + 1], z: packet[at + 3 + 2] }, sh2: $types.Vector { x: packet[at + 6 + 0], y: packet[at + 6 + 1], z: packet[at + 6 + 2] }, sh3: $types.Vector { x: packet[at + 9 + 0], y: packet[at + 9 + 1], z: packet[at + 9 + 2] }, sh4: $types.Vector { x: packet[at + 12 + 0], y: packet[at + 12 + 1], z: packet[at + 12 + 2] }, sh5: $types.Vector { x: packet[at + 15 + 0], y: packet[at + 15 + 1], z: packet[at + 15 + 2] }, sh6: $types.Vector { x: packet[at + 18 + 0], y: packet[at + 18 + 1], z: packet[at + 18 + 2] }, sh7: $types.Vector { x: packet[at + 21 + 0], y: packet[at + 21 + 1], z: packet[at + 21 + 2] }, sh8: $types.Vector { x: packet[at + 24 + 0], y: packet[at + 24 + 1], z: packet[at + 24 + 2] }, valid: packet[at + 27] }
 func project_listener (context: Context) -> (at: U32) =>
   let packet: #[F32] = context.packet
   return $types.Listener { position: $types.Vector { x: packet[at + 0 + 0], y: packet[at + 0 + 1], z: packet[at + 0 + 2] }, forward: $types.Vector { x: packet[at + 3 + 0], y: packet[at + 3 + 1], z: packet[at + 3 + 2] }, up: $types.Vector { x: packet[at + 6 + 0], y: packet[at + 6 + 1], z: packet[at + 6 + 2] } }
@@ -112,7 +115,7 @@ func project_instance_removal (context: Context) -> (at: U32) =>
   let packet: #[F32] = context.packet
   return $types.InstanceRemoval { id_low: F32.to_u32 packet[at + 0], id_high: F32.to_u32 packet[at + 1] }
 func reencode_views (packet: #[F32]) -> (destination: own #[~F32]) =>
-  let state_start: U32 = 181
+  let state_start: U32 = 190
   let state_count: U32 = F32.to_u32 packet[2]
   let draws_start: U32 = state_start + state_count
   let draws_count: U32 = F32.to_u32 packet[3]
@@ -131,32 +134,34 @@ func reencode_views (packet: #[F32]) -> (destination: own #[~F32]) =>
   let preferences_start: U32 = inset_draws_start + inset_draws_count * 24
   let preferences_count: U32 = F32.to_u32 packet[11]
   let fields_start: U32 = preferences_start + preferences_count
-  let fields_count: U32 = F32.to_u32 packet[160]
-  let ui_start: U32 = fields_start + F32.to_u32 packet[161]
-  let ui_count: U32 = F32.to_u32 packet[162]
-  let services_start: U32 = ui_start + F32.to_u32 packet[163]
-  let services_count: U32 = F32.to_u32 packet[164]
-  let buses_start: U32 = services_start + F32.to_u32 packet[165]
-  let buses_count: U32 = F32.to_u32 packet[166]
+  let fields_count: U32 = F32.to_u32 packet[168]
+  let ui_start: U32 = fields_start + F32.to_u32 packet[169]
+  let ui_count: U32 = F32.to_u32 packet[170]
+  let services_start: U32 = ui_start + F32.to_u32 packet[171]
+  let services_count: U32 = F32.to_u32 packet[172]
+  let buses_start: U32 = services_start + F32.to_u32 packet[173]
+  let buses_count: U32 = F32.to_u32 packet[174]
   let voices_start: U32 = buses_start + buses_count * 3
-  let voices_count: U32 = F32.to_u32 packet[167]
+  let voices_count: U32 = F32.to_u32 packet[175]
   let poses_start: U32 = voices_start + voices_count * 12
-  let poses_count: U32 = F32.to_u32 packet[168]
+  let poses_count: U32 = F32.to_u32 packet[176]
   let emitters_start: U32 = poses_start + poses_count * 4
-  let emitters_count: U32 = F32.to_u32 packet[169]
+  let emitters_count: U32 = F32.to_u32 packet[177]
   let lights_start: U32 = emitters_start + emitters_count * 42
-  let lights_count: U32 = F32.to_u32 packet[171]
-  let listener_start: U32 = lights_start + lights_count * 12
-  let listener_count: U32 = F32.to_u32 packet[172]
+  let lights_count: U32 = F32.to_u32 packet[179]
+  let probes_start: U32 = lights_start + lights_count * 12
+  let probes_count: U32 = F32.to_u32 packet[180]
+  let listener_start: U32 = probes_start + probes_count * 28
+  let listener_count: U32 = F32.to_u32 packet[181]
   let panners_start: U32 = listener_start + listener_count * 9
-  let panners_count: U32 = F32.to_u32 packet[173]
+  let panners_count: U32 = F32.to_u32 packet[182]
   let instances_start: U32 = panners_start + panners_count * 15
-  let instances_count: U32 = F32.to_u32 packet[179]
+  let instances_count: U32 = F32.to_u32 packet[188]
   let instance_removals_start: U32 = instances_start + instances_count * 26
-  let instance_removals_count: U32 = F32.to_u32 packet[180]
+  let instance_removals_count: U32 = F32.to_u32 packet[189]
   let extras_start: U32 = instance_removals_start + instance_removals_count * 2
   let context: Context = {packet, draws_start, draws_count, inset_draws_start, inset_draws_count, insets_start, insets_count, extras_start}
-  let header: types.RenderHeader = { schema: F32.to_u32 packet[1], save_requested: packet[12] == 1.0, load_requested: packet[13] == 1.0, scene_save_requested: packet[14] == 1.0, scene_load_requested: packet[15] == 1.0, checkpoint_requested: packet[16] == 1.0, undo_requested: packet[17] == 1.0, redo_requested: packet[18] == 1.0, exit_requested: packet[19] == 1.0, view: $types.Mat4 { x: vec4_at packet (20 + 0), y: vec4_at packet (20 + 4), z: vec4_at packet (20 + 8), w: vec4_at packet (20 + 12) }, projection: $types.Mat4 { x: vec4_at packet (36 + 0), y: vec4_at packet (36 + 4), z: vec4_at packet (36 + 8), w: vec4_at packet (36 + 12) }, clear: $types.Color { r: packet[52 + 0], g: packet[52 + 1], b: packet[52 + 2], a: packet[52 + 3] }, ambient: $types.Vector { x: packet[56 + 0], y: packet[56 + 1], z: packet[56 + 2] }, light_direction: $types.Vector { x: packet[59 + 0], y: packet[59 + 1], z: packet[59 + 2] }, light_color: $types.Vector { x: packet[62 + 0], y: packet[62 + 1], z: packet[62 + 2] }, aberration: $types.Aberration { x: packet[65 + 0], y: packet[65 + 1] }, quality: $types.Quality { msaa: F32.to_u32 packet[67], fxaa: packet[68] == 1.0, scale: packet[69], filtering: F32.to_u32 packet[70], occlusion: packet[71] == 1.0, sky: packet[72] == 1.0, effects: packet[73] == 1.0, bloom: packet[155] == 1.0, taa: packet[170] == 1.0 }, sky: $types.Sky { zenith: $types.Vector { x: packet[74 + 0], y: packet[74 + 1], z: packet[74 + 2] }, horizon: $types.Vector { x: packet[77 + 0], y: packet[77 + 1], z: packet[77 + 2] }, ground: $types.Vector { x: packet[80 + 0], y: packet[80 + 1], z: packet[80 + 2] }, sun: $types.Vector { x: packet[83 + 0], y: packet[83 + 1], z: packet[83 + 2] }, night: packet[86], tint: $types.Vector { x: packet[87 + 0], y: packet[87 + 1], z: packet[87 + 2] }, sh0: $types.Vector { x: packet[90 + 0], y: packet[90 + 1], z: packet[90 + 2] }, sh1: $types.Vector { x: packet[93 + 0], y: packet[93 + 1], z: packet[93 + 2] }, sh2: $types.Vector { x: packet[96 + 0], y: packet[96 + 1], z: packet[96 + 2] }, sh3: $types.Vector { x: packet[99 + 0], y: packet[99 + 1], z: packet[99 + 2] }, sh4: $types.Vector { x: packet[102 + 0], y: packet[102 + 1], z: packet[102 + 2] }, sh5: $types.Vector { x: packet[105 + 0], y: packet[105 + 1], z: packet[105 + 2] }, sh6: $types.Vector { x: packet[108 + 0], y: packet[108 + 1], z: packet[108 + 2] }, sh7: $types.Vector { x: packet[111 + 0], y: packet[111 + 1], z: packet[111 + 2] }, sh8: $types.Vector { x: packet[114 + 0], y: packet[114 + 1], z: packet[114 + 2] } }, fog: $types.Fog { radius: packet[117], density: packet[118], height: packet[119] }, shadow: $types.Shadow { view: $types.Mat4 { x: vec4_at packet (120 + 0), y: vec4_at packet (120 + 4), z: vec4_at packet (120 + 8), w: vec4_at packet (120 + 12) }, projection: $types.Mat4 { x: vec4_at packet (136 + 0), y: vec4_at packet (136 + 4), z: vec4_at packet (136 + 8), w: vec4_at packet (136 + 12) }, texel: packet[152], texels: F32.to_u32 packet[153] }, blur: packet[154], clouds: $types.Clouds { cover: packet[156], drift: $types.Drift { x: packet[157 + 0], z: packet[157 + 1] } }, hide_cursor: packet[159] == 1.0, loading: packet[174] == 1.0, show_captions: packet[175] == 1.0, retained_enabled: packet[176] == 1.0, retained_reset: packet[177] == 1.0, retained_after: F32.to_u32 packet[178] }
+  let header: types.RenderHeader = { schema: F32.to_u32 packet[1], save_requested: packet[12] == 1.0, load_requested: packet[13] == 1.0, scene_save_requested: packet[14] == 1.0, scene_load_requested: packet[15] == 1.0, checkpoint_requested: packet[16] == 1.0, undo_requested: packet[17] == 1.0, redo_requested: packet[18] == 1.0, exit_requested: packet[19] == 1.0, view: $types.Mat4 { x: vec4_at packet (20 + 0), y: vec4_at packet (20 + 4), z: vec4_at packet (20 + 8), w: vec4_at packet (20 + 12) }, projection: $types.Mat4 { x: vec4_at packet (36 + 0), y: vec4_at packet (36 + 4), z: vec4_at packet (36 + 8), w: vec4_at packet (36 + 12) }, clear: $types.Color { r: packet[52 + 0], g: packet[52 + 1], b: packet[52 + 2], a: packet[52 + 3] }, ambient: $types.Vector { x: packet[56 + 0], y: packet[56 + 1], z: packet[56 + 2] }, light_direction: $types.Vector { x: packet[59 + 0], y: packet[59 + 1], z: packet[59 + 2] }, light_color: $types.Vector { x: packet[62 + 0], y: packet[62 + 1], z: packet[62 + 2] }, aberration: $types.Aberration { x: packet[65 + 0], y: packet[65 + 1] }, quality: $types.Quality { msaa: F32.to_u32 packet[67], fxaa: packet[68] == 1.0, scale: packet[69], filtering: F32.to_u32 packet[70], occlusion: packet[71] == 1.0, sky: packet[72] == 1.0, effects: packet[73] == 1.0, bloom: packet[163] == 1.0, taa: packet[178] == 1.0 }, sky: $types.Sky { zenith: $types.Vector { x: packet[74 + 0], y: packet[74 + 1], z: packet[74 + 2] }, horizon: $types.Vector { x: packet[77 + 0], y: packet[77 + 1], z: packet[77 + 2] }, ground: $types.Vector { x: packet[80 + 0], y: packet[80 + 1], z: packet[80 + 2] }, sun: $types.Vector { x: packet[83 + 0], y: packet[83 + 1], z: packet[83 + 2] }, night: packet[86], tint: $types.Vector { x: packet[87 + 0], y: packet[87 + 1], z: packet[87 + 2] }, sh0: $types.Vector { x: packet[90 + 0], y: packet[90 + 1], z: packet[90 + 2] }, sh1: $types.Vector { x: packet[93 + 0], y: packet[93 + 1], z: packet[93 + 2] }, sh2: $types.Vector { x: packet[96 + 0], y: packet[96 + 1], z: packet[96 + 2] }, sh3: $types.Vector { x: packet[99 + 0], y: packet[99 + 1], z: packet[99 + 2] }, sh4: $types.Vector { x: packet[102 + 0], y: packet[102 + 1], z: packet[102 + 2] }, sh5: $types.Vector { x: packet[105 + 0], y: packet[105 + 1], z: packet[105 + 2] }, sh6: $types.Vector { x: packet[108 + 0], y: packet[108 + 1], z: packet[108 + 2] }, sh7: $types.Vector { x: packet[111 + 0], y: packet[111 + 1], z: packet[111 + 2] }, sh8: $types.Vector { x: packet[114 + 0], y: packet[114 + 1], z: packet[114 + 2] } }, probe_volume: $types.ProbeVolume { revision: F32.to_u32 packet[117], nx: F32.to_u32 packet[118], ny: F32.to_u32 packet[119], nz: F32.to_u32 packet[120], spacing: packet[121], origin: $types.Vector { x: packet[122 + 0], y: packet[122 + 1], z: packet[122 + 2] } }, fog: $types.Fog { radius: packet[125], density: packet[126], height: packet[127] }, shadow: $types.Shadow { view: $types.Mat4 { x: vec4_at packet (128 + 0), y: vec4_at packet (128 + 4), z: vec4_at packet (128 + 8), w: vec4_at packet (128 + 12) }, projection: $types.Mat4 { x: vec4_at packet (144 + 0), y: vec4_at packet (144 + 4), z: vec4_at packet (144 + 8), w: vec4_at packet (144 + 12) }, texel: packet[160], texels: F32.to_u32 packet[161] }, blur: packet[162], clouds: $types.Clouds { cover: packet[164], drift: $types.Drift { x: packet[165 + 0], z: packet[165 + 1] } }, hide_cursor: packet[167] == 1.0, loading: packet[183] == 1.0, show_captions: packet[184] == 1.0, retained_enabled: packet[185] == 1.0, retained_reset: packet[186] == 1.0, retained_after: F32.to_u32 packet[187] }
   let state = packet.view state_start (state_start + state_count)
   let draws = array.generate draws_count (func i => draws_start + i * 24)
   let solids: #[+U32] = #[]
@@ -189,10 +194,11 @@ func reencode_views (packet: #[F32]) -> (destination: own #[~F32]) =>
   let poses = array.generate poses_count (func i => poses_start + i * 4)
   let emitters = array.generate emitters_count (func i => emitters_start + i * 42)
   let lights = array.generate lights_count (func i => lights_start + i * 12)
+  let probes = array.generate probes_count (func i => probes_start + i * 28)
   let listener = array.generate listener_count (func i => listener_start + i * 9)
   let panners = array.generate panners_count (func i => panners_start + i * 15)
   let instances = array.generate instances_count (func i => instances_start + i * 26)
   let instance_removals = array.generate instance_removals_count (func i => instance_removals_start + i * 2)
-  let collections = { state, draws, solids, decals, sounds, sprites, insets, preferences, fields, ui, services, buses, voices, poses, emitters, lights, listener, panners, instances, instance_removals }
-  let project = { draw_metadata, draw_transform, draw_parameters, extra_count, append_extra, inset_draws, sprite_rect, sprite_color, sprite_parameters, instance_metadata, instance_transform, instance_parameters, solid: project_solid, decal: project_decal, sound: project_sound, inset: project_inset, inset_draw: project_inset_draw, field: project_field, ui: project_ui, service: project_service, buse: project_buse, voice: project_voice, pose: project_pose, emitter: project_emitter, light: project_light, listener: project_listener, panner: project_panner, instance_removal: project_instance_removal }
+  let collections = { state, draws, solids, decals, sounds, sprites, insets, preferences, fields, ui, services, buses, voices, poses, emitters, lights, probes, listener, panners, instances, instance_removals }
+  let project = { draw_metadata, draw_transform, draw_parameters, extra_count, append_extra, inset_draws, sprite_rect, sprite_color, sprite_parameters, instance_metadata, instance_transform, instance_parameters, solid: project_solid, decal: project_decal, sound: project_sound, inset: project_inset, inset_draw: project_inset_draw, field: project_field, ui: project_ui, service: project_service, buse: project_buse, voice: project_voice, pose: project_pose, emitter: project_emitter, light: project_light, probe: project_probe, listener: project_listener, panner: project_panner, instance_removal: project_instance_removal }
   return renderer.encode_render_views header collections project context destination

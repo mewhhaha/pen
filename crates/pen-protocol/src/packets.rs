@@ -1185,6 +1185,41 @@ pub mod types {
         /// point light, which shines all round.
         pub outer: f32,
     }
+    /// A diffuse light probe: nine spherical-harmonic RGB terms of the light there, and whether
+    /// it is valid.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Probe {
+        /// Term 0 (constant) of the light a white surface facing each way shows here: cosine
+        /// lobe applied, divided by pi.
+        pub sh0: Vector,
+        /// Term 1 (y) of the light a white surface facing each way shows here: cosine lobe
+        /// applied, divided by pi.
+        pub sh1: Vector,
+        /// Term 2 (z) of the light a white surface facing each way shows here: cosine lobe
+        /// applied, divided by pi.
+        pub sh2: Vector,
+        /// Term 3 (x) of the light a white surface facing each way shows here: cosine lobe
+        /// applied, divided by pi.
+        pub sh3: Vector,
+        /// Term 4 (xy) of the light a white surface facing each way shows here: cosine lobe
+        /// applied, divided by pi.
+        pub sh4: Vector,
+        /// Term 5 (yz) of the light a white surface facing each way shows here: cosine lobe
+        /// applied, divided by pi.
+        pub sh5: Vector,
+        /// Term 6 (zz) of the light a white surface facing each way shows here: cosine lobe
+        /// applied, divided by pi.
+        pub sh6: Vector,
+        /// Term 7 (xz) of the light a white surface facing each way shows here: cosine lobe
+        /// applied, divided by pi.
+        pub sh7: Vector,
+        /// Term 8 (xx_yy) of the light a white surface facing each way shows here: cosine lobe
+        /// applied, divided by pi.
+        pub sh8: Vector,
+        /// 1 for a probe in open space, 0 for one inside geometry, whose light the host leaves
+        /// out.
+        pub valid: f32,
+    }
     /// A listener: where it is, the way it faces and its up, in world units.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Listener {
@@ -1323,6 +1358,22 @@ pub mod types {
         pub texel: f32,
         pub texels: u32,
     }
+    /// A lattice of diffuse light probes the game baked: where it is and how big, and the
+    /// revision of the probes the host holds.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct ProbeVolume {
+        /// Which bake the probes are: the host keeps the probes it was last sent, and uses them
+        /// while this matches theirs.
+        pub revision: u32,
+        /// Probes along x; 0 for no probe volume.
+        pub nx: u32,
+        pub ny: u32,
+        pub nz: u32,
+        /// The distance between neighbouring probes, in world units.
+        pub spacing: f32,
+        /// Where probe 0 is; probe (z * ny + y) * nx + x lies at origin + (x, y, z) * spacing.
+        pub origin: Vector,
+    }
     /// Clouds over the scene: how much of the sky they cover, 0 for none, and how far the wind
     /// has carried them along x and z.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1364,6 +1415,9 @@ pub mod types {
         pub quality: Quality,
         /// The sky's colors and the way toward the sun or moon.
         pub sky: Sky,
+        /// A lattice of diffuse light probes the game baked: where it is and how big, and the
+        /// revision of the probes the host holds.
+        pub probe_volume: ProbeVolume,
         /// Mist beyond `radius` of the middle; density 0 for none.
         pub fog: Fog,
         /// The shadow map's view; `texels` 0 for no shadows.
@@ -1431,6 +1485,10 @@ pub mod types {
         /// Point and spot lights beside the sun. The renderer sorts them into clusters of the
         /// view, which the shaders of lit materials read (pen-render's lights.wgsl).
         pub lights: Vec<Light>,
+        /// The light probes of the volume `probe_volume` describes, in index order, sent when
+        /// the game has a new bake; none keeps the probes the host holds (while their revision
+        /// matches).
+        pub probes: Vec<Probe>,
         /// Where the panners are heard from, as WebAudio's AudioListener: none, the camera
         /// (`view`'s eye, facing where it looks, its up the view's), or one listener.
         pub listener: Vec<Listener>,
@@ -1543,6 +1601,9 @@ pub mod codec {
     pub const MAX_TOUCHES: usize = 32;
     /// The most point and spot lights one frame may have.
     pub const MAX_LIGHTS: usize = 4096;
+    /// The most light probes one frame may carry (a volume may be larger than a frame's share
+    /// only by sending none: see `probe_volume.revision`).
+    pub const MAX_PROBES: usize = 16384;
     /// Preference events from this index on carry the engine's preferences
     /// (ENGINE_PREFERENCE_*); below it, the game's own.
     pub const ENGINE_PREFERENCES: usize = 64;
@@ -1561,14 +1622,15 @@ pub mod codec {
     /// aberration2, quality.msaa, quality.fxaa, quality.scale, quality.filtering,
     /// quality.occlusion, quality.sky, quality.effects, sky.zenith3, sky.horizon3, sky.ground3,
     /// sky.sun3, sky.night, sky.tint3, sky.sh03, sky.sh13, sky.sh23, sky.sh33, sky.sh43,
-    /// sky.sh53, sky.sh63, sky.sh73, sky.sh83, fog.radius, fog.density, fog.height,
-    /// shadow.view16, shadow.projection16, shadow.texel, shadow.texels, blur, quality.bloom,
-    /// clouds.cover, clouds.drift2, hide_cursor, field_count, field_lanes, ui_count, ui_lanes,
-    /// service_count, service_lanes, bus_count, voice_count, pose_count, emitter_count,
-    /// quality.taa, light_count, listener_count, panner_count, loading, show_captions,
-    /// retained_enabled, retained_reset, retained_after, instance_count,
-    /// instance_removal_count.
-    pub const PACKET_HEADER_FLOATS: usize = 181;
+    /// sky.sh53, sky.sh63, sky.sh73, sky.sh83, probe_volume.revision, probe_volume.nx,
+    /// probe_volume.ny, probe_volume.nz, probe_volume.spacing, probe_volume.origin3,
+    /// fog.radius, fog.density, fog.height, shadow.view16, shadow.projection16, shadow.texel,
+    /// shadow.texels, blur, quality.bloom, clouds.cover, clouds.drift2, hide_cursor,
+    /// field_count, field_lanes, ui_count, ui_lanes, service_count, service_lanes, bus_count,
+    /// voice_count, pose_count, emitter_count, quality.taa, light_count, probe_count,
+    /// listener_count, panner_count, loading, show_captions, retained_enabled, retained_reset,
+    /// retained_after, instance_count, instance_removal_count.
+    pub const PACKET_HEADER_FLOATS: usize = 190;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -1610,6 +1672,8 @@ pub mod codec {
     pub const EMITTER_FLOATS: usize = 42;
     /// Lanes: position3, radius, color3, direction3, inner, outer.
     pub const LIGHT_FLOATS: usize = 12;
+    /// Lanes: sh03, sh13, sh23, sh33, sh43, sh53, sh63, sh73, sh83, valid.
+    pub const PROBE_FLOATS: usize = 28;
     /// Lanes: position3, forward3, up3.
     pub const LISTENER_FLOATS: usize = 9;
     /// Lanes: voice, sound, position3, orientation3, distance_model, ref_distance,
@@ -1673,39 +1737,46 @@ pub mod codec {
             pub const SKY_SH6: usize = 108;
             pub const SKY_SH7: usize = 111;
             pub const SKY_SH8: usize = 114;
-            pub const FOG_RADIUS: usize = 117;
-            pub const FOG_DENSITY: usize = 118;
-            pub const FOG_HEIGHT: usize = 119;
-            pub const SHADOW_VIEW: usize = 120;
-            pub const SHADOW_PROJECTION: usize = 136;
-            pub const SHADOW_TEXEL: usize = 152;
-            pub const SHADOW_TEXELS: usize = 153;
-            pub const BLUR: usize = 154;
-            pub const QUALITY_BLOOM: usize = 155;
-            pub const CLOUDS_COVER: usize = 156;
-            pub const CLOUDS_DRIFT: usize = 157;
-            pub const HIDE_CURSOR: usize = 159;
-            pub const FIELD_COUNT: usize = 160;
-            pub const FIELD_LANES: usize = 161;
-            pub const UI_COUNT: usize = 162;
-            pub const UI_LANES: usize = 163;
-            pub const SERVICE_COUNT: usize = 164;
-            pub const SERVICE_LANES: usize = 165;
-            pub const BUS_COUNT: usize = 166;
-            pub const VOICE_COUNT: usize = 167;
-            pub const POSE_COUNT: usize = 168;
-            pub const EMITTER_COUNT: usize = 169;
-            pub const QUALITY_TAA: usize = 170;
-            pub const LIGHT_COUNT: usize = 171;
-            pub const LISTENER_COUNT: usize = 172;
-            pub const PANNER_COUNT: usize = 173;
-            pub const LOADING: usize = 174;
-            pub const SHOW_CAPTIONS: usize = 175;
-            pub const RETAINED_ENABLED: usize = 176;
-            pub const RETAINED_RESET: usize = 177;
-            pub const RETAINED_AFTER: usize = 178;
-            pub const INSTANCE_COUNT: usize = 179;
-            pub const INSTANCE_REMOVAL_COUNT: usize = 180;
+            pub const PROBE_VOLUME_REVISION: usize = 117;
+            pub const PROBE_VOLUME_NX: usize = 118;
+            pub const PROBE_VOLUME_NY: usize = 119;
+            pub const PROBE_VOLUME_NZ: usize = 120;
+            pub const PROBE_VOLUME_SPACING: usize = 121;
+            pub const PROBE_VOLUME_ORIGIN: usize = 122;
+            pub const FOG_RADIUS: usize = 125;
+            pub const FOG_DENSITY: usize = 126;
+            pub const FOG_HEIGHT: usize = 127;
+            pub const SHADOW_VIEW: usize = 128;
+            pub const SHADOW_PROJECTION: usize = 144;
+            pub const SHADOW_TEXEL: usize = 160;
+            pub const SHADOW_TEXELS: usize = 161;
+            pub const BLUR: usize = 162;
+            pub const QUALITY_BLOOM: usize = 163;
+            pub const CLOUDS_COVER: usize = 164;
+            pub const CLOUDS_DRIFT: usize = 165;
+            pub const HIDE_CURSOR: usize = 167;
+            pub const FIELD_COUNT: usize = 168;
+            pub const FIELD_LANES: usize = 169;
+            pub const UI_COUNT: usize = 170;
+            pub const UI_LANES: usize = 171;
+            pub const SERVICE_COUNT: usize = 172;
+            pub const SERVICE_LANES: usize = 173;
+            pub const BUS_COUNT: usize = 174;
+            pub const VOICE_COUNT: usize = 175;
+            pub const POSE_COUNT: usize = 176;
+            pub const EMITTER_COUNT: usize = 177;
+            pub const QUALITY_TAA: usize = 178;
+            pub const LIGHT_COUNT: usize = 179;
+            pub const PROBE_COUNT: usize = 180;
+            pub const LISTENER_COUNT: usize = 181;
+            pub const PANNER_COUNT: usize = 182;
+            pub const LOADING: usize = 183;
+            pub const SHOW_CAPTIONS: usize = 184;
+            pub const RETAINED_ENABLED: usize = 185;
+            pub const RETAINED_RESET: usize = 186;
+            pub const RETAINED_AFTER: usize = 187;
+            pub const INSTANCE_COUNT: usize = 188;
+            pub const INSTANCE_REMOVAL_COUNT: usize = 189;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -1811,6 +1882,18 @@ pub mod codec {
             pub const DIRECTION: usize = 7;
             pub const INNER: usize = 10;
             pub const OUTER: usize = 11;
+        }
+        pub mod probe {
+            pub const SH0: usize = 0;
+            pub const SH1: usize = 3;
+            pub const SH2: usize = 6;
+            pub const SH3: usize = 9;
+            pub const SH4: usize = 12;
+            pub const SH5: usize = 15;
+            pub const SH6: usize = 18;
+            pub const SH7: usize = 21;
+            pub const SH8: usize = 24;
+            pub const VALID: usize = 27;
         }
         pub mod listener {
             pub const POSITION: usize = 0;
@@ -2263,6 +2346,21 @@ pub mod codec {
             Ok(())
         }
 
+        fn decode_probe(&mut self, lane: usize, probe: &mut Probe) -> Result<()> {
+            let sh0 = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
+            let sh1 = Vector { x: self.packet[lane + 3], y: self.packet[lane + 4], z: self.packet[lane + 5] };
+            let sh2 = Vector { x: self.packet[lane + 6], y: self.packet[lane + 7], z: self.packet[lane + 8] };
+            let sh3 = Vector { x: self.packet[lane + 9], y: self.packet[lane + 10], z: self.packet[lane + 11] };
+            let sh4 = Vector { x: self.packet[lane + 12], y: self.packet[lane + 13], z: self.packet[lane + 14] };
+            let sh5 = Vector { x: self.packet[lane + 15], y: self.packet[lane + 16], z: self.packet[lane + 17] };
+            let sh6 = Vector { x: self.packet[lane + 18], y: self.packet[lane + 19], z: self.packet[lane + 20] };
+            let sh7 = Vector { x: self.packet[lane + 21], y: self.packet[lane + 22], z: self.packet[lane + 23] };
+            let sh8 = Vector { x: self.packet[lane + 24], y: self.packet[lane + 25], z: self.packet[lane + 26] };
+            let valid = self.packet[lane + 27];
+            *probe = Probe { sh0, sh1, sh2, sh3, sh4, sh5, sh6, sh7, sh8, valid };
+            Ok(())
+        }
+
         fn decode_listener(&mut self, lane: usize, listener: &mut Listener) -> Result<()> {
             let position = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
             let forward = Vector { x: self.packet[lane + 3], y: self.packet[lane + 4], z: self.packet[lane + 5] };
@@ -2352,21 +2450,22 @@ pub mod codec {
         let insets_count = reader.count(9, MAX_INSETS)?;
         let inset_draws_count = reader.count(10, MAX_DRAWS)?;
         let preferences_lanes = reader.count(11, PREFERENCE_FLOATS)?;
-        let fields_count = reader.count(160, MAX_FIELD_PATCHES)?;
-        let fields_lanes = reader.count(161, 16805888)?;
-        let ui_count = reader.count(162, MAX_UI_NODES)?;
-        let ui_lanes = reader.count(163, 4292608)?;
-        let services_count = reader.count(164, MAX_SERVICE_REQUESTS)?;
-        let services_lanes = reader.count(165, 4196352)?;
-        let buses_count = reader.count(166, MAX_BUSES)?;
-        let voices_count = reader.count(167, MAX_VOICES)?;
-        let poses_count = reader.count(168, MAX_POSES)?;
-        let emitters_count = reader.count(169, MAX_EMITTERS)?;
-        let lights_count = reader.count(171, MAX_LIGHTS)?;
-        let listener_count = reader.count(172, 1)?;
-        let panners_count = reader.count(173, MAX_PANNERS)?;
-        let instances_count = reader.count(179, MAX_INSTANCES)?;
-        let instance_removals_count = reader.count(180, MAX_INSTANCE_REMOVALS)?;
+        let fields_count = reader.count(168, MAX_FIELD_PATCHES)?;
+        let fields_lanes = reader.count(169, 16805888)?;
+        let ui_count = reader.count(170, MAX_UI_NODES)?;
+        let ui_lanes = reader.count(171, 4292608)?;
+        let services_count = reader.count(172, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = reader.count(173, 4196352)?;
+        let buses_count = reader.count(174, MAX_BUSES)?;
+        let voices_count = reader.count(175, MAX_VOICES)?;
+        let poses_count = reader.count(176, MAX_POSES)?;
+        let emitters_count = reader.count(177, MAX_EMITTERS)?;
+        let lights_count = reader.count(179, MAX_LIGHTS)?;
+        let probes_count = reader.count(180, MAX_PROBES)?;
+        let listener_count = reader.count(181, 1)?;
+        let panners_count = reader.count(182, MAX_PANNERS)?;
+        let instances_count = reader.count(188, MAX_INSTANCES)?;
+        let instance_removals_count = reader.count(189, MAX_INSTANCE_REMOVALS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -2402,7 +2501,9 @@ pub mod codec {
         let emitters_end = emitters_start + emitters_count * EMITTER_FLOATS;
         let lights_start = emitters_end;
         let lights_end = lights_start + lights_count * LIGHT_FLOATS;
-        let listener_start = lights_end;
+        let probes_start = lights_end;
+        let probes_end = probes_start + probes_count * PROBE_FLOATS;
+        let listener_start = probes_end;
         let listener_end = listener_start + listener_count * LISTENER_FLOATS;
         let panners_start = listener_end;
         let panners_end = panners_start + panners_count * PANNER_FLOATS;
@@ -2492,24 +2593,30 @@ pub mod codec {
         let sky_sh6 = Vector { x: reader.packet[108], y: reader.packet[109], z: reader.packet[110] };
         let sky_sh7 = Vector { x: reader.packet[111], y: reader.packet[112], z: reader.packet[113] };
         let sky_sh8 = Vector { x: reader.packet[114], y: reader.packet[115], z: reader.packet[116] };
-        let fog_radius = reader.packet[117];
-        let fog_density = reader.packet[118];
-        let fog_height = reader.packet[119];
-        let shadow_view = reader.matrix(120);
-        let shadow_projection = reader.matrix(136);
-        let shadow_texel = reader.packet[152];
-        let shadow_texels = reader.count(153, 8192)?;
-        let blur = reader.packet[154];
-        let quality_bloom = reader.flag(155)?;
-        let clouds_cover = reader.packet[156];
-        let clouds_drift = Drift { x: reader.packet[157], z: reader.packet[158] };
-        let hide_cursor = reader.flag(159)?;
-        let quality_taa = reader.flag(170)?;
-        let loading = reader.flag(174)?;
-        let show_captions = reader.flag(175)?;
-        let retained_enabled = reader.flag(176)?;
-        let retained_reset = reader.flag(177)?;
-        let retained_after = reader.count(178, 100000)?;
+        let probe_volume_revision = reader.count(117, 16777215)?;
+        let probe_volume_nx = reader.count(118, 64)?;
+        let probe_volume_ny = reader.count(119, 64)?;
+        let probe_volume_nz = reader.count(120, 64)?;
+        let probe_volume_spacing = reader.packet[121];
+        let probe_volume_origin = Vector { x: reader.packet[122], y: reader.packet[123], z: reader.packet[124] };
+        let fog_radius = reader.packet[125];
+        let fog_density = reader.packet[126];
+        let fog_height = reader.packet[127];
+        let shadow_view = reader.matrix(128);
+        let shadow_projection = reader.matrix(144);
+        let shadow_texel = reader.packet[160];
+        let shadow_texels = reader.count(161, 8192)?;
+        let blur = reader.packet[162];
+        let quality_bloom = reader.flag(163)?;
+        let clouds_cover = reader.packet[164];
+        let clouds_drift = Drift { x: reader.packet[165], z: reader.packet[166] };
+        let hide_cursor = reader.flag(167)?;
+        let quality_taa = reader.flag(178)?;
+        let loading = reader.flag(183)?;
+        let show_captions = reader.flag(184)?;
+        let retained_enabled = reader.flag(185)?;
+        let retained_reset = reader.flag(186)?;
+        let retained_after = reader.count(187, 100000)?;
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -2659,6 +2766,11 @@ pub mod codec {
         for (index, light) in lights.iter_mut().enumerate() {
             reader.decode_light(lights_start + index * LIGHT_FLOATS, light)?;
         }
+        let mut probes = std::mem::take(&mut frame.probes);
+        resize(&mut probes, probes_count);
+        for (index, probe) in probes.iter_mut().enumerate() {
+            reader.decode_probe(probes_start + index * PROBE_FLOATS, probe)?;
+        }
         let mut listener = std::mem::take(&mut frame.listener);
         resize(&mut listener, listener_count);
         for (index, listener) in listener.iter_mut().enumerate() {
@@ -2697,6 +2809,7 @@ pub mod codec {
             aberration,
             quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa },
             sky: Sky { zenith: sky_zenith, horizon: sky_horizon, ground: sky_ground, sun: sky_sun, night: sky_night, tint: sky_tint, sh0: sky_sh0, sh1: sky_sh1, sh2: sky_sh2, sh3: sky_sh3, sh4: sky_sh4, sh5: sky_sh5, sh6: sky_sh6, sh7: sky_sh7, sh8: sky_sh8 },
+            probe_volume: ProbeVolume { revision: probe_volume_revision as u32, nx: probe_volume_nx as u32, ny: probe_volume_ny as u32, nz: probe_volume_nz as u32, spacing: probe_volume_spacing, origin: probe_volume_origin },
             fog: Fog { radius: fog_radius, density: fog_density, height: fog_height },
             shadow: Shadow { view: shadow_view, projection: shadow_projection, texel: shadow_texel, texels: shadow_texels as u32 },
             blur,
@@ -2722,6 +2835,7 @@ pub mod codec {
             poses,
             emitters,
             lights,
+            probes,
             listener,
             panners,
             instances,
@@ -2788,21 +2902,22 @@ pub mod codec {
         let insets_count = d.count(&header.field("inset_count"), 9, MAX_INSETS)?;
         let inset_draws_count = d.count(&header.field("inset_draw_count"), 10, MAX_DRAWS)?;
         let preferences_lanes = d.count(&header.field("preference_count"), 11, 256)?;
-        let fields_count = d.count(&header.field("field_count"), 160, MAX_FIELD_PATCHES)?;
-        let fields_lanes = d.count(&header.field("field_lanes"), 161, 16805888)?;
-        let ui_count = d.count(&header.field("ui_count"), 162, MAX_UI_NODES)?;
-        let ui_lanes = d.count(&header.field("ui_lanes"), 163, 4292608)?;
-        let services_count = d.count(&header.field("service_count"), 164, MAX_SERVICE_REQUESTS)?;
-        let services_lanes = d.count(&header.field("service_lanes"), 165, 4196352)?;
-        let buses_count = d.count(&header.field("bus_count"), 166, MAX_BUSES)?;
-        let voices_count = d.count(&header.field("voice_count"), 167, MAX_VOICES)?;
-        let poses_count = d.count(&header.field("pose_count"), 168, MAX_POSES)?;
-        let emitters_count = d.count(&header.field("emitter_count"), 169, MAX_EMITTERS)?;
-        let lights_count = d.count(&header.field("light_count"), 171, MAX_LIGHTS)?;
-        let listener_count = d.count(&header.field("listener_count"), 172, 1)?;
-        let panners_count = d.count(&header.field("panner_count"), 173, MAX_PANNERS)?;
-        let instances_count = d.count(&header.field("instance_count"), 179, MAX_INSTANCES)?;
-        let instance_removals_count = d.count(&header.field("instance_removal_count"), 180, MAX_INSTANCE_REMOVALS)?;
+        let fields_count = d.count(&header.field("field_count"), 168, MAX_FIELD_PATCHES)?;
+        let fields_lanes = d.count(&header.field("field_lanes"), 169, 16805888)?;
+        let ui_count = d.count(&header.field("ui_count"), 170, MAX_UI_NODES)?;
+        let ui_lanes = d.count(&header.field("ui_lanes"), 171, 4292608)?;
+        let services_count = d.count(&header.field("service_count"), 172, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = d.count(&header.field("service_lanes"), 173, 4196352)?;
+        let buses_count = d.count(&header.field("bus_count"), 174, MAX_BUSES)?;
+        let voices_count = d.count(&header.field("voice_count"), 175, MAX_VOICES)?;
+        let poses_count = d.count(&header.field("pose_count"), 176, MAX_POSES)?;
+        let emitters_count = d.count(&header.field("emitter_count"), 177, MAX_EMITTERS)?;
+        let lights_count = d.count(&header.field("light_count"), 179, MAX_LIGHTS)?;
+        let probes_count = d.count(&header.field("probe_count"), 180, MAX_PROBES)?;
+        let listener_count = d.count(&header.field("listener_count"), 181, 1)?;
+        let panners_count = d.count(&header.field("panner_count"), 182, MAX_PANNERS)?;
+        let instances_count = d.count(&header.field("instance_count"), 188, MAX_INSTANCES)?;
+        let instance_removals_count = d.count(&header.field("instance_removal_count"), 189, MAX_INSTANCE_REMOVALS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -2838,7 +2953,9 @@ pub mod codec {
         let emitters_end = d.end(&Location::section("emitters"), emitters_start, emitters_count, EMITTER_FLOATS)?;
         let lights_start = emitters_end;
         let lights_end = d.end(&Location::section("lights"), lights_start, lights_count, LIGHT_FLOATS)?;
-        let listener_start = lights_end;
+        let probes_start = lights_end;
+        let probes_end = d.end(&Location::section("probes"), probes_start, probes_count, PROBE_FLOATS)?;
+        let listener_start = probes_end;
         let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
         let panners_start = listener_end;
         let panners_end = d.end(&Location::section("panners"), panners_start, panners_count, PANNER_FLOATS)?;
@@ -2885,24 +3002,30 @@ pub mod codec {
         d.values(&header.field("sky.sh6"), 108, 3, &["x","y","z"])?;
         d.values(&header.field("sky.sh7"), 111, 3, &["x","y","z"])?;
         d.values(&header.field("sky.sh8"), 114, 3, &["x","y","z"])?;
-        d.finite(&header.field("fog.radius"), 117)?;
-        d.finite(&header.field("fog.density"), 118)?;
-        d.finite(&header.field("fog.height"), 119)?;
-        d.values(&header.field("shadow.view"), 120, 16, &[])?;
-        d.values(&header.field("shadow.projection"), 136, 16, &[])?;
-        d.finite(&header.field("shadow.texel"), 152)?;
-        let _ = d.count(&header.field("shadow.texels"), 153, 8192)?;
-        d.finite(&header.field("blur"), 154)?;
-        d.count(&header.field("quality.bloom"), 155, 1)?;
-        d.finite(&header.field("clouds.cover"), 156)?;
-        d.values(&header.field("clouds.drift"), 157, 2, &["x","z"])?;
-        d.count(&header.field("hide_cursor"), 159, 1)?;
-        d.count(&header.field("quality.taa"), 170, 1)?;
-        d.count(&header.field("loading"), 174, 1)?;
-        d.count(&header.field("show_captions"), 175, 1)?;
-        d.count(&header.field("retained_enabled"), 176, 1)?;
-        d.count(&header.field("retained_reset"), 177, 1)?;
-        let _ = d.count(&header.field("retained_after"), 178, 100000)?;
+        let _ = d.count(&header.field("probe_volume.revision"), 117, 16777215)?;
+        let _ = d.count(&header.field("probe_volume.nx"), 118, 64)?;
+        let _ = d.count(&header.field("probe_volume.ny"), 119, 64)?;
+        let _ = d.count(&header.field("probe_volume.nz"), 120, 64)?;
+        d.finite(&header.field("probe_volume.spacing"), 121)?;
+        d.values(&header.field("probe_volume.origin"), 122, 3, &["x","y","z"])?;
+        d.finite(&header.field("fog.radius"), 125)?;
+        d.finite(&header.field("fog.density"), 126)?;
+        d.finite(&header.field("fog.height"), 127)?;
+        d.values(&header.field("shadow.view"), 128, 16, &[])?;
+        d.values(&header.field("shadow.projection"), 144, 16, &[])?;
+        d.finite(&header.field("shadow.texel"), 160)?;
+        let _ = d.count(&header.field("shadow.texels"), 161, 8192)?;
+        d.finite(&header.field("blur"), 162)?;
+        d.count(&header.field("quality.bloom"), 163, 1)?;
+        d.finite(&header.field("clouds.cover"), 164)?;
+        d.values(&header.field("clouds.drift"), 165, 2, &["x","z"])?;
+        d.count(&header.field("hide_cursor"), 167, 1)?;
+        d.count(&header.field("quality.taa"), 178, 1)?;
+        d.count(&header.field("loading"), 183, 1)?;
+        d.count(&header.field("show_captions"), 184, 1)?;
+        d.count(&header.field("retained_enabled"), 185, 1)?;
+        d.count(&header.field("retained_reset"), 186, 1)?;
+        let _ = d.count(&header.field("retained_after"), 187, 100000)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -3144,6 +3267,22 @@ pub mod codec {
             base += LIGHT_FLOATS;
         }
         d.exhausted(&Location::section("lights"), base, lights_end)?;
+        let mut base = probes_start;
+        for item in 0..probes_count {
+            let path = &Location::section("probes").index(item);
+            d.values(&path.field("sh0"), base, 3, &["x","y","z"])?;
+            d.values(&path.field("sh1"), base + 3, 3, &["x","y","z"])?;
+            d.values(&path.field("sh2"), base + 6, 3, &["x","y","z"])?;
+            d.values(&path.field("sh3"), base + 9, 3, &["x","y","z"])?;
+            d.values(&path.field("sh4"), base + 12, 3, &["x","y","z"])?;
+            d.values(&path.field("sh5"), base + 15, 3, &["x","y","z"])?;
+            d.values(&path.field("sh6"), base + 18, 3, &["x","y","z"])?;
+            d.values(&path.field("sh7"), base + 21, 3, &["x","y","z"])?;
+            d.values(&path.field("sh8"), base + 24, 3, &["x","y","z"])?;
+            d.finite(&path.field("valid"), base + 27)?;
+            base += PROBE_FLOATS;
+        }
+        d.exhausted(&Location::section("probes"), base, probes_end)?;
         let mut base = listener_start;
         for item in 0..listener_count {
             let path = &Location::section("listener").index(item);
@@ -3220,21 +3359,22 @@ pub mod codec {
         let insets_count = d.count(&header.field("inset_count"), 9, MAX_INSETS)?;
         let inset_draws_count = d.count(&header.field("inset_draw_count"), 10, MAX_DRAWS)?;
         let preferences_lanes = d.count(&header.field("preference_count"), 11, 256)?;
-        let fields_count = d.count(&header.field("field_count"), 160, MAX_FIELD_PATCHES)?;
-        let fields_lanes = d.count(&header.field("field_lanes"), 161, 16805888)?;
-        let ui_count = d.count(&header.field("ui_count"), 162, MAX_UI_NODES)?;
-        let ui_lanes = d.count(&header.field("ui_lanes"), 163, 4292608)?;
-        let services_count = d.count(&header.field("service_count"), 164, MAX_SERVICE_REQUESTS)?;
-        let services_lanes = d.count(&header.field("service_lanes"), 165, 4196352)?;
-        let buses_count = d.count(&header.field("bus_count"), 166, MAX_BUSES)?;
-        let voices_count = d.count(&header.field("voice_count"), 167, MAX_VOICES)?;
-        let poses_count = d.count(&header.field("pose_count"), 168, MAX_POSES)?;
-        let emitters_count = d.count(&header.field("emitter_count"), 169, MAX_EMITTERS)?;
-        let lights_count = d.count(&header.field("light_count"), 171, MAX_LIGHTS)?;
-        let listener_count = d.count(&header.field("listener_count"), 172, 1)?;
-        let panners_count = d.count(&header.field("panner_count"), 173, MAX_PANNERS)?;
-        let instances_count = d.count(&header.field("instance_count"), 179, MAX_INSTANCES)?;
-        let instance_removals_count = d.count(&header.field("instance_removal_count"), 180, MAX_INSTANCE_REMOVALS)?;
+        let fields_count = d.count(&header.field("field_count"), 168, MAX_FIELD_PATCHES)?;
+        let fields_lanes = d.count(&header.field("field_lanes"), 169, 16805888)?;
+        let ui_count = d.count(&header.field("ui_count"), 170, MAX_UI_NODES)?;
+        let ui_lanes = d.count(&header.field("ui_lanes"), 171, 4292608)?;
+        let services_count = d.count(&header.field("service_count"), 172, MAX_SERVICE_REQUESTS)?;
+        let services_lanes = d.count(&header.field("service_lanes"), 173, 4196352)?;
+        let buses_count = d.count(&header.field("bus_count"), 174, MAX_BUSES)?;
+        let voices_count = d.count(&header.field("voice_count"), 175, MAX_VOICES)?;
+        let poses_count = d.count(&header.field("pose_count"), 176, MAX_POSES)?;
+        let emitters_count = d.count(&header.field("emitter_count"), 177, MAX_EMITTERS)?;
+        let lights_count = d.count(&header.field("light_count"), 179, MAX_LIGHTS)?;
+        let probes_count = d.count(&header.field("probe_count"), 180, MAX_PROBES)?;
+        let listener_count = d.count(&header.field("listener_count"), 181, 1)?;
+        let panners_count = d.count(&header.field("panner_count"), 182, MAX_PANNERS)?;
+        let instances_count = d.count(&header.field("instance_count"), 188, MAX_INSTANCES)?;
+        let instance_removals_count = d.count(&header.field("instance_removal_count"), 189, MAX_INSTANCE_REMOVALS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3270,7 +3410,9 @@ pub mod codec {
         let emitters_end = d.end(&Location::section("emitters"), emitters_start, emitters_count, EMITTER_FLOATS)?;
         let lights_start = emitters_end;
         let lights_end = d.end(&Location::section("lights"), lights_start, lights_count, LIGHT_FLOATS)?;
-        let listener_start = lights_end;
+        let probes_start = lights_end;
+        let probes_end = d.end(&Location::section("probes"), probes_start, probes_count, PROBE_FLOATS)?;
+        let listener_start = probes_end;
         let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
         let panners_start = listener_end;
         let panners_end = d.end(&Location::section("panners"), panners_start, panners_count, PANNER_FLOATS)?;
@@ -3390,7 +3532,10 @@ pub mod codec {
             frame.sky.sh3.y, frame.sky.sh3.z, frame.sky.sh4.x, frame.sky.sh4.y, frame.sky.sh4.z, frame.sky.sh5.x,
             frame.sky.sh5.y, frame.sky.sh5.z, frame.sky.sh6.x, frame.sky.sh6.y, frame.sky.sh6.z, frame.sky.sh7.x,
             frame.sky.sh7.y, frame.sky.sh7.z, frame.sky.sh8.x, frame.sky.sh8.y, frame.sky.sh8.z,
-            frame.fog.radius, frame.fog.density, frame.fog.height,
+            frame.probe_volume.revision as f32, frame.probe_volume.nx as f32, frame.probe_volume.ny as f32,
+            frame.probe_volume.nz as f32, frame.probe_volume.spacing, frame.probe_volume.origin.x,
+            frame.probe_volume.origin.y, frame.probe_volume.origin.z, frame.fog.radius, frame.fog.density,
+            frame.fog.height,
         ]);
         out.extend_from_slice(&frame.shadow.view);
         out.extend_from_slice(&frame.shadow.projection);
@@ -3463,6 +3608,10 @@ pub mod codec {
         out.push(frame.lights.len() as f32);
         for light in &frame.lights {
             canonical_light(&mut out, light);
+        }
+        out.push(frame.probes.len() as f32);
+        for probe in &frame.probes {
+            canonical_probe(&mut out, probe);
         }
         out.push(frame.listener.len() as f32);
         for listener in &frame.listener {
@@ -3615,6 +3764,15 @@ pub mod codec {
         out.extend([
             light.position.x, light.position.y, light.position.z, light.radius, light.color.x, light.color.y,
             light.color.z, light.direction.x, light.direction.y, light.direction.z, light.inner, light.outer,
+        ]);
+    }
+
+    fn canonical_probe(out: &mut Vec<f32>, probe: &Probe) {
+        out.extend([
+            probe.sh0.x, probe.sh0.y, probe.sh0.z, probe.sh1.x, probe.sh1.y, probe.sh1.z, probe.sh2.x,
+            probe.sh2.y, probe.sh2.z, probe.sh3.x, probe.sh3.y, probe.sh3.z, probe.sh4.x, probe.sh4.y,
+            probe.sh4.z, probe.sh5.x, probe.sh5.y, probe.sh5.z, probe.sh6.x, probe.sh6.y, probe.sh6.z,
+            probe.sh7.x, probe.sh7.y, probe.sh7.z, probe.sh8.x, probe.sh8.y, probe.sh8.z, probe.valid,
         ]);
     }
 

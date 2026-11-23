@@ -14,11 +14,18 @@ struct SkyLight {
   tint: vec4f,
   // x: the cube's last level; yzw: unused.
   reflection: vec4f,
+  // xyz: where probe 0 of the baked probe volume is; w: the spacing between probes.
+  probe_origin: vec4f,
+  // xyz: probes along x, y and z; w: 1 when the frame has a probe volume.
+  probe_counts: vec4f,
 };
 @group(0) @binding(4) var sky_cube: texture_cube<f32>;
 @group(0) @binding(5) var sky_table: texture_2d<f32>;
 @group(0) @binding(6) var sky_sampler: sampler;
 @group(0) @binding(7) var<uniform> sky_light: SkyLight;
+// Seven vec4s a probe: nine RGB terms (27 floats, order as `sky_ambient`) then
+// a validity weight of 1 (open) or 0 (inside geometry); probe (z * ny + y) * nx + x.
+@group(0) @binding(8) var<storage, read> probe_data: array<vec4f>;
 
 // The sky's diffuse light toward `normal` (unit length): the SH sum, never
 // below zero. Multiply it by albedo.
@@ -38,12 +45,91 @@ fn sky_ambient(normal: vec3f) -> vec3f {
   return max(light, vec3f(0.0));
 }
 
+fn probe_float(at: u32) -> f32 {
+  return probe_data[at >> 2u][at & 3u];
+}
+
+// What probe `index` shows a surface with SH `terms` of its normal.
+fn probe_light(index: u32, terms: array<f32, 9>) -> vec3f {
+  let base = index * 28u;
+  var light = vec3f(0.0);
+  for (var i = 0u; i < 9u; i++) {
+    light += vec3f(probe_float(base + i * 3u), probe_float(base + i * 3u + 1u), probe_float(base + i * 3u + 2u)) * terms[i];
+  }
+  return max(light, vec3f(0.0));
+}
+
+// The probe volume's light at `world` facing `normal` (unit length): rgb, and
+// in w how much of it to trust (0 outside the lattice, fading in over a cell
+// beyond its edge; the share of valid corners inside). Trilinear between the
+// eight probes round the point lifted a quarter spacing off the surface,
+// each weighed by its validity and by how much it faces the surface, so a
+// wall does not hand the light of its other side through. A probe's own
+// position gives exactly that probe's light.
+fn probe_ambient(world: vec3f, normal: vec3f) -> vec4f {
+  let counts = vec3u(sky_light.probe_counts.xyz);
+  let spacing = sky_light.probe_origin.w;
+  let origin = sky_light.probe_origin.xyz;
+  let lifted = world + normal * (0.25 * spacing);
+  let g = (lifted - origin) / spacing;
+  let last = vec3f(counts) - vec3f(1.0);
+  let edge = min(min(min(g.x, last.x - g.x), min(g.y, last.y - g.y)), min(g.z, last.z - g.z));
+  let reach = clamp(edge + 1.0, 0.0, 1.0);
+  if (reach <= 0.0) {
+    return vec4f(0.0);
+  }
+  let c = clamp(g, vec3f(0.0), last);
+  let low = vec3u(min(floor(c), max(last - vec3f(1.0), vec3f(0.0))));
+  let f = c - vec3f(low);
+  let x = normal.x;
+  let y = normal.y;
+  let z = normal.z;
+  var terms = array<f32, 9>(
+    0.2820947918, 0.4886025119 * y, 0.4886025119 * z, 0.4886025119 * x,
+    1.0925484306 * x * y, 1.0925484306 * y * z, 0.3153915653 * (3.0 * z * z - 1.0),
+    1.0925484306 * x * z, 0.5462742153 * (x * x - y * y));
+  var sum = vec3f(0.0);
+  var weight = 0.0;
+  var share = 0.0;
+  var total = 0.0;
+  for (var corner = 0u; corner < 8u; corner++) {
+    let d = vec3u(corner & 1u, (corner >> 1u) & 1u, (corner >> 2u) & 1u);
+    let at = min(low + d, counts - vec3u(1u));
+    let w3 = select(vec3f(1.0) - f, f, d == vec3u(1u));
+    let tri = w3.x * w3.y * w3.z;
+    if (tri <= 0.0) {
+      continue;
+    }
+    let index = (at.z * counts.y + at.y) * counts.x + at.x;
+    let valid = probe_float(index * 28u + 27u);
+    total += tri;
+    share += tri * valid;
+    if (valid > 0.0) {
+      let toward = origin + vec3f(at) * spacing - world;
+      let gap = length(toward);
+      let facing = select(0.5 + 0.5 * dot(toward, normal) / gap, 1.0, gap < 0.0001);
+      let w = tri * valid * max(0.02, facing * facing);
+      sum += w * probe_light(index, terms);
+      weight += w;
+    }
+  }
+  if (weight <= 0.000001 || total <= 0.0) {
+    return vec4f(0.0);
+  }
+  return vec4f(sum / weight, reach * reach * (3.0 - 2.0 * reach) * (share / total));
+}
+
 // The light all round a surface at `world` facing `normal` (unit length), to
-// multiply by albedo: today the whole sky's, wherever it is. This is the one
-// place a per-position source (a probe grid's interpolated irradiance) takes
-// over from the sky; its callers need not change.
+// multiply by albedo: the baked probe volume's where the frame has one, else
+// (and past its edge, blending smoothly) the whole sky's. This is the one
+// place a material asks for diffuse sky light.
 fn ambient_light(world: vec3f, normal: vec3f) -> vec3f {
-  return sky_ambient(normal);
+  let sky = sky_ambient(normal);
+  if (sky_light.probe_counts.w < 0.5) {
+    return sky;
+  }
+  let probes = probe_ambient(world, normal);
+  return mix(sky, probes.rgb, probes.a);
 }
 
 // The split-sum table at `normal_dot_view` and `roughness`: x scales f0 and y

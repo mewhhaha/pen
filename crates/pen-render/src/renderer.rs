@@ -685,6 +685,7 @@ impl State {
                 crate::environment::layout_entries()[1],
                 crate::environment::layout_entries()[2],
                 crate::environment::layout_entries()[3],
+                crate::environment::layout_entries()[4],
             ],
         });
         let texture_entry = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {

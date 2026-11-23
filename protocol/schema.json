@@ -1613,6 +1613,14 @@
       "clouds": {
         "type": "Clouds",
         "doc": "Clouds over the scene: how much of the sky they cover, 0 for none, and how far the wind has carried them along x and z."
+      },
+      "exposure": {
+        "type": "Exposure",
+        "doc": "How the camera exposes the frame: a fixed exposure in stops, or auto exposure that meters the scene on the GPU and adapts over time, with the limits and the speeds of the adaptation."
+      },
+      "grade": {
+        "type": "Grade",
+        "doc": "The color grade the present pass applies after exposure and before tone mapping: white balance, contrast about a pivot, ASC CDL lift, gamma and gain, saturation and vibrance, up to two blended look-up tables, and a vignette. The defaults grade nothing."
       }
     },
     "header": {
@@ -2191,6 +2199,190 @@
         "kind": "size",
         "section": "instance_removals",
         "of": "count"
+      },
+      "exposure.auto": {
+        "kind": "flag",
+        "doc": "Meter the scene on the GPU and adapt toward it (eye adaptation); off, `compensation` is a fixed exposure in stops."
+      },
+      "exposure.compensation": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Stops of exposure added to the scene's light: the fixed exposure when `auto` is off, else a bias on what the metering finds. Within -16..16."
+      },
+      "exposure.min": {
+        "kind": "f32",
+        "default": -6,
+        "doc": "The least exposure auto exposure may adapt to, in stops. Within -16..16."
+      },
+      "exposure.max": {
+        "kind": "f32",
+        "default": 6,
+        "doc": "The most exposure auto exposure may adapt to, in stops. Within -16..16 and at least `min`."
+      },
+      "exposure.brighten": {
+        "kind": "f32",
+        "default": 3,
+        "doc": "How fast auto exposure rises when the scene darkens, as a rate per second: each frame closes 1 - exp(-rate * dt) of the distance to its target, so frame rate does not change the curve. 0 holds."
+      },
+      "exposure.darken": {
+        "kind": "f32",
+        "default": 1,
+        "doc": "How fast auto exposure falls when the scene brightens, as a rate per second."
+      },
+      "exposure.low": {
+        "kind": "f32",
+        "default": 0.1,
+        "doc": "The metering ignores pixels below this share of the picture's weight, darkest first (0 to 1)."
+      },
+      "exposure.high": {
+        "kind": "f32",
+        "default": 0.9,
+        "doc": "The metering ignores pixels above this share of the picture's weight (0 to 1, above `low`)."
+      },
+      "exposure.centre": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "How much the middle of the picture counts for more than its edges in the metering: 0 weighs every pixel equally, 1 by a Gaussian of the distance from the centre (0 to 1)."
+      },
+      "exposure.range_low": {
+        "kind": "f32",
+        "default": -10,
+        "doc": "The darkest luminance the metering histogram tells apart, as log2 of linear luminance (1 is SDR white); darker pixels fall in its first bin."
+      },
+      "exposure.range_high": {
+        "kind": "f32",
+        "default": 6,
+        "doc": "The brightest luminance the histogram tells apart, as log2 of linear luminance, above `range_low` by at most 32; brighter pixels fall in its last bin."
+      },
+      "exposure.target": {
+        "kind": "f32",
+        "default": 0.18,
+        "doc": "The linear luminance the metered average is brought to (middle grey)."
+      },
+      "exposure.dt": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Seconds of the game's time since the last frame: auto exposure adapts by this much. 0 holds it, as a paused game should."
+      },
+      "exposure.cut": {
+        "kind": "flag",
+        "doc": "The camera cut or the game restored an earlier moment: auto exposure jumps to its target this frame instead of adapting."
+      },
+      "grade.temperature": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "White balance along blue to orange, -1 cooler to 1 warmer, which scales red up and blue down by up to half a stop each."
+      },
+      "grade.tint": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "White balance along green to magenta, -1 greener to 1 more magenta."
+      },
+      "grade.exposure": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Stops added to the light before grading (0 for none). Within -8..8."
+      },
+      "grade.contrast": {
+        "kind": "f32",
+        "default": 1,
+        "doc": "Contrast about `pivot` in a log encoding of the light: 1 keeps it, 0 flattens, above 1 steepens (0 to 4)."
+      },
+      "grade.pivot": {
+        "kind": "f32",
+        "default": 0.18,
+        "doc": "The linear luminance contrast keeps in place (middle grey, 0.18)."
+      },
+      "grade.saturation": {
+        "kind": "f32",
+        "default": 1,
+        "doc": "How far colors lie from grey of the same luminance: 1 keeps it, 0 is grey (0 to 4)."
+      },
+      "grade.vibrance": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Saturation that favours the duller colors: positive boosts them most, negative mutes the vivid (-1 to 1)."
+      },
+      "grade.lift": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "default": [
+          0,
+          0,
+          0
+        ],
+        "doc": "ASC CDL offset per channel, added after the gain, in linear light (-0.5 to 0.5); lifts the shadows."
+      },
+      "grade.gamma": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "default": [
+          1,
+          1,
+          1
+        ],
+        "doc": "Per channel, the ASC CDL power is its reciprocal (0.1 to 4); above 1 brightens the midtones."
+      },
+      "grade.gain": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "default": [
+          1,
+          1,
+          1
+        ],
+        "doc": "ASC CDL slope per channel, scaling the light (0 to 8); moves the highlights."
+      },
+      "grade.lut_a": {
+        "kind": "count",
+        "max": 16777215,
+        "doc": "A look-up table to grade with: 1 plus the catalog index of a material whose texture is its strip: N slices of N by N texels (N from 2 to 64, the strip N*N wide and N tall) side by side, blue picking the slice, red across it and green down, holding colors in the grade's ACEScc-like log encoding (pen-render's ARCHITECTURE.md); 0 for none."
+      },
+      "grade.lut_b": {
+        "kind": "count",
+        "max": 16777215,
+        "doc": "A second table, 1 plus its material's catalog index, to blend toward from `lut_a` (a zone transition); 0 for none."
+      },
+      "grade.lut_blend": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "How far from `lut_a` toward `lut_b` the tables are blended, 0 to 1."
+      },
+      "grade.lut_weight": {
+        "kind": "f32",
+        "default": 1,
+        "doc": "How much of the table grades the picture, 0 (none) to 1 (all of it)."
+      },
+      "grade.vignette": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "How much the corners darken, 0 for none to 1 for black."
+      },
+      "grade.vignette_radius": {
+        "kind": "f32",
+        "default": 0.5,
+        "doc": "Where the vignette starts, as a share of the way from the middle to a corner (0 to 1)."
       }
     },
     "sections": [

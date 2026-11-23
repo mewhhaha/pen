@@ -316,6 +316,42 @@ type Clouds is data = $Clouds {
   drift: Drift,
 }
 
+type Exposure is data = $Exposure {
+  auto: Bool,
+  compensation: F32,
+  min: F32,
+  max: F32,
+  brighten: F32,
+  darken: F32,
+  low: F32,
+  high: F32,
+  centre: F32,
+  range_low: F32,
+  range_high: F32,
+  target: F32,
+  dt: F32,
+  cut: Bool,
+}
+
+type Grade is data = $Grade {
+  temperature: F32,
+  tint: F32,
+  exposure: F32,
+  contrast: F32,
+  pivot: F32,
+  saturation: F32,
+  vibrance: F32,
+  lift: Vector,
+  gamma: Vector,
+  gain: Vector,
+  lut_a: U32,
+  lut_b: U32,
+  lut_blend: F32,
+  lut_weight: F32,
+  vignette: F32,
+  vignette_radius: F32,
+}
+
 type RenderHeader = {
   schema: U32,
   save_requested: Bool,
@@ -346,4 +382,6 @@ type RenderHeader = {
   retained_enabled: Bool,
   retained_reset: Bool,
   retained_after: U32,
+  exposure: Exposure,
+  grade: Grade,
 }

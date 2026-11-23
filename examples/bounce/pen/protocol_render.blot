@@ -466,6 +466,42 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (U32.to_f32 (packet.retained_after))
   @storage.push encoded (U32.to_f32 instances_count)
   @storage.push encoded (U32.to_f32 instance_removals_count)
+  @storage.push encoded (lanes.bit packet.exposure.auto)
+  @storage.push encoded (packet.exposure.compensation)
+  @storage.push encoded (packet.exposure.min)
+  @storage.push encoded (packet.exposure.max)
+  @storage.push encoded (packet.exposure.brighten)
+  @storage.push encoded (packet.exposure.darken)
+  @storage.push encoded (packet.exposure.low)
+  @storage.push encoded (packet.exposure.high)
+  @storage.push encoded (packet.exposure.centre)
+  @storage.push encoded (packet.exposure.range_low)
+  @storage.push encoded (packet.exposure.range_high)
+  @storage.push encoded (packet.exposure.target)
+  @storage.push encoded (packet.exposure.dt)
+  @storage.push encoded (lanes.bit packet.exposure.cut)
+  @storage.push encoded (packet.grade.temperature)
+  @storage.push encoded (packet.grade.tint)
+  @storage.push encoded (packet.grade.exposure)
+  @storage.push encoded (packet.grade.contrast)
+  @storage.push encoded (packet.grade.pivot)
+  @storage.push encoded (packet.grade.saturation)
+  @storage.push encoded (packet.grade.vibrance)
+  @storage.push encoded (packet.grade.lift.x)
+  @storage.push encoded (packet.grade.lift.y)
+  @storage.push encoded (packet.grade.lift.z)
+  @storage.push encoded (packet.grade.gamma.x)
+  @storage.push encoded (packet.grade.gamma.y)
+  @storage.push encoded (packet.grade.gamma.z)
+  @storage.push encoded (packet.grade.gain.x)
+  @storage.push encoded (packet.grade.gain.y)
+  @storage.push encoded (packet.grade.gain.z)
+  @storage.push encoded (U32.to_f32 (packet.grade.lut_a))
+  @storage.push encoded (U32.to_f32 (packet.grade.lut_b))
+  @storage.push encoded (packet.grade.lut_blend)
+  @storage.push encoded (packet.grade.lut_weight)
+  @storage.push encoded (packet.grade.vignette)
+  @storage.push encoded (packet.grade.vignette_radius)
   let state_start = encoded.length
   for i in 0 .. state_count:
     let source = collections.state[i]
@@ -1212,6 +1248,42 @@ func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (
   encoded[177] := U32.to_f32 (packet.retained_after)
   encoded[178] := 0.0
   encoded[179] := 0.0
+  encoded[180] := lanes.bit packet.exposure.auto
+  encoded[181] := packet.exposure.compensation
+  encoded[182] := packet.exposure.min
+  encoded[183] := packet.exposure.max
+  encoded[184] := packet.exposure.brighten
+  encoded[185] := packet.exposure.darken
+  encoded[186] := packet.exposure.low
+  encoded[187] := packet.exposure.high
+  encoded[188] := packet.exposure.centre
+  encoded[189] := packet.exposure.range_low
+  encoded[190] := packet.exposure.range_high
+  encoded[191] := packet.exposure.target
+  encoded[192] := packet.exposure.dt
+  encoded[193] := lanes.bit packet.exposure.cut
+  encoded[194] := packet.grade.temperature
+  encoded[195] := packet.grade.tint
+  encoded[196] := packet.grade.exposure
+  encoded[197] := packet.grade.contrast
+  encoded[198] := packet.grade.pivot
+  encoded[199] := packet.grade.saturation
+  encoded[200] := packet.grade.vibrance
+  encoded[201] := packet.grade.lift.x
+  encoded[202] := packet.grade.lift.y
+  encoded[203] := packet.grade.lift.z
+  encoded[204] := packet.grade.gamma.x
+  encoded[205] := packet.grade.gamma.y
+  encoded[206] := packet.grade.gamma.z
+  encoded[207] := packet.grade.gain.x
+  encoded[208] := packet.grade.gain.y
+  encoded[209] := packet.grade.gain.z
+  encoded[210] := U32.to_f32 (packet.grade.lut_a)
+  encoded[211] := U32.to_f32 (packet.grade.lut_b)
+  encoded[212] := packet.grade.lut_blend
+  encoded[213] := packet.grade.lut_weight
+  encoded[214] := packet.grade.vignette
+  encoded[215] := packet.grade.vignette_radius
   let at: U32 = protocol.packet_header_floats
   for draw in draws:
     encoded[at + 0] := U32.to_f32 (draw.mesh)

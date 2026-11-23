@@ -66,6 +66,8 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
         fog: Fog { radius: 0.0, density: 0.0, height: 1.0 },
         clouds: Clouds { cover: 0.0, drift: Drift { x: 0.0, z: 0.0 } },
         shadow: Shadow::default(),
+        exposure: Default::default(),
+        grade: Default::default(),
         cascades: Vec::new(),
         draws,
         decals: Vec::new(),

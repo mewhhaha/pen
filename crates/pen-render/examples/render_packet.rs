@@ -214,6 +214,8 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
         fog: Fog { radius: 30.0, density: 0.02, height: 10.0 },
         clouds: Clouds { cover: 0.0, drift: Drift { x: 0.0, z: 0.0 } },
         shadow: Shadow::default(),
+        exposure: Default::default(),
+        grade: Default::default(),
         cascades: Vec::new(),
         draws,
         decals: Vec::new(),

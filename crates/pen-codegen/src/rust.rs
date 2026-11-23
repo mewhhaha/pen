@@ -31,10 +31,33 @@ struct Member {
     ty: String,
     copy: bool,
     doc: Option<String>,
+    /// The Rust expression of the schema's `default`, which a blank frame gives the lane.
+    default: Option<String>,
+}
+/// A header lane's `default` as a Rust expression.
+#[allow(clippy::cast_possible_truncation, reason = "the wire holds float32 lanes, and so do the defaults")]
+fn default_of(field: &Value) -> Option<String> {
+    let default = &field["default"];
+    let number = |value: &Value| format!("{:?}", value.as_f64().unwrap_or_default() as f32);
+    match kind(field) {
+        _ if default.is_null() => None,
+        "flag" => Some(default.as_bool().unwrap_or_default().to_string()),
+        "f32" => Some(number(default)),
+        "count" => Some(default.as_u64().unwrap_or_default().to_string()),
+        "vector" => {
+            let parts: Vec<String> = array(&field["type"]["components"])
+                .iter()
+                .zip(array(default))
+                .map(|(name, value)| format!("{}: {}", s(name), number(value)))
+                .collect();
+            Some(format!("{} {{ {} }}", s(&field["type"]["name"]), parts.join(", ")))
+        }
+        _ => None,
+    }
 }
 fn member(model: &Model, laid: &Laid) -> Member {
     let (ty, copy) = field_type(model, &laid.field);
-    Member { name: laid.name.clone(), ty, copy, doc: text(&laid.field, "doc") }
+    Member { name: laid.name.clone(), ty, copy, doc: text(&laid.field, "doc"), default: default_of(&laid.field) }
 }
 fn structure(name: &str, about: Option<&str>, fields: &[Member]) -> Vec<String> {
     let mut out = doc(about, "    ");
@@ -42,13 +65,29 @@ fn structure(name: &str, about: Option<&str>, fields: &[Member]) -> Vec<String> 
     if fields.iter().all(|field| field.copy) {
         copy = "Copy, ";
     }
-    out.push(format!("    #[derive(Clone, {copy}Debug, Default, PartialEq)]"));
+    // A blank record carries the schema's defaults where it has them, so a game or a test
+    // that leaves a group alone gets its neutral settings, not zeros.
+    let defaults = fields.iter().any(|field| field.default.is_some());
+    let derived = if defaults { "" } else { "Default, " };
+    out.push(format!("    #[derive(Clone, {copy}Debug, {derived}PartialEq)]"));
     out.push(format!("    pub struct {name} {{"));
     for field in fields {
         out.extend(doc(field.doc.as_deref(), "        "));
         out.push(format!("        pub {}: {},", field.name, field.ty));
     }
     out.push("    }".to_owned());
+    if defaults {
+        out.push(format!("    impl Default for {name} {{"));
+        out.push("        fn default() -> Self {".to_owned());
+        out.push("            Self {".to_owned());
+        for field in fields {
+            let value = field.default.clone().unwrap_or_else(|| "Default::default()".to_owned());
+            out.push(format!("                {}: {value},", field.name));
+        }
+        out.push("            }".to_owned());
+        out.push("        }".to_owned());
+        out.push("    }".to_owned());
+    }
     out
 }
 fn emit_record(
@@ -88,7 +127,7 @@ fn types(model: &Model) -> Vec<String> {
     for vector in array(&protocol["vectors"]) {
         let fields = array(&vector["components"])
             .iter()
-            .map(|name| Member { name: s(name).to_owned(), ty: "f32".to_owned(), copy: true, doc: None })
+            .map(|name| Member { name: s(name).to_owned(), ty: "f32".to_owned(), copy: true, doc: None, default: None })
             .collect::<Vec<_>>();
         out.extend(structure(s(&vector["name"]), vector["doc"].as_str(), &fields));
     }
@@ -96,8 +135,8 @@ fn types(model: &Model) -> Vec<String> {
         "Viewport",
         None,
         &[
-            Member { name: "width".to_owned(), ty: "u32".to_owned(), copy: true, doc: None },
-            Member { name: "height".to_owned(), ty: "u32".to_owned(), copy: true, doc: None },
+            Member { name: "width".to_owned(), ty: "u32".to_owned(), copy: true, doc: None, default: None },
+            Member { name: "height".to_owned(), ty: "u32".to_owned(), copy: true, doc: None, default: None },
         ],
     ));
     out.extend(["    #[derive(Clone, Debug, PartialEq)]".to_owned(), "    pub enum GameEvent {".to_owned()]);
@@ -130,6 +169,7 @@ fn types(model: &Model) -> Vec<String> {
             ty: "Vec<String>".to_owned(),
             copy: false,
             doc: text(list, "doc"),
+            default: None,
         })
         .collect::<Vec<_>>();
     out.extend(structure(
@@ -164,7 +204,13 @@ fn types(model: &Model) -> Vec<String> {
                 model,
                 record,
                 &entry.head,
-                Some(Member { name: s(&rest["name"]).to_owned(), ty, copy: false, doc: text(rest, "doc") }),
+                Some(Member {
+                    name: s(&rest["name"]).to_owned(),
+                    ty,
+                    copy: false,
+                    doc: text(rest, "doc"),
+                    default: None,
+                }),
                 &mut emitted,
             );
         }
@@ -197,7 +243,7 @@ fn types(model: &Model) -> Vec<String> {
             {
                 ty = format!("Option<{ty}>");
             }
-            frame.push(Member { name: group.clone(), ty, copy: true, doc: text(value, "doc") });
+            frame.push(Member { name: group.clone(), ty, copy: true, doc: text(value, "doc"), default: None });
         } else {
             frame.push(member(model, &entry.laid));
         }
@@ -215,15 +261,21 @@ fn types(model: &Model) -> Vec<String> {
             "lanes" => "Vec<f32>".to_owned(),
             _ => format!("Vec<{}>", s(&section["record"]["name"])),
         };
-        frame.push(Member { name: s(&section["name"]).to_owned(), ty, copy: false, doc: text(section, "doc") });
+        frame.push(Member {
+            name: s(&section["name"]).to_owned(),
+            ty,
+            copy: false,
+            doc: text(section, "doc"),
+            default: None,
+        });
     }
     if let Some(extensions) = model.extensions() {
         out.extend(structure(
             "Extension",
             Some("One of the game's own sections: its tag, from its declaration, and its lanes."),
             &[
-                Member { name: "tag".to_owned(), ty: "u32".to_owned(), copy: true, doc: None },
-                Member { name: "values".to_owned(), ty: "Vec<f32>".to_owned(), copy: false, doc: None },
+                Member { name: "tag".to_owned(), ty: "u32".to_owned(), copy: true, doc: None, default: None },
+                Member { name: "values".to_owned(), ty: "Vec<f32>".to_owned(), copy: false, doc: None, default: None },
             ],
         ));
         frame.push(Member {
@@ -231,6 +283,7 @@ fn types(model: &Model) -> Vec<String> {
             ty: "Vec<Extension>".to_owned(),
             copy: false,
             doc: text(extensions, "doc"),
+            default: None,
         });
     }
     out.extend(structure("RenderFrame", protocol["render"]["doc"].as_str(), &frame));

@@ -291,6 +291,8 @@ fn frame(draws: Vec<Draw>, poses: Vec<Pose>, view: Matrix, projection: Matrix) -
         sky: Sky { sun: Vector { x: 0.0, y: 1.0, z: 0.0 }, ..Default::default() },
         fog: Fog { radius: 0.0, density: 0.0, height: 1.0 },
         shadow: Shadow::default(),
+        exposure: Default::default(),
+        grade: Default::default(),
         cascades: Vec::new(),
         view,
         projection,

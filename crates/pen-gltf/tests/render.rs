@@ -88,7 +88,8 @@ fn skinned_draws_take_their_pose() {
 
     // Skinned shadows: the same pose cast into the sun's shadow map.
     let mut sunny = frame(vec![draw.clone()], vec![layer(0, 0.99, 1.0)]);
-    sunny.shadow = Shadow { view: IDENTITY, projection: PROJECTION, texel: 0.01, texels: 256 };
+    sunny.shadow = Shadow { view: IDENTITY, texels: 256, ..Shadow::default() };
+    sunny.cascades = vec![Cascade { projection: PROJECTION, texel: 0.01, far: 100.0 }];
     settle(&mut renderer, &sunny, &catalog, &mut target, &[]);
     assert_eq!(pixels(&device, &queue, &target.0), bent);
 }

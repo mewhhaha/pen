@@ -1292,7 +1292,7 @@ pub mod types {
     }
     /// How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture
     /// filtering, ambient occlusion, a sky, screen effects, bloom and temporal antialiasing.
-    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct Quality {
         /// Samples per pixel: 1 or 4.
         pub msaa: u32,
@@ -1307,6 +1307,21 @@ pub mod types {
         /// Temporal antialiasing: each frame's samples move within their pixels and blend with
         /// the frames before, followed through the camera's motion.
         pub taa: bool,
+    }
+    impl Default for Quality {
+        fn default() -> Self {
+            Self {
+                msaa: Default::default(),
+                fxaa: Default::default(),
+                scale: 1.0,
+                filtering: 1,
+                occlusion: Default::default(),
+                sky: Default::default(),
+                effects: Default::default(),
+                bloom: Default::default(),
+                taa: Default::default(),
+            }
+        }
     }
     /// The sky's colors and the way toward the sun or moon.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1416,6 +1431,144 @@ pub mod types {
         pub cover: f32,
         pub drift: Drift,
     }
+    /// How the camera exposes the frame: a fixed exposure in stops, or auto exposure that
+    /// meters the scene on the GPU and adapts over time, with the limits and the speeds of the
+    /// adaptation.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Exposure {
+        /// Meter the scene on the GPU and adapt toward it (eye adaptation); off, `compensation`
+        /// is a fixed exposure in stops.
+        pub auto: bool,
+        /// Stops of exposure added to the scene's light: the fixed exposure when `auto` is off,
+        /// else a bias on what the metering finds. Within -16..16.
+        pub compensation: f32,
+        /// The least exposure auto exposure may adapt to, in stops. Within -16..16.
+        pub min: f32,
+        /// The most exposure auto exposure may adapt to, in stops. Within -16..16 and at least
+        /// `min`.
+        pub max: f32,
+        /// How fast auto exposure rises when the scene darkens, as a rate per second: each
+        /// frame closes 1 - exp(-rate * dt) of the distance to its target, so frame rate does
+        /// not change the curve. 0 holds.
+        pub brighten: f32,
+        /// How fast auto exposure falls when the scene brightens, as a rate per second.
+        pub darken: f32,
+        /// The metering ignores pixels below this share of the picture's weight, darkest first
+        /// (0 to 1).
+        pub low: f32,
+        /// The metering ignores pixels above this share of the picture's weight (0 to 1, above
+        /// `low`).
+        pub high: f32,
+        /// How much the middle of the picture counts for more than its edges in the metering: 0
+        /// weighs every pixel equally, 1 by a Gaussian of the distance from the centre (0 to
+        /// 1).
+        pub centre: f32,
+        /// The darkest luminance the metering histogram tells apart, as log2 of linear
+        /// luminance (1 is SDR white); darker pixels fall in its first bin.
+        pub range_low: f32,
+        /// The brightest luminance the histogram tells apart, as log2 of linear luminance,
+        /// above `range_low` by at most 32; brighter pixels fall in its last bin.
+        pub range_high: f32,
+        /// The linear luminance the metered average is brought to (middle grey).
+        pub target: f32,
+        /// Seconds of the game's time since the last frame: auto exposure adapts by this much.
+        /// 0 holds it, as a paused game should.
+        pub dt: f32,
+        /// The camera cut or the game restored an earlier moment: auto exposure jumps to its
+        /// target this frame instead of adapting.
+        pub cut: bool,
+    }
+    impl Default for Exposure {
+        fn default() -> Self {
+            Self {
+                auto: Default::default(),
+                compensation: 0.0,
+                min: -6.0,
+                max: 6.0,
+                brighten: 3.0,
+                darken: 1.0,
+                low: 0.1,
+                high: 0.9,
+                centre: 0.0,
+                range_low: -10.0,
+                range_high: 6.0,
+                target: 0.18,
+                dt: 0.0,
+                cut: Default::default(),
+            }
+        }
+    }
+    /// The color grade the present pass applies after exposure and before tone mapping: white
+    /// balance, contrast about a pivot, ASC CDL lift, gamma and gain, saturation and vibrance,
+    /// up to two blended look-up tables, and a vignette. The defaults grade nothing.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Grade {
+        /// White balance along blue to orange, -1 cooler to 1 warmer, which scales red up and
+        /// blue down by up to half a stop each.
+        pub temperature: f32,
+        /// White balance along green to magenta, -1 greener to 1 more magenta.
+        pub tint: f32,
+        /// Stops added to the light before grading (0 for none). Within -8..8.
+        pub exposure: f32,
+        /// Contrast about `pivot` in a log encoding of the light: 1 keeps it, 0 flattens, above
+        /// 1 steepens (0 to 4).
+        pub contrast: f32,
+        /// The linear luminance contrast keeps in place (middle grey, 0.18).
+        pub pivot: f32,
+        /// How far colors lie from grey of the same luminance: 1 keeps it, 0 is grey (0 to 4).
+        pub saturation: f32,
+        /// Saturation that favours the duller colors: positive boosts them most, negative mutes
+        /// the vivid (-1 to 1).
+        pub vibrance: f32,
+        /// ASC CDL offset per channel, added after the gain, in linear light (-0.5 to 0.5);
+        /// lifts the shadows.
+        pub lift: Vector,
+        /// Per channel, the ASC CDL power is its reciprocal (0.1 to 4); above 1 brightens the
+        /// midtones.
+        pub gamma: Vector,
+        /// ASC CDL slope per channel, scaling the light (0 to 8); moves the highlights.
+        pub gain: Vector,
+        /// A look-up table to grade with: 1 plus the catalog index of a material whose texture
+        /// is its strip: N slices of N by N texels (N from 2 to 64, the strip N*N wide and N
+        /// tall) side by side, blue picking the slice, red across it and green down, holding
+        /// colors in the grade's ACEScc-like log encoding (pen-render's ARCHITECTURE.md); 0 for
+        /// none.
+        pub lut_a: u32,
+        /// A second table, 1 plus its material's catalog index, to blend toward from `lut_a` (a
+        /// zone transition); 0 for none.
+        pub lut_b: u32,
+        /// How far from `lut_a` toward `lut_b` the tables are blended, 0 to 1.
+        pub lut_blend: f32,
+        /// How much of the table grades the picture, 0 (none) to 1 (all of it).
+        pub lut_weight: f32,
+        /// How much the corners darken, 0 for none to 1 for black.
+        pub vignette: f32,
+        /// Where the vignette starts, as a share of the way from the middle to a corner (0 to
+        /// 1).
+        pub vignette_radius: f32,
+    }
+    impl Default for Grade {
+        fn default() -> Self {
+            Self {
+                temperature: 0.0,
+                tint: 0.0,
+                exposure: 0.0,
+                contrast: 1.0,
+                pivot: 0.18,
+                saturation: 1.0,
+                vibrance: 0.0,
+                lift: Vector { x: 0.0, y: 0.0, z: 0.0 },
+                gamma: Vector { x: 1.0, y: 1.0, z: 1.0 },
+                gain: Vector { x: 1.0, y: 1.0, z: 1.0 },
+                lut_a: Default::default(),
+                lut_b: Default::default(),
+                lut_blend: 0.0,
+                lut_weight: 1.0,
+                vignette: 0.0,
+                vignette_radius: 0.5,
+            }
+        }
+    }
     /// One of the game's own sections: its tag, from its declaration, and its lanes.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct Extension {
@@ -1423,7 +1576,7 @@ pub mod types {
         pub values: Vec<f32>,
     }
     /// The game's frame: what to draw and play, and what to do.
-    #[derive(Clone, Debug, Default, PartialEq)]
+    #[derive(Clone, Debug, PartialEq)]
     pub struct RenderFrame {
         pub save_requested: bool,
         pub load_requested: bool,
@@ -1477,6 +1630,15 @@ pub mod types {
         /// Replace the persistent instance scene. Required on its first frame.
         pub retained_reset: bool,
         pub retained_after: u32,
+        /// How the camera exposes the frame: a fixed exposure in stops, or auto exposure that
+        /// meters the scene on the GPU and adapts over time, with the limits and the speeds of
+        /// the adaptation.
+        pub exposure: Exposure,
+        /// The color grade the present pass applies after exposure and before tone mapping:
+        /// white balance, contrast about a pivot, ASC CDL lift, gamma and gain, saturation and
+        /// vibrance, up to two blended look-up tables, and a vignette. The defaults grade
+        /// nothing.
+        pub grade: Grade,
         pub draws: Vec<Draw>,
         /// Convex solids: the points behind every face plane (normal · p <= distance).
         pub solids: Vec<Solid>,
@@ -1546,6 +1708,64 @@ pub mod types {
         /// consume this metadata without retaining it in the rendered frame; release games omit
         /// it.
         pub extensions: Vec<Extension>,
+    }
+    impl Default for RenderFrame {
+        fn default() -> Self {
+            Self {
+                save_requested: Default::default(),
+                load_requested: Default::default(),
+                scene_save_requested: Default::default(),
+                scene_load_requested: Default::default(),
+                checkpoint_requested: Default::default(),
+                undo_requested: Default::default(),
+                redo_requested: Default::default(),
+                exit_requested: Default::default(),
+                view: Default::default(),
+                projection: Default::default(),
+                clear: Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                ambient: Vector { x: 0.2, y: 0.2, z: 0.2 },
+                light_direction: Vector { x: 0.0, y: -1.0, z: 0.0 },
+                light_color: Vector { x: 1.0, y: 1.0, z: 1.0 },
+                aberration: Default::default(),
+                quality: Default::default(),
+                sky: Default::default(),
+                probe_volume: Default::default(),
+                fog: Default::default(),
+                shadow: Default::default(),
+                blur: Default::default(),
+                clouds: Default::default(),
+                hide_cursor: Default::default(),
+                loading: Default::default(),
+                show_captions: Default::default(),
+                retained_enabled: Default::default(),
+                retained_reset: Default::default(),
+                retained_after: Default::default(),
+                exposure: Default::default(),
+                grade: Default::default(),
+                draws: Default::default(),
+                solids: Default::default(),
+                decals: Default::default(),
+                sounds: Default::default(),
+                sprites: Default::default(),
+                insets: Default::default(),
+                preferences: Default::default(),
+                fields: Default::default(),
+                ui: Default::default(),
+                services: Default::default(),
+                buses: Default::default(),
+                voices: Default::default(),
+                poses: Default::default(),
+                emitters: Default::default(),
+                lights: Default::default(),
+                cascades: Default::default(),
+                probes: Default::default(),
+                listener: Default::default(),
+                panners: Default::default(),
+                instances: Default::default(),
+                instance_removals: Default::default(),
+                extensions: Default::default(),
+            }
+        }
     }
 }
 
@@ -1671,8 +1891,14 @@ pub mod codec {
     /// field_count, field_lanes, ui_count, ui_lanes, service_count, service_lanes, bus_count,
     /// voice_count, pose_count, emitter_count, quality.taa, light_count, cascade_count,
     /// probe_count, listener_count, panner_count, loading, show_captions, retained_enabled,
-    /// retained_reset, retained_after, instance_count, instance_removal_count.
-    pub const PACKET_HEADER_FLOATS: usize = 180;
+    /// retained_reset, retained_after, instance_count, instance_removal_count, exposure.auto,
+    /// exposure.compensation, exposure.min, exposure.max, exposure.brighten, exposure.darken,
+    /// exposure.low, exposure.high, exposure.centre, exposure.range_low, exposure.range_high,
+    /// exposure.target, exposure.dt, exposure.cut, grade.temperature, grade.tint,
+    /// grade.exposure, grade.contrast, grade.pivot, grade.saturation, grade.vibrance,
+    /// grade.lift3, grade.gamma3, grade.gain3, grade.lut_a, grade.lut_b, grade.lut_blend,
+    /// grade.lut_weight, grade.vignette, grade.vignette_radius.
+    pub const PACKET_HEADER_FLOATS: usize = 216;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -1826,6 +2052,36 @@ pub mod codec {
             pub const RETAINED_AFTER: usize = 177;
             pub const INSTANCE_COUNT: usize = 178;
             pub const INSTANCE_REMOVAL_COUNT: usize = 179;
+            pub const EXPOSURE_AUTO: usize = 180;
+            pub const EXPOSURE_COMPENSATION: usize = 181;
+            pub const EXPOSURE_MIN: usize = 182;
+            pub const EXPOSURE_MAX: usize = 183;
+            pub const EXPOSURE_BRIGHTEN: usize = 184;
+            pub const EXPOSURE_DARKEN: usize = 185;
+            pub const EXPOSURE_LOW: usize = 186;
+            pub const EXPOSURE_HIGH: usize = 187;
+            pub const EXPOSURE_CENTRE: usize = 188;
+            pub const EXPOSURE_RANGE_LOW: usize = 189;
+            pub const EXPOSURE_RANGE_HIGH: usize = 190;
+            pub const EXPOSURE_TARGET: usize = 191;
+            pub const EXPOSURE_DT: usize = 192;
+            pub const EXPOSURE_CUT: usize = 193;
+            pub const GRADE_TEMPERATURE: usize = 194;
+            pub const GRADE_TINT: usize = 195;
+            pub const GRADE_EXPOSURE: usize = 196;
+            pub const GRADE_CONTRAST: usize = 197;
+            pub const GRADE_PIVOT: usize = 198;
+            pub const GRADE_SATURATION: usize = 199;
+            pub const GRADE_VIBRANCE: usize = 200;
+            pub const GRADE_LIFT: usize = 201;
+            pub const GRADE_GAMMA: usize = 204;
+            pub const GRADE_GAIN: usize = 207;
+            pub const GRADE_LUT_A: usize = 210;
+            pub const GRADE_LUT_B: usize = 211;
+            pub const GRADE_LUT_BLEND: usize = 212;
+            pub const GRADE_LUT_WEIGHT: usize = 213;
+            pub const GRADE_VIGNETTE: usize = 214;
+            pub const GRADE_VIGNETTE_RADIUS: usize = 215;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -2690,6 +2946,36 @@ pub mod codec {
         let retained_enabled = reader.flag(175)?;
         let retained_reset = reader.flag(176)?;
         let retained_after = reader.count(177, 100000)?;
+        let exposure_auto = reader.flag(180)?;
+        let exposure_compensation = reader.packet[181];
+        let exposure_min = reader.packet[182];
+        let exposure_max = reader.packet[183];
+        let exposure_brighten = reader.packet[184];
+        let exposure_darken = reader.packet[185];
+        let exposure_low = reader.packet[186];
+        let exposure_high = reader.packet[187];
+        let exposure_centre = reader.packet[188];
+        let exposure_range_low = reader.packet[189];
+        let exposure_range_high = reader.packet[190];
+        let exposure_target = reader.packet[191];
+        let exposure_dt = reader.packet[192];
+        let exposure_cut = reader.flag(193)?;
+        let grade_temperature = reader.packet[194];
+        let grade_tint = reader.packet[195];
+        let grade_exposure = reader.packet[196];
+        let grade_contrast = reader.packet[197];
+        let grade_pivot = reader.packet[198];
+        let grade_saturation = reader.packet[199];
+        let grade_vibrance = reader.packet[200];
+        let grade_lift = Vector { x: reader.packet[201], y: reader.packet[202], z: reader.packet[203] };
+        let grade_gamma = Vector { x: reader.packet[204], y: reader.packet[205], z: reader.packet[206] };
+        let grade_gain = Vector { x: reader.packet[207], y: reader.packet[208], z: reader.packet[209] };
+        let grade_lut_a = reader.count(210, 16777215)?;
+        let grade_lut_b = reader.count(211, 16777215)?;
+        let grade_lut_blend = reader.packet[212];
+        let grade_lut_weight = reader.packet[213];
+        let grade_vignette = reader.packet[214];
+        let grade_vignette_radius = reader.packet[215];
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -2898,6 +3184,8 @@ pub mod codec {
             retained_enabled,
             retained_reset,
             retained_after: retained_after as u32,
+            exposure: Exposure { auto: exposure_auto, compensation: exposure_compensation, min: exposure_min, max: exposure_max, brighten: exposure_brighten, darken: exposure_darken, low: exposure_low, high: exposure_high, centre: exposure_centre, range_low: exposure_range_low, range_high: exposure_range_high, target: exposure_target, dt: exposure_dt, cut: exposure_cut },
+            grade: Grade { temperature: grade_temperature, tint: grade_tint, exposure: grade_exposure, contrast: grade_contrast, pivot: grade_pivot, saturation: grade_saturation, vibrance: grade_vibrance, lift: grade_lift, gamma: grade_gamma, gain: grade_gain, lut_a: grade_lut_a as u32, lut_b: grade_lut_b as u32, lut_blend: grade_lut_blend, lut_weight: grade_lut_weight, vignette: grade_vignette, vignette_radius: grade_vignette_radius },
             draws,
             solids,
             decals,
@@ -3112,6 +3400,36 @@ pub mod codec {
         d.count(&header.field("retained_enabled"), 175, 1)?;
         d.count(&header.field("retained_reset"), 176, 1)?;
         let _ = d.count(&header.field("retained_after"), 177, 100000)?;
+        d.count(&header.field("exposure.auto"), 180, 1)?;
+        d.finite(&header.field("exposure.compensation"), 181)?;
+        d.finite(&header.field("exposure.min"), 182)?;
+        d.finite(&header.field("exposure.max"), 183)?;
+        d.finite(&header.field("exposure.brighten"), 184)?;
+        d.finite(&header.field("exposure.darken"), 185)?;
+        d.finite(&header.field("exposure.low"), 186)?;
+        d.finite(&header.field("exposure.high"), 187)?;
+        d.finite(&header.field("exposure.centre"), 188)?;
+        d.finite(&header.field("exposure.range_low"), 189)?;
+        d.finite(&header.field("exposure.range_high"), 190)?;
+        d.finite(&header.field("exposure.target"), 191)?;
+        d.finite(&header.field("exposure.dt"), 192)?;
+        d.count(&header.field("exposure.cut"), 193, 1)?;
+        d.finite(&header.field("grade.temperature"), 194)?;
+        d.finite(&header.field("grade.tint"), 195)?;
+        d.finite(&header.field("grade.exposure"), 196)?;
+        d.finite(&header.field("grade.contrast"), 197)?;
+        d.finite(&header.field("grade.pivot"), 198)?;
+        d.finite(&header.field("grade.saturation"), 199)?;
+        d.finite(&header.field("grade.vibrance"), 200)?;
+        d.values(&header.field("grade.lift"), 201, 3, &["x","y","z"])?;
+        d.values(&header.field("grade.gamma"), 204, 3, &["x","y","z"])?;
+        d.values(&header.field("grade.gain"), 207, 3, &["x","y","z"])?;
+        let _ = d.count(&header.field("grade.lut_a"), 210, 16777215)?;
+        let _ = d.count(&header.field("grade.lut_b"), 211, 16777215)?;
+        d.finite(&header.field("grade.lut_blend"), 212)?;
+        d.finite(&header.field("grade.lut_weight"), 213)?;
+        d.finite(&header.field("grade.vignette"), 214)?;
+        d.finite(&header.field("grade.vignette_radius"), 215)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -3644,7 +3962,16 @@ pub mod codec {
             frame.shadow.local_texels as f32, frame.blur, frame.clouds.cover, frame.clouds.drift.x,
             frame.clouds.drift.z, f32::from(frame.hide_cursor), f32::from(frame.loading),
             f32::from(frame.show_captions), f32::from(frame.retained_enabled), f32::from(frame.retained_reset),
-            frame.retained_after as f32, state.len() as f32,
+            frame.retained_after as f32, f32::from(frame.exposure.auto), frame.exposure.compensation,
+            frame.exposure.min, frame.exposure.max, frame.exposure.brighten, frame.exposure.darken,
+            frame.exposure.low, frame.exposure.high, frame.exposure.centre, frame.exposure.range_low,
+            frame.exposure.range_high, frame.exposure.target, frame.exposure.dt, f32::from(frame.exposure.cut),
+            frame.grade.temperature, frame.grade.tint, frame.grade.exposure, frame.grade.contrast,
+            frame.grade.pivot, frame.grade.saturation, frame.grade.vibrance, frame.grade.lift.x,
+            frame.grade.lift.y, frame.grade.lift.z, frame.grade.gamma.x, frame.grade.gamma.y,
+            frame.grade.gamma.z, frame.grade.gain.x, frame.grade.gain.y, frame.grade.gain.z,
+            frame.grade.lut_a as f32, frame.grade.lut_b as f32, frame.grade.lut_blend, frame.grade.lut_weight,
+            frame.grade.vignette, frame.grade.vignette_radius, state.len() as f32,
         ]);
         out.extend_from_slice(state);
         out.push(frame.draws.len() as f32);

@@ -291,7 +291,7 @@ fn compile_cached(engine: &Engine, wasm: &[u8], directory: &Path) -> Result<Modu
     let directory = wtime_aot::ensure_private_cache_dir(directory)?;
     let key = cache_key(engine, wasm);
     let path = directory.join(format!("{key}.cwasm"));
-    if path.exists() {
+    if std::fs::symlink_metadata(&path).is_ok() {
         match read_cached_module(engine, &path, &key) {
             Some(module) => {
                 // Its modification time says when it was last used, for `prune`.

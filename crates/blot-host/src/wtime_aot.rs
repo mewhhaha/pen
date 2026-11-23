@@ -11,12 +11,16 @@
 
 use std::any::Any;
 use std::ffi::c_void;
+#[cfg(feature = "compiler")]
+use std::io::Read as _;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "compiler")]
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use libloading::Library;
@@ -618,7 +622,7 @@ fn rt_sources_fingerprint(canon_bin: &Path) -> String {
     let mut hasher = Sha256::new();
     for (rel, bytes) in files {
         hasher.update(rel.as_bytes());
-        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(&bytes);
     }
     format!("{:x}", hasher.finalize())[..16].to_string()
@@ -645,19 +649,207 @@ fn host_cpu_fingerprint() -> &'static str {
     })
 }
 
-/// Computes the exact same effective `-march=<target_cpu>` compiler target macro fingerprint as
-/// `wtime-aot`'s `cgen::cc_target_fingerprint`, so Pen's warm C fast-cache key cannot alias across
-/// compiler or effective target-ISA changes (with ambient compiler env vars stripped).
+/// Resolves Pen's host-side build/lock timeout (`PEN_WTIME_AOT_BUILD_TIMEOUT_SECS`, default 120s).
 #[cfg(feature = "compiler")]
-fn c_compiler_target_fingerprint(target_cpu: &str) -> Result<String> {
+fn build_timeout() -> Result<Duration> {
+    match std::env::var("PEN_WTIME_AOT_BUILD_TIMEOUT_SECS") {
+        Ok(raw) if !raw.is_empty() => {
+            let secs = raw
+                .parse::<f64>()
+                .ok()
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .and_then(|s| Duration::try_from_secs_f64(s).ok())
+                .ok_or_else(|| {
+                    anyhow!("invalid PEN_WTIME_AOT_BUILD_TIMEOUT_SECS={raw:?} (expected positive number of seconds)")
+                })?;
+            Ok(secs)
+        }
+        _ => Ok(Duration::from_secs(120)),
+    }
+}
+
+#[cfg(feature = "compiler")]
+fn ensure_before_deadline(deadline: Instant, phase: &str) -> Result<()> {
+    ensure!(
+        Instant::now() < deadline,
+        "wtime-aot {phase} exceeded host build timeout"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "compiler")]
+fn lock_file_with_deadline(file: &std::fs::File, path: &Path, exclusive: bool, deadline: Instant) -> Result<()> {
+    loop {
+        let res = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        match res {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                ensure!(
+                    Instant::now() < deadline,
+                    "timed out waiting for lock {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("locking {}", path.display()));
+            }
+        }
+    }
+}
+
+/// Runs `cmd` in its own Unix process group, capturing stdout/stderr without pipe deadlocks and
+/// terminating the entire process group if `deadline` expires.
+#[cfg(feature = "compiler")]
+fn run_cmd_output_with_deadline(mut cmd: Command, label: &str, deadline: Instant) -> Result<std::process::Output> {
+    ensure_before_deadline(deadline, label)?;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    std::thread::scope(|scope| {
+        let out_t = scope.spawn(move || {
+            let mut v = Vec::new();
+            if let Some(ref mut p) = stdout_pipe {
+                let _ = p.read_to_end(&mut v);
+            }
+            v
+        });
+        let err_t = scope.spawn(move || {
+            let mut v = Vec::new();
+            if let Some(ref mut p) = stderr_pipe {
+                let _ = p.read_to_end(&mut v);
+            }
+            v
+        });
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        #[cfg(unix)]
+                        {
+                            let group = format!("-{}", child.id());
+                            let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+                        }
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = out_t.join();
+                        let _ = err_t.join();
+                        bail!("{label} exceeded host build timeout");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => {
+                    #[cfg(unix)]
+                    {
+                        let group = format!("-{}", child.id());
+                        let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+                    }
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = out_t.join();
+                    let _ = err_t.join();
+                    return Err(e).with_context(|| format!("waiting on {label}"));
+                }
+            }
+        };
+        let stdout = out_t.join().unwrap_or_default();
+        let stderr = err_t.join().unwrap_or_default();
+        Ok(std::process::Output { status, stdout, stderr })
+    })
+}
+
+/// Computes the exact same `(cc_ver, full_64_hex_cc_target_digest, has_cet_return)` C compiler
+/// identity as `wtime-aot`'s `cgen.rs` + `build.rs`.
+///
+/// Keyed by `(canon_cc, bin_stamp, host_cpu_fingerprint, target_cpu)` in BOTH an in-process
+/// `OnceLock` cache AND an owner-private `<canon_cache>/cc-probe/` file so:
+/// 1. Warm fresh-process `pen run` launches spawn ZERO compiler subprocesses (~20 us `stat`+read);
+/// 2. Mid-process or cross-process C toolchain upgrades invalidate immediately (never stale);
+/// 3. The hashed identity matches `wtime-aot/src/build.rs` 1:1.
+#[cfg(feature = "compiler")]
+type CcIdentityKey = (PathBuf, BinStamp, String, String);
+#[cfg(feature = "compiler")]
+type CcIdentityVal = (String, String, bool);
+
+#[cfg(feature = "compiler")]
+fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) -> Result<CcIdentityVal> {
     use sha2::{Digest, Sha256};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, String>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<CcIdentityKey, CcIdentityVal>>> = OnceLock::new();
+    let mut resolved = None;
+    for cc in ["clang", "cc", "gcc"] {
+        if let Some(p) = find_in_path(cc)
+            && let Ok(canon) = std::fs::canonicalize(&p)
+            && let Ok(stamp) = bin_stamp(&canon)
+        {
+            resolved = Some((canon, stamp));
+            break;
+        }
+    }
+    let Some((canon_cc, stamp)) = resolved else {
+        bail!("no C compiler found (install clang or gcc)");
+    };
+    let host_fp = host_cpu_fingerprint().to_string();
+    let mem_key = (canon_cc.clone(), stamp, host_fp.clone(), target_cpu.to_string());
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Some(hit) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(target_cpu).cloned() {
+    if let Some(hit) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&mem_key).cloned() {
         return Ok(hit);
     }
-    let clean_cc = |cc: &str| {
-        let mut cmd = Command::new(cc);
+
+    let probe_key_line = format!(
+        "v1|{}|{:?}|{}|{}",
+        canon_cc.display(),
+        stamp,
+        host_fp,
+        target_cpu
+    );
+    let probe_dir = ensure_private_cache_dir(&canon_cache.join("cc-probe"))?;
+    let probe_file = probe_dir.join(format!("{}.txt", wasm_sha256_hex(probe_key_line.as_bytes())));
+    if let Ok(meta) = std::fs::symlink_metadata(&probe_file)
+        && !meta.file_type().is_symlink()
+        && meta.file_type().is_file()
+    {
+        let owner_ok = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                current_euid().ok().is_some_and(|euid| meta.uid() == euid)
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        };
+        if owner_ok
+            && let Ok(text) = std::fs::read_to_string(&probe_file)
+        {
+            let mut lines = text.lines();
+            if let (Some(k), Some(ver), Some(digest), Some(cet)) =
+                (lines.next(), lines.next(), lines.next(), lines.next())
+                && k == probe_key_line
+                && digest.len() == 64
+                && digest.bytes().all(|b| b.is_ascii_hexdigit())
+                && (cet == "0" || cet == "1")
+            {
+                let id = (ver.to_string(), digest.to_string(), cet == "1");
+                cache.lock().unwrap_or_else(|p| p.into_inner()).insert(mem_key, id.clone());
+                return Ok(id);
+            }
+        }
+    }
+
+    let cc_str = canon_cc.to_string_lossy().into_owned();
+    let clean_cc = || {
+        let mut cmd = Command::new(&cc_str);
         cmd.env_clear();
         for var in ["PATH", "HOME", "TMPDIR"] {
             if let Some(v) = std::env::var_os(var) {
@@ -666,27 +858,27 @@ fn c_compiler_target_fingerprint(target_cpu: &str) -> Result<String> {
         }
         cmd
     };
-    let mut found = None;
-    for cc in ["clang", "cc", "gcc"] {
-        if let Ok(out) = clean_cc(cc).arg("--version").output()
-            && out.status.success()
-        {
-            let ver = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or(cc).trim().to_string();
-            found = Some((cc, ver));
-            break;
-        }
-    }
-    let Some((cc, cc_ver)) = found else {
-        bail!("no C compiler found (install clang or gcc)");
-    };
-    let out = clean_cc(cc)
-        .args([&format!("-march={target_cpu}"), "-dM", "-E", "-x", "c", "-"])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .with_context(|| format!("probing {cc} -march={target_cpu}"))?;
+    let mut ver_cmd = clean_cc();
+    ver_cmd.arg("--version");
+    let ver_out = run_cmd_output_with_deadline(ver_cmd, "C compiler --version probe", deadline)?;
+    ensure!(ver_out.status.success(), "{cc_str} --version failed ({})", ver_out.status);
+    let cc_ver = String::from_utf8_lossy(&ver_out.stdout)
+        .lines()
+        .next()
+        .unwrap_or(&cc_str)
+        .trim()
+        .to_string();
+
+    let mut target_cmd = clean_cc();
+    target_cmd.args([&format!("-march={target_cpu}"), "-dM", "-E", "-x", "c", "-"]);
+    let out = run_cmd_output_with_deadline(
+        target_cmd,
+        &format!("probing {cc_str} -march={target_cpu}"),
+        deadline,
+    )?;
     ensure!(
         out.status.success(),
-        "{cc} -march={target_cpu} probe failed: {}",
+        "{cc_str} -march={target_cpu} probe failed: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
     let mut lines: Vec<&str> = std::str::from_utf8(&out.stdout)
@@ -697,16 +889,45 @@ fn c_compiler_target_fingerprint(target_cpu: &str) -> Result<String> {
     lines.sort_unstable();
     let mut h = Sha256::new();
     h.update(b"cc-target-v1");
-    h.update(cc_ver.as_bytes());
-    h.update(b"\n");
     h.update(target_cpu.as_bytes());
     for l in lines {
         h.update(l.as_bytes());
         h.update(b"\n");
     }
-    let fp = format!("{:x}", h.finalize())[..32].to_string();
-    cache.lock().unwrap_or_else(|p| p.into_inner()).insert(target_cpu.to_string(), fp.clone());
-    Ok(fp)
+    let cc_target = format!("{:x}", h.finalize());
+
+    #[cfg(target_arch = "x86_64")]
+    let has_cet_return = {
+        let mut cet_cmd = clean_cc();
+        cet_cmd.args(["-x", "c", "-c", "-fcf-protection=return", "-o", "/dev/null", "-"]);
+        run_cmd_output_with_deadline(cet_cmd, "probing -fcf-protection=return", deadline)?
+            .status
+            .success()
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let has_cet_return = false;
+
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = probe_dir.join(format!(
+        ".probe.{}.{}.tmp",
+        std::process::id(),
+        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let body = format!(
+        "{probe_key_line}\n{cc_ver}\n{cc_target}\n{}\n",
+        u8::from(has_cet_return)
+    );
+    if std::fs::write(&tmp, body).is_ok() {
+        if std::fs::rename(&tmp, &probe_file).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    let id = (cc_ver, cc_target, has_cet_return);
+    cache.lock().unwrap_or_else(|p| p.into_inner()).insert(mem_key, id.clone());
+    Ok(id)
 }
 
 #[cfg(feature = "compiler")]
@@ -783,19 +1004,24 @@ fn linux_shstk_status() -> ShstkStatus {
             ));
         }
     };
+    let mut saw_flags = false;
     for line in cpuinfo.lines() {
         if let Some(rest) = line.strip_prefix("flags")
             && let Some((_, flags)) = rest.split_once(':')
         {
+            saw_flags = true;
             if flags.split_whitespace().any(|f| f == "user_shstk" || f == "shstk") {
                 return ShstkStatus::Unknown(
                     "CPU/kernel advertises CET shstk but /proc/thread-self/status lacks x86_Thread_features".into(),
                 );
             }
-            return ShstkStatus::ConfirmedOff;
         }
     }
-    ShstkStatus::Unknown("unable to confirm CET shstk status from procfs".into())
+    if saw_flags {
+        ShstkStatus::ConfirmedOff
+    } else {
+        ShstkStatus::Unknown("unable to confirm CET shstk status from procfs".into())
+    }
 }
 
 /// Validates `--target-cpu` syntax independently of the host OS/architecture so an invalid CPU
@@ -945,22 +1171,32 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "native".to_string());
 
-    // Validate backend and target/host platform BEFORE touching the filesystem or hashing binaries.
+    // Validate backend, build timeout, and target/host platform BEFORE touching the filesystem or hashing binaries.
+    let deadline = Instant::now() + build_timeout()?;
     let x64_isa = match backend.as_str() {
         "c" | "rust" => None,
         "x64" => Some(resolved_x64_isa_tag(&target_cpu)?),
         other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
     };
 
+    let cache_dir = default_cache_dir(cache)?;
+    let canon_cache = ensure_private_cache_dir(&cache_dir)?;
+    let fast_dir = ensure_private_cache_dir(&canon_cache.join("by-wasm"))?;
+    let verified_dir = ensure_private_cache_dir(&canon_cache.join("verified"))?;
+
     let bin = resolve_wtime_aot_bin().unwrap_or_else(|| PathBuf::from(DEFAULT_WTIME_AOT_BIN));
     let (canon_bin, bin_hash) = bin_digest(&bin)?;
     let profile_tag = match backend.as_str() {
         "c" => {
+            let (cc_ver, cc_target, has_cet_return) = c_compiler_identity(&target_cpu, &canon_cache, deadline)?;
+            let cc_ver_hash = wasm_sha256_hex(cc_ver.as_bytes());
             format!(
-                "c-{}-{}-{}",
+                "c-{}-{}-{}-{}-cet{}",
                 sanitize_key_part(&c_opt),
                 sanitize_key_part(&target_cpu),
-                c_compiler_target_fingerprint(&target_cpu)?
+                cc_ver_hash,
+                cc_target,
+                u8::from(has_cet_return)
             )
         }
         "rust" => {
@@ -979,10 +1215,6 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
         "x64" => format!("x64-{}", x64_isa.expect("validated above")),
         _ => unreachable!(),
     };
-    let cache_dir = default_cache_dir(cache)?;
-    let canon_cache = ensure_private_cache_dir(&cache_dir)?;
-    let fast_dir = ensure_private_cache_dir(&canon_cache.join("by-wasm"))?;
-    let verified_dir = ensure_private_cache_dir(&canon_cache.join("verified"))?;
 
     let digest = wasm_sha256_hex(wasm);
     let fast_key = format!("{digest}-{profile_tag}-{bin_hash}");
@@ -992,8 +1224,9 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
     let fast_link = fast_dir.join(format!("{fast_link_name}.path"));
 
     // Single cohesive cache publication RWLock (`canon_cache/.cache.lock`, strictly ordered BEFORE
-    // any builder `entry/.publish.lock`): shared lock across warm verification + `dlopen`,
-    // exclusive lock across mismatch invalidation, rebuild, immutable staging, and cold `dlopen`.
+    // any builder `entry/.publish.lock`), acquired with host-side deadline polling: shared lock
+    // across warm verification + `dlopen`, exclusive lock across invalidation, rebuild, staging,
+    // and cold `dlopen`.
     let cache_lock_path = canon_cache.join(".cache.lock");
     let cache_lock = std::fs::File::options()
         .read(true)
@@ -1002,10 +1235,10 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
         .truncate(false)
         .open(&cache_lock_path)
         .with_context(|| format!("opening cache lock {}", cache_lock_path.display()))?;
-    cache_lock
-        .lock_shared()
-        .with_context(|| format!("shared-locking {}", cache_lock_path.display()))?;
+    lock_file_with_deadline(&cache_lock, &cache_lock_path, false, deadline)?;
+    ensure_before_deadline(deadline, "warm cache check")?;
     if let Some((_path, lib)) = try_load_warm_verified_so(&fast_link, &fast_key, &verified_dir) {
+        ensure_before_deadline(deadline, "warm cache verify")?;
         return Ok(lib);
     }
     cache_lock
@@ -1013,16 +1246,16 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
         .with_context(|| format!("unlocking {}", cache_lock_path.display()))?;
 
     // Upgrade to exclusive cache publication lock for repair/build/staging/dlopen.
-    cache_lock
-        .lock()
-        .with_context(|| format!("exclusively locking {}", cache_lock_path.display()))?;
+    lock_file_with_deadline(&cache_lock, &cache_lock_path, true, deadline)?;
+    ensure_before_deadline(deadline, "exclusive cache check")?;
     if let Some((_path, lib)) = try_load_warm_verified_so(&fast_link, &fast_key, &verified_dir) {
+        ensure_before_deadline(deadline, "exclusive cache verify")?;
         return Ok(lib);
     }
 
     // Mismatch or stale entry under the exclusive lock (no reader can be mid-`dlopen`):
     // restrict deletion strictly to `<canon_cache>/<entry>/library.so` (+ sidecar) and require
-    // successful `entry/.publish.lock` acquisition as a hard prerequisite before unlinking.
+    // successful deadline-bounded `entry/.publish.lock` acquisition as a hard prerequisite.
     if let Ok(recorded) = std::fs::read_to_string(&fast_link) {
         let mut lines = recorded.lines();
         if let (Some(_), Some(_), Some(rec_path)) = (lines.next(), lines.next(), lines.next()) {
@@ -1039,7 +1272,7 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
                     .create(true)
                     .truncate(false)
                     .open(&entry_lock_path)
-                    && entry_lock.lock().is_ok()
+                    && lock_file_with_deadline(&entry_lock, &entry_lock_path, true, deadline).is_ok()
                 {
                     let _ = std::fs::remove_file(&canon_so);
                     let _ = std::fs::remove_file(canon_so.with_extension("so.sha256"));
@@ -1058,6 +1291,11 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
     let fast_link_name = wasm_sha256_hex(fast_key.as_bytes());
     let fast_link = fast_dir.join(format!("{fast_link_name}.path"));
 
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| anyhow!("wtime-aot build exceeded host build timeout"))?;
+    let time_limit_arg = format!("{:.3}", remaining.as_secs_f64().max(0.001));
+
     let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_wasm = canon_cache.join(format!("input-{digest}-{}-{seq}.wasm", std::process::id()));
     std::fs::write(&tmp_wasm, wasm)?;
@@ -1067,7 +1305,15 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
         .arg(&tmp_wasm)
         .args(["--cache"])
         .arg(&canon_cache)
-        .args(["--backend", &backend, "--blot-cdylib", "--target-cpu", &target_cpu]);
+        .args([
+            "--backend",
+            &backend,
+            "--blot-cdylib",
+            "--target-cpu",
+            &target_cpu,
+            "--time-limit",
+            &time_limit_arg,
+        ]);
     match backend.as_str() {
         "c" => {
             cmd.args(["--c-opt", &c_opt]);
@@ -1078,7 +1324,7 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
         "x64" => {}
         _ => unreachable!(),
     }
-    let output = cmd.output().with_context(|| format!("running wtime-aot ({})", canon_bin.display()))?;
+    let output = run_cmd_output_with_deadline(cmd, &format!("wtime-aot ({})", canon_bin.display()), deadline)?;
     drop(_cleanup_wasm);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1089,6 +1335,7 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
         }
         bail!("wtime-aot build failed ({}): {stderr}", output.status);
     }
+    ensure_before_deadline(deadline, "post-build verification")?;
     let post_stamp = bin_stamp(&canon_bin)?;
     let post_bin_hash = file_sha256_hex(&canon_bin)?;
     ensure!(

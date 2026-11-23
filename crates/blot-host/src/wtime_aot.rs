@@ -281,9 +281,25 @@ fn wasm_sha256_hex(wasm: &[u8]) -> String {
 }
 
 #[cfg(feature = "compiler")]
+fn reader_sha256_hex(f: &mut std::fs::File, path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(feature = "compiler")]
 fn file_sha256_hex(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    Ok(wasm_sha256_hex(&bytes))
+    let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    reader_sha256_hex(&mut f, path)
 }
 
 /// Reads the calling thread's Linux proc status (`/proc/thread-self/status`, falling back to
@@ -594,12 +610,11 @@ type BinStamp = (u64, u64, u64, i64, i64, i64, i64);
 type BinStamp = (u64, u64, u32);
 
 #[cfg(feature = "compiler")]
-fn bin_stamp(canon: &Path) -> Result<BinStamp> {
-    let meta = std::fs::metadata(canon).with_context(|| format!("stat wtime-aot binary {}", canon.display()))?;
+fn bin_stamp_from_meta(meta: &std::fs::Metadata) -> BinStamp {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Ok((
+        (
             meta.dev(),
             meta.ino(),
             meta.len(),
@@ -607,7 +622,7 @@ fn bin_stamp(canon: &Path) -> Result<BinStamp> {
             meta.mtime_nsec(),
             meta.ctime(),
             meta.ctime_nsec(),
-        ))
+        )
     }
     #[cfg(not(unix))]
     {
@@ -616,12 +631,58 @@ fn bin_stamp(canon: &Path) -> Result<BinStamp> {
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()));
-        Ok((meta.len(), secs, nanos))
+        (meta.len(), secs, nanos)
     }
 }
 
 #[cfg(feature = "compiler")]
-fn bin_digest(bin: &Path) -> Result<(PathBuf, String)> {
+fn bin_stamp(canon: &Path) -> Result<BinStamp> {
+    let meta = std::fs::metadata(canon).with_context(|| format!("stat wtime-aot binary {}", canon.display()))?;
+    Ok(bin_stamp_from_meta(&meta))
+}
+
+#[cfg(feature = "compiler")]
+fn read_private_digest_cache_entry(entry_path: &Path) -> Option<String> {
+    const MAX_ENTRY_BYTES: u64 = 8192;
+    let sym = std::fs::symlink_metadata(entry_path).ok()?;
+    if sym.file_type().is_symlink() || !sym.file_type().is_file() || sym.len() > MAX_ENTRY_BYTES {
+        return None;
+    }
+    #[cfg(unix)]
+    let euid = current_euid().ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if (sym.permissions().mode() & 0o022) != 0 || sym.uid() != euid {
+            return None;
+        }
+    }
+    let f = std::fs::File::open(entry_path).ok()?;
+    let meta = f.metadata().ok()?;
+    if !meta.file_type().is_file() || meta.len() > MAX_ENTRY_BYTES {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.dev() != sym.dev()
+            || meta.ino() != sym.ino()
+            || meta.uid() != euid
+            || (meta.permissions().mode() & 0o022) != 0
+        {
+            return None;
+        }
+    }
+    let mut text = String::new();
+    f.take(MAX_ENTRY_BYTES + 1).read_to_string(&mut text).ok()?;
+    if (text.len() as u64) > MAX_ENTRY_BYTES {
+        return None;
+    }
+    Some(text)
+}
+
+#[cfg(feature = "compiler")]
+fn bin_digest(bin: &Path, canon_cache: &Path) -> Result<(PathBuf, String)> {
     let canon = std::fs::canonicalize(bin).with_context(|| format!("canonicalizing wtime-aot binary {}", bin.display()))?;
     static CACHE: OnceLock<Mutex<std::collections::HashMap<(PathBuf, BinStamp), String>>> = OnceLock::new();
     let stamp = bin_stamp(&canon)?;
@@ -630,7 +691,57 @@ fn bin_digest(bin: &Path) -> Result<(PathBuf, String)> {
     if let Some(hit) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key).cloned() {
         return Ok((canon, hit));
     }
-    let digest = file_sha256_hex(&canon)?;
+
+    // Fresh-process warm-path lookup persisted inside owner-private `canon_cache/bin-digests/`,
+    // keyed strictly by canonical binary path + full `BinStamp` (`dev/ino/len/mtime/ctime`).
+    // Cold builds still compute full pre- and post-build `file_sha256_hex` before publishing.
+    let bin_cache_dir = ensure_private_cache_dir(&canon_cache.join("bin-digests"))?;
+    let path_hash = wasm_sha256_hex(canon.as_os_str().as_encoded_bytes());
+    let entry_path = bin_cache_dir.join(format!("{path_hash}.txt"));
+    let expected_header = format!("v1|{}|{stamp:?}", canon.display());
+    if let Some(text) = read_private_digest_cache_entry(&entry_path) {
+        let mut lines = text.lines();
+        if let (Some(hdr), Some(sha), None) = (lines.next(), lines.next(), lines.next())
+            && hdr == expected_header
+            && sha.len() == 64
+            && sha.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            let digest = sha.to_string();
+            cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, digest.clone());
+            return Ok((canon, digest));
+        }
+    }
+
+    // Open once and verify pre-read, post-read, and path `BinStamp` all match `stamp` before
+    // binding `(canon, stamp) -> digest` in memory or on disk (prevents stamp-to-hash TOCTOU).
+    let mut f = std::fs::File::open(&canon).with_context(|| format!("opening {}", canon.display()))?;
+    let pre_meta = f.metadata().with_context(|| format!("fstat {}", canon.display()))?;
+    let pre_stamp = bin_stamp_from_meta(&pre_meta);
+    ensure!(
+        pre_stamp == stamp,
+        "wtime-aot binary {} changed before hashing; refusing to cache stale digest",
+        canon.display()
+    );
+    let digest = reader_sha256_hex(&mut f, &canon)?;
+    let post_meta = f.metadata().with_context(|| format!("fstat {}", canon.display()))?;
+    let post_stamp = bin_stamp_from_meta(&post_meta);
+    let path_stamp = bin_stamp(&canon)?;
+    ensure!(
+        post_stamp == stamp && path_stamp == stamp,
+        "wtime-aot binary {} changed during hashing; refusing to cache stale digest",
+        canon.display()
+    );
+
+    if !expected_header.contains('\n')
+        && !expected_header.contains('\r')
+        && let Ok((mut tmp_file, tmp_path)) = create_private_temp_file(&bin_cache_dir, &path_hash, ".tmp")
+    {
+        let ok = tmp_file.write_all(format!("{expected_header}\n{digest}\n").as_bytes()).is_ok();
+        drop(tmp_file);
+        if !ok || std::fs::rename(&tmp_path, &entry_path).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
     cache.lock().unwrap_or_else(|p| p.into_inner()).insert(key, digest.clone());
     Ok((canon, digest))
 }
@@ -2521,16 +2632,22 @@ fn try_load_warm_verified_so(
     if !canon_verified.starts_with(verified_dir) {
         return None;
     }
-    let bytes = std::fs::read(&canon_verified).ok()?;
-    if wasm_sha256_hex(&bytes) != rec_so_sha {
-        return None;
-    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if require_shstk && !elf64_has_x86_shstk_property(&bytes) {
+    if require_shstk {
+        let bytes = std::fs::read(&canon_verified).ok()?;
+        if wasm_sha256_hex(&bytes) != rec_so_sha || !elf64_has_x86_shstk_property(&bytes) {
+            return None;
+        }
+    } else if file_sha256_hex(&canon_verified).ok().as_deref() != Some(rec_so_sha) {
         return None;
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
-    let _ = require_shstk;
+    {
+        let _ = require_shstk;
+        if file_sha256_hex(&canon_verified).ok().as_deref() != Some(rec_so_sha) {
+            return None;
+        }
+    }
     // SAFETY: `canon_verified` is an immutable `0o555` content-addressed file inside our owner-only
     // `0o700` cache whose SHA-256 matches `rec_so_sha` while `.cache.lock` is held across `dlopen`.
     let lib = unsafe { Library::new(&canon_verified) }.ok()?;
@@ -2593,7 +2710,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
     let verified_dir = ensure_private_cache_dir(&canon_cache.join("verified"))?;
 
     let bin = resolve_wtime_aot_bin().unwrap_or_else(|| PathBuf::from(DEFAULT_WTIME_AOT_BIN));
-    let (canon_bin, bin_hash) = bin_digest(&bin)?;
+    let (canon_bin, bin_hash) = bin_digest(&bin, &canon_cache)?;
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
     let require_c_shstk = backend == "c" && !matches!(linux_shstk_status(), ShstkStatus::ConfirmedOff);
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64")))]
@@ -2959,29 +3076,6 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
 }
 
 #[cfg(feature = "compiler")]
-fn counter_export_names(wasm: &[u8], abi: &GuestAbi) -> Vec<String> {
-    let mut names = Vec::new();
-    for payload in wasmparser::Parser::new(0).parse_all(wasm).flatten() {
-        if let wasmparser::Payload::ExportSection(section) = payload {
-            for export in section.into_iter().flatten() {
-                if export.kind == wasmparser::ExternalKind::Global
-                    && export.name.starts_with("blot:")
-                    && abi.constants.iter().all(|c| c.name != export.name)
-                {
-                    names.push(export.name.to_owned());
-                }
-            }
-        }
-    }
-    names
-}
-
-#[cfg(not(feature = "compiler"))]
-fn counter_export_names(_wasm: &[u8], _abi: &GuestAbi) -> Vec<String> {
-    Vec::new()
-}
-
-#[cfg(feature = "compiler")]
 fn wasmparser_val(value: ValueType) -> wasmparser::ValType {
     match value {
         ValueType::F32 => wasmparser::ValType::F32,
@@ -2994,10 +3088,13 @@ struct ValidatedAotWasm {
     has_blot_memory_export: bool,
     has_mut_extern_table: bool,
     expected_imports: Option<Vec<CallbackType>>,
+    counter_names: Vec<String>,
+    imaged: Result<Vec<String>, String>,
 }
 
 /// Validates every import, entrypoint, constant, arena, ownership, and finish-invocation
-/// Wasm signature before cache lookup or compilation, matching Wasmtime's exact ABI checks.
+/// Wasm signature in a single section-skipping pass (skipping the Code section body in O(1))
+/// while also collecting counter exports and imaged mutable globals.
 #[cfg(feature = "compiler")]
 fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
     let callbacks = abi.callbacks();
@@ -3005,12 +3102,33 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
     let mut func_type_idxs: Vec<u32> = Vec::new();
     let mut expected_imports: Vec<CallbackType> = Vec::new();
     let mut global_types: Vec<wasmparser::ValType> = Vec::new();
+    let mut mutable_globals: Vec<u32> = Vec::new();
+    let mut exported_globals = std::collections::HashMap::new();
+    let mut counter_names: Vec<String> = Vec::new();
+    let mut imaged_err: Option<String> = None;
     let mut memory_limits: Option<(u64, Option<u64>)> = None;
     let mut has_mut_extern_table = false;
     let mut exports = std::collections::HashMap::new();
 
-    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
-        match payload? {
+    let mut parser = wasmparser::Parser::new(0);
+    let mut offset = 0usize;
+    loop {
+        let rest = &wasm[offset..];
+        let (consumed, payload) = match parser.parse(rest, true)? {
+            wasmparser::Chunk::Parsed { consumed, payload } => (consumed, payload),
+            wasmparser::Chunk::NeedMoreData(_) => bail!("invalid_abi: unexpected EOF in wasm module"),
+        };
+        match payload {
+            wasmparser::Payload::CodeSectionStart { size, .. } => {
+                let size = usize::try_from(size).map_err(|_| anyhow!("invalid_abi: code section size overflow"))?;
+                let skip = consumed
+                    .checked_add(size)
+                    .ok_or_else(|| anyhow!("invalid_abi: code section size overflow"))?;
+                ensure!(skip <= rest.len(), "invalid_abi: truncated code section");
+                offset += skip;
+                parser.skip_section();
+                continue;
+            }
             wasmparser::Payload::TypeSection(section) => {
                 for group in section {
                     for st in group?.into_types() {
@@ -3064,6 +3182,9 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
                     let table = table?;
                     if table.ty.element_type.is_extern_ref() {
                         has_mut_extern_table = true;
+                        if imaged_err.is_none() {
+                            imaged_err = Some("mutable externref tables are not captured by snapshots".into());
+                        }
                     }
                 }
             }
@@ -3084,19 +3205,46 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
                 }
             }
             wasmparser::Payload::GlobalSection(section) => {
-                for g in section {
+                for (index, g) in section.into_iter().enumerate() {
                     let g = g?;
                     global_types.push(g.ty.content_type);
+                    if g.ty.mutable {
+                        if !matches!(
+                            g.ty.content_type,
+                            wasmparser::ValType::I32
+                                | wasmparser::ValType::I64
+                                | wasmparser::ValType::F32
+                                | wasmparser::ValType::F64
+                        ) {
+                            if imaged_err.is_none() {
+                                imaged_err = Some(format!("its mutable global {index} holds a reference"));
+                            }
+                        } else if let Ok(gi) = u32::try_from(index) {
+                            mutable_globals.push(gi);
+                        } else if imaged_err.is_none() {
+                            imaged_err = Some("global index exceeds u32".into());
+                        }
+                    }
                 }
             }
             wasmparser::Payload::ExportSection(section) => {
                 for export in section {
                     let export = export?;
+                    if export.kind == wasmparser::ExternalKind::Global {
+                        exported_globals.entry(export.index).or_insert_with(|| export.name.to_owned());
+                        if export.name.starts_with("blot:") && abi.constants.iter().all(|c| c.name != export.name) {
+                            counter_names.push(export.name.to_owned());
+                        }
+                    }
                     exports.insert(export.name.to_owned(), (export.kind, export.index));
                 }
             }
+            wasmparser::Payload::End(_) => {
+                break;
+            }
             _ => {}
         }
+        offset += consumed;
     }
 
     let lookup_func_sig = |fidx: u32| -> Option<&wasmparser::FuncType> {
@@ -3175,11 +3323,26 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
                 .is_some_and(|fty| fty.params().is_empty() && fty.results() == [wasmparser::ValType::I32]);
         ensure!(valid_sig, "invalid_abi: invalid {INVOCATION_FINISH} signature");
     }
+    let imaged = if let Some(err) = imaged_err {
+        Err(err)
+    } else {
+        let hidden = mutable_globals.iter().filter(|idx| !exported_globals.contains_key(idx)).count();
+        if hidden > 0 {
+            Err(format!(
+                "{hidden} of its {} mutable globals are not exported, out of the host's reach",
+                mutable_globals.len()
+            ))
+        } else {
+            Ok(mutable_globals.iter().map(|idx| exported_globals[idx].clone()).collect())
+        }
+    };
     Ok(ValidatedAotWasm {
         memory_limits,
         has_blot_memory_export,
         has_mut_extern_table,
         expected_imports: Some(expected_imports),
+        counter_names,
+        imaged,
     })
 }
 
@@ -3190,6 +3353,8 @@ fn validate_aot_wasm(_wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
         has_blot_memory_export: abi.uses_arrays(),
         has_mut_extern_table: false,
         expected_imports: None,
+        counter_names: Vec::new(),
+        imaged: Ok(Vec::new()),
     })
 }
 
@@ -3209,7 +3374,7 @@ unsafe fn read_aot_str(_lib: &Library, ptr: *const u8, len: usize) -> Result<&st
 }
 
 impl AotModule {
-    pub fn compile(wasm: &[u8], abi: &GuestAbi, cache: Option<&Path>) -> Result<Self> {
+    pub fn compile(wasm: &[u8], abi: &GuestAbi, cache: Option<&Path>) -> Result<(Self, Result<Vec<String>, String>)> {
         ensure!(abi.tasks.is_none(), "wtime-aot experimental backend does not support legacy tasks");
         abi.check_hostable()?;
         let validated = validate_aot_wasm(wasm, abi)?;
@@ -3270,18 +3435,20 @@ impl AotModule {
                 active_get_global: *lib.get(b"blot_aot_active_get_global\0")?,
             }
         };
-        let counter_names = counter_export_names(wasm, abi);
-        Ok(Self {
-            lib: Arc::new(AotLibrary {
-                _lib: lib,
-                syms,
-                imports,
-                counter_names,
-                memory_limits: validated.memory_limits,
-                has_blot_memory_export: validated.has_blot_memory_export,
-                has_mut_extern_table: validated.has_mut_extern_table,
-            }),
-        })
+        Ok((
+            Self {
+                lib: Arc::new(AotLibrary {
+                    _lib: lib,
+                    syms,
+                    imports,
+                    counter_names: validated.counter_names,
+                    memory_limits: validated.memory_limits,
+                    has_blot_memory_export: validated.has_blot_memory_export,
+                    has_mut_extern_table: validated.has_mut_extern_table,
+                }),
+            },
+            validated.imaged,
+        ))
     }
 }
 

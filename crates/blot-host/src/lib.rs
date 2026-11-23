@@ -91,8 +91,25 @@ fn imaged_globals(wasm: &[u8]) -> Result<Vec<String>, String> {
     let mut mutable = Vec::new();
     let mut exported = std::collections::HashMap::new();
     let mut imported = 0;
-    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
-        match payload.map_err(|error| error.to_string())? {
+    let mut parser = wasmparser::Parser::new(0);
+    let mut offset = 0usize;
+    loop {
+        let rest = &wasm[offset..];
+        let (consumed, payload) = match parser.parse(rest, true).map_err(|error| error.to_string())? {
+            wasmparser::Chunk::Parsed { consumed, payload } => (consumed, payload),
+            wasmparser::Chunk::NeedMoreData(_) => return Err("unexpected EOF in wasm module".into()),
+        };
+        match payload {
+            wasmparser::Payload::CodeSectionStart { size, .. } => {
+                let size = usize::try_from(size).map_err(|error| error.to_string())?;
+                let skip = consumed.checked_add(size).ok_or_else(|| "code section size overflow".to_string())?;
+                if skip > rest.len() {
+                    return Err("truncated code section".into());
+                }
+                offset += skip;
+                parser.skip_section();
+                continue;
+            }
             wasmparser::Payload::ImportSection(section) => {
                 for import in section.into_imports() {
                     match import.map_err(|error| error.to_string())?.ty {
@@ -137,8 +154,10 @@ fn imaged_globals(wasm: &[u8]) -> Result<Vec<String>, String> {
                     }
                 }
             }
+            wasmparser::Payload::End(_) => break,
             _ => {}
         }
+        offset += consumed;
     }
     let hidden = mutable.iter().filter(|index| !exported.contains_key(index)).count();
     if hidden > 0 {
@@ -203,20 +222,20 @@ impl GuestModule {
             let shape = read_memory_shape(wasm)?;
             validate_memory_shape(&shape)?;
             let use_aot = if prefer_aot { wtime_aot::preferred_for_run() } else { wtime_aot::enabled() };
-            let module = if use_aot
+            let (module, imaged) = if use_aot
                 && engine_allows_aot(engine)
                 && abi.tasks.is_none()
                 && abi.kernels.is_empty()
                 && abi.processes.is_empty()
             {
-                CompiledModule::WtimeAot(wtime_aot::AotModule::compile(wasm, &abi, cache)?)
+                let (aot, imaged) = wtime_aot::AotModule::compile(wasm, &abi, cache)?;
+                (CompiledModule::WtimeAot(aot), Arc::new(imaged))
             } else {
                 let module = compile(engine, wasm, cache)?;
                 validate_raw_memory_shape(&module, &shape)?;
                 validate_module(&module, &abi)?;
-                CompiledModule::Wasmtime(module)
+                (CompiledModule::Wasmtime(module), Arc::new(imaged_globals(wasm)))
             };
-            let imaged = Arc::new(imaged_globals(wasm));
             Ok(GuestModule { module, trace: None, abi, symbols: Arc::new(Symbols::read(wasm)), imaged })
         }
         #[cfg(not(feature = "compiler"))]

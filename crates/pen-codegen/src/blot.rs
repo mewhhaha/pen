@@ -313,9 +313,8 @@ fn render_views(model: &Model) -> Vec<String> {
     let mut out = vec![String::new(),
         "func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own #[~F32]) =>".into(),
         "  @storage.truncate encoded 0".into(),
-        "  append_render_views packet collections project context encoded".into(),
-        "  return encoded".into(),
-        "func append_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: #[~F32]) =>".into(),
+        "  return append_render_views packet collections project context encoded".into(),
+        "func append_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own #[~F32]) =>".into(),
         "  let start = encoded.length".into()];
     for section in &model.sections {
         if kind(&section.section) != "trailing" && section.owner.is_none() {
@@ -411,10 +410,10 @@ fn render_views(model: &Model) -> Vec<String> {
             if *unit == "count" {
                 size.push_str(&format!(" / {}", section.fixed.as_ref().unwrap().lanes));
             }
-            out.push(format!("  encoded[start + {offset}] = U32.to_f32 ({size})"));
+            out.push(format!("  encoded[start + {offset}] := U32.to_f32 ({size})"));
         }
     }
-    out.push("  return ()".into());
+    out.push("  return encoded".into());
     out.push(String::new());
     out.push("func measure_render_floats collections -> project -> context =>".into());
     out.push("  let total: U32 = protocol.packet_header_floats".into());

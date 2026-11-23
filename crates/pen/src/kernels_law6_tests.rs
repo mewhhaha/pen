@@ -302,14 +302,14 @@ func decode_state_fn (own access) -> (values: #[F32]) =>
   let report: #[F32] = #[]
   if values.length >= 12:
     for i in 0 .. 9:
-      access.sim[i] = values[i]
-    access.clock[0] = $clock.Clock {{ tick: F32.to_u32 values[9], remainder: values[10] }}
+      access.sim[i] := values[i]
+    access.clock[0] := $clock.Clock {{ tick: F32.to_u32 values[9], remainder: values[10] }}
     let svc_len = F32.to_u32 values[11]
     if 12 + svc_len <= values.length:
       let slice = array.slice 12 svc_len values
       access.services := services.decode slice self
   access := colony_paths.reset_storage access
-  kernel_transport.reset access.kernel_transport
+  access.kernel_transport := kernel_transport.reset self
   return (report, access)
 
 // Operation::SnapshotScene (op 5) exposes ephemeral prewarm metrics so tests can
@@ -327,45 +327,48 @@ func decode_telemetry (own access) -> (values: #[F32]) =>
   let report: #[F32] = #[]
   return (report, access)
 
-func receive_kernels_fn access -> (evs: &[events.Event]) =>
-  kernel_transport.receive_events access.kernel_transport evs
+func receive_kernels_fn (own access) -> (evs: &[events.Event]) =>
+  access.kernel_transport := kernel_transport.receive_events self evs
   colony_paths.absorb_prewarmed_routes access.colony_paths access.kernel_transport (kernel.id plan_routes) (kernel.binding_hash plan_routes)
-  return ()
+  return access
 
-func emit_kernels_fn access -> (base_floats: U32) -> (canonical_count: U32) -> (admitted: #[~services.Request]) -> (payload_out: #[~F32]) =>
-  let kt: kernel_transport.Access = access.kernel_transport
-  let cp: colony_paths.Access = access.colony_paths
-  if kernel_transport.cap_active kt and cp.state[0].ready:
+func emit_kernels_fn (own access) -> (base_floats: U32) -> (canonical_count: U32) -> (admitted: #[~services.Request]) -> (payload_out: #[~F32]) =>
+  if kernel_transport.cap_active access.kernel_transport and access.colony_paths.state[0].ready:
     let kid = kernel.id plan_routes
     let bh = kernel.binding_hash plan_routes
-    let gh = cp.state[0].geom_hash
-    let wire = &cp.wire_ctx[0..cp.wire_ctx.length]
-    if kernel_transport.ensure_context kt kid bh gh wire:
+    let gh = access.colony_paths.state[0].geom_hash
+    let (ctx_ready, next_kt) = do:
+      let cp: colony_paths.Access = access.colony_paths
+      let wire = &cp.wire_ctx[0..cp.wire_ctx.length]
+      break kernel_transport.ensure_context access.kernel_transport kid bh gh wire
+    access.kernel_transport := next_kt
+    if ctx_ready:
       let batch: #[~F32] = #[]
       let cnt: U32 = 0
-      if not (colony_paths.has_prewarm cp (kernel.f32_bits q0_ox) (kernel.f32_bits q0_oz) (kernel.f32_bits q0_tx) (kernel.f32_bits q0_tz) gh):
+      if not (colony_paths.has_prewarm access.colony_paths (kernel.f32_bits q0_ox) (kernel.f32_bits q0_oz) (kernel.f32_bits q0_tx) (kernel.f32_bits q0_tz) gh):
         @storage.push batch q0_ox
         @storage.push batch q0_oz
         @storage.push batch q0_tx
         @storage.push batch q0_tz
         cnt := cnt + 1
-      if not (colony_paths.has_prewarm cp (kernel.f32_bits q1_ox) (kernel.f32_bits q1_oz) (kernel.f32_bits q1_tx) (kernel.f32_bits q1_tz) gh):
+      if not (colony_paths.has_prewarm access.colony_paths (kernel.f32_bits q1_ox) (kernel.f32_bits q1_oz) (kernel.f32_bits q1_tx) (kernel.f32_bits q1_tz) gh):
         @storage.push batch q1_ox
         @storage.push batch q1_oz
         @storage.push batch q1_tx
         @storage.push batch q1_tz
         cnt := cnt + 1
       if cnt > 0:
-        let ignored = kernel_transport.enqueue_batch kt kid bh gh cnt (&batch[0..batch.length])
-    host.admit_kernel_requests base_floats canonical_count kt admitted
-    for i in 0 .. kt.payload.length:
-      @storage.push payload_out kt.payload[i]
-  return ()
+        let (_, next_kt2) = kernel_transport.enqueue_batch access.kernel_transport kid bh gh cnt (&batch[0..batch.length])
+        access.kernel_transport := next_kt2
+    access.kernel_transport := host.admit_kernel_requests base_floats canonical_count self admitted
+    for i in 0 .. access.kernel_transport.payload.length:
+      @storage.push payload_out access.kernel_transport.payload[i]
+  return access
 
 func init_world (own access) =>
   access.services := services.idle self 6
-  access.services.next[0] = 8388607
-  kernel_transport.reset access.kernel_transport
+  access.services.next[0] := 8388607
+  access.kernel_transport := kernel_transport.reset self
   access := colony_paths.reset_storage access
   return access
 

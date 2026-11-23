@@ -179,9 +179,9 @@ const ui_live_assertive = 2
 // a navmesh, ray and shape queries against colliders, and noise and
 // heightfields, the game's actions and their bindings (INPUT_OP_*), the engine's
 // preferences (PREFERENCES_OP_*), the player's language (LOCALE_OP_*), the
-// captions of the sounds that play (CAPTIONS_OP_*) and the player's consent to
-// crash and performance reports (REPORTS_OP_*). A host without one answers
-// unavailable.
+// captions of the sounds that play (CAPTIONS_OP_*), the player's consent to
+// crash and performance reports (REPORTS_OP_*), and isolated pure data-parallel
+// batch kernels (KERNEL_OP_*). A host without one answers unavailable.
 const service_steam = 0
 const service_clipboard = 1
 const service_url = 2
@@ -197,6 +197,7 @@ const service_preferences = 11
 const service_locale = 12
 const service_captions = 13
 const service_reports = 14
+const service_kernel = 15
 
 // How a service request went: done; the service is not there (Steam is off, no
 // clipboard, the browser cannot); it is there but refused or failed; or the host
@@ -205,6 +206,15 @@ const service_status_ok = 0
 const service_status_unavailable = 1
 const service_status_failed = 2
 const service_status_unknown = 3
+
+// Isolated entry kernel service operations: ctx_begin, ctx_chunk and ctx_commit
+// upload and verify a kernel's prepared WireCtx under lossless 32-bit
+// (host_epoch, upload_seq) ordering, and run_batch executes a batch of items
+// against the bound kernel and context.
+const kernel_op_ctx_begin = 0
+const kernel_op_ctx_chunk = 1
+const kernel_op_ctx_commit = 2
+const kernel_op_run_batch = 3
 
 // Steam's operations. Achievements and stats go by their API names (the text);
 // set_stat and set_stat_float set `a`, add_stat adds `a` to an integer stat, and

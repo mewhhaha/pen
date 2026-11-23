@@ -592,9 +592,9 @@ fn bin_digest(bin: &Path) -> Result<(PathBuf, String)> {
 }
 
 /// Computes a deterministic 16-hex-char fingerprint of the adjacent `wtime-aot/rt` runtime crate
-/// sources when using `--backend rust`, preventing stale Rust fast-cache hits after runtime edits.
+/// sources when using `--backend rust`, propagating read errors cleanly (matching `build.rs`).
 #[cfg(feature = "compiler")]
-fn rt_sources_fingerprint(canon_bin: &Path) -> String {
+fn rt_sources_fingerprint(canon_bin: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let rt_dir = canon_bin
         .ancestors()
@@ -603,18 +603,21 @@ fn rt_sources_fingerprint(canon_bin: &Path) -> String {
         .map(|anc| anc.join("rt"))
         .find(|cand| cand.join("Cargo.toml").is_file() && cand.join("src").is_dir());
     let Some(rt_dir) = rt_dir else {
-        return "no-rt".to_string();
+        return Ok("no-rt".to_string());
     };
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut pending = vec![rt_dir.join("Cargo.toml"), rt_dir.join("src")];
     while let Some(path) = pending.pop() {
         if path.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&path) {
-                for entry in entries.flatten() {
-                    pending.push(entry.path());
-                }
+            let entries = std::fs::read_dir(&path)
+                .with_context(|| format!("reading runtime source directory {}", path.display()))?;
+            for entry in entries {
+                let entry = entry.with_context(|| format!("iterating runtime source directory {}", path.display()))?;
+                pending.push(entry.path());
             }
-        } else if let Ok(bytes) = std::fs::read(&path) {
+        } else {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("reading runtime source file {}", path.display()))?;
             let rel = path.strip_prefix(&rt_dir).unwrap_or(&path).to_string_lossy().into_owned();
             files.push((rel, bytes));
         }
@@ -626,7 +629,7 @@ fn rt_sources_fingerprint(canon_bin: &Path) -> String {
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(&bytes);
     }
-    format!("{:x}", hasher.finalize())[..16].to_string()
+    Ok(format!("{:x}", hasher.finalize())[..16].to_string())
 }
 
 #[cfg(feature = "compiler")]
@@ -819,11 +822,15 @@ fn elf64_has_x86_shstk_property(elf: &[u8]) -> bool {
     const NT_GNU_PROPERTY_TYPE_0: u32 = 5;
     const GNU_PROPERTY_X86_FEATURE_1_AND: u32 = 0xc000_0002;
     const GNU_PROPERTY_X86_FEATURE_1_SHSTK: u32 = 1 << 1;
+    let align_up = |v: usize, a: usize| v.checked_add(a - 1).map(|x| x & !(a - 1));
     for i in 0..e_phnum {
-        let Some(off) = e_phoff.checked_add(i.saturating_mul(e_phentsize)) else {
+        let Some(off) = i.checked_mul(e_phentsize).and_then(|d| e_phoff.checked_add(d)) else {
             break;
         };
-        if off + 56 > elf.len() {
+        let Some(ph_end) = off.checked_add(56) else {
+            break;
+        };
+        if ph_end > elf.len() {
             break;
         }
         let p_type = u32::from_le_bytes(elf[off..off + 4].try_into().unwrap());
@@ -840,10 +847,12 @@ fn elf64_has_x86_shstk_property(elf: &[u8]) -> bool {
             continue;
         };
         let note_align = if p_type == PT_GNU_PROPERTY || p_align >= 8 { 8 } else { 4 };
-        let align_up = |v: usize, a: usize| (v + (a - 1)) & !(a - 1);
         let mut cur = p_offset;
         let end = p_offset.saturating_add(p_filesz).min(elf.len());
-        while cur + 12 <= end {
+        while let Some(name_start) = cur.checked_add(12) {
+            if name_start > end {
+                break;
+            }
             let Ok(namesz) = usize::try_from(u32::from_le_bytes(elf[cur..cur + 4].try_into().unwrap())) else {
                 break;
             };
@@ -851,23 +860,32 @@ fn elf64_has_x86_shstk_property(elf: &[u8]) -> bool {
                 break;
             };
             let ntype = u32::from_le_bytes(elf[cur + 8..cur + 12].try_into().unwrap());
-            let name_start = cur + 12;
-            let name_end = name_start.saturating_add(namesz);
-            let desc_start = align_up(name_end, note_align);
-            let desc_end = desc_start.saturating_add(descsz);
+            let Some(name_end) = name_start.checked_add(namesz) else {
+                break;
+            };
+            let Some(desc_start) = align_up(name_end, note_align) else {
+                break;
+            };
+            let Some(desc_end) = desc_start.checked_add(descsz) else {
+                break;
+            };
             if desc_end > end {
                 break;
             }
             if ntype == NT_GNU_PROPERTY_TYPE_0 && &elf[name_start..name_end] == b"GNU\0" {
                 let mut p = desc_start;
-                while p + 8 <= desc_end {
+                while let Some(data_start) = p.checked_add(8) {
+                    if data_start > desc_end {
+                        break;
+                    }
                     let pr_type = u32::from_le_bytes(elf[p..p + 4].try_into().unwrap());
                     let Ok(pr_datasz) = usize::try_from(u32::from_le_bytes(elf[p + 4..p + 8].try_into().unwrap()))
                     else {
                         break;
                     };
-                    let data_start = p + 8;
-                    let data_end = data_start.saturating_add(pr_datasz);
+                    let Some(data_end) = data_start.checked_add(pr_datasz) else {
+                        break;
+                    };
                     if data_end > desc_end {
                         break;
                     }
@@ -877,10 +895,16 @@ fn elf64_has_x86_shstk_property(elf: &[u8]) -> bool {
                             return true;
                         }
                     }
-                    p = align_up(data_end, 8);
+                    let Some(next_p) = align_up(data_end, 8) else {
+                        break;
+                    };
+                    p = next_p;
                 }
             }
-            cur = align_up(desc_end, note_align);
+            let Some(next_cur) = align_up(desc_end, note_align) else {
+                break;
+            };
+            cur = next_cur;
         }
     }
     false
@@ -903,6 +927,7 @@ struct ResolvedCcIdentity {
     cc_name: &'static str,
     canon_cc: PathBuf,
     stamp: BinStamp,
+    lld_key: Option<(PathBuf, BinStamp)>,
     cc_ver: String,
     cc_target: String,
     has_cet_return: bool,
@@ -931,6 +956,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
                 cc_name: cc,
                 canon_cc,
                 stamp,
+                lld_key: lld_key.clone(),
                 cc_ver,
                 cc_target,
                 has_cet_return,
@@ -981,6 +1007,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
                         cc_name: cc,
                         canon_cc,
                         stamp,
+                        lld_key: lld_key.clone(),
                         cc_ver: id.0,
                         cc_target: id.1,
                         has_cet_return: id.2,
@@ -1121,6 +1148,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
             cc_name: cc,
             canon_cc,
             stamp,
+            lld_key: lld_key.clone(),
             cc_ver: id.0,
             cc_target: id.1,
             has_cet_return: id.2,
@@ -1487,7 +1515,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64")))]
     let require_c_shstk = false;
 
-    let mut resolved_cc: Option<(&'static str, PathBuf, BinStamp)> = None;
+    let mut resolved_cc: Option<ResolvedCcIdentity> = None;
     let mut resolved_rust: Option<(ResolvedRustcIdentity, String)> = None;
     let profile_tag = match backend.as_str() {
         "c" => {
@@ -1500,8 +1528,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
                 );
             }
             let cc_ver_hash = wasm_sha256_hex(cc_id.cc_ver.as_bytes());
-            resolved_cc = Some((cc_id.cc_name, cc_id.canon_cc, cc_id.stamp));
-            format!(
+            let tag = format!(
                 "c-{}-{}-{}-{}-cet{}-sc{}",
                 sanitize_key_part(c_opt),
                 sanitize_key_part(target_cpu),
@@ -1509,7 +1536,9 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
                 cc_id.cc_target,
                 u8::from(cc_id.has_cet_return),
                 u8::from(cc_id.has_stack_clash),
-            )
+            );
+            resolved_cc = Some(cc_id);
+            tag
         }
         "rust" => {
             let cpu_tag = if target_cpu == "native" {
@@ -1518,7 +1547,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
                 sanitize_key_part(target_cpu)
             };
             let rust_id = rustc_identity(toolchain, &canon_cache, deadline, false)?;
-            let rt_fp = rt_sources_fingerprint(&canon_bin);
+            let rt_fp = rt_sources_fingerprint(&canon_bin)?;
             let tag = format!(
                 "rust-{}-{cpu_tag}-{}-{rt_fp}",
                 sanitize_key_part(toolchain),
@@ -1666,22 +1695,55 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         "wtime-aot compiler binary {} changed during build; refusing to bind artifact to stale provenance",
         canon_bin.display()
     );
-    if let Some((cc_name, ref pre_canon_cc, pre_cc_stamp)) = resolved_cc {
+    if let Some(ref pre_cc) = resolved_cc {
+        let cc_name = pre_cc.cc_name;
+        for cand in ["clang", "cc", "gcc"] {
+            if cand == cc_name {
+                break;
+            }
+            if let Some(higher) = find_in_path(cand)
+                && let Ok(canon_higher) = std::fs::canonicalize(&higher)
+            {
+                let mut ver_cmd = Command::new(&canon_higher);
+                ver_cmd.env_clear();
+                for var in ["PATH", "HOME", "TMPDIR"] {
+                    if let Some(v) = std::env::var_os(var) {
+                        ver_cmd.env(var, v);
+                    }
+                }
+                ver_cmd.arg("--version");
+                if run_cmd_output_with_deadline(ver_cmd, &canon_cache, &format!("{cand} --version"), deadline)
+                    .is_ok_and(|o| o.status.success())
+                {
+                    bail!(
+                        "higher-precedence C compiler {cand} ({}) appeared on PATH during build (previously selected {cc_name}); refusing to bind artifact to stale provenance",
+                        canon_higher.display()
+                    );
+                }
+            }
+        }
         let post_found = find_in_path(cc_name)
             .ok_or_else(|| anyhow!("C compiler {cc_name} disappeared from PATH during build"))?;
         let post_canon_cc = std::fs::canonicalize(&post_found)
             .with_context(|| format!("canonicalizing post-build C compiler {}", post_found.display()))?;
         let post_cc_stamp = bin_stamp(&post_canon_cc)?;
         ensure!(
-            &post_canon_cc == pre_canon_cc && pre_cc_stamp == post_cc_stamp,
+            post_canon_cc == pre_cc.canon_cc && pre_cc.stamp == post_cc_stamp,
             "C compiler {cc_name} changed during build ({} -> {}); refusing to bind artifact to stale provenance",
-            pre_canon_cc.display(),
+            pre_cc.canon_cc.display(),
             post_canon_cc.display()
+        );
+        let post_lld_key = find_in_path("ld.lld")
+            .and_then(|p| std::fs::canonicalize(&p).ok())
+            .and_then(|c| bin_stamp(&c).ok().map(|s| (c, s)));
+        ensure!(
+            post_lld_key == pre_cc.lld_key,
+            "linker ld.lld changed on PATH during build; refusing to bind artifact to stale provenance"
         );
     }
     if let Some((ref pre_rust, ref pre_rt_fp)) = resolved_rust {
         let post_rust = rustc_identity(toolchain, &canon_cache, deadline, true)?;
-        let post_rt_fp = rt_sources_fingerprint(&canon_bin);
+        let post_rt_fp = rt_sources_fingerprint(&canon_bin)?;
         ensure!(
             post_rust.proxy_path == pre_rust.proxy_path
                 && post_rust.canon_real == pre_rust.canon_real
@@ -1744,8 +1806,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         sidecar.display()
     );
     let verified_so = publish_immutable_verified_so(&verified_dir, &so_sha, &so_bytes, seq)?;
-    let tmp_link = fast_dir.join(format!(".{fast_link_name}.{}.{seq}.tmp", std::process::id()));
-    if let Ok(mut link_file) = std::fs::File::options().write(true).create_new(true).open(&tmp_link) {
+    if let Ok((mut link_file, tmp_link)) = create_private_temp_file(&fast_dir, &fast_link_name, ".tmp") {
         let written = link_file.write_all(format!("{fast_key}\n{so_sha}\n{}\n", canon_so.display()).as_bytes());
         drop(link_file);
         if written.is_err() || std::fs::rename(&tmp_link, &fast_link).is_err() {

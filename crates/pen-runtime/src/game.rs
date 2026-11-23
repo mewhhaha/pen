@@ -976,9 +976,9 @@ mod receive_tests {
         ready(runtime.load(&mut Viewer, &moment.saved)).unwrap(); // F9 takes this path too.
         backend.answer(&[Snapshot, Restore, LoadScene, Frame]);
         ready(runtime.load_scene(&mut Viewer, &moment.saved)).unwrap();
-        backend.answer(&[Restore, Frame]);
+        backend.answer(&[Restore, Frame, Restore]);
         ready(runtime.restore(&mut Viewer, &moment)).unwrap();
-        backend.answer(&[Snapshot, Restore, Frame]);
+        backend.answer(&[Snapshot, Restore, Frame, Restore]);
         ready(runtime.reroot(&Viewer)).unwrap();
 
         let mut timeline = Timeline::default();
@@ -991,9 +991,9 @@ mod receive_tests {
         timeline.ran(Recorded { input, ..Recorded::default() });
         assert_eq!(timeline.recording().unwrap().frames[0].input, [0.0, 64.0, 64.0, 0.0, 0.0]);
 
-        backend.answer(&[Restore, Frame, Frame]);
+        backend.answer(&[Restore, Frame, Restore, Frame]);
         ready(timeline.rewind(&mut runtime, &Viewer, 1, &mut |_, _, _| Ok(()))).unwrap();
-        backend.answer(&[Restore, Frame]);
+        backend.answer(&[Restore, Frame, Restore]);
         ready(timeline.restart(&mut runtime, &Viewer, 0)).unwrap();
 
         let script = backend.0.borrow();

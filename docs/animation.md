@@ -125,13 +125,15 @@ emitter at the same time draws the same particles, whatever the frame rate
 or what came before, and time travel needs no history. They draw as
 camera-facing squares after the translucent surfaces and before overlays,
 depth-tested, not writing depth (pen-render's `renderer/particles.rs`,
-`shaders/particles.wgsl`, `shaders/particle_quads.wgsl`).
+`shaders/particles.wgsl`, `shaders/particle_quads.wgsl`). They draw over the
+opaque picture after its sky and mist, and take the mist between the eye and
+their own middle: covering particles its transmittance and in-scatter, added
+light its transmittance alone (ARCHITECTURE.md, "Translucent surfaces and
+particles").
 
 Left out for now: sorting alpha-blended particles back to front, collisions,
 particles that stay where they were born while their emitter moves (they
-move with it), lighting, and particles over the sky when the atmosphere
-pass runs (as with translucent surfaces, it paints the sky over what lies
-in front of empty depth).
+move with it), and lighting.
 
 ## Games
 

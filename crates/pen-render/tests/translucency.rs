@@ -1489,6 +1489,45 @@ fn overlays_draw_dimmed_where_the_scene_hides_them_and_whole_where_it_does_not()
     }
 }
 
+#[test]
+fn an_inset_draws_beside_a_translucent_frame_with_stand_ins_for_the_mist() {
+    // The inset's own scene has no opaque picture and no mist to read: the pane of glass
+    // in it, whose shader asks for both, is the plain blend, laid over the frame's own
+    // picture (the pane and the mist of the frame itself).
+    let Some(mut rig) = Rig::new("inset", 64, &[flat(WALL), glass(PANE)]) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let view = camera([4.0, 1.5, 0.0], [4.0, 1.5, -10.0], 1.0, 0.5);
+    let mist = Mist { density: 0.03, height: 2000.0, mean: MEAN };
+    let pane = Pane { near: 4.0, far: 40.0 };
+    let mut frame = pane_frame(&view, &mist, 2, &pane);
+    frame.insets = vec![Inset {
+        x: 32.0,
+        y: 0.0,
+        width: 32.0,
+        height: 64.0,
+        view: IDENTITY,
+        projection: IDENTITY,
+        ambient: vector(1.0, 1.0, 1.0),
+        light_direction: vector(0.0, -1.0, 0.0),
+        light_color: vector(0.0, 0.0, 0.0),
+        draws: vec![draw(0, 1, IDENTITY)],
+        pixel_size: 0.0,
+        after_sprites: 0,
+    }];
+    let picture = rig.settle(&frame, 3);
+    let (inside, _, _) = pane_references(&rig, &view, &mist, &pane, (40, 32));
+    let tint = [f64::from(PANE[0]), f64::from(PANE[1]), f64::from(PANE[2])];
+    let expected = over(tint, 0.5, inside);
+    let got = rig.pixel(&picture, 40, 32);
+    assert!(largest_difference(got, expected) < LEVELS, "{got:?} vs {expected:?}");
+    // The left half is the frame alone.
+    let (alone, _, _) = pane_references(&rig, &view, &mist, &pane, (24, 32));
+    assert!(largest_difference(rig.pixel(&picture, 24, 32), alone) < LEVELS);
+    assert!(rig.renderer.passes().contains(&"backdrop"));
+}
+
 fn frame_without_decals(frame: &RenderFrame) -> RenderFrame {
     let mut bare = frame.clone();
     bare.decals.clear();

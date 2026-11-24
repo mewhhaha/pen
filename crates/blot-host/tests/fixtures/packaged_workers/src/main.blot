@@ -9,7 +9,7 @@ entry kernel func spin_forever (x: U32): U32 =>
     acc := @u32.add acc 1
   return acc
 
-func build_frame_response (out: #[~F32]): Unit =>
+func build_frame_response (out: own #[F32]): #[F32] =>
   @storage.truncate out 0
   // Response operation echo (2.0 = Frame) followed by 151-float render header.
   @storage.push out 2.0
@@ -17,12 +17,12 @@ func build_frame_response (out: #[~F32]): Unit =>
   @storage.push out 1.0
   for _ in 0..149:
     @storage.push out 0.0
-  return ()
+  return out
 
 entry func main (host: #[F32] -> #[F32] ! {Foreign}): Unit ! {Foreign} =>
   use first <- host #[4670544.0, 2.0, 1.0, 0.0]
   let req = first
-  let out: #[~F32] = #[]
+  let out: #[F32] = #[]
   for ever:
     if req.length < 2:
       break
@@ -30,8 +30,8 @@ entry func main (host: #[F32] -> #[F32] ! {Foreign}): Unit ! {Foreign} =>
     if op == 0.0:
       break
     if op == 2.0:
-      build_frame_response out
-      use next <- host (seal (@storage.copy out))
+      out := build_frame_response self
+      use next <- host (@storage.copy out)
       req := next
     else:
       use next <- host #[op, 0.0]

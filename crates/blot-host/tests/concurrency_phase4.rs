@@ -504,10 +504,10 @@ func run_ctx (ctx: #[U32]) -> (x: U32): U32 =>
 entry kernel prepared_k: Kernel [#[U32], U32, U32] = { prepare: prep, run: run_ctx }
 
 func var_row (n: U32): #[U32] =>
-  let out: #[+U32] = #[]
+  let out: #[U32] = #[]
   for i in 0..n:
     @storage.push out (@u32.add n i)
-  return seal out
+  return out
 
 entry kernel func var_k (n: U32): #[U32] => return var_row n
 
@@ -672,7 +672,7 @@ fn kernel_pool_warm_worker_fragmentation_retry_monotonicity_and_zero_drift() -> 
 func alloc_class_blocks (class_words: U32) -> (blocks: U32): U32 =>
   let sum = 0
   for i in 0..blocks:
-    let arr: #[+U32] = #[]
+    let arr: #[U32] = #[]
     for j in 0..class_words:
       @storage.push arr (@u32.add i j)
     sum := @u32.add sum arr[0]
@@ -698,10 +698,10 @@ entry kernel func drift_fixed (x: U32): #[4; U32] =>
   return #[x, @u32.add x 1, @u32.add x 2, @u32.add x 3]
 
 entry kernel func drift_var (n: U32): #[U32] =>
-  let out: #[+U32] = #[]
+  let out: #[U32] = #[]
   for i in 0..n:
     @storage.push out i
-  return seal out
+  return out
 
 // Witness (6): context replacement + rollback preserving rev 1 (with start-time static pool!)
 const STATIC_POOL: #[U32] = #[100, 200, 300, 400]
@@ -709,11 +709,11 @@ const STATIC_POOL: #[U32] = #[100, 200, 300, 400]
 func prep_ctx (w: #[U32]): #[U32] =>
   if w.length > 0 and w[0] == 999999:
     return @panic "bad_rev"
-  let big: #[+U32] = #[]
+  let big: #[U32] = #[]
   let n = if w.length > 0 then w[0] else 1
   for i in 0..n:
     @storage.push big (@u32.add i STATIC_POOL[0])
-  return seal big
+  return big
 
 func run_ctx (ctx: #[U32]) -> (x: U32): U32 =>
   return @u32.add x ctx[0]

@@ -163,7 +163,7 @@ const step_policy = $clock.Policy {{ step_seconds: 1.0 / 60.0, max_steps: 5, max
 const svc_policy = $services.Policy {{ retry_ticks: 2, tries: 3, most_answers: 8 }}
 const default_prefs = $preferences.Preferences {{
   quality: $preferences.Quality {{ msaa: 1, fxaa: false, scale: 1.0, filtering: 0,
-    shadows: 0, occlusion: false, sky: false, fog: 1.0, effects: false, bloom: false }},
+    shadows: 0, occlusion: false, sky: false, fog: 1.0, effects: false, bloom: false, reflections: 0, volumetrics: 0 }},
   volumes: $preferences.Volumes {{ master: 1.0, music: 1.0, effects: 1.0 }},
   controls: $preferences.Controls {{ left_handed: false }}, changed: false,
 }}
@@ -195,22 +195,22 @@ func fresh_world () =>
   let clk = #[clock.clock]
   let prefs = #[default_prefs]
   let requests = persist.requests ()
-  let response: #[~F32] = #[]
-  let service_scratch: #[~F32] = #[]
+  let response: #[F32] = #[]
+  let service_scratch: #[F32] = #[]
   let next = #[8388607]
-  let outbox: #[~services.Request] = #[]
-  let waiting: #[~services.Request] = #[]
-  let filling: #[~services.Filling] = #[]
-  let answers: #[~services.Answer] = #[]
-  let statuses: #[~U32] = #[]
-  let payload: #[~F32] = #[]
+  let outbox: #[services.Request] = #[]
+  let waiting: #[services.Request] = #[]
+  let filling: #[services.Filling] = #[]
+  let answers: #[services.Answer] = #[]
+  let statuses: #[U32] = #[]
+  let payload: #[F32] = #[]
   let svc = services.access next outbox waiting filling answers statuses payload
   let kt = kernel_transport.owners ()
   let cp = colony_paths.owners ()
-  let g_boxes: #[~navigation.Box] = #[]
-  let g_rounds: #[~navigation.Round] = #[]
-  let g_words: #[~U32] = #[]
-  let g_shapes: #[~F32] = #[]
+  let g_boxes: #[navigation.Box] = #[]
+  let g_rounds: #[navigation.Round] = #[]
+  let g_words: #[U32] = #[]
+  let g_shapes: #[F32] = #[]
   let g_storage = $navigation.Storage {{ boxes: g_boxes, rounds: g_rounds, words: g_words, shapes: g_shapes }}
   let g_stored = #[navigation.closed_stored]
   // Canonical deterministic simulation state (persisted in Save Schema 26!):
@@ -221,10 +221,8 @@ func fresh_world () =>
     services: svc, kernel_transport: kt, colony_paths: cp,
     g_storage, g_stored, sim,
     frame: f.frame, audio: f.audio, events: f.events, ui_nodes: f.ui_nodes, ui_marked: f.ui_marked,
-    ui_labels: f.ui_labels, ui_options: f.ui_options, frame_vectors: f.frame_vectors,
-    frame_faces: f.frame_faces, frame_values: f.frame_values, frame_floats: f.frame_floats,
-    frame_inset_draws: f.frame_inset_draws, semantic_text: f.semantic_text,
-    semantic_values: f.semantic_values, service_output: f.service_output, encoder_text: f.encoder_text,
+    ui_labels: f.ui_labels, ui_options: f.ui_options, frame_floats: f.frame_floats,
+    semantic_text: f.semantic_text, service_output: f.service_output,
   }}
 
 func ensure_ground_and_mesh (own access) =>
@@ -285,16 +283,15 @@ func present_world (own access) -> (presentation: app.Presentation) =>
   // canonical render packets stay 100% identical between Worker ON and Worker OFF!
   access.frame.settings[0].lighting.clear := math.vec4 (access.sim[1] * 0.01) (access.sim[2] * 0.01) (access.sim[5] * 0.001) 1.0
   // Emit a 1-lane canonical draw reflecting sim state.
-  let fv: #[~math.Vec4] = access.frame_vectors
-  access.frame.draws.push ($render.Draw {{
+  @storage.push access.frame.draws ($render.Draw {{
     mesh: 0, material: 0,
     matrix: math.Mat4.identity,
     parameters: $Some (math.vec4 access.sim[0] access.sim[1] access.sim[3] access.sim[6]),
-    extra: &fv[0..0],
+    extra: render.no_span,
   }})
   return access
 
-func encode_state_fn access -> (dst: #[~F32]) =>
+func encode_state_fn access -> (dst: own #[F32]): #[F32] =>
   @storage.truncate dst 0
   // Save Schema 26 payload: canonical sim + clock + services (NEVER kernel_transport or prewarm_entries!)
   for i in 0 .. access.sim.length:
@@ -306,7 +303,7 @@ func encode_state_fn access -> (dst: #[~F32]) =>
   for v in svc_lanes:
     @storage.push dst v
   // Append ephemeral telemetry ONLY if we expose a separate SaveScene (op 5) for test inspection!
-  return ()
+  return dst
 
 func decode_state_fn (own access) -> (values: #[F32]) =>
   let report: #[F32] = #[]
@@ -324,14 +321,14 @@ func decode_state_fn (own access) -> (values: #[F32]) =>
 
 // Operation::SnapshotScene (op 5) exposes ephemeral prewarm metrics so tests can
 // FIRST assert `prewarm_hits > 0 && sync_routes_skipped > 0` without polluting Save 26!
-func encode_telemetry access -> (dst: #[~F32]) =>
+func encode_telemetry access -> (dst: own #[F32]): #[F32] =>
   @storage.truncate dst 0
   @storage.push dst (U32.to_f32 (colony_paths.prewarm_hits access.colony_paths))
   @storage.push dst (U32.to_f32 (colony_paths.sync_routes_skipped access.colony_paths))
   @storage.push dst (if kernel_transport.cap_active access.kernel_transport then 1.0 else 0.0)
   @storage.push dst (U32.to_f32 access.colony_paths.prewarm_entries.length)
   @storage.push dst (U32.to_f32 access.colony_paths.regions.length)
-  return ()
+  return dst
 
 func decode_telemetry (own access) -> (values: #[F32]) =>
   let report: #[F32] = #[]
@@ -342,7 +339,7 @@ func receive_kernels_fn (own access) -> (evs: &[events.Event]) =>
   access.colony_paths := colony_paths.absorb_prewarmed_routes self access.kernel_transport (kernel.id plan_routes) (kernel.binding_hash plan_routes)
   return access
 
-func emit_kernels_fn (own access) -> (canonical_count: U32) -> (admitted: #[~services.Request]) -> (payload_out: #[~F32]) =>
+func emit_kernels_fn (own access) -> (canonical_count: U32) -> (admitted: own #[services.Request]) -> (payload_out: own #[F32]) =>
   if kernel_transport.cap_active access.kernel_transport and access.colony_paths.state[0].ready:
     let kid = kernel.id plan_routes
     let bh = kernel.binding_hash plan_routes
@@ -353,7 +350,7 @@ func emit_kernels_fn (own access) -> (canonical_count: U32) -> (admitted: #[~ser
       break kernel_transport.ensure_context access.kernel_transport kid bh gh wire
     access.kernel_transport := next_kt
     if ctx_ready:
-      let batch: #[~F32] = #[]
+      let batch: #[F32] = #[]
       let cnt: U32 = 0
       if not (colony_paths.has_prewarm access.colony_paths (kernel.f32_bits q0_ox) (kernel.f32_bits q0_oz) (kernel.f32_bits q0_tx) (kernel.f32_bits q0_tz) gh):
         @storage.push batch q0_ox
@@ -372,10 +369,12 @@ func emit_kernels_fn (own access) -> (canonical_count: U32) -> (admitted: #[~ser
         access.kernel_transport := next_kt2
     if access.kernel_transport.requests.length > 0:
       let base_floats = host.measure_access access
-      access.kernel_transport := host.admit_kernel_requests base_floats canonical_count self admitted
+      let (next_kt, next_admitted) = host.admit_kernel_requests base_floats canonical_count access.kernel_transport admitted
+      access.kernel_transport := next_kt
+      admitted := next_admitted
       for i in 0 .. access.kernel_transport.payload.length:
         @storage.push payload_out access.kernel_transport.payload[i]
-  return access
+  return (access, admitted, payload_out)
 
 func init_world (own access) =>
   access.services := services.idle self 6
@@ -386,7 +385,9 @@ func init_world (own access) =>
 
 func ack_world (own access) -> (published: Bool) =>
   access.requests := persist.clear_requests self
-  access.services := services.compact self access.service_scratch
+  let (next_services, next_scratch) = services.compact access.services access.service_scratch
+  access.services := next_services
+  access.service_scratch := next_scratch
   return access
 
 const stages = app.stages app.no_action app.no_action app.no_action app.no_action app.route_event

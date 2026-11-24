@@ -10,10 +10,10 @@ entry const partitioned = func (owner: own #[U32]) =>
   return @u32.add owner[0] owner[2]
 entry const failing = func (value: U32) => @u32.div value 0
 entry const large_result = func (count: U32) =>
-  let output: #[+U32] = #[]
+  let output: #[U32] = #[]
   for i in 0 .. count:
     @storage.push output (@u32.add i 1)
-  return seal output
+  return output
 entry const repeated = func (count: U32) =>
   let sum = 0
   for index in 0 .. count:

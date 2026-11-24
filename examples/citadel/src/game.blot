@@ -207,11 +207,11 @@ func build_arena_physics () : scene.Scene =>
     scene.box 4 (math.vec3 4.8 2.0 (-4.8)) (math.vec3 1.4 4.0 1.4),
     scene.box 5 (math.vec3 (-4.8) 2.0 4.8) (math.vec3 1.4 4.0 1.4),
     scene.box 6 (math.vec3 4.8 2.0 4.8) (math.vec3 1.4 4.0 1.4),
-    // Low perimeter parapets keeping hero & bots safely on the stone island
-    scene.box 7 (math.vec3 0.0 0.6 (-8.8)) (math.vec3 18.0 1.6 0.6),
-    scene.box 8 (math.vec3 0.0 0.6 8.8) (math.vec3 18.0 1.6 0.6),
-    scene.box 9 (math.vec3 (-8.8) 0.6 0.0) (math.vec3 0.6 1.6 18.0),
-    scene.box 10 (math.vec3 8.8 0.6 0.0) (math.vec3 0.6 1.6 18.0),
+    // Tall invisible physics containment walls around the low stone parapets so jumps never leave the island
+    scene.box 7 (math.vec3 0.0 2.4 (-8.8)) (math.vec3 18.0 5.2 0.7),
+    scene.box 8 (math.vec3 0.0 2.4 8.8) (math.vec3 18.0 5.2 0.7),
+    scene.box 9 (math.vec3 (-8.8) 2.4 0.0) (math.vec3 0.7 5.2 18.0),
+    scene.box 10 (math.vec3 8.8 2.4 0.0) (math.vec3 0.7 5.2 18.0),
   ]
   return scene.build_into (scene.empty ()) sources
 
@@ -361,9 +361,55 @@ func apply_event (world: own World) -> (ev: events.Event) : World =>
       if code == keys.r:
         let w = world.width
         let h = world.height
-        world := create ()
+        let fresh = create ()
+        @storage.truncate world.sentinels 0
+        for i in 0 .. fresh.sentinels.length:
+          @storage.push world.sentinels fresh.sentinels[i]
+        @storage.truncate world.shards 0
+        for i in 0 .. fresh.shards.length:
+          @storage.push world.shards fresh.shards[i]
+        @storage.truncate world.trail 0
+        @storage.truncate world.fx_bursts 0
+        @storage.truncate world.bt_mem 0
+        for i in 0 .. fresh.bt_mem.length:
+          @storage.push world.bt_mem fresh.bt_mem[i]
+        @storage.truncate world.crowd_sep 0
+        for i in 0 .. fresh.crowd_sep.length:
+          @storage.push world.crowd_sep fresh.crowd_sep[i]
+        world.time := fresh.time
         world.width := w
         world.height := h
+        world.held_keys := 0
+        world.paused := false
+        world.victory := false
+        world.defeat := false
+        world.score := 0
+        world.hero_pos := fresh.hero_pos
+        world.hero_walker := fresh.hero_walker
+        world.hero_heading := fresh.hero_heading
+        world.cam_yaw := fresh.cam_yaw
+        world.follower := fresh.follower
+        world.hero_hp := fresh.hero_hp
+        world.hero_invuln := 0.0
+        world.stamina := fresh.stamina
+        world.dash_timer := 0.0
+        world.stride_phase := 0.0
+        world.step_accum := 0.0
+        world.slash_timer := 0.0
+        world.slash_cooldown := 0.0
+        world.slash_hit_applied := false
+        world.trauma := fresh.trauma
+        world.hitstop := fresh.hitstop
+        world.recoil := fresh.recoil
+        world.walkable_cells := fresh.walkable_cells
+        world.sfx_step := false
+        world.sfx_swing := false
+        world.sfx_hit := false
+        world.sfx_hit_pos := math.zero3
+        world.sfx_pickup := false
+        world.sfx_pickup_pos := math.zero3
+        world.save_req := false
+        world.load_req := false
       if code == keys.f6:
         world.save_req := true
       if code == keys.f9:
@@ -572,6 +618,10 @@ func step (world: own World) -> (phys: scene.Queries) -> (dt: F32) -> (width: F3
   let moved = character.move_queries hit_scratch phys hero_body solid_filter world.hero_pos wv math.zero3 sim_dt
   world.hero_pos := moved.position
   world.hero_walker := moved.walker
+  // Safety guard: keep hero bounded on the stone island even under extreme impulses.
+  if world.hero_pos.y < (-2.0):
+    world.hero_pos := math.vec3 0.0 0.5 5.0
+    world.hero_walker.velocity := math.zero3
 
   // Footstep stride cadence while running on ground.
   let hspd = sqrt (world.hero_walker.velocity.x * world.hero_walker.velocity.x + world.hero_walker.velocity.z * world.hero_walker.velocity.z)
@@ -720,14 +770,15 @@ func step (world: own World) -> (phys: scene.Queries) -> (dt: F32) -> (width: F3
           gold: false,
         })
 
-  // Advance & retire transient GPU particle bursts.
-  let live_fx: #[FxBurst] = #[]
+  // Advance & retire transient GPU particle bursts in place (zero per-frame owner allocation).
+  let keep_fx: U32 = 0
   for i in 0 .. world.fx_bursts.length:
     let b = world.fx_bursts[i]
     b.age := b.age + sim_dt
     if b.age < b.duration:
-      @storage.push live_fx b
-  world.fx_bursts := live_fx
+      world.fx_bursts[keep_fx] := b
+      keep_fx := self + 1
+  @storage.truncate world.fx_bursts keep_fx
 
   // Check victory: all sentinels defeated AND all 3 arcane shards collected!
   if alive_sentinel_count world == 0 and collected_shard_count world == world.shards.length:
@@ -790,6 +841,21 @@ func push_u32_4 (val: U32) -> (x: F32) -> (y: F32) -> (scale: F32) -> (col: math
   frame := push_glyph (48 + d0) (x + s * 3.0) y scale col self
   return frame
 
+const c_lbl_hp: #[U32] = #[72, 80] // HP
+const c_lbl_st: #[U32] = #[83, 84] // ST
+const c_lbl_score: #[U32] = #[83, 67, 79, 82, 69, 58] // SCORE:
+const c_lbl_bots: #[U32] = #[66, 79, 84, 83, 58] // BOTS:
+const c_lbl_shard: #[U32] = #[83, 72, 65, 82, 68, 58] // SHARD:
+const c_lbl_of3: #[U32] = #[47, 51] // /3
+const c_lbl_keys: #[U32] = #[87, 65, 83, 68, 32, 83, 80, 65, 67, 69, 58, 74, 85, 77, 80, 32, 83, 72, 73, 70, 84, 58, 68, 65, 83, 72, 32, 74, 58, 83, 76, 65, 83, 72, 32, 69, 83, 67, 58, 80, 65, 85, 83, 69]
+const c_lbl_victory: #[U32] = #[86, 73, 67, 84, 79, 82, 89, 33] // VICTORY!
+const c_lbl_defeat: #[U32] = #[68, 69, 70, 69, 65, 84] // DEFEAT
+const c_lbl_paused: #[U32] = #[80, 65, 85, 83, 69, 68] // PAUSED
+const c_lbl_sub: #[U32] = #[82, 58, 82, 69, 83, 84, 65, 82, 84, 32, 32, 69, 83, 67, 58, 82, 69, 83, 85, 77, 69]
+const c_lbl_hud: #[U32] = #[72, 85, 68] // HUD
+const c_lbl_menu: #[U32] = #[77, 69, 78, 85] // MENU
+const c_no_txt: #[U32] = #[]
+
 func emit_hud (world: World) -> (frame: own render.FrameAccess) : render.FrameAccess =>
   let bg = math.vec4 0.06 0.08 0.14 0.84
   let white = math.vec4 0.95 0.97 1.0 1.0
@@ -797,15 +863,13 @@ func emit_hud (world: World) -> (frame: own render.FrameAccess) : render.FrameAc
 
   // Top-left Vitality & Stamina bars
   frame := push_panel 10.0 10.0 168.0 48.0 bg 6.0 0.6 self
-  let hp_lbl = #[72, 80] // HP
-  frame := push_text (&hp_lbl[0..2]) 18.0 17.0 1.2 white self
+  frame := push_text (&c_lbl_hp[0..2]) 18.0 17.0 1.2 white self
   let hp_frac = U32.to_f32 world.hero_hp / 5.0
   frame := push_panel 42.0 16.0 124.0 12.0 (math.vec4 0.22 0.08 0.10 0.9) 3.0 0.2 self
   if hp_frac > 0.01:
     frame := push_panel 42.0 16.0 (124.0 * hp_frac) 12.0 (math.vec4 0.92 0.22 0.24 0.95) 3.0 0.5 self
 
-  let st_lbl = #[83, 84] // ST
-  frame := push_text (&st_lbl[0..2]) 18.0 37.0 1.2 dim self
+  frame := push_text (&c_lbl_st[0..2]) 18.0 37.0 1.2 dim self
   frame := push_panel 42.0 36.0 124.0 10.0 (math.vec4 0.08 0.16 0.24 0.9) 3.0 0.2 self
   if world.stamina > 0.01:
     frame := push_panel 42.0 36.0 (124.0 * clamp 0.0 1.0 world.stamina) 10.0 (math.vec4 0.20 0.82 0.96 0.95) 3.0 0.4 self
@@ -813,21 +877,23 @@ func emit_hud (world: World) -> (frame: own render.FrameAccess) : render.FrameAc
   // Top-right Score, Sentinels remaining & Shards collected
   let rx = max 240.0 (world.width - 210.0)
   frame := push_panel rx 10.0 200.0 48.0 bg 6.0 0.6 self
-  let sc_lbl = #[83, 67, 79, 82, 69, 58] // SCORE:
-  frame := push_text (&sc_lbl[0..6]) (rx + 10.0) 16.0 1.15 dim self
+  frame := push_text (&c_lbl_score[0..6]) (rx + 10.0) 16.0 1.15 dim self
   frame := push_u32_4 world.score (rx + 62.0) 16.0 1.2 white self
   let bots = alive_sentinel_count world
   let got = collected_shard_count world
-  let st2 = #[66, 79, 84, 83, 58, 48 + bots, 32, 32, 83, 72, 65, 82, 68, 58, 48 + got, 47, 51]
-  // "BOTS:4  SHARD:0/3"
-  frame := push_text (&st2[0..17]) (rx + 10.0) 36.0 1.1 (math.vec4 0.55 0.92 1.0 1.0) self
+  let cyan = math.vec4 0.55 0.92 1.0 1.0
+  let step11 = 6.5 * 1.1
+  frame := push_text (&c_lbl_bots[0..5]) (rx + 10.0) 36.0 1.1 cyan self
+  frame := push_glyph (48 + bots) (rx + 10.0 + step11 * 5.0) 36.0 1.1 cyan self
+  frame := push_text (&c_lbl_shard[0..6]) (rx + 10.0 + step11 * 8.0) 36.0 1.1 cyan self
+  frame := push_glyph (48 + got) (rx + 10.0 + step11 * 14.0) 36.0 1.1 cyan self
+  frame := push_text (&c_lbl_of3[0..2]) (rx + 10.0 + step11 * 15.0) 36.0 1.1 cyan self
 
   // Bottom control bar
   let by = max 270.0 (world.height - 30.0)
   let bw = max 440.0 (world.width - 20.0)
   frame := push_panel 10.0 by bw 22.0 bg 5.0 0.4 self
-  let keys_lbl = #[87, 65, 83, 68, 32, 83, 80, 65, 67, 69, 58, 74, 85, 77, 80, 32, 83, 72, 73, 70, 84, 58, 68, 65, 83, 72, 32, 74, 58, 83, 76, 65, 83, 72, 32, 69, 83, 67, 58, 80, 65, 85, 83, 69]
-  frame := push_text (&keys_lbl[0..44]) 18.0 (by + 6.0) 1.05 dim self
+  frame := push_text (&c_lbl_keys[0..44]) 18.0 (by + 6.0) 1.05 dim self
 
   // Centered modal banner on Pause / Victory / Defeat
   if world.paused or world.victory or world.defeat:
@@ -836,27 +902,21 @@ func emit_hud (world: World) -> (frame: own render.FrameAccess) : render.FrameAc
     let accent = if world.victory then math.vec4 0.14 0.64 0.36 0.94 else if world.defeat then math.vec4 0.72 0.18 0.18 0.94 else math.vec4 0.14 0.24 0.44 0.92
     frame := push_panel mx my 240.0 84.0 accent 8.0 0.9 self
     if world.victory:
-      let msg = #[86, 73, 67, 84, 79, 82, 89, 33] // VICTORY!
-      frame := push_text (&msg[0..8]) (mx + 56.0) (my + 20.0) 2.2 white self
+      frame := push_text (&c_lbl_victory[0..8]) (mx + 56.0) (my + 20.0) 2.2 white self
     else:
       if world.defeat:
-        let msg = #[68, 69, 70, 69, 65, 84] // DEFEAT
-        frame := push_text (&msg[0..6]) (mx + 74.0) (my + 20.0) 2.2 white self
+        frame := push_text (&c_lbl_defeat[0..6]) (mx + 74.0) (my + 20.0) 2.2 white self
       else:
-        let msg = #[80, 65, 85, 83, 69, 68] // PAUSED
-        frame := push_text (&msg[0..6]) (mx + 74.0) (my + 20.0) 2.2 white self
-    let sub = #[82, 58, 82, 69, 83, 84, 65, 82, 84, 32, 32, 69, 83, 67, 58, 82, 69, 83, 85, 77, 69]
-    frame := push_text (&sub[0..21]) (mx + 34.0) (my + 56.0) 1.15 white self
+        frame := push_text (&c_lbl_paused[0..6]) (mx + 74.0) (my + 20.0) 2.2 white self
+    frame := push_text (&c_lbl_sub[0..21]) (mx + 34.0) (my + 56.0) 1.15 white self
   return frame
 
 func emit_ui_tree (world: World) -> (ui_labels: own #[U32]) -> (ui_nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
   @storage.truncate ui_labels 0
   @storage.truncate ui_nodes 0
-  let no_txt: #[U32] = #[]
-  let hud_name = #[72, 85, 68] // HUD
   let hud = $tree.Node {
     id: 10, parent: 0, role: vocab.role_status,
-    name: &hud_name[0..3], description: &no_txt[0..0], value_text: &no_txt[0..0],
+    name: &c_lbl_hud[0..3], description: &c_no_txt[0..0], value_text: &c_no_txt[0..0],
     x: 10.0, y: 10.0, width: 168.0, height: 48.0,
     focusable: false, focused: false, disabled: false, hidden: false, modal: false,
     checked: vocab.state_none, expanded: vocab.state_none, selected: vocab.state_none, live: vocab.live_polite,
@@ -866,10 +926,9 @@ func emit_ui_tree (world: World) -> (ui_labels: own #[U32]) -> (ui_nodes: own #[
   ui_labels := l1
   ui_nodes := n1
   if world.paused or world.victory or world.defeat:
-    let dlg_name = #[77, 69, 78, 85] // MENU
     let dlg = $tree.Node {
       id: 20, parent: 0, role: vocab.role_dialog,
-      name: &dlg_name[0..4], description: &no_txt[0..0], value_text: &no_txt[0..0],
+      name: &c_lbl_menu[0..4], description: &c_no_txt[0..0], value_text: &c_no_txt[0..0],
       x: world.width * 0.5 - 120.0, y: world.height * 0.5 - 42.0, width: 240.0, height: 84.0,
       focusable: true, focused: true, disabled: false, hidden: false, modal: true,
       checked: vocab.state_none, expanded: vocab.state_none, selected: vocab.state_none, live: vocab.live_assertive,
@@ -1213,8 +1272,171 @@ func restore (lanes_in: &[F32]) : World =>
 
 // --- Pen Session 2 Runtime & Multi-Core `steer_crowd` Kernel Transport ---
 
+type WorldScalars is data = $WorldScalars {
+  time: F32,
+  width: F32,
+  height: F32,
+  held_keys: U32,
+  paused: Bool,
+  victory: Bool,
+  defeat: Bool,
+  score: U32,
+  hero_pos: Vec3,
+  hero_walker: scene.Walker,
+  hero_heading: F32,
+  cam_yaw: F32,
+  follower: rig.Follower,
+  hero_hp: U32,
+  hero_invuln: F32,
+  stamina: F32,
+  dash_timer: F32,
+  stride_phase: F32,
+  step_accum: F32,
+  slash_timer: F32,
+  slash_cooldown: F32,
+  slash_hit_applied: Bool,
+  trauma: feel.Trauma,
+  hitstop: feel.Hitstop,
+  recoil: feel.Recoil,
+  walkable_cells: U32,
+  sfx_step: Bool,
+  sfx_swing: Bool,
+  sfx_hit: Bool,
+  sfx_hit_pos: Vec3,
+  sfx_pickup: Bool,
+  sfx_pickup_pos: Vec3,
+  save_req: Bool,
+  load_req: Bool,
+  last_crowd_hash: kernel.Hash64,
+}
+
+func pack_world_scalars (w: World) -> (last_crowd_hash: kernel.Hash64) : WorldScalars => $WorldScalars {
+  time: w.time,
+  width: w.width,
+  height: w.height,
+  held_keys: w.held_keys,
+  paused: w.paused,
+  victory: w.victory,
+  defeat: w.defeat,
+  score: w.score,
+  hero_pos: w.hero_pos,
+  hero_walker: w.hero_walker,
+  hero_heading: w.hero_heading,
+  cam_yaw: w.cam_yaw,
+  follower: w.follower,
+  hero_hp: w.hero_hp,
+  hero_invuln: w.hero_invuln,
+  stamina: w.stamina,
+  dash_timer: w.dash_timer,
+  stride_phase: w.stride_phase,
+  step_accum: w.step_accum,
+  slash_timer: w.slash_timer,
+  slash_cooldown: w.slash_cooldown,
+  slash_hit_applied: w.slash_hit_applied,
+  trauma: w.trauma,
+  hitstop: w.hitstop,
+  recoil: w.recoil,
+  walkable_cells: w.walkable_cells,
+  sfx_step: w.sfx_step,
+  sfx_swing: w.sfx_swing,
+  sfx_hit: w.sfx_hit,
+  sfx_hit_pos: w.sfx_hit_pos,
+  sfx_pickup: w.sfx_pickup,
+  sfx_pickup_pos: w.sfx_pickup_pos,
+  save_req: w.save_req,
+  load_req: w.load_req,
+  last_crowd_hash,
+}
+
+func unpack_world (s: WorldScalars) -> (sentinels: own #[Sentinel]) -> (shards: own #[Shard]) -> (trail: own #[Vec3]) -> (fx_bursts: own #[FxBurst]) -> (bt_mem: own #[bt.Slot]) -> (crowd_sep: own #[Vec3]) : World =>
+  $World {
+    time: s.time,
+    width: s.width,
+    height: s.height,
+    held_keys: s.held_keys,
+    paused: s.paused,
+    victory: s.victory,
+    defeat: s.defeat,
+    score: s.score,
+    hero_pos: s.hero_pos,
+    hero_walker: s.hero_walker,
+    hero_heading: s.hero_heading,
+    cam_yaw: s.cam_yaw,
+    follower: s.follower,
+    hero_hp: s.hero_hp,
+    hero_invuln: s.hero_invuln,
+    stamina: s.stamina,
+    dash_timer: s.dash_timer,
+    stride_phase: s.stride_phase,
+    step_accum: s.step_accum,
+    slash_timer: s.slash_timer,
+    slash_cooldown: s.slash_cooldown,
+    slash_hit_applied: s.slash_hit_applied,
+    trauma: s.trauma,
+    hitstop: s.hitstop,
+    recoil: s.recoil,
+    sentinels,
+    shards,
+    trail,
+    fx_bursts,
+    bt_mem,
+    crowd_sep,
+    walkable_cells: s.walkable_cells,
+    sfx_step: s.sfx_step,
+    sfx_swing: s.sfx_swing,
+    sfx_hit: s.sfx_hit,
+    sfx_hit_pos: s.sfx_hit_pos,
+    sfx_pickup: s.sfx_pickup,
+    sfx_pickup_pos: s.sfx_pickup_pos,
+    save_req: s.save_req,
+    load_req: s.load_req,
+  }
+
+func pack_world (w: own World) -> (last_crowd_hash: kernel.Hash64) : (WorldScalars, #[Sentinel], #[Shard], #[Vec3], #[FxBurst], #[bt.Slot], #[Vec3]) =>
+  let scalars = pack_world_scalars w last_crowd_hash
+  let $World { sentinels, shards, trail, fx_bursts, bt_mem, crowd_sep } = w
+  return (scalars, sentinels, shards, trail, fx_bursts, bt_mem, crowd_sep)
+
+func copy_sentinels_into (dst: own #[Sentinel]) -> (src: &[Sentinel]) : #[Sentinel] =>
+  @storage.truncate dst 0
+  for i in 0 .. src.length:
+    @storage.push dst (src.at i)
+  return dst
+
+func copy_shards_into (dst: own #[Shard]) -> (src: &[Shard]) : #[Shard] =>
+  @storage.truncate dst 0
+  for i in 0 .. src.length:
+    @storage.push dst (src.at i)
+  return dst
+
+func copy_vec3_into (dst: own #[Vec3]) -> (src: &[Vec3]) : #[Vec3] =>
+  @storage.truncate dst 0
+  for i in 0 .. src.length:
+    @storage.push dst (src.at i)
+  return dst
+
+func copy_fx_into (dst: own #[FxBurst]) -> (src: &[FxBurst]) : #[FxBurst] =>
+  @storage.truncate dst 0
+  for i in 0 .. src.length:
+    @storage.push dst (src.at i)
+  return dst
+
+func copy_bt_into (dst: own #[bt.Slot]) -> (src: &[bt.Slot]) : #[bt.Slot] =>
+  @storage.truncate dst 0
+  for i in 0 .. src.length:
+    @storage.push dst (src.at i)
+  return dst
+
+// Keep every field on loop-carried `Access` a pre-allocated owner handle so Blot's
+// `for ever:` boxed-carry check stays unchanged and releases frame temporaries every tick.
 type Access = {
-  world: World,
+  world_scalars: #[WorldScalars],
+  sentinels: #[Sentinel],
+  shards: #[Shard],
+  trail: #[Vec3],
+  fx_bursts: #[FxBurst],
+  bt_mem: #[bt.Slot],
+  crowd_sep: #[Vec3],
   physics: scene.Scene,
   frame: render.FrameAccess,
   audio: sound.Access,
@@ -1228,7 +1450,6 @@ type Access = {
   kernels: kernel_transport.Access,
   preferences: #[preferences.Preferences],
   requests: #[U32],
-  last_crowd_hash: kernel.Hash64,
 }
 
 func init_access () : Access =>
@@ -1243,8 +1464,15 @@ func init_access () : Access =>
   let svc = services.access svc_next svc_outbox svc_waiting svc_filling svc_answers svc_statuses svc_payload
   let packet_events: #[protocol.Event] = #[]
   let kernel_out: #[services.Request] = #[]
+  let (ws, sents, shards, trail, fx_bursts, bt_mem, crowd_sep) = pack_world (create ()) ($kernel.Hash64 { lo: 0, hi: 0 })
   return {
-    world: create (),
+    world_scalars: #[ws],
+    sentinels: sents,
+    shards,
+    trail,
+    fx_bursts,
+    bt_mem,
+    crowd_sep,
     physics: build_arena_physics (),
     frame: owners.frame,
     audio: owners.audio,
@@ -1258,7 +1486,6 @@ func init_access () : Access =>
     kernels: kernel_transport.owners (),
     preferences: #[default_preferences],
     requests: persist.requests (),
-    last_crowd_hash: $kernel.Hash64 { lo: 0, hi: 0 },
   }
 
 func measure_current_frame (access: Access) : U32 =>
@@ -1282,8 +1509,15 @@ func apply_crowd_answer (kt: kernel_transport.Access) -> (crowd_kernel: Kernel [
 func execute (crowd_kernel: Kernel [#[F32], #[4; F32], #[4; F32]]) -> (access: own Access) -> (operation: U32) -> (payload: &[F32]) -> (outgoing: own #[F32]) =>
   case operation of
     1 => do:
-      access.world := create ()
-      outgoing := program.append (save access.world) self
+      let fresh = create ()
+      access.world_scalars[0] := pack_world_scalars fresh ($kernel.Hash64 { lo: 0, hi: 0 })
+      access.sentinels := copy_sentinels_into self (&fresh.sentinels[0..fresh.sentinels.length])
+      access.shards := copy_shards_into self (&fresh.shards[0..fresh.shards.length])
+      access.trail := copy_vec3_into self (&fresh.trail[0..fresh.trail.length])
+      access.fx_bursts := copy_fx_into self (&fresh.fx_bursts[0..fresh.fx_bursts.length])
+      access.bt_mem := copy_bt_into self (&fresh.bt_mem[0..fresh.bt_mem.length])
+      access.crowd_sep := copy_vec3_into self (&fresh.crowd_sep[0..fresh.crowd_sep.length])
+      outgoing := program.append (save fresh) self
     2 => do:
       access.frame := render.begin_frame self
       access.audio := sound.begin_frame self
@@ -1296,20 +1530,23 @@ func execute (crowd_kernel: Kernel [#[F32], #[4; F32], #[4; F32]]) -> (access: o
       for ev in ev_copy:
         access.preferences := preferences.receive self ev
 
-      // Apply latest multi-core `steer_crowd` separation vectors if completed.
-      access.world.crowd_sep := apply_crowd_answer access.kernels crowd_kernel access.last_crowd_hash self
+      let last_hash = access.world_scalars[0].last_crowd_hash
+      let w = unpack_world access.world_scalars[0] access.sentinels access.shards access.trail access.fx_bursts access.bt_mem access.crowd_sep
 
-      access.world := step self (scene.queries access.physics) input.elapsed input.width input.height (&ev_copy[0..ev_copy.length])
+      // Apply latest multi-core `steer_crowd` separation vectors if completed.
+      w.crowd_sep := apply_crowd_answer access.kernels crowd_kernel last_hash self
+
+      w := step self (scene.queries access.physics) input.elapsed input.width input.height (&ev_copy[0..ev_copy.length])
       access.requests := persist.clear_requests self
-      if access.world.save_req:
+      if w.save_req:
         access.requests := persist.request self $persist.Save
-      if access.world.load_req:
+      if w.load_req:
         access.requests := persist.request self $persist.Load
 
       // Offload 4-sentinel crowd separation batch to Pen's worker pool when CAP is ready.
       let positions: #[Vec3] = #[]
-      for i in 0 .. access.world.sentinels.length:
-        @storage.push positions access.world.sentinels[i].position
+      for i in 0 .. w.sentinels.length:
+        @storage.push positions w.sentinels[i].position
       let wire = kernel_kits.crowd_ctx_pack (&positions[0..positions.length]) 6.0
       let hash = kernel.fnv1a64_f32s (&wire[0..wire.length])
       let agents: #[F32] = #[]
@@ -1320,19 +1557,26 @@ func execute (crowd_kernel: Kernel [#[F32], #[4; F32], #[4; F32]]) -> (access: o
         @storage.push agents 2.8
       let (queued, next_kt) = kernel_kits.dispatch_batch access.kernels crowd_kernel hash (&wire[0..wire.length]) positions.length (&agents[0..agents.length])
       access.kernels := next_kt
-      if queued:
-        access.last_crowd_hash := hash
+      let next_hash = if queued then hash else last_hash
 
-      let (next_frame, next_audio) = populate_frame access.world access.frame access.audio
+      let (next_frame, next_audio) = populate_frame w access.frame access.audio
       access.frame := next_frame
       access.audio := next_audio
-      let (next_lbls, next_ui) = emit_ui_tree access.world access.ui_labels access.ui_nodes
+      let (next_lbls, next_ui) = emit_ui_tree w access.ui_labels access.ui_nodes
       access.ui_labels := next_lbls
       access.ui_nodes := next_ui
+      let (ws, sents, shards, trail, fx_bursts, bt_mem, crowd_sep) = pack_world w next_hash
+      access.world_scalars[0] := ws
+      access.sentinels := sents
+      access.shards := shards
+      access.trail := trail
+      access.fx_bursts := fx_bursts
+      access.bt_mem := bt_mem
+      access.crowd_sep := crowd_sep
       let base_floats = measure_current_frame access
       let svc_count = access.service_output.length
-      let kout_fresh: #[services.Request] = #[]
-      let (next_kt2, next_kout) = host.admit_kernel_requests base_floats svc_count access.kernels kout_fresh
+      @storage.truncate access.kernel_out 0
+      let (next_kt2, next_kout) = host.admit_kernel_requests base_floats svc_count access.kernels access.kernel_out
       access.kernels := next_kt2
       access.kernel_out := next_kout
       let drawn = render.finish access.frame
@@ -1344,10 +1588,27 @@ func execute (crowd_kernel: Kernel [#[F32], #[4; F32], #[4; F32]]) -> (access: o
         svc_view access.services (&access.kernel_out[0..access.kernel_out.length]) (&access.kernels.payload[0..access.kernels.payload.length]) self
       access.preferences[0].changed := false
     3 => do:
-      outgoing := program.append (save access.world) self
+      let last_hash = access.world_scalars[0].last_crowd_hash
+      let w = unpack_world access.world_scalars[0] access.sentinels access.shards access.trail access.fx_bursts access.bt_mem access.crowd_sep
+      outgoing := program.append (save w) self
+      let (ws, sents, shards, trail, fx_bursts, bt_mem, crowd_sep) = pack_world w last_hash
+      access.world_scalars[0] := ws
+      access.sentinels := sents
+      access.shards := shards
+      access.trail := trail
+      access.fx_bursts := fx_bursts
+      access.bt_mem := bt_mem
+      access.crowd_sep := crowd_sep
     4 => do:
-      access.world := restore payload
-      outgoing := program.append (save access.world) self
+      let restored = restore payload
+      access.world_scalars[0] := pack_world_scalars restored ($kernel.Hash64 { lo: 0, hi: 0 })
+      access.sentinels := copy_sentinels_into self (&restored.sentinels[0..restored.sentinels.length])
+      access.shards := copy_shards_into self (&restored.shards[0..restored.shards.length])
+      access.trail := copy_vec3_into self (&restored.trail[0..restored.trail.length])
+      access.fx_bursts := copy_fx_into self (&restored.fx_bursts[0..restored.fx_bursts.length])
+      access.bt_mem := copy_bt_into self (&restored.bt_mem[0..restored.bt_mem.length])
+      access.crowd_sep := copy_vec3_into self (&restored.crowd_sep[0..restored.crowd_sep.length])
+      outgoing := program.append (save restored) self
     _ => panic "scenes are not supported"
   return (access, outgoing)
 

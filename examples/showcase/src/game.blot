@@ -266,13 +266,17 @@ func apply_event (world: own World) -> (event: events.Event) : World =>
           let (next_ed, restored_nodes) = editor.exit_play world.editor_state world.pie_snapshot world.nodes
           world.editor_state := next_ed
           world.nodes := restored_nodes
-          world.pie_snapshot := $editor.PlaySnapshot { active: false, nodes: #[] }
+          @storage.truncate world.pie_snapshot.nodes 0
+          world.pie_snapshot.active := false
           world.play_time := 0.0
           world.chime_pending := true
         else:
           let (next_ed, snap) = editor.enter_play world.editor_state (&world.nodes[0..world.nodes.length])
           world.editor_state := next_ed
-          world.pie_snapshot := snap
+          @storage.truncate world.pie_snapshot.nodes 0
+          for i in 0 .. snap.nodes.length:
+            @storage.push world.pie_snapshot.nodes snap.nodes[i]
+          world.pie_snapshot.active := snap.active
           world.play_time := 0.0
           world.chime_pending := true
       if code == key_1:
@@ -525,6 +529,28 @@ func push_u32_label (val: U32) -> (x: F32) -> (y: F32) -> (scale: F32) -> (col: 
   frame := push_glyph (48 + d0) (x + 6.5 * scale) y scale col self
   return frame
 
+const lbl_move: #[U32] = #[77, 79, 86, 69] // MOVE
+const lbl_rot: #[U32] = #[82, 79, 84, 32] // ROT
+const lbl_scal: #[U32] = #[83, 67, 65, 76] // SCAL
+const lbl_play: #[U32] = #[80, 76, 65, 89] // PLAY
+const lbl_edit: #[U32] = #[69, 68, 73, 84] // EDIT
+const lbl_sky: #[U32] = #[49, 58, 83, 75, 89] // 1:SKY
+const lbl_rt: #[U32] = #[50, 58, 82, 84] // 2:RT
+const lbl_gi: #[U32] = #[51, 58, 71, 73] // 3:GI
+const lbl_oit: #[U32] = #[52, 58, 79, 73, 84] // 4:OIT
+const lbl_up: #[U32] = #[53, 58, 85, 80] // 5:UP
+const lbl_env: #[U32] = #[54, 58, 69, 78, 86] // 6:ENV
+const lbl_scene: #[U32] = #[83, 67, 69, 78, 69] // SCENE
+const lbl_node: #[U32] = #[78, 79, 68, 69, 32] // NODE
+const lbl_sel: #[U32] = #[83, 69, 76, 58] // SEL:
+const lbl_undo: #[U32] = #[85, 78, 68, 79, 58] // UNDO:
+const lbl_hint: #[U32] = #[78, 58, 65, 68, 68, 32, 68, 58, 68, 85, 80, 32, 70, 58, 80, 82, 69, 70, 32, 90, 47, 89, 32, 80, 58, 80, 73, 69]
+const lbl_toolbar: #[U32] = #[84, 79, 79, 76, 66, 65, 82] // TOOLBAR
+const no_txt_codes: #[U32] = #[]
+const foliage_xs: #[F32] = #[(-4.2), 4.2, (-4.2), 4.2]
+const foliage_zs: #[F32] = #[(-3.6), (-3.6), 3.1, 3.1]
+const water_cos_angles: #[F32] = #[0.25, 0.45, 0.65, 0.85]
+
 func emit_hud_sprites (world: World) -> (resolved: &[scene_graph.WorldNode]) -> (frame: own render.FrameAccess) : render.FrameAccess =>
   let panel_bg = math.vec4 0.06 0.08 0.13 0.82
   let text_hi = math.vec4 0.94 0.96 1.0 1.0
@@ -541,59 +567,47 @@ func emit_hud_sprites (world: World) -> (resolved: &[scene_graph.WorldNode]) -> 
   // Mode badge (MOVE / ROT / SCALE)
   frame := push_panel 16.0 13.0 54.0 22.0 pill_mode 4.0 0.5 self
   if world.editor_state.mode == editor.mode_translate:
-    let lbl = #[77, 79, 86, 69] // MOVE
-    frame := push_text (&lbl[0..4]) 22.0 18.0 1.2 text_hi self
+    frame := push_text (&lbl_move[0..4]) 22.0 18.0 1.2 text_hi self
   else:
     if world.editor_state.mode == editor.mode_rotate:
-      let lbl = #[82, 79, 84, 32] // ROT
-      frame := push_text (&lbl[0..4]) 26.0 18.0 1.2 text_hi self
+      frame := push_text (&lbl_rot[0..4]) 26.0 18.0 1.2 text_hi self
     else:
-      let lbl = #[83, 67, 65, 76] // SCAL
-      frame := push_text (&lbl[0..4]) 22.0 18.0 1.2 text_hi self
+      frame := push_text (&lbl_scal[0..4]) 22.0 18.0 1.2 text_hi self
 
   // PIE Play/Edit pill
   frame := push_panel 74.0 13.0 52.0 22.0 pill_play 4.0 0.6 self
   if world.editor_state.playing:
-    let lbl = #[80, 76, 65, 89] // PLAY
-    frame := push_text (&lbl[0..4]) 80.0 18.0 1.2 text_hi self
+    frame := push_text (&lbl_play[0..4]) 80.0 18.0 1.2 text_hi self
   else:
-    let lbl = #[69, 68, 73, 84] // EDIT
-    frame := push_text (&lbl[0..4]) 80.0 18.0 1.2 text_hi self
+    frame := push_text (&lbl_edit[0..4]) 80.0 18.0 1.2 text_hi self
 
   // Feature pills 1:SKY, 2:RT, 3:GI, 4:OIT, 5:UP, 6:ENV (fits inside 480px)
-  let sky_lbl = #[49, 58, 83, 75, 89] // 1:SKY
   frame := push_panel 132.0 13.0 50.0 22.0 (if world.physical_sky then pill_on else pill_off) 4.0 0.4 self
-  frame := push_text (&sky_lbl[0..5]) 137.0 18.0 1.1 text_hi self
+  frame := push_text (&lbl_sky[0..5]) 137.0 18.0 1.1 text_hi self
 
-  let rt_lbl = #[50, 58, 82, 84, 48 + world.ray_tracing] // 2:RT0..2
   frame := push_panel 186.0 13.0 50.0 22.0 (if world.ray_tracing > 0 then pill_on else pill_off) 4.0 0.4 self
-  frame := push_text (&rt_lbl[0..5]) 191.0 18.0 1.1 text_hi self
+  frame := push_text (&lbl_rt[0..4]) 191.0 18.0 1.1 text_hi self
+  frame := push_glyph (48 + world.ray_tracing) (191.0 + 4.0 * 6.5 * 1.1) 18.0 1.1 text_hi self
 
-  let gi_lbl = #[51, 58, 71, 73] // 3:GI
   frame := push_panel 240.0 13.0 42.0 22.0 (if world.ddgi then pill_on else pill_off) 4.0 0.4 self
-  frame := push_text (&gi_lbl[0..4]) 245.0 18.0 1.1 text_hi self
+  frame := push_text (&lbl_gi[0..4]) 245.0 18.0 1.1 text_hi self
 
-  let oit_lbl = #[52, 58, 79, 73, 84] // 4:OIT
   frame := push_panel 286.0 13.0 50.0 22.0 (if world.oit then pill_on else pill_off) 4.0 0.4 self
-  frame := push_text (&oit_lbl[0..5]) 291.0 18.0 1.1 text_hi self
+  frame := push_text (&lbl_oit[0..5]) 291.0 18.0 1.1 text_hi self
 
-  let up_lbl = #[53, 58, 85, 80] // 5:UP
   frame := push_panel 340.0 13.0 42.0 22.0 (if world.upscale then pill_on else pill_off) 4.0 0.4 self
-  frame := push_text (&up_lbl[0..4]) 345.0 18.0 1.1 text_hi self
+  frame := push_text (&lbl_up[0..4]) 345.0 18.0 1.1 text_hi self
 
-  let env_lbl = #[54, 58, 69, 78, 86] // 6:ENV
   frame := push_panel 386.0 13.0 50.0 22.0 (if world.outdoor_env then pill_on else pill_off) 4.0 0.4 self
-  frame := push_text (&env_lbl[0..5]) 391.0 18.0 1.1 text_hi self
+  frame := push_text (&lbl_env[0..5]) 391.0 18.0 1.1 text_hi self
 
   // Left Scene Hierarchy panel (hidden during PLAY)
   if not world.editor_state.playing:
     let shown = min 10 world.nodes.length
     let side_h = 26.0 + U32.to_f32 shown * 22.0
     frame := push_panel 10.0 46.0 138.0 side_h panel_bg 6.0 0.5 self
-    let hdr = #[83, 67, 69, 78, 69] // SCENE
-    frame := push_text (&hdr[0..5]) 18.0 52.0 1.2 text_dim self
+    frame := push_text (&lbl_scene[0..5]) 18.0 52.0 1.2 text_dim self
     frame := push_u32_label world.nodes.length 118.0 52.0 1.2 text_hi self
-    let node_prefix = #[78, 79, 68, 69, 32] // NODE
     for row in 0 .. shown:
       let n = world.nodes[row]
       let is_sel = case world.editor_state.selected_id of
@@ -603,32 +617,26 @@ func emit_hud_sprites (world: World) -> (resolved: &[scene_graph.WorldNode]) -> 
       let rcol = if is_sel then math.vec4 0.85 0.62 0.14 0.88 else math.vec4 0.12 0.16 0.24 0.68
       frame := push_panel 15.0 ry 128.0 19.0 rcol 3.0 (if is_sel then 0.8 else 0.2) self
       let indent = if n.parent == scene_graph.no_parent then 22.0 else 32.0
-      frame := push_text (&node_prefix[0..5]) indent (ry + 5.0) 1.05 text_hi self
+      frame := push_text (&lbl_node[0..5]) indent (ry + 5.0) 1.05 text_hi self
       frame := push_u32_label n.id (indent + 36.0) (ry + 5.0) 1.05 text_hi self
 
   // Bottom Inspector & hotkey strip
   let bot_y = max 260.0 (world.height - 34.0)
   frame := push_panel 10.0 bot_y top_w 26.0 panel_bg 5.0 0.5 self
-  let sel_lbl = #[83, 69, 76, 58] // SEL:
-  frame := push_text (&sel_lbl[0..4]) 18.0 (bot_y + 8.0) 1.15 text_dim self
+  frame := push_text (&lbl_sel[0..4]) 18.0 (bot_y + 8.0) 1.15 text_dim self
   let sel_id = Maybe.unwrap_or 0 world.editor_state.selected_id
   frame := push_u32_label sel_id 48.0 (bot_y + 8.0) 1.15 text_hi self
-  let hist_lbl = #[85, 78, 68, 79, 58] // UNDO:
-  frame := push_text (&hist_lbl[0..5]) 74.0 (bot_y + 8.0) 1.15 text_dim self
+  frame := push_text (&lbl_undo[0..5]) 74.0 (bot_y + 8.0) 1.15 text_dim self
   frame := push_u32_label world.history.cursor 112.0 (bot_y + 8.0) 1.15 text_hi self
-  let hint = #[78, 58, 65, 68, 68, 32, 68, 58, 68, 85, 80, 32, 70, 58, 80, 82, 69, 70, 32, 90, 47, 89, 32, 80, 58, 80, 73, 69]
-  // "N:ADD D:DUP F:PREF Z/Y P:PIE"
-  frame := push_text (&hint[0..28]) 142.0 (bot_y + 8.0) 1.1 text_dim self
+  frame := push_text (&lbl_hint[0..28]) 142.0 (bot_y + 8.0) 1.1 text_dim self
   return frame
 
 func emit_ui_tree (world: World) -> (ui_labels: own #[U32]) -> (ui_nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
   @storage.truncate ui_labels 0
   @storage.truncate ui_nodes 0
-  let no_txt: #[U32] = #[]
-  let bar_name = #[84, 79, 79, 76, 66, 65, 82] // TOOLBAR
   let bar = $tree.Node {
     id: 100, parent: 0, role: vocab.role_toolbar,
-    name: &bar_name[0..7], description: &no_txt[0..0], value_text: &no_txt[0..0],
+    name: &lbl_toolbar[0..7], description: &no_txt_codes[0..0], value_text: &no_txt_codes[0..0],
     x: 10.0, y: 8.0, width: max 440.0 (world.width - 20.0), height: 32.0,
     focusable: false, focused: false, disabled: false, hidden: false, modal: false,
     checked: vocab.state_none, expanded: vocab.state_none, selected: vocab.state_none, live: vocab.live_off,
@@ -637,10 +645,9 @@ func emit_ui_tree (world: World) -> (ui_labels: own #[U32]) -> (ui_nodes: own #[
   let (l1, n1) = tree.declare_owned bar ui_labels ui_nodes
   ui_labels := l1
   ui_nodes := n1
-  let list_name = #[83, 67, 69, 78, 69] // SCENE
   let list = $tree.Node {
     id: 200, parent: 0, role: vocab.role_list,
-    name: &list_name[0..5], description: &no_txt[0..0], value_text: &no_txt[0..0],
+    name: &lbl_scene[0..5], description: &no_txt_codes[0..0], value_text: &no_txt_codes[0..0],
     x: 10.0, y: 46.0, width: 138.0, height: 246.0,
     focusable: false, focused: false, disabled: false, hidden: world.editor_state.playing, modal: false,
     checked: vocab.state_none, expanded: vocab.state_true, selected: vocab.state_none, live: vocab.live_off,
@@ -655,16 +662,15 @@ func emit_ui_tree (world: World) -> (ui_labels: own #[U32]) -> (ui_nodes: own #[
     let is_sel = case world.editor_state.selected_id of
       $Some sid => sid == n.id
       $Nothing => false
-    let row_name = #[78, 79, 68, 69, 32, 48 + (n.id / 10) % 10, 48 + n.id % 10]
     let item = $tree.Node {
       id: 201 + row, parent: 200, role: vocab.role_listitem,
-      name: &row_name[0..7], description: &no_txt[0..0], value_text: &no_txt[0..0],
+      name: &lbl_node[0..4], description: &no_txt_codes[0..0], value_text: &no_txt_codes[0..0],
       x: 15.0, y: 68.0 + U32.to_f32 row * 22.0, width: 128.0, height: 19.0,
       focusable: true, focused: is_sel, disabled: false, hidden: world.editor_state.playing, modal: false,
       checked: vocab.state_none, expanded: vocab.state_none,
       selected: if is_sel then vocab.state_true else vocab.state_false,
       live: vocab.live_off,
-      value: 0.0, minimum: 0.0, maximum: 0.0, step: 0.0,
+      value: U32.to_f32 n.id, minimum: 0.0, maximum: 999.0, step: 1.0,
       actions: 1 << vocab.action_activate,
     }
     let (next_l, next_n) = tree.declare_owned item ui_labels ui_nodes
@@ -715,11 +721,8 @@ func populate_frame (world: World) -> (frame: own render.FrameAccess) -> (audio:
 
   // Evaluate `spark` SIMD foliage wind gusts and water Fresnel shimmer for the 4 foliage pillars.
   let resolved = scene_graph.resolve (&world.nodes[0..world.nodes.length])
-  let fxs = #[(-4.2), 4.2, (-4.2), 4.2]
-  let fzs = #[(-3.6), (-3.6), 3.1, 3.1]
-  let gusts = foliage.gust_factors_batch foliage_wind (&fxs[0..4]) (&fzs[0..4]) world.time
-  let cos_angles = #[0.25, 0.45, 0.65, 0.85]
-  let fres = water.fresnel_batch (&cos_angles[0..4]) 0.02
+  let gusts = foliage.gust_factors_batch foliage_wind (&foliage_xs[0..4]) (&foliage_zs[0..4]) world.time
+  let fres = water.fresnel_batch (&water_cos_angles[0..4]) 0.02
 
   for i in 0 .. resolved.length:
     let wn = resolved[i]
@@ -934,8 +937,127 @@ func restore (lanes_in: &[F32]) : World =>
     base.nodes := nodes
   return base
 
+type WorldScalars is data = $WorldScalars {
+  yaw: F32,
+  pitch: F32,
+  distance: F32,
+  target: Vec3,
+  held_arrows: U32,
+  time: F32,
+  play_time: F32,
+  pointer_x: F32,
+  pointer_y: F32,
+  width: F32,
+  height: F32,
+  physical_sky: Bool,
+  ray_tracing: U32,
+  ddgi: Bool,
+  oit: Bool,
+  upscale: Bool,
+  outdoor_env: Bool,
+  spawn_seq: U32,
+  chime_pending: Bool,
+  scene_save_pending: Bool,
+  scene_load_pending: Bool,
+  terrain_baked: Bool,
+  terrain_height_sum: F32,
+  editor_state: editor.State,
+  history_cursor: U32,
+  history_limit: U32,
+  history_next_group: U32,
+  pie_active: Bool,
+}
+
+func pack_world_scalars (w: World) : WorldScalars => $WorldScalars {
+  yaw: w.yaw,
+  pitch: w.pitch,
+  distance: w.distance,
+  target: w.target,
+  held_arrows: w.held_arrows,
+  time: w.time,
+  play_time: w.play_time,
+  pointer_x: w.pointer_x,
+  pointer_y: w.pointer_y,
+  width: w.width,
+  height: w.height,
+  physical_sky: w.physical_sky,
+  ray_tracing: w.ray_tracing,
+  ddgi: w.ddgi,
+  oit: w.oit,
+  upscale: w.upscale,
+  outdoor_env: w.outdoor_env,
+  spawn_seq: w.spawn_seq,
+  chime_pending: w.chime_pending,
+  scene_save_pending: w.scene_save_pending,
+  scene_load_pending: w.scene_load_pending,
+  terrain_baked: w.terrain_baked,
+  terrain_height_sum: w.terrain_height_sum,
+  editor_state: w.editor_state,
+  history_cursor: w.history.cursor,
+  history_limit: w.history.limit,
+  history_next_group: w.history.next_group,
+  pie_active: w.pie_snapshot.active,
+}
+
+func unpack_world (s: WorldScalars) -> (nodes: own #[scene_graph.Node]) -> (hist_cmds: own #[editor.HistoryEntry]) -> (pie_nodes: own #[scene_graph.Node]) : World =>
+  $World {
+    yaw: s.yaw,
+    pitch: s.pitch,
+    distance: s.distance,
+    target: s.target,
+    held_arrows: s.held_arrows,
+    time: s.time,
+    play_time: s.play_time,
+    pointer_x: s.pointer_x,
+    pointer_y: s.pointer_y,
+    width: s.width,
+    height: s.height,
+    physical_sky: s.physical_sky,
+    ray_tracing: s.ray_tracing,
+    ddgi: s.ddgi,
+    oit: s.oit,
+    upscale: s.upscale,
+    outdoor_env: s.outdoor_env,
+    spawn_seq: s.spawn_seq,
+    chime_pending: s.chime_pending,
+    scene_save_pending: s.scene_save_pending,
+    scene_load_pending: s.scene_load_pending,
+    terrain_baked: s.terrain_baked,
+    terrain_height_sum: s.terrain_height_sum,
+    nodes,
+    editor_state: s.editor_state,
+    history: $editor.History {
+      commands: hist_cmds,
+      cursor: s.history_cursor,
+      limit: s.history_limit,
+      next_group: s.history_next_group,
+    },
+    pie_snapshot: $editor.PlaySnapshot {
+      active: s.pie_active,
+      nodes: pie_nodes,
+    },
+  }
+
+func pack_world (w: own World) : (WorldScalars, #[scene_graph.Node], #[editor.HistoryEntry], #[scene_graph.Node]) =>
+  let scalars = pack_world_scalars w
+  let $World { nodes, history, pie_snapshot } = w
+  let $editor.History { commands } = history
+  let $editor.PlaySnapshot { nodes: pie_nodes } = pie_snapshot
+  return (scalars, nodes, commands, pie_nodes)
+
+func copy_nodes_into (dst: own #[scene_graph.Node]) -> (src: &[scene_graph.Node]) : #[scene_graph.Node] =>
+  @storage.truncate dst 0
+  for i in 0 .. src.length:
+    @storage.push dst (src.at i)
+  return dst
+
+// Keep every field on loop-carried `Access` a pre-allocated owner handle (or constant)
+// so Blot's `for ever:` boxed-carry check stays unchanged and releases frame temporaries every tick.
 type Access = {
-  world: World,
+  world_scalars: #[WorldScalars],
+  world_nodes: #[scene_graph.Node],
+  world_history: #[editor.HistoryEntry],
+  world_pie: #[scene_graph.Node],
   frame: render.FrameAccess,
   audio: sound.Access,
   packet_events: #[protocol.Event],
@@ -973,8 +1095,12 @@ func init_access () : Access =>
   let kernel_out: #[services.Request] = #[]
   let terrain_wire = kernel_kits.terrain_ctx_pack terrain_spec
   let terrain_hash = kernel.fnv1a64_f32s (&terrain_wire[0..terrain_wire.length])
+  let (ws, wn, wh, wp) = pack_world (create ())
   return {
-    world: create (),
+    world_scalars: #[ws],
+    world_nodes: wn,
+    world_history: wh,
+    world_pie: wp,
     frame: owners.frame,
     audio: owners.audio,
     packet_events,
@@ -1002,8 +1128,12 @@ const acknowledge = func access -> published => ()
 func execute (terrain_kernel: Kernel [#[F32], #[2; F32], #[4; F32]]) -> (access: own Access) -> (operation: U32) -> (payload: &[F32]) -> (outgoing: own #[F32]) =>
   case operation of
     1 => do:
-      access.world := create ()
-      outgoing := program.append (save access.world) self
+      let fresh = create ()
+      access.world_scalars[0] := pack_world_scalars fresh
+      access.world_nodes := copy_nodes_into self (&fresh.nodes[0..fresh.nodes.length])
+      @storage.truncate access.world_history 0
+      @storage.truncate access.world_pie 0
+      outgoing := program.append (save fresh) self
     2 => do:
       access.frame := render.begin_frame self
       access.audio := sound.begin_frame self
@@ -1016,36 +1146,42 @@ func execute (terrain_kernel: Kernel [#[F32], #[2; F32], #[4; F32]]) -> (access:
       access.kernels := kernel_transport.receive_events self (&ev_copy[0..ev_copy.length])
       for ev in ev_copy:
         access.preferences := preferences.receive self ev
+      let w = unpack_world access.world_scalars[0] access.world_nodes access.world_history access.world_pie
       if let $Some ans = kernel_kits.find_answer_for access.kernels terrain_kernel access.terrain_hash:
         let vals = kernel_transport.batch_values access.kernels ans
         let sum = 0.0
         for i in 0 .. ans.item_count:
           if i * 4 < vals.length:
             sum := sum + vals[i * 4]
-        access.world.terrain_height_sum := sum
-        access.world.terrain_baked := true
-      access.world := step self input.elapsed input.width input.height (&ev_copy[0..ev_copy.length])
+        w.terrain_height_sum := sum
+        w.terrain_baked := true
+      w := step self input.elapsed input.width input.height (&ev_copy[0..ev_copy.length])
       access.requests := persist.clear_requests self
-      if access.world.scene_save_pending:
+      if w.scene_save_pending:
         access.requests := persist.request self $persist.SaveScene
-      if access.world.scene_load_pending:
+      if w.scene_load_pending:
         access.requests := persist.request self $persist.LoadScene
       // Dispatch the 16-cell terrain bake batch to Pen's multi-core worker pool once CAP arrives.
-      if not access.world.terrain_baked:
+      if not w.terrain_baked:
         let wire = kernel_kits.terrain_ctx_pack terrain_spec
         let cells = make_terrain_cells ()
         let (_, next_kt) = kernel_kits.dispatch_batch access.kernels terrain_kernel access.terrain_hash (&wire[0..wire.length]) 16 (&cells[0..cells.length])
         access.kernels := next_kt
-      let (next_frame, next_audio) = populate_frame access.world access.frame access.audio
+      let (next_frame, next_audio) = populate_frame w access.frame access.audio
       access.frame := next_frame
       access.audio := next_audio
-      let (next_labels, next_ui) = emit_ui_tree access.world access.ui_labels access.ui_nodes
+      let (next_labels, next_ui) = emit_ui_tree w access.ui_labels access.ui_nodes
       access.ui_labels := next_labels
       access.ui_nodes := next_ui
+      let (ws, wn, wh, wp) = pack_world w
+      access.world_scalars[0] := ws
+      access.world_nodes := wn
+      access.world_history := wh
+      access.world_pie := wp
       let base_floats = measure_current_frame access
       let svc_count = access.service_output.length
-      let kout_fresh: #[services.Request] = #[]
-      let (next_kt, next_kout) = host.admit_kernel_requests base_floats svc_count access.kernels kout_fresh
+      @storage.truncate access.kernel_out 0
+      let (next_kt, next_kout) = host.admit_kernel_requests base_floats svc_count access.kernels access.kernel_out
       access.kernels := next_kt
       access.kernel_out := next_kout
       let drawn = render.finish access.frame
@@ -1057,23 +1193,38 @@ func execute (terrain_kernel: Kernel [#[F32], #[2; F32], #[4; F32]]) -> (access:
         svc_view access.services (&access.kernel_out[0..access.kernel_out.length]) (&access.kernels.payload[0..access.kernels.payload.length]) self
       access.preferences[0].changed := false
     3 => do:
-      outgoing := program.append (save access.world) self
+      let w = unpack_world access.world_scalars[0] access.world_nodes access.world_history access.world_pie
+      outgoing := program.append (save w) self
+      let (ws, wn, wh, wp) = pack_world w
+      access.world_scalars[0] := ws
+      access.world_nodes := wn
+      access.world_history := wh
+      access.world_pie := wp
     4 => do:
-      access.world := restore payload
-      outgoing := program.append (save access.world) self
+      let restored = restore payload
+      access.world_scalars[0] := pack_world_scalars restored
+      access.world_nodes := copy_nodes_into self (&restored.nodes[0..restored.nodes.length])
+      @storage.truncate access.world_history 0
+      @storage.truncate access.world_pie 0
+      outgoing := program.append (save restored) self
     5 => do:
-      let encoded = editor.encode_scene (&access.world.nodes[0..access.world.nodes.length])
+      let encoded = editor.encode_scene (&access.world_nodes[0..access.world_nodes.length])
       outgoing := program.append encoded self
     6 => do:
       if let $Some loaded = editor.decode_scene payload:
         let next_sel = if loaded.length > 1 then $Some loaded[1].id else if loaded.length > 0 then $Some loaded[0].id else $Nothing
-        @storage.truncate access.world.nodes 0
-        for i in 0 .. loaded.length:
-          @storage.push access.world.nodes loaded[i]
-        access.world.history := editor.new_history 64
-        access.world.editor_state.playing := false
-        access.world.editor_state.selected_id := next_sel
-      let encoded = editor.encode_scene (&access.world.nodes[0..access.world.nodes.length])
+        access.world_nodes := copy_nodes_into self (&loaded[0..loaded.length])
+        @storage.truncate access.world_history 0
+        @storage.truncate access.world_pie 0
+        let s = access.world_scalars[0]
+        s.history_cursor := 0
+        s.history_limit := 64
+        s.history_next_group := 1
+        s.pie_active := false
+        s.editor_state.playing := false
+        s.editor_state.selected_id := next_sel
+        access.world_scalars[0] := s
+      let encoded = editor.encode_scene (&access.world_nodes[0..access.world_nodes.length])
       outgoing := program.append encoded self
     _ => panic "unexpected session op"
   return (access, outgoing)

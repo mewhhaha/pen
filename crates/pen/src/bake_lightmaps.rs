@@ -170,11 +170,11 @@ pub fn run(opts: &BakeCliOptions) -> Result<()> {
                 .with_context(|| format!("reading mesh {}", mesh_path.display()))?;
             let mesh: MeshJson = serde_json::from_str(&mraw)?;
             let idx_list: Vec<u32> = if mesh.indices.is_empty() {
-                (0..mesh.positions.len() as u32).collect()
+                (0..u32::try_from(mesh.positions.len()).context("mesh vertex count exceeds u32::MAX")?).collect()
             } else {
                 mesh.indices
             };
-            for tri in idx_list.chunks_exact(3) {
+            for tri in idx_list.as_chunks::<3>().0 {
                 let (i0, i1, i2) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
                 if i0 >= mesh.positions.len() || i1 >= mesh.positions.len() || i2 >= mesh.positions.len() {
                     continue;

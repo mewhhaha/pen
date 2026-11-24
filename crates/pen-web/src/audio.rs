@@ -255,8 +255,7 @@ impl Playing {
     }
 }
 fn linear_q_to_db(q: f32) -> f32 {
-    // WebAudio BiquadFilterNode lowpass interprets `Q` in dB (gain = 10^(Q/20)).
-    20.0 * q.clamp(0.5, 20.0).log10()
+    crate::policy::linear_q_to_db(q)
 }
 enum SynthSource {
     Osc(OscillatorNode),
@@ -303,19 +302,8 @@ struct PlayingSynth {
     leaving: Option<f64>,
 }
 impl PlayingSynth {
-    #[allow(clippy::cast_possible_truncation, reason = "envelope amplitude in 0..=1")]
     fn current_env(&self, now: f64) -> f32 {
-        let elapsed = (now - self.started_at).max(0.0);
-        let atk = f64::from(self.spec.attack.max(0.001));
-        let dec = f64::from(self.spec.decay.max(0.001));
-        if elapsed < atk {
-            (elapsed / atk) as f32
-        } else if elapsed < atk + dec {
-            let t = (elapsed - atk) / dec;
-            (1.0 + (f64::from(self.spec.sustain) - 1.0) * t) as f32
-        } else {
-            self.spec.sustain
-        }
+        crate::policy::synth_adsr_level(now - self.started_at, self.spec.attack, self.spec.decay, self.spec.sustain)
     }
     fn begin_release(&mut self, now: f64) {
         let rel = f64::from(self.spec.release.max(0.01));
@@ -765,9 +753,7 @@ impl Audio {
         );
         // Crossfade between two persistent ConvolverNodes with room hysteresis so zone
         // transitions never truncate active convolution tails or regenerate IRs every frame.
-        let room_changed = (room.0 - self.reverb_room.0).abs() > 0.08
-            || (room.1 - self.reverb_room.1).abs() > 0.05
-            || ((room.0 > 0.0) != (self.reverb_room.0 > 0.0));
+        let room_changed = crate::policy::reverb_room_changed(room, self.reverb_room);
         if room_changed
             && now >= self.reverb_switch_ready
             && let (Some(conv_a), Some(conv_b), Some(send_a), Some(send_b), Some(ret_a), Some(ret_b)) = (
@@ -821,12 +807,8 @@ impl Audio {
             }
             let spec = frame.buses.get(index).unwrap_or(&fallback);
             let bus = self.bus(index);
-            let duck = if spec.duck_amount.is_finite() && spec.duck_amount > 0.0 {
-                let sc = rms_by_bus.get(spec.duck_bus as usize).copied().unwrap_or(0.0);
-                (1.0 - spec.duck_amount.clamp(0.0, 1.0) * (sc * 2.0).clamp(0.0, 1.0)).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
+            let sc = rms_by_bus.get(spec.duck_bus as usize).copied().unwrap_or(0.0);
+            let duck = crate::policy::sidechain_duck_gain(spec.duck_amount, sc);
             let level = if self.monitor.audible(index) { spec.gain * duck } else { 0.0 };
             glide(&bus.gain.gain(), level, &context);
             if index != 0 {
@@ -955,11 +937,16 @@ impl Audio {
                     return true;
                 }
                 if spec.mode == SynthMode::Granular {
-                    let rel_diff = |a: f32, b: f32| (a - b).abs() > a.abs().max(1e-3) * 0.02;
-                    return rel_diff(s.spec.frequency, spec.frequency)
-                        || (s.spec.detune_cents - spec.detune_cents).abs() > 2.0
-                        || rel_diff(s.spec.grain_size, spec.grain_size)
-                        || rel_diff(s.spec.grain_pitch, spec.grain_pitch);
+                    return crate::policy::granular_synth_needs_restart(
+                        s.spec.frequency,
+                        spec.frequency,
+                        s.spec.detune_cents,
+                        spec.detune_cents,
+                        s.spec.grain_size,
+                        spec.grain_size,
+                        s.spec.grain_pitch,
+                        spec.grain_pitch,
+                    );
                 }
                 false
             });
@@ -1145,6 +1132,58 @@ pub async fn qualify() -> Result<()> {
         report.buses.len() == pen_protocol::boundary::MAX_BUSES && report.buses[1].used && report.buses[1].muted,
         "the audio report must have every bus, bus 1 in use and muted"
     );
+    // Procedural oscillator + granular synth voices, reverb zone crossfade, and retirement.
+    frame.reverb_zones.push(pen_protocol::ReverbZone {
+        id: 1,
+        position: at(1.0, 0.0, 0.0),
+        half_extents: at(5.0, 5.0, 5.0),
+        blend: 1.0,
+        decay: 2.2,
+        damping: 0.4,
+        wet: 0.45,
+        portal_attenuation: 0.1,
+    });
+    frame.synths.push(pen_protocol::SynthVoice {
+        id: 10,
+        mode: 3, // Triangle
+        bus: 0,
+        frequency: 220.0,
+        gain: 0.08,
+        pan: 0.0,
+        detune: 0.0,
+        attack: 0.01,
+        decay: 0.05,
+        sustain: 0.7,
+        release: 0.05,
+        cutoff: 2400.0,
+        resonance: 1.2,
+        grain_size: 0.05,
+        grain_pitch: 1.0,
+        reverb: 0.2,
+    });
+    frame.synths.push(pen_protocol::SynthVoice {
+        id: 11,
+        mode: 5, // Granular
+        bus: 0,
+        frequency: 330.0,
+        gain: 0.06,
+        pan: -0.25,
+        detune: 0.0,
+        attack: 0.01,
+        decay: 0.05,
+        sustain: 0.6,
+        release: 0.05,
+        cutoff: 3000.0,
+        resonance: 1.0,
+        grain_size: 0.04,
+        grain_pitch: 1.2,
+        reverb: 0.15,
+    });
+    audio.mix(&frame, &Placements::of(&frame))?;
+    anyhow::ensure!(audio.synths.len() == 2, "both procedural and granular synth voices must start");
+    frame.synths.clear();
+    audio.mix(&frame, &Placements::of(&frame))?;
+    anyhow::ensure!(audio.synths.is_empty() && audio.retiring_synths.len() == 2, "omitted synths must enter retiring pool");
     frame.voices.clear();
     audio.mix(&frame, &Placements::of(&frame))?;
     let _ = audio.context.as_ref().unwrap().close();

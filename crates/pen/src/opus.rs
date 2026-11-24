@@ -64,7 +64,7 @@ impl VoiceEncoder {
     pub fn new_voip(bitrate_bps: i32) -> Result<Self> {
         let mut error = 0;
         // SAFETY: valid 48 kHz mono VoIP application; libopus returns null and sets error on failure.
-        let state = unsafe { sys::opus_encoder_create(RATE, 1, sys::OPUS_APPLICATION_VOIP as i32, &mut error) };
+        let state = unsafe { sys::opus_encoder_create(RATE, 1, sys::OPUS_APPLICATION_VOIP, &mut error) };
         ensure!(!state.is_null() && error == sys::OPUS_OK, "creating an Opus VoIP encoder failed ({error})");
         let mut enc = Self(state);
         enc.set_bitrate(bitrate_bps)?;
@@ -75,7 +75,7 @@ impl VoiceEncoder {
     pub fn set_bitrate(&mut self, bps: i32) -> Result<()> {
         let bps = bps.clamp(6_000, 128_000);
         // SAFETY: `self.0` is a live OpusEncoder; OPUS_SET_BITRATE_REQUEST takes one i32 vararg.
-        let err = unsafe { sys::opus_encoder_ctl(self.0, sys::OPUS_SET_BITRATE_REQUEST as i32, bps) };
+        let err = unsafe { sys::opus_encoder_ctl(self.0, sys::OPUS_SET_BITRATE_REQUEST, bps) };
         ensure!(err == sys::OPUS_OK, "OPUS_SET_BITRATE failed ({err})");
         Ok(())
     }
@@ -83,7 +83,7 @@ impl VoiceEncoder {
     pub fn set_inband_fec(&mut self, enabled: bool) -> Result<()> {
         let val: i32 = i32::from(enabled);
         // SAFETY: `self.0` is a live OpusEncoder; OPUS_SET_INBAND_FEC_REQUEST takes one i32 vararg.
-        let err = unsafe { sys::opus_encoder_ctl(self.0, sys::OPUS_SET_INBAND_FEC_REQUEST as i32, val) };
+        let err = unsafe { sys::opus_encoder_ctl(self.0, sys::OPUS_SET_INBAND_FEC_REQUEST, val) };
         ensure!(err == sys::OPUS_OK, "OPUS_SET_INBAND_FEC failed ({err})");
         Ok(())
     }
@@ -91,7 +91,7 @@ impl VoiceEncoder {
     pub fn set_dtx(&mut self, enabled: bool) -> Result<()> {
         let val: i32 = i32::from(enabled);
         // SAFETY: `self.0` is a live OpusEncoder; OPUS_SET_DTX_REQUEST takes one i32 vararg.
-        let err = unsafe { sys::opus_encoder_ctl(self.0, sys::OPUS_SET_DTX_REQUEST as i32, val) };
+        let err = unsafe { sys::opus_encoder_ctl(self.0, sys::OPUS_SET_DTX_REQUEST, val) };
         ensure!(err == sys::OPUS_OK, "OPUS_SET_DTX failed ({err})");
         Ok(())
     }
@@ -338,7 +338,7 @@ mod tests {
             let wire = encode_packet(&VoicePacket {
                 speaker_id: 11,
                 seq: f,
-                timestamp: u32::from(f) * VOICE_FRAME_SAMPLES as u32,
+                timestamp: u32::from(f) * u32::try_from(VOICE_FRAME_SAMPLES).unwrap(),
                 flags: FLAG_SPEAKING,
                 payload,
             })

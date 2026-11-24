@@ -1816,11 +1816,12 @@ impl Session {
                             format!("saved scene {}", paths.scene.display()),
                         );
                     }
-                    if rendered.scene_load_requested && local {
-                        if let Some(load) = load_file(&mut self.runtime, &mut shell, paths.scene_to_read(), true) {
-                            loads.push(load);
-                            state_replaced = true;
-                        }
+                    if rendered.scene_load_requested
+                        && local
+                        && let Some(load) = load_file(&mut self.runtime, &mut shell, paths.scene_to_read(), true)
+                    {
+                        loads.push(load);
+                        state_replaced = true;
                     }
                     if rendered.save_requested {
                         report(
@@ -1828,11 +1829,12 @@ impl Session {
                             format!("saved {}", paths.quicksave.display()),
                         );
                     }
-                    if rendered.load_requested && local {
-                        if let Some(load) = load_file(&mut self.runtime, &mut shell, &paths.quicksave, false) {
-                            loads.push(load);
-                            state_replaced = true;
-                        }
+                    if rendered.load_requested
+                        && local
+                        && let Some(load) = load_file(&mut self.runtime, &mut shell, &paths.quicksave, false)
+                    {
+                        loads.push(load);
+                        state_replaced = true;
                     }
                     for path in &planned.saves {
                         report(self.runtime.save(path), format!("saved {}", path.display()));

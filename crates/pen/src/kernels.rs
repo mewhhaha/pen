@@ -837,7 +837,7 @@ impl KernelService {
             self.ready_replies.push(KernelReply::ctl(req.request, service_status::FAILED, ERR_UPLOAD_TOO_LARGE));
             return;
         }
-        let max_chunks = (self.max_ctx_bytes() / 4).div_ceil(16_380).max(1) as u32;
+        let max_chunks = u32::try_from((self.max_ctx_bytes() / 4).div_ceil(16_380).max(1)).unwrap_or(u32::MAX);
         if (total_words > 0 && total_chunks == 0) || total_chunks > max_chunks {
             self.ready_replies.push(KernelReply::ctl(req.request, service_status::FAILED, ERR_INVALID_REQUEST));
             return;
@@ -1195,7 +1195,7 @@ mod tests {
             b,
             c,
             d,
-            value_count: values.len() as u32,
+            value_count: u32::try_from(values.len()).unwrap(),
             values,
         }
     }
@@ -1239,7 +1239,7 @@ entry kernel scale_ctx: Kernel [#[F32], F32, #[F32]] = { prepare: prep, run: run
         let geom_hash = fnv1a64_words(&ctx_words);
         let seq = 0x0102_0304u32;
         let [seq_lo, seq_hi] = pack_u32(seq);
-        let [w_lo, w_hi] = pack_u32(ctx_floats.len() as u32);
+        let [w_lo, w_hi] = pack_u32(u32::try_from(ctx_floats.len()).unwrap());
         let epoch_w = pack_u64(svc.host_epoch());
         let geom_w = pack_u64(geom_hash);
         let bind_w = pack_u64(manifest.binding_hash);

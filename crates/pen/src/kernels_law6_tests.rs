@@ -419,6 +419,9 @@ entry func main (h: #[F32] -> #[F32] ! {{Foreign}}): Unit ! {{Foreign}} => retur
     path
 }
 
+type SessionRunResult = (Vec<Vec<f32>>, Vec<u64>, Vec<f32>, Vec<f32>, Vec<Vec<ServiceRequest>>);
+
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "Law 6 test harness decodes non-negative wire counts")]
 fn drive_session_frames(
     engine: &wasmtime::Engine,
     module: &GuestModule,
@@ -429,7 +432,7 @@ fn drive_session_frames(
     initial_save: Option<&[f32]>,
     replayed_inputs: Option<&[Vec<f32>]>,
     enforce_old_pen_decoder: bool,
-) -> (Vec<Vec<f32>>, Vec<u64>, Vec<f32>, Vec<f32>, Vec<Vec<ServiceRequest>>) {
+) -> SessionRunResult {
     let mut guest = SessionGuest::open(engine, module);
     if let Some(saved) = initial_save {
         let _ = guest.send_op(Operation::Restore, saved);
@@ -498,10 +501,10 @@ fn drive_session_frames(
                 .services
         };
         let kernel_reqs: Vec<ServiceRequest> = reqs.iter().filter(|r| r.service == service::KERNEL).cloned().collect();
-        if let Some(ksvc) = svc.as_deref_mut() {
-            if !kernel_reqs.is_empty() {
-                ksvc.submit(&kernel_reqs);
-            }
+        if let Some(ksvc) = svc.as_deref_mut()
+            && !kernel_reqs.is_empty()
+        {
+            ksvc.submit(&kernel_reqs);
         }
         all_services.push(reqs);
 
@@ -525,6 +528,7 @@ fn drive_session_frames(
 }
 
 #[test]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "test asserts non-negative wire tags and counts")]
 fn law6_end_to_end_replay_old_pen_moment_hot_reload_mods_and_equivalence() {
     let dir = std::env::temp_dir().join(format!("pen-law6-suite-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

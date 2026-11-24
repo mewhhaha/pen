@@ -108,6 +108,66 @@ pub fn granular_loop_frames(sample_rate: f32) -> usize {
     }
 }
 
+/// Converts a linear filter resonance Q (`0.5..=20.0`) to WebAudio BiquadFilterNode dB Q.
+pub fn linear_q_to_db(q: f32) -> f32 {
+    20.0 * q.clamp(0.5, 20.0).log10()
+}
+
+/// Evaluates the held ADSR envelope level in `0.0..=1.0` at `elapsed` seconds after note-on,
+/// used to start click-free releases if a WebAudio synth is interrupted mid-attack or mid-decay.
+pub fn synth_adsr_level(elapsed: f64, attack: f32, decay: f32, sustain: f32) -> f32 {
+    let elapsed = elapsed.max(0.0);
+    let atk = f64::from(attack.max(0.001));
+    let dec = f64::from(decay.max(0.001));
+    #[allow(clippy::cast_possible_truncation, reason = "envelope amplitude clamped to 0..=1")]
+    {
+        if elapsed < atk {
+            (elapsed / atk) as f32
+        } else if elapsed < atk + dec {
+            let t = (elapsed - atk) / dec;
+            (1.0 + (f64::from(sustain) - 1.0) * t) as f32
+        } else {
+            sustain
+        }
+    }
+}
+
+/// Hysteresis test deciding whether two reverb rooms `(decay, damping)` differ enough to
+/// regenerate the WebAudio convolution impulse response and crossfade ConvolverNodes.
+pub fn reverb_room_changed(next: (f32, f32), current: (f32, f32)) -> bool {
+    (next.0 - current.0).abs() > 0.08
+        || (next.1 - current.1).abs() > 0.05
+        || ((next.0 > 0.0) != (current.0 > 0.0))
+}
+
+/// Computes linear sidechain ducking multiplier in `0.0..=1.0` from `duck_amount` and sidechain RMS.
+pub fn sidechain_duck_gain(duck_amount: f32, sidechain_rms: f32) -> f32 {
+    if duck_amount.is_finite() && duck_amount > 0.0 && sidechain_rms.is_finite() {
+        (1.0 - duck_amount.clamp(0.0, 1.0) * (sidechain_rms.max(0.0) * 2.0).clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Returns whether a pre-rendered granular WebAudio loop must be re-synthesized for updated parameters.
+#[allow(clippy::too_many_arguments, reason = "explicit old/new granular synth parameters")]
+pub fn granular_synth_needs_restart(
+    old_freq: f32,
+    new_freq: f32,
+    old_detune: f32,
+    new_detune: f32,
+    old_grain_size: f32,
+    new_grain_size: f32,
+    old_grain_pitch: f32,
+    new_grain_pitch: f32,
+) -> bool {
+    let rel_diff = |a: f32, b: f32| (a - b).abs() > a.abs().max(1e-3) * 0.02;
+    rel_diff(old_freq, new_freq)
+        || (old_detune - new_detune).abs() > 2.0
+        || rel_diff(old_grain_size, new_grain_size)
+        || rel_diff(old_grain_pitch, new_grain_pitch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +224,27 @@ mod tests {
         assert_eq!(noise_buffer_len(-100.0), 4096);
         assert_eq!(granular_loop_frames(48_000.0), 24_000);
         assert_eq!(granular_loop_frames(0.0), 256);
+    }
+
+    #[test]
+    fn audio_adsr_reverb_ducking_and_granular_restart_policies() {
+        // ADSR ramps smoothly through attack -> decay -> sustain.
+        assert!((synth_adsr_level(0.05, 0.1, 0.2, 0.4) - 0.5).abs() < 1e-6);
+        assert!((synth_adsr_level(0.20, 0.1, 0.2, 0.4) - 0.7).abs() < 1e-6);
+        assert!((synth_adsr_level(1.00, 0.1, 0.2, 0.4) - 0.4).abs() < 1e-6);
+        assert!((linear_q_to_db(1.0)).abs() < 1e-6);
+        assert!((linear_q_to_db(10.0) - 20.0).abs() < 1e-5);
+        // Reverb room hysteresis rejects tiny jitter but fires on zone change or on/off flip.
+        assert!(!reverb_room_changed((1.52, 0.36), (1.50, 0.35)));
+        assert!(reverb_room_changed((2.20, 0.35), (1.50, 0.35)));
+        assert!(reverb_room_changed((0.0, 0.0), (0.04, 0.0)));
+        // Sidechain ducking clamps cleanly and ignores NaN.
+        assert!((sidechain_duck_gain(0.5, 0.25) - 0.75).abs() < 1e-6);
+        assert!((sidechain_duck_gain(1.0, 1.0) - 0.0).abs() < 1e-6);
+        assert!((sidechain_duck_gain(f32::NAN, 0.5) - 1.0).abs() < 1e-6);
+        // Granular loop avoids thrashing on <2% drift, restarts on real pitch/grain changes.
+        assert!(!granular_synth_needs_restart(440.0, 444.0, 0.0, 1.0, 0.05, 0.0505, 1.0, 1.01));
+        assert!(granular_synth_needs_restart(440.0, 460.0, 0.0, 0.0, 0.05, 0.05, 1.0, 1.0));
+        assert!(granular_synth_needs_restart(440.0, 440.0, 0.0, 5.0, 0.05, 0.05, 1.0, 1.0));
     }
 }

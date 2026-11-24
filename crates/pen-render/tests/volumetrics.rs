@@ -1279,3 +1279,161 @@ fn the_volumes_gpu_time_by_tier() {
         eprintln!("{name}: volume {best:.3} ms (largest of 30 frames) in a {total:.3} ms frame");
     }
 }
+
+/// Ink's `noise.hash3`, `value3` and `fbm_value3`, in f64 where it is not integers.
+fn noise_hash(x: u32, y: u32, z: u32, seed: u32) -> u32 {
+    let mut h = x.wrapping_mul(2747636419)
+        ^ y.wrapping_mul(2654435769)
+        ^ z.wrapping_mul(2246822519)
+        ^ seed.wrapping_mul(3266489917);
+    h ^= h >> 15;
+    h = h.wrapping_mul(2246822507);
+    h ^= h >> 13;
+    h = h.wrapping_mul(3266489909);
+    h ^ (h >> 16)
+}
+
+fn value3(seed: u32, p: V3) -> f64 {
+    let cell = |v: f64| v.floor() as i32 as u32;
+    let fade = |t: f64| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+    let (xi, yi, zi) = (cell(p[0]), cell(p[1]), cell(p[2]));
+    let (u, v, w) = (fade(p[0] - p[0].floor()), fade(p[1] - p[1].floor()), fade(p[2] - p[2].floor()));
+    let corner = |dx: u32, dy: u32, dz: u32| {
+        f64::from(noise_hash(xi.wrapping_add(dx), yi.wrapping_add(dy), zi.wrapping_add(dz), seed) >> 8) / 16777216.0
+            * 2.0
+            - 1.0
+    };
+    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+    let x00 = lerp(corner(0, 0, 0), corner(1, 0, 0), u);
+    let x10 = lerp(corner(0, 1, 0), corner(1, 1, 0), u);
+    let x01 = lerp(corner(0, 0, 1), corner(1, 0, 1), u);
+    let x11 = lerp(corner(0, 1, 1), corner(1, 1, 1), u);
+    lerp(lerp(x00, x10, v), lerp(x01, x11, v), w)
+}
+
+fn fbm_value3(seed: u32, octaves: u32, p: V3) -> f64 {
+    let (mut sum, mut total, mut amplitude, mut frequency) = (0.0, 0.0, 1.0, 1.0);
+    for octave in 0..octaves {
+        sum += amplitude * value3(seed + octave * 101, p.map(|v| v * frequency));
+        total += amplitude;
+        amplitude *= 0.5;
+        frequency *= 2.0;
+    }
+    sum / total
+}
+
+/// Where the sample of frame `index`'s jitter sits in froxel (x, y, k): the point of the world.
+fn jittered_point(
+    view: &Camera,
+    grid: (u32, u32),
+    slices: u32,
+    reach: f64,
+    (x, y, k): (u32, u32, u32),
+    jitter: [f64; 3],
+) -> V3 {
+    let (u, v) =
+        ((f64::from(x) + 0.5 + jitter[0]) / f64::from(grid.0), (f64::from(y) + 0.5 + jitter[1]) / f64::from(grid.1));
+    let (nx, ny) = (u * 2.0 - 1.0, 1.0 - v * 2.0);
+    let ray = [nx / view.scale.0, ny / view.scale.1, -1.0];
+    let along = depth(reach, slices, f64::from(k) + 0.5 + jitter[2]);
+    std::array::from_fn(|i| {
+        view.eye[i] + along * (ray[0] * view.right[i] + ray[1] * view.up[i] + ray[2] * view.back[i])
+    })
+}
+
+/// The jitter frame `index` of the volume takes (the Halton (2, 3, 5) points).
+fn jitter_of(index: u64) -> [f64; 3] {
+    let halton = |mut index: u64, base: u64| {
+        let (mut result, mut fraction) = (0.0f32, 1.0f32);
+        while index > 0 {
+            fraction /= base as f32;
+            result += fraction * (index % base) as f32;
+            index /= base;
+        }
+        f64::from(result) - 0.5
+    };
+    let index = index % 16 + 1;
+    [halton(index, 2), halton(index, 3), halton(index, 5)]
+}
+
+#[test]
+fn the_mists_noise_follows_inks_reference_and_the_games_drift() {
+    let Some(mut rig) = Rig::new("noise", 64) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let view = camera([1.0, 2.0, 5.0], [0.0, 2.5, -10.0], 1.6, 0.5);
+    let (density, amount, scale, reach) = (0.05f64, 0.8f64, 7.0f64, 50.0f64);
+    let build = |drift: [f32; 3], tier: u32| {
+        let fog = Fog {
+            density: density as f32,
+            height: 1.0e9,
+            distance: reach as f32,
+            noise: amount as f32,
+            noise_scale: scale as f32,
+            drift: vector(drift[0], drift[1], drift[2]),
+            ..Fog::default()
+        };
+        let mut frame = mist_frame(&view, fog, tier);
+        frame.sky = sky_with_mean([0.2, 0.2, 0.2]);
+        frame
+    };
+    let probes: Vec<(u32, u32, u32)> =
+        (0..40).map(|i| (7 + (i * 13) % 140, 5 + (i * 29) % 80, 6 + (i * 7) % 56)).collect();
+    for (tier, octaves, slices, grid) in [(2u32, 3u32, 64u32, (160u32, 90u32)), (1, 2, 32, (80, 45))] {
+        for drift in [[0.0f32, 0.0, 0.0], [3.1, -1.2, 5.5]] {
+            let frame = build(drift, tier);
+            rig.draw(&frame);
+            rig.renderer.reset_volumetrics();
+            rig.draw(&frame);
+            assert!(!rig.renderer.stats().volume_history);
+            let injected = rig.volume(VolumeLayer::Injected);
+            // The frame's jitter is one of the sixteen: the reference at the right one matches.
+            let mut best = (f64::MAX, 0);
+            for candidate in 0..16u64 {
+                let mut worst = 0.0f64;
+                for &(x, y, k) in &probes {
+                    let k = k.min(slices - 1);
+                    let (x, y) = (x.min(grid.0 - 1), y.min(grid.1 - 1));
+                    let p = jittered_point(&view, grid, slices, reach, (x, y, k), jitter_of(candidate));
+                    let q = [
+                        (p[0] + f64::from(drift[0])) / scale,
+                        (p[1] + f64::from(drift[1])) / scale,
+                        (p[2] + f64::from(drift[2])) / scale,
+                    ];
+                    let want = density * (1.0 + amount * fbm_value3(0, octaves, q)).max(0.0);
+                    worst = worst.max((f64::from(injected.at(x, y, k)[3]) - want).abs() / density);
+                }
+                if worst < best.0 {
+                    best = (worst, candidate);
+                }
+            }
+            eprintln!(
+                "tier {tier} drift {drift:?}: the jitter {} matches the noise within {:.2e} of the density",
+                best.1, best.0
+            );
+            assert!(best.0 < 2e-3, "the noise against its reference: {}", best.0);
+        }
+        // The same drift, the same mist; a different drift, another one.
+        let still = build([0.0, 0.0, 0.0], tier);
+        let moved = build([40.0, 0.0, 0.0], tier);
+        rig.settle(&still, 20);
+        let a = rig.volume(VolumeLayer::Injected);
+        rig.renderer.reset_volumetrics();
+        rig.settle(&moved, 20);
+        let b = rig.volume(VolumeLayer::Injected);
+        rig.renderer.reset_volumetrics();
+        rig.settle(&still, 20);
+        let c = rig.volume(VolumeLayer::Injected);
+        let difference = |p: &VolumeImage, q: &VolumeImage| {
+            p.texels.iter().zip(&q.texels).map(|(u, v)| f64::from((u[3] - v[3]).abs())).sum::<f64>()
+                / p.texels.len() as f64
+        };
+        eprintln!("drift: same {:.2e}, moved {:.2e}", difference(&a, &c), difference(&a, &b));
+        // (The same drift settles to the same mist but for where the jitter sequence stands.)
+        assert!(
+            difference(&a, &c) * 4.0 < difference(&a, &b) && difference(&a, &b) > 1e-3,
+            "a drift carries the noise"
+        );
+    }
+}

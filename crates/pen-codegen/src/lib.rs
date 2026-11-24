@@ -95,8 +95,8 @@ mod tests {
         let model = model::build(schema()).unwrap();
         assert_eq!(model.magic, 0x474446);
         // The 180 lanes before the exposure and the grade, their 36, volumetrics' 16, bone_matrices & morph_weights counts,
-        // plus motion_blur (3), dof (4), and motion_count (1).
-        assert_eq!(model.header_lanes, 245);
+        // plus motion_blur (3), dof (4), motion_count (1), quality.ssgi (1), and ribbon_count (1).
+        assert_eq!(model.header_lanes, 247);
         assert_eq!(model.event_lanes(), 5);
         assert_eq!(model.section("draws").fixed.as_ref().unwrap().lanes, 24);
         assert_eq!(model.section("insets").fixed.as_ref().unwrap().lanes, 48);
@@ -105,7 +105,8 @@ mod tests {
         assert_eq!(model.section("bone_matrices").fixed.as_ref().unwrap().lanes, 19);
         assert_eq!(model.section("morph_weights").fixed.as_ref().unwrap().lanes, 4);
         assert_eq!(model.section("motions").fixed.as_ref().unwrap().lanes, 17);
-        assert_eq!(model.section("emitters").fixed.as_ref().unwrap().lanes, 42);
+        assert_eq!(model.section("ribbons").fixed.as_ref().unwrap().lanes, 12);
+        assert_eq!(model.section("emitters").fixed.as_ref().unwrap().lanes, 47);
         // Position, reach, color, direction, a spot's two cosines, whether it
         // casts shadows and its id.
         assert_eq!(model.section("lights").fixed.as_ref().unwrap().lanes, 14);

@@ -62,6 +62,8 @@ const max_morph_weights = 65536
 // The most per-draw previous transforms one frame may declare for motion
 // vectors.
 const max_motions = 100000
+// The most ribbon trail control points one frame may declare.
+const max_ribbons = 65536
 // The most buses one frame may declare, the master (bus 0) included.
 const max_buses = 16
 // Voice ids are whole numbers from 1 to this, the wire's exact-integer range.
@@ -798,7 +800,7 @@ const reports_op_queued = 2
 
 // Sizes in lanes.
 const packet_magic = 4670534.0
-const packet_header_floats = 245
+const packet_header_floats = 247
 const frame_header_floats = 5
 const event_floats = 5
 const extensions_marker = 5260632.0
@@ -816,7 +818,7 @@ const service_request_floats = 8
 const bus_floats = 3
 const voice_floats = 12
 const pose_floats = 5
-const emitter_floats = 42
+const emitter_floats = 47
 const light_floats = 14
 const cascade_floats = 18
 const probe_floats = 28
@@ -829,6 +831,7 @@ const instance_removal_floats = 2
 const bone_matrix_floats = 19
 const morph_weight_floats = 4
 const motion_floats = 17
+const ribbon_floats = 12
 
 // Where each header lane and record field starts.
 const header_magic_lane = 0
@@ -980,6 +983,8 @@ const header_dof_focus_range_lane = 241
 const header_dof_aperture_lane = 242
 const header_dof_max_blur_lane = 243
 const header_motion_count_lane = 244
+const header_quality_ssgi_lane = 245
+const header_ribbon_count_lane = 246
 const draw_mesh_lane = 0
 const draw_material_lane = 1
 const draw_transform_lane = 2
@@ -1058,6 +1063,11 @@ const emitter_size_end_lane = 32
 const emitter_color_start_lane = 33
 const emitter_color_end_lane = 37
 const emitter_additive_lane = 41
+const emitter_soft_depth_lane = 42
+const emitter_lit_lane = 43
+const emitter_flipbook_cols_lane = 44
+const emitter_flipbook_rows_lane = 45
+const emitter_flipbook_fps_lane = 46
 const light_position_lane = 0
 const light_radius_lane = 3
 const light_color_lane = 4
@@ -1130,6 +1140,13 @@ const morph_weight_target_lane = 2
 const morph_weight_weight_lane = 3
 const motion_draw_lane = 0
 const motion_previous_lane = 1
+const ribbon_point_ribbon_lane = 0
+const ribbon_point_material_lane = 1
+const ribbon_point_additive_lane = 2
+const ribbon_point_position_lane = 3
+const ribbon_point_width_lane = 6
+const ribbon_point_color_lane = 7
+const ribbon_point_soft_depth_lane = 11
 const solid_faces_lane = 0
 const field_patch_material_lane = 0
 const field_patch_width_lane = 1

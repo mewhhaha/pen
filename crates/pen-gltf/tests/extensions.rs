@@ -206,7 +206,7 @@ fn an_extension_the_import_does_not_read_is_reported_and_one_it_does_is_not() {
             "KHR_materials_iridescence": {"iridescenceFactor": 1.0},
             "KHR_materials_clearcoat": {"clearcoatFactor": 0.5},
         }}),
-        &["KHR_materials_unlit", "KHR_materials_iridescence", "KHR_materials_clearcoat", "KHR_texture_transform"],
+        &["KHR_materials_unlit", "KHR_materials_iridescence", "KHR_materials_clearcoat", "KHR_materials_dispersion"],
     );
     assert_eq!(material["lighting"], "unlit");
     assert_eq!(material["surface"], json!({"clearcoat": 0.5}));
@@ -214,9 +214,72 @@ fn an_extension_the_import_does_not_read_is_reported_and_one_it_does_is_not() {
         notes,
         [
             "the file uses KHR_materials_iridescence, which the import does not read",
-            "the file uses KHR_texture_transform, which the import does not read",
+            "the file uses KHR_materials_dispersion, which the import does not read",
         ]
     );
+}
+
+#[test]
+fn orm_emissive_and_texture_transform_are_imported_without_unread_notes() {
+    let directory = directory("orm_uv");
+    let out = directory.join("assets");
+    let (mut document, mut bytes) = model(
+        &square(),
+        json!({
+            "name": "pbr",
+            "pbrMetallicRoughness": {
+                "baseColorTexture": {
+                    "index": 0,
+                    "extensions": {
+                        "KHR_texture_transform": {
+                            "offset": [0.25, 0.5],
+                            "scale": [2.0, 3.0],
+                            "rotation": 0.5,
+                        }
+                    }
+                },
+                "metallicRoughnessTexture": {"index": 1},
+            },
+            "occlusionTexture": {"index": 2},
+            "emissiveTexture": {"index": 0},
+            "emissiveFactor": [1.0, 0.5, 0.25],
+        }),
+        &["KHR_texture_transform"],
+        json!({}),
+    );
+    let append_png = |document: &mut Value, bytes: &mut Vec<u8>, name: &str, color: [u8; 4]| {
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+        let img = png(color);
+        let view_idx = document["bufferViews"].as_array().unwrap().len();
+        document["bufferViews"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"buffer": 0, "byteOffset": bytes.len(), "byteLength": img.len()}));
+        bytes.extend_from_slice(&img);
+        let img_idx = document["images"].as_array().unwrap().len();
+        document["images"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": name, "bufferView": view_idx, "mimeType": "image/png"}));
+        document["textures"].as_array_mut().unwrap().push(json!({"source": img_idx}));
+    };
+    // Texture 1: metallicRoughness (G=roughness 128, B=metallic 200)
+    append_png(&mut document, &mut bytes, "mr", [10, 128, 200, 255]);
+    // Texture 2: occlusion (R=AO 90)
+    append_png(&mut document, &mut bytes, "occ", [90, 20, 30, 255]);
+    document["buffers"][0]["byteLength"] = json!(bytes.len());
+
+    let file = gltf_file(&directory.join("orm_uv.gltf"), document, &bytes);
+    let imported = import(&file, &out, &Options::default()).unwrap();
+    assert!(imported.notes.is_empty(), "{:?}", imported.notes);
+    let material = read_json(&out.join(&imported.materials[0]));
+    assert_eq!(material["uvTransform"], json!({"offset": [0.25, 0.5], "scale": [2.0, 3.0], "rotation": 0.5}));
+    assert_eq!(material["emissiveTexture"], material["texture"]);
+    let orm_key = material["ormTexture"].as_str().expect("packed ormTexture");
+    let orm_img = image::open(out.join(orm_key)).unwrap().to_rgba8();
+    assert_eq!(orm_img.get_pixel(0, 0).0, [90, 128, 200, 255]);
 }
 
 #[test]

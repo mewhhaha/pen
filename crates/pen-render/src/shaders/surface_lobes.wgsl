@@ -617,3 +617,23 @@ fn surface_lod_dither(pixel: vec2f, fade: f32) -> bool {
   }
   return threshold < (-fade);
 }
+
+// Applies glTF `KHR_texture_transform` (scale -> rotation -> translation) to `uv`.
+// `offset_scale` holds `(offset.x, offset.y, scale.x, scale.y)` and `rot_cs` holds `(cos(r), sin(r))`.
+fn surface_transform_uv(uv: vec2f, offset_scale: vec4f, rot_cs: vec2f) -> vec2f {
+  let s = uv * offset_scale.zw;
+  let r = vec2f(s.x * rot_cs.x + s.y * rot_cs.y, -s.x * rot_cs.y + s.y * rot_cs.x);
+  return r + offset_scale.xy;
+}
+
+// Applies a linear ORM texture sample (`R = occlusion`, `G = roughness`, `B = metallic`)
+// onto `s` when `enabled > 0.5`.
+fn surface_apply_orm(s: StandardSurface, orm: vec4f, enabled: f32) -> StandardSurface {
+  var out = s;
+  if (enabled > 0.5) {
+    out.occlusion *= clamp(orm.r, 0.0, 1.0);
+    out.roughness = clamp(out.roughness * orm.g, 0.04, 1.0);
+    out.metallic = clamp(out.metallic * orm.b, 0.0, 1.0);
+  }
+  return out;
+}

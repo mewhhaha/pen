@@ -519,7 +519,7 @@ func pose_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
 func emitter_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
-  for 0 .. 42:
+  for 0 .. 47:
     @storage.push stream.output 0.0
   stream.output[base + 0] := canonical[at + 0]
   at := at + 1
@@ -579,6 +579,16 @@ func emitter_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   stream.output[base + 40] := canonical[at + 3]
   at := at + 4
   stream.output[base + 41] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 42] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 43] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 44] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 45] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 46] := canonical[at + 0]
   at := at + 1
   stream.at := at
   return stream
@@ -942,6 +952,33 @@ func motion_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   stream.at := at
   return stream
 
+func ribbon_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
+  let at = stream.at
+  let base = stream.output.length
+  for 0 .. 12:
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 1] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 2] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 3] := canonical[at + 0]
+  stream.output[base + 4] := canonical[at + 1]
+  stream.output[base + 5] := canonical[at + 2]
+  at := at + 3
+  stream.output[base + 6] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 7] := canonical[at + 0]
+  stream.output[base + 8] := canonical[at + 1]
+  stream.output[base + 9] := canonical[at + 2]
+  stream.output[base + 10] := canonical[at + 3]
+  at := at + 4
+  stream.output[base + 11] := canonical[at + 0]
+  at := at + 1
+  stream.at := at
+  return stream
+
 // Canonical render values streamed into the packet it is given and returns.
 func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): #[~F32] =>
   lanes.finite canonical
@@ -1046,6 +1083,8 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   stream.output[217] := canonical[at + 0]
   at := at + 1
   stream.output[233] := canonical[at + 0]
+  at := at + 1
+  stream.output[245] := canonical[at + 0]
   at := at + 1
   stream.output[74] := canonical[at + 0]
   stream.output[75] := canonical[at + 1]
@@ -1509,6 +1548,14 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
     stream := motion_into canonical stream
   at := stream.at
   stream.output[244] := U32.to_f32 motions_count
+  let ribbons_start: U32 = stream.output.length
+  let ribbons_count = lanes.integer canonical[at] lanes.max_integer
+  at := at + 1
+  stream.at := at
+  for 0 .. ribbons_count:
+    stream := ribbon_into canonical stream
+  at := stream.at
+  stream.output[246] := U32.to_f32 ribbons_count
   let extras_start: U32 = stream.output.length
   for value in stream.extras:
     @storage.push stream.output value

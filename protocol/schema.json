@@ -185,6 +185,11 @@
       "doc": "The most per-draw previous transforms one frame may declare for motion vectors."
     },
     {
+      "limit": "MAX_RIBBONS",
+      "value": 65536,
+      "doc": "The most ribbon trail control points one frame may declare."
+    },
+    {
       "limit": "MAX_BUSES",
       "value": 16,
       "doc": "The most buses one frame may declare, the master (bus 0) included."
@@ -2556,6 +2561,15 @@
         "kind": "size",
         "section": "motions",
         "of": "count"
+      },
+      "quality.ssgi": {
+        "kind": "flag",
+        "doc": "Screen-space diffuse global illumination bounce over the opaque scene."
+      },
+      "ribbon_count": {
+        "kind": "size",
+        "section": "ribbons",
+        "of": "count"
       }
     },
     "sections": [
@@ -3441,6 +3455,28 @@
             "additive": {
               "kind": "flag",
               "doc": "Particles add their light to what is behind them, rather than covering it."
+            },
+            "soft_depth": {
+              "kind": "f32",
+              "doc": "View-space fade distance in world units against opaque scene depth; 0 disables soft particle fading."
+            },
+            "lit": {
+              "kind": "f32",
+              "doc": "Directional sun and ambient lighting weight on particles (0 unlit, 1 fully lit)."
+            },
+            "flipbook_cols": {
+              "kind": "count",
+              "max": 32,
+              "doc": "Horizontal sprite-sheet frames in the emitter texture (0 or 1 for a single frame)."
+            },
+            "flipbook_rows": {
+              "kind": "count",
+              "max": 32,
+              "doc": "Vertical sprite-sheet frames in the emitter texture (0 or 1 for a single frame)."
+            },
+            "flipbook_fps": {
+              "kind": "f32",
+              "doc": "Flipbook playback rate in frames per second (0 plays one full sheet over each particle's lifetime)."
             }
           },
           "doc": "A particle emitter: `rate` particles a second, each living `lifetime` seconds, born in a ball round `transform`'s origin and flying from it under gravity and drag, sized and colored over their lives."
@@ -4092,6 +4128,70 @@
           "limit": "MAX_MOTIONS",
           "value": 100000,
           "doc": "The most per-draw previous transforms one frame may declare for motion vectors."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "ribbons",
+        "doc": "World-space camera-facing ribbon and beam trail control points rendered in the translucent pass.",
+        "record": {
+          "name": "RibbonPoint",
+          "constant": "RIBBON",
+          "fields": {
+            "ribbon": {
+              "kind": "count",
+              "max": 65535,
+              "doc": "Ribbon trail ID; consecutive points sharing an ID, material and blend mode form one strip."
+            },
+            "material": {
+              "kind": "reference",
+              "to": "material",
+              "doc": "Material providing color tint and optional texture."
+            },
+            "additive": {
+              "kind": "flag",
+              "doc": "Ribbon adds light to what is behind it rather than alpha-blending."
+            },
+            "position": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "World-space spine point."
+            },
+            "width": {
+              "kind": "f32",
+              "doc": "Ribbon width in world units at this control point."
+            },
+            "color": {
+              "kind": "vector",
+              "type": {
+                "name": "Color",
+                "components": [
+                  "r",
+                  "g",
+                  "b",
+                  "a"
+                ]
+              },
+              "doc": "RGBA color tint and opacity at this control point."
+            },
+            "soft_depth": {
+              "kind": "f32",
+              "doc": "View-space soft depth fade distance in world units; 0 disables."
+            }
+          },
+          "doc": "One spine control point of a camera-facing ribbon trail."
+        },
+        "max": {
+          "limit": "MAX_RIBBONS",
+          "value": 65536,
+          "doc": "The most ribbon trail control points one frame may declare."
         }
       },
       {

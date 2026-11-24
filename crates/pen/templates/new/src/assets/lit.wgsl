@@ -42,9 +42,16 @@ struct Draw {
   // ior, thickness, attenuation distance; attenuation color, specular;
   // specular color, emissive strength (see `surface_apply_block`).
   surface: array<vec4f, 5>,
+  // KHR_texture_transform (offset.xy, scale.xy) and (cos(rot), sin(rot), orm_map, emissive_map).
+  uv_transform: vec4f,
+  maps: vec4f,
 };
 @group(0) @binding(0) var<uniform> scene: Scene;
 @group(1) @binding(0) var<uniform> draw: Draw;
+@group(1) @binding(1) var base_texture: texture_2d<f32>;
+@group(1) @binding(2) var base_sampler: sampler;
+@group(1) @binding(4) var layer_texture: texture_2d<f32>;
+@group(1) @binding(5) var orm_texture: texture_2d<f32>;
 // BEGIN shadows
 // The sun's shadows for a material shader: its cascaded maps, filtered, and
 // the screen-space contact shadows that catch what the maps are too coarse
@@ -1750,6 +1757,26 @@ fn surface_lod_dither(pixel: vec2f, fade: f32) -> bool {
   }
   return threshold < (-fade);
 }
+
+// Applies glTF `KHR_texture_transform` (scale -> rotation -> translation) to `uv`.
+// `offset_scale` holds `(offset.x, offset.y, scale.x, scale.y)` and `rot_cs` holds `(cos(r), sin(r))`.
+fn surface_transform_uv(uv: vec2f, offset_scale: vec4f, rot_cs: vec2f) -> vec2f {
+  let s = uv * offset_scale.zw;
+  let r = vec2f(s.x * rot_cs.x + s.y * rot_cs.y, -s.x * rot_cs.y + s.y * rot_cs.x);
+  return r + offset_scale.xy;
+}
+
+// Applies a linear ORM texture sample (`R = occlusion`, `G = roughness`, `B = metallic`)
+// onto `s` when `enabled > 0.5`.
+fn surface_apply_orm(s: StandardSurface, orm: vec4f, enabled: f32) -> StandardSurface {
+  var out = s;
+  if (enabled > 0.5) {
+    out.occlusion *= clamp(orm.r, 0.0, 1.0);
+    out.roughness = clamp(out.roughness * orm.g, 0.04, 1.0);
+    out.metallic = clamp(out.metallic * orm.b, 0.0, 1.0);
+  }
+  return out;
+}
 // END surface_lobes
 // BEGIN surface
 // A standard surface lit by the sky and the frame's lights: `standard_surface`
@@ -1934,21 +1961,28 @@ const LOBES: u32 = 0u;
   let normal = normalize(surface.normal);
   let view = normalize(scene.eye.xyz - surface.world);
   let seen = scene.view * vec4f(surface.world, 1.0);
+  let uv = surface_transform_uv(surface.uv, draw.uv_transform, draw.maps.xy);
+  let base_sample = textureSample(base_texture, base_sampler, uv);
+  let orm_sample = textureSample(orm_texture, base_sampler, uv);
+  let emissive_sample = textureSample(layer_texture, base_sampler, uv).rgb;
   // The material's parameters are metallic (x) and roughness (y, 0.5 if it gives none).
   let roughness = select(draw.parameters.y, 0.5, draw.parameters.y <= 0.0);
-  var s = surface_default(surface.world, normal, view, draw.color.rgb, draw.parameters.x, roughness, surface.position, seen.z);
+  var s = surface_default(
+    surface.world,
+    normal,
+    view,
+    draw.color.rgb * base_sample.rgb,
+    draw.parameters.x,
+    roughness,
+    surface.position,
+    seen.z,
+  );
   s = surface_apply_block(s, draw.surface, LOBES, length(draw.model[0].xyz));
-  // A frame for anisotropy: the mesh's tangents if it has them (add
-  // `@location(11) tangent: vec4f` to Vertex and Surface), else the uv's
-  // direction from the screen-space derivatives (call it where every fragment does):
-  //   let tangent = surface_tangent(surface.tangent, surface_derived_tangent(surface.world, normal, surface.uv));
-  //   s = surface_frame(s, tangent.xyz, tangent.w, draw.surface[1].w);
-  // A coat takes the mesh's own normal where a normal map moved `s.normal`:
-  //   s.coat_normal = normal;
-  // The sun lit by the whole model: its visibility (1 in the sun, 0 in shadow) times
-  // the lobes' response. For Lambert alone:
-  //   draw.color.rgb * scene.light_color.rgb * (max(dot(normal, -normalize(scene.light_direction.xyz)), 0.0) * visibility)
+  s = surface_apply_orm(s, orm_sample, draw.maps.z);
   let visibility = sun_shadow(surface.world, normal, surface.position);
-  let light = standard_surface(s) + standard_sun(s, scene.light_direction.xyz, scene.light_color.rgb, visibility);
-  return vec4f(light, draw.color.a);
+  var light = standard_surface(s) + standard_sun(s, scene.light_direction.xyz, scene.light_color.rgb, visibility);
+  if (draw.maps.w > 0.5) {
+    light += emissive_sample * draw.surface[4].w;
+  }
+  return vec4f(light, draw.color.a * base_sample.a);
 }

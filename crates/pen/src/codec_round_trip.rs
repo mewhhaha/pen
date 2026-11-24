@@ -39,8 +39,8 @@ use pen_protocol::{
     Aberration, BoneMatrix, Bus, Cascade, Catalog, Clouds, Color, Decal, Dof, Draw, Drift, Emitter, Exposure,
     FieldPatch, Fog, FogVolume, Frame, GameEvent, Grade, Inset, Instance, InstanceRemoval, Light, Listener,
     MorphWeight, Motion, MotionBlur, Panner, Pose, Probe, ProbeVolume, Quality, Reflection, ReflectionProbe,
-    RenderFrame, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode, Vector, Viewport, Voice,
-    service, ui_live, ui_role, ui_state,
+    RenderFrame, RibbonPoint, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode, Vector, Viewport,
+    Voice, service, ui_live, ui_role, ui_state,
 };
 
 const HARNESS: &str = include_str!("codec_round_trip.blot");
@@ -611,6 +611,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             taa: rng.flag(),
             ssr: rng.whole(2),
             volumetrics: rng.whole(2),
+            ssgi: rng.flag(),
         },
         reflection: Reflection { budget: rng.whole(6) },
         sky: Sky {
@@ -987,6 +988,18 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 previous: rng.lanes(),
             })
         },
+        ribbons: {
+            let count = rng.count(8);
+            rng.list(count, |rng| RibbonPoint {
+                ribbon: rng.whole(65535),
+                material: material(rng),
+                additive: rng.flag(),
+                position: rng.vector(),
+                width: rng.number(),
+                color: Color { r: rng.number(), g: rng.number(), b: rng.number(), a: rng.number() },
+                soft_depth: rng.number(),
+            })
+        },
         emitters: {
             let count = rng.count(4);
             rng.list(count, |rng| Emitter {
@@ -1007,6 +1020,11 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 color_start: Color { r: rng.number(), g: rng.number(), b: rng.number(), a: rng.number() },
                 color_end: Color { r: rng.number(), g: rng.number(), b: rng.number(), a: rng.number() },
                 additive: rng.flag(),
+                soft_depth: rng.number(),
+                lit: rng.number(),
+                flipbook_cols: rng.whole(32),
+                flipbook_rows: rng.whole(32),
+                flipbook_fps: rng.number(),
             })
         },
         retained_enabled: rng.flag(),
@@ -1037,7 +1055,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
 }
 
 /// What `sections` reports of a frame, in its order.
-const SECTIONS: [&str; 26] = [
+const SECTIONS: [&str; 28] = [
     "draws",
     "draw parameters",
     "draw extras",
@@ -1064,6 +1082,8 @@ const SECTIONS: [&str; 26] = [
     "instance removals",
     "bone matrices",
     "morph weights",
+    "motions",
+    "ribbons",
 ];
 
 /// Which of `SECTIONS` a frame holds any of.
@@ -1096,5 +1116,7 @@ fn sections(frame: &RenderFrame) -> [bool; SECTIONS.len()] {
         !frame.instance_removals.is_empty(),
         !frame.bone_matrices.is_empty(),
         !frame.morph_weights.is_empty(),
+        !frame.motions.is_empty(),
+        !frame.ribbons.is_empty(),
     ]
 }

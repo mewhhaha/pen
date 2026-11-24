@@ -42,6 +42,7 @@ func header (schema: U32): types.RenderHeader => {
     taa: false,
     ssr: 0,
     volumetrics: 0,
+    ssgi: false,
   },
   sky: $types.Sky {
     zenith: $types.Vector { x: 0.0, y: 0.0, z: 0.0 },

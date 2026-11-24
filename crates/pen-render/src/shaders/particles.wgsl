@@ -16,8 +16,10 @@ struct Emitter {
   // Birth ball's radius, width at birth and at death, lifetime in seconds.
   shape: vec4f,
   // x: the age of its first slot's particle (the oldest), y: seconds between
-  // births.
+  // births, z: flipbook fps (0 plays full sheet across lifetime).
   timing: vec4f,
+  // x: soft depth fade distance, y: sun/ambient lighting weight, z: flipbook cols, w: flipbook rows.
+  style: vec4f,
   // x: its first slot among the frame's, y: its slots, z: how many of them
   // are alive, w: the first slot's particle's birth number.
   counts: vec4u,
@@ -29,6 +31,9 @@ struct Particle {
   // xyz: where it is; w: its width, 0 for none.
   place: vec4f,
   color: vec4f,
+  // x: soft depth fade distance, y: lighting weight, z: flipbook frame index,
+  // w: packed flipbook grid (`cols * 64 + rows`).
+  info: vec4f,
 };
 
 @group(0) @binding(0) var<storage, read> emitters: array<Emitter>;
@@ -76,7 +81,7 @@ fn simulate(@builtin(global_invocation_id) id: vec3u) {
     return;
   }
   if (local >= emitter.counts.z) {
-    particles[slot] = Particle(vec4f(0.0), vec4f(0.0));
+    particles[slot] = Particle(vec4f(0.0), vec4f(0.0), vec4f(0.0));
     return;
   }
   let index = emitter.counts.w + local;
@@ -95,5 +100,17 @@ fn simulate(@builtin(global_invocation_id) id: vec3u) {
     moved = velocity * carried + gravity * (age - carried) / drag;
   }
   let width = mix(emitter.shape.y, emitter.shape.z, life);
-  particles[slot] = Particle(vec4f(born + moved, width), mix(emitter.color_start, emitter.color_end, life));
+  let cols = max(emitter.style.z, 1.0);
+  let rows = max(emitter.style.w, 1.0);
+  let frames = cols * rows;
+  var frame = 0.0;
+  if (frames > 1.0) {
+    if (emitter.timing.z > 0.0) {
+      frame = floor(age * emitter.timing.z) % frames;
+    } else {
+      frame = min(floor(life * frames), frames - 1.0);
+    }
+  }
+  let info = vec4f(max(emitter.style.x, 0.0), clamp(emitter.style.y, 0.0, 1.0), frame, cols * 64.0 + rows);
+  particles[slot] = Particle(vec4f(born + moved, width), mix(emitter.color_start, emitter.color_end, life), info);
 }

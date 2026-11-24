@@ -58,6 +58,7 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
             taa: false,
             ssr: 0,
             volumetrics: 0,
+            ssgi: false,
         },
         sky: Sky {
             zenith: zero,
@@ -96,6 +97,7 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
         bone_matrices: Vec::new(),
         morph_weights: Vec::new(),
         motions: Vec::new(),
+        ribbons: Vec::new(),
         emitters: Vec::new(),
         extensions: Vec::new(),
         lights: Vec::new(),

@@ -204,6 +204,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
             taa: false,
             ssr: 0,
             volumetrics: 0,
+            ssgi: false,
         },
         sky: Sky {
             zenith: vector(0.2, 0.4, 0.8),
@@ -255,6 +256,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
         bone_matrices: Vec::new(),
         morph_weights: Vec::new(),
         motions: Vec::new(),
+        ribbons: Vec::new(),
         emitters: Vec::new(),
         extensions: Vec::new(),
         lights: Vec::new(),

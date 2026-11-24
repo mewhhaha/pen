@@ -500,8 +500,15 @@ impl State {
                     }
                 }
                 if self.preloading {
-                    for key in
-                        [&material.texture, &material.normal_texture, &material.layer_texture].into_iter().flatten()
+                    for key in [
+                        &material.texture,
+                        &material.normal_texture,
+                        &material.layer_texture,
+                        &material.orm_texture,
+                        &material.emissive_texture,
+                    ]
+                    .into_iter()
+                    .flatten()
                     {
                         let _ = self.assets.prefetch(AssetKind::Texture, key);
                     }
@@ -509,7 +516,7 @@ impl State {
                 }
                 let next = u32::try_from(self.states.len()).map_err(|error| error.to_string())?;
                 let state = *self.states.entry(material.state_key()).or_insert(next);
-                Ok(Some((GpuAsset::Material(Arc::new(MaterialAsset { material, state })), None)))
+                Ok(Some((GpuAsset::Material(Arc::new(MaterialAsset { material: *material, state })), None)))
             }
             Loaded::Shader { module, instancing, skinning, persistent, margin, cascaded } => {
                 // What the materials naming it draw with compiles now, for
@@ -817,7 +824,7 @@ impl State {
 
     /// Drops the cached draw bind groups that bind views `id`.
     pub(super) fn forget_views(&mut self, id: u64) {
-        self.groups.retain(|&(texture, normal, outline, _), _| texture != id && normal != id && outline != id);
+        self.groups.retain(|&(ids, _), _| !ids.contains(&id));
     }
 
     /// Loads the changed `keys` again: every
@@ -852,9 +859,7 @@ impl State {
         // The groups that drew a settled texture's detail fading in are not
         // drawn with again.
         for view in settled {
-            self.groups.retain(|&(texture, normal, outline, sampler), _| {
-                sampler == 0 || ![texture, normal, outline].contains(&view)
-            });
+            self.groups.retain(|&(views, sampler), _| sampler == 0 || !views.contains(&view));
         }
     }
 }

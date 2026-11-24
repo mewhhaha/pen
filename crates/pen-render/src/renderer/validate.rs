@@ -173,13 +173,28 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
                 emitter.spread,
                 emitter.drag,
                 emitter.size_start,
-                emitter.size_end
+                emitter.size_end,
+                emitter.soft_depth,
+                emitter.lit,
+                emitter.flipbook_fps
             ]
             .into_iter()
             .chain(colors)
             .all(|value| value.is_finite() && value >= 0.0)
                 && [emitter.time, emitter.duration].into_iter().chain(gravity).chain(velocity).all(f32::is_finite),
             "an emitter needs finite values, and rates, lifetimes, sizes and colors of 0 or more"
+        );
+    }
+    for point in &frame.ribbons {
+        let color = [point.color.r, point.color.g, point.color.b, point.color.a];
+        ensure!(
+            finite(&point.position)
+                && point.width.is_finite()
+                && point.width >= 0.0
+                && point.soft_depth.is_finite()
+                && point.soft_depth >= 0.0
+                && color.iter().all(|v| v.is_finite() && *v >= 0.0),
+            "ribbon points need finite position, nonnegative width/soft_depth, and nonnegative color"
         );
     }
     for solid in &frame.solids {

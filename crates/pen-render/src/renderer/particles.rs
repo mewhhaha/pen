@@ -25,8 +25,8 @@ const QUADS: &str = include_str!("../shaders/particle_quads.wgsl");
 // within a storage binding and a dispatch.
 const MOST: u32 = 1 << 21;
 // What particles.wgsl's Emitter and Particle take.
-const EMITTER_BYTES: u64 = 192;
-const PARTICLE_BYTES: u64 = 32;
+const EMITTER_BYTES: u64 = 208;
+const PARTICLE_BYTES: u64 = 48;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -38,6 +38,7 @@ struct Params {
     color_end: [f32; 4],
     shape: [f32; 4],
     timing: [f32; 4],
+    style: [f32; 4],
     counts: [u32; 4],
     seed: [u32; 4],
 }
@@ -93,9 +94,91 @@ pub(crate) fn pipeline(context: &PipelineContext, samples: u32, additive: bool) 
         dst_factor: if additive { BlendFactor::One } else { BlendFactor::OneMinusSrcAlpha },
         operation: BlendOperation::Add,
     };
+    let group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("particles"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 15,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 16,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 17,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("particles"),
+        bind_group_layouts: &[Some(&group_layout)],
+        immediate_size: 0,
+    });
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("particles"),
-        layout: None,
+        layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &module,
             entry_point: Some("vertex"),
@@ -182,7 +265,7 @@ impl Particles {
                 mipmap_filter: wgpu::MipmapFilterMode::Linear,
                 ..Default::default()
             }),
-            view: uniform_buffer(device, "particle view", 96),
+            view: uniform_buffer(device, "particle view", 224),
             params: Vec::new(),
             emitters: None,
             particles: None,
@@ -289,7 +372,13 @@ impl State {
                 color_start: color(&emitter.color_start),
                 color_end: color(&emitter.color_end),
                 shape: [emitter.radius, emitter.size_start, emitter.size_end, emitter.lifetime],
-                timing: [narrow(living.age), narrow(1.0 / f64::from(emitter.rate)), 0.0, 0.0],
+                timing: [narrow(living.age), narrow(1.0 / f64::from(emitter.rate)), emitter.flipbook_fps.max(0.0), 0.0],
+                style: [
+                    emitter.soft_depth.max(0.0),
+                    emitter.lit.clamp(0.0, 1.0),
+                    emitter.flipbook_cols.max(1) as f32,
+                    emitter.flipbook_rows.max(1) as f32,
+                ],
                 counts: [total, living.slots, living.alive, first_born],
                 seed: [emitter.seed, 0, 0, 0],
             });
@@ -310,9 +399,37 @@ impl State {
         let (emitters, buffer) = (particles.emitters.as_ref().unwrap(), particles.particles.as_ref().unwrap());
         self.queue.write_buffer(emitters, 0, bytemuck::cast_slice(&particles.params));
         let view_projection = multiply(&frame.projection, &frame.view);
+        let inv_projection = crate::matrix::invert(&frame.projection);
         let v = &frame.view;
-        let mut view = view_projection.to_vec();
-        view.extend([v[0], v[4], v[8], 0.0, v[1], v[5], v[9], 0.0]);
+        let mut view = Vec::with_capacity(56);
+        view.extend_from_slice(&view_projection);
+        view.extend_from_slice(&inv_projection);
+        view.extend_from_slice(&[
+            v[0],
+            v[4],
+            v[8],
+            0.0,
+            v[1],
+            v[5],
+            v[9],
+            0.0,
+            frame.light_direction.x,
+            frame.light_direction.y,
+            frame.light_direction.z,
+            0.0,
+            frame.light_color.x,
+            frame.light_color.y,
+            frame.light_color.z,
+            0.0,
+            frame.ambient.x,
+            frame.ambient.y,
+            frame.ambient.z,
+            0.0,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+        ]);
         self.queue.write_buffer(&particles.view, 0, bytemuck::cast_slice(&view));
         let simulate = particles.simulate.get_or_insert_with(|| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -348,9 +465,15 @@ impl State {
     }
 
     /// Binds the frame's emitters to what their shaders read: the view, their
-    /// particles, their shapes, and the mist between them and the eye.
-    pub(super) fn bind_particles(&self, volume: &crate::volume::Applied, emitters: &mut [Ready]) {
+    /// particles, their shapes, opaque depth for soft fading, and the mist.
+    pub(super) fn bind_particles(
+        &self,
+        opaque: Option<&crate::post::OpaqueTargets>,
+        volume: &crate::volume::Applied,
+        emitters: &mut [Ready],
+    ) {
         let Some(particles) = &self.particles else { return };
+        let depth_view = opaque.map_or(&self.white.linear, |o| &o.depth);
         for emitter in emitters {
             let shape = emitter.shape.as_ref().unwrap_or(&particles.dot);
             let bytes = u64::from(particles.total) * PARTICLE_BYTES;
@@ -370,6 +493,7 @@ impl State {
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(shape) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&particles.sampler) },
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&particles.sampler) },
+                    wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(depth_view) },
                     wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(&volume.texture) },
                     wgpu::BindGroupEntry { binding: 17, resource: volume.uniform.as_entire_binding() },
                 ],

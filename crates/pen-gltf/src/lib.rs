@@ -344,7 +344,7 @@ const SURFACE_EXTENSIONS: [(&str, &[&str]); 7] = [
 
 /// The extensions a file may use without the import leaving any of what they
 /// say out but the textures it reports.
-const READ_EXTENSIONS: [&str; 9] = [
+const READ_EXTENSIONS: [&str; 10] = [
     "KHR_materials_unlit",
     "KHR_materials_emissive_strength",
     "KHR_materials_clearcoat",
@@ -354,6 +354,7 @@ const READ_EXTENSIONS: [&str; 9] = [
     "KHR_materials_volume",
     "KHR_materials_ior",
     "KHR_materials_specular",
+    "KHR_texture_transform",
 ];
 
 const IDENTITY: [f64; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
@@ -394,6 +395,38 @@ fn tidy(value: f32) -> f64 {
 fn short(value: f64) -> f64 {
     let most = f64::from(f32::MAX);
     format!("{}", narrow(value.clamp(-most, most))).parse().unwrap_or(0.0)
+}
+
+/// Converts a glTF `KHR_texture_transform` extension object into the renderer's
+/// `uvTransform` block, omitting identity transforms.
+fn uv_transform(extension: Option<&Value>) -> Option<Value> {
+    let object = extension?.as_object()?;
+    let pair = |key: &str| -> Option<[f64; 2]> {
+        let arr = object.get(key)?.as_array()?;
+        let x = arr.first()?.as_f64().filter(|v| v.is_finite())?;
+        let y = arr.get(1)?.as_f64().filter(|v| v.is_finite())?;
+        Some([short(x), short(y)])
+    };
+    let offset = pair("offset");
+    let scale = pair("scale");
+    let rotation = object.get("rotation").and_then(Value::as_f64).filter(|v| v.is_finite()).map(short);
+    let mut map = serde_json::Map::new();
+    if let Some(o) = offset
+        && o != [0.0, 0.0]
+    {
+        map.insert("offset".to_owned(), json!(o));
+    }
+    if let Some(s) = scale
+        && s != [1.0, 1.0]
+    {
+        map.insert("scale".to_owned(), json!(s));
+    }
+    if let Some(r) = rotation
+        && r != 0.0
+    {
+        map.insert("rotation".to_owned(), json!(r));
+    }
+    (!map.is_empty()).then_some(Value::Object(map))
 }
 
 /// A buffer's bytes: the GLB's binary chunk, a data URI's, or a file's
@@ -874,11 +907,43 @@ impl Writer<'_> {
             if let Some(image) = self.image(&info.texture().source(), buffers)? {
                 json["texture"] = image.into();
             }
+            if let Some(transform) = uv_transform(info.extension_value("KHR_texture_transform")) {
+                json["uvTransform"] = transform;
+            }
         }
-        if let Some(normal) = material.normal_texture()
-            && let Some(image) = self.image(&normal.texture().source(), buffers)?
+        if let Some(normal) = material.normal_texture() {
+            if let Some(image) = self.image(&normal.texture().source(), buffers)? {
+                json["normalTexture"] = image.into();
+            }
+            if json.get("uvTransform").is_none()
+                && let Some(transform) = uv_transform(normal.extension_value("KHR_texture_transform"))
+            {
+                json["uvTransform"] = transform;
+            }
+        }
+        if let Some(mr) = pbr.metallic_roughness_texture()
+            && json.get("uvTransform").is_none()
+            && let Some(transform) = uv_transform(mr.extension_value("KHR_texture_transform"))
         {
-            json["normalTexture"] = image.into();
+            json["uvTransform"] = transform;
+        }
+        if let Some(orm_key) = self.orm_texture(
+            &stem,
+            material.occlusion_texture().map(|t| t.texture().source()),
+            pbr.metallic_roughness_texture().map(|t| t.texture().source()),
+            buffers,
+        )? {
+            json["ormTexture"] = orm_key.into();
+        }
+        if let Some(emissive) = material.emissive_texture() {
+            if let Some(image) = self.image(&emissive.texture().source(), buffers)? {
+                json["emissiveTexture"] = image.into();
+            }
+            if json.get("uvTransform").is_none()
+                && let Some(transform) = uv_transform(emissive.extension_value("KHR_texture_transform"))
+            {
+                json["uvTransform"] = transform;
+            }
         }
         if let Some(surface) = self.surface(material) {
             json["surface"] = surface;
@@ -960,24 +1025,88 @@ impl Writer<'_> {
         (!surface.is_empty()).then_some(Value::Object(surface))
     }
 
+    /// Raw encoded bytes of a glTF image from its buffer view or URI.
+    fn image_bytes(&self, image: &gltf::Image, buffers: &[Vec<u8>]) -> Result<Vec<u8>> {
+        match image.source() {
+            gltf::image::Source::View { view, .. } => {
+                let buffer = buffers.get(view.buffer().index()).context("an image names a missing buffer")?;
+                Ok(buffer
+                    .get(view.offset()..view.offset() + view.length())
+                    .context("an image lies outside its buffer")?
+                    .to_vec())
+            }
+            gltf::image::Source::Uri { uri, .. } => {
+                uri_bytes(uri, Path::new(&self.imported.source).parent().unwrap_or(Path::new(".")))
+            }
+        }
+    }
+
+    /// Packs optional `occlusionTexture` (R) and `metallicRoughnessTexture` (G=roughness, B=metallic)
+    /// into one linear RGBA PNG (`R=AO, G=roughness, B=metallic, A=255`).
+    fn orm_texture(
+        &mut self,
+        stem: &str,
+        occlusion: Option<gltf::Image>,
+        metallic_roughness: Option<gltf::Image>,
+        buffers: &[Vec<u8>],
+    ) -> Result<Option<String>> {
+        if occlusion.is_none() && metallic_roughness.is_none() {
+            return Ok(None);
+        }
+        // When both point to the exact same PNG/JPEG image, reuse it directly.
+        if let (Some(occ), Some(mr)) = (&occlusion, &metallic_roughness)
+            && occ.index() == mr.index()
+        {
+            return self.image(occ, buffers);
+        }
+        let decode = |img: &gltf::Image| -> Result<Option<image::RgbaImage>> {
+            let bytes = self.image_bytes(img, buffers)?;
+            if !(bytes.starts_with(b"\x89PNG") || bytes.starts_with(&[0xFF, 0xD8])) {
+                return Ok(None);
+            }
+            Ok(Some(image::load_from_memory(&bytes).context("decoding ORM source image")?.to_rgba8()))
+        };
+        let occ_img = occlusion.as_ref().map(decode).transpose()?.flatten();
+        let mr_img = metallic_roughness.as_ref().map(decode).transpose()?.flatten();
+        let (width, height) = match (&occ_img, &mr_img) {
+            (Some(a), Some(b)) => (a.width().max(b.width()), a.height().max(b.height())),
+            (Some(a), None) => (a.width(), a.height()),
+            (None, Some(b)) => (b.width(), b.height()),
+            (None, None) => return Ok(None),
+        };
+        let mut packed = image::RgbaImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let sample = |img: &image::RgbaImage| {
+                    let sx = (x * img.width() / width).min(img.width() - 1);
+                    let sy = (y * img.height() / height).min(img.height() - 1);
+                    img.get_pixel(sx, sy).0
+                };
+                let ao = occ_img.as_ref().map_or(255, |img| sample(img)[0]);
+                let (rough, metal) = mr_img.as_ref().map_or((255, 255), |img| {
+                    let p = sample(img);
+                    (p[1], p[2])
+                });
+                packed.put_pixel(x, y, image::Rgba([ao, rough, metal, 255]));
+            }
+        }
+        let mut png_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(packed)
+            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .context("encoding packed ORM PNG")?;
+        let key = self.unique(&format!("{stem}_orm"), ".png");
+        self.write(&key, &png_bytes)?;
+        self.imported.images.push(key.clone());
+        Ok(Some(key))
+    }
+
     /// An image's key, written the first time; None for one that is not a
     /// PNG or JPEG, which the renderer cannot read.
     fn image(&mut self, image: &gltf::Image, buffers: &[Vec<u8>]) -> Result<Option<String>> {
         if let Some(known) = self.images.get(&image.index()) {
             return Ok(known.clone());
         }
-        let bytes: Vec<u8> = match image.source() {
-            gltf::image::Source::View { view, .. } => {
-                let buffer = buffers.get(view.buffer().index()).context("an image names a missing buffer")?;
-                buffer
-                    .get(view.offset()..view.offset() + view.length())
-                    .context("an image lies outside its buffer")?
-                    .to_vec()
-            }
-            gltf::image::Source::Uri { uri, .. } => {
-                uri_bytes(uri, Path::new(&self.imported.source).parent().unwrap_or(Path::new(".")))?
-            }
-        };
+        let bytes = self.image_bytes(image, buffers)?;
         let extension = if bytes.starts_with(b"\x89PNG") {
             Some("png")
         } else if bytes.starts_with(&[0xFF, 0xD8]) {

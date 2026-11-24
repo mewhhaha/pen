@@ -168,7 +168,9 @@ func encode_emitter (emitter: types.Emitter) =>
     emitter.drag, emitter.size_start, emitter.size_end, emitter.color_start.r,
     emitter.color_start.g, emitter.color_start.b, emitter.color_start.a,
     emitter.color_end.r, emitter.color_end.g, emitter.color_end.b,
-    emitter.color_end.a, lanes.bit emitter.additive,
+    emitter.color_end.a, lanes.bit emitter.additive, emitter.soft_depth,
+    emitter.lit, U32.to_f32 (emitter.flipbook_cols),
+    U32.to_f32 (emitter.flipbook_rows), emitter.flipbook_fps,
   ]
 
 // Light: A point light, or a spot light shining along `direction` within a cone,
@@ -304,6 +306,16 @@ func encode_motion (motion: types.Motion) =>
     previous_w.y, previous_w.z, previous_w.w,
   ]
 
+// RibbonPoint: One spine control point of a camera-facing ribbon trail.
+func encode_ribbon_point (ribbon_point: types.RibbonPoint) =>
+  return #[
+    U32.to_f32 (ribbon_point.ribbon), U32.to_f32 (ribbon_point.material),
+    lanes.bit ribbon_point.additive, ribbon_point.position.x,
+    ribbon_point.position.y, ribbon_point.position.z, ribbon_point.width,
+    ribbon_point.color.r, ribbon_point.color.g, ribbon_point.color.b,
+    ribbon_point.color.a, ribbon_point.soft_depth,
+  ]
+
 // A Draw's extra, at most protocol.max_draw_extra of them, for the packet's last
 // section.
 func encode_draw_extra (draw: types.Draw) =>
@@ -344,6 +356,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   let bone_matrices_count: U32 = collections.bone_matrices.length
   let morph_weights_count: U32 = collections.morph_weights.length
   let motions_count: U32 = collections.motions.length
+  let ribbons_count: U32 = collections.ribbons.length
   @storage.push encoded (protocol.packet_magic)
   @storage.push encoded (U32.to_f32 packet.schema)
   @storage.push encoded (0.0)
@@ -592,6 +605,8 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (packet.dof.aperture)
   @storage.push encoded (packet.dof.max_blur)
   @storage.push encoded (U32.to_f32 motions_count)
+  @storage.push encoded (lanes.bit packet.quality.ssgi)
+  @storage.push encoded (U32.to_f32 ribbons_count)
   let state_start = encoded.length
   for i in 0 .. state_count:
     let source = collections.state[i]
@@ -927,6 +942,11 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     @storage.push encoded (emitter.color_end.b)
     @storage.push encoded (emitter.color_end.a)
     @storage.push encoded (lanes.bit emitter.additive)
+    @storage.push encoded (emitter.soft_depth)
+    @storage.push encoded (emitter.lit)
+    @storage.push encoded (U32.to_f32 (emitter.flipbook_cols))
+    @storage.push encoded (U32.to_f32 (emitter.flipbook_rows))
+    @storage.push encoded (emitter.flipbook_fps)
   for i in 0 .. lights_count:
     let source = collections.lights[i]
     let light: types.Light = project.light context source
@@ -1156,6 +1176,21 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     @storage.push encoded (previous_w.y)
     @storage.push encoded (previous_w.z)
     @storage.push encoded (previous_w.w)
+  for i in 0 .. ribbons_count:
+    let source = collections.ribbons[i]
+    let ribbon: types.RibbonPoint = project.ribbon context source
+    @storage.push encoded (U32.to_f32 (ribbon.ribbon))
+    @storage.push encoded (U32.to_f32 (ribbon.material))
+    @storage.push encoded (lanes.bit ribbon.additive)
+    @storage.push encoded (ribbon.position.x)
+    @storage.push encoded (ribbon.position.y)
+    @storage.push encoded (ribbon.position.z)
+    @storage.push encoded (ribbon.width)
+    @storage.push encoded (ribbon.color.r)
+    @storage.push encoded (ribbon.color.g)
+    @storage.push encoded (ribbon.color.b)
+    @storage.push encoded (ribbon.color.a)
+    @storage.push encoded (ribbon.soft_depth)
   for i in 0 .. draws_count:
     let source = collections.draws[i]
     project.append_extra context source encoded
@@ -1196,6 +1231,7 @@ func measure_render_floats collections -> project -> context =>
   let bone_matrices_count: U32 = collections.bone_matrices.length
   let morph_weights_count: U32 = collections.morph_weights.length
   let motions_count: U32 = collections.motions.length
+  let ribbons_count: U32 = collections.ribbons.length
   total := self + state_count
   total := self + draws_count * 24
   for i in 0 .. solids_count:
@@ -1229,7 +1265,7 @@ func measure_render_floats collections -> project -> context =>
   total := self + buses_count * 3
   total := self + voices_count * 12
   total := self + poses_count * 5
-  total := self + emitters_count * 42
+  total := self + emitters_count * 47
   total := self + lights_count * 14
   total := self + cascades_count * 18
   total := self + probes_count * 28
@@ -1242,6 +1278,7 @@ func measure_render_floats collections -> project -> context =>
   total := self + bone_matrices_count * 19
   total := self + morph_weights_count * 4
   total := self + motions_count * 17
+  total := self + ribbons_count * 12
   for i in 0 .. draws_count:
     let source = collections.draws[i]
     total := self + (project.extra_count context source) * 4
@@ -1507,6 +1544,8 @@ func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (
   encoded[242] := packet.dof.aperture
   encoded[243] := packet.dof.max_blur
   encoded[244] := 0.0
+  encoded[245] := lanes.bit packet.quality.ssgi
+  encoded[246] := 0.0
   let at: U32 = protocol.packet_header_floats
   for draw in draws:
     encoded[at + 0] := U32.to_f32 (draw.mesh)

@@ -103,7 +103,7 @@ pub(crate) enum Message {
 pub(crate) enum Loaded {
     // Boxed: a mesh is the largest thing a message carries, by far.
     Mesh(Box<Mesh>),
-    Material(Material),
+    Material(Box<Material>),
     /// A shader's module; its pipelines compile in jobs of their own.
     Shader {
         module: wgpu::ShaderModule,
@@ -471,7 +471,7 @@ impl Worker {
             Some(Prepared::Bytes(bytes)) => bytes,
             Some(Prepared::Mesh(mesh)) => return self.send(loaded(Ok(Loaded::Mesh(mesh)))),
             Some(Prepared::Material(material)) => {
-                return self.send(loaded(self.material(key, Ok(material)).map(Loaded::Material)));
+                return self.send(loaded(self.material(key, Ok(*material)).map(|m| Loaded::Material(Box::new(m)))));
             }
             Some(Prepared::Image(image)) => return self.send(loaded(Ok(Loaded::Image(image)))),
             Some(Prepared::Packed(header, levels)) => {
@@ -503,7 +503,7 @@ impl Worker {
             AssetKind::Mesh => self.send(loaded(parse_mesh(&bytes).map(|mesh| Loaded::Mesh(Box::new(mesh))))),
             AssetKind::Material => {
                 let material = self.material(key, parse_material(&bytes));
-                self.send(loaded(material.map(Loaded::Material)));
+                self.send(loaded(material.map(|m| Loaded::Material(Box::new(m)))));
             }
             AssetKind::SpriteShader => {
                 let pipeline = match shader::compile_shader(device, &bytes).await {

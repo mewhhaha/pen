@@ -134,6 +134,11 @@ type Emitter is data = $Emitter {
   color_start: Color,
   color_end: Color,
   additive: Bool,
+  soft_depth: F32,
+  lit: F32,
+  flipbook_cols: U32,
+  flipbook_rows: U32,
+  flipbook_fps: F32,
 }
 
 type Light is data = $Light {
@@ -244,6 +249,16 @@ type Motion is data = $Motion {
   previous: Mat4,
 }
 
+type RibbonPoint is data = $RibbonPoint {
+  ribbon: U32,
+  material: U32,
+  additive: Bool,
+  position: Vector,
+  width: F32,
+  color: Color,
+  soft_depth: F32,
+}
+
 type Solid is data = $Solid {
   faces: &[SolidFace],
 }
@@ -311,6 +326,7 @@ type Quality is data = $Quality {
   taa: Bool,
   ssr: U32,
   volumetrics: U32,
+  ssgi: Bool,
 }
 
 type Sky is data = $Sky {

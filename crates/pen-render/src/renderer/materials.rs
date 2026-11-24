@@ -11,6 +11,8 @@ use crate::asset_store::{AssetKind, Material};
 use crate::built_in::BuiltIn;
 use crate::shader::{Pipelines, Variants};
 
+pub(super) type Dressed = ([TextureRef; 4], f32, f32, f32, f32);
+
 // Texture filtering as the frame's quality gives it: 0 reads only the
 // finest level there is, 1 is trilinear, more is that many anisotropic
 // samples. `blur` keeps it that many levels off the finest, while a level
@@ -119,22 +121,30 @@ impl State {
     }
 
     /// The textures of a draw's material, or None while one is on its way:
-    /// nothing is drawn half-dressed. Also whether the normal and layer
-    /// textures loaded, as the draw's settings tell the shader.
+    /// nothing is drawn half-dressed. Also whether the normal, layer/emissive,
+    /// ORM, and emissive textures loaded, as the draw uniform tells the shader.
     pub(super) fn dress(
         &mut self,
         material: &Material,
         field: Option<usize>,
-    ) -> Result<Option<([TextureRef; 3], f32, f32)>> {
+    ) -> Result<Option<Dressed>> {
         let loaded_texture = self.loaded_texture(&material.texture)?;
         let loaded_normal = self.loaded_texture(&material.normal_texture)?;
         let loaded_outline = self.loaded_texture(&material.layer_texture)?;
+        let loaded_emissive = self.loaded_texture(&material.emissive_texture)?;
+        let loaded_orm = self.loaded_texture(&material.orm_texture)?;
         // A texture on its way holds the draw back; one that failed shows as
         // the checker.
-        if [&material.texture, &material.normal_texture, &material.layer_texture]
-            .into_iter()
-            .flatten()
-            .any(|key| self.assets.loading_key(AssetKind::Texture, key))
+        if [
+            &material.texture,
+            &material.normal_texture,
+            &material.layer_texture,
+            &material.emissive_texture,
+            &material.orm_texture,
+        ]
+        .into_iter()
+        .flatten()
+        .any(|key| self.assets.loading_key(AssetKind::Texture, key))
         {
             return Ok(None);
         }
@@ -147,7 +157,14 @@ impl State {
             Some(field) => TextureRef::Field(field),
             None => loaded_normal.map_or(TextureRef::FlatNormal, TextureRef::Slot),
         };
-        let mut outline = loaded_outline.map_or(TextureRef::Transparent, TextureRef::Slot);
+        // Binding 4 holds `layerTexture`, or `emissiveTexture` when no layer texture is present.
+        let (mut outline, emissive_setting) = match (loaded_outline, loaded_emissive) {
+            (Some(slot), _) => (TextureRef::Slot(slot), 0.0),
+            (None, Some(slot)) => (TextureRef::Slot(slot), 1.0),
+            (None, None) => (TextureRef::Transparent, 0.0),
+        };
+        let orm = loaded_orm.map_or(TextureRef::White, TextureRef::Slot);
+        let orm_setting = if loaded_orm.is_some() { 1.0 } else { 0.0 };
         // Index and palette must become usable together: an ordinary fallback
         // texture must never be interpreted as palette indices or oct normals.
         let indexed = material.indexed;
@@ -179,15 +196,17 @@ impl State {
             if packed_ready { 2.0 } else { 0.0 }
         } else if loaded_outline.is_some() {
             1.0
+        } else if emissive_setting > 0.5 {
+            3.0
         } else {
             0.0
         };
-        Ok(Some(([texture, normal, outline], normal_setting, outline_setting)))
+        Ok(Some(([texture, normal, outline, orm], normal_setting, outline_setting, orm_setting, emissive_setting)))
     }
 
     /// The draw bind group for these textures, with the sampler their
     /// settling detail asks for.
-    pub(super) fn draw_group(&mut self, textures: [TextureRef; 3]) -> wgpu::BindGroup {
+    pub(super) fn draw_group(&mut self, textures: [TextureRef; 4]) -> wgpu::BindGroup {
         for texture in textures {
             if let TextureRef::Slot(slot) = texture
                 && let Some(GpuAsset::Texture(texture)) = self.assets.current_mut(slot)
@@ -205,14 +224,14 @@ impl State {
         let (sampler_key, sampler) = self.sampler_at(blur);
         // Every texture's resident levels participate in cache identity.
         // Reloading any layer, or a finer level arriving, replaces its group.
-        let [texture_id, normal_id, outline_id] = textures.map(|texture| self.texture(texture).view_id);
-        let key = (texture_id, normal_id, outline_id, sampler_key);
+        let ids = textures.map(|texture| self.texture(texture).view_id);
+        let key = (ids, sampler_key);
         let frame = self.frames;
         if let Some((group, used)) = self.groups.get_mut(&key) {
             *used = frame;
             return group.clone();
         }
-        let [texture, normal, outline] = textures.map(|texture| self.texture(texture));
+        let [texture, normal, outline, orm] = textures.map(|texture| self.texture(texture));
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.context.draw_group,
@@ -229,6 +248,7 @@ impl State {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&normal.linear) },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&outline.view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&orm.linear) },
             ],
         });
         self.groups.insert(key, (group.clone(), frame));

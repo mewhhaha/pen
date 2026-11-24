@@ -1170,6 +1170,18 @@ pub mod types {
         pub color_end: Color,
         /// Particles add their light to what is behind them, rather than covering it.
         pub additive: bool,
+        /// View-space fade distance in world units against opaque scene depth; 0 disables soft
+        /// particle fading.
+        pub soft_depth: f32,
+        /// Directional sun and ambient lighting weight on particles (0 unlit, 1 fully lit).
+        pub lit: f32,
+        /// Horizontal sprite-sheet frames in the emitter texture (0 or 1 for a single frame).
+        pub flipbook_cols: u32,
+        /// Vertical sprite-sheet frames in the emitter texture (0 or 1 for a single frame).
+        pub flipbook_rows: u32,
+        /// Flipbook playback rate in frames per second (0 plays one full sheet over each
+        /// particle's lifetime).
+        pub flipbook_fps: f32,
     }
     /// A point light, or a spot light shining along `direction` within a cone, lighting what
     /// lies within `radius` of `position`.
@@ -1381,6 +1393,25 @@ pub mod types {
         /// The draw's column-major model transform in the previous frame.
         pub previous: Matrix,
     }
+    /// One spine control point of a camera-facing ribbon trail.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct RibbonPoint {
+        /// Ribbon trail ID; consecutive points sharing an ID, material and blend mode form one
+        /// strip.
+        pub ribbon: u32,
+        /// Material providing color tint and optional texture.
+        pub material: u32,
+        /// Ribbon adds light to what is behind it rather than alpha-blending.
+        pub additive: bool,
+        /// World-space spine point.
+        pub position: Vector,
+        /// Ribbon width in world units at this control point.
+        pub width: f32,
+        /// RGBA color tint and opacity at this control point.
+        pub color: Color,
+        /// View-space soft depth fade distance in world units; 0 disables.
+        pub soft_depth: f32,
+    }
     /// How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture
     /// filtering, ambient occlusion, a sky, screen effects, bloom and temporal antialiasing.
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1406,6 +1437,8 @@ pub mod types {
         /// The froxel volume's tier: 0 off (the mist is analytic, with no shafts or local
         /// volumes), 1 low (a coarser grid, fewer slices and sun-shadow taps), 2 high.
         pub volumetrics: u32,
+        /// Screen-space diffuse global illumination bounce over the opaque scene.
+        pub ssgi: bool,
     }
     impl Default for Quality {
         fn default() -> Self {
@@ -1421,6 +1454,7 @@ pub mod types {
                 taa: Default::default(),
                 ssr: Default::default(),
                 volumetrics: Default::default(),
+                ssgi: Default::default(),
             }
         }
     }
@@ -1946,6 +1980,9 @@ pub mod types {
         /// Previous-frame model transforms for moving scene draws, used to generate per-object
         /// screen-space motion vectors for TAA reprojection and per-object motion blur.
         pub motions: Vec<Motion>,
+        /// World-space camera-facing ribbon and beam trail control points rendered in the
+        /// translucent pass.
+        pub ribbons: Vec<RibbonPoint>,
         /// The game's own sections, which its pen.json `protocol` declares, after the rest of
         /// the packet: a marker, their count, then each one's tag, length and values. A packet
         /// without any ends before the marker. Tag 0 is reserved for one optional development
@@ -2018,6 +2055,7 @@ pub mod types {
                 bone_matrices: Default::default(),
                 morph_weights: Default::default(),
                 motions: Default::default(),
+                ribbons: Default::default(),
                 extensions: Default::default(),
             }
         }
@@ -2082,6 +2120,8 @@ pub mod codec {
     pub const MAX_MORPH_WEIGHTS: usize = 65536;
     /// The most per-draw previous transforms one frame may declare for motion vectors.
     pub const MAX_MOTIONS: usize = 100000;
+    /// The most ribbon trail control points one frame may declare.
+    pub const MAX_RIBBONS: usize = 65536;
     /// The most buses one frame may declare, the master (bus 0) included.
     pub const MAX_BUSES: usize = 16;
     /// Voice ids are whole numbers from 1 to this, the wire's exact-integer range.
@@ -2168,8 +2208,9 @@ pub mod codec {
     /// fog.albedo3, fog.anisotropy, fog.sun, fog.ambient, fog.sky, fog.noise, fog.noise_scale,
     /// fog.drift3, quality.volumetrics, fog_volume_count, bone_matrix_count,
     /// morph_weight_count, motion_blur.strength, motion_blur.max_radius, motion_blur.samples,
-    /// dof.focus_distance, dof.focus_range, dof.aperture, dof.max_blur, motion_count.
-    pub const PACKET_HEADER_FLOATS: usize = 245;
+    /// dof.focus_distance, dof.focus_range, dof.aperture, dof.max_blur, motion_count,
+    /// quality.ssgi, ribbon_count.
+    pub const PACKET_HEADER_FLOATS: usize = 247;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -2207,8 +2248,9 @@ pub mod codec {
     /// Lanes: draw, clip, time, weight, inset.
     pub const POSE_FLOATS: usize = 5;
     /// Lanes: material, transform16, seed, time, duration, rate, lifetime, radius, velocity3,
-    /// spread, gravity3, drag, size_start, size_end, color_start4, color_end4, additive.
-    pub const EMITTER_FLOATS: usize = 42;
+    /// spread, gravity3, drag, size_start, size_end, color_start4, color_end4, additive,
+    /// soft_depth, lit, flipbook_cols, flipbook_rows, flipbook_fps.
+    pub const EMITTER_FLOATS: usize = 47;
     /// Lanes: position3, radius, color3, direction3, inner, outer, shadow, id.
     pub const LIGHT_FLOATS: usize = 14;
     /// Lanes: projection16, texel, far.
@@ -2236,6 +2278,8 @@ pub mod codec {
     pub const MORPH_WEIGHT_FLOATS: usize = 4;
     /// Lanes: draw, previous16.
     pub const MOTION_FLOATS: usize = 17;
+    /// Lanes: ribbon, material, additive, position3, width, color4, soft_depth.
+    pub const RIBBON_FLOATS: usize = 12;
     /// Where each header lane and record field starts; an optional field's lanes
     /// follow its count.
     pub mod lanes {
@@ -2389,6 +2433,8 @@ pub mod codec {
             pub const DOF_APERTURE: usize = 242;
             pub const DOF_MAX_BLUR: usize = 243;
             pub const MOTION_COUNT: usize = 244;
+            pub const QUALITY_SSGI: usize = 245;
+            pub const RIBBON_COUNT: usize = 246;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -2487,6 +2533,11 @@ pub mod codec {
             pub const COLOR_START: usize = 33;
             pub const COLOR_END: usize = 37;
             pub const ADDITIVE: usize = 41;
+            pub const SOFT_DEPTH: usize = 42;
+            pub const LIT: usize = 43;
+            pub const FLIPBOOK_COLS: usize = 44;
+            pub const FLIPBOOK_ROWS: usize = 45;
+            pub const FLIPBOOK_FPS: usize = 46;
         }
         pub mod light {
             pub const POSITION: usize = 0;
@@ -2583,6 +2634,15 @@ pub mod codec {
         pub mod motion {
             pub const DRAW: usize = 0;
             pub const PREVIOUS: usize = 1;
+        }
+        pub mod ribbon_point {
+            pub const RIBBON: usize = 0;
+            pub const MATERIAL: usize = 1;
+            pub const ADDITIVE: usize = 2;
+            pub const POSITION: usize = 3;
+            pub const WIDTH: usize = 6;
+            pub const COLOR: usize = 7;
+            pub const SOFT_DEPTH: usize = 11;
         }
         pub mod solid {
             pub const FACES: usize = 0;
@@ -2990,7 +3050,12 @@ pub mod codec {
             let color_start = Color { r: self.packet[lane + 33], g: self.packet[lane + 34], b: self.packet[lane + 35], a: self.packet[lane + 36] };
             let color_end = Color { r: self.packet[lane + 37], g: self.packet[lane + 38], b: self.packet[lane + 39], a: self.packet[lane + 40] };
             let additive = self.flag(lane + 41)?;
-            *emitter = Emitter { material, transform, seed: seed as u32, time, duration, rate, lifetime, radius, velocity, spread, gravity, drag, size_start, size_end, color_start, color_end, additive };
+            let soft_depth = self.packet[lane + 42];
+            let lit = self.packet[lane + 43];
+            let flipbook_cols = self.count(lane + 44, 32)?;
+            let flipbook_rows = self.count(lane + 45, 32)?;
+            let flipbook_fps = self.packet[lane + 46];
+            *emitter = Emitter { material, transform, seed: seed as u32, time, duration, rate, lifetime, radius, velocity, spread, gravity, drag, size_start, size_end, color_start, color_end, additive, soft_depth, lit, flipbook_cols: flipbook_cols as u32, flipbook_rows: flipbook_rows as u32, flipbook_fps };
             Ok(())
         }
 
@@ -3127,6 +3192,18 @@ pub mod codec {
             *motion = Motion { draw: draw as u32, previous };
             Ok(())
         }
+
+        fn decode_ribbon_point(&mut self, lane: usize, ribbon_point: &mut RibbonPoint) -> Result<()> {
+            let ribbon = self.count(lane, 65535)?;
+            let material = self.material_at(lane + 1)?;
+            let additive = self.flag(lane + 2)?;
+            let position = Vector { x: self.packet[lane + 3], y: self.packet[lane + 4], z: self.packet[lane + 5] };
+            let width = self.packet[lane + 6];
+            let color = Color { r: self.packet[lane + 7], g: self.packet[lane + 8], b: self.packet[lane + 9], a: self.packet[lane + 10] };
+            let soft_depth = self.packet[lane + 11];
+            *ribbon_point = RibbonPoint { ribbon: ribbon as u32, material, additive, position, width, color, soft_depth };
+            Ok(())
+        }
     }
 
     /// Decodes a render packet. The game's frame: what to draw and play, and what to do.
@@ -3194,6 +3271,7 @@ pub mod codec {
         let bone_matrices_count = reader.count(235, MAX_BONE_MATRICES)?;
         let morph_weights_count = reader.count(236, MAX_MORPH_WEIGHTS)?;
         let motions_count = reader.count(244, MAX_MOTIONS)?;
+        let ribbons_count = reader.count(246, MAX_RIBBONS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -3251,9 +3329,11 @@ pub mod codec {
         let morph_weights_end = morph_weights_start + morph_weights_count * MORPH_WEIGHT_FLOATS;
         let motions_start = morph_weights_end;
         let motions_end = motions_start + motions_count * MOTION_FLOATS;
-        let extras_start = motions_end;
+        let ribbons_start = motions_end;
+        let ribbons_end = ribbons_start + ribbons_count * RIBBON_FLOATS;
+        let extras_start = ribbons_end;
         let truncated = "game returned a truncated, oversized or nonfinite frame";
-        ensure!(packet.len() >= motions_end && packet.iter().all(|value| value.is_finite()), truncated);
+        ensure!(packet.len() >= ribbons_end && packet.iter().all(|value| value.is_finite()), truncated);
         // What the records' tails claim of extras, in order.
         let mut extras_lanes = 0;
         for index in 0..draws_count {
@@ -3411,6 +3491,7 @@ pub mod codec {
         let dof_focus_range = reader.packet[241];
         let dof_aperture = reader.packet[242];
         let dof_max_blur = reader.packet[243];
+        let quality_ssgi = reader.flag(245)?;
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -3615,6 +3696,11 @@ pub mod codec {
         for (index, motion) in motions.iter_mut().enumerate() {
             reader.decode_motion(motions_start + index * MOTION_FLOATS, motion)?;
         }
+        let mut ribbons = std::mem::take(&mut frame.ribbons);
+        resize(&mut ribbons, ribbons_count);
+        for (index, ribbon_point) in ribbons.iter_mut().enumerate() {
+            reader.decode_ribbon_point(ribbons_start + index * RIBBON_FLOATS, ribbon_point)?;
+        }
         *frame = RenderFrame {
             save_requested,
             load_requested,
@@ -3631,7 +3717,7 @@ pub mod codec {
             light_direction,
             light_color,
             aberration,
-            quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa, ssr: quality_ssr as u32, volumetrics: quality_volumetrics as u32 },
+            quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa, ssr: quality_ssr as u32, volumetrics: quality_volumetrics as u32, ssgi: quality_ssgi },
             sky: Sky { zenith: sky_zenith, horizon: sky_horizon, ground: sky_ground, sun: sky_sun, night: sky_night, tint: sky_tint, sh0: sky_sh0, sh1: sky_sh1, sh2: sky_sh2, sh3: sky_sh3, sh4: sky_sh4, sh5: sky_sh5, sh6: sky_sh6, sh7: sky_sh7, sh8: sky_sh8 },
             probe_volume: ProbeVolume { revision: probe_volume_revision as u32, nx: probe_volume_nx as u32, ny: probe_volume_ny as u32, nz: probe_volume_nz as u32, spacing: probe_volume_spacing, origin: probe_volume_origin },
             fog: Fog { radius: fog_radius, density: fog_density, height: fog_height, edge: fog_edge, distance: fog_distance, albedo: fog_albedo, anisotropy: fog_anisotropy, sun: fog_sun, ambient: fog_ambient, sky: fog_sky, noise: fog_noise, noise_scale: fog_noise_scale, drift: fog_drift },
@@ -3675,6 +3761,7 @@ pub mod codec {
             bone_matrices,
             morph_weights,
             motions,
+            ribbons,
             extensions,
         };
         Ok(&packet[state_start..state_end])
@@ -3759,6 +3846,7 @@ pub mod codec {
         let bone_matrices_count = d.count(&header.field("bone_matrix_count"), 235, MAX_BONE_MATRICES)?;
         let morph_weights_count = d.count(&header.field("morph_weight_count"), 236, MAX_MORPH_WEIGHTS)?;
         let motions_count = d.count(&header.field("motion_count"), 244, MAX_MOTIONS)?;
+        let ribbons_count = d.count(&header.field("ribbon_count"), 246, MAX_RIBBONS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3816,7 +3904,9 @@ pub mod codec {
         let morph_weights_end = d.end(&Location::section("morph_weights"), morph_weights_start, morph_weights_count, MORPH_WEIGHT_FLOATS)?;
         let motions_start = morph_weights_end;
         let motions_end = d.end(&Location::section("motions"), motions_start, motions_count, MOTION_FLOATS)?;
-        let extras_start = motions_end;
+        let ribbons_start = motions_end;
+        let ribbons_end = d.end(&Location::section("ribbons"), ribbons_start, ribbons_count, RIBBON_FLOATS)?;
+        let extras_start = ribbons_end;
         let extras_cursor = &mut { extras_start };
         d.count(&header.field("save_requested"), 12, 1)?;
         d.count(&header.field("load_requested"), 13, 1)?;
@@ -3933,6 +4023,7 @@ pub mod codec {
         d.finite(&header.field("dof.focus_range"), 241)?;
         d.finite(&header.field("dof.aperture"), 242)?;
         d.finite(&header.field("dof.max_blur"), 243)?;
+        d.count(&header.field("quality.ssgi"), 245, 1)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -4160,6 +4251,11 @@ pub mod codec {
             d.values(&path.field("color_start"), base + 33, 4, &["r","g","b","a"])?;
             d.values(&path.field("color_end"), base + 37, 4, &["r","g","b","a"])?;
             d.count(&path.field("additive"), base + 41, 1)?;
+            d.finite(&path.field("soft_depth"), base + 42)?;
+            d.finite(&path.field("lit"), base + 43)?;
+            let flipbook_cols = d.count(&path.field("flipbook_cols"), base + 44, 32)?;
+            let flipbook_rows = d.count(&path.field("flipbook_rows"), base + 45, 32)?;
+            d.finite(&path.field("flipbook_fps"), base + 46)?;
             base += EMITTER_FLOATS;
         }
         d.exhausted(&Location::section("emitters"), base, emitters_end)?;
@@ -4309,6 +4405,19 @@ pub mod codec {
             base += MOTION_FLOATS;
         }
         d.exhausted(&Location::section("motions"), base, motions_end)?;
+        let mut base = ribbons_start;
+        for item in 0..ribbons_count {
+            let path = &Location::section("ribbons").index(item);
+            let ribbon = d.count(&path.field("ribbon"), base, 65535)?;
+            d.reference(&path.field("material"), base + 1, catalog.materials.len(), true)?;
+            d.count(&path.field("additive"), base + 2, 1)?;
+            d.values(&path.field("position"), base + 3, 3, &["x","y","z"])?;
+            d.finite(&path.field("width"), base + 6)?;
+            d.values(&path.field("color"), base + 7, 4, &["r","g","b","a"])?;
+            d.finite(&path.field("soft_depth"), base + 11)?;
+            base += RIBBON_FLOATS;
+        }
+        d.exhausted(&Location::section("ribbons"), base, ribbons_end)?;
         inspect_extensions(d, *extras_cursor)?;
         Ok(())
     }
@@ -4358,6 +4467,7 @@ pub mod codec {
         let bone_matrices_count = d.count(&header.field("bone_matrix_count"), 235, MAX_BONE_MATRICES)?;
         let morph_weights_count = d.count(&header.field("morph_weight_count"), 236, MAX_MORPH_WEIGHTS)?;
         let motions_count = d.count(&header.field("motion_count"), 244, MAX_MOTIONS)?;
+        let ribbons_count = d.count(&header.field("ribbon_count"), 246, MAX_RIBBONS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -4415,7 +4525,9 @@ pub mod codec {
         let morph_weights_end = d.end(&Location::section("morph_weights"), morph_weights_start, morph_weights_count, MORPH_WEIGHT_FLOATS)?;
         let motions_start = morph_weights_end;
         let motions_end = d.end(&Location::section("motions"), motions_start, motions_count, MOTION_FLOATS)?;
-        let extras_start = motions_end;
+        let ribbons_start = motions_end;
+        let ribbons_end = d.end(&Location::section("ribbons"), ribbons_start, ribbons_count, RIBBON_FLOATS)?;
+        let extras_start = ribbons_end;
         let mut end = extras_start;
         for item in 0..draws_count {
             let count = d.count(&Location::section("draws").index(item).field("extra"), draws_start + item * DRAW_FLOATS + 23, MAX_DRAW_EXTRA)?;
@@ -4519,21 +4631,21 @@ pub mod codec {
             frame.aberration.y, frame.quality.msaa as f32, f32::from(frame.quality.fxaa), frame.quality.scale,
             frame.quality.filtering as f32, f32::from(frame.quality.occlusion), f32::from(frame.quality.sky),
             f32::from(frame.quality.effects), f32::from(frame.quality.bloom), f32::from(frame.quality.taa),
-            frame.quality.ssr as f32, frame.quality.volumetrics as f32, frame.sky.zenith.x, frame.sky.zenith.y,
-            frame.sky.zenith.z, frame.sky.horizon.x, frame.sky.horizon.y, frame.sky.horizon.z,
-            frame.sky.ground.x, frame.sky.ground.y, frame.sky.ground.z, frame.sky.sun.x, frame.sky.sun.y,
-            frame.sky.sun.z, frame.sky.night, frame.sky.tint.x, frame.sky.tint.y, frame.sky.tint.z,
-            frame.sky.sh0.x, frame.sky.sh0.y, frame.sky.sh0.z, frame.sky.sh1.x, frame.sky.sh1.y, frame.sky.sh1.z,
-            frame.sky.sh2.x, frame.sky.sh2.y, frame.sky.sh2.z, frame.sky.sh3.x, frame.sky.sh3.y, frame.sky.sh3.z,
-            frame.sky.sh4.x, frame.sky.sh4.y, frame.sky.sh4.z, frame.sky.sh5.x, frame.sky.sh5.y, frame.sky.sh5.z,
-            frame.sky.sh6.x, frame.sky.sh6.y, frame.sky.sh6.z, frame.sky.sh7.x, frame.sky.sh7.y, frame.sky.sh7.z,
-            frame.sky.sh8.x, frame.sky.sh8.y, frame.sky.sh8.z, frame.probe_volume.revision as f32,
-            frame.probe_volume.nx as f32, frame.probe_volume.ny as f32, frame.probe_volume.nz as f32,
-            frame.probe_volume.spacing, frame.probe_volume.origin.x, frame.probe_volume.origin.y,
-            frame.probe_volume.origin.z, frame.fog.radius, frame.fog.density, frame.fog.height, frame.fog.edge,
-            frame.fog.distance, frame.fog.albedo.x, frame.fog.albedo.y, frame.fog.albedo.z, frame.fog.anisotropy,
-            frame.fog.sun, frame.fog.ambient, frame.fog.sky, frame.fog.noise, frame.fog.noise_scale,
-            frame.fog.drift.x, frame.fog.drift.y, frame.fog.drift.z,
+            frame.quality.ssr as f32, frame.quality.volumetrics as f32, f32::from(frame.quality.ssgi),
+            frame.sky.zenith.x, frame.sky.zenith.y, frame.sky.zenith.z, frame.sky.horizon.x, frame.sky.horizon.y,
+            frame.sky.horizon.z, frame.sky.ground.x, frame.sky.ground.y, frame.sky.ground.z, frame.sky.sun.x,
+            frame.sky.sun.y, frame.sky.sun.z, frame.sky.night, frame.sky.tint.x, frame.sky.tint.y,
+            frame.sky.tint.z, frame.sky.sh0.x, frame.sky.sh0.y, frame.sky.sh0.z, frame.sky.sh1.x,
+            frame.sky.sh1.y, frame.sky.sh1.z, frame.sky.sh2.x, frame.sky.sh2.y, frame.sky.sh2.z, frame.sky.sh3.x,
+            frame.sky.sh3.y, frame.sky.sh3.z, frame.sky.sh4.x, frame.sky.sh4.y, frame.sky.sh4.z, frame.sky.sh5.x,
+            frame.sky.sh5.y, frame.sky.sh5.z, frame.sky.sh6.x, frame.sky.sh6.y, frame.sky.sh6.z, frame.sky.sh7.x,
+            frame.sky.sh7.y, frame.sky.sh7.z, frame.sky.sh8.x, frame.sky.sh8.y, frame.sky.sh8.z,
+            frame.probe_volume.revision as f32, frame.probe_volume.nx as f32, frame.probe_volume.ny as f32,
+            frame.probe_volume.nz as f32, frame.probe_volume.spacing, frame.probe_volume.origin.x,
+            frame.probe_volume.origin.y, frame.probe_volume.origin.z, frame.fog.radius, frame.fog.density,
+            frame.fog.height, frame.fog.edge, frame.fog.distance, frame.fog.albedo.x, frame.fog.albedo.y,
+            frame.fog.albedo.z, frame.fog.anisotropy, frame.fog.sun, frame.fog.ambient, frame.fog.sky,
+            frame.fog.noise, frame.fog.noise_scale, frame.fog.drift.x, frame.fog.drift.y, frame.fog.drift.z,
         ]);
         out.extend_from_slice(&frame.shadow.view);
         out.extend([
@@ -4664,6 +4776,10 @@ pub mod codec {
         for motion in &frame.motions {
             canonical_motion(&mut out, motion);
         }
+        out.push(frame.ribbons.len() as f32);
+        for ribbon_point in &frame.ribbons {
+            canonical_ribbon_point(&mut out, ribbon_point);
+        }
         out
     }
 
@@ -4791,7 +4907,8 @@ pub mod codec {
             emitter.gravity.y, emitter.gravity.z, emitter.drag, emitter.size_start, emitter.size_end,
             emitter.color_start.r, emitter.color_start.g, emitter.color_start.b, emitter.color_start.a,
             emitter.color_end.r, emitter.color_end.g, emitter.color_end.b, emitter.color_end.a,
-            f32::from(emitter.additive),
+            f32::from(emitter.additive), emitter.soft_depth, emitter.lit, emitter.flipbook_cols as f32,
+            emitter.flipbook_rows as f32, emitter.flipbook_fps,
         ]);
     }
 
@@ -4888,5 +5005,14 @@ pub mod codec {
     fn canonical_motion(out: &mut Vec<f32>, motion: &Motion) {
         out.push(motion.draw as f32);
         out.extend_from_slice(&motion.previous);
+    }
+
+    fn canonical_ribbon_point(out: &mut Vec<f32>, ribbon_point: &RibbonPoint) {
+        out.extend([
+            ribbon_point.ribbon as f32, ribbon_point.material as f32, f32::from(ribbon_point.additive),
+            ribbon_point.position.x, ribbon_point.position.y, ribbon_point.position.z, ribbon_point.width,
+            ribbon_point.color.r, ribbon_point.color.g, ribbon_point.color.b, ribbon_point.color.a,
+            ribbon_point.soft_depth,
+        ]);
     }
 }

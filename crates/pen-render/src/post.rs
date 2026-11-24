@@ -83,32 +83,13 @@ pub(crate) fn atmosphere_shader(samples: u32) -> String {
         .replace("${share}", &format!("{:.4}", 1.0 / f64::from(samples)))
 }
 
-// Directions around a surface's normal (z) to test for occluders, spread on a
-// golden-angle spiral and gathered toward the surface.
-fn kernel() -> String {
-    (0..12)
-        .map(|index| {
-            let index = f64::from(index);
-            let z = 1.0 - (index + 0.5) / 12.0 * 0.9;
-            let around = (1.0 - z * z).sqrt();
-            let angle = index * std::f64::consts::PI * (3.0 - 5f64.sqrt());
-            let reach = 0.25 + 0.75 * ((index + 1.0) / 12.0).powi(2);
-            let values = [angle.cos() * around, angle.sin() * around, z].map(|value| format!("{:.5}", value * reach));
-            format!("vec3f({})", values.join(", "))
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-// Screen-space ambient occlusion: how much of the hemisphere above each
-// surface the depth buffer shows to be filled, within a world-space radius.
+// Ground-truth ambient occlusion (GTAO): horizon-based visibility from depth.
 const OCCLUSION_SHADER: &str = include_str!("shaders/occlusion.wgsl");
 
 pub(crate) fn occlusion_shader(samples: u32) -> String {
     OCCLUSION_SHADER
         .replace("${depth_texture}", depth_texture(samples))
         .replace("${fullscreen}", FULLSCREEN)
-        .replace("${kernel}", &kernel())
 }
 
 // The opaque scene's nearest depth to read from the translucent pass, its
@@ -272,6 +253,7 @@ struct TargetsKey {
     samples: u32,
     occluding: bool,
     atmosphere: bool,
+    ssgi: bool,
     levels: u32,
     taa: bool,
     dof: bool,
@@ -409,6 +391,7 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
     let (code, target, blend) = match which {
         BuiltIn::Occlusion(samples) => (occlusion_shader(samples), wgpu::TextureFormat::R8Unorm, None),
         BuiltIn::Atmosphere(samples) => (atmosphere_shader(samples), SCENE_FORMAT, None),
+        BuiltIn::Ssgi(samples) => (crate::ssgi::shader(samples), SCENE_FORMAT, None),
         BuiltIn::OpaqueDepth(samples) => (opaque_depth_shader(samples), wgpu::TextureFormat::R32Float, None),
         BuiltIn::OpaqueMip => (OPAQUE_MIP_SHADER.to_owned(), SCENE_FORMAT, None),
         BuiltIn::Subsurface(samples) => (crate::subsurface::shader(samples), SCENE_FORMAT, None),
@@ -419,7 +402,11 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
         BuiltIn::BloomDown { first } => (bloom_down_shader(first), SCENE_FORMAT, None),
         // Each level up is added onto the one above.
         BuiltIn::BloomUp => (bloom_up_shader(), SCENE_FORMAT, Some(wgpu::BlendState { color: add, alpha: add })),
-        BuiltIn::Decal { .. } | BuiltIn::Composite | BuiltIn::Particles { .. } | BuiltIn::Backdrop(_) => {
+        BuiltIn::Decal { .. }
+        | BuiltIn::Composite
+        | BuiltIn::Particles { .. }
+        | BuiltIn::Ribbons { .. }
+        | BuiltIn::Backdrop(_) => {
             unreachable!("not a pass around the scene: {which:?}")
         }
     };
@@ -757,13 +744,25 @@ impl Post {
         } else {
             0
         };
+        let ssgi = quality.ssgi;
         let taa = quality.taa;
         let dof =
             quality.effects && frame.dof.focus_distance > 0.0 && frame.dof.aperture > 0.0 && frame.dof.max_blur > 0.0;
         let motion_blur =
             quality.effects && frame.motion_blur.strength > 0.0 && frame.motion_blur.max_radius > 0.0;
-        let key =
-            TargetsKey { width, height, samples, occluding, atmosphere, levels, taa, dof, motion_blur, volume: volume.serial };
+        let key = TargetsKey {
+            width,
+            height,
+            samples,
+            occluding,
+            atmosphere,
+            ssgi,
+            levels,
+            taa,
+            dof,
+            motion_blur,
+            volume: volume.serial,
+        };
         let mut targets_recreated = false;
         if self.targets.as_ref().is_none_or(|targets| targets.key != key) {
             self.targets = None;
@@ -1001,7 +1000,7 @@ impl Post {
         volume: &crate::volume::Applied,
         sharing: Option<&Graph>,
     ) -> anyhow::Result<Graph> {
-        let TargetsKey { width, height, samples, occluding, atmosphere, levels, dof, motion_blur, .. } = key;
+        let TargetsKey { width, height, samples, occluding, atmosphere, ssgi, levels, dof, motion_blur, .. } = key;
         let full = |format: wgpu::TextureFormat| Spec { width, height, format };
         let sampler = Binding::Sampler(self.sampler.clone());
         let mut graph = GraphBuilder::default();
@@ -1025,7 +1024,7 @@ impl Post {
             };
             if atmosphere || matches!(part, Part::Opaque(..)) {
                 let composed = match part {
-                    Part::Opaque(chain, _) => graph.import("opaque", chain[0].clone()),
+                    Part::Opaque(chain, _) if !ssgi => graph.import("opaque", chain[0].clone()),
                     _ => graph.texture("composed", full(SCENE_FORMAT)),
                 };
                 let uniform = Binding::Uniform(self.uniform("atmosphere", 224));
@@ -1041,6 +1040,16 @@ impl Post {
                 ];
                 graph.pass("atmosphere", BuiltIn::Atmosphere(samples), bindings, Target::Texture(composed), false);
                 lit = composed;
+            }
+            if ssgi {
+                let bounced = match part {
+                    Part::Opaque(chain, _) => graph.import("opaque", chain[0].clone()),
+                    _ => graph.texture("ssgi", full(SCENE_FORMAT)),
+                };
+                let uniform = Binding::Uniform(self.uniform("ssgi", 160));
+                let bindings = vec![uniform, Binding::Texture(lit), Binding::Texture(depth), sampler.clone()];
+                graph.pass("ssgi", BuiltIn::Ssgi(samples), bindings, Target::Texture(bounced), false);
+                lit = bounced;
             }
         }
         // The nearest depth of each pixel, and each level of the picture from the
@@ -1176,7 +1185,7 @@ impl Post {
     /// work out the opaque surfaces' picture, for the scene as it was drawn.
     fn write_opaque_uniforms(&mut self, frame: &RenderFrame) {
         let quality = self.quality.expect("Post::begin comes first");
-        let TargetsKey { width, height, occluding, atmosphere, .. } = self.targets.as_ref().unwrap().key;
+        let TargetsKey { width, height, occluding, atmosphere, ssgi, .. } = self.targets.as_ref().unwrap().key;
         // What the scene drew with.
         let (projection, _) = self.jittered.unwrap_or((frame.projection, (0.0, 0.0)));
         if occluding {
@@ -1199,6 +1208,11 @@ impl Post {
         if atmosphere || self.translucent {
             let uniform = self.uniform("atmosphere", 224);
             let data = atmosphere_of(frame, &projection, &quality, width, height);
+            self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
+        }
+        if ssgi {
+            let uniform = self.uniform("ssgi", 160);
+            let data = crate::ssgi::uniform(&projection, (width, height));
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
     }
@@ -1406,7 +1420,10 @@ mod tests {
         for code in [
             atmosphere_shader(1),
             atmosphere_shader(4),
+            occlusion_shader(1),
             occlusion_shader(4),
+            crate::ssgi::shader(1),
+            crate::ssgi::shader(4),
             present_shader(1, &crate::Display::SDR),
             present_shader(
                 4,
@@ -1428,17 +1445,10 @@ mod tests {
             assert!(!code.contains("${"), "{code}");
         }
         assert!(atmosphere_shader(4).contains("empty += 0.2500;"));
+        assert!(occlusion_shader(4).contains("gtao_arc"));
         assert!(
             opaque_depth_shader(4).contains("texture_depth_multisampled_2d")
                 && opaque_depth_shader(4).contains("sample < 4")
-        );
-        // Five decimals, as WGSL literals.
-        assert_eq!(
-            kernel(),
-            "vec3f(0.06923, 0.00000, 0.24564), vec3f(-0.09203, 0.08430, 0.24036), vec3f(0.01513, -0.17240, 0.24121), \
-             vec3f(0.13697, 0.17865, 0.24583), vec3f(-0.28045, -0.04961, 0.25189), vec3f(0.29872, -0.19002, 0.25703), \
-             vec3f(-0.11262, 0.41894, 0.25892), vec3f(-0.24177, -0.46551, 0.25521), vec3f(0.58818, 0.21480, 0.24355), \
-             vec3f(-0.68243, 0.28170, 0.22161), vec3f(0.36455, -0.77903, 0.18704), vec3f(0.29644, 0.94510, 0.13750)"
         );
     }
 }

@@ -21,7 +21,7 @@ use crate::texture::DecodedImage;
 pub(crate) enum Prepared {
     // Boxed: a mesh carries its bounds, levels of detail and skin.
     Mesh(Box<Mesh>),
-    Material(Material),
+    Material(Box<Material>),
     Image(DecodedImage),
     /// A packed texture with every level inflated.
     Packed(PackedHeader, Vec<PackedLevel>),
@@ -119,7 +119,7 @@ fn prepare(root: &str, kind: AssetKind, key: &str) -> Option<Prepared> {
     let bytes = pollster::block_on(crate::platform::read_asset(root, key)).ok()?;
     match kind {
         AssetKind::Mesh => parse_mesh(&bytes).ok().map(|mesh| Prepared::Mesh(Box::new(mesh))),
-        AssetKind::Material => parse_material(&bytes).ok().map(Prepared::Material),
+        AssetKind::Material => parse_material(&bytes).ok().map(|m| Prepared::Material(Box::new(m))),
         AssetKind::Texture if is_packed_texture(&bytes) => {
             let mut reader = PackedReader::open(bytes).ok()?;
             let mut levels = Vec::new();

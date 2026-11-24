@@ -10,7 +10,7 @@ use pen_protocol::{Catalog, RenderFrame, Sprite};
 
 use super::timing::Span;
 use super::validate::validate_frame;
-use super::{Drawing, GpuAsset, MeshAsset, ReadyEntry, Scratch, ShaderAsset, Shape, State, particles};
+use super::{Drawing, GpuAsset, MeshAsset, ReadyEntry, Scratch, ShaderAsset, Shape, State, particles, ribbons};
 use crate::asset_store::{AssetKind, Material};
 use crate::built_in::BuiltIn;
 use crate::decals::{DECAL_MARK, Decals};
@@ -318,8 +318,9 @@ impl State {
         self.decal_batches(frame, catalog, scratch)?;
         // Sprites over the finished image, in order.
         self.sprite_batches(&frame.sprites, catalog, &mut scratch.sprites, &mut scratch.sprite_order)?;
-        // Particles whose material, texture and pipeline are ready.
+        // Particles and ribbon trails whose material, texture and pipeline are ready.
         self.prepare_particles(frame, catalog, samples, scratch)?;
+        self.prepare_ribbons(frame, catalog, samples, scratch)?;
         self.sort_passes(frame, scratch, shadowed);
         let ready = &scratch.ready;
         // Until they are ready, draw the cover and any opted-in startup sprites.
@@ -362,8 +363,10 @@ impl State {
         // Translucent surfaces, particles and overlays draw after the opaque
         // picture is misted, in a pass of their own; a frame without them draws
         // the scene as one picture.
-        let translucent =
-            !scratch.translucent.is_empty() || !scratch.overlays.is_empty() || !scratch.emitters.is_empty();
+        let translucent = !scratch.translucent.is_empty()
+            || !scratch.overlays.is_empty()
+            || !scratch.emitters.is_empty()
+            || !scratch.ribbons.is_empty();
         let volume = self.volumetrics.prepare(&self.context, frame, &quality, target.size(), translucent);
         // Opaque surfaces of a subsurface material have the scene's picture
         // diffused over them once it is resolved; a frame with none makes no passes
@@ -397,7 +400,9 @@ impl State {
         if let Some(opaque) = &targets.opaque {
             self.bind_translucent(opaque, &volume);
         }
-        self.bind_particles(&volume, &mut scratch.emitters);
+        let active_proj_for_trails = jittered.unwrap_or(frame.projection);
+        self.bind_particles(targets.opaque.as_ref(), &volume, &mut scratch.emitters);
+        self.bind_ribbons(frame, &active_proj_for_trails, targets.opaque.as_ref(), &volume, &mut scratch.ribbons);
         self.write_screen(frame, reflected);
         self.clusters.update(
             &self.device,
@@ -629,6 +634,7 @@ impl State {
             post.draw_backdrop(&mut self.built_ins, &mut pass);
             draw_layers(&mut pass, group, &[(&scratch.translucent, Layer::Translucent)], &mut stats);
             particles::draw(&mut pass, &scratch.emitters);
+            ribbons::draw(&mut pass, self.ribbons.as_ref(), &scratch.ribbons);
             let overlays = [(&scratch.overlays[..], Layer::Occluded), (&scratch.overlays[..], Layer::Visible)];
             draw_layers(&mut pass, group, &overlays, &mut stats);
         }

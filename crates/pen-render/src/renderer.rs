@@ -28,6 +28,7 @@ mod particles;
 pub(crate) mod readback;
 mod reflections;
 mod resolution;
+mod ribbons;
 #[cfg(test)]
 mod shadow_tests;
 mod shadows;
@@ -45,7 +46,7 @@ use anyhow::Result;
 use pen_protocol::boundary::MAX_DRAW_EXTRA;
 use pen_protocol::{GameEvent, Matrix, Sky, Solid, Vector};
 
-use crate::asset_store::{AssetStore, Lod, MAX_LODS, Material, SURFACE_FLOATS};
+use crate::asset_store::{AssetStore, Lod, MAPS_FLOATS, MAX_LODS, Material, SURFACE_FLOATS};
 use crate::built_in::{BuiltIn, BuiltIns};
 use crate::culling::{Detail, MAX_VIEWS, Sphere, ViewMask, Views};
 use crate::decals::{DecalBatch, Decals};
@@ -69,6 +70,7 @@ pub(crate) use gpu_culling::pipeline as culling_pipeline;
 use gpu_culling::{GpuBatch, GpuCulling};
 pub(crate) use insets::composite_pipeline;
 pub(crate) use particles::pipeline as particle_pipeline;
+pub(crate) use ribbons::pipeline as ribbon_pipeline;
 pub use shadows::SHADOWS_WGSL;
 pub(crate) use timing::{GpuTimer, Span};
 pub use validate::validate_frame;
@@ -92,11 +94,12 @@ const SCENE_FLOATS: usize = 80 + 4 + 16 * MAX_CASCADES + 4 * MAX_CASCADES + 4;
 const SCENE_BYTES: u64 = SCENE_FLOATS as u64 * 4;
 
 // A draw's uniform: model and normal matrices, color, settings, the four
-// parameters, up to 32 extra vectors (see pen-protocol's Draw), then the
-// material's five surface vectors (`asset_store::Surface::vectors`), which
-// start at float `SURFACE_AT` (byte 688).
+// parameters, up to 32 extra vectors (see pen-protocol's Draw), the material's
+// five surface vectors (`asset_store::Surface::vectors`, byte 688), and the
+// two UV-transform / PBR map-flag vectors (byte 768, total 800 bytes).
 const SURFACE_AT: usize = 44 + MAX_DRAW_EXTRA * 4;
-const DRAW_BYTES: u64 = (SURFACE_AT + SURFACE_FLOATS) as u64 * 4;
+const MAPS_AT: usize = SURFACE_AT + SURFACE_FLOATS;
+const DRAW_BYTES: u64 = (MAPS_AT + MAPS_FLOATS) as u64 * 4;
 
 pub(crate) struct MeshAsset {
     vertex_count: u32,
@@ -518,8 +521,9 @@ struct Scratch {
     morph_order: Vec<u32>,
     /// Previous-frame model transform index in `frame.motions` per scene draw (`u32::MAX` for static).
     motion_for_draw: Vec<u32>,
-    /// The frame's emitters ready to draw, in order.
+    /// The frame's emitters and ribbons ready to draw, in order.
     emitters: Vec<particles::Ready>,
+    ribbons: Vec<ribbons::Ready>,
 }
 
 /// What drawing an item reads.
@@ -724,9 +728,9 @@ pub(crate) struct State {
     capacity: usize,
     draw_uniform: wgpu::Buffer,
     uniform_data: Vec<f32>,
-    // Draw bind groups by their three textures' views and their sampler, and
+    // Draw bind groups by their four textures' views and their sampler, and
     // the frame that last drew with each.
-    groups: HashMap<(u64, u64, u64, i32), (wgpu::BindGroup, u64)>,
+    groups: HashMap<([u64; 4], i32), (wgpu::BindGroup, u64)>,
     instance_capacity: usize,
     instance_buffer: wgpu::Buffer,
     // What a mesh without tangents binds as them: a zero `vec4f` for each
@@ -786,11 +790,12 @@ pub(crate) struct State {
     // Whether something this frame draws is still on its way.
     waiting: bool,
     scratch: Scratch,
-    // Posed draws' joint matrices, GPU morph targets, velocity pass, and the frame's particles.
+    // Posed draws' joint matrices, GPU morph targets, velocity pass, particles, and ribbon trails.
     skinning: skinning::Skinning,
     morphing: morphing::Morphing,
     velocity: velocity::Velocity,
     particles: Option<particles::Particles>,
+    ribbons: Option<ribbons::Ribbons>,
     // Interned material render states (`MaterialAsset::state`).
     states: HashMap<String, u32>,
     // The frame the catalog's mesh and material keys were last checked in.
@@ -970,6 +975,8 @@ pub(crate) fn draw_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
         // A normal map, or a field the vertices read too.
         texture_entry(3, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
         texture_entry(4, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+        // Packed linear ORM (occlusion/roughness/metallic) texture.
+        texture_entry(5, wgpu::ShaderStages::FRAGMENT),
     ]
 }
 
@@ -1147,6 +1154,7 @@ impl State {
             morphing: morphing::Morphing::new(&device),
             velocity: velocity::Velocity::new(&device),
             particles: None,
+            ribbons: None,
             states: HashMap::new(),
             checks: 0,
             checked_meshes: Vec::new(),
@@ -1281,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mesh_pipelines_fragment_stage_samples_fifteen_textures_of_the_sixteen_webgpu_allows() {
+    fn a_mesh_pipelines_fragment_stage_samples_sixteen_textures_of_the_sixteen_webgpu_allows() {
         let scene = fragment_textures(&scene_layout_entries());
         let draw = fragment_textures(&draw_layout_entries());
         let lights = fragment_textures(&crate::lights::layout_entries());
@@ -1289,11 +1297,12 @@ mod tests {
         // the depth and picture of screen-space reflections, the camera's depth for contact shadows,
         // and the opaque picture, its depth and the froxel volume (bindings 14 to 16, fragment only).
         assert_eq!(scene, [1, 3, 4, 5, 10, 12, 13, 9, 14, 15, 16]);
-        // The draw's texture, its normal map and its layer texture; the local lights' shadow atlas.
-        assert_eq!(draw, [1, 3, 4]);
+        // The draw's texture, normal map, layer/emissive texture, and packed linear ORM texture;
+        // plus the local lights' shadow atlas.
+        assert_eq!(draw, [1, 3, 4, 5]);
         assert_eq!(lights, [4]);
         let total = scene.len() + draw.len() + lights.len();
-        assert_eq!(total, 15, "a new binding must leave room under WebGPU's default of 16");
+        assert_eq!(total, 16, "a new binding must stay within WebGPU's default of 16");
         assert!(total <= 16);
     }
 }

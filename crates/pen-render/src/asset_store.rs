@@ -125,6 +125,12 @@ pub(crate) struct Material {
     /// Optional third image the shader reads at binding 4: an impostor
     /// outline atlas, an indexed atlas's palette or a surface's detail map.
     pub layer_texture: Option<String>,
+    /// Optional packed linear ORM texture at binding 5 (R = occlusion, G = roughness, B = metallic).
+    pub orm_texture: Option<String>,
+    /// Optional sRGB emissive texture (bound at binding 4 when `layer_texture` is absent).
+    pub emissive_texture: Option<String>,
+    /// Optional UV transform (`KHR_texture_transform`: offset, scale, rotation).
+    pub uv_transform: UvTransform,
     /// Indexed color/coverage palette with octahedral two-channel normals
     /// (atlasEncoding "indexed-oct"), rather than "rgba".
     pub indexed: bool,
@@ -206,8 +212,73 @@ impl Default for Surface {
     }
 }
 
+/// glTF `KHR_texture_transform` parameters applied to material UVs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct UvTransform {
+    pub offset: [f32; 2],
+    pub scale: [f32; 2],
+    pub rotation: f32,
+}
+
+impl Default for UvTransform {
+    fn default() -> Self {
+        Self { offset: [0.0, 0.0], scale: [1.0, 1.0], rotation: 0.0 }
+    }
+}
+
+impl UvTransform {
+    /// Packs `[offset.x, offset.y, scale.x, scale.y, cos(rot), sin(rot), orm, emissive]`.
+    pub fn vectors(&self, orm_present: f32, emissive_present: f32) -> [f32; 8] {
+        [
+            self.offset[0],
+            self.offset[1],
+            self.scale[0],
+            self.scale[1],
+            self.rotation.cos(),
+            self.rotation.sin(),
+            orm_present,
+            emissive_present,
+        ]
+    }
+
+    fn parse(value: Option<&Value>) -> Result<Self> {
+        let Some(value) = value else { return Ok(Self::default()) };
+        if value.is_null() {
+            return Ok(Self::default());
+        }
+        let Some(object) = value.as_object() else { bail!("material uvTransform must be an object") };
+        for key in object.keys() {
+            ensure!(matches!(key.as_str(), "offset" | "scale" | "rotation"), "unknown uvTransform key: {key}");
+        }
+        let pair = |field: &str, default: [f32; 2]| -> Result<[f32; 2]> {
+            match object.get(field) {
+                None | Some(Value::Null) => Ok(default),
+                Some(raw) => {
+                    let vals = numbers(Some(raw), field)?;
+                    ensure!(vals.len() == 2, "material uvTransform.{field} must have two finite numbers");
+                    #[allow(clippy::cast_possible_truncation, reason = "finite f32 shader parameter")]
+                    Ok([vals[0] as f32, vals[1] as f32])
+                }
+            }
+        };
+        let rotation = match object.get("rotation") {
+            None | Some(Value::Null) => 0.0,
+            Some(Value::Number(n)) if n.as_f64().is_some_and(f64::is_finite) => {
+                #[allow(clippy::cast_possible_truncation, reason = "finite f32 shader parameter")]
+                {
+                    n.as_f64().unwrap() as f32
+                }
+            }
+            Some(_) => bail!("material uvTransform.rotation must be a finite number"),
+        };
+        Ok(Self { offset: pair("offset", [0.0, 0.0])?, scale: pair("scale", [1.0, 1.0])?, rotation })
+    }
+}
+
 /// The draw uniform's floats for the surface block: five `vec4f`s.
 pub(crate) const SURFACE_FLOATS: usize = 20;
+/// Additional draw uniform floats for UV transform and PBR texture map flags: two `vec4f`s.
+pub(crate) const MAPS_FLOATS: usize = 8;
 
 impl Surface {
     /// The five `vec4f`s of the draw uniform's `surface` array:
@@ -812,6 +883,9 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
     let texture = optional_key("texture")?;
     let normal_texture = optional_key("normalTexture")?;
     let layer_texture = optional_key("layerTexture")?;
+    let orm_texture = optional_key("ormTexture")?;
+    let emissive_texture = optional_key("emissiveTexture")?;
+    let uv_transform = UvTransform::parse(material.get("uvTransform"))?;
     let color = numbers(material.get("color"), "color")?;
     let instance_parameters = match material.get("instanceParameters") {
         None | Some(Value::Null) => None,
@@ -870,6 +944,9 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
         texture,
         normal_texture,
         layer_texture,
+        orm_texture,
+        emissive_texture,
+        uv_transform,
         indexed,
         instance_parameters,
         color: [color[0], color[1], color[2], color[3]],

@@ -11,12 +11,11 @@ use super::frame::stencil;
 use super::skinning::Posed;
 use super::validate::normal_matrix;
 use super::{
-    ALONE, Batching, Choice, GpuAsset, INSET_SAMPLES, InstanceBatch, Item, LEFT_OUT, Placement, ReadyEntry, SURFACE_AT,
-    Scratch, Shape, SolidMesh, Source, State, uniform_buffer,
+    ALONE, Batching, Choice, GpuAsset, INSET_SAMPLES, InstanceBatch, Item, LEFT_OUT, MAPS_AT, Placement, ReadyEntry,
+    SURFACE_AT, Scratch, Shape, SolidMesh, Source, State, uniform_buffer,
 };
 use crate::RenderStats;
-use crate::asset_store::AssetKind;
-use crate::asset_store::{MAX_LODS, SURFACE_FLOATS};
+use crate::asset_store::{AssetKind, MAPS_FLOATS, MAX_LODS, SURFACE_FLOATS};
 use crate::culling::{ALL_VIEWS, CAMERA, Detail, Frustum, MAX_VIEWS, Sphere, ViewMask, Views, stretch};
 use crate::decals::DecalBatch;
 use crate::local_shadows::Selection;
@@ -108,6 +107,7 @@ impl Scratch {
         self.decal_order.clear();
         self.insets.clear();
         self.emitters.clear();
+        self.ribbons.clear();
         self.motion_for_draw.clear();
     }
 
@@ -186,6 +186,7 @@ impl State {
         let named = named
             .chain(frame.decals.iter().map(|decal| decal.material))
             .chain(frame.emitters.iter().map(|emitter| emitter.material))
+            .chain(frame.ribbons.iter().map(|ribbon| ribbon.material))
             .chain(frame.sprites.iter().map(|sprite| sprite.material))
             .chain(frame.fields.iter().map(|patch| patch.material))
             .chain(
@@ -551,7 +552,9 @@ impl State {
             );
         }
         let field = self.field_ids.get(catalog.material(item.material)).copied();
-        let Some((textures, normal_setting, outline_setting)) = self.dress(&material.material, field)? else {
+        let Some((textures, normal_setting, outline_setting, orm_setting, emissive_setting)) =
+            self.dress(&material.material, field)?
+        else {
             return Ok(None);
         };
         if item.views == 0 {
@@ -592,6 +595,8 @@ impl State {
         // Every path writes the material's surface: a batch's draws share its first's
         // material, or one of the same render state.
         data[SURFACE_AT..SURFACE_AT + SURFACE_FLOATS].copy_from_slice(&m.surface.vectors());
+        data[MAPS_AT..MAPS_AT + MAPS_FLOATS]
+            .copy_from_slice(&m.uv_transform.vectors(orm_setting, emissive_setting));
         // Insets preserve authored coverage, separately from scene sky alpha.
         let (pipeline, visible) = if persistent {
             let inset = item.inset().is_some();

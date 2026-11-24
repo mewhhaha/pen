@@ -15,6 +15,8 @@ pub(crate) enum BuiltIn {
     Occlusion(u32),
     /// Sky and fog over a scene of this many samples.
     Atmosphere(u32),
+    /// Screen-space diffuse global illumination bounce over the opaque scene (ssgi.rs).
+    Ssgi(u32),
     /// Temporal antialiasing, reading the depth and velocity of such a scene (taa.rs).
     Taa(u32),
     /// Bokeh depth of field, reading the depth of such a scene (dof.rs).
@@ -38,6 +40,11 @@ pub(crate) enum BuiltIn {
         samples: u32,
         additive: bool,
     },
+    /// Camera-facing ribbon trails into a scene of this many samples.
+    Ribbons {
+        samples: u32,
+        additive: bool,
+    },
     /// The nearest depth of each pixel of a scene of this many samples, for
     /// the translucent surfaces to read.
     OpaqueDepth(u32),
@@ -52,10 +59,11 @@ pub(crate) enum BuiltIn {
 
 impl BuiltIn {
     /// Every one a frame drawn with `samples` per pixel may draw with.
-    pub fn all(samples: u32) -> [BuiltIn; 16] {
+    pub fn all(samples: u32) -> [BuiltIn; 17] {
         [
             BuiltIn::Occlusion(samples),
             BuiltIn::Atmosphere(samples),
+            BuiltIn::Ssgi(samples),
             BuiltIn::Taa(samples),
             BuiltIn::Dof(samples),
             BuiltIn::MotionBlur(samples),
@@ -79,6 +87,7 @@ impl BuiltIn {
             BuiltIn::Decal { samples, paint } => crate::decals::pipeline(context, samples, paint),
             BuiltIn::Composite => crate::renderer::composite_pipeline(context),
             BuiltIn::Particles { samples, additive } => crate::renderer::particle_pipeline(context, samples, additive),
+            BuiltIn::Ribbons { samples, additive } => crate::renderer::ribbon_pipeline(context, samples, additive),
             BuiltIn::Backdrop(samples) => crate::post::backdrop_pipeline(context, samples),
             _ => crate::post::pipeline(context, self),
         };
@@ -163,6 +172,42 @@ mod tests {
             }
             let distinct: HashSet<BuiltIn> = all.into_iter().collect();
             assert_eq!(distinct.len(), all.len());
+        }
+    }
+
+    #[test]
+    fn particles_and_ribbons_pipelines_compile_cleanly() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
+        let Ok((device, _queue)) = pollster::block_on(adapter.request_device(&Default::default())) else { return };
+        let dummy_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[] });
+        let dummy_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let ctx = PipelineContext {
+            device: device.clone(),
+            layout: dummy_pl.clone(),
+            skinned_layout: dummy_pl.clone(),
+            sprite_layout: dummy_pl,
+            scene_group: dummy_layout.clone(),
+            draw_group: dummy_layout.clone(),
+            skin_group: dummy_layout.clone(),
+            lights_group: dummy_layout.clone(),
+            sprite_group: dummy_layout,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            display: crate::Display::SDR,
+            cache: crate::pipeline_cache::PipelineCache::open(&device, None),
+        };
+        for which in [
+            BuiltIn::Particles { samples: 1, additive: false },
+            BuiltIn::Particles { samples: 1, additive: true },
+            BuiltIn::Ribbons { samples: 1, additive: false },
+            BuiltIn::Ribbons { samples: 1, additive: true },
+        ] {
+            let res = pollster::block_on(crate::shader::checked(&device, || which.compile(&ctx)));
+            assert!(res.is_ok(), "{which:?} failed: {}", res.unwrap_err());
         }
     }
 }

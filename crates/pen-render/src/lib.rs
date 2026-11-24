@@ -35,6 +35,7 @@ mod shader;
 mod simplify;
 mod solids;
 mod sprites;
+mod ssgi;
 mod subsurface;
 mod surface;
 mod taa;

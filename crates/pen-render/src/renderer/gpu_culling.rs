@@ -30,8 +30,8 @@ const DRAW_WORDS: usize = 5;
 // The shader's `planes` array holds six planes for each of the views.
 const _: () = assert!(MAX_VIEWS == 24, "cull.wgsl's planes array is 6 * MAX_VIEWS");
 
-// The views uniform: four words, the camera's row, six planes a view.
-const UNIFORM_WORDS: usize = 8 + 4 * 6 * MAX_VIEWS;
+// The views uniform: header (4), camera row (4), hiz size (4), hiz vp (16), six planes a view.
+const UNIFORM_WORDS: usize = 28 + 4 * 6 * MAX_VIEWS;
 const WORKGROUP: u32 = 64;
 
 /// The compute pipeline that culls, made on the loader's threads.
@@ -132,8 +132,8 @@ pub(crate) struct GpuCulling {
     batches: Grown,
     culled: Grown,
     draws: Grown,
-    /// The bind group, and the buffers it binds.
-    group: Option<(wgpu::BindGroup, [wgpu::Buffer; 4])>,
+    /// The bind group, the buffers it binds, and the Hi-Z pyramid view ID it bound.
+    group: Option<(wgpu::BindGroup, [wgpu::Buffer; 4], u64)>,
     // This frame's batches, their draws' arguments and what they mean, the
     // instances they cull into, and the widest batch.
     batch_words: Vec<u32>,
@@ -203,6 +203,11 @@ impl GpuCulling {
     pub fn compiling(&self) -> bool {
         // A device that cannot cull on the GPU never asks.
         self.supported && self.requested && self.pipeline.is_none() && !self.failed
+    }
+
+    /// Whether the device supports GPU compute culling.
+    pub fn supported(&self) -> bool {
+        self.supported
     }
 
     /// Whether a batch of `count` instances culls on the GPU this frame.
@@ -277,17 +282,28 @@ impl GpuCulling {
     }
 
     /// Encodes the compute pass that culls this frame's batches, reading
-    /// their instances from `instances`.
-    pub fn dispatch(&mut self, encoder: &mut wgpu::CommandEncoder, timer: &GpuTimer, instances: &wgpu::Buffer) {
+    /// their instances from `instances` and testing camera visibility against `hiz`.
+    pub fn dispatch(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        timer: &GpuTimer,
+        instances: &wgpu::Buffer,
+        hiz: &super::hiz::HiZ,
+    ) {
         let Some(pipeline) = &self.pipeline else { return };
         if self.counted.is_empty() {
             return;
         }
         let device = &self.device;
+        let (hiz_view, hiz_view_id, hiz_vp, hiz_size, hiz_mips, hiz_active) = hiz.source();
         let mut uniform = Vec::with_capacity(UNIFORM_WORDS);
         let view_count = u32::try_from(self.views.count()).expect("at most MAX_VIEWS");
-        uniform.extend([view_count, self.detail.pixels.to_bits(), 0, 0]);
+        uniform.extend([view_count, self.detail.pixels.to_bits(), u32::from(hiz_active), hiz_mips]);
         uniform.extend(self.detail.row.map(f32::to_bits));
+        #[allow(clippy::cast_precision_loss, reason = "screen dimensions in pixels")]
+        let (hw, hh) = (hiz_size.0.max(1) as f32, hiz_size.1.max(1) as f32);
+        uniform.extend([hw, hh, 1.0 / hw, 1.0 / hh].map(f32::to_bits));
+        uniform.extend(hiz_vp.map(f32::to_bits));
         uniform.extend(self.views.planes().flatten().map(|lane| lane.to_bits()));
         uniform.resize(UNIFORM_WORDS, 0);
         self.queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&uniform));
@@ -301,7 +317,7 @@ impl GpuCulling {
         let limit = device.limits().max_storage_buffer_binding_size;
         let inputs = wgpu::BufferSize::new(instances.size().min(limit / INSTANCE_BYTES * INSTANCE_BYTES));
         let bound = [batches, instances.clone(), culled, draws];
-        if self.group.as_ref().is_none_or(|(_, buffers)| *buffers != bound) {
+        if self.group.as_ref().is_none_or(|(_, buffers, view_id)| *buffers != bound || *view_id != hiz_view_id) {
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("cull"),
                 layout: &pipeline.get_bind_group_layout(0),
@@ -318,9 +334,10 @@ impl GpuCulling {
                     },
                     wgpu::BindGroupEntry { binding: 3, resource: bound[2].as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: bound[3].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(hiz_view) },
                 ],
             });
-            self.group = Some((group, bound));
+            self.group = Some((group, bound, hiz_view_id));
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("cull"),

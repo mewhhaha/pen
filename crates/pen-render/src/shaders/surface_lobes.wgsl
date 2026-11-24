@@ -589,3 +589,31 @@ fn standard_sun(s: StandardSurface, sun_dir: vec3f, sun_color: vec3f, visibility
   let response = surface_light(s, -normalize(sun_dir), sun_color * visibility);
   return response.diffuse * s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0)) + response.specular;
 }
+
+// Screen-door 4x4 Bayer dither predicate for smooth LOD crossfading without
+// transparency sorting (returns true when the fragment should be discarded).
+// Pass `fade` in (0, 1] for the outgoing LOD and `-fade` in [-1, 0) for the
+// incoming LOD so both halves cover complementary pixel masks with zero holes
+// and zero double-drawn pixels. `fade >= 1.0` never discards; `fade == 0.0` or
+// `fade <= -1.0` always discards.
+fn surface_lod_dither(pixel: vec2f, fade: f32) -> bool {
+  if (fade >= 1.0) {
+    return false;
+  }
+  if (fade == 0.0 || fade <= -1.0) {
+    return true;
+  }
+  let p = vec2u(floor(max(pixel, vec2f(0.0)))) & vec2u(3u, 3u);
+  let idx = p.y * 4u + p.x;
+  let bayer = array<f32, 16>(
+     0.0,  8.0,  2.0, 10.0,
+    12.0,  4.0, 14.0,  6.0,
+     3.0, 11.0,  1.0,  9.0,
+    15.0,  7.0, 13.0,  5.0,
+  );
+  let threshold = (bayer[idx] + 0.5) / 16.0;
+  if (fade > 0.0) {
+    return threshold >= fade;
+  }
+  return threshold < (-fade);
+}

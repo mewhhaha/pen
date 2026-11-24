@@ -115,6 +115,34 @@ impl Detail {
         let per_unit = self.pixels * stretch / nearest;
         (1..errors.len()).rev().find(|&level| errors[level] * per_unit <= 1.0).unwrap_or(0)
     }
+
+    /// Picks a primary LOD plus an optional crossfade partner `(coarser_lod, fade)`
+    /// across a transition band `band` in `(0, 1)` around the 1-pixel error threshold,
+    /// matching Ink's `render/streaming::lod_crossfade` screen-door dither convention:
+    /// `fade` in `(0, 1)` is the finer LOD's share (outgoing) and `-fade` is the
+    /// coarser LOD's complementary share (incoming).
+    #[allow(dead_code, reason = "tested and available for CPU LOD crossfade drawers")]
+    pub fn crossfade(&self, placed: &Sphere, stretch: f32, errors: &[f32], band: f32) -> (usize, Option<(usize, f32)>) {
+        let level = self.level(placed, stretch, errors);
+        if self.pixels <= 0.0 || errors.len() < 2 || band <= 0.0 || level + 1 >= errors.len() {
+            return (level, None);
+        }
+        let [a, b, c, d] = self.row;
+        let [x, y, z] = placed.center;
+        let reach = (a * a + b * b + c * c).sqrt();
+        let nearest = (a * x + b * y + c * z + d - placed.radius * reach).max(1e-4);
+        let per_unit = self.pixels * stretch / nearest;
+        let next_error = errors[level + 1] * per_unit;
+        let width = band.clamp(1e-4, 0.99);
+        let upper = 1.0 + width;
+        if next_error > 1.0 && next_error < upper {
+            // Smoothstep fade of the finer LOD from 1 (at `upper`) down to 0 (at `1.0`).
+            let t = ((next_error - 1.0) / width).clamp(0.0, 1.0);
+            let fade = t * t * (3.0 - 2.0 * t);
+            return (level, Some((level + 1, fade)));
+        }
+        (level, None)
+    }
 }
 
 /// The planes bounding a view's clip volume (WebGPU's: x and y within -w..w,
@@ -297,6 +325,15 @@ mod tests {
         assert_eq!(detail.level(&at(0.0), 1.0, &errors), 0);
         assert_eq!(detail.level(&at(-100.0), 1.0, &errors[..1]), 0);
         assert_eq!(Detail::default().level(&at(-100.0), 1.0, &errors), 0);
+        // Crossfade activates inside the transition band above the 1-pixel error threshold.
+        // At w = 3.0 (z = -4.0), error[1] = 0.01 spans 320 * 0.01 / 3 = 1.0667 px, inside band 0.25.
+        let (primary, partner) = detail.crossfade(&at(-4.0), 1.0, &errors, 0.25);
+        assert_eq!(primary, 0);
+        let (next, fade) = partner.expect("inside LOD 0 -> 1 crossfade band");
+        assert_eq!(next, 1);
+        assert!(fade > 0.0 && fade < 1.0, "fade={fade}");
+        // Far outside the band (z = -3.0, error = 1.6 px): no crossfade partner.
+        assert_eq!(detail.crossfade(&at(-3.0), 1.0, &errors, 0.25), (0, None));
     }
 
     #[test]

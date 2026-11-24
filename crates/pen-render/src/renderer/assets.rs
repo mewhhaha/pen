@@ -262,24 +262,12 @@ impl State {
                     // Not published until its allocation and upload have
                     // passed the error scopes (at once natively).
                     Ok(Some((asset, Some(mut check)))) => match shader::settled(&mut check) {
-                        Some(Ok(())) => {
-                            let previous = self.assets.finish(slot, revision, early, Ok(asset), now);
-                            self.retire(previous);
-                        }
-                        Some(Err(message)) => {
-                            let previous = self.assets.finish(slot, revision, early, Err(message), now);
-                            self.retire(previous);
-                        }
+                        Some(Ok(())) => self.finish_asset(slot, revision, early, Ok(asset), now),
+                        Some(Err(message)) => self.finish_asset(slot, revision, early, Err(message), now),
                         None => self.checking.push(Checking { slot, revision, early, asset, check }),
                     },
-                    Ok(Some((asset, None))) => {
-                        let previous = self.assets.finish(slot, revision, early, Ok(asset), now);
-                        self.retire(previous);
-                    }
-                    Err(message) => {
-                        let previous = self.assets.finish(slot, revision, early, Err(message), now);
-                        self.retire(previous);
-                    }
+                    Ok(Some((asset, None))) => self.finish_asset(slot, revision, early, Ok(asset), now),
+                    Err(message) => self.finish_asset(slot, revision, early, Err(message), now),
                 }
             }
             Message::Sorted { key, sprite } => {
@@ -364,8 +352,7 @@ impl State {
                 Some(message) => Err(message),
                 None => Ok(GpuAsset::Shader(shader)),
             };
-            let previous = self.assets.finish(slot, revision, early, published, now);
-            self.retire(previous);
+            self.finish_asset(slot, revision, early, published, now);
         }
     }
 
@@ -382,8 +369,7 @@ impl State {
                 continue;
             };
             let Checking { slot, revision, early, asset, .. } = self.checking.swap_remove(index);
-            let previous = self.assets.finish(slot, revision, early, result.map(|()| asset), now);
-            self.retire(previous);
+            self.finish_asset(slot, revision, early, result.map(|()| asset), now);
         }
         self.receive_levels(now);
         // The scene's assets are in: the rest of the catalog may come.
@@ -671,8 +657,7 @@ impl State {
             let pending = self.pending.swap_remove(index);
             match outcome {
                 Err(message) => {
-                    let previous = self.assets.finish(pending.slot, pending.revision, pending.early, Err(message), now);
-                    self.retire(previous);
+                    self.finish_asset(pending.slot, pending.revision, pending.early, Err(message), now);
                 }
                 Ok(()) => {
                     let (view, linear) = texture_views(&pending.texture, pending.finest);
@@ -687,14 +672,13 @@ impl State {
                         stream: Some(pending.levels),
                     };
                     let current = self.assets.slots[pending.slot].revision == pending.revision;
-                    let previous = self.assets.finish(
+                    self.finish_asset(
                         pending.slot,
                         pending.revision,
                         pending.early,
                         Ok(GpuAsset::Texture(asset)),
                         now,
                     );
-                    self.retire(previous);
                     // The rest, in the background: each finer level joins the
                     // views and fades in. (A revision it replaced may still be
                     // listed; its stream went with it.)
@@ -762,6 +746,63 @@ impl State {
                 index += 1;
             }
         }
+    }
+
+    /// Publishes an asset load into `assets`, updates its tracked GPU footprint and
+    /// last-used frame, and retires any previous asset it replaced.
+    pub(super) fn finish_asset(
+        &mut self,
+        slot: usize,
+        revision: u64,
+        early: bool,
+        prepared: Result<GpuAsset, String>,
+        now: f64,
+    ) {
+        let bytes = prepared.as_ref().map_or(0, GpuAsset::gpu_bytes);
+        let accepted = prepared.is_ok() && self.assets.slots[slot].revision == revision;
+        let previous = self.assets.finish(slot, revision, early, prepared, now);
+        if accepted {
+            self.assets.set_gpu_bytes(slot, bytes);
+            self.assets.touch(slot, self.frames);
+        }
+        self.retire(previous);
+    }
+
+    /// Evicts idle resident meshes and textures that have gone unused for at least
+    /// `max_age_frames`, oldest first (largest first on ties), until resident GPU
+    /// memory is at or below `target_bytes`. Evicted slots reload transparently on
+    /// next draw.
+    pub fn evict_unused(&mut self, max_age_frames: u64, target_bytes: u64) -> usize {
+        if self.assets.total_gpu_bytes() <= target_bytes {
+            return 0;
+        }
+        let mut candidates: Vec<(usize, u64, u64)> = self
+            .assets
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|&(id, slot)| {
+                matches!(slot.kind, AssetKind::Mesh | AssetKind::Texture)
+                    && self.assets.can_evict(id)
+                    && self.frames.saturating_sub(slot.last_used) >= max_age_frames
+            })
+            .map(|(id, slot)| (id, slot.last_used, slot.gpu_bytes))
+            .collect();
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)));
+        let mut evicted = 0;
+        for (id, _, _) in candidates {
+            if self.assets.total_gpu_bytes() <= target_bytes {
+                break;
+            }
+            if let Some(previous) = self.assets.evict_slot(id) {
+                self.streaming.retain(|&s| s != id);
+                self.fading.retain(|&s| s != id);
+                self.scene.retain(|&s| s != id);
+                self.retire(Some(previous));
+                evicted += 1;
+            }
+        }
+        evicted
     }
 
     /// Lets go of what depended on an asset a new revision replaced. Shader,

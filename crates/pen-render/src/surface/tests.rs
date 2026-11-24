@@ -1148,3 +1148,38 @@ fn the_sky_lookup_of_an_anisotropic_surface_bends_toward_the_view_across_the_gra
     }
     assert!(moved > 0.1, "the lookups bend by up to {moved}: the test would see them");
 }
+
+#[test]
+fn lod_crossfade_dither_covers_expected_fractions_with_exact_complements() {
+    let Some(gpu) = gpu() else { return };
+    // Run every pixel of a 4x4 Bayer tile for multiple positive/negative fades.
+    let fades = [0.0f32, 0.25, 0.5, 0.75, 1.0, -0.25, -0.5, -0.75, -1.0];
+    let mut input = Vec::new();
+    for &fade in &fades {
+        for y in 0..4 {
+            for x in 0..4 {
+                input.extend([x as f32, y as f32, fade]);
+            }
+        }
+    }
+    let body = "put(i, 0u, select(0.0, 1.0, surface_lod_dither(vec2f(arg(i, 0u), arg(i, 1u)), arg(i, 2u))));";
+    let got = scalars(&gpu, body, &input, 3, 1);
+    let tile = |idx: usize| -> Vec<bool> {
+        got[idx * 16..(idx + 1) * 16].iter().map(|&v| v > 0.5).collect()
+    };
+    let kept = |discards: &[bool]| discards.iter().filter(|&&d| !d).count();
+    assert_eq!(kept(&tile(0)), 0, "fade 0.0 discards all 16 pixels");
+    assert_eq!(kept(&tile(1)), 4, "fade 0.25 keeps 4/16 pixels");
+    assert_eq!(kept(&tile(2)), 8, "fade 0.50 keeps 8/16 pixels");
+    assert_eq!(kept(&tile(3)), 12, "fade 0.75 keeps 12/16 pixels");
+    assert_eq!(kept(&tile(4)), 16, "fade 1.0 keeps all 16 pixels");
+    assert_eq!(kept(&tile(8)), 0, "fade -1.0 discards all 16 pixels");
+    // Outgoing (+fade) and incoming (-fade) must be exact per-pixel complements.
+    for (pos, neg) in [(1, 5), (2, 6), (3, 7)] {
+        let a = tile(pos);
+        let b = tile(neg);
+        for pixel in 0..16 {
+            assert_ne!(a[pixel], b[pixel], "fade pair ({pos}, {neg}) pixel {pixel} must complement");
+        }
+    }
+}

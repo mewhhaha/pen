@@ -39,6 +39,7 @@ impl State {
     /// frame waits on it.
     pub(super) fn resolve(&mut self, kind: AssetKind, key: &str) -> Result<usize> {
         let slot = self.assets.get(kind, key)?;
+        self.assets.touch(slot, self.frames);
         if self.assets.current(slot).is_none() && self.assets.loading(slot) {
             self.waiting = true;
         }

@@ -934,6 +934,10 @@ pub(crate) struct Slot<T> {
     loading: u32,
     /// Its last load failed, and it has nothing to show.
     failed: bool,
+    /// Frame number on which this slot was last resolved or published.
+    pub last_used: u64,
+    /// Estimated GPU memory footprint (bytes) of `current`.
+    pub gpu_bytes: u64,
 }
 
 /// The assets by kind and key; each slot's index is its ID, which stays.
@@ -977,6 +981,8 @@ impl<T> AssetStore<T> {
             queued: false,
             loading: 0,
             failed: false,
+            last_used: 0,
+            gpu_bytes: 0,
         });
         self.ids[kind as usize].insert(key.to_owned(), id);
         Ok(id)
@@ -1025,6 +1031,41 @@ impl<T> AssetStore<T> {
 
     pub fn current_mut(&mut self, id: usize) -> Option<&mut T> {
         self.slots[id].current.as_mut()
+    }
+
+    /// Records that slot `id` was used on `frame`.
+    pub fn touch(&mut self, id: usize, frame: u64) {
+        self.slots[id].last_used = frame;
+    }
+
+    /// Updates the GPU memory footprint tracked for slot `id`.
+    pub fn set_gpu_bytes(&mut self, id: usize, bytes: u64) {
+        self.slots[id].gpu_bytes = bytes;
+    }
+
+    /// Total GPU bytes across all resident slots.
+    pub fn total_gpu_bytes(&self) -> u64 {
+        self.slots.iter().filter(|slot| slot.current.is_some()).map(|slot| slot.gpu_bytes).sum()
+    }
+
+    /// Whether slot `id` has a resident asset and no in-flight or queued load.
+    pub fn can_evict(&self, id: usize) -> bool {
+        let slot = &self.slots[id];
+        slot.current.is_some() && slot.loading == 0 && !slot.queued
+    }
+
+    /// Evicts slot `id` if idle, returning its GPU asset to retire and resetting
+    /// the slot so future `get` calls transparently reload it on demand.
+    #[must_use]
+    pub fn evict_slot(&mut self, id: usize) -> Option<T> {
+        if !self.can_evict(id) {
+            return None;
+        }
+        let slot = &mut self.slots[id];
+        slot.revision = 0;
+        slot.failed = false;
+        slot.gpu_bytes = 0;
+        slot.current.take()
     }
 
     /// Loads the asset ahead of need, behind anything asked for with `get`.

@@ -18,6 +18,7 @@ mod fields;
 mod frame;
 mod gpu_culling;
 mod grading;
+mod hiz;
 mod insets;
 mod inspect;
 mod instance_upload;
@@ -205,6 +206,44 @@ pub(crate) enum GpuAsset {
     Shader(ShaderAsset),
     SpriteShader(wgpu::RenderPipeline),
     Texture(TextureAsset),
+}
+
+impl MeshAsset {
+    pub(crate) fn gpu_bytes(&self) -> u64 {
+        self.vertices.size()
+            + self.indices.size()
+            + self.tangents.as_ref().map_or(0, wgpu::Buffer::size)
+            + self.skin.as_ref().map_or(0, |s| s.vertices.size())
+            + self.morphs.as_ref().map_or(0, |m| m.deltas.size())
+            + self.instances.as_ref().map_or(0, |i| i.buffer.size())
+    }
+}
+
+impl TextureAsset {
+    pub(crate) fn gpu_bytes(&self) -> u64 {
+        let format = self.texture.format();
+        let (bw, bh) = format.block_dimensions();
+        let block_bytes = u64::from(format.block_copy_size(None).unwrap_or(4));
+        let mut w = self.texture.width().max(1);
+        let mut h = self.texture.height().max(1);
+        let mut total = 0u64;
+        for _ in 0..self.texture.mip_level_count().max(1) {
+            total += u64::from(w.div_ceil(bw)) * u64::from(h.div_ceil(bh)) * block_bytes;
+            w = (w / 2).max(1);
+            h = (h / 2).max(1);
+        }
+        total * u64::from(self.texture.depth_or_array_layers().max(1))
+    }
+}
+
+impl GpuAsset {
+    pub(crate) fn gpu_bytes(&self) -> u64 {
+        match self {
+            GpuAsset::Mesh(mesh) => mesh.gpu_bytes(),
+            GpuAsset::Texture(texture) => texture.gpu_bytes(),
+            GpuAsset::Material(_) | GpuAsset::Shader(_) | GpuAsset::SpriteShader(_) => 0,
+        }
+    }
 }
 
 /// An asset made on this thread, published once its error scopes come back
@@ -700,8 +739,11 @@ pub(crate) struct State {
     // whether the host wants them.
     timer: timing::GpuTimer,
     timing: bool,
-    // Instances of large batches culled on the GPU.
+    // Instances of large batches culled on the GPU, plus prior-frame Hi-Z occlusion pyramid.
     culling: GpuCulling,
+    hiz: hiz::HiZ,
+    /// Optional byte budget for resident meshes and textures (LRU-evicted after submit).
+    asset_budget: Option<u64>,
     // The share of the frame's render scale drawn at, to hold a frame budget.
     resolution: resolution::Resolution,
     // Samplers by how many levels off the finest they keep, in quarters.
@@ -1075,6 +1117,8 @@ impl State {
             timer: timing::GpuTimer::new(&device, &queue),
             timing: false,
             culling: GpuCulling::new(&device, &queue),
+            hiz: hiz::HiZ::new(&device, &queue),
+            asset_budget: None,
             resolution: resolution::Resolution::new(),
             samplers: HashMap::new(),
             white,
@@ -1132,6 +1176,18 @@ impl State {
 
     pub fn gpu_culling(&mut self, from: Option<u32>) {
         self.culling.from = from;
+    }
+
+    pub fn occlusion_culling(&mut self, enabled: bool) {
+        self.hiz.set_enabled(enabled);
+    }
+
+    pub fn gpu_asset_bytes(&self) -> u64 {
+        self.assets.total_gpu_bytes()
+    }
+
+    pub fn set_asset_budget(&mut self, bytes: Option<u64>) {
+        self.asset_budget = bytes;
     }
 
     pub fn frame_budget(&mut self, milliseconds: Option<f32>) {

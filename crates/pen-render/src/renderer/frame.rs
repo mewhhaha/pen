@@ -379,6 +379,10 @@ impl State {
         );
         if targets.targets_recreated {
             self.velocity.reset_target();
+            self.hiz.reset_target();
+        }
+        if frame.exposure.cut {
+            self.hiz.invalidate();
         }
         // With TAA the scene draws through a projection jittered within its
         // pixels: the scene uniform's, after its view.
@@ -412,7 +416,7 @@ impl State {
         self.timer.begin(self.timing || self.resolution.budgeted());
         // Evaluate morph targets and cull instanced batches on the GPU before any pass draws them.
         self.morphing.dispatch(&device, &mut encoder, &self.assets);
-        self.culling.dispatch(&mut encoder, &self.timer, &self.instance_buffer);
+        self.culling.dispatch(&mut encoder, &self.timer, &self.instance_buffer, &self.hiz);
         let redraw = if shadowed {
             let signatures = self.local_signatures(frame, scratch);
             self.plan_local_shadows(&signatures, &mut stats)
@@ -563,6 +567,20 @@ impl State {
                 ..Default::default()
             });
             draw_layers(&mut first, scene_group, &[(&scratch.opaque, Layer::Opaque)], &mut stats);
+        }
+        if self.hiz.enabled() && self.culling.supported() && self.culling.from.is_some() {
+            let active_proj = jittered.unwrap_or(frame.projection);
+            let active_vp = crate::matrix::multiply(&active_proj, &frame.view);
+            self.hiz.build(
+                &device,
+                &mut encoder,
+                &targets.depth_only,
+                targets.size,
+                samples,
+                active_vp,
+                self.context.cache.get(),
+                &self.timer,
+            );
         }
         if layered {
             let decals = self.decals.get_or_insert_with(|| Decals::new(&device));
@@ -755,6 +773,11 @@ impl State {
         self.culling.submitted();
         self.resolution.submitted(&self.queue, self.timer.timed());
         target.present();
+        if let Some(budget) = self.asset_budget
+            && self.gpu_asset_bytes() > budget
+        {
+            let _ = self.evict_unused(2, budget);
+        }
         // Once background compiles end, what they added to the pipeline
         // cache is written, in the background too.
         if self.frames.is_multiple_of(30) {

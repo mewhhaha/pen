@@ -340,6 +340,31 @@ impl Renderer {
         self.state.gpu_culling(from);
     }
 
+    /// Enables or disables prior-frame Hi-Z occlusion culling inside the GPU
+    /// culling pass (enabled by default).
+    pub fn occlusion_culling(&mut self, enabled: bool) {
+        self.state.occlusion_culling(enabled);
+    }
+
+    /// Total GPU memory (bytes) currently held by resident meshes and textures.
+    pub fn gpu_asset_bytes(&self) -> u64 {
+        self.state.gpu_asset_bytes()
+    }
+
+    /// Sets an optional byte budget for resident meshes and textures. When set,
+    /// frames that exceed the budget automatically LRU-evict idle meshes and
+    /// textures unused for at least 2 frames; evicted assets reload on demand.
+    pub fn set_asset_budget(&mut self, bytes: Option<u64>) {
+        self.state.set_asset_budget(bytes);
+    }
+
+    /// Explicitly evicts idle resident meshes and textures unused for at least
+    /// `max_age_frames`, oldest first, until resident GPU memory is at or below
+    /// `target_bytes`. Returns the number of evicted assets.
+    pub fn evict_unused(&mut self, max_age_frames: u64, target_bytes: u64) -> usize {
+        self.state.evict_unused(max_age_frames, target_bytes)
+    }
+
     /// Times the GPU's passes (`RenderStats::gpu`), where the device has
     /// timestamps (`optional_features`). Off by default: timestamps between
     /// passes keep the GPU from overlapping them.

@@ -5,14 +5,17 @@
 //! that stream in on loader threads. Natively and in the browser (WebGPU)
 //! alike. See ARCHITECTURE.md for how it works.
 pub mod animation;
+pub mod area_lights;
 mod asset_store;
+pub mod atmosphere_lut;
 mod built_in;
 mod compressed;
 mod culling;
-mod decals;
+pub mod decals;
 mod display;
 mod dof;
 mod environment;
+pub mod environment_passes;
 mod exposure;
 mod filter;
 mod grade;
@@ -48,9 +51,16 @@ mod volume;
 
 use pen_protocol::{Catalog, GameEvent, RenderFrame};
 
+pub use area_lights::{AREA_LIGHTS_WGSL, AreaLight, AreaLightKind, AreaLightResources, LTC_LUT_SIZE, generate_ltc_luts};
 pub use asset_store::{mesh_bounds, pack_mesh, validate_asset_key};
+pub use atmosphere_lut::{ATMOSPHERE_LUT_WGSL, AtmosphereParams, CLOUDS_WGSL, PhysicalAtmosphere};
+pub use decals::{PBR_DECAL_WGSL, PbrDecal, PbrDecalPass, PbrDecalView};
 pub use display::{DEFAULT_HEADROOM, Display, REFERENCE_WHITE_NITS, choose_surface};
 pub use environment::ENVIRONMENT_WGSL;
+pub use environment_passes::{
+    FOLIAGE_WGSL, FoliageInstance, FoliagePipeline, FoliageUniform, PipelineTarget, TERRAIN_WGSL, TerrainHeightmap,
+    TerrainPatch, TerrainPipeline, TerrainUniform, WATER_WGSL, WaterPipeline, WaterUniform,
+};
 pub use filter::ColorFilter;
 pub use inspect::{TextureInfo, inspect_material, inspect_mesh, inspect_texture, shader_draws_sprites};
 pub use lights::LIGHTS_WGSL;

@@ -77,10 +77,8 @@ pub(crate) struct Mesh {
     /// Blendshape / morph target vertex deltas (position + normal per target per vertex).
     pub morphs: Option<MorphTargets>,
     /// Optional secondary UV set (`TEXCOORD_1`) retained from mesh JSON.
-    #[allow(dead_code)]
     pub uvs1: Option<Vec<[f32; 2]>>,
     /// Optional per-vertex linear RGBA colors (`COLOR_0`) retained from mesh JSON.
-    #[allow(dead_code)]
     pub colors: Option<Vec<[f32; 4]>>,
 }
 
@@ -205,6 +203,17 @@ pub(crate) struct Surface {
     pub thickness_texture: Option<String>,
     pub specular_texture: Option<String>,
     pub specular_color_texture: Option<String>,
+    /// KHR_materials_iridescence thin-film interference parameters.
+    pub iridescence: f32,
+    pub iridescence_ior: f32,
+    pub iridescence_thickness_min: f32,
+    pub iridescence_thickness_max: f32,
+    pub iridescence_texture: Option<String>,
+    /// KHR_materials_dispersion chromatic aberration dispersion (Abbe number reciprocal).
+    pub dispersion: f32,
+    /// Optional baked lightmap irradiance texture (sampled with `TEXCOORD_1`) and directional/shadowmask map.
+    pub lightmap_texture: Option<String>,
+    pub lightmap_dir_texture: Option<String>,
 }
 
 impl Default for Surface {
@@ -234,6 +243,14 @@ impl Default for Surface {
             thickness_texture: None,
             specular_texture: None,
             specular_color_texture: None,
+            iridescence: 0.0,
+            iridescence_ior: 1.3,
+            iridescence_thickness_min: 100.0,
+            iridescence_thickness_max: 400.0,
+            iridescence_texture: None,
+            dispersion: 0.0,
+            lightmap_texture: None,
+            lightmap_dir_texture: None,
         }
     }
 }
@@ -343,7 +360,7 @@ impl Surface {
     /// The block of a material's JSON: every key optional, the rest as
     /// `Surface::default()`, and none but these.
     fn parse(value: Option<&Value>) -> Result<Surface> {
-        const KEYS: [&str; 24] = [
+        const KEYS: [&str; 32] = [
             "clearcoat",
             "clearcoatRoughness",
             "clearcoatTexture",
@@ -368,6 +385,14 @@ impl Surface {
             "specularTexture",
             "specularColorTexture",
             "emissiveStrength",
+            "iridescence",
+            "iridescenceIor",
+            "iridescenceThicknessMin",
+            "iridescenceThicknessMax",
+            "iridescenceTexture",
+            "dispersion",
+            "lightmapTexture",
+            "lightmapDirTexture",
         ];
         let block = match value {
             None | Some(Value::Null) => return Ok(Surface::default()),
@@ -446,6 +471,14 @@ impl Surface {
             thickness_texture: tex_key("thicknessTexture")?,
             specular_texture: tex_key("specularTexture")?,
             specular_color_texture: tex_key("specularColorTexture")?,
+            iridescence: number("iridescence", defaults.iridescence, 0.0, 1.0)?,
+            iridescence_ior: number("iridescenceIor", defaults.iridescence_ior, 1.0, float32)?,
+            iridescence_thickness_min: number("iridescenceThicknessMin", defaults.iridescence_thickness_min, 0.0, float32)?,
+            iridescence_thickness_max: number("iridescenceThicknessMax", defaults.iridescence_thickness_max, 0.0, float32)?,
+            iridescence_texture: tex_key("iridescenceTexture")?,
+            dispersion: number("dispersion", defaults.dispersion, 0.0, float32)?,
+            lightmap_texture: tex_key("lightmapTexture")?,
+            lightmap_dir_texture: tex_key("lightmapDirTexture")?,
         })
     }
 }

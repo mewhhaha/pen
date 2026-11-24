@@ -886,6 +886,7 @@ impl State {
                 .expect("MAX_SOLIDS and MAX_SOLID_FACES keep solids' vertices below 2^32");
             // Solids have no tangents: they read the zeros.
             self.ensure_zero_tangents(count as usize);
+            self.ensure_default_extra_attrs(count as usize);
             // A buffer from before is written again if the batch fits it.
             let buffer = match old.next() {
                 Some(mesh) if mesh.buffer.size() >= bytes.len() as u64 => {

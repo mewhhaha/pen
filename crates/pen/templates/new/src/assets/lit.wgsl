@@ -51,7 +51,6 @@ struct Draw {
 @group(1) @binding(1) var base_texture: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
 @group(1) @binding(4) var layer_texture: texture_2d<f32>;
-@group(1) @binding(5) var orm_texture: texture_2d<f32>;
 // BEGIN shadows
 // The sun's shadows for a material shader: its cascaded maps, filtered, and
 // the screen-space contact shadows that catch what the maps are too coarse
@@ -1963,8 +1962,10 @@ const LOBES: u32 = 0u;
   let seen = scene.view * vec4f(surface.world, 1.0);
   let uv = surface_transform_uv(surface.uv, draw.uv_transform, draw.maps.xy);
   let base_sample = textureSample(base_texture, base_sampler, uv);
-  let orm_sample = textureSample(orm_texture, base_sampler, uv);
-  let emissive_sample = textureSample(layer_texture, base_sampler, uv).rgb;
+  let is_atlas = draw.settings.w > 4.5;
+  let direct_layer = textureSample(layer_texture, base_sampler, uv);
+  let orm_sample = select(direct_layer, surface_read_atlas(layer_texture, base_sampler, 0u, uv, false), is_atlas);
+  let emissive_sample = select(direct_layer.rgb, surface_read_atlas(layer_texture, base_sampler, 1u, uv, false).rgb, is_atlas);
   // The material's parameters are metallic (x) and roughness (y, 0.5 if it gives none).
   let roughness = select(draw.parameters.y, 0.5, draw.parameters.y <= 0.0);
   var s = surface_default(

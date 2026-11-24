@@ -52,7 +52,6 @@ struct Draw {
 @group(1) @binding(1) var base: texture_2d<f32>;
 @group(1) @binding(2) var base_sampler: sampler;
 @group(1) @binding(4) var layer_tex: texture_2d<f32>;
-@group(1) @binding(5) var orm_tex: texture_2d<f32>;
 
 struct Out {
   @builtin(position) position: vec4f,
@@ -70,15 +69,26 @@ struct Out {
   return out;
 }
 
+fn sample_atlas_tile(tex: texture_2d<f32>, samp: sampler, tile: u32, uv: vec2f) -> vec4f {
+  let dims = vec2f(textureDimensions(tex, 0));
+  let cell = dims / vec2f(4.0, 3.0);
+  let col = f32(tile % 4u);
+  let row = f32(tile / 4u);
+  let auv = (vec2f(col, row) * cell + vec2f(1.0) + fract(uv) * (cell - vec2f(2.0))) / dims;
+  return textureSampleLevel(tex, samp, auv, 0.0);
+}
+
 @fragment fn fragment(input: Out) -> @location(0) vec4f {
   let s = input.uv * draw.uv_transform.zw;
   let uv = vec2f(s.x * draw.maps.x + s.y * draw.maps.y, -s.x * draw.maps.y + s.y * draw.maps.x) + draw.uv_transform.xy;
   let base_rgb = textureSample(base, base_sampler, uv).rgb;
-  let orm = textureSample(orm_tex, base_sampler, uv);
+  let is_atlas = draw.settings.w > 4.5;
+  let orm = select(textureSample(layer_tex, base_sampler, uv), sample_atlas_tile(layer_tex, base_sampler, 0u, uv), is_atlas);
   let ao = select(1.0, orm.r, draw.maps.z > 0.5);
   var rgb = draw.color.rgb * base_rgb * ao;
   if (draw.maps.w > 0.5) {
-    rgb += textureSample(layer_tex, base_sampler, uv).rgb * draw.surface[4].w;
+    let em = select(textureSample(layer_tex, base_sampler, uv).rgb, sample_atlas_tile(layer_tex, base_sampler, 1u, uv).rgb, is_atlas);
+    rgb += em * draw.surface[4].w;
   }
   return vec4f(rgb, draw.color.a);
 }

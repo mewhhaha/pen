@@ -76,6 +76,8 @@ pub(crate) struct Environment {
     stale: bool,
     table_drawn: bool,
     pipelines: Option<Pipelines>,
+    /// Optional real HDRI prefiltered specular cubemap + L2 SH diffuse override.
+    hdri: Option<crate::hdri::HdriCubemap>,
 }
 
 struct Pipelines {
@@ -261,7 +263,40 @@ impl Environment {
             stale: false,
             table_drawn: false,
             pipelines: None,
+            hdri: None,
         }
+    }
+
+    /// Installs a prefiltered HDRI cubemap + L2 SH irradiance override for scene IBL.
+    pub fn set_hdri(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        image: &crate::hdri::HdriImage,
+        intensity: f32,
+        rotation_rad: f32,
+    ) -> anyhow::Result<[Vector; 9]> {
+        let cube = crate::hdri::HdriPrefilterer::build_for_environment(
+            device,
+            queue,
+            &self.cache,
+            image,
+            intensity,
+            rotation_rad,
+        )?;
+        let sh = cube.sh_l2;
+        self.hdri = Some(cube);
+        Ok(sh)
+    }
+
+    /// Clears any HDRI override, returning to the procedural 3-color gradient sky cubemap.
+    pub fn clear_hdri(&mut self) {
+        self.hdri = None;
+    }
+
+    /// Active sky cubemap view (HDRI if installed, otherwise procedural gradient sky).
+    pub fn active_cube_view(&self) -> &wgpu::TextureView {
+        self.hdri.as_ref().map_or(&self.cube_view, |h| &h.view)
     }
 
     /// The bindings 4 to 8, 10 and 11 of a scene group, with `light` as the
@@ -277,7 +312,7 @@ impl Environment {
         table: &'a wgpu::Buffer,
     ) -> [wgpu::BindGroupEntry<'a>; 7] {
         [
-            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.cube_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(self.active_cube_view()) },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.table_view) },
             wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             wgpu::BindGroupEntry { binding: 7, resource: light.as_entire_binding() },
@@ -352,9 +387,25 @@ impl Environment {
 
     /// Writes the sky's light, and notes whether the cube must be drawn again.
     pub fn set_sky(&mut self, queue: &wgpu::Queue, sky: &Sky, ambient: &Vector, volume: &ProbeVolume, probes: bool) {
-        let floats = sky_floats(sky, ambient, volume, probes);
+        let mut floats = if let Some(hdri) = &self.hdri {
+            let tint = Vector { x: 1.0, y: 1.0, z: 1.0 };
+            let mut f = light_floats(&hdri.sh_l2, &tint, true);
+            f[40] = (hdri.mip_levels.saturating_sub(1)) as f32;
+            if probes {
+                f[44..48].copy_from_slice(&[volume.origin.x, volume.origin.y, volume.origin.z, volume.spacing]);
+                f[48..52].copy_from_slice(&[volume.nx as f32, volume.ny as f32, volume.nz as f32, 1.0]);
+            }
+            f
+        } else {
+            sky_floats(sky, ambient, volume, probes)
+        };
+        let _ = &mut floats;
         queue.write_buffer(&self.light, 0, bytemuck::cast_slice(&floats));
         queue.write_buffer(&self.capture_light, 0, bytemuck::cast_slice(&floats));
+        if self.hdri.is_some() {
+            self.stale = false;
+            return;
+        }
         let wanted = key(sky);
         if self.drawn != Some(wanted) {
             self.drawn = Some(wanted);

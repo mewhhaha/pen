@@ -53,9 +53,11 @@ impl Drawing<'_> {
                     return false;
                 };
                 // A posed draw: its joints and weights, and its joint matrices.
+                let mut has_slot2 = false;
                 if let (Some(at), Some(skin), Some(group)) = (entry.skin, &mesh.skin, self.skin) {
                     pass.set_vertex_buffer(2, skin.vertices.slice(..));
                     pass.set_bind_group(3, group, &[at]);
+                    has_slot2 = true;
                 }
                 let lod = mesh.lods.get(usize::from(item.lod)).unwrap_or(&mesh.lods[0]);
                 if let (Some((start, end)), Some(morphed)) = (entry.morph, self.morphed) {
@@ -67,10 +69,12 @@ impl Drawing<'_> {
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 let count = if let Some(instances) = &mesh.instances {
                     pass.set_vertex_buffer(2, instances.buffer.slice(..));
+                    has_slot2 = true;
                     instances.count
                 } else {
                     1
                 };
+                pass.set_vertex_buffer(if has_slot2 { 3 } else { 2 }, self.extra_attrs(mesh).slice(..));
                 pass.draw_indexed(lod.first..lod.first + lod.count, 0, 0..count);
                 if let Some(stats) = stats {
                     stats.draw_calls += 1;
@@ -87,7 +91,7 @@ impl Drawing<'_> {
                 // Culled on the GPU: its instances and triangles are
                 // counted as they are read back.
                 if let Some(culled) = &batch.gpu {
-                    let draws = self.culling.draw(pass, culled, view, mesh, self.tangents(mesh));
+                    let draws = self.culling.draw(pass, culled, view, mesh, self.tangents(mesh), self.extra_attrs(mesh));
                     if let Some(stats) = stats {
                         stats.draw_calls += draws;
                         stats.instanced_draw_calls += draws;
@@ -101,6 +105,7 @@ impl Drawing<'_> {
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_vertex_buffer(1, self.tangents(mesh).slice(..));
                 pass.set_vertex_buffer(2, self.instances.slice(..));
+                pass.set_vertex_buffer(3, self.extra_attrs(mesh).slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 let mut stats = stats;
                 for (lod, &(first, count)) in mesh.lods.iter().zip(ranges) {
@@ -120,6 +125,7 @@ impl Drawing<'_> {
                 let solid = &self.solids[index];
                 pass.set_vertex_buffer(0, solid.buffer.slice(..));
                 pass.set_vertex_buffer(1, self.zero_tangents.slice(..));
+                pass.set_vertex_buffer(2, self.default_extra_attrs.slice(..));
                 pass.draw(0..solid.count, 0..1);
                 if let Some(stats) = stats {
                     stats.draw_calls += 1;
@@ -132,6 +138,11 @@ impl Drawing<'_> {
     /// The mesh's tangents, or zeros for each of its vertices.
     fn tangents<'b>(&'b self, mesh: &'b MeshAsset) -> &'b wgpu::Buffer {
         mesh.tangents.as_ref().unwrap_or(self.zero_tangents)
+    }
+
+    /// The mesh's extra vertex attributes (`uv1`, `color`), or the shared white defaults.
+    fn extra_attrs<'b>(&'b self, mesh: &'b MeshAsset) -> &'b wgpu::Buffer {
+        mesh.extra_attrs.as_ref().unwrap_or(self.default_extra_attrs)
     }
 
     pub(super) fn shader(&self, entry: &ReadyEntry) -> &ShaderAsset {
@@ -285,7 +296,9 @@ impl State {
         }
         self.fade(now);
         if self.post.is_none() {
-            self.post = Some(Post::new(&self.device, &self.queue));
+            let mut post = Post::new(&self.device, &self.queue);
+            post.set_tonemap(self.tonemap, self.context.display.encoded_peak());
+            self.post = Some(post);
         }
         let samples = self.quality(frame, catalog, scratch)?;
         // The veil covers the frame while the passes around the scene
@@ -436,6 +449,7 @@ impl State {
             solids: &self.solid_meshes,
             instances: &self.instance_buffer,
             zero_tangents: &self.zero_tangents,
+            default_extra_attrs: &self.default_extra_attrs,
             skin: self.skinning.group(),
             morphed: self.morphing.output(),
             culling: &self.culling,

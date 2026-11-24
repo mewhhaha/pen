@@ -47,7 +47,12 @@ fn fetch(uv: vec2f) -> vec3f {
   if (grade.luts.w > 0.5) {
     light = srgb_encode(grade_apply(grade, lut_a, lut_b, srgb_decode(light), uv));
   }
-  return toned(light);
+  let tonemap_mode = u32(max(grade.vignette.z, 0.0) + 0.5);
+  let hdr_peak = max(grade.vignette.w, 1.0);
+  if (tonemap_mode == 0u) {
+    return toned(light);
+  }
+  return toned_with_mode(light, tonemap_mode, hdr_peak);
 }
 
 fn luma(color: vec3f) -> f32 {

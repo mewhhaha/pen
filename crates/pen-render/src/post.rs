@@ -117,12 +117,13 @@ const PRESENT_SHADER: &str = include_str!("shaders/present.wgsl");
 pub(crate) fn present_shader(samples: u32, display: &crate::Display) -> String {
     // An HDR display's highlights roll off toward its peak, not white.
     let toned = if display.is_hdr() { crate::display::toned_wgsl(display.encoded_peak()) } else { TONED_WGSL.into() };
+    let toned_full = format!("{toned}\n{}", crate::tonemap::TONEMAP_SUITE_WGSL);
     PRESENT_SHADER
         .replace("${marks_texture}", if samples > 1 { "texture_multisampled_2d<u32>" } else { "texture_2d<u32>" })
         .replace("${fullscreen}", FULLSCREEN)
         .replace("${transfer}", TRANSFER_WGSL)
         .replace("${grade}", GRADE_WGSL)
-        .replace("${tonedWgsl}", &toned)
+        .replace("${tonedWgsl}", &toned_full)
         .replace("${fxaa}", include_str!("shaders/fxaa.wgsl"))
 }
 
@@ -539,6 +540,9 @@ pub(crate) struct Post {
     exposure: Exposure,
     /// The present pass's late bind group: the grade's two tables, and which they are.
     tables: Option<(([u64; 2], u32), wgpu::BindGroup)>,
+    /// Active display tonemapper and encoded display peak (1.0 for SDR).
+    tonemap: crate::tonemap::TonemapOperator,
+    display_peak: f32,
 }
 
 fn texture(
@@ -627,7 +631,14 @@ impl Post {
             previous_vp: None,
             exposure: Exposure::new(device, queue),
             tables: None,
+            tonemap: crate::tonemap::TonemapOperator::Shoulder,
+            display_peak: 1.0,
         }
+    }
+
+    pub fn set_tonemap(&mut self, tonemap: crate::tonemap::TonemapOperator, display_peak: f32) {
+        self.tonemap = tonemap;
+        self.display_peak = display_peak.max(1.0);
     }
 
     /// The next metered frame takes the exposure its scene asks for at once.
@@ -1312,7 +1323,11 @@ impl Post {
         // The exposure, fixed or metered, and the grade, for the present pass.
         self.exposure.begin(&frame.exposure);
         let uniform = self.uniform("grade", size_of::<grade::GradeUniform>() as u64);
-        self.queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&grade::uniform(&frame.grade, tables)));
+        self.queue.write_buffer(
+            &uniform,
+            0,
+            bytemuck::bytes_of(&grade::uniform_with_tonemap(&frame.grade, tables, self.tonemap, self.display_peak)),
+        );
         let late = self.tables_group(built_ins, self.targets.as_ref().unwrap().key.samples, tables);
         let (targets, exposure) = (self.targets.as_ref().unwrap(), &mut self.exposure);
         let graphs = match &targets.split {

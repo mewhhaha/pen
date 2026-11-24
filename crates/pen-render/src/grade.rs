@@ -60,7 +60,18 @@ pub(crate) fn tables(grade: &Grade, a: Option<Lut>, b: Option<Lut>) -> [Option<L
 
 /// The uniform for `grade` with these `tables`; its last lane of `luts` is 1 when
 /// the present pass has anything to do.
+#[allow(dead_code)]
 pub(crate) fn uniform(grade: &Grade, tables: &[Option<Lut>; 2]) -> GradeUniform {
+    uniform_with_tonemap(grade, tables, crate::tonemap::TonemapOperator::Shoulder, 1.0)
+}
+
+/// The uniform for `grade` including display tonemap operator and encoded HDR peak.
+pub(crate) fn uniform_with_tonemap(
+    grade: &Grade,
+    tables: &[Option<Lut>; 2],
+    tonemap: crate::tonemap::TonemapOperator,
+    peak_encoded: f32,
+) -> GradeUniform {
     let size = |table: &Option<Lut>| table.as_ref().map_or(0.0, |table| table.size as f32);
     let active = !neutral(grade) || tables[0].is_some();
     GradeUniform {
@@ -75,7 +86,7 @@ pub(crate) fn uniform(grade: &Grade, tables: &[Option<Lut>; 2]) -> GradeUniform 
             if tables[1].is_some() { grade.lut_blend } else { 0.0 },
             if active { 1.0 } else { 0.0 },
         ],
-        vignette: [grade.vignette, grade.vignette_radius, 0.0, 0.0],
+        vignette: [grade.vignette, grade.vignette_radius, (tonemap as u32) as f32, peak_encoded.max(1.0)],
     }
 }
 

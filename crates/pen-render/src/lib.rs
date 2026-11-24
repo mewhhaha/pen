@@ -9,6 +9,7 @@ pub mod area_lights;
 mod asset_store;
 pub mod atmosphere_lut;
 mod built_in;
+pub mod camera_precision;
 mod compressed;
 mod culling;
 pub mod decals;
@@ -21,6 +22,7 @@ mod filter;
 pub mod gpu_particles;
 mod grade;
 mod graph;
+pub mod hdri;
 mod inspect;
 mod lights;
 mod loader;
@@ -29,6 +31,7 @@ mod matrix;
 pub mod meshlets;
 mod mipmaps;
 mod motion_blur;
+pub mod oit;
 mod packed_texture;
 mod pipeline_cache;
 mod platform;
@@ -46,11 +49,13 @@ mod sprites;
 mod ssgi;
 mod subsurface;
 mod surface;
+pub mod surface_atlas;
 mod taa;
 #[cfg(test)]
 mod testing;
 mod texture;
 mod texture_recipe;
+pub mod tonemap;
 pub mod video;
 mod volume;
 
@@ -59,6 +64,7 @@ use pen_protocol::{Catalog, GameEvent, RenderFrame};
 pub use area_lights::{AREA_LIGHTS_WGSL, AreaLight, AreaLightKind, AreaLightResources, LTC_LUT_SIZE, generate_ltc_luts};
 pub use asset_store::{mesh_bounds, pack_mesh, validate_asset_key};
 pub use atmosphere_lut::{ATMOSPHERE_LUT_WGSL, AtmosphereParams, CLOUDS_WGSL, PhysicalAtmosphere};
+pub use camera_precision::{CameraRelativeFrame, DepthMode, perspective_forward_z, perspective_reversed_z};
 pub use decals::{PBR_DECAL_WGSL, PbrDecal, PbrDecalPass, PbrDecalView};
 pub use display::{DEFAULT_HEADROOM, Display, REFERENCE_WHITE_NITS, choose_surface};
 pub use environment::ENVIRONMENT_WGSL;
@@ -71,12 +77,14 @@ pub use gpu_particles::{
     GPU_PARTICLES_DRAW_WGSL, GPU_PARTICLES_SIM_WGSL, GpuParticle, GpuParticleMeshVertex, GpuParticleSimParams,
     GpuParticleSystem, ParticleSimCounters, unit_cube_particle_mesh,
 };
+pub use hdri::{DEFAULT_HDRI_FACE_SIZE, DEFAULT_HDRI_SAMPLES, HdriCubemap, HdriImage, HdriPrefilterer, blend_sh_l2};
 pub use inspect::{TextureInfo, inspect_material, inspect_mesh, inspect_texture, shader_draws_sprites};
 pub use lights::LIGHTS_WGSL;
 pub use meshlets::{
     DEFAULT_MAX_MESHLET_TRIANGLES, DEFAULT_MAX_MESHLET_VERTICES, MESHLET_CULL_WGSL, MeshletCullParams,
     MeshletCullStats, MeshletCuller, MeshletGpu, MeshletIndirectDraw, MeshletMesh, build_meshlets,
 };
+pub use oit::{OIT_SHADER_HELPERS_WGSL, OitPass, oit_color_targets};
 pub use post_fx::{
     POST_FX_WGSL, PostFxParams, PostFxPass, RcasSharpener, TaauUpscaler, UPSCALE_RCAS_WGSL, apply_projection_jitter,
     halton_jitter,
@@ -90,6 +98,8 @@ pub use render_targets::{
     ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,
     oblique_clip_projection, planar_reflection_camera, planar_reflection_view,
 };
+pub use surface_atlas::{SURFACE_ATLAS_WGSL, SurfaceAtlasPacker, SurfaceTile, TileCopy};
+pub use tonemap::{TONEMAP_SUITE_WGSL, TonemapOperator, tonemap_linear_f64};
 pub use video::{
     ChromaSiting, ColorMatrix, ColorRange, ColorSpace, IvfFrame, IvfStream, VideoPlayer, VideoTexture, Y4mStream,
     Yuv420Frame,
@@ -439,5 +449,27 @@ impl Renderer {
         size: (u32, u32),
     ) -> anyhow::Result<()> {
         self.state.render_camera_to_texture(key, frame, catalog, size)
+    }
+
+    /// Loads an equirectangular HDRI image (`.hdr`/`.exr`) as the active IBL
+    /// environment: prefilters its GGX specular cubemap on the GPU and returns
+    /// the extracted L2 spherical harmonic diffuse irradiance coefficients.
+    pub fn set_hdri_environment(
+        &mut self,
+        image: &HdriImage,
+        intensity: f32,
+        rotation_rad: f32,
+    ) -> anyhow::Result<[pen_protocol::Vector; 9]> {
+        self.state.set_hdri_environment(image, intensity, rotation_rad)
+    }
+
+    /// Reverts the environment cubemap back to the procedural sky gradient.
+    pub fn clear_hdri_environment(&mut self) {
+        self.state.clear_hdri_environment();
+    }
+
+    /// Selects the display tonemapping operator (`Shoulder`, `AgX`, `AcesFilmic`, `PbrNeutral`).
+    pub fn set_tonemap(&mut self, operator: TonemapOperator) {
+        self.state.set_tonemap(operator);
     }
 }

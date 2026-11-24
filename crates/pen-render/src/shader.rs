@@ -355,6 +355,14 @@ const TANGENT_ATTRIBUTES: [wgpu::VertexAttribute; 1] =
     [wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 11 }];
 /// Bytes of a tangent.
 pub(crate) const TANGENT_BYTES: u64 = (MESH_TANGENT_FLOATS * 4) as u64;
+// Optional secondary UV (`TEXCOORD_1`, location 12) and linear RGBA vertex color
+// (`COLOR_0`, location 13): always bound (mesh's own or shared default white).
+const EXTRA_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 12 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 8, shader_location: 13 },
+];
+/// Bytes per vertex of `[uv1.x, uv1.y, r, g, b, a]`.
+pub(crate) const EXTRA_VERTEX_BYTES: u64 = 24;
 // A skinned mesh's third buffer: each vertex's four joints and weights.
 const SKIN_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint16x4, offset: 0, shader_location: 9 },
@@ -370,9 +378,9 @@ const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 64, shader_location: 7 },
 ];
 
-/// The buffers a mesh pipeline reads: the mesh's vertices, its tangents and,
-/// instanced, each instance's transform and parameters, or, skinned, each
-/// vertex's joints and weights.
+/// The buffers a mesh pipeline reads: the mesh's vertices, its tangents,
+/// optional instancing/skinning at slot 2, and extra attributes (`uv1`, `color`)
+/// at the trailing slot (slot 2 for `Plain`, slot 3 for `Instanced`/`Persistent`/`Skinned`).
 fn vertex_buffers(stage: Stage) -> Vec<Option<wgpu::VertexBufferLayout<'static>>> {
     let mut buffers = vec![
         Some(wgpu::VertexBufferLayout {
@@ -399,6 +407,11 @@ fn vertex_buffers(stage: Stage) -> Vec<Option<wgpu::VertexBufferLayout<'static>>
             attributes: &SKIN_ATTRIBUTES,
         })),
     }
+    buffers.push(Some(wgpu::VertexBufferLayout {
+        array_stride: EXTRA_VERTEX_BYTES,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &EXTRA_VERTEX_ATTRIBUTES,
+    }));
     buffers
 }
 

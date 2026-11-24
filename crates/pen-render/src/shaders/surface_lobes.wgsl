@@ -637,3 +637,57 @@ fn surface_apply_orm(s: StandardSurface, orm: vec4f, enabled: f32) -> StandardSu
   }
   return out;
 }
+
+// ---- Thin-film iridescence (KHR_materials_iridescence) & chromatic dispersion.
+const SURFACE_IRIDESCENCE: u32 = 64u;
+
+fn lobe_iridescence_xyz_to_srgb(xyz: vec3f) -> vec3f {
+  let m = mat3x3f(
+    vec3f( 3.2404542, -0.9692660,  0.0556434),
+    vec3f(-1.5371385,  1.8760108, -0.2040259),
+    vec3f(-0.4985314,  0.0415560,  1.0572252)
+  );
+  return max(m * xyz, vec3f(0.0));
+}
+
+// Belcour & Barla (2017) analytical Airy thin-film interference reflectance (`KHR_materials_iridescence`).
+fn lobe_iridescence_fresnel(outside_ior: f32, film_ior: f32, cos_theta1: f32, thickness_nm: f32, base_f0: vec3f) -> vec3f {
+  let sin2_t2 = (outside_ior / max(film_ior, 1.0001)) * (outside_ior / max(film_ior, 1.0001))
+    * max(1.0 - cos_theta1 * cos_theta1, 0.0);
+  if (sin2_t2 >= 1.0) {
+    return vec3f(1.0);
+  }
+  let cos_t2 = sqrt(1.0 - sin2_t2);
+  let r0_12 = ((film_ior - outside_ior) / (film_ior + outside_ior));
+  let r12 = r0_12 * r0_12 + (1.0 - r0_12 * r0_12) * pow(1.0 - cos_theta1, 5.0);
+  let base_ior = (1.0 + sqrt(clamp(base_f0, vec3f(0.0), vec3f(0.999)))) / max(1.0 - sqrt(clamp(base_f0, vec3f(0.0), vec3f(0.999))), vec3f(0.001));
+  let r0_23 = (base_ior - vec3f(film_ior)) / (base_ior + vec3f(film_ior));
+  let r23 = r0_23 * r0_23 + (vec3f(1.0) - r0_23 * r0_23) * pow(1.0 - cos_t2, 5.0);
+  let opd = 2.0 * film_ior * thickness_nm * cos_t2;
+  let phi = 2.0 * 3.14159265359 * opd / vec3f(650.0, 510.0, 475.0);
+  let r123 = clamp(sqrt(vec3f(r12) * r23), vec3f(0.0), vec3f(0.999));
+  let num = vec3f(r12) + r23 + 2.0 * r123 * cos(phi);
+  let den = vec3f(1.0) + vec3f(r12) * r23 + 2.0 * r123 * cos(phi);
+  return clamp(num / max(den, vec3f(0.0001)), vec3f(0.0), vec3f(1.0));
+}
+
+// Per-channel IOR spread for `KHR_materials_dispersion` (`dispersion = 20 / abbe_number`).
+fn lobe_dispersion_iors(ior: f32, dispersion: f32) -> vec3f {
+  let half_spread = (ior - 1.0) * 0.052356 * max(dispersion, 0.0);
+  return vec3f(max(ior - half_spread, 1.0), ior, ior + half_spread);
+}
+
+// Samples a tile from the 4x3 SurfaceMapAtlas bound at @group(1) @binding(4) when `settings.w == 5.0`.
+fn surface_atlas_tile_uv(tile: u32, uv: vec2f, atlas_dims: vec2f, clamp_uv: bool) -> vec2f {
+  let col = f32(tile % 4u);
+  let row = f32(tile / 4u);
+  let cell = atlas_dims / vec2f(4.0, 3.0);
+  let wrapped = select(fract(uv), clamp(uv, vec2f(0.0), vec2f(1.0)), clamp_uv);
+  let inner = cell - vec2f(2.0);
+  return (vec2f(col, row) * cell + vec2f(1.0) + wrapped * inner) / atlas_dims;
+}
+
+fn surface_read_atlas(atlas: texture_2d<f32>, samp: sampler, tile: u32, uv: vec2f, clamp_uv: bool) -> vec4f {
+  let dims = vec2f(textureDimensions(atlas, 0));
+  return textureSampleLevel(atlas, samp, surface_atlas_tile_uv(tile, uv, dims, clamp_uv), 0.0);
+}

@@ -432,6 +432,19 @@ impl State {
                 if mesh.tangents.is_none() {
                     self.ensure_zero_tangents(vertex_count as usize);
                 }
+                let extra_bytes: Option<Vec<u8>> = if mesh.uvs1.is_some() || mesh.colors.is_some() {
+                    let count = vertex_count as usize;
+                    let mut floats = Vec::with_capacity(count * 6);
+                    for i in 0..count {
+                        let uv1 = mesh.uvs1.as_ref().and_then(|v| v.get(i)).copied().unwrap_or([0.0, 0.0]);
+                        let col = mesh.colors.as_ref().and_then(|v| v.get(i)).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
+                        floats.extend_from_slice(&[uv1[0], uv1[1], col[0], col[1], col[2], col[3]]);
+                    }
+                    Some(bytemuck::cast_slice(&floats).to_vec())
+                } else {
+                    self.ensure_default_extra_attrs(vertex_count as usize);
+                    None
+                };
                 let buffer = |bytes: &[u8], usage: wgpu::BufferUsages| {
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytes, usage })
                 };
@@ -458,6 +471,7 @@ impl State {
                             .tangents
                             .as_ref()
                             .map(|tangents| buffer(bytemuck::cast_slice(tangents), wgpu::BufferUsages::VERTEX)),
+                        extra_attrs: extra_bytes.as_deref().map(|b| buffer(b, wgpu::BufferUsages::VERTEX)),
                         indices: buffer(index_bytes, wgpu::BufferUsages::INDEX),
                         bounds: mesh.bounds,
                         lods: mesh.lods.clone(),
@@ -506,6 +520,19 @@ impl State {
                         &material.layer_texture,
                         &material.orm_texture,
                         &material.emissive_texture,
+                        &material.surface.clearcoat_texture,
+                        &material.surface.clearcoat_roughness_texture,
+                        &material.surface.clearcoat_normal_texture,
+                        &material.surface.sheen_color_texture,
+                        &material.surface.sheen_roughness_texture,
+                        &material.surface.anisotropy_texture,
+                        &material.surface.transmission_texture,
+                        &material.surface.thickness_texture,
+                        &material.surface.specular_texture,
+                        &material.surface.specular_color_texture,
+                        &material.surface.iridescence_texture,
+                        &material.surface.lightmap_texture,
+                        &material.surface.lightmap_dir_texture,
                     ]
                     .into_iter()
                     .flatten()

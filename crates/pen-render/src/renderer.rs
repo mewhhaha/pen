@@ -57,7 +57,7 @@ use crate::mipmaps::Mipmapper;
 use crate::packed_texture::PackedHeader;
 use crate::pipeline_cache::PipelineCache;
 use crate::post::{Post, TONED_WGSL};
-use crate::shader::{self, PipelineContext, Pipelines, TANGENT_BYTES, Variants};
+use crate::shader::{self, EXTRA_VERTEX_BYTES, PipelineContext, Pipelines, TANGENT_BYTES, Variants};
 use crate::solids::SolidBatch;
 use crate::sprites::{SpriteBatch, Sprites, sprite_group_layout};
 use crate::{RenderStats, RendererOptions};
@@ -107,6 +107,8 @@ pub(crate) struct MeshAsset {
     /// Each vertex's tangent, if the mesh has them: pipelines read them at
     /// location 11, from the renderer's zeros when it has none.
     tangents: Option<wgpu::Buffer>,
+    /// Optional packed `[uv1.x, uv1.y, r, g, b, a]` per vertex (`TEXCOORD_1` loc 12, `COLOR_0` loc 13).
+    extra_attrs: Option<wgpu::Buffer>,
     /// Its triangles, then each simpler level of detail's.
     indices: wgpu::Buffer,
     /// A sphere holding its vertices.
@@ -216,6 +218,7 @@ impl MeshAsset {
         self.vertices.size()
             + self.indices.size()
             + self.tangents.as_ref().map_or(0, wgpu::Buffer::size)
+            + self.extra_attrs.as_ref().map_or(0, wgpu::Buffer::size)
             + self.skin.as_ref().map_or(0, |s| s.vertices.size())
             + self.morphs.as_ref().map_or(0, |m| m.deltas.size())
             + self.instances.as_ref().map_or(0, |i| i.buffer.size())
@@ -370,6 +373,8 @@ enum TextureRef {
     Video(usize),
     /// A live render-to-texture secondary camera output, by its index in `camera_targets`.
     CameraTarget(usize),
+    /// A GPU-packed 4x3 SurfaceMapAtlas (ORM + Emissive + PBR extension maps + Lightmaps).
+    SurfaceAtlas(usize),
     White,
     FlatNormal,
     Transparent,
@@ -551,6 +556,8 @@ struct Drawing<'a> {
     instances: &'a wgpu::Buffer,
     /// Zero tangents for every vertex of the largest mesh without any.
     zero_tangents: &'a wgpu::Buffer,
+    /// Default `[uv1=(0,0), color=(1,1,1,1)]` stream for meshes without `uvs1`/`colors`.
+    default_extra_attrs: &'a wgpu::Buffer,
     /// The frame's joint matrices, for posed draws.
     skin: Option<&'a wgpu::BindGroup>,
     /// The frame's GPU-morphed vertex buffer, for draws with active morph weights.
@@ -668,6 +675,22 @@ fn zero_tangent_size(current: u64, vertices: usize, limit: u64) -> u64 {
     if needed <= current { current } else { needed.next_power_of_two().min(limit).max(needed) }
 }
 
+fn default_extra_attrs_buffer(device: &wgpu::Device, queue: &wgpu::Queue, vertices: usize) -> wgpu::Buffer {
+    let count = vertices.max(1);
+    let mut data = Vec::with_capacity(count * 6);
+    for _ in 0..count {
+        data.extend_from_slice(&[0.0f32, 0.0, 1.0, 1.0, 1.0, 1.0]);
+    }
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("default extra vertex attrs"),
+        size: count as u64 * EXTRA_VERTEX_BYTES,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buf, 0, bytemuck::cast_slice(&data));
+    buf
+}
+
 impl State {
     /// Makes sure the zero tangents reach as many vertices as a mesh of
     /// `vertices` has: one stream serves every mesh without tangents, and it
@@ -678,11 +701,24 @@ impl State {
             self.zero_tangents = zero_tangent_buffer(&self.device, size);
         }
     }
+
+    /// Makes sure the default `[uv1=(0,0), color=white]` vertex attribute stream covers `vertices`.
+    fn ensure_default_extra_attrs(&mut self, vertices: usize) {
+        let needed = vertices.max(1) as u64 * EXTRA_VERTEX_BYTES;
+        if needed > self.default_extra_attrs.size() {
+            let cap = vertices.next_power_of_two().max(1);
+            let max_verts = (self.device.limits().max_buffer_size / EXTRA_VERTEX_BYTES) as usize;
+            let count = cap.min(max_verts).max(vertices);
+            self.default_extra_attrs = default_extra_attrs_buffer(&self.device, &self.queue, count);
+        }
+    }
 }
 
 fn extent(width: u32, height: u32) -> wgpu::Extent3d {
     wgpu::Extent3d { width, height, depth_or_array_layers: 1 }
 }
+
+type SurfaceAtlasKey = Vec<(u32, u64, u64)>;
 
 pub(crate) struct State {
     device: wgpu::Device,
@@ -744,14 +780,22 @@ pub(crate) struct State {
     capacity: usize,
     draw_uniform: wgpu::Buffer,
     uniform_data: Vec<f32>,
-    // Draw bind groups by their four textures' views and their sampler, and
+    // Draw bind groups by their three textures' views and their sampler, and
     // the frame that last drew with each.
-    groups: HashMap<([u64; 4], i32), (wgpu::BindGroup, u64)>,
+    groups: HashMap<([u64; 3], i32), (wgpu::BindGroup, u64)>,
     instance_capacity: usize,
     instance_buffer: wgpu::Buffer,
     // What a mesh without tangents binds as them: a zero `vec4f` for each
     // vertex of the largest mesh loaded or meshed without (`ensure_zero_tangents`).
     zero_tangents: wgpu::Buffer,
+    // Default `[uv1=(0,0), color=white]` stream for meshes without `uvs1`/`colors`.
+    default_extra_attrs: wgpu::Buffer,
+    // Cached GPU-packed 4x3 SurfaceMapAtlas textures keyed by sorted component texture view IDs.
+    surface_atlases: Vec<TextureAsset>,
+    surface_atlas_ids: HashMap<SurfaceAtlasKey, (usize, u32)>,
+    surface_atlas_packer: Option<crate::surface_atlas::SurfaceAtlasPacker>,
+    // Active display tonemap operator (`Shoulder` default).
+    tonemap: crate::tonemap::TonemapOperator,
     instance_data: Vec<f32>,
     instance_uploads: instance_upload::Uploads,
     last_stats: RenderStats,
@@ -997,9 +1041,8 @@ pub(crate) fn draw_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
         },
         // A normal map, or a field the vertices read too.
         texture_entry(3, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+        // Layer / emissive / standalone ORM / GPU-packed 4x3 SurfaceMapAtlas.
         texture_entry(4, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
-        // Packed linear ORM (occlusion/roughness/metallic) texture.
-        texture_entry(5, wgpu::ShaderStages::FRAGMENT),
     ]
 }
 
@@ -1141,6 +1184,11 @@ impl State {
             instance_capacity: 1,
             instance_buffer: batching::instance_buffer(&device, 1),
             zero_tangents: zero_tangent_buffer(&device, TANGENT_BYTES),
+            default_extra_attrs: default_extra_attrs_buffer(&device, &queue, 1),
+            surface_atlases: Vec::new(),
+            surface_atlas_ids: HashMap::new(),
+            surface_atlas_packer: None,
+            tonemap: crate::tonemap::TonemapOperator::Shoulder,
             instance_data: vec![0.0; 20],
             instance_uploads: instance_upload::Uploads::default(),
             last_stats: RenderStats::default(),
@@ -1470,6 +1518,32 @@ impl State {
     pub fn waiting(&self) -> bool {
         self.waiting
     }
+
+    pub fn set_hdri_environment(
+        &mut self,
+        image: &crate::hdri::HdriImage,
+        intensity: f32,
+        rotation_rad: f32,
+    ) -> Result<[pen_protocol::Vector; 9]> {
+        let sh = self.environment.set_hdri(&self.device, &self.queue, image, intensity, rotation_rad)?;
+        // Invalidate scene bind groups so binding 4 switches to the HDRI cubemap view.
+        self.scene_group = None;
+        self.translucent_group = None;
+        Ok(sh)
+    }
+
+    pub fn clear_hdri_environment(&mut self) {
+        self.environment.clear_hdri();
+        self.scene_group = None;
+        self.translucent_group = None;
+    }
+
+    pub fn set_tonemap(&mut self, operator: crate::tonemap::TonemapOperator) {
+        self.tonemap = operator;
+        if let Some(post) = &mut self.post {
+            post.set_tonemap(operator, self.context.display.encoded_peak());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1511,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mesh_pipelines_fragment_stage_samples_sixteen_textures_of_the_sixteen_webgpu_allows() {
+    fn a_mesh_pipelines_fragment_stage_samples_fifteen_textures_within_strict_webgpu_limits() {
         let scene = fragment_textures(&scene_layout_entries());
         let draw = fragment_textures(&draw_layout_entries());
         let lights = fragment_textures(&crate::lights::layout_entries());
@@ -1519,12 +1593,12 @@ mod tests {
         // the depth and picture of screen-space reflections, the camera's depth for contact shadows,
         // and the opaque picture, its depth and the froxel volume (bindings 14 to 16, fragment only).
         assert_eq!(scene, [1, 3, 4, 5, 10, 12, 13, 9, 14, 15, 16]);
-        // The draw's texture, normal map, layer/emissive texture, and packed linear ORM texture;
+        // The draw's albedo, normal map, and layer/emissive/ORM/SurfaceMapAtlas slot;
         // plus the local lights' shadow atlas.
-        assert_eq!(draw, [1, 3, 4, 5]);
+        assert_eq!(draw, [1, 3, 4]);
         assert_eq!(lights, [4]);
         let total = scene.len() + draw.len() + lights.len();
-        assert_eq!(total, 16, "a new binding must stay within WebGPU's default of 16");
-        assert!(total <= 16);
+        assert_eq!(total, 15, "mesh fragment stage must stay within strict 15-texture limit");
+        assert!(total <= 15);
     }
 }

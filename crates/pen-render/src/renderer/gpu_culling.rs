@@ -358,10 +358,12 @@ impl GpuCulling {
         view: usize,
         mesh: &MeshAsset,
         tangents: &wgpu::Buffer,
+        extra_attrs: &wgpu::Buffer,
     ) -> u32 {
         let (Some(culled), Some(draws)) = (&self.culled.buffer, &self.draws.buffer) else { return 0 };
         pass.set_vertex_buffer(0, mesh.vertices.slice(..));
         pass.set_vertex_buffer(1, tangents.slice(..));
+        pass.set_vertex_buffer(3, extra_attrs.slice(..));
         pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
         let view = u32::try_from(view).expect("at most MAX_VIEWS");
         for level in 0..batch.levels {

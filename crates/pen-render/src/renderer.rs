@@ -567,6 +567,8 @@ pub(crate) struct State {
     built_ins: BuiltIns,
     // Created on first use, so a renderer that never draws needs none.
     post: Option<Post>,
+    // The froxel volume of the mist (volume.rs).
+    volumetrics: crate::volume::Volumetrics,
     mipmaps: Mipmapper,
     /// The sky the scene is lit by: diffuse coefficients, reflection cube and table.
     environment: Environment,
@@ -685,7 +687,7 @@ impl State {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -695,7 +697,7 @@ impl State {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2,
@@ -705,14 +707,14 @@ impl State {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                     count: None,
                 },
                 // Every shadow map, the game's last (shadows.rs).
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -734,7 +736,7 @@ impl State {
                 // which screen-space reflections read.
                 wgpu::BindGroupLayoutEntry {
                     binding: 12,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -744,7 +746,7 @@ impl State {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 13,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
@@ -755,7 +757,7 @@ impl State {
                 // The camera's depth, drawn for contact shadows (shadows.rs).
                 wgpu::BindGroupLayoutEntry {
                     binding: 9,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
                         view_dimension: wgpu::TextureViewDimension::D2,
@@ -897,6 +899,7 @@ impl State {
             samples_now: 1,
             samples_shown: 1,
             post: None,
+            volumetrics: crate::volume::Volumetrics::new(&device, &queue),
             environment: Environment::new(&device, context.cache.clone()),
             mipmaps,
             decals: None,

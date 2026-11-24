@@ -91,7 +91,7 @@ struct Pipelines {
 pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 7] {
     let texture = |binding: u32, view_dimension: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
+        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::Texture {
             sample_type: wgpu::TextureSampleType::Float { filterable: true },
             view_dimension,
@@ -104,13 +104,13 @@ pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 7] {
         texture(5, wgpu::TextureViewDimension::D2),
         wgpu::BindGroupLayoutEntry {
             binding: 6,
-            visibility: wgpu::ShaderStages::FRAGMENT,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
         },
         wgpu::BindGroupLayoutEntry {
             binding: 7,
-            visibility: wgpu::ShaderStages::FRAGMENT,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -120,7 +120,7 @@ pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 7] {
         },
         wgpu::BindGroupLayoutEntry {
             binding: 8,
-            visibility: wgpu::ShaderStages::FRAGMENT,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Storage { read_only: true },
                 has_dynamic_offset: false,
@@ -131,7 +131,7 @@ pub(crate) fn layout_entries() -> [wgpu::BindGroupLayoutEntry; 7] {
         texture(10, wgpu::TextureViewDimension::CubeArray),
         wgpu::BindGroupLayoutEntry {
             binding: 11,
-            visibility: wgpu::ShaderStages::FRAGMENT,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,

@@ -265,6 +265,11 @@
       "doc": "The most reflection probes one frame may publish; the host keeps the nearest and most important few in its cube array (MAX_REFLECTION_SLOTS)."
     },
     {
+      "limit": "MAX_FOG_VOLUMES",
+      "value": 32,
+      "doc": "The most local fog volumes one frame may publish."
+    },
+    {
       "limit": "ENGINE_PREFERENCES",
       "value": 64,
       "doc": "Preference events from this index on carry the engine's preferences (ENGINE_PREFERENCE_*); below it, the game's own."
@@ -1605,7 +1610,7 @@
       },
       "fog": {
         "type": "Fog",
-        "doc": "Mist beyond `radius` of the middle; density 0 for none."
+        "doc": "The participating medium: a mist beyond `radius` of the origin whose density falls off exponentially with height, drawn through a froxel volume out to `distance` (lit by the sun, the lights and the sky, with shafts and shadows) and analytically beyond it; density 0 and no fog volumes for none."
       },
       "shadow": {
         "type": "Shadow",
@@ -2038,7 +2043,9 @@
         "kind": "f32"
       },
       "fog.height": {
-        "kind": "f32"
+        "kind": "f32",
+        "default": 1,
+        "doc": "The scale height of the mist: its density falls by a factor of e over this many world units above the ground (above y = 0)."
       },
       "shadow.view": {
         "kind": "matrix"
@@ -2407,6 +2414,74 @@
         "kind": "count",
         "max": 6,
         "doc": "The most faces of reflection probe cubes drawn in one frame (6 make a whole probe); a probe whose revision changed, or that asks, is drawn again over as many frames as that takes. 0 draws none: the probes keep what they held."
+      },
+      "fog.edge": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "How far past `radius` (world units) the mist takes to rise from nothing to its full density, smoothly; 0 for a hard edge."
+      },
+      "fog.distance": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "How far ahead of the camera the froxel volume reaches, along the view; beyond it the mist continues analytically with the same medium. 0 draws the mist analytically alone (and the local volumes not at all)."
+      },
+      "fog.albedo": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": ["x", "y", "z"]
+        },
+        "default": [1, 1, 1],
+        "doc": "The share of light the mist scatters, by channel; the rest it absorbs."
+      },
+      "fog.anisotropy": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "The Henyey-Greenstein asymmetry g (-0.95 to 0.95) of the mist's phase function: positive scatters toward where the light is going (shafts toward the sun), negative back toward it, 0 evenly."
+      },
+      "fog.sun": {
+        "kind": "f32",
+        "default": 1,
+        "doc": "How much of the sun's light the mist scatters, a scale on its in-scattering (0 for none)."
+      },
+      "fog.ambient": {
+        "kind": "f32",
+        "default": 1,
+        "doc": "How much of the sky's and the probes' ambient light the mist scatters, a scale on its in-scattering."
+      },
+      "fog.sky": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "How far the mist's ambient colour is the sky's own color in the direction looked, rather than the sky's mean light all round (0 to 1): 1 makes distant objects fade into the sky behind them."
+      },
+      "fog.noise": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "How much a 3D noise varies the global mist's density (0 to 1: 0 uniform, 1 from nothing to twice the mean); the mean density stays what it was."
+      },
+      "fog.noise_scale": {
+        "kind": "f32",
+        "default": 16,
+        "doc": "The size in world units of the noise's coarsest cell; finer octaves follow."
+      },
+      "fog.drift": {
+        "kind": "vector",
+        "type": {
+          "name": "Vector",
+          "components": ["x", "y", "z"]
+        },
+        "default": [0, 0, 0],
+        "doc": "How far the game has carried the noise along x, y and z (wind times time): the same drift draws the same mist."
+      },
+      "quality.volumetrics": {
+        "kind": "count",
+        "max": 2,
+        "doc": "The froxel volume's tier: 0 off (the mist is analytic, with no shafts or local volumes), 1 low (a coarser grid, fewer slices and sun-shadow taps), 2 high."
+      },
+      "fog_volume_count": {
+        "kind": "size",
+        "section": "fog_volumes",
+        "of": "count"
       }
     },
     "sections": [
@@ -3574,6 +3649,68 @@
           "limit": "MAX_REFLECTION_PROBES",
           "value": 64,
           "doc": "The most reflection probes one frame may publish."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "fog_volumes",
+        "doc": "Local fog volumes: boxes and ellipsoids of the world, axis-aligned, whose medium adds to the global mist's inside them (when `fog.distance` is above 0 and the volumetrics tier is on): extinction `density` per world unit, scattering `albedo`, `emission`, and a falloff toward the edge.",
+        "record": {
+          "name": "FogVolume",
+          "constant": "FOG_VOLUME",
+          "fields": {
+            "shape": {
+              "kind": "count",
+              "max": 1,
+              "doc": "0 a box, 1 an ellipsoid."
+            },
+            "center": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": ["x", "y", "z"]
+              },
+              "doc": "The middle of the volume, in world units."
+            },
+            "extent": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": ["x", "y", "z"]
+              },
+              "doc": "Half the volume's size along x, y and z (an ellipsoid's semi-axes)."
+            },
+            "density": {
+              "kind": "f32",
+              "doc": "The extinction at full strength, per world unit."
+            },
+            "albedo": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": ["x", "y", "z"]
+              },
+              "doc": "The share of light it scatters, by channel; the rest it absorbs."
+            },
+            "emission": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": ["x", "y", "z"]
+              },
+              "doc": "The light it gives out, as radiance per unit of density (so a thicker volume glows more); 0 for none."
+            },
+            "falloff": {
+              "kind": "f32",
+              "doc": "The share of the half size, from the edge in, over which the density rises smoothly from nothing to full (0 to 1; 0 for a hard edge)."
+            }
+          },
+          "doc": "A local fog volume."
+        },
+        "max": {
+          "limit": "MAX_FOG_VOLUMES",
+          "value": 32,
+          "doc": "The most local fog volumes one frame may publish."
         }
       },
       {

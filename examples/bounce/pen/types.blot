@@ -179,6 +179,16 @@ type ReflectionProbe is data = $ReflectionProbe {
   far: F32,
 }
 
+type FogVolume is data = $FogVolume {
+  shape: U32,
+  center: Vector,
+  extent: Vector,
+  density: F32,
+  albedo: Vector,
+  emission: Vector,
+  falloff: F32,
+}
+
 type Listener is data = $Listener {
   position: Vector,
   forward: Vector,
@@ -280,6 +290,7 @@ type Quality is data = $Quality {
   bloom: Bool,
   taa: Bool,
   ssr: U32,
+  volumetrics: U32,
 }
 
 type Sky is data = $Sky {
@@ -304,6 +315,16 @@ type Fog is data = $Fog {
   radius: F32,
   density: F32,
   height: F32,
+  edge: F32,
+  distance: F32,
+  albedo: Vector,
+  anisotropy: F32,
+  sun: F32,
+  ambient: F32,
+  sky: F32,
+  noise: F32,
+  noise_scale: F32,
+  drift: Vector,
 }
 
 type Shadow is data = $Shadow {

@@ -132,6 +132,18 @@ impl State {
         self.post.as_ref().map(Post::passes).unwrap_or_default()
     }
 
+    /// The next frame the mist's volume draws takes no history from the ones before.
+    pub fn reset_volumetrics(&mut self) {
+        self.volumetrics.reset();
+    }
+
+    /// Reads a texture of the last frame's froxel volume back, waiting for the
+    /// GPU (for tools and tests).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn read_volume(&self, layer: crate::volume::VolumeLayer) -> Option<crate::volume::VolumeImage> {
+        self.volumetrics.read(layer)
+    }
+
     /// Auto exposure takes the exposure its next frame's scene asks for at once.
     pub fn reset_exposure(&mut self) {
         if let Some(post) = &mut self.post {
@@ -331,7 +343,8 @@ impl State {
         // Screen-space reflections read the history and the noise of TAA.
         let quality =
             pen_protocol::Quality { msaa: samples, scale, taa: frame.quality.taa || reflected > 0, ..frame.quality };
-        let targets = self.post.as_mut().unwrap().begin(&mut self.built_ins, frame, quality, target.size());
+        let volume = self.volumetrics.prepare(&self.context, frame, &quality, target.size());
+        let targets = self.post.as_mut().unwrap().begin(&mut self.built_ins, frame, quality, target.size(), &volume);
         // With TAA the scene draws through a projection jittered within its
         // pixels: the scene uniform's, after its view.
         if let Some(projection) = self.post.as_ref().unwrap().jittered() {
@@ -401,6 +414,11 @@ impl State {
             );
         }
         self.environment.commit_reflections(&self.queue, frame, self.capture.as_ref(), capture.is_some());
+        // The mist's froxels, once the shadow maps and the lights they read are drawn.
+        self.volumetrics.encode(&mut encoder, &self.scene_group.as_ref().unwrap().0, self.clusters.group());
+        let (volume_froxels, volume_history) = self.volumetrics.stats();
+        stats.volume_froxels = volume_froxels;
+        stats.volume_history = volume_history;
         if let Some(particles) = &self.particles {
             particles.simulate(&mut encoder);
         }

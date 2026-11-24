@@ -219,6 +219,16 @@ func encode_reflection_probe (reflection_probe: types.ReflectionProbe) =>
     reflection_probe.far,
   ]
 
+// FogVolume: A local fog volume.
+func encode_fog_volume (fog_volume: types.FogVolume) =>
+  return #[
+    U32.to_f32 (fog_volume.shape), fog_volume.center.x, fog_volume.center.y,
+    fog_volume.center.z, fog_volume.extent.x, fog_volume.extent.y,
+    fog_volume.extent.z, fog_volume.density, fog_volume.albedo.x,
+    fog_volume.albedo.y, fog_volume.albedo.z, fog_volume.emission.x,
+    fog_volume.emission.y, fog_volume.emission.z, fog_volume.falloff,
+  ]
+
 // Listener: A listener: where it is, the way it faces and its up, in world
 // units.
 func encode_listener (listener: types.Listener) =>
@@ -297,6 +307,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   let cascades_count: U32 = collections.cascades.length
   let probes_count: U32 = collections.probes.length
   let reflection_probes_count: U32 = collections.reflection_probes.length
+  let fog_volumes_count: U32 = collections.fog_volumes.length
   let listener_count: U32 = collections.listener.length
   let panners_count: U32 = collections.panners.length
   let instances_count: U32 = collections.instances.length
@@ -523,6 +534,22 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (packet.grade.vignette_radius)
   @storage.push encoded (U32.to_f32 (packet.quality.ssr))
   @storage.push encoded (U32.to_f32 (packet.reflection.budget))
+  @storage.push encoded (packet.fog.edge)
+  @storage.push encoded (packet.fog.distance)
+  @storage.push encoded (packet.fog.albedo.x)
+  @storage.push encoded (packet.fog.albedo.y)
+  @storage.push encoded (packet.fog.albedo.z)
+  @storage.push encoded (packet.fog.anisotropy)
+  @storage.push encoded (packet.fog.sun)
+  @storage.push encoded (packet.fog.ambient)
+  @storage.push encoded (packet.fog.sky)
+  @storage.push encoded (packet.fog.noise)
+  @storage.push encoded (packet.fog.noise_scale)
+  @storage.push encoded (packet.fog.drift.x)
+  @storage.push encoded (packet.fog.drift.y)
+  @storage.push encoded (packet.fog.drift.z)
+  @storage.push encoded (U32.to_f32 (packet.quality.volumetrics))
+  @storage.push encoded (U32.to_f32 fog_volumes_count)
   let state_start = encoded.length
   for i in 0 .. state_count:
     let source = collections.state[i]
@@ -951,6 +978,24 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     @storage.push encoded (reflection_probe.parallax_extent.y)
     @storage.push encoded (reflection_probe.parallax_extent.z)
     @storage.push encoded (reflection_probe.far)
+  for i in 0 .. fog_volumes_count:
+    let source = collections.fog_volumes[i]
+    let fog_volume: types.FogVolume = project.fog_volume context source
+    @storage.push encoded (U32.to_f32 (fog_volume.shape))
+    @storage.push encoded (fog_volume.center.x)
+    @storage.push encoded (fog_volume.center.y)
+    @storage.push encoded (fog_volume.center.z)
+    @storage.push encoded (fog_volume.extent.x)
+    @storage.push encoded (fog_volume.extent.y)
+    @storage.push encoded (fog_volume.extent.z)
+    @storage.push encoded (fog_volume.density)
+    @storage.push encoded (fog_volume.albedo.x)
+    @storage.push encoded (fog_volume.albedo.y)
+    @storage.push encoded (fog_volume.albedo.z)
+    @storage.push encoded (fog_volume.emission.x)
+    @storage.push encoded (fog_volume.emission.y)
+    @storage.push encoded (fog_volume.emission.z)
+    @storage.push encoded (fog_volume.falloff)
   for i in 0 .. listener_count:
     let source = collections.listener[i]
     let listener: types.Listener = project.listener context source
@@ -1049,6 +1094,7 @@ func measure_render_floats collections -> project -> context =>
   let cascades_count: U32 = collections.cascades.length
   let probes_count: U32 = collections.probes.length
   let reflection_probes_count: U32 = collections.reflection_probes.length
+  let fog_volumes_count: U32 = collections.fog_volumes.length
   let listener_count: U32 = collections.listener.length
   let panners_count: U32 = collections.panners.length
   let instances_count: U32 = collections.instances.length
@@ -1091,6 +1137,7 @@ func measure_render_floats collections -> project -> context =>
   total := self + cascades_count * 18
   total := self + probes_count * 28
   total := self + reflection_probes_count * 21
+  total := self + fog_volumes_count * 15
   total := self + listener_count * 9
   total := self + panners_count * 15
   total := self + instances_count * 26
@@ -1334,6 +1381,22 @@ func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (
   encoded[216] := packet.grade.vignette_radius
   encoded[217] := U32.to_f32 (packet.quality.ssr)
   encoded[218] := U32.to_f32 (packet.reflection.budget)
+  encoded[219] := packet.fog.edge
+  encoded[220] := packet.fog.distance
+  encoded[221] := packet.fog.albedo.x
+  encoded[222] := packet.fog.albedo.y
+  encoded[223] := packet.fog.albedo.z
+  encoded[224] := packet.fog.anisotropy
+  encoded[225] := packet.fog.sun
+  encoded[226] := packet.fog.ambient
+  encoded[227] := packet.fog.sky
+  encoded[228] := packet.fog.noise
+  encoded[229] := packet.fog.noise_scale
+  encoded[230] := packet.fog.drift.x
+  encoded[231] := packet.fog.drift.y
+  encoded[232] := packet.fog.drift.z
+  encoded[233] := U32.to_f32 (packet.quality.volumetrics)
+  encoded[234] := 0.0
   let at: U32 = protocol.packet_header_floats
   for draw in draws:
     encoded[at + 0] := U32.to_f32 (draw.mesh)

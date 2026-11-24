@@ -51,8 +51,12 @@ fn depth_texture(samples: u32) -> &'static str {
 // smooth edges against the sky.
 const ATMOSPHERE_SHADER: &str = include_str!("shaders/atmosphere.wgsl");
 
+const ATMOSPHERE_COMMON: &str = include_str!("shaders/atmosphere_common.wgsl");
+
 pub(crate) fn atmosphere_shader(samples: u32) -> String {
     ATMOSPHERE_SHADER
+        .replace("${common}", ATMOSPHERE_COMMON)
+        .replace("${volume}", crate::volume::COMMON_WGSL)
         .replace("${depth_texture}", depth_texture(samples))
         .replace("${fullscreen}", FULLSCREEN)
         .replace("${samples}", &samples.to_string())
@@ -163,7 +167,13 @@ const OCCLUSION_BIAS: f32 = 0.04;
 
 // The atmosphere pass's uniform: the camera, the sky the game worked out, the
 // fog and how far ambient occlusion darkens.
-fn atmosphere_of(frame: &RenderFrame, projection: &Matrix, quality: &Quality, width: u32, height: u32) -> [f32; 56] {
+pub(crate) fn atmosphere_of(
+    frame: &RenderFrame,
+    projection: &Matrix,
+    quality: &Quality,
+    width: u32,
+    height: u32,
+) -> [f32; 56] {
     let camera = invert(&frame.view);
     let sky = &frame.sky;
     let clear = &frame.clear;
@@ -224,6 +234,8 @@ struct TargetsKey {
     atmosphere: bool,
     levels: u32,
     taa: bool,
+    /// The froxel volume's grid the atmosphere pass reads (0 for none).
+    volume: u64,
 }
 
 /// The scene's attachments, as the passes view them, and the graph of the
@@ -487,11 +499,13 @@ impl Post {
         frame: &RenderFrame,
         quality: Quality,
         size: (u32, u32),
+        volume: &crate::volume::Applied,
     ) -> SceneTargets {
         self.quality = Some(quality);
         self.size = size;
         let occluding = quality.occlusion;
-        let atmosphere = quality.sky || frame.fog.density > 0.0 || occluding || frame.clouds.cover > 0.0;
+        let atmosphere =
+            quality.sky || frame.fog.density > 0.0 || occluding || frame.clouds.cover > 0.0 || volume.serial != 0;
         // At most the pixels of a 4K screen, whatever the scale and display:
         // the multisampled targets of more would take gigabytes.
         let limit = self.device.limits().max_texture_dimension_2d;
@@ -510,7 +524,7 @@ impl Post {
             0
         };
         let taa = quality.taa;
-        let key = TargetsKey { width, height, samples, occluding, atmosphere, levels, taa };
+        let key = TargetsKey { width, height, samples, occluding, atmosphere, levels, taa, volume: volume.serial };
         if self.targets.as_ref().is_none_or(|targets| targets.key != key) {
             self.targets = None;
             let attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
@@ -540,7 +554,7 @@ impl Post {
             for read in 0..if taa { 2 } else { 1 } {
                 let history = histories.as_ref().map(|textures| [view(&textures[read]), view(&textures[1 - read])]);
                 let graph = self
-                    .graph(built_ins, key, depth_only(), view(&scene), marks.clone(), history, graphs.first())
+                    .graph(built_ins, key, depth_only(), view(&scene), marks.clone(), history, volume, graphs.first())
                     .expect("the passes after the scene read only what earlier ones draw");
                 log::debug!("passes after the scene: {:?}, {} textures", graph.names(), graph.allocations());
                 graphs.push(graph);
@@ -585,6 +599,7 @@ impl Post {
         scene: wgpu::TextureView,
         marks: wgpu::TextureView,
         history: Option<[wgpu::TextureView; 2]>,
+        volume: &crate::volume::Applied,
         sharing: Option<&Graph>,
     ) -> anyhow::Result<Graph> {
         let TargetsKey { width, height, samples, occluding, atmosphere, levels, .. } = key;
@@ -607,12 +622,15 @@ impl Post {
         if atmosphere {
             let composed = graph.texture("composed", full(SCENE_FORMAT));
             let uniform = Binding::Uniform(self.uniform("atmosphere", 224));
+            let froxels = graph.import("froxels", volume.texture.clone());
             let bindings = vec![
                 uniform,
                 Binding::Texture(scene),
                 Binding::Texture(depth),
                 Binding::Texture(occlusion),
                 sampler.clone(),
+                Binding::Uniform(volume.uniform.clone()),
+                Binding::Texture(froxels),
             ];
             graph.pass("atmosphere", BuiltIn::Atmosphere(samples), bindings, Target::Texture(composed), false);
             lit = composed;

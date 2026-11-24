@@ -1270,6 +1270,26 @@ pub mod types {
         /// How far the capture sees: the farthest of its draws, in world units.
         pub far: f32,
     }
+    /// A local fog volume.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct FogVolume {
+        /// 0 a box, 1 an ellipsoid.
+        pub shape: u32,
+        /// The middle of the volume, in world units.
+        pub center: Vector,
+        /// Half the volume's size along x, y and z (an ellipsoid's semi-axes).
+        pub extent: Vector,
+        /// The extinction at full strength, per world unit.
+        pub density: f32,
+        /// The share of light it scatters, by channel; the rest it absorbs.
+        pub albedo: Vector,
+        /// The light it gives out, as radiance per unit of density (so a thicker volume glows
+        /// more); 0 for none.
+        pub emission: Vector,
+        /// The share of the half size, from the edge in, over which the density rises smoothly
+        /// from nothing to full (0 to 1; 0 for a hard edge).
+        pub falloff: f32,
+    }
     /// A listener: where it is, the way it faces and its up, in world units.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Listener {
@@ -1346,6 +1366,9 @@ pub mod types {
         /// resolved picture and the camera's depth, so they need a perspective camera, and they
         /// turn temporal antialiasing on: its history resolves their noise.
         pub ssr: u32,
+        /// The froxel volume's tier: 0 off (the mist is analytic, with no shafts or local
+        /// volumes), 1 low (a coarser grid, fewer slices and sun-shadow taps), 2 high.
+        pub volumetrics: u32,
     }
     impl Default for Quality {
         fn default() -> Self {
@@ -1360,6 +1383,7 @@ pub mod types {
                 bloom: Default::default(),
                 taa: Default::default(),
                 ssr: Default::default(),
+                volumetrics: Default::default(),
             }
         }
     }
@@ -1413,12 +1437,67 @@ pub mod types {
         /// already applied and divided by pi.
         pub sh8: Vector,
     }
-    /// Mist beyond `radius` of the middle; density 0 for none.
-    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    /// The participating medium: a mist beyond `radius` of the origin whose density falls off
+    /// exponentially with height, drawn through a froxel volume out to `distance` (lit by the
+    /// sun, the lights and the sky, with shafts and shadows) and analytically beyond it;
+    /// density 0 and no fog volumes for none.
+    #[derive(Clone, Copy, Debug, PartialEq)]
     pub struct Fog {
         pub radius: f32,
         pub density: f32,
+        /// The scale height of the mist: its density falls by a factor of e over this many
+        /// world units above the ground (above y = 0).
         pub height: f32,
+        /// How far past `radius` (world units) the mist takes to rise from nothing to its full
+        /// density, smoothly; 0 for a hard edge.
+        pub edge: f32,
+        /// How far ahead of the camera the froxel volume reaches, along the view; beyond it the
+        /// mist continues analytically with the same medium. 0 draws the mist analytically
+        /// alone (and the local volumes not at all).
+        pub distance: f32,
+        /// The share of light the mist scatters, by channel; the rest it absorbs.
+        pub albedo: Vector,
+        /// The Henyey-Greenstein asymmetry g (-0.95 to 0.95) of the mist's phase function:
+        /// positive scatters toward where the light is going (shafts toward the sun), negative
+        /// back toward it, 0 evenly.
+        pub anisotropy: f32,
+        /// How much of the sun's light the mist scatters, a scale on its in-scattering (0 for
+        /// none).
+        pub sun: f32,
+        /// How much of the sky's and the probes' ambient light the mist scatters, a scale on
+        /// its in-scattering.
+        pub ambient: f32,
+        /// How far the mist's ambient colour is the sky's own color in the direction looked,
+        /// rather than the sky's mean light all round (0 to 1): 1 makes distant objects fade
+        /// into the sky behind them.
+        pub sky: f32,
+        /// How much a 3D noise varies the global mist's density (0 to 1: 0 uniform, 1 from
+        /// nothing to twice the mean); the mean density stays what it was.
+        pub noise: f32,
+        /// The size in world units of the noise's coarsest cell; finer octaves follow.
+        pub noise_scale: f32,
+        /// How far the game has carried the noise along x, y and z (wind times time): the same
+        /// drift draws the same mist.
+        pub drift: Vector,
+    }
+    impl Default for Fog {
+        fn default() -> Self {
+            Self {
+                radius: Default::default(),
+                density: Default::default(),
+                height: 1.0,
+                edge: 0.0,
+                distance: 0.0,
+                albedo: Vector { x: 1.0, y: 1.0, z: 1.0 },
+                anisotropy: 0.0,
+                sun: 1.0,
+                ambient: 1.0,
+                sky: 0.0,
+                noise: 0.0,
+                noise_scale: 16.0,
+                drift: Vector { x: 0.0, y: 0.0, z: 0.0 },
+            }
+        }
     }
     /// The shadow map's view; `texels` 0 for no shadows.
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -1655,7 +1734,10 @@ pub mod types {
         /// A lattice of diffuse light probes the game baked: where it is and how big, and the
         /// revision of the probes the host holds.
         pub probe_volume: ProbeVolume,
-        /// Mist beyond `radius` of the middle; density 0 for none.
+        /// The participating medium: a mist beyond `radius` of the origin whose density falls
+        /// off exponentially with height, drawn through a froxel volume out to `distance` (lit
+        /// by the sun, the lights and the sky, with shafts and shadows) and analytically beyond
+        /// it; density 0 and no fog volumes for none.
         pub fog: Fog,
         /// The shadow map's view; `texels` 0 for no shadows.
         pub shadow: Shadow,
@@ -1748,6 +1830,11 @@ pub mod types {
         /// rises), within `reflection.budget` faces a frame, and keeps MAX_REFLECTION_SLOTS
         /// cubes, dropping the ones least worth keeping.
         pub reflection_probes: Vec<ReflectionProbe>,
+        /// Local fog volumes: boxes and ellipsoids of the world, axis-aligned, whose medium
+        /// adds to the global mist's inside them (when `fog.distance` is above 0 and the
+        /// volumetrics tier is on): extinction `density` per world unit, scattering `albedo`,
+        /// `emission`, and a falloff toward the edge.
+        pub fog_volumes: Vec<FogVolume>,
         /// Where the panners are heard from, as WebAudio's AudioListener: none, the camera
         /// (`view`'s eye, facing where it looks, its up the view's), or one listener.
         pub listener: Vec<Listener>,
@@ -1819,6 +1906,7 @@ pub mod types {
                 cascades: Default::default(),
                 probes: Default::default(),
                 reflection_probes: Default::default(),
+                fog_volumes: Default::default(),
                 listener: Default::default(),
                 panners: Default::default(),
                 instances: Default::default(),
@@ -1928,6 +2016,8 @@ pub mod codec {
     /// The most reflection probes one frame may publish; the host keeps the nearest and most
     /// important few in its cube array (MAX_REFLECTION_SLOTS).
     pub const MAX_REFLECTION_PROBES: usize = 64;
+    /// The most local fog volumes one frame may publish.
+    pub const MAX_FOG_VOLUMES: usize = 32;
     /// Preference events from this index on carry the engine's preferences
     /// (ENGINE_PREFERENCE_*); below it, the game's own.
     pub const ENGINE_PREFERENCES: usize = 64;
@@ -1961,8 +2051,10 @@ pub mod codec {
     /// exposure.cut, grade.temperature, grade.tint, grade.exposure, grade.contrast,
     /// grade.pivot, grade.saturation, grade.vibrance, grade.lift3, grade.gamma3, grade.gain3,
     /// grade.lut_a, grade.lut_b, grade.lut_blend, grade.lut_weight, grade.vignette,
-    /// grade.vignette_radius, quality.ssr, reflection.budget.
-    pub const PACKET_HEADER_FLOATS: usize = 219;
+    /// grade.vignette_radius, quality.ssr, reflection.budget, fog.edge, fog.distance,
+    /// fog.albedo3, fog.anisotropy, fog.sun, fog.ambient, fog.sky, fog.noise, fog.noise_scale,
+    /// fog.drift3, quality.volumetrics, fog_volume_count.
+    pub const PACKET_HEADER_FLOATS: usize = 235;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -2011,6 +2103,8 @@ pub mod codec {
     /// Lanes: id, revision, priority, capture, position3, center3, extent3, blend,
     /// parallax_center3, parallax_extent3, far.
     pub const REFLECTION_PROBE_FLOATS: usize = 21;
+    /// Lanes: shape, center3, extent3, density, albedo3, emission3, falloff.
+    pub const FOG_VOLUME_FLOATS: usize = 15;
     /// Lanes: position3, forward3, up3.
     pub const LISTENER_FLOATS: usize = 9;
     /// Lanes: voice, sound, position3, orientation3, distance_model, ref_distance,
@@ -2152,6 +2246,18 @@ pub mod codec {
             pub const GRADE_VIGNETTE_RADIUS: usize = 216;
             pub const QUALITY_SSR: usize = 217;
             pub const REFLECTION_BUDGET: usize = 218;
+            pub const FOG_EDGE: usize = 219;
+            pub const FOG_DISTANCE: usize = 220;
+            pub const FOG_ALBEDO: usize = 221;
+            pub const FOG_ANISOTROPY: usize = 224;
+            pub const FOG_SUN: usize = 225;
+            pub const FOG_AMBIENT: usize = 226;
+            pub const FOG_SKY: usize = 227;
+            pub const FOG_NOISE: usize = 228;
+            pub const FOG_NOISE_SCALE: usize = 229;
+            pub const FOG_DRIFT: usize = 230;
+            pub const QUALITY_VOLUMETRICS: usize = 233;
+            pub const FOG_VOLUME_COUNT: usize = 234;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -2289,6 +2395,15 @@ pub mod codec {
             pub const PARALLAX_CENTER: usize = 14;
             pub const PARALLAX_EXTENT: usize = 17;
             pub const FAR: usize = 20;
+        }
+        pub mod fog_volume {
+            pub const SHAPE: usize = 0;
+            pub const CENTER: usize = 1;
+            pub const EXTENT: usize = 4;
+            pub const DENSITY: usize = 7;
+            pub const ALBEDO: usize = 8;
+            pub const EMISSION: usize = 11;
+            pub const FALLOFF: usize = 14;
         }
         pub mod listener {
             pub const POSITION: usize = 0;
@@ -2782,6 +2897,18 @@ pub mod codec {
             Ok(())
         }
 
+        fn decode_fog_volume(&mut self, lane: usize, fog_volume: &mut FogVolume) -> Result<()> {
+            let shape = self.count(lane, 1)?;
+            let center = Vector { x: self.packet[lane + 1], y: self.packet[lane + 2], z: self.packet[lane + 3] };
+            let extent = Vector { x: self.packet[lane + 4], y: self.packet[lane + 5], z: self.packet[lane + 6] };
+            let density = self.packet[lane + 7];
+            let albedo = Vector { x: self.packet[lane + 8], y: self.packet[lane + 9], z: self.packet[lane + 10] };
+            let emission = Vector { x: self.packet[lane + 11], y: self.packet[lane + 12], z: self.packet[lane + 13] };
+            let falloff = self.packet[lane + 14];
+            *fog_volume = FogVolume { shape: shape as u32, center, extent, density, albedo, emission, falloff };
+            Ok(())
+        }
+
         fn decode_listener(&mut self, lane: usize, listener: &mut Listener) -> Result<()> {
             let position = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
             let forward = Vector { x: self.packet[lane + 3], y: self.packet[lane + 4], z: self.packet[lane + 5] };
@@ -2889,6 +3016,7 @@ pub mod codec {
         let panners_count = reader.count(173, MAX_PANNERS)?;
         let instances_count = reader.count(179, MAX_INSTANCES)?;
         let instance_removals_count = reader.count(180, MAX_INSTANCE_REMOVALS)?;
+        let fog_volumes_count = reader.count(234, MAX_FOG_VOLUMES)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -2930,7 +3058,9 @@ pub mod codec {
         let probes_end = probes_start + probes_count * PROBE_FLOATS;
         let reflection_probes_start = probes_end;
         let reflection_probes_end = reflection_probes_start + reflection_probes_count * REFLECTION_PROBE_FLOATS;
-        let listener_start = reflection_probes_end;
+        let fog_volumes_start = reflection_probes_end;
+        let fog_volumes_end = fog_volumes_start + fog_volumes_count * FOG_VOLUME_FLOATS;
+        let listener_start = fog_volumes_end;
         let listener_end = listener_start + listener_count * LISTENER_FLOATS;
         let panners_start = listener_end;
         let panners_end = panners_start + panners_count * PANNER_FLOATS;
@@ -3080,6 +3210,17 @@ pub mod codec {
         let grade_vignette_radius = reader.packet[216];
         let quality_ssr = reader.count(217, 2)?;
         let reflection_budget = reader.count(218, 6)?;
+        let fog_edge = reader.packet[219];
+        let fog_distance = reader.packet[220];
+        let fog_albedo = Vector { x: reader.packet[221], y: reader.packet[222], z: reader.packet[223] };
+        let fog_anisotropy = reader.packet[224];
+        let fog_sun = reader.packet[225];
+        let fog_ambient = reader.packet[226];
+        let fog_sky = reader.packet[227];
+        let fog_noise = reader.packet[228];
+        let fog_noise_scale = reader.packet[229];
+        let fog_drift = Vector { x: reader.packet[230], y: reader.packet[231], z: reader.packet[232] };
+        let quality_volumetrics = reader.count(233, 2)?;
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -3244,6 +3385,11 @@ pub mod codec {
         for (index, reflection_probe) in reflection_probes.iter_mut().enumerate() {
             reader.decode_reflection_probe(reflection_probes_start + index * REFLECTION_PROBE_FLOATS, reflection_probe)?;
         }
+        let mut fog_volumes = std::mem::take(&mut frame.fog_volumes);
+        resize(&mut fog_volumes, fog_volumes_count);
+        for (index, fog_volume) in fog_volumes.iter_mut().enumerate() {
+            reader.decode_fog_volume(fog_volumes_start + index * FOG_VOLUME_FLOATS, fog_volume)?;
+        }
         let mut listener = std::mem::take(&mut frame.listener);
         resize(&mut listener, listener_count);
         for (index, listener) in listener.iter_mut().enumerate() {
@@ -3280,10 +3426,10 @@ pub mod codec {
             light_direction,
             light_color,
             aberration,
-            quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa, ssr: quality_ssr as u32 },
+            quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa, ssr: quality_ssr as u32, volumetrics: quality_volumetrics as u32 },
             sky: Sky { zenith: sky_zenith, horizon: sky_horizon, ground: sky_ground, sun: sky_sun, night: sky_night, tint: sky_tint, sh0: sky_sh0, sh1: sky_sh1, sh2: sky_sh2, sh3: sky_sh3, sh4: sky_sh4, sh5: sky_sh5, sh6: sky_sh6, sh7: sky_sh7, sh8: sky_sh8 },
             probe_volume: ProbeVolume { revision: probe_volume_revision as u32, nx: probe_volume_nx as u32, ny: probe_volume_ny as u32, nz: probe_volume_nz as u32, spacing: probe_volume_spacing, origin: probe_volume_origin },
-            fog: Fog { radius: fog_radius, density: fog_density, height: fog_height },
+            fog: Fog { radius: fog_radius, density: fog_density, height: fog_height, edge: fog_edge, distance: fog_distance, albedo: fog_albedo, anisotropy: fog_anisotropy, sun: fog_sun, ambient: fog_ambient, sky: fog_sky, noise: fog_noise, noise_scale: fog_noise_scale, drift: fog_drift },
             shadow: Shadow { view: shadow_view, texels: shadow_texels as u32, filter: shadow_filter as u32, softness: shadow_softness, contact: shadow_contact as u32, contact_length: shadow_contact_length, local: shadow_local as u32, local_texels: shadow_local_texels as u32 },
             blur,
             clouds: Clouds { cover: clouds_cover, drift: clouds_drift },
@@ -3314,6 +3460,7 @@ pub mod codec {
             cascades,
             probes,
             reflection_probes,
+            fog_volumes,
             listener,
             panners,
             instances,
@@ -3398,6 +3545,7 @@ pub mod codec {
         let panners_count = d.count(&header.field("panner_count"), 173, MAX_PANNERS)?;
         let instances_count = d.count(&header.field("instance_count"), 179, MAX_INSTANCES)?;
         let instance_removals_count = d.count(&header.field("instance_removal_count"), 180, MAX_INSTANCE_REMOVALS)?;
+        let fog_volumes_count = d.count(&header.field("fog_volume_count"), 234, MAX_FOG_VOLUMES)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3439,7 +3587,9 @@ pub mod codec {
         let probes_end = d.end(&Location::section("probes"), probes_start, probes_count, PROBE_FLOATS)?;
         let reflection_probes_start = probes_end;
         let reflection_probes_end = d.end(&Location::section("reflection_probes"), reflection_probes_start, reflection_probes_count, REFLECTION_PROBE_FLOATS)?;
-        let listener_start = reflection_probes_end;
+        let fog_volumes_start = reflection_probes_end;
+        let fog_volumes_end = d.end(&Location::section("fog_volumes"), fog_volumes_start, fog_volumes_count, FOG_VOLUME_FLOATS)?;
+        let listener_start = fog_volumes_end;
         let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
         let panners_start = listener_end;
         let panners_end = d.end(&Location::section("panners"), panners_start, panners_count, PANNER_FLOATS)?;
@@ -3546,6 +3696,17 @@ pub mod codec {
         d.finite(&header.field("grade.vignette_radius"), 216)?;
         let _ = d.count(&header.field("quality.ssr"), 217, 2)?;
         let _ = d.count(&header.field("reflection.budget"), 218, 6)?;
+        d.finite(&header.field("fog.edge"), 219)?;
+        d.finite(&header.field("fog.distance"), 220)?;
+        d.values(&header.field("fog.albedo"), 221, 3, &["x","y","z"])?;
+        d.finite(&header.field("fog.anisotropy"), 224)?;
+        d.finite(&header.field("fog.sun"), 225)?;
+        d.finite(&header.field("fog.ambient"), 226)?;
+        d.finite(&header.field("fog.sky"), 227)?;
+        d.finite(&header.field("fog.noise"), 228)?;
+        d.finite(&header.field("fog.noise_scale"), 229)?;
+        d.values(&header.field("fog.drift"), 230, 3, &["x","y","z"])?;
+        let _ = d.count(&header.field("quality.volumetrics"), 233, 2)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -3831,6 +3992,19 @@ pub mod codec {
             base += REFLECTION_PROBE_FLOATS;
         }
         d.exhausted(&Location::section("reflection_probes"), base, reflection_probes_end)?;
+        let mut base = fog_volumes_start;
+        for item in 0..fog_volumes_count {
+            let path = &Location::section("fog_volumes").index(item);
+            let shape = d.count(&path.field("shape"), base, 1)?;
+            d.values(&path.field("center"), base + 1, 3, &["x","y","z"])?;
+            d.values(&path.field("extent"), base + 4, 3, &["x","y","z"])?;
+            d.finite(&path.field("density"), base + 7)?;
+            d.values(&path.field("albedo"), base + 8, 3, &["x","y","z"])?;
+            d.values(&path.field("emission"), base + 11, 3, &["x","y","z"])?;
+            d.finite(&path.field("falloff"), base + 14)?;
+            base += FOG_VOLUME_FLOATS;
+        }
+        d.exhausted(&Location::section("fog_volumes"), base, fog_volumes_end)?;
         let mut base = listener_start;
         for item in 0..listener_count {
             let path = &Location::section("listener").index(item);
@@ -3925,6 +4099,7 @@ pub mod codec {
         let panners_count = d.count(&header.field("panner_count"), 173, MAX_PANNERS)?;
         let instances_count = d.count(&header.field("instance_count"), 179, MAX_INSTANCES)?;
         let instance_removals_count = d.count(&header.field("instance_removal_count"), 180, MAX_INSTANCE_REMOVALS)?;
+        let fog_volumes_count = d.count(&header.field("fog_volume_count"), 234, MAX_FOG_VOLUMES)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3966,7 +4141,9 @@ pub mod codec {
         let probes_end = d.end(&Location::section("probes"), probes_start, probes_count, PROBE_FLOATS)?;
         let reflection_probes_start = probes_end;
         let reflection_probes_end = d.end(&Location::section("reflection_probes"), reflection_probes_start, reflection_probes_count, REFLECTION_PROBE_FLOATS)?;
-        let listener_start = reflection_probes_end;
+        let fog_volumes_start = reflection_probes_end;
+        let fog_volumes_end = d.end(&Location::section("fog_volumes"), fog_volumes_start, fog_volumes_count, FOG_VOLUME_FLOATS)?;
+        let listener_start = fog_volumes_end;
         let listener_end = d.end(&Location::section("listener"), listener_start, listener_count, LISTENER_FLOATS)?;
         let panners_start = listener_end;
         let panners_end = d.end(&Location::section("panners"), panners_start, panners_count, PANNER_FLOATS)?;
@@ -4078,18 +4255,21 @@ pub mod codec {
             frame.aberration.y, frame.quality.msaa as f32, f32::from(frame.quality.fxaa), frame.quality.scale,
             frame.quality.filtering as f32, f32::from(frame.quality.occlusion), f32::from(frame.quality.sky),
             f32::from(frame.quality.effects), f32::from(frame.quality.bloom), f32::from(frame.quality.taa),
-            frame.quality.ssr as f32, frame.sky.zenith.x, frame.sky.zenith.y, frame.sky.zenith.z,
-            frame.sky.horizon.x, frame.sky.horizon.y, frame.sky.horizon.z, frame.sky.ground.x,
-            frame.sky.ground.y, frame.sky.ground.z, frame.sky.sun.x, frame.sky.sun.y, frame.sky.sun.z,
-            frame.sky.night, frame.sky.tint.x, frame.sky.tint.y, frame.sky.tint.z, frame.sky.sh0.x,
-            frame.sky.sh0.y, frame.sky.sh0.z, frame.sky.sh1.x, frame.sky.sh1.y, frame.sky.sh1.z, frame.sky.sh2.x,
-            frame.sky.sh2.y, frame.sky.sh2.z, frame.sky.sh3.x, frame.sky.sh3.y, frame.sky.sh3.z, frame.sky.sh4.x,
-            frame.sky.sh4.y, frame.sky.sh4.z, frame.sky.sh5.x, frame.sky.sh5.y, frame.sky.sh5.z, frame.sky.sh6.x,
-            frame.sky.sh6.y, frame.sky.sh6.z, frame.sky.sh7.x, frame.sky.sh7.y, frame.sky.sh7.z, frame.sky.sh8.x,
-            frame.sky.sh8.y, frame.sky.sh8.z, frame.probe_volume.revision as f32, frame.probe_volume.nx as f32,
-            frame.probe_volume.ny as f32, frame.probe_volume.nz as f32, frame.probe_volume.spacing,
-            frame.probe_volume.origin.x, frame.probe_volume.origin.y, frame.probe_volume.origin.z,
-            frame.fog.radius, frame.fog.density, frame.fog.height,
+            frame.quality.ssr as f32, frame.quality.volumetrics as f32, frame.sky.zenith.x, frame.sky.zenith.y,
+            frame.sky.zenith.z, frame.sky.horizon.x, frame.sky.horizon.y, frame.sky.horizon.z,
+            frame.sky.ground.x, frame.sky.ground.y, frame.sky.ground.z, frame.sky.sun.x, frame.sky.sun.y,
+            frame.sky.sun.z, frame.sky.night, frame.sky.tint.x, frame.sky.tint.y, frame.sky.tint.z,
+            frame.sky.sh0.x, frame.sky.sh0.y, frame.sky.sh0.z, frame.sky.sh1.x, frame.sky.sh1.y, frame.sky.sh1.z,
+            frame.sky.sh2.x, frame.sky.sh2.y, frame.sky.sh2.z, frame.sky.sh3.x, frame.sky.sh3.y, frame.sky.sh3.z,
+            frame.sky.sh4.x, frame.sky.sh4.y, frame.sky.sh4.z, frame.sky.sh5.x, frame.sky.sh5.y, frame.sky.sh5.z,
+            frame.sky.sh6.x, frame.sky.sh6.y, frame.sky.sh6.z, frame.sky.sh7.x, frame.sky.sh7.y, frame.sky.sh7.z,
+            frame.sky.sh8.x, frame.sky.sh8.y, frame.sky.sh8.z, frame.probe_volume.revision as f32,
+            frame.probe_volume.nx as f32, frame.probe_volume.ny as f32, frame.probe_volume.nz as f32,
+            frame.probe_volume.spacing, frame.probe_volume.origin.x, frame.probe_volume.origin.y,
+            frame.probe_volume.origin.z, frame.fog.radius, frame.fog.density, frame.fog.height, frame.fog.edge,
+            frame.fog.distance, frame.fog.albedo.x, frame.fog.albedo.y, frame.fog.albedo.z, frame.fog.anisotropy,
+            frame.fog.sun, frame.fog.ambient, frame.fog.sky, frame.fog.noise, frame.fog.noise_scale,
+            frame.fog.drift.x, frame.fog.drift.y, frame.fog.drift.z,
         ]);
         out.extend_from_slice(&frame.shadow.view);
         out.extend([
@@ -4185,6 +4365,10 @@ pub mod codec {
         out.push(frame.reflection_probes.len() as f32);
         for reflection_probe in &frame.reflection_probes {
             canonical_reflection_probe(&mut out, reflection_probe);
+        }
+        out.push(frame.fog_volumes.len() as f32);
+        for fog_volume in &frame.fog_volumes {
+            canonical_fog_volume(&mut out, fog_volume);
         }
         out.push(frame.listener.len() as f32);
         for listener in &frame.listener {
@@ -4365,6 +4549,15 @@ pub mod codec {
             reflection_probe.parallax_center.y, reflection_probe.parallax_center.z,
             reflection_probe.parallax_extent.x, reflection_probe.parallax_extent.y,
             reflection_probe.parallax_extent.z, reflection_probe.far,
+        ]);
+    }
+
+    fn canonical_fog_volume(out: &mut Vec<f32>, fog_volume: &FogVolume) {
+        out.extend([
+            fog_volume.shape as f32, fog_volume.center.x, fog_volume.center.y, fog_volume.center.z,
+            fog_volume.extent.x, fog_volume.extent.y, fog_volume.extent.z, fog_volume.density,
+            fog_volume.albedo.x, fog_volume.albedo.y, fog_volume.albedo.z, fog_volume.emission.x,
+            fog_volume.emission.y, fog_volume.emission.z, fog_volume.falloff,
         ]);
     }
 

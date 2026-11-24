@@ -38,6 +38,7 @@ mod taa;
 mod testing;
 mod texture;
 mod texture_recipe;
+mod volume;
 
 use pen_protocol::{Catalog, GameEvent, RenderFrame};
 
@@ -48,6 +49,7 @@ pub use filter::ColorFilter;
 pub use inspect::{TextureInfo, inspect_material, inspect_mesh, inspect_texture, shader_draws_sprites};
 pub use lights::LIGHTS_WGSL;
 pub use prefetch::Prefetch;
+pub use volume::{VolumeImage, VolumeLayer};
 
 /// WGSL a sprite shader adds to draw text from a multi-channel signed
 /// distance field atlas (pen-texture's `msdf`), crisp at any scale:
@@ -135,6 +137,10 @@ pub struct RenderStats {
     /// back): a fixed frame's setting, or where auto exposure had adapted to.
     /// Read back without waiting for the GPU.
     pub exposure: Option<f32>,
+    /// The froxels the volumetric fog filled this frame (0 when it is off or the
+    /// mist is analytic alone), and whether it blended last frame's.
+    pub volume_froxels: u32,
+    pub volume_history: bool,
 }
 
 /// How long the GPU took over a frame's passes, in milliseconds: the shadow
@@ -279,6 +285,21 @@ impl Renderer {
     /// the same from the game).
     pub fn reset_exposure(&mut self) {
         self.state.reset_exposure();
+    }
+
+    /// Makes the froxel volume of the mist take no history from the frames
+    /// before for the next frame it draws, as a host that restores or replays
+    /// an earlier moment of the game does (a frame's `exposure.cut` does the
+    /// same from the game).
+    pub fn reset_volumetrics(&mut self) {
+        self.state.reset_volumetrics();
+    }
+
+    /// Reads a texture of the last frame's froxel volume back, waiting for the
+    /// GPU: for tools and tests. None before a frame has drawn one.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn read_volume(&self, layer: VolumeLayer) -> Option<VolumeImage> {
+        self.state.read_volume(layer)
     }
 
     /// Where the catalog's mesh or material (`pen_protocol::devtools_asset`

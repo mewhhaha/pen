@@ -90,7 +90,7 @@ checkout as Blot (`pen/protocol.blot`, `pen/types.blot`,
   and height, the events (keys by code, the pointer, the wheel, focus lost,
   console commands, stored preferences, tunables, interface actions, service
   answers, the game's own events) and no state.
-- **Render packet**, each frame: the camera, the light, the sky, fog and shadow
+- **Render packet**, each frame: the camera, the light, the sky, fog (with its local fog volumes) and shadow
   settings, quality, then sections: the draws, solids, decals, sprites, insets,
   sounds, voices and buses, field patches, the interface's nodes for assistive
   technology, service requests, preferences to store, then the game's own

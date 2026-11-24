@@ -289,7 +289,7 @@ fn frame(draws: Vec<Draw>, poses: Vec<Pose>, view: Matrix, projection: Matrix) -
         clear: Color { r: 0.12, g: 0.13, b: 0.16, a: 1.0 },
         quality: Quality { msaa: 4, scale: 1.0, filtering: 1, ..Default::default() },
         sky: Sky { sun: Vector { x: 0.0, y: 1.0, z: 0.0 }, ..Default::default() },
-        fog: Fog { radius: 0.0, density: 0.0, height: 1.0 },
+        fog: Fog { height: 1.0, ..Fog::default() },
         shadow: Shadow::default(),
         exposure: Default::default(),
         grade: Default::default(),

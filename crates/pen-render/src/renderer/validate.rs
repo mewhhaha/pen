@@ -63,6 +63,7 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
         );
         ensure!(probe.far > 0.0, "a reflection probe must see some distance");
     }
+    validate_fog(frame)?;
     ensure!(hypot(&frame.light_direction) >= 1e-8, "light direction must be nonzero");
     let aberration = &frame.aberration;
     ensure!(
@@ -254,5 +255,64 @@ fn validate_grade(grade: &Grade) -> Result<()> {
             && within(grade.vignette_radius, 0.0, 1.0),
         "the grade's table blend and weight and its vignette must be within 0..1"
     );
+    Ok(())
+}
+
+/// The mist and the local fog volumes: finite, and within what the shaders
+/// divide by.
+fn validate_fog(frame: &RenderFrame) -> Result<()> {
+    let finite = |v: &pen_protocol::Vector| v.x.is_finite() && v.y.is_finite() && v.z.is_finite();
+    let fog = &frame.fog;
+    let scalars = [
+        fog.radius,
+        fog.density,
+        fog.height,
+        fog.edge,
+        fog.distance,
+        fog.anisotropy,
+        fog.sun,
+        fog.ambient,
+        fog.sky,
+        fog.noise,
+        fog.noise_scale,
+    ];
+    ensure!(scalars.iter().all(|value| value.is_finite()), "fog must contain finite float32 values");
+    ensure!(finite(&fog.albedo) && finite(&fog.drift), "fog must contain finite float32 values");
+    ensure!(
+        fog.radius >= 0.0
+            && fog.density >= 0.0
+            && fog.edge >= 0.0
+            && fog.distance >= 0.0
+            && fog.sun >= 0.0
+            && fog.ambient >= 0.0,
+        "fog's radius, density, edge, distance, sun and ambient must not be negative"
+    );
+    ensure!(fog.height > 0.0 && fog.noise_scale > 0.0, "fog needs a positive height and noise scale");
+    ensure!(
+        (-1.0..=1.0).contains(&fog.anisotropy) && (0.0..=1.0).contains(&fog.sky) && (0.0..=1.0).contains(&fog.noise),
+        "fog's anisotropy must be within -1..1, its sky and noise within 0..1"
+    );
+    ensure!(fog.albedo.x >= 0.0 && fog.albedo.y >= 0.0 && fog.albedo.z >= 0.0, "fog's albedo must not be negative");
+    for volume in &frame.fog_volumes {
+        let vectors = [volume.center, volume.extent, volume.albedo, volume.emission];
+        ensure!(
+            vectors.iter().all(finite) && volume.density.is_finite() && volume.falloff.is_finite(),
+            "fog volumes must contain finite float32 values"
+        );
+        ensure!(
+            volume.extent.x > 0.0 && volume.extent.y > 0.0 && volume.extent.z > 0.0 && volume.density >= 0.0,
+            "a fog volume needs a positive size and a density that is not negative"
+        );
+        ensure!((0.0..=1.0).contains(&volume.falloff), "a fog volume's falloff must be within 0..1");
+        ensure!(
+            volume.albedo.x >= 0.0
+                && volume.albedo.y >= 0.0
+                && volume.albedo.z >= 0.0
+                && volume.emission.x >= 0.0
+                && volume.emission.y >= 0.0
+                && volume.emission.z >= 0.0,
+            "a fog volume's albedo and emission must not be negative"
+        );
+    }
     Ok(())
 }

@@ -726,6 +726,36 @@ func reflection_probe_into (canonical: #[F32]) -> (stream: own Stream): Stream =
   stream.at := at
   return stream
 
+func fog_volume_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
+  let at = stream.at
+  let base = stream.output.length
+  for 0 .. 15:
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 1] := canonical[at + 0]
+  stream.output[base + 2] := canonical[at + 1]
+  stream.output[base + 3] := canonical[at + 2]
+  at := at + 3
+  stream.output[base + 4] := canonical[at + 0]
+  stream.output[base + 5] := canonical[at + 1]
+  stream.output[base + 6] := canonical[at + 2]
+  at := at + 3
+  stream.output[base + 7] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 8] := canonical[at + 0]
+  stream.output[base + 9] := canonical[at + 1]
+  stream.output[base + 10] := canonical[at + 2]
+  at := at + 3
+  stream.output[base + 11] := canonical[at + 0]
+  stream.output[base + 12] := canonical[at + 1]
+  stream.output[base + 13] := canonical[at + 2]
+  at := at + 3
+  stream.output[base + 14] := canonical[at + 0]
+  at := at + 1
+  stream.at := at
+  return stream
+
 func listener_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
@@ -939,6 +969,8 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   at := at + 1
   stream.output[217] := canonical[at + 0]
   at := at + 1
+  stream.output[233] := canonical[at + 0]
+  at := at + 1
   stream.output[74] := canonical[at + 0]
   stream.output[75] := canonical[at + 1]
   stream.output[76] := canonical[at + 2]
@@ -1017,6 +1049,30 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   at := at + 1
   stream.output[127] := canonical[at + 0]
   at := at + 1
+  stream.output[219] := canonical[at + 0]
+  at := at + 1
+  stream.output[220] := canonical[at + 0]
+  at := at + 1
+  stream.output[221] := canonical[at + 0]
+  stream.output[222] := canonical[at + 1]
+  stream.output[223] := canonical[at + 2]
+  at := at + 3
+  stream.output[224] := canonical[at + 0]
+  at := at + 1
+  stream.output[225] := canonical[at + 0]
+  at := at + 1
+  stream.output[226] := canonical[at + 0]
+  at := at + 1
+  stream.output[227] := canonical[at + 0]
+  at := at + 1
+  stream.output[228] := canonical[at + 0]
+  at := at + 1
+  stream.output[229] := canonical[at + 0]
+  at := at + 1
+  stream.output[230] := canonical[at + 0]
+  stream.output[231] := canonical[at + 1]
+  stream.output[232] := canonical[at + 2]
+  at := at + 3
   stream.output[128] := canonical[at + 0]
   stream.output[129] := canonical[at + 1]
   stream.output[130] := canonical[at + 2]
@@ -1299,6 +1355,14 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
     stream := reflection_probe_into canonical stream
   at := stream.at
   stream.output[171] := U32.to_f32 reflection_probes_count
+  let fog_volumes_start: U32 = stream.output.length
+  let fog_volumes_count = lanes.integer canonical[at] lanes.max_integer
+  at := at + 1
+  stream.at := at
+  for 0 .. fog_volumes_count:
+    stream := fog_volume_into canonical stream
+  at := stream.at
+  stream.output[234] := U32.to_f32 fog_volumes_count
   let listener_start: U32 = stream.output.length
   let listener_count = lanes.integer canonical[at] lanes.max_integer
   at := at + 1

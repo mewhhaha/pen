@@ -36,10 +36,10 @@ use pen_protocol::boundary::{
     canonical_input, canonical_render, decode_frame, encode_frame, whole,
 };
 use pen_protocol::{
-    Aberration, Bus, Cascade, Catalog, Clouds, Color, Decal, Draw, Drift, Emitter, Exposure, FieldPatch, Fog, Frame,
-    GameEvent, Grade, Inset, Instance, InstanceRemoval, Light, Listener, Panner, Pose, Probe, ProbeVolume, Quality,
-    Reflection, ReflectionProbe, RenderFrame, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode,
-    Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
+    Aberration, Bus, Cascade, Catalog, Clouds, Color, Decal, Draw, Drift, Emitter, Exposure, FieldPatch, Fog,
+    FogVolume, Frame, GameEvent, Grade, Inset, Instance, InstanceRemoval, Light, Listener, Panner, Pose, Probe,
+    ProbeVolume, Quality, Reflection, ReflectionProbe, RenderFrame, ServiceRequest, Shadow, Sky, Solid, SolidFace,
+    Sound, Sprite, UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
 };
 
 const HARNESS: &str = include_str!("codec_round_trip.blot");
@@ -609,6 +609,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             bloom: rng.flag(),
             taa: rng.flag(),
             ssr: rng.whole(2),
+            volumetrics: rng.whole(2),
         },
         reflection: Reflection { budget: rng.whole(6) },
         sky: Sky {
@@ -636,7 +637,21 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             spacing: rng.number(),
             origin: rng.vector(),
         },
-        fog: Fog { radius: rng.number(), density: rng.number(), height: rng.number() },
+        fog: Fog {
+            radius: rng.number(),
+            density: rng.number(),
+            height: rng.number(),
+            edge: rng.number(),
+            distance: rng.number(),
+            albedo: rng.vector(),
+            anisotropy: rng.number(),
+            sun: rng.number(),
+            ambient: rng.number(),
+            sky: rng.number(),
+            noise: rng.number(),
+            noise_scale: rng.number(),
+            drift: rng.vector(),
+        },
         shadow: Shadow {
             view: rng.lanes(),
             texels: rng.whole(8192),
@@ -871,6 +886,18 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 parallax_center: rng.vector(),
                 parallax_extent: rng.vector(),
                 far: rng.number(),
+            })
+        },
+        fog_volumes: {
+            let count = rng.count(4);
+            rng.list(count, |rng| FogVolume {
+                shape: rng.whole(1),
+                center: rng.vector(),
+                extent: rng.vector(),
+                density: rng.number(),
+                albedo: rng.vector(),
+                emission: rng.vector(),
+                falloff: rng.number(),
             })
         },
         lights: {

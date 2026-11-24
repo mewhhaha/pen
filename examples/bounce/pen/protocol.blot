@@ -102,6 +102,8 @@ const max_probes = 16384
 // The most reflection probes one frame may publish; the host keeps the nearest
 // and most important few in its cube array (MAX_REFLECTION_SLOTS).
 const max_reflection_probes = 64
+// The most local fog volumes one frame may publish.
+const max_fog_volumes = 32
 // Preference events from this index on carry the engine's preferences
 // (ENGINE_PREFERENCE_*); below it, the game's own.
 const engine_preferences = 64
@@ -789,7 +791,7 @@ const reports_op_queued = 2
 
 // Sizes in lanes.
 const packet_magic = 4670534.0
-const packet_header_floats = 219
+const packet_header_floats = 235
 const frame_header_floats = 5
 const event_floats = 5
 const extensions_marker = 5260632.0
@@ -812,6 +814,7 @@ const light_floats = 14
 const cascade_floats = 18
 const probe_floats = 28
 const reflection_probe_floats = 21
+const fog_volume_floats = 15
 const listener_floats = 9
 const panner_floats = 15
 const instance_floats = 26
@@ -945,6 +948,18 @@ const header_grade_vignette_lane = 215
 const header_grade_vignette_radius_lane = 216
 const header_quality_ssr_lane = 217
 const header_reflection_budget_lane = 218
+const header_fog_edge_lane = 219
+const header_fog_distance_lane = 220
+const header_fog_albedo_lane = 221
+const header_fog_anisotropy_lane = 224
+const header_fog_sun_lane = 225
+const header_fog_ambient_lane = 226
+const header_fog_sky_lane = 227
+const header_fog_noise_lane = 228
+const header_fog_noise_scale_lane = 229
+const header_fog_drift_lane = 230
+const header_quality_volumetrics_lane = 233
+const header_fog_volume_count_lane = 234
 const draw_mesh_lane = 0
 const draw_material_lane = 1
 const draw_transform_lane = 2
@@ -1054,6 +1069,13 @@ const reflection_probe_blend_lane = 13
 const reflection_probe_parallax_center_lane = 14
 const reflection_probe_parallax_extent_lane = 17
 const reflection_probe_far_lane = 20
+const fog_volume_shape_lane = 0
+const fog_volume_center_lane = 1
+const fog_volume_extent_lane = 4
+const fog_volume_density_lane = 7
+const fog_volume_albedo_lane = 8
+const fog_volume_emission_lane = 11
+const fog_volume_falloff_lane = 14
 const listener_position_lane = 0
 const listener_forward_lane = 3
 const listener_up_lane = 6

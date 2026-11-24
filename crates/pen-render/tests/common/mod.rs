@@ -54,6 +54,7 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
             bloom: false,
             taa: false,
             ssr: 0,
+            volumetrics: 0,
         },
         sky: Sky {
             zenith: zero,
@@ -65,8 +66,9 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
         probe_volume: ProbeVolume::default(),
         reflection: Default::default(),
         reflection_probes: Vec::new(),
+        fog_volumes: Vec::new(),
         probes: Vec::new(),
-        fog: Fog { radius: 0.0, density: 0.0, height: 1.0 },
+        fog: Fog { height: 1.0, ..Fog::default() },
         clouds: Clouds { cover: 0.0, drift: Drift { x: 0.0, z: 0.0 } },
         shadow: Shadow::default(),
         exposure: Default::default(),

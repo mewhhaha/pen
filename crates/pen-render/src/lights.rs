@@ -201,7 +201,7 @@ pub(crate) fn validate(lights: &[Light]) -> Result<()> {
 pub(crate) fn group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     let storage = |binding: u32| wgpu::BindGroupLayoutEntry {
         binding,
-        visibility: wgpu::ShaderStages::FRAGMENT,
+        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Storage { read_only: true },
             has_dynamic_offset: false,
@@ -214,7 +214,7 @@ pub(crate) fn group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -229,7 +229,7 @@ pub(crate) fn group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             // matrix of each face (local_shadows.rs).
             wgpu::BindGroupLayoutEntry {
                 binding: 4,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Texture {
                     sample_type: wgpu::TextureSampleType::Depth,
                     view_dimension: wgpu::TextureViewDimension::D2Array,
@@ -239,7 +239,7 @@ pub(crate) fn group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
             },
             wgpu::BindGroupLayoutEntry {
                 binding: 5,
-                visibility: wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
                 count: None,
             },

@@ -316,7 +316,7 @@ finishing its work.
 
 `post.rs` draws the scene into a floating-point target (`SCENE_FORMAT`),
 multisampled and resolved for MSAA, at the render scale. Then come ambient
-occlusion from its depth, sky, fog and cloud shadows, TAA, the metering of
+occlusion from its depth, sky, fog (through the froxel volume, below) and cloud shadows, TAA, the metering of
 auto exposure, and bloom, as a render graph (below). Last, the present pass
 exposes the light, grades it, tones highlights into white (or toward an HDR
 display's peak), applies FXAA Quality (`shaders/fxaa.wgsl`), splits the colours
@@ -430,6 +430,88 @@ motion vectors of the hit). The result mixes over the probe and sky reflection
 by that confidence; TAA averages the rest. Casters only: a material that does not
 cast shadows is not in the depth, so it is neither hit nor reflecting by march.
 Without `quality.ssr` and probes the output is what it was before.
+
+### Participating media
+
+The frame's `fog` is a medium: a mist whose extinction `density` falls off
+exponentially with height (`height`, constant below the ground at y = 0), clear
+inside a cylinder of `radius` about the origin (rising over `edge` for a soft
+rim), varied by a 3D noise (`noise`, `noise_scale`, carried by the game's own
+`drift`, so the same drift draws the same mist), plus up to 32 local `fog_volumes`
+(axis-aligned boxes and ellipsoids with their own density, albedo, emission and a
+falloff toward the edge). It scatters by `albedo` through a Henyey-Greenstein
+phase of asymmetry `anisotropy`. `quality.volumetrics` (0 off, 1 low, 2 high) and
+`fog.distance` (the reach; 0 for none) decide how it is drawn; the formulas are
+Ink's `volumetrics`.
+
+**The froxel volume** (`volume.rs`, `shaders/volume_*.wgsl`). A grid aligned with
+the camera: froxels across and down the picture, slices deep along the view (not
+radial), 160 x 90 x 64 at high and 80 x 45 x 32 at low. Boundary `b` of `N` is at
+depth `knee * (exp(b / N * ln(1 + reach / knee)) - 1)` with `knee = reach / 64`:
+the first slice is thin and each next one a fixed share thicker, out to the reach.
+The grid needs a perspective camera and a medium; otherwise nothing runs. Two
+compute passes run after the shadow maps and before the scene:
+
+- *Injection* (`volume_inject.wgsl`), one invocation a froxel, at a point of the
+  froxel that moves each frame along a Halton (2, 3, 5) sequence of sixteen: the
+  medium there (extinction, scattering by channel, emission) and the light it
+  sends toward the eye per unit of length. The sun is its cascades' visibility
+  (`sun_visibility` from `shadows.wgsl`, the frame's filter at most the tier's: a
+  hardware tap at low, the 16-tap PCF at high, never the soft-shadow search) times
+  the clouds' shadow and the phase; the clustered lights come from the froxel's
+  cluster (`lights.wgsl`'s window and falloff without the cosine, times the phase
+  and `local_shadow` toward the light); the ambient is the mean of the probe
+  volume's light, or the sky's constant coefficient, blended by `fog.sky` toward
+  the sky's colour in the direction looked. Lights are in the units of surfaces
+  (irradiance over pi), so they scatter as `pi * HG`: `(1 - g^2) / (4 (1 + g^2 -
+  2 g c)^1.5)`. A froxel with no medium costs one density evaluation.
+  Then it blends with the froxel at the same place in the world last frame (its
+  centre through last frame's unjittered camera, trilinear), 90% history. The
+  history is dropped for the whole grid on the first frame, `exposure.cut`, a
+  change of tier or reach, a camera that moved more than a tenth of the reach, a
+  frame without a medium and `Renderer::reset_volumetrics()`; and for a froxel
+  that reprojects outside the old frustum, or whose extinction differs from the
+  history's by 25% to 75% of the larger (fading out the blend), so a medium that
+  appears or vanishes does not ghost.
+- *Integration* (`volume_integrate.wgsl`), a column a thread, front to back:
+  each slice's source `L` against its extinction `s` over the segment `d` along the
+  ray gives `L (1 - exp(-s d)) / s` of in-scatter, which conserves energy however
+  thick the slice. A texture of `N + 1` layers holds, at layer `k`, the in-scatter
+  and the optical depth up to boundary `k` (layer 0 is nothing).
+
+**Applying it** (`atmosphere.wgsl`). The atmosphere pass samples the integral at
+each surface's depth (trilinear, optical depth interpolated in slice space, so a
+homogeneous medium is exact), and beyond the reach continues the same medium
+analytically (`mist_beyond_arena`, the height integral outside the cylinder), in
+the colour the grid ends on (its in-scatter over its opacity, faded to the
+analytic colour where the grid holds little), so that the surface seam shows no
+step: the transmittance and the in-scatter are both continuous in depth at the
+grid's end. Without a grid (the off tier, no reach, an orthographic camera) the
+whole path is analytic, with the same colours as an unshadowed, noiseless
+medium: the sun times its phase plus the ambient (`fog.sun`, `fog.ambient`,
+`fog.sky`); with `sun` 0 and `sky` 1 it is the sky's colour in the direction
+looked, the way the mist was before there was a grid. The sky itself stays
+unmisted. Translucent surfaces and particles are still misted with everything
+else by what lies behind them (the pass sees one picture, and a translucent
+surface writes no depth): see the limits below.
+
+Limits: a perspective camera only; the sun and the lights are those the
+scene's own maps hold (a light's shadow only while it holds a face); no
+multiple scattering; local volumes do not take the noise; translucents are
+misted at the depth behind them, so a translucent surface much nearer than what
+is behind it looks hazier than its own distance says (a pass that misted the opaque
+colour before the translucent surfaces draw would need its own multisampled
+resolve).
+
+Tests (`tests/volumetrics.rs`, f64 references, headless): a homogeneous mist's
+transmittance and ambient in-scatter at every froxel depth of both tiers; the
+exponential height mist's optical depth along slanted rays against the closed
+form; sun shafts behind a roof slit (the sun's share of in-scatter, 1 where lit
+and 0 where shadowed); the phase's forward over back ratio for three values of
+`g`; a point light's in-scatter against its falloff, its integral against a fine
+f64 integration, and its shadow; local volumes only inside their bounds, with
+emission; a still camera's convergence and the history's reset on cuts, jumps and
+disocclusion; no seam at the grid's end against the analytic mist; and the off tier.
 
 ### Exposure and grading
 
@@ -633,6 +715,9 @@ host installs the logger. The `render_packet` example prints them with
   histogram, trimmed average, adaptation, clamps and cuts are checked against f64
   references by `exposure.rs`'s tests, and the grade and table sampling by
   `grade.rs`'s.
+  `tests/volumetrics.rs` holds the froxel volume of the mist to f64 references and
+  draws a hazy room's sun shafts and a point light in mist (PNGs in the directory
+  `VOLUME_SHOTS` names if set); see Participating media.
   `tests/shadow_looks.rs` draws the sun's soft and contact shadows and the
   spot and point lights' shadows (before and after PNGs, in the directory
   `SHADOW_SHOTS` names if set); the shaders' filters, cascade blending, bias,

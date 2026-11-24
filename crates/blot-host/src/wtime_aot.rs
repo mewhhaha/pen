@@ -2,27 +2,29 @@
 //!
 //! Used by default for `pen run` builds when `wtime-aot` is available (disable
 //! with `PEN_WTIME_AOT=0`), or for non-`dev_engine` engines when `PEN_WTIME_AOT=1`.
-//! Compiles the guest Wasm module once via `wtime-aot build --backend c --c-opt auto --blot-cdylib`
-//! (override backend with `PEN_WTIME_AOT_BACKEND=c|rust|x64`, C optimization mode
-//! with `PEN_WTIME_AOT_C_OPT=auto|O2|O1|O0`, and x64 target CPU with
+//! Compiles the guest Wasm module once via `wtime-aot build --backend x64 --blot-cdylib`
+//! on Linux x86-64 (automatically falling back to `--backend c --c-opt auto --target-cpu native`
+//! on unsupported platforms, ISAs/SHSTK, or admission rejections; override backend with
+//! `PEN_WTIME_AOT_BACKEND=x64|c|rust`, C optimization mode with
+//! `PEN_WTIME_AOT_C_OPT=auto|O2|O1|O0`, and x64 target CPU with
 //! `PEN_WTIME_AOT_TARGET_CPU=native|x86-64-v2|x86-64-v3`) into a cached shared library,
 //! then loads it with `libloading` and drives the exact same Blot ABI 8 lifecycle,
 //! arena array copies, host callbacks, and snapshots as Wasmtime.
 
 use std::any::Any;
 use std::ffi::c_void;
+use std::io::Write;
 #[cfg(feature = "compiler")]
 use std::io::{Read as _, Seek as _, SeekFrom};
-use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "compiler")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "compiler")]
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "compiler")]
 use std::time::{Duration, Instant};
 
@@ -33,16 +35,12 @@ use pen_runtime::memory_image::{Captured, MemoryImage, PAGE};
 use wasmtime::Val;
 
 use crate::{
-    Active, Argument, GuestImage, HOST_MODULE, LEFT_FAILING, LEFT_NORMALLY, Limits, OWNERSHIP_ENTER,
-    OWNERSHIP_LEAVE, Probe, TEARDOWN, TOKENS, Value, array_range,
+    Active, Argument, GuestImage, HOST_MODULE, LEFT_FAILING, LEFT_NORMALLY, Limits, OWNERSHIP_ENTER, OWNERSHIP_LEAVE,
+    Probe, TEARDOWN, TOKENS, Value, array_range,
 };
 
-const DEFAULT_WTIME_AOT_BIN: &str = "/home/jacobt/src/wtime/tools/wtime-aot/target/release/wtime-aot";
-
 fn parse_env_bool(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+    std::env::var(name).ok().map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -71,9 +69,8 @@ fn is_bare_prog_name(s: &str) -> bool {
 /// identically to `find_in_path` with zero CWD lookup.
 fn sanitized_path_env() -> Option<std::ffi::OsString> {
     let raw = std::env::var_os("PATH")?;
-    let dirs: Vec<PathBuf> = std::env::split_paths(&raw)
-        .filter(|d| !d.as_os_str().is_empty() && d.is_absolute())
-        .collect();
+    let dirs: Vec<PathBuf> =
+        std::env::split_paths(&raw).filter(|d| !d.as_os_str().is_empty() && d.is_absolute()).collect();
     if dirs.is_empty() {
         return None;
     }
@@ -104,11 +101,26 @@ fn resolve_wtime_aot_bin() -> Option<PathBuf> {
         let p = PathBuf::from(&explicit);
         return is_executable_file(&p).then_some(p);
     }
-    let default_path = PathBuf::from(DEFAULT_WTIME_AOT_BIN);
-    if is_executable_file(&default_path) {
-        return Some(default_path);
+    if let Some(in_path) = find_in_path("wtime-aot") {
+        return Some(in_path);
     }
-    find_in_path("wtime-aot")
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("wtime-aot");
+        if is_executable_file(&sibling) {
+            return Some(sibling);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        let home = PathBuf::from(home);
+        for candidate in [home.join(".local/lib/pen-runtime/wtime-aot"), home.join(".local/bin/wtime-aot")] {
+            if is_executable_file(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Returns whether the `wtime-aot` backend is explicitly forced on everywhere.
@@ -271,7 +283,9 @@ fn default_cache_dir(cache: Option<&Path>) -> Result<PathBuf> {
     {
         return Ok(PathBuf::from(rt).join("pen").join("wtime-aot"));
     }
-    bail!("no owner-private wtime-aot cache directory available (set PEN_WTIME_AOT_CACHE, XDG_CACHE_HOME, HOME, or XDG_RUNTIME_DIR)")
+    bail!(
+        "no owner-private wtime-aot cache directory available (set PEN_WTIME_AOT_CACHE, XDG_CACHE_HOME, HOME, or XDG_RUNTIME_DIR)"
+    )
 }
 
 #[cfg(feature = "compiler")]
@@ -323,13 +337,9 @@ pub(crate) fn current_euid() -> Result<u32> {
         let status = read_thread_proc_status().context("reading /proc/thread-self/status for effective uid")?;
         for line in status.lines() {
             if let Some(rest) = line.strip_prefix("Uid:") {
-                let euid_str = rest
-                    .split_whitespace()
-                    .nth(1)
-                    .ok_or_else(|| anyhow!("malformed Uid line in proc status"))?;
-                return euid_str
-                    .parse::<u32>()
-                    .context("parsing effective uid from proc status");
+                let euid_str =
+                    rest.split_whitespace().nth(1).ok_or_else(|| anyhow!("malformed Uid line in proc status"))?;
+                return euid_str.parse::<u32>().context("parsing effective uid from proc status");
             }
         }
         bail!("missing Uid line in proc status")
@@ -342,18 +352,14 @@ pub(crate) fn current_euid() -> Result<u32> {
             .output()
             .context("running /usr/bin/id -u for effective uid")?;
         ensure!(out.status.success(), "/usr/bin/id -u failed ({})", out.status);
-        String::from_utf8_lossy(&out.stdout)
-            .trim()
-            .parse::<u32>()
-            .context("parsing effective uid from /usr/bin/id -u")
+        String::from_utf8_lossy(&out.stdout).trim().parse::<u32>().context("parsing effective uid from /usr/bin/id -u")
     }
 }
 
 #[cfg(all(feature = "compiler", unix))]
 fn validate_trusted_ancestor(anc: &Path, target: &Path, euid: u32) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let am = std::fs::symlink_metadata(anc)
-        .with_context(|| format!("lstat cache ancestor {}", anc.display()))?;
+    let am = std::fs::symlink_metadata(anc).with_context(|| format!("lstat cache ancestor {}", anc.display()))?;
     ensure!(
         !am.file_type().is_symlink() && am.file_type().is_dir(),
         "cache ancestor {} (for {}) is not a real directory",
@@ -397,9 +403,7 @@ pub(crate) fn ensure_private_cache_dir(path: &Path) -> Result<PathBuf> {
         let abs_path = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            std::env::current_dir()
-                .with_context(|| format!("resolving current_dir for {}", path.display()))?
-                .join(path)
+            std::env::current_dir().with_context(|| format!("resolving current_dir for {}", path.display()))?.join(path)
         };
         let mut existing = PathBuf::new();
         let mut missing: Vec<std::ffi::OsString> = Vec::new();
@@ -451,13 +455,10 @@ pub(crate) fn ensure_private_cache_dir(path: &Path) -> Result<PathBuf> {
             }
         }
         ensure!(!existing.as_os_str().is_empty(), "empty cache path: {}", path.display());
-        let canon_existing = std::fs::canonicalize(&existing)
-            .with_context(|| format!("canonicalizing {}", existing.display()))?;
+        let canon_existing =
+            std::fs::canonicalize(&existing).with_context(|| format!("canonicalizing {}", existing.display()))?;
         if missing.is_empty() {
-            ensure!(
-                canon_existing.parent().is_some(),
-                "refusing to use filesystem root as cache directory"
-            );
+            ensure!(canon_existing.parent().is_some(), "refusing to use filesystem root as cache directory");
             let sym = std::fs::symlink_metadata(&existing)
                 .with_context(|| format!("lstat cache dir {}", existing.display()))?;
             ensure!(
@@ -527,8 +528,7 @@ pub(crate) fn ensure_private_cache_dir(path: &Path) -> Result<PathBuf> {
                 }
                 Err(e) => return Err(e).with_context(|| format!("creating cache dir {}", cur.display())),
             }
-            let post = std::fs::symlink_metadata(&cur)
-                .with_context(|| format!("lstat cache dir {}", cur.display()))?;
+            let post = std::fs::symlink_metadata(&cur).with_context(|| format!("lstat cache dir {}", cur.display()))?;
             ensure!(
                 !post.file_type().is_symlink()
                     && post.file_type().is_dir()
@@ -580,9 +580,7 @@ fn publish_immutable_verified_so(verified_dir: &Path, so_sha: &str, bytes: &[u8]
     opts.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let mut f = opts
-        .open(&tmp)
-        .with_context(|| format!("creating immutable verified artifact {}", tmp.display()))?;
+    let mut f = opts.open(&tmp).with_context(|| format!("creating immutable verified artifact {}", tmp.display()))?;
     if let Err(err) = f.write_all(bytes) {
         drop(f);
         let _ = std::fs::remove_file(&tmp);
@@ -614,15 +612,7 @@ fn bin_stamp_from_meta(meta: &std::fs::Metadata) -> BinStamp {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        (
-            meta.dev(),
-            meta.ino(),
-            meta.len(),
-            meta.mtime(),
-            meta.mtime_nsec(),
-            meta.ctime(),
-            meta.ctime_nsec(),
-        )
+        (meta.dev(), meta.ino(), meta.len(), meta.mtime(), meta.mtime_nsec(), meta.ctime(), meta.ctime_nsec())
     }
     #[cfg(not(unix))]
     {
@@ -683,7 +673,8 @@ fn read_private_digest_cache_entry(entry_path: &Path) -> Option<String> {
 
 #[cfg(feature = "compiler")]
 fn bin_digest(bin: &Path, canon_cache: &Path) -> Result<(PathBuf, String)> {
-    let canon = std::fs::canonicalize(bin).with_context(|| format!("canonicalizing wtime-aot binary {}", bin.display()))?;
+    let canon =
+        std::fs::canonicalize(bin).with_context(|| format!("canonicalizing wtime-aot binary {}", bin.display()))?;
     static CACHE: OnceLock<Mutex<std::collections::HashMap<(PathBuf, BinStamp), String>>> = OnceLock::new();
     let stamp = bin_stamp(&canon)?;
     let key = (canon.clone(), stamp);
@@ -771,8 +762,8 @@ fn rt_sources_fingerprint(canon_bin: &Path) -> Result<String> {
                 pending.push(entry.path());
             }
         } else {
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("reading runtime source file {}", path.display()))?;
+            let bytes =
+                std::fs::read(&path).with_context(|| format!("reading runtime source file {}", path.display()))?;
             let rel = path.strip_prefix(&rt_dir).unwrap_or(&path).to_string_lossy().into_owned();
             files.push((rel, bytes));
         }
@@ -829,29 +820,18 @@ fn build_timeout() -> Result<Duration> {
 
 #[cfg(feature = "compiler")]
 fn ensure_before_deadline(deadline: Instant, phase: &str) -> Result<()> {
-    ensure!(
-        Instant::now() < deadline,
-        "wtime-aot {phase} exceeded host build timeout"
-    );
+    ensure!(Instant::now() < deadline, "wtime-aot {phase} exceeded host build timeout");
     Ok(())
 }
 
 #[cfg(feature = "compiler")]
 fn lock_file_with_deadline(file: &std::fs::File, path: &Path, exclusive: bool, deadline: Instant) -> Result<()> {
     loop {
-        let res = if exclusive {
-            file.try_lock()
-        } else {
-            file.try_lock_shared()
-        };
+        let res = if exclusive { file.try_lock() } else { file.try_lock_shared() };
         match res {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::WouldBlock) => {
-                ensure!(
-                    Instant::now() < deadline,
-                    "timed out waiting for lock {}",
-                    path.display()
-                );
+                ensure!(Instant::now() < deadline, "timed out waiting for lock {}", path.display());
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(std::fs::TryLockError::Error(e)) => {
@@ -863,11 +843,7 @@ fn lock_file_with_deadline(file: &std::fs::File, path: &Path, exclusive: bool, d
 
 #[cfg(all(feature = "compiler", unix))]
 fn kill_process_group(pgid: u32) {
-    let kill_bin = if Path::new("/bin/kill").is_file() {
-        "/bin/kill"
-    } else {
-        "/usr/bin/kill"
-    };
+    let kill_bin = if Path::new("/bin/kill").is_file() { "/bin/kill" } else { "/usr/bin/kill" };
     let group = format!("-{pgid}");
     let _ = Command::new(kill_bin)
         .env_clear()
@@ -993,9 +969,7 @@ fn run_cmd_output_with_deadline(
     deadline: Instant,
 ) -> Result<std::process::Output> {
     ensure_before_deadline(deadline, label)?;
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+    cmd.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd.spawn().with_context(|| format!("spawning {label}"))?;
@@ -1060,10 +1034,7 @@ fn run_cmd_output_with_deadline(
     };
     #[cfg(unix)]
     kill_process_group(pid);
-    ensure!(
-        !overflowed.load(Ordering::Acquire),
-        "{label} exceeded subprocess output cap ({MAX_CAPTURE_BYTES} bytes)"
-    );
+    ensure!(!overflowed.load(Ordering::Acquire), "{label} exceeded subprocess output cap ({MAX_CAPTURE_BYTES} bytes)");
     let stdout = recv_bounded_pipe(rx_out, deadline, label)?;
     let stderr = recv_bounded_pipe(rx_err, deadline, label)?;
     ensure_before_deadline(deadline, label)?;
@@ -1297,11 +1268,7 @@ fn resolve_driver_prog(
         String::from_utf8_lossy(&out.stderr).trim()
     );
     let printed = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    ensure!(
-        !printed.is_empty(),
-        "{} -print-prog-name={prog} returned empty output",
-        cc_path.display()
-    );
+    ensure!(!printed.is_empty(), "{} -print-prog-name={prog} returned empty output", cc_path.display());
     let candidate = if is_bare_prog_name(&printed) {
         if allow_path_fallback {
             find_in_path(&printed).or_else(|| find_in_path(prog))
@@ -1318,19 +1285,13 @@ fn resolve_driver_prog(
         Some(p)
     };
     let Some(cand) = candidate else { return Ok(None) };
-    let canon = std::fs::canonicalize(&cand)
-        .with_context(|| format!("canonicalizing {prog} {}", cand.display()))?;
+    let canon = std::fs::canonicalize(&cand).with_context(|| format!("canonicalizing {prog} {}", cand.display()))?;
     let stamp = bin_stamp(&canon)?;
     Ok(Some((cand, canon, stamp)))
 }
 
 #[cfg(feature = "compiler")]
-fn resolve_driver_linker(
-    cc_path: &Path,
-    has_lld: bool,
-    scratch_dir: &Path,
-    deadline: Instant,
-) -> Result<WatchedFile> {
+fn resolve_driver_linker(cc_path: &Path, has_lld: bool, scratch_dir: &Path, deadline: Instant) -> Result<WatchedFile> {
     let prog = if has_lld { "ld.lld" } else { "ld" };
     resolve_driver_prog(cc_path, prog, true, scratch_dir, deadline)?
         .ok_or_else(|| anyhow!("could not resolve driver linker {prog} for C compiler {}", cc_path.display()))
@@ -1344,21 +1305,14 @@ fn elf64_pt_interp(elf_path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
     let mut magic = [0u8; 4];
-    f.read_exact(&mut magic)
-        .with_context(|| format!("reading {}", elf_path.display()))?;
+    f.read_exact(&mut magic).with_context(|| format!("reading {}", elf_path.display()))?;
     if &magic != b"\x7fELF" {
         return Ok(None);
     }
-    ensure!(
-        file_len >= 64,
-        "{}: truncated ELF header ({file_len} bytes)",
-        elf_path.display()
-    );
-    f.seek(SeekFrom::Start(0))
-        .with_context(|| format!("seeking {}", elf_path.display()))?;
+    ensure!(file_len >= 64, "{}: truncated ELF header ({file_len} bytes)", elf_path.display());
+    f.seek(SeekFrom::Start(0)).with_context(|| format!("seeking {}", elf_path.display()))?;
     let mut ehdr = [0u8; 64];
-    f.read_exact(&mut ehdr)
-        .with_context(|| format!("reading ELF header {}", elf_path.display()))?;
+    f.read_exact(&mut ehdr).with_context(|| format!("reading ELF header {}", elf_path.display()))?;
     ensure!(
         ehdr[4] == 2 && ehdr[5] == 1,
         "{}: unsupported ELF class/endianness ({}, {}) for shared-library tracking",
@@ -1384,11 +1338,9 @@ fn elf64_pt_interp(elf_path: &Path) -> Result<Option<PathBuf>> {
         .checked_add(ph_table_bytes)
         .ok_or_else(|| anyhow!("{}: ELF program header offset overflow", elf_path.display()))?;
     ensure!(ph_end <= file_len, "{}: ELF program headers exceed file size", elf_path.display());
-    f.seek(SeekFrom::Start(e_phoff))
-        .with_context(|| format!("seeking phdrs in {}", elf_path.display()))?;
+    f.seek(SeekFrom::Start(e_phoff)).with_context(|| format!("seeking phdrs in {}", elf_path.display()))?;
     let mut phdrs = vec![0u8; usize::try_from(ph_table_bytes)?];
-    f.read_exact(&mut phdrs)
-        .with_context(|| format!("reading phdrs in {}", elf_path.display()))?;
+    f.read_exact(&mut phdrs).with_context(|| format!("reading phdrs in {}", elf_path.display()))?;
     const PT_DYNAMIC: u32 = 2;
     const PT_INTERP: u32 = 3;
     let stride = usize::try_from(e_phentsize)?;
@@ -1406,11 +1358,7 @@ fn elf64_pt_interp(elf_path: &Path) -> Result<Option<PathBuf>> {
         }
     }
     let Some((p_offset, p_filesz)) = interp_span else {
-        ensure!(
-            !has_dynamic,
-            "{}: dynamic ELF has PT_DYNAMIC but no PT_INTERP",
-            elf_path.display()
-        );
+        ensure!(!has_dynamic, "{}: dynamic ELF has PT_DYNAMIC but no PT_INTERP", elf_path.display());
         return Ok(None);
     };
     ensure!(
@@ -1418,14 +1366,11 @@ fn elf64_pt_interp(elf_path: &Path) -> Result<Option<PathBuf>> {
         "{}: invalid PT_INTERP span ({p_offset}, {p_filesz})",
         elf_path.display()
     );
-    f.seek(SeekFrom::Start(p_offset))
-        .with_context(|| format!("seeking PT_INTERP in {}", elf_path.display()))?;
+    f.seek(SeekFrom::Start(p_offset)).with_context(|| format!("seeking PT_INTERP in {}", elf_path.display()))?;
     let mut raw = vec![0u8; usize::try_from(p_filesz)?];
-    f.read_exact(&mut raw)
-        .with_context(|| format!("reading PT_INTERP in {}", elf_path.display()))?;
+    f.read_exact(&mut raw).with_context(|| format!("reading PT_INTERP in {}", elf_path.display()))?;
     let trimmed = raw.split(|&b| b == 0).next().unwrap_or(&raw);
-    let s = std::str::from_utf8(trimmed)
-        .map_err(|_| anyhow!("{}: non-UTF-8 PT_INTERP path", elf_path.display()))?;
+    let s = std::str::from_utf8(trimmed).map_err(|_| anyhow!("{}: non-UTF-8 PT_INTERP path", elf_path.display()))?;
     let p = PathBuf::from(s);
     ensure!(
         p.is_absolute() && is_executable_file(&p),
@@ -1476,11 +1421,7 @@ fn probe_dynamic_shared_libs(elf_path: &Path, scratch_dir: &Path, deadline: Inst
             {
                 continue;
             }
-            let rhs = if let Some((_, after)) = line.split_once(" => ") {
-                after.trim()
-            } else {
-                line
-            };
+            let rhs = if let Some((_, after)) = line.split_once(" => ") { after.trim() } else { line };
             let path_part = match rhs.rfind(" (0x") {
                 Some(idx) => rhs[..idx].trim(),
                 None => rhs.trim(),
@@ -1491,8 +1432,8 @@ fn probe_dynamic_shared_libs(elf_path: &Path, scratch_dir: &Path, deadline: Inst
                 "unresolved or non-absolute shared library for {}: {line}",
                 elf_path.display()
             );
-            let canon = std::fs::canonicalize(p)
-                .with_context(|| format!("canonicalizing shared library {}", p.display()))?;
+            let canon =
+                std::fs::canonicalize(p).with_context(|| format!("canonicalizing shared library {}", p.display()))?;
             let stamp = bin_stamp(&canon)?;
             libs.push((p.to_path_buf(), canon, stamp));
         }
@@ -1518,20 +1459,13 @@ fn hash_shared_lib_sample(h: &mut sha2::Sha256, canon: &Path, stamp: BinStamp) -
         stamp_len(stamp)
     );
     let mut head = Vec::new();
-    (&mut f)
-        .take(65536)
-        .read_to_end(&mut head)
-        .with_context(|| format!("reading head of {}", canon.display()))?;
+    (&mut f).take(65536).read_to_end(&mut head).with_context(|| format!("reading head of {}", canon.display()))?;
     h.update((head.len() as u64).to_le_bytes());
     h.update(&head);
     if total_len > 65536 {
-        f.seek(SeekFrom::Start(total_len - 65536))
-            .with_context(|| format!("seeking tail of {}", canon.display()))?;
+        f.seek(SeekFrom::Start(total_len - 65536)).with_context(|| format!("seeking tail of {}", canon.display()))?;
         let mut tail = Vec::new();
-        (&mut f)
-            .take(65536)
-            .read_to_end(&mut tail)
-            .with_context(|| format!("reading tail of {}", canon.display()))?;
+        (&mut f).take(65536).read_to_end(&mut tail).with_context(|| format!("reading tail of {}", canon.display()))?;
         h.update((tail.len() as u64).to_le_bytes());
         h.update(&tail);
     } else {
@@ -1722,8 +1656,8 @@ fn probe_sys_headers(
             "{} {opt_flag} -H/-E reported non-absolute or missing header: {path_str:?}",
             cc_path.display()
         );
-        let canon = std::fs::canonicalize(&dep)
-            .with_context(|| format!("canonicalizing system header {}", dep.display()))?;
+        let canon =
+            std::fs::canonicalize(&dep).with_context(|| format!("canonicalizing system header {}", dep.display()))?;
         if canon == canon_src {
             return Ok(());
         }
@@ -1733,8 +1667,7 @@ fn probe_sys_headers(
     };
     for opt_flag in ["-O2", "-O0"] {
         let mut cmd = clean_cc_cmd(cc_path);
-        cmd.args([opt_flag, "-fPIC", &format!("-march={target_cpu}"), "-H", "-E", "-x", "c"])
-            .arg(&hdr_path);
+        cmd.args([opt_flag, "-fPIC", &format!("-march={target_cpu}"), "-H", "-E", "-x", "c"]).arg(&hdr_path);
         let out = run_cmd_output_with_deadline(
             cmd,
             probe_dir,
@@ -1799,12 +1732,8 @@ fn probe_link_env_and_cet(
             c_cmd.arg("-fcf-protection=return");
         }
         c_cmd.arg(&c_path).arg("-o").arg(&o_path);
-        let c_out = run_cmd_output_with_deadline(
-            c_cmd,
-            probe_dir,
-            &format!("{} probe compile", cc_path.display()),
-            deadline,
-        )?;
+        let c_out =
+            run_cmd_output_with_deadline(c_cmd, probe_dir, &format!("{} probe compile", cc_path.display()), deadline)?;
         if !c_out.status.success() {
             return Ok(None);
         }
@@ -1824,22 +1753,13 @@ fn probe_link_env_and_cet(
         l_cmd.arg("-pthread");
         #[cfg(unix)]
         l_cmd.arg("-lm");
-        let l_out = run_cmd_output_with_deadline(
-            l_cmd,
-            probe_dir,
-            &format!("{} probe link", cc_path.display()),
-            deadline,
-        )?;
+        let l_out =
+            run_cmd_output_with_deadline(l_cmd, probe_dir, &format!("{} probe link", cc_path.display()), deadline)?;
         if !l_out.status.success() {
             return Ok(None);
         }
         let so_bytes = std::fs::read(&so_path)?;
-        Ok(Some(LinkProbeOut {
-            stdout: l_out.stdout,
-            stderr: l_out.stderr,
-            so_bytes,
-            canon_obj: canon_o,
-        }))
+        Ok(Some(LinkProbeOut { stdout: l_out.stdout, stderr: l_out.stderr, so_bytes, canon_obj: canon_o }))
     };
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1848,22 +1768,19 @@ fn probe_link_env_and_cet(
     {
         (true, out)
     } else {
-        let out = compile_and_link(false)?
-            .ok_or_else(|| anyhow!("{} -shared probe link failed", cc_path.display()))?;
+        let out = compile_and_link(false)?.ok_or_else(|| anyhow!("{} -shared probe link failed", cc_path.display()))?;
         (false, out)
     };
     #[cfg(all(not(target_os = "linux"), target_arch = "x86_64"))]
     let (has_cet_return, probe_out) = if let Some(out) = compile_and_link(true)? {
         (true, out)
     } else {
-        let out = compile_and_link(false)?
-            .ok_or_else(|| anyhow!("{} -shared probe link failed", cc_path.display()))?;
+        let out = compile_and_link(false)?.ok_or_else(|| anyhow!("{} -shared probe link failed", cc_path.display()))?;
         (false, out)
     };
     #[cfg(not(target_arch = "x86_64"))]
     let (has_cet_return, probe_out) = {
-        let out = compile_and_link(false)?
-            .ok_or_else(|| anyhow!("{} -shared probe link failed", cc_path.display()))?;
+        let out = compile_and_link(false)?.ok_or_else(|| anyhow!("{} -shared probe link failed", cc_path.display()))?;
         (false, out)
     };
     let LinkProbeOut { stdout, stderr, canon_obj: canon_o, .. } = probe_out;
@@ -1871,8 +1788,8 @@ fn probe_link_env_and_cet(
     let canon_probe_dir = std::fs::canonicalize(probe_dir).ok();
     let mut watched = Vec::new();
     for path in parse_ld_trace_files(&stdout, &stderr) {
-        let canon = std::fs::canonicalize(&path)
-            .with_context(|| format!("canonicalizing link input {}", path.display()))?;
+        let canon =
+            std::fs::canonicalize(&path).with_context(|| format!("canonicalizing link input {}", path.display()))?;
         if canon == canon_o {
             continue;
         }
@@ -1999,9 +1916,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
                     true
                 }
             };
-            if owner_and_mode_ok
-                && let Ok(text) = std::fs::read_to_string(&probe_file)
-            {
+            if owner_and_mode_ok && let Ok(text) = std::fs::read_to_string(&probe_file) {
                 let mut lines = text.lines();
                 if let (
                     Some(k),
@@ -2039,8 +1954,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
                     lines.next(),
                     lines.next(),
                     lines.next(),
-                )
-                    && k == probe_key_line
+                ) && k == probe_key_line
                     && is_sha64(digest)
                     && is_sha64(cc_sha)
                     && is_sha64(linker_sha)
@@ -2078,18 +1992,11 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
                         Some((orig, canon, cur_stamp))
                     };
                     let parse_opt = |line: &str| -> Option<Option<WatchedFile>> {
-                        if line == "-" {
-                            Some(None)
-                        } else {
-                            parse_watched_line(line).map(Some)
-                        }
+                        if line == "-" { Some(None) } else { parse_watched_line(line).map(Some) }
                     };
-                    if let (Some(cur_linker_stamp), Some(cc1_file), Some(as_file), Some(collect2_file)) = (
-                        linker_ok,
-                        parse_opt(cc1_line),
-                        parse_opt(as_line),
-                        parse_opt(collect2_line),
-                    ) {
+                    if let (Some(cur_linker_stamp), Some(cc1_file), Some(as_file), Some(collect2_file)) =
+                        (linker_ok, parse_opt(cc1_line), parse_opt(as_line), parse_opt(collect2_line))
+                    {
                         let mut watched_files = Vec::with_capacity(n_watched);
                         let mut all_ok = true;
                         for _ in 0..n_watched {
@@ -2138,12 +2045,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
         if !ver_out.status.success() {
             continue;
         }
-        let cc_ver = String::from_utf8_lossy(&ver_out.stdout)
-            .lines()
-            .next()
-            .unwrap_or(cc)
-            .trim()
-            .to_string();
+        let cc_ver = String::from_utf8_lossy(&ver_out.stdout).lines().next().unwrap_or(cc).trim().to_string();
 
         let mut target_cmd = clean_cc_cmd(&p);
         target_cmd.args([&format!("-march={target_cpu}"), "-dM", "-E", "-x", "c", "-"]);
@@ -2159,11 +2061,8 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
             p.display(),
             String::from_utf8_lossy(&out.stderr).trim()
         );
-        let mut lines: Vec<&str> = std::str::from_utf8(&out.stdout)
-            .unwrap_or("")
-            .lines()
-            .filter(|l| l.starts_with("#define __"))
-            .collect();
+        let mut lines: Vec<&str> =
+            std::str::from_utf8(&out.stdout).unwrap_or("").lines().filter(|l| l.starts_with("#define __")).collect();
         lines.sort_unstable();
         let mut h = Sha256::new();
         h.update(b"cc-target-v1");
@@ -2177,9 +2076,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
         let has_lld = if let Some((ref lld_prog, _, _)) = lld_key {
             let mut lld_cmd = clean_cc_cmd(lld_prog);
             lld_cmd.arg("--version");
-            run_cmd_output_with_deadline(lld_cmd, &probe_dir, "probing ld.lld --version", deadline)?
-                .status
-                .success()
+            run_cmd_output_with_deadline(lld_cmd, &probe_dir, "probing ld.lld --version", deadline)?.status.success()
         } else {
             false
         };
@@ -2206,8 +2103,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
         ld_libs.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
 
         let (sys_headers_sha256, header_files) = probe_sys_headers(&p, target_cpu, &probe_dir, deadline)?;
-        let (has_cet_return, link_env_sha256, link_files) =
-            probe_link_env_and_cet(&p, has_lld, &probe_dir, deadline)?;
+        let (has_cet_return, link_env_sha256, link_files) = probe_link_env_and_cet(&p, has_lld, &probe_dir, deadline)?;
         let cc_sha256 = hash_compiler_binaries(
             &p,
             &canon_cc,
@@ -2262,8 +2158,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
                 .then_some(s)
         }
         let clean_opt_watched = |opt: &Option<WatchedFile>| -> bool {
-            opt.as_ref()
-                .is_none_or(|(o, c, _)| clean_path_str(o).is_some() && clean_path_str(c).is_some())
+            opt.as_ref().is_none_or(|(o, c, _)| clean_path_str(o).is_some() && clean_path_str(c).is_some())
         };
         let format_watched = |(orig, canon, st): &WatchedFile| -> Option<String> {
             Some(format!("{}\t{}\t{st:?}", clean_path_str(orig)?, clean_path_str(canon)?))
@@ -2337,9 +2232,7 @@ fn c_compiler_identity(target_cpu: &str, canon_cache: &Path, deadline: Instant) 
 
 #[cfg(feature = "compiler")]
 fn sanitize_key_part(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
-        .collect()
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect()
 }
 
 #[cfg(feature = "compiler")]
@@ -2502,9 +2395,7 @@ fn parse_x64_target_cpu_syntax(target_cpu: &str) -> Result<Option<&'static str>>
         | "cooperlake" | "cannonlake" | "icelake-client" | "icelake-server" | "tigerlake" | "rocketlake"
         | "alderlake" | "raptorlake" | "sapphirerapids" | "emeraldrapids" | "graniterapids" => Ok(Some("x64-v3")),
         other
-            if other
-                .strip_prefix("znver")
-                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) =>
+            if other.strip_prefix("znver").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) =>
         {
             Ok(Some("x64-v3"))
         }
@@ -2572,10 +2463,11 @@ fn load_verified_so(_wasm: &[u8], _cache: Option<&Path>) -> Result<Library> {
     bail!("wtime-aot compilation requires blot-host's `compiler` feature")
 }
 
-/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset.
-/// Kept on `"c"` until the frozen `opt-palm` §5.2 CI promotion gate is cleared.
+/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset (`wtime` v0.1.0).
+/// Uses native Linux x86-64 (`"x64"`), falling back automatically to `"c"`
+/// (`--c-opt auto --target-cpu native`) on [`X64FallbackError`].
 #[cfg(feature = "compiler")]
-const DEFAULT_AOT_BACKEND: &str = "c";
+const DEFAULT_AOT_BACKEND: &str = "x64";
 
 /// Explicit compilation configuration threaded into `load_verified_so_with_config` so
 /// default-path fallback (`x64 -> c --c-opt auto --target-cpu native`) never mutates env vars.
@@ -2632,16 +2524,19 @@ impl AotCompileConfig {
 /// returned a typed [`X64FallbackError`]. Explicit `PEN_WTIME_AOT_BACKEND=x64` and non-fallback
 /// errors (such as exit code `1` compiler/I/O/config failures) always propagate unchanged.
 #[cfg(feature = "compiler")]
-fn load_verified_so_with_fallback<T, F>(wasm: &[u8], cache: Option<&Path>, cfg: &AotCompileConfig, mut loader: F) -> Result<T>
+fn load_verified_so_with_fallback<T, F>(
+    wasm: &[u8],
+    cache: Option<&Path>,
+    cfg: &AotCompileConfig,
+    mut loader: F,
+) -> Result<T>
 where
     F: FnMut(&[u8], Option<&Path>, &AotCompileConfig) -> Result<T>,
 {
     match loader(wasm, cache, cfg) {
         Ok(lib) => Ok(lib),
         Err(err)
-            if cfg.backend == "x64"
-                && !cfg.explicit_backend
-                && err.downcast_ref::<X64FallbackError>().is_some() =>
+            if cfg.backend == "x64" && !cfg.explicit_backend && err.downcast_ref::<X64FallbackError>().is_some() =>
         {
             let fallback_cfg = cfg.x64_fallback_to_c();
             loader(wasm, cache, &fallback_cfg)
@@ -2653,9 +2548,7 @@ where
 #[cfg(feature = "compiler")]
 fn classify_build_failure(backend: &str, exit_code: Option<i32>, status_display: &str, stderr: &str) -> anyhow::Error {
     if backend == "x64" && exit_code == Some(X64_ADMISSION_REJECTED_EXIT_CODE) {
-        anyhow::Error::new(X64FallbackError(X64FallbackReason::AdmissionRejected(
-            stderr.trim().to_string(),
-        )))
+        anyhow::Error::new(X64FallbackError(X64FallbackReason::AdmissionRejected(stderr.trim().to_string())))
     } else {
         anyhow!("wtime-aot build failed ({status_display}): {stderr}")
     }
@@ -2717,8 +2610,8 @@ fn load_verified_so(wasm: &[u8], cache: Option<&Path>) -> Result<Library> {
         // `dlopen`'s `LD_LIBRARY_PATH` search.
         let p = PathBuf::from(override_so);
         ensure!(p.is_file(), "PEN_WTIME_AOT_SO does not exist: {}", p.display());
-        let canon = std::fs::canonicalize(&p)
-            .with_context(|| format!("canonicalizing PEN_WTIME_AOT_SO {}", p.display()))?;
+        let canon =
+            std::fs::canonicalize(&p).with_context(|| format!("canonicalizing PEN_WTIME_AOT_SO {}", p.display()))?;
         // SAFETY: explicit operator-supplied trusted native shared library override.
         return unsafe { Library::new(&canon) }
             .with_context(|| format!("loading PEN_WTIME_AOT_SO {}", canon.display()));
@@ -2739,9 +2632,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
     ensure!(
         !target_cpu.is_empty()
             && !target_cpu.starts_with('-')
-            && target_cpu
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+            && target_cpu.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
         "invalid PEN_WTIME_AOT_TARGET_CPU={target_cpu:?}"
     );
     let deadline = Instant::now() + build_timeout()?;
@@ -2763,7 +2654,11 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
     let fast_dir = ensure_private_cache_dir(&canon_cache.join("by-wasm"))?;
     let verified_dir = ensure_private_cache_dir(&canon_cache.join("verified"))?;
 
-    let bin = resolve_wtime_aot_bin().unwrap_or_else(|| PathBuf::from(DEFAULT_WTIME_AOT_BIN));
+    let bin = resolve_wtime_aot_bin().ok_or_else(|| {
+        anyhow!(
+            "wtime-aot binary not found (install wtime v0.1.0 with `just install-wtime-aot`, put `wtime-aot` on PATH, or set PEN_WTIME_AOT_BIN)"
+        )
+    })?;
     let (canon_bin, bin_hash) = bin_digest(&bin, &canon_cache)?;
     #[cfg(all(target_os = "linux", target_arch = "x86_64", target_pointer_width = "64"))]
     let require_c_shstk = backend == "c" && !matches!(linux_shstk_status(), ShstkStatus::ConfirmedOff);
@@ -2807,11 +2702,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
             };
             let rust_id = rustc_identity(toolchain, &canon_cache, deadline, false)?;
             let rt_fp = rt_sources_fingerprint(&canon_bin)?;
-            let tag = format!(
-                "rust-{}-{cpu_tag}-{}-{rt_fp}",
-                sanitize_key_part(toolchain),
-                rust_id.fp
-            );
+            let tag = format!("rust-{}-{cpu_tag}-{}-{rt_fp}", sanitize_key_part(toolchain), rust_id.fp);
             resolved_rust = Some((rust_id, rt_fp));
             tag
         }
@@ -2844,9 +2735,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         ensure_before_deadline(deadline, "warm cache verify")?;
         return Ok(lib);
     }
-    cache_lock
-        .unlock()
-        .with_context(|| format!("unlocking {}", cache_lock_path.display()))?;
+    cache_lock.unlock().with_context(|| format!("unlocking {}", cache_lock_path.display()))?;
 
     // Upgrade to exclusive cache publication lock for repair/build/staging/dlopen.
     lock_file_with_deadline(&cache_lock, &cache_lock_path, true, deadline)?;
@@ -2869,12 +2758,8 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
                 && entry_dir.parent() == Some(canon_cache.as_path())
             {
                 let entry_lock_path = entry_dir.join(".publish.lock");
-                if let Ok(entry_lock) = std::fs::File::options()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&entry_lock_path)
+                if let Ok(entry_lock) =
+                    std::fs::File::options().read(true).write(true).create(true).truncate(false).open(&entry_lock_path)
                     && lock_file_with_deadline(&entry_lock, &entry_lock_path, true, deadline).is_ok()
                 {
                     let _ = std::fs::remove_file(&canon_so);
@@ -2912,20 +2797,15 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
     }
     // Keep `wtime-aot` and all compiler/linker children inside Pen's single process group so a
     // host timeout kills the entire build tree atomically.
-    cmd.env("WTIME_AOT_INHERIT_PGID", "1")
-        .args(["build"])
-        .arg(&tmp_wasm)
-        .args(["--cache"])
-        .arg(&canon_cache)
-        .args([
-            "--backend",
-            backend.as_str(),
-            "--blot-cdylib",
-            "--target-cpu",
-            target_cpu.as_str(),
-            "--time-limit",
-            &time_limit_arg,
-        ]);
+    cmd.env("WTIME_AOT_INHERIT_PGID", "1").args(["build"]).arg(&tmp_wasm).args(["--cache"]).arg(&canon_cache).args([
+        "--backend",
+        backend.as_str(),
+        "--blot-cdylib",
+        "--target-cpu",
+        target_cpu.as_str(),
+        "--time-limit",
+        &time_limit_arg,
+    ]);
     match backend.as_str() {
         "c" => {
             cmd.args(["--c-opt", c_opt.as_str()]);
@@ -2936,12 +2816,8 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         "x64" => {}
         _ => unreachable!(),
     }
-    let output = run_cmd_output_with_deadline(
-        cmd,
-        &canon_cache,
-        &format!("wtime-aot ({})", canon_bin.display()),
-        deadline,
-    )?;
+    let output =
+        run_cmd_output_with_deadline(cmd, &canon_cache, &format!("wtime-aot ({})", canon_bin.display()), deadline)?;
     drop(_cleanup_wasm);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2979,8 +2855,8 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
                 }
             }
         }
-        let post_found = find_in_path(cc_name)
-            .ok_or_else(|| anyhow!("C compiler {cc_name} disappeared from PATH during build"))?;
+        let post_found =
+            find_in_path(cc_name).ok_or_else(|| anyhow!("C compiler {cc_name} disappeared from PATH during build"))?;
         let post_canon_cc = std::fs::canonicalize(&post_found)
             .with_context(|| format!("canonicalizing post-build C compiler {}", post_found.display()))?;
         let post_cc_stamp = bin_stamp(&post_canon_cc)?;
@@ -3071,15 +2947,14 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         "wtime-aot build produced artifact outside cache root: {}",
         canon_so.display()
     );
-    let so_meta = std::fs::symlink_metadata(&canon_so)
-        .with_context(|| format!("lstat built library {}", canon_so.display()))?;
+    let so_meta =
+        std::fs::symlink_metadata(&canon_so).with_context(|| format!("lstat built library {}", canon_so.display()))?;
     ensure!(
         is_immutable_regular_file(&so_meta),
         "wtime-aot build artifact failed immutable owner-file checks: {}",
         canon_so.display()
     );
-    let so_bytes = std::fs::read(&canon_so)
-        .with_context(|| format!("reading built library {}", canon_so.display()))?;
+    let so_bytes = std::fs::read(&canon_so).with_context(|| format!("reading built library {}", canon_so.display()))?;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if require_c_shstk {
         ensure!(
@@ -3107,13 +2982,9 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
             sidecar.display()
         );
     }
-    let expected_sidecar = std::fs::read_to_string(&sidecar)
-        .with_context(|| format!("reading digest sidecar {}", sidecar.display()))?;
-    ensure!(
-        expected_sidecar.trim() == so_sha,
-        "built library digest mismatch with sidecar {}",
-        sidecar.display()
-    );
+    let expected_sidecar =
+        std::fs::read_to_string(&sidecar).with_context(|| format!("reading digest sidecar {}", sidecar.display()))?;
+    ensure!(expected_sidecar.trim() == so_sha, "built library digest mismatch with sidecar {}", sidecar.display());
     let verified_so = publish_immutable_verified_so(&verified_dir, &so_sha, &so_bytes, seq)?;
     if let Ok((mut link_file, tmp_link)) = create_private_temp_file(&fast_dir, &fast_link_name, ".tmp") {
         let written = link_file.write_all(format!("{fast_key}\n{so_sha}\n{}\n", canon_so.display()).as_bytes());
@@ -3175,9 +3046,8 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
         match payload {
             wasmparser::Payload::CodeSectionStart { size, .. } => {
                 let size = usize::try_from(size).map_err(|_| anyhow!("invalid_abi: code section size overflow"))?;
-                let skip = consumed
-                    .checked_add(size)
-                    .ok_or_else(|| anyhow!("invalid_abi: code section size overflow"))?;
+                let skip =
+                    consumed.checked_add(size).ok_or_else(|| anyhow!("invalid_abi: code section size overflow"))?;
                 ensure!(skip <= rest.len(), "invalid_abi: truncated code section");
                 offset += skip;
                 parser.skip_section();
@@ -3197,19 +3067,22 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
             wasmparser::Payload::ImportSection(section) => {
                 for import in section.into_imports() {
                     let import = import?;
-                    ensure!(import.module == HOST_MODULE, "invalid_abi: unexpected import {}::{}", import.module, import.name);
-                    let cb = callbacks
-                        .iter()
-                        .copied()
-                        .find(|cb| cb.import_name() == import.name)
-                        .ok_or_else(|| anyhow!("invalid_abi: unexpected import {}::{}", import.module, import.name))?;
+                    ensure!(
+                        import.module == HOST_MODULE,
+                        "invalid_abi: unexpected import {}::{}",
+                        import.module,
+                        import.name
+                    );
+                    let cb =
+                        callbacks.iter().copied().find(|cb| cb.import_name() == import.name).ok_or_else(|| {
+                            anyhow!("invalid_abi: unexpected import {}::{}", import.module, import.name)
+                        })?;
                     let wasmparser::TypeRef::Func(ti) = import.ty else {
                         bail!("invalid_abi: import {}::{} must be a plain function", import.module, import.name);
                     };
-                    let fty = types
-                        .get(ti as usize)
-                        .and_then(|o| o.as_ref())
-                        .ok_or_else(|| anyhow!("invalid_abi: import {}::{} has invalid type index {ti}", import.module, import.name))?;
+                    let fty = types.get(ti as usize).and_then(|o| o.as_ref()).ok_or_else(|| {
+                        anyhow!("invalid_abi: import {}::{} has invalid type index {ti}", import.module, import.name)
+                    })?;
                     let expected_params = [wasmparser::ValType::EXTERNREF, wasmparser_val(cb.parameter)];
                     let expected_res = [wasmparser_val(cb.result)];
                     ensure!(
@@ -3245,10 +3118,7 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
             wasmparser::Payload::MemorySection(section) => {
                 for mem in section {
                     let mem = mem?;
-                    ensure!(
-                        memory_limits.is_none(),
-                        "invalid_abi: wtime-aot supports at most one linear memory"
-                    );
+                    ensure!(memory_limits.is_none(), "invalid_abi: wtime-aot supports at most one linear memory");
                     ensure!(!mem.memory64, "invalid_abi: wtime-aot does not support memory64");
                     ensure!(!mem.shared, "invalid_abi: wtime-aot does not support shared memories");
                     ensure!(
@@ -3302,10 +3172,7 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
     }
 
     let lookup_func_sig = |fidx: u32| -> Option<&wasmparser::FuncType> {
-        func_type_idxs
-            .get(fidx as usize)
-            .and_then(|&ti| types.get(ti as usize))
-            .and_then(|o| o.as_ref())
+        func_type_idxs.get(fidx as usize).and_then(|&ti| types.get(ti as usize)).and_then(|o| o.as_ref())
     };
 
     for function in &abi.functions {
@@ -3344,8 +3211,9 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
             let Some((wasmparser::ExternalKind::Func, fidx)) = exports.get(name).copied() else {
                 bail!("invalid_abi: missing array arena export {name}");
             };
-            let ok = lookup_func_sig(fidx)
-                .is_some_and(|fty| fty.params() == [wasmparser::ValType::I32] && fty.results() == [wasmparser::ValType::I32]);
+            let ok = lookup_func_sig(fidx).is_some_and(|fty| {
+                fty.params() == [wasmparser::ValType::I32] && fty.results() == [wasmparser::ValType::I32]
+            });
             ensure!(ok, "invalid_abi: invalid {name} signature");
         }
     }
@@ -3676,15 +3544,10 @@ fn invoke_aot_import(
     // Short lock #1: extract metadata and move `spare` out so NO lock/reference to `AotHostState`
     // is held across any FFI call (`active_mem_data`, `active_get_global`, `callback`, or `active_allocate`).
     let (signature, export, lib, uses_arrays, memory_gauge, probe, mut spare) = {
-        let mut state = host_box
-            .state
-            .try_lock()
-            .map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
-        let signature = *state
-            .lib
-            .imports
-            .get(import_idx as usize)
-            .ok_or_else(|| anyhow!("unknown import index {import_idx}"))?;
+        let mut state =
+            host_box.state.try_lock().map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
+        let signature =
+            *state.lib.imports.get(import_idx as usize).ok_or_else(|| anyhow!("unknown import index {import_idx}"))?;
         let (export, expected) = match &state.active {
             Some(active) if token != 0 && active.token == token => (active.export.clone(), active.signature),
             _ => bail!("stale_capability: host call has no active capability reference"),
@@ -3719,16 +3582,15 @@ fn invoke_aot_import(
             return Err(err);
         }
     };
-    if uses_arrays
-        && let Some(gauge) = &memory_gauge
-    {
+    if uses_arrays && let Some(gauge) = &memory_gauge {
         gauge.store(mem_len, Ordering::Relaxed);
     }
     if let Some(probe) = probe {
         let mut vals = Vec::with_capacity(lib.counter_names.len());
         for name in &lib.counter_names {
             let (mut val, mut kind) = (0u64, 0u8);
-            let rc = unsafe { (lib.syms.active_get_global)(active_call, name.as_ptr(), name.len(), &mut val, &mut kind) };
+            let rc =
+                unsafe { (lib.syms.active_get_global)(active_call, name.as_ptr(), name.len(), &mut val, &mut kind) };
             let c = if rc == 0 && (kind == 0 || kind == 1) { (val & 0xffff_ffff) as u32 } else { 0 };
             vals.push(u64::from(c));
         }
@@ -3737,10 +3599,8 @@ fn invoke_aot_import(
 
     // Short lock #2: take callback out before invoking it.
     let mut callback = {
-        let mut state = host_box
-            .state
-            .try_lock()
-            .map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
+        let mut state =
+            host_box.state.try_lock().map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
         match state.active.as_mut().and_then(|active| active.callback.take()) {
             Some(cb) => cb,
             None => {
@@ -3755,10 +3615,8 @@ fn invoke_aot_import(
     // Short lock #3: restore callback immediately after invocation, matching Wasmtime so guest
     // `blot:allocate` during result encoding may legally invoke the active callback.
     {
-        let mut state = host_box
-            .state
-            .try_lock()
-            .map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
+        let mut state =
+            host_box.state.try_lock().map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
         if let Some(active) = state.active.as_mut() {
             active.callback = Some(callback);
         }
@@ -3772,11 +3630,7 @@ fn invoke_aot_import(
     };
     if result.kind() != signature.result {
         restore_spare(host_box, spare);
-        bail!(
-            "host_result: host callback during {export} returned {}, not {}",
-            result.kind(),
-            signature.result
-        );
+        bail!("host_result: host callback during {export} returned {}, not {}", result.kind(), signature.result);
     }
 
     // Zero locks are held during `active_allocate` below.
@@ -3867,7 +3721,10 @@ impl AotGuest {
                 if let Some((min_p, max_p)) = module.lib.memory_limits {
                     let initial_bytes = min_p.saturating_mul(PAGE as u64);
                     if initial_bytes > lim.memory as u64 {
-                        bail!("memory_limit: guest initial memory ({initial_bytes} B) exceeds limit ({} B)", lim.memory);
+                        bail!(
+                            "memory_limit: guest initial memory ({initial_bytes} B) exceeds limit ({} B)",
+                            lim.memory
+                        );
                     }
                     if max_allowed_pages == 0 {
                         // Blot ABI v1 reserves `mem_limit_pages == 0` as unlimited; reject growable memories
@@ -3903,7 +3760,12 @@ impl AotGuest {
         }));
         let mut trap_code = 0u8;
         let handle = unsafe {
-            (module.lib.syms.new)(host_ptr.cast::<c_void>(), Some(host_callback_trampoline), limit_pages, &mut trap_code)
+            (module.lib.syms.new)(
+                host_ptr.cast::<c_void>(),
+                Some(host_callback_trampoline),
+                limit_pages,
+                &mut trap_code,
+            )
         };
         if handle.is_null() {
             // SAFETY: `new` returned null, so no handle retains `host_ptr`.
@@ -3939,11 +3801,7 @@ impl AotGuest {
 
     pub fn probe(&mut self, probe: Arc<Probe>) {
         probe.counters_named(
-            self.lib
-                .counter_names
-                .iter()
-                .map(|name| name.trim_start_matches("blot:").to_owned())
-                .collect(),
+            self.lib.counter_names.iter().map(|name| name.trim_start_matches("blot:").to_owned()).collect(),
         );
         self.with_host_mut(|host| host.probe = Some(probe));
     }
@@ -3979,7 +3837,14 @@ impl AotGuest {
         let mut res_out = 0u64;
         let mut trap_code = 0u8;
         let rc = unsafe {
-            (self.lib.syms.call_export)(self.handle.0, name.as_ptr(), name.len(), arg_bits, &mut res_out, &mut trap_code)
+            (self.lib.syms.call_export)(
+                self.handle.0,
+                name.as_ptr(),
+                name.len(),
+                arg_bits,
+                &mut res_out,
+                &mut trap_code,
+            )
         };
         self.maybe_resume_panic();
         match rc {
@@ -4036,10 +3901,15 @@ impl AotGuest {
         }
         let arg_bits = match (function.parameter, argument) {
             (Parameter::Value(expected), Argument::Value(value)) => {
-                ensure!(value.kind() == expected, "invalid_argument: {name} argument must be {expected}, not {}", value.kind());
+                ensure!(
+                    value.kind() == expected,
+                    "invalid_argument: {name} argument must be {expected}, not {}",
+                    value.kind()
+                );
                 let lib = self.lib.clone();
                 let handle = self.handle.0;
-                let (uses_arrays, mut spare) = self.with_host_mut(|host| (host.uses_arrays, std::mem::take(&mut host.spare)));
+                let (uses_arrays, mut spare) =
+                    self.with_host_mut(|host| (host.uses_arrays, std::mem::take(&mut host.spare)));
                 let mut alloc_host_err = false;
                 let encoded = aot_to_bits(
                     uses_arrays,
@@ -4177,7 +4047,8 @@ impl AotGuest {
         for name in names {
             let (mut val, mut kind) = (0u64, 0u8);
             ensure!(
-                unsafe { (self.lib.syms.get_global)(self.handle.0, name.as_ptr(), name.len(), &mut val, &mut kind) } == 0,
+                unsafe { (self.lib.syms.get_global)(self.handle.0, name.as_ptr(), name.len(), &mut val, &mut kind) }
+                    == 0,
                 "an imaged global disappeared: {name}"
             );
             let wval = match kind {
@@ -4224,8 +4095,9 @@ impl AotGuest {
             };
             let (mut cur_val, mut cur_kind) = (0u64, u8::MAX);
             ensure!(
-                unsafe { (self.lib.syms.get_global)(self.handle.0, name.as_ptr(), name.len(), &mut cur_val, &mut cur_kind) }
-                    == 0,
+                unsafe {
+                    (self.lib.syms.get_global)(self.handle.0, name.as_ptr(), name.len(), &mut cur_val, &mut cur_kind)
+                } == 0,
                 "an imaged global disappeared: {name}"
             );
             ensure!(
@@ -4283,7 +4155,8 @@ impl AotGuest {
         let mut out = Vec::with_capacity(self.lib.counter_names.len());
         for name in &self.lib.counter_names {
             let (mut val, mut kind) = (0u64, 0u8);
-            let rc = unsafe { (self.lib.syms.get_global)(self.handle.0, name.as_ptr(), name.len(), &mut val, &mut kind) };
+            let rc =
+                unsafe { (self.lib.syms.get_global)(self.handle.0, name.as_ptr(), name.len(), &mut val, &mut kind) };
             if rc == 0 && (kind == 0 || kind == 1) {
                 out.push((name.clone(), (val & 0xffff_ffff) as u32));
             }
@@ -4321,6 +4194,11 @@ mod tests {
             target_cpu: "x86-64-v3".to_string(),
             explicit_backend: false,
         }
+    }
+
+    #[test]
+    fn default_aot_backend_is_x64() {
+        assert_eq!(DEFAULT_AOT_BACKEND, "x64");
     }
 
     #[test]
@@ -4480,12 +4358,12 @@ mod tests {
         funcs.function(0);
         m.section(&funcs);
         let mut globals = GlobalSection::new();
-        globals.global(GlobalType { val_type: EncValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(7));
-        globals.global(GlobalType { val_type: EncValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(0));
-        globals.global(
-            GlobalType { val_type: EncValType::I32, mutable: false, shared: false },
-            &ConstExpr::i32_const(42),
-        );
+        globals
+            .global(GlobalType { val_type: EncValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(7));
+        globals
+            .global(GlobalType { val_type: EncValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(0));
+        globals
+            .global(GlobalType { val_type: EncValType::I32, mutable: false, shared: false }, &ConstExpr::i32_const(42));
         m.section(&globals);
         let mut exports = ExportSection::new();
         exports.export("g_mut", ExportKind::Global, 0);
@@ -4507,7 +4385,8 @@ mod tests {
         // Hidden mutable global produces the exact same error string in both paths.
         let mut hm = Module::new();
         let mut hglobals = GlobalSection::new();
-        hglobals.global(GlobalType { val_type: EncValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(1));
+        hglobals
+            .global(GlobalType { val_type: EncValType::I32, mutable: true, shared: false }, &ConstExpr::i32_const(1));
         hm.section(&hglobals);
         let hidden = hm.finish();
         let v_hidden = validate_aot_wasm(&hidden, &abi).expect("validate hidden");

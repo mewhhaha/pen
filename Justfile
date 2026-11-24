@@ -5,11 +5,15 @@ pen := "cargo run --release -q -p pen --"
 # too): pnpm, run through npx, and playwright-core, which picks Chromium.
 pnpm := "npx --yes pnpm@12.8.2"
 playwright := "1.63.0"
+# Pinned wtime-aot release (Linux x86-64 Blot ABI 8 AOT compiler, default `--backend x64`).
+wtime_version := "v0.1.0"
+wtime_aot_archive_sha256 := "14cc8b925c2553cf71857093072a24d6b45c179541e40e81e198bb2255d0478c"
+wtime_aot_bin_sha256 := "2d1733122c5c8a14bc57cc59bd34446d8ebf3b41a0a3ff7d181fcc1347be2c24"
 
 # Then removes what earlier installs left in plugins/ and web/ that this one
 # no longer builds, saying what it removes.
 # Install the native CLI, compiler component, browser host and shipping player.
-install: plugins web-host install-player
+install: plugins web-host install-player install-wtime-aot
   cargo build --release -p pen --features steam
   mkdir -p ~/.local/lib/pen-runtime/plugins ~/.local/lib/pen-runtime/web
   cp target/release/pen ~/.local/lib/pen-runtime/pen.new
@@ -25,6 +29,37 @@ install: plugins web-host install-player
     -exec echo removing stale {} \; -exec rm -rf {} +
   cp LICENSE THIRD_PARTY_NOTICES.md ~/.local/lib/pen-runtime/
   ln -sf ~/.local/lib/pen-runtime/pen ~/.local/bin/pen
+
+# Install the pinned wtime-aot release binary (Linux x86-64) verified by SHA-256.
+install-wtime-aot:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [ "$(uname -s)-$(uname -m)" != "Linux-x86_64" ]; then
+    echo "install-wtime-aot: skipping (prebuilt release asset is Linux x86_64 only)"
+    exit 0
+  fi
+  mkdir -p ~/.local/lib/pen-runtime ~/.local/bin
+  dest="$HOME/.local/lib/pen-runtime/wtime-aot"
+  if [ -x "$dest" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "{{wtime_aot_bin_sha256}}" ]; then
+    ln -sf "$dest" "$HOME/.local/bin/wtime-aot"
+    echo "wtime-aot {{wtime_version}} already installed ($dest)"
+    exit 0
+  fi
+  archive="wtime-aot-{{wtime_version}}-x86_64-unknown-linux-gnu.tar.gz"
+  tmp="$(mktemp -d "${TMPDIR:-/var/tmp}/pen-wtime-aot.XXXXXX")"
+  trap 'rm -rf "$tmp"' EXIT
+  if command -v gh > /dev/null 2>&1; then
+    gh release download "{{wtime_version}}" --repo mewhhaha/wtime --pattern "$archive" --dir "$tmp"
+  else
+    curl -fsSL "https://github.com/mewhhaha/wtime/releases/download/{{wtime_version}}/$archive" -o "$tmp/$archive"
+  fi
+  (cd "$tmp" && echo "{{wtime_aot_archive_sha256}}  $archive" | sha256sum -c)
+  tar -xzf "$tmp/$archive" -C "$tmp" wtime-aot
+  (cd "$tmp" && echo "{{wtime_aot_bin_sha256}}  wtime-aot" | sha256sum -c)
+  install -m 0755 "$tmp/wtime-aot" "$dest.new"
+  mv -f "$dest.new" "$dest"
+  ln -sf "$dest" "$HOME/.local/bin/wtime-aot"
+  echo "installed wtime-aot {{wtime_version}} -> $dest"
 
 plugins:
   cd plugins && cargo build --release --target wasm32-wasip2

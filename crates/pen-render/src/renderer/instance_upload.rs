@@ -22,28 +22,34 @@ impl Uploads {
         assert_eq!(current.len() % LANES, 0);
         let words: &[u32] = bytemuck::cast_slice(current);
         self.ranges.clear();
-        if words.len() > self.previous.len() {
+        let common = words.len().min(self.previous.len());
+        for (instance, values) in words[..common].as_chunks::<LANES>().0.iter().enumerate() {
+            let start = instance * LANES;
+            let end = start + LANES;
+            if values == &self.previous[start..end] {
+                continue;
+            }
+            if let Some(last) = self.ranges.last_mut()
+                && start - last.end <= MERGE_GAP
+            {
+                last.end = end;
+            } else {
+                self.ranges.push(start..end);
+            }
+        }
+        if words.len() > common {
+            if let Some(last) = self.ranges.last_mut()
+                && common - last.end <= MERGE_GAP
+            {
+                last.end = words.len();
+            } else {
+                self.ranges.push(common..words.len());
+            }
+        }
+        let changed: usize = self.ranges.iter().map(|range| range.len()).sum();
+        if self.ranges.len() > MAX_WRITES || changed > words.len() / 2 {
+            self.ranges.clear();
             self.ranges.push(0..words.len());
-        } else {
-            for (instance, values) in words.as_chunks::<LANES>().0.iter().enumerate() {
-                let start = instance * LANES;
-                let end = start + LANES;
-                if values == &self.previous[start..end] {
-                    continue;
-                }
-                if let Some(last) = self.ranges.last_mut()
-                    && start - last.end <= MERGE_GAP
-                {
-                    last.end = end;
-                } else {
-                    self.ranges.push(start..end);
-                }
-            }
-            let changed: usize = self.ranges.iter().map(|range| range.len()).sum();
-            if self.ranges.len() > MAX_WRITES || changed > words.len() / 2 {
-                self.ranges.clear();
-                self.ranges.push(0..words.len());
-            }
         }
         self.previous.clear();
         self.previous.extend_from_slice(words);

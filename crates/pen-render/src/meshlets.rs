@@ -6,7 +6,7 @@
 //!   into baseline-WebGPU `DrawIndexedIndirect` records (`first_instance = 0`).
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "GPU meshlet buffer indices")]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, ensure};
 
@@ -53,6 +53,23 @@ fn norm3(a: [f64; 3]) -> Option<[f64; 3]> {
     if l > 1e-12 && l.is_finite() { Some([a[0] / l, a[1] / l, a[2] / l]) } else { None }
 }
 
+fn expand_bits_10(v: u32) -> u32 {
+    let mut x = v & 0x3ff;
+    x = (x | (x << 16)) & 0x0300_00ff;
+    x = (x | (x << 8)) & 0x0300_f00f;
+    x = (x | (x << 4)) & 0x030c_30c3;
+    x = (x | (x << 2)) & 0x0924_9249;
+    x
+}
+
+fn morton3_10(p: [f32; 3], min_p: [f32; 3], inv_span: [f32; 3]) -> u32 {
+    let q = |axis: usize| -> u32 {
+        let t = ((p[axis] - min_p[axis]) * inv_span[axis]).clamp(0.0, 1.0);
+        (t * 1023.0).round() as u32
+    };
+    expand_bits_10(q(0)) | (expand_bits_10(q(1)) << 1) | (expand_bits_10(q(2)) << 2)
+}
+
 /// Builds spatially coherent meshlet clusters with conservative bounding spheres and normal cones.
 pub fn build_meshlets(
     positions: &[[f32; 3]],
@@ -74,18 +91,37 @@ pub fn build_meshlets(
 
     let mut adj: Vec<Vec<usize>> = vec![Vec::new(); positions.len()];
     let mut tri_centroids = Vec::with_capacity(tri_count);
+    let mut cmin = [f32::INFINITY; 3];
+    let mut cmax = [f32::NEG_INFINITY; 3];
     for t in 0..tri_count {
         let (a, b, c) = (indices[t * 3] as usize, indices[t * 3 + 1] as usize, indices[t * 3 + 2] as usize);
         adj[a].push(t);
         adj[b].push(t);
         adj[c].push(t);
         let (pa, pb, pc) = (positions[a], positions[b], positions[c]);
-        tri_centroids.push([
+        let tc = [
             (pa[0] + pb[0] + pc[0]) / 3.0,
             (pa[1] + pb[1] + pc[1]) / 3.0,
             (pa[2] + pb[2] + pc[2]) / 3.0,
-        ]);
+        ];
+        for axis in 0..3 {
+            cmin[axis] = cmin[axis].min(tc[axis]);
+            cmax[axis] = cmax[axis].max(tc[axis]);
+        }
+        tri_centroids.push(tc);
     }
+    let inv_span = [
+        if cmax[0] > cmin[0] { 1.0 / (cmax[0] - cmin[0]) } else { 0.0 },
+        if cmax[1] > cmin[1] { 1.0 / (cmax[1] - cmin[1]) } else { 0.0 },
+        if cmax[2] > cmin[2] { 1.0 / (cmax[2] - cmin[2]) } else { 0.0 },
+    ];
+    let mut morton_order: Vec<(u32, usize)> = tri_centroids
+        .iter()
+        .enumerate()
+        .map(|(t, &tc)| (morton3_10(tc, cmin, inv_span), t))
+        .collect();
+    morton_order.sort_unstable();
+    let morton_tris: Vec<usize> = morton_order.into_iter().map(|(_, t)| t).collect();
 
     let mut emitted = vec![false; tri_count];
     let mut in_frontier = vec![false; tri_count];
@@ -95,12 +131,13 @@ pub fn build_meshlets(
     let mut next_seed = 0usize;
 
     while emitted_count < tri_count {
-        while next_seed < tri_count && emitted[next_seed] {
+        while next_seed < tri_count && emitted[morton_tris[next_seed]] {
             next_seed += 1;
         }
         if next_seed >= tri_count {
             break;
         }
+        let seed_tri = morton_tris[next_seed];
         let mut cluster_tris: Vec<usize> = Vec::with_capacity(max_triangles);
         let mut cluster_verts: HashSet<u32> = HashSet::with_capacity(max_vertices);
         let mut frontier: Vec<usize> = Vec::new();
@@ -138,7 +175,7 @@ pub fn build_meshlets(
         };
 
         push_tri(
-            next_seed,
+            seed_tri,
             &mut emitted,
             &mut in_frontier,
             &mut cluster_tris,
@@ -175,6 +212,42 @@ pub fn build_meshlets(
                 let score = (added as f64) * 100.0 + d2;
                 if best.is_none_or(|(_, s)| score < s) {
                     best = Some((cand, score));
+                }
+            }
+            // On flat-shaded / disconnected meshes (unshared vertices per face), shared-vertex
+            // adjacency runs dry immediately; pack spatially adjacent triangles in Morton order
+            // so meshes never degenerate into one meshlet per triangle.
+            if best.is_none() && cluster_verts.len() + 3 <= max_vertices {
+                while next_seed < tri_count && emitted[morton_tris[next_seed]] {
+                    next_seed += 1;
+                }
+                let mut scanned = 0usize;
+                let mut cursor = next_seed;
+                while cursor < tri_count && scanned < 64 {
+                    let cand = morton_tris[cursor];
+                    cursor += 1;
+                    if emitted[cand] {
+                        continue;
+                    }
+                    scanned += 1;
+                    let (v0, v1, v2) = (indices[cand * 3], indices[cand * 3 + 1], indices[cand * 3 + 2]);
+                    let mut added = usize::from(!cluster_verts.contains(&v0));
+                    if v1 != v0 && !cluster_verts.contains(&v1) {
+                        added += 1;
+                    }
+                    if v2 != v0 && v2 != v1 && !cluster_verts.contains(&v2) {
+                        added += 1;
+                    }
+                    if cluster_verts.len() + added > max_vertices {
+                        continue;
+                    }
+                    let tc = tri_centroids[cand];
+                    let d2 = (f64::from(tc[0]) - mean[0]).powi(2)
+                        + (f64::from(tc[1]) - mean[1]).powi(2)
+                        + (f64::from(tc[2]) - mean[2]).powi(2);
+                    if best.is_none_or(|(_, s)| d2 < s) {
+                        best = Some((cand, d2));
+                    }
                 }
             }
             let Some((chosen, _)) = best else {
@@ -321,14 +394,28 @@ fn encode_copy(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, dst: &
     encoder.copy_buffer_to_buffer(&stage, 0, dst, 0, bytes.len() as u64);
 }
 
+/// One draw queued for batched GPU meshlet culling in a single compute pass.
+pub struct MeshletBatchEntry<'a> {
+    pub mesh_key: u64,
+    pub draws_gen: u64,
+    pub meshlets_buf: &'a wgpu::Buffer,
+    pub draws_buf: &'a wgpu::Buffer,
+    pub meshlet_count: u32,
+    pub params: MeshletCullParams,
+}
+
 /// GPU compute meshlet cluster culler (local-space frustum + shear-safe normal-cone backface + full-footprint Hi-Z).
 pub struct MeshletCuller {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
+    uniform_stride: u64,
+    uniform_capacity: usize,
+    uniform_bytes: Vec<u8>,
     stats: wgpu::Buffer,
     dummy_hiz: wgpu::Texture,
     dummy_hiz_view: wgpu::TextureView,
+    batch_groups: HashMap<(u64, u64, u32, u64), wgpu::BindGroup>,
 }
 
 impl MeshletCuller {
@@ -341,7 +428,7 @@ impl MeshletCuller {
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
+                        has_dynamic_offset: true,
                         min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<CullUniform>() as u64),
                     },
                     count: None,
@@ -405,9 +492,12 @@ impl MeshletCuller {
             compilation_options: Default::default(),
             cache: None,
         });
+        let align = u64::from(device.limits().min_uniform_buffer_offset_alignment).max(1);
+        let uniform_stride = (std::mem::size_of::<CullUniform>() as u64).next_multiple_of(align);
+        let uniform_capacity = 16usize;
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("meshlet_cull_u"),
-            size: std::mem::size_of::<CullUniform>() as u64,
+            size: uniform_stride * uniform_capacity as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -428,11 +518,163 @@ impl MeshletCuller {
             view_formats: &[],
         });
         let dummy_hiz_view = dummy_hiz.create_view(&wgpu::TextureViewDescriptor::default());
-        Self { pipeline, bgl, uniform, stats, dummy_hiz, dummy_hiz_view }
+        Self {
+            pipeline,
+            bgl,
+            uniform,
+            uniform_stride,
+            uniform_capacity,
+            uniform_bytes: Vec::new(),
+            stats,
+            dummy_hiz,
+            dummy_hiz_view,
+            batch_groups: HashMap::new(),
+        }
     }
 
     pub fn stats_buffer(&self) -> &wgpu::Buffer {
         &self.stats
+    }
+
+    fn build_uniform(meshlet_count: u32, hiz_view: Option<&wgpu::TextureView>, params: &MeshletCullParams) -> CullUniform {
+        let flags = u32::from(params.backface_cull) | (u32::from(params.reversed_z) << 1);
+        let hiz_mips = hiz_view.map_or(0, |v| params.hiz_mips.min(v.texture().mip_level_count()));
+        CullUniform {
+            model: params.model,
+            inv_model: crate::matrix::invert(&params.model),
+            hiz_vp: params.hiz_vp,
+            planes: params.frustum_planes,
+            camera_pos: [params.camera_pos[0], params.camera_pos[1], params.camera_pos[2], 0.0],
+            counts_flags: [
+                meshlet_count,
+                u32::from(params.hiz_enabled && hiz_view.is_some()),
+                hiz_mips,
+                flags,
+            ],
+        }
+    }
+
+    /// Dispatches GPU meshlet cluster culling for an entire frame's solo mesh draws inside
+    /// a single compute pass, uploading all draw uniforms in one `queue.write_buffer` call
+    /// and reusing cached bind groups across frames.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cull_batch(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        hiz: Option<(&wgpu::TextureView, u64)>,
+        entries: &[MeshletBatchEntry<'_>],
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let limits = device.limits();
+        let stride = self.uniform_stride as usize;
+        if entries.len() > self.uniform_capacity {
+            let cap = entries.len().next_power_of_two();
+            ensure!(
+                cap as u64 * self.uniform_stride <= limits.max_buffer_size,
+                "meshlet cull uniform buffer exceeds device max_buffer_size"
+            );
+            self.uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("meshlet_cull_u"),
+                size: cap as u64 * self.uniform_stride,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.uniform_capacity = cap;
+            self.batch_groups.clear();
+        }
+        if self.batch_groups.len() > 2048 {
+            self.batch_groups.clear();
+        }
+        let total_bytes = entries.len() * stride;
+        if self.uniform_bytes.len() < total_bytes {
+            self.uniform_bytes.resize(total_bytes, 0);
+        }
+        let hiz_view_opt = hiz.map(|(v, _)| v);
+        let hiz_id = hiz.map_or(0, |(_, id)| id);
+        let bound_hiz = hiz_view_opt.unwrap_or(&self.dummy_hiz_view);
+        let u_size = std::mem::size_of::<CullUniform>();
+        for (i, entry) in entries.iter().enumerate() {
+            if entry.meshlet_count == 0 {
+                continue;
+            }
+            let req_m_bytes = u64::from(entry.meshlet_count) * std::mem::size_of::<MeshletGpu>() as u64;
+            let req_d_bytes = u64::from(entry.meshlet_count) * std::mem::size_of::<MeshletIndirectDraw>() as u64;
+            ensure!(
+                req_m_bytes <= limits.max_storage_buffer_binding_size
+                    && req_d_bytes <= limits.max_storage_buffer_binding_size,
+                "meshlet buffers exceed device max_storage_buffer_binding_size"
+            );
+            let wg = entry.meshlet_count.div_ceil(64);
+            ensure!(
+                wg <= limits.max_compute_workgroups_per_dimension,
+                "meshlet workgroup count {wg} exceeds device limit {}",
+                limits.max_compute_workgroups_per_dimension
+            );
+            let u = Self::build_uniform(entry.meshlet_count, hiz_view_opt, &entry.params);
+            let off = i * stride;
+            self.uniform_bytes[off..off + u_size].copy_from_slice(bytemuck::bytes_of(&u));
+            let key = (entry.mesh_key, entry.draws_gen, entry.meshlet_count, hiz_id);
+            self.batch_groups.entry(key).or_insert_with(|| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("meshlet_cull_bg"),
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &self.uniform,
+                                offset: 0,
+                                size: wgpu::BufferSize::new(u_size as u64),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: entry.meshlets_buf,
+                                offset: 0,
+                                size: wgpu::BufferSize::new(req_m_bytes),
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: entry.draws_buf,
+                                offset: 0,
+                                size: wgpu::BufferSize::new(req_d_bytes),
+                            }),
+                        },
+                        wgpu::BindGroupEntry { binding: 3, resource: self.stats.as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(bound_hiz),
+                        },
+                    ],
+                })
+            });
+        }
+        queue.write_buffer(&self.uniform, 0, &self.uniform_bytes[..total_bytes]);
+        encoder.clear_buffer(&self.stats, 0, None);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("meshlet_cull_batch"),
+            timestamp_writes,
+        });
+        pass.set_pipeline(&self.pipeline);
+        for (i, entry) in entries.iter().enumerate() {
+            if entry.meshlet_count == 0 {
+                continue;
+            }
+            let key = (entry.mesh_key, entry.draws_gen, entry.meshlet_count, hiz_id);
+            let bg = &self.batch_groups[&key];
+            let dyn_offset = u32::try_from(i as u64 * self.uniform_stride)?;
+            pass.set_bind_group(0, bg, &[dyn_offset]);
+            pass.dispatch_workgroups(entry.meshlet_count.div_ceil(64), 1, 1);
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -470,21 +712,7 @@ impl MeshletCuller {
             "meshlet workgroup count {wg} exceeds device limit {}",
             limits.max_compute_workgroups_per_dimension
         );
-        let flags = u32::from(params.backface_cull) | (u32::from(params.reversed_z) << 1);
-        let hiz_mips = hiz_view.map_or(0, |v| params.hiz_mips.min(v.texture().mip_level_count()));
-        let u = CullUniform {
-            model: params.model,
-            inv_model: crate::matrix::invert(&params.model),
-            hiz_vp: params.hiz_vp,
-            planes: params.frustum_planes,
-            camera_pos: [params.camera_pos[0], params.camera_pos[1], params.camera_pos[2], 0.0],
-            counts_flags: [
-                meshlet_count,
-                u32::from(params.hiz_enabled && hiz_view.is_some()),
-                hiz_mips,
-                flags,
-            ],
-        };
+        let u = Self::build_uniform(meshlet_count, hiz_view, params);
         encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u));
         encode_copy(device, encoder, &self.stats, bytemuck::bytes_of(&MeshletCullStats::default()));
 
@@ -492,7 +720,14 @@ impl MeshletCuller {
             label: Some("meshlet_cull_bg"),
             layout: &self.bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.uniform,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(std::mem::size_of::<CullUniform>() as u64),
+                    }),
+                },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -521,7 +756,7 @@ impl MeshletCuller {
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, &bg, &[0]);
         pass.dispatch_workgroups(wg, 1, 1);
         Ok(())
     }
@@ -558,6 +793,34 @@ mod tests {
         for m in &built.meshlets {
             assert!(m.meta[0] <= 64 && m.counts[3] <= 124, "meshlet violated vertex/tri cap: {:?} {:?}", m.meta, m.counts);
             assert!(m.cone_axis_cutoff[1] > 0.99 && m.cone_axis_cutoff[3] < 0.01, "flat grid normal cone must be sharp +Y");
+        }
+    }
+
+    #[test]
+    fn build_meshlets_packs_disconnected_flat_shaded_triangles() {
+        let mut pos = Vec::new();
+        let mut idx = Vec::new();
+        // 400 disconnected flat-shaded triangles (3 unique vertices each = 1200 vertices).
+        for z in 0..20u32 {
+            for x in 0..20u32 {
+                let base = pos.len() as u32;
+                let fx = x as f32;
+                let fz = z as f32;
+                pos.push([fx, 0.0, fz]);
+                pos.push([fx, 0.0, fz + 0.8]);
+                pos.push([fx + 0.8, 0.0, fz]);
+                idx.extend_from_slice(&[base, base + 1, base + 2]);
+            }
+        }
+        let built = build_meshlets(&pos, &idx, 64, 124).unwrap();
+        assert_eq!(built.indices.len(), idx.len(), "every disconnected triangle must be preserved");
+        assert!(
+            built.meshlets.len() <= 25,
+            "400 flat-shaded tris at 64 verts/cluster (~21 tris each) should pack into <=25 meshlets, got {}",
+            built.meshlets.len()
+        );
+        for m in &built.meshlets {
+            assert!(m.meta[0] <= 64 && m.counts[3] <= 124);
         }
     }
 

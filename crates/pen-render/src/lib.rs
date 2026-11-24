@@ -165,6 +165,7 @@ pub fn optional_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     adapter.features()
         & (wgpu::Features::PIPELINE_CACHE
             | wgpu::Features::TIMESTAMP_QUERY
+            | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
             | wgpu::Features::TEXTURE_COMPRESSION_BC
             | wgpu::Features::TEXTURE_COMPRESSION_ASTC
             | wgpu::Features::TEXTURE_COMPRESSION_ETC2)

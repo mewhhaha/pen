@@ -77,15 +77,23 @@ impl Drawing<'_> {
                 if view == 0
                     && item.lod == 0
                     && let (Some(slot), Some(ml)) = (entry.meshlet_slot, &mesh.meshlets)
-                    && let Some(&(ml_count, ref ind_buf)) = self.meshlet_indirect.get(slot)
+                    && let Some(&(ml_count, _, ref ind_buf)) = self.meshlet_indirect.get(slot)
                 {
                     pass.set_index_buffer(ml.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    for k in 0..ml_count {
-                        pass.draw_indexed_indirect(ind_buf, u64::from(k) * 20);
-                    }
-                    if let Some(stats) = stats {
-                        stats.draw_calls += ml_count;
-                        stats.triangles += u64::from(lod.count / 3);
+                    if self.multi_draw_indirect {
+                        pass.multi_draw_indexed_indirect(ind_buf, 0, ml_count);
+                        if let Some(stats) = stats {
+                            stats.draw_calls += 1;
+                            stats.triangles += u64::from(lod.count / 3);
+                        }
+                    } else {
+                        for k in 0..ml_count {
+                            pass.draw_indexed_indirect(ind_buf, u64::from(k) * 20);
+                        }
+                        if let Some(stats) = stats {
+                            stats.draw_calls += ml_count;
+                            stats.triangles += u64::from(lod.count / 3);
+                        }
                     }
                 } else {
                     pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -514,6 +522,7 @@ impl State {
             morphed: self.morphing.output(),
             culling: &self.culling,
             meshlet_indirect: &self.meshlet_indirect,
+            multi_draw_indirect: self.device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT),
         };
         if let Some((vel_view, vel_depth)) = &targets.velocity {
             let active_proj = jittered.unwrap_or(frame.projection);
@@ -1200,6 +1209,7 @@ impl State {
             morphed: self.morphing.output(),
             culling: &self.culling,
             meshlet_indirect: &[],
+            multi_draw_indirect: false,
         };
         let ready = &scratch.ready;
         scratch.insets.sort_by_key(|&(index, _)| frame.insets[index].after_sprites);

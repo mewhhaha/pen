@@ -611,7 +611,8 @@ struct Drawing<'a> {
     /// The frame's GPU-morphed vertex buffer, for draws with active morph weights.
     morphed: Option<&'a wgpu::Buffer>,
     culling: &'a GpuCulling,
-    meshlet_indirect: &'a [(u32, wgpu::Buffer)],
+    meshlet_indirect: &'a [(u32, u64, wgpu::Buffer)],
+    multi_draw_indirect: bool,
 }
 
 /// Floats for a uniform buffer, gathered on the stack.
@@ -847,8 +848,8 @@ pub(crate) struct State {
     tonemap: crate::tonemap::TonemapOperator,
     // Wired end-to-end passes driven directly by RenderFrame (physical sky, area lights, PBR decals, RCAS/post-FX, OIT, split-screen).
     wired: wired_passes::WiredPasses,
-    // Indirect draw-command buffers populated by GPU meshlet cluster culling for the primary view.
-    meshlet_indirect: Vec<(u32, wgpu::Buffer)>,
+    // Indirect draw-command buffers `(meshlet_count, buffer_generation, buffer)` populated by GPU meshlet cluster culling.
+    meshlet_indirect: Vec<(u32, u64, wgpu::Buffer)>,
     instance_data: Vec<f32>,
     instance_uploads: instance_upload::Uploads,
     last_stats: RenderStats,

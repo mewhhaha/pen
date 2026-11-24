@@ -19,7 +19,7 @@ use crate::shader::PipelineContext;
 pub(crate) const CULL_WGSL: &str = include_str!("../shaders/cull.wgsl");
 
 /// Batches of at least this many instances cull on the GPU, where it can.
-pub(crate) const GPU_CULLING_FROM: u32 = 256;
+pub(crate) const GPU_CULLING_FROM: u32 = 32;
 
 // An instance's floats: its transform's four columns and its parameters.
 const INSTANCE_BYTES: u64 = 80;

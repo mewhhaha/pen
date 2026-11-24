@@ -16,7 +16,7 @@ use super::{
 };
 use crate::RenderStats;
 use crate::asset_store::{AssetKind, MAPS_FLOATS, MAX_LODS, SURFACE_FLOATS};
-use crate::culling::{ALL_VIEWS, CAMERA, Detail, Frustum, MAX_VIEWS, Sphere, ViewMask, Views, stretch};
+use crate::culling::{ALL_VIEWS, CAMERA, Detail, Frustum, Sphere, ViewMask, Views, stretch};
 use crate::decals::DecalBatch;
 use crate::local_shadows::Selection;
 use crate::matrix::{IDENTITY, narrow};
@@ -241,15 +241,23 @@ impl State {
             scratch.placements.push(placement);
         }
         // Batches of many instances cull on the GPU: their instances go first
-        // in the buffer, whole, once each.
+        // in the buffer, whole, once each, largest first so big static batches
+        // stay at stable offsets when smaller dynamic batches change size.
         let mut instance_count = 0;
-        for batch in &mut scratch.batches {
+        let mut gpu_order: Vec<usize> = (0..scratch.batches.len())
+            .filter(|&i| {
+                let batch = &scratch.batches[i];
+                batch.bounds.is_some()
+                    && matches!(self.assets.current(batch.mesh), Some(GpuAsset::Mesh(_)))
+                    && self.culling.takes(batch.count)
+            })
+            .collect();
+        gpu_order.sort_by(|&a, &b| scratch.batches[b].count.cmp(&scratch.batches[a].count).then_with(|| a.cmp(&b)));
+        for index in gpu_order {
+            let batch = &mut scratch.batches[index];
             let (Some(bounds), Some(GpuAsset::Mesh(mesh))) = (batch.bounds, self.assets.current(batch.mesh)) else {
                 continue;
             };
-            if !self.culling.takes(batch.count) {
-                continue;
-            }
             let views = if batch.casts { scratch.views.all() } else { CAMERA | scratch.capture_bit };
             batch.gpu = self.culling.add(&bounds, &mesh.lods, instance_count, batch.count, views);
             if batch.gpu.is_some() {
@@ -277,8 +285,12 @@ impl State {
                 seen(choice, draw, &scratch.views, &scratch.detail, scratch.capture_bit, stats)
             };
             if let Some(batch) = batch {
-                for (view, ranges) in batch.ranges.iter_mut().enumerate() {
-                    ranges[usize::from(placement.lod)].1 += u32::from(placement.views & (1 << view) != 0);
+                let mut mask = placement.views;
+                let lod = usize::from(placement.lod);
+                while mask != 0 {
+                    let view = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    batch.ranges[view][lod].1 += 1;
                 }
             }
         }
@@ -318,12 +330,14 @@ impl State {
                 batch.written += 1;
                 continue;
             }
-            for view in 0..MAX_VIEWS {
-                if placement.views & (1 << view) != 0 {
-                    let (first, count) = &mut batch.ranges[view][usize::from(placement.lod)];
-                    write(*first + *count);
-                    *count += 1;
-                }
+            let mut mask = placement.views;
+            let lod = usize::from(placement.lod);
+            while mask != 0 {
+                let view = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let (first, count) = &mut batch.ranges[view][lod];
+                write(*first + *count);
+                *count += 1;
             }
         }
         for (index, (draw, placement)) in frame.draws.iter().zip(&scratch.placements).enumerate() {
@@ -342,7 +356,7 @@ impl State {
             let views = match batch.gpu {
                 Some(_) if batch.casts => scratch.views.all(),
                 Some(_) => CAMERA | scratch.capture_bit,
-                None => (0..MAX_VIEWS)
+                None => (0..scratch.views.count())
                     .filter(|&view| batch.ranges[view].iter().any(|range| range.1 > 0))
                     .fold(0, |views, view| views | 1 << view),
             };

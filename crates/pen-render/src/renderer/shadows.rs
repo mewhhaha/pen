@@ -539,13 +539,29 @@ impl State {
     pub(super) fn local_signatures(&self, frame: &RenderFrame, scratch: &super::Scratch) -> Vec<u64> {
         use super::{Shape, Source};
         use std::hash::{Hash, Hasher};
+        if self.local.casters.is_empty() {
+            return Vec::new();
+        }
         let count = self.cascades.1;
         let mut signatures = Vec::with_capacity(self.local.faces.len());
         let floats = |hasher: &mut std::collections::hash_map::DefaultHasher, values: &[f32]| {
-            for value in values {
-                value.to_bits().hash(hasher);
-            }
+            hasher.write(bytemuck::cast_slice(values));
         };
+        // Precompute GPU-culled batch instance hashes once per frame instead of
+        // re-hashing every instance for every local light shadow face.
+        let gpu_batch_hashes: Vec<Option<u64>> = scratch
+            .batches
+            .iter()
+            .map(|batch| {
+                batch.gpu.map(|_| {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    batch.count.hash(&mut h);
+                    let from = batch.first as usize * 20;
+                    floats(&mut h, &self.instance_data[from..from + batch.count as usize * 20]);
+                    h.finish()
+                })
+            })
+            .collect();
         for caster in &self.local.casters {
             let light = &frame.lights[caster.light];
             for face in 0..caster.faces() {
@@ -593,17 +609,19 @@ impl State {
                                 self.frames.hash(&mut hasher);
                             }
                         }
-                        Shape::Batch(batch) => {
-                            let batch = &scratch.batches[batch];
+                        Shape::Batch(batch_idx) => {
+                            let batch = &scratch.batches[batch_idx];
                             (batch.mesh, self.assets.slots[batch.mesh].revision).hash(&mut hasher);
-                            let ranges: Vec<(u32, u32)> = match batch.gpu {
-                                Some(_) => vec![(batch.first, batch.count)],
-                                None => batch.ranges[view].to_vec(),
-                            };
-                            for (first, count) in ranges {
-                                count.hash(&mut hasher);
-                                let from = first as usize * 20;
-                                floats(&mut hasher, &self.instance_data[from..from + count as usize * 20]);
+                            if let Some(hash) = gpu_batch_hashes[batch_idx] {
+                                hash.hash(&mut hasher);
+                            } else {
+                                for &(first, count) in &batch.ranges[view] {
+                                    count.hash(&mut hasher);
+                                    if count > 0 {
+                                        let from = first as usize * 20;
+                                        floats(&mut hasher, &self.instance_data[from..from + count as usize * 20]);
+                                    }
+                                }
                             }
                         }
                         Shape::Solid(solid) => (solid, self.solids_revision).hash(&mut hasher),
@@ -752,6 +770,7 @@ fn draw_casters(
     ready: &[ReadyEntry],
     view: usize,
 ) {
+    let mut current: Option<&wgpu::RenderPipeline> = None;
     for &index in casters {
         let entry = &ready[index];
         let item = &drawing.items[entry.item];
@@ -759,7 +778,11 @@ fn draw_casters(
             continue;
         }
         let stage = entry.stage(drawing.items) as usize;
-        pass.set_pipeline(drawing.shader(entry).shadow[stage].as_ref().unwrap());
+        let pipeline = drawing.shader(entry).shadow[stage].as_ref().unwrap();
+        if current != Some(pipeline) {
+            current = Some(pipeline);
+            pass.set_pipeline(pipeline);
+        }
         pass.set_bind_group(1, &entry.group, &[entry.offset]);
         drawing.draw(pass, entry, view, None);
     }

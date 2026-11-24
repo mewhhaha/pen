@@ -29,7 +29,7 @@ use crate::environment_passes::{
 };
 use crate::lights::MAX_AREA_COOKIES;
 use crate::matrix::{IDENTITY, invert, multiply};
-use crate::meshlets::{MeshletCullParams, MeshletCuller, MeshletIndirectDraw};
+use crate::meshlets::{MeshletBatchEntry, MeshletCullParams, MeshletCuller, MeshletIndirectDraw};
 use crate::oit::OitPass;
 use crate::post::{PhysicalSkyBinding, SCENE_FORMAT};
 use crate::post_fx::{PostFxParams, PostFxPass, RcasSharpener};
@@ -609,6 +609,7 @@ pub(super) struct WiredPasses {
     pub ddgi: Option<DdgiVolume>,
     ddgi_composite: Option<DdgiCompositePipeline>,
     pub meshlet_culler: Option<MeshletCuller>,
+    pub meshlet_indirect_serial: u64,
     pub last_meshlet_cull_draws: u32,
     pub env_pipelines: HashMap<(u32, bool), EnvPipelines>,
     pub env_scene: Option<EnvironmentScene>,
@@ -1923,10 +1924,12 @@ impl State {
         let eye = invert(&frame.view);
         let camera_pos = [eye[12], eye[13], eye[14]];
         let reversed_z = depth_mode == DepthMode::ReversedZ;
-        let (hiz_view_ref, _, hiz_vp, _, hiz_mips, hiz_active) = self.hiz.source();
+        let (hiz_view_ref, hiz_view_id, hiz_vp, _, hiz_mips, hiz_active) = self.hiz.source();
         let use_hiz = hiz_active && !reversed_z;
-        let hiz_opt = use_hiz.then_some(hiz_view_ref);
+        let hiz_opt = use_hiz.then_some((hiz_view_ref, hiz_view_id));
+        let has_mdi = device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
 
+        let mut planned: Vec<(usize, usize, u64, u32, MeshletCullParams)> = Vec::new();
         let mut slot_cursor = 0usize;
         for &ready_idx in &scratch.opaque {
             let entry = &scratch.ready[ready_idx];
@@ -1937,7 +1940,10 @@ impl State {
             if item.lod != 0 || !matches!(item.shape, Shape::Mesh(_)) {
                 continue;
             }
-            let Some(GpuAsset::Mesh(mesh)) = entry.mesh.and_then(|s| self.assets.current(s)) else {
+            let Some(mesh_slot) = entry.mesh else {
+                continue;
+            };
+            let Some(GpuAsset::Mesh(mesh)) = self.assets.current(mesh_slot) else {
                 continue;
             };
             if mesh.instances.is_some() {
@@ -1946,30 +1952,31 @@ impl State {
             let Some(ml) = &mesh.meshlets else {
                 continue;
             };
-            if ml.count <= 1 {
+            if ml.count <= 1 || (!has_mdi && ml.count > 64) {
                 continue;
             }
             let need_bytes = u64::from(ml.count) * size_of::<MeshletIndirectDraw>() as u64;
             if slot_cursor >= self.meshlet_indirect.len() {
+                self.wired.meshlet_indirect_serial += 1;
                 let buf = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("meshlet_indirect_draws"),
                     size: need_bytes.max(1280),
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
                     mapped_at_creation: false,
                 });
-                self.meshlet_indirect.push((ml.count, buf));
-            } else if self.meshlet_indirect[slot_cursor].1.size() < need_bytes {
+                self.meshlet_indirect.push((ml.count, self.wired.meshlet_indirect_serial, buf));
+            } else if self.meshlet_indirect[slot_cursor].2.size() < need_bytes {
+                self.wired.meshlet_indirect_serial += 1;
                 let buf = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("meshlet_indirect_draws"),
                     size: need_bytes.next_power_of_two(),
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
                     mapped_at_creation: false,
                 });
-                self.meshlet_indirect[slot_cursor] = (ml.count, buf);
+                self.meshlet_indirect[slot_cursor] = (ml.count, self.wired.meshlet_indirect_serial, buf);
             } else {
                 self.meshlet_indirect[slot_cursor].0 = ml.count;
             }
-            let culler = self.wired.meshlet_culler.get_or_insert_with(|| MeshletCuller::new(device));
             let model = *item.transform(frame);
             let det3 = model[0] * (model[5] * model[10] - model[6] * model[9])
                 - model[4] * (model[1] * model[10] - model[2] * model[9])
@@ -1984,17 +1991,36 @@ impl State {
                 backface_cull: det3 > 0.0,
                 reversed_z,
             };
-            culler.cull(
-                device,
-                encoder,
-                &ml.descriptors,
-                &self.meshlet_indirect[slot_cursor].1,
-                ml.count,
-                hiz_opt,
-                &params,
-            )?;
+            let rev = self.assets.slots[mesh_slot].revision;
+            let mesh_key = ((mesh_slot as u64) << 32) ^ rev;
+            planned.push((slot_cursor, mesh_slot, mesh_key, ml.count, params));
             scratch.ready[ready_idx].meshlet_slot = Some(slot_cursor);
             slot_cursor += 1;
+        }
+        if !planned.is_empty() {
+            let culler = self.wired.meshlet_culler.get_or_insert_with(|| MeshletCuller::new(device));
+            let mut batch = Vec::with_capacity(planned.len());
+            for &(slot, mesh_slot, mesh_key, ml_count, params) in &planned {
+                let Some(GpuAsset::Mesh(mesh)) = self.assets.current(mesh_slot) else { continue };
+                let Some(ml) = &mesh.meshlets else { continue };
+                let &(_, draws_gen, ref draws_buf) = &self.meshlet_indirect[slot];
+                batch.push(MeshletBatchEntry {
+                    mesh_key,
+                    draws_gen,
+                    meshlets_buf: &ml.descriptors,
+                    draws_buf,
+                    meshlet_count: ml_count,
+                    params,
+                });
+            }
+            culler.cull_batch(
+                device,
+                &self.queue,
+                encoder,
+                hiz_opt,
+                &batch,
+                self.timer.compute(super::timing::Span::Culling),
+            )?;
         }
         self.wired.last_meshlet_cull_draws = u32::try_from(slot_cursor).unwrap_or(u32::MAX);
         Ok(())

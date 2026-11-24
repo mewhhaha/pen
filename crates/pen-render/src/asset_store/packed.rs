@@ -31,7 +31,7 @@ pub(super) fn encode_recipe(mesh: &super::Mesh) -> Result<Vec<u8>> {
     };
     let json = serde_json::to_vec(&serde_json::json!({
         "positions":component(0,3),"normals":component(3,3),"uvs":component(6,2),"attributes":component(8,2),
-        "indices":mesh.indices,"lods":[],
+        "tangents":mesh.tangents,"indices":mesh.indices,"lods":[],
         "instances":{"recipe":instances.recipe,"min":instances.min,"max":instances.max}
     }))?;
     ensure!(json.len() <= 64 * 1024 * 1024, "instance recipe JSON exceeds its size limit");
@@ -152,6 +152,21 @@ mod tests {
         let parsed = parse_mesh(&packed).unwrap();
         assert_eq!(parsed.vertices[0].to_bits(), (-0.0f32).to_bits());
         assert_eq!(parsed.vertices[1].to_bits(), 1);
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
+    }
+
+    #[test]
+    fn tangents_round_trip_bit_exactly_through_the_byte_planes() {
+        let mut mesh = parse_mesh(skinned_triangle().as_bytes()).unwrap();
+        // Signed zero, a subnormal and an ordinary value of each sign.
+        let tangents = vec![-0.0, f32::from_bits(1), 0.6, 1.0, 0.0, -1.0, 0.0, -1.0, 0.8, 0.0, 0.6, 1.0];
+        mesh.set_tangents(Some(tangents.clone())).unwrap();
+        let raw = pack_uncompressed(&mesh).unwrap();
+        let packed = encode(raw.clone()).unwrap();
+        assert_eq!(decode(&packed).unwrap().as_ref(), raw);
+        let parsed = parse_mesh(&packed).unwrap();
+        let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(parsed.tangents.as_ref().unwrap()), bits(&tangents));
         assert_eq!(pack_mesh(&packed).unwrap(), packed);
     }
 

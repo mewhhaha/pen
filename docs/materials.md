@@ -149,7 +149,14 @@ but the two uniforms.
 
 A mesh's vertex is `@location(0) position: vec3f`, `@location(1) normal:
 vec3f`, `@location(2) uv: vec2f` and, when the mesh has `attributes`,
-`@location(8) attributes: vec2f`.
+`@location(8) attributes: vec2f`. Every mesh pipeline also offers
+`@location(11) tangent: vec4f`, from a vertex buffer of its own: the mesh's
+`tangents` (four numbers a vertex, xyz and a handedness w of -1 or 1, the
+bitangent being `cross(normal, tangent.xyz) * tangent.w`), or zeros where it has
+none, and for brush solids; a shader that does not declare the location is
+unaffected, and one that does treats a tangent of no length as "derive the frame
+from the screen-space derivatives of position and uv". Locations 3 to 7 are
+an instance's below, so the tangent does not sit among them.
 
 - `@vertex func vertex` and `@fragment func fragment` draw the material. The
   fragment's colour is linear and may pass 1: the frame is drawn into a

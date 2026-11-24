@@ -107,10 +107,11 @@ character carries its code point (a letter, its capital's).
 ## Assets
 
 A catalog lists paths under `src/assets`. A mesh is JSON (`positions`,
-`normals`, `uvs`, `indices`, optional `attributes`) or the binary form
+`normals`, `uvs`, `indices`, optional `attributes` and `tangents`) or the binary form
 `pen build` packs it into. A material is JSON naming its shader (a WGSL asset),
-its colour, `lit` or `unlit`, and optionally textures, blending, overlay, decals
-and shadow casting. A sound is a WAV or Ogg Opus clip. pen has no built-in
+its colour, `lit` or `unlit`, and optionally textures, blending, overlay, decals,
+shadow casting and a `surface` block of clear coat, sheen, anisotropy, transmission
+and the like. A sound is a WAV or Ogg Opus clip. pen has no built-in
 shaders: each game supplies its own ([material shaders](materials.md)).
 
 ## What pen still assumes of gdev

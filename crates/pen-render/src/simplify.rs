@@ -68,6 +68,8 @@ fn simplified(mesh: Mesh) -> Result<Mesh> {
     let whole = whole.to_vec();
     let mut reduced = checked_mesh(mesh.vertices, whole, &simpler, mesh.skin)?;
     reduced.precision = mesh.precision;
+    // Its vertices are the mesh's, so each keeps its tangent.
+    reduced.tangents = mesh.tangents;
     Ok(reduced)
 }
 
@@ -116,6 +118,20 @@ mod tests {
         // A small mesh is left whole.
         let small = parse_mesh(&pack_mesh_with_lods(&grid(8)).unwrap()).unwrap();
         assert_eq!(small.lods.len(), 1);
+    }
+
+    #[test]
+    fn simpler_levels_keep_the_vertices_tangents() {
+        let mut json: serde_json::Value = serde_json::from_slice(&grid(40)).unwrap();
+        let vertices = 41 * 41;
+        let tangents: Vec<f32> =
+            (0..vertices).flat_map(|n| [1.0, 0.0, 0.0, if n % 2 == 0 { 1.0 } else { -1.0 }]).collect();
+        json["tangents"] = serde_json::json!(tangents);
+        let packed = pack_mesh_with_lods(&serde_json::to_vec(&json).unwrap()).unwrap();
+        let mesh = parse_mesh(&packed).unwrap();
+        assert!(mesh.lods.len() > 1, "{:?}", mesh.lods);
+        assert_eq!(mesh.tangents.as_deref(), Some(&tangents[..]));
+        assert_eq!(pack_mesh_with_lods(&packed).unwrap(), packed);
     }
 
     /// The levels the game's meshes get, and how long making them takes

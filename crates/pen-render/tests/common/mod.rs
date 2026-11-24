@@ -1,6 +1,7 @@
 //! What the GPU tests share: a headless device, a plain frame, an offscreen
 //! target and reading its middle pixel back.
 #![allow(dead_code)]
+pub mod picture;
 use std::time::{Duration, Instant};
 
 use pen_protocol::*;

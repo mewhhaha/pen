@@ -242,6 +242,19 @@ mod tests {
     }
 
     #[test]
+    fn recipe_meshes_keep_their_tangents() {
+        let mut json = fixture();
+        let count = json["positions"].as_array().unwrap().len() / 3;
+        json["tangents"] = json!([1.0, 0.0, 0.0, -1.0].repeat(count));
+        let mesh = parse_mesh(&serde_json::to_vec(&json).unwrap()).unwrap();
+        let packed = pack_mesh(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(packed.starts_with(b"PMRP"));
+        assert_eq!(parse_mesh(&packed).unwrap().tangents, mesh.tangents);
+        assert_eq!(mesh.tangents.as_ref().map(Vec::len), Some(count * 4));
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
+    }
+
+    #[test]
     fn packing_keeps_recipes_and_expands_identical_records() {
         let json = serde_json::to_vec(&fixture()).unwrap();
         let mesh = parse_mesh(&json).unwrap();

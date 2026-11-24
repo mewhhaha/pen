@@ -15,15 +15,10 @@
 )]
 mod common;
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-
+use common::picture::*;
 use common::*;
 use pen_protocol::*;
-use pen_render::{Display, Renderer, RendererOptions};
 use serde_json::json;
-
-const SIZE: u32 = 128;
 
 // The draw uniform to its end, and a swatch for each of the ten things the
 // surface block holds in `draw.surface`: swatches 0 to 4 show the xyz of each
@@ -114,15 +109,6 @@ fn full_block() -> (serde_json::Value, [[f32; 4]; 5]) {
     (block, vectors)
 }
 
-/// What a frame with its effects off shows, as 8 bits, of light `value`: the
-/// value as it is up to 0.9, rolling off toward 1 above (the present pass's
-/// highlights).
-fn shown(value: f32) -> u8 {
-    let value = f64::from(value);
-    let toned = if value > 0.9 { 1.0 - 0.01 / (value + 0.1 - 0.9) } else { value };
-    (toned.clamp(0.0, 1.0) * 255.0).round() as u8
-}
-
 /// The swatch `which`'s colour for `vectors`: what the shader writes of it.
 fn swatch_color(vectors: &[[f32; 4]; 5], which: usize) -> [u8; 3] {
     let vector = vectors[which % 5];
@@ -135,119 +121,9 @@ fn center(which: usize) -> (f32, f32) {
     (-0.8 + 0.4 * (which % 5) as f32, if which < 5 { 0.5 } else { -0.5 })
 }
 
-fn moved(x: f32, y: f32) -> Matrix {
-    let mut matrix = IDENTITY;
-    matrix[12] = x;
-    matrix[13] = y;
-    matrix
-}
-
 fn draw(mesh: u32, material: u32, which: usize) -> Draw {
     let (x, y) = center(which);
     Draw { mesh, material, transform: moved(x, y), parameters: Some([which as f32, 0.0, 0.0, 0.0]), extra: None }
-}
-
-struct Rig {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    root: PathBuf,
-    renderer: Renderer,
-    catalog: Catalog,
-    target: Offscreen,
-}
-
-fn write(root: &Path, key: &str, bytes: impl AsRef<[u8]>) {
-    std::fs::write(root.join(key), bytes).unwrap();
-}
-
-impl Rig {
-    /// A renderer over a directory of these `files` and a catalog of the meshes and materials.
-    fn new(name: &str, meshes: &[&str], materials: &[&str], files: &[(&str, Vec<u8>)]) -> Option<Rig> {
-        let Some((device, queue)) = device() else {
-            eprintln!("no GPU adapter; skipping");
-            return None;
-        };
-        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("surface-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        write(&root, "catalog.json", json!({"meshes": meshes, "materials": materials}).to_string());
-        for (key, bytes) in files {
-            write(&root, key, bytes);
-        }
-        let catalog = boundary::read_catalog(&root).unwrap();
-        let renderer = Renderer::new(
-            device.clone(),
-            queue.clone(),
-            RendererOptions {
-                format: FORMAT,
-                display: Display::SDR,
-                assets: root.clone(),
-                veil: None,
-                pipeline_cache: None,
-            },
-        )
-        .unwrap();
-        let target = Offscreen::new(&device, SIZE);
-        Some(Rig { device, queue, root, renderer, catalog, target })
-    }
-
-    /// Draws `frame` once everything it names is loaded and compiled, and
-    /// reads the picture back.
-    fn show(&mut self, frame: &RenderFrame) -> Vec<[u8; 4]> {
-        let started = Instant::now();
-        loop {
-            self.renderer.submit(frame, &self.catalog, &mut self.target).unwrap();
-            for event in self.renderer.take_events() {
-                if let GameEvent::AssetFailed { key, message, .. } = event {
-                    panic!("{key} failed: {message}");
-                }
-            }
-            if !self.renderer.waiting() && self.renderer.pending() == 0 {
-                break;
-            }
-            assert!(started.elapsed() < Duration::from_secs(30), "assets still loading");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        self.renderer.submit(frame, &self.catalog, &mut self.target).unwrap();
-        pixels(&self.device, &self.queue, &self.target.0)
-    }
-}
-
-/// The picture's pixels, RGBA, row by row.
-fn pixels(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<[u8; 4]> {
-    let row = SIZE * 4;
-    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: None,
-        size: u64::from(row * SIZE),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&Default::default());
-    encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
-            buffer: &buffer,
-            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: None },
-        },
-        wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
-    );
-    queue.submit([encoder.finish()]);
-    buffer.slice(..).map_async(wgpu::MapMode::Read, |result| result.unwrap());
-    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    let bytes = buffer.slice(..).get_mapped_range().unwrap();
-    bytes.as_chunks::<4>().0.iter().map(|&[b, g, r, a]| [r, g, b, a]).collect()
-}
-
-/// The pixel showing the clip-space point (x, y).
-fn at(pixels: &[[u8; 4]], x: f32, y: f32) -> [u8; 3] {
-    let column = (((x + 1.0) / 2.0 * SIZE as f32) as usize).min(SIZE as usize - 1);
-    let row = (((1.0 - y) / 2.0 * SIZE as f32) as usize).min(SIZE as usize - 1);
-    let [r, g, b, _] = pixels[row * SIZE as usize + column];
-    [r, g, b]
-}
-
-fn near(got: [u8; 3], want: [u8; 3]) -> bool {
-    got.iter().zip(want).all(|(&got, want)| got.abs_diff(want) <= 2)
 }
 
 /// Every swatch of `pixels` against what `vectors` should show, as one

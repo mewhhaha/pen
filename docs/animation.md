@@ -61,9 +61,10 @@ in the mesh's space times its inverse bind matrix) and draws the draw alone
 with the shader's skinned pipeline. Other posed draws draw as they are, in
 their bind pose (pen-render's `animation.rs` and `renderer/skinning.rs`).
 
-A skinned pipeline reads two vertex buffers, the mesh's (locations 0, 1, 2
-and 8) and its joints (`Uint16x4`, location 9) and weights (`Float32x4`,
-location 10), and a third bind group: the frame's joint matrices,
+A skinned pipeline reads three vertex buffers, the mesh's (locations 0, 1, 2
+and 8), its tangents (`Float32x4`, location 11, zeros without any) and its
+joints (`Uint16x4`, location 9) and weights (`Float32x4`, location 10), and a
+third bind group: the frame's joint matrices,
 `var<storage, read> joints: array<mat4x4f>` at `@group(3) @binding(0)`,
 bound at the draw's offset. gdev's `scene.wgsl` has the entry point:
 

@@ -98,7 +98,10 @@ three simpler levels with growing errors. Each mesh gets a bounding sphere
 as it is parsed, which culls its draws. A skinned mesh adds four `joints`
 and `weights` a vertex and its rig (`skeleton`, `skin`, `clips`;
 `animation.rs`, which also writes and reads the rig's binary form after the
-joints and weights); its joints and weights become a second vertex buffer.
+joints and weights); its joints and weights become a vertex buffer of their
+own. A mesh may also have `tangents`, four floats a vertex (flag 32 of the
+binary form: its own block after the vertices), which become a vertex buffer
+too.
 
 A level of detail keeps the mesh's vertices and leaves out triangles: its
 indices follow the whole mesh's in the same index buffer, with the error (in
@@ -149,6 +152,18 @@ compiles ends, and again when the renderer is dropped. wgpu and the driver
 ignore a cache from another driver or wgpu version. pen passes
 `~/.cache/pen/pipelines`.
 
+A material with `transmission` above 0 is translucent even with an opaque
+colour (`Material::opaque`), as it reads the opaque picture behind it.
+
+Every mesh pipeline, shadows' included, reads vertex buffers in slots 0 to 2: the
+mesh's vertices (locations 0 to 2 and 8), its tangents (location 11, one `vec4f`
+a vertex), and the instances' transforms and parameters (locations 3 to 7) or a
+skinned mesh's joints and weights (9 and 10). A mesh without tangents, and each
+brush solid, binds one shared buffer of zeros that is as large as the largest
+mesh meshed without any (`State::zero_tangents`, grown by doubling when a mesh
+arrives), so no pipeline needs a variant for tangents and shaders that leave
+out location 11 are unaffected.
+
 ## A frame
 
 `renderer.rs` holds the state and the types its parts share. The parts are
@@ -164,8 +179,10 @@ in `renderer/`:
   Opaque draws of a mesh and material whose shader has `vertex_instanced`
   share an instanced batch. Materials with `instanceParameters` share one
   across their render state, so animation poses draw together. Draws with
-  their own `extra` data draw alone. Brush solids are meshed from their
-  planes (`solids.rs`); only the solids that changed are meshed again. Each
+  their own `extra` data draw alone. The render state includes the material's
+  `surface` block, written for every draw after its extra vectors (byte 688 of
+  the draw uniform, `DRAW_BYTES` 768) by the one function that fills the
+  draws' uniforms. Brush solids are meshed from their planes (`solids.rs`); only the solids that changed are meshed again. Each
   draw is then culled (below). Each item then gets its uniforms and
   pipeline; one no view sees still loads and compiles what it draws with,
   but writes no uniforms. The passes are sorted next: opaque surfaces by

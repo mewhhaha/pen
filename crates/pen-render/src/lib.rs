@@ -50,6 +50,7 @@ mod ssgi;
 mod subsurface;
 mod surface;
 pub mod surface_atlas;
+pub mod svgf;
 mod taa;
 #[cfg(test)]
 mod testing;
@@ -91,9 +92,11 @@ pub use post_fx::{
 };
 pub use prefetch::Prefetch;
 pub use ray_tracing::{
-    BVH_RAYTRACE_WGSL, BvhNodeGpu, BvhScene, BvhTriGpu, BvhTriangle, GpuRayTracer, RayTraceParams,
-    supports_hardware_ray_query,
+    BVH_RAYTRACE_WGSL, Blas, BlasTriGpu, BlasTriangle, BvhNodeGpu, BvhScene, BvhTriGpu, BvhTriangle, GpuRayTracer,
+    RayTraceParams, TLAS_RAYTRACE_WGSL, TLAS_TRAVERSAL_WGSL, TlasInstance, TlasInstanceGpu, TlasRayTraceParams,
+    TlasRayTracer, TlasScene, TlasSceneGpu, supports_hardware_ray_query,
 };
+pub use svgf::{SVGF_WGSL, SvgfDenoiser, SvgfInputs, SvgfParams};
 pub use render_targets::{
     ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,
     oblique_clip_projection, planar_reflection_camera, planar_reflection_view,

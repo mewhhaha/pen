@@ -71,6 +71,9 @@ pub(crate) struct Mesh {
     pub instances: Option<MeshInstances>,
     /// Opt-in fractional precision for shipping positions and normals.
     pub precision: Option<u8>,
+    /// Each vertex's tangent (`MESH_TANGENT_FLOATS` floats: xyz and a
+    /// handedness of -1 or 1), a stream of its own beside the vertices.
+    pub tangents: Option<Vec<f32>>,
 }
 
 /// Up to four joints (indices into the rig's joints) per vertex, and how
@@ -95,6 +98,8 @@ pub(crate) const MAX_LODS: usize = 4;
 
 // position3, normal3, UV2, optional shader attributes2 (location 8).
 pub(crate) const MESH_VERTEX_FLOATS: usize = 10;
+// An optional tangent stream (location 11): xyz and the handedness w.
+pub(crate) const MESH_TANGENT_FLOATS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Material {
@@ -129,6 +134,175 @@ pub(crate) struct Material {
     pub decals: bool,
     /// A lit, opaque material casts a shadow unless this is false.
     pub shadow: bool,
+    /// The richer lobes: clear coat, sheen, anisotropy, transmission and
+    /// volume, specular and emissive strength. Part of the render state.
+    /// Boxed: the loader's messages carry materials, and a material this big
+    /// would make its variants differ in size past what clippy accepts.
+    pub surface: Box<Surface>,
+}
+
+/// A material's `surface` block, as the draw uniform's last five `vec4f`s
+/// hold it (`Surface::vectors`; docs/materials.md): the factors of the glTF
+/// extensions KHR_materials_clearcoat, sheen, anisotropy, transmission,
+/// volume, ior and specular, and KHR_materials_emissive_strength. A material
+/// without the block has `Surface::default()`, which leaves every lobe off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Surface {
+    pub clearcoat: f32,
+    pub clearcoat_roughness: f32,
+    pub sheen_color: [f32; 3],
+    pub sheen_roughness: f32,
+    pub anisotropy: f32,
+    /// Radians.
+    pub anisotropy_rotation: f32,
+    pub transmission: f32,
+    pub ior: f32,
+    /// In model units; 0 is thin-walled.
+    pub thickness: f32,
+    pub attenuation_color: [f32; 3],
+    /// In model units; 0 is infinite.
+    pub attenuation_distance: f32,
+    pub specular: f32,
+    pub specular_color: [f32; 3],
+    pub emissive_strength: f32,
+}
+
+impl Default for Surface {
+    fn default() -> Self {
+        Surface {
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.0,
+            sheen_color: [0.0; 3],
+            sheen_roughness: 0.0,
+            anisotropy: 0.0,
+            anisotropy_rotation: 0.0,
+            transmission: 0.0,
+            ior: 1.5,
+            thickness: 0.0,
+            attenuation_color: [1.0; 3],
+            attenuation_distance: 0.0,
+            specular: 1.0,
+            specular_color: [1.0; 3],
+            emissive_strength: 1.0,
+        }
+    }
+}
+
+/// The draw uniform's floats for the surface block: five `vec4f`s.
+pub(crate) const SURFACE_FLOATS: usize = 20;
+
+impl Surface {
+    /// The five `vec4f`s of the draw uniform's `surface` array:
+    /// (clearcoat, clearcoat roughness, sheen roughness, anisotropy),
+    /// (sheen color, anisotropy rotation), (transmission, ior, thickness,
+    /// attenuation distance), (attenuation color, specular) and (specular
+    /// color, emissive strength).
+    pub fn vectors(&self) -> [f32; SURFACE_FLOATS] {
+        let [sheen_r, sheen_g, sheen_b] = self.sheen_color;
+        let [attenuation_r, attenuation_g, attenuation_b] = self.attenuation_color;
+        let [specular_r, specular_g, specular_b] = self.specular_color;
+        [
+            self.clearcoat,
+            self.clearcoat_roughness,
+            self.sheen_roughness,
+            self.anisotropy,
+            sheen_r,
+            sheen_g,
+            sheen_b,
+            self.anisotropy_rotation,
+            self.transmission,
+            self.ior,
+            self.thickness,
+            self.attenuation_distance,
+            attenuation_r,
+            attenuation_g,
+            attenuation_b,
+            self.specular,
+            specular_r,
+            specular_g,
+            specular_b,
+            self.emissive_strength,
+        ]
+    }
+
+    /// The block of a material's JSON: every key optional, the rest as
+    /// `Surface::default()`, and none but these.
+    fn parse(value: Option<&Value>) -> Result<Surface> {
+        const KEYS: [&str; 14] = [
+            "clearcoat",
+            "clearcoatRoughness",
+            "sheenColor",
+            "sheenRoughness",
+            "anisotropy",
+            "anisotropyRotation",
+            "transmission",
+            "ior",
+            "thickness",
+            "attenuationColor",
+            "attenuationDistance",
+            "specular",
+            "specularColor",
+            "emissiveStrength",
+        ];
+        let block = match value {
+            None | Some(Value::Null) => return Ok(Surface::default()),
+            Some(Value::Object(block)) => block,
+            Some(_) => bail!("material surface must be an object"),
+        };
+        if let Some(unknown) = block.keys().find(|key| !KEYS.contains(&key.as_str())) {
+            bail!("material surface has no {unknown}");
+        }
+        let float32 = f64::from(f32::MAX);
+        let range = |least: f64, most: f64| {
+            if most == float32 && least == -float32 {
+                "finite".to_owned()
+            } else if most == float32 {
+                format!("at least {least}")
+            } else {
+                format!("from {least} to {most}")
+            }
+        };
+        // Held to the range, and to the float32 the uniform holds.
+        #[allow(clippy::cast_possible_truncation, reason = "within float32's range, as the range says")]
+        let number = |key: &str, default: f32, least: f64, most: f64| -> Result<f32> {
+            match block.get(key) {
+                None => Ok(default),
+                Some(value) => value
+                    .as_f64()
+                    .filter(|value| (least..=most).contains(value))
+                    .map(|value| value as f32)
+                    .ok_or_else(|| anyhow!("material surface {key} must be a number {}", range(least, most))),
+            }
+        };
+        #[allow(clippy::cast_possible_truncation, reason = "within float32's range, as the range says")]
+        let channels = |key: &str, default: f32, most: f64| -> Result<[f32; 3]> {
+            let Some(value) = block.get(key) else { return Ok([default; 3]) };
+            let invalid = || anyhow!("material surface {key} must be three numbers {}", range(0.0, most));
+            let values = value.as_array().filter(|values| values.len() == 3).ok_or_else(invalid)?;
+            let mut out = [0.0; 3];
+            for (out, value) in out.iter_mut().zip(values) {
+                *out = value.as_f64().filter(|value| (0.0..=most).contains(value)).ok_or_else(invalid)? as f32;
+            }
+            Ok(out)
+        };
+        let defaults = Surface::default();
+        Ok(Surface {
+            clearcoat: number("clearcoat", defaults.clearcoat, 0.0, 1.0)?,
+            clearcoat_roughness: number("clearcoatRoughness", defaults.clearcoat_roughness, 0.0, 1.0)?,
+            sheen_color: channels("sheenColor", 0.0, 1.0)?,
+            sheen_roughness: number("sheenRoughness", defaults.sheen_roughness, 0.0, 1.0)?,
+            anisotropy: number("anisotropy", defaults.anisotropy, -1.0, 1.0)?,
+            anisotropy_rotation: number("anisotropyRotation", defaults.anisotropy_rotation, -float32, float32)?,
+            transmission: number("transmission", defaults.transmission, 0.0, 1.0)?,
+            ior: number("ior", defaults.ior, 1.0, float32)?,
+            thickness: number("thickness", defaults.thickness, 0.0, float32)?,
+            attenuation_color: channels("attenuationColor", 1.0, 1.0)?,
+            attenuation_distance: number("attenuationDistance", defaults.attenuation_distance, 0.0, float32)?,
+            specular: number("specular", defaults.specular, 0.0, float32)?,
+            specular_color: channels("specularColor", 1.0, float32)?,
+            emissive_strength: number("emissiveStrength", defaults.emissive_strength, 0.0, float32)?,
+        })
+    }
 }
 
 impl Material {
@@ -140,9 +314,11 @@ impl Material {
         format!("{state:?}")
     }
 
-    /// Opaque: not an overlay, not blended and with an opaque color.
+    /// Opaque: not an overlay, not blended, with an opaque color and not
+    /// transmissive: a transmissive surface draws among the translucent ones,
+    /// as it reads the opaque picture behind it, whatever its alpha.
     pub fn opaque(&self) -> bool {
-        !self.overlay && !self.blend && self.color[3] == 1.0
+        !self.overlay && !self.blend && self.color[3] == 1.0 && self.surface.transmission <= 0.0
     }
 
     pub fn casts_shadow(&self) -> bool {
@@ -176,6 +352,8 @@ const MESH_SHORT_INDICES: u8 = 2;
 const MESH_SKIN: u8 = 4;
 const MESH_LODS: u8 = 8;
 const MESH_INSTANCES: u8 = 16;
+// Flag: each vertex's tangent (four f32s) follows the vertices.
+const MESH_TANGENTS: u8 = 32;
 const MESH_HEADER: usize = 16;
 
 /// A mesh as its JSON has it: flat arrays, three or two numbers a vertex,
@@ -205,6 +383,10 @@ struct MeshArrays {
     lods: Option<Vec<LodArrays>>,
     #[serde(default)]
     instances: Option<MeshInstances>,
+    /// Four numbers a vertex: a tangent's xyz and its handedness, the sign
+    /// of the bitangent (cross(normal, tangent) * w).
+    #[serde(default)]
+    tangents: Option<Vec<f32>>,
 }
 
 #[derive(Deserialize)]
@@ -236,6 +418,7 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
         skin,
         clips,
         instances,
+        tangents,
     } = arrays;
     let count = positions.len() / 3;
     ensure!(
@@ -276,6 +459,7 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
     mesh.precision = precision;
     mesh.authored_lods = authored_lods;
     mesh.set_instances(instances)?;
+    mesh.set_tangents(tangents)?;
     Ok(mesh)
 }
 
@@ -345,6 +529,7 @@ pub(crate) fn checked_mesh(
         skin,
         instances: None,
         precision: None,
+        tangents: None,
     };
     let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
     ensure!(count != 0, "mesh requires matching position/normal/UV vertices and triangle indices");
@@ -379,12 +564,28 @@ pub(crate) fn checked_mesh(
     Ok(mesh)
 }
 
+impl Mesh {
+    /// Gives the mesh its tangents: four finite numbers for each vertex, or
+    /// none.
+    pub(crate) fn set_tangents(&mut self, tangents: Option<Vec<f32>>) -> Result<()> {
+        if let Some(tangents) = &tangents {
+            ensure!(
+                tangents.len() == self.vertices.len() / MESH_VERTEX_FLOATS * MESH_TANGENT_FLOATS,
+                "mesh tangents need four numbers a vertex"
+            );
+            ensure!(tangents.iter().all(|value| value.is_finite()), "mesh tangents must be finite float32 values");
+        }
+        self.tangents = tangents;
+        Ok(())
+    }
+}
+
 /// The compact binary form of a mesh asset (JSON, or already binary), which
 /// the renderer reads in place of its JSON under the same key: "PMSH",
 /// version 1 (or its losslessly compressed version-2 wrapper), flags (1: shader attributes, 2: 16-bit indices, 4: a skin,
-/// 8: simpler levels of detail, 16: persistent instances), two zero bytes, then the vertex and index
+/// 8: simpler levels of detail, 16: persistent instances, 32: tangents), two zero bytes, then the vertex and index
 /// counts (u32s), each vertex's position, normal, UV and, flagged,
-/// attributes (f32s), and the indices; flagged, then the count of simpler
+/// attributes (f32s); flagged, each vertex's tangent (four f32s); and the indices; flagged, then the count of simpler
 /// levels (u32), each one's index count (u32) and error (f32), and their
 /// indices; flagged, a skinned mesh's each vertex's joints (u16s) and
 /// weights (f32s) and its rig; or persistent instance count, min/max bounds,
@@ -420,7 +621,8 @@ fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
             | if short { MESH_SHORT_INDICES } else { 0 }
             | if mesh.skin.is_some() { MESH_SKIN } else { 0 }
             | if lods { MESH_LODS } else { 0 }
-            | if mesh.instances.is_some() { MESH_INSTANCES } else { 0 },
+            | if mesh.instances.is_some() { MESH_INSTANCES } else { 0 }
+            | if mesh.tangents.is_some() { MESH_TANGENTS } else { 0 },
         0,
         0,
     ]);
@@ -441,6 +643,9 @@ fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
         }
         Ok(())
     };
+    for value in mesh.tangents.iter().flatten() {
+        packed.extend(value.to_le_bytes());
+    }
     let whole = mesh.lods[0];
     write(&mut packed, &mesh.indices[whole.first as usize..(whole.first + whole.count) as usize])?;
     if lods {
@@ -500,9 +705,13 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
     } else {
         None
     };
+    let tangents = layout.tangents.as_ref().map(|block| {
+        bytes[block.range()].as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)).collect::<Vec<_>>()
+    });
     let mut mesh = checked_mesh(vertices, indices, &simpler, skin)?;
     mesh.authored_lods = true;
     mesh.set_instances(layout.instances.as_ref().map(|layout| MeshInstances::read(bytes, layout)).transpose()?)?;
+    mesh.set_tangents(tangents)?;
     Ok(mesh)
 }
 
@@ -586,6 +795,7 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
         scene_filter,
         decals,
         shadow,
+        surface: Box::new(Surface::parse(material.get("surface"))?),
     })
 }
 
@@ -884,6 +1094,108 @@ mod tests {
         assert!(validate_asset_key("a/b.png").is_ok());
     }
 
+    fn material_with(surface: &str) -> Result<Material> {
+        parse_material(
+            format!(r#"{{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit","surface":{surface}}}"#).as_bytes(),
+        )
+    }
+
+    #[test]
+    fn a_material_without_a_surface_block_has_its_lobes_off() {
+        let plain = parse_material(br#"{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit"}"#).unwrap();
+        assert_eq!(*plain.surface, Surface::default());
+        // The documented defaults: ior 1.5, full specular, white colours, strength 1, the rest 0.
+        assert_eq!(
+            plain.surface.vectors(),
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        );
+        // An empty block and a null one say the same.
+        assert_eq!(*material_with("{}").unwrap().surface, Surface::default());
+        assert_eq!(*material_with("null").unwrap().surface, Surface::default());
+        assert!(plain.opaque() && plain.casts_shadow());
+    }
+
+    #[test]
+    fn the_surface_block_fills_the_five_vectors_in_the_documented_order() {
+        let material = material_with(
+            r#"{"clearcoat":0.25,"clearcoatRoughness":0.125,"sheenColor":[0.5,0.25,0.75],"sheenRoughness":0.375,
+                "anisotropy":-0.5,"anisotropyRotation":1.5,"transmission":0.0,"ior":1.75,"thickness":2.5,
+                "attenuationColor":[0.9,0.8,0.7],"attenuationDistance":4.0,"specular":0.5,
+                "specularColor":[2.0,0.5,0.25],"emissiveStrength":3.0}"#,
+        )
+        .unwrap();
+        let v = material.surface.vectors();
+        assert_eq!(v[0..4], [0.25, 0.125, 0.375, -0.5], "clearcoat, its roughness, sheen roughness, anisotropy");
+        assert_eq!(v[4..8], [0.5, 0.25, 0.75, 1.5], "sheen colour and the anisotropy's rotation");
+        assert_eq!(v[8..12], [0.0, 1.75, 2.5, 4.0], "transmission, ior, thickness, attenuation distance");
+        assert_eq!(v[12..16], [0.9f32, 0.8, 0.7, 0.5], "attenuation colour and specular");
+        assert_eq!(v[16..20], [2.0, 0.5, 0.25, 3.0], "specular colour and emissive strength");
+        // Keys left out keep their defaults, one by one.
+        let partly = material_with(r#"{"clearcoat":1.0}"#).unwrap().surface.vectors();
+        let mut expected = Surface::default().vectors();
+        expected[0] = 1.0;
+        assert_eq!(partly, expected);
+    }
+
+    #[test]
+    fn the_surface_block_is_checked() {
+        for (surface, said) in [
+            (r#"{"clearcoat":1.5}"#, "clearcoat"),
+            (r#"{"clearcoatRoughness":-0.1}"#, "clearcoatRoughness"),
+            (r#"{"sheenColor":[1,1]}"#, "sheenColor"),
+            (r#"{"sheenColor":[1,1,2]}"#, "sheenColor"),
+            (r#"{"anisotropy":1.5}"#, "anisotropy"),
+            (r#"{"transmission":2}"#, "transmission"),
+            (r#"{"ior":0.5}"#, "ior"),
+            (r#"{"thickness":-1}"#, "thickness"),
+            (r#"{"attenuationDistance":-1}"#, "attenuationDistance"),
+            (r#"{"attenuationColor":[0,0,"x"]}"#, "attenuationColor"),
+            (r#"{"specular":-1}"#, "specular"),
+            (r#"{"specularColor":[-1,0,0]}"#, "specularColor"),
+            (r#"{"emissiveStrength":"high"}"#, "emissiveStrength"),
+            (r#"{"anisotropyRotation":1e300}"#, "anisotropyRotation"),
+            // A key it has no lobe for, a misspelt one among them.
+            (r#"{"clearcoatRoughnes":0.5}"#, "clearcoatRoughnes"),
+            (r#"[0.5]"#, "an object"),
+        ] {
+            let error = format!("{:#}", material_with(surface).unwrap_err());
+            assert!(error.contains(said), "{surface}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_surface_is_part_of_the_render_state_but_instance_parameters_are_not() {
+        let state = |surface: &str, parameters: &str| {
+            let json = format!(
+                r#"{{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit","instanceParameters":{parameters}{surface}}}"#
+            );
+            parse_material(json.as_bytes()).unwrap().state_key()
+        };
+        let plain = state("", "[0,0,0,0]");
+        assert_eq!(plain, state("", "[1,2,3,4]"), "parameters may differ inside one batch");
+        assert_eq!(plain, state(r#","surface":{"clearcoat":0}"#, "[0,0,0,0]"), "a block of defaults is no block");
+        assert_ne!(plain, state(r#","surface":{"clearcoat":0.5}"#, "[0,0,0,0]"));
+        assert_ne!(
+            state(r#","surface":{"sheenColor":[1,0,0]}"#, "[0,0,0,0]"),
+            state(r#","surface":{"sheenColor":[0,1,0]}"#, "[0,0,0,0]")
+        );
+        assert_ne!(plain, state(r#","surface":{"ior":1.4}"#, "[0,0,0,0]"));
+        assert_ne!(plain, state(r#","surface":{"emissiveStrength":2}"#, "[0,0,0,0]"));
+    }
+
+    #[test]
+    fn a_transmissive_material_draws_among_the_translucent_ones_whatever_its_alpha() {
+        let glass = material_with(r#"{"transmission":0.5}"#).unwrap();
+        assert_eq!(glass.color[3], 1.0);
+        assert!(!glass.opaque(), "it reads the opaque picture behind it");
+        assert!(!glass.casts_shadow());
+        assert_eq!(glass.variants(), Variants::TRANSLUCENT);
+        // Without transmission the same block stays as an opaque material was.
+        let coated = material_with(r#"{"clearcoat":1,"transmission":0,"thickness":2}"#).unwrap();
+        assert!(coated.opaque() && coated.casts_shadow());
+        assert_eq!(coated.variants(), material_with("{}").unwrap().variants());
+    }
+
     #[test]
     fn packed_meshes_read_as_their_json() {
         let plain =
@@ -910,6 +1222,93 @@ mod tests {
         let mut packed = pack_mesh(plain).unwrap();
         packed[4] = 255;
         assert!(parse_mesh(&packed).is_err());
+    }
+
+    /// A triangle with a tangent at each vertex, as mesh JSON.
+    fn tangent_triangle() -> serde_json::Value {
+        serde_json::json!({
+            "positions": [0, 0, 0, 1, 0, 0, 0, 1, 0], "normals": [0, 0, 1, 0, 0, 1, 0, 0, 1],
+            "uvs": [0, 0, 1, 0, 0, 1], "indices": [0, 1, 2],
+            "tangents": [1, 0, 0, 1, 0.6, 0.8, 0, -1, 0, 1, 0, 1],
+        })
+    }
+
+    #[test]
+    fn tangents_are_four_numbers_a_vertex_and_pack_with_the_mesh() {
+        let json = serde_json::to_vec(&tangent_triangle()).unwrap();
+        let mesh = parse_mesh(&json).unwrap();
+        assert_eq!(mesh.tangents.as_deref(), Some(&[1.0, 0.0, 0.0, 1.0, 0.6, 0.8, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0][..]));
+        // Meshes without them have none, and pack as they did.
+        let plain =
+            br#"{"positions":[0,0,0,1,0,0,0,1,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],"indices":[0,1,2]}"#;
+        assert!(parse_mesh(plain).unwrap().tangents.is_none());
+        assert_eq!(pack_mesh(plain).unwrap()[5] & MESH_TANGENTS, 0);
+        // The binary form carries them, exactly (a signed zero among them), and packs again as itself.
+        let mut with_zero = tangent_triangle();
+        with_zero["tangents"][2] = serde_json::json!(-0.0);
+        let packed = pack_mesh(&serde_json::to_vec(&with_zero).unwrap()).unwrap();
+        assert_eq!(packed[5] & MESH_TANGENTS, MESH_TANGENTS);
+        let unpacked = parse_mesh(&packed).unwrap();
+        let bits =
+            |mesh: &Mesh| mesh.tangents.as_ref().unwrap().iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&unpacked), bits(&parse_mesh(&serde_json::to_vec(&with_zero).unwrap()).unwrap()));
+        assert_eq!(unpacked.tangents.as_ref().unwrap()[2].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(unpacked.vertices, mesh.vertices);
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
+        for end in 0..packed.len() {
+            assert!(parse_mesh(&packed[..end]).is_err(), "truncated at {end}");
+        }
+        // The flag without the stream, and the stream with a NaN, are refused.
+        let mut flagged = pack_uncompressed(&parse_mesh(plain).unwrap()).unwrap();
+        flagged[5] |= MESH_TANGENTS;
+        assert!(parse_mesh(&flagged).is_err());
+        let mut nan = pack_uncompressed(&mesh).unwrap();
+        let first = MESH_HEADER + 3 * 8 * 4;
+        nan[first..first + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(parse_mesh(&nan).is_err());
+    }
+
+    #[test]
+    fn tangents_that_do_not_fit_the_vertices_or_are_not_numbers_are_refused() {
+        let mut json = tangent_triangle();
+        json["tangents"] = serde_json::json!([1, 0, 0, 1, 0, 1, 0, 1]);
+        assert!(parse_mesh(&serde_json::to_vec(&json).unwrap()).is_err(), "two vertices' worth");
+        json["tangents"] = serde_json::json!([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1]);
+        assert!(parse_mesh(&serde_json::to_vec(&json).unwrap()).is_err(), "not whole");
+        json["tangents"] = serde_json::json!([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, "x"]);
+        assert!(parse_mesh(&serde_json::to_vec(&json).unwrap()).is_err(), "a string");
+        json["tangents"] = serde_json::json!([1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1e60]);
+        assert!(parse_mesh(&serde_json::to_vec(&json).unwrap()).is_err(), "past float32");
+        // An empty list for a mesh that has vertices is wrong too; none at all is fine.
+        json["tangents"] = serde_json::json!([]);
+        assert!(parse_mesh(&serde_json::to_vec(&json).unwrap()).is_err());
+        json.as_object_mut().unwrap().remove("tangents");
+        assert!(parse_mesh(&serde_json::to_vec(&json).unwrap()).unwrap().tangents.is_none());
+    }
+
+    #[test]
+    fn tangents_stay_with_levels_of_detail_and_a_skin() {
+        let mut json = tangent_triangle();
+        json["positions"] = serde_json::json!([0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0]);
+        json["normals"] = serde_json::json!([0, 0, 1].repeat(4));
+        json["uvs"] = serde_json::json!([0, 0, 1, 0, 1, 1, 0, 1]);
+        json["indices"] = serde_json::json!([0, 1, 2, 0, 2, 3]);
+        json["tangents"] = serde_json::json!([1, 0, 0, 1].repeat(4));
+        json["lods"] = serde_json::json!([{"error": 0.5, "indices": [0, 1, 2]}]);
+        let packed = pack_mesh(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(packed[5] & (MESH_TANGENTS | MESH_LODS), MESH_TANGENTS | MESH_LODS);
+        let mesh = parse_mesh(&packed).unwrap();
+        assert_eq!((mesh.lods.len(), mesh.tangents.as_ref().map(Vec::len)), (2, Some(16)));
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
+        // A skinned mesh: the tangents come before its joints and weights.
+        let mut skinned: serde_json::Value = serde_json::from_str(&skinned_triangle()).unwrap();
+        skinned["tangents"] = tangent_triangle()["tangents"].clone();
+        let packed = pack_mesh(&serde_json::to_vec(&skinned).unwrap()).unwrap();
+        assert_eq!(packed[5] & (MESH_TANGENTS | MESH_SKIN), MESH_TANGENTS | MESH_SKIN);
+        let mesh = parse_mesh(&packed).unwrap();
+        assert_eq!(mesh.tangents.as_ref().map(Vec::len), Some(12));
+        assert_eq!(mesh.skin.as_ref().unwrap().joints[1], [0, 1, 0, 0]);
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
     }
 
     /// A triangle bound to the arm rig's two joints: JSON and its binary

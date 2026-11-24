@@ -10,7 +10,7 @@ use pen_protocol::{Catalog, RenderFrame, Sprite};
 
 use super::timing::Span;
 use super::validate::validate_frame;
-use super::{Drawing, GpuAsset, ReadyEntry, Scratch, ShaderAsset, Shape, State, particles};
+use super::{Drawing, GpuAsset, MeshAsset, ReadyEntry, Scratch, ShaderAsset, Shape, State, particles};
 use crate::asset_store::{AssetKind, Material};
 use crate::built_in::BuiltIn;
 use crate::decals::{DECAL_MARK, Decals};
@@ -50,14 +50,15 @@ impl Drawing<'_> {
                 };
                 // A posed draw: its joints and weights, and its joint matrices.
                 if let (Some(at), Some(skin), Some(group)) = (entry.skin, &mesh.skin, self.skin) {
-                    pass.set_vertex_buffer(1, skin.vertices.slice(..));
+                    pass.set_vertex_buffer(2, skin.vertices.slice(..));
                     pass.set_bind_group(3, group, &[at]);
                 }
                 let lod = mesh.lods.get(usize::from(item.lod)).unwrap_or(&mesh.lods[0]);
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                pass.set_vertex_buffer(1, self.tangents(mesh).slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 let count = if let Some(instances) = &mesh.instances {
-                    pass.set_vertex_buffer(1, instances.buffer.slice(..));
+                    pass.set_vertex_buffer(2, instances.buffer.slice(..));
                     instances.count
                 } else {
                     1
@@ -78,7 +79,7 @@ impl Drawing<'_> {
                 // Culled on the GPU: its instances and triangles are
                 // counted as they are read back.
                 if let Some(culled) = &batch.gpu {
-                    let draws = self.culling.draw(pass, culled, view, mesh);
+                    let draws = self.culling.draw(pass, culled, view, mesh, self.tangents(mesh));
                     if let Some(stats) = stats {
                         stats.draw_calls += draws;
                         stats.instanced_draw_calls += draws;
@@ -90,7 +91,8 @@ impl Drawing<'_> {
                     return false;
                 }
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_vertex_buffer(1, self.instances.slice(..));
+                pass.set_vertex_buffer(1, self.tangents(mesh).slice(..));
+                pass.set_vertex_buffer(2, self.instances.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 let mut stats = stats;
                 for (lod, &(first, count)) in mesh.lods.iter().zip(ranges) {
@@ -109,6 +111,7 @@ impl Drawing<'_> {
             Shape::Solid(index) => {
                 let solid = &self.solids[index];
                 pass.set_vertex_buffer(0, solid.buffer.slice(..));
+                pass.set_vertex_buffer(1, self.zero_tangents.slice(..));
                 pass.draw(0..solid.count, 0..1);
                 if let Some(stats) = stats {
                     stats.draw_calls += 1;
@@ -116,6 +119,11 @@ impl Drawing<'_> {
             }
         }
         true
+    }
+
+    /// The mesh's tangents, or zeros for each of its vertices.
+    fn tangents<'b>(&'b self, mesh: &'b MeshAsset) -> &'b wgpu::Buffer {
+        mesh.tangents.as_ref().unwrap_or(self.zero_tangents)
     }
 
     pub(super) fn shader(&self, entry: &ReadyEntry) -> &ShaderAsset {
@@ -396,6 +404,7 @@ impl State {
             batches: &scratch.batches,
             solids: &self.solid_meshes,
             instances: &self.instance_buffer,
+            zero_tangents: &self.zero_tangents,
             skin: self.skinning.group(),
             culling: &self.culling,
         };

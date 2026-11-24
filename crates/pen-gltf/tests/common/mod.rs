@@ -145,6 +145,105 @@ pub fn arm() -> (Value, Vec<u8>) {
     (document, builder.bytes)
 }
 
+/// A surface to import: vertices, triangles and, if it has them, tangents.
+#[derive(Clone)]
+pub struct Surface {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub uvs: Vec<[f32; 2]>,
+    pub indices: Vec<u16>,
+    pub tangents: Option<Vec<[f32; 4]>>,
+}
+
+/// A unit square in the xy plane facing +z, as a glTF has it: counterclockwise
+/// from its bottom left, u growing along +x and v down the image (so down -y).
+pub fn square() -> Surface {
+    Surface {
+        positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+        normals: vec![[0.0, 0.0, 1.0]; 4],
+        uvs: vec![[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        indices: vec![0, 1, 2, 0, 2, 3],
+        tangents: None,
+    }
+}
+
+/// A latitude and longitude sphere of radius 1, u along the longitude from 0
+/// to 1 and v down the latitude from the north pole, with `rings` rings and
+/// `segments` segments; its seam and poles have vertices of their own, as an
+/// exporter makes them.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "test geometry, from f64 to the f32 a mesh holds"
+)]
+pub fn sphere(rings: usize, segments: usize) -> Surface {
+    let (mut positions, mut normals, mut uvs, mut indices) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for ring in 0..=rings {
+        let v = ring as f64 / rings as f64;
+        let theta = v * std::f64::consts::PI;
+        for segment in 0..=segments {
+            let u = segment as f64 / segments as f64;
+            let phi = u * std::f64::consts::TAU;
+            let point = [theta.sin() * phi.cos(), theta.cos(), -theta.sin() * phi.sin()];
+            positions.push(point.map(|value| value as f32));
+            normals.push(point.map(|value| value as f32));
+            uvs.push([u as f32, v as f32]);
+        }
+    }
+    let width = u16::try_from(segments + 1).unwrap();
+    for ring in 0..u16::try_from(rings).unwrap() {
+        for segment in 0..u16::try_from(segments).unwrap() {
+            let (a, b) = (ring * width + segment, (ring + 1) * width + segment);
+            // Counterclockwise seen from outside.
+            indices.extend([a, b, a + 1, a + 1, b, b + 1]);
+        }
+    }
+    Surface { positions, normals, uvs, indices, tangents: None }
+}
+
+/// A glTF of one node holding one mesh of one primitive of `surface` with the
+/// glTF material `material` (which may name texture 0, a 2 x 2 white image),
+/// naming `extensions` as used; `node` adds to the node (its placement).
+pub fn model(surface: &Surface, material: Value, extensions: &[&str], node: Value) -> (Value, Vec<u8>) {
+    let mut builder = Builder { bytes: Vec::new(), views: Vec::new(), accessors: Vec::new() };
+    let flat = |values: &[[f32; 3]]| values.iter().flatten().copied().collect::<Vec<f32>>();
+    let position = builder.floats(&flat(&surface.positions), "VEC3", true);
+    let normal = builder.floats(&flat(&surface.normals), "VEC3", false);
+    let uv = builder.floats(&surface.uvs.iter().flatten().copied().collect::<Vec<f32>>(), "VEC2", false);
+    let index = builder.shorts(&surface.indices, "SCALAR");
+    let mut attributes = json!({"POSITION": position, "NORMAL": normal, "TEXCOORD_0": uv});
+    if let Some(tangents) = &surface.tangents {
+        let tangent = builder.floats(&tangents.iter().flatten().copied().collect::<Vec<f32>>(), "VEC4", false);
+        attributes["TANGENT"] = tangent.into();
+    }
+    let image = builder.view(&png([255, 255, 255, 255]));
+    let mut node_json = json!({"name": "thing", "mesh": 0});
+    node_json.as_object_mut().unwrap().extend(node.as_object().cloned().unwrap_or_default());
+    let mut document = json!({
+        "asset": {"version": "2.0", "generator": "pen-gltf tests"},
+        "scene": 0,
+        "scenes": [{"nodes": [0]}],
+        "nodes": [node_json],
+        "meshes": [{"name": "thing", "primitives": [{"attributes": attributes, "indices": index, "material": 0}]}],
+        "materials": [material],
+        "textures": [{"source": 0}],
+        "images": [{"name": "white", "bufferView": image, "mimeType": "image/png"}],
+        "bufferViews": builder.views,
+        "accessors": builder.accessors,
+    });
+    if !extensions.is_empty() {
+        document["extensionsUsed"] = json!(extensions);
+    }
+    let length = builder.bytes.len();
+    document["buffers"] = json!([{"byteLength": length}]);
+    (document, builder.bytes)
+}
+
+/// `model`'s file for `name` in `directory`.
+pub fn model_file(directory: &Path, name: &str, model: (Value, Vec<u8>)) -> PathBuf {
+    gltf_file(&directory.join(format!("{name}.gltf")), model.0, &model.1)
+}
+
 fn base64(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut text = String::new();

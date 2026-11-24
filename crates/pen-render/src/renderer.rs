@@ -42,7 +42,7 @@ use anyhow::Result;
 use pen_protocol::boundary::MAX_DRAW_EXTRA;
 use pen_protocol::{GameEvent, Matrix, Sky, Solid, Vector};
 
-use crate::asset_store::{AssetStore, Lod, MAX_LODS, Material};
+use crate::asset_store::{AssetStore, Lod, MAX_LODS, Material, SURFACE_FLOATS};
 use crate::built_in::{BuiltIn, BuiltIns};
 use crate::culling::{Detail, MAX_VIEWS, Sphere, ViewMask, Views};
 use crate::decals::{DecalBatch, Decals};
@@ -53,7 +53,7 @@ use crate::mipmaps::Mipmapper;
 use crate::packed_texture::PackedHeader;
 use crate::pipeline_cache::PipelineCache;
 use crate::post::{Post, TONED_WGSL};
-use crate::shader::{self, PipelineContext, Pipelines, Variants};
+use crate::shader::{self, PipelineContext, Pipelines, TANGENT_BYTES, Variants};
 use crate::solids::SolidBatch;
 use crate::sprites::{SpriteBatch, Sprites, sprite_group_layout};
 use crate::{RenderStats, RendererOptions};
@@ -85,11 +85,17 @@ const SCENE_FLOATS: usize = 80 + 4 + 16 * MAX_CASCADES + 4 * MAX_CASCADES + 4;
 const SCENE_BYTES: u64 = SCENE_FLOATS as u64 * 4;
 
 // A draw's uniform: model and normal matrices, color, settings, the four
-// parameters, then up to 32 extra vectors (see pen-protocol's Draw).
-const DRAW_BYTES: u64 = 176 + MAX_DRAW_EXTRA as u64 * 16;
+// parameters, up to 32 extra vectors (see pen-protocol's Draw), then the
+// material's five surface vectors (`asset_store::Surface::vectors`), which
+// start at float `SURFACE_AT` (byte 688).
+const SURFACE_AT: usize = 44 + MAX_DRAW_EXTRA * 4;
+const DRAW_BYTES: u64 = (SURFACE_AT + SURFACE_FLOATS) as u64 * 4;
 
 pub(crate) struct MeshAsset {
     vertices: wgpu::Buffer,
+    /// Each vertex's tangent, if the mesh has them: pipelines read them at
+    /// location 11, from the renderer's zeros when it has none.
+    tangents: Option<wgpu::Buffer>,
     /// Its triangles, then each simpler level of detail's.
     indices: wgpu::Buffer,
     /// A sphere holding its vertices.
@@ -456,6 +462,8 @@ struct Drawing<'a> {
     batches: &'a [InstanceBatch],
     solids: &'a [SolidMesh],
     instances: &'a wgpu::Buffer,
+    /// Zero tangents for every vertex of the largest mesh without any.
+    zero_tangents: &'a wgpu::Buffer,
     /// The frame's joint matrices, for posed draws.
     skin: Option<&'a wgpu::BindGroup>,
     culling: &'a GpuCulling,
@@ -552,6 +560,37 @@ fn uniform_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer
     })
 }
 
+/// A vertex buffer of `size` bytes, all zero (as every new buffer is): the
+/// tangents of meshes that have none.
+fn zero_tangent_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("zero tangents"),
+        size,
+        usage: wgpu::BufferUsages::VERTEX,
+        mapped_at_creation: false,
+    })
+}
+
+/// How many bytes the zero tangents of `current` bytes should have to reach
+/// each of a mesh's `vertices`: as they are, or the next power of two (so the
+/// stream doubles as meshes grow), at most the device's `limit`.
+fn zero_tangent_size(current: u64, vertices: usize, limit: u64) -> u64 {
+    let needed = vertices as u64 * TANGENT_BYTES;
+    if needed <= current { current } else { needed.next_power_of_two().min(limit).max(needed) }
+}
+
+impl State {
+    /// Makes sure the zero tangents reach as many vertices as a mesh of
+    /// `vertices` has: one stream serves every mesh without tangents, and it
+    /// grows with the largest.
+    fn ensure_zero_tangents(&mut self, vertices: usize) {
+        let size = zero_tangent_size(self.zero_tangents.size(), vertices, self.device.limits().max_buffer_size);
+        if size != self.zero_tangents.size() {
+            self.zero_tangents = zero_tangent_buffer(&self.device, size);
+        }
+    }
+}
+
 fn extent(width: u32, height: u32) -> wgpu::Extent3d {
     wgpu::Extent3d { width, height, depth_or_array_layers: 1 }
 }
@@ -621,6 +660,9 @@ pub(crate) struct State {
     groups: HashMap<(u64, u64, u64, i32), (wgpu::BindGroup, u64)>,
     instance_capacity: usize,
     instance_buffer: wgpu::Buffer,
+    // What a mesh without tangents binds as them: a zero `vec4f` for each
+    // vertex of the largest mesh loaded or meshed without (`ensure_zero_tangents`).
+    zero_tangents: wgpu::Buffer,
     instance_data: Vec<f32>,
     instance_uploads: instance_upload::Uploads,
     last_stats: RenderStats,
@@ -981,6 +1023,7 @@ impl State {
             groups: HashMap::new(),
             instance_capacity: 1,
             instance_buffer: batching::instance_buffer(&device, 1),
+            zero_tangents: zero_tangent_buffer(&device, TANGENT_BYTES),
             instance_data: vec![0.0; 20],
             instance_uploads: instance_upload::Uploads::default(),
             last_stats: RenderStats::default(),
@@ -1093,5 +1136,27 @@ impl State {
     /// Whether something the last frame draws is still on its way.
     pub fn waiting(&self) -> bool {
         self.waiting
+    }
+}
+
+#[cfg(test)]
+mod tangent_tests {
+    use super::*;
+
+    #[test]
+    fn the_zero_tangents_grow_to_the_largest_mesh_and_stay() {
+        let limit = 1 << 30;
+        // A first mesh of three vertices wants 48 bytes, taken as 64.
+        assert_eq!(zero_tangent_size(TANGENT_BYTES, 3, limit), 64);
+        // Meshes that fit change nothing.
+        assert_eq!(zero_tangent_size(64, 4, limit), 64);
+        assert_eq!(zero_tangent_size(64, 1, limit), 64);
+        // A larger one doubles to a power of two that holds every vertex.
+        let size = zero_tangent_size(64, 1000, limit);
+        assert!(size >= 1000 * TANGENT_BYTES && size.is_power_of_two(), "{size}");
+        // Never past the device's limit, but always every vertex's tangent.
+        assert_eq!(zero_tangent_size(64, 1000, 20_000), 16_384);
+        assert_eq!(zero_tangent_size(64, 1000, 16_100), 16_100);
+        assert_eq!(zero_tangent_size(64, 1000, 100), 1000 * TANGENT_BYTES);
     }
 }

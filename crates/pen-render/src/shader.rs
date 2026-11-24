@@ -7,7 +7,7 @@ use std::task::{Context, Poll, Waker};
 
 use anyhow::{Result, bail};
 
-use crate::asset_store::MESH_VERTEX_FLOATS;
+use crate::asset_store::{MESH_TANGENT_FLOATS, MESH_VERTEX_FLOATS};
 use crate::pipeline_cache::PipelineCache;
 use crate::post::SCENE_FORMAT;
 
@@ -333,7 +333,14 @@ const MESH_ATTRIBUTES: [wgpu::VertexAttribute; 4] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 24, shader_location: 2 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 32, shader_location: 8 },
 ];
-// A skinned mesh's second buffer: each vertex's four joints and weights.
+// Each vertex's tangent (xyz and the handedness w), the second buffer of every
+// mesh pipeline: the mesh's own, or a shared stream of zeros. Location 11, as 3
+// to 7 are an instance's and 8 to 10 the mesh's shader attributes and skin.
+const TANGENT_ATTRIBUTES: [wgpu::VertexAttribute; 1] =
+    [wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 11 }];
+/// Bytes of a tangent.
+pub(crate) const TANGENT_BYTES: u64 = (MESH_TANGENT_FLOATS * 4) as u64;
+// A skinned mesh's third buffer: each vertex's four joints and weights.
 const SKIN_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint16x4, offset: 0, shader_location: 9 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 8, shader_location: 10 },
@@ -348,15 +355,22 @@ const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 64, shader_location: 7 },
 ];
 
-/// The buffers a mesh pipeline reads: the mesh's vertices and, instanced,
-/// each instance's transform and parameters, or, skinned, each vertex's
-/// joints and weights.
+/// The buffers a mesh pipeline reads: the mesh's vertices, its tangents and,
+/// instanced, each instance's transform and parameters, or, skinned, each
+/// vertex's joints and weights.
 fn vertex_buffers(stage: Stage) -> Vec<Option<wgpu::VertexBufferLayout<'static>>> {
-    let mut buffers = vec![Some(wgpu::VertexBufferLayout {
-        array_stride: (MESH_VERTEX_FLOATS * 4) as u64,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &MESH_ATTRIBUTES,
-    })];
+    let mut buffers = vec![
+        Some(wgpu::VertexBufferLayout {
+            array_stride: (MESH_VERTEX_FLOATS * 4) as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &MESH_ATTRIBUTES,
+        }),
+        Some(wgpu::VertexBufferLayout {
+            array_stride: TANGENT_BYTES,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &TANGENT_ATTRIBUTES,
+        }),
+    ];
     match stage {
         Stage::Plain => {}
         Stage::Instanced | Stage::Persistent => buffers.push(Some(wgpu::VertexBufferLayout {

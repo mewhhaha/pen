@@ -18,7 +18,32 @@ translucent, blended over what is behind it) and `lighting` (`lit` or
 unless a draw gives its own), an `alphaCutoff`, and say whether it is an
 `overlay` (drawn over the scene, dimmed where the scene hides it), takes
 `decals`, casts a `shadow` (yes unless false) or splits its colours by the
-frame's `aberration`.
+frame's `aberration`. A `surface` object adds the lobes of glTF's clear coat,
+sheen, anisotropy, transmission and volume, ior, specular and emissive strength
+extensions (below).
+
+### The `surface` block
+
+Every key is optional, numbers are plain floats and a key left out takes its
+default; a material without the block has all of them. It is part of the
+material's render state, not an instance parameter: draws of materials that
+differ in it never share an instanced batch.
+
+| Key | Default | Range |
+|---|---|---|
+| `clearcoat`, `clearcoatRoughness` | 0, 0 | 0 to 1 |
+| `sheenColor` (three channels), `sheenRoughness` | [0, 0, 0], 0 | 0 to 1 |
+| `anisotropy`, `anisotropyRotation` | 0, 0 | -1 to 1; radians |
+| `transmission` | 0 | 0 to 1 |
+| `ior` | 1.5 | at least 1 |
+| `thickness`, `attenuationDistance` | 0, 0 | at least 0, in model units; thickness 0 is thin-walled and distance 0 is infinite |
+| `attenuationColor` (three channels) | [1, 1, 1] | 0 to 1 |
+| `specular`, `specularColor` (three channels) | 1, [1, 1, 1] | at least 0 |
+| `emissiveStrength` | 1 | at least 0 |
+
+A material with `transmission` above 0 draws among the translucent surfaces
+even with an opaque `color` alpha (it reads the opaque picture behind it), and
+casts no shadow. Textures for these lobes are not supported.
 
 ## What a draw binds
 
@@ -150,7 +175,7 @@ Group 1, the draw's:
 
 | Binding | What |
 |---|---|
-| 0 | The draw, a uniform: `model` and `normal` matrices, the material's `color`, `settings` (x 1 when lit, y the alpha cutoff, z 1 when it has a normal texture or a field, w 1 when it has a layer texture), the four `parameters`, then 32 `vec4f` of the draw's `extra` (zero past what it sent). |
+| 0 | The draw, a uniform: `model` and `normal` matrices, the material's `color`, `settings` (x 1 when lit, y the alpha cutoff, z 1 when it has a normal texture or a field, w 1 when it has a layer texture), the four `parameters`, then 32 `vec4f` of the draw's `extra` (zero past what it sent), then, from byte 688, `surface: array<vec4f, 5>` from the material's `surface` block: (clearcoat, clearcoat roughness, sheen roughness, anisotropy), (sheen color, anisotropy rotation), (transmission, ior, thickness, attenuation distance), (attenuation color, specular) and (specular color, emissive strength). |
 | 1 | The material's `texture`, or white without one (a checker when it failed to load). |
 | 2 | A filtering sampler, at the frame's quality. |
 | 3 | The normal texture, or the material's field (the render packet's `fields`), or a flat normal. |
@@ -164,7 +189,14 @@ but the two uniforms.
 
 A mesh's vertex is `@location(0) position: vec3f`, `@location(1) normal:
 vec3f`, `@location(2) uv: vec2f` and, when the mesh has `attributes`,
-`@location(8) attributes: vec2f`.
+`@location(8) attributes: vec2f`. Every mesh pipeline also offers
+`@location(11) tangent: vec4f`, from a vertex buffer of its own: the mesh's
+`tangents` (four numbers a vertex, xyz and a handedness w of -1 or 1, the
+bitangent being `cross(normal, tangent.xyz) * tangent.w`), or zeros where it has
+none, and for brush solids; a shader that does not declare the location is
+unaffected, and one that does treats a tangent of no length as "derive the frame
+from the screen-space derivatives of position and uv". Locations 3 to 7 are
+an instance's below, so the tangent does not sit among them.
 
 - `@vertex func vertex` and `@fragment func fragment` draw the material. The
   fragment's colour is linear and may pass 1: the frame is drawn into a

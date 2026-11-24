@@ -13,7 +13,7 @@ use super::{
     Checking, GpuAsset, INSET_SAMPLES, MaterialAsset, MeshAsset, MeshInstanceBuffer, MeshSkin, PendingTexture,
     ShaderAsset, Staged, State, TextureAsset, extent,
 };
-use crate::asset_store::AssetKind;
+use crate::asset_store::{AssetKind, MESH_VERTEX_FLOATS};
 use crate::built_in::BuiltIn;
 use crate::loader::{Job, JobQueue, LevelMessage, Loaded, Message, Priority};
 use crate::mipmaps::Mipmapper;
@@ -416,6 +416,7 @@ impl State {
         let device = self.device.clone();
         match loaded {
             Loaded::Mesh(mesh) => {
+                let mesh = *mesh;
                 let vertex_bytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
                 let index_bytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
                 let instance_bytes: &[u8] =
@@ -424,6 +425,9 @@ impl State {
                     > device.limits().max_buffer_size
                 {
                     return Err("mesh exceeds device buffer size".into());
+                }
+                if mesh.tangents.is_none() {
+                    self.ensure_zero_tangents(mesh.vertices.len() / MESH_VERTEX_FLOATS);
                 }
                 let buffer = |bytes: &[u8], usage: wgpu::BufferUsages| {
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytes, usage })
@@ -441,6 +445,10 @@ impl State {
                 let (asset, check) = shader::scoped(&device, || {
                     GpuAsset::Mesh(MeshAsset {
                         vertices: buffer(vertex_bytes, wgpu::BufferUsages::VERTEX),
+                        tangents: mesh
+                            .tangents
+                            .as_ref()
+                            .map(|tangents| buffer(bytemuck::cast_slice(tangents), wgpu::BufferUsages::VERTEX)),
                         indices: buffer(index_bytes, wgpu::BufferUsages::INDEX),
                         bounds: mesh.bounds,
                         lods: mesh.lods.clone(),

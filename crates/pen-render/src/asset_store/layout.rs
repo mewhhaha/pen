@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 
 use super::{
     MAX_LODS, MESH_ATTRIBUTES, MESH_HEADER, MESH_INSTANCES, MESH_LODS, MESH_MAGIC, MESH_SHORT_INDICES, MESH_SKIN,
-    MESH_VERSION, MESH_VERTEX_FLOATS,
+    MESH_TANGENT_FLOATS, MESH_TANGENTS, MESH_VERSION, MESH_VERTEX_FLOATS,
 };
 
 pub(super) const INSTANCE_FLOATS: usize = 20;
@@ -40,6 +40,7 @@ pub(super) struct Instances {
 
 pub(super) struct Layout {
     pub vertices: Block,
+    pub tangents: Option<Block>,
     pub indices: Block,
     pub lods: Vec<(f32, Block)>,
     pub skin: Option<(Block, Range<usize>)>,
@@ -58,7 +59,8 @@ impl Layout {
         ensure!(bytes[6..8] == [0; 2], "unsupported binary mesh header");
         let flags = bytes[5];
         ensure!(
-            flags & !(MESH_ATTRIBUTES | MESH_SHORT_INDICES | MESH_SKIN | MESH_LODS | MESH_INSTANCES) == 0,
+            flags & !(MESH_ATTRIBUTES | MESH_SHORT_INDICES | MESH_SKIN | MESH_LODS | MESH_INSTANCES | MESH_TANGENTS)
+                == 0,
             "unsupported binary mesh flags"
         );
         ensure!(
@@ -70,6 +72,11 @@ impl Layout {
         let index_bytes = if flags & MESH_SHORT_INDICES != 0 { 2 } else { 4 };
         let mut at = MESH_HEADER;
         let vertices = Block::take(bytes, &mut at, count, floats * 4)?;
+        let tangents = if flags & MESH_TANGENTS != 0 {
+            Some(Block::take(bytes, &mut at, count, MESH_TANGENT_FLOATS * 4)?)
+        } else {
+            None
+        };
         let indices = Block::take(bytes, &mut at, word(bytes, 12)?, index_bytes)?;
         let mut lods = Vec::new();
         if flags & MESH_LODS != 0 {
@@ -101,7 +108,7 @@ impl Layout {
             None
         };
         ensure!(at == bytes.len(), "binary mesh has trailing bytes");
-        Ok(Self { vertices, indices, lods, skin, instances })
+        Ok(Self { vertices, tangents, indices, lods, skin, instances })
     }
 
     /// Record blocks only: counts, errors, bounds and a skin's variable
@@ -109,6 +116,7 @@ impl Layout {
     pub fn blocks(&self) -> impl Iterator<Item = &Block> {
         [&self.vertices, &self.indices]
             .into_iter()
+            .chain(self.tangents.iter())
             .chain(self.lods.iter().map(|(_, block)| block))
             .chain(self.skin.iter().map(|(block, _)| block))
             .chain(self.instances.iter().map(|instances| &instances.records))

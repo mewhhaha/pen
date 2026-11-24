@@ -172,6 +172,7 @@ mod tests {
             indices: vec![0, 1, 2],
             joints: vec![[0, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0]],
             weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],
+            tangents: Vec::new(),
         };
         (geometry, rig)
     }

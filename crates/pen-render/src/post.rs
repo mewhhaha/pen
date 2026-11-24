@@ -274,6 +274,8 @@ struct TargetsKey {
     atmosphere: bool,
     levels: u32,
     taa: bool,
+    dof: bool,
+    motion_blur: bool,
     /// The froxel volume's grid the atmosphere pass reads (0 for none).
     volume: u64,
 }
@@ -329,6 +331,8 @@ struct Targets {
     graphs: Vec<Graph>,
     /// With TAA, the history textures: the picture each frame resolved to.
     histories: Option<[wgpu::TextureView; 2]>,
+    /// With TAA or velocity motion blur, the 1x Rg16Float velocity target and its Depth32Float buffer.
+    velocity: Option<(wgpu::TextureView, wgpu::TextureView)>,
     /// What frames with translucent surfaces add, once one has come.
     split: Option<Split>,
     /// The two passes that diffuse the marked surfaces of the resolved scene (into
@@ -347,6 +351,10 @@ pub(crate) struct SceneTargets {
     /// For a frame with translucent surfaces, the picture and depth of the
     /// opaque ones.
     pub opaque: Option<OpaqueTargets>,
+    /// For a frame with TAA or velocity motion blur, `(velocity_view, velocity_depth)`.
+    pub velocity: Option<(wgpu::TextureView, wgpu::TextureView)>,
+    /// True when scene targets were freshly allocated this frame.
+    pub targets_recreated: bool,
 }
 
 impl SceneTargets {
@@ -405,6 +413,8 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
         BuiltIn::OpaqueMip => (OPAQUE_MIP_SHADER.to_owned(), SCENE_FORMAT, None),
         BuiltIn::Subsurface(samples) => (crate::subsurface::shader(samples), SCENE_FORMAT, None),
         BuiltIn::Taa(samples) => (crate::taa::shader(samples), SCENE_FORMAT, None),
+        BuiltIn::Dof(samples) => (crate::dof::shader(samples), SCENE_FORMAT, None),
+        BuiltIn::MotionBlur(samples) => (crate::motion_blur::shader(samples), SCENE_FORMAT, None),
         BuiltIn::Present(samples) => (present_shader(samples, &context.display), context.format, None),
         BuiltIn::BloomDown { first } => (bloom_down_shader(first), SCENE_FORMAT, None),
         // Each level up is added onto the one above.
@@ -486,6 +496,7 @@ struct Inputs {
     depth: wgpu::TextureView,
     scene: wgpu::TextureView,
     marks: wgpu::TextureView,
+    velocity: wgpu::TextureView,
     /// With TAA, the history texture read and the one drawn.
     history: Option<[wgpu::TextureView; 2]>,
 }
@@ -518,6 +529,7 @@ pub(crate) struct Post {
     // Bound in place of the occlusion when it is off, and of the bloom.
     unoccluded: wgpu::Texture,
     unbloomed: wgpu::Texture,
+    no_velocity: wgpu::Texture,
     targets: Option<Targets>,
     filtered_present: Option<FilteredPresent>,
     /// The begun frame's quality and output size, and whether it has translucent
@@ -534,6 +546,8 @@ pub(crate) struct Post {
     jitters: u64,
     jittered: Option<(Matrix, (f64, f64))>,
     memory: crate::taa::Memory,
+    /// Previous frame's unjittered view-projection matrix (tracked for both TAA and velocity motion blur).
+    previous_vp: Option<Matrix>,
     /// The scene's metering and the exposure it leaves on the GPU.
     exposure: Exposure,
     /// The present pass's late bind group: the grade's two tables, and which they are.
@@ -595,6 +609,24 @@ impl Post {
             }),
             unoccluded: single(wgpu::TextureFormat::R8Unorm, 255),
             unbloomed: single(SCENE_FORMAT, 0),
+            no_velocity: {
+                let made = texture(
+                    device,
+                    1,
+                    1,
+                    wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    1,
+                    wgpu::TextureFormat::Rg16Float,
+                    1,
+                );
+                queue.write_texture(
+                    made.as_image_copy(),
+                    &crate::renderer::velocity_sentinel_bytes(),
+                    wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: None },
+                    wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                );
+                made
+            },
             targets: None,
             filtered_present: None,
             quality: None,
@@ -605,6 +637,7 @@ impl Post {
             jitters: 0,
             jittered: None,
             memory: Default::default(),
+            previous_vp: None,
             exposure: Exposure::new(device, queue),
             tables: None,
         }
@@ -667,6 +700,11 @@ impl Post {
         self.jittered.map(|(projection, _)| projection)
     }
 
+    /// Previous frame's unjittered view-projection matrix, if one has been drawn.
+    pub fn previous_vp(&self) -> Option<Matrix> {
+        self.previous_vp
+    }
+
     fn uniform(&mut self, name: &'static str, size: u64) -> wgpu::Buffer {
         let device = &self.device;
         self.uniforms
@@ -720,9 +758,16 @@ impl Post {
             0
         };
         let taa = quality.taa;
-        let key = TargetsKey { width, height, samples, occluding, atmosphere, levels, taa, volume: volume.serial };
+        let dof =
+            quality.effects && frame.dof.focus_distance > 0.0 && frame.dof.aperture > 0.0 && frame.dof.max_blur > 0.0;
+        let motion_blur =
+            quality.effects && frame.motion_blur.strength > 0.0 && frame.motion_blur.max_radius > 0.0;
+        let key =
+            TargetsKey { width, height, samples, occluding, atmosphere, levels, taa, dof, motion_blur, volume: volume.serial };
+        let mut targets_recreated = false;
         if self.targets.as_ref().is_none_or(|targets| targets.key != key) {
             self.targets = None;
+            targets_recreated = true;
             let attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
             let sampled = attachment | wgpu::TextureUsages::TEXTURE_BINDING;
             let device = &self.device;
@@ -742,14 +787,30 @@ impl Post {
                 ..Default::default()
             });
             let view = |texture: &wgpu::Texture| texture.create_view(&Default::default());
+            let velocity = (taa || motion_blur).then(|| {
+                let vel = texture(device, width, height, sampled, 1, wgpu::TextureFormat::Rg16Float, 1);
+                let vel_depth = texture(device, width, height, attachment, 1, wgpu::TextureFormat::Depth32Float, 1);
+                (view(&vel), view(&vel_depth))
+            });
+            let vel_view = velocity
+                .as_ref()
+                .map(|(v, _)| v.clone())
+                .unwrap_or_else(|| self.no_velocity.create_view(&Default::default()));
             // With TAA, a graph for each history texture read, sharing the
             // rest; a new history starts afresh.
             self.memory = Default::default();
+            self.previous_vp = None;
             let histories = taa.then(|| [0, 1].map(|_| crate::taa::history(device, width, height, SCENE_FORMAT)));
             let mut graphs: Vec<Graph> = Vec::new();
             for read in 0..if taa { 2 } else { 1 } {
                 let history = histories.as_ref().map(|textures| [view(&textures[read]), view(&textures[1 - read])]);
-                let inputs = Inputs { depth: depth_only(), scene: view(&scene), marks: marks.clone(), history };
+                let inputs = Inputs {
+                    depth: depth_only(),
+                    scene: view(&scene),
+                    marks: marks.clone(),
+                    velocity: vel_view.clone(),
+                    history,
+                };
                 let graph = self
                     .graph(built_ins, key, inputs, Part::Whole, volume, graphs.first())
                     .expect("the passes after the scene read only what earlier ones draw");
@@ -760,6 +821,7 @@ impl Post {
             self.targets = Some(Targets {
                 key,
                 histories: kept,
+                velocity,
                 depth: view(&depth),
                 depth_only: depth_only(),
                 multisampled: multisampled.as_ref().map(view),
@@ -769,6 +831,9 @@ impl Post {
                 split: None,
                 subsurface: None,
             });
+        } else if frame.exposure.cut {
+            self.memory.cut();
+            self.previous_vp = None;
         }
         if translucent && self.targets.as_ref().unwrap().split.is_none() {
             let split = self.split(built_ins, volume);
@@ -792,6 +857,8 @@ impl Post {
             scene: current.scene.clone(),
             multisampled: current.multisampled.clone(),
             opaque: current.split.as_ref().filter(|_| translucent).map(|split| split.opaque.clone()),
+            velocity: current.velocity.clone(),
+            targets_recreated,
         }
     }
 
@@ -803,6 +870,11 @@ impl Post {
         let targets = self.targets.as_ref().unwrap();
         let key = targets.key;
         let (depth, scene, marks) = (targets.depth_only.clone(), targets.scene.clone(), targets.marks.clone());
+        let velocity = targets
+            .velocity
+            .as_ref()
+            .map(|(v, _)| v.clone())
+            .unwrap_or_else(|| self.no_velocity.create_view(&Default::default()));
         let histories = targets.histories.clone();
         let TargetsKey { width, height, samples, taa, .. } = key;
         let sampled = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
@@ -824,6 +896,7 @@ impl Post {
             depth: depth.clone(),
             scene: scene.clone(),
             marks: marks.clone(),
+            velocity: velocity.clone(),
             history: histories.as_ref().map(|textures| [textures[read].clone(), textures[1 - read].clone()]),
         };
         let before = self
@@ -928,13 +1001,14 @@ impl Post {
         volume: &crate::volume::Applied,
         sharing: Option<&Graph>,
     ) -> anyhow::Result<Graph> {
-        let TargetsKey { width, height, samples, occluding, atmosphere, levels, .. } = key;
+        let TargetsKey { width, height, samples, occluding, atmosphere, levels, dof, motion_blur, .. } = key;
         let full = |format: wgpu::TextureFormat| Spec { width, height, format };
         let sampler = Binding::Sampler(self.sampler.clone());
         let mut graph = GraphBuilder::default();
         let depth = graph.import("depth", inputs.depth);
         let scene = graph.import("scene", inputs.scene);
         let marks = graph.import("marks", inputs.marks);
+        let velocity = graph.import("velocity", inputs.velocity);
         let mut lit = scene;
         // The sky, the occlusion and the mist go onto the opaque picture alone:
         // a frame with translucent surfaces draws them into level 0 of its chain,
@@ -993,10 +1067,31 @@ impl Post {
         if let Some([read, drawn]) = inputs.history {
             let (read, drawn) = (graph.import("history", read), graph.import("history", drawn));
             let uniform = Binding::Uniform(self.uniform("taa", 160));
-            let bindings =
-                vec![uniform, Binding::Texture(lit), Binding::Texture(read), Binding::Texture(depth), sampler.clone()];
+            let bindings = vec![
+                uniform,
+                Binding::Texture(lit),
+                Binding::Texture(read),
+                Binding::Texture(depth),
+                sampler.clone(),
+                Binding::Texture(velocity),
+            ];
             graph.pass("taa", BuiltIn::Taa(samples), bindings, Target::Texture(drawn), false);
             lit = drawn;
+        }
+        if dof {
+            let focused = graph.texture("dof", full(SCENE_FORMAT));
+            let uniform = Binding::Uniform(self.uniform("dof", 96));
+            let bindings = vec![uniform, Binding::Texture(lit), Binding::Texture(depth), sampler.clone()];
+            graph.pass("dof", BuiltIn::Dof(samples), bindings, Target::Texture(focused), false);
+            lit = focused;
+        }
+        if motion_blur {
+            let smeared = graph.texture("motion blur", full(SCENE_FORMAT));
+            let uniform = Binding::Uniform(self.uniform("motion blur", 160));
+            let bindings =
+                vec![uniform, Binding::Texture(lit), Binding::Texture(velocity), Binding::Texture(depth), sampler.clone()];
+            graph.pass("motion blur", BuiltIn::MotionBlur(samples), bindings, Target::Texture(smeared), false);
+            lit = smeared;
         }
         // Auto exposure meters the lit picture, before the bloom (exposure.rs).
         graph.hook("meter", lit);
@@ -1144,7 +1239,7 @@ impl Post {
     ) {
         let quality = self.quality.expect("Post::begin comes first");
         let size = self.size;
-        let TargetsKey { width, height, levels, taa, .. } = self.targets.as_ref().unwrap().key;
+        let TargetsKey { width, height, levels, taa, dof, motion_blur, .. } = self.targets.as_ref().unwrap().key;
         // The opaque picture of a frame with translucent surfaces was worked out
         // before the translucent pass.
         if !self.translucent {
@@ -1157,6 +1252,22 @@ impl Post {
         if taa {
             let uniform = self.uniform("taa", 160);
             let data = self.memory.uniform(&frame.view, &frame.projection, (&projection, offset), (width, height));
+            self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
+        }
+        if dof {
+            let uniform = self.uniform("dof", 96);
+            let data = crate::dof::uniform(&projection, &frame.dof, (width, height));
+            self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
+        }
+        if motion_blur {
+            let uniform = self.uniform("motion blur", 160);
+            let data = crate::motion_blur::uniform(
+                &frame.view,
+                (&projection, offset),
+                self.previous_vp,
+                &frame.motion_blur,
+                (width, height),
+            );
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
         let uniform = self.uniform("present", 64);
@@ -1205,6 +1316,7 @@ impl Post {
                 exposure.meter(encoder, picture, (width, height));
             },
         );
+        self.previous_vp = Some(multiply(&frame.projection, &frame.view));
     }
     /// Apply blur and stencil-masked aberration to the styled image, before UI.
     #[allow(clippy::too_many_arguments)]
@@ -1305,6 +1417,10 @@ mod tests {
             bloom_up_shader(),
             crate::taa::shader(1),
             crate::taa::shader(4),
+            crate::dof::shader(1),
+            crate::dof::shader(4),
+            crate::motion_blur::shader(1),
+            crate::motion_blur::shader(4),
             opaque_depth_shader(1),
             opaque_depth_shader(4),
             backdrop_shader(),

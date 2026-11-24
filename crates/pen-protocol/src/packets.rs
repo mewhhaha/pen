@@ -1373,6 +1373,14 @@ pub mod types {
         /// Linear blend weight for this target.
         pub weight: f32,
     }
+    /// Previous-frame model transform for a moving draw.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Motion {
+        /// The scene draw index in `frame.draws`.
+        pub draw: u32,
+        /// The draw's column-major model transform in the previous frame.
+        pub previous: Matrix,
+    }
     /// How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture
     /// filtering, ambient occlusion, a sky, screen effects, bloom and temporal antialiasing.
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1726,6 +1734,54 @@ pub mod types {
             }
         }
     }
+    /// Camera and per-object velocity motion blur applied in linear HDR light after TAA and
+    /// depth of field.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct MotionBlur {
+        /// Shutter scale on per-frame screen-space velocity for camera and per-object motion
+        /// blur (0 disables the pass; 0.5 is a 180-degree shutter; within 0..4).
+        pub strength: f32,
+        /// Maximum velocity motion blur radius as a fraction of screen dimensions (within
+        /// 0..0.25).
+        pub max_radius: f32,
+        /// Number of samples along the velocity vector for motion blur (clamped to 4..32 when
+        /// active).
+        pub samples: u32,
+    }
+    impl Default for MotionBlur {
+        fn default() -> Self {
+            Self {
+                strength: 0.0,
+                max_radius: 0.05,
+                samples: 8,
+            }
+        }
+    }
+    /// Bokeh depth of field applied in linear HDR light after TAA and before motion blur and
+    /// bloom.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Dof {
+        /// Distance from the camera to the focal plane in world units (0 disables depth of
+        /// field).
+        pub focus_distance: f32,
+        /// Depth band centered on `focus_distance` that remains fully sharp, in world units.
+        pub focus_range: f32,
+        /// Circle-of-confusion blur scale in screen-height UV units (0 disables depth of field;
+        /// within 0..1).
+        pub aperture: f32,
+        /// Maximum bokeh disk radius as a fraction of screen height (within 0..0.1).
+        pub max_blur: f32,
+    }
+    impl Default for Dof {
+        fn default() -> Self {
+            Self {
+                focus_distance: 0.0,
+                focus_range: 0.0,
+                aperture: 0.0,
+                max_blur: 0.025,
+            }
+        }
+    }
     /// One of the game's own sections: its tag, from its declaration, and its lanes.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct Extension {
@@ -1802,6 +1858,12 @@ pub mod types {
         /// How the host keeps local reflection probes up to date: how many cube faces it may
         /// draw in one frame.
         pub reflection: Reflection,
+        /// Camera and per-object velocity motion blur applied in linear HDR light after TAA and
+        /// depth of field.
+        pub motion_blur: MotionBlur,
+        /// Bokeh depth of field applied in linear HDR light after TAA and before motion blur
+        /// and bloom.
+        pub dof: Dof,
         pub draws: Vec<Draw>,
         /// Convex solids: the points behind every face plane (normal · p <= distance).
         pub solids: Vec<Solid>,
@@ -1881,6 +1943,9 @@ pub mod types {
         /// Blendshape / morph target weights applied to mesh vertices on the GPU before
         /// skinning and shading.
         pub morph_weights: Vec<MorphWeight>,
+        /// Previous-frame model transforms for moving scene draws, used to generate per-object
+        /// screen-space motion vectors for TAA reprojection and per-object motion blur.
+        pub motions: Vec<Motion>,
         /// The game's own sections, which its pen.json `protocol` declares, after the rest of
         /// the packet: a marker, their count, then each one's tag, length and values. A packet
         /// without any ends before the marker. Tag 0 is reserved for one optional development
@@ -1925,6 +1990,8 @@ pub mod types {
                 exposure: Default::default(),
                 grade: Default::default(),
                 reflection: Default::default(),
+                motion_blur: Default::default(),
+                dof: Default::default(),
                 draws: Default::default(),
                 solids: Default::default(),
                 decals: Default::default(),
@@ -1950,6 +2017,7 @@ pub mod types {
                 instance_removals: Default::default(),
                 bone_matrices: Default::default(),
                 morph_weights: Default::default(),
+                motions: Default::default(),
                 extensions: Default::default(),
             }
         }
@@ -2012,6 +2080,8 @@ pub mod codec {
     pub const MAX_BONE_MATRICES: usize = 65536;
     /// The most morph target weights one frame may declare.
     pub const MAX_MORPH_WEIGHTS: usize = 65536;
+    /// The most per-draw previous transforms one frame may declare for motion vectors.
+    pub const MAX_MOTIONS: usize = 100000;
     /// The most buses one frame may declare, the master (bus 0) included.
     pub const MAX_BUSES: usize = 16;
     /// Voice ids are whole numbers from 1 to this, the wire's exact-integer range.
@@ -2097,8 +2167,9 @@ pub mod codec {
     /// grade.vignette_radius, quality.ssr, reflection.budget, fog.edge, fog.distance,
     /// fog.albedo3, fog.anisotropy, fog.sun, fog.ambient, fog.sky, fog.noise, fog.noise_scale,
     /// fog.drift3, quality.volumetrics, fog_volume_count, bone_matrix_count,
-    /// morph_weight_count.
-    pub const PACKET_HEADER_FLOATS: usize = 237;
+    /// morph_weight_count, motion_blur.strength, motion_blur.max_radius, motion_blur.samples,
+    /// dof.focus_distance, dof.focus_range, dof.aperture, dof.max_blur, motion_count.
+    pub const PACKET_HEADER_FLOATS: usize = 245;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -2163,6 +2234,8 @@ pub mod codec {
     pub const BONE_MATRIX_FLOATS: usize = 19;
     /// Lanes: inset, draw, target, weight.
     pub const MORPH_WEIGHT_FLOATS: usize = 4;
+    /// Lanes: draw, previous16.
+    pub const MOTION_FLOATS: usize = 17;
     /// Where each header lane and record field starts; an optional field's lanes
     /// follow its count.
     pub mod lanes {
@@ -2308,6 +2381,14 @@ pub mod codec {
             pub const FOG_VOLUME_COUNT: usize = 234;
             pub const BONE_MATRIX_COUNT: usize = 235;
             pub const MORPH_WEIGHT_COUNT: usize = 236;
+            pub const MOTION_BLUR_STRENGTH: usize = 237;
+            pub const MOTION_BLUR_MAX_RADIUS: usize = 238;
+            pub const MOTION_BLUR_SAMPLES: usize = 239;
+            pub const DOF_FOCUS_DISTANCE: usize = 240;
+            pub const DOF_FOCUS_RANGE: usize = 241;
+            pub const DOF_APERTURE: usize = 242;
+            pub const DOF_MAX_BLUR: usize = 243;
+            pub const MOTION_COUNT: usize = 244;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -2498,6 +2579,10 @@ pub mod codec {
             pub const DRAW: usize = 1;
             pub const TARGET: usize = 2;
             pub const WEIGHT: usize = 3;
+        }
+        pub mod motion {
+            pub const DRAW: usize = 0;
+            pub const PREVIOUS: usize = 1;
         }
         pub mod solid {
             pub const FACES: usize = 0;
@@ -3035,6 +3120,13 @@ pub mod codec {
             *morph_weight = MorphWeight { inset: inset as u32, draw: draw as u32, target: target as u32, weight };
             Ok(())
         }
+
+        fn decode_motion(&mut self, lane: usize, motion: &mut Motion) -> Result<()> {
+            let draw = self.count(lane, MAX_DRAWS)?;
+            let previous = self.matrix(lane + 1);
+            *motion = Motion { draw: draw as u32, previous };
+            Ok(())
+        }
     }
 
     /// Decodes a render packet. The game's frame: what to draw and play, and what to do.
@@ -3101,6 +3193,7 @@ pub mod codec {
         let fog_volumes_count = reader.count(234, MAX_FOG_VOLUMES)?;
         let bone_matrices_count = reader.count(235, MAX_BONE_MATRICES)?;
         let morph_weights_count = reader.count(236, MAX_MORPH_WEIGHTS)?;
+        let motions_count = reader.count(244, MAX_MOTIONS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -3156,9 +3249,11 @@ pub mod codec {
         let bone_matrices_end = bone_matrices_start + bone_matrices_count * BONE_MATRIX_FLOATS;
         let morph_weights_start = bone_matrices_end;
         let morph_weights_end = morph_weights_start + morph_weights_count * MORPH_WEIGHT_FLOATS;
-        let extras_start = morph_weights_end;
+        let motions_start = morph_weights_end;
+        let motions_end = motions_start + motions_count * MOTION_FLOATS;
+        let extras_start = motions_end;
         let truncated = "game returned a truncated, oversized or nonfinite frame";
-        ensure!(packet.len() >= morph_weights_end && packet.iter().all(|value| value.is_finite()), truncated);
+        ensure!(packet.len() >= motions_end && packet.iter().all(|value| value.is_finite()), truncated);
         // What the records' tails claim of extras, in order.
         let mut extras_lanes = 0;
         for index in 0..draws_count {
@@ -3309,6 +3404,13 @@ pub mod codec {
         let fog_noise_scale = reader.packet[229];
         let fog_drift = Vector { x: reader.packet[230], y: reader.packet[231], z: reader.packet[232] };
         let quality_volumetrics = reader.count(233, 2)?;
+        let motion_blur_strength = reader.packet[237];
+        let motion_blur_max_radius = reader.packet[238];
+        let motion_blur_samples = reader.count(239, 32)?;
+        let dof_focus_distance = reader.packet[240];
+        let dof_focus_range = reader.packet[241];
+        let dof_aperture = reader.packet[242];
+        let dof_max_blur = reader.packet[243];
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -3508,6 +3610,11 @@ pub mod codec {
         for (index, morph_weight) in morph_weights.iter_mut().enumerate() {
             reader.decode_morph_weight(morph_weights_start + index * MORPH_WEIGHT_FLOATS, morph_weight)?;
         }
+        let mut motions = std::mem::take(&mut frame.motions);
+        resize(&mut motions, motions_count);
+        for (index, motion) in motions.iter_mut().enumerate() {
+            reader.decode_motion(motions_start + index * MOTION_FLOATS, motion)?;
+        }
         *frame = RenderFrame {
             save_requested,
             load_requested,
@@ -3540,6 +3647,8 @@ pub mod codec {
             exposure: Exposure { auto: exposure_auto, compensation: exposure_compensation, min: exposure_min, max: exposure_max, brighten: exposure_brighten, darken: exposure_darken, low: exposure_low, high: exposure_high, centre: exposure_centre, range_low: exposure_range_low, range_high: exposure_range_high, target: exposure_target, dt: exposure_dt, cut: exposure_cut },
             grade: Grade { temperature: grade_temperature, tint: grade_tint, exposure: grade_exposure, contrast: grade_contrast, pivot: grade_pivot, saturation: grade_saturation, vibrance: grade_vibrance, lift: grade_lift, gamma: grade_gamma, gain: grade_gain, lut_a: grade_lut_a as u32, lut_b: grade_lut_b as u32, lut_blend: grade_lut_blend, lut_weight: grade_lut_weight, vignette: grade_vignette, vignette_radius: grade_vignette_radius },
             reflection: Reflection { budget: reflection_budget as u32 },
+            motion_blur: MotionBlur { strength: motion_blur_strength, max_radius: motion_blur_max_radius, samples: motion_blur_samples as u32 },
+            dof: Dof { focus_distance: dof_focus_distance, focus_range: dof_focus_range, aperture: dof_aperture, max_blur: dof_max_blur },
             draws,
             solids,
             decals,
@@ -3565,6 +3674,7 @@ pub mod codec {
             instance_removals,
             bone_matrices,
             morph_weights,
+            motions,
             extensions,
         };
         Ok(&packet[state_start..state_end])
@@ -3648,6 +3758,7 @@ pub mod codec {
         let fog_volumes_count = d.count(&header.field("fog_volume_count"), 234, MAX_FOG_VOLUMES)?;
         let bone_matrices_count = d.count(&header.field("bone_matrix_count"), 235, MAX_BONE_MATRICES)?;
         let morph_weights_count = d.count(&header.field("morph_weight_count"), 236, MAX_MORPH_WEIGHTS)?;
+        let motions_count = d.count(&header.field("motion_count"), 244, MAX_MOTIONS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3703,7 +3814,9 @@ pub mod codec {
         let bone_matrices_end = d.end(&Location::section("bone_matrices"), bone_matrices_start, bone_matrices_count, BONE_MATRIX_FLOATS)?;
         let morph_weights_start = bone_matrices_end;
         let morph_weights_end = d.end(&Location::section("morph_weights"), morph_weights_start, morph_weights_count, MORPH_WEIGHT_FLOATS)?;
-        let extras_start = morph_weights_end;
+        let motions_start = morph_weights_end;
+        let motions_end = d.end(&Location::section("motions"), motions_start, motions_count, MOTION_FLOATS)?;
+        let extras_start = motions_end;
         let extras_cursor = &mut { extras_start };
         d.count(&header.field("save_requested"), 12, 1)?;
         d.count(&header.field("load_requested"), 13, 1)?;
@@ -3813,6 +3926,13 @@ pub mod codec {
         d.finite(&header.field("fog.noise_scale"), 229)?;
         d.values(&header.field("fog.drift"), 230, 3, &["x","y","z"])?;
         let _ = d.count(&header.field("quality.volumetrics"), 233, 2)?;
+        d.finite(&header.field("motion_blur.strength"), 237)?;
+        d.finite(&header.field("motion_blur.max_radius"), 238)?;
+        let _ = d.count(&header.field("motion_blur.samples"), 239, 32)?;
+        d.finite(&header.field("dof.focus_distance"), 240)?;
+        d.finite(&header.field("dof.focus_range"), 241)?;
+        d.finite(&header.field("dof.aperture"), 242)?;
+        d.finite(&header.field("dof.max_blur"), 243)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -4181,6 +4301,14 @@ pub mod codec {
             base += MORPH_WEIGHT_FLOATS;
         }
         d.exhausted(&Location::section("morph_weights"), base, morph_weights_end)?;
+        let mut base = motions_start;
+        for item in 0..motions_count {
+            let path = &Location::section("motions").index(item);
+            let draw = d.count(&path.field("draw"), base, MAX_DRAWS)?;
+            d.values(&path.field("previous"), base + 1, 16, &[])?;
+            base += MOTION_FLOATS;
+        }
+        d.exhausted(&Location::section("motions"), base, motions_end)?;
         inspect_extensions(d, *extras_cursor)?;
         Ok(())
     }
@@ -4229,6 +4357,7 @@ pub mod codec {
         let fog_volumes_count = d.count(&header.field("fog_volume_count"), 234, MAX_FOG_VOLUMES)?;
         let bone_matrices_count = d.count(&header.field("bone_matrix_count"), 235, MAX_BONE_MATRICES)?;
         let morph_weights_count = d.count(&header.field("morph_weight_count"), 236, MAX_MORPH_WEIGHTS)?;
+        let motions_count = d.count(&header.field("motion_count"), 244, MAX_MOTIONS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -4284,7 +4413,9 @@ pub mod codec {
         let bone_matrices_end = d.end(&Location::section("bone_matrices"), bone_matrices_start, bone_matrices_count, BONE_MATRIX_FLOATS)?;
         let morph_weights_start = bone_matrices_end;
         let morph_weights_end = d.end(&Location::section("morph_weights"), morph_weights_start, morph_weights_count, MORPH_WEIGHT_FLOATS)?;
-        let extras_start = morph_weights_end;
+        let motions_start = morph_weights_end;
+        let motions_end = d.end(&Location::section("motions"), motions_start, motions_count, MOTION_FLOATS)?;
+        let extras_start = motions_end;
         let mut end = extras_start;
         for item in 0..draws_count {
             let count = d.count(&Location::section("draws").index(item).field("extra"), draws_start + item * DRAW_FLOATS + 23, MAX_DRAW_EXTRA)?;
@@ -4421,6 +4552,8 @@ pub mod codec {
             frame.grade.gamma.z, frame.grade.gain.x, frame.grade.gain.y, frame.grade.gain.z,
             frame.grade.lut_a as f32, frame.grade.lut_b as f32, frame.grade.lut_blend, frame.grade.lut_weight,
             frame.grade.vignette, frame.grade.vignette_radius, frame.reflection.budget as f32,
+            frame.motion_blur.strength, frame.motion_blur.max_radius, frame.motion_blur.samples as f32,
+            frame.dof.focus_distance, frame.dof.focus_range, frame.dof.aperture, frame.dof.max_blur,
             state.len() as f32,
         ]);
         out.extend_from_slice(state);
@@ -4526,6 +4659,10 @@ pub mod codec {
         out.push(frame.morph_weights.len() as f32);
         for morph_weight in &frame.morph_weights {
             canonical_morph_weight(&mut out, morph_weight);
+        }
+        out.push(frame.motions.len() as f32);
+        for motion in &frame.motions {
+            canonical_motion(&mut out, motion);
         }
         out
     }
@@ -4746,5 +4883,10 @@ pub mod codec {
         out.extend([
             morph_weight.inset as f32, morph_weight.draw as f32, morph_weight.target as f32, morph_weight.weight,
         ]);
+    }
+
+    fn canonical_motion(out: &mut Vec<f32>, motion: &Motion) {
+        out.push(motion.draw as f32);
+        out.extend_from_slice(&motion.previous);
     }
 }

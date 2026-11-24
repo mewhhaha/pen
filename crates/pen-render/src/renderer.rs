@@ -34,6 +34,7 @@ mod skinning;
 mod timing;
 mod validate;
 mod veil;
+mod velocity;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -70,6 +71,10 @@ pub(crate) use particles::pipeline as particle_pipeline;
 pub use shadows::SHADOWS_WGSL;
 pub(crate) use timing::{GpuTimer, Span};
 pub use validate::validate_frame;
+
+pub(crate) fn velocity_sentinel_bytes() -> [u8; 4] {
+    velocity::SENTINEL_F16_BYTES
+}
 
 use assets::{texture_from, whole};
 
@@ -472,6 +477,8 @@ struct Scratch {
     /// Morph target weights by draw target index.
     morph_first: Vec<u32>,
     morph_order: Vec<u32>,
+    /// Previous-frame model transform index in `frame.motions` per scene draw (`u32::MAX` for static).
+    motion_for_draw: Vec<u32>,
     /// The frame's emitters ready to draw, in order.
     emitters: Vec<particles::Ready>,
 }
@@ -737,9 +744,10 @@ pub(crate) struct State {
     // Whether something this frame draws is still on its way.
     waiting: bool,
     scratch: Scratch,
-    // Posed draws' joint matrices, GPU morph targets, and the frame's particles.
+    // Posed draws' joint matrices, GPU morph targets, velocity pass, and the frame's particles.
     skinning: skinning::Skinning,
     morphing: morphing::Morphing,
+    velocity: velocity::Velocity,
     particles: Option<particles::Particles>,
     // Interned material render states (`MaterialAsset::state`).
     states: HashMap<String, u32>,
@@ -1093,6 +1101,7 @@ impl State {
             scratch: Scratch::default(),
             skinning: skinning::Skinning::new(&device),
             morphing: morphing::Morphing::new(&device),
+            velocity: velocity::Velocity::new(&device),
             particles: None,
             states: HashMap::new(),
             checks: 0,

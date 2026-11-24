@@ -71,6 +71,24 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
         "aberration must be finite and within a screen"
     );
     ensure!(frame.blur >= 0.0 && frame.blur <= 0.5, "blur must be within 0..0.5");
+    ensure!(
+        frame.motion_blur.strength.is_finite()
+            && (0.0..=4.0).contains(&frame.motion_blur.strength)
+            && frame.motion_blur.max_radius.is_finite()
+            && (0.0..=0.25).contains(&frame.motion_blur.max_radius),
+        "motion blur strength must be within 0..4 and max_radius within 0..0.25"
+    );
+    ensure!(
+        frame.dof.focus_distance.is_finite()
+            && frame.dof.focus_distance >= 0.0
+            && frame.dof.focus_range.is_finite()
+            && frame.dof.focus_range >= 0.0
+            && frame.dof.aperture.is_finite()
+            && (0.0..=1.0).contains(&frame.dof.aperture)
+            && frame.dof.max_blur.is_finite()
+            && (0.0..=0.1).contains(&frame.dof.max_blur),
+        "depth of field settings must be finite and within range"
+    );
     validate_exposure(&frame.exposure)?;
     validate_grade(&frame.grade)?;
     let clear = &frame.clear;
@@ -135,6 +153,10 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
             (morph.target as usize) < crate::asset_store::MAX_MORPH_TARGETS && morph.weight.is_finite(),
             "a morph weight needs a valid target index and finite weight"
         );
+    }
+    for motion in &frame.motions {
+        ensure!((motion.draw as usize) < frame.draws.len(), "a motion record must name one of the frame's draws");
+        validate_matrix(&motion.previous)?;
     }
     for emitter in &frame.emitters {
         validate_matrix(&emitter.transform)?;

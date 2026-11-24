@@ -5,6 +5,7 @@
 // point draws alone with its matching skinned pipeline (opaque, translucent,
 // inset, or blended inset), its joint matrices laid in one storage buffer for
 // the frame, bound at group 3 with a dynamic offset.
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pen_protocol::RenderFrame;
@@ -160,18 +161,30 @@ impl Scratch {
     }
 }
 
+/// One frame's GPU joint buffer and per-draw offset table (double-buffered so
+/// the velocity pass can read both current and previous skeletal palettes).
+#[derive(Default)]
+struct SkinSlot {
+    buffer: Option<wgpu::Buffer>,
+    /// The bind group, for the buffer and the binding's size it was made with.
+    group: Option<(wgpu::BindGroup, u64)>,
+    largest: u64,
+    /// Maps `(draw_target, mesh_slot)` to its byte offset in `buffer`.
+    offsets: HashMap<(usize, usize), u32>,
+}
+
 /// The frame's joint matrices: each posed draw's palette at an offset that
 /// storage bindings allow, in one buffer bound once with each offset.
+/// Double-buffered across frames so skeletal motion vectors have exact
+/// previous-frame palettes without extra copies.
 pub(super) struct Skinning {
     alignment: usize,
     /// This frame's palettes, as floats.
     data: Vec<f32>,
     /// The largest palette this frame, in bytes: what the binding spans.
     largest: u64,
-    buffer: Option<wgpu::Buffer>,
-    /// The bind group, for the buffer and the binding's size it was made
-    /// with.
-    group: Option<(wgpu::BindGroup, u64)>,
+    slots: [SkinSlot; 2],
+    current: usize,
     layers: Vec<Layer>,
     palette: Vec<Matrix>,
 }
@@ -193,23 +206,31 @@ impl Skinning {
             alignment: device.limits().min_storage_buffer_offset_alignment as usize,
             data: Vec::new(),
             largest: 0,
-            buffer: None,
-            group: None,
+            slots: [SkinSlot::default(), SkinSlot::default()],
+            current: 0,
             layers: Vec::new(),
             palette: Vec::new(),
         }
     }
 
-    /// Starts a frame's palettes.
-    pub fn begin(&mut self) {
+    /// Starts a frame's palettes, swapping current/previous double-buffer slots.
+    /// When `cut` is true, drops previous-frame history so cuts do not smear.
+    pub fn begin(&mut self, cut: bool) {
+        self.current = 1 - self.current;
+        if cut {
+            self.slots[1 - self.current].offsets.clear();
+        }
         self.data.clear();
         self.largest = 0;
+        self.slots[self.current].offsets.clear();
     }
 
     /// Lays `rig`'s joint matrices for `layers` and explicit `overrides` after
     /// the frame's others, and returns their offset in bytes.
     fn pose(
         &mut self,
+        target: usize,
+        mesh_slot: usize,
         rig: &Rig,
         layers: impl Iterator<Item = Layer>,
         overrides: impl Iterator<Item = (u32, Matrix)>,
@@ -233,31 +254,36 @@ impl Skinning {
             self.data.extend_from_slice(matrix);
         }
         self.largest = self.largest.max(self.palette.len() as u64 * 64);
-        u32::try_from(aligned).unwrap_or(u32::MAX)
+        let offset = u32::try_from(aligned).unwrap_or(u32::MAX);
+        self.slots[self.current].offsets.insert((target, mesh_slot), offset);
+        offset
     }
 
     /// Writes the frame's palettes for its draws to bind; the bind group,
     /// if any draw is posed.
     pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layout: &wgpu::BindGroupLayout) {
+        let slot = &mut self.slots[self.current];
         if self.data.is_empty() {
+            slot.largest = 0;
             return;
         }
         // Room for the last palette's whole binding past its offset.
         let used = (self.data.len() * 4) as u64;
         let size = used + self.largest;
-        if self.buffer.as_ref().is_none_or(|buffer| buffer.size() < size) {
+        if slot.buffer.as_ref().is_none_or(|buffer| buffer.size() < size) {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("joints"),
                 size: size.next_power_of_two(),
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.buffer = Some(buffer);
-            self.group = None;
+            slot.buffer = Some(buffer);
+            slot.group = None;
         }
-        let buffer = self.buffer.as_ref().unwrap();
+        let buffer = slot.buffer.as_ref().unwrap();
         queue.write_buffer(buffer, 0, bytemuck::cast_slice(&self.data));
-        if self.group.as_ref().is_none_or(|(_, binding)| *binding != self.largest) {
+        slot.largest = self.largest;
+        if slot.group.as_ref().is_none_or(|(_, binding)| *binding != self.largest) {
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("joints"),
                 layout,
@@ -270,13 +296,39 @@ impl Skinning {
                     }),
                 }],
             });
-            self.group = Some((group, self.largest));
+            slot.group = Some((group, self.largest));
         }
     }
 
     /// The bind group of this frame's palettes, if any draw is posed.
     pub fn group(&self) -> Option<&wgpu::BindGroup> {
-        if self.data.is_empty() { None } else { self.group.as_ref().map(|(group, _)| group) }
+        if self.data.is_empty() { None } else { self.slots[self.current].group.as_ref().map(|(group, _)| group) }
+    }
+
+    /// Byte offset of `(target, mesh_slot)` in the previous frame's joint buffer, if any.
+    pub fn previous_offset(&self, target: usize, mesh_slot: usize) -> Option<u32> {
+        let prev = &self.slots[1 - self.current];
+        if prev.buffer.is_none() || prev.largest == 0 {
+            return None;
+        }
+        prev.offsets.get(&(target, mesh_slot)).copied()
+    }
+
+    /// Current and previous joint storage buffers with their per-draw binding sizes.
+    pub fn buffers(&self) -> [Option<(&wgpu::Buffer, u64)>; 2] {
+        let curr = &self.slots[self.current];
+        let prev = &self.slots[1 - self.current];
+        let current = if self.data.is_empty() || curr.largest == 0 {
+            None
+        } else {
+            curr.buffer.as_ref().map(|b| (b, curr.largest))
+        };
+        let previous = if prev.largest == 0 || prev.offsets.is_empty() {
+            None
+        } else {
+            prev.buffer.as_ref().map(|b| (b, prev.largest))
+        };
+        [current, previous]
     }
 }
 
@@ -334,7 +386,8 @@ impl State {
             (true, false) => made.inset_skinned_blended.clone(),
         }
         .expect("an ensured variant is compiled");
-        let offset = self.skinning.pose(&rig, scratch.layers(frame, target), scratch.bone_matrices(frame, target));
+        let offset =
+            self.skinning.pose(target, mesh, &rig, scratch.layers(frame, target), scratch.bone_matrices(frame, target));
         Posed::Ready(pipeline, offset)
     }
 }

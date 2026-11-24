@@ -189,6 +189,8 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
         ambient: vector(0.25, 0.27, 0.3),
         aberration: Aberration { x: 0.0, y: 0.0 },
         blur: 0.0,
+        motion_blur: Default::default(),
+        dof: Default::default(),
         clear: Color { r: 0.4, g: 0.55, b: 0.75, a: 1.0 },
         quality: Quality {
             msaa: 4,
@@ -252,6 +254,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
         poses: Vec::new(),
         bone_matrices: Vec::new(),
         morph_weights: Vec::new(),
+        motions: Vec::new(),
         emitters: Vec::new(),
         extensions: Vec::new(),
         lights: Vec::new(),

@@ -180,6 +180,11 @@
       "doc": "The most morph target weights one frame may declare."
     },
     {
+      "limit": "MAX_MOTIONS",
+      "value": 100000,
+      "doc": "The most per-draw previous transforms one frame may declare for motion vectors."
+    },
+    {
       "limit": "MAX_BUSES",
       "value": 16,
       "doc": "The most buses one frame may declare, the master (bus 0) included."
@@ -1645,6 +1650,14 @@
       "grade": {
         "type": "Grade",
         "doc": "The color grade the present pass applies after exposure and before tone mapping: white balance, contrast about a pivot, ASC CDL lift, gamma and gain, saturation and vibrance, up to two blended look-up tables, and a vignette. The defaults grade nothing."
+      },
+      "motion_blur": {
+        "type": "MotionBlur",
+        "doc": "Camera and per-object velocity motion blur applied in linear HDR light after TAA and depth of field."
+      },
+      "dof": {
+        "type": "Dof",
+        "doc": "Bokeh depth of field applied in linear HDR light after TAA and before motion blur and bloom."
       }
     },
     "header": {
@@ -2501,6 +2514,47 @@
       "morph_weight_count": {
         "kind": "size",
         "section": "morph_weights",
+        "of": "count"
+      },
+      "motion_blur.strength": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Shutter scale on per-frame screen-space velocity for camera and per-object motion blur (0 disables the pass; 0.5 is a 180-degree shutter; within 0..4)."
+      },
+      "motion_blur.max_radius": {
+        "kind": "f32",
+        "default": 0.05,
+        "doc": "Maximum velocity motion blur radius as a fraction of screen dimensions (within 0..0.25)."
+      },
+      "motion_blur.samples": {
+        "kind": "count",
+        "max": 32,
+        "default": 8,
+        "doc": "Number of samples along the velocity vector for motion blur (clamped to 4..32 when active)."
+      },
+      "dof.focus_distance": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Distance from the camera to the focal plane in world units (0 disables depth of field)."
+      },
+      "dof.focus_range": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Depth band centered on `focus_distance` that remains fully sharp, in world units."
+      },
+      "dof.aperture": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Circle-of-confusion blur scale in screen-height UV units (0 disables depth of field; within 0..1)."
+      },
+      "dof.max_blur": {
+        "kind": "f32",
+        "default": 0.025,
+        "doc": "Maximum bokeh disk radius as a fraction of screen height (within 0..0.1)."
+      },
+      "motion_count": {
+        "kind": "size",
+        "section": "motions",
         "of": "count"
       }
     },
@@ -4009,6 +4063,35 @@
           "limit": "MAX_MORPH_WEIGHTS",
           "value": 65536,
           "doc": "The most morph target weights one frame may declare."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "motions",
+        "doc": "Previous-frame model transforms for moving scene draws, used to generate per-object screen-space motion vectors for TAA reprojection and per-object motion blur.",
+        "record": {
+          "name": "Motion",
+          "constant": "MOTION",
+          "fields": {
+            "draw": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_DRAWS",
+                "value": 100000
+              },
+              "doc": "The scene draw index in `frame.draws`."
+            },
+            "previous": {
+              "kind": "matrix",
+              "doc": "The draw's column-major model transform in the previous frame."
+            }
+          },
+          "doc": "Previous-frame model transform for a moving draw."
+        },
+        "max": {
+          "limit": "MAX_MOTIONS",
+          "value": 100000,
+          "doc": "The most per-draw previous transforms one frame may declare for motion vectors."
         }
       },
       {

@@ -14,6 +14,7 @@ struct Taa {
 @group(0) @binding(2) var history: texture_2d<f32>;
 @group(0) @binding(3) var depth: ${depth_texture};
 @group(0) @binding(4) var filtering: sampler;
+@group(0) @binding(5) var velocity: texture_2d<f32>;
 ${fullscreen}
 
 fn luma(color: vec3f) -> f32 {
@@ -85,6 +86,7 @@ fn clipped(color: vec3f, low: vec3f, high: vec3f) -> vec3f {
   var square = vec3f(0.0);
   var middle = vec3f(0.0);
   var nearest = 1.0;
+  var nearest_at = pixel;
   for (var y = -1; y <= 1; y++) {
     for (var x = -1; x <= 1; x++) {
       let at = clamp(pixel + vec2i(x, y), vec2i(0), last);
@@ -96,19 +98,33 @@ fn clipped(color: vec3f, low: vec3f, high: vec3f) -> vec3f {
       high = max(high, color);
       mean += color;
       square += color * color;
-      nearest = min(nearest, textureLoad(depth, at, 0));
+      let d = textureLoad(depth, at, 0);
+      if (d < nearest) {
+        nearest = d;
+        nearest_at = at;
+      }
     }
   }
   mean /= 9.0;
   let spread = sqrt(max(square / 9.0 - mean * mean, vec3f(0.0))) * 1.25;
-  // Where that surface was in the last frame. The pixel's sample sat the
-  // jitter off its middle, so the surface's place is shifted back by as
-  // much: a still picture reads its history where it is, not resampled.
+  // Where that surface was in the last frame. When a velocity vector is present
+  // at the nearest depth in the 3x3 neighbourhood, follow it directly (covering
+  // rigid, skinned and morphed motion); otherwise fall back to camera depth
+  // reprojection shifted back by this frame's jitter so still surfaces read
+  // their history without resampling.
   let uv = position.xy / size;
-  let world = taa.inverse * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, nearest, 1.0);
-  let before = taa.previous * vec4f(world.xyz / world.w, 1.0);
-  let was = vec2f(before.x, -before.y) / before.w * 0.5 + 0.5 + taa.blend.xy;
-  let gone = before.w <= 0.0 || any(was < vec2f(0.0)) || any(was > vec2f(1.0));
+  let obj_vel = textureLoad(velocity, nearest_at, 0).xy;
+  var was = uv;
+  var gone = false;
+  if (abs(obj_vel.x) < 500.0) {
+    was = uv - obj_vel;
+    gone = any(was < vec2f(0.0)) || any(was > vec2f(1.0));
+  } else {
+    let world = taa.inverse * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, nearest, 1.0);
+    let before = taa.previous * vec4f(world.xyz / world.w, 1.0);
+    was = vec2f(before.x, -before.y) / before.w * 0.5 + 0.5 + taa.blend.xy;
+    gone = before.w <= 0.0 || any(was < vec2f(0.0)) || any(was > vec2f(1.0));
+  }
   if (taa.blend.w > 0.5 || gone) {
     return vec4f(unsqueezed(rgb(middle)), 1.0);
   }

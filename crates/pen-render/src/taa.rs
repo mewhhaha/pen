@@ -76,6 +76,11 @@ impl Memory {
         self.previous
     }
 
+    /// Drops history across a camera cut so the next frame does not blend the old view.
+    pub fn cut(&mut self) {
+        self.previous = None;
+    }
+
     /// Which history texture this frame reads; it draws into the other.
     pub fn read(&self) -> usize {
         usize::from(self.frames % 2 == 1)

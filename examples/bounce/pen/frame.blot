@@ -141,4 +141,15 @@ func header (schema: U32): types.RenderHeader => {
   reflection: $types.Reflection {
     budget: 0,
   },
+  motion_blur: $types.MotionBlur {
+    strength: 0.0,
+    max_radius: 0.05,
+    samples: 8,
+  },
+  dof: $types.Dof {
+    focus_distance: 0.0,
+    focus_range: 0.0,
+    aperture: 0.0,
+    max_blur: 0.025,
+  },
 }

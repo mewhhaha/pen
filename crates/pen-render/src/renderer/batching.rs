@@ -108,6 +108,33 @@ impl Scratch {
         self.decal_order.clear();
         self.insets.clear();
         self.emitters.clear();
+        self.motion_for_draw.clear();
+    }
+
+    /// Maps each scene draw index with a differing previous transform to its index in `frame.motions`.
+    pub(super) fn group_motions(&mut self, frame: &RenderFrame) {
+        self.motion_for_draw.clear();
+        if frame.motions.is_empty() {
+            return;
+        }
+        self.motion_for_draw.resize(frame.draws.len(), u32::MAX);
+        for (index, motion) in frame.motions.iter().enumerate() {
+            let draw = motion.draw as usize;
+            if let Some(current) = frame.draws.get(draw)
+                && current.transform != motion.previous
+            {
+                self.motion_for_draw[draw] = u32::try_from(index).unwrap_or(u32::MAX);
+            }
+        }
+    }
+
+    pub(super) fn has_motion(&self, draw: usize) -> bool {
+        self.motion_for_draw.get(draw).is_some_and(|&slot| slot != u32::MAX)
+    }
+
+    pub(super) fn motion_previous<'a>(&self, frame: &'a RenderFrame, draw: usize) -> Option<&'a Matrix> {
+        let slot = *self.motion_for_draw.get(draw)?;
+        (slot != u32::MAX).then(|| &frame.motions[slot as usize].previous)
     }
 }
 
@@ -195,10 +222,11 @@ impl State {
         self.culling.begin(scratch.views, scratch.detail);
         scratch.group_poses(frame);
         scratch.group_morphs(frame);
+        scratch.group_motions(frame);
         for (index, draw) in frame.draws.iter().enumerate() {
-            // A posed or morphed draw has per-draw joint matrices or deformed vertices: drawn alone.
-            let deformed = scratch.posed(index) || scratch.morphed(index);
-            let placement = self.place(draw, catalog, samples, scratch, deformed)?;
+            // A posed, morphed, or explicitly moving draw has per-draw matrices/deformations: drawn alone.
+            let alone = scratch.posed(index) || scratch.morphed(index) || scratch.has_motion(index);
+            let placement = self.place(draw, catalog, samples, scratch, alone)?;
             scratch.placements.push(placement);
         }
         // Batches of many instances cull on the GPU: their instances go first
@@ -474,7 +502,7 @@ impl State {
     ) -> Result<()> {
         let item_count = scratch.items.len();
         let floats = (self.stride / 4) as usize;
-        self.skinning.begin();
+        self.skinning.begin(frame.exposure.cut);
         self.morphing.begin();
         for index in 0..item_count {
             let item = scratch.items[index];

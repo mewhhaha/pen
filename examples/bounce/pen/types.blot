@@ -239,6 +239,11 @@ type MorphWeight is data = $MorphWeight {
   weight: F32,
 }
 
+type Motion is data = $Motion {
+  draw: U32,
+  previous: Mat4,
+}
+
 type Solid is data = $Solid {
   faces: &[SolidFace],
 }
@@ -407,6 +412,19 @@ type Grade is data = $Grade {
   vignette_radius: F32,
 }
 
+type MotionBlur is data = $MotionBlur {
+  strength: F32,
+  max_radius: F32,
+  samples: U32,
+}
+
+type Dof is data = $Dof {
+  focus_distance: F32,
+  focus_range: F32,
+  aperture: F32,
+  max_blur: F32,
+}
+
 type RenderHeader = {
   schema: U32,
   save_requested: Bool,
@@ -440,4 +458,6 @@ type RenderHeader = {
   exposure: Exposure,
   grade: Grade,
   reflection: Reflection,
+  motion_blur: MotionBlur,
+  dof: Dof,
 }

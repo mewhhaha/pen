@@ -1,0 +1,123 @@
+// Camera and per-object velocity motion blur (motion_blur.rs).
+// Reads screen-space velocity from the velocity buffer (falling back to
+// depth-reprojected camera velocity where velocity holds the sentinel >= 500),
+// finds the dominant neighborhood velocity to smear fast foreground edges over
+// static backgrounds, and integrates depth-weighted taps along the motion line.
+struct MotionBlur {
+  inverse: mat4x4f,
+  previous: mat4x4f,
+  // x: strength, y: max_radius, z: samples, w: 1 if previous camera exists
+  params: vec4f,
+  // xy: size in pixels, zw: jitter in UV coordinates
+  size: vec4f,
+};
+@group(0) @binding(0) var<uniform> mb: MotionBlur;
+@group(0) @binding(1) var source: texture_2d<f32>;
+@group(0) @binding(2) var velocity: texture_2d<f32>;
+@group(0) @binding(3) var depth: ${depth_texture};
+@group(0) @binding(4) var filtering: sampler;
+${fullscreen}
+
+fn depth_at(pixel: vec2i) -> f32 {
+  let last = vec2i(mb.size.xy) - 1;
+  return textureLoad(depth, clamp(pixel, vec2i(0), last), 0);
+}
+
+fn clamp_len(v: vec2f, max_len: f32) -> vec2f {
+  let len = length(v);
+  return select(v, v * (max_len / len), len > max_len && len > 1e-6);
+}
+
+fn velocity_at(pixel: vec2i) -> vec2f {
+  let size = mb.size.xy;
+  let last = vec2i(size) - 1;
+  let p = clamp(pixel, vec2i(0), last);
+  let obj = textureLoad(velocity, p, 0).xy;
+  if (abs(obj.x) < 500.0) {
+    return obj;
+  }
+  if (mb.params.w < 0.5) {
+    return vec2f(0.0);
+  }
+  let uv = (vec2f(p) + 0.5) / size;
+  let d = textureLoad(depth, p, 0);
+  let world = mb.inverse * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
+  let before = mb.previous * vec4f(world.xyz / world.w, 1.0);
+  if (before.w <= 1e-5) {
+    return vec2f(0.0);
+  }
+  let was = vec2f(before.x, -before.y) / before.w * 0.5 + 0.5 + mb.size.zw;
+  return uv - was;
+}
+
+@fragment fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+  let size = mb.size.xy;
+  let uv = position.xy / size;
+  let pixel = vec2i(position.xy);
+  let last = vec2i(size) - 1;
+  let center_color = textureLoad(source, clamp(pixel, vec2i(0), last), 0);
+  let strength = mb.params.x;
+  let max_radius = mb.params.y;
+  if (strength <= 1e-5 || max_radius <= 1e-5) {
+    return center_color;
+  }
+
+  let v_c = clamp_len(velocity_at(pixel) * strength, max_radius);
+  var v_max = v_c;
+  var max_speed = length(v_c);
+
+  // Neighborhood max-velocity search across an 8-direction ring (and half-ring)
+  // so fast-moving foreground objects smear smoothly over static backgrounds.
+  let dirs = array<vec2f, 8>(
+    vec2f(1.0, 0.0), vec2f(-1.0, 0.0), vec2f(0.0, 1.0), vec2f(0.0, -1.0),
+    vec2f(0.7071, 0.7071), vec2f(-0.7071, 0.7071), vec2f(0.7071, -0.7071), vec2f(-0.7071, -0.7071),
+  );
+  for (var ring = 1; ring <= 2; ring++) {
+    let step_uv = max_radius * 0.25 * f32(ring);
+    for (var i = 0; i < 8; i++) {
+      let np = vec2i((uv + dirs[i] * step_uv) * size);
+      let vn = clamp_len(velocity_at(np) * strength, max_radius);
+      let s = length(vn);
+      if (s > max_speed) {
+        max_speed = s;
+        v_max = vn;
+      }
+    }
+  }
+
+  let min_speed = 0.5 / max(size.x, size.y);
+  if (max_speed < min_speed) {
+    return center_color;
+  }
+
+  let count = i32(clamp(mb.params.z, 4.0, 32.0));
+  let z_c = depth_at(pixel);
+  let v_c_len = length(v_c);
+  // Interleaved gradient noise breaks stepping bands across fast silhouettes.
+  let jitter = fract(52.9829189 * fract(dot(floor(position.xy), vec2f(0.06711056, 0.00583715)))) - 0.5;
+
+  var accum = center_color.rgb;
+  var total = 1.0;
+  for (var i = 0; i < count; i++) {
+    let t = (f32(i) + 0.5 + jitter * 0.5) / f32(count) - 0.5;
+    let sample_uv = clamp(uv + v_max * t, vec2f(0.0), vec2f(1.0));
+    let sample_pixel = vec2i(sample_uv * size);
+    let z_q = depth_at(sample_pixel);
+    let v_q = clamp_len(velocity_at(sample_pixel) * strength, max_radius);
+    let v_q_len = length(v_q);
+    let dist = abs(t) * max_speed;
+    // Soft depth comparison (hardware depth 0..1, smaller = nearer).
+    let fg = clamp(1.0 - (z_q - z_c) * 120.0, 0.0, 1.0);
+    let bg = clamp(1.0 - (z_c - z_q) * 120.0, 0.0, 1.0);
+    let cone_q = clamp(1.0 - dist / max(v_q_len * 0.5, 1e-5), 0.0, 1.0);
+    let cone_c = clamp(1.0 - dist / max(v_c_len * 0.5, 1e-5), 0.0, 1.0);
+    let both = select(0.0, 0.5, dist <= min(v_q_len, v_c_len) * 0.5);
+    let w = fg * cone_q + bg * cone_c + both;
+    if (w > 1e-4) {
+      let col = textureSampleLevel(source, filtering, sample_uv, 0.0).rgb;
+      accum += col * w;
+      total += w;
+    }
+  }
+  return vec4f(accum / total, center_color.a);
+}

@@ -36,10 +36,11 @@ use pen_protocol::boundary::{
     canonical_input, canonical_render, decode_frame, encode_frame, whole,
 };
 use pen_protocol::{
-    Aberration, BoneMatrix, Bus, Cascade, Catalog, Clouds, Color, Decal, Draw, Drift, Emitter, Exposure, FieldPatch,
-    Fog, FogVolume, Frame, GameEvent, Grade, Inset, Instance, InstanceRemoval, Light, Listener, MorphWeight, Panner,
-    Pose, Probe, ProbeVolume, Quality, Reflection, ReflectionProbe, RenderFrame, ServiceRequest, Shadow, Sky, Solid,
-    SolidFace, Sound, Sprite, UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
+    Aberration, BoneMatrix, Bus, Cascade, Catalog, Clouds, Color, Decal, Dof, Draw, Drift, Emitter, Exposure,
+    FieldPatch, Fog, FogVolume, Frame, GameEvent, Grade, Inset, Instance, InstanceRemoval, Light, Listener,
+    MorphWeight, Motion, MotionBlur, Panner, Pose, Probe, ProbeVolume, Quality, Reflection, ReflectionProbe,
+    RenderFrame, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode, Vector, Viewport, Voice,
+    service, ui_live, ui_role, ui_state,
 };
 
 const HARNESS: &str = include_str!("codec_round_trip.blot");
@@ -663,6 +664,17 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             local_texels: rng.whole(4096),
         },
         blur: rng.number(),
+        motion_blur: MotionBlur {
+            strength: rng.number(),
+            max_radius: rng.number(),
+            samples: rng.whole(32),
+        },
+        dof: Dof {
+            focus_distance: rng.number(),
+            focus_range: rng.number(),
+            aperture: rng.number(),
+            max_blur: rng.number(),
+        },
         clouds: Clouds { cover: rng.number(), drift: Drift { x: rng.number(), z: rng.number() } },
         exposure: Exposure {
             auto: rng.flag(),
@@ -966,6 +978,13 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 draw: rng.whole(u32::try_from(MAX_DRAWS).unwrap()),
                 target: rng.whole(256),
                 weight: rng.number(),
+            })
+        },
+        motions: {
+            let count = rng.count(8);
+            rng.list(count, |rng| Motion {
+                draw: rng.whole(u32::try_from(MAX_DRAWS).unwrap()),
+                previous: rng.lanes(),
             })
         },
         emitters: {

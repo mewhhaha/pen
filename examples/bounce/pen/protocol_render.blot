@@ -294,6 +294,16 @@ func encode_morph_weight (morph_weight: types.MorphWeight) =>
     U32.to_f32 (morph_weight.target), morph_weight.weight,
   ]
 
+// Motion: Previous-frame model transform for a moving draw.
+func encode_motion (motion: types.Motion) =>
+  let $types.Mat4 { x: previous_x, y: previous_y, z: previous_z, w: previous_w } = motion.previous
+  return #[
+    U32.to_f32 (motion.draw), previous_x.x, previous_x.y, previous_x.z,
+    previous_x.w, previous_y.x, previous_y.y, previous_y.z, previous_y.w,
+    previous_z.x, previous_z.y, previous_z.z, previous_z.w, previous_w.x,
+    previous_w.y, previous_w.z, previous_w.w,
+  ]
+
 // A Draw's extra, at most protocol.max_draw_extra of them, for the packet's last
 // section.
 func encode_draw_extra (draw: types.Draw) =>
@@ -333,6 +343,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   let instance_removals_count: U32 = collections.instance_removals.length
   let bone_matrices_count: U32 = collections.bone_matrices.length
   let morph_weights_count: U32 = collections.morph_weights.length
+  let motions_count: U32 = collections.motions.length
   @storage.push encoded (protocol.packet_magic)
   @storage.push encoded (U32.to_f32 packet.schema)
   @storage.push encoded (0.0)
@@ -573,6 +584,14 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (U32.to_f32 fog_volumes_count)
   @storage.push encoded (U32.to_f32 bone_matrices_count)
   @storage.push encoded (U32.to_f32 morph_weights_count)
+  @storage.push encoded (packet.motion_blur.strength)
+  @storage.push encoded (packet.motion_blur.max_radius)
+  @storage.push encoded (U32.to_f32 (packet.motion_blur.samples))
+  @storage.push encoded (packet.dof.focus_distance)
+  @storage.push encoded (packet.dof.focus_range)
+  @storage.push encoded (packet.dof.aperture)
+  @storage.push encoded (packet.dof.max_blur)
+  @storage.push encoded (U32.to_f32 motions_count)
   let state_start = encoded.length
   for i in 0 .. state_count:
     let source = collections.state[i]
@@ -1116,6 +1135,27 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     @storage.push encoded (U32.to_f32 (morph_weight.draw))
     @storage.push encoded (U32.to_f32 (morph_weight.target))
     @storage.push encoded (morph_weight.weight)
+  for i in 0 .. motions_count:
+    let source = collections.motions[i]
+    let motion: types.Motion = project.motion context source
+    @storage.push encoded (U32.to_f32 (motion.draw))
+    let $types.Mat4 { x: previous_x, y: previous_y, z: previous_z, w: previous_w } = motion.previous
+    @storage.push encoded (previous_x.x)
+    @storage.push encoded (previous_x.y)
+    @storage.push encoded (previous_x.z)
+    @storage.push encoded (previous_x.w)
+    @storage.push encoded (previous_y.x)
+    @storage.push encoded (previous_y.y)
+    @storage.push encoded (previous_y.z)
+    @storage.push encoded (previous_y.w)
+    @storage.push encoded (previous_z.x)
+    @storage.push encoded (previous_z.y)
+    @storage.push encoded (previous_z.z)
+    @storage.push encoded (previous_z.w)
+    @storage.push encoded (previous_w.x)
+    @storage.push encoded (previous_w.y)
+    @storage.push encoded (previous_w.z)
+    @storage.push encoded (previous_w.w)
   for i in 0 .. draws_count:
     let source = collections.draws[i]
     project.append_extra context source encoded
@@ -1155,6 +1195,7 @@ func measure_render_floats collections -> project -> context =>
   let instance_removals_count: U32 = collections.instance_removals.length
   let bone_matrices_count: U32 = collections.bone_matrices.length
   let morph_weights_count: U32 = collections.morph_weights.length
+  let motions_count: U32 = collections.motions.length
   total := self + state_count
   total := self + draws_count * 24
   for i in 0 .. solids_count:
@@ -1200,6 +1241,7 @@ func measure_render_floats collections -> project -> context =>
   total := self + instance_removals_count * 2
   total := self + bone_matrices_count * 19
   total := self + morph_weights_count * 4
+  total := self + motions_count * 17
   for i in 0 .. draws_count:
     let source = collections.draws[i]
     total := self + (project.extra_count context source) * 4
@@ -1457,6 +1499,14 @@ func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (
   encoded[234] := 0.0
   encoded[235] := 0.0
   encoded[236] := 0.0
+  encoded[237] := packet.motion_blur.strength
+  encoded[238] := packet.motion_blur.max_radius
+  encoded[239] := U32.to_f32 (packet.motion_blur.samples)
+  encoded[240] := packet.dof.focus_distance
+  encoded[241] := packet.dof.focus_range
+  encoded[242] := packet.dof.aperture
+  encoded[243] := packet.dof.max_blur
+  encoded[244] := 0.0
   let at: U32 = protocol.packet_header_floats
   for draw in draws:
     encoded[at + 0] := U32.to_f32 (draw.mesh)

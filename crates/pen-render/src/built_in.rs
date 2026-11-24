@@ -15,8 +15,12 @@ pub(crate) enum BuiltIn {
     Occlusion(u32),
     /// Sky and fog over a scene of this many samples.
     Atmosphere(u32),
-    /// Temporal antialiasing, reading the depth of such a scene (taa.rs).
+    /// Temporal antialiasing, reading the depth and velocity of such a scene (taa.rs).
     Taa(u32),
+    /// Bokeh depth of field, reading the depth of such a scene (dof.rs).
+    Dof(u32),
+    /// Camera and per-object velocity motion blur, reading velocity and depth (motion_blur.rs).
+    MotionBlur(u32),
     /// The last pass onto the output, reading the stencil of such a scene.
     Present(u32),
     BloomDown {
@@ -48,11 +52,13 @@ pub(crate) enum BuiltIn {
 
 impl BuiltIn {
     /// Every one a frame drawn with `samples` per pixel may draw with.
-    pub fn all(samples: u32) -> [BuiltIn; 14] {
+    pub fn all(samples: u32) -> [BuiltIn; 16] {
         [
             BuiltIn::Occlusion(samples),
             BuiltIn::Atmosphere(samples),
             BuiltIn::Taa(samples),
+            BuiltIn::Dof(samples),
+            BuiltIn::MotionBlur(samples),
             BuiltIn::Present(samples),
             BuiltIn::BloomDown { first: true },
             BuiltIn::BloomDown { first: false },

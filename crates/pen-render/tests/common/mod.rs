@@ -43,6 +43,8 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
         ambient: zero,
         aberration: Aberration { x: 0.0, y: 0.0 },
         blur: 0.0,
+        motion_blur: Default::default(),
+        dof: Default::default(),
         clear: Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
         quality: Quality {
             msaa: 1,
@@ -93,6 +95,7 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
         poses: Vec::new(),
         bone_matrices: Vec::new(),
         morph_weights: Vec::new(),
+        motions: Vec::new(),
         emitters: Vec::new(),
         extensions: Vec::new(),
         lights: Vec::new(),

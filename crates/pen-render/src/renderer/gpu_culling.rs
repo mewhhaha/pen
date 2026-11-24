@@ -357,6 +357,22 @@ impl GpuCulling {
         batch.levels
     }
 
+    /// Draws `batch`'s culled instances with vertex buffer 0 = positions and buffer 1 = instances
+    /// (used by the velocity pass, which skips tangents).
+    pub fn draw_positions(&self, pass: &mut wgpu::RenderPass<'_>, batch: &GpuBatch, view: usize, mesh: &MeshAsset) {
+        let (Some(culled), Some(draws)) = (&self.culled.buffer, &self.draws.buffer) else { return };
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+        let view = u32::try_from(view).expect("at most MAX_VIEWS");
+        for level in 0..batch.levels {
+            let draw = view * batch.levels + level;
+            let first = u64::from(batch.out + draw * batch.count) * INSTANCE_BYTES;
+            let last = first + u64::from(batch.count) * INSTANCE_BYTES;
+            pass.set_vertex_buffer(1, culled.slice(first..last));
+            pass.draw_indexed_indirect(draws, u64::from(batch.draws + draw) * (DRAW_WORDS * 4) as u64);
+        }
+    }
+
     /// Copies the frame's draws' arguments out to be read back; `submitted`
     /// follows once the encoder is submitted.
     pub fn finish(&mut self, encoder: &mut wgpu::CommandEncoder) {

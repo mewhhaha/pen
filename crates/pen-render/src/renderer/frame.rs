@@ -377,9 +377,13 @@ impl State {
             &volume,
             Extras { translucent, subsurface },
         );
+        if targets.targets_recreated {
+            self.velocity.reset_target();
+        }
         // With TAA the scene draws through a projection jittered within its
         // pixels: the scene uniform's, after its view.
         let jittered = self.post.as_ref().unwrap().jittered();
+        let previous_vp = self.post.as_ref().unwrap().previous_vp();
         if let Some(projection) = jittered {
             self.queue.write_buffer(&self.scene_uniform, 64, bytemuck::cast_slice(&projection));
         }
@@ -427,6 +431,24 @@ impl State {
             morphed: self.morphing.output(),
             culling: &self.culling,
         };
+        if let Some((vel_view, vel_depth)) = &targets.velocity {
+            let active_proj = jittered.unwrap_or(frame.projection);
+            self.velocity.encode(
+                &device,
+                &self.queue,
+                &mut encoder,
+                vel_view,
+                vel_depth,
+                frame,
+                &active_proj,
+                previous_vp,
+                scratch,
+                &drawing,
+                &self.skinning,
+                ready,
+                &self.timer,
+            );
+        }
         if shadowed {
             self.cast_shadows(
                 &mut encoder,

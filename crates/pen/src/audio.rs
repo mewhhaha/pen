@@ -70,9 +70,11 @@ pub fn decode(path: &Path, rate: f64) -> Result<Arc<Clip>> {
 pub fn mix(frame: &RenderFrame, catalog: &Catalog, clips: &HashMap<String, Arc<Clip>>) -> Mix {
     let clip = |index: u32| clips.get(catalog.sound(index)).cloned();
     let placements = Placements::of(frame);
+    let zone = placements.zone_mix();
     Mix {
-        reverb_decay: frame.reverb.decay,
-        reverb_damping: frame.reverb.damping,
+        reverb_decay: zone.decay,
+        reverb_damping: zone.damping,
+        synths: frame.synths.iter().map(pen_runtime::synth::SynthSpec::from_wire).collect(),
         buses: frame
             .buses
             .iter()

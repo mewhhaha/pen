@@ -28,6 +28,7 @@ use std::sync::Arc;
 use pen_protocol::boundary::{AUDIO_FADE_MS, AUDIO_GLIDE_MS, AUDIO_OPEN, MAX_BUSES};
 use pen_runtime::mix::{Meter, Monitor};
 use pen_runtime::panner::{DEFAULT_EAR, Pan, Placement, Vec3, azimuth, equal_power};
+use pen_runtime::synth::{SynthEngine, SynthSpec};
 
 use super::resample::{Resampler, resample};
 use super::reverb::Convolver;
@@ -185,12 +186,14 @@ pub struct SoundSpec {
     pub panner: Option<Placement>,
 }
 
-/// One frame's sound: its buses, voices, sounds, and optional reverb room parameters.
+/// One frame's sound: its buses, voices, sounds, procedural/granular synths,
+/// and optional reverb room parameters.
 #[derive(Default)]
 pub struct Mix {
     pub buses: Vec<BusSpec>,
     pub voices: Vec<VoiceSpec>,
     pub sounds: Vec<SoundSpec>,
+    pub synths: Vec<SynthSpec>,
     pub reverb_decay: f32,
     pub reverb_damping: f32,
 }
@@ -448,11 +451,13 @@ struct Spatial {
     placed: Option<(Vec3, Vec3)>,
     pan: Pan,
     gain: f32,
+    doppler: f32,
     binaural: Option<Binaural>,
 }
 
 impl Spatial {
     fn new(placement: Placement) -> Spatial {
+        let doppler = placement.doppler_ratio(placement.position);
         Spatial {
             binaural: placement.hrtf.then(Binaural::new),
             placement,
@@ -461,6 +466,7 @@ impl Spatial {
             placed: None,
             pan: Pan { left: 1.0, right: 1.0, rightward: false },
             gain: 1.0,
+            doppler,
         }
     }
 
@@ -478,7 +484,15 @@ impl Spatial {
         }
     }
 
-    /// This sample's pan and gain, then a step on.
+    fn doppler_ratio(&self) -> f32 {
+        self.doppler
+    }
+
+    fn wet_scale(&self) -> f32 {
+        self.placement.wet_scale
+    }
+
+    /// This sample's pan and gain (including distance, cone, and occlusion), then a step on.
     fn next(&mut self, step: f64, mono: bool, rate: f64) -> (Pan, f32) {
         let position = next(&mut self.position, step);
         let orientation = next(&mut self.orientation, step);
@@ -486,7 +500,8 @@ impl Spatial {
             self.placed = Some((position, orientation));
             let az = azimuth(position, &DEFAULT_EAR);
             self.pan = equal_power(az, mono);
-            self.gain = self.placement.gain(position, orientation, &DEFAULT_EAR);
+            self.gain = self.placement.gain(position, orientation, &DEFAULT_EAR) * self.placement.occlusion_gain();
+            self.doppler = self.placement.doppler_ratio(position);
             if let Some(binaural) = &mut self.binaural {
                 binaural.update(position, az, rate);
             }
@@ -574,7 +589,13 @@ impl Voice {
             gain: Glide::at(gain),
             pan: Glide::at(pan.clamp(-1.0, 1.0)),
             send: Glide::at(reverb),
-            lowpass: Lowpass::new(cutoff(lowpass, rate), rate),
+            lowpass: Lowpass::new(
+                cutoff(
+                    panner.map_or(lowpass, |p| lowpass.min(p.occlusion_lowpass(OPEN))),
+                    rate,
+                ),
+                rate,
+            ),
             fade,
             fade_out: 0.0,
             leaving: false,
@@ -623,8 +644,10 @@ impl Voice {
         let frames = &self.clip.frames;
         let length = self.clip.len();
         let end = length as f64;
-        // playbackRate is k-rate: its value at the quantum's start.
-        let step = f64::from(self.pitch.next(quantum_glide)) * self.clip.rate / rate;
+        // playbackRate is k-rate: its value at the quantum's start, modulated by physical Doppler shift.
+        let doppler = self.spatial.as_ref().map_or(1.0, |s| f64::from(s.doppler_ratio()));
+        let wet_scale = self.spatial.as_ref().map_or(1.0, Spatial::wet_scale);
+        let step = f64::from(self.pitch.next(quantum_glide)) * doppler * self.clip.rate / rate;
         let mono = self.clip.mono;
         // Frame `index` of a streamed clip, by its place in the stream.
         let (first, whole) = (self.first as u64, length as u64);
@@ -691,8 +714,9 @@ impl Voice {
             }
             dry[i][0] += out_left;
             dry[i][1] += out_right;
-            send[i][0] += out_left * reverb;
-            send[i][1] += out_right * reverb;
+            let rev = reverb * wet_scale;
+            send[i][0] += out_left * rev;
+            send[i][1] += out_right * rev;
         }
         if let Some(stream) = &mut self.stream {
             stream.end(self.passes * whole + self.position as u64 - first);
@@ -910,13 +934,19 @@ pub struct Mixer {
     /// The sample the next quantum starts at.
     now: u64,
     voices: Vec<Voice>,
+    synths: SynthEngine,
     buses: Vec<Bus>,
     reverb: Convolver,
+    reverb_outgoing: Option<Convolver>,
+    reverb_fade: f64,
+    reverb_fade_step: f64,
     reverb_decay: f32,
     reverb_damping: f32,
+    reverb_pending: Option<(f32, f32)>,
     master_in: [[f32; 2]; QUANTUM],
     reverb_in: [[f32; 2]; QUANTUM],
     reverb_out: [[f32; 2]; QUANTUM],
+    reverb_out_prev: [[f32; 2]; QUANTUM],
     out: [[f32; 2]; QUANTUM],
     /// How much of `out` has been handed out.
     taken: usize,
@@ -948,13 +978,19 @@ impl Mixer {
             quantum_glide: 1.0 - (-(QUANTUM as f64) / (GLIDE_SECONDS * rate)).exp(),
             now: 0,
             voices: Vec::with_capacity(1024),
+            synths: SynthEngine::new(),
             buses,
             reverb: Convolver::new(rate),
+            reverb_outgoing: None,
+            reverb_fade: 1.0,
+            reverb_fade_step: 1.0 / (0.25 * rate).max(1.0),
             reverb_decay: 0.0,
             reverb_damping: 0.0,
+            reverb_pending: None,
             master_in: [[0.0; 2]; QUANTUM],
             reverb_in: [[0.0; 2]; QUANTUM],
             reverb_out: [[0.0; 2]; QUANTUM],
+            reverb_out_prev: [[0.0; 2]; QUANTUM],
             out: [[0.0; 2]; QUANTUM],
             taken: QUANTUM,
             meters: [Meter::default(); MAX_BUSES],
@@ -967,9 +1003,9 @@ impl Mixer {
         self.rate
     }
 
-    /// Voices and sounds playing, those fading out included.
+    /// Voices, sounds, and active synth voices playing, those fading out included.
     pub fn playing(&self) -> usize {
-        self.voices.len()
+        self.voices.len() + self.synths.active_count()
     }
 
     /// Those of them streaming their clip.
@@ -1012,6 +1048,15 @@ impl Mixer {
         index
     }
 
+    fn start_reverb_transition(&mut self, decay: f32, damping: f32) {
+        let next = Convolver::with_room(self.rate, f64::from(decay), f64::from(damping));
+        let prev = std::mem::replace(&mut self.reverb, next);
+        self.reverb_outgoing = Some(prev);
+        self.reverb_fade = 0.0;
+        self.reverb_decay = decay;
+        self.reverb_damping = damping;
+    }
+
     /// A frame's sound, from the next quantum on: buses glide to theirs (those
     /// it lacks to plain), voices start, return, change or leave by id, and
     /// its sounds start.
@@ -1019,10 +1064,18 @@ impl Mixer {
         let (now, rate) = (self.now, self.rate);
         let decay = if mix.reverb_decay.is_finite() { mix.reverb_decay.max(0.0) } else { 0.0 };
         let damping = if mix.reverb_damping.is_finite() { mix.reverb_damping.clamp(0.0, 1.0) } else { 0.0 };
-        if (decay - self.reverb_decay).abs() > 1e-3 || (damping - self.reverb_damping).abs() > 1e-3 {
-            self.reverb = Convolver::with_room(rate, f64::from(decay), f64::from(damping));
-            self.reverb_decay = decay;
-            self.reverb_damping = damping;
+        // Quantized room hysteresis: avoids rebuilding IRs every frame while walking across a zone blend,
+        // and crossfades persistent convolvers smoothly so outgoing tails decay naturally without cuts.
+        let significant = (decay - self.reverb_decay).abs() > 0.08
+            || (damping - self.reverb_damping).abs() > 0.05
+            || ((decay > 0.0) != (self.reverb_decay > 0.0));
+        if significant {
+            if self.reverb_outgoing.is_none() {
+                self.start_reverb_transition(decay, damping);
+                self.reverb_pending = None;
+            } else {
+                self.reverb_pending = Some((decay, damping));
+            }
         }
         for (index, bus) in self.buses.iter_mut().enumerate() {
             let spec = mix.buses.get(index).copied();
@@ -1058,7 +1111,8 @@ impl Mixer {
                     voice.pan.set(spec.pan.clamp(-1.0, 1.0));
                     voice.pitch.set(spec.pitch.max(0.0));
                     voice.send.set(spec.reverb);
-                    voice.lowpass.cutoff.set(cutoff(spec.lowpass, rate));
+                    let eff_lp = spec.panner.map_or(spec.lowpass, |p| spec.lowpass.min(p.occlusion_lowpass(OPEN)));
+                    voice.lowpass.cutoff.set(cutoff(eff_lp, rate));
                     voice.looping = spec.looping;
                     voice.fade_out = spec.fade_out;
                     if voice.leaving {
@@ -1100,6 +1154,10 @@ impl Mixer {
             let sound = SoundSpec { bus, ..sound.clone() };
             self.voices.push(Voice::new(None, &sound, false, 0.0, 0.0, now, rate, &mut self.streams));
         }
+        for synth in &mix.synths {
+            let _ = self.bus(synth.bus);
+        }
+        self.synths.apply(&mix.synths);
     }
 
     /// The next quantum, into `out`.
@@ -1114,6 +1172,14 @@ impl Mixer {
             let bus = &mut self.buses[voice.bus];
             voice.render(now, rate, glide, self.quantum_glide, &mut bus.dry, &mut bus.send);
         }
+        let buses_ref = &mut self.buses;
+        self.synths.render(rate, QUANTUM, |bus_idx, i, l, r, rev| {
+            let bus = &mut buses_ref[bus_idx.min(MAX_BUSES - 1)];
+            bus.dry[i][0] += l;
+            bus.dry[i][1] += r;
+            bus.send[i][0] += l * rev;
+            bus.send[i][1] += r * rev;
+        });
         let end = now + QUANTUM as u64;
         self.voices.retain(|voice| !voice.gone(end));
         let prev_rms: [f64; MAX_BUSES] = std::array::from_fn(|i| self.buses[i].last_rms);
@@ -1150,6 +1216,31 @@ impl Mixer {
         }
         self.reverb_out = [[0.0; 2]; QUANTUM];
         self.reverb.process(&self.reverb_in, &mut self.reverb_out);
+        if let Some(outgoing) = &mut self.reverb_outgoing {
+            self.reverb_out_prev = [[0.0; 2]; QUANTUM];
+            let silence = [[0.0f32; 2]; QUANTUM];
+            outgoing.process(&silence, &mut self.reverb_out_prev);
+            for i in 0..QUANTUM {
+                let w_in = self.reverb_fade.clamp(0.0, 1.0) as f32;
+                let w_out = 1.0 - w_in;
+                self.reverb_out[i][0] = self.reverb_out[i][0] * w_in + self.reverb_out_prev[i][0] * w_out;
+                self.reverb_out[i][1] = self.reverb_out[i][1] * w_in + self.reverb_out_prev[i][1] * w_out;
+                self.reverb_fade = (self.reverb_fade + self.reverb_fade_step).min(1.0);
+            }
+            if self.reverb_fade >= 1.0 {
+                self.reverb_outgoing = None;
+                if let Some((d, damp)) = self.reverb_pending.take()
+                    && ((d - self.reverb_decay).abs() > 0.08 || (damp - self.reverb_damping).abs() > 0.05)
+                {
+                    let next = Convolver::with_room(rate, f64::from(d), f64::from(damp));
+                    let prev = std::mem::replace(&mut self.reverb, next);
+                    self.reverb_outgoing = Some(prev);
+                    self.reverb_fade = 0.0;
+                    self.reverb_decay = d;
+                    self.reverb_damping = damp;
+                }
+            }
+        }
         let master_sc = prev_rms[master.duck_bus];
         let mut master_sq = 0.0f64;
         for i in 0..QUANTUM {
@@ -1590,7 +1681,12 @@ mod tests {
         let frames = (0..120).map(|frame| {
             let side = if frame % 2 == 0 { 3.0 } else { -3.0 };
             let turn = if frame % 3 == 0 { 0.0 } else { 1.0f32 };
-            let ear = Ear { position: [0.0; 3], forward: [turn.sin(), 0.0, -turn.cos()], up: [0.0, 1.0, 0.0] };
+            let ear = Ear {
+                position: [0.0; 3],
+                forward: [turn.sin(), 0.0, -turn.cos()],
+                up: [0.0, 1.0, 0.0],
+                velocity: [0.0; 3],
+            };
             let mut spec = voice(1, &clip);
             spec.panner = Some(placed([side, 0.0, -1.0]).heard_from(&ear));
             Mix { voices: vec![spec], ..Mix::default() }
@@ -1635,6 +1731,7 @@ mod tests {
                     position: vector(&listener["position"]),
                     forward: vector(&listener["forward"]),
                     up: vector(&listener["up"]),
+                    velocity: [0.0; 3],
                 };
                 spec.panner = Some(
                     Placement::new(&pen_protocol::Panner {
@@ -1773,6 +1870,77 @@ mod tests {
             rms(&out[18_000..])
         };
         assert!(tail_rms(2.4) > tail_rms(0.25) * 3.0, "longer reverb decay must sustain late tail");
+    }
+
+    #[test]
+    fn doppler_occlusion_and_synths_render_accurately_through_mixer() {
+        let tone = sine(440.0, 2.0);
+        let ear = Ear::default();
+        let make_panner = |vx: f32, occlusion: f32| {
+            Placement::new(&pen_protocol::Panner {
+                voice: 1,
+                position: pen_protocol::Vector { x: 10.0, y: 0.0, z: 0.0 },
+                velocity: pen_protocol::Vector { x: vx, y: 0.0, z: 0.0 },
+                doppler: 1.0,
+                occlusion,
+                ref_distance: 10.0,
+                max_distance: 100.0,
+                rolloff: 1.0,
+                ..pen_protocol::Panner::default()
+            })
+            .heard_from(&ear)
+        };
+        let measure_freq = |vx: f32| -> usize {
+            let mut v = voice(1, &tone);
+            v.panner = Some(make_panner(vx, 0.0));
+            let mut m = Mixer::new(RATE);
+            let out = play(&mut m, (0..10).map(|_| Mix { voices: vec![v.clone()], buses: vec![MASTER], ..Mix::default() }));
+            let seg = &out[1600..6400]; // 0.1 s
+            seg.windows(2).filter(|w| w[0][1] <= 0.0 && w[1][1] > 0.0).count()
+        };
+        let f_still = measure_freq(0.0);
+        let f_approach = measure_freq(-68.6); // 0.2c approaching -> +25% pitch (~550 Hz)
+        let f_recede = measure_freq(68.6); // 0.2c receding -> -16.7% pitch (~367 Hz)
+        assert!(f_approach > f_still + 5, "approaching must raise pitch: {f_approach} vs {f_still}");
+        assert!(f_recede + 4 < f_still, "receding must lower pitch: {f_recede} vs {f_still}");
+
+        // Occlusion reduces both overall level and high-frequency content on a 3 kHz tone.
+        let high = sine(3000.0, 1.0);
+        let level_for_occ = |occ: f32| -> f64 {
+            let mut v = voice(1, &high);
+            v.panner = Some(make_panner(0.0, occ));
+            let mut m = Mixer::new(RATE);
+            let out = play(&mut m, (0..8).map(|_| Mix { voices: vec![v.clone()], buses: vec![MASTER], ..Mix::default() }));
+            rms(&out[1600..])
+        };
+        assert!(level_for_occ(0.0) > level_for_occ(0.85) * 4.0, "occlusion must attenuate & lowpass 3 kHz source");
+
+        // Procedural & granular synths render through bus meters and release cleanly.
+        let mut synth_mixer = Mixer::new(RATE);
+        let synth_spec = SynthSpec::from_wire(&pen_protocol::SynthVoice {
+            id: 50,
+            mode: 5, // Granular
+            bus: 1,
+            frequency: 300.0,
+            gain: 0.6,
+            pan: 0.0,
+            detune: 20.0,
+            attack: 0.005,
+            decay: 0.02,
+            sustain: 0.8,
+            release: 0.02,
+            cutoff: 4000.0,
+            resonance: 1.0,
+            grain_size: 0.05,
+            grain_pitch: 1.0,
+            reverb: 0.2,
+        });
+        let out = play(
+            &mut synth_mixer,
+            (0..8).map(|_| Mix { synths: vec![synth_spec], buses: vec![MASTER, PLAIN], ..Mix::default() }),
+        );
+        assert!(rms(&out[1600..]) > 0.02, "granular synth must produce audible output");
+        assert!(synth_mixer.take_meters().0[1].rms()[0] > 0.01, "synth must meter on its target bus");
     }
 
     /// A calibration scenario, for comparing with WebAudio playing the same

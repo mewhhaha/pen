@@ -305,6 +305,16 @@
       "doc": "The most panners one frame may declare: one for each voice and sound it may have."
     },
     {
+      "limit": "MAX_REVERB_ZONES",
+      "value": 32,
+      "doc": "The most spatial reverb zones and acoustic portals one frame may declare."
+    },
+    {
+      "limit": "MAX_SYNTHS",
+      "value": 64,
+      "doc": "The most procedural or granular DSP synth voices one frame may declare."
+    },
+    {
       "limit": "MAX_INSTANCES",
       "value": 100000
     },
@@ -2594,6 +2604,16 @@
         "kind": "size",
         "section": "haptics",
         "of": "count"
+      },
+      "reverb_zone_count": {
+        "kind": "size",
+        "section": "reverb_zones",
+        "of": "count"
+      },
+      "synth_count": {
+        "kind": "size",
+        "section": "synths",
+        "of": "count"
       }
     },
     "sections": [
@@ -3923,6 +3943,18 @@
                 ]
               },
               "doc": "Its up, which with `forward` tells left from right."
+            },
+            "velocity": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "World-space listener velocity in world units per second, for Doppler pitch shifting."
             }
           },
           "doc": "A listener: where it is, the way it faces and its up, in world units."
@@ -4005,6 +4037,31 @@
             "hrtf": {
               "kind": "flag",
               "doc": "Enable HRTF binaural spatialization (ITD delay and head-shadowing ILD natively, PanningModelType::Hrtf in WebAudio) instead of equal-power panning."
+            },
+            "velocity": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "World-space source velocity in world units per second, for Doppler pitch shifting."
+            },
+            "doppler": {
+              "kind": "f32",
+              "doc": "Doppler pitch shift multiplier (0 disables, 1 uses physical speed of sound 343 m/s)."
+            },
+            "occlusion": {
+              "kind": "f32",
+              "doc": "Direct-path acoustic occlusion in 0..1 (0 open, 1 fully muffled by lowpass and direct gain attenuation)."
+            },
+            "zone": {
+              "kind": "count",
+              "max": 64,
+              "doc": "Optional acoustic reverb zone ID (0 auto-detects from world position against reverb_zones)."
             }
           },
           "doc": "Where a voice or sound is, as a PannerNode places it: from the listener, equal-power panned by its azimuth (in place of its pan), and quieted by its distance model and its cone. Positions and orientations glide as gains do (AUDIO_GLIDE_MS); the rest change at once. A voice that gains or loses its panner starts afresh, as one whose bus changed; a panner that places nothing is ignored, and of two for one voice or sound hosts take the first."
@@ -4283,6 +4340,160 @@
           "limit": "MAX_HAPTICS",
           "value": 32,
           "doc": "The most gamepad haptic rumble commands one frame may declare."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "reverb_zones",
+        "doc": "Spatial acoustic reverb zones and room portals blended smoothly around the listener.",
+        "record": {
+          "name": "ReverbZone",
+          "constant": "REVERB_ZONE",
+          "fields": {
+            "id": {
+              "kind": "count",
+              "max": 64,
+              "doc": "Zone identifier (1..64; 0 matches unzoned space)."
+            },
+            "position": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "World-space AABB center of the acoustic zone."
+            },
+            "half_extents": {
+              "kind": "vector",
+              "type": {
+                "name": "Vector",
+                "components": [
+                  "x",
+                  "y",
+                  "z"
+                ]
+              },
+              "doc": "World-space half extents of the zone box."
+            },
+            "blend": {
+              "kind": "f32",
+              "doc": "Outer transition distance in world units for smooth room blending."
+            },
+            "decay": {
+              "kind": "f32",
+              "doc": "RT60 reverb decay time in seconds for this zone."
+            },
+            "damping": {
+              "kind": "f32",
+              "doc": "High-frequency reverb damping in 0..1 for this zone."
+            },
+            "wet": {
+              "kind": "f32",
+              "doc": "Reverb send wet multiplier for sources inside this zone (0 defaults to 1)."
+            },
+            "portal_attenuation": {
+              "kind": "f32",
+              "doc": "Extra acoustic occlusion in 0..1 applied across room boundaries/portals when source and listener occupy different zones."
+            }
+          },
+          "doc": "One spatial acoustic reverb zone and portal boundary."
+        },
+        "max": {
+          "limit": "MAX_REVERB_ZONES",
+          "value": 32,
+          "doc": "The most spatial reverb zones and acoustic portals one frame may declare."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "synths",
+        "doc": "Real-time procedural and granular DSP synthesizer voices mixed alongside clip voices.",
+        "record": {
+          "name": "SynthVoice",
+          "constant": "SYNTH_VOICE",
+          "fields": {
+            "id": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_VOICE_ID",
+                "value": 16777215,
+                "doc": "Voice ids are whole numbers from 1 to this, the wire's exact-integer range."
+              },
+              "doc": "Persistent synth voice identifier."
+            },
+            "mode": {
+              "kind": "count",
+              "max": 5,
+              "doc": "Oscillator/synth mode: 0 Sine, 1 Saw, 2 Square, 3 Triangle, 4 Noise, 5 Granular cloud."
+            },
+            "bus": {
+              "kind": "count",
+              "max": 15,
+              "doc": "Target mixer bus index (0..MAX_BUSES-1)."
+            },
+            "frequency": {
+              "kind": "f32",
+              "doc": "Base oscillator frequency in Hz (or grain carrier frequency in granular mode)."
+            },
+            "gain": {
+              "kind": "f32",
+              "doc": "Linear output gain."
+            },
+            "pan": {
+              "kind": "f32",
+              "doc": "Stereo pan in -1..1."
+            },
+            "detune": {
+              "kind": "f32",
+              "doc": "Pitch detune in cents (or granular pitch jitter spread in cents)."
+            },
+            "attack": {
+              "kind": "f32",
+              "doc": "ADSR envelope attack time in seconds."
+            },
+            "decay": {
+              "kind": "f32",
+              "doc": "ADSR envelope decay time in seconds."
+            },
+            "sustain": {
+              "kind": "f32",
+              "doc": "ADSR envelope sustain level in 0..1."
+            },
+            "release": {
+              "kind": "f32",
+              "doc": "ADSR envelope release time in seconds when the voice leaves the frame."
+            },
+            "cutoff": {
+              "kind": "f32",
+              "doc": "Resonant lowpass filter cutoff frequency in Hz."
+            },
+            "resonance": {
+              "kind": "f32",
+              "doc": "Resonant lowpass filter Q factor (0.5..20)."
+            },
+            "grain_size": {
+              "kind": "f32",
+              "doc": "Granular window duration in seconds (used in Granular mode)."
+            },
+            "grain_pitch": {
+              "kind": "f32",
+              "doc": "Granular harmonic/playback pitch multiplier (used in Granular mode)."
+            },
+            "reverb": {
+              "kind": "f32",
+              "doc": "Reverb send level."
+            }
+          },
+          "doc": "One real-time procedural or granular DSP synthesizer voice."
+        },
+        "max": {
+          "limit": "MAX_SYNTHS",
+          "value": 64,
+          "doc": "The most procedural or granular DSP synth voices one frame may declare."
         }
       },
       {

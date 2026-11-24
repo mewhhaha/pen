@@ -52,6 +52,102 @@ impl Drop for Decoder {
     }
 }
 
+/// Real-time VoIP mono Opus encoder at 48 kHz (wrapping vendored libopus).
+#[allow(dead_code, reason = "voice chat codec API wired through runtime voice transport")]
+pub struct VoiceEncoder(*mut sys::OpusEncoder);
+
+// SAFETY: encoder state is plain memory accessed exclusively through `&mut self`.
+unsafe impl Send for VoiceEncoder {}
+
+#[allow(dead_code, reason = "voice chat codec API wired through runtime voice transport")]
+impl VoiceEncoder {
+    pub fn new_voip(bitrate_bps: i32) -> Result<Self> {
+        let mut error = 0;
+        // SAFETY: valid 48 kHz mono VoIP application; libopus returns null and sets error on failure.
+        let state = unsafe { sys::opus_encoder_create(RATE, 1, sys::OPUS_APPLICATION_VOIP as i32, &mut error) };
+        ensure!(!state.is_null() && error == sys::OPUS_OK, "creating an Opus VoIP encoder failed ({error})");
+        let mut enc = Self(state);
+        enc.set_bitrate(bitrate_bps)?;
+        enc.set_inband_fec(true)?;
+        Ok(enc)
+    }
+
+    pub fn set_bitrate(&mut self, bps: i32) -> Result<()> {
+        let bps = bps.clamp(6_000, 128_000);
+        // SAFETY: `self.0` is a live OpusEncoder; OPUS_SET_BITRATE_REQUEST takes one i32 vararg.
+        let err = unsafe { sys::opus_encoder_ctl(self.0, sys::OPUS_SET_BITRATE_REQUEST as i32, bps) };
+        ensure!(err == sys::OPUS_OK, "OPUS_SET_BITRATE failed ({err})");
+        Ok(())
+    }
+
+    pub fn set_inband_fec(&mut self, enabled: bool) -> Result<()> {
+        let val: i32 = i32::from(enabled);
+        // SAFETY: `self.0` is a live OpusEncoder; OPUS_SET_INBAND_FEC_REQUEST takes one i32 vararg.
+        let err = unsafe { sys::opus_encoder_ctl(self.0, sys::OPUS_SET_INBAND_FEC_REQUEST as i32, val) };
+        ensure!(err == sys::OPUS_OK, "OPUS_SET_INBAND_FEC failed ({err})");
+        Ok(())
+    }
+
+    pub fn set_dtx(&mut self, enabled: bool) -> Result<()> {
+        let val: i32 = i32::from(enabled);
+        // SAFETY: `self.0` is a live OpusEncoder; OPUS_SET_DTX_REQUEST takes one i32 vararg.
+        let err = unsafe { sys::opus_encoder_ctl(self.0, sys::OPUS_SET_DTX_REQUEST as i32, val) };
+        ensure!(err == sys::OPUS_OK, "OPUS_SET_DTX failed ({err})");
+        Ok(())
+    }
+
+    /// Encodes one 20 ms mono 48 kHz PCM frame (960 samples) into a non-empty Opus VoIP packet.
+    pub fn encode_frame(&mut self, pcm: &[f32]) -> Result<Vec<u8>> {
+        ensure!(
+            pcm.len() == pen_runtime::voice::VOICE_FRAME_SAMPLES,
+            "Opus VoIP frame length must be {} samples (20 ms at 48 kHz), got {}",
+            pen_runtime::voice::VOICE_FRAME_SAMPLES,
+            pcm.len()
+        );
+        let mut out = vec![0u8; pen_runtime::voice::MAX_OPUS_PAYLOAD];
+        let frame_size = i32::try_from(pcm.len())?;
+        let max_bytes = i32::try_from(out.len())?;
+        // SAFETY: `pcm` has `frame_size` mono floats and `out` holds `max_bytes` bytes.
+        let len = unsafe { sys::opus_encode_float(self.0, pcm.as_ptr(), frame_size, out.as_mut_ptr(), max_bytes) };
+        let len = usize::try_from(len).ok().with_context(|| format!("encoding Opus VoIP frame failed ({len})"))?;
+        out.truncate(len);
+        Ok(out)
+    }
+}
+
+impl Drop for VoiceEncoder {
+    fn drop(&mut self) {
+        // SAFETY: created by opus_encoder_create and freed once.
+        unsafe { sys::opus_encoder_destroy(self.0) }
+    }
+}
+
+/// Real-time VoIP mono Opus decoder with Packet Loss Concealment (PLC).
+#[allow(dead_code, reason = "voice chat codec API wired through runtime voice transport")]
+pub struct VoiceDecoder(Decoder);
+
+#[allow(dead_code, reason = "voice chat codec API wired through runtime voice transport")]
+impl VoiceDecoder {
+    pub fn new_mono() -> Result<Self> {
+        Ok(Self(Decoder::new(1)?))
+    }
+
+    /// Decodes one non-empty incoming Opus packet into `out` (returns decoded sample count).
+    /// Empty packets are rejected so PLC is only invoked explicitly via [`Self::conceal_loss`].
+    pub fn decode_frame(&mut self, packet: &[u8], out: &mut [f32]) -> Result<usize> {
+        ensure!(!packet.is_empty(), "empty Opus packet passed to decode_frame; call conceal_loss for PLC");
+        self.0.decode(packet, out, 1)
+    }
+
+    /// Generates `frame_samples` of Packet Loss Concealment audio when a packet was dropped.
+    pub fn conceal_loss(&mut self, out: &mut [f32]) -> Result<usize> {
+        let frames = i32::try_from(out.len())?;
+        // SAFETY: libopus accepts a null packet pointer with length 0 to invoke PLC for `frames` samples.
+        let count = unsafe { sys::opus_decode_float(self.0.0, std::ptr::null(), 0, out.as_mut_ptr(), frames, 0) };
+        usize::try_from(count).ok().with_context(|| format!("Opus PLC failed ({count})"))
+    }
+}
+
 pub fn is_ogg_opus(bytes: &[u8]) -> bool {
     bytes.starts_with(b"OggS") && bytes.windows(8).take(256).any(|window| window == b"OpusHead")
 }
@@ -213,6 +309,70 @@ mod tests {
             let snr = 10.0 * (signal / noise).log10();
             assert!(snr > 30.0, "side {side}: {snr:.1} dB");
         }
+    }
+
+    #[test]
+    fn voip_voice_chat_pipeline_encodes_reorders_conceals_loss_and_decodes() {
+        use pen_runtime::voice::{
+            FLAG_SPEAKING, JitterBuffer, PopAction, VOICE_FRAME_SAMPLES, VoiceActivityDetector, VoicePacket,
+            decode_packet, encode_packet,
+        };
+        let mut vad = VoiceActivityDetector::default();
+        let mut enc = super::VoiceEncoder::new_voip(32_000).unwrap();
+        enc.set_dtx(false).unwrap();
+        let mut dec = super::VoiceDecoder::new_mono().unwrap();
+        let mut jb = JitterBuffer::new(2);
+
+        // Generate 8 frames (160 ms) of a 350 Hz speech-band tone.
+        let mut packets = Vec::new();
+        for f in 0..8u16 {
+            let pcm: Vec<f32> = (0..VOICE_FRAME_SAMPLES)
+                .map(|i| {
+                    let t = (usize::from(f) * VOICE_FRAME_SAMPLES + i) as f32 / 48_000.0;
+                    0.35 * (std::f32::consts::TAU * 350.0 * t).sin()
+                })
+                .collect();
+            assert!(vad.analyze(&pcm), "frame {f} must trigger VAD");
+            let payload = enc.encode_frame(&pcm).unwrap();
+            assert!(!payload.is_empty());
+            let wire = encode_packet(&VoicePacket {
+                speaker_id: 11,
+                seq: f,
+                timestamp: u32::from(f) * VOICE_FRAME_SAMPLES as u32,
+                flags: FLAG_SPEAKING,
+                payload,
+            })
+            .unwrap();
+            packets.push(decode_packet(&wire).unwrap());
+        }
+        // Deliver out-of-order and drop packet #4 to exercise JitterBuffer reorder + Opus PLC.
+        for &idx in &[1usize, 0, 3, 2, 5, 6, 7] {
+            let p = &packets[idx];
+            jb.push(p.seq, p.payload.clone());
+        }
+        let mut pcm_out = vec![0.0f32; VOICE_FRAME_SAMPLES];
+        let mut played = 0usize;
+        let mut concealed = 0usize;
+        for _ in 0..8 {
+            match jb.pop() {
+                PopAction::Play(data) => {
+                    let n = dec.decode_frame(&data, &mut pcm_out).unwrap();
+                    assert_eq!(n, VOICE_FRAME_SAMPLES);
+                    assert!(pcm_out.iter().all(|v| v.is_finite()));
+                    played += 1;
+                }
+                PopAction::Conceal => {
+                    let n = dec.conceal_loss(&mut pcm_out).unwrap();
+                    assert_eq!(n, VOICE_FRAME_SAMPLES);
+                    assert!(pcm_out.iter().all(|v| v.is_finite()));
+                    let rms = (pcm_out.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / n as f64).sqrt();
+                    assert!(rms > 0.02, "PLC must synthesize continuous signal, got rms={rms}");
+                    concealed += 1;
+                }
+                PopAction::Silence => {}
+            }
+        }
+        assert_eq!((played, concealed), (7, 1));
     }
 
     /// Writes the bundle's music as raw f32 stereo, for comparing with ffmpeg.

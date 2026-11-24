@@ -54,16 +54,18 @@ fn degrees(radians: f64) -> f64 {
     radians.to_degrees()
 }
 
-/// The listener: where it is, the way it faces and its up.
+/// The listener: where it is, the way it faces, its up, and its velocity.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Ear {
     pub position: Vec3,
     pub forward: Vec3,
     pub up: Vec3,
+    pub velocity: Vec3,
 }
 
 /// WebAudio's AudioListener as it starts: at the origin, facing -z, up +y.
-pub const DEFAULT_EAR: Ear = Ear { position: [0.0; 3], forward: [0.0, 0.0, -1.0], up: [0.0, 1.0, 0.0] };
+pub const DEFAULT_EAR: Ear =
+    Ear { position: [0.0; 3], forward: [0.0, 0.0, -1.0], up: [0.0, 1.0, 0.0], velocity: [0.0; 3] };
 
 impl Default for Ear {
     fn default() -> Ear {
@@ -75,6 +77,17 @@ fn vec3(vector: Vector) -> Vec3 {
     [vector.x, vector.y, vector.z]
 }
 
+fn finite_vec3(v: Vec3) -> Vec3 {
+    [
+        if v[0].is_finite() { v[0] } else { 0.0 },
+        if v[1].is_finite() { v[1] } else { 0.0 },
+        if v[2].is_finite() { v[2] } else { 0.0 },
+    ]
+}
+
+/// Speed of sound in air at 20 °C, in meters per second.
+pub const SPEED_OF_SOUND: f64 = 343.0;
+
 impl Ear {
     /// The frame's listener, or with none the camera that `view` (a
     /// column-major world-to-camera matrix) looks through: at its eye,
@@ -82,7 +95,12 @@ impl Ear {
     /// its axes is undone first.
     pub fn of_frame(listener: Option<&Listener>, view: &Matrix) -> Ear {
         if let Some(listener) = listener {
-            return Ear { position: vec3(listener.position), forward: vec3(listener.forward), up: vec3(listener.up) };
+            return Ear {
+                position: vec3(listener.position),
+                forward: vec3(listener.forward),
+                up: vec3(listener.up),
+                velocity: finite_vec3(vec3(listener.velocity)),
+            };
         }
         let column = |index: usize| [view[index * 4], view[index * 4 + 1], view[index * 4 + 2]];
         let translation = column(3);
@@ -94,7 +112,7 @@ impl Ear {
         // The rows of the view's rotation: the camera's right, up and back.
         let row = |index: usize| [view[index], view[4 + index], view[8 + index]];
         let back = row(2);
-        Ear { position: eye, forward: [-back[0], -back[1], -back[2]], up: row(1) }
+        Ear { position: eye, forward: [-back[0], -back[1], -back[2]], up: row(1), velocity: [0.0; 3] }
     }
 }
 
@@ -105,6 +123,8 @@ impl Ear {
 pub struct Placement {
     pub position: Vec3,
     pub orientation: Vec3,
+    pub velocity: Vec3,
+    pub ear_velocity: Vec3,
     pub distance_model: u32,
     pub ref_distance: f64,
     pub max_distance: f64,
@@ -113,6 +133,11 @@ pub struct Placement {
     pub cone_outer: f64,
     pub cone_outer_gain: f64,
     pub hrtf: bool,
+    pub doppler: f64,
+    pub occlusion: f64,
+    pub portal_occlusion: f64,
+    pub zone: u32,
+    pub wet_scale: f32,
 }
 
 /// A value the browser's setter would take, else `otherwise`.
@@ -129,6 +154,8 @@ impl Placement {
         Placement {
             position: vec3(panner.position),
             orientation: vec3(panner.orientation),
+            velocity: finite_vec3(vec3(panner.velocity)),
+            ear_velocity: [0.0; 3],
             distance_model: if panner.distance_model <= distance_model::EXPONENTIAL {
                 panner.distance_model
             } else {
@@ -141,6 +168,11 @@ impl Placement {
             cone_outer: finite(panner.cone_outer, 360.0),
             cone_outer_gain: finite(panner.cone_outer_gain, 0.0).clamp(0.0, 1.0),
             hrtf: panner.hrtf,
+            doppler: finite(panner.doppler, 0.0).clamp(0.0, 4.0),
+            occlusion: finite(panner.occlusion, 0.0).clamp(0.0, 1.0),
+            portal_occlusion: 0.0,
+            zone: panner.zone,
+            wet_scale: 1.0,
         }
     }
 
@@ -187,15 +219,69 @@ impl Placement {
         }
     }
 
-    /// Its position and orientation as `ear` has them: relative to it,
-    /// along its right, up and back, which is where WebAudio's default
+    /// Its position, orientation, and velocities as `ear` has them: relative to
+    /// it, along its right, up and back, which is where WebAudio's default
     /// listener hears it as `ear` would.
     pub fn heard_from(self, ear: &Ear) -> Placement {
         let right = normalize(cross(ear.forward, ear.up));
         let forward = normalize(ear.forward);
         let up = cross(right, forward);
         let local = |vector: Vec3| [dot(vector, right), dot(vector, up), -dot(vector, forward)];
-        Placement { position: local(sub(self.position, ear.position)), orientation: local(self.orientation), ..self }
+        Placement {
+            position: local(sub(self.position, ear.position)),
+            orientation: local(self.orientation),
+            velocity: local(self.velocity),
+            ear_velocity: local(ear.velocity),
+            ..self
+        }
+    }
+
+    /// Physical Doppler pitch ratio `(c + v_l) / (c + v_s)` at listener-relative
+    /// `position` (where `ear` is at the origin), clamped safely against supersonic
+    /// singularities. Returns `1.0` when `doppler <= 0.0` or stationary.
+    pub fn doppler_ratio(&self, position: Vec3) -> f32 {
+        if self.doppler <= 0.0 || (is_zero(self.velocity) && is_zero(self.ear_velocity)) {
+            return 1.0;
+        }
+        let dist = length(position);
+        if dist < 1e-5 {
+            return 1.0;
+        }
+        // Unit vector pointing from listener (origin) toward source.
+        let ux = f64::from(position[0]) / dist;
+        let uy = f64::from(position[1]) / dist;
+        let uz = f64::from(position[2]) / dist;
+        let v_l = f64::from(self.ear_velocity[0]) * ux
+            + f64::from(self.ear_velocity[1]) * uy
+            + f64::from(self.ear_velocity[2]) * uz;
+        let v_s = f64::from(self.velocity[0]) * ux
+            + f64::from(self.velocity[1]) * uy
+            + f64::from(self.velocity[2]) * uz;
+        let max_v = 0.9 * SPEED_OF_SOUND;
+        let vl_eff = (v_l * self.doppler).clamp(-max_v, max_v);
+        let vs_eff = (v_s * self.doppler).clamp(-max_v, max_v);
+        ((SPEED_OF_SOUND + vl_eff) / (SPEED_OF_SOUND + vs_eff)).clamp(0.25, 4.0) as f32
+    }
+
+    /// Combined direct-path + cross-zone acoustic portal occlusion in `0..=1`.
+    pub fn effective_occlusion(&self) -> f64 {
+        let a = self.occlusion.clamp(0.0, 1.0);
+        let b = self.portal_occlusion.clamp(0.0, 1.0);
+        (1.0 - (1.0 - a) * (1.0 - b)).clamp(0.0, 1.0)
+    }
+
+    /// Direct-path linear gain multiplier due to occlusion (`1.0` open -> `0.15` fully occluded).
+    pub fn occlusion_gain(&self) -> f32 {
+        (1.0 - 0.85 * self.effective_occlusion()) as f32
+    }
+
+    /// Lowpass cutoff ceiling in Hz due to occlusion (`open_hz` open -> `400 Hz` fully occluded).
+    pub fn occlusion_lowpass(&self, open_hz: f32) -> f32 {
+        let occ = self.effective_occlusion();
+        if occ <= 1e-4 {
+            return open_hz;
+        }
+        (20_000.0 * (400.0 / 20_000.0f64).powf(occ)).min(f64::from(open_hz)) as f32
     }
 
     /// The distance and cone gains together, for a source at `position`
@@ -208,18 +294,50 @@ impl Placement {
 
 /// A frame's panners by what they place, in its listener's frame: the first
 /// for each voice id, and for each sound by its place in the frame's
-/// `sounds`.
-#[derive(Debug, Default)]
+/// `sounds`, plus the listener's blended [`crate::reverb::ZoneMix`].
+#[derive(Debug)]
 pub struct Placements {
     voices: HashMap<u32, Placement>,
     sounds: Vec<Option<Placement>>,
+    zone_mix: crate::reverb::ZoneMix,
+}
+
+impl Default for Placements {
+    fn default() -> Self {
+        Self {
+            voices: HashMap::new(),
+            sounds: Vec::new(),
+            zone_mix: crate::reverb::ZoneMix { decay: 0.0, damping: 0.0, wet_scale: 1.0, dominant_zone: 0 },
+        }
+    }
 }
 
 impl Placements {
     pub fn of(frame: &RenderFrame) -> Placements {
         let ear = Ear::of_frame(frame.listener.first(), &frame.view);
-        let placed = |panner: &Panner| Placement::new(panner).heard_from(&ear);
-        let mut placements = Placements { voices: HashMap::new(), sounds: vec![None; frame.sounds.len()] };
+        let zone_mix = crate::reverb::blend_zones(
+            ear.position,
+            frame.reverb.decay,
+            frame.reverb.damping,
+            &frame.reverb_zones,
+        );
+        let placed = |panner: &Panner| {
+            let mut p = Placement::new(panner);
+            let (portal, wet_scale) = crate::reverb::source_zone_acoustics(
+                p.position,
+                p.zone,
+                ear.position,
+                &frame.reverb_zones,
+            );
+            p.portal_occlusion = f64::from(portal);
+            p.wet_scale = wet_scale;
+            p.heard_from(&ear)
+        };
+        let mut placements = Placements {
+            voices: HashMap::new(),
+            sounds: vec![None; frame.sounds.len()],
+            zone_mix,
+        };
         for panner in &frame.panners {
             if panner.voice != 0 {
                 placements.voices.entry(panner.voice).or_insert_with(|| placed(panner));
@@ -228,6 +346,10 @@ impl Placements {
             }
         }
         placements
+    }
+
+    pub fn zone_mix(&self) -> crate::reverb::ZoneMix {
+        self.zone_mix
     }
 
     pub fn voice(&self, id: u32) -> Option<Placement> {
@@ -328,7 +450,7 @@ mod tests {
         assert!(close(azimuth([1.0, 7.0, -1.0], &ear), 45.0));
         assert_eq!(azimuth([0.0; 3], &ear), 0.0);
         // A listener turned to face +x hears +x ahead and -z on its left.
-        let turned = Ear { position: [0.0; 3], forward: [1.0, 0.0, 0.0], up: [0.0, 1.0, 0.0] };
+        let turned = Ear { position: [0.0; 3], forward: [1.0, 0.0, 0.0], up: [0.0, 1.0, 0.0], velocity: [0.0; 3] };
         assert!(close(azimuth([3.0, 0.0, 0.0], &turned), 0.0));
         assert!(close(azimuth([0.0, 0.0, -3.0], &turned), -90.0));
     }
@@ -426,6 +548,7 @@ mod tests {
                 position: Vector { x: 0.0, y: 0.0, z: 0.0 },
                 forward: Vector { x: 0.0, y: 0.0, z: -1.0 },
                 up: Vector { x: 0.0, y: 1.0, z: 0.0 },
+                velocity: Vector { x: 0.0, y: 0.0, z: 0.0 },
             }],
             panners: vec![
                 Panner { voice: 7, position: at(1.0), ..Panner::default() },
@@ -449,7 +572,7 @@ mod tests {
     /// the same azimuth, distance and cone.
     #[test]
     fn placing_in_the_listeners_frame_changes_nothing_heard() {
-        let ear = Ear { position: [2.0, -1.0, 5.0], forward: [0.6, 0.0, 0.8], up: [0.0, 1.0, 0.0] };
+        let ear = Ear { position: [2.0, -1.0, 5.0], forward: [0.6, 0.0, 0.8], up: [0.0, 1.0, 0.0], velocity: [0.0; 3] };
         let placement = Placement {
             position: [-3.0, 2.0, 1.0],
             orientation: [0.0, 0.0, 1.0],
@@ -483,7 +606,34 @@ mod tests {
             position: Vector { x: 4.0, y: 5.0, z: 6.0 },
             forward: Vector { x: 0.0, y: 0.0, z: 1.0 },
             up: Vector { x: 0.0, y: 1.0, z: 0.0 },
+            velocity: Vector { x: 0.0, y: 0.0, z: 0.0 },
         };
         assert_eq!(Ear::of_frame(Some(&listener), &view).position, [4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn doppler_and_occlusion_follow_physical_laws() {
+        let ear = Ear { position: [0.0; 3], forward: [0.0, 0.0, -1.0], up: [0.0, 1.0, 0.0], velocity: [0.0; 3] };
+        let approaching = Placement::new(&Panner {
+            position: Vector { x: 10.0, y: 0.0, z: 0.0 },
+            velocity: Vector { x: -34.3, y: 0.0, z: 0.0 },
+            doppler: 1.0,
+            occlusion: 0.5,
+            ..Panner::default()
+        })
+        .heard_from(&ear);
+        // Source approaching at 0.1c -> ratio = 1 / (1 - 0.1) = 10/9.
+        assert!((approaching.doppler_ratio(approaching.position) - (10.0 / 9.0)).abs() < 1e-4);
+        // Receding at 0.1c -> ratio = 1 / 1.1.
+        let receding = Placement { velocity: [34.3, 0.0, 0.0], ..approaching };
+        assert!((receding.doppler_ratio(receding.position) - (1.0 / 1.1)).abs() < 1e-4);
+        // Supersonic velocity stays finite and bounded.
+        let supersonic = Placement { velocity: [-10_000.0, 0.0, 0.0], ..approaching };
+        let r = supersonic.doppler_ratio(supersonic.position);
+        assert!(r.is_finite() && (0.25..=4.0).contains(&r));
+        // Occlusion = 0.5 attenuates direct gain and lowers cutoff below 3.5 kHz.
+        assert!((approaching.occlusion_gain() - 0.575).abs() < 1e-4);
+        let lp = approaching.occlusion_lowpass(24_000.0);
+        assert!(lp > 2000.0 && lp < 3500.0, "expected ~2828 Hz, got {lp}");
     }
 }

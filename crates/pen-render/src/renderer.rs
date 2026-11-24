@@ -354,6 +354,8 @@ enum TextureRef {
     Slot(usize),
     /// A field, by its index in `fields`.
     Field(usize),
+    /// A live GPU-converted video texture, by its index in `videos`.
+    Video(usize),
     White,
     FlatNormal,
     Transparent,
@@ -760,6 +762,9 @@ pub(crate) struct State {
     // its draws read at binding 3; a new one reads zero until patches arrive.
     fields: Vec<(String, TextureAsset, fields::FieldShadow)>,
     field_ids: HashMap<String, usize>,
+    // Live GPU-converted YUV420p video textures keyed by material texture name.
+    videos: Vec<(String, TextureAsset, crate::video::VideoTexture)>,
+    video_ids: HashMap<String, usize>,
     next_view_id: u64,
     // Packed textures still bringing their first levels; published textures
     // still streaming the rest in, and those whose detail is still settling.
@@ -1134,6 +1139,8 @@ impl State {
             checker,
             fields: Vec::new(),
             field_ids: HashMap::new(),
+            videos: Vec::new(),
+            video_ids: HashMap::new(),
             next_view_id: 5,
             pending: Vec::new(),
             checking: Vec::new(),
@@ -1200,6 +1207,53 @@ impl State {
 
     pub fn frame_budget(&mut self, milliseconds: Option<f32>) {
         self.resolution.set_budget(milliseconds);
+    }
+
+    pub fn upload_video_frame(&mut self, key: &str, frame: &crate::video::Yuv420Frame) -> Result<()> {
+        let max_dim = self.device.limits().max_texture_dimension_2d;
+        frame.validate(max_dim)?;
+        let found = self.video_ids.get(key).copied();
+        let needs_new = !matches!(found, Some(idx) if self.videos[idx].2.size() == (frame.width, frame.height));
+        if needs_new {
+            // Construct and upload into the new VideoTexture BEFORE swapping so an error
+            // never invalidates a working texture.
+            let video = crate::video::VideoTexture::new(&self.device, frame.width, frame.height)?;
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("video_upload"),
+            });
+            video.upload_and_convert(&self.queue, &mut encoder, frame)?;
+            self.queue.submit(Some(encoder.finish()));
+            let id = self.view_id();
+            let texture = video.texture().clone();
+            // Materials sample `view` via `Rgba8UnormSrgb` so display-referred YUV video
+            // linearizes properly under PBR lighting & sRGB present encoding.
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+                ..Default::default()
+            });
+            let linear = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let asset = TextureAsset { texture, view, linear, view_id: id, resident: 0, shown: 0.0, seen: false, stream: None };
+            match found {
+                Some(index) => {
+                    let old = std::mem::replace(&mut self.videos[index].1, asset);
+                    self.videos[index].2 = video;
+                    self.forget_views(old.view_id);
+                }
+                None => {
+                    let idx = self.videos.len();
+                    self.videos.push((key.to_owned(), asset, video));
+                    self.video_ids.insert(key.to_owned(), idx);
+                }
+            }
+            return Ok(());
+        }
+        let index = found.unwrap();
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("video_upload"),
+        });
+        self.videos[index].2.upload_and_convert(&self.queue, &mut encoder, frame)?;
+        self.queue.submit(Some(encoder.finish()));
+        Ok(())
     }
 
     pub fn time_passes(&mut self, timing: bool) {

@@ -43,6 +43,7 @@ mod taa;
 mod testing;
 mod texture;
 mod texture_recipe;
+pub mod video;
 mod volume;
 
 use pen_protocol::{Catalog, GameEvent, RenderFrame};
@@ -54,6 +55,10 @@ pub use filter::ColorFilter;
 pub use inspect::{TextureInfo, inspect_material, inspect_mesh, inspect_texture, shader_draws_sprites};
 pub use lights::LIGHTS_WGSL;
 pub use prefetch::Prefetch;
+pub use video::{
+    ChromaSiting, ColorMatrix, ColorRange, ColorSpace, IvfFrame, IvfStream, VideoPlayer, VideoTexture, Y4mStream,
+    Yuv420Frame,
+};
 pub use volume::{TRANSLUCENCY_WGSL, VolumeImage, VolumeLayer};
 
 /// WGSL a sprite shader adds to draw text from a multi-channel signed
@@ -379,5 +384,12 @@ impl Renderer {
     /// (`RenderStats::scale`). None, the default, draws at the frame's scale.
     pub fn frame_budget(&mut self, milliseconds: Option<f32>) {
         self.state.frame_budget(milliseconds);
+    }
+
+    /// Uploads a planar YUV420p video frame and converts it on the GPU into a
+    /// live dynamic RGBA texture bound by any material whose `texture` key
+    /// equals `key`.
+    pub fn upload_video_frame(&mut self, key: &str, frame: &Yuv420Frame) -> anyhow::Result<()> {
+        self.state.upload_video_frame(key, frame)
     }
 }

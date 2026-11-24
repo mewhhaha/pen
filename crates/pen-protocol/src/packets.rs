@@ -1327,6 +1327,8 @@ pub mod types {
         pub forward: Vector,
         /// Its up, which with `forward` tells left from right.
         pub up: Vector,
+        /// World-space listener velocity in world units per second, for Doppler pitch shifting.
+        pub velocity: Vector,
     }
     /// Where a voice or sound is, as a PannerNode places it: from the listener, equal-power
     /// panned by its azimuth (in place of its pan), and quieted by its distance model and its
@@ -1359,6 +1361,16 @@ pub mod types {
         /// Enable HRTF binaural spatialization (ITD delay and head-shadowing ILD natively,
         /// PanningModelType::Hrtf in WebAudio) instead of equal-power panning.
         pub hrtf: bool,
+        /// World-space source velocity in world units per second, for Doppler pitch shifting.
+        pub velocity: Vector,
+        /// Doppler pitch shift multiplier (0 disables, 1 uses physical speed of sound 343 m/s).
+        pub doppler: f32,
+        /// Direct-path acoustic occlusion in 0..1 (0 open, 1 fully muffled by lowpass and
+        /// direct gain attenuation).
+        pub occlusion: f32,
+        /// Optional acoustic reverb zone ID (0 auto-detects from world position against
+        /// reverb_zones).
+        pub zone: u32,
     }
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Instance {
@@ -1440,6 +1452,64 @@ pub mod types {
         pub high: f32,
         /// Pulse duration in seconds (0 stops rumble or applies for one frame).
         pub duration: f32,
+    }
+    /// One spatial acoustic reverb zone and portal boundary.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct ReverbZone {
+        /// Zone identifier (1..64; 0 matches unzoned space).
+        pub id: u32,
+        /// World-space AABB center of the acoustic zone.
+        pub position: Vector,
+        /// World-space half extents of the zone box.
+        pub half_extents: Vector,
+        /// Outer transition distance in world units for smooth room blending.
+        pub blend: f32,
+        /// RT60 reverb decay time in seconds for this zone.
+        pub decay: f32,
+        /// High-frequency reverb damping in 0..1 for this zone.
+        pub damping: f32,
+        /// Reverb send wet multiplier for sources inside this zone (0 defaults to 1).
+        pub wet: f32,
+        /// Extra acoustic occlusion in 0..1 applied across room boundaries/portals when source
+        /// and listener occupy different zones.
+        pub portal_attenuation: f32,
+    }
+    /// One real-time procedural or granular DSP synthesizer voice.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct SynthVoice {
+        /// Persistent synth voice identifier.
+        pub id: u32,
+        /// Oscillator/synth mode: 0 Sine, 1 Saw, 2 Square, 3 Triangle, 4 Noise, 5 Granular
+        /// cloud.
+        pub mode: u32,
+        /// Target mixer bus index (0..MAX_BUSES-1).
+        pub bus: u32,
+        /// Base oscillator frequency in Hz (or grain carrier frequency in granular mode).
+        pub frequency: f32,
+        /// Linear output gain.
+        pub gain: f32,
+        /// Stereo pan in -1..1.
+        pub pan: f32,
+        /// Pitch detune in cents (or granular pitch jitter spread in cents).
+        pub detune: f32,
+        /// ADSR envelope attack time in seconds.
+        pub attack: f32,
+        /// ADSR envelope decay time in seconds.
+        pub decay: f32,
+        /// ADSR envelope sustain level in 0..1.
+        pub sustain: f32,
+        /// ADSR envelope release time in seconds when the voice leaves the frame.
+        pub release: f32,
+        /// Resonant lowpass filter cutoff frequency in Hz.
+        pub cutoff: f32,
+        /// Resonant lowpass filter Q factor (0.5..20).
+        pub resonance: f32,
+        /// Granular window duration in seconds (used in Granular mode).
+        pub grain_size: f32,
+        /// Granular harmonic/playback pitch multiplier (used in Granular mode).
+        pub grain_pitch: f32,
+        /// Reverb send level.
+        pub reverb: f32,
     }
     /// How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture
     /// filtering, ambient occlusion, a sky, screen effects, bloom and temporal antialiasing.
@@ -2035,6 +2105,11 @@ pub mod types {
         pub ribbons: Vec<RibbonPoint>,
         /// Dual-motor gamepad rumble / haptic commands for connected controllers.
         pub haptics: Vec<Haptic>,
+        /// Spatial acoustic reverb zones and room portals blended smoothly around the listener.
+        pub reverb_zones: Vec<ReverbZone>,
+        /// Real-time procedural and granular DSP synthesizer voices mixed alongside clip
+        /// voices.
+        pub synths: Vec<SynthVoice>,
         /// The game's own sections, which its pen.json `protocol` declares, after the rest of
         /// the packet: a marker, their count, then each one's tag, length and values. A packet
         /// without any ends before the marker. Tag 0 is reserved for one optional development
@@ -2110,6 +2185,8 @@ pub mod types {
                 motions: Default::default(),
                 ribbons: Default::default(),
                 haptics: Default::default(),
+                reverb_zones: Default::default(),
+                synths: Default::default(),
                 extensions: Default::default(),
             }
         }
@@ -2232,6 +2309,10 @@ pub mod codec {
     pub const ENGINE_PREFERENCES: usize = 64;
     /// The most panners one frame may declare: one for each voice and sound it may have.
     pub const MAX_PANNERS: usize = 512;
+    /// The most spatial reverb zones and acoustic portals one frame may declare.
+    pub const MAX_REVERB_ZONES: usize = 32;
+    /// The most procedural or granular DSP synth voices one frame may declare.
+    pub const MAX_SYNTHS: usize = 64;
     pub const MAX_INSTANCES: usize = 100000;
     pub const MAX_INSTANCE_REMOVALS: usize = 100000;
     pub const PACKET_MAGIC: f32 = 0x474446 as f32;
@@ -2265,8 +2346,9 @@ pub mod codec {
     /// fog.drift3, quality.volumetrics, fog_volume_count, bone_matrix_count,
     /// morph_weight_count, motion_blur.strength, motion_blur.max_radius, motion_blur.samples,
     /// dof.focus_distance, dof.focus_range, dof.aperture, dof.max_blur, motion_count,
-    /// quality.ssgi, ribbon_count, reverb.decay, reverb.damping, haptic_count.
-    pub const PACKET_HEADER_FLOATS: usize = 250;
+    /// quality.ssgi, ribbon_count, reverb.decay, reverb.damping, haptic_count,
+    /// reverb_zone_count, synth_count.
+    pub const PACKET_HEADER_FLOATS: usize = 252;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -2319,11 +2401,12 @@ pub mod codec {
     pub const REFLECTION_PROBE_FLOATS: usize = 21;
     /// Lanes: shape, center3, extent3, density, albedo3, emission3, falloff.
     pub const FOG_VOLUME_FLOATS: usize = 15;
-    /// Lanes: position3, forward3, up3.
-    pub const LISTENER_FLOATS: usize = 9;
+    /// Lanes: position3, forward3, up3, velocity3.
+    pub const LISTENER_FLOATS: usize = 12;
     /// Lanes: voice, sound, position3, orientation3, distance_model, ref_distance,
-    /// max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain, hrtf.
-    pub const PANNER_FLOATS: usize = 16;
+    /// max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain, hrtf, velocity3,
+    /// doppler, occlusion, zone.
+    pub const PANNER_FLOATS: usize = 22;
     /// Lanes: id_low, id_high, order, mesh, material, transform16, parameters count and
     /// parameters4.
     pub const INSTANCE_FLOATS: usize = 26;
@@ -2339,6 +2422,11 @@ pub mod codec {
     pub const RIBBON_FLOATS: usize = 12;
     /// Lanes: pad, low, high, duration.
     pub const HAPTIC_FLOATS: usize = 4;
+    /// Lanes: id, position3, half_extents3, blend, decay, damping, wet, portal_attenuation.
+    pub const REVERB_ZONE_FLOATS: usize = 12;
+    /// Lanes: id, mode, bus, frequency, gain, pan, detune, attack, decay, sustain, release,
+    /// cutoff, resonance, grain_size, grain_pitch, reverb.
+    pub const SYNTH_VOICE_FLOATS: usize = 16;
     /// Where each header lane and record field starts; an optional field's lanes
     /// follow its count.
     pub mod lanes {
@@ -2497,6 +2585,8 @@ pub mod codec {
             pub const REVERB_DECAY: usize = 247;
             pub const REVERB_DAMPING: usize = 248;
             pub const HAPTIC_COUNT: usize = 249;
+            pub const REVERB_ZONE_COUNT: usize = 250;
+            pub const SYNTH_COUNT: usize = 251;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -2661,6 +2751,7 @@ pub mod codec {
             pub const POSITION: usize = 0;
             pub const FORWARD: usize = 3;
             pub const UP: usize = 6;
+            pub const VELOCITY: usize = 9;
         }
         pub mod panner {
             pub const VOICE: usize = 0;
@@ -2675,6 +2766,10 @@ pub mod codec {
             pub const CONE_OUTER: usize = 13;
             pub const CONE_OUTER_GAIN: usize = 14;
             pub const HRTF: usize = 15;
+            pub const VELOCITY: usize = 16;
+            pub const DOPPLER: usize = 19;
+            pub const OCCLUSION: usize = 20;
+            pub const ZONE: usize = 21;
         }
         pub mod instance {
             pub const ID_LOW: usize = 0;
@@ -2719,6 +2814,34 @@ pub mod codec {
             pub const LOW: usize = 1;
             pub const HIGH: usize = 2;
             pub const DURATION: usize = 3;
+        }
+        pub mod reverb_zone {
+            pub const ID: usize = 0;
+            pub const POSITION: usize = 1;
+            pub const HALF_EXTENTS: usize = 4;
+            pub const BLEND: usize = 7;
+            pub const DECAY: usize = 8;
+            pub const DAMPING: usize = 9;
+            pub const WET: usize = 10;
+            pub const PORTAL_ATTENUATION: usize = 11;
+        }
+        pub mod synth_voice {
+            pub const ID: usize = 0;
+            pub const MODE: usize = 1;
+            pub const BUS: usize = 2;
+            pub const FREQUENCY: usize = 3;
+            pub const GAIN: usize = 4;
+            pub const PAN: usize = 5;
+            pub const DETUNE: usize = 6;
+            pub const ATTACK: usize = 7;
+            pub const DECAY: usize = 8;
+            pub const SUSTAIN: usize = 9;
+            pub const RELEASE: usize = 10;
+            pub const CUTOFF: usize = 11;
+            pub const RESONANCE: usize = 12;
+            pub const GRAIN_SIZE: usize = 13;
+            pub const GRAIN_PITCH: usize = 14;
+            pub const REVERB: usize = 15;
         }
         pub mod solid {
             pub const FACES: usize = 0;
@@ -3210,7 +3333,8 @@ pub mod codec {
             let position = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
             let forward = Vector { x: self.packet[lane + 3], y: self.packet[lane + 4], z: self.packet[lane + 5] };
             let up = Vector { x: self.packet[lane + 6], y: self.packet[lane + 7], z: self.packet[lane + 8] };
-            *listener = Listener { position, forward, up };
+            let velocity = Vector { x: self.packet[lane + 9], y: self.packet[lane + 10], z: self.packet[lane + 11] };
+            *listener = Listener { position, forward, up, velocity };
             Ok(())
         }
 
@@ -3227,7 +3351,11 @@ pub mod codec {
             let cone_outer = self.packet[lane + 13];
             let cone_outer_gain = self.packet[lane + 14];
             let hrtf = self.flag(lane + 15)?;
-            *panner = Panner { voice: voice as u32, sound: sound as u32, position, orientation, distance_model: distance_model as u32, ref_distance, max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain, hrtf };
+            let velocity = Vector { x: self.packet[lane + 16], y: self.packet[lane + 17], z: self.packet[lane + 18] };
+            let doppler = self.packet[lane + 19];
+            let occlusion = self.packet[lane + 20];
+            let zone = self.count(lane + 21, 64)?;
+            *panner = Panner { voice: voice as u32, sound: sound as u32, position, orientation, distance_model: distance_model as u32, ref_distance, max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain, hrtf, velocity, doppler, occlusion, zone: zone as u32 };
             Ok(())
         }
 
@@ -3295,6 +3423,40 @@ pub mod codec {
             let high = self.packet[lane + 2];
             let duration = self.packet[lane + 3];
             *haptic = Haptic { pad: pad as u32, low, high, duration };
+            Ok(())
+        }
+
+        fn decode_reverb_zone(&mut self, lane: usize, reverb_zone: &mut ReverbZone) -> Result<()> {
+            let id = self.count(lane, 64)?;
+            let position = Vector { x: self.packet[lane + 1], y: self.packet[lane + 2], z: self.packet[lane + 3] };
+            let half_extents = Vector { x: self.packet[lane + 4], y: self.packet[lane + 5], z: self.packet[lane + 6] };
+            let blend = self.packet[lane + 7];
+            let decay = self.packet[lane + 8];
+            let damping = self.packet[lane + 9];
+            let wet = self.packet[lane + 10];
+            let portal_attenuation = self.packet[lane + 11];
+            *reverb_zone = ReverbZone { id: id as u32, position, half_extents, blend, decay, damping, wet, portal_attenuation };
+            Ok(())
+        }
+
+        fn decode_synth_voice(&mut self, lane: usize, synth_voice: &mut SynthVoice) -> Result<()> {
+            let id = self.count(lane, MAX_VOICE_ID)?;
+            let mode = self.count(lane + 1, 5)?;
+            let bus = self.count(lane + 2, 15)?;
+            let frequency = self.packet[lane + 3];
+            let gain = self.packet[lane + 4];
+            let pan = self.packet[lane + 5];
+            let detune = self.packet[lane + 6];
+            let attack = self.packet[lane + 7];
+            let decay = self.packet[lane + 8];
+            let sustain = self.packet[lane + 9];
+            let release = self.packet[lane + 10];
+            let cutoff = self.packet[lane + 11];
+            let resonance = self.packet[lane + 12];
+            let grain_size = self.packet[lane + 13];
+            let grain_pitch = self.packet[lane + 14];
+            let reverb = self.packet[lane + 15];
+            *synth_voice = SynthVoice { id: id as u32, mode: mode as u32, bus: bus as u32, frequency, gain, pan, detune, attack, decay, sustain, release, cutoff, resonance, grain_size, grain_pitch, reverb };
             Ok(())
         }
     }
@@ -3366,6 +3528,8 @@ pub mod codec {
         let motions_count = reader.count(244, MAX_MOTIONS)?;
         let ribbons_count = reader.count(246, MAX_RIBBONS)?;
         let haptics_count = reader.count(249, MAX_HAPTICS)?;
+        let reverb_zones_count = reader.count(250, MAX_REVERB_ZONES)?;
+        let synths_count = reader.count(251, MAX_SYNTHS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -3427,9 +3591,13 @@ pub mod codec {
         let ribbons_end = ribbons_start + ribbons_count * RIBBON_FLOATS;
         let haptics_start = ribbons_end;
         let haptics_end = haptics_start + haptics_count * HAPTIC_FLOATS;
-        let extras_start = haptics_end;
+        let reverb_zones_start = haptics_end;
+        let reverb_zones_end = reverb_zones_start + reverb_zones_count * REVERB_ZONE_FLOATS;
+        let synths_start = reverb_zones_end;
+        let synths_end = synths_start + synths_count * SYNTH_VOICE_FLOATS;
+        let extras_start = synths_end;
         let truncated = "game returned a truncated, oversized or nonfinite frame";
-        ensure!(packet.len() >= haptics_end && packet.iter().all(|value| value.is_finite()), truncated);
+        ensure!(packet.len() >= synths_end && packet.iter().all(|value| value.is_finite()), truncated);
         // What the records' tails claim of extras, in order.
         let mut extras_lanes = 0;
         for index in 0..draws_count {
@@ -3804,6 +3972,16 @@ pub mod codec {
         for (index, haptic) in haptics.iter_mut().enumerate() {
             reader.decode_haptic(haptics_start + index * HAPTIC_FLOATS, haptic)?;
         }
+        let mut reverb_zones = std::mem::take(&mut frame.reverb_zones);
+        resize(&mut reverb_zones, reverb_zones_count);
+        for (index, reverb_zone) in reverb_zones.iter_mut().enumerate() {
+            reader.decode_reverb_zone(reverb_zones_start + index * REVERB_ZONE_FLOATS, reverb_zone)?;
+        }
+        let mut synths = std::mem::take(&mut frame.synths);
+        resize(&mut synths, synths_count);
+        for (index, synth_voice) in synths.iter_mut().enumerate() {
+            reader.decode_synth_voice(synths_start + index * SYNTH_VOICE_FLOATS, synth_voice)?;
+        }
         *frame = RenderFrame {
             save_requested,
             load_requested,
@@ -3867,6 +4045,8 @@ pub mod codec {
             motions,
             ribbons,
             haptics,
+            reverb_zones,
+            synths,
             extensions,
         };
         Ok(&packet[state_start..state_end])
@@ -3953,6 +4133,8 @@ pub mod codec {
         let motions_count = d.count(&header.field("motion_count"), 244, MAX_MOTIONS)?;
         let ribbons_count = d.count(&header.field("ribbon_count"), 246, MAX_RIBBONS)?;
         let haptics_count = d.count(&header.field("haptic_count"), 249, MAX_HAPTICS)?;
+        let reverb_zones_count = d.count(&header.field("reverb_zone_count"), 250, MAX_REVERB_ZONES)?;
+        let synths_count = d.count(&header.field("synth_count"), 251, MAX_SYNTHS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -4014,7 +4196,11 @@ pub mod codec {
         let ribbons_end = d.end(&Location::section("ribbons"), ribbons_start, ribbons_count, RIBBON_FLOATS)?;
         let haptics_start = ribbons_end;
         let haptics_end = d.end(&Location::section("haptics"), haptics_start, haptics_count, HAPTIC_FLOATS)?;
-        let extras_start = haptics_end;
+        let reverb_zones_start = haptics_end;
+        let reverb_zones_end = d.end(&Location::section("reverb_zones"), reverb_zones_start, reverb_zones_count, REVERB_ZONE_FLOATS)?;
+        let synths_start = reverb_zones_end;
+        let synths_end = d.end(&Location::section("synths"), synths_start, synths_count, SYNTH_VOICE_FLOATS)?;
+        let extras_start = synths_end;
         let extras_cursor = &mut { extras_start };
         d.count(&header.field("save_requested"), 12, 1)?;
         d.count(&header.field("load_requested"), 13, 1)?;
@@ -4451,6 +4637,7 @@ pub mod codec {
             d.values(&path.field("position"), base, 3, &["x","y","z"])?;
             d.values(&path.field("forward"), base + 3, 3, &["x","y","z"])?;
             d.values(&path.field("up"), base + 6, 3, &["x","y","z"])?;
+            d.values(&path.field("velocity"), base + 9, 3, &["x","y","z"])?;
             base += LISTENER_FLOATS;
         }
         d.exhausted(&Location::section("listener"), base, listener_end)?;
@@ -4469,6 +4656,10 @@ pub mod codec {
             d.finite(&path.field("cone_outer"), base + 13)?;
             d.finite(&path.field("cone_outer_gain"), base + 14)?;
             d.count(&path.field("hrtf"), base + 15, 1)?;
+            d.values(&path.field("velocity"), base + 16, 3, &["x","y","z"])?;
+            d.finite(&path.field("doppler"), base + 19)?;
+            d.finite(&path.field("occlusion"), base + 20)?;
+            let zone = d.count(&path.field("zone"), base + 21, 64)?;
             base += PANNER_FLOATS;
         }
         d.exhausted(&Location::section("panners"), base, panners_end)?;
@@ -4546,6 +4737,42 @@ pub mod codec {
             base += HAPTIC_FLOATS;
         }
         d.exhausted(&Location::section("haptics"), base, haptics_end)?;
+        let mut base = reverb_zones_start;
+        for item in 0..reverb_zones_count {
+            let path = &Location::section("reverb_zones").index(item);
+            let id = d.count(&path.field("id"), base, 64)?;
+            d.values(&path.field("position"), base + 1, 3, &["x","y","z"])?;
+            d.values(&path.field("half_extents"), base + 4, 3, &["x","y","z"])?;
+            d.finite(&path.field("blend"), base + 7)?;
+            d.finite(&path.field("decay"), base + 8)?;
+            d.finite(&path.field("damping"), base + 9)?;
+            d.finite(&path.field("wet"), base + 10)?;
+            d.finite(&path.field("portal_attenuation"), base + 11)?;
+            base += REVERB_ZONE_FLOATS;
+        }
+        d.exhausted(&Location::section("reverb_zones"), base, reverb_zones_end)?;
+        let mut base = synths_start;
+        for item in 0..synths_count {
+            let path = &Location::section("synths").index(item);
+            let id = d.count(&path.field("id"), base, MAX_VOICE_ID)?;
+            let mode = d.count(&path.field("mode"), base + 1, 5)?;
+            let bus = d.count(&path.field("bus"), base + 2, 15)?;
+            d.finite(&path.field("frequency"), base + 3)?;
+            d.finite(&path.field("gain"), base + 4)?;
+            d.finite(&path.field("pan"), base + 5)?;
+            d.finite(&path.field("detune"), base + 6)?;
+            d.finite(&path.field("attack"), base + 7)?;
+            d.finite(&path.field("decay"), base + 8)?;
+            d.finite(&path.field("sustain"), base + 9)?;
+            d.finite(&path.field("release"), base + 10)?;
+            d.finite(&path.field("cutoff"), base + 11)?;
+            d.finite(&path.field("resonance"), base + 12)?;
+            d.finite(&path.field("grain_size"), base + 13)?;
+            d.finite(&path.field("grain_pitch"), base + 14)?;
+            d.finite(&path.field("reverb"), base + 15)?;
+            base += SYNTH_VOICE_FLOATS;
+        }
+        d.exhausted(&Location::section("synths"), base, synths_end)?;
         inspect_extensions(d, *extras_cursor)?;
         Ok(())
     }
@@ -4597,6 +4824,8 @@ pub mod codec {
         let motions_count = d.count(&header.field("motion_count"), 244, MAX_MOTIONS)?;
         let ribbons_count = d.count(&header.field("ribbon_count"), 246, MAX_RIBBONS)?;
         let haptics_count = d.count(&header.field("haptic_count"), 249, MAX_HAPTICS)?;
+        let reverb_zones_count = d.count(&header.field("reverb_zone_count"), 250, MAX_REVERB_ZONES)?;
+        let synths_count = d.count(&header.field("synth_count"), 251, MAX_SYNTHS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -4658,7 +4887,11 @@ pub mod codec {
         let ribbons_end = d.end(&Location::section("ribbons"), ribbons_start, ribbons_count, RIBBON_FLOATS)?;
         let haptics_start = ribbons_end;
         let haptics_end = d.end(&Location::section("haptics"), haptics_start, haptics_count, HAPTIC_FLOATS)?;
-        let extras_start = haptics_end;
+        let reverb_zones_start = haptics_end;
+        let reverb_zones_end = d.end(&Location::section("reverb_zones"), reverb_zones_start, reverb_zones_count, REVERB_ZONE_FLOATS)?;
+        let synths_start = reverb_zones_end;
+        let synths_end = d.end(&Location::section("synths"), synths_start, synths_count, SYNTH_VOICE_FLOATS)?;
+        let extras_start = synths_end;
         let mut end = extras_start;
         for item in 0..draws_count {
             let count = d.count(&Location::section("draws").index(item).field("extra"), draws_start + item * DRAW_FLOATS + 23, MAX_DRAW_EXTRA)?;
@@ -4915,6 +5148,14 @@ pub mod codec {
         for haptic in &frame.haptics {
             canonical_haptic(&mut out, haptic);
         }
+        out.push(frame.reverb_zones.len() as f32);
+        for reverb_zone in &frame.reverb_zones {
+            canonical_reverb_zone(&mut out, reverb_zone);
+        }
+        out.push(frame.synths.len() as f32);
+        for synth_voice in &frame.synths {
+            canonical_synth_voice(&mut out, synth_voice);
+        }
         out
     }
 
@@ -5098,6 +5339,7 @@ pub mod codec {
         out.extend([
             listener.position.x, listener.position.y, listener.position.z, listener.forward.x,
             listener.forward.y, listener.forward.z, listener.up.x, listener.up.y, listener.up.z,
+            listener.velocity.x, listener.velocity.y, listener.velocity.z,
         ]);
     }
 
@@ -5106,7 +5348,8 @@ pub mod codec {
             panner.voice as f32, panner.sound as f32, panner.position.x, panner.position.y, panner.position.z,
             panner.orientation.x, panner.orientation.y, panner.orientation.z, panner.distance_model as f32,
             panner.ref_distance, panner.max_distance, panner.rolloff, panner.cone_inner, panner.cone_outer,
-            panner.cone_outer_gain, f32::from(panner.hrtf),
+            panner.cone_outer_gain, f32::from(panner.hrtf), panner.velocity.x, panner.velocity.y,
+            panner.velocity.z, panner.doppler, panner.occlusion, panner.zone as f32,
         ]);
     }
 
@@ -5156,5 +5399,23 @@ pub mod codec {
 
     fn canonical_haptic(out: &mut Vec<f32>, haptic: &Haptic) {
         out.extend([haptic.pad as f32, haptic.low, haptic.high, haptic.duration]);
+    }
+
+    fn canonical_reverb_zone(out: &mut Vec<f32>, reverb_zone: &ReverbZone) {
+        out.extend([
+            reverb_zone.id as f32, reverb_zone.position.x, reverb_zone.position.y, reverb_zone.position.z,
+            reverb_zone.half_extents.x, reverb_zone.half_extents.y, reverb_zone.half_extents.z,
+            reverb_zone.blend, reverb_zone.decay, reverb_zone.damping, reverb_zone.wet,
+            reverb_zone.portal_attenuation,
+        ]);
+    }
+
+    fn canonical_synth_voice(out: &mut Vec<f32>, synth_voice: &SynthVoice) {
+        out.extend([
+            synth_voice.id as f32, synth_voice.mode as f32, synth_voice.bus as f32, synth_voice.frequency,
+            synth_voice.gain, synth_voice.pan, synth_voice.detune, synth_voice.attack, synth_voice.decay,
+            synth_voice.sustain, synth_voice.release, synth_voice.cutoff, synth_voice.resonance,
+            synth_voice.grain_size, synth_voice.grain_pitch, synth_voice.reverb,
+        ]);
     }
 }

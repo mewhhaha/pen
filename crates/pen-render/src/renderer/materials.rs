@@ -80,6 +80,7 @@ impl State {
             TextureRef::Transparent => &self.transparent,
             TextureRef::Checker => &self.checker,
             TextureRef::Field(index) => &self.fields[index].1,
+            TextureRef::Video(index) => &self.videos[index].1,
         }
     }
 
@@ -128,15 +129,17 @@ impl State {
         material: &Material,
         field: Option<usize>,
     ) -> Result<Option<Dressed>> {
-        let loaded_texture = self.loaded_texture(&material.texture)?;
+        let video_texture = material.texture.as_deref().and_then(|key| self.video_ids.get(key).copied());
+        let loaded_texture = if video_texture.is_some() { None } else { self.loaded_texture(&material.texture)? };
         let loaded_normal = self.loaded_texture(&material.normal_texture)?;
         let loaded_outline = self.loaded_texture(&material.layer_texture)?;
         let loaded_emissive = self.loaded_texture(&material.emissive_texture)?;
         let loaded_orm = self.loaded_texture(&material.orm_texture)?;
         // A texture on its way holds the draw back; one that failed shows as
         // the checker.
+        let disk_texture = if video_texture.is_some() { &None } else { &material.texture };
         if [
-            &material.texture,
+            disk_texture,
             &material.normal_texture,
             &material.layer_texture,
             &material.emissive_texture,
@@ -148,10 +151,11 @@ impl State {
         {
             return Ok(None);
         }
-        let mut texture = match (&material.texture, loaded_texture) {
-            (None, _) => TextureRef::White,
-            (Some(_), Some(slot)) => TextureRef::Slot(slot),
-            (Some(_), None) => TextureRef::Checker,
+        let mut texture = match (video_texture, &material.texture, loaded_texture) {
+            (Some(idx), _, _) => TextureRef::Video(idx),
+            (None, None, _) => TextureRef::White,
+            (None, Some(_), Some(slot)) => TextureRef::Slot(slot),
+            (None, Some(_), None) => TextureRef::Checker,
         };
         let mut normal = match field {
             Some(field) => TextureRef::Field(field),

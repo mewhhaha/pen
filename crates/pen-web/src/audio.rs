@@ -19,6 +19,7 @@ use pen_protocol::boundary::{AUDIO_FADE_MS, AUDIO_GLIDE_MS, AUDIO_OPEN};
 use pen_protocol::{Bus, Catalog, RenderFrame, Sound, Voice, distance_model};
 use pen_runtime::mix::{AudioReport, BusReport, Monitor};
 use pen_runtime::panner::{Placement, Placements};
+use pen_runtime::synth::{SynthMode, SynthSpec, render_granular_loop};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -27,8 +28,8 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     AnalyserNode, AudioBuffer, AudioBufferSourceNode, AudioContext, AudioContextOptions, AudioContextState, AudioNode,
     AudioParam, BiquadFilterNode, BiquadFilterType, Blob, BlobPropertyBag, ConvolverNode, DistanceModelType,
-    DynamicsCompressorNode, GainNode, HtmlAudioElement, HtmlCanvasElement, MediaElementAudioSourceNode, PannerNode,
-    PanningModelType, StereoPannerNode, Url,
+    DynamicsCompressorNode, GainNode, HtmlAudioElement, HtmlCanvasElement, MediaElementAudioSourceNode, OscillatorNode,
+    OscillatorType, PannerNode, PanningModelType, StereoPannerNode, Url,
 };
 const Q: f32 = -3.010_3;
 fn glide(param: &AudioParam, value: f32, context: &AudioContext) {
@@ -253,17 +254,110 @@ impl Playing {
         self.ramp = (value, target, now, seconds);
     }
 }
+fn linear_q_to_db(q: f32) -> f32 {
+    // WebAudio BiquadFilterNode lowpass interprets `Q` in dB (gain = 10^(Q/20)).
+    20.0 * q.clamp(0.5, 20.0).log10()
+}
+enum SynthSource {
+    Osc(OscillatorNode),
+    Buffer(AudioBufferSourceNode),
+}
+impl SynthSource {
+    fn node(&self) -> &AudioNode {
+        match self {
+            SynthSource::Osc(osc) => osc,
+            SynthSource::Buffer(buf) => buf,
+        }
+    }
+    fn stop_at(&self, when: f64) {
+        match self {
+            SynthSource::Osc(osc) => {
+                let _ = osc.unchecked_ref::<web_sys::AudioScheduledSourceNode>().stop_with_when(when);
+            }
+            SynthSource::Buffer(buf) => {
+                let _ = buf.unchecked_ref::<web_sys::AudioScheduledSourceNode>().stop_with_when(when);
+            }
+        }
+    }
+    fn stop_now(&self) {
+        match self {
+            SynthSource::Osc(osc) => {
+                let _ = osc.unchecked_ref::<web_sys::AudioScheduledSourceNode>().stop();
+            }
+            SynthSource::Buffer(buf) => {
+                let _ = buf.unchecked_ref::<web_sys::AudioScheduledSourceNode>().stop();
+            }
+        }
+    }
+}
+struct PlayingSynth {
+    source: SynthSource,
+    filter: BiquadFilterNode,
+    env: GainNode,
+    gain: GainNode,
+    pan: StereoPannerNode,
+    send: GainNode,
+    spec: SynthSpec,
+    /// Start time of attack/decay schedule so interrupting mid-ADSR computes exact held level.
+    started_at: f64,
+    leaving: Option<f64>,
+}
+impl PlayingSynth {
+    #[allow(clippy::cast_possible_truncation, reason = "envelope amplitude in 0..=1")]
+    fn current_env(&self, now: f64) -> f32 {
+        let elapsed = (now - self.started_at).max(0.0);
+        let atk = f64::from(self.spec.attack.max(0.001));
+        let dec = f64::from(self.spec.decay.max(0.001));
+        if elapsed < atk {
+            (elapsed / atk) as f32
+        } else if elapsed < atk + dec {
+            let t = (elapsed - atk) / dec;
+            (1.0 + (f64::from(self.spec.sustain) - 1.0) * t) as f32
+        } else {
+            self.spec.sustain
+        }
+    }
+    fn begin_release(&mut self, now: f64) {
+        let rel = f64::from(self.spec.release.max(0.01));
+        let held = self.current_env(now);
+        let param = self.env.gain();
+        let _ = param.cancel_scheduled_values(now);
+        let _ = param.set_value_at_time(held, now);
+        let _ = param.linear_ramp_to_value_at_time(0.0, now + rel);
+        self.source.stop_at(now + rel);
+        self.leaving = Some(now + rel);
+    }
+    fn disconnect(&self) {
+        self.source.stop_now();
+        let _ = self.source.node().disconnect();
+        let _ = self.filter.disconnect();
+        let _ = self.env.disconnect();
+        let _ = self.gain.disconnect();
+        let _ = self.pan.disconnect();
+        let _ = self.send.disconnect();
+    }
+}
 pub struct Audio {
     context: Option<AudioContext>,
     master: Option<BusNodes>,
     reverb_in: Option<GainNode>,
     reverb_convolver: Option<ConvolverNode>,
+    reverb_convolver_alt: Option<ConvolverNode>,
+    reverb_send_a: Option<GainNode>,
+    reverb_send_b: Option<GainNode>,
+    reverb_ret_a: Option<GainNode>,
+    reverb_ret_b: Option<GainNode>,
+    reverb_use_b: bool,
+    reverb_switch_ready: f64,
     reverb_return: Option<GainNode>,
     reverb_room: (f32, f32),
     buses: Vec<BusNodes>,
     clips: Rc<RefCell<HashMap<u32, Loaded>>>,
     loading: HashSet<u32>,
     voices: HashMap<u32, Playing>,
+    synths: HashMap<u32, PlayingSynth>,
+    retiring_synths: Vec<PlayingSynth>,
+    noise_buffer: Option<AudioBuffer>,
     assets: String,
     pending_sounds: Vec<(Sound, Option<Placement>)>,
     retiring: Vec<Playing>,
@@ -277,12 +371,22 @@ impl Audio {
             master: None,
             reverb_in: None,
             reverb_convolver: None,
+            reverb_convolver_alt: None,
+            reverb_send_a: None,
+            reverb_send_b: None,
+            reverb_ret_a: None,
+            reverb_ret_b: None,
+            reverb_use_b: false,
+            reverb_switch_ready: 0.0,
             reverb_return: None,
             reverb_room: (0.0, 0.0),
             buses: Vec::new(),
             clips: Rc::new(RefCell::new(HashMap::new())),
             loading: HashSet::new(),
             voices: HashMap::new(),
+            synths: HashMap::new(),
+            retiring_synths: Vec::new(),
+            noise_buffer: None,
             assets,
             pending_sounds: Vec::new(),
             retiring: Vec::new(),
@@ -325,15 +429,28 @@ impl Audio {
         let input = gain(&context, 1.0)?;
         let convolver = context.create_convolver().map_err(error)?;
         convolver.set_normalize(false);
+        let convolver_alt = context.create_convolver().map_err(error)?;
+        convolver_alt.set_normalize(false);
         let channels = pen_runtime::reverb::impulse_response(f64::from(context.sample_rate()));
         let buffer =
             context.create_buffer(2, u32::try_from(channels[0].len())?, context.sample_rate()).map_err(error)?;
         buffer.copy_to_channel(&channels[0], 0).map_err(error)?;
         buffer.copy_to_channel(&channels[1], 1).map_err(error)?;
         convolver.set_buffer(Some(&buffer));
+        convolver_alt.set_buffer(Some(&buffer));
+        let send_a = gain(&context, 1.0)?;
+        let send_b = gain(&context, 0.0)?;
+        let ret_a = gain(&context, 1.0)?;
+        let ret_b = gain(&context, 0.0)?;
         let return_gain = gain(&context, 1.0)?;
-        input.connect_with_audio_node(&convolver).map_err(error)?;
-        convolver.connect_with_audio_node(&return_gain).map_err(error)?;
+        input.connect_with_audio_node(&send_a).map_err(error)?;
+        input.connect_with_audio_node(&send_b).map_err(error)?;
+        send_a.connect_with_audio_node(&convolver).map_err(error)?;
+        send_b.connect_with_audio_node(&convolver_alt).map_err(error)?;
+        convolver.connect_with_audio_node(&ret_a).map_err(error)?;
+        convolver_alt.connect_with_audio_node(&ret_b).map_err(error)?;
+        ret_a.connect_with_audio_node(&return_gain).map_err(error)?;
+        ret_b.connect_with_audio_node(&return_gain).map_err(error)?;
         return_gain.connect_with_audio_node(&dry).map_err(error)?;
         let send = filter(&context, AUDIO_OPEN as f32)?;
         send.connect_with_audio_node(&input).map_err(error)?;
@@ -352,6 +469,11 @@ impl Audio {
         });
         self.reverb_in = Some(input);
         self.reverb_convolver = Some(convolver);
+        self.reverb_convolver_alt = Some(convolver_alt);
+        self.reverb_send_a = Some(send_a);
+        self.reverb_send_b = Some(send_b);
+        self.reverb_ret_a = Some(ret_a);
+        self.reverb_ret_b = Some(ret_b);
         self.reverb_return = Some(return_gain);
         self.context = Some(context);
         Ok(())
@@ -450,27 +572,31 @@ impl Audio {
             return Ok(None);
         };
         let context = self.context.as_ref().unwrap();
+        let eff_pitch = placement.map_or(spec.pitch, |p| spec.pitch * p.doppler_ratio(p.position));
+        let eff_gain = placement.map_or(spec.gain, |p| spec.gain * p.occlusion_gain());
+        let eff_lowpass = placement.map_or(spec.lowpass, |p| spec.lowpass.min(p.occlusion_lowpass(AUDIO_OPEN as f32)));
+        let eff_reverb = placement.map_or(spec.reverb, |p| spec.reverb * p.wet_scale);
         let (source, seconds) = match &loaded {
             Loaded::Buffer(buffer) => {
                 let source = context.create_buffer_source().map_err(error)?;
                 source.set_buffer(Some(buffer));
                 source.set_loop(spec.looping);
-                source.playback_rate().set_value(spec.pitch);
+                source.playback_rate().set_value(eff_pitch);
                 (Source::Buffer(source), buffer.duration())
             }
             Loaded::Streamed { url, seconds } => {
                 let element = HtmlAudioElement::new_with_src(url).map_err(error)?;
                 element.set_loop(spec.looping);
-                element.set_playback_rate(f64::from(spec.pitch).clamp(0.0625, 16.0));
+                element.set_playback_rate(f64::from(eff_pitch).clamp(0.0625, 16.0));
                 // Pitch, as an AudioBufferSourceNode's playbackRate has it.
                 let _ = js_sys::Reflect::set(&element, &"preservesPitch".into(), &false.into());
                 let node = context.create_media_element_source(&element).map_err(error)?;
                 (Source::Media(Media { element, node, stop: Cell::new(None) }), *seconds)
             }
         };
-        let lowpass = filter(context, spec.lowpass)?;
+        let lowpass = filter(context, eff_lowpass)?;
         let fade = gain(context, 0.0)?;
-        let level = gain(context, spec.gain)?;
+        let level = gain(context, eff_gain)?;
         let pan = match placement {
             Some(placement) => {
                 let node = context.create_panner().map_err(error)?;
@@ -484,7 +610,7 @@ impl Audio {
                 Panning::Stereo(node)
             }
         };
-        let send = gain(context, spec.reverb)?;
+        let send = gain(context, eff_reverb)?;
         source.node().connect_with_audio_node(&lowpass).map_err(error)?;
         lowpass.connect_with_audio_node(&fade).map_err(error)?;
         fade.connect_with_audio_node(&level).map_err(error)?;
@@ -542,22 +668,116 @@ impl Audio {
             web_sys::console::warn_1(&format!("mix: {error}").into());
         }
     }
+    fn start_synth(&mut self, spec: SynthSpec) -> Result<PlayingSynth> {
+        self.ensure_bus(spec.bus)?;
+        let context = self.context.as_ref().unwrap().clone();
+        let now = context.current_time();
+        let source = match spec.mode {
+            SynthMode::Noise => {
+                if self.noise_buffer.is_none() {
+                    let rate = context.sample_rate();
+                    let len = (rate as usize).clamp(4096, 48_000);
+                    let buf = context.create_buffer(1, u32::try_from(len)?, rate).map_err(error)?;
+                    let mut state = 0x2545_f491u32;
+                    let samples: Vec<f32> = (0..len)
+                        .map(|_| {
+                            state ^= state << 13;
+                            state ^= state >> 17;
+                            state ^= state << 5;
+                            (state as f32 / 2_147_483_648.0) - 1.0
+                        })
+                        .collect();
+                    buf.copy_to_channel(&samples, 0).map_err(error)?;
+                    self.noise_buffer = Some(buf);
+                }
+                let node = context.create_buffer_source().map_err(error)?;
+                node.set_buffer(self.noise_buffer.as_ref());
+                node.set_loop(true);
+                node.start().map_err(error)?;
+                SynthSource::Buffer(node)
+            }
+            SynthMode::Granular => {
+                let rate = context.sample_rate();
+                let frames = (rate * 0.5) as usize;
+                let [left, right] = render_granular_loop(spec, f64::from(rate), frames);
+                let buf = context.create_buffer(2, u32::try_from(left.len())?, rate).map_err(error)?;
+                buf.copy_to_channel(&left, 0).map_err(error)?;
+                buf.copy_to_channel(&right, 1).map_err(error)?;
+                let node = context.create_buffer_source().map_err(error)?;
+                node.set_buffer(Some(&buf));
+                node.set_loop(true);
+                node.start().map_err(error)?;
+                SynthSource::Buffer(node)
+            }
+            mode => {
+                let osc = context.create_oscillator().map_err(error)?;
+                osc.set_type(match mode {
+                    SynthMode::Saw => OscillatorType::Sawtooth,
+                    SynthMode::Square => OscillatorType::Square,
+                    SynthMode::Triangle => OscillatorType::Triangle,
+                    _ => OscillatorType::Sine,
+                });
+                osc.frequency().set_value(spec.frequency);
+                osc.detune().set_value(spec.detune_cents);
+                osc.start().map_err(error)?;
+                SynthSource::Osc(osc)
+            }
+        };
+        let flt = context.create_biquad_filter().map_err(error)?;
+        flt.set_type(BiquadFilterType::Lowpass);
+        flt.frequency().set_value(spec.cutoff.min(context.sample_rate() / 2.0));
+        flt.q().set_value(linear_q_to_db(spec.resonance));
+        let env = gain(&context, 0.0)?;
+        let attack_end = now + f64::from(spec.attack.max(0.001));
+        let decay_end = attack_end + f64::from(spec.decay.max(0.001));
+        let _ = env.gain().set_value_at_time(0.0, now);
+        let _ = env.gain().linear_ramp_to_value_at_time(1.0, attack_end);
+        let _ = env.gain().linear_ramp_to_value_at_time(spec.sustain, decay_end);
+        let level = gain(&context, spec.gain)?;
+        let pan = context.create_stereo_panner().map_err(error)?;
+        pan.pan().set_value(spec.pan.clamp(-1.0, 1.0));
+        let send = gain(&context, spec.reverb)?;
+        source.node().connect_with_audio_node(&flt).map_err(error)?;
+        flt.connect_with_audio_node(&env).map_err(error)?;
+        env.connect_with_audio_node(&level).map_err(error)?;
+        level.connect_with_audio_node(&pan).map_err(error)?;
+        let bus = self.bus(spec.bus);
+        pan.connect_with_audio_node(&bus.dry).map_err(error)?;
+        pan.connect_with_audio_node(&send).map_err(error)?;
+        send.connect_with_audio_node(&bus.send).map_err(error)?;
+        Ok(PlayingSynth { source, filter: flt, env, gain: level, pan, send, spec, started_at: now, leaving: None })
+    }
     fn mix(&mut self, frame: &RenderFrame, placements: &Placements) -> Result<()> {
         let needed = frame
             .buses
             .len()
             .max(1)
             .max(frame.voices.iter().map(|v| v.bus as usize + 1).max().unwrap_or(1))
-            .max(frame.sounds.iter().map(|v| v.bus as usize + 1).max().unwrap_or(1));
+            .max(frame.sounds.iter().map(|v| v.bus as usize + 1).max().unwrap_or(1))
+            .max(frame.synths.iter().map(|s| s.bus as usize + 1).max().unwrap_or(1));
         self.ensure_bus(needed - 1)?;
         let context = self.context.as_ref().unwrap().clone();
         let now = context.current_time();
+        let zone = placements.zone_mix();
         let room = (
-            if frame.reverb.decay.is_finite() { frame.reverb.decay.max(0.0) } else { 0.0 },
-            if frame.reverb.damping.is_finite() { frame.reverb.damping.clamp(0.0, 1.0) } else { 0.0 },
+            if zone.decay.is_finite() { zone.decay.max(0.0) } else { 0.0 },
+            if zone.damping.is_finite() { zone.damping.clamp(0.0, 1.0) } else { 0.0 },
         );
-        if ((room.0 - self.reverb_room.0).abs() > 1e-3 || (room.1 - self.reverb_room.1).abs() > 1e-3)
-            && let Some(convolver) = &self.reverb_convolver
+        // Crossfade between two persistent ConvolverNodes with room hysteresis so zone
+        // transitions never truncate active convolution tails or regenerate IRs every frame.
+        let room_changed = (room.0 - self.reverb_room.0).abs() > 0.08
+            || (room.1 - self.reverb_room.1).abs() > 0.05
+            || ((room.0 > 0.0) != (self.reverb_room.0 > 0.0));
+        if room_changed
+            && now >= self.reverb_switch_ready
+            && let (Some(conv_a), Some(conv_b), Some(send_a), Some(send_b), Some(ret_a), Some(ret_b)) = (
+                &self.reverb_convolver,
+                &self.reverb_convolver_alt,
+                &self.reverb_send_a,
+                &self.reverb_send_b,
+                &self.reverb_ret_a,
+                &self.reverb_ret_b,
+            )
         {
             let channels = pen_runtime::reverb::impulse_response_for(
                 f64::from(context.sample_rate()),
@@ -568,7 +788,24 @@ impl Audio {
                 context.create_buffer(2, u32::try_from(channels[0].len())?, context.sample_rate()).map_err(error)?;
             buffer.copy_to_channel(&channels[0], 0).map_err(error)?;
             buffer.copy_to_channel(&channels[1], 1).map_err(error)?;
-            convolver.set_buffer(Some(&buffer));
+            let next_b = !self.reverb_use_b;
+            let (in_conv, in_send, out_send, in_ret, out_ret) = if next_b {
+                (conv_b, send_b, send_a, ret_b, ret_a)
+            } else {
+                (conv_a, send_a, send_b, ret_a, ret_b)
+            };
+            in_conv.set_buffer(Some(&buffer));
+            let fade = 0.25;
+            let _ = in_send.gain().set_value_at_time(1.0, now);
+            let _ = out_send.gain().set_value_at_time(0.0, now);
+            let _ = in_ret.gain().cancel_scheduled_values(now);
+            let _ = in_ret.gain().set_value_at_time(0.0, now);
+            let _ = in_ret.gain().linear_ramp_to_value_at_time(1.0, now + fade);
+            let _ = out_ret.gain().cancel_scheduled_values(now);
+            let _ = out_ret.gain().set_value_at_time(1.0, now);
+            let _ = out_ret.gain().linear_ramp_to_value_at_time(0.0, now + fade);
+            self.reverb_use_b = next_b;
+            self.reverb_switch_ready = now + fade;
             self.reverb_room = room;
         }
         let rms_by_bus: Vec<f32> = (0..=self.buses.len())
@@ -646,15 +883,19 @@ impl Audio {
                     playing.fade_to(1.0, now, f64::from(spec.fade_in).max(AUDIO_FADE_MS as f64 / 1000.0));
                 }
                 if !*playing.ended.borrow() {
-                    glide(&playing.gain.gain(), spec.gain, &context);
+                    let eff_gain = placement.map_or(spec.gain, |p| spec.gain * p.occlusion_gain());
+                    let eff_pitch = placement.map_or(spec.pitch, |p| spec.pitch * p.doppler_ratio(p.position));
+                    let eff_lp = placement.map_or(spec.lowpass, |p| spec.lowpass.min(p.occlusion_lowpass(AUDIO_OPEN as f32)));
+                    let eff_rev = placement.map_or(spec.reverb, |p| spec.reverb * p.wet_scale);
+                    glide(&playing.gain.gain(), eff_gain, &context);
                     match (&playing.pan, &placement) {
                         (Panning::Placed(node), Some(placement)) => place(node, placement, &context, false),
                         (Panning::Stereo(node), _) => glide(&node.pan(), spec.pan.clamp(-1.0, 1.0), &context),
                         (Panning::Placed(_), None) => {}
                     }
-                    playing.source.pitch(spec.pitch, &context);
-                    glide(&playing.filter.frequency(), spec.lowpass.min(context.sample_rate() / 2.0), &context);
-                    glide(&playing.send.gain(), spec.reverb, &context);
+                    playing.source.pitch(eff_pitch, &context);
+                    glide(&playing.filter.frequency(), eff_lp.min(context.sample_rate() / 2.0), &context);
+                    glide(&playing.send.gain(), eff_rev, &context);
                     playing.spec = *spec;
                 }
             } else if let Some(playing) = self.start_voice(*spec, placement)? {
@@ -671,6 +912,76 @@ impl Audio {
             }
         }
         self.pending_sounds = waiting;
+        // Reconcile procedural / granular synth voices, disconnecting retired graphs cleanly.
+        let mut kept_retiring = Vec::with_capacity(self.retiring_synths.len());
+        for s in self.retiring_synths.drain(..) {
+            if s.leaving.is_none_or(|until| now < until) {
+                kept_retiring.push(s);
+            } else {
+                s.disconnect();
+            }
+        }
+        self.retiring_synths = kept_retiring;
+        let max_retiring = pen_protocol::boundary::MAX_SYNTHS;
+        let retire = |retiring: &mut Vec<PlayingSynth>, mut old: PlayingSynth| {
+            if old.leaving.is_none() {
+                old.begin_release(now);
+            }
+            if retiring.len() >= max_retiring {
+                retiring.remove(0).disconnect();
+            }
+            retiring.push(old);
+        };
+        // Move omitted synths immediately into `retiring_synths` so a returning ID starts a
+        // fresh crossfading node instead of dying at its old irreversible WebAudio stop deadline.
+        let omitted: Vec<u32> = self
+            .synths
+            .keys()
+            .copied()
+            .filter(|id| !frame.synths.iter().any(|s| s.id == *id))
+            .collect();
+        for id in omitted {
+            if let Some(old) = self.synths.remove(&id) {
+                retire(&mut self.retiring_synths, old);
+            }
+        }
+        for wire in frame.synths.iter().take(pen_protocol::boundary::MAX_SYNTHS) {
+            if wire.id == 0 {
+                continue;
+            }
+            let spec = SynthSpec::from_wire(wire);
+            let needs_restart = self.synths.get(&spec.id).is_some_and(|s| {
+                if s.spec.mode != spec.mode || s.spec.bus != spec.bus {
+                    return true;
+                }
+                if spec.mode == SynthMode::Granular {
+                    let rel_diff = |a: f32, b: f32| (a - b).abs() > a.abs().max(1e-3) * 0.02;
+                    return rel_diff(s.spec.frequency, spec.frequency)
+                        || (s.spec.detune_cents - spec.detune_cents).abs() > 2.0
+                        || rel_diff(s.spec.grain_size, spec.grain_size)
+                        || rel_diff(s.spec.grain_pitch, spec.grain_pitch);
+                }
+                false
+            });
+            if needs_restart && let Some(old) = self.synths.remove(&spec.id) {
+                retire(&mut self.retiring_synths, old);
+            }
+            if let Some(playing) = self.synths.get_mut(&spec.id) {
+                if let SynthSource::Osc(osc) = &playing.source {
+                    glide(&osc.frequency(), spec.frequency, &context);
+                    glide(&osc.detune(), spec.detune_cents, &context);
+                }
+                glide(&playing.filter.frequency(), spec.cutoff.min(context.sample_rate() / 2.0), &context);
+                glide(&playing.filter.q(), linear_q_to_db(spec.resonance), &context);
+                glide(&playing.gain.gain(), spec.gain, &context);
+                glide(&playing.pan.pan(), spec.pan.clamp(-1.0, 1.0), &context);
+                glide(&playing.send.gain(), spec.reverb, &context);
+                playing.spec = spec;
+            } else {
+                let playing = self.start_synth(spec)?;
+                self.synths.insert(spec.id, playing);
+            }
+        }
         Ok(())
     }
 }
@@ -772,6 +1083,7 @@ pub async fn qualify() -> Result<()> {
         position: at(1.0, 0.0, 0.0),
         forward: at(0.0, 0.0, -1.0),
         up: at(0.0, 1.0, 0.0),
+        velocity: at(0.0, 0.0, 0.0),
     });
     let panner = pen_protocol::Panner {
         voice: 2,

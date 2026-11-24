@@ -39,8 +39,8 @@ use pen_protocol::{
     Aberration, BoneMatrix, Bus, Cascade, Catalog, Clouds, Color, Decal, Dof, Draw, Drift, Emitter, Exposure,
     FieldPatch, Fog, FogVolume, Frame, GameEvent, Grade, Haptic, Inset, Instance, InstanceRemoval, Light, Listener,
     MorphWeight, Motion, MotionBlur, Panner, Pose, Probe, ProbeVolume, Quality, Reflection, ReflectionProbe,
-    RenderFrame, ReverbRoom, RibbonPoint, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode, Vector,
-    Viewport, Voice, service, ui_live, ui_role, ui_state,
+    RenderFrame, ReverbRoom, ReverbZone, RibbonPoint, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite,
+    SynthVoice, UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
 };
 
 const HARNESS: &str = include_str!("codec_round_trip.blot");
@@ -944,7 +944,12 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
         },
         listener: {
             let count = rng.count(1);
-            rng.list(count, |rng| Listener { position: rng.vector(), forward: rng.vector(), up: rng.vector() })
+            rng.list(count, |rng| Listener {
+                position: rng.vector(),
+                forward: rng.vector(),
+                up: rng.vector(),
+                velocity: rng.vector(),
+            })
         },
         panners: {
             let count = rng.count(6);
@@ -961,6 +966,10 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 cone_outer: rng.number(),
                 cone_outer_gain: rng.number(),
                 hrtf: rng.flag(),
+                velocity: rng.vector(),
+                doppler: rng.number(),
+                occlusion: rng.number(),
+                zone: rng.whole(64),
             })
         },
         // The game's own sections follow the packet, and only a checkout that
@@ -1022,6 +1031,40 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 duration: rng.number(),
             })
         },
+        reverb_zones: {
+            let count = rng.count(4);
+            rng.list(count, |rng| ReverbZone {
+                id: rng.whole(64),
+                position: rng.vector(),
+                half_extents: rng.vector(),
+                blend: rng.number(),
+                decay: rng.number(),
+                damping: rng.number(),
+                wet: rng.number(),
+                portal_attenuation: rng.number(),
+            })
+        },
+        synths: {
+            let count = rng.count(4);
+            rng.list(count, |rng| SynthVoice {
+                id: rng.whole(u32::try_from(MAX_VOICE_ID).unwrap()),
+                mode: rng.whole(5),
+                bus: rng.whole(15),
+                frequency: rng.number(),
+                gain: rng.number(),
+                pan: rng.number(),
+                detune: rng.number(),
+                attack: rng.number(),
+                decay: rng.number(),
+                sustain: rng.number(),
+                release: rng.number(),
+                cutoff: rng.number(),
+                resonance: rng.number(),
+                grain_size: rng.number(),
+                grain_pitch: rng.number(),
+                reverb: rng.number(),
+            })
+        },
         emitters: {
             let count = rng.count(4);
             rng.list(count, |rng| Emitter {
@@ -1077,7 +1120,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
 }
 
 /// What `sections` reports of a frame, in its order.
-const SECTIONS: [&str; 29] = [
+const SECTIONS: [&str; 31] = [
     "draws",
     "draw parameters",
     "draw extras",
@@ -1107,6 +1150,8 @@ const SECTIONS: [&str; 29] = [
     "motions",
     "ribbons",
     "haptics",
+    "reverb zones",
+    "synths",
 ];
 
 /// Which of `SECTIONS` a frame holds any of.
@@ -1142,5 +1187,7 @@ fn sections(frame: &RenderFrame) -> [bool; SECTIONS.len()] {
         !frame.motions.is_empty(),
         !frame.ribbons.is_empty(),
         !frame.haptics.is_empty(),
+        !frame.reverb_zones.is_empty(),
+        !frame.synths.is_empty(),
     ]
 }

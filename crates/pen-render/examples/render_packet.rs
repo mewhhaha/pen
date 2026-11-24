@@ -259,6 +259,8 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
         motions: Vec::new(),
         ribbons: Vec::new(),
         haptics: Vec::new(),
+        reverb_zones: Vec::new(),
+        synths: Vec::new(),
         emitters: Vec::new(),
         extensions: Vec::new(),
         lights: Vec::new(),

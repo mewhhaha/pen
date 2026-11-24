@@ -18,9 +18,10 @@ ${fullscreen}
 const GOLDEN_ANGLE: f32 = 2.39996323;
 const TAPS: i32 = 32;
 
-fn depth_at(pixel: vec2i) -> f32 {
-  let limit = vec2i(dof.size.xy) - 1;
-  return textureLoad(depth, clamp(pixel, vec2i(0), limit), 0);
+fn depth_at_uv(uv: vec2f) -> f32 {
+  let dsize = vec2i(textureDimensions(depth));
+  let p = clamp(vec2i(uv * vec2f(dsize)), vec2i(0), dsize - 1);
+  return textureLoad(depth, p, 0);
 }
 
 fn linear_depth(uv: vec2f, d: f32) -> f32 {
@@ -51,7 +52,7 @@ fn signed_coc(z: f32) -> f32 {
   if (max_blur <= 1e-5 || dof.params.z <= 1e-5 || dof.params.x <= 1e-5) {
     return center_color;
   }
-  let center_z = linear_depth(uv, depth_at(pixel));
+  let center_z = linear_depth(uv, depth_at_uv(uv));
   let center_coc = signed_coc(center_z);
   let c_mag = abs(center_coc);
   let aspect = max(dof.size.z, 1e-4);
@@ -66,8 +67,7 @@ fn signed_coc(z: f32) -> f32 {
     let angle = f32(i) * GOLDEN_ANGLE + spin;
     let offset = vec2f(cos(angle) / aspect, sin(angle)) * r;
     let sample_uv = clamp(uv + offset, vec2f(0.0), vec2f(1.0));
-    let sample_pixel = vec2i(sample_uv * size);
-    let sz = linear_depth(sample_uv, depth_at(sample_pixel));
+    let sz = linear_depth(sample_uv, depth_at_uv(sample_uv));
     let sc = signed_coc(sz);
     let s_mag = abs(sc);
     // A tap contributes if its CoC disk reaches the center pixel AND either

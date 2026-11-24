@@ -676,7 +676,7 @@ impl Audio {
             SynthMode::Noise => {
                 if self.noise_buffer.is_none() {
                     let rate = context.sample_rate();
-                    let len = (rate as usize).clamp(4096, 48_000);
+                    let len = crate::policy::noise_buffer_len(rate);
                     let buf = context.create_buffer(1, u32::try_from(len)?, rate).map_err(error)?;
                     let mut state = 0x2545_f491u32;
                     let samples: Vec<f32> = (0..len)
@@ -698,7 +698,7 @@ impl Audio {
             }
             SynthMode::Granular => {
                 let rate = context.sample_rate();
-                let frames = (rate * 0.5) as usize;
+                let frames = crate::policy::granular_loop_frames(rate);
                 let [left, right] = render_granular_loop(spec, f64::from(rate), frames);
                 let buf = context.create_buffer(2, u32::try_from(left.len())?, rate).map_err(error)?;
                 buf.copy_to_channel(&left, 0).map_err(error)?;

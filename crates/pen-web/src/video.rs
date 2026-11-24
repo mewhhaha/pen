@@ -11,17 +11,11 @@ use pen_protocol::{Catalog, RenderFrame};
 use pen_render::{ColorMatrix, IndexedY4mStream, Renderer, VideoPlayer};
 use wasm_bindgen_futures::spawn_local;
 
-/// Maximum simultaneous in-flight HTTP video fetches.
-const MAX_CONCURRENT_FETCHES: usize = 2;
-/// Maximum payload bytes accepted for a single video stream (32 MiB).
-const MAX_STREAM_BYTES: usize = 32 * 1024 * 1024;
-/// Cumulative byte budget across all resident video streams (64 MiB).
-const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
-/// Evict resident CPU + GPU video entries after this many unused frames.
-const EVICT_IDLE_FRAMES: u64 = 180;
-/// Base retry backoff after transient fetch/parse errors (frames).
-const RETRY_BASE_FRAMES: u64 = 60;
-const RETRY_MAX_FRAMES: u64 = 600;
+use crate::policy::{
+    MAX_CONCURRENT_VIDEO_FETCHES as MAX_CONCURRENT_FETCHES, MAX_VIDEO_TOTAL_BYTES as MAX_TOTAL_BYTES,
+    VIDEO_EVICT_IDLE_FRAMES as EVICT_IDLE_FRAMES, select_video_evictions, video_remaining_budget,
+    video_retry_backoff_frames,
+};
 
 struct ActiveVideo {
     player: VideoPlayer,
@@ -131,7 +125,7 @@ impl WebVideoRegistry {
                                             let mut st = shared.borrow_mut();
                                             st.in_flight = st.in_flight.saturating_sub(1);
                                             let next_attempts = attempts.saturating_add(1);
-                                            let backoff = (RETRY_BASE_FRAMES << next_attempts.min(4)).min(RETRY_MAX_FRAMES);
+                                            let backoff = video_retry_backoff_frames(next_attempts);
                                             st.material_keys.insert(
                                                 mat_key_owned.clone(),
                                                 MaterialSlot::Failed { retry_at: now_frame + backoff, attempts: next_attempts },
@@ -154,7 +148,7 @@ impl WebVideoRegistry {
                                         let mut st = shared.borrow_mut();
                                         st.in_flight = st.in_flight.saturating_sub(1);
                                         let next_attempts = attempts.saturating_add(1);
-                                        let backoff = (RETRY_BASE_FRAMES << next_attempts.min(4)).min(RETRY_MAX_FRAMES);
+                                        let backoff = video_retry_backoff_frames(next_attempts);
                                         st.material_keys.insert(
                                             mat_key_owned.clone(),
                                             MaterialSlot::Failed { retry_at: now_frame + backoff, attempts: next_attempts },
@@ -255,38 +249,18 @@ impl WebVideoRegistry {
             }
 
             // Evict idle CPU + GPU streams once past EVICT_IDLE_FRAMES or above cumulative byte budget.
-            let mut evict_keys: Vec<String> = st
+            let snapshot: Vec<(String, u64, usize, bool)> = st
                 .streams
                 .iter()
                 .filter_map(|(k, slot)| match slot {
-                    StreamSlot::Ready(active)
-                        if !touched_keys.contains(k)
-                            && now_frame.saturating_sub(active.last_used_frame) >= EVICT_IDLE_FRAMES =>
-                    {
-                        Some(k.clone())
+                    StreamSlot::Ready(active) => {
+                        Some((k.clone(), active.last_used_frame, active.player.byte_len(), touched_keys.contains(k)))
                     }
                     _ => None,
                 })
                 .collect();
-            if st.total_bytes > MAX_TOTAL_BYTES {
-                let mut candidates: Vec<(String, u64)> = st
-                    .streams
-                    .iter()
-                    .filter_map(|(k, slot)| match slot {
-                        StreamSlot::Ready(active) if !touched_keys.contains(k) && !evict_keys.contains(k) => {
-                            Some((k.clone(), active.last_used_frame))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                candidates.sort_by_key(|&(_, last)| last);
-                for (k, _) in candidates {
-                    if st.total_bytes <= MAX_TOTAL_BYTES {
-                        break;
-                    }
-                    evict_keys.push(k);
-                }
-            }
+            let evict_keys =
+                select_video_evictions(&snapshot, now_frame, st.total_bytes, EVICT_IDLE_FRAMES, MAX_TOTAL_BYTES);
             for k in evict_keys {
                 if let Some(StreamSlot::Ready(active)) = st.streams.remove(&k) {
                     st.total_bytes = st.total_bytes.saturating_sub(active.player.byte_len());
@@ -308,10 +282,7 @@ async fn fetch_stream_task(
     now_frame: u64,
     attempts: u32,
 ) {
-    let remaining_budget = {
-        let st = shared.borrow();
-        MAX_TOTAL_BYTES.saturating_sub(st.total_bytes).min(MAX_STREAM_BYTES)
-    };
+    let remaining_budget = video_remaining_budget(shared.borrow().total_bytes);
     let video_url = format!("{}/{}", assets.trim_end_matches('/'), tex_key);
     let result = if remaining_budget == 0 {
         Err(anyhow::anyhow!("video memory budget ({MAX_TOTAL_BYTES} bytes) exhausted"))
@@ -339,7 +310,7 @@ async fn fetch_stream_task(
         }
         Err(err) => {
             let next_attempts = attempts.saturating_add(1);
-            let backoff = (RETRY_BASE_FRAMES << next_attempts.min(4)).min(RETRY_MAX_FRAMES);
+            let backoff = video_retry_backoff_frames(next_attempts);
             st.streams.insert(
                 tex_key.clone(),
                 StreamSlot::Failed { retry_at: now_frame + backoff, attempts: next_attempts },

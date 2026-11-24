@@ -88,13 +88,15 @@ impl Memory {
 
     /// The TAA pass's uniform for a frame seen through `view` and
     /// `projection`, jittered by `offset` pixels (across and down) into
-    /// `jittered`, on a picture of `size`; the frame is then remembered.
+    /// `jittered`, rendered at `scene_size` and accumulated into `output_size`;
+    /// the frame is then remembered.
     pub fn uniform(
         &mut self,
         view: &Matrix,
         projection: &Matrix,
         (jittered, offset): (&Matrix, (f64, f64)),
-        size: (u32, u32),
+        scene_size: (u32, u32),
+        output_size: (u32, u32),
     ) -> [f32; 40] {
         let now = multiply(projection, view);
         let fresh = self.previous.is_none();
@@ -102,9 +104,18 @@ impl Memory {
         data[..16].copy_from_slice(&invert(&multiply(jittered, view)));
         data[16..32].copy_from_slice(&self.previous.unwrap_or(now));
         let reset = if fresh { 1.0 } else { 0.0 };
-        let (across, down) = (offset.0 / f64::from(size.0.max(1)), offset.1 / f64::from(size.1.max(1)));
+        let (across, down) = (offset.0 / f64::from(scene_size.0.max(1)), offset.1 / f64::from(scene_size.1.max(1)));
         let (across, down) = (crate::matrix::narrow(across), crate::matrix::narrow(down));
-        data[32..].copy_from_slice(&[across, down, BLEND, reset, size.0 as f32, size.1 as f32, 0.0, 0.0]);
+        data[32..].copy_from_slice(&[
+            across,
+            down,
+            BLEND,
+            reset,
+            output_size.0 as f32,
+            output_size.1 as f32,
+            scene_size.0 as f32,
+            scene_size.1 as f32,
+        ]);
         self.previous = Some(now);
         self.frames += 1;
         data
@@ -178,15 +189,15 @@ mod tests {
         let mut memory = Memory::default();
         let mut moved = IDENTITY;
         moved[12] = 1.0;
-        let first = memory.uniform(&IDENTITY, &IDENTITY, (&IDENTITY, (0.0, 0.0)), (8, 8));
+        let first = memory.uniform(&IDENTITY, &IDENTITY, (&IDENTITY, (0.0, 0.0)), (8, 8), (8, 8));
         assert_eq!((first[35], memory.read()), (1.0, 1));
-        let second = memory.uniform(&moved, &IDENTITY, (&IDENTITY, (0.25, -0.5)), (8, 8));
+        let second = memory.uniform(&moved, &IDENTITY, (&IDENTITY, (0.25, -0.5)), (8, 8), (16, 16));
         assert_eq!((second[35], memory.read()), (0.0, 0));
         // The jitter, in texture coordinates.
         assert_eq!(&second[32..34], &[0.25 / 8.0, -0.5 / 8.0]);
         // The last frame's camera, as it was, and this one's inverse.
         assert_eq!(&second[16..32], &IDENTITY);
         assert_eq!(second[12], -1.0);
-        assert_eq!(&second[36..38], &[8.0, 8.0]);
+        assert_eq!(&second[36..40], &[16.0, 16.0, 8.0, 8.0]);
     }
 }

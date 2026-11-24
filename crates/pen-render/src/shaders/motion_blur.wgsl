@@ -18,9 +18,10 @@ struct MotionBlur {
 @group(0) @binding(4) var filtering: sampler;
 ${fullscreen}
 
-fn depth_at(pixel: vec2i) -> f32 {
-  let last = vec2i(mb.size.xy) - 1;
-  return textureLoad(depth, clamp(pixel, vec2i(0), last), 0);
+fn depth_at_uv(uv: vec2f) -> f32 {
+  let dsize = vec2i(textureDimensions(depth));
+  let p = clamp(vec2i(uv * vec2f(dsize)), vec2i(0), dsize - 1);
+  return textureLoad(depth, p, 0);
 }
 
 fn clamp_len(v: vec2f, max_len: f32) -> vec2f {
@@ -28,19 +29,17 @@ fn clamp_len(v: vec2f, max_len: f32) -> vec2f {
   return select(v, v * (max_len / len), len > max_len && len > 1e-6);
 }
 
-fn velocity_at(pixel: vec2i) -> vec2f {
-  let size = mb.size.xy;
-  let last = vec2i(size) - 1;
-  let p = clamp(pixel, vec2i(0), last);
-  let obj = textureLoad(velocity, p, 0).xy;
+fn velocity_at_uv(uv: vec2f) -> vec2f {
+  let vsize = vec2i(textureDimensions(velocity));
+  let vp = clamp(vec2i(uv * vec2f(vsize)), vec2i(0), vsize - 1);
+  let obj = textureLoad(velocity, vp, 0).xy;
   if (abs(obj.x) < 500.0) {
     return obj;
   }
   if (mb.params.w < 0.5) {
     return vec2f(0.0);
   }
-  let uv = (vec2f(p) + 0.5) / size;
-  let d = textureLoad(depth, p, 0);
+  let d = depth_at_uv(uv);
   let world = mb.inverse * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, d, 1.0);
   let before = mb.previous * vec4f(world.xyz / world.w, 1.0);
   if (before.w <= 1e-5) {
@@ -62,7 +61,7 @@ fn velocity_at(pixel: vec2i) -> vec2f {
     return center_color;
   }
 
-  let v_c = clamp_len(velocity_at(pixel) * strength, max_radius);
+  let v_c = clamp_len(velocity_at_uv(uv) * strength, max_radius);
   var v_max = v_c;
   var max_speed = length(v_c);
 
@@ -75,8 +74,8 @@ fn velocity_at(pixel: vec2i) -> vec2f {
   for (var ring = 1; ring <= 2; ring++) {
     let step_uv = max_radius * 0.25 * f32(ring);
     for (var i = 0; i < 8; i++) {
-      let np = vec2i((uv + dirs[i] * step_uv) * size);
-      let vn = clamp_len(velocity_at(np) * strength, max_radius);
+      let nuv = clamp(uv + dirs[i] * step_uv, vec2f(0.0), vec2f(1.0));
+      let vn = clamp_len(velocity_at_uv(nuv) * strength, max_radius);
       let s = length(vn);
       if (s > max_speed) {
         max_speed = s;
@@ -91,7 +90,7 @@ fn velocity_at(pixel: vec2i) -> vec2f {
   }
 
   let count = i32(clamp(mb.params.z, 4.0, 32.0));
-  let z_c = depth_at(pixel);
+  let z_c = depth_at_uv(uv);
   let v_c_len = length(v_c);
   // Interleaved gradient noise breaks stepping bands across fast silhouettes.
   let jitter = fract(52.9829189 * fract(dot(floor(position.xy), vec2f(0.06711056, 0.00583715)))) - 0.5;
@@ -101,9 +100,8 @@ fn velocity_at(pixel: vec2i) -> vec2f {
   for (var i = 0; i < count; i++) {
     let t = (f32(i) + 0.5 + jitter * 0.5) / f32(count) - 0.5;
     let sample_uv = clamp(uv + v_max * t, vec2f(0.0), vec2f(1.0));
-    let sample_pixel = vec2i(sample_uv * size);
-    let z_q = depth_at(sample_pixel);
-    let v_q = clamp_len(velocity_at(sample_pixel) * strength, max_radius);
+    let z_q = depth_at_uv(sample_uv);
+    let v_q = clamp_len(velocity_at_uv(sample_uv) * strength, max_radius);
     let v_q_len = length(v_q);
     let dist = abs(t) * max_speed;
     // Soft depth comparison (hardware depth 0..1, smaller = nearer).

@@ -463,6 +463,37 @@ impl State {
                 } else {
                     wgpu::BufferUsages::VERTEX
                 };
+                let rt_id = self.view_id();
+                let rt_source = mesh.lods.first().and_then(|lod| {
+                    let start = lod.first as usize;
+                    let end = start.saturating_add(lod.count as usize).min(mesh.indices.len());
+                    let idx_slice = mesh.indices.get(start..end)?;
+                    let tri_count = idx_slice.len() / 3;
+                    if tri_count == 0 {
+                        return None;
+                    }
+                    let mut triangles = Vec::with_capacity(tri_count);
+                    let verts = &mesh.vertices;
+                    let vlen = verts.len();
+                    let (tri_chunks, _) = idx_slice.as_chunks::<3>();
+                    for tri in tri_chunks {
+                        let o0 = tri[0] as usize * MESH_VERTEX_FLOATS;
+                        let o1 = tri[1] as usize * MESH_VERTEX_FLOATS;
+                        let o2 = tri[2] as usize * MESH_VERTEX_FLOATS;
+                        if o0 + 6 > vlen || o1 + 6 > vlen || o2 + 6 > vlen {
+                            continue;
+                        }
+                        triangles.push(crate::ray_tracing::BlasTriangle::smooth(
+                            [verts[o0], verts[o0 + 1], verts[o0 + 2]],
+                            [verts[o1], verts[o1 + 1], verts[o1 + 2]],
+                            [verts[o2], verts[o2 + 1], verts[o2 + 2]],
+                            [verts[o0 + 3], verts[o0 + 4], verts[o0 + 5]],
+                            [verts[o1 + 3], verts[o1 + 4], verts[o1 + 5]],
+                            [verts[o2 + 3], verts[o2 + 4], verts[o2 + 5]],
+                        ));
+                    }
+                    (!triangles.is_empty()).then(|| Arc::new(super::RtMeshSource { id: rt_id, triangles }))
+                });
                 let (asset, check) = shader::scoped(&device, || {
                     GpuAsset::Mesh(MeshAsset {
                         vertex_count,
@@ -487,6 +518,7 @@ impl State {
                             targets,
                             deltas: buffer(bytes, wgpu::BufferUsages::STORAGE),
                         }),
+                        rt_source,
                     })
                 });
                 Ok(Some((asset, Some(check))))
@@ -545,7 +577,7 @@ impl State {
                 let state = *self.states.entry(material.state_key()).or_insert(next);
                 Ok(Some((GpuAsset::Material(Arc::new(MaterialAsset { material: *material, state })), None)))
             }
-            Loaded::Shader { module, instancing, skinning, persistent, margin, cascaded } => {
+            Loaded::Shader { module, code, instancing, skinning, persistent, margin, cascaded } => {
                 // What the materials naming it draw with compiles now, for
                 // the sample count frames draw with, each pipeline on a
                 // thread of its own; other variants and counts when a
@@ -557,6 +589,7 @@ impl State {
                 let mut shader = ShaderAsset {
                     revision,
                     module,
+                    code,
                     instancing,
                     skinning,
                     persistent,

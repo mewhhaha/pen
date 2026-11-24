@@ -107,6 +107,7 @@ pub(crate) enum Loaded {
     /// A shader's module; its pipelines compile in jobs of their own.
     Shader {
         module: wgpu::ShaderModule,
+        code: Arc<String>,
         instancing: bool,
         skinning: bool,
         persistent: bool,
@@ -536,12 +537,14 @@ impl Worker {
                     let skinning = shader::has_skinning(&code);
                     let persistent = shader::has_persistent(&code);
                     let cascaded = code.contains("shadow_cascades");
+                    let margin = shader::bounds_margin(&code);
                     Loaded::Shader {
                         module,
+                        code: Arc::new(code),
                         instancing,
                         skinning,
                         persistent,
-                        margin: shader::bounds_margin(&code),
+                        margin,
                         cascaded,
                     }
                 });

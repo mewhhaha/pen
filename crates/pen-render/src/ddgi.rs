@@ -369,6 +369,14 @@ impl DdgiVolume {
         &self.vis_curr.tex
     }
 
+    pub fn uniform_buffer(&self) -> &wgpu::Buffer {
+        &self.uniform
+    }
+
+    pub fn sampler(&self) -> &wgpu::Sampler {
+        &self.sampler
+    }
+
     pub fn reset(&mut self) {
         self.frame_index = 0;
     }

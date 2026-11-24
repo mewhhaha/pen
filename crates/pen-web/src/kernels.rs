@@ -426,10 +426,10 @@ fn js_error_code(err: &JsValue) -> Option<String> {
 }
 
 fn browser_worker_count() -> usize {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped browser hardware concurrency")]
     web_sys::window()
-        .map(|w| w.navigator().hardware_concurrency() as usize)
-        .filter(|&n| n >= 1)
-        .map_or(2, |n| n.clamp(1, 4))
+        .map(|w| w.navigator().hardware_concurrency().clamp(1.0, 4.0) as usize)
+        .unwrap_or(2)
 }
 
 pub struct WebKernelService {
@@ -645,7 +645,7 @@ impl WebKernelService {
             self.ready_replies.push(KernelReply::ctl(req.request, service_status::FAILED, ERR_UPLOAD_TOO_LARGE));
             return;
         }
-        let max_chunks = (self.max_ctx_bytes() / 4).div_ceil(16_380).max(1) as u32;
+        let max_chunks = u32::try_from((self.max_ctx_bytes() / 4).div_ceil(16_380).max(1)).unwrap_or(u32::MAX);
         if (total_words > 0 && total_chunks == 0) || total_chunks > max_chunks {
             self.ready_replies.push(KernelReply::ctl(req.request, service_status::FAILED, ERR_INVALID_REQUEST));
             return;
@@ -880,7 +880,8 @@ impl WebKernelService {
             return Ok(());
         }
         let config = Object::new();
-        let _ = Reflect::set(&config, &"workers".into(), &JsValue::from(self.worker_count as u32));
+        let workers_u32 = u32::try_from(self.worker_count).unwrap_or(1);
+        let _ = Reflect::set(&config, &"workers".into(), &JsValue::from(workers_u32));
         let _ = Reflect::set(&config, &"deadlineMs".into(), &JsValue::from(WEB_BATCH_DEADLINE_MS));
         let _ = Reflect::set(&config, &"maxTotalOutputBytes".into(), &JsValue::from((2u32 << 20) as f64));
         let _ = Reflect::set(&config, &"maxPhysicalOutputBytes".into(), &JsValue::from((4u32 << 20) as f64));
@@ -978,9 +979,10 @@ impl WebKernelService {
     pub async fn join_live_kernels_async(&mut self, input: &mut Vec<f32>) -> usize {
         let batches = std::mem::take(&mut self.pending_batches);
         for batch in batches {
-            if batch.epoch == self.host_epoch {
+            let expected_epoch = batch.epoch;
+            if crate::policy::kernel_epoch_valid(expected_epoch, self.host_epoch) {
                 let reply = self.execute_batch(batch).await;
-                if self.host_epoch == self.host_epoch {
+                if crate::policy::kernel_epoch_valid(expected_epoch, self.host_epoch) {
                     self.ready_replies.push(reply);
                 }
             }
@@ -996,7 +998,13 @@ impl WebKernelService {
         }
         let available = MAX_EVENTS.saturating_sub(base_count);
         let cap_reserve = if self.pending_cap_announcement && available >= CAP_EVENTS { CAP_EVENTS } else { 0 };
-        let reply_budget = available.saturating_sub(cap_reserve).min(MAX_KERNEL_REPLY_EVENTS);
+        let reply_budget = crate::policy::kernel_reply_event_budget(
+            MAX_EVENTS,
+            base_count,
+            self.pending_cap_announcement,
+            CAP_EVENTS,
+            MAX_KERNEL_REPLY_EVENTS,
+        );
         let mut events: Vec<[f32; EVENT_FLOATS]> = Vec::new();
         let mut used = 0usize;
         for reply in self.ready_replies.drain(..) {

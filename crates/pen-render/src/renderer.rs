@@ -102,6 +102,13 @@ const SURFACE_AT: usize = 44 + MAX_DRAW_EXTRA * 4;
 const MAPS_AT: usize = SURFACE_AT + SURFACE_FLOATS;
 const DRAW_BYTES: u64 = (MAPS_AT + MAPS_FLOATS) as u64 * 4;
 
+/// CPU LOD0 triangle snapshot retained on a loaded mesh for lazy BLAS construction when
+/// `quality.ray_tracing > 0` or `quality.ddgi` is active.
+pub(crate) struct RtMeshSource {
+    pub id: u64,
+    pub triangles: Vec<crate::ray_tracing::BlasTriangle>,
+}
+
 pub(crate) struct MeshAsset {
     vertex_count: u32,
     vertices: wgpu::Buffer,
@@ -121,6 +128,8 @@ pub(crate) struct MeshAsset {
     /// Blendshape / morph target deltas on the GPU, evaluated by compute pass.
     morphs: Option<MeshMorphs>,
     instances: Option<MeshInstanceBuffer>,
+    /// LOD0 triangles for lazy ray-tracing / DDGI BLAS construction.
+    rt_source: Option<Arc<RtMeshSource>>,
 }
 
 pub(crate) struct MeshMorphs {
@@ -149,6 +158,8 @@ pub(crate) struct ShaderAsset {
     /// The load that made it, which background compiles answer to.
     revision: u64,
     module: wgpu::ShaderModule,
+    /// Original WGSL source retained for on-demand WBOIT pipeline derivation.
+    code: Arc<String>,
     /// Whether it has a `vertex_instanced` entry point.
     instancing: bool,
     /// Whether it has a `vertex_skinned` entry point.
@@ -350,6 +361,8 @@ struct SolidMesh {
     material: u32,
     buffer: wgpu::Buffer,
     count: u32,
+    /// Triangle snapshot for lazy ray-tracing / DDGI BLAS construction.
+    rt_source: Option<Arc<RtMeshSource>>,
 }
 
 /// Independent per-camera temporal & history state so secondary views (RTT cameras and

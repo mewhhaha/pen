@@ -882,3 +882,185 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
+    let Some((device, queue)) = common::device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pen-wired-oit-rt-ddgi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let quad = json!({
+        "positions": [-1.0, -1.0, 0.0,  1.0, -1.0, 0.0,  1.0, 1.0, 0.0,  -1.0, 1.0, 0.0],
+        "normals": [0.0, 0.0, 1.0,  0.0, 0.0, 1.0,  0.0, 0.0, 1.0,  0.0, 0.0, 1.0],
+        "uvs": [0.0, 1.0,  1.0, 1.0,  1.0, 0.0,  0.0, 0.0],
+        "indices": [0, 1, 2, 0, 2, 3]
+    });
+    std::fs::write(dir.join("quad.mesh.json"), serde_json::to_vec(&quad).unwrap()).unwrap();
+    std::fs::write(dir.join("simple.wgsl"), SIMPLE_SHADER).unwrap();
+    write_solid_png(&dir.join("white.png"), [255, 255, 255, 255]);
+
+    // Materials:
+    // 0: opaque white lit (receiver)
+    // 1: translucent red (alpha 0.5)
+    // 2: translucent blue (alpha 0.6)
+    // 3: unlit emissive red wall (for RT GI/reflection & DDGI color bleeding)
+    // 4: opaque dark receiver / blocker
+    let mats = [
+        ("white.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.85, 0.85, 0.85, 1.0], "lighting": "lit" })),
+        ("red_trans.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.95, 0.08, 0.05, 0.5], "blend": true, "lighting": "unlit" })),
+        ("blue_trans.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.05, 0.15, 0.95, 0.6], "blend": true, "lighting": "unlit" })),
+        ("emissive_red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [1.0, 0.0, 0.0, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 6.0 } })),
+        ("blocker.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.06, 0.06, 0.06, 1.0], "lighting": "lit" })),
+    ];
+    for (name, val) in &mats {
+        std::fs::write(dir.join(name), val.to_string()).unwrap();
+    }
+
+    let catalog = Catalog {
+        meshes: vec!["quad.mesh.json".into()],
+        materials: mats.iter().map(|(n, _)| (*n).into()).collect(),
+        sounds: vec![],
+    };
+
+    let mut renderer = Renderer::new(
+        device.clone(),
+        queue.clone(),
+        RendererOptions {
+            format: common::FORMAT,
+            display: pen_render::Display::SDR,
+            assets: dir.clone(),
+            veil: None,
+            pipeline_cache: None,
+        },
+    )
+    .unwrap();
+    let mut target = common::Offscreen::new(&device, 64);
+
+    let proj = pen_render::perspective_forward_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 50.0);
+    let scale_at = |s: f32, z: f32| -> [f32; 16] {
+        [
+            s, 0.0, 0.0, 0.0,
+            0.0, s, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, z, 1.0,
+        ]
+    };
+
+    // 1) Weighted Blended OIT (`quality.oit = true`) produces identical pixels regardless of draw order!
+    let red_near = Draw { mesh: 0, material: 1, transform: scale_at(3.0, -2.0), parameters: None, extra: None };
+    let blue_far = Draw { mesh: 0, material: 2, transform: scale_at(3.0, -3.5), parameters: None, extra: None };
+
+    let mut oit_ab = common::frame(vec![red_near.clone(), blue_far.clone()]);
+    oit_ab.projection = proj;
+    oit_ab.quality.sky = false;
+    oit_ab.quality.oit = true;
+    oit_ab.clear = Color { r: 0.05, g: 0.05, b: 0.05, a: 1.0 };
+    wait_ready(&mut renderer, &oit_ab, &catalog, &mut target);
+    let px_oit_ab = common::middle(&device, &queue, &target.0);
+
+    let mut oit_ba = oit_ab.clone();
+    oit_ba.draws = vec![blue_far.clone(), red_near.clone()];
+    renderer.submit(&oit_ba, &catalog, &mut target).unwrap();
+    let px_oit_ba = common::middle(&device, &queue, &target.0);
+
+    assert_eq!(
+        px_oit_ab, px_oit_ba,
+        "quality.oit=true must render overlapping translucents identically regardless of submission order: {px_oit_ab:?} vs {px_oit_ba:?}"
+    );
+    assert!(
+        px_oit_ab[0] > px_oit_ab[2],
+        "WBOIT depth weighting must give nearer red quad stronger contribution than farther blue quad: {px_oit_ab:?}"
+    );
+
+    // 2) Ray Tracing (`quality.ray_tracing = 1` shadows/RTAO, `= 2` +reflections/GI) via live RenderFrame!
+    let receiver = Draw { mesh: 0, material: 0, transform: scale_at(4.0, -2.0), parameters: None, extra: None };
+    // Blocker sits behind the camera (z = +1.0) between sun at +z and receiver at z = -2.0.
+    let blocker = Draw { mesh: 0, material: 4, transform: scale_at(4.0, 1.0), parameters: None, extra: None };
+    let mut rt_off = common::frame(vec![receiver.clone(), blocker.clone()]);
+    rt_off.projection = proj;
+    rt_off.light_direction = Vector { x: 0.0, y: 0.0, z: -1.0 };
+    rt_off.light_color = Vector { x: 2.5, y: 2.5, z: 2.5 };
+    rt_off.sky = Default::default();
+    rt_off.quality.sky = false;
+    rt_off.quality.ray_tracing = 0;
+    wait_ready(&mut renderer, &rt_off, &catalog, &mut target);
+    let px_rt0 = common::middle(&device, &queue, &target.0);
+
+    let mut rt_tier1 = rt_off.clone();
+    rt_tier1.quality.ray_tracing = 1;
+    renderer.submit(&rt_tier1, &catalog, &mut target).unwrap();
+    let px_rt1 = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_rt0[0] > px_rt1[0].saturating_add(40),
+        "quality.ray_tracing=1 must cast BVH RT shadows onto receiver: off={px_rt0:?}, rt1={px_rt1:?}"
+    );
+
+    // Swap blocker for bright emissive red panel facing a dark receiver; tier 2 adds RT reflections + 1-bounce GI!
+    let dark_receiver = Draw { mesh: 0, material: 4, transform: scale_at(4.0, -2.0), parameters: None, extra: None };
+    let emissive_panel = Draw { mesh: 0, material: 3, transform: scale_at(4.0, 1.0), parameters: None, extra: None };
+    let mut rt_dark_tier1 = rt_tier1.clone();
+    rt_dark_tier1.draws = vec![dark_receiver.clone(), emissive_panel.clone()];
+    wait_ready(&mut renderer, &rt_dark_tier1, &catalog, &mut target);
+    let px_dark_rt1 = common::middle(&device, &queue, &target.0);
+
+    let mut rt_tier2 = rt_dark_tier1.clone();
+    rt_tier2.quality.ray_tracing = 2;
+    renderer.submit(&rt_tier2, &catalog, &mut target).unwrap();
+    let px_rt2 = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_rt2[0] > px_rt2[2].saturating_add(40) && px_rt2[0] > px_dark_rt1[0].saturating_add(40),
+        "quality.ray_tracing=2 must inject colored RT reflection + 1-bounce GI from emissive wall: rt1={px_dark_rt1:?}, rt2={px_rt2:?}"
+    );
+
+    // 3) Dynamic Diffuse GI (`quality.ddgi = true`) bleeds colored indirect light onto a dark receiver!
+    let mut ddgi_off = common::frame(vec![
+        Draw { mesh: 0, material: 4, transform: scale_at(4.0, -2.0), parameters: None, extra: None },
+        emissive_panel,
+    ]);
+    ddgi_off.projection = proj;
+    ddgi_off.light_direction = Vector { x: 0.0, y: -1.0, z: 0.0 };
+    ddgi_off.light_color = Vector { x: 0.0, y: 0.0, z: 0.0 };
+    ddgi_off.sky = Default::default();
+    ddgi_off.quality.sky = false;
+    ddgi_off.probe_volume = pen_protocol::ProbeVolume {
+        revision: 1,
+        nx: 3,
+        ny: 3,
+        nz: 3,
+        spacing: 1.5,
+        origin: Vector { x: -1.5, y: -1.5, z: -2.0 },
+    };
+    ddgi_off.quality.ddgi = false;
+    renderer.submit(&ddgi_off, &catalog, &mut target).unwrap();
+    let px_no_ddgi = common::middle(&device, &queue, &target.0);
+
+    let mut ddgi_on = ddgi_off.clone();
+    ddgi_on.quality.ddgi = true;
+    for _ in 0..4 {
+        renderer.submit(&ddgi_on, &catalog, &mut target).unwrap();
+    }
+    let px_ddgi = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_ddgi[0] > px_no_ddgi[0].saturating_add(25) && px_ddgi[0] > px_ddgi[2].saturating_add(20),
+        "quality.ddgi=true must illuminate receiver with red indirect diffuse color bleed: off={px_no_ddgi:?}, on={px_ddgi:?}"
+    );
+
+    // 4) Temporal Upscaling (`quality.upscale = true`, `scale = 0.5`) accumulates into full-res TAA history + RCAS!
+    let mut upscale_frame = common::frame(vec![receiver]);
+    upscale_frame.projection = proj;
+    upscale_frame.quality.sky = false;
+    upscale_frame.quality.scale = 0.5;
+    upscale_frame.quality.upscale = true;
+    for _ in 0..8 {
+        renderer.submit(&upscale_frame, &catalog, &mut target).unwrap();
+    }
+    let passes = renderer.passes();
+    assert!(passes.contains(&"taa"), "quality.upscale=true must enable temporal accumulation pass: {passes:?}");
+    let px_up = common::middle(&device, &queue, &target.0);
+    assert!(px_up[0] > 100 && px_up[1] > 100 && px_up[2] > 100, "upscaled receiver must render cleanly: {px_up:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -396,9 +396,13 @@ impl State {
         let composite = (!scratch.insets.is_empty()).then(|| self.built_ins.get(BuiltIn::Composite).clone());
 
         let tables = self.look_up_tables(frame, catalog)?;
-        // Screen-space reflections read the history and the noise of TAA.
-        let quality =
-            pen_protocol::Quality { msaa: samples, scale, taa: frame.quality.taa || reflected > 0, ..frame.quality };
+        // Screen-space reflections and temporal upscaling read TAA's jittered history.
+        let quality = pen_protocol::Quality {
+            msaa: samples,
+            scale,
+            taa: frame.quality.taa || reflected > 0 || frame.quality.upscale,
+            ..frame.quality
+        };
         // Translucent surfaces, particles and overlays draw after the opaque
         // picture is misted, in a pass of their own; a frame without them draws
         // the scene as one picture.
@@ -476,6 +480,8 @@ impl State {
             Vec::new()
         };
         let capture = self.prepare_capture(frame, scratch, samples);
+        let oit_pipelines = self.prepare_oit_pipelines(frame, scratch, samples);
+        let tlas_ready = self.prepare_tlas_scene(frame, scratch)?;
         let drawing = Drawing {
             assets: &self.assets,
             items: &scratch.items,
@@ -684,6 +690,22 @@ impl State {
                 targets.size,
             )?;
         }
+        if tlas_ready && (frame.quality.ray_tracing > 0 || frame.quality.ddgi) {
+            Self::encode_rt_and_ddgi_wired(
+                &mut self.wired,
+                &mut self.built_ins,
+                &device,
+                &self.queue,
+                &mut encoder,
+                frame,
+                self.frames,
+                &active_proj_for_trails,
+                &targets.scene,
+                &targets.depth_only,
+                targets.size,
+                samples,
+            )?;
+        }
         if subsurface {
             self.post.as_mut().unwrap().diffuse(&mut self.built_ins, &mut encoder, frame, &self.timer);
         }
@@ -691,23 +713,108 @@ impl State {
             let post = self.post.as_mut().unwrap();
             post.opaque(&mut self.built_ins, &mut encoder, frame, &self.timer);
             let group = &self.translucent_group.as_ref().expect("a translucent frame binds its own scene").0;
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("translucent"),
-                color_attachments: &[Some(targets.translucent_color())],
-                timestamp_writes: self.timer.pass(Span::Scene),
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &targets.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                    stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                }),
-                ..Default::default()
-            });
-            post.draw_backdrop(&mut self.built_ins, &mut pass);
-            draw_layers(&mut pass, group, &[(&scratch.translucent, Layer::Translucent)], &mut stats);
-            particles::draw(&mut pass, &scratch.emitters);
-            ribbons::draw(&mut pass, self.ribbons.as_ref(), &scratch.ribbons);
-            let overlays = [(&scratch.overlays[..], Layer::Occluded), (&scratch.overlays[..], Layer::Visible)];
-            draw_layers(&mut pass, group, &overlays, &mut stats);
+            let use_oit = frame.quality.oit && oit_pipelines.iter().any(Option::is_some);
+            if use_oit {
+                let mut fallback_translucent = Vec::new();
+                for (slot, &entry_idx) in scratch.translucent.iter().enumerate() {
+                    if oit_pipelines.get(slot).and_then(Option::as_ref).is_none() {
+                        fallback_translucent.push(entry_idx);
+                    }
+                }
+                let has_after_oit = !fallback_translucent.is_empty()
+                    || !scratch.emitters.is_empty()
+                    || !scratch.ribbons.is_empty()
+                    || !scratch.overlays.is_empty();
+                {
+                    let mut backdrop_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("translucent_backdrop"),
+                        color_attachments: &[Some(targets.color(wgpu::Color::BLACK, true, false))],
+                        timestamp_writes: self.timer.pass(Span::Scene),
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &targets.depth,
+                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                            stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        }),
+                        ..Default::default()
+                    });
+                    post.draw_backdrop(&mut self.built_ins, &mut backdrop_pass);
+                }
+                {
+                    let oit = self
+                        .wired
+                        .oit_pass
+                        .get_or_insert_with(|| crate::oit::OitPass::new(&device, crate::post::SCENE_FORMAT, None));
+                    oit.resize_with_samples(&device, targets.size, samples);
+                    let mut oit_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("translucent_oit"),
+                        color_attachments: &oit.attachments(),
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &targets.depth,
+                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                            stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        }),
+                        ..Default::default()
+                    });
+                    oit_pass.set_bind_group(0, group, &[]);
+                    oit_pass.set_bind_group(2, lights, &[]);
+                    oit_pass.set_stencil_reference(0);
+                    let mut current: Option<&wgpu::RenderPipeline> = None;
+                    for (slot, &entry_idx) in scratch.translucent.iter().enumerate() {
+                        let Some(pipeline) = oit_pipelines.get(slot).and_then(Option::as_ref) else { continue };
+                        let entry = &ready[entry_idx];
+                        if current != Some(pipeline) {
+                            current = Some(pipeline);
+                            oit_pass.set_pipeline(pipeline);
+                        }
+                        oit_pass.set_bind_group(1, &entry.group, &[entry.offset]);
+                        drawing.draw(&mut oit_pass, entry, 0, Some(&mut stats));
+                    }
+                }
+                let oit = self.wired.oit_pass.as_mut().unwrap();
+                oit.composite_attachment(
+                    &device,
+                    &mut encoder,
+                    targets.color(wgpu::Color::BLACK, false, !has_after_oit),
+                    samples,
+                );
+                if has_after_oit {
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("translucent_after_oit"),
+                        color_attachments: &[Some(targets.color(wgpu::Color::BLACK, false, true))],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &targets.depth,
+                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                            stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        }),
+                        ..Default::default()
+                    });
+                    if !fallback_translucent.is_empty() {
+                        draw_layers(&mut pass, group, &[(&fallback_translucent, Layer::Translucent)], &mut stats);
+                    }
+                    particles::draw(&mut pass, &scratch.emitters);
+                    ribbons::draw(&mut pass, self.ribbons.as_ref(), &scratch.ribbons);
+                    let overlays = [(&scratch.overlays[..], Layer::Occluded), (&scratch.overlays[..], Layer::Visible)];
+                    draw_layers(&mut pass, group, &overlays, &mut stats);
+                }
+            } else {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("translucent"),
+                    color_attachments: &[Some(targets.translucent_color())],
+                    timestamp_writes: self.timer.pass(Span::Scene),
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &targets.depth,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    }),
+                    ..Default::default()
+                });
+                post.draw_backdrop(&mut self.built_ins, &mut pass);
+                draw_layers(&mut pass, group, &[(&scratch.translucent, Layer::Translucent)], &mut stats);
+                particles::draw(&mut pass, &scratch.emitters);
+                ribbons::draw(&mut pass, self.ribbons.as_ref(), &scratch.ribbons);
+                let overlays = [(&scratch.overlays[..], Layer::Occluded), (&scratch.overlays[..], Layer::Visible)];
+                draw_layers(&mut pass, group, &overlays, &mut stats);
+            }
         }
         let has_filters = scratch.sprites.iter().any(|batch| batch.scene_filter);
         let wants_polish = super::wired_passes::WiredPasses::wants_post_polish(frame);

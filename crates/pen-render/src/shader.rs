@@ -597,6 +597,54 @@ pub(crate) fn pipelines(
     }
 }
 
+/// A shader's Weighted Blended OIT pipeline (dual `accum: Rgba16Float` + `reveal: R8Unorm` targets,
+/// depth-tested without depth writes).
+pub(crate) fn oit_pipeline(
+    context: &PipelineContext,
+    module: &wgpu::ShaderModule,
+    samples: u32,
+    stage: Stage,
+) -> wgpu::RenderPipeline {
+    let buffers = vertex_buffers(stage);
+    context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("oit_mesh"),
+        layout: Some(stage.layout(context)),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some(stage.entry_point()),
+            compilation_options: Default::default(),
+            buffers: &buffers,
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: Some(wgpu::Face::Back),
+            front_face: wgpu::FrontFace::Ccw,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24PlusStencil8,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: wgpu::StencilState {
+                front: stamping(false),
+                back: stamping(false),
+                read_mask: !0,
+                write_mask: !0,
+            },
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: samples.max(1), ..Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some("fragment_oit"),
+            compilation_options: Default::default(),
+            targets: &crate::oit::oit_color_targets(),
+        }),
+        multiview_mask: None,
+        cache: context.cache.get(),
+    })
+}
+
 /// A shader's depth-only pipeline into the shadow map.
 pub(crate) fn shadow_pipeline(
     context: &PipelineContext,

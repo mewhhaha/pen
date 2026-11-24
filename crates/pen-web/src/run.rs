@@ -303,6 +303,7 @@ pub struct Browser {
 }
 
 impl Browser {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mut game: Runtime,
         game_wasm: Option<Vec<u8>>,
@@ -686,27 +687,27 @@ impl Browser {
                     let saved = self.game.scene().await;
                     self.save("pen.scene", saved, "saved the scene").await;
                 }
-                if rendered.scene_load_requested {
-                    if let Some(load) = self.load("pen.scene", true).await {
-                        loads.push(load);
-                        state_replaced = true;
-                    }
+                if rendered.scene_load_requested
+                    && let Some(load) = self.load("pen.scene", true).await
+                {
+                    loads.push(load);
+                    state_replaced = true;
                 }
                 if rendered.save_requested {
                     let saved = self.game.snapshot().await;
                     self.save("pen.quicksave", saved, "saved").await;
                 }
-                if rendered.load_requested {
-                    if let Some(load) = self.load("pen.quicksave", false).await {
-                        loads.push(load);
-                        state_replaced = true;
-                    }
+                if rendered.load_requested
+                    && let Some(load) = self.load("pen.quicksave", false).await
+                {
+                    loads.push(load);
+                    state_replaced = true;
                 }
-                if let Some((name, saved)) = self.importing.take() {
-                    if let Some(load) = self.load_state(&name, saved, false).await {
-                        loads.push(load);
-                        state_replaced = true;
-                    }
+                if let Some((name, saved)) = self.importing.take()
+                    && let Some(load) = self.load_state(&name, saved, false).await
+                {
+                    loads.push(load);
+                    state_replaced = true;
                 }
             }
         }

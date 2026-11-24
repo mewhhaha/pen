@@ -1,41 +1,75 @@
 //! Browser front end for the shared pen runtime and WebGPU renderer. It
-//! builds for wasm32-unknown-unknown only (`build.sh`).
-#![cfg(target_arch = "wasm32")]
+//! builds for wasm32-unknown-unknown (`build.sh`), while exposing pure
+//! target-independent browser host policies in [`policy`] for native unit tests.
+pub mod policy;
+
+#[cfg(target_arch = "wasm32")]
 mod accessibility;
+#[cfg(target_arch = "wasm32")]
 mod audio;
+#[cfg(target_arch = "wasm32")]
 mod development;
+#[cfg(target_arch = "wasm32")]
 mod files;
+#[cfg(target_arch = "wasm32")]
 mod input;
+#[cfg(target_arch = "wasm32")]
 mod kernels;
+#[cfg(target_arch = "wasm32")]
 pub mod net;
+#[cfg(target_arch = "wasm32")]
 mod preferences;
+#[cfg(target_arch = "wasm32")]
 mod program;
+#[cfg(target_arch = "wasm32")]
 mod replay;
+#[cfg(target_arch = "wasm32")]
 mod run;
+#[cfg(target_arch = "wasm32")]
 mod saves;
+#[cfg(target_arch = "wasm32")]
 mod screen;
+#[cfg(target_arch = "wasm32")]
 mod services;
+#[cfg(target_arch = "wasm32")]
 mod tools;
+#[cfg(target_arch = "wasm32")]
 mod video;
 
+#[cfg(target_arch = "wasm32")]
 use anyhow::Result;
+#[cfg(target_arch = "wasm32")]
 use js_sys::Uint8Array;
+#[cfg(target_arch = "wasm32")]
 use pen_protocol::{Catalog, GameEvent, RenderFrame, Viewport, service, service_status};
+#[cfg(target_arch = "wasm32")]
 use pen_runtime::devtools::{Log, log_source};
+#[cfg(target_arch = "wasm32")]
 use pen_runtime::game::Host;
+#[cfg(target_arch = "wasm32")]
 use pen_runtime::snapshot::{self, SavedState};
+#[cfg(target_arch = "wasm32")]
 use pen_runtime::state::{self, CONFIG_FILE, StateAdapter};
+#[cfg(target_arch = "wasm32")]
 use std::sync::Arc;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, prelude::*};
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::{JsFuture, spawn_local};
+#[cfg(target_arch = "wasm32")]
 use web_sys::{HtmlCanvasElement, Response};
 
+#[cfg(target_arch = "wasm32")]
 use program::{BrowserBackend, error};
+#[cfg(target_arch = "wasm32")]
 use run::{Browser, Options, Runtime};
+#[cfg(target_arch = "wasm32")]
 use screen::Screen;
+#[cfg(target_arch = "wasm32")]
 use tools::Tools;
 
 /// Fetches `path`, relative to the page.
+#[cfg(target_arch = "wasm32")]
 pub async fn fetch(path: &str) -> Result<Vec<u8>> {
     let response: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str(path))
         .await
@@ -49,6 +83,7 @@ pub async fn fetch(path: &str) -> Result<Vec<u8>> {
 
 /// Fetches `path`, rejecting responses whose `Content-Length` or payload exceeds `max_bytes`
 /// before copying into Wasm linear memory.
+#[cfg(target_arch = "wasm32")]
 pub async fn fetch_bounded(path: &str, max_bytes: usize) -> Result<Vec<u8>> {
     let response: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str(path))
         .await
@@ -56,12 +91,10 @@ pub async fn fetch_bounded(path: &str, max_bytes: usize) -> Result<Vec<u8>> {
         .dyn_into()
         .map_err(error)?;
     anyhow::ensure!(response.ok(), "fetch {path}: HTTP {}", response.status());
-    if let Ok(Some(len_header)) = response.headers().get("content-length")
-        && let Ok(declared) = len_header.trim().parse::<u64>()
-    {
+    if let Ok(Some(len_header)) = response.headers().get("content-length") {
         anyhow::ensure!(
-            declared <= max_bytes as u64,
-            "fetch {path}: Content-Length {declared} exceeds {max_bytes}-byte limit"
+            policy::content_length_within_limit(&len_header, max_bytes),
+            "fetch {path}: Content-Length {len_header} exceeds {max_bytes}-byte limit"
         );
     }
     let buffer = JsFuture::from(response.array_buffer().map_err(error)?).await.map_err(error)?;
@@ -72,6 +105,7 @@ pub async fn fetch_bounded(path: &str, max_bytes: usize) -> Result<Vec<u8>> {
 }
 
 /// Missing optional declarations are opaque; all other failures stay visible.
+#[cfg(target_arch = "wasm32")]
 pub(crate) async fn load_state_adapter(assets: &str) -> Arc<dyn StateAdapter> {
     let path = format!("{assets}/{CONFIG_FILE}");
     let loaded: Result<Arc<dyn StateAdapter>> = async {
@@ -99,6 +133,7 @@ pub(crate) async fn load_state_adapter(assets: &str) -> Arc<dyn StateAdapter> {
 /// Names the page after the game, as its `game.json` (`pen build --web`
 /// writes it) titles it; returns its name, which the files the page hands
 /// the player are named after.
+#[cfg(target_arch = "wasm32")]
 async fn manifest(manifest: &str, canvas: &HtmlCanvasElement) -> String {
     let game = fetch(manifest).await.ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
     let field = |key: &str| {
@@ -112,18 +147,21 @@ async fn manifest(manifest: &str, canvas: &HtmlCanvasElement) -> String {
     field("name").unwrap_or_else(|| "game".to_owned())
 }
 
+#[cfg(target_arch = "wasm32")]
 fn failed(error: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&format!("{error:#}"))
 }
 
 /// What the game's runtime needs while it starts: the viewport, checks,
 /// and the log for what it made of the saved state.
+#[cfg(target_arch = "wasm32")]
 struct Starting<'a> {
     viewport: Viewport,
     log: &'a mut Log,
     state_adapter: &'a Arc<dyn StateAdapter>,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl Host for Starting<'_> {
     fn viewport(&self) -> Viewport {
         self.viewport
@@ -151,6 +189,7 @@ impl Host for Starting<'_> {
 /// all relative to the page for portable exports, and set `development`
 /// (served by `pen web`) and `qualify` (the browser harnesses' hooks). A
 /// recording the page's link names (`#replay=` or `?replay=`) plays first.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(|info| web_sys::console::error_1(&info.to_string().into())));
@@ -185,9 +224,16 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         .and_then(|obj| {
             let url = js_sys::Reflect::get(&obj, &"url".into()).ok()?.as_string()?;
             let room = js_sys::Reflect::get(&obj, &"room".into()).ok()?.as_string()?;
-            let player = js_sys::Reflect::get(&obj, &"player".into()).ok()?.as_f64()? as usize;
-            let players = js_sys::Reflect::get(&obj, &"players".into()).ok()?.as_f64()? as usize;
-            let token = js_sys::Reflect::get(&obj, &"token".into()).ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as u64;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped positive JS netplay config")]
+            let (player, players, token) = (
+                js_sys::Reflect::get(&obj, &"player".into()).ok()?.as_f64()?.clamp(0.0, 255.0) as usize,
+                js_sys::Reflect::get(&obj, &"players".into()).ok()?.as_f64()?.clamp(1.0, 256.0) as usize,
+                js_sys::Reflect::get(&obj, &"token".into())
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .unwrap_or(0.0) as u64,
+            );
             Some(run::NetRelayConfig { url, room, player, players, token })
         });
     let options = Options {
@@ -246,6 +292,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
 
 /// Browser engine qualification: identical request packets to `pen packets`.
 /// It deliberately skips rendering and platform IO, just as native packet runs do.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn qualify(module: Uint8Array, scene: Uint8Array, inputs: js_sys::Array) -> Result<js_sys::Array, JsValue> {
     use pen_runtime::program::{Backend, Operation, Program};
@@ -275,6 +322,7 @@ pub async fn qualify(module: Uint8Array, scene: Uint8Array, inputs: js_sys::Arra
 }
 
 /// Exercises real browser platform adapters without changing a game's saves.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub async fn qualify_platform() -> Result<String, JsValue> {
     let result = async {
@@ -319,6 +367,7 @@ pub async fn qualify_platform() -> Result<String, JsValue> {
 /// The simulation services' answers to fixed requests, here in wasm32, as
 /// their digest: the same bits as native's, or an error saying what
 /// differs. Needs no page, so node runs it too (tests/services.mjs).
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn qualify_services() -> Result<String, JsValue> {
     let mut services = pen_runtime::services::Services::<()>::new();
@@ -327,6 +376,7 @@ pub fn qualify_services() -> Result<String, JsValue> {
 }
 
 /// Checks the host boundary with the same binary fixtures as the native tests.
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn qualify_frame(packet: &[f32], schema: u32, catalog: &str) -> Result<String, JsValue> {
     let catalog = serde_json::from_str(catalog).map_err(failed)?;

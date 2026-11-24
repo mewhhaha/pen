@@ -75,9 +75,13 @@ fn clipped(color: vec3f, low: vec3f, high: vec3f) -> vec3f {
 }
 
 @fragment fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
-  let size = taa.size.xy;
-  let pixel = vec2i(position.xy);
-  let last = vec2i(size) - 1;
+  let out_size = taa.size.xy;
+  let scene_size = select(out_size, taa.size.zw, taa.size.z > 0.5 && taa.size.w > 0.5);
+  let is_upscale = any(abs(out_size - scene_size) > vec2f(0.5));
+  let uv = position.xy / out_size;
+  let sample_uv = clamp(uv + taa.blend.xy, vec2f(0.0), vec2f(1.0));
+  let scene_last = vec2i(scene_size) - 1;
+  let pixel = select(vec2i(position.xy), clamp(vec2i(floor(sample_uv * scene_size)), vec2i(0), scene_last), is_upscale);
   // The neighbourhood of this frame: its colours' range and spread, and the
   // nearest depth in it, so an edge follows the surface in front.
   var low = vec3f(1e9);
@@ -89,7 +93,7 @@ fn clipped(color: vec3f, low: vec3f, high: vec3f) -> vec3f {
   var nearest_at = pixel;
   for (var y = -1; y <= 1; y++) {
     for (var x = -1; x <= 1; x++) {
-      let at = clamp(pixel + vec2i(x, y), vec2i(0), last);
+      let at = clamp(pixel + vec2i(x, y), vec2i(0), scene_last);
       let color = ycocg(squeezed(textureLoad(current, at, 0).rgb));
       if (x == 0 && y == 0) {
         middle = color;
@@ -105,14 +109,17 @@ fn clipped(color: vec3f, low: vec3f, high: vec3f) -> vec3f {
       }
     }
   }
+  if (is_upscale) {
+    middle = clamp(ycocg(squeezed(textureSampleLevel(current, filtering, sample_uv, 0.0).rgb)), low, high);
+  }
   mean /= 9.0;
   let spread = sqrt(max(square / 9.0 - mean * mean, vec3f(0.0))) * 1.25;
   // Where that surface was in the last frame. When a velocity vector is present
   // at the nearest depth in the 3x3 neighbourhood, follow it directly (covering
   // rigid, skinned and morphed motion); otherwise fall back to camera depth
-  // reprojection shifted back by this frame's jitter so still surfaces read
-  // their history without resampling.
-  let uv = position.xy / size;
+  // reprojection. In temporal-upscaling mode (`is_upscale`), `sample_uv` maps
+  // the unjittered output pixel to its jittered scene coordinate so `before`
+  // lands directly on the unjittered full-res history UV.
   let obj_vel = textureLoad(velocity, nearest_at, 0).xy;
   var was = uv;
   var gone = false;
@@ -120,9 +127,10 @@ fn clipped(color: vec3f, low: vec3f, high: vec3f) -> vec3f {
     was = uv - obj_vel;
     gone = any(was < vec2f(0.0)) || any(was > vec2f(1.0));
   } else {
-    let world = taa.inverse * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, nearest, 1.0);
+    let reproj_uv = select(uv, sample_uv, is_upscale);
+    let world = taa.inverse * vec4f(reproj_uv.x * 2.0 - 1.0, 1.0 - reproj_uv.y * 2.0, nearest, 1.0);
     let before = taa.previous * vec4f(world.xyz / world.w, 1.0);
-    was = vec2f(before.x, -before.y) / before.w * 0.5 + 0.5 + taa.blend.xy;
+    was = vec2f(before.x, -before.y) / before.w * 0.5 + 0.5 + select(taa.blend.xy, vec2f(0.0), is_upscale);
     gone = before.w <= 0.0 || any(was < vec2f(0.0)) || any(was > vec2f(1.0));
   }
   if (taa.blend.w > 0.5 || gone) {

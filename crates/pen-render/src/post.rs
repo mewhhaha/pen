@@ -291,6 +291,9 @@ pub(crate) fn scene_size(device: &wgpu::Device, size: (u32, u32), scale: f32) ->
 struct TargetsKey {
     width: u32,
     height: u32,
+    /// Post-TAA target resolution (equals display resolution when temporal upscaling is active).
+    taa_width: u32,
+    taa_height: u32,
     samples: u32,
     occluding: bool,
     atmosphere: bool,
@@ -790,16 +793,21 @@ impl Post {
         // the multisampled targets of more would take gigabytes.
         let (width, height) = scene_size(&self.device, size, quality.scale);
         let samples = quality.msaa;
+        let ssgi = quality.ssgi;
+        let taa = quality.taa;
+        let (taa_width, taa_height) = if taa && quality.upscale && (width < size.0 || height < size.1) {
+            scene_size(&self.device, size, 1.0)
+        } else {
+            (width, height)
+        };
         // Halving down to no smaller than a few pixels.
-        let half = (width.div_ceil(2), height.div_ceil(2));
+        let half = (taa_width.div_ceil(2), taa_height.div_ceil(2));
         let levels = if quality.bloom {
             // floor(log2(side / 4)) + 1
             half.0.min(half.1).checked_ilog2().unwrap_or(0).saturating_sub(1).clamp(1, BLOOM_LEVELS)
         } else {
             0
         };
-        let ssgi = quality.ssgi;
-        let taa = quality.taa;
         let dof =
             quality.effects && frame.dof.focus_distance > 0.0 && frame.dof.aperture > 0.0 && frame.dof.max_blur > 0.0;
         let motion_blur =
@@ -807,6 +815,8 @@ impl Post {
         let key = TargetsKey {
             width,
             height,
+            taa_width,
+            taa_height,
             samples,
             occluding,
             atmosphere,
@@ -854,7 +864,8 @@ impl Post {
             // rest; a new history starts afresh.
             self.memory = Default::default();
             self.previous_vp = None;
-            let histories = taa.then(|| [0, 1].map(|_| crate::taa::history(device, width, height, SCENE_FORMAT)));
+            let histories =
+                taa.then(|| [0, 1].map(|_| crate::taa::history(device, taa_width, taa_height, SCENE_FORMAT)));
             let mut graphs: Vec<Graph> = Vec::new();
             for read in 0..if taa { 2 } else { 1 } {
                 let history = histories.as_ref().map(|textures| [view(&textures[read]), view(&textures[1 - read])]);
@@ -1062,8 +1073,22 @@ impl Post {
         physical_sky: Option<&PhysicalSkyBinding>,
         sharing: Option<&Graph>,
     ) -> anyhow::Result<Graph> {
-        let TargetsKey { width, height, samples, occluding, atmosphere, ssgi, levels, dof, motion_blur, .. } = key;
+        let TargetsKey {
+            width,
+            height,
+            taa_width,
+            taa_height,
+            samples,
+            occluding,
+            atmosphere,
+            ssgi,
+            levels,
+            dof,
+            motion_blur,
+            ..
+        } = key;
         let full = |format: wgpu::TextureFormat| Spec { width, height, format };
+        let full_post = |format: wgpu::TextureFormat| Spec { width: taa_width, height: taa_height, format };
         let sampler = Binding::Sampler(self.sampler.clone());
         let mut graph = GraphBuilder::default();
         let depth = graph.import("depth", inputs.depth);
@@ -1165,14 +1190,14 @@ impl Post {
             lit = drawn;
         }
         if dof {
-            let focused = graph.texture("dof", full(SCENE_FORMAT));
+            let focused = graph.texture("dof", full_post(SCENE_FORMAT));
             let uniform = Binding::Uniform(self.uniform("dof", 96));
             let bindings = vec![uniform, Binding::Texture(lit), Binding::Texture(depth), sampler.clone()];
             graph.pass("dof", BuiltIn::Dof(samples), bindings, Target::Texture(focused), false);
             lit = focused;
         }
         if motion_blur {
-            let smeared = graph.texture("motion blur", full(SCENE_FORMAT));
+            let smeared = graph.texture("motion blur", full_post(SCENE_FORMAT));
             let uniform = Binding::Uniform(self.uniform("motion blur", 160));
             let bindings =
                 vec![uniform, Binding::Texture(lit), Binding::Texture(velocity), Binding::Texture(depth), sampler.clone()];
@@ -1183,8 +1208,8 @@ impl Post {
         graph.hook("meter", lit);
         let exposure = Binding::Storage(self.exposure.state().clone());
         // Bloom halves the picture level by level, then adds each level onto
-        // the one above, back up to half the scene's size.
-        let half = (width.div_ceil(2), height.div_ceil(2));
+        // the one above, back up to half the post-TAA picture's size.
+        let half = (taa_width.div_ceil(2), taa_height.div_ceil(2));
         let bloom: Vec<Handle> = (0..levels)
             .map(|level| {
                 let size = (level_size(half.0, level), level_size(half.1, level));
@@ -1330,7 +1355,8 @@ impl Post {
     ) {
         let quality = self.quality.expect("Post::begin comes first");
         let size = self.size;
-        let TargetsKey { width, height, levels, taa, dof, motion_blur, .. } = self.targets.as_ref().unwrap().key;
+        let TargetsKey { width, height, taa_width, taa_height, levels, taa, dof, motion_blur, .. } =
+            self.targets.as_ref().unwrap().key;
         // The opaque picture of a frame with translucent surfaces was worked out
         // before the translucent pass.
         if !self.translucent {
@@ -1342,12 +1368,18 @@ impl Post {
         let graph = if taa { self.memory.read() } else { 0 };
         if taa {
             let uniform = self.uniform("taa", 160);
-            let data = self.memory.uniform(&frame.view, &frame.projection, (&projection, offset), (width, height));
+            let data = self.memory.uniform(
+                &frame.view,
+                &frame.projection,
+                (&projection, offset),
+                (width, height),
+                (taa_width, taa_height),
+            );
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
         if dof {
             let uniform = self.uniform("dof", 96);
-            let data = crate::dof::uniform(&projection, &frame.dof, (width, height));
+            let data = crate::dof::uniform(&projection, &frame.dof, (taa_width, taa_height));
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
         if motion_blur {
@@ -1357,7 +1389,7 @@ impl Post {
                 (&projection, offset),
                 self.previous_vp,
                 &frame.motion_blur,
-                (width, height),
+                (taa_width, taa_height),
             );
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
@@ -1371,8 +1403,8 @@ impl Post {
                 1.0 / output_height,
                 if quality.effects && !filtered { frame.blur } else { 0.0 },
                 0.0,
-                1.0 / width as f32,
-                1.0 / height as f32,
+                1.0 / taa_width as f32,
+                1.0 / taa_height as f32,
                 if quality.fxaa { 1.0 } else { 0.0 },
                 0.0,
                 // Screen heights, as texture coordinates.
@@ -1408,7 +1440,7 @@ impl Post {
             Span::Post,
             Some(&late),
             &mut |picture, encoder| {
-                exposure.meter(encoder, picture, (width, height));
+                exposure.meter(encoder, picture, (taa_width, taa_height));
             },
         );
         self.previous_vp = Some(multiply(&frame.projection, &frame.view));

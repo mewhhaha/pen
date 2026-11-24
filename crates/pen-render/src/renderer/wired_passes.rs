@@ -1,26 +1,35 @@
 //! End-to-end wiring of high-fidelity rendering passes into `Renderer::draw`:
 //! - Hillaire physical atmosphere LUTs & volumetric clouds (`quality.physical_sky`)
 //! - Full PBR deferred decals (`frame.pbr_decals`)
+//! - Weighted Blended Order-Independent Transparency (`quality.oit`)
+//! - Portable 2-level TLAS/BLAS ray tracing (`quality.ray_tracing` 1 = shadows+RTAO, 2 = +reflections+GI)
+//! - Dynamic Diffuse Global Illumination probe grid (`quality.ddgi`)
 //! - AMD FidelityFX RCAS sharpening & Post-FX polish (`grade.{sharpness, grain, flare, outline_strength}`)
 //! - Render-to-texture & split-screen secondary cameras (`frame.camera_targets`)
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use anyhow::Result;
 use pen_protocol::{Catalog, Matrix, RenderFrame};
 
-use super::{GpuAsset, State, TextureRef, ViewTemporalState};
+use super::{GpuAsset, Scratch, Shape, State, TextureRef, ViewTemporalState};
 use crate::asset_store::AssetKind;
 use crate::atmosphere_lut::{
     AtmosphereParams, BASE_CAMERA_ALTITUDE_KM, PhysicalAtmosphere, WORLD_METERS_TO_KM, physical_camera_km,
 };
 use crate::built_in::{BuiltIn, BuiltIns};
+use crate::ddgi::{DDGI_WGSL, DdgiFrameParams, DdgiGridConfig, DdgiVolume};
 use crate::decals::{PbrDecal, PbrDecalPass, PbrDecalView};
 use crate::lights::MAX_AREA_COOKIES;
-use crate::matrix::{invert, multiply};
+use crate::matrix::{IDENTITY, invert, multiply};
+use crate::oit::OitPass;
 use crate::post::{PhysicalSkyBinding, SCENE_FORMAT};
 use crate::post_fx::{PostFxParams, PostFxPass, RcasSharpener};
+use crate::ray_tracing::{Blas, TLAS_TRAVERSAL_WGSL, TlasInstance, TlasRayTraceParams, TlasRayTracer, TlasScene, TlasSceneGpu};
 use crate::render_targets::{ColorTransfer, OffscreenRenderTarget, SplitScreenCompositor, ViewportRect};
+use crate::shader::{self, Stage};
 use crate::RenderTarget;
 
 type CookieUpload = (u32, wgpu::TextureView, u64);
@@ -62,12 +71,204 @@ pub(super) struct SplitViewSlot {
     pub temporal: ViewTemporalState,
 }
 
+const RT_COMPOSITE_WGSL: &str = r#"
+@group(0) @binding(0) var depth_tex: texture_2d<f32>;
+@group(0) @binding(1) var shadow_ao_tex: texture_2d<f32>;
+
+@vertex fn vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
+  let x = f32((idx << 1u) & 2u) * 2.0 - 1.0;
+  let y = 1.0 - f32(idx & 2u) * 2.0;
+  return vec4f(x, y, 0.0, 1.0);
+}
+
+@fragment fn fs_shadow_ao(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let dims = vec2i(textureDimensions(depth_tex, 0));
+  let p = clamp(vec2i(pos.xy), vec2i(0), dims - vec2i(1));
+  let d = textureLoad(depth_tex, p, 0).r;
+  if (d >= 0.99999) {
+    return vec4f(1.0, 1.0, 1.0, 1.0);
+  }
+  let sao = textureLoad(shadow_ao_tex, p, 0);
+  let shadow = mix(0.25, 1.0, clamp(sao.r, 0.0, 1.0));
+  let ao = mix(0.35, 1.0, clamp(sao.g, 0.0, 1.0));
+  let atten = shadow * ao;
+  return vec4f(atten, atten, atten, 1.0);
+}
+"#;
+
+const RT_BOUNCE_WGSL: &str = r#"
+@group(0) @binding(0) var depth_tex: texture_2d<f32>;
+@group(0) @binding(1) var refl_tex: texture_2d<f32>;
+@group(0) @binding(2) var gi_tex: texture_2d<f32>;
+
+@vertex fn vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
+  let x = f32((idx << 1u) & 2u) * 2.0 - 1.0;
+  let y = 1.0 - f32(idx & 2u) * 2.0;
+  return vec4f(x, y, 0.0, 1.0);
+}
+
+@fragment fn fs_bounce(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let dims = vec2i(textureDimensions(depth_tex, 0));
+  let p = clamp(vec2i(pos.xy), vec2i(0), dims - vec2i(1));
+  let d = textureLoad(depth_tex, p, 0).r;
+  if (d >= 0.99999) {
+    discard;
+  }
+  let refl = max(textureLoad(refl_tex, p, 0).rgb, vec3f(0.0));
+  let gi = max(textureLoad(gi_tex, p, 0).rgb, vec3f(0.0));
+  let bounce = refl * 0.35 + gi * 0.65;
+  return vec4f(bounce, 0.0);
+}
+"#;
+
+const DDGI_COMPOSITE_SUFFIX_WGSL: &str = r#"
+struct DdgiCompCam {
+  inverse_view_projection: mat4x4f,
+  camera_pos_and_strength: vec4f, // xyz = camera world pos, w = indirect strength
+};
+
+@group(1) @binding(0) var<uniform> ddgi_cam: DdgiCompCam;
+@group(1) @binding(1) var ddgi_depth_tex: texture_2d<f32>;
+@group(1) @binding(2) var ddgi_irr_tex: texture_2d<f32>;
+@group(1) @binding(3) var ddgi_vis_tex: texture_2d<f32>;
+@group(1) @binding(4) var ddgi_samp: sampler;
+
+struct DdgiDepthPt {
+  world: vec3f,
+  valid: bool,
+};
+
+fn ddgi_load_world(px: vec2i, dims: vec2i) -> DdgiDepthPt {
+  if (px.x < 0 || px.y < 0 || px.x >= dims.x || px.y >= dims.y) {
+    return DdgiDepthPt(vec3f(0.0), false);
+  }
+  let d = textureLoad(ddgi_depth_tex, px, 0).r;
+  if (d >= 0.99999) {
+    return DdgiDepthPt(vec3f(0.0), false);
+  }
+  let ndc = vec2f(
+    (f32(px.x) + 0.5) / f32(dims.x) * 2.0 - 1.0,
+    1.0 - (f32(px.y) + 0.5) / f32(dims.y) * 2.0,
+  );
+  let clip = ddgi_cam.inverse_view_projection * vec4f(ndc, d, 1.0);
+  if (abs(clip.w) <= 1e-6) {
+    return DdgiDepthPt(vec3f(0.0), false);
+  }
+  return DdgiDepthPt(clip.xyz / clip.w, true);
+}
+
+@vertex fn ddgi_comp_vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
+  let x = f32((idx << 1u) & 2u) * 2.0 - 1.0;
+  let y = 1.0 - f32(idx & 2u) * 2.0;
+  return vec4f(x, y, 0.0, 1.0);
+}
+
+@fragment fn ddgi_comp_fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let dims = vec2i(textureDimensions(ddgi_depth_tex, 0));
+  let px = clamp(vec2i(pos.xy), vec2i(0), dims - vec2i(1));
+  let center = ddgi_load_world(px, dims);
+  if (!center.valid) {
+    discard;
+  }
+  let sr = ddgi_load_world(px + vec2i(1, 0), dims);
+  let sl = ddgi_load_world(px - vec2i(1, 0), dims);
+  let sd = ddgi_load_world(px + vec2i(0, 1), dims);
+  let su = ddgi_load_world(px - vec2i(0, 1), dims);
+
+  var dx = vec3f(1.0, 0.0, 0.0);
+  var has_dx = true;
+  if (sr.valid && sl.valid) {
+    let dr = sr.world - center.world;
+    let dl = center.world - sl.world;
+    dx = select(dl, dr, dot(dr, dr) < dot(dl, dl));
+  } else if (sr.valid) {
+    dx = sr.world - center.world;
+  } else if (sl.valid) {
+    dx = center.world - sl.world;
+  } else {
+    has_dx = false;
+  }
+
+  var dy = vec3f(0.0, 0.0, 1.0);
+  var has_dy = true;
+  if (sd.valid && su.valid) {
+    let dd = sd.world - center.world;
+    let du = center.world - su.world;
+    dy = select(du, dd, dot(dd, dd) < dot(du, du));
+  } else if (sd.valid) {
+    dy = sd.world - center.world;
+  } else if (su.valid) {
+    dy = center.world - su.world;
+  } else {
+    has_dy = false;
+  }
+
+  var n = vec3f(0.0, 1.0, 0.0);
+  if (has_dx && has_dy) {
+    let raw_n = cross(dx, dy);
+    let area2 = dot(raw_n, raw_n);
+    let ref2 = dot(dx, dx) * dot(dy, dy);
+    if (area2 > 1e-12 * ref2 && ref2 > 0.0) {
+      n = raw_n * inverseSqrt(area2);
+    }
+  }
+  let to_cam = ddgi_cam.camera_pos_and_strength.xyz - center.world;
+  let cam_dist = length(to_cam);
+  let view_dir = select(vec3f(0.0, 1.0, 0.0), to_cam / cam_dist, cam_dist > 1e-6);
+  if (dot(n, view_dir) < 0.0) {
+    n = -n;
+  }
+  let irr = ddgi_sample_irradiance(
+    center.world,
+    n,
+    view_dir,
+    u,
+    ddgi_irr_tex,
+    ddgi_vis_tex,
+    ddgi_samp,
+  );
+  let indirect = max(irr, vec3f(0.0)) * ddgi_cam.camera_pos_and_strength.w;
+  return vec4f(indirect, 0.0);
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DdgiCompCamUniform {
+    inverse_view_projection: [f32; 16],
+    camera_pos_and_strength: [f32; 4],
+}
+
+struct RtCompositePipelines {
+    sao_bgl: wgpu::BindGroupLayout,
+    sao_pipeline: wgpu::RenderPipeline,
+    bounce_bgl: wgpu::BindGroupLayout,
+    bounce_pipeline: wgpu::RenderPipeline,
+}
+
+struct DdgiCompositePipeline {
+    u_bgl: wgpu::BindGroupLayout,
+    cam_bgl: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    cam_uniform: wgpu::Buffer,
+}
+
 #[derive(Default)]
 pub(super) struct WiredPasses {
     pub physical_atmosphere: Option<PhysicalAtmosphere>,
     pub physical_sky_serial: u64,
     pub physical_sky_last_key: (bool, u64),
     pub pbr_decals: HashMap<u32, PbrDecalPass>,
+    pub oit_pass: Option<OitPass>,
+    pub oit_pipelines: HashMap<(usize, u64, u32, bool), Option<wgpu::RenderPipeline>>,
+    pub blas_cache: HashMap<u64, Arc<Blas>>,
+    pub tlas_hash: u64,
+    pub tlas_gpu: Option<TlasSceneGpu>,
+    pub tlas_bounds: Option<([f32; 3], [f32; 3])>,
+    pub ray_tracer: Option<TlasRayTracer>,
+    rt_composite: Option<RtCompositePipelines>,
+    pub ddgi: Option<DdgiVolume>,
+    ddgi_composite: Option<DdgiCompositePipeline>,
     pub rcas: Option<RcasSharpener>,
     pub post_fx: Option<PostFxPass>,
     pub split_screen: Option<(wgpu::TextureFormat, SplitScreenCompositor)>,
@@ -326,6 +527,344 @@ impl WiredPasses {
         });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    fn ensure_rt_composite(&mut self, device: &wgpu::Device) -> &RtCompositePipelines {
+        self.rt_composite.get_or_insert_with(|| {
+            let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            };
+            let sao_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rt_sao_comp_bgl"),
+                entries: &[tex_entry(0), tex_entry(1)],
+            });
+            let sao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rt_sao_comp_pl"),
+                bind_group_layouts: &[Some(&sao_bgl)],
+                immediate_size: 0,
+            });
+            let sao_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rt_sao_comp"),
+                source: wgpu::ShaderSource::Wgsl(RT_COMPOSITE_WGSL.into()),
+            });
+            let sao_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("rt_sao_comp"),
+                layout: Some(&sao_pl),
+                vertex: wgpu::VertexState {
+                    module: &sao_mod,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &sao_mod,
+                    entry_point: Some("fs_shadow_ao"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: SCENE_FORMAT,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Dst,
+                                dst_factor: wgpu::BlendFactor::Zero,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Zero,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+
+            let bounce_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rt_bounce_comp_bgl"),
+                entries: &[tex_entry(0), tex_entry(1), tex_entry(2)],
+            });
+            let bounce_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rt_bounce_comp_pl"),
+                bind_group_layouts: &[Some(&bounce_bgl)],
+                immediate_size: 0,
+            });
+            let bounce_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rt_bounce_comp"),
+                source: wgpu::ShaderSource::Wgsl(RT_BOUNCE_WGSL.into()),
+            });
+            let bounce_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("rt_bounce_comp"),
+                layout: Some(&bounce_pl),
+                vertex: wgpu::VertexState {
+                    module: &bounce_mod,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &bounce_mod,
+                    entry_point: Some("fs_bounce"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: SCENE_FORMAT,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Zero,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            RtCompositePipelines { sao_bgl, sao_pipeline, bounce_bgl, bounce_pipeline }
+        })
+    }
+
+    fn ensure_ddgi_composite(&mut self, device: &wgpu::Device) -> &DdgiCompositePipeline {
+        self.ddgi_composite.get_or_insert_with(|| {
+            let u_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ddgi_comp_u_bgl"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+            let tex_entry = |binding: u32, filterable: bool| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            };
+            let cam_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ddgi_comp_cam_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(size_of::<DdgiCompCamUniform>() as u64),
+                        },
+                        count: None,
+                    },
+                    tex_entry(1, false),
+                    tex_entry(2, true),
+                    tex_entry(3, true),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ddgi_comp_pl"),
+                bind_group_layouts: &[Some(&u_bgl), Some(&cam_bgl)],
+                immediate_size: 0,
+            });
+            let source = format!("{TLAS_TRAVERSAL_WGSL}\n{DDGI_WGSL}\n{DDGI_COMPOSITE_SUFFIX_WGSL}");
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("ddgi_composite"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("ddgi_composite"),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("ddgi_comp_vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: Default::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some("ddgi_comp_fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: SCENE_FORMAT,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Zero,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+            let cam_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ddgi_comp_cam_u"),
+                size: size_of::<DdgiCompCamUniform>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            DdgiCompositePipeline { u_bgl, cam_bgl, pipeline, cam_uniform }
+        })
+    }
+
+    pub fn composite_ray_tracing(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scene_view: &wgpu::TextureView,
+        depth_r32f: &wgpu::TextureView,
+        tier: u32,
+    ) {
+        let Some(rt) = &self.ray_tracer else { return };
+        let Some(sao_view) = rt.shadow_ao_view().cloned() else { return };
+        let refl_view = rt.reflection_view().cloned();
+        let gi_view = rt.gi_view().cloned();
+        let comp = self.ensure_rt_composite(device);
+        let sao_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rt_sao_comp_bg"),
+            layout: &comp.sao_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_r32f) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&sao_view) },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rt_shadow_ao_composite"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: scene_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&comp.sao_pipeline);
+            pass.set_bind_group(0, &sao_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        if tier >= 2
+            && let (Some(rv), Some(gv)) = (refl_view, gi_view)
+        {
+            let bounce_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rt_bounce_comp_bg"),
+                layout: &comp.bounce_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_r32f) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&rv) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&gv) },
+                ],
+            });
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("rt_bounce_composite"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: scene_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&comp.bounce_pipeline);
+            pass.set_bind_group(0, &bounce_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_ddgi(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        scene_view: &wgpu::TextureView,
+        depth_r32f: &wgpu::TextureView,
+        inv_vp: [f32; 16],
+        camera_pos: [f32; 3],
+    ) {
+        if self.ddgi.is_none() {
+            return;
+        }
+        let _ = self.ensure_ddgi_composite(device);
+        let comp = self.ddgi_composite.as_ref().unwrap();
+        let ddgi = self.ddgi.as_ref().unwrap();
+        let cam_u = DdgiCompCamUniform {
+            inverse_view_projection: inv_vp,
+            camera_pos_and_strength: [camera_pos[0], camera_pos[1], camera_pos[2], 0.55],
+        };
+        queue.write_buffer(&comp.cam_uniform, 0, bytemuck::bytes_of(&cam_u));
+        let u_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ddgi_comp_u_bg"),
+            layout: &comp.u_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ddgi.uniform_buffer().as_entire_binding() }],
+        });
+        let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ddgi_comp_cam_bg"),
+            layout: &comp.cam_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: comp.cam_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_r32f) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(ddgi.irradiance_view()) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(ddgi.visibility_view()) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(ddgi.sampler()) },
+            ],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("ddgi_composite"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: scene_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&comp.pipeline);
+        pass.set_bind_group(0, &u_bg, &[]);
+        pass.set_bind_group(1, &cam_bg, &[]);
         pass.draw(0..3, 0..1);
     }
 }
@@ -800,6 +1339,312 @@ impl State {
             divider_px: 0,
         };
         comp.composite(&device, encoder, output, &layout, &views, wgpu::Color::BLACK)?;
+        Ok(())
+    }
+
+    /// Prepares (lazily compiling and caching) WBOIT render pipelines for every translucent entry
+    /// when `frame.quality.oit` is enabled.
+    pub(super) fn prepare_oit_pipelines(
+        &mut self,
+        frame: &RenderFrame,
+        scratch: &Scratch,
+        samples: u32,
+    ) -> Vec<Option<wgpu::RenderPipeline>> {
+        if !frame.quality.oit || scratch.translucent.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(scratch.translucent.len());
+        for &ready_idx in &scratch.translucent {
+            let entry = &scratch.ready[ready_idx];
+            let skinned = entry.skin.is_some();
+            let Some(GpuAsset::Shader(sh)) = self.assets.current(entry.shader) else {
+                out.push(None);
+                continue;
+            };
+            let key = (entry.shader, sh.revision, samples, skinned);
+            if let Some(cached) = self.wired.oit_pipelines.get(&key) {
+                out.push(cached.clone());
+                continue;
+            }
+            let code = sh.code.clone();
+            let stage = if skinned { Stage::Skinned } else { Stage::Plain };
+            let compiled = crate::oit::derive_oit_wgsl(&code).and_then(|oit_wgsl| {
+                let (pipe, mut check) = shader::scoped(&self.device, || {
+                    let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("oit_derived_shader"),
+                        source: wgpu::ShaderSource::Wgsl(oit_wgsl.into()),
+                    });
+                    shader::oit_pipeline(&self.context, &module, samples, stage)
+                });
+                match shader::settled(&mut check) {
+                    Some(Ok(())) | None => Some(pipe),
+                    Some(Err(_)) => None,
+                }
+            });
+            self.wired.oit_pipelines.insert(key, compiled.clone());
+            out.push(compiled);
+        }
+        out
+    }
+
+    /// Lazily builds per-mesh BLASes and updates the cached 2-level `TlasSceneGpu` whenever
+    /// `frame.quality.ray_tracing > 0 || frame.quality.ddgi` and opaque geometry changed.
+    pub(super) fn prepare_tlas_scene(&mut self, frame: &RenderFrame, scratch: &Scratch) -> Result<bool> {
+        if frame.quality.ray_tracing == 0 && !frame.quality.ddgi {
+            return Ok(false);
+        }
+        let mut blas_id_to_idx: HashMap<u64, u32> = HashMap::new();
+        let mut blas_ids: Vec<u64> = Vec::new();
+        let mut instances: Vec<TlasInstance> = Vec::new();
+        let mut world_min = [f32::INFINITY; 3];
+        let mut world_max = [f32::NEG_INFINITY; 3];
+
+        let mut push_inst = |blas_cache: &mut HashMap<u64, Arc<Blas>>,
+                             source: &Arc<super::RtMeshSource>,
+                             transform: [f32; 16],
+                             m: &crate::asset_store::Material|
+         -> Result<()> {
+            let blas = match blas_cache.entry(source.id) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(Arc::new(Blas::build(&source.triangles)?)),
+            };
+            if blas.nodes().is_empty() {
+                return Ok(());
+            }
+            let inv = invert(&transform);
+            if !inv.iter().all(|v| v.is_finite()) {
+                return Ok(());
+            }
+            let bi = *blas_id_to_idx.entry(source.id).or_insert_with(|| {
+                let idx = u32::try_from(blas_ids.len()).unwrap_or(u32::MAX);
+                blas_ids.push(source.id);
+                idx
+            });
+            let (bmin, bmax) = blas.bounds();
+            for &x in &[bmin[0], bmax[0]] {
+                for &y in &[bmin[1], bmax[1]] {
+                    for &z in &[bmin[2], bmax[2]] {
+                        let wx = transform[0] * x + transform[4] * y + transform[8] * z + transform[12];
+                        let wy = transform[1] * x + transform[5] * y + transform[9] * z + transform[13];
+                        let wz = transform[2] * x + transform[6] * y + transform[10] * z + transform[14];
+                        world_min[0] = world_min[0].min(wx);
+                        world_min[1] = world_min[1].min(wy);
+                        world_min[2] = world_min[2].min(wz);
+                        world_max[0] = world_max[0].max(wx);
+                        world_max[1] = world_max[1].max(wy);
+                        world_max[2] = world_max[2].max(wz);
+                    }
+                }
+            }
+            #[allow(clippy::cast_possible_truncation, reason = "clamped finite material color")]
+            let albedo = [
+                m.color[0].clamp(0.0, 10.0) as f32,
+                m.color[1].clamp(0.0, 10.0) as f32,
+                m.color[2].clamp(0.0, 10.0) as f32,
+            ];
+            let emissive = if !m.lit {
+                let s = m.surface.emissive_strength.max(1.0);
+                [albedo[0] * s, albedo[1] * s, albedo[2] * s]
+            } else if m.surface.emissive_strength > 1.0 {
+                let s = m.surface.emissive_strength - 1.0;
+                [albedo[0] * s, albedo[1] * s, albedo[2] * s]
+            } else {
+                [0.0; 3]
+            };
+            let mut inst = TlasInstance::new(bi, transform);
+            inst.albedo = albedo;
+            inst.emissive = emissive;
+            inst.roughness = if m.surface.clearcoat > 0.0 { 0.2 } else { 0.45 };
+            inst.metallic = 0.0;
+            instances.push(inst);
+            Ok(())
+        };
+
+        for &ready_idx in &scratch.opaque {
+            let entry = &scratch.ready[ready_idx];
+            let item = &scratch.items[entry.item];
+            let mat = &entry.material.material;
+            match item.shape {
+                Shape::Mesh(_) => {
+                    if let Some(GpuAsset::Mesh(mesh)) = entry.mesh.and_then(|slot| self.assets.current(slot))
+                        && let Some(src) = &mesh.rt_source
+                    {
+                        push_inst(&mut self.wired.blas_cache, src, *item.transform(frame), mat)?;
+                    }
+                }
+                Shape::Solid(idx) => {
+                    if let Some(solid) = self.solid_meshes.get(idx)
+                        && let Some(src) = &solid.rt_source
+                    {
+                        push_inst(&mut self.wired.blas_cache, src, IDENTITY, mat)?;
+                    }
+                }
+                Shape::Batch(batch_idx) => {
+                    let batch = &scratch.batches[batch_idx];
+                    if let Some(GpuAsset::Mesh(mesh)) = self.assets.current(batch.mesh)
+                        && let Some(src) = &mesh.rt_source
+                    {
+                        for (draw_idx, placement) in scratch.placements.iter().enumerate() {
+                            if placement.batch as usize == batch_idx
+                                && let Some(draw) = frame.draws.get(draw_idx)
+                            {
+                                push_inst(&mut self.wired.blas_cache, src, draw.transform, mat)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if instances.is_empty() {
+            self.wired.tlas_gpu = None;
+            self.wired.tlas_bounds = None;
+            return Ok(false);
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        blas_ids.hash(&mut hasher);
+        instances.len().hash(&mut hasher);
+        for inst in &instances {
+            inst.blas_index.hash(&mut hasher);
+            for v in inst.transform {
+                v.to_bits().hash(&mut hasher);
+            }
+            for v in inst.albedo {
+                v.to_bits().hash(&mut hasher);
+            }
+            for v in inst.emissive {
+                v.to_bits().hash(&mut hasher);
+            }
+        }
+        let scene_hash = hasher.finish();
+        if self.wired.tlas_gpu.is_none() || self.wired.tlas_hash != scene_hash {
+            let blases: Vec<Blas> = blas_ids
+                .iter()
+                .map(|id| (**self.wired.blas_cache.get(id).expect("cached BLAS")).clone())
+                .collect();
+            let tlas = TlasScene::build(&blases, &instances)?;
+            self.wired.tlas_gpu = Some(TlasSceneGpu::upload(&self.device, &tlas)?);
+            self.wired.tlas_hash = scene_hash;
+        }
+        self.wired.tlas_bounds = Some((world_min, world_max));
+        Ok(true)
+    }
+
+    /// Runs `TlasRayTracer` (`quality.ray_tracing >= 1`) and/or `DdgiVolume` (`quality.ddgi`)
+    /// against the resolved 1x opaque HDR scene buffer and 1x R32Float depth.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn encode_rt_and_ddgi_wired(
+        wired: &mut WiredPasses,
+        built_ins: &mut BuiltIns,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+        frames_count: u64,
+        active_proj: &Matrix,
+        scene_view: &wgpu::TextureView,
+        depth_only: &wgpu::TextureView,
+        scene_size: (u32, u32),
+        samples: u32,
+    ) -> Result<()> {
+        let wants_rt = frame.quality.ray_tracing > 0;
+        let wants_ddgi = frame.quality.ddgi;
+        if (!wants_rt && !wants_ddgi) || wired.tlas_gpu.is_none() {
+            return Ok(());
+        }
+        let depth_r32f = wired.resolve_msaa_depth(device, built_ins, encoder, depth_only, scene_size, samples);
+        let active_vp = multiply(active_proj, &frame.view);
+        let inv_vp = invert(&active_vp);
+        let eye = invert(&frame.view);
+        let camera_pos = [eye[12], eye[13], eye[14]];
+        let sun_raw = [-frame.light_direction.x, -frame.light_direction.y, -frame.light_direction.z];
+        let sun_len = (sun_raw[0] * sun_raw[0] + sun_raw[1] * sun_raw[1] + sun_raw[2] * sun_raw[2]).sqrt();
+        let sun_direction =
+            if sun_len > 1e-6 { [sun_raw[0] / sun_len, sun_raw[1] / sun_len, sun_raw[2] / sun_len] } else { [0.0, 1.0, 0.0] };
+        let sun_color = [frame.light_color.x.max(0.0), frame.light_color.y.max(0.0), frame.light_color.z.max(0.0)];
+        let sky_zenith = [frame.sky.zenith.x.max(0.0), frame.sky.zenith.y.max(0.0), frame.sky.zenith.z.max(0.0)];
+        let sky_horizon = [frame.sky.horizon.x.max(0.0), frame.sky.horizon.y.max(0.0), frame.sky.horizon.z.max(0.0)];
+
+        if wants_rt {
+            let tier = frame.quality.ray_tracing;
+            let params = TlasRayTraceParams {
+                view_projection: active_vp,
+                camera_pos,
+                depth_clear: 1.0,
+                sun_direction,
+                sun_angular_radius: 0.015,
+                sun_color,
+                sky_zenith,
+                sky_horizon,
+                surface_roughness: if tier >= 2 { 0.12 } else { 0.45 },
+                ao_radius: 2.0,
+                max_ray_distance: 64.0,
+                shadow_samples: 2,
+                ao_samples: 4,
+                reflection_samples: if tier >= 2 { 2 } else { 0 },
+                gi_samples: if tier >= 2 { 2 } else { 0 },
+                gi_bounce_scale: 1.0,
+                frame_seed: (frames_count % 4096) as f32 * 0.618_034,
+                normal_bias: 0.015,
+                visibility_mask: u32::MAX,
+            };
+            let tlas = wired.tlas_gpu.as_ref().unwrap();
+            let rt = wired.ray_tracer.get_or_insert_with(|| TlasRayTracer::new(device));
+            rt.trace_with_scene(device, encoder, tlas, &depth_r32f, scene_size, &params)?;
+            wired.composite_ray_tracing(device, encoder, scene_view, &depth_r32f, tier);
+        }
+
+        if wants_ddgi {
+            let pv = frame.probe_volume;
+            let desired_cfg = if pv.nx > 0 && pv.ny > 0 && pv.nz > 0 && pv.spacing > 0.0 {
+                let dims = [pv.nx.clamp(2, 8), pv.ny.clamp(2, 4), pv.nz.clamp(2, 8)];
+                let origin = [pv.origin.x, pv.origin.y, pv.origin.z];
+                let sp = pv.spacing.max(0.25);
+                DdgiGridConfig { origin, spacing: [sp, sp, sp], dims, rays_per_probe: 96, hysteresis: 0.85, ..Default::default() }
+            } else if let Some((bmin, bmax)) = wired.tlas_bounds {
+                let dims = [5, 3, 5];
+                let pad = [
+                    ((bmax[0] - bmin[0]) * 0.1).max(0.35),
+                    ((bmax[1] - bmin[1]) * 0.1).max(0.35),
+                    ((bmax[2] - bmin[2]) * 0.1).max(0.35),
+                ];
+                let lo = [bmin[0] - pad[0], bmin[1] - pad[1], bmin[2] - pad[2]];
+                let hi = [bmax[0] + pad[0], bmax[1] + pad[1], bmax[2] + pad[2]];
+                let spacing = [
+                    ((hi[0] - lo[0]) / (dims[0] - 1) as f32).max(0.5),
+                    ((hi[1] - lo[1]) / (dims[1] - 1) as f32).max(0.5),
+                    ((hi[2] - lo[2]) / (dims[2] - 1) as f32).max(0.5),
+                ];
+                DdgiGridConfig { origin: lo, spacing, dims, rays_per_probe: 96, hysteresis: 0.85, ..Default::default() }
+            } else {
+                DdgiGridConfig { rays_per_probe: 96, hysteresis: 0.85, ..Default::default() }
+            };
+            let need_recreate = match &wired.ddgi {
+                None => true,
+                Some(existing) => {
+                    let c = existing.config();
+                    c.dims != desired_cfg.dims
+                        || (0..3).any(|k| (c.origin[k] - desired_cfg.origin[k]).abs() > 1e-2)
+                        || (0..3).any(|k| (c.spacing[k] - desired_cfg.spacing[k]).abs() > 1e-2)
+                }
+            };
+            if need_recreate {
+                wired.ddgi = Some(DdgiVolume::new(device, desired_cfg)?);
+            }
+            let ddgi_params = DdgiFrameParams {
+                sun_direction,
+                sun_color,
+                sky_zenith,
+                sky_horizon,
+                visibility_mask: u32::MAX,
+                reset_history: frame.exposure.cut,
+            };
+            let tlas = wired.tlas_gpu.as_ref().unwrap();
+            wired.ddgi.as_mut().unwrap().update(device, encoder, tlas, &ddgi_params);
+            wired.composite_ddgi(device, queue, encoder, scene_view, &depth_r32f, inv_vp, camera_pos);
+        }
+
         Ok(())
     }
 }

@@ -116,10 +116,12 @@ fn mist_along(a: vec3f, b: vec3f) -> f32 {
   return length * height * (exp(-low / height) - exp(-high / height)) / (high - low);
 }
 
-// The mist between two points outside the arena: the vertical cylinder of the
-// fog's radius about the origin, which stays clear.
+// The mist between two points outside the arena: the vertical cylinder about the
+// origin, which stays clear. Its radius is the fog's, and half of the soft edge
+// more where the mist rises over one (the midpoint of that rise, which stands in
+// for it: its integral has no closed form).
 fn mist_beyond_arena(start: vec3f, end: vec3f) -> f32 {
-  let radius = atmosphere.fog.x;
+  let radius = atmosphere.fog.x + 0.5 * volume.scatter.w;
   let along = end.xz - start.xz;
   let a = dot(along, along);
   let b = 2.0 * dot(start.xz, along);

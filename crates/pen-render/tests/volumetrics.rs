@@ -1027,7 +1027,12 @@ fn a_still_camera_converges_and_a_cut_resets_the_history() {
 /// A frame of the floor under a sky, in a homogeneous mist the colour of the sky, seen from
 /// the near end of the floor so that the grid's reach falls inside the picture.
 fn seam_frame(view: &Camera, reach: f32, tier: u32, radius: f32) -> RenderFrame {
-    let fog = Fog { radius, density: 0.03, height: 2000.0, distance: reach, sun: 0.0, sky: 1.0, ..Fog::default() };
+    seam_frame_with_edge(view, reach, tier, radius, 0.0)
+}
+
+fn seam_frame_with_edge(view: &Camera, reach: f32, tier: u32, radius: f32, edge: f32) -> RenderFrame {
+    let fog =
+        Fog { radius, edge, density: 0.03, height: 2000.0, distance: reach, sun: 0.0, sky: 1.0, ..Fog::default() };
     let mut frame = mist_frame(view, fog, tier);
     frame.draws = vec![draw(0, 0, IDENTITY), draw(1, 2, scale_at(2.0, 6.0, 2.0, 0.0, 0.0, -30.0))];
     frame.quality.sky = true;
@@ -1055,14 +1060,14 @@ fn the_grids_end_leaves_no_seam_against_the_analytic_mist_beyond_it() {
     let view = camera([0.0, 1.5, 55.0], [0.0, 0.5, 10.0], 1.0, 0.5);
     // The same homogeneous mist drawn analytically (no grid) and through grids reaching 12, 30
     // and 100: in the picture the floor crosses each grid's end somewhere.
-    for radius in [0.0f32, 20.0] {
-        let analytic = rig.settle(&seam_frame(&view, 0.0, 2, radius), 2);
+    for (radius, edge) in [(0.0f32, 0.0f32), (20.0, 0.0), (14.0, 12.0)] {
+        let analytic = rig.settle(&seam_frame_with_edge(&view, 0.0, 2, radius, edge), 2);
         assert_eq!(rig.renderer.stats().volume_froxels, 0, "no reach, no grid");
-        save(&format!("volumetrics-seam-analytic-r{radius}.png"), &analytic, rig.size);
+        save(&format!("volumetrics-seam-analytic-r{radius}-e{edge}.png"), &analytic, rig.size);
         for reach in [12.0f32, 30.0, 100.0] {
-            let image = rig.settle(&seam_frame(&view, reach, 2, radius), 40);
+            let image = rig.settle(&seam_frame_with_edge(&view, reach, 2, radius, edge), 40);
             assert!(rig.renderer.stats().volume_froxels > 0);
-            save(&format!("volumetrics-seam-r{radius}-reach-{reach}.png"), &image, rig.size);
+            save(&format!("volumetrics-seam-r{radius}-e{edge}-reach-{reach}.png"), &image, rig.size);
             let (mut total, mut worst) = (0.0f64, 0.0f64);
             for (a, b) in image.iter().zip(&analytic) {
                 let difference = (0..3).map(|c| (f64::from(a[c]) - f64::from(b[c])).abs()).fold(0.0, f64::max);
@@ -1070,9 +1075,11 @@ fn the_grids_end_leaves_no_seam_against_the_analytic_mist_beyond_it() {
                 worst = worst.max(difference);
             }
             let mean = total / image.len() as f64;
-            eprintln!("radius {radius} reach {reach}: mean difference {mean:.3} of 255, worst {worst}");
-            assert!(mean < 0.8, "the same mist looks the same through the grid and without it: {mean}");
-            assert!(worst < 12.0, "and nowhere across the grid's end does it show a seam: {worst}");
+            eprintln!("radius {radius} edge {edge} reach {reach}: mean difference {mean:.3} of 255, worst {worst}");
+            // A soft edge has no closed form: the analytic mist takes the middle of its rise.
+            let (mean_limit, worst_limit) = if edge > 0.0 { (1.0, 14.0) } else { (0.8, 12.0) };
+            assert!(mean < mean_limit, "the same mist looks the same through the grid and without it: {mean}");
+            assert!(worst < worst_limit, "and nowhere across the grid's end does it show a seam: {worst}");
             // Down a column of the picture the grid's end makes no step: no pixel differs from its
             // neighbour more than the analytic picture's own steps do.
             let column = |image: &[[u8; 4]]| -> Vec<f64> {

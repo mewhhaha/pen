@@ -131,7 +131,9 @@ struct Scene {
 struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f, settings: vec4f, parameters: vec4f };
 @group(0) @binding(0) var<uniform> scene: Scene;
 @group(1) @binding(0) var<uniform> draw: Draw;
+${lights}
 ${environment}
+${surface}
 struct Corner {
   @builtin(position) position: vec4f,
   @location(0) world: vec3f,
@@ -290,7 +292,10 @@ impl Scene {
     /// drawn with the ROOM shader.
     fn new(name: &str, meshes: &[String], materials: &[(&str, [f32; 3])], size: (u32, u32)) -> Option<Scene> {
         let (device, queue) = device()?;
-        let shader = ROOM.replace("${environment}", pen_render::ENVIRONMENT_WGSL);
+        let shader = ROOM
+            .replace("${lights}", pen_render::LIGHTS_WGSL)
+            .replace("${environment}", pen_render::ENVIRONMENT_WGSL)
+            .replace("${surface}", &format!("{}\n{}", pen_render::SURFACE_LOBES_WGSL, pen_render::SURFACE_WGSL));
         let mut files: Vec<(String, Vec<u8>)> = vec![("room.wgsl".into(), shader.into_bytes())];
         let names: Vec<String> = (0..meshes.len()).map(|i| format!("\"m{i}.mesh.json\"")).collect();
         let mats: Vec<String> = materials.iter().map(|(n, _)| format!("\"{n}.material.json\"")).collect();

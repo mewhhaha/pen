@@ -1034,6 +1034,7 @@ struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f, settings: vec4f, pa
 @group(1) @binding(0) var<uniform> draw: Draw;
 ${lights}
 ${environment}
+${surface}
 struct Corner {
   @builtin(position) position: vec4f,
   @location(0) world: vec3f,
@@ -1075,8 +1076,10 @@ fn the_sky_and_lights_light_a_glossy_floor() {
         eprintln!("no GPU adapter; skipping");
         return;
     };
-    let source =
-        GLOSSY.replace("${lights}", pen_render::LIGHTS_WGSL).replace("${environment}", pen_render::ENVIRONMENT_WGSL);
+    let source = GLOSSY
+        .replace("${lights}", pen_render::LIGHTS_WGSL)
+        .replace("${environment}", pen_render::ENVIRONMENT_WGSL)
+        .replace("${surface}", &format!("{}\n{}", pen_render::SURFACE_LOBES_WGSL, pen_render::SURFACE_WGSL));
     let floor = br#"{"positions":[-12,0,-12, 12,0,-12, -12,0,12, 12,0,12],"normals":[0,1,0,0,1,0,0,1,0,0,1,0],
                      "uvs":[0,0,1,0,0,1,1,1],"indices":[0,2,1,1,2,3]}"#;
     let root = assets(

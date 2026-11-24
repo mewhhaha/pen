@@ -29,6 +29,8 @@ struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f, settings: vec4f, pa
 @group(1) @binding(0) var<uniform> draw: Draw;
 ${shadows}
 ${lights}
+${environment}
+${surface}
 struct Surface {
   @builtin(position) position: vec4f,
   @location(0) world: vec3f,
@@ -256,7 +258,11 @@ struct Scene {
 
 impl Scene {
     fn new(name: &str) -> Option<Scene> {
-        let source = LIT.replace("${shadows}", pen_render::SHADOWS_WGSL).replace("${lights}", pen_render::LIGHTS_WGSL);
+        let source = LIT
+            .replace("${shadows}", pen_render::SHADOWS_WGSL)
+            .replace("${lights}", pen_render::LIGHTS_WGSL)
+            .replace("${environment}", pen_render::ENVIRONMENT_WGSL)
+            .replace("${surface}", &format!("{}\n{}", pen_render::SURFACE_LOBES_WGSL, pen_render::SURFACE_WGSL));
         Scene::with_shader(name, source)
     }
 

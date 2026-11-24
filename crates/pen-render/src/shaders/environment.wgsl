@@ -3,7 +3,8 @@
 // from a cube map of the same sky prefiltered by roughness (environment.rs)
 // with the split-sum BRDF table. Declare these bindings (group 0 of every
 // mesh pipeline, after the scene's) and call `ambient_light` where the flat
-// ambient color went, and `sky_reflection` or `surface_ambient` for gloss.
+// ambient color went, and `sky_reflection` for gloss (`surface_ambient` and
+// the rest of the standard surface are in surface.wgsl).
 struct SkyLight {
   // The sky's diffuse light, real SH terms of bands 0 to 2 in the order
   // y, z, x (band 1), xy, yz, 3zz - 1, xz, xx - yy (band 2): what a white
@@ -560,21 +561,24 @@ fn screen_reflection(world: vec3f, normal: vec3f, view: vec3f, roughness: f32) -
   return vec4f(colour, same * on_screen * near_end * glossy);
 }
 
-// The light a surface at `world` facing `normal`, seen along `view` (both unit
-// length, `view` toward the eye), of `roughness` (0 mirror to 1 matte) and
-// with Fresnel reflectance `f0` face on, mirrors: what it reflects (a ray
-// from it meets the screen's picture, the local reflection probes it is in
-// the boxes of, or else the prefiltered sky) times the split-sum table's scale
-// and bias. The picture takes the probes' and the sky's place by its
-// confidence; the probes take the sky's by theirs. Zero where there is
-// none of these.
-fn sky_reflection(world: vec3f, normal: vec3f, view: vec3f, roughness: f32, f0: vec3f) -> vec3f {
+// The light a surface at `world` mirrors, looked up along the reflection of
+// `view` about `normal` (both unit length, `view` toward the eye), of
+// `roughness` (0 mirror to 1 matte), times the split-sum table's scale and
+// bias for a face-on reflectance `f0` and a grazing one `f90`, read at
+// `normal_dot_view`: what it reflects (a ray from it meets the screen's
+// picture, the local reflection probes it is in the boxes of, or else the
+// prefiltered sky). The picture takes the probes' and the sky's place by its
+// confidence; the probes take the sky's by theirs. Zero where there is none
+// of these. `normal` is where to look and `normal_dot_view` how much to
+// reflect: they are the same cosine unless the lookup is bent (an anisotropic
+// surface) or belongs to another layer's normal (a clear coat).
+fn sky_reflection_lobe(world: vec3f, normal: vec3f, view: vec3f, normal_dot_view: f32, roughness: f32, f0: vec3f, f90: f32) -> vec3f {
   let probes = reflection_probes.counts.x > 0.5;
   let traced = sky_light.ssr.x > 0.5;
   if (sky_light.tint.w < 0.5 && !probes && !traced) {
     return vec3f(0.0);
   }
-  let nv = max(dot(normal, view), 0.0001);
+  let nv = max(normal_dot_view, 0.0001);
   let toward = reflect(-view, normal);
   let rough = clamp(roughness, 0.04, 1.0);
   var radiance = vec3f(0.0);
@@ -590,7 +594,14 @@ fn sky_reflection(world: vec3f, normal: vec3f, view: vec3f, roughness: f32, f0: 
     radiance = mix(radiance, screen.rgb, screen.a);
   }
   let split = sky_brdf(nv, rough);
-  return radiance * (f0 * split.x + vec3f(split.y));
+  return radiance * (f0 * split.x + vec3f(f90 * split.y));
+}
+
+// The light a surface at `world` facing `normal`, seen along `view` (both unit
+// length, `view` toward the eye), of `roughness` (0 mirror to 1 matte) and
+// with Fresnel reflectance `f0` face on, mirrors (`sky_reflection_lobe`).
+fn sky_reflection(world: vec3f, normal: vec3f, view: vec3f, roughness: f32, f0: vec3f) -> vec3f {
+  return sky_reflection_lobe(world, normal, view, dot(normal, view), roughness, f0, 1.0);
 }
 
 // How much of the sky's reflection a surface with ambient occlusion
@@ -598,18 +609,4 @@ fn sky_reflection(world: vec3f, normal: vec3f, view: vec3f, roughness: f32, f0: 
 // rough one, and a grazing view more.
 fn specular_occlusion(normal_dot_view: f32, occlusion: f32, roughness: f32) -> f32 {
   return clamp(pow(normal_dot_view + occlusion, exp2(-16.0 * roughness - 1.0)) - 1.0 + occlusion, 0.0, 1.0);
-}
-
-// A surface's light from the sky, diffuse and glossy: `albedo`, `metallic`
-// and `roughness` as `lighting.Material` has them, at `world` facing
-// `normal`, seen along `view` (unit length, toward the eye). The diffuse part
-// gives up what the reflection takes.
-fn surface_ambient(world: vec3f, normal: vec3f, view: vec3f, albedo: vec3f, metallic: f32, roughness: f32) -> vec3f {
-  let f0 = mix(vec3f(0.04), albedo, clamp(metallic, 0.0, 1.0));
-  let nv = max(dot(normal, view), 0.0001);
-  let split = sky_brdf(nv, clamp(roughness, 0.04, 1.0));
-  let reflected = f0 * split.x + vec3f(split.y);
-  let reflecting = max(sky_light.tint.w, select(0.0, 1.0, reflection_probes.counts.x > 0.5 || sky_light.ssr.x > 0.5));
-  let diffuse = albedo * (1.0 - clamp(metallic, 0.0, 1.0)) * (vec3f(1.0) - reflected * reflecting);
-  return diffuse * ambient_light(world, normal) + sky_reflection(world, normal, view, roughness, f0);
 }

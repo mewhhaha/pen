@@ -30,6 +30,8 @@ struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f, settings: vec4f, pa
 @group(1) @binding(0) var<uniform> draw: Draw;
 ${shadows}
 ${lights}
+${environment}
+${surface}
 struct Surface {
   @builtin(position) position: vec4f,
   @location(0) world: vec3f,
@@ -208,7 +210,11 @@ impl Rig {
         let (device, queue) = featured_device()?;
         let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("volumes-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let source = LIT.replace("${shadows}", pen_render::SHADOWS_WGSL).replace("${lights}", pen_render::LIGHTS_WGSL);
+        let source = LIT
+            .replace("${shadows}", pen_render::SHADOWS_WGSL)
+            .replace("${lights}", pen_render::LIGHTS_WGSL)
+            .replace("${environment}", pen_render::ENVIRONMENT_WGSL)
+            .replace("${surface}", &format!("{}\n{}", pen_render::SURFACE_LOBES_WGSL, pen_render::SURFACE_WGSL));
         let floor = br#"{"positions":[-60,0,-60, 60,0,-60, -60,0,60, 60,0,60],"normals":[0,1,0,0,1,0,0,1,0,0,1,0],
                          "uvs":[0,0,1,0,0,1,1,1],"indices":[0,2,1,1,2,3]}"#;
         let files: Vec<(&str, Vec<u8>)> = vec![

@@ -33,6 +33,7 @@ mod shader;
 mod simplify;
 mod solids;
 mod sprites;
+mod surface;
 mod taa;
 #[cfg(test)]
 mod testing;
@@ -58,6 +59,7 @@ pub const MSDF_WGSL: &str = include_str!("shaders/msdf.wgsl");
 pub use renderer::{SHADOWS_WGSL, validate_frame};
 #[cfg(feature = "simplify")]
 pub use simplify::pack_mesh_with_lods;
+pub use surface::{SURFACE_LOBES_WGSL, SURFACE_TRANSMISSION_WGSL, SURFACE_WGSL};
 
 pub struct RendererOptions {
     /// The swapchain format. Like the browser's preferred canvas format it is

@@ -132,6 +132,9 @@ pub(crate) struct Material {
     pub scene_filter: bool,
     /// The frame's decals lie on this material's surfaces.
     pub decals: bool,
+    /// Its opaque surfaces are diffused on screen after the scene draws, as skin
+    /// is (subsurface.rs). Part of the render state: it stamps a stencil mark.
+    pub subsurface: bool,
     /// A lit, opaque material casts a shadow unless this is false.
     pub shadow: bool,
     /// The richer lobes: clear coat, sheen, anisotropy, transmission and
@@ -771,6 +774,7 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
     let aberration = flag("aberration", false)?;
     let scene_filter = flag("scene_filter", false)?;
     let decals = flag("decals", false)?;
+    let subsurface = flag("subsurface", false)?;
     let shadow = flag("shadow", true)?;
     let alpha_cutoff = match material.get("alphaCutoff") {
         None => 0.0,
@@ -794,6 +798,7 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
         aberration,
         scene_filter,
         decals,
+        subsurface,
         shadow,
         surface: Box::new(Surface::parse(material.get("surface"))?),
     })
@@ -1092,6 +1097,27 @@ mod tests {
         assert!(validate_asset_key("a/../b").is_err());
         assert!(validate_asset_key("a//b").is_err());
         assert!(validate_asset_key("a/b.png").is_ok());
+    }
+
+    #[test]
+    fn the_subsurface_flag_is_render_state_and_its_own_boolean() {
+        let state = |extra: &str| {
+            let json = format!(r#"{{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit"{extra}}}"#);
+            parse_material(json.as_bytes()).map(|material| (material.subsurface, material.state_key()))
+        };
+        let (plain, plain_state) = state("").unwrap();
+        assert!(!plain, "off unless asked for");
+        let (skin, skin_state) = state(r#","subsurface":true"#).unwrap();
+        assert!(skin);
+        assert_ne!(plain_state, skin_state, "a stencil mark of its own: draws of the two never share a batch");
+        assert_eq!(plain_state, state(r#","subsurface":false"#).unwrap().1);
+        assert!(
+            state(r#","subsurface":1"#).is_err_and(|error| error.to_string().contains("subsurface must be a boolean"))
+        );
+        // It leaves the other marks and where the material draws alone.
+        let skin =
+            parse_material(br#"{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit","subsurface":true}"#).unwrap();
+        assert!(skin.opaque() && skin.casts_shadow() && !skin.aberration && !skin.decals);
     }
 
     fn material_with(surface: &str) -> Result<Material> {

@@ -10,6 +10,13 @@
 // render graph (graph.rs), made again when the targets' size or the passes
 // change.
 //
+// Surfaces whose material is `subsurface` are diffused first (subsurface.rs):
+// once the opaque surfaces and their decals are resolved, two passes blur the
+// scene's picture where the stencil marks them, along x and then along y, back
+// into the scene's texture, so that everything below (the sky, the occlusion
+// and the mist, then the rest) sees the diffused picture. A frame none of
+// whose opaque draws are such makes no passes and no textures for it.
+//
 // A frame with translucent surfaces, particles or overlays splits that graph
 // in two round a second pass over the scene's targets. What the scene drew
 // until then, the opaque surfaces and their decals, is resolved, and the sky,
@@ -271,6 +278,15 @@ struct TargetsKey {
     volume: u64,
 }
 
+/// What a frame draws beyond the scene's opaque surfaces.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Extras {
+    /// Translucent surfaces, particles or overlays, drawn after the opaque picture is misted.
+    pub translucent: bool,
+    /// Opaque surfaces whose material is `subsurface`, diffused on screen.
+    pub subsurface: bool,
+}
+
 /// What a frame with translucent surfaces draws and reads besides the scene's
 /// own targets, made with the first such frame and kept until the targets change.
 struct Split {
@@ -315,6 +331,9 @@ struct Targets {
     histories: Option<[wgpu::TextureView; 2]>,
     /// What frames with translucent surfaces add, once one has come.
     split: Option<Split>,
+    /// The two passes that diffuse the marked surfaces of the resolved scene (into
+    /// a texture of their own and back into the scene), once a frame needs them.
+    subsurface: Option<Graph>,
 }
 
 /// The attachments of one frame's scene passes, from `Post::begin`.
@@ -384,6 +403,7 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
         BuiltIn::Atmosphere(samples) => (atmosphere_shader(samples), SCENE_FORMAT, None),
         BuiltIn::OpaqueDepth(samples) => (opaque_depth_shader(samples), wgpu::TextureFormat::R32Float, None),
         BuiltIn::OpaqueMip => (OPAQUE_MIP_SHADER.to_owned(), SCENE_FORMAT, None),
+        BuiltIn::Subsurface(samples) => (crate::subsurface::shader(samples), SCENE_FORMAT, None),
         BuiltIn::Taa(samples) => (crate::taa::shader(samples), SCENE_FORMAT, None),
         BuiltIn::Present(samples) => (present_shader(samples, &context.display), context.format, None),
         BuiltIn::BloomDown { first } => (bloom_down_shader(first), SCENE_FORMAT, None),
@@ -505,6 +525,8 @@ pub(crate) struct Post {
     quality: Option<Quality>,
     size: (u32, u32),
     translucent: bool,
+    /// Whether the begun frame diffuses surfaces on screen.
+    subsurface: bool,
     /// How many opaque pictures have been made, to number them.
     opaques: u64,
     /// With TAA: frames jittered so far, the begun frame's jittered
@@ -578,6 +600,7 @@ impl Post {
             quality: None,
             size: (1, 1),
             translucent: false,
+            subsurface: false,
             opaques: 0,
             jitters: 0,
             jittered: None,
@@ -608,20 +631,25 @@ impl Post {
         self.exposure.submitted();
     }
 
-    /// The passes after the scene that the last frame drew, in order: for a frame
-    /// with translucent surfaces, those of the opaque picture, the backdrop the
-    /// translucent pass starts with, and the passes that read its result.
+    /// The passes after the scene that the last frame drew, in order: the two that
+    /// diffuse subsurface surfaces, if it had any; for a frame with translucent
+    /// surfaces, those of the opaque picture, the backdrop the translucent pass
+    /// starts with, and the passes that read its result.
     pub fn passes(&self) -> Vec<&'static str> {
         let Some(targets) = &self.targets else { return Vec::new() };
+        let mut names = match (&targets.subsurface, self.subsurface) {
+            (Some(diffusion), true) => diffusion.names(),
+            _ => Vec::new(),
+        };
         match (&targets.split, self.translucent) {
             (Some(split), true) => {
-                let mut names = split.before.names();
+                names.extend(split.before.names());
                 names.push("backdrop");
                 names.extend(split.after[0].names());
-                names
             }
-            _ => targets.graphs[0].names(),
+            _ => names.extend(targets.graphs[0].names()),
         }
+        names
     }
 
     /// With TAA and a frame before this one: the picture the last frame
@@ -664,11 +692,13 @@ impl Post {
         quality: Quality,
         size: (u32, u32),
         volume: &crate::volume::Applied,
-        translucent: bool,
+        extras: Extras,
     ) -> SceneTargets {
+        let Extras { translucent, subsurface } = extras;
         self.quality = Some(quality);
         self.size = size;
         self.translucent = translucent;
+        self.subsurface = subsurface;
         let occluding = quality.occlusion;
         let atmosphere =
             quality.sky || frame.fog.density > 0.0 || occluding || frame.clouds.cover > 0.0 || volume.serial != 0;
@@ -737,11 +767,16 @@ impl Post {
                 marks,
                 graphs,
                 split: None,
+                subsurface: None,
             });
         }
         if translucent && self.targets.as_ref().unwrap().split.is_none() {
             let split = self.split(built_ins, volume);
             self.targets.as_mut().unwrap().split = Some(split);
+        }
+        if subsurface && self.targets.as_ref().unwrap().subsurface.is_none() {
+            let diffusion = self.diffusion(built_ins);
+            self.targets.as_mut().unwrap().subsurface = Some(diffusion);
         }
         // The scene's samples move within their pixels from frame to frame.
         self.jittered = taa.then(|| {
@@ -812,6 +847,62 @@ impl Post {
         let opaque =
             OpaqueTargets { serial: self.opaques, picture: picture.create_view(&Default::default()), depth: nearest };
         Split { opaque, backdrop, before, after }
+    }
+
+    /// The graph of the two passes that diffuse the marked surfaces of the resolved
+    /// scene: along x into a texture of their own, then along y back into the scene.
+    fn diffusion(&mut self, built_ins: &mut BuiltIns) -> Graph {
+        let targets = self.targets.as_ref().unwrap();
+        let TargetsKey { width, height, samples, .. } = targets.key;
+        let mut graph = GraphBuilder::default();
+        let depth = graph.import("depth", targets.depth_only.clone());
+        let scene = graph.import("scene", targets.scene.clone());
+        let marks = graph.import("marks", targets.marks.clone());
+        let across = graph.texture("diffused across", Spec { width, height, format: SCENE_FORMAT });
+        let (horizontal, vertical) = (self.uniform("subsurface x", 96), self.uniform("subsurface y", 96));
+        let pass = |graph: &mut GraphBuilder, name, uniform, from, target| {
+            let bindings = vec![
+                Binding::Uniform(uniform),
+                Binding::Texture(from),
+                Binding::Texture(depth),
+                Binding::Texture(marks),
+            ];
+            graph.pass(name, BuiltIn::Subsurface(samples), bindings, Target::Texture(target), false);
+        };
+        pass(&mut graph, "subsurface x", horizontal, scene, across);
+        pass(&mut graph, "subsurface y", vertical, across, scene);
+        graph
+            .compile(&self.device, built_ins, None)
+            .expect("the diffusion reads the scene and what its first pass draws")
+    }
+
+    /// For a frame with subsurface surfaces, once the opaque surfaces and their
+    /// decals are drawn and resolved: blurs the scene's picture where they are,
+    /// before anything else reads it.
+    pub fn diffuse(
+        &mut self,
+        built_ins: &mut BuiltIns,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+        timer: &GpuTimer,
+    ) {
+        let TargetsKey { width, height, .. } = self.targets.as_ref().unwrap().key;
+        // What the scene drew with.
+        let (projection, _) = self.jittered.unwrap_or((frame.projection, (0.0, 0.0)));
+        let inverse = invert(&projection);
+        for (name, vertical) in [("subsurface x", false), ("subsurface y", true)] {
+            let uniform = self.uniform(name, 96);
+            let data = crate::subsurface::uniform(&inverse, vertical, (width, height));
+            self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
+        }
+        let diffusion = self
+            .targets
+            .as_ref()
+            .unwrap()
+            .subsurface
+            .as_ref()
+            .expect("a frame with subsurface surfaces has its diffusion");
+        diffusion.execute(encoder, built_ins, None, timer, Span::Subsurface, None, &mut |_, _| {});
     }
 
     /// Draws the opaque picture into every sample of the translucent pass, which

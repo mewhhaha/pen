@@ -39,13 +39,16 @@ pub(crate) enum BuiltIn {
     OpaqueDepth(u32),
     /// A level of the opaque picture's chain from the one above.
     OpaqueMip,
+    /// One axis of the screen-space subsurface blur of a scene of this many samples
+    /// (subsurface.rs).
+    Subsurface(u32),
     /// The opaque picture laid into every sample of the translucent pass.
     Backdrop(u32),
 }
 
 impl BuiltIn {
     /// Every one a frame drawn with `samples` per pixel may draw with.
-    pub fn all(samples: u32) -> [BuiltIn; 13] {
+    pub fn all(samples: u32) -> [BuiltIn; 14] {
         [
             BuiltIn::Occlusion(samples),
             BuiltIn::Atmosphere(samples),
@@ -60,6 +63,7 @@ impl BuiltIn {
             BuiltIn::OpaqueDepth(samples),
             BuiltIn::OpaqueMip,
             BuiltIn::Backdrop(samples),
+            BuiltIn::Subsurface(samples),
         ]
     }
 
@@ -147,6 +151,7 @@ mod tests {
                 BuiltIn::OpaqueMip,
                 BuiltIn::Backdrop(samples),
                 BuiltIn::Atmosphere(samples),
+                BuiltIn::Subsurface(samples),
             ] {
                 assert!(all.contains(&needed), "{needed:?}");
             }

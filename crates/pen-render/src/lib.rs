@@ -33,6 +33,7 @@ mod shader;
 mod simplify;
 mod solids;
 mod sprites;
+mod subsurface;
 mod surface;
 mod taa;
 #[cfg(test)]
@@ -146,7 +147,8 @@ pub struct RenderStats {
 }
 
 /// How long the GPU took over a frame's passes, in milliseconds: the shadow
-/// maps, culling instances, the mist's froxel volume, the scene, the opaque
+/// maps, culling instances, the mist's froxel volume, the scene, the subsurface
+/// diffusion of the surfaces that ask for it, the opaque
 /// picture's passes (sky, mist, ambient occlusion, depth and the chain of
 /// levels translucent surfaces read; in frames that have such surfaces,
 /// particles or overlays, else they count as `post`), the passes after it, and
@@ -158,6 +160,7 @@ pub struct GpuTimes {
     pub culling: f32,
     pub volume: f32,
     pub scene: f32,
+    pub subsurface: f32,
     pub opaque: f32,
     pub post: f32,
     pub overlay: f32,

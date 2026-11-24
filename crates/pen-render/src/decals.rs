@@ -13,7 +13,8 @@ use crate::matrix::{invert, multiply, narrow};
 use crate::post::SCENE_FORMAT;
 use crate::shader::PipelineContext;
 
-/// The stencil bit of surfaces that take decals; bit 1 is the aberration's.
+/// The stencil bit of surfaces that take decals; bit 1 is the aberration's and
+/// bit 4 the subsurface's (`subsurface::MARK`).
 pub(crate) const DECAL_MARK: u32 = 2;
 // Model and inverse matrices, then color times opacity, per decal.
 const DECAL_FLOATS: usize = 36;

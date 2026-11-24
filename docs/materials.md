@@ -17,8 +17,9 @@ translucent, blended over what is behind it) and `lighting` (`lit` or
 `layerTexture`, give `instanceParameters` (four numbers its draws read
 unless a draw gives its own), an `alphaCutoff`, and say whether it is an
 `overlay` (drawn over the scene, dimmed where the scene hides it), takes
-`decals`, casts a `shadow` (yes unless false) or splits its colours by the
-frame's `aberration`. A `surface` object adds the lobes of glTF's clear coat,
+`decals`, casts a `shadow` (yes unless false), splits its colours by the
+frame's `aberration` or is `subsurface` (its opaque surfaces are diffused on screen,
+as skin is, [below](#subsurface-the-cheap-kind-and-the-screen-space-kind)). A `surface` object adds the lobes of glTF's clear coat,
 sheen, anisotropy, transmission and volume, ior, specular and emissive strength
 extensions (below).
 
@@ -227,7 +228,7 @@ weight at run time, so that a weight of 0 gives the base lobe's bits.
 | `SURFACE_COAT` | `coat` (0 to 1), `coat_roughness`, `coat_normal` | A second GGX lobe over everything, with the base lobe's visibility at the coat's alpha and normal and its Fresnel (0.04 to 1) at the half vector; the lobes under it keep `1 - coat * Fresnel` at the view's angle to the coat normal, for every light. One more GGX per light and one more sky reflection (a second cube lookup, a second probe and SSR march where the frame has them), which is the cost to watch. |
 | `SURFACE_SHEEN` | `sheen_color`, `sheen_roughness` | Charlie's distribution with Neubelt's visibility (cloth's rim light), `s * D * V * cos`; the lobes under it keep `1 - max(s) * Es` where `Es` is the lobe's directional albedo from a 32 by 16 table. A few `pow` and a table read per light; the sky adds `s * Es` of its diffuse light. The sheen is not dimmed by the coat. |
 | `SURFACE_ANISOTROPY` | `anisotropy` (-1 to 1), a frame (`surface_frame`) | The specular lobe stretched along the tangent: widths `mix(alpha, 1, a^2)` and `alpha`, with the visibility that goes with it; the sky's reflection looks up a normal bent toward the view across the grain. The sign of `anisotropy` only turns that bend (the lights' highlight depends on its square): turn the brushing with the frame's rotation. As cheap as the isotropic lobe plus a few dot products. |
-| `SURFACE_SUBSURFACE` | `subsurface` (0 to 1), `subsurface_color`, `thin` (0 a leaf, 1 opaque) | The diffuse lobe's cosine becomes a wrapped one (`wrap(x, 0.5)` times the color plus the cosine), so light reaches past the terminator, and a back-lit term lets the light through to a viewer on the other side. Lights behind the surface count for it (their shadow maps are read). Cheap. The screen-space diffusion for skin is a separate pass, not this. |
+| `SURFACE_SUBSURFACE` | `subsurface` (0 to 1), `subsurface_color`, `thin` (0 a leaf, 1 opaque) | The diffuse lobe's cosine becomes a wrapped one (`wrap(x, 0.5)` times the color plus the cosine), so light reaches past the terminator, and a back-lit term lets the light through to a viewer on the other side. Lights behind the surface count for it (their shadow maps are read). Cheap. The screen-space diffusion for skin is a separate pass, not this (see [Subsurface](#subsurface-the-cheap-kind-and-the-screen-space-kind)). |
 | `SURFACE_TRANSMISSION` | `transmission` (0 to 1), `ior`, `thickness` (world units), `attenuation_color`, `attenuation_distance`, `behind` | The diffuse lobe gives way to the frame's picture of what is behind the surface (`surface_transmit`, in `SURFACE_TRANSMISSION_WGSL`, which needs the translucency library's `opaque_*` functions): a thin wall (`thickness` 0) reads the pixel behind the fragment, a volume refracts the view's ray in (Snell, `1 / ior`) and reads where it leaves `thickness` along, through Beer-Lambert's `pow(attenuation_color, thickness / attenuation_distance)`, at a mip level that grows with roughness and `2 ior - 2`. Lights have no transmitted term. One texture read. |
 | `SURFACE_SPECULAR` | `ior`, `specular`, `specular_color` (`surface_apply_block`) | `f0 = min(((ior - 1) / (ior + 1))^2 * specular_color, 1) * specular` and `f90 = specular` for a dielectric, mixed to the base color by `metallic` (`SURFACE_TRANSMISSION` does the same). No run-time cost. |
 
@@ -293,6 +294,63 @@ the first layer, or a view below the surface leaves the uv alone. The self-shado
 marches toward the light the same way. `lod` is the layer texture's level: 0 for the base
 (a shader that wants derivatives' worth of filtering passes its own). Bricks lying at a
 grazing angle, with and without it, are in pen-render's `tests/standard_surface.rs`.
+
+## Subsurface: the cheap kind and the screen-space kind
+
+Light that enters a surface and leaves a little way off shows in two ways, and pen has one
+for each.
+
+**The cheap kind** is a lobe of the standard surface (`SURFACE_SUBSURFACE`, above): a wrapped
+diffuse term, so light reaches past the terminator, and a back-lit term for a viewer on the
+far side. It costs a few instructions per light and changes nothing but the shading of the
+pixel it is on. Use it for foliage, thin cloth, wax, ears against the sun, paper and fruit,
+where what shows is light getting through a thin thing, and for skin's soft terminator when
+a blur is too much.
+
+**The screen-space kind** is a material that says `"subsurface": true`. Its opaque surfaces
+carry a stencil mark (bit 4, beside the aberration's 1 and the decals' 2), and once the
+opaque surfaces and their decals are drawn, two passes blur the frame's picture where the
+mark is (along x, then along y; after Jimenez et al., "Separable Subsurface Scattering",
+2015) with a kernel that is the sum of Gaussians d'Eon and Luebke fitted to skin: red
+spreads farthest, then green, then blue, and every edge of detail, every freckle and every
+terminator softens and takes a warm glow. It runs before the sky, the ambient occlusion and the
+mist, so skin is diffused and then misted, and anything translucent is drawn over the diffused
+picture. Use it for skin: faces and hands. It costs two full-screen passes over the picture
+(a pixel that is not marked is copied; a marked one reads 15 taps of four texels) in frames
+that have such a draw, and nothing at all in frames that do not: no passes, no textures.
+
+```json
+{ "shader": "skin.wgsl", "color": [0.78, 0.52, 0.42, 1], "lighting": "lit", "subsurface": true }
+```
+
+What it does and does not do:
+
+- A pixel is blurred only if every one of its samples is a `subsurface` surface; any other pixel
+  (the sky, other materials, a silhouette's partly covered pixels) is copied bit for bit and
+  neither gives nor takes light. A tap on one of those, or on a surface more than four widths
+  nearer or farther along the view (a linear ramp from two), gives the pixel's own colour
+  instead, so the blur stops at an edge: a nose does not bleed into the cheek behind it, and a
+  white of the eye is not tinted by skin.
+- The taps reach `1 cm` (a world unit is a metre) from a pixel and, in pixels, as far as that is at
+  the pixel's depth: a head close to the eye is blurred over more pixels than one far off (at
+  most 64). The reach is one constant for every frame; the render packet has no field for it,
+  and neither has the draw uniform. A character at another scale needs a model whose units
+  are metres.
+- The picture holds the specular light as well, so it is blurred with the diffuse: a sharp
+  highlight on skin softens too, which it should not. A separate specular buffer is a
+  follow-up.
+- It acts on opaque surfaces of the camera's picture only; insets and reflection probes do not
+  diffuse, and a translucent material that says `subsurface` is drawn as it would be without.
+- It is not tied to the `quality` settings (the render packet has no field for it): a game
+  that wants it off draws its skin with a material that does not say `subsurface`.
+- Shade the skin as you would without it: the albedo, the lights and the shadows are the
+  material shader's; the pass only spreads what was drawn. The result conserves the picture's
+  light (a flat picture stays flat), so a skin that looked right unblurred gets softer, not
+  brighter or darker.
+
+Both kinds can be used on one material (a lit skin with the wrapped terminator that also
+says `"subsurface": true`), but the blur already softens the terminator, so most skin wants
+the wrap turned down.
 
 ## Vertices and entry points
 

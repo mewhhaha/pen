@@ -15,9 +15,10 @@ use crate::asset_store::{AssetKind, Material};
 use crate::built_in::BuiltIn;
 use crate::decals::{DECAL_MARK, Decals};
 use crate::loader::{Job, Priority};
-use crate::post::Post;
+use crate::post::{Extras, Post};
 use crate::shader::Layer;
 use crate::sprites::Sprites;
+use crate::subsurface::MARK as SUBSURFACE_MARK;
 use crate::{RenderStats, RenderTarget};
 
 // Bind groups no frame has drawn with for this many frames are let go.
@@ -27,9 +28,12 @@ const GROUP_LIFETIME: u64 = 120;
 const OCCLUDED_STRENGTH: f64 = 0.3;
 
 /// The stencil marks a material's surfaces stamp: the frame's aberration
-/// splits them, and decals lie on them.
+/// splits them, decals lie on them, and the scene's picture is diffused over
+/// them (subsurface.rs).
 pub(super) fn stencil(material: &Material) -> u32 {
-    (if material.aberration { 1 } else { 0 }) | if material.decals { DECAL_MARK } else { 0 }
+    (if material.aberration { 1 } else { 0 })
+        | if material.decals { DECAL_MARK } else { 0 }
+        | if material.subsurface { SUBSURFACE_MARK } else { 0 }
 }
 
 impl Drawing<'_> {
@@ -357,8 +361,18 @@ impl State {
         let translucent =
             !scratch.translucent.is_empty() || !scratch.overlays.is_empty() || !scratch.emitters.is_empty();
         let volume = self.volumetrics.prepare(&self.context, frame, &quality, target.size(), translucent);
-        let targets =
-            self.post.as_mut().unwrap().begin(&mut self.built_ins, frame, quality, target.size(), &volume, translucent);
+        // Opaque surfaces of a subsurface material have the scene's picture
+        // diffused over them once it is resolved; a frame with none makes no passes
+        // and no textures for it.
+        let subsurface = scratch.opaque.iter().any(|&index| scratch.ready[index].material.material.subsurface);
+        let targets = self.post.as_mut().unwrap().begin(
+            &mut self.built_ins,
+            frame,
+            quality,
+            target.size(),
+            &volume,
+            Extras { translucent, subsurface },
+        );
         // With TAA the scene draws through a projection jittered within its
         // pixels: the scene uniform's, after its view.
         let jittered = self.post.as_ref().unwrap().jittered();
@@ -548,6 +562,9 @@ impl State {
                 samples,
                 targets.size,
             );
+        }
+        if subsurface {
+            self.post.as_mut().unwrap().diffuse(&mut self.built_ins, &mut encoder, frame, &self.timer);
         }
         if targets.opaque.is_some() {
             let post = self.post.as_mut().unwrap();

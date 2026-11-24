@@ -218,7 +218,9 @@ in `renderer/`:
 - `frame.rs`: `submit` puts the frame together and encodes its passes. The
   culling compute pass comes first, then the shadow passes, then the
   particles' compute pass. The scene draws opaque surfaces, then decals over
-  them if there are any, and resolves. The opaque picture's passes follow (the
+  them if there are any, and resolves. If any opaque surface's material is
+  `subsurface`, two passes diffuse the resolved picture where they are marked
+  (below). The opaque picture's passes follow (the
   occlusion, the sky and the mist on that picture alone, its nearest depth and
   a chain of blurred levels), then the translucent pass: the opaque picture
   written into every sample, and over it the translucent surfaces, the
@@ -543,6 +545,57 @@ f64 integration, and its shadow; local volumes only inside their bounds, with
 emission; a still camera's convergence and the history's reset on cuts, jumps and
 disocclusion; no seam at the grid's end against the analytic mist; and the off tier.
 
+### Subsurface scattering on the screen
+
+A material with `"subsurface": true` (render state, like `aberration` and `decals`; `Material::subsurface`)
+stamps its opaque surfaces into the stencil with bit 4 (`subsurface::MARK`; the aberration's mark is bit 1
+and the decals' bit 2, `stencil()` in `renderer/frame.rs` ORs them). Once the opaque surfaces and
+their decals are drawn and resolved, a frame with any such draw runs two passes of
+`shaders/subsurface.wgsl` (`subsurface.rs`, after Jimenez et al., "Separable Subsurface Scattering",
+2015) over the resolved scene texture, before the opaque picture's passes: the first blurs it along x
+into a texture of its own, the second along y back into the scene texture, so nothing after them (the
+sky, the occlusion and the mist, the translucent pass, TAA, bloom) has to know. The sky, occlusion
+and mist are applied to the diffused picture, so skin is diffused before it is misted.
+
+- *Kernel.* Seven pairs of taps and a centre, spaced `2 * sign * (t / 2)^2` over `t` from -2 to 2
+  (denser at the centre) out to the reach, each weighted by d'Eon and Luebke's sum of six Gaussians for
+  skin (variances 0.0064 to 7.41 mm squared, summing to one) times the width of its cell, with a falloff per channel
+  (1, 0.37, 0.3: red reaches farthest), normalised per channel, the centre keeping `1 - strength +
+  strength * weight` and the others `strength * weight` for strengths (0.48, 0.41, 0.28), so a flat
+  picture stays as it is. `subsurface::kernel()` builds it in f64 and the shader's constant table is
+  generated from it; the tests build it again from the paper's recipe.
+- *Reach.* The outermost tap is `subsurface::WIDTH` = 1 cm (world units: metres) from the pixel,
+  which is `width / pixel size` pixels at the pixel's depth, the pixel's size in view space worked out
+  from the inverse of the projection the scene drew with (TAA's jitter included) and capped at 64
+  pixels. The width is one constant for every frame; a per-frame or per-material width would need a
+  field in the render packet or the draw uniform, neither of which this has.
+- *Taps.* A tap reads the picture bilinearly (four `textureLoad`s, so the reference is exact), and is
+  valid only if its nearest pixel has every sample marked, so empty and unmarked pixels, a silhouette's
+  partly covered pixels and anything off the picture give the pixel's own colour in the tap's place.
+  A tap's surface more than two widths nearer or farther along the view counts partly (a linear ramp
+  to nothing at four widths) with the pixel's own colour in the rest, so light does not cross an edge
+  between a nose and a cheek, but a slope does not shut it out.
+- *Marks.* A pixel is diffused only where all its samples carry the mark (the nearest depth over them
+  is its surface's): any other is copied as it is, bit for bit, which is also what the second
+  pass does to the first's copy. A silhouette pixel of a multisampled surface keeps its antialiased edge.
+- *Cost and keys.* A frame with no such opaque draw makes no passes (`Post::passes()` does not list them)
+  and no textures: the passes' graph (the one made texture, `diffused across`, and two uniforms) is made
+  with the first frame that needs it and kept with the targets, which are keyed on the size, samples and
+  quality only, so turning a skin on and off allocates nothing. `GpuTimes::subsurface` times the two
+  passes. Insets and reflection probe captures do not diffuse.
+- *Limits.* The picture the passes blur has the specular light in it: it is diffused with the diffuse
+  (a separate specular buffer is a follow-up); the width is one constant; one kernel (skin's) for every
+  such material; and translucent surfaces, particles and overlays are drawn after, so a `subsurface`
+  flag on one has no effect.
+
+Tests (`tests/subsurface.rs`, f64 references, headless, half-float HDR output so that a pixel is the
+scene's own half-float): the kernel built again from the paper's recipe against the shader's table
+through the pictures of a line, a row, an edge and a point of light on a flat marked surface (every
+pixel of the profile within two half-float steps, 1 and 4 samples, and an edge with TAA), the light of
+the picture conserved, unmarked and half-marked pixels the same bits as without the flag and neither
+giving nor taking light, the depth ramp at four gaps, no passes without the flag and flipping it
+changing nothing else, a translucent pane over a diffused surface, and a head with and without the flag.
+
 ### Translucent surfaces and particles
 
 Translucent surfaces (materials with an alpha below 1 or `blend`), particles and
@@ -553,7 +606,8 @@ the one graph it always has. The order (`post.rs`, `graph.rs`, `renderer/frame.r
 
 1. The `scene` pass draws the opaque surfaces (and, in the layered path, the `decals`
    pass draws the decals over them) into the multisampled picture and resolves it into the
-   single-sample scene texture. The multisampled depth and stencil stay.
+   single-sample scene texture. The multisampled depth and stencil stay. With subsurface
+   materials, the two diffusion passes (above) then blur the scene texture where they are marked.
 2. The opaque graph (`Post::opaque`): `occlusion` if the quality has it, `atmosphere` (the
    same shader and numbers as before, on this picture alone: the sky, the occlusion, the
    froxel volume and its analytic continuation, the clouds' shadow; it runs even where the
@@ -579,8 +633,9 @@ only: the opaque picture and its depth are made with the first frame that needs 
 kept, with the graphs that read them, until the targets change, so turning a translucent
 surface on and off allocates nothing and drops no history (TAA reads and draws the same
 history textures in both). `passes()` lists, for a frame with the pass, the opaque graph's
-passes, `backdrop` and the passes after; the opaque graph is timed as `GpuTimes::opaque`
-and the translucent pass counts with the scene.
+passes, `backdrop` and the passes after (the two `subsurface` passes first, for a frame that
+has them); the opaque graph is timed as `GpuTimes::opaque` and the translucent pass counts
+with the scene.
 
 **What a shader reads** (`TRANSLUCENCY_WGSL`, `shaders/translucency.wgsl`, after
 `ENVIRONMENT_WGSL`, which declares the `sky_sampler` it samples with; materials.md lists
@@ -738,7 +793,9 @@ each texture the graph makes a lifetime, and lets textures of one size and
 format whose lifetimes do not overlap share an allocation. `Post` builds the
 graph again only when the targets' size or the passes change (the
 `TargetsKey`): occlusion, atmosphere, TAA, each bloom level down and up,
-present. The scene's own targets (depth, picture, stencil marks) and TAA's
+present. A frame with subsurface surfaces has a small graph of its own before these, made
+the first time one comes and kept with the targets: its two passes, along x into a made
+texture and along y back into the imported scene texture. The scene's own targets (depth, picture, stencil marks) and TAA's
 history are imported. A frame with translucent surfaces, particles or overlays
 splits it at the translucent pass (above): the opaque graph (occlusion,
 atmosphere into level 0 of the opaque picture, `opaque depth`, `opaque mip` for
@@ -892,6 +949,9 @@ host installs the logger. The `render_packet` example prints them with
   real sky and lights. `tests/standard_surface.rs` draws a row of materials, the base lobe as the old
   functions drew it, an anisotropic highlight's stretch against the reference and bricks with
   and without parallax (PNGs in /tmp/fidelity/materials).
+  `tests/subsurface.rs` holds the screen-space subsurface diffusion to an f64
+  reference (see Subsurface scattering on the screen) and writes the head with and
+  without it to /tmp/fidelity/materials/subsurface-e.png.
   `tests/shadow_looks.rs` draws the sun's soft and contact shadows and the
   spot and point lights' shadows (before and after PNGs, in the directory
   `SHADOW_SHOTS` names if set); the shaders' filters, cascade blending, bias,

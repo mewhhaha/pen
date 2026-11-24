@@ -379,3 +379,34 @@ The synthetic witnesses isolate aliasing and detail loss; they do not prove
 quality or performance on every game, GPU, browser, or display transfer
 function. Physical external-device checks were unavailable in this Linux
 environment.
+
+## Translucent surfaces: the opaque picture's passes
+
+A frame with translucent surfaces, particles or overlays draws them in a pass of
+their own, over the opaque picture misted to its own depth (ARCHITECTURE.md,
+"Translucent surfaces and particles"). The opaque picture needs its passes
+(sky, occlusion and mist, the nearest depth, the chain of ten levels below level
+0) and the translucent pass a backdrop, resolve and the draws; a frame without
+them does none of it and draws as before.
+
+GPU time of a frame of 1280 by 720 at 4 samples a pixel, a room with a sky,
+mist at the high tier, occlusion, bloom and FXAA, an RTX 4080 SUPER, release
+build, passes timed (`GpuTimes`), median of 50 frames, milliseconds:
+
+| Frame | Before (one picture) | After |
+|---|---|---|
+| nothing translucent | 0.45 | 0.44 to 0.45 |
+| nothing translucent, TAA | 0.50 | 0.49 |
+| one translucent pane | 0.46 | 0.58 |
+| one translucent pane, TAA | 0.51 | 0.62 to 0.63 |
+| a pane and 2000 particles, TAA | 0.54 | 0.66 |
+
+The frame with a pane spends 0.23 ms in the opaque picture's passes (what the
+passes after the scene took, 0.27 ms, plus the depth and the levels) and about
+0.09 in the translucent pass, and 0.06 to 0.10 in the passes after; a frame
+without a pane is the one it was. Measured with
+
+```sh
+cargo test --release -p pen-render --test translucency \
+  the_translucent_pass_costs -- --ignored --nocapture
+```

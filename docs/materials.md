@@ -36,6 +36,10 @@ Group 0, the frame's, the same for every draw:
 | 7 | The sky's light, a uniform: nine diffuse spherical-harmonic coefficients, the reflection tint, the cube's last level and the probe volume's origin, spacing and counts. |
 | 8 | The baked light probes, a read-only storage array of `vec4f`: seven a probe (nine RGB terms and a validity weight). |
 | 9 | The camera's depth from the frame's casters, a `texture_depth_2d` of the scene's size, drawn only when the frame asks for contact shadows. |
+| 14 | The opaque picture, a `texture_2d<f32>` (`Rgba16Float`) with its whole chain of levels: level 0 is the frame's opaque surfaces after the sky, the ambient occlusion and the mist, at the scene's size, and each next level the last halved by a 4 x 4 tent, down to a texel. Fragment stage only. |
+| 15 | The nearest depth buffer value of each pixel of that picture (the projection's own, 0 to 1; the nearest of a pixel's samples; 1 where nothing opaque is), a `texture_2d<f32>` (`R32Float`, read with `textureLoad`). Fragment stage only. |
+| 16 | The integrated froxel volume of the mist, a `texture_3d<f32>`: layer k holds the in-scatter (rgb) and the optical depth (a) up to boundary k of the grid. Fragment stage only. |
+| 17 | The fog block, a uniform of 512 bytes: the volume's own uniform followed by the eye, the sky's colours, the sun, the clouds and the scene's jittered view-projection. Fragment stage only. |
 
 ## The sun's shadows
 
@@ -106,6 +110,42 @@ roughness, f0, position, view_z)`, their diffuse sum and GGX highlights. Both
 use the lobe of ink's `lighting.brdf` (GGX with alpha the square of the
 roughness, height-correlated Smith visibility, Schlick Fresnel).
 
+## Translucent surfaces: the opaque picture and the mist
+
+A translucent material, a particle or an overlay is drawn after the frame's opaque
+surfaces have had their sky, ambient occlusion and mist, over that picture, so it is
+misted by the air between it and the eye and not by what is behind it, and it can read
+what is behind it. `pen_render::TRANSLUCENCY_WGSL` (after `ENVIRONMENT_WGSL`, which declares
+the `sky_sampler` of binding 6 it samples with) declares bindings 14 to 17 of group 0, for
+the fragment stage only, and gives:
+
+- `fog_apply(color, world)`: `color` as the eye sees it through the mist from the eye to
+  the point `world` (the surface's fragment): `color * transmittance + in-scatter`, the
+  numbers the atmosphere pass gives an opaque surface there (the froxel volume at the
+  point's depth, then the same medium analytically past its reach or without a grid, and
+  the clouds' shadow on the surface). A translucent material outputs
+  `vec4f(fog_apply(lit, world), alpha)`; the ordinary blend then composites it right.
+  Light that only adds (a particle's) takes the transmittance alone:
+  `fog_terms(world)` is the in-scatter (rgb) and the transmittance (a).
+- `opaque_available()`: whether this pass reads an opaque picture.
+- `opaque_screen_uv(position)`: a fragment's place in it, from `@builtin(position)`, 0 to
+  1, y down; `opaque_world_uv(world)`: a world point's place, through the projection the
+  scene draws with, TAA's jitter included.
+- `opaque_behind(uv, level)`: the picture at `uv`, clamped to it, read trilinearly at
+  `level` (clamped to the chain, 0 sharp, `opaque_levels()` a texel): a refracted or a
+  frosted view of what is behind. Black where there is no picture.
+- `opaque_levels()`: the chain's last level.
+- `opaque_depth_at(uv)`: how far ahead of the eye, along the view, the opaque surface
+  behind `uv` is; 1e30 where there is none.
+
+In every pass that has no opaque picture to give (the opaque draws themselves, the shadow
+passes, a reflection probe's faces, insets) the bindings hold stand-ins, `fog_apply`
+returns its colour, `opaque_available()` is false and the rest give black and 1e30: one
+shader serves opaque and translucent draws, and the atmosphere pass mists the opaque
+ones. Frames without translucent surfaces, particles or overlays do not make the picture
+at all. With this the fragment stage has 15 sampled textures at most (12 before).
+Particles are misted by the renderer, at their middle (`particle_quads.wgsl`).
+
 Group 1, the draw's:
 
 | Binding | What |
@@ -142,7 +182,10 @@ vec3f`, `@location(2) uv: vec2f` and, when the mesh has `attributes`,
   `instance_index`) draws sprites instead: group 0 is then the screen's size
   (a `vec4f` uniform at binding 0), the frame's sprites (a storage array at
   1: each one's rectangle, texture coordinates, colour and parameters), the
-  material's texture (2), a sampler (3), and the raw resolved scene (4).
+  material's texture (2), a sampler (3), and the raw resolved scene (4): the picture
+  the frame's draws made before the sky, the mist and the passes after the scene, or,
+  in a frame with translucent surfaces, particles or overlays, the picture the translucent
+  pass resolved to, with them in it and the sky and mist the opaque picture got.
 - A sprite material with `"scene_filter": true` runs before UI. Binding 4
   instead reads the preceding filter's image, initially the scene after
   atmosphere/occlusion, TAA, bloom, tone mapping and FXAA. Write those display

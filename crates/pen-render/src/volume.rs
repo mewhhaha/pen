@@ -726,4 +726,83 @@ mod tests {
         assert!(!inject_shader().contains("${"));
         assert!(!integrate_shader().contains("${"));
     }
+
+    /// The fields of `struct name` in `source`, as (name, type), comments left out.
+    fn fields(source: &str, name: &str) -> Vec<(String, String)> {
+        let start = source.find(&format!("struct {name} {{")).expect("the struct is declared");
+        let body = &source[start..start + source[start..].find("};").unwrap()];
+        body.lines()
+            .skip(1)
+            .map(|line| line.split("//").next().unwrap().trim())
+            .filter(|line| !line.is_empty())
+            .flat_map(|line| line.split(',').map(str::trim).filter(|field| !field.is_empty()).collect::<Vec<_>>())
+            .map(|field| {
+                let (name, ty) = field.split_once(':').expect("a field has a type");
+                (name.trim().to_owned(), ty.trim().to_owned())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_library_s_fog_block_is_the_volume_uniform_field_for_field() {
+        let volume = fields(COMMON, "Volume");
+        let block = fields(TRANSLUCENCY_WGSL, "FogBlock");
+        assert_eq!(volume, block, "binding 17 reads the volume's own uniform");
+        // And the uniform's floats are those fields: matrices 16, vectors 4.
+        let floats: usize = volume.iter().map(|(_, ty)| if ty == "mat4x4f" { 16 } else { 4 }).sum();
+        assert_eq!(floats, UNIFORM_FLOATS);
+        assert_eq!(UNIFORM_BYTES, 512);
+        // Where the scene's projection goes, and the flags, in the uniform: after `ambient`.
+        let at = |name: &str| {
+            volume
+                .iter()
+                .take_while(|(field, _)| field != name)
+                .map(|(_, ty)| if ty == "mat4x4f" { 16 } else { 4 })
+                .sum::<usize>()
+        };
+        assert_eq!(at("clip"), PROJECTION_AT);
+        assert_eq!(at("flags"), 88);
+        assert_eq!(at("camera"), 92);
+        assert_eq!(at("fog"), 120);
+        assert_eq!(at("clouds"), 124);
+    }
+
+    #[test]
+    fn the_library_keeps_to_its_own_names() {
+        // Whatever else a material shader declares (the scene, the draw, the other
+        // libraries) cannot collide with these: every function, variable and struct of
+        // the library carries one of its prefixes.
+        let mut names = Vec::new();
+        for line in TRANSLUCENCY_WGSL.lines() {
+            let line = line.trim_start();
+            if let Some(rest) = line.strip_prefix("fn ") {
+                names.push(rest.split('(').next().unwrap().to_owned());
+            } else if let Some(rest) = line.strip_prefix("struct ") {
+                names.push(rest.split(' ').next().unwrap().to_ascii_lowercase());
+            } else if let Some(at) = line.strip_prefix("@group(") {
+                // `var<uniform> name: Type` or `var name: Type`.
+                let rest = at[at.find("var").unwrap() + 3..].trim_start();
+                let rest = if rest.starts_with('<') { &rest[rest.find('>').unwrap() + 1..] } else { rest };
+                names.push(rest.trim().split(':').next().unwrap().trim().to_owned());
+            }
+        }
+        assert!(names.len() >= 22, "{names:?}");
+        for name in names {
+            assert!(
+                ["fog_", "fogblock", "opaque_", "translucent_"].iter().any(|prefix| name.starts_with(prefix)),
+                "{name} is not the library's"
+            );
+        }
+        for exposed in [
+            "fog_apply",
+            "opaque_available",
+            "opaque_screen_uv",
+            "opaque_world_uv",
+            "opaque_behind",
+            "opaque_levels",
+            "opaque_depth_at",
+        ] {
+            assert!(TRANSLUCENCY_WGSL.contains(&format!("fn {exposed}(")), "{exposed}");
+        }
+    }
 }

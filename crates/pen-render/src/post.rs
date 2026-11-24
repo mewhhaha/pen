@@ -1214,10 +1214,17 @@ mod tests {
             bloom_up_shader(),
             crate::taa::shader(1),
             crate::taa::shader(4),
+            opaque_depth_shader(1),
+            opaque_depth_shader(4),
+            backdrop_shader(),
         ] {
             assert!(!code.contains("${"), "{code}");
         }
         assert!(atmosphere_shader(4).contains("empty += 0.2500;"));
+        assert!(
+            opaque_depth_shader(4).contains("texture_depth_multisampled_2d")
+                && opaque_depth_shader(4).contains("sample < 4")
+        );
         // Five decimals, as WGSL literals.
         assert_eq!(
             kernel(),

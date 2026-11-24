@@ -48,9 +48,10 @@ costs, culling, levels of detail, shadows and FXAA.
   `pack_mesh_with_lods(bytes)` adds simpler levels of detail (pen's packaging
   uses it).
 - `passes()` names the passes after the scene the last frame drew.
-- `LIGHTS_WGSL` and `MSDF_WGSL` are WGSL that material and sprite shaders add
-  to light with the frame's point and spot lights and to draw text from a
-  multi-channel distance field (below).
+- `LIGHTS_WGSL`, `TRANSLUCENCY_WGSL` and `MSDF_WGSL` are WGSL that material
+  and sprite shaders add to light with the frame's point and spot lights, to
+  mist a translucent surface at its own depth and read the opaque picture
+  behind it, and to draw text from a multi-channel distance field (below).
 - `stats()` says what the last frame drew: draw calls, instances, triangles,
   what culling left out, the render scale, and the GPU's time over each part
   of a recent frame (`GpuTimes`) where the device has timestamps.
@@ -199,8 +200,14 @@ in `renderer/`:
 - `frame.rs`: `submit` puts the frame together and encodes its passes. The
   culling compute pass comes first, then the shadow passes, then the
   particles' compute pass. The scene draws opaque surfaces, then decals over
-  them if there are any, then translucent surfaces, particles and overlays. Then come the passes in `post.rs`, then sprites
-  (`sprites.rs`), insets and the veil.
+  them if there are any, and resolves. The opaque picture's passes follow (the
+  occlusion, the sky and the mist on that picture alone, its nearest depth and
+  a chain of blurred levels), then the translucent pass: the opaque picture
+  written into every sample, and over it the translucent surfaces, the
+  particles and the overlays. A frame with none of those has no such pass and
+  no such chain. Then come the passes in `post.rs` (TAA, the metering, the
+  bloom, present), then sprites (`sprites.rs`), insets and the veil (see
+  "Translucent surfaces and particles" below).
 
 ### Culling and levels of detail
 
@@ -428,7 +435,10 @@ reprojected point must be the point's depth within 2 to 6%; else the hit is
 dropped: a disocclusion or a mover). A mover's reflection lags a frame (there are no
 motion vectors of the hit). The result mixes over the probe and sky reflection
 by that confidence; TAA averages the rest. Casters only: a material that does not
-cast shadows is not in the depth, so it is neither hit nor reflecting by march.
+cast shadows is not in the depth, so it is neither hit nor reflecting by march. The
+history is the whole picture TAA made, translucent surfaces and particles included
+(they come before it, in the translucent pass), but they are not in the depth: a ray
+meets them as colour on what is behind them.
 Without `quality.ssr` and probes the output is what it was before.
 
 ### Participating media
@@ -491,9 +501,9 @@ whole path is analytic, with the same colours as an unshadowed, noiseless
 medium: the sun times its phase plus the ambient (`fog.sun`, `fog.ambient`,
 `fog.sky`); with `sun` 0 and `sky` 1 it is the sky's colour in the direction
 looked, the way the mist was before there was a grid. The sky itself stays
-unmisted. Translucent surfaces and particles are still misted with everything
-else by what lies behind them (the pass sees one picture, and a translucent
-surface writes no depth): see the limits below.
+unmisted. The pass works on the opaque surfaces' picture alone: translucent
+surfaces, particles and overlays are drawn after it and mist themselves where
+they are (next section).
 
 Cost (an RTX 4080 SUPER, the hazy room of `tests/volumetrics.rs`, the injection and the integration
 together, `GpuTimes::volume`): 0.03 ms at low, 0.18 ms at high with the 16-tap sun filter; the off tier
@@ -501,11 +511,7 @@ runs no pass at all.
 
 Limits: a perspective camera only; the sun and the lights are those the
 scene's own maps hold (a light's shadow only while it holds a face); no
-multiple scattering; local volumes do not take the noise; translucents are
-misted at the depth behind them, so a translucent surface much nearer than what
-is behind it looks hazier than its own distance says (a pass that misted the opaque
-colour before the translucent surfaces draw would need its own multisampled
-resolve).
+multiple scattering; local volumes do not take the noise.
 
 Tests (`tests/volumetrics.rs`, f64 references, headless): a homogeneous mist's
 transmittance and ambient in-scatter at every froxel depth of both tiers; the
@@ -516,6 +522,108 @@ and 0 where shadowed); the phase's forward over back ratio for three values of
 f64 integration, and its shadow; local volumes only inside their bounds, with
 emission; a still camera's convergence and the history's reset on cuts, jumps and
 disocclusion; no seam at the grid's end against the analytic mist; and the off tier.
+
+### Translucent surfaces and particles
+
+Translucent surfaces (materials with an alpha below 1 or `blend`), particles and
+overlays are drawn after the opaque picture has had its sky, ambient occlusion and mist,
+so each is misted by the air between it and the eye and not by what lies behind it, and
+each can read the opaque picture. A frame with none of them has no such pass and draws
+the one graph it always has. The order (`post.rs`, `graph.rs`, `renderer/frame.rs`):
+
+1. The `scene` pass draws the opaque surfaces (and, in the layered path, the `decals`
+   pass draws the decals over them) into the multisampled picture and resolves it into the
+   single-sample scene texture. The multisampled depth and stencil stay.
+2. The opaque graph (`Post::opaque`): `occlusion` if the quality has it, `atmosphere` (the
+   same shader and numbers as before, on this picture alone: the sky, the occlusion, the
+   froxel volume and its analytic continuation, the clouds' shadow; it runs even where the
+   quality asks for none of them, to write level 0), `opaque depth` (the nearest depth
+   buffer value over a pixel's samples into an `R32Float` texture, 1 where nothing is) and
+   `opaque mip`, once for each level below level 0, which makes it from the one above
+   with a (1, 3, 3, 1) / 8 tent, four bilinear taps three quarters of a texel out, down to a
+   texel (eleven levels at 1280 by 720). The picture is `Rgba16Float` with the whole chain.
+3. The `translucent` pass: its colour target is the multisampled texture again (resolving
+   into the scene texture; at one sample the scene texture itself), cleared; the `backdrop`
+   writes level 0 into every sample (no depth test; the depth and stencil attachment is
+   loaded and kept, so what follows tests against the opaque surfaces); then the
+   translucent surfaces back to front, the particles and the overlays, with the sorting,
+   stencil marks and blend constants they always had.
+4. The passes after: TAA, the metering hook, the bloom, present, reading what the
+   translucent pass resolved to. The atmosphere is no longer among them.
+
+An opaque edge pixel keeps its blend of surface and sky, which the backdrop writes to all
+its samples; a translucent surface's own edges are antialiased by its samples. A frame
+without the pass draws the graph it always did (occlusion, atmosphere into a made texture,
+TAA, bloom, present), bit for bit. The targets are keyed on the size, samples and quality
+only: the opaque picture and its depth are made with the first frame that needs them, and
+kept, with the graphs that read them, until the targets change, so turning a translucent
+surface on and off allocates nothing and drops no history (TAA reads and draws the same
+history textures in both). `passes()` lists, for a frame with the pass, the opaque graph's
+passes, `backdrop` and the passes after; the opaque graph is timed as `GpuTimes::opaque`
+and the translucent pass counts with the scene.
+
+**What a shader reads** (`TRANSLUCENCY_WGSL`, `shaders/translucency.wgsl`, after
+`ENVIRONMENT_WGSL`, which declares the `sky_sampler` it samples with; materials.md lists
+it). Bindings 14 to 17 of the scene group, fragment stage only: the opaque picture and its
+chain (14), the nearest depth (15), the integrated froxel volume (16) and the fog block
+(17: the volume's uniform, with the eye, the sky's colours, the sun, the clouds and the
+scene's jittered view-projection after it). They are stand-ins in every pass that has no
+such picture: the opaque draws themselves (so `fog_apply` is the identity there and one
+shader serves both, the atmosphere pass misting what it draws), the shadow passes, a
+reflection probe's faces, insets and frames without a translucent pass. The scene group
+has 15 sampled textures in the fragment stage with the draw's three and the lights' one
+(it had 12; WebGPU allows 16 by default).
+
+**Compositing.** Each draw's destination already holds the mist to its own depth: the
+backdrop is the opaque surface misted to where it is, and each earlier translucent surface
+was drawn misted to where it is. A translucent surface at depth z with colour c and alpha a
+sees the air in front of it with transmittance T and in-scatter L, over what is behind:
+the eye gets `T (a c + (1 - a) B) + L`, where B is the light that reached z from behind,
+and the destination is `D = T B + L` since the ray's mist includes the stretch in front of
+z, so `T (1 - a) B = (1 - a) (D - L)` and the eye gets `a (T c + L) + (1 - a) D`. That is
+the ordinary blend of the colour `fog_apply(c, world) = c T + L`, which is what
+translucent surfaces output. For the other blends: an occluded overlay blends by its
+constant as alpha, the same; a visible overlay replaces what is behind and so is
+`c T + L`; a covering particle (premultiplied, source factor 1, destination 1 - a) outputs
+`p T + a L` for `p = a c`; added light (destination 1) outputs `p T` alone, since it hides
+nothing and adds no mist of its own. A particle takes `fog_terms` at its middle (all its
+square is at one depth), once a vertex.
+
+`fog_terms(world)` (L, and T with the clouds' shadow on a surface that the atmosphere pass
+also applies) takes the froxel integral at the point's depth with the optical depth
+interpolated in slice space (a homogeneous medium is exact), and continues the same
+medium analytically beyond the grid's reach, in the colour the grid ends on, or the
+whole way without a grid, with the numbers of `atmosphere.wgsl`: a surface at the wall's
+pixel gets the wall's own mist (a test compares the two). It needs a perspective camera for
+a grid, like the atmosphere pass. Without a medium it is (0, 0, 0, 1).
+
+Cost (an RTX 4080 SUPER, release, 1280 by 720, 4 samples, a room with sky, mist at the
+high tier, occlusion, bloom and FXAA, passes timed): a frame with nothing translucent 0.45
+ms (0.49 with TAA), as before; with one translucent pane 0.58 ms (0.62 with TAA) where the
+old pipeline took 0.46 (0.51): the opaque picture's passes (atmosphere, occlusion, depth
+and the ten levels) 0.23 ms and the translucent pass 0.09, against the 0.27 ms the passes
+after the scene took; with a plume of 2000 particles on top 0.66 (0.54 before). About
+0.12 to 0.13 ms more for a frame that has them, and nothing for one that has not.
+
+Limits: the opaque picture holds the opaque surfaces only, so a translucent surface seen
+through another does not refract it (`opaque_behind` reads what is behind both); the
+scene texture that sprite shaders read (binding 4) is, in a frame with the pass, the
+picture with its translucent surfaces and its mist and sky, and in one without, as it was
+drawn (before the sky and the mist); TAA reprojects a translucent surface by the opaque
+depth behind it, as it always did; the chain's levels are a tent, not a Gaussian, and
+blocky past a few levels.
+
+Tests (`tests/translucency.rs`, f64 references, headless): a translucent quad in front of a
+wall in a homogeneous and an exponential-height mist, at both tiers and without a grid,
+against the closed forms and the froxel volume's own numbers, far clearer than the old
+number; the plain blend without a mist; a particle covering and adding; the opaque
+picture's chain against an f64 filter to within a step of the 8 bit output (0.8 of 255 at worst) at every level, and its nearest
+depth (the nearest sample's at a multisampled edge); the library's identity where there is
+no picture; the world point's place in the picture equal to the pixel's under TAA's
+jitter; frames with a translucent surface that shows nothing bit for bit the frames
+without it (both tiers, 1 and 4 samples, TAA), and turning one on and off keeping
+the history; the passes' order; edges at 4 samples; screen-space reflections; auto exposure
+metering the picture with the pane in it; scene filters seeing it.
 
 ### Exposure and grading
 
@@ -530,8 +638,8 @@ present pass shows exactly what it showed before there was either.
 
 **Exposure** (`exposure.rs`). `exposure.auto` off, `compensation` is a fixed
 exposure in stops (-16 to 16); on, the scene is metered on the GPU and the
-exposure adapts. Metering reads the lit scene, after the sky, fog and TAA and
-before the bloom: the bloom's first pass exposes the picture itself before it
+exposure adapts. Metering reads the lit scene, after the sky, fog, translucent
+surfaces and TAA and before the bloom: the bloom's first pass exposes the picture itself before it
 blurs it (so what glows is the picture as the screen shows it, whatever the exposure),
 which makes metering after it circular, and a glow is the scene's light
 spilling, not more of it. Two compute passes run each metered frame, from a
@@ -611,7 +719,13 @@ format whose lifetimes do not overlap share an allocation. `Post` builds the
 graph again only when the targets' size or the passes change (the
 `TargetsKey`): occlusion, atmosphere, TAA, each bloom level down and up,
 present. The scene's own targets (depth, picture, stencil marks) and TAA's
-history are imported. `Graph::execute` encodes the passes each frame, and
+history are imported. A frame with translucent surfaces, particles or overlays
+splits it at the translucent pass (above): the opaque graph (occlusion,
+atmosphere into level 0 of the opaque picture, `opaque depth`, `opaque mip` for
+each level below) draws into imported views of the opaque textures, and
+the graph after it (TAA, bloom, present) reads the scene the translucent pass
+resolved to; both are made the first time such a frame comes, and the graph
+for frames without them is the one made with the targets. `Graph::execute` encodes the passes each frame, and
 `Renderer::passes()` lists them. A hook is a pass that draws nothing: it reads one
 texture and `execute` hands its view to the caller at that place (the metering
 of auto exposure); `passes()` leaves hooks out. A pass may bind a read-only
@@ -621,8 +735,9 @@ storage buffer, and the present pass has a late bind group at group 1.
 
 `quality.taa` turns it on (`taa.rs`, `shaders/taa.wgsl`). The scene's
 projection is jittered within its pixels along the Halton (2, 3) sequence,
-eight frames long; the scene uniform, ambient occlusion and the atmosphere
-use the jittered matrix. A pass after the atmosphere reprojects each pixel:
+eight frames long; the scene uniform, ambient occlusion, the atmosphere and the
+translucent pass's reads of the opaque picture use the jittered matrix. A pass after
+the atmosphere (and the translucent pass, where the frame has one) reprojects each pixel:
 the nearest depth of its 3 x 3 neighbourhood puts its surface in the world,
 and the last frame's unjittered camera says where it was (shifted back by the
 jitter its sample sat at, so a still picture reads its history in place and is

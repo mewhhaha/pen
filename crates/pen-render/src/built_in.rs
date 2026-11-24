@@ -133,3 +133,25 @@ impl BuiltIns {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_frame_waits_for_the_translucent_pass_s_pipelines_with_the_rest() {
+        for samples in [1, 4] {
+            let all = BuiltIn::all(samples);
+            for needed in [
+                BuiltIn::OpaqueDepth(samples),
+                BuiltIn::OpaqueMip,
+                BuiltIn::Backdrop(samples),
+                BuiltIn::Atmosphere(samples),
+            ] {
+                assert!(all.contains(&needed), "{needed:?}");
+            }
+            let distinct: HashSet<BuiltIn> = all.into_iter().collect();
+            assert_eq!(distinct.len(), all.len());
+        }
+    }
+}

@@ -310,6 +310,9 @@ impl Rig {
         write("glass.wgsl", shader(GLASS).as_bytes());
         write("probe.wgsl", shader(PROBE).as_bytes());
         write("invert.wgsl", INVERT.as_bytes());
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255; 4])).write_to(&mut png, image::ImageFormat::Png).unwrap();
+        write("decal.png", &png.into_inner());
         let mut keys = Vec::new();
         for (index, material) in materials.iter().enumerate() {
             let key = format!("m{index}.material.json");
@@ -352,6 +355,7 @@ impl Rig {
         for shader in ["flat.wgsl", "glass.wgsl", "probe.wgsl"] {
             assets.push(("shader".into(), shader.into()));
         }
+        assets.push(("texture".into(), "decal.png".into()));
         self.renderer.preload_scene(&assets, samples);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while self.renderer.pending() > 0 {
@@ -1021,18 +1025,31 @@ fn a_frame_whose_translucent_surface_shows_nothing_draws_as_if_it_were_not_there
         return;
     }
     let view = camera([3.0, 2.0, 18.0], [0.0, 1.0, -10.0], 1.0, 0.5);
-    for (tier, msaa, taa) in [(2, 4, false), (0, 4, false), (2, 1, false), (2, 4, true), (0, 1, true)] {
+    let configurations = [(2, 4, false), (0, 4, false), (2, 1, false), (2, 4, true), (0, 1, true)];
+    let plain_frame = |tier: u32, msaa: u32, taa: bool| {
         let mut plain = hazy(&view, tier, msaa);
         plain.quality.taa = taa;
+        plain
+    };
+    let frames_of = |taa: bool| if taa { 12 } else { 3 };
+    // The frames without the pane, which the pipeline that draws one picture drew the
+    // same before there was a pane to draw: the pictures are saved to hold them to
+    // that build's (the same test of it).
+    let mut plains = Vec::new();
+    for (tier, msaa, taa) in configurations {
+        let (before, passes) =
+            drawn_fresh("hazy-plain", &hazy_materials(), &plain_frame(tier, msaa, taa), frames_of(taa));
+        save(&format!("translucency-hazy-plain-tier{tier}-msaa{msaa}-taa{taa}.png"), &before, 64);
+        assert!(!passes.contains(&"backdrop"), "{passes:?}");
+        plains.push(before);
+    }
+    for ((tier, msaa, taa), before) in configurations.into_iter().zip(plains) {
         // The same room with a pane too small to cover the middle of a pixel, or a
         // sample, in front: translucent, so drawn in the translucent pass over the
         // opaque picture, and invisible, so changing nothing.
-        let mut with_pane = plain.clone();
+        let mut with_pane = plain_frame(tier, msaa, taa);
         with_pane.draws.push(draw(0, 1, view.facing(5.0, 1.0e-4)));
-        let frames = if taa { 12 } else { 3 };
-        let (before, passes) = drawn_fresh("hazy-plain", &hazy_materials(), &plain, frames);
-        assert!(!passes.contains(&"backdrop"), "{passes:?}");
-        let (after, split) = drawn_fresh("hazy-pane", &hazy_materials(), &with_pane, frames);
+        let (after, split) = drawn_fresh("hazy-pane", &hazy_materials(), &with_pane, frames_of(taa));
         assert!(split.contains(&"backdrop") && split.contains(&"opaque depth"), "{split:?}");
         save(&format!("translucency-hazy-tier{tier}-msaa{msaa}-taa{taa}.png"), &after, 64);
         let differing = before.iter().zip(&after).filter(|(a, b)| a != b).count();
@@ -1254,4 +1271,273 @@ fn scene_filters_see_the_picture_with_its_translucent_surfaces_in_it() {
     assert!(largest_difference(got, expected) < LEVELS, "{got:?} vs {expected:?}");
     let corner = rig.pixel(&picture, 3, 3);
     assert!(largest_difference(corner, rgb(WALL).map(|value| 1.0 - value)) < LEVELS, "{corner:?}");
+}
+
+/// How long the GPU takes over a frame of 1280 by 720 at 4 samples a pixel, in
+/// milliseconds (the median of the frames timed), for a room with a sky, mist,
+/// occlusion, bloom and TAA, drawn with and without a translucent pane and a
+/// plume of particles. Run with `-- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a witness"]
+fn the_translucent_pass_costs_this_much_at_1280_by_720() {
+    let mut materials = hazy_materials();
+    materials.push(Material { shader: "none.wgsl", color: [1.0; 4], extra: "" });
+    let Some(mut rig) = Rig::new("cost", 64, &materials) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    rig.target = Offscreen(rig.device.create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: 1280, height: 720, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    }));
+    rig.renderer.time_passes(true);
+    let view = camera([3.0, 2.0, 18.0], [0.0, 1.0, -10.0], 16.0 / 9.0, 0.5);
+    for (label, taa, translucent) in [
+        ("plain, no TAA", false, false),
+        ("plain, TAA", true, false),
+        ("with a pane, no TAA", false, true),
+        ("with a pane, TAA", true, true),
+        ("with a pane and particles, TAA", true, true),
+    ] {
+        let mut frame = hazy(&view, 2, 4);
+        frame.quality.taa = taa;
+        frame.draws = vec![
+            draw(0, 0, view.placed(60.0, 60.0, (0.0, -12.0))),
+            draw(0, 3, view.placed(25.0, 3.0, (-5.0, 1.0))),
+            draw(1, 2, view.placed(12.0, 6.0, (1.5, -1.0))),
+        ];
+        if translucent {
+            frame.draws.push(draw(0, 1, view.facing(6.0, 3.0)));
+        }
+        if label.contains("particles") {
+            frame.emitters = vec![particle([0.0, 1.0, 4.0], 0.5, [0.9, 0.6, 0.2, 0.4], false)];
+            frame.emitters[0].rate = 2000.0;
+            frame.emitters[0].lifetime = 1.0;
+            frame.emitters[0].radius = 3.0;
+            frame.emitters[0].velocity = vector(0.0, 1.0, 0.0);
+            frame.emitters[0].time = 2.0;
+            frame.emitters[0].material = 4;
+        }
+        let mut samples: Vec<String> = Vec::new();
+        let mut totals: Vec<f32> = Vec::new();
+        for index in 0..90 {
+            rig.draw(&frame);
+            if index >= 40 {
+                if let Some(gpu) = rig.renderer.stats().gpu {
+                    totals.push(gpu.total);
+                    samples.push(format!("{gpu:?}"));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        totals.sort_by(f32::total_cmp);
+        let median = totals.get(totals.len() / 2).copied().unwrap_or(f32::NAN);
+        println!(
+            "{label}: total {median:.3} ms (median of {}); a frame: {}",
+            totals.len(),
+            samples.last().cloned().unwrap_or_default()
+        );
+    }
+}
+
+#[test]
+fn the_scene_a_sprite_reads_is_the_picture_with_its_translucent_surfaces_and_their_mist() {
+    // The inverting shader as an ordinary sprite (no scene filter): binding 4 is the
+    // resolved scene, which in a frame with a translucent surface has it, misted.
+    let sprite = Material { shader: "invert.wgsl", color: [1.0; 4], extra: "" };
+    let materials = [flat(WALL), glass(PANE), sprite];
+    let Some(mut rig) = Rig::new("sprite-scene", 64, &materials) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let view = camera([4.0, 1.5, 0.0], [4.0, 1.5, -10.0], 1.0, 0.5);
+    let mist = Mist { density: 0.03, height: 2000.0, mean: MEAN };
+    let pane = Pane { near: 4.0, far: 40.0 };
+    let mut frame = pane_frame(&view, &mist, 2, &pane);
+    frame.sprites = vec![Sprite {
+        x: 0.0,
+        y: 0.0,
+        width: 64.0,
+        height: 64.0,
+        u0: 0.0,
+        v0: 0.0,
+        u1: 1.0,
+        v1: 1.0,
+        color: [1.0; 4],
+        material: 2,
+        parameters: [0.0; 4],
+    }];
+    let picture = rig.settle(&frame, 3);
+    let (through, _, _) = pane_references(&rig, &view, &mist, &pane, (32, 32));
+    let got = rig.pixel(&picture, 32, 32);
+    let expected = through.map(|value| 1.0 - value);
+    assert!(largest_difference(got, expected) < LEVELS, "{got:?} vs {expected:?}");
+    let (_, corner, _) = pane_references(&rig, &view, &mist, &pane, (3, 3));
+    assert!(largest_difference(rig.pixel(&picture, 3, 3), corner.map(|value| 1.0 - value)) < LEVELS);
+}
+
+#[test]
+fn decals_lie_on_the_opaque_surfaces_beneath_translucent_ones() {
+    // A wall that takes decals, a decal painted on it, and a pane over part of the
+    // decal. The decals' passes run in the scene pass, ahead of the translucent one.
+    let wall = Material { shader: "flat.wgsl", color: [WALL[0], WALL[1], WALL[2], 1.0], extra: r#""decals":true"# };
+    let paint = Material { shader: "none.wgsl", color: [0.6, 0.2, 0.2, 1.0], extra: r#""texture":"decal.png""# };
+    let materials = [wall, glass(PANE), paint];
+    let Some(mut rig) = Rig::new("decals", 64, &materials) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let view = camera([0.0, 0.0, 0.0], [0.0, 0.0, -10.0], 1.0, 0.5);
+    let mut frame = view_frame(&view);
+    frame.quality.msaa = 4;
+    frame.draws = vec![draw(0, 0, view.facing(20.0, 100.0))];
+    // A box of 3 across, its y axis (the way it projects) toward the eye, centred on the wall.
+    let at_wall = [view.eye[0] + 2.0 * view.right[0], 0.0, -20.0];
+    let along = |axis: V3, length: f64| axis.map(|component| component * length);
+    let columns = [along(view.right, 3.0), along(view.back, 3.0), along(view.up, 3.0), at_wall];
+    let mut model = [0.0f32; 16];
+    for (column, values) in columns.iter().enumerate() {
+        for (row, value) in values.iter().enumerate() {
+            model[column * 4 + row] = *value as f32;
+        }
+        model[column * 4 + 3] = if column == 3 { 1.0 } else { 0.0 };
+    }
+    frame.decals = vec![Decal { material: 2, transform: model, opacity: 1.0 }];
+    rig.load(4);
+    let bare = rig.settle(&frame_without_decals(&frame), 2);
+    let painted = rig.settle(&frame, 2);
+    // Where the decal lies the wall is painted: x of 2 units right of the middle, at depth 20.
+    let (x, y) = (32 + (2.0 / (20.0 * 0.5) * 32.0) as u32, 32);
+    assert!(largest_difference(rig.pixel(&bare, x, y), rgb(WALL)) < LEVELS);
+    assert!(largest_difference(rig.pixel(&painted, x, y), [0.6, 0.2, 0.2]) < LEVELS, "{:?}", rig.pixel(&painted, x, y));
+    // With a pane covering it, the decal still shows beneath, and the frame is the one
+    // picture without the pane wherever the pane is not.
+    let mut with_pane = frame.clone();
+    with_pane.draws.push(draw(0, 1, view.placed(10.0, 4.0, (2.0, 0.0))));
+    let covered = rig.settle(&with_pane, 2);
+    let expected = over([f64::from(PANE[0]), f64::from(PANE[1]), f64::from(PANE[2])], 0.5, [0.6, 0.2, 0.2]);
+    assert!(
+        largest_difference(rig.pixel(&covered, x, y), expected) < LEVELS,
+        "{:?} vs {expected:?}",
+        rig.pixel(&covered, x, y)
+    );
+    assert_eq!(rig.pixel(&covered, 4, 4), rig.pixel(&painted, 4, 4));
+    // A pane that covers nothing: bit for bit the picture without it.
+    let mut nothing = frame.clone();
+    nothing.draws.push(draw(0, 1, view.facing(5.0, 1.0e-4)));
+    assert_eq!(rig.settle(&nothing, 2), painted);
+}
+
+#[test]
+fn the_translucent_pass_follows_the_render_scale_and_the_mist_s_grid() {
+    let Some(mut rig) = Rig::new("scale", 64, &[flat(WALL), glass(PANE)]) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let view = camera([4.0, 1.5, 0.0], [4.0, 1.5, -10.0], 1.0, 0.5);
+    let mist = Mist { density: 0.03, height: 2000.0, mean: MEAN };
+    let pane = Pane { near: 4.0, far: 40.0 };
+    let (through, _, _) = pane_references(&rig, &view, &mist, &pane, (32, 32));
+    // The picture's size and the grid (a tier, then none) change from frame to frame: the
+    // opaque picture, its chain and the bind groups that read them are made again each time.
+    for (scale, tier) in [(1.0, 2), (0.5, 2), (0.5, 1), (1.0, 0), (0.75, 2), (1.0, 2)] {
+        let mut frame = pane_frame(&view, &mist, tier, &pane);
+        frame.quality.scale = scale;
+        let picture = rig.settle(&frame, 3);
+        let got = rig.pixel(&picture, 32, 32);
+        assert!(largest_difference(got, through) < LEVELS, "scale {scale} tier {tier}: {got:?} vs {through:?}");
+        assert!(rig.renderer.passes().contains(&"backdrop"));
+    }
+}
+
+fn frame_without_decals(frame: &RenderFrame) -> RenderFrame {
+    let mut bare = frame.clone();
+    bare.decals.clear();
+    bare
+}
+
+/// A quad of `half` across and up, the first axis then the second, which faces the
+/// way they cross, at `position`.
+fn plane(position: V3, across: V3, up: V3) -> Matrix {
+    let normal = unit(cross(across, up));
+    let columns = [across, up, normal, position];
+    let mut matrix = [0.0f32; 16];
+    for (column, values) in columns.iter().enumerate() {
+        for (row, value) in values.iter().enumerate() {
+            matrix[column * 4 + row] = *value as f32;
+        }
+        matrix[column * 4 + 3] = if column == 3 { 1.0 } else { 0.0 };
+    }
+    matrix
+}
+
+/// A hazy room seen through a pane of tinted glass: walls, floor and pillars in a
+/// mist, a sky above them, and two panes of glass before them, one near the camera
+/// and one in the middle of the room. What the picture shows of a pane is how hazy
+/// its own distance makes it.
+#[test]
+fn glass_in_a_hazy_room() {
+    let materials = [
+        flat([0.62, 0.55, 0.45]),
+        flat([0.45, 0.5, 0.58]),
+        flat([0.75, 0.3, 0.25]),
+        flat([0.35, 0.4, 0.3]),
+        glass([0.05, 0.5, 0.45, 0.55]),
+        glass([0.9, 0.45, 0.1, 0.65]),
+    ];
+    let Some(mut rig) = Rig::new("glass-room", 512, &materials) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let view = camera([0.0, 1.7, 12.0], [0.0, 2.2, -30.0], 1.0, 0.55);
+    let mut frame = view_frame(&view);
+    frame.fog = Fog {
+        density: 0.045,
+        height: 25.0,
+        distance: 120.0,
+        albedo: vector(0.9, 0.95, 1.0),
+        anisotropy: 0.4,
+        sun: 1.0,
+        ambient: 1.0,
+        sky: 0.5,
+        ..Fog::default()
+    };
+    frame.quality.volumetrics = 2;
+    frame.quality.sky = true;
+    frame.quality.msaa = 4;
+    frame.sky = Sky {
+        zenith: vector(0.3, 0.5, 0.8),
+        horizon: vector(0.75, 0.82, 0.9),
+        ground: vector(0.4, 0.4, 0.42),
+        sun: vector(0.4, 0.7, 0.3),
+        sh0: vector(1.6, 1.8, 2.2),
+        ..Sky::default()
+    };
+    frame.light_color = vector(1.1, 0.95, 0.75);
+    frame.light_direction = vector(-0.4, -0.7, -0.3);
+    frame.clear = Color { r: 0.75, g: 0.82, b: 0.9, a: 1.0 };
+    frame.draws = vec![
+        // The floor and the back and side walls of a room 28 across.
+        draw(0, 0, plane([0.0, 0.0, -19.0], [14.0, 0.0, 0.0], [0.0, 0.0, -31.0])),
+        draw(0, 1, plane([0.0, 7.0, -50.0], [14.0, 0.0, 0.0], [0.0, 7.0, 0.0])),
+        draw(0, 3, plane([-14.0, 7.0, -19.0], [0.0, 0.0, -31.0], [0.0, 7.0, 0.0])),
+        draw(0, 3, plane([14.0, 7.0, -19.0], [0.0, 0.0, 31.0], [0.0, 7.0, 0.0])),
+    ];
+    for (index, z) in [-10.0, -22.0, -34.0, -46.0].into_iter().enumerate() {
+        for x in [-6.0, 6.0] {
+            let colour = if (index + usize::from(x > 0.0)) % 2 == 0 { 2 } else { 1 };
+            frame.draws.push(draw(0, colour, plane([x, 4.0, z], [0.8, 0.0, 0.0], [0.0, 4.0, 0.0])));
+        }
+    }
+    // The panes: one a short way from the camera, one in the room.
+    frame.draws.push(draw(0, 4, view.placed(7.0, 2.4, (0.6, -0.2))));
+    frame.draws.push(draw(0, 5, view.placed(24.0, 3.2, (-5.5, 0.6))));
+    let picture = rig.settle(&frame, 40);
+    save("translucency-glass-in-fog.png", &picture, rig.size);
 }

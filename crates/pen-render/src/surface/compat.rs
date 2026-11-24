@@ -4,6 +4,16 @@
 //! pipeline, over grids of inputs, compared bit for bit. Where the two files'
 //! own text is wanted whole (`PEN_BASELINE_SHADERS` names a directory holding
 //! the parent's environment.wgsl and lights.wgsl), they are compared too.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::float_cmp,
+    reason = "test geometry and the shaders' own f32 against f64"
+)]
 use pen_protocol::Light;
 
 use super::harness::{Gpu, World, compute, gpu, sky, vector};
@@ -262,4 +272,162 @@ fn kernel(i: u32) {{
     );
     let different = old.chunks(6).zip(new.chunks(6)).filter(|(a, b)| bits(a) != bits(b)).count();
     assert_eq!(different, 0, "{different} of {} cases differ against the parent's own files", cases.len());
+}
+
+/// The translucency library's four functions, as a test stands them in (the
+/// real ones are workstream A's: after merging with it, run these tests with
+/// that library in their place). `opaque_world_uv` is an affine map of the
+/// world point and `opaque_behind` returns what it is asked, uv and level, so
+/// that the glue's questions can be read back.
+const STAND_IN: &str = "
+fn opaque_available() -> bool { return AVAILABLE; }
+fn opaque_levels() -> f32 { return 10.0; }
+fn opaque_world_uv(world: vec3f) -> vec2f { return vec2f(world.x * 0.1 + 0.5, world.y * 0.1 + world.z * 0.02 + 0.5); }
+fn opaque_behind(uv: vec2f, level: f32) -> vec3f { return vec3f(uv, level); }
+";
+
+#[test]
+fn surface_transmit_asks_the_picture_where_the_ray_leaves_and_how_blurred() {
+    use super::reference::V;
+    let Some(gpu) = gpu() else { return };
+    // Surface (world 3, normal 3, view 3), roughness, ior, thickness, attenuation
+    // color 3 and distance, weight, then whether the lobe is on.
+    let mut cases: Vec<[f32; 17]> = Vec::new();
+    let normal = [0.0, 0.6, 0.8];
+    for view in [[0.0, 0.6, 0.8], [0.3, 0.5, 0.8124], [0.8, 0.2, 0.5657]] {
+        for (roughness, ior, thickness, distance, weight, on) in [
+            (0.0, 1.5, 0.0, 0.0, 1.0, 1.0),
+            (0.4, 1.5, 0.0, 2.0, 1.0, 1.0),
+            (0.0, 1.5, 0.5, 0.0, 1.0, 1.0),
+            (0.3, 1.33, 0.7, 1.5, 0.8, 1.0),
+            (1.0, 2.4, 1.2, 0.0, 1.0, 1.0),
+            (0.5, 1.0, 0.6, 1.0, 1.0, 1.0),
+            (0.5, 0.7, 0.6, 1.0, 1.0, 1.0),
+            (0.2, 1.5, 0.5, 1.0, 0.0, 1.0),
+            (0.2, 1.5, 0.5, 1.0, 1.0, 0.0),
+        ] {
+            cases.push([
+                1.0,
+                2.0,
+                -3.0,
+                normal[0],
+                normal[1],
+                normal[2],
+                view[0],
+                view[1],
+                view[2],
+                roughness,
+                ior,
+                thickness,
+                0.5,
+                0.25,
+                0.8,
+                distance,
+                weight * on,
+            ]);
+        }
+    }
+    let input: Vec<f32> = cases.iter().flatten().copied().collect();
+    let kernel = "
+fn kernel(i: u32) {
+  var s = surface_default(arg3(i, 0u), normalize(arg3(i, 3u)), normalize(arg3(i, 6u)), vec3f(1.0), 0.0, arg(i, 9u), vec4f(0.0), 0.0);
+  s.lobes = select(0u, SURFACE_TRANSMISSION, arg(i, 16u) > 0.0);
+  s.transmission = arg(i, 16u);
+  s.ior = arg(i, 10u);
+  s.thickness = arg(i, 11u);
+  s.attenuation_color = arg3(i, 12u);
+  s.attenuation_distance = arg(i, 15u);
+  if (arg(i, 16u) == 0.0 && arg(i, 11u) == 0.5) { s.lobes = SURFACE_TRANSMISSION; }
+  let t = surface_transmit(s);
+  put3(i, 0u, t.behind);
+}";
+    let library = |available: bool| {
+        format!(
+            "{ENVIRONMENT_WGSL}\n{LIGHTS_WGSL}\n{SURFACE_LOBES_WGSL}\n{SURFACE_WGSL}\n{}\n{}",
+            super::SURFACE_TRANSMISSION_WGSL,
+            STAND_IN.replace("AVAILABLE", if available { "true" } else { "false" })
+        )
+    };
+    let lit = sky(vector(0.2, 0.4, 1.0), vector(0.9, 0.8, 0.7), vector(0.15, 0.12, 0.1), vector(0.5, 0.6, 0.8));
+    let world = World::new(&gpu, &lit, &[]);
+    let out = compute(&gpu, &library(true), kernel, &input, 17, 3, Some(&world), None);
+    let mut asked = 0;
+    for (case, got) in cases.iter().zip(out.chunks(3)) {
+        let weight = f64::from(case[16]);
+        let on = !(weight == 0.0);
+        let v = V::from32([case[6], case[7], case[8]]).unit();
+        let n = V::from32([case[3], case[4], case[5]]).unit();
+        let (ior, thickness, distance, roughness) =
+            (f64::from(case[10]).max(1.0), f64::from(case[11]), f64::from(case[15]), f64::from(case[9]));
+        let world = V::from32([case[0], case[1], case[2]]);
+        if !on {
+            assert_eq!(got, [0.0, 0.0, 0.0], "a surface without the lobe, or a weight of 0, shows nothing: {case:?}");
+            continue;
+        }
+        asked += 1;
+        // Where the ray leaves: the shaded point for a thin wall, else a refracted ray `thickness` on.
+        let exit = if thickness > 0.0 {
+            // Snell, written out: eta = 1 / ior, incident -v.
+            let (eta, cosi) = (1.0 / ior, n.dot(v));
+            let k = 1.0 - eta * eta * (1.0 - cosi * cosi);
+            assert!(k >= 0.0);
+            let direction = -v * eta + n * (eta * cosi - k.sqrt());
+            world + direction * thickness
+        } else {
+            world
+        };
+        let uv = (exit.0 * 0.1 + 0.5, exit.1 * 0.1 + exit.2 * 0.02 + 0.5);
+        let attenuation = if thickness > 0.0 && distance > 0.0 {
+            V::from32([case[12], case[13], case[14]]).each(|c| c.powf(thickness / distance))
+        } else {
+            V::all(1.0)
+        };
+        let level = (10.0 * (roughness * (2.0 * ior - 2.0).clamp(0.0, 1.0)).clamp(0.0, 1.0)).min(10.0);
+        let want = [uv.0 * attenuation.0, uv.1 * attenuation.1, level * attenuation.2];
+        for c in 0..3 {
+            assert!(
+                (f64::from(got[c]) - want[c]).abs() < 2e-5 * want[c].abs().max(1.0),
+                "case {case:?}: channel {c} is {} where the contract has {} (uv {uv:?}, level {level})",
+                got[c],
+                want[c]
+            );
+        }
+    }
+    assert!(asked >= 20);
+    // With no picture to read (shadow passes, captures) the sky shows along the ray, blurred by the roughness.
+    let none = compute(&gpu, &library(false), kernel, &input, 17, 3, Some(&world), None);
+    let (with, without): (Vec<_>, Vec<_>) = out.chunks(3).zip(none.chunks(3)).unzip();
+    assert!(with.iter().zip(&without).any(|(a, b)| a != b), "the sky stands in for a missing picture");
+    for (case, got) in cases.iter().zip(&none.chunks(3).collect::<Vec<_>>()) {
+        if case[16] > 0.0 {
+            assert!(got.iter().all(|c| *c > 0.0 && *c < 2.0), "case {case:?}: sky behind {got:?}");
+        }
+    }
+}
+
+#[test]
+fn lobes_of_weight_zero_give_the_sky_light_of_the_base_lobe_to_the_bit() {
+    let Some(gpu) = gpu() else { return };
+    let cases = surfaces();
+    let input: Vec<f32> = cases.iter().flatten().copied().collect();
+    let kernel = "
+fn kernel(i: u32) {
+  let world = arg3(i, 0u); let normal = arg3(i, 3u); let view = arg3(i, 6u); let albedo = arg3(i, 9u);
+  let metallic = arg(i, 12u); let roughness = arg(i, 13u);
+  let position = vec4f(100.0, 100.0, 0.5, 1.0);
+  var plain = surface_default(world, normal, view, albedo, metallic, roughness, position, -5.0);
+  var zeroed = plain;
+  zeroed.lobes = SURFACE_COAT | SURFACE_SHEEN | SURFACE_ANISOTROPY | SURFACE_TRANSMISSION | SURFACE_SUBSURFACE | SURFACE_SPECULAR;
+  zeroed.sheen_color = vec3f(0.0);
+  zeroed.tangent = vec3f(1.0, 0.0, 0.0);
+  zeroed.bitangent = vec3f(0.0, 1.0, 0.0);
+  let a = standard_surface(plain);
+  let b = standard_surface(zeroed);
+  put3(i, 0u, a);
+  put3(i, 3u, b);
+}";
+    for (name, world) in worlds(&gpu) {
+        let out = compute(&gpu, &library(), kernel, &input, 14, 6, Some(&world), None);
+        assert_same(&format!("standard_surface with every lobe at weight 0 under {name}"), &cases, 3, &out);
+    }
 }

@@ -1,7 +1,16 @@
 //! Independent f64 references for the standard surface's lobes, written from
 //! the material design (Ink's `lighting.brdf` conventions: a lobe's response is
 //! per unit radiance, with the cosine in it) and not from the WGSL.
-#![allow(clippy::many_single_char_names, reason = "the formulas' own symbols")]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::float_cmp,
+    reason = "test geometry and the shaders' own f32 against f64"
+)]
 use std::f64::consts::PI;
 use std::ops::{Add, Mul, Neg, Sub};
 

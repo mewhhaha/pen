@@ -1765,7 +1765,11 @@ fn surface_sky(s: StandardSurface) -> vec3f {
   let reflected = s.f0 * split.x + vec3f(s.f90 * split.y);
   let reflecting = max(sky_light.tint.w, select(0.0, 1.0, reflection_probes.counts.x > 0.5 || sky_light.ssr.x > 0.5));
   let diffuse = s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0)) * (vec3f(1.0) - reflected * reflecting);
-  if ((s.lobes & (SURFACE_COAT | SURFACE_SHEEN | SURFACE_ANISOTROPY | SURFACE_TRANSMISSION)) == 0u && s.occlusion >= 1.0) {
+  let coating = (s.lobes & SURFACE_COAT) != 0u && s.coat > 0.0;
+  let sheening = (s.lobes & SURFACE_SHEEN) != 0u && dot(s.sheen_color, s.sheen_color) > 0.0;
+  let brushing = (s.lobes & SURFACE_ANISOTROPY) != 0u && s.anisotropy != 0.0;
+  let transmitting = (s.lobes & SURFACE_TRANSMISSION) != 0u && s.transmission > 0.0;
+  if (!coating && !sheening && !brushing && !transmitting && s.occlusion >= 1.0) {
     // The base lobe alone, written as one expression: the very arithmetic
     // `surface_ambient` always had, to the bit.
     return diffuse * ambient_light(s.world, s.normal)
@@ -1773,7 +1777,7 @@ fn surface_sky(s: StandardSurface) -> vec3f {
   }
   var irradiance = ambient_light(s.world, s.normal);
   var lookup = s.normal;
-  if ((s.lobes & SURFACE_ANISOTROPY) != 0u && s.anisotropy != 0.0) {
+  if (brushing) {
     lookup = lobe_bent_normal(s.normal, s.tangent, s.bitangent, s.view, s.roughness, clamp(s.anisotropy, -1.0, 1.0));
   }
   var reflection = sky_reflection_lobe(s.world, lookup, s.view, dot(s.normal, s.view), s.roughness, s.f0, s.f90);
@@ -1782,7 +1786,7 @@ fn surface_sky(s: StandardSurface) -> vec3f {
     reflection *= specular_occlusion(nv, s.occlusion, s.roughness);
   }
   var base = diffuse * irradiance;
-  if ((s.lobes & SURFACE_TRANSMISSION) != 0u && s.transmission > 0.0) {
+  if (transmitting) {
     // The diffuse lobe gives way to the picture behind: what the base lobe's
     // reflection leaves of it, by the albedo and not the metal.
     let weight = clamp(s.transmission, 0.0, 1.0);
@@ -1791,7 +1795,7 @@ fn surface_sky(s: StandardSurface) -> vec3f {
   }
   var layers = 1.0;
   var added = vec3f(0.0);
-  if ((s.lobes & SURFACE_SHEEN) != 0u && dot(s.sheen_color, s.sheen_color) > 0.0) {
+  if (sheening) {
     let tint = max(s.sheen_color, vec3f(0.0));
     let albedo = lobe_sheen_albedo(nv, s.sheen_roughness);
     added = tint * (albedo * irradiance);
@@ -1799,10 +1803,10 @@ fn surface_sky(s: StandardSurface) -> vec3f {
   }
   var coated = 1.0;
   var coat = vec3f(0.0);
-  if ((s.lobes & SURFACE_COAT) != 0u && s.coat > 0.0) {
+  if (coating) {
     let weight = clamp(s.coat, 0.0, 1.0);
     let nvc = dot(s.coat_normal, s.view);
-    coated = 1.0 - weight * lobe_coat_fresnel(clamp(nvc, 0.0, 1.0));
+    coated = 1.0 - weight * lobe_coat_fresnel(clamp(nvc, 0.00001, 1.0));
     coat = weight * sky_reflection_lobe(s.world, s.coat_normal, s.view, nvc, s.coat_roughness, vec3f(0.04), 1.0);
     if (s.occlusion < 1.0) {
       coat *= specular_occlusion(max(nvc, 0.0001), s.occlusion, s.coat_roughness);

@@ -50,7 +50,8 @@ costs, culling, levels of detail, shadows and FXAA.
 - `passes()` names the passes after the scene the last frame drew.
 - `LIGHTS_WGSL` and `MSDF_WGSL` are WGSL that material and sprite shaders add
   to light with the frame's point and spot lights and to draw text from a
-  multi-channel distance field (below).
+  multi-channel distance field (below). `SURFACE_LOBES_WGSL`, `SURFACE_WGSL` and
+  `SURFACE_TRANSMISSION_WGSL` are the standard surface (below).
 - `stats()` says what the last frame drew: draw calls, instances, triangles,
   what culling left out, the render scale, and the GPU's time over each part
   of a recent frame (`GpuTimes`) where the device has timestamps.
@@ -353,8 +354,10 @@ the rest.
 `sky_reflection(world, normal, view, roughness, f0)` is the one entry point; it
 takes the prefiltered sky cube, lays the local reflection probes over it where
 the surface is inside their boxes, and lays screen-space reflections over both
-by their confidence. `surface_ambient` calls it, so materials that call
-`surface_ambient` need no change.
+by their confidence. `surface_ambient` (in `surface.wgsl` now) reaches it through
+`sky_reflection_lobe`, which takes the lookup's normal and the cosine to reflect
+separately (an anisotropic surface bends the lookup, a clear coat looks up its own
+normal), so materials that call `surface_ambient` need no change.
 
 **Reflection probes** (`environment/reflection_probes.rs`, `probe_finalise.wgsl`,
 `probe_filter.wgsl`; the packet's `reflection_probes`). A probe is a position, an
@@ -654,6 +657,33 @@ their comparison sampler and each layer's matrix (see Shadows). Material shaders
 the shadow passes bind a group of no lights and a stand-in atlas. A frame without lights writes one
 48-byte uniform.
 
+### The standard surface
+
+`surface_lobes.wgsl`, `surface.wgsl` and `surface_transmission.wgsl` (`surface.rs`;
+materials.md for what a shader calls) are one lighting model for material
+shaders: a `StandardSurface` of position, normal, view, base color, metallic,
+roughness, occlusion, the fragment's position and view depth (for the light
+clusters), the face-on reflectance and optional lobes (clear coat, sheen,
+anisotropic GGX, transmission with thin and volume refraction, a cheap subsurface),
+lit by the sky (`surface_sky`: diffuse SH or probe light, the sky, probe and
+screen reflections through `sky_reflection_lobe`), the frame's clustered lights
+(`clustered_lobes`, one `surface_light` per light of the cluster) and the sun
+(`standard_sun`, with the visibility of `sun_shadow`). Three files so that the
+parts that can run alone do: the lobes have no bindings (`surface_light`, the
+sun's helper and `parallax_uv` included: tests run them in compute shaders), the
+glue needs `ENVIRONMENT_WGSL` and `LIGHTS_WGSL`, and the transmission glue needs the
+translucency library's four `opaque_*` functions (it reads the frame's picture of
+what is behind a surface; where there is none it shows the sky along the ray).
+`surface_ambient` and `clustered_surface` are the base lobe through the same code:
+`surface_sky` takes one expression for the base lobe alone (so a compiler fuses it
+as it always did, which is what makes the results the old functions' to the bit),
+and the lobes' branches are behind flags a shader names as constants. The layering
+is `(diffuse * (1 - transmission) + specular) * sheen_keep * coat_keep + sheen +
+coat`. Sheen's directional albedo is a 32 by 16 table (Ink's, integrated by
+`tools/native/src/surface.rs`; pen-render's tests integrate it again and compare it
+with the table in the shader's text). The lit.wgsl of `pen new` embeds the five
+libraries between BEGIN and END lines that a test keeps equal to the sources.
+
 ### HDR output
 
 `choose_surface` picks, when HDR is asked for and the surface offers it, in
@@ -722,6 +752,14 @@ host installs the logger. The `render_packet` example prints them with
   `tests/volumetrics.rs` holds the froxel volume of the mist to f64 references and
   draws a hazy room's sun shafts and a point light in mist (PNGs in the directory
   `VOLUME_SHOTS` names if set); see Participating media.
+  `surface.rs`'s tests (in `src/surface/`) run the standard surface's lobes in compute
+  shaders against independent f64 references (every lobe, white furnaces for the coat and
+  the sheen, the sheen table's integral, anisotropy at 0 against the isotropic lobe,
+  parallax against analytic shifts) and compare the base lobe with the functions it
+  replaced, frozen in `src/surface/baseline.wgsl`, to the bit, on a grid of inputs and on the
+  real sky and lights. `tests/standard_surface.rs` draws a row of materials, the base lobe as the old
+  functions drew it, an anisotropic highlight's stretch against the reference and bricks with
+  and without parallax (PNGs in /tmp/fidelity/materials).
   `tests/shadow_looks.rs` draws the sun's soft and contact shadows and the
   spot and point lights' shadows (before and after PNGs, in the directory
   `SHADOW_SHOTS` names if set); the shaders' filters, cascade blending, bias,

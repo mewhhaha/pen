@@ -98,27 +98,136 @@ flat `ambient` color's replacement: the game's baked probe volume where it sends
 one, blended into the sky's light past its edge), `sky_reflection(world, normal, view, roughness,
 f0)` (the prefiltered sky, the reflection probes the surface is inside of, with
 box-projected lookups, and the screen-space march, by confidence: see
-`ARCHITECTURE.md`), `surface_ambient(world, normal, view, albedo, metallic, roughness)` for
-both together, and `specular_occlusion`. A game that sends no coefficients gets
-its flat `ambient` from `ambient_light` and no reflections. The point and spot
-lights of `LIGHTS_WGSL` also have `clustered_surface(world, normal, view,
-roughness, f0, position, view_z)`, their diffuse sum and GGX highlights. Both
-use the lobe of ink's `lighting.brdf` (GGX with alpha the square of the
-roughness, height-correlated Smith visibility, Schlick Fresnel).
+`ARCHITECTURE.md`; `sky_reflection_lobe` takes the lookup's normal and the
+cosine to reflect separately, and a grazing reflectance), and `specular_occlusion`.
+A game that sends no coefficients gets its flat `ambient` from `ambient_light`
+and no reflections. `pen_render::LIGHTS_WGSL` declares the frame's lights (group
+2) and gives `clustered_light(world, normal, position, view_z)`, their diffuse
+sum. The lighting of a glossy surface with both is `SURFACE_LOBES_WGSL` and
+`SURFACE_WGSL`, below: `surface_ambient(world, normal, view, albedo, metallic,
+roughness)` and `clustered_surface(world, normal, view, roughness, f0, position,
+view_z)` are its base lobe's two halves, as ink's `lighting.brdf` has it (GGX
+with alpha the square of the roughness, height-correlated Smith visibility,
+Schlick Fresnel), and give exactly the light they always have.
 
 Group 1, the draw's:
 
 | Binding | What |
 |---|---|
-| 0 | The draw, a uniform: `model` and `normal` matrices, the material's `color`, `settings` (x 1 when lit, y the alpha cutoff, z 1 when it has a normal texture or a field, w 1 when it has a layer texture), the four `parameters`, then 32 `vec4f` of the draw's `extra` (zero past what it sent). |
+| 0 | The draw, a uniform: `model` and `normal` matrices, the material's `color`, `settings` (x 1 when lit, y the alpha cutoff, z 1 when it has a normal texture or a field, w 1 when it has a layer texture), the four `parameters`, then 32 `vec4f` of the draw's `extra` (zero past what it sent), then the material's `surface` block, five `vec4f` (see [The standard surface](#the-standard-surface)). |
 | 1 | The material's `texture`, or white without one (a checker when it failed to load). |
 | 2 | A filtering sampler, at the frame's quality. |
 | 3 | The normal texture, or the material's field (the render packet's `fields`), or a flat normal. |
-| 4 | The layer texture, or transparent. |
+| 4 | The layer texture, or transparent. `parallax_uv` reads its red channel as a height field. |
 
 A shader declares only what it reads: a struct may stop after its leading
 fields, and an unused binding may be left out, as `lit.wgsl` leaves out all
 but the two uniforms.
+
+## The standard surface
+
+A material shader that wants more than albedo, Lambert and a mirror adds four
+libraries, in this order: `pen_render::LIGHTS_WGSL`, `ENVIRONMENT_WGSL`,
+`SURFACE_LOBES_WGSL` and `SURFACE_WGSL` (the `lit.wgsl` of `pen new` has all of
+them, and `SHADOWS_WGSL` for the sun's shadow). `SURFACE_LOBES_WGSL` is pure
+functions with no bindings: a `StandardSurface`, every lobe's distribution,
+visibility, Fresnel and tables, `surface_light` (one light on a surface), the
+sun (`standard_sun`) and parallax occlusion mapping. `SURFACE_WGSL` lights a
+`StandardSurface` with the sky and the frame's lights: `standard_surface(s)`.
+
+```wgsl
+var s = surface_default(world, normal, view, base_color, metallic, roughness, position, view_z);
+s = surface_apply_block(s, draw.surface, LOBES, length(draw.model[0].xyz));
+let light = standard_surface(s)
+          + standard_sun(s, scene.light_direction.xyz, scene.light_color.rgb, sun_shadow(world, normal, position));
+```
+
+`surface_default` is the base lobe alone: `world`, `normal` and `view` (unit, toward
+the eye), `base_color` (albedo, or a metal's color), `metallic`, `roughness`, and
+the fragment's `@builtin(position)` and its view-space z (negative ahead of the
+eye), which find its cluster of lights. Everything else of a `StandardSurface` is
+set to what the base lobe needs: `occlusion` (1 open, 0 closed: it darkens the
+sky's light, and the sky's reflection by `specular_occlusion`), `f0` (0.04
+mixed to `base_color` by `metallic`) and `f90` (1), `coat_normal` (the shading
+normal). A shader that has a normal map sets `s.coat_normal` to the mesh's own
+normal.
+
+**Lobes.** `s.lobes` holds `SURFACE_*` flags, named from constants so that the
+compiler leaves out a lobe the material does not have, and each lobe also checks its
+weight at run time, so that a weight of 0 gives the base lobe's bits.
+
+| Flag | Parameters | What it adds and costs |
+|---|---|---|
+| (always) | `base_color`, `metallic`, `roughness`, `f0`, `f90`, `occlusion` | GGX with height-correlated Smith visibility and Schlick Fresnel, Lambert, the sky's diffuse and reflection. One distribution, one visibility and a Fresnel per light. |
+| `SURFACE_COAT` | `coat` (0 to 1), `coat_roughness`, `coat_normal` | A second GGX lobe over everything, with the base lobe's visibility at the coat's alpha and normal and its Fresnel (0.04 to 1) at the half vector; the lobes under it keep `1 - coat * Fresnel` at the view's angle to the coat normal, for every light. One more GGX per light and one more sky reflection (a second cube lookup, a second probe and SSR march where the frame has them), which is the cost to watch. |
+| `SURFACE_SHEEN` | `sheen_color`, `sheen_roughness` | Charlie's distribution with Neubelt's visibility (cloth's rim light), `s * D * V * cos`; the lobes under it keep `1 - max(s) * Es` where `Es` is the lobe's directional albedo from a 32 by 16 table. A few `pow` and a table read per light; the sky adds `s * Es` of its diffuse light. The sheen is not dimmed by the coat. |
+| `SURFACE_ANISOTROPY` | `anisotropy` (-1 to 1), a frame (`surface_frame`) | The specular lobe stretched along the tangent: widths `mix(alpha, 1, a^2)` and `alpha`, with the visibility that goes with it; the sky's reflection looks up a normal bent toward the view across the grain. The sign of `anisotropy` only turns that bend (the lights' highlight depends on its square): turn the brushing with the frame's rotation. As cheap as the isotropic lobe plus a few dot products. |
+| `SURFACE_SUBSURFACE` | `subsurface` (0 to 1), `subsurface_color`, `thin` (0 a leaf, 1 opaque) | The diffuse lobe's cosine becomes a wrapped one (`wrap(x, 0.5)` times the color plus the cosine), so light reaches past the terminator, and a back-lit term lets the light through to a viewer on the other side. Lights behind the surface count for it (their shadow maps are read). Cheap. The screen-space diffusion for skin is a separate pass, not this. |
+| `SURFACE_TRANSMISSION` | `transmission` (0 to 1), `ior`, `thickness` (world units), `attenuation_color`, `attenuation_distance`, `behind` | The diffuse lobe gives way to the frame's picture of what is behind the surface (`surface_transmit`, in `SURFACE_TRANSMISSION_WGSL`, which needs the translucency library's `opaque_*` functions): a thin wall (`thickness` 0) reads the pixel behind the fragment, a volume refracts the view's ray in (Snell, `1 / ior`) and reads where it leaves `thickness` along, through Beer-Lambert's `pow(attenuation_color, thickness / attenuation_distance)`, at a mip level that grows with roughness and `2 ior - 2`. Lights have no transmitted term. One texture read. |
+| `SURFACE_SPECULAR` | `ior`, `specular`, `specular_color` (`surface_apply_block`) | `f0 = min(((ior - 1) / (ior + 1))^2 * specular_color, 1) * specular` and `f90 = specular` for a dielectric, mixed to the base color by `metallic` (`SURFACE_TRANSMISSION` does the same). No run-time cost. |
+
+The lobes layer as `(diffuse * (1 - transmission) + specular) * sheen_keep *
+coat_keep + sheen + coat`. Every lobe is in Ink's `lighting.brdf` convention (a
+response per unit radiance, the cosine in it); the frame's lights are scaled so
+that a diffuse surface is albedo times color times the cosine, so the specular
+lobes here carry the factor pi that Ink's carry in the lights' own scale.
+`tools/native/src/surface.rs` in Ink and pen-render's `surface` tests hold each lobe
+to an independent f64 reference.
+
+**The sun.** The sun is not a cluster light: its visibility comes from
+`sun_shadow`. `standard_sun(s, sun_dir, sun_color, visibility)` lights `s` with it
+through the same lobes (`sun_dir` the way its light travels, `scene.light_direction`).
+Lambert alone, as shaders have always lit with it, is `base_color * sun_color *
+(max(dot(normal, -sun_dir), 0) * visibility)`.
+
+**The material's `surface` block.** The draw uniform ends with five `vec4f`:
+
+| | x | y | z | w |
+|---|---|---|---|---|
+| `surface[0]` | clearcoat | clearcoat roughness | sheen roughness | anisotropy |
+| `surface[1]` | sheen color r | g | b | anisotropy rotation (radians) |
+| `surface[2]` | transmission | ior | thickness (model units) | attenuation distance (0: none) |
+| `surface[3]` | attenuation color r | g | b | specular |
+| `surface[4]` | specular color r | g | b | emissive strength |
+
+A material's JSON may give these as a `surface` object (every key optional, camelCase:
+`clearcoat`, `clearcoatRoughness`, `sheenColor`, `sheenRoughness`, `anisotropy`,
+`anisotropyRotation`, `transmission`, `ior`, `thickness`, `attenuationColor`,
+`attenuationDistance`, `specular`, `specularColor`, `emissiveStrength`). A material without
+one has ior 1.5, specular 1, specular color and attenuation color white, emissive
+strength 1 and the rest 0. `surface_apply_block(s,
+block, lobes, model_scale)` reads it for the lobes `lobes` names (the thickness times
+`model_scale`, `length(draw.model[0].xyz)`, is in world units); the anisotropy's
+rotation is `block[1].w` for `surface_frame`. The subsurface has no block
+parameters: set `s.subsurface`, `s.subsurface_color` and `s.thin` yourself.
+
+**Frames for anisotropy and parallax.** A mesh may carry tangents (`@location(3)
+tangent: vec4f`, xyz and the handedness in w); a mesh without them binds a zero
+stream. `surface_derived_tangent(world, normal, uv)` makes one from the screen-space
+derivatives of the position and the uv (call it in uniform control flow, where every
+fragment does), and `surface_tangent(stream, derived)` takes the stream's where it
+has one. `surface_frame(s, tangent.xyz, tangent.w, rotation)` makes it perpendicular to the
+normal and turns it about the normal by `rotation`.
+
+**Parallax occlusion mapping.** `parallax_uv(layers, layer_sampler, uv, view, light,
+scale, lod, with_shadow)` returns the `uv` every texture read of the material should
+use instead of the mesh's, its `height` there and, with `with_shadow`, a `shadow` from
+0 (in a groove) to 1 to multiply the sun's visibility by. `layers` is the
+material's layer texture (group 1, binding 4: `@group(1) @binding(4) var heights:
+texture_2d<f32>;`, with the material sampler at 2), and **its red channel is the height
+field**: 1 is the surface, 0 the deepest point, `scale` uv units below it (a shader
+sets its own, often from a draw parameter); a layer texture used for something else
+cannot also be a height map. `view` and `light` are unit vectors toward the eye and the
+light in tangent space (`parallax_tangent_space(tangent, bitangent, normal, v)`; the uv's
+own axes, so a mesh needs a uv-aligned frame). The march takes 8 to 32 layers
+(`floor(32 - 24 |view.z|)`, the fewer the closer to straight down), stops at the first
+whose height is at or above the ray, and puts the hit where the line to the layer before
+crosses the height field, so that a plateau's shift is exact: `(h1 - h2) * scale *
+tan(angle)` between plateaus of heights `h1` and `h2`. A view straight down, a hit at
+the first layer, or a view below the surface leaves the uv alone. The self-shadow
+marches toward the light the same way. `lod` is the layer texture's level: 0 for the base
+(a shader that wants derivatives' worth of filtering passes its own). Bricks lying at a
+grazing angle, with and without it, are in pen-render's `tests/standard_surface.rs`.
 
 ## Vertices and entry points
 

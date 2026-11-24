@@ -2,6 +2,16 @@
 //! (headless) GPU. Every test says its tolerance; compute shaders run the pure
 //! lobes of `surface_lobes.wgsl` on their own, and the real sky and lights are
 //! bound where a test needs them.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::float_cmp,
+    reason = "test geometry and the shaders' own f32 against f64"
+)]
 use std::f64::consts::PI;
 
 use super::harness::{Gpu, Heights, compute, gpu};
@@ -726,6 +736,7 @@ fn the_wrap_and_the_back_lit_term_match_the_reference() {
             f64::from(case[1]),
             V::from32([case[2], case[3], case[4]]),
         ) * PI;
+        #[allow(clippy::needless_range_loop, reason = "a channel of three arrays")]
         for c in 0..3 {
             assert!(
                 (f64::from(got[c]) - want.array()[c]).abs() < 1e-5,
@@ -761,6 +772,7 @@ fn the_wrap_and_the_back_lit_term_match_the_reference() {
             f64::from(case[7]),
         ) * PI;
         peak = peak.max(want.0);
+        #[allow(clippy::needless_range_loop, reason = "a channel of three arrays")]
         for c in 0..3 {
             assert!(
                 (f64::from(got[c]) - want.array()[c]).abs() < 1e-5,
@@ -794,6 +806,7 @@ fn the_wrap_diffuse_gives_back_no_more_than_its_albedo() {
     }
     let got = furnace(&gpu, &cases);
     for (case, albedo) in cases.iter().zip(&got) {
+        #[allow(clippy::needless_range_loop, reason = "a channel of three arrays")]
         for c in 0..3 {
             // The sphere's integral of the wrap diffuse, light from all round.
             assert!(
@@ -885,6 +898,7 @@ fn transmission_maths_matches_the_references() {
         } else {
             color.each(|c| c.powf(thickness / distance))
         };
+        #[allow(clippy::needless_range_loop, reason = "a channel of three arrays")]
         for c in 0..3 {
             assert!(
                 (f64::from(got[c]) - want.array()[c]).abs() < 1e-5,
@@ -1090,4 +1104,47 @@ fn the_new_game_template_carries_the_current_lights_and_surface_blocks() {
     // The transmission glue is not in the template: it needs the translucency library.
     assert!(!template.contains("fn surface_transmit"));
     assert!(SURFACE_TRANSMISSION_WGSL.contains("fn surface_transmit"));
+}
+
+#[test]
+fn the_sky_lookup_of_an_anisotropic_surface_bends_toward_the_view_across_the_grain() {
+    let Some(gpu) = gpu() else { return };
+    let mut input = Vec::new();
+    let mut cases = Vec::new();
+    for roughness in [0.05, 0.2, 0.6] {
+        for anisotropy in [-0.9, -0.3, 0.4, 1.0] {
+            for (theta, phi) in [(0.2, 0.0), (0.9, 1.0), (1.3, 4.0)] {
+                let v = dir(theta, phi);
+                let (t, b) = (V(0.8, 0.6, 0.0), V(-0.6, 0.8, 0.0));
+                cases.push((roughness, anisotropy, v, t, b));
+                input.extend([
+                    roughness as f32,
+                    anisotropy as f32,
+                    v.0 as f32,
+                    v.1 as f32,
+                    v.2 as f32,
+                    t.0 as f32,
+                    t.1 as f32,
+                    t.2 as f32,
+                    b.0 as f32,
+                    b.1 as f32,
+                    b.2 as f32,
+                ]);
+            }
+        }
+    }
+    let body = "put3(i, 0u, lobe_bent_normal(vec3f(0.0, 0.0, 1.0), arg3(i, 5u), arg3(i, 8u), arg3(i, 2u), arg(i, 0u), arg(i, 1u)));";
+    let got = scalars(&gpu, body, &input, 11, 3);
+    let mut moved = 0.0f64;
+    for ((roughness, anisotropy, v, t, b), got) in cases.iter().zip(got.chunks(3)) {
+        let want = reference::bent_normal(V(0.0, 0.0, 1.0), *t, *b, *v, *roughness, *anisotropy);
+        moved = moved.max((want - V(0.0, 0.0, 1.0)).length());
+        for c in 0..3 {
+            assert!(
+                (f64::from(got[c]) - want.array()[c]).abs() < 2e-5,
+                "roughness {roughness} anisotropy {anisotropy}: {got:?} vs {want:?}"
+            );
+        }
+    }
+    assert!(moved > 0.1, "the lookups bend by up to {moved}: the test would see them");
 }

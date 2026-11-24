@@ -2,6 +2,16 @@
 //! `kernel(i)` that reads case `i` of a float buffer and writes its results to
 //! another, optionally with the real sky and lights bound as a mesh pipeline
 //! has them (group 0 bindings 4 to 13, group 2).
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::float_cmp,
+    reason = "test geometry and the shaders' own f32 against f64"
+)]
 use pen_protocol::{Light, ProbeVolume, Sky, Vector};
 use wgpu::util::DeviceExt;
 

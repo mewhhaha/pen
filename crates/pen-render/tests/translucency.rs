@@ -19,8 +19,7 @@ use common::*;
 use pen_protocol::*;
 use pen_render::{Display, Renderer, RendererOptions, VolumeLayer};
 
-/// The library as a shader adds it; the copy that measures the build before the
-/// library was there (`scripts`-less: sed this line) has an identity function.
+/// The library as a shader adds it.
 const TRANSLUCENCY: &str = pen_render::TRANSLUCENCY_WGSL;
 
 const HEAD: &str = r#"
@@ -1328,11 +1327,9 @@ fn the_translucent_pass_costs_this_much_at_1280_by_720() {
         let mut totals: Vec<f32> = Vec::new();
         for index in 0..90 {
             rig.draw(&frame);
-            if index >= 40 {
-                if let Some(gpu) = rig.renderer.stats().gpu {
-                    totals.push(gpu.total);
-                    samples.push(format!("{gpu:?}"));
-                }
+            if let Some(gpu) = rig.renderer.stats().gpu.filter(|_| index >= 40) {
+                totals.push(gpu.total);
+                samples.push(format!("{gpu:?}"));
             }
             std::thread::sleep(std::time::Duration::from_millis(3));
         }
@@ -1452,6 +1449,40 @@ fn the_translucent_pass_follows_the_render_scale_and_the_mist_s_grid() {
         let picture = rig.settle(&frame, 3);
         let got = rig.pixel(&picture, 32, 32);
         assert!(largest_difference(got, through) < LEVELS, "scale {scale} tier {tier}: {got:?} vs {through:?}");
+        assert!(rig.renderer.passes().contains(&"backdrop"));
+    }
+}
+
+#[test]
+fn overlays_draw_dimmed_where_the_scene_hides_them_and_whole_where_it_does_not() {
+    // An overlay behind the wall shows through it at the dimming's strength; one before
+    // the wall replaces what is behind it: both in the translucent pass, after the picture.
+    let overlay = Material { shader: "glass.wgsl", color: [0.15, 0.55, 0.25, 1.0], extra: r#""overlay":true"# };
+    let Some(mut rig) = Rig::new("overlays", 64, &[flat(WALL), overlay]) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    for msaa in [1, 4] {
+        let mut frame = frame(vec![
+            draw(0, 0, scale_at(32.0, 32.0, 1.0, 32.0, 32.0, -40.0)),
+            draw(0, 1, scale_at(16.0, 32.0, 1.0, 16.0, 32.0, -60.0)),
+            draw(0, 1, scale_at(16.0, 32.0, 1.0, 48.0, 32.0, -10.0)),
+        ]);
+        frame.projection = ortho(64.0, 100.0);
+        frame.quality.msaa = msaa;
+        let picture = rig.settle(&frame, 2);
+        let colour = [0.15, 0.55, 0.25];
+        let behind = over(colour, 0.3, rgb(WALL));
+        assert!(
+            largest_difference(rig.pixel(&picture, 16, 32), behind) < LEVELS,
+            "msaa {msaa}: {:?}",
+            rig.pixel(&picture, 16, 32)
+        );
+        assert!(
+            largest_difference(rig.pixel(&picture, 48, 32), colour) < LEVELS,
+            "msaa {msaa}: {:?}",
+            rig.pixel(&picture, 48, 32)
+        );
         assert!(rig.renderer.passes().contains(&"backdrop"));
     }
 }

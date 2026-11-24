@@ -12,6 +12,7 @@ mod built_in;
 pub mod camera_precision;
 mod compressed;
 mod culling;
+pub mod ddgi;
 pub mod decals;
 mod display;
 mod dof;
@@ -24,6 +25,7 @@ mod grade;
 mod graph;
 pub mod hdri;
 mod inspect;
+pub mod lightmap;
 mod lights;
 mod loader;
 mod local_shadows;
@@ -66,6 +68,10 @@ pub use area_lights::{AREA_LIGHTS_WGSL, AreaLight, AreaLightKind, AreaLightResou
 pub use asset_store::{mesh_bounds, pack_mesh, validate_asset_key};
 pub use atmosphere_lut::{ATMOSPHERE_LUT_WGSL, AtmosphereParams, CLOUDS_WGSL, PhysicalAtmosphere};
 pub use camera_precision::{CameraRelativeFrame, DepthMode, perspective_forward_z, perspective_reversed_z};
+pub use ddgi::{
+    DDGI_IRRADIANCE_INNER, DDGI_IRRADIANCE_TILE, DDGI_VISIBILITY_INNER, DDGI_VISIBILITY_TILE, DDGI_WGSL,
+    DdgiFrameParams, DdgiGridConfig, DdgiQueryPoint, DdgiVolume,
+};
 pub use decals::{PBR_DECAL_WGSL, PbrDecal, PbrDecalPass, PbrDecalView};
 pub use display::{DEFAULT_HEADROOM, Display, REFERENCE_WHITE_NITS, choose_surface};
 pub use environment::ENVIRONMENT_WGSL;
@@ -80,6 +86,10 @@ pub use gpu_particles::{
 };
 pub use hdri::{DEFAULT_HDRI_FACE_SIZE, DEFAULT_HDRI_SAMPLES, HdriCubemap, HdriImage, HdriPrefilterer, blend_sh_l2};
 pub use inspect::{TextureInfo, inspect_material, inspect_mesh, inspect_texture, shader_draws_sprites};
+pub use lightmap::{
+    BakedLightmap, GpuLightmapBaker, LIGHTMAP_BAKE_WGSL, LightmapBakeParams, LightmapTriangle, PackedLightmapMesh,
+    pack_lightmap_uv2,
+};
 pub use lights::LIGHTS_WGSL;
 pub use meshlets::{
     DEFAULT_MAX_MESHLET_TRIANGLES, DEFAULT_MAX_MESHLET_VERTICES, MESHLET_CULL_WGSL, MeshletCullParams,

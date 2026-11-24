@@ -12,6 +12,7 @@ mod asset_lint;
 #[cfg(feature = "compiler")]
 mod atlas;
 mod audio;
+mod bake_lightmaps;
 #[cfg(feature = "compiler")]
 mod bench;
 #[cfg(feature = "compiler")]
@@ -664,6 +665,13 @@ const COMMANDS: &[CommandSpec] = &[
                 NAME.import.json listing them; an asset recipe's work",
     },
     CommandSpec {
+        name: "bake-lightmaps",
+        operands: "FILE",
+        checkout: false,
+        about: "bake multi-bounce GPU path-traced lightmaps (HDR irradiance EXR, directional map, sun shadowmask) \
+                with automatic UV2 chart unwrapping and gutter dilation from a scene bake job JSON",
+    },
+    CommandSpec {
         name: "diverge",
         operands: "RECORDING",
         checkout: true,
@@ -811,7 +819,7 @@ const CHECKOUT: &[&str] = &[
     "fuzz",
 ];
 
-const OPTIONS: [OptionSpec; 103] = [
+const OPTIONS: &[OptionSpec] = &[
     OptionSpec { name: "--help", value: "", commands: &[], place: Place::Prose, about: "this" },
     OptionSpec {
         name: "--out",
@@ -1032,6 +1040,34 @@ const OPTIONS: [OptionSpec; 103] = [
         commands: &["gltf"],
         place: Place::Command,
         about: "the asset directory written into (default src/assets)",
+    },
+    OptionSpec {
+        name: "--out",
+        value: "DIR",
+        commands: &["bake-lightmaps"],
+        place: Place::Command,
+        about: "output directory for baked lightmap images and manifest (default lightmaps/)",
+    },
+    OptionSpec {
+        name: "--size",
+        value: "N",
+        commands: &["bake-lightmaps"],
+        place: Place::Command,
+        about: "override square lightmap atlas resolution in texels (default from job JSON or 256)",
+    },
+    OptionSpec {
+        name: "--samples",
+        value: "N",
+        commands: &["bake-lightmaps"],
+        place: Place::Command,
+        about: "override path-traced samples per texel (1..=256)",
+    },
+    OptionSpec {
+        name: "--bounces",
+        value: "N",
+        commands: &["bake-lightmaps"],
+        place: Place::Command,
+        about: "override indirect diffuse bounce count (1..=4)",
     },
     OptionSpec {
         name: "--name",
@@ -2396,6 +2432,16 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
     }
     if args.command == "gltf" {
         return import_gltf(&args);
+    }
+    if args.command == "bake-lightmaps" {
+        let opts = bake_lightmaps::BakeCliOptions {
+            job_path: PathBuf::from(&args.operands[0]),
+            out_dir: args.path("--out").unwrap_or_else(|| PathBuf::from("lightmaps")),
+            size_override: args.number::<u32>("--size")?,
+            samples_override: args.number::<u32>("--samples")?,
+            bounces_override: args.number::<u32>("--bounces")?,
+        };
+        return bake_lightmaps::run(&opts);
     }
     if args.command == "report" {
         return bugreport::open(Path::new(&args.operands[0]), args.path("--out").as_deref());

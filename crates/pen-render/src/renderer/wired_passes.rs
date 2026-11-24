@@ -15,6 +15,7 @@ use super::{GpuAsset, State, TextureRef};
 use crate::area_lights::{AreaLight, AreaLightResources};
 use crate::asset_store::AssetKind;
 use crate::atmosphere_lut::{AtmosphereParams, PhysicalAtmosphere};
+use crate::ddgi::{DdgiGridConfig, DdgiVolume};
 use crate::decals::{PbrDecal, PbrDecalPass, PbrDecalView};
 use crate::matrix::{invert, multiply};
 use crate::oit::OitPass;
@@ -56,6 +57,7 @@ pub(super) struct WiredPasses {
     pub rcas: Option<RcasSharpener>,
     pub post_fx: Option<PostFxPass>,
     pub oit: Option<OitPass>,
+    pub ddgi: Option<DdgiVolume>,
     pub split_screen: Option<SplitScreenCompositor>,
     pub polish_input: Option<(u32, u32, wgpu::TextureFormat, wgpu::Texture, wgpu::TextureView)>,
     pub dummy_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
@@ -258,6 +260,12 @@ impl State {
             let device = self.device.clone();
             let oit = self.wired.oit.get_or_insert_with(|| OitPass::new(&device, SCENE_FORMAT, None));
             oit.resize(&device, scene_size);
+        }
+        if frame.quality.ddgi
+            && self.wired.ddgi.is_none()
+            && let Ok(vol) = DdgiVolume::new(&self.device, DdgiGridConfig::default())
+        {
+            self.wired.ddgi = Some(vol);
         }
         if !frame.quality.physical_sky {
             return Ok(());

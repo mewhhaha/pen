@@ -30,7 +30,6 @@ mod devlog;
 mod devtools;
 #[cfg(feature = "compiler")]
 mod diverge;
-mod editor;
 #[cfg(test)]
 mod fixtures;
 #[cfg(feature = "compiler")]
@@ -669,8 +668,8 @@ const COMMANDS: &[CommandSpec] = &[
         name: "import-scene",
         operands: "FILE",
         checkout: false,
-        about: "import a full glTF 2.0 scene/prefab (.gltf or .glb) into unpacked assets plus a hierarchical \
-                .pen-scene.json preserving node trees, cameras, punctual lights, -col/-colonly/-convcol colliders, \
+        about: "import a glTF 2.0 scene (.gltf or .glb) into unpacked assets plus a neutral .scene.json \
+                manifest preserving node trees, cameras, punctual lights, -col/-colonly/-convcol colliders, \
                 _LOD0..3 groups, and a re-import preset",
     },
     CommandSpec {
@@ -679,14 +678,6 @@ const COMMANDS: &[CommandSpec] = &[
         checkout: false,
         about: "bake multi-bounce GPU path-traced lightmaps (HDR irradiance EXR, directional map, sun shadowmask) \
                 with automatic UV2 chart unwrapping and gutter dilation from a scene bake job JSON",
-    },
-    CommandSpec {
-        name: "edit",
-        operands: "[FILE]",
-        checkout: false,
-        about: "launch the interactive 3D viewport scene editor & property inspector for a .pen-scene.json \
-                (orbit/fly camera, raycast picking, 3D move/rotate/scale gizmos, hierarchy, inspector, timeline, \
-                live shader graph compile, play-in-editor, undo/redo)",
     },
     CommandSpec {
         name: "diverge",
@@ -1087,13 +1078,6 @@ const OPTIONS: &[OptionSpec] = &[
         about: "override indirect diffuse bounce count (1..=4)",
     },
     OptionSpec {
-        name: "--assets",
-        value: "DIR",
-        commands: &["edit"],
-        place: Place::Command,
-        about: "asset root directory containing catalog.json (default src/assets)",
-    },
-    OptionSpec {
         name: "--name",
         value: "NAME",
         commands: &["gltf", "import-scene"],
@@ -1112,7 +1096,7 @@ const OPTIONS: &[OptionSpec] = &[
         value: "FILE",
         commands: &["import-scene"],
         place: Place::Command,
-        about: "explicit output path for the generated .pen-scene.json (default <out>/<name>.pen-scene.json)",
+        about: "explicit output path for the generated .scene.json manifest (default <out>/<name>.scene.json)",
     },
     OptionSpec {
         name: "--scale",
@@ -2483,11 +2467,6 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             bounces_override: args.number::<u32>("--bounces")?,
         };
         return bake_lightmaps::run(&opts);
-    }
-    if args.command == "edit" {
-        let scene_path = args.operands.first().map(PathBuf::from);
-        let assets = args.path("--assets").unwrap_or_else(|| PathBuf::from("src/assets"));
-        return editor::app::run(scene_path, assets);
     }
     if args.command == "report" {
         return bugreport::open(Path::new(&args.operands[0]), args.path("--out").as_deref());

@@ -48,7 +48,10 @@ pub mod scene_import;
 pub mod tangents;
 pub mod vat;
 
-pub use scene_import::{ImportedScene, SceneImportOptions, SceneImportPreset, import_scene};
+pub use scene_import::{
+    ImportedScene, SceneCameraData, SceneColliderData, SceneImportOptions, SceneImportPreset, SceneLightData,
+    SceneLodLevel, SceneManifest, SceneMeshRef, SceneNodeData, SceneTransform, import_scene,
+};
 
 /// A shader that draws with vertex-animation textures, which an import
 /// asked to bake them writes as their materials' shader when the asset

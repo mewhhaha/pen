@@ -1,39 +1,30 @@
-//! Full glTF 2.0 Scene/Prefab Importer (`pen import-scene`).
+//! Build-time glTF 2.0 Scene Metadata Exporter (`pen import-scene`).
 //!
-//! Imports a multi-node `.gltf` / `.glb` file into:
-//! - Unpacked Pen meshes (with `TEXCOORD_1`, `COLOR_0`, tangents, skins, morphs, PBR materials & images)
-//! - A hierarchical `.pen-scene.json` (or `.prefab.json`) preserving parent-child transforms,
-//!   cameras, `KHR_lights_punctual` lights, animation clips, Godot/Unity collider naming
-//!   conventions (`-col`, `-colonly`, `-convcol`), and `_LOD0..3` sibling grouping
-//! - A `<name>.import-scene.json` re-import sidecar preset so subsequent re-imports preserve settings.
+//! Unpacks meshes (with `TEXCOORD_1`, `COLOR_0`, tangents, skins, morphs), materials, and images
+//! via [`crate::import`], and emits a neutral, host-agnostic `<name>.scene.json` manifest
+//! containing the glTF node tree, local TRS transforms, cameras, `KHR_lights_punctual` lights,
+//! collider conventions (`-col`, `-colonly`, `-convcol`), `_LOD0..3` sibling groups, and
+//! animation clip references so Blot/Ink applications can load scenes into their own state format.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use pen_scene::{
-    AssetId, BodyMode, ColliderShape, Component, LightKind, LodLevel, NodeId, Scene, SceneNode, Transform,
-};
 use serde::{Deserialize, Serialize};
 
 use crate::{Imported, Options, import};
 
-/// Options controlling full glTF scene/prefab import.
+/// Options controlling glTF scene asset import.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SceneImportOptions {
-    /// Base asset prefix (defaults to source file stem).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Shader key assigned to imported materials (default `"scene.wgsl"`).
     #[serde(default = "default_shader")]
     pub shader: String,
-    /// Optional explicit output scene path (defaults to `<out_dir>/<name>.pen-scene.json`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene_path: Option<PathBuf>,
-    /// Enable vertex-cache + fetch optimization on imported meshes.
     #[serde(default)]
     pub optimize_vertices: bool,
-    /// Global uniform scale applied to root nodes (default `1.0`).
     #[serde(default = "default_one")]
     pub root_scale: f32,
 }
@@ -57,7 +48,91 @@ impl Default for SceneImportOptions {
     }
 }
 
-/// Sidecar re-import preset saved beside the imported scene (`<name>.import-scene.json`).
+/// Neutral local TRS transform exported from glTF.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneTransform {
+    pub position: [f32; 3],
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+}
+
+/// One LOD mesh entry grouped from `_LOD0..3` sibling nodes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneLodLevel {
+    pub mesh: String,
+    pub material: String,
+    pub screen_threshold: f32,
+}
+
+/// Neutral mesh attachment on an imported glTF node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneMeshRef {
+    pub mesh: String,
+    pub material: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lods: Vec<SceneLodLevel>,
+}
+
+/// Neutral camera descriptor exported from a glTF camera node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneCameraData {
+    pub perspective: bool,
+    pub fov_deg: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+/// Neutral punctual light descriptor exported from `KHR_lights_punctual`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneLightData {
+    pub kind: String,
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub range: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inner_cone: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outer_cone: Option<f32>,
+}
+
+/// Neutral collision geometry hint extracted from `-col`, `-colonly`, or `-convcol` nodes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "shape", rename_all = "snake_case")]
+pub enum SceneColliderData {
+    Box { half_extents: [f32; 3] },
+    ConvexHull { points: Vec<[f32; 3]> },
+    TriMesh { mesh: String },
+}
+
+/// One node in the topologically ordered (parent-before-child) exported scene manifest.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneNodeData {
+    pub name: String,
+    /// Index of the parent node in [`SceneManifest::nodes`], or `None` for a root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
+    pub transform: SceneTransform,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meshes: Vec<SceneMeshRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<SceneCameraData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub light: Option<SceneLightData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collider: Option<SceneColliderData>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clips: Vec<String>,
+}
+
+/// Host-agnostic scene asset manifest written as `<name>.scene.json`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SceneManifest {
+    pub name: String,
+    pub source: String,
+    pub nodes: Vec<SceneNodeData>,
+}
+
+/// Re-import preset sidecar saved beside the scene manifest (`<name>.import-scene.json`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SceneImportPreset {
     pub source: String,
@@ -72,7 +147,7 @@ pub struct SceneImportPreset {
 #[derive(Debug)]
 pub struct ImportedScene {
     pub assets: Imported,
-    pub scene: Scene,
+    pub scene: SceneManifest,
     pub scene_path: PathBuf,
     pub preset_path: PathBuf,
     pub lod_groups: usize,
@@ -80,7 +155,16 @@ pub struct ImportedScene {
 }
 
 fn parse_lod_suffix(name: &str) -> Option<(&str, u32)> {
-    for (suffix, level) in [("_LOD0", 0), ("_LOD1", 1), ("_LOD2", 2), ("_LOD3", 3), ("-lod0", 0), ("-lod1", 1), ("-lod2", 2), ("-lod3", 3)] {
+    for (suffix, level) in [
+        ("_LOD0", 0),
+        ("_LOD1", 1),
+        ("_LOD2", 2),
+        ("_LOD3", 3),
+        ("-lod0", 0),
+        ("-lod1", 1),
+        ("-lod2", 2),
+        ("-lod3", 3),
+    ] {
         if let Some(base) = name.strip_suffix(suffix)
             && !base.is_empty()
         {
@@ -99,7 +183,7 @@ fn lod_threshold(level: u32) -> f32 {
     }
 }
 
-fn read_node_local_bounds(doc: &gltf::Document, node: &gltf::Node, buffers: &[Vec<u8>]) -> ([f32; 3], Vec<[f32; 3]>) {
+fn read_node_local_bounds(node: &gltf::Node, buffers: &[Vec<u8>]) -> ([f32; 3], Vec<[f32; 3]>) {
     let mut min_p = [f32::INFINITY; 3];
     let mut max_p = [f32::NEG_INFINITY; 3];
     let mut hull_pts = Vec::new();
@@ -120,7 +204,6 @@ fn read_node_local_bounds(doc: &gltf::Document, node: &gltf::Node, buffers: &[Ve
             }
         }
     }
-    let _ = doc;
     if !min_p[0].is_finite() {
         return ([0.5, 0.5, 0.5], hull_pts);
     }
@@ -132,14 +215,13 @@ fn read_node_local_bounds(doc: &gltf::Document, node: &gltf::Node, buffers: &[Ve
     (half, hull_pts)
 }
 
-/// Imports a full glTF 2.0 scene/prefab from `source` into `out_assets`, writing unpacked assets,
-/// `<name>.pen-scene.json`, and `<name>.import-scene.json`.
+/// Imports a glTF 2.0 scene into unpacked assets plus a neutral `<name>.scene.json` manifest
+/// and `<name>.import-scene.json` re-import preset.
 pub fn import_scene(source: &Path, out_assets: &Path, options: &SceneImportOptions) -> Result<ImportedScene> {
     let bytes = std::fs::read(source).with_context(|| format!("reading {}", source.display()))?;
     let stem = source.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "scene".to_owned());
     let base_name = options.name.clone().unwrap_or(stem);
 
-    // 1. Run standard asset import (meshes, materials, textures, skins, morphs, clips).
     let asset_opts = Options {
         name: Some(base_name.clone()),
         shader: options.shader.clone(),
@@ -148,7 +230,6 @@ pub fn import_scene(source: &Path, out_assets: &Path, options: &SceneImportOptio
     };
     let assets = import(source, out_assets, &asset_opts)?;
 
-    // 2. Parse glTF hierarchy directly to preserve full node tree, cameras, lights, colliders, and LODs.
     let gltf::Gltf { document, blob } = gltf::Gltf::from_slice_without_validation(&bytes)
         .with_context(|| format!("parsing {} as glTF", source.display()))?;
     let dir = source.parent().unwrap_or_else(|| Path::new("."));
@@ -169,7 +250,6 @@ pub fn import_scene(source: &Path, out_assets: &Path, options: &SceneImportOptio
 
     let gltf_scene = document.default_scene().or_else(|| document.scenes().next()).context("glTF has no scene")?;
 
-    // Map each mesh-bearing node in DFS order to the imported mesh/material entries created by `import`.
     let mut node_mesh_map: HashMap<usize, Vec<(String, String)>> = HashMap::new();
     let mut imported_cursor = 0usize;
     let mut dfs_stack: Vec<gltf::Node> = gltf_scene.nodes().collect();
@@ -193,30 +273,25 @@ pub fn import_scene(source: &Path, out_assets: &Path, options: &SceneImportOptio
         }
     }
 
-    // Build Scene hierarchy preserving parent-child links.
-    let mut scene = Scene::new(base_name.clone());
-    scene.id = AssetId::from_path(&format!("{base_name}.pen-scene.json"));
+    let mut nodes: Vec<SceneNodeData> = Vec::new();
     let mut colliders = 0usize;
 
-    type LodEntry = (String, String, Transform);
-    type LodBuckets = BTreeMap<(Option<NodeId>, String), BTreeMap<u32, LodEntry>>;
-    // Track LOD siblings keyed by `(parent_id, base_lod_name)` -> `BTreeMap<lod_level, (mesh, material, transform)>`.
+    type LodEntry = (String, String, SceneTransform);
+    type LodBuckets = BTreeMap<(Option<usize>, String), BTreeMap<u32, LodEntry>>;
     let mut lod_buckets: LodBuckets = BTreeMap::new();
 
-    // Traverse top-down so parent NodeIds exist before children.
-    let mut walk: Vec<(gltf::Node, Option<NodeId>, u32)> =
-        gltf_scene.nodes().enumerate().map(|(ord, n)| (n, None, u32::try_from(ord).unwrap_or(u32::MAX))).collect();
+    // Top-down DFS guarantees every parent appears strictly before its children (`parent < index`).
+    let mut walk: Vec<(gltf::Node, Option<usize>)> = gltf_scene.nodes().map(|n| (n, None)).collect();
     walk.reverse();
 
-    while let Some((node, parent_id, ordinal)) = walk.pop() {
+    while let Some((node, parent_idx)) = walk.pop() {
         let raw_name = node.name().map_or_else(|| format!("node_{}", node.index()), str::to_owned);
         let (t, r, mut s) = node.transform().decomposed();
-        if parent_id.is_none() && (options.root_scale - 1.0).abs() > 1e-6 {
+        if parent_idx.is_none() && (options.root_scale - 1.0).abs() > 1e-6 {
             s = [s[0] * options.root_scale, s[1] * options.root_scale, s[2] * options.root_scale];
         }
-        let local_xform = Transform { position: t, rotation: r, scale: s };
+        let transform = SceneTransform { position: t, rotation: r, scale: s };
 
-        // Detect _LOD0..3 sibling meshes when the node has no children/camera/light of its own.
         if let Some((lod_base, lod_level)) = parse_lod_suffix(&raw_name)
             && node.children().count() == 0
             && node.camera().is_none()
@@ -225,9 +300,9 @@ pub fn import_scene(source: &Path, out_assets: &Path, options: &SceneImportOptio
             && let Some((mesh_key, mat_key)) = prims.first()
         {
             lod_buckets
-                .entry((parent_id, lod_base.to_owned()))
+                .entry((parent_idx, lod_base.to_owned()))
                 .or_default()
-                .insert(lod_level, (mesh_key.clone(), mat_key.clone(), local_xform));
+                .insert(lod_level, (mesh_key.clone(), mat_key.clone(), transform));
             continue;
         }
 
@@ -241,157 +316,114 @@ pub fn import_scene(source: &Path, out_assets: &Path, options: &SceneImportOptio
             .unwrap_or(&raw_name)
             .to_owned();
 
-        let mut snode = SceneNode::new(clean_name, parent_id, ordinal);
-        snode.transform = local_xform;
-
-        // MeshRenderer (omitted for -colonly invisible collision volumes).
+        let mut meshes = Vec::new();
         if !is_colonly
             && let Some(prims) = node_mesh_map.get(&node.index())
         {
             for (mesh_key, mat_key) in prims {
-                snode.components.push(Component::MeshRenderer {
-                    mesh: mesh_key.clone(),
-                    material: mat_key.clone(),
-                    cast_shadows: true,
-                    receive_shadows: true,
-                    lod_group: Vec::new(),
-                    parameters: None,
-                });
+                meshes.push(SceneMeshRef { mesh: mesh_key.clone(), material: mat_key.clone(), lods: Vec::new() });
             }
         }
 
-        // Collider convention extraction (-col, -colonly, -convcol).
-        if is_col || is_colonly || is_convcol {
-            let (half_extents, hull_pts) = read_node_local_bounds(&document, &node, &buffers);
-            let shape = if is_convcol && !hull_pts.is_empty() {
-                ColliderShape::ConvexHull { points: hull_pts }
+        let collider = if is_col || is_colonly || is_convcol {
+            colliders += 1;
+            let (half_extents, hull_pts) = read_node_local_bounds(&node, &buffers);
+            if is_convcol && !hull_pts.is_empty() {
+                Some(SceneColliderData::ConvexHull { points: hull_pts })
             } else if is_col
                 && let Some(prims) = node_mesh_map.get(&node.index())
                 && let Some((mesh_key, _)) = prims.first()
             {
-                ColliderShape::TriMesh { mesh: mesh_key.clone() }
+                Some(SceneColliderData::TriMesh { mesh: mesh_key.clone() })
             } else {
-                ColliderShape::Box { half_extents }
-            };
-            snode.components.push(Component::Collider { shape, is_trigger: false, layer: 1 });
-            snode.components.push(Component::RigidBody {
-                mode: BodyMode::Static,
-                mass: 0.0,
-                linear_damping: 0.0,
-                angular_damping: 0.0,
-            });
-            colliders += 1;
-        }
-
-        // Cameras.
-        if let Some(cam) = node.camera() {
-            match cam.projection() {
-                gltf::camera::Projection::Perspective(p) => {
-                    snode.components.push(Component::Camera {
-                        fov_deg: p.yfov().to_degrees(),
-                        near: p.znear(),
-                        far: p.zfar().unwrap_or(500.0),
-                        active: true,
-                        clear_color: [0.08, 0.10, 0.14, 1.0],
-                        target_material: None,
-                        viewport: None,
-                    });
-                }
-                gltf::camera::Projection::Orthographic(o) => {
-                    snode.components.push(Component::Camera {
-                        fov_deg: 45.0,
-                        near: o.znear(),
-                        far: o.zfar(),
-                        active: false,
-                        clear_color: [0.08, 0.10, 0.14, 1.0],
-                        target_material: None,
-                        viewport: None,
-                    });
-                }
+                Some(SceneColliderData::Box { half_extents })
             }
-        }
+        } else {
+            None
+        };
 
-        // KHR_lights_punctual attached directly to hierarchy node!
-        if let Some(light) = node.light() {
-            let (kind, inner_cone, outer_cone) = match light.kind() {
-                gltf::khr_lights_punctual::Kind::Directional => (LightKind::Directional, 0.0, 0.0),
-                gltf::khr_lights_punctual::Kind::Point => (LightKind::Point, 0.0, 0.0),
+        let camera = node.camera().map(|cam| match cam.projection() {
+            gltf::camera::Projection::Perspective(p) => SceneCameraData {
+                perspective: true,
+                fov_deg: p.yfov().to_degrees(),
+                near: p.znear(),
+                far: p.zfar().unwrap_or(500.0),
+            },
+            gltf::camera::Projection::Orthographic(o) => {
+                SceneCameraData { perspective: false, fov_deg: 45.0, near: o.znear(), far: o.zfar() }
+            }
+        });
+
+        let light = node.light().map(|l| {
+            let (kind, inner_cone, outer_cone) = match l.kind() {
+                gltf::khr_lights_punctual::Kind::Directional => ("directional".to_owned(), None, None),
+                gltf::khr_lights_punctual::Kind::Point => ("point".to_owned(), None, None),
                 gltf::khr_lights_punctual::Kind::Spot { inner_cone_angle, outer_cone_angle } => {
-                    (LightKind::Spot, inner_cone_angle, outer_cone_angle)
+                    ("spot".to_owned(), Some(inner_cone_angle), Some(outer_cone_angle))
                 }
             };
-            snode.components.push(Component::Light {
+            SceneLightData {
                 kind,
-                color: light.color(),
-                intensity: light.intensity(),
-                range: light.range().unwrap_or(20.0),
+                color: l.color(),
+                intensity: l.intensity(),
+                range: l.range().unwrap_or(20.0),
                 inner_cone,
                 outer_cone,
-                width: 1.0,
-                height: 1.0,
-                cast_shadows: matches!(kind, LightKind::Directional | LightKind::Spot),
-            });
-        }
+            }
+        });
 
-        // Attach AnimationPlayer to skinned root or first mesh node when animations exist.
-        if !assets.clips.is_empty() && node.skin().is_some() {
-            let clip_names: Vec<String> = assets.clips.iter().map(|c| c.name.clone()).collect();
-            let active_clip = clip_names.first().cloned();
-            snode.components.push(Component::AnimationPlayer {
-                clips: clip_names,
-                active_clip,
-                speed: 1.0,
-                looping: true,
-            });
-        }
+        let clips = if !assets.clips.is_empty() && node.skin().is_some() {
+            assets.clips.iter().map(|c| c.name.clone()).collect()
+        } else {
+            Vec::new()
+        };
 
-        let this_id = snode.id;
-        scene.nodes.push(snode);
+        let this_idx = nodes.len();
+        nodes.push(SceneNodeData { name: clean_name, parent: parent_idx, transform, meshes, camera, light, collider, clips });
 
-        let mut children: Vec<(gltf::Node, Option<NodeId>, u32)> = node
-            .children()
-            .enumerate()
-            .map(|(c_ord, c)| (c, Some(this_id), u32::try_from(c_ord).unwrap_or(u32::MAX)))
-            .collect();
+        let mut children: Vec<(gltf::Node, Option<usize>)> = node.children().map(|c| (c, Some(this_idx))).collect();
         children.reverse();
         walk.extend(children);
     }
 
-    // Materialize grouped _LOD0..3 sibling nodes.
     let lod_groups = lod_buckets.len();
-    for ((parent_id, lod_base), levels) in lod_buckets {
+    for ((parent_idx, lod_base), levels) in lod_buckets {
         let Some((_, (mesh0, mat0, xform0))) = levels.iter().next() else { continue };
-        let mut snode = SceneNode::new(lod_base, parent_id, u32::try_from(scene.nodes.len()).unwrap_or(u32::MAX));
-        snode.transform = *xform0;
-        let lod_group: Vec<LodLevel> = levels
+        let lods: Vec<SceneLodLevel> = levels
             .iter()
-            .map(|(&lvl, (m, mat, _))| LodLevel {
+            .map(|(&lvl, (m, mat, _))| SceneLodLevel {
                 mesh: m.clone(),
                 material: mat.clone(),
                 screen_threshold: lod_threshold(lvl),
             })
             .collect();
-        snode.components.push(Component::MeshRenderer {
-            mesh: mesh0.clone(),
-            material: mat0.clone(),
-            cast_shadows: true,
-            receive_shadows: true,
-            lod_group,
-            parameters: None,
+        nodes.push(SceneNodeData {
+            name: lod_base,
+            parent: parent_idx,
+            transform: *xform0,
+            meshes: vec![SceneMeshRef { mesh: mesh0.clone(), material: mat0.clone(), lods }],
+            camera: None,
+            light: None,
+            collider: None,
+            clips: Vec::new(),
         });
-        scene.nodes.push(snode);
     }
 
-    let scene_path = options
-        .scene_path
-        .clone()
-        .unwrap_or_else(|| out_assets.join(format!("{base_name}.pen-scene.json")));
-    scene.save(&scene_path)?;
+    let scene = SceneManifest { name: base_name.clone(), source: source.display().to_string(), nodes };
+    let scene_path = options.scene_path.clone().unwrap_or_else(|| out_assets.join(format!("{base_name}.scene.json")));
+    if let Some(parent) = scene_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&scene_path, serde_json::to_string_pretty(&scene)?)?;
 
     let preset_path = out_assets.join(format!("{base_name}.import-scene.json"));
     let preset = SceneImportPreset {
         source: source.display().to_string(),
-        scene_file: scene_path.file_name().map_or_else(|| format!("{base_name}.pen-scene.json"), |f| f.to_string_lossy().into_owned()),
+        scene_file: scene_path
+            .file_name()
+            .map_or_else(|| format!("{base_name}.scene.json"), |f| f.to_string_lossy().into_owned()),
         options: options.clone(),
         node_count: scene.nodes.len(),
         lod_groups,
@@ -420,6 +452,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>> {
         if b == b'=' || b.is_ascii_whitespace() {
             continue;
         }
+        ensure!(b < 128, "invalid base64 byte");
         let digit = TABLE[b as usize];
         ensure!(digit >= 0, "invalid base64 byte");
         buf = (buf << 6) | u32::from(digit.cast_unsigned());
@@ -435,7 +468,6 @@ fn decode_base64(input: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pen_scene::NullPrefabResolver;
 
     fn b64_encode(bytes: &[u8]) -> String {
         const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -454,8 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn imports_hierarchy_camera_punctual_light_colliders_and_lod_groups() {
-        // Minimal 1-triangle mesh buffer (3 positions + 3 normals + 3 indices).
+    fn exports_neutral_hierarchy_camera_punctual_light_colliders_and_lod_groups() {
         let mut bin = Vec::new();
         let positions: [[f32; 3]; 3] = [[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0]];
         for p in positions {
@@ -526,7 +557,7 @@ mod tests {
             "scene": 0
         });
 
-        let tmp = std::env::temp_dir().join(format!("pen_scene_import_test_{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("pen_neutral_scene_import_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let src = tmp.join("demo.gltf");
@@ -536,37 +567,26 @@ mod tests {
         let imported = import_scene(&src, &out_dir, &SceneImportOptions::default()).unwrap();
         assert!(imported.scene_path.exists());
         assert!(imported.preset_path.exists());
-        assert_eq!(imported.lod_groups, 1, "Tree_LOD0 + Tree_LOD1 must group into 1 LOD node");
-        assert_eq!(imported.colliders, 2, "Wall-colonly + Rock-convcol must create 2 colliders");
+        assert_eq!(imported.lod_groups, 1);
+        assert_eq!(imported.colliders, 2);
 
-        let resolved = imported.scene.resolve(&NullPrefabResolver).unwrap();
-        let wall = resolved.nodes.iter().find(|n| n.name == "Wall").expect("Wall-colonly node");
-        assert!(
-            !wall.components.iter().any(|c| matches!(c, Component::MeshRenderer { .. })),
-            "-colonly must omit MeshRenderer"
-        );
-        assert!(wall.components.iter().any(|c| matches!(c, Component::Collider { shape: ColliderShape::Box { .. }, .. })));
-        assert!((wall.world_matrix[12] - 6.0).abs() < 1e-5, "parent Root(5) + Wall(1) = 6");
-
-        let rock = resolved.nodes.iter().find(|n| n.name == "Rock").expect("Rock-convcol node");
-        assert!(rock.components.iter().any(|c| matches!(c, Component::Collider { shape: ColliderShape::ConvexHull { .. }, .. })));
-
-        let tree = resolved.nodes.iter().find(|n| n.name == "Tree").expect("merged Tree LOD node");
-        let lod_count = tree
-            .components
-            .iter()
-            .find_map(|c| match c {
-                Component::MeshRenderer { lod_group, .. } => Some(lod_group.len()),
-                _ => None,
-            })
-            .unwrap_or(0);
-        assert_eq!(lod_count, 2, "Tree must carry LOD0 and LOD1");
-
-        let lamp = resolved.nodes.iter().find(|n| n.name == "LampNode").expect("LampNode");
-        assert!(lamp.components.iter().any(|c| matches!(c, Component::Light { kind: LightKind::Spot, .. })));
-
-        let cam = resolved.nodes.iter().find(|n| n.name == "MainCam").expect("MainCam");
-        assert!(cam.components.iter().any(|c| matches!(c, Component::Camera { .. })));
+        // Topological parent-before-child ordering holds for every node.
+        for (idx, n) in imported.scene.nodes.iter().enumerate() {
+            if let Some(p) = n.parent {
+                assert!(p < idx, "parent {p} must precede child {idx}");
+            }
+        }
+        let wall = imported.scene.nodes.iter().find(|n| n.name == "Wall").unwrap();
+        assert!(wall.meshes.is_empty(), "-colonly omits render meshes");
+        assert!(matches!(wall.collider, Some(SceneColliderData::Box { .. })));
+        let rock = imported.scene.nodes.iter().find(|n| n.name == "Rock").unwrap();
+        assert!(matches!(rock.collider, Some(SceneColliderData::ConvexHull { .. })));
+        let tree = imported.scene.nodes.iter().find(|n| n.name == "Tree").unwrap();
+        assert_eq!(tree.meshes[0].lods.len(), 2);
+        let lamp = imported.scene.nodes.iter().find(|n| n.name == "LampNode").unwrap();
+        assert_eq!(lamp.light.as_ref().unwrap().kind, "spot");
+        let cam = imported.scene.nodes.iter().find(|n| n.name == "MainCam").unwrap();
+        assert!(cam.camera.as_ref().unwrap().perspective);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

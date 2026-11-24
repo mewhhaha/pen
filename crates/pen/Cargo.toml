@@ -48,7 +48,6 @@ pen-protocol.workspace = true
 pen-runtime.workspace = true
 pen-ink.workspace = true
 pen-render.workspace = true
-pen-scene.workspace = true
 pen-simulation.workspace = true
 wasmtime.workspace = true
 # The game's interface (and the dev tools') for assistive technology:

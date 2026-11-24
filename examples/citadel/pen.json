@@ -1,0 +1,32 @@
+{
+  "game": {
+    "name": "citadel",
+    "title": "Citadel Striker — Ink + Pen Playable 3D Vertical Slice"
+  },
+  "plugins": {
+    "blot": {
+      "read": [
+        "../../../blot2/std",
+        "../../../ink/lib"
+      ],
+      "run": {
+        "blotc": "../../../blot2/compiler-goose/build/blotc-goose"
+      }
+    }
+  },
+  "compiler": {
+    "plugin": "blot",
+    "settings": {
+      "std": "../../../blot2/std",
+      "imports": {
+        "pen/": "pen/",
+        "ink/": "../../../ink/lib/"
+      },
+      "nativeAssets": {
+        "roots": [
+          "src"
+        ]
+      }
+    }
+  }
+}

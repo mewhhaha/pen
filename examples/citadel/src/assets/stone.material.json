@@ -1,0 +1,12 @@
+{
+  "shader": "lit.wgsl",
+  "texture": "stone.png",
+  "color": [
+    0.68,
+    0.7,
+    0.76,
+    1.0
+  ],
+  "lighting": "lit",
+  "decals": true
+}

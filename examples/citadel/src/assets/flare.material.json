@@ -1,0 +1,12 @@
+{
+  "shader": "lit.wgsl",
+  "texture": "flare.png",
+  "color": [
+    1.0,
+    0.85,
+    0.35,
+    1.0
+  ],
+  "lighting": "unlit",
+  "blend": true
+}

@@ -1,0 +1,19 @@
+{
+  "size": [480, 320],
+  "fps": 60,
+  "threshold": 0.02,
+  "scenarios": {
+    "start": {
+      "about": "citadel arena opening view with skinned hero, glowing blade, 4 sentinels, shards, water moat, grass and HUD",
+      "script": "wait=12 shot=start"
+    },
+    "action_slash": {
+      "about": "hero sprints forward, jumps onto dais, and executes a glowing energy slash with ribbon trail",
+      "script": "down=KeyW wait=24 key=Space wait=10 key=KeyJ wait=6 up=KeyW wait=4 shot=action_slash"
+    },
+    "paused": {
+      "about": "pause modal overlay toggled via Escape",
+      "script": "wait=6 key=Escape wait=6 shot=paused"
+    }
+  }
+}

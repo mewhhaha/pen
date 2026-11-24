@@ -1,0 +1,19 @@
+{
+  "shader": "portal.matgraph.json",
+  "texture": "portal.png",
+  "color": [
+    0.85,
+    0.95,
+    1.0,
+    1.0
+  ],
+  "lighting": "lit",
+  "surface": {
+    "clearcoat": 0.9,
+    "clearcoatRoughness": 0.1,
+    "iridescence": 0.85,
+    "iridescenceIor": 1.65,
+    "iridescenceThicknessMin": 220.0,
+    "iridescenceThicknessMax": 540.0
+  }
+}

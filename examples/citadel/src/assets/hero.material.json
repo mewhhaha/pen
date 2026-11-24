@@ -1,0 +1,14 @@
+{
+  "shader": "lit.wgsl",
+  "color": [
+    0.24,
+    0.56,
+    0.92,
+    1.0
+  ],
+  "lighting": "lit",
+  "surface": {
+    "clearcoat": 0.6,
+    "clearcoatRoughness": 0.2
+  }
+}

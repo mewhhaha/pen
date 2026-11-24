@@ -1,0 +1,16 @@
+{
+  "shader": "lit.wgsl",
+  "texture": "stone.png",
+  "color": [
+    0.46,
+    0.5,
+    0.58,
+    1.0
+  ],
+  "lighting": "lit",
+  "decals": true,
+  "surface": {
+    "clearcoat": 0.25,
+    "clearcoatRoughness": 0.35
+  }
+}

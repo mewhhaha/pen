@@ -1,0 +1,26 @@
+{
+  "threshold": 0.02,
+  "shots": [
+    {
+      "scenario": "action_slash",
+      "about": "hero sprints forward, jumps onto dais, and executes a glowing energy slash with ribbon trail",
+      "file": "action_slash.png",
+      "status": "Passed",
+      "summary": "RMSE 0.4948%, largest 23.5%, 0.433% of pixels visibly changed"
+    },
+    {
+      "scenario": "paused",
+      "about": "pause modal overlay toggled via Escape",
+      "file": "paused.png",
+      "status": "Passed",
+      "summary": "RMSE 0.3658%, largest 13.3%, 0.413% of pixels visibly changed"
+    },
+    {
+      "scenario": "start",
+      "about": "citadel arena opening view with skinned hero, glowing blade, 4 sentinels, shards, water moat, grass and HUD",
+      "file": "start.png",
+      "status": "Passed",
+      "summary": "RMSE 0.4545%, largest 38.4%, 0.510% of pixels visibly changed"
+    }
+  ]
+}

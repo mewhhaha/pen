@@ -1,0 +1,13 @@
+{
+  "shader": "lit.wgsl",
+  "color": [
+    1.0,
+    0.92,
+    0.65,
+    1.0
+  ],
+  "lighting": "unlit",
+  "surface": {
+    "emissiveStrength": 3.5
+  }
+}

@@ -1,0 +1,160 @@
+{
+  "name": "citadel_portal",
+  "nodes": [
+    {
+      "id": "uv",
+      "op": "uv",
+      "ui_pos": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "id": "tex",
+      "op": "texture2_d",
+      "ui_pos": [
+        120.0,
+        0.0
+      ],
+      "uv": {
+        "node": "uv"
+      },
+      "fallback_color": [
+        0.25,
+        0.85,
+        1.0
+      ]
+    },
+    {
+      "id": "rgb",
+      "op": "swizzle",
+      "ui_pos": [
+        240.0,
+        0.0
+      ],
+      "input": {
+        "node": "tex"
+      },
+      "mask": "xyz"
+    },
+    {
+      "id": "t",
+      "op": "time",
+      "ui_pos": [
+        120.0,
+        120.0
+      ]
+    },
+    {
+      "id": "s",
+      "op": "sin",
+      "ui_pos": [
+        220.0,
+        120.0
+      ],
+      "x": {
+        "node": "t"
+      }
+    },
+    {
+      "id": "pulse",
+      "op": "clamp",
+      "ui_pos": [
+        320.0,
+        120.0
+      ],
+      "x": {
+        "node": "s"
+      },
+      "min": 0.25,
+      "max": 0.95
+    },
+    {
+      "id": "rim",
+      "op": "fresnel",
+      "ui_pos": [
+        320.0,
+        180.0
+      ],
+      "power": 3.0
+    },
+    {
+      "id": "boost",
+      "op": "add",
+      "ui_pos": [
+        420.0,
+        140.0
+      ],
+      "a": {
+        "node": "pulse"
+      },
+      "b": {
+        "node": "rim"
+      }
+    },
+    {
+      "id": "glow",
+      "op": "mul",
+      "ui_pos": [
+        500.0,
+        120.0
+      ],
+      "a": {
+        "node": "rgb"
+      },
+      "b": {
+        "node": "boost"
+      }
+    },
+    {
+      "id": "rough",
+      "op": "float_const",
+      "ui_pos": [
+        320.0,
+        240.0
+      ],
+      "value": 0.14
+    },
+    {
+      "id": "coat",
+      "op": "float_const",
+      "ui_pos": [
+        320.0,
+        300.0
+      ],
+      "value": 0.9
+    },
+    {
+      "id": "irid",
+      "op": "float_const",
+      "ui_pos": [
+        320.0,
+        360.0
+      ],
+      "value": 0.85
+    },
+    {
+      "id": "out",
+      "op": "standard_surface_output",
+      "ui_pos": [
+        620.0,
+        80.0
+      ],
+      "base_color": {
+        "node": "rgb"
+      },
+      "roughness": {
+        "node": "rough"
+      },
+      "emissive": {
+        "node": "glow"
+      },
+      "clearcoat": {
+        "node": "coat"
+      },
+      "iridescence": {
+        "node": "irid"
+      }
+    }
+  ]
+}

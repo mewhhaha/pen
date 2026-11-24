@@ -1,0 +1,27 @@
+{
+  "meshes": [
+    "box.mesh.json",
+    "hero.mesh.json",
+    "sentinel.mesh.json",
+    "blade.mesh.json"
+  ],
+  "materials": [
+    "stone.material.json",
+    "pillar.material.json",
+    "hero.material.json",
+    "sentinel.material.json",
+    "sentinel_hit.material.json",
+    "blade.material.json",
+    "portal.material.json",
+    "flare.material.json",
+    "rune.material.json",
+    "ui_panel.material.json",
+    "ui_font.material.json"
+  ],
+  "sounds": [
+    "step.wav",
+    "swing.wav",
+    "hit.wav",
+    "pickup.wav"
+  ]
+}

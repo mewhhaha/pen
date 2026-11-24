@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang=en>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1">
+<title>Golden images</title>
+<style>
+:root { color-scheme: light dark; --page: #fafafa; --text: #1d1d1f; --muted: #5f6368; --card: #fff; --line: #d9d9de; --bad: #b3261e; --good: #1e7d3a; }
+@media (prefers-color-scheme: dark) { :root { --page: #161618; --text: #e8e8ea; --muted: #a0a0a8; --card: #202024; --line: #3a3a40; --bad: #f28b82; --good: #81c995; } }
+body { background: var(--page); color: var(--text); font: 15px/1.45 system-ui, sans-serif; margin: 0 auto; max-width: 1400px; padding: 16px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+.shot { background: var(--card); border: 1px solid var(--line); border-radius: 8px; margin: 16px 0; padding: 12px 16px; }
+.shot h2 { font-size: 16px; margin: 0; }
+.shot p { color: var(--muted); margin: 4px 0 8px; }
+.status { font-weight: normal; margin-left: 8px; }
+.failing .status { color: var(--bad); }
+.passing .status, .accepted .status { color: var(--good); }
+.images { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+figure { margin: 0; }
+figure img { border: 1px solid var(--line); display: block; height: auto; width: 100%; }
+figcaption { color: var(--muted); font-size: 13px; margin-top: 2px; }
+.none { align-items: center; aspect-ratio: 3 / 2; border: 1px dashed var(--line); color: var(--muted); display: flex; justify-content: center; }
+button { font: inherit; margin-top: 10px; padding: 4px 12px; }
+body.only-failing .passing { display: none; }
+</style>
+<h1>Golden images</h1>
+<p>3 shots, 0 not passing (RMSE threshold 2.00%). \n         <label><input type=checkbox id=failing> only those not passing</label></p>
+<p id=offline hidden>Opened \n         as a file: <code>pen test --review</code> serves this page with buttons that accept a shot as its golden \n         image, or <code>pen test --update --only SCENARIO</code> accepts a scenario's.</p>
+<section class="shot passing" data-id="action_slash/action_slash.png">
+<h2>action_slash/action_slash.png <span class=status>passed</span></h2>
+\n             <p>hero sprints forward, jumps onto dais, and executes a glowing energy slash with ribbon trail<br>RMSE 0.4948%, largest 23.5%, 0.433% of pixels visibly changed</p>
+<div class=images>
+<figure><a href="action_slash/action_slash.golden.png"><img src="action_slash/action_slash.golden.png" alt="golden"></a><figcaption>golden</figcaption></figure>
+\n             <figure><a href="action_slash/action_slash.png"><img src="action_slash/action_slash.png" alt="shot"></a>\n             <figcaption>this run</figcaption></figure>
+<figure><a href="action_slash/action_slash.diff.png"><img src="action_slash/action_slash.diff.png" alt="difference"></a><figcaption>difference, 4x</figcaption></figure>
+\n             </div>
+<button class=accept>Accept as the golden image</button>
+</section>
+<section class="shot passing" data-id="paused/paused.png">
+<h2>paused/paused.png <span class=status>passed</span></h2>
+\n             <p>pause modal overlay toggled via Escape<br>RMSE 0.3658%, largest 13.3%, 0.413% of pixels visibly changed</p>
+<div class=images>
+<figure><a href="paused/paused.golden.png"><img src="paused/paused.golden.png" alt="golden"></a><figcaption>golden</figcaption></figure>
+\n             <figure><a href="paused/paused.png"><img src="paused/paused.png" alt="shot"></a>\n             <figcaption>this run</figcaption></figure>
+<figure><a href="paused/paused.diff.png"><img src="paused/paused.diff.png" alt="difference"></a><figcaption>difference, 4x</figcaption></figure>
+\n             </div>
+<button class=accept>Accept as the golden image</button>
+</section>
+<section class="shot passing" data-id="start/start.png">
+<h2>start/start.png <span class=status>passed</span></h2>
+\n             <p>citadel arena opening view with skinned hero, glowing blade, 4 sentinels, shards, water moat, grass and HUD<br>RMSE 0.4545%, largest 38.4%, 0.510% of pixels visibly changed</p>
+<div class=images>
+<figure><a href="start/start.golden.png"><img src="start/start.golden.png" alt="golden"></a><figcaption>golden</figcaption></figure>
+\n             <figure><a href="start/start.png"><img src="start/start.png" alt="shot"></a>\n             <figcaption>this run</figcaption></figure>
+<figure><a href="start/start.diff.png"><img src="start/start.diff.png" alt="difference"></a><figcaption>difference, 4x</figcaption></figure>
+\n             </div>
+<button class=accept>Accept as the golden image</button>
+</section>
+<script>
+const offline = location.protocol === "file:";
+document.getElementById("offline").hidden = !offline;
+const failing = document.getElementById("failing");
+const filter = () => document.body.classList.toggle("only-failing", failing.checked);
+failing.addEventListener("change", filter);
+filter();
+for (const section of document.querySelectorAll(".shot")) {
+  const button = section.querySelector(".accept");
+  if (offline) { button.remove(); continue; }
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    const response = await fetch("accept", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ shots: [section.dataset.id] }) });
+    const status = section.querySelector(".status");
+    if (response.ok) {
+      status.textContent = "accepted";
+      // Still shown under the filter, until the page is loaded again.
+      section.classList.replace("failing", "accepted");
+      for (const image of section.querySelectorAll("img")) image.src = image.src.split("?")[0] + "?" + Date.now();
+    } else {
+      status.textContent = "not accepted: " + await response.text();
+      button.disabled = false;
+    }
+  });
+}
+</script>

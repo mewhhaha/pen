@@ -34,6 +34,7 @@ for (
   const [name, project, needsInk] of [
     ["bounce", resolve(root, "examples/bounce"), false],
     ["showcase", resolve(root, "examples/showcase"), true],
+    ["citadel", resolve(root, "examples/citadel"), true],
     ["new", scaffold, false],
   ] as const
 ) {
@@ -247,6 +248,57 @@ for (
   console.log(
     "showcase: ABI8 create/frame/scene/load_scene/restore passed (scene lanes=" +
       savedScene.length + ")",
+  );
+  guest.dispose();
+}
+
+// Verify citadel ABI 8 create/frame/snapshot/restore.
+{
+  const guest = await instantiateGuest(
+    await Deno.readFile(paths["citadel-main"]),
+  );
+  if (guest.abi.version !== 8) throw Error("wrong ABI " + guest.abi.version);
+  let stage = 0;
+  let savedState: number[] = [];
+  const host = guest.capability({
+    parameter: "Array F32",
+    result: "Array F32",
+    call: (v: Float32Array) => {
+      const arr = [...v];
+      stage++;
+      if (stage === 1) {
+        if (arr[0] !== 4670544 || arr[1] !== 2) {
+          throw Error("citadel hello bad framing: " + JSON.stringify(arr));
+        }
+        return new Float32Array([1, 1]); // Create
+      }
+      if (stage === 2) {
+        if (arr[0] !== 1) throw Error("citadel create bad op");
+        savedState = arr.slice(1);
+        return new Float32Array([1, 2, 0.016, 1280, 720, 0, 0]); // Frame
+      }
+      if (stage === 3) {
+        if (arr[0] !== 2 || arr.length < 100) throw Error("citadel frame too short");
+        return new Float32Array([1, 3]); // Snapshot
+      }
+      if (stage === 4) {
+        if (arr[0] !== 3 || arr.length !== savedState.length + 1) {
+          throw Error("citadel snapshot mismatch");
+        }
+        return new Float32Array([1, 4, ...savedState]); // Restore
+      }
+      if (stage === 5) {
+        if (arr[0] !== 4) throw Error("citadel restore failed");
+        return new Float32Array([1, 0]); // Stop
+      }
+      throw Error("citadel extra step");
+    },
+  });
+  guest.call("main", host);
+  if (stage !== 5) throw Error("citadel incomplete session: " + stage);
+  console.log(
+    "citadel: ABI8 create/frame/snapshot/restore passed (state lanes=" +
+      savedState.length + ")",
   );
   guest.dispose();
 }

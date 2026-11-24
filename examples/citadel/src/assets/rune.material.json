@@ -1,0 +1,13 @@
+{
+  "shader": "lit.wgsl",
+  "texture": "rune_albedo.png",
+  "normalTexture": "rune_normal.png",
+  "ormTexture": "rune_orm.png",
+  "color": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "lighting": "lit"
+}

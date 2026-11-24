@@ -1,0 +1,11 @@
+{
+  "shader": "ui.wgsl",
+  "color": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "lighting": "unlit",
+  "blend": true
+}

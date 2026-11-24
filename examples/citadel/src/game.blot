@@ -1,0 +1,1359 @@
+// Citadel Striker — Playable 3D Third-Person Action-Adventure Vertical Slice.
+//
+// Exercises the full Ink + Pen gameplay, animation, physics, AI, concurrency,
+// high-fidelity GPU rendering, and 3D spatial audio stack end-to-end:
+// - `ink/character` + `ink/scene` capsule sweep, wall slide, dais step-up & jump
+// - `ink/rig` spring-damped third-person chase camera + `ink/feel` trauma shake,
+//   hitstop impact freeze & damped weapon recoil
+// - `ink/animation` + `ink/animation/ik` 6-bone skinned hero rig (`push_skin_palette`)
+//   with `animation.socket` glowing blade attachment & GPU ribbon slash trail
+// - `ink/navigation/voxel` arena heightfield bake + `ink/ai/bt` Behavior Tree
+//   sentinel patrol/chase/attack + Blot 2 `entry kernel steer_crowd` separation
+// - Step 3 GPU outdoor Gerstner water moat (`ENV_WATER_EXT_TAG`) & swaying perimeter
+//   grass (`ENV_FOLIAGE_EXT_TAG`), GPU meshlet-culled sentinels, visual `.matgraph.json`
+//   arcane shards, GPU spark particle bursts, LTC arena torch lights, deferred floor
+//   rune decal, 3D spatial sound panners + reverb zone + adaptive combat DSP synth,
+//   live HUD & Pause menu (`ink/ui/tree`), and deterministic quicksave/restore.
+import * as array from "std/array"
+import * as kernel from "std/kernel"
+import { Vec2, Vec3 } from "std/vector"
+import * as animation from "ink/animation"
+import * as bt from "ink/ai/bt"
+import * as character from "ink/character"
+import * as color from "ink/color"
+import * as events from "ink/events"
+import * as feel from "ink/feel"
+import * as host from "ink/pen/host"
+import * as ik from "ink/animation/ik"
+import * as kernel_kits from "ink/kernel_kits"
+import * as kernel_transport from "ink/kernel_transport"
+import * as keys from "ink/input/keys"
+import * as math from "ink/math"
+import * as persist from "ink/persist"
+import * as preferences from "ink/preferences"
+import * as render from "ink/render"
+import * as rig from "ink/rig"
+import * as scene from "ink/scene"
+import * as services from "ink/services"
+import * as sound from "ink/sound"
+import * as transform from "ink/transform"
+import * as tree from "ink/ui/tree"
+import * as vocab from "ink/ui/vocabulary"
+import * as voxel from "ink/navigation/voxel"
+import * as program from "pen/program"
+import * as protocol from "pen/protocol"
+import { meshes, materials, sounds } from "./assets/catalog.json"
+
+const schema: U32 = 1
+
+const key_w_bit: U32 = 1
+const key_s_bit: U32 = 2
+const key_a_bit: U32 = 4
+const key_d_bit: U32 = 8
+const key_q_bit: U32 = 16
+const key_e_bit: U32 = 32
+const key_all_bits: U32 = 63
+
+const env_water_ext_tag: U32 = 65002
+const env_foliage_ext_tag: U32 = 65003
+
+const fov_y_rad: F32 = 0.92
+const cam_near: F32 = 0.1
+const cam_far: F32 = 140.0
+
+const hero_body = $character.Body {
+  low: math.vec3 0.0 0.35 0.0,
+  high: math.vec3 0.0 1.55 0.0,
+  radius: 0.35,
+}
+
+const solid_filter = $scene.Filter {
+  mask: 1,
+  skip: 0,
+  triggers: false,
+  walkers: false,
+  dynamics: true,
+}
+
+const follow_cfg = $rig.Follow {
+  offset: math.vec3 0.0 3.4 7.2,
+  turns: true,
+  dead_zone: 0.12,
+  lookahead: 0.18,
+  frequency: 9.0,
+  damping: 0.92,
+  turn_rate: 10.0,
+}
+
+const default_preferences = preferences.make
+  ($preferences.Quality {
+    msaa: 1,
+    fxaa: false,
+    scale: 1.0,
+    filtering: 8,
+    shadows: 2048,
+    occlusion: true,
+    sky: true,
+    fog: 0.35,
+    effects: true,
+    bloom: true,
+    reflections: 2,
+    volumetrics: 1,
+  })
+  ($preferences.Volumes { master: 0.8, effects: 0.85, music: 0.65 })
+  ($preferences.Controls { left_handed: false })
+
+// Behavior Tree shared across all citadel sentinels:
+//   0: Selector [1, 4, 7]
+//   1: Sequence [2, 3]             (in melee range -> cooldown attack)
+//   2: Condition(1: in_attack)
+//   3: Cooldown(1.25s, Action 1: lunge_strike)
+//   4: Sequence [5, 6]             (in sight range -> chase hero)
+//   5: Condition(2: sees_hero)
+//   6: Action(2: chase_hero)
+//   7: Action(3: patrol_orbit)
+const sentinel_bt = $bt.Tree {
+  root: 0,
+  nodes: #[
+    $bt.Selector { first: 0, count: 3 },
+    $bt.Sequence { first: 3, count: 2 },
+    $bt.Condition { id: 1 },
+    $bt.Cooldown { child: 8, duration: 1.25 },
+    $bt.Sequence { first: 5, count: 2 },
+    $bt.Condition { id: 2 },
+    $bt.Action { id: 2 },
+    $bt.Action { id: 3 },
+    $bt.Action { id: 1 },
+  ],
+  children: #[1, 4, 7, 2, 3, 5, 6],
+}
+
+type Sentinel is data = $Sentinel {
+  id: U32,
+  position: Vec3,
+  velocity: Vec3,
+  home: Vec3,
+  hp: U32,
+  alive: Bool,
+  hit_flash: F32,
+  patrol_phase: F32,
+  ai_mode: U32, // 0=patrol, 1=chase, 2=attack
+}
+
+type Shard is data = $Shard {
+  id: U32,
+  position: Vec3,
+  collected: Bool,
+}
+
+type FxBurst is data = $FxBurst {
+  position: Vec3,
+  age: F32,
+  duration: F32,
+  seed: U32,
+  gold: Bool,
+}
+
+type World is data = $World {
+  time: F32,
+  width: F32,
+  height: F32,
+  held_keys: U32,
+  paused: Bool,
+  victory: Bool,
+  defeat: Bool,
+  score: U32,
+  hero_pos: Vec3,
+  hero_walker: scene.Walker,
+  hero_heading: F32,
+  cam_yaw: F32,
+  follower: rig.Follower,
+  hero_hp: U32,
+  hero_invuln: F32,
+  stamina: F32,
+  dash_timer: F32,
+  stride_phase: F32,
+  step_accum: F32,
+  slash_timer: F32,
+  slash_cooldown: F32,
+  slash_hit_applied: Bool,
+  trauma: feel.Trauma,
+  hitstop: feel.Hitstop,
+  recoil: feel.Recoil,
+  sentinels: #[Sentinel],
+  shards: #[Shard],
+  trail: #[Vec3],
+  fx_bursts: #[FxBurst],
+  bt_mem: #[bt.Slot],
+  crowd_sep: #[Vec3],
+  walkable_cells: U32,
+  sfx_step: Bool,
+  sfx_swing: Bool,
+  sfx_hit: Bool,
+  sfx_hit_pos: Vec3,
+  sfx_pickup: Bool,
+  sfx_pickup_pos: Vec3,
+  save_req: Bool,
+  load_req: Bool,
+}
+
+// Builds the static physics collision geometry for the Citadel arena:
+// main stone island floor, elevated central dais, 4 corner pillars, and 4 perimeter walls.
+func build_arena_physics () : scene.Scene =>
+  let sources: #[scene.Source] = #[
+    scene.box 1 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 18.0 1.0 18.0),
+    scene.box 2 (math.vec3 0.0 0.2 0.0) (math.vec3 5.0 0.4 5.0),
+    scene.box 3 (math.vec3 (-4.8) 2.0 (-4.8)) (math.vec3 1.4 4.0 1.4),
+    scene.box 4 (math.vec3 4.8 2.0 (-4.8)) (math.vec3 1.4 4.0 1.4),
+    scene.box 5 (math.vec3 (-4.8) 2.0 4.8) (math.vec3 1.4 4.0 1.4),
+    scene.box 6 (math.vec3 4.8 2.0 4.8) (math.vec3 1.4 4.0 1.4),
+    // Low perimeter parapets keeping hero & bots safely on the stone island
+    scene.box 7 (math.vec3 0.0 0.6 (-8.8)) (math.vec3 18.0 1.6 0.6),
+    scene.box 8 (math.vec3 0.0 0.6 8.8) (math.vec3 18.0 1.6 0.6),
+    scene.box 9 (math.vec3 (-8.8) 0.6 0.0) (math.vec3 0.6 1.6 18.0),
+    scene.box 10 (math.vec3 8.8 0.6 0.0) (math.vec3 0.6 1.6 18.0),
+  ]
+  return scene.build_into (scene.empty ()) sources
+
+// Bakes a Recast-style voxel walkable heightfield over the arena floor + dais.
+func bake_arena_nav () : U32 =>
+  let cfg = $voxel.Config {
+    origin: math.vec3 (-9.0) 0.0 (-9.0),
+    cell_size: 1.5,
+    width: 12,
+    depth: 12,
+    max_slope_cos: 0.7,
+    max_step: 0.5,
+    agent_radius: 0.5,
+  }
+  let verts: #[Vec3] = #[
+    // Main floor quad
+    math.vec3 (-9.0) 0.0 (-9.0),
+    math.vec3 (-9.0) 0.0 9.0,
+    math.vec3 9.0 0.0 9.0,
+    math.vec3 9.0 0.0 (-9.0),
+    // Elevated central dais quad (y = 0.4)
+    math.vec3 (-2.5) 0.4 (-2.5),
+    math.vec3 (-2.5) 0.4 2.5,
+    math.vec3 2.5 0.4 2.5,
+    math.vec3 2.5 0.4 (-2.5),
+  ]
+  let idx: #[U32] = #[0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]
+  let count: U32 = 0
+  if let $Some field = voxel.bake cfg verts idx:
+    for i in 0 .. field.walkable.length:
+      if field.walkable[i]:
+        count := self + 1
+  return count
+
+func make_sentinel (id: U32) -> (px: F32) -> (pz: F32) -> (phase: F32) : Sentinel =>
+  let pos = math.vec3 px 0.75 pz
+  return $Sentinel {
+    id,
+    position: pos,
+    velocity: math.zero3,
+    home: pos,
+    hp: 2,
+    alive: true,
+    hit_flash: 0.0,
+    patrol_phase: phase,
+    ai_mode: 0,
+  }
+
+func create () : World =>
+  let start_pos = math.vec3 0.0 0.02 5.4
+  let walker = scene.default_walker
+  walker.step_height := 0.48
+  walker.grounded := true
+  let follower = rig.follower follow_cfg (start_pos + math.vec3 0.0 1.35 0.0) math.zero3 0.0
+  let sents: #[Sentinel] = #[
+    make_sentinel 1 (-3.4) (-3.4) 0.0,
+    make_sentinel 2 3.4 (-3.4) 1.57,
+    make_sentinel 3 (-5.6) 1.4 3.14,
+    make_sentinel 4 5.6 1.4 4.71,
+  ]
+  let shards: #[Shard] = #[
+    $Shard { id: 1, position: math.vec3 0.0 1.15 0.0, collected: false },
+    $Shard { id: 2, position: math.vec3 (-6.2) 0.85 (-5.8), collected: false },
+    $Shard { id: 3, position: math.vec3 6.2 0.85 (-5.8), collected: false },
+  ]
+  let bt_len = sentinel_bt.nodes.length * 4
+  let bt_mem = bt.memory bt_len
+  let sep = @array.fill 4 math.zero3
+  let walkable_cells = bake_arena_nav ()
+  return $World {
+    time: 0.0,
+    width: 1280.0,
+    height: 720.0,
+    held_keys: 0,
+    paused: false,
+    victory: false,
+    defeat: false,
+    score: 0,
+    hero_pos: start_pos,
+    hero_walker: walker,
+    hero_heading: 0.0,
+    cam_yaw: 0.0,
+    follower,
+    hero_hp: 5,
+    hero_invuln: 0.0,
+    stamina: 1.0,
+    dash_timer: 0.0,
+    stride_phase: 0.0,
+    step_accum: 0.0,
+    slash_timer: 0.0,
+    slash_cooldown: 0.0,
+    slash_hit_applied: false,
+    trauma: feel.trauma_new 1.8 18.0 (math.vec3 0.25 0.22 0.15) (math.vec3 0.04 0.04 0.06) 42,
+    hitstop: feel.hitstop_none (),
+    recoil: feel.recoil_new 140.0 16.0,
+    sentinels: sents,
+    shards,
+    trail: #[],
+    fx_bursts: #[],
+    bt_mem,
+    crowd_sep: sep,
+    walkable_cells,
+    sfx_step: false,
+    sfx_swing: false,
+    sfx_hit: false,
+    sfx_hit_pos: math.zero3,
+    sfx_pickup: false,
+    sfx_pickup_pos: math.zero3,
+    save_req: false,
+    load_req: false,
+  }
+
+func move_key_bit (code: U32) : U32 =>
+  if code == keys.w or code == keys.up:
+    return key_w_bit
+  if code == keys.s or code == keys.down:
+    return key_s_bit
+  if code == keys.a or code == keys.left:
+    return key_a_bit
+  if code == keys.d or code == keys.right:
+    return key_d_bit
+  if code == keys.q:
+    return key_q_bit
+  if code == keys.e:
+    return key_e_bit
+  return 0
+
+func trigger_slash (world: own World) : World =>
+  if world.paused or world.victory or world.defeat:
+    return world
+  if world.slash_cooldown <= 0.0:
+    world.slash_timer := 0.28
+    world.slash_cooldown := 0.36
+    world.slash_hit_applied := false
+    world.sfx_swing := true
+    world.recoil := feel.kick_recoil (math.vec3 0.0 0.0 2.6) self
+  return world
+
+func apply_event (world: own World) -> (ev: events.Event) : World =>
+  case ev of
+    $events.KeyDown code => do:
+      let bit = move_key_bit code
+      if bit != 0:
+        world.held_keys := world.held_keys | bit
+      if code == keys.escape and not world.victory and not world.defeat:
+        world.paused := not world.paused
+      if code == keys.r:
+        let w = world.width
+        let h = world.height
+        world := create ()
+        world.width := w
+        world.height := h
+      if code == keys.f6:
+        world.save_req := true
+      if code == keys.f9:
+        world.load_req := true
+      if not world.paused and not world.victory and not world.defeat:
+        if code == keys.space and world.hero_walker.grounded:
+          world.hero_walker.velocity.y := 7.8
+          world.hero_walker.grounded := false
+          world.sfx_step := true
+        if code == keys.shift and world.stamina >= 0.35 and world.dash_timer <= 0.0:
+          world.dash_timer := 0.18
+          world.stamina := max 0.0 (world.stamina - 0.38)
+          world.sfx_swing := true
+        if code == keys.j:
+          world := trigger_slash self
+    $events.KeyUp code => do:
+      let bit = move_key_bit code
+      if bit != 0:
+        world.held_keys := world.held_keys & (key_all_bits ^ bit)
+    $events.PointerDown { button } => do:
+      if button == 0:
+        world := trigger_slash self
+    $events.FocusLost => do:
+      world.held_keys := 0
+    _ => ()
+  return world
+
+// Computes the 6-bone hero local poses & world affines + GPU skinning matrix palette
+// using `ink/animation` and `ink/animation/ik` (two-bone sword arm reach during slashes).
+func hero_rest_poses () : #[transform.Pose3] => #[
+  $transform.Pose3 { position: math.vec3 0.0 0.90 0.0, rotation: math.identity_quat, scale: math.one3 },
+  $transform.Pose3 { position: math.vec3 0.0 0.45 0.0, rotation: math.identity_quat, scale: math.one3 },
+  $transform.Pose3 { position: math.vec3 0.0 0.50 0.0, rotation: math.identity_quat, scale: math.one3 },
+  $transform.Pose3 { position: math.vec3 (-0.18) (-0.45) 0.0, rotation: math.identity_quat, scale: math.one3 },
+  $transform.Pose3 { position: math.vec3 0.18 (-0.45) 0.0, rotation: math.identity_quat, scale: math.one3 },
+  $transform.Pose3 { position: math.vec3 0.46 0.10 0.0, rotation: math.identity_quat, scale: math.one3 },
+]
+
+const hero_parents: #[U32] = #[4294967295, 0, 1, 0, 0, 1]
+const hero_joints: #[U32] = #[0, 1, 2, 3, 4, 5]
+
+func eval_hero_world_bones (world: World) : #[transform.Affine3] =>
+  let horiz_speed = sqrt (world.hero_walker.velocity.x * world.hero_walker.velocity.x + world.hero_walker.velocity.z * world.hero_walker.velocity.z)
+  let run_blend = clamp 0.0 1.0 (horiz_speed / 5.5)
+  let bob = if world.hero_walker.grounded then abs (sin world.stride_phase) * 0.06 * run_blend + sin (world.time * 2.6) * 0.02 else 0.0
+  let leg_swing = if world.hero_walker.grounded then sin world.stride_phase * 0.65 * run_blend else 0.4
+  let dash_lean = if world.dash_timer > 0.0 then (-0.32) else (-0.10) * run_blend
+
+  // Slash arc driven cleanly by `slash_timer` + two-bone IK reach toward the target arc.
+  let slash_u = clamp 0.0 1.0 (1.0 - world.slash_timer / 0.28)
+  let arm_rot = math.axis_angle math.right (-0.35 + sin world.stride_phase * 0.35 * run_blend)
+  let torso_twist = 0.0
+  if world.slash_timer > 0.0:
+    let sweep = (-1.1) + slash_u * 2.4
+    torso_twist := sweep * 0.45
+    let shoulder = math.vec3 0.46 1.45 0.0
+    let elbow = math.vec3 0.46 1.25 (-0.28)
+    let hand = math.vec3 0.46 1.15 (-0.62)
+    let target = math.vec3 (0.46 - sin sweep * 0.65) (1.30 + cos sweep * 0.18) ((-0.68) * cos (sweep * 0.5))
+    let pole = math.vec3 0.9 1.2 0.2
+    if let $Some chain = ik.two_bone shoulder elbow hand target pole 0.1 0.85:
+      arm_rot := math.Quat.normalized (math.Quat.mul (math.Quat.yaw sweep) chain.root_delta)
+    else:
+      arm_rot := math.Quat.mul (math.Quat.yaw sweep) (math.axis_angle math.right (-1.0))
+
+  let local: #[transform.Pose3] = #[
+    $transform.Pose3 {
+      position: math.vec3 0.0 (0.90 + bob) 0.0,
+      rotation: math.axis_angle math.right dash_lean,
+      scale: math.one3,
+    },
+    $transform.Pose3 {
+      position: math.vec3 0.0 0.45 0.0,
+      rotation: math.Quat.yaw torso_twist,
+      scale: math.one3,
+    },
+    $transform.Pose3 {
+      position: math.vec3 0.0 0.50 0.0,
+      rotation: math.Quat.yaw (F32.neg torso_twist * 0.6),
+      scale: math.one3,
+    },
+    $transform.Pose3 {
+      position: math.vec3 (-0.18) (-0.45) 0.0,
+      rotation: math.axis_angle math.right leg_swing,
+      scale: math.one3,
+    },
+    $transform.Pose3 {
+      position: math.vec3 0.18 (-0.45) 0.0,
+      rotation: math.axis_angle math.right (F32.neg leg_swing),
+      scale: math.one3,
+    },
+    $transform.Pose3 {
+      position: math.vec3 0.46 0.10 0.0,
+      rotation: arm_rot,
+      scale: math.one3,
+    },
+  ]
+  return animation.world local hero_parents
+
+func compute_hero_skin_palette (world_bones: #[transform.Affine3]) : #[math.Mat4] =>
+  let rest = hero_rest_poses ()
+  if let $Some inv_bind = animation.bind_inverses rest hero_parents hero_joints:
+    if let $Some mats = animation.skin_matrices world_bones hero_joints inv_bind:
+      return @storage.copy mats
+  return @array.fill 6 math.Mat4.identity
+
+func hero_blade_world_affine (world: World) -> (world_bones: #[transform.Affine3]) : transform.Affine3 =>
+  let hero_aff = transform.affine3 ($transform.Pose3 {
+    position: world.hero_pos,
+    rotation: math.Quat.yaw world.hero_heading,
+    scale: math.one3,
+  })
+  let local_sock = $transform.Pose3 {
+    position: math.vec3 0.0 (-0.28) (-0.12),
+    rotation: math.axis_angle math.right (if world.slash_timer > 0.0 then (-0.35) else 0.25),
+    scale: math.one3,
+  }
+  let sock = Maybe.unwrap_or transform.identity3 (animation.socket world_bones 5 local_sock)
+  return transform.compose3 hero_aff sock
+
+func alive_sentinel_count (world: World) : U32 =>
+  let n: U32 = 0
+  for i in 0 .. world.sentinels.length:
+    if world.sentinels[i].alive:
+      n := self + 1
+  return n
+
+func collected_shard_count (world: World) : U32 =>
+  let n: U32 = 0
+  for i in 0 .. world.shards.length:
+    if world.shards[i].collected:
+      n := self + 1
+  return n
+
+// Steps one fixed/variable gameplay frame with real capsule physics, combat, AI BT, and feel.
+func step (world: own World) -> (phys: scene.Queries) -> (dt: F32) -> (width: F32) -> (height: F32) -> (incoming: &[events.Event]) : World =>
+  world.width := max 1.0 width
+  world.height := max 1.0 height
+  world.sfx_step := false
+  world.sfx_swing := false
+  world.sfx_hit := false
+  world.sfx_pickup := false
+  world.save_req := false
+  world.load_req := false
+  for ev in incoming:
+    world := apply_event self ev
+  if world.paused or world.victory or world.defeat:
+    return world
+
+  let raw_dt = clamp 0.0 0.05 dt
+  let (sim_dt, next_hs) = feel.step_hitstop raw_dt world.hitstop
+  world.hitstop := next_hs
+  world.trauma := feel.step_trauma raw_dt self
+  world.recoil := feel.step_recoil raw_dt self
+  world.time := world.time + sim_dt
+
+  // Orbit camera smoothly via Q / E.
+  if (world.held_keys & key_q_bit) != 0:
+    world.cam_yaw := world.cam_yaw + 1.8 * sim_dt
+  if (world.held_keys & key_e_bit) != 0:
+    world.cam_yaw := world.cam_yaw - 1.8 * sim_dt
+
+  // Camera-relative WASD hero wish direction.
+  let ix = 0.0
+  let iz = 0.0
+  if (world.held_keys & key_w_bit) != 0:
+    iz := iz - 1.0
+  if (world.held_keys & key_s_bit) != 0:
+    iz := iz + 1.0
+  if (world.held_keys & key_a_bit) != 0:
+    ix := ix - 1.0
+  if (world.held_keys & key_d_bit) != 0:
+    ix := ix + 1.0
+
+  let wish_local = math.vec3 ix 0.0 iz
+  let wish_world = math.Quat.rotate (math.Quat.yaw world.cam_yaw) wish_local
+  let wish_dir = Maybe.unwrap_or math.zero3 (math.normalize3 wish_world)
+  let moving = wish_dir.length_squared > 0.01
+
+  let speed = if world.dash_timer > 0.0 then 11.5 else 6.2
+  if world.dash_timer > 0.0:
+    world.dash_timer := max 0.0 (world.dash_timer - sim_dt)
+    if not moving:
+      wish_dir := math.Quat.rotate (math.Quat.yaw world.hero_heading) math.forward
+  else:
+    world.stamina := min 1.0 (world.stamina + 0.34 * sim_dt)
+
+  // Turn hero smoothly toward movement direction.
+  if moving:
+    let target_yaw = math.atan2 (F32.neg wish_dir.x) (F32.neg wish_dir.z)
+    let diff = math.atan2 (sin (target_yaw - world.hero_heading)) (cos (target_yaw - world.hero_heading))
+    world.hero_heading := world.hero_heading + diff * min 1.0 (12.0 * sim_dt)
+
+  // Integrate gravity & horizontal velocity through `ink/character.move` against static arena physics!
+  let wv = world.hero_walker
+  let horiz_scale = if moving or world.dash_timer > 0.0 then speed else 0.0
+  wv.velocity.x := wish_dir.x * horiz_scale
+  wv.velocity.z := wish_dir.z * horiz_scale
+  if not wv.grounded:
+    wv.velocity.y := max (-24.0) (wv.velocity.y - 21.0 * sim_dt)
+  else:
+    if wv.velocity.y < 0.0:
+      wv.velocity.y := 0.0
+
+  let hit_scratch: #[scene.Hit] = #[]
+  let moved = character.move_queries hit_scratch phys hero_body solid_filter world.hero_pos wv math.zero3 sim_dt
+  world.hero_pos := moved.position
+  world.hero_walker := moved.walker
+
+  // Footstep stride cadence while running on ground.
+  let hspd = sqrt (world.hero_walker.velocity.x * world.hero_walker.velocity.x + world.hero_walker.velocity.z * world.hero_walker.velocity.z)
+  if world.hero_walker.grounded and hspd > 0.6:
+    world.stride_phase := world.stride_phase + hspd * 1.45 * sim_dt
+    world.step_accum := world.step_accum + hspd * sim_dt
+    if world.step_accum >= 2.2:
+      world.step_accum := 0.0
+      world.sfx_step := true
+
+  // Update timers & slash combat hitbox (front cone 2.9m reach).
+  world.hero_invuln := max 0.0 (world.hero_invuln - sim_dt)
+  world.slash_cooldown := max 0.0 (world.slash_cooldown - sim_dt)
+  if world.slash_timer > 0.0:
+    world.slash_timer := max 0.0 (world.slash_timer - sim_dt)
+    if not world.slash_hit_applied and world.slash_timer <= 0.21:
+      world.slash_hit_applied := true
+      let hero_fwd = math.Quat.rotate (math.Quat.yaw world.hero_heading) math.forward
+      for i in 0 .. world.sentinels.length:
+        let s = world.sentinels[i]
+        if s.alive:
+          let to_s = s.position - world.hero_pos
+          let flat_to = math.vec3 to_s.x 0.0 to_s.z
+          let dist = flat_to.length
+          let facing = if dist > 0.001 then (flat_to * (1.0 / dist)).dot hero_fwd else 1.0
+          if dist <= 3.1 and facing > (-0.15):
+            if s.hp > 1:
+              s.hp := s.hp - 1
+              s.hit_flash := 0.18
+              let push_dir = Maybe.unwrap_or hero_fwd (math.normalize3 flat_to)
+              s.velocity := push_dir * 7.5
+              world.score := world.score + 50
+            else:
+              s.hp := 0
+              s.alive := false
+              world.score := world.score + 200
+            world.sentinels[i] := s
+            world.hitstop := feel.trigger_hitstop 0.055 0.05 self
+            world.trauma := feel.add_trauma 0.52 self
+            world.recoil := feel.kick_recoil (math.vec3 0.0 0.8 4.0) self
+            world.sfx_hit := true
+            world.sfx_hit_pos := s.position
+            @storage.push world.fx_bursts ($FxBurst {
+              position: s.position + math.vec3 0.0 0.35 0.0,
+              age: 0.0,
+              duration: 0.45,
+              seed: 100 + world.score + i,
+              gold: true,
+            })
+
+  // Record blade tip positions for GPU ribbon slash trail!
+  if world.slash_timer > 0.0:
+    let wb = eval_hero_world_bones world
+    let blade_aff = hero_blade_world_affine world wb
+    let tip = transform.point3 blade_aff (math.vec3 0.0 0.0 (-1.3))
+    @storage.push world.trail tip
+    if world.trail.length > 8:
+      for k in 1 .. world.trail.length:
+        world.trail[k - 1] := world.trail[k]
+      @storage.truncate world.trail 8
+  else:
+    if world.trail.length > 0:
+      @storage.truncate world.trail 0
+
+  // Tick Sentinel AI Behavior Trees + apply crowd separation (`steer_crowd` kernel or local).
+  let n_nodes = sentinel_bt.nodes.length
+  for i in 0 .. world.sentinels.length:
+    let s = world.sentinels[i]
+    if s.alive:
+      s.hit_flash := max 0.0 (s.hit_flash - sim_dt)
+      s.patrol_phase := s.patrol_phase + sim_dt * 1.15
+      let to_hero = math.vec3 (world.hero_pos.x - s.position.x) 0.0 (world.hero_pos.z - s.position.z)
+      let dist = to_hero.length
+      let mem_start = i * n_nodes
+      let sub_mem: #[bt.Slot] = #[]
+      for k in 0 .. n_nodes:
+        @storage.push sub_mem world.bt_mem[mem_start + k]
+      let chosen_mode = 0
+      let check_cond = func (cid: U32) : Bool =>
+        if cid == 1:
+          return dist <= 1.65
+        if cid == 2:
+          return dist <= 8.5
+        return false
+      let run_act = func (aid: U32) : bt.Status =>
+        if aid == 1:
+          chosen_mode := 2
+          return $bt.Success
+        if aid == 2:
+          chosen_mode := 1
+          return $bt.Running
+        chosen_mode := 0
+        return $bt.Running
+      let (_, next_sub) = bt.tick sentinel_bt sim_dt check_cond run_act sub_mem
+      for k in 0 .. n_nodes:
+        world.bt_mem[mem_start + k] := next_sub[k]
+      s.ai_mode := chosen_mode
+
+      // Compute desired velocity from BT action + crowd separation force.
+      let sep = if i < world.crowd_sep.length then world.crowd_sep[i] else math.zero3
+      let desired = math.zero3
+      if chosen_mode == 1:
+        let dir = Maybe.unwrap_or math.zero3 (math.normalize3 to_hero)
+        desired := dir * 3.1 + math.vec3 sep.x 0.0 sep.z * 0.45
+      else:
+        if chosen_mode == 2:
+          // Lunge attack damages player if not invulnerable!
+          if world.hero_invuln <= 0.0 and world.hero_hp > 0:
+            world.hero_hp := world.hero_hp - 1
+            world.hero_invuln := 0.9
+            world.trauma := feel.add_trauma 0.65 self
+            world.sfx_hit := true
+            world.sfx_hit_pos := world.hero_pos
+            if world.hero_hp == 0:
+              world.defeat := true
+        else:
+          let patrol_goal = s.home + math.vec3 (cos s.patrol_phase * 2.1) 0.0 (sin s.patrol_phase * 2.1)
+          let to_patrol = math.vec3 (patrol_goal.x - s.position.x) 0.0 (patrol_goal.z - s.position.z)
+          desired := Maybe.unwrap_or math.zero3 (math.normalize3 to_patrol) * 2.0 + math.vec3 sep.x 0.0 sep.z * 0.35
+
+      // Smoothly blend knockback velocity into desired AI velocity and clamp inside arena.
+      let blend = min 1.0 (6.0 * sim_dt)
+      s.velocity := math.vec3 (s.velocity.x + (desired.x - s.velocity.x) * blend) 0.0 (s.velocity.z + (desired.z - s.velocity.z) * blend)
+      let nx = clamp (-7.6) 7.6 (s.position.x + s.velocity.x * sim_dt)
+      let nz = clamp (-7.6) 7.6 (s.position.z + s.velocity.z * sim_dt)
+      let ny = if abs nx < 2.6 and abs nz < 2.6 then 1.15 else 0.75
+      s.position := math.vec3 nx ny nz
+      world.sentinels[i] := s
+
+  // Collect arcane shards when hero approaches within 1.35m!
+  for i in 0 .. world.shards.length:
+    let sh = world.shards[i]
+    if not sh.collected:
+      let d = (math.vec3 (world.hero_pos.x - sh.position.x) 0.0 (world.hero_pos.z - sh.position.z)).length
+      if d <= 1.35:
+        sh.collected := true
+        world.shards[i] := sh
+        world.score := world.score + 150
+        world.sfx_pickup := true
+        world.sfx_pickup_pos := sh.position
+        @storage.push world.fx_bursts ($FxBurst {
+          position: sh.position,
+          age: 0.0,
+          duration: 0.5,
+          seed: 500 + i,
+          gold: false,
+        })
+
+  // Advance & retire transient GPU particle bursts.
+  let live_fx: #[FxBurst] = #[]
+  for i in 0 .. world.fx_bursts.length:
+    let b = world.fx_bursts[i]
+    b.age := b.age + sim_dt
+    if b.age < b.duration:
+      @storage.push live_fx b
+  world.fx_bursts := live_fx
+
+  // Check victory: all sentinels defeated AND all 3 arcane shards collected!
+  if alive_sentinel_count world == 0 and collected_shard_count world == world.shards.length:
+    world.victory := true
+
+  // Step third-person spring-damped chase camera (`ink/rig`).
+  let target_pt = world.hero_pos + math.vec3 0.0 1.45 0.0
+  let (next_fol, _) = rig.follow follow_cfg world.follower target_pt world.hero_walker.velocity world.cam_yaw raw_dt
+  world.follower := next_fol
+  return world
+
+// --- HUD Sprite & Bitmap Text Helpers ---
+
+func push_panel (x: F32) -> (y: F32) -> (w: F32) -> (h: F32) -> (col: math.Vec4) -> (radius: F32) -> (border: F32) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  @storage.push frame.sprites ($render.Sprite {
+    x, y, width: w, height: h,
+    u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0,
+    color: col,
+    material: materials.ui_panel,
+    parameters: math.vec4 0.0 radius border 0.0,
+  })
+  return frame
+
+func push_glyph (code: U32) -> (x: F32) -> (y: F32) -> (scale: F32) -> (col: math.Vec4) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  if code < 32 or code >= 96:
+    return frame
+  let idx = code - 32
+  let gx = idx % 8
+  let gy = idx / 8
+  let cell = 1.0 / 8.0
+  let u0 = U32.to_f32 gx * cell
+  let v0 = U32.to_f32 gy * cell
+  @storage.push frame.sprites ($render.Sprite {
+    x, y, width: 7.0 * scale, height: 8.0 * scale,
+    u0, v0, u1: u0 + cell, v1: v0 + cell,
+    color: col,
+    material: materials.ui_font,
+    parameters: math.vec4 1.0 0.0 0.0 0.0,
+  })
+  return frame
+
+func push_text (codes: &[U32]) -> (x: F32) -> (y: F32) -> (scale: F32) -> (col: math.Vec4) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  let cx = x
+  for i in 0 .. codes.length:
+    let c = codes[i]
+    if c != 32:
+      frame := push_glyph c cx y scale col self
+    cx := self + 6.5 * scale
+  return frame
+
+func push_u32_4 (val: U32) -> (x: F32) -> (y: F32) -> (scale: F32) -> (col: math.Vec4) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  let d3 = (val / 1000) % 10
+  let d2 = (val / 100) % 10
+  let d1 = (val / 10) % 10
+  let d0 = val % 10
+  let s = 6.5 * scale
+  frame := push_glyph (48 + d3) x y scale col self
+  frame := push_glyph (48 + d2) (x + s) y scale col self
+  frame := push_glyph (48 + d1) (x + s * 2.0) y scale col self
+  frame := push_glyph (48 + d0) (x + s * 3.0) y scale col self
+  return frame
+
+func emit_hud (world: World) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  let bg = math.vec4 0.06 0.08 0.14 0.84
+  let white = math.vec4 0.95 0.97 1.0 1.0
+  let dim = math.vec4 0.68 0.74 0.85 1.0
+
+  // Top-left Vitality & Stamina bars
+  frame := push_panel 10.0 10.0 168.0 48.0 bg 6.0 0.6 self
+  let hp_lbl = #[72, 80] // HP
+  frame := push_text (&hp_lbl[0..2]) 18.0 17.0 1.2 white self
+  let hp_frac = U32.to_f32 world.hero_hp / 5.0
+  frame := push_panel 42.0 16.0 124.0 12.0 (math.vec4 0.22 0.08 0.10 0.9) 3.0 0.2 self
+  if hp_frac > 0.01:
+    frame := push_panel 42.0 16.0 (124.0 * hp_frac) 12.0 (math.vec4 0.92 0.22 0.24 0.95) 3.0 0.5 self
+
+  let st_lbl = #[83, 84] // ST
+  frame := push_text (&st_lbl[0..2]) 18.0 37.0 1.2 dim self
+  frame := push_panel 42.0 36.0 124.0 10.0 (math.vec4 0.08 0.16 0.24 0.9) 3.0 0.2 self
+  if world.stamina > 0.01:
+    frame := push_panel 42.0 36.0 (124.0 * clamp 0.0 1.0 world.stamina) 10.0 (math.vec4 0.20 0.82 0.96 0.95) 3.0 0.4 self
+
+  // Top-right Score, Sentinels remaining & Shards collected
+  let rx = max 240.0 (world.width - 210.0)
+  frame := push_panel rx 10.0 200.0 48.0 bg 6.0 0.6 self
+  let sc_lbl = #[83, 67, 79, 82, 69, 58] // SCORE:
+  frame := push_text (&sc_lbl[0..6]) (rx + 10.0) 16.0 1.15 dim self
+  frame := push_u32_4 world.score (rx + 62.0) 16.0 1.2 white self
+  let bots = alive_sentinel_count world
+  let got = collected_shard_count world
+  let st2 = #[66, 79, 84, 83, 58, 48 + bots, 32, 32, 83, 72, 65, 82, 68, 58, 48 + got, 47, 51]
+  // "BOTS:4  SHARD:0/3"
+  frame := push_text (&st2[0..17]) (rx + 10.0) 36.0 1.1 (math.vec4 0.55 0.92 1.0 1.0) self
+
+  // Bottom control bar
+  let by = max 270.0 (world.height - 30.0)
+  let bw = max 440.0 (world.width - 20.0)
+  frame := push_panel 10.0 by bw 22.0 bg 5.0 0.4 self
+  let keys_lbl = #[87, 65, 83, 68, 32, 83, 80, 65, 67, 69, 58, 74, 85, 77, 80, 32, 83, 72, 73, 70, 84, 58, 68, 65, 83, 72, 32, 74, 58, 83, 76, 65, 83, 72, 32, 69, 83, 67, 58, 80, 65, 85, 83, 69]
+  frame := push_text (&keys_lbl[0..44]) 18.0 (by + 6.0) 1.05 dim self
+
+  // Centered modal banner on Pause / Victory / Defeat
+  if world.paused or world.victory or world.defeat:
+    let mx = world.width * 0.5 - 120.0
+    let my = world.height * 0.5 - 42.0
+    let accent = if world.victory then math.vec4 0.14 0.64 0.36 0.94 else if world.defeat then math.vec4 0.72 0.18 0.18 0.94 else math.vec4 0.14 0.24 0.44 0.92
+    frame := push_panel mx my 240.0 84.0 accent 8.0 0.9 self
+    if world.victory:
+      let msg = #[86, 73, 67, 84, 79, 82, 89, 33] // VICTORY!
+      frame := push_text (&msg[0..8]) (mx + 56.0) (my + 20.0) 2.2 white self
+    else:
+      if world.defeat:
+        let msg = #[68, 69, 70, 69, 65, 84] // DEFEAT
+        frame := push_text (&msg[0..6]) (mx + 74.0) (my + 20.0) 2.2 white self
+      else:
+        let msg = #[80, 65, 85, 83, 69, 68] // PAUSED
+        frame := push_text (&msg[0..6]) (mx + 74.0) (my + 20.0) 2.2 white self
+    let sub = #[82, 58, 82, 69, 83, 84, 65, 82, 84, 32, 32, 69, 83, 67, 58, 82, 69, 83, 85, 77, 69]
+    frame := push_text (&sub[0..21]) (mx + 34.0) (my + 56.0) 1.15 white self
+  return frame
+
+func emit_ui_tree (world: World) -> (ui_labels: own #[U32]) -> (ui_nodes: own #[tree.StoredNode]) : (#[U32], #[tree.StoredNode]) =>
+  @storage.truncate ui_labels 0
+  @storage.truncate ui_nodes 0
+  let no_txt: #[U32] = #[]
+  let hud_name = #[72, 85, 68] // HUD
+  let hud = $tree.Node {
+    id: 10, parent: 0, role: vocab.role_status,
+    name: &hud_name[0..3], description: &no_txt[0..0], value_text: &no_txt[0..0],
+    x: 10.0, y: 10.0, width: 168.0, height: 48.0,
+    focusable: false, focused: false, disabled: false, hidden: false, modal: false,
+    checked: vocab.state_none, expanded: vocab.state_none, selected: vocab.state_none, live: vocab.live_polite,
+    value: U32.to_f32 world.hero_hp, minimum: 0.0, maximum: 5.0, step: 1.0, actions: 0,
+  }
+  let (l1, n1) = tree.declare_owned hud ui_labels ui_nodes
+  ui_labels := l1
+  ui_nodes := n1
+  if world.paused or world.victory or world.defeat:
+    let dlg_name = #[77, 69, 78, 85] // MENU
+    let dlg = $tree.Node {
+      id: 20, parent: 0, role: vocab.role_dialog,
+      name: &dlg_name[0..4], description: &no_txt[0..0], value_text: &no_txt[0..0],
+      x: world.width * 0.5 - 120.0, y: world.height * 0.5 - 42.0, width: 240.0, height: 84.0,
+      focusable: true, focused: true, disabled: false, hidden: false, modal: true,
+      checked: vocab.state_none, expanded: vocab.state_none, selected: vocab.state_none, live: vocab.live_assertive,
+      value: 0.0, minimum: 0.0, maximum: 0.0, step: 0.0, actions: 1 << vocab.action_activate,
+    }
+    let (l2, n2) = tree.declare_owned dlg ui_labels ui_nodes
+    ui_labels := l2
+    ui_nodes := n2
+  return (ui_labels, ui_nodes)
+
+func box_mat (px: F32) -> (py: F32) -> (pz: F32) -> (sx: F32) -> (sy: F32) -> (sz: F32) : math.Mat4 =>
+  return transform.matrix ($transform.Pose3 {
+    position: math.vec3 px py pz,
+    rotation: math.identity_quat,
+    scale: math.vec3 sx sy sz,
+  })
+
+func push_draw (mesh: U32) -> (material: U32) -> (matrix: math.Mat4) -> (frame: own render.FrameAccess) : render.FrameAccess =>
+  @storage.push frame.draws ($render.Draw {
+    mesh,
+    material,
+    matrix,
+    parameters: $Nothing,
+    extra: render.no_span,
+  })
+  return frame
+
+func populate_frame (world: World) -> (frame: own render.FrameAccess) -> (audio: own sound.Access) : (render.FrameAccess, sound.Access) =>
+  let aspect = max 0.1 (world.width / max 1.0 world.height)
+  let shake = feel.sample_shake world.trauma
+  let cam_pos = world.follower.eye.value + shake.offset + world.recoil.value * 0.08
+  let shake_rot = math.Quat.normalized (math.Quat.mul (math.Quat.yaw shake.angles.y) (math.axis_angle math.right shake.angles.x))
+  let cam_rot = math.Quat.normalized (math.Quat.mul world.follower.rotation shake_rot)
+  let (half_s, half_c) = sin_cos (fov_y_rad * 0.5)
+  let focal = half_c / half_s
+
+  frame.settings[0].view := math.Mat4.view cam_pos cam_rot
+  frame.settings[0].projection := math.Mat4.perspective focal aspect cam_near cam_far
+  frame.settings[0].taa := true
+  frame.settings[0].ssgi := true
+  frame.settings[0].lighting := $render.Lighting {
+    clear: math.vec4 0.12 0.22 0.38 1.0,
+    ambient: math.vec3 0.24 0.28 0.36,
+    direction: (math.vec3 (-0.48) (-0.72) (-0.50)).normalized,
+    color: math.vec3 2.3 2.05 1.75,
+  }
+  frame.settings[0].clouds := $render.Clouds {
+    cover: 0.42,
+    drift: math.vec2 (world.time * 0.18) (world.time * 0.09),
+  }
+  frame.settings[0].post_look := $render.PostLook {
+    tonemap: color.tonemap_agx_mode,
+    sharpness: 0.22,
+    grain: 0.0,
+    flare: 0.12,
+    outline_strength: 0.0,
+  }
+  frame.settings[0].features := $render.Features {
+    oit: false,
+    physical_sky: true,
+    upscale: false,
+    ray_tracing: 1,
+    ddgi: false,
+  }
+  let exp = render.auto_exposure
+  exp.compensation := (-0.65)
+  frame.settings[0].exposure := exp
+
+  // 1. Arena architecture: stone island floor, central dais, 4 pillars, 4 low parapets.
+  frame := push_draw meshes.box materials.stone (box_mat 0.0 (-0.5) 0.0 9.0 0.5 9.0) self
+  frame := push_draw meshes.box materials.pillar (box_mat 0.0 0.2 0.0 2.5 0.2 2.5) self
+  frame := push_draw meshes.box materials.pillar (box_mat (-4.8) 2.0 (-4.8) 0.7 2.0 0.7) self
+  frame := push_draw meshes.box materials.pillar (box_mat 4.8 2.0 (-4.8) 0.7 2.0 0.7) self
+  frame := push_draw meshes.box materials.pillar (box_mat (-4.8) 2.0 4.8 0.7 2.0 0.7) self
+  frame := push_draw meshes.box materials.pillar (box_mat 4.8 2.0 4.8 0.7 2.0 0.7) self
+  frame := push_draw meshes.box materials.pillar (box_mat 0.0 0.35 (-8.8) 9.0 0.35 0.28) self
+  frame := push_draw meshes.box materials.pillar (box_mat 0.0 0.35 8.8 9.0 0.35 0.28) self
+  frame := push_draw meshes.box materials.pillar (box_mat (-8.8) 0.35 0.0 0.28 0.35 9.0) self
+  frame := push_draw meshes.box materials.pillar (box_mat 8.8 0.35 0.0 0.28 0.35 9.0) self
+
+  // 2. Skinned 6-bone Hero draw + live `render.push_skin_palette` + socketed energy blade!
+  let hero_draw_idx = frame.draws.length
+  let hero_pose = $transform.Pose3 {
+    position: world.hero_pos,
+    rotation: math.Quat.yaw world.hero_heading,
+    scale: math.one3,
+  }
+  frame := push_draw meshes.hero materials.hero (transform.matrix hero_pose) self
+  let world_bones = eval_hero_world_bones world
+  let skin_mats = compute_hero_skin_palette world_bones
+  frame := render.push_skin_palette 0 hero_draw_idx skin_mats self
+
+  let blade_aff = hero_blade_world_affine world world_bones
+  frame := push_draw meshes.blade materials.blade (animation.affine_to_mat4 blade_aff) self
+
+  // 3. GPU meshlet-culled Sentinels (dense > 400 tri spheres) with hit-flash material swap.
+  for i in 0 .. world.sentinels.length:
+    let s = world.sentinels[i]
+    if s.alive:
+      let bob = sin (world.time * 3.5 + U32.to_f32 i * 1.4) * 0.14
+      let spose = $transform.Pose3 {
+        position: s.position + math.vec3 0.0 bob 0.0,
+        rotation: math.Quat.yaw (world.time * 1.2 + U32.to_f32 i),
+        scale: math.vec3 0.65 0.65 0.65,
+      }
+      let smat = if s.hit_flash > 0.0 then materials.sentinel_hit else materials.sentinel
+      frame := push_draw meshes.sentinel smat (transform.matrix spose) self
+
+  // 4. Visual `.matgraph.json` Arcane Shards (spinning + hovering).
+  for i in 0 .. world.shards.length:
+    let sh = world.shards[i]
+    if not sh.collected:
+      let bob = sin (world.time * 2.8 + U32.to_f32 i * 2.1) * 0.2
+      let sh_pose = $transform.Pose3 {
+        position: sh.position + math.vec3 0.0 bob 0.0,
+        rotation: math.Quat.mul (math.Quat.yaw (world.time * 1.6)) (math.axis_angle math.right 0.45),
+        scale: math.vec3 0.36 0.62 0.36,
+      }
+      frame := push_draw meshes.sentinel materials.portal (transform.matrix sh_pose) self
+
+  // 5. GPU Ribbon Trail behind swinging energy blade!
+  if world.trail.length >= 2:
+    for i in 0 .. world.trail.length:
+      let frac = U32.to_f32 (i + 1) / U32.to_f32 world.trail.length
+      @storage.push frame.ribbons ($render.RibbonPoint {
+        ribbon: 1,
+        material: materials.flare,
+        additive: true,
+        position: world.trail[i],
+        width: 0.28 * frac,
+        color: math.vec4 0.35 0.95 1.0 (0.85 * frac),
+        soft_depth: 0.25,
+      })
+
+  // 6. GPU Spark Particle Bursts on combat impacts & shard pickups!
+  for i in 0 .. world.fx_bursts.length:
+    let b = world.fx_bursts[i]
+    let c0 = if b.gold then math.vec4 1.0 0.82 0.25 1.0 else math.vec4 0.3 0.95 1.0 1.0
+    let c1 = if b.gold then math.vec4 1.0 0.25 0.05 0.0 else math.vec4 0.2 0.45 1.0 0.0
+    @storage.push frame.emitters ($render.Emitter {
+      material: materials.flare,
+      matrix: box_mat b.position.x b.position.y b.position.z 1.0 1.0 1.0,
+      seed: b.seed,
+      time: b.age,
+      duration: 0.12,
+      rate: 160.0,
+      lifetime: 0.35,
+      radius: 0.2,
+      velocity: math.vec3 0.0 3.2 0.0,
+      spread: 4.5,
+      gravity: math.vec3 0.0 (-9.8) 0.0,
+      drag: 0.4,
+      size_start: 0.16,
+      size_end: 0.02,
+      color_start: c0,
+      color_end: c1,
+      additive: true,
+      soft_depth: 0.2,
+      lit: 0.0,
+      flipbook_cols: 1,
+      flipbook_rows: 1,
+      flipbook_fps: 0.0,
+    })
+
+  // 7. LTC Arena Lighting + Deferred Floor Rune PBR Decal.
+  @storage.push frame.area_lights ($render.AreaLight {
+    kind: render.area_light_disk,
+    position: math.vec3 0.0 5.5 0.0,
+    right: math.right,
+    up: math.forward,
+    color: math.vec3 0.75 0.92 1.0,
+    intensity: 8.5,
+    width: 2.2,
+    height: 2.2,
+    range: 20.0,
+    cookie_material: 0,
+    two_sided: false,
+  })
+  @storage.push frame.pbr_decals ($render.PbrDecal {
+    material: materials.rune,
+    matrix: box_mat 0.0 0.42 0.0 2.1 0.35 2.1,
+    albedo: math.vec4 1.0 1.0 1.0 1.0,
+    normal_strength: 0.85,
+    roughness: 0.22,
+    metallic: 0.75,
+    emissive_strength: 1.8,
+    fade: 1.0,
+  })
+
+  // 8. Outdoor GPU Gerstner Water Moat & Swaying Perimeter Grass (`ENV_*_EXT_TAG`).
+  let water_vals: #[F32] = #[
+    (-0.55), (-3.0), 0.02, 32.0, world.time,
+    0.38, 0.12, 0.08,
+    0.03, 0.16, 0.32,
+    0.66,
+    0.42, 0.38, 0.30,
+    0.65,
+    36.0,
+  ]
+  frame := render.push_extension env_water_ext_tag (&water_vals[0..water_vals.length]) self
+  let grass_vals: #[F32] = #[
+    world.time,
+    0.88, 0.47,
+    0.42, 2.0, 0.7,
+    0.08, 0.9,
+    0.07, 0.32, 0.08,
+    0.25, 0.70, 0.18,
+    0.42, 0.88, 0.22, 2.0,
+  ]
+  for g in 0 .. 28:
+    let ga = U32.to_f32 g * 0.22439947
+    let rad = 7.4 + U32.to_f32 (g % 3) * 0.32
+    @storage.push grass_vals (cos ga * rad)
+    @storage.push grass_vals 0.0
+    @storage.push grass_vals (sin ga * rad)
+    @storage.push grass_vals (0.85 + U32.to_f32 (g % 4) * 0.16)
+    @storage.push grass_vals ga
+    @storage.push grass_vals (U32.to_f32 g * 0.6)
+    @storage.push grass_vals 0.1
+    @storage.push grass_vals (0.85 + U32.to_f32 (g % 5) * 0.05)
+  frame := render.push_extension env_foliage_ext_tag (&grass_vals[0..grass_vals.length]) self
+
+  // 9. Live HUD & Modal overlay.
+  frame := emit_hud world self
+
+  // 10. 3D Spatial Audio: listener, citadel reverb zone, adaptive DSP drone & panned combat SFX.
+  let fwd = math.Quat.forward cam_rot
+  let up_v = math.Quat.up cam_rot
+  audio := sound.set_listener self (sound.listener cam_pos fwd up_v)
+  let zone = sound.reverb_zone 1 (math.vec3 0.0 2.0 0.0) (math.vec3 10.0 6.0 10.0)
+  zone.decay := 2.6
+  zone.damping := 0.32
+  zone.wet := 0.3
+  audio := sound.add_reverb_zone self zone
+  let in_combat = alive_sentinel_count world > 0 and not world.paused
+  let drone = sound.synth_voice 1 sound.synth_triangle sound.ambience (if in_combat then 110.0 else 82.41)
+  drone.gain := if world.paused then 0.015 else 0.045
+  drone.cutoff := if in_combat then 850.0 else 480.0
+  drone.reverb := 0.4
+  audio := sound.play_synth self drone
+  if world.sfx_step:
+    audio := sound.at self sounds.step 0.35 1.0 world.hero_pos
+  if world.sfx_swing:
+    audio := sound.at self sounds.swing 0.55 1.05 world.hero_pos
+  if world.sfx_hit:
+    let sidx = audio.sounds.length
+    audio := sound.at self sounds.hit 0.85 1.0 world.sfx_hit_pos
+    let p = sound.panner_for_sound sidx world.sfx_hit_pos
+    p.zone := 1
+    audio := sound.pan self p
+  if world.sfx_pickup:
+    audio := sound.at self sounds.pickup 0.75 1.0 world.sfx_pickup_pos
+  return (frame, audio)
+
+// --- Deterministic Quicksave / Restore ---
+
+func save (world: World) : #[F32] =>
+  let out: #[F32] = #[
+    world.time,
+    if world.paused then 1.0 else 0.0,
+    if world.victory then 1.0 else 0.0,
+    if world.defeat then 1.0 else 0.0,
+    U32.to_f32 world.score,
+    world.hero_pos.x,
+    world.hero_pos.y,
+    world.hero_pos.z,
+    world.hero_walker.velocity.x,
+    world.hero_walker.velocity.y,
+    world.hero_walker.velocity.z,
+    if world.hero_walker.grounded then 1.0 else 0.0,
+    world.hero_heading,
+    world.cam_yaw,
+    U32.to_f32 world.hero_hp,
+    world.hero_invuln,
+    world.stamina,
+    world.dash_timer,
+    world.stride_phase,
+    world.slash_timer,
+    world.slash_cooldown,
+    U32.to_f32 world.sentinels.length,
+    U32.to_f32 world.shards.length,
+  ]
+  for i in 0 .. world.sentinels.length:
+    let s = world.sentinels[i]
+    @storage.push out (U32.to_f32 s.id)
+    @storage.push out s.position.x
+    @storage.push out s.position.y
+    @storage.push out s.position.z
+    @storage.push out s.velocity.x
+    @storage.push out s.velocity.y
+    @storage.push out s.velocity.z
+    @storage.push out (U32.to_f32 s.hp)
+    @storage.push out (if s.alive then 1.0 else 0.0)
+    @storage.push out s.patrol_phase
+  for i in 0 .. world.shards.length:
+    let sh = world.shards[i]
+    @storage.push out (if sh.collected then 1.0 else 0.0)
+  return out
+
+func restore (lanes_in: &[F32]) : World =>
+  let base = create ()
+  if lanes_in.length < 23:
+    return base
+  base.time := lanes_in[0]
+  base.paused := lanes_in[1] >= 0.5
+  base.victory := lanes_in[2] >= 0.5
+  base.defeat := lanes_in[3] >= 0.5
+  base.score := F32.to_u32 (max 0.0 lanes_in[4])
+  base.hero_pos := math.vec3 lanes_in[5] lanes_in[6] lanes_in[7]
+  base.hero_walker.velocity := math.vec3 lanes_in[8] lanes_in[9] lanes_in[10]
+  base.hero_walker.grounded := lanes_in[11] >= 0.5
+  base.hero_heading := lanes_in[12]
+  base.cam_yaw := lanes_in[13]
+  base.hero_hp := min 5 (F32.to_u32 (max 0.0 lanes_in[14]))
+  base.hero_invuln := max 0.0 lanes_in[15]
+  base.stamina := clamp 0.0 1.0 lanes_in[16]
+  base.dash_timer := max 0.0 lanes_in[17]
+  base.stride_phase := lanes_in[18]
+  base.slash_timer := max 0.0 lanes_in[19]
+  base.slash_cooldown := max 0.0 lanes_in[20]
+  let sc = F32.to_u32 (max 0.0 lanes_in[21])
+  let shc = F32.to_u32 (max 0.0 lanes_in[22])
+  let sh_off = 23 + sc * 10
+  if sc == base.sentinels.length and shc == base.shards.length and lanes_in.length >= sh_off + shc:
+    for i in 0 .. sc:
+      let o = 23 + i * 10
+      let s = base.sentinels[i]
+      s.id := F32.to_u32 (max 0.0 lanes_in[o])
+      s.position := math.vec3 lanes_in[o + 1] lanes_in[o + 2] lanes_in[o + 3]
+      s.velocity := math.vec3 lanes_in[o + 4] lanes_in[o + 5] lanes_in[o + 6]
+      s.hp := F32.to_u32 (max 0.0 lanes_in[o + 7])
+      s.alive := lanes_in[o + 8] >= 0.5
+      s.patrol_phase := lanes_in[o + 9]
+      base.sentinels[i] := s
+    for i in 0 .. shc:
+      let sh = base.shards[i]
+      sh.collected := lanes_in[sh_off + i] >= 0.5
+      base.shards[i] := sh
+  base.follower := rig.follower follow_cfg (base.hero_pos + math.vec3 0.0 1.35 0.0) base.hero_walker.velocity base.cam_yaw
+  return base
+
+// --- Pen Session 2 Runtime & Multi-Core `steer_crowd` Kernel Transport ---
+
+type Access = {
+  world: World,
+  physics: scene.Scene,
+  frame: render.FrameAccess,
+  audio: sound.Access,
+  packet_events: #[protocol.Event],
+  events: #[events.Event],
+  ui_nodes: #[tree.StoredNode],
+  ui_labels: #[U32],
+  services: services.Services,
+  service_output: #[services.Request],
+  kernel_out: #[services.Request],
+  kernels: kernel_transport.Access,
+  preferences: #[preferences.Preferences],
+  requests: #[U32],
+  last_crowd_hash: kernel.Hash64,
+}
+
+func init_access () : Access =>
+  let owners = host.frame_owners ()
+  let svc_next = #[1]
+  let svc_outbox: #[services.Request] = #[]
+  let svc_waiting: #[services.Request] = #[]
+  let svc_filling: #[services.Filling] = #[]
+  let svc_answers: #[services.Answer] = #[]
+  let svc_statuses: #[U32] = #[]
+  let svc_payload: #[F32] = #[]
+  let svc = services.access svc_next svc_outbox svc_waiting svc_filling svc_answers svc_statuses svc_payload
+  let packet_events: #[protocol.Event] = #[]
+  let kernel_out: #[services.Request] = #[]
+  return {
+    world: create (),
+    physics: build_arena_physics (),
+    frame: owners.frame,
+    audio: owners.audio,
+    packet_events,
+    events: owners.events,
+    ui_nodes: owners.ui_nodes,
+    ui_labels: owners.ui_labels,
+    services: svc,
+    service_output: owners.service_output,
+    kernel_out,
+    kernels: kernel_transport.owners (),
+    preferences: #[default_preferences],
+    requests: persist.requests (),
+    last_crowd_hash: $kernel.Hash64 { lo: 0, hi: 0 },
+  }
+
+func measure_current_frame (access: Access) : U32 =>
+  let drawn = render.finish access.frame
+  let audio_view = sound.read access.audio
+  let ui_view = &access.ui_nodes[0..access.ui_nodes.length]
+  let svc_view = &access.service_output[0..access.service_output.length]
+  return host.measure_frame_floats audio_view access.preferences[0] ui_view drawn svc_view access.services
+
+const acknowledge = func access -> published => ()
+
+func apply_crowd_answer (kt: kernel_transport.Access) -> (crowd_kernel: Kernel [#[F32], #[4; F32], #[4; F32]]) -> (hash: kernel.Hash64) -> (sep: own #[Vec3]) : #[Vec3] =>
+  if let $Some ans = kernel_kits.find_answer_for kt crowd_kernel hash:
+    let vals = kernel_transport.batch_values kt ans
+    let limit = min ans.item_count sep.length
+    for i in 0 .. limit:
+      if i * 4 + 3 < vals.length:
+        sep[i] := math.vec3 vals[i * 4 + 1] vals[i * 4 + 2] vals[i * 4 + 3]
+  return sep
+
+func execute (crowd_kernel: Kernel [#[F32], #[4; F32], #[4; F32]]) -> (access: own Access) -> (operation: U32) -> (payload: &[F32]) -> (outgoing: own #[F32]) =>
+  case operation of
+    1 => do:
+      access.world := create ()
+      outgoing := program.append (save access.world) self
+    2 => do:
+      access.frame := render.begin_frame self
+      access.audio := sound.begin_frame self
+      let packet: #[F32] = array.generate payload.length (func i => payload.at i)
+      let (input, next_pe, next_ev) = host.decode_frame packet access.packet_events access.events
+      access.packet_events := next_pe
+      access.events := next_ev
+      let ev_copy: #[events.Event] = copy access.events
+      access.kernels := kernel_transport.receive_events self (&ev_copy[0..ev_copy.length])
+      for ev in ev_copy:
+        access.preferences := preferences.receive self ev
+
+      // Apply latest multi-core `steer_crowd` separation vectors if completed.
+      access.world.crowd_sep := apply_crowd_answer access.kernels crowd_kernel access.last_crowd_hash self
+
+      access.world := step self (scene.queries access.physics) input.elapsed input.width input.height (&ev_copy[0..ev_copy.length])
+      access.requests := persist.clear_requests self
+      if access.world.save_req:
+        access.requests := persist.request self $persist.Save
+      if access.world.load_req:
+        access.requests := persist.request self $persist.Load
+
+      // Offload 4-sentinel crowd separation batch to Pen's worker pool when CAP is ready.
+      let positions: #[Vec3] = #[]
+      for i in 0 .. access.world.sentinels.length:
+        @storage.push positions access.world.sentinels[i].position
+      let wire = kernel_kits.crowd_ctx_pack (&positions[0..positions.length]) 6.0
+      let hash = kernel.fnv1a64_f32s (&wire[0..wire.length])
+      let agents: #[F32] = #[]
+      for i in 0 .. positions.length:
+        @storage.push agents positions[i].x
+        @storage.push agents positions[i].y
+        @storage.push agents positions[i].z
+        @storage.push agents 2.8
+      let (queued, next_kt) = kernel_kits.dispatch_batch access.kernels crowd_kernel hash (&wire[0..wire.length]) positions.length (&agents[0..agents.length])
+      access.kernels := next_kt
+      if queued:
+        access.last_crowd_hash := hash
+
+      let (next_frame, next_audio) = populate_frame access.world access.frame access.audio
+      access.frame := next_frame
+      access.audio := next_audio
+      let (next_lbls, next_ui) = emit_ui_tree access.world access.ui_labels access.ui_nodes
+      access.ui_labels := next_lbls
+      access.ui_nodes := next_ui
+      let base_floats = measure_current_frame access
+      let svc_count = access.service_output.length
+      let kout_fresh: #[services.Request] = #[]
+      let (next_kt2, next_kout) = host.admit_kernel_requests base_floats svc_count access.kernels kout_fresh
+      access.kernels := next_kt2
+      access.kernel_out := next_kout
+      let drawn = render.finish access.frame
+      let audio_view = sound.read access.audio
+      let ui_view = &access.ui_nodes[0..access.ui_nodes.length]
+      let ui_label_view = &access.ui_labels[0..access.ui_labels.length]
+      let svc_view = &access.service_output[0..access.service_output.length]
+      outgoing := host.append_frame_with_kernels schema access.requests audio_view access.preferences[0] ui_view ui_label_view drawn
+        svc_view access.services (&access.kernel_out[0..access.kernel_out.length]) (&access.kernels.payload[0..access.kernels.payload.length]) self
+      access.preferences[0].changed := false
+    3 => do:
+      outgoing := program.append (save access.world) self
+    4 => do:
+      access.world := restore payload
+      outgoing := program.append (save access.world) self
+    _ => panic "scenes are not supported"
+  return (access, outgoing)
+
+func run (crowd_kernel: Kernel [#[F32], #[4; F32], #[4; F32]]) -> host =>
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
+  let access = init_access ()
+  use _ <- program.run (execute crowd_kernel) acknowledge access schema false incoming outgoing host
+  return ()

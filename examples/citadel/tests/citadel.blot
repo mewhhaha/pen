@@ -1,0 +1,119 @@
+// Verification suite for Citadel Striker (Playable 3D Vertical Slice).
+// Run with `pen test-blot` inside `examples/citadel/`.
+import * as check from "pen/check"
+import * as events from "ink/events"
+import * as keys from "ink/input/keys"
+import * as math from "ink/math"
+import * as render from "ink/render"
+import * as scene from "ink/scene"
+import * as sound from "ink/sound"
+import * as tree from "ink/ui/tree"
+import {
+  create,
+  build_arena_physics,
+  step,
+  save,
+  restore,
+  populate_frame,
+  emit_ui_tree,
+  eval_hero_world_bones,
+  compute_hero_skin_palette,
+  alive_sentinel_count,
+  collected_shard_count,
+} from "./game"
+
+entry const test_character_movement_jump_dais_and_voxel_nav = func () =>
+  let phys_scene = build_arena_physics ()
+  let phys = scene.queries phys_scene
+  let w = create ()
+  let start_z = w.hero_pos.z
+  // Hold W to sprint forward onto the central dais (z: 5.4 -> ~2.0, climbing step_height = 0.4).
+  let down_w = #[$events.KeyDown keys.w]
+  let empty: #[events.Event] = #[]
+  w := step self phys 0.016 1280.0 720.0 (&down_w[0..1])
+  for _ in 0 .. 45:
+    w := step self phys 0.016 1280.0 720.0 (&empty[0..0])
+  let walked_z = w.hero_pos.z
+  // Jump via Space and verify positive airborne height & velocity.
+  let press_jump = #[$events.KeyDown keys.space]
+  w := step self phys 0.016 1280.0 720.0 (&press_jump[0..1])
+  for _ in 0 .. 8:
+    w := step self phys 0.016 1280.0 720.0 (&empty[0..0])
+  let jump_y = w.hero_pos.y
+  return check.report #[
+    check.equal #[1.0, 1.0, 1.0] #[
+      if w.walkable_cells >= 80 then 1.0 else 0.0,
+      if walked_z < start_z - 2.5 then 1.0 else 0.0,
+      if jump_y > 0.7 then 1.0 else 0.0,
+    ],
+  ]
+
+entry const test_combat_slash_hitstop_shake_shard_and_skinned_bones = func () =>
+  let phys_scene = build_arena_physics ()
+  let phys = scene.queries phys_scene
+  let w = create ()
+  // Place hero facing sentinel[0] at close range and trigger slash (KeyJ).
+  let s0 = w.sentinels[0]
+  w.hero_pos := math.vec3 s0.position.x 0.02 (s0.position.z + 1.8)
+  w.hero_heading := 0.0 // facing -Z directly at sentinel[0]
+  let press_j = #[$events.KeyDown keys.j]
+  let empty: #[events.Event] = #[]
+  w := step self phys 0.016 1280.0 720.0 (&press_j[0..1])
+  // Advance past the 0.07s wind-up so the slash hitbox lands!
+  for _ in 0 .. 6:
+    w := step self phys 0.016 1280.0 720.0 (&empty[0..0])
+  let hp_after_hit1 = w.sentinels[0].hp
+  let score_after_hit1 = w.score
+  let trauma_after_hit = w.trauma.level
+  let hitstop_active = w.hitstop.remaining > 0.0 or w.sfx_hit
+
+  // Check 6-bone skinning palette & ribbon trail + spark emitter emission during active slash!
+  let bones = eval_hero_world_bones w
+  let palette = compute_hero_skin_palette bones
+  let frame = render.begin_frame (render.empty_frame ())
+  let audio = sound.begin_frame (sound.empty_access ())
+  let (frame, audio) = populate_frame w frame audio
+
+  // Move hero onto shard[0] at (0, 0, 0) to collect it.
+  w.hero_pos := math.vec3 0.0 0.42 0.0
+  w := step self phys 0.016 1280.0 720.0 (&empty[0..0])
+  let shards_got = collected_shard_count w
+
+  return check.report #[
+    check.equal #[1.0, 50.0, 6.0, 6.0, 1.0, 2.0, 1.0, 1.0] #[
+      U32.to_f32 hp_after_hit1,
+      U32.to_f32 score_after_hit1,
+      U32.to_f32 palette.length,
+      U32.to_f32 frame.bone_matrices.length,
+      U32.to_f32 shards_got,
+      U32.to_f32 frame.extensions.length,
+      U32.to_f32 audio.reverb_zones.length,
+      U32.to_f32 audio.synths.length,
+    ],
+    check.equal #[1.0, 1.0, 1.0] #[
+      if trauma_after_hit > 0.2 then 1.0 else 0.0,
+      if frame.ribbons.length >= 2 then 1.0 else 0.0,
+      if frame.emitters.length >= 1 then 1.0 else 0.0,
+    ],
+  ]
+
+entry const test_pause_ui_tree_and_save_restore_roundtrip = func () =>
+  let phys_scene = build_arena_physics ()
+  let phys = scene.queries phys_scene
+  let w0 = create ()
+  let evs = #[$events.KeyDown keys.w, $events.KeyDown keys.shift, $events.KeyDown keys.escape]
+  let w1 = step w0 phys 0.016 1280.0 720.0 (&evs[0..3])
+  let lbls: #[U32] = #[]
+  let unodes: #[tree.StoredNode] = #[]
+  let (lbls, unodes) = emit_ui_tree w1 lbls unodes
+  let saved = save w1
+  let w2 = restore (&saved[0..saved.length])
+  let saved2 = save w2
+  return check.report #[
+    check.equal #[1.0, 2.0, 4.0] #[
+      if w1.paused then 1.0 else 0.0,
+      U32.to_f32 unodes.length,
+      U32.to_f32 (alive_sentinel_count w2),
+    ],
+    check.equal saved saved2,
+  ]

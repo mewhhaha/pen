@@ -18,7 +18,7 @@ type Event is data =
   | $Pen protocol.Event
   | $Kick { x: F32, z: F32 }
 
-type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: &[Event], state: &[F32] }
+type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: #[Event], state: &[F32] }
 
 // An event's lanes from `start`: one of pen's, or one of the game's, which
 // travels as pen's Game event: its tag, then its values in the lanes after,
@@ -36,7 +36,7 @@ func decode_event values => func (start: U32) =>
 
 // The input packet, as protocol.decode_input_into reads it, with the game's own
 // events.
-func decode_input_into values -> (events: #[~Event]) =>
+func decode_input_into values -> (events: own #[Event]) =>
   use lanes.require (values.length >= protocol.frame_header_floats)
   use lanes.finite values
   let elapsed = (values.at (0))
@@ -55,7 +55,7 @@ func decode_input_into values -> (events: #[~Event]) =>
   return $Input {
     state: values.view state_start (state_start + state_count),
     elapsed, width, height,
-    events: &events[0..events.length],
+    events,
   }
 
 // Score: How the ball is doing, every frame: how often it has hit a wall, and
@@ -63,10 +63,10 @@ func decode_input_into values -> (events: #[~Event]) =>
 type Score is data = $Score { bounces: U32, speed: F32 }
 const score_floats = 2
 // Append the tag, length and these Scores to a caller-owned extension packet.
-func append_score (records: #[Score]) -> (packet: #[~F32]) =>
+func append_score (records: #[Score]) -> (packet: own #[F32]): #[F32] =>
   @storage.push packet (U32.to_f32 score_tag)
   @storage.push packet (U32.to_f32 (records.length * score_floats))
   for record in records:
     @storage.push packet (U32.to_f32 record.bounces)
     @storage.push packet (record.speed)
-  return ()
+  return packet

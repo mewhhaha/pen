@@ -87,9 +87,6 @@ pub fn floats(record: &Value) -> String {
 pub fn decoder(record: &Value) -> String {
     format!("decode_{}", snake(s(&record["name"])))
 }
-pub fn encoder(record: &Value) -> String {
-    format!("encode_{}", snake(s(&record["name"])))
-}
 
 #[derive(Clone)]
 pub struct Laid {

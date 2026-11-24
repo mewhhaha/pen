@@ -16,10 +16,10 @@ func dialog name => named protocol.ui_role_dialog name
 func text value =>
   let length: U32 = value.length
   let at: U32 -> U32 = value.at
-  let packet: #[+F32] = #[U32.to_f32 length]
+  let packet: #[F32] = #[U32.to_f32 length]
   for i in 0 .. length:
-    packet.push (U32.to_f32 (at i))
-  return seal packet
+    @storage.push packet (U32.to_f32 (at i))
+  return packet
 func call (driver: #[F32] -> #[F32] ! { Foreign }) -> op -> values => return
   driver (array.concat #[1.0, from op] values)
 
@@ -63,15 +63,15 @@ func equal driver -> label -> expected -> actual =>
   let actual_length: U32 = actual.length
   let expected_at: U32 -> F32 = expected.at
   let actual_at: U32 -> F32 = actual.at
-  let packet: #[+F32] = #[]
-  array.append_into packet (text label)
-  packet.push (U32.to_f32 expected_length)
+  let packet: #[F32] = #[]
+  packet := array.extend self (text label)
+  @storage.push packet (U32.to_f32 expected_length)
   for i in 0 .. expected_length:
-    packet.push (expected_at i)
-  packet.push (U32.to_f32 actual_length)
+    @storage.push packet (expected_at i)
+  @storage.push packet (U32.to_f32 actual_length)
   for i in 0 .. actual_length:
-    packet.push (actual_at i)
-  use call driver protocol.test_driver_op_equal (seal packet)
+    @storage.push packet (actual_at i)
+  use call driver protocol.test_driver_op_equal packet
   return ()
 
 func picture driver -> name -> compare -> tolerance =>

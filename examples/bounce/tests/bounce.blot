@@ -8,13 +8,13 @@ import { game, score } from "./game"
 const empty_state: #[F32] = #[]
 
 // A tenth of a second of a 640 x 480 frame, with `events`.
-const input = func (events: #[extensions.Event]) => return
-  $extensions.Input { elapsed: 0.1, width: 640.0, height: 480.0, events: &events[0..events.length], state: &empty_state[0..0] }
+const input = func (events: own #[extensions.Event]) => return
+  $extensions.Input { elapsed: 0.1, width: 640.0, height: 480.0, events, state: &empty_state[0..0] }
 
 const key = func (code: U32) => $extensions.Pen ($protocol.KeyDown code)
 
 // The world after one frame of `events` from `state`.
-const after = func (state: #[F32]) => func (events: #[extensions.Event]) =>
+const after = func (state: #[F32]) => func (events: own #[extensions.Event]) =>
   let (world, _) = game.step (game.restore state) (input events)
   return game.save world
 

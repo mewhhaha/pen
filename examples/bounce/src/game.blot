@@ -162,7 +162,7 @@ const markers = func (bounces: U32) => return
     | index <- array.generate (min bounces 16) identity]
 
 // What the world looks like, and the blip of a bounce.
-const view = func (world: World) -> (hit: Bool) -> (input: extensions.Input) -> (draws: #[~codec.MeshDraw]) -> (sounds_out: #[~types.Sound]) =>
+const view = func (world: World) -> (hit: Bool) -> (input: extensions.Input) -> (draws: own #[codec.MeshDraw]) -> (sounds_out: own #[types.Sound]) =>
   @storage.truncate draws 0
   @storage.truncate sounds_out 0
   let drawn = frame.header schema
@@ -179,7 +179,7 @@ const view = func (world: World) -> (hit: Bool) -> (input: extensions.Input) -> 
     @storage.push draws item
   if hit:
     @storage.push sounds_out ($types.Sound { clip: sounds.bounce, bus: 0, gain: 0.5, pan: world.x / yard, pitch: 1.0, lowpass: 24000.0, reverb: 0.0 })
-  return drawn
+  return (drawn, draws, sounds_out)
 
 // One frame: the events, then the ball rolls on (a tenth of a second at
 // most), then how it looks and its Score.
@@ -192,47 +192,51 @@ const step = func (world: World) => func (input: extensions.Input) =>
 
 // One Score section, encoded after the render packet with its fixed framing.
 const score = func (world: World) =>
-  let packet: #[~F32] = #[protocol.extensions_marker, 1.0]
-  extensions.append_score #[$extensions.Score {
+  let packet: #[F32] = #[protocol.extensions_marker, 1.0]
+  return extensions.append_score #[$extensions.Score {
     bounces: world.bounces, speed: F32.sqrt (world.vx * world.vx + world.vz * world.vz),
   }] packet
-  return seal packet
 
 // The program loop owns the game's world and hands it to `execute`, which
 // returns it. Presentation rejection needs no cache repair here; it never
 // rolls simulation back.
 const acknowledge = func access -> published => ()
 type Access = {
-  world: World, events: #[~extensions.Event], draws: #[~codec.MeshDraw],
-  sounds: #[~types.Sound], rendered: #[~F32],
+  world: World, events: #[extensions.Event], draws: #[codec.MeshDraw],
+  sounds: #[types.Sound], rendered: #[F32],
 }
-const execute = func (access: own Access) -> operation -> payload -> outgoing =>
+const execute = func (access: own Access) -> operation -> payload -> (outgoing: own #[F32]) =>
   case operation of
     1 => do:
       access.world := create ()
-      program.append (save access.world) outgoing
+      outgoing := program.append (save access.world) self
     2 => do:
       let input = extensions.decode_input_into payload access.events
       let (next, hit) = step access.world input
       access.world := next
-      let header = view next hit input access.draws access.sounds
-      access.rendered := codec.encode_mesh_frame header (&access.draws[0..access.draws.length]) (&access.sounds[0..access.sounds.length]) access.rendered
-      program.append access.rendered outgoing
-      program.append (score next) outgoing
-    3 => program.append (save access.world) outgoing
+      let (header, next_draws, next_sounds) = view next hit input access.draws access.sounds
+      access.draws := next_draws
+      access.sounds := next_sounds
+      let $extensions.Input { events } = input
+      access.events := events
+      access.rendered := codec.encode_mesh_frame header (&access.draws[0..access.draws.length]) (&access.sounds[0..access.sounds.length]) self
+      outgoing := program.append access.rendered self
+      outgoing := program.append (score next) self
+    3 => do:
+      outgoing := program.append (save access.world) self
     4 => do:
       access.world := restore payload
-      program.append (save access.world) outgoing
+      outgoing := program.append (save access.world) self
     _ => panic "scenes are not supported"
-  return access
+  return (access, outgoing)
 
 const run = func host =>
-  let events: #[~extensions.Event] = #[]
-  let draws: #[~codec.MeshDraw] = #[]
-  let sounds: #[~types.Sound] = #[]
-  let rendered: #[~F32] = #[]
-  let incoming: #[~F32] = #[]
-  let outgoing: #[~F32] = #[]
+  let events: #[extensions.Event] = #[]
+  let draws: #[codec.MeshDraw] = #[]
+  let sounds: #[types.Sound] = #[]
+  let rendered: #[F32] = #[]
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
   let access: Access = {world: create (), events, draws, sounds, rendered}
   use program.run execute acknowledge access schema false incoming outgoing host
   return ()

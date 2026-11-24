@@ -90,7 +90,7 @@ func report (checks: #[Check]) : #[F32] =>
   for found in checks:
     if not found.passed:
       failed := failed + 1
-  let packet: #[+F32] = #[]
+  let packet: #[F32] = #[]
   @storage.push packet (U32.to_f32 checks.length)
   @storage.push packet (U32.to_f32 failed)
   for i in 0 .. checks.length:
@@ -107,4 +107,4 @@ func report (checks: #[Check]) : #[F32] =>
       @storage.push packet (U32.to_f32 found.actual_length)
       @storage.push packet found.actual_low
       @storage.push packet found.actual_high
-  return seal packet
+  return packet

@@ -4,31 +4,31 @@ import * as test from "pen/test"
 // Read every collection mode without copying borrowed observations first.
 entry const test_readonly_diagnostics = func () =>
   let fixed: #[F32] = #[1.0, 2.0, 3.0]
-  let grow: #[+F32] = #[1.0, 2.0, 4.0]
-  let resize: #[~F32] = #[1.0, 2.0]
+  let grow: #[F32] = #[1.0, 2.0, 4.0]
+  let resize: #[F32] = #[1.0, 2.0]
   let view = fixed.view 0 fixed.length
   let pass = check.near 0.0 fixed view
   let tail = check.near 0.0 view grow
   let length = check.equal fixed resize
   let words: #[U32] = #[0, 4294967295, 2147483648]
-  let changed: #[~U32] = #[0, 4294967294, 2147483648]
+  let changed: #[U32] = #[0, 4294967294, 2147483648]
   let word_view = words.view 0 words.length
   let word = check.words word_view changed
-  let positive: #[+F32] = #[0.0]
-  let negative: #[~F32] = #[-0.0]
+  let positive: #[F32] = #[0.0]
+  let negative: #[F32] = #[-0.0]
   let signed = check.bits positive (negative.view 0 negative.length)
-  let output: #[+check.Check] = #[]
-  output.push (check.holds pass.passed)
-  output.push (check.holds (not tail.passed and tail.lane == 2 and tail.expected_length == 3 and tail.actual_length == 3))
-  output.push (check.holds (tail.expected_low == 3.0 and tail.actual_low == 4.0))
-  output.push (check.holds (not length.passed and length.lane == 2 and length.expected_length == 3 and length.actual_length == 2))
-  output.push (check.holds (length.expected_low == 3.0 and length.actual_low == 0.0))
-  output.push (check.holds (not word.passed and word.lane == 1 and word.expected_low == 65535.0 and word.expected_high == 65535.0 and word.actual_low == 65534.0 and word.actual_high == 65535.0))
-  output.push (check.holds (not signed.passed and signed.lane == 0 and signed.expected_low == 0.0 and signed.expected_high == 0.0 and signed.actual_low == 0.0 and signed.actual_high == 32768.0))
-  return check.report (seal output)
+  let output: #[check.Check] = #[]
+  output := self.push (check.holds pass.passed)
+  output := self.push (check.holds (not tail.passed and tail.lane == 2 and tail.expected_length == 3 and tail.actual_length == 3))
+  output := self.push (check.holds (tail.expected_low == 3.0 and tail.actual_low == 4.0))
+  output := self.push (check.holds (not length.passed and length.lane == 2 and length.expected_length == 3 and length.actual_length == 2))
+  output := self.push (check.holds (length.expected_low == 3.0 and length.actual_low == 0.0))
+  output := self.push (check.holds (not word.passed and word.lane == 1 and word.expected_low == 65535.0 and word.expected_high == 65535.0 and word.actual_low == 65534.0 and word.actual_high == 65535.0))
+  output := self.push (check.holds (not signed.passed and signed.lane == 0 and signed.expected_low == 0.0 and signed.expected_high == 0.0 and signed.actual_low == 0.0 and signed.actual_high == 32768.0))
+  return check.report output
 
 entry const test_borrowed_selector_text = func () =>
-  let name: #[~U32] = #[65, 66, 67]
+  let name: #[U32] = #[65, 66, 67]
   let view = name.view 1 3
   let selector = test.button view
   return check.report #[
@@ -38,9 +38,9 @@ entry const test_borrowed_selector_text = func () =>
 
 // scripts/check-examples.ts inspects the copied Foreign packets on the CPU.
 entry const exercise_readonly_session = func (driver: #[F32] -> #[F32] ! { Foreign }) =>
-  let name: #[~U32] = #[65, 66, 67]
-  let values: #[~F32] = #[1.0, 2.0, 3.0]
-  let expected: #[+F32] = #[2.0, 3.0]
+  let name: #[U32] = #[65, 66, 67]
+  let values: #[F32] = #[1.0, 2.0, 3.0]
+  let expected: #[F32] = #[2.0, 3.0]
   let selector = test.button (name.view 1 3)
   use test.expect_visible driver selector
   use test.equal driver (name.view 0 1) expected (values.view 1 3)

@@ -19,11 +19,11 @@ const HEADER: &str =
 const RUST_HEADER: &str =
     "Generated from protocol/schema.json by `just sync-protocol`:\nedit the schema and run that, not this file.";
 
-/// The game's Blot bindings, as `generate` writes them: each file's name in
-/// the checkout's `pen/`, and its source.
+/// The Blot bindings Pen's own round-trip codec harness overlays in memory,
+/// including its test-only canonical and view-projection modules.
 pub fn blot_bindings() -> Result<Vec<(&'static str, String)>> {
     let model = model::build(serde_json::from_str(SCHEMA).context("invalid protocol/schema.json")?)?;
-    Ok(blot::emit(&model, HEADER))
+    Ok(blot::emit_with_tests(&model, HEADER))
 }
 
 /// What a game's bindings for its own events and sections say they come
@@ -41,6 +41,17 @@ pub fn generate(project: &Path, rust_output: Option<&Path>, check: bool) -> Resu
         blot::emit(&model, HEADER).into_iter().map(|(name, source)| (project.join("pen").join(name), source)).collect();
     let declarations = extensions::Declarations::of_checkout(project)?;
     let declared = project.join("pen").join("extensions.blot");
+    let mut stale = Vec::new();
+    for name in blot::TEST_ONLY {
+        let legacy = project.join("pen").join(name);
+        if legacy.is_file() {
+            if check {
+                stale.push(format!("{} (test-only harness no longer emitted into checkouts)", legacy.display()));
+            } else {
+                std::fs::remove_file(&legacy).with_context(|| format!("remove {}", legacy.display()))?;
+            }
+        }
+    }
     if declarations.is_empty() {
         // Bindings for declarations the checkout no longer has.
         if declared.is_file() {
@@ -58,7 +69,6 @@ pub fn generate(project: &Path, rust_output: Option<&Path>, check: bool) -> Resu
     if let Some(path) = rust_output {
         outputs.push((path.to_owned(), rust));
     }
-    let mut stale = Vec::new();
     for (path, contents) in &outputs {
         if std::fs::read_to_string(path).ok().as_ref() == Some(contents) {
             continue;
@@ -137,19 +147,26 @@ mod tests {
         let render = &sources.iter().find(|(name, _)| *name == "protocol_render.blot").unwrap().1;
         assert!(render.contains("func encode_render_views (packet: types.RenderHeader)"));
         assert!(render.contains("func measure_render_floats collections -> project -> context =>"));
-        assert!(render.contains("func encode_draw (draw: types.Draw)"));
+        assert!(render.contains("func encode_mesh_frame (packet: types.RenderHeader)"));
+        assert!(!render.contains("func encode_draw "));
         assert!(render.contains("draw.transform"));
         assert!(render.contains("inset.ambient.x"));
         assert!(render.contains("packet.clear.r"));
         assert!(render.contains("packet.clouds.drift.z"));
+        let program = &sources.iter().find(|(name, _)| *name == "program.blot").unwrap().1;
+        assert!(!program.contains("func serve "));
         let types = &sources.iter().find(|(name, _)| *name == "types.blot").unwrap().1;
         assert!(types.contains("transform: Mat4"));
         assert!(types.contains("parameters: Maybe Vec4"));
         assert!(types.contains("draws: &[Draw]"));
         assert!(types.contains("type RenderHeader ="));
         assert!(!types.contains("RenderFrame"));
-        // Only tests import the canonical walks; no binding the game uses does.
-        assert!(sources.iter().all(|(_, source)| !source.contains("./protocol_canonical")));
+        // Game checkouts do not receive Pen's internal round-trip test harnesses.
+        assert!(
+            sources
+                .iter()
+                .all(|(name, source)| { !blot::TEST_ONLY.contains(name) && !source.contains("./protocol_canonical") })
+        );
     }
 
     #[test]
@@ -160,7 +177,7 @@ mod tests {
         assert!(
             rust.contains("pub fn canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> Vec<f32> {")
         );
-        let sources = blot::emit(&model, HEADER);
+        let sources = blot::emit_with_tests(&model, HEADER);
         let canonical = &sources.iter().find(|(name, _)| *name == "protocol_canonical.blot").unwrap().1;
         assert!(canonical.contains("func canonical_input (input: protocol.Input) =>"));
         assert!(canonical.contains("func render_packet_from_canonical (canonical: #[F32])"));
@@ -199,7 +216,7 @@ mod tests {
         assert!(rust.contains("            None => out.push(0.0),\n        }\n        out.extend(["));
         assert!(rust.contains("frame.probe_volume.revision as f32"));
         assert!(rust.contains(" sky.environment as f32,\n"));
-        let sources = blot::emit(&model, HEADER);
+        let sources = blot::emit_with_tests(&model, HEADER);
         let canonical = &sources.iter().find(|(name, _)| *name == "protocol_canonical.blot").unwrap().1;
         assert!(canonical.contains("  if present == 1:"));
         let environment = model.header.iter().find(|field| field.key == "sky.environment").unwrap().laid.offset;
@@ -251,7 +268,7 @@ mod tests {
                 let result = std::panic::catch_unwind(|| {
                     if let Ok(model) = model::build(invalid) {
                         rust::emit(&model, RUST_HEADER);
-                        blot::emit(&model, HEADER);
+                        blot::emit_with_tests(&model, HEADER);
                     }
                 });
                 assert!(result.is_ok(), "malformed schema panicked at {path}");
@@ -270,7 +287,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&rust).unwrap(), "stale");
         std::fs::remove_file(dir.join("pen/types.blot")).unwrap();
         assert!(generate(&dir, None, true).is_err());
+        std::fs::write(dir.join("pen/protocol_canonical.blot"), "stale").unwrap();
+        assert!(generate(&dir, None, true).is_err());
         generate(&dir, Some(&rust), false).unwrap();
+        assert!(!dir.join("pen/protocol_canonical.blot").exists());
+        assert!(!dir.join("pen/protocol_views_test.blot").exists());
         generate(&dir, Some(&rust), true).unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }

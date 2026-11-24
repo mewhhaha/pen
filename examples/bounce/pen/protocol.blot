@@ -121,6 +121,10 @@ const engine_preferences = 64
 // The most panners one frame may declare: one for each voice and sound it may
 // have.
 const max_panners = 512
+// The most spatial reverb zones and acoustic portals one frame may declare.
+const max_reverb_zones = 32
+// The most procedural or granular DSP synth voices one frame may declare.
+const max_synths = 64
 const max_instances = 100000
 const max_instance_removals = 100000
 
@@ -802,7 +806,7 @@ const reports_op_queued = 2
 
 // Sizes in lanes.
 const packet_magic = 4670534.0
-const packet_header_floats = 250
+const packet_header_floats = 252
 const frame_header_floats = 5
 const event_floats = 5
 const extensions_marker = 5260632.0
@@ -826,8 +830,8 @@ const cascade_floats = 18
 const probe_floats = 28
 const reflection_probe_floats = 21
 const fog_volume_floats = 15
-const listener_floats = 9
-const panner_floats = 16
+const listener_floats = 12
+const panner_floats = 22
 const instance_floats = 26
 const instance_removal_floats = 2
 const bone_matrix_floats = 19
@@ -835,6 +839,8 @@ const morph_weight_floats = 4
 const motion_floats = 17
 const ribbon_floats = 12
 const haptic_floats = 4
+const reverb_zone_floats = 12
+const synth_voice_floats = 16
 
 // Where each header lane and record field starts.
 const header_magic_lane = 0
@@ -991,6 +997,8 @@ const header_ribbon_count_lane = 246
 const header_reverb_decay_lane = 247
 const header_reverb_damping_lane = 248
 const header_haptic_count_lane = 249
+const header_reverb_zone_count_lane = 250
+const header_synth_count_lane = 251
 const draw_mesh_lane = 0
 const draw_material_lane = 1
 const draw_transform_lane = 2
@@ -1123,6 +1131,7 @@ const fog_volume_falloff_lane = 14
 const listener_position_lane = 0
 const listener_forward_lane = 3
 const listener_up_lane = 6
+const listener_velocity_lane = 9
 const panner_voice_lane = 0
 const panner_sound_lane = 1
 const panner_position_lane = 2
@@ -1135,6 +1144,10 @@ const panner_cone_inner_lane = 12
 const panner_cone_outer_lane = 13
 const panner_cone_outer_gain_lane = 14
 const panner_hrtf_lane = 15
+const panner_velocity_lane = 16
+const panner_doppler_lane = 19
+const panner_occlusion_lane = 20
+const panner_zone_lane = 21
 const instance_id_low_lane = 0
 const instance_id_high_lane = 1
 const instance_order_lane = 2
@@ -1165,6 +1178,30 @@ const haptic_pad_lane = 0
 const haptic_low_lane = 1
 const haptic_high_lane = 2
 const haptic_duration_lane = 3
+const reverb_zone_id_lane = 0
+const reverb_zone_position_lane = 1
+const reverb_zone_half_extents_lane = 4
+const reverb_zone_blend_lane = 7
+const reverb_zone_decay_lane = 8
+const reverb_zone_damping_lane = 9
+const reverb_zone_wet_lane = 10
+const reverb_zone_portal_attenuation_lane = 11
+const synth_voice_id_lane = 0
+const synth_voice_mode_lane = 1
+const synth_voice_bus_lane = 2
+const synth_voice_frequency_lane = 3
+const synth_voice_gain_lane = 4
+const synth_voice_pan_lane = 5
+const synth_voice_detune_lane = 6
+const synth_voice_attack_lane = 7
+const synth_voice_decay_lane = 8
+const synth_voice_sustain_lane = 9
+const synth_voice_release_lane = 10
+const synth_voice_cutoff_lane = 11
+const synth_voice_resonance_lane = 12
+const synth_voice_grain_size_lane = 13
+const synth_voice_grain_pitch_lane = 14
+const synth_voice_reverb_lane = 15
 const solid_faces_lane = 0
 const field_patch_material_lane = 0
 const field_patch_width_lane = 1
@@ -1301,7 +1338,7 @@ type Event is data =
   | $SessionStarted { restored: U32 }
   | $RendererReady
 
-type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: &[Event], state: &[F32] }
+type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: #[Event], state: &[F32] }
 
 // An event's lanes from `start`: its tag, then code, x, y, delta. The code lane
 // holds a whole number; lanes an event does not use are zero.
@@ -1438,7 +1475,7 @@ func decode_event values => func (start: U32) =>
 // The input packet: the seconds since the last frame, the viewport's width and
 // height, the event and state counts, the events and the state. Anything else
 // traps.
-func decode_input_into values -> (events: #[~Event]) =>
+func decode_input_into values -> (events: own #[Event]) =>
   use lanes.require (values.length >= frame_header_floats)
   use lanes.finite values
   let elapsed = (values.at (0))
@@ -1457,5 +1494,5 @@ func decode_input_into values -> (events: #[~Event]) =>
   return $Input {
     state: values.view state_start (state_start + state_count),
     elapsed, width, height,
-    events: &events[0..events.length],
+    events,
   }

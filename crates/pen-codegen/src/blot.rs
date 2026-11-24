@@ -76,28 +76,6 @@ fn encode(field: &Value, path: &str, local: &str) -> (Vec<String>, Vec<String>) 
 fn field_path(variable: &str, laid: &Laid) -> String {
     format!("{variable}.{}", laid.name)
 }
-fn record(layout: &Layout) -> Vec<String> {
-    let name = s(&layout.record["name"]);
-    let variable = singular(&snake(name));
-    let about = match layout.record["doc"].as_str() {
-        Some(doc) => format!("{name}: {doc}"),
-        None => format!("A {name}'s lanes."),
-    };
-    let mut out = comment(Some(&about));
-    out.push(format!("func {} ({variable}: types.{name}) =>", encoder(&layout.record)));
-    let mut lets = Vec::new();
-    let mut lanes = Vec::new();
-    for laid in &layout.fields {
-        let (local, values) = encode(&laid.field, &field_path(&variable, laid), &laid.name);
-        lets.extend(local);
-        lanes.extend(values);
-    }
-    out.extend(lets.iter().map(|line| format!("  {line}")));
-    out.push("  return #[".to_owned());
-    out.extend(chunk(&lanes, 76).iter().map(|line| format!("    {line},")));
-    out.push("  ]".to_owned());
-    out
-}
 fn constants(model: &Model) -> Vec<String> {
     let mut out = vec!["// Limits.".to_owned()];
     for limit in array(&model.protocol["limits"]) {
@@ -212,7 +190,7 @@ fn input(model: &Model) -> Vec<String> {
     }
     out.extend([
         String::new(),
-        "type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: &[Event], state: &[F32] }"
+        "type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: #[Event], state: &[F32] }"
             .to_owned(),
         String::new(),
     ]);
@@ -275,7 +253,7 @@ fn input(model: &Model) -> Vec<String> {
     out.push(format!("    _ => panic {}", quote(&input["messages"]["tag"])));
     out.push(String::new());
     out.extend(comment(Some("The input packet: the seconds since the last frame, the viewport's width and height, the event and state counts, the events and the state. Anything else traps.")));
-    out.extend("func decode_input_into values -> (events: #[~Event]) =>\n  use lanes.require (values.length >= frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)".lines().map(str::to_owned));
+    out.extend("func decode_input_into values -> (events: own #[Event]) =>\n  use lanes.require (values.length >= frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)".lines().map(str::to_owned));
     out.push(format!(
         "  let event_count = lanes.integer (values.at (3)) {}",
         s(&input["maxEvents"]["limit"]).to_lowercase()
@@ -284,7 +262,7 @@ fn input(model: &Model) -> Vec<String> {
         "  let state_count = lanes.integer (values.at (4)) {}",
         s(&model.protocol["state"]["max"]["limit"]).to_lowercase()
     ));
-    out.extend("  let state_start = frame_header_floats + event_count * event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (frame_header_floats + index * event_floats))\n  return $Input {\n    state: values.view state_start (state_start + state_count),\n    elapsed, width, height,\n    events: &events[0..events.length],\n  }".lines().map(str::to_owned));
+    out.extend("  let state_start = frame_header_floats + event_count * event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (frame_header_floats + index * event_floats))\n  return $Input {\n    state: values.view state_start (state_start + state_count),\n    elapsed, width, height,\n    events,\n  }".lines().map(str::to_owned));
     out
 }
 // Emit schema offsets directly into the named packet destination.
@@ -311,10 +289,10 @@ fn append_fields(out: &mut Vec<String>, fields: &[Laid], row: &str, indent: &str
 
 fn render_views(model: &Model) -> Vec<String> {
     let mut out = vec![String::new(),
-        "func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own #[~F32]) =>".into(),
+        "func encode_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own #[F32]) =>".into(),
         "  @storage.truncate encoded 0".into(),
         "  return append_render_views packet collections project context encoded".into(),
-        "func append_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own #[~F32]) =>".into(),
+        "func append_render_views (packet: types.RenderHeader) -> collections -> project -> context -> (encoded: own #[F32]) =>".into(),
         "  let start = encoded.length".into()];
     for section in &model.sections {
         if kind(&section.section) != "trailing" && section.owner.is_none() {
@@ -357,7 +335,7 @@ fn render_views(model: &Model) -> Vec<String> {
             for owner in owners {
                 let section = model.section(&owner.section);
                 let indent = view_rows(&mut out, section);
-                out.push(format!("{indent}project.append_extra context source encoded"));
+                out.push(format!("{indent}encoded := project.append_extra context source (own self)"));
             }
             continue;
         }
@@ -521,7 +499,7 @@ fn render_meshes(model: &Model) -> Vec<String> {
     let mut out = vec![String::new(),
         "// Flat mesh draws (no parameters/extras) and sounds, into the packet it is given and returns.".to_owned(),
         "type MeshDraw = { mesh: U32, material: U32, transform: types.Mat4 }".to_owned(),
-        "func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: own #[~F32]) =>".to_owned(),
+        "func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (sounds: &[types.Sound]) -> (encoded: own #[F32]) =>".to_owned(),
         "  @storage.truncate encoded 0".to_owned(),
         format!("  for 0 .. (protocol.packet_header_floats + draws.length * {} + sounds.length * {}):", draws.lanes, sounds.lanes),
         "    @storage.push encoded 0.0".to_owned()];
@@ -561,126 +539,8 @@ fn render_meshes(model: &Model) -> Vec<String> {
 }
 
 fn render(model: &Model) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut emitted = HashSet::new();
-    for entry in &model.sections {
-        if let Some(layout) = &entry.fixed
-            && emitted.insert(s(&layout.record["name"]))
-        {
-            out.push(String::new());
-            out.extend(record(layout));
-        }
-        if kind(&entry.section) != "variable" {
-            continue;
-        }
-        let record = &entry.section["record"];
-        let rest = &record["rest"];
-        let name = singular(&snake(s(&record["name"])));
-        let rest_name = s(&rest["name"]);
-        out.push(String::new());
-        if kind(rest) == "values" {
-            let mut lets = Vec::new();
-            let mut lanes = Vec::new();
-            for laid in &entry.head {
-                let (local, values) = encode(&laid.field, &field_path(&name, laid), &laid.name);
-                lets.extend(local);
-                lanes.extend(values);
-            }
-            out.extend(comment(Some(&format!(
-                "{}: its {}, then its {rest_name}.",
-                s(&record["name"]),
-                entry.head.iter().map(|field| field.name.as_str()).collect::<Vec<_>>().join(", ")
-            ))));
-            out.push(format!("func {} ({name}: types.{}) =>", encoder(record), s(&record["name"])));
-            out.extend(lets.iter().map(|line| format!("  {line}")));
-            out.push("  return array.concat #[".to_owned());
-            out.extend(chunk(&lanes, 76).iter().map(|line| format!("    {line},")));
-            out.push(format!("  ] {name}.{rest_name}"));
-        } else {
-            let item = entry.item.as_ref().unwrap();
-            let item_name = singular(rest_name);
-            let mut lines = Vec::new();
-            let mut lane = 0;
-            for laid in &entry.head {
-                let (local, values) = encode(&laid.field, &field_path(&name, laid), &laid.name);
-                lines.extend(local);
-                for value in values {
-                    lines.push(format!("encoded[{lane}] := {value}"));
-                    lane += 1;
-                }
-            }
-            lines.push(format!("encoded[{lane}] := U32.to_f32 {rest_name}.length"));
-            let mut writes = Vec::new();
-            let mut offset = 0;
-            for laid in &item.fields {
-                let (local, values) = encode(&laid.field, &field_path(&item_name, laid), &laid.name);
-                writes.extend(local);
-                for value in values {
-                    let mut index = "start".to_owned();
-                    if offset != 0 {
-                        index = format!("start + {offset}");
-                    }
-                    writes.push(format!("encoded[{index}] := {value}"));
-                    offset += 1;
-                }
-            }
-            let mut head = String::new();
-            if !entry.head.is_empty() {
-                head = format!(
-                    "its {}, ",
-                    entry.head.iter().map(|field| field.name.as_str()).collect::<Vec<_>>().join(", ")
-                );
-            }
-            out.extend(comment(Some(&format!(
-                "{}: {head}its {rest_name}' count, then each of them.",
-                s(&record["name"])
-            ))));
-            out.push(format!("func {} ({name}: types.{}) =>", encoder(record), s(&record["name"])));
-            out.push(format!("  let {rest_name} = {name}.{rest_name}"));
-            out.push(format!(
-                "  let encoded = @array.fill (protocol.{} + {rest_name}.length * protocol.{}) 0.0",
-                count(record),
-                count(&item.record)
-            ));
-            out.extend(lines.iter().map(|line| format!("  {line}")));
-            out.push(format!("  for index in 0 .. {rest_name}.length:"));
-            out.push(format!("    let {item_name} = {rest_name}[index]"));
-            out.push(format!("    let start = protocol.{} + index * protocol.{}", count(record), count(&item.record)));
-            out.extend(writes.iter().map(|line| format!("    {line}")));
-            out.push("  return encoded".to_owned());
-        }
-    }
-    let mut tail_encoders = HashMap::new();
-    for (_, owners) in &model.tails {
-        for owner in owners {
-            let key = format!("{}.{}", s(&owner.layout.record["name"]), owner.field.name);
-            if tail_encoders.contains_key(&key) {
-                continue;
-            }
-            let name = format!("encode_{}_{}", snake(s(&owner.layout.record["name"])), owner.field.name);
-            tail_encoders.insert(key, name.clone());
-            let variable = singular(&snake(s(&owner.layout.record["name"])));
-            let path = field_path(&variable, &owner.field);
-            let max = bound_blot(&owner.field.field["max"]);
-            out.push(String::new());
-            out.extend(comment(Some(&format!(
-                "A {}'s {}, at most {max} of them, for the packet's last section.",
-                s(&owner.layout.record["name"]),
-                owner.field.name
-            ))));
-            out.push(format!("func {name} ({variable}: types.{}) =>", s(&owner.layout.record["name"])));
-            out.push(format!("  let kept = min {path}.length {max}"));
-            out.push(format!(
-                "  return #[lane | index <- array.generate kept identity, lane <- vec4_lanes {path}[index]]"
-            ));
-        }
-    }
-    if !tail_encoders.is_empty() {
-        out.extend([String::new(), "func vec4_lanes (v: types.Vec4) => #[v.x, v.y, v.z, v.w]".to_owned()]);
-    }
-    out.extend(render_views(model));
+    let mut out = render_views(model);
     out.extend(render_meshes(model));
-
     out
 }
 fn field_type(model: &Model, field: &Value) -> String {
@@ -798,6 +658,8 @@ func bit (value: Bool) =>
     return 1.0
   return 0.0"#;
 
+pub const TEST_ONLY: [&str; 2] = ["protocol_canonical.blot", "protocol_views_test.blot"];
+
 pub fn emit(model: &Model, header: &str) -> Vec<(&'static str, String)> {
     let top: Vec<_> = header.lines().map(|line| format!("// {line}")).collect();
     let mut protocol = top.clone();
@@ -818,7 +680,6 @@ import * as lanes from "./lanes"
     render_source.extend(
         r#"//
 // Encode Pen wire records without application dependencies.
-import * as array from "std/array"
 import * as lanes from "./lanes"
 import * as protocol from "./protocol"
 import * as types from "./types""#
@@ -830,8 +691,6 @@ import * as types from "./types""#
     let mut wire_types = top.clone();
     wire_types.extend(types(model));
     wire_types.push(String::new());
-    let canonical = crate::canonical::blot(model, &top);
-    let bridge = crate::bridge::emit(model, &top);
     let program = crate::program::program(&top);
     let frame = crate::program::frame(model, &top);
     let check = crate::program::check(&top);
@@ -844,11 +703,19 @@ import * as types from "./types""#
         ("protocol_render.blot", render_source.join("\n")),
         ("types.blot", wire_types.join("\n")),
         ("lanes.blot", numeric.join("\n")),
-        ("protocol_canonical.blot", canonical),
-        ("protocol_views_test.blot", bridge),
         ("program.blot", program),
         ("frame.blot", frame),
         ("check.blot", check),
         ("test.blot", testing),
     ]
+}
+
+/// All game bindings plus Pen's internal round-trip test harnesses (`protocol_canonical.blot`
+/// and `protocol_views_test.blot`), which stay out of game checkouts.
+pub fn emit_with_tests(model: &Model, header: &str) -> Vec<(&'static str, String)> {
+    let top: Vec<_> = header.lines().map(|line| format!("// {line}")).collect();
+    let mut out = emit(model, header);
+    out.push(("protocol_canonical.blot", crate::canonical::blot(model, &top)));
+    out.push(("protocol_views_test.blot", crate::bridge::emit(model, &top)));
+    out
 }

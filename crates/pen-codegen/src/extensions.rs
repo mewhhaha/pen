@@ -299,7 +299,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
     }
     out.push(String::new());
     out.push(
-        "type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: &[Event], state: &[F32] }"
+        "type Input is data = $Input { elapsed: F32, width: F32, height: F32, events: #[Event], state: &[F32] }"
             .to_owned(),
     );
     out.push(String::new());
@@ -344,7 +344,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
     out.push(String::new());
     out.extend(comment("The input packet, as protocol.decode_input_into reads it, with the game's own events."));
     out.extend(
-        "func decode_input_into values -> (events: #[~Event]) =>\n  use lanes.require (values.length >= protocol.frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)\n  let event_count = lanes.integer (values.at (3)) protocol.max_events\n  let state_count = lanes.integer (values.at (4)) protocol.max_state_floats\n  let state_start = protocol.frame_header_floats + event_count * protocol.event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (protocol.frame_header_floats + index * protocol.event_floats))\n  return $Input {\n    state: values.view state_start (state_start + state_count),\n    elapsed, width, height,\n    events: &events[0..events.length],\n  }"
+        "func decode_input_into values -> (events: own #[Event]) =>\n  use lanes.require (values.length >= protocol.frame_header_floats)\n  use lanes.finite values\n  let elapsed = (values.at (0))\n  use lanes.require (elapsed >= 0.0)\n  let width = (values.at (1))\n  let height = (values.at (2))\n  use lanes.require (width > 0.0)\n  use lanes.require (height > 0.0)\n  let event_count = lanes.integer (values.at (3)) protocol.max_events\n  let state_count = lanes.integer (values.at (4)) protocol.max_state_floats\n  let state_start = protocol.frame_header_floats + event_count * protocol.event_floats\n  use lanes.require (values.length == state_start + state_count)\n  @storage.truncate events 0\n  for index in 0 .. event_count:\n    @storage.push events (decode_event values (protocol.frame_header_floats + index * protocol.event_floats))\n  return $Input {\n    state: values.view state_start (state_start + state_count),\n    elapsed, width, height,\n    events,\n  }"
             .lines()
             .map(str::to_owned),
     );
@@ -368,7 +368,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             section.name
         )));
         out.push(format!(
-            "func append_{name} (records: #[{}]) -> (packet: #[~F32]) =>",
+            "func append_{name} (records: #[{}]) -> (packet: own #[F32]): #[F32] =>",
             section.name
         ));
         out.push(format!("  @storage.push packet (U32.to_f32 {name}_tag)"));
@@ -382,7 +382,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             };
             out.push(format!("    @storage.push packet ({value})"));
         }
-        out.push("  return ()".to_owned());
+        out.push("  return packet".to_owned());
     }
     out.push(String::new());
     out.join("\n")

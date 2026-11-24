@@ -206,6 +206,7 @@ type Listener is data = $Listener {
   position: Vector,
   forward: Vector,
   up: Vector,
+  velocity: Vector,
 }
 
 type Panner is data = $Panner {
@@ -221,6 +222,10 @@ type Panner is data = $Panner {
   cone_outer: F32,
   cone_outer_gain: F32,
   hrtf: Bool,
+  velocity: Vector,
+  doppler: F32,
+  occlusion: F32,
+  zone: U32,
 }
 
 type Instance is data = $Instance {
@@ -272,6 +277,36 @@ type Haptic is data = $Haptic {
   low: F32,
   high: F32,
   duration: F32,
+}
+
+type ReverbZone is data = $ReverbZone {
+  id: U32,
+  position: Vector,
+  half_extents: Vector,
+  blend: F32,
+  decay: F32,
+  damping: F32,
+  wet: F32,
+  portal_attenuation: F32,
+}
+
+type SynthVoice is data = $SynthVoice {
+  id: U32,
+  mode: U32,
+  bus: U32,
+  frequency: F32,
+  gain: F32,
+  pan: F32,
+  detune: F32,
+  attack: F32,
+  decay: F32,
+  sustain: F32,
+  release: F32,
+  cutoff: F32,
+  resonance: F32,
+  grain_size: F32,
+  grain_pitch: F32,
+  reverb: F32,
 }
 
 type Solid is data = $Solid {

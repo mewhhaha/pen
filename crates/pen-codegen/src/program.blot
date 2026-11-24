@@ -12,11 +12,11 @@ const snapshot: U32 = 3
 const restore: U32 = 4
 const scene: U32 = 5
 const load_scene: U32 = 6
-func append values -> (destination: #[~F32]) =>
+func append values -> (destination: own #[F32]): #[F32] =>
   let count = values.length
   for i in 0 .. count:
     @storage.push destination (values.at i)
-  return ()
+  return destination
 func valid_state values =>
   if values.length > protocol.max_state_floats:
     return false
@@ -24,23 +24,23 @@ func valid_state values =>
     if not (is_finite value):
       return false
   return true
-// The loop owns the game's world and is lent both packet buffers for the
-// whole invocation. Foreign returns a copied temporary which is consumed
-// within the iteration. `execute access operation payload outgoing` takes the
-// world over, writes its response lanes AFTER the echoed operation, and
-// returns the world. `acknowledge access published` repairs presentation caches.
-func run execute -> acknowledge -> (own access) -> (schema: U32) -> (scenes: Bool) -> (incoming: #[~F32]) -> (outgoing: #[~F32]) -> (host: #[F32] -> #[F32] ! { Foreign }) : Unit ! { Foreign } =>
+// The loop owns the game's world and both packet buffers for the whole
+// invocation. Foreign returns a copied temporary which is consumed within the
+// iteration. `execute access operation payload outgoing` takes both over,
+// writes its response lanes AFTER the echoed operation, and returns both.
+// `acknowledge access published` repairs presentation caches.
+func run execute -> acknowledge -> (own access) -> (schema: U32) -> (scenes: Bool) -> (incoming: own #[F32]) -> (outgoing: own #[F32]) -> (host: #[F32] -> #[F32] ! { Foreign }) : Unit ! { Foreign } =>
   @storage.truncate incoming 0
   @storage.truncate outgoing 0
-  append #[magic, version, U32.to_f32 schema, lanes.bit scenes] outgoing
+  outgoing := append #[magic, version, U32.to_f32 schema, lanes.bit scenes] self
   let initialized = false
   for ever:
-    use following <- host (seal (copy outgoing))
+    use following <- host outgoing
     lanes.require (following.length >= 2)
     let published = lanes.integer following[0] 1 == 1
     acknowledge access published
     @storage.truncate incoming 0
-    append following incoming
+    incoming := append following self
     let operation = lanes.integer incoming[1] 6
     if operation == stop:
       return ()
@@ -48,24 +48,12 @@ func run execute -> acknowledge -> (own access) -> (schema: U32) -> (scenes: Boo
     lanes.require (scenes or (operation != scene and operation != load_scene))
     @storage.truncate outgoing 0
     @storage.push outgoing (U32.to_f32 operation)
-    access := execute (own access) operation (&incoming[2..incoming.length]) outgoing
+    let (next_access, next_outgoing) = execute (own access) operation (&incoming[2..incoming.length]) (own outgoing)
+    access := next_access
+    outgoing := next_outgoing
     if operation == create or operation == restore:
       initialized := true
     // Invalid non-render output poisons this invocation; no partial mutation is
     // presented as a rolled-back world. Recover in a fresh guest from a snapshot.
     if operation != frame:
       lanes.require (valid_state outgoing)
-
-// game is a compile-known policy, not a stored runtime callback object. Each
-// operation takes the world over, appends only its response lanes to
-// outgoing, and returns the world. Snapshots and restores remain explicit.
-func execute game -> (own access) -> operation -> payload -> outgoing => case operation of
-  1 => game.create access outgoing
-  2 => game.frame access payload outgoing
-  3 => game.save access outgoing
-  4 => game.restore access payload outgoing
-  5 => game.scene access outgoing
-  6 => game.load_scene access payload outgoing
-  _ => panic "invalid game operation"
-func serve game -> (own access) -> incoming -> outgoing -> host =>
-  return run (execute game) game.acknowledge access game.schema game.scenes incoming outgoing host

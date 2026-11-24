@@ -48,7 +48,7 @@ const perspective = func (focal: F32) => func (aspect: F32) =>
   }
 
 // What the world looks like: the cube, five units in front of the eye.
-const view = func (world: World) -> (input: protocol.Input) -> (draws: #[~codec.MeshDraw]) =>
+const view = func (world: World) -> (input: protocol.Input) -> (draws: own #[codec.MeshDraw]) =>
   @storage.truncate draws 0
   let drawn = frame.header schema
   drawn.view := moved 0.0 0.0 (-5.0)
@@ -56,7 +56,7 @@ const view = func (world: World) -> (input: protocol.Input) -> (draws: #[~codec.
   drawn.clear := $types.Color { r: 0.08, g: 0.1, b: 0.14, a: 1.0 }
   drawn.light_direction := $types.Vector { x: -0.4, y: -1.0, z: -0.6 }
   @storage.push draws { mesh: meshes.cube, material: materials.cube, transform: turned world.angle }
-  return drawn
+  return (drawn, draws)
 
 // One frame: the arrows pressed change the speed, and the cube turns on.
 const step = func (world: World) => func (input: protocol.Input) =>
@@ -75,35 +75,39 @@ const step = func (world: World) => func (input: protocol.Input) =>
 // rolls simulation back.
 const acknowledge = func access -> published => ()
 type Access = {
-  world: World, events: #[~protocol.Event], draws: #[~codec.MeshDraw],
-  sounds: #[~types.Sound], rendered: #[~F32],
+  world: World, events: #[protocol.Event], draws: #[codec.MeshDraw],
+  sounds: #[types.Sound], rendered: #[F32],
 }
-const execute = func (access: own Access) -> operation -> payload -> outgoing =>
+const execute = func (access: own Access) -> operation -> payload -> (outgoing: own #[F32]) =>
   case operation of
     1 => do:
       access.world := create ()
-      program.append (save access.world) outgoing
+      outgoing := program.append (save access.world) self
     2 => do:
       let input = protocol.decode_input_into payload access.events
       let next = step access.world input
       access.world := next
-      let header = view next input access.draws
-      access.rendered := codec.encode_mesh_frame header (&access.draws[0..access.draws.length]) (&access.sounds[0..access.sounds.length]) access.rendered
-      program.append access.rendered outgoing
-    3 => program.append (save access.world) outgoing
+      let (header, next_draws) = view next input access.draws
+      access.draws := next_draws
+      let $protocol.Input { events } = input
+      access.events := events
+      access.rendered := codec.encode_mesh_frame header (&access.draws[0..access.draws.length]) (&access.sounds[0..access.sounds.length]) self
+      outgoing := program.append access.rendered self
+    3 => do:
+      outgoing := program.append (save access.world) self
     4 => do:
       access.world := restore payload
-      program.append (save access.world) outgoing
+      outgoing := program.append (save access.world) self
     _ => panic "scenes are not supported"
-  return access
+  return (access, outgoing)
 
 const run = func host =>
-  let events: #[~protocol.Event] = #[]
-  let draws: #[~codec.MeshDraw] = #[]
-  let sounds: #[~types.Sound] = #[]
-  let rendered: #[~F32] = #[]
-  let incoming: #[~F32] = #[]
-  let outgoing: #[~F32] = #[]
+  let events: #[protocol.Event] = #[]
+  let draws: #[codec.MeshDraw] = #[]
+  let sounds: #[types.Sound] = #[]
+  let rendered: #[F32] = #[]
+  let incoming: #[F32] = #[]
+  let outgoing: #[F32] = #[]
   let access: Access = {world: create (), events, draws, sounds, rendered}
   use program.run execute acknowledge access schema false incoming outgoing host
   return ()

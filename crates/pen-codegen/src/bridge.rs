@@ -138,11 +138,11 @@ pub fn emit(model: &Model, header: &[String]) -> String {
         "  return (packet[at + 18], packet[at + 19], packet[at + 20], packet[at + 21], packet[at + 22])".to_owned(),
         "func extra_count (context: Context) -> (at: U32) =>".to_owned(),
         format!("  return F32.to_u32 context.packet[at + {}]", tail.offset),
-        "func append_extra (context: Context) -> (at: U32) -> (encoded: #[~F32]) =>".to_owned(),
+        "func append_extra (context: Context) -> (at: U32) -> (encoded: own #[F32]): #[F32] =>".to_owned(),
         "  let first = extra_start context at".to_owned(),
         "  for lane in 0 .. extra_count context at * 4:".to_owned(),
         "    @storage.push encoded context.packet[first + lane]".to_owned(),
-        "  return ()".to_owned(),
+        "  return encoded".to_owned(),
         "func sprite_rect (context: Context) -> (at: U32) =>".to_owned(),
         "  let packet: #[F32] = context.packet".to_owned(),
         "  return (packet[at], packet[at + 1], packet[at + 2], packet[at + 3], packet[at + 4], packet[at + 5], packet[at + 6], packet[at + 7], F32.to_u32 packet[at + 12])".to_owned(),
@@ -168,7 +168,7 @@ pub fn emit(model: &Model, header: &[String]) -> String {
             projected(section, &mut out);
         }
     }
-    out.push("func reencode_views (packet: #[F32]) -> (destination: own #[~F32]) =>".to_owned());
+    out.push("func reencode_views (packet: #[F32]) -> (destination: own #[F32]) =>".to_owned());
     let mut start = model.header_lanes.to_string();
     for section in &model.sections {
         let name = s(&section.section["name"]);
@@ -244,7 +244,7 @@ pub fn emit(model: &Model, header: &[String]) -> String {
                         .join(" * ")
                 };
                 out.extend([
-                    format!("  let {name}: #[+U32] = #[]"),
+                    format!("  let {name}: #[U32] = #[]"),
                     format!("  let at = {name}_start"),
                     format!("  for 0 .. {name}_count:"),
                     format!("    @storage.push {name} at"),

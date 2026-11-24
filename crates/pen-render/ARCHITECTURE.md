@@ -647,7 +647,9 @@ such picture: the opaque draws themselves (so `fog_apply` is the identity there 
 shader serves both, the atmosphere pass misting what it draws), the shadow passes, a
 reflection probe's faces, insets and frames without a translucent pass. The scene group
 has 15 sampled textures in the fragment stage with the draw's three and the lights' one
-(it had 12; WebGPU allows 16 by default).
+(it had 12; WebGPU allows 16 by default): `renderer.rs`'s `scene_layout_entries`,
+`draw_layout_entries` and `lights::layout_entries` are the layouts' entries, a unit test counts
+them, and a device limited to 15 draws a frame of glass (`tests/materials_integration.rs`).
 
 **Compositing.** Each draw's destination already holds the mist to its own depth: the
 backdrop is the opaque surface misted to where it is, and each earlier translucent surface
@@ -949,6 +951,16 @@ host installs the logger. The `render_packet` example prints them with
   real sky and lights. `tests/standard_surface.rs` draws a row of materials, the base lobe as the old
   functions drew it, an anisotropic highlight's stretch against the reference and bricks with
   and without parallax (PNGs in /tmp/fidelity/materials).
+  `tests/materials_integration.rs` puts the merged material stack through the renderer from
+  a material's JSON (`surface.transmission`, `ior`, `thickness`) with f64 references: the stripes of a
+  wall seen through tilted slabs of glass at three indices against Snell's law and the
+  library's sampling rule (to 0.15 px; an index of 1 and a thin wall move nothing; a rougher glass
+  reads a blurrier level), a glass slab in the analytic mist against the closed form's composition
+  (refracted misted picture times what the glass lets through, misted again at the glass's own
+  depth, to 0.2 of a level of 255), a glass ball before a wall and pillars in mist
+  (/tmp/fidelity/materials/glass-in-fog-e.png), a transmission material drawn among the
+  translucent surfaces, casting no shadow and not instanced, and the layouts on a device of 15
+  sampled textures.
   `tests/subsurface.rs` holds the screen-space subsurface diffusion to an f64
   reference (see Subsurface scattering on the screen) and writes the head with and
   without it to /tmp/fidelity/materials/subsurface-e.png.

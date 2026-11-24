@@ -731,170 +731,183 @@ pub(crate) struct State {
     ready_sent: bool,
 }
 
-impl State {
-    pub fn new(device: wgpu::Device, queue: wgpu::Queue, options: RendererOptions) -> Result<Self> {
-        let scene_group = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("scene"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(SCENE_BYTES),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
-                    count: None,
-                },
-                // Every shadow map, the game's last (shadows.rs).
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // The sky as light: its reflection cube, the BRDF table, their
-                // sampler and the diffuse coefficients (environment.rs).
-                crate::environment::layout_entries()[0],
-                crate::environment::layout_entries()[1],
-                crate::environment::layout_entries()[2],
-                crate::environment::layout_entries()[3],
-                crate::environment::layout_entries()[4],
-                // The reflection probes' cubes and their table.
-                crate::environment::layout_entries()[5],
-                crate::environment::layout_entries()[6],
-                // The depth of this frame and last, and last frame's picture,
-                // which screen-space reflections read.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 12,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 13,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // The camera's depth, drawn for contact shadows (shadows.rs).
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // What translucent surfaces read (translucency.wgsl): the opaque
-                // picture with its chain of levels, its nearest depth, the froxel
-                // volume and the fog's block. Stand-ins where there is no such pass.
-                wgpu::BindGroupLayoutEntry {
-                    binding: 14,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 15,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 16,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 17,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(crate::volume::UNIFORM_BYTES),
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let texture_entry = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility,
+/// The scene group's layout (group 0 of every mesh pipeline): the scene uniform, the sun's
+/// maps, the sky as light, the reflection probes, the depth and picture of screen-space
+/// reflections, the camera's depth for contact shadows and what translucent surfaces read.
+pub(crate) fn scene_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
+    vec![
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(SCENE_BYTES),
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+            count: None,
+        },
+        // Every shadow map, the game's last (shadows.rs).
+        wgpu::BindGroupLayoutEntry {
+            binding: 3,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        },
+        // The sky as light: its reflection cube, the BRDF table, their
+        // sampler and the diffuse coefficients (environment.rs).
+        crate::environment::layout_entries()[0],
+        crate::environment::layout_entries()[1],
+        crate::environment::layout_entries()[2],
+        crate::environment::layout_entries()[3],
+        crate::environment::layout_entries()[4],
+        // The reflection probes' cubes and their table.
+        crate::environment::layout_entries()[5],
+        crate::environment::layout_entries()[6],
+        // The depth of this frame and last, and last frame's picture,
+        // which screen-space reflections read.
+        wgpu::BindGroupLayoutEntry {
+            binding: 12,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 13,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Texture {
                 sample_type: wgpu::TextureSampleType::Float { filterable: true },
                 view_dimension: wgpu::TextureViewDimension::D2,
                 multisampled: false,
             },
             count: None,
-        };
+        },
+        // The camera's depth, drawn for contact shadows (shadows.rs).
+        wgpu::BindGroupLayoutEntry {
+            binding: 9,
+            visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        // What translucent surfaces read (translucency.wgsl): the opaque
+        // picture with its chain of levels, its nearest depth, the froxel
+        // volume and the fog's block. Stand-ins where there is no such pass.
+        wgpu::BindGroupLayoutEntry {
+            binding: 14,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 15,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 16,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D3,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 17,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(crate::volume::UNIFORM_BYTES),
+            },
+            count: None,
+        },
+    ]
+}
+
+/// The draw group's layout (group 1): the draw's uniform, its texture and sampler, and the
+/// normal map and layer texture.
+pub(crate) fn draw_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
+    let texture_entry = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    vec![
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(DRAW_BYTES),
+            },
+            count: None,
+        },
+        texture_entry(1, wgpu::ShaderStages::FRAGMENT),
+        wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
+        // A normal map, or a field the vertices read too.
+        texture_entry(3, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+        texture_entry(4, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
+    ]
+}
+
+impl State {
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue, options: RendererOptions) -> Result<Self> {
+        let scene_group = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scene"),
+            entries: &scene_layout_entries(),
+        });
         let draw_group = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("draw"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: wgpu::BufferSize::new(DRAW_BYTES),
-                    },
-                    count: None,
-                },
-                texture_entry(1, wgpu::ShaderStages::FRAGMENT),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // A normal map, or a field the vertices read too.
-                texture_entry(3, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
-                texture_entry(4, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT),
-            ],
+            entries: &draw_layout_entries(),
         });
         let lights_group = crate::lights::group_layout(&device);
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1158,5 +1171,39 @@ mod tangent_tests {
         assert_eq!(zero_tangent_size(64, 1000, 20_000), 16_384);
         assert_eq!(zero_tangent_size(64, 1000, 16_100), 16_100);
         assert_eq!(zero_tangent_size(64, 1000, 100), 1000 * TANGENT_BYTES);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sampled textures the fragment stage of a mesh pipeline binds, across its groups.
+    fn fragment_textures(entries: &[wgpu::BindGroupLayoutEntry]) -> Vec<u32> {
+        entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry.ty, wgpu::BindingType::Texture { .. })
+                    && entry.visibility.contains(wgpu::ShaderStages::FRAGMENT)
+            })
+            .map(|entry| entry.binding)
+            .collect()
+    }
+
+    #[test]
+    fn a_mesh_pipelines_fragment_stage_samples_fifteen_textures_of_the_sixteen_webgpu_allows() {
+        let scene = fragment_textures(&scene_layout_entries());
+        let draw = fragment_textures(&draw_layout_entries());
+        let lights = fragment_textures(&crate::lights::layout_entries());
+        // The sun's map and cascades, the sky's cube and BRDF table, the reflection probes' cubes,
+        // the depth and picture of screen-space reflections, the camera's depth for contact shadows,
+        // and the opaque picture, its depth and the froxel volume (bindings 14 to 16, fragment only).
+        assert_eq!(scene, [1, 3, 4, 5, 10, 12, 13, 9, 14, 15, 16]);
+        // The draw's texture, its normal map and its layer texture; the local lights' shadow atlas.
+        assert_eq!(draw, [1, 3, 4]);
+        assert_eq!(lights, [4]);
+        let total = scene.len() + draw.len() + lights.len();
+        assert_eq!(total, 15, "a new binding must leave room under WebGPU's default of 16");
+        assert!(total <= 16);
     }
 }

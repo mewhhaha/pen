@@ -43,8 +43,9 @@ differ in it never share an instanced batch.
 | `emissiveStrength` | 1 | at least 0 |
 
 A material with `transmission` above 0 draws among the translucent surfaces
-even with an opaque `color` alpha (it reads the opaque picture behind it), and
-casts no shadow. Textures for these lobes are not supported.
+even with an opaque `color` alpha (it reads the opaque picture behind it), casts no
+shadow and does not share an instanced batch (the tests in `tests/materials_integration.rs`
+hold each of these to the renderer). Textures for these lobes are not supported.
 
 ## What a draw binds
 

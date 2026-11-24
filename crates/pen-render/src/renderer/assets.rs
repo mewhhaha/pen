@@ -416,6 +416,7 @@ impl State {
         let device = self.device.clone();
         match loaded {
             Loaded::Mesh(mesh) => {
+                let mesh = *mesh;
                 let vertex_bytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
                 let index_bytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
                 let instance_bytes: &[u8] =

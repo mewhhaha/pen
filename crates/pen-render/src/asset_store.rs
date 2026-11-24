@@ -136,7 +136,9 @@ pub(crate) struct Material {
     pub shadow: bool,
     /// The richer lobes: clear coat, sheen, anisotropy, transmission and
     /// volume, specular and emissive strength. Part of the render state.
-    pub surface: Surface,
+    /// Boxed: the loader's messages carry materials, and a material this big
+    /// would make its variants differ in size past what clippy accepts.
+    pub surface: Box<Surface>,
 }
 
 /// A material's `surface` block, as the draw uniform's last five `vec4f`s
@@ -146,23 +148,23 @@ pub(crate) struct Material {
 /// without the block has `Surface::default()`, which leaves every lobe off.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Surface {
-    pub clearcoat: f64,
-    pub clearcoat_roughness: f64,
-    pub sheen_color: [f64; 3],
-    pub sheen_roughness: f64,
-    pub anisotropy: f64,
+    pub clearcoat: f32,
+    pub clearcoat_roughness: f32,
+    pub sheen_color: [f32; 3],
+    pub sheen_roughness: f32,
+    pub anisotropy: f32,
     /// Radians.
-    pub anisotropy_rotation: f64,
-    pub transmission: f64,
-    pub ior: f64,
+    pub anisotropy_rotation: f32,
+    pub transmission: f32,
+    pub ior: f32,
     /// In model units; 0 is thin-walled.
-    pub thickness: f64,
-    pub attenuation_color: [f64; 3],
+    pub thickness: f32,
+    pub attenuation_color: [f32; 3],
     /// In model units; 0 is infinite.
-    pub attenuation_distance: f64,
-    pub specular: f64,
-    pub specular_color: [f64; 3],
-    pub emissive_strength: f64,
+    pub attenuation_distance: f32,
+    pub specular: f32,
+    pub specular_color: [f32; 3],
+    pub emissive_strength: f32,
 }
 
 impl Default for Surface {
@@ -199,7 +201,6 @@ impl Surface {
         let [sheen_r, sheen_g, sheen_b] = self.sheen_color;
         let [attenuation_r, attenuation_g, attenuation_b] = self.attenuation_color;
         let [specular_r, specular_g, specular_b] = self.specular_color;
-        #[allow(clippy::cast_possible_truncation, reason = "validated to fit float32")]
         [
             self.clearcoat,
             self.clearcoat_roughness,
@@ -222,7 +223,6 @@ impl Surface {
             specular_b,
             self.emissive_strength,
         ]
-        .map(|value| value as f32)
     }
 
     /// The block of a material's JSON: every key optional, the rest as
@@ -262,22 +262,26 @@ impl Surface {
                 format!("from {least} to {most}")
             }
         };
-        let number = |key: &str, default: f64, least: f64, most: f64| -> Result<f64> {
+        // Held to the range, and to the float32 the uniform holds.
+        #[allow(clippy::cast_possible_truncation, reason = "within float32's range, as the range says")]
+        let number = |key: &str, default: f32, least: f64, most: f64| -> Result<f32> {
             match block.get(key) {
                 None => Ok(default),
                 Some(value) => value
                     .as_f64()
                     .filter(|value| (least..=most).contains(value))
+                    .map(|value| value as f32)
                     .ok_or_else(|| anyhow!("material surface {key} must be a number {}", range(least, most))),
             }
         };
-        let channels = |key: &str, default: f64, most: f64| -> Result<[f64; 3]> {
+        #[allow(clippy::cast_possible_truncation, reason = "within float32's range, as the range says")]
+        let channels = |key: &str, default: f32, most: f64| -> Result<[f32; 3]> {
             let Some(value) = block.get(key) else { return Ok([default; 3]) };
             let invalid = || anyhow!("material surface {key} must be three numbers {}", range(0.0, most));
             let values = value.as_array().filter(|values| values.len() == 3).ok_or_else(invalid)?;
             let mut out = [0.0; 3];
             for (out, value) in out.iter_mut().zip(values) {
-                *out = value.as_f64().filter(|value| (0.0..=most).contains(value)).ok_or_else(invalid)?;
+                *out = value.as_f64().filter(|value| (0.0..=most).contains(value)).ok_or_else(invalid)? as f32;
             }
             Ok(out)
         };
@@ -791,7 +795,7 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
         scene_filter,
         decals,
         shadow,
-        surface: Surface::parse(material.get("surface"))?,
+        surface: Box::new(Surface::parse(material.get("surface"))?),
     })
 }
 
@@ -1099,15 +1103,15 @@ mod tests {
     #[test]
     fn a_material_without_a_surface_block_has_its_lobes_off() {
         let plain = parse_material(br#"{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit"}"#).unwrap();
-        assert_eq!(plain.surface, Surface::default());
+        assert_eq!(*plain.surface, Surface::default());
         // The documented defaults: ior 1.5, full specular, white colours, strength 1, the rest 0.
         assert_eq!(
             plain.surface.vectors(),
             [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
         );
         // An empty block and a null one say the same.
-        assert_eq!(material_with("{}").unwrap().surface, Surface::default());
-        assert_eq!(material_with("null").unwrap().surface, Surface::default());
+        assert_eq!(*material_with("{}").unwrap().surface, Surface::default());
+        assert_eq!(*material_with("null").unwrap().surface, Surface::default());
         assert!(plain.opaque() && plain.casts_shadow());
     }
 

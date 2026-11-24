@@ -183,7 +183,9 @@ const MESHES: [&str; 2] = ["with.mesh.json", "without.mesh.json"];
 
 #[test]
 fn a_meshs_tangents_reach_the_plain_pipeline_and_a_mesh_without_reads_zeros() {
-    let Some(mut rig) = Rig::new("plain", &MESHES, &["paint.material.json"], &files(BASE.to_owned())) else { return };
+    let Some(mut rig) = Rig::new("tangent-plain", &MESHES, &["paint.material.json"], &files(BASE.to_owned())) else {
+        return;
+    };
     let picture = rig.show(&shadowed(rows(0, 1)));
     let wrong = wrong_rows(&picture, &TANGENTS);
     // The zero stream is every vertex of the largest mesh; both meshes have twenty.
@@ -192,7 +194,8 @@ fn a_meshs_tangents_reach_the_plain_pipeline_and_a_mesh_without_reads_zeros() {
 
 #[test]
 fn instanced_draws_read_the_tangents_beside_their_instance_data() {
-    let Some(mut rig) = Rig::new("batch", &MESHES, &["paint.material.json"], &files(format!("{BASE}{INSTANCED}")))
+    let Some(mut rig) =
+        Rig::new("tangent-batch", &MESHES, &["paint.material.json"], &files(format!("{BASE}{INSTANCED}")))
     else {
         return;
     };
@@ -222,7 +225,7 @@ fn a_posed_skinned_mesh_reads_its_tangents_beside_its_joints() {
         ("tangent.wgsl", shader.into_bytes()),
         ("paint.material.json", material("tangent.wgsl")),
     ];
-    let Some(mut rig) = Rig::new("skin", &MESHES, &["paint.material.json"], &files) else { return };
+    let Some(mut rig) = Rig::new("tangent-skin", &MESHES, &["paint.material.json"], &files) else { return };
     let mut posed = shadowed(rows(0, 1));
     posed.poses = (0..3).map(|draw| Pose { draw, clip: 0, time: 0.0, weight: 1.0 }).collect();
     let picture = rig.show(&posed);
@@ -240,7 +243,7 @@ fn persistent_instances_read_the_tangents_of_their_template() {
         ("tangent.wgsl", shader.into_bytes()),
         ("paint.material.json", material("tangent.wgsl")),
     ];
-    let Some(mut rig) = Rig::new("persistent", &MESHES, &["paint.material.json"], &files) else { return };
+    let Some(mut rig) = Rig::new("tangent-persistent", &MESHES, &["paint.material.json"], &files) else { return };
     let picture = rig.show(&shadowed(rows(0, 1)));
     let wrong = wrong_rows(&picture, &TANGENTS);
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -253,7 +256,9 @@ fn a_brush_solid_reads_zero_tangents() {
         ("tangent.wgsl", BASE.as_bytes().to_vec()),
         ("paint.material.json", material("tangent.wgsl")),
     ];
-    let Some(mut rig) = Rig::new("solid", &["with.mesh.json"], &["paint.material.json"], &files) else { return };
+    let Some(mut rig) = Rig::new("tangent-solid", &["with.mesh.json"], &["paint.material.json"], &files) else {
+        return;
+    };
     // A box in front of the camera: its faces' vertices have no tangents.
     let faces = [
         ([1.0, 0.0, 0.0], 0.3),
@@ -296,7 +301,9 @@ fn a_mesh_larger_than_any_before_gets_zero_tangents_all_the_same() {
         ("tangent.wgsl", BASE.as_bytes().to_vec()),
         ("paint.material.json", material("tangent.wgsl")),
     ];
-    let Some(mut rig) = Rig::new("grow", &["with.mesh.json", "big.mesh.json"], &["paint.material.json"], &files) else {
+    let Some(mut rig) =
+        Rig::new("tangent-grow", &["with.mesh.json", "big.mesh.json"], &["paint.material.json"], &files)
+    else {
         return;
     };
     // The small one alone first, then the big one's arrival (a frame asking for it).
@@ -311,7 +318,8 @@ fn a_mesh_larger_than_any_before_gets_zero_tangents_all_the_same() {
 
 #[test]
 fn a_reloaded_mesh_swaps_its_tangents_for_the_new_ones_or_for_none() {
-    let Some(mut rig) = Rig::new("reload", &["with.mesh.json"], &["paint.material.json"], &files(BASE.to_owned()))
+    let Some(mut rig) =
+        Rig::new("tangent-reload", &["with.mesh.json"], &["paint.material.json"], &files(BASE.to_owned()))
     else {
         return;
     };

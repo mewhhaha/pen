@@ -37,6 +37,8 @@ pub fn moved(x: f32, y: f32) -> Matrix {
 }
 
 pub struct Rig {
+    name: String,
+    shots: usize,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub root: PathBuf,
@@ -77,7 +79,7 @@ impl Rig {
         )
         .unwrap();
         let target = Offscreen::new(&device, SIZE);
-        Some(Rig { device, queue, root, renderer, catalog, target })
+        Some(Rig { name: name.to_owned(), shots: 0, device, queue, root, renderer, catalog, target })
     }
 
     /// Draws `frame` once everything it names is loaded and compiled, and
@@ -98,7 +100,15 @@ impl Rig {
             std::thread::sleep(Duration::from_millis(5));
         }
         self.renderer.submit(frame, &self.catalog, &mut self.target).unwrap();
-        pixels(&self.device, &self.queue, &self.target.0)
+        let picture = pixels(&self.device, &self.queue, &self.target.0);
+        // With $PEN_SHOTS set, every picture is kept for a look.
+        if let Some(directory) = std::env::var_os("PEN_SHOTS") {
+            self.shots += 1;
+            let path = Path::new(&directory).join(format!("{}-{}.png", self.name, self.shots));
+            std::fs::create_dir_all(&directory).unwrap();
+            image::RgbaImage::from_raw(SIZE, SIZE, picture.as_flattened().to_vec()).unwrap().save(path).unwrap();
+        }
+        picture
     }
 }
 

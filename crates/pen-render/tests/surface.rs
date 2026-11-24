@@ -173,7 +173,8 @@ fn every_draw_of_a_plain_path_reads_its_materials_surface() {
         ("coated.material.json", surface_material("plain.wgsl", Some(&block), false)),
         ("bare.material.json", surface_material("plain.wgsl", None, false)),
     ];
-    let Some(mut rig) = Rig::new("plain", &["quad.mesh.json"], &["coated.material.json", "bare.material.json"], &files)
+    let Some(mut rig) =
+        Rig::new("surface-plain", &["quad.mesh.json"], &["coated.material.json", "bare.material.json"], &files)
     else {
         return;
     };
@@ -205,7 +206,8 @@ fn an_instanced_batch_reads_the_surface_of_its_material() {
         ("coated.material.json", surface_material("batch.wgsl", Some(&block), false)),
         ("bare.material.json", surface_material("batch.wgsl", None, false)),
     ];
-    let Some(mut rig) = Rig::new("batch", &["quad.mesh.json"], &["coated.material.json", "bare.material.json"], &files)
+    let Some(mut rig) =
+        Rig::new("surface-batch", &["quad.mesh.json"], &["coated.material.json", "bare.material.json"], &files)
     else {
         return;
     };
@@ -230,7 +232,8 @@ fn a_posed_skinned_draw_reads_the_surface_of_its_material() {
         ("coated.material.json", surface_material("skin.wgsl", Some(&block), false)),
         ("bare.material.json", surface_material("skin.wgsl", None, false)),
     ];
-    let Some(mut rig) = Rig::new("skin", &["quad.mesh.json"], &["coated.material.json", "bare.material.json"], &files)
+    let Some(mut rig) =
+        Rig::new("surface-skin", &["quad.mesh.json"], &["coated.material.json", "bare.material.json"], &files)
     else {
         return;
     };
@@ -268,7 +271,7 @@ fn materials_of_different_surfaces_never_share_a_batch() {
         ("other.material.json", surface_material("batch.wgsl", Some(&other), true)),
     ];
     let Some(mut rig) = Rig::new(
-        "state",
+        "surface-state",
         &["quad.mesh.json"],
         &["a.material.json", "same.material.json", "other.material.json"],
         &files,
@@ -300,7 +303,9 @@ fn a_reloaded_surface_replaces_the_one_a_material_drew_with() {
         ("batch.wgsl", shader.into_bytes()),
         ("paint.material.json", surface_material("batch.wgsl", None, false)),
     ];
-    let Some(mut rig) = Rig::new("reload", &["quad.mesh.json"], &["paint.material.json"], &files) else { return };
+    let Some(mut rig) = Rig::new("surface-reload", &["quad.mesh.json"], &["paint.material.json"], &files) else {
+        return;
+    };
     let draws = || -> Vec<Draw> { ALL.iter().map(|&which| draw(0, 0, which)).collect() };
     let picture = rig.show(&frame(draws()));
     let wrong = wrong_swatches(&picture, &ALL.map(|which| (which, &DEFAULTS)));
@@ -374,7 +379,7 @@ fn a_transmissive_material_blends_over_what_is_behind_it_even_with_an_opaque_alp
         ("glass.material.json", glass(json!({"transmission": 0.5}))),
     ];
     let Some(mut rig) = Rig::new(
-        "glass",
+        "surface-glass",
         &["behind.mesh.json", "quad.mesh.json"],
         &["red.material.json", "clear.material.json", "glass.material.json"],
         &files,
@@ -408,7 +413,9 @@ fn an_inset_reads_the_surface_of_its_material_too() {
         ("plain.wgsl", BASE.as_bytes().to_vec()),
         ("coated.material.json", surface_material("plain.wgsl", Some(&block), false)),
     ];
-    let Some(mut rig) = Rig::new("inset", &["quad.mesh.json"], &["coated.material.json"], &files) else { return };
+    let Some(mut rig) = Rig::new("surface-inset", &["quad.mesh.json"], &["coated.material.json"], &files) else {
+        return;
+    };
     let mut inset_frame = frame(Vec::new());
     inset_frame.insets.push(Inset {
         x: 0.0,

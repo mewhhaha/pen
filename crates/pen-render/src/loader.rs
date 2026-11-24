@@ -101,7 +101,8 @@ pub(crate) enum Message {
 }
 
 pub(crate) enum Loaded {
-    Mesh(Mesh),
+    // Boxed: a mesh is the largest thing a message carries, by far.
+    Mesh(Box<Mesh>),
     Material(Material),
     /// A shader's module; its pipelines compile in jobs of their own.
     Shader {
@@ -468,7 +469,7 @@ impl Worker {
         };
         let bytes = match prepared {
             Some(Prepared::Bytes(bytes)) => bytes,
-            Some(Prepared::Mesh(mesh)) => return self.send(loaded(Ok(Loaded::Mesh(*mesh)))),
+            Some(Prepared::Mesh(mesh)) => return self.send(loaded(Ok(Loaded::Mesh(mesh)))),
             Some(Prepared::Material(material)) => {
                 return self.send(loaded(self.material(key, Ok(material)).map(Loaded::Material)));
             }
@@ -499,7 +500,7 @@ impl Worker {
         };
         let device = &self.context.device;
         match kind {
-            AssetKind::Mesh => self.send(loaded(parse_mesh(&bytes).map(Loaded::Mesh))),
+            AssetKind::Mesh => self.send(loaded(parse_mesh(&bytes).map(|mesh| Loaded::Mesh(Box::new(mesh))))),
             AssetKind::Material => {
                 let material = self.material(key, parse_material(&bytes));
                 self.send(loaded(material.map(Loaded::Material)));

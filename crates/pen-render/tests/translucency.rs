@@ -1409,6 +1409,7 @@ fn decals_lie_on_the_opaque_surfaces_beneath_translucent_ones() {
     rig.load(4);
     let bare = rig.settle(&frame_without_decals(&frame), 2);
     let painted = rig.settle(&frame, 2);
+    save("translucency-decals-plain.png", &painted, rig.size);
     // Where the decal lies the wall is painted: x of 2 units right of the middle, at depth 20.
     let (x, y) = (32 + (2.0 / (20.0 * 0.5) * 32.0) as u32, 32);
     assert!(largest_difference(rig.pixel(&bare, x, y), rgb(WALL)) < LEVELS);
@@ -1418,6 +1419,7 @@ fn decals_lie_on_the_opaque_surfaces_beneath_translucent_ones() {
     let mut with_pane = frame.clone();
     with_pane.draws.push(draw(0, 1, view.placed(10.0, 4.0, (2.0, 0.0))));
     let covered = rig.settle(&with_pane, 2);
+    save("translucency-decals-pane.png", &covered, rig.size);
     let expected = over([f64::from(PANE[0]), f64::from(PANE[1]), f64::from(PANE[2])], 0.5, [0.6, 0.2, 0.2]);
     assert!(
         largest_difference(rig.pixel(&covered, x, y), expected) < LEVELS,

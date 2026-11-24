@@ -37,10 +37,10 @@ use pen_protocol::boundary::{
 };
 use pen_protocol::{
     Aberration, BoneMatrix, Bus, Cascade, Catalog, Clouds, Color, Decal, Dof, Draw, Drift, Emitter, Exposure,
-    FieldPatch, Fog, FogVolume, Frame, GameEvent, Grade, Inset, Instance, InstanceRemoval, Light, Listener,
+    FieldPatch, Fog, FogVolume, Frame, GameEvent, Grade, Haptic, Inset, Instance, InstanceRemoval, Light, Listener,
     MorphWeight, Motion, MotionBlur, Panner, Pose, Probe, ProbeVolume, Quality, Reflection, ReflectionProbe,
-    RenderFrame, RibbonPoint, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode, Vector, Viewport,
-    Voice, service, ui_live, ui_role, ui_state,
+    RenderFrame, ReverbRoom, RibbonPoint, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite, UiNode, Vector,
+    Viewport, Voice, service, ui_live, ui_role, ui_state,
 };
 
 const HARNESS: &str = include_str!("codec_round_trip.blot");
@@ -676,6 +676,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             aperture: rng.number(),
             max_blur: rng.number(),
         },
+        reverb: ReverbRoom { decay: rng.number(), damping: rng.number() },
         clouds: Clouds { cover: rng.number(), drift: Drift { x: rng.number(), z: rng.number() } },
         exposure: Exposure {
             auto: rng.flag(),
@@ -854,7 +855,18 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
         },
         buses: {
             let count = if rng.one_in(10) { MAX_BUSES } else { rng.count(4) };
-            rng.list(count, |rng| Bus { gain: rng.number(), lowpass: rng.number(), reverb: rng.number() })
+            rng.list(count, |rng| Bus {
+                gain: rng.number(),
+                lowpass: rng.number(),
+                reverb: rng.number(),
+                comp_threshold: rng.number(),
+                comp_ratio: rng.number(),
+                duck_bus: rng.whole(15),
+                duck_amount: rng.number(),
+                eq_low_db: rng.number(),
+                eq_mid_db: rng.number(),
+                eq_high_db: rng.number(),
+            })
         },
         voices: rng.list(voices, |rng| Voice {
             id: rng.whole(u32::try_from(MAX_VOICE_ID).unwrap()),
@@ -948,6 +960,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 cone_inner: rng.number(),
                 cone_outer: rng.number(),
                 cone_outer_gain: rng.number(),
+                hrtf: rng.flag(),
             })
         },
         // The game's own sections follow the packet, and only a checkout that
@@ -998,6 +1011,15 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 width: rng.number(),
                 color: Color { r: rng.number(), g: rng.number(), b: rng.number(), a: rng.number() },
                 soft_depth: rng.number(),
+            })
+        },
+        haptics: {
+            let count = rng.count(4);
+            rng.list(count, |rng| Haptic {
+                pad: rng.whole(15),
+                low: rng.number(),
+                high: rng.number(),
+                duration: rng.number(),
             })
         },
         emitters: {
@@ -1055,7 +1077,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
 }
 
 /// What `sections` reports of a frame, in its order.
-const SECTIONS: [&str; 28] = [
+const SECTIONS: [&str; 29] = [
     "draws",
     "draw parameters",
     "draw extras",
@@ -1084,6 +1106,7 @@ const SECTIONS: [&str; 28] = [
     "morph weights",
     "motions",
     "ribbons",
+    "haptics",
 ];
 
 /// Which of `SECTIONS` a frame holds any of.
@@ -1118,5 +1141,6 @@ fn sections(frame: &RenderFrame) -> [bool; SECTIONS.len()] {
         !frame.morph_weights.is_empty(),
         !frame.motions.is_empty(),
         !frame.ribbons.is_empty(),
+        !frame.haptics.is_empty(),
     ]
 }

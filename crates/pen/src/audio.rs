@@ -71,10 +71,23 @@ pub fn mix(frame: &RenderFrame, catalog: &Catalog, clips: &HashMap<String, Arc<C
     let clip = |index: u32| clips.get(catalog.sound(index)).cloned();
     let placements = Placements::of(frame);
     Mix {
+        reverb_decay: frame.reverb.decay,
+        reverb_damping: frame.reverb.damping,
         buses: frame
             .buses
             .iter()
-            .map(|bus| BusSpec { gain: bus.gain, lowpass: bus.lowpass, reverb: bus.reverb })
+            .map(|bus| BusSpec {
+                gain: bus.gain,
+                lowpass: bus.lowpass,
+                reverb: bus.reverb,
+                comp_threshold: bus.comp_threshold,
+                comp_ratio: bus.comp_ratio,
+                duck_bus: bus.duck_bus as usize,
+                duck_amount: bus.duck_amount,
+                eq_low_db: bus.eq_low_db,
+                eq_mid_db: bus.eq_mid_db,
+                eq_high_db: bus.eq_high_db,
+            })
             .collect(),
         voices: frame
             .voices
@@ -521,11 +534,21 @@ mod tests {
                     Vec::new()
                 };
                 let buses = vec![
-                    BusSpec { gain: 0.9, lowpass: OPEN, reverb: 1.0 },
-                    BusSpec { gain: if frame / 7 % 2 == 0 { 1.0 } else { 0.5 }, lowpass: OPEN, reverb: 0.1 },
-                    BusSpec { gain: 1.0, lowpass: if frame / 11 % 2 == 0 { 1000.0 } else { OPEN }, reverb: 0.0 },
+                    BusSpec { gain: 0.9, lowpass: OPEN, reverb: 1.0, ..BusSpec::default() },
+                    BusSpec {
+                        gain: if frame / 7 % 2 == 0 { 1.0 } else { 0.5 },
+                        lowpass: OPEN,
+                        reverb: 0.1,
+                        ..BusSpec::default()
+                    },
+                    BusSpec {
+                        gain: 1.0,
+                        lowpass: if frame / 11 % 2 == 0 { 1000.0 } else { OPEN },
+                        reverb: 0.0,
+                        ..BusSpec::default()
+                    },
                 ];
-                Mix { buses, voices, sounds }
+                Mix { buses, voices, sounds, ..Mix::default() }
             })
             .collect();
         let out = live(frames);

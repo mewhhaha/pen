@@ -156,6 +156,11 @@ impl Gamepads {
     pub fn keys(&self) -> Vec<u64> {
         self.slots.iter().flatten().map(|slot| slot.key).collect()
     }
+
+    /// The host's key for pad index `pad`, if connected.
+    pub fn key_for(&self, pad: u32) -> Option<u64> {
+        self.slots.get(pad as usize)?.as_ref().map(|slot| slot.key)
+    }
 }
 
 #[cfg(test)]

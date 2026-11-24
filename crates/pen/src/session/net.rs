@@ -11,7 +11,7 @@ use winit::window::Window;
 
 use super::{KEEP_SECONDS, Quiet, Recorded, Session, Shell, hash_lanes, timeline};
 use crate::devlog::{self, Source};
-use crate::net::{Net, Spec, Udp};
+use crate::net::{Net, Spec};
 
 impl Session {
     /// Joins the net session `spec` names: its frames keep moments to roll
@@ -21,14 +21,14 @@ impl Session {
             crate::project::game_fingerprint(&self.paths.game).context("reading the game for the net session")?;
         let moment = self.runtime.moment()?;
         let viewport = Viewport { width: self.gpu.size.0, height: self.gpu.size.1 };
-        let link = Box::new(Udp::bind(spec)?);
+        let link = spec.connect()?;
         self.net = Some(Net::start(spec, link, build, &moment, viewport)?);
         self.timeline.keep_history(Some(KEEP_SECONDS));
         self.runtime.hash_packets(true);
         self.overlap.enabled = false;
         devlog::info(
             Source::Session,
-            format!("net: player {} of {}, waiting for the others", spec.player, spec.addresses.len()),
+            format!("net: player {} of {}, waiting for the others", spec.player, spec.players()),
         );
         Ok(())
     }

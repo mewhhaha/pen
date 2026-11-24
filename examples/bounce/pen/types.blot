@@ -91,6 +91,13 @@ type Bus is data = $Bus {
   gain: F32,
   lowpass: F32,
   reverb: F32,
+  comp_threshold: F32,
+  comp_ratio: F32,
+  duck_bus: U32,
+  duck_amount: F32,
+  eq_low_db: F32,
+  eq_mid_db: F32,
+  eq_high_db: F32,
 }
 
 type Voice is data = $Voice {
@@ -213,6 +220,7 @@ type Panner is data = $Panner {
   cone_inner: F32,
   cone_outer: F32,
   cone_outer_gain: F32,
+  hrtf: Bool,
 }
 
 type Instance is data = $Instance {
@@ -257,6 +265,13 @@ type RibbonPoint is data = $RibbonPoint {
   width: F32,
   color: Color,
   soft_depth: F32,
+}
+
+type Haptic is data = $Haptic {
+  pad: U32,
+  low: F32,
+  high: F32,
+  duration: F32,
 }
 
 type Solid is data = $Solid {
@@ -441,6 +456,11 @@ type Dof is data = $Dof {
   max_blur: F32,
 }
 
+type ReverbRoom is data = $ReverbRoom {
+  decay: F32,
+  damping: F32,
+}
+
 type RenderHeader = {
   schema: U32,
   save_requested: Bool,
@@ -476,4 +496,5 @@ type RenderHeader = {
   reflection: Reflection,
   motion_blur: MotionBlur,
   dof: Dof,
+  reverb: ReverbRoom,
 }

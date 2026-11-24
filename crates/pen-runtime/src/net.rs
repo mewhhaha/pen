@@ -32,10 +32,12 @@
 //! who play them as a replay does.
 pub mod inputs;
 pub mod play;
+pub mod relay;
 pub mod stream;
 pub mod wire;
 
 pub use play::{Desync, Link, Netplay, Settings, Stats};
+pub use relay::{ChannelLink, RelayBroker, RelayPacket, Transport};
 
 #[cfg(test)]
 mod tests;

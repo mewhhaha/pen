@@ -6,8 +6,11 @@
 //! SDL's controller database; its own filters are off, so pen-runtime's dead
 //! zone is the only one, as in the browser. Only a window reads pads: a
 //! headless run's pads are its script's.
+use std::collections::HashMap;
+
+use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Repeat, Replay, Ticks};
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs, GilrsBuilder};
-use pen_protocol::{GameEvent, gamepad_axis, gamepad_button};
+use pen_protocol::{GameEvent, Haptic, gamepad_axis, gamepad_button};
 use pen_runtime::gamepad::{Gamepads, Pad};
 
 /// gilrs's buttons by the standard gamepad's.
@@ -74,15 +77,29 @@ fn key(id: GamepadId) -> u64 {
 pub struct Pads {
     gilrs: Gilrs,
     gamepads: Gamepads,
+    ids: HashMap<u64, GamepadId>,
+    effects: HashMap<u32, Effect>,
 }
 
 impl Pads {
     /// gilrs, or None (and the game plays without pads) where it cannot
     /// read them: no udev, no permission, or a platform it does not know.
     pub fn open() -> Option<Pads> {
-        let built = GilrsBuilder::new().with_default_filters(false).with_force_feedback(false).build();
+        let built = match GilrsBuilder::new()
+            .with_default_filters(false)
+            .with_force_feedback(true)
+            .build()
+        {
+            Ok(gilrs) => Ok(gilrs),
+            Err(_) => GilrsBuilder::new().with_default_filters(false).with_force_feedback(false).build(),
+        };
         match built {
-            Ok(gilrs) => Some(Pads { gilrs, gamepads: Gamepads::default() }),
+            Ok(gilrs) => Some(Pads {
+                gilrs,
+                gamepads: Gamepads::default(),
+                ids: HashMap::new(),
+                effects: HashMap::new(),
+            }),
             Err(error) => {
                 eprintln!("gamepads are off: {error}");
                 None
@@ -94,13 +111,64 @@ impl Pads {
     /// gilrs saw, so a press shorter than a frame is not lost.
     pub fn poll(&mut self, events: &mut Vec<GameEvent>) {
         while let Some(event) = self.gilrs.next_event() {
+            let k = key(event.id);
             match event.event {
-                EventType::Disconnected => self.gamepads.disconnect(key(event.id), events),
+                EventType::Disconnected => {
+                    self.ids.remove(&k);
+                    self.gamepads.disconnect(k, events);
+                }
                 EventType::Dropped | EventType::ForceFeedbackEffectCompleted => {}
                 _ => {
+                    self.ids.insert(k, event.id);
                     let pad = read(&self.gilrs.gamepad(event.id));
-                    self.gamepads.update(key(event.id), &pad, events);
+                    self.gamepads.update(k, &pad, events);
                 }
+            }
+        }
+    }
+
+    /// Drives dual-motor force feedback on connected gamepads from frame haptic commands.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped motor magnitude and ms")]
+    pub fn apply_haptics(&mut self, haptics: &[Haptic]) {
+        for cmd in haptics {
+            let Some(k) = self.gamepads.key_for(cmd.pad) else { continue };
+            let Some(&id) = self.ids.get(&k) else { continue };
+            if !self.gilrs.gamepad(id).is_ff_supported() {
+                continue;
+            }
+            if let Some(old) = self.effects.remove(&cmd.pad) {
+                let _ = old.stop();
+            }
+            let low = if cmd.low.is_finite() { cmd.low.clamp(0.0, 1.0) } else { 0.0 };
+            let high = if cmd.high.is_finite() { cmd.high.clamp(0.0, 1.0) } else { 0.0 };
+            if low <= 0.0 && high <= 0.0 {
+                continue;
+            }
+            let ms = if cmd.duration.is_finite() && cmd.duration > 0.0 {
+                (cmd.duration.clamp(0.016, 10.0) * 1000.0).round() as u32
+            } else {
+                50
+            };
+            let scheduling = Replay { play_for: Ticks::from_ms(ms), ..Default::default() };
+            let mut builder = EffectBuilder::new();
+            if low > 0.0 {
+                builder.add_effect(BaseEffect {
+                    kind: BaseEffectType::Strong { magnitude: (low * 65535.0).round() as u16 },
+                    scheduling,
+                    ..Default::default()
+                });
+            }
+            if high > 0.0 {
+                builder.add_effect(BaseEffect {
+                    kind: BaseEffectType::Weak { magnitude: (high * 65535.0).round() as u16 },
+                    scheduling,
+                    ..Default::default()
+                });
+            }
+            if let Ok(effect) = builder.repeat(Repeat::For(Ticks::from_ms(ms))).gamepads(&[id]).finish(&mut self.gilrs)
+            {
+                let _ = effect.play();
+                self.effects.insert(cmd.pad, effect);
             }
         }
     }

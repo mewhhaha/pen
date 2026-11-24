@@ -274,6 +274,22 @@ pub fn hash_lanes(lanes: &[f32]) -> u64 {
     hash
 }
 
+/// FNV-1a over a canonical render packet's lanes, normalizing the restore-only
+/// `exposure.cut` presentation hint so replays, spectating, and netplay rollbacks
+/// hash identically to a straight run.
+fn hash_render_packet(packet: &[f32]) -> u64 {
+    let canonical = pen_protocol::canonical_render_packet(packet);
+    let cut_lane = pen_protocol::boundary::lanes::header::EXPOSURE_CUT;
+    let mut hash = 0xcbf29ce484222325u64;
+    for (index, &lane) in canonical.iter().enumerate() {
+        let value = if index == cut_lane { 0.0f32 } else { lane };
+        for byte in value.to_bits().to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+        }
+    }
+    hash
+}
+
 impl<B: Backend> GameRuntime<B> {
     pub async fn new(
         engine: &B,
@@ -522,7 +538,7 @@ impl<B: Backend> GameRuntime<B> {
         self.active.accept();
         self.snapshot = None;
         if self.hashing {
-            self.packet_hash = hash_lanes(&pen_protocol::canonical_render_packet(&packet));
+            self.packet_hash = hash_render_packet(&packet);
         }
         self.packet_lanes = packet.len();
         if self.keeping {

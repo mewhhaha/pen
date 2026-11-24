@@ -362,11 +362,11 @@ mod tests {
                     Vec::new()
                 };
                 let buses = vec![
-                    BusSpec { gain: 1.0, lowpass: OPEN, reverb: 1.0 },
-                    BusSpec { gain: 0.9, lowpass: OPEN, reverb: 0.3 },
-                    BusSpec { gain: 0.7, lowpass: 5000.0, reverb: 0.0 },
+                    BusSpec { gain: 1.0, lowpass: OPEN, reverb: 1.0, ..BusSpec::default() },
+                    BusSpec { gain: 0.9, lowpass: OPEN, reverb: 0.3, ..BusSpec::default() },
+                    BusSpec { gain: 0.7, lowpass: 5000.0, reverb: 0.0, ..BusSpec::default() },
                 ];
-                Mix { buses, voices: if frame < 70 { vec![voice] } else { Vec::new() }, sounds }
+                Mix { buses, voices: if frame < 70 { vec![voice] } else { Vec::new() }, sounds, ..Mix::default() }
             })
         };
         // 24 frames a second: 2000 samples each, not a whole number of quanta.

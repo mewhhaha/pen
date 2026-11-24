@@ -521,7 +521,7 @@ mod tests {
             for r in reqs {
                 packet.extend_from_slice(r);
             }
-            packet.extend([0.75, 1.0, 0.25]); // 1 bus record after services
+            packet.extend([0.75, 1.0, 0.25, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]); // 1 bus record after services
             packet
         };
         let platform = req(1, service::PLATFORM, platform_op::OS, &[]);

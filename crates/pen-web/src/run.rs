@@ -616,6 +616,7 @@ impl Browser {
         rendered: RenderFrame,
     ) -> Result<bool> {
         self.audio.submit(&rendered, &self.catalog).await;
+        self.input.borrow().apply_haptics(&rendered.haptics);
         self.services.rendered(&rendered, &self.catalog);
         if let Some(values) = &rendered.preferences {
             self.preferences.store(values);

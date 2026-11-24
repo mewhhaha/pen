@@ -112,6 +112,7 @@ pub struct Placement {
     pub cone_inner: f64,
     pub cone_outer: f64,
     pub cone_outer_gain: f64,
+    pub hrtf: bool,
 }
 
 /// A value the browser's setter would take, else `otherwise`.
@@ -139,6 +140,7 @@ impl Placement {
             cone_inner: finite(panner.cone_inner, 360.0),
             cone_outer: finite(panner.cone_outer, 360.0),
             cone_outer_gain: finite(panner.cone_outer_gain, 0.0).clamp(0.0, 1.0),
+            hrtf: panner.hrtf,
         }
     }
 

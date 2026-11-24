@@ -153,4 +153,8 @@ func header (schema: U32): types.RenderHeader => {
     aperture: 0.0,
     max_blur: 0.025,
   },
+  reverb: $types.ReverbRoom {
+    decay: 0.0,
+    damping: 0.0,
+  },
 }

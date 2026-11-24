@@ -190,6 +190,11 @@
       "doc": "The most ribbon trail control points one frame may declare."
     },
     {
+      "limit": "MAX_HAPTICS",
+      "value": 32,
+      "doc": "The most gamepad haptic rumble commands one frame may declare."
+    },
+    {
       "limit": "MAX_BUSES",
       "value": 16,
       "doc": "The most buses one frame may declare, the master (bus 0) included."
@@ -1663,6 +1668,10 @@
       "dof": {
         "type": "Dof",
         "doc": "Bokeh depth of field applied in linear HDR light after TAA and before motion blur and bloom."
+      },
+      "reverb": {
+        "type": "ReverbRoom",
+        "doc": "Shared reverb room RT60 decay and high-frequency damping; zeros use the default 1.5 s room."
       }
     },
     "header": {
@@ -2570,6 +2579,21 @@
         "kind": "size",
         "section": "ribbons",
         "of": "count"
+      },
+      "reverb.decay": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Shared reverb RT60 decay time in seconds; 0 uses the default 1.5 s room."
+      },
+      "reverb.damping": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Shared reverb high-frequency damping in 0..1; 0 uses the default curve, higher values darken the room faster."
+      },
+      "haptic_count": {
+        "kind": "size",
+        "section": "haptics",
+        "of": "count"
       }
     },
     "sections": [
@@ -3227,6 +3251,35 @@
             "reverb": {
               "kind": "f32",
               "doc": "How much of it goes to the shared reverb; on the master, how loud the reverb comes back."
+            },
+            "comp_threshold": {
+              "kind": "f32",
+              "doc": "Linear compressor threshold in (0, 1]; 0 disables bus compression."
+            },
+            "comp_ratio": {
+              "kind": "f32",
+              "doc": "Compressor ratio (>= 1.0); values <= 1.0 disable bus compression."
+            },
+            "duck_bus": {
+              "kind": "count",
+              "max": 15,
+              "doc": "Bus index whose RMS level ducks this bus when `duck_amount > 0`."
+            },
+            "duck_amount": {
+              "kind": "f32",
+              "doc": "Sidechain ducking attenuation share in 0..1; 0 disables ducking."
+            },
+            "eq_low_db": {
+              "kind": "f32",
+              "doc": "Low-shelf EQ gain at 200 Hz in dB; 0 bypasses."
+            },
+            "eq_mid_db": {
+              "kind": "f32",
+              "doc": "Peaking EQ gain at 1000 Hz (Q=1.0) in dB; 0 bypasses."
+            },
+            "eq_high_db": {
+              "kind": "f32",
+              "doc": "High-shelf EQ gain at 4000 Hz in dB; 0 bypasses."
             }
           },
           "doc": "A bus: the voices and sounds on it mix through its lowpass and gain into the master, and `reverb` of that goes to the shared reverb, as do their own sends through its lowpass and gain. Bus 0 is the master: everything passes through it last, the reverb's return included."
@@ -3948,6 +4001,10 @@
             },
             "cone_outer_gain": {
               "kind": "f32"
+            },
+            "hrtf": {
+              "kind": "flag",
+              "doc": "Enable HRTF binaural spatialization (ITD delay and head-shadowing ILD natively, PanningModelType::Hrtf in WebAudio) instead of equal-power panning."
             }
           },
           "doc": "Where a voice or sound is, as a PannerNode places it: from the listener, equal-power panned by its azimuth (in place of its pan), and quieted by its distance model and its cone. Positions and orientations glide as gains do (AUDIO_GLIDE_MS); the rest change at once. A voice that gains or loses its panner starts afresh, as one whose bus changed; a panner that places nothing is ignored, and of two for one voice or sound hosts take the first."
@@ -4192,6 +4249,40 @@
           "limit": "MAX_RIBBONS",
           "value": 65536,
           "doc": "The most ribbon trail control points one frame may declare."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "haptics",
+        "doc": "Dual-motor gamepad rumble / haptic commands for connected controllers.",
+        "record": {
+          "name": "Haptic",
+          "constant": "HAPTIC",
+          "fields": {
+            "pad": {
+              "kind": "count",
+              "max": 15,
+              "doc": "Gamepad index (0 to MAX_GAMEPADS - 1)."
+            },
+            "low": {
+              "kind": "f32",
+              "doc": "Low-frequency (strong) motor intensity in 0..1."
+            },
+            "high": {
+              "kind": "f32",
+              "doc": "High-frequency (weak) motor intensity in 0..1."
+            },
+            "duration": {
+              "kind": "f32",
+              "doc": "Pulse duration in seconds (0 stops rumble or applies for one frame)."
+            }
+          },
+          "doc": "Dual-motor haptic feedback command for one gamepad."
+        },
+        "max": {
+          "limit": "MAX_HAPTICS",
+          "value": 32,
+          "doc": "The most gamepad haptic rumble commands one frame may declare."
         }
       },
       {

@@ -308,6 +308,15 @@ impl Input {
         }
     }
 
+    /// Drives gamepad rumble motors from the rendered frame's haptic commands.
+    pub fn apply_haptics(&mut self, haptics: &[pen_protocol::Haptic]) {
+        if !haptics.is_empty()
+            && let Some(pads) = &mut self.pads
+        {
+            pads.apply_haptics(haptics);
+        }
+    }
+
     pub fn device_event(&mut self, event: &DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
             && self.locked

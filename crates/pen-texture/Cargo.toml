@@ -11,11 +11,12 @@ workspace = true
 [features]
 # What the asset pipeline needs beside reading: the block encoders, mip
 # chains and font atlases. The renderer only reads.
-tools = ["dep:skrifa"]
+tools = ["dep:skrifa", "dep:read-fonts"]
 
 [dependencies]
 anyhow.workspace = true
 flate2 = "1"
+read-fonts = { version = "0.45", optional = true }
 skrifa = { version = "0.48", optional = true }
 
 [dev-dependencies]

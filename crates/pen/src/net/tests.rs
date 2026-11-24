@@ -72,6 +72,42 @@ fn udp_carries_datagrams_between_listed_peers_only() {
     assert_eq!(second.receive(), None);
 }
 
+#[test]
+fn relay_spec_and_loopback_tcp_relay_route_peer_datagrams() {
+    let mut server = TcpRelayServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    let spec0 = Spec::parse(&format!("relay:0/2@{addr}/match-room#42")).unwrap();
+    let spec1 = Spec::parse(&format!("relay:1/2@{addr}/match-room#42")).unwrap();
+    assert_eq!(spec0.players(), 2);
+    assert_eq!(spec1.player, 1);
+
+    let mut link0 = spec0.connect().unwrap();
+    let mut link1 = spec1.connect().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    // Pump join handshakes through the relay server.
+    for _ in 0..20 {
+        server.poll();
+        let _ = link0.receive();
+        let _ = link1.receive();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    link0.send(1, b"PNET-0-TO-1");
+    link1.send(0, b"PNET-1-TO-0");
+    let (mut got0, mut got1) = (None, None);
+    while (got0.is_none() || got1.is_none()) && Instant::now() < deadline {
+        server.poll();
+        if got0.is_none() {
+            got0 = link0.receive();
+        }
+        if got1.is_none() {
+            got1 = link1.receive();
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(got1, Some((0, b"PNET-0-TO-1".to_vec())));
+    assert_eq!(got0, Some((1, b"PNET-1-TO-0".to_vec())));
+}
+
 /// A link that holds what it sends for `latency` before handing it to UDP,
 /// as a long way would.
 struct Late {

@@ -306,6 +306,41 @@ impl Input {
         }
     }
 
+    /// Triggers dual-rumble haptic pulses on connected gamepads supporting `vibrationActuator`.
+    pub fn apply_haptics(&self, haptics: &[pen_protocol::Haptic]) {
+        if haptics.is_empty() {
+            return;
+        }
+        let Ok(list) = web_sys::window().unwrap().navigator().get_gamepads() else { return };
+        for cmd in haptics {
+            let Some(key) = self.gamepads.key_for(cmd.pad) else { continue };
+            for gamepad in list.iter().filter_map(|g| g.dyn_into::<Gamepad>().ok()) {
+                if !gamepad.connected() || u64::from(gamepad.index()) != key {
+                    continue;
+                }
+                let Ok(actuator) = js_sys::Reflect::get(&gamepad, &"vibrationActuator".into()) else { continue };
+                if actuator.is_null() || actuator.is_undefined() {
+                    continue;
+                }
+                let Ok(play) = js_sys::Reflect::get(&actuator, &"playEffect".into()) else { continue };
+                let Ok(func) = play.dyn_into::<js_sys::Function>() else { continue };
+                let low = if cmd.low.is_finite() { f64::from(cmd.low.clamp(0.0, 1.0)) } else { 0.0 };
+                let high = if cmd.high.is_finite() { f64::from(cmd.high.clamp(0.0, 1.0)) } else { 0.0 };
+                let duration_ms = if cmd.duration.is_finite() && cmd.duration > 0.0 {
+                    f64::from(cmd.duration.clamp(0.016, 10.0)) * 1000.0
+                } else {
+                    50.0
+                };
+                let params = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(&params, &"startDelay".into(), &0.0.into());
+                let _ = js_sys::Reflect::set(&params, &"duration".into(), &duration_ms.into());
+                let _ = js_sys::Reflect::set(&params, &"strongMagnitude".into(), &low.into());
+                let _ = js_sys::Reflect::set(&params, &"weakMagnitude".into(), &high.into());
+                let _ = func.call2(&actuator, &"dual-rumble".into(), &params);
+            }
+        }
+    }
+
     /// The game's focused text box (in backing pixels), or None: the
     /// hidden field takes the focus over it, so an input method's window
     /// opens there, or gives it back to the canvas.

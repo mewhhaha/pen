@@ -455,13 +455,27 @@ func service_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
 func buse_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
-  for 0 .. 3:
+  for 0 .. 10:
     @storage.push stream.output 0.0
   stream.output[base + 0] := canonical[at + 0]
   at := at + 1
   stream.output[base + 1] := canonical[at + 0]
   at := at + 1
   stream.output[base + 2] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 3] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 4] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 5] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 6] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 7] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 8] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 9] := canonical[at + 0]
   at := at + 1
   stream.at := at
   return stream
@@ -791,7 +805,7 @@ func listener_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
 func panner_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
-  for 0 .. 15:
+  for 0 .. 16:
     @storage.push stream.output 0.0
   stream.output[base + 0] := canonical[at + 0]
   at := at + 1
@@ -818,6 +832,8 @@ func panner_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   stream.output[base + 13] := canonical[at + 0]
   at := at + 1
   stream.output[base + 14] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 15] := canonical[at + 0]
   at := at + 1
   stream.at := at
   return stream
@@ -975,6 +991,22 @@ func ribbon_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   stream.output[base + 10] := canonical[at + 3]
   at := at + 4
   stream.output[base + 11] := canonical[at + 0]
+  at := at + 1
+  stream.at := at
+  return stream
+
+func haptic_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
+  let at = stream.at
+  let base = stream.output.length
+  for 0 .. 4:
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 1] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 2] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
   stream.at := at
   return stream
@@ -1320,6 +1352,10 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
   at := at + 1
   stream.output[243] := canonical[at + 0]
   at := at + 1
+  stream.output[247] := canonical[at + 0]
+  at := at + 1
+  stream.output[248] := canonical[at + 0]
+  at := at + 1
   let state_start: U32 = stream.output.length
   let state_count: U32 = 0
   state_count := lanes.integer canonical[at] lanes.max_integer
@@ -1556,6 +1592,14 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
     stream := ribbon_into canonical stream
   at := stream.at
   stream.output[246] := U32.to_f32 ribbons_count
+  let haptics_start: U32 = stream.output.length
+  let haptics_count = lanes.integer canonical[at] lanes.max_integer
+  at := at + 1
+  stream.at := at
+  for 0 .. haptics_count:
+    stream := haptic_into canonical stream
+  at := stream.at
+  stream.output[249] := U32.to_f32 haptics_count
   let extras_start: U32 = stream.output.length
   for value in stream.extras:
     @storage.push stream.output value

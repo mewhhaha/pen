@@ -111,12 +111,47 @@ pub struct BusSpec {
     pub gain: f32,
     pub lowpass: f32,
     pub reverb: f32,
+    pub comp_threshold: f32,
+    pub comp_ratio: f32,
+    pub duck_bus: usize,
+    pub duck_amount: f32,
+    pub eq_low_db: f32,
+    pub eq_mid_db: f32,
+    pub eq_high_db: f32,
+}
+
+impl Default for BusSpec {
+    fn default() -> Self {
+        PLAIN
+    }
 }
 
 /// What a frame without buses mixes through: an open master at gain 1,
 /// returning the reverb whole, and buses it lacks open and dry at gain 1.
-const MASTER: BusSpec = BusSpec { gain: 1.0, lowpass: OPEN, reverb: 1.0 };
-const PLAIN: BusSpec = BusSpec { gain: 1.0, lowpass: OPEN, reverb: 0.0 };
+const MASTER: BusSpec = BusSpec {
+    gain: 1.0,
+    lowpass: OPEN,
+    reverb: 1.0,
+    comp_threshold: 0.0,
+    comp_ratio: 1.0,
+    duck_bus: 0,
+    duck_amount: 0.0,
+    eq_low_db: 0.0,
+    eq_mid_db: 0.0,
+    eq_high_db: 0.0,
+};
+const PLAIN: BusSpec = BusSpec {
+    gain: 1.0,
+    lowpass: OPEN,
+    reverb: 0.0,
+    comp_threshold: 0.0,
+    comp_ratio: 1.0,
+    duck_bus: 0,
+    duck_amount: 0.0,
+    eq_low_db: 0.0,
+    eq_mid_db: 0.0,
+    eq_high_db: 0.0,
+};
 
 /// A voice as a frame declares it.
 #[derive(Clone)]
@@ -150,12 +185,14 @@ pub struct SoundSpec {
     pub panner: Option<Placement>,
 }
 
-/// One frame's sound: its buses, voices and sounds.
+/// One frame's sound: its buses, voices, sounds, and optional reverb room parameters.
 #[derive(Default)]
 pub struct Mix {
     pub buses: Vec<BusSpec>,
     pub voices: Vec<VoiceSpec>,
     pub sounds: Vec<SoundSpec>,
+    pub reverb_decay: f32,
+    pub reverb_damping: f32,
 }
 
 /// A value setTargetAtTime glides toward its target: each sample, the step's
@@ -323,6 +360,81 @@ fn next(glides: &mut [Glide; 3], step: f64) -> Vec3 {
     [glides[0].next(step), glides[1].next(step), glides[2].next(step)]
 }
 
+/// Fractional-sample binaural ITD delay line + contralateral head-shadowing ILD lowpass
+/// approximating a spherical-head HRTF (Woodworth ITD + acoustic shadow + rear pinna cue).
+struct Binaural {
+    ring: [[f32; 64]; 2],
+    write: usize,
+    shadow: [f64; 2],
+    itd_samples: f64,
+    alpha_left: f64,
+    alpha_right: f64,
+}
+
+impl Binaural {
+    fn new() -> Self {
+        Self { ring: [[0.0; 64]; 2], write: 0, shadow: [0.0; 2], itd_samples: 0.0, alpha_left: 1.0, alpha_right: 1.0 }
+    }
+
+    fn update(&mut self, position: Vec3, azimuth_deg: f64, rate: f64) {
+        // Woodworth spherical-head ITD: r = 0.0875 m, c = 343 m/s.
+        let az_rad = azimuth_deg.to_radians();
+        let lateral = az_rad.sin().clamp(-1.0, 1.0);
+        let theta = lateral.asin();
+        let itd_sec = (0.0875 / 343.0) * (theta.sin() + theta);
+        self.itd_samples = (itd_sec * rate).clamp(-56.0, 56.0);
+        // Rear hemisphere (z > 0 in listener space) adds subtle pinna high-frequency dulling.
+        let dist = (f64::from(position[0]).powi(2)
+            + f64::from(position[1]).powi(2)
+            + f64::from(position[2]).powi(2))
+        .sqrt()
+        .max(1e-6);
+        let rear = (f64::from(position[2]) / dist).clamp(0.0, 1.0);
+        let ear_alpha = |shadow_amount: f64| -> f64 {
+            let amount = (shadow_amount + rear * 0.25).clamp(0.0, 1.0);
+            if amount < 1e-4 {
+                return 1.0;
+            }
+            let cutoff = 18_000.0 * (1600.0 / 18_000.0f64).powf(amount);
+            (1.0 - (-2.0 * PI * cutoff / rate).exp()).clamp(0.01, 1.0)
+        };
+        // Positive lateral = source on right -> left ear is contralateral (shadowed + delayed).
+        self.alpha_left = ear_alpha(lateral.max(0.0));
+        self.alpha_right = ear_alpha((-lateral).max(0.0));
+    }
+
+    fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let w = self.write;
+        self.ring[0][w] = left;
+        self.ring[1][w] = right;
+        let read_delayed = |ch: usize, delay: f64| -> f32 {
+            let d = delay.clamp(0.0, 60.0);
+            let i0 = d.floor() as usize;
+            let frac = (d - i0 as f64) as f32;
+            let idx0 = (w + 64 - i0) & 63;
+            let idx1 = (w + 64 - i0 - 1) & 63;
+            self.ring[ch][idx0] * (1.0 - frac) + self.ring[ch][idx1] * frac
+        };
+        let (delay_l, delay_r) = if self.itd_samples >= 0.0 {
+            (self.itd_samples, 0.0)
+        } else {
+            (0.0, -self.itd_samples)
+        };
+        let dl = f64::from(read_delayed(0, delay_l));
+        let dr = f64::from(read_delayed(1, delay_r));
+        self.shadow[0] += self.alpha_left * (dl - self.shadow[0]);
+        self.shadow[1] += self.alpha_right * (dr - self.shadow[1]);
+        if self.shadow[0].abs() < 1e-30 {
+            self.shadow[0] = 0.0;
+        }
+        if self.shadow[1].abs() < 1e-30 {
+            self.shadow[1] = 0.0;
+        }
+        self.write = (w + 1) & 63;
+        (self.shadow[0] as f32, self.shadow[1] as f32)
+    }
+}
+
 /// A voice's PannerNode: its settings, which change at once, its position
 /// and orientation in the listener's frame, which glide, and the pan and
 /// gain worked out for where it was last. While it moves, they are worked
@@ -336,11 +448,13 @@ struct Spatial {
     placed: Option<(Vec3, Vec3)>,
     pan: Pan,
     gain: f32,
+    binaural: Option<Binaural>,
 }
 
 impl Spatial {
     fn new(placement: Placement) -> Spatial {
         Spatial {
+            binaural: placement.hrtf.then(Binaural::new),
             placement,
             position: glides(placement.position),
             orientation: glides(placement.orientation),
@@ -353,6 +467,11 @@ impl Spatial {
     fn set(&mut self, placement: Placement) {
         glide_to(&mut self.position, placement.position);
         glide_to(&mut self.orientation, placement.orientation);
+        if placement.hrtf && self.binaural.is_none() {
+            self.binaural = Some(Binaural::new());
+        } else if !placement.hrtf {
+            self.binaural = None;
+        }
         if placement != self.placement {
             self.placement = placement;
             self.placed = None;
@@ -360,15 +479,26 @@ impl Spatial {
     }
 
     /// This sample's pan and gain, then a step on.
-    fn next(&mut self, step: f64, mono: bool) -> (Pan, f32) {
+    fn next(&mut self, step: f64, mono: bool, rate: f64) -> (Pan, f32) {
         let position = next(&mut self.position, step);
         let orientation = next(&mut self.orientation, step);
         if self.placed != Some((position, orientation)) {
             self.placed = Some((position, orientation));
-            self.pan = equal_power(azimuth(position, &DEFAULT_EAR), mono);
+            let az = azimuth(position, &DEFAULT_EAR);
+            self.pan = equal_power(az, mono);
             self.gain = self.placement.gain(position, orientation, &DEFAULT_EAR);
+            if let Some(binaural) = &mut self.binaural {
+                binaural.update(position, az, rate);
+            }
         }
         (self.pan, self.gain)
+    }
+
+    fn filter_binaural(&mut self, left: f32, right: f32) -> (f32, f32) {
+        match &mut self.binaural {
+            Some(binaural) => binaural.process(left, right),
+            None => (left, right),
+        }
     }
 }
 
@@ -535,7 +665,7 @@ impl Voice {
             let reverb = self.send.next(glide);
             let (pan, gain) = match &mut self.spatial {
                 Some(spatial) => {
-                    let (pan, placed) = spatial.next(glide, mono);
+                    let (pan, placed) = spatial.next(glide, mono, rate);
                     (pan, gain * placed)
                 }
                 None => {
@@ -547,7 +677,7 @@ impl Voice {
                     (self.gains, gain)
                 }
             };
-            let (out_left, out_right) = if mono {
+            let (mut out_left, mut out_right) = if mono {
                 let x = self.lowpass.run(0, left) * fade * gain;
                 (x * pan.left, x * pan.right)
             } else {
@@ -556,6 +686,9 @@ impl Voice {
                 let r = self.lowpass.run(1, right) * fade * gain;
                 if pan.rightward { (l * pan.left, r + l * pan.right) } else { (l + r * pan.left, r * pan.right) }
             };
+            if let Some(spatial) = &mut self.spatial {
+                (out_left, out_right) = spatial.filter_binaural(out_left, out_right);
+            }
             dry[i][0] += out_left;
             dry[i][1] += out_right;
             send[i][0] += out_left * reverb;
@@ -567,6 +700,100 @@ impl Voice {
     }
 }
 
+#[derive(Clone, Copy)]
+enum EqKind {
+    LowShelf,
+    Peaking,
+    HighShelf,
+}
+
+/// One stereo Audio EQ Cookbook biquad band (bypassed cleanly at 0 dB).
+struct EqBand {
+    kind: EqKind,
+    freq: f64,
+    gain_db: f32,
+    active: bool,
+    b: [f64; 3],
+    a: [f64; 2],
+    state: [[f64; 4]; 2],
+}
+
+impl EqBand {
+    fn new(kind: EqKind, freq: f64) -> Self {
+        Self { kind, freq, gain_db: 0.0, active: false, b: [1.0, 0.0, 0.0], a: [0.0, 0.0], state: [[0.0; 4]; 2] }
+    }
+
+    fn set_gain(&mut self, gain_db: f32, rate: f64) {
+        let gain_db = if gain_db.is_finite() { gain_db.clamp(-24.0, 24.0) } else { 0.0 };
+        if gain_db.to_bits() == self.gain_db.to_bits() {
+            return;
+        }
+        self.gain_db = gain_db;
+        if gain_db.abs() < 1e-4 {
+            self.active = false;
+            self.b = [1.0, 0.0, 0.0];
+            self.a = [0.0, 0.0];
+            return;
+        }
+        self.active = true;
+        let w0 = 2.0 * PI * (self.freq / rate).clamp(1e-4, 0.49);
+        let cos_w = w0.cos();
+        let sin_w = w0.sin();
+        let amp = 10f64.powf(f64::from(gain_db) / 40.0);
+        let (b0, b1, b2, a0, a1, a2) = match self.kind {
+            EqKind::LowShelf => {
+                let alpha = sin_w * 0.5 * 2f64.sqrt();
+                let t = 2.0 * amp.sqrt() * alpha;
+                (
+                    amp * ((amp + 1.0) - (amp - 1.0) * cos_w + t),
+                    2.0 * amp * ((amp - 1.0) - (amp + 1.0) * cos_w),
+                    amp * ((amp + 1.0) - (amp - 1.0) * cos_w - t),
+                    (amp + 1.0) + (amp - 1.0) * cos_w + t,
+                    -2.0 * ((amp - 1.0) + (amp + 1.0) * cos_w),
+                    (amp + 1.0) + (amp - 1.0) * cos_w - t,
+                )
+            }
+            EqKind::Peaking => {
+                let alpha = sin_w * 0.5; // Q = 1.0
+                (
+                    1.0 + alpha * amp,
+                    -2.0 * cos_w,
+                    1.0 - alpha * amp,
+                    1.0 + alpha / amp,
+                    -2.0 * cos_w,
+                    1.0 - alpha / amp,
+                )
+            }
+            EqKind::HighShelf => {
+                let alpha = sin_w * 0.5 * 2f64.sqrt();
+                let t = 2.0 * amp.sqrt() * alpha;
+                (
+                    amp * ((amp + 1.0) + (amp - 1.0) * cos_w + t),
+                    -2.0 * amp * ((amp - 1.0) + (amp + 1.0) * cos_w),
+                    amp * ((amp + 1.0) + (amp - 1.0) * cos_w - t),
+                    (amp + 1.0) - (amp - 1.0) * cos_w + t,
+                    2.0 * ((amp - 1.0) - (amp + 1.0) * cos_w),
+                    (amp + 1.0) - (amp - 1.0) * cos_w - t,
+                )
+            }
+        };
+        self.b = [b0 / a0, b1 / a0, b2 / a0];
+        self.a = [a1 / a0, a2 / a0];
+    }
+
+    fn run(&mut self, channel: usize, input: f32) -> f32 {
+        if !self.active {
+            return input;
+        }
+        let [x1, x2, y1, y2] = self.state[channel];
+        let x = f64::from(input);
+        let y = self.b[0] * x + self.b[1] * x1 + self.b[2] * x2 - self.a[0] * y1 - self.a[1] * y2;
+        let y = if y.abs() < 1e-30 { 0.0 } else { y };
+        self.state[channel] = [x, x1, y, y1];
+        y as f32
+    }
+}
+
 struct Bus {
     active: bool,
     /// Its gain as the frame has it, before the developer's mute and solo.
@@ -575,6 +802,16 @@ struct Bus {
     reverb: Glide,
     /// Channels 0 and 1 filter the dry input, 2 and 3 the send.
     lowpass: Lowpass,
+    eq_low: EqBand,
+    eq_mid: EqBand,
+    eq_high: EqBand,
+    comp_threshold: f32,
+    comp_ratio: f32,
+    duck_bus: usize,
+    duck_amount: f32,
+    env: f64,
+    dyn_gain: f64,
+    last_rms: f64,
     dry: [[f32; 2]; QUANTUM],
     send: [[f32; 2]; QUANTUM],
 }
@@ -587,9 +824,29 @@ impl Bus {
             gain: Glide::at(1.0),
             reverb: Glide::at(0.0),
             lowpass: Lowpass::new(OPEN, rate),
+            eq_low: EqBand::new(EqKind::LowShelf, 200.0),
+            eq_mid: EqBand::new(EqKind::Peaking, 1000.0),
+            eq_high: EqBand::new(EqKind::HighShelf, 4000.0),
+            comp_threshold: 0.0,
+            comp_ratio: 1.0,
+            duck_bus: 0,
+            duck_amount: 0.0,
+            env: 0.0,
+            dyn_gain: 1.0,
+            last_rms: 0.0,
             dry: [[0.0; 2]; QUANTUM],
             send: [[0.0; 2]; QUANTUM],
         }
+    }
+
+    fn apply_processing(&mut self, spec: BusSpec, rate: f64) {
+        self.comp_threshold = if spec.comp_threshold.is_finite() { spec.comp_threshold.clamp(0.0, 4.0) } else { 0.0 };
+        self.comp_ratio = if spec.comp_ratio.is_finite() { spec.comp_ratio.max(1.0) } else { 1.0 };
+        self.duck_bus = spec.duck_bus.min(MAX_BUSES - 1);
+        self.duck_amount = if spec.duck_amount.is_finite() { spec.duck_amount.clamp(0.0, 1.0) } else { 0.0 };
+        self.eq_low.set_gain(spec.eq_low_db, rate);
+        self.eq_mid.set_gain(spec.eq_mid_db, rate);
+        self.eq_high.set_gain(spec.eq_high_db, rate);
     }
 
     /// Starts it at `spec` at once, as a new bus's nodes do, silent if it
@@ -600,6 +857,7 @@ impl Bus {
         self.gain = Glide::at(if audible { spec.gain } else { 0.0 });
         self.reverb = Glide::at(spec.reverb);
         self.lowpass = Lowpass::new(cutoff(spec.lowpass, rate), rate);
+        self.apply_processing(spec, rate);
     }
 
     fn glide_to(&mut self, spec: BusSpec, rate: f64, audible: bool) {
@@ -607,6 +865,40 @@ impl Bus {
         self.gain.set(if audible { spec.gain } else { 0.0 });
         self.reverb.set(spec.reverb);
         self.lowpass.cutoff.set(cutoff(spec.lowpass, rate));
+        self.apply_processing(spec, rate);
+    }
+
+    fn run_eq(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let l = self.eq_high.run(0, self.eq_mid.run(0, self.eq_low.run(0, left)));
+        let r = self.eq_high.run(1, self.eq_mid.run(1, self.eq_low.run(1, right)));
+        (l, r)
+    }
+
+    fn step_dynamics(&mut self, peak: f64, sidechain_rms: f64, rate: f64) -> f32 {
+        let comp_on = self.comp_threshold > 0.0 && self.comp_ratio > 1.0;
+        let duck_on = self.duck_amount > 0.0;
+        if !comp_on && !duck_on {
+            self.dyn_gain = 1.0;
+            return 1.0;
+        }
+        let coeff = if peak > self.env { 1.0 - (-1.0 / (0.010 * rate)).exp() } else { 1.0 - (-1.0 / (0.120 * rate)).exp() };
+        self.env += (peak - self.env) * coeff;
+        let mut target = 1.0;
+        if comp_on && self.env > f64::from(self.comp_threshold) {
+            let over = self.env / f64::from(self.comp_threshold);
+            target *= over.powf(1.0 / f64::from(self.comp_ratio) - 1.0);
+        }
+        if duck_on {
+            let duck = (1.0 - f64::from(self.duck_amount) * (sidechain_rms * 2.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+            target *= duck;
+        }
+        let g_coeff = if target < self.dyn_gain {
+            1.0 - (-1.0 / (0.010 * rate)).exp()
+        } else {
+            1.0 - (-1.0 / (0.120 * rate)).exp()
+        };
+        self.dyn_gain += (target - self.dyn_gain) * g_coeff;
+        self.dyn_gain as f32
     }
 }
 
@@ -620,6 +912,8 @@ pub struct Mixer {
     voices: Vec<Voice>,
     buses: Vec<Bus>,
     reverb: Convolver,
+    reverb_decay: f32,
+    reverb_damping: f32,
     master_in: [[f32; 2]; QUANTUM],
     reverb_in: [[f32; 2]; QUANTUM],
     reverb_out: [[f32; 2]; QUANTUM],
@@ -656,6 +950,8 @@ impl Mixer {
             voices: Vec::with_capacity(1024),
             buses,
             reverb: Convolver::new(rate),
+            reverb_decay: 0.0,
+            reverb_damping: 0.0,
             master_in: [[0.0; 2]; QUANTUM],
             reverb_in: [[0.0; 2]; QUANTUM],
             reverb_out: [[0.0; 2]; QUANTUM],
@@ -721,6 +1017,13 @@ impl Mixer {
     /// its sounds start.
     pub fn apply(&mut self, mix: &Mix) {
         let (now, rate) = (self.now, self.rate);
+        let decay = if mix.reverb_decay.is_finite() { mix.reverb_decay.max(0.0) } else { 0.0 };
+        let damping = if mix.reverb_damping.is_finite() { mix.reverb_damping.clamp(0.0, 1.0) } else { 0.0 };
+        if (decay - self.reverb_decay).abs() > 1e-3 || (damping - self.reverb_damping).abs() > 1e-3 {
+            self.reverb = Convolver::with_room(rate, f64::from(decay), f64::from(damping));
+            self.reverb_decay = decay;
+            self.reverb_damping = damping;
+        }
         for (index, bus) in self.buses.iter_mut().enumerate() {
             let spec = mix.buses.get(index).copied();
             let audible = self.monitor.audible(index);
@@ -813,39 +1116,60 @@ impl Mixer {
         }
         let end = now + QUANTUM as u64;
         self.voices.retain(|voice| !voice.gone(end));
+        let prev_rms: [f64; MAX_BUSES] = std::array::from_fn(|i| self.buses[i].last_rms);
         // The master's own voices go straight to it and to the reverb.
         let (master, buses) = self.buses.split_first_mut().expect("a master bus");
         self.master_in = master.dry;
         self.reverb_in = master.send;
         for (bus, meter) in buses.iter_mut().zip(&mut self.meters[1..]).filter(|(bus, _)| bus.active) {
+            let sc_rms = prev_rms[bus.duck_bus];
+            let mut sq_sum = 0.0f64;
             for i in 0..QUANTUM {
                 bus.lowpass.step(glide, rate);
                 let gain = bus.gain.next(glide);
                 let reverb = bus.reverb.next(glide);
                 let [dry_left, dry_right] = bus.dry[i];
                 let [send_left, send_right] = bus.send[i];
-                let left = bus.lowpass.run(0, dry_left) * gain;
-                let right = bus.lowpass.run(1, dry_right) * gain;
+                let lp_l = bus.lowpass.run(0, dry_left);
+                let lp_r = bus.lowpass.run(1, dry_right);
+                let (eq_l, eq_r) = bus.run_eq(lp_l, lp_r);
+                let peak = f64::from(eq_l.abs().max(eq_r.abs())) * f64::from(gain.abs());
+                let dyn_gain = bus.step_dynamics(peak, sc_rms, rate);
+                let left = eq_l * gain * dyn_gain;
+                let right = eq_r * gain * dyn_gain;
                 let wet_left = bus.lowpass.run(2, send_left) * gain;
                 let wet_right = bus.lowpass.run(3, send_right) * gain;
+                sq_sum += f64::from(left) * f64::from(left) + f64::from(right) * f64::from(right);
                 meter.add([left, right]);
                 self.master_in[i][0] += left;
                 self.master_in[i][1] += right;
                 self.reverb_in[i][0] += wet_left + left * reverb;
                 self.reverb_in[i][1] += wet_right + right * reverb;
             }
+            bus.last_rms = (sq_sum / (2 * QUANTUM) as f64).sqrt();
         }
         self.reverb_out = [[0.0; 2]; QUANTUM];
         self.reverb.process(&self.reverb_in, &mut self.reverb_out);
+        let master_sc = prev_rms[master.duck_bus];
+        let mut master_sq = 0.0f64;
         for i in 0..QUANTUM {
             let back = master.reverb.next(glide);
             master.lowpass.step(glide, rate);
             let gain = master.gain.next(glide);
             let left = self.master_in[i][0] + self.reverb_out[i][0] * back;
             let right = self.master_in[i][1] + self.reverb_out[i][1] * back;
-            self.out[i] = [master.lowpass.run(0, left) * gain, master.lowpass.run(1, right) * gain];
+            let lp_l = master.lowpass.run(0, left);
+            let lp_r = master.lowpass.run(1, right);
+            let (eq_l, eq_r) = master.run_eq(lp_l, lp_r);
+            let peak = f64::from(eq_l.abs().max(eq_r.abs())) * f64::from(gain.abs());
+            let dyn_gain = master.step_dynamics(peak, master_sc, rate);
+            let out_l = eq_l * gain * dyn_gain;
+            let out_r = eq_r * gain * dyn_gain;
+            master_sq += f64::from(out_l) * f64::from(out_l) + f64::from(out_r) * f64::from(out_r);
+            self.out[i] = [out_l, out_r];
             self.meters[0].add(self.out[i]);
         }
+        master.last_rms = (master_sq / (2 * QUANTUM) as f64).sqrt();
         self.now = end;
     }
 
@@ -1083,7 +1407,7 @@ mod tests {
             spec.reverb = reverb;
             Mix { voices: vec![spec], buses, ..Mix::default() }
         };
-        let master = BusSpec { gain: 1.0, lowpass: OPEN, reverb: 1.0 };
+        let master = BusSpec { gain: 1.0, lowpass: OPEN, reverb: 1.0, ..PLAIN };
         let mut dry = Mixer::new(RATE);
         let plain = rms(&play(&mut dry, (0..30).map(|_| on_bus(1, 0.0, vec![master, PLAIN])))[4800..]);
         let mut quiet = Mixer::new(RATE);
@@ -1133,7 +1457,8 @@ mod tests {
                 Mix {
                     voices: vec![spec],
                     sounds,
-                    buses: vec![MASTER, PLAIN, BusSpec { gain: 0.7, lowpass: 5000.0, reverb: 0.2 }],
+                    buses: vec![MASTER, PLAIN, BusSpec { gain: 0.7, lowpass: 5000.0, reverb: 0.2, ..PLAIN }],
+                    ..Mix::default()
                 }
             })
         };
@@ -1344,6 +1669,110 @@ mod tests {
             eprintln!("{}: largest difference from Chromium {worst:e}", scenario["name"]);
         }
         assert!(expected.next().is_none());
+    }
+
+    #[test]
+    fn hrtf_binaural_applies_itd_delay_and_contralateral_head_shadow() {
+        // Impulse clip to measure exact interaural arrival delay.
+        let mut imp = vec![[0.0f32; 2]; 1024];
+        imp[16] = [1.0, 1.0];
+        let impulse = Arc::new(Clip::new(imp.into(), RATE));
+        let mut p = placed([2.0, 0.0, -2.0]); // +45 deg right
+        p.hrtf = true;
+        let mut spec = voice(1, &impulse);
+        spec.looping = false;
+        spec.panner = Some(p);
+        let mut mixer = Mixer::new(RATE);
+        mixer.apply(&Mix { voices: vec![spec], ..Mix::default() });
+        let mut out = vec![[0.0f32; 2]; 256];
+        mixer.render(&mut out);
+        let peak_idx = |ch: usize| {
+            out.iter().enumerate().max_by(|a, b| a.1[ch].abs().total_cmp(&b.1[ch].abs())).unwrap().0
+        };
+        let (idx_l, idx_r) = (peak_idx(0), peak_idx(1));
+        assert!(idx_l > idx_r + 12, "left contralateral ear must lag right ear by Woodworth ITD: L={idx_l}, R={idx_r}");
+
+        // High-frequency 6 kHz tone on right (+45 deg): contralateral ear is head-shadowed more than equal-power.
+        let hi = sine(6000.0, 0.5);
+        let run = |hrtf: bool| {
+            let mut p = placed([2.0, 0.0, -2.0]);
+            p.hrtf = hrtf;
+            let mut s = voice(1, &hi);
+            s.panner = Some(p);
+            let out = play(&mut Mixer::new(RATE), (0..10).map(|_| Mix { voices: vec![s.clone()], ..Mix::default() }));
+            let l_rms = (out[2400..].iter().map(|f| f64::from(f[0]).powi(2)).sum::<f64>() / (out.len() - 2400) as f64).sqrt();
+            let r_rms = (out[2400..].iter().map(|f| f64::from(f[1]).powi(2)).sum::<f64>() / (out.len() - 2400) as f64).sqrt();
+            l_rms / r_rms.max(1e-6)
+        };
+        assert!(run(true) < run(false) * 0.75, "HRTF must attenuate high frequencies on contralateral ear");
+    }
+
+    #[test]
+    fn bus_eq_compressor_sidechain_and_custom_reverb_shape_output() {
+        let low = sine(100.0, 1.0);
+        let high = sine(6000.0, 1.0);
+        let run_bus = |clip: &Arc<Clip>, bus_spec: BusSpec| {
+            let mut s = voice(1, clip);
+            s.bus = 1;
+            let out = play(
+                &mut Mixer::new(RATE),
+                (0..20).map(|_| Mix { voices: vec![s.clone()], buses: vec![MASTER, bus_spec], ..Mix::default() }),
+            );
+            rms(&out[4800..])
+        };
+        let flat_low = run_bus(&low, PLAIN);
+        let boosted_low = run_bus(&low, BusSpec { eq_low_db: 12.0, ..PLAIN });
+        let cut_high = run_bus(&high, BusSpec { eq_high_db: -12.0, ..PLAIN });
+        let flat_high = run_bus(&high, PLAIN);
+        assert!(boosted_low > flat_low * 2.5, "low-shelf +12 dB must boost 100 Hz: {boosted_low} vs {flat_low}");
+        assert!(cut_high < flat_high * 0.4, "high-shelf -12 dB must cut 6 kHz: {cut_high} vs {flat_high}");
+
+        // Self-compressor at threshold 0.15, ratio 6:1 reduces loud sine level markedly.
+        let compressed = run_bus(&low, BusSpec { comp_threshold: 0.15, comp_ratio: 6.0, ..PLAIN });
+        assert!(compressed < flat_low * 0.65, "bus compressor must attenuate signal above threshold: {compressed} vs {flat_low}");
+
+        // Sidechain ducking: bus 2 loud signal ducks bus 1 by 80%.
+        let mut music = voice(1, &low);
+        music.bus = 1;
+        let mut dialogue = voice(2, &high);
+        dialogue.bus = 2;
+        let ducked_bus = BusSpec { duck_bus: 2, duck_amount: 0.8, ..PLAIN };
+        let mut m_solo = Mixer::new(RATE);
+        play(&mut m_solo, (0..25).map(|_| Mix { voices: vec![music.clone()], buses: vec![MASTER, ducked_bus, PLAIN], ..Mix::default() }));
+        let alone_rms = m_solo.take_meters().0[1].rms()[0];
+        let mut m_duck = Mixer::new(RATE);
+        play(
+            &mut m_duck,
+            (0..25).map(|_| Mix { voices: vec![music.clone(), dialogue.clone()], buses: vec![MASTER, ducked_bus, PLAIN], ..Mix::default() }),
+        );
+        let ducked_rms = m_duck.take_meters().0[1].rms()[0];
+        assert!(ducked_rms < alone_rms * 0.45, "sidechain bus 2 must duck bus 1: {ducked_rms} vs {alone_rms}");
+
+        // Custom reverb decay: long room sustains noticeably louder late tail than short room.
+        let mut burst = vec![[0.0f32; 2]; 2400];
+        for (i, sample) in burst.iter_mut().enumerate().take(400) {
+            let v = (std::f64::consts::TAU * 600.0 * i as f64 / RATE).sin() as f32;
+            *sample = [v, v];
+        }
+        let burst_clip = Arc::new(Clip::new(burst.into(), RATE));
+        let tail_rms = |decay: f32| {
+            let mut s = voice(1, &burst_clip);
+            s.looping = false;
+            s.reverb = 1.0;
+            let mut mixer = Mixer::new(RATE);
+            let out = play(
+                &mut mixer,
+                (0..40).map(|f| Mix {
+                    voices: if f == 0 { vec![s.clone()] } else { vec![] },
+                    buses: vec![MASTER],
+                    reverb_decay: decay,
+                    reverb_damping: 0.2,
+                    ..Mix::default()
+                }),
+            );
+            rms(&out[18_000..])
+        };
+        assert!(tail_rms(2.4) > tail_rms(0.25) * 3.0, "longer reverb decay must sustain late tail");
     }
 
     /// A calibration scenario, for comparing with WebAudio playing the same

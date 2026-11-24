@@ -265,6 +265,7 @@ impl Host for Shell<'_> {
         if let Some(audio) = self.audio.as_deref_mut() {
             audio.frame(frame, catalog);
         }
+        self.input.apply_haptics(&frame.haptics);
         self.services.rendered(frame, catalog);
         show_cursor(self.window, frame, self.overlay.as_ref().is_some_and(|overlay| overlay.wants_pointer()));
         self.input.text_field(self.window, &frame.ui);

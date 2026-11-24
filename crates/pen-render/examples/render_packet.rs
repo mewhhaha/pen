@@ -191,6 +191,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
         blur: 0.0,
         motion_blur: Default::default(),
         dof: Default::default(),
+        reverb: Default::default(),
         clear: Color { r: 0.4, g: 0.55, b: 0.75, a: 1.0 },
         quality: Quality {
             msaa: 4,
@@ -257,6 +258,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
         morph_weights: Vec::new(),
         motions: Vec::new(),
         ribbons: Vec::new(),
+        haptics: Vec::new(),
         emitters: Vec::new(),
         extensions: Vec::new(),
         lights: Vec::new(),

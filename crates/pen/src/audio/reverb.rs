@@ -15,7 +15,9 @@ use std::f64::consts::TAU;
 
 use super::mixer::QUANTUM;
 
+#[cfg(test)]
 pub use pen_runtime::reverb::impulse_response;
+pub use pen_runtime::reverb::impulse_response_for;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Complex {
@@ -224,7 +226,11 @@ pub struct Convolver {
 
 impl Convolver {
     pub fn new(rate: f64) -> Convolver {
-        let response = impulse_response(rate);
+        Convolver::with_room(rate, 0.0, 0.0)
+    }
+
+    pub fn with_room(rate: f64, decay: f64, damping: f64) -> Convolver {
+        let response = impulse_response_for(rate, decay, damping);
         let length = response[0].len();
         let split_at = TAIL_BLOCK.min(length);
         Convolver {

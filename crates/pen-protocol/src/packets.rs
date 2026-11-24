@@ -1085,6 +1085,20 @@ pub mod types {
         /// How much of it goes to the shared reverb; on the master, how loud the reverb comes
         /// back.
         pub reverb: f32,
+        /// Linear compressor threshold in (0, 1]; 0 disables bus compression.
+        pub comp_threshold: f32,
+        /// Compressor ratio (>= 1.0); values <= 1.0 disable bus compression.
+        pub comp_ratio: f32,
+        /// Bus index whose RMS level ducks this bus when `duck_amount > 0`.
+        pub duck_bus: u32,
+        /// Sidechain ducking attenuation share in 0..1; 0 disables ducking.
+        pub duck_amount: f32,
+        /// Low-shelf EQ gain at 200 Hz in dB; 0 bypasses.
+        pub eq_low_db: f32,
+        /// Peaking EQ gain at 1000 Hz (Q=1.0) in dB; 0 bypasses.
+        pub eq_mid_db: f32,
+        /// High-shelf EQ gain at 4000 Hz in dB; 0 bypasses.
+        pub eq_high_db: f32,
     }
     /// A voice the game keeps playing, declared by every frame that has it, whole. Hosts start
     /// a new id from `start`, fading in over `fade_in`; fade out an id the frame leaves out
@@ -1342,6 +1356,9 @@ pub mod types {
         /// The angle, in degrees, beyond which it is heard at cone_outer_gain.
         pub cone_outer: f32,
         pub cone_outer_gain: f32,
+        /// Enable HRTF binaural spatialization (ITD delay and head-shadowing ILD natively,
+        /// PanningModelType::Hrtf in WebAudio) instead of equal-power panning.
+        pub hrtf: bool,
     }
     #[derive(Clone, Copy, Debug, Default, PartialEq)]
     pub struct Instance {
@@ -1411,6 +1428,18 @@ pub mod types {
         pub color: Color,
         /// View-space soft depth fade distance in world units; 0 disables.
         pub soft_depth: f32,
+    }
+    /// Dual-motor haptic feedback command for one gamepad.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Haptic {
+        /// Gamepad index (0 to MAX_GAMEPADS - 1).
+        pub pad: u32,
+        /// Low-frequency (strong) motor intensity in 0..1.
+        pub low: f32,
+        /// High-frequency (weak) motor intensity in 0..1.
+        pub high: f32,
+        /// Pulse duration in seconds (0 stops rumble or applies for one frame).
+        pub duration: f32,
     }
     /// How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture
     /// filtering, ambient occlusion, a sky, screen effects, bloom and temporal antialiasing.
@@ -1816,6 +1845,24 @@ pub mod types {
             }
         }
     }
+    /// Shared reverb room RT60 decay and high-frequency damping; zeros use the default 1.5 s
+    /// room.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct ReverbRoom {
+        /// Shared reverb RT60 decay time in seconds; 0 uses the default 1.5 s room.
+        pub decay: f32,
+        /// Shared reverb high-frequency damping in 0..1; 0 uses the default curve, higher
+        /// values darken the room faster.
+        pub damping: f32,
+    }
+    impl Default for ReverbRoom {
+        fn default() -> Self {
+            Self {
+                decay: 0.0,
+                damping: 0.0,
+            }
+        }
+    }
     /// One of the game's own sections: its tag, from its declaration, and its lanes.
     #[derive(Clone, Debug, Default, PartialEq)]
     pub struct Extension {
@@ -1898,6 +1945,9 @@ pub mod types {
         /// Bokeh depth of field applied in linear HDR light after TAA and before motion blur
         /// and bloom.
         pub dof: Dof,
+        /// Shared reverb room RT60 decay and high-frequency damping; zeros use the default 1.5
+        /// s room.
+        pub reverb: ReverbRoom,
         pub draws: Vec<Draw>,
         /// Convex solids: the points behind every face plane (normal · p <= distance).
         pub solids: Vec<Solid>,
@@ -1983,6 +2033,8 @@ pub mod types {
         /// World-space camera-facing ribbon and beam trail control points rendered in the
         /// translucent pass.
         pub ribbons: Vec<RibbonPoint>,
+        /// Dual-motor gamepad rumble / haptic commands for connected controllers.
+        pub haptics: Vec<Haptic>,
         /// The game's own sections, which its pen.json `protocol` declares, after the rest of
         /// the packet: a marker, their count, then each one's tag, length and values. A packet
         /// without any ends before the marker. Tag 0 is reserved for one optional development
@@ -2029,6 +2081,7 @@ pub mod types {
                 reflection: Default::default(),
                 motion_blur: Default::default(),
                 dof: Default::default(),
+                reverb: Default::default(),
                 draws: Default::default(),
                 solids: Default::default(),
                 decals: Default::default(),
@@ -2056,6 +2109,7 @@ pub mod types {
                 morph_weights: Default::default(),
                 motions: Default::default(),
                 ribbons: Default::default(),
+                haptics: Default::default(),
                 extensions: Default::default(),
             }
         }
@@ -2122,6 +2176,8 @@ pub mod codec {
     pub const MAX_MOTIONS: usize = 100000;
     /// The most ribbon trail control points one frame may declare.
     pub const MAX_RIBBONS: usize = 65536;
+    /// The most gamepad haptic rumble commands one frame may declare.
+    pub const MAX_HAPTICS: usize = 32;
     /// The most buses one frame may declare, the master (bus 0) included.
     pub const MAX_BUSES: usize = 16;
     /// Voice ids are whole numbers from 1 to this, the wire's exact-integer range.
@@ -2209,8 +2265,8 @@ pub mod codec {
     /// fog.drift3, quality.volumetrics, fog_volume_count, bone_matrix_count,
     /// morph_weight_count, motion_blur.strength, motion_blur.max_radius, motion_blur.samples,
     /// dof.focus_distance, dof.focus_range, dof.aperture, dof.max_blur, motion_count,
-    /// quality.ssgi, ribbon_count.
-    pub const PACKET_HEADER_FLOATS: usize = 247;
+    /// quality.ssgi, ribbon_count, reverb.decay, reverb.damping, haptic_count.
+    pub const PACKET_HEADER_FLOATS: usize = 250;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -2240,8 +2296,9 @@ pub mod codec {
     pub const UI_NODE_FLOATS: usize = 24;
     /// Lanes: request, service, operation, a, b, c, d, value_count, before a service's values.
     pub const SERVICE_REQUEST_FLOATS: usize = 8;
-    /// Lanes: gain, lowpass, reverb.
-    pub const BUS_FLOATS: usize = 3;
+    /// Lanes: gain, lowpass, reverb, comp_threshold, comp_ratio, duck_bus, duck_amount,
+    /// eq_low_db, eq_mid_db, eq_high_db.
+    pub const BUS_FLOATS: usize = 10;
     /// Lanes: id, clip, bus, gain, pan, pitch, lowpass, reverb, looping, start, fade_in,
     /// fade_out.
     pub const VOICE_FLOATS: usize = 12;
@@ -2265,8 +2322,8 @@ pub mod codec {
     /// Lanes: position3, forward3, up3.
     pub const LISTENER_FLOATS: usize = 9;
     /// Lanes: voice, sound, position3, orientation3, distance_model, ref_distance,
-    /// max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain.
-    pub const PANNER_FLOATS: usize = 15;
+    /// max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain, hrtf.
+    pub const PANNER_FLOATS: usize = 16;
     /// Lanes: id_low, id_high, order, mesh, material, transform16, parameters count and
     /// parameters4.
     pub const INSTANCE_FLOATS: usize = 26;
@@ -2280,6 +2337,8 @@ pub mod codec {
     pub const MOTION_FLOATS: usize = 17;
     /// Lanes: ribbon, material, additive, position3, width, color4, soft_depth.
     pub const RIBBON_FLOATS: usize = 12;
+    /// Lanes: pad, low, high, duration.
+    pub const HAPTIC_FLOATS: usize = 4;
     /// Where each header lane and record field starts; an optional field's lanes
     /// follow its count.
     pub mod lanes {
@@ -2435,6 +2494,9 @@ pub mod codec {
             pub const MOTION_COUNT: usize = 244;
             pub const QUALITY_SSGI: usize = 245;
             pub const RIBBON_COUNT: usize = 246;
+            pub const REVERB_DECAY: usize = 247;
+            pub const REVERB_DAMPING: usize = 248;
+            pub const HAPTIC_COUNT: usize = 249;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -2493,6 +2555,13 @@ pub mod codec {
             pub const GAIN: usize = 0;
             pub const LOWPASS: usize = 1;
             pub const REVERB: usize = 2;
+            pub const COMP_THRESHOLD: usize = 3;
+            pub const COMP_RATIO: usize = 4;
+            pub const DUCK_BUS: usize = 5;
+            pub const DUCK_AMOUNT: usize = 6;
+            pub const EQ_LOW_DB: usize = 7;
+            pub const EQ_MID_DB: usize = 8;
+            pub const EQ_HIGH_DB: usize = 9;
         }
         pub mod voice {
             pub const ID: usize = 0;
@@ -2605,6 +2674,7 @@ pub mod codec {
             pub const CONE_INNER: usize = 12;
             pub const CONE_OUTER: usize = 13;
             pub const CONE_OUTER_GAIN: usize = 14;
+            pub const HRTF: usize = 15;
         }
         pub mod instance {
             pub const ID_LOW: usize = 0;
@@ -2643,6 +2713,12 @@ pub mod codec {
             pub const WIDTH: usize = 6;
             pub const COLOR: usize = 7;
             pub const SOFT_DEPTH: usize = 11;
+        }
+        pub mod haptic {
+            pub const PAD: usize = 0;
+            pub const LOW: usize = 1;
+            pub const HIGH: usize = 2;
+            pub const DURATION: usize = 3;
         }
         pub mod solid {
             pub const FACES: usize = 0;
@@ -3001,7 +3077,14 @@ pub mod codec {
             let gain = self.packet[lane];
             let lowpass = self.packet[lane + 1];
             let reverb = self.packet[lane + 2];
-            *bus = Bus { gain, lowpass, reverb };
+            let comp_threshold = self.packet[lane + 3];
+            let comp_ratio = self.packet[lane + 4];
+            let duck_bus = self.count(lane + 5, 15)?;
+            let duck_amount = self.packet[lane + 6];
+            let eq_low_db = self.packet[lane + 7];
+            let eq_mid_db = self.packet[lane + 8];
+            let eq_high_db = self.packet[lane + 9];
+            *bus = Bus { gain, lowpass, reverb, comp_threshold, comp_ratio, duck_bus: duck_bus as u32, duck_amount, eq_low_db, eq_mid_db, eq_high_db };
             Ok(())
         }
 
@@ -3143,7 +3226,8 @@ pub mod codec {
             let cone_inner = self.packet[lane + 12];
             let cone_outer = self.packet[lane + 13];
             let cone_outer_gain = self.packet[lane + 14];
-            *panner = Panner { voice: voice as u32, sound: sound as u32, position, orientation, distance_model: distance_model as u32, ref_distance, max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain };
+            let hrtf = self.flag(lane + 15)?;
+            *panner = Panner { voice: voice as u32, sound: sound as u32, position, orientation, distance_model: distance_model as u32, ref_distance, max_distance, rolloff, cone_inner, cone_outer, cone_outer_gain, hrtf };
             Ok(())
         }
 
@@ -3202,6 +3286,15 @@ pub mod codec {
             let color = Color { r: self.packet[lane + 7], g: self.packet[lane + 8], b: self.packet[lane + 9], a: self.packet[lane + 10] };
             let soft_depth = self.packet[lane + 11];
             *ribbon_point = RibbonPoint { ribbon: ribbon as u32, material, additive, position, width, color, soft_depth };
+            Ok(())
+        }
+
+        fn decode_haptic(&mut self, lane: usize, haptic: &mut Haptic) -> Result<()> {
+            let pad = self.count(lane, 15)?;
+            let low = self.packet[lane + 1];
+            let high = self.packet[lane + 2];
+            let duration = self.packet[lane + 3];
+            *haptic = Haptic { pad: pad as u32, low, high, duration };
             Ok(())
         }
     }
@@ -3272,6 +3365,7 @@ pub mod codec {
         let morph_weights_count = reader.count(236, MAX_MORPH_WEIGHTS)?;
         let motions_count = reader.count(244, MAX_MOTIONS)?;
         let ribbons_count = reader.count(246, MAX_RIBBONS)?;
+        let haptics_count = reader.count(249, MAX_HAPTICS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -3331,9 +3425,11 @@ pub mod codec {
         let motions_end = motions_start + motions_count * MOTION_FLOATS;
         let ribbons_start = motions_end;
         let ribbons_end = ribbons_start + ribbons_count * RIBBON_FLOATS;
-        let extras_start = ribbons_end;
+        let haptics_start = ribbons_end;
+        let haptics_end = haptics_start + haptics_count * HAPTIC_FLOATS;
+        let extras_start = haptics_end;
         let truncated = "game returned a truncated, oversized or nonfinite frame";
-        ensure!(packet.len() >= ribbons_end && packet.iter().all(|value| value.is_finite()), truncated);
+        ensure!(packet.len() >= haptics_end && packet.iter().all(|value| value.is_finite()), truncated);
         // What the records' tails claim of extras, in order.
         let mut extras_lanes = 0;
         for index in 0..draws_count {
@@ -3492,6 +3588,8 @@ pub mod codec {
         let dof_aperture = reader.packet[242];
         let dof_max_blur = reader.packet[243];
         let quality_ssgi = reader.flag(245)?;
+        let reverb_decay = reader.packet[247];
+        let reverb_damping = reader.packet[248];
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -3701,6 +3799,11 @@ pub mod codec {
         for (index, ribbon_point) in ribbons.iter_mut().enumerate() {
             reader.decode_ribbon_point(ribbons_start + index * RIBBON_FLOATS, ribbon_point)?;
         }
+        let mut haptics = std::mem::take(&mut frame.haptics);
+        resize(&mut haptics, haptics_count);
+        for (index, haptic) in haptics.iter_mut().enumerate() {
+            reader.decode_haptic(haptics_start + index * HAPTIC_FLOATS, haptic)?;
+        }
         *frame = RenderFrame {
             save_requested,
             load_requested,
@@ -3735,6 +3838,7 @@ pub mod codec {
             reflection: Reflection { budget: reflection_budget as u32 },
             motion_blur: MotionBlur { strength: motion_blur_strength, max_radius: motion_blur_max_radius, samples: motion_blur_samples as u32 },
             dof: Dof { focus_distance: dof_focus_distance, focus_range: dof_focus_range, aperture: dof_aperture, max_blur: dof_max_blur },
+            reverb: ReverbRoom { decay: reverb_decay, damping: reverb_damping },
             draws,
             solids,
             decals,
@@ -3762,6 +3866,7 @@ pub mod codec {
             morph_weights,
             motions,
             ribbons,
+            haptics,
             extensions,
         };
         Ok(&packet[state_start..state_end])
@@ -3847,6 +3952,7 @@ pub mod codec {
         let morph_weights_count = d.count(&header.field("morph_weight_count"), 236, MAX_MORPH_WEIGHTS)?;
         let motions_count = d.count(&header.field("motion_count"), 244, MAX_MOTIONS)?;
         let ribbons_count = d.count(&header.field("ribbon_count"), 246, MAX_RIBBONS)?;
+        let haptics_count = d.count(&header.field("haptic_count"), 249, MAX_HAPTICS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3906,7 +4012,9 @@ pub mod codec {
         let motions_end = d.end(&Location::section("motions"), motions_start, motions_count, MOTION_FLOATS)?;
         let ribbons_start = motions_end;
         let ribbons_end = d.end(&Location::section("ribbons"), ribbons_start, ribbons_count, RIBBON_FLOATS)?;
-        let extras_start = ribbons_end;
+        let haptics_start = ribbons_end;
+        let haptics_end = d.end(&Location::section("haptics"), haptics_start, haptics_count, HAPTIC_FLOATS)?;
+        let extras_start = haptics_end;
         let extras_cursor = &mut { extras_start };
         d.count(&header.field("save_requested"), 12, 1)?;
         d.count(&header.field("load_requested"), 13, 1)?;
@@ -4024,6 +4132,8 @@ pub mod codec {
         d.finite(&header.field("dof.aperture"), 242)?;
         d.finite(&header.field("dof.max_blur"), 243)?;
         d.count(&header.field("quality.ssgi"), 245, 1)?;
+        d.finite(&header.field("reverb.decay"), 247)?;
+        d.finite(&header.field("reverb.damping"), 248)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -4199,6 +4309,13 @@ pub mod codec {
             d.finite(&path.field("gain"), base)?;
             d.finite(&path.field("lowpass"), base + 1)?;
             d.finite(&path.field("reverb"), base + 2)?;
+            d.finite(&path.field("comp_threshold"), base + 3)?;
+            d.finite(&path.field("comp_ratio"), base + 4)?;
+            let duck_bus = d.count(&path.field("duck_bus"), base + 5, 15)?;
+            d.finite(&path.field("duck_amount"), base + 6)?;
+            d.finite(&path.field("eq_low_db"), base + 7)?;
+            d.finite(&path.field("eq_mid_db"), base + 8)?;
+            d.finite(&path.field("eq_high_db"), base + 9)?;
             base += BUS_FLOATS;
         }
         d.exhausted(&Location::section("buses"), base, buses_end)?;
@@ -4351,6 +4468,7 @@ pub mod codec {
             d.finite(&path.field("cone_inner"), base + 12)?;
             d.finite(&path.field("cone_outer"), base + 13)?;
             d.finite(&path.field("cone_outer_gain"), base + 14)?;
+            d.count(&path.field("hrtf"), base + 15, 1)?;
             base += PANNER_FLOATS;
         }
         d.exhausted(&Location::section("panners"), base, panners_end)?;
@@ -4418,6 +4536,16 @@ pub mod codec {
             base += RIBBON_FLOATS;
         }
         d.exhausted(&Location::section("ribbons"), base, ribbons_end)?;
+        let mut base = haptics_start;
+        for item in 0..haptics_count {
+            let path = &Location::section("haptics").index(item);
+            let pad = d.count(&path.field("pad"), base, 15)?;
+            d.finite(&path.field("low"), base + 1)?;
+            d.finite(&path.field("high"), base + 2)?;
+            d.finite(&path.field("duration"), base + 3)?;
+            base += HAPTIC_FLOATS;
+        }
+        d.exhausted(&Location::section("haptics"), base, haptics_end)?;
         inspect_extensions(d, *extras_cursor)?;
         Ok(())
     }
@@ -4468,6 +4596,7 @@ pub mod codec {
         let morph_weights_count = d.count(&header.field("morph_weight_count"), 236, MAX_MORPH_WEIGHTS)?;
         let motions_count = d.count(&header.field("motion_count"), 244, MAX_MOTIONS)?;
         let ribbons_count = d.count(&header.field("ribbon_count"), 246, MAX_RIBBONS)?;
+        let haptics_count = d.count(&header.field("haptic_count"), 249, MAX_HAPTICS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -4527,7 +4656,9 @@ pub mod codec {
         let motions_end = d.end(&Location::section("motions"), motions_start, motions_count, MOTION_FLOATS)?;
         let ribbons_start = motions_end;
         let ribbons_end = d.end(&Location::section("ribbons"), ribbons_start, ribbons_count, RIBBON_FLOATS)?;
-        let extras_start = ribbons_end;
+        let haptics_start = ribbons_end;
+        let haptics_end = d.end(&Location::section("haptics"), haptics_start, haptics_count, HAPTIC_FLOATS)?;
+        let extras_start = haptics_end;
         let mut end = extras_start;
         for item in 0..draws_count {
             let count = d.count(&Location::section("draws").index(item).field("extra"), draws_start + item * DRAW_FLOATS + 23, MAX_DRAW_EXTRA)?;
@@ -4666,7 +4797,7 @@ pub mod codec {
             frame.grade.vignette, frame.grade.vignette_radius, frame.reflection.budget as f32,
             frame.motion_blur.strength, frame.motion_blur.max_radius, frame.motion_blur.samples as f32,
             frame.dof.focus_distance, frame.dof.focus_range, frame.dof.aperture, frame.dof.max_blur,
-            state.len() as f32,
+            frame.reverb.decay, frame.reverb.damping, state.len() as f32,
         ]);
         out.extend_from_slice(state);
         out.push(frame.draws.len() as f32);
@@ -4780,6 +4911,10 @@ pub mod codec {
         for ribbon_point in &frame.ribbons {
             canonical_ribbon_point(&mut out, ribbon_point);
         }
+        out.push(frame.haptics.len() as f32);
+        for haptic in &frame.haptics {
+            canonical_haptic(&mut out, haptic);
+        }
         out
     }
 
@@ -4884,7 +5019,10 @@ pub mod codec {
     }
 
     fn canonical_bus(out: &mut Vec<f32>, bus: &Bus) {
-        out.extend([bus.gain, bus.lowpass, bus.reverb]);
+        out.extend([
+            bus.gain, bus.lowpass, bus.reverb, bus.comp_threshold, bus.comp_ratio, bus.duck_bus as f32,
+            bus.duck_amount, bus.eq_low_db, bus.eq_mid_db, bus.eq_high_db,
+        ]);
     }
 
     fn canonical_voice(out: &mut Vec<f32>, voice: &Voice) {
@@ -4968,7 +5106,7 @@ pub mod codec {
             panner.voice as f32, panner.sound as f32, panner.position.x, panner.position.y, panner.position.z,
             panner.orientation.x, panner.orientation.y, panner.orientation.z, panner.distance_model as f32,
             panner.ref_distance, panner.max_distance, panner.rolloff, panner.cone_inner, panner.cone_outer,
-            panner.cone_outer_gain,
+            panner.cone_outer_gain, f32::from(panner.hrtf),
         ]);
     }
 
@@ -5014,5 +5152,9 @@ pub mod codec {
             ribbon_point.color.r, ribbon_point.color.g, ribbon_point.color.b, ribbon_point.color.a,
             ribbon_point.soft_depth,
         ]);
+    }
+
+    fn canonical_haptic(out: &mut Vec<f32>, haptic: &Haptic) {
+        out.extend([haptic.pad as f32, haptic.low, haptic.high, haptic.duration]);
     }
 }

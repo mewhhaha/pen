@@ -64,6 +64,8 @@ const max_morph_weights = 65536
 const max_motions = 100000
 // The most ribbon trail control points one frame may declare.
 const max_ribbons = 65536
+// The most gamepad haptic rumble commands one frame may declare.
+const max_haptics = 32
 // The most buses one frame may declare, the master (bus 0) included.
 const max_buses = 16
 // Voice ids are whole numbers from 1 to this, the wire's exact-integer range.
@@ -800,7 +802,7 @@ const reports_op_queued = 2
 
 // Sizes in lanes.
 const packet_magic = 4670534.0
-const packet_header_floats = 247
+const packet_header_floats = 250
 const frame_header_floats = 5
 const event_floats = 5
 const extensions_marker = 5260632.0
@@ -815,7 +817,7 @@ const preference_floats = 256
 const field_floats = 7
 const ui_node_floats = 24
 const service_request_floats = 8
-const bus_floats = 3
+const bus_floats = 10
 const voice_floats = 12
 const pose_floats = 5
 const emitter_floats = 47
@@ -825,13 +827,14 @@ const probe_floats = 28
 const reflection_probe_floats = 21
 const fog_volume_floats = 15
 const listener_floats = 9
-const panner_floats = 15
+const panner_floats = 16
 const instance_floats = 26
 const instance_removal_floats = 2
 const bone_matrix_floats = 19
 const morph_weight_floats = 4
 const motion_floats = 17
 const ribbon_floats = 12
+const haptic_floats = 4
 
 // Where each header lane and record field starts.
 const header_magic_lane = 0
@@ -985,6 +988,9 @@ const header_dof_max_blur_lane = 243
 const header_motion_count_lane = 244
 const header_quality_ssgi_lane = 245
 const header_ribbon_count_lane = 246
+const header_reverb_decay_lane = 247
+const header_reverb_damping_lane = 248
+const header_haptic_count_lane = 249
 const draw_mesh_lane = 0
 const draw_material_lane = 1
 const draw_transform_lane = 2
@@ -1029,6 +1035,13 @@ const inset_after_sprites_lane = 47
 const bus_gain_lane = 0
 const bus_lowpass_lane = 1
 const bus_reverb_lane = 2
+const bus_comp_threshold_lane = 3
+const bus_comp_ratio_lane = 4
+const bus_duck_bus_lane = 5
+const bus_duck_amount_lane = 6
+const bus_eq_low_db_lane = 7
+const bus_eq_mid_db_lane = 8
+const bus_eq_high_db_lane = 9
 const voice_id_lane = 0
 const voice_clip_lane = 1
 const voice_bus_lane = 2
@@ -1121,6 +1134,7 @@ const panner_rolloff_lane = 11
 const panner_cone_inner_lane = 12
 const panner_cone_outer_lane = 13
 const panner_cone_outer_gain_lane = 14
+const panner_hrtf_lane = 15
 const instance_id_low_lane = 0
 const instance_id_high_lane = 1
 const instance_order_lane = 2
@@ -1147,6 +1161,10 @@ const ribbon_point_position_lane = 3
 const ribbon_point_width_lane = 6
 const ribbon_point_color_lane = 7
 const ribbon_point_soft_depth_lane = 11
+const haptic_pad_lane = 0
+const haptic_low_lane = 1
+const haptic_high_lane = 2
+const haptic_duration_lane = 3
 const solid_faces_lane = 0
 const field_patch_material_lane = 0
 const field_patch_width_lane = 1

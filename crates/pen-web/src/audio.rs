@@ -26,9 +26,9 @@ use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
     AnalyserNode, AudioBuffer, AudioBufferSourceNode, AudioContext, AudioContextOptions, AudioContextState, AudioNode,
-    AudioParam, BiquadFilterNode, BiquadFilterType, Blob, BlobPropertyBag, DistanceModelType, GainNode,
-    HtmlAudioElement, HtmlCanvasElement, MediaElementAudioSourceNode, PannerNode, PanningModelType, StereoPannerNode,
-    Url,
+    AudioParam, BiquadFilterNode, BiquadFilterType, Blob, BlobPropertyBag, ConvolverNode, DistanceModelType,
+    DynamicsCompressorNode, GainNode, HtmlAudioElement, HtmlCanvasElement, MediaElementAudioSourceNode, PannerNode,
+    PanningModelType, StereoPannerNode, Url,
 };
 const Q: f32 = -3.010_3;
 fn glide(param: &AudioParam, value: f32, context: &AudioContext) {
@@ -50,9 +50,18 @@ fn filter(context: &AudioContext, frequency: f32) -> Result<BiquadFilterNode> {
     node.frequency().set_value(frequency.min(context.sample_rate() / 2.0));
     Ok(node)
 }
+fn eq_filter(context: &AudioContext, kind: BiquadFilterType, freq: f32) -> Result<BiquadFilterNode> {
+    let node = context.create_biquad_filter().map_err(error)?;
+    node.set_type(kind);
+    node.frequency().set_value(freq);
+    node.q().set_value(1.0);
+    node.gain().set_value(0.0);
+    Ok(node)
+}
 /// Places `node` where `placement` says: its settings at once, its position
 /// and orientation gliding there, or at once as it starts.
 fn place(node: &PannerNode, placement: &Placement, context: &AudioContext, start: bool) {
+    node.set_panning_model(if placement.hrtf { PanningModelType::Hrtf } else { PanningModelType::Equalpower });
     node.set_distance_model(match placement.distance_model {
         distance_model::LINEAR => DistanceModelType::Linear,
         distance_model::EXPONENTIAL => DistanceModelType::Exponential,
@@ -207,6 +216,10 @@ impl Meter {
 }
 struct BusNodes {
     dry: BiquadFilterNode,
+    eq_low: BiquadFilterNode,
+    eq_mid: BiquadFilterNode,
+    eq_high: BiquadFilterNode,
+    compressor: DynamicsCompressorNode,
     send: BiquadFilterNode,
     gain: GainNode,
     send_gain: GainNode,
@@ -244,7 +257,9 @@ pub struct Audio {
     context: Option<AudioContext>,
     master: Option<BusNodes>,
     reverb_in: Option<GainNode>,
+    reverb_convolver: Option<ConvolverNode>,
     reverb_return: Option<GainNode>,
+    reverb_room: (f32, f32),
     buses: Vec<BusNodes>,
     clips: Rc<RefCell<HashMap<u32, Loaded>>>,
     loading: HashSet<u32>,
@@ -261,7 +276,9 @@ impl Audio {
             context: None,
             master: None,
             reverb_in: None,
+            reverb_convolver: None,
             reverb_return: None,
+            reverb_room: (0.0, 0.0),
             buses: Vec::new(),
             clips: Rc::new(RefCell::new(HashMap::new())),
             loading: HashSet::new(),
@@ -292,8 +309,18 @@ impl Audio {
         }
         let context = AudioContext::new_with_context_options(&options).map_err(error)?;
         let dry = filter(&context, AUDIO_OPEN as f32)?;
+        let eq_low = eq_filter(&context, BiquadFilterType::Lowshelf, 200.0)?;
+        let eq_mid = eq_filter(&context, BiquadFilterType::Peaking, 1000.0)?;
+        let eq_high = eq_filter(&context, BiquadFilterType::Highshelf, 4000.0)?;
+        let compressor = context.create_dynamics_compressor().map_err(error)?;
+        compressor.threshold().set_value(0.0);
+        compressor.ratio().set_value(1.0);
         let output = gain(&context, 1.0)?;
-        dry.connect_with_audio_node(&output).map_err(error)?;
+        dry.connect_with_audio_node(&eq_low).map_err(error)?;
+        eq_low.connect_with_audio_node(&eq_mid).map_err(error)?;
+        eq_mid.connect_with_audio_node(&eq_high).map_err(error)?;
+        eq_high.connect_with_audio_node(&compressor).map_err(error)?;
+        compressor.connect_with_audio_node(&output).map_err(error)?;
         output.connect_with_audio_node(&context.destination()).map_err(error)?;
         let input = gain(&context, 1.0)?;
         let convolver = context.create_convolver().map_err(error)?;
@@ -311,9 +338,20 @@ impl Audio {
         let send = filter(&context, AUDIO_OPEN as f32)?;
         send.connect_with_audio_node(&input).map_err(error)?;
         let meter = Meter::new(&context, &output)?;
-        self.master =
-            Some(BusNodes { dry, send, gain: output.clone(), send_gain: output, reverb: return_gain.clone(), meter });
+        self.master = Some(BusNodes {
+            dry,
+            eq_low,
+            eq_mid,
+            eq_high,
+            compressor,
+            send,
+            gain: output.clone(),
+            send_gain: output,
+            reverb: return_gain.clone(),
+            meter,
+        });
         self.reverb_in = Some(input);
+        self.reverb_convolver = Some(convolver);
         self.reverb_return = Some(return_gain);
         self.context = Some(context);
         Ok(())
@@ -334,18 +372,39 @@ impl Audio {
         };
         while self.buses.len() < index {
             let dry = filter(context, AUDIO_OPEN as f32)?;
+            let eq_low = eq_filter(context, BiquadFilterType::Lowshelf, 200.0)?;
+            let eq_mid = eq_filter(context, BiquadFilterType::Peaking, 1000.0)?;
+            let eq_high = eq_filter(context, BiquadFilterType::Highshelf, 4000.0)?;
+            let compressor = context.create_dynamics_compressor().map_err(error)?;
+            compressor.threshold().set_value(0.0);
+            compressor.ratio().set_value(1.0);
             let send = filter(context, AUDIO_OPEN as f32)?;
             let level = gain(context, 1.0)?;
             let send_gain = gain(context, 1.0)?;
             let reverb = gain(context, 0.0)?;
-            dry.connect_with_audio_node(&level).map_err(error)?;
+            dry.connect_with_audio_node(&eq_low).map_err(error)?;
+            eq_low.connect_with_audio_node(&eq_mid).map_err(error)?;
+            eq_mid.connect_with_audio_node(&eq_high).map_err(error)?;
+            eq_high.connect_with_audio_node(&compressor).map_err(error)?;
+            compressor.connect_with_audio_node(&level).map_err(error)?;
             level.connect_with_audio_node(&self.master.as_ref().unwrap().dry).map_err(error)?;
             level.connect_with_audio_node(&reverb).map_err(error)?;
             reverb.connect_with_audio_node(self.reverb_in.as_ref().unwrap()).map_err(error)?;
             send.connect_with_audio_node(&send_gain).map_err(error)?;
             send_gain.connect_with_audio_node(self.reverb_in.as_ref().unwrap()).map_err(error)?;
             let meter = Meter::new(context, &level)?;
-            self.buses.push(BusNodes { dry, send, gain: level, send_gain, reverb, meter });
+            self.buses.push(BusNodes {
+                dry,
+                eq_low,
+                eq_mid,
+                eq_high,
+                compressor,
+                send,
+                gain: level,
+                send_gain,
+                reverb,
+                meter,
+            });
         }
         Ok(())
     }
@@ -493,14 +552,45 @@ impl Audio {
         self.ensure_bus(needed - 1)?;
         let context = self.context.as_ref().unwrap().clone();
         let now = context.current_time();
+        let room = (
+            if frame.reverb.decay.is_finite() { frame.reverb.decay.max(0.0) } else { 0.0 },
+            if frame.reverb.damping.is_finite() { frame.reverb.damping.clamp(0.0, 1.0) } else { 0.0 },
+        );
+        if ((room.0 - self.reverb_room.0).abs() > 1e-3 || (room.1 - self.reverb_room.1).abs() > 1e-3)
+            && let Some(convolver) = &self.reverb_convolver
+        {
+            let channels = pen_runtime::reverb::impulse_response_for(
+                f64::from(context.sample_rate()),
+                f64::from(room.0),
+                f64::from(room.1),
+            );
+            let buffer =
+                context.create_buffer(2, u32::try_from(channels[0].len())?, context.sample_rate()).map_err(error)?;
+            buffer.copy_to_channel(&channels[0], 0).map_err(error)?;
+            buffer.copy_to_channel(&channels[1], 1).map_err(error)?;
+            convolver.set_buffer(Some(&buffer));
+            self.reverb_room = room;
+        }
+        let rms_by_bus: Vec<f32> = (0..=self.buses.len())
+            .map(|i| {
+                let (_, rms) = self.bus(i).meter.read();
+                rms[0].max(rms[1])
+            })
+            .collect();
         for index in 0..=self.buses.len() {
-            let mut fallback = Bus { gain: 1.0, lowpass: AUDIO_OPEN as f32, reverb: 0.0 };
+            let mut fallback = Bus { gain: 1.0, lowpass: AUDIO_OPEN as f32, reverb: 0.0, ..Bus::default() };
             if index == 0 {
                 fallback.reverb = 1.0;
             }
             let spec = frame.buses.get(index).unwrap_or(&fallback);
             let bus = self.bus(index);
-            let level = if self.monitor.audible(index) { spec.gain } else { 0.0 };
+            let duck = if spec.duck_amount.is_finite() && spec.duck_amount > 0.0 {
+                let sc = rms_by_bus.get(spec.duck_bus as usize).copied().unwrap_or(0.0);
+                (1.0 - spec.duck_amount.clamp(0.0, 1.0) * (sc * 2.0).clamp(0.0, 1.0)).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let level = if self.monitor.audible(index) { spec.gain * duck } else { 0.0 };
             glide(&bus.gain.gain(), level, &context);
             if index != 0 {
                 glide(&bus.send_gain.gain(), level, &context);
@@ -508,6 +598,17 @@ impl Audio {
             glide(&bus.dry.frequency(), spec.lowpass.min(context.sample_rate() / 2.0), &context);
             if index != 0 {
                 glide(&bus.send.frequency(), spec.lowpass.min(context.sample_rate() / 2.0), &context);
+            }
+            glide(&bus.eq_low.gain(), if spec.eq_low_db.is_finite() { spec.eq_low_db.clamp(-24.0, 24.0) } else { 0.0 }, &context);
+            glide(&bus.eq_mid.gain(), if spec.eq_mid_db.is_finite() { spec.eq_mid_db.clamp(-24.0, 24.0) } else { 0.0 }, &context);
+            glide(&bus.eq_high.gain(), if spec.eq_high_db.is_finite() { spec.eq_high_db.clamp(-24.0, 24.0) } else { 0.0 }, &context);
+            if spec.comp_threshold.is_finite() && spec.comp_threshold > 0.0 && spec.comp_ratio.is_finite() && spec.comp_ratio > 1.0 {
+                let thresh_db = (20.0 * spec.comp_threshold.max(1e-4).log10()).clamp(-100.0, 0.0);
+                bus.compressor.threshold().set_value(thresh_db);
+                bus.compressor.ratio().set_value(spec.comp_ratio.clamp(1.0, 20.0));
+            } else {
+                bus.compressor.threshold().set_value(0.0);
+                bus.compressor.ratio().set_value(1.0);
             }
             glide(&bus.reverb.gain(), spec.reverb, &context);
         }
@@ -640,7 +741,7 @@ pub async fn qualify() -> Result<()> {
     buffer.copy_to_channel(&tone, 0).map_err(error)?;
     audio.clips.borrow_mut().insert(0, Loaded::Buffer(buffer));
     let mut frame = RenderFrame::default();
-    frame.buses.push(Bus { gain: 0.1, lowpass: 5000.0, reverb: 0.1 });
+    frame.buses.push(Bus { gain: 0.1, lowpass: 5000.0, reverb: 0.1, ..Bus::default() });
     frame.voices.push(Voice {
         id: 1,
         clip: 0,
@@ -724,7 +825,7 @@ pub async fn qualify() -> Result<()> {
     );
     frame.voices.pop();
     // The dev tools' meters and mute, on a second bus.
-    frame.buses.push(Bus { gain: 0.5, lowpass: AUDIO_OPEN as f32, reverb: 0.0 });
+    frame.buses.push(Bus { gain: 0.5, lowpass: AUDIO_OPEN as f32, reverb: 0.0, ..Bus::default() });
     anyhow::ensure!(audio.monitor(1, true, true), "a host with sound mutes");
     audio.mix(&frame, &Placements::of(&frame))?;
     let report = audio.report().ok_or_else(|| anyhow::anyhow!("no audio report"))?;

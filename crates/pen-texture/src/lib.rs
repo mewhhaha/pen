@@ -17,3 +17,5 @@ pub mod etc2;
 pub mod mips;
 #[cfg(feature = "tools")]
 pub mod msdf;
+#[cfg(feature = "tools")]
+pub mod shaping;

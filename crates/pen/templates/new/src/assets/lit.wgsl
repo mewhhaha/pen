@@ -1911,7 +1911,7 @@ const LOBES: u32 = 0u;
   var s = surface_default(surface.world, normal, view, draw.color.rgb, draw.parameters.x, roughness, surface.position, seen.z);
   s = surface_apply_block(s, draw.surface, LOBES, length(draw.model[0].xyz));
   // A frame for anisotropy: the mesh's tangents if it has them (add
-  // `@location(3) tangent: vec4f` to Vertex and Surface), else the uv's
+  // `@location(11) tangent: vec4f` to Vertex and Surface), else the uv's
   // direction from the screen-space derivatives (call it where every fragment does):
   //   let tangent = surface_tangent(surface.tangent, surface_derived_tangent(surface.world, normal, surface.uv));
   //   s = surface_frame(s, tangent.xyz, tangent.w, draw.surface[1].w);

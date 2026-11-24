@@ -266,7 +266,7 @@ block, lobes, model_scale)` reads it for the lobes `lobes` names (the thickness 
 rotation is `block[1].w` for `surface_frame`. The subsurface has no block
 parameters: set `s.subsurface`, `s.subsurface_color` and `s.thin` yourself.
 
-**Frames for anisotropy and parallax.** A mesh may carry tangents (`@location(3)
+**Frames for anisotropy and parallax.** A mesh may carry tangents (`@location(11)
 tangent: vec4f`, xyz and the handedness in w); a mesh without them binds a zero
 stream. `surface_derived_tangent(world, normal, uv)` makes one from the screen-space
 derivatives of the position and the uv (call it in uniform control flow, where every

@@ -1,6 +1,6 @@
 //! The standard surface through the whole renderer on a real (headless) GPU:
 //! a row of materials under the sky, the sun and a light (clear coat, sheen,
-//! anisotropy, subsurface, and glass over a stand-in picture), the base lobe
+//! anisotropy, subsurface, and glass over the opaque picture), the base lobe
 //! rendered bit for bit as the functions it replaced drew it, the stretch of
 //! an anisotropic highlight against the f64 reference, and a brick wall seen
 //! across its face with and without parallax. Pictures go to
@@ -363,7 +363,7 @@ struct Corner {
 }
 "#;
 
-// A checkered wall in screen space: what the glass's stand-in picture shows
+// A checkered wall in screen space: what the glass refracts
 // where nothing else has been drawn (`opaque_behind` evaluates the same
 // pattern at the uv it is asked for).
 const CHECKER: &str = r#"
@@ -385,32 +385,12 @@ struct Corner { @builtin(position) position: vec4f };
 }
 "#;
 
-/// The translucency library's functions as this test stands them in: the
-/// picture behind is the checkered wall's pattern, which the wall's shader
-/// draws at the same screen uv.
-const STAND_IN: &str = r#"
-fn checker(uv: vec2f) -> vec3f {
-  let cell = floor(uv * vec2f(18.0, 12.0));
-  let odd = (i32(cell.x) + i32(cell.y)) & 1;
-  return select(vec3f(0.55, 0.32, 0.22), vec3f(0.2, 0.3, 0.5), odd == 1);
-}
-fn opaque_available() -> bool { return true; }
-fn opaque_levels() -> f32 { return 8.0; }
-fn opaque_world_uv(world: vec3f) -> vec2f {
-  let clip = scene.projection * scene.view * vec4f(world, 1.0);
-  return vec2f(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
-}
-fn opaque_behind(uv: vec2f, level: f32) -> vec3f {
-  return mix(checker(clamp(uv, vec2f(0.0), vec2f(0.9999))), vec3f(0.42, 0.3, 0.3), clamp(level / 8.0 * 1.4, 0.0, 1.0));
-}
-"#;
-
 fn spheres_shader(with_transmission: bool) -> String {
     SPHERES
         .replace("${lights}", pen_render::LIGHTS_WGSL)
         .replace("${environment}", pen_render::ENVIRONMENT_WGSL)
         .replace("${surface}", &format!("{}\n{}", pen_render::SURFACE_LOBES_WGSL, pen_render::SURFACE_WGSL))
-        .replace("${stand_in}", if with_transmission { STAND_IN } else { "" })
+        .replace("${stand_in}", if with_transmission { pen_render::TRANSLUCENCY_WGSL } else { "" })
         .replace("${transmission}", if with_transmission { pen_render::SURFACE_TRANSMISSION_WGSL } else { "" })
         .replace("${transmit}", if with_transmission { "s = surface_transmit(s);" } else { "" })
 }
@@ -450,7 +430,7 @@ fn sheet() -> [(&'static str, [f32; 4], [f32; 2], Look); 6] {
             },
         ),
         (
-            "glass (over a stand-in picture)",
+            "glass (over the opaque picture)",
             [0.9, 0.97, 1.0, 1.0],
             [0.0, 0.05],
             Look {
@@ -559,7 +539,8 @@ fn a_row_of_materials_under_the_sky_the_sun_and_a_light() {
         let shader = if index == 5 { "glass.wgsl" } else { "standard.wgsl" };
         files.push((
             format!("look{index}.material.json"),
-            format!(r#"{{"shader":"{shader}","color":{color:?},"lighting":"unlit"}}"#).into_bytes(),
+            format!(r#"{{"shader":"{shader}","color":{color:?},"lighting":"unlit","blend":{}}}"#, index == 5)
+                .into_bytes(),
         ));
         materials.push(format!("\"look{index}.material.json\""));
     }

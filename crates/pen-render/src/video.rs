@@ -248,6 +248,123 @@ impl Y4mStream {
     }
 }
 
+/// Memory-efficient Y4M stream backed by a single owned byte buffer and per-frame offsets
+/// (zero per-frame allocations or plane copies).
+#[derive(Clone, Debug)]
+pub struct IndexedY4mStream {
+    pub width: u32,
+    pub height: u32,
+    pub fps_num: u32,
+    pub fps_den: u32,
+    pub color_space: ColorSpace,
+    pub siting: ChromaSiting,
+    bytes: Vec<u8>,
+    frame_offsets: Vec<usize>,
+    y_len: usize,
+    uv_len: usize,
+}
+
+impl IndexedY4mStream {
+    pub fn fps(&self) -> f64 {
+        if self.fps_den == 0 || self.fps_num == 0 {
+            30.0
+        } else {
+            f64::from(self.fps_num) / f64::from(self.fps_den)
+        }
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.frame_offsets.len()
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Indexes `bytes` in-place after validating payload byte budget and dimensions against `max_dim`.
+    pub fn parse_with_limits(
+        bytes: Vec<u8>,
+        default_matrix: ColorMatrix,
+        max_dim: u32,
+        max_bytes: usize,
+    ) -> Result<Self> {
+        ensure!(bytes.len() <= max_bytes, "Y4M payload {} bytes exceeds {max_bytes}-byte limit", bytes.len());
+        let header_end = bytes.iter().position(|&b| b == b'\n').context("Y4M missing header newline")?;
+        let header = std::str::from_utf8(&bytes[..header_end]).context("Y4M header not UTF-8")?;
+        let mut tokens = header.split_ascii_whitespace();
+        ensure!(tokens.next() == Some("YUV4MPEG2"), "not a YUV4MPEG2 stream");
+        let (mut width, mut height) = (0u32, 0u32);
+        let (mut fps_num, mut fps_den) = (30u32, 1u32);
+        let mut siting = ChromaSiting::Centered;
+        let mut range = ColorRange::Limited;
+        for tok in tokens {
+            if let Some(rest) = tok.strip_prefix('W') {
+                width = rest.parse().context("invalid Y4M width")?;
+            } else if let Some(rest) = tok.strip_prefix('H') {
+                height = rest.parse().context("invalid Y4M height")?;
+            } else if let Some(rest) = tok.strip_prefix('F') {
+                let (n, d) = rest.split_once(':').context("invalid Y4M frame rate")?;
+                fps_num = n.parse().context("invalid Y4M fps numerator")?;
+                fps_den = d.parse().context("invalid Y4M fps denominator")?;
+                ensure!(fps_num > 0 && fps_den > 0, "Y4M frame rate must be positive");
+            } else if let Some(rest) = tok.strip_prefix('C') {
+                match rest {
+                    "420" | "420jpeg" => siting = ChromaSiting::Centered,
+                    "420mpeg2" => siting = ChromaSiting::Left,
+                    "420paldv" => siting = ChromaSiting::TopLeft,
+                    other => bail!("unsupported Y4M chroma format C{other} (only 420 variants supported)"),
+                }
+            } else if let Some(val) = tok.strip_prefix("XCOLORRANGE=") {
+                if val.eq_ignore_ascii_case("FULL") {
+                    range = ColorRange::Full;
+                } else if val.eq_ignore_ascii_case("LIMITED") {
+                    range = ColorRange::Limited;
+                }
+            }
+        }
+        let dim_limit = max_dim.min(MAX_VIDEO_DIM);
+        ensure!(
+            width >= 2
+                && height >= 2
+                && width <= dim_limit
+                && height <= dim_limit
+                && width.is_multiple_of(2)
+                && height.is_multiple_of(2),
+            "invalid Y4M dimensions {width}x{height} (limit {dim_limit})"
+        );
+        let color_space = ColorSpace::from_parts(default_matrix, range);
+        let y_len = (width as usize).checked_mul(height as usize).context("Y4M frame size overflow")?;
+        let uv_len = ((width / 2) as usize).checked_mul((height / 2) as usize).context("Y4M chroma overflow")?;
+        let frame_bytes = y_len.checked_add(uv_len * 2).context("Y4M total frame overflow")?;
+        let mut frame_offsets = Vec::new();
+        let mut at = header_end + 1;
+        while at < bytes.len() {
+            let nl = bytes[at..].iter().position(|&b| b == b'\n').context("truncated Y4M FRAME header")?;
+            let line = std::str::from_utf8(&bytes[at..at + nl]).context("Y4M FRAME header not UTF-8")?;
+            let line_trimmed = line.trim_end_matches('\r');
+            ensure!(
+                line_trimmed == "FRAME" || line_trimmed.starts_with("FRAME "),
+                "expected Y4M FRAME marker, got {line:?}"
+            );
+            at += nl + 1;
+            let end = at.checked_add(frame_bytes).context("Y4M frame offset overflow")?;
+            ensure!(end <= bytes.len(), "truncated Y4M frame payload");
+            frame_offsets.push(at);
+            at = end;
+        }
+        ensure!(!frame_offsets.is_empty(), "Y4M stream contains no frames");
+        Ok(Self { width, height, fps_num, fps_den, color_space, siting, bytes, frame_offsets, y_len, uv_len })
+    }
+
+    pub fn frame_planes(&self, index: usize) -> (&[u8], &[u8], &[u8]) {
+        let off = self.frame_offsets[index];
+        let y = &self.bytes[off..off + self.y_len];
+        let u = &self.bytes[off + self.y_len..off + self.y_len + self.uv_len];
+        let v = &self.bytes[off + self.y_len + self.uv_len..off + self.y_len + 2 * self.uv_len];
+        (y, u, v)
+    }
+}
+
 /// One compressed elementary frame extracted from an IVF (`DKIF`) container.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IvfFrame {
@@ -299,9 +416,14 @@ impl IvfStream {
     }
 }
 
+enum VideoSource {
+    Owned(Y4mStream),
+    Indexed(IndexedY4mStream),
+}
+
 /// Wall-clock video stream player tracking current frame index, looping, and pause.
 pub struct VideoPlayer {
-    stream: Y4mStream,
+    source: VideoSource,
     elapsed: f64,
     frame_index: usize,
     pub looping: bool,
@@ -311,7 +433,33 @@ pub struct VideoPlayer {
 impl VideoPlayer {
     pub fn from_y4m(stream: Y4mStream, looping: bool) -> Result<Self> {
         ensure!(!stream.frames.is_empty(), "VideoPlayer requires at least one frame");
-        Ok(Self { stream, elapsed: 0.0, frame_index: 0, looping, paused: false })
+        Ok(Self { source: VideoSource::Owned(stream), elapsed: 0.0, frame_index: 0, looping, paused: false })
+    }
+
+    pub fn from_indexed_y4m(stream: IndexedY4mStream, looping: bool) -> Result<Self> {
+        ensure!(stream.frame_count() > 0, "VideoPlayer requires at least one frame");
+        Ok(Self { source: VideoSource::Indexed(stream), elapsed: 0.0, frame_index: 0, looping, paused: false })
+    }
+
+    pub fn fps(&self) -> f64 {
+        match &self.source {
+            VideoSource::Owned(s) => s.fps(),
+            VideoSource::Indexed(s) => s.fps(),
+        }
+    }
+
+    pub fn frame_count(&self) -> usize {
+        match &self.source {
+            VideoSource::Owned(s) => s.frames.len(),
+            VideoSource::Indexed(s) => s.frame_count(),
+        }
+    }
+
+    pub fn byte_len(&self) -> usize {
+        match &self.source {
+            VideoSource::Owned(s) => s.frames.iter().map(|f| f.y.len() + f.u.len() + f.v.len()).sum(),
+            VideoSource::Indexed(s) => s.byte_len(),
+        }
     }
 
     pub fn current_index(&self) -> usize {
@@ -319,31 +467,82 @@ impl VideoPlayer {
     }
 
     pub fn current_frame(&self) -> &Yuv420Frame {
-        &self.stream.frames[self.frame_index]
+        match &self.source {
+            VideoSource::Owned(s) => &s.frames[self.frame_index],
+            VideoSource::Indexed(_) => panic!("current_frame() requires Owned Y4mStream; use current_planes() for IndexedY4mStream"),
+        }
+    }
+
+    /// Zero-copy planar view `(width, height, color_space, siting, y, u, v)` of the current frame.
+    pub fn current_planes(&self) -> (u32, u32, ColorSpace, ChromaSiting, &[u8], &[u8], &[u8]) {
+        match &self.source {
+            VideoSource::Owned(s) => {
+                let f = &s.frames[self.frame_index];
+                (f.width, f.height, f.color_space, f.siting, &f.y, &f.u, &f.v)
+            }
+            VideoSource::Indexed(s) => {
+                let (y, u, v) = s.frame_planes(self.frame_index);
+                (s.width, s.height, s.color_space, s.siting, y, u, v)
+            }
+        }
     }
 
     pub fn seek_frame(&mut self, index: usize) {
-        self.frame_index = index.min(self.stream.frames.len().saturating_sub(1));
-        self.elapsed = self.frame_index as f64 / self.stream.fps();
+        let total = self.frame_count();
+        self.frame_index = if self.looping {
+            index % total
+        } else {
+            index.min(total.saturating_sub(1))
+        };
+        self.elapsed = self.frame_index as f64 / self.fps();
+    }
+
+    /// Seeks to an absolute timestamp `time_s` scaled by `speed` (defaulting to `1.0` if non-positive),
+    /// applying looping modulo in floating-point duration BEFORE integer frame indexing, and honoring
+    /// seeks regardless of `paused`. Returns the selected frame index.
+    pub fn seek_time(&mut self, time_s: f64, speed: f64) -> usize {
+        let effective_speed = if speed.is_finite() && speed > 0.0 { speed } else { 1.0 };
+        let scaled = if time_s.is_finite() { time_s.max(0.0) * effective_speed } else { 0.0 };
+        let total = self.frame_count();
+        let fps = self.fps();
+        let duration = total as f64 / fps;
+        let next = if self.looping {
+            let wrapped = scaled.rem_euclid(duration);
+            let idx = (wrapped * fps).floor() as usize;
+            idx.min(total - 1)
+        } else if scaled >= duration {
+            total - 1
+        } else {
+            ((scaled * fps).floor() as usize).min(total - 1)
+        };
+        self.frame_index = next;
+        self.elapsed = next as f64 / fps;
+        next
     }
 
     /// Advances playback by `dt` seconds and returns `Some(&Yuv420Frame)` whenever
-    /// the displayed frame index changes.
+    /// the displayed frame index changes (for owned `Y4mStream` players).
     pub fn advance(&mut self, dt: f64) -> Option<&Yuv420Frame> {
         if self.paused || !dt.is_finite() || dt <= 0.0 {
             return None;
         }
-        self.elapsed += dt;
-        let total = self.stream.frames.len();
-        let raw = (self.elapsed * self.stream.fps()).floor() as usize;
+        let next_elapsed = self.elapsed + dt;
+        let prev = self.frame_index;
+        let total = self.frame_count();
+        let fps = self.fps();
+        let duration = total as f64 / fps;
         let next = if self.looping {
-            raw % total
+            let wrapped = next_elapsed.rem_euclid(duration);
+            ((wrapped * fps).floor() as usize).min(total - 1)
+        } else if next_elapsed >= duration {
+            total - 1
         } else {
-            raw.min(total - 1)
+            ((next_elapsed * fps).floor() as usize).min(total - 1)
         };
-        if next != self.frame_index {
+        self.elapsed = next_elapsed;
+        if next != prev {
             self.frame_index = next;
-            Some(&self.stream.frames[self.frame_index])
+            Some(self.current_frame())
         } else {
             None
         }
@@ -574,14 +773,42 @@ impl VideoTexture {
         frame: &Yuv420Frame,
     ) -> Result<()> {
         frame.validate(MAX_VIDEO_DIM)?;
-        ensure!(
-            frame.width == self.width && frame.height == self.height,
-            "frame size {}x{} does not match VideoTexture {}x{}",
+        self.upload_planes(
+            queue,
+            encoder,
             frame.width,
             frame.height,
+            frame.color_space,
+            frame.siting,
+            &frame.y,
+            &frame.u,
+            &frame.v,
+        )
+    }
+
+    /// Zero-copy planar YUV420p upload and GPU conversion pass into `encoder`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_planes(
+        &self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        width: u32,
+        height: u32,
+        color_space: ColorSpace,
+        siting: ChromaSiting,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+    ) -> Result<()> {
+        ensure!(
+            width == self.width && height == self.height,
+            "frame size {width}x{height} does not match VideoTexture {}x{}",
             self.width,
             self.height
         );
+        let y_len = (width as usize).checked_mul(height as usize).context("Y plane size overflow")?;
+        let uv_len = ((width / 2) as usize).checked_mul((height / 2) as usize).context("UV plane size overflow")?;
+        ensure!(y.len() == y_len && u.len() == uv_len && v.len() == uv_len, "YUV420 plane sizes mismatch");
         let write_plane = |tex: &wgpu::Texture, w: u32, h: u32, data: &[u8]| {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -595,23 +822,23 @@ impl VideoTexture {
                 wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             );
         };
-        write_plane(&self.y_tex, self.width, self.height, &frame.y);
-        write_plane(&self.u_tex, self.width / 2, self.height / 2, &frame.u);
-        write_plane(&self.v_tex, self.width / 2, self.height / 2, &frame.v);
+        write_plane(&self.y_tex, self.width, self.height, y);
+        write_plane(&self.u_tex, self.width / 2, self.height / 2, u);
+        write_plane(&self.v_tex, self.width / 2, self.height / 2, v);
         let cw = (self.width / 2) as f32;
         let ch = (self.height / 2) as f32;
         // Shift sample coordinates so hardware bilinear taps match 4:2:0 chroma siting:
         // Centered: texel center aligns with 2x2 luma center -> shift (0, 0).
         // Left (MPEG-2): chroma sits 0.25 chroma texels left of center -> shift (+0.25/cw, 0).
         // TopLeft (PAL-DV): chroma sits 0.25 chroma texels top-left -> shift (+0.25/cw, +0.25/ch).
-        let (shift_u, shift_v) = match frame.siting {
+        let (shift_u, shift_v) = match siting {
             ChromaSiting::Centered => (0.0, 0.0),
             ChromaSiting::Left => (0.25 / cw, 0.0),
             ChromaSiting::TopLeft => (0.25 / cw, 0.25 / ch),
         };
         let uniform = YuvUniform {
-            colorspace: frame.color_space as u32,
-            siting: frame.siting as u32,
+            colorspace: color_space as u32,
+            siting: siting as u32,
             chroma_shift_u: shift_u,
             chroma_shift_v: shift_v,
         };
@@ -737,6 +964,40 @@ mod tests {
         let mut zero_tb = ivf.clone();
         zero_tb[16..20].copy_from_slice(&0u32.to_le_bytes());
         assert!(IvfStream::parse(&zero_tb).is_err(), "zero IVF timebase must be rejected");
+    }
+
+    #[test]
+    fn video_player_seek_time_loops_accurately_honors_paused_seeks_and_indexed_limits() {
+        // 3 frames at 2 fps (duration = 1.5 s): looping seek to 2.0 s -> 0.5 s -> frame 1.
+        let mut raw = b"YUV4MPEG2 W4 H4 F2:1 Ip C420jpeg\n".to_vec();
+        for f in 0..3u8 {
+            raw.extend_from_slice(b"FRAME\n");
+            raw.extend(std::iter::repeat_n(40 + f * 60, 16));
+            raw.extend(std::iter::repeat_n(128u8, 8));
+        }
+        // Byte limit and dimension limit reject oversized streams before scanning frames.
+        assert!(IndexedY4mStream::parse_with_limits(raw.clone(), ColorMatrix::Bt709, 64, raw.len() - 1).is_err());
+        assert!(IndexedY4mStream::parse_with_limits(raw.clone(), ColorMatrix::Bt709, 2, raw.len()).is_err());
+
+        let indexed = IndexedY4mStream::parse_with_limits(raw.clone(), ColorMatrix::Bt709, 64, raw.len()).unwrap();
+        assert_eq!(indexed.frame_count(), 3);
+        assert_eq!(indexed.frame_planes(1).0[0], 100);
+        assert_eq!(indexed.frame_planes(2).0[0], 160);
+
+        let mut player = VideoPlayer::from_indexed_y4m(indexed, true).unwrap();
+        // Looping seek to 2.0s (4 frames mod 3 = frame 1).
+        assert_eq!(player.seek_time(2.0, 1.0), 1);
+        assert_eq!(player.current_index(), 1);
+        assert_eq!(player.current_planes().4[0], 100);
+        // Large looping timestamp does not saturate/overflow: 1_000_000.0 % 1.5 == 1.0s -> frame 2.
+        assert_eq!(player.seek_time(1_000_000.0, 1.0), 2);
+        // Paused player still honors explicit timestamp seeks.
+        player.paused = true;
+        assert_eq!(player.seek_time(1.0, 1.0), 2);
+        assert_eq!(player.current_index(), 2);
+        // Non-looping clamps at last frame.
+        player.looping = false;
+        assert_eq!(player.seek_time(10.0, 1.0), 2);
     }
 
     #[test]

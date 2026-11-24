@@ -502,6 +502,10 @@ struct Scene {
   horizon: vec4f,
   ground: vec4f,
   eye: vec4f,
+  cascades: vec4f,
+  cascade_view_projection: array<mat4x4f, 4>,
+  cascade_texels: array<vec4f, 4>,
+  shadow_params: vec4f,
 };
 struct Draw {
   model: mat4x4f,
@@ -511,6 +515,10 @@ struct Draw {
   parameters: vec4f,
   extra: array<vec4f, 32>,
   surface: array<vec4f, 5>,
+  uv_transform: vec4f,
+  maps: vec4f,
+  atlas: vec4f,
+  iridescence: vec4f,
 };
 @group(0) @binding(0) var<uniform> scene: Scene;
 @group(1) @binding(0) var<uniform> draw: Draw;
@@ -749,7 +757,7 @@ impl ShaderGraph {
                 ShaderNodeKind::Time => {
                     uses_time = true;
                     if material_mode {
-                        writeln!(body, "  let {vname}: f32 = draw.parameters.x;")?;
+                        writeln!(body, "  let {vname}: f32 = scene.shadow_params.z;")?;
                     } else {
                         writeln!(body, "  let {vname}: f32 = sg_u.time_and_params.x;")?;
                     }
@@ -810,7 +818,7 @@ impl ShaderGraph {
                         )?;
                         writeln!(
                             body,
-                            "  let {vname}: vec4f = select(vec4f({}, {}, {}, 1.0), {vname}_tex, draw.settings.x > 0.5);",
+                            "  let {vname}: vec4f = select(vec4f({}, {}, {}, 1.0), {vname}_tex, draw.atlas.y > 0.5);",
                             fmt_f32(fallback_color[0]),
                             fmt_f32(fallback_color[1]),
                             fmt_f32(fallback_color[2])
@@ -1069,6 +1077,7 @@ impl ShaderGraph {
         if material_mode {
             let mut wgsl = String::with_capacity(
                 MATERIAL_HELPERS_WGSL.len()
+                    + crate::SHADOWS_WGSL.len()
                     + crate::LIGHTS_WGSL.len()
                     + crate::ENVIRONMENT_WGSL.len()
                     + crate::SURFACE_LOBES_WGSL.len()
@@ -1077,6 +1086,8 @@ impl ShaderGraph {
                     + 1024,
             );
             wgsl.push_str(MATERIAL_HELPERS_WGSL);
+            wgsl.push('\n');
+            wgsl.push_str(crate::SHADOWS_WGSL);
             wgsl.push('\n');
             wgsl.push_str(crate::LIGHTS_WGSL);
             wgsl.push('\n');
@@ -1089,22 +1100,32 @@ impl ShaderGraph {
             writeln!(wgsl, "  let in_n = normalize(in_v.world_normal);")?;
             writeln!(wgsl, "  let in_view = normalize(scene.eye.xyz - in_v.world_pos);")?;
             wgsl.push_str(&body);
+            writeln!(wgsl, "  let sg_alpha = clamp(({}) * draw.color.a, 0.0, 1.0);", out_exprs.6)?;
+            writeln!(wgsl, "  if (draw.settings.y > 0.0 && sg_alpha < draw.settings.y) {{ discard; }}")?;
+            writeln!(wgsl, "  let sg_base = ({}) * draw.color.rgb;", out_exprs.0)?;
+            writeln!(wgsl, "  let sg_emissive = {};", out_exprs.4)?;
+            writeln!(wgsl, "  if (draw.settings.x <= 0.5) {{ return vec4f(sg_base + sg_emissive, sg_alpha); }}")?;
             writeln!(
                 wgsl,
-                "  var s = surface_default(in_v.world_pos, {}, in_view, ({}) * draw.color.rgb, clamp({}, 0.0, 1.0), clamp({}, 0.04, 1.0), in_v.clip, in_v.view_z);",
-                out_exprs.3, out_exprs.0, out_exprs.1, out_exprs.2
+                "  let sg_normal = {};",
+                out_exprs.3
+            )?;
+            writeln!(
+                wgsl,
+                "  var s = surface_default(in_v.world_pos, sg_normal, in_view, sg_base, clamp({}, 0.0, 1.0), clamp({}, 0.04, 1.0), in_v.clip, in_v.view_z);",
+                out_exprs.1, out_exprs.2
             )?;
             writeln!(wgsl, "  s.occlusion = clamp({}, 0.0, 1.0);", out_exprs.5)?;
             writeln!(wgsl, "  let sg_coat = clamp({}, 0.0, 1.0);", out_exprs.7)?;
             writeln!(wgsl, "  if (sg_coat > 0.0) {{ s.lobes |= SURFACE_COAT; s.coat = sg_coat; s.coat_roughness = 0.08; }}")?;
             writeln!(wgsl, "  let sg_irid = clamp({}, 0.0, 1.0);", out_exprs.8)?;
             writeln!(wgsl, "  if (sg_irid > 0.0) {{ s.lobes |= SURFACE_IRIDESCENCE; s.iridescence = sg_irid; }}")?;
+            writeln!(wgsl, "  let sg_vis = sun_shadow(in_v.world_pos, sg_normal, in_v.clip);")?;
             writeln!(
                 wgsl,
-                "  let lit = standard_surface(s) + standard_sun(s, scene.light_direction.xyz, scene.light_color.rgb, 1.0) + ({});",
-                out_exprs.4
+                "  let lit = standard_surface(s) + standard_sun(s, scene.light_direction.xyz, scene.light_color.rgb, sg_vis) + sg_emissive;"
             )?;
-            writeln!(wgsl, "  return vec4f(lit, clamp(({}) * draw.color.a, 0.0, 1.0));", out_exprs.6)?;
+            writeln!(wgsl, "  return vec4f(lit, sg_alpha);")?;
             writeln!(wgsl, "}}")?;
             return Ok(CompiledShaderGraph { name: self.name.clone(), wgsl, node_count: order.len(), uses_time });
         }

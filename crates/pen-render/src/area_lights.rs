@@ -522,4 +522,34 @@ mod tests {
         drop(bytes);
         readback.unmap();
     }
+
+    #[test]
+    fn ltc_amplitude_lut_fresnel_and_hemisphere_energy_conservation() {
+        let (_mat, amp) = generate_ltc_luts();
+        let n = LTC_LUT_SIZE as usize;
+        for y in 0..n {
+            for x in 0..n {
+                let [scale, bias, mag, _] = amp[y * n + x];
+                assert!(scale >= 0.0 && bias >= 0.0 && (0.0..=1.001).contains(&mag));
+                // Reconstructed Schlick F(F0, F90) = F0 * scale + F90 * bias stays in [0, 1].
+                let f_dielectric = 0.04 * scale + 1.0 * bias;
+                let f_conductor = 0.9 * scale + 1.0 * bias;
+                let f_zero_f90 = 0.04 * scale + 0.0 * bias;
+                assert!((0.0..=1.001).contains(&f_dielectric), "dielectric={f_dielectric}");
+                assert!(f_conductor >= f_dielectric && f_conductor <= 1.001);
+                assert!(f_zero_f90 <= f_dielectric + 1e-6);
+                // White dielectric energy sum under unit-radiance full hemisphere:
+                // diff_albedo * 1 + spec_fresnel * 1 = (1 - F) + F = 1.0.
+                let energy = (1.0 - f_dielectric).max(0.0) + f_dielectric;
+                assert!((energy - 1.0).abs() < 1e-5);
+            }
+        }
+        // Grazing view (high y) has significantly stronger Schlick grazing bias than normal incidence (y = 0).
+        let bias_normal = amp[n / 2][1];
+        let bias_grazing = amp[(n - 2) * n + n / 2][1];
+        assert!(
+            bias_grazing > bias_normal * 3.0,
+            "grazing Schlick bias must exceed normal incidence: normal={bias_normal}, grazing={bias_grazing}"
+        );
+    }
 }

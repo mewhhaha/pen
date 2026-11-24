@@ -9,16 +9,22 @@ use std::collections::HashMap;
 use anyhow::Result;
 use pen_protocol::{Catalog, Matrix, RenderFrame};
 
-use super::{GpuAsset, State, TextureRef};
+use super::{GpuAsset, State, TextureRef, ViewTemporalState};
 use crate::asset_store::AssetKind;
-use crate::atmosphere_lut::{AtmosphereParams, PhysicalAtmosphere};
+use crate::atmosphere_lut::{
+    AtmosphereParams, BASE_CAMERA_ALTITUDE_KM, PhysicalAtmosphere, WORLD_METERS_TO_KM, physical_camera_km,
+};
 use crate::built_in::{BuiltIn, BuiltIns};
 use crate::decals::{PbrDecal, PbrDecalPass, PbrDecalView};
+use crate::lights::MAX_AREA_COOKIES;
 use crate::matrix::{invert, multiply};
 use crate::post::{PhysicalSkyBinding, SCENE_FORMAT};
 use crate::post_fx::{PostFxParams, PostFxPass, RcasSharpener};
 use crate::render_targets::{ColorTransfer, OffscreenRenderTarget, SplitScreenCompositor, ViewportRect};
 use crate::RenderTarget;
+
+type CookieUpload = (u32, wgpu::TextureView, u64);
+type PreparedCookies = (Vec<Option<u32>>, Vec<CookieUpload>);
 
 pub(super) struct PreparedPbrDecalBatch {
     pub albedo: wgpu::TextureView,
@@ -51,6 +57,11 @@ struct BlitShared {
     sampler: wgpu::Sampler,
 }
 
+pub(super) struct SplitViewSlot {
+    pub target: OffscreenRenderTarget,
+    pub temporal: ViewTemporalState,
+}
+
 #[derive(Default)]
 pub(super) struct WiredPasses {
     pub physical_atmosphere: Option<PhysicalAtmosphere>,
@@ -60,13 +71,14 @@ pub(super) struct WiredPasses {
     pub rcas: Option<RcasSharpener>,
     pub post_fx: Option<PostFxPass>,
     pub split_screen: Option<(wgpu::TextureFormat, SplitScreenCompositor)>,
-    pub split_targets: Vec<OffscreenRenderTarget>,
+    pub split_views: Vec<SplitViewSlot>,
     pub polish_input: Option<(u32, u32, wgpu::TextureFormat, wgpu::Texture, wgpu::TextureView)>,
     pub msaa_depth_resolve: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
     pub dummy_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
     blit_shared: Option<BlitShared>,
     blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     pub in_secondary_camera: bool,
+    pub bypass_display_output: bool,
 }
 
 /// Builds a lightweight secondary-camera `RenderFrame` cloning only 3D scene fields and
@@ -372,15 +384,18 @@ impl State {
         Ok(Some(PhysicalSkyBinding {
             serial: self.wired.physical_sky_serial,
             sky_view: atmo.sky_view_view().clone(),
+            transmittance: atmo.transmittance_view().clone(),
             clouds: if wants_clouds { atmo.cloud_view().cloned() } else { None },
         }))
     }
 
     /// Updates Hillaire physical atmosphere LUTs & volumetric clouds when `quality.physical_sky` is on.
+    /// Uses the active (potentially TAA-jittered) projection and unified world-meters-to-km camera coordinates.
     pub(super) fn encode_physical_sky(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         frame: &RenderFrame,
+        active_projection: &Matrix,
         scene_size: (u32, u32),
     ) -> Result<()> {
         if !frame.quality.physical_sky {
@@ -388,7 +403,11 @@ impl State {
         }
         let device = self.device.clone();
         let atmo = self.wired.physical_atmosphere.get_or_insert_with(|| PhysicalAtmosphere::new(&device));
+        let eye = invert(&frame.view);
+        let world_eye = [eye[12], eye[13], eye[14]];
+        let cam_km = physical_camera_km(world_eye);
         let mut params = AtmosphereParams {
+            camera_altitude_km: cam_km[1],
             sun_direction: [-frame.light_direction.x, -frame.light_direction.y, -frame.light_direction.z],
             sun_irradiance: [frame.light_color.x, frame.light_color.y, frame.light_color.z],
             cloud_coverage: frame.clouds.cover.clamp(0.0, 1.0),
@@ -400,14 +419,78 @@ impl State {
         }
         atmo.update_luts(&device, encoder, &params);
         if frame.clouds.cover > 0.001 {
-            let vp = multiply(&frame.projection, &frame.view);
+            let vp = multiply(active_projection, &frame.view);
             let inv_vp = invert(&vp);
-            let eye = invert(&frame.view);
             let cw = (scene_size.0 / 2).clamp(16, 1024);
             let ch = (scene_size.1 / 2).clamp(16, 1024);
-            atmo.render_clouds(&device, encoder, &params, inv_vp, [eye[12], eye[13], eye[14]], (cw, ch))?;
+            atmo.render_clouds_world(
+                &device,
+                encoder,
+                &params,
+                inv_vp,
+                world_eye,
+                WORLD_METERS_TO_KM,
+                BASE_CAMERA_ALTITUDE_KM,
+                (cw, ch),
+            )?;
         }
         Ok(())
+    }
+
+    /// Resolves cookie textures named by `frame.area_lights[i].cookie_material` (1-based catalog material
+    /// index) into packed storage slots `0..MAX_AREA_COOKIES`.
+    pub(super) fn prepare_area_cookies(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+    ) -> Result<PreparedCookies> {
+        if frame.area_lights.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mut slots = Vec::with_capacity(frame.area_lights.len().min(64));
+        let mut uploads: Vec<CookieUpload> = Vec::new();
+        let mut view_to_slot: HashMap<u64, u32> = HashMap::new();
+        for spec in frame.area_lights.iter().take(64) {
+            if spec.kind != 3 || spec.cookie_material == 0 {
+                slots.push(None);
+                continue;
+            }
+            let mat_idx = spec.cookie_material - 1;
+            let Some(mat) = self.material(catalog, mat_idx)? else {
+                slots.push(None);
+                continue;
+            };
+            let Some(tex_key) = &mat.material.texture else {
+                slots.push(None);
+                continue;
+            };
+            let tex_ref = if let Some(&vid) = self.video_ids.get(tex_key.as_str()) {
+                Some(TextureRef::Video(vid))
+            } else if let Some(&cid) = self.camera_target_ids.get(tex_key.as_str()) {
+                Some(TextureRef::CameraTarget(cid))
+            } else if !self.reserved_videos.contains(tex_key.as_str()) {
+                self.loaded_texture(&mat.material.texture)?.map(TextureRef::Slot)
+            } else {
+                None
+            };
+            let Some(tref) = tex_ref else {
+                slots.push(None);
+                continue;
+            };
+            let tex = self.texture(tref);
+            let view_id = tex.view_id;
+            if let Some(&existing) = view_to_slot.get(&view_id) {
+                slots.push(Some(existing));
+            } else if uploads.len() < MAX_AREA_COOKIES {
+                let slot = u32::try_from(uploads.len()).unwrap_or(0);
+                view_to_slot.insert(view_id, slot);
+                uploads.push((slot, tex.view.clone(), view_id));
+                slots.push(Some(slot));
+            } else {
+                slots.push(None);
+            }
+        }
+        Ok((slots, uploads))
     }
 
     /// Resolves PBR decal materials/textures ahead of constructing `Drawing` so the render pass
@@ -599,82 +682,124 @@ impl State {
         Ok(())
     }
 
-    /// Renders and composites `split_screen == true` entries in `frame.camera_targets` directly
-    /// into `output` (reusing cached offscreen targets across frames), skipping any unused primary
-    /// 3D scene pass and leaving `output` ready for HUD sprites and veil overlays.
-    pub(super) fn render_split_screen_into(
+    /// Pre-validates split-screen pixel rectangles and renders each `split_screen == true` camera
+    /// into its own temporally-isolated offscreen target in presentation format (`self.context.format`),
+    /// bypassing display decode and global accessibility filters so those run once on the composite.
+    pub(super) fn render_split_screen_views(
         &mut self,
         frame: &RenderFrame,
         catalog: &Catalog,
+        output_size: (u32, u32),
+    ) -> Result<(Vec<ViewportRect>, bool, crate::RenderStats)> {
+        let split_cams: Vec<_> = frame.camera_targets.iter().filter(|c| c.split_screen).cloned().collect();
+        anyhow::ensure!(
+            output_size.0 > 0 && output_size.1 > 0,
+            "split-screen output target must be non-empty"
+        );
+        let mut rects: Vec<ViewportRect> = Vec::with_capacity(split_cams.len());
+        for cam in &split_cams {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "validated normalized [0, 1] viewport"
+            )]
+            let (x0, y0, x1, y1) = {
+                let ow = output_size.0 as f32;
+                let oh = output_size.1 as f32;
+                let x0 = (cam.viewport_x * ow).round().clamp(0.0, ow) as u32;
+                let y0 = (cam.viewport_y * oh).round().clamp(0.0, oh) as u32;
+                let x1 = ((cam.viewport_x + cam.viewport_w) * ow).round().clamp(0.0, ow) as u32;
+                let y1 = ((cam.viewport_y + cam.viewport_h) * oh).round().clamp(0.0, oh) as u32;
+                (x0, y0, x1, y1)
+            };
+            anyhow::ensure!(
+                x0 < output_size.0 && y0 < output_size.1 && x1 > x0 && y1 > y0,
+                "split-screen viewport ({}, {}, {}, {}) produces an empty or out-of-bounds rectangle on {}x{}",
+                cam.viewport_x,
+                cam.viewport_y,
+                cam.viewport_w,
+                cam.viewport_h,
+                output_size.0,
+                output_size.1
+            );
+            rects.push(ViewportRect { x: x0, y: y0, width: x1 - x0, height: y1 - y0 });
+        }
+
+        let format = self.context.format;
+        let mut views = std::mem::take(&mut self.wired.split_views);
+        let mut any_waiting = false;
+        let mut combined = crate::RenderStats::default();
+        let mut scale_sum = 0.0f32;
+        let mut rendered_count = 0u32;
+
+        let res = (|| -> Result<()> {
+            for (idx, (cam, rect)) in split_cams.iter().zip(&rects).enumerate() {
+                let size = (rect.width, rect.height);
+                if idx >= views.len() {
+                    let target = OffscreenRenderTarget::new(&self.device, size.0, size.1, format)?;
+                    let temporal = ViewTemporalState::new(&self.device, &self.queue);
+                    views.push(SplitViewSlot { target, temporal });
+                } else if views[idx].target.size() != size || views[idx].target.format() != format {
+                    views[idx].target = OffscreenRenderTarget::new(&self.device, size.0, size.1, format)?;
+                }
+                let sub = secondary_frame(frame, cam.view, cam.projection);
+                let slot = &mut views[idx];
+                let (child_waiting, child_stats) =
+                    self.submit_secondary_view(&sub, catalog, &mut slot.target, &mut slot.temporal)?;
+                any_waiting |= child_waiting;
+                combined.draw_calls += child_stats.draw_calls;
+                combined.instanced_draw_calls += child_stats.instanced_draw_calls;
+                combined.instances += child_stats.instances;
+                combined.instance_upload_bytes += child_stats.instance_upload_bytes;
+                combined.instance_upload_calls += child_stats.instance_upload_calls;
+                combined.triangles += child_stats.triangles;
+                combined.culled += child_stats.culled;
+                combined.shadow_culled += child_stats.shadow_culled;
+                combined.local_shadow_casters += child_stats.local_shadow_casters;
+                combined.local_shadow_faces += child_stats.local_shadow_faces;
+                combined.local_shadow_kept += child_stats.local_shadow_kept;
+                combined.volume_froxels += child_stats.volume_froxels;
+                combined.volume_history |= child_stats.volume_history;
+                if combined.exposure.is_none() {
+                    combined.exposure = child_stats.exposure;
+                }
+                scale_sum += child_stats.scale;
+                rendered_count += 1;
+            }
+            views.truncate(split_cams.len());
+            Ok(())
+        })();
+        self.wired.split_views = views;
+        res?;
+        if rendered_count > 0 {
+            combined.scale = scale_sum / rendered_count as f32;
+        }
+        Ok((rects, any_waiting, combined))
+    }
+
+    /// Composites already-rendered `split_views` onto `output`.
+    pub(super) fn composite_split_screen(
+        &mut self,
         encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::TextureView,
         output_size: (u32, u32),
-    ) -> Result<(bool, crate::RenderStats)> {
-        let split_cams: Vec<_> = frame.camera_targets.iter().filter(|c| c.split_screen).cloned().collect();
+        rects: Vec<ViewportRect>,
+    ) -> Result<()> {
         let format = self.context.format;
-        let mut cached = std::mem::take(&mut self.wired.split_targets);
-        let mut rects: Vec<ViewportRect> = Vec::with_capacity(split_cams.len());
-        let mut any_waiting = false;
-        let mut combined = crate::RenderStats::default();
-
-        self.wired.in_secondary_camera = true;
-        let res = (|| -> Result<()> {
-            for (idx, cam) in split_cams.iter().enumerate() {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "clamped normalized [0,1] viewport"
-                )]
-                let (x, y, w, h) = {
-                    let x = (cam.viewport_x.clamp(0.0, 1.0) * output_size.0 as f32).round() as u32;
-                    let y = (cam.viewport_y.clamp(0.0, 1.0) * output_size.1 as f32).round() as u32;
-                    let w = ((cam.viewport_w.clamp(0.0, 1.0) * output_size.0 as f32).round() as u32)
-                        .clamp(1, output_size.0.saturating_sub(x).max(1));
-                    let h = ((cam.viewport_h.clamp(0.0, 1.0) * output_size.1 as f32).round() as u32)
-                        .clamp(1, output_size.1.saturating_sub(y).max(1));
-                    (x, y, w, h)
-                };
-                let needs_new = cached
-                    .get(idx)
-                    .is_none_or(|rt| rt.size() != (w, h) || rt.format() != format);
-                if needs_new {
-                    let rt = OffscreenRenderTarget::new(&self.device, w, h, format)?;
-                    if idx < cached.len() {
-                        cached[idx] = rt;
-                    } else {
-                        cached.push(rt);
-                    }
-                }
-                let sub = secondary_frame(frame, cam.view, cam.projection);
-                self.submit(&sub, catalog, &mut cached[idx])?;
-                any_waiting |= self.waiting;
-                combined.draw_calls += self.last_stats.draw_calls;
-                combined.instanced_draw_calls += self.last_stats.instanced_draw_calls;
-                combined.instances += self.last_stats.instances;
-                combined.triangles += self.last_stats.triangles;
-                combined.culled += self.last_stats.culled;
-                combined.shadow_culled += self.last_stats.shadow_culled;
-                rects.push(ViewportRect { x, y, width: w, height: h });
-            }
-            cached.truncate(split_cams.len());
-            let device = self.device.clone();
-            if !matches!(&self.wired.split_screen, Some((fmt, _)) if *fmt == format) {
-                self.wired.split_screen =
-                    Some((format, SplitScreenCompositor::new(&device, format, ColorTransfer::Passthrough)));
-            }
-            let (_, comp) = self.wired.split_screen.as_mut().unwrap();
-            let views: Vec<&wgpu::TextureView> = cached.iter().map(OffscreenRenderTarget::render_view).collect();
-            let layout = crate::render_targets::SplitScreenLayout {
-                output_size,
-                viewports: rects,
-                divider_px: 0,
-            };
-            comp.composite(&device, encoder, output, &layout, &views, wgpu::Color::BLACK)?;
-            Ok(())
-        })();
-        self.wired.in_secondary_camera = false;
-        self.wired.split_targets = cached;
-        res?;
-        Ok((any_waiting, combined))
+        let device = self.device.clone();
+        if !matches!(&self.wired.split_screen, Some((fmt, _)) if *fmt == format) {
+            self.wired.split_screen =
+                Some((format, SplitScreenCompositor::new(&device, format, ColorTransfer::Passthrough)));
+        }
+        let (_, comp) = self.wired.split_screen.as_mut().unwrap();
+        let views: Vec<&wgpu::TextureView> =
+            self.wired.split_views.iter().take(rects.len()).map(|s| s.target.render_view()).collect();
+        let layout = crate::render_targets::SplitScreenLayout {
+            output_size,
+            viewports: rects,
+            divider_px: 0,
+        };
+        comp.composite(&device, encoder, output, &layout, &views, wgpu::Color::BLACK)?;
+        Ok(())
     }
 }

@@ -36,9 +36,7 @@ fn surface_derived_tangent(world: vec3f, normal: vec3f, uv: vec2f) -> vec4f {
 fn surface_sky(s: StandardSurface) -> vec3f {
   let nv = max(dot(s.normal, s.view), 0.0001);
   let split = sky_brdf(nv, clamp(s.roughness, 0.04, 1.0));
-  let reflected = s.f0 * split.x + vec3f(s.f90 * split.y);
   let reflecting = max(sky_light.tint.w, select(0.0, 1.0, reflection_probes.counts.x > 0.5 || sky_light.ssr.x > 0.5));
-  let diffuse = s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0)) * (vec3f(1.0) - reflected * reflecting);
   let coating = (s.lobes & SURFACE_COAT) != 0u && s.coat > 0.0;
   let sheening = (s.lobes & SURFACE_SHEEN) != 0u && dot(s.sheen_color, s.sheen_color) > 0.0;
   let brushing = (s.lobes & SURFACE_ANISOTROPY) != 0u && s.anisotropy != 0.0;
@@ -46,6 +44,8 @@ fn surface_sky(s: StandardSurface) -> vec3f {
   let iridescent = (s.lobes & SURFACE_IRIDESCENCE) != 0u && s.iridescence > 0.0;
   let lightmapped = (s.lobes & SURFACE_LIGHTMAP) != 0u && s.has_lightmap > 0.5;
   if (!coating && !sheening && !brushing && !transmitting && !iridescent && !lightmapped && s.occlusion >= 1.0) {
+    let reflected = s.f0 * split.x + vec3f(s.f90 * split.y);
+    let diffuse = s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0)) * (vec3f(1.0) - reflected * reflecting);
     // The base lobe alone, written as one expression: the very arithmetic
     // `surface_ambient` always had, to the bit.
     return diffuse * ambient_light(s.world, s.normal)
@@ -61,6 +61,8 @@ fn surface_sky(s: StandardSurface) -> vec3f {
     let irid_f = lobe_iridescence_fresnel(1.0, max(s.iridescence_ior, 1.0001), nv, max(s.iridescence_thickness, 0.0), s.f0);
     eff_f0 = mix(eff_f0, irid_f, clamp(s.iridescence, 0.0, 1.0));
   }
+  let reflected = eff_f0 * split.x + vec3f(s.f90 * split.y);
+  let diffuse = s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0)) * (vec3f(1.0) - reflected * reflecting);
   var reflection = sky_reflection_lobe(s.world, lookup, s.view, dot(s.normal, s.view), s.roughness, eff_f0, s.f90);
   if (s.occlusion < 1.0) {
     irradiance *= s.occlusion;
@@ -71,7 +73,7 @@ fn surface_sky(s: StandardSurface) -> vec3f {
     // The diffuse lobe gives way to the picture behind: what the base lobe's
     // reflection leaves of it, by the albedo and not the metal.
     let weight = clamp(s.transmission, 0.0, 1.0);
-    let through = s.behind * s.base_color * (vec3f(1.0) - (s.f0 * split.x + vec3f(split.y))) * (1.0 - clamp(s.metallic, 0.0, 1.0));
+    let through = s.behind * s.base_color * max(vec3f(1.0) - reflected, vec3f(0.0)) * (1.0 - clamp(s.metallic, 0.0, 1.0));
     base = diffuse * (irradiance * (1.0 - weight)) + through * weight;
   }
   var layers = 1.0;
@@ -123,7 +125,50 @@ fn standard_surface(s: StandardSurface) -> vec3f {
   let local = clustered_lobes(s);
   light += local.diffuse * s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0));
   light += local.specular;
-  light += clustered_area_lights(s.world, s.normal, s.view, s.base_color, s.metallic, s.f0, s.roughness);
+  if (cluster_grid.options.y >= 0.5) {
+    let nv = max(dot(s.normal, s.view), 0.0001);
+    var eff_f0 = s.f0;
+    if ((s.lobes & SURFACE_IRIDESCENCE) != 0u && s.iridescence > 0.0) {
+      let irid_f = lobe_iridescence_fresnel(1.0, max(s.iridescence_ior, 1.0001), nv, max(s.iridescence_thickness, 0.0), s.f0);
+      eff_f0 = mix(eff_f0, irid_f, clamp(s.iridescence, 0.0, 1.0));
+    }
+    var layers = 1.0;
+    var sheen_tint = vec3f(0.0);
+    if ((s.lobes & SURFACE_SHEEN) != 0u && dot(s.sheen_color, s.sheen_color) > 0.0) {
+      let tint = max(s.sheen_color, vec3f(0.0));
+      let albedo = lobe_sheen_albedo(nv, s.sheen_roughness);
+      sheen_tint = tint * albedo;
+      layers = max(0.0, 1.0 - max(tint.x, max(tint.y, tint.z)) * albedo);
+    }
+    var coat_weight = 0.0;
+    var coat_rough = 0.04;
+    if ((s.lobes & SURFACE_COAT) != 0u && s.coat > 0.0) {
+      coat_weight = clamp(s.coat, 0.0, 1.0);
+      coat_rough = clamp(s.coat_roughness, 0.04, 1.0);
+      let nvc = max(dot(s.coat_normal, s.view), 0.00001);
+      layers *= 1.0 - coat_weight * lobe_coat_fresnel(min(nvc, 1.0));
+    }
+    var diff_scale = layers;
+    if ((s.lobes & SURFACE_TRANSMISSION) != 0u && s.transmission > 0.0) {
+      diff_scale *= 1.0 - clamp(s.transmission, 0.0, 1.0);
+    }
+    light += clustered_area_lights_surface(
+      s.world,
+      s.normal,
+      s.view,
+      s.base_color,
+      s.metallic,
+      eff_f0,
+      s.f90,
+      s.roughness,
+      diff_scale,
+      layers,
+      coat_weight,
+      coat_rough,
+      s.coat_normal,
+      sheen_tint,
+    );
+  }
   return light;
 }
 

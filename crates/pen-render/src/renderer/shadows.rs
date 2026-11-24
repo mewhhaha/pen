@@ -29,7 +29,17 @@ const BAND: f32 = 0.15;
 
 /// The scene uniform for `frame`, its sun's `count` maps (`maps`) included:
 /// what `shadows.wgsl` and materials read (materials.md lists the fields).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn scene_floats(frame: &RenderFrame, maps: &[Cascade; MAX_CASCADES], count: usize) -> Floats<SCENE_FLOATS> {
+    scene_floats_at(frame, maps, count, 0.0)
+}
+
+pub(super) fn scene_floats_at(
+    frame: &RenderFrame,
+    maps: &[Cascade; MAX_CASCADES],
+    count: usize,
+    elapsed_s: f32,
+) -> Floats<SCENE_FLOATS> {
     let sun = frame.shadow.texels > 0 && count > 0;
     let texel = 1.0 / frame.shadow.texels.max(1) as f32;
     let mut scene = Floats::<SCENE_FLOATS>::new();
@@ -43,7 +53,7 @@ pub(super) fn scene_floats(frame: &RenderFrame, maps: &[Cascade; MAX_CASCADES], 
     // The maps: how many, the band they blend over, the filter and the
     // contact shadow's steps; what each sees, and each one's texel in
     // texture coordinates and in the world, where its slice ends and its
-    // depth range; then the soft shadows' settings.
+    // depth range; then the soft shadows' settings and elapsed renderer time.
     let contact = if sun { frame.shadow.contact } else { 0 };
     #[allow(clippy::cast_precision_loss, reason = "at most MAX_CASCADES")]
     scene.extend([count as f32, BAND, frame.shadow.filter as f32, contact as f32]);
@@ -54,7 +64,7 @@ pub(super) fn scene_floats(frame: &RenderFrame, maps: &[Cascade; MAX_CASCADES], 
         let range = if map.projection[10] != 0.0 { 1.0 / map.projection[10].abs() } else { 0.0 };
         scene.extend([texel, map.texel, map.far, range]);
     }
-    scene.extend([frame.shadow.softness, frame.shadow.contact_length, 0.0, 0.0]);
+    scene.extend([frame.shadow.softness, frame.shadow.contact_length, elapsed_s, 0.0]);
     scene
 }
 
@@ -334,7 +344,9 @@ impl State {
         let sun = (shadow_texels > 0 && self.cascades.1 > 0).then_some(&frame.shadow);
         let (maps, count) = self.cascades;
         let contact = if sun.is_some() { frame.shadow.contact } else { 0 };
-        let scene = scene_floats(frame, &maps, count);
+        #[allow(clippy::cast_possible_truncation, reason = "f32 shader time uniform")]
+        let elapsed_s = self.now() as f32;
+        let scene = scene_floats_at(frame, &maps, count, elapsed_s);
         self.queue.write_buffer(&self.scene_uniform, 0, scene.bytes());
         self.environment.update(&self.queue, frame);
         // Each shadow pass sees the scene from its light.

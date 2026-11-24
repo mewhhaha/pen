@@ -42,9 +42,12 @@ struct Draw {
   // ior, thickness, attenuation distance; attenuation color, specular;
   // specular color, emissive strength (see `surface_apply_block`).
   surface: array<vec4f, 5>,
-  // KHR_texture_transform (offset.xy, scale.xy) and (cos(rot), sin(rot), orm_map, emissive_map).
+  // KHR_texture_transform (offset.xy, scale.xy), (cos(rot), sin(rot), orm_map, emissive_map),
+  // (atlas_tile_mask, has_base_texture, 0, 0), and (iridescence, iridescence_ior, thickness_min, thickness_max).
   uv_transform: vec4f,
   maps: vec4f,
+  atlas: vec4f,
+  iridescence: vec4f,
 };
 @group(0) @binding(0) var<uniform> scene: Scene;
 @group(1) @binding(0) var<uniform> draw: Draw;
@@ -618,6 +621,27 @@ fn area_basis(n: vec3f, v: vec3f) -> mat3x3f {
   return transpose(mat3x3f(t1, t2, n));
 }
 
+const AREA_COOKIE_OFFSET: u32 = 8512u;
+const AREA_COOKIE_DIM: u32 = 32u;
+const AREA_COOKIE_TEXELS: u32 = 1024u;
+const AREA_MAX_COOKIES: u32 = 8u;
+
+fn area_sample_cookie(slot: u32, uv: vec2f) -> vec3f {
+  let c = clamp(uv, vec2f(0.0), vec2f(1.0)) * f32(AREA_COOKIE_DIM - 1u);
+  let x0 = u32(floor(c.x));
+  let y0 = u32(floor(c.y));
+  let x1 = min(x0 + 1u, AREA_COOKIE_DIM - 1u);
+  let y1 = min(y0 + 1u, AREA_COOKIE_DIM - 1u);
+  let fx = c.x - f32(x0);
+  let fy = c.y - f32(y0);
+  let base = AREA_COOKIE_OFFSET + min(slot, AREA_MAX_COOKIES - 1u) * AREA_COOKIE_TEXELS;
+  let t00 = area_light_data[base + y0 * AREA_COOKIE_DIM + x0].rgb;
+  let t10 = area_light_data[base + y0 * AREA_COOKIE_DIM + x1].rgb;
+  let t01 = area_light_data[base + y1 * AREA_COOKIE_DIM + x0].rgb;
+  let t11 = area_light_data[base + y1 * AREA_COOKIE_DIM + x1].rgb;
+  return mix(mix(t00, t10, fx), mix(t01, t11, fx), fy);
+}
+
 fn area_range_window(dist: f32, reach: f32) -> f32 {
   if (reach <= 0.0) {
     return 1.0;
@@ -630,16 +654,26 @@ fn area_range_window(dist: f32, reach: f32) -> f32 {
   return w * w;
 }
 
-// Evaluates all active LTC area lights (Rect, Disk, Tube, CookieSpot) in `area_light_data`.
-// Fast-path returns zero immediately when `cluster_grid.options.y < 0.5`.
-fn clustered_area_lights(
+// Evaluates all active LTC area lights (Rect, Disk, Tube, CookieSpot) in `area_light_data`
+// with full Fresnel endpoints (`f0`, `f90`), lobe energy sharing (transmission/sheen/coat),
+// packed RGBA cookies, and directional GGX BRDF for cookie projectors.
+// Emitter `col_reach.rgb` is radiance in scene-linear units (a unit-radiance full hemisphere
+// produces irradiance 1.0 in Pen's pi-scaled Lambert convention).
+fn clustered_area_lights_surface(
   world: vec3f,
   normal: vec3f,
   view: vec3f,
   base_color: vec3f,
   metallic: f32,
   f0: vec3f,
+  f90: f32,
   roughness: f32,
+  diff_scale: f32,
+  spec_scale: f32,
+  coat_weight: f32,
+  coat_roughness: f32,
+  coat_normal: vec3f,
+  sheen_tint: vec3f,
 ) -> vec3f {
   let count = min(u32(max(cluster_grid.options.y, 0.0) + 0.5), AREA_MAX_LIGHTS);
   if (count == 0u) {
@@ -659,8 +693,29 @@ fn clustered_area_lights(
   );
   let basis = area_basis(n, v);
   let spec_xf = minv * basis;
-  let diff_albedo = base_color * (1.0 - clamp(metallic, 0.0, 1.0));
-  let spec_fresnel = f0 * t2.x + (vec3f(1.0) - f0) * t2.y;
+  let spec_fresnel = f0 * t2.x + vec3f(f90 * t2.y);
+  let metal = clamp(metallic, 0.0, 1.0);
+  // Conserve energy against the LTC directional specular albedo so a unit-radiance hemisphere stays <= 1.
+  let diff_albedo = base_color * (1.0 - metal) * max(vec3f(1.0) - spec_fresnel, vec3f(0.0)) * diff_scale;
+
+  var coat_xf = spec_xf;
+  var coat_fresnel = 0.0;
+  if (coat_weight > 0.0) {
+    let cn = normalize(coat_normal);
+    let cndv = clamp(dot(cn, v), 0.0, 1.0);
+    let cq = sqrt(max(1.0 - cndv, 0.0));
+    let cr = clamp(coat_roughness, 0.04, 1.0);
+    let ct1 = area_sample_lut(AREA_MAT_OFFSET, cr, cq);
+    let ct2 = area_sample_lut(AREA_AMP_OFFSET, cr, cq);
+    let cminv = mat3x3f(
+      vec3f(ct1.x, 0.0, ct1.y),
+      vec3f(0.0, 1.0, 0.0),
+      vec3f(ct1.z, 0.0, ct1.w),
+    );
+    coat_xf = cminv * area_basis(cn, v);
+    coat_fresnel = coat_weight * (0.04 * ct2.x + ct2.y);
+  }
+  let has_sheen = dot(sheen_tint, sheen_tint) > 0.0;
   var total = vec3f(0.0);
 
   for (var i = 0u; i < count; i++) {
@@ -686,8 +741,6 @@ fn clustered_area_lights(
       continue;
     }
     let two_sided = flags.x > 0.5;
-    var diff_form = 0.0;
-    var spec_form = 0.0;
 
     if (kind == 0u || kind == 1u) {
       let emit_raw = cross(right, up);
@@ -701,6 +754,71 @@ fn clustered_area_lights(
       }
     }
 
+    if (kind == 3u) {
+      // Cookie spotlight cone projector evaluated with directional GGX microfacet BRDF.
+      let forward = normalize(cross(right, up));
+      let rel = world - center;
+      let lz = dot(rel, forward);
+      if (lz <= 1e-4) {
+        continue;
+      }
+      let tan_fov = max(flags.w, 0.05);
+      let aspect = max(up_ext.w, 0.1);
+      let u = 0.5 + dot(rel, right) / (2.0 * lz * tan_fov * aspect);
+      let v_coord = 0.5 - dot(rel, up) / (2.0 * lz * tan_fov);
+      if (u < 0.0 || u > 1.0 || v_coord < 0.0 || v_coord > 1.0) {
+        continue;
+      }
+      let edge = max(flags.z, 0.005);
+      let mask = smoothstep(0.0, edge, u) * smoothstep(0.0, edge, 1.0 - u)
+        * smoothstep(0.0, edge, v_coord) * smoothstep(0.0, edge, 1.0 - v_coord);
+      let cookie_rgb = select(vec3f(1.0), area_sample_cookie(u32(flags.y + 0.5), vec2f(u, v_coord)), flags.y >= 0.0);
+      let to_l = -rel / max(dist_center, 1e-4);
+      let ndl = max(dot(n, to_l), 0.0);
+      if (ndl <= 0.0) {
+        continue;
+      }
+      let falloff = mask / (dist_center * dist_center + 1.0);
+      let radiance = col_reach.rgb * cookie_rgb * (falloff * atten);
+      let h = normalize(v + to_l);
+      let nh = clamp(dot(n, h), 0.0, 1.0);
+      let vh = clamp(dot(v, h), 0.0, 1.0);
+      let nv = max(ndotv, 1e-5);
+      let a = rough * rough;
+      let a2 = a * a;
+      let denom = nh * nh * (a2 - 1.0) + 1.0;
+      let ggx_d = a2 / (3.14159265359 * denom * denom);
+      let vis = 0.5 / max(1e-6, ndl * sqrt(nv * nv * (1.0 - a2) + a2) + nv * sqrt(ndl * ndl * (1.0 - a2) + a2));
+      let fade = 1.0 - vh;
+      let schlick = f0 + (vec3f(f90) - f0) * (fade * fade * fade * fade * fade);
+      let dir_diff = base_color * (1.0 - metal) * max(vec3f(1.0) - schlick, vec3f(0.0)) * (ndl * diff_scale);
+      let dir_spec = schlick * (ggx_d * vis * ndl * 3.14159265359 * spec_scale);
+      var dir_coat = vec3f(0.0);
+      if (coat_weight > 0.0) {
+        let cn = normalize(coat_normal);
+        let nlc = max(dot(cn, to_l), 0.0);
+        let nhc = clamp(dot(cn, h), 0.0, 1.0);
+        let nvc = max(dot(cn, v), 1e-5);
+        let ca = coat_roughness * coat_roughness;
+        let ca2 = ca * ca;
+        let cd = nhc * nhc * (ca2 - 1.0) + 1.0;
+        let c_ggx = ca2 / (3.14159265359 * cd * cd);
+        let c_vis = 0.5 / max(1e-6, nlc * sqrt(nvc * nvc * (1.0 - ca2) + ca2) + nvc * sqrt(nlc * nlc * (1.0 - ca2) + ca2));
+        let fc = coat_weight * (0.04 + 0.96 * fade * fade * fade * fade * fade);
+        dir_coat = vec3f(fc * c_ggx * c_vis * nlc * 3.14159265359);
+      }
+      var dir_sheen = vec3f(0.0);
+      if (has_sheen) {
+        dir_sheen = sheen_tint * ndl;
+      }
+      total += (dir_diff + dir_spec + dir_sheen + dir_coat) * radiance;
+      continue;
+    }
+
+    var diff_form = 0.0;
+    var spec_form = 0.0;
+    var coat_form = 0.0;
+
     if (kind == 0u) {
       let ex = right * right_ext.w;
       let ey = up * up_ext.w;
@@ -710,6 +828,9 @@ fn clustered_area_lights(
       let q3 = (center - ex + ey) - world;
       diff_form = area_eval_quad(basis * q0, basis * q1, basis * q2, basis * q3);
       spec_form = area_eval_quad(spec_xf * q0, spec_xf * q1, spec_xf * q2, spec_xf * q3);
+      if (coat_weight > 0.0) {
+        coat_form = area_eval_quad(coat_xf * q0, coat_xf * q1, coat_xf * q2, coat_xf * q3);
+      }
     } else if (kind == 1u) {
       let rad = max(right_ext.w, 1e-4) * AREA_OCTAGON_SCALE;
       let d = rad * 0.70710678;
@@ -727,7 +848,12 @@ fn clustered_area_lights(
       spec_form = area_eval_quad(spec_xf * c0, spec_xf * c1, spec_xf * c2, spec_xf * c3)
         + area_eval_quad(spec_xf * c4, spec_xf * c5, spec_xf * c6, spec_xf * c7)
         + area_eval_quad(spec_xf * c0, spec_xf * c3, spec_xf * c4, spec_xf * c7);
-    } else if (kind == 2u) {
+      if (coat_weight > 0.0) {
+        coat_form = area_eval_quad(coat_xf * c0, coat_xf * c1, coat_xf * c2, coat_xf * c3)
+          + area_eval_quad(coat_xf * c4, coat_xf * c5, coat_xf * c6, coat_xf * c7)
+          + area_eval_quad(coat_xf * c0, coat_xf * c3, coat_xf * c4, coat_xf * c7);
+      }
+    } else {
       let half_len = max(right_ext.w, 1e-4);
       let tube_r = max(up_ext.w, 0.01);
       let to_p = world - center;
@@ -742,34 +868,36 @@ fn clustered_area_lights(
       let q3 = (center - ex + ey) - world;
       diff_form = area_eval_quad(basis * q0, basis * q1, basis * q2, basis * q3);
       spec_form = area_eval_quad(spec_xf * q0, spec_xf * q1, spec_xf * q2, spec_xf * q3);
-    } else {
-      // Cookie spotlight cone projector.
-      let forward = normalize(cross(right, up));
-      let rel = world - center;
-      let lz = dot(rel, forward);
-      if (lz <= 1e-4) {
-        continue;
+      if (coat_weight > 0.0) {
+        coat_form = area_eval_quad(coat_xf * q0, coat_xf * q1, coat_xf * q2, coat_xf * q3);
       }
-      let tan_fov = max(flags.w, 0.05);
-      let aspect = max(up_ext.w, 0.1);
-      let u = 0.5 + dot(rel, right) / (2.0 * lz * tan_fov * aspect);
-      let v_coord = 0.5 - dot(rel, up) / (2.0 * lz * tan_fov);
-      if (u < 0.0 || u > 1.0 || v_coord < 0.0 || v_coord > 1.0) {
-        continue;
-      }
-      let edge = max(flags.z, 0.005);
-      let mask = smoothstep(0.0, edge, u) * smoothstep(0.0, edge, 1.0 - u)
-        * smoothstep(0.0, edge, v_coord) * smoothstep(0.0, edge, 1.0 - v_coord);
-      let to_l = -rel / max(dist_center, 1e-4);
-      let ndl = max(dot(n, to_l), 0.0);
-      let falloff = mask / (dist_center * dist_center + 1.0);
-      diff_form = ndl * falloff;
-      spec_form = ndl * falloff;
     }
 
-    total += (diff_albedo * diff_form + spec_fresnel * spec_form) * col_reach.rgb * atten;
+    var contrib = diff_albedo * diff_form + spec_fresnel * (spec_form * spec_scale);
+    if (has_sheen) {
+      contrib += sheen_tint * diff_form;
+    }
+    if (coat_weight > 0.0) {
+      contrib += vec3f(coat_fresnel * coat_form);
+    }
+    total += contrib * col_reach.rgb * atten;
   }
   return total;
+}
+
+// Convenience wrapper for shaders calling the 7-argument LTC area-light entry point.
+fn clustered_area_lights(
+  world: vec3f,
+  normal: vec3f,
+  view: vec3f,
+  base_color: vec3f,
+  metallic: f32,
+  f0: vec3f,
+  roughness: f32,
+) -> vec3f {
+  return clustered_area_lights_surface(
+    world, normal, view, base_color, metallic, f0, 1.0, roughness, 1.0, 1.0, 0.0, 0.04, normal, vec3f(0.0),
+  );
 }
 // END lights
 // BEGIN environment
@@ -2057,23 +2185,33 @@ fn lobe_iridescence_xyz_to_srgb(xyz: vec3f) -> vec3f {
 }
 
 // Belcour & Barla (2017) analytical Airy thin-film interference reflectance (`KHR_materials_iridescence`).
+// Preserves signed interface reflection phases so zero thickness matches the exact bare outside/base Fresnel.
 fn lobe_iridescence_fresnel(outside_ior: f32, film_ior: f32, cos_theta1: f32, thickness_nm: f32, base_f0: vec3f) -> vec3f {
-  let sin2_t2 = (outside_ior / max(film_ior, 1.0001)) * (outside_ior / max(film_ior, 1.0001))
-    * max(1.0 - cos_theta1 * cos_theta1, 0.0);
+  let c1 = clamp(cos_theta1, 0.0, 1.0);
+  let eta = outside_ior / max(film_ior, 1.0001);
+  let sin2_t2 = eta * eta * max(1.0 - c1 * c1, 0.0);
   if (sin2_t2 >= 1.0) {
     return vec3f(1.0);
   }
   let cos_t2 = sqrt(1.0 - sin2_t2);
-  let r0_12 = ((film_ior - outside_ior) / (film_ior + outside_ior));
-  let r12 = r0_12 * r0_12 + (1.0 - r0_12 * r0_12) * pow(1.0 - cos_theta1, 5.0);
-  let base_ior = (1.0 + sqrt(clamp(base_f0, vec3f(0.0), vec3f(0.999)))) / max(1.0 - sqrt(clamp(base_f0, vec3f(0.0), vec3f(0.999))), vec3f(0.001));
-  let r0_23 = (base_ior - vec3f(film_ior)) / (base_ior + vec3f(film_ior));
-  let r23 = r0_23 * r0_23 + (vec3f(1.0) - r0_23 * r0_23) * pow(1.0 - cos_t2, 5.0);
-  let opd = 2.0 * film_ior * thickness_nm * cos_t2;
-  let phi = 2.0 * 3.14159265359 * opd / vec3f(650.0, 510.0, 475.0);
+  let r0_12 = (outside_ior - film_ior) / (outside_ior + film_ior);
+  let r0_12_sq = r0_12 * r0_12;
+  let r12 = r0_12_sq + (1.0 - r0_12_sq) * pow(1.0 - c1, 5.0);
+  let phi12 = select(0.0, 3.14159265359, film_ior > outside_ior);
+
+  let s = sqrt(clamp(base_f0, vec3f(0.0), vec3f(0.999)));
+  let base_ior = (vec3f(1.0) + s) / max(vec3f(1.0) - s, vec3f(0.001));
+  let r0_23 = (vec3f(film_ior) - base_ior) / (vec3f(film_ior) + base_ior);
+  let r0_23_sq = r0_23 * r0_23;
+  let r23 = r0_23_sq + (vec3f(1.0) - r0_23_sq) * pow(1.0 - cos_t2, 5.0);
+  let phi23 = select(vec3f(0.0), vec3f(3.14159265359), base_ior > vec3f(film_ior));
+
+  let opd = 2.0 * film_ior * max(thickness_nm, 0.0) * cos_t2;
+  let phi = 2.0 * 3.14159265359 * opd / vec3f(650.0, 510.0, 475.0) + vec3f(phi12) + phi23;
   let r123 = clamp(sqrt(vec3f(r12) * r23), vec3f(0.0), vec3f(0.999));
-  let num = vec3f(r12) + r23 + 2.0 * r123 * cos(phi);
-  let den = vec3f(1.0) + vec3f(r12) * r23 + 2.0 * r123 * cos(phi);
+  let term = 2.0 * r123 * cos(phi);
+  let num = vec3f(r12) + r23 + term;
+  let den = vec3f(1.0) + vec3f(r12) * r23 + term;
   return clamp(num / max(den, vec3f(0.0001)), vec3f(0.0), vec3f(1.0));
 }
 
@@ -2098,9 +2236,10 @@ fn surface_read_atlas(atlas: texture_2d<f32>, samp: sampler, tile: u32, uv: vec2
   return textureSampleLevel(atlas, samp, surface_atlas_tile_uv(tile, uv, dims, clamp_uv), 0.0);
 }
 
-// Applies enabled tiles from the GPU-packed 4x3 SurfaceMapAtlas (@group(1) @binding(4))
-// onto `s` when `atlas_mode > 4.5` (`draw.settings.w == 5.0`). `tile_mask` is the bitmask
-// of populated `SurfaceTile` slots (bit `1u << tile`).
+// Applies authored iridescence factors and enabled tiles from the GPU-packed 4x3 SurfaceMapAtlas
+// (@group(1) @binding(4)) onto `s`. Preserves authored surface block factors and custom dielectric F0,
+// and decodes ORM, Clearcoat, ClearcoatNormal, Sheen, Anisotropy, Transmission, Specular,
+// Iridescence, Lightmap, and LightmapDir tiles.
 fn surface_apply_atlas(
   s: StandardSurface,
   atlas: texture_2d<f32>,
@@ -2109,51 +2248,130 @@ fn surface_apply_atlas(
   uv1: vec2f,
   atlas_mode: f32,
   tile_mask: u32,
+  block: array<vec4f, 5>,
+  irid_params: vec4f,
+  model_scale: f32,
 ) -> StandardSurface {
   var out = s;
+  let authored_ior = max(block[2].y, 1.0);
+  let authored_spec_w = max(block[3].w, 0.0);
+  let authored_spec_c = max(block[4].xyz, vec3f(0.0));
+
+  if (irid_params.x > 0.0) {
+    out.lobes |= SURFACE_IRIDESCENCE;
+    out.iridescence = clamp(irid_params.x, 0.0, 1.0);
+    out.iridescence_ior = max(irid_params.y, 1.0001);
+    out.iridescence_thickness = max(irid_params.w, 0.0);
+  }
+
   if (atlas_mode <= 4.5 || tile_mask == 0u) {
     return out;
   }
+
   if ((tile_mask & 1u) != 0u) {
     let orm = surface_read_atlas(atlas, samp, 0u, uv, false);
     out = surface_apply_orm(out, orm, 1.0);
-    out.f0 = mix(vec3f(0.04), out.base_color, clamp(out.metallic, 0.0, 1.0));
+    let m = clamp(out.metallic, 0.0, 1.0);
+    let dielectric = min(lobe_ior_f0(authored_ior) * authored_spec_c, vec3f(1.0)) * authored_spec_w;
+    out.ior = authored_ior;
+    out.f0 = mix(dielectric, out.base_color, m);
+    out.f90 = mix(authored_spec_w, 1.0, m);
   }
   if ((tile_mask & 8u) != 0u) {
     let cc = surface_read_atlas(atlas, samp, 3u, uv, false);
+    if ((out.lobes & SURFACE_COAT) == 0u) {
+      out.coat = block[0].x;
+      out.coat_roughness = block[0].y;
+    }
     out.lobes |= SURFACE_COAT;
     out.coat = clamp(out.coat * cc.r, 0.0, 1.0);
     out.coat_roughness = clamp(out.coat_roughness * cc.g, 0.04, 1.0);
   }
+  if ((tile_mask & 16u) != 0u) {
+    let ccn = surface_read_atlas(atlas, samp, 4u, uv, false);
+    let txy = ccn.xy * 2.0 - vec2f(1.0);
+    let tz = sqrt(max(1.0 - dot(txy, txy), 0.0001));
+    let n_base = normalize(out.coat_normal);
+    var t_vec = out.tangent;
+    var b_vec = out.bitangent;
+    if (dot(t_vec, t_vec) < 0.25 || dot(b_vec, b_vec) < 0.25) {
+      let up_ref = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(n_base.y) > 0.9);
+      t_vec = normalize(cross(up_ref, n_base));
+      b_vec = cross(n_base, t_vec);
+    }
+    out.coat_normal = normalize(t_vec * txy.x + b_vec * txy.y + n_base * tz);
+  }
   if ((tile_mask & 32u) != 0u) {
     let sh = surface_read_atlas(atlas, samp, 5u, uv, false);
+    if ((out.lobes & SURFACE_SHEEN) == 0u) {
+      out.sheen_color = block[1].xyz;
+      out.sheen_roughness = block[0].z;
+    }
     out.lobes |= SURFACE_SHEEN;
     out.sheen_color *= sh.rgb;
     out.sheen_roughness = clamp(out.sheen_roughness * sh.a, 0.07, 1.0);
   }
+  if ((tile_mask & 64u) != 0u) {
+    let an = surface_read_atlas(atlas, samp, 6u, uv, false);
+    if ((out.lobes & SURFACE_ANISOTROPY) == 0u) {
+      out.anisotropy = block[0].w;
+    }
+    out.lobes |= SURFACE_ANISOTROPY;
+    out.anisotropy = clamp(out.anisotropy * an.b, -1.0, 1.0);
+    let dir = an.rg * 2.0 - vec2f(1.0);
+    if (dot(dir, dir) > 1e-4 && dot(out.tangent, out.tangent) > 0.25 && dot(out.bitangent, out.bitangent) > 0.25) {
+      let d = normalize(dir);
+      let new_t = normalize(out.tangent * d.x + out.bitangent * d.y);
+      let hand = select(-1.0, 1.0, dot(cross(out.normal, out.tangent), out.bitangent) >= 0.0);
+      out.tangent = new_t;
+      out.bitangent = cross(out.normal, new_t) * hand;
+    }
+  }
   if ((tile_mask & 128u) != 0u) {
     let tr = surface_read_atlas(atlas, samp, 7u, uv, false);
+    if ((out.lobes & SURFACE_TRANSMISSION) == 0u) {
+      out.transmission = block[2].x;
+      out.ior = authored_ior;
+      out.thickness = block[2].z * model_scale;
+      out.attenuation_distance = block[2].w;
+      out.attenuation_color = block[3].xyz;
+    }
     out.lobes |= SURFACE_TRANSMISSION;
     out.transmission = clamp(out.transmission * tr.r, 0.0, 1.0);
     out.thickness *= tr.g;
   }
   if ((tile_mask & 256u) != 0u) {
     let sp = surface_read_atlas(atlas, samp, 8u, uv, false);
-    let dielectric = min(lobe_ior_f0(out.ior) * sp.rgb, vec3f(1.0)) * sp.a;
-    out.f0 = mix(dielectric, out.base_color, clamp(out.metallic, 0.0, 1.0));
-    out.f90 = mix(sp.a, 1.0, clamp(out.metallic, 0.0, 1.0));
+    let spec_w = authored_spec_w * sp.a;
+    let spec_c = authored_spec_c * sp.rgb;
+    let m = clamp(out.metallic, 0.0, 1.0);
+    let dielectric = min(lobe_ior_f0(authored_ior) * spec_c, vec3f(1.0)) * spec_w;
+    out.lobes |= SURFACE_SPECULAR;
+    out.ior = authored_ior;
+    out.f0 = mix(dielectric, out.base_color, m);
+    out.f90 = mix(spec_w, 1.0, m);
   }
   if ((tile_mask & 512u) != 0u) {
     let ir = surface_read_atlas(atlas, samp, 9u, uv, false);
     out.lobes |= SURFACE_IRIDESCENCE;
-    out.iridescence = clamp(ir.r, 0.0, 1.0);
-    out.iridescence_thickness = mix(100.0, 600.0, clamp(ir.g, 0.0, 1.0));
+    out.iridescence = clamp(irid_params.x * ir.r, 0.0, 1.0);
+    out.iridescence_ior = max(irid_params.y, 1.0001);
+    out.iridescence_thickness = mix(max(irid_params.z, 0.0), max(irid_params.w, 0.0), clamp(ir.g, 0.0, 1.0));
   }
   if ((tile_mask & 1024u) != 0u) {
     let lm = surface_read_atlas(atlas, samp, 10u, uv1, true);
     out.lobes |= SURFACE_LIGHTMAP;
     out.lightmap_irradiance = lm.rgb;
     out.has_lightmap = 1.0;
+  }
+  if ((tile_mask & 2048u) != 0u && out.has_lightmap > 0.5) {
+    let ld = surface_read_atlas(atlas, samp, 11u, uv1, true);
+    let raw_dir = ld.xyz * 2.0 - vec3f(1.0);
+    if (dot(raw_dir, raw_dir) > 1e-4) {
+      let half_lambert = 0.5 + 0.5 * clamp(dot(normalize(out.normal), normalize(raw_dir)), -1.0, 1.0);
+      let dir_weight = clamp(ld.a, 0.0, 1.0);
+      out.lightmap_irradiance *= mix(1.0, half_lambert / max(dir_weight, 0.25), dir_weight);
+    }
   }
   return out;
 }
@@ -2197,9 +2415,7 @@ fn surface_derived_tangent(world: vec3f, normal: vec3f, uv: vec2f) -> vec4f {
 fn surface_sky(s: StandardSurface) -> vec3f {
   let nv = max(dot(s.normal, s.view), 0.0001);
   let split = sky_brdf(nv, clamp(s.roughness, 0.04, 1.0));
-  let reflected = s.f0 * split.x + vec3f(s.f90 * split.y);
   let reflecting = max(sky_light.tint.w, select(0.0, 1.0, reflection_probes.counts.x > 0.5 || sky_light.ssr.x > 0.5));
-  let diffuse = s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0)) * (vec3f(1.0) - reflected * reflecting);
   let coating = (s.lobes & SURFACE_COAT) != 0u && s.coat > 0.0;
   let sheening = (s.lobes & SURFACE_SHEEN) != 0u && dot(s.sheen_color, s.sheen_color) > 0.0;
   let brushing = (s.lobes & SURFACE_ANISOTROPY) != 0u && s.anisotropy != 0.0;
@@ -2207,6 +2423,8 @@ fn surface_sky(s: StandardSurface) -> vec3f {
   let iridescent = (s.lobes & SURFACE_IRIDESCENCE) != 0u && s.iridescence > 0.0;
   let lightmapped = (s.lobes & SURFACE_LIGHTMAP) != 0u && s.has_lightmap > 0.5;
   if (!coating && !sheening && !brushing && !transmitting && !iridescent && !lightmapped && s.occlusion >= 1.0) {
+    let reflected = s.f0 * split.x + vec3f(s.f90 * split.y);
+    let diffuse = s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0)) * (vec3f(1.0) - reflected * reflecting);
     // The base lobe alone, written as one expression: the very arithmetic
     // `surface_ambient` always had, to the bit.
     return diffuse * ambient_light(s.world, s.normal)
@@ -2222,6 +2440,8 @@ fn surface_sky(s: StandardSurface) -> vec3f {
     let irid_f = lobe_iridescence_fresnel(1.0, max(s.iridescence_ior, 1.0001), nv, max(s.iridescence_thickness, 0.0), s.f0);
     eff_f0 = mix(eff_f0, irid_f, clamp(s.iridescence, 0.0, 1.0));
   }
+  let reflected = eff_f0 * split.x + vec3f(s.f90 * split.y);
+  let diffuse = s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0)) * (vec3f(1.0) - reflected * reflecting);
   var reflection = sky_reflection_lobe(s.world, lookup, s.view, dot(s.normal, s.view), s.roughness, eff_f0, s.f90);
   if (s.occlusion < 1.0) {
     irradiance *= s.occlusion;
@@ -2232,7 +2452,7 @@ fn surface_sky(s: StandardSurface) -> vec3f {
     // The diffuse lobe gives way to the picture behind: what the base lobe's
     // reflection leaves of it, by the albedo and not the metal.
     let weight = clamp(s.transmission, 0.0, 1.0);
-    let through = s.behind * s.base_color * (vec3f(1.0) - (s.f0 * split.x + vec3f(split.y))) * (1.0 - clamp(s.metallic, 0.0, 1.0));
+    let through = s.behind * s.base_color * max(vec3f(1.0) - reflected, vec3f(0.0)) * (1.0 - clamp(s.metallic, 0.0, 1.0));
     base = diffuse * (irradiance * (1.0 - weight)) + through * weight;
   }
   var layers = 1.0;
@@ -2284,7 +2504,50 @@ fn standard_surface(s: StandardSurface) -> vec3f {
   let local = clustered_lobes(s);
   light += local.diffuse * s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0));
   light += local.specular;
-  light += clustered_area_lights(s.world, s.normal, s.view, s.base_color, s.metallic, s.f0, s.roughness);
+  if (cluster_grid.options.y >= 0.5) {
+    let nv = max(dot(s.normal, s.view), 0.0001);
+    var eff_f0 = s.f0;
+    if ((s.lobes & SURFACE_IRIDESCENCE) != 0u && s.iridescence > 0.0) {
+      let irid_f = lobe_iridescence_fresnel(1.0, max(s.iridescence_ior, 1.0001), nv, max(s.iridescence_thickness, 0.0), s.f0);
+      eff_f0 = mix(eff_f0, irid_f, clamp(s.iridescence, 0.0, 1.0));
+    }
+    var layers = 1.0;
+    var sheen_tint = vec3f(0.0);
+    if ((s.lobes & SURFACE_SHEEN) != 0u && dot(s.sheen_color, s.sheen_color) > 0.0) {
+      let tint = max(s.sheen_color, vec3f(0.0));
+      let albedo = lobe_sheen_albedo(nv, s.sheen_roughness);
+      sheen_tint = tint * albedo;
+      layers = max(0.0, 1.0 - max(tint.x, max(tint.y, tint.z)) * albedo);
+    }
+    var coat_weight = 0.0;
+    var coat_rough = 0.04;
+    if ((s.lobes & SURFACE_COAT) != 0u && s.coat > 0.0) {
+      coat_weight = clamp(s.coat, 0.0, 1.0);
+      coat_rough = clamp(s.coat_roughness, 0.04, 1.0);
+      let nvc = max(dot(s.coat_normal, s.view), 0.00001);
+      layers *= 1.0 - coat_weight * lobe_coat_fresnel(min(nvc, 1.0));
+    }
+    var diff_scale = layers;
+    if ((s.lobes & SURFACE_TRANSMISSION) != 0u && s.transmission > 0.0) {
+      diff_scale *= 1.0 - clamp(s.transmission, 0.0, 1.0);
+    }
+    light += clustered_area_lights_surface(
+      s.world,
+      s.normal,
+      s.view,
+      s.base_color,
+      s.metallic,
+      eff_f0,
+      s.f90,
+      s.roughness,
+      diff_scale,
+      layers,
+      coat_weight,
+      coat_rough,
+      s.coat_normal,
+      sheen_tint,
+    );
+  }
   return light;
 }
 
@@ -2311,12 +2574,14 @@ struct Vertex {
   @location(0) position: vec3f,
   @location(1) normal: vec3f,
   @location(2) uv: vec2f,
+  @location(12) uv1: vec2f,
 };
 struct Surface {
   @builtin(position) position: vec4f,
   @location(0) normal: vec3f,
   @location(1) world: vec3f,
   @location(2) uv: vec2f,
+  @location(3) uv1: vec2f,
 };
 
 @vertex fn vertex(input: Vertex) -> Surface {
@@ -2326,6 +2591,7 @@ struct Surface {
   output.normal = (draw.normal * vec4f(input.normal, 0.0)).xyz;
   output.world = world.xyz;
   output.uv = input.uv;
+  output.uv1 = input.uv1;
   return output;
 }
 
@@ -2353,10 +2619,10 @@ const LOBES: u32 = 0u;
   let base_sample = textureSample(base_texture, base_sampler, uv);
   let is_atlas = draw.settings.w > 4.5;
   let direct_layer = textureSample(layer_texture, base_sampler, uv);
-  let orm_sample = select(direct_layer, surface_read_atlas(layer_texture, base_sampler, 0u, uv, false), is_atlas);
   let emissive_sample = select(direct_layer.rgb, surface_read_atlas(layer_texture, base_sampler, 1u, uv, false).rgb, is_atlas);
   // The material's parameters are metallic (x) and roughness (y, 0.5 if it gives none).
   let roughness = select(draw.parameters.y, 0.5, draw.parameters.y <= 0.0);
+  let model_scale = length(draw.model[0].xyz);
   var s = surface_default(
     surface.world,
     normal,
@@ -2367,8 +2633,23 @@ const LOBES: u32 = 0u;
     surface.position,
     seen.z,
   );
-  s = surface_apply_block(s, draw.surface, LOBES, length(draw.model[0].xyz));
-  s = surface_apply_orm(s, orm_sample, draw.maps.z);
+  s = surface_apply_block(s, draw.surface, LOBES, model_scale);
+  if (!is_atlas) {
+    s = surface_apply_orm(s, direct_layer, draw.maps.z);
+  }
+  let tile_mask = u32(max(draw.atlas.x, 0.0) + 0.5);
+  s = surface_apply_atlas(
+    s,
+    layer_texture,
+    base_sampler,
+    uv,
+    surface.uv1,
+    draw.settings.w,
+    tile_mask,
+    draw.surface,
+    draw.iridescence,
+    model_scale,
+  );
   let visibility = sun_shadow(surface.world, normal, surface.position);
   var light = standard_surface(s) + standard_sun(s, scene.light_direction.xyz, scene.light_color.rgb, visibility);
   if (draw.maps.w > 0.5) {

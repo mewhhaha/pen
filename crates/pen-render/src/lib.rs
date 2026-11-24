@@ -86,7 +86,9 @@ pub use gpu_particles::{
     GpuParticleSystem, ParticleSimCounters, unit_cube_particle_mesh,
 };
 pub use hdri::{DEFAULT_HDRI_FACE_SIZE, DEFAULT_HDRI_SAMPLES, HdriCubemap, HdriImage, HdriPrefilterer, blend_sh_l2};
-pub use inspect::{TextureInfo, inspect_material, inspect_mesh, inspect_texture, shader_draws_sprites};
+pub use inspect::{
+    TextureInfo, inspect_material, inspect_material_base_texture, inspect_mesh, inspect_texture, shader_draws_sprites,
+};
 pub use lightmap::{
     BakedLightmap, GpuLightmapBaker, LIGHTMAP_BAKE_WGSL, LightmapBakeParams, LightmapTriangle, PackedLightmapMesh,
     pack_lightmap_uv2,
@@ -112,12 +114,14 @@ pub use render_targets::{
     ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,
     oblique_clip_projection, planar_reflection_camera, planar_reflection_view,
 };
-pub use shader_graph::{CompiledShaderGraph, NodeRef, PortType, RampStop, ShaderGraph, ShaderNode, ShaderNodeKind};
+pub use shader_graph::{
+    CompiledShaderGraph, NodeRef, PortType, RampStop, ShaderGraph, ShaderNode, ShaderNodeKind, is_shader_graph_key,
+};
 pub use surface_atlas::{SURFACE_ATLAS_WGSL, SurfaceAtlasPacker, SurfaceTile, TileCopy};
 pub use tonemap::{TONEMAP_SUITE_WGSL, TonemapOperator, tonemap_linear_f64};
 pub use video::{
-    ChromaSiting, ColorMatrix, ColorRange, ColorSpace, IvfFrame, IvfStream, VideoPlayer, VideoTexture, Y4mStream,
-    Yuv420Frame,
+    ChromaSiting, ColorMatrix, ColorRange, ColorSpace, IndexedY4mStream, IvfFrame, IvfStream, VideoPlayer,
+    VideoTexture, Y4mStream, Yuv420Frame,
 };
 pub use volume::{TRANSLUCENCY_WGSL, VolumeImage, VolumeLayer};
 
@@ -446,11 +450,43 @@ impl Renderer {
         self.state.frame_budget(milliseconds);
     }
 
+    /// Maximum 2D texture side supported by the active WebGPU device.
+    pub fn max_texture_dimension_2d(&self) -> u32 {
+        self.state.max_texture_dimension_2d()
+    }
+
+    /// Reserves a video texture key while its stream is loading asynchronously so the static
+    /// image loader does not attempt to decode the video file as PNG/JPEG.
+    pub fn reserve_video_texture(&mut self, key: &str) {
+        self.state.reserve_video_texture(key);
+    }
+
+    /// Evicts a live or reserved video texture key from the renderer, releasing its GPU texture.
+    pub fn evict_video_texture(&mut self, key: &str) {
+        self.state.evict_video_texture(key);
+    }
+
     /// Uploads a planar YUV420p video frame and converts it on the GPU into a
     /// live dynamic RGBA texture bound by any material whose `texture` key
     /// equals `key`.
     pub fn upload_video_frame(&mut self, key: &str, frame: &Yuv420Frame) -> anyhow::Result<()> {
         self.state.upload_video_frame(key, frame)
+    }
+
+    /// Zero-copy planar YUV420p upload directly from an [`IndexedY4mStream`] backing buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_video_planes(
+        &mut self,
+        key: &str,
+        width: u32,
+        height: u32,
+        color_space: ColorSpace,
+        siting: ChromaSiting,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+    ) -> anyhow::Result<()> {
+        self.state.upload_video_planes(key, width, height, color_space, siting, y, u, v)
     }
 
     /// Renders a secondary camera's `frame` into a double-buffered offscreen

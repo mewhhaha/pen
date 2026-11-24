@@ -147,6 +147,12 @@ pub fn inspect_material(bytes: &[u8]) -> Result<(String, Vec<String>)> {
     Ok((material.shader, textures))
 }
 
+/// Returns the material's authored base `texture` key, if any (distinct from normal/layer/PBR maps).
+pub fn inspect_material_base_texture(bytes: &[u8]) -> Result<Option<String>> {
+    let material = parse_material(bytes)?;
+    Ok(material.texture)
+}
+
 /// Whether a shader draws sprites (its vertex stage takes only builtins) or
 /// meshes; None when it has no `vertex` entry point.
 pub fn shader_draws_sprites(code: &str) -> Option<bool> {

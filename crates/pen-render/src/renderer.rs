@@ -352,16 +352,34 @@ struct SolidMesh {
     count: u32,
 }
 
+/// Independent per-camera temporal & history state so secondary views (RTT cameras and
+/// split-screen viewports) never corrupt the primary camera's or each other's TAA, exposure,
+/// volumetric fog, Hi-Z occlusion, or SSR history.
+pub(super) struct ViewTemporalState {
+    pub(super) post: Option<Post>,
+    pub(super) volumetrics: Option<crate::volume::Volumetrics>,
+    pub(super) hiz: Option<hiz::HiZ>,
+    pub(super) reflected: Option<(wgpu::TextureView, Matrix, u64)>,
+    pub(super) last_time: Option<f64>,
+}
+
+impl ViewTemporalState {
+    pub(super) fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        Self {
+            post: None,
+            volumetrics: Some(crate::volume::Volumetrics::new(device, queue)),
+            hiz: Some(hiz::HiZ::new(device, queue)),
+            reflected: None,
+            last_time: None,
+        }
+    }
+}
+
 struct CameraTargetEntry {
     assets: [TextureAsset; 2],
     targets: [Option<crate::render_targets::OffscreenRenderTarget>; 2],
     front: usize,
-    // Independent per-camera temporal state so secondary cameras never corrupt main-view TAA,
-    // exposure adaptation, volumetric fog history, or prior-frame Hi-Z.
-    post: Option<Post>,
-    volumetrics: Option<crate::volume::Volumetrics>,
-    hiz: Option<hiz::HiZ>,
-    last_time: Option<f64>,
+    temporal: ViewTemporalState,
 }
 
 /// Which texture a draw binds: an asset's, or a built-in stand-in.
@@ -826,6 +844,8 @@ pub(crate) struct State {
     // Live GPU-converted YUV420p video textures keyed by material texture name.
     videos: Vec<(String, TextureAsset, crate::video::VideoTexture)>,
     video_ids: HashMap<String, usize>,
+    // Video texture keys whose streams are currently fetching asynchronously, kept out of the static image loader.
+    reserved_videos: HashSet<String>,
     // Double-buffered render-to-texture secondary camera targets keyed by material texture name.
     // `front` is bound by materials while `back` is rendered into to prevent read/write hazards.
     camera_targets: Vec<CameraTargetEntry>,
@@ -1211,6 +1231,7 @@ impl State {
             field_ids: HashMap::new(),
             videos: Vec::new(),
             video_ids: HashMap::new(),
+            reserved_videos: HashSet::new(),
             camera_targets: Vec::new(),
             camera_target_ids: HashMap::new(),
             next_view_id: 5,
@@ -1281,19 +1302,74 @@ impl State {
         self.resolution.set_budget(milliseconds);
     }
 
+    pub fn max_texture_dimension_2d(&self) -> u32 {
+        self.device.limits().max_texture_dimension_2d
+    }
+
+    pub fn reserve_video_texture(&mut self, key: &str) {
+        self.reserved_videos.insert(key.to_owned());
+    }
+
+    pub fn evict_video_texture(&mut self, key: &str) {
+        self.reserved_videos.remove(key);
+        if let Some(idx) = self.video_ids.remove(key) {
+            let removed = self.videos.swap_remove(idx);
+            self.forget_views(removed.1.view_id);
+            if idx < self.videos.len() {
+                let swapped_key = self.videos[idx].0.clone();
+                self.video_ids.insert(swapped_key, idx);
+            }
+        }
+    }
+
     pub fn upload_video_frame(&mut self, key: &str, frame: &crate::video::Yuv420Frame) -> Result<()> {
         let max_dim = self.device.limits().max_texture_dimension_2d;
         frame.validate(max_dim)?;
+        self.upload_video_planes(
+            key,
+            frame.width,
+            frame.height,
+            frame.color_space,
+            frame.siting,
+            &frame.y,
+            &frame.u,
+            &frame.v,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_video_planes(
+        &mut self,
+        key: &str,
+        width: u32,
+        height: u32,
+        color_space: crate::video::ColorSpace,
+        siting: crate::video::ChromaSiting,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+    ) -> Result<()> {
+        let max_dim = self.device.limits().max_texture_dimension_2d;
+        anyhow::ensure!(
+            width >= 2
+                && height >= 2
+                && width <= max_dim.min(crate::video::MAX_VIDEO_DIM)
+                && height <= max_dim.min(crate::video::MAX_VIDEO_DIM)
+                && width.is_multiple_of(2)
+                && height.is_multiple_of(2),
+            "invalid video frame dimensions {width}x{height} (limit {max_dim})"
+        );
+        self.reserved_videos.remove(key);
         let found = self.video_ids.get(key).copied();
-        let needs_new = !matches!(found, Some(idx) if self.videos[idx].2.size() == (frame.width, frame.height));
+        let needs_new = !matches!(found, Some(idx) if self.videos[idx].2.size() == (width, height));
         if needs_new {
             // Construct and upload into the new VideoTexture BEFORE swapping so an error
             // never invalidates a working texture.
-            let video = crate::video::VideoTexture::new(&self.device, frame.width, frame.height)?;
+            let video = crate::video::VideoTexture::new(&self.device, width, height)?;
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("video_upload"),
             });
-            video.upload_and_convert(&self.queue, &mut encoder, frame)?;
+            video.upload_planes(&self.queue, &mut encoder, width, height, color_space, siting, y, u, v)?;
             self.queue.submit(Some(encoder.finish()));
             let id = self.view_id();
             let texture = video.texture().clone();
@@ -1323,15 +1399,78 @@ impl State {
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("video_upload"),
         });
-        self.videos[index].2.upload_and_convert(&self.queue, &mut encoder, frame)?;
+        self.videos[index].2.upload_planes(&self.queue, &mut encoder, width, height, color_space, siting, y, u, v)?;
         self.queue.submit(Some(encoder.finish()));
         Ok(())
+    }
+
+    /// Executes a secondary camera `frame` into `target` with full temporal state isolation
+    /// (`Post`/TAA, exposure, `Volumetrics`, `HiZ`, SSR `reflected`, `last_time`) and display
+    /// output bypass (skipping parent `Screen::decode` and global `ColorFilter`), preserving all
+    /// primary-frame counters, veil, and readiness state. Returns `(child_waiting, child_stats)`.
+    pub(super) fn submit_secondary_view(
+        &mut self,
+        frame: &pen_protocol::RenderFrame,
+        catalog: &pen_protocol::Catalog,
+        target: &mut dyn crate::RenderTarget,
+        temporal: &mut ViewTemporalState,
+    ) -> Result<(bool, RenderStats)> {
+        let mut cam_vol = temporal
+            .volumetrics
+            .take()
+            .unwrap_or_else(|| crate::volume::Volumetrics::new(&self.device, &self.queue));
+        let mut cam_hiz = temporal
+            .hiz
+            .take()
+            .unwrap_or_else(|| hiz::HiZ::new(&self.device, &self.queue));
+        std::mem::swap(&mut self.post, &mut temporal.post);
+        std::mem::swap(&mut self.volumetrics, &mut cam_vol);
+        std::mem::swap(&mut self.hiz, &mut cam_hiz);
+        std::mem::swap(&mut self.reflected, &mut temporal.reflected);
+        std::mem::swap(&mut self.last_time, &mut temporal.last_time);
+
+        let saved_stats = self.last_stats;
+        let saved_frames = self.frames;
+        let saved_waiting = self.waiting;
+        let saved_veil = self.veil.take();
+        let saved_timing = self.timing;
+        let saved_loading = self.loading_seen;
+        let saved_ready = self.ready_sent;
+        let saved_secondary = self.wired.in_secondary_camera;
+        let saved_bypass = self.wired.bypass_display_output;
+
+        self.timing = false;
+        self.wired.in_secondary_camera = true;
+        self.wired.bypass_display_output = true;
+        let res = self.submit(frame, catalog, target);
+        let child_waiting = self.waiting;
+        let child_stats = self.last_stats;
+
+        self.wired.bypass_display_output = saved_bypass;
+        self.wired.in_secondary_camera = saved_secondary;
+        self.last_stats = saved_stats;
+        self.frames = saved_frames;
+        self.waiting = saved_waiting;
+        self.veil = saved_veil;
+        self.timing = saved_timing;
+        self.loading_seen = saved_loading;
+        self.ready_sent = saved_ready;
+
+        std::mem::swap(&mut self.post, &mut temporal.post);
+        std::mem::swap(&mut self.volumetrics, &mut cam_vol);
+        std::mem::swap(&mut self.hiz, &mut cam_hiz);
+        std::mem::swap(&mut self.reflected, &mut temporal.reflected);
+        std::mem::swap(&mut self.last_time, &mut temporal.last_time);
+        temporal.volumetrics = Some(cam_vol);
+        temporal.hiz = Some(cam_hiz);
+        res?;
+        Ok((child_waiting, child_stats))
     }
 
     /// Renders a secondary camera's `frame` into a double-buffered offscreen target bound by any
     /// material whose `texture` key equals `key` (mirrors, portals, security monitors, minimaps).
     ///
-    /// Maintains independent temporal state (`Post`/TAA, exposure, `Volumetrics`, `HiZ`) per key
+    /// Maintains independent temporal state (`Post`/TAA, exposure, `Volumetrics`, `HiZ`, SSR) per key
     /// and preserves the main camera's stats, frame counter, veil, and readiness bookkeeping.
     /// Requires a right-handed view matrix (`det > 0`; use `planar_reflection_camera` for mirrors)
     /// and an SDR or linear scRGB output format (not PQ `Rgb10a2Unorm`).
@@ -1368,43 +1507,6 @@ impl State {
             stream: None,
         };
 
-        // Helper closure isolating main-camera temporal, SSR, stats, timing, veil and readiness state across `self.submit`.
-        let submit_isolated = |state: &mut State,
-                               cam_post: &mut Option<Post>,
-                               cam_vol: &mut crate::volume::Volumetrics,
-                               cam_hiz: &mut hiz::HiZ,
-                               cam_time: &mut Option<f64>,
-                               target: &mut crate::render_targets::OffscreenRenderTarget|
-         -> Result<()> {
-            std::mem::swap(&mut state.post, cam_post);
-            std::mem::swap(&mut state.volumetrics, cam_vol);
-            std::mem::swap(&mut state.hiz, cam_hiz);
-            std::mem::swap(&mut state.last_time, cam_time);
-            let saved_stats = state.last_stats;
-            let saved_frames = state.frames;
-            let saved_waiting = state.waiting;
-            let saved_veil = state.veil.take();
-            let saved_reflected = state.reflected.take();
-            let saved_timing = state.timing;
-            let saved_loading = state.loading_seen;
-            let saved_ready = state.ready_sent;
-            state.timing = false;
-            let res = state.submit(frame, catalog, target);
-            state.last_stats = saved_stats;
-            state.frames = saved_frames;
-            state.waiting = saved_waiting;
-            state.veil = saved_veil;
-            state.reflected = saved_reflected;
-            state.timing = saved_timing;
-            state.loading_seen = saved_loading;
-            state.ready_sent = saved_ready;
-            std::mem::swap(&mut state.post, cam_post);
-            std::mem::swap(&mut state.volumetrics, cam_vol);
-            std::mem::swap(&mut state.hiz, cam_hiz);
-            std::mem::swap(&mut state.last_time, cam_time);
-            res
-        };
-
         let needs_alloc = match found {
             None => true,
             Some(idx) => {
@@ -1415,11 +1517,8 @@ impl State {
         if needs_alloc {
             let mut rt0 = crate::render_targets::OffscreenRenderTarget::new(&self.device, size.0, size.1, format)?;
             let rt1 = crate::render_targets::OffscreenRenderTarget::new(&self.device, size.0, size.1, format)?;
-            let mut cam_post = None;
-            let mut cam_vol = crate::volume::Volumetrics::new(&self.device, &self.queue);
-            let mut cam_hiz = hiz::HiZ::new(&self.device, &self.queue);
-            let mut cam_time = None;
-            submit_isolated(self, &mut cam_post, &mut cam_vol, &mut cam_hiz, &mut cam_time, &mut rt0)?;
+            let mut temporal = ViewTemporalState::new(&self.device, &self.queue);
+            self.submit_secondary_view(frame, catalog, &mut rt0, &mut temporal)?;
             let id0 = self.view_id();
             let id1 = self.view_id();
             let assets = [make_asset(&rt0, id0), make_asset(&rt1, id1)];
@@ -1428,29 +1527,13 @@ impl State {
                 Some(idx) => {
                     let old0 = self.camera_targets[idx].assets[0].view_id;
                     let old1 = self.camera_targets[idx].assets[1].view_id;
-                    self.camera_targets[idx] = CameraTargetEntry {
-                        assets,
-                        targets,
-                        front: 0,
-                        post: cam_post,
-                        volumetrics: Some(cam_vol),
-                        hiz: Some(cam_hiz),
-                        last_time: cam_time,
-                    };
+                    self.camera_targets[idx] = CameraTargetEntry { assets, targets, front: 0, temporal };
                     self.forget_views(old0);
                     self.forget_views(old1);
                 }
                 None => {
                     let idx = self.camera_targets.len();
-                    self.camera_targets.push(CameraTargetEntry {
-                        assets,
-                        targets,
-                        front: 0,
-                        post: cam_post,
-                        volumetrics: Some(cam_vol),
-                        hiz: Some(cam_hiz),
-                        last_time: cam_time,
-                    });
+                    self.camera_targets.push(CameraTargetEntry { assets, targets, front: 0, temporal });
                     self.camera_target_ids.insert(key.to_owned(), idx);
                 }
             }
@@ -1460,17 +1543,14 @@ impl State {
         let idx = found.unwrap();
         let back = 1 - self.camera_targets[idx].front;
         let mut target = self.camera_targets[idx].targets[back].take().expect("camera back buffer present");
-        let mut cam_post = self.camera_targets[idx].post.take();
-        let mut cam_vol = self.camera_targets[idx].volumetrics.take().expect("camera volumetrics present");
-        let mut cam_hiz = self.camera_targets[idx].hiz.take().expect("camera hiz present");
-        let mut cam_time = self.camera_targets[idx].last_time;
-        let res = submit_isolated(self, &mut cam_post, &mut cam_vol, &mut cam_hiz, &mut cam_time, &mut target);
+        let mut temporal = std::mem::replace(
+            &mut self.camera_targets[idx].temporal,
+            ViewTemporalState { post: None, volumetrics: None, hiz: None, reflected: None, last_time: None },
+        );
+        let res = self.submit_secondary_view(frame, catalog, &mut target, &mut temporal);
         let entry = &mut self.camera_targets[idx];
         entry.targets[back] = Some(target);
-        entry.post = cam_post;
-        entry.volumetrics = Some(cam_vol);
-        entry.hiz = Some(cam_hiz);
-        entry.last_time = cam_time;
+        entry.temporal = temporal;
         res?;
         entry.front = back;
         Ok(())

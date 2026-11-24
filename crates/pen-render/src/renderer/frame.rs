@@ -284,17 +284,19 @@ impl State {
         let _ = self.device.poll(wgpu::PollType::Poll);
         let now = self.now();
         self.receive(now);
-        self.frames += 1;
-        self.loading_seen = frame.loading;
-        if !frame.loading {
-            self.ready_sent = false;
-        }
         self.waiting = false;
-        if self.frames.is_multiple_of(GROUP_LIFETIME) {
-            let oldest = self.frames - GROUP_LIFETIME;
-            self.groups.retain(|_, (_, used)| *used >= oldest);
+        if !self.wired.in_secondary_camera {
+            self.frames += 1;
+            self.loading_seen = frame.loading;
+            if !frame.loading {
+                self.ready_sent = false;
+            }
+            if self.frames.is_multiple_of(GROUP_LIFETIME) {
+                let oldest = self.frames - GROUP_LIFETIME;
+                self.groups.retain(|_, (_, used)| *used >= oldest);
+            }
+            self.fade(now);
         }
-        self.fade(now);
         if self.post.is_none() {
             let mut post = Post::new(&self.device, &self.queue);
             post.set_tonemap(self.tonemap, self.context.display.encoded_peak());
@@ -444,6 +446,7 @@ impl State {
         self.bind_particles(targets.opaque.as_ref(), &volume, &mut scratch.emitters);
         self.bind_ribbons(frame, &active_proj_for_trails, targets.opaque.as_ref(), &volume, &mut scratch.ribbons);
         self.write_screen(frame, reflected);
+        let (cookie_slots, cookie_uploads) = self.prepare_area_cookies(frame, catalog)?;
         self.clusters.update(
             &self.device,
             &self.queue,
@@ -451,13 +454,15 @@ impl State {
             targets.size,
             &self.local,
             super::shadows::local_atlas(&self.shadows),
+            &cookie_slots,
         );
         let device = self.device.clone();
         let mut encoder = device.create_command_encoder(&Default::default());
+        self.clusters.encode_cookies(&device, &mut encoder, &cookie_uploads);
         // The sky's reflection, drawn again if its colors changed.
         self.environment.encode(&device, &mut encoder);
-        // Physical atmosphere LUTs and raymarched 3D volumetric clouds when enabled.
-        self.encode_physical_sky(&mut encoder, frame, targets.size)?;
+        // Physical atmosphere LUTs and raymarched 3D volumetric clouds when enabled (matching jittered rays).
+        self.encode_physical_sky(&mut encoder, frame, &active_proj_for_trails, targets.size)?;
         // Timestamps around the passes, read back a few frames later, while
         // the host or a frame budget wants them.
         self.timer.begin(self.timing || self.resolution.budgeted());
@@ -546,10 +551,18 @@ impl State {
         // colour filter on, the frame draws into the filter's texture first,
         // which its pass draws into that picture (or the surface) last.
         let Some(surface) = target.view() else { return Ok(()) };
-        let screen = self.screen.view(&self.device, &self.queue, &surface, (output_width, output_height));
+        let bypass = self.wired.bypass_display_output;
+        let screen = if bypass {
+            surface.clone()
+        } else {
+            self.screen.view(&self.device, &self.queue, &surface, (output_width, output_height))
+        };
         let format = self.context.format;
-        let filtered =
-            self.filter.begin(&device, &self.queue, format, self.context.cache.get(), (output_width, output_height));
+        let filtered = if bypass {
+            None
+        } else {
+            self.filter.begin(&device, &self.queue, format, self.context.cache.get(), (output_width, output_height))
+        };
         let output = filtered.as_ref().unwrap_or(&screen).clone();
         // Opaque surfaces, then any decals over them. A frame with translucent
         // surfaces, particles or overlays then has its opaque picture misted, and
@@ -849,10 +862,12 @@ impl State {
         if !frame.loading {
             self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
         }
-        if filtered.is_some() {
-            self.filter.finish(&mut encoder, &screen);
+        if !bypass {
+            if filtered.is_some() {
+                self.filter.finish(&mut encoder, &screen);
+            }
+            self.screen.decode(&mut encoder, &surface);
         }
-        self.screen.decode(&mut encoder, &surface);
         // The scale the scene drew at, as `Post` sized it.
         #[allow(clippy::cast_precision_loss, reason = "a ratio of pixels")]
         let drawn = targets.size.0 as f32 / output_width.max(1) as f32;
@@ -876,28 +891,33 @@ impl State {
         }
         self.timer.submitted();
         self.culling.submitted();
-        self.resolution.submitted(&self.queue, self.timer.timed());
-        target.present();
-        if let Some(budget) = self.asset_budget
-            && self.gpu_asset_bytes() > budget
-        {
-            let _ = self.evict_unused(2, budget);
+        if !self.wired.in_secondary_camera {
+            self.resolution.submitted(&self.queue, self.timer.timed());
         }
-        // Once background compiles end, what they added to the pipeline
-        // cache is written, in the background too.
-        if self.frames.is_multiple_of(30) {
-            let busy = self.pending() > 0;
-            if self.busy && !busy {
-                self.loader.jobs.push(Job::Persist, Priority::Background);
+        target.present();
+        if !self.wired.in_secondary_camera {
+            if let Some(budget) = self.asset_budget
+                && self.gpu_asset_bytes() > budget
+            {
+                let _ = self.evict_unused(2, budget);
             }
-            self.busy = busy;
+            // Once background compiles end, what they added to the pipeline
+            // cache is written, in the background too.
+            if self.frames.is_multiple_of(30) {
+                let busy = self.pending() > 0;
+                if self.busy && !busy {
+                    self.loader.jobs.push(Job::Persist, Priority::Background);
+                }
+                self.busy = busy;
+            }
         }
         Ok(())
     }
 
     /// Fast path for split-screen frames: renders each `split_screen == true` camera into
-    /// cached offscreen targets, composites them onto `output`, then draws HUD sprites and
-    /// the startup veil once on top without running a wasted primary 3D scene pass.
+    /// temporally-isolated offscreen targets BEFORE acquiring display/filter targets, then
+    /// composites them once with scene-filter sprites, ordered insets, HUD sprites, startup veil,
+    /// global color filter, and HDR display decode.
     fn draw_split_screen(
         &mut self,
         frame: &RenderFrame,
@@ -913,8 +933,8 @@ impl State {
         while !covered && self.built_ins.coming(BuiltIn::all(samples)) && self.wait(std::time::Duration::from_secs(10))
         {
         }
-        self.sprite_batches(&frame.sprites, catalog, &mut scratch.sprites, &mut scratch.sprite_order)?;
         let (output_width, output_height) = target.size();
+        self.sprite_batches(&frame.sprites, catalog, &mut scratch.sprites, &mut scratch.sprite_order)?;
         if covered && !self.built_ins.ready(BuiltIn::all(samples)) {
             self.waiting = true;
             self.last_stats = RenderStats::default();
@@ -942,6 +962,21 @@ impl State {
             target.present();
             return Ok(());
         }
+        // 1. Render all split-screen child views FIRST into presentation-format intermediates
+        //    with display decode and global color filter bypassed, and isolated temporal state.
+        let (rects, child_waiting, mut stats) =
+            self.render_split_screen_views(frame, catalog, (output_width, output_height))?;
+
+        // 2. Prepare parent-level insets (after child views so draw uniforms hold inset draws).
+        let parent_waiting_before_insets = self.waiting;
+        if !frame.insets.is_empty() {
+            self.batch_insets_only(frame, scratch)?;
+            self.prepare_items(frame, catalog, samples, scratch)?;
+            self.prepare_insets(frame, (output_width, output_height), &mut scratch.insets);
+        }
+        let composite = (!scratch.insets.is_empty()).then(|| self.built_ins.get(BuiltIn::Composite).clone());
+
+        // 3. Acquire parent display & accessibility filter targets AFTER child submissions.
         let Some(surface) = target.view() else { return Ok(()) };
         let device = self.device.clone();
         let screen = self.screen.view(&device, &self.queue, &surface, (output_width, output_height));
@@ -952,38 +987,140 @@ impl State {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("split_screen_frame"),
         });
-        let (any_waiting, mut stats) =
-            self.render_split_screen_into(frame, catalog, &mut encoder, &output, (output_width, output_height))?;
-        stats.field_upload_bytes = field_upload_bytes;
-        stats.field_upload_calls = field_upload_calls;
-        stats.field_input_texels = field_input_texels;
-        stats.scale = frame.quality.scale;
-        self.waiting = any_waiting;
-        if frame.loading {
-            self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
+        self.timer.begin(self.timing || self.resolution.budgeted());
+        if !scratch.items.is_empty() {
+            self.morphing.dispatch(&device, &mut encoder, &self.assets);
         }
+
+        // 4. Composite split views, running scene-filter sprites when present.
+        let has_filters = scratch.sprites.iter().any(|batch| batch.scene_filter);
+        let composite_scene_view = if has_filters {
+            let layout = self.context.sprite_group.clone();
+            let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&device, layout));
+            let images = sprites.filter_targets(&device, (output_width, output_height), format);
+            self.composite_split_screen(&mut encoder, &images[0], (output_width, output_height), rects)?;
+            let sprites = self.sprites.as_mut().unwrap();
+            sprites.prepare(&device, &self.queue, (output_width, output_height), &frame.sprites, &scratch.sprite_order);
+            let mut current = 0;
+            for batch in scratch.sprites.iter().filter(|batch| batch.scene_filter) {
+                for index in batch.first..batch.first + batch.count {
+                    let next = 1 - current;
+                    encoder.copy_texture_to_texture(
+                        images[current].texture().as_image_copy(),
+                        images[next].texture().as_image_copy(),
+                        wgpu::Extent3d { width: output_width, height: output_height, depth_or_array_layers: 1 },
+                    );
+                    sprites.set_scene(Some(images[current].clone()));
+                    sprites.draw_pass(
+                        &device,
+                        &mut encoder,
+                        &images[next],
+                        std::slice::from_ref(batch),
+                        index..index + 1,
+                        self.timer.pass(Span::Post),
+                        true,
+                    );
+                    current = next;
+                }
+            }
+            self.wired.blit(&device, &mut encoder, &images[current], &output, format);
+            Some(images[current].clone())
+        } else {
+            self.composite_split_screen(&mut encoder, &output, (output_width, output_height), rects)?;
+            None
+        };
+
+        // 5. Draw ordered insets, HUD sprites, and startup veil identically to single-view frames.
         if !scratch.sprites.is_empty() {
             let layout = self.context.sprite_group.clone();
             let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&device, layout));
-            sprites.prepare(&device, &self.queue, (output_width, output_height), &frame.sprites, &scratch.sprite_order);
-            sprites.draw_prepared(
+            sprites.set_scene(composite_scene_view);
+            if !has_filters {
+                sprites.prepare(
+                    &device,
+                    &self.queue,
+                    (output_width, output_height),
+                    &frame.sprites,
+                    &scratch.sprite_order,
+                );
+            }
+        }
+        let drawing = Drawing {
+            assets: &self.assets,
+            items: &scratch.items,
+            batches: &scratch.batches,
+            solids: &self.solid_meshes,
+            instances: &self.instance_buffer,
+            zero_tangents: &self.zero_tangents,
+            default_extra_attrs: &self.default_extra_attrs,
+            skin: self.skinning.group(),
+            morphed: self.morphing.output(),
+            culling: &self.culling,
+        };
+        let ready = &scratch.ready;
+        scratch.insets.sort_by_key(|&(index, _)| frame.insets[index].after_sprites);
+        let mut cursor = 0;
+        for layer in 0..scratch.insets.len() {
+            let index = scratch.insets[layer].0;
+            let boundary = frame.insets[index].after_sprites;
+            let end = scratch.sprite_order.partition_point(|&index| index < boundary);
+            if end > cursor {
+                self.sprites.as_mut().unwrap().draw_prepared(
+                    &device,
+                    &mut encoder,
+                    &output,
+                    &scratch.sprites,
+                    u32::try_from(cursor).expect("bounded sprite count")
+                        ..u32::try_from(end).expect("bounded sprite count"),
+                    self.timer.pass(Span::Overlay),
+                );
+                cursor = end;
+            }
+            if let Some(composite) = &composite {
+                self.draw_insets(
+                    &mut encoder,
+                    &output,
+                    &drawing,
+                    &scratch.insets[layer..layer + 1],
+                    ready,
+                    composite,
+                    &mut stats,
+                );
+            }
+        }
+        if frame.loading {
+            self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
+        }
+        if cursor < scratch.sprite_order.len() {
+            self.sprites.as_mut().unwrap().draw_prepared(
                 &device,
                 &mut encoder,
                 &output,
                 &scratch.sprites,
-                0..u32::try_from(scratch.sprite_order.len()).expect("bounded sprite count"),
-                None,
+                u32::try_from(cursor).expect("bounded sprite count")
+                    ..u32::try_from(scratch.sprite_order.len()).expect("bounded sprite count"),
+                self.timer.pass(Span::Overlay),
             );
         }
         if !frame.loading {
             self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
         }
+
+        // 6. Apply global accessibility filter and display decode ONCE to the full composite.
         if filtered.is_some() {
             self.filter.finish(&mut encoder, &screen);
         }
         self.screen.decode(&mut encoder, &surface);
+        stats.field_upload_bytes = field_upload_bytes;
+        stats.field_upload_calls = field_upload_calls;
+        stats.field_input_texels = field_input_texels;
+        stats.gpu = self.timer.latest();
+        self.waiting = self.waiting || parent_waiting_before_insets || child_waiting;
         self.last_stats = stats;
+        self.timer.resolve(&mut encoder);
         self.queue.submit([encoder.finish()]);
+        self.timer.submitted();
+        self.resolution.submitted(&self.queue, self.timer.timed());
         target.present();
         if let Some(budget) = self.asset_budget
             && self.gpu_asset_bytes() > budget

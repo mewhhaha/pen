@@ -181,7 +181,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     let rb = cloud.camera.w;
     let r_bot = rb + cloud.ambient.w;
     let r_top = rb + max(cloud.wind.w, cloud.ambient.w + 0.1);
-    let origin = vec3f(cloud.camera.x, rb + max(cloud.camera.y, 0.002), cloud.camera.z);
+    let w2k = select(1.0, cloud.quality.z, cloud.quality.z > 0.0);
+    let alt_km = max(cloud.quality.w + cloud.camera.y * w2k, 0.002);
+    let origin = vec3f(cloud.camera.x * w2k, rb + alt_km, cloud.camera.z * w2k);
     let cam_r = length(origin);
 
     let hit_planet = ray_sphere(origin, dir, rb);

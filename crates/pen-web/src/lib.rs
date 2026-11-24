@@ -47,6 +47,30 @@ pub async fn fetch(path: &str) -> Result<Vec<u8>> {
     Ok(Uint8Array::new(&bytes).to_vec())
 }
 
+/// Fetches `path`, rejecting responses whose `Content-Length` or payload exceeds `max_bytes`
+/// before copying into Wasm linear memory.
+pub async fn fetch_bounded(path: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    let response: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str(path))
+        .await
+        .map_err(error)?
+        .dyn_into()
+        .map_err(error)?;
+    anyhow::ensure!(response.ok(), "fetch {path}: HTTP {}", response.status());
+    if let Ok(Some(len_header)) = response.headers().get("content-length")
+        && let Ok(declared) = len_header.trim().parse::<u64>()
+    {
+        anyhow::ensure!(
+            declared <= max_bytes as u64,
+            "fetch {path}: Content-Length {declared} exceeds {max_bytes}-byte limit"
+        );
+    }
+    let buffer = JsFuture::from(response.array_buffer().map_err(error)?).await.map_err(error)?;
+    let array = Uint8Array::new(&buffer);
+    let len = array.byte_length() as usize;
+    anyhow::ensure!(len <= max_bytes, "fetch {path}: payload {len} bytes exceeds {max_bytes}-byte limit");
+    Ok(array.to_vec())
+}
+
 /// Missing optional declarations are opaque; all other failures stay visible.
 pub(crate) async fn load_state_adapter(assets: &str) -> Arc<dyn StateAdapter> {
     let path = format!("{assets}/{CONFIG_FILE}");

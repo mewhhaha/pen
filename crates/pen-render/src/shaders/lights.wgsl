@@ -279,6 +279,27 @@ fn area_basis(n: vec3f, v: vec3f) -> mat3x3f {
   return transpose(mat3x3f(t1, t2, n));
 }
 
+const AREA_COOKIE_OFFSET: u32 = 8512u;
+const AREA_COOKIE_DIM: u32 = 32u;
+const AREA_COOKIE_TEXELS: u32 = 1024u;
+const AREA_MAX_COOKIES: u32 = 8u;
+
+fn area_sample_cookie(slot: u32, uv: vec2f) -> vec3f {
+  let c = clamp(uv, vec2f(0.0), vec2f(1.0)) * f32(AREA_COOKIE_DIM - 1u);
+  let x0 = u32(floor(c.x));
+  let y0 = u32(floor(c.y));
+  let x1 = min(x0 + 1u, AREA_COOKIE_DIM - 1u);
+  let y1 = min(y0 + 1u, AREA_COOKIE_DIM - 1u);
+  let fx = c.x - f32(x0);
+  let fy = c.y - f32(y0);
+  let base = AREA_COOKIE_OFFSET + min(slot, AREA_MAX_COOKIES - 1u) * AREA_COOKIE_TEXELS;
+  let t00 = area_light_data[base + y0 * AREA_COOKIE_DIM + x0].rgb;
+  let t10 = area_light_data[base + y0 * AREA_COOKIE_DIM + x1].rgb;
+  let t01 = area_light_data[base + y1 * AREA_COOKIE_DIM + x0].rgb;
+  let t11 = area_light_data[base + y1 * AREA_COOKIE_DIM + x1].rgb;
+  return mix(mix(t00, t10, fx), mix(t01, t11, fx), fy);
+}
+
 fn area_range_window(dist: f32, reach: f32) -> f32 {
   if (reach <= 0.0) {
     return 1.0;
@@ -291,16 +312,26 @@ fn area_range_window(dist: f32, reach: f32) -> f32 {
   return w * w;
 }
 
-// Evaluates all active LTC area lights (Rect, Disk, Tube, CookieSpot) in `area_light_data`.
-// Fast-path returns zero immediately when `cluster_grid.options.y < 0.5`.
-fn clustered_area_lights(
+// Evaluates all active LTC area lights (Rect, Disk, Tube, CookieSpot) in `area_light_data`
+// with full Fresnel endpoints (`f0`, `f90`), lobe energy sharing (transmission/sheen/coat),
+// packed RGBA cookies, and directional GGX BRDF for cookie projectors.
+// Emitter `col_reach.rgb` is radiance in scene-linear units (a unit-radiance full hemisphere
+// produces irradiance 1.0 in Pen's pi-scaled Lambert convention).
+fn clustered_area_lights_surface(
   world: vec3f,
   normal: vec3f,
   view: vec3f,
   base_color: vec3f,
   metallic: f32,
   f0: vec3f,
+  f90: f32,
   roughness: f32,
+  diff_scale: f32,
+  spec_scale: f32,
+  coat_weight: f32,
+  coat_roughness: f32,
+  coat_normal: vec3f,
+  sheen_tint: vec3f,
 ) -> vec3f {
   let count = min(u32(max(cluster_grid.options.y, 0.0) + 0.5), AREA_MAX_LIGHTS);
   if (count == 0u) {
@@ -320,8 +351,29 @@ fn clustered_area_lights(
   );
   let basis = area_basis(n, v);
   let spec_xf = minv * basis;
-  let diff_albedo = base_color * (1.0 - clamp(metallic, 0.0, 1.0));
-  let spec_fresnel = f0 * t2.x + (vec3f(1.0) - f0) * t2.y;
+  let spec_fresnel = f0 * t2.x + vec3f(f90 * t2.y);
+  let metal = clamp(metallic, 0.0, 1.0);
+  // Conserve energy against the LTC directional specular albedo so a unit-radiance hemisphere stays <= 1.
+  let diff_albedo = base_color * (1.0 - metal) * max(vec3f(1.0) - spec_fresnel, vec3f(0.0)) * diff_scale;
+
+  var coat_xf = spec_xf;
+  var coat_fresnel = 0.0;
+  if (coat_weight > 0.0) {
+    let cn = normalize(coat_normal);
+    let cndv = clamp(dot(cn, v), 0.0, 1.0);
+    let cq = sqrt(max(1.0 - cndv, 0.0));
+    let cr = clamp(coat_roughness, 0.04, 1.0);
+    let ct1 = area_sample_lut(AREA_MAT_OFFSET, cr, cq);
+    let ct2 = area_sample_lut(AREA_AMP_OFFSET, cr, cq);
+    let cminv = mat3x3f(
+      vec3f(ct1.x, 0.0, ct1.y),
+      vec3f(0.0, 1.0, 0.0),
+      vec3f(ct1.z, 0.0, ct1.w),
+    );
+    coat_xf = cminv * area_basis(cn, v);
+    coat_fresnel = coat_weight * (0.04 * ct2.x + ct2.y);
+  }
+  let has_sheen = dot(sheen_tint, sheen_tint) > 0.0;
   var total = vec3f(0.0);
 
   for (var i = 0u; i < count; i++) {
@@ -347,8 +399,6 @@ fn clustered_area_lights(
       continue;
     }
     let two_sided = flags.x > 0.5;
-    var diff_form = 0.0;
-    var spec_form = 0.0;
 
     if (kind == 0u || kind == 1u) {
       let emit_raw = cross(right, up);
@@ -362,6 +412,71 @@ fn clustered_area_lights(
       }
     }
 
+    if (kind == 3u) {
+      // Cookie spotlight cone projector evaluated with directional GGX microfacet BRDF.
+      let forward = normalize(cross(right, up));
+      let rel = world - center;
+      let lz = dot(rel, forward);
+      if (lz <= 1e-4) {
+        continue;
+      }
+      let tan_fov = max(flags.w, 0.05);
+      let aspect = max(up_ext.w, 0.1);
+      let u = 0.5 + dot(rel, right) / (2.0 * lz * tan_fov * aspect);
+      let v_coord = 0.5 - dot(rel, up) / (2.0 * lz * tan_fov);
+      if (u < 0.0 || u > 1.0 || v_coord < 0.0 || v_coord > 1.0) {
+        continue;
+      }
+      let edge = max(flags.z, 0.005);
+      let mask = smoothstep(0.0, edge, u) * smoothstep(0.0, edge, 1.0 - u)
+        * smoothstep(0.0, edge, v_coord) * smoothstep(0.0, edge, 1.0 - v_coord);
+      let cookie_rgb = select(vec3f(1.0), area_sample_cookie(u32(flags.y + 0.5), vec2f(u, v_coord)), flags.y >= 0.0);
+      let to_l = -rel / max(dist_center, 1e-4);
+      let ndl = max(dot(n, to_l), 0.0);
+      if (ndl <= 0.0) {
+        continue;
+      }
+      let falloff = mask / (dist_center * dist_center + 1.0);
+      let radiance = col_reach.rgb * cookie_rgb * (falloff * atten);
+      let h = normalize(v + to_l);
+      let nh = clamp(dot(n, h), 0.0, 1.0);
+      let vh = clamp(dot(v, h), 0.0, 1.0);
+      let nv = max(ndotv, 1e-5);
+      let a = rough * rough;
+      let a2 = a * a;
+      let denom = nh * nh * (a2 - 1.0) + 1.0;
+      let ggx_d = a2 / (3.14159265359 * denom * denom);
+      let vis = 0.5 / max(1e-6, ndl * sqrt(nv * nv * (1.0 - a2) + a2) + nv * sqrt(ndl * ndl * (1.0 - a2) + a2));
+      let fade = 1.0 - vh;
+      let schlick = f0 + (vec3f(f90) - f0) * (fade * fade * fade * fade * fade);
+      let dir_diff = base_color * (1.0 - metal) * max(vec3f(1.0) - schlick, vec3f(0.0)) * (ndl * diff_scale);
+      let dir_spec = schlick * (ggx_d * vis * ndl * 3.14159265359 * spec_scale);
+      var dir_coat = vec3f(0.0);
+      if (coat_weight > 0.0) {
+        let cn = normalize(coat_normal);
+        let nlc = max(dot(cn, to_l), 0.0);
+        let nhc = clamp(dot(cn, h), 0.0, 1.0);
+        let nvc = max(dot(cn, v), 1e-5);
+        let ca = coat_roughness * coat_roughness;
+        let ca2 = ca * ca;
+        let cd = nhc * nhc * (ca2 - 1.0) + 1.0;
+        let c_ggx = ca2 / (3.14159265359 * cd * cd);
+        let c_vis = 0.5 / max(1e-6, nlc * sqrt(nvc * nvc * (1.0 - ca2) + ca2) + nvc * sqrt(nlc * nlc * (1.0 - ca2) + ca2));
+        let fc = coat_weight * (0.04 + 0.96 * fade * fade * fade * fade * fade);
+        dir_coat = vec3f(fc * c_ggx * c_vis * nlc * 3.14159265359);
+      }
+      var dir_sheen = vec3f(0.0);
+      if (has_sheen) {
+        dir_sheen = sheen_tint * ndl;
+      }
+      total += (dir_diff + dir_spec + dir_sheen + dir_coat) * radiance;
+      continue;
+    }
+
+    var diff_form = 0.0;
+    var spec_form = 0.0;
+    var coat_form = 0.0;
+
     if (kind == 0u) {
       let ex = right * right_ext.w;
       let ey = up * up_ext.w;
@@ -371,6 +486,9 @@ fn clustered_area_lights(
       let q3 = (center - ex + ey) - world;
       diff_form = area_eval_quad(basis * q0, basis * q1, basis * q2, basis * q3);
       spec_form = area_eval_quad(spec_xf * q0, spec_xf * q1, spec_xf * q2, spec_xf * q3);
+      if (coat_weight > 0.0) {
+        coat_form = area_eval_quad(coat_xf * q0, coat_xf * q1, coat_xf * q2, coat_xf * q3);
+      }
     } else if (kind == 1u) {
       let rad = max(right_ext.w, 1e-4) * AREA_OCTAGON_SCALE;
       let d = rad * 0.70710678;
@@ -388,7 +506,12 @@ fn clustered_area_lights(
       spec_form = area_eval_quad(spec_xf * c0, spec_xf * c1, spec_xf * c2, spec_xf * c3)
         + area_eval_quad(spec_xf * c4, spec_xf * c5, spec_xf * c6, spec_xf * c7)
         + area_eval_quad(spec_xf * c0, spec_xf * c3, spec_xf * c4, spec_xf * c7);
-    } else if (kind == 2u) {
+      if (coat_weight > 0.0) {
+        coat_form = area_eval_quad(coat_xf * c0, coat_xf * c1, coat_xf * c2, coat_xf * c3)
+          + area_eval_quad(coat_xf * c4, coat_xf * c5, coat_xf * c6, coat_xf * c7)
+          + area_eval_quad(coat_xf * c0, coat_xf * c3, coat_xf * c4, coat_xf * c7);
+      }
+    } else {
       let half_len = max(right_ext.w, 1e-4);
       let tube_r = max(up_ext.w, 0.01);
       let to_p = world - center;
@@ -403,32 +526,34 @@ fn clustered_area_lights(
       let q3 = (center - ex + ey) - world;
       diff_form = area_eval_quad(basis * q0, basis * q1, basis * q2, basis * q3);
       spec_form = area_eval_quad(spec_xf * q0, spec_xf * q1, spec_xf * q2, spec_xf * q3);
-    } else {
-      // Cookie spotlight cone projector.
-      let forward = normalize(cross(right, up));
-      let rel = world - center;
-      let lz = dot(rel, forward);
-      if (lz <= 1e-4) {
-        continue;
+      if (coat_weight > 0.0) {
+        coat_form = area_eval_quad(coat_xf * q0, coat_xf * q1, coat_xf * q2, coat_xf * q3);
       }
-      let tan_fov = max(flags.w, 0.05);
-      let aspect = max(up_ext.w, 0.1);
-      let u = 0.5 + dot(rel, right) / (2.0 * lz * tan_fov * aspect);
-      let v_coord = 0.5 - dot(rel, up) / (2.0 * lz * tan_fov);
-      if (u < 0.0 || u > 1.0 || v_coord < 0.0 || v_coord > 1.0) {
-        continue;
-      }
-      let edge = max(flags.z, 0.005);
-      let mask = smoothstep(0.0, edge, u) * smoothstep(0.0, edge, 1.0 - u)
-        * smoothstep(0.0, edge, v_coord) * smoothstep(0.0, edge, 1.0 - v_coord);
-      let to_l = -rel / max(dist_center, 1e-4);
-      let ndl = max(dot(n, to_l), 0.0);
-      let falloff = mask / (dist_center * dist_center + 1.0);
-      diff_form = ndl * falloff;
-      spec_form = ndl * falloff;
     }
 
-    total += (diff_albedo * diff_form + spec_fresnel * spec_form) * col_reach.rgb * atten;
+    var contrib = diff_albedo * diff_form + spec_fresnel * (spec_form * spec_scale);
+    if (has_sheen) {
+      contrib += sheen_tint * diff_form;
+    }
+    if (coat_weight > 0.0) {
+      contrib += vec3f(coat_fresnel * coat_form);
+    }
+    total += contrib * col_reach.rgb * atten;
   }
   return total;
+}
+
+// Convenience wrapper for shaders calling the 7-argument LTC area-light entry point.
+fn clustered_area_lights(
+  world: vec3f,
+  normal: vec3f,
+  view: vec3f,
+  base_color: vec3f,
+  metallic: f32,
+  f0: vec3f,
+  roughness: f32,
+) -> vec3f {
+  return clustered_area_lights_surface(
+    world, normal, view, base_color, metallic, f0, 1.0, roughness, 1.0, 1.0, 0.0, 0.04, normal, vec3f(0.0),
+  );
 }

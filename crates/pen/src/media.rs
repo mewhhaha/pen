@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use pen_protocol::{Catalog, RenderFrame};
-use pen_render::{IvfStream, Renderer, VideoPlayer, Y4mStream};
+use pen_render::{IvfStream, Renderer, VideoPlayer};
 use pen_runtime::voice::{
     PopAction, VOICE_FRAME_SAMPLES, VoiceActivityDetector, VoicePacket, VoiceRouter,
 };
@@ -16,8 +16,8 @@ use crate::opus::{VoiceDecoder, VoiceEncoder};
 
 struct ActiveVideo {
     player: VideoPlayer,
-    fps: f64,
     last_frame_index: Option<usize>,
+    last_seek: Option<(u32, u32, bool)>,
 }
 
 /// Manages GPU-decoded video textures referenced by `frame.video_streams`.
@@ -32,36 +32,50 @@ impl VideoRegistry {
     }
 
     /// Steps all active `frame.video_streams`, lazily opening `.y4m`/`.ivf` files from
-    /// `assets_dir` and uploading changed frames into `renderer` via `upload_video_frame`.
+    /// `assets_dir` and uploading changed frames zero-copy into `renderer`.
     pub fn update(&mut self, frame: &RenderFrame, catalog: &Catalog, renderer: &mut Renderer) -> Result<()> {
+        let max_dim = renderer.max_texture_dimension_2d();
+        let mut directives: Vec<(String, &pen_protocol::VideoStreamSpec)> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
         for spec in &frame.video_streams {
-            let mat_key = catalog.material(spec.material);
+            let Some(mat_key) = catalog.materials.get(spec.material as usize) else { continue };
+            if pen_render::validate_asset_key(mat_key).is_err() {
+                continue;
+            }
             let mat_path = self.assets_dir.join(mat_key);
             let Ok(mat_bytes) = std::fs::read(&mat_path) else { continue };
-            let Ok((_, textures)) = pen_render::inspect_material(&mat_bytes) else { continue };
-            let Some(tex_key) = textures.first().cloned() else { continue };
-
+            let Ok(Some(tex_key)) = pen_render::inspect_material_base_texture(&mat_bytes) else { continue };
+            if pen_render::validate_asset_key(&tex_key).is_err() {
+                continue;
+            }
+            if let Some(&pos) = seen.get(&tex_key) {
+                directives[pos].1 = spec;
+            } else {
+                seen.insert(tex_key.clone(), directives.len());
+                directives.push((tex_key, spec));
+            }
+        }
+        for (tex_key, spec) in directives {
             if !self.streams.contains_key(&tex_key) {
                 let video_path = self.assets_dir.join(&tex_key);
-                if let Some((player, fps)) = load_video_player(&video_path, spec.looping)? {
-                    self.streams.insert(tex_key.clone(), ActiveVideo { player, fps, last_frame_index: None });
+                if let Some(player) = load_video_player(&video_path, spec.looping, max_dim)? {
+                    self.streams.insert(tex_key.clone(), ActiveVideo { player, last_frame_index: None, last_seek: None });
                 } else {
                     continue;
                 }
             }
             if let Some(active) = self.streams.get_mut(&tex_key) {
-                let speed = if spec.speed <= 0.0 { 1.0 } else { spec.speed };
                 active.player.looping = spec.looping;
                 active.player.paused = !spec.playing;
-                if spec.playing {
-                    let target_t = f64::from(spec.time.max(0.0)) * f64::from(speed);
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "non-negative frame index")]
-                    let target_idx = (target_t * active.fps).floor().max(0.0) as usize;
-                    active.player.seek_frame(target_idx);
+                let seek_key = (spec.time.to_bits(), spec.speed.to_bits(), spec.looping);
+                if spec.playing || active.last_seek != Some(seek_key) {
+                    active.player.seek_time(f64::from(spec.time), f64::from(spec.speed));
+                    active.last_seek = Some(seek_key);
                 }
                 let idx = active.player.current_index();
                 if active.last_frame_index != Some(idx) {
-                    renderer.upload_video_frame(&tex_key, active.player.current_frame())?;
+                    let (w, h, cs, siting, y, u, v) = active.player.current_planes();
+                    renderer.upload_video_planes(&tex_key, w, h, cs, siting, y, u, v)?;
                     active.last_frame_index = Some(idx);
                 }
             }
@@ -70,16 +84,21 @@ impl VideoRegistry {
     }
 }
 
-fn load_video_player(path: &Path, looping: bool) -> Result<Option<(VideoPlayer, f64)>> {
+fn load_video_player(path: &Path, looping: bool, max_dim: u32) -> Result<Option<VideoPlayer>> {
     if !path.is_file() {
         return Ok(None);
     }
+    const MAX_NATIVE_Y4M_BYTES: usize = 256 * 1024 * 1024;
     let bytes = std::fs::read(path).with_context(|| format!("reading video {}", path.display()))?;
     if bytes.starts_with(b"YUV4MPEG2") {
-        let stream = Y4mStream::parse(&bytes)?;
-        let fps = stream.fps();
-        let player = VideoPlayer::from_y4m(stream, looping)?;
-        return Ok(Some((player, fps)));
+        let stream = pen_render::IndexedY4mStream::parse_with_limits(
+            bytes,
+            pen_render::ColorMatrix::Bt709,
+            max_dim,
+            MAX_NATIVE_Y4M_BYTES,
+        )?;
+        let player = VideoPlayer::from_indexed_y4m(stream, looping)?;
+        return Ok(Some(player));
     }
     if bytes.starts_with(b"DKIF") {
         let _ivf = IvfStream::parse(&bytes)?;

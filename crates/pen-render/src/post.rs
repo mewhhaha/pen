@@ -208,13 +208,18 @@ pub(crate) fn atmosphere_of(
         0.0
     };
     let sun = if quality.physical_sky {
-        let sx = -frame.light_direction.x;
-        let sy = -frame.light_direction.y;
-        let sz = -frame.light_direction.z;
-        let len = (sx * sx + sy * sy + sz * sz).sqrt();
-        if len > 1e-6 { [sx / len, sy / len, sz / len] } else { [0.0, 0.85, -0.5268] }
+        crate::atmosphere_lut::normalize_sun_dir([
+            -frame.light_direction.x,
+            -frame.light_direction.y,
+            -frame.light_direction.z,
+        ])
     } else {
         [sky.sun.x, sky.sun.y, sky.sun.z]
+    };
+    let cam_alt_km = if quality.physical_sky {
+        crate::atmosphere_lut::physical_camera_km([camera[12], camera[13], camera[14]])[1]
+    } else {
+        0.0
     };
     let mut data = [0.0; 56];
     data[..16].copy_from_slice(&invert(&multiply(projection, &frame.view)));
@@ -230,7 +235,7 @@ pub(crate) fn atmosphere_of(
         sky.horizon.x,
         sky.horizon.y,
         sky.horizon.z,
-        0.0,
+        cam_alt_km,
         sky.ground.x,
         sky.ground.y,
         sky.ground.z,
@@ -265,9 +270,10 @@ pub(crate) fn atmosphere_of(
 
 /// GPU views bound into `BuiltIn::Atmosphere` when `quality.physical_sky` is active.
 pub(crate) struct PhysicalSkyBinding {
-    /// Non-zero version key bumped whenever `sky_view` or `clouds` view identity changes.
+    /// Non-zero version key bumped whenever `sky_view`, `transmittance`, or `clouds` view identity changes.
     pub serial: u64,
     pub sky_view: wgpu::TextureView,
+    pub transmittance: wgpu::TextureView,
     pub clouds: Option<wgpu::TextureView>,
 }
 
@@ -1091,8 +1097,12 @@ impl Post {
                 let phys_clouds_view = physical_sky
                     .and_then(|b| b.clouds.clone())
                     .unwrap_or_else(|| self.unbloomed.create_view(&Default::default()));
+                let phys_trans_view = physical_sky
+                    .map(|b| b.transmittance.clone())
+                    .unwrap_or_else(|| self.unoccluded.create_view(&Default::default()));
                 let phys_sky = graph.import("physical_sky_lut", phys_sky_view);
                 let phys_clouds = graph.import("physical_clouds", phys_clouds_view);
+                let phys_trans = graph.import("physical_transmittance_lut", phys_trans_view);
                 let bindings = vec![
                     uniform,
                     Binding::Texture(scene),
@@ -1103,6 +1113,7 @@ impl Post {
                     Binding::Texture(froxels),
                     Binding::Texture(phys_sky),
                     Binding::Texture(phys_clouds),
+                    Binding::Texture(phys_trans),
                 ];
                 graph.pass("atmosphere", BuiltIn::Atmosphere(samples), bindings, Target::Texture(composed), false);
                 lit = composed;

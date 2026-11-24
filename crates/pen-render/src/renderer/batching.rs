@@ -400,6 +400,36 @@ impl State {
         Ok(())
     }
 
+    /// Batches only `frame.insets` draws (used by the split-screen compositor path so insets
+    /// render and interleave with sprites identically to single-camera frames).
+    pub(super) fn batch_insets_only(&mut self, frame: &RenderFrame, scratch: &mut Scratch) -> Result<()> {
+        scratch.group_poses(frame);
+        scratch.group_morphs(frame);
+        for (inset, drawn) in frame.insets.iter().enumerate() {
+            for (index, draw) in drawn.draws.iter().enumerate() {
+                scratch.items.push(Item {
+                    material: draw.material,
+                    source: Source::Inset(inset, index),
+                    shape: Shape::Mesh(draw.mesh),
+                    views: ALL_VIEWS,
+                    lod: 0,
+                });
+            }
+        }
+        let item_count = scratch.items.len();
+        if item_count > self.capacity {
+            self.capacity = item_count.next_power_of_two();
+            ensure!(
+                self.capacity as u64 * self.stride <= self.device.limits().max_buffer_size,
+                "draw list exceeds device buffer size"
+            );
+            self.draw_uniform = uniform_buffer(&self.device, "draws", self.capacity as u64 * self.stride);
+            self.groups.clear();
+            self.uniform_data = vec![0.0; self.capacity * (self.stride / 4) as usize];
+        }
+        Ok(())
+    }
+
     /// Where `draw` goes this frame: alone or into a batch, or left out. An
     /// opaque material whose shader can instance it joins a batch of its
     /// mesh and material, or, with instance parameters, of its mesh and
@@ -562,7 +592,7 @@ impl State {
             );
         }
         let field = self.field_ids.get(catalog.material(item.material)).copied();
-        let Some((textures, normal_setting, outline_setting, orm_setting, emissive_setting)) =
+        let Some((textures, normal_setting, outline_setting, orm_setting, emissive_setting, tile_mask, has_base_texture)) =
             self.dress(&material.material, field)?
         else {
             return Ok(None);
@@ -605,8 +635,15 @@ impl State {
         // Every path writes the material's surface: a batch's draws share its first's
         // material, or one of the same render state.
         data[SURFACE_AT..SURFACE_AT + SURFACE_FLOATS].copy_from_slice(&m.surface.vectors());
-        data[MAPS_AT..MAPS_AT + MAPS_FLOATS]
-            .copy_from_slice(&m.uv_transform.vectors(orm_setting, emissive_setting));
+        let uv_maps = m.uv_transform.vectors(orm_setting, emissive_setting);
+        data[MAPS_AT..MAPS_AT + 8].copy_from_slice(&uv_maps);
+        data[MAPS_AT + 8..MAPS_AT + 12].copy_from_slice(&[tile_mask as f32, has_base_texture, 0.0, 0.0]);
+        data[MAPS_AT + 12..MAPS_AT + MAPS_FLOATS].copy_from_slice(&[
+            m.surface.iridescence,
+            m.surface.iridescence_ior,
+            m.surface.iridescence_thickness_min,
+            m.surface.iridescence_thickness_max,
+        ]);
         // Insets preserve authored coverage, separately from scene sky alpha.
         let (pipeline, visible) = if persistent {
             let inset = item.inset().is_some();

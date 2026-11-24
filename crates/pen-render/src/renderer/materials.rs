@@ -13,7 +13,7 @@ use crate::shader::{Pipelines, Variants};
 
 use crate::surface_atlas::{DEFAULT_TILE_SIZE, SurfaceAtlasPacker, SurfaceTile, TileCopy};
 
-pub(super) type Dressed = ([TextureRef; 3], f32, f32, f32, f32);
+pub(super) type Dressed = ([TextureRef; 3], f32, f32, f32, f32, u32, f32);
 
 // Texture filtering as the frame's quality gives it: 0 reads only the
 // finest level there is, 1 is trilinear, more is that many anisotropic
@@ -137,12 +137,14 @@ impl State {
         field: Option<usize>,
     ) -> Result<Option<Dressed>> {
         let video_texture = material.texture.as_deref().and_then(|key| self.video_ids.get(key).copied());
-        let camera_texture = if video_texture.is_some() {
+        let reserved_video = video_texture.is_none()
+            && material.texture.as_deref().is_some_and(|key| self.reserved_videos.contains(key));
+        let camera_texture = if video_texture.is_some() || reserved_video {
             None
         } else {
             material.texture.as_deref().and_then(|key| self.camera_target_ids.get(key).copied())
         };
-        let has_dynamic_texture = video_texture.is_some() || camera_texture.is_some();
+        let has_dynamic_texture = video_texture.is_some() || reserved_video || camera_texture.is_some();
         let loaded_texture = if has_dynamic_texture { None } else { self.loaded_texture(&material.texture)? };
         let loaded_normal = self.loaded_texture(&material.normal_texture)?;
         let loaded_outline = self.loaded_texture(&material.layer_texture)?;
@@ -191,13 +193,16 @@ impl State {
         {
             return Ok(None);
         }
-        let mut texture = match (video_texture, camera_texture, &material.texture, loaded_texture) {
-            (Some(idx), _, _, _) => TextureRef::Video(idx),
-            (None, Some(idx), _, _) => TextureRef::CameraTarget(idx),
-            (None, None, None, _) => TextureRef::White,
-            (None, None, Some(_), Some(slot)) => TextureRef::Slot(slot),
-            (None, None, Some(_), None) => TextureRef::Checker,
+        let mut texture = match (video_texture, reserved_video, camera_texture, &material.texture, loaded_texture) {
+            (Some(idx), _, _, _, _) => TextureRef::Video(idx),
+            (None, true, _, _, _) => TextureRef::White,
+            (None, false, Some(idx), _, _) => TextureRef::CameraTarget(idx),
+            (None, false, None, None, _) => TextureRef::White,
+            (None, false, None, Some(_), Some(slot)) => TextureRef::Slot(slot),
+            (None, false, None, Some(_), None) => TextureRef::Checker,
         };
+        let has_base_texture =
+            if video_texture.is_some() || camera_texture.is_some() || loaded_texture.is_some() { 1.0 } else { 0.0 };
         let mut normal = match field {
             Some(field) => TextureRef::Field(field),
             None => loaded_normal.map_or(TextureRef::FlatNormal, TextureRef::Slot),
@@ -227,7 +232,7 @@ impl State {
         let emissive_setting = if loaded_emissive.is_some() { 1.0 } else { 0.0 };
 
         // Binding 4 holds standalone layer / emissive / ORM texture, or the GPU-packed 4x3 SurfaceMapAtlas.
-        let (mut outline, mut outline_setting) = if needs_atlas {
+        let (mut outline, mut outline_setting, tile_mask) = if needs_atlas {
             let mut key: Vec<(u32, u64, u64)> = Vec::new();
             let view_id = |slot: Option<usize>| -> u64 {
                 slot.map_or(0, |s| self.texture(TextureRef::Slot(s)).view_id)
@@ -250,8 +255,8 @@ impl State {
             push_pair(&mut key, SurfaceTile::Lightmap, loaded_lm, None);
             push_pair(&mut key, SurfaceTile::LightmapDir, loaded_lm_dir, None);
 
-            let atlas_idx = if let Some(&(idx, _mask)) = self.surface_atlas_ids.get(&key) {
-                idx
+            let (atlas_idx, tile_mask) = if let Some(&(idx, mask)) = self.surface_atlas_ids.get(&key) {
+                (idx, mask)
             } else {
                 let device = self.device.clone();
                 if self.surface_atlas_packer.is_none() {
@@ -317,17 +322,17 @@ impl State {
                 let idx = self.surface_atlases.len();
                 self.surface_atlases.push(super::assets::whole(tex, id));
                 self.surface_atlas_ids.insert(key, (idx, mask));
-                idx
+                (idx, mask)
             };
-            (TextureRef::SurfaceAtlas(atlas_idx), 5.0)
+            (TextureRef::SurfaceAtlas(atlas_idx), 5.0, tile_mask)
         } else if let Some(slot) = loaded_outline {
-            (TextureRef::Slot(slot), 1.0)
+            (TextureRef::Slot(slot), 1.0, 0)
         } else if let Some(slot) = loaded_emissive {
-            (TextureRef::Slot(slot), 3.0)
+            (TextureRef::Slot(slot), 3.0, 0)
         } else if let Some(slot) = loaded_orm {
-            (TextureRef::Slot(slot), 4.0)
+            (TextureRef::Slot(slot), 4.0, 0)
         } else {
-            (TextureRef::Transparent, 0.0)
+            (TextureRef::Transparent, 0.0, 0)
         };
         // Index and palette must become usable together: an ordinary fallback
         // texture must never be interpreted as palette indices or oct normals.
@@ -359,7 +364,15 @@ impl State {
         if indexed {
             outline_setting = if packed_ready { 2.0 } else { 0.0 };
         }
-        Ok(Some(([texture, normal, outline], normal_setting, outline_setting, orm_setting, emissive_setting)))
+        Ok(Some((
+            [texture, normal, outline],
+            normal_setting,
+            outline_setting,
+            orm_setting,
+            emissive_setting,
+            tile_mask,
+            has_base_texture,
+        )))
     }
 
     /// The draw bind group for these textures, with the sampler their

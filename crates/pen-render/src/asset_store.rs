@@ -320,8 +320,9 @@ impl UvTransform {
 
 /// The draw uniform's floats for the surface block: five `vec4f`s.
 pub(crate) const SURFACE_FLOATS: usize = 20;
-/// Additional draw uniform floats for UV transform and PBR texture map flags: two `vec4f`s.
-pub(crate) const MAPS_FLOATS: usize = 8;
+/// Additional draw uniform floats for UV transform, PBR map flags, atlas/texture flags,
+/// and iridescence parameters: four `vec4f`s.
+pub(crate) const MAPS_FLOATS: usize = 16;
 
 impl Surface {
     /// The five `vec4f`s of the draw uniform's `surface` array:

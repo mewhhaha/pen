@@ -7,20 +7,52 @@
 @group(0) @binding(6) var volume_integrated: texture_3d<f32>;
 @group(0) @binding(7) var physical_sky_lut: texture_2d<f32>;
 @group(0) @binding(8) var physical_clouds: texture_2d<f32>;
+@group(0) @binding(9) var physical_transmittance_lut: texture_2d<f32>;
 ${fullscreen}
 ${common}
 ${volume}
 
-// Samples the Hillaire 2020 physical sky-view LUT (with solar disk) and optionally
+fn physical_ray_sphere_dist(r: f32, mu: f32, radius: f32) -> f32 {
+  let d = r * r * (mu * mu - 1.0) + radius * radius;
+  if (d < 0.0) {
+    return -1.0;
+  }
+  let sq = sqrt(d);
+  let t0 = -r * mu - sq;
+  let t1 = -r * mu + sq;
+  if (t0 >= 0.0) {
+    return t0;
+  }
+  return select(-1.0, t1, t1 >= 0.0);
+}
+
+fn physical_sample_transmittance(r: f32, mu: f32, rb: f32, rt: f32) -> vec3f {
+  let h_max = sqrt(max(rt * rt - rb * rb, 1e-4));
+  let rho = sqrt(max(r * r - rb * rb, 0.0));
+  let disc = r * r * (mu * mu - 1.0) + rt * rt;
+  let d = max(0.0, -r * mu + sqrt(max(disc, 0.0)));
+  let d_min = rt - r;
+  let d_max = rho + h_max;
+  let u = clamp((d - d_min) / max(d_max - d_min, 1e-5), 0.0, 1.0);
+  let v = clamp(rho / h_max, 0.0, 1.0);
+  let dims = max(vec2f(textureDimensions(physical_transmittance_lut, 0)), vec2f(2.0));
+  let safe_uv = clamp(vec2f(u, v) * ((dims - 1.0) / dims) + 0.5 / dims, vec2f(0.0), vec2f(1.0));
+  return textureSampleLevel(physical_transmittance_lut, occlusion_sampler, safe_uv, 0.0).rgb;
+}
+
+// Samples the Hillaire 2020 physical sky-view LUT with transmittance-attenuated 0.267 deg
+// planet-occluded solar disk (matching `atmosphere_lut.wgsl::eval_solar_disk`) and optionally
 // composites the raymarched volumetric cloud buffer (`cloud.rgb + sky * cloud.a`).
 fn physical_sky_background(direction: vec3f, screen_uv: vec2f, with_clouds: bool) -> vec3f {
   let rb = 6360.0;
-  let r = rb + 0.2;
+  let rt = 6460.0;
+  let cam_alt = max(atmosphere.horizon.w, 0.002);
+  let r = rb + cam_alt;
   let pi = 3.14159265359;
   let d = normalize(direction);
   let sun_raw = atmosphere.sun.xyz;
   let sun_len = length(sun_raw);
-  let sun_dir = select(vec3f(0.0, 0.85, -0.5268), sun_raw / sun_len, sun_len > 1e-5);
+  let sun_dir = select(vec3f(0.0, 1.0, 0.0), sun_raw / sun_len, sun_len > 1e-8);
 
   let horizon_angle = -acos(clamp(rb / r, 0.0, 1.0));
   let lat = asin(clamp(d.y, -1.0, 1.0));
@@ -43,9 +75,10 @@ fn physical_sky_background(direction: vec3f, screen_uv: vec2f, with_clouds: bool
   let safe_uv = clamp(uv * ((dims - 1.0) / dims) + 0.5 / dims, vec2f(0.0), vec2f(1.0));
   var col = textureSampleLevel(physical_sky_lut, occlusion_sampler, safe_uv, 0.0).rgb;
 
-  let toward = max(dot(d, sun_dir), 0.0);
-  let above = smoothstep(-0.02, 0.02, d.y);
-  col += atmosphere.sun_color.rgb * 4.0 * smoothstep(0.99945, 0.9997, toward) * above;
+  // Output-resolution 0.267 deg solar disk (cos = 0.999989), planet-occluded and transmittance-attenuated.
+  if (dot(d, sun_dir) >= 0.999989 && physical_ray_sphere_dist(r, d.y, rb) <= 0.0) {
+    col += physical_sample_transmittance(r, d.y, rb, rt) * atmosphere.sun_color.rgb * 12.0;
+  }
 
   if (with_clouds) {
     let c = textureSampleLevel(physical_clouds, occlusion_sampler, clamp(screen_uv, vec2f(0.0), vec2f(1.0)), 0.0);

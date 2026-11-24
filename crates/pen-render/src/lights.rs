@@ -262,7 +262,123 @@ const MAX_AREA_LIGHTS: usize = 64;
 const AREA_MAT_OFFSET: usize = MAX_AREA_LIGHTS * 5;
 const AREA_LUT_TEXELS: usize = (crate::area_lights::LTC_LUT_SIZE * crate::area_lights::LTC_LUT_SIZE) as usize;
 const AREA_AMP_OFFSET: usize = AREA_MAT_OFFSET + AREA_LUT_TEXELS;
-const AREA_BUFFER_BYTES: u64 = ((AREA_AMP_OFFSET + AREA_LUT_TEXELS) * 16) as u64;
+pub(crate) const MAX_AREA_COOKIES: usize = 8;
+const AREA_COOKIE_DIM: u32 = 32;
+const AREA_COOKIE_TEXELS: usize = (AREA_COOKIE_DIM * AREA_COOKIE_DIM) as usize;
+const AREA_COOKIE_OFFSET: usize = AREA_AMP_OFFSET + AREA_LUT_TEXELS;
+const AREA_BUFFER_BYTES: u64 = ((AREA_COOKIE_OFFSET + MAX_AREA_COOKIES * AREA_COOKIE_TEXELS) * 16) as u64;
+
+const COOKIE_PACK_WGSL: &str = r#"
+struct PackParams {
+  slot: u32,
+  _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
+};
+@group(0) @binding(0) var<uniform> params: PackParams;
+@group(0) @binding(1) var cookie_tex: texture_2d<f32>;
+@group(0) @binding(2) var cookie_samp: sampler;
+@group(0) @binding(3) var<storage, read_write> area_buf: array<vec4f>;
+
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= 32u || id.y >= 32u) {
+    return;
+  }
+  let uv = (vec2f(id.xy) + vec2f(0.5)) / 32.0;
+  let c = textureSampleLevel(cookie_tex, cookie_samp, uv, 0.0);
+  area_buf[8512u + params.slot * 1024u + id.y * 32u + id.x] = c;
+}
+"#;
+
+struct CookiePacker {
+    pipeline: wgpu::ComputePipeline,
+    bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    params: [wgpu::Buffer; MAX_AREA_COOKIES],
+}
+
+impl CookiePacker {
+    fn new(device: &wgpu::Device) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("area_cookie_pack"),
+            source: wgpu::ShaderSource::Wgsl(COOKIE_PACK_WGSL.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("area_cookie_pack_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(16),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("area_cookie_pack_pl"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("area_cookie_pack"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("area_cookie_pack_samp"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let params = std::array::from_fn(|slot| {
+            let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("area_cookie_pack_params"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM,
+                mapped_at_creation: true,
+            });
+            let words = [u32::try_from(slot).unwrap_or(0), 0u32, 0u32, 0u32];
+            buf.slice(..).get_mapped_range_mut().unwrap().copy_from_slice(bytemuck::cast_slice(&words));
+            buf.unmap();
+            buf
+        });
+        Self { pipeline, bgl, sampler, params }
+    }
+}
 
 /// The grid's uniform: its counts, its scales, whether its slices are linear,
 /// and the active LTC area light count in `options.y`.
@@ -304,8 +420,10 @@ pub(crate) struct Clusters {
     indices: wgpu::Buffer,
     /// The matrix of each atlas layer's face, as the lights' shadows read it.
     faces: wgpu::Buffer,
-    /// Packed LTC area lights (`0..320` vec4f) + static 64x64 LTC mat & amp LUTs (`320..8512` vec4f).
+    /// Packed LTC area lights (`0..320` vec4f), 64x64 LTC LUTs (`320..8512`), and 8x 32x32 cookies (`8512..16704`).
     area: wgpu::Buffer,
+    cookie_packer: Option<CookiePacker>,
+    cookie_ids: [u64; MAX_AREA_COOKIES],
     sampler: wgpu::Sampler,
     /// The local lights' shadow maps the group binds, and which texture they are.
     atlas: wgpu::TextureView,
@@ -391,6 +509,8 @@ impl Clusters {
             indices,
             faces,
             area,
+            cookie_packer: None,
+            cookie_ids: [0; MAX_AREA_COOKIES],
             sampler,
             atlas: stand_in.clone(),
             atlas_id: 0,
@@ -429,17 +549,17 @@ impl Clusters {
     }
 
     /// Packs `frame.area_lights` (up to `MAX_AREA_LIGHTS`) into the area-light storage region.
-    fn upload_area_lights(&mut self, queue: &wgpu::Queue, frame: &RenderFrame) -> u32 {
+    fn upload_area_lights(&mut self, queue: &wgpu::Queue, frame: &RenderFrame, cookie_slots: &[Option<u32>]) -> u32 {
         use crate::area_lights::AreaLight;
         self.area_data.clear();
-        for spec in frame.area_lights.iter().take(MAX_AREA_LIGHTS) {
+        for (idx, spec) in frame.area_lights.iter().take(MAX_AREA_LIGHTS).enumerate() {
             let pos = [spec.position.x, spec.position.y, spec.position.z];
             let right = [spec.right.x, spec.right.y, spec.right.z];
             let up = [spec.up.x, spec.up.y, spec.up.z];
             let gain = spec.intensity.max(0.0);
             let col = [spec.color.x * gain, spec.color.y * gain, spec.color.z * gain];
             let reach = spec.range.max(0.1);
-            let light = match spec.kind {
+            let mut light = match spec.kind {
                 1 => AreaLight::disk(pos, right, up, (spec.width * 0.5).max(0.01), col, reach, spec.two_sided),
                 2 => AreaLight::tube(
                     pos,
@@ -471,6 +591,7 @@ impl Clusters {
                     spec.two_sided,
                 ),
             };
+            light.flags[1] = cookie_slots.get(idx).and_then(|s| *s).map_or(-1.0, |s| s as f32);
             self.area_data.push(light);
         }
         if !self.area_data.is_empty() {
@@ -479,9 +600,57 @@ impl Clusters {
         u32::try_from(self.area_data.len()).unwrap_or(0)
     }
 
+    /// Downsamples changed cookie projector textures (32x32 RGBA) into `self.area` storage slots.
+    pub fn encode_cookies(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        cookies: &[(u32, wgpu::TextureView, u64)],
+    ) {
+        if cookies.is_empty() {
+            return;
+        }
+        let mut any_dirty = false;
+        for &(slot, _, view_id) in cookies {
+            if (slot as usize) < MAX_AREA_COOKIES && self.cookie_ids[slot as usize] != view_id {
+                any_dirty = true;
+                break;
+            }
+        }
+        if !any_dirty {
+            return;
+        }
+        let packer = self.cookie_packer.get_or_insert_with(|| CookiePacker::new(device));
+        for &(slot, ref view, view_id) in cookies {
+            let s = slot as usize;
+            if s >= MAX_AREA_COOKIES || self.cookie_ids[s] == view_id {
+                continue;
+            }
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("area_cookie_pack_bg"),
+                layout: &packer.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: packer.params[s].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&packer.sampler) },
+                    wgpu::BindGroupEntry { binding: 3, resource: self.area.as_entire_binding() },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("area_cookie_pack"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&packer.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(AREA_COOKIE_DIM.div_ceil(8), AREA_COOKIE_DIM.div_ceil(8), 1);
+            self.cookie_ids[s] = view_id;
+        }
+    }
+
     /// Sorts `frame`'s lights into the clusters of its view, on a picture
     /// of `size` pixels. The lights `shadows` picked read the maps of
     /// `atlas` (a view of its layers, and which texture it is).
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         device: &wgpu::Device,
@@ -490,8 +659,9 @@ impl Clusters {
         size: (u32, u32),
         shadows: &Selection,
         atlas: Option<(&wgpu::TextureView, u64)>,
+        cookie_slots: &[Option<u32>],
     ) {
-        let area_count = self.upload_area_lights(queue, frame);
+        let area_count = self.upload_area_lights(queue, frame, cookie_slots);
         let count = u32::try_from(frame.lights.len()).unwrap_or(u32::MAX);
         if count == 0 {
             let mut words = [0u32; 12];

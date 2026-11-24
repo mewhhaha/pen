@@ -406,10 +406,10 @@ impl Browser {
         let ran = self.step().await?;
         let overlay = self.tools.as_ref().and_then(|tools| tools.frame.as_ref());
         self.preferences.apply(&mut self.screen.renderer);
-        if !self.shown.video_streams.is_empty()
-            && let Err(err) = self.videos.update(&self.shown, &self.catalog, &mut self.screen.renderer)
-        {
-            say(&mut self.log, log_source::GAME, true, format!("video stream: {err:#}"));
+        if !self.shown.video_streams.is_empty() {
+            for message in self.videos.update(&self.shown, &self.catalog, &mut self.screen.renderer) {
+                say(&mut self.log, log_source::GAME, true, message);
+            }
         }
         let (presented, draw_timings) = match self.screen.draw(&self.shown, overlay, &self.catalog).await {
             Ok(result) => result,

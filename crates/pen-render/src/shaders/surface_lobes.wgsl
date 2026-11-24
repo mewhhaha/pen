@@ -668,23 +668,33 @@ fn lobe_iridescence_xyz_to_srgb(xyz: vec3f) -> vec3f {
 }
 
 // Belcour & Barla (2017) analytical Airy thin-film interference reflectance (`KHR_materials_iridescence`).
+// Preserves signed interface reflection phases so zero thickness matches the exact bare outside/base Fresnel.
 fn lobe_iridescence_fresnel(outside_ior: f32, film_ior: f32, cos_theta1: f32, thickness_nm: f32, base_f0: vec3f) -> vec3f {
-  let sin2_t2 = (outside_ior / max(film_ior, 1.0001)) * (outside_ior / max(film_ior, 1.0001))
-    * max(1.0 - cos_theta1 * cos_theta1, 0.0);
+  let c1 = clamp(cos_theta1, 0.0, 1.0);
+  let eta = outside_ior / max(film_ior, 1.0001);
+  let sin2_t2 = eta * eta * max(1.0 - c1 * c1, 0.0);
   if (sin2_t2 >= 1.0) {
     return vec3f(1.0);
   }
   let cos_t2 = sqrt(1.0 - sin2_t2);
-  let r0_12 = ((film_ior - outside_ior) / (film_ior + outside_ior));
-  let r12 = r0_12 * r0_12 + (1.0 - r0_12 * r0_12) * pow(1.0 - cos_theta1, 5.0);
-  let base_ior = (1.0 + sqrt(clamp(base_f0, vec3f(0.0), vec3f(0.999)))) / max(1.0 - sqrt(clamp(base_f0, vec3f(0.0), vec3f(0.999))), vec3f(0.001));
-  let r0_23 = (base_ior - vec3f(film_ior)) / (base_ior + vec3f(film_ior));
-  let r23 = r0_23 * r0_23 + (vec3f(1.0) - r0_23 * r0_23) * pow(1.0 - cos_t2, 5.0);
-  let opd = 2.0 * film_ior * thickness_nm * cos_t2;
-  let phi = 2.0 * 3.14159265359 * opd / vec3f(650.0, 510.0, 475.0);
+  let r0_12 = (outside_ior - film_ior) / (outside_ior + film_ior);
+  let r0_12_sq = r0_12 * r0_12;
+  let r12 = r0_12_sq + (1.0 - r0_12_sq) * pow(1.0 - c1, 5.0);
+  let phi12 = select(0.0, 3.14159265359, film_ior > outside_ior);
+
+  let s = sqrt(clamp(base_f0, vec3f(0.0), vec3f(0.999)));
+  let base_ior = (vec3f(1.0) + s) / max(vec3f(1.0) - s, vec3f(0.001));
+  let r0_23 = (vec3f(film_ior) - base_ior) / (vec3f(film_ior) + base_ior);
+  let r0_23_sq = r0_23 * r0_23;
+  let r23 = r0_23_sq + (vec3f(1.0) - r0_23_sq) * pow(1.0 - cos_t2, 5.0);
+  let phi23 = select(vec3f(0.0), vec3f(3.14159265359), base_ior > vec3f(film_ior));
+
+  let opd = 2.0 * film_ior * max(thickness_nm, 0.0) * cos_t2;
+  let phi = 2.0 * 3.14159265359 * opd / vec3f(650.0, 510.0, 475.0) + vec3f(phi12) + phi23;
   let r123 = clamp(sqrt(vec3f(r12) * r23), vec3f(0.0), vec3f(0.999));
-  let num = vec3f(r12) + r23 + 2.0 * r123 * cos(phi);
-  let den = vec3f(1.0) + vec3f(r12) * r23 + 2.0 * r123 * cos(phi);
+  let term = 2.0 * r123 * cos(phi);
+  let num = vec3f(r12) + r23 + term;
+  let den = vec3f(1.0) + vec3f(r12) * r23 + term;
   return clamp(num / max(den, vec3f(0.0001)), vec3f(0.0), vec3f(1.0));
 }
 
@@ -709,9 +719,10 @@ fn surface_read_atlas(atlas: texture_2d<f32>, samp: sampler, tile: u32, uv: vec2
   return textureSampleLevel(atlas, samp, surface_atlas_tile_uv(tile, uv, dims, clamp_uv), 0.0);
 }
 
-// Applies enabled tiles from the GPU-packed 4x3 SurfaceMapAtlas (@group(1) @binding(4))
-// onto `s` when `atlas_mode > 4.5` (`draw.settings.w == 5.0`). `tile_mask` is the bitmask
-// of populated `SurfaceTile` slots (bit `1u << tile`).
+// Applies authored iridescence factors and enabled tiles from the GPU-packed 4x3 SurfaceMapAtlas
+// (@group(1) @binding(4)) onto `s`. Preserves authored surface block factors and custom dielectric F0,
+// and decodes ORM, Clearcoat, ClearcoatNormal, Sheen, Anisotropy, Transmission, Specular,
+// Iridescence, Lightmap, and LightmapDir tiles.
 fn surface_apply_atlas(
   s: StandardSurface,
   atlas: texture_2d<f32>,
@@ -720,51 +731,130 @@ fn surface_apply_atlas(
   uv1: vec2f,
   atlas_mode: f32,
   tile_mask: u32,
+  block: array<vec4f, 5>,
+  irid_params: vec4f,
+  model_scale: f32,
 ) -> StandardSurface {
   var out = s;
+  let authored_ior = max(block[2].y, 1.0);
+  let authored_spec_w = max(block[3].w, 0.0);
+  let authored_spec_c = max(block[4].xyz, vec3f(0.0));
+
+  if (irid_params.x > 0.0) {
+    out.lobes |= SURFACE_IRIDESCENCE;
+    out.iridescence = clamp(irid_params.x, 0.0, 1.0);
+    out.iridescence_ior = max(irid_params.y, 1.0001);
+    out.iridescence_thickness = max(irid_params.w, 0.0);
+  }
+
   if (atlas_mode <= 4.5 || tile_mask == 0u) {
     return out;
   }
+
   if ((tile_mask & 1u) != 0u) {
     let orm = surface_read_atlas(atlas, samp, 0u, uv, false);
     out = surface_apply_orm(out, orm, 1.0);
-    out.f0 = mix(vec3f(0.04), out.base_color, clamp(out.metallic, 0.0, 1.0));
+    let m = clamp(out.metallic, 0.0, 1.0);
+    let dielectric = min(lobe_ior_f0(authored_ior) * authored_spec_c, vec3f(1.0)) * authored_spec_w;
+    out.ior = authored_ior;
+    out.f0 = mix(dielectric, out.base_color, m);
+    out.f90 = mix(authored_spec_w, 1.0, m);
   }
   if ((tile_mask & 8u) != 0u) {
     let cc = surface_read_atlas(atlas, samp, 3u, uv, false);
+    if ((out.lobes & SURFACE_COAT) == 0u) {
+      out.coat = block[0].x;
+      out.coat_roughness = block[0].y;
+    }
     out.lobes |= SURFACE_COAT;
     out.coat = clamp(out.coat * cc.r, 0.0, 1.0);
     out.coat_roughness = clamp(out.coat_roughness * cc.g, 0.04, 1.0);
   }
+  if ((tile_mask & 16u) != 0u) {
+    let ccn = surface_read_atlas(atlas, samp, 4u, uv, false);
+    let txy = ccn.xy * 2.0 - vec2f(1.0);
+    let tz = sqrt(max(1.0 - dot(txy, txy), 0.0001));
+    let n_base = normalize(out.coat_normal);
+    var t_vec = out.tangent;
+    var b_vec = out.bitangent;
+    if (dot(t_vec, t_vec) < 0.25 || dot(b_vec, b_vec) < 0.25) {
+      let up_ref = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(n_base.y) > 0.9);
+      t_vec = normalize(cross(up_ref, n_base));
+      b_vec = cross(n_base, t_vec);
+    }
+    out.coat_normal = normalize(t_vec * txy.x + b_vec * txy.y + n_base * tz);
+  }
   if ((tile_mask & 32u) != 0u) {
     let sh = surface_read_atlas(atlas, samp, 5u, uv, false);
+    if ((out.lobes & SURFACE_SHEEN) == 0u) {
+      out.sheen_color = block[1].xyz;
+      out.sheen_roughness = block[0].z;
+    }
     out.lobes |= SURFACE_SHEEN;
     out.sheen_color *= sh.rgb;
     out.sheen_roughness = clamp(out.sheen_roughness * sh.a, 0.07, 1.0);
   }
+  if ((tile_mask & 64u) != 0u) {
+    let an = surface_read_atlas(atlas, samp, 6u, uv, false);
+    if ((out.lobes & SURFACE_ANISOTROPY) == 0u) {
+      out.anisotropy = block[0].w;
+    }
+    out.lobes |= SURFACE_ANISOTROPY;
+    out.anisotropy = clamp(out.anisotropy * an.b, -1.0, 1.0);
+    let dir = an.rg * 2.0 - vec2f(1.0);
+    if (dot(dir, dir) > 1e-4 && dot(out.tangent, out.tangent) > 0.25 && dot(out.bitangent, out.bitangent) > 0.25) {
+      let d = normalize(dir);
+      let new_t = normalize(out.tangent * d.x + out.bitangent * d.y);
+      let hand = select(-1.0, 1.0, dot(cross(out.normal, out.tangent), out.bitangent) >= 0.0);
+      out.tangent = new_t;
+      out.bitangent = cross(out.normal, new_t) * hand;
+    }
+  }
   if ((tile_mask & 128u) != 0u) {
     let tr = surface_read_atlas(atlas, samp, 7u, uv, false);
+    if ((out.lobes & SURFACE_TRANSMISSION) == 0u) {
+      out.transmission = block[2].x;
+      out.ior = authored_ior;
+      out.thickness = block[2].z * model_scale;
+      out.attenuation_distance = block[2].w;
+      out.attenuation_color = block[3].xyz;
+    }
     out.lobes |= SURFACE_TRANSMISSION;
     out.transmission = clamp(out.transmission * tr.r, 0.0, 1.0);
     out.thickness *= tr.g;
   }
   if ((tile_mask & 256u) != 0u) {
     let sp = surface_read_atlas(atlas, samp, 8u, uv, false);
-    let dielectric = min(lobe_ior_f0(out.ior) * sp.rgb, vec3f(1.0)) * sp.a;
-    out.f0 = mix(dielectric, out.base_color, clamp(out.metallic, 0.0, 1.0));
-    out.f90 = mix(sp.a, 1.0, clamp(out.metallic, 0.0, 1.0));
+    let spec_w = authored_spec_w * sp.a;
+    let spec_c = authored_spec_c * sp.rgb;
+    let m = clamp(out.metallic, 0.0, 1.0);
+    let dielectric = min(lobe_ior_f0(authored_ior) * spec_c, vec3f(1.0)) * spec_w;
+    out.lobes |= SURFACE_SPECULAR;
+    out.ior = authored_ior;
+    out.f0 = mix(dielectric, out.base_color, m);
+    out.f90 = mix(spec_w, 1.0, m);
   }
   if ((tile_mask & 512u) != 0u) {
     let ir = surface_read_atlas(atlas, samp, 9u, uv, false);
     out.lobes |= SURFACE_IRIDESCENCE;
-    out.iridescence = clamp(ir.r, 0.0, 1.0);
-    out.iridescence_thickness = mix(100.0, 600.0, clamp(ir.g, 0.0, 1.0));
+    out.iridescence = clamp(irid_params.x * ir.r, 0.0, 1.0);
+    out.iridescence_ior = max(irid_params.y, 1.0001);
+    out.iridescence_thickness = mix(max(irid_params.z, 0.0), max(irid_params.w, 0.0), clamp(ir.g, 0.0, 1.0));
   }
   if ((tile_mask & 1024u) != 0u) {
     let lm = surface_read_atlas(atlas, samp, 10u, uv1, true);
     out.lobes |= SURFACE_LIGHTMAP;
     out.lightmap_irradiance = lm.rgb;
     out.has_lightmap = 1.0;
+  }
+  if ((tile_mask & 2048u) != 0u && out.has_lightmap > 0.5) {
+    let ld = surface_read_atlas(atlas, samp, 11u, uv1, true);
+    let raw_dir = ld.xyz * 2.0 - vec3f(1.0);
+    if (dot(raw_dir, raw_dir) > 1e-4) {
+      let half_lambert = 0.5 + 0.5 * clamp(dot(normalize(out.normal), normalize(raw_dir)), -1.0, 1.0);
+      let dir_weight = clamp(ld.a, 0.0, 1.0);
+      out.lightmap_irradiance *= mix(1.0, half_lambert / max(dir_weight, 0.25), dir_weight);
+    }
   }
   return out;
 }

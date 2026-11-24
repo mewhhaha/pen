@@ -108,7 +108,7 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
     }
     for d in &frame.pbr_decals {
         validate_matrix(&d.transform)?;
-        determinant_of(&d.transform)?;
+        determinant4_of(&d.transform)?;
         ensure!(
             [d.albedo.r, d.albedo.g, d.albedo.b, d.albedo.a, d.normal_strength, d.roughness, d.metallic, d.emissive_strength, d.fade]
                 .iter()
@@ -123,6 +123,17 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
             [c.viewport_x, c.viewport_y, c.viewport_w, c.viewport_h].iter().all(|v| v.is_finite()),
             "camera target viewport must be finite"
         );
+        if c.split_screen {
+            ensure!(
+                (0.0..=1.0).contains(&c.viewport_x)
+                    && (0.0..=1.0).contains(&c.viewport_y)
+                    && c.viewport_w > 0.0
+                    && c.viewport_h > 0.0
+                    && c.viewport_x + c.viewport_w <= 1.0001
+                    && c.viewport_y + c.viewport_h <= 1.0001,
+                "split-screen camera target viewport must lie within [0, 1] with positive size"
+            );
+        }
     }
     for v in &frame.video_streams {
         ensure!(
@@ -280,6 +291,26 @@ pub(super) fn determinant_of(matrix: &Matrix) -> Result<f64> {
     let determinant = a * (e * i - f * h) - d * (b * i - c * h) + g * (b * f - c * e);
     ensure!(determinant.is_finite() && determinant.abs() >= 1e-12, "draw transform must be invertible");
     Ok(determinant)
+}
+
+/// Full 4x4 matrix invertibility check matching `crate::matrix::invert` (for 4x4 projective/decal matrices).
+pub(super) fn determinant4_of(matrix: &Matrix) -> Result<f64> {
+    let m = matrix.map(f64::from);
+    let s0 = m[0] * m[5] - m[4] * m[1];
+    let s1 = m[0] * m[6] - m[4] * m[2];
+    let s2 = m[0] * m[7] - m[4] * m[3];
+    let s3 = m[1] * m[6] - m[5] * m[2];
+    let s4 = m[1] * m[7] - m[5] * m[3];
+    let s5 = m[2] * m[7] - m[6] * m[3];
+    let c5 = m[10] * m[15] - m[14] * m[11];
+    let c4 = m[9] * m[15] - m[13] * m[11];
+    let c3 = m[9] * m[14] - m[13] * m[10];
+    let c2 = m[8] * m[15] - m[12] * m[11];
+    let c1 = m[8] * m[14] - m[12] * m[10];
+    let c0 = m[8] * m[13] - m[12] * m[9];
+    let det = s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
+    ensure!(det.is_finite() && det.abs() >= 1e-12, "PBR decal transform must be 4x4 invertible");
+    Ok(det)
 }
 
 pub(super) fn normal_matrix(matrix: &Matrix) -> Result<[f32; 16]> {

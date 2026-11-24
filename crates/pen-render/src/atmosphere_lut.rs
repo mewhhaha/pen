@@ -104,6 +104,26 @@ struct CloudUniform {
     quality: [f32; 4],
 }
 
+/// World-space scene units (meters) converted to atmosphere kilometers (`1 unit = 1 meter`).
+pub const WORLD_METERS_TO_KM: f32 = 0.001;
+/// Base observer elevation above sea level (km) when scene camera `y == 0`.
+pub const BASE_CAMERA_ALTITUDE_KM: f32 = 0.2;
+
+/// Converts a scene world camera position (meters) to physical atmosphere coordinates (kilometers),
+/// anchored at `BASE_CAMERA_ALTITUDE_KM` and clamped above planet ground (`>= 0.002 km`).
+pub fn physical_camera_km(world_eye: [f32; 3]) -> [f32; 3] {
+    [
+        finite_or(world_eye[0], 0.0) * WORLD_METERS_TO_KM,
+        (BASE_CAMERA_ALTITUDE_KM + finite_or(world_eye[1], 0.0) * WORLD_METERS_TO_KM).max(0.002),
+        finite_or(world_eye[2], 0.0) * WORLD_METERS_TO_KM,
+    ]
+}
+
+/// Normalizes a sun direction vector consistently across LUTs, clouds, and sky composite.
+pub fn normalize_sun_dir(v: [f32; 3]) -> [f32; 3] {
+    normalize3(v)
+}
+
 fn finite_or(v: f32, fallback: f32) -> f32 {
     if v.is_finite() { v } else { fallback }
 }
@@ -501,8 +521,8 @@ impl PhysicalAtmosphere {
     }
 
     /// Raymarches the 3D volumetric cloud layer at `(width, height)` into an `Rgba16Float` texture.
-    /// Recommended real-time resolution is quarter- or half-res (up to 2048x2048); step budget is
-    /// controlled via `params.cloud_steps` (8..=64).
+    /// `camera_pos_km` is in kilometers (matching `inverse_view_projection` in km space).
+    /// For scene world-meter projections, prefer [`Self::render_clouds_world`].
     #[allow(clippy::too_many_arguments)]
     pub fn render_clouds(
         &mut self,
@@ -511,20 +531,37 @@ impl PhysicalAtmosphere {
         params: &AtmosphereParams,
         inverse_view_projection: [f32; 16],
         camera_pos_km: [f32; 3],
+        size: (u32, u32),
+    ) -> Result<()> {
+        self.render_clouds_world(device, encoder, params, inverse_view_projection, camera_pos_km, 1.0, 0.0, size)
+    }
+
+    /// Raymarches the 3D volumetric cloud layer using a scene world-space `inverse_view_projection`
+    /// and `world_camera_pos` (converted to atmosphere km via `world_to_km` and `base_altitude_km`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_clouds_world(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &AtmosphereParams,
+        inverse_view_projection: [f32; 16],
+        world_camera_pos: [f32; 3],
+        world_to_km: f32,
+        base_altitude_km: f32,
         (width, height): (u32, u32),
     ) -> Result<()> {
         self.ensure_clouds(device, (width, height))?;
         ensure!(inverse_view_projection.iter().all(|v| v.is_finite()), "non-finite inverse_view_projection");
-        ensure!(camera_pos_km.iter().all(|v| v.is_finite()), "non-finite camera_pos_km");
+        ensure!(world_camera_pos.iter().all(|v| v.is_finite()), "non-finite camera position");
         let sun = normalize3(params.sun_direction);
         let bottom = finite_or(params.cloud_bottom_km, 1.5).max(0.1);
         let top = finite_or(params.cloud_top_km, bottom + 2.5).max(bottom + 0.2);
         let u = CloudUniform {
             inverse_view_projection,
             camera: [
-                camera_pos_km[0],
-                camera_pos_km[1],
-                camera_pos_km[2],
+                world_camera_pos[0],
+                world_camera_pos[1],
+                world_camera_pos[2],
                 finite_or(params.planet_radius_km, 6360.0).max(100.0),
             ],
             sun_dir: [sun[0], sun[1], sun[2], finite_or(params.cloud_coverage, 0.5).clamp(0.0, 1.0)],
@@ -555,8 +592,8 @@ impl PhysicalAtmosphere {
             quality: [
                 params.cloud_steps.clamp(8, 64) as f32,
                 finite_or(params.cloud_max_march_km, 45.0).clamp(5.0, 120.0),
-                0.0,
-                0.0,
+                finite_or(world_to_km, 1.0).max(1e-6),
+                finite_or(base_altitude_km, 0.0),
             ],
         };
         encode_uniform_upload(device, encoder, &self.cloud_uniform, bytemuck::bytes_of(&u));

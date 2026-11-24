@@ -137,10 +137,14 @@ pub fn lint(assets: &Path, wasm: &[u8], settings: &Settings) -> Result<Vec<Findi
             continue;
         };
         named.push((key.clone(), shader.clone()));
-        let sprites = std::fs::read_to_string(assets.join(&shader))
-            .ok()
-            .and_then(|code| pen_render::shader_draws_sprites(&code))
-            .unwrap_or(false);
+        let sprites = if pen_render::is_shader_graph_key(&shader) {
+            false
+        } else {
+            std::fs::read_to_string(assets.join(&shader))
+                .ok()
+                .and_then(|code| pen_render::shader_draws_sprites(&code))
+                .unwrap_or(false)
+        };
         for texture in textures {
             named.push((key.clone(), texture.clone()));
             if !sprites {
@@ -235,6 +239,14 @@ fn inspect(key: &str, bytes: &[u8]) -> Inspected {
     }
     if lower.ends_with(".sound") {
         return fine(pen_runtime::sound_recipe::Recipe::parse(bytes).and_then(|recipe| recipe.render()).map(drop));
+    }
+    if pen_render::is_shader_graph_key(&lower) {
+        return fine(
+            serde_json::from_slice::<pen_render::ShaderGraph>(bytes)
+                .map_err(anyhow::Error::from)
+                .and_then(|graph| graph.compile_material_wgsl())
+                .and_then(|compiled| validate_wgsl(compiled.wgsl.as_bytes())),
+        );
     }
     if lower.ends_with(".json") {
         return fine(serde_json::from_slice::<serde_json::Value>(bytes).map(drop).map_err(Into::into));

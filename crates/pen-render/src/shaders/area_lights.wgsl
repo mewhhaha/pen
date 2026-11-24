@@ -267,9 +267,10 @@ fn eval_area_light(
     }
 
     let cookie = ltc_sample_cookie(light, world, cookie_tex, lut_sampler);
-    // Split-sum Fresnel: t2.x = E[(1 - Fc) G_vis], t2.y = E[Fc G_vis] -> F0 * t2.x + t2.y.
+    // Split-sum Fresnel: t2.x = E[(1 - Fc) G_vis], t2.y = E[Fc G_vis] -> F0 * t2.x + F90 * t2.y (F90 = 1).
     let spec_tint = f0 * t2.x + vec3f(t2.y);
-    let diffuse = albedo * diff_form;
+    // Conserve diffuse energy against specular Fresnel reflectance.
+    let diffuse = albedo * max(vec3f(1.0) - spec_tint, vec3f(0.0)) * diff_form;
     let specular = spec_tint * spec_form;
     return light.color_reach.rgb * cookie * atten * (diffuse + specular);
 }

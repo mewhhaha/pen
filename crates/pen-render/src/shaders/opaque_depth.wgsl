@@ -5,9 +5,9 @@ ${fullscreen}
 
 @fragment fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
   let pixel = vec2i(position.xy);
-  var nearest = 1.0;
+  var nearest = ${depth_clear};
   for (var sample = 0; sample < ${samples}; sample++) {
-    nearest = min(nearest, textureLoad(scene_depth, pixel, sample));
+    nearest = ${nearer_op}(nearest, textureLoad(scene_depth, pixel, sample));
   }
   return vec4f(nearest, 0.0, 0.0, 1.0);
 }

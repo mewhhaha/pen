@@ -81,6 +81,18 @@ impl BuiltIn {
         ]
     }
 
+    /// Whether this pipeline depends on the active `DepthMode` (Forward-Z vs Reversed-Z).
+    pub fn is_depth_dependent(self) -> bool {
+        matches!(
+            self,
+            BuiltIn::Atmosphere(_)
+                | BuiltIn::OpaqueDepth(_)
+                | BuiltIn::Particles { .. }
+                | BuiltIn::Ribbons { .. }
+                | BuiltIn::Decal { .. }
+        )
+    }
+
     pub fn compile(self, context: &PipelineContext) -> wgpu::RenderPipeline {
         let clock = crate::platform::Clock::new();
         let pipeline = match self {
@@ -127,6 +139,14 @@ impl BuiltIns {
         which.into_iter().any(|which| !self.made.contains_key(&which) && self.compiling.contains(&which))
     }
 
+    /// Clears cached pipelines whose depth comparison or clear value depends on `DepthMode`,
+    /// leaving depth-independent pipelines (`Present`, `Composite`, `Backdrop`, etc.) intact
+    /// so external bind groups created from their layouts stay valid.
+    pub fn invalidate_depth_dependent(&mut self) {
+        self.made.retain(|k, _| !k.is_depth_dependent());
+        self.compiling.retain(|k| !k.is_depth_dependent());
+    }
+
     /// Background compiles under way.
     pub fn compiling(&self) -> usize {
         self.compiling.len()
@@ -142,7 +162,15 @@ impl BuiltIns {
     }
 
     /// A background compile ended.
-    pub fn arrived(&mut self, which: BuiltIn, result: Result<wgpu::RenderPipeline, String>) {
+    pub fn arrived(
+        &mut self,
+        which: BuiltIn,
+        depth_mode: crate::camera_precision::DepthMode,
+        result: Result<wgpu::RenderPipeline, String>,
+    ) {
+        if which.is_depth_dependent() && depth_mode != self.context.depth_mode() {
+            return;
+        }
         self.compiling.remove(&which);
         match result {
             Ok(pipeline) => {
@@ -199,6 +227,7 @@ mod tests {
             format: wgpu::TextureFormat::Bgra8Unorm,
             display: crate::Display::SDR,
             cache: crate::pipeline_cache::PipelineCache::open(&device, None),
+            depth_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
         for which in [
             BuiltIn::Particles { samples: 1, additive: false },

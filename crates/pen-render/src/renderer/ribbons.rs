@@ -133,7 +133,7 @@ pub(crate) fn pipeline(context: &PipelineContext, samples: u32, additive: bool) 
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth24PlusStencil8,
             depth_write_enabled: Some(false),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            depth_compare: Some(context.depth_mode().compare_nearer()),
             stencil: wgpu::StencilState { read_mask: 0, write_mask: 0, ..Default::default() },
             bias: Default::default(),
         }),

@@ -68,7 +68,9 @@ use pen_protocol::{Catalog, GameEvent, RenderFrame};
 pub use area_lights::{AREA_LIGHTS_WGSL, AreaLight, AreaLightKind, AreaLightResources, LTC_LUT_SIZE, generate_ltc_luts};
 pub use asset_store::{mesh_bounds, pack_mesh, validate_asset_key};
 pub use atmosphere_lut::{ATMOSPHERE_LUT_WGSL, AtmosphereParams, CLOUDS_WGSL, PhysicalAtmosphere};
-pub use camera_precision::{CameraRelativeFrame, DepthMode, perspective_forward_z, perspective_reversed_z};
+pub use camera_precision::{
+    CameraRelativeFrame, DepthMode, detect_depth_mode, perspective_forward_z, perspective_reversed_z,
+};
 pub use ddgi::{
     DDGI_IRRADIANCE_INNER, DDGI_IRRADIANCE_TILE, DDGI_VISIBILITY_INNER, DDGI_VISIBILITY_TILE, DDGI_WGSL,
     DdgiFrameParams, DdgiGridConfig, DdgiQueryPoint, DdgiVolume,
@@ -129,7 +131,10 @@ pub use volume::{TRANSLUCENCY_WGSL, VolumeImage, VolumeLayer};
 /// distance field atlas (pen-texture's `msdf`), crisp at any scale:
 /// `msdf_coverage(msdf_median(field.rgb), uv, range, size)`.
 pub const MSDF_WGSL: &str = include_str!("shaders/msdf.wgsl");
-pub use renderer::{SHADOWS_WGSL, validate_frame};
+pub use renderer::{
+    ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentFoliage, EnvironmentScene,
+    EnvironmentTerrain, SHADOWS_WGSL, validate_frame,
+};
 #[cfg(feature = "simplify")]
 pub use simplify::pack_mesh_with_lods;
 pub use surface::{SURFACE_LOBES_WGSL, SURFACE_TRANSMISSION_WGSL, SURFACE_WGSL};
@@ -514,9 +519,71 @@ impl Renderer {
         self.state.set_hdri_environment(image, intensity, rotation_rad)
     }
 
+    /// Auto-detects Radiance `.hdr` or OpenEXR `.exr` bytes and activates the prefiltered IBL cubemap.
+    pub fn set_hdri_bytes(
+        &mut self,
+        bytes: &[u8],
+        intensity: f32,
+        rotation_rad: f32,
+    ) -> anyhow::Result<[pen_protocol::Vector; 9]> {
+        self.state.set_hdri_bytes(bytes, intensity, rotation_rad)
+    }
+
+    /// Loads a `.hdr` or `.exr` file from disk and activates it as the live IBL environment.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_hdri_asset(
+        &mut self,
+        path: &std::path::Path,
+        intensity: f32,
+        rotation_rad: f32,
+    ) -> anyhow::Result<[pen_protocol::Vector; 9]> {
+        self.state.load_hdri_asset(path, intensity, rotation_rad)
+    }
+
+    /// Whether a custom HDRI cubemap environment is currently active.
+    pub fn has_hdri_environment(&self) -> bool {
+        self.state.has_hdri_environment()
+    }
+
     /// Reverts the environment cubemap back to the procedural sky gradient.
     pub fn clear_hdri_environment(&mut self) {
         self.state.clear_hdri_environment();
+    }
+
+    /// Active scene depth convention (`ForwardZ` or `ReversedZ`).
+    pub fn depth_mode(&self) -> DepthMode {
+        self.state.depth_mode()
+    }
+
+    /// Switches scene depth convention (`ForwardZ` or `ReversedZ`), recompiling depth-tested passes.
+    pub fn set_depth_mode(&mut self, mode: DepthMode) {
+        self.state.set_depth_mode(mode);
+    }
+
+    /// Uploads a validated `R32Float` terrain heightmap texture for [`EnvironmentScene`].
+    pub fn upload_terrain_heightmap(
+        &self,
+        width: u32,
+        height: u32,
+        heights: &[f32],
+    ) -> anyhow::Result<TerrainHeightmap> {
+        self.state.upload_terrain_heightmap(width, height, heights)
+    }
+
+    /// Attaches an outdoor environment scene (CDLOD terrain, Gerstner water, GPU foliage) drawn
+    /// inside every opaque scene pass.
+    pub fn set_environment_scene(&mut self, scene: EnvironmentScene) {
+        self.state.set_environment_scene(scene);
+    }
+
+    /// Detaches the active outdoor environment scene.
+    pub fn clear_environment_scene(&mut self) {
+        self.state.clear_environment_scene();
+    }
+
+    /// Number of LOD0 mesh draws dispatched through GPU meshlet cluster culling on the last frame.
+    pub fn last_meshlet_cull_draws(&self) -> u32 {
+        self.state.last_meshlet_cull_draws()
     }
 
     /// Selects the display tonemapping operator (`Shoulder`, `AgX`, `AcesFilmic`, `PbrNeutral`).

@@ -75,6 +75,10 @@ pub(crate) use ribbons::pipeline as ribbon_pipeline;
 pub use shadows::SHADOWS_WGSL;
 pub(crate) use timing::{GpuTimer, Span};
 pub use validate::validate_frame;
+pub use wired_passes::{
+    ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentFoliage, EnvironmentScene,
+    EnvironmentTerrain,
+};
 
 pub(crate) fn velocity_sentinel_bytes() -> [u8; 4] {
     velocity::SENTINEL_F16_BYTES
@@ -109,6 +113,13 @@ pub(crate) struct RtMeshSource {
     pub triangles: Vec<crate::ray_tracing::BlasTriangle>,
 }
 
+/// GPU meshlet cluster descriptors + cluster-ordered index buffer for LOD0 indirect culling.
+pub(crate) struct MeshletGpuAsset {
+    pub indices: wgpu::Buffer,
+    pub descriptors: wgpu::Buffer,
+    pub count: u32,
+}
+
 pub(crate) struct MeshAsset {
     vertex_count: u32,
     vertices: wgpu::Buffer,
@@ -130,6 +141,8 @@ pub(crate) struct MeshAsset {
     instances: Option<MeshInstanceBuffer>,
     /// LOD0 triangles for lazy ray-tracing / DDGI BLAS construction.
     rt_source: Option<Arc<RtMeshSource>>,
+    /// LOD0 meshlet clusters for GPU frustum/backface/Hi-Z cluster culling.
+    meshlets: Option<MeshletGpuAsset>,
 }
 
 pub(crate) struct MeshMorphs {
@@ -234,6 +247,7 @@ impl MeshAsset {
             + self.skin.as_ref().map_or(0, |s| s.vertices.size())
             + self.morphs.as_ref().map_or(0, |m| m.deltas.size())
             + self.instances.as_ref().map_or(0, |i| i.buffer.size())
+            + self.meshlets.as_ref().map_or(0, |ml| ml.indices.size() + ml.descriptors.size())
     }
 }
 
@@ -518,6 +532,8 @@ struct ReadyEntry {
     skin: Option<u32>,
     /// A morphed draw's deformed vertex slice `(start, end)` in the frame's morph output buffer.
     morph: Option<(u64, u64)>,
+    /// Optional GPU meshlet-culled indirect buffer slot for LOD0 main-camera draws.
+    meshlet_slot: Option<usize>,
     persistent: bool,
 }
 
@@ -595,6 +611,7 @@ struct Drawing<'a> {
     /// The frame's GPU-morphed vertex buffer, for draws with active morph weights.
     morphed: Option<&'a wgpu::Buffer>,
     culling: &'a GpuCulling,
+    meshlet_indirect: &'a [(u32, wgpu::Buffer)],
 }
 
 /// Floats for a uniform buffer, gathered on the stack.
@@ -830,6 +847,8 @@ pub(crate) struct State {
     tonemap: crate::tonemap::TonemapOperator,
     // Wired end-to-end passes driven directly by RenderFrame (physical sky, area lights, PBR decals, RCAS/post-FX, OIT, split-screen).
     wired: wired_passes::WiredPasses,
+    // Indirect draw-command buffers populated by GPU meshlet cluster culling for the primary view.
+    meshlet_indirect: Vec<(u32, wgpu::Buffer)>,
     instance_data: Vec<f32>,
     instance_uploads: instance_upload::Uploads,
     last_stats: RenderStats,
@@ -1125,6 +1144,7 @@ impl State {
             format: options.display.drawing_format(options.format),
             display: options.display,
             cache: PipelineCache::open(&device, options.pipeline_cache.as_deref()),
+            depth_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
         let screen = crate::display::Screen::new(&device, options.display, options.format);
         let loader = Loader::new(options.assets, context.clone())?;
@@ -1226,6 +1246,7 @@ impl State {
             surface_atlas_packer: None,
             tonemap: crate::tonemap::TonemapOperator::Shoulder,
             wired: wired_passes::WiredPasses::default(),
+            meshlet_indirect: Vec::new(),
             instance_data: vec![0.0; 20],
             instance_uploads: instance_upload::Uploads::default(),
             last_stats: RenderStats::default(),
@@ -1629,10 +1650,97 @@ impl State {
         Ok(sh)
     }
 
+    pub fn set_hdri_bytes(
+        &mut self,
+        bytes: &[u8],
+        intensity: f32,
+        rotation_rad: f32,
+    ) -> Result<[pen_protocol::Vector; 9]> {
+        let image = crate::hdri::HdriImage::from_bytes(bytes)?;
+        self.set_hdri_environment(&image, intensity, rotation_rad)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn load_hdri_asset(
+        &mut self,
+        path: &std::path::Path,
+        intensity: f32,
+        rotation_rad: f32,
+    ) -> Result<[pen_protocol::Vector; 9]> {
+        let bytes = std::fs::read(path)?;
+        self.set_hdri_bytes(&bytes, intensity, rotation_rad)
+    }
+
+    pub fn has_hdri_environment(&self) -> bool {
+        self.environment.has_hdri()
+    }
+
     pub fn clear_hdri_environment(&mut self) {
         self.environment.clear_hdri();
         self.scene_group = None;
         self.translucent_group = None;
+    }
+
+    pub fn depth_mode(&self) -> crate::camera_precision::DepthMode {
+        self.context.depth_mode()
+    }
+
+    pub fn set_depth_mode(&mut self, mode: crate::camera_precision::DepthMode) {
+        if self.context.depth_mode() == mode {
+            return;
+        }
+        self.context.set_depth_mode(mode);
+        // Clear all depth-dependent cached pipelines so shaders, built-ins, decals, OIT and
+        // outdoor environment passes recompile cleanly for the new depth convention.
+        for slot in &mut self.assets.slots {
+            if let Some(GpuAsset::Shader(sh)) = &mut slot.current {
+                sh.made.clear();
+                sh.compiling.clear();
+                sh.failed.clear();
+            }
+        }
+        for staged in self.staging.values_mut() {
+            staged.shader.made.clear();
+            staged.shader.compiling.clear();
+            staged.shader.failed.clear();
+        }
+        self.built_ins.invalidate_depth_dependent();
+        self.post = None;
+        for ct in &mut self.camera_targets {
+            ct.temporal.post = None;
+        }
+        for sv in &mut self.wired.split_views {
+            sv.temporal.post = None;
+        }
+        self.particles = None;
+        self.ribbons = None;
+        self.decals = None;
+        self.wired.oit_pipelines.clear();
+        self.wired.pbr_decals.clear();
+        self.wired.env_pipelines.clear();
+        self.wired.reset_svgf_history();
+        self.hiz.invalidate();
+    }
+
+    pub fn upload_terrain_heightmap(
+        &self,
+        width: u32,
+        height: u32,
+        heights: &[f32],
+    ) -> Result<crate::environment_passes::TerrainHeightmap> {
+        crate::environment_passes::TerrainPipeline::upload_heightmap(&self.device, &self.queue, width, height, heights)
+    }
+
+    pub fn set_environment_scene(&mut self, scene: EnvironmentScene) {
+        self.wired.env_scene = Some(scene);
+    }
+
+    pub fn clear_environment_scene(&mut self) {
+        self.wired.env_scene = None;
+    }
+
+    pub fn last_meshlet_cull_draws(&self) -> u32 {
+        self.wired.last_meshlet_cull_draws
     }
 
     pub fn set_tonemap(&mut self, operator: crate::tonemap::TonemapOperator) {

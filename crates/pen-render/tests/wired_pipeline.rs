@@ -14,12 +14,13 @@
 mod common;
 
 use pen_protocol::{
-    AreaLightSpec, CameraTargetSpec, Cascade, Catalog, Color, Draw, Inset, PbrDecalSpec, Sprite, Vector,
+    AreaLightSpec, CameraTargetSpec, Cascade, Catalog, Color, Draw, Extension, Inset, PbrDecalSpec, Sprite, Vector,
     VideoStreamSpec, color_filter,
 };
 use pen_render::{
-    ColorFilter, HdriImage, NodeRef, Renderer, RendererOptions, ShaderGraph, ShaderNode, ShaderNodeKind,
-    TonemapOperator,
+    ColorFilter, DepthMode, ENV_FOLIAGE_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentScene, EnvironmentTerrain, HdriImage,
+    NodeRef, Renderer, RendererOptions, ShaderGraph, ShaderNode, ShaderNodeKind, TerrainPatch, TerrainUniform,
+    TonemapOperator, perspective_reversed_z,
 };
 use serde_json::json;
 
@@ -1061,6 +1062,310 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
     assert!(passes.contains(&"taa"), "quality.upscale=true must enable temporal accumulation pass: {passes:?}");
     let px_up = common::middle(&device, &queue, &target.0);
     assert!(px_up[0] > 100 && px_up[1] > 100 && px_up[2] > 100, "upscaled receiver must render cleanly: {px_up:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
+    let Some((device, queue)) = common::device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pen-wired-gpu-v2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Build a dense 16x16 UV sphere (512 triangles >= 128 threshold) so meshlet cluster culling activates.
+    let (mut pos, mut norm, mut uv, mut idx) = (Vec::<f32>::new(), Vec::<f32>::new(), Vec::<f32>::new(), Vec::<u32>::new());
+    let stacks = 16u32;
+    let slices = 16u32;
+    for r in 0..=stacks {
+        let v = r as f32 / stacks as f32;
+        let phi = v * std::f32::consts::PI;
+        for c in 0..=slices {
+            let u = c as f32 / slices as f32;
+            let theta = u * std::f32::consts::TAU;
+            let x = phi.sin() * theta.cos();
+            let y = phi.cos();
+            let z = phi.sin() * theta.sin();
+            pos.extend_from_slice(&[x, y, z]);
+            norm.extend_from_slice(&[x, y, z]);
+            uv.extend_from_slice(&[u, v]);
+        }
+    }
+    let stride = slices + 1;
+    for r in 0..stacks {
+        for c in 0..slices {
+            let i0 = r * stride + c;
+            let i1 = i0 + 1;
+            let i2 = (r + 1) * stride + c;
+            let i3 = i2 + 1;
+            idx.extend_from_slice(&[i0, i1, i2, i1, i3, i2]);
+        }
+    }
+    let sphere_json = json!({ "positions": pos, "normals": norm, "uvs": uv, "indices": idx });
+    let quad_json = json!({
+        "positions": [-1.0, -1.0, 0.0,  1.0, -1.0, 0.0,  1.0, 1.0, 0.0,  -1.0, 1.0, 0.0],
+        "normals": [0.0, 0.0, 1.0,  0.0, 0.0, 1.0,  0.0, 0.0, 1.0,  0.0, 0.0, 1.0],
+        "uvs": [0.0, 1.0,  1.0, 1.0,  1.0, 0.0,  0.0, 0.0],
+        "indices": [0, 1, 2, 0, 2, 3]
+    });
+    std::fs::write(dir.join("sphere.mesh.json"), serde_json::to_vec(&sphere_json).unwrap()).unwrap();
+    std::fs::write(dir.join("quad.mesh.json"), serde_json::to_vec(&quad_json).unwrap()).unwrap();
+    std::fs::write(dir.join("simple.wgsl"), SIMPLE_SHADER).unwrap();
+    std::fs::write(dir.join("lit.wgsl"), STOCK_LIT_SHADER).unwrap();
+    write_solid_png(&dir.join("white.png"), [255, 255, 255, 255]);
+
+    let mats = [
+        ("green.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.1, 0.9, 0.15, 1.0], "lighting": "unlit" })),
+        ("red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.95, 0.1, 0.1, 1.0], "lighting": "unlit" })),
+        ("chrome.mat.json", json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.95, 0.95, 0.95, 1.0], "lighting": "lit", "instanceParameters": [0.1, 0.95, 1.0, 0.0] })),
+        ("dark_lit.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.05, 0.05, 0.05, 1.0], "lighting": "lit" })),
+        ("emissive_red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [1.0, 0.0, 0.0, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 6.0 } })),
+    ];
+    for (name, val) in &mats {
+        std::fs::write(dir.join(name), val.to_string()).unwrap();
+    }
+
+    let catalog = Catalog {
+        meshes: vec!["sphere.mesh.json".into(), "quad.mesh.json".into()],
+        materials: mats.iter().map(|(n, _)| (*n).into()).collect(),
+        sounds: vec![],
+    };
+    let mut renderer = Renderer::new(
+        device.clone(),
+        queue.clone(),
+        RendererOptions {
+            format: common::FORMAT,
+            display: pen_render::Display::SDR,
+            assets: dir.clone(),
+            veil: None,
+            pipeline_cache: None,
+        },
+    )
+    .unwrap();
+    let mut target = common::Offscreen::new(&device, 64);
+    let proj_fwd = pen_render::perspective_forward_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
+
+    // 1) GPU meshlet cluster culling activates on the 512-triangle sphere and renders visibly.
+    let mut ml_frame = common::frame(vec![Draw {
+        mesh: 0,
+        material: 0,
+        transform: [
+            1.5, 0.0, 0.0, 0.0,
+            0.0, 1.5, 0.0, 0.0,
+            0.0, 0.0, 1.5, 0.0,
+            0.0, 0.0, -3.0, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    }]);
+    ml_frame.projection = proj_fwd;
+    ml_frame.quality.sky = false;
+    ml_frame.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    wait_ready(&mut renderer, &ml_frame, &catalog, &mut target);
+    assert!(
+        renderer.last_meshlet_cull_draws() >= 1,
+        "dense opaque LOD0 sphere must execute GPU meshlet culling"
+    );
+    let px_ml = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_ml[1] > 150 && px_ml[0] < 80,
+        "GPU meshlet indirect draw must rasterize the green sphere visibly: {px_ml:?}"
+    );
+
+    // 2) SVGF spatiotemporal denoiser runs cleanly over 4 consecutive RT tier-2 frames.
+    let scale_at = |s: f32, z: f32| -> [f32; 16] {
+        [
+            s, 0.0, 0.0, 0.0,
+            0.0, s, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, z, 1.0,
+        ]
+    };
+    let mut svgf_frame = common::frame(vec![
+        Draw { mesh: 1, material: 3, transform: scale_at(4.0, -2.0), parameters: None, extra: None },
+        Draw { mesh: 1, material: 4, transform: scale_at(4.0, 1.0), parameters: None, extra: None },
+    ]);
+    svgf_frame.projection = proj_fwd;
+    svgf_frame.light_direction = Vector { x: 0.0, y: 0.0, z: -1.0 };
+    svgf_frame.light_color = Vector { x: 2.0, y: 2.0, z: 2.0 };
+    svgf_frame.sky = Default::default();
+    svgf_frame.quality.sky = false;
+    svgf_frame.quality.ray_tracing = 2;
+    wait_ready(&mut renderer, &svgf_frame, &catalog, &mut target);
+    for _ in 0..3 {
+        renderer.submit(&svgf_frame, &catalog, &mut target).unwrap();
+    }
+    let px_svgf = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_svgf[0] > px_svgf[2].saturating_add(40),
+        "4-frame SVGF-denoised RT tier-2 pass must preserve warm red GI bounce: {px_svgf:?}"
+    );
+
+    // 3) HDRI Radiance `.hdr` bytes IBL (`Renderer::set_hdri_bytes` + `has_hdri_environment`).
+    let mut hdr_frame = common::frame(vec![Draw {
+        mesh: 0,
+        material: 2,
+        transform: [
+            1.6, 0.0, 0.0, 0.0,
+            0.0, 1.6, 0.0, 0.0,
+            0.0, 0.0, 1.6, 0.0,
+            0.0, 0.0, -3.0, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    }]);
+    hdr_frame.projection = proj_fwd;
+    hdr_frame.light_color = Vector { x: 0.0, y: 0.0, z: 0.0 };
+    hdr_frame.ambient = Vector { x: 0.0, y: 0.0, z: 0.0 };
+    hdr_frame.sky = Default::default();
+    hdr_frame.quality.sky = false;
+    assert!(!renderer.has_hdri_environment());
+    wait_ready(&mut renderer, &hdr_frame, &catalog, &mut target);
+    let px_no_hdri = common::middle(&device, &queue, &target.0);
+
+    // Build a valid flat 4x4 Radiance .hdr file filled with bright warm amber (RGBE ~ [8.0, 4.0, 0.5]).
+    let mut hdr_bytes = b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 4 +X 4\n".to_vec();
+    for _ in 0..16 {
+        // E=132 -> scale = 2^(132-128)/256 = 16/256 = 0.0625; R=192 -> 12.0, G=96 -> 6.0, B=8 -> 0.5
+        hdr_bytes.extend_from_slice(&[192, 96, 8, 132]);
+    }
+    renderer.set_hdri_bytes(&hdr_bytes, 1.0, 0.0).unwrap();
+    assert!(renderer.has_hdri_environment());
+    renderer.submit(&hdr_frame, &catalog, &mut target).unwrap();
+    let px_with_hdri = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_with_hdri[0] > px_no_hdri[0].saturating_add(50) && px_with_hdri[0] > px_with_hdri[2].saturating_add(40),
+        "Radiance .hdr IBL must light metallic chrome sphere warmly: before={px_no_hdri:?}, after={px_with_hdri:?}"
+    );
+    renderer.clear_hdri_environment();
+    assert!(!renderer.has_hdri_environment());
+
+    // 4) Built-in outdoor environment passes: CDLOD terrain (`EnvironmentScene`), Gerstner water (`ENV_WATER_EXT_TAG`),
+    //    and GPU wind-swaying foliage (`ENV_FOLIAGE_EXT_TAG`) rendered through standard `Renderer::submit`.
+    let look_down: [f32; 16] = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, -1.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, -6.0, 1.0,
+    ]; // camera at (0, 6, 0) looking straight down -Y at XZ plane y=0!
+    let mut env_base = common::frame(vec![]);
+    env_base.view = look_down;
+    env_base.projection = proj_fwd;
+    env_base.light_direction = Vector { x: 0.0, y: -1.0, z: 0.0 };
+    env_base.light_color = Vector { x: 2.5, y: 2.4, z: 2.2 };
+    env_base.sky.horizon = Vector { x: 0.65, y: 0.78, z: 0.92 };
+    env_base.sky.zenith = Vector { x: 0.15, y: 0.38, z: 0.78 };
+    env_base.quality.sky = false;
+    env_base.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+
+    // 4a. Host-configured CDLOD terrain heightmap.
+    let hm = renderer.upload_terrain_heightmap(4, 4, &[0.5f32; 16]).unwrap();
+    renderer.set_environment_scene(EnvironmentScene {
+        terrain: Some(EnvironmentTerrain {
+            heightmap: std::sync::Arc::new(hm),
+            uniform: TerrainUniform {
+                view_projection: [0.0; 16],
+                camera_pos_and_fog: [0.0, 6.0, 0.0, 0.0],
+                sun_dir_and_height_scale: [0.0, 1.0, 0.0, 1.0],
+                sun_color_and_ambient: [2.2, 2.1, 2.0, 0.4],
+                world_bounds: [20.0, 20.0, 40.0, 80.0],
+                layer_heights: [0.1, 0.4, 0.8, 0.2],
+                fog_color: [0.6, 0.7, 0.8, 0.0],
+            },
+            patches: vec![TerrainPatch {
+                origin_scale_morph: [-10.0, -10.0, 20.0, 0.0],
+                uv_rect_and_grid: [0.0, 0.0, 1.0, 8.0],
+            }],
+        }),
+        water: vec![],
+        foliage: None,
+    });
+    renderer.submit(&env_base, &catalog, &mut target).unwrap();
+    let px_terrain = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_terrain[0] > 20 || px_terrain[1] > 20 || px_terrain[2] > 20,
+        "CDLOD terrain pass must rasterize terrain pixels: {px_terrain:?}"
+    );
+    renderer.clear_environment_scene();
+
+    // 4b. Blot extension Gerstner water (`ENV_WATER_EXT_TAG`).
+    let mut water_frame = env_base.clone();
+    water_frame.extensions.push(Extension {
+        tag: ENV_WATER_EXT_TAG,
+        values: vec![
+            0.0,   // water level y
+            -2.0,  // bed y
+            0.0,   // bed slope
+            16.0,  // grid cells
+            0.5,   // time
+            0.45, 0.12, 0.08, // Beer-Lambert absorption
+            0.04, 0.25, 0.42, // deep tint
+            0.65,  // foam threshold
+            0.55, 0.48, 0.35, // bed color
+            0.6,   // wave amp
+            10.0,  // half extent
+        ],
+    });
+    renderer.submit(&water_frame, &catalog, &mut target).unwrap();
+    let px_water = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_water[2] > 30 && px_water[2] >= px_water[0],
+        "ENV_WATER_EXT_TAG must draw blue-tinted Gerstner water: {px_water:?}"
+    );
+
+    // 4c. Blot extension GPU foliage (`ENV_FOLIAGE_EXT_TAG`).
+    let mut foliage_frame = common::frame(vec![]);
+    foliage_frame.projection = proj_fwd;
+    foliage_frame.light_direction = Vector { x: 0.0, y: -1.0, z: -0.3 };
+    foliage_frame.light_color = Vector { x: 2.4, y: 2.4, z: 2.2 };
+    foliage_frame.quality.sky = false;
+    foliage_frame.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    let mut fvals = vec![
+        0.5,             // time
+        1.0, 0.0,        // wind dir xz
+        0.2, 1.5, 1.0,   // wind strength, speed, gust
+        0.45, 2.4,       // blade half-width, height
+        0.08, 0.42, 0.06, // root rgb
+        0.25, 0.85, 0.12, // tip rgb
+        0.4, 0.9, 0.15, 2.0, // sss rgb + power
+    ];
+    // Cluster blades right in front of the camera at z = -2.0 spanning y = -1.2..+1.2!
+    for i in 0..8 {
+        let x = -0.7 + i as f32 * 0.2;
+        fvals.extend_from_slice(&[x, -1.2, -2.0, 1.0, 0.0, i as f32 * 0.4, 0.0, 1.0]);
+    }
+    foliage_frame.extensions.push(Extension { tag: ENV_FOLIAGE_EXT_TAG, values: fvals });
+    renderer.submit(&foliage_frame, &catalog, &mut target).unwrap();
+    let px_foliage = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_foliage[1] > px_foliage[0].saturating_add(25) && px_foliage[1] > 40,
+        "ENV_FOLIAGE_EXT_TAG must draw green wind-swaying grass blades: {px_foliage:?}"
+    );
+
+    // 5) Reversed-Z auto-detection & distant depth precision:
+    //    Two quads 1m apart at 5 km (`z = -5000.0` GREEN in front of `z = -5001.0` RED)
+    //    must always show GREEN even when RED is submitted AFTER GREEN!
+    let proj_rev = perspective_reversed_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, None);
+    let mut rev_frame = common::frame(vec![
+        Draw { mesh: 1, material: 0, transform: scale_at(8000.0, -5000.0), parameters: None, extra: None }, // nearer GREEN
+        Draw { mesh: 1, material: 1, transform: scale_at(8000.0, -5001.0), parameters: None, extra: None }, // farther RED drawn second
+    ]);
+    rev_frame.projection = proj_rev;
+    rev_frame.quality.sky = false;
+    rev_frame.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    wait_ready(&mut renderer, &rev_frame, &catalog, &mut target);
+    assert_eq!(renderer.depth_mode(), DepthMode::ReversedZ);
+    let px_rev = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_rev[1] > px_rev[0].saturating_add(120),
+        "Reversed-Z must resolve 1m depth separation at 5km cleanly (green in front of red): {px_rev:?}"
+    );
+    // Verify switching back to Forward-Z restores DepthMode::ForwardZ cleanly too.
+    renderer.submit(&ml_frame, &catalog, &mut target).unwrap();
+    assert_eq!(renderer.depth_mode(), DepthMode::ForwardZ);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

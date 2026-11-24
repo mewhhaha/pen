@@ -66,7 +66,6 @@ impl Drawing<'_> {
                     pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 }
                 pass.set_vertex_buffer(1, self.tangents(mesh).slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 let count = if let Some(instances) = &mesh.instances {
                     pass.set_vertex_buffer(2, instances.buffer.slice(..));
                     has_slot2 = true;
@@ -75,13 +74,29 @@ impl Drawing<'_> {
                     1
                 };
                 pass.set_vertex_buffer(if has_slot2 { 3 } else { 2 }, self.extra_attrs(mesh).slice(..));
-                pass.draw_indexed(lod.first..lod.first + lod.count, 0, 0..count);
-                if let Some(stats) = stats {
-                    stats.draw_calls += 1;
-                    stats.triangles += u64::from(lod.count / 3) * u64::from(count);
-                    if mesh.instances.is_some() {
-                        stats.instanced_draw_calls += 1;
-                        stats.instances += count;
+                if view == 0
+                    && item.lod == 0
+                    && let (Some(slot), Some(ml)) = (entry.meshlet_slot, &mesh.meshlets)
+                    && let Some(&(ml_count, ref ind_buf)) = self.meshlet_indirect.get(slot)
+                {
+                    pass.set_index_buffer(ml.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    for k in 0..ml_count {
+                        pass.draw_indexed_indirect(ind_buf, u64::from(k) * 20);
+                    }
+                    if let Some(stats) = stats {
+                        stats.draw_calls += ml_count;
+                        stats.triangles += u64::from(lod.count / 3);
+                    }
+                } else {
+                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(lod.first..lod.first + lod.count, 0, 0..count);
+                    if let Some(stats) = stats {
+                        stats.draw_calls += 1;
+                        stats.triangles += u64::from(lod.count / 3) * u64::from(count);
+                        if mesh.instances.is_some() {
+                            stats.instanced_draw_calls += 1;
+                            stats.instances += count;
+                        }
                     }
                 }
             }
@@ -272,6 +287,10 @@ impl State {
     ) -> Result<()> {
         validate_frame(frame)?;
         self.check_names(frame, catalog)?;
+        if let Some(detected) = crate::camera_precision::detect_depth_mode(&frame.projection) {
+            self.set_depth_mode(detected);
+        }
+        let depth_mode = self.context.depth_mode();
         let (mut field_upload_bytes, mut field_upload_calls, mut field_input_texels) = (0, 0, 0);
         for patch in &frame.fields {
             let (bytes, calls) = self.write_field(catalog.material(patch.material), patch);
@@ -361,7 +380,6 @@ impl State {
         self.prepare_particles(frame, catalog, samples, scratch)?;
         self.prepare_ribbons(frame, catalog, samples, scratch)?;
         self.sort_passes(frame, scratch, shadowed);
-        let ready = &scratch.ready;
         // Until they are ready, draw the cover and any opted-in startup sprites.
         if covered && !self.built_ins.ready(BuiltIn::all(samples)) {
             self.waiting = true;
@@ -482,6 +500,8 @@ impl State {
         let capture = self.prepare_capture(frame, scratch, samples);
         let oit_pipelines = self.prepare_oit_pipelines(frame, scratch, samples);
         let tlas_ready = self.prepare_tlas_scene(frame, scratch)?;
+        self.encode_meshlet_culling(&device, &mut encoder, frame, scratch, &active_proj_for_trails, depth_mode)?;
+        let ready = &scratch.ready;
         let drawing = Drawing {
             assets: &self.assets,
             items: &scratch.items,
@@ -493,6 +513,7 @@ impl State {
             skin: self.skinning.group(),
             morphed: self.morphing.output(),
             culling: &self.culling,
+            meshlet_indirect: &self.meshlet_indirect,
         };
         if let Some((vel_view, vel_depth)) = &targets.velocity {
             let active_proj = jittered.unwrap_or(frame.projection);
@@ -628,12 +649,25 @@ impl State {
                 timestamp_writes: self.timer.pass(Span::Scene),
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &targets.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(depth_mode.clear_value()),
+                        store: wgpu::StoreOp::Store,
+                    }),
                     stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0), store: wgpu::StoreOp::Store }),
                 }),
                 ..Default::default()
             });
             draw_layers(&mut first, scene_group, &[(&scratch.opaque, Layer::Opaque)], &mut stats);
+            Self::encode_environment_passes(
+                &mut self.wired,
+                &device,
+                &self.queue,
+                &mut first,
+                frame,
+                &active_proj_for_trails,
+                samples,
+                depth_mode,
+            )?;
         }
         if self.hiz.enabled() && self.culling.supported() && self.culling.from.is_some() {
             let active_proj = jittered.unwrap_or(frame.projection);
@@ -688,6 +722,7 @@ impl State {
                 &targets.depth_only,
                 samples,
                 targets.size,
+                depth_mode,
             )?;
         }
         if tlas_ready && (frame.quality.ray_tracing > 0 || frame.quality.ddgi) {
@@ -704,6 +739,7 @@ impl State {
                 &targets.depth_only,
                 targets.size,
                 samples,
+                depth_mode,
             )?;
         }
         if subsurface {
@@ -1163,6 +1199,7 @@ impl State {
             skin: self.skinning.group(),
             morphed: self.morphing.output(),
             culling: &self.culling,
+            meshlet_indirect: &[],
         };
         let ready = &scratch.ready;
         scratch.insets.sort_by_key(|&(index, _)| frame.insets[index].after_sprites);

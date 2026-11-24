@@ -725,6 +725,7 @@ impl State {
             visible,
             skin,
             morph,
+            meshlet_slot: None,
             persistent,
         }))
     }

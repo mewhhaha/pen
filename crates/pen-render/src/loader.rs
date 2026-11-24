@@ -83,6 +83,7 @@ pub(crate) enum Message {
         revision: u64,
         samples: u32,
         variants: Variants,
+        depth_mode: crate::camera_precision::DepthMode,
         result: Result<Pipelines, String>,
     },
     Shadow {
@@ -93,6 +94,7 @@ pub(crate) enum Message {
     },
     BuiltIn {
         which: BuiltIn,
+        depth_mode: crate::camera_precision::DepthMode,
         result: Result<wgpu::RenderPipeline, String>,
     },
     Culling(Result<wgpu::ComputePipeline, String>),
@@ -403,8 +405,9 @@ impl Worker {
                 }
             }
             Job::Compile { slot, revision, samples, variants, module, instancing, skinning, persistent } => {
+                let depth_mode = self.context.depth_mode();
                 let result = self.compile(&module, instancing, skinning, persistent, samples, variants).await;
-                self.send(Message::Compiled { slot, revision, samples, variants, result });
+                self.send(Message::Compiled { slot, revision, samples, variants, depth_mode, result });
             }
             Job::Shadow { slot, revision, module, stage } => {
                 let clock = platform::Clock::new();
@@ -413,8 +416,9 @@ impl Worker {
                 self.send(Message::Shadow { slot, revision, stage, result });
             }
             Job::BuiltIn(which) => {
+                let depth_mode = self.context.depth_mode();
                 let result = shader::checked(device, || which.compile(&self.context)).await;
-                self.send(Message::BuiltIn { which, result });
+                self.send(Message::BuiltIn { which, depth_mode, result });
             }
             Job::Culling => {
                 let result = shader::checked(device, || crate::renderer::culling_pipeline(&self.context)).await;

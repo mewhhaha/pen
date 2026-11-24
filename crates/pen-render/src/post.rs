@@ -73,7 +73,11 @@ const ATMOSPHERE_SHADER: &str = include_str!("shaders/atmosphere.wgsl");
 
 const ATMOSPHERE_COMMON: &str = include_str!("shaders/atmosphere_common.wgsl");
 
-pub(crate) fn atmosphere_shader(samples: u32) -> String {
+pub(crate) fn atmosphere_shader(samples: u32, depth_mode: crate::camera_precision::DepthMode) -> String {
+    let (depth_clear, empty_cond, nearer_op) = match depth_mode {
+        crate::camera_precision::DepthMode::ForwardZ => ("1.0", "depth >= 1.0", "min"),
+        crate::camera_precision::DepthMode::ReversedZ => ("0.0", "depth <= 0.0", "max"),
+    };
     ATMOSPHERE_SHADER
         .replace("${common}", ATMOSPHERE_COMMON)
         .replace("${volume}", crate::volume::COMMON_WGSL)
@@ -81,6 +85,9 @@ pub(crate) fn atmosphere_shader(samples: u32) -> String {
         .replace("${fullscreen}", FULLSCREEN)
         .replace("${samples}", &samples.to_string())
         .replace("${share}", &format!("{:.4}", 1.0 / f64::from(samples)))
+        .replace("${depth_clear}", depth_clear)
+        .replace("${empty_cond}", empty_cond)
+        .replace("${nearer_op}", nearer_op)
 }
 
 // Ground-truth ambient occlusion (GTAO): horizon-based visibility from depth.
@@ -97,11 +104,17 @@ pub(crate) fn occlusion_shader(samples: u32) -> String {
 // pass's samples.
 const OPAQUE_DEPTH_SHADER: &str = include_str!("shaders/opaque_depth.wgsl");
 
-pub(crate) fn opaque_depth_shader(samples: u32) -> String {
+pub(crate) fn opaque_depth_shader(samples: u32, depth_mode: crate::camera_precision::DepthMode) -> String {
+    let (depth_clear, nearer_op) = match depth_mode {
+        crate::camera_precision::DepthMode::ForwardZ => ("1.0", "min"),
+        crate::camera_precision::DepthMode::ReversedZ => ("0.0", "max"),
+    };
     OPAQUE_DEPTH_SHADER
         .replace("${depth_texture}", depth_texture(samples))
         .replace("${fullscreen}", FULLSCREEN)
         .replace("${samples}", &samples.to_string())
+        .replace("${depth_clear}", depth_clear)
+        .replace("${nearer_op}", nearer_op)
 }
 
 const OPAQUE_MIP_SHADER: &str = include_str!("shaders/opaque_mip.wgsl");
@@ -434,11 +447,12 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
         dst_factor: wgpu::BlendFactor::One,
         operation: wgpu::BlendOperation::Add,
     };
+    let depth_mode = context.depth_mode();
     let (code, target, blend) = match which {
         BuiltIn::Occlusion(samples) => (occlusion_shader(samples), wgpu::TextureFormat::R8Unorm, None),
-        BuiltIn::Atmosphere(samples) => (atmosphere_shader(samples), SCENE_FORMAT, None),
+        BuiltIn::Atmosphere(samples) => (atmosphere_shader(samples, depth_mode), SCENE_FORMAT, None),
         BuiltIn::Ssgi(samples) => (crate::ssgi::shader(samples), SCENE_FORMAT, None),
-        BuiltIn::OpaqueDepth(samples) => (opaque_depth_shader(samples), wgpu::TextureFormat::R32Float, None),
+        BuiltIn::OpaqueDepth(samples) => (opaque_depth_shader(samples, depth_mode), wgpu::TextureFormat::R32Float, None),
         BuiltIn::OpaqueMip => (OPAQUE_MIP_SHADER.to_owned(), SCENE_FORMAT, None),
         BuiltIn::Subsurface(samples) => (crate::subsurface::shader(samples), SCENE_FORMAT, None),
         BuiltIn::Taa(samples) => (crate::taa::shader(samples), SCENE_FORMAT, None),
@@ -1530,9 +1544,12 @@ mod tests {
 
     #[test]
     fn templates_fill_every_hole() {
+        let fz = crate::camera_precision::DepthMode::ForwardZ;
+        let rz = crate::camera_precision::DepthMode::ReversedZ;
         for code in [
-            atmosphere_shader(1),
-            atmosphere_shader(4),
+            atmosphere_shader(1, fz),
+            atmosphere_shader(4, fz),
+            atmosphere_shader(1, rz),
             occlusion_shader(1),
             occlusion_shader(4),
             crate::ssgi::shader(1),
@@ -1551,18 +1568,21 @@ mod tests {
             crate::dof::shader(4),
             crate::motion_blur::shader(1),
             crate::motion_blur::shader(4),
-            opaque_depth_shader(1),
-            opaque_depth_shader(4),
+            opaque_depth_shader(1, fz),
+            opaque_depth_shader(4, fz),
+            opaque_depth_shader(1, rz),
             backdrop_shader(),
         ] {
             assert!(!code.contains("${"), "{code}");
         }
-        assert!(atmosphere_shader(4).contains("empty += 0.2500;"));
+        assert!(atmosphere_shader(4, fz).contains("empty += 0.2500;"));
+        assert!(atmosphere_shader(1, rz).contains("depth <= 0.0"));
         assert!(occlusion_shader(4).contains("gtao_arc"));
         assert!(
-            opaque_depth_shader(4).contains("texture_depth_multisampled_2d")
-                && opaque_depth_shader(4).contains("sample < 4")
+            opaque_depth_shader(4, fz).contains("texture_depth_multisampled_2d")
+                && opaque_depth_shader(4, fz).contains("sample < 4")
         );
+        assert!(opaque_depth_shader(1, rz).contains("max(nearest"));
     }
 }
 

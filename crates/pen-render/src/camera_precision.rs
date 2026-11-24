@@ -43,6 +43,24 @@ impl DepthMode {
     }
 }
 
+/// Detects whether a right-handed WebGPU `[0, 1]` perspective `projection` matrix uses
+/// `ForwardZ` (`z_ndc` 0->1) or `ReversedZ` (`z_ndc` 1->0). Returns `None` for non-perspective
+/// matrices (e.g. identity or orthographic) so callers preserve the active depth mode.
+pub fn detect_depth_mode(projection: &Matrix) -> Option<DepthMode> {
+    if !projection.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    if projection[11] < -0.5 {
+        if projection[10] >= 0.0 && projection[14] > 0.0 {
+            return Some(DepthMode::ReversedZ);
+        }
+        if projection[10] < 0.0 && projection[14] < 0.0 {
+            return Some(DepthMode::ForwardZ);
+        }
+    }
+    None
+}
+
 /// Right-handed WebGPU `[0, 1]` Reversed-Z perspective projection matrix (`z_ndc = 1` at `near`,
 /// `z_ndc = 0` at `far` or infinity when `far` is `None`).
 pub fn perspective_reversed_z(fov_y_rad: f32, aspect: f32, near: f32, far: Option<f32>) -> Matrix {
@@ -141,6 +159,18 @@ impl CameraRelativeFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_depth_mode_classifies_forward_reversed_and_non_perspective() {
+        let rev_inf = perspective_reversed_z(1.0, 1.5, 0.1, None);
+        let rev_fin = perspective_reversed_z(1.0, 1.5, 0.1, Some(10_000.0));
+        let fwd = perspective_forward_z(1.0, 1.5, 0.1, 10_000.0);
+        let ortho = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -0.01, 0.0, 0.0, 0.0, 0.0, 1.0];
+        assert_eq!(detect_depth_mode(&rev_inf), Some(DepthMode::ReversedZ));
+        assert_eq!(detect_depth_mode(&rev_fin), Some(DepthMode::ReversedZ));
+        assert_eq!(detect_depth_mode(&fwd), Some(DepthMode::ForwardZ));
+        assert_eq!(detect_depth_mode(&ortho), None);
+    }
 
     #[test]
     fn camera_relative_preserves_submillimeter_precision_at_100km() {

@@ -122,13 +122,13 @@ fn mist_light(direction: vec3f, point: vec3f) -> vec3f {
   let pixel = vec2i(position.xy);
   let scene = textureLoad(scene_color, pixel, 0);
   var empty = 0.0;
-  var nearest = 1.0;
+  var nearest = ${depth_clear};
   for (var sample = 0; sample < ${samples}; sample++) {
     let depth = textureLoad(scene_depth, pixel, sample);
-    if (depth >= 1.0) {
+    if (${empty_cond}) {
       empty += ${share};
     } else {
-      nearest = min(nearest, depth);
+      nearest = ${nearer_op}(nearest, depth);
     }
   }
   // The clear colour fills what the samples left empty, in what the resolve

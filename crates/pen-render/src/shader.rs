@@ -3,11 +3,14 @@
 // materials draw with, for the sample counts frames draw at.
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use anyhow::{Result, bail};
 
 use crate::asset_store::{MESH_TANGENT_FLOATS, MESH_VERTEX_FLOATS};
+use crate::camera_precision::DepthMode;
 use crate::pipeline_cache::PipelineCache;
 use crate::post::SCENE_FORMAT;
 
@@ -37,6 +40,18 @@ pub(crate) struct PipelineContext {
     pub display: crate::Display,
     /// Where compiled pipelines are kept between runs, if anywhere.
     pub cache: PipelineCache,
+    /// Active scene depth mode (`0` = `ForwardZ`, `1` = `ReversedZ`), shared with loader threads.
+    pub depth_mode: Arc<AtomicU8>,
+}
+
+impl PipelineContext {
+    pub fn depth_mode(&self) -> DepthMode {
+        if self.depth_mode.load(Ordering::Acquire) == 1 { DepthMode::ReversedZ } else { DepthMode::ForwardZ }
+    }
+
+    pub fn set_depth_mode(&self, mode: DepthMode) {
+        self.depth_mode.store(u8::from(mode == DepthMode::ReversedZ), Ordering::Release);
+    }
 }
 
 /// What error scopes caught: Ok once they come back empty, else the
@@ -521,9 +536,13 @@ pub(crate) fn pipelines(
             };
             Some(variant_of(context, module, samples, depth_write, depth_compare, blending, stage))
         };
+    let depth_mode = context.depth_mode();
+    let near = depth_mode.compare_nearer();
+    let near_eq = depth_mode.compare_nearer_or_equal();
+    let far = depth_mode.compare_farther();
     Pipelines {
         persistent: if persistent {
-            make(Variants::PERSISTENT, true, CompareFunction::Less, None, Stage::Persistent)
+            make(Variants::PERSISTENT, true, near, None, Stage::Persistent)
         } else {
             None
         },
@@ -532,13 +551,13 @@ pub(crate) fn pipelines(
         } else {
             None
         },
-        opaque: make(Variants::OPAQUE, true, CompareFunction::Less, None, Stage::Plain),
+        opaque: make(Variants::OPAQUE, true, near, None, Stage::Plain),
         inset: make(Variants::INSET, true, CompareFunction::Less, None, Stage::Plain),
         inset_blended: make(Variants::INSET_BLENDED, false, CompareFunction::Less, None, Stage::Plain),
         translucent: make(
             Variants::TRANSLUCENT,
             false,
-            CompareFunction::Less,
+            near,
             Some(wgpu::BlendComponent {
                 src_factor: BlendFactor::SrcAlpha,
                 dst_factor: BlendFactor::OneMinusSrcAlpha,
@@ -550,7 +569,7 @@ pub(crate) fn pipelines(
         occluded: make(
             Variants::OCCLUDED,
             false,
-            CompareFunction::Greater,
+            far,
             Some(wgpu::BlendComponent {
                 src_factor: BlendFactor::Constant,
                 dst_factor: BlendFactor::OneMinusConstant,
@@ -558,14 +577,14 @@ pub(crate) fn pipelines(
             }),
             Stage::Plain,
         ),
-        visible: make(Variants::VISIBLE, true, CompareFunction::LessEqual, None, Stage::Plain),
+        visible: make(Variants::VISIBLE, true, near_eq, None, Stage::Plain),
         instanced: if instancing {
-            make(Variants::INSTANCED, true, CompareFunction::Less, None, Stage::Instanced)
+            make(Variants::INSTANCED, true, near, None, Stage::Instanced)
         } else {
             None
         },
         skinned: if skinning {
-            make(Variants::SKINNED, true, CompareFunction::Less, None, Stage::Skinned)
+            make(Variants::SKINNED, true, near, None, Stage::Skinned)
         } else {
             None
         },
@@ -573,7 +592,7 @@ pub(crate) fn pipelines(
             make(
                 Variants::SKINNED_TRANSLUCENT,
                 false,
-                CompareFunction::Less,
+                near,
                 Some(wgpu::BlendComponent {
                     src_factor: BlendFactor::SrcAlpha,
                     dst_factor: BlendFactor::OneMinusSrcAlpha,
@@ -624,7 +643,7 @@ pub(crate) fn oit_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth24PlusStencil8,
             depth_write_enabled: Some(false),
-            depth_compare: Some(wgpu::CompareFunction::Less),
+            depth_compare: Some(context.depth_mode().compare_nearer()),
             stencil: wgpu::StencilState {
                 front: stamping(false),
                 back: stamping(false),

@@ -274,7 +274,10 @@ impl State {
                 let kind = if sprite { AssetKind::SpriteShader } else { AssetKind::Shader };
                 let _ = self.assets.prefetch(kind, &key);
             }
-            Message::Compiled { slot, revision, samples, variants, result } => {
+            Message::Compiled { slot, revision, samples, variants, depth_mode, result } => {
+                if depth_mode != self.context.depth_mode() {
+                    return;
+                }
                 let failure = self.compiled(slot, revision, |shader| {
                     let compiling = shader.compiling.entry(samples).or_default();
                     *compiling = compiling.without(variants);
@@ -291,7 +294,7 @@ impl State {
                 });
                 self.compiled_out(slot, revision, failure, now);
             }
-            Message::BuiltIn { which, result } => self.built_ins.arrived(which, result),
+            Message::BuiltIn { which, depth_mode, result } => self.built_ins.arrived(which, depth_mode, result),
             Message::Culling(result) => self.culling.arrived(result),
             // Taken in with the others' levels.
             Message::Level => {}
@@ -494,7 +497,35 @@ impl State {
                     }
                     (!triangles.is_empty()).then(|| Arc::new(super::RtMeshSource { id: rt_id, triangles }))
                 });
+                let meshlet_data = (mesh.skin.is_none() && mesh.morphs.is_none() && mesh.instances.is_none())
+                    .then(|| {
+                        let lod0 = mesh.lods.first()?;
+                        let start = lod0.first as usize;
+                        let end = start.checked_add(lod0.count as usize)?;
+                        let idx_slice = mesh.indices.get(start..end)?;
+                        if idx_slice.len() / 3 < 128 {
+                            return None;
+                        }
+                        let mut positions = Vec::with_capacity(mesh.vertices.len() / MESH_VERTEX_FLOATS);
+                        for v in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
+                            positions.push([v[0], v[1], v[2]]);
+                        }
+                        crate::meshlets::build_meshlets(
+                            &positions,
+                            idx_slice,
+                            crate::meshlets::DEFAULT_MAX_MESHLET_VERTICES,
+                            crate::meshlets::DEFAULT_MAX_MESHLET_TRIANGLES,
+                        )
+                        .ok()
+                        .filter(|ml| ml.meshlets.len() > 1)
+                    })
+                    .flatten();
                 let (asset, check) = shader::scoped(&device, || {
+                    let meshlets = meshlet_data.as_ref().map(|ml| super::MeshletGpuAsset {
+                        indices: buffer(bytemuck::cast_slice(&ml.indices), wgpu::BufferUsages::INDEX),
+                        descriptors: buffer(bytemuck::cast_slice(&ml.meshlets), wgpu::BufferUsages::STORAGE),
+                        count: u32::try_from(ml.meshlets.len()).unwrap_or(0),
+                    });
                     GpuAsset::Mesh(MeshAsset {
                         vertex_count,
                         vertices: buffer(vertex_bytes, vertex_usage),
@@ -519,6 +550,7 @@ impl State {
                             deltas: buffer(bytes, wgpu::BufferUsages::STORAGE),
                         }),
                         rt_source,
+                        meshlets,
                     })
                 });
                 Ok(Some((asset, Some(check))))

@@ -294,6 +294,10 @@ impl Environment {
         self.hdri = None;
     }
 
+    pub fn has_hdri(&self) -> bool {
+        self.hdri.is_some()
+    }
+
     /// Active sky cubemap view (HDRI if installed, otherwise procedural gradient sky).
     pub fn active_cube_view(&self) -> &wgpu::TextureView {
         self.hdri.as_ref().map_or(&self.cube_view, |h| &h.view)

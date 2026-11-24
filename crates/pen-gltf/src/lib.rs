@@ -44,8 +44,11 @@ use serde_json::{Value, json};
 
 mod gtex;
 pub mod optimize;
+pub mod scene_import;
 pub mod tangents;
 pub mod vat;
+
+pub use scene_import::{ImportedScene, SceneImportOptions, SceneImportPreset, import_scene};
 
 /// A shader that draws with vertex-animation textures, which an import
 /// asked to bake them writes as their materials' shader when the asset

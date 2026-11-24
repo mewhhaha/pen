@@ -665,6 +665,14 @@ const COMMANDS: &[CommandSpec] = &[
                 NAME.import.json listing them; an asset recipe's work",
     },
     CommandSpec {
+        name: "import-scene",
+        operands: "FILE",
+        checkout: false,
+        about: "import a full glTF 2.0 scene/prefab (.gltf or .glb) into unpacked assets plus a hierarchical \
+                .pen-scene.json preserving node trees, cameras, punctual lights, -col/-colonly/-convcol colliders, \
+                _LOD0..3 groups, and a re-import preset",
+    },
+    CommandSpec {
         name: "bake-lightmaps",
         operands: "FILE",
         checkout: false,
@@ -1037,7 +1045,7 @@ const OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         name: "--out",
         value: "DIR",
-        commands: &["gltf"],
+        commands: &["gltf", "import-scene"],
         place: Place::Command,
         about: "the asset directory written into (default src/assets)",
     },
@@ -1072,16 +1080,30 @@ const OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         name: "--name",
         value: "NAME",
-        commands: &["gltf"],
+        commands: &["gltf", "import-scene"],
         place: Place::Command,
         about: "what the assets' names start with (default the file's name)",
     },
     OptionSpec {
         name: "--shader",
         value: "KEY",
-        commands: &["gltf"],
+        commands: &["gltf", "import-scene"],
         place: Place::Command,
         about: "the shader the materials name (default scene.wgsl)",
+    },
+    OptionSpec {
+        name: "--scene",
+        value: "FILE",
+        commands: &["import-scene"],
+        place: Place::Command,
+        about: "explicit output path for the generated .pen-scene.json (default <out>/<name>.pen-scene.json)",
+    },
+    OptionSpec {
+        name: "--scale",
+        value: "FACTOR",
+        commands: &["import-scene"],
+        place: Place::Command,
+        about: "uniform root scale applied to imported scene root nodes (default 1.0)",
     },
     OptionSpec {
         name: "--vat",
@@ -2433,6 +2455,9 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
     if args.command == "gltf" {
         return import_gltf(&args);
     }
+    if args.command == "import-scene" {
+        return import_gltf_scene(&args);
+    }
     if args.command == "bake-lightmaps" {
         let opts = bake_lightmaps::BakeCliOptions {
             job_path: PathBuf::from(&args.operands[0]),
@@ -2827,6 +2852,30 @@ fn import_gltf(args: &Args) -> Result<()> {
     };
     let out = args.path("--out").unwrap_or_else(|| PathBuf::from("src/assets"));
     gltf::import(Path::new(&args.operands[0]), &out, &options)
+}
+
+/// `pen import-scene FILE`: full glTF scene/prefab import into assets + `.pen-scene.json`.
+#[cfg(feature = "compiler")]
+fn import_gltf_scene(args: &Args) -> Result<()> {
+    let options = pen_gltf::SceneImportOptions {
+        name: args.value("--name"),
+        shader: args.value("--shader").unwrap_or_else(|| "scene.wgsl".to_owned()),
+        scene_path: args.path("--scene"),
+        optimize_vertices: false,
+        root_scale: args.number::<f32>("--scale")?.unwrap_or(1.0),
+    };
+    let out = args.path("--out").unwrap_or_else(|| PathBuf::from("src/assets"));
+    let imported = pen_gltf::import_scene(Path::new(&args.operands[0]), &out, &options)?;
+    println!(
+        "Imported scene '{}' ({} nodes, {} meshes, {} LOD groups, {} colliders) -> {}",
+        imported.scene.name,
+        imported.scene.nodes.len(),
+        imported.assets.meshes.len(),
+        imported.lod_groups,
+        imported.colliders,
+        imported.scene_path.display()
+    );
+    Ok(())
 }
 
 #[cfg(all(test, feature = "compiler"))]

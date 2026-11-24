@@ -42,7 +42,7 @@ use anyhow::Result;
 use pen_protocol::boundary::MAX_DRAW_EXTRA;
 use pen_protocol::{GameEvent, Matrix, Sky, Solid, Vector};
 
-use crate::asset_store::{AssetStore, Lod, MAX_LODS, Material};
+use crate::asset_store::{AssetStore, Lod, MAX_LODS, Material, SURFACE_FLOATS};
 use crate::built_in::{BuiltIn, BuiltIns};
 use crate::culling::{Detail, MAX_VIEWS, Sphere, ViewMask, Views};
 use crate::decals::{DecalBatch, Decals};
@@ -85,8 +85,11 @@ const SCENE_FLOATS: usize = 80 + 4 + 16 * MAX_CASCADES + 4 * MAX_CASCADES + 4;
 const SCENE_BYTES: u64 = SCENE_FLOATS as u64 * 4;
 
 // A draw's uniform: model and normal matrices, color, settings, the four
-// parameters, then up to 32 extra vectors (see pen-protocol's Draw).
-const DRAW_BYTES: u64 = 176 + MAX_DRAW_EXTRA as u64 * 16;
+// parameters, up to 32 extra vectors (see pen-protocol's Draw), then the
+// material's five surface vectors (`asset_store::Surface::vectors`), which
+// start at float `SURFACE_AT` (byte 688).
+const SURFACE_AT: usize = 44 + MAX_DRAW_EXTRA * 4;
+const DRAW_BYTES: u64 = (SURFACE_AT + SURFACE_FLOATS) as u64 * 4;
 
 pub(crate) struct MeshAsset {
     vertices: wgpu::Buffer,

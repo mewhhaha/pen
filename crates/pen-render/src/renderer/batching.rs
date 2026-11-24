@@ -11,12 +11,12 @@ use super::frame::stencil;
 use super::skinning::Posed;
 use super::validate::normal_matrix;
 use super::{
-    ALONE, Batching, Choice, GpuAsset, INSET_SAMPLES, InstanceBatch, Item, LEFT_OUT, Placement, ReadyEntry, Scratch,
-    Shape, SolidMesh, Source, State, uniform_buffer,
+    ALONE, Batching, Choice, GpuAsset, INSET_SAMPLES, InstanceBatch, Item, LEFT_OUT, Placement, ReadyEntry, SURFACE_AT,
+    Scratch, Shape, SolidMesh, Source, State, uniform_buffer,
 };
 use crate::RenderStats;
 use crate::asset_store::AssetKind;
-use crate::asset_store::MAX_LODS;
+use crate::asset_store::{MAX_LODS, SURFACE_FLOATS};
 use crate::culling::{ALL_VIEWS, CAMERA, Detail, Frustum, MAX_VIEWS, Sphere, ViewMask, Views, stretch};
 use crate::decals::DecalBatch;
 use crate::local_shadows::Selection;
@@ -552,12 +552,15 @@ impl State {
             .unwrap_or([0.0; 4]);
         data[40..44].copy_from_slice(&parameters);
         // Unused extra vectors read as zero.
-        let extra = &mut data[44..44 + MAX_DRAW_EXTRA * 4];
+        let extra = &mut data[44..SURFACE_AT];
         extra.fill(0.0);
         if let Some(values) = draw.and_then(|draw| draw.extra.as_deref()) {
             let count = values.len().min(MAX_DRAW_EXTRA * 4);
             extra[..count].copy_from_slice(&values[..count]);
         }
+        // Every path writes the material's surface: a batch's draws share its first's
+        // material, or one of the same render state.
+        data[SURFACE_AT..SURFACE_AT + SURFACE_FLOATS].copy_from_slice(&m.surface.vectors());
         // Insets preserve authored coverage, separately from scene sky alpha.
         let (pipeline, visible) = if persistent {
             let inset = item.inset().is_some();

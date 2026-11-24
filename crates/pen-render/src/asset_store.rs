@@ -129,6 +129,171 @@ pub(crate) struct Material {
     pub decals: bool,
     /// A lit, opaque material casts a shadow unless this is false.
     pub shadow: bool,
+    /// The richer lobes: clear coat, sheen, anisotropy, transmission and
+    /// volume, specular and emissive strength. Part of the render state.
+    pub surface: Surface,
+}
+
+/// A material's `surface` block, as the draw uniform's last five `vec4f`s
+/// hold it (`Surface::vectors`; docs/materials.md): the factors of the glTF
+/// extensions KHR_materials_clearcoat, sheen, anisotropy, transmission,
+/// volume, ior and specular, and KHR_materials_emissive_strength. A material
+/// without the block has `Surface::default()`, which leaves every lobe off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Surface {
+    pub clearcoat: f64,
+    pub clearcoat_roughness: f64,
+    pub sheen_color: [f64; 3],
+    pub sheen_roughness: f64,
+    pub anisotropy: f64,
+    /// Radians.
+    pub anisotropy_rotation: f64,
+    pub transmission: f64,
+    pub ior: f64,
+    /// In model units; 0 is thin-walled.
+    pub thickness: f64,
+    pub attenuation_color: [f64; 3],
+    /// In model units; 0 is infinite.
+    pub attenuation_distance: f64,
+    pub specular: f64,
+    pub specular_color: [f64; 3],
+    pub emissive_strength: f64,
+}
+
+impl Default for Surface {
+    fn default() -> Self {
+        Surface {
+            clearcoat: 0.0,
+            clearcoat_roughness: 0.0,
+            sheen_color: [0.0; 3],
+            sheen_roughness: 0.0,
+            anisotropy: 0.0,
+            anisotropy_rotation: 0.0,
+            transmission: 0.0,
+            ior: 1.5,
+            thickness: 0.0,
+            attenuation_color: [1.0; 3],
+            attenuation_distance: 0.0,
+            specular: 1.0,
+            specular_color: [1.0; 3],
+            emissive_strength: 1.0,
+        }
+    }
+}
+
+/// The draw uniform's floats for the surface block: five `vec4f`s.
+pub(crate) const SURFACE_FLOATS: usize = 20;
+
+impl Surface {
+    /// The five `vec4f`s of the draw uniform's `surface` array:
+    /// (clearcoat, clearcoat roughness, sheen roughness, anisotropy),
+    /// (sheen color, anisotropy rotation), (transmission, ior, thickness,
+    /// attenuation distance), (attenuation color, specular) and (specular
+    /// color, emissive strength).
+    pub fn vectors(&self) -> [f32; SURFACE_FLOATS] {
+        let [sheen_r, sheen_g, sheen_b] = self.sheen_color;
+        let [attenuation_r, attenuation_g, attenuation_b] = self.attenuation_color;
+        let [specular_r, specular_g, specular_b] = self.specular_color;
+        #[allow(clippy::cast_possible_truncation, reason = "validated to fit float32")]
+        [
+            self.clearcoat,
+            self.clearcoat_roughness,
+            self.sheen_roughness,
+            self.anisotropy,
+            sheen_r,
+            sheen_g,
+            sheen_b,
+            self.anisotropy_rotation,
+            self.transmission,
+            self.ior,
+            self.thickness,
+            self.attenuation_distance,
+            attenuation_r,
+            attenuation_g,
+            attenuation_b,
+            self.specular,
+            specular_r,
+            specular_g,
+            specular_b,
+            self.emissive_strength,
+        ]
+        .map(|value| value as f32)
+    }
+
+    /// The block of a material's JSON: every key optional, the rest as
+    /// `Surface::default()`, and none but these.
+    fn parse(value: Option<&Value>) -> Result<Surface> {
+        const KEYS: [&str; 14] = [
+            "clearcoat",
+            "clearcoatRoughness",
+            "sheenColor",
+            "sheenRoughness",
+            "anisotropy",
+            "anisotropyRotation",
+            "transmission",
+            "ior",
+            "thickness",
+            "attenuationColor",
+            "attenuationDistance",
+            "specular",
+            "specularColor",
+            "emissiveStrength",
+        ];
+        let block = match value {
+            None | Some(Value::Null) => return Ok(Surface::default()),
+            Some(Value::Object(block)) => block,
+            Some(_) => bail!("material surface must be an object"),
+        };
+        if let Some(unknown) = block.keys().find(|key| !KEYS.contains(&key.as_str())) {
+            bail!("material surface has no {unknown}");
+        }
+        let float32 = f64::from(f32::MAX);
+        let range = |least: f64, most: f64| {
+            if most == float32 && least == -float32 {
+                "finite".to_owned()
+            } else if most == float32 {
+                format!("at least {least}")
+            } else {
+                format!("from {least} to {most}")
+            }
+        };
+        let number = |key: &str, default: f64, least: f64, most: f64| -> Result<f64> {
+            match block.get(key) {
+                None => Ok(default),
+                Some(value) => value
+                    .as_f64()
+                    .filter(|value| (least..=most).contains(value))
+                    .ok_or_else(|| anyhow!("material surface {key} must be a number {}", range(least, most))),
+            }
+        };
+        let channels = |key: &str, default: f64, most: f64| -> Result<[f64; 3]> {
+            let Some(value) = block.get(key) else { return Ok([default; 3]) };
+            let invalid = || anyhow!("material surface {key} must be three numbers {}", range(0.0, most));
+            let values = value.as_array().filter(|values| values.len() == 3).ok_or_else(invalid)?;
+            let mut out = [0.0; 3];
+            for (out, value) in out.iter_mut().zip(values) {
+                *out = value.as_f64().filter(|value| (0.0..=most).contains(value)).ok_or_else(invalid)?;
+            }
+            Ok(out)
+        };
+        let defaults = Surface::default();
+        Ok(Surface {
+            clearcoat: number("clearcoat", defaults.clearcoat, 0.0, 1.0)?,
+            clearcoat_roughness: number("clearcoatRoughness", defaults.clearcoat_roughness, 0.0, 1.0)?,
+            sheen_color: channels("sheenColor", 0.0, 1.0)?,
+            sheen_roughness: number("sheenRoughness", defaults.sheen_roughness, 0.0, 1.0)?,
+            anisotropy: number("anisotropy", defaults.anisotropy, -1.0, 1.0)?,
+            anisotropy_rotation: number("anisotropyRotation", defaults.anisotropy_rotation, -float32, float32)?,
+            transmission: number("transmission", defaults.transmission, 0.0, 1.0)?,
+            ior: number("ior", defaults.ior, 1.0, float32)?,
+            thickness: number("thickness", defaults.thickness, 0.0, float32)?,
+            attenuation_color: channels("attenuationColor", 1.0, 1.0)?,
+            attenuation_distance: number("attenuationDistance", defaults.attenuation_distance, 0.0, float32)?,
+            specular: number("specular", defaults.specular, 0.0, float32)?,
+            specular_color: channels("specularColor", 1.0, float32)?,
+            emissive_strength: number("emissiveStrength", defaults.emissive_strength, 0.0, float32)?,
+        })
+    }
 }
 
 impl Material {
@@ -140,9 +305,11 @@ impl Material {
         format!("{state:?}")
     }
 
-    /// Opaque: not an overlay, not blended and with an opaque color.
+    /// Opaque: not an overlay, not blended, with an opaque color and not
+    /// transmissive: a transmissive surface draws among the translucent ones,
+    /// as it reads the opaque picture behind it, whatever its alpha.
     pub fn opaque(&self) -> bool {
-        !self.overlay && !self.blend && self.color[3] == 1.0
+        !self.overlay && !self.blend && self.color[3] == 1.0 && self.surface.transmission <= 0.0
     }
 
     pub fn casts_shadow(&self) -> bool {
@@ -586,6 +753,7 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
         scene_filter,
         decals,
         shadow,
+        surface: Surface::parse(material.get("surface"))?,
     })
 }
 
@@ -882,6 +1050,108 @@ mod tests {
         assert!(validate_asset_key("a/../b").is_err());
         assert!(validate_asset_key("a//b").is_err());
         assert!(validate_asset_key("a/b.png").is_ok());
+    }
+
+    fn material_with(surface: &str) -> Result<Material> {
+        parse_material(
+            format!(r#"{{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit","surface":{surface}}}"#).as_bytes(),
+        )
+    }
+
+    #[test]
+    fn a_material_without_a_surface_block_has_its_lobes_off() {
+        let plain = parse_material(br#"{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit"}"#).unwrap();
+        assert_eq!(plain.surface, Surface::default());
+        // The documented defaults: ior 1.5, full specular, white colours, strength 1, the rest 0.
+        assert_eq!(
+            plain.surface.vectors(),
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        );
+        // An empty block and a null one say the same.
+        assert_eq!(material_with("{}").unwrap().surface, Surface::default());
+        assert_eq!(material_with("null").unwrap().surface, Surface::default());
+        assert!(plain.opaque() && plain.casts_shadow());
+    }
+
+    #[test]
+    fn the_surface_block_fills_the_five_vectors_in_the_documented_order() {
+        let material = material_with(
+            r#"{"clearcoat":0.25,"clearcoatRoughness":0.125,"sheenColor":[0.5,0.25,0.75],"sheenRoughness":0.375,
+                "anisotropy":-0.5,"anisotropyRotation":1.5,"transmission":0.0,"ior":1.75,"thickness":2.5,
+                "attenuationColor":[0.9,0.8,0.7],"attenuationDistance":4.0,"specular":0.5,
+                "specularColor":[2.0,0.5,0.25],"emissiveStrength":3.0}"#,
+        )
+        .unwrap();
+        let v = material.surface.vectors();
+        assert_eq!(v[0..4], [0.25, 0.125, 0.375, -0.5], "clearcoat, its roughness, sheen roughness, anisotropy");
+        assert_eq!(v[4..8], [0.5, 0.25, 0.75, 1.5], "sheen colour and the anisotropy's rotation");
+        assert_eq!(v[8..12], [0.0, 1.75, 2.5, 4.0], "transmission, ior, thickness, attenuation distance");
+        assert_eq!(v[12..16], [0.9f32, 0.8, 0.7, 0.5], "attenuation colour and specular");
+        assert_eq!(v[16..20], [2.0, 0.5, 0.25, 3.0], "specular colour and emissive strength");
+        // Keys left out keep their defaults, one by one.
+        let partly = material_with(r#"{"clearcoat":1.0}"#).unwrap().surface.vectors();
+        let mut expected = Surface::default().vectors();
+        expected[0] = 1.0;
+        assert_eq!(partly, expected);
+    }
+
+    #[test]
+    fn the_surface_block_is_checked() {
+        for (surface, said) in [
+            (r#"{"clearcoat":1.5}"#, "clearcoat"),
+            (r#"{"clearcoatRoughness":-0.1}"#, "clearcoatRoughness"),
+            (r#"{"sheenColor":[1,1]}"#, "sheenColor"),
+            (r#"{"sheenColor":[1,1,2]}"#, "sheenColor"),
+            (r#"{"anisotropy":1.5}"#, "anisotropy"),
+            (r#"{"transmission":2}"#, "transmission"),
+            (r#"{"ior":0.5}"#, "ior"),
+            (r#"{"thickness":-1}"#, "thickness"),
+            (r#"{"attenuationDistance":-1}"#, "attenuationDistance"),
+            (r#"{"attenuationColor":[0,0,"x"]}"#, "attenuationColor"),
+            (r#"{"specular":-1}"#, "specular"),
+            (r#"{"specularColor":[-1,0,0]}"#, "specularColor"),
+            (r#"{"emissiveStrength":"high"}"#, "emissiveStrength"),
+            (r#"{"anisotropyRotation":1e300}"#, "anisotropyRotation"),
+            // A key it has no lobe for, a misspelt one among them.
+            (r#"{"clearcoatRoughnes":0.5}"#, "clearcoatRoughnes"),
+            (r#"[0.5]"#, "an object"),
+        ] {
+            let error = format!("{:#}", material_with(surface).unwrap_err());
+            assert!(error.contains(said), "{surface}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_surface_is_part_of_the_render_state_but_instance_parameters_are_not() {
+        let state = |surface: &str, parameters: &str| {
+            let json = format!(
+                r#"{{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit","instanceParameters":{parameters}{surface}}}"#
+            );
+            parse_material(json.as_bytes()).unwrap().state_key()
+        };
+        let plain = state("", "[0,0,0,0]");
+        assert_eq!(plain, state("", "[1,2,3,4]"), "parameters may differ inside one batch");
+        assert_eq!(plain, state(r#","surface":{"clearcoat":0}"#, "[0,0,0,0]"), "a block of defaults is no block");
+        assert_ne!(plain, state(r#","surface":{"clearcoat":0.5}"#, "[0,0,0,0]"));
+        assert_ne!(
+            state(r#","surface":{"sheenColor":[1,0,0]}"#, "[0,0,0,0]"),
+            state(r#","surface":{"sheenColor":[0,1,0]}"#, "[0,0,0,0]")
+        );
+        assert_ne!(plain, state(r#","surface":{"ior":1.4}"#, "[0,0,0,0]"));
+        assert_ne!(plain, state(r#","surface":{"emissiveStrength":2}"#, "[0,0,0,0]"));
+    }
+
+    #[test]
+    fn a_transmissive_material_draws_among_the_translucent_ones_whatever_its_alpha() {
+        let glass = material_with(r#"{"transmission":0.5}"#).unwrap();
+        assert_eq!(glass.color[3], 1.0);
+        assert!(!glass.opaque(), "it reads the opaque picture behind it");
+        assert!(!glass.casts_shadow());
+        assert_eq!(glass.variants(), Variants::TRANSLUCENT);
+        // Without transmission the same block stays as an opaque material was.
+        let coated = material_with(r#"{"clearcoat":1,"transmission":0,"thickness":2}"#).unwrap();
+        assert!(coated.opaque() && coated.casts_shadow());
+        assert_eq!(coated.variants(), material_with("{}").unwrap().variants());
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{
+  "shader": "lit.wgsl",
+  "color": [
+    1.0,
+    0.88,
+    0.2,
+    1.0
+  ],
+  "lighting": "unlit",
+  "overlay": true
+}

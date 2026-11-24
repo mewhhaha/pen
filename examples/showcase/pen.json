@@ -1,0 +1,32 @@
+{
+  "game": {
+    "name": "showcase",
+    "title": "Ink + Pen High-Fidelity Showcase & Scene Editor"
+  },
+  "plugins": {
+    "blot": {
+      "read": [
+        "../../../blot2/std",
+        "../../../ink/lib"
+      ],
+      "run": {
+        "blotc": "../../../blot2/compiler-goose/build/blotc-goose"
+      }
+    }
+  },
+  "compiler": {
+    "plugin": "blot",
+    "settings": {
+      "std": "../../../blot2/std",
+      "imports": {
+        "pen/": "pen/",
+        "ink/": "../../../ink/lib/"
+      },
+      "nativeAssets": {
+        "roots": [
+          "src"
+        ]
+      }
+    }
+  }
+}

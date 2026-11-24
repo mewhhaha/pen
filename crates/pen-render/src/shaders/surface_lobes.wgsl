@@ -22,14 +22,14 @@
 // Names: `surface_` for what a shader calls, `lobe_` for the maths under it,
 // `parallax_` for POM; `SURFACE_` for flags.
 
-const SURFACE_COAT: u32 = 1u;
-const SURFACE_SHEEN: u32 = 2u;
-const SURFACE_ANISOTROPY: u32 = 4u;
-const SURFACE_TRANSMISSION: u32 = 8u;
-const SURFACE_SUBSURFACE: u32 = 16u;
+const surface_coat: u32 = 1u;
+const surface_sheen: u32 = 2u;
+const surface_anisotropy: u32 = 4u;
+const surface_transmission: u32 = 8u;
+const surface_subsurface: u32 = 16u;
 // The face-on reflectance comes from the ior, the specular factor and its color
 // (`surface_apply_block`); without it f0 is the dielectric 0.04 of ior 1.5.
-const SURFACE_SPECULAR: u32 = 32u;
+const surface_specular: u32 = 32u;
 
 // What the frame's lights bring to a glossy surface, in two parts a material
 // scales by its own: `diffuse` is for albedo (times 1 - metallic) to multiply,
@@ -90,11 +90,11 @@ struct StandardSurface {
   subsurface: f32,
   subsurface_color: vec3f,
   thin: f32,
-  // Thin-film iridescence (SURFACE_IRIDESCENCE): weight, film IOR, thickness (nm).
+  // Thin-film iridescence (surface_iridescence): weight, film IOR, thickness (nm).
   iridescence: f32,
   iridescence_ior: f32,
   iridescence_thickness: f32,
-  // Baked lightmap diffuse irradiance (SURFACE_LIGHTMAP).
+  // Baked lightmap diffuse irradiance (surface_lightmap).
   lightmap_irradiance: vec3f,
   has_lightmap: f32,
 };
@@ -136,31 +136,31 @@ fn surface_default(world: vec3f, normal: vec3f, view: vec3f, base_color: vec3f, 
 //   [3] attenuation color, specular
 //   [4] specular color, emissive strength
 // `model_scale` is what the thickness is scaled by to reach world units
-// (`length(draw.model[0].xyz)`). With `SURFACE_SPECULAR` or
-// `SURFACE_TRANSMISSION` the reflectance (f0 and f90) follows the ior, the
+// (`length(draw.model[0].xyz)`). With `surface_specular` or
+// `surface_transmission` the reflectance (f0 and f90) follows the ior, the
 // specular factor and its color; otherwise it stays the 0.04 of `surface_default`.
 fn surface_apply_block(s: StandardSurface, block: array<vec4f, 5>, lobes: u32, model_scale: f32) -> StandardSurface {
   var r = s;
   r.lobes = lobes;
-  if ((lobes & SURFACE_COAT) != 0u) {
+  if ((lobes & surface_coat) != 0u) {
     r.coat = block[0].x;
     r.coat_roughness = block[0].y;
   }
-  if ((lobes & SURFACE_SHEEN) != 0u) {
+  if ((lobes & surface_sheen) != 0u) {
     r.sheen_roughness = block[0].z;
     r.sheen_color = block[1].xyz;
   }
-  if ((lobes & SURFACE_ANISOTROPY) != 0u) {
+  if ((lobes & surface_anisotropy) != 0u) {
     r.anisotropy = block[0].w;
   }
-  if ((lobes & (SURFACE_SPECULAR | SURFACE_TRANSMISSION)) != 0u) {
+  if ((lobes & (surface_specular | surface_transmission)) != 0u) {
     r.ior = block[2].y;
     let specular = block[3].w;
     let dielectric = min(lobe_ior_f0(r.ior) * block[4].xyz, vec3f(1.0)) * specular;
     r.f0 = mix(dielectric, s.base_color, clamp(s.metallic, 0.0, 1.0));
     r.f90 = mix(specular, 1.0, clamp(s.metallic, 0.0, 1.0));
   }
-  if ((lobes & SURFACE_TRANSMISSION) != 0u) {
+  if ((lobes & surface_transmission) != 0u) {
     r.transmission = block[2].x;
     r.thickness = block[2].z * model_scale;
     r.attenuation_distance = block[2].w;
@@ -522,7 +522,7 @@ fn surface_light(s: StandardSurface, way: vec3f, radiance: vec3f) -> LightRespon
   var response = LightResponse(vec3f(0.0), vec3f(0.0));
   let signed = dot(s.normal, way);
   let nl = max(signed, 0.0);
-  let wrapping = (s.lobes & SURFACE_SUBSURFACE) != 0u && s.subsurface > 0.0;
+  let wrapping = (s.lobes & surface_subsurface) != 0u && s.subsurface > 0.0;
   if (nl <= 0.0 && !wrapping) {
     return response;
   }
@@ -533,7 +533,7 @@ fn surface_light(s: StandardSurface, way: vec3f, radiance: vec3f) -> LightRespon
     diffuse = lobe_subsurface_diffuse(signed, amount, s.subsurface_color);
     back = s.base_color * lobe_subsurface_back(way, s.normal, s.view, amount, s.subsurface_color, s.thin);
   }
-  if ((s.lobes & SURFACE_TRANSMISSION) != 0u && s.transmission > 0.0) {
+  if ((s.lobes & surface_transmission) != 0u && s.transmission > 0.0) {
     let kept = 1.0 - clamp(s.transmission, 0.0, 1.0);
     diffuse *= kept;
     back *= kept;
@@ -551,7 +551,7 @@ fn surface_light(s: StandardSurface, way: vec3f, radiance: vec3f) -> LightRespon
   var distribution = 0.0;
   var visibility = 0.0;
   let anisotropy = clamp(s.anisotropy, -1.0, 1.0);
-  if ((s.lobes & SURFACE_ANISOTROPY) != 0u && anisotropy != 0.0) {
+  if ((s.lobes & surface_anisotropy) != 0u && anisotropy != 0.0) {
     let alpha = lobe_aniso_alpha(s.roughness, anisotropy);
     distribution = lobe_aniso_distribution(nh, dot(s.tangent, half_way), dot(s.bitangent, half_way), alpha);
     visibility = lobe_aniso_visibility(nl, nv, dot(s.tangent, way), dot(s.bitangent, way), dot(s.tangent, s.view), dot(s.bitangent, s.view), alpha);
@@ -562,7 +562,7 @@ fn surface_light(s: StandardSurface, way: vec3f, radiance: vec3f) -> LightRespon
     visibility = lobe_smith_visibility(nl, nv, a2);
   }
   var fresnel = lobe_schlick(s.f0, s.f90, vh);
-  if ((s.lobes & SURFACE_IRIDESCENCE) != 0u && s.iridescence > 0.0) {
+  if ((s.lobes & surface_iridescence) != 0u && s.iridescence > 0.0) {
     let irid_f = lobe_iridescence_fresnel(1.0, max(s.iridescence_ior, 1.0001), vh, max(s.iridescence_thickness, 0.0), s.f0);
     fresnel = mix(fresnel, irid_f, clamp(s.iridescence, 0.0, 1.0));
   }
@@ -570,7 +570,7 @@ fn surface_light(s: StandardSurface, way: vec3f, radiance: vec3f) -> LightRespon
   // The layers over the base lobes take their share of the light, and add theirs.
   var layers = 1.0;
   var added = vec3f(0.0);
-  if ((s.lobes & SURFACE_SHEEN) != 0u && dot(s.sheen_color, s.sheen_color) > 0.0) {
+  if ((s.lobes & surface_sheen) != 0u && dot(s.sheen_color, s.sheen_color) > 0.0) {
     let tint = max(s.sheen_color, vec3f(0.0));
     let rough = lobe_sheen_roughness(s.sheen_roughness);
     let lobe = lobe_sheen_distribution(nh, rough) * lobe_sheen_visibility(nl, nv) * nl;
@@ -578,7 +578,7 @@ fn surface_light(s: StandardSurface, way: vec3f, radiance: vec3f) -> LightRespon
     layers = max(0.0, 1.0 - max(tint.x, max(tint.y, tint.z)) * lobe_sheen_albedo(nv, rough));
   }
   var coat = vec3f(0.0);
-  if ((s.lobes & SURFACE_COAT) != 0u && s.coat > 0.0) {
+  if ((s.lobes & surface_coat) != 0u && s.coat > 0.0) {
     let weight = clamp(s.coat, 0.0, 1.0);
     let rc = clamp(s.coat_roughness, 0.04, 1.0);
     let a2 = rc * rc * rc * rc;
@@ -655,8 +655,8 @@ fn surface_apply_orm(s: StandardSurface, orm: vec4f, enabled: f32) -> StandardSu
 }
 
 // ---- Thin-film iridescence (KHR_materials_iridescence), baked lightmaps & chromatic dispersion.
-const SURFACE_IRIDESCENCE: u32 = 64u;
-const SURFACE_LIGHTMAP: u32 = 128u;
+const surface_iridescence: u32 = 64u;
+const surface_lightmap: u32 = 128u;
 
 fn lobe_iridescence_xyz_to_srgb(xyz: vec3f) -> vec3f {
   let m = mat3x3f(
@@ -741,7 +741,7 @@ fn surface_apply_atlas(
   let authored_spec_c = max(block[4].xyz, vec3f(0.0));
 
   if (irid_params.x > 0.0) {
-    out.lobes |= SURFACE_IRIDESCENCE;
+    out.lobes |= surface_iridescence;
     out.iridescence = clamp(irid_params.x, 0.0, 1.0);
     out.iridescence_ior = max(irid_params.y, 1.0001);
     out.iridescence_thickness = max(irid_params.w, 0.0);
@@ -762,11 +762,11 @@ fn surface_apply_atlas(
   }
   if ((tile_mask & 8u) != 0u) {
     let cc = surface_read_atlas(atlas, samp, 3u, uv, false);
-    if ((out.lobes & SURFACE_COAT) == 0u) {
+    if ((out.lobes & surface_coat) == 0u) {
       out.coat = block[0].x;
       out.coat_roughness = block[0].y;
     }
-    out.lobes |= SURFACE_COAT;
+    out.lobes |= surface_coat;
     out.coat = clamp(out.coat * cc.r, 0.0, 1.0);
     out.coat_roughness = clamp(out.coat_roughness * cc.g, 0.04, 1.0);
   }
@@ -786,20 +786,20 @@ fn surface_apply_atlas(
   }
   if ((tile_mask & 32u) != 0u) {
     let sh = surface_read_atlas(atlas, samp, 5u, uv, false);
-    if ((out.lobes & SURFACE_SHEEN) == 0u) {
+    if ((out.lobes & surface_sheen) == 0u) {
       out.sheen_color = block[1].xyz;
       out.sheen_roughness = block[0].z;
     }
-    out.lobes |= SURFACE_SHEEN;
+    out.lobes |= surface_sheen;
     out.sheen_color *= sh.rgb;
     out.sheen_roughness = clamp(out.sheen_roughness * sh.a, 0.07, 1.0);
   }
   if ((tile_mask & 64u) != 0u) {
     let an = surface_read_atlas(atlas, samp, 6u, uv, false);
-    if ((out.lobes & SURFACE_ANISOTROPY) == 0u) {
+    if ((out.lobes & surface_anisotropy) == 0u) {
       out.anisotropy = block[0].w;
     }
-    out.lobes |= SURFACE_ANISOTROPY;
+    out.lobes |= surface_anisotropy;
     out.anisotropy = clamp(out.anisotropy * an.b, -1.0, 1.0);
     let dir = an.rg * 2.0 - vec2f(1.0);
     if (dot(dir, dir) > 1e-4 && dot(out.tangent, out.tangent) > 0.25 && dot(out.bitangent, out.bitangent) > 0.25) {
@@ -812,14 +812,14 @@ fn surface_apply_atlas(
   }
   if ((tile_mask & 128u) != 0u) {
     let tr = surface_read_atlas(atlas, samp, 7u, uv, false);
-    if ((out.lobes & SURFACE_TRANSMISSION) == 0u) {
+    if ((out.lobes & surface_transmission) == 0u) {
       out.transmission = block[2].x;
       out.ior = authored_ior;
       out.thickness = block[2].z * model_scale;
       out.attenuation_distance = block[2].w;
       out.attenuation_color = block[3].xyz;
     }
-    out.lobes |= SURFACE_TRANSMISSION;
+    out.lobes |= surface_transmission;
     out.transmission = clamp(out.transmission * tr.r, 0.0, 1.0);
     out.thickness *= tr.g;
   }
@@ -829,21 +829,21 @@ fn surface_apply_atlas(
     let spec_c = authored_spec_c * sp.rgb;
     let m = clamp(out.metallic, 0.0, 1.0);
     let dielectric = min(lobe_ior_f0(authored_ior) * spec_c, vec3f(1.0)) * spec_w;
-    out.lobes |= SURFACE_SPECULAR;
+    out.lobes |= surface_specular;
     out.ior = authored_ior;
     out.f0 = mix(dielectric, out.base_color, m);
     out.f90 = mix(spec_w, 1.0, m);
   }
   if ((tile_mask & 512u) != 0u) {
     let ir = surface_read_atlas(atlas, samp, 9u, uv, false);
-    out.lobes |= SURFACE_IRIDESCENCE;
+    out.lobes |= surface_iridescence;
     out.iridescence = clamp(irid_params.x * ir.r, 0.0, 1.0);
     out.iridescence_ior = max(irid_params.y, 1.0001);
     out.iridescence_thickness = mix(max(irid_params.z, 0.0), max(irid_params.w, 0.0), clamp(ir.g, 0.0, 1.0));
   }
   if ((tile_mask & 1024u) != 0u) {
     let lm = surface_read_atlas(atlas, samp, 10u, uv1, true);
-    out.lobes |= SURFACE_LIGHTMAP;
+    out.lobes |= surface_lightmap;
     out.lightmap_irradiance = lm.rgb;
     out.has_lightmap = 1.0;
   }

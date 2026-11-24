@@ -1,0 +1,19 @@
+{
+  "shader": "crystal.matgraph.json",
+  "texture": "crystal.png",
+  "color": [
+    0.85,
+    0.95,
+    1.0,
+    1.0
+  ],
+  "lighting": "lit",
+  "surface": {
+    "clearcoat": 0.85,
+    "clearcoatRoughness": 0.12,
+    "iridescence": 0.9,
+    "iridescenceIor": 1.75,
+    "iridescenceThicknessMin": 200.0,
+    "iridescenceThicknessMax": 520.0
+  }
+}

@@ -1117,9 +1117,9 @@ impl ShaderGraph {
             )?;
             writeln!(wgsl, "  s.occlusion = clamp({}, 0.0, 1.0);", out_exprs.5)?;
             writeln!(wgsl, "  let sg_coat = clamp({}, 0.0, 1.0);", out_exprs.7)?;
-            writeln!(wgsl, "  if (sg_coat > 0.0) {{ s.lobes |= SURFACE_COAT; s.coat = sg_coat; s.coat_roughness = 0.08; }}")?;
+            writeln!(wgsl, "  if (sg_coat > 0.0) {{ s.lobes |= surface_coat; s.coat = sg_coat; s.coat_roughness = 0.08; }}")?;
             writeln!(wgsl, "  let sg_irid = clamp({}, 0.0, 1.0);", out_exprs.8)?;
-            writeln!(wgsl, "  if (sg_irid > 0.0) {{ s.lobes |= SURFACE_IRIDESCENCE; s.iridescence = sg_irid; }}")?;
+            writeln!(wgsl, "  if (sg_irid > 0.0) {{ s.lobes |= surface_iridescence; s.iridescence = sg_irid; }}")?;
             writeln!(wgsl, "  let sg_vis = sun_shadow(in_v.world_pos, sg_normal, in_v.clip);")?;
             writeln!(
                 wgsl,

@@ -1,0 +1,89 @@
+// Verification suite for the Ink + Pen high-fidelity showcase & scene editor.
+// Run with `pen test-blot` inside `examples/showcase/`.
+import * as check from "pen/check"
+import * as editor from "ink/editor/scene"
+import * as events from "ink/events"
+import * as keys from "ink/input/keys"
+import * as math from "ink/math"
+import * as scene_graph from "ink/scene_graph"
+import { create, step, save, restore, populate_frame, build_camera } from "./game"
+import * as render from "ink/render"
+import * as sound from "ink/sound"
+
+entry const test_pick_gizmo_undo_redo = func () =>
+  let w0 = create ()
+  // Select node 2 (central monolith), move it via editor history, undo & redo.
+  let before = w0.nodes[1].local
+  let after = before
+  after.position := math.vec3 1.75 1.2 0.0
+  let cmd = $editor.SetPose { node_id: 2, before, after }
+  let (h1, n1) = editor.commit_command cmd w0.history w0.nodes
+  w0.history := h1
+  w0.nodes := n1
+  let moved_world = scene_graph.resolve (&w0.nodes[0..w0.nodes.length])
+  // Child crystal (index 2, id 3) must follow parent monolith X = 1.75!
+  let child_moved_x = moved_world[2].world.position.x
+  // Press Z (undo) and Y (redo) through live game step!
+  let ev_undo = #[$events.KeyDown keys.z]
+  let w1 = step w0 0.016 1280.0 720.0 (&ev_undo[0..1])
+  let undone_world = scene_graph.resolve (&w1.nodes[0..w1.nodes.length])
+  let ev_redo = #[$events.KeyDown keys.y]
+  let w2 = step w1 0.016 1280.0 720.0 (&ev_redo[0..1])
+  let redone_world = scene_graph.resolve (&w2.nodes[0..w2.nodes.length])
+  return check.report #[
+    check.near 0.001 #[1.75, 0.0, 1.75] #[child_moved_x, undone_world[2].world.position.x, redone_world[2].world.position.x],
+  ]
+
+entry const test_play_in_editor_snapshot_and_restore = func () =>
+  let w0 = create ()
+  let base_crystal_y = w0.nodes[2].local.position.y
+  let ev_play = #[$events.KeyDown keys.p]
+  let w1 = step w0 0.016 1280.0 720.0 (&ev_play[0..1])
+  let empty: #[events.Event] = #[]
+  let w2 = step w1 0.1 1280.0 720.0 (&empty[0..0])
+  let w3 = step w2 0.1 1280.0 720.0 (&empty[0..0])
+  let animated_y = w3.nodes[2].local.position.y
+  let playing_during = w3.editor_state.playing
+  let w4 = step w3 0.016 1280.0 720.0 (&ev_play[0..1])
+  let restored_y = w4.nodes[2].local.position.y
+  return check.report #[
+    check.equal #[1.0, 0.0] #[if playing_during then 1.0 else 0.0, if w4.editor_state.playing then 1.0 else 0.0],
+    check.equal #[1.0] #[if animated_y > base_crystal_y + 0.05 then 1.0 else 0.0],
+    check.near 0.0001 #[base_crystal_y] #[restored_y],
+  ]
+
+entry const test_feature_toggles_and_frame_emission = func () =>
+  let w0 = create ()
+  // Press '5' to enable TAAU temporal upscaling (0.65x scale), '2' to cycle RT 2 -> 0.
+  let evs = #[$events.KeyDown 53, $events.KeyDown 50]
+  let w1 = step w0 0.016 1280.0 720.0 (&evs[0..2])
+  let frame = render.begin_frame (render.empty_frame ())
+  let audio = sound.begin_frame (sound.empty_access ())
+  let (frame, audio) = populate_frame w1 frame audio
+  let s = frame.settings[0]
+  return check.report #[
+    check.equal #[1.0, 0.0, 1.0, 1.0] #[
+      if s.features.upscale then 1.0 else 0.0,
+      U32.to_f32 s.features.ray_tracing,
+      if s.features.ddgi then 1.0 else 0.0,
+      if s.features.oit then 1.0 else 0.0,
+    ],
+    check.near 0.001 #[0.65] #[s.render_scale],
+    // 10 scene nodes + 15 gizmo segments = 25 draws, 2 area lights, 1 PBR decal, 1 reverb zone, 1 synth.
+    check.equal #[25.0, 2.0, 1.0, 1.0, 1.0] #[
+      U32.to_f32 frame.draws.length,
+      U32.to_f32 frame.area_lights.length,
+      U32.to_f32 frame.pbr_decals.length,
+      U32.to_f32 audio.reverb_zones.length,
+      U32.to_f32 audio.synths.length,
+    ],
+  ]
+
+entry const test_save_and_restore_roundtrip = func () =>
+  let w0 = create ()
+  let evs = #[$events.KeyDown keys.e, $events.KeyDown 53, $events.KeyDown keys.left]
+  let w1 = step w0 0.05 1280.0 720.0 (&evs[0..3])
+  let saved = save w1
+  let w2 = restore (&saved[0..saved.length])
+  let saved2 = save w2
+  return check.report #[check.equal saved saved2]

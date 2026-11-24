@@ -1,0 +1,15 @@
+{
+  "shader": "lit.wgsl",
+  "color": [
+    0.42,
+    0.45,
+    0.52,
+    1.0
+  ],
+  "lighting": "lit",
+  "decals": true,
+  "surface": {
+    "clearcoat": 0.35,
+    "clearcoatRoughness": 0.25
+  }
+}

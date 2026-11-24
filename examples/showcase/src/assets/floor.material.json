@@ -1,0 +1,12 @@
+{
+  "shader": "lit.wgsl",
+  "texture": "checker.png",
+  "color": [
+    0.78,
+    0.8,
+    0.84,
+    1.0
+  ],
+  "lighting": "lit",
+  "decals": true
+}

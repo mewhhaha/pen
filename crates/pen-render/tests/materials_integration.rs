@@ -347,7 +347,7 @@ struct Corner {
   let view = normalize(scene.eye.xyz - corner.world);
   let seen = scene.view * vec4f(corner.world, 1.0);
   var s = surface_default(corner.world, normal, view, draw.color.rgb, 0.0, draw.parameters.x, corner.position, seen.z);
-  s = surface_apply_block(s, draw.surface, SURFACE_TRANSMISSION, length(draw.model[0].xyz));
+  s = surface_apply_block(s, draw.surface, surface_transmission, length(draw.model[0].xyz));
   s = surface_transmit(s);
   return vec4f(fog_apply(standard_surface(s), corner.world), draw.color.a);
 }

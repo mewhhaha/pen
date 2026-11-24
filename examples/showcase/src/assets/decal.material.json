@@ -1,0 +1,13 @@
+{
+  "shader": "lit.wgsl",
+  "texture": "decal_albedo.png",
+  "normalTexture": "decal_normal.png",
+  "ormTexture": "decal_orm.png",
+  "color": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "lighting": "lit"
+}

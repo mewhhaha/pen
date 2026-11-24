@@ -331,13 +331,13 @@ fn surface_transmit_asks_the_picture_where_the_ray_leaves_and_how_blurred() {
     let kernel = "
 fn kernel(i: u32) {
   var s = surface_default(arg3(i, 0u), normalize(arg3(i, 3u)), normalize(arg3(i, 6u)), vec3f(1.0), 0.0, arg(i, 9u), vec4f(0.0), 0.0);
-  s.lobes = select(0u, SURFACE_TRANSMISSION, arg(i, 16u) > 0.0);
+  s.lobes = select(0u, surface_transmission, arg(i, 16u) > 0.0);
   s.transmission = arg(i, 16u);
   s.ior = arg(i, 10u);
   s.thickness = arg(i, 11u);
   s.attenuation_color = arg3(i, 12u);
   s.attenuation_distance = arg(i, 15u);
-  if (arg(i, 16u) == 0.0 && arg(i, 11u) == 0.5) { s.lobes = SURFACE_TRANSMISSION; }
+  if (arg(i, 16u) == 0.0 && arg(i, 11u) == 0.5) { s.lobes = surface_transmission; }
   let t = surface_transmit(s);
   put3(i, 0u, t.behind);
 }";
@@ -417,7 +417,7 @@ fn kernel(i: u32) {
   let position = vec4f(100.0, 100.0, 0.5, 1.0);
   var plain = surface_default(world, normal, view, albedo, metallic, roughness, position, -5.0);
   var zeroed = plain;
-  zeroed.lobes = SURFACE_COAT | SURFACE_SHEEN | SURFACE_ANISOTROPY | SURFACE_TRANSMISSION | SURFACE_SUBSURFACE | SURFACE_SPECULAR;
+  zeroed.lobes = surface_coat | surface_sheen | surface_anisotropy | surface_transmission | surface_subsurface | surface_specular;
   zeroed.sheen_color = vec3f(0.0);
   zeroed.tangent = vec3f(1.0, 0.0, 0.0);
   zeroed.bitangent = vec3f(0.0, 1.0, 0.0);

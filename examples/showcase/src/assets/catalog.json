@@ -1,0 +1,24 @@
+{
+  "meshes": [
+    "box.mesh.json",
+    "sphere.mesh.json"
+  ],
+  "materials": [
+    "floor.material.json",
+    "monolith.material.json",
+    "crystal.material.json",
+    "beacon.material.json",
+    "foliage.material.json",
+    "glass_red.material.json",
+    "glass_blue.material.json",
+    "gizmo_x.material.json",
+    "gizmo_y.material.json",
+    "gizmo_z.material.json",
+    "gizmo_sel.material.json",
+    "cookie.material.json",
+    "decal.material.json"
+  ],
+  "sounds": [
+    "chime.wav"
+  ]
+}

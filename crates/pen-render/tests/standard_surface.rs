@@ -354,7 +354,7 @@ struct Corner {
   s.subsurface = draw.extra[5].y;
   s.thin = draw.extra[5].z;
   s.subsurface_color = draw.extra[6].xyz;
-  if ((lobes & SURFACE_ANISOTROPY) != 0u) {
+  if ((lobes & surface_anisotropy) != 0u) {
     s = surface_frame(s, cross(vec3f(0.0, 1.0, 0.0), normal), 1.0, draw.extra[1].w);
   }
   ${transmit}
@@ -788,7 +788,7 @@ struct Corner {
   let normal = normalize(corner.normal);
   let view = normalize(scene.eye.xyz - corner.world);
   var s = surface_default(corner.world, normal, view, vec3f(1.0), draw.parameters.x, draw.parameters.y, corner.position, 0.0);
-  s.lobes = SURFACE_ANISOTROPY;
+  s.lobes = surface_anisotropy;
   s.anisotropy = draw.parameters.z;
   s = surface_frame(s, vec3f(1.0, 0.0, 0.0), 1.0, draw.parameters.w);
   return vec4f(standard_sun(s, scene.light_direction.xyz, scene.light_color.rgb, 1.0), 1.0);

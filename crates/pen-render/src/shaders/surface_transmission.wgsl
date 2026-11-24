@@ -31,7 +31,7 @@ fn surface_sky_behind(direction: vec3f, roughness: f32) -> vec3f {
 // total internal reflection `behind` is left black.
 fn surface_transmit(s: StandardSurface) -> StandardSurface {
   var r = s;
-  if ((s.lobes & SURFACE_TRANSMISSION) == 0u || s.transmission <= 0.0) {
+  if ((s.lobes & surface_transmission) == 0u || s.transmission <= 0.0) {
     return r;
   }
   var direction = -s.view;

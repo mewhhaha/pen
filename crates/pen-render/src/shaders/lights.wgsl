@@ -187,11 +187,11 @@ fn cluster_light_sample(light: ClusterLight, world: vec3f, normal: vec3f, behind
 }
 
 // ---- Linearly Transformed Cosines (LTC) Area Lights via @group(2) @binding(7).
-const AREA_MAX_LIGHTS: u32 = 64u;
-const AREA_MAT_OFFSET: u32 = 320u;
-const AREA_AMP_OFFSET: u32 = 4416u;
-const AREA_PI: f32 = 3.14159265359;
-const AREA_OCTAGON_SCALE: f32 = 1.0539073;
+const area_max_lights: u32 = 64u;
+const area_mat_offset: u32 = 320u;
+const area_amp_offset: u32 = 4416u;
+const area_pi: f32 = 3.14159265359;
+const area_octagon_scale: f32 = 1.0539073;
 
 fn area_sample_lut(base_offset: u32, rough: f32, q: f32) -> vec4f {
   let fx = clamp(rough, 0.0, 1.0) * 63.0;
@@ -217,7 +217,7 @@ fn area_integrate_edge(v1: vec3f, v2: vec3f) -> vec3f {
   }
   let cos_t = clamp(dot(v1, v2), -1.0, 1.0);
   let theta = atan2(sin_t, cos_t);
-  return c * (theta / (2.0 * AREA_PI * sin_t));
+  return c * (theta / (2.0 * area_pi * sin_t));
 }
 
 fn area_eval_quad(p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f) -> f32 {
@@ -279,24 +279,24 @@ fn area_basis(n: vec3f, v: vec3f) -> mat3x3f {
   return transpose(mat3x3f(t1, t2, n));
 }
 
-const AREA_COOKIE_OFFSET: u32 = 8512u;
-const AREA_COOKIE_DIM: u32 = 32u;
-const AREA_COOKIE_TEXELS: u32 = 1024u;
-const AREA_MAX_COOKIES: u32 = 8u;
+const area_cookie_offset: u32 = 8512u;
+const area_cookie_dim: u32 = 32u;
+const area_cookie_texels: u32 = 1024u;
+const area_max_cookies: u32 = 8u;
 
 fn area_sample_cookie(slot: u32, uv: vec2f) -> vec3f {
-  let c = clamp(uv, vec2f(0.0), vec2f(1.0)) * f32(AREA_COOKIE_DIM - 1u);
+  let c = clamp(uv, vec2f(0.0), vec2f(1.0)) * f32(area_cookie_dim - 1u);
   let x0 = u32(floor(c.x));
   let y0 = u32(floor(c.y));
-  let x1 = min(x0 + 1u, AREA_COOKIE_DIM - 1u);
-  let y1 = min(y0 + 1u, AREA_COOKIE_DIM - 1u);
+  let x1 = min(x0 + 1u, area_cookie_dim - 1u);
+  let y1 = min(y0 + 1u, area_cookie_dim - 1u);
   let fx = c.x - f32(x0);
   let fy = c.y - f32(y0);
-  let base = AREA_COOKIE_OFFSET + min(slot, AREA_MAX_COOKIES - 1u) * AREA_COOKIE_TEXELS;
-  let t00 = area_light_data[base + y0 * AREA_COOKIE_DIM + x0].rgb;
-  let t10 = area_light_data[base + y0 * AREA_COOKIE_DIM + x1].rgb;
-  let t01 = area_light_data[base + y1 * AREA_COOKIE_DIM + x0].rgb;
-  let t11 = area_light_data[base + y1 * AREA_COOKIE_DIM + x1].rgb;
+  let base = area_cookie_offset + min(slot, area_max_cookies - 1u) * area_cookie_texels;
+  let t00 = area_light_data[base + y0 * area_cookie_dim + x0].rgb;
+  let t10 = area_light_data[base + y0 * area_cookie_dim + x1].rgb;
+  let t01 = area_light_data[base + y1 * area_cookie_dim + x0].rgb;
+  let t11 = area_light_data[base + y1 * area_cookie_dim + x1].rgb;
   return mix(mix(t00, t10, fx), mix(t01, t11, fx), fy);
 }
 
@@ -333,7 +333,7 @@ fn clustered_area_lights_surface(
   coat_normal: vec3f,
   sheen_tint: vec3f,
 ) -> vec3f {
-  let count = min(u32(max(cluster_grid.options.y, 0.0) + 0.5), AREA_MAX_LIGHTS);
+  let count = min(u32(max(cluster_grid.options.y, 0.0) + 0.5), area_max_lights);
   if (count == 0u) {
     return vec3f(0.0);
   }
@@ -342,8 +342,8 @@ fn clustered_area_lights_surface(
   let ndotv = clamp(dot(n, v), 0.0, 1.0);
   let rough = clamp(roughness, 0.04, 1.0);
   let q = sqrt(max(1.0 - ndotv, 0.0));
-  let t1 = area_sample_lut(AREA_MAT_OFFSET, rough, q);
-  let t2 = area_sample_lut(AREA_AMP_OFFSET, rough, q);
+  let t1 = area_sample_lut(area_mat_offset, rough, q);
+  let t2 = area_sample_lut(area_amp_offset, rough, q);
   let minv = mat3x3f(
     vec3f(t1.x, 0.0, t1.y),
     vec3f(0.0, 1.0, 0.0),
@@ -363,8 +363,8 @@ fn clustered_area_lights_surface(
     let cndv = clamp(dot(cn, v), 0.0, 1.0);
     let cq = sqrt(max(1.0 - cndv, 0.0));
     let cr = clamp(coat_roughness, 0.04, 1.0);
-    let ct1 = area_sample_lut(AREA_MAT_OFFSET, cr, cq);
-    let ct2 = area_sample_lut(AREA_AMP_OFFSET, cr, cq);
+    let ct1 = area_sample_lut(area_mat_offset, cr, cq);
+    let ct2 = area_sample_lut(area_amp_offset, cr, cq);
     let cminv = mat3x3f(
       vec3f(ct1.x, 0.0, ct1.y),
       vec3f(0.0, 1.0, 0.0),
@@ -490,7 +490,7 @@ fn clustered_area_lights_surface(
         coat_form = area_eval_quad(coat_xf * q0, coat_xf * q1, coat_xf * q2, coat_xf * q3);
       }
     } else if (kind == 1u) {
-      let rad = max(right_ext.w, 1e-4) * AREA_OCTAGON_SCALE;
+      let rad = max(right_ext.w, 1e-4) * area_octagon_scale;
       let d = rad * 0.70710678;
       let c0 = center + right * rad - world;
       let c1 = center + right * d + up * d - world;

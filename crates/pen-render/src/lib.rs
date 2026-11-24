@@ -49,7 +49,7 @@ pub use filter::ColorFilter;
 pub use inspect::{TextureInfo, inspect_material, inspect_mesh, inspect_texture, shader_draws_sprites};
 pub use lights::LIGHTS_WGSL;
 pub use prefetch::Prefetch;
-pub use volume::{VolumeImage, VolumeLayer};
+pub use volume::{TRANSLUCENCY_WGSL, VolumeImage, VolumeLayer};
 
 /// WGSL a sprite shader adds to draw text from a multi-channel signed
 /// distance field atlas (pen-texture's `msdf`), crisp at any scale:
@@ -144,15 +144,19 @@ pub struct RenderStats {
 }
 
 /// How long the GPU took over a frame's passes, in milliseconds: the shadow
-/// maps, culling instances, the mist's froxel volume, the scene, the passes after
-/// it, and sprites and insets; and the whole frame, from its first pass's start
-/// to its last's end.
+/// maps, culling instances, the mist's froxel volume, the scene, the opaque
+/// picture's passes (sky, mist, ambient occlusion, depth and the chain of
+/// levels translucent surfaces read; in frames that have such surfaces,
+/// particles or overlays, else they count as `post`), the passes after it, and
+/// sprites and insets; and the whole frame, from its first pass's start to its
+/// last's end.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GpuTimes {
     pub shadow: f32,
     pub culling: f32,
     pub volume: f32,
     pub scene: f32,
+    pub opaque: f32,
     pub post: f32,
     pub overlay: f32,
     pub total: f32,

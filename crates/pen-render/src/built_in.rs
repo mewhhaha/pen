@@ -34,11 +34,18 @@ pub(crate) enum BuiltIn {
         samples: u32,
         additive: bool,
     },
+    /// The nearest depth of each pixel of a scene of this many samples, for
+    /// the translucent surfaces to read.
+    OpaqueDepth(u32),
+    /// A level of the opaque picture's chain from the one above.
+    OpaqueMip,
+    /// The opaque picture laid into every sample of the translucent pass.
+    Backdrop(u32),
 }
 
 impl BuiltIn {
     /// Every one a frame drawn with `samples` per pixel may draw with.
-    pub fn all(samples: u32) -> [BuiltIn; 10] {
+    pub fn all(samples: u32) -> [BuiltIn; 13] {
         [
             BuiltIn::Occlusion(samples),
             BuiltIn::Atmosphere(samples),
@@ -50,6 +57,9 @@ impl BuiltIn {
             BuiltIn::Decal { samples, paint: true },
             BuiltIn::Decal { samples, paint: false },
             BuiltIn::Composite,
+            BuiltIn::OpaqueDepth(samples),
+            BuiltIn::OpaqueMip,
+            BuiltIn::Backdrop(samples),
         ]
     }
 
@@ -59,6 +69,7 @@ impl BuiltIn {
             BuiltIn::Decal { samples, paint } => crate::decals::pipeline(context, samples, paint),
             BuiltIn::Composite => crate::renderer::composite_pipeline(context),
             BuiltIn::Particles { samples, additive } => crate::renderer::particle_pipeline(context, samples, additive),
+            BuiltIn::Backdrop(samples) => crate::post::backdrop_pipeline(context, samples),
             _ => crate::post::pipeline(context, self),
         };
         log::debug!("{self:?} pipeline: {:.2} ms", clock.now() * 1000.0);

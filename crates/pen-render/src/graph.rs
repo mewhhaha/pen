@@ -315,17 +315,20 @@ pub(crate) struct Graph {
 }
 
 impl Graph {
-    /// Encodes every pass, the last ones onto `output`, each timed as one
-    /// of the passes after the scene where `timer` times the frame. The
-    /// present pass has `late` at group 1, which changes from frame to frame
-    /// (the grade's tables); a hook is given its texture and the encoder.
+    /// Encodes every pass, the last ones onto `output` (a graph that draws only
+    /// into textures has none), each timed as one pass of `span` where `timer`
+    /// times the frame. The present pass has `late` at group 1, which changes
+    /// from frame to frame (the grade's tables); a hook is given its texture
+    /// and the encoder.
+    #[allow(clippy::too_many_arguments, reason = "what a frame gives each pass")]
     pub fn execute(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         built_ins: &mut BuiltIns,
-        output: &wgpu::TextureView,
+        output: Option<&wgpu::TextureView>,
         timer: &GpuTimer,
-        late: &wgpu::BindGroup,
+        span: Span,
+        late: Option<&wgpu::BindGroup>,
         hook: &mut dyn FnMut(&wgpu::TextureView, &mut wgpu::CommandEncoder),
     ) {
         for pass in &self.passes {
@@ -335,9 +338,9 @@ impl Graph {
             };
             let mut drawing = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(pass.name),
-                timestamp_writes: timer.pass(Span::Post),
+                timestamp_writes: timer.pass(span),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: pass.target.as_ref().unwrap_or(output),
+                    view: pass.target.as_ref().or(output).expect("a pass that draws into the output has one"),
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -349,7 +352,7 @@ impl Graph {
             });
             drawing.set_pipeline(built_ins.get(which));
             drawing.set_bind_group(0, group, &[]);
-            if matches!(which, BuiltIn::Present(_)) {
+            if let (BuiltIn::Present(_), Some(late)) = (which, late) {
                 drawing.set_bind_group(1, late, &[]);
             }
             drawing.draw(0..3, 0..1);

@@ -343,15 +343,27 @@ impl State {
         // Screen-space reflections read the history and the noise of TAA.
         let quality =
             pen_protocol::Quality { msaa: samples, scale, taa: frame.quality.taa || reflected > 0, ..frame.quality };
-        let volume = self.volumetrics.prepare(&self.context, frame, &quality, target.size());
-        let targets = self.post.as_mut().unwrap().begin(&mut self.built_ins, frame, quality, target.size(), &volume);
+        // Translucent surfaces, particles and overlays draw after the opaque
+        // picture is misted, in a pass of their own; a frame without them draws
+        // the scene as one picture.
+        let translucent =
+            !scratch.translucent.is_empty() || !scratch.overlays.is_empty() || !scratch.emitters.is_empty();
+        let volume = self.volumetrics.prepare(&self.context, frame, &quality, target.size(), translucent);
+        let targets =
+            self.post.as_mut().unwrap().begin(&mut self.built_ins, frame, quality, target.size(), &volume, translucent);
         // With TAA the scene draws through a projection jittered within its
         // pixels: the scene uniform's, after its view.
-        if let Some(projection) = self.post.as_ref().unwrap().jittered() {
+        let jittered = self.post.as_ref().unwrap().jittered();
+        if let Some(projection) = jittered {
             self.queue.write_buffer(&self.scene_uniform, 64, bytemuck::cast_slice(&projection));
         }
+        self.volumetrics.set_projection(&frame.view, &jittered.unwrap_or(frame.projection));
         self.prepare_screen(reflected);
         self.prepare_contact(frame, targets.size, reflected > 0);
+        if let Some(opaque) = &targets.opaque {
+            self.bind_translucent(opaque, &volume);
+        }
+        self.bind_particles(&volume, &mut scratch.emitters);
         self.write_screen(frame, reflected);
         self.clusters.update(
             &self.device,
@@ -437,13 +449,18 @@ impl State {
         let filtered =
             self.filter.begin(&device, &self.queue, format, self.context.cache.get(), (output_width, output_height));
         let output = filtered.as_ref().unwrap_or(&screen).clone();
-        // Opaque surfaces, then any decals over them, then translucent ones
-        // and overlays; without decals, all in one pass.
+        // Opaque surfaces, then any decals over them. A frame with translucent
+        // surfaces, particles or overlays then has its opaque picture misted, and
+        // draws those over it in a second pass, with the mist and the opaque
+        // picture to read.
         let layered = !scratch.decals.is_empty();
         let scene_group = &self.scene_group.as_ref().unwrap().0;
         let lights = self.clusters.group();
-        let draw_layers = |pass: &mut wgpu::RenderPass<'_>, layers: &[(&[usize], Layer)], stats: &mut RenderStats| {
-            pass.set_bind_group(0, scene_group, &[]);
+        let draw_layers = |pass: &mut wgpu::RenderPass<'_>,
+                           group: &wgpu::BindGroup,
+                           layers: &[(&[usize], Layer)],
+                           stats: &mut RenderStats| {
+            pass.set_bind_group(0, group, &[]);
             pass.set_bind_group(2, lights, &[]);
             pass.set_blend_constant(wgpu::Color {
                 r: OCCLUDED_STRENGTH,
@@ -475,16 +492,12 @@ impl State {
                 }
             }
         };
-        let later: [(&[usize], Layer); 3] = [
-            (&scratch.translucent, Layer::Translucent),
-            (&scratch.overlays, Layer::Occluded),
-            (&scratch.overlays, Layer::Visible),
-        ];
+        // The clear colour is what the sky and the mist take back out of the resolved
+        // scene where no surface was; its alpha 1 is what surfaces draw 0 over.
         let clear = wgpu::Color {
             r: f64::from(frame.clear.r),
             g: f64::from(frame.clear.g),
             b: f64::from(frame.clear.b),
-            // Scene alpha stores the remaining background, independently of frame alpha.
             a: 1.0,
         };
         {
@@ -499,46 +512,41 @@ impl State {
                 }),
                 ..Default::default()
             });
-            let opaque: (&[usize], Layer) = (&scratch.opaque, Layer::Opaque);
-            // Particles come after the translucent surfaces, before overlays.
-            if layered {
-                draw_layers(&mut first, &[opaque], &mut stats);
-            } else {
-                draw_layers(&mut first, &[opaque, later[0]], &mut stats);
-                particles::draw(&mut first, &scratch.emitters);
-                draw_layers(&mut first, &later[1..], &mut stats);
-            }
+            draw_layers(&mut first, scene_group, &[(&scratch.opaque, Layer::Opaque)], &mut stats);
         }
         if layered {
             let decals = self.decals.get_or_insert_with(|| Decals::new(&device));
-            {
-                let mut decal_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("decals"),
-                    color_attachments: &[Some(targets.color(clear, false, false))],
-                    timestamp_writes: self.timer.pass(Span::Scene),
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &targets.depth,
-                        depth_ops: None,
-                        stencil_ops: None,
-                    }),
-                    ..Default::default()
-                });
-                decals.draw(
-                    &device,
-                    &self.queue,
-                    &mut self.built_ins,
-                    &mut decal_pass,
-                    frame,
-                    &scratch.decals,
-                    &scratch.decal_order,
-                    &targets.depth_only,
-                    samples,
-                    targets.size,
-                );
-            }
-            let mut last = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene over decals"),
+            let mut decal_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("decals"),
                 color_attachments: &[Some(targets.color(clear, false, true))],
+                timestamp_writes: self.timer.pass(Span::Scene),
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &targets.depth,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            decals.draw(
+                &device,
+                &self.queue,
+                &mut self.built_ins,
+                &mut decal_pass,
+                frame,
+                &scratch.decals,
+                &scratch.decal_order,
+                &targets.depth_only,
+                samples,
+                targets.size,
+            );
+        }
+        if targets.opaque.is_some() {
+            let post = self.post.as_mut().unwrap();
+            post.opaque(&mut self.built_ins, &mut encoder, frame, &self.timer);
+            let group = &self.translucent_group.as_ref().expect("a translucent frame binds its own scene").0;
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("translucent"),
+                color_attachments: &[Some(targets.translucent_color())],
                 timestamp_writes: self.timer.pass(Span::Scene),
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &targets.depth,
@@ -547,9 +555,11 @@ impl State {
                 }),
                 ..Default::default()
             });
-            draw_layers(&mut last, &later[..1], &mut stats);
-            particles::draw(&mut last, &scratch.emitters);
-            draw_layers(&mut last, &later[1..], &mut stats);
+            post.draw_backdrop(&mut self.built_ins, &mut pass);
+            draw_layers(&mut pass, group, &[(&scratch.translucent, Layer::Translucent)], &mut stats);
+            particles::draw(&mut pass, &scratch.emitters);
+            let overlays = [(&scratch.overlays[..], Layer::Occluded), (&scratch.overlays[..], Layer::Visible)];
+            draw_layers(&mut pass, group, &overlays, &mut stats);
         }
         let has_filters = scratch.sprites.iter().any(|batch| batch.scene_filter);
         if has_filters {

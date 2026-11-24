@@ -245,6 +245,12 @@ struct Shadows {
     contact_frames: u64,
     /// A picture of one texel to bind where there is no last frame to read.
     blank: wgpu::TextureView,
+    /// What a scene group binds at 14 to 17 where no translucent pass reads
+    /// them: the picture above, a depth and a volume of one texel, and a block
+    /// of zeros, whose flags say there is no picture and no mist.
+    blank_depth: wgpu::TextureView,
+    blank_volume: wgpu::TextureView,
+    no_fog: wgpu::Buffer,
     /// The local lights' map faces, and what each holds.
     local: Option<shadows::LocalMaps>,
 }
@@ -592,8 +598,11 @@ pub(crate) struct State {
     // Where frames for an HDR surface that needs decoding draw, shared with
     // the renderers drawing over this one's frames.
     screen: crate::display::SharedScreen,
-    // The scene's bind group, and the maps, the layer and the contact depth it binds.
+    // The scene's bind group, and the maps, the layer and the contact depth it binds;
+    // and the translucent pass's, which binds the opaque picture and the mist as well
+    // where the other holds stand-ins.
     scene_group: Option<(wgpu::BindGroup, shadows::SceneKey)>,
+    translucent_group: Option<(wgpu::BindGroup, shadows::SceneKey)>,
     // Last frame's resolved picture, which screen-space reflections read, the
     // view-projection it was seen through and which frame it is for; and this
     // frame's capture of a reflection probe.
@@ -765,6 +774,49 @@ impl State {
                     },
                     count: None,
                 },
+                // What translucent surfaces read (translucency.wgsl): the opaque
+                // picture with its chain of levels, its nearest depth, the froxel
+                // volume and the fog's block. Stand-ins where there is no such pass.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 17,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(crate::volume::UNIFORM_BYTES),
+                    },
+                    count: None,
+                },
             ],
         });
         let texture_entry = |binding: u32, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
@@ -917,6 +969,7 @@ impl State {
             capture_uniforms: Vec::new(),
             screen,
             scene_group: None,
+            translucent_group: None,
             reflected: None,
             capture: None,
             cascades: ([Cascade::NONE; MAX_CASCADES], 0),

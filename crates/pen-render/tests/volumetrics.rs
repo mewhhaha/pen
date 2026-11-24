@@ -1268,11 +1268,9 @@ fn the_volumes_gpu_time_by_tier() {
         let mut total = 0.0;
         for index in 0..60 {
             rig.draw(&frame);
-            if index >= 30 {
-                if let Some(gpu) = rig.renderer.stats().gpu {
-                    best = best.max(gpu.volume);
-                    total = gpu.total;
-                }
+            if let Some(gpu) = rig.renderer.stats().gpu.filter(|_| index >= 30) {
+                best = best.max(gpu.volume);
+                total = gpu.total;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -1294,7 +1292,7 @@ fn noise_hash(x: u32, y: u32, z: u32, seed: u32) -> u32 {
 }
 
 fn value3(seed: u32, p: V3) -> f64 {
-    let cell = |v: f64| v.floor() as i32 as u32;
+    let cell = |v: f64| (v.floor() as i32).cast_unsigned();
     let fade = |t: f64| t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
     let (xi, yi, zi) = (cell(p[0]), cell(p[1]), cell(p[2]));
     let (u, v, w) = (fade(p[0] - p[0].floor()), fade(p[1] - p[1].floor()), fade(p[2] - p[2].floor()));

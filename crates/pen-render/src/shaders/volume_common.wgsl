@@ -27,6 +27,31 @@ struct Volume {
   drift: vec4f,
   // rgb: the sky's mean light; w: 1 while the volume is drawn this frame.
   ambient: vec4f,
+  // What `fog_apply` (translucency.wgsl) takes beyond the above to fog a surface at
+  // its own depth the way the atmosphere pass fogs the opaque ones; the volume's own
+  // passes and the atmosphere pass ignore it. The scene's view-projection, jittered
+  // as the draws are.
+  clip: mat4x4f,
+  // Elements 10, 14, 11 and 15 of the scene's projection: a depth buffer value's
+  // distance ahead of the eye.
+  depth: vec4f,
+  // x: 1 in a translucent pass, which reads the opaque picture; y: 1 when
+  // `fog_apply` fogs (a mist, a volume or clouds in the frame).
+  flags: vec4f,
+  // xyz: the eye; w: 1 with a sky.
+  camera: vec4f,
+  // The sky's colours (zenith.w: its stars' brightness), the sun's direction, its
+  // light and the clear colour, as the atmosphere pass has them.
+  zenith: vec4f,
+  horizon: vec4f,
+  ground: vec4f,
+  sun: vec4f,
+  sun_color: vec4f,
+  clear: vec4f,
+  // x: the mist's radius, y: its density, z: its scale height.
+  fog: vec4f,
+  // x: how much of the sky the clouds cover; yz: how far the wind carried them.
+  clouds: vec4f,
 };
 
 // A boundary of the grid, in slices from the eye (0 to the slice count), as a

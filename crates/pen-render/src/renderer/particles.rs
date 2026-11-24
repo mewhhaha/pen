@@ -81,9 +81,12 @@ pub(crate) fn living(emitter: &Emitter) -> Option<Living> {
 pub(crate) fn pipeline(context: &PipelineContext, samples: u32, additive: bool) -> wgpu::RenderPipeline {
     use wgpu::{BlendComponent, BlendFactor, BlendOperation};
     let device = &context.device;
+    let code = QUADS
+        .replace("${translucency}", crate::volume::TRANSLUCENCY_WGSL)
+        .replace("${additive}", if additive { "true" } else { "false" });
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("particles"),
-        source: wgpu::ShaderSource::Wgsl(QUADS.into()),
+        source: wgpu::ShaderSource::Wgsl(code.into()),
     });
     let color = BlendComponent {
         src_factor: BlendFactor::One,
@@ -118,7 +121,7 @@ pub(crate) fn pipeline(context: &PipelineContext, samples: u32, additive: bool) 
                     color,
                     alpha: BlendComponent {
                         src_factor: BlendFactor::Zero,
-                        dst_factor: color.dst_factor,
+                        dst_factor: BlendFactor::One,
                         operation: BlendOperation::Add,
                     },
                 }),
@@ -130,11 +133,13 @@ pub(crate) fn pipeline(context: &PipelineContext, samples: u32, additive: bool) 
     })
 }
 
-/// An emitter ready to draw: its pipeline, its bind group (the view, the
-/// particles and its shape) and its slots among the frame's particles.
+/// An emitter ready to draw: its pipeline, its shape, its bind group (the
+/// view, the particles, its shape and the mist; made once the frame's volume
+/// is known) and its slots among the frame's particles.
 pub(crate) struct Ready {
     pipeline: wgpu::RenderPipeline,
-    group: wgpu::BindGroup,
+    shape: Option<wgpu::TextureView>,
+    group: Option<wgpu::BindGroup>,
     first: u32,
     count: u32,
 }
@@ -202,7 +207,7 @@ impl Particles {
 pub(super) fn draw(pass: &mut wgpu::RenderPass<'_>, emitters: &[Ready]) {
     for emitter in emitters {
         pass.set_pipeline(&emitter.pipeline);
-        pass.set_bind_group(0, &emitter.group, &[]);
+        pass.set_bind_group(0, emitter.group.as_ref().expect("an emitter is bound before it draws"), &[]);
         pass.draw(0..6, emitter.first..emitter.first + emitter.count);
     }
 }
@@ -335,26 +340,41 @@ impl State {
             ],
         }));
         particles.total = total;
-        for (which, texture, first, count) in placed {
+        for (which, shape, first, count) in placed {
             let pipeline = self.built_ins.get(which).clone();
-            let particles = self.particles.as_ref().unwrap();
-            let shape = texture.as_ref().unwrap_or(&particles.dot);
-            let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            scratch.emitters.push(Ready { pipeline, shape, group: None, first, count });
+        }
+        Ok(())
+    }
+
+    /// Binds the frame's emitters to what their shaders read: the view, their
+    /// particles, their shapes, and the mist between them and the eye.
+    pub(super) fn bind_particles(&self, volume: &crate::volume::Applied, emitters: &mut [Ready]) {
+        let Some(particles) = &self.particles else { return };
+        for emitter in emitters {
+            let shape = emitter.shape.as_ref().unwrap_or(&particles.dot);
+            let bytes = u64::from(particles.total) * PARTICLE_BYTES;
+            emitter.group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("particle quads"),
-                layout: &pipeline.get_bind_group_layout(0),
+                layout: &emitter.pipeline.get_bind_group_layout(0),
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: particles.view.as_entire_binding() },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: binding(particles.particles.as_ref().unwrap(), particle_bytes),
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: particles.particles.as_ref().unwrap(),
+                            offset: 0,
+                            size: wgpu::BufferSize::new(bytes),
+                        }),
                     },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(shape) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&particles.sampler) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::Sampler(&particles.sampler) },
+                    wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(&volume.texture) },
+                    wgpu::BindGroupEntry { binding: 17, resource: volume.uniform.as_entire_binding() },
                 ],
-            });
-            scratch.emitters.push(Ready { pipeline, group, first, count });
+            }));
         }
-        Ok(())
     }
 }
 

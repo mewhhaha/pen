@@ -23,7 +23,11 @@ pub(crate) enum Span {
     Volume,
     /// The scene's passes: opaque surfaces, decals, translucent ones and overlays.
     Scene,
-    /// The passes after the scene: occlusion, sky and fog, bloom, present.
+    /// The opaque picture of a frame with translucent surfaces: occlusion, sky and
+    /// fog, the nearest depth and the chain of levels they read.
+    Opaque,
+    /// The passes after the scene: occlusion, sky and fog (without translucent
+    /// surfaces), bloom, present.
     Post,
     /// Sprites and insets over the output.
     Overlay,
@@ -202,6 +206,7 @@ fn times(spans: &[Span], ticks: &[u64], period: f64) -> GpuTimes {
             Span::Culling => times.culling += taken,
             Span::Volume => times.volume += taken,
             Span::Scene => times.scene += taken,
+            Span::Opaque => times.opaque += taken,
             Span::Post => times.post += taken,
             Span::Overlay => times.overlay += taken,
         }
@@ -227,6 +232,7 @@ mod tests {
         assert_eq!(times.overlay, 0.0);
         assert_eq!(times.culling, 0.0);
         assert_eq!(times.volume, 0.0);
+        assert_eq!(times.opaque, 0.0);
         assert_eq!(times.total, 4.0);
     }
 }

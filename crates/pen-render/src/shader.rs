@@ -455,8 +455,11 @@ pub(crate) fn pipelines(
             if !variants.contains(variant) {
                 return None;
             }
-            // Scene alpha tracks the remaining clear color. Insets retain their
-            // authored alpha for coverage when composited over the finished frame.
+            // Opaque surfaces draw alpha 0 over the 1 the scene clears to, so that alpha
+            // is the share of the sky: what a reflection probe's capture fills in
+            // (probe_finalise.wgsl). Surfaces drawn over the picture (translucent
+            // ones, overlays) leave the alpha it has. Insets retain their authored
+            // alpha for coverage when composited over the finished frame.
             let blending = if variant == Variants::INSET || variant == Variants::INSET_PERSISTENT {
                 None
             } else if variant == Variants::INSET_BLENDED {
@@ -466,7 +469,7 @@ pub(crate) fn pipelines(
                     color: blend.unwrap_or(wgpu::BlendComponent::REPLACE),
                     alpha: wgpu::BlendComponent {
                         src_factor: BlendFactor::Zero,
-                        dst_factor: blend.map_or(BlendFactor::Zero, |component| component.dst_factor),
+                        dst_factor: if blend.is_some() { BlendFactor::One } else { BlendFactor::Zero },
                         operation: BlendOperation::Add,
                     },
                 })

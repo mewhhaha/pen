@@ -30,6 +30,14 @@ const ATMOSPHERE_COMMON: &str = include_str!("shaders/atmosphere_common.wgsl");
 /// volume and the atmosphere pass that applies it share.
 pub(crate) const COMMON_WGSL: &str = COMMON;
 
+/// WGSL a material shader adds to read what lies behind a translucent surface
+/// and to fog it at its own depth (translucency.wgsl): bindings 14 to 17 of
+/// group 0 and `opaque_available`, `opaque_screen_uv`, `opaque_world_uv`,
+/// `opaque_behind`, `opaque_levels`, `opaque_depth_at`, `fog_apply` and, for
+/// light that only adds, `fog_terms`. It needs the filtering `sky_sampler` of
+/// binding 6, which `ENVIRONMENT_WGSL` declares.
+pub const TRANSLUCENCY_WGSL: &str = include_str!("shaders/translucency.wgsl");
+
 /// The scene uniform as the volume's injection declares it.
 const SCENE: &str = "struct Scene {
   view: mat4x4f, projection: mat4x4f, ambient: vec4f, light_direction: vec4f, light_color: vec4f,
@@ -50,8 +58,16 @@ pub(crate) const KNEE_DIVISOR: f64 = 64.0;
 /// The most local fog volumes a frame publishes (the wire's MAX_FOG_VOLUMES).
 const MAX_LOCAL: usize = pen_protocol::boundary::MAX_FOG_VOLUMES;
 
-const UNIFORM_FLOATS: usize = 68;
-const UNIFORM_BYTES: u64 = UNIFORM_FLOATS as u64 * 4;
+/// The uniform's floats: `Volume`'s of volume_common.wgsl, 68 of them, then the
+/// 60 that fog a translucent surface at its own depth (the scene's projection,
+/// the eye, the sky, the sun, the clouds).
+const UNIFORM_FLOATS: usize = 128;
+/// Where the scene's jittered view-projection and depth terms go, which the
+/// frame knows once TAA has jittered it.
+const PROJECTION_AT: usize = 68;
+/// What the fog block is, in bytes: the uniform that scene bind groups bind at
+/// binding 17.
+pub(crate) const UNIFORM_BYTES: u64 = UNIFORM_FLOATS as u64 * 4;
 const LOCAL_BYTES: u64 = (MAX_LOCAL * 64) as u64;
 
 /// The weight of the history in the temporal blend of a froxel that holds.
@@ -385,6 +401,7 @@ impl Volumetrics {
         frame: &RenderFrame,
         quality: &Quality,
         size: (u32, u32),
+        translucent: bool,
     ) -> Applied {
         let tier = wanted(frame, quality.volumetrics);
         self.drawing = tier.is_some();
@@ -471,8 +488,27 @@ impl Volumetrics {
             sh.z * 0.282_094_8,
             if tier.is_some() { 1.0 } else { 0.0 },
         ]);
+        // What `fog_apply` takes beyond the volume: the atmosphere pass's own
+        // camera, sky, sun, clear colour, mist and clouds. The projection comes
+        // later (`set_projection`), jittered.
+        let atmosphere = atmosphere_of(frame, &frame.projection, quality, size.0, size.1);
+        let misted = frame.fog.density > 0.0 || tier.is_some() || frame.clouds.cover > 0.0;
+        data[88..92].copy_from_slice(&[if translucent { 1.0 } else { 0.0 }, if misted { 1.0 } else { 0.0 }, 0.0, 0.0]);
+        data[92..120].copy_from_slice(&atmosphere[16..44]);
+        data[120..123].copy_from_slice(&atmosphere[44..47]);
+        data[124..128].copy_from_slice(&atmosphere[52..56]);
         self.queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&data));
         Applied { serial, texture, uniform: self.uniform.clone() }
+    }
+
+    /// The projection the scene draws this frame with (jittered when TAA is
+    /// on), which translucent surfaces find their place in the opaque picture
+    /// by and read its depth through.
+    pub fn set_projection(&self, view: &Matrix, projection: &Matrix) {
+        let mut data = [0.0f32; 20];
+        data[..16].copy_from_slice(&multiply(projection, view));
+        data[16..].copy_from_slice(&[projection[10], projection[14], projection[11], projection[15]]);
+        self.queue.write_buffer(&self.uniform, (PROJECTION_AT * 4) as u64, bytemuck::cast_slice(&data));
     }
 
     fn upload_local(&self, frame: &RenderFrame) {

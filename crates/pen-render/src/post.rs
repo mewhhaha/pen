@@ -10,6 +10,19 @@
 // render graph (graph.rs), made again when the targets' size or the passes
 // change.
 //
+// A frame with translucent surfaces, particles or overlays splits that graph
+// in two round a second pass over the scene's targets. What the scene drew
+// until then, the opaque surfaces and their decals, is resolved, and the sky,
+// the occlusion and the mist are applied to that alone (the opaque picture,
+// level 0 of a chain of blurred levels, and the nearest depth of each of its
+// pixels). The translucent pass then starts from that picture, written into
+// every sample (the `backdrop`), under the same depth, and draws the
+// translucent surfaces, the particles and the overlays, which mist
+// themselves at their own depth (translucency.wgsl) and read the opaque
+// picture. The passes that follow (TAA, the metering, the bloom, the present
+// pass) read what it resolved to. A frame without any of them draws the one
+// graph, as it always has.
+//
 // `${...}` in the WGSL marks where a value is put in.
 use std::collections::HashMap;
 
@@ -21,7 +34,7 @@ use crate::grade::{self, Lut};
 use crate::graph::{Binding, Graph, GraphBuilder, Handle, Spec, Target};
 use crate::matrix::{invert, multiply};
 use crate::packed_texture::level_size;
-use crate::renderer::GpuTimer;
+use crate::renderer::{GpuTimer, Span};
 use crate::shader::PipelineContext;
 
 /// The scene's format: floating point, so its light can go past white.
@@ -89,6 +102,26 @@ pub(crate) fn occlusion_shader(samples: u32) -> String {
         .replace("${depth_texture}", depth_texture(samples))
         .replace("${fullscreen}", FULLSCREEN)
         .replace("${kernel}", &kernel())
+}
+
+// The opaque scene's nearest depth to read from the translucent pass, its
+// picture's chain of levels, and the picture written into the translucent
+// pass's samples.
+const OPAQUE_DEPTH_SHADER: &str = include_str!("shaders/opaque_depth.wgsl");
+
+pub(crate) fn opaque_depth_shader(samples: u32) -> String {
+    OPAQUE_DEPTH_SHADER
+        .replace("${depth_texture}", depth_texture(samples))
+        .replace("${fullscreen}", FULLSCREEN)
+        .replace("${samples}", &samples.to_string())
+}
+
+const OPAQUE_MIP_SHADER: &str = include_str!("shaders/opaque_mip.wgsl");
+
+const BACKDROP_SHADER: &str = include_str!("shaders/backdrop.wgsl");
+
+pub(crate) fn backdrop_shader() -> String {
+    BACKDROP_SHADER.replace("${fullscreen}", FULLSCREEN)
 }
 
 const PRESENT_SHADER: &str = include_str!("shaders/present.wgsl");
@@ -238,6 +271,30 @@ struct TargetsKey {
     volume: u64,
 }
 
+/// What a frame with translucent surfaces draws and reads besides the scene's
+/// own targets, made with the first such frame and kept until the targets change.
+struct Split {
+    opaque: OpaqueTargets,
+    /// Level 0 of the opaque picture, as the backdrop pass reads it.
+    backdrop: wgpu::BindGroup,
+    /// The opaque picture's passes, run once the opaque surfaces are drawn.
+    before: Graph,
+    /// The passes that read the translucent pass's picture; with TAA, one for
+    /// each history texture it reads, turn about.
+    after: Vec<Graph>,
+}
+
+/// The opaque surfaces' picture and depth, as the translucent pass reads them.
+#[derive(Clone)]
+pub(crate) struct OpaqueTargets {
+    /// Which these are (never 0), to know when a bind group of them is old.
+    pub serial: u64,
+    /// The picture after the sky, the occlusion and the mist, with its chain of levels.
+    pub picture: wgpu::TextureView,
+    /// The nearest depth of each of its pixels (1 for none).
+    pub depth: wgpu::TextureView,
+}
+
 /// The scene's attachments, as the passes view them, and the graph of the
 /// passes after the scene.
 struct Targets {
@@ -256,6 +313,8 @@ struct Targets {
     graphs: Vec<Graph>,
     /// With TAA, the history textures: the picture each frame resolved to.
     histories: Option<[wgpu::TextureView; 2]>,
+    /// What frames with translucent surfaces add, once one has come.
+    split: Option<Split>,
 }
 
 /// The attachments of one frame's scene passes, from `Post::begin`.
@@ -266,6 +325,9 @@ pub(crate) struct SceneTargets {
     pub depth_only: wgpu::TextureView,
     pub scene: wgpu::TextureView,
     multisampled: Option<wgpu::TextureView>,
+    /// For a frame with translucent surfaces, the picture and depth of the
+    /// opaque ones.
+    pub opaque: Option<OpaqueTargets>,
 }
 
 impl SceneTargets {
@@ -288,6 +350,26 @@ impl SceneTargets {
             },
         }
     }
+
+    /// The color attachment of the translucent pass: cleared, which the backdrop
+    /// then overwrites everywhere, and resolved into the scene.
+    pub fn translucent_color(&self) -> wgpu::RenderPassColorAttachment<'_> {
+        let load = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
+        match &self.multisampled {
+            None => wgpu::RenderPassColorAttachment {
+                view: &self.scene,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
+            },
+            Some(multisampled) => wgpu::RenderPassColorAttachment {
+                view: multisampled,
+                depth_slice: None,
+                resolve_target: Some(&self.scene),
+                ops: wgpu::Operations { load, store: wgpu::StoreOp::Discard },
+            },
+        }
+    }
 }
 
 /// One of the passes' pipelines, its layout made from its shader.
@@ -300,12 +382,14 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
     let (code, target, blend) = match which {
         BuiltIn::Occlusion(samples) => (occlusion_shader(samples), wgpu::TextureFormat::R8Unorm, None),
         BuiltIn::Atmosphere(samples) => (atmosphere_shader(samples), SCENE_FORMAT, None),
+        BuiltIn::OpaqueDepth(samples) => (opaque_depth_shader(samples), wgpu::TextureFormat::R32Float, None),
+        BuiltIn::OpaqueMip => (OPAQUE_MIP_SHADER.to_owned(), SCENE_FORMAT, None),
         BuiltIn::Taa(samples) => (crate::taa::shader(samples), SCENE_FORMAT, None),
         BuiltIn::Present(samples) => (present_shader(samples, &context.display), context.format, None),
         BuiltIn::BloomDown { first } => (bloom_down_shader(first), SCENE_FORMAT, None),
         // Each level up is added onto the one above.
         BuiltIn::BloomUp => (bloom_up_shader(), SCENE_FORMAT, Some(wgpu::BlendState { color: add, alpha: add })),
-        BuiltIn::Decal { .. } | BuiltIn::Composite | BuiltIn::Particles { .. } => {
+        BuiltIn::Decal { .. } | BuiltIn::Composite | BuiltIn::Particles { .. } | BuiltIn::Backdrop(_) => {
             unreachable!("not a pass around the scene: {which:?}")
         }
     };
@@ -337,6 +421,69 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
     })
 }
 
+/// The pipeline that lays the opaque picture into every sample of the
+/// translucent pass, whose depth and stencil it leaves as they are.
+pub(crate) fn backdrop_pipeline(context: &PipelineContext, samples: u32) -> wgpu::RenderPipeline {
+    let module = context.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("backdrop"),
+        source: wgpu::ShaderSource::Wgsl(backdrop_shader().into()),
+    });
+    context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("backdrop"),
+        layout: None,
+        vertex: wgpu::VertexState {
+            module: &module,
+            entry_point: None,
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24PlusStencil8,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState { read_mask: 0, write_mask: 0, ..Default::default() },
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+        fragment: Some(wgpu::FragmentState {
+            module: &module,
+            entry_point: None,
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: SCENE_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: context.cache.get(),
+    })
+}
+
+/// What a graph of the passes after the scene reads.
+struct Inputs {
+    depth: wgpu::TextureView,
+    scene: wgpu::TextureView,
+    marks: wgpu::TextureView,
+    /// With TAA, the history texture read and the one drawn.
+    history: Option<[wgpu::TextureView; 2]>,
+}
+
+/// Which of the passes after the scene a graph holds.
+enum Part<'a> {
+    /// All of them, from the scene as the passes drew it to the output: the
+    /// frames without translucent surfaces.
+    Whole,
+    /// The opaque picture's, of a frame with translucent surfaces: the
+    /// occlusion and the atmosphere into level 0 of the chain (views of each
+    /// level), the nearest depth of each pixel (its view), and each level from
+    /// the one above.
+    Opaque(&'a [wgpu::TextureView], &'a wgpu::TextureView),
+    /// The ones that read what the translucent pass resolved to.
+    After,
+}
+
 struct FilteredPresent {
     source: wgpu::TextureView,
     marks: wgpu::TextureView,
@@ -353,9 +500,13 @@ pub(crate) struct Post {
     unbloomed: wgpu::Texture,
     targets: Option<Targets>,
     filtered_present: Option<FilteredPresent>,
-    /// The begun frame's quality and output size.
+    /// The begun frame's quality and output size, and whether it has translucent
+    /// surfaces, particles or overlays.
     quality: Option<Quality>,
     size: (u32, u32),
+    translucent: bool,
+    /// How many opaque pictures have been made, to number them.
+    opaques: u64,
     /// With TAA: frames jittered so far, the begun frame's jittered
     /// projection, and what the history remembers.
     jitters: u64,
@@ -426,6 +577,8 @@ impl Post {
             filtered_present: None,
             quality: None,
             size: (1, 1),
+            translucent: false,
+            opaques: 0,
             jitters: 0,
             jittered: None,
             memory: Default::default(),
@@ -455,9 +608,20 @@ impl Post {
         self.exposure.submitted();
     }
 
-    /// The passes after the scene that the last frame drew, in order.
+    /// The passes after the scene that the last frame drew, in order: for a frame
+    /// with translucent surfaces, those of the opaque picture, the backdrop the
+    /// translucent pass starts with, and the passes that read its result.
     pub fn passes(&self) -> Vec<&'static str> {
-        self.targets.as_ref().map(|targets| targets.graphs[0].names()).unwrap_or_default()
+        let Some(targets) = &self.targets else { return Vec::new() };
+        match (&targets.split, self.translucent) {
+            (Some(split), true) => {
+                let mut names = split.before.names();
+                names.push("backdrop");
+                names.extend(split.after[0].names());
+                names
+            }
+            _ => targets.graphs[0].names(),
+        }
     }
 
     /// With TAA and a frame before this one: the picture the last frame
@@ -500,9 +664,11 @@ impl Post {
         quality: Quality,
         size: (u32, u32),
         volume: &crate::volume::Applied,
+        translucent: bool,
     ) -> SceneTargets {
         self.quality = Some(quality);
         self.size = size;
+        self.translucent = translucent;
         let occluding = quality.occlusion;
         let atmosphere =
             quality.sky || frame.fog.density > 0.0 || occluding || frame.clouds.cover > 0.0 || volume.serial != 0;
@@ -553,8 +719,9 @@ impl Post {
             let mut graphs: Vec<Graph> = Vec::new();
             for read in 0..if taa { 2 } else { 1 } {
                 let history = histories.as_ref().map(|textures| [view(&textures[read]), view(&textures[1 - read])]);
+                let inputs = Inputs { depth: depth_only(), scene: view(&scene), marks: marks.clone(), history };
                 let graph = self
-                    .graph(built_ins, key, depth_only(), view(&scene), marks.clone(), history, volume, graphs.first())
+                    .graph(built_ins, key, inputs, Part::Whole, volume, graphs.first())
                     .expect("the passes after the scene read only what earlier ones draw");
                 log::debug!("passes after the scene: {:?}, {} textures", graph.names(), graph.allocations());
                 graphs.push(graph);
@@ -569,7 +736,12 @@ impl Post {
                 scene: view(&scene),
                 marks,
                 graphs,
+                split: None,
             });
+        }
+        if translucent && self.targets.as_ref().unwrap().split.is_none() {
+            let split = self.split(built_ins, volume);
+            self.targets.as_mut().unwrap().split = Some(split);
         }
         // The scene's samples move within their pixels from frame to frame.
         self.jittered = taa.then(|| {
@@ -584,21 +756,84 @@ impl Post {
             depth_only: current.depth_only.clone(),
             scene: current.scene.clone(),
             multisampled: current.multisampled.clone(),
+            opaque: current.split.as_ref().filter(|_| translucent).map(|split| split.opaque.clone()),
         }
     }
 
-    /// The passes after the scene for frames of `key`, reading the scene's
-    /// depth, its picture and its stencil marks, and ending on the output.
-    /// With TAA, `history` is the texture it reads and the one it draws.
-    #[allow(clippy::too_many_arguments, reason = "the scene's views, each its own")]
+    /// What a frame with translucent surfaces adds to the targets: the opaque
+    /// picture and its depth, the graph that makes them, the backdrop's bind
+    /// group and the graphs of the passes that read what the translucent pass
+    /// draws.
+    fn split(&mut self, built_ins: &mut BuiltIns, volume: &crate::volume::Applied) -> Split {
+        let targets = self.targets.as_ref().unwrap();
+        let key = targets.key;
+        let (depth, scene, marks) = (targets.depth_only.clone(), targets.scene.clone(), targets.marks.clone());
+        let histories = targets.histories.clone();
+        let TargetsKey { width, height, samples, taa, .. } = key;
+        let sampled = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        // Every level down to one texel.
+        let count = width.max(height).ilog2() + 1;
+        let picture = texture(&self.device, width, height, sampled, 1, SCENE_FORMAT, count);
+        let levels: Vec<wgpu::TextureView> = (0..count)
+            .map(|level| {
+                picture.create_view(&wgpu::TextureViewDescriptor {
+                    base_mip_level: level,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        let nearest = texture(&self.device, width, height, sampled, 1, wgpu::TextureFormat::R32Float, 1)
+            .create_view(&Default::default());
+        let inputs = |read: usize| Inputs {
+            depth: depth.clone(),
+            scene: scene.clone(),
+            marks: marks.clone(),
+            history: histories.as_ref().map(|textures| [textures[read].clone(), textures[1 - read].clone()]),
+        };
+        let before = self
+            .graph(built_ins, key, inputs(0), Part::Opaque(&levels, &nearest), volume, None)
+            .expect("the opaque picture's passes read only what earlier ones draw");
+        log::debug!("opaque picture: {:?}, {} textures", before.names(), before.allocations());
+        let mut after: Vec<Graph> = Vec::new();
+        for read in 0..if taa { 2 } else { 1 } {
+            let graph = self
+                .graph(built_ins, key, inputs(read), Part::After, volume, after.first())
+                .expect("the passes after the translucent pass read only what earlier ones draw");
+            log::debug!("passes after the translucent pass: {:?}, {} textures", graph.names(), graph.allocations());
+            after.push(graph);
+        }
+        let backdrop = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("backdrop"),
+            layout: &built_ins.get(BuiltIn::Backdrop(samples)).get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&levels[0]) }],
+        });
+        self.opaques += 1;
+        let opaque =
+            OpaqueTargets { serial: self.opaques, picture: picture.create_view(&Default::default()), depth: nearest };
+        Split { opaque, backdrop, before, after }
+    }
+
+    /// Draws the opaque picture into every sample of the translucent pass, which
+    /// then draws over it.
+    pub fn draw_backdrop(&self, built_ins: &mut BuiltIns, pass: &mut wgpu::RenderPass<'_>) {
+        let targets = self.targets.as_ref().expect("Post::begin comes first");
+        let split = targets.split.as_ref().expect("a frame with translucent surfaces has its opaque picture");
+        pass.set_pipeline(built_ins.get(BuiltIn::Backdrop(targets.key.samples)));
+        pass.set_bind_group(0, &split.backdrop, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// The passes after the scene for frames of `key`, as `part` says, reading
+    /// the scene's depth, its picture and its stencil marks and, for the last
+    /// part, ending on the output. With TAA, `history` is the texture it reads
+    /// and the one it draws.
     fn graph(
         &mut self,
         built_ins: &mut BuiltIns,
         key: TargetsKey,
-        depth: wgpu::TextureView,
-        scene: wgpu::TextureView,
-        marks: wgpu::TextureView,
-        history: Option<[wgpu::TextureView; 2]>,
+        inputs: Inputs,
+        part: Part<'_>,
         volume: &crate::volume::Applied,
         sharing: Option<&Graph>,
     ) -> anyhow::Result<Graph> {
@@ -606,38 +841,65 @@ impl Post {
         let full = |format: wgpu::TextureFormat| Spec { width, height, format };
         let sampler = Binding::Sampler(self.sampler.clone());
         let mut graph = GraphBuilder::default();
-        let depth = graph.import("depth", depth);
-        let scene = graph.import("scene", scene);
-        let marks = graph.import("marks", marks);
-        let occlusion = if occluding {
-            let occlusion = graph.texture("occlusion", full(wgpu::TextureFormat::R8Unorm));
-            let uniform = Binding::Uniform(self.uniform("occlusion", 160));
-            let bindings = vec![uniform, Binding::Texture(depth)];
-            graph.pass("occlusion", BuiltIn::Occlusion(samples), bindings, Target::Texture(occlusion), false);
-            occlusion
-        } else {
-            graph.import("unoccluded", self.unoccluded.create_view(&Default::default()))
-        };
+        let depth = graph.import("depth", inputs.depth);
+        let scene = graph.import("scene", inputs.scene);
+        let marks = graph.import("marks", inputs.marks);
         let mut lit = scene;
-        if atmosphere {
-            let composed = graph.texture("composed", full(SCENE_FORMAT));
-            let uniform = Binding::Uniform(self.uniform("atmosphere", 224));
-            let froxels = graph.import("froxels", volume.texture.clone());
-            let bindings = vec![
-                uniform,
-                Binding::Texture(scene),
-                Binding::Texture(depth),
-                Binding::Texture(occlusion),
-                sampler.clone(),
-                Binding::Uniform(volume.uniform.clone()),
-                Binding::Texture(froxels),
-            ];
-            graph.pass("atmosphere", BuiltIn::Atmosphere(samples), bindings, Target::Texture(composed), false);
-            lit = composed;
+        // The sky, the occlusion and the mist go onto the opaque picture alone:
+        // a frame with translucent surfaces draws them into level 0 of its chain,
+        // whatever the quality asks, as that is what the translucent pass starts from.
+        if !matches!(part, Part::After) {
+            let occlusion = if occluding {
+                let occlusion = graph.texture("occlusion", full(wgpu::TextureFormat::R8Unorm));
+                let uniform = Binding::Uniform(self.uniform("occlusion", 160));
+                let bindings = vec![uniform, Binding::Texture(depth)];
+                graph.pass("occlusion", BuiltIn::Occlusion(samples), bindings, Target::Texture(occlusion), false);
+                occlusion
+            } else {
+                graph.import("unoccluded", self.unoccluded.create_view(&Default::default()))
+            };
+            if atmosphere || matches!(part, Part::Opaque(..)) {
+                let composed = match part {
+                    Part::Opaque(chain, _) => graph.import("opaque", chain[0].clone()),
+                    _ => graph.texture("composed", full(SCENE_FORMAT)),
+                };
+                let uniform = Binding::Uniform(self.uniform("atmosphere", 224));
+                let froxels = graph.import("froxels", volume.texture.clone());
+                let bindings = vec![
+                    uniform,
+                    Binding::Texture(scene),
+                    Binding::Texture(depth),
+                    Binding::Texture(occlusion),
+                    sampler.clone(),
+                    Binding::Uniform(volume.uniform.clone()),
+                    Binding::Texture(froxels),
+                ];
+                graph.pass("atmosphere", BuiltIn::Atmosphere(samples), bindings, Target::Texture(composed), false);
+                lit = composed;
+            }
+        }
+        // The nearest depth of each pixel, and each level of the picture from the
+        // one above it.
+        if let Part::Opaque(chain, nearest) = part {
+            let nearest = graph.import("opaque depth", nearest.clone());
+            graph.pass(
+                "opaque depth",
+                BuiltIn::OpaqueDepth(samples),
+                vec![Binding::Texture(depth)],
+                Target::Texture(nearest),
+                false,
+            );
+            for level in &chain[1..] {
+                let level = graph.import("opaque", level.clone());
+                let bindings = vec![Binding::Texture(lit), sampler.clone()];
+                graph.pass("opaque mip", BuiltIn::OpaqueMip, bindings, Target::Texture(level), false);
+                lit = level;
+            }
+            return graph.compile(&self.device, built_ins, sharing);
         }
         // TAA blends the lit picture into the history, which the passes
         // after it read.
-        if let Some([read, drawn]) = history {
+        if let Some([read, drawn]) = inputs.history {
             let (read, drawn) = (graph.import("history", read), graph.import("history", drawn));
             let uniform = Binding::Uniform(self.uniform("taa", 160));
             let bindings =
@@ -724,23 +986,13 @@ impl Post {
         self.finish_base(built_ins, encoder, frame, output, timer, false, tables);
     }
 
-    /// With scene filters, defer camera effects until their output is ready.
-    #[allow(clippy::too_many_arguments)]
-    pub fn finish_base(
-        &mut self,
-        built_ins: &mut BuiltIns,
-        encoder: &mut wgpu::CommandEncoder,
-        frame: &RenderFrame,
-        output: &wgpu::TextureView,
-        timer: &GpuTimer,
-        filtered: bool,
-        tables: &[Option<Lut>; 2],
-    ) {
+    /// Writes the uniforms of the occlusion and the atmosphere passes, which
+    /// work out the opaque surfaces' picture, for the scene as it was drawn.
+    fn write_opaque_uniforms(&mut self, frame: &RenderFrame) {
         let quality = self.quality.expect("Post::begin comes first");
-        let size = self.size;
-        let TargetsKey { width, height, occluding, atmosphere, levels, taa, .. } = self.targets.as_ref().unwrap().key;
+        let TargetsKey { width, height, occluding, atmosphere, .. } = self.targets.as_ref().unwrap().key;
         // What the scene drew with.
-        let (projection, offset) = self.jittered.unwrap_or((frame.projection, (0.0, 0.0)));
+        let (projection, _) = self.jittered.unwrap_or((frame.projection, (0.0, 0.0)));
         if occluding {
             let uniform = self.uniform("occlusion", 160);
             let mut data = [0.0f32; 40];
@@ -758,11 +1010,57 @@ impl Post {
             ]);
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
-        if atmosphere {
+        if atmosphere || self.translucent {
             let uniform = self.uniform("atmosphere", 224);
             let data = atmosphere_of(frame, &projection, &quality, width, height);
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
+    }
+
+    /// For a frame with translucent surfaces, once the opaque surfaces are
+    /// drawn and resolved: the sky, the occlusion and the mist on them alone,
+    /// their nearest depth and the chain of levels, ready for the translucent
+    /// pass.
+    pub fn opaque(
+        &mut self,
+        built_ins: &mut BuiltIns,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+        timer: &GpuTimer,
+    ) {
+        self.write_opaque_uniforms(frame);
+        let split = self
+            .targets
+            .as_ref()
+            .unwrap()
+            .split
+            .as_ref()
+            .expect("a frame with translucent surfaces has its opaque picture");
+        split.before.execute(encoder, built_ins, None, timer, Span::Opaque, None, &mut |_, _| {});
+    }
+
+    /// With scene filters, defer camera effects until their output is ready.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_base(
+        &mut self,
+        built_ins: &mut BuiltIns,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+        output: &wgpu::TextureView,
+        timer: &GpuTimer,
+        filtered: bool,
+        tables: &[Option<Lut>; 2],
+    ) {
+        let quality = self.quality.expect("Post::begin comes first");
+        let size = self.size;
+        let TargetsKey { width, height, levels, taa, .. } = self.targets.as_ref().unwrap().key;
+        // The opaque picture of a frame with translucent surfaces was worked out
+        // before the translucent pass.
+        if !self.translucent {
+            self.write_opaque_uniforms(frame);
+        }
+        // What the scene drew with.
+        let (projection, offset) = self.jittered.unwrap_or((frame.projection, (0.0, 0.0)));
         // The graph reading the history this frame reads.
         let graph = if taa { self.memory.read() } else { 0 };
         if taa {
@@ -801,9 +1099,21 @@ impl Post {
         self.queue.write_buffer(&uniform, 0, bytemuck::bytes_of(&grade::uniform(&frame.grade, tables)));
         let late = self.tables_group(built_ins, self.targets.as_ref().unwrap().key.samples, tables);
         let (targets, exposure) = (self.targets.as_ref().unwrap(), &mut self.exposure);
-        targets.graphs[graph].execute(encoder, built_ins, output, timer, &late, &mut |picture, encoder| {
-            exposure.meter(encoder, picture, (width, height));
-        });
+        let graphs = match &targets.split {
+            Some(split) if self.translucent => &split.after,
+            _ => &targets.graphs,
+        };
+        graphs[graph].execute(
+            encoder,
+            built_ins,
+            Some(output),
+            timer,
+            Span::Post,
+            Some(&late),
+            &mut |picture, encoder| {
+                exposure.meter(encoder, picture, (width, height));
+            },
+        );
     }
     /// Apply blur and stencil-masked aberration to the styled image, before UI.
     #[allow(clippy::too_many_arguments)]

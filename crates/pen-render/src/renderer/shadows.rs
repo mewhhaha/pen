@@ -81,7 +81,8 @@ pub(super) struct ContactDepth {
 
 /// What a scene bind group binds that changes: the maps, the layer of them the
 /// game's binding is, the camera's depth and its layer, and the frame whose
-/// picture screen-space reflections read (0 for none).
+/// picture screen-space reflections read (0 for none); and what a translucent
+/// pass reads: its opaque picture and the froxel volume (0 for the stand-ins).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SceneKey {
     map: u64,
@@ -89,6 +90,8 @@ pub(super) struct SceneKey {
     contact: u64,
     contact_layer: usize,
     picture: u64,
+    opaque: u64,
+    volume: u64,
 }
 
 /// The local lights' faces, and which light's what each layer holds.
@@ -138,6 +141,23 @@ pub(super) struct Screen<'a> {
     pub picture: &'a wgpu::TextureView,
 }
 
+/// What a scene group reads of the frame's opaque surfaces and its mist, at
+/// bindings 14 to 17 (translucency.wgsl).
+pub(super) struct Translucency<'a> {
+    pub picture: &'a wgpu::TextureView,
+    pub depth: &'a wgpu::TextureView,
+    pub froxels: &'a wgpu::TextureView,
+    pub fog: &'a wgpu::Buffer,
+}
+
+impl Shadows {
+    /// The stand-ins every function of translucency.wgsl is the identity over:
+    /// bound where no translucent pass reads the opaque picture.
+    fn no_translucency(&self) -> Translucency<'_> {
+        Translucency { picture: &self.blank, depth: &self.blank_depth, froxels: &self.blank_volume, fog: &self.no_fog }
+    }
+}
+
 /// A scene bind group: its uniform, the game's map (`game`, else the first
 /// layer of `maps`), the comparison sampler, every map and the camera's
 /// depth (`contact`, else the stand-in's first layer).
@@ -152,6 +172,7 @@ fn scene_group(
     sampler: &wgpu::Sampler,
     sky: (&Environment, &wgpu::Buffer, &wgpu::Buffer),
     screen: &Screen<'_>,
+    translucency: &Translucency<'_>,
 ) -> wgpu::BindGroup {
     let [cube, table, sky_sampler, light, probes, cubes, reflection_table] = sky.0.entries_with(sky.1, sky.2);
     device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -167,6 +188,10 @@ fn scene_group(
             reflection_table,
             wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(screen.depth) },
             wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(screen.picture) },
+            wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(translucency.picture) },
+            wgpu::BindGroupEntry { binding: 15, resource: wgpu::BindingResource::TextureView(translucency.depth) },
+            wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(translucency.froxels) },
+            wgpu::BindGroupEntry { binding: 17, resource: translucency.fog.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
             wgpu::BindGroupEntry {
                 binding: 1,
@@ -204,6 +229,26 @@ impl State {
                     view_formats: &[],
                 })
                 .create_view(&Default::default());
+            let blank_texture = |dimension: wgpu::TextureDimension, format: wgpu::TextureFormat, label: &str| {
+                device
+                    .create_texture(&wgpu::TextureDescriptor {
+                        label: Some(label),
+                        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension,
+                        format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    })
+                    .create_view(&Default::default())
+            };
+            let blank_depth =
+                blank_texture(wgpu::TextureDimension::D2, wgpu::TextureFormat::R32Float, "no opaque depth");
+            let blank_volume =
+                blank_texture(wgpu::TextureDimension::D3, wgpu::TextureFormat::Rgba16Float, "no froxel volume");
+            let no_fog = uniform_buffer(device, "no fog", crate::volume::UNIFORM_BYTES);
+            let none = Translucency { picture: &blank, depth: &blank_depth, froxels: &blank_volume, fog: &no_fog };
             // The passes that draw into maps bind the stand-in, as they draw into the real ones.
             let (uniforms, groups) = (0..PASSES)
                 .map(|_| {
@@ -218,6 +263,7 @@ impl State {
                         &sampler,
                         (environment, environment.empty(), environment.empty_probes()),
                         &Screen { depth: &stand_in.all, picture: &blank },
+                        &none,
                     );
                     (uniform, group)
                 })
@@ -235,6 +281,9 @@ impl State {
                 contact_layer: 0,
                 contact_frames: 0,
                 blank,
+                blank_depth,
+                blank_volume,
+                no_fog,
                 local: None,
             }
         })
@@ -257,6 +306,7 @@ impl State {
             &resources.sampler,
             (&self.environment, light, self.environment.empty_probes()),
             &Screen { depth: &resources.stand_in.all, picture: &resources.blank },
+            &resources.no_translucency(),
         )
     }
 
@@ -347,28 +397,56 @@ impl State {
             contact: resources.contact_id,
             contact_layer: resources.contact_layer,
             picture,
+            opaque: 0,
+            volume: 0,
         };
         if self.scene_group.as_ref().is_none_or(|(_, key)| *key != bound) {
-            let resources = self.shadows.as_ref().unwrap();
-            let maps = resources.maps.as_ref().filter(|_| bound.map != 0);
-            let contact = resources.contact.as_ref().filter(|_| bound.contact != 0);
-            let history = self.reflected.as_ref().map(|(view, _, _)| view);
-            let group = scene_group(
-                &self.device,
-                &self.context.scene_group,
-                &self.scene_uniform,
-                maps.unwrap_or(&resources.stand_in),
-                maps.map(|maps| &maps.layers[bound.layer]),
-                contact.map_or(&resources.stand_in.layers[0], |contact| &contact.layers[bound.contact_layer]),
-                &resources.sampler,
-                (&self.environment, self.environment.light(), self.environment.probe_table()),
-                &Screen {
-                    depth: contact.map_or(&resources.stand_in.all, |contact| &contact.all),
-                    picture: history.unwrap_or(&resources.blank),
-                },
-            );
+            let group = self.build_scene(&bound, None);
             self.scene_group = Some((group, bound));
         }
+    }
+
+    /// The translucent pass's bind group: the scene's, with the frame's opaque
+    /// picture and depth, and the mist's volume and block, bound as well. Made
+    /// again when any of them changed.
+    pub(super) fn bind_translucent(&mut self, opaque: &crate::post::OpaqueTargets, volume: &crate::volume::Applied) {
+        let Some((_, plain)) = &self.scene_group else { return };
+        let bound = SceneKey { opaque: opaque.serial, volume: volume.serial, ..*plain };
+        if self.translucent_group.as_ref().is_none_or(|(_, key)| *key != bound) {
+            let translucency = Translucency {
+                picture: &opaque.picture,
+                depth: &opaque.depth,
+                froxels: &volume.texture,
+                fog: &volume.uniform,
+            };
+            let group = self.build_scene(&bound, Some(&translucency));
+            self.translucent_group = Some((group, bound));
+        }
+    }
+
+    /// A scene bind group for the maps, contact depth and picture `bound` names,
+    /// with stand-ins at 14 to 17 unless `translucency` gives the real ones.
+    fn build_scene(&self, bound: &SceneKey, translucency: Option<&Translucency<'_>>) -> wgpu::BindGroup {
+        let resources = self.shadows.as_ref().unwrap();
+        let maps = resources.maps.as_ref().filter(|_| bound.map != 0);
+        let contact = resources.contact.as_ref().filter(|_| bound.contact != 0);
+        let history = self.reflected.as_ref().map(|(view, _, _)| view);
+        let none = resources.no_translucency();
+        scene_group(
+            &self.device,
+            &self.context.scene_group,
+            &self.scene_uniform,
+            maps.unwrap_or(&resources.stand_in),
+            maps.map(|maps| &maps.layers[bound.layer]),
+            contact.map_or(&resources.stand_in.layers[0], |contact| &contact.layers[bound.contact_layer]),
+            &resources.sampler,
+            (&self.environment, self.environment.light(), self.environment.probe_table()),
+            &Screen {
+                depth: contact.map_or(&resources.stand_in.all, |contact| &contact.all),
+                picture: history.unwrap_or(&resources.blank),
+            },
+            translucency.unwrap_or(&none),
+        )
     }
 
     /// The scene bind group the probes' captures draw with: `uniform` as the
@@ -392,6 +470,7 @@ impl State {
             &resources.sampler,
             (&self.environment, self.environment.capture_light(), self.environment.probe_table()),
             &Screen { depth: &resources.stand_in.all, picture: &resources.blank },
+            &resources.no_translucency(),
         )
     }
 

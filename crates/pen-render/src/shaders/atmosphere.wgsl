@@ -43,8 +43,6 @@ fn mist_light(direction: vec3f, point: vec3f) -> vec3f {
 @fragment fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
   let pixel = vec2i(position.xy);
   let scene = textureLoad(scene_color, pixel, 0);
-  let remaining = scene.a;
-  let color = scene.rgb - remaining * atmosphere.clear.rgb;
   var empty = 0.0;
   var nearest = 1.0;
   for (var sample = 0; sample < ${samples}; sample++) {
@@ -55,15 +53,16 @@ fn mist_light(direction: vec3f, point: vec3f) -> vec3f {
       nearest = min(nearest, depth);
     }
   }
+  // The clear colour fills what the samples left empty, in what the resolve
+  // averaged: take it back out, to keep the surfaces' own share.
+  let color = scene.rgb - empty * atmosphere.clear.rgb;
   let camera = atmosphere.camera.xyz;
   let direction = normalize(unproject(position.xy, 0.5) - camera);
   let with_sky = atmosphere.camera.w > 0.5;
   let background = select(atmosphere.clear.rgb, sky(direction, true), with_sky);
   if (empty > 0.999) {
-    return vec4f(color + remaining * background, 1.0);
+    return vec4f(color + empty * background, 1.0);
   }
-  // Depth counts opaque coverage; alpha also accounts for translucent
-  // surfaces and particles covering the background without writing depth.
   let surface = color / (1.0 - empty) *
     mix(1.0, occlusion(position.xy), atmosphere.fog.w);
   let point = unproject(position.xy, nearest);
@@ -93,5 +92,5 @@ fn mist_light(direction: vec3f, point: vec3f) -> vec3f {
   let transmitted = exp(-optical);
   let light = scattered + transmitted * tint * (1.0 - exp(-beyond));
   let misted = surface * cloud_shadow(point) * (transmitted * exp(-beyond)) + light;
-  return vec4f(misted * (1.0 - empty) + remaining * background, 1.0);
+  return vec4f(misted * (1.0 - empty) + empty * background, 1.0);
 }

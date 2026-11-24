@@ -18,6 +18,7 @@ mod environment;
 pub mod environment_passes;
 mod exposure;
 mod filter;
+pub mod gpu_particles;
 mod grade;
 mod graph;
 mod inspect;
@@ -25,13 +26,17 @@ mod lights;
 mod loader;
 mod local_shadows;
 mod matrix;
+pub mod meshlets;
 mod mipmaps;
 mod motion_blur;
 mod packed_texture;
 mod pipeline_cache;
 mod platform;
 mod post;
+pub mod post_fx;
 mod prefetch;
+pub mod ray_tracing;
+pub mod render_targets;
 mod renderer;
 mod shader;
 #[cfg(feature = "simplify")]
@@ -62,9 +67,29 @@ pub use environment_passes::{
     TerrainPatch, TerrainPipeline, TerrainUniform, WATER_WGSL, WaterPipeline, WaterUniform,
 };
 pub use filter::ColorFilter;
+pub use gpu_particles::{
+    GPU_PARTICLES_DRAW_WGSL, GPU_PARTICLES_SIM_WGSL, GpuParticle, GpuParticleMeshVertex, GpuParticleSimParams,
+    GpuParticleSystem, ParticleSimCounters, unit_cube_particle_mesh,
+};
 pub use inspect::{TextureInfo, inspect_material, inspect_mesh, inspect_texture, shader_draws_sprites};
 pub use lights::LIGHTS_WGSL;
+pub use meshlets::{
+    DEFAULT_MAX_MESHLET_TRIANGLES, DEFAULT_MAX_MESHLET_VERTICES, MESHLET_CULL_WGSL, MeshletCullParams,
+    MeshletCullStats, MeshletCuller, MeshletGpu, MeshletIndirectDraw, MeshletMesh, build_meshlets,
+};
+pub use post_fx::{
+    POST_FX_WGSL, PostFxParams, PostFxPass, RcasSharpener, TaauUpscaler, UPSCALE_RCAS_WGSL, apply_projection_jitter,
+    halton_jitter,
+};
 pub use prefetch::Prefetch;
+pub use ray_tracing::{
+    BVH_RAYTRACE_WGSL, BvhNodeGpu, BvhScene, BvhTriGpu, BvhTriangle, GpuRayTracer, RayTraceParams,
+    supports_hardware_ray_query,
+};
+pub use render_targets::{
+    ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,
+    oblique_clip_projection, planar_reflection_camera, planar_reflection_view,
+};
 pub use video::{
     ChromaSiting, ColorMatrix, ColorRange, ColorSpace, IvfFrame, IvfStream, VideoPlayer, VideoTexture, Y4mStream,
     Yuv420Frame,
@@ -401,5 +426,18 @@ impl Renderer {
     /// equals `key`.
     pub fn upload_video_frame(&mut self, key: &str, frame: &Yuv420Frame) -> anyhow::Result<()> {
         self.state.upload_video_frame(key, frame)
+    }
+
+    /// Renders a secondary camera's `frame` into a double-buffered offscreen
+    /// texture bound by any material whose `texture` key equals `key` (for
+    /// planar reflections, portals, security monitors, or minimaps).
+    pub fn render_camera_to_texture(
+        &mut self,
+        key: &str,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        size: (u32, u32),
+    ) -> anyhow::Result<()> {
+        self.state.render_camera_to_texture(key, frame, catalog, size)
     }
 }

@@ -81,6 +81,10 @@ impl State {
             TextureRef::Checker => &self.checker,
             TextureRef::Field(index) => &self.fields[index].1,
             TextureRef::Video(index) => &self.videos[index].1,
+            TextureRef::CameraTarget(index) => {
+                let entry = &self.camera_targets[index];
+                &entry.assets[entry.front]
+            }
         }
     }
 
@@ -130,14 +134,20 @@ impl State {
         field: Option<usize>,
     ) -> Result<Option<Dressed>> {
         let video_texture = material.texture.as_deref().and_then(|key| self.video_ids.get(key).copied());
-        let loaded_texture = if video_texture.is_some() { None } else { self.loaded_texture(&material.texture)? };
+        let camera_texture = if video_texture.is_some() {
+            None
+        } else {
+            material.texture.as_deref().and_then(|key| self.camera_target_ids.get(key).copied())
+        };
+        let has_dynamic_texture = video_texture.is_some() || camera_texture.is_some();
+        let loaded_texture = if has_dynamic_texture { None } else { self.loaded_texture(&material.texture)? };
         let loaded_normal = self.loaded_texture(&material.normal_texture)?;
         let loaded_outline = self.loaded_texture(&material.layer_texture)?;
         let loaded_emissive = self.loaded_texture(&material.emissive_texture)?;
         let loaded_orm = self.loaded_texture(&material.orm_texture)?;
         // A texture on its way holds the draw back; one that failed shows as
         // the checker.
-        let disk_texture = if video_texture.is_some() { &None } else { &material.texture };
+        let disk_texture = if has_dynamic_texture { &None } else { &material.texture };
         if [
             disk_texture,
             &material.normal_texture,
@@ -151,11 +161,12 @@ impl State {
         {
             return Ok(None);
         }
-        let mut texture = match (video_texture, &material.texture, loaded_texture) {
-            (Some(idx), _, _) => TextureRef::Video(idx),
-            (None, None, _) => TextureRef::White,
-            (None, Some(_), Some(slot)) => TextureRef::Slot(slot),
-            (None, Some(_), None) => TextureRef::Checker,
+        let mut texture = match (video_texture, camera_texture, &material.texture, loaded_texture) {
+            (Some(idx), _, _, _) => TextureRef::Video(idx),
+            (None, Some(idx), _, _) => TextureRef::CameraTarget(idx),
+            (None, None, None, _) => TextureRef::White,
+            (None, None, Some(_), Some(slot)) => TextureRef::Slot(slot),
+            (None, None, Some(_), None) => TextureRef::Checker,
         };
         let mut normal = match field {
             Some(field) => TextureRef::Field(field),

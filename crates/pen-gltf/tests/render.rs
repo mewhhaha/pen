@@ -149,3 +149,138 @@ fn vertex_animation_crowds_draw_as_one_instanced_draw() {
     assert!(lit(seen(&later, 1.0, 1.75)), "the third stands again");
     assert_ne!(now, later);
 }
+
+// A quad's first tangent as its colour: xyz scaled to 0.2 to 0.8.
+const TANGENT: &str = r#"
+struct Scene { view: mat4x4f, projection: mat4x4f };
+struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f, settings: vec4f, parameters: vec4f };
+@group(0) @binding(0) var<uniform> scene: Scene;
+@group(1) @binding(0) var<uniform> draw: Draw;
+struct Corner { @builtin(position) position: vec4f, @location(0) tangent: vec4f };
+@vertex fn vertex(@location(0) position: vec3f, @location(11) tangent: vec4f) -> Corner {
+  return Corner(scene.projection * scene.view * draw.model * vec4f(position, 1.0), tangent);
+}
+@fragment fn fragment(corner: Corner) -> @location(0) vec4f {
+  return vec4f(corner.tangent.xyz * 0.3 + 0.5, 1.0);
+}
+"#;
+
+#[test]
+fn imported_tangents_reach_the_shader() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let directory = directory("tangent-shader");
+    let assets = directory.join("assets");
+    // A normal-mapped quad with its texture mirrored: made tangents face -x, left-handed.
+    let mut quad = square();
+    for uv in &mut quad.uvs {
+        uv[0] = 1.0 - uv[0];
+    }
+    let material = serde_json::json!({"name": "mapped", "normalTexture": {"index": 0}});
+    let file = model_file(&directory, "quad", model(&quad, material, &[], serde_json::json!({})));
+    let options = Options { shader: "tangent.wgsl".to_owned(), ..Options::default() };
+    let imported = import(&file, &assets, &options).unwrap();
+    std::fs::write(assets.join("tangent.wgsl"), TANGENT).unwrap();
+    std::fs::write(
+        assets.join("catalog.json"),
+        serde_json::json!({"meshes": [imported.meshes[0].mesh], "materials": [imported.materials[0]]}).to_string(),
+    )
+    .unwrap();
+    let catalog = boundary::read_catalog(&assets).unwrap();
+    let mut renderer = renderer(&device, &queue, &assets);
+    renderer.preload(&catalog);
+    let mut target = Offscreen::new(&device);
+    let draw = Draw { mesh: 0, material: 0, transform: IDENTITY, parameters: None, extra: None };
+    let frame = frame(vec![draw], Vec::new());
+    let keys = [imported.meshes[0].mesh.as_str(), imported.materials[0].as_str(), "tangent.wgsl"];
+    settle(&mut renderer, &frame, &catalog, &mut target, &keys);
+    let shot = pixels(&device, &queue, &target.0);
+    eprintln!("{}", save(&shot, "imported-tangents.png").display());
+    let got = seen(&shot, 0.5, 0.5);
+    // (-1, 0, 0) as 0.2, 0.5, 0.5 light: 51, 128, 128.
+    assert!(got[0].abs_diff(51) <= 2 && got[1].abs_diff(128) <= 2 && got[2].abs_diff(128) <= 2, "{got:?}");
+}
+
+// Half-transparent green, opaque red.
+const GLASS: &str = r#"
+struct Scene { view: mat4x4f, projection: mat4x4f };
+struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f };
+@group(0) @binding(0) var<uniform> scene: Scene;
+@group(1) @binding(0) var<uniform> draw: Draw;
+@vertex fn vertex(@location(0) position: vec3f) -> @builtin(position) vec4f {
+  return scene.projection * scene.view * draw.model * vec4f(position, 1.0);
+}
+@fragment fn fragment() -> @location(0) vec4f { return vec4f(0.0, 1.0, 0.0, 0.5); }
+"#;
+
+const RED: &str = r#"
+struct Scene { view: mat4x4f, projection: mat4x4f };
+struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f };
+@group(0) @binding(0) var<uniform> scene: Scene;
+@group(1) @binding(0) var<uniform> draw: Draw;
+@vertex fn vertex(@location(0) position: vec3f) -> @builtin(position) vec4f {
+  return scene.projection * scene.view * draw.model * vec4f(position, 1.0);
+}
+@fragment fn fragment() -> @location(0) vec4f { return vec4f(1.0, 0.0, 0.0, 1.0); }
+"#;
+
+#[test]
+fn an_imported_transmissive_material_draws_among_the_translucent_ones() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let directory = directory("transmission");
+    let assets = directory.join("assets");
+    // Red behind, glass in front: the glass half the size, with a factor of 0 or 0.5.
+    let behind = model_file(
+        &directory,
+        "behind",
+        model(&square(), serde_json::json!({"name": "red"}), &[], serde_json::json!({"translation": [0.0, 0.0, -0.3]})),
+    );
+    let behind = import(&behind, &assets, &Options { shader: "red.wgsl".to_owned(), ..Options::default() }).unwrap();
+    std::fs::write(assets.join("red.wgsl"), RED).unwrap();
+    std::fs::write(assets.join("glass.wgsl"), GLASS).unwrap();
+    let mut pictures = Vec::new();
+    for (name, transmission) in [("clear", 0.0), ("glass", 0.5)] {
+        let glass = serde_json::json!({
+            "name": name,
+            "extensions": {"KHR_materials_transmission": {"transmissionFactor": transmission}},
+        });
+        let placement = serde_json::json!({"translation": [0.25, 0.25, 0.3], "scale": [0.5, 0.5, 1.0]});
+        let file = model_file(&directory, name, model(&square(), glass, &["KHR_materials_transmission"], placement));
+        let options = Options { name: Some(name.to_owned()), shader: "glass.wgsl".to_owned(), ..Options::default() };
+        let front = import(&file, &assets, &options).unwrap();
+        std::fs::write(
+            assets.join("catalog.json"),
+            serde_json::json!({
+                "meshes": [behind.meshes[0].mesh, front.meshes[0].mesh],
+                "materials": [behind.materials[0], front.materials[0]],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let catalog = boundary::read_catalog(&assets).unwrap();
+        let mut renderer = renderer(&device, &queue, &assets);
+        renderer.preload(&catalog);
+        let mut target = Offscreen::new(&device);
+        let draws = vec![
+            Draw { mesh: 0, material: 0, transform: IDENTITY, parameters: None, extra: None },
+            Draw { mesh: 1, material: 1, transform: IDENTITY, parameters: None, extra: None },
+        ];
+        let frame = frame(draws, Vec::new());
+        settle(&mut renderer, &frame, &catalog, &mut target, &[]);
+        let shot = pixels(&device, &queue, &target.0);
+        eprintln!("{}", save(&shot, &format!("imported-{name}.png")).display());
+        pictures.push((seen(&shot, 0.5, 0.5), seen(&shot, 0.1, 0.1)));
+    }
+    let [(clear, clear_outside), (glass, glass_outside)] = pictures[..] else { unreachable!() };
+    // Without transmission the quad is opaque: its green replaces the red.
+    assert!(clear[1] > 200 && clear[0] < 30, "{clear:?}");
+    // With it the same alpha blends over the red behind: half and half.
+    assert!(glass[0].abs_diff(128) <= 3 && glass[1].abs_diff(128) <= 3 && glass[2] < 5, "{glass:?}");
+    // Beyond the glass the red shows alone.
+    assert!(clear_outside[0] > 200 && glass_outside[0] > 200 && glass_outside[1] < 30, "{glass_outside:?}");
+}

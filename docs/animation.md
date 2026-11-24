@@ -17,15 +17,32 @@ itself made by `sprout-model` from a Blender script).
   JSON: `NAME.mesh.json` for a file of one, `NAME_MESH[_N].mesh.json`
   otherwise. Static ones are baked where the scene's nodes put them (mirrored
   ones turned right side out); smooth normals are worked out where the file
-  has none. Coordinates stay glTF's: Y up, right-handed, in the file's units.
+  has none. A primitive whose material has a normal map or anisotropy gets
+  `tangents`: the file's `TANGENT` attribute, moved with the placement, or,
+  where it has none, MikkTSpace tangents made from its positions, normals and
+  texture coordinates (a vertex where mirrored coordinates meet becomes two;
+  `pen_gltf::tangents` lists how it differs from the reference code). Skinned
+  and static primitives alike. Coordinates stay glTF's: Y up, right-handed, in
+  the file's units.
 - **Materials.** `NAME_MATERIAL.material.json` for each material they use
   (`NAME_default` for none), naming `--shader` (default `scene.wgsl`): base
   color and its texture, the normal map, `instanceParameters` [1 −
   roughness, metallic, emission, 0] (gdev's `scene.wgsl` reads them as gloss,
   metal and glow), `KHR_materials_unlit`, `blend` for BLEND and
-  `alphaCutoff` for MASK.
+  `alphaCutoff` for MASK. The factors of `KHR_materials_clearcoat`, `sheen`,
+  `anisotropy`, `transmission`, `volume`, `ior`, `specular` and
+  `emissive_strength` become the material's `surface` block
+  ([material shaders](materials.md)); `emissive_strength` also multiplies the
+  glow, as it always has, so a shader that multiplies the glow by the
+  surface's `emissiveStrength` counts it twice. Their textures are not read.
 - **Images.** The PNG and JPEG images those name, as `NAME_IMAGE.png|jpg`.
   Other formats (KTX2, WebP) are left out with a note.
+- **What is left out** is reported on standard error, once for each kind: the
+  textures of the extensions above, and every other extension in the file's
+  `extensionsUsed` (`KHR_texture_transform`, `KHR_materials_iridescence`,
+  ...). A file that requires an extension, rather than using it (the
+  extensions above are only ever used), is refused, but for
+  `KHR_materials_unlit` and `KHR_materials_emissive_strength`.
 - **Skins and animations.** A skinned primitive keeps its bind pose and
   carries, in its mesh JSON, its four joints and weights a vertex (weights
   made to add up to 1), its rig (`skeleton`: the joints and the nodes above

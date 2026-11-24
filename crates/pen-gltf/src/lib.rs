@@ -7,10 +7,13 @@
 //!   ones where the scene puts them, skinned ones in their bind pose with
 //!   their four joints and weights a vertex and their rig (the skeleton, the
 //!   joints and every animation of the file as a clip, see
-//!   `pen_render::animation`), which posed draws move;
+//!   `pen_render::animation`), which posed draws move; and, for a primitive
+//!   with a normal map or an anisotropic material, its `tangents`: the file's
+//!   `TANGENT` attribute or, where it has none, MikkTSpace tangents ([`tangents`]);
 //! - a material JSON for each material those use (base color and its
 //!   texture, normal map, PBR factors as `instanceParameters` [gloss, metal,
-//!   glow, 0], unlit, blend and cutoff), naming the shader the import is told;
+//!   glow, 0], unlit, blend and cutoff, and the factors of the extensions
+//!   below as its `surface` block), naming the shader the import is told;
 //! - the PNG and JPEG images those materials name;
 //! - with vertex-animation textures asked for, each skinned primitive's clips
 //!   baked into one (vat.rs) and a material that draws with it, and the
@@ -18,10 +21,20 @@
 //! - and `NAME.import.json`, what it wrote: each mesh's material, and the
 //!   clips by name in the order poses name them.
 //!
+//! Material extensions read: `KHR_materials_unlit`, `KHR_materials_emissive_strength`
+//! (multiplying the emissive `glow` parameter, and as the surface's `emissiveStrength`),
+//! and, as factors only, `KHR_materials_clearcoat`, `_sheen`, `_anisotropy`,
+//! `_transmission`, `_volume`, `_ior` and `_specular`, into the material's
+//! `surface` block (docs/materials.md). The textures of those (clear coat,
+//! sheen colour and roughness, anisotropy, transmission, thickness, specular
+//! and specular colour) are not imported: each kind with one is reported in
+//! [`Imported::notes`], as is any other extension the file uses, which the import
+//! does not read.
+//!
 //! Files whose content is unchanged are left alone, so rerunning an import
 //! sets nothing else off; files the last import of the same name made and
 //! this one does not are removed.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -30,6 +43,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 mod gtex;
+pub mod tangents;
 pub mod vat;
 
 /// A shader that draws with vertex-animation textures, which an import
@@ -113,6 +127,9 @@ pub struct Geometry {
     /// A skinned primitive's four joints and weights a vertex.
     pub joints: Vec<[u16; 4]>,
     pub weights: Vec<[f32; 4]>,
+    /// Each vertex's tangent (xyz and a handedness of -1 or 1), or none for
+    /// the primitive.
+    pub tangents: Vec<[f32; 4]>,
 }
 
 /// Mesh JSON as the renderer reads it (`pen_render::pack_mesh`).
@@ -122,6 +139,8 @@ struct MeshFile<'a> {
     normals: Vec<f32>,
     uvs: Vec<f32>,
     indices: &'a [u32],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tangents: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     joints: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,6 +191,7 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
         taken: HashSet::new(),
         materials: HashMap::new(),
         images: HashMap::new(),
+        unread_textures: BTreeMap::new(),
     };
     writer.imported.clips = document
         .animations()
@@ -210,8 +230,15 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
                 None => None,
             };
             // A skinned mesh stays in its bind pose: its joints place it.
-            let geometry = geometry(&primitive, &buffers, rig.is_some(), (rig.is_none()).then_some(world))
+            let wants = wants_tangents(&primitive.material());
+            let geometry = geometry(&primitive, &buffers, rig.is_some(), (rig.is_none()).then_some(world), wants)
                 .with_context(|| format!("mesh {} primitive {}", mesh.index(), primitive.index()))?;
+            if wants && geometry.tangents.is_empty() {
+                writer.note(format!(
+                    "mesh {} has a normal map or anisotropy but no texture coordinates to make tangents from",
+                    mesh.index()
+                ));
+            }
             if primitive.get(&gltf::Semantic::Joints(1)).is_some() {
                 writer.note(format!(
                     "mesh {} binds vertices to more than four joints; the four first count",
@@ -228,6 +255,15 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
             let joints = rig.map_or(0, |rig| rig.joints.len());
             writer.imported.meshes.push(ImportedMesh { mesh: mesh_key, material, joints, vat });
         }
+    }
+    for name in document.extensions_used() {
+        if !READ_EXTENSIONS.contains(&name) {
+            writer.note(format!("the file uses {name}, which the import does not read"));
+        }
+    }
+    for (extension, textures) in std::mem::take(&mut writer.unread_textures) {
+        let textures: Vec<&str> = textures.into_iter().collect();
+        writer.note(format!("{extension}'s textures ({}) are not imported; its factors are", textures.join(", ")));
     }
     if let Some(vat) = &options.vat
         && writer.imported.meshes.iter().any(|mesh| mesh.vat.is_some())
@@ -269,6 +305,32 @@ fn sanitized(name: &str) -> String {
     if name.is_empty() { "model".to_owned() } else { name }
 }
 
+/// The material extensions whose factors become a material's `surface`
+/// block, each with the textures it can name, which are left out.
+const SURFACE_EXTENSIONS: [(&str, &[&str]); 7] = [
+    ("KHR_materials_clearcoat", &["clearcoatTexture", "clearcoatRoughnessTexture", "clearcoatNormalTexture"]),
+    ("KHR_materials_sheen", &["sheenColorTexture", "sheenRoughnessTexture"]),
+    ("KHR_materials_anisotropy", &["anisotropyTexture"]),
+    ("KHR_materials_transmission", &["transmissionTexture"]),
+    ("KHR_materials_volume", &["thicknessTexture"]),
+    ("KHR_materials_ior", &[]),
+    ("KHR_materials_specular", &["specularTexture", "specularColorTexture"]),
+];
+
+/// The extensions a file may use without the import leaving any of what they
+/// say out but the textures it reports.
+const READ_EXTENSIONS: [&str; 9] = [
+    "KHR_materials_unlit",
+    "KHR_materials_emissive_strength",
+    "KHR_materials_clearcoat",
+    "KHR_materials_sheen",
+    "KHR_materials_anisotropy",
+    "KHR_materials_transmission",
+    "KHR_materials_volume",
+    "KHR_materials_ior",
+    "KHR_materials_specular",
+];
+
 const IDENTITY: [f64; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 
 fn columns(matrix: [[f32; 4]; 4]) -> [f64; 16] {
@@ -300,6 +362,13 @@ fn narrow(value: f64) -> f32 {
 /// nearest it, 0.19999998807907104.
 fn tidy(value: f32) -> f64 {
     (f64::from(value) * 1e6).round() / 1e6
+}
+
+/// A surface number as people would write it, too small or large as it may be:
+/// the shortest decimal of the f32 nearest it, within what an f32 holds.
+fn short(value: f64) -> f64 {
+    let most = f64::from(f32::MAX);
+    format!("{}", narrow(value.clamp(-most, most))).parse().unwrap_or(0.0)
 }
 
 /// A buffer's bytes: the GLB's binary chunk, a data URI's, or a file's
@@ -475,6 +544,7 @@ fn geometry(
     buffers: &[Vec<u8>],
     skinned: bool,
     world: Option<&[f64; 16]>,
+    generate_tangents: bool,
 ) -> Result<Geometry> {
     let reader = primitive.reader(|buffer| buffers.get(buffer.index()).map(Vec::as_slice));
     let mut positions: Vec<[f32; 3]> = reader.read_positions().context("a primitive has no positions")?.collect();
@@ -488,10 +558,16 @@ fn geometry(
         !indices.is_empty() && indices.len().is_multiple_of(3) && indices.iter().all(|&index| (index as usize) < count),
         "a primitive's triangles must name its vertices"
     );
+    let textured = reader.read_tex_coords(0).is_some();
     let uvs: Vec<[f32; 2]> = match reader.read_tex_coords(0) {
         Some(coordinates) => coordinates.into_f32().collect(),
         None => vec![[0.0; 2]; count],
     };
+    let mut tangents: Vec<[f32; 4]> = reader.read_tangents().map(Iterator::collect).unwrap_or_default();
+    ensure!(
+        tangents.is_empty() || tangents.iter().flatten().all(|value| value.is_finite()),
+        "a primitive's tangents must be finite"
+    );
     let mut normals: Vec<[f32; 3]> = match reader.read_normals() {
         Some(normals) => normals.collect(),
         None => smooth_normals(&positions, &indices),
@@ -513,7 +589,10 @@ fn geometry(
         }
     }
     ensure!(
-        uvs.len() == count && normals.len() == count && (!skinned || (joints.len() == count && weights.len() == count)),
+        uvs.len() == count
+            && normals.len() == count
+            && (tangents.is_empty() || tangents.len() == count)
+            && (!skinned || (joints.len() == count && weights.len() == count)),
         "a primitive's attributes must have a value for each vertex"
     );
     if let Some(world) = world {
@@ -529,10 +608,24 @@ fn geometry(
                 [0, 1, 2].map(|row| narrow(normal[row * 3] * x + normal[row * 3 + 1] * y + normal[row * 3 + 2] * z));
         }
         // A mirroring placement turns triangles inside out: turn them back.
-        if determinant(world) < 0.0 {
+        let mirrored = determinant(world) < 0.0;
+        if mirrored {
             for triangle in indices.as_chunks_mut::<3>().0 {
                 triangle.swap(1, 2);
             }
+        }
+        // A tangent goes where the surface does, and a mirror turns the
+        // frame it makes with the normal and the bitangent inside out.
+        for tangent in &mut tangents {
+            let [x, y, z] = [tangent[0], tangent[1], tangent[2]].map(f64::from);
+            let moved = [0, 1, 2].map(|row| world[row] * x + world[4 + row] * y + world[8 + row] * z);
+            let length = moved.iter().map(|value| value * value).sum::<f64>().sqrt();
+            // One long, but for what is long enough already (so that a
+            // placement that moves it alone leaves it as it was).
+            let moved =
+                if length > 1e-8 && (length - 1.0).abs() > 1e-6 { moved.map(|value| value / length) } else { moved };
+            *tangent =
+                [narrow(moved[0]), narrow(moved[1]), narrow(moved[2]), if mirrored { -tangent[3] } else { tangent[3] }];
         }
     }
     for vector in &mut normals {
@@ -543,7 +636,25 @@ fn geometry(
             [0.0, 1.0, 0.0]
         };
     }
-    Ok(Geometry { positions, normals, uvs, indices, joints, weights })
+    let mut geometry = Geometry { positions, normals, uvs, indices, joints, weights, tangents };
+    // The tangents a normal map or an anisotropic material wants, made of
+    // the geometry as it stands in the mesh (placed, and wound as it draws).
+    if geometry.tangents.is_empty() && generate_tangents && textured {
+        let corners = tangents::corners(&geometry.positions, &geometry.normals, &geometry.uvs, &geometry.indices);
+        tangents::split(&mut geometry, &corners);
+    }
+    Ok(geometry)
+}
+
+/// Whether a primitive of `material` reads a tangent frame: a normal map, or
+/// anisotropy.
+fn wants_tangents(material: &gltf::Material) -> bool {
+    let anisotropic = material
+        .extension_value("KHR_materials_anisotropy")
+        .and_then(|extension| extension.get("anisotropyStrength"))
+        .and_then(Value::as_f64)
+        .is_some_and(|strength| strength != 0.0);
+    material.normal_texture().is_some() || anisotropic
 }
 
 fn determinant(m: &[f64; 16]) -> f64 {
@@ -597,6 +708,9 @@ struct Writer<'a> {
     materials: HashMap<Option<usize>, (String, Value)>,
     /// Each image's key, or None for one the renderer cannot read.
     images: HashMap<usize, Option<String>>,
+    /// The textures the materials name of each extension that has some, which
+    /// the import leaves out.
+    unread_textures: BTreeMap<&'static str, BTreeSet<&'static str>>,
 }
 
 impl Writer<'_> {
@@ -637,6 +751,7 @@ impl Writer<'_> {
             normals: geometry.normals.iter().flatten().copied().collect(),
             uvs: geometry.uvs.iter().flatten().copied().collect(),
             indices: &geometry.indices,
+            tangents: (!geometry.tangents.is_empty()).then(|| geometry.tangents.iter().flatten().copied().collect()),
             joints: rig.map(|_| geometry.joints.iter().flatten().copied().collect()),
             weights: rig.map(|_| geometry.weights.iter().flatten().copied().collect()),
             rig: rig.map(Rig::json),
@@ -696,6 +811,9 @@ impl Writer<'_> {
         {
             json["normalTexture"] = image.into();
         }
+        if let Some(surface) = self.surface(material) {
+            json["surface"] = surface;
+        }
         match material.alpha_mode() {
             gltf::material::AlphaMode::Blend => json["blend"] = true.into(),
             gltf::material::AlphaMode::Mask => {
@@ -703,10 +821,74 @@ impl Writer<'_> {
             }
             gltf::material::AlphaMode::Opaque => {}
         }
-        self.write(&key, (serde_json::to_string_pretty(&json)? + "\n").as_bytes())?;
+        let text = serde_json::to_string_pretty(&json)? + "\n";
+        // What the renderer would refuse is refused here.
+        pen_render::inspect_material(text.as_bytes()).with_context(|| format!("{key} as the renderer reads it"))?;
+        self.write(&key, text.as_bytes())?;
         self.imported.materials.push(key.clone());
         self.materials.insert(material.index(), (key.clone(), json.clone()));
         Ok((key, json))
+    }
+
+    /// A material's `surface` block, from the factors of its extensions
+    /// (docs/materials.md): the keys the file gives, in the ranges the renderer
+    /// takes, or None if it gives none. Their textures it notes as left out.
+    fn surface(&mut self, material: &gltf::Material) -> Option<Value> {
+        let mut surface = serde_json::Map::new();
+        let number = |extension: &Value, key: &str, least: f64, most: f64| -> Option<Value> {
+            let value = extension.get(key)?.as_f64().filter(|value| value.is_finite())?;
+            Some(json!(short(value.clamp(least, most))))
+        };
+        let channels = |extension: &Value, key: &str, most: f64| -> Option<Value> {
+            let values = extension.get(key)?.as_array()?;
+            let channel = |at: usize| -> Option<f64> {
+                values.get(at)?.as_f64().filter(|value| value.is_finite()).map(|value| short(value.clamp(0.0, most)))
+            };
+            Some(json!([channel(0)?, channel(1)?, channel(2)?]))
+        };
+        let mut set = |key: &str, value: Option<Value>| {
+            if let Some(value) = value {
+                surface.insert(key.to_owned(), value);
+            }
+        };
+        for (name, textures) in SURFACE_EXTENSIONS {
+            let Some(extension) = material.extension_value(name).filter(|extension| extension.is_object()) else {
+                continue;
+            };
+            for texture in textures.iter().filter(|texture| extension.get(**texture).is_some()) {
+                self.unread_textures.entry(name).or_default().insert(texture);
+            }
+            match name {
+                "KHR_materials_clearcoat" => {
+                    set("clearcoat", number(extension, "clearcoatFactor", 0.0, 1.0));
+                    set("clearcoatRoughness", number(extension, "clearcoatRoughnessFactor", 0.0, 1.0));
+                }
+                "KHR_materials_sheen" => {
+                    set("sheenColor", channels(extension, "sheenColorFactor", 1.0));
+                    set("sheenRoughness", number(extension, "sheenRoughnessFactor", 0.0, 1.0));
+                }
+                "KHR_materials_anisotropy" => {
+                    set("anisotropy", number(extension, "anisotropyStrength", -1.0, 1.0));
+                    set("anisotropyRotation", number(extension, "anisotropyRotation", f64::MIN, f64::MAX));
+                }
+                "KHR_materials_transmission" => set("transmission", number(extension, "transmissionFactor", 0.0, 1.0)),
+                "KHR_materials_volume" => {
+                    set("thickness", number(extension, "thicknessFactor", 0.0, f64::MAX));
+                    // No distance, or none above 0, is the glTF's infinity: 0.
+                    set("attenuationDistance", number(extension, "attenuationDistance", 0.0, f64::MAX));
+                    set("attenuationColor", channels(extension, "attenuationColor", 1.0));
+                }
+                "KHR_materials_ior" => set("ior", number(extension, "ior", 1.0, f64::MAX)),
+                _ => {
+                    set("specular", number(extension, "specularFactor", 0.0, f64::MAX));
+                    set("specularColor", channels(extension, "specularColorFactor", f64::MAX));
+                }
+            }
+        }
+        if let Some(strength) = material.emissive_strength() {
+            set("emissiveStrength", Some(json!(short(f64::from(strength).max(0.0)))));
+        }
+        (!surface.is_empty()).then_some(Value::Object(surface))
     }
 
     /// An image's key, written the first time; None for one that is not a

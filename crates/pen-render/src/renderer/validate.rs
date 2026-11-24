@@ -79,6 +79,51 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
         "motion blur strength must be within 0..4 and max_radius within 0..0.25"
     );
     ensure!(
+        frame.grade.sharpness.is_finite()
+            && (0.0..=1.0).contains(&frame.grade.sharpness)
+            && frame.grade.grain.is_finite()
+            && (0.0..=1.0).contains(&frame.grade.grain)
+            && frame.grade.flare.is_finite()
+            && (0.0..=2.0).contains(&frame.grade.flare)
+            && frame.grade.outline_strength.is_finite()
+            && (0.0..=1.0).contains(&frame.grade.outline_strength),
+        "grade sharpness/grain/outline_strength/flare must be finite and in range"
+    );
+    for al in &frame.area_lights {
+        ensure!(
+            finite(&al.position)
+                && finite(&al.right)
+                && finite(&al.up)
+                && finite(&al.color)
+                && al.intensity.is_finite()
+                && al.intensity >= 0.0
+                && al.width.is_finite()
+                && al.width >= 0.0
+                && al.height.is_finite()
+                && al.height >= 0.0
+                && al.range.is_finite()
+                && al.range >= 0.0,
+            "area light parameters must be finite and non-negative"
+        );
+    }
+    for d in &frame.pbr_decals {
+        validate_matrix(&d.transform)?;
+        ensure!(
+            [d.albedo.r, d.albedo.g, d.albedo.b, d.albedo.a, d.normal_strength, d.roughness, d.metallic, d.emissive_strength, d.fade]
+                .iter()
+                .all(|v| v.is_finite()),
+            "PBR decal parameters must be finite"
+        );
+    }
+    for c in &frame.camera_targets {
+        validate_matrix(&c.view)?;
+        validate_matrix(&c.projection)?;
+        ensure!(
+            [c.viewport_x, c.viewport_y, c.viewport_w, c.viewport_h].iter().all(|v| v.is_finite()),
+            "camera target viewport must be finite"
+        );
+    }
+    ensure!(
         frame.dof.focus_distance.is_finite()
             && frame.dof.focus_distance >= 0.0
             && frame.dof.focus_range.is_finite()

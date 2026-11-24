@@ -612,6 +612,11 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             ssr: rng.whole(2),
             volumetrics: rng.whole(2),
             ssgi: rng.flag(),
+            oit: rng.flag(),
+            physical_sky: rng.flag(),
+            upscale: rng.flag(),
+            ray_tracing: rng.whole(3),
+            ddgi: rng.flag(),
         },
         reflection: Reflection { budget: rng.whole(6) },
         sky: Sky {
@@ -711,6 +716,11 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             lut_weight: rng.number(),
             vignette: rng.number(),
             vignette_radius: rng.number(),
+            tonemap: rng.whole(3),
+            sharpness: rng.number(),
+            grain: rng.number(),
+            flare: rng.number(),
+            outline_strength: rng.number(),
         },
         hide_cursor: rng.flag(),
         loading: rng.flag(),
@@ -1063,6 +1073,60 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 grain_size: rng.number(),
                 grain_pitch: rng.number(),
                 reverb: rng.number(),
+            })
+        },
+        area_lights: {
+            let count = rng.count(4);
+            rng.list(count, |rng| pen_protocol::AreaLightSpec {
+                kind: rng.whole(3),
+                position: rng.vector(),
+                right: rng.vector(),
+                up: rng.vector(),
+                color: rng.vector(),
+                intensity: rng.number(),
+                width: rng.number(),
+                height: rng.number(),
+                range: rng.number(),
+                cookie_material: rng.whole(65535),
+                two_sided: rng.flag(),
+            })
+        },
+        pbr_decals: {
+            let count = rng.count(4);
+            rng.list(count, |rng| pen_protocol::PbrDecalSpec {
+                material: material(rng),
+                transform: rng.lanes(),
+                albedo: Color { r: rng.number(), g: rng.number(), b: rng.number(), a: rng.number() },
+                normal_strength: rng.number(),
+                roughness: rng.number(),
+                metallic: rng.number(),
+                emissive_strength: rng.number(),
+                fade: rng.number(),
+            })
+        },
+        camera_targets: {
+            let count = rng.count(3);
+            rng.list(count, |rng| pen_protocol::CameraTargetSpec {
+                material: material(rng),
+                width: rng.whole(4096),
+                height: rng.whole(4096),
+                viewport_x: rng.number(),
+                viewport_y: rng.number(),
+                viewport_w: rng.number(),
+                viewport_h: rng.number(),
+                split_screen: rng.flag(),
+                view: rng.lanes(),
+                projection: rng.lanes(),
+            })
+        },
+        video_streams: {
+            let count = rng.count(3);
+            rng.list(count, |rng| pen_protocol::VideoStreamSpec {
+                material: material(rng),
+                time: rng.number(),
+                playing: rng.flag(),
+                looping: rng.flag(),
+                speed: rng.number(),
             })
         },
         emitters: {

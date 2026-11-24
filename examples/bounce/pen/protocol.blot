@@ -66,6 +66,15 @@ const max_motions = 100000
 const max_ribbons = 65536
 // The most gamepad haptic rumble commands one frame may declare.
 const max_haptics = 32
+// The most LTC area lights one frame may declare.
+const max_area_lights = 64
+// The most PBR deferred decals one frame may declare.
+const max_pbr_decals = 1024
+// The most render-to-texture or split-screen secondary cameras one frame may
+// declare.
+const max_camera_targets = 8
+// The most GPU video streams one frame may declare.
+const max_video_streams = 16
 // The most buses one frame may declare, the master (bus 0) included.
 const max_buses = 16
 // Voice ids are whole numbers from 1 to this, the wire's exact-integer range.
@@ -806,7 +815,7 @@ const reports_op_queued = 2
 
 // Sizes in lanes.
 const packet_magic = 4670534.0
-const packet_header_floats = 252
+const packet_header_floats = 266
 const frame_header_floats = 5
 const event_floats = 5
 const extensions_marker = 5260632.0
@@ -841,6 +850,10 @@ const ribbon_floats = 12
 const haptic_floats = 4
 const reverb_zone_floats = 12
 const synth_voice_floats = 16
+const area_light_floats = 19
+const pbr_decal_floats = 26
+const camera_target_floats = 40
+const video_stream_floats = 5
 
 // Where each header lane and record field starts.
 const header_magic_lane = 0
@@ -999,6 +1012,20 @@ const header_reverb_damping_lane = 248
 const header_haptic_count_lane = 249
 const header_reverb_zone_count_lane = 250
 const header_synth_count_lane = 251
+const header_grade_tonemap_lane = 252
+const header_grade_sharpness_lane = 253
+const header_grade_grain_lane = 254
+const header_grade_flare_lane = 255
+const header_grade_outline_strength_lane = 256
+const header_quality_oit_lane = 257
+const header_quality_physical_sky_lane = 258
+const header_quality_upscale_lane = 259
+const header_quality_ray_tracing_lane = 260
+const header_quality_ddgi_lane = 261
+const header_area_light_count_lane = 262
+const header_pbr_decal_count_lane = 263
+const header_camera_target_count_lane = 264
+const header_video_stream_count_lane = 265
 const draw_mesh_lane = 0
 const draw_material_lane = 1
 const draw_transform_lane = 2
@@ -1202,6 +1229,40 @@ const synth_voice_resonance_lane = 12
 const synth_voice_grain_size_lane = 13
 const synth_voice_grain_pitch_lane = 14
 const synth_voice_reverb_lane = 15
+const area_light_spec_kind_lane = 0
+const area_light_spec_position_lane = 1
+const area_light_spec_right_lane = 4
+const area_light_spec_up_lane = 7
+const area_light_spec_color_lane = 10
+const area_light_spec_intensity_lane = 13
+const area_light_spec_width_lane = 14
+const area_light_spec_height_lane = 15
+const area_light_spec_range_lane = 16
+const area_light_spec_cookie_material_lane = 17
+const area_light_spec_two_sided_lane = 18
+const pbr_decal_spec_material_lane = 0
+const pbr_decal_spec_transform_lane = 1
+const pbr_decal_spec_albedo_lane = 17
+const pbr_decal_spec_normal_strength_lane = 21
+const pbr_decal_spec_roughness_lane = 22
+const pbr_decal_spec_metallic_lane = 23
+const pbr_decal_spec_emissive_strength_lane = 24
+const pbr_decal_spec_fade_lane = 25
+const camera_target_spec_material_lane = 0
+const camera_target_spec_width_lane = 1
+const camera_target_spec_height_lane = 2
+const camera_target_spec_viewport_x_lane = 3
+const camera_target_spec_viewport_y_lane = 4
+const camera_target_spec_viewport_w_lane = 5
+const camera_target_spec_viewport_h_lane = 6
+const camera_target_spec_split_screen_lane = 7
+const camera_target_spec_view_lane = 8
+const camera_target_spec_projection_lane = 24
+const video_stream_spec_material_lane = 0
+const video_stream_spec_time_lane = 1
+const video_stream_spec_playing_lane = 2
+const video_stream_spec_looping_lane = 3
+const video_stream_spec_speed_lane = 4
 const solid_faces_lane = 0
 const field_patch_material_lane = 0
 const field_patch_width_lane = 1

@@ -37,6 +37,7 @@ mod timing;
 mod validate;
 mod veil;
 mod velocity;
+mod wired_passes;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -796,6 +797,8 @@ pub(crate) struct State {
     surface_atlas_packer: Option<crate::surface_atlas::SurfaceAtlasPacker>,
     // Active display tonemap operator (`Shoulder` default).
     tonemap: crate::tonemap::TonemapOperator,
+    // Wired end-to-end passes driven directly by RenderFrame (physical sky, area lights, PBR decals, RCAS/post-FX, OIT, split-screen).
+    wired: wired_passes::WiredPasses,
     instance_data: Vec<f32>,
     instance_uploads: instance_upload::Uploads,
     last_stats: RenderStats,
@@ -1189,6 +1192,7 @@ impl State {
             surface_atlas_ids: HashMap::new(),
             surface_atlas_packer: None,
             tonemap: crate::tonemap::TonemapOperator::Shoulder,
+            wired: wired_passes::WiredPasses::default(),
             instance_data: vec![0.0; 20],
             instance_uploads: instance_upload::Uploads::default(),
             last_stats: RenderStats::default(),

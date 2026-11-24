@@ -195,6 +195,26 @@
       "doc": "The most gamepad haptic rumble commands one frame may declare."
     },
     {
+      "limit": "MAX_AREA_LIGHTS",
+      "value": 64,
+      "doc": "The most LTC area lights one frame may declare."
+    },
+    {
+      "limit": "MAX_PBR_DECALS",
+      "value": 1024,
+      "doc": "The most PBR deferred decals one frame may declare."
+    },
+    {
+      "limit": "MAX_CAMERA_TARGETS",
+      "value": 8,
+      "doc": "The most render-to-texture or split-screen secondary cameras one frame may declare."
+    },
+    {
+      "limit": "MAX_VIDEO_STREAMS",
+      "value": 16,
+      "doc": "The most GPU video streams one frame may declare."
+    },
+    {
       "limit": "MAX_BUSES",
       "value": 16,
       "doc": "The most buses one frame may declare, the master (bus 0) included."
@@ -2614,6 +2634,74 @@
         "kind": "size",
         "section": "synths",
         "of": "count"
+      },
+      "grade.tonemap": {
+        "kind": "count",
+        "max": 3,
+        "default": 0,
+        "doc": "Display tonemapping operator: 0 Shoulder (default), 1 AgX filmic, 2 ACES Filmic, 3 Khronos PBR Neutral."
+      },
+      "grade.sharpness": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "AMD FidelityFX RCAS contrast-adaptive sharpening strength in 0..1 (0 disables)."
+      },
+      "grade.grain": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Luminance-aware film grain intensity in 0..1 (0 disables)."
+      },
+      "grade.flare": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Horizontal chromatic anamorphic lens flare strength in 0..2 (0 disables)."
+      },
+      "grade.outline_strength": {
+        "kind": "f32",
+        "default": 0,
+        "doc": "Depth/normal edge outline strength in 0..1 (0 disables)."
+      },
+      "quality.oit": {
+        "kind": "flag",
+        "doc": "Weighted Blended Order-Independent Transparency for overlapping translucent draws."
+      },
+      "quality.physical_sky": {
+        "kind": "flag",
+        "doc": "Hillaire 2020 physical atmosphere LUTs and raymarched 3D volumetric clouds."
+      },
+      "quality.upscale": {
+        "kind": "flag",
+        "doc": "TAAU temporal upscaling and RCAS sharpening when render scale < 1."
+      },
+      "quality.ray_tracing": {
+        "kind": "count",
+        "max": 3,
+        "default": 0,
+        "doc": "GPU BVH ray tracing tier: 0 off, 1 RT sun shadows, 2 RT shadows + RTAO, 3 RT shadows + RTAO + RT reflections/GI."
+      },
+      "quality.ddgi": {
+        "kind": "flag",
+        "doc": "Dynamic Diffuse Global Illumination octahedral probe volume evaluation."
+      },
+      "area_light_count": {
+        "kind": "size",
+        "section": "area_lights",
+        "of": "count"
+      },
+      "pbr_decal_count": {
+        "kind": "size",
+        "section": "pbr_decals",
+        "of": "count"
+      },
+      "camera_target_count": {
+        "kind": "size",
+        "section": "camera_targets",
+        "of": "count"
+      },
+      "video_stream_count": {
+        "kind": "size",
+        "section": "video_streams",
+        "of": "count"
       }
     },
     "sections": [
@@ -4494,6 +4582,222 @@
           "limit": "MAX_SYNTHS",
           "value": 64,
           "doc": "The most procedural or granular DSP synth voices one frame may declare."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "area_lights",
+        "doc": "Physically based LTC area lights (rect, disk, tube) and 2D cookie projectors.",
+        "record": {
+          "name": "AreaLightSpec",
+          "constant": "AREA_LIGHT",
+          "fields": {
+            "kind": {
+              "kind": "count",
+              "max": 3,
+              "doc": "Area light shape: 0 Rect, 1 Disk, 2 Tube, 3 Cookie projector."
+            },
+            "position": {
+              "kind": "vector",
+              "type": { "name": "Vector", "components": ["x", "y", "z"] },
+              "doc": "World-space center position."
+            },
+            "right": {
+              "kind": "vector",
+              "type": { "name": "Vector", "components": ["x", "y", "z"] },
+              "doc": "Unit local right axis."
+            },
+            "up": {
+              "kind": "vector",
+              "type": { "name": "Vector", "components": ["x", "y", "z"] },
+              "doc": "Unit local up axis (light emits along cross(right, up))."
+            },
+            "color": {
+              "kind": "vector",
+              "type": { "name": "Vector", "components": ["x", "y", "z"] },
+              "doc": "Linear RGB light color."
+            },
+            "intensity": {
+              "kind": "f32",
+              "doc": "Radiant intensity / luminance multiplier."
+            },
+            "width": {
+              "kind": "f32",
+              "doc": "Full width (or diameter for disk, length for tube) in world units."
+            },
+            "height": {
+              "kind": "f32",
+              "doc": "Full height (or tube radius) in world units."
+            },
+            "range": {
+              "kind": "f32",
+              "doc": "Maximum attenuation distance in world units."
+            },
+            "cookie_material": {
+              "kind": "count",
+              "max": 65535,
+              "doc": "1-based catalog material index whose texture acts as a 2D light cookie (0 for none)."
+            },
+            "two_sided": {
+              "kind": "flag",
+              "doc": "Emit from both front and back faces."
+            }
+          },
+          "doc": "One LTC area light or cookie projector."
+        },
+        "max": {
+          "limit": "MAX_AREA_LIGHTS",
+          "value": 64,
+          "doc": "The most LTC area lights one frame may declare."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "pbr_decals",
+        "doc": "Full PBR deferred decals projecting albedo, normal, ORM, and emissive onto opaque surfaces.",
+        "record": {
+          "name": "PbrDecalSpec",
+          "constant": "PBR_DECAL",
+          "fields": {
+            "material": {
+              "kind": "reference",
+              "to": "material",
+              "doc": "Catalog material supplying decal albedo, normal, ORM, and emissive maps."
+            },
+            "transform": {
+              "kind": "matrix",
+              "doc": "World-space oriented unit-cube decal projection transform."
+            },
+            "albedo": {
+              "kind": "vector",
+              "type": { "name": "Color", "components": ["r", "g", "b", "a"] },
+              "doc": "Albedo RGBA tint and opacity."
+            },
+            "normal_strength": {
+              "kind": "f32",
+              "doc": "Tangent-space normal blending weight in 0..1."
+            },
+            "roughness": {
+              "kind": "f32",
+              "doc": "Decal roughness factor in 0..1."
+            },
+            "metallic": {
+              "kind": "f32",
+              "doc": "Decal metallic factor in 0..1."
+            },
+            "emissive_strength": {
+              "kind": "f32",
+              "doc": "Additive emissive intensity multiplier."
+            },
+            "fade": {
+              "kind": "f32",
+              "doc": "Normal angle fade cutoff cosine in 0..1."
+            }
+          },
+          "doc": "One PBR deferred decal volume."
+        },
+        "max": {
+          "limit": "MAX_PBR_DECALS",
+          "value": 1024,
+          "doc": "The most PBR deferred decals one frame may declare."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "camera_targets",
+        "doc": "Secondary cameras rendered either to dynamic material textures (portals, mirrors, monitors) or split-screen viewports.",
+        "record": {
+          "name": "CameraTargetSpec",
+          "constant": "CAMERA_TARGET",
+          "fields": {
+            "material": {
+              "kind": "reference",
+              "to": "material",
+              "doc": "Catalog material whose texture key receives the rendered output (ignored when split_screen is true)."
+            },
+            "width": {
+              "kind": "count",
+              "max": 4096,
+              "doc": "Offscreen target width in pixels (0 defaults to 256)."
+            },
+            "height": {
+              "kind": "count",
+              "max": 4096,
+              "doc": "Offscreen target height in pixels (0 defaults to 256)."
+            },
+            "viewport_x": {
+              "kind": "f32",
+              "doc": "Normalized [0,1] split-screen X origin."
+            },
+            "viewport_y": {
+              "kind": "f32",
+              "doc": "Normalized [0,1] split-screen Y origin."
+            },
+            "viewport_w": {
+              "kind": "f32",
+              "doc": "Normalized [0,1] split-screen width."
+            },
+            "viewport_h": {
+              "kind": "f32",
+              "doc": "Normalized [0,1] split-screen height."
+            },
+            "split_screen": {
+              "kind": "flag",
+              "doc": "When true, composites this camera directly onto the main screen at the normalized viewport rect."
+            },
+            "view": {
+              "kind": "matrix",
+              "doc": "Secondary camera column-major view matrix."
+            },
+            "projection": {
+              "kind": "matrix",
+              "doc": "Secondary camera column-major projection matrix."
+            }
+          },
+          "doc": "One render-to-texture or split-screen secondary camera."
+        },
+        "max": {
+          "limit": "MAX_CAMERA_TARGETS",
+          "value": 8,
+          "doc": "The most render-to-texture or split-screen secondary cameras one frame may declare."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "video_streams",
+        "doc": "GPU-decoded video streams bound to dynamic material textures.",
+        "record": {
+          "name": "VideoStreamSpec",
+          "constant": "VIDEO_STREAM",
+          "fields": {
+            "material": {
+              "kind": "reference",
+              "to": "material",
+              "doc": "Catalog material whose texture key names the video asset (.y4m/.ivf)."
+            },
+            "time": {
+              "kind": "f32",
+              "doc": "Target playback timestamp in seconds."
+            },
+            "playing": {
+              "kind": "flag",
+              "doc": "Whether playback is active."
+            },
+            "looping": {
+              "kind": "flag",
+              "doc": "Whether playback loops at end of stream."
+            },
+            "speed": {
+              "kind": "f32",
+              "doc": "Playback speed multiplier (0 defaults to 1.0)."
+            }
+          },
+          "doc": "One GPU video texture playback directive."
+        },
+        "max": {
+          "limit": "MAX_VIDEO_STREAMS",
+          "value": 16,
+          "doc": "The most GPU video streams one frame may declare."
         }
       },
       {

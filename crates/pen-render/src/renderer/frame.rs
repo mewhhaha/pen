@@ -300,6 +300,19 @@ impl State {
             post.set_tonemap(self.tonemap, self.context.display.encoded_peak());
             self.post = Some(post);
         }
+        // Apply per-frame tonemap selection from RenderFrame when nonzero (or keep host override).
+        let effective_tonemap = if frame.grade.tonemap != 0 {
+            crate::tonemap::TonemapOperator::from_u32(frame.grade.tonemap)
+        } else {
+            self.tonemap
+        };
+        if let Some(post) = &mut self.post {
+            post.set_tonemap(effective_tonemap, self.context.display.encoded_peak());
+        }
+        // Execute non-split-screen RTT secondary cameras before main-view batching so materials sample them fresh.
+        self.run_rtt_cameras(frame, catalog)?;
+        // Upload frame LTC area lights if present.
+        self.upload_area_lights(frame);
         let samples = self.quality(frame, catalog, scratch)?;
         // The veil covers the frame while the passes around the scene
         // compile (it waits for them, see below). Without one, the frame
@@ -329,6 +342,7 @@ impl State {
         self.prepare_items(frame, catalog, samples, scratch)?;
         // Decals whose material and texture are ready, by material.
         self.decal_batches(frame, catalog, scratch)?;
+        let prepared_pbr_decals = self.prepare_pbr_decals(frame, catalog)?;
         // Sprites over the finished image, in order.
         self.sprite_batches(&frame.sprites, catalog, &mut scratch.sprites, &mut scratch.sprite_order)?;
         // Particles and ribbon trails whose material, texture and pipeline are ready.
@@ -429,6 +443,8 @@ impl State {
         let mut encoder = device.create_command_encoder(&Default::default());
         // The sky's reflection, drawn again if its colors changed.
         self.environment.encode(&device, &mut encoder);
+        // Physical atmosphere LUTs and raymarched 3D volumetric clouds when enabled.
+        self.encode_physical_sky(&mut encoder, frame, targets.size)?;
         // Timestamps around the passes, read back a few frames later, while
         // the host or a frame budget wants them.
         self.timer.begin(self.timing || self.resolution.budgeted());
@@ -526,7 +542,7 @@ impl State {
         // surfaces, particles or overlays then has its opaque picture misted, and
         // draws those over it in a second pass, with the mist and the opaque
         // picture to read.
-        let layered = !scratch.decals.is_empty();
+        let layered = !scratch.decals.is_empty() || !prepared_pbr_decals.is_empty();
         let scene_group = &self.scene_group.as_ref().unwrap().0;
         let lights = self.clusters.group();
         let draw_layers = |pass: &mut wgpu::RenderPass<'_>,
@@ -601,11 +617,11 @@ impl State {
                 &self.timer,
             );
         }
-        if layered {
+        if !scratch.decals.is_empty() {
             let decals = self.decals.get_or_insert_with(|| Decals::new(&device));
             let mut decal_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("decals"),
-                color_attachments: &[Some(targets.color(clear, false, true))],
+                color_attachments: &[Some(targets.color(clear, false, prepared_pbr_decals.is_empty()))],
                 timestamp_writes: self.timer.pass(Span::Scene),
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &targets.depth,
@@ -626,6 +642,21 @@ impl State {
                 samples,
                 targets.size,
             );
+        }
+        if !prepared_pbr_decals.is_empty() {
+            Self::encode_pbr_decals_prepared(
+                &mut self.wired,
+                &device,
+                &self.queue,
+                &mut encoder,
+                frame,
+                &prepared_pbr_decals,
+                targets.color(clear, false, true),
+                &targets.depth,
+                &targets.depth_only,
+                samples,
+                targets.size,
+            )?;
         }
         if subsurface {
             self.post.as_mut().unwrap().diffuse(&mut self.built_ins, &mut encoder, frame, &self.timer);
@@ -698,6 +729,22 @@ impl State {
                 &output,
                 self.timer.pass(Span::Post),
             );
+        } else if super::wired_passes::WiredPasses::wants_post_polish(frame) {
+            let polish_in = self.wired.polish_target(&device, (output_width, output_height), self.context.format);
+            self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &polish_in, &self.timer, &tables);
+            Self::encode_post_polish_wired(
+                &mut self.wired,
+                &device,
+                &mut encoder,
+                frame,
+                self.frames,
+                self.context.format,
+                &polish_in,
+                &targets.depth_only,
+                &output,
+                (output_width, output_height),
+                samples,
+            )?;
         } else {
             self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &output, &self.timer, &tables);
         }
@@ -786,6 +833,8 @@ impl State {
             post.exposure_finish(&mut encoder);
         }
         self.queue.submit([encoder.finish()]);
+        // Render and composite any split-screen cameras directly onto the output surface before present.
+        self.composite_split_screen(frame, catalog, &surface, (output_width, output_height))?;
         if let Some(post) = &mut self.post {
             post.exposure_submitted();
         }

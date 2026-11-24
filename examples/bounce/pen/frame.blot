@@ -43,6 +43,11 @@ func header (schema: U32): types.RenderHeader => {
     ssr: 0,
     volumetrics: 0,
     ssgi: false,
+    oit: false,
+    physical_sky: false,
+    upscale: false,
+    ray_tracing: 0,
+    ddgi: false,
   },
   sky: $types.Sky {
     zenith: $types.Vector { x: 0.0, y: 0.0, z: 0.0 },
@@ -138,6 +143,11 @@ func header (schema: U32): types.RenderHeader => {
     lut_weight: 1.0,
     vignette: 0.0,
     vignette_radius: 0.5,
+    tonemap: 0,
+    sharpness: 0.0,
+    grain: 0.0,
+    flare: 0.0,
+    outline_strength: 0.0,
   },
   reflection: $types.Reflection {
     budget: 0,

@@ -309,6 +309,52 @@ type SynthVoice is data = $SynthVoice {
   reverb: F32,
 }
 
+type AreaLightSpec is data = $AreaLightSpec {
+  kind: U32,
+  position: Vector,
+  right: Vector,
+  up: Vector,
+  color: Vector,
+  intensity: F32,
+  width: F32,
+  height: F32,
+  range: F32,
+  cookie_material: U32,
+  two_sided: Bool,
+}
+
+type PbrDecalSpec is data = $PbrDecalSpec {
+  material: U32,
+  transform: Mat4,
+  albedo: Color,
+  normal_strength: F32,
+  roughness: F32,
+  metallic: F32,
+  emissive_strength: F32,
+  fade: F32,
+}
+
+type CameraTargetSpec is data = $CameraTargetSpec {
+  material: U32,
+  width: U32,
+  height: U32,
+  viewport_x: F32,
+  viewport_y: F32,
+  viewport_w: F32,
+  viewport_h: F32,
+  split_screen: Bool,
+  view: Mat4,
+  projection: Mat4,
+}
+
+type VideoStreamSpec is data = $VideoStreamSpec {
+  material: U32,
+  time: F32,
+  playing: Bool,
+  looping: Bool,
+  speed: F32,
+}
+
 type Solid is data = $Solid {
   faces: &[SolidFace],
 }
@@ -377,6 +423,11 @@ type Quality is data = $Quality {
   ssr: U32,
   volumetrics: U32,
   ssgi: Bool,
+  oit: Bool,
+  physical_sky: Bool,
+  upscale: Bool,
+  ray_tracing: U32,
+  ddgi: Bool,
 }
 
 type Sky is data = $Sky {
@@ -476,6 +527,11 @@ type Grade is data = $Grade {
   lut_weight: F32,
   vignette: F32,
   vignette_radius: F32,
+  tonemap: U32,
+  sharpness: F32,
+  grain: F32,
+  flare: F32,
+  outline_strength: F32,
 }
 
 type MotionBlur is data = $MotionBlur {

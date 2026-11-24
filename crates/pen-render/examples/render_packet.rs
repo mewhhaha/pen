@@ -206,6 +206,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
             ssr: 0,
             volumetrics: 0,
             ssgi: false,
+            ..Quality::default()
         },
         sky: Sky {
             zenith: vector(0.2, 0.4, 0.8),
@@ -275,6 +276,7 @@ fn synthetic(catalog: &Catalog, (width, height): (u32, u32)) -> RenderFrame {
         undo_requested: false,
         redo_requested: false,
         exit_requested: false,
+        ..RenderFrame::default()
     }
 }
 

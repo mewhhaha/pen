@@ -60,6 +60,7 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
             ssr: 0,
             volumetrics: 0,
             ssgi: false,
+            ..Quality::default()
         },
         sky: Sky {
             zenith: zero,
@@ -116,6 +117,7 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
         undo_requested: false,
         redo_requested: false,
         exit_requested: false,
+        ..RenderFrame::default()
     }
 }
 

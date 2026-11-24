@@ -44,6 +44,7 @@ mod logger;
 mod loudness;
 #[cfg(feature = "devtools")]
 mod materials;
+mod media;
 mod mods;
 mod net;
 #[cfg(feature = "compiler")]

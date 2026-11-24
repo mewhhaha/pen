@@ -1511,6 +1511,92 @@ pub mod types {
         /// Reverb send level.
         pub reverb: f32,
     }
+    /// One LTC area light or cookie projector.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct AreaLightSpec {
+        /// Area light shape: 0 Rect, 1 Disk, 2 Tube, 3 Cookie projector.
+        pub kind: u32,
+        /// World-space center position.
+        pub position: Vector,
+        /// Unit local right axis.
+        pub right: Vector,
+        /// Unit local up axis (light emits along cross(right, up)).
+        pub up: Vector,
+        /// Linear RGB light color.
+        pub color: Vector,
+        /// Radiant intensity / luminance multiplier.
+        pub intensity: f32,
+        /// Full width (or diameter for disk, length for tube) in world units.
+        pub width: f32,
+        /// Full height (or tube radius) in world units.
+        pub height: f32,
+        /// Maximum attenuation distance in world units.
+        pub range: f32,
+        /// 1-based catalog material index whose texture acts as a 2D light cookie (0 for none).
+        pub cookie_material: u32,
+        /// Emit from both front and back faces.
+        pub two_sided: bool,
+    }
+    /// One PBR deferred decal volume.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct PbrDecalSpec {
+        /// Catalog material supplying decal albedo, normal, ORM, and emissive maps.
+        pub material: u32,
+        /// World-space oriented unit-cube decal projection transform.
+        pub transform: Matrix,
+        /// Albedo RGBA tint and opacity.
+        pub albedo: Color,
+        /// Tangent-space normal blending weight in 0..1.
+        pub normal_strength: f32,
+        /// Decal roughness factor in 0..1.
+        pub roughness: f32,
+        /// Decal metallic factor in 0..1.
+        pub metallic: f32,
+        /// Additive emissive intensity multiplier.
+        pub emissive_strength: f32,
+        /// Normal angle fade cutoff cosine in 0..1.
+        pub fade: f32,
+    }
+    /// One render-to-texture or split-screen secondary camera.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct CameraTargetSpec {
+        /// Catalog material whose texture key receives the rendered output (ignored when
+        /// split_screen is true).
+        pub material: u32,
+        /// Offscreen target width in pixels (0 defaults to 256).
+        pub width: u32,
+        /// Offscreen target height in pixels (0 defaults to 256).
+        pub height: u32,
+        /// Normalized [0,1] split-screen X origin.
+        pub viewport_x: f32,
+        /// Normalized [0,1] split-screen Y origin.
+        pub viewport_y: f32,
+        /// Normalized [0,1] split-screen width.
+        pub viewport_w: f32,
+        /// Normalized [0,1] split-screen height.
+        pub viewport_h: f32,
+        /// When true, composites this camera directly onto the main screen at the normalized
+        /// viewport rect.
+        pub split_screen: bool,
+        /// Secondary camera column-major view matrix.
+        pub view: Matrix,
+        /// Secondary camera column-major projection matrix.
+        pub projection: Matrix,
+    }
+    /// One GPU video texture playback directive.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct VideoStreamSpec {
+        /// Catalog material whose texture key names the video asset (.y4m/.ivf).
+        pub material: u32,
+        /// Target playback timestamp in seconds.
+        pub time: f32,
+        /// Whether playback is active.
+        pub playing: bool,
+        /// Whether playback loops at end of stream.
+        pub looping: bool,
+        /// Playback speed multiplier (0 defaults to 1.0).
+        pub speed: f32,
+    }
     /// How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture
     /// filtering, ambient occlusion, a sky, screen effects, bloom and temporal antialiasing.
     #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1538,6 +1624,17 @@ pub mod types {
         pub volumetrics: u32,
         /// Screen-space diffuse global illumination bounce over the opaque scene.
         pub ssgi: bool,
+        /// Weighted Blended Order-Independent Transparency for overlapping translucent draws.
+        pub oit: bool,
+        /// Hillaire 2020 physical atmosphere LUTs and raymarched 3D volumetric clouds.
+        pub physical_sky: bool,
+        /// TAAU temporal upscaling and RCAS sharpening when render scale < 1.
+        pub upscale: bool,
+        /// GPU BVH ray tracing tier: 0 off, 1 RT sun shadows, 2 RT shadows + RTAO, 3 RT shadows
+        /// + RTAO + RT reflections/GI.
+        pub ray_tracing: u32,
+        /// Dynamic Diffuse Global Illumination octahedral probe volume evaluation.
+        pub ddgi: bool,
     }
     impl Default for Quality {
         fn default() -> Self {
@@ -1554,6 +1651,11 @@ pub mod types {
                 ssr: Default::default(),
                 volumetrics: Default::default(),
                 ssgi: Default::default(),
+                oit: Default::default(),
+                physical_sky: Default::default(),
+                upscale: Default::default(),
+                ray_tracing: 0,
+                ddgi: Default::default(),
             }
         }
     }
@@ -1844,6 +1946,17 @@ pub mod types {
         /// Where the vignette starts, as a share of the way from the middle to a corner (0 to
         /// 1).
         pub vignette_radius: f32,
+        /// Display tonemapping operator: 0 Shoulder (default), 1 AgX filmic, 2 ACES Filmic, 3
+        /// Khronos PBR Neutral.
+        pub tonemap: u32,
+        /// AMD FidelityFX RCAS contrast-adaptive sharpening strength in 0..1 (0 disables).
+        pub sharpness: f32,
+        /// Luminance-aware film grain intensity in 0..1 (0 disables).
+        pub grain: f32,
+        /// Horizontal chromatic anamorphic lens flare strength in 0..2 (0 disables).
+        pub flare: f32,
+        /// Depth/normal edge outline strength in 0..1 (0 disables).
+        pub outline_strength: f32,
     }
     impl Default for Grade {
         fn default() -> Self {
@@ -1864,6 +1977,11 @@ pub mod types {
                 lut_weight: 1.0,
                 vignette: 0.0,
                 vignette_radius: 0.5,
+                tonemap: 0,
+                sharpness: 0.0,
+                grain: 0.0,
+                flare: 0.0,
+                outline_strength: 0.0,
             }
         }
     }
@@ -2110,6 +2228,16 @@ pub mod types {
         /// Real-time procedural and granular DSP synthesizer voices mixed alongside clip
         /// voices.
         pub synths: Vec<SynthVoice>,
+        /// Physically based LTC area lights (rect, disk, tube) and 2D cookie projectors.
+        pub area_lights: Vec<AreaLightSpec>,
+        /// Full PBR deferred decals projecting albedo, normal, ORM, and emissive onto opaque
+        /// surfaces.
+        pub pbr_decals: Vec<PbrDecalSpec>,
+        /// Secondary cameras rendered either to dynamic material textures (portals, mirrors,
+        /// monitors) or split-screen viewports.
+        pub camera_targets: Vec<CameraTargetSpec>,
+        /// GPU-decoded video streams bound to dynamic material textures.
+        pub video_streams: Vec<VideoStreamSpec>,
         /// The game's own sections, which its pen.json `protocol` declares, after the rest of
         /// the packet: a marker, their count, then each one's tag, length and values. A packet
         /// without any ends before the marker. Tag 0 is reserved for one optional development
@@ -2187,6 +2315,10 @@ pub mod types {
                 haptics: Default::default(),
                 reverb_zones: Default::default(),
                 synths: Default::default(),
+                area_lights: Default::default(),
+                pbr_decals: Default::default(),
+                camera_targets: Default::default(),
+                video_streams: Default::default(),
                 extensions: Default::default(),
             }
         }
@@ -2255,6 +2387,14 @@ pub mod codec {
     pub const MAX_RIBBONS: usize = 65536;
     /// The most gamepad haptic rumble commands one frame may declare.
     pub const MAX_HAPTICS: usize = 32;
+    /// The most LTC area lights one frame may declare.
+    pub const MAX_AREA_LIGHTS: usize = 64;
+    /// The most PBR deferred decals one frame may declare.
+    pub const MAX_PBR_DECALS: usize = 1024;
+    /// The most render-to-texture or split-screen secondary cameras one frame may declare.
+    pub const MAX_CAMERA_TARGETS: usize = 8;
+    /// The most GPU video streams one frame may declare.
+    pub const MAX_VIDEO_STREAMS: usize = 16;
     /// The most buses one frame may declare, the master (bus 0) included.
     pub const MAX_BUSES: usize = 16;
     /// Voice ids are whole numbers from 1 to this, the wire's exact-integer range.
@@ -2347,8 +2487,11 @@ pub mod codec {
     /// morph_weight_count, motion_blur.strength, motion_blur.max_radius, motion_blur.samples,
     /// dof.focus_distance, dof.focus_range, dof.aperture, dof.max_blur, motion_count,
     /// quality.ssgi, ribbon_count, reverb.decay, reverb.damping, haptic_count,
-    /// reverb_zone_count, synth_count.
-    pub const PACKET_HEADER_FLOATS: usize = 252;
+    /// reverb_zone_count, synth_count, grade.tonemap, grade.sharpness, grade.grain,
+    /// grade.flare, grade.outline_strength, quality.oit, quality.physical_sky, quality.upscale,
+    /// quality.ray_tracing, quality.ddgi, area_light_count, pbr_decal_count,
+    /// camera_target_count, video_stream_count.
+    pub const PACKET_HEADER_FLOATS: usize = 266;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -2427,6 +2570,17 @@ pub mod codec {
     /// Lanes: id, mode, bus, frequency, gain, pan, detune, attack, decay, sustain, release,
     /// cutoff, resonance, grain_size, grain_pitch, reverb.
     pub const SYNTH_VOICE_FLOATS: usize = 16;
+    /// Lanes: kind, position3, right3, up3, color3, intensity, width, height, range,
+    /// cookie_material, two_sided.
+    pub const AREA_LIGHT_FLOATS: usize = 19;
+    /// Lanes: material, transform16, albedo4, normal_strength, roughness, metallic,
+    /// emissive_strength, fade.
+    pub const PBR_DECAL_FLOATS: usize = 26;
+    /// Lanes: material, width, height, viewport_x, viewport_y, viewport_w, viewport_h,
+    /// split_screen, view16, projection16.
+    pub const CAMERA_TARGET_FLOATS: usize = 40;
+    /// Lanes: material, time, playing, looping, speed.
+    pub const VIDEO_STREAM_FLOATS: usize = 5;
     /// Where each header lane and record field starts; an optional field's lanes
     /// follow its count.
     pub mod lanes {
@@ -2587,6 +2741,20 @@ pub mod codec {
             pub const HAPTIC_COUNT: usize = 249;
             pub const REVERB_ZONE_COUNT: usize = 250;
             pub const SYNTH_COUNT: usize = 251;
+            pub const GRADE_TONEMAP: usize = 252;
+            pub const GRADE_SHARPNESS: usize = 253;
+            pub const GRADE_GRAIN: usize = 254;
+            pub const GRADE_FLARE: usize = 255;
+            pub const GRADE_OUTLINE_STRENGTH: usize = 256;
+            pub const QUALITY_OIT: usize = 257;
+            pub const QUALITY_PHYSICAL_SKY: usize = 258;
+            pub const QUALITY_UPSCALE: usize = 259;
+            pub const QUALITY_RAY_TRACING: usize = 260;
+            pub const QUALITY_DDGI: usize = 261;
+            pub const AREA_LIGHT_COUNT: usize = 262;
+            pub const PBR_DECAL_COUNT: usize = 263;
+            pub const CAMERA_TARGET_COUNT: usize = 264;
+            pub const VIDEO_STREAM_COUNT: usize = 265;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -2842,6 +3010,48 @@ pub mod codec {
             pub const GRAIN_SIZE: usize = 13;
             pub const GRAIN_PITCH: usize = 14;
             pub const REVERB: usize = 15;
+        }
+        pub mod area_light_spec {
+            pub const KIND: usize = 0;
+            pub const POSITION: usize = 1;
+            pub const RIGHT: usize = 4;
+            pub const UP: usize = 7;
+            pub const COLOR: usize = 10;
+            pub const INTENSITY: usize = 13;
+            pub const WIDTH: usize = 14;
+            pub const HEIGHT: usize = 15;
+            pub const RANGE: usize = 16;
+            pub const COOKIE_MATERIAL: usize = 17;
+            pub const TWO_SIDED: usize = 18;
+        }
+        pub mod pbr_decal_spec {
+            pub const MATERIAL: usize = 0;
+            pub const TRANSFORM: usize = 1;
+            pub const ALBEDO: usize = 17;
+            pub const NORMAL_STRENGTH: usize = 21;
+            pub const ROUGHNESS: usize = 22;
+            pub const METALLIC: usize = 23;
+            pub const EMISSIVE_STRENGTH: usize = 24;
+            pub const FADE: usize = 25;
+        }
+        pub mod camera_target_spec {
+            pub const MATERIAL: usize = 0;
+            pub const WIDTH: usize = 1;
+            pub const HEIGHT: usize = 2;
+            pub const VIEWPORT_X: usize = 3;
+            pub const VIEWPORT_Y: usize = 4;
+            pub const VIEWPORT_W: usize = 5;
+            pub const VIEWPORT_H: usize = 6;
+            pub const SPLIT_SCREEN: usize = 7;
+            pub const VIEW: usize = 8;
+            pub const PROJECTION: usize = 24;
+        }
+        pub mod video_stream_spec {
+            pub const MATERIAL: usize = 0;
+            pub const TIME: usize = 1;
+            pub const PLAYING: usize = 2;
+            pub const LOOPING: usize = 3;
+            pub const SPEED: usize = 4;
         }
         pub mod solid {
             pub const FACES: usize = 0;
@@ -3459,6 +3669,60 @@ pub mod codec {
             *synth_voice = SynthVoice { id: id as u32, mode: mode as u32, bus: bus as u32, frequency, gain, pan, detune, attack, decay, sustain, release, cutoff, resonance, grain_size, grain_pitch, reverb };
             Ok(())
         }
+
+        fn decode_area_light_spec(&mut self, lane: usize, area_light_spec: &mut AreaLightSpec) -> Result<()> {
+            let kind = self.count(lane, 3)?;
+            let position = Vector { x: self.packet[lane + 1], y: self.packet[lane + 2], z: self.packet[lane + 3] };
+            let right = Vector { x: self.packet[lane + 4], y: self.packet[lane + 5], z: self.packet[lane + 6] };
+            let up = Vector { x: self.packet[lane + 7], y: self.packet[lane + 8], z: self.packet[lane + 9] };
+            let color = Vector { x: self.packet[lane + 10], y: self.packet[lane + 11], z: self.packet[lane + 12] };
+            let intensity = self.packet[lane + 13];
+            let width = self.packet[lane + 14];
+            let height = self.packet[lane + 15];
+            let range = self.packet[lane + 16];
+            let cookie_material = self.count(lane + 17, 65535)?;
+            let two_sided = self.flag(lane + 18)?;
+            *area_light_spec = AreaLightSpec { kind: kind as u32, position, right, up, color, intensity, width, height, range, cookie_material: cookie_material as u32, two_sided };
+            Ok(())
+        }
+
+        fn decode_pbr_decal_spec(&mut self, lane: usize, pbr_decal_spec: &mut PbrDecalSpec) -> Result<()> {
+            let material = self.material_at(lane)?;
+            let transform = self.matrix(lane + 1);
+            let albedo = Color { r: self.packet[lane + 17], g: self.packet[lane + 18], b: self.packet[lane + 19], a: self.packet[lane + 20] };
+            let normal_strength = self.packet[lane + 21];
+            let roughness = self.packet[lane + 22];
+            let metallic = self.packet[lane + 23];
+            let emissive_strength = self.packet[lane + 24];
+            let fade = self.packet[lane + 25];
+            *pbr_decal_spec = PbrDecalSpec { material, transform, albedo, normal_strength, roughness, metallic, emissive_strength, fade };
+            Ok(())
+        }
+
+        fn decode_camera_target_spec(&mut self, lane: usize, camera_target_spec: &mut CameraTargetSpec) -> Result<()> {
+            let material = self.material_at(lane)?;
+            let width = self.count(lane + 1, 4096)?;
+            let height = self.count(lane + 2, 4096)?;
+            let viewport_x = self.packet[lane + 3];
+            let viewport_y = self.packet[lane + 4];
+            let viewport_w = self.packet[lane + 5];
+            let viewport_h = self.packet[lane + 6];
+            let split_screen = self.flag(lane + 7)?;
+            let view = self.matrix(lane + 8);
+            let projection = self.matrix(lane + 24);
+            *camera_target_spec = CameraTargetSpec { material, width: width as u32, height: height as u32, viewport_x, viewport_y, viewport_w, viewport_h, split_screen, view, projection };
+            Ok(())
+        }
+
+        fn decode_video_stream_spec(&mut self, lane: usize, video_stream_spec: &mut VideoStreamSpec) -> Result<()> {
+            let material = self.material_at(lane)?;
+            let time = self.packet[lane + 1];
+            let playing = self.flag(lane + 2)?;
+            let looping = self.flag(lane + 3)?;
+            let speed = self.packet[lane + 4];
+            *video_stream_spec = VideoStreamSpec { material, time, playing, looping, speed };
+            Ok(())
+        }
     }
 
     /// Decodes a render packet. The game's frame: what to draw and play, and what to do.
@@ -3530,6 +3794,10 @@ pub mod codec {
         let haptics_count = reader.count(249, MAX_HAPTICS)?;
         let reverb_zones_count = reader.count(250, MAX_REVERB_ZONES)?;
         let synths_count = reader.count(251, MAX_SYNTHS)?;
+        let area_lights_count = reader.count(262, MAX_AREA_LIGHTS)?;
+        let pbr_decals_count = reader.count(263, MAX_PBR_DECALS)?;
+        let camera_targets_count = reader.count(264, MAX_CAMERA_TARGETS)?;
+        let video_streams_count = reader.count(265, MAX_VIDEO_STREAMS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -3595,9 +3863,17 @@ pub mod codec {
         let reverb_zones_end = reverb_zones_start + reverb_zones_count * REVERB_ZONE_FLOATS;
         let synths_start = reverb_zones_end;
         let synths_end = synths_start + synths_count * SYNTH_VOICE_FLOATS;
-        let extras_start = synths_end;
+        let area_lights_start = synths_end;
+        let area_lights_end = area_lights_start + area_lights_count * AREA_LIGHT_FLOATS;
+        let pbr_decals_start = area_lights_end;
+        let pbr_decals_end = pbr_decals_start + pbr_decals_count * PBR_DECAL_FLOATS;
+        let camera_targets_start = pbr_decals_end;
+        let camera_targets_end = camera_targets_start + camera_targets_count * CAMERA_TARGET_FLOATS;
+        let video_streams_start = camera_targets_end;
+        let video_streams_end = video_streams_start + video_streams_count * VIDEO_STREAM_FLOATS;
+        let extras_start = video_streams_end;
         let truncated = "game returned a truncated, oversized or nonfinite frame";
-        ensure!(packet.len() >= synths_end && packet.iter().all(|value| value.is_finite()), truncated);
+        ensure!(packet.len() >= video_streams_end && packet.iter().all(|value| value.is_finite()), truncated);
         // What the records' tails claim of extras, in order.
         let mut extras_lanes = 0;
         for index in 0..draws_count {
@@ -3758,6 +4034,16 @@ pub mod codec {
         let quality_ssgi = reader.flag(245)?;
         let reverb_decay = reader.packet[247];
         let reverb_damping = reader.packet[248];
+        let grade_tonemap = reader.count(252, 3)?;
+        let grade_sharpness = reader.packet[253];
+        let grade_grain = reader.packet[254];
+        let grade_flare = reader.packet[255];
+        let grade_outline_strength = reader.packet[256];
+        let quality_oit = reader.flag(257)?;
+        let quality_physical_sky = reader.flag(258)?;
+        let quality_upscale = reader.flag(259)?;
+        let quality_ray_tracing = reader.count(260, 3)?;
+        let quality_ddgi = reader.flag(261)?;
         // The sections.
         let mut draws = std::mem::take(&mut frame.draws);
         resize(&mut draws, draws_count);
@@ -3982,6 +4268,26 @@ pub mod codec {
         for (index, synth_voice) in synths.iter_mut().enumerate() {
             reader.decode_synth_voice(synths_start + index * SYNTH_VOICE_FLOATS, synth_voice)?;
         }
+        let mut area_lights = std::mem::take(&mut frame.area_lights);
+        resize(&mut area_lights, area_lights_count);
+        for (index, area_light_spec) in area_lights.iter_mut().enumerate() {
+            reader.decode_area_light_spec(area_lights_start + index * AREA_LIGHT_FLOATS, area_light_spec)?;
+        }
+        let mut pbr_decals = std::mem::take(&mut frame.pbr_decals);
+        resize(&mut pbr_decals, pbr_decals_count);
+        for (index, pbr_decal_spec) in pbr_decals.iter_mut().enumerate() {
+            reader.decode_pbr_decal_spec(pbr_decals_start + index * PBR_DECAL_FLOATS, pbr_decal_spec)?;
+        }
+        let mut camera_targets = std::mem::take(&mut frame.camera_targets);
+        resize(&mut camera_targets, camera_targets_count);
+        for (index, camera_target_spec) in camera_targets.iter_mut().enumerate() {
+            reader.decode_camera_target_spec(camera_targets_start + index * CAMERA_TARGET_FLOATS, camera_target_spec)?;
+        }
+        let mut video_streams = std::mem::take(&mut frame.video_streams);
+        resize(&mut video_streams, video_streams_count);
+        for (index, video_stream_spec) in video_streams.iter_mut().enumerate() {
+            reader.decode_video_stream_spec(video_streams_start + index * VIDEO_STREAM_FLOATS, video_stream_spec)?;
+        }
         *frame = RenderFrame {
             save_requested,
             load_requested,
@@ -3998,7 +4304,7 @@ pub mod codec {
             light_direction,
             light_color,
             aberration,
-            quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa, ssr: quality_ssr as u32, volumetrics: quality_volumetrics as u32, ssgi: quality_ssgi },
+            quality: Quality { msaa: quality_msaa, fxaa: quality_fxaa, scale: quality_scale, filtering: quality_filtering as u32, occlusion: quality_occlusion, sky: quality_sky, effects: quality_effects, bloom: quality_bloom, taa: quality_taa, ssr: quality_ssr as u32, volumetrics: quality_volumetrics as u32, ssgi: quality_ssgi, oit: quality_oit, physical_sky: quality_physical_sky, upscale: quality_upscale, ray_tracing: quality_ray_tracing as u32, ddgi: quality_ddgi },
             sky: Sky { zenith: sky_zenith, horizon: sky_horizon, ground: sky_ground, sun: sky_sun, night: sky_night, tint: sky_tint, sh0: sky_sh0, sh1: sky_sh1, sh2: sky_sh2, sh3: sky_sh3, sh4: sky_sh4, sh5: sky_sh5, sh6: sky_sh6, sh7: sky_sh7, sh8: sky_sh8 },
             probe_volume: ProbeVolume { revision: probe_volume_revision as u32, nx: probe_volume_nx as u32, ny: probe_volume_ny as u32, nz: probe_volume_nz as u32, spacing: probe_volume_spacing, origin: probe_volume_origin },
             fog: Fog { radius: fog_radius, density: fog_density, height: fog_height, edge: fog_edge, distance: fog_distance, albedo: fog_albedo, anisotropy: fog_anisotropy, sun: fog_sun, ambient: fog_ambient, sky: fog_sky, noise: fog_noise, noise_scale: fog_noise_scale, drift: fog_drift },
@@ -4012,7 +4318,7 @@ pub mod codec {
             retained_reset,
             retained_after: retained_after as u32,
             exposure: Exposure { auto: exposure_auto, compensation: exposure_compensation, min: exposure_min, max: exposure_max, brighten: exposure_brighten, darken: exposure_darken, low: exposure_low, high: exposure_high, centre: exposure_centre, range_low: exposure_range_low, range_high: exposure_range_high, target: exposure_target, dt: exposure_dt, cut: exposure_cut },
-            grade: Grade { temperature: grade_temperature, tint: grade_tint, exposure: grade_exposure, contrast: grade_contrast, pivot: grade_pivot, saturation: grade_saturation, vibrance: grade_vibrance, lift: grade_lift, gamma: grade_gamma, gain: grade_gain, lut_a: grade_lut_a as u32, lut_b: grade_lut_b as u32, lut_blend: grade_lut_blend, lut_weight: grade_lut_weight, vignette: grade_vignette, vignette_radius: grade_vignette_radius },
+            grade: Grade { temperature: grade_temperature, tint: grade_tint, exposure: grade_exposure, contrast: grade_contrast, pivot: grade_pivot, saturation: grade_saturation, vibrance: grade_vibrance, lift: grade_lift, gamma: grade_gamma, gain: grade_gain, lut_a: grade_lut_a as u32, lut_b: grade_lut_b as u32, lut_blend: grade_lut_blend, lut_weight: grade_lut_weight, vignette: grade_vignette, vignette_radius: grade_vignette_radius, tonemap: grade_tonemap as u32, sharpness: grade_sharpness, grain: grade_grain, flare: grade_flare, outline_strength: grade_outline_strength },
             reflection: Reflection { budget: reflection_budget as u32 },
             motion_blur: MotionBlur { strength: motion_blur_strength, max_radius: motion_blur_max_radius, samples: motion_blur_samples as u32 },
             dof: Dof { focus_distance: dof_focus_distance, focus_range: dof_focus_range, aperture: dof_aperture, max_blur: dof_max_blur },
@@ -4047,6 +4353,10 @@ pub mod codec {
             haptics,
             reverb_zones,
             synths,
+            area_lights,
+            pbr_decals,
+            camera_targets,
+            video_streams,
             extensions,
         };
         Ok(&packet[state_start..state_end])
@@ -4135,6 +4445,10 @@ pub mod codec {
         let haptics_count = d.count(&header.field("haptic_count"), 249, MAX_HAPTICS)?;
         let reverb_zones_count = d.count(&header.field("reverb_zone_count"), 250, MAX_REVERB_ZONES)?;
         let synths_count = d.count(&header.field("synth_count"), 251, MAX_SYNTHS)?;
+        let area_lights_count = d.count(&header.field("area_light_count"), 262, MAX_AREA_LIGHTS)?;
+        let pbr_decals_count = d.count(&header.field("pbr_decal_count"), 263, MAX_PBR_DECALS)?;
+        let camera_targets_count = d.count(&header.field("camera_target_count"), 264, MAX_CAMERA_TARGETS)?;
+        let video_streams_count = d.count(&header.field("video_stream_count"), 265, MAX_VIDEO_STREAMS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -4200,7 +4514,15 @@ pub mod codec {
         let reverb_zones_end = d.end(&Location::section("reverb_zones"), reverb_zones_start, reverb_zones_count, REVERB_ZONE_FLOATS)?;
         let synths_start = reverb_zones_end;
         let synths_end = d.end(&Location::section("synths"), synths_start, synths_count, SYNTH_VOICE_FLOATS)?;
-        let extras_start = synths_end;
+        let area_lights_start = synths_end;
+        let area_lights_end = d.end(&Location::section("area_lights"), area_lights_start, area_lights_count, AREA_LIGHT_FLOATS)?;
+        let pbr_decals_start = area_lights_end;
+        let pbr_decals_end = d.end(&Location::section("pbr_decals"), pbr_decals_start, pbr_decals_count, PBR_DECAL_FLOATS)?;
+        let camera_targets_start = pbr_decals_end;
+        let camera_targets_end = d.end(&Location::section("camera_targets"), camera_targets_start, camera_targets_count, CAMERA_TARGET_FLOATS)?;
+        let video_streams_start = camera_targets_end;
+        let video_streams_end = d.end(&Location::section("video_streams"), video_streams_start, video_streams_count, VIDEO_STREAM_FLOATS)?;
+        let extras_start = video_streams_end;
         let extras_cursor = &mut { extras_start };
         d.count(&header.field("save_requested"), 12, 1)?;
         d.count(&header.field("load_requested"), 13, 1)?;
@@ -4320,6 +4642,16 @@ pub mod codec {
         d.count(&header.field("quality.ssgi"), 245, 1)?;
         d.finite(&header.field("reverb.decay"), 247)?;
         d.finite(&header.field("reverb.damping"), 248)?;
+        let _ = d.count(&header.field("grade.tonemap"), 252, 3)?;
+        d.finite(&header.field("grade.sharpness"), 253)?;
+        d.finite(&header.field("grade.grain"), 254)?;
+        d.finite(&header.field("grade.flare"), 255)?;
+        d.finite(&header.field("grade.outline_strength"), 256)?;
+        d.count(&header.field("quality.oit"), 257, 1)?;
+        d.count(&header.field("quality.physical_sky"), 258, 1)?;
+        d.count(&header.field("quality.upscale"), 259, 1)?;
+        let _ = d.count(&header.field("quality.ray_tracing"), 260, 3)?;
+        d.count(&header.field("quality.ddgi"), 261, 1)?;
         d.values(&Location::section("state"), state_start, state_lanes, &[])?;
         let mut base = draws_start;
         for item in 0..draws_count {
@@ -4773,6 +5105,64 @@ pub mod codec {
             base += SYNTH_VOICE_FLOATS;
         }
         d.exhausted(&Location::section("synths"), base, synths_end)?;
+        let mut base = area_lights_start;
+        for item in 0..area_lights_count {
+            let path = &Location::section("area_lights").index(item);
+            let kind = d.count(&path.field("kind"), base, 3)?;
+            d.values(&path.field("position"), base + 1, 3, &["x","y","z"])?;
+            d.values(&path.field("right"), base + 4, 3, &["x","y","z"])?;
+            d.values(&path.field("up"), base + 7, 3, &["x","y","z"])?;
+            d.values(&path.field("color"), base + 10, 3, &["x","y","z"])?;
+            d.finite(&path.field("intensity"), base + 13)?;
+            d.finite(&path.field("width"), base + 14)?;
+            d.finite(&path.field("height"), base + 15)?;
+            d.finite(&path.field("range"), base + 16)?;
+            let cookie_material = d.count(&path.field("cookie_material"), base + 17, 65535)?;
+            d.count(&path.field("two_sided"), base + 18, 1)?;
+            base += AREA_LIGHT_FLOATS;
+        }
+        d.exhausted(&Location::section("area_lights"), base, area_lights_end)?;
+        let mut base = pbr_decals_start;
+        for item in 0..pbr_decals_count {
+            let path = &Location::section("pbr_decals").index(item);
+            d.reference(&path.field("material"), base, catalog.materials.len(), true)?;
+            d.values(&path.field("transform"), base + 1, 16, &[])?;
+            d.values(&path.field("albedo"), base + 17, 4, &["r","g","b","a"])?;
+            d.finite(&path.field("normal_strength"), base + 21)?;
+            d.finite(&path.field("roughness"), base + 22)?;
+            d.finite(&path.field("metallic"), base + 23)?;
+            d.finite(&path.field("emissive_strength"), base + 24)?;
+            d.finite(&path.field("fade"), base + 25)?;
+            base += PBR_DECAL_FLOATS;
+        }
+        d.exhausted(&Location::section("pbr_decals"), base, pbr_decals_end)?;
+        let mut base = camera_targets_start;
+        for item in 0..camera_targets_count {
+            let path = &Location::section("camera_targets").index(item);
+            d.reference(&path.field("material"), base, catalog.materials.len(), true)?;
+            let width = d.count(&path.field("width"), base + 1, 4096)?;
+            let height = d.count(&path.field("height"), base + 2, 4096)?;
+            d.finite(&path.field("viewport_x"), base + 3)?;
+            d.finite(&path.field("viewport_y"), base + 4)?;
+            d.finite(&path.field("viewport_w"), base + 5)?;
+            d.finite(&path.field("viewport_h"), base + 6)?;
+            d.count(&path.field("split_screen"), base + 7, 1)?;
+            d.values(&path.field("view"), base + 8, 16, &[])?;
+            d.values(&path.field("projection"), base + 24, 16, &[])?;
+            base += CAMERA_TARGET_FLOATS;
+        }
+        d.exhausted(&Location::section("camera_targets"), base, camera_targets_end)?;
+        let mut base = video_streams_start;
+        for item in 0..video_streams_count {
+            let path = &Location::section("video_streams").index(item);
+            d.reference(&path.field("material"), base, catalog.materials.len(), true)?;
+            d.finite(&path.field("time"), base + 1)?;
+            d.count(&path.field("playing"), base + 2, 1)?;
+            d.count(&path.field("looping"), base + 3, 1)?;
+            d.finite(&path.field("speed"), base + 4)?;
+            base += VIDEO_STREAM_FLOATS;
+        }
+        d.exhausted(&Location::section("video_streams"), base, video_streams_end)?;
         inspect_extensions(d, *extras_cursor)?;
         Ok(())
     }
@@ -4826,6 +5216,10 @@ pub mod codec {
         let haptics_count = d.count(&header.field("haptic_count"), 249, MAX_HAPTICS)?;
         let reverb_zones_count = d.count(&header.field("reverb_zone_count"), 250, MAX_REVERB_ZONES)?;
         let synths_count = d.count(&header.field("synth_count"), 251, MAX_SYNTHS)?;
+        let area_lights_count = d.count(&header.field("area_light_count"), 262, MAX_AREA_LIGHTS)?;
+        let pbr_decals_count = d.count(&header.field("pbr_decal_count"), 263, MAX_PBR_DECALS)?;
+        let camera_targets_count = d.count(&header.field("camera_target_count"), 264, MAX_CAMERA_TARGETS)?;
+        let video_streams_count = d.count(&header.field("video_stream_count"), 265, MAX_VIDEO_STREAMS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -4891,7 +5285,15 @@ pub mod codec {
         let reverb_zones_end = d.end(&Location::section("reverb_zones"), reverb_zones_start, reverb_zones_count, REVERB_ZONE_FLOATS)?;
         let synths_start = reverb_zones_end;
         let synths_end = d.end(&Location::section("synths"), synths_start, synths_count, SYNTH_VOICE_FLOATS)?;
-        let extras_start = synths_end;
+        let area_lights_start = synths_end;
+        let area_lights_end = d.end(&Location::section("area_lights"), area_lights_start, area_lights_count, AREA_LIGHT_FLOATS)?;
+        let pbr_decals_start = area_lights_end;
+        let pbr_decals_end = d.end(&Location::section("pbr_decals"), pbr_decals_start, pbr_decals_count, PBR_DECAL_FLOATS)?;
+        let camera_targets_start = pbr_decals_end;
+        let camera_targets_end = d.end(&Location::section("camera_targets"), camera_targets_start, camera_targets_count, CAMERA_TARGET_FLOATS)?;
+        let video_streams_start = camera_targets_end;
+        let video_streams_end = d.end(&Location::section("video_streams"), video_streams_start, video_streams_count, VIDEO_STREAM_FLOATS)?;
+        let extras_start = video_streams_end;
         let mut end = extras_start;
         for item in 0..draws_count {
             let count = d.count(&Location::section("draws").index(item).field("extra"), draws_start + item * DRAW_FLOATS + 23, MAX_DRAW_EXTRA)?;
@@ -4996,6 +5398,8 @@ pub mod codec {
             frame.quality.filtering as f32, f32::from(frame.quality.occlusion), f32::from(frame.quality.sky),
             f32::from(frame.quality.effects), f32::from(frame.quality.bloom), f32::from(frame.quality.taa),
             frame.quality.ssr as f32, frame.quality.volumetrics as f32, f32::from(frame.quality.ssgi),
+            f32::from(frame.quality.oit), f32::from(frame.quality.physical_sky),
+            f32::from(frame.quality.upscale), frame.quality.ray_tracing as f32, f32::from(frame.quality.ddgi),
             frame.sky.zenith.x, frame.sky.zenith.y, frame.sky.zenith.z, frame.sky.horizon.x, frame.sky.horizon.y,
             frame.sky.horizon.z, frame.sky.ground.x, frame.sky.ground.y, frame.sky.ground.z, frame.sky.sun.x,
             frame.sky.sun.y, frame.sky.sun.z, frame.sky.night, frame.sky.tint.x, frame.sky.tint.y,
@@ -5027,7 +5431,8 @@ pub mod codec {
             frame.grade.lift.y, frame.grade.lift.z, frame.grade.gamma.x, frame.grade.gamma.y,
             frame.grade.gamma.z, frame.grade.gain.x, frame.grade.gain.y, frame.grade.gain.z,
             frame.grade.lut_a as f32, frame.grade.lut_b as f32, frame.grade.lut_blend, frame.grade.lut_weight,
-            frame.grade.vignette, frame.grade.vignette_radius, frame.reflection.budget as f32,
+            frame.grade.vignette, frame.grade.vignette_radius, frame.grade.tonemap as f32, frame.grade.sharpness,
+            frame.grade.grain, frame.grade.flare, frame.grade.outline_strength, frame.reflection.budget as f32,
             frame.motion_blur.strength, frame.motion_blur.max_radius, frame.motion_blur.samples as f32,
             frame.dof.focus_distance, frame.dof.focus_range, frame.dof.aperture, frame.dof.max_blur,
             frame.reverb.decay, frame.reverb.damping, state.len() as f32,
@@ -5155,6 +5560,22 @@ pub mod codec {
         out.push(frame.synths.len() as f32);
         for synth_voice in &frame.synths {
             canonical_synth_voice(&mut out, synth_voice);
+        }
+        out.push(frame.area_lights.len() as f32);
+        for area_light_spec in &frame.area_lights {
+            canonical_area_light_spec(&mut out, area_light_spec);
+        }
+        out.push(frame.pbr_decals.len() as f32);
+        for pbr_decal_spec in &frame.pbr_decals {
+            canonical_pbr_decal_spec(&mut out, pbr_decal_spec);
+        }
+        out.push(frame.camera_targets.len() as f32);
+        for camera_target_spec in &frame.camera_targets {
+            canonical_camera_target_spec(&mut out, camera_target_spec);
+        }
+        out.push(frame.video_streams.len() as f32);
+        for video_stream_spec in &frame.video_streams {
+            canonical_video_stream_spec(&mut out, video_stream_spec);
         }
         out
     }
@@ -5416,6 +5837,45 @@ pub mod codec {
             synth_voice.gain, synth_voice.pan, synth_voice.detune, synth_voice.attack, synth_voice.decay,
             synth_voice.sustain, synth_voice.release, synth_voice.cutoff, synth_voice.resonance,
             synth_voice.grain_size, synth_voice.grain_pitch, synth_voice.reverb,
+        ]);
+    }
+
+    fn canonical_area_light_spec(out: &mut Vec<f32>, area_light_spec: &AreaLightSpec) {
+        out.extend([
+            area_light_spec.kind as f32, area_light_spec.position.x, area_light_spec.position.y,
+            area_light_spec.position.z, area_light_spec.right.x, area_light_spec.right.y,
+            area_light_spec.right.z, area_light_spec.up.x, area_light_spec.up.y, area_light_spec.up.z,
+            area_light_spec.color.x, area_light_spec.color.y, area_light_spec.color.z, area_light_spec.intensity,
+            area_light_spec.width, area_light_spec.height, area_light_spec.range,
+            area_light_spec.cookie_material as f32, f32::from(area_light_spec.two_sided),
+        ]);
+    }
+
+    fn canonical_pbr_decal_spec(out: &mut Vec<f32>, pbr_decal_spec: &PbrDecalSpec) {
+        out.push(pbr_decal_spec.material as f32);
+        out.extend_from_slice(&pbr_decal_spec.transform);
+        out.extend([
+            pbr_decal_spec.albedo.r, pbr_decal_spec.albedo.g, pbr_decal_spec.albedo.b, pbr_decal_spec.albedo.a,
+            pbr_decal_spec.normal_strength, pbr_decal_spec.roughness, pbr_decal_spec.metallic,
+            pbr_decal_spec.emissive_strength, pbr_decal_spec.fade,
+        ]);
+    }
+
+    fn canonical_camera_target_spec(out: &mut Vec<f32>, camera_target_spec: &CameraTargetSpec) {
+        out.extend([
+            camera_target_spec.material as f32, camera_target_spec.width as f32,
+            camera_target_spec.height as f32, camera_target_spec.viewport_x, camera_target_spec.viewport_y,
+            camera_target_spec.viewport_w, camera_target_spec.viewport_h,
+            f32::from(camera_target_spec.split_screen),
+        ]);
+        out.extend_from_slice(&camera_target_spec.view);
+        out.extend_from_slice(&camera_target_spec.projection);
+    }
+
+    fn canonical_video_stream_spec(out: &mut Vec<f32>, video_stream_spec: &VideoStreamSpec) {
+        out.extend([
+            video_stream_spec.material as f32, video_stream_spec.time, f32::from(video_stream_spec.playing),
+            f32::from(video_stream_spec.looping), video_stream_spec.speed,
         ]);
     }
 }

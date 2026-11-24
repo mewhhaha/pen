@@ -85,8 +85,11 @@ const SCENE_FLOATS: usize = 80 + 4 + 16 * MAX_CASCADES + 4 * MAX_CASCADES + 4;
 const SCENE_BYTES: u64 = SCENE_FLOATS as u64 * 4;
 
 // A draw's uniform: model and normal matrices, color, settings, the four
-// parameters, then up to 32 extra vectors (see pen-protocol's Draw).
-const DRAW_BYTES: u64 = 176 + MAX_DRAW_EXTRA as u64 * 16;
+// parameters, up to 32 extra vectors (see pen-protocol's Draw), then the
+// material's `surface` block of five vectors (clear coat, sheen, anisotropy,
+// transmission and volume, specular: materials.md).
+const SURFACE_BYTES: u64 = 5 * 16;
+const DRAW_BYTES: u64 = 176 + MAX_DRAW_EXTRA as u64 * 16 + SURFACE_BYTES;
 
 pub(crate) struct MeshAsset {
     vertices: wgpu::Buffer,

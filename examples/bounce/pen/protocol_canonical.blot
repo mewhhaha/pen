@@ -501,7 +501,7 @@ func voice_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
 func pose_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   let at = stream.at
   let base = stream.output.length
-  for 0 .. 4:
+  for 0 .. 5:
     @storage.push stream.output 0.0
   stream.output[base + 0] := canonical[at + 0]
   at := at + 1
@@ -510,6 +510,8 @@ func pose_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
   stream.output[base + 2] := canonical[at + 0]
   at := at + 1
   stream.output[base + 3] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 4] := canonical[at + 0]
   at := at + 1
   stream.at := at
   return stream
@@ -862,6 +864,53 @@ func instance_removal_into (canonical: #[F32]) -> (stream: own Stream): Stream =
   stream.output[base + 0] := canonical[at + 0]
   at := at + 1
   stream.output[base + 1] := canonical[at + 0]
+  at := at + 1
+  stream.at := at
+  return stream
+
+func bone_matrice_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
+  let at = stream.at
+  let base = stream.output.length
+  for 0 .. 19:
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 1] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 2] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 3] := canonical[at + 0]
+  stream.output[base + 4] := canonical[at + 1]
+  stream.output[base + 5] := canonical[at + 2]
+  stream.output[base + 6] := canonical[at + 3]
+  stream.output[base + 7] := canonical[at + 4]
+  stream.output[base + 8] := canonical[at + 5]
+  stream.output[base + 9] := canonical[at + 6]
+  stream.output[base + 10] := canonical[at + 7]
+  stream.output[base + 11] := canonical[at + 8]
+  stream.output[base + 12] := canonical[at + 9]
+  stream.output[base + 13] := canonical[at + 10]
+  stream.output[base + 14] := canonical[at + 11]
+  stream.output[base + 15] := canonical[at + 12]
+  stream.output[base + 16] := canonical[at + 13]
+  stream.output[base + 17] := canonical[at + 14]
+  stream.output[base + 18] := canonical[at + 15]
+  at := at + 16
+  stream.at := at
+  return stream
+
+func morph_weight_into (canonical: #[F32]) -> (stream: own Stream): Stream =>
+  let at = stream.at
+  let base = stream.output.length
+  for 0 .. 4:
+    @storage.push stream.output 0.0
+  stream.output[base + 0] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 1] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 2] := canonical[at + 0]
+  at := at + 1
+  stream.output[base + 3] := canonical[at + 0]
   at := at + 1
   stream.at := at
   return stream
@@ -1395,6 +1444,22 @@ func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[~F32]): 
     stream := instance_removal_into canonical stream
   at := stream.at
   stream.output[180] := U32.to_f32 instance_removals_count
+  let bone_matrices_start: U32 = stream.output.length
+  let bone_matrices_count = lanes.integer canonical[at] lanes.max_integer
+  at := at + 1
+  stream.at := at
+  for 0 .. bone_matrices_count:
+    stream := bone_matrice_into canonical stream
+  at := stream.at
+  stream.output[235] := U32.to_f32 bone_matrices_count
+  let morph_weights_start: U32 = stream.output.length
+  let morph_weights_count = lanes.integer canonical[at] lanes.max_integer
+  at := at + 1
+  stream.at := at
+  for 0 .. morph_weights_count:
+    stream := morph_weight_into canonical stream
+  at := stream.at
+  stream.output[236] := U32.to_f32 morph_weights_count
   let extras_start: U32 = stream.output.length
   for value in stream.extras:
     @storage.push stream.output value

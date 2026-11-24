@@ -113,6 +113,7 @@ type Pose is data = $Pose {
   clip: U32,
   time: F32,
   weight: F32,
+  inset: U32,
 }
 
 type Emitter is data = $Emitter {
@@ -222,6 +223,20 @@ type Instance is data = $Instance {
 type InstanceRemoval is data = $InstanceRemoval {
   id_low: U32,
   id_high: U32,
+}
+
+type BoneMatrix is data = $BoneMatrix {
+  inset: U32,
+  draw: U32,
+  joint: U32,
+  matrix: Mat4,
+}
+
+type MorphWeight is data = $MorphWeight {
+  inset: U32,
+  draw: U32,
+  target: U32,
+  weight: F32,
 }
 
 type Solid is data = $Solid {

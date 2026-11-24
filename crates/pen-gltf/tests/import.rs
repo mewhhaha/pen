@@ -137,3 +137,45 @@ fn refuses_what_is_not_a_model() {
     let error = import(&empty, &directory.join("assets"), &Options::default()).unwrap_err();
     assert!(format!("{error:#}").contains("no meshes"), "{error:#}");
 }
+
+#[test]
+fn imports_morph_targets_and_packs_them() {
+    let directory = directory("morphs");
+    let out = directory.join("assets");
+    // Minimal 1-triangle glTF with one POSITION morph target (shifts +0.5 along X).
+    let positions: [f32; 9] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+    let delta_pos: [f32; 9] = [0.5, 0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 0.0, 0.0];
+    let mut bin = Vec::new();
+    for v in positions.iter().chain(&delta_pos) {
+        bin.extend_from_slice(&v.to_le_bytes());
+    }
+    let document = serde_json::json!({
+        "asset": { "version": "2.0" },
+        "scene": 0,
+        "scenes": [{ "nodes": [0] }],
+        "nodes": [{ "mesh": 0 }],
+        "buffers": [{ "byteLength": bin.len() }],
+        "bufferViews": [
+            { "buffer": 0, "byteOffset": 0, "byteLength": 36 },
+            { "buffer": 0, "byteOffset": 36, "byteLength": 36 }
+        ],
+        "accessors": [
+            { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0] },
+            { "bufferView": 1, "componentType": 5126, "count": 3, "type": "VEC3" }
+        ],
+        "meshes": [{
+            "name": "tri",
+            "primitives": [{
+                "attributes": { "POSITION": 0 },
+                "targets": [{ "POSITION": 1 }]
+            }]
+        }]
+    });
+    let path = gltf_file(&directory.join("morph.gltf"), document, &bin);
+    let imported = import(&path, &out, &Options::default()).unwrap();
+    assert_eq!(imported.meshes[0].morph_targets, 1);
+    let mesh = read_json(&out.join(&imported.meshes[0].mesh));
+    assert_eq!(mesh["morphs"][0]["positions"][0], 0.5);
+    let packed = pen_render::pack_mesh(&std::fs::read(out.join(&imported.meshes[0].mesh)).unwrap()).unwrap();
+    assert_eq!(packed[5] & 64, 64, "the binary mesh carries the morph targets flag");
+}

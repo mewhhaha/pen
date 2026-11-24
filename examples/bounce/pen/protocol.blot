@@ -55,6 +55,10 @@ const max_service_id = 16777215
 const max_service_operation = 255
 // The most voices one frame may declare.
 const max_voices = 256
+// The most explicit joint matrices one frame may declare.
+const max_bone_matrices = 65536
+// The most morph target weights one frame may declare.
+const max_morph_weights = 65536
 // The most buses one frame may declare, the master (bus 0) included.
 const max_buses = 16
 // Voice ids are whole numbers from 1 to this, the wire's exact-integer range.
@@ -791,7 +795,7 @@ const reports_op_queued = 2
 
 // Sizes in lanes.
 const packet_magic = 4670534.0
-const packet_header_floats = 235
+const packet_header_floats = 237
 const frame_header_floats = 5
 const event_floats = 5
 const extensions_marker = 5260632.0
@@ -808,7 +812,7 @@ const ui_node_floats = 24
 const service_request_floats = 8
 const bus_floats = 3
 const voice_floats = 12
-const pose_floats = 4
+const pose_floats = 5
 const emitter_floats = 42
 const light_floats = 14
 const cascade_floats = 18
@@ -819,6 +823,8 @@ const listener_floats = 9
 const panner_floats = 15
 const instance_floats = 26
 const instance_removal_floats = 2
+const bone_matrix_floats = 19
+const morph_weight_floats = 4
 
 // Where each header lane and record field starts.
 const header_magic_lane = 0
@@ -960,6 +966,8 @@ const header_fog_noise_scale_lane = 229
 const header_fog_drift_lane = 230
 const header_quality_volumetrics_lane = 233
 const header_fog_volume_count_lane = 234
+const header_bone_matrix_count_lane = 235
+const header_morph_weight_count_lane = 236
 const draw_mesh_lane = 0
 const draw_material_lane = 1
 const draw_transform_lane = 2
@@ -1020,6 +1028,7 @@ const pose_draw_lane = 0
 const pose_clip_lane = 1
 const pose_time_lane = 2
 const pose_weight_lane = 3
+const pose_inset_lane = 4
 const emitter_material_lane = 0
 const emitter_transform_lane = 1
 const emitter_seed_lane = 17
@@ -1099,6 +1108,14 @@ const instance_transform_lane = 5
 const instance_parameters_lane = 21
 const instance_removal_id_low_lane = 0
 const instance_removal_id_high_lane = 1
+const bone_matrix_inset_lane = 0
+const bone_matrix_draw_lane = 1
+const bone_matrix_joint_lane = 2
+const bone_matrix_matrix_lane = 3
+const morph_weight_inset_lane = 0
+const morph_weight_draw_lane = 1
+const morph_weight_target_lane = 2
+const morph_weight_weight_lane = 3
 const solid_faces_lane = 0
 const field_patch_material_lane = 0
 const field_patch_width_lane = 1

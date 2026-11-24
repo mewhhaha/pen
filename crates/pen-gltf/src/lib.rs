@@ -107,15 +107,28 @@ pub struct ImportedMesh {
     pub material: String,
     /// Its joints, 0 for a static mesh.
     pub joints: usize,
+    /// Its morph targets, omitted when 0.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub morph_targets: usize,
     /// Its vertex-animation texture's material, if it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vat: Option<String>,
+}
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Serialize)]
 pub struct ImportedClip {
     pub name: String,
     pub duration: f32,
+}
+
+/// One morph target's per-vertex position and normal deltas.
+pub struct MorphTarget {
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
 }
 
 /// A primitive's vertices and triangles.
@@ -130,6 +143,15 @@ pub struct Geometry {
     /// Each vertex's tangent (xyz and a handedness of -1 or 1), or none for
     /// the primitive.
     pub tangents: Vec<[f32; 4]>,
+    /// Morph targets (blendshapes), if any.
+    pub morphs: Vec<MorphTarget>,
+}
+
+#[derive(Serialize)]
+struct MorphTargetFile {
+    positions: Vec<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    normals: Option<Vec<f32>>,
 }
 
 /// Mesh JSON as the renderer reads it (`pen_render::pack_mesh`).
@@ -141,6 +163,8 @@ struct MeshFile<'a> {
     indices: &'a [u32],
     #[serde(skip_serializing_if = "Option::is_none")]
     tangents: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    morphs: Option<Vec<MorphTargetFile>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     joints: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,7 +277,8 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
                 _ => None,
             };
             let joints = rig.map_or(0, |rig| rig.joints.len());
-            writer.imported.meshes.push(ImportedMesh { mesh: mesh_key, material, joints, vat });
+            let morph_targets = geometry.morphs.len();
+            writer.imported.meshes.push(ImportedMesh { mesh: mesh_key, material, joints, morph_targets, vat });
         }
     }
     for name in document.extensions_used() {
@@ -588,6 +613,25 @@ fn geometry(
             }
         }
     }
+    let mut morphs: Vec<MorphTarget> = Vec::new();
+    for (pos_iter, norm_iter, _) in reader.read_morph_targets() {
+        let m_positions: Vec<[f32; 3]> = match pos_iter {
+            Some(iter) => iter.collect(),
+            None => vec![[0.0; 3]; count],
+        };
+        let m_normals: Vec<[f32; 3]> = match norm_iter {
+            Some(iter) => iter.collect(),
+            None => vec![[0.0; 3]; count],
+        };
+        ensure!(
+            m_positions.len() == count
+                && m_normals.len() == count
+                && m_positions.iter().flatten().all(|v| v.is_finite())
+                && m_normals.iter().flatten().all(|v| v.is_finite()),
+            "a morph target's position and normal deltas must be finite and match the vertex count"
+        );
+        morphs.push(MorphTarget { positions: m_positions, normals: m_normals });
+    }
     ensure!(
         uvs.len() == count
             && normals.len() == count
@@ -606,6 +650,17 @@ fn geometry(
             let [x, y, z] = vector.map(f64::from);
             *vector =
                 [0, 1, 2].map(|row| narrow(normal[row * 3] * x + normal[row * 3 + 1] * y + normal[row * 3 + 2] * z));
+        }
+        for target in &mut morphs {
+            for delta in &mut target.positions {
+                let [x, y, z] = delta.map(f64::from);
+                *delta = [0, 1, 2].map(|row| narrow(world[row] * x + world[4 + row] * y + world[8 + row] * z));
+            }
+            for delta in &mut target.normals {
+                let [x, y, z] = delta.map(f64::from);
+                *delta = [0, 1, 2]
+                    .map(|row| narrow(normal[row * 3] * x + normal[row * 3 + 1] * y + normal[row * 3 + 2] * z));
+            }
         }
         // A mirroring placement turns triangles inside out: turn them back.
         let mirrored = determinant(world) < 0.0;
@@ -636,7 +691,7 @@ fn geometry(
             [0.0, 1.0, 0.0]
         };
     }
-    let mut geometry = Geometry { positions, normals, uvs, indices, joints, weights, tangents };
+    let mut geometry = Geometry { positions, normals, uvs, indices, joints, weights, tangents, morphs };
     // The tangents a normal map or an anisotropic material wants, made of
     // the geometry as it stands in the mesh (placed, and wound as it draws).
     if geometry.tangents.is_empty() && generate_tangents && textured {
@@ -746,12 +801,26 @@ impl Writer<'_> {
     }
 
     fn write_mesh(&mut self, key: &str, geometry: &Geometry, rig: Option<&Rig>) -> Result<()> {
+        let morphs = (!geometry.morphs.is_empty()).then(|| {
+            geometry
+                .morphs
+                .iter()
+                .map(|target| {
+                    let has_normals = target.normals.iter().flatten().any(|&v| v != 0.0);
+                    MorphTargetFile {
+                        positions: target.positions.iter().flatten().copied().collect(),
+                        normals: has_normals.then(|| target.normals.iter().flatten().copied().collect()),
+                    }
+                })
+                .collect()
+        });
         let file = MeshFile {
             positions: geometry.positions.iter().flatten().copied().collect(),
             normals: geometry.normals.iter().flatten().copied().collect(),
             uvs: geometry.uvs.iter().flatten().copied().collect(),
             indices: &geometry.indices,
             tangents: (!geometry.tangents.is_empty()).then(|| geometry.tangents.iter().flatten().copied().collect()),
+            morphs,
             joints: rig.map(|_| geometry.joints.iter().flatten().copied().collect()),
             weights: rig.map(|_| geometry.weights.iter().flatten().copied().collect()),
             rig: rig.map(Rig::json),

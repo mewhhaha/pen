@@ -1127,6 +1127,9 @@ pub mod types {
         pub time: f32,
         /// How much it counts among its draw's layers: 0 or more.
         pub weight: f32,
+        /// Which draw list `draw` indexes: 0 for the main scene's `draws`, or `1 + k` for
+        /// `insets[k].draws`.
+        pub inset: u32,
     }
     /// A particle emitter: `rate` particles a second, each living `lifetime` seconds, born in a
     /// ball round `transform`'s origin and flying from it under gravity and drag, sized and
@@ -1343,6 +1346,32 @@ pub mod types {
     pub struct InstanceRemoval {
         pub id_low: u32,
         pub id_high: u32,
+    }
+    /// One explicit joint skinning matrix for a skinned draw.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct BoneMatrix {
+        /// Which draw list `draw` indexes: 0 for the main scene's `draws`, or `1 + k` for
+        /// `insets[k].draws`.
+        pub inset: u32,
+        /// The draw this joint matrix skins.
+        pub draw: u32,
+        /// Joint index within the mesh's skin palette.
+        pub joint: u32,
+        /// Column-major skinning matrix (world joint transform times inverse bind matrix).
+        pub matrix: Matrix,
+    }
+    /// One morph target blend weight for a draw.
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct MorphWeight {
+        /// Which draw list `draw` indexes: 0 for the main scene's `draws`, or `1 + k` for
+        /// `insets[k].draws`.
+        pub inset: u32,
+        /// The draw whose mesh vertices are morphed.
+        pub draw: u32,
+        /// Morph target index in the mesh's morph target array.
+        pub target: u32,
+        /// Linear blend weight for this target.
+        pub weight: f32,
     }
     /// How the game wants this frame drawn: samples per pixel, FXAA, render scale, texture
     /// filtering, ambient occlusion, a sky, screen effects, bloom and temporal antialiasing.
@@ -1844,6 +1873,14 @@ pub mod types {
         pub panners: Vec<Panner>,
         pub instances: Vec<Instance>,
         pub instance_removals: Vec<InstanceRemoval>,
+        /// Explicit skinning joint matrices supplied by the game (e.g. from Ink's animation,
+        /// IK, inertialization, ragdoll or secondary-bone solvers). Applied after any clip
+        /// `poses` for the same draw, or starting from identity when no clip layers are
+        /// declared.
+        pub bone_matrices: Vec<BoneMatrix>,
+        /// Blendshape / morph target weights applied to mesh vertices on the GPU before
+        /// skinning and shading.
+        pub morph_weights: Vec<MorphWeight>,
         /// The game's own sections, which its pen.json `protocol` declares, after the rest of
         /// the packet: a marker, their count, then each one's tag, length and values. A packet
         /// without any ends before the marker. Tag 0 is reserved for one optional development
@@ -1911,6 +1948,8 @@ pub mod types {
                 panners: Default::default(),
                 instances: Default::default(),
                 instance_removals: Default::default(),
+                bone_matrices: Default::default(),
+                morph_weights: Default::default(),
                 extensions: Default::default(),
             }
         }
@@ -1969,6 +2008,10 @@ pub mod codec {
     pub const MAX_SERVICE_OPERATION: usize = 255;
     /// The most voices one frame may declare.
     pub const MAX_VOICES: usize = 256;
+    /// The most explicit joint matrices one frame may declare.
+    pub const MAX_BONE_MATRICES: usize = 65536;
+    /// The most morph target weights one frame may declare.
+    pub const MAX_MORPH_WEIGHTS: usize = 65536;
     /// The most buses one frame may declare, the master (bus 0) included.
     pub const MAX_BUSES: usize = 16;
     /// Voice ids are whole numbers from 1 to this, the wire's exact-integer range.
@@ -2053,8 +2096,9 @@ pub mod codec {
     /// grade.lut_a, grade.lut_b, grade.lut_blend, grade.lut_weight, grade.vignette,
     /// grade.vignette_radius, quality.ssr, reflection.budget, fog.edge, fog.distance,
     /// fog.albedo3, fog.anisotropy, fog.sun, fog.ambient, fog.sky, fog.noise, fog.noise_scale,
-    /// fog.drift3, quality.volumetrics, fog_volume_count.
-    pub const PACKET_HEADER_FLOATS: usize = 235;
+    /// fog.drift3, quality.volumetrics, fog_volume_count, bone_matrix_count,
+    /// morph_weight_count.
+    pub const PACKET_HEADER_FLOATS: usize = 237;
     /// The input packet header: elapsed, width, height, event count and state count.
     pub const FRAME_HEADER_FLOATS: usize = 5;
     /// An event: its tag, then code, x, y, delta.
@@ -2089,8 +2133,8 @@ pub mod codec {
     /// Lanes: id, clip, bus, gain, pan, pitch, lowpass, reverb, looping, start, fade_in,
     /// fade_out.
     pub const VOICE_FLOATS: usize = 12;
-    /// Lanes: draw, clip, time, weight.
-    pub const POSE_FLOATS: usize = 4;
+    /// Lanes: draw, clip, time, weight, inset.
+    pub const POSE_FLOATS: usize = 5;
     /// Lanes: material, transform16, seed, time, duration, rate, lifetime, radius, velocity3,
     /// spread, gravity3, drag, size_start, size_end, color_start4, color_end4, additive.
     pub const EMITTER_FLOATS: usize = 42;
@@ -2115,6 +2159,10 @@ pub mod codec {
     pub const INSTANCE_FLOATS: usize = 26;
     /// Lanes: id_low, id_high.
     pub const INSTANCE_REMOVAL_FLOATS: usize = 2;
+    /// Lanes: inset, draw, joint, matrix16.
+    pub const BONE_MATRIX_FLOATS: usize = 19;
+    /// Lanes: inset, draw, target, weight.
+    pub const MORPH_WEIGHT_FLOATS: usize = 4;
     /// Where each header lane and record field starts; an optional field's lanes
     /// follow its count.
     pub mod lanes {
@@ -2258,6 +2306,8 @@ pub mod codec {
             pub const FOG_DRIFT: usize = 230;
             pub const QUALITY_VOLUMETRICS: usize = 233;
             pub const FOG_VOLUME_COUNT: usize = 234;
+            pub const BONE_MATRIX_COUNT: usize = 235;
+            pub const MORPH_WEIGHT_COUNT: usize = 236;
         }
         pub mod draw {
             pub const MESH: usize = 0;
@@ -2336,6 +2386,7 @@ pub mod codec {
             pub const CLIP: usize = 1;
             pub const TIME: usize = 2;
             pub const WEIGHT: usize = 3;
+            pub const INSET: usize = 4;
         }
         pub mod emitter {
             pub const MATERIAL: usize = 0;
@@ -2435,6 +2486,18 @@ pub mod codec {
         pub mod instance_removal {
             pub const ID_LOW: usize = 0;
             pub const ID_HIGH: usize = 1;
+        }
+        pub mod bone_matrix {
+            pub const INSET: usize = 0;
+            pub const DRAW: usize = 1;
+            pub const JOINT: usize = 2;
+            pub const MATRIX: usize = 3;
+        }
+        pub mod morph_weight {
+            pub const INSET: usize = 0;
+            pub const DRAW: usize = 1;
+            pub const TARGET: usize = 2;
+            pub const WEIGHT: usize = 3;
         }
         pub mod solid {
             pub const FACES: usize = 0;
@@ -2819,7 +2882,8 @@ pub mod codec {
             let clip = self.count(lane + 1, 65535)?;
             let time = self.packet[lane + 2];
             let weight = self.packet[lane + 3];
-            *pose = Pose { draw: draw as u32, clip: clip as u32, time, weight };
+            let inset = self.count(lane + 4, 16)?;
+            *pose = Pose { draw: draw as u32, clip: clip as u32, time, weight, inset: inset as u32 };
             Ok(())
         }
 
@@ -2953,6 +3017,24 @@ pub mod codec {
             *instance_removal = InstanceRemoval { id_low: id_low as u32, id_high: id_high as u32 };
             Ok(())
         }
+
+        fn decode_bone_matrix(&mut self, lane: usize, bone_matrix: &mut BoneMatrix) -> Result<()> {
+            let inset = self.count(lane, 16)?;
+            let draw = self.count(lane + 1, MAX_DRAWS)?;
+            let joint = self.count(lane + 2, 1024)?;
+            let matrix = self.matrix(lane + 3);
+            *bone_matrix = BoneMatrix { inset: inset as u32, draw: draw as u32, joint: joint as u32, matrix };
+            Ok(())
+        }
+
+        fn decode_morph_weight(&mut self, lane: usize, morph_weight: &mut MorphWeight) -> Result<()> {
+            let inset = self.count(lane, 16)?;
+            let draw = self.count(lane + 1, MAX_DRAWS)?;
+            let target = self.count(lane + 2, 256)?;
+            let weight = self.packet[lane + 3];
+            *morph_weight = MorphWeight { inset: inset as u32, draw: draw as u32, target: target as u32, weight };
+            Ok(())
+        }
     }
 
     /// Decodes a render packet. The game's frame: what to draw and play, and what to do.
@@ -3017,6 +3099,8 @@ pub mod codec {
         let instances_count = reader.count(179, MAX_INSTANCES)?;
         let instance_removals_count = reader.count(180, MAX_INSTANCE_REMOVALS)?;
         let fog_volumes_count = reader.count(234, MAX_FOG_VOLUMES)?;
+        let bone_matrices_count = reader.count(235, MAX_BONE_MATRICES)?;
+        let morph_weights_count = reader.count(236, MAX_MORPH_WEIGHTS)?;
         // Where the sections lie.
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = state_start + state_lanes;
@@ -3068,9 +3152,13 @@ pub mod codec {
         let instances_end = instances_start + instances_count * INSTANCE_FLOATS;
         let instance_removals_start = instances_end;
         let instance_removals_end = instance_removals_start + instance_removals_count * INSTANCE_REMOVAL_FLOATS;
-        let extras_start = instance_removals_end;
+        let bone_matrices_start = instance_removals_end;
+        let bone_matrices_end = bone_matrices_start + bone_matrices_count * BONE_MATRIX_FLOATS;
+        let morph_weights_start = bone_matrices_end;
+        let morph_weights_end = morph_weights_start + morph_weights_count * MORPH_WEIGHT_FLOATS;
+        let extras_start = morph_weights_end;
         let truncated = "game returned a truncated, oversized or nonfinite frame";
-        ensure!(packet.len() >= instance_removals_end && packet.iter().all(|value| value.is_finite()), truncated);
+        ensure!(packet.len() >= morph_weights_end && packet.iter().all(|value| value.is_finite()), truncated);
         // What the records' tails claim of extras, in order.
         let mut extras_lanes = 0;
         for index in 0..draws_count {
@@ -3410,6 +3498,16 @@ pub mod codec {
         for (index, instance_removal) in instance_removals.iter_mut().enumerate() {
             reader.decode_instance_removal(instance_removals_start + index * INSTANCE_REMOVAL_FLOATS, instance_removal)?;
         }
+        let mut bone_matrices = std::mem::take(&mut frame.bone_matrices);
+        resize(&mut bone_matrices, bone_matrices_count);
+        for (index, bone_matrix) in bone_matrices.iter_mut().enumerate() {
+            reader.decode_bone_matrix(bone_matrices_start + index * BONE_MATRIX_FLOATS, bone_matrix)?;
+        }
+        let mut morph_weights = std::mem::take(&mut frame.morph_weights);
+        resize(&mut morph_weights, morph_weights_count);
+        for (index, morph_weight) in morph_weights.iter_mut().enumerate() {
+            reader.decode_morph_weight(morph_weights_start + index * MORPH_WEIGHT_FLOATS, morph_weight)?;
+        }
         *frame = RenderFrame {
             save_requested,
             load_requested,
@@ -3465,6 +3563,8 @@ pub mod codec {
             panners,
             instances,
             instance_removals,
+            bone_matrices,
+            morph_weights,
             extensions,
         };
         Ok(&packet[state_start..state_end])
@@ -3546,6 +3646,8 @@ pub mod codec {
         let instances_count = d.count(&header.field("instance_count"), 179, MAX_INSTANCES)?;
         let instance_removals_count = d.count(&header.field("instance_removal_count"), 180, MAX_INSTANCE_REMOVALS)?;
         let fog_volumes_count = d.count(&header.field("fog_volume_count"), 234, MAX_FOG_VOLUMES)?;
+        let bone_matrices_count = d.count(&header.field("bone_matrix_count"), 235, MAX_BONE_MATRICES)?;
+        let morph_weights_count = d.count(&header.field("morph_weight_count"), 236, MAX_MORPH_WEIGHTS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -3597,7 +3699,11 @@ pub mod codec {
         let instances_end = d.end(&Location::section("instances"), instances_start, instances_count, INSTANCE_FLOATS)?;
         let instance_removals_start = instances_end;
         let instance_removals_end = d.end(&Location::section("instance_removals"), instance_removals_start, instance_removals_count, INSTANCE_REMOVAL_FLOATS)?;
-        let extras_start = instance_removals_end;
+        let bone_matrices_start = instance_removals_end;
+        let bone_matrices_end = d.end(&Location::section("bone_matrices"), bone_matrices_start, bone_matrices_count, BONE_MATRIX_FLOATS)?;
+        let morph_weights_start = bone_matrices_end;
+        let morph_weights_end = d.end(&Location::section("morph_weights"), morph_weights_start, morph_weights_count, MORPH_WEIGHT_FLOATS)?;
+        let extras_start = morph_weights_end;
         let extras_cursor = &mut { extras_start };
         d.count(&header.field("save_requested"), 12, 1)?;
         d.count(&header.field("load_requested"), 13, 1)?;
@@ -3910,6 +4016,7 @@ pub mod codec {
             let clip = d.count(&path.field("clip"), base + 1, 65535)?;
             d.finite(&path.field("time"), base + 2)?;
             d.finite(&path.field("weight"), base + 3)?;
+            let inset = d.count(&path.field("inset"), base + 4, 16)?;
             base += POSE_FLOATS;
         }
         d.exhausted(&Location::section("poses"), base, poses_end)?;
@@ -4054,6 +4161,26 @@ pub mod codec {
             base += INSTANCE_REMOVAL_FLOATS;
         }
         d.exhausted(&Location::section("instance_removals"), base, instance_removals_end)?;
+        let mut base = bone_matrices_start;
+        for item in 0..bone_matrices_count {
+            let path = &Location::section("bone_matrices").index(item);
+            let inset = d.count(&path.field("inset"), base, 16)?;
+            let draw = d.count(&path.field("draw"), base + 1, MAX_DRAWS)?;
+            let joint = d.count(&path.field("joint"), base + 2, 1024)?;
+            d.values(&path.field("matrix"), base + 3, 16, &[])?;
+            base += BONE_MATRIX_FLOATS;
+        }
+        d.exhausted(&Location::section("bone_matrices"), base, bone_matrices_end)?;
+        let mut base = morph_weights_start;
+        for item in 0..morph_weights_count {
+            let path = &Location::section("morph_weights").index(item);
+            let inset = d.count(&path.field("inset"), base, 16)?;
+            let draw = d.count(&path.field("draw"), base + 1, MAX_DRAWS)?;
+            let target = d.count(&path.field("target"), base + 2, 256)?;
+            d.finite(&path.field("weight"), base + 3)?;
+            base += MORPH_WEIGHT_FLOATS;
+        }
+        d.exhausted(&Location::section("morph_weights"), base, morph_weights_end)?;
         inspect_extensions(d, *extras_cursor)?;
         Ok(())
     }
@@ -4100,6 +4227,8 @@ pub mod codec {
         let instances_count = d.count(&header.field("instance_count"), 179, MAX_INSTANCES)?;
         let instance_removals_count = d.count(&header.field("instance_removal_count"), 180, MAX_INSTANCE_REMOVALS)?;
         let fog_volumes_count = d.count(&header.field("fog_volume_count"), 234, MAX_FOG_VOLUMES)?;
+        let bone_matrices_count = d.count(&header.field("bone_matrix_count"), 235, MAX_BONE_MATRICES)?;
+        let morph_weights_count = d.count(&header.field("morph_weight_count"), 236, MAX_MORPH_WEIGHTS)?;
         let state_start = PACKET_HEADER_FLOATS;
         let state_end = d.end(&Location::section("state"), state_start, state_lanes, 1)?;
         let draws_start = state_end;
@@ -4151,7 +4280,11 @@ pub mod codec {
         let instances_end = d.end(&Location::section("instances"), instances_start, instances_count, INSTANCE_FLOATS)?;
         let instance_removals_start = instances_end;
         let instance_removals_end = d.end(&Location::section("instance_removals"), instance_removals_start, instance_removals_count, INSTANCE_REMOVAL_FLOATS)?;
-        let extras_start = instance_removals_end;
+        let bone_matrices_start = instance_removals_end;
+        let bone_matrices_end = d.end(&Location::section("bone_matrices"), bone_matrices_start, bone_matrices_count, BONE_MATRIX_FLOATS)?;
+        let morph_weights_start = bone_matrices_end;
+        let morph_weights_end = d.end(&Location::section("morph_weights"), morph_weights_start, morph_weights_count, MORPH_WEIGHT_FLOATS)?;
+        let extras_start = morph_weights_end;
         let mut end = extras_start;
         for item in 0..draws_count {
             let count = d.count(&Location::section("draws").index(item).field("extra"), draws_start + item * DRAW_FLOATS + 23, MAX_DRAW_EXTRA)?;
@@ -4386,6 +4519,14 @@ pub mod codec {
         for instance_removal in &frame.instance_removals {
             canonical_instance_removal(&mut out, instance_removal);
         }
+        out.push(frame.bone_matrices.len() as f32);
+        for bone_matrix in &frame.bone_matrices {
+            canonical_bone_matrix(&mut out, bone_matrix);
+        }
+        out.push(frame.morph_weights.len() as f32);
+        for morph_weight in &frame.morph_weights {
+            canonical_morph_weight(&mut out, morph_weight);
+        }
         out
     }
 
@@ -4501,7 +4642,7 @@ pub mod codec {
     }
 
     fn canonical_pose(out: &mut Vec<f32>, pose: &Pose) {
-        out.extend([pose.draw as f32, pose.clip as f32, pose.time, pose.weight]);
+        out.extend([pose.draw as f32, pose.clip as f32, pose.time, pose.weight, pose.inset as f32]);
     }
 
     fn canonical_emitter(out: &mut Vec<f32>, emitter: &Emitter) {
@@ -4594,5 +4735,16 @@ pub mod codec {
 
     fn canonical_instance_removal(out: &mut Vec<f32>, instance_removal: &InstanceRemoval) {
         out.extend([instance_removal.id_low as f32, instance_removal.id_high as f32]);
+    }
+
+    fn canonical_bone_matrix(out: &mut Vec<f32>, bone_matrix: &BoneMatrix) {
+        out.extend([bone_matrix.inset as f32, bone_matrix.draw as f32, bone_matrix.joint as f32]);
+        out.extend_from_slice(&bone_matrix.matrix);
+    }
+
+    fn canonical_morph_weight(out: &mut Vec<f32>, morph_weight: &MorphWeight) {
+        out.extend([
+            morph_weight.inset as f32, morph_weight.draw as f32, morph_weight.target as f32, morph_weight.weight,
+        ]);
     }
 }

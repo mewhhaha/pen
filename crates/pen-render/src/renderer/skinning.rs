@@ -1,17 +1,18 @@
-// Skinned draws' poses. A frame's pose layers name the draws they pose; a
-// posed draw whose mesh has a skin and whose material's shader has a
-// `vertex_skinned` entry point is drawn alone with its skinned pipeline, its
-// joint matrices worked out here from its layers (the mesh's clips sampled
-// and blended, animation.rs) and laid in one storage buffer for the frame,
-// which the draw binds at group 3 with a dynamic offset. Other posed draws
-// are drawn as they are, in their mesh's bind pose.
+// Skinned draws' poses. A frame's clip pose layers (`poses`) and/or explicit
+// joint matrices (`bone_matrices`) name the draws they pose (either scene draws
+// with `inset == 0` or inset draws with `inset == 1 + k`). A posed draw whose
+// mesh has a skin and whose material's shader has a `vertex_skinned` entry
+// point draws alone with its matching skinned pipeline (opaque, translucent,
+// inset, or blended inset), its joint matrices laid in one storage buffer for
+// the frame, bound at group 3 with a dynamic offset.
 use std::sync::Arc;
 
 use pen_protocol::RenderFrame;
 
-use super::{GpuAsset, Item, MeshAsset, ReadyEntry, Scratch, Shape, State};
+use super::{GpuAsset, INSET_SAMPLES, Item, MeshAsset, ReadyEntry, Scratch, Shape, Source, State};
 use crate::animation::{Layer, Matrix, Rig};
 use crate::asset_store::Material;
+use crate::matrix::IDENTITY;
 use crate::shader::{Stage, Variants};
 
 /// Group 3 of a skinned pipeline (after the lights): the draw's joint matrices, read by its
@@ -33,45 +34,128 @@ pub(super) fn group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 }
 
 impl Scratch {
-    /// Sorts the frame's pose layers by the draw they pose.
+    /// Builds the flat draw-target index mapping (`0..draws.len()` for scene
+    /// draws, followed by each inset's draws) and sorts the frame's pose layers
+    /// and explicit bone matrices by target index.
     pub(super) fn group_poses(&mut self, frame: &RenderFrame) {
+        self.scene_draw_count = frame.draws.len();
+        self.inset_draw_bases.clear();
+        let mut total = frame.draws.len();
+        for inset in &frame.insets {
+            self.inset_draw_bases.push(total);
+            total += inset.draws.len();
+        }
+        self.total_draw_targets = total;
+
         self.pose_first.clear();
         self.pose_order.clear();
-        if frame.poses.is_empty() {
-            return;
+        if !frame.poses.is_empty() {
+            self.pose_first.resize(total + 1, 0);
+            for pose in &frame.poses {
+                if let Some(target) = self.draw_target_index(pose.inset, pose.draw) {
+                    self.pose_first[target + 1] += 1;
+                }
+            }
+            for index in 1..self.pose_first.len() {
+                self.pose_first[index] += self.pose_first[index - 1];
+            }
+            let mut next: Vec<u32> = self.pose_first[..total].to_vec();
+            self.pose_order.resize(frame.poses.len(), 0);
+            for (index, pose) in frame.poses.iter().enumerate() {
+                if let Some(target) = self.draw_target_index(pose.inset, pose.draw) {
+                    let slot = &mut next[target];
+                    self.pose_order[*slot as usize] = u32::try_from(index).unwrap_or(u32::MAX);
+                    *slot += 1;
+                }
+            }
         }
-        // Validation keeps every layer's draw among the frame's.
-        let first = &mut self.pose_first;
-        first.resize(frame.draws.len() + 1, 0);
-        for pose in &frame.poses {
-            first[pose.draw as usize + 1] += 1;
-        }
-        for index in 1..first.len() {
-            first[index] += first[index - 1];
-        }
-        let mut next: Vec<u32> = first[..frame.draws.len()].to_vec();
-        self.pose_order.resize(frame.poses.len(), 0);
-        for (index, pose) in frame.poses.iter().enumerate() {
-            let slot = &mut next[pose.draw as usize];
-            self.pose_order[*slot as usize] = u32::try_from(index).unwrap_or(u32::MAX);
-            *slot += 1;
+
+        self.bone_first.clear();
+        self.bone_order.clear();
+        if !frame.bone_matrices.is_empty() {
+            self.bone_first.resize(total + 1, 0);
+            for bone in &frame.bone_matrices {
+                if let Some(target) = self.draw_target_index(bone.inset, bone.draw) {
+                    self.bone_first[target + 1] += 1;
+                }
+            }
+            for index in 1..self.bone_first.len() {
+                self.bone_first[index] += self.bone_first[index - 1];
+            }
+            let mut next: Vec<u32> = self.bone_first[..total].to_vec();
+            self.bone_order.resize(frame.bone_matrices.len(), 0);
+            for (index, bone) in frame.bone_matrices.iter().enumerate() {
+                if let Some(target) = self.draw_target_index(bone.inset, bone.draw) {
+                    let slot = &mut next[target];
+                    self.bone_order[*slot as usize] = u32::try_from(index).unwrap_or(u32::MAX);
+                    *slot += 1;
+                }
+            }
         }
     }
 
-    /// Whether the frame's draw `draw` has pose layers.
-    pub(super) fn posed(&self, draw: usize) -> bool {
-        self.pose_first.get(draw + 1).is_some_and(|&end| end > self.pose_first[draw])
+    pub(super) fn total_draw_targets(&self) -> usize {
+        self.total_draw_targets
     }
 
-    /// Draw `draw`'s pose layers.
-    pub(super) fn layers<'a>(&'a self, frame: &'a RenderFrame, draw: usize) -> impl Iterator<Item = Layer> + 'a {
-        let range = match self.pose_first.get(draw + 1) {
-            Some(&end) => self.pose_first[draw] as usize..end as usize,
+    pub(super) fn draw_target_index(&self, inset: u32, draw: u32) -> Option<usize> {
+        let draw = draw as usize;
+        if inset == 0 {
+            (draw < self.scene_draw_count).then_some(draw)
+        } else {
+            let k = (inset - 1) as usize;
+            let base = *self.inset_draw_bases.get(k)?;
+            let end = self.inset_draw_bases.get(k + 1).copied().unwrap_or(self.total_draw_targets);
+            let idx = base + draw;
+            (idx < end).then_some(idx)
+        }
+    }
+
+    pub(super) fn target_of_source(&self, source: Source) -> Option<usize> {
+        match source {
+            Source::Draw(draw) => (draw < self.scene_draw_count).then_some(draw),
+            Source::Inset(inset, draw) => {
+                let base = *self.inset_draw_bases.get(inset)?;
+                let end = self.inset_draw_bases.get(inset + 1).copied().unwrap_or(self.total_draw_targets);
+                let idx = base + draw;
+                (idx < end).then_some(idx)
+            }
+            Source::World => None,
+        }
+    }
+
+    /// Whether draw target `target` has clip pose layers or explicit bone matrices.
+    pub(super) fn posed(&self, target: usize) -> bool {
+        let has_poses = self.pose_first.get(target + 1).is_some_and(|&end| end > self.pose_first[target]);
+        let has_bones = self.bone_first.get(target + 1).is_some_and(|&end| end > self.bone_first[target]);
+        has_poses || has_bones
+    }
+
+    /// Draw target `target`'s clip pose layers.
+    pub(super) fn layers<'a>(&'a self, frame: &'a RenderFrame, target: usize) -> impl Iterator<Item = Layer> + 'a {
+        let range = match self.pose_first.get(target + 1) {
+            Some(&end) => self.pose_first[target] as usize..end as usize,
             None => 0..0,
         };
         self.pose_order[range].iter().map(move |&index| {
             let pose = &frame.poses[index as usize];
             Layer { clip: pose.clip, time: pose.time, weight: pose.weight }
+        })
+    }
+
+    /// Draw target `target`'s explicit joint matrix overrides.
+    pub(super) fn bone_matrices<'a>(
+        &'a self,
+        frame: &'a RenderFrame,
+        target: usize,
+    ) -> impl Iterator<Item = (u32, Matrix)> + 'a {
+        let range = match self.bone_first.get(target + 1) {
+            Some(&end) => self.bone_first[target] as usize..end as usize,
+            None => 0..0,
+        };
+        self.bone_order[range].iter().map(move |&index| {
+            let bone = &frame.bone_matrices[index as usize];
+            (bone.joint, bone.matrix)
         })
     }
 }
@@ -95,7 +179,7 @@ pub(super) struct Skinning {
 /// What became of a posed draw.
 pub(super) enum Posed {
     /// It is drawn as it is: its mesh has no skin, its shader no skinned
-    /// entry point, or its material is not opaque.
+    /// entry point, or it is an overlay.
     Unskinned,
     /// Its skinned pipeline is compiling.
     Waiting,
@@ -122,12 +206,27 @@ impl Skinning {
         self.largest = 0;
     }
 
-    /// Lays `rig`'s joint matrices for `layers` after the frame's others,
-    /// and returns their offset in bytes.
-    fn pose(&mut self, rig: &Rig, layers: impl Iterator<Item = Layer>) -> u32 {
+    /// Lays `rig`'s joint matrices for `layers` and explicit `overrides` after
+    /// the frame's others, and returns their offset in bytes.
+    fn pose(
+        &mut self,
+        rig: &Rig,
+        layers: impl Iterator<Item = Layer>,
+        overrides: impl Iterator<Item = (u32, Matrix)>,
+    ) -> u32 {
         self.layers.clear();
         self.layers.extend(layers);
-        rig.palette(&self.layers, &mut self.palette);
+        if self.layers.is_empty() {
+            self.palette.clear();
+            self.palette.resize(rig.joints.len(), IDENTITY);
+        } else {
+            rig.palette(&self.layers, &mut self.palette);
+        }
+        for (joint, matrix) in overrides {
+            if let Some(slot) = self.palette.get_mut(joint as usize) {
+                *slot = matrix;
+            }
+        }
         let aligned = (self.data.len() * 4).next_multiple_of(self.alignment);
         self.data.resize(aligned / 4, 0.0);
         for matrix in &self.palette {
@@ -197,30 +296,45 @@ impl ReadyEntry {
 }
 
 impl State {
-    /// The frame's draw `draw` of `mesh` with `material` and `shader`,
-    /// posed by its layers: drawn skinned once its pipeline is there, or as
-    /// it is.
+    /// The frame's draw target `target` of `mesh` with `material` and `shader`,
+    /// posed by its clip layers and/or explicit bone matrices: drawn skinned
+    /// once its pipeline is there (opaque, translucent, inset, or blended inset),
+    /// or as it is.
     pub(super) fn pose_draw(
         &mut self,
         frame: &RenderFrame,
         scratch: &Scratch,
-        draw: usize,
+        target: usize,
         (mesh, material, shader): (usize, &Material, usize),
         samples: u32,
+        inset: bool,
     ) -> Posed {
         let rig: Arc<Rig> = match self.assets.current(mesh) {
             Some(GpuAsset::Mesh(MeshAsset { skin: Some(skin), .. })) => skin.rig.clone(),
             _ => return Posed::Unskinned,
         };
         let skinning = matches!(self.assets.current(shader), Some(GpuAsset::Shader(shader)) if shader.skinning);
-        if !skinning || !material.opaque() {
+        if !skinning || material.overlay {
             return Posed::Unskinned;
         }
-        if !self.ensure_variants(shader, samples, Variants::SKINNED) {
+        let (target_samples, variant) = match (inset, material.opaque()) {
+            (false, true) => (samples, Variants::SKINNED),
+            (false, false) => (samples, Variants::SKINNED_TRANSLUCENT),
+            (true, true) => (INSET_SAMPLES, Variants::INSET_SKINNED),
+            (true, false) => (INSET_SAMPLES, Variants::INSET_SKINNED_BLENDED),
+        };
+        if !self.ensure_variants(shader, target_samples, variant) {
             return Posed::Waiting;
         }
-        let pipeline = self.pipelines(shader, samples).skinned.clone().expect("an ensured variant is compiled");
-        let offset = self.skinning.pose(&rig, scratch.layers(frame, draw));
+        let made = self.pipelines(shader, target_samples);
+        let pipeline = match (inset, material.opaque()) {
+            (false, true) => made.skinned.clone(),
+            (false, false) => made.skinned_translucent.clone(),
+            (true, true) => made.inset_skinned.clone(),
+            (true, false) => made.inset_skinned_blended.clone(),
+        }
+        .expect("an ensured variant is compiled");
+        let offset = self.skinning.pose(&rig, scratch.layers(frame, target), scratch.bone_matrices(frame, target));
         Posed::Ready(pipeline, offset)
     }
 }

@@ -384,6 +384,10 @@ pub fn split(geometry: &mut Geometry, corners: &[[f32; 4]]) {
                     geometry.joints.push(geometry.joints[vertex]);
                     geometry.weights.push(geometry.weights[vertex]);
                 }
+                for target in &mut geometry.morphs {
+                    target.positions.push(target.positions[vertex]);
+                    target.normals.push(target.normals[vertex]);
+                }
                 tangents.push(tangent);
                 u32::try_from(made).expect("a primitive's vertices are indexed by u32")
             });

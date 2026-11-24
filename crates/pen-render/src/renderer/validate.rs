@@ -101,11 +101,39 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
         determinant_of(&decal.transform)?;
         ensure!(decal.opacity >= 0.0 && decal.opacity <= 1.0, "decal opacity must be within 0..1");
     }
+    let valid_draw_target = |inset: u32, draw: u32| -> bool {
+        if inset == 0 {
+            (draw as usize) < frame.draws.len()
+        } else {
+            frame.insets.get((inset - 1) as usize).is_some_and(|ins| (draw as usize) < ins.draws.len())
+        }
+    };
     for pose in &frame.poses {
-        ensure!((pose.draw as usize) < frame.draws.len(), "a pose layer must name one of the frame's draws");
+        ensure!(valid_draw_target(pose.inset, pose.draw), "a pose layer must name one of the frame's or inset's draws");
         ensure!(
             pose.time.is_finite() && pose.weight.is_finite() && pose.weight >= 0.0,
             "a pose layer needs a finite time and a finite weight of 0 or more"
+        );
+    }
+    for bone in &frame.bone_matrices {
+        ensure!(
+            valid_draw_target(bone.inset, bone.draw),
+            "a bone matrix must name one of the frame's or inset's draws"
+        );
+        ensure!(
+            (bone.joint as usize) < crate::animation::MAX_JOINTS,
+            "a bone matrix joint index must lie within MAX_JOINTS"
+        );
+        validate_matrix(&bone.matrix)?;
+    }
+    for morph in &frame.morph_weights {
+        ensure!(
+            valid_draw_target(morph.inset, morph.draw),
+            "a morph weight must name one of the frame's or inset's draws"
+        );
+        ensure!(
+            (morph.target as usize) < crate::asset_store::MAX_MORPH_TARGETS && morph.weight.is_finite(),
+            "a morph weight needs a valid target index and finite weight"
         );
     }
     for emitter in &frame.emitters {

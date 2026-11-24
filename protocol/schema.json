@@ -170,6 +170,16 @@
       "doc": "The most voices one frame may declare."
     },
     {
+      "limit": "MAX_BONE_MATRICES",
+      "value": 65536,
+      "doc": "The most explicit joint matrices one frame may declare."
+    },
+    {
+      "limit": "MAX_MORPH_WEIGHTS",
+      "value": 65536,
+      "doc": "The most morph target weights one frame may declare."
+    },
+    {
       "limit": "MAX_BUSES",
       "value": 16,
       "doc": "The most buses one frame may declare, the master (bus 0) included."
@@ -2482,6 +2492,16 @@
         "kind": "size",
         "section": "fog_volumes",
         "of": "count"
+      },
+      "bone_matrix_count": {
+        "kind": "size",
+        "section": "bone_matrices",
+        "of": "count"
+      },
+      "morph_weight_count": {
+        "kind": "size",
+        "section": "morph_weights",
+        "of": "count"
       }
     },
     "sections": [
@@ -3243,6 +3263,11 @@
             "weight": {
               "kind": "f32",
               "doc": "How much it counts among its draw's layers: 0 or more."
+            },
+            "inset": {
+              "kind": "count",
+              "max": 16,
+              "doc": "Which draw list `draw` indexes: 0 for the main scene's `draws`, or `1 + k` for `insets[k].draws`."
             }
           },
           "doc": "A layer of a skinned draw's pose: clip `clip` of the draw's mesh at `time` seconds, counting `weight` among the draw's layers."
@@ -3906,6 +3931,84 @@
         "max": {
           "limit": "MAX_INSTANCE_REMOVALS",
           "value": 100000
+        }
+      },
+      {
+        "kind": "records",
+        "name": "bone_matrices",
+        "doc": "Explicit skinning joint matrices supplied by the game (e.g. from Ink's animation, IK, inertialization, ragdoll or secondary-bone solvers). Applied after any clip `poses` for the same draw, or starting from identity when no clip layers are declared.",
+        "record": {
+          "name": "BoneMatrix",
+          "constant": "BONE_MATRIX",
+          "fields": {
+            "inset": {
+              "kind": "count",
+              "max": 16,
+              "doc": "Which draw list `draw` indexes: 0 for the main scene's `draws`, or `1 + k` for `insets[k].draws`."
+            },
+            "draw": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_DRAWS",
+                "value": 100000
+              },
+              "doc": "The draw this joint matrix skins."
+            },
+            "joint": {
+              "kind": "count",
+              "max": 1024,
+              "doc": "Joint index within the mesh's skin palette."
+            },
+            "matrix": {
+              "kind": "matrix",
+              "doc": "Column-major skinning matrix (world joint transform times inverse bind matrix)."
+            }
+          },
+          "doc": "One explicit joint skinning matrix for a skinned draw."
+        },
+        "max": {
+          "limit": "MAX_BONE_MATRICES",
+          "value": 65536,
+          "doc": "The most explicit joint matrices one frame may declare."
+        }
+      },
+      {
+        "kind": "records",
+        "name": "morph_weights",
+        "doc": "Blendshape / morph target weights applied to mesh vertices on the GPU before skinning and shading.",
+        "record": {
+          "name": "MorphWeight",
+          "constant": "MORPH_WEIGHT",
+          "fields": {
+            "inset": {
+              "kind": "count",
+              "max": 16,
+              "doc": "Which draw list `draw` indexes: 0 for the main scene's `draws`, or `1 + k` for `insets[k].draws`."
+            },
+            "draw": {
+              "kind": "count",
+              "max": {
+                "limit": "MAX_DRAWS",
+                "value": 100000
+              },
+              "doc": "The draw whose mesh vertices are morphed."
+            },
+            "target": {
+              "kind": "count",
+              "max": 256,
+              "doc": "Morph target index in the mesh's morph target array."
+            },
+            "weight": {
+              "kind": "f32",
+              "doc": "Linear blend weight for this target."
+            }
+          },
+          "doc": "One morph target blend weight for a draw."
+        },
+        "max": {
+          "limit": "MAX_MORPH_WEIGHTS",
+          "value": 65536,
+          "doc": "The most morph target weights one frame may declare."
         }
       },
       {

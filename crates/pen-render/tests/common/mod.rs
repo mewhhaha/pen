@@ -91,6 +91,8 @@ pub fn frame(draws: Vec<Draw>) -> RenderFrame {
         buses: Vec::new(),
         voices: Vec::new(),
         poses: Vec::new(),
+        bone_matrices: Vec::new(),
+        morph_weights: Vec::new(),
         emitters: Vec::new(),
         extensions: Vec::new(),
         lights: Vec::new(),

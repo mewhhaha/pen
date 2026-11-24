@@ -171,6 +171,41 @@ mod tests {
     }
 
     #[test]
+    fn morph_targets_round_trip_bit_exactly_beside_a_skin() {
+        let mut mesh = parse_mesh(skinned_triangle().as_bytes()).unwrap();
+        let deltas = vec![
+            -0.0,
+            f32::from_bits(1),
+            0.25,
+            0.0,
+            0.0,
+            0.5,
+            0.5,
+            -0.25,
+            0.0,
+            0.1,
+            0.2,
+            0.3,
+            0.0,
+            1.0,
+            -0.5,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        mesh.set_morphs(Some(crate::asset_store::MorphTargets { targets: 1, deltas: deltas.clone() })).unwrap();
+        let raw = pack_uncompressed(&mesh).unwrap();
+        let packed = encode(raw.clone()).unwrap();
+        assert_eq!(decode(&packed).unwrap().as_ref(), raw);
+        let parsed = parse_mesh(&packed).unwrap();
+        let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+        assert_eq!(parsed.morphs.as_ref().unwrap().targets, 1);
+        assert_eq!(bits(&parsed.morphs.as_ref().unwrap().deltas), bits(&deltas));
+        assert!(parsed.skin.is_some());
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
+    }
+
+    #[test]
     fn rejects_truncation_corruption_trailers_and_false_expanded_sizes() {
         let raw = pack_uncompressed(&parse_mesh(skinned_triangle().as_bytes()).unwrap()).unwrap();
         let packed = encode(raw.clone()).unwrap();

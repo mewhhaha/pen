@@ -74,7 +74,22 @@ pub(crate) struct Mesh {
     /// Each vertex's tangent (`MESH_TANGENT_FLOATS` floats: xyz and a
     /// handedness of -1 or 1), a stream of its own beside the vertices.
     pub tangents: Option<Vec<f32>>,
+    /// Blendshape / morph target vertex deltas (position + normal per target per vertex).
+    pub morphs: Option<MorphTargets>,
 }
+
+/// Morph targets for a mesh: `targets` blendshapes, each storing
+/// `[dx, dy, dz, dnx, dny, dnz]` for every vertex (target-major order).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MorphTargets {
+    pub targets: u32,
+    pub deltas: Vec<f32>,
+}
+
+/// Maximum number of morph targets per mesh.
+pub(crate) const MAX_MORPH_TARGETS: usize = 256;
+/// Floats per vertex per morph target: position delta (3) + normal delta (3).
+pub(crate) const MESH_MORPH_FLOATS: usize = 6;
 
 /// Up to four joints (indices into the rig's joints) per vertex, and how
 /// much each moves it; the weights of a vertex add up to 1.
@@ -357,7 +372,16 @@ const MESH_LODS: u8 = 8;
 const MESH_INSTANCES: u8 = 16;
 // Flag: each vertex's tangent (four f32s) follows the vertices.
 const MESH_TANGENTS: u8 = 32;
+// Flag: morph target count (u32) + targets * vertices * 6 f32s follow LODs.
+const MESH_MORPHS: u8 = 64;
 const MESH_HEADER: usize = 16;
+
+#[derive(Deserialize)]
+struct MorphTargetArrays {
+    positions: Vec<f32>,
+    #[serde(default)]
+    normals: Option<Vec<f32>>,
+}
 
 /// A mesh as its JSON has it: flat arrays, three or two numbers a vertex,
 /// and any simpler levels of detail over the same vertices.
@@ -390,6 +414,8 @@ struct MeshArrays {
     /// of the bitangent (cross(normal, tangent) * w).
     #[serde(default)]
     tangents: Option<Vec<f32>>,
+    #[serde(default)]
+    morphs: Option<Vec<MorphTargetArrays>>,
 }
 
 #[derive(Deserialize)]
@@ -422,6 +448,7 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
         clips,
         instances,
         tangents,
+        morphs,
     } = arrays;
     let count = positions.len() / 3;
     ensure!(
@@ -463,6 +490,30 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
     mesh.authored_lods = authored_lods;
     mesh.set_instances(instances)?;
     mesh.set_tangents(tangents)?;
+    let morphs = match morphs {
+        None => None,
+        Some(list) if list.is_empty() => None,
+        Some(list) => {
+            ensure!(list.len() <= MAX_MORPH_TARGETS, "mesh has more than {MAX_MORPH_TARGETS} morph targets");
+            let mut deltas = Vec::with_capacity(list.len() * count * MESH_MORPH_FLOATS);
+            for target in list {
+                ensure!(
+                    target.positions.len() == count * 3 && target.normals.as_ref().is_none_or(|n| n.len() == count * 3),
+                    "morph target needs three position (and optional normal) deltas per vertex"
+                );
+                let normals = target.normals.as_deref();
+                for v in 0..count {
+                    deltas.extend_from_slice(&target.positions[v * 3..v * 3 + 3]);
+                    match normals {
+                        Some(n) => deltas.extend_from_slice(&n[v * 3..v * 3 + 3]),
+                        None => deltas.extend([0.0, 0.0, 0.0]),
+                    }
+                }
+            }
+            Some(MorphTargets { targets: u32::try_from(deltas.len() / (count * MESH_MORPH_FLOATS))?, deltas })
+        }
+    };
+    mesh.set_morphs(morphs)?;
     Ok(mesh)
 }
 
@@ -533,6 +584,7 @@ pub(crate) fn checked_mesh(
         instances: None,
         precision: None,
         tangents: None,
+        morphs: None,
     };
     let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
     ensure!(count != 0, "mesh requires matching position/normal/UV vertices and triangle indices");
@@ -581,6 +633,23 @@ impl Mesh {
         self.tangents = tangents;
         Ok(())
     }
+
+    pub(crate) fn set_morphs(&mut self, morphs: Option<MorphTargets>) -> Result<()> {
+        if let Some(morphs) = &morphs {
+            let count = self.vertices.len() / MESH_VERTEX_FLOATS;
+            ensure!(
+                (1..=MAX_MORPH_TARGETS).contains(&(morphs.targets as usize)),
+                "mesh morph target count must be 1..={MAX_MORPH_TARGETS}"
+            );
+            ensure!(
+                morphs.deltas.len() == morphs.targets as usize * count * MESH_MORPH_FLOATS,
+                "mesh morph deltas must provide 6 floats per target per vertex"
+            );
+            ensure!(morphs.deltas.iter().all(|v| v.is_finite()), "mesh morph deltas must be finite float32 values");
+        }
+        self.morphs = morphs;
+        Ok(())
+    }
 }
 
 /// The compact binary form of a mesh asset (JSON, or already binary), which
@@ -625,7 +694,8 @@ fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
             | if mesh.skin.is_some() { MESH_SKIN } else { 0 }
             | if lods { MESH_LODS } else { 0 }
             | if mesh.instances.is_some() { MESH_INSTANCES } else { 0 }
-            | if mesh.tangents.is_some() { MESH_TANGENTS } else { 0 },
+            | if mesh.tangents.is_some() { MESH_TANGENTS } else { 0 }
+            | if mesh.morphs.is_some() { MESH_MORPHS } else { 0 },
         0,
         0,
     ]);
@@ -659,6 +729,12 @@ fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
         }
         for lod in &mesh.lods[1..] {
             write(&mut packed, &mesh.indices[lod.first as usize..(lod.first + lod.count) as usize])?;
+        }
+    }
+    if let Some(morphs) = &mesh.morphs {
+        packed.extend(morphs.targets.to_le_bytes());
+        for value in &morphs.deltas {
+            packed.extend(value.to_le_bytes());
         }
     }
     if let Some(skin) = &mesh.skin {
@@ -711,10 +787,16 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
     let tangents = layout.tangents.as_ref().map(|block| {
         bytes[block.range()].as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)).collect::<Vec<_>>()
     });
+    let morphs = layout.morphs.as_ref().map(|(targets, block)| {
+        let deltas =
+            bytes[block.range()].as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)).collect::<Vec<_>>();
+        MorphTargets { targets: *targets, deltas }
+    });
     let mut mesh = checked_mesh(vertices, indices, &simpler, skin)?;
     mesh.authored_lods = true;
     mesh.set_instances(layout.instances.as_ref().map(|layout| MeshInstances::read(bytes, layout)).transpose()?)?;
     mesh.set_tangents(tangents)?;
+    mesh.set_morphs(morphs)?;
     Ok(mesh)
 }
 

@@ -6,8 +6,9 @@ use std::ops::Range;
 use anyhow::{Context, Result, ensure};
 
 use super::{
-    MAX_LODS, MESH_ATTRIBUTES, MESH_HEADER, MESH_INSTANCES, MESH_LODS, MESH_MAGIC, MESH_SHORT_INDICES, MESH_SKIN,
-    MESH_TANGENT_FLOATS, MESH_TANGENTS, MESH_VERSION, MESH_VERTEX_FLOATS,
+    MAX_LODS, MAX_MORPH_TARGETS, MESH_ATTRIBUTES, MESH_HEADER, MESH_INSTANCES, MESH_LODS, MESH_MAGIC,
+    MESH_MORPH_FLOATS, MESH_MORPHS, MESH_SHORT_INDICES, MESH_SKIN, MESH_TANGENT_FLOATS, MESH_TANGENTS, MESH_VERSION,
+    MESH_VERTEX_FLOATS,
 };
 
 pub(super) const INSTANCE_FLOATS: usize = 20;
@@ -43,6 +44,7 @@ pub(super) struct Layout {
     pub tangents: Option<Block>,
     pub indices: Block,
     pub lods: Vec<(f32, Block)>,
+    pub morphs: Option<(u32, Block)>,
     pub skin: Option<(Block, Range<usize>)>,
     pub instances: Option<Instances>,
 }
@@ -59,7 +61,14 @@ impl Layout {
         ensure!(bytes[6..8] == [0; 2], "unsupported binary mesh header");
         let flags = bytes[5];
         ensure!(
-            flags & !(MESH_ATTRIBUTES | MESH_SHORT_INDICES | MESH_SKIN | MESH_LODS | MESH_INSTANCES | MESH_TANGENTS)
+            flags
+                & !(MESH_ATTRIBUTES
+                    | MESH_SHORT_INDICES
+                    | MESH_SKIN
+                    | MESH_LODS
+                    | MESH_INSTANCES
+                    | MESH_TANGENTS
+                    | MESH_MORPHS)
                 == 0,
             "unsupported binary mesh flags"
         );
@@ -90,6 +99,16 @@ impl Layout {
                 lods.push((error, Block::take(bytes, &mut at, count, index_bytes)?));
             }
         }
+        let morphs = if flags & MESH_MORPHS != 0 {
+            let targets = word(bytes, at)?;
+            ensure!((1..=MAX_MORPH_TARGETS).contains(&targets), "binary mesh has invalid morph target count");
+            at += 4;
+            let records = count.checked_mul(targets).context("binary mesh morph count overflows")?;
+            let block = Block::take(bytes, &mut at, records, MESH_MORPH_FLOATS * 4)?;
+            Some((u32::try_from(targets)?, block))
+        } else {
+            None
+        };
         let skin = if flags & MESH_SKIN != 0 {
             let records = Block::take(bytes, &mut at, count, SKIN_STRIDE)?;
             let rig = at..bytes.len();
@@ -108,7 +127,7 @@ impl Layout {
             None
         };
         ensure!(at == bytes.len(), "binary mesh has trailing bytes");
-        Ok(Self { vertices, tangents, indices, lods, skin, instances })
+        Ok(Self { vertices, tangents, indices, lods, morphs, skin, instances })
     }
 
     /// Record blocks only: counts, errors, bounds and a skin's variable
@@ -118,6 +137,7 @@ impl Layout {
             .into_iter()
             .chain(self.tangents.iter())
             .chain(self.lods.iter().map(|(_, block)| block))
+            .chain(self.morphs.iter().map(|(_, block)| block))
             .chain(self.skin.iter().map(|(block, _)| block))
             .chain(self.instances.iter().map(|instances| &instances.records))
     }

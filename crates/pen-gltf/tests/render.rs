@@ -31,7 +31,7 @@ struct Skinned { @location(0) position: vec3f, @location(9) joints: vec4u, @loca
 "#;
 
 fn layer(clip: u32, time: f32, weight: f32) -> Pose {
-    Pose { draw: 0, clip, time, weight }
+    Pose { draw: 0, clip, time, weight, inset: 0 }
 }
 
 #[test]

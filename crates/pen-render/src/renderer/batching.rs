@@ -194,10 +194,11 @@ impl State {
         scratch.detail = Detail::new(&frame.projection, &frame.view, height);
         self.culling.begin(scratch.views, scratch.detail);
         scratch.group_poses(frame);
+        scratch.group_morphs(frame);
         for (index, draw) in frame.draws.iter().enumerate() {
-            // A posed draw has joint matrices of its own: drawn alone.
-            let posed = scratch.posed(index);
-            let placement = self.place(draw, catalog, samples, scratch, posed)?;
+            // A posed or morphed draw has per-draw joint matrices or deformed vertices: drawn alone.
+            let deformed = scratch.posed(index) || scratch.morphed(index);
+            let placement = self.place(draw, catalog, samples, scratch, deformed)?;
             scratch.placements.push(placement);
         }
         // Batches of many instances cull on the GPU: their instances go first
@@ -221,7 +222,7 @@ impl State {
         // vertices past their mesh's bounds, so every view they may be in
         // draws them, whole.
         for (index, draw) in frame.draws.iter().enumerate() {
-            let posed = scratch.posed(index);
+            let deformed = scratch.posed(index) || scratch.morphed(index);
             let placement = &mut scratch.placements[index];
             if placement.batch == LEFT_OUT {
                 continue;
@@ -231,7 +232,7 @@ impl State {
                 continue;
             }
             let choice = &scratch.choices[placement.choice as usize];
-            (placement.views, placement.lod) = if posed {
+            (placement.views, placement.lod) = if deformed {
                 (if choice.casts { scratch.views.all() } else { CAMERA | scratch.capture_bit }, 0)
             } else {
                 seen(choice, draw, &scratch.views, &scratch.detail, scratch.capture_bit, stats)
@@ -474,12 +475,14 @@ impl State {
         let item_count = scratch.items.len();
         let floats = (self.stride / 4) as usize;
         self.skinning.begin();
+        self.morphing.begin();
         for index in 0..item_count {
             let item = scratch.items[index];
             let Some(entry) = self.ready_entry(frame, catalog, scratch, index, item, samples)? else { continue };
             scratch.ready.push(entry);
         }
         self.skinning.upload(&self.device, &self.queue, &self.context.skin_group);
+        self.morphing.upload(&self.device, &self.queue);
         if item_count > 0 {
             self.queue.write_buffer(
                 &self.draw_uniform,
@@ -515,8 +518,8 @@ impl State {
                 "persistent mesh instances require a vertex_persistent shader entry point"
             );
             ensure!(
-                !matches!(item.source, Source::Draw(draw) if scratch.posed(draw)),
-                "persistent mesh instances cannot be posed"
+                !scratch.target_of_source(item.source).is_some_and(|t| scratch.posed(t) || scratch.morphed(t)),
+                "persistent mesh instances cannot be posed or morphed"
             );
         }
         let field = self.field_ids.get(catalog.material(item.material)).copied();
@@ -609,24 +612,41 @@ impl State {
             }
         };
         let mut pipeline = pipeline.expect("an ensured variant is compiled");
-        // A posed draw of a skinned mesh draws skinned, its joint matrices
-        // laid out for it.
+        // A posed draw (scene or inset, opaque or translucent) of a skinned mesh
+        // draws skinned with its joint matrices; a morphed draw schedules GPU
+        // blendshape evaluation into the frame's morphed vertex buffer.
         let mut skin = None;
-        if let (Source::Draw(draw), Some(mesh)) = (item.source, mesh)
-            && scratch.posed(draw)
-        {
-            match self.pose_draw(frame, scratch, draw, (mesh, m, shader), samples) {
-                Posed::Unskinned => {}
-                Posed::Waiting => return Ok(None),
-                Posed::Ready(skinned, at) => {
-                    pipeline = skinned;
-                    skin = Some(at);
+        let mut morph = None;
+        if let (Some(target), Some(mesh)) = (scratch.target_of_source(item.source), mesh) {
+            if scratch.posed(target) {
+                match self.pose_draw(frame, scratch, target, (mesh, m, shader), samples, item.inset().is_some()) {
+                    Posed::Unskinned => {}
+                    Posed::Waiting => return Ok(None),
+                    Posed::Ready(skinned, at) => {
+                        pipeline = skinned;
+                        skin = Some(at);
+                    }
                 }
+            }
+            if scratch.morphed(target) {
+                morph = self.morph_draw(frame, scratch, target, mesh);
             }
         }
         let offset =
             u32::try_from(index as u64 * self.stride).context("draw uniforms lie past a dynamic offset's reach")?;
-        Ok(Some(ReadyEntry { item: index, offset, group, material, shader, mesh, pipeline, visible, skin, persistent }))
+        Ok(Some(ReadyEntry {
+            item: index,
+            offset,
+            group,
+            material,
+            shader,
+            mesh,
+            pipeline,
+            visible,
+            skin,
+            morph,
+            persistent,
+        }))
     }
 
     /// Sorts what is ready into the scene's passes: opaque surfaces by

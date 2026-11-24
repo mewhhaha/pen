@@ -149,6 +149,7 @@ func encode_voice (voice: types.Voice) =>
 func encode_pose (pose: types.Pose) =>
   return #[
     U32.to_f32 (pose.draw), U32.to_f32 (pose.clip), pose.time, pose.weight,
+    U32.to_f32 (pose.inset),
   ]
 
 // Emitter: A particle emitter: `rate` particles a second, each living `lifetime`
@@ -275,6 +276,24 @@ func encode_instance_removal (instance_removal: types.InstanceRemoval) =>
     U32.to_f32 (instance_removal.id_low), U32.to_f32 (instance_removal.id_high),
   ]
 
+// BoneMatrix: One explicit joint skinning matrix for a skinned draw.
+func encode_bone_matrix (bone_matrix: types.BoneMatrix) =>
+  let $types.Mat4 { x: matrix_x, y: matrix_y, z: matrix_z, w: matrix_w } = bone_matrix.matrix
+  return #[
+    U32.to_f32 (bone_matrix.inset), U32.to_f32 (bone_matrix.draw),
+    U32.to_f32 (bone_matrix.joint), matrix_x.x, matrix_x.y, matrix_x.z,
+    matrix_x.w, matrix_y.x, matrix_y.y, matrix_y.z, matrix_y.w, matrix_z.x,
+    matrix_z.y, matrix_z.z, matrix_z.w, matrix_w.x, matrix_w.y, matrix_w.z,
+    matrix_w.w,
+  ]
+
+// MorphWeight: One morph target blend weight for a draw.
+func encode_morph_weight (morph_weight: types.MorphWeight) =>
+  return #[
+    U32.to_f32 (morph_weight.inset), U32.to_f32 (morph_weight.draw),
+    U32.to_f32 (morph_weight.target), morph_weight.weight,
+  ]
+
 // A Draw's extra, at most protocol.max_draw_extra of them, for the packet's last
 // section.
 func encode_draw_extra (draw: types.Draw) =>
@@ -312,6 +331,8 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   let panners_count: U32 = collections.panners.length
   let instances_count: U32 = collections.instances.length
   let instance_removals_count: U32 = collections.instance_removals.length
+  let bone_matrices_count: U32 = collections.bone_matrices.length
+  let morph_weights_count: U32 = collections.morph_weights.length
   @storage.push encoded (protocol.packet_magic)
   @storage.push encoded (U32.to_f32 packet.schema)
   @storage.push encoded (0.0)
@@ -550,6 +571,8 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
   @storage.push encoded (packet.fog.drift.z)
   @storage.push encoded (U32.to_f32 (packet.quality.volumetrics))
   @storage.push encoded (U32.to_f32 fog_volumes_count)
+  @storage.push encoded (U32.to_f32 bone_matrices_count)
+  @storage.push encoded (U32.to_f32 morph_weights_count)
   let state_start = encoded.length
   for i in 0 .. state_count:
     let source = collections.state[i]
@@ -838,6 +861,7 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     @storage.push encoded (U32.to_f32 (pose.clip))
     @storage.push encoded (pose.time)
     @storage.push encoded (pose.weight)
+    @storage.push encoded (U32.to_f32 (pose.inset))
   for i in 0 .. emitters_count:
     let source = collections.emitters[i]
     let emitter: types.Emitter = project.emitter context source
@@ -1062,6 +1086,36 @@ func append_render_views (packet: types.RenderHeader) -> collections -> project 
     let instance_removal: types.InstanceRemoval = project.instance_removal context source
     @storage.push encoded (U32.to_f32 (instance_removal.id_low))
     @storage.push encoded (U32.to_f32 (instance_removal.id_high))
+  for i in 0 .. bone_matrices_count:
+    let source = collections.bone_matrices[i]
+    let bone_matrice: types.BoneMatrix = project.bone_matrice context source
+    @storage.push encoded (U32.to_f32 (bone_matrice.inset))
+    @storage.push encoded (U32.to_f32 (bone_matrice.draw))
+    @storage.push encoded (U32.to_f32 (bone_matrice.joint))
+    let $types.Mat4 { x: matrix_x, y: matrix_y, z: matrix_z, w: matrix_w } = bone_matrice.matrix
+    @storage.push encoded (matrix_x.x)
+    @storage.push encoded (matrix_x.y)
+    @storage.push encoded (matrix_x.z)
+    @storage.push encoded (matrix_x.w)
+    @storage.push encoded (matrix_y.x)
+    @storage.push encoded (matrix_y.y)
+    @storage.push encoded (matrix_y.z)
+    @storage.push encoded (matrix_y.w)
+    @storage.push encoded (matrix_z.x)
+    @storage.push encoded (matrix_z.y)
+    @storage.push encoded (matrix_z.z)
+    @storage.push encoded (matrix_z.w)
+    @storage.push encoded (matrix_w.x)
+    @storage.push encoded (matrix_w.y)
+    @storage.push encoded (matrix_w.z)
+    @storage.push encoded (matrix_w.w)
+  for i in 0 .. morph_weights_count:
+    let source = collections.morph_weights[i]
+    let morph_weight: types.MorphWeight = project.morph_weight context source
+    @storage.push encoded (U32.to_f32 (morph_weight.inset))
+    @storage.push encoded (U32.to_f32 (morph_weight.draw))
+    @storage.push encoded (U32.to_f32 (morph_weight.target))
+    @storage.push encoded (morph_weight.weight)
   for i in 0 .. draws_count:
     let source = collections.draws[i]
     project.append_extra context source encoded
@@ -1099,6 +1153,8 @@ func measure_render_floats collections -> project -> context =>
   let panners_count: U32 = collections.panners.length
   let instances_count: U32 = collections.instances.length
   let instance_removals_count: U32 = collections.instance_removals.length
+  let bone_matrices_count: U32 = collections.bone_matrices.length
+  let morph_weights_count: U32 = collections.morph_weights.length
   total := self + state_count
   total := self + draws_count * 24
   for i in 0 .. solids_count:
@@ -1131,7 +1187,7 @@ func measure_render_floats collections -> project -> context =>
     total := self + 8 + count
   total := self + buses_count * 3
   total := self + voices_count * 12
-  total := self + poses_count * 4
+  total := self + poses_count * 5
   total := self + emitters_count * 42
   total := self + lights_count * 14
   total := self + cascades_count * 18
@@ -1142,6 +1198,8 @@ func measure_render_floats collections -> project -> context =>
   total := self + panners_count * 15
   total := self + instances_count * 26
   total := self + instance_removals_count * 2
+  total := self + bone_matrices_count * 19
+  total := self + morph_weights_count * 4
   for i in 0 .. draws_count:
     let source = collections.draws[i]
     total := self + (project.extra_count context source) * 4
@@ -1397,6 +1455,8 @@ func encode_mesh_frame (packet: types.RenderHeader) -> (draws: &[MeshDraw]) -> (
   encoded[232] := packet.fog.drift.z
   encoded[233] := U32.to_f32 (packet.quality.volumetrics)
   encoded[234] := 0.0
+  encoded[235] := 0.0
+  encoded[236] := 0.0
   let at: U32 = protocol.packet_header_floats
   for draw in draws:
     encoded[at + 0] := U32.to_f32 (draw.mesh)

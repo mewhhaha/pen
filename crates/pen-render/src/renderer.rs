@@ -22,6 +22,7 @@ mod insets;
 mod inspect;
 mod instance_upload;
 mod materials;
+mod morphing;
 mod particles;
 pub(crate) mod readback;
 mod reflections;
@@ -92,6 +93,7 @@ const SURFACE_AT: usize = 44 + MAX_DRAW_EXTRA * 4;
 const DRAW_BYTES: u64 = (SURFACE_AT + SURFACE_FLOATS) as u64 * 4;
 
 pub(crate) struct MeshAsset {
+    vertex_count: u32,
     vertices: wgpu::Buffer,
     /// Each vertex's tangent, if the mesh has them: pipelines read them at
     /// location 11, from the renderer's zeros when it has none.
@@ -104,7 +106,14 @@ pub(crate) struct MeshAsset {
     lods: Vec<Lod>,
     /// A skinned mesh's joints and weights, and its rig.
     skin: Option<MeshSkin>,
+    /// Blendshape / morph target deltas on the GPU, evaluated by compute pass.
+    morphs: Option<MeshMorphs>,
     instances: Option<MeshInstanceBuffer>,
+}
+
+pub(crate) struct MeshMorphs {
+    targets: u32,
+    deltas: wgpu::Buffer,
 }
 
 pub(crate) struct MeshInstanceBuffer {
@@ -407,6 +416,8 @@ struct ReadyEntry {
     visible: Option<wgpu::RenderPipeline>,
     /// A posed draw's joint matrices: where they lie in the frame's.
     skin: Option<u32>,
+    /// A morphed draw's deformed vertex slice `(start, end)` in the frame's morph output buffer.
+    morph: Option<(u64, u64)>,
     persistent: bool,
 }
 
@@ -447,10 +458,20 @@ struct Scratch {
     decal_order: Vec<u32>,
     /// The insets drawn, and how many pixels across and down each draws.
     insets: Vec<(usize, (u32, u32))>,
-    /// The frame's pose layers by the draw they pose: draw `d`'s are
-    /// `pose_order[pose_first[d]..pose_first[d + 1]]` (none without poses).
+    /// Flat draw-target layout: scene draws occupy `0..scene_draw_count`, then
+    /// inset `k`'s draws start at `inset_draw_bases[k]`.
+    scene_draw_count: usize,
+    inset_draw_bases: Vec<usize>,
+    total_draw_targets: usize,
+    /// The frame's pose layers by draw target index.
     pose_first: Vec<u32>,
     pose_order: Vec<u32>,
+    /// Explicit custom joint matrices by draw target index.
+    bone_first: Vec<u32>,
+    bone_order: Vec<u32>,
+    /// Morph target weights by draw target index.
+    morph_first: Vec<u32>,
+    morph_order: Vec<u32>,
     /// The frame's emitters ready to draw, in order.
     emitters: Vec<particles::Ready>,
 }
@@ -466,6 +487,8 @@ struct Drawing<'a> {
     zero_tangents: &'a wgpu::Buffer,
     /// The frame's joint matrices, for posed draws.
     skin: Option<&'a wgpu::BindGroup>,
+    /// The frame's GPU-morphed vertex buffer, for draws with active morph weights.
+    morphed: Option<&'a wgpu::Buffer>,
     culling: &'a GpuCulling,
 }
 
@@ -714,8 +737,9 @@ pub(crate) struct State {
     // Whether something this frame draws is still on its way.
     waiting: bool,
     scratch: Scratch,
-    // Posed draws' joint matrices, and the frame's particles.
+    // Posed draws' joint matrices, GPU morph targets, and the frame's particles.
     skinning: skinning::Skinning,
+    morphing: morphing::Morphing,
     particles: Option<particles::Particles>,
     // Interned material render states (`MaterialAsset::state`).
     states: HashMap<String, u32>,
@@ -1068,6 +1092,7 @@ impl State {
             waiting: false,
             scratch: Scratch::default(),
             skinning: skinning::Skinning::new(&device),
+            morphing: morphing::Morphing::new(&device),
             particles: None,
             states: HashMap::new(),
             checks: 0,

@@ -227,7 +227,7 @@ fn a_posed_skinned_mesh_reads_its_tangents_beside_its_joints() {
     ];
     let Some(mut rig) = Rig::new("tangent-skin", &MESHES, &["paint.material.json"], &files) else { return };
     let mut posed = shadowed(rows(0, 1));
-    posed.poses = (0..3).map(|draw| Pose { draw, clip: 0, time: 0.0, weight: 1.0 }).collect();
+    posed.poses = (0..3).map(|draw| Pose { draw, clip: 0, time: 0.0, weight: 1.0, inset: 0 }).collect();
     let picture = rig.show(&posed);
     assert_eq!(rig.renderer.stats().instanced_draw_calls, 0, "posed draws are drawn alone");
     let wrong = wrong_rows(&picture, &TANGENTS);

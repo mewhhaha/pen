@@ -201,7 +201,7 @@ pub(crate) fn bounds_margin(code: &str) -> Option<f32> {
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Variants(u16);
 
-const VARIANT_NAMES: [(Variants, &str); 10] = [
+const VARIANT_NAMES: [(Variants, &str); 13] = [
     (Variants::PERSISTENT, "persistent"),
     (Variants::INSET_PERSISTENT, "inset_persistent"),
     (Variants::OPAQUE, "opaque"),
@@ -210,8 +210,11 @@ const VARIANT_NAMES: [(Variants, &str); 10] = [
     (Variants::VISIBLE, "visible"),
     (Variants::INSTANCED, "instanced"),
     (Variants::SKINNED, "skinned"),
+    (Variants::SKINNED_TRANSLUCENT, "skinned_translucent"),
     (Variants::INSET, "inset"),
     (Variants::INSET_BLENDED, "inset_blended"),
+    (Variants::INSET_SKINNED, "inset_skinned"),
+    (Variants::INSET_SKINNED_BLENDED, "inset_skinned_blended"),
 ];
 
 impl std::fmt::Debug for Variants {
@@ -234,6 +237,9 @@ impl Variants {
     pub const SKINNED: Variants = Variants(32);
     pub const INSET: Variants = Variants(64);
     pub const INSET_BLENDED: Variants = Variants(128);
+    pub const SKINNED_TRANSLUCENT: Variants = Variants(1024);
+    pub const INSET_SKINNED: Variants = Variants(2048);
+    pub const INSET_SKINNED_BLENDED: Variants = Variants(4096);
 
     pub fn is_empty(self) -> bool {
         self.0 == 0
@@ -274,8 +280,11 @@ pub(crate) struct Pipelines {
     pub persistent: Option<wgpu::RenderPipeline>,
     pub inset_persistent: Option<wgpu::RenderPipeline>,
     pub skinned: Option<wgpu::RenderPipeline>,
+    pub skinned_translucent: Option<wgpu::RenderPipeline>,
     pub inset: Option<wgpu::RenderPipeline>,
     pub inset_blended: Option<wgpu::RenderPipeline>,
+    pub inset_skinned: Option<wgpu::RenderPipeline>,
+    pub inset_skinned_blended: Option<wgpu::RenderPipeline>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -298,8 +307,11 @@ impl Pipelines {
             (&self.persistent, Variants::PERSISTENT),
             (&self.inset_persistent, Variants::INSET_PERSISTENT),
             (&self.skinned, Variants::SKINNED),
+            (&self.skinned_translucent, Variants::SKINNED_TRANSLUCENT),
             (&self.inset, Variants::INSET),
             (&self.inset_blended, Variants::INSET_BLENDED),
+            (&self.inset_skinned, Variants::INSET_SKINNED),
+            (&self.inset_skinned_blended, Variants::INSET_SKINNED_BLENDED),
         ]
         .into_iter()
         .filter(|(pipeline, _)| pipeline.is_some())
@@ -317,8 +329,11 @@ impl Pipelines {
             (&mut self.persistent, other.persistent),
             (&mut self.inset_persistent, other.inset_persistent),
             (&mut self.skinned, other.skinned),
+            (&mut self.skinned_translucent, other.skinned_translucent),
             (&mut self.inset, other.inset),
             (&mut self.inset_blended, other.inset_blended),
+            (&mut self.inset_skinned, other.inset_skinned),
+            (&mut self.inset_skinned_blended, other.inset_skinned_blended),
         ] {
             if mine.is_none() {
                 *mine = theirs;
@@ -474,9 +489,12 @@ pub(crate) fn pipelines(
             // (probe_finalise.wgsl). Surfaces drawn over the picture (translucent
             // ones, overlays) leave the alpha it has. Insets retain their authored
             // alpha for coverage when composited over the finished frame.
-            let blending = if variant == Variants::INSET || variant == Variants::INSET_PERSISTENT {
+            let blending = if variant == Variants::INSET
+                || variant == Variants::INSET_PERSISTENT
+                || variant == Variants::INSET_SKINNED
+            {
                 None
-            } else if variant == Variants::INSET_BLENDED {
+            } else if variant == Variants::INSET_BLENDED || variant == Variants::INSET_SKINNED_BLENDED {
                 Some(wgpu::BlendState::ALPHA_BLENDING)
             } else {
                 Some(wgpu::BlendState {
@@ -535,6 +553,31 @@ pub(crate) fn pipelines(
         },
         skinned: if skinning {
             make(Variants::SKINNED, true, CompareFunction::Less, None, Stage::Skinned)
+        } else {
+            None
+        },
+        skinned_translucent: if skinning {
+            make(
+                Variants::SKINNED_TRANSLUCENT,
+                false,
+                CompareFunction::Less,
+                Some(wgpu::BlendComponent {
+                    src_factor: BlendFactor::SrcAlpha,
+                    dst_factor: BlendFactor::OneMinusSrcAlpha,
+                    operation: BlendOperation::Add,
+                }),
+                Stage::Skinned,
+            )
+        } else {
+            None
+        },
+        inset_skinned: if skinning {
+            make(Variants::INSET_SKINNED, true, CompareFunction::Less, None, Stage::Skinned)
+        } else {
+            None
+        },
+        inset_skinned_blended: if skinning {
+            make(Variants::INSET_SKINNED_BLENDED, false, CompareFunction::Less, None, Stage::Skinned)
         } else {
             None
         },

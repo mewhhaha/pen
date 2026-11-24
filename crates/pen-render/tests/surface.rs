@@ -239,7 +239,8 @@ fn a_posed_skinned_draw_reads_the_surface_of_its_material() {
     };
     let draws: Vec<Draw> = ALL.iter().map(|&which| draw(0, if which < 5 { 0 } else { 1 }, which)).collect();
     let mut posed = frame(draws);
-    posed.poses = ALL.iter().map(|&which| Pose { draw: which as u32, clip: 0, time: 0.0, weight: 1.0 }).collect();
+    posed.poses =
+        ALL.iter().map(|&which| Pose { draw: which as u32, clip: 0, time: 0.0, weight: 1.0, inset: 0 }).collect();
     let picture = rig.show(&posed);
     // Posed draws of a skinned mesh draw alone, each with the skinned pipeline.
     assert_eq!(rig.renderer.stats().draw_calls, 10);

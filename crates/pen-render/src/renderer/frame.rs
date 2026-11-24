@@ -58,7 +58,11 @@ impl Drawing<'_> {
                     pass.set_bind_group(3, group, &[at]);
                 }
                 let lod = mesh.lods.get(usize::from(item.lod)).unwrap_or(&mesh.lods[0]);
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                if let (Some((start, end)), Some(morphed)) = (entry.morph, self.morphed) {
+                    pass.set_vertex_buffer(0, morphed.slice(start..end));
+                } else {
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                }
                 pass.set_vertex_buffer(1, self.tangents(mesh).slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
                 let count = if let Some(instances) = &mesh.instances {
@@ -402,8 +406,8 @@ impl State {
         // Timestamps around the passes, read back a few frames later, while
         // the host or a frame budget wants them.
         self.timer.begin(self.timing || self.resolution.budgeted());
-        // Instances of large batches culled on the GPU, before any pass
-        // draws them.
+        // Evaluate morph targets and cull instanced batches on the GPU before any pass draws them.
+        self.morphing.dispatch(&device, &mut encoder, &self.assets);
         self.culling.dispatch(&mut encoder, &self.timer, &self.instance_buffer);
         let redraw = if shadowed {
             let signatures = self.local_signatures(frame, scratch);
@@ -420,6 +424,7 @@ impl State {
             instances: &self.instance_buffer,
             zero_tangents: &self.zero_tangents,
             skin: self.skinning.group(),
+            morphed: self.morphing.output(),
             culling: &self.culling,
         };
         if shadowed {

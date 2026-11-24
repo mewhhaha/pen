@@ -94,13 +94,15 @@ mod tests {
     fn packet_contract_layout() {
         let model = model::build(schema()).unwrap();
         assert_eq!(model.magic, 0x474446);
-        // The 180 lanes before the exposure and the grade, their 36, and the volumetrics' 16.
-        assert_eq!(model.header_lanes, 235);
+        // The 180 lanes before the exposure and the grade, their 36, volumetrics' 16, plus bone_matrices & morph_weights counts.
+        assert_eq!(model.header_lanes, 237);
         assert_eq!(model.event_lanes(), 5);
         assert_eq!(model.section("draws").fixed.as_ref().unwrap().lanes, 24);
         assert_eq!(model.section("insets").fixed.as_ref().unwrap().lanes, 48);
         assert_eq!(model.section("ui").head_lanes, 24);
-        assert_eq!(model.section("poses").fixed.as_ref().unwrap().lanes, 4);
+        assert_eq!(model.section("poses").fixed.as_ref().unwrap().lanes, 5);
+        assert_eq!(model.section("bone_matrices").fixed.as_ref().unwrap().lanes, 19);
+        assert_eq!(model.section("morph_weights").fixed.as_ref().unwrap().lanes, 4);
         assert_eq!(model.section("emitters").fixed.as_ref().unwrap().lanes, 42);
         // Position, reach, color, direction, a spot's two cosines, whether it
         // casts shadows and its id.

@@ -36,10 +36,10 @@ use pen_protocol::boundary::{
     canonical_input, canonical_render, decode_frame, encode_frame, whole,
 };
 use pen_protocol::{
-    Aberration, Bus, Cascade, Catalog, Clouds, Color, Decal, Draw, Drift, Emitter, Exposure, FieldPatch, Fog,
-    FogVolume, Frame, GameEvent, Grade, Inset, Instance, InstanceRemoval, Light, Listener, Panner, Pose, Probe,
-    ProbeVolume, Quality, Reflection, ReflectionProbe, RenderFrame, ServiceRequest, Shadow, Sky, Solid, SolidFace,
-    Sound, Sprite, UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
+    Aberration, BoneMatrix, Bus, Cascade, Catalog, Clouds, Color, Decal, Draw, Drift, Emitter, Exposure, FieldPatch,
+    Fog, FogVolume, Frame, GameEvent, Grade, Inset, Instance, InstanceRemoval, Light, Listener, MorphWeight, Panner,
+    Pose, Probe, ProbeVolume, Quality, Reflection, ReflectionProbe, RenderFrame, ServiceRequest, Shadow, Sky, Solid,
+    SolidFace, Sound, Sprite, UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
 };
 
 const HARNESS: &str = include_str!("codec_round_trip.blot");
@@ -947,6 +947,25 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
                 clip: rng.whole(65535),
                 time: rng.number(),
                 weight: rng.number(),
+                inset: rng.whole(16),
+            })
+        },
+        bone_matrices: {
+            let count = rng.count(8);
+            rng.list(count, |rng| BoneMatrix {
+                inset: rng.whole(16),
+                draw: rng.whole(u32::try_from(MAX_DRAWS).unwrap()),
+                joint: rng.whole(1024),
+                matrix: rng.lanes(),
+            })
+        },
+        morph_weights: {
+            let count = rng.count(8);
+            rng.list(count, |rng| MorphWeight {
+                inset: rng.whole(16),
+                draw: rng.whole(u32::try_from(MAX_DRAWS).unwrap()),
+                target: rng.whole(256),
+                weight: rng.number(),
             })
         },
         emitters: {
@@ -999,7 +1018,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
 }
 
 /// What `sections` reports of a frame, in its order.
-const SECTIONS: [&str; 24] = [
+const SECTIONS: [&str; 26] = [
     "draws",
     "draw parameters",
     "draw extras",
@@ -1024,6 +1043,8 @@ const SECTIONS: [&str; 24] = [
     "panners",
     "retained instances",
     "instance removals",
+    "bone matrices",
+    "morph weights",
 ];
 
 /// Which of `SECTIONS` a frame holds any of.
@@ -1054,5 +1075,7 @@ fn sections(frame: &RenderFrame) -> [bool; SECTIONS.len()] {
         !frame.panners.is_empty(),
         !frame.instances.is_empty(),
         !frame.instance_removals.is_empty(),
+        !frame.bone_matrices.is_empty(),
+        !frame.morph_weights.is_empty(),
     ]
 }

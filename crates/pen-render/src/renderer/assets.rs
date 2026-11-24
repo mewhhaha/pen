@@ -31,7 +31,16 @@ impl ShaderAsset {
     /// skinned only with `vertex_skinned`.
     pub(super) fn own(&self, variants: Variants) -> Variants {
         let variants = if self.instancing { variants } else { variants.without(Variants::INSTANCED) };
-        let variants = if self.skinning { variants } else { variants.without(Variants::SKINNED) };
+        let variants = if self.skinning {
+            variants
+        } else {
+            variants.without(
+                Variants::SKINNED
+                    | Variants::SKINNED_TRANSLUCENT
+                    | Variants::INSET_SKINNED
+                    | Variants::INSET_SKINNED_BLENDED,
+            )
+        };
         if self.persistent { variants } else { variants.without(Variants::PERSISTENT | Variants::INSET_PERSISTENT) }
     }
 
@@ -421,13 +430,21 @@ impl State {
                 let index_bytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
                 let instance_bytes: &[u8] =
                     mesh.instances.as_ref().map_or(&[], |instances| bytemuck::cast_slice(&instances.data));
-                if vertex_bytes.len().max(index_bytes.len()).max(instance_bytes.len()) as u64
+                let vertex_count = u32::try_from(mesh.vertices.len() / MESH_VERTEX_FLOATS)
+                    .map_err(|_| "mesh vertex count exceeds u32".to_owned())?;
+                let morph_bytes: Option<(u32, &[u8])> =
+                    mesh.morphs.as_ref().map(|m| (m.targets, bytemuck::cast_slice(&m.deltas)));
+                if vertex_bytes
+                    .len()
+                    .max(index_bytes.len())
+                    .max(instance_bytes.len())
+                    .max(morph_bytes.map_or(0, |(_, b)| b.len())) as u64
                     > device.limits().max_buffer_size
                 {
                     return Err("mesh exceeds device buffer size".into());
                 }
                 if mesh.tangents.is_none() {
-                    self.ensure_zero_tangents(mesh.vertices.len() / MESH_VERTEX_FLOATS);
+                    self.ensure_zero_tangents(vertex_count as usize);
                 }
                 let buffer = |bytes: &[u8], usage: wgpu::BufferUsages| {
                     device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytes, usage })
@@ -442,9 +459,15 @@ impl State {
                     }
                     bytes
                 });
+                let vertex_usage = if morph_bytes.is_some() {
+                    wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE
+                } else {
+                    wgpu::BufferUsages::VERTEX
+                };
                 let (asset, check) = shader::scoped(&device, || {
                     GpuAsset::Mesh(MeshAsset {
-                        vertices: buffer(vertex_bytes, wgpu::BufferUsages::VERTEX),
+                        vertex_count,
+                        vertices: buffer(vertex_bytes, vertex_usage),
                         tangents: mesh
                             .tangents
                             .as_ref()
@@ -459,6 +482,10 @@ impl State {
                         skin: mesh.skin.zip(skin_bytes).map(|(skin, bytes)| MeshSkin {
                             vertices: buffer(&bytes, wgpu::BufferUsages::VERTEX),
                             rig: Arc::new(skin.rig),
+                        }),
+                        morphs: morph_bytes.map(|(targets, bytes)| super::MeshMorphs {
+                            targets,
+                            deltas: buffer(bytes, wgpu::BufferUsages::STORAGE),
                         }),
                     })
                 });

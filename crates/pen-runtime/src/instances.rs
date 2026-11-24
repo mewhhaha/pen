@@ -62,11 +62,31 @@ impl Scene {
         }
         next.started = true;
         ensure!(frame.draws.len() + next.ordered.len() <= MAX_DRAWS, "too many resolved draws");
-        // Poses refer to immediate draws in the packet, before insertion.
+        // Poses, explicit bone matrices and morph weights targeting scene draws
+        // (`inset == 0`) refer to immediate draws in the packet, before insertion.
+        let inserted = u32::try_from(next.ordered.len())?;
         for pose in &mut frame.poses {
-            ensure!((pose.draw as usize) < frame.draws.len(), "pose refers to an unknown immediate draw");
-            if pose.draw as usize >= after {
-                pose.draw += u32::try_from(next.ordered.len())?;
+            if pose.inset == 0 {
+                ensure!((pose.draw as usize) < frame.draws.len(), "pose refers to an unknown immediate draw");
+                if pose.draw as usize >= after {
+                    pose.draw += inserted;
+                }
+            }
+        }
+        for bone in &mut frame.bone_matrices {
+            if bone.inset == 0 {
+                ensure!((bone.draw as usize) < frame.draws.len(), "bone matrix refers to an unknown immediate draw");
+                if bone.draw as usize >= after {
+                    bone.draw += inserted;
+                }
+            }
+        }
+        for morph in &mut frame.morph_weights {
+            if morph.inset == 0 {
+                ensure!((morph.draw as usize) < frame.draws.len(), "morph weight refers to an unknown immediate draw");
+                if morph.draw as usize >= after {
+                    morph.draw += inserted;
+                }
             }
         }
         frame.draws.splice(after..after, next.ordered.iter().cloned());

@@ -51,8 +51,10 @@ itself made by `sprout-model` from a Blender script).
   the file as a clip (`clips`: name, duration, and channels of translation,
   rotation or scale keys, linear, step or cubic spline). Clips keep the
   file's order, so a clip's number is the same for every skinned mesh of the
-  file. Morph targets and more than four joints a vertex are left out with a
-  note.
+  file. Primitive morph targets (`POSITION` and `NORMAL` deltas) are imported
+  into the mesh JSON's `morphs` array and packed under flag 64 of `PMSH`;
+  more than four joints a vertex and glTF morph-weight animation channels are
+  left out with a note.
 - **`NAME.import.json`** lists what was written: each mesh with its
   material, joint count and vertex-animation material, and the clips by name
   and duration, for the game (Blot imports JSON) and for people.
@@ -98,9 +100,14 @@ CPU, a pure function of the packet, so recordings, rewinds and replays pose
 alike. Every opaque material's shader that has `vertex_skinned` compiles its
 skinned pipeline (and skinned shadow pipeline) with the rest, ahead of need.
 
-Left out for now: posed draws in insets and translucent posed draws (both
-draw their bind pose), and root motion. Many posed draws of one mesh draw
-one call each; crowds are what vertex-animation textures are for.
+Games may also supply explicit joint skinning matrices through the
+`bone_matrices` section (e.g. computed by Ink's animation, IK, inertialization,
+secondary-bone or ragdoll solvers). Explicit bone matrices override clip poses
+for the named draw, or pose it from identity when no clip layers are declared.
+Blendshape weights travel in the `morph_weights` section and are evaluated on
+the GPU compute pass before skinning and shading. Both `poses`, `bone_matrices`
+and `morph_weights` carry an `inset` field (`0` for scene draws, `1 + k` for
+`insets[k].draws`) and work across opaque, translucent and inset pipelines.
 
 ## Vertex-animation textures
 

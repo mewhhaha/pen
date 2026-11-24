@@ -308,7 +308,7 @@ mod tests {
         packet[1] = 3.0;
         packet[lanes::header::POSE_COUNT] = 2.0;
         packet[lanes::header::EMITTER_COUNT] = 1.0;
-        packet.extend([0.0, 1.0, 0.25, 1.0, 0.0, 0.0, 0.5, 0.5]);
+        packet.extend([0.0, 1.0, 0.25, 1.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0]);
         let mut emitter = vec![0.0; EMITTER_FLOATS];
         emitter[lanes::emitter::MATERIAL] = 1.0;
         emitter[lanes::emitter::TRANSFORM..lanes::emitter::TRANSFORM + 16]
@@ -322,13 +322,16 @@ mod tests {
         let render = decode_frame(&packet, 3, &catalog).unwrap().render;
         assert_eq!(
             render.poses,
-            [Pose { draw: 0, clip: 1, time: 0.25, weight: 1.0 }, Pose { draw: 0, clip: 0, time: 0.5, weight: 0.5 }]
+            [
+                Pose { draw: 0, clip: 1, time: 0.25, weight: 1.0, inset: 0 },
+                Pose { draw: 0, clip: 0, time: 0.5, weight: 0.5, inset: 0 },
+            ]
         );
         let decoded = &render.emitters[0];
         assert_eq!((decoded.material, decoded.seed, decoded.rate, decoded.additive), (1, 9, 30.0, true));
         assert_eq!((decoded.transform[12], decoded.gravity.y, decoded.color_end.a), (2.0, -9.8, 0.5));
         let mut unknown = packet.clone();
-        unknown[PACKET_HEADER_FLOATS + 8 + lanes::emitter::MATERIAL] = 2.0;
+        unknown[PACKET_HEADER_FLOATS + 10 + lanes::emitter::MATERIAL] = 2.0;
         assert!(decode_frame(&unknown, 3, &catalog).is_err());
     }
 

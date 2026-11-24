@@ -147,6 +147,7 @@ fn main() -> Result<()> {
                     clip: u32::try_from(clip_index)?,
                     time: time.min(clip.duration * 0.999),
                     weight: 1.0,
+                    inset: 0,
                 };
                 let frame = frame(vec![draw.clone()], vec![pose], view, projection);
                 settle(&mut renderer, &frame, &catalog, &mut target)?;

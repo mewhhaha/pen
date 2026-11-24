@@ -44,6 +44,7 @@ pub mod ray_tracing;
 pub mod render_targets;
 mod renderer;
 mod shader;
+pub mod shader_graph;
 #[cfg(feature = "simplify")]
 mod simplify;
 mod solids;
@@ -111,6 +112,7 @@ pub use render_targets::{
     ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,
     oblique_clip_projection, planar_reflection_camera, planar_reflection_view,
 };
+pub use shader_graph::{CompiledShaderGraph, NodeRef, PortType, RampStop, ShaderGraph, ShaderNode, ShaderNodeKind};
 pub use surface_atlas::{SURFACE_ATLAS_WGSL, SurfaceAtlasPacker, SurfaceTile, TileCopy};
 pub use tonemap::{TONEMAP_SUITE_WGSL, TonemapOperator, tonemap_linear_f64};
 pub use video::{

@@ -30,6 +30,7 @@ mod devlog;
 mod devtools;
 #[cfg(feature = "compiler")]
 mod diverge;
+mod editor;
 #[cfg(test)]
 mod fixtures;
 #[cfg(feature = "compiler")]
@@ -680,6 +681,14 @@ const COMMANDS: &[CommandSpec] = &[
                 with automatic UV2 chart unwrapping and gutter dilation from a scene bake job JSON",
     },
     CommandSpec {
+        name: "edit",
+        operands: "[FILE]",
+        checkout: false,
+        about: "launch the interactive 3D viewport scene editor & property inspector for a .pen-scene.json \
+                (orbit/fly camera, raycast picking, 3D move/rotate/scale gizmos, hierarchy, inspector, timeline, \
+                live shader graph compile, play-in-editor, undo/redo)",
+    },
+    CommandSpec {
         name: "diverge",
         operands: "RECORDING",
         checkout: true,
@@ -1076,6 +1085,13 @@ const OPTIONS: &[OptionSpec] = &[
         commands: &["bake-lightmaps"],
         place: Place::Command,
         about: "override indirect diffuse bounce count (1..=4)",
+    },
+    OptionSpec {
+        name: "--assets",
+        value: "DIR",
+        commands: &["edit"],
+        place: Place::Command,
+        about: "asset root directory containing catalog.json (default src/assets)",
     },
     OptionSpec {
         name: "--name",
@@ -2467,6 +2483,11 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             bounces_override: args.number::<u32>("--bounces")?,
         };
         return bake_lightmaps::run(&opts);
+    }
+    if args.command == "edit" {
+        let scene_path = args.operands.first().map(PathBuf::from);
+        let assets = args.path("--assets").unwrap_or_else(|| PathBuf::from("src/assets"));
+        return editor::app::run(scene_path, assets);
     }
     if args.command == "report" {
         return bugreport::open(Path::new(&args.operands[0]), args.path("--out").as_deref());

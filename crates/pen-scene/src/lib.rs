@@ -5,6 +5,7 @@
 pub mod components;
 pub mod id;
 pub mod scene;
+pub mod sequencer;
 pub mod transform;
 
 pub use components::{BodyMode, ColliderShape, Component, LightKind, LodLevel};
@@ -12,6 +13,10 @@ pub use id::{AssetId, NodeId, fnv1a64};
 pub use scene::{
     AssetManifest, FsPrefabResolver, MemoryPrefabResolver, NullPrefabResolver, PrefabRef, PrefabResolver,
     PropertyOverride, ResolvedNode, ResolvedScene, SCENE_FORMAT_VERSION, Scene, SceneEnvironment, SceneNode,
+};
+pub use sequencer::{
+    CurveInterp, EventKey, FiredEvent, QuatKey, ScalarKey, Sequence, SequencePlayer, SequenceTrack, Vec3Key,
+    eval_bezier_ease, sample_quat, sample_scalar, sample_vec3,
 };
 pub use transform::{
     IDENTITY_MAT4, Transform, TransformOverride, camera_world_to_view, look_at, mat4_to_trs, mul_mat4, normalize3,

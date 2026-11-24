@@ -6,9 +6,9 @@ pen := "cargo run --release -q -p pen --"
 pnpm := "npx --yes pnpm@12.8.2"
 playwright := "1.63.0"
 # Pinned wtime-aot release (Linux x86-64 Blot ABI 8 AOT compiler, default `--backend x64`).
-wtime_version := "v0.1.0"
-wtime_aot_archive_sha256 := "14cc8b925c2553cf71857093072a24d6b45c179541e40e81e198bb2255d0478c"
-wtime_aot_bin_sha256 := "2d1733122c5c8a14bc57cc59bd34446d8ebf3b41a0a3ff7d181fcc1347be2c24"
+wtime_version := "v0.1.1"
+wtime_aot_archive_sha256 := "4015ecaedad0f8cd7bcd86437edfbe72848c58406d407ac02d945e98c8d64c9c"
+wtime_aot_bin_sha256 := "87d30dfb76653d5b98f9cab1668b31655964f9a806fb5ad3a9198e1a84140aac"
 
 # Then removes what earlier installs left in plugins/ and web/ that this one
 # no longer builds, saying what it removes.

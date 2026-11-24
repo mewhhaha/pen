@@ -2463,7 +2463,7 @@ fn load_verified_so(_wasm: &[u8], _cache: Option<&Path>) -> Result<Library> {
     bail!("wtime-aot compilation requires blot-host's `compiler` feature")
 }
 
-/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset (`wtime` v0.1.0).
+/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset (`wtime` v0.1.1).
 /// Uses native Linux x86-64 (`"x64"`), falling back automatically to `"c"`
 /// (`--c-opt auto --target-cpu native`) on [`X64FallbackError`].
 #[cfg(feature = "compiler")]

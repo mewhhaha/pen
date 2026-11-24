@@ -1,27 +1,24 @@
 //! End-to-end wiring of high-fidelity rendering passes into `Renderer::draw`:
 //! - Hillaire physical atmosphere LUTs & volumetric clouds (`quality.physical_sky`)
-//! - LTC area lights & cookie projectors (`frame.area_lights`)
 //! - Full PBR deferred decals (`frame.pbr_decals`)
 //! - AMD FidelityFX RCAS sharpening & Post-FX polish (`grade.{sharpness, grain, flare, outline_strength}`)
-//! - Weighted Blended OIT state (`quality.oit`)
 //! - Render-to-texture & split-screen secondary cameras (`frame.camera_targets`)
 
 use std::collections::HashMap;
 
 use anyhow::Result;
-use pen_protocol::{Catalog, RenderFrame};
+use pen_protocol::{Catalog, Matrix, RenderFrame};
 
 use super::{GpuAsset, State, TextureRef};
-use crate::area_lights::{AreaLight, AreaLightResources};
 use crate::asset_store::AssetKind;
 use crate::atmosphere_lut::{AtmosphereParams, PhysicalAtmosphere};
-use crate::ddgi::{DdgiGridConfig, DdgiVolume};
+use crate::built_in::{BuiltIn, BuiltIns};
 use crate::decals::{PbrDecal, PbrDecalPass, PbrDecalView};
 use crate::matrix::{invert, multiply};
-use crate::oit::OitPass;
-use crate::post::SCENE_FORMAT;
+use crate::post::{PhysicalSkyBinding, SCENE_FORMAT};
 use crate::post_fx::{PostFxParams, PostFxPass, RcasSharpener};
 use crate::render_targets::{ColorTransfer, OffscreenRenderTarget, SplitScreenCompositor, ViewportRect};
+use crate::RenderTarget;
 
 pub(super) struct PreparedPbrDecalBatch {
     pub albedo: wgpu::TextureView,
@@ -47,22 +44,72 @@ const COPY_BLIT_WGSL: &str = r#"
 }
 "#;
 
+struct BlitShared {
+    module: wgpu::ShaderModule,
+    bgl: wgpu::BindGroupLayout,
+    pl: wgpu::PipelineLayout,
+    sampler: wgpu::Sampler,
+}
+
 #[derive(Default)]
 pub(super) struct WiredPasses {
     pub physical_atmosphere: Option<PhysicalAtmosphere>,
+    pub physical_sky_serial: u64,
+    pub physical_sky_last_key: (bool, u64),
     pub pbr_decals: HashMap<u32, PbrDecalPass>,
-    pub area_lights: Option<AreaLightResources>,
-    pub area_light_buffer: Option<wgpu::Buffer>,
-    pub area_light_count: u32,
     pub rcas: Option<RcasSharpener>,
     pub post_fx: Option<PostFxPass>,
-    pub oit: Option<OitPass>,
-    pub ddgi: Option<DdgiVolume>,
-    pub split_screen: Option<SplitScreenCompositor>,
+    pub split_screen: Option<(wgpu::TextureFormat, SplitScreenCompositor)>,
+    pub split_targets: Vec<OffscreenRenderTarget>,
     pub polish_input: Option<(u32, u32, wgpu::TextureFormat, wgpu::Texture, wgpu::TextureView)>,
+    pub msaa_depth_resolve: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
     pub dummy_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
-    pub blit_pipeline: Option<(wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Sampler)>,
+    blit_shared: Option<BlitShared>,
+    blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     pub in_secondary_camera: bool,
+}
+
+/// Builds a lightweight secondary-camera `RenderFrame` cloning only 3D scene fields and
+/// omitting audio, UI, services, haptics, video streams, camera targets, sprites, and insets.
+pub(super) fn secondary_frame(frame: &RenderFrame, view: Matrix, projection: Matrix) -> RenderFrame {
+    RenderFrame {
+        view,
+        projection,
+        clear: frame.clear,
+        ambient: frame.ambient,
+        light_direction: frame.light_direction,
+        light_color: frame.light_color,
+        aberration: frame.aberration,
+        quality: frame.quality,
+        sky: frame.sky,
+        probe_volume: frame.probe_volume,
+        fog: frame.fog,
+        shadow: frame.shadow,
+        blur: frame.blur,
+        clouds: frame.clouds,
+        exposure: frame.exposure,
+        grade: frame.grade,
+        reflection: frame.reflection,
+        motion_blur: frame.motion_blur,
+        dof: frame.dof,
+        draws: frame.draws.clone(),
+        solids: frame.solids.clone(),
+        decals: frame.decals.clone(),
+        poses: frame.poses.clone(),
+        emitters: frame.emitters.clone(),
+        lights: frame.lights.clone(),
+        cascades: frame.cascades.clone(),
+        probes: frame.probes.clone(),
+        reflection_probes: frame.reflection_probes.clone(),
+        fog_volumes: frame.fog_volumes.clone(),
+        bone_matrices: frame.bone_matrices.clone(),
+        morph_weights: frame.morph_weights.clone(),
+        motions: frame.motions.clone(),
+        ribbons: frame.ribbons.clone(),
+        area_lights: frame.area_lights.clone(),
+        pbr_decals: frame.pbr_decals.clone(),
+        ..RenderFrame::default()
+    }
 }
 
 impl WiredPasses {
@@ -118,72 +165,122 @@ impl WiredPasses {
         self.dummy_depth.as_ref().unwrap().1.clone()
     }
 
-    fn ensure_blit(&mut self, device: &wgpu::Device, target_format: wgpu::TextureFormat) {
-        if self.blit_pipeline.is_some() {
-            return;
+    /// Resolves a multisampled depth view into a cached 1x `R32Float` texture via `BuiltIn::OpaqueDepth`
+    /// so screen-space outlines work identically under MSAA.
+    pub fn resolve_msaa_depth(
+        &mut self,
+        device: &wgpu::Device,
+        built_ins: &mut BuiltIns,
+        encoder: &mut wgpu::CommandEncoder,
+        depth_only: &wgpu::TextureView,
+        size: (u32, u32),
+        samples: u32,
+    ) -> wgpu::TextureView {
+        let size = (size.0.max(1), size.1.max(1));
+        if !matches!(&self.msaa_depth_resolve, Some((w, h, _, _)) if *w == size.0 && *h == size.1) {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("wired_msaa_depth_resolve"),
+                size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            self.msaa_depth_resolve = Some((size.0, size.1, tex, view));
         }
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("wired_copy_blit"),
-            source: wgpu::ShaderSource::Wgsl(COPY_BLIT_WGSL.into()),
+        let dst = self.msaa_depth_resolve.as_ref().unwrap().3.clone();
+        let pipeline = built_ins.get(BuiltIn::OpaqueDepth(samples));
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wired_msaa_depth_resolve_bg"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_only) }],
         });
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("wired_copy_blit_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("wired_copy_blit_pl"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("wired_copy_blit"),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: target_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("wired_copy_blit_samp"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("wired_msaa_depth_resolve"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &dst,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+            })],
             ..Default::default()
         });
-        self.blit_pipeline = Some((pipeline, bgl, sampler));
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
+        dst
+    }
+
+    fn ensure_blit(&mut self, device: &wgpu::Device, target_format: wgpu::TextureFormat) {
+        let shared = self.blit_shared.get_or_insert_with(|| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("wired_copy_blit"),
+                source: wgpu::ShaderSource::Wgsl(COPY_BLIT_WGSL.into()),
+            });
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("wired_copy_blit_bgl"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("wired_copy_blit_pl"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("wired_copy_blit_samp"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            BlitShared { module, bgl, pl, sampler }
+        });
+        self.blit_pipelines.entry(target_format).or_insert_with(|| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("wired_copy_blit"),
+                layout: Some(&shared.pl),
+                vertex: wgpu::VertexState {
+                    module: &shared.module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shared.module,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
     }
 
     pub fn blit(
@@ -195,13 +292,14 @@ impl WiredPasses {
         target_format: wgpu::TextureFormat,
     ) {
         self.ensure_blit(device, target_format);
-        let (pipeline, bgl, sampler) = self.blit_pipeline.as_ref().unwrap();
+        let shared = self.blit_shared.as_ref().unwrap();
+        let pipeline = self.blit_pipelines.get(&target_format).unwrap();
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wired_copy_blit_bg"),
-            layout: bgl,
+            layout: &shared.bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&shared.sampler) },
             ],
         });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -237,16 +335,45 @@ impl State {
                 let Some(key) = mat.material.texture.clone() else { continue };
                 let w = if cam.width == 0 { 256 } else { cam.width.clamp(16, 4096) };
                 let h = if cam.height == 0 { 256 } else { cam.height.clamp(16, 4096) };
-                let mut sub = frame.clone();
-                sub.view = cam.view;
-                sub.projection = cam.projection;
-                sub.camera_targets.clear();
+                let sub = secondary_frame(frame, cam.view, cam.projection);
                 self.render_camera_to_texture(&key, &sub, catalog, (w, h))?;
             }
             Ok(())
         })();
         self.wired.in_secondary_camera = false;
         result
+    }
+
+    /// Ensures physical atmosphere LUTs & optional cloud target exist before `Post::begin`
+    /// builds the pass graph, returning their views and generation key for `BuiltIn::Atmosphere`.
+    pub(super) fn prepare_physical_sky(
+        &mut self,
+        frame: &RenderFrame,
+        scene_size: (u32, u32),
+    ) -> Result<Option<PhysicalSkyBinding>> {
+        if !frame.quality.physical_sky {
+            return Ok(None);
+        }
+        let device = self.device.clone();
+        let atmo = self.wired.physical_atmosphere.get_or_insert_with(|| PhysicalAtmosphere::new(&device));
+        let wants_clouds = frame.clouds.cover > 0.001;
+        let cloud_serial = if wants_clouds {
+            let cw = (scene_size.0 / 2).clamp(16, 1024);
+            let ch = (scene_size.1 / 2).clamp(16, 1024);
+            atmo.ensure_clouds(&device, (cw, ch))?
+        } else {
+            0
+        };
+        let key = (wants_clouds, cloud_serial);
+        if self.wired.physical_sky_serial == 0 || self.wired.physical_sky_last_key != key {
+            self.wired.physical_sky_serial += 1;
+            self.wired.physical_sky_last_key = key;
+        }
+        Ok(Some(PhysicalSkyBinding {
+            serial: self.wired.physical_sky_serial,
+            sky_view: atmo.sky_view_view().clone(),
+            clouds: if wants_clouds { atmo.cloud_view().cloned() } else { None },
+        }))
     }
 
     /// Updates Hillaire physical atmosphere LUTs & volumetric clouds when `quality.physical_sky` is on.
@@ -256,17 +383,6 @@ impl State {
         frame: &RenderFrame,
         scene_size: (u32, u32),
     ) -> Result<()> {
-        if frame.quality.oit {
-            let device = self.device.clone();
-            let oit = self.wired.oit.get_or_insert_with(|| OitPass::new(&device, SCENE_FORMAT, None));
-            oit.resize(&device, scene_size);
-        }
-        if frame.quality.ddgi
-            && self.wired.ddgi.is_none()
-            && let Ok(vol) = DdgiVolume::new(&self.device, DdgiGridConfig::default())
-        {
-            self.wired.ddgi = Some(vol);
-        }
         if !frame.quality.physical_sky {
             return Ok(());
         }
@@ -292,76 +408,6 @@ impl State {
             atmo.render_clouds(&device, encoder, &params, inv_vp, [eye[12], eye[13], eye[14]], (cw, ch))?;
         }
         Ok(())
-    }
-
-    /// Uploads `frame.area_lights` (LTC rect/disk/tube/cookie lights) into GPU storage.
-    pub(super) fn upload_area_lights(&mut self, frame: &RenderFrame) {
-        if frame.area_lights.is_empty() {
-            self.wired.area_light_count = 0;
-            return;
-        }
-        if self.wired.area_lights.is_none() {
-            self.wired.area_lights = Some(AreaLightResources::new(&self.device, &self.queue));
-        }
-        let lights: Vec<AreaLight> = frame
-            .area_lights
-            .iter()
-            .map(|spec| {
-                let pos = [spec.position.x, spec.position.y, spec.position.z];
-                let right = [spec.right.x, spec.right.y, spec.right.z];
-                let up = [spec.up.x, spec.up.y, spec.up.z];
-                let gain = spec.intensity.max(0.0);
-                let col = [spec.color.x * gain, spec.color.y * gain, spec.color.z * gain];
-                let reach = spec.range.max(0.1);
-                match spec.kind {
-                    1 => AreaLight::disk(pos, right, up, (spec.width * 0.5).max(0.01), col, reach, spec.two_sided),
-                    2 => AreaLight::tube(
-                        pos,
-                        right,
-                        up,
-                        (spec.width * 0.5).max(0.01),
-                        spec.height.max(0.01),
-                        col,
-                        reach,
-                    ),
-                    3 => AreaLight::cookie_projector(
-                        pos,
-                        right,
-                        up,
-                        spec.width.clamp(0.05, 4.0),
-                        (spec.width / spec.height.max(0.01)).clamp(0.1, 10.0),
-                        col,
-                        reach,
-                        0.05,
-                    ),
-                    _ => AreaLight::rect(
-                        pos,
-                        right,
-                        up,
-                        (spec.width * 0.5).max(0.01),
-                        (spec.height * 0.5).max(0.01),
-                        col,
-                        reach,
-                        spec.two_sided,
-                    ),
-                }
-            })
-            .collect();
-        let bytes = bytemuck::cast_slice(&lights);
-        let needed = bytes.len() as u64;
-        if self.wired.area_light_buffer.as_ref().is_none_or(|b| b.size() < needed) {
-            self.wired.area_light_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("wired_area_lights"),
-                size: needed.next_power_of_two().max(256),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-        }
-        self.queue.write_buffer(self.wired.area_light_buffer.as_ref().unwrap(), 0, bytes);
-        #[allow(clippy::cast_possible_truncation, reason = "bounded by MAX_AREA_LIGHTS")]
-        {
-            self.wired.area_light_count = lights.len() as u32;
-        }
     }
 
     /// Resolves PBR decal materials/textures ahead of constructing `Drawing` so the render pass
@@ -493,6 +539,7 @@ impl State {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode_post_polish_wired(
         wired: &mut WiredPasses,
+        built_ins: &mut BuiltIns,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         frame: &RenderFrame,
@@ -500,6 +547,7 @@ impl State {
         target_format: wgpu::TextureFormat,
         polish_src: &wgpu::TextureView,
         depth_view: &wgpu::TextureView,
+        depth_size: (u32, u32),
         dst_output: &wgpu::TextureView,
         size: (u32, u32),
         samples: u32,
@@ -522,13 +570,22 @@ impl State {
         }
 
         if frame.grade.grain > 0.0 || frame.grade.flare > 0.0 || frame.grade.outline_strength > 0.0 {
-            let depth_for_fx = if samples > 1 { wired.dummy_depth_view(device) } else { depth_view.clone() };
+            let outline = frame.grade.outline_strength.clamp(0.0, 1.0);
+            let depth_for_fx = if samples > 1 {
+                if outline > 0.0 {
+                    wired.resolve_msaa_depth(device, built_ins, encoder, depth_view, depth_size, samples)
+                } else {
+                    wired.dummy_depth_view(device)
+                }
+            } else {
+                depth_view.clone()
+            };
             let fx = wired.post_fx.get_or_insert_with(|| PostFxPass::new(device));
             let params = PostFxParams {
                 grain_strength: frame.grade.grain.clamp(0.0, 1.0),
                 frame_seed: (frames_count % 4096) as f32 * 0.618_034,
                 flare_strength: frame.grade.flare.clamp(0.0, 2.0),
-                outline_strength: if samples > 1 { 0.0 } else { frame.grade.outline_strength.clamp(0.0, 1.0) },
+                outline_strength: outline,
                 inverse_projection: Some(invert(&frame.projection)),
                 ..Default::default()
             };
@@ -542,27 +599,32 @@ impl State {
         Ok(())
     }
 
-    /// Renders and composites any `split_screen == true` entries in `frame.camera_targets` onto `output`.
-    pub(super) fn composite_split_screen(
+    /// Renders and composites `split_screen == true` entries in `frame.camera_targets` directly
+    /// into `output` (reusing cached offscreen targets across frames), skipping any unused primary
+    /// 3D scene pass and leaving `output` ready for HUD sprites and veil overlays.
+    pub(super) fn render_split_screen_into(
         &mut self,
         frame: &RenderFrame,
         catalog: &Catalog,
+        encoder: &mut wgpu::CommandEncoder,
         output: &wgpu::TextureView,
         output_size: (u32, u32),
-    ) -> Result<()> {
-        if self.wired.in_secondary_camera {
-            return Ok(());
-        }
+    ) -> Result<(bool, crate::RenderStats)> {
         let split_cams: Vec<_> = frame.camera_targets.iter().filter(|c| c.split_screen).cloned().collect();
-        if split_cams.is_empty() {
-            return Ok(());
-        }
-        self.wired.in_secondary_camera = true;
         let format = self.context.format;
+        let mut cached = std::mem::take(&mut self.wired.split_targets);
+        let mut rects: Vec<ViewportRect> = Vec::with_capacity(split_cams.len());
+        let mut any_waiting = false;
+        let mut combined = crate::RenderStats::default();
+
+        self.wired.in_secondary_camera = true;
         let res = (|| -> Result<()> {
-            let mut rendered: Vec<(OffscreenRenderTarget, ViewportRect)> = Vec::with_capacity(split_cams.len());
-            for cam in &split_cams {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped normalized [0,1] viewport")]
+            for (idx, cam) in split_cams.iter().enumerate() {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "clamped normalized [0,1] viewport"
+                )]
                 let (x, y, w, h) = {
                     let x = (cam.viewport_x.clamp(0.0, 1.0) * output_size.0 as f32).round() as u32;
                     let y = (cam.viewport_y.clamp(0.0, 1.0) * output_size.1 as f32).round() as u32;
@@ -572,34 +634,47 @@ impl State {
                         .clamp(1, output_size.1.saturating_sub(y).max(1));
                     (x, y, w, h)
                 };
-                let mut rt = OffscreenRenderTarget::new(&self.device, w, h, format)?;
-                let mut sub = frame.clone();
-                sub.view = cam.view;
-                sub.projection = cam.projection;
-                sub.camera_targets.clear();
-                self.submit(&sub, catalog, &mut rt)?;
-                rendered.push((rt, ViewportRect { x, y, width: w, height: h }));
+                let needs_new = cached
+                    .get(idx)
+                    .is_none_or(|rt| rt.size() != (w, h) || rt.format() != format);
+                if needs_new {
+                    let rt = OffscreenRenderTarget::new(&self.device, w, h, format)?;
+                    if idx < cached.len() {
+                        cached[idx] = rt;
+                    } else {
+                        cached.push(rt);
+                    }
+                }
+                let sub = secondary_frame(frame, cam.view, cam.projection);
+                self.submit(&sub, catalog, &mut cached[idx])?;
+                any_waiting |= self.waiting;
+                combined.draw_calls += self.last_stats.draw_calls;
+                combined.instanced_draw_calls += self.last_stats.instanced_draw_calls;
+                combined.instances += self.last_stats.instances;
+                combined.triangles += self.last_stats.triangles;
+                combined.culled += self.last_stats.culled;
+                combined.shadow_culled += self.last_stats.shadow_culled;
+                rects.push(ViewportRect { x, y, width: w, height: h });
             }
+            cached.truncate(split_cams.len());
             let device = self.device.clone();
-            let comp = self
-                .wired
-                .split_screen
-                .get_or_insert_with(|| SplitScreenCompositor::new(&device, format, ColorTransfer::Passthrough));
-            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("split_screen_composite"),
-            });
-            let views: Vec<&wgpu::TextureView> = rendered.iter().map(|(rt, _)| rt.render_view()).collect();
-            let rects: Vec<ViewportRect> = rendered.iter().map(|(_, r)| *r).collect();
+            if !matches!(&self.wired.split_screen, Some((fmt, _)) if *fmt == format) {
+                self.wired.split_screen =
+                    Some((format, SplitScreenCompositor::new(&device, format, ColorTransfer::Passthrough)));
+            }
+            let (_, comp) = self.wired.split_screen.as_mut().unwrap();
+            let views: Vec<&wgpu::TextureView> = cached.iter().map(OffscreenRenderTarget::render_view).collect();
             let layout = crate::render_targets::SplitScreenLayout {
                 output_size,
                 viewports: rects,
                 divider_px: 0,
             };
-            comp.composite(&device, &mut encoder, output, &layout, &views, wgpu::Color::BLACK)?;
-            self.queue.submit([encoder.finish()]);
+            comp.composite(&device, encoder, output, &layout, &views, wgpu::Color::BLACK)?;
             Ok(())
         })();
         self.wired.in_secondary_camera = false;
-        res
+        self.wired.split_targets = cached;
+        res?;
+        Ok((any_waiting, combined))
     }
 }

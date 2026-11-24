@@ -185,10 +185,20 @@ impl State {
         let named = frame.solids.iter().flat_map(|solid| solid.faces.iter().map(|face| face.material));
         let named = named
             .chain(frame.decals.iter().map(|decal| decal.material))
+            .chain(frame.pbr_decals.iter().map(|decal| decal.material))
             .chain(frame.emitters.iter().map(|emitter| emitter.material))
             .chain(frame.ribbons.iter().map(|ribbon| ribbon.material))
             .chain(frame.sprites.iter().map(|sprite| sprite.material))
             .chain(frame.fields.iter().map(|patch| patch.material))
+            .chain(frame.camera_targets.iter().filter(|cam| !cam.split_screen).map(|cam| cam.material))
+            .chain(frame.video_streams.iter().map(|video| video.material))
+            .chain(
+                frame
+                    .area_lights
+                    .iter()
+                    .filter(|light| light.cookie_material != 0)
+                    .map(|light| light.cookie_material - 1),
+            )
             .chain(
                 [frame.grade.lut_a, frame.grade.lut_b].into_iter().filter(|&table| table != 0).map(|table| table - 1),
             );

@@ -287,14 +287,14 @@ mod tests {
         @group(0) @binding(2) var<storage, read_write> outputs: array<vec4f>;
         @group(0) @binding(3) var lut_a: texture_2d<f32>;
         @group(0) @binding(4) var lut_b: texture_2d<f32>;
-        // Two vec4s a sample: its light and u, then v. The unused lane of the vignette
+        // Two vec4s a sample: its light and u, then v. The unused lane of `gain`
         // asks for the plain table lookup of the first table instead of the grade.
         @compute @workgroup_size(64) fn run(@builtin(global_invocation_id) id: vec3u) {
           let i = id.x;
           if (i >= arrayLength(&inputs) / 2u) { return; }
           let a = inputs[2u * i];
           let b = inputs[2u * i + 1u];
-          if (g.vignette.w > 0.5) {
+          if (g.gain.w > 0.5) {
             outputs[i] = vec4f(lut_lookup(lut_a, i32(g.luts.x), a.xyz), 0.0);
           } else {
             outputs[i] = vec4f(grade_apply(g, lut_a, lut_b, a.xyz, vec2f(a.w, b.x)), 0.0);
@@ -615,8 +615,8 @@ mod tests {
             ];
             samples.extend((0..800).map(|_| ([noise.next(), noise.next(), noise.next()], [0.0; 2])));
             let mut uniform = uniform(&grade_of(&Settings::NEUTRAL), &[Some(lut.clone()), None]);
-            // The lookup alone is asked for in the vignette's fourth lane.
-            uniform.vignette[3] = 1.0;
+            // The lookup alone is asked for in `gain`'s unused fourth lane.
+            uniform.gain[3] = 1.0;
             let got = rig.run(&uniform, &[Some(lut), None], &samples);
             for ((v, _), got) in samples.iter().zip(&got) {
                 let want = table.lookup(*v);

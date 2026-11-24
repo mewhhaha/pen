@@ -311,8 +311,18 @@ impl State {
         }
         // Execute non-split-screen RTT secondary cameras before main-view batching so materials sample them fresh.
         self.run_rtt_cameras(frame, catalog)?;
-        // Upload frame LTC area lights if present.
-        self.upload_area_lights(frame);
+        // Split-screen fast path: skip the unused primary 3D scene pass, render each split-screen
+        // camera into cached targets, composite onto `output`, then draw HUD sprites and veil once on top.
+        if !self.wired.in_secondary_camera && frame.camera_targets.iter().any(|c| c.split_screen) {
+            return self.draw_split_screen(
+                frame,
+                catalog,
+                target,
+                scratch,
+                now,
+                (field_upload_bytes, field_upload_calls, field_input_texels),
+            );
+        }
         let samples = self.quality(frame, catalog, scratch)?;
         // The veil covers the frame while the passes around the scene
         // compile (it waits for them, see below). Without one, the frame
@@ -395,6 +405,8 @@ impl State {
             || !scratch.emitters.is_empty()
             || !scratch.ribbons.is_empty();
         let volume = self.volumetrics.prepare(&self.context, frame, &quality, target.size(), translucent);
+        let planned_scene_size = crate::post::scene_size(&self.device, target.size(), quality.scale);
+        let physical_sky = self.prepare_physical_sky(frame, planned_scene_size)?;
         // Opaque surfaces of a subsurface material have the scene's picture
         // diffused over them once it is resolved; a frame with none makes no passes
         // and no textures for it.
@@ -405,6 +417,7 @@ impl State {
             quality,
             target.size(),
             &volume,
+            physical_sky.as_ref(),
             Extras { translucent, subsurface },
         );
         if targets.targets_recreated {
@@ -684,6 +697,7 @@ impl State {
             draw_layers(&mut pass, group, &overlays, &mut stats);
         }
         let has_filters = scratch.sprites.iter().any(|batch| batch.scene_filter);
+        let wants_polish = super::wired_passes::WiredPasses::wants_post_polish(frame);
         if has_filters {
             let layout = self.context.sprite_group.clone();
             let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&device, layout));
@@ -721,19 +735,42 @@ impl State {
                     current = next;
                 }
             }
+            let filter_dst = if wants_polish {
+                self.wired.polish_target(&device, (output_width, output_height), self.context.format)
+            } else {
+                output.clone()
+            };
             self.post.as_mut().unwrap().finish_filtered(
                 &mut self.built_ins,
                 &mut encoder,
                 frame,
                 &images[current],
-                &output,
+                &filter_dst,
                 self.timer.pass(Span::Post),
             );
-        } else if super::wired_passes::WiredPasses::wants_post_polish(frame) {
+            if wants_polish {
+                Self::encode_post_polish_wired(
+                    &mut self.wired,
+                    &mut self.built_ins,
+                    &device,
+                    &mut encoder,
+                    frame,
+                    self.frames,
+                    self.context.format,
+                    &filter_dst,
+                    &targets.depth_only,
+                    targets.size,
+                    &output,
+                    (output_width, output_height),
+                    samples,
+                )?;
+            }
+        } else if wants_polish {
             let polish_in = self.wired.polish_target(&device, (output_width, output_height), self.context.format);
             self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &polish_in, &self.timer, &tables);
             Self::encode_post_polish_wired(
                 &mut self.wired,
+                &mut self.built_ins,
                 &device,
                 &mut encoder,
                 frame,
@@ -741,6 +778,7 @@ impl State {
                 self.context.format,
                 &polish_in,
                 &targets.depth_only,
+                targets.size,
                 &output,
                 (output_width, output_height),
                 samples,
@@ -833,8 +871,6 @@ impl State {
             post.exposure_finish(&mut encoder);
         }
         self.queue.submit([encoder.finish()]);
-        // Render and composite any split-screen cameras directly onto the output surface before present.
-        self.composite_split_screen(frame, catalog, &surface, (output_width, output_height))?;
         if let Some(post) = &mut self.post {
             post.exposure_submitted();
         }
@@ -849,6 +885,111 @@ impl State {
         }
         // Once background compiles end, what they added to the pipeline
         // cache is written, in the background too.
+        if self.frames.is_multiple_of(30) {
+            let busy = self.pending() > 0;
+            if self.busy && !busy {
+                self.loader.jobs.push(Job::Persist, Priority::Background);
+            }
+            self.busy = busy;
+        }
+        Ok(())
+    }
+
+    /// Fast path for split-screen frames: renders each `split_screen == true` camera into
+    /// cached offscreen targets, composites them onto `output`, then draws HUD sprites and
+    /// the startup veil once on top without running a wasted primary 3D scene pass.
+    fn draw_split_screen(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+        scratch: &mut Scratch,
+        now: f64,
+        (field_upload_bytes, field_upload_calls, field_input_texels): (u64, u32, u64),
+    ) -> Result<()> {
+        let samples = self.quality(frame, catalog, scratch)?;
+        let covered = self.veil.as_ref().is_some_and(|veil| veil.clearing.is_none());
+        #[cfg(not(target_arch = "wasm32"))]
+        while !covered && self.built_ins.coming(BuiltIn::all(samples)) && self.wait(std::time::Duration::from_secs(10))
+        {
+        }
+        self.sprite_batches(&frame.sprites, catalog, &mut scratch.sprites, &mut scratch.sprite_order)?;
+        let (output_width, output_height) = target.size();
+        if covered && !self.built_ins.ready(BuiltIn::all(samples)) {
+            self.waiting = true;
+            self.last_stats = RenderStats::default();
+            let Some(surface) = target.view() else { return Ok(()) };
+            let output = self.screen.view(&self.device, &self.queue, &surface, (output_width, output_height));
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            self.cover(&mut encoder, &output, frame, now, (output_width, output_height), true);
+            if frame.loading && !scratch.sprites.is_empty() {
+                let layout = self.context.sprite_group.clone();
+                let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&self.device, layout));
+                sprites.draw(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    &output,
+                    (output_width, output_height),
+                    &scratch.sprites,
+                    &frame.sprites,
+                    &scratch.sprite_order,
+                    None,
+                );
+            }
+            self.screen.decode(&mut encoder, &surface);
+            self.queue.submit([encoder.finish()]);
+            target.present();
+            return Ok(());
+        }
+        let Some(surface) = target.view() else { return Ok(()) };
+        let device = self.device.clone();
+        let screen = self.screen.view(&device, &self.queue, &surface, (output_width, output_height));
+        let format = self.context.format;
+        let filtered =
+            self.filter.begin(&device, &self.queue, format, self.context.cache.get(), (output_width, output_height));
+        let output = filtered.as_ref().unwrap_or(&screen).clone();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("split_screen_frame"),
+        });
+        let (any_waiting, mut stats) =
+            self.render_split_screen_into(frame, catalog, &mut encoder, &output, (output_width, output_height))?;
+        stats.field_upload_bytes = field_upload_bytes;
+        stats.field_upload_calls = field_upload_calls;
+        stats.field_input_texels = field_input_texels;
+        stats.scale = frame.quality.scale;
+        self.waiting = any_waiting;
+        if frame.loading {
+            self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
+        }
+        if !scratch.sprites.is_empty() {
+            let layout = self.context.sprite_group.clone();
+            let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&device, layout));
+            sprites.prepare(&device, &self.queue, (output_width, output_height), &frame.sprites, &scratch.sprite_order);
+            sprites.draw_prepared(
+                &device,
+                &mut encoder,
+                &output,
+                &scratch.sprites,
+                0..u32::try_from(scratch.sprite_order.len()).expect("bounded sprite count"),
+                None,
+            );
+        }
+        if !frame.loading {
+            self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
+        }
+        if filtered.is_some() {
+            self.filter.finish(&mut encoder, &screen);
+        }
+        self.screen.decode(&mut encoder, &surface);
+        self.last_stats = stats;
+        self.queue.submit([encoder.finish()]);
+        target.present();
+        if let Some(budget) = self.asset_budget
+            && self.gpu_asset_bytes() > budget
+        {
+            let _ = self.evict_unused(2, budget);
+        }
         if self.frames.is_multiple_of(30) {
             let busy = self.pending() > 0;
             if self.busy && !busy {

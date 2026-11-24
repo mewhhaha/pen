@@ -32,6 +32,9 @@ struct ClusterLight {
 @group(2) @binding(4) var local_shadows: texture_depth_2d_array;
 @group(2) @binding(5) var local_shadow_sampler: sampler_comparison;
 @group(2) @binding(6) var<storage, read> local_shadow_faces: array<mat4x4f>;
+// Packed LTC area lights (up to 64 lights * 5 vec4f at offset 0) followed by
+// 64x64 LTC inverse-M matrix LUT (offset 320) and 64x64 LTC amplitude LUT (offset 4416).
+@group(2) @binding(7) var<storage, read> area_light_data: array<vec4f>;
 
 // Eight points of a Poisson disk of radius 1.
 var<private> local_shadow_taps = array<vec2f, 8>(
@@ -181,4 +184,251 @@ fn cluster_light_sample(light: ClusterLight, world: vec3f, normal: vec3f, behind
   taken.way = way;
   taken.radiance = light.color.rgb * strength * local_shadow(light, world, normal, way, distance);
   return taken;
+}
+
+// ---- Linearly Transformed Cosines (LTC) Area Lights via @group(2) @binding(7).
+const AREA_MAX_LIGHTS: u32 = 64u;
+const AREA_MAT_OFFSET: u32 = 320u;
+const AREA_AMP_OFFSET: u32 = 4416u;
+const AREA_PI: f32 = 3.14159265359;
+const AREA_OCTAGON_SCALE: f32 = 1.0539073;
+
+fn area_sample_lut(base_offset: u32, rough: f32, q: f32) -> vec4f {
+  let fx = clamp(rough, 0.0, 1.0) * 63.0;
+  let fy = clamp(q, 0.0, 1.0) * 63.0;
+  let x0 = min(u32(floor(fx)), 62u);
+  let y0 = min(u32(floor(fy)), 62u);
+  let tx = fx - f32(x0);
+  let ty = fy - f32(y0);
+  let i00 = base_offset + y0 * 64u + x0;
+  let i10 = i00 + 1u;
+  let i01 = i00 + 64u;
+  let i11 = i01 + 1u;
+  let row0 = mix(area_light_data[i00], area_light_data[i10], tx);
+  let row1 = mix(area_light_data[i01], area_light_data[i11], tx);
+  return mix(row0, row1, ty);
+}
+
+fn area_integrate_edge(v1: vec3f, v2: vec3f) -> vec3f {
+  let c = cross(v1, v2);
+  let sin_t = length(c);
+  if (sin_t <= 1e-6) {
+    return vec3f(0.0);
+  }
+  let cos_t = clamp(dot(v1, v2), -1.0, 1.0);
+  let theta = atan2(sin_t, cos_t);
+  return c * (theta / (2.0 * AREA_PI * sin_t));
+}
+
+fn area_eval_quad(p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f) -> f32 {
+  let poly = array<vec3f, 4>(p0, p1, p2, p3);
+  var clipped = array<vec3f, 5>(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
+  var out_n = 0u;
+  for (var i = 0u; i < 4u; i++) {
+    let cur = poly[i];
+    let nxt = poly[(i + 1u) % 4u];
+    let cur_in = cur.z >= 0.0;
+    let nxt_in = nxt.z >= 0.0;
+    if (cur_in && out_n < 5u) {
+      clipped[out_n] = cur;
+      out_n += 1u;
+    }
+    if (cur_in != nxt_in && out_n < 5u) {
+      let denom = cur.z - nxt.z;
+      let t = select(0.5, cur.z / denom, abs(denom) > 1e-7);
+      clipped[out_n] = mix(cur, nxt, clamp(t, 0.0, 1.0));
+      out_n += 1u;
+    }
+  }
+  if (out_n < 3u) {
+    return 0.0;
+  }
+  var dirs = array<vec3f, 5>(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
+  var valid_n = 0u;
+  for (var i = 0u; i < out_n; i++) {
+    let len2 = dot(clipped[i], clipped[i]);
+    if (len2 > 1e-10) {
+      let d = clipped[i] * inverseSqrt(len2);
+      if (valid_n == 0u || dot(d - dirs[valid_n - 1u], d - dirs[valid_n - 1u]) > 1e-10) {
+        dirs[valid_n] = d;
+        valid_n += 1u;
+      }
+    }
+  }
+  if (valid_n < 3u) {
+    return 0.0;
+  }
+  var sum = vec3f(0.0);
+  for (var i = 0u; i < valid_n; i++) {
+    sum += area_integrate_edge(dirs[i], dirs[(i + 1u) % valid_n]);
+  }
+  return clamp(abs(sum.z), 0.0, 1.0);
+}
+
+fn area_basis(n: vec3f, v: vec3f) -> mat3x3f {
+  let v_proj = v - n * dot(v, n);
+  let len2 = dot(v_proj, v_proj);
+  var t1: vec3f;
+  if (len2 > 1e-6) {
+    t1 = v_proj * inverseSqrt(len2);
+  } else {
+    let up = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(n.y) > 0.9);
+    t1 = normalize(cross(up, n));
+  }
+  let t2 = cross(n, t1);
+  return transpose(mat3x3f(t1, t2, n));
+}
+
+fn area_range_window(dist: f32, reach: f32) -> f32 {
+  if (reach <= 0.0) {
+    return 1.0;
+  }
+  if (dist >= reach) {
+    return 0.0;
+  }
+  let r = dist / reach;
+  let w = clamp(1.0 - r * r * r * r, 0.0, 1.0);
+  return w * w;
+}
+
+// Evaluates all active LTC area lights (Rect, Disk, Tube, CookieSpot) in `area_light_data`.
+// Fast-path returns zero immediately when `cluster_grid.options.y < 0.5`.
+fn clustered_area_lights(
+  world: vec3f,
+  normal: vec3f,
+  view: vec3f,
+  base_color: vec3f,
+  metallic: f32,
+  f0: vec3f,
+  roughness: f32,
+) -> vec3f {
+  let count = min(u32(max(cluster_grid.options.y, 0.0) + 0.5), AREA_MAX_LIGHTS);
+  if (count == 0u) {
+    return vec3f(0.0);
+  }
+  let n = normalize(normal);
+  let v = normalize(view);
+  let ndotv = clamp(dot(n, v), 0.0, 1.0);
+  let rough = clamp(roughness, 0.04, 1.0);
+  let q = sqrt(max(1.0 - ndotv, 0.0));
+  let t1 = area_sample_lut(AREA_MAT_OFFSET, rough, q);
+  let t2 = area_sample_lut(AREA_AMP_OFFSET, rough, q);
+  let minv = mat3x3f(
+    vec3f(t1.x, 0.0, t1.y),
+    vec3f(0.0, 1.0, 0.0),
+    vec3f(t1.z, 0.0, t1.w),
+  );
+  let basis = area_basis(n, v);
+  let spec_xf = minv * basis;
+  let diff_albedo = base_color * (1.0 - clamp(metallic, 0.0, 1.0));
+  let spec_fresnel = f0 * t2.x + (vec3f(1.0) - f0) * t2.y;
+  var total = vec3f(0.0);
+
+  for (var i = 0u; i < count; i++) {
+    let base = i * 5u;
+    let pos_kind = area_light_data[base];
+    let right_ext = area_light_data[base + 1u];
+    let up_ext = area_light_data[base + 2u];
+    let col_reach = area_light_data[base + 3u];
+    let flags = area_light_data[base + 4u];
+
+    let center = pos_kind.xyz;
+    let kind = u32(round(pos_kind.w));
+    let right_len = length(right_ext.xyz);
+    let up_len = length(up_ext.xyz);
+    if (right_len <= 1e-5 || up_len <= 1e-5) {
+      continue;
+    }
+    let right = right_ext.xyz / right_len;
+    let up = up_ext.xyz / up_len;
+    let dist_center = length(center - world);
+    let atten = area_range_window(dist_center, col_reach.w);
+    if (atten <= 0.0) {
+      continue;
+    }
+    let two_sided = flags.x > 0.5;
+    var diff_form = 0.0;
+    var spec_form = 0.0;
+
+    if (kind == 0u || kind == 1u) {
+      let emit_raw = cross(right, up);
+      let emit_len = length(emit_raw);
+      if (emit_len <= 1e-5) {
+        continue;
+      }
+      let emit_n = emit_raw / emit_len;
+      if (!two_sided && dot(emit_n, world - center) <= 0.0) {
+        continue;
+      }
+    }
+
+    if (kind == 0u) {
+      let ex = right * right_ext.w;
+      let ey = up * up_ext.w;
+      let q0 = (center - ex - ey) - world;
+      let q1 = (center + ex - ey) - world;
+      let q2 = (center + ex + ey) - world;
+      let q3 = (center - ex + ey) - world;
+      diff_form = area_eval_quad(basis * q0, basis * q1, basis * q2, basis * q3);
+      spec_form = area_eval_quad(spec_xf * q0, spec_xf * q1, spec_xf * q2, spec_xf * q3);
+    } else if (kind == 1u) {
+      let rad = max(right_ext.w, 1e-4) * AREA_OCTAGON_SCALE;
+      let d = rad * 0.70710678;
+      let c0 = center + right * rad - world;
+      let c1 = center + right * d + up * d - world;
+      let c2 = center + up * rad - world;
+      let c3 = center - right * d + up * d - world;
+      let c4 = center - right * rad - world;
+      let c5 = center - right * d - up * d - world;
+      let c6 = center - up * rad - world;
+      let c7 = center + right * d - up * d - world;
+      diff_form = area_eval_quad(basis * c0, basis * c1, basis * c2, basis * c3)
+        + area_eval_quad(basis * c4, basis * c5, basis * c6, basis * c7)
+        + area_eval_quad(basis * c0, basis * c3, basis * c4, basis * c7);
+      spec_form = area_eval_quad(spec_xf * c0, spec_xf * c1, spec_xf * c2, spec_xf * c3)
+        + area_eval_quad(spec_xf * c4, spec_xf * c5, spec_xf * c6, spec_xf * c7)
+        + area_eval_quad(spec_xf * c0, spec_xf * c3, spec_xf * c4, spec_xf * c7);
+    } else if (kind == 2u) {
+      let half_len = max(right_ext.w, 1e-4);
+      let tube_r = max(up_ext.w, 0.01);
+      let to_p = world - center;
+      let perp_raw = to_p - right * dot(to_p, right);
+      let perp_dir = select(up, normalize(perp_raw), dot(perp_raw, perp_raw) > 1e-6);
+      let side = normalize(cross(right, perp_dir));
+      let ex = right * half_len;
+      let ey = side * tube_r;
+      let q0 = (center - ex - ey) - world;
+      let q1 = (center + ex - ey) - world;
+      let q2 = (center + ex + ey) - world;
+      let q3 = (center - ex + ey) - world;
+      diff_form = area_eval_quad(basis * q0, basis * q1, basis * q2, basis * q3);
+      spec_form = area_eval_quad(spec_xf * q0, spec_xf * q1, spec_xf * q2, spec_xf * q3);
+    } else {
+      // Cookie spotlight cone projector.
+      let forward = normalize(cross(right, up));
+      let rel = world - center;
+      let lz = dot(rel, forward);
+      if (lz <= 1e-4) {
+        continue;
+      }
+      let tan_fov = max(flags.w, 0.05);
+      let aspect = max(up_ext.w, 0.1);
+      let u = 0.5 + dot(rel, right) / (2.0 * lz * tan_fov * aspect);
+      let v_coord = 0.5 - dot(rel, up) / (2.0 * lz * tan_fov);
+      if (u < 0.0 || u > 1.0 || v_coord < 0.0 || v_coord > 1.0) {
+        continue;
+      }
+      let edge = max(flags.z, 0.005);
+      let mask = smoothstep(0.0, edge, u) * smoothstep(0.0, edge, 1.0 - u)
+        * smoothstep(0.0, edge, v_coord) * smoothstep(0.0, edge, 1.0 - v_coord);
+      let to_l = -rel / max(dist_center, 1e-4);
+      let ndl = max(dot(n, to_l), 0.0);
+      let falloff = mask / (dist_center * dist_center + 1.0);
+      diff_form = ndl * falloff;
+      spec_form = ndl * falloff;
+    }
+
+    total += (diff_albedo * diff_form + spec_fresnel * spec_form) * col_reach.rgb * atten;
+  }
+  return total;
 }

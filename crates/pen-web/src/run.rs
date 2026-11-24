@@ -36,6 +36,7 @@ use crate::replay::{self, Recorder};
 use crate::saves;
 use crate::screen::{FRAMES_IN_FLIGHT, Screen};
 use crate::tools::Tools;
+use crate::video::WebVideoRegistry;
 
 pub type Runtime = GameRuntime<BrowserBackend>;
 
@@ -298,6 +299,7 @@ pub struct Browser {
     /// Active browser WebSocket relay netplay session, when configured via `options.netRelay`.
     #[allow(dead_code)]
     netplay: Option<pen_runtime::net::Netplay>,
+    videos: WebVideoRegistry,
 }
 
 impl Browser {
@@ -357,6 +359,7 @@ impl Browser {
             cursor_hidden: false,
             previous: None,
             state_adapter: options.state_adapter,
+            videos: WebVideoRegistry::new(options.assets.clone()),
             assets: options.assets,
             files: Files::install(),
             name: options.name,
@@ -403,6 +406,11 @@ impl Browser {
         let ran = self.step().await?;
         let overlay = self.tools.as_ref().and_then(|tools| tools.frame.as_ref());
         self.preferences.apply(&mut self.screen.renderer);
+        if !self.shown.video_streams.is_empty()
+            && let Err(err) = self.videos.update(&self.shown, &self.catalog, &mut self.screen.renderer)
+        {
+            say(&mut self.log, log_source::GAME, true, format!("video stream: {err:#}"));
+        }
         let (presented, draw_timings) = match self.screen.draw(&self.shown, overlay, &self.catalog).await {
             Ok(result) => result,
             Err(err) => {

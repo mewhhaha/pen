@@ -90,6 +90,13 @@ struct StandardSurface {
   subsurface: f32,
   subsurface_color: vec3f,
   thin: f32,
+  // Thin-film iridescence (SURFACE_IRIDESCENCE): weight, film IOR, thickness (nm).
+  iridescence: f32,
+  iridescence_ior: f32,
+  iridescence_thickness: f32,
+  // Baked lightmap diffuse irradiance (SURFACE_LIGHTMAP).
+  lightmap_irradiance: vec3f,
+  has_lightmap: f32,
 };
 
 // A surface of albedo (or metal color) `base_color`, `metallic` and
@@ -113,6 +120,11 @@ fn surface_default(world: vec3f, normal: vec3f, view: vec3f, base_color: vec3f, 
   s.ior = 1.5;
   s.attenuation_color = vec3f(1.0);
   s.thin = 1.0;
+  s.iridescence = 0.0;
+  s.iridescence_ior = 1.3;
+  s.iridescence_thickness = 400.0;
+  s.lightmap_irradiance = vec3f(0.0);
+  s.has_lightmap = 0.0;
   return s;
 }
 
@@ -549,7 +561,11 @@ fn surface_light(s: StandardSurface, way: vec3f, radiance: vec3f) -> LightRespon
     distribution = lobe_ggx_distribution(nh, a2);
     visibility = lobe_smith_visibility(nl, nv, a2);
   }
-  let fresnel = lobe_schlick(s.f0, s.f90, vh);
+  var fresnel = lobe_schlick(s.f0, s.f90, vh);
+  if ((s.lobes & SURFACE_IRIDESCENCE) != 0u && s.iridescence > 0.0) {
+    let irid_f = lobe_iridescence_fresnel(1.0, max(s.iridescence_ior, 1.0001), vh, max(s.iridescence_thickness, 0.0), s.f0);
+    fresnel = mix(fresnel, irid_f, clamp(s.iridescence, 0.0, 1.0));
+  }
   var specular = radiance * (fresnel * (distribution * visibility * nl * 3.14159265359));
   // The layers over the base lobes take their share of the light, and add theirs.
   var layers = 1.0;
@@ -638,8 +654,9 @@ fn surface_apply_orm(s: StandardSurface, orm: vec4f, enabled: f32) -> StandardSu
   return out;
 }
 
-// ---- Thin-film iridescence (KHR_materials_iridescence) & chromatic dispersion.
+// ---- Thin-film iridescence (KHR_materials_iridescence), baked lightmaps & chromatic dispersion.
 const SURFACE_IRIDESCENCE: u32 = 64u;
+const SURFACE_LIGHTMAP: u32 = 128u;
 
 fn lobe_iridescence_xyz_to_srgb(xyz: vec3f) -> vec3f {
   let m = mat3x3f(
@@ -690,4 +707,64 @@ fn surface_atlas_tile_uv(tile: u32, uv: vec2f, atlas_dims: vec2f, clamp_uv: bool
 fn surface_read_atlas(atlas: texture_2d<f32>, samp: sampler, tile: u32, uv: vec2f, clamp_uv: bool) -> vec4f {
   let dims = vec2f(textureDimensions(atlas, 0));
   return textureSampleLevel(atlas, samp, surface_atlas_tile_uv(tile, uv, dims, clamp_uv), 0.0);
+}
+
+// Applies enabled tiles from the GPU-packed 4x3 SurfaceMapAtlas (@group(1) @binding(4))
+// onto `s` when `atlas_mode > 4.5` (`draw.settings.w == 5.0`). `tile_mask` is the bitmask
+// of populated `SurfaceTile` slots (bit `1u << tile`).
+fn surface_apply_atlas(
+  s: StandardSurface,
+  atlas: texture_2d<f32>,
+  samp: sampler,
+  uv: vec2f,
+  uv1: vec2f,
+  atlas_mode: f32,
+  tile_mask: u32,
+) -> StandardSurface {
+  var out = s;
+  if (atlas_mode <= 4.5 || tile_mask == 0u) {
+    return out;
+  }
+  if ((tile_mask & 1u) != 0u) {
+    let orm = surface_read_atlas(atlas, samp, 0u, uv, false);
+    out = surface_apply_orm(out, orm, 1.0);
+    out.f0 = mix(vec3f(0.04), out.base_color, clamp(out.metallic, 0.0, 1.0));
+  }
+  if ((tile_mask & 8u) != 0u) {
+    let cc = surface_read_atlas(atlas, samp, 3u, uv, false);
+    out.lobes |= SURFACE_COAT;
+    out.coat = clamp(out.coat * cc.r, 0.0, 1.0);
+    out.coat_roughness = clamp(out.coat_roughness * cc.g, 0.04, 1.0);
+  }
+  if ((tile_mask & 32u) != 0u) {
+    let sh = surface_read_atlas(atlas, samp, 5u, uv, false);
+    out.lobes |= SURFACE_SHEEN;
+    out.sheen_color *= sh.rgb;
+    out.sheen_roughness = clamp(out.sheen_roughness * sh.a, 0.07, 1.0);
+  }
+  if ((tile_mask & 128u) != 0u) {
+    let tr = surface_read_atlas(atlas, samp, 7u, uv, false);
+    out.lobes |= SURFACE_TRANSMISSION;
+    out.transmission = clamp(out.transmission * tr.r, 0.0, 1.0);
+    out.thickness *= tr.g;
+  }
+  if ((tile_mask & 256u) != 0u) {
+    let sp = surface_read_atlas(atlas, samp, 8u, uv, false);
+    let dielectric = min(lobe_ior_f0(out.ior) * sp.rgb, vec3f(1.0)) * sp.a;
+    out.f0 = mix(dielectric, out.base_color, clamp(out.metallic, 0.0, 1.0));
+    out.f90 = mix(sp.a, 1.0, clamp(out.metallic, 0.0, 1.0));
+  }
+  if ((tile_mask & 512u) != 0u) {
+    let ir = surface_read_atlas(atlas, samp, 9u, uv, false);
+    out.lobes |= SURFACE_IRIDESCENCE;
+    out.iridescence = clamp(ir.r, 0.0, 1.0);
+    out.iridescence_thickness = mix(100.0, 600.0, clamp(ir.g, 0.0, 1.0));
+  }
+  if ((tile_mask & 1024u) != 0u) {
+    let lm = surface_read_atlas(atlas, samp, 10u, uv1, true);
+    out.lobes |= SURFACE_LIGHTMAP;
+    out.lightmap_irradiance = lm.rgb;
+    out.has_lightmap = 1.0;
+  }
+  return out;
 }

@@ -200,13 +200,29 @@ pub(crate) fn atmosphere_of(
     let sky = &frame.sky;
     let clear = &frame.clear;
     let light = &frame.light_color;
+    let sky_mode = if quality.physical_sky {
+        if frame.clouds.cover > 0.001 { 3.0 } else { 2.0 }
+    } else if quality.sky {
+        1.0
+    } else {
+        0.0
+    };
+    let sun = if quality.physical_sky {
+        let sx = -frame.light_direction.x;
+        let sy = -frame.light_direction.y;
+        let sz = -frame.light_direction.z;
+        let len = (sx * sx + sy * sy + sz * sz).sqrt();
+        if len > 1e-6 { [sx / len, sy / len, sz / len] } else { [0.0, 0.85, -0.5268] }
+    } else {
+        [sky.sun.x, sky.sun.y, sky.sun.z]
+    };
     let mut data = [0.0; 56];
     data[..16].copy_from_slice(&invert(&multiply(projection, &frame.view)));
     data[16..].copy_from_slice(&[
         camera[12],
         camera[13],
         camera[14],
-        if quality.sky { 1.0 } else { 0.0 },
+        sky_mode,
         sky.zenith.x,
         sky.zenith.y,
         sky.zenith.z,
@@ -219,9 +235,9 @@ pub(crate) fn atmosphere_of(
         sky.ground.y,
         sky.ground.z,
         0.0,
-        sky.sun.x,
-        sky.sun.y,
-        sky.sun.z,
+        sun[0],
+        sun[1],
+        sun[2],
         0.0,
         light.x,
         light.y,
@@ -247,6 +263,24 @@ pub(crate) fn atmosphere_of(
     data
 }
 
+/// GPU views bound into `BuiltIn::Atmosphere` when `quality.physical_sky` is active.
+pub(crate) struct PhysicalSkyBinding {
+    /// Non-zero version key bumped whenever `sky_view` or `clouds` view identity changes.
+    pub serial: u64,
+    pub sky_view: wgpu::TextureView,
+    pub clouds: Option<wgpu::TextureView>,
+}
+
+/// Computes the scaled internal scene resolution `Post::begin` will allocate.
+pub(crate) fn scene_size(device: &wgpu::Device, size: (u32, u32), scale: f32) -> (u32, u32) {
+    let limit = device.limits().max_texture_dimension_2d;
+    let budget =
+        f64::from(scale).min((MAX_RENDER_PIXELS / (f64::from(size.0) * f64::from(size.1)).max(1.0)).sqrt());
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "at least 1, and saturating")]
+    let scaled = |value: u32| ((f64::from(value) * budget).round().max(1.0) as u32).min(limit);
+    (scaled(size.0), scaled(size.1))
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct TargetsKey {
     width: u32,
@@ -261,6 +295,8 @@ struct TargetsKey {
     motion_blur: bool,
     /// The froxel volume's grid the atmosphere pass reads (0 for none).
     volume: u64,
+    /// Physical sky LUT + cloud texture generation (0 when off).
+    physical_sky: u64,
 }
 
 /// What a frame draws beyond the scene's opaque surfaces.
@@ -721,6 +757,7 @@ impl Post {
     /// Prepares the attachments for `frame` drawn with `quality` on an
     /// output of `size`, and returns the scene pass's color and depth
     /// attachments.
+    #[allow(clippy::too_many_arguments)]
     pub fn begin(
         &mut self,
         built_ins: &mut BuiltIns,
@@ -728,6 +765,7 @@ impl Post {
         quality: Quality,
         size: (u32, u32),
         volume: &crate::volume::Applied,
+        physical_sky: Option<&PhysicalSkyBinding>,
         extras: Extras,
     ) -> SceneTargets {
         let Extras { translucent, subsurface } = extras;
@@ -736,16 +774,15 @@ impl Post {
         self.translucent = translucent;
         self.subsurface = subsurface;
         let occluding = quality.occlusion;
-        let atmosphere =
-            quality.sky || frame.fog.density > 0.0 || occluding || frame.clouds.cover > 0.0 || volume.serial != 0;
+        let atmosphere = quality.sky
+            || quality.physical_sky
+            || frame.fog.density > 0.0
+            || occluding
+            || frame.clouds.cover > 0.0
+            || volume.serial != 0;
         // At most the pixels of a 4K screen, whatever the scale and display:
         // the multisampled targets of more would take gigabytes.
-        let limit = self.device.limits().max_texture_dimension_2d;
-        let budget =
-            f64::from(quality.scale).min((MAX_RENDER_PIXELS / (f64::from(size.0) * f64::from(size.1)).max(1.0)).sqrt());
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "at least 1, and saturating")]
-        let scaled = |value: u32| ((f64::from(value) * budget).round().max(1.0) as u32).min(limit);
-        let (width, height) = (scaled(size.0), scaled(size.1));
+        let (width, height) = scene_size(&self.device, size, quality.scale);
         let samples = quality.msaa;
         // Halving down to no smaller than a few pixels.
         let half = (width.div_ceil(2), height.div_ceil(2));
@@ -773,6 +810,7 @@ impl Post {
             dof,
             motion_blur,
             volume: volume.serial,
+            physical_sky: physical_sky.map_or(0, |b| b.serial),
         };
         let mut targets_recreated = false;
         if self.targets.as_ref().is_none_or(|targets| targets.key != key) {
@@ -822,7 +860,7 @@ impl Post {
                     history,
                 };
                 let graph = self
-                    .graph(built_ins, key, inputs, Part::Whole, volume, graphs.first())
+                    .graph(built_ins, key, inputs, Part::Whole, volume, physical_sky, graphs.first())
                     .expect("the passes after the scene read only what earlier ones draw");
                 log::debug!("passes after the scene: {:?}, {} textures", graph.names(), graph.allocations());
                 graphs.push(graph);
@@ -846,7 +884,7 @@ impl Post {
             self.previous_vp = None;
         }
         if translucent && self.targets.as_ref().unwrap().split.is_none() {
-            let split = self.split(built_ins, volume);
+            let split = self.split(built_ins, volume, physical_sky);
             self.targets.as_mut().unwrap().split = Some(split);
         }
         if subsurface && self.targets.as_ref().unwrap().subsurface.is_none() {
@@ -876,7 +914,12 @@ impl Post {
     /// picture and its depth, the graph that makes them, the backdrop's bind
     /// group and the graphs of the passes that read what the translucent pass
     /// draws.
-    fn split(&mut self, built_ins: &mut BuiltIns, volume: &crate::volume::Applied) -> Split {
+    fn split(
+        &mut self,
+        built_ins: &mut BuiltIns,
+        volume: &crate::volume::Applied,
+        physical_sky: Option<&PhysicalSkyBinding>,
+    ) -> Split {
         let targets = self.targets.as_ref().unwrap();
         let key = targets.key;
         let (depth, scene, marks) = (targets.depth_only.clone(), targets.scene.clone(), targets.marks.clone());
@@ -910,13 +953,13 @@ impl Post {
             history: histories.as_ref().map(|textures| [textures[read].clone(), textures[1 - read].clone()]),
         };
         let before = self
-            .graph(built_ins, key, inputs(0), Part::Opaque(&levels, &nearest), volume, None)
+            .graph(built_ins, key, inputs(0), Part::Opaque(&levels, &nearest), volume, physical_sky, None)
             .expect("the opaque picture's passes read only what earlier ones draw");
         log::debug!("opaque picture: {:?}, {} textures", before.names(), before.allocations());
         let mut after: Vec<Graph> = Vec::new();
         for read in 0..if taa { 2 } else { 1 } {
             let graph = self
-                .graph(built_ins, key, inputs(read), Part::After, volume, after.first())
+                .graph(built_ins, key, inputs(read), Part::After, volume, physical_sky, after.first())
                 .expect("the passes after the translucent pass read only what earlier ones draw");
             log::debug!("passes after the translucent pass: {:?}, {} textures", graph.names(), graph.allocations());
             after.push(graph);
@@ -1002,6 +1045,7 @@ impl Post {
     /// the scene's depth, its picture and its stencil marks and, for the last
     /// part, ending on the output. With TAA, `history` is the texture it reads
     /// and the one it draws.
+    #[allow(clippy::too_many_arguments)]
     fn graph(
         &mut self,
         built_ins: &mut BuiltIns,
@@ -1009,6 +1053,7 @@ impl Post {
         inputs: Inputs,
         part: Part<'_>,
         volume: &crate::volume::Applied,
+        physical_sky: Option<&PhysicalSkyBinding>,
         sharing: Option<&Graph>,
     ) -> anyhow::Result<Graph> {
         let TargetsKey { width, height, samples, occluding, atmosphere, ssgi, levels, dof, motion_blur, .. } = key;
@@ -1040,6 +1085,14 @@ impl Post {
                 };
                 let uniform = Binding::Uniform(self.uniform("atmosphere", 224));
                 let froxels = graph.import("froxels", volume.texture.clone());
+                let phys_sky_view = physical_sky
+                    .map(|b| b.sky_view.clone())
+                    .unwrap_or_else(|| self.unbloomed.create_view(&Default::default()));
+                let phys_clouds_view = physical_sky
+                    .and_then(|b| b.clouds.clone())
+                    .unwrap_or_else(|| self.unbloomed.create_view(&Default::default()));
+                let phys_sky = graph.import("physical_sky_lut", phys_sky_view);
+                let phys_clouds = graph.import("physical_clouds", phys_clouds_view);
                 let bindings = vec![
                     uniform,
                     Binding::Texture(scene),
@@ -1048,6 +1101,8 @@ impl Post {
                     sampler.clone(),
                     Binding::Uniform(volume.uniform.clone()),
                     Binding::Texture(froxels),
+                    Binding::Texture(phys_sky),
+                    Binding::Texture(phys_clouds),
                 ];
                 graph.pass("atmosphere", BuiltIn::Atmosphere(samples), bindings, Target::Texture(composed), false);
                 lit = composed;

@@ -250,16 +250,23 @@ pub(crate) fn layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
             count: None,
         },
         storage(6),
+        // Packed LTC area lights + static 64x64 LTC matrix & amplitude LUTs.
+        storage(7),
     ]
 }
 
 const GRID_BYTES: u64 = 48;
 const FACE_BYTES: u64 = (MAX_FACES * 64) as u64;
 const LIGHT_FLOATS: usize = 16;
+const MAX_AREA_LIGHTS: usize = 64;
+const AREA_MAT_OFFSET: usize = MAX_AREA_LIGHTS * 5;
+const AREA_LUT_TEXELS: usize = (crate::area_lights::LTC_LUT_SIZE * crate::area_lights::LTC_LUT_SIZE) as usize;
+const AREA_AMP_OFFSET: usize = AREA_MAT_OFFSET + AREA_LUT_TEXELS;
+const AREA_BUFFER_BYTES: u64 = ((AREA_AMP_OFFSET + AREA_LUT_TEXELS) * 16) as u64;
 
-/// The grid's uniform: its counts, its scales and whether its slices are
-/// linear.
-fn grid(lights: u32, slicing: &Slicing, size: (u32, u32)) -> [u32; 12] {
+/// The grid's uniform: its counts, its scales, whether its slices are linear,
+/// and the active LTC area light count in `options.y`.
+fn grid(lights: u32, area_lights: u32, slicing: &Slicing, size: (u32, u32)) -> [u32; 12] {
     let float = |value: f64| crate::matrix::narrow(value).to_bits();
     [
         TILES.0,
@@ -271,7 +278,7 @@ fn grid(lights: u32, slicing: &Slicing, size: (u32, u32)) -> [u32; 12] {
         float(slicing.scale),
         float(slicing.bias),
         float(if slicing.linear { 1.0 } else { 0.0 }),
-        0,
+        float(f64::from(area_lights)),
         0,
         0,
     ]
@@ -297,6 +304,8 @@ pub(crate) struct Clusters {
     indices: wgpu::Buffer,
     /// The matrix of each atlas layer's face, as the lights' shadows read it.
     faces: wgpu::Buffer,
+    /// Packed LTC area lights (`0..320` vec4f) + static 64x64 LTC mat & amp LUTs (`320..8512` vec4f).
+    area: wgpu::Buffer,
     sampler: wgpu::Sampler,
     /// The local lights' shadow maps the group binds, and which texture they are.
     atlas: wgpu::TextureView,
@@ -305,6 +314,7 @@ pub(crate) struct Clusters {
     empty: wgpu::BindGroup,
     data: Vec<f32>,
     face_data: Vec<f32>,
+    area_data: Vec<crate::area_lights::AreaLight>,
 }
 
 impl Clusters {
@@ -324,6 +334,28 @@ impl Clusters {
             storage(device, "light indices", 4),
             storage(device, "light shadow faces", FACE_BYTES),
         );
+        let area = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("area lights + LTC LUTs"),
+            size: AREA_BUFFER_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        {
+            let (ltc_mat, ltc_amp) = crate::area_lights::generate_ltc_luts();
+            let mat_bytes: &[u8] = bytemuck::cast_slice(&ltc_mat);
+            let amp_bytes: &[u8] = bytemuck::cast_slice(&ltc_amp);
+            let mat_off = (AREA_MAT_OFFSET * 16) as u64;
+            let amp_off = (AREA_AMP_OFFSET * 16) as u64;
+            area.slice(mat_off..mat_off + mat_bytes.len() as u64)
+                .get_mapped_range_mut()
+                .unwrap()
+                .copy_from_slice(mat_bytes);
+            area.slice(amp_off..amp_off + amp_bytes.len() as u64)
+                .get_mapped_range_mut()
+                .unwrap()
+                .copy_from_slice(amp_bytes);
+        }
+        area.unmap();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("local shadows"),
             compare: Some(wgpu::CompareFunction::Less),
@@ -346,9 +378,11 @@ impl Clusters {
             ..Default::default()
         });
         let empty_uniform = uniform("no lights");
-        let empty = Self::bind(device, layout, &empty_uniform, &lights, &ranges, &indices, &stand_in, &sampler, &faces);
+        let empty =
+            Self::bind(device, layout, &empty_uniform, &lights, &ranges, &indices, &stand_in, &sampler, &faces, &area);
         let uniform = uniform("light grid");
-        let group = Self::bind(device, layout, &uniform, &lights, &ranges, &indices, &stand_in, &sampler, &faces);
+        let group =
+            Self::bind(device, layout, &uniform, &lights, &ranges, &indices, &stand_in, &sampler, &faces, &area);
         Self {
             layout: layout.clone(),
             uniform,
@@ -356,6 +390,7 @@ impl Clusters {
             ranges,
             indices,
             faces,
+            area,
             sampler,
             atlas: stand_in.clone(),
             atlas_id: 0,
@@ -363,6 +398,7 @@ impl Clusters {
             empty,
             data: Vec::new(),
             face_data: vec![0.0; MAX_FACES * 16],
+            area_data: Vec::new(),
         }
     }
 
@@ -377,6 +413,7 @@ impl Clusters {
         atlas: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
         faces: &wgpu::Buffer,
+        area: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         let entries = [
             wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
@@ -386,8 +423,60 @@ impl Clusters {
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(atlas) },
             wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
             wgpu::BindGroupEntry { binding: 6, resource: faces.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: area.as_entire_binding() },
         ];
         device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("lights"), layout, entries: &entries })
+    }
+
+    /// Packs `frame.area_lights` (up to `MAX_AREA_LIGHTS`) into the area-light storage region.
+    fn upload_area_lights(&mut self, queue: &wgpu::Queue, frame: &RenderFrame) -> u32 {
+        use crate::area_lights::AreaLight;
+        self.area_data.clear();
+        for spec in frame.area_lights.iter().take(MAX_AREA_LIGHTS) {
+            let pos = [spec.position.x, spec.position.y, spec.position.z];
+            let right = [spec.right.x, spec.right.y, spec.right.z];
+            let up = [spec.up.x, spec.up.y, spec.up.z];
+            let gain = spec.intensity.max(0.0);
+            let col = [spec.color.x * gain, spec.color.y * gain, spec.color.z * gain];
+            let reach = spec.range.max(0.1);
+            let light = match spec.kind {
+                1 => AreaLight::disk(pos, right, up, (spec.width * 0.5).max(0.01), col, reach, spec.two_sided),
+                2 => AreaLight::tube(
+                    pos,
+                    right,
+                    up,
+                    (spec.width * 0.5).max(0.01),
+                    spec.height.max(0.01),
+                    col,
+                    reach,
+                ),
+                3 => AreaLight::cookie_projector(
+                    pos,
+                    right,
+                    up,
+                    spec.width.clamp(0.05, 4.0),
+                    (spec.width / spec.height.max(0.01)).clamp(0.1, 10.0),
+                    col,
+                    reach,
+                    0.05,
+                ),
+                _ => AreaLight::rect(
+                    pos,
+                    right,
+                    up,
+                    (spec.width * 0.5).max(0.01),
+                    (spec.height * 0.5).max(0.01),
+                    col,
+                    reach,
+                    spec.two_sided,
+                ),
+            };
+            self.area_data.push(light);
+        }
+        if !self.area_data.is_empty() {
+            queue.write_buffer(&self.area, 0, bytemuck::cast_slice(&self.area_data));
+        }
+        u32::try_from(self.area_data.len()).unwrap_or(0)
     }
 
     /// Sorts `frame`'s lights into the clusters of its view, on a picture
@@ -402,13 +491,16 @@ impl Clusters {
         shadows: &Selection,
         atlas: Option<(&wgpu::TextureView, u64)>,
     ) {
+        let area_count = self.upload_area_lights(queue, frame);
         let count = u32::try_from(frame.lights.len()).unwrap_or(u32::MAX);
         if count == 0 {
-            queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&[0u32; 12]));
+            let mut words = [0u32; 12];
+            words[9] = crate::matrix::narrow(f64::from(area_count)).to_bits();
+            queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&words));
             return;
         }
         let assignment = assign(&frame.lights, &frame.view, &frame.projection);
-        let words = grid(count, &assignment.slicing, size);
+        let words = grid(count, area_count, &assignment.slicing, size);
         self.upload(device, queue, &frame.lights, shadows, atlas, &assignment, words);
     }
 
@@ -505,6 +597,7 @@ impl Clusters {
                 &self.atlas,
                 &self.sampler,
                 &self.faces,
+                &self.area,
             );
         }
         if !shadows.casters.is_empty() {
@@ -650,7 +743,7 @@ mod tests {
             lights.push(light);
         }
         let assignment = assign(&lights, &view, &projection);
-        let grid = grid(200, &assignment.slicing, (320, 180));
+        let grid = grid(200, 0, &assignment.slicing, (320, 180));
         let scale = (f64::from(f32::from_bits(grid[4])), f64::from(f32::from_bits(grid[5])));
         for _ in 0..4000 {
             let (sx, sy, depth) = (random() * 320.0, random() * 180.0, 0.2 + random() * 55.0);

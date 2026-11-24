@@ -391,6 +391,10 @@ impl Worker {
         match job {
             Job::Load { slot, kind, key, revision, early } => self.load(slot, kind, &key, revision, early).await,
             Job::Sort { key } => {
+                if crate::shader_graph::is_shader_graph_key(&key) {
+                    self.send(Message::Sorted { key, sprite: false });
+                    return;
+                }
                 let Ok(bytes) = self.read(&key).await else { return };
                 let Ok(code) = std::str::from_utf8(&bytes) else { return };
                 if let Some(sprite) = shader::draws_sprites(code) {
@@ -515,7 +519,19 @@ impl Worker {
                 self.send(loaded(pipeline.map(Loaded::SpriteShader)));
             }
             AssetKind::Shader => {
-                let shader = shader::compile_shader(device, &bytes).await.map(|(module, code)| {
+                let compiled_graph = if crate::shader_graph::is_shader_graph_key(key) {
+                    match serde_json::from_slice::<crate::shader_graph::ShaderGraph>(&bytes)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|graph| graph.compile_material_wgsl())
+                    {
+                        Ok(compiled) => Some(compiled.wgsl),
+                        Err(err) => return self.send(loaded(Err(err))),
+                    }
+                } else {
+                    None
+                };
+                let source = compiled_graph.as_deref().map_or(bytes.as_slice(), str::as_bytes);
+                let shader = shader::compile_shader(device, source).await.map(|(module, code)| {
                     let instancing = shader::has_instancing(&code);
                     let skinning = shader::has_skinning(&code);
                     let persistent = shader::has_persistent(&code);

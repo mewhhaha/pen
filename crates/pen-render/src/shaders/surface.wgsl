@@ -43,18 +43,25 @@ fn surface_sky(s: StandardSurface) -> vec3f {
   let sheening = (s.lobes & SURFACE_SHEEN) != 0u && dot(s.sheen_color, s.sheen_color) > 0.0;
   let brushing = (s.lobes & SURFACE_ANISOTROPY) != 0u && s.anisotropy != 0.0;
   let transmitting = (s.lobes & SURFACE_TRANSMISSION) != 0u && s.transmission > 0.0;
-  if (!coating && !sheening && !brushing && !transmitting && s.occlusion >= 1.0) {
+  let iridescent = (s.lobes & SURFACE_IRIDESCENCE) != 0u && s.iridescence > 0.0;
+  let lightmapped = (s.lobes & SURFACE_LIGHTMAP) != 0u && s.has_lightmap > 0.5;
+  if (!coating && !sheening && !brushing && !transmitting && !iridescent && !lightmapped && s.occlusion >= 1.0) {
     // The base lobe alone, written as one expression: the very arithmetic
     // `surface_ambient` always had, to the bit.
     return diffuse * ambient_light(s.world, s.normal)
       + sky_reflection_lobe(s.world, s.normal, s.view, dot(s.normal, s.view), s.roughness, s.f0, s.f90);
   }
-  var irradiance = ambient_light(s.world, s.normal);
+  var irradiance = select(ambient_light(s.world, s.normal), s.lightmap_irradiance, lightmapped);
   var lookup = s.normal;
   if (brushing) {
     lookup = lobe_bent_normal(s.normal, s.tangent, s.bitangent, s.view, s.roughness, clamp(s.anisotropy, -1.0, 1.0));
   }
-  var reflection = sky_reflection_lobe(s.world, lookup, s.view, dot(s.normal, s.view), s.roughness, s.f0, s.f90);
+  var eff_f0 = s.f0;
+  if (iridescent) {
+    let irid_f = lobe_iridescence_fresnel(1.0, max(s.iridescence_ior, 1.0001), nv, max(s.iridescence_thickness, 0.0), s.f0);
+    eff_f0 = mix(eff_f0, irid_f, clamp(s.iridescence, 0.0, 1.0));
+  }
+  var reflection = sky_reflection_lobe(s.world, lookup, s.view, dot(s.normal, s.view), s.roughness, eff_f0, s.f90);
   if (s.occlusion < 1.0) {
     irradiance *= s.occlusion;
     reflection *= specular_occlusion(nv, s.occlusion, s.roughness);
@@ -109,13 +116,14 @@ fn clustered_lobes(s: StandardSurface) -> LightResponse {
   return sum;
 }
 
-// The light a standard surface sends the eye from the sky and the frame's
-// point and spot lights (not the sun: `standard_sun`).
+// The light a standard surface sends the eye from the sky, the frame's
+// point/spot lights, and LTC area lights (not the sun: `standard_sun`).
 fn standard_surface(s: StandardSurface) -> vec3f {
   var light = surface_sky(s);
   let local = clustered_lobes(s);
   light += local.diffuse * s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0));
   light += local.specular;
+  light += clustered_area_lights(s.world, s.normal, s.view, s.base_color, s.metallic, s.f0, s.roughness);
   return light;
 }
 

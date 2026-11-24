@@ -371,6 +371,9 @@ struct ClusterLight {
 @group(2) @binding(4) var local_shadows: texture_depth_2d_array;
 @group(2) @binding(5) var local_shadow_sampler: sampler_comparison;
 @group(2) @binding(6) var<storage, read> local_shadow_faces: array<mat4x4f>;
+// Packed LTC area lights (up to 64 lights * 5 vec4f at offset 0) followed by
+// 64x64 LTC inverse-M matrix LUT (offset 320) and 64x64 LTC amplitude LUT (offset 4416).
+@group(2) @binding(7) var<storage, read> area_light_data: array<vec4f>;
 
 // Eight points of a Poisson disk of radius 1.
 var<private> local_shadow_taps = array<vec2f, 8>(
@@ -520,6 +523,253 @@ fn cluster_light_sample(light: ClusterLight, world: vec3f, normal: vec3f, behind
   taken.way = way;
   taken.radiance = light.color.rgb * strength * local_shadow(light, world, normal, way, distance);
   return taken;
+}
+
+// ---- Linearly Transformed Cosines (LTC) Area Lights via @group(2) @binding(7).
+const AREA_MAX_LIGHTS: u32 = 64u;
+const AREA_MAT_OFFSET: u32 = 320u;
+const AREA_AMP_OFFSET: u32 = 4416u;
+const AREA_PI: f32 = 3.14159265359;
+const AREA_OCTAGON_SCALE: f32 = 1.0539073;
+
+fn area_sample_lut(base_offset: u32, rough: f32, q: f32) -> vec4f {
+  let fx = clamp(rough, 0.0, 1.0) * 63.0;
+  let fy = clamp(q, 0.0, 1.0) * 63.0;
+  let x0 = min(u32(floor(fx)), 62u);
+  let y0 = min(u32(floor(fy)), 62u);
+  let tx = fx - f32(x0);
+  let ty = fy - f32(y0);
+  let i00 = base_offset + y0 * 64u + x0;
+  let i10 = i00 + 1u;
+  let i01 = i00 + 64u;
+  let i11 = i01 + 1u;
+  let row0 = mix(area_light_data[i00], area_light_data[i10], tx);
+  let row1 = mix(area_light_data[i01], area_light_data[i11], tx);
+  return mix(row0, row1, ty);
+}
+
+fn area_integrate_edge(v1: vec3f, v2: vec3f) -> vec3f {
+  let c = cross(v1, v2);
+  let sin_t = length(c);
+  if (sin_t <= 1e-6) {
+    return vec3f(0.0);
+  }
+  let cos_t = clamp(dot(v1, v2), -1.0, 1.0);
+  let theta = atan2(sin_t, cos_t);
+  return c * (theta / (2.0 * AREA_PI * sin_t));
+}
+
+fn area_eval_quad(p0: vec3f, p1: vec3f, p2: vec3f, p3: vec3f) -> f32 {
+  let poly = array<vec3f, 4>(p0, p1, p2, p3);
+  var clipped = array<vec3f, 5>(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
+  var out_n = 0u;
+  for (var i = 0u; i < 4u; i++) {
+    let cur = poly[i];
+    let nxt = poly[(i + 1u) % 4u];
+    let cur_in = cur.z >= 0.0;
+    let nxt_in = nxt.z >= 0.0;
+    if (cur_in && out_n < 5u) {
+      clipped[out_n] = cur;
+      out_n += 1u;
+    }
+    if (cur_in != nxt_in && out_n < 5u) {
+      let denom = cur.z - nxt.z;
+      let t = select(0.5, cur.z / denom, abs(denom) > 1e-7);
+      clipped[out_n] = mix(cur, nxt, clamp(t, 0.0, 1.0));
+      out_n += 1u;
+    }
+  }
+  if (out_n < 3u) {
+    return 0.0;
+  }
+  var dirs = array<vec3f, 5>(vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0), vec3f(0.0));
+  var valid_n = 0u;
+  for (var i = 0u; i < out_n; i++) {
+    let len2 = dot(clipped[i], clipped[i]);
+    if (len2 > 1e-10) {
+      let d = clipped[i] * inverseSqrt(len2);
+      if (valid_n == 0u || dot(d - dirs[valid_n - 1u], d - dirs[valid_n - 1u]) > 1e-10) {
+        dirs[valid_n] = d;
+        valid_n += 1u;
+      }
+    }
+  }
+  if (valid_n < 3u) {
+    return 0.0;
+  }
+  var sum = vec3f(0.0);
+  for (var i = 0u; i < valid_n; i++) {
+    sum += area_integrate_edge(dirs[i], dirs[(i + 1u) % valid_n]);
+  }
+  return clamp(abs(sum.z), 0.0, 1.0);
+}
+
+fn area_basis(n: vec3f, v: vec3f) -> mat3x3f {
+  let v_proj = v - n * dot(v, n);
+  let len2 = dot(v_proj, v_proj);
+  var t1: vec3f;
+  if (len2 > 1e-6) {
+    t1 = v_proj * inverseSqrt(len2);
+  } else {
+    let up = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(n.y) > 0.9);
+    t1 = normalize(cross(up, n));
+  }
+  let t2 = cross(n, t1);
+  return transpose(mat3x3f(t1, t2, n));
+}
+
+fn area_range_window(dist: f32, reach: f32) -> f32 {
+  if (reach <= 0.0) {
+    return 1.0;
+  }
+  if (dist >= reach) {
+    return 0.0;
+  }
+  let r = dist / reach;
+  let w = clamp(1.0 - r * r * r * r, 0.0, 1.0);
+  return w * w;
+}
+
+// Evaluates all active LTC area lights (Rect, Disk, Tube, CookieSpot) in `area_light_data`.
+// Fast-path returns zero immediately when `cluster_grid.options.y < 0.5`.
+fn clustered_area_lights(
+  world: vec3f,
+  normal: vec3f,
+  view: vec3f,
+  base_color: vec3f,
+  metallic: f32,
+  f0: vec3f,
+  roughness: f32,
+) -> vec3f {
+  let count = min(u32(max(cluster_grid.options.y, 0.0) + 0.5), AREA_MAX_LIGHTS);
+  if (count == 0u) {
+    return vec3f(0.0);
+  }
+  let n = normalize(normal);
+  let v = normalize(view);
+  let ndotv = clamp(dot(n, v), 0.0, 1.0);
+  let rough = clamp(roughness, 0.04, 1.0);
+  let q = sqrt(max(1.0 - ndotv, 0.0));
+  let t1 = area_sample_lut(AREA_MAT_OFFSET, rough, q);
+  let t2 = area_sample_lut(AREA_AMP_OFFSET, rough, q);
+  let minv = mat3x3f(
+    vec3f(t1.x, 0.0, t1.y),
+    vec3f(0.0, 1.0, 0.0),
+    vec3f(t1.z, 0.0, t1.w),
+  );
+  let basis = area_basis(n, v);
+  let spec_xf = minv * basis;
+  let diff_albedo = base_color * (1.0 - clamp(metallic, 0.0, 1.0));
+  let spec_fresnel = f0 * t2.x + (vec3f(1.0) - f0) * t2.y;
+  var total = vec3f(0.0);
+
+  for (var i = 0u; i < count; i++) {
+    let base = i * 5u;
+    let pos_kind = area_light_data[base];
+    let right_ext = area_light_data[base + 1u];
+    let up_ext = area_light_data[base + 2u];
+    let col_reach = area_light_data[base + 3u];
+    let flags = area_light_data[base + 4u];
+
+    let center = pos_kind.xyz;
+    let kind = u32(round(pos_kind.w));
+    let right_len = length(right_ext.xyz);
+    let up_len = length(up_ext.xyz);
+    if (right_len <= 1e-5 || up_len <= 1e-5) {
+      continue;
+    }
+    let right = right_ext.xyz / right_len;
+    let up = up_ext.xyz / up_len;
+    let dist_center = length(center - world);
+    let atten = area_range_window(dist_center, col_reach.w);
+    if (atten <= 0.0) {
+      continue;
+    }
+    let two_sided = flags.x > 0.5;
+    var diff_form = 0.0;
+    var spec_form = 0.0;
+
+    if (kind == 0u || kind == 1u) {
+      let emit_raw = cross(right, up);
+      let emit_len = length(emit_raw);
+      if (emit_len <= 1e-5) {
+        continue;
+      }
+      let emit_n = emit_raw / emit_len;
+      if (!two_sided && dot(emit_n, world - center) <= 0.0) {
+        continue;
+      }
+    }
+
+    if (kind == 0u) {
+      let ex = right * right_ext.w;
+      let ey = up * up_ext.w;
+      let q0 = (center - ex - ey) - world;
+      let q1 = (center + ex - ey) - world;
+      let q2 = (center + ex + ey) - world;
+      let q3 = (center - ex + ey) - world;
+      diff_form = area_eval_quad(basis * q0, basis * q1, basis * q2, basis * q3);
+      spec_form = area_eval_quad(spec_xf * q0, spec_xf * q1, spec_xf * q2, spec_xf * q3);
+    } else if (kind == 1u) {
+      let rad = max(right_ext.w, 1e-4) * AREA_OCTAGON_SCALE;
+      let d = rad * 0.70710678;
+      let c0 = center + right * rad - world;
+      let c1 = center + right * d + up * d - world;
+      let c2 = center + up * rad - world;
+      let c3 = center - right * d + up * d - world;
+      let c4 = center - right * rad - world;
+      let c5 = center - right * d - up * d - world;
+      let c6 = center - up * rad - world;
+      let c7 = center + right * d - up * d - world;
+      diff_form = area_eval_quad(basis * c0, basis * c1, basis * c2, basis * c3)
+        + area_eval_quad(basis * c4, basis * c5, basis * c6, basis * c7)
+        + area_eval_quad(basis * c0, basis * c3, basis * c4, basis * c7);
+      spec_form = area_eval_quad(spec_xf * c0, spec_xf * c1, spec_xf * c2, spec_xf * c3)
+        + area_eval_quad(spec_xf * c4, spec_xf * c5, spec_xf * c6, spec_xf * c7)
+        + area_eval_quad(spec_xf * c0, spec_xf * c3, spec_xf * c4, spec_xf * c7);
+    } else if (kind == 2u) {
+      let half_len = max(right_ext.w, 1e-4);
+      let tube_r = max(up_ext.w, 0.01);
+      let to_p = world - center;
+      let perp_raw = to_p - right * dot(to_p, right);
+      let perp_dir = select(up, normalize(perp_raw), dot(perp_raw, perp_raw) > 1e-6);
+      let side = normalize(cross(right, perp_dir));
+      let ex = right * half_len;
+      let ey = side * tube_r;
+      let q0 = (center - ex - ey) - world;
+      let q1 = (center + ex - ey) - world;
+      let q2 = (center + ex + ey) - world;
+      let q3 = (center - ex + ey) - world;
+      diff_form = area_eval_quad(basis * q0, basis * q1, basis * q2, basis * q3);
+      spec_form = area_eval_quad(spec_xf * q0, spec_xf * q1, spec_xf * q2, spec_xf * q3);
+    } else {
+      // Cookie spotlight cone projector.
+      let forward = normalize(cross(right, up));
+      let rel = world - center;
+      let lz = dot(rel, forward);
+      if (lz <= 1e-4) {
+        continue;
+      }
+      let tan_fov = max(flags.w, 0.05);
+      let aspect = max(up_ext.w, 0.1);
+      let u = 0.5 + dot(rel, right) / (2.0 * lz * tan_fov * aspect);
+      let v_coord = 0.5 - dot(rel, up) / (2.0 * lz * tan_fov);
+      if (u < 0.0 || u > 1.0 || v_coord < 0.0 || v_coord > 1.0) {
+        continue;
+      }
+      let edge = max(flags.z, 0.005);
+      let mask = smoothstep(0.0, edge, u) * smoothstep(0.0, edge, 1.0 - u)
+        * smoothstep(0.0, edge, v_coord) * smoothstep(0.0, edge, 1.0 - v_coord);
+      let to_l = -rel / max(dist_center, 1e-4);
+      let ndl = max(dot(n, to_l), 0.0);
+      let falloff = mask / (dist_center * dist_center + 1.0);
+      diff_form = ndl * falloff;
+      spec_form = ndl * falloff;
+    }
+
+    total += (diff_albedo * diff_form + spec_fresnel * spec_form) * col_reach.rgb * atten;
+  }
+  return total;
 }
 // END lights
 // BEGIN environment
@@ -1229,6 +1479,13 @@ struct StandardSurface {
   subsurface: f32,
   subsurface_color: vec3f,
   thin: f32,
+  // Thin-film iridescence (SURFACE_IRIDESCENCE): weight, film IOR, thickness (nm).
+  iridescence: f32,
+  iridescence_ior: f32,
+  iridescence_thickness: f32,
+  // Baked lightmap diffuse irradiance (SURFACE_LIGHTMAP).
+  lightmap_irradiance: vec3f,
+  has_lightmap: f32,
 };
 
 // A surface of albedo (or metal color) `base_color`, `metallic` and
@@ -1252,6 +1509,11 @@ fn surface_default(world: vec3f, normal: vec3f, view: vec3f, base_color: vec3f, 
   s.ior = 1.5;
   s.attenuation_color = vec3f(1.0);
   s.thin = 1.0;
+  s.iridescence = 0.0;
+  s.iridescence_ior = 1.3;
+  s.iridescence_thickness = 400.0;
+  s.lightmap_irradiance = vec3f(0.0);
+  s.has_lightmap = 0.0;
   return s;
 }
 
@@ -1688,7 +1950,11 @@ fn surface_light(s: StandardSurface, way: vec3f, radiance: vec3f) -> LightRespon
     distribution = lobe_ggx_distribution(nh, a2);
     visibility = lobe_smith_visibility(nl, nv, a2);
   }
-  let fresnel = lobe_schlick(s.f0, s.f90, vh);
+  var fresnel = lobe_schlick(s.f0, s.f90, vh);
+  if ((s.lobes & SURFACE_IRIDESCENCE) != 0u && s.iridescence > 0.0) {
+    let irid_f = lobe_iridescence_fresnel(1.0, max(s.iridescence_ior, 1.0001), vh, max(s.iridescence_thickness, 0.0), s.f0);
+    fresnel = mix(fresnel, irid_f, clamp(s.iridescence, 0.0, 1.0));
+  }
   var specular = radiance * (fresnel * (distribution * visibility * nl * 3.14159265359));
   // The layers over the base lobes take their share of the light, and add theirs.
   var layers = 1.0;
@@ -1776,6 +2042,121 @@ fn surface_apply_orm(s: StandardSurface, orm: vec4f, enabled: f32) -> StandardSu
   }
   return out;
 }
+
+// ---- Thin-film iridescence (KHR_materials_iridescence), baked lightmaps & chromatic dispersion.
+const SURFACE_IRIDESCENCE: u32 = 64u;
+const SURFACE_LIGHTMAP: u32 = 128u;
+
+fn lobe_iridescence_xyz_to_srgb(xyz: vec3f) -> vec3f {
+  let m = mat3x3f(
+    vec3f( 3.2404542, -0.9692660,  0.0556434),
+    vec3f(-1.5371385,  1.8760108, -0.2040259),
+    vec3f(-0.4985314,  0.0415560,  1.0572252)
+  );
+  return max(m * xyz, vec3f(0.0));
+}
+
+// Belcour & Barla (2017) analytical Airy thin-film interference reflectance (`KHR_materials_iridescence`).
+fn lobe_iridescence_fresnel(outside_ior: f32, film_ior: f32, cos_theta1: f32, thickness_nm: f32, base_f0: vec3f) -> vec3f {
+  let sin2_t2 = (outside_ior / max(film_ior, 1.0001)) * (outside_ior / max(film_ior, 1.0001))
+    * max(1.0 - cos_theta1 * cos_theta1, 0.0);
+  if (sin2_t2 >= 1.0) {
+    return vec3f(1.0);
+  }
+  let cos_t2 = sqrt(1.0 - sin2_t2);
+  let r0_12 = ((film_ior - outside_ior) / (film_ior + outside_ior));
+  let r12 = r0_12 * r0_12 + (1.0 - r0_12 * r0_12) * pow(1.0 - cos_theta1, 5.0);
+  let base_ior = (1.0 + sqrt(clamp(base_f0, vec3f(0.0), vec3f(0.999)))) / max(1.0 - sqrt(clamp(base_f0, vec3f(0.0), vec3f(0.999))), vec3f(0.001));
+  let r0_23 = (base_ior - vec3f(film_ior)) / (base_ior + vec3f(film_ior));
+  let r23 = r0_23 * r0_23 + (vec3f(1.0) - r0_23 * r0_23) * pow(1.0 - cos_t2, 5.0);
+  let opd = 2.0 * film_ior * thickness_nm * cos_t2;
+  let phi = 2.0 * 3.14159265359 * opd / vec3f(650.0, 510.0, 475.0);
+  let r123 = clamp(sqrt(vec3f(r12) * r23), vec3f(0.0), vec3f(0.999));
+  let num = vec3f(r12) + r23 + 2.0 * r123 * cos(phi);
+  let den = vec3f(1.0) + vec3f(r12) * r23 + 2.0 * r123 * cos(phi);
+  return clamp(num / max(den, vec3f(0.0001)), vec3f(0.0), vec3f(1.0));
+}
+
+// Per-channel IOR spread for `KHR_materials_dispersion` (`dispersion = 20 / abbe_number`).
+fn lobe_dispersion_iors(ior: f32, dispersion: f32) -> vec3f {
+  let half_spread = (ior - 1.0) * 0.052356 * max(dispersion, 0.0);
+  return vec3f(max(ior - half_spread, 1.0), ior, ior + half_spread);
+}
+
+// Samples a tile from the 4x3 SurfaceMapAtlas bound at @group(1) @binding(4) when `settings.w == 5.0`.
+fn surface_atlas_tile_uv(tile: u32, uv: vec2f, atlas_dims: vec2f, clamp_uv: bool) -> vec2f {
+  let col = f32(tile % 4u);
+  let row = f32(tile / 4u);
+  let cell = atlas_dims / vec2f(4.0, 3.0);
+  let wrapped = select(fract(uv), clamp(uv, vec2f(0.0), vec2f(1.0)), clamp_uv);
+  let inner = cell - vec2f(2.0);
+  return (vec2f(col, row) * cell + vec2f(1.0) + wrapped * inner) / atlas_dims;
+}
+
+fn surface_read_atlas(atlas: texture_2d<f32>, samp: sampler, tile: u32, uv: vec2f, clamp_uv: bool) -> vec4f {
+  let dims = vec2f(textureDimensions(atlas, 0));
+  return textureSampleLevel(atlas, samp, surface_atlas_tile_uv(tile, uv, dims, clamp_uv), 0.0);
+}
+
+// Applies enabled tiles from the GPU-packed 4x3 SurfaceMapAtlas (@group(1) @binding(4))
+// onto `s` when `atlas_mode > 4.5` (`draw.settings.w == 5.0`). `tile_mask` is the bitmask
+// of populated `SurfaceTile` slots (bit `1u << tile`).
+fn surface_apply_atlas(
+  s: StandardSurface,
+  atlas: texture_2d<f32>,
+  samp: sampler,
+  uv: vec2f,
+  uv1: vec2f,
+  atlas_mode: f32,
+  tile_mask: u32,
+) -> StandardSurface {
+  var out = s;
+  if (atlas_mode <= 4.5 || tile_mask == 0u) {
+    return out;
+  }
+  if ((tile_mask & 1u) != 0u) {
+    let orm = surface_read_atlas(atlas, samp, 0u, uv, false);
+    out = surface_apply_orm(out, orm, 1.0);
+    out.f0 = mix(vec3f(0.04), out.base_color, clamp(out.metallic, 0.0, 1.0));
+  }
+  if ((tile_mask & 8u) != 0u) {
+    let cc = surface_read_atlas(atlas, samp, 3u, uv, false);
+    out.lobes |= SURFACE_COAT;
+    out.coat = clamp(out.coat * cc.r, 0.0, 1.0);
+    out.coat_roughness = clamp(out.coat_roughness * cc.g, 0.04, 1.0);
+  }
+  if ((tile_mask & 32u) != 0u) {
+    let sh = surface_read_atlas(atlas, samp, 5u, uv, false);
+    out.lobes |= SURFACE_SHEEN;
+    out.sheen_color *= sh.rgb;
+    out.sheen_roughness = clamp(out.sheen_roughness * sh.a, 0.07, 1.0);
+  }
+  if ((tile_mask & 128u) != 0u) {
+    let tr = surface_read_atlas(atlas, samp, 7u, uv, false);
+    out.lobes |= SURFACE_TRANSMISSION;
+    out.transmission = clamp(out.transmission * tr.r, 0.0, 1.0);
+    out.thickness *= tr.g;
+  }
+  if ((tile_mask & 256u) != 0u) {
+    let sp = surface_read_atlas(atlas, samp, 8u, uv, false);
+    let dielectric = min(lobe_ior_f0(out.ior) * sp.rgb, vec3f(1.0)) * sp.a;
+    out.f0 = mix(dielectric, out.base_color, clamp(out.metallic, 0.0, 1.0));
+    out.f90 = mix(sp.a, 1.0, clamp(out.metallic, 0.0, 1.0));
+  }
+  if ((tile_mask & 512u) != 0u) {
+    let ir = surface_read_atlas(atlas, samp, 9u, uv, false);
+    out.lobes |= SURFACE_IRIDESCENCE;
+    out.iridescence = clamp(ir.r, 0.0, 1.0);
+    out.iridescence_thickness = mix(100.0, 600.0, clamp(ir.g, 0.0, 1.0));
+  }
+  if ((tile_mask & 1024u) != 0u) {
+    let lm = surface_read_atlas(atlas, samp, 10u, uv1, true);
+    out.lobes |= SURFACE_LIGHTMAP;
+    out.lightmap_irradiance = lm.rgb;
+    out.has_lightmap = 1.0;
+  }
+  return out;
+}
 // END surface_lobes
 // BEGIN surface
 // A standard surface lit by the sky and the frame's lights: `standard_surface`
@@ -1823,18 +2204,25 @@ fn surface_sky(s: StandardSurface) -> vec3f {
   let sheening = (s.lobes & SURFACE_SHEEN) != 0u && dot(s.sheen_color, s.sheen_color) > 0.0;
   let brushing = (s.lobes & SURFACE_ANISOTROPY) != 0u && s.anisotropy != 0.0;
   let transmitting = (s.lobes & SURFACE_TRANSMISSION) != 0u && s.transmission > 0.0;
-  if (!coating && !sheening && !brushing && !transmitting && s.occlusion >= 1.0) {
+  let iridescent = (s.lobes & SURFACE_IRIDESCENCE) != 0u && s.iridescence > 0.0;
+  let lightmapped = (s.lobes & SURFACE_LIGHTMAP) != 0u && s.has_lightmap > 0.5;
+  if (!coating && !sheening && !brushing && !transmitting && !iridescent && !lightmapped && s.occlusion >= 1.0) {
     // The base lobe alone, written as one expression: the very arithmetic
     // `surface_ambient` always had, to the bit.
     return diffuse * ambient_light(s.world, s.normal)
       + sky_reflection_lobe(s.world, s.normal, s.view, dot(s.normal, s.view), s.roughness, s.f0, s.f90);
   }
-  var irradiance = ambient_light(s.world, s.normal);
+  var irradiance = select(ambient_light(s.world, s.normal), s.lightmap_irradiance, lightmapped);
   var lookup = s.normal;
   if (brushing) {
     lookup = lobe_bent_normal(s.normal, s.tangent, s.bitangent, s.view, s.roughness, clamp(s.anisotropy, -1.0, 1.0));
   }
-  var reflection = sky_reflection_lobe(s.world, lookup, s.view, dot(s.normal, s.view), s.roughness, s.f0, s.f90);
+  var eff_f0 = s.f0;
+  if (iridescent) {
+    let irid_f = lobe_iridescence_fresnel(1.0, max(s.iridescence_ior, 1.0001), nv, max(s.iridescence_thickness, 0.0), s.f0);
+    eff_f0 = mix(eff_f0, irid_f, clamp(s.iridescence, 0.0, 1.0));
+  }
+  var reflection = sky_reflection_lobe(s.world, lookup, s.view, dot(s.normal, s.view), s.roughness, eff_f0, s.f90);
   if (s.occlusion < 1.0) {
     irradiance *= s.occlusion;
     reflection *= specular_occlusion(nv, s.occlusion, s.roughness);
@@ -1889,13 +2277,14 @@ fn clustered_lobes(s: StandardSurface) -> LightResponse {
   return sum;
 }
 
-// The light a standard surface sends the eye from the sky and the frame's
-// point and spot lights (not the sun: `standard_sun`).
+// The light a standard surface sends the eye from the sky, the frame's
+// point/spot lights, and LTC area lights (not the sun: `standard_sun`).
 fn standard_surface(s: StandardSurface) -> vec3f {
   var light = surface_sky(s);
   let local = clustered_lobes(s);
   light += local.diffuse * s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0));
   light += local.specular;
+  light += clustered_area_lights(s.world, s.normal, s.view, s.base_color, s.metallic, s.f0, s.roughness);
   return light;
 }
 

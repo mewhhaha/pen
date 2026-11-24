@@ -16,6 +16,7 @@ mod saves;
 mod screen;
 mod services;
 mod tools;
+mod video;
 
 use anyhow::Result;
 use js_sys::Uint8Array;

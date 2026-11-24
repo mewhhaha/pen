@@ -108,6 +108,7 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
     }
     for d in &frame.pbr_decals {
         validate_matrix(&d.transform)?;
+        determinant_of(&d.transform)?;
         ensure!(
             [d.albedo.r, d.albedo.g, d.albedo.b, d.albedo.a, d.normal_strength, d.roughness, d.metallic, d.emissive_strength, d.fade]
                 .iter()
@@ -121,6 +122,12 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
         ensure!(
             [c.viewport_x, c.viewport_y, c.viewport_w, c.viewport_h].iter().all(|v| v.is_finite()),
             "camera target viewport must be finite"
+        );
+    }
+    for v in &frame.video_streams {
+        ensure!(
+            v.time.is_finite() && v.time >= 0.0 && v.speed.is_finite() && v.speed >= 0.0,
+            "video stream time and speed must be finite and non-negative"
         );
     }
     ensure!(

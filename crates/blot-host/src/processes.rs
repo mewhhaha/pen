@@ -228,6 +228,7 @@ impl Child {
     }
 }
 
+#[allow(clippy::large_enum_variant, reason = "short-lived scheduler wave ring avoids per-child boxing")]
 enum RingSlot {
     Present(Child),
     InWave(usize), // index into wave_tasks

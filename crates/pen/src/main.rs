@@ -2854,7 +2854,7 @@ fn import_gltf(args: &Args) -> Result<()> {
     gltf::import(Path::new(&args.operands[0]), &out, &options)
 }
 
-/// `pen import-scene FILE`: full glTF scene/prefab import into assets + `.pen-scene.json`.
+/// `pen import-scene FILE`: full glTF scene/prefab import into assets + `.scene.json`.
 #[cfg(feature = "compiler")]
 fn import_gltf_scene(args: &Args) -> Result<()> {
     let options = pen_gltf::SceneImportOptions {

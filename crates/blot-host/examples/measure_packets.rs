@@ -22,15 +22,15 @@ fn main() -> Result<()> {
     ensure!(!cases.is_empty() && measured > 0, "expected cases and measurements");
     let start = Instant::now();
     let engine = blot_host::engine()?;
-    let engine_ns = start.elapsed().as_nanos() as u64;
+    let engine_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let start = Instant::now();
     let compiled = engine.precompile_module(&bytes)?;
-    let compile_ns = start.elapsed().as_nanos() as u64;
+    let compile_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     std::fs::write(&args[2], &compiled)?;
     let start = Instant::now();
     // SAFETY: these bytes were compiled above using this exact engine.
     let module = unsafe { Module::deserialize(&engine, &compiled)? };
-    let load_ns = start.elapsed().as_nanos() as u64;
+    let load_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let start = Instant::now();
     let mut store = Store::new(&engine, ());
     let instance = Instance::new(&mut store, &module, &[])?;
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     let alloc = instance.get_typed_func::<u32, u32>(&mut store, "blot:allocate")?;
     let solve = instance.get_typed_func::<u32, u32>(&mut store, "solve")?;
     let finish = instance.get_typed_func::<(), u32>(&mut store, "blot:finish_invocation")?;
-    let instantiate_ns = start.elapsed().as_nanos() as u64;
+    let instantiate_ns = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let mut records = Vec::new();
     for (index, case) in cases.iter().enumerate() {
         let words = u32::try_from(case.input.len())?;
@@ -60,7 +60,7 @@ fn main() -> Result<()> {
                     let mut reply = [0; 12];
                     memory.read(&store, out as usize, &mut reply)?;
                     let values: Vec<_> =
-                        reply.chunks_exact(4).map(|v| u32::from_le_bytes(v.try_into().unwrap())).collect();
+                        reply.as_chunks::<4>().0.iter().map(|&v| u32::from_le_bytes(v)).collect();
                     ensure!(
                         values == [2, expected[0], expected[1]],
                         "case {index} got {values:?}, wanted {expected:?}"
@@ -77,9 +77,9 @@ fn main() -> Result<()> {
                 records.push(json!([
                     index,
                     repeat,
-                    (prepared - start).as_nanos() as u64,
-                    (solved - prepared).as_nanos() as u64,
-                    (end - solved).as_nanos() as u64
+                    u64::try_from((prepared - start).as_nanos()).unwrap_or(u64::MAX),
+                    u64::try_from((solved - prepared).as_nanos()).unwrap_or(u64::MAX),
+                    u64::try_from((end - solved).as_nanos()).unwrap_or(u64::MAX)
                 ]));
             }
         }

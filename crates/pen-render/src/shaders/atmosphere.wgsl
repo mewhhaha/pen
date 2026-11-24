@@ -5,9 +5,54 @@
 @group(0) @binding(4) var occlusion_sampler: sampler;
 @group(0) @binding(5) var<uniform> volume: Volume;
 @group(0) @binding(6) var volume_integrated: texture_3d<f32>;
+@group(0) @binding(7) var physical_sky_lut: texture_2d<f32>;
+@group(0) @binding(8) var physical_clouds: texture_2d<f32>;
 ${fullscreen}
 ${common}
 ${volume}
+
+// Samples the Hillaire 2020 physical sky-view LUT (with solar disk) and optionally
+// composites the raymarched volumetric cloud buffer (`cloud.rgb + sky * cloud.a`).
+fn physical_sky_background(direction: vec3f, screen_uv: vec2f, with_clouds: bool) -> vec3f {
+  let rb = 6360.0;
+  let r = rb + 0.2;
+  let pi = 3.14159265359;
+  let d = normalize(direction);
+  let sun_raw = atmosphere.sun.xyz;
+  let sun_len = length(sun_raw);
+  let sun_dir = select(vec3f(0.0, 0.85, -0.5268), sun_raw / sun_len, sun_len > 1e-5);
+
+  let horizon_angle = -acos(clamp(rb / r, 0.0, 1.0));
+  let lat = asin(clamp(d.y, -1.0, 1.0));
+  var v = 0.5;
+  if (lat < horizon_angle) {
+    let span = max(horizon_angle + 0.5 * pi, 1e-4);
+    v = 0.5 * (1.0 - sqrt(clamp((horizon_angle - lat) / span, 0.0, 1.0)));
+  } else {
+    let span = max(0.5 * pi - horizon_angle, 1e-4);
+    v = 0.5 * (1.0 + sqrt(clamp((lat - horizon_angle) / span, 0.0, 1.0)));
+  }
+  let sun_xz = vec2f(sun_dir.x, sun_dir.z);
+  let sun_xz_len = length(sun_xz);
+  let fwd = select(vec2f(0.0, -1.0), sun_xz / sun_xz_len, sun_xz_len > 1e-5);
+  let right = vec2f(-fwd.y, fwd.x);
+  let az = atan2(dot(d.xz, right), dot(d.xz, fwd));
+  let uv = vec2f(fract(az / (2.0 * pi) + 0.5), clamp(v, 0.0, 1.0));
+
+  let dims = max(vec2f(textureDimensions(physical_sky_lut, 0)), vec2f(2.0));
+  let safe_uv = clamp(uv * ((dims - 1.0) / dims) + 0.5 / dims, vec2f(0.0), vec2f(1.0));
+  var col = textureSampleLevel(physical_sky_lut, occlusion_sampler, safe_uv, 0.0).rgb;
+
+  let toward = max(dot(d, sun_dir), 0.0);
+  let above = smoothstep(-0.02, 0.02, d.y);
+  col += atmosphere.sun_color.rgb * 4.0 * smoothstep(0.99945, 0.9997, toward) * above;
+
+  if (with_clouds) {
+    let c = textureSampleLevel(physical_clouds, occlusion_sampler, clamp(screen_uv, vec2f(0.0), vec2f(1.0)), 0.0);
+    col = c.rgb + col * clamp(c.a, 0.0, 1.0);
+  }
+  return col;
+}
 
 // The ambient occlusion here, blurred over the 4 x 4 pixels its noise repeats
 // in: four filtered reads, each averaging 2 x 2.
@@ -58,8 +103,13 @@ fn mist_light(direction: vec3f, point: vec3f) -> vec3f {
   let color = scene.rgb - empty * atmosphere.clear.rgb;
   let camera = atmosphere.camera.xyz;
   let direction = normalize(unproject(position.xy, 0.5) - camera);
-  let with_sky = atmosphere.camera.w > 0.5;
-  let background = select(atmosphere.clear.rgb, sky(direction, true), with_sky);
+  let sky_mode = atmosphere.camera.w;
+  var background = atmosphere.clear.rgb;
+  if (sky_mode > 1.5) {
+    background = physical_sky_background(direction, position.xy / atmosphere.size.xy, sky_mode > 2.5);
+  } else if (sky_mode > 0.5) {
+    background = sky(direction, true);
+  }
   if (empty > 0.999) {
     return vec4f(color + empty * background, 1.0);
   }

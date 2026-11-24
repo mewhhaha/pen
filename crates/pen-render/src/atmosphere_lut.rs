@@ -165,6 +165,7 @@ pub struct PhysicalAtmosphere {
     cloud_pipe: wgpu::ComputePipeline,
     cloud_uniform: wgpu::Buffer,
     cloud_tex: Option<(u32, u32, wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
+    cloud_serial: u64,
 }
 
 impl PhysicalAtmosphere {
@@ -368,6 +369,7 @@ impl PhysicalAtmosphere {
             cloud_pipe,
             cloud_uniform,
             cloud_tex: None,
+            cloud_serial: 0,
         }
     }
 
@@ -394,6 +396,46 @@ impl PhysicalAtmosphere {
     }
     pub fn cloud_view(&self) -> Option<&wgpu::TextureView> {
         self.cloud_tex.as_ref().map(|t| &t.3)
+    }
+    pub fn cloud_serial(&self) -> u64 {
+        self.cloud_serial
+    }
+
+    /// Ensures the volumetric cloud target exists at `(width, height)`, bumping `cloud_serial`
+    /// whenever the texture is freshly allocated or resized.
+    pub fn ensure_clouds(&mut self, device: &wgpu::Device, (width, height): (u32, u32)) -> Result<u64> {
+        let max_dim = device.limits().max_texture_dimension_2d.min(2048);
+        ensure!(
+            width >= 1 && height >= 1 && width <= max_dim && height <= max_dim,
+            "invalid cloud size {width}x{height} (max {max_dim})"
+        );
+        let need_alloc = !matches!(&self.cloud_tex, Some((w, h, _, _, _)) if *w == width && *h == height);
+        if need_alloc {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("volumetric_clouds"),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::STORAGE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("clouds_bg"),
+                layout: &self.cloud_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.cloud_uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                ],
+            });
+            self.cloud_tex = Some((width, height, tex, view, bg));
+            self.cloud_serial += 1;
+        }
+        Ok(self.cloud_serial)
     }
 
     /// Dispatches Transmittance -> Multi-Scattering -> Sky-View LUT updates in command order into `encoder`.
@@ -471,35 +513,9 @@ impl PhysicalAtmosphere {
         camera_pos_km: [f32; 3],
         (width, height): (u32, u32),
     ) -> Result<()> {
-        let max_dim = device.limits().max_texture_dimension_2d.min(2048);
-        ensure!(width >= 1 && height >= 1 && width <= max_dim && height <= max_dim, "invalid cloud size {width}x{height} (max {max_dim})");
+        self.ensure_clouds(device, (width, height))?;
         ensure!(inverse_view_projection.iter().all(|v| v.is_finite()), "non-finite inverse_view_projection");
         ensure!(camera_pos_km.iter().all(|v| v.is_finite()), "non-finite camera_pos_km");
-        let need_alloc = !matches!(&self.cloud_tex, Some((w, h, _, _, _)) if *w == width && *h == height);
-        if need_alloc {
-            let tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("volumetric_clouds"),
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::STORAGE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("clouds_bg"),
-                layout: &self.cloud_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.cloud_uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
-                ],
-            });
-            self.cloud_tex = Some((width, height, tex, view, bg));
-        }
         let sun = normalize3(params.sun_direction);
         let bottom = finite_or(params.cloud_bottom_km, 1.5).max(0.1);
         let top = finite_or(params.cloud_top_km, bottom + 2.5).max(bottom + 0.2);

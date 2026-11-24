@@ -1484,7 +1484,7 @@ impl WasmtimeGuest {
             Some(finish) => {
                 self.last_reclaimed_owners = None;
                 finish.call(&mut self.store, ()).map(|released| {
-                    self.last_reclaimed_owners = Some(released as u32);
+                    self.last_reclaimed_owners = Some(released.cast_unsigned());
                 })
             }
             None => Ok(()),

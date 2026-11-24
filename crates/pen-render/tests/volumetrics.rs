@@ -1243,3 +1243,32 @@ fn a_point_light_glows_in_the_mist_and_is_cut_by_what_stands_before_it() {
     let corner = window(0, size - 80, 80);
     assert!(near_light > 4.0 * corner.max(1.0), "the glow falls off with distance: {near_light} against {corner}");
 }
+
+/// What the volume costs the GPU, at each tier (`cargo test --release -- --ignored --nocapture
+/// the_volumes_gpu_time`): the injection and the integration of the hazy room, in milliseconds.
+#[test]
+#[ignore = "a measurement, not a witness"]
+fn the_volumes_gpu_time_by_tier() {
+    let Some(mut rig) = Rig::new("cost", 512) else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    rig.renderer.time_passes(true);
+    let view = camera([12.0, 3.0, 14.0], [-4.0, 3.5, -2.0], 1.0, 0.55);
+    for (tier, name) in [(0u32, "off"), (1, "low"), (2, "high")] {
+        let frame = room_frame(&view, tier, 0.045);
+        let mut best = 0.0f32;
+        let mut total = 0.0;
+        for index in 0..60 {
+            rig.draw(&frame);
+            if index >= 30 {
+                if let Some(gpu) = rig.renderer.stats().gpu {
+                    best = best.max(gpu.volume);
+                    total = gpu.total;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        eprintln!("{name}: volume {best:.3} ms (largest of 30 frames) in a {total:.3} ms frame");
+    }
+}

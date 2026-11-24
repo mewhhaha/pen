@@ -19,6 +19,8 @@ pub(crate) enum Span {
     Shadow,
     /// Instances culled on the GPU.
     Culling,
+    /// The mist's froxel volume: its injection and its integration.
+    Volume,
     /// The scene's passes: opaque surfaces, decals, translucent ones and overlays.
     Scene,
     /// The passes after the scene: occlusion, sky and fog, bloom, present.
@@ -198,6 +200,7 @@ fn times(spans: &[Span], ticks: &[u64], period: f64) -> GpuTimes {
         match span {
             Span::Shadow => times.shadow += taken,
             Span::Culling => times.culling += taken,
+            Span::Volume => times.volume += taken,
             Span::Scene => times.scene += taken,
             Span::Post => times.post += taken,
             Span::Overlay => times.overlay += taken,
@@ -223,6 +226,7 @@ mod tests {
         assert_eq!(times.post, 1.0);
         assert_eq!(times.overlay, 0.0);
         assert_eq!(times.culling, 0.0);
+        assert_eq!(times.volume, 0.0);
         assert_eq!(times.total, 4.0);
     }
 }

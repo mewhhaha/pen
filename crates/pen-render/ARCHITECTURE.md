@@ -495,6 +495,10 @@ unmisted. Translucent surfaces and particles are still misted with everything
 else by what lies behind them (the pass sees one picture, and a translucent
 surface writes no depth): see the limits below.
 
+Cost (an RTX 4080 SUPER, the hazy room of `tests/volumetrics.rs`, the injection and the integration
+together, `GpuTimes::volume`): 0.03 ms at low, 0.18 ms at high with the 16-tap sun filter; the off tier
+runs no pass at all.
+
 Limits: a perspective camera only; the sun and the lights are those the
 scene's own maps hold (a light's shadow only while it holds a face); no
 multiple scattering; local volumes do not take the noise; translucents are

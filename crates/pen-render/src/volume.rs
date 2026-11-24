@@ -504,14 +504,22 @@ impl Volumetrics {
 
     /// Fills and integrates the grid, if this frame draws it: after the shadow
     /// maps and the lights it reads are drawn, before the scene.
-    pub fn encode(&mut self, encoder: &mut wgpu::CommandEncoder, scene: &wgpu::BindGroup, lights: &wgpu::BindGroup) {
+    pub fn encode(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        timer: &crate::renderer::GpuTimer,
+        scene: &wgpu::BindGroup,
+        lights: &wgpu::BindGroup,
+    ) {
         if !self.drawing {
             return;
         }
         let (Some(grid), Some(pipelines)) = (&self.grid, &self.pipelines) else { return };
         let tier = grid.tier;
-        let mut pass =
-            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("volume"), ..Default::default() });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("volume"),
+            timestamp_writes: timer.compute(crate::renderer::Span::Volume),
+        });
         pass.set_pipeline(&pipelines.inject);
         pass.set_bind_group(0, scene, &[]);
         pass.set_bind_group(1, &grid.inject[self.turn], &[]);
@@ -521,7 +529,7 @@ impl Volumetrics {
         drop(pass);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("volume integration"),
-            ..Default::default()
+            timestamp_writes: timer.compute(crate::renderer::Span::Volume),
         });
         pass.set_pipeline(&pipelines.integrate);
         pass.set_bind_group(0, &grid.integrate[self.turn], &[]);

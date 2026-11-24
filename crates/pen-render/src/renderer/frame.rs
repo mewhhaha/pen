@@ -415,7 +415,12 @@ impl State {
         }
         self.environment.commit_reflections(&self.queue, frame, self.capture.as_ref(), capture.is_some());
         // The mist's froxels, once the shadow maps and the lights they read are drawn.
-        self.volumetrics.encode(&mut encoder, &self.scene_group.as_ref().unwrap().0, self.clusters.group());
+        self.volumetrics.encode(
+            &mut encoder,
+            &self.timer,
+            &self.scene_group.as_ref().unwrap().0,
+            self.clusters.group(),
+        );
         let (volume_froxels, volume_history) = self.volumetrics.stats();
         stats.volume_froxels = volume_froxels;
         stats.volume_history = volume_history;

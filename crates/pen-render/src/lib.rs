@@ -144,12 +144,14 @@ pub struct RenderStats {
 }
 
 /// How long the GPU took over a frame's passes, in milliseconds: the shadow
-/// maps, culling instances, the scene, the passes after it, and sprites and
-/// insets; and the whole frame, from its first pass's start to its last's end.
+/// maps, culling instances, the mist's froxel volume, the scene, the passes after
+/// it, and sprites and insets; and the whole frame, from its first pass's start
+/// to its last's end.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GpuTimes {
     pub shadow: f32,
     pub culling: f32,
+    pub volume: f32,
     pub scene: f32,
     pub post: f32,
     pub overlay: f32,

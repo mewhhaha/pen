@@ -6,9 +6,10 @@ import * as events from "ink/events"
 import * as keys from "ink/input/keys"
 import * as math from "ink/math"
 import * as scene_graph from "ink/scene_graph"
-import { create, step, save, restore, populate_frame, build_camera } from "./game"
+import { create, step, save, restore, populate_frame, emit_ui_tree, build_camera } from "./game"
 import * as render from "ink/render"
 import * as sound from "ink/sound"
+import * as tree from "ink/ui/tree"
 
 entry const test_pick_gizmo_undo_redo = func () =>
   let w0 = create ()
@@ -69,14 +70,16 @@ entry const test_feature_toggles_and_frame_emission = func () =>
       if s.features.oit then 1.0 else 0.0,
     ],
     check.near 0.001 #[0.65] #[s.render_scale],
-    // 10 scene nodes + 15 gizmo segments = 25 draws, 2 area lights, 1 PBR decal, 1 reverb zone, 1 synth.
-    check.equal #[25.0, 2.0, 1.0, 1.0, 1.0] #[
+    // 10 scene nodes + 15 gizmo segments = 25 draws, 2 area lights, 1 PBR decal, 1 reverb zone, 1 synth, 2 outdoor env extensions.
+    check.equal #[25.0, 2.0, 1.0, 1.0, 1.0, 2.0] #[
       U32.to_f32 frame.draws.length,
       U32.to_f32 frame.area_lights.length,
       U32.to_f32 frame.pbr_decals.length,
       U32.to_f32 audio.reverb_zones.length,
       U32.to_f32 audio.synths.length,
+      U32.to_f32 frame.extensions.length,
     ],
+    check.equal #[1.0] #[if frame.sprites.length > 20 then 1.0 else 0.0],
   ]
 
 entry const test_save_and_restore_roundtrip = func () =>
@@ -87,3 +90,49 @@ entry const test_save_and_restore_roundtrip = func () =>
   let w2 = restore (&saved[0..saved.length])
   let saved2 = save w2
   return check.report #[check.equal saved saved2]
+
+entry const test_authoring_hotkeys_hud_and_scene_codec = func () =>
+  let w0 = create ()
+  let initial_len = w0.nodes.length
+  // N spawns 1 node, D duplicates it (+1), F spawns 3-node prefab (+3), Delete removes prefab (-3), Z undoes delete (+3).
+  let ev_n = #[$events.KeyDown keys.n]
+  let w1 = step w0 0.016 1280.0 720.0 (&ev_n[0..1])
+  let after_n = w1.nodes.length
+  let ev_d = #[$events.KeyDown keys.d]
+  let w2 = step w1 0.016 1280.0 720.0 (&ev_d[0..1])
+  let after_d = w2.nodes.length
+  let ev_f = #[$events.KeyDown keys.f]
+  let w3 = step w2 0.016 1280.0 720.0 (&ev_f[0..1])
+  let after_f = w3.nodes.length
+  let ev_del = #[$events.KeyDown keys.delete]
+  let w4 = step w3 0.016 1280.0 720.0 (&ev_del[0..1])
+  let after_del = w4.nodes.length
+  let ev_undo = #[$events.KeyDown keys.z]
+  let w5 = step w4 0.016 1280.0 720.0 (&ev_undo[0..1])
+  let after_undo = w5.nodes.length
+  // Clicking sidebar row 3 (y = 68 + 3*22 + 8 = 142) selects node[3] (id=4).
+  let ev_click = #[$events.PointerDown { button: 0, x: 40.0, y: 142.0 }]
+  let w6 = step w5 0.016 1280.0 720.0 (&ev_click[0..1])
+  let clicked_sel = Maybe.unwrap_or 0 w6.editor_state.selected_id
+  // Accessibility UI tree emits toolbar + list + 10 visible hierarchy items = 12 nodes.
+  let lbls: #[U32] = #[]
+  let unodes: #[tree.StoredNode] = #[]
+  let (lbls, unodes) = emit_ui_tree w6 lbls unodes
+  // Scene codec round-trip preserves exact node count and IDs.
+  let scene_lanes = editor.encode_scene (&w6.nodes[0..w6.nodes.length])
+  let dec_len = case editor.decode_scene (&scene_lanes[0..scene_lanes.length]) of
+    $Some loaded => loaded.length
+    $Nothing => 0
+  return check.report #[
+    check.equal #[10.0, 11.0, 12.0, 15.0, 12.0, 15.0, 4.0, 12.0, 15.0] #[
+      U32.to_f32 initial_len,
+      U32.to_f32 after_n,
+      U32.to_f32 after_d,
+      U32.to_f32 after_f,
+      U32.to_f32 after_del,
+      U32.to_f32 after_undo,
+      U32.to_f32 clicked_sel,
+      U32.to_f32 unodes.length,
+      U32.to_f32 dec_len,
+    ],
+  ]

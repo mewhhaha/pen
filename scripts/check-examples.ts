@@ -29,17 +29,21 @@ const generated = await new Deno.Command(
 if (!generated.success) throw Error("scaffold code generation failed");
 const paths: Record<string, string> = {};
 const testPaths: string[] = [];
+const inkLib = resolve(root, "../ink/lib");
 for (
-  const [name, project] of [[
-    "bounce",
-    resolve(root, "examples/bounce"),
-  ], ["new", scaffold]]
+  const [name, project, needsInk] of [
+    ["bounce", resolve(root, "examples/bounce"), false],
+    ["showcase", resolve(root, "examples/showcase"), true],
+    ["new", scaffold, false],
+  ] as const
 ) {
   const tests: string[] = [];
   for await (const entry of Deno.readDir(resolve(project, "tests"))) {
     if (entry.isFile && entry.name.endsWith(".blot")) tests.push(entry.name);
   }
   tests.sort();
+  const imports: Record<string, string> = { "pen/": resolve(project, "pen") + "/" };
+  if (needsInk) imports["ink/"] = inkLib + "/";
   for (const test of [...tests, null]) {
     const fixture = resolve(project, "src/test_fixture.blot");
     const compiler = await createZigProjectCompiler({
@@ -48,7 +52,7 @@ for (
       entry: test ? fixture : resolve(project, "src/main.blot"),
       prelude: resolve(blot, "std/prelude.blot"),
       stdRoot: resolve(blot, "std"),
-      imports: { "pen/": resolve(project, "pen") + "/" },
+      imports,
       nativeAssets: { roots: [resolve(project, "src")] },
       cacheDirectory: false,
     });
@@ -186,6 +190,63 @@ for (
   console.log(
     name + ": ABI8 create/frame/reject/snapshot/restore passed (" +
       rendered.length + " response lanes)",
+  );
+  guest.dispose();
+}
+
+// Verify showcase ABI 8 create/frame/scene(5)/load_scene(6)/snapshot/restore.
+{
+  const guest = await instantiateGuest(
+    await Deno.readFile(paths["showcase-main"]),
+  );
+  if (guest.abi.version !== 8) throw Error("wrong ABI " + guest.abi.version);
+  let stage = 0;
+  let savedScene: number[] = [];
+  let savedState: number[] = [];
+  const host = guest.capability({
+    parameter: "Array F32",
+    result: "Array F32",
+    call: (v: Float32Array) => {
+      const arr = [...v];
+      stage++;
+      if (stage === 1) {
+        if (arr[0] !== 4670544 || arr[1] !== 2 || arr[3] !== 1) {
+          throw Error("showcase hello bad framing: " + JSON.stringify(arr));
+        }
+        return new Float32Array([1, 1]); // Create
+      }
+      if (stage === 2) {
+        if (arr[0] !== 1) throw Error("showcase create bad op");
+        savedState = arr.slice(1);
+        return new Float32Array([1, 2, 0.016, 1280, 720, 0, 0]); // Frame
+      }
+      if (stage === 3) {
+        if (arr[0] !== 2 || arr.length < 100) throw Error("showcase frame too short");
+        return new Float32Array([1, 5]); // Scene (op 5)
+      }
+      if (stage === 4) {
+        if (arr[0] !== 5 || arr.length < 20) throw Error("showcase scene encode failed");
+        savedScene = arr.slice(1);
+        return new Float32Array([1, 6, ...savedScene]); // LoadScene (op 6)
+      }
+      if (stage === 5) {
+        if (arr[0] !== 6 || arr.length !== savedScene.length + 1) {
+          throw Error("showcase load_scene mismatch");
+        }
+        return new Float32Array([1, 4, ...savedState]); // Restore (op 4)
+      }
+      if (stage === 6) {
+        if (arr[0] !== 4) throw Error("showcase restore failed");
+        return new Float32Array([1, 0]); // Stop
+      }
+      throw Error("showcase extra step");
+    },
+  });
+  guest.call("main", host);
+  if (stage !== 6) throw Error("showcase incomplete session: " + stage);
+  console.log(
+    "showcase: ABI8 create/frame/scene/load_scene/restore passed (scene lanes=" +
+      savedScene.length + ")",
   );
   guest.dispose();
 }

@@ -16,7 +16,9 @@
     "gizmo_z.material.json",
     "gizmo_sel.material.json",
     "cookie.material.json",
-    "decal.material.json"
+    "decal.material.json",
+    "ui_panel.material.json",
+    "ui_font.material.json"
   ],
   "sounds": [
     "chime.wav"

@@ -1,0 +1,19 @@
+{
+  "size": [480, 320],
+  "fps": 60,
+  "threshold": 0.02,
+  "scenarios": {
+    "start": {
+      "about": "initial showcase courtyard with monolith, iridescent crystal, stained glass, HUD, water & foliage",
+      "script": "wait=12 shot=start"
+    },
+    "spawn_and_orbit": {
+      "about": "spawns a new node via N, duplicates via D, and orbits camera with ArrowLeft",
+      "script": "wait=4 key=KeyN wait=2 key=KeyD down=ArrowLeft wait=20 up=ArrowLeft wait=6 shot=spawn_and_orbit"
+    },
+    "play_mode": {
+      "about": "enters Play-in-Editor via P and animates the crystal and beacon via ink/sequencer",
+      "script": "wait=4 key=KeyP wait=30 shot=play_mode"
+    }
+  }
+}

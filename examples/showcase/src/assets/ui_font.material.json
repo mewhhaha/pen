@@ -1,0 +1,12 @@
+{
+  "shader": "ui.wgsl",
+  "texture": "font.png",
+  "color": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "lighting": "unlit",
+  "blend": true
+}

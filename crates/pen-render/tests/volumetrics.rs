@@ -1163,7 +1163,7 @@ fn a_hazy_room_shows_the_sun_in_shafts_past_its_pillars() {
     };
     let view = camera([12.0, 3.0, 14.0], [-4.0, 3.5, -2.0], 1.0, 0.55);
     let before = rig.settle(&room_frame(&view, 2, 0.0), 2);
-    let after = rig.settle(&room_frame(&view, 2, 0.045), 48);
+    let after = rig.settle(&room_frame(&view, 2, 0.065), 48);
     assert_eq!(rig.renderer.stats().volume_froxels, 160 * 90 * 64);
     save("volumetrics-room-before.png", &before, rig.size);
     save("volumetrics-room-after.png", &after, rig.size);

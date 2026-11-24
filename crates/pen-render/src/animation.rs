@@ -84,12 +84,34 @@ pub enum Path {
     Translation,
     Rotation,
     Scale,
+    Weights,
 }
 
 impl Path {
-    /// Values a key holds.
+    /// Values a key holds for fixed-width transform paths (0 for variable-width morph weights).
     pub fn width(self) -> usize {
-        if self == Path::Rotation { 4 } else { 3 }
+        match self {
+            Path::Rotation => 4,
+            Path::Weights => 0,
+            Path::Translation | Path::Scale => 3,
+        }
+    }
+}
+
+impl Channel {
+    /// Number of scalar lanes per sampled keyframe value (3 for translation/scale,
+    /// 4 for rotation, or the morph target count for `Path::Weights`).
+    pub fn value_width(&self) -> usize {
+        let fixed = self.path.width();
+        if fixed > 0 {
+            return fixed;
+        }
+        let factor = self.times.len() * if self.interpolation == Interpolation::Cubic { 3 } else { 1 };
+        if factor > 0 && self.values.len().is_multiple_of(factor) {
+            self.values.len() / factor
+        } else {
+            0
+        }
     }
 }
 
@@ -225,8 +247,17 @@ impl Rig {
             for channel in &clip.channels {
                 ensure!((channel.node as usize) < count, "a channel must name a skeleton node");
                 let keys = channel.times.len();
-                let per_key = channel.path.width() * if channel.interpolation == Interpolation::Cubic { 3 } else { 1 };
-                ensure!(keys > 0 && channel.values.len() == keys * per_key, "a channel needs a value for each key");
+                let width = channel.value_width();
+                ensure!(
+                    width > 0 && width <= usize::from(u16::MAX),
+                    "a channel's value width ({width}) must be in 1..={}",
+                    u16::MAX
+                );
+                let per_key = width.checked_mul(if channel.interpolation == Interpolation::Cubic { 3 } else { 1 });
+                ensure!(
+                    keys > 0 && per_key.and_then(|pk| keys.checked_mul(pk)) == Some(channel.values.len()),
+                    "a channel needs a value for each key"
+                );
                 ensure!(
                     channel.times.iter().all(|time| time.is_finite() && *time >= 0.0)
                         && channel.times.is_sorted()
@@ -292,6 +323,9 @@ impl Rig {
             0.0
         };
         for channel in &clip.channels {
+            if channel.path == Path::Weights {
+                continue;
+            }
             let node = &mut pose[channel.node as usize];
             let mut value = [0.0; 4];
             sample(channel, time, &mut value);
@@ -299,9 +333,69 @@ impl Rig {
                 Path::Translation => node.translation = [value[0], value[1], value[2]].map(narrow),
                 Path::Rotation => node.rotation = normalized(value),
                 Path::Scale => node.scale = [value[0], value[1], value[2]].map(narrow),
+                Path::Weights => {}
             }
         }
         pose
+    }
+
+    /// Samples blended morph target weights for a specific mesh `node` across
+    /// `layers` into a vector of `target_count` floats.
+    pub fn morph_weights_for_node(&self, node: u32, layers: &[Layer], target_count: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; target_count];
+        if target_count == 0 {
+            return out;
+        }
+        let active: Vec<Layer> = layers
+            .iter()
+            .copied()
+            .filter(|layer| (layer.clip as usize) < self.clips.len() && layer.weight > 0.0 && layer.weight.is_finite())
+            .collect();
+        if active.is_empty() {
+            return out;
+        }
+        let total: f64 = active.iter().map(|layer| f64::from(layer.weight)).sum();
+        let mut accum = vec![0.0f64; target_count];
+        let mut scratch = vec![0.0f64; target_count];
+        for layer in &active {
+            let clip = &self.clips[layer.clip as usize];
+            let time = if clip.duration > 0.0 && layer.time.is_finite() {
+                f64::from(layer.time).rem_euclid(f64::from(clip.duration))
+            } else {
+                0.0
+            };
+            let w = f64::from(layer.weight) / total;
+            for channel in &clip.channels {
+                if channel.path != Path::Weights || channel.node != node {
+                    continue;
+                }
+                let width = channel.value_width().min(target_count);
+                scratch[..width].fill(0.0);
+                sample(channel, time, &mut scratch[..width]);
+                for i in 0..width {
+                    accum[i] += scratch[i] * w;
+                }
+            }
+        }
+        for (dst, src) in out.iter_mut().zip(accum) {
+            *dst = narrow(src);
+        }
+        out
+    }
+
+    /// Samples blended morph target weights across `layers` for the rig's primary
+    /// morph-animated node (first node referenced by a `Path::Weights` channel).
+    pub fn morph_weights(&self, layers: &[Layer], target_count: usize) -> Vec<f32> {
+        let Some(node) = self
+            .clips
+            .iter()
+            .flat_map(|c| c.channels.iter())
+            .find(|ch| ch.path == Path::Weights)
+            .map(|ch| ch.node)
+        else {
+            return vec![0.0f32; target_count];
+        };
+        self.morph_weights_for_node(node, layers, target_count)
     }
 
     /// Each node's matrix in the mesh's space for `pose`.
@@ -359,20 +453,26 @@ fn normalized(q: [f64; 4]) -> [f32; 4] {
     q.map(|value| narrow(value / length))
 }
 
-/// The channel's value at `time` into `out` (its first `path.width()`
-/// lanes): its first key's before it, its last's after.
-fn sample(channel: &Channel, time: f64, out: &mut [f64; 4]) {
-    let width = channel.path.width();
+/// The channel's value at `time` into `out` (up to `min(channel.value_width(), out.len())`
+/// lanes): its first key's before it, its last's after. Source indexing always
+/// uses the channel's full width so narrower `out` slices read the correct lanes.
+fn sample(channel: &Channel, time: f64, out: &mut [f64]) {
+    let channel_width = channel.value_width();
+    let out_width = channel_width.min(out.len());
+    if out_width == 0 {
+        return;
+    }
     let cubic = channel.interpolation == Interpolation::Cubic;
-    let stride = if cubic { width * 3 } else { width };
+    let stride = if cubic { channel_width * 3 } else { channel_width };
     // A key's value, past a cubic key's in-tangent.
-    let value =
-        |key: usize, lane: usize| f64::from(channel.values[key * stride + if cubic { width } else { 0 } + lane]);
+    let value = |key: usize, lane: usize| {
+        f64::from(channel.values[key * stride + if cubic { channel_width } else { 0 } + lane])
+    };
     let times = &channel.times;
     let next = times.partition_point(|&key| f64::from(key) <= time);
     if next == 0 || next == times.len() {
         let key = if next == 0 { 0 } else { times.len() - 1 };
-        for (lane, slot) in out.iter_mut().enumerate().take(width) {
+        for (lane, slot) in out.iter_mut().enumerate().take(out_width) {
             *slot = value(key, lane);
         }
         return;
@@ -382,26 +482,26 @@ fn sample(channel: &Channel, time: f64, out: &mut [f64; 4]) {
     let s = if span > 0.0 { ((time - f64::from(times[key])) / span).clamp(0.0, 1.0) } else { 0.0 };
     match channel.interpolation {
         Interpolation::Step => {
-            for (lane, slot) in out.iter_mut().enumerate().take(width) {
+            for (lane, slot) in out.iter_mut().enumerate().take(out_width) {
                 *slot = value(key, lane);
             }
         }
         Interpolation::Linear if channel.path == Path::Rotation => {
             let a = [0, 1, 2, 3].map(|lane| value(key, lane));
             let b = [0, 1, 2, 3].map(|lane| value(next, lane));
-            *out = slerp(a, b, s);
+            out[..out_width].copy_from_slice(&slerp(a, b, s)[..out_width]);
         }
         Interpolation::Linear => {
-            for (lane, slot) in out.iter_mut().enumerate().take(width) {
+            for (lane, slot) in out.iter_mut().enumerate().take(out_width) {
                 *slot = value(key, lane) + (value(next, lane) - value(key, lane)) * s;
             }
         }
         Interpolation::Cubic => {
-            // Hermite, the tangents scaled by the keys' span.
+            // Hermite, the tangents scaled by the keys' span (using full channel_width).
             let (s2, s3) = (s * s, s * s * s);
-            let out_tangent = |lane: usize| f64::from(channel.values[key * stride + 2 * width + lane]);
+            let out_tangent = |lane: usize| f64::from(channel.values[key * stride + 2 * channel_width + lane]);
             let in_tangent = |lane: usize| f64::from(channel.values[next * stride + lane]);
-            for (lane, slot) in out.iter_mut().enumerate().take(width) {
+            for (lane, slot) in out.iter_mut().enumerate().take(out_width) {
                 *slot = (2.0 * s3 - 3.0 * s2 + 1.0) * value(key, lane)
                     + (s3 - 2.0 * s2 + s) * span * out_tangent(lane)
                     + (-2.0 * s3 + 3.0 * s2) * value(next, lane)
@@ -469,13 +569,15 @@ pub(crate) fn write_rig(rig: &Rig, out: &mut Vec<u8>) {
                 Path::Translation => 0,
                 Path::Rotation => 1,
                 Path::Scale => 2,
+                Path::Weights => 3,
             };
             let interpolation = match channel.interpolation {
                 Interpolation::Linear => 0,
                 Interpolation::Step => 1,
                 Interpolation::Cubic => 2,
             };
-            out.extend([path, interpolation, 0, 0]);
+            let width = u16::try_from(channel.value_width()).unwrap_or(0).to_le_bytes();
+            out.extend([path, interpolation, width[0], width[1]]);
             count(out, channel.times.len());
             floats(out, &channel.times);
             floats(out, &channel.values);
@@ -508,11 +610,12 @@ pub(crate) fn read_rig(bytes: &[u8]) -> Result<Rig> {
             let channels = (0..reader.count(usize::MAX)?)
                 .map(|_| {
                     let node = reader.u32()?;
-                    let [path, interpolation, _, _] = reader.take::<4>()?;
+                    let [path, interpolation, w_lo, w_hi] = reader.take::<4>()?;
                     let path = match path {
                         0 => Path::Translation,
                         1 => Path::Rotation,
                         2 => Path::Scale,
+                        3 => Path::Weights,
                         _ => bail!("unknown channel path in binary mesh"),
                     };
                     let interpolation = match interpolation {
@@ -522,7 +625,12 @@ pub(crate) fn read_rig(bytes: &[u8]) -> Result<Rig> {
                         _ => bail!("unknown channel interpolation in binary mesh"),
                     };
                     let keys = reader.count(usize::MAX)?;
-                    let per_key = path.width() * if interpolation == Interpolation::Cubic { 3 } else { 1 };
+                    let width = if path == Path::Weights {
+                        usize::from(u16::from_le_bytes([w_lo, w_hi]))
+                    } else {
+                        path.width()
+                    };
+                    let per_key = width * if interpolation == Interpolation::Cubic { 3 } else { 1 };
                     let times = reader.vector(keys)?;
                     let values = reader.vector(keys.saturating_mul(per_key))?;
                     Ok(Channel { node, path, interpolation, times, values })
@@ -739,5 +847,40 @@ pub(crate) mod tests {
         let mut broken = rig;
         broken.clips[0].channels[0].values.pop();
         assert!(broken.validate().is_err(), "a value short");
+    }
+
+    #[test]
+    fn morph_weight_channels_blend_and_round_trip_in_binary_rigs() {
+        let mut rig = arm();
+        // Node 0: 3-target linear morph channel; Node 1: 2-target cubic morph channel.
+        rig.clips[0].channels.push(Channel {
+            node: 0,
+            path: Path::Weights,
+            interpolation: Interpolation::Linear,
+            times: vec![0.0, 1.0],
+            values: vec![0.0, 1.0, 0.5, 0.8, 0.2, 0.9],
+        });
+        rig.clips[0].channels.push(Channel {
+            node: 1,
+            path: Path::Weights,
+            interpolation: Interpolation::Cubic,
+            times: vec![0.0, 1.0],
+            // key0: in(0,0), val(0.1,0.2), out(0,0); key1: in(0,0), val(0.9,0.6), out(0,0)
+            values: vec![0.0, 0.0, 0.1, 0.2, 0.0, 0.0, 0.0, 0.0, 0.9, 0.6, 0.0, 0.0],
+        });
+        rig.validate().unwrap();
+        let mut bytes = Vec::new();
+        write_rig(&rig, &mut bytes);
+        let decoded = read_rig(&bytes).unwrap();
+        assert_eq!(decoded, rig);
+        // Narrowed output (2 of 3 targets) must still stride by full channel width (3) on linear.
+        let n0_narrow = decoded.morph_weights_for_node(0, &[Layer { clip: 0, time: 0.5, weight: 1.0 }], 2);
+        assert!((n0_narrow[0] - 0.4).abs() < 1e-5 && (n0_narrow[1] - 0.6).abs() < 1e-5, "{n0_narrow:?}");
+        // Narrowed output (1 of 2 targets) on cubic channel must stride by full channel width (2*3=6).
+        let n1_narrow = decoded.morph_weights_for_node(1, &[Layer { clip: 0, time: 0.5, weight: 1.0 }], 1);
+        assert!((n1_narrow[0] - 0.5).abs() < 1e-5, "{n1_narrow:?}");
+        // Multi-node isolation: node 0 does NOT sum node 1's weights!
+        let n0_full = decoded.morph_weights_for_node(0, &[Layer { clip: 0, time: 0.5, weight: 1.0 }], 3);
+        assert!((n0_full[2] - 0.7).abs() < 1e-5, "{n0_full:?}");
     }
 }

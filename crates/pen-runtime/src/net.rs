@@ -33,11 +33,13 @@
 pub mod inputs;
 pub mod play;
 pub mod relay;
+pub mod server;
 pub mod stream;
+pub mod stun;
 pub mod wire;
 
 pub use play::{Desync, Link, Netplay, Settings, Stats};
-pub use relay::{ChannelLink, RelayBroker, RelayPacket, Transport};
+pub use relay::{ChannelLink, RelayBroker, RelayPacket, RoomSummary, Transport};
 
 #[cfg(test)]
 mod tests;

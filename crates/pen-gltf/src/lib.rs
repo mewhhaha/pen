@@ -34,7 +34,7 @@
 //! Files whose content is unchanged are left alone, so rerunning an import
 //! sets nothing else off; files the last import of the same name made and
 //! this one does not are removed.
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -43,6 +43,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 mod gtex;
+pub mod optimize;
 pub mod tangents;
 pub mod vat;
 
@@ -60,11 +61,13 @@ pub struct Options {
     pub shader: String,
     /// Vertex-animation textures for skinned primitives.
     pub vat: Option<VatOptions>,
+    /// Reorder vertex buffers in first-use fetch order in addition to vertex-cache index sorting.
+    pub optimize_vertices: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { name: None, shader: "scene.wgsl".to_owned(), vat: None }
+        Options { name: None, shader: "scene.wgsl".to_owned(), vat: None, optimize_vertices: false }
     }
 }
 
@@ -86,6 +89,9 @@ pub struct Imported {
     pub images: Vec<String>,
     /// The file's animations, which are every skinned mesh's clips.
     pub clips: Vec<ImportedClip>,
+    /// Punctual lights (`KHR_lights_punctual`) placed in the scene.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lights: Vec<ImportedLight>,
     /// Every asset it made, written or found unchanged: what the next import
     /// of the same name removes if it no longer makes it.
     pub files: Vec<String>,
@@ -101,6 +107,33 @@ pub struct Imported {
     pub notes: Vec<String>,
 }
 
+/// One `KHR_lights_punctual` light placed in the scene's world space.
+/// Per `KHR_lights_punctual`, `intensity` is in candela (`lm/sr`) for `"point"`
+/// and `"spot"` lights and in lux (`lm/m^2`) for `"directional"` lights.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ImportedLight {
+    pub name: String,
+    pub kind: String,
+    pub position: [f32; 3],
+    pub direction: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub range: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner_cone_angle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outer_cone_angle: Option<f32>,
+}
+
+/// One `EXT_mesh_gpu_instancing` TRS transform on a mesh node.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ImportedInstance {
+    pub translation: [f32; 3],
+    pub rotation: [f32; 4],
+    pub scale: [f32; 3],
+}
+
 #[derive(Debug, Serialize)]
 pub struct ImportedMesh {
     pub mesh: String,
@@ -113,6 +146,9 @@ pub struct ImportedMesh {
     /// Its vertex-animation texture's material, if it has one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vat: Option<String>,
+    /// GPU instances from `EXT_mesh_gpu_instancing`, if present on the node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<ImportedInstance>,
 }
 
 fn is_zero(v: &usize) -> bool {
@@ -136,6 +172,10 @@ pub struct Geometry {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub uvs: Vec<[f32; 2]>,
+    /// Optional secondary UV set (`TEXCOORD_1`) for lightmaps or detail textures.
+    pub uvs1: Vec<[f32; 2]>,
+    /// Optional RGBA linear vertex colors (`COLOR_0`).
+    pub colors: Vec<[f32; 4]>,
     pub indices: Vec<u32>,
     /// A skinned primitive's four joints and weights a vertex.
     pub joints: Vec<[u16; 4]>,
@@ -154,17 +194,30 @@ struct MorphTargetFile {
     normals: Option<Vec<f32>>,
 }
 
+#[derive(Serialize)]
+struct MeshInstancesFile {
+    data: Vec<f32>,
+    min: [f32; 3],
+    max: [f32; 3],
+}
+
 /// Mesh JSON as the renderer reads it (`pen_render::pack_mesh`).
 #[derive(Serialize)]
 struct MeshFile<'a> {
     positions: Vec<f32>,
     normals: Vec<f32>,
     uvs: Vec<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uvs1: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    colors: Option<Vec<f32>>,
     indices: &'a [u32],
     #[serde(skip_serializing_if = "Option::is_none")]
     tangents: Option<Vec<f32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     morphs: Option<Vec<MorphTargetFile>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instances: Option<MeshInstancesFile>,
     #[serde(skip_serializing_if = "Option::is_none")]
     joints: Option<Vec<u16>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,8 +231,15 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
     let bytes = std::fs::read(source).with_context(|| format!("reading {}", source.display()))?;
     let stem = source.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
     let name = sanitized(options.name.as_deref().unwrap_or(&stem));
-    let gltf::Gltf { document, blob } =
-        gltf::Gltf::from_slice(&bytes).with_context(|| format!("reading {} as glTF", source.display()))?;
+    let gltf::Gltf { document, blob } = gltf::Gltf::from_slice_without_validation(&bytes)
+        .with_context(|| format!("reading {} as glTF", source.display()))?;
+    for required in document.extensions_required() {
+        ensure!(
+            READ_EXTENSIONS.contains(&required),
+            "reading {} as glTF: unsupported required extension {required}",
+            source.display()
+        );
+    }
     let directory = source.parent().unwrap_or(Path::new("."));
     let buffers = document
         .buffers()
@@ -215,7 +275,6 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
         taken: HashSet::new(),
         materials: HashMap::new(),
         images: HashMap::new(),
-        unread_textures: BTreeMap::new(),
     };
     writer.imported.clips = document
         .animations()
@@ -225,12 +284,55 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
             Ok(ImportedClip { name, duration: duration(&animation, &buffers)? })
         })
         .collect::<Result<_>>()?;
+    // Import KHR_lights_punctual scene lights placed at node world transforms.
+    for (node, world) in &placed {
+        let Some(light) = node.light() else { continue };
+        let (kind, inner_cone_angle, outer_cone_angle) = match light.kind() {
+            gltf::khr_lights_punctual::Kind::Directional => ("directional".to_owned(), None, None),
+            gltf::khr_lights_punctual::Kind::Point => ("point".to_owned(), None, None),
+            gltf::khr_lights_punctual::Kind::Spot { inner_cone_angle, outer_cone_angle } => {
+                ("spot".to_owned(), Some(inner_cone_angle), Some(outer_cone_angle))
+            }
+        };
+        let lname = light
+            .name()
+            .or_else(|| node.name())
+            .map_or_else(|| format!("light{}", light.index()), str::to_owned);
+        let color = light.color().map(|c| if c.is_finite() { c.max(0.0) } else { 1.0 });
+        let intensity = if light.intensity().is_finite() { light.intensity().max(0.0) } else { 1.0 };
+        let range = light.range().filter(|r| r.is_finite() && *r > 0.0);
+        let position = [narrow(world[12]), narrow(world[13]), narrow(world[14])];
+        // glTF lights point along local -Z; scale-normalize so tiny node scales keep orientation.
+        let dir_raw = [-world[8], -world[9], -world[10]];
+        let scale_max = dir_raw[0].abs().max(dir_raw[1].abs()).max(dir_raw[2].abs());
+        let direction = if scale_max > 0.0 && scale_max.is_finite() {
+            let s = dir_raw.map(|v| v / scale_max);
+            let len = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
+            s.map(|v| narrow(v / len))
+        } else {
+            [0.0, 0.0, -1.0]
+        };
+        writer.imported.lights.push(ImportedLight {
+            name: lname,
+            kind,
+            position,
+            direction,
+            color,
+            intensity,
+            range,
+            inner_cone_angle,
+            outer_cone_angle,
+        });
+    }
+
     let parts: Vec<(&gltf::Node, &[f64; 16], gltf::Mesh)> =
         placed.iter().filter_map(|(node, world)| node.mesh().map(|mesh| (node, world, mesh))).collect();
     let primitives: usize = parts.iter().map(|(_, _, mesh)| mesh.primitives().len()).sum();
     ensure!(primitives > 0, "the file's scene has no meshes");
-    let mut rigs: HashMap<usize, Rig> = HashMap::new();
+    let mut rigs: HashMap<(Option<usize>, Option<usize>), Rig> = HashMap::new();
     for (node, world, mesh) in parts {
+        let gpu_instances = read_gpu_instances(&document, node, &buffers)?;
+        let has_morph_anim = node_has_morph_animation(&document, node.index());
         let several = mesh.primitives().len() > 1;
         for primitive in mesh.primitives() {
             if primitive.mode() != gltf::mesh::Mode::Triangles {
@@ -244,19 +346,54 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
                 if several { format!("{name}_{base}_{}", primitive.index()) } else { format!("{name}_{base}") }
             };
             let skin = node.skin().filter(|_| primitive.get(&gltf::Semantic::Joints(0)).is_some());
-            let rig = match &skin {
-                Some(skin) => Some(&*match rigs.entry(skin.index()) {
+            let morph_only = skin.is_none() && primitive.morph_targets().len() > 0 && has_morph_anim && gpu_instances.is_empty();
+            let rig = if let Some(skin) = &skin {
+                let key = (Some(skin.index()), has_morph_anim.then_some(node.index()));
+                Some(&*match rigs.entry(key) {
                     std::collections::hash_map::Entry::Occupied(known) => known.into_mut(),
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(rig(&document, skin, &parents, &order, &buffers, &mut writer.imported.notes)?)
-                    }
-                }),
-                None => None,
+                    std::collections::hash_map::Entry::Vacant(slot) => slot.insert(rig(
+                        &document,
+                        Some(skin),
+                        has_morph_anim.then_some(node.index()),
+                        &parents,
+                        &order,
+                        &buffers,
+                        &mut writer.imported.notes,
+                    )?),
+                })
+            } else if morph_only {
+                let key = (None, Some(node.index()));
+                Some(&*match rigs.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(known) => known.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(slot) => slot.insert(rig(
+                        &document,
+                        None,
+                        Some(node.index()),
+                        &parents,
+                        &order,
+                        &buffers,
+                        &mut writer.imported.notes,
+                    )?),
+                })
+            } else {
+                None
             };
-            // A skinned mesh stays in its bind pose: its joints place it.
+            // A skinned mesh stays in its bind pose; an instanced mesh stays in mesh-local space so
+            // `node_world * T * R * S` applies in the right order.
             let wants = wants_tangents(&primitive.material());
-            let geometry = geometry(&primitive, &buffers, rig.is_some(), (rig.is_none()).then_some(world), wants)
+            let bake_world = (rig.is_none() && gpu_instances.is_empty()).then_some(world);
+            let mut geometry = geometry(&primitive, &buffers, skin.is_some(), bake_world, wants)
                 .with_context(|| format!("mesh {} primitive {}", mesh.index(), primitive.index()))?;
+            if morph_only {
+                let vcount = geometry.positions.len();
+                geometry.joints = vec![[0, 0, 0, 0]; vcount];
+                geometry.weights = vec![[1.0, 0.0, 0.0, 0.0]; vcount];
+            }
+            if options.optimize_vertices {
+                optimize::optimize_geometry(&mut geometry);
+            } else if geometry.indices.len() >= 9 {
+                geometry.indices = optimize::optimize_vertex_cache(&geometry.indices, geometry.positions.len());
+            }
             if wants && geometry.tangents.is_empty() {
                 writer.note(format!(
                     "mesh {} has a normal map or anisotropy but no texture coordinates to make tangents from",
@@ -269,26 +406,31 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
                     mesh.index()
                 ));
             }
-            let (material, material_json) = writer.material(&primitive.material(), &buffers, options)?;
+            let mesh_instances = (!gpu_instances.is_empty() && rig.is_none())
+                .then(|| build_mesh_instances(&geometry.positions, world, &gpu_instances));
+            let (material, material_json) = writer.material(&document, &primitive.material(), &buffers, options)?;
             let mesh_key = writer.unique(&part, ".mesh.json");
-            writer.write_mesh(&mesh_key, &geometry, rig)?;
+            writer.write_mesh(&mesh_key, &geometry, rig, mesh_instances)?;
             let vat = match (&options.vat, rig) {
                 (Some(vat), Some(rig)) => writer.vat(&part, &geometry, rig, vat, &material_json)?,
                 _ => None,
             };
             let joints = rig.map_or(0, |rig| rig.joints.len());
             let morph_targets = geometry.morphs.len();
-            writer.imported.meshes.push(ImportedMesh { mesh: mesh_key, material, joints, morph_targets, vat });
+            writer.imported.meshes.push(ImportedMesh {
+                mesh: mesh_key,
+                material,
+                joints,
+                morph_targets,
+                vat,
+                instances: gpu_instances.clone(),
+            });
         }
     }
     for name in document.extensions_used() {
         if !READ_EXTENSIONS.contains(&name) {
             writer.note(format!("the file uses {name}, which the import does not read"));
         }
-    }
-    for (extension, textures) in std::mem::take(&mut writer.unread_textures) {
-        let textures: Vec<&str> = textures.into_iter().collect();
-        writer.note(format!("{extension}'s textures ({}) are not imported; its factors are", textures.join(", ")));
     }
     if let Some(vat) = &options.vat
         && writer.imported.meshes.iter().any(|mesh| mesh.vat.is_some())
@@ -342,9 +484,8 @@ const SURFACE_EXTENSIONS: [(&str, &[&str]); 7] = [
     ("KHR_materials_specular", &["specularTexture", "specularColorTexture"]),
 ];
 
-/// The extensions a file may use without the import leaving any of what they
-/// say out but the textures it reports.
-const READ_EXTENSIONS: [&str; 10] = [
+/// The extensions a file may use or require that the import actually reads.
+const READ_EXTENSIONS: [&str; 12] = [
     "KHR_materials_unlit",
     "KHR_materials_emissive_strength",
     "KHR_materials_clearcoat",
@@ -355,6 +496,8 @@ const READ_EXTENSIONS: [&str; 10] = [
     "KHR_materials_ior",
     "KHR_materials_specular",
     "KHR_texture_transform",
+    "KHR_lights_punctual",
+    "EXT_mesh_gpu_instancing",
 ];
 
 const IDENTITY: [f64; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
@@ -505,28 +648,47 @@ fn duration(animation: &gltf::Animation, buffers: &[Vec<u8>]) -> Result<f32> {
 }
 
 /// The skin's rig: its joints and the nodes above them, parents first, and
-/// the file's animations as clips of those nodes.
+fn node_has_morph_animation(document: &gltf::Document, node_index: usize) -> bool {
+    document.animations().any(|anim| {
+        anim.channels().any(|ch| {
+            ch.target().node().index() == node_index
+                && ch.target().property() == gltf::animation::Property::MorphTargetWeights
+        })
+    })
+}
+
+/// Builds a rig containing a skin's joints (if skinned) plus `morph_node` (when
+/// the mesh has morph weight animations targeting its node) and their ancestors.
 fn rig(
     document: &gltf::Document,
-    skin: &gltf::Skin,
+    skin: Option<&gltf::Skin>,
+    morph_node: Option<usize>,
     parents: &[Option<usize>],
     order: &[usize],
     buffers: &[Vec<u8>],
-    notes: &mut Vec<String>,
+    _notes: &mut Vec<String>,
 ) -> Result<Rig> {
     let get = |buffer: gltf::Buffer| buffers.get(buffer.index()).map(Vec::as_slice);
     let mut needed = HashSet::new();
-    for joint in skin.joints() {
-        let mut node = Some(joint.index());
+    let mut add_chain = |start: usize| {
+        let mut node = Some(start);
         while let Some(index) = node {
             if !needed.insert(index) {
                 break;
             }
             node = parents[index];
         }
+    };
+    if let Some(mnode) = morph_node {
+        add_chain(mnode);
+    }
+    if let Some(skin) = skin {
+        for joint in skin.joints() {
+            add_chain(joint.index());
+        }
     }
     let nodes_in_order: Vec<usize> = order.iter().copied().filter(|index| needed.contains(index)).collect();
-    ensure!(nodes_in_order.len() == needed.len(), "skin {} has joints outside the scene", skin.index());
+    ensure!(nodes_in_order.len() == needed.len(), "rig references nodes outside the scene");
     let place: HashMap<usize, u32> = nodes_in_order
         .iter()
         .enumerate()
@@ -544,25 +706,30 @@ fn rig(
             }
         })
         .collect();
-    let inverse_binds: Vec<[[f32; 4]; 4]> = match skin.reader(get).read_inverse_bind_matrices() {
-        Some(matrices) => matrices.collect(),
-        None => vec![
-            [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
-            skin.joints().len()
-        ],
+    let joints = if let Some(skin) = skin {
+        let inverse_binds: Vec<[[f32; 4]; 4]> = match skin.reader(get).read_inverse_bind_matrices() {
+            Some(matrices) => matrices.collect(),
+            None => vec![
+                [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+                skin.joints().len()
+            ],
+        };
+        ensure!(inverse_binds.len() >= skin.joints().len(), "skin {} lacks inverse bind matrices", skin.index());
+        skin.joints()
+            .zip(inverse_binds)
+            .map(|(joint, inverse)| Joint { node: place[&joint.index()], inverse_bind: columns(inverse).map(narrow) })
+            .collect()
+    } else {
+        let mnode = morph_node.context("unskinned morph rig requires morph_node")?;
+        vec![Joint { node: place[&mnode], inverse_bind: IDENTITY.map(narrow) }]
     };
-    ensure!(inverse_binds.len() >= skin.joints().len(), "skin {} lacks inverse bind matrices", skin.index());
-    let joints = skin
-        .joints()
-        .zip(inverse_binds)
-        .map(|(joint, inverse)| Joint { node: place[&joint.index()], inverse_bind: columns(inverse).map(narrow) })
-        .collect();
     let mut clips = Vec::new();
     for (index, animation) in document.animations().enumerate() {
         let mut channels = Vec::new();
         for channel in animation.channels() {
             let target = channel.target();
-            let Some(&node) = place.get(&target.node().index()) else { continue };
+            let target_idx = target.node().index();
+            let Some(&node) = place.get(&target_idx) else { continue };
             let reader = channel.reader(get);
             let times: Vec<f32> = reader.read_inputs().context("an animation channel has no times")?.collect();
             let (path, values): (Property, Vec<f32>) = match reader.read_outputs() {
@@ -575,9 +742,12 @@ fn rig(
                 Some(gltf::animation::util::ReadOutputs::Scales(values)) => {
                     (Property::Scale, values.flatten().collect())
                 }
-                Some(gltf::animation::util::ReadOutputs::MorphTargetWeights(_)) => {
-                    notes.push(format!("animation {index} moves morph targets, which pen leaves out"));
-                    continue;
+                Some(gltf::animation::util::ReadOutputs::MorphTargetWeights(values)) => {
+                    // Only bind morph-weight channels belonging to this mesh node.
+                    if morph_node != Some(target_idx) {
+                        continue;
+                    }
+                    (Property::Weights, values.into_f32().collect())
                 }
                 None => bail!("an animation channel has no values"),
             };
@@ -592,7 +762,7 @@ fn rig(
         clips.push(Clip { name, duration: duration(&animation, buffers)?, channels });
     }
     let rig = Rig { nodes, joints, clips };
-    rig.validate().with_context(|| format!("skin {}", skin.index()))?;
+    rig.validate().with_context(|| format!("rig for {:?}", morph_node))?;
     Ok(rig)
 }
 
@@ -621,6 +791,13 @@ fn geometry(
         Some(coordinates) => coordinates.into_f32().collect(),
         None => vec![[0.0; 2]; count],
     };
+    let uvs1: Vec<[f32; 2]> = reader.read_tex_coords(1).map(|c| c.into_f32().collect()).unwrap_or_default();
+    let colors: Vec<[f32; 4]> = reader.read_colors(0).map(|c| c.into_rgba_f32().collect()).unwrap_or_default();
+    ensure!(
+        (uvs1.is_empty() || (uvs1.len() == count && uvs1.iter().flatten().all(|v| v.is_finite())))
+            && (colors.is_empty() || (colors.len() == count && colors.iter().flatten().all(|v| v.is_finite()))),
+        "a primitive's secondary UVs and vertex colors must be finite and match the vertex count"
+    );
     let mut tangents: Vec<[f32; 4]> = reader.read_tangents().map(Iterator::collect).unwrap_or_default();
     ensure!(
         tangents.is_empty() || tangents.iter().flatten().all(|value| value.is_finite()),
@@ -724,7 +901,7 @@ fn geometry(
             [0.0, 1.0, 0.0]
         };
     }
-    let mut geometry = Geometry { positions, normals, uvs, indices, joints, weights, tangents, morphs };
+    let mut geometry = Geometry { positions, normals, uvs, uvs1, colors, indices, joints, weights, tangents, morphs };
     // The tangents a normal map or an anisotropic material wants, made of
     // the geometry as it stands in the mesh (placed, and wound as it draws).
     if geometry.tangents.is_empty() && generate_tangents && textured {
@@ -732,6 +909,197 @@ fn geometry(
         tangents::split(&mut geometry, &corners);
     }
     Ok(geometry)
+}
+
+/// Composes `T * R * S` into a 4x4 column-major matrix in `f64`.
+fn trs_matrix(t: [f32; 3], r: [f32; 4], s: [f32; 3]) -> [f64; 16] {
+    let [qx, qy, qz, qw] = r.map(f64::from);
+    let qlen = (qx * qx + qy * qy + qz * qz + qw * qw).sqrt();
+    let (x, y, z, w) = if qlen > 0.0 && qlen.is_finite() {
+        (qx / qlen, qy / qlen, qz / qlen, qw / qlen)
+    } else {
+        (0.0, 0.0, 0.0, 1.0)
+    };
+    let [sx, sy, sz] = s.map(f64::from);
+    let [tx, ty, tz] = t.map(f64::from);
+    let (xx, yy, zz) = (x * x, y * y, z * z);
+    let (xy, xz, yz) = (x * y, x * z, y * z);
+    let (wx, wy, wz) = (w * x, w * y, w * z);
+    [
+        (1.0 - 2.0 * (yy + zz)) * sx,
+        (2.0 * (xy + wz)) * sx,
+        (2.0 * (xz - wy)) * sx,
+        0.0,
+        (2.0 * (xy - wz)) * sy,
+        (1.0 - 2.0 * (xx + zz)) * sy,
+        (2.0 * (yz + wx)) * sy,
+        0.0,
+        (2.0 * (xz + wy)) * sz,
+        (2.0 * (yz - wx)) * sz,
+        (1.0 - 2.0 * (xx + yy)) * sz,
+        0.0,
+        tx,
+        ty,
+        tz,
+        1.0,
+    ]
+}
+
+/// Converts `EXT_mesh_gpu_instancing` TRS records into renderer-ready persistent
+/// instance records (`node_world * T * R * S`, 20 floats each) and world bounds.
+fn build_mesh_instances(
+    positions: &[[f32; 3]],
+    node_world: &[f64; 16],
+    instances: &[ImportedInstance],
+) -> MeshInstancesFile {
+    let mut local_min = [f64::INFINITY; 3];
+    let mut local_max = [f64::NEG_INFINITY; 3];
+    for p in positions {
+        for a in 0..3 {
+            local_min[a] = local_min[a].min(f64::from(p[a]));
+            local_max[a] = local_max[a].max(f64::from(p[a]));
+        }
+    }
+    let corners = [
+        [local_min[0], local_min[1], local_min[2]],
+        [local_max[0], local_min[1], local_min[2]],
+        [local_min[0], local_max[1], local_min[2]],
+        [local_max[0], local_max[1], local_min[2]],
+        [local_min[0], local_min[1], local_max[2]],
+        [local_max[0], local_min[1], local_max[2]],
+        [local_min[0], local_max[1], local_max[2]],
+        [local_max[0], local_max[1], local_max[2]],
+    ];
+    let mut world_min = [f64::INFINITY; 3];
+    let mut world_max = [f64::NEG_INFINITY; 3];
+    let mut data = Vec::with_capacity(instances.len() * 20);
+    for inst in instances {
+        // Per EXT_mesh_gpu_instancing spec: world = node_world * (T * R * S).
+        let local = trs_matrix(inst.translation, inst.rotation, inst.scale);
+        let m = multiply(node_world, &local);
+        for &v in &m {
+            data.push(narrow(v));
+        }
+        data.extend_from_slice(&[0.0, 0.0, 0.0, 0.0]);
+        for c in &corners {
+            let x = m[0] * c[0] + m[4] * c[1] + m[8] * c[2] + m[12];
+            let y = m[1] * c[0] + m[5] * c[1] + m[9] * c[2] + m[13];
+            let z = m[2] * c[0] + m[6] * c[1] + m[10] * c[2] + m[14];
+            world_min[0] = world_min[0].min(x);
+            world_min[1] = world_min[1].min(y);
+            world_min[2] = world_min[2].min(z);
+            world_max[0] = world_max[0].max(x);
+            world_max[1] = world_max[1].max(y);
+            world_max[2] = world_max[2].max(z);
+        }
+    }
+    MeshInstancesFile { data, min: world_min.map(narrow), max: world_max.map(narrow) }
+}
+
+/// Reads validated per-instance TRS transforms from `EXT_mesh_gpu_instancing` on `node`.
+/// Enforces strict buffer-view bounds before allocation, validates matching accessor
+/// counts, dimensions, strides, and decodes `FLOAT`, normalized `BYTE`, and normalized
+/// `SHORT` quaternion rotations per the `EXT_mesh_gpu_instancing` specification.
+fn read_gpu_instances(
+    document: &gltf::Document,
+    node: &gltf::Node,
+    buffers: &[Vec<u8>],
+) -> Result<Vec<ImportedInstance>> {
+    let Some(attrs) = node
+        .extension_value("EXT_mesh_gpu_instancing")
+        .and_then(|ext| ext.get("attributes"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(Vec::new());
+    };
+    let read_vec = |key: &str, expected_dims: gltf::accessor::Dimensions, allow_norm_int: bool| -> Result<Option<(usize, Vec<f32>)>> {
+        let Some(idx) = attrs.get(key).and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok()) else {
+            return Ok(None);
+        };
+        let acc = document.accessors().nth(idx).with_context(|| format!("missing instancing accessor {idx}"))?;
+        ensure!(acc.dimensions() == expected_dims, "instancing {key} accessor has wrong dimensions");
+        let comps = match expected_dims {
+            gltf::accessor::Dimensions::Vec3 => 3usize,
+            gltf::accessor::Dimensions::Vec4 => 4usize,
+            _ => bail!("unsupported instancing accessor dimensions"),
+        };
+        let dtype = acc.data_type();
+        let comp_bytes = match dtype {
+            gltf::accessor::DataType::F32 => 4usize,
+            gltf::accessor::DataType::I8 if allow_norm_int && acc.normalized() => 1usize,
+            gltf::accessor::DataType::I16 if allow_norm_int && acc.normalized() => 2usize,
+            _ => bail!("unsupported instancing {key} component type {dtype:?} (normalized={})", acc.normalized()),
+        };
+        let elem_bytes = comps * comp_bytes;
+        let view = acc.view().context("instancing accessor lacks buffer view")?;
+        let buf = buffers.get(view.buffer().index()).context("instancing buffer missing")?;
+        let view_end = view
+            .offset()
+            .checked_add(view.length())
+            .filter(|&end| end <= buf.len())
+            .context("instancing buffer view out of buffer bounds")?;
+        let step = view.stride().unwrap_or(elem_bytes);
+        ensure!(step >= elem_bytes, "instancing buffer view stride {step} < element size {elem_bytes}");
+        let base = view.offset().checked_add(acc.offset()).context("instancing accessor offset overflow")?;
+        let count = acc.count();
+        if count > 0 {
+            let last_start = count
+                .checked_sub(1)
+                .and_then(|n| n.checked_mul(step))
+                .and_then(|span| base.checked_add(span))
+                .context("instancing accessor span overflow")?;
+            let last_end = last_start.checked_add(elem_bytes).context("instancing accessor end overflow")?;
+            ensure!(last_end <= view_end, "instancing {key} accessor exceeds its buffer view bounds");
+        }
+        let mut out = Vec::with_capacity(count.checked_mul(comps).context("instancing allocation overflow")?);
+        for i in 0..count {
+            let at = base + i * step;
+            for c in 0..comps {
+                let v = match dtype {
+                    gltf::accessor::DataType::F32 => {
+                        let b = &buf[at + c * 4..at + c * 4 + 4];
+                        f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+                    }
+                    gltf::accessor::DataType::I8 => {
+                        (f32::from(buf[at + c].cast_signed()) / 127.0).max(-1.0)
+                    }
+                    gltf::accessor::DataType::I16 => {
+                        let b = &buf[at + c * 2..at + c * 2 + 2];
+                        (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0)
+                    }
+                    _ => unreachable!(),
+                };
+                ensure!(v.is_finite(), "non-finite instancing {key} value");
+                out.push(v);
+            }
+        }
+        Ok(Some((count, out)))
+    };
+    let translations = read_vec("TRANSLATION", gltf::accessor::Dimensions::Vec3, false)?;
+    let rotations = read_vec("ROTATION", gltf::accessor::Dimensions::Vec4, true)?;
+    let scales = read_vec("SCALE", gltf::accessor::Dimensions::Vec3, false)?;
+    let counts: Vec<usize> = [
+        translations.as_ref().map(|(c, _)| *c),
+        rotations.as_ref().map(|(c, _)| *c),
+        scales.as_ref().map(|(c, _)| *c),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let Some(&count) = counts.first() else {
+        return Ok(Vec::new());
+    };
+    ensure!(counts.iter().all(|&c| c == count), "instancing attributes have mismatched instance counts");
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let t = translations.as_ref().map_or([0.0, 0.0, 0.0], |(_, v)| [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
+        let r = rotations
+            .as_ref()
+            .map_or([0.0, 0.0, 0.0, 1.0], |(_, v)| [v[i * 4], v[i * 4 + 1], v[i * 4 + 2], v[i * 4 + 3]]);
+        let s = scales.as_ref().map_or([1.0, 1.0, 1.0], |(_, v)| [v[i * 3], v[i * 3 + 1], v[i * 3 + 2]]);
+        out.push(ImportedInstance { translation: t, rotation: r, scale: s });
+    }
+    Ok(out)
 }
 
 /// Whether a primitive of `material` reads a tangent frame: a normal map, or
@@ -796,9 +1164,6 @@ struct Writer<'a> {
     materials: HashMap<Option<usize>, (String, Value)>,
     /// Each image's key, or None for one the renderer cannot read.
     images: HashMap<usize, Option<String>>,
-    /// The textures the materials name of each extension that has some, which
-    /// the import leaves out.
-    unread_textures: BTreeMap<&'static str, BTreeSet<&'static str>>,
 }
 
 impl Writer<'_> {
@@ -833,7 +1198,13 @@ impl Writer<'_> {
         Ok(())
     }
 
-    fn write_mesh(&mut self, key: &str, geometry: &Geometry, rig: Option<&Rig>) -> Result<()> {
+    fn write_mesh(
+        &mut self,
+        key: &str,
+        geometry: &Geometry,
+        rig: Option<&Rig>,
+        instances: Option<MeshInstancesFile>,
+    ) -> Result<()> {
         let morphs = (!geometry.morphs.is_empty()).then(|| {
             geometry
                 .morphs
@@ -851,9 +1222,12 @@ impl Writer<'_> {
             positions: geometry.positions.iter().flatten().copied().collect(),
             normals: geometry.normals.iter().flatten().copied().collect(),
             uvs: geometry.uvs.iter().flatten().copied().collect(),
+            uvs1: (!geometry.uvs1.is_empty()).then(|| geometry.uvs1.iter().flatten().copied().collect()),
+            colors: (!geometry.colors.is_empty()).then(|| geometry.colors.iter().flatten().copied().collect()),
             indices: &geometry.indices,
             tangents: (!geometry.tangents.is_empty()).then(|| geometry.tangents.iter().flatten().copied().collect()),
             morphs,
+            instances,
             joints: rig.map(|_| geometry.joints.iter().flatten().copied().collect()),
             weights: rig.map(|_| geometry.weights.iter().flatten().copied().collect()),
             rig: rig.map(Rig::json),
@@ -867,6 +1241,7 @@ impl Writer<'_> {
     /// The key and JSON of a glTF material, written the first time.
     fn material(
         &mut self,
+        document: &gltf::Document,
         material: &gltf::Material,
         buffers: &[Vec<u8>],
         options: &Options,
@@ -945,7 +1320,7 @@ impl Writer<'_> {
                 json["uvTransform"] = transform;
             }
         }
-        if let Some(surface) = self.surface(material) {
+        if let Some(surface) = self.surface(document, material, buffers)? {
             json["surface"] = surface;
         }
         match material.alpha_mode() {
@@ -964,10 +1339,14 @@ impl Writer<'_> {
         Ok((key, json))
     }
 
-    /// A material's `surface` block, from the factors of its extensions
-    /// (docs/materials.md): the keys the file gives, in the ranges the renderer
-    /// takes, or None if it gives none. Their textures it notes as left out.
-    fn surface(&mut self, material: &gltf::Material) -> Option<Value> {
+    /// A material's `surface` block, from both the scalar factors and textures of
+    /// its `KHR_materials_*` extensions.
+    fn surface(
+        &mut self,
+        document: &gltf::Document,
+        material: &gltf::Material,
+        buffers: &[Vec<u8>],
+    ) -> Result<Option<Value>> {
         let mut surface = serde_json::Map::new();
         let number = |extension: &Value, key: &str, least: f64, most: f64| -> Option<Value> {
             let value = extension.get(key)?.as_f64().filter(|value| value.is_finite())?;
@@ -980,18 +1359,32 @@ impl Writer<'_> {
             };
             Some(json!([channel(0)?, channel(1)?, channel(2)?]))
         };
-        let mut set = |key: &str, value: Option<Value>| {
-            if let Some(value) = value {
-                surface.insert(key.to_owned(), value);
-            }
-        };
+        let textures_all: Vec<gltf::Texture> = document.textures().collect();
         for (name, textures) in SURFACE_EXTENSIONS {
             let Some(extension) = material.extension_value(name).filter(|extension| extension.is_object()) else {
                 continue;
             };
-            for texture in textures.iter().filter(|texture| extension.get(**texture).is_some()) {
-                self.unread_textures.entry(name).or_default().insert(texture);
+            for &tex_field in textures {
+                if let Some(tex_info) = extension.get(tex_field)
+                    && let Some(tex_idx) =
+                        tex_info.get("index").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok())
+                    && let Some(tex) = textures_all.get(tex_idx)
+                    && let Some(image_key) = self.image(&tex.source(), buffers)?
+                {
+                    if tex_info.get("texCoord").and_then(Value::as_u64).is_some_and(|c| c != 0) {
+                        self.note(format!("{tex_field} uses a secondary texCoord; UV0 is assumed"));
+                    }
+                    if tex_info.get("extensions").and_then(|e| e.get("KHR_texture_transform")).is_some() {
+                        self.note(format!("{tex_field} has a per-texture KHR_texture_transform which is not applied separately"));
+                    }
+                    surface.insert(tex_field.to_owned(), json!(image_key));
+                }
             }
+            let mut set = |key: &str, value: Option<Value>| {
+                if let Some(value) = value {
+                    surface.insert(key.to_owned(), value);
+                }
+            };
             match name {
                 "KHR_materials_clearcoat" => {
                     set("clearcoat", number(extension, "clearcoatFactor", 0.0, 1.0));
@@ -1020,9 +1413,9 @@ impl Writer<'_> {
             }
         }
         if let Some(strength) = material.emissive_strength() {
-            set("emissiveStrength", Some(json!(short(f64::from(strength).max(0.0)))));
+            surface.insert("emissiveStrength".to_owned(), json!(short(f64::from(strength).max(0.0))));
         }
-        (!surface.is_empty()).then_some(Value::Object(surface))
+        Ok((!surface.is_empty()).then_some(Value::Object(surface)))
     }
 
     /// Raw encoded bytes of a glTF image from its buffer view or URI.

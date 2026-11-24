@@ -169,6 +169,8 @@ mod tests {
             positions: vec![[0.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.5, 2.0, 0.0]],
             normals: vec![[0.0, 0.0, 1.0]; 3],
             uvs: vec![[0.0; 2]; 3],
+            uvs1: Vec::new(),
+            colors: Vec::new(),
             indices: vec![0, 1, 2],
             joints: vec![[0, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0]],
             weights: vec![[1.0, 0.0, 0.0, 0.0]; 3],

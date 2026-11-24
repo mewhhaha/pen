@@ -108,6 +108,156 @@ fn relay_spec_and_loopback_tcp_relay_route_peer_datagrams() {
     assert_eq!(got0, Some((1, b"PNET-1-TO-0".to_vec())));
 }
 
+#[test]
+fn relay_bridges_native_tcp_and_browser_websocket_clients_and_lists_rooms() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let mut server = TcpRelayServer::bind("127.0.0.1:0").unwrap();
+    let addr = server.local_addr().unwrap();
+    let mut tcp_link = Spec::parse(&format!("relay:0/2@{addr}/cross-play#7")).unwrap().connect().unwrap();
+
+    // Simulated browser WebSocket client connecting to the same relay port.
+    let mut ws = TcpStream::connect(addr).unwrap();
+    ws.set_nodelay(true).unwrap();
+    let handshake = format!(
+        "GET / HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    ws.write_all(handshake.as_bytes()).unwrap();
+    ws.set_nonblocking(true).unwrap();
+
+    let send_ws_frame = |stream: &mut TcpStream, fin: bool, opcode: u8, payload: &[u8]| {
+        let mask = [0x12u8, 0x34, 0x56, 0x78];
+        let mut frame = vec![(if fin { 0x80 } else { 0 }) | (opcode & 0x0f)];
+        if payload.len() < 126 {
+            frame.push(0x80 | u8::try_from(payload.len()).unwrap());
+        } else {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        for (i, &b) in payload.iter().enumerate() {
+            frame.push(b ^ mask[i & 3]);
+        }
+        stream.write_all(&frame).unwrap();
+    };
+
+    let pop_server_ws_frame = |buf: &mut Vec<u8>| -> Option<(u8, Vec<u8>)> {
+        if buf.len() < 2 {
+            return None;
+        }
+        let opcode = buf[0] & 0x0f;
+        let (len, hdr) = match buf[1] & 0x7f {
+            126 => {
+                if buf.len() < 4 {
+                    return None;
+                }
+                (usize::from(u16::from_be_bytes([buf[2], buf[3]])), 4)
+            }
+            n => (usize::from(n), 2),
+        };
+        if buf.len() < hdr + len {
+            return None;
+        }
+        let payload = buf[hdr..hdr + len].to_vec();
+        buf.drain(..hdr + len);
+        Some((opcode, payload))
+    };
+
+    let mut resp = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !resp.windows(4).any(|w| w == b"\r\n\r\n") && Instant::now() < deadline {
+        server.poll();
+        let _ = tcp_link.receive();
+        let mut tmp = [0u8; 256];
+        if let Ok(n) = ws.read(&mut tmp) {
+            resp.extend_from_slice(&tmp[..n]);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let header_end = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    assert!(String::from_utf8_lossy(&resp[..header_end]).contains("101 Switching Protocols"));
+    let mut ws_buf = resp[header_end + 4..].to_vec();
+
+    // Join via WebSocket as player 1, send a fragmented Forward frame (2 fragments),
+    // interleave a Ping control frame, and request the room list.
+    let join = RelayPacket::Join { room: "cross-play".into(), player: 1, players: 2, token: 7 }.encode().unwrap();
+    let list = RelayPacket::ListRooms.encode().unwrap();
+    let fwd = RelayPacket::Forward { from: 1, to: 0, payload: b"FROM-BROWSER-FRAG".to_vec() }.encode().unwrap();
+    send_ws_frame(&mut ws, true, 2, &join);
+    send_ws_frame(&mut ws, false, 2, &fwd[..6]);
+    send_ws_frame(&mut ws, true, 9, b"hi"); // RFC 6455 interleaved Ping control frame
+    send_ws_frame(&mut ws, true, 0, &fwd[6..]); // continuation FIN=1
+    send_ws_frame(&mut ws, true, 2, &list);
+
+    // Also forward in the reverse direction: native TCP -> WebSocket!
+    tcp_link.send(1, b"FROM-NATIVE");
+
+    let mut got_tcp = None;
+    let mut got_joined = false;
+    let mut got_pong = false;
+    let mut got_rooms = None;
+    let mut got_native_on_ws = None;
+    while (got_tcp.is_none() || !got_joined || !got_pong || got_rooms.is_none() || got_native_on_ws.is_none())
+        && Instant::now() < deadline
+    {
+        server.poll();
+        if got_tcp.is_none() {
+            got_tcp = tcp_link.receive();
+        }
+        let mut tmp = [0u8; 256];
+        if let Ok(n) = ws.read(&mut tmp)
+            && n > 0
+        {
+            ws_buf.extend_from_slice(&tmp[..n]);
+        }
+        while let Some((opcode, payload)) = pop_server_ws_frame(&mut ws_buf) {
+            match opcode {
+                10 => {
+                    assert_eq!(payload, b"hi");
+                    got_pong = true;
+                }
+                2 => match RelayPacket::decode(&payload).unwrap() {
+                    RelayPacket::Joined { player: 1, players: 2 } => got_joined = true,
+                    RelayPacket::Rooms(rooms) => got_rooms = Some(rooms),
+                    RelayPacket::Forward { from: 0, to: 1, payload } => got_native_on_ws = Some(payload),
+                    other => panic!("unexpected packet on WS: {other:?}"),
+                },
+                other => panic!("unexpected WS opcode {other}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(got_tcp, Some((1, b"FROM-BROWSER-FRAG".to_vec())));
+    assert_eq!(got_native_on_ws, Some(b"FROM-NATIVE".to_vec()));
+    assert!(got_joined && got_pong);
+    let rooms = got_rooms.unwrap();
+    assert_eq!(rooms.len(), 1);
+    assert_eq!(rooms[0].room, "cross-play");
+    assert_eq!((rooms[0].occupied, rooms[0].capacity), (2, 2));
+
+    // Close handshake replies with Close frame (opcode 8) carrying status 1000.
+    send_ws_frame(&mut ws, true, 8, &1000u16.to_be_bytes());
+    let mut got_close = false;
+    while !got_close && Instant::now() < deadline {
+        server.poll();
+        let mut tmp = [0u8; 64];
+        if let Ok(n) = ws.read(&mut tmp)
+            && n > 0
+        {
+            ws_buf.extend_from_slice(&tmp[..n]);
+        }
+        while let Some((opcode, payload)) = pop_server_ws_frame(&mut ws_buf) {
+            if opcode == 8 {
+                assert_eq!(payload, 1000u16.to_be_bytes());
+                got_close = true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(got_close, "relay must reply to Close frame before disconnecting");
+}
+
 /// A link that holds what it sends for `latency` before handing it to UDP,
 /// as a long way would.
 struct Late {

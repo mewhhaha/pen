@@ -7,6 +7,7 @@ mod development;
 mod files;
 mod input;
 mod kernels;
+pub mod net;
 mod preferences;
 mod program;
 mod replay;
@@ -153,6 +154,17 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         }),
         Err(_) => Default::default(),
     };
+    let relay_config = js_sys::Reflect::get(&options, &"netRelay".into())
+        .ok()
+        .filter(|v| v.is_object())
+        .and_then(|obj| {
+            let url = js_sys::Reflect::get(&obj, &"url".into()).ok()?.as_string()?;
+            let room = js_sys::Reflect::get(&obj, &"room".into()).ok()?.as_string()?;
+            let player = js_sys::Reflect::get(&obj, &"player".into()).ok()?.as_f64()? as usize;
+            let players = js_sys::Reflect::get(&obj, &"players".into()).ok()?.as_f64()? as usize;
+            let token = js_sys::Reflect::get(&obj, &"token".into()).ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as u64;
+            Some(run::NetRelayConfig { url, room, player, players, token })
+        });
     let options = Options {
         development: flag("development"),
         qualify: flag("qualify"),
@@ -161,6 +173,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         state_adapter: state_adapter.clone(),
         assets: assets.clone(),
         captions,
+        netplay: None,
     };
     let mut screen = Screen::new(canvas.clone(), assets.clone()).await.map_err(failed)?;
     screen.renderer.preload(&catalog);
@@ -168,11 +181,22 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     log.push(log_source::SESSION, false, "pen browser host ready");
     let viewport = screen.viewport();
     let game_wasm_for_kernels = game.clone();
+    let build_hash = pen_runtime::net::wire::hash_bytes(&game);
     let started = {
         let mut host = Starting { viewport, log: &mut log, state_adapter: &state_adapter };
         Runtime::new(&BrowserBackend, game, catalog.clone(), &mut host, saves::read("pen.autosave").await, scene).await
     };
-    let runtime = started.map_err(failed)?;
+    let mut runtime = started.map_err(failed)?;
+    let mut options = options;
+    if let Some(cfg) = relay_config {
+        let link = net::BrowserRelayLink::connect(&cfg.url, &cfg.room, cfg.player, cfg.players, cfg.token)
+            .map_err(failed)?;
+        let settings = pen_runtime::net::Settings::new(cfg.players, cfg.player, viewport);
+        let start = runtime.moment().await.map_err(failed)?;
+        options.netplay = Some(
+            pen_runtime::net::Netplay::new(settings, Box::new(link), build_hash, &start, 1).map_err(failed)?,
+        );
+    }
     let tools = match devtools {
         Some(module) => {
             let saved = saves::read("pen.devtools").await;

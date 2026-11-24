@@ -750,6 +750,13 @@ const COMMANDS: &[CommandSpec] = &[
                 and takes pushes with its token only",
     },
     CommandSpec {
+        name: "relay",
+        operands: "",
+        checkout: false,
+        about: "run a multi-room NAT-traversal netplay relay accepting both native TCP and browser WebSocket \
+                peers on the same port (default 0.0.0.0:7813 unless --listen says where)",
+    },
+    CommandSpec {
         name: "push",
         operands: "ADDRESS",
         checkout: false,
@@ -1454,9 +1461,9 @@ const OPTIONS: [OptionSpec; 103] = [
     OptionSpec {
         name: "--listen",
         value: "ADDRESS",
-        commands: &["serve"],
+        commands: &["serve", "relay"],
         place: Place::Command,
-        about: "where to listen (default 127.0.0.1:7811; 0.0.0.0:7811 takes pushes from the network)",
+        about: "where to listen (serve default 127.0.0.1:7811; relay default 0.0.0.0:7813)",
     },
     OptionSpec {
         name: "--dir",
@@ -1996,7 +2003,7 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
     let net = args.value("--net").map(|spec| net::Spec::parse(&spec)).transpose()?;
     let spectating = args.value("--spectate").is_some();
     if let Some(spec) = &net {
-        net::check_players(identity().players, spec.addresses.len())?;
+        net::check_players(identity().players, spec.players())?;
         ensure!(args.path("--replay").is_none(), "a net session plays its players' input, not a recording's");
     }
     ensure!(
@@ -2205,6 +2212,13 @@ fn network(args: &Args) -> Option<Result<()>> {
                 std::net::TcpListener::bind(&serve.listen).with_context(|| format!("listening on {}", serve.listen))?;
             eprintln!("serve: packages pushed to {} go in {}", listener.local_addr()?, serve.directory.display());
             push::Server::default().serve(&serve, &listener, || false)
+        })()),
+        "relay" => Some((|| {
+            let listen = args.value("--listen").unwrap_or_else(|| "0.0.0.0:7813".to_owned());
+            let mut server =
+                net::TcpRelayServer::bind(&listen).with_context(|| format!("binding relay on {listen}"))?;
+            eprintln!("relay: listening for TCP and WebSocket netplay peers on {}", server.local_addr()?);
+            server.serve(|| false)
         })()),
         #[cfg(feature = "compiler")]
         "push" => Some((|| {
@@ -2762,6 +2776,7 @@ fn import_gltf(args: &Args) -> Result<()> {
             fps,
             shader: args.value("--vat-shader").unwrap_or_else(|| "vat.wgsl".to_owned()),
         }),
+        ..Default::default()
     };
     let out = args.path("--out").unwrap_or_else(|| PathBuf::from("src/assets"));
     gltf::import(Path::new(&args.operands[0]), &out, &options)

@@ -76,6 +76,12 @@ pub(crate) struct Mesh {
     pub tangents: Option<Vec<f32>>,
     /// Blendshape / morph target vertex deltas (position + normal per target per vertex).
     pub morphs: Option<MorphTargets>,
+    /// Optional secondary UV set (`TEXCOORD_1`) retained from mesh JSON.
+    #[allow(dead_code)]
+    pub uvs1: Option<Vec<[f32; 2]>>,
+    /// Optional per-vertex linear RGBA colors (`COLOR_0`) retained from mesh JSON.
+    #[allow(dead_code)]
+    pub colors: Option<Vec<[f32; 4]>>,
 }
 
 /// Morph targets for a mesh: `targets` blendshapes, each storing
@@ -170,7 +176,7 @@ pub(crate) struct Material {
 /// extensions KHR_materials_clearcoat, sheen, anisotropy, transmission,
 /// volume, ior and specular, and KHR_materials_emissive_strength. A material
 /// without the block has `Surface::default()`, which leaves every lobe off.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Surface {
     pub clearcoat: f32,
     pub clearcoat_roughness: f32,
@@ -189,6 +195,16 @@ pub(crate) struct Surface {
     pub specular: f32,
     pub specular_color: [f32; 3],
     pub emissive_strength: f32,
+    pub clearcoat_texture: Option<String>,
+    pub clearcoat_roughness_texture: Option<String>,
+    pub clearcoat_normal_texture: Option<String>,
+    pub sheen_color_texture: Option<String>,
+    pub sheen_roughness_texture: Option<String>,
+    pub anisotropy_texture: Option<String>,
+    pub transmission_texture: Option<String>,
+    pub thickness_texture: Option<String>,
+    pub specular_texture: Option<String>,
+    pub specular_color_texture: Option<String>,
 }
 
 impl Default for Surface {
@@ -208,6 +224,16 @@ impl Default for Surface {
             specular: 1.0,
             specular_color: [1.0; 3],
             emissive_strength: 1.0,
+            clearcoat_texture: None,
+            clearcoat_roughness_texture: None,
+            clearcoat_normal_texture: None,
+            sheen_color_texture: None,
+            sheen_roughness_texture: None,
+            anisotropy_texture: None,
+            transmission_texture: None,
+            thickness_texture: None,
+            specular_texture: None,
+            specular_color_texture: None,
         }
     }
 }
@@ -317,20 +343,30 @@ impl Surface {
     /// The block of a material's JSON: every key optional, the rest as
     /// `Surface::default()`, and none but these.
     fn parse(value: Option<&Value>) -> Result<Surface> {
-        const KEYS: [&str; 14] = [
+        const KEYS: [&str; 24] = [
             "clearcoat",
             "clearcoatRoughness",
+            "clearcoatTexture",
+            "clearcoatRoughnessTexture",
+            "clearcoatNormalTexture",
             "sheenColor",
             "sheenRoughness",
+            "sheenColorTexture",
+            "sheenRoughnessTexture",
             "anisotropy",
             "anisotropyRotation",
+            "anisotropyTexture",
             "transmission",
+            "transmissionTexture",
             "ior",
             "thickness",
+            "thicknessTexture",
             "attenuationColor",
             "attenuationDistance",
             "specular",
             "specularColor",
+            "specularTexture",
+            "specularColorTexture",
             "emissiveStrength",
         ];
         let block = match value {
@@ -341,6 +377,16 @@ impl Surface {
         if let Some(unknown) = block.keys().find(|key| !KEYS.contains(&key.as_str())) {
             bail!("material surface has no {unknown}");
         }
+        let tex_key = |key: &str| -> Result<Option<String>> {
+            match block.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(v) => v
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| Some(s.to_owned()))
+                    .ok_or_else(|| anyhow!("material surface {key} must be a non-empty key")),
+            }
+        };
         let float32 = f64::from(f32::MAX);
         let range = |least: f64, most: f64| {
             if most == float32 && least == -float32 {
@@ -390,6 +436,16 @@ impl Surface {
             specular: number("specular", defaults.specular, 0.0, float32)?,
             specular_color: channels("specularColor", 1.0, float32)?,
             emissive_strength: number("emissiveStrength", defaults.emissive_strength, 0.0, float32)?,
+            clearcoat_texture: tex_key("clearcoatTexture")?,
+            clearcoat_roughness_texture: tex_key("clearcoatRoughnessTexture")?,
+            clearcoat_normal_texture: tex_key("clearcoatNormalTexture")?,
+            sheen_color_texture: tex_key("sheenColorTexture")?,
+            sheen_roughness_texture: tex_key("sheenRoughnessTexture")?,
+            anisotropy_texture: tex_key("anisotropyTexture")?,
+            transmission_texture: tex_key("transmissionTexture")?,
+            thickness_texture: tex_key("thicknessTexture")?,
+            specular_texture: tex_key("specularTexture")?,
+            specular_color_texture: tex_key("specularColorTexture")?,
         })
     }
 }
@@ -486,6 +542,10 @@ struct MeshArrays {
     #[serde(default)]
     tangents: Option<Vec<f32>>,
     #[serde(default)]
+    uvs1: Option<Vec<f32>>,
+    #[serde(default)]
+    colors: Option<Vec<f32>>,
+    #[serde(default)]
     morphs: Option<Vec<MorphTargetArrays>>,
 }
 
@@ -519,6 +579,8 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
         clips,
         instances,
         tangents,
+        uvs1,
+        colors,
         morphs,
     } = arrays;
     let count = positions.len() / 3;
@@ -526,6 +588,8 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
         positions.len() % 3 == 0
             && normals.len() == positions.len()
             && uvs.len() == count * 2
+            && uvs1.as_ref().is_none_or(|u| u.len() == count * 2 && u.iter().all(|v| v.is_finite()))
+            && colors.as_ref().is_none_or(|c| c.len() == count * 4 && c.iter().all(|v| v.is_finite()))
             && attributes.as_ref().is_none_or(|attributes| attributes.len() == count * 2),
         "mesh requires matching position/normal/UV vertices and triangle indices"
     );
@@ -534,9 +598,10 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
         vertices.extend_from_slice(&positions[index * 3..index * 3 + 3]);
         vertices.extend_from_slice(&normals[index * 3..index * 3 + 3]);
         vertices.extend_from_slice(&uvs[index * 2..index * 2 + 2]);
-        match &attributes {
-            Some(attributes) => vertices.extend_from_slice(&attributes[index * 2..index * 2 + 2]),
-            None => vertices.extend([0.0, 0.0]),
+        match (&attributes, &uvs1) {
+            (Some(attributes), _) => vertices.extend_from_slice(&attributes[index * 2..index * 2 + 2]),
+            (None, Some(u1)) => vertices.extend_from_slice(&u1[index * 2..index * 2 + 2]),
+            (None, None) => vertices.extend([0.0, 0.0]),
         }
     }
     let skin = match (joints, weights, skeleton, skin) {
@@ -585,6 +650,8 @@ pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
         }
     };
     mesh.set_morphs(morphs)?;
+    mesh.uvs1 = uvs1.map(|u| u.as_chunks::<2>().0.to_vec());
+    mesh.colors = colors.map(|c| c.as_chunks::<4>().0.to_vec());
     Ok(mesh)
 }
 
@@ -656,6 +723,8 @@ pub(crate) fn checked_mesh(
         precision: None,
         tangents: None,
         morphs: None,
+        uvs1: None,
+        colors: None,
     };
     let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
     ensure!(count != 0, "mesh requires matching position/normal/UV vertices and triangle indices");

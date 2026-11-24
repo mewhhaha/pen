@@ -20,6 +20,16 @@ const TAG_FORWARD: u8 = 3;
 const TAG_HEARTBEAT: u8 = 4;
 const TAG_ACK: u8 = 5;
 const TAG_LEAVE: u8 = 6;
+const TAG_LIST_ROOMS: u8 = 7;
+const TAG_ROOMS: u8 = 8;
+
+/// Public lobby summary of an active relay room for room discovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoomSummary {
+    pub room: String,
+    pub occupied: u8,
+    pub capacity: u8,
+}
 
 /// Control and data packets exchanged between a peer and a relay server or
 /// multiplexed WebRTC DataChannel bridge.
@@ -37,6 +47,10 @@ pub enum RelayPacket {
     Ack { nonce: u32 },
     /// Graceful peer disconnect.
     Leave { player: u8 },
+    /// Lobby room discovery request.
+    ListRooms,
+    /// Lobby room discovery response.
+    Rooms(Vec<RoomSummary>),
 }
 
 impl RelayPacket {
@@ -79,6 +93,21 @@ impl RelayPacket {
                 out.push(TAG_LEAVE);
                 out.push(*player);
             }
+            Self::ListRooms => out.push(TAG_LIST_ROOMS),
+            Self::Rooms(rooms) => {
+                out.push(TAG_ROOMS);
+                let count = u16::try_from(rooms.len()).map_err(|_| anyhow::anyhow!("too many rooms"))?;
+                out.extend_from_slice(&count.to_le_bytes());
+                for r in rooms {
+                    let bytes = r.room.as_bytes();
+                    let rlen = u8::try_from(bytes.len()).map_err(|_| anyhow::anyhow!("room name > 255 bytes"))?;
+                    out.push(r.occupied);
+                    out.push(r.capacity);
+                    out.push(rlen);
+                    out.extend_from_slice(bytes);
+                }
+                ensure!(out.len() <= MAX_FRAME_BYTES, "rooms listing exceeds max frame");
+            }
         }
         Ok(out)
     }
@@ -116,6 +145,29 @@ impl RelayPacket {
             TAG_LEAVE => {
                 ensure!(rest.len() == 1, "truncated Leave packet");
                 Ok(Self::Leave { player: rest[0] })
+            }
+            TAG_LIST_ROOMS => {
+                ensure!(rest.is_empty(), "trailing bytes in ListRooms");
+                Ok(Self::ListRooms)
+            }
+            TAG_ROOMS => {
+                ensure!(rest.len() >= 2, "truncated Rooms packet");
+                let count = usize::from(u16::from_le_bytes([rest[0], rest[1]]));
+                let mut pos = 2;
+                let mut rooms = Vec::with_capacity(count.min(256));
+                for _ in 0..count {
+                    ensure!(pos + 3 <= rest.len(), "truncated RoomSummary");
+                    let occupied = rest[pos];
+                    let capacity = rest[pos + 1];
+                    let rlen = usize::from(rest[pos + 2]);
+                    pos += 3;
+                    ensure!(pos + rlen <= rest.len(), "truncated RoomSummary name");
+                    let room = std::str::from_utf8(&rest[pos..pos + rlen])?.to_owned();
+                    pos += rlen;
+                    rooms.push(RoomSummary { room, occupied, capacity });
+                }
+                ensure!(pos == rest.len(), "trailing bytes in Rooms");
+                Ok(Self::Rooms(rooms))
             }
             other => bail!("unknown relay packet tag {other}"),
         }
@@ -293,17 +345,28 @@ impl RelayBroker {
     pub fn handle(&mut self, client: ClientId, packet: RelayPacket) -> Vec<(ClientId, RelayPacket)> {
         match packet {
             RelayPacket::Join { room, player, players, token } => {
-                if !(2..=32).contains(&players) || player >= players {
+                if !(2..=32).contains(&players) || player >= players || room.is_empty() || room.len() > 255 {
                     return Vec::new();
                 }
+                // Validate target room before modifying existing membership so joins are atomic.
+                if let Some(existing) = self.rooms.get(&room) {
+                    if existing.players != players || existing.token != token {
+                        return Vec::new();
+                    }
+                    // Reject hijacking an active slot occupied by a different client.
+                    if let Some(&occupant) = existing.members.get(&player)
+                        && occupant != client
+                    {
+                        return Vec::new();
+                    }
+                }
+                // Remove any prior room/slot membership for this client atomically.
+                self.disconnect(client);
                 let entry = self.rooms.entry(room.clone()).or_insert_with(|| Room {
                     players,
                     token,
                     members: HashMap::new(),
                 });
-                if entry.players != players || entry.token != token {
-                    return Vec::new();
-                }
                 entry.members.insert(player, client);
                 self.membership.insert(client, (room, player));
                 vec![(client, RelayPacket::Joined { player, players })]
@@ -321,8 +384,45 @@ impl RelayBroker {
                 self.disconnect(client);
                 Vec::new()
             }
-            RelayPacket::Joined { .. } | RelayPacket::Ack { .. } => Vec::new(),
+            RelayPacket::ListRooms => vec![(client, RelayPacket::Rooms(self.list_rooms_within_frame()))],
+            RelayPacket::Joined { .. } | RelayPacket::Ack { .. } | RelayPacket::Rooms(_) => Vec::new(),
         }
+    }
+
+    /// Returns a deterministically sorted list of active rooms for lobby discovery.
+    pub fn list_rooms(&self) -> Vec<RoomSummary> {
+        let mut out: Vec<RoomSummary> = self
+            .rooms
+            .iter()
+            .map(|(name, room)| RoomSummary {
+                room: name.clone(),
+                occupied: u8::try_from(room.members.len()).unwrap_or(u8::MAX),
+                capacity: room.players,
+            })
+            .collect();
+        out.sort_by(|a, b| a.room.cmp(&b.room));
+        out
+    }
+
+    /// Returns a deterministically sorted page of active rooms.
+    pub fn list_rooms_page(&self, offset: usize, limit: usize) -> Vec<RoomSummary> {
+        self.list_rooms().into_iter().skip(offset).take(limit).collect()
+    }
+
+    /// Returns as many deterministically sorted active rooms as fit inside one
+    /// [`MAX_FRAME_BYTES`] [`RelayPacket::Rooms`] wire frame (never fails `encode()`).
+    pub fn list_rooms_within_frame(&self) -> Vec<RoomSummary> {
+        let mut out = Vec::new();
+        let mut used = 3usize; // TAG_ROOMS (1) + count (2)
+        for summary in self.list_rooms() {
+            let entry_bytes = 3 + summary.room.len();
+            if used + entry_bytes > MAX_FRAME_BYTES || out.len() >= usize::from(u16::MAX) {
+                break;
+            }
+            used += entry_bytes;
+            out.push(summary);
+        }
+        out
     }
 
     /// Removes `client` from its room (cleaning up empty rooms).
@@ -438,5 +538,23 @@ mod tests {
         p0.leave();
         p1.leave();
         assert_eq!(hub.borrow().broker.room_count(), 0);
+    }
+
+    #[test]
+    fn relay_broker_joins_atomically_rejects_slot_hijack_and_bounds_room_list() {
+        let mut broker = RelayBroker::new();
+        assert!(!broker.handle(1, RelayPacket::Join { room: "alpha".into(), player: 0, players: 2, token: 5 }).is_empty());
+        assert!(broker.handle(2, RelayPacket::Join { room: "alpha".into(), player: 0, players: 2, token: 5 }).is_empty());
+        assert!(!broker.handle(1, RelayPacket::Join { room: "beta".into(), player: 1, players: 2, token: 9 }).is_empty());
+        assert_eq!(broker.room_count(), 1);
+        assert_eq!(broker.list_rooms()[0].room, "beta");
+        for i in 0..400u32 {
+            let name = format!("room-{i:04}-{}", "x".repeat(200));
+            broker.handle(100 + u64::from(i), RelayPacket::Join { room: name, player: 0, players: 2, token: 1 });
+        }
+        let replies = broker.handle(999, RelayPacket::ListRooms);
+        assert_eq!(replies.len(), 1);
+        let encoded = replies[0].1.encode().unwrap();
+        assert!(encoded.len() <= MAX_FRAME_BYTES);
     }
 }

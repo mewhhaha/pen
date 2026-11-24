@@ -127,10 +127,12 @@ fn emissive_strength_multiplies_the_glow_and_is_the_surfaces_too() {
 }
 
 #[test]
-fn the_textures_of_the_extensions_are_reported_once_a_kind_and_left_out() {
+fn the_textures_of_the_extensions_are_imported_when_backing_images_exist() {
+    let directory = directory("surface_textures");
+    let out = directory.join("assets");
     let texture = json!({"index": 0});
-    let (material, notes) = imported(
-        "textures",
+    let (mut document, mut bytes) = model(
+        &square(),
         json!({"extensions": {
             "KHR_materials_clearcoat": {
                 "clearcoatFactor": 1.0, "clearcoatTexture": texture, "clearcoatRoughnessTexture": texture,
@@ -150,51 +152,241 @@ fn the_textures_of_the_extensions_are_reported_once_a_kind_and_left_out() {
             "KHR_materials_volume",
             "KHR_materials_specular",
         ],
+        json!({}),
     );
-    // Their factors are in, the textures are not named anywhere.
-    assert_eq!(material["surface"], json!({"clearcoat": 1.0}));
-    assert!(!material.to_string().contains("Texture"), "{material}");
-    assert_eq!(
-        notes,
-        [
-            "KHR_materials_anisotropy's textures (anisotropyTexture) are not imported; its factors are",
-            "KHR_materials_clearcoat's textures (clearcoatNormalTexture, clearcoatRoughnessTexture, clearcoatTexture) \
-             are not imported; its factors are",
-            "KHR_materials_sheen's textures (sheenColorTexture, sheenRoughnessTexture) are not imported; its factors are",
-            "KHR_materials_specular's textures (specularColorTexture, specularTexture) are not imported; its factors are",
-            "KHR_materials_transmission's textures (transmissionTexture) are not imported; its factors are",
-            "KHR_materials_volume's textures (thicknessTexture) are not imported; its factors are",
-        ]
-    );
+    while !bytes.len().is_multiple_of(4) {
+        bytes.push(0);
+    }
+    let img = png([200, 128, 64, 255]);
+    let view_idx = document["bufferViews"].as_array().unwrap().len();
+    document["bufferViews"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"buffer": 0, "byteOffset": bytes.len(), "byteLength": img.len()}));
+    bytes.extend_from_slice(&img);
+    document["images"] = json!([{"bufferView": view_idx, "mimeType": "image/png", "name": "lobe"}]);
+    document["textures"] = json!([{"source": 0}]);
+    document["buffers"][0]["byteLength"] = bytes.len().into();
+    let file = gltf_file(&directory.join("surface_textures.gltf"), document, &bytes);
+    let imported = import(&file, &out, &Options::default()).unwrap();
+    assert!(imported.notes.is_empty(), "{:?}", imported.notes);
+    let material = read_json(&out.join(&imported.materials[0]));
+    let surface = &material["surface"];
+    assert_eq!(surface["clearcoat"], 1.0);
+    for key in [
+        "clearcoatTexture",
+        "clearcoatRoughnessTexture",
+        "clearcoatNormalTexture",
+        "sheenColorTexture",
+        "sheenRoughnessTexture",
+        "anisotropyTexture",
+        "transmissionTexture",
+        "thicknessTexture",
+        "specularTexture",
+        "specularColorTexture",
+    ] {
+        assert!(surface[key].as_str().is_some_and(|s| s.ends_with(".png")), "missing {key}: {surface}");
+    }
 }
 
 #[test]
-fn a_kind_is_reported_once_however_many_materials_use_it() {
-    let directory = directory("twice");
+fn punctual_lights_and_gpu_instancing_and_extra_attributes_are_imported() {
+    let directory = directory("lights_instances_attrs");
     let out = directory.join("assets");
-    let texture = json!({"index": 0});
-    let (mut document, bytes) = model(&square(), json!({"name": "a"}), &["KHR_materials_transmission"], json!({}));
-    let glass = |factor: f64| {
-        json!({"name": format!("glass{factor}"), "extensions": {
-            "KHR_materials_transmission": {"transmissionFactor": factor, "transmissionTexture": texture},
-        }})
+    let (mut document, mut bytes) = model(
+        &square(),
+        json!({"name": "inst"}),
+        &["KHR_lights_punctual", "EXT_mesh_gpu_instancing"],
+        json!({}),
+    );
+    let mut push_f32_accessor = |doc: &mut Value, data: &[f32], acc_type: &str, count: usize| -> usize {
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+        let offset = bytes.len();
+        for &v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let bv = doc["bufferViews"].as_array().unwrap().len();
+        doc["bufferViews"].as_array_mut().unwrap().push(json!({
+            "buffer": 0, "byteOffset": offset, "byteLength": data.len() * 4,
+        }));
+        let acc = doc["accessors"].as_array().unwrap().len();
+        doc["accessors"].as_array_mut().unwrap().push(json!({
+            "bufferView": bv, "componentType": 5126, "count": count, "type": acc_type,
+        }));
+        acc
     };
-    document["materials"] = json!([glass(0.25), glass(0.75)]);
-    document["meshes"][0]["primitives"] = json!([
-        document["meshes"][0]["primitives"][0].clone(),
-        {
-            "attributes": document["meshes"][0]["primitives"][0]["attributes"].clone(),
-            "indices": document["meshes"][0]["primitives"][0]["indices"].clone(),
-            "material": 1,
-        },
-    ]);
-    let file = gltf_file(&directory.join("twice.gltf"), document, &bytes);
+    let uv1_acc = push_f32_accessor(&mut document, &[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0], "VEC2", 4);
+    let col_acc = push_f32_accessor(
+        &mut document,
+        &[1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        "VEC4",
+        4,
+    );
+    let inst_t = push_f32_accessor(&mut document, &[1.0, 2.0, 3.0, -4.0, 5.0, 6.0], "VEC3", 2);
+    document["meshes"][0]["primitives"][0]["attributes"]["TEXCOORD_1"] = uv1_acc.into();
+    document["meshes"][0]["primitives"][0]["attributes"]["COLOR_0"] = col_acc.into();
+    document["nodes"][0]["extensions"] = json!({
+        "EXT_mesh_gpu_instancing": { "attributes": { "TRANSLATION": inst_t } }
+    });
+    document["extensions"] = json!({
+        "KHR_lights_punctual": {
+            "lights": [{
+                "name": "lamp",
+                "type": "spot",
+                "color": [1.0, 0.8, 0.5],
+                "intensity": 12.0,
+                "range": 25.0,
+                "spot": { "innerConeAngle": 0.2, "outerConeAngle": 0.5 }
+            }]
+        }
+    });
+    document["nodes"].as_array_mut().unwrap().push(json!({
+        "name": "lamp_node",
+        "translation": [3.0, 4.0, 5.0],
+        "extensions": { "KHR_lights_punctual": { "light": 0 } }
+    }));
+    document["scenes"][0]["nodes"].as_array_mut().unwrap().push(json!(1));
+    document["buffers"][0]["byteLength"] = bytes.len().into();
+    let file = gltf_file(&directory.join("lights_instances_attrs.gltf"), document, &bytes);
     let imported = import(&file, &out, &Options::default()).unwrap();
-    assert_eq!(imported.materials.len(), 2);
-    assert_eq!(imported.notes.len(), 1, "{:?}", imported.notes);
-    let surfaces: Vec<Value> =
-        imported.materials.iter().map(|key| read_json(&out.join(key))["surface"].clone()).collect();
-    assert_eq!(surfaces, [json!({"transmission": 0.25}), json!({"transmission": 0.75})]);
+    assert!(imported.notes.is_empty(), "{:?}", imported.notes);
+    assert_eq!(imported.lights.len(), 1);
+    assert_eq!(imported.lights[0].kind, "spot");
+    assert_eq!(imported.lights[0].position, [3.0, 4.0, 5.0]);
+    assert_eq!(imported.lights[0].intensity, 12.0);
+    assert_eq!(imported.meshes[0].instances.len(), 2);
+    assert_eq!(imported.meshes[0].instances[1].translation, [-4.0, 5.0, 6.0]);
+    let mesh = read_json(&out.join(&imported.meshes[0].mesh));
+    assert_eq!(mesh["uvs1"].as_array().unwrap().len(), 8);
+    assert_eq!(mesh["colors"].as_array().unwrap().len(), 16);
+    assert_eq!(mesh["instances"]["data"].as_array().unwrap().len(), 40, "2 instances * 20 floats");
+}
+
+#[test]
+fn instancing_applies_node_world_times_trs_and_validates_normalized_rotations_and_required_exts() {
+    let directory = directory("inst_order");
+    let out = directory.join("assets");
+    // Parent node rotated 90° around +Z: (x, y, z) -> (-y, x, z).
+    // Instance translated by (10, 0, 0) in node-local space -> world translation MUST be (0, 10, 0)!
+    let s = std::f32::consts::FRAC_1_SQRT_2;
+    let (mut document, mut bytes) = model(
+        &square(),
+        json!({"name": "inst_order"}),
+        &["KHR_lights_punctual", "EXT_mesh_gpu_instancing"],
+        json!({}),
+    );
+    document["extensionsRequired"] = json!(["KHR_lights_punctual", "EXT_mesh_gpu_instancing"]);
+    while !bytes.len().is_multiple_of(4) {
+        bytes.push(0);
+    }
+    let t_off = bytes.len();
+    for &v in &[10.0f32, 0.0, 0.0] {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let t_bv = document["bufferViews"].as_array().unwrap().len();
+    document["bufferViews"].as_array_mut().unwrap().push(json!({"buffer": 0, "byteOffset": t_off, "byteLength": 12}));
+    let t_acc = document["accessors"].as_array().unwrap().len();
+    document["accessors"].as_array_mut().unwrap().push(json!({
+        "bufferView": t_bv, "componentType": 5126, "count": 1, "type": "VEC3"
+    }));
+    // Normalized BYTE (5120) identity rotation [0, 0, 0, 127].
+    let r_off = bytes.len();
+    bytes.extend_from_slice(&[0u8, 0, 0, 127]);
+    let r_bv = document["bufferViews"].as_array().unwrap().len();
+    document["bufferViews"].as_array_mut().unwrap().push(json!({"buffer": 0, "byteOffset": r_off, "byteLength": 4}));
+    let r_acc = document["accessors"].as_array().unwrap().len();
+    document["accessors"].as_array_mut().unwrap().push(json!({
+        "bufferView": r_bv, "componentType": 5120, "normalized": true, "count": 1, "type": "VEC4"
+    }));
+    document["nodes"][0]["rotation"] = json!([0.0, 0.0, s, s]);
+    document["nodes"][0]["extensions"] = json!({
+        "EXT_mesh_gpu_instancing": { "attributes": { "TRANSLATION": t_acc, "ROTATION": r_acc } }
+    });
+    // Also test spot: {} default cone angles & tiny scale orientation preservation.
+    document["extensions"] = json!({
+        "KHR_lights_punctual": { "lights": [{ "type": "spot", "spot": {} }] }
+    });
+    document["nodes"].as_array_mut().unwrap().push(json!({
+        "name": "tiny_spot",
+        "rotation": [0.0, s, 0.0, s], // 90° around Y: local -Z -> world -X
+        "scale": [1e-10, 1e-10, 1e-10],
+        "extensions": { "KHR_lights_punctual": { "light": 0 } }
+    }));
+    document["scenes"][0]["nodes"].as_array_mut().unwrap().push(json!(1));
+    document["buffers"][0]["byteLength"] = bytes.len().into();
+    let file = gltf_file(&directory.join("inst_order.gltf"), document, &bytes);
+    let imported = import(&file, &out, &Options::default()).unwrap();
+    let mesh = read_json(&out.join(&imported.meshes[0].mesh));
+    #[allow(clippy::cast_possible_truncation, reason = "test JSON f32")]
+    let data: Vec<f32> = mesh["instances"]["data"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+    // Column 3 of composed matrix (indices 12, 13, 14) must be (0, 10, 0) from Rz(90°) * (10, 0, 0).
+    assert!(data[12].abs() < 1e-4 && (data[13] - 10.0).abs() < 1e-4 && data[14].abs() < 1e-4, "{data:?}");
+    // Spot defaults: inner = 0.0, outer = PI/4; direction = (-1, 0, 0) despite 1e-10 node scale!
+    assert_eq!(imported.lights[0].inner_cone_angle, Some(0.0));
+    assert!((imported.lights[0].outer_cone_angle.unwrap() - std::f32::consts::FRAC_PI_4).abs() < 1e-5);
+    assert!((imported.lights[0].direction[0] + 1.0).abs() < 1e-4, "{:?}", imported.lights[0].direction);
+}
+
+#[test]
+fn unskinned_morph_weight_animations_are_preserved_per_mesh_node() {
+    let directory = directory("unskinned_morph_anim");
+    let out = directory.join("assets");
+    let (mut document, mut bytes) = model(&square(), json!({"name": "face"}), &[], json!({}));
+    let mut push_f32 = |doc: &mut Value, data: &[f32], acc_type: &str, count: usize| -> usize {
+        while !bytes.len().is_multiple_of(4) {
+            bytes.push(0);
+        }
+        let off = bytes.len();
+        for &v in data {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let bv = doc["bufferViews"].as_array().unwrap().len();
+        doc["bufferViews"].as_array_mut().unwrap().push(json!({"buffer": 0, "byteOffset": off, "byteLength": data.len() * 4}));
+        let acc = doc["accessors"].as_array().unwrap().len();
+        doc["accessors"].as_array_mut().unwrap().push(json!({
+            "bufferView": bv, "componentType": 5126, "count": count, "type": acc_type,
+            "min": if acc_type == "SCALAR" { json!([data[0]]) } else { Value::Null },
+            "max": if acc_type == "SCALAR" { json!([*data.last().unwrap()]) } else { Value::Null },
+        }));
+        if acc_type != "SCALAR" {
+            doc["accessors"][acc].as_object_mut().unwrap().remove("min");
+            doc["accessors"][acc].as_object_mut().unwrap().remove("max");
+        }
+        acc
+    };
+    let delta_pos = push_f32(&mut document, &[0.0, 0.5, 0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 0.0], "VEC3", 4);
+    document["meshes"][0]["primitives"][0]["targets"] = json!([{ "POSITION": delta_pos }]);
+    let times = push_f32(&mut document, &[0.0, 1.0], "SCALAR", 2);
+    let weights_a = push_f32(&mut document, &[0.0, 1.0], "SCALAR", 2);
+    let weights_b = push_f32(&mut document, &[1.0, 0.0], "SCALAR", 2);
+    // Add a second mesh node animated by the SAME clip with different weights.
+    document["nodes"].as_array_mut().unwrap().push(json!({"name": "face_b", "mesh": 0}));
+    document["scenes"][0]["nodes"].as_array_mut().unwrap().push(json!(1));
+    document["animations"] = json!([{
+        "name": "smile",
+        "samplers": [
+            { "input": times, "output": weights_a, "interpolation": "LINEAR" },
+            { "input": times, "output": weights_b, "interpolation": "LINEAR" }
+        ],
+        "channels": [
+            { "sampler": 0, "target": { "node": 0, "path": "weights" } },
+            { "sampler": 1, "target": { "node": 1, "path": "weights" } }
+        ]
+    }]);
+    document["buffers"][0]["byteLength"] = bytes.len().into();
+    let file = gltf_file(&directory.join("unskinned_morph_anim.gltf"), document, &bytes);
+    let imported = import(&file, &out, &Options::default()).unwrap();
+    assert_eq!(imported.meshes.len(), 2);
+    let m0 = read_json(&out.join(&imported.meshes[0].mesh));
+    let m1 = read_json(&out.join(&imported.meshes[1].mesh));
+    // Each unskinned mesh has its own rig containing ONLY its own morph channel (not summed together!).
+    assert_eq!(m0["clips"][0]["channels"].as_array().unwrap().len(), 1);
+    assert_eq!(m1["clips"][0]["channels"].as_array().unwrap().len(), 1);
+    assert_eq!(m0["clips"][0]["channels"][0]["path"], "weights");
+    assert_eq!(m0["clips"][0]["channels"][0]["values"], json!([0.0, 1.0]));
+    assert_eq!(m1["clips"][0]["channels"][0]["values"], json!([1.0, 0.0]));
 }
 
 #[test]
@@ -328,11 +520,11 @@ fn every_extension_at_once_gives_every_key_and_what_is_left_out() {
     assert_eq!(
         material["surface"],
         json!({
-            "clearcoat": 0.75, "clearcoatRoughness": 0.125,
+            "clearcoat": 0.75, "clearcoatRoughness": 0.125, "clearcoatTexture": "everything_white.png",
             "sheenColor": [0.25, 0.5, 0.75], "sheenRoughness": 0.5,
-            "anisotropy": 0.5, "anisotropyRotation": -0.5,
+            "anisotropy": 0.5, "anisotropyRotation": -0.5, "anisotropyTexture": "everything_white.png",
             "transmission": 1.0,
-            "thickness": 1.5, "attenuationDistance": 2.0, "attenuationColor": [1.0, 0.5, 0.25],
+            "thickness": 1.5, "thicknessTexture": "everything_white.png", "attenuationDistance": 2.0, "attenuationColor": [1.0, 0.5, 0.25],
             "ior": 1.45,
             "specular": 0.75, "specularColor": [0.5, 1.0, 1.5],
             "emissiveStrength": 2.0,
@@ -341,6 +533,6 @@ fn every_extension_at_once_gives_every_key_and_what_is_left_out() {
     // The factors the import has always read stay.
     assert_eq!(material["color"], json!([0.5, 0.25, 1.0, 1.0]));
     assert_eq!(material["instanceParameters"], json!([0.75, 0.5, 1.0, 0.0]));
-    assert_eq!(notes.len(), 4, "{notes:#?}");
+    assert_eq!(notes.len(), 1, "{notes:#?}");
     assert!(notes.iter().any(|note| note.contains("KHR_materials_iridescence")));
 }

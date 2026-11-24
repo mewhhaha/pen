@@ -380,6 +380,12 @@ pub fn split(geometry: &mut Geometry, corners: &[[f32; 4]]) {
                 geometry.positions.push(geometry.positions[vertex]);
                 geometry.normals.push(geometry.normals[vertex]);
                 geometry.uvs.push(geometry.uvs[vertex]);
+                if !geometry.uvs1.is_empty() {
+                    geometry.uvs1.push(geometry.uvs1[vertex]);
+                }
+                if !geometry.colors.is_empty() {
+                    geometry.colors.push(geometry.colors[vertex]);
+                }
                 if !geometry.joints.is_empty() {
                     geometry.joints.push(geometry.joints[vertex]);
                     geometry.weights.push(geometry.weights[vertex]);

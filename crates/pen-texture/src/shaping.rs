@@ -62,15 +62,28 @@ pub struct ShapedLine {
 /// Primary font followed by zero or more fallback fonts.
 pub struct FontChain<'a> {
     fonts: Vec<FontRef<'a>>,
+    font_ids: Vec<u64>,
+}
+
+fn hash_font_bytes(bytes: &[u8]) -> u64 {
+    // Deterministic 64-bit FNV-1a fingerprint of the font's raw bytes.
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 impl<'a> FontChain<'a> {
     pub fn new(font_bytes: &[&'a [u8]]) -> Result<Self> {
         let mut fonts = Vec::with_capacity(font_bytes.len());
+        let mut font_ids = Vec::with_capacity(font_bytes.len());
         for (i, bytes) in font_bytes.iter().enumerate() {
             fonts.push(FontRef::new(bytes).with_context(|| format!("parsing font {i} in fallback chain"))?);
+            font_ids.push(hash_font_bytes(bytes));
         }
-        Ok(Self { fonts })
+        Ok(Self { fonts, font_ids })
     }
 
     pub fn len(&self) -> usize {
@@ -79,6 +92,15 @@ impl<'a> FontChain<'a> {
 
     pub fn is_empty(&self) -> bool {
         self.fonts.is_empty()
+    }
+
+    pub fn font(&self, index: usize) -> Option<&FontRef<'a>> {
+        self.fonts.get(index)
+    }
+
+    /// Stable content-hash identity for the font at `index`.
+    pub fn font_id(&self, index: usize) -> Option<u64> {
+        self.font_ids.get(index).copied()
     }
 
     fn resolve_char(&self, ch: char) -> (usize, GlyphId) {

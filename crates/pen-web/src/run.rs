@@ -208,6 +208,15 @@ fn keep(name: &'static str, saved: SavedState, last: Option<u64>) -> Option<u64>
     Some(hash)
 }
 
+/// Optional browser WebSocket relay netplay configuration passed via `options.netRelay`.
+pub struct NetRelayConfig {
+    pub url: String,
+    pub room: String,
+    pub player: usize,
+    pub players: usize,
+    pub token: u64,
+}
+
 /// How the page runs the game.
 pub struct Options {
     /// Served by `pen web`: new builds load as they come, Bake writes the
@@ -225,6 +234,8 @@ pub struct Options {
     pub name: String,
     /// Where the page's link has a recording to play (`replay::linked`).
     pub replay: Option<String>,
+    /// Optional WebSocket relay netplay session (`BrowserRelayLink`).
+    pub netplay: Option<pen_runtime::net::Netplay>,
 }
 
 pub struct Browser {
@@ -284,6 +295,9 @@ pub struct Browser {
     recorder: Option<Recorder>,
     /// The recording the page's link names, played first.
     linked: Option<String>,
+    /// Active browser WebSocket relay netplay session, when configured via `options.netRelay`.
+    #[allow(dead_code)]
+    netplay: Option<pen_runtime::net::Netplay>,
 }
 
 impl Browser {
@@ -310,6 +324,7 @@ impl Browser {
         let mut services = crate::services::standard();
         services.register(Box::new(pen_runtime::captions::CaptionsService(captions.clone())));
         let kernels = game_wasm.as_deref().and_then(crate::kernels::WebKernelService::maybe_new);
+        let netplay = options.netplay;
         game.hash_packets(options.qualify);
         Ok(Browser {
             shown: game.take_drawn().unwrap_or_default(),
@@ -348,6 +363,7 @@ impl Browser {
             importing: None,
             recorder: None,
             linked: options.replay,
+            netplay,
         })
     }
 

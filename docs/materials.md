@@ -193,6 +193,17 @@ but the two uniforms.
 
 ## The standard surface
 
+**Where the base lobe differs from Ink's `lighting.brdf`.** The shipped shaders
+light diffuse as albedo times `(1 - metallic)` times the light's colour times the
+cosine, with no `(1 - F)` weight, and a back-facing view still receives diffuse
+light; `lighting.brdf` weights diffuse by `(1 - F)` and returns nothing for a
+back-facing view. The library keeps the shipped model so that existing frames do
+not change, so the specular term and every optional lobe are held to Ink and the
+f64 references, and the diffuse difference is stated here rather than hidden.
+`surface.emissiveStrength` in the block is carried for shaders that want it;
+the library's lobes do not read it, and pen-gltf already multiplies the
+emissive `glow` parameter by it, so it is counted once.
+
 A material shader that wants more than albedo, Lambert and a mirror adds four
 libraries, in this order: `pen_render::LIGHTS_WGSL`, `ENVIRONMENT_WGSL`,
 `SURFACE_LOBES_WGSL` and `SURFACE_WGSL` (the `lit.wgsl` of `pen new` has all of

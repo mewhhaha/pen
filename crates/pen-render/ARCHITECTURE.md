@@ -582,7 +582,10 @@ and mist are applied to the diffused picture, so skin is diffused before it is m
   and no textures: the passes' graph (the one made texture, `diffused across`, and two uniforms) is made
   with the first frame that needs it and kept with the targets, which are keyed on the size, samples and
   quality only, so turning a skin on and off allocates nothing. `GpuTimes::subsurface` times the two
-  passes. Insets and reflection probe captures do not diffuse.
+  passes: 0.34 ms for the two (an RTX 4080 SUPER, 1024 by 1024 at 4 samples, a head filling most
+  of the picture, the frame 0.42 ms against 0.07 ms for the same head without the flag;
+  `cargo test --release -p pen-render --test subsurface cost -- --ignored --nocapture`). Insets and
+  reflection probe captures do not diffuse.
 - *Limits.* The picture the passes blur has the specular light in it: it is diffused with the diffuse
   (a separate specular buffer is a follow-up); the width is one constant; one kernel (skin's) for every
   such material; and translucent surfaces, particles and overlays are drawn after, so a `subsurface`

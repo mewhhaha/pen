@@ -1043,3 +1043,46 @@ fn a_head_with_and_without_the_flag() {
     eprintln!("head: {count} shadowed pixels beside light gain {gain:.4?}");
     assert!(count > 50 && gain[0] > gain[1] && gain[1] > gain[2] && gain[2] > 0.0, "{gain:?}");
 }
+
+/// The diffusion's cost on the GPU (`cargo test --release -p pen-render --test subsurface cost -- --ignored
+/// --nocapture`): a head filling most of a 1024 picture at four samples, the two passes timed, with
+/// the head plain for comparison.
+#[test]
+#[ignore = "a measurement"]
+fn cost() {
+    const COST_SIZE: u32 = 1024;
+    let flesh = |extra: &'static str| Material { shader: "skin.wgsl", color: FLESH, alpha: 1.0, extra };
+    let materials = [
+        flesh(""),
+        flesh(r#""subsurface":true"#),
+        Material { shader: "light.wgsl", color: [0.9; 3], alpha: 1.0, extra: "" },
+    ];
+    let files = [("skin.wgsl", SKIN_SHADER.to_owned()), ("sphere.mesh.json", sphere(48, 96))];
+    let Some(mut rig) = Rig::sized("cost", COST_SIZE, &materials, &files) else { return };
+    rig.load(4, &["light.wgsl", "skin.wgsl"]);
+    rig.renderer.time_passes(true);
+    for (label, skin) in [("plain head", 0), ("diffused head", 1)] {
+        let mut frame = head_frame(skin);
+        // Closer, so the head fills most of the picture.
+        frame.view[14] = -0.2;
+        let (mut totals, mut diffusion) = (Vec::new(), Vec::new());
+        for index in 0..90 {
+            rig.draw(&frame);
+            if let Some(gpu) = rig.renderer.stats().gpu.filter(|_| index >= 40) {
+                totals.push(gpu.total);
+                diffusion.push(gpu.subsurface);
+            }
+            std::thread::sleep(Duration::from_millis(3));
+        }
+        let median = |mut values: Vec<f32>| {
+            values.sort_by(f32::total_cmp);
+            values.get(values.len() / 2).copied().unwrap_or(f32::NAN)
+        };
+        println!(
+            "{label}: the frame {:.3} ms, the diffusion {:.3} ms (medians of {})",
+            median(totals),
+            median(diffusion.clone()),
+            diffusion.len()
+        );
+    }
+}

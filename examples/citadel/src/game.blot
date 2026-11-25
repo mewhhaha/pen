@@ -8,7 +8,7 @@
 // - `ink/animation` + `ink/animation/ik` 6-bone skinned hero rig (`push_skin_palette`)
 //   with `animation.socket` glowing blade attachment & GPU ribbon slash trail
 // - `ink/navigation/voxel` arena heightfield bake + `ink/ai/bt` Behavior Tree
-//   sentinel patrol/chase/attack + Blot 2 `entry kernel steer_crowd` separation
+//   sentinel patrol/chase/attack + Blot 2 `#kernel const steer_crowd` separation
 // - Step 3 GPU outdoor Gerstner water moat (`ENV_WATER_EXT_TAG`) & swaying perimeter
 //   grass (`ENV_FOLIAGE_EXT_TAG`), GPU meshlet-culled sentinels, visual `.matgraph.json`
 //   arcane shards, GPU spark particle bursts, LTC arena torch lights, deferred floor

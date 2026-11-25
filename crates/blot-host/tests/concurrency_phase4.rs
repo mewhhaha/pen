@@ -229,7 +229,7 @@ fn crafted_var_kernel_wasm(
     .concat()
 }
 
-/// Crafts a minimal ABI 8 scalar-only `entry process` whose `blot:finish_invocation` spins forever
+/// Crafts a minimal ABI 8 scalar-only `#process` whose `blot:finish_invocation` spins forever
 /// (testing Law #5(b): successful `proc_step` followed by cleanup Overrun must NOT be masked!).
 fn crafted_spin_cleanup_process_wasm() -> Vec<u8> {
     // ABI 8 exports: `blot:proc_init:p` (U32->Unit), `blot:proc_step:p` (U32->U32), `blot:finish_invocation`
@@ -302,7 +302,7 @@ func s_init (x: U32): U32 => return x
 func s_step (st: own U32) -> (cmd: U32): (U32, U32) =>
   let next = @u32.add st cmd
   return (next, next)
-entry process scalar_only: Process [U32, U32, U32] = { init: s_init, step: s_step }
+#process const scalar_only: Process [U32, U32, U32] = { init: s_init, step: s_step }
 "#,
     )?;
     let abi = blot_host::read_abi(&wasm)?;
@@ -363,7 +363,7 @@ entry process scalar_only: Process [U32, U32, U32] = { init: s_init, step: s_ste
     // Ordinary legacy ABI 8 module WITH exported blot:memory and ZERO kernels/processes still loads cleanly!
     let legacy_wasm = compile_blot(
         r#"
-entry func echo (xs: #[U32]): #[U32] => return copy xs
+#entry func echo (xs: #[U32]): #[U32] => return copy xs
 "#,
     )?;
     let (legacy_meta, legacy_code) = GuestModule::native_bytes(&engine, &legacy_wasm)?;
@@ -385,8 +385,8 @@ entry func echo (xs: #[U32]): #[U32] => return copy xs
 fn kernel_pool_engine_admission_unticked_and_slow_ticking_condvar_wakeup() -> Result<()> {
     let wasm = compile_blot(
         r#"
-entry kernel func double (x: U32): U32 => return @u32.mul x 2
-entry kernel func spin (x: U32): U32 =>
+#kernel func double (x: U32): U32 => return @u32.mul x 2
+#kernel func spin (x: U32): U32 =>
   let acc = x
   for ever:
     acc := @u32.add acc 1
@@ -501,7 +501,7 @@ func run_ctx (ctx: #[U32]) -> (x: U32): U32 =>
     return @panic "slow_trap"
   return @u32.add x ctx[0]
 
-entry kernel prepared_k: Kernel [#[U32], U32, U32] = { prepare: prep, run: run_ctx }
+#kernel const prepared_k: Kernel [#[U32], U32, U32] = { prepare: prep, run: run_ctx }
 
 func var_row (n: U32): #[U32] =>
   let out: #[U32] = #[]
@@ -509,10 +509,10 @@ func var_row (n: U32): #[U32] =>
     @storage.push out (@u32.add n i)
   return out
 
-entry kernel func var_k (n: U32): #[U32] => return var_row n
+#kernel func var_k (n: U32): #[U32] => return var_row n
 
 // 1 MiB fixed row (262,144 U32 words = 1,048,576 bytes) under 2 MiB transport_budget!
-entry kernel func huge_fixed (row: #[262144; U32]): U32 =>
+#kernel func huge_fixed (row: #[262144; U32]): U32 =>
   return @u32.add row[0] row[262143]
 "#,
     )?;
@@ -679,7 +679,7 @@ func alloc_class_blocks (class_words: U32) -> (blocks: U32): U32 =>
   return sum
 
 // cmd encoding: 1 = class-A warmup (small blocks), 2 = class-B test (larger blocks), 3 = huge OOM always
-entry kernel func frag_heap (cmd: U32): U32 =>
+#kernel func frag_heap (cmd: U32): U32 =>
   if cmd == 1:
     return alloc_class_blocks 2000 100
   if cmd == 2:
@@ -691,13 +691,13 @@ func touch_stack (n: U32): U32 =>
   let a = @array.fill n 7
   return a[0]
 
-entry kernel func stack_frag (n: U32): U32 => return touch_stack n
+#kernel func stack_frag (n: U32): U32 => return touch_stack n
 
 // Witness (5): fixed, variable, and variable-overflow zero heap_live_bytes drift across 100 batches
-entry kernel func drift_fixed (x: U32): #[4; U32] =>
+#kernel func drift_fixed (x: U32): #[4; U32] =>
   return #[x, @u32.add x 1, @u32.add x 2, @u32.add x 3]
 
-entry kernel func drift_var (n: U32): #[U32] =>
+#kernel func drift_var (n: U32): #[U32] =>
   let out: #[U32] = #[]
   for i in 0..n:
     @storage.push out i
@@ -718,7 +718,7 @@ func prep_ctx (w: #[U32]): #[U32] =>
 func run_ctx (ctx: #[U32]) -> (x: U32): U32 =>
   return @u32.add x ctx[0]
 
-entry kernel ctx_k: Kernel [#[U32], U32, U32] = { prepare: prep_ctx, run: run_ctx }
+#kernel const ctx_k: Kernel [#[U32], U32, U32] = { prepare: prep_ctx, run: run_ctx }
 "#,
     )?;
     let engine = blot_host::engine()?;
@@ -865,7 +865,7 @@ func fast_init (x: U32): U32 => return x
 func fast_step (st: own U32) -> (cmd: U32): (U32, U32) =>
   let next = @u32.add st cmd
   return (next, next)
-entry process fast: Process [U32, U32, U32] = { init: fast_init, step: fast_step }
+#process const fast: Process [U32, U32, U32] = { init: fast_init, step: fast_step }
 
 func slow_init (x: U32): U32 => return x
 func slow_step (st: own U32) -> (cmd: U32): (U32, U32) =>
@@ -877,11 +877,11 @@ func slow_step (st: own U32) -> (cmd: U32): (U32, U32) =>
     for i in 0..cmd:
       acc := @u32.add acc 1
   return (acc, acc)
-entry process slow: Process [U32, U32, U32] = { init: slow_init, step: slow_step }
+#process const slow: Process [U32, U32, U32] = { init: slow_init, step: slow_step }
 
 func unit_init (_: Unit): U32 => return 0
 func unit_step (st: own U32) -> (_: Unit): (U32, Unit) => return (@u32.add st 1, ())
-entry process unit_p: Process [Unit, Unit, Unit] = { init: unit_init, step: unit_step }
+#process const unit_p: Process [Unit, Unit, Unit] = { init: unit_init, step: unit_step }
 "#,
     )?;
 
@@ -962,9 +962,9 @@ func s_step (st: own U32) -> (cmd: U32): (U32, U32) =>
     for ever:
       acc := @u32.add acc 1
   return (@u32.add acc cmd, @u32.add acc cmd)
-entry process short_dl: Process [U32, U32, U32] = { init: s_init, step: s_step }
-entry process long_dl: Process [U32, U32, U32] = { init: s_init, step: s_step }
-entry process done_p: Process [U32, U32, U32] = { init: s_init, step: s_step }
+#process const short_dl: Process [U32, U32, U32] = { init: s_init, step: s_step }
+#process const long_dl: Process [U32, U32, U32] = { init: s_init, step: s_step }
+#process const done_p: Process [U32, U32, U32] = { init: s_init, step: s_step }
 "#,
     )?;
     let b_mod2 = GuestModule::new(&b_eng, &wasm_two_spin, None)?;

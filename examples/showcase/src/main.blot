@@ -1,17 +1,17 @@
 // Vertical-slice Ink + Pen showcase & interactive 3D scene editor.
-// Declares multi-core `entry kernel` workloads backed by `ink/kernel_kits`
+// Declares multi-core `#kernel` workloads backed by `ink/kernel_kits`
 // and runs the interactive scene-graph editor over Pen's Session 2 loop.
 import * as kernel_kits from "ink/kernel_kits"
 import { run } from "./game"
 
-entry kernel bake_terrain : Kernel [#[F32], #[2; F32], #[4; F32]] = {
+#kernel const bake_terrain: Kernel [#[F32], #[2; F32], #[4; F32]] = {
   prepare: kernel_kits.terrain_prepare,
   run: kernel_kits.terrain_eval_cell,
 }
 
-entry kernel steer_crowd : Kernel [#[F32], #[4; F32], #[4; F32]] = {
+#kernel const steer_crowd: Kernel [#[F32], #[4; F32], #[4; F32]] = {
   prepare: kernel_kits.crowd_prepare,
   run: kernel_kits.crowd_steer_agent,
 }
 
-entry const main = func host => run bake_terrain host
+#entry const main = func host => run bake_terrain host

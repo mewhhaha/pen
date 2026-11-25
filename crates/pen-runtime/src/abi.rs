@@ -9,9 +9,9 @@ use anyhow::{Result, anyhow, bail, ensure};
 
 /// The custom section the manifest is in.
 pub const ABI_SECTION: &str = "blot:abi";
-/// The custom section declaring `entry kernel` manifests (version 1).
+/// The custom section declaring `#kernel` manifests (version 1).
 pub const KERNELS_SECTION: &str = "blot:kernels";
-/// The custom section declaring `entry process` manifests (version 1).
+/// The custom section declaring `#process` manifests (version 1).
 pub const PROCESSES_SECTION: &str = "blot:processes";
 /// Default logical transport packet ceiling in bytes (2 MiB).
 pub const DEFAULT_TRANSPORT_BUDGET: u32 = 2_097_152;
@@ -53,7 +53,7 @@ pub struct WireSchema {
     pub schema_hash: u64,
 }
 
-/// One `entry kernel` descriptor from `blot:kernels` v1 (0-based index == `kernel_id`).
+/// One `#kernel` descriptor from `blot:kernels` v1 (0-based index == `kernel_id`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelManifest {
     pub id: u32,
@@ -79,7 +79,7 @@ impl KernelManifest {
     }
 }
 
-/// One `entry process` descriptor from `blot:processes` v1.
+/// One `#process` descriptor from `blot:processes` v1.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessManifest {
     pub name: String,
@@ -215,9 +215,9 @@ pub struct GuestAbi {
     /// Functions whose callback is `concurrent` (manifest tag 13): tasks
     /// may suspend in it side by side.
     pub concurrent: Vec<String>,
-    /// `entry kernel` descriptors parsed from `blot:kernels` v1 (index == `kernel_id`).
+    /// `#kernel` descriptors parsed from `blot:kernels` v1 (index == `kernel_id`).
     pub kernels: Vec<KernelManifest>,
-    /// `entry process` descriptors parsed from `blot:processes` v1.
+    /// `#process` descriptors parsed from `blot:processes` v1.
     pub processes: Vec<ProcessManifest>,
     /// Declared logical transport ceiling in bytes (`DEFAULT_TRANSPORT_BUDGET` if absent).
     pub transport_budget: u32,

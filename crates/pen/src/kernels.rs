@@ -581,7 +581,7 @@ pub struct KernelService {
 
 impl KernelService {
     /// Creates a `KernelService` iff `PEN_KERNELS != 0` and `worker_module` declares
-    /// at least one `entry kernel`.
+    /// at least one `#kernel`.
     pub fn maybe_new(worker_engine: wasmtime::Engine, worker_module: GuestModule, has_deadlines: bool) -> Option<Self> {
         if !env_kernels_enabled() {
             return None;
@@ -1218,7 +1218,7 @@ mod tests {
         let src = r#"
 func prep (ctx: #[F32]) => #[ctx[0], ctx[1]]
 func run_item (ctx: #[F32]) -> (x: F32) => #[x + ctx[0], x + ctx[1]]
-entry kernel scale_ctx: Kernel [#[F32], F32, #[F32]] = { prepare: prep, run: run_item }
+#kernel const scale_ctx: Kernel [#[F32], F32, #[F32]] = { prepare: prep, run: run_item }
 "#;
         let mut svc = dummy_service_from_blot(src);
         let manifest = svc.kernels[0].clone();

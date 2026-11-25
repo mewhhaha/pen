@@ -6,7 +6,7 @@
 //   bounded undo/redo history, and Play-in-Editor snapshot/restore (`P`)
 // - `ink/sequencer` Hermite/linear animation during Play-in-Editor
 // - `ink/pcg/noise`, `ink/render/foliage`, `ink/render/water` `spark` SIMD kernels
-// - `ink/kernel_kits` + `ink/kernel_transport` multi-core `entry kernel` offload
+// - `ink/kernel_kits` + `ink/kernel_transport` multi-core `#kernel` offload
 // - Pen high-fidelity GPU pipeline: visual `.matgraph.json` crystal shader,
 //   physical sky + volumetric clouds (`1`), 2-tier ray tracing (`2`), DDGI probe
 //   volume (`3`), WBOIT stained glass (`4`), TAAU temporal upscale (`5`), AgX

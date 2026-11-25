@@ -1,9 +1,9 @@
-// Minimal Protocol-2 game plus `entry kernel` declarations used to qualify
+// Minimal Protocol-2 game plus `#kernel` declarations used to qualify
 // compiler-free `pen check-workers` on both `pen build` and `pen build --worker-deadlines`.
 
-entry kernel func double_fixed (x: U32): U32 => return @u32.mul x 2
+#kernel func double_fixed (x: U32): U32 => return @u32.mul x 2
 
-entry kernel func spin_forever (x: U32): U32 =>
+#kernel func spin_forever (x: U32): U32 =>
   let acc = x
   for ever:
     acc := @u32.add acc 1
@@ -19,7 +19,7 @@ func build_frame_response (out: own #[F32]): #[F32] =>
     @storage.push out 0.0
   return out
 
-entry func main (host: #[F32] -> #[F32] ! {Foreign}): Unit ! {Foreign} =>
+#entry func main (host: #[F32] -> #[F32] ! {Foreign}): Unit ! {Foreign} =>
   use first <- host #[4670544.0, 2.0, 1.0, 0.0]
   let req = first
   let out: #[F32] = #[]

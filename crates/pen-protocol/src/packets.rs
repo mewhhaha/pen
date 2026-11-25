@@ -130,7 +130,7 @@ pub mod types {
         /// The names of the codes, by code.
         pub const NAMES: [&str; 4] = ["ok", "unavailable", "failed", "unknown"];
     }
-    /// Isolated entry kernel service operations: ctx_begin, ctx_chunk and ctx_commit upload and
+    /// Isolated #kernel service operations: ctx_begin, ctx_chunk and ctx_commit upload and
     /// verify a kernel's prepared WireCtx under lossless 32-bit (host_epoch, upload_seq)
     /// ordering, and run_batch executes a batch of items against the bound kernel and context.
     pub mod kernel_op {

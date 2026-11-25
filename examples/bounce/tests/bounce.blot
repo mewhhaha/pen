@@ -18,17 +18,17 @@ const after = func (state: #[F32]) => func (events: own #[extensions.Event]) =>
   let (world, _) = game.step (game.restore state) (input events)
   return game.save world
 
-entry const test_a_kick_sets_it_rolling = func () => check.report #[
+#entry const test_a_kick_sets_it_rolling = func () => check.report #[
   // x, z, vx, vz, bounces, held: 3 a second, less 3% drag, for a tenth.
   check.near 0.0001 #[0.291, 0.0, 2.91, 0.0, 0.0, 0.0] (after (game.save (game.create ())) #[$extensions.Kick { x: 3.0, z: 0.0 }]),
 ]
 
-entry const test_it_bounces_off_a_wall = func () => check.report #[
+#entry const test_it_bounces_off_a_wall = func () => check.report #[
   // From 3.4 at 2 a second it reaches past the wall at 3.5 and comes back.
   check.near 0.0001 #[3.406, 0.0, -1.94, 0.0, 1.0, 0.0] (after #[3.4, 0.0, 2.0, 0.0, 0.0, 0.0] #[]),
 ]
 
-entry const test_a_held_arrow_pushes_it = func () =>
+#entry const test_a_held_arrow_pushes_it = func () =>
   let held = after (game.save (game.create ())) #[key protocol.key_arrow_up]
   let let_go = after held #[$extensions.Pen ($protocol.KeyUp protocol.key_arrow_up)]
   return check.report #[
@@ -37,7 +37,7 @@ entry const test_a_held_arrow_pushes_it = func () =>
     check.near 0.0001 #[0.0, 0.0] #[let_go[5], let_go[2]],
   ]
 
-entry const test_its_score_says_how_it_is_doing = func () =>
+#entry const test_its_score_says_how_it_is_doing = func () =>
   let (world, _) = game.step (game.restore #[3.4, 0.0, 2.0, 0.0, 4.0, 0.0]) (input #[])
   let section = score world
   return check.report #[
@@ -46,6 +46,6 @@ entry const test_its_score_says_how_it_is_doing = func () =>
     check.near 0.0001 #[5.0, 1.94] #[section[4], section[5]],
   ]
 
-entry const test_a_saved_world_comes_back = func () =>
+#entry const test_a_saved_world_comes_back = func () =>
   let saved = after (game.save (game.create ())) #[key protocol.key_arrow_left, $extensions.Kick { x: 1.0, z: -2.0 }]
   return check.report #[check.equal saved (game.save (game.restore saved))]

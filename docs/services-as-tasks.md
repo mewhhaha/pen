@@ -1,8 +1,8 @@
 # Services, data queues, `KernelPool` and isolated `Processes`
 
 This greenfield rewrite retires language tasks and the legacy `blot_host::workers` /
-`blot_host::worker_sessions` experiments. Host kernels (`entry kernel` + `KernelPool`),
-isolated stateful processes (`entry process` + `Processes`), and frame-gated Pen services
+`blot_host::worker_sessions` experiments. Host kernels (`#kernel` + `KernelPool`),
+isolated stateful processes (`#process` + `Processes`), and frame-gated Pen services
 remain clean, separate mechanisms. See `blot2/tasks/CONCURRENCY_VNEXT.md`.
 
 ## Frame-gated services
@@ -18,7 +18,7 @@ access records. Applications own revision identities and deterministic result pu
 
 ## Warm work-stealing `KernelPool` (`blot_host::kernels`)
 
-`blot_host::kernels::KernelPool` executes ABI 8 `entry kernel` modules declared in
+`blot_host::kernels::KernelPool` executes ABI 8 `#kernel` modules declared in
 the `blot:kernels` v1 custom section. Workers are warm, persistent Wasmtime `Store`s
 sharing compiled code and reusing prepared context snapshots via `set_context` /
 `clear_context`.
@@ -34,7 +34,7 @@ sharing compiled code and reusing prepared context snapshots via `set_context` /
 
 ## Deterministic isolated `Processes` (`blot_host::processes`)
 
-`blot_host::processes::Processes` schedules ABI 8 `entry process` actors declared in
+`blot_host::processes::Processes` schedules ABI 8 `#process` actors declared in
 the `blot:processes` v1 custom section. Each admitted endpoint owns an isolated
 Wasmtime `Store` with persistent staged state across turns, bounded by explicit
 `ProcessPolicy` work, memory, mailbox-slot, `mailbox_bytes`, `max_reply_bytes`,

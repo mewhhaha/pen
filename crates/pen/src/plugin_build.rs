@@ -227,11 +227,12 @@ fn expand_point_span(bytes: &[u8], start: usize, end: usize) -> (usize, usize) {
 
 fn find_enclosing_scope(lines: &[&str], line_1_based: usize) -> Option<String> {
     let prefixes = [
-        "entry func ",
-        "entry kernel ",
-        "entry process ",
-        "entry const ",
-        "entry let ",
+        "#entry func ",
+        "#entry const ",
+        "#entry let ",
+        "#kernel func ",
+        "#kernel const ",
+        "#process const ",
         "private func ",
         "private const ",
         "func ",
@@ -652,8 +653,20 @@ mod tests {
     }
 
     #[test]
+    fn shows_worker_declaration_names_in_diagnostics() {
+        for (declaration, expected) in [
+            ("#kernel func double (value: U32): U32 =>", "#kernel func double"),
+            ("#kernel const plan_routes: Kernel [F32, F32, F32] = {", "#kernel const plan_routes"),
+            ("#process const sim: Process [U32, U32, U32] = {", "#process const sim"),
+        ] {
+            let lines = ["func previous (): U32 => return 0", declaration, "  missing_name"];
+            assert_eq!(find_enclosing_scope(&lines, 3).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
     fn describes_spent_value_with_secondary_move_blame_and_copy_fix() {
-        let source = "func consume (xs: own #[U32]): U32 => return xs.length\nentry func main (): U32 =>\n  let a = #[1, 2, 3]\n  let n = consume a\n  return n + a.length\n";
+        let source = "func consume (xs: own #[U32]): U32 => return xs.length\n#entry func main (): U32 =>\n  let a = #[1, 2, 3]\n  let n = consume a\n  return n + a.length\n";
         let move_start = u32::try_from(source.find("consume a").unwrap()).unwrap();
         let move_end = move_start + u32::try_from("consume a".len()).unwrap();
         let subj_start = u32::try_from(source.find("a =").unwrap()).unwrap();
@@ -673,7 +686,7 @@ mod tests {
         };
         let rendered = describe(&diagnostic, Some(("/tmp/spent.blot", source)));
         assert!(rendered.starts_with("/tmp/spent.blot:5:14: [SPENT_VALUE] (spent_value)"), "{rendered}");
-        assert!(rendered.contains("in spent.blot › entry func main"), "{rendered}");
+        assert!(rendered.contains("in spent.blot › #entry func main"), "{rendered}");
         assert!(rendered.contains("--------- `a` moved here"), "{rendered}");
         assert!(rendered.contains("^^^^^^^^ `a` used after move"), "{rendered}");
         assert!(rendered.contains("fix: Pass `a.copy` at line 4"), "{rendered}");

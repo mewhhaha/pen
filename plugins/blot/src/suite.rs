@@ -123,7 +123,7 @@ pub fn find(
         let inline_traps = kind(&path) == Kind::Checks
             && source.lines().any(|line| {
                 line.trim_start()
-                    .strip_prefix("entry ")
+                    .strip_prefix("#entry ")
                     .and_then(|declaration| {
                         declaration.strip_prefix("func ").or_else(|| declaration.strip_prefix("const "))
                     })
@@ -249,8 +249,8 @@ mod tests {
         Program { root: "/gdev".into(), entry: "/gdev/src/main.blot".into(), settings: "{}".into() }
     }
 
-    const SAYS: &str = "// rejects: what test_d says\nentry func test_d () => return 0\n";
-    const TEST: &str = "entry func test_d () => return 0\n";
+    const SAYS: &str = "// rejects: what test_d says\n#entry func test_d () => return 0\n";
+    const TEST: &str = "#entry func test_d () => return 0\n";
 
     fn layout() -> Memory {
         checkout(&[
@@ -320,8 +320,8 @@ mod tests {
 
     #[test]
     fn expected_panics_can_share_the_check_fixture() {
-        for trap in ["entry func trap_bad () => return @panic \"bad\"", "entry const trap_bad = panic_callback"] {
-            let source = format!("entry func test_ok () => return #[1.0,0.0]\n{trap}\n");
+        for trap in ["#entry func trap_bad () => return @panic \"bad\"", "#entry const trap_bad = panic_callback"] {
+            let source = format!("#entry func test_ok () => return #[1.0,0.0]\n{trap}\n");
             let mut files = checkout(&[("tests/a.blot", &source)]);
             let found = find(&program(), &[], None, &mut files).unwrap();
             assert_eq!(found.len(), 2);
@@ -348,7 +348,7 @@ mod tests {
         // not compile is named for its file.
         let mut files = checkout(&[
             ("tests/a.blot", TEST),
-            ("tests/b.blot", "entry func test_e () => return 0\n"),
+            ("tests/b.blot", "#entry func test_e () => return 0\n"),
             ("tests/rejected/twice.blot", SAYS),
         ]);
         assert_eq!(paths(&find(&program(), &[], Some("test_d"), &mut files).unwrap()), ["a.blot"]);

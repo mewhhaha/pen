@@ -1,5 +1,5 @@
 //! Compare native route kernel performance across direct (`workers = 0`) and warm
-//! multi-core `KernelPool` (`workers = 1, 2, 4, 8`) on an ABI 8 `entry kernel` artifact.
+//! multi-core `KernelPool` (`workers = 1, 2, 4, 8`) on an ABI 8 `#kernel` artifact.
 use anyhow::{Context, Result, ensure};
 use blot_host::{
     GuestModule,
@@ -16,7 +16,7 @@ fn main() -> Result<()> {
     let wasm = std::fs::read(path)?;
     let engine = blot_host::engine()?;
     let module = GuestModule::new(&engine, &wasm, None)?;
-    let manifest = module.abi().kernel(&kernel_name).context("missing entry kernel")?.clone();
+    let manifest = module.abi().kernel(&kernel_name).context("missing #kernel")?.clone();
     let variable = manifest.variable_output();
 
     let mut results = Vec::new();

@@ -11,7 +11,7 @@ import * as render from "ink/render"
 import * as sound from "ink/sound"
 import * as tree from "ink/ui/tree"
 
-entry const test_pick_gizmo_undo_redo = func () =>
+#entry const test_pick_gizmo_undo_redo = func () =>
   let w0 = create ()
   // Select node 2 (central monolith), move it via editor history, undo & redo.
   let before = w0.nodes[1].local
@@ -35,7 +35,7 @@ entry const test_pick_gizmo_undo_redo = func () =>
     check.near 0.001 #[1.75, 0.0, 1.75] #[child_moved_x, undone_world[2].world.position.x, redone_world[2].world.position.x],
   ]
 
-entry const test_play_in_editor_snapshot_and_restore = func () =>
+#entry const test_play_in_editor_snapshot_and_restore = func () =>
   let w0 = create ()
   let base_crystal_y = w0.nodes[2].local.position.y
   let ev_play = #[$events.KeyDown keys.p]
@@ -53,7 +53,7 @@ entry const test_play_in_editor_snapshot_and_restore = func () =>
     check.near 0.0001 #[base_crystal_y] #[restored_y],
   ]
 
-entry const test_feature_toggles_and_frame_emission = func () =>
+#entry const test_feature_toggles_and_frame_emission = func () =>
   let w0 = create ()
   // Press '5' to enable TAAU temporal upscaling (0.65x scale), '2' to cycle RT 2 -> 3 (Tier 3 ReSTIR GI).
   let evs = #[$events.KeyDown 53, $events.KeyDown 50]
@@ -82,7 +82,7 @@ entry const test_feature_toggles_and_frame_emission = func () =>
     check.equal #[1.0] #[if frame.sprites.length > 20 then 1.0 else 0.0],
   ]
 
-entry const test_save_and_restore_roundtrip = func () =>
+#entry const test_save_and_restore_roundtrip = func () =>
   let w0 = create ()
   let evs = #[$events.KeyDown keys.e, $events.KeyDown 53, $events.KeyDown keys.left]
   let w1 = step w0 0.05 1280.0 720.0 (&evs[0..3])
@@ -91,7 +91,7 @@ entry const test_save_and_restore_roundtrip = func () =>
   let saved2 = save w2
   return check.report #[check.equal saved saved2]
 
-entry const test_authoring_hotkeys_hud_and_scene_codec = func () =>
+#entry const test_authoring_hotkeys_hud_and_scene_codec = func () =>
   let w0 = create ()
   let initial_len = w0.nodes.length
   // N spawns 1 node, D duplicates it (+1), F spawns 3-node prefab (+3), Delete removes prefab (-3), Z undoes delete (+3).
@@ -137,7 +137,7 @@ entry const test_authoring_hotkeys_hud_and_scene_codec = func () =>
     ],
   ]
 
-entry const test_night_64_lights_toggle_and_roundtrip = func () =>
+#entry const test_night_64_lights_toggle_and_roundtrip = func () =>
   let w0 = create ()
   let ev_night = #[$events.KeyDown 55]
   let w1 = step w0 0.016 1280.0 720.0 (&ev_night[0..1])

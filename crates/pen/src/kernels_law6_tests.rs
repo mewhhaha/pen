@@ -1,7 +1,7 @@
 //! Phase 5 Law #6 integration tests (`tasks/CONCURRENCY_VNEXT.md:706`):
 //! Exercises ALL NINE mandatory Law #6 witnesses (a)-(i) against real compiled
 //! Blot guests, real `ink/services` + `ink/kernel_transport` + `ink/pen/host`,
-//! real `gdev/src/world/colony_paths` + `entry kernel plan_routes`, real
+//! real `gdev/src/world/colony_paths` + `#kernel const plan_routes`, real
 //! `KernelService` (`KernelPool`), real `canonical_render_packet`, and real
 //! `pen_runtime::mods::splice`.
 
@@ -123,7 +123,7 @@ fn validate_old_pen_render_packet(packet: &[f32], catalog: &Catalog) -> Result<V
 }
 
 /// Shared Session-2 Blot guest wired directly to real `game/world/colony_paths`,
-/// `ink/kernel_transport`, `ink/services`, `ink/pen/host`, and `entry kernel plan_routes`
+/// `ink/kernel_transport`, `ink/services`, `ink/pen/host`, and `#kernel const plan_routes`
 /// (with Save Schema 26 persistence and optional immutable pool initializer for Law #6e).
 fn write_law6_session_guest(dir: &std::path::Path, name: &str, pool_bias: f32) -> PathBuf {
     let path = dir.join(name);
@@ -154,7 +154,7 @@ func plan_route_with_pool (ctx: colony_paths.RouteContext) -> (query: #[4; F32])
   let adjusted: #[4; F32] = #[query[0] + immutable_pool[0], query[1], query[2], query[3]]
   return colony_paths.plan_one_route ctx adjusted
 
-entry kernel plan_routes: Kernel [#[F32], #[4; F32], #[F32]] = {{
+#kernel const plan_routes: Kernel [#[F32], #[4; F32], #[F32]] = {{
   prepare: colony_paths.prepare_route_world,
   run: plan_route_with_pool,
 }}
@@ -411,7 +411,7 @@ const application = {{
   decode_scene: decode_telemetry,
 }}
 
-entry func main (h: #[F32] -> #[F32] ! {{Foreign}}): Unit ! {{Foreign}} => return
+#entry func main (h: #[F32] -> #[F32] ! {{Foreign}}): Unit ! {{Foreign}} => return
   host.run application (fresh_world ()) h
 "#
     );
@@ -807,7 +807,7 @@ fn gdev_main_wasm_plan_routes_kernel_runs_deterministically_across_worker_counts
         .kernels
         .iter()
         .find(|k| k.name == "plan_routes")
-        .expect("gdev/src/main.blot must declare entry kernel plan_routes");
+        .expect("gdev/src/main.blot must declare #kernel const plan_routes");
 
     // Canonical WireCtx with a central wall & round obstacle.
     let wire_ctx: Vec<f32> = vec![

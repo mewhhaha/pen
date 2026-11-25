@@ -83,7 +83,9 @@ impl SdfShapePass {
 
     /// Prepare one draw, with shapes in back-to-front order.
     pub fn prepare(&self, device: &wgpu::Device, viewport: [f32; 2], shapes: &[SdfShape]) -> Option<Draw2d> {
-        if shapes.is_empty() {
+        let limits = device.limits();
+        let bytes = std::mem::size_of_val(shapes) as u64;
+        if shapes.is_empty() || bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
             return None;
         }
         let viewport = [viewport[0], viewport[1], 0.0, 0.0];
@@ -96,5 +98,86 @@ impl SdfShapePass {
             &[uniform.as_entire_binding(), shapes_buffer.as_entire_binding()],
             u32::try_from(shapes.len()).expect("shape instance count exceeds u32"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wgpu::util::DeviceExt as _;
+
+    #[test]
+    fn thin_ellipse_matches_an_independent_pixel_distance_reference() {
+        let (device, queue) = crate::testing::device().expect("headless GPU adapter required");
+        let points =
+            [[999.0_f32, 0.0001], [999.5, 0.020], [1000.0, 0.015], [1000.1, 0.01], [985.0, 0.1], [500.0, 0.000001]];
+        let wgsl = format!(
+            "{SDF_UI_WGSL}
+@group(0) @binding(8) var<storage, read> samples: array<vec2f>;
+@group(0) @binding(9) var<storage, read_write> distances: array<f32>;
+@compute @workgroup_size(1)
+fn witness(@builtin(global_invocation_id) id: vec3u) {{
+    distances[id.x] = ellipse_distance(samples[id.x], vec2f(1000.0, 0.5));
+}}"
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &module,
+            entry_point: Some("witness"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let input = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(&points),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (points.len() * size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 8, resource: input.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: output.as_entire_binding() },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(u32::try_from(points.len()).unwrap(), 1, 1);
+        }
+        queue.submit([encoder.finish()]);
+        let read = crate::testing::read(&device, &queue, &output, output.size());
+        for (bits, p) in read.as_chunks::<4>().0.iter().zip(points) {
+            let actual = f64::from(f32::from_le_bytes(*bits));
+            let [x, y] = p.map(f64::from);
+            let distance = |theta: f64| (x - 1000.0 * theta.cos()).hypot(y - 0.5 * theta.sin());
+            let mut left = 0.0;
+            let mut right = std::f64::consts::FRAC_PI_2;
+            for _ in 0..80 {
+                let a = (left * 2.0 + right) / 3.0;
+                let b = (left + right * 2.0) / 3.0;
+                if distance(a) < distance(b) {
+                    right = b;
+                } else {
+                    left = a;
+                }
+            }
+            let sign = if (x / 1000.0).powi(2) + (y * 2.0).powi(2) < 1.0 { -1.0 } else { 1.0 };
+            let expected = sign * distance((left + right) * 0.5);
+            assert!((actual - expected).abs() < 0.02, "point {p:?} gave {actual} px, expected {expected} px");
+        }
     }
 }

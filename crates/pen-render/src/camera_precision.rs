@@ -4,7 +4,7 @@
 use pen_protocol::Matrix;
 
 /// Depth buffer convention for pipelines and depth linearization.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum DepthMode {
     /// Standard WebGPU `[0, 1]` depth where `0` = near, `1` = far.
     #[default]
@@ -67,21 +67,11 @@ pub fn perspective_reversed_z(fov_y_rad: f32, aspect: f32, near: f32, far: Optio
     let f = 1.0 / (fov_y_rad * 0.5).tan();
     let near = near.max(1e-5);
     match far {
-        None => [
-            f / aspect, 0.0, 0.0, 0.0,
-            0.0, f, 0.0, 0.0,
-            0.0, 0.0, 0.0, -1.0,
-            0.0, 0.0, near, 0.0,
-        ],
+        None => [f / aspect, 0.0, 0.0, 0.0, 0.0, f, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, near, 0.0],
         Some(far) => {
             let far = far.max(near + 1e-4);
             let k = near / (far - near);
-            [
-                f / aspect, 0.0, 0.0, 0.0,
-                0.0, f, 0.0, 0.0,
-                0.0, 0.0, k, -1.0,
-                0.0, 0.0, far * k, 0.0,
-            ]
+            [f / aspect, 0.0, 0.0, 0.0, 0.0, f, 0.0, 0.0, 0.0, 0.0, k, -1.0, 0.0, 0.0, far * k, 0.0]
         }
     }
 }
@@ -92,12 +82,7 @@ pub fn perspective_forward_z(fov_y_rad: f32, aspect: f32, near: f32, far: f32) -
     let near = near.max(1e-5);
     let far = far.max(near + 1e-4);
     let nf = far / (near - far);
-    [
-        f / aspect, 0.0, 0.0, 0.0,
-        0.0, f, 0.0, 0.0,
-        0.0, 0.0, nf, -1.0,
-        0.0, 0.0, nf * near, 0.0,
-    ]
+    [f / aspect, 0.0, 0.0, 0.0, 0.0, f, 0.0, 0.0, 0.0, 0.0, nf, -1.0, 0.0, 0.0, nf * near, 0.0]
 }
 
 /// Camera-relative floating-origin frame built from `f64` world coordinates.
@@ -116,11 +101,9 @@ impl CameraRelativeFrame {
     /// Builds a camera-relative frame from `f64` eye/target/up vectors.
     pub fn look_at(eye: [f64; 3], target: [f64; 3], up: [f64; 3]) -> Self {
         let sub = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-        let cross = |a: [f64; 3], b: [f64; 3]| [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ];
+        let cross = |a: [f64; 3], b: [f64; 3]| {
+            [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+        };
         let norm = |v: [f64; 3]| {
             let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-12);
             [v[0] / l, v[1] / l, v[2] / l]
@@ -130,10 +113,22 @@ impl CameraRelativeFrame {
         let u = cross(s, f);
         #[allow(clippy::cast_possible_truncation, reason = "unit camera basis narrowed to f32")]
         let view_rotation = [
-            s[0] as f32, u[0] as f32, -f[0] as f32, 0.0,
-            s[1] as f32, u[1] as f32, -f[1] as f32, 0.0,
-            s[2] as f32, u[2] as f32, -f[2] as f32, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            s[0] as f32,
+            u[0] as f32,
+            -f[0] as f32,
+            0.0,
+            s[1] as f32,
+            u[1] as f32,
+            -f[1] as f32,
+            0.0,
+            s[2] as f32,
+            u[2] as f32,
+            -f[2] as f32,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
         ];
         Self { camera_world: eye, view_rotation }
     }
@@ -148,10 +143,22 @@ impl CameraRelativeFrame {
             (world_pos[2] - self.camera_world[2]) as f32,
         ];
         [
-            basis3[0][0], basis3[0][1], basis3[0][2], 0.0,
-            basis3[1][0], basis3[1][1], basis3[1][2], 0.0,
-            basis3[2][0], basis3[2][1], basis3[2][2], 0.0,
-            rel[0], rel[1], rel[2], 1.0,
+            basis3[0][0],
+            basis3[0][1],
+            basis3[0][2],
+            0.0,
+            basis3[1][0],
+            basis3[1][1],
+            basis3[1][2],
+            0.0,
+            basis3[2][0],
+            basis3[2][1],
+            basis3[2][2],
+            0.0,
+            rel[0],
+            rel[1],
+            rel[2],
+            1.0,
         ]
     }
 }
@@ -177,8 +184,14 @@ mod tests {
         let eye = [100_000.0f64, 50_000.0, -250_000.0];
         let target = [100_000.0, 50_000.0, -250_010.0];
         let frame = CameraRelativeFrame::look_at(eye, target, [0.0, 1.0, 0.0]);
-        let a = frame.entity_model_matrix([100_000.0, 50_000.0, -250_005.000], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
-        let b = frame.entity_model_matrix([100_000.0, 50_000.0, -250_005.001], [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let a = frame.entity_model_matrix(
+            [100_000.0, 50_000.0, -250_005.000],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        );
+        let b = frame.entity_model_matrix(
+            [100_000.0, 50_000.0, -250_005.001],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        );
         let dz = (a[14] - b[14]).abs();
         assert!((dz - 0.001).abs() < 1e-6, "1mm delta at 250km should stay exact, got {dz}");
     }
@@ -226,8 +239,16 @@ mod tests {
             let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: None,
                 layout: Some(&pl),
-                vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
-                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
                     depth_write_enabled: Some(true),
@@ -240,7 +261,11 @@ mod tests {
                     module: &module,
                     entry_point: Some("fs"),
                     compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
                 }),
                 multiview_mask: None,
                 cache: None,
@@ -297,11 +322,17 @@ mod tests {
                         view: &cv,
                         depth_slice: None,
                         resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &dv,
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(mode.clear_value()), store: wgpu::StoreOp::Store }),
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(mode.clear_value()),
+                            store: wgpu::StoreOp::Store,
+                        }),
                         stencil_ops: None,
                     }),
                     ..Default::default()
@@ -323,7 +354,11 @@ mod tests {
                 color_tex.as_image_copy(),
                 wgpu::TexelCopyBufferInfo {
                     buffer: &rb,
-                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(8) },
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(8),
+                    },
                 },
                 wgpu::Extent3d { width: 8, height: 8, depth_or_array_layers: 1 },
             );

@@ -110,8 +110,18 @@ fn ellipse_distance(point: vec2f, half_size: vec2f) -> f32 {
         let n = r * uv.x;
         var lo = max(uv.y, n - (r - 1.0));
         var hi = select(max(1.0, length(vec2f(n, uv.y))), 1.0, inside);
-        for (var i = 0u; i < 20u; i++) {
+        // The major-axis term decreases with the root, so its value at the
+        // lower bound gives an upper bound on the remaining minor-axis term.
+        let major = n / (lo + (r - 1.0));
+        if major < 1.0 {
+            hi = min(hi, uv.y / sqrt((1.0 - major) * (1.0 + major)));
+        }
+        hi = max(lo, hi);
+        for (var i = 0u; i < 48u; i++) {
             let mid = (lo + hi) * 0.5;
+            if mid == lo || mid == hi {
+                break;
+            }
             let projection = vec2f(n / (mid + (r - 1.0)), uv.y / mid);
             let too_small = dot(projection, projection) > 1.0;
             lo = select(lo, mid, too_small);

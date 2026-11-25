@@ -28,7 +28,7 @@ mod platform;
 mod snapshots;
 pub mod testing;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Write as _;
@@ -41,6 +41,7 @@ use accesskit::{
 };
 use anyhow::{Context, Result};
 use pen_protocol::{GameEvent, UiNode, ui_action, ui_live, ui_role, ui_state};
+use pen_runtime::role_testing::AccessibilityTree;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
@@ -97,21 +98,10 @@ fn game_id(node: NodeId) -> Option<u32> {
     node.0.checked_sub(GAME).and_then(|id| u32::try_from(id).ok())
 }
 
-/// The place of a node's parent, if one comes before it; else it is at the top.
-fn parent(index: usize, node: &UiNode) -> Option<usize> {
-    (node.parent as usize).checked_sub(1).filter(|parent| *parent < index)
-}
-
-/// Which nodes the tree has: those not hidden nor under a node it leaves
-/// out, the first with each id.
+/// The nodes with visible ancestry, before applying modal action scope.
+#[cfg(any(feature = "compiler", feature = "devtools"))]
 pub(crate) fn included(ui: &[UiNode]) -> Vec<bool> {
-    let mut ids = HashSet::with_capacity(ui.len());
-    let mut included: Vec<bool> = Vec::with_capacity(ui.len());
-    for (index, node) in ui.iter().enumerate() {
-        let kept = !node.hidden && parent(index, node).is_none_or(|parent| included[parent]) && ids.insert(node.id);
-        included.push(kept);
-    }
-    included
+    AccessibilityTree::new(ui).nodes().iter().map(|info| info.in_tree).collect()
 }
 
 /// Code points as text; one that is no character (or NUL, which D-Bus
@@ -273,7 +263,7 @@ fn tree(interface: &Interface) -> TreeUpdate {
 /// have the focus (an adapter fails on a focused graft without one).
 fn build(interface: &Interface, grafted: bool) -> TreeUpdate {
     let ui = &interface.ui;
-    let included = included(ui);
+    let tree = AccessibilityTree::new(ui);
     let mut root = Node::new(Role::Window);
     // The window's title, as the game's pen.json or package names it.
     root.set_label(crate::identity().title.as_str());
@@ -282,34 +272,25 @@ fn build(interface: &Interface, grafted: bool) -> TreeUpdate {
     // Where each node the tree has is in `nodes`.
     let mut places = vec![0; ui.len()];
     let mut focus = ROOT;
-    // A list whose items are chosen, and those items, are a list box and its
-    // options, as the browser host has them.
-    let option = |game: &UiNode| game.role == ui_role::LISTITEM && game.focusable;
-    let mut listbox = vec![false; ui.len()];
-    for (index, game) in ui.iter().enumerate() {
-        if let Some(parent) = parent(index, game).filter(|_| option(game)) {
-            listbox[parent] = ui[parent].role == ui_role::LIST;
-        }
-    }
-    for (index, game) in ui.iter().enumerate() {
-        if !included[index] {
+    for (index, (game, info)) in ui.iter().zip(tree.nodes()).enumerate() {
+        if !info.in_tree {
             continue;
         }
         let id = game_node(game.id);
         // A node the tree has is under a parent it has, or at the top.
-        match parent(index, game) {
+        match info.parent {
             Some(parent) => nodes[places[parent]].1.push_child(id),
             None => root.push_child(id),
         }
-        if game.focused && focus == ROOT {
+        if info.exposed() && !info.disabled && game.focused && focus == ROOT {
             focus = id;
         }
         places[index] = nodes.len();
         let mut made = node(game, interface.scale);
-        if option(game) {
-            made.set_role(Role::ListBoxOption);
-        } else if listbox[index] {
-            made.set_role(Role::ListBox);
+        match info.effective_role {
+            "option" => made.set_role(Role::ListBoxOption),
+            "listbox" => made.set_role(Role::ListBox),
+            _ => {}
         }
         nodes.push((id, made));
     }
@@ -362,9 +343,7 @@ fn game_event(ui: &[UiNode], request: &ActionRequest) -> Option<GameEvent> {
     if !value.is_finite() {
         return None;
     }
-    let included = included(ui);
-    let (node, _) = ui.iter().zip(included).find(|(node, included)| *included && node.id == id)?;
-    takes(node, action).then_some(GameEvent::UiAction { node: id, action, value })
+    AccessibilityTree::new(ui).allows_action(id, action).then_some(GameEvent::UiAction { node: id, action, value })
 }
 
 /// The dev tools program's interface as a tree of its own, as their
@@ -380,7 +359,9 @@ fn program_tree(ui: &[UiNode]) -> TreeUpdate {
 
 /// Whether one of the dev tools program's nodes has the keyboard.
 fn program_focused(ui: &[UiNode]) -> bool {
-    ui.iter().zip(included(ui)).any(|(node, included)| included && node.focused)
+    ui.iter()
+        .zip(AccessibilityTree::new(ui).nodes())
+        .any(|(node, info)| info.exposed() && !info.disabled && node.focused)
 }
 
 /// An assistive technology's request for one of the dev tools program's
@@ -1050,6 +1031,48 @@ mod tests {
     }
 
     #[test]
+    fn rejects_requests_for_inert_nodes() {
+        let button = |id, parent| UiNode {
+            focusable: true,
+            actions: 1 << ui_action::ACTIVATE,
+            ..named(id, parent, ui_role::BUTTON, "Button")
+        };
+        let ui = [
+            button(1, 0),
+            UiNode { modal: true, ..named(2, 0, ui_role::DIALOG, "Modal") },
+            UiNode { disabled: true, ..named(3, 2, ui_role::GROUP, "Disabled") },
+            button(4, 3),
+            UiNode { hidden: true, ..named(5, 2, ui_role::GROUP, "Hidden") },
+            button(6, 5),
+            button(7, 2),
+        ];
+        for id in [1, 4, 6] {
+            for action in [Action::Click, Action::Focus, Action::Blur] {
+                assert_eq!(game_event(&ui, &request(game_node(id), action, None)), None);
+            }
+        }
+        assert_eq!(
+            game_event(&ui, &request(game_node(7), Action::Click, None)),
+            Some(GameEvent::UiAction { node: 7, action: ui_action::ACTIVATE, value: 0.0 })
+        );
+    }
+
+    #[test]
+    fn promotes_list_roles_only_for_visible_direct_children() {
+        let item = |id, parent| UiNode { focusable: true, ..named(id, parent, ui_role::LISTITEM, "Item") };
+        let update = tree(&interface(vec![
+            named(1, 0, ui_role::LIST, "Ordinary list"),
+            UiNode { hidden: true, ..item(2, 1) },
+            item(3, 0),
+            named(4, 0, ui_role::LIST, "Choices"),
+            item(5, 4),
+        ]));
+        for (id, role) in [(1, Role::List), (3, Role::ListItem), (4, Role::ListBox), (5, Role::ListBoxOption)] {
+            assert_eq!(find(&update, game_node(id)).role(), role);
+        }
+    }
+
+    #[test]
     fn describes_the_tree() {
         let mut interface = interface(menu());
         interface.overlay = Some(false);
@@ -1057,7 +1080,15 @@ mod tests {
         assert_eq!(
             text,
             format!("Window \"{}\"\n", crate::identity().title)
-                + "\x20 Dialog #10 \"Paused\" modal at=100,50 size=400x300\n\\n             \x20   Heading #11 \"Paused\"\n\\n             \x20   Button #12 \"Resume\" at=120,80 size=200x40 actions=focus,activate <- focus\n\\n             \x20   Slider #13 \"Volume\" value=\"80%\" number=0.8 range=0..1 step=0.1 \\n             actions=focus,increment,decrement,set_value\n\\n             \x20   CheckBox #16 \"Music\" toggled=true actions=activate\n\\n             \x20 GenericContainer (the dev tools)\n"
+                + concat!(
+                    "  Dialog #10 \"Paused\" modal at=100,50 size=400x300\n",
+                    "    Heading #11 \"Paused\"\n",
+                    "    Button #12 \"Resume\" at=120,80 size=200x40 actions=focus,activate <- focus\n",
+                    "    Slider #13 \"Volume\" value=\"80%\" number=0.8 range=0..1 step=0.1 ",
+                    "actions=focus,increment,decrement,set_value\n",
+                    "    CheckBox #16 \"Music\" toggled=true actions=activate\n",
+                    "  GenericContainer (the dev tools)\n",
+                )
         );
     }
 

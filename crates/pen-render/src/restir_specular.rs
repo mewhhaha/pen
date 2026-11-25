@@ -15,7 +15,7 @@ pub const RESTIR_SPECULAR_WGSL: &str = include_str!("shaders/restir_specular.wgs
 
 const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const GEOMETRY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
-const RESERVOIR_STRIDE: u64 = 64;
+pub(crate) const RESERVOIR_STRIDE: u64 = 64;
 const LIGHT_BUFFER_BYTES: usize = RESTIR_MAX_LIGHTS * std::mem::size_of::<RtLocalLight>();
 const BINDING_COUNT: usize = 33;
 

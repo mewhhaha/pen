@@ -102,15 +102,31 @@ fn write_split_cookie_png(path: &std::path::Path) {
 }
 
 fn translate_view(tx: f32, ty: f32, tz: f32) -> [f32; 16] {
-    [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        tx, ty, tz, 1.0,
-    ]
+    [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, tx, ty, tz, 1.0]
 }
 
-fn wait_ready(renderer: &mut Renderer, frame: &pen_protocol::RenderFrame, catalog: &Catalog, target: &mut common::Offscreen) {
+struct UnavailableTarget(u32);
+
+impl pen_render::RenderTarget for UnavailableTarget {
+    fn size(&self) -> (u32, u32) {
+        (self.0, self.0)
+    }
+
+    fn view(&mut self) -> Option<wgpu::TextureView> {
+        None
+    }
+
+    fn present(&mut self) {
+        panic!("target has no view");
+    }
+}
+
+fn wait_ready(
+    renderer: &mut Renderer,
+    frame: &pen_protocol::RenderFrame,
+    catalog: &Catalog,
+    target: &mut common::Offscreen,
+) {
     let mut events = Vec::new();
     let mut steady = 0u32;
     for _ in 0..150 {
@@ -150,12 +166,7 @@ fn frame_validation_rejects_bad_video_singular_4x4_pbr_decal_and_oob_split_viewp
     let mut bad_decal = common::frame(vec![]);
     bad_decal.pbr_decals.push(PbrDecalSpec {
         material: 0,
-        transform: [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 0.0,
-        ],
+        transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         albedo: Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
         normal_strength: 1.0,
         roughness: 0.5,
@@ -273,11 +284,7 @@ fn main() {{
         "1.0/1.3/1.5 zero-thickness must match bare Fresnel 0.04, got {:?}",
         vals[1]
     );
-    assert!(
-        (vals[2][0] - 0.04).abs() < 1e-4,
-        "matched film/substrate IOR must stay 0.04, got {:?}",
-        vals[2]
-    );
+    assert!((vals[2][0] - 0.04).abs() < 1e-4, "matched film/substrate IOR must stay 0.04, got {:?}", vals[2]);
     let spread = (vals[3][0] - vals[3][2]).abs().max((vals[3][1] - vals[3][2]).abs());
     assert!(spread > 0.02, "350 nm thin film must show chromatic interference spread, got {:?}", vals[3]);
     drop(data);
@@ -311,36 +318,21 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
             ShaderNode {
                 id: "tex".into(),
                 ui_pos: [120.0, 0.0],
-                kind: ShaderNodeKind::Texture2D {
-                    uv: Some(NodeRef::of("uv")),
-                    fallback_color: [0.95, 0.15, 0.1],
-                },
+                kind: ShaderNodeKind::Texture2D { uv: Some(NodeRef::of("uv")), fallback_color: [0.95, 0.15, 0.1] },
             },
             ShaderNode {
                 id: "rgb".into(),
                 ui_pos: [240.0, 0.0],
                 kind: ShaderNodeKind::Swizzle { input: NodeRef::of("tex"), mask: "xyz".into() },
             },
-            ShaderNode {
-                id: "t".into(),
-                ui_pos: [120.0, 120.0],
-                kind: ShaderNodeKind::Time,
-            },
-            ShaderNode {
-                id: "p0".into(),
-                ui_pos: [120.0, 180.0],
-                kind: ShaderNodeKind::InstanceParam { index: 0 },
-            },
+            ShaderNode { id: "t".into(), ui_pos: [120.0, 120.0], kind: ShaderNodeKind::Time },
+            ShaderNode { id: "p0".into(), ui_pos: [120.0, 180.0], kind: ShaderNodeKind::InstanceParam { index: 0 } },
             ShaderNode {
                 id: "rough".into(),
                 ui_pos: [240.0, 150.0],
                 kind: ShaderNodeKind::Clamp { x: NodeRef::of("p0"), min: 0.2, max: 0.9 },
             },
-            ShaderNode {
-                id: "alpha".into(),
-                ui_pos: [240.0, 220.0],
-                kind: ShaderNodeKind::InstanceParam { index: 1 },
-            },
+            ShaderNode { id: "alpha".into(), ui_pos: [240.0, 220.0], kind: ShaderNodeKind::InstanceParam { index: 1 } },
             ShaderNode {
                 id: "out".into(),
                 ui_pos: [400.0, 0.0],
@@ -372,34 +364,61 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
     let write_mat = |name: &str, v: serde_json::Value| {
         std::fs::write(dir.join(name), serde_json::to_vec(&v).unwrap()).unwrap();
     };
-    write_mat("wall_red.mat.json", json!({ "shader": "simple.wgsl", "color": [1.0, 0.15, 0.1, 1.0], "lighting": "lit", "decals": true }));
-    write_mat("wall_green.mat.json", json!({ "shader": "simple.wgsl", "color": [0.1, 0.95, 0.15, 1.0], "lighting": "lit" }));
+    write_mat(
+        "wall_red.mat.json",
+        json!({ "shader": "simple.wgsl", "color": [1.0, 0.15, 0.1, 1.0], "lighting": "lit", "decals": true }),
+    );
+    write_mat(
+        "wall_green.mat.json",
+        json!({ "shader": "simple.wgsl", "color": [0.1, 0.95, 0.15, 1.0], "lighting": "lit" }),
+    );
     write_mat("decal.mat.json", json!({ "shader": "simple.wgsl", "color": [0.1, 0.9, 0.2, 1.0], "lighting": "lit" }));
     write_mat("lit_plain.mat.json", json!({ "shader": "lit.wgsl", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "lit" }));
-    write_mat("lit_lightmap.mat.json", json!({
-        "shader": "lit.wgsl",
-        "color": [1.0, 1.0, 1.0, 1.0],
-        "lighting": "lit",
-        "surface": { "lightmapTexture": "lightmap.png" }
-    }));
-    write_mat("lit_irid.mat.json", json!({
-        "shader": "lit.wgsl",
-        "color": [0.15, 0.15, 0.15, 1.0],
-        "lighting": "lit",
-        "surface": {
-            "iridescence": 1.0,
-            "iridescenceIor": 1.9,
-            "iridescenceThicknessMin": 200.0,
-            "iridescenceThicknessMax": 520.0,
-            "iridescenceTexture": "irid.png"
-        }
-    }));
+    write_mat(
+        "lit_lightmap.mat.json",
+        json!({
+            "shader": "lit.wgsl",
+            "color": [1.0, 1.0, 1.0, 1.0],
+            "lighting": "lit",
+            "surface": { "lightmapTexture": "lightmap.png" }
+        }),
+    );
+    write_mat(
+        "lit_irid.mat.json",
+        json!({
+            "shader": "lit.wgsl",
+            "color": [0.15, 0.15, 0.15, 1.0],
+            "lighting": "lit",
+            "surface": {
+                "iridescence": 1.0,
+                "iridescenceIor": 1.9,
+                "iridescenceThicknessMin": 200.0,
+                "iridescenceThicknessMax": 520.0,
+                "iridescenceTexture": "irid.png"
+            }
+        }),
+    );
     write_mat("hud.mat.json", json!({ "shader": "hud.wgsl", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "unlit" }));
-    write_mat("filter.mat.json", json!({ "shader": "filter.wgsl", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "unlit", "scene_filter": true }));
-    write_mat("cookie.mat.json", json!({ "shader": "simple.wgsl", "texture": "cookie.png", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "unlit" }));
-    write_mat("graph_tex_unlit.mat.json", json!({ "shader": "tex_graph.matgraph.json", "texture": "teal.png", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "unlit", "alphaCutoff": 0.5 }));
-    write_mat("graph_fallback_unlit.mat.json", json!({ "shader": "tex_graph.matgraph.json", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "unlit" }));
-    write_mat("graph_lit.mat.json", json!({ "shader": "tex_graph.matgraph.json", "texture": "teal.png", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "lit" }));
+    write_mat(
+        "filter.mat.json",
+        json!({ "shader": "filter.wgsl", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "unlit", "scene_filter": true }),
+    );
+    write_mat(
+        "cookie.mat.json",
+        json!({ "shader": "simple.wgsl", "texture": "cookie.png", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "unlit" }),
+    );
+    write_mat(
+        "graph_tex_unlit.mat.json",
+        json!({ "shader": "tex_graph.matgraph.json", "texture": "teal.png", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "unlit", "alphaCutoff": 0.5 }),
+    );
+    write_mat(
+        "graph_fallback_unlit.mat.json",
+        json!({ "shader": "tex_graph.matgraph.json", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "unlit" }),
+    );
+    write_mat(
+        "graph_lit.mat.json",
+        json!({ "shader": "tex_graph.matgraph.json", "texture": "teal.png", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "lit" }),
+    );
 
     let mut renderer = Renderer::new(
         device.clone(),
@@ -437,32 +456,17 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
         sounds: vec![],
     };
 
-    let wall_xform = [
-        2.0, 0.0, 0.0, 0.0,
-        0.0, 2.0, 0.0, 0.0,
-        0.0, 0.0, 1.0, 0.0,
-        0.0, 0.0, -2.0, 1.0,
-    ];
+    let wall_xform = [2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -2.0, 1.0];
     let proj = pen_render::perspective_forward_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 50.0);
 
-    let mut frame = common::frame(vec![Draw {
-        mesh: 0,
-        material: 0,
-        transform: wall_xform,
-        parameters: None,
-        extra: None,
-    }]);
+    let mut frame =
+        common::frame(vec![Draw { mesh: 0, material: 0, transform: wall_xform, parameters: None, extra: None }]);
     frame.projection = proj;
     frame.light_direction = Vector { x: 0.2, y: -0.9, z: -0.3 };
     frame.grade.tonemap = TonemapOperator::AgX as u32;
     frame.pbr_decals.push(PbrDecalSpec {
         material: 2,
-        transform: [
-            0.8, 0.0, 0.0, 0.0,
-            0.0, 0.8, 0.0, 0.0,
-            0.0, 0.0, 0.8, 0.0,
-            0.0, 0.0, -2.0, 1.0,
-        ],
+        transform: [0.8, 0.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0, -2.0, 1.0],
         albedo: Color { r: 0.1, g: 1.0, b: 0.2, a: 0.9 },
         normal_strength: 0.5,
         roughness: 0.4,
@@ -616,24 +620,14 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
         Draw {
             mesh: 0,
             material: 0, // red at x = -10
-            transform: [
-                2.0, 0.0, 0.0, 0.0,
-                0.0, 2.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                -10.0, 0.0, -2.0, 1.0,
-            ],
+            transform: [2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -10.0, 0.0, -2.0, 1.0],
             parameters: None,
             extra: None,
         },
         Draw {
             mesh: 0,
             material: 1, // green at x = +10
-            transform: [
-                2.0, 0.0, 0.0, 0.0,
-                0.0, 2.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 0.0,
-                10.0, 0.0, -2.0, 1.0,
-            ],
+            transform: [2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 10.0, 0.0, -2.0, 1.0],
             parameters: None,
             extra: None,
         },
@@ -661,7 +655,7 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
         viewport_h: 1.0,
         split_screen: true,
         view: translate_view(-10.0, 0.0, 0.0), // camera at x=+10 -> sees GREEN quad
-        projection: proj,
+        projection: perspective_reversed_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, None),
     });
     split_frame.sprites.push(Sprite {
         x: 24.0,
@@ -698,12 +692,9 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
     });
     // Enable an active accessibility ColorFilter (tritanopia at 0.25) to prove split-screen
     // does NOT overwrite the filter target and present only the last camera!
-    renderer.set_color_filter(ColorFilter {
-        kind: color_filter::TRITANOPIA,
-        strength: 0.25,
-        simulate: false,
-    });
+    renderer.set_color_filter(ColorFilter { kind: color_filter::TRITANOPIA, strength: 0.25, simulate: false });
     wait_ready(&mut renderer, &split_frame, &catalog, &mut target);
+    assert_eq!(renderer.depth_mode(), DepthMode::ForwardZ);
     // Run a second frame to exercise cached split-screen temporal state across frames.
     renderer.submit(&split_frame, &catalog, &mut target).unwrap();
     let split_stats = renderer.stats();
@@ -736,12 +727,7 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
     let mut filter_msaa = common::frame(vec![Draw {
         mesh: 0,
         material: 0,
-        transform: [
-            0.5, 0.0, 0.0, 0.0,
-            0.0, 0.5, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, -2.0, 1.0,
-        ],
+        transform: [0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -2.0, 1.0],
         parameters: None,
         extra: None,
     }]);
@@ -830,12 +816,7 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
     graph_lit.shadow.texels = 256;
     graph_lit.shadow.view = translate_view(0.0, 0.0, -5.0);
     graph_lit.cascades = vec![Cascade {
-        projection: [
-            0.25, 0.0, 0.0, 0.0,
-            0.0, 0.25, 0.0, 0.0,
-            0.0, 0.0, -0.1, 0.0,
-            0.0, 0.0, -0.1, 1.0,
-        ],
+        projection: [0.25, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.0, -0.1, 0.0, 0.0, 0.0, -0.1, 1.0],
         texel: 8.0 / 256.0,
         far: 50.0,
     }];
@@ -848,12 +829,7 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
     graph_shadowed.draws.push(Draw {
         mesh: 0,
         material: 11,
-        transform: [
-            1.5, 0.0, 0.0, 0.0,
-            0.0, 1.5, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0, 1.0,
-        ],
+        transform: [1.5, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0],
         parameters: Some([0.5, 1.0, 0.0, 0.0]),
         extra: None,
     });
@@ -884,7 +860,6 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 #[test]
 fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
     let Some((device, queue)) = common::device() else {
@@ -914,13 +889,34 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
     // 5: stock PBR lit white receiver (lit.wgsl — samples packed in-shader DDGI!)
     // 6: stock PBR lit dark charcoal receiver (lit.wgsl — verifies albedo-modulated DDGI!)
     let mats = [
-        ("white.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.85, 0.85, 0.85, 1.0], "lighting": "lit" })),
-        ("red_trans.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.95, 0.08, 0.05, 0.5], "blend": true, "lighting": "unlit" })),
-        ("blue_trans.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.05, 0.15, 0.95, 0.6], "blend": true, "lighting": "unlit" })),
-        ("emissive_red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [1.0, 0.0, 0.0, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 6.0 } })),
-        ("blocker.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.06, 0.06, 0.06, 1.0], "lighting": "lit" })),
-        ("lit_white.mat.json", json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.85, 0.85, 0.85, 1.0], "lighting": "lit", "instanceParameters": [0.0, 0.85, 0.0, 0.0] })),
-        ("lit_dark.mat.json", json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.04, 0.04, 0.04, 1.0], "lighting": "lit", "instanceParameters": [0.0, 0.85, 0.0, 0.0] })),
+        (
+            "white.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.85, 0.85, 0.85, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "red_trans.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.95, 0.08, 0.05, 0.5], "blend": true, "lighting": "unlit" }),
+        ),
+        (
+            "blue_trans.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.05, 0.15, 0.95, 0.6], "blend": true, "lighting": "unlit" }),
+        ),
+        (
+            "emissive_red.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [1.0, 0.0, 0.0, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 6.0 } }),
+        ),
+        (
+            "blocker.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.06, 0.06, 0.06, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "lit_white.mat.json",
+            json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.85, 0.85, 0.85, 1.0], "lighting": "lit", "instanceParameters": [0.0, 0.85, 0.0, 0.0] }),
+        ),
+        (
+            "lit_dark.mat.json",
+            json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.04, 0.04, 0.04, 1.0], "lighting": "lit", "instanceParameters": [0.0, 0.85, 0.0, 0.0] }),
+        ),
     ];
     for (name, val) in &mats {
         std::fs::write(dir.join(name), val.to_string()).unwrap();
@@ -947,14 +943,8 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
     let mut target = common::Offscreen::new(&device, 64);
 
     let proj = pen_render::perspective_forward_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 50.0);
-    let scale_at = |s: f32, z: f32| -> [f32; 16] {
-        [
-            s, 0.0, 0.0, 0.0,
-            0.0, s, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, z, 1.0,
-        ]
-    };
+    let scale_at =
+        |s: f32, z: f32| -> [f32; 16] { [s, 0.0, 0.0, 0.0, 0.0, s, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, z, 1.0] };
 
     // 1) Weighted Blended OIT (`quality.oit = true`) produces identical pixels regardless of draw order!
     let red_near = Draw { mesh: 0, material: 1, transform: scale_at(3.0, -2.0), parameters: None, extra: None };
@@ -998,12 +988,57 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
 
     let mut rt_tier1 = rt_off.clone();
     rt_tier1.quality.ray_tracing = 1;
+    renderer.submit(&rt_tier1, &catalog, &mut UnavailableTarget(64)).unwrap();
     renderer.submit(&rt_tier1, &catalog, &mut target).unwrap();
     let px_rt1 = common::middle(&device, &queue, &target.0);
     assert!(
         px_rt0[0] > px_rt1[0].saturating_add(40),
         "quality.ray_tracing=1 must cast BVH RT shadows onto receiver: off={px_rt0:?}, rt1={px_rt1:?}"
     );
+
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+    let limits = wgpu::Limits { max_storage_buffers_per_shader_stage: 4, ..wgpu::Limits::default() };
+    let (limited_device, limited_queue) = pollster::block_on(
+        adapter.request_device(&wgpu::DeviceDescriptor { required_limits: limits, ..Default::default() }),
+    )
+    .unwrap();
+    let mut limited = Renderer::new(
+        limited_device.clone(),
+        limited_queue.clone(),
+        RendererOptions {
+            format: common::FORMAT,
+            display: pen_render::Display::SDR,
+            assets: dir.clone(),
+            veil: None,
+            pipeline_cache: None,
+        },
+    )
+    .unwrap();
+    let mut limited_target = common::Offscreen::new(&limited_device, 64);
+    let mut fallback = rt_off.clone();
+    fallback.quality.ray_tracing = 3;
+    fallback.quality.ddgi = true;
+    wait_ready(&mut limited, &fallback, &catalog, &mut limited_target);
+    assert_eq!(common::middle(&limited_device, &limited_queue, &limited_target.0), px_rt0);
+    fallback.draws[0].material = 5;
+    fallback.light_color = Vector::default();
+    fallback.lights.push(pen_protocol::Light {
+        position: Vector { z: -1.0, ..Default::default() },
+        radius: 8.0,
+        color: Vector { x: 10.0, y: 1.0, z: 0.0 },
+        inner: -1.0,
+        outer: -1.0,
+        ..Default::default()
+    });
+    wait_ready(&mut limited, &fallback, &catalog, &mut limited_target);
+    let compact_lit = common::middle(&limited_device, &limited_queue, &limited_target.0);
+    fallback.quality.ray_tracing = 0;
+    fallback.quality.ddgi = false;
+    wait_ready(&mut renderer, &fallback, &catalog, &mut target);
+    assert_eq!(compact_lit, common::middle(&device, &queue, &target.0));
+    assert!(compact_lit[0] > compact_lit[2].saturating_add(40));
+    drop(limited);
 
     // Swap blocker for bright emissive red panel facing a dark receiver; tier 2 adds RT reflections + 1-bounce GI!
     let dark_receiver = Draw { mesh: 0, material: 4, transform: scale_at(4.0, -2.0), parameters: None, extra: None };
@@ -1028,12 +1063,7 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
     let facing_emissive = Draw {
         mesh: 0,
         material: 3,
-        transform: [
-            -4.0, 0.0, 0.0, 0.0,
-            0.0, 4.0, 0.0, 0.0,
-            0.0, 0.0, -1.0, 0.0,
-            0.0, 0.0, 1.0, 1.0,
-        ],
+        transform: [-4.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0, 1.0],
         parameters: None,
         extra: None,
     };
@@ -1168,7 +1198,10 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
         renderer.submit(&upscale_frame, &catalog, &mut target).unwrap();
     }
     let px_up = common::middle(&device, &queue, &target.0);
-    assert!(px_up[0] > 100 && px_up[1] > 100 && px_up[2] > 100, "DRS FSR Performance receiver must render cleanly: {px_up:?}");
+    assert!(
+        px_up[0] > 100 && px_up[1] > 100 && px_up[2] > 100,
+        "DRS FSR Performance receiver must render cleanly: {px_up:?}"
+    );
 
     // Non-TAA reduced-scale spatial FSR 1 EASU path in present.wgsl.
     let mut easu_frame = common::frame(vec![receiver]);
@@ -1179,11 +1212,13 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
     easu_frame.quality.upscale = false;
     renderer.submit(&easu_frame, &catalog, &mut target).unwrap();
     let px_easu = common::middle(&device, &queue, &target.0);
-    assert!(px_easu[0] > 100 && px_easu[1] > 100 && px_easu[2] > 100, "non-TAA FSR 1 EASU present path must render cleanly: {px_easu:?}");
+    assert!(
+        px_easu[0] > 100 && px_easu[1] > 100 && px_easu[2] > 100,
+        "non-TAA FSR 1 EASU present path must render cleanly: {px_easu:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 #[test]
 fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
@@ -1196,7 +1231,8 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
     std::fs::create_dir_all(&dir).unwrap();
 
     // Build a dense 16x16 UV sphere (512 triangles >= 128 threshold) so meshlet cluster culling activates.
-    let (mut pos, mut norm, mut uv, mut idx) = (Vec::<f32>::new(), Vec::<f32>::new(), Vec::<f32>::new(), Vec::<u32>::new());
+    let (mut pos, mut norm, mut uv, mut idx) =
+        (Vec::<f32>::new(), Vec::<f32>::new(), Vec::<f32>::new(), Vec::<u32>::new());
     let stacks = 16u32;
     let slices = 16u32;
     for r in 0..=stacks {
@@ -1237,11 +1273,26 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
     write_solid_png(&dir.join("white.png"), [255, 255, 255, 255]);
 
     let mats = [
-        ("green.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.1, 0.9, 0.15, 1.0], "lighting": "unlit" })),
-        ("red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.95, 0.1, 0.1, 1.0], "lighting": "unlit" })),
-        ("chrome.mat.json", json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.95, 0.95, 0.95, 1.0], "lighting": "lit", "instanceParameters": [0.1, 0.95, 1.0, 0.0] })),
-        ("dark_lit.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.05, 0.05, 0.05, 1.0], "lighting": "lit" })),
-        ("emissive_red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [1.0, 0.0, 0.0, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 6.0 } })),
+        (
+            "green.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.1, 0.9, 0.15, 1.0], "lighting": "unlit" }),
+        ),
+        (
+            "red.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.95, 0.1, 0.1, 1.0], "lighting": "unlit" }),
+        ),
+        (
+            "chrome.mat.json",
+            json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.95, 0.95, 0.95, 1.0], "lighting": "lit", "instanceParameters": [0.1, 0.95, 1.0, 0.0] }),
+        ),
+        (
+            "dark_lit.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.05, 0.05, 0.05, 1.0], "lighting": "lit" }),
+        ),
+        (
+            "emissive_red.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [1.0, 0.0, 0.0, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 6.0 } }),
+        ),
     ];
     for (name, val) in &mats {
         std::fs::write(dir.join(name), val.to_string()).unwrap();
@@ -1271,12 +1322,7 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
     let mut ml_frame = common::frame(vec![Draw {
         mesh: 0,
         material: 0,
-        transform: [
-            1.5, 0.0, 0.0, 0.0,
-            0.0, 1.5, 0.0, 0.0,
-            0.0, 0.0, 1.5, 0.0,
-            0.0, 0.0, -3.0, 1.0,
-        ],
+        transform: [1.5, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0, -3.0, 1.0],
         parameters: None,
         extra: None,
     }]);
@@ -1284,10 +1330,7 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
     ml_frame.quality.sky = false;
     ml_frame.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
     wait_ready(&mut renderer, &ml_frame, &catalog, &mut target);
-    assert!(
-        renderer.last_meshlet_cull_draws() >= 1,
-        "dense opaque LOD0 sphere must execute GPU meshlet culling"
-    );
+    assert!(renderer.last_meshlet_cull_draws() >= 1, "dense opaque LOD0 sphere must execute GPU meshlet culling");
     let px_ml = common::middle(&device, &queue, &target.0);
     assert!(
         px_ml[1] > 150 && px_ml[0] < 80,
@@ -1295,14 +1338,8 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
     );
 
     // 2) SVGF spatiotemporal denoiser runs cleanly over 4 consecutive RT tier-2 frames.
-    let scale_at = |s: f32, z: f32| -> [f32; 16] {
-        [
-            s, 0.0, 0.0, 0.0,
-            0.0, s, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, z, 1.0,
-        ]
-    };
+    let scale_at =
+        |s: f32, z: f32| -> [f32; 16] { [s, 0.0, 0.0, 0.0, 0.0, s, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, z, 1.0] };
     let mut svgf_frame = common::frame(vec![
         Draw { mesh: 1, material: 3, transform: scale_at(4.0, -2.0), parameters: None, extra: None },
         Draw { mesh: 1, material: 4, transform: scale_at(4.0, 1.0), parameters: None, extra: None },
@@ -1327,12 +1364,7 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
     let mut hdr_frame = common::frame(vec![Draw {
         mesh: 0,
         material: 2,
-        transform: [
-            1.6, 0.0, 0.0, 0.0,
-            0.0, 1.6, 0.0, 0.0,
-            0.0, 0.0, 1.6, 0.0,
-            0.0, 0.0, -3.0, 1.0,
-        ],
+        transform: [1.6, 0.0, 0.0, 0.0, 0.0, 1.6, 0.0, 0.0, 0.0, 0.0, 1.6, 0.0, 0.0, 0.0, -3.0, 1.0],
         parameters: None,
         extra: None,
     }]);
@@ -1364,12 +1396,7 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
 
     // 4) Built-in outdoor environment passes: CDLOD terrain (`EnvironmentScene`), Gerstner water (`ENV_WATER_EXT_TAG`),
     //    and GPU wind-swaying foliage (`ENV_FOLIAGE_EXT_TAG`) rendered through standard `Renderer::submit`.
-    let look_down: [f32; 16] = [
-        1.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, -1.0, 0.0,
-        0.0, 1.0, 0.0, 0.0,
-        0.0, 0.0, -6.0, 1.0,
-    ]; // camera at (0, 6, 0) looking straight down -Y at XZ plane y=0!
+    let look_down: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, -6.0, 1.0]; // camera at (0, 6, 0) looking straight down -Y at XZ plane y=0!
     let mut env_base = common::frame(vec![]);
     env_base.view = look_down;
     env_base.projection = proj_fwd;
@@ -1415,17 +1442,17 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
     water_frame.extensions.push(Extension {
         tag: ENV_WATER_EXT_TAG,
         values: vec![
-            0.0,   // water level y
-            -2.0,  // bed y
-            0.0,   // bed slope
-            16.0,  // grid cells
-            0.5,   // time
+            0.0,  // water level y
+            -2.0, // bed y
+            0.0,  // bed slope
+            16.0, // grid cells
+            0.5,  // time
             0.45, 0.12, 0.08, // Beer-Lambert absorption
             0.04, 0.25, 0.42, // deep tint
-            0.65,  // foam threshold
+            0.65, // foam threshold
             0.55, 0.48, 0.35, // bed color
-            0.6,   // wave amp
-            10.0,  // half extent
+            0.6,  // wave amp
+            10.0, // half extent
         ],
     });
     renderer.submit(&water_frame, &catalog, &mut target).unwrap();
@@ -1443,10 +1470,10 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
     foliage_frame.quality.sky = false;
     foliage_frame.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
     let mut fvals = vec![
-        0.5,             // time
-        1.0, 0.0,        // wind dir xz
-        0.2, 1.5, 1.0,   // wind strength, speed, gust
-        0.45, 2.4,       // blade half-width, height
+        0.5, // time
+        1.0, 0.0, // wind dir xz
+        0.2, 1.5, 1.0, // wind strength, speed, gust
+        0.45, 2.4, // blade half-width, height
         0.08, 0.42, 0.06, // root rgb
         0.25, 0.85, 0.12, // tip rgb
         0.4, 0.9, 0.15, 2.0, // sss rgb + power
@@ -1488,7 +1515,6 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
-
 
 #[test]
 fn tier3_restir_di_many_light_shadows_sharc_and_two_phase_meshlet_disocclusion_witness() {
@@ -1536,9 +1562,18 @@ fn tier3_restir_di_many_light_shadows_sharc_and_two_phase_meshlet_disocclusion_w
     write_solid_png(&dir.join("white.png"), [255, 255, 255, 255]);
 
     let mats = [
-        ("green.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.1, 0.9, 0.15, 1.0], "lighting": "unlit" })),
-        ("red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.95, 0.1, 0.1, 1.0], "lighting": "unlit" })),
-        ("white_lit.mat.json", json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.85, 0.85, 0.85, 1.0], "lighting": "lit", "instanceParameters": [0.0, 0.75, 1.0, 0.0] })),
+        (
+            "green.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.1, 0.9, 0.15, 1.0], "lighting": "unlit" }),
+        ),
+        (
+            "red.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.95, 0.1, 0.1, 1.0], "lighting": "unlit" }),
+        ),
+        (
+            "white_lit.mat.json",
+            json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.85, 0.85, 0.85, 1.0], "lighting": "lit", "instanceParameters": [0.0, 0.75, 1.0, 0.0] }),
+        ),
     ];
     for (name, val) in &mats {
         std::fs::write(dir.join(name), val.to_string()).unwrap();
@@ -1568,24 +1603,14 @@ fn tier3_restir_di_many_light_shadows_sharc_and_two_phase_meshlet_disocclusion_w
     let sphere_draw = Draw {
         mesh: 0,
         material: 0,
-        transform: [
-            1.4, 0.0, 0.0, 0.0,
-            0.0, 1.4, 0.0, 0.0,
-            0.0, 0.0, 1.4, 0.0,
-            0.0, 0.0, -5.0, 1.0,
-        ],
+        transform: [1.4, 0.0, 0.0, 0.0, 0.0, 1.4, 0.0, 0.0, 0.0, 0.0, 1.4, 0.0, 0.0, 0.0, -5.0, 1.0],
         parameters: None,
         extra: None,
     };
     let blocker_draw = Draw {
         mesh: 1,
         material: 1,
-        transform: [
-            3.0, 0.0, 0.0, 0.0,
-            0.0, 3.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, -1.5, 1.0,
-        ],
+        transform: [3.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.5, 1.0],
         parameters: None,
         extra: None,
     };
@@ -1624,12 +1649,7 @@ fn tier3_restir_di_many_light_shadows_sharc_and_two_phase_meshlet_disocclusion_w
     let back_wall = Draw {
         mesh: 1,
         material: 2,
-        transform: [
-            4.0, 0.0, 0.0, 0.0,
-            0.0, 4.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, -3.0, 1.0,
-        ],
+        transform: [4.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -3.0, 1.0],
         parameters: None,
         extra: None,
     };
@@ -1637,12 +1657,7 @@ fn tier3_restir_di_many_light_shadows_sharc_and_two_phase_meshlet_disocclusion_w
     let divider = Draw {
         mesh: 1,
         material: 2,
-        transform: [
-            0.0, 0.0, -1.5, 0.0,
-            0.0, 4.0, 0.0, 0.0,
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, -1.8, 1.0,
-        ],
+        transform: [0.0, 0.0, -1.5, 0.0, 0.0, 4.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.8, 1.0],
         parameters: None,
         extra: None,
     };
@@ -1702,7 +1717,6 @@ fn tier3_restir_di_many_light_shadows_sharc_and_two_phase_meshlet_disocclusion_w
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 #[test]
 fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() {
     use pen_render::{
@@ -1755,15 +1769,27 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
     write_solid_png(&dir.join("white.png"), [255, 255, 255, 255]);
 
     let mats = [
-        ("blue.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.08, 0.25, 0.9, 1.0], "lighting": "unlit" })),
-        ("red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.9, 0.08, 0.08, 1.0], "lighting": "unlit" })),
+        (
+            "blue.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.08, 0.25, 0.9, 1.0], "lighting": "unlit" }),
+        ),
+        (
+            "red.mat.json",
+            json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.9, 0.08, 0.08, 1.0], "lighting": "unlit" }),
+        ),
     ];
     for (name, val) in &mats {
         std::fs::write(dir.join(name), val.to_string()).unwrap();
     }
+    write_solid_png(&dir.join("world_only.png"), [20, 220, 255, 255]);
+    std::fs::write(
+        dir.join("world_only.mat.json"),
+        json!({ "shader": "simple.wgsl", "texture": "world_only.png", "color": [1.0, 1.0, 1.0, 1.0], "lighting": "unlit" }).to_string(),
+    )
+    .unwrap();
     let catalog = Catalog {
         meshes: vec!["sphere_dag.mesh.json".into(), "quad.mesh.json".into()],
-        materials: mats.iter().map(|(n, _)| (*n).into()).collect(),
+        materials: mats.iter().map(|(n, _)| (*n).into()).chain(["world_only.mat.json".into()]).collect(),
         sounds: vec![],
     };
     let mut renderer = Renderer::new(
@@ -1786,12 +1812,7 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
     let sphere_draw = Draw {
         mesh: 0,
         material: 0,
-        transform: [
-            1.2, 0.0, 0.0, 0.0,
-            0.0, 1.2, 0.0, 0.0,
-            0.0, 0.0, 1.2, 0.0,
-            0.0, 0.0, -4.0, 1.0,
-        ],
+        transform: [1.2, 0.0, 0.0, 0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 0.0, 1.2, 0.0, 0.0, 0.0, -4.0, 1.0],
         parameters: None,
         extra: None,
     };
@@ -1819,12 +1840,7 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
     let center_quad = Draw {
         mesh: 1,
         material: 0,
-        transform: [
-            0.45, 0.0, 0.0, 0.0,
-            0.0, 0.45, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, -2.0, 1.0,
-        ],
+        transform: [0.45, 0.0, 0.0, 0.0, 0.0, 0.45, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -2.0, 1.0],
         parameters: None,
         extra: None,
     };
@@ -1865,12 +1881,7 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
     let right_blocker = Draw {
         mesh: 1,
         material: 1,
-        transform: [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 2.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            1.0, 0.0, -1.5, 1.0,
-        ],
+        transform: [1.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, -1.5, 1.0],
         parameters: None,
         extra: None,
     };
@@ -1931,6 +1942,16 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
     let mid_ext_line = common::middle(&device, &queue, &target.0);
     assert!(mid_ext_line[1] > 180 && mid_ext_line[0] < 40, "LINES_EXT_TAG must draw green 2D line: {mid_ext_line:?}");
 
+    // The first edge is 22 px, so the next edge starts partway into a 20 px dash period.
+    f_line_ext.extensions[0].values = vec![
+        0.3, 0.0, 10.0, 64.0, 0.0, 2.0, 32.0, 64.0, 0.0, 8.0, 0.0, 1.0, 0.0, 1.0, 12.0, 1.0, 0.0, 1.0, 32.0, 64.0, 0.0,
+        2.0, 100.0, 64.0, 0.0, 8.0, 0.0, 1.0, 0.0, 1.0, 12.0, 1.0, 0.0, 3.0,
+    ];
+    renderer.submit(&f_line_ext, &catalog, &mut target).unwrap();
+    let dashed = common::pixels(&device, &queue, &target.0);
+    assert!(dashed[64 * 128 + 38][1] < 10, "continuation should already be in the gap");
+    assert!(dashed[64 * 128 + 52][1] > 180, "next dash should start at the continued phase");
+
     // 4) Live GPU Mesh Particles (via API & GPU_PARTICLES_EXT_TAG).
     let mut p_scene = GpuParticleScene {
         max_particles: 64,
@@ -1941,13 +1962,8 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
         ambient: 1.2,
         ..GpuParticleScene::default()
     };
-    p_scene.pending_seed = Some(vec![GpuParticle::primary(
-        [0.0, 0.0, -2.2],
-        [0.0, 0.0, 0.0],
-        5.0,
-        0.9,
-        [1.8, 0.6, 0.05, 1.0],
-    )]);
+    p_scene.pending_seed =
+        Some(vec![GpuParticle::primary([0.0, 0.0, -2.2], [0.0, 0.0, 0.0], 5.0, 0.9, [1.8, 0.6, 0.05, 1.0])]);
     renderer.set_gpu_particle_scene(p_scene);
     let mut f_gp = common::frame(vec![]);
     f_gp.projection = proj_fwd;
@@ -1961,8 +1977,22 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
     // Smoke-check GPU_PARTICLES_EXT_TAG extension decoding as well.
     let mut f_gp_ext = f_gp.clone();
     let mut ext_vals = vec![
-        64.0, 1.0 / 60.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, // max, dt, gravity, drag, curl
-        0.5, 0.2, 0.3, 17.0, 0.0, 2.0, 0.5, 1.2, // rest, fric, thick, flags(collide+reseed), subemit, ambient
+        64.0,
+        1.0 / 60.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.5, // max, dt, gravity, drag, curl
+        0.5,
+        0.2,
+        0.3,
+        17.0,
+        0.0,
+        2.0,
+        0.5,
+        1.2, // rest, fric, thick, flags(collide+reseed), subemit, ambient
     ];
     ext_vals.extend_from_slice(&[
         0.0, 0.0, -2.2, 0.0, // pos_age
@@ -1974,6 +2004,67 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
     renderer.submit(&f_gp_ext, &catalog, &mut target).unwrap();
     let p_ext_mid = common::middle(&device, &queue, &target.0);
     assert!(p_ext_mid[1] > 140 && p_ext_mid[0] < 70, "GPU_PARTICLES_EXT_TAG must render green cube: {p_ext_mid:?}");
+
+    let mut split_particles = f_gp_ext.clone();
+    let args = &mut split_particles.extensions[0].values;
+    args[1] = 0.075;
+    args[11] = 1.0;
+    args[23] = 0.12;
+    for (x, projection) in [(0.0, proj_fwd), (0.5, proj_rev)] {
+        split_particles.camera_targets.push(CameraTargetSpec {
+            viewport_x: x,
+            viewport_y: 0.0,
+            viewport_w: 0.5,
+            viewport_h: 1.0,
+            split_screen: true,
+            view: common::IDENTITY,
+            projection,
+            ..Default::default()
+        });
+    }
+    renderer.submit(&split_particles, &catalog, &mut target).unwrap();
+    let split = common::pixels(&device, &queue, &target.0);
+    for x in [32, 96] {
+        assert!(split[64 * 128 + x][1] > 140, "both cameras must draw the same live particle");
+    }
+
+    let mut msaa_particles = f_gp_ext.clone();
+    let args = &mut msaa_particles.extensions[0].values;
+    args[1] = 0.1;
+    args[11] = 1.0;
+    args[20] = 10.0;
+    renderer.submit(&msaa_particles, &catalog, &mut target).unwrap();
+    let before_msaa = common::pixels(&device, &queue, &target.0);
+    assert!(before_msaa[64 * 128 + 93][1] > 140);
+    msaa_particles.quality.msaa = 4;
+    msaa_particles.extensions[0].values[1] = 0.0;
+    renderer.submit(&msaa_particles, &catalog, &mut target).unwrap();
+    let after_msaa = common::pixels(&device, &queue, &target.0);
+    assert!(after_msaa[64 * 128 + 93][1] > 140);
+    assert!(after_msaa[64 * 128 + 64][1] < 10, "MSAA switch must preserve the simulated position");
+
+    f_gp_ext.extensions[0].values.truncate(16);
+    renderer.submit(&f_gp_ext, &catalog, &mut target).unwrap();
+    let cleared = common::middle(&device, &queue, &target.0);
+    assert!(cleared[..3].iter().all(|&channel| channel < 10), "empty reseed must clear the buffer");
+
+    // With backface culling enabled, a front-only mesh must survive both basis and spin.
+    let mut face_particle = GpuParticle::primary([0.0, 0.0, -2.2], [0.0; 3], 5.0, 1.0, [1.8, 0.4, 0.0, 1.0]);
+    face_particle.size_rot_gen[1] = 0.4;
+    renderer.set_gpu_particle_scene(GpuParticleScene {
+        max_particles: 1,
+        mesh_vertices: [[0.0, -0.5, 0.5], [0.0, -0.5, -0.5], [0.0, 0.5, 0.0]]
+            .map(|position| pen_render::GpuParticleMeshVertex { position, normal: [1.0, 0.0, 0.0] })
+            .into(),
+        mesh_indices: vec![0, 1, 2],
+        dt: 0.0,
+        ambient: 1.2,
+        pending_seed: Some(vec![face_particle]),
+        ..Default::default()
+    });
+    renderer.submit(&f_gp, &catalog, &mut target).unwrap();
+    assert!(common::middle(&device, &queue, &target.0)[0] > 180, "spun particle front face must survive culling");
+    renderer.clear_gpu_particle_scene();
 
     // 5) Live First-Class 2D Renderer Suite (Tilemap + Sprites2d + 2D Radiance Cascades GI + SDF UI + RENDER2D_EXT_TAG).
     let white_atlas = renderer.upload_2d_texture_rgba8(2, 2, &[255u8; 16]);
@@ -2042,6 +2133,11 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
             0.0, 0.0, 0.0, 0.0, // clip_rect
         ],
     });
+    renderer.set_devtools_sdf_overlay(vec![SdfShape {
+        rect: [48.0, 8.0, 32.0, 20.0],
+        fill_color: [0.95, 0.0, 0.0, 1.0],
+        ..Default::default()
+    }]);
     renderer.submit(&f_2d, &catalog, &mut target).unwrap();
     let px_2d = common::pixels(&device, &queue, &target.0);
     let at2d = |x: u32, y: u32| px_2d[(y * 128 + x) as usize];
@@ -2049,7 +2145,12 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
     let rc_umbra = at2d(90, 64);
     let sdf_card = at2d(24, 18);
     let sdf_ext = at2d(106, 106);
-    assert!(rc_lit[0] > 120 && rc_umbra[0] < 15, "2D RC GI must light left and shadow right behind wall: lit={rc_lit:?} umbra={rc_umbra:?}");
+    let sdf_devtools = at2d(64, 18);
+    assert!(sdf_devtools[0] > 180 && sdf_devtools[1] < 40);
+    assert!(
+        rc_lit[0] > 120 && rc_umbra[0] < 15,
+        "2D RC GI must light left and shadow right behind wall: lit={rc_lit:?} umbra={rc_umbra:?}"
+    );
     assert!(sdf_card[2] > 180 && sdf_card[0] < 60, "SDF UI card must render blue fill: {sdf_card:?}");
     assert!(sdf_ext[1] > 180 && sdf_ext[0] < 40, "RENDER2D_EXT_TAG SDF badge must render green: {sdf_ext:?}");
     renderer.clear_scene_2d();
@@ -2066,10 +2167,8 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
         1.0, 1.0, 1.0, 1.0,
         // 1 sprite (25 floats): white mat=-1, pos(-32,0), size(12,12), pivot(0.5,0.5), rot=0, layer=0, uv(0,0,1,1), color(1), slice(0), flags(0)
         -1.0, -32.0, 0.0, 12.0, 12.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0,
-        // 2 RC emitters (9 floats each): Circle light left + opaque Rect wall center
-        0.0, 24.0, 64.0, 10.0, 0.0, 5.0, 3.5, 1.0, 1.0,
-        1.0, 60.0, 16.0, 10.0, 96.0, 0.0, 0.0, 0.0, 1.0,
+        0.0, 0.0, 0.0, 0.0, // 2 RC emitters (9 floats each): Circle light left + opaque Rect wall center
+        0.0, 24.0, 64.0, 10.0, 0.0, 5.0, 3.5, 1.0, 1.0, 1.0, 60.0, 16.0, 10.0, 96.0, 0.0, 0.0, 0.0, 1.0,
     ];
     let mut f_2d_ext = common::frame(vec![]);
     f_2d_ext.projection = proj_fwd;
@@ -2080,6 +2179,16 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
     let px_2d_ext = common::pixels(&device, &queue, &target.0);
     let ext_lit = px_2d_ext[(64 * 128 + 42) as usize];
     let ext_umbra = px_2d_ext[(64 * 128 + 90) as usize];
+    assert!(px_2d_ext[18 * 128 + 64][0] > 180, "devtools overlay must coexist with the world extension");
+    let values = &mut f_2d_ext.extensions[0].values;
+    values[33] = 2.0;
+    wait_ready(&mut renderer, &f_2d_ext, &catalog, &mut target);
+    let atlas_pixel = common::pixels(&device, &queue, &target.0)[64 * 128 + 32];
+    assert!(
+        atlas_pixel[1] > atlas_pixel[0].saturating_add(50),
+        "extension-only atlas must load while the devtools overlay is active: {atlas_pixel:?}"
+    );
+    renderer.clear_devtools_sdf_overlay();
     assert!(
         ext_lit[0] > 120 && ext_umbra[0] < 15,
         "RENDER2D_WORLD_EXT_TAG must drive 2D tilemap + RC2D GI purely from extensions: lit={ext_lit:?} umbra={ext_umbra:?}"
@@ -2171,24 +2280,14 @@ fn live_renderer_dag_two_phase_hiz_recovers_disocclusion_same_frame() {
     let dag_sphere = Draw {
         mesh: 0,
         material: 0,
-        transform: [
-            1.1, 0.0, 0.0, 0.0,
-            0.0, 1.1, 0.0, 0.0,
-            0.0, 0.0, 1.1, 0.0,
-            0.0, 0.0, -4.5, 1.0,
-        ],
+        transform: [1.1, 0.0, 0.0, 0.0, 0.0, 1.1, 0.0, 0.0, 0.0, 0.0, 1.1, 0.0, 0.0, 0.0, -4.5, 1.0],
         parameters: None,
         extra: None,
     };
     let blocker = Draw {
         mesh: 1,
         material: 1,
-        transform: [
-            2.5, 0.0, 0.0, 0.0,
-            0.0, 2.5, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, -1.5, 1.0,
-        ],
+        transform: [2.5, 0.0, 0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.5, 1.0],
         parameters: None,
         extra: None,
     };

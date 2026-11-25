@@ -3,6 +3,7 @@ use crate::input::Input;
 use crate::program::error;
 use anyhow::Result;
 use pen_protocol::{GameEvent, UiNode, ui_action, ui_live, ui_role, ui_state};
+use pen_runtime::role_testing::AccessibilityTree;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::{JsCast, closure::Closure};
@@ -15,6 +16,7 @@ pub struct Accessibility {
     last: Vec<UiNode>,
     tools: bool,
     replacing: Rc<Cell<bool>>,
+    generation: Rc<Cell<u64>>,
     input: Rc<RefCell<Input>>,
     /// The captions' live region, while the game's sounds carry captions,
     /// and what it says.
@@ -31,11 +33,20 @@ impl Accessibility {
         .map_err(error)?;
         root.set_attribute("aria-label", "Game interface").map_err(error)?;
         document.body().unwrap().append_child(&root).map_err(error)?;
-        Ok(Self { root, last: Vec::new(), tools: false, replacing: Rc::default(), input, captions: None })
+        Ok(Self {
+            root,
+            last: Vec::new(),
+            tools: false,
+            replacing: Rc::default(),
+            generation: Rc::default(),
+            input,
+            captions: None,
+        })
     }
 
-    /// The reading direction of the selected game language.
-    pub fn set_rtl(&self, rtl: bool) -> Result<()> {
+    /// The selected game language and its reading direction.
+    pub fn set_locale(&self, tag: &str, rtl: bool) -> Result<()> {
+        self.root.set_attribute("lang", tag).map_err(error)?;
         self.root.set_attribute("dir", if rtl { "rtl" } else { "ltr" }).map_err(error)
     }
     /// The captions showing, a line each, in a polite live region after the
@@ -74,28 +85,22 @@ impl Accessibility {
             .active_element()
             .filter(|element| self.tools == tools && self.root.contains(Some(element)))
             .map(|element| element.id());
-        let mut elements: Vec<Element> = Vec::with_capacity(nodes.len());
+        let tree = AccessibilityTree::new(nodes);
+        let modal = tree.active_modal();
+        let generation = self.generation.get().wrapping_add(1);
+        let mut elements: Vec<Option<Element>> = vec![None; nodes.len()];
         let mut top_level = Vec::new();
-        let mut listboxes = vec![false; nodes.len()];
-        for (index, node) in nodes.iter().enumerate() {
-            if option(node)
-                && let Some(parent) = parent(index, node)
-            {
-                listboxes[parent] = nodes[parent].role == ui_role::LIST;
+        let mut restore_focus = None;
+        let mut game_focus = None;
+        for (index, (node, info)) in nodes.iter().zip(tree.nodes()).enumerate() {
+            if !info.in_tree {
+                continue;
             }
-        }
-        for (index, node) in nodes.iter().enumerate() {
             let element = document.create_element("div").map_err(error)?;
-            if node.hidden {
-                element.set_attribute("aria-hidden", "true").map_err(error)?;
+            if info.blocked {
+                element.set_attribute("inert", "").map_err(error)?;
             }
-            let role = if listboxes[index] {
-                "listbox"
-            } else if option(node) {
-                "option"
-            } else {
-                ui_role::NAMES.get(node.role as usize).copied().unwrap_or("group")
-            };
+            let role = if info.effective_role == "unknown" { "group" } else { info.effective_role };
             element.set_attribute("role", role).map_err(error)?;
             element.set_attribute("id", &format!("pen-ui-{}", node.id)).map_err(error)?;
             let name_end = (node.name_length as usize).min(node.text.len());
@@ -109,10 +114,10 @@ impl Accessibility {
                     element.set_attribute(key, &pen_runtime::services::text(points)).map_err(error)?;
                 }
             }
-            if node.disabled {
+            if info.disabled {
                 element.set_attribute("aria-disabled", "true").map_err(error)?;
             }
-            if node.modal {
+            if modal == Some(index) {
                 element.set_attribute("aria-modal", "true").map_err(error)?;
             }
             let live = match node.live {
@@ -138,8 +143,15 @@ impl Accessibility {
                         .map_err(error)?;
                 }
             }
-            if node.focusable || takes(node, ui_action::FOCUS) {
+            let focusable = tree.allows_action(node.id, ui_action::FOCUS);
+            if focusable || modal == Some(index) {
                 element.set_attribute("tabindex", "-1").map_err(error)?;
+                if focused.as_ref().is_some_and(|id| element.id() == *id) {
+                    restore_focus = Some(index);
+                }
+                if focusable && node.focused {
+                    game_focus.get_or_insert(index);
+                }
             }
             let ranged = matches!(node.role, ui_role::SLIDER | ui_role::SPINBUTTON | ui_role::PROGRESSBAR)
                 || [ui_action::INCREMENT, ui_action::DECREMENT, ui_action::SET_VALUE]
@@ -154,28 +166,34 @@ impl Accessibility {
                     }
                 }
             }
-            self.listen(&element, node, tools)?;
-            if let Some(parent) = parent(index, node) {
-                elements[parent].append_child(&element).map_err(error)?;
+            if info.exposed() && !info.disabled {
+                self.listen(&element, node, tools, &tree, generation)?;
+            }
+            // A nested active modal needs to sit outside its inert ancestors.
+            if let Some(parent) = info.parent.filter(|_| modal != Some(index)) {
+                elements[parent].as_ref().unwrap().append_child(&element).map_err(error)?;
             } else {
                 top_level.push(index);
             }
-            elements.push(element);
+            elements[index] = Some(element);
         }
 
-        // Keep a screen reader's DOM focus as the game redraws the same
-        // control, without turning the replacement itself into a game action.
+        // Preserve an eligible focused control across redraws. If a modal
+        // displaced it, focus the game's selection in the modal or the modal itself.
+        let focus = if let Some(modal) = modal {
+            restore_focus.filter(|&index| index != modal).or(game_focus).or(Some(modal))
+        } else {
+            restore_focus
+        };
         self.replacing.set(true);
+        self.generation.set(generation);
         let replaced: Result<()> = (|| {
             self.root.set_text_content(None);
             for index in top_level {
-                self.root.append_child(&elements[index]).map_err(error)?;
+                self.root.append_child(elements[index].as_ref().unwrap()).map_err(error)?;
             }
-            if let Some(element) = elements
-                .iter()
-                .find(|element| focused.as_ref().is_some_and(|id| element.id() == *id))
-                .and_then(|element| element.dyn_ref::<HtmlElement>())
-                .filter(|element| element.has_attribute("tabindex"))
+            if let Some(element) =
+                focus.and_then(|index| elements[index].as_ref()).and_then(|element| element.dyn_ref::<HtmlElement>())
             {
                 element.focus().map_err(error)?;
             }
@@ -188,16 +206,33 @@ impl Accessibility {
         Ok(())
     }
 
-    fn listen(&self, element: &Element, node: &UiNode, tools: bool) -> Result<()> {
+    fn listen(
+        &self,
+        element: &Element,
+        node: &UiNode,
+        tools: bool,
+        tree: &AccessibilityTree<'_>,
+        generation: u64,
+    ) -> Result<()> {
         let callbacks = js_sys::Array::new();
         let id = node.id;
         let input = self.input.clone();
+        let current = self.generation.clone();
+        let replacing = self.replacing.clone();
+        let accepts = move |event: &Event| {
+            current.get() == generation
+                && !replacing.get()
+                && event.target().and_then(|target| target.dyn_into::<Element>().ok()).is_some_and(|target| {
+                    target.is_connected() && target.closest("[inert], [aria-disabled=true]").ok().flatten().is_none()
+                })
+        };
         let send = move |action| {
             let mut input = input.borrow_mut();
             let queue = if tools { &mut input.tools } else { &mut input.events };
             queue.push(GameEvent::UiAction { node: id, action, value: 0.0 });
         };
-        let click = if takes(node, ui_action::ACTIVATE) {
+        let allowed = |action| tree.allows_action(id, action);
+        let click = if allowed(ui_action::ACTIVATE) {
             Some(ui_action::ACTIVATE)
         } else {
             let action = if matches!(node.expanded, ui_state::TRUE | ui_state::MIXED) {
@@ -205,28 +240,31 @@ impl Accessibility {
             } else {
                 ui_action::EXPAND
             };
-            takes(node, action).then_some(action)
+            allowed(action).then_some(action)
         };
         for (event, action) in [
-            ("focus", (node.focusable || takes(node, ui_action::FOCUS)).then_some(ui_action::FOCUS)),
-            ("blur", (node.focusable || takes(node, ui_action::BLUR)).then_some(ui_action::BLUR)),
+            ("focus", allowed(ui_action::FOCUS).then_some(ui_action::FOCUS)),
+            ("blur", allowed(ui_action::BLUR).then_some(ui_action::BLUR)),
             ("click", click),
         ] {
             if let Some(action) = action {
                 let send = send.clone();
-                let replacing = self.replacing.clone();
+                let accepts = accepts.clone();
                 listen(element, &callbacks, event, move |event| {
-                    if !replacing.get() {
+                    if accepts(&event) {
                         event.stop_propagation();
                         send(action);
                     }
                 })?;
             }
         }
-        let increment = takes(node, ui_action::INCREMENT);
-        let decrement = takes(node, ui_action::DECREMENT);
+        let increment = allowed(ui_action::INCREMENT);
+        let decrement = allowed(ui_action::DECREMENT);
         if increment || decrement {
             listen(element, &callbacks, "keydown", move |event| {
+                if !accepts(&event) {
+                    return;
+                }
                 let Some(key) = event.dyn_ref::<KeyboardEvent>() else { return };
                 let action = match key.key().as_str() {
                     "ArrowUp" | "ArrowRight" if increment => ui_action::INCREMENT,
@@ -244,12 +282,14 @@ impl Accessibility {
     }
 }
 
-fn parent(index: usize, node: &UiNode) -> Option<usize> {
-    (node.parent as usize).checked_sub(1).filter(|parent| *parent < index)
-}
-
-fn option(node: &UiNode) -> bool {
-    node.role == ui_role::LISTITEM && node.focusable
+impl Drop for Accessibility {
+    fn drop(&mut self) {
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.root.remove();
+        if let Some((captions, _)) = &self.captions {
+            captions.remove();
+        }
+    }
 }
 
 fn takes(node: &UiNode, action: u32) -> bool {

@@ -228,11 +228,23 @@ impl RadianceCascades2d {
         output: &wgpu::TextureView,
         weights: [f32; 3],
     ) {
+        self.composite_layer(device, encoder, albedo, output, weights, false);
+    }
+
+    pub(crate) fn composite_layer(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        albedo: &wgpu::TextureView,
+        output: &wgpu::TextureView,
+        weights: [f32; 3],
+        premultiplied: bool,
+    ) {
         let [ambient, multiply, add] = weights;
         let uniform = buffer(
             device,
             "2D RC composite weights",
-            bytemuck::bytes_of(&[ambient, multiply, add, 0.0]),
+            bytemuck::bytes_of(&[ambient, multiply, add, f32::from(premultiplied)]),
             wgpu::BufferUsages::UNIFORM,
         );
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -287,6 +299,8 @@ pub enum Scene2dEmitter {
 pub fn rasterize_scene_2d(size: [u32; 2], emitters: &[Scene2dEmitter]) -> Vec<[f32; 4]> {
     let width = size[0] as usize;
     let mut pixels = vec![[0.0; 4]; width * size[1] as usize];
+    // Count bounding-box visits, including pixels rejected by the circle test.
+    let mut remaining = (width * size[1] as usize).saturating_mul(4).clamp(1_048_576, 33_554_432);
     for &emitter in emitters {
         let ([left, top, right, bottom], material) = match emitter {
             Scene2dEmitter::Circle { center: [x, y], radius, material } => {
@@ -296,6 +310,11 @@ pub fn rasterize_scene_2d(size: [u32; 2], emitters: &[Scene2dEmitter]) -> Vec<[f
         };
         let x_range = pixel_bound(left, size[0])..pixel_bound(right, size[0]);
         let y_range = pixel_bound(top, size[1])..pixel_bound(bottom, size[1]);
+        let area = x_range.len() * y_range.len();
+        if area > remaining {
+            continue;
+        }
+        remaining -= area;
         let opacity = material[3].clamp(0.0, 1.0);
         let transmittance = 1.0 - opacity;
         for y in y_range {
@@ -321,4 +340,17 @@ pub fn rasterize_scene_2d(size: [u32; 2], emitters: &[Scene2dEmitter]) -> Vec<[f
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "quantizing clamped pixel bounds")]
 fn pixel_bound(edge: f32, limit: u32) -> usize {
     ((edge - 0.5).ceil().clamp(0.0, limit as f32) as usize).min(limit as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overlapping_emitters_share_one_clipped_raster_budget() {
+        let covering = Scene2dEmitter::Rect { rect: [-100.0, -100.0, 2000.0, 2000.0], material: [1.0, 0.0, 0.0, 0.0] };
+        let image = rasterize_scene_2d([512, 512], &[covering; 64]);
+        assert_eq!(image[0], [4.0, 0.0, 0.0, 0.0]);
+        assert_eq!(image[image.len() - 1], image[0]);
+    }
 }

@@ -1,3 +1,4 @@
+use crate::camera_precision::DepthMode;
 // The renderer's own pipelines, beside its materials' shaders: the passes
 // around the scene (post.rs), decals, particles and the inset composite. They compile on
 // the loader's threads ahead of need, for the sample count frames draw at,
@@ -111,8 +112,8 @@ impl BuiltIn {
 pub(crate) struct BuiltIns {
     context: PipelineContext,
     jobs: JobQueue,
-    made: HashMap<BuiltIn, wgpu::RenderPipeline>,
-    compiling: HashSet<BuiltIn>,
+    made: HashMap<(BuiltIn, DepthMode), wgpu::RenderPipeline>,
+    compiling: HashSet<(BuiltIn, DepthMode)>,
 }
 
 impl BuiltIns {
@@ -120,31 +121,31 @@ impl BuiltIns {
         Self { context, jobs, made: HashMap::new(), compiling: HashSet::new() }
     }
 
+    fn key(which: BuiltIn, depth: DepthMode) -> (BuiltIn, DepthMode) {
+        (which, if which.is_depth_dependent() { depth } else { DepthMode::ForwardZ })
+    }
+
     /// Compiles these in the background, unless they are there or on their way.
     pub fn prepare(&mut self, which: impl IntoIterator<Item = BuiltIn>) {
         for which in which {
-            if !self.made.contains_key(&which) && self.compiling.insert(which) {
-                self.jobs.push(Job::BuiltIn(which), Priority::Urgent);
+            let key = Self::key(which, self.context.depth_mode());
+            if !self.made.contains_key(&key) && self.compiling.insert(key) {
+                self.jobs.push(Job::BuiltIn(which, key.1), Priority::Urgent);
             }
         }
     }
 
     pub fn ready(&self, which: impl IntoIterator<Item = BuiltIn>) -> bool {
-        which.into_iter().all(|which| self.made.contains_key(&which))
+        which.into_iter().all(|which| self.made.contains_key(&Self::key(which, self.context.depth_mode())))
     }
 
     /// Whether some of these are not there yet but on their way.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn coming(&self, which: impl IntoIterator<Item = BuiltIn>) -> bool {
-        which.into_iter().any(|which| !self.made.contains_key(&which) && self.compiling.contains(&which))
-    }
-
-    /// Clears cached pipelines whose depth comparison or clear value depends on `DepthMode`,
-    /// leaving depth-independent pipelines (`Present`, `Composite`, `Backdrop`, etc.) intact
-    /// so external bind groups created from their layouts stay valid.
-    pub fn invalidate_depth_dependent(&mut self) {
-        self.made.retain(|k, _| !k.is_depth_dependent());
-        self.compiling.retain(|k| !k.is_depth_dependent());
+        which
+            .into_iter()
+            .map(|which| Self::key(which, self.context.depth_mode()))
+            .any(|key| !self.made.contains_key(&key) && self.compiling.contains(&key))
     }
 
     /// Background compiles under way.
@@ -155,7 +156,7 @@ impl BuiltIns {
     /// The pipeline, compiled now if it is not there yet.
     pub fn get(&mut self, which: BuiltIn) -> &wgpu::RenderPipeline {
         let context = &self.context;
-        self.made.entry(which).or_insert_with(|| {
+        self.made.entry(Self::key(which, context.depth_mode())).or_insert_with(|| {
             log::debug!("{which:?} compiles on the frame's thread");
             which.compile(context)
         })
@@ -168,13 +169,11 @@ impl BuiltIns {
         depth_mode: crate::camera_precision::DepthMode,
         result: Result<wgpu::RenderPipeline, String>,
     ) {
-        if which.is_depth_dependent() && depth_mode != self.context.depth_mode() {
-            return;
-        }
-        self.compiling.remove(&which);
+        let key = Self::key(which, depth_mode);
+        self.compiling.remove(&key);
         match result {
             Ok(pipeline) => {
-                self.made.entry(which).or_insert(pipeline);
+                self.made.entry(key).or_insert(pipeline);
             }
             Err(message) => log::warn!("{which:?} pipeline: {message}"),
         }
@@ -208,7 +207,8 @@ mod tests {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return };
         let Ok((device, _queue)) = pollster::block_on(adapter.request_device(&Default::default())) else { return };
-        let dummy_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[] });
+        let dummy_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[] });
         let dummy_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[],

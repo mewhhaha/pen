@@ -43,12 +43,12 @@ pub(super) use decals_oit::PreparedPbrDecalBatch;
 pub use gpu_particles::GpuParticleScene;
 pub(super) use gpu_particles::GpuParticleWiredState;
 pub use jfa_outline::{JfaOutlineScene, JfaOutlineTarget};
-pub(super) use jfa_outline::JfaOutlineWiredState;
+pub(super) use jfa_outline::{JfaOutlineWiredState, OutlineScenes, outlined};
 pub use lines::LineScene;
 pub(super) use lines::LineWiredState;
 pub(super) use post_split::SplitViewSlot;
-pub use render2d::{RadianceCascades2dLayer, Scene2d, SpriteLayer2d, TilemapLayer2d};
 pub(super) use render2d::Render2dWiredState;
+pub use render2d::{RadianceCascades2dLayer, Scene2d, SpriteLayer2d, TilemapLayer2d};
 pub(super) use sky_env::EnvPipelines;
 
 /// Built-in optional `RenderFrame::extensions` tags driving outdoor GPU environment passes from Blot.
@@ -141,6 +141,13 @@ impl Default for DagLodSettings {
 }
 
 #[derive(Default)]
+pub(super) struct RtHistory {
+    restir: Option<RestirRenderer>,
+    restir_specular: Option<RestirSpecularRenderer>,
+    svgf_rt: Option<SvgfRtState>,
+}
+
+#[derive(Default)]
 pub(super) struct WiredPasses {
     pub physical_atmosphere: Option<PhysicalAtmosphere>,
     pub physical_sky_serial: u64,
@@ -153,11 +160,11 @@ pub(super) struct WiredPasses {
     pub tlas_gpu: Option<TlasSceneGpu>,
     pub tlas_bounds: Option<([f32; 3], [f32; 3])>,
     pub ray_tracer: Option<TlasRayTracer>,
-    pub restir: Option<RestirRenderer>,
-    pub restir_specular: Option<RestirSpecularRenderer>,
+    pub rt_history: RtHistory,
     pub sharc: Option<SharcCache>,
     pub sharc_needs_clear: bool,
-    svgf_rt: Option<SvgfRtState>,
+    sharc_frame: Option<u64>,
+    pub split_child: bool,
     rt_composite: Option<RtCompositePipelines>,
     pub ddgi_near: Option<DdgiVolume>,
     pub ddgi_far: Option<DdgiVolume>,
@@ -239,16 +246,6 @@ pub(super) fn secondary_frame(frame: &RenderFrame, view: Matrix, projection: Mat
 }
 
 impl WiredPasses {
-    pub fn reset_svgf_history(&mut self) {
-        if let Some(svgf) = &mut self.svgf_rt {
-            svgf.reset_history();
-        }
-        if let Some(restir) = &mut self.restir {
-            restir.reset_history();
-        }
-        self.sharc_needs_clear = true;
-    }
-
     pub fn wants_post_polish(frame: &RenderFrame) -> bool {
         frame.grade.sharpness > 0.0
             || frame.quality.upscale

@@ -114,6 +114,14 @@ impl Table {
         if self.entries.contains_key(&key) {
             bail!("\"{key}\" is given twice");
         }
+        let has_nul = |text: &str| text.contains('\0');
+        let contains_nul = match &entry {
+            Entry::Text(text) => has_nul(text),
+            Entry::Plural(forms) => forms.iter().flatten().any(|text| has_nul(text)),
+        };
+        if contains_nul {
+            bail!("{key:?}: string contains a NUL character (U+0000)");
+        }
         self.entries.insert(key, entry);
         Ok(())
     }
@@ -186,6 +194,18 @@ mod tests {
         assert_eq!(error(r#"{"lines": ["a"], "lines.0": "b"}"#), "\"lines.0\" is given twice");
         assert_eq!(error("[]"), "a string table is a JSON object from key to string, not a list");
         assert_eq!(error("{"), "not JSON: EOF while parsing an object at line 1 column 1");
+    }
+
+    #[test]
+    fn embedded_nul_reports_the_offending_key() {
+        for (json, key) in [
+            (r#"{"title":"Hello\u0000world"}"#, "title"),
+            (r#"{"lines":["ok","bad\u0000"]}"#, "lines.1"),
+            (r#"{"coins":{"one":"\u0000","other":"coins"}}"#, "coins"),
+        ] {
+            let error = Table::parse(json).unwrap_err().to_string();
+            assert_eq!(error, format!("{key:?}: string contains a NUL character (U+0000)"));
+        }
     }
 
     #[test]

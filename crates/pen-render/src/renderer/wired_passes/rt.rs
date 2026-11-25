@@ -725,6 +725,18 @@ impl WiredPasses {
     }
 }
 
+fn rt_grid_size(size: (u32, u32), binding_bytes: u64) -> (u32, u32) {
+    let max_pixels = (binding_bytes / crate::restir_specular::RESERVOIR_STRIDE).max(1);
+    let mut divisor = if size.0 > 128 || size.1 > 128 { 2 } else { 1 };
+    loop {
+        let grid = (size.0.div_ceil(divisor), size.1.div_ceil(divisor));
+        if u64::from(grid.0) * u64::from(grid.1) <= max_pixels {
+            return grid;
+        }
+        divisor += 1;
+    }
+}
+
 impl State {
     /// Runs half-resolution `TlasRayTracer` (`quality.ray_tracing >= 1`) fed directly by the
     /// rasterized Thin G-Buffer (zero primary TLAS material-lookup rays, exact skinned/instanced/sheared
@@ -751,17 +763,14 @@ impl State {
         samples: u32,
         depth_mode: DepthMode,
     ) -> Result<()> {
-        if frame.quality.ray_tracing == 0 || wired.tlas_gpu.is_none() {
+        if frame.quality.ray_tracing == 0 || !TlasRayTracer::supported(device) || wired.tlas_gpu.is_none() {
             return Ok(());
         }
         let ddgi_active = ddgi_packed_buf.is_some();
         let depth_clear = depth_mode.clear_value();
         let depth_r32f = wired.resolve_msaa_depth(device, built_ins, encoder, depth_only, scene_size, samples);
-        let rt_size = if scene_size.0 > 128 || scene_size.1 > 128 {
-            (scene_size.0.div_ceil(2), scene_size.1.div_ceil(2))
-        } else {
-            scene_size
-        };
+        let limits = device.limits();
+        let rt_size = rt_grid_size(scene_size, limits.max_storage_buffer_binding_size.min(limits.max_buffer_size));
         let active_vp = multiply(active_proj, &frame.view);
         let inv_vp = invert(&active_vp);
         let eye = invert(&frame.view);
@@ -787,8 +796,10 @@ impl State {
                 wired.sharc = Some(SharcCache::new(device, SharcConfig::default())?);
                 wired.sharc_needs_clear = true;
             }
-            if let Some(sharc) = wired.sharc.as_ref() {
-                let sharc_reset = frame.exposure.cut || wired.sharc_needs_clear;
+            if let Some(sharc) = wired.sharc.as_ref()
+                && (wired.sharc_frame != Some(frames_count) || wired.sharc_needs_clear)
+            {
+                let sharc_reset = wired.sharc_needs_clear;
                 let sharc_params = SharcParams {
                     camera_pos,
                     frame_index: u32::try_from(frames_count & 0xffff_ffff).unwrap_or(0),
@@ -799,7 +810,10 @@ impl State {
                 if sharc_reset {
                     sharc.clear(encoder);
                     wired.sharc_needs_clear = false;
+                } else {
+                    sharc.resolve_uploaded(encoder, true);
                 }
+                wired.sharc_frame = Some(frames_count);
             }
         }
         let sharc_ref = if use_sharc { wired.sharc.as_ref() } else { None };
@@ -850,8 +864,9 @@ impl State {
         if (use_restir_di || use_restir_gi || use_restir_specular)
             && let Some((gbuf_nr, gbuf_am, gbuf_depth)) = thin_gbuffer
         {
-            let restir_has_prev = wired.svgf_rt.as_ref().is_some_and(|s| s.prev_vp.is_some()) && !frame.exposure.cut;
-            let restir_prev_vp = wired.svgf_rt.as_ref().and_then(|s| s.prev_vp).unwrap_or(active_vp);
+            let restir_has_prev =
+                wired.rt_history.svgf_rt.as_ref().is_some_and(|s| s.prev_vp.is_some()) && !frame.exposure.cut;
+            let restir_prev_vp = wired.rt_history.svgf_rt.as_ref().and_then(|s| s.prev_vp).unwrap_or(active_vp);
             let frame_idx = u32::try_from(frames_count & 0xffff_ffff).unwrap_or(0);
             if use_restir_di || use_restir_gi {
                 let restir_params = RestirParams {
@@ -889,7 +904,7 @@ impl State {
                     ddgi_packed: ddgi_packed_buf,
                     sharc: sharc_ref,
                 };
-                let restir = wired.restir.get_or_insert_with(|| RestirRenderer::new(device));
+                let restir = wired.rt_history.restir.get_or_insert_with(|| RestirRenderer::new(device));
                 restir.dispatch(device, encoder, tlas, restir_inputs, rt_size, &restir_params, restir_lights)?;
                 if use_restir_di {
                     raw_di = restir.di_view().cloned();
@@ -927,14 +942,13 @@ impl State {
                     ddgi_buf: ddgi_packed_buf,
                     sharc: sharc_ref,
                 };
-                let restir_spec = wired.restir_specular.get_or_insert_with(|| RestirSpecularRenderer::new(device));
+                let restir_spec =
+                    wired.rt_history.restir_specular.get_or_insert_with(|| RestirSpecularRenderer::new(device));
                 let spec_lights = &local_lights[..local_lights.len().min(RESTIR_MAX_LIGHTS)];
-                let out = restir_spec.dispatch(device, encoder, tlas, spec_inputs, rt_size, &spec_params, spec_lights)?;
+                let out =
+                    restir_spec.dispatch(device, encoder, tlas, spec_inputs, rt_size, &spec_params, spec_lights)?;
                 raw_refl = Some(out.specular_view.clone());
                 raw_refl_motion = Some(out.motion_view.clone());
-            }
-            if let Some(sharc) = sharc_ref {
-                sharc.resolve_uploaded(encoder, true);
             }
         }
 
@@ -943,7 +957,7 @@ impl State {
             let dummy_gbuf = wired.dummy_rgba16f_view(device);
             let vel_bind = velocity_view.unwrap_or(&dummy_vel);
             let gbuf_nr_bind = thin_gbuffer.map_or(&dummy_gbuf, |(nr, _, _)| nr);
-            let svgf = wired.svgf_rt.get_or_insert_with(|| SvgfRtState::new(device));
+            let svgf = wired.rt_history.svgf_rt.get_or_insert_with(|| SvgfRtState::new(device));
             let resized = !matches!(&svgf.buffers, Some(b) if b.size == rt_size);
             if resized {
                 svgf.buffers = Some(SvgfRtBuffers {
@@ -1091,5 +1105,19 @@ impl State {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rt_grid_size;
+
+    #[test]
+    fn restir_grid_fits_4k_and_larger_devices() {
+        let limit = 128 * 1024 * 1024;
+        assert_eq!(rt_grid_size((3840, 2160), limit), (1920, 1080));
+        assert_eq!(rt_grid_size((4096, 2160), limit), (1366, 720));
+        let (width, height) = rt_grid_size((7680, 4320), 16 * 1024 * 1024);
+        assert!(u64::from(width) * u64::from(height) * 64 <= 16 * 1024 * 1024);
     }
 }

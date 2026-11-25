@@ -29,7 +29,7 @@
 //! recording like any service's.
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use pen_protocol::plural_category::{self, OTHER};
@@ -64,6 +64,38 @@ pub struct Locales {
     tables: Vec<(String, Table)>,
 }
 
+/// The tables that loaded and the errors encountered while reading them.
+#[derive(Debug, Default)]
+pub struct LocaleLoad {
+    pub locales: Option<Locales>,
+    pub errors: Vec<LoadError>,
+}
+
+/// A problem reading or parsing a particular locale file or directory.
+#[derive(Debug)]
+pub struct LoadError {
+    pub path: PathBuf,
+    source: anyhow::Error,
+}
+
+impl fmt::Display for LoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {:#}", self.path.display(), self.source)
+    }
+}
+
+impl LocaleLoad {
+    fn record<T>(&mut self, path: impl Into<PathBuf>, result: anyhow::Result<T>) -> Option<T> {
+        match result {
+            Ok(value) => Some(value),
+            Err(source) => {
+                self.errors.push(LoadError { path: path.into(), source });
+                None
+            }
+        }
+    }
+}
+
 /// Tags compare without case and with `_` as `-`.
 fn normal(tag: &str) -> String {
     tag.trim().replace('_', "-").to_ascii_lowercase()
@@ -77,38 +109,42 @@ impl Locales {
     }
 
     /// Parses the base table and translations from JSON held in memory.
-    pub fn from_json(base_json: &str, base_language: &str, translations: &[(&str, &str)]) -> anyhow::Result<Locales> {
-        let base = Table::parse(base_json).context("text.json")?;
+    pub fn from_json(base_json: &str, base_language: &str, translations: &[(&str, &str)]) -> LocaleLoad {
+        let mut loaded = LocaleLoad::default();
+        let base = loaded.record("text.json", Table::parse(base_json));
         let tables = translations
             .iter()
-            .map(|&(tag, json)| {
-                let table = Table::parse(json).with_context(|| format!("locales/{tag}.json"))?;
-                Ok((tag.to_owned(), table))
+            .filter_map(|&(tag, json)| {
+                let table = loaded.record(format!("locales/{tag}.json"), Table::parse(json))?;
+                Some((tag.to_owned(), table))
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        Ok(Locales::new(base, base_language, tables))
+            .collect();
+        loaded.locales = base.map(|base| Locales::new(base, base_language, tables));
+        loaded
     }
 
-    /// Reads the base table from `base` (the game's `text.json`), in
-    /// `language`, and a translation from each `*.json` in `directory`, its
-    /// file name its tag (`sv.json`, `pt-BR.json`). Without the directory
-    /// there are none; a table that does not read is an error naming it.
-    pub fn load(base: &Path, language: &str, directory: &Path) -> anyhow::Result<Locales> {
+    /// Reads the game's base table and each translation from the locales directory.
+    /// The base is required for lookup. Each file's failure is reported independently.
+    pub fn load(base: &Path, language: &str, directory: &Path) -> LocaleLoad {
         let read = |path: &Path| -> anyhow::Result<Table> {
-            let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-            Table::parse(&text).with_context(|| path.display().to_string())
+            let text = std::fs::read_to_string(path).context("reading file")?;
+            Table::parse(&text)
         };
-        let base = read(base)?;
+        let mut loaded = LocaleLoad::default();
+        let base = loaded.record(base, read(base));
         let entries = match std::fs::read_dir(directory) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Locales::new(base, language, Vec::new()));
-            }
-            Err(error) => return Err(error).with_context(|| format!("reading {}", directory.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            entries => loaded.record(directory, entries.context("reading directory")),
         };
+        let mut paths = Vec::new();
+        for entry in entries.into_iter().flatten() {
+            if let Some(entry) = loaded.record(directory, entry.context("reading directory entry")) {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
         let mut tables = Vec::new();
-        for entry in entries {
-            let path = entry.with_context(|| format!("reading {}", directory.display()))?.path();
+        for path in paths {
             // Exported sites reserve index.json for translation discovery.
             if path.extension().is_none_or(|extension| extension != "json")
                 || path.file_name().is_some_and(|name| name == "index.json")
@@ -116,11 +152,14 @@ impl Locales {
             {
                 continue;
             }
-            if let Some(tag) = path.file_stem().and_then(|stem| stem.to_str()) {
-                tables.push((tag.to_owned(), read(&path)?));
+            if let Some(tag) = path.file_stem().and_then(|stem| stem.to_str())
+                && let Some(table) = loaded.record(&path, read(&path))
+            {
+                tables.push((tag.to_owned(), table));
             }
         }
-        Ok(Locales::new(base, language, tables))
+        loaded.locales = base.map(|base| Locales::new(base, language, tables));
+        loaded
     }
 
     /// The tags of the translations, in order.
@@ -455,13 +494,33 @@ mod tests {
     #[test]
     fn parses_in_memory_tables_with_their_language_and_tag() {
         let base = r#"{"title":"Pausa","settings":"Inställningar"}"#;
-        let locales = Locales::from_json(base, "sv", &[("fr", r#"{"title":"Pause"}"#), ("ar", "{}")]).unwrap();
+        let loaded = Locales::from_json(base, "sv", &[("fr", r#"{"title":"Pause"}"#), ("ar", "{}")]);
+        assert!(loaded.errors.is_empty());
+        let locales = loaded.locales.unwrap();
         assert_eq!(locales.tags().collect::<Vec<_>>(), ["ar", "fr"]);
         assert_eq!(locales.select("de").tag(), "sv");
         assert_eq!(locales.select("fr-CA").text("title", None).unwrap().spoken, "Pause");
         assert_eq!(locales.select("fr").text("settings", None).unwrap().spoken, "Inställningar");
-        assert_eq!(Locales::from_json("{", "sv", &[]).unwrap_err().to_string(), "text.json");
-        assert_eq!(Locales::from_json(base, "sv", &[("de", "[]")]).unwrap_err().to_string(), "locales/de.json");
+        let broken_base = Locales::from_json("{", "sv", &[]);
+        assert!(broken_base.locales.is_none());
+        assert_eq!(broken_base.errors[0].path, Path::new("text.json"));
+    }
+
+    #[test]
+    fn malformed_translation_leaves_base_and_valid_translations_usable() {
+        let loaded = Locales::from_json(
+            r#"{"title":"Continue","settings":"Settings"}"#,
+            "en",
+            &[("ar", r#"{"title":"متابعة"}"#), ("sv", "{")],
+        );
+        let [error] = loaded.errors.as_slice() else { panic!("{:?}", loaded.errors) };
+        assert_eq!(error.path, Path::new("locales/sv.json"));
+        assert!(error.to_string().contains("not JSON"));
+        let locales = loaded.locales.unwrap();
+        assert_eq!(locales.tags().collect::<Vec<_>>(), ["ar"]);
+        assert_eq!(locales.select("ar").text("title", None).unwrap().spoken, "متابعة");
+        assert_eq!(locales.select("ar").text("settings", None).unwrap().spoken, "Settings");
+        assert_eq!(locales.select("sv").text("title", None).unwrap().spoken, "Continue");
     }
 
     #[test]
@@ -482,6 +541,7 @@ mod tests {
             "en",
             &[("ar", r#"{"name":"مرحبا {name}"}"#)],
         )
+        .locales
         .unwrap();
         let locale = tables.select("ar");
         let args = [("0", "{count}"), ("count", "many")];
@@ -692,17 +752,23 @@ mod tests {
         let directory = root.join("locales");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(root.join("text.json"), r#"{"resume": "Continue"}"#).unwrap();
-        let missing = Locales::load(&root.join("text.json"), "en", &root.join("nowhere")).unwrap();
-        assert_eq!(missing.tags().count(), 0);
+        let missing = Locales::load(&root.join("text.json"), "en", &root.join("nowhere"));
+        assert!(missing.errors.is_empty());
+        assert_eq!(missing.locales.unwrap().tags().count(), 0);
         std::fs::write(directory.join("pt-BR.json"), r#"{"resume": "Continuar"}"#).unwrap();
         std::fs::write(directory.join("sv.json"), r#"{"resume": "Fortsätt"}"#).unwrap();
         std::fs::write(directory.join("index.json"), r#"["pt-BR","sv"]"#).unwrap();
         std::fs::write(directory.join("notes.txt"), "not a table").unwrap();
-        let locales = Locales::load(&root.join("text.json"), "en", &directory).unwrap();
+        let loaded = Locales::load(&root.join("text.json"), "en", &directory);
+        assert!(loaded.errors.is_empty());
+        let locales = loaded.locales.unwrap();
         assert_eq!(locales.tags().collect::<Vec<_>>(), ["pt-BR", "sv"]);
         assert_eq!(locales.select("pt-BR").text("resume", None).unwrap().text, "Continuar");
         std::fs::write(directory.join("de.json"), r#"{"resume": 3}"#).unwrap();
-        let error = Locales::load(&root.join("text.json"), "en", &directory).unwrap_err();
+        let loaded = Locales::load(&root.join("text.json"), "en", &directory);
+        assert_eq!(loaded.locales.unwrap().tags().collect::<Vec<_>>(), ["pt-BR", "sv"]);
+        let [error] = loaded.errors.as_slice() else { panic!("{:?}", loaded.errors) };
+        assert_eq!(error.path, directory.join("de.json"));
         assert_eq!(
             format!("{error:#}"),
             format!(

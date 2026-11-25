@@ -3,6 +3,7 @@ struct Uniform {
     viewport: vec2f,
     xray_alpha: f32,
     xray_desaturate: f32,
+    reversed_z: u32,
 }
 
 struct Segment {
@@ -103,7 +104,13 @@ fn vs_line(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: u
     let ndc = select(ndc_a, ndc_b, at_end) + (tangent * extension + normal * across) / scale;
     let clipped = select(ca, cb, at_end);
     let w = select(wa, wb, at_end);
-    out.position = vec4f(ndc * w, clamp(clipped.z, 0.0, w), w);
+    var z = clipped.z;
+    if len <= 1e-4 {
+        let a_depth = ca.z / wa;
+        let b_depth = cb.z / wb;
+        z = select(min(a_depth, b_depth), max(a_depth, b_depth), frame.reversed_z != 0u) * w;
+    }
+    out.position = vec4f(ndc * w, clamp(z, 0.0, w), w);
     out.local = vec2f(along + extension, across);
     out.color = mix(line.color0, line.color1, select(t.x, t.y, at_end));
     out.shape = vec3f(len, radius, feather);

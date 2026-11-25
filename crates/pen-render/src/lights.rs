@@ -226,17 +226,69 @@ pub(crate) fn validate(lights: &[Light]) -> Result<()> {
     Ok(())
 }
 
+const RANGE_OFFSET_BITS: u32 = 20;
+const PACKED_RANGE_BYTES: u64 = (CLUSTERS * size_of::<u32>()) as u64;
+const _: () = assert!(CLUSTERS * (PER_CLUSTER as usize) < 1 << RANGE_OFFSET_BITS && CLUSTERS.is_multiple_of(4));
+
+pub(crate) fn compact_bindings(device: &wgpu::Device) -> bool {
+    // The scene's probe data and the volume's fog data also consume storage bindings.
+    device.limits().max_storage_buffers_per_shader_stage < 7
+}
+
+/// Adapts the standard lighting declarations to fixed-size uniforms on low-limit devices.
+pub(crate) fn shader_for_device(device: &wgpu::Device, code: String) -> String {
+    if !compact_bindings(device) {
+        return code;
+    }
+    let code = code.replace(
+        "var<storage, read> local_shadow_faces: array<mat4x4f>;",
+        &format!("var<uniform> local_shadow_faces: array<mat4x4f, {MAX_FACES}>;"),
+    );
+    let declaration = "var<storage, read> cluster_ranges: array<vec2u>;";
+    if !code.contains(declaration) {
+        return code;
+    }
+    let mut adapted = String::with_capacity(code.len());
+    let mut rest = code.as_str();
+    while let Some((prefix, access)) = rest.split_once("cluster_ranges[") {
+        let mut depth = 1;
+        let Some(end) = access.find(|c| {
+            depth += i32::from(c == '[') - i32::from(c == ']');
+            depth == 0
+        }) else {
+            break;
+        };
+        adapted.push_str(prefix);
+        adapted.push_str("cluster_range_at(");
+        adapted.push_str(&access[..end]);
+        adapted.push(')');
+        rest = &access[end + 1..];
+    }
+    adapted.push_str(rest);
+    adapted.replace(
+        declaration,
+        &format!(
+            "var<uniform> cluster_ranges: array<vec4u, {}>;
+fn cluster_range_at(index: u32) -> vec2u {{
+    let packed = cluster_ranges[index / 4u][index % 4u];
+    return vec2u(packed & ((1u << {RANGE_OFFSET_BITS}u) - 1u), packed >> {RANGE_OFFSET_BITS}u);
+}}",
+            CLUSTERS / 4,
+        ),
+    )
+}
+
 /// The layout of group 2 of every mesh pipeline: the grid, the lights, each
 /// cluster's range and the lights' indices.
 pub(crate) fn group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("lights"),
-        entries: &layout_entries(),
+        entries: &layout_entries(compact_bindings(device)),
     })
 }
 
 /// The entries of that layout.
-pub(crate) fn layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
+pub(crate) fn layout_entries(compact: bool) -> Vec<wgpu::BindGroupLayoutEntry> {
     let storage = |binding: u32| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::COMPUTE,
@@ -246,6 +298,14 @@ pub(crate) fn layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
             min_binding_size: None,
         },
         count: None,
+    };
+    let constant = |binding, size| wgpu::BindGroupLayoutEntry {
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: wgpu::BufferSize::new(size),
+        },
+        ..storage(binding)
     };
     vec![
         wgpu::BindGroupLayoutEntry {
@@ -259,7 +319,7 @@ pub(crate) fn layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
             count: None,
         },
         storage(1),
-        storage(2),
+        if compact { constant(2, PACKED_RANGE_BYTES) } else { storage(2) },
         storage(3),
         // The local lights' shadow maps, their comparison sampler and the
         // matrix of each face (local_shadows.rs).
@@ -279,9 +339,13 @@ pub(crate) fn layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
             count: None,
         },
-        storage(6),
-        // Packed LTC area lights + static 64x64 LTC matrix & amplitude LUTs.
-        storage(7),
+        if compact { constant(6, FACE_BYTES) } else { storage(6) },
+        // The compact layout's compute stage only needs point and spot lights.
+        if compact {
+            wgpu::BindGroupLayoutEntry { visibility: wgpu::ShaderStages::FRAGMENT, ..storage(7) }
+        } else {
+            storage(7)
+        },
     ]
 }
 
@@ -448,6 +512,7 @@ pub(crate) struct Clusters {
     area_only_uniform: wgpu::Buffer,
     lights: wgpu::Buffer,
     ranges: wgpu::Buffer,
+    packed_ranges: Option<Vec<u32>>,
     indices: wgpu::Buffer,
     /// The matrix of each atlas layer's face, as the lights' shadows read it.
     faces: wgpu::Buffer,
@@ -479,12 +544,22 @@ impl Clusters {
                 mapped_at_creation: false,
             })
         };
-        let (lights, ranges, indices, faces) = (
-            storage(device, "lights", 4 * LIGHT_FLOATS as u64),
-            storage(device, "light clusters", CLUSTERS as u64 * 8),
-            storage(device, "light indices", 4),
-            storage(device, "light shadow faces", FACE_BYTES),
-        );
+        let compact = compact_bindings(device);
+        let constants = |label, size| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let lights = storage(device, "lights", 4 * LIGHT_FLOATS as u64);
+        let indices = storage(device, "light indices", 4);
+        let (ranges, faces) = if compact {
+            (constants("light clusters", PACKED_RANGE_BYTES), constants("light shadow faces", FACE_BYTES))
+        } else {
+            (storage(device, "light clusters", CLUSTERS as u64 * 8), storage(device, "light shadow faces", FACE_BYTES))
+        };
         let area = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("area lights + LTC LUTs"),
             size: AREA_BUFFER_BYTES,
@@ -553,6 +628,7 @@ impl Clusters {
             area_only_uniform,
             lights,
             ranges,
+            packed_ranges: compact.then(Vec::new),
             indices,
             faces,
             area,
@@ -610,15 +686,7 @@ impl Clusters {
             let reach = spec.range.max(0.1);
             let mut light = match spec.kind {
                 1 => AreaLight::disk(pos, right, up, (spec.width * 0.5).max(0.01), col, reach, spec.two_sided),
-                2 => AreaLight::tube(
-                    pos,
-                    right,
-                    up,
-                    (spec.width * 0.5).max(0.01),
-                    spec.height.max(0.01),
-                    col,
-                    reach,
-                ),
+                2 => AreaLight::tube(pos, right, up, (spec.width * 0.5).max(0.01), spec.height.max(0.01), col, reach),
                 3 => AreaLight::cookie_projector(
                     pos,
                     right,
@@ -865,7 +933,13 @@ impl Clusters {
         if !index_bytes.is_empty() {
             queue.write_buffer(&self.indices, 0, index_bytes);
         }
-        queue.write_buffer(&self.ranges, 0, bytemuck::cast_slice(ranges));
+        if let Some(packed) = &mut self.packed_ranges {
+            packed.clear();
+            packed.extend(ranges.iter().map(|&[start, count]| start | (count << RANGE_OFFSET_BITS)));
+            queue.write_buffer(&self.ranges, 0, bytemuck::cast_slice(packed));
+        } else {
+            queue.write_buffer(&self.ranges, 0, bytemuck::cast_slice(ranges));
+        }
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&words));
     }
 

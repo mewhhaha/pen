@@ -208,6 +208,10 @@ pub struct DdgiVolume {
 }
 
 impl DdgiVolume {
+    pub(crate) fn supported(device: &wgpu::Device) -> bool {
+        device.limits().max_storage_buffers_per_shader_stage >= 7
+    }
+
     pub fn new(device: &wgpu::Device, config: DdgiGridConfig) -> Result<Self> {
         let [nx, ny, nz] = config.dims;
         ensure!(nx >= 1 && ny >= 1 && nz >= 1, "DDGI grid dims must be >= 1");
@@ -331,10 +335,8 @@ impl DdgiVolume {
             entries: &[u_entry, pack_u_entry, tex_ro(2, false), tex_ro(3, false), storage_rw(4), storage_ro(10)],
         });
 
-        let sw_body = DDGI_WGSL.replace(
-            "// __TLAS_BINDING_1__",
-            "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;",
-        );
+        let sw_body = DDGI_WGSL
+            .replace("// __TLAS_BINDING_1__", "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;");
         let source = format!("{TLAS_TRAVERSAL_WGSL}\n{sw_body}");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ddgi_wgsl"),
@@ -388,10 +390,8 @@ impl DdgiVolume {
                     storage_ro(10),
                 ],
             });
-            let hw_body = DDGI_WGSL.replace(
-                "// __TLAS_BINDING_1__",
-                "@group(0) @binding(1) var hw_tlas: acceleration_structure;",
-            );
+            let hw_body = DDGI_WGSL
+                .replace("// __TLAS_BINDING_1__", "@group(0) @binding(1) var hw_tlas: acceleration_structure;");
             let hw_src = format!("{TLAS_TRAVERSAL_HW_WGSL}\n{hw_body}");
             let hw_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("ddgi_wgsl_hw"),
@@ -663,7 +663,8 @@ impl DdgiVolume {
         #[allow(unused_mut)]
         let mut dispatched_hw = false;
         #[cfg(not(target_arch = "wasm32"))]
-        if let (Some(pipe_hw), Some(bgl_hw), Some(hw_tlas)) = (&self.trace_pipe_hw, &self.trace_bgl_hw, &scene.hw_tlas) {
+        if let (Some(pipe_hw), Some(bgl_hw), Some(hw_tlas)) = (&self.trace_pipe_hw, &self.trace_bgl_hw, &scene.hw_tlas)
+        {
             let trace_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ddgi_trace_bg_hw"),
                 layout: bgl_hw,
@@ -673,8 +674,14 @@ impl DdgiVolume {
                     wgpu::BindGroupEntry { binding: 2, resource: scene.tlas_instances_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: scene.blas_nodes_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: scene.blas_tris_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.irr_curr.view) },
-                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.vis_curr.view) },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&self.irr_curr.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&self.vis_curr.view),
+                    },
                     wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     wgpu::BindGroupEntry { binding: 8, resource: self.ray_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
@@ -700,18 +707,22 @@ impl DdgiVolume {
                     wgpu::BindGroupEntry { binding: 2, resource: scene.tlas_instances_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 3, resource: scene.blas_nodes_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 4, resource: scene.blas_tris_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.irr_curr.view) },
-                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.vis_curr.view) },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&self.irr_curr.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&self.vis_curr.view),
+                    },
                     wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     wgpu::BindGroupEntry { binding: 8, resource: self.ray_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 10, resource: self.probe_offsets.as_entire_binding() },
                 ],
             });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("ddgi_trace"),
-                timestamp_writes: None,
-            });
+            let mut pass = encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ddgi_trace"), timestamp_writes: None });
             pass.set_pipeline(&self.trace_pipe);
             pass.set_bind_group(0, &trace_bg, &[]);
             pass.dispatch_workgroups(total_rays.div_ceil(64), 1, 1);
@@ -732,17 +743,23 @@ impl DdgiVolume {
         });
         let cols = nx * nz;
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("ddgi_blend"),
-                timestamp_writes: None,
-            });
+            let mut pass = encoder
+                .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ddgi_blend"), timestamp_writes: None });
             pass.set_pipeline(&self.blend_irr_pipe);
             pass.set_bind_group(0, &blend_bg, &[]);
-            pass.dispatch_workgroups((cols * DDGI_IRRADIANCE_INNER).div_ceil(8), (ny * DDGI_IRRADIANCE_INNER).div_ceil(8), 1);
+            pass.dispatch_workgroups(
+                (cols * DDGI_IRRADIANCE_INNER).div_ceil(8),
+                (ny * DDGI_IRRADIANCE_INNER).div_ceil(8),
+                1,
+            );
 
             pass.set_pipeline(&self.blend_vis_pipe);
             pass.set_bind_group(0, &blend_bg, &[]);
-            pass.dispatch_workgroups((cols * DDGI_VISIBILITY_INNER).div_ceil(8), (ny * DDGI_VISIBILITY_INNER).div_ceil(8), 1);
+            pass.dispatch_workgroups(
+                (cols * DDGI_VISIBILITY_INNER).div_ceil(8),
+                (ny * DDGI_VISIBILITY_INNER).div_ceil(8),
+                1,
+            );
         }
 
         // 3. Copy interior + wrap borders from tmp -> curr so curr is always sampling-ready!
@@ -769,11 +786,19 @@ impl DdgiVolume {
             });
             pass.set_pipeline(&self.border_irr_pipe);
             pass.set_bind_group(0, &border_irr_bg, &[]);
-            pass.dispatch_workgroups((cols * DDGI_IRRADIANCE_TILE).div_ceil(8), (ny * DDGI_IRRADIANCE_TILE).div_ceil(8), 1);
+            pass.dispatch_workgroups(
+                (cols * DDGI_IRRADIANCE_TILE).div_ceil(8),
+                (ny * DDGI_IRRADIANCE_TILE).div_ceil(8),
+                1,
+            );
 
             pass.set_pipeline(&self.border_vis_pipe);
             pass.set_bind_group(0, &border_vis_bg, &[]);
-            pass.dispatch_workgroups((cols * DDGI_VISIBILITY_TILE).div_ceil(8), (ny * DDGI_VISIBILITY_TILE).div_ceil(8), 1);
+            pass.dispatch_workgroups(
+                (cols * DDGI_VISIBILITY_TILE).div_ceil(8),
+                (ny * DDGI_VISIBILITY_TILE).div_ceil(8),
+                1,
+            );
         }
 
         // 4. Relocate probes trapped inside solid geometry or hugging surfaces for subsequent frames.
@@ -1001,15 +1026,8 @@ mod tests {
             inst
         };
 
-        let instances = vec![
-            dark_wall(0),
-            dark_wall(1),
-            red_wall,
-            dark_wall(3),
-            dark_wall(4),
-            dark_wall(5),
-            dark_wall(6),
-        ];
+        let instances =
+            vec![dark_wall(0), dark_wall(1), red_wall, dark_wall(3), dark_wall(4), dark_wall(5), dark_wall(6)];
         let scene = TlasScene::build(&blases, &instances).unwrap();
         let scene_gpu = TlasSceneGpu::upload(&device, &scene).unwrap();
 
@@ -1292,11 +1310,8 @@ mod tests {
             queue.submit(Some(enc.finish()));
             let _ = device.poll(wgpu::PollType::wait_indefinitely());
         }
-        let q = [DdgiQueryPoint {
-            pos: [-2.0, 2.0, 0.0, 0.0],
-            normal: [0.0, -1.0, 0.0, 0.0],
-            view: [0.0, -1.0, 0.0, 0.0],
-        }];
+        let q =
+            [DdgiQueryPoint { pos: [-2.0, 2.0, 0.0, 0.0], normal: [0.0, -1.0, 0.0, 0.0], view: [0.0, -1.0, 0.0, 0.0] }];
         let after_2 = ddgi.evaluate_points(&device, &queue, &q).unwrap()[0];
         for _ in 0..14 {
             let mut enc = device.create_command_encoder(&Default::default());

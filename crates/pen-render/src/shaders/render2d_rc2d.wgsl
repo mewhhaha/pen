@@ -173,6 +173,6 @@ fn composite_irradiance(@builtin(global_invocation_id) id: vec3u) {
     let xy = vec2i(id.xy);
     let light = textureLoad(irradiance, xy, 0).rgb;
     let base = textureLoad(albedo, xy, 0);
-    let rgb = base.rgb * (weights.x + light * weights.y) + light * weights.z;
+    let rgb = base.rgb * (weights.x + light * weights.y) + light * weights.z * mix(1.0, base.a, weights.w);
     textureStore(output, id.xy, vec4f(rgb, base.a));
 }

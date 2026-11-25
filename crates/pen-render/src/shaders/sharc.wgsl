@@ -11,6 +11,7 @@ struct SharcUniform {
 struct SharcKey {
     home: u32,
     tag: u32,
+    fingerprint: u32,
 }
 
 const SHARC_PROBE_STEPS: u32 = 8u;
@@ -58,12 +59,9 @@ fn sharc_hash_key(pos: vec3f, nrm: vec3f, u: SharcUniform) -> SharcKey {
     let face = sharc_normal_face(nrm);
     let home = sharc_hash_cell(cell, level, face, 0x9e3779b9u) & (u.counts.x - 1u);
     let fingerprint = sharc_hash_cell(cell, level, face, 0x85ebca6bu);
-    // One CAS publishes the complete tag. Zero marks empty, and the low bits
-    // hold the exact face so opposite normals cannot match, even on a hash
-    // collision. The default home contributes 17 bits and the fingerprint
-    // contributes 29 bits within each face. Probing compares tags at up to
-    // eight slots, so distinct cells on the same face can still alias.
-    return SharcKey(home, (fingerprint & ~7u) | (face + 1u));
+    let second = sharc_hash_cell(cell.yzx, level, face, 0xc2b2ae35u);
+    // Preserve the face and reserve zero for empty slots.
+    return SharcKey(home, (fingerprint & ~7u) | (face + 1u), max(second, 1u));
 }
 
 // __SHARC_MUTABLE__
@@ -78,7 +76,8 @@ fn sharc_query(pos: vec3f, nrm: vec3f) -> vec4f {
     let mask = sharc_u.counts.x - 1u;
     for (var probe = 0u; probe < min(SHARC_PROBE_STEPS, sharc_u.counts.x); probe += 1u) {
         let slot = (key.home + probe) & mask;
-        if (atomicLoad(&sharc_keys[slot]) == key.tag) {
+        if (atomicLoad(&sharc_keys[slot * 2u]) == key.tag
+            && atomicLoad(&sharc_keys[slot * 2u + 1u]) == key.fingerprint) {
             return sharc_resolved[slot];
         }
     }
@@ -94,23 +93,32 @@ fn sharc_find_or_claim(key: SharcKey) -> u32 {
     let mask = capacity - 1u;
     for (var attempt = 0u; attempt <= SHARC_PROBE_STEPS; attempt += 1u) {
         var empty = capacity;
-        // Eviction makes holes in probe chains. Find an existing tag before
-        // trying to claim the first empty slot.
+        var pending = false;
+        // Eviction makes holes in probe chains. Search all slots before claiming.
         for (var probe = 0u; probe < min(SHARC_PROBE_STEPS, capacity); probe += 1u) {
             let slot = (key.home + probe) & mask;
-            let tag = atomicLoad(&sharc_keys[slot]);
+            let tag = atomicLoad(&sharc_keys[slot * 2u]);
             if (tag == key.tag) {
-                return slot;
+                let fingerprint = atomicLoad(&sharc_keys[slot * 2u + 1u]);
+                if (fingerprint == key.fingerprint) {
+                    return slot;
+                }
+                pending = pending || fingerprint == 0u;
             }
             if (tag == 0u && empty == capacity) {
                 empty = slot;
             }
         }
+        // A matching reservation can still be publishing its fingerprint.
+        if (pending) {
+            continue;
+        }
         if (empty == capacity) {
             return capacity;
         }
-        let claim = atomicCompareExchangeWeak(&sharc_keys[empty], 0u, key.tag);
-        if (claim.exchanged || claim.old_value == key.tag) {
+        let claim = atomicCompareExchangeWeak(&sharc_keys[empty * 2u], 0u, key.tag);
+        if (claim.exchanged) {
+            atomicStore(&sharc_keys[empty * 2u + 1u], key.fingerprint);
             return empty;
         }
         // Retry after a spurious failure or a competing claim. During a
@@ -160,6 +168,11 @@ fn sharc_accumulate(pos: vec3f, nrm: vec3f, radiance: vec3f) {
 @group(0) @binding(2) var<storage, read_write> sharc_accum: array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read_write> sharc_resolved: array<vec4f>;
 
+fn sharc_clear_key(slot: u32) {
+    atomicStore(&sharc_keys[slot * 2u], 0u);
+    atomicStore(&sharc_keys[slot * 2u + 1u], 0u);
+}
+
 @compute @workgroup_size(64)
 fn sharc_resolve(@builtin(global_invocation_id) id: vec3u) {
     let slot = id.x;
@@ -180,12 +193,12 @@ fn sharc_resolve(@builtin(global_invocation_id) id: vec3u) {
         let age = prev.a + 1.0;
         if (age > f32(sharc_u.counts.y)) {
             sharc_resolved[slot] = vec4f(0.0);
-            atomicStore(&sharc_keys[slot], 0u);
+            sharc_clear_key(slot);
         } else {
             sharc_resolved[slot] = vec4f(prev.rgb, age);
         }
-    } else if (atomicLoad(&sharc_keys[slot]) != 0u) {
-        atomicStore(&sharc_keys[slot], 0u);
+    } else if (atomicLoad(&sharc_keys[slot * 2u]) != 0u) {
+        sharc_clear_key(slot);
     }
 }
 
@@ -196,7 +209,7 @@ fn sharc_clear(@builtin(global_invocation_id) id: vec3u) {
         return;
     }
     let base = slot * 4u;
-    atomicStore(&sharc_keys[slot], 0u);
+    sharc_clear_key(slot);
     atomicStore(&sharc_accum[base], 0u);
     atomicStore(&sharc_accum[base + 1u], 0u);
     atomicStore(&sharc_accum[base + 2u], 0u);

@@ -327,7 +327,12 @@ impl Volumetrics {
                 })
             };
             Pipelines {
-                inject: pipeline("volume injection", inject_shader(), &inject_pipeline_layout, "inject"),
+                inject: pipeline(
+                    "volume injection",
+                    crate::lights::shader_for_device(device, inject_shader()),
+                    &inject_pipeline_layout,
+                    "inject",
+                ),
                 integrate: pipeline("volume integration", integrate_shader(), &integrate_pipeline_layout, "integrate"),
                 inject_layout,
                 integrate_layout,

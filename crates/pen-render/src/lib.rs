@@ -72,15 +72,17 @@ mod volume;
 
 use pen_protocol::{Catalog, GameEvent, RenderFrame};
 
-pub use area_lights::{AREA_LIGHTS_WGSL, AreaLight, AreaLightKind, AreaLightResources, LTC_LUT_SIZE, generate_ltc_luts};
+pub use area_lights::{
+    AREA_LIGHTS_WGSL, AreaLight, AreaLightKind, AreaLightResources, LTC_LUT_SIZE, generate_ltc_luts,
+};
 pub use asset_store::{mesh_bounds, pack_mesh, validate_asset_key};
 pub use atmosphere_lut::{ATMOSPHERE_LUT_WGSL, AtmosphereParams, CLOUDS_WGSL, PhysicalAtmosphere};
 pub use camera_precision::{
     CameraRelativeFrame, DepthMode, detect_depth_mode, perspective_forward_z, perspective_reversed_z,
 };
 pub use ddgi::{
-    DDGI_IRRADIANCE_INNER, DDGI_IRRADIANCE_TILE, DDGI_PACKED_HEADER_VEC4S, DDGI_VISIBILITY_INNER,
-    DDGI_VISIBILITY_TILE, DDGI_WGSL, DdgiFrameParams, DdgiGridConfig, DdgiQueryPoint, DdgiVolume,
+    DDGI_IRRADIANCE_INNER, DDGI_IRRADIANCE_TILE, DDGI_PACKED_HEADER_VEC4S, DDGI_VISIBILITY_INNER, DDGI_VISIBILITY_TILE,
+    DDGI_WGSL, DdgiFrameParams, DdgiGridConfig, DdgiQueryPoint, DdgiVolume,
 };
 pub use decals::{PBR_DECAL_WGSL, PbrDecal, PbrDecalPass, PbrDecalView};
 pub use display::{DEFAULT_HEADROOM, Display, REFERENCE_WHITE_NITS, choose_surface};
@@ -125,7 +127,6 @@ pub use post_fx::{
     FsrEasuUpscaler, FsrQualityPreset, POST_FX_WGSL, PostFxParams, PostFxPass, RcasSharpener, TaauUpscaler,
     UPSCALE_RCAS_WGSL, apply_projection_jitter, fsr_halton_jitter, halton_jitter,
 };
-pub use taa::{fsr_jitter_phase_count, fsr_mip_bias};
 pub use prefetch::Prefetch;
 pub use ray_tracing::{
     BVH_RAYTRACE_WGSL, Blas, BlasTriGpu, BlasTriangle, BvhNodeGpu, BvhScene, BvhTriGpu, BvhTriangle, GpuBlasPool,
@@ -133,27 +134,28 @@ pub use ray_tracing::{
     TlasInstance, TlasInstanceGpu, TlasRayTraceParams, TlasRayTracer, TlasScene, TlasSceneGpu,
     device_supports_hardware_ray_query, supports_hardware_ray_query,
 };
+pub use render_targets::{
+    ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,
+    oblique_clip_projection, planar_reflection_camera, planar_reflection_view,
+};
+pub use render2d::{
+    Camera2d, Draw2d, RadianceCascades2d, RadianceCascades2dConfig, Scene2dEmitter, SdfShape, SdfShapePass, Sprite2d,
+    Sprites2dPass, TileCell, TilemapPass, TilemapUniform, rasterize_scene_2d, sort_sprites,
+};
 pub use restir::{RESTIR_MAX_LIGHTS, RESTIR_WGSL, RestirInputs, RestirParams, RestirRenderer};
 pub use restir_specular::{
     RESTIR_SPECULAR_WGSL, RestirSpecularInputs, RestirSpecularOutputs, RestirSpecularParams, RestirSpecularRenderer,
+};
+pub use shader_graph::{
+    CompiledShaderGraph, NodeRef, PortType, RampStop, ShaderGraph, ShaderNode, ShaderNodeKind, is_shader_graph_key,
 };
 pub use sharc::{
     SHARC_COMMON_WGSL, SHARC_DEFAULT_CAPACITY, SHARC_HASH_WGSL, SHARC_QUERY_RO_FN_WGSL, SHARC_WGSL, SharcCache,
     SharcConfig, SharcParams,
 };
-pub use svgf::{SVGF_WGSL, SvgfDenoiser, SvgfInputs, SvgfParams};
-pub use render2d::{
-    Camera2d, Draw2d, RadianceCascades2d, RadianceCascades2dConfig, Scene2dEmitter, SdfShape, SdfShapePass, Sprite2d,
-    Sprites2dPass, TileCell, TilemapPass, TilemapUniform, rasterize_scene_2d, sort_sprites,
-};
-pub use render_targets::{
-    ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,
-    oblique_clip_projection, planar_reflection_camera, planar_reflection_view,
-};
-pub use shader_graph::{
-    CompiledShaderGraph, NodeRef, PortType, RampStop, ShaderGraph, ShaderNode, ShaderNodeKind, is_shader_graph_key,
-};
 pub use surface_atlas::{SURFACE_ATLAS_WGSL, SurfaceAtlasPacker, SurfaceTile, TileCopy};
+pub use svgf::{SVGF_WGSL, SvgfDenoiser, SvgfInputs, SvgfParams};
+pub use taa::{fsr_jitter_phase_count, fsr_mip_bias};
 pub use tonemap::{TONEMAP_SUITE_WGSL, TonemapOperator, tonemap_linear_f64};
 pub use video::{
     ChromaSiting, ColorMatrix, ColorRange, ColorSpace, IndexedY4mStream, IvfFrame, IvfStream, VideoPlayer,
@@ -217,21 +219,27 @@ pub fn optional_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     adapter.features() & wanted
 }
 
-/// Device limits matching [`optional_features`] (enables hardware acceleration
-/// structure limits on native GPUs supporting `EXPERIMENTAL_RAY_QUERY`, while
-/// keeping strict core WebGPU default limits in browsers / WASM).
-#[allow(unused_variables)]
+/// Device limits matching [`optional_features`]. Request the renderer's core
+/// limits, within the adapter's available storage capacity, and enable native
+/// acceleration structure limits when supported.
 pub fn optional_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
-    let base = wgpu::Limits::default();
+    let available = adapter.limits();
+    let defaults = wgpu::Limits::default();
+    let base = wgpu::Limits {
+        max_storage_buffers_per_shader_stage: defaults
+            .max_storage_buffers_per_shader_stage
+            .min(available.max_storage_buffers_per_shader_stage),
+        max_storage_buffer_binding_size: defaults
+            .max_storage_buffer_binding_size
+            .min(available.max_storage_buffer_binding_size),
+        ..defaults
+    };
     #[cfg(not(target_arch = "wasm32"))]
+    if adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+        && available.max_blas_primitive_count > 0
+        && available.max_tlas_instance_count > 0
     {
-        let al = adapter.limits();
-        if adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
-            && al.max_blas_primitive_count > 0
-            && al.max_tlas_instance_count > 0
-        {
-            return base.using_acceleration_structure_values(al);
-        }
+        return base.using_acceleration_structure_values(available);
     }
     base
 }

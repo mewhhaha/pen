@@ -18,6 +18,7 @@ pub struct LineScene {
 #[derive(Default)]
 pub(in crate::renderer) struct LineWiredState {
     pub scene: Option<LineScene>,
+    pub devtools_scene: Option<LineScene>,
     pub renderer_3d: Option<LineRenderer>,
     pub renderer_2d: Option<LineRenderer>,
 }
@@ -32,6 +33,7 @@ fn decode_ext_lines(frame: &RenderFrame, batch: &mut LineBatch) -> Option<XRaySt
         xray =
             Some(XRayStyle { alpha: v[0].clamp(0.0, 1.0), desaturate: v[1].clamp(0.0, 1.0), solid_line_dash_px: None });
         let segs = (v.len() - 2) / 16;
+        let mut previous = None;
         for i in 0..segs {
             let o = 2 + i * 16;
             let p0 = [v[o], v[o + 1], v[o + 2]];
@@ -47,16 +49,19 @@ fn decode_ext_lines(frame: &RenderFrame, batch: &mut LineBatch) -> Option<XRaySt
                 2 => LineLayer::OnTop,
                 _ => LineLayer::DepthTested,
             };
-            let is_2d = v[o + 15] > 0.5;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "line flags")]
+            let flags = v[o + 15].round() as u32;
+            let is_2d = flags & 1 != 0;
             if !(width_px.is_finite() && width_px > 0.0) {
+                previous = None;
                 continue;
             }
             let style = LineStyle { width_px, dash_len_px, gap_len_px, dash_offset_px: 0.0, feather_px, layer };
-            if is_2d {
-                batch.segment_2d([p0[0], p0[1]], [p1[0], p1[1]], color, color, style);
-            } else {
-                batch.segment(p0, p1, color, color, style);
-            }
+            let point = |[x, y, z]: [f32; 3]| [x, y, if is_2d { 0.0 } else { z }];
+            let (p0, p1) = (point(p0), point(p1));
+            let continues = flags & 2 != 0 && previous == Some((p0, is_2d, style));
+            batch.push(p0, p1, [color; 2], style, is_2d, continues);
+            previous = Some((p1, is_2d, style));
         }
     }
     xray
@@ -74,6 +79,15 @@ impl State {
             && self.wired.lines.scene.is_none()
         {
             xray = ext_xray;
+        }
+        if let Some(scene) = &self.wired.lines.devtools_scene {
+            if batch.is_empty() && self.wired.lines.scene.is_none() {
+                xray = scene.xray;
+            }
+            batch.extend_from(&scene.batch);
+        }
+        if self.wired.split_child {
+            batch = batch.only_3d();
         }
         (!batch.is_empty()).then_some(LineScene { batch, xray })
     }

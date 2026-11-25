@@ -97,15 +97,44 @@ async fn load_locales() -> Result<Option<pen_runtime::locale::Locales>> {
     }
     let base = read_response("text.json", response).await?;
     let base = std::str::from_utf8(&base).context("text.json")?;
-    let tags: Vec<String> =
-        serde_json::from_slice(&fetch("locales/index.json").await?).context("locales/index.json")?;
+    let warn = |error| web_sys::console::warn_1(&format!("the game's string tables: {error}").into());
+    let tags = async {
+        let response = get_response("locales/index.json").await?;
+        if response.status() == 404 {
+            return Ok(Vec::new());
+        }
+        let bytes = read_response("locales/index.json", response).await?;
+        serde_json::from_slice::<Vec<String>>(&bytes).context("locales/index.json")
+    }
+    .await
+    .unwrap_or_else(|error| {
+        warn(format!("{error:#}"));
+        Vec::new()
+    });
     let mut texts = Vec::with_capacity(tags.len());
     for tag in &tags {
         let path = format!("locales/{}.json", js_sys::encode_uri_component(tag));
-        texts.push(String::from_utf8(fetch(&path).await?).with_context(|| path)?);
+        let result: Result<String> = async { Ok(String::from_utf8(fetch(&path).await?)?) }.await;
+        match result {
+            Ok(text) => texts.push((tag.as_str(), text)),
+            Err(error) => warn(format!("locales/{tag}.json: {error:#}")),
+        }
     }
-    let translations: Vec<_> = tags.iter().zip(&texts).map(|(tag, json)| (tag.as_str(), json.as_str())).collect();
-    Ok(Some(pen_runtime::locale::Locales::from_json(base, "en", &translations)?))
+    let translations: Vec<_> = texts.iter().map(|(tag, json)| (*tag, json.as_str())).collect();
+    let loaded = pen_runtime::locale::Locales::from_json(base, "en", &translations);
+    if let Some(locales) = loaded.locales {
+        for error in loaded.errors {
+            warn(error.to_string());
+        }
+        Ok(Some(locales))
+    } else {
+        let mut errors = loaded.errors.into_iter();
+        let base_error = errors.next().expect("missing base table has a load error");
+        for error in errors {
+            warn(error.to_string());
+        }
+        anyhow::bail!("{base_error}")
+    }
 }
 
 /// Fetches `path`, rejecting responses whose `Content-Length` or payload exceeds `max_bytes`
@@ -249,13 +278,15 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         web_sys::console::warn_1(&format!("the game's string tables: {error:#}").into());
         None
     });
-    let relay_config = js_sys::Reflect::get(&options, &"netRelay".into())
-        .ok()
-        .filter(|v| v.is_object())
-        .and_then(|obj| {
+    let relay_config =
+        js_sys::Reflect::get(&options, &"netRelay".into()).ok().filter(|v| v.is_object()).and_then(|obj| {
             let url = js_sys::Reflect::get(&obj, &"url".into()).ok()?.as_string()?;
             let room = js_sys::Reflect::get(&obj, &"room".into()).ok()?.as_string()?;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped positive JS netplay config")]
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "clamped positive JS netplay config"
+            )]
             let (player, players, token) = (
                 js_sys::Reflect::get(&obj, &"player".into()).ok()?.as_f64()?.clamp(0.0, 255.0) as usize,
                 js_sys::Reflect::get(&obj, &"players".into()).ok()?.as_f64()?.clamp(1.0, 256.0) as usize,
@@ -292,13 +323,12 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     let mut runtime = started.map_err(failed)?;
     let mut options = options;
     if let Some(cfg) = relay_config {
-        let link = net::BrowserRelayLink::connect(&cfg.url, &cfg.room, cfg.player, cfg.players, cfg.token)
-            .map_err(failed)?;
+        let link =
+            net::BrowserRelayLink::connect(&cfg.url, &cfg.room, cfg.player, cfg.players, cfg.token).map_err(failed)?;
         let settings = pen_runtime::net::Settings::new(cfg.players, cfg.player, viewport);
         let start = runtime.moment().await.map_err(failed)?;
-        options.netplay = Some(
-            pen_runtime::net::Netplay::new(settings, Box::new(link), build_hash, &start, 1).map_err(failed)?,
-        );
+        options.netplay =
+            Some(pen_runtime::net::Netplay::new(settings, Box::new(link), build_hash, &start, 1).map_err(failed)?);
     }
     let tools = match devtools {
         Some(module) => {
@@ -309,8 +339,8 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     };
     let input = input::Input::install(&canvas);
     let audio = audio::Audio::new(&canvas, assets);
-    let browser =
-        Browser::new(runtime, Some(game_wasm_for_kernels), tools, screen, input, audio, log, options).map_err(failed)?;
+    let browser = Browser::new(runtime, Some(game_wasm_for_kernels), tools, screen, input, audio, log, options)
+        .map_err(failed)?;
     spawn_local(async move {
         if let Err(error) = browser.run().await {
             web_sys::console::error_1(&format!("{error:#}").into());

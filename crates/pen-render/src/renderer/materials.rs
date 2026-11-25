@@ -104,18 +104,19 @@ impl State {
     /// loaded at another sample count, or the settings changed it.
     pub(super) fn ensure_variants(&mut self, slot: usize, samples: u32, variants: Variants) -> bool {
         let Some(GpuAsset::Shader(shader)) = self.assets.current_mut(slot) else { return false };
-        let made = shader.made.get(&samples).map_or(Variants::NONE, Pipelines::variants);
+        let depth = self.context.depth_mode();
+        let made = shader.made.get(&(samples, depth)).map_or(Variants::NONE, Pipelines::variants);
         if made.contains(shader.own(variants)) {
             return true;
         }
-        shader.request(&self.loader.jobs, slot, samples, variants | shader.needs);
+        shader.request(&self.loader.jobs, slot, samples, depth, variants | shader.needs);
         self.waiting = true;
         false
     }
 
     pub(super) fn pipelines(&self, slot: usize, samples: u32) -> &Pipelines {
         match self.assets.current(slot) {
-            Some(GpuAsset::Shader(shader)) => &shader.made[&samples],
+            Some(GpuAsset::Shader(shader)) => &shader.made[&(samples, self.context.depth_mode())],
             _ => unreachable!("pipelines of a loaded shader"),
         }
     }
@@ -131,11 +132,7 @@ impl State {
     /// The textures of a draw's material, or None while one is on its way:
     /// nothing is drawn half-dressed. Also whether the normal, layer/emissive,
     /// ORM, and emissive textures loaded, as the draw uniform tells the shader.
-    pub(super) fn dress(
-        &mut self,
-        material: &Material,
-        field: Option<usize>,
-    ) -> Result<Option<Dressed>> {
+    pub(super) fn dress(&mut self, material: &Material, field: Option<usize>) -> Result<Option<Dressed>> {
         let video_texture = material.texture.as_deref().and_then(|key| self.video_ids.get(key).copied());
         let reserved_video = video_texture.is_none()
             && material.texture.as_deref().is_some_and(|key| self.reserved_videos.contains(key));
@@ -234,9 +231,8 @@ impl State {
         // Binding 4 holds standalone layer / emissive / ORM texture, or the GPU-packed 4x3 SurfaceMapAtlas.
         let (mut outline, mut outline_setting, tile_mask) = if needs_atlas {
             let mut key: Vec<(u32, u64, u64)> = Vec::new();
-            let view_id = |slot: Option<usize>| -> u64 {
-                slot.map_or(0, |s| self.texture(TextureRef::Slot(s)).view_id)
-            };
+            let view_id =
+                |slot: Option<usize>| -> u64 { slot.map_or(0, |s| self.texture(TextureRef::Slot(s)).view_id) };
             let push_pair = |key: &mut Vec<(u32, u64, u64)>, tile: SurfaceTile, a: Option<usize>, b: Option<usize>| {
                 if a.is_some() || b.is_some() {
                     key.push((tile as u32, view_id(a), view_id(b)));
@@ -281,40 +277,112 @@ impl State {
                 };
                 let mut copies: Vec<TileCopy<'_>> = Vec::new();
                 if loaded_orm.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::Orm, src0: view_linear(loaded_orm, "w"), src1: None, mode: 0, clamp_edges: false });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::Orm,
+                        src0: view_linear(loaded_orm, "w"),
+                        src1: None,
+                        mode: 0,
+                        clamp_edges: false,
+                    });
                 }
                 if loaded_emissive.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::Emissive, src0: view_srgb(loaded_emissive), src1: None, mode: 0, clamp_edges: false });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::Emissive,
+                        src0: view_srgb(loaded_emissive),
+                        src1: None,
+                        mode: 0,
+                        clamp_edges: false,
+                    });
                 }
                 if loaded_outline.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::Layer, src0: view_srgb(loaded_outline), src1: None, mode: 0, clamp_edges: false });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::Layer,
+                        src0: view_srgb(loaded_outline),
+                        src1: None,
+                        mode: 0,
+                        clamp_edges: false,
+                    });
                 }
                 if loaded_cc.is_some() || loaded_ccr.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::Clearcoat, src0: view_linear(loaded_cc, "w"), src1: Some(view_linear(loaded_ccr, "w")), mode: 1, clamp_edges: false });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::Clearcoat,
+                        src0: view_linear(loaded_cc, "w"),
+                        src1: Some(view_linear(loaded_ccr, "w")),
+                        mode: 1,
+                        clamp_edges: false,
+                    });
                 }
                 if loaded_ccn.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::ClearcoatNormal, src0: view_linear(loaded_ccn, "normal"), src1: None, mode: 0, clamp_edges: false });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::ClearcoatNormal,
+                        src0: view_linear(loaded_ccn, "normal"),
+                        src1: None,
+                        mode: 0,
+                        clamp_edges: false,
+                    });
                 }
                 if loaded_sheen_c.is_some() || loaded_sheen_r.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::Sheen, src0: view_srgb(loaded_sheen_c), src1: Some(view_linear(loaded_sheen_r, "w")), mode: 2, clamp_edges: false });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::Sheen,
+                        src0: view_srgb(loaded_sheen_c),
+                        src1: Some(view_linear(loaded_sheen_r, "w")),
+                        mode: 2,
+                        clamp_edges: false,
+                    });
                 }
                 if loaded_aniso.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::Anisotropy, src0: view_linear(loaded_aniso, "w"), src1: None, mode: 0, clamp_edges: false });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::Anisotropy,
+                        src0: view_linear(loaded_aniso, "w"),
+                        src1: None,
+                        mode: 0,
+                        clamp_edges: false,
+                    });
                 }
                 if loaded_trans.is_some() || loaded_thick.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::Transmission, src0: view_linear(loaded_trans, "w"), src1: Some(view_linear(loaded_thick, "w")), mode: 1, clamp_edges: false });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::Transmission,
+                        src0: view_linear(loaded_trans, "w"),
+                        src1: Some(view_linear(loaded_thick, "w")),
+                        mode: 1,
+                        clamp_edges: false,
+                    });
                 }
                 if loaded_spec.is_some() || loaded_spec_c.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::Specular, src0: view_srgb(loaded_spec_c), src1: Some(view_linear(loaded_spec, "w")), mode: 2, clamp_edges: false });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::Specular,
+                        src0: view_srgb(loaded_spec_c),
+                        src1: Some(view_linear(loaded_spec, "w")),
+                        mode: 2,
+                        clamp_edges: false,
+                    });
                 }
                 if loaded_irid.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::Iridescence, src0: view_linear(loaded_irid, "w"), src1: None, mode: 0, clamp_edges: false });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::Iridescence,
+                        src0: view_linear(loaded_irid, "w"),
+                        src1: None,
+                        mode: 0,
+                        clamp_edges: false,
+                    });
                 }
                 if loaded_lm.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::Lightmap, src0: view_linear(loaded_lm, "w"), src1: None, mode: 0, clamp_edges: true });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::Lightmap,
+                        src0: view_linear(loaded_lm, "w"),
+                        src1: None,
+                        mode: 0,
+                        clamp_edges: true,
+                    });
                 }
                 if loaded_lm_dir.is_some() {
-                    copies.push(TileCopy { tile: SurfaceTile::LightmapDir, src0: view_linear(loaded_lm_dir, "w"), src1: None, mode: 0, clamp_edges: true });
+                    copies.push(TileCopy {
+                        tile: SurfaceTile::LightmapDir,
+                        src0: view_linear(loaded_lm_dir, "w"),
+                        src1: None,
+                        mode: 0,
+                        clamp_edges: true,
+                    });
                 }
                 let (tex, mask) = packer.pack(&device, &self.queue, DEFAULT_TILE_SIZE, &copies, white_v);
                 let id = self.next_view_id;

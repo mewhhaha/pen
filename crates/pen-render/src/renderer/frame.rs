@@ -210,7 +210,8 @@ impl Drawing<'_> {
                 // Culled on the GPU: its instances and triangles are
                 // counted as they are read back.
                 if let Some(culled) = &batch.gpu {
-                    let draws = self.culling.draw(pass, culled, view, mesh, self.tangents(mesh), self.extra_attrs(mesh));
+                    let draws =
+                        self.culling.draw(pass, culled, view, mesh, self.tangents(mesh), self.extra_attrs(mesh));
                     if let Some(stats) = stats {
                         stats.draw_calls += draws;
                         stats.instanced_draw_calls += draws;
@@ -379,6 +380,14 @@ impl State {
         scratch.clear();
         let drawn = self.draw(frame, catalog, target, &mut scratch);
         self.scratch = scratch;
+        if drawn.is_err() {
+            self.wired.blas_pool = None;
+            self.wired.tlas_gpu = None;
+            self.wired.tlas_hash = 0;
+            self.wired.tlas_bounds = None;
+            self.wired.rt_history = Default::default();
+            self.wired.sharc_needs_clear = true;
+        }
         drawn
     }
 
@@ -410,6 +419,7 @@ impl State {
         self.waiting = false;
         if !self.wired.in_secondary_camera {
             self.frames += 1;
+            self.wired.sharc_needs_clear |= frame.exposure.cut;
             self.loading_seen = frame.loading;
             if !frame.loading {
                 self.ready_sent = false;
@@ -436,6 +446,9 @@ impl State {
         }
         // Execute non-split-screen RTT secondary cameras before main-view batching so materials sample them fresh.
         self.run_rtt_cameras(frame, catalog)?;
+        if !self.wired.split_child {
+            self.load_2d_extension_atlases(frame, catalog)?;
+        }
         // Split-screen fast path: skip the unused primary 3D scene pass, render each split-screen
         // camera into cached targets, composite onto `output`, then draw HUD sprites and veil once on top.
         if !self.wired.in_secondary_camera && frame.camera_targets.iter().any(|c| c.split_screen) {
@@ -472,7 +485,8 @@ impl State {
         // objects retain their global back-to-front order.
         #[allow(clippy::cast_precision_loss, reason = "pixels")]
         let height = target.size().1 as f32 * scale;
-        self.batch(frame, catalog, samples, height, scratch, &mut stats)?;
+        let jfa_scenes = self.gather_jfa_outlines(frame);
+        self.batch(frame, catalog, samples, height, scratch, &mut stats, &jfa_scenes)?;
         let shadowed = self.light(frame) || reflected > 0;
         self.prepare_items(frame, catalog, samples, scratch)?;
         // Decals whose material and texture are ready, by material.
@@ -512,6 +526,7 @@ impl State {
             target.present();
             return Ok(());
         }
+        let Some(surface) = target.view() else { return Ok(()) };
         // Each inset's targets and scene, ready to draw into.
         let (output_width, output_height) = target.size();
         self.prepare_insets(frame, (output_width, output_height), &mut scratch.insets);
@@ -530,13 +545,12 @@ impl State {
         // draws the scene as one picture.
         let line_scene = self.gather_line_scene(frame);
         let has_3d_lines = line_scene.as_ref().is_some_and(|s| s.batch.has_3d());
-        let jfa_scene = self.gather_jfa_outlines(frame);
         let translucent = !scratch.translucent.is_empty()
             || !scratch.overlays.is_empty()
             || !scratch.emitters.is_empty()
             || !scratch.ribbons.is_empty()
             || has_3d_lines
-            || jfa_scene.is_some();
+            || jfa_scenes.iter().any(Option::is_some);
         let mut opaque_mips = false;
         let mut opaque_depth = !scratch.emitters.is_empty() || !scratch.ribbons.is_empty();
         for &index in scratch.translucent.iter().chain(&scratch.overlays) {
@@ -578,11 +592,7 @@ impl State {
         }
         // FSR 2.2/3.1 negative texture mip-bias (`-log2(out_w / in_w)`) stored in `scene.shadow_params.w`
         // so textured surfaces rendered at reduced scale retain full native detail.
-        let mip_bias = if quality.upscale {
-            crate::taa::fsr_mip_bias(targets.size.0, output_width)
-        } else {
-            0.0
-        };
+        let mip_bias = if quality.upscale { crate::taa::fsr_mip_bias(targets.size.0, output_width) } else { 0.0 };
         let mip_bias_offset = ((super::SCENE_FLOATS - 1) * 4) as u64;
         self.queue.write_buffer(&self.scene_uniform, mip_bias_offset, bytemuck::bytes_of(&mip_bias));
         self.volumetrics.set_projection(&frame.view, &jittered.unwrap_or(frame.projection));
@@ -627,11 +637,12 @@ impl State {
         let capture = self.prepare_capture(frame, scratch, samples);
         let oit_pipelines = self.prepare_oit_pipelines(frame, scratch, samples);
         let tlas_ready = self.prepare_tlas_scene(&mut encoder, frame, scratch)?;
-        if tlas_ready && frame.quality.ddgi {
+        if tlas_ready && frame.quality.ddgi && crate::ddgi::DdgiVolume::supported(&device) {
             self.encode_ddgi_prepass(&mut encoder, frame)?;
         }
+        let rt_active = tlas_ready && crate::ray_tracing::TlasRayTracer::supported(&device);
         let restir_di_active =
-            tlas_ready && frame.quality.ray_tracing >= 3 && super::wired_passes::has_active_point_spot_lights(frame);
+            rt_active && frame.quality.ray_tracing >= 3 && super::wired_passes::has_active_point_spot_lights(frame);
         #[allow(clippy::cast_precision_loss, reason = "viewport height in pixels")]
         let dag_viewport_height = targets.size.1 as f32;
         self.encode_meshlet_culling_phase1(
@@ -639,6 +650,7 @@ impl State {
             &mut encoder,
             frame,
             scratch,
+            &jfa_scenes,
             &active_proj_for_trails,
             dag_viewport_height,
             depth_mode,
@@ -677,7 +689,7 @@ impl State {
                 &self.timer,
             );
         }
-        if tlas_ready && frame.quality.ray_tracing > 0 {
+        if rt_active && frame.quality.ray_tracing > 0 {
             self.thin_gbuffer.encode(
                 &device,
                 &self.queue,
@@ -733,11 +745,6 @@ impl State {
         if let Some(particles) = &self.particles {
             particles.simulate(&mut encoder);
         }
-        // Acquired as late as possible. An HDR surface that needs decoding
-        // gets the frame through a picture of its own (display.rs); with a
-        // colour filter on, the frame draws into the filter's texture first,
-        // which its pass draws into that picture (or the surface) last.
-        let Some(surface) = target.view() else { return Ok(()) };
         let bypass = self.wired.bypass_display_output;
         let screen = if bypass {
             surface.clone()
@@ -969,7 +976,7 @@ impl State {
                 depth_mode,
             )?;
         }
-        if has_gpu_particles {
+        let particle_step = if has_gpu_particles {
             Self::encode_gpu_particles_wired(
                 &mut self.wired,
                 &mut self.built_ins,
@@ -983,9 +990,12 @@ impl State {
                 targets.size,
                 samples,
                 depth_mode,
-            )?;
-        }
-        if tlas_ready && frame.quality.ray_tracing > 0 {
+                self.frames,
+            )?
+        } else {
+            None
+        };
+        if rt_active && frame.quality.ray_tracing > 0 {
             let ddgi_buf = self.wired.ddgi_active_this_frame.then_some(self.environment.probe_data_buffer());
             let vel_view = targets.velocity.as_ref().map(|(v, _)| v);
             let thin_gbuf = match (
@@ -1043,7 +1053,10 @@ impl State {
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                             view: &targets.depth,
                             depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                            stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                            stencil_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
                         }),
                         ..Default::default()
                     });
@@ -1061,7 +1074,10 @@ impl State {
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                             view: &targets.depth,
                             depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                            stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                            stencil_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
                         }),
                         ..Default::default()
                     });
@@ -1094,12 +1110,21 @@ impl State {
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                             view: &targets.depth,
                             depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
-                            stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                            stencil_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
                         }),
                         ..Default::default()
                     });
                     if !fallback_translucent.is_empty() {
-                        draw_layers(&mut pass, group, lights, &[(&fallback_translucent, Layer::Translucent)], &mut stats);
+                        draw_layers(
+                            &mut pass,
+                            group,
+                            lights,
+                            &[(&fallback_translucent, Layer::Translucent)],
+                            &mut stats,
+                        );
                     }
                     particles::draw(&mut pass, &scratch.emitters);
                     ribbons::draw(&mut pass, self.ribbons.as_ref(), &scratch.ribbons);
@@ -1154,16 +1179,17 @@ impl State {
                 }
             }
         }
-        if let Some(jfa) = &jfa_scene {
+        for jfa in jfa_scenes.iter().flatten() {
             Self::encode_jfa_outlines_wired(
                 &mut self.wired,
                 &mut self.built_ins,
-                &self.assets,
+                &drawing,
+                ready,
+                self.skinning.buffers()[0],
                 &device,
                 &self.queue,
                 &mut encoder,
                 frame,
-                catalog,
                 jfa,
                 &active_proj_for_trails,
                 &targets.scene,
@@ -1244,7 +1270,14 @@ impl State {
             }
         } else if wants_polish {
             let polish_in = self.wired.polish_target(&device, (output_width, output_height), self.context.format);
-            self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &polish_in, &self.timer, &tables);
+            self.post.as_mut().unwrap().finish(
+                &mut self.built_ins,
+                &mut encoder,
+                frame,
+                &polish_in,
+                &self.timer,
+                &tables,
+            );
             Self::encode_post_polish_wired(
                 &mut self.wired,
                 &mut self.built_ins,
@@ -1336,17 +1369,15 @@ impl State {
                 self.timer.pass(Span::Overlay),
             );
         }
-        if !render2d_overlay_sdf.is_empty() {
-            Self::encode_render2d_overlay_wired(
-                &mut self.wired,
-                &device,
-                &mut encoder,
-                &render2d_overlay_sdf,
-                &output,
-                self.context.format,
-                (output_width, output_height),
-            );
-        }
+        Self::encode_render2d_overlay_wired(
+            &mut self.wired,
+            &device,
+            &mut encoder,
+            &render2d_overlay_sdf,
+            &output,
+            self.context.format,
+            (output_width, output_height),
+        );
         if let Some(lines) = &line_scene
             && lines.batch.has_2d()
         {
@@ -1388,6 +1419,9 @@ impl State {
             post.exposure_finish(&mut encoder);
         }
         self.queue.submit([encoder.finish()]);
+        if let Some(step) = particle_step {
+            self.wired.gpu_particles.submitted(step);
+        }
         if let Some(post) = &mut self.post {
             post.exposure_submitted();
         }
@@ -1464,7 +1498,8 @@ impl State {
             target.present();
             return Ok(());
         }
-        // 1. Render all split-screen child views FIRST into presentation-format intermediates
+        let Some(surface) = target.view() else { return Ok(()) };
+        // 1. Render all split-screen child views into presentation-format intermediates
         //    with display decode and global color filter bypassed, and isolated temporal state.
         let (rects, child_waiting, mut stats) =
             self.render_split_screen_views(frame, catalog, (output_width, output_height))?;
@@ -1478,17 +1513,15 @@ impl State {
         }
         let composite = (!scratch.insets.is_empty()).then(|| self.built_ins.get(BuiltIn::Composite).clone());
 
-        // 3. Acquire parent display & accessibility filter targets AFTER child submissions.
-        let Some(surface) = target.view() else { return Ok(()) };
+        // 3. Prepare parent display and accessibility filter targets.
         let device = self.device.clone();
         let screen = self.screen.view(&device, &self.queue, &surface, (output_width, output_height));
         let format = self.context.format;
         let filtered =
             self.filter.begin(&device, &self.queue, format, self.context.cache.get(), (output_width, output_height));
         let output = filtered.as_ref().unwrap_or(&screen).clone();
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("split_screen_frame"),
-        });
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("split_screen_frame") });
         self.timer.begin(self.timing || self.resolution.budgeted());
         if !scratch.items.is_empty() {
             self.morphing.dispatch(&device, &mut encoder, &self.assets);
@@ -1621,17 +1654,15 @@ impl State {
                 self.timer.pass(Span::Overlay),
             );
         }
-        if !split_render2d_overlay.is_empty() {
-            Self::encode_render2d_overlay_wired(
-                &mut self.wired,
-                &device,
-                &mut encoder,
-                &split_render2d_overlay,
-                &output,
-                format,
-                (output_width, output_height),
-            );
-        }
+        Self::encode_render2d_overlay_wired(
+            &mut self.wired,
+            &device,
+            &mut encoder,
+            &split_render2d_overlay,
+            &output,
+            format,
+            (output_width, output_height),
+        );
         if let Some(lines) = &split_line_scene
             && lines.batch.has_2d()
         {

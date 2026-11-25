@@ -1,5 +1,5 @@
-use super::super::{GpuAsset, MeshletIndirectSlot, Scratch, Shape, State, hiz, timing};
-use super::{PlannedDagDraw, PlannedMeshletDraw, WiredPasses};
+use super::super::{GpuAsset, MeshletIndirectSlot, Scratch, Shape, Source, State, hiz, timing};
+use super::{OutlineScenes, PlannedDagDraw, PlannedMeshletDraw, WiredPasses, outlined};
 use crate::camera_precision::DepthMode;
 use crate::matrix::{invert, multiply};
 use crate::meshlet_dag::{MeshletDagCullParams, MeshletDagCuller, MeshletDagTwoPhaseOutput};
@@ -42,6 +42,7 @@ impl State {
         encoder: &mut wgpu::CommandEncoder,
         frame: &RenderFrame,
         scratch: &mut Scratch,
+        outline_scenes: &OutlineScenes,
         active_proj: &Matrix,
         viewport_height: f32,
         depth_mode: DepthMode,
@@ -69,11 +70,18 @@ impl State {
         let mut dag_cursor = 0usize;
         for &ready_idx in &scratch.opaque {
             let entry = &scratch.ready[ready_idx];
-            if entry.skin.is_some() || entry.morph.is_some() {
+            if entry.skin.is_some()
+                || entry.morph.is_some()
+                || matches!(self.assets.current(entry.shader), Some(GpuAsset::Shader(shader)) if shader.margin.is_some_and(|margin| margin > 0.0))
+            {
                 continue;
             }
             let item = &scratch.items[entry.item];
-            if item.lod != 0 || !matches!(item.shape, Shape::Mesh(_)) {
+            // Outlined draws use the same discrete LOD for the scene and silhouette mask.
+            if item.lod != 0
+                || !matches!(item.shape, Shape::Mesh(_))
+                || matches!(item.source, Source::Draw(index) if outlined(outline_scenes, index))
+            {
                 continue;
             }
             let Some(mesh_slot) = entry.mesh else {

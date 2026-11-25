@@ -130,7 +130,9 @@ impl State {
         scratch: &Scratch,
     ) -> Result<bool> {
         self.wired.ddgi_active_this_frame = false;
-        if frame.quality.ray_tracing == 0 && !frame.quality.ddgi {
+        if (frame.quality.ray_tracing == 0 || !crate::ray_tracing::TlasRayTracer::supported(&self.device))
+            && !(frame.quality.ddgi && DdgiVolume::supported(&self.device))
+        {
             return Ok(false);
         }
         let device = &self.device;

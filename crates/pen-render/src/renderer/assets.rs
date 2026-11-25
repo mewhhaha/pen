@@ -1,3 +1,4 @@
+use crate::camera_precision::DepthMode;
 // Assets arriving from the loader: made into GPU assets on the thread that
 // submits frames, shaders staged until their pipelines compile, packed
 // textures streaming in their levels, smallest first, and detail fading in.
@@ -53,18 +54,36 @@ impl ShaderAsset {
     /// Compiles in the background those of `variants` for `samples` it has
     /// not and is not compiling, each pipeline in a job of its own, so that
     /// they compile side by side.
-    pub(super) fn request(&mut self, jobs: &JobQueue, slot: usize, samples: u32, variants: Variants) {
-        let made = self.made.get(&samples).map_or(Variants::NONE, Pipelines::variants);
-        let failed = self.failed.get(&samples).copied().unwrap_or_default();
+    pub(super) fn request(
+        &mut self,
+        jobs: &JobQueue,
+        slot: usize,
+        samples: u32,
+        depth_mode: DepthMode,
+        variants: Variants,
+    ) {
+        let key = (samples, depth_mode);
+        let made = self.made.get(&key).map_or(Variants::NONE, Pipelines::variants);
+        let failed = self.failed.get(&key).copied().unwrap_or_default();
         let missing = self.own(variants).without(made).without(failed);
-        let compiling = self.compiling.entry(samples).or_default();
+        let compiling = self.compiling.entry(key).or_default();
         let missing = missing.without(*compiling);
         *compiling |= missing;
         for variant in missing.each() {
             let (revision, module) = (self.revision, self.module.clone());
             let (instancing, skinning, persistent) = (self.instancing, self.skinning, self.persistent);
             jobs.push(
-                Job::Compile { slot, revision, samples, variants: variant, module, instancing, skinning, persistent },
+                Job::Compile {
+                    slot,
+                    revision,
+                    samples,
+                    variants: variant,
+                    depth_mode,
+                    module,
+                    instancing,
+                    skinning,
+                    persistent,
+                },
                 Priority::Urgent,
             );
         }
@@ -91,8 +110,8 @@ impl ShaderAsset {
     }
 
     /// Whether its compiles for `samples` and its shadows have all ended.
-    pub(super) fn settled(&self, samples: u32) -> bool {
-        self.compiling.get(&samples).is_none_or(|variants| variants.is_empty())
+    pub(super) fn settled(&self, samples: u32, depth_mode: DepthMode) -> bool {
+        self.compiling.get(&(samples, depth_mode)).is_none_or(|variants| variants.is_empty())
             && !self.shadow_compiling.contains(&true)
     }
 }
@@ -275,19 +294,17 @@ impl State {
                 let _ = self.assets.prefetch(kind, &key);
             }
             Message::Compiled { slot, revision, samples, variants, depth_mode, result } => {
-                if depth_mode != self.context.depth_mode() {
-                    return;
-                }
+                let key = (samples, depth_mode);
                 let failure = self.compiled(slot, revision, |shader| {
-                    let compiling = shader.compiling.entry(samples).or_default();
+                    let compiling = shader.compiling.entry(key).or_default();
                     *compiling = compiling.without(variants);
                     match result {
                         Ok(pipelines) => {
-                            shader.made.entry(samples).or_default().merge(pipelines);
+                            shader.made.entry(key).or_default().merge(pipelines);
                             None
                         }
                         Err(message) => {
-                            *shader.failed.entry(samples).or_default() |= variants;
+                            *shader.failed.entry(key).or_default() |= variants;
                             Some(message)
                         }
                     }
@@ -345,11 +362,9 @@ impl State {
                 message,
             });
         }
-        if self
-            .staging
-            .get(&slot)
-            .is_some_and(|staged| staged.shader.revision == revision && staged.shader.settled(staged.samples))
-        {
+        if self.staging.get(&slot).is_some_and(|staged| {
+            staged.shader.revision == revision && staged.shader.settled(staged.samples, staged.depth_mode)
+        }) {
             let Staged { shader, early, failure, .. } = self.staging.remove(&slot).unwrap();
             let published = match failure {
                 Some(message) => Err(message),
@@ -614,18 +629,19 @@ impl State {
                 // it draws with, ahead of the frames that draw it.
                 if let Some(slot) = self.assets.id(AssetKind::Shader, &material.shader) {
                     let jobs = &self.loader.jobs;
+                    let depth = self.context.depth_mode();
                     if let Some(GpuAsset::Shader(shader)) = self.assets.current_mut(slot) {
                         shader.needs |= material.variants();
                         for samples in [self.samples_shown, self.samples_now] {
-                            shader.request(jobs, slot, samples, shader.needs);
+                            shader.request(jobs, slot, samples, depth, shader.needs);
                         }
                         if material.casts_shadow() {
                             shader.request_shadow(jobs, slot);
                         }
                     }
-                    if let Some(Staged { shader, samples, .. }) = self.staging.get_mut(&slot) {
+                    if let Some(Staged { shader, samples, depth_mode, .. }) = self.staging.get_mut(&slot) {
                         shader.needs |= material.variants();
-                        shader.request(jobs, slot, *samples, shader.needs);
+                        shader.request(jobs, slot, *samples, *depth_mode, shader.needs);
                         if material.casts_shadow() {
                             shader.request_shadow(jobs, slot);
                         }
@@ -701,7 +717,8 @@ impl State {
                     shadow_compiling: [false; 4],
                 };
                 let (jobs, samples) = (&self.loader.jobs, self.samples_now);
-                shader.request(jobs, slot, samples, needs);
+                let depth_mode = self.context.depth_mode();
+                shader.request(jobs, slot, samples, depth_mode, needs);
                 if need.shadow {
                     shader.request_shadow(jobs, slot);
                 }
@@ -712,8 +729,8 @@ impl State {
                 if needs.contains(Variants::TRANSLUCENT) {
                     inset_needs |= Variants::INSET_BLENDED;
                 }
-                shader.request(jobs, slot, INSET_SAMPLES, inset_needs);
-                let staged = Staged { shader, early, samples, failure: None };
+                shader.request(jobs, slot, INSET_SAMPLES, depth_mode, inset_needs);
+                let staged = Staged { shader, early, samples, depth_mode, failure: None };
                 // A revision this one overtook is let go.
                 if let Some(Staged { shader, early, .. }) = self.staging.insert(slot, staged) {
                     let _ = self.assets.finish(slot, shader.revision, early, Err(String::new()), now);
@@ -837,13 +854,7 @@ impl State {
                         stream: Some(pending.levels),
                     };
                     let current = self.assets.slots[pending.slot].revision == pending.revision;
-                    self.finish_asset(
-                        pending.slot,
-                        pending.revision,
-                        pending.early,
-                        Ok(GpuAsset::Texture(asset)),
-                        now,
-                    );
+                    self.finish_asset(pending.slot, pending.revision, pending.early, Ok(GpuAsset::Texture(asset)), now);
                     // The rest, in the background: each finer level joins the
                     // views and fades in. (A revision it replaced may still be
                     // listed; its stream went with it.)
@@ -1084,16 +1095,21 @@ mod shadow_tests {
         assert!(!shader(&state, shader_slot).shadow_compiling.contains(&true));
         // Only what its materials draw with (an opaque material, alone or
         // instanced), and the inset's opaque pipeline.
-        assert_eq!(shader(&state, shader_slot).made[&1].variants(), Variants::OPAQUE | Variants::INSTANCED);
-        assert!(!state.ensure_variants(shader_slot, 4, Variants::INSTANCED));
-        assert!(!state.ensure_variants(shader_slot, 4, Variants::INSTANCED));
-        assert!(shader(&state, shader_slot).compiling[&4].contains(Variants::INSTANCED));
-        assert!(state.pending() > 0);
-        pump(&mut state, |state| shader(state, shader_slot).made.get(&4).is_some_and(|made| made.instanced.is_some()));
-        assert!(state.ensure_variants(shader_slot, 4, Variants::INSTANCED));
-        pump(&mut state, |state| shader(state, shader_slot).made[&4].opaque.is_some());
         assert_eq!(
-            shader(&state, shader_slot).made[&4].variants(),
+            shader(&state, shader_slot).made[&(1, DepthMode::ForwardZ)].variants(),
+            Variants::OPAQUE | Variants::INSTANCED
+        );
+        assert!(!state.ensure_variants(shader_slot, 4, Variants::INSTANCED));
+        assert!(!state.ensure_variants(shader_slot, 4, Variants::INSTANCED));
+        assert!(shader(&state, shader_slot).compiling[&(4, DepthMode::ForwardZ)].contains(Variants::INSTANCED));
+        assert!(state.pending() > 0);
+        pump(&mut state, |state| {
+            shader(state, shader_slot).made.get(&(4, DepthMode::ForwardZ)).is_some_and(|made| made.instanced.is_some())
+        });
+        assert!(state.ensure_variants(shader_slot, 4, Variants::INSTANCED));
+        pump(&mut state, |state| shader(state, shader_slot).made[&(4, DepthMode::ForwardZ)].opaque.is_some());
+        assert_eq!(
+            shader(&state, shader_slot).made[&(4, DepthMode::ForwardZ)].variants(),
             Variants::OPAQUE | Variants::INSTANCED | Variants::INSET
         );
 

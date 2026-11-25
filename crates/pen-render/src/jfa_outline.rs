@@ -90,6 +90,7 @@ struct MeshPipelineKey {
     stride: u64,
     depth_mode: DepthMode,
     scene_depth: SceneDepthKind,
+    skinned: bool,
 }
 
 struct MaskTargets {
@@ -110,7 +111,7 @@ pub struct JfaOutlinePass {
     mesh_pipelines: Vec<(MeshPipelineKey, wgpu::RenderPipeline)>,
     composite_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     targets: Option<MaskTargets>,
-    resolved: Option<(usize, wgpu::TextureView)>,
+    resolved: Option<(usize, wgpu::TextureView, u32)>,
 }
 
 impl JfaOutlinePass {
@@ -253,6 +254,24 @@ impl JfaOutlinePass {
 
     /// Replace the palette. Omitted palette entries become transparent.
     pub fn set_styles(&mut self, queue: &wgpu::Queue, styles: &[OutlineStyle]) {
+        queue.write_buffer(&self.styles, 0, bytemuck::cast_slice(&Self::pack_styles(styles)));
+    }
+
+    pub(crate) fn encode_styles(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        styles: &[OutlineStyle],
+    ) {
+        let upload = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JFA palette upload"),
+            contents: bytemuck::cast_slice(&Self::pack_styles(styles)),
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+        encoder.copy_buffer_to_buffer(&upload, 0, &self.styles, 0, self.styles.size());
+    }
+
+    fn pack_styles(styles: &[OutlineStyle]) -> [OutlineStyleGpu; OUTLINE_STYLE_CAPACITY] {
         use bytemuck::Zeroable as _;
 
         assert!(styles.len() <= OUTLINE_STYLE_CAPACITY, "the outline palette supports up to 256 styles");
@@ -267,7 +286,7 @@ impl JfaOutlinePass {
                 padding: 0.0,
             };
         }
-        queue.write_buffer(&self.styles, 0, bytemuck::cast_slice(&gpu_styles));
+        gpu_styles
     }
 
     /// The pass-owned `R32Uint` mask. Callers may render or copy packed mask values into it directly.
@@ -313,14 +332,25 @@ impl JfaOutlinePass {
     /// occlusion. The mask pass's own depth attachment resolves selected-mesh overlap.
     pub fn prepare_mesh_mask(&mut self, device: &wgpu::Device, params: &MeshMaskParams<'_>) -> PreparedMeshMask {
         let kind = if params.scene_depth.is_some() { SceneDepthKind::Depth2d } else { SceneDepthKind::None };
-        self.prepare_mesh_mask_inner(device, params, kind)
+        self.prepare_mesh_mask_inner(device, params, kind, None)
     }
 
     /// Variant of [`Self::prepare_mesh_mask`] accepting a single-sampled `R32Float` resolved depth view
     /// (e.g. from MSAA depth resolve) for occlusion tagging.
     pub fn prepare_mesh_mask_r32(&mut self, device: &wgpu::Device, params: &MeshMaskParams<'_>) -> PreparedMeshMask {
         let kind = if params.scene_depth.is_some() { SceneDepthKind::R32Float } else { SceneDepthKind::None };
-        self.prepare_mesh_mask_inner(device, params, kind)
+        self.prepare_mesh_mask_inner(device, params, kind, None)
+    }
+
+    pub(crate) fn prepare_scene_mask(
+        &mut self,
+        device: &wgpu::Device,
+        params: &MeshMaskParams<'_>,
+        resolved: bool,
+        skin: Option<(u32, &wgpu::Buffer, u64)>,
+    ) -> PreparedMeshMask {
+        let kind = if resolved { SceneDepthKind::R32Float } else { SceneDepthKind::Depth2d };
+        self.prepare_mesh_mask_inner(device, params, kind, skin)
     }
 
     fn prepare_mesh_mask_inner(
@@ -328,6 +358,7 @@ impl JfaOutlinePass {
         device: &wgpu::Device,
         params: &MeshMaskParams<'_>,
         scene_depth_kind: SceneDepthKind,
+        skin: Option<(u32, &wgpu::Buffer, u64)>,
     ) -> PreparedMeshMask {
         assert!(params.style_index < OUTLINE_STYLE_CAPACITY, "style index is outside the outline palette");
         assert!(
@@ -340,6 +371,7 @@ impl JfaOutlinePass {
             stride: params.vertex_stride,
             depth_mode: params.depth_mode,
             scene_depth: scene_depth_kind,
+            skinned: skin.is_some(),
         };
         let pipeline = if let Some((_, pipeline)) = self.mesh_pipelines.iter().find(|(candidate, _)| *candidate == key)
         {
@@ -369,6 +401,16 @@ impl JfaOutlinePass {
                 _ => 1,
             };
             entries.push(wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(depth) });
+        }
+        if let Some((offset, buffer, size)) = skin {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: u64::from(offset),
+                    size: wgpu::BufferSize::new(size),
+                }),
+            });
         }
         let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JFA mesh draw bindings"),
@@ -411,7 +453,7 @@ impl JfaOutlinePass {
     ) {
         let targets = self.targets();
         let final_seed = self.encode_flood(encoder, &targets.init, max_radius_px);
-        self.resolved = Some((final_seed, targets.mask_view.clone()));
+        self.resolved = Some((final_seed, targets.mask_view.clone(), max_radius_px.clamp(1, MAX_RADIUS)));
     }
 
     /// Initialize from an external, single-sampled `R32Uint` 2D mask with
@@ -431,7 +473,7 @@ impl JfaOutlinePass {
         let view = mask.create_view(&wgpu::TextureViewDescriptor { mip_level_count: Some(1), ..Default::default() });
         let init = self.init_bindings(device, &view, &targets.seeds[0]);
         let final_seed = self.encode_flood(encoder, &init, max_radius_px);
-        self.resolved = Some((final_seed, view));
+        self.resolved = Some((final_seed, view, max_radius_px.clamp(1, MAX_RADIUS)));
     }
 
     /// Blend over a single-sampled, blendable color target with the mask's extent.
@@ -443,7 +485,7 @@ impl JfaOutlinePass {
         target_view: &wgpu::TextureView,
         target_format: wgpu::TextureFormat,
     ) {
-        let (seed, mask) = self.resolved.as_ref().expect("run the outline flood before compositing");
+        let (seed, mask, radius) = self.resolved.as_ref().expect("run the outline flood before compositing");
         let targets = self.targets.as_ref().expect("resize the outline pass before use");
         let pipeline =
             if let Some((_, pipeline)) = self.composite_pipelines.iter().find(|(format, _)| *format == target_format) {
@@ -453,6 +495,11 @@ impl JfaOutlinePass {
                 self.composite_pipelines.push((target_format, pipeline));
                 &self.composite_pipelines.last().unwrap().1
             };
+        let radius = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JFA composite radius"),
+            contents: bytemuck::bytes_of(radius),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
         let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JFA composite bindings"),
             layout: &pipeline.get_bind_group_layout(0),
@@ -460,6 +507,7 @@ impl JfaOutlinePass {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(mask) },
                 wgpu::BindGroupEntry { binding: 3, resource: targets.seeds[*seed].as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: self.styles.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: radius.as_entire_binding() },
             ],
         });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -516,18 +564,26 @@ impl JfaOutlinePass {
     }
 
     fn create_mesh_pipeline(&self, device: &wgpu::Device, key: MeshPipelineKey) -> wgpu::RenderPipeline {
+        let buffers = [
+            Some(wgpu::VertexBufferLayout {
+                array_stride: key.stride,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+            }),
+            Some(wgpu::VertexBufferLayout {
+                array_stride: crate::shader::SKIN_VERTEX_BYTES,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![9 => Uint16x4, 10 => Float32x4],
+            }),
+        ];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("JFA mesh mask pipeline"),
             layout: None,
             vertex: wgpu::VertexState {
                 module: &self.shader,
-                entry_point: Some("mask_vs"),
+                entry_point: Some(if key.skinned { "mask_skinned_vs" } else { "mask_vs" }),
                 compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: key.stride,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3],
-                })],
+                buffers: &buffers[..if key.skinned { 2 } else { 1 }],
             },
             primitive: Default::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -859,6 +915,68 @@ mod tests {
             (1..=5).map(|distance| pixel(48 - distance, 32)).collect::<Vec<_>>(),
             pixel(39, 32),
         );
+    }
+
+    #[test]
+    fn skinned_mask_uses_the_prepared_joint_pose() {
+        let red = OutlineStyle {
+            color: [1.0, 0.0, 0.0, 1.0],
+            occluded_color: [1.0, 0.0, 0.0, 1.0],
+            fill_alpha: 1.0,
+            ..Default::default()
+        };
+        let mut frame = Frame::new(WIDTH, HEIGHT, &[red]);
+        let depth = frame.scene_depth(DepthMode::ForwardZ);
+        let buffer = |contents, usage| {
+            frame.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents, usage })
+        };
+        let positions = BOX_VERTICES.map(|[x, y, z]| [x * 0.25, y * 0.5, z * 0.1 + 0.5]);
+        let vertices = buffer(bytemuck::cast_slice(&positions), wgpu::BufferUsages::VERTEX);
+        let indices = buffer(bytemuck::cast_slice(&BOX_INDICES), wgpu::BufferUsages::INDEX);
+        let skin = [[0_u32, 0, 1.0_f32.to_bits(), 0, 0, 0]; BOX_VERTICES.len()];
+        let skin = buffer(bytemuck::cast_slice(&skin), wgpu::BufferUsages::VERTEX);
+        let mut joint = IDENTITY;
+        joint[12] = 0.5;
+        let joints = buffer(bytemuck::cast_slice(&joint), wgpu::BufferUsages::STORAGE);
+        let prepared = frame.outline.prepare_scene_mask(
+            &frame.device,
+            &MeshMaskParams {
+                vertex_stride: 12,
+                model: IDENTITY,
+                view_proj: IDENTITY,
+                style_index: 0,
+                depth_mode: DepthMode::ForwardZ,
+                scene_depth: Some(&depth),
+                depth_bias: 1e-4,
+            },
+            false,
+            Some((0, &joints, 64)),
+        );
+        {
+            let mut pass = frame.outline.begin_mask_pass(&mut frame.encoder);
+            pass.set_vertex_buffer(1, skin.slice(..));
+            frame.outline.draw_mesh_mask(
+                &mut pass,
+                &prepared,
+                vertices.slice(..),
+                Some((indices.slice(..), wgpu::IndexFormat::Uint16)),
+                0..36,
+            );
+        }
+        let pixel = frame.finish(1, None);
+        assert_eq!(pixel(64, 32), BACKGROUND);
+        assert_eq!(pixel(96, 32), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn composite_cuts_off_wide_styles_at_the_requested_radius() {
+        let red = OutlineStyle { color: [1.0, 0.0, 0.0, 1.0], width_px: 20.0, ..Default::default() };
+        let mut frame = Frame::new(WIDTH, HEIGHT, &[red]);
+        frame.draw_boxes(&[(0.0, 0)], DepthMode::ForwardZ, None);
+        let pixel = frame.finish(5, None);
+        assert_eq!(pixel(43, 32), [255, 0, 0, 255]);
+        assert_eq!(pixel(42, 32), BACKGROUND);
+        assert_eq!(pixel(44, 12), BACKGROUND);
     }
 
     #[test]

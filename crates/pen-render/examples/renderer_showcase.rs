@@ -195,7 +195,6 @@ fn trs(pos: [f32; 3], yaw: f32, scale: [f32; 3]) -> [f32; 16] {
 }
 
 fn build_assets(dir: &Path) -> Catalog {
-    std::fs::create_dir_all(dir).unwrap();
     // 1024-triangle UV sphere (hits MeshletDagGpu >= 768 tris!)
     let (stacks, slices) = (16u32, 32u32);
     let (mut pos, mut norm, mut uv, mut idx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -428,6 +427,28 @@ fn draw_divider(img: &mut RgbaImage) {
     }
 }
 
+struct ShowcaseAssets(std::path::PathBuf);
+
+impl ShowcaseAssets {
+    fn new() -> std::io::Result<Self> {
+        for index in 0u64.. {
+            let dir = std::env::temp_dir().join(format!("pen-renderer-showcase-{}-{index}", std::process::id()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Ok(Self(dir)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("directory counter exhausted")
+    }
+}
+
+impl Drop for ShowcaseAssets {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let out_png = PathBuf::from(args.get(1).map_or("/tmp/renderer_expansion_showcase.png", String::as_str));
@@ -451,9 +472,9 @@ fn main() -> Result<()> {
         ..Default::default()
     }))?;
 
-    let dir = std::env::temp_dir().join(format!("pen-renderer-showcase-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let catalog = build_assets(&dir);
+    let assets = ShowcaseAssets::new()?;
+    let dir = &assets.0;
+    let catalog = build_assets(dir);
 
     let make_renderer = || {
         let mut r = Renderer::new(
@@ -884,6 +905,5 @@ fn main() -> Result<()> {
         last_composite.height(),
         frame_count
     );
-    let _ = std::fs::remove_dir_all(&dir);
     Ok(())
 }

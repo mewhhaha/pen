@@ -132,6 +132,10 @@ pub trait Overlay {
     /// A line for its console, as if typed there (a script's `overlay=`),
     /// run on the next update.
     fn command(&mut self, _line: String) {}
+    /// Whether renderer-native viewport overlays (F8) are currently enabled.
+    fn viewport_overlay_enabled(&self) -> bool {
+        false
+    }
     /// Prepares renderer-native viewport overlays (JFA outlines, 3D/2D gizmos, SDF HUD)
     /// right before `frame` is submitted. When `show` is false (clean capture/recording),
     /// any previously attached overlay scenes are suspended without changing user toggle state.
@@ -210,63 +214,108 @@ impl Host for Shell<'_> {
         self.preferences.apply(&mut self.gpu.renderer)?;
         let capture = &mut *self.capture;
         let audited = capture.audits.due(&frame.ui);
-        let offscreen = capture.offscreen
+        let viewport_overlay_active = self.overlay.as_ref().is_some_and(|overlay| overlay.viewport_overlay_enabled());
+        let has_overlay_shots = !capture.overlay_shots.is_empty();
+        let need_clean_texture = capture.offscreen
             || !capture.screenshots.is_empty()
             || capture.recorder.is_some()
-            || !capture.overlay_shots.is_empty()
             || capture.picture.is_some()
-            || audited;
-        let texture = offscreen.then(|| self.gpu.capture_texture());
+            || audited
+            || (has_overlay_shots && !viewport_overlay_active);
         let gpu = &mut *self.gpu;
+        let viewport = [gpu.size.0.max(1) as f32, gpu.size.1.max(1) as f32];
         #[cfg(feature = "devtools")]
         {
             gpu.drawn = Drawn { meshes: frame.draws.len(), brushes: frame.solids.len() };
         }
-        if let Some(overlay) = self.overlay.as_deref_mut() {
-            let show_viewport_overlay = !offscreen || !capture.overlay_shots.is_empty();
-            overlay.prepare_scene(
-                &mut gpu.renderer,
-                frame,
-                [gpu.size.0.max(1) as f32, gpu.size.1.max(1) as f32],
-                show_viewport_overlay,
-            );
+        let separate_overlay_pass =
+            need_clean_texture && viewport_overlay_active && (has_overlay_shots || gpu.surface.is_some());
+        let clean_texture = need_clean_texture.then(|| gpu.capture_texture());
+        if let Some(texture) = &clean_texture {
+            if let Some(overlay) = self.overlay.as_deref_mut() {
+                overlay.prepare_scene(&mut gpu.renderer, frame, viewport, false);
+            }
+            let output = Output {
+                device: &gpu.device,
+                queue: &gpu.queue,
+                surface: (!separate_overlay_pass).then_some(gpu.surface.as_ref()).flatten(),
+                size: gpu.size,
+                blitter: (!separate_overlay_pass).then_some(gpu.blitter.as_ref()).flatten(),
+                overlay: (!separate_overlay_pass).then_some(self.overlay.as_deref_mut()).flatten(),
+                timings: &mut gpu.draw_timings,
+            };
+            let mut target = CaptureTarget { output, texture: texture.clone() };
+            gpu.renderer.submit(frame, catalog, &mut target)?;
         }
-        let output = Output {
-            device: &gpu.device,
-            queue: &gpu.queue,
-            surface: gpu.surface.as_ref(),
-            size: gpu.size,
-            blitter: gpu.blitter.as_ref(),
-            overlay: self.overlay.as_deref_mut(),
-            timings: &mut gpu.draw_timings,
-        };
-        match &texture {
-            Some(texture) => {
+        let overlay_texture = if separate_overlay_pass || (!need_clean_texture && has_overlay_shots) {
+            if let Some(overlay) = self.overlay.as_deref_mut() {
+                overlay.prepare_scene(&mut gpu.renderer, frame, viewport, true);
+            }
+            if has_overlay_shots {
+                let texture = gpu.overlay_capture_texture();
+                let output = Output {
+                    device: &gpu.device,
+                    queue: &gpu.queue,
+                    surface: gpu.surface.as_ref(),
+                    size: gpu.size,
+                    blitter: gpu.blitter.as_ref(),
+                    overlay: self.overlay.as_deref_mut(),
+                    timings: &mut gpu.draw_timings,
+                };
                 let mut target = CaptureTarget { output, texture: texture.clone() };
                 gpu.renderer.submit(frame, catalog, &mut target)?;
-            }
-            None => {
+                Some(texture)
+            } else {
+                let output = Output {
+                    device: &gpu.device,
+                    queue: &gpu.queue,
+                    surface: gpu.surface.as_ref(),
+                    size: gpu.size,
+                    blitter: gpu.blitter.as_ref(),
+                    overlay: self.overlay.as_deref_mut(),
+                    timings: &mut gpu.draw_timings,
+                };
                 let mut target = SurfaceTarget { output, texture: None };
                 gpu.renderer.submit(frame, catalog, &mut target)?;
                 target.present();
+                None
             }
-        }
+        } else if !need_clean_texture {
+            if let Some(overlay) = self.overlay.as_deref_mut() {
+                overlay.prepare_scene(&mut gpu.renderer, frame, viewport, true);
+            }
+            let output = Output {
+                device: &gpu.device,
+                queue: &gpu.queue,
+                surface: gpu.surface.as_ref(),
+                size: gpu.size,
+                blitter: gpu.blitter.as_ref(),
+                overlay: self.overlay.as_deref_mut(),
+                timings: &mut gpu.draw_timings,
+            };
+            let mut target = SurfaceTarget { output, texture: None };
+            gpu.renderer.submit(frame, catalog, &mut target)?;
+            target.present();
+            None
+        } else {
+            None
+        };
         gpu.draw_timings.render_ms = (started.elapsed().as_secs_f64() * 1000.0 - gpu.draw_timings.total_ms()).max(0.0);
-        if let Some(texture) = texture.as_ref().filter(|_| audited) {
+        if let Some(texture) = clean_texture.as_ref().filter(|_| audited) {
             capture.audits.capture(gpu, texture, &frame.ui)?;
         }
         crate::startup::drawn(&gpu.renderer);
-        if let Some(texture) = &texture {
+        if let Some(texture) = overlay_texture.as_ref().or(clean_texture.as_ref()) {
             for path in capture.overlay_shots.drain(..) {
                 write_overlay_shot(gpu, texture, self.overlay.as_deref_mut(), &path)?;
             }
         }
         if let (Some(position), Some(texture), Some(overlay)) =
-            (capture.picture.take(), &texture, self.overlay.as_deref_mut())
+            (capture.picture.take(), &clean_texture, self.overlay.as_deref_mut())
         {
             overlay.picture(&gpu.device, &gpu.queue, texture, position);
         }
-        if let Some(texture) = &texture
+        if let Some(texture) = &clean_texture
             && !capture.screenshots.is_empty()
         {
             let pixels = gpu.read(texture)?;
@@ -274,7 +323,7 @@ impl Host for Shell<'_> {
                 write_png(&path, &pixels, texture.width(), texture.height(), gpu.bgra())?;
             }
         }
-        if let Some(texture) = &texture
+        if let Some(texture) = &clean_texture
             && let Some(recorder) = &mut capture.recorder
         {
             recorder.sound(frame, catalog)?;
@@ -748,7 +797,12 @@ impl Session {
 
     /// Upgrades the session's kernel worker module (used by packaged `--worker-deadlines` games
     /// via `load_packaged_workers`).
-    pub fn set_worker_module(&mut self, worker_engine: wasmtime::Engine, worker_module: GuestModule, has_deadlines: bool) {
+    pub fn set_worker_module(
+        &mut self,
+        worker_engine: wasmtime::Engine,
+        worker_module: GuestModule,
+        has_deadlines: bool,
+    ) {
         self.worker_engine = worker_engine.clone();
         self.worker_deadlines = has_deadlines;
         if let Some(kernels) = &mut self.kernels {
@@ -1547,25 +1601,63 @@ impl Session {
         if current && gpu.surface.is_none() && !shots {
             return Ok(());
         }
+        let viewport = [gpu.size.0.max(1) as f32, gpu.size.1.max(1) as f32];
+        let viewport_overlay_active = self.overlay.as_ref().is_some_and(|overlay| overlay.viewport_overlay_enabled());
+        let need_overlay_pass = viewport_overlay_active && (gpu.surface.is_some() || !capture.overlay_shots.is_empty());
         let texture = gpu.still_texture();
-        let output = Output {
-            device: &gpu.device,
-            queue: &gpu.queue,
-            surface: gpu.surface.as_ref(),
-            size: gpu.size,
-            blitter: gpu.blitter.as_ref(),
-            overlay: self.overlay.as_mut(),
-            timings: &mut Default::default(),
-        };
-        let mut target = CaptureTarget { output, texture: texture.clone() };
-        if current {
-            target.present();
-        } else {
+        if !current {
+            if let Some(overlay) = self.overlay.as_mut() {
+                overlay.prepare_scene(&mut gpu.renderer, frame, viewport, false);
+            }
+            let output = Output {
+                device: &gpu.device,
+                queue: &gpu.queue,
+                surface: (!need_overlay_pass).then_some(gpu.surface.as_ref()).flatten(),
+                size: gpu.size,
+                blitter: (!need_overlay_pass).then_some(gpu.blitter.as_ref()).flatten(),
+                overlay: (!need_overlay_pass).then_some(self.overlay.as_mut()).flatten(),
+                timings: &mut Default::default(),
+            };
+            let mut target = CaptureTarget { output, texture: texture.clone() };
             gpu.renderer.submit(frame, self.runtime.catalog(), &mut target)?;
             self.still = true;
         }
+        let overlay_texture = if need_overlay_pass {
+            if let Some(overlay) = self.overlay.as_mut() {
+                overlay.prepare_scene(&mut gpu.renderer, frame, viewport, true);
+            }
+            let overlay_tex = gpu.overlay_capture_texture();
+            let output = Output {
+                device: &gpu.device,
+                queue: &gpu.queue,
+                surface: gpu.surface.as_ref(),
+                size: gpu.size,
+                blitter: gpu.blitter.as_ref(),
+                overlay: self.overlay.as_mut(),
+                timings: &mut Default::default(),
+            };
+            let mut target = CaptureTarget { output, texture: overlay_tex.clone() };
+            gpu.renderer.submit(frame, self.runtime.catalog(), &mut target)?;
+            Some(overlay_tex)
+        } else {
+            if current {
+                let output = Output {
+                    device: &gpu.device,
+                    queue: &gpu.queue,
+                    surface: gpu.surface.as_ref(),
+                    size: gpu.size,
+                    blitter: gpu.blitter.as_ref(),
+                    overlay: self.overlay.as_mut(),
+                    timings: &mut Default::default(),
+                };
+                let mut target = CaptureTarget { output, texture: texture.clone() };
+                target.present();
+            }
+            None
+        };
+        let overlay_source = overlay_texture.as_ref().unwrap_or(&texture);
         for path in capture.overlay_shots.drain(..) {
-            write_overlay_shot(gpu, &texture, self.overlay.as_mut(), &path)?;
+            write_overlay_shot(gpu, overlay_source, self.overlay.as_mut(), &path)?;
         }
         if !capture.screenshots.is_empty() {
             let pixels = gpu.read(&texture)?;
@@ -1776,7 +1868,9 @@ impl Session {
         let has_kernels = crate::kernels::has_kernel_requests(&rendered.services);
         // Submit live local kernel work right before `shell.render` so workers
         // overlap GPU rendering; strip silently under Netplay (`self.net.is_some()`).
-        if planned.replayed.is_none() && self.net.is_none() && has_kernels
+        if planned.replayed.is_none()
+            && self.net.is_none()
+            && has_kernels
             && let Some(kernels) = &mut self.kernels
         {
             kernels.submit(&rendered.services);

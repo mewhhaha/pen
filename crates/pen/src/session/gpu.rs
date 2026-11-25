@@ -41,6 +41,9 @@ pub struct Gpu {
     pinned: Option<(u32, u32)>,
     /// The offscreen image frames are captured from.
     capture: Option<wgpu::Texture>,
+    /// Offscreen image for viewport-overlay shots and overlay presentation when
+    /// a clean capture/recording also needs uncontaminated game pixels.
+    overlay_capture: Option<wgpu::Texture>,
     /// The paused frame's image, shown again without drawing it again.
     pub(super) still: Option<wgpu::Texture>,
     fault: Fault,
@@ -179,6 +182,7 @@ impl Gpu {
             renderer,
             format,
             capture: None,
+            overlay_capture: None,
             still: None,
             #[cfg(feature = "devtools")]
             drawn: Drawn::default(),
@@ -205,6 +209,7 @@ impl Gpu {
             blitter: None,
             pinned: Some(size),
             capture: None,
+            overlay_capture: None,
             still: None,
             #[cfg(feature = "devtools")]
             drawn: Drawn::default(),
@@ -230,6 +235,10 @@ impl Gpu {
 
     pub(super) fn capture_texture(&mut self) -> wgpu::Texture {
         offscreen(&self.device, &mut self.capture, self.size, self.format, "capture")
+    }
+
+    pub(super) fn overlay_capture_texture(&mut self) -> wgpu::Texture {
+        offscreen(&self.device, &mut self.overlay_capture, self.size, self.format, "overlay capture")
     }
 
     pub(super) fn still_texture(&mut self) -> wgpu::Texture {

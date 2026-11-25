@@ -10,7 +10,7 @@ import { serve } from './serve.mjs';
 
 const hostDir = resolve(process.env.PEN_WEB_HOST || 'crates/pen-web/pkg');
 
-// --- Minimal Wasm binary helpers (ABI 3 + session protocol 2) ---
+// --- Minimal Wasm binary helpers (ABI 8 + session protocol 2) ---
 const uleb = value => {
   const bytes = [];
   do {
@@ -54,7 +54,7 @@ function encodeFloatArray(values) {
 }
 
 function uiNodeLanes({
-  id, parent = 0, role, x, y, w, h,
+  id, parent = 0, role, x = 0, y = 0, w = 0, h = 0,
   focusable = 0, focused = 0, disabled = 0, hidden = 0, modal = 0,
   checked = 0, expanded = 0, selected = 0, live = 0,
   value = 0, min = 0, max = 0, step = 0, actions = 0,
@@ -135,9 +135,24 @@ function buildRenderFramePacket({ includeLocaleRequest }) {
     id: 4, parent: 3, role: 9, x: 0.06, y: 0.46, w: 0.30, h: 0.12,
     focusable: 1, selected: 2, actions: (1 << 0) | (1 << 2), name: 'Hard',
   });
-  const ui = [...n0, ...n1, ...n2, ...n3];
-  header[159] = 4; // UI_COUNT
+  const nodes = [
+    n0, n1, n2, n3,
+    uiNodeLanes({ id: 5, role: 0, name: 'Dialog holder' }),
+    uiNodeLanes({ id: 6, parent: 5, role: 10, hidden: 1, modal: 1, name: 'Confirm' }),
+    uiNodeLanes({ id: 7, parent: 6, role: 3, focusable: 1, focused: 1, actions: 1 << 2, name: 'Exit' }),
+    uiNodeLanes({ id: 8, parent: 6, role: 0, disabled: 1, name: 'Disabled group' }),
+    uiNodeLanes({ id: 9, parent: 8, role: 3, focusable: 1, actions: 1 << 2, name: 'Unavailable' }),
+    uiNodeLanes({ id: 10, role: 8, name: 'News' }),
+    uiNodeLanes({ id: 11, parent: 10, role: 9, focusable: 1, hidden: 1, name: 'Unpublished' }),
+    uiNodeLanes({ id: 12, role: 9, focusable: 1, name: 'Orphan' }),
+  ];
+  const ui = nodes.flat();
+  header[159] = nodes.length; // UI_COUNT
   header[160] = ui.length; // UI_LANES
+
+  const sounds = includeLocaleRequest ? [0, 0, 0, 0, 1, 0, 0] : [];
+  header[7] = sounds.length ? 1 : 0;
+  header[175] = 1; // SHOW_CAPTIONS
 
   const keyCps = [...'greeting'].map(c => c.codePointAt(0));
   const services = includeLocaleRequest
@@ -191,10 +206,11 @@ function buildRenderFramePacket({ includeLocaleRequest }) {
   const n1ValueLane = 266 + n0.length + 16;
 
   return {
-    packet: [...header, ...ui, ...services, ...extensions],
+    packet: [...header, ...sounds, ...ui, ...services, ...extensions],
     n0CheckedLane,
     n0ExpandedLane,
     n1ValueLane,
+    modalHiddenLane: 266 + nodes.slice(0, 5).flat().length + 10,
   };
 }
 
@@ -216,10 +232,15 @@ function buildGuestWasm() {
   const checkedAddr = laneAddr(FRAME_STEADY, steady.n0CheckedLane);
   const expandedAddr = laneAddr(FRAME_STEADY, steady.n0ExpandedLane);
   const sliderValAddr = laneAddr(FRAME_STEADY, steady.n1ValueLane);
+  const modalHiddenAddr = laneAddr(FRAME_STEADY, steady.modalHiddenLane);
+  const exitAddr = laneAddr(FRAME_STEADY, 19);
+  const requestArena = 32768;
+  const resetRequestArena = [...i32Const(requestArena), 0x24, 0];
 
   // Scratch slots in low linear memory:
   // 0: req ptr, 4: sent_locale flag, 8: loop i, 12: event_count, 16: event ptr, 20: reply ptr
-  const exchange = [...i32Const(0), 0x20, 0, ...i32Load(20), 0x10, 0, 0x36, 2, 0];
+  // The guest has consumed the previous request when it publishes its reply.
+  const exchange = [...resetRequestArena, ...i32Const(0), 0x20, 0, ...i32Load(20), 0x10, 0, 0x36, 2, 0];
   const reqF32 = off => [...i32Load(0), 0x2a, 2, off];
   const reqI32 = off => [...reqF32(off), 0xa8]; // i32.trunc_f32_s
 
@@ -257,10 +278,14 @@ function buildGuestWasm() {
         ...i32Store(16, [...i32Load(0), ...i32Const(32), 0x6a, ...i32Load(8), ...i32Const(20), 0x6c, 0x6a]),
         // tag == 12 (UI_ACTION): [12, action, node, value, 0]
         ...i32Load(16), 0x2a, 2, 0, 0xa8, ...i32Const(12), 0x46, 0x04, 0x40,
-          // action == 2 (ACTIVATE) && node == 1 (Play button) -> checked = 2.0 (TRUE)
+          // Play opens the modal; its Exit button requests shutdown.
           ...i32Load(16), 0x2a, 2, 4, 0xa8, ...i32Const(2), 0x46, 0x04, 0x40,
             ...i32Load(16), 0x2a, 2, 8, 0xa8, ...i32Const(1), 0x46, 0x04, 0x40,
               ...i32Const(checkedAddr), ...f32Const(2.0), 0x38, 2, 0,
+              ...i32Const(modalHiddenAddr), ...f32Const(0.0), 0x38, 2, 0,
+            0x0b,
+            ...i32Load(16), 0x2a, 2, 8, 0xa8, ...i32Const(7), 0x46, 0x04, 0x40,
+              ...i32Const(exitAddr), ...f32Const(1.0), 0x38, 2, 0,
             0x0b,
           0x0b,
           // action == 3 (INCREMENT) && node == 2 (Volume slider) -> value += 10.0
@@ -304,20 +329,16 @@ function buildGuestWasm() {
     [0x60, 2, 0x6f, 0x7f, 1, 0x7f],
     [0x60, 1, 0x6f, 1, 0x7f],
     [0x60, 1, 0x7f, 1, 0x7f],
-    [0x60, 0, 0],
-    [0x60, 1, 0x7f, 0],
   ]);
   const imports = vector([[...text('blot:host/1'), ...text('call_array_f32_array_f32'), 0, 0]]);
-  const functions = vector([[1], [2], [2], [3], [4]]);
+  const functions = vector([[1], [2], [2]]);
   const memory = vector([[0, 2]]); // 128 KiB
-  const globals = vector([[0x7f, 1, ...i32Const(32768), 0x0b]]);
+  const globals = vector([[0x7f, 1, ...i32Const(requestArena), 0x0b]]);
   const exports = vector([
     [...text('main'), 0, 1],
     [...text('blot:memory'), 2, 0],
     [...text('blot:allocate'), 0, 2],
     [...text('blot:reset'), 0, 3],
-    [...text('blot:ownership_enter'), 0, 4],
-    [...text('blot:ownership_leave'), 0, 5],
   ]);
   const body = code => {
     const bytes = [...vector([]), ...code, 0x0b];
@@ -327,9 +348,7 @@ function buildGuestWasm() {
     body(main),
     // allocate: bump global 0, aligned to 4
     body([0x23, 0, 0x23, 0, 0x20, 0, 0x41, 3, 0x6a, 0x41, ...sleb(-4), 0x71, 0x6a, 0x24, 0]),
-    body([...i32Const(32768), 0x24, 0, ...i32Const(32768)]),
-    body([]),
-    body([]),
+    body([...resetRequestArena, ...i32Const(requestArena)]),
   ]);
   const seg = (addr, floats) => {
     const bytes = encodeFloatArray(floats);
@@ -343,7 +362,7 @@ function buildGuestWasm() {
     seg(FRAME_FIRST, firstReply),
     seg(FRAME_STEADY, steadyReply),
   ]);
-  const manifest = [3, 1, ...text('main'), 4, 6, 6, 0, 0];
+  const manifest = [8, 1, ...text('main'), 4, 6, 6, 0, 0];
   return new Uint8Array([
     0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
     ...custom('blot:abi', manifest),
@@ -358,7 +377,30 @@ function buildGuestWasm() {
   ]);
 }
 
+// Exercise thousands of exchanges without waiting for browser animation frames.
+async function verifyRequestArena(bytes) {
+  let exchanged = 0;
+  const frames = 4096;
+  const { instance } = await WebAssembly.instantiate(bytes, {
+    'blot:host/1': {
+      call_array_f32_array_f32() {
+        const memory = instance.exports['blot:memory'].buffer;
+        const pointer = instance.exports['blot:allocate'](256);
+        const request = new Float32Array(memory, pointer + 4, 63);
+        new DataView(memory).setUint32(pointer, request.length, true);
+        request.fill(0);
+        request[1] = exchanged++ < frames ? 2 : 0;
+        return pointer;
+      },
+    },
+  });
+  instance.exports.main(null);
+  assert.equal(exchanged, frames + 1);
+  assert.equal(instance.exports['blot:memory'].buffer.byteLength, 128 * 1024);
+}
+
 const guestBytes = buildGuestWasm();
+await verifyRequestArena(guestBytes);
 const hostFiles = Object.fromEntries(
   ['pen_web.js', 'pen_web_bg.wasm', 'guest.js', 'structured.js', 'kernels.js', 'kernel_worker.js']
     .map(name => [`/${name}`, join(hostDir, name)]),
@@ -372,10 +414,13 @@ try {
   const page = await context.newPage();
   const consoleErrors = [];
   const pageErrors = [];
+  const localeWarnings = [];
   page.on('console', msg => {
     if (msg.type() === 'error') {
       consoleErrors.push(msg.text());
       console.error('[browser console.error]', msg.text());
+    } else if (msg.type() === 'warning' && msg.text().includes("the game's string tables")) {
+      localeWarnings.push(msg.text());
     } else if (process.env.PEN_WEB_VERBOSE) {
       console.log(`[browser ${msg.type()}]`, msg.text());
     }
@@ -385,14 +430,31 @@ try {
     console.error('[browser pageerror]', String(err));
   });
 
-  await page.route('**/catalog.json', route => route.fulfill({ json: { meshes: [], materials: [], sounds: [] } }));
+  await page.route('**/catalog.json', route => route.fulfill({ json: { meshes: [], materials: [], sounds: ['chime.wav'] } }));
   await page.route('**/game.json', route => route.fulfill({ json: { name: 'render-expansion', title: 'Render Expansion Check' } }));
   await page.route('**/game.wasm', route => route.fulfill({ body: Buffer.from(guestBytes), contentType: 'application/wasm' }));
   await page.route('**/assets/saved.json', route => route.fulfill({ json: { format: 'opaque' } }));
-  await page.route('**/assets/captions.json', route => route.fulfill({ json: {} }));
+  await page.route('**/assets/captions.json', route => route.fulfill({
+    json: { 'chime.wav': { text: 'Chime', seconds: 120 } },
+  }));
+  await page.route('**/assets/chime.wav', route => route.fulfill({
+    body: Buffer.from('524946462600000057415645666d74201000000001000100401f0000401f00000100080064617461020000008080', 'hex'),
+    contentType: 'audio/wav',
+  }));
   await page.route('**/text.json', route => route.fulfill({ json: { greeting: 'Hello' } }));
-  await page.route('**/locales/index.json', route => route.fulfill({ json: ['ar'] }));
-  await page.route('**/locales/ar.json', route => route.fulfill({ json: { greeting: 'مرحبا' } }));
+  let revision = 1;
+  let expectRevisionPoll;
+  const revisionPolled = new Promise(resolve => { expectRevisionPoll = resolve; });
+  let arabicAvailable = true;
+  await page.route('**/__pen/revision', route => {
+    return route.fulfill({ body: String(revision) }).then(expectRevisionPoll);
+  });
+  await page.route('**/locales/index.json', route => route.fulfill({ json: ['ar', 'sv', 'de'] }));
+  await page.route('**/locales/ar.json', route => arabicAvailable
+    ? route.fulfill({ json: { greeting: 'مرحبا' } })
+    : route.fulfill({ status: 404 }));
+  await page.route('**/locales/sv.json', route => route.fulfill({ body: '{' }));
+  await page.route('**/locales/de.json', route => route.fulfill({ status: 404 }));
   await page.route('**/test.html*', route => route.fulfill({
     contentType: 'text/html; charset=utf-8',
     headers: { 'Cross-Origin-Opener-Policy': 'same-origin', 'Cross-Origin-Embedder-Policy': 'require-corp' },
@@ -407,7 +469,8 @@ try {
           await init();
           window.__platformResult = await qualify_platform();
           const canvas = document.querySelector('canvas');
-          await start(canvas, { qualify: true });
+          window.__startGame = options => start(canvas, { qualify: true, ...options });
+          await window.__startGame();
           window.__started = 'ready';
         } catch (err) {
           window.__started = 'ERR:' + String(err);
@@ -416,7 +479,7 @@ try {
       </script>`,
   }));
 
-  // Load with ?lang=ar to exercise Arabic RTL locale loading + Accessibility::set_rtl(true)
+  // Load with ?lang=ar to exercise Arabic locale selection and direction
   await page.goto(`${server.url}test.html?lang=ar`);
   await page.waitForFunction(() => Boolean(window.__started), null, { timeout: 30000 });
   const statusText = await page.evaluate(() => window.__started);
@@ -435,7 +498,13 @@ try {
   assert.match(platformMsg, /WebAudio graph passed/, `unexpected platform result: ${platformMsg}`);
 
   // 2) Verify LocaleService RTL (`dir="rtl"` on accessibility root + guest received RTL answer!)
-  const a11yDir = await page.locator('[aria-label="Game interface"]').getAttribute('dir');
+  const a11y = page.locator('[aria-label="Game interface"]');
+  const a11yDir = await a11y.getAttribute('dir');
+  assert.equal(await a11y.getAttribute('lang'), 'ar');
+  assert.equal(await page.locator('[aria-label="Captions"]').textContent(), 'Chime');
+  for (const path of ['locales/sv.json', 'locales/de.json']) {
+    assert.ok(localeWarnings.some(warning => warning.includes(path)), localeWarnings.join('\n'));
+  }
   assert.equal(a11yDir, 'rtl', 'Arabic locale must set dir="rtl" on browser accessibility root');
   await page.waitForFunction(
     () => document.querySelector('[role="button"][aria-label="Play"]')?.getAttribute('aria-expanded') === 'true',
@@ -449,14 +518,8 @@ try {
   const option = listbox.locator('[role="option"][aria-label="Hard"]');
   assert.equal(await option.getAttribute('aria-selected'), 'true');
 
-  const button = page.locator('[role="button"][aria-label="Play"]');
-  assert.equal(await button.getAttribute('aria-checked'), 'false');
-  await button.evaluate(el => el.click());
-  await page.waitForFunction(
-    () => document.querySelector('[role="button"][aria-label="Play"]')?.getAttribute('aria-checked') === 'true',
-    null,
-    { timeout: 15000 },
-  );
+  assert.equal(await page.locator('[aria-label="News"]').getAttribute('role'), 'list');
+  assert.equal(await page.locator('[aria-label="Orphan"]').getAttribute('role'), 'listitem');
 
   const slider = page.locator('[role="slider"][aria-label="Volume"]');
   assert.equal(await slider.getAttribute('aria-valuenow'), '50');
@@ -466,6 +529,37 @@ try {
     null,
     { timeout: 15000 },
   );
+
+  const button = page.locator('[role="button"][aria-label="Play"]');
+  assert.equal(await button.getAttribute('aria-checked'), 'false');
+  await button.evaluate(el => {
+    el.focus();
+    el.click();
+  });
+  await page.waitForFunction(
+    () => document.querySelector('[role="button"][aria-label="Play"]')?.getAttribute('aria-checked') === 'true',
+    null,
+    { timeout: 15000 },
+  );
+
+  const dialog = page.locator('[role="dialog"][aria-label="Confirm"]');
+  await dialog.waitFor({ state: 'attached' });
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('aria-label')), 'Exit');
+  assert.equal(await dialog.getAttribute('aria-modal'), 'true');
+  assert.equal(await button.getAttribute('inert'), '');
+  const unavailable = dialog.locator('[aria-label="Unavailable"]');
+  assert.equal(await unavailable.getAttribute('aria-disabled'), 'true');
+  await unavailable.evaluate(el => el.click());
+  const blockedAt = await slider.evaluate(el => {
+    el.focus();
+    el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+    return Number(document.querySelector('canvas').dataset.frame);
+  });
+  await page.waitForFunction(frame => Number(document.querySelector('canvas').dataset.frame) > frame + 2, blockedAt);
+  assert.equal(await slider.getAttribute('aria-valuenow'), '60');
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('aria-label')), 'Exit');
+  assert.ok(await page.evaluate(() => !JSON.parse(document.querySelector('canvas').dataset.events)
+    .some(([tag, , id]) => tag === 12 && id === 9)));
 
   // 4) Verify REAL WebGPU rendered canvas pixels for 65006 (lines), 65008 (SDF UI), and 65009 (2D World + RC2D GI)!
   //    Wait 2 extra frames so the swapchain presents the latest state cleanly, then sample the PNG screenshot.
@@ -505,6 +599,31 @@ try {
     pixels.sdfBlueCard[2] > 70 && pixels.sdfBlueCard[0] < 40 && pixels.sdfBlueCard[2] > pixels.sdfBlueCard[0] * 4,
     `RENDER2D_EXT_TAG (65008) blue SDF UI card missing in WebGPU canvas: ${JSON.stringify(pixels)}`,
   );
+
+  // Shutdown removes both DOM regions even if a caller retains an old control.
+  await dialog.locator('[aria-label="Exit"]').evaluate(el => {
+    window.__oldExit = el;
+    el.click();
+  });
+  await a11y.waitFor({ state: 'detached' });
+  assert.equal(await page.locator('[aria-label="Captions"]').count(), 0);
+  await page.evaluate(() => window.__startGame({ development: true }));
+  await page.locator('#pen-ui-1').waitFor({ state: 'attached' });
+  assert.ok(await page.evaluate(() => {
+    let bubbled = false;
+    window.__oldExit.parentElement.addEventListener('click', () => { bubbled = true; }, { once: true });
+    window.__oldExit.click();
+    return bubbled;
+  }));
+  assert.equal(await page.locator('#pen-ui-1').count(), 1);
+  assert.equal(await a11y.count(), 1);
+
+  // A new revision resolves the remaining base locale when Arabic is missing.
+  await revisionPolled;
+  arabicAvailable = false;
+  revision += 1;
+  await page.waitForFunction(() => document.querySelector('[aria-label="Game interface"]')?.lang === 'en');
+  assert.equal(await a11y.getAttribute('dir'), 'ltr');
 
   const unexpectedConsoleErrors = consoleErrors.filter(
     msg => !msg.includes('Failed to load resource: the server responded with a status of 404'),

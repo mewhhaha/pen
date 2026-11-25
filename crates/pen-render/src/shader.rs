@@ -49,6 +49,10 @@ impl PipelineContext {
         if self.depth_mode.load(Ordering::Acquire) == 1 { DepthMode::ReversedZ } else { DepthMode::ForwardZ }
     }
 
+    pub fn with_depth_mode(&self, mode: DepthMode) -> Self {
+        Self { depth_mode: Arc::new(AtomicU8::new(u8::from(mode == DepthMode::ReversedZ))), ..self.clone() }
+    }
+
     pub fn set_depth_mode(&self, mode: DepthMode) {
         self.depth_mode.store(u8::from(mode == DepthMode::ReversedZ), Ordering::Release);
     }
@@ -100,7 +104,7 @@ pub(crate) fn settled(check: &mut Check) -> Option<Result<(), String>> {
 
 /// A WGSL module, or the compiler's errors.
 pub(crate) async fn compile_shader(device: &wgpu::Device, bytes: &[u8]) -> Result<(wgpu::ShaderModule, String)> {
-    let code = std::str::from_utf8(bytes)?.to_owned();
+    let code = crate::lights::shader_for_device(device, std::str::from_utf8(bytes)?.to_owned());
     let module = checked(device, || {
         device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
@@ -541,11 +545,7 @@ pub(crate) fn pipelines(
     let near_eq = depth_mode.compare_nearer_or_equal();
     let far = depth_mode.compare_farther();
     Pipelines {
-        persistent: if persistent {
-            make(Variants::PERSISTENT, true, near, None, Stage::Persistent)
-        } else {
-            None
-        },
+        persistent: if persistent { make(Variants::PERSISTENT, true, near, None, Stage::Persistent) } else { None },
         inset_persistent: if persistent {
             make(Variants::INSET_PERSISTENT, true, CompareFunction::Less, None, Stage::Persistent)
         } else {
@@ -578,16 +578,8 @@ pub(crate) fn pipelines(
             Stage::Plain,
         ),
         visible: make(Variants::VISIBLE, true, near_eq, None, Stage::Plain),
-        instanced: if instancing {
-            make(Variants::INSTANCED, true, near, None, Stage::Instanced)
-        } else {
-            None
-        },
-        skinned: if skinning {
-            make(Variants::SKINNED, true, near, None, Stage::Skinned)
-        } else {
-            None
-        },
+        instanced: if instancing { make(Variants::INSTANCED, true, near, None, Stage::Instanced) } else { None },
+        skinned: if skinning { make(Variants::SKINNED, true, near, None, Stage::Skinned) } else { None },
         skinned_translucent: if skinning {
             make(
                 Variants::SKINNED_TRANSLUCENT,

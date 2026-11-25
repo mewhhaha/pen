@@ -111,6 +111,23 @@ impl Scene {
                 motion.draw += inserted;
             }
         }
+        for extension in frame.extensions.iter_mut().filter(|ext| ext.tag == 65_007) {
+            let values = &mut extension.values;
+            if values.len() < 3 || !(1.0..=256.0).contains(&values[0]) {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "bounded style count")]
+            let targets_start = 3 + values[0].round() as usize * 11;
+            let Some(targets) = values.get_mut(targets_start..) else { continue };
+            for pair in targets.as_chunks_mut::<2>().0 {
+                let draw = pair[0].round();
+                if !draw.is_finite() || pair[0] < 0.0 || draw >= frame.draws.len() as f32 {
+                    pair[0] = -1.0;
+                } else if draw >= after as f32 {
+                    pair[0] = draw + inserted as f32;
+                }
+            }
+        }
         for (draw, previous) in moved_retained {
             if frame.motions.len() < MAX_MOTIONS {
                 frame.motions.push(Motion { draw, previous });
@@ -131,7 +148,7 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pen_protocol::{Instance, InstanceRemoval, Pose};
+    use pen_protocol::{Extension, Instance, InstanceRemoval, Pose};
     fn frame(reset: bool, updates: &[(u32, u32, u32)]) -> RenderFrame {
         RenderFrame {
             retained_enabled: true,
@@ -162,9 +179,14 @@ mod tests {
         delta.retained_after = 1;
         delta.poses.push(Pose { draw: 1, ..Default::default() });
         delta.motions.push(Motion { draw: 1, previous: [2.0; 16] });
+        let mut outline = vec![0.0; 14];
+        outline[0] = 1.0;
+        outline.extend([0.0, 0.0, 1.0, 0.0, 2.0, 0.0]);
+        delta.extensions.push(Extension { tag: 65_007, values: outline });
         let scene = scene.resolve(&mut delta).unwrap();
         assert_eq!(delta.draws.iter().map(|d| d.mesh).collect::<Vec<_>>(), [4, 2, 3, 5]);
         assert_eq!(delta.poses[0].draw, 3);
+        assert_eq!(&delta.extensions[0].values[14..], &[0.0, 0.0, 3.0, 0.0, -1.0, 0.0]);
         assert_eq!(delta.motions.len(), 2);
         assert_eq!(delta.motions[0], Motion { draw: 3, previous: [2.0; 16] });
         assert_eq!(delta.motions[1].draw, 2);

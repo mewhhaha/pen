@@ -216,6 +216,7 @@ impl State {
     /// mesh draws, then one draw per batch and per solid batch in world
     /// space, then the insets' draws. The scene is `height` pixels high.
     /// Counts what culling here left out.
+    #[allow(clippy::too_many_arguments, reason = "frame batching inputs")]
     pub(super) fn batch(
         &mut self,
         frame: &RenderFrame,
@@ -224,6 +225,7 @@ impl State {
         height: f32,
         scratch: &mut Scratch,
         stats: &mut RenderStats,
+        outline_scenes: &super::wired_passes::OutlineScenes,
     ) -> Result<()> {
         let capture = self.capture.as_ref().map(|step| {
             let at = &step.probe.position;
@@ -235,12 +237,14 @@ impl State {
         scratch.group_poses(frame);
         scratch.group_morphs(frame);
         scratch.group_motions(frame);
-        let mut last_key = (u32::MAX, u32::MAX);
-        let mut last_choice = u32::MAX;
+        let mut last = ((u32::MAX, u32::MAX), u32::MAX);
         for (index, draw) in frame.draws.iter().enumerate() {
             // A posed, morphed, or explicitly moving draw has per-draw matrices/deformations: drawn alone.
-            let alone = scratch.posed(index) || scratch.morphed(index) || scratch.has_motion(index);
-            let placement = self.place_cached(draw, catalog, samples, scratch, alone, &mut last_key, &mut last_choice)?;
+            let alone = scratch.posed(index)
+                || scratch.morphed(index)
+                || scratch.has_motion(index)
+                || super::wired_passes::outlined(outline_scenes, index);
+            let placement = self.place_cached(draw, catalog, samples, scratch, alone, &mut last)?;
             scratch.placements.push(placement);
         }
         // Batches of many instances cull on the GPU: their instances go first
@@ -257,9 +261,9 @@ impl State {
                 scratch.gpu_order.push(i);
             }
         }
-        scratch.gpu_order.sort_by(|&a, &b| {
-            scratch.batches[b].count.cmp(&scratch.batches[a].count).then_with(|| a.cmp(&b))
-        });
+        scratch
+            .gpu_order
+            .sort_by(|&a, &b| scratch.batches[b].count.cmp(&scratch.batches[a].count).then_with(|| a.cmp(&b)));
         for i in 0..scratch.gpu_order.len() {
             let index = scratch.gpu_order[i];
             let batch = &mut scratch.batches[index];
@@ -317,10 +321,8 @@ impl State {
         // actor counts do not shift static instances in the upload diff.
         for single in [true, false] {
             for view in 0..scratch.views.count() {
-                for batch in scratch
-                    .batches
-                    .iter_mut()
-                    .filter(|batch| batch.gpu.is_none() && (batch.count == 1) == single)
+                for batch in
+                    scratch.batches.iter_mut().filter(|batch| batch.gpu.is_none() && (batch.count == 1) == single)
                 {
                     for range in &mut batch.ranges[view] {
                         let count = range.1;
@@ -480,12 +482,11 @@ impl State {
         samples: u32,
         scratch: &mut Scratch,
         alone: bool,
-        last_key: &mut (u32, u32),
-        last_choice: &mut u32,
+        last: &mut ((u32, u32), u32),
     ) -> Result<Placement> {
         let key = (draw.mesh, draw.material);
-        let choice = if key == *last_key {
-            *last_choice
+        let choice = if key == last.0 {
+            last.1
         } else {
             let c = match scratch.chosen.get(&key) {
                 Some(&choice) => choice,
@@ -497,8 +498,7 @@ impl State {
                     index
                 }
             };
-            *last_key = key;
-            *last_choice = c;
+            *last = (key, c);
             c
         };
         let placement = Placement { batch: ALONE, choice, parameters: [0.0; 4], views: 0, lod: 0 };
@@ -629,12 +629,7 @@ impl State {
                     surface_vecs: m.surface.vectors(),
                     uv_maps: m.uv_transform.vectors(orm_setting, emissive_setting),
                     color: m.color.map(narrow),
-                    settings: [
-                        if m.lit { 1.0 } else { 0.0 },
-                        narrow(m.alpha_cutoff),
-                        normal_setting,
-                        outline_setting,
-                    ],
+                    settings: [if m.lit { 1.0 } else { 0.0 }, narrow(m.alpha_cutoff), normal_setting, outline_setting],
                     default_params: m.instance_parameters.map(|values| values.map(narrow)).unwrap_or([0.0; 4]),
                     maps_tail: [
                         tile_mask as f32,

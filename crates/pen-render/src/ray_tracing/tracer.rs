@@ -363,6 +363,10 @@ pub struct TlasRayTracer {
 }
 
 impl TlasRayTracer {
+    pub(crate) fn supported(device: &wgpu::Device) -> bool {
+        device.limits().max_storage_buffers_per_shader_stage >= 8
+    }
+
     pub fn new(device: &wgpu::Device) -> Self {
         let storage_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,

@@ -44,7 +44,7 @@ struct VsOut {
   }
   let ref_axis = select(vec3f(0.0, 1.0, 0.0), vec3f(1.0, 0.0, 0.0), abs(up.y) > 0.9);
   let r0 = normalize(cross(ref_axis, up));
-  let f0 = cross(up, r0);
+  let f0 = cross(r0, up);
   let c = cos(rot);
   let s = sin(rot);
   let right = r0 * c + f0 * s;

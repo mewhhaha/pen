@@ -154,29 +154,31 @@ impl fmt::Display for ActionError {
 
 impl std::error::Error for ActionError {}
 
-struct NodeInfo {
-    parent: Option<usize>,
-    in_tree: bool,
-    disabled: bool,
-    blocked: bool,
-    effective_role: &'static str,
+/// Effective accessibility state for a node in frame order.
+pub struct NodeInfo {
+    pub parent: Option<usize>,
+    pub in_tree: bool,
+    pub disabled: bool,
+    pub blocked: bool,
+    pub effective_role: &'static str,
 }
 
-struct Tree {
+impl NodeInfo {
+    /// Whether the node is visible and belongs to the active modal scope.
+    pub fn exposed(&self) -> bool {
+        self.in_tree && !self.blocked
+    }
+}
+
+/// Visibility, modal scope and action eligibility shared by the host projections.
+pub struct AccessibilityTree<'a> {
+    ui: &'a [UiNode],
     nodes: Vec<NodeInfo>,
     indices: HashMap<u32, usize>,
     modal: Option<usize>,
 }
 
-/// A borrowed accessibility frame. Queries return owned snapshots in frame order.
-#[derive(Clone)]
-pub struct RoleScreen<'a> {
-    ui: &'a [UiNode],
-    tree: Arc<Tree>,
-    scope: Option<Arc<[bool]>>,
-}
-
-impl<'a> RoleScreen<'a> {
+impl<'a> AccessibilityTree<'a> {
     pub fn new(ui: &'a [UiNode]) -> Self {
         let mut nodes: Vec<NodeInfo> = Vec::with_capacity(ui.len());
         let mut indices = HashMap::with_capacity(ui.len());
@@ -187,26 +189,78 @@ impl<'a> RoleScreen<'a> {
             let first = *indices.entry(node.id).or_insert(index) == index;
             let in_tree = first && !node.hidden && parent.is_none_or(|parent| nodes[parent].in_tree);
             let disabled = node.disabled || parent.is_some_and(|parent| nodes[parent].disabled);
-            let effective_role = if node.role == ui_role::LISTITEM && node.focusable {
-                if let Some(parent) = parent.filter(|&parent| ui[parent].role == ui_role::LIST) {
-                    nodes[parent].effective_role = "listbox";
-                }
-                "option"
-            } else {
-                role_name(node.role)
-            };
-            if in_tree && !disabled && node.role == ui_role::DIALOG && node.modal {
+            if in_tree && node.role == ui_role::DIALOG && node.modal {
                 modal = Some(index);
             }
-            nodes.push(NodeInfo { parent, in_tree, disabled, blocked: false, effective_role });
+            nodes.push(NodeInfo { parent, in_tree, disabled, blocked: false, effective_role: role_name(node.role) });
         }
-        // The last eligible modal in frame order wins, including any nested modal.
+        // The last visible modal in frame order wins, including any nested modal.
         if let Some(modal) = modal {
             for index in 0..nodes.len() {
                 nodes[index].blocked = index != modal && nodes[index].parent.is_none_or(|parent| nodes[parent].blocked);
             }
         }
-        Self { ui, tree: Arc::new(Tree { nodes, indices, modal }), scope: None }
+        for (index, node) in ui.iter().enumerate() {
+            if nodes[index].exposed()
+                && node.role == ui_role::LISTITEM
+                && node.focusable
+                && let Some(parent) = nodes[index].parent
+                && nodes[parent].exposed()
+                && ui[parent].role == ui_role::LIST
+            {
+                nodes[parent].effective_role = "listbox";
+                nodes[index].effective_role = "option";
+            }
+        }
+        Self { ui, nodes, indices, modal }
+    }
+
+    pub fn nodes(&self) -> &[NodeInfo] {
+        &self.nodes
+    }
+
+    /// The active modal's frame index.
+    pub fn active_modal(&self) -> Option<usize> {
+        self.modal
+    }
+
+    pub fn allows_action(&self, id: u32, action: u32) -> bool {
+        self.check_action(id, action).is_ok()
+    }
+
+    fn check_action(&self, id: u32, action: u32) -> Result<(), ActionError> {
+        let &index = self.indices.get(&id).ok_or(ActionError::NotFound { id })?;
+        let info = &self.nodes[index];
+        let node = &self.ui[index];
+        if !info.in_tree {
+            return Err(ActionError::Hidden { id });
+        }
+        if info.disabled {
+            return Err(ActionError::Disabled { id });
+        }
+        if info.blocked {
+            return Err(ActionError::BlockedByModal { id });
+        }
+        let listed = 1u32.checked_shl(action).is_some_and(|bit| node.actions & bit != 0);
+        if listed || (node.focusable && matches!(action, ui_action::FOCUS | ui_action::BLUR)) {
+            Ok(())
+        } else {
+            Err(ActionError::Unsupported { id, action })
+        }
+    }
+}
+
+/// A borrowed accessibility frame. Queries return owned snapshots in frame order.
+#[derive(Clone)]
+pub struct RoleScreen<'a> {
+    ui: &'a [UiNode],
+    tree: Arc<AccessibilityTree<'a>>,
+    scope: Option<Arc<[bool]>>,
+}
+
+impl<'a> RoleScreen<'a> {
+    pub fn new(ui: &'a [UiNode]) -> Self {
+        Self { ui, tree: Arc::new(AccessibilityTree::new(ui)), scope: None }
     }
 
     fn in_scope(&self, index: usize) -> bool {
@@ -283,9 +337,7 @@ impl<'a> RoleScreen<'a> {
 
     fn searchable(&self, index: usize, include_hidden: bool) -> bool {
         let info = &self.tree.nodes[index];
-        self.in_scope(index)
-            && self.tree.indices[&self.ui[index].id] == index
-            && (include_hidden || (info.in_tree && !info.blocked))
+        self.in_scope(index) && self.tree.indices[&self.ui[index].id] == index && (include_hidden || info.exposed())
     }
 
     fn indices(&self, include_hidden: bool) -> impl Iterator<Item = usize> + '_ {
@@ -408,25 +460,10 @@ impl<'a> RoleScreen<'a> {
 
     fn action(&self, node: &RoleNode, action: u32, value: f32) -> Result<GameEvent, ActionError> {
         let id = node.id;
-        let Some(&index) = self.tree.indices.get(&id).filter(|&&index| self.in_scope(index)) else {
+        if !self.tree.indices.get(&id).is_some_and(|&index| self.in_scope(index)) {
             return Err(ActionError::NotFound { id });
-        };
-        let info = &self.tree.nodes[index];
-        let current = &self.ui[index];
-        if !info.in_tree {
-            return Err(ActionError::Hidden { id });
         }
-        if info.disabled {
-            return Err(ActionError::Disabled { id });
-        }
-        if info.blocked {
-            return Err(ActionError::BlockedByModal { id });
-        }
-        if current.actions & (1 << action) == 0
-            && !(current.focusable && matches!(action, ui_action::FOCUS | ui_action::BLUR))
-        {
-            return Err(ActionError::Unsupported { id, action });
-        }
+        self.tree.check_action(id, action)?;
         if !value.is_finite() {
             return Err(ActionError::NonFiniteValue { id });
         }
@@ -779,6 +816,52 @@ mod tests {
     }
 
     #[test]
+    fn promotes_only_exposed_focusable_children_of_lists() {
+        let item = |id, parent, name| UiNode { focusable: true, ..node(id, parent, ui_role::LISTITEM, name) };
+        let ui = [
+            node(1, 0, ui_role::LIST, "List"),
+            UiNode { hidden: true, ..item(2, 1, "Hidden") },
+            item(3, 0, "Orphan"),
+            node(4, 0, ui_role::GROUP, "Group"),
+            item(5, 4, "Under group"),
+        ];
+        let screen = RoleScreen::new(&ui);
+        assert_eq!(screen.get_by_role("list").unwrap().effective_role, "list");
+        assert!(screen.by_role("option").include_hidden(true).query_all().is_empty());
+        for name in ["Orphan", "Under group"] {
+            assert_eq!(screen.get_by_label_text(name).unwrap().effective_role, "listitem");
+        }
+    }
+
+    #[test]
+    fn shared_action_eligibility_checks_ancestors_and_modal_scope() {
+        let button = |id, parent| UiNode {
+            focusable: true,
+            actions: 1 << ui_action::ACTIVATE,
+            ..node(id, parent, ui_role::BUTTON, "Button")
+        };
+        let ui = [
+            button(1, 0),
+            UiNode { modal: true, ..node(2, 0, ui_role::DIALOG, "Modal") },
+            UiNode { hidden: true, ..node(3, 2, ui_role::GROUP, "Hidden") },
+            button(4, 3),
+            UiNode { disabled: true, ..node(5, 2, ui_role::GROUP, "Disabled") },
+            button(6, 5),
+            button(7, 2),
+        ];
+        let tree = AccessibilityTree::new(&ui);
+        assert_eq!(tree.active_modal(), Some(1));
+        for action in [ui_action::ACTIVATE, ui_action::FOCUS, ui_action::BLUR] {
+            for id in [1, 4, 6] {
+                assert!(!tree.allows_action(id, action), "node {id}, action {action}");
+            }
+            assert!(tree.allows_action(7, action));
+        }
+        assert!(!tree.allows_action(7, ui_action::INCREMENT));
+        assert!(!tree.allows_action(7, u32::MAX));
+    }
+
+    #[test]
     fn filters_states_and_decoded_text_and_exposes_the_owned_snapshot() {
         let mut mixed = node(4, 1, ui_role::CHECKBOX, "Some");
         mixed.description_length = 4;
@@ -824,7 +907,7 @@ mod tests {
     }
 
     #[test]
-    fn traps_queries_and_actions_inside_the_topmost_eligible_dialog() {
+    fn traps_queries_and_actions_inside_the_topmost_visible_dialog() {
         let modal = |id, parent, name| UiNode { modal: true, ..node(id, parent, ui_role::DIALOG, name) };
         let button =
             |id, parent, name| UiNode { actions: 1 << ui_action::ACTIVATE, ..node(id, parent, ui_role::BUTTON, name) };
@@ -834,7 +917,6 @@ mod tests {
             button(3, 2, "Back"),
             modal(4, 2, "Confirm"),
             button(5, 4, "Continue"),
-            UiNode { disabled: true, ..modal(6, 0, "Disabled") },
             UiNode { hidden: true, ..modal(7, 0, "Hidden") },
         ];
         let previous = RoleScreen::new(&ui[..1]).get_by_role("button").unwrap();
@@ -852,6 +934,12 @@ mod tests {
         assert!(!screen.debug_tree().contains("Outside"));
         let error = screen.by_role("tab").include_hidden(true).get().unwrap_err().to_string();
         assert!(error.contains("[blocked by modal]") && error.contains("[hidden]"));
+
+        let mut ui = ui.to_vec();
+        ui.push(UiNode { disabled: true, ..modal(6, 0, "Disabled") });
+        let screen = RoleScreen::new(&ui);
+        assert_eq!(screen.get_by_role("dialog").unwrap().id, 6);
+        assert!(screen.query_all_by_role("button").is_empty());
     }
 
     #[test]

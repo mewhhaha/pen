@@ -119,6 +119,7 @@ struct CachedRc2d {
 #[derive(Default)]
 pub(in crate::renderer) struct Render2dWiredState {
     pub scene: Option<Scene2d>,
+    pub devtools_sdf_overlay: Vec<SdfShape>,
     sprites_passes: HashMap<wgpu::TextureFormat, Sprites2dPass>,
     tilemap_passes: HashMap<wgpu::TextureFormat, TilemapPass>,
     sdf_passes: HashMap<wgpu::TextureFormat, SdfShapePass>,
@@ -177,11 +178,13 @@ fn hash_emitters(emitters: &[Scene2dEmitter]) -> u64 {
 }
 
 fn decode_ext_sdf_shapes(frame: &RenderFrame, base: &mut Vec<SdfShape>, overlay: &mut Vec<SdfShape>) {
+    const SHAPE_BUDGET: usize = 65_536;
     for ext in &frame.extensions {
         if ext.tag != RENDER2D_EXT_TAG || ext.values.len() < 36 {
             continue;
         }
-        let count = ext.values.len() / 36;
+        let remaining = SHAPE_BUDGET - (base.len() + overlay.len());
+        let count = (ext.values.len() / 36).min(remaining);
         for i in 0..count {
             let v = &ext.values[i * 36..(i + 1) * 36];
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -248,6 +251,50 @@ fn resolve_2d_material_view(
     }
 }
 
+#[derive(Debug)]
+struct World2dPayload<'a> {
+    values: &'a [f32],
+    rc_flags: u32,
+    tilemaps: Vec<&'a [f32]>,
+    sprites: &'a [f32],
+    emitters: &'a [f32],
+}
+
+fn world_2d_payload(frame: &RenderFrame) -> Option<World2dPayload<'_>> {
+    let values = &frame.extensions.iter().rev().find(|ext| ext.tag == RENDER2D_WORLD_EXT_TAG)?.values;
+    let header = values.get(..8)?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "validated wire counts")]
+    let count = |index: usize, max: f32| {
+        let value = header[index];
+        ((0.0..=max).contains(&value) && value.fract() == 0.0).then_some(value as usize)
+    };
+    let tilemaps_count = count(4, 64.0)?;
+    let sprites_count = count(5, 65_536.0)?;
+    let emitters_count = count(6, 4096.0)?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "bounded extension flags")]
+    let rc_flags = header[7].round().clamp(0.0, 255.0) as u32;
+    let header_size = if rc_flags & 3 == 0 { 8 } else { 14 };
+    let records = values.get(header_size..)?;
+    let (tiles, tail) =
+        records.split_at_checked(records.len().checked_sub(sprites_count * 25 + emitters_count * 9)?)?;
+    let (sprites, emitters) = tail.split_at(sprites_count * 25);
+    let mut rest = tiles;
+    let mut tilemaps = Vec::with_capacity(tilemaps_count);
+    for _ in 0..tilemaps_count {
+        let tile = rest.get(..15)?;
+        let cell_count = (tile_grid_dim(tile[5]) * tile_grid_dim(tile[6])) as usize;
+        let (record, remaining) = rest.split_at_checked(15 + cell_count)?;
+        tilemaps.push(record);
+        rest = remaining;
+    }
+    rest.is_empty().then_some(World2dPayload { values, rc_flags, tilemaps, sprites, emitters })
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped tilemap grid dimension")]
+fn tile_grid_dim(value: f32) -> u32 {
+    value.round().clamp(1.0, 1024.0) as u32
+}
+
 fn decode_ext_world_2d(
     device: &wgpu::Device,
     wired: &mut Render2dWiredState,
@@ -256,31 +303,21 @@ fn decode_ext_world_2d(
     assets: &crate::asset_store::AssetStore<GpuAsset>,
     white: &TextureAsset,
 ) -> Option<Scene2d> {
-    let ext = frame.extensions.iter().rev().find(|e| e.tag == RENDER2D_WORLD_EXT_TAG && e.values.len() >= 8)?;
-    let v = &ext.values;
-    let mut cursor = 8usize;
+    let payload = world_2d_payload(frame)?;
+    let v = payload.values;
+    let cursor = 8;
     let camera = Camera2d {
         center: [v[0], v[1]],
         zoom: if v[2] > 0.0 { v[2] } else { 1.0 },
         rotation: v[3],
         viewport: [0.0, 0.0],
     };
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "bounded extension header counts")]
-    let tilemap_count = v[4].round().clamp(0.0, 64.0) as usize;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "bounded extension header counts")]
-    let sprite_count = v[5].round().clamp(0.0, 65_536.0) as usize;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "bounded extension header counts")]
-    let emitter_count = v[6].round().clamp(0.0, 4096.0) as usize;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "bounded extension header flags")]
-    let rc_flags = v[7].round().clamp(0.0, 255.0) as u32;
+    let rc_flags = payload.rc_flags;
     let rc_mode = rc_flags & 3;
     let y_sort = (rc_flags & 4) != 0;
 
     let mut rc_layer: Option<RadianceCascades2dLayer> = None;
     if rc_mode != 0 {
-        if cursor + 6 > v.len() {
-            return None;
-        }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped RC2D config")]
         let c0_spacing = v[cursor].round().clamp(1.0, 64.0) as u32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped RC2D config")]
@@ -298,46 +335,34 @@ fn decode_ext_world_2d(
             composite_weights: [v[cursor + 3].max(0.0), v[cursor + 4].max(0.0), v[cursor + 5].max(0.0)],
             opaque_backdrop: rc_mode == 1,
         });
-        cursor += 6;
     }
 
-    let mut tilemaps = Vec::with_capacity(tilemap_count);
-    for _ in 0..tilemap_count {
-        if cursor + 15 > v.len() {
-            break;
-        }
-        let mat_idx = v[cursor];
-        let ox = v[cursor + 1];
-        let oy = v[cursor + 2];
-        let tw = v[cursor + 3].max(1e-3);
-        let th = v[cursor + 4].max(1e-3);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped tilemap grid dims")]
-        let gw = v[cursor + 5].round().clamp(1.0, 1024.0) as u32;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped tilemap grid dims")]
-        let gh = v[cursor + 6].round().clamp(1.0, 1024.0) as u32;
+    let mut tilemaps = Vec::with_capacity(payload.tilemaps.len());
+    for tile in payload.tilemaps {
+        let mat_idx = tile[0];
+        let ox = tile[1];
+        let oy = tile[2];
+        let tw = tile[3].max(1e-3);
+        let th = tile[4].max(1e-3);
+        let gw = tile_grid_dim(tile[5]);
+        let gh = tile_grid_dim(tile[6]);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped tilemap atlas dims")]
-        let acols = v[cursor + 7].round().clamp(1.0, 256.0) as u32;
+        let acols = tile[7].round().clamp(1.0, 256.0) as u32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped tilemap atlas dims")]
-        let arows = v[cursor + 8].round().clamp(1.0, 256.0) as u32;
-        let anim_time = v[cursor + 9];
-        let anim_fps = v[cursor + 10];
-        let tint = [v[cursor + 11], v[cursor + 12], v[cursor + 13], v[cursor + 14]];
-        cursor += 15;
-        let cell_count = (gw as usize).saturating_mul(gh as usize);
-        if cursor + cell_count > v.len() {
-            break;
-        }
-        let mut cells = Vec::with_capacity(cell_count);
+        let arows = tile[8].round().clamp(1.0, 256.0) as u32;
+        let anim_time = tile[9];
+        let anim_fps = tile[10];
+        let tint = [tile[11], tile[12], tile[13], tile[14]];
+        let mut cells = Vec::with_capacity(tile.len() - 15);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         gw.hash(&mut hasher);
         gh.hash(&mut hasher);
-        for &raw in &v[cursor..cursor + cell_count] {
+        for &raw in &tile[15..] {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "24-bit TileCell packed in f32")]
             let bits = raw.round().clamp(0.0, 16_777_215.0) as u32;
             bits.hash(&mut hasher);
             cells.push(TileCell(bits));
         }
-        cursor += cell_count;
         let key = hasher.finish();
         if wired.ext_tilemap_buffers.len() > 32 && !wired.ext_tilemap_buffers.contains_key(&key) {
             wired.ext_tilemap_buffers.clear();
@@ -362,23 +387,19 @@ fn decode_ext_world_2d(
     }
 
     // Read sprites, sort globally by painter's key when y_sort is on, then batch contiguous runs by material index.
-    let mut raw_sprites: Vec<(i32, Sprite2d)> = Vec::with_capacity(sprite_count);
-    for _ in 0..sprite_count {
-        if cursor + 25 > v.len() {
-            break;
-        }
+    let mut raw_sprites: Vec<(i32, Sprite2d)> = Vec::with_capacity(payload.sprites.len() / 25);
+    for v in payload.sprites.as_chunks::<25>().0 {
         #[allow(clippy::cast_possible_truncation, reason = "signed catalog material index")]
-        let mat_id = if v[cursor] < 0.0 { -1 } else { v[cursor].round().min(i32::MAX as f32) as i32 };
+        let mat_id = if !v[0].is_finite() || v[0] < 0.0 { -1 } else { v[0].round().min(i32::MAX as f32) as i32 };
         let sprite = Sprite2d {
-            pos: [v[cursor + 1], v[cursor + 2]],
-            size: [v[cursor + 3], v[cursor + 4]],
-            pivot_rot_layer: [v[cursor + 5], v[cursor + 6], v[cursor + 7], v[cursor + 8]],
-            uv_rect: [v[cursor + 9], v[cursor + 10], v[cursor + 11], v[cursor + 12]],
-            color: [v[cursor + 13], v[cursor + 14], v[cursor + 15], v[cursor + 16]],
-            nine_slice: [v[cursor + 17], v[cursor + 18], v[cursor + 19], v[cursor + 20]],
-            flags: [v[cursor + 21], v[cursor + 22], v[cursor + 23], v[cursor + 24]],
+            pos: [v[1], v[2]],
+            size: [v[3], v[4]],
+            pivot_rot_layer: [v[5], v[6], v[7], v[8]],
+            uv_rect: [v[9], v[10], v[11], v[12]],
+            color: [v[13], v[14], v[15], v[16]],
+            nine_slice: [v[17], v[18], v[19], v[20]],
+            flags: [v[21], v[22], v[23], v[24]],
         };
-        cursor += 25;
         raw_sprites.push((mat_id, sprite));
     }
     raw_sprites.sort_by(|a, b| {
@@ -404,26 +425,15 @@ fn decode_ext_world_2d(
         });
     }
 
-    let mut emitters = Vec::with_capacity(emitter_count);
-    for _ in 0..emitter_count {
-        if cursor + 9 > v.len() {
-            break;
-        }
-        let is_rect = v[cursor] > 0.5;
-        let material = [v[cursor + 5], v[cursor + 6], v[cursor + 7], v[cursor + 8]];
+    let mut emitters = Vec::with_capacity(payload.emitters.len() / 9);
+    for v in payload.emitters.as_chunks::<9>().0 {
+        let is_rect = v[0] > 0.5;
+        let material = [v[5], v[6], v[7], v[8]];
         if is_rect {
-            emitters.push(Scene2dEmitter::Rect {
-                rect: [v[cursor + 1], v[cursor + 2], v[cursor + 3], v[cursor + 4]],
-                material,
-            });
+            emitters.push(Scene2dEmitter::Rect { rect: [v[1], v[2], v[3], v[4]], material });
         } else {
-            emitters.push(Scene2dEmitter::Circle {
-                center: [v[cursor + 1], v[cursor + 2]],
-                radius: v[cursor + 3].max(0.0),
-                material,
-            });
+            emitters.push(Scene2dEmitter::Circle { center: [v[1], v[2]], radius: v[3].max(0.0), material });
         }
-        cursor += 9;
     }
     if let Some(rc) = rc_layer.as_mut() {
         rc.emitters = emitters;
@@ -522,7 +532,7 @@ impl Render2dWiredState {
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: target_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -555,6 +565,35 @@ impl Render2dWiredState {
 }
 
 impl State {
+    pub(in crate::renderer) fn load_2d_extension_atlases(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+    ) -> Result<()> {
+        if self.wired.render2d.scene.is_some() {
+            return Ok(());
+        }
+        let Some(payload) = world_2d_payload(frame) else { return Ok(()) };
+        let mut materials = std::collections::BTreeSet::new();
+        let tile_materials = payload.tilemaps.iter().map(|record| record[0]);
+        let sprite_materials = payload.sprites.as_chunks::<25>().0.iter().map(|record| record[0]);
+        for material in tile_materials.chain(sprite_materials) {
+            if material.is_finite() && material >= 0.0 {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "checked against catalog")]
+                let index = material.round() as u32;
+                if (index as usize) < catalog.materials.len() {
+                    materials.insert(index);
+                }
+            }
+        }
+        for index in materials {
+            if let Some(material) = self.material(catalog, index)? {
+                self.loaded_texture(&material.material.texture)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Encodes world-space 2D tilemaps, sprites2d, optional 2D Radiance Cascades GI, and base
     /// vector SDF UI shapes onto `output` BEFORE Pen's MSDF `frame.sprites`.
     #[allow(clippy::too_many_arguments)]
@@ -571,6 +610,9 @@ impl State {
         target_format: wgpu::TextureFormat,
         size: (u32, u32),
     ) -> Result<Vec<SdfShape>> {
+        if wired.split_child {
+            return Ok(Vec::new());
+        }
         let mut ext_base_sdf = Vec::new();
         let mut ext_overlay_sdf = Vec::new();
         decode_ext_sdf_shapes(frame, &mut ext_base_sdf, &mut ext_overlay_sdf);
@@ -741,7 +783,14 @@ impl State {
                 }
                 let rc = &wired.render2d.rc_state.as_ref().unwrap().pass;
                 rc.build(device, encoder, &rc_scene_view);
-                rc.composite(device, encoder, &albedo_view, &lit_view, rc_layer.composite_weights);
+                rc.composite_layer(
+                    device,
+                    encoder,
+                    &albedo_view,
+                    &lit_view,
+                    rc_layer.composite_weights,
+                    !rc_layer.opaque_backdrop,
+                );
                 if rc_layer.opaque_backdrop {
                     wired.blit(device, encoder, &lit_view, target_view, target_format);
                 } else {
@@ -799,26 +848,7 @@ impl State {
         all_base_sdf.extend_from_slice(&ext_base_sdf);
         all_overlay_sdf.extend_from_slice(&ext_overlay_sdf);
 
-        if !all_base_sdf.is_empty() {
-            let sdf_pass = wired
-                .render2d
-                .sdf_passes
-                .entry(target_format)
-                .or_insert_with(|| SdfShapePass::new(device, target_format));
-            if let Some(draw) = sdf_pass.prepare(device, viewport, &all_base_sdf) {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("render2d_sdf_ui"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                    })],
-                    ..Default::default()
-                });
-                draw.draw(&mut pass);
-            }
-        }
+        wired.render2d.draw_sdf_layers(device, encoder, viewport, target_view, target_format, [&all_base_sdf[..]]);
         Ok(all_overlay_sdf)
     }
 
@@ -832,24 +862,73 @@ impl State {
         target_format: wgpu::TextureFormat,
         size: (u32, u32),
     ) {
-        if shapes.is_empty() {
+        if wired.split_child {
             return;
         }
+        let devtools = std::mem::take(&mut wired.render2d.devtools_sdf_overlay);
         let viewport = [size.0.max(1) as f32, size.1.max(1) as f32];
-        let sdf_pass =
-            wired.render2d.sdf_passes.entry(target_format).or_insert_with(|| SdfShapePass::new(device, target_format));
-        if let Some(draw) = sdf_pass.prepare(device, viewport, shapes) {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("render2d_sdf_overlay"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                ..Default::default()
-            });
+        wired.render2d.draw_sdf_layers(device, encoder, viewport, target_view, target_format, [shapes, &devtools]);
+        wired.render2d.devtools_sdf_overlay = devtools;
+    }
+}
+
+impl Render2dWiredState {
+    fn draw_sdf_layers<'a>(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        viewport: [f32; 2],
+        target_view: &wgpu::TextureView,
+        target_format: wgpu::TextureFormat,
+        layers: impl IntoIterator<Item = &'a [SdfShape]>,
+    ) {
+        let limits = device.limits();
+        let bytes = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
+        let batch_size = usize::try_from(bytes / size_of::<SdfShape>() as u64).unwrap_or(usize::MAX);
+        if batch_size == 0 {
+            return;
+        }
+        let mut batches = layers.into_iter().flat_map(|shapes| shapes.chunks(batch_size)).peekable();
+        if batches.peek().is_none() {
+            return;
+        }
+        let sdf = self.sdf_passes.entry(target_format).or_insert_with(|| SdfShapePass::new(device, target_format));
+        let draws: Vec<_> = batches.filter_map(|shapes| sdf.prepare(device, viewport, shapes)).collect();
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("render2d_sdf"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+        for draw in &draws {
             draw.draw(&mut pass);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pen_protocol::Extension;
+
+    #[test]
+    fn world_payload_rejects_a_short_tilemap_even_with_a_complete_tail() {
+        let mut values = vec![0.0; 8 + 6 + 15];
+        values[4..8].copy_from_slice(&[1.0, 1.0, 1.0, 1.0]);
+        values[19..21].copy_from_slice(&[2.0, 2.0]);
+        values.extend([1.0; 4]);
+        values.extend([0.0; 25 + 9]);
+        let mut frame =
+            RenderFrame { extensions: vec![Extension { tag: RENDER2D_WORLD_EXT_TAG, values }], ..Default::default() };
+        let payload = world_2d_payload(&frame).unwrap();
+        assert_eq!(&payload.tilemaps[0][15..], &[1.0; 4]);
+        assert_eq!(payload.sprites.len(), 25);
+        assert_eq!(payload.emitters.len(), 9);
+        frame.extensions[0].values.remove(8 + 6 + 15);
+        assert!(world_2d_payload(&frame).is_none());
     }
 }

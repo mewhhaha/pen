@@ -39,6 +39,7 @@ pub(crate) enum Job {
         revision: u64,
         samples: u32,
         variants: Variants,
+        depth_mode: crate::camera_precision::DepthMode,
         module: wgpu::ShaderModule,
         instancing: bool,
         skinning: bool,
@@ -52,7 +53,7 @@ pub(crate) enum Job {
         module: wgpu::ShaderModule,
         stage: Stage,
     },
-    BuiltIn(BuiltIn),
+    BuiltIn(BuiltIn, crate::camera_precision::DepthMode),
     /// Compile the pipeline that culls instances on the GPU.
     Culling,
     /// Write the pipeline cache to its file.
@@ -408,9 +409,20 @@ impl Worker {
                     self.send(Message::Sorted { key, sprite });
                 }
             }
-            Job::Compile { slot, revision, samples, variants, module, instancing, skinning, persistent } => {
-                let depth_mode = self.context.depth_mode();
-                let result = self.compile(&module, instancing, skinning, persistent, samples, variants).await;
+            Job::Compile {
+                slot,
+                revision,
+                samples,
+                variants,
+                depth_mode,
+                module,
+                instancing,
+                skinning,
+                persistent,
+            } => {
+                let context = self.context.with_depth_mode(depth_mode);
+                let result =
+                    Self::compile(&context, &module, instancing, skinning, persistent, samples, variants).await;
                 self.send(Message::Compiled { slot, revision, samples, variants, depth_mode, result });
             }
             Job::Shadow { slot, revision, module, stage } => {
@@ -419,9 +431,9 @@ impl Worker {
                 log::debug!("shadow pipeline: slot {slot}, {stage:?}, {:.2} ms", clock.now() * 1000.0);
                 self.send(Message::Shadow { slot, revision, stage, result });
             }
-            Job::BuiltIn(which) => {
-                let depth_mode = self.context.depth_mode();
-                let result = shader::checked(device, || which.compile(&self.context)).await;
+            Job::BuiltIn(which, depth_mode) => {
+                let context = self.context.with_depth_mode(depth_mode);
+                let result = shader::checked(device, || which.compile(&context)).await;
                 self.send(Message::BuiltIn { which, depth_mode, result });
             }
             Job::Culling => {
@@ -433,7 +445,7 @@ impl Worker {
     }
 
     async fn compile(
-        &self,
+        context: &PipelineContext,
         module: &wgpu::ShaderModule,
         instancing: bool,
         skinning: bool,
@@ -442,8 +454,8 @@ impl Worker {
         variants: Variants,
     ) -> Result<Pipelines, String> {
         let clock = platform::Clock::new();
-        let result = shader::checked(&self.context.device, || {
-            shader::pipelines(&self.context, module, instancing, skinning, persistent, samples, variants)
+        let result = shader::checked(&context.device, || {
+            shader::pipelines(context, module, instancing, skinning, persistent, samples, variants)
         })
         .await;
         log::debug!("pipelines {variants:?} at {samples} samples: {:.2} ms", clock.now() * 1000.0);

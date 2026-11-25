@@ -29,7 +29,7 @@ fn sharc_query_ro(pos: vec3f, nrm: vec3f) -> vec4f {
     let mask = sharc_u.counts.x - 1u;
     for (var probe = 0u; probe < min(SHARC_PROBE_STEPS, sharc_u.counts.x); probe += 1u) {
         let slot = (key.home + probe) & mask;
-        if (sharc_keys[slot] == key.tag) {
+        if (sharc_keys[slot * 2u] == key.tag && sharc_keys[slot * 2u + 1u] == key.fingerprint) {
             return sharc_resolved[slot];
         }
     }
@@ -166,7 +166,7 @@ impl SharcCache {
                 mapped_at_creation: false,
             })
         };
-        let keys = storage("sharc keys", bucket_bytes / 4);
+        let keys = storage("sharc keys", bucket_bytes / 2);
         let accum = storage("sharc accumulation", bucket_bytes);
         let resolved = storage("sharc resolved radiance", bucket_bytes);
 
@@ -474,6 +474,16 @@ fn query(@builtin(global_invocation_id) id: vec3u) {
                 }
             }
         }
+    }
+
+    #[test]
+    fn gpu_sharc_rejects_a_collision_on_the_original_fingerprint() {
+        let gpu = Witness::new(SharcConfig { capacity: 1, ..Default::default() });
+        // Distinct cells with +X normals and the same original tag, 0x5971df11.
+        let stored = Hit { pos: [14.5, 2.5, -4.5, 0.0], nrm: [1.0, 0.0, 0.0, 0.0], radiance: [4.0, 0.0, 0.0, 0.0] };
+        let colliding = Hit { pos: [7.0, -15.0, -27.0, 0.0], radiance: [0.0, 4.0, 0.0, 0.0], ..stored };
+        assert_eq!(gpu.frame(0, &[stored], &[stored, colliding]), [[4.0, 0.0, 0.0, 1.0], [0.0; 4]]);
+        assert_eq!(gpu.frame(1, &[colliding], &[stored, colliding]), [[4.0, 0.0, 0.0, 2.0], [0.0; 4]]);
     }
 
     #[test]

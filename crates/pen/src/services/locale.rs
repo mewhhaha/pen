@@ -55,28 +55,23 @@ pub fn wanted() -> String {
 
 /// The locale service for the game whose assets are in `assets`, or None
 /// for a game without string tables (its requests are answered unknown, and
-/// it keeps its own words). Tables that do not read are reported, and the
-/// game keeps its words then too.
+/// it keeps its own words). Invalid translations are reported and skipped.
 pub fn service(assets: &Path) -> Option<LocaleService> {
     let root = assets.parent()?;
     let base = root.join("text.json");
     if !base.is_file() {
         return None;
     }
-    match Locales::load(&base, "en", &root.join("locales")) {
-        Ok(locales) => {
-            let service = LocaleService::new(locales, &wanted());
-            let locale = service.locale();
-            if !locale.tag().is_empty() && std::env::var_os("PEN_SERVICES_LOG").is_some() {
-                eprintln!("locale: {} (right to left: {})", locale.tag(), locale.right_to_left());
-            }
-            Some(service)
-        }
-        Err(error) => {
-            eprintln!("the game's string tables: {error:#}");
-            None
-        }
+    let loaded = Locales::load(&base, "en", &root.join("locales"));
+    for error in loaded.errors {
+        eprintln!("the game's string tables: {error}");
     }
+    let service = LocaleService::new(loaded.locales?, &wanted());
+    let locale = service.locale();
+    if !locale.tag().is_empty() && std::env::var_os("PEN_SERVICES_LOG").is_some() {
+        eprintln!("locale: {} (right to left: {})", locale.tag(), locale.right_to_left());
+    }
+    Some(service)
 }
 
 #[cfg(test)]
@@ -108,7 +103,7 @@ mod tests {
         std::fs::write(source.join("locales/notes.txt"), "notes").unwrap();
         ship_tables(&source.join("assets"), &site).unwrap();
         assert_eq!(std::fs::read_to_string(site.join("locales/index.json")).unwrap(), r#"["ar","sv"]"#);
-        let locales = Locales::load(&site.join("text.json"), "en", &site.join("locales")).unwrap();
+        let locales = Locales::load(&site.join("text.json"), "en", &site.join("locales")).locales.unwrap();
         assert_eq!(locales.tags().collect::<Vec<_>>(), ["ar", "sv"]);
         assert_eq!(locales.select("sv").text("title", None).unwrap().spoken, "Fortsätt");
         assert_eq!(locales.select("en").text("title", None).unwrap().spoken, "Continue");
@@ -131,7 +126,9 @@ mod tests {
             r#"{"resume": "Fortsätt", "gnorps": {"one": "{count} gnorp", "other": "{count} gnorper"}}"#,
         )
         .unwrap();
-        let locales = Locales::load(&root.join("text.json"), "en", &root.join("locales")).unwrap();
+        std::fs::write(root.join("locales/ar.json"), "{").unwrap();
+        assert!(service(&root.join("assets")).is_some());
+        let locales = Locales::load(&root.join("text.json"), "en", &root.join("locales")).locales.unwrap();
         let mut services: Services = Services::new();
         services.register(Box::new(LocaleService::new(locales, "sv-SE")));
         let ask = |id, key: &str, count: Option<f32>| ServiceRequest {
@@ -188,7 +185,7 @@ mod tests {
             }
         }
         let source = checkout.join("src");
-        let locales = Locales::load(&source.join("text.json"), "en", &source.join("locales")).unwrap();
+        let locales = Locales::load(&source.join("text.json"), "en", &source.join("locales")).locales.unwrap();
         assert!(locales.tags().count() >= 3, "{:?}", locales.tags().collect::<Vec<_>>());
         let problems = locales.check(&|character| covered.contains(&character) || character == '\n');
         let errors: Vec<String> = problems

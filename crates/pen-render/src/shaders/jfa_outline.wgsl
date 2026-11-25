@@ -34,10 +34,21 @@ struct OutlineStyleGpu {
 @group(0) @binding(5) var<uniform> flood: Flood;
 @group(0) @binding(6) var<uniform> styles: array<OutlineStyleGpu, 256>;
 @group(0) @binding(7) var scene_depth_r32: texture_2d<f32>;
+@group(0) @binding(8) var<storage, read> joints: array<mat4x4f>;
+@group(0) @binding(9) var<uniform> max_radius: u32;
 
 @vertex
 fn mask_vs(@location(0) position: vec3f) -> @builtin(position) vec4f {
     return mesh.view_proj * (mesh.model * vec4f(position, 1.0));
+}
+
+@vertex
+fn mask_skinned_vs(
+    @location(0) position: vec3f, @location(9) indices: vec4u, @location(10) weights: vec4f,
+) -> @builtin(position) vec4f {
+    let skin = joints[indices.x] * weights.x + joints[indices.y] * weights.y
+        + joints[indices.z] * weights.z + joints[indices.w] * weights.w;
+    return mesh.view_proj * (mesh.model * (skin * vec4f(position, 1.0)));
 }
 
 @fragment
@@ -158,7 +169,11 @@ fn composite(@builtin(position) position: vec4f) -> @location(0) vec4f {
     if style.width_px <= 0.0 {
         return vec4f(0.0);
     }
-    let distance = sqrt(f32(distance_squared(vec2i(pixel), seed.xy)));
+    let distance_sq = distance_squared(vec2i(pixel), seed.xy);
+    if distance_sq > max_radius * max_radius {
+        return vec4f(0.0);
+    }
+    let distance = sqrt(f32(distance_sq));
     var coverage = select(0.0, 1.0, distance <= style.width_px);
     if style.feather_px > 0.0 {
         let inner = style.width_px - style.feather_px;

@@ -42,6 +42,17 @@ fn slice_axis(uv: f32, dest: f32, source: f32, borders: vec2f) -> f32 {
     let d = fit_borders(borders, dest);
     let s = fit_borders(borders, source);
     let x = uv * dest;
+    if max(borders.x, 0.0) + max(borders.y, 0.0) >= dest {
+        if d.x > 0.0 && (x <= d.x || d.y == 0.0) {
+            let inset = min(0.5, s.x * 0.5);
+            return clamp(x / d.x * s.x, inset, s.x - inset);
+        }
+        if d.y > 0.0 {
+            let inset = min(0.5, s.y * 0.5);
+            return clamp(source - (dest - x) / d.y * s.y, source - s.y + inset, source - inset);
+        }
+        return uv * source;
+    }
     if x < d.x {
         return x / d.x * s.x;
     }

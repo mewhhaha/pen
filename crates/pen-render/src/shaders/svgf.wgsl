@@ -29,6 +29,15 @@ fn luminance(c: vec3f) -> f32 {
   return dot(c, vec3f(0.2126, 0.7152, 0.0722));
 }
 
+fn finite_clamp(value: f32, limit: f32) -> f32 {
+  let bits = bitcast<u32>(value) & 0x7fffffffu;
+  return select(clamp(value, 0.0, limit), 0.0, bits > 0x7f800000u);
+}
+
+fn finite_rgb(c: vec3f) -> vec3f {
+  return vec3f(finite_clamp(c.x, 65504.0), finite_clamp(c.y, 65504.0), finite_clamp(c.z, 65504.0));
+}
+
 fn rgb_to_ycocg(c: vec3f) -> vec3f {
   return vec3f(
     dot(c, vec3f(0.25, 0.5, 0.25)),
@@ -69,14 +78,14 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
 
   let adaptive_hit_dist = (u.dims.w & 4u) != 0u;
   let noisy = textureLoad(curr_noisy, px, 0);
-  let sample_c = noisy.rgb;
-  let hit_dist = select(0.0, clamp(noisy.a, 0.0, 65504.0), adaptive_hit_dist);
+  let sample_c = finite_rgb(noisy.rgb);
+  let hit_dist = select(0.0, finite_clamp(noisy.a, 65504.0), adaptive_hit_dist);
   let z_c = textureLoad(curr_depth, px, 0).r;
   let n_raw = textureLoad(curr_normal, px, 0);
   let n_l2 = dot(n_raw.xyz, n_raw.xyz);
   let n_c = select(vec3f(0.0, 1.0, 0.0), n_raw.xyz * inverseSqrt(n_l2), n_l2 > 1e-8);
   let rough_c = clamp(n_raw.w, 0.04, 1.0);
-  let lum_c = luminance(sample_c);
+  let lum_c = finite_clamp(luminance(sample_c), 240.0);
   let moments_c = vec2f(lum_c, lum_c * lum_c);
 
   var acc_color = sample_c;
@@ -121,9 +130,9 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
       let n_p = load_normal(prev_normal, q);
       if (is_consistent(z_c, z_p, n_c, n_p)) {
         let bw = bilinear_w[i];
-        hist_c += textureLoad(prev_color, q, 0).rgb * bw;
+        hist_c += finite_rgb(textureLoad(prev_color, q, 0).rgb) * bw;
         let pm = textureLoad(prev_moments, q, 0);
-        hist_m += pm.xy * bw;
+        hist_m += vec2f(finite_clamp(pm.x, 240.0), finite_clamp(pm.y, 57600.0)) * bw;
         hist_l += pm.z * bw;
         // Zero encodes sky or an invalid sample. Keep it out of surface distance history.
         if (adaptive_hit_dist && hit_dist > 0.0 && pm.w > 0.0) {
@@ -151,7 +160,7 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
             let z_q = textureLoad(curr_depth, q, 0).r;
             let n_q = load_normal(curr_normal, q);
             if (dx == 0 && dy == 0 || is_consistent(z_c, z_q, n_c, n_q)) {
-              let yc = rgb_to_ycocg(max(textureLoad(curr_noisy, q, 0).rgb, vec3f(0.0)));
+              let yc = rgb_to_ycocg(max(finite_rgb(textureLoad(curr_noisy, q, 0).rgb), vec3f(0.0)));
               yc_m1 += yc;
               yc_m2 += yc * yc;
               yc_w += 1.0;
@@ -203,8 +212,8 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
         let wz = exp(-abs(z_c - z_q) / (max(u.atrous_params.z, 1e-4) * max(abs(z_c), 1e-3) + 1e-5));
         let wn = pow(max(0.0, dot(n_c, n_q)), max(u.atrous_params.y, 1.0));
         let wt = wz * wn;
-        let cq = textureLoad(curr_noisy, q, 0).rgb;
-        let lq = luminance(cq);
+        let cq = finite_rgb(textureLoad(curr_noisy, q, 0).rgb);
+        let lq = finite_clamp(luminance(cq), 240.0);
         sc += cq * wt;
         sm += vec2f(lq, lq * lq) * wt;
         sw += wt;
@@ -221,8 +230,11 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
     }
   }
 
-  textureStore(out_color, px, vec4f(acc_color, variance));
-  textureStore(out_moments, px, vec4f(acc_moments.x, acc_moments.y, hist_len, filtered_hit_dist));
+  textureStore(out_color, px, vec4f(finite_rgb(acc_color), finite_clamp(variance, 65504.0)));
+  textureStore(out_moments, px, vec4f(
+    finite_clamp(acc_moments.x, 240.0), finite_clamp(acc_moments.y, 57600.0),
+    finite_clamp(hist_len, 65504.0), finite_clamp(filtered_hit_dist, 65504.0),
+  ));
 }
 
 // A-Trous pass bindings (separate bind group layout for minimal bindings).

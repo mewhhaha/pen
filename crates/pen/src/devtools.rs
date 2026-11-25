@@ -1043,6 +1043,10 @@ impl Overlay for Devtools {
         self.typed.extend(typed_line(&line, console_focused || opening));
     }
 
+    fn viewport_overlay_enabled(&self) -> bool {
+        self.viewport_overlay.is_enabled()
+    }
+
     fn prepare_scene(
         &mut self,
         renderer: &mut pen_render::Renderer,
@@ -1055,10 +1059,24 @@ impl Overlay for Devtools {
             return;
         }
         if self.viewport_overlay.is_enabled() {
-            let pointer = [self.routing.pointer.0, self.routing.pointer.1];
+            let map_to_frame = |[px, py]: [f32; 2]| -> [f32; 2] {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let frame_size = (
+                    viewport[0].clamp(1.0, 16_777_216.0).round() as u32,
+                    viewport[1].clamp(1.0, 16_777_216.0).round() as u32,
+                );
+                if (self.viewport.width, self.viewport.height) == frame_size {
+                    [px, py]
+                } else {
+                    let shown = (f64::from(self.viewport.width.max(1)), f64::from(self.viewport.height.max(1)));
+                    let (x, y) = pen_runtime::scale::to_frame((f64::from(px), f64::from(py)), shown, frame_size);
+                    [crate::input::narrow(x), crate::input::narrow(y)]
+                }
+            };
+            let pointer = map_to_frame([self.routing.pointer.0, self.routing.pointer.1]);
             self.viewport_overlay.update_pointer(frame, pointer, viewport);
             if let Some(click) = self.pending_viewport_click.take() {
-                self.viewport_overlay.click_select(frame, click, viewport);
+                self.viewport_overlay.click_select(frame, map_to_frame(click), viewport);
             }
         } else {
             self.pending_viewport_click = None;

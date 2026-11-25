@@ -211,7 +211,8 @@ impl ViewportOverlay {
         Some(Scene2d { sdf_overlay_shapes: shapes, ..Default::default() })
     }
 
-    /// Apply on the same renderer each frame. Release its scene slots once on disable.
+    /// Apply on the same renderer each frame using dedicated devtools slots so
+    /// game-owned scenes and wire extensions stay intact.
     pub fn apply_to_renderer(
         &mut self,
         renderer: &mut Renderer,
@@ -222,34 +223,34 @@ impl ViewportOverlay {
         if self.enabled {
             self.active_on_renderer = true;
             if let Some(scene) = self.build_jfa_outlines(frame) {
-                renderer.set_jfa_outlines(scene);
+                renderer.set_devtools_jfa_outlines(scene);
             } else {
-                renderer.clear_jfa_outlines();
+                renderer.clear_devtools_jfa_outlines();
             }
             if let Some(scene) = self.build_line_scene(frame, viewport) {
-                renderer.set_line_scene(scene);
+                renderer.set_devtools_line_scene(scene);
             } else {
-                renderer.clear_line_scene();
+                renderer.clear_devtools_line_scene();
             }
             if let Some(scene) = self.build_sdf_hud(frame, stats, viewport) {
-                renderer.set_scene_2d(scene);
+                renderer.set_devtools_sdf_overlay(scene.sdf_overlay_shapes);
             } else {
-                renderer.clear_scene_2d();
+                renderer.clear_devtools_sdf_overlay();
             }
         } else if std::mem::take(&mut self.active_on_renderer) {
-            renderer.clear_jfa_outlines();
-            renderer.clear_line_scene();
-            renderer.clear_scene_2d();
+            renderer.clear_devtools_jfa_outlines();
+            renderer.clear_devtools_line_scene();
+            renderer.clear_devtools_sdf_overlay();
         }
     }
 
-    /// Temporarily removes overlay scenes from `renderer` (e.g. for clean captures)
-    /// without disabling the overlay for future windowed frames.
+    /// Temporarily removes devtools overlay scenes from `renderer` (e.g. for clean
+    /// captures) without disabling the overlay or disturbing game-owned scenes.
     pub fn suspend_on_renderer(&mut self, renderer: &mut Renderer) {
         if std::mem::take(&mut self.active_on_renderer) {
-            renderer.clear_jfa_outlines();
-            renderer.clear_line_scene();
-            renderer.clear_scene_2d();
+            renderer.clear_devtools_jfa_outlines();
+            renderer.clear_devtools_line_scene();
+            renderer.clear_devtools_sdf_overlay();
         }
     }
 }
@@ -262,7 +263,8 @@ fn valid_viewport(viewport: [f32; 2]) -> bool {
     viewport.into_iter().all(|extent| extent.is_finite() && extent > 0.0)
 }
 
-/// Pick the nearest positive intersection with a draw's approximate world-space sphere.
+/// Pick the nearest positive intersection with a draw's local unit cube
+/// `[-0.5, 0.5]^3` within the camera's near-to-far clip interval.
 pub fn pick_draw(frame: &RenderFrame, pointer_px: [f32; 2], viewport: [f32; 2]) -> Option<usize> {
     if frame.draws.is_empty()
         || !valid_viewport(viewport)
@@ -271,17 +273,21 @@ pub fn pick_draw(frame: &RenderFrame, pointer_px: [f32; 2], viewport: [f32; 2]) 
         return None;
     }
 
-    let (origin, direction) = pointer_ray(frame, pointer_px, viewport)?;
+    let (origin, direction, max_t) = pointer_ray(frame, pointer_px, viewport)?;
     frame
         .draws
         .iter()
         .enumerate()
-        .filter_map(|(index, draw)| sphere_hit(&draw.transform, origin, direction).map(|t| (index, t)))
+        .filter_map(|(index, draw)| draw_hit(&draw.transform, origin, direction, max_t).map(|t| (index, t)))
         .min_by(|left, right| left.1.total_cmp(&right.1))
         .map(|(index, _)| index)
 }
 
-fn pointer_ray(frame: &RenderFrame, [x, y]: [f32; 2], [width, height]: [f32; 2]) -> Option<([f64; 3], [f64; 3])> {
+fn pointer_ray(
+    frame: &RenderFrame,
+    [x, y]: [f32; 2],
+    [width, height]: [f32; 2],
+) -> Option<([f64; 3], [f64; 3], Option<f64>)> {
     let projection = frame.projection;
     let view_projection = std::array::from_fn(|row| {
         std::array::from_fn(|column| {
@@ -305,17 +311,17 @@ fn pointer_ray(frame: &RenderFrame, [x, y]: [f32; 2], [width, height]: [f32; 2])
     }
 
     let origin = std::array::from_fn(|i| near[i] / near[3]);
-    let delta: [f64; 3] = if far[3] == 0.0 {
+    let (delta, finite_far): ([f64; 3], bool) = if far[3] == 0.0 {
         // The infinite far plane unprojects to a homogeneous direction.
-        std::array::from_fn(|i| far[i] * near[3].signum())
+        (std::array::from_fn(|i| far[i] * near[3].signum()), false)
     } else {
-        std::array::from_fn(|i| far[i] / far[3] - origin[i])
+        (std::array::from_fn(|i| far[i] / far[3] - origin[i]), true)
     };
     let length = delta[0].hypot(delta[1]).hypot(delta[2]);
     if length == 0.0 || !length.is_finite() || !origin.into_iter().all(f64::is_finite) {
         return None;
     }
-    Some((origin, delta.map(|lane| lane / length)))
+    Some((origin, delta.map(|lane| lane / length), finite_far.then_some(length)))
 }
 
 fn invert(matrix: [[f64; 4]; 4]) -> Option<[[f64; 4]; 4]> {
@@ -350,14 +356,57 @@ fn dot<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
     a.into_iter().zip(b).map(|(a, b)| a * b).sum()
 }
 
-fn sphere_hit(transform: &Matrix, origin: [f64; 3], direction: [f64; 3]) -> Option<f64> {
+fn draw_hit(transform: &Matrix, origin: [f64; 3], direction: [f64; 3], max_t: Option<f64>) -> Option<f64> {
+    if !transform.iter().all(|lane| lane.is_finite()) {
+        return None;
+    }
+    let matrix = std::array::from_fn(|row| std::array::from_fn(|column| f64::from(transform[column * 4 + row])));
+    if let Some(inverse) = invert(matrix) {
+        let local_origin: [f64; 3] =
+            std::array::from_fn(|row| dot(inverse[row], [origin[0], origin[1], origin[2], 1.0]));
+        let local_direction: [f64; 3] =
+            std::array::from_fn(|row| dot(inverse[row], [direction[0], direction[1], direction[2], 0.0]));
+        if local_origin.into_iter().chain(local_direction).all(f64::is_finite) {
+            return local_unit_box_hit(local_origin, local_direction, max_t);
+        }
+    }
+    sphere_hit(transform, origin, direction, max_t)
+}
+
+fn local_unit_box_hit(origin: [f64; 3], direction: [f64; 3], max_t: Option<f64>) -> Option<f64> {
+    let mut t_min = 0.0_f64;
+    let mut t_max = max_t.unwrap_or(f64::INFINITY);
+    for axis in 0..3 {
+        let dir = direction[axis];
+        let orig = origin[axis];
+        if dir == 0.0 {
+            if !(-0.5..=0.5).contains(&orig) {
+                return None;
+            }
+        } else {
+            let inv = 1.0 / dir;
+            let t0 = (-0.5 - orig) * inv;
+            let t1 = (0.5 - orig) * inv;
+            let (near, far) = if t0 <= t1 { (t0, t1) } else { (t1, t0) };
+            t_min = t_min.max(near);
+            t_max = t_max.min(far);
+            if t_min > t_max {
+                return None;
+            }
+        }
+    }
+    let hit = if t_min > 0.0 { t_min } else { t_max };
+    (hit.is_finite() && hit > 0.0 && max_t.is_none_or(|far| hit <= far)).then_some(hit)
+}
+
+fn sphere_hit(transform: &Matrix, origin: [f64; 3], direction: [f64; 3], max_t: Option<f64>) -> Option<f64> {
     if !transform.iter().all(|lane| lane.is_finite()) {
         return None;
     }
     let transform = transform.map(f64::from);
     let (columns, _) = transform[..12].as_chunks::<4>();
-    let scale = columns.iter().map(|&[x, y, z, _]| x.hypot(y).hypot(z));
-    let radius = (scale.fold(0.0, f64::max) * 0.85).max(0.25);
+    // Half the sum of column norms bounds every corner of `[-0.5, 0.5]^3`, even under combined shear.
+    let radius = (columns.iter().map(|&[x, y, z, _]| x.hypot(y).hypot(z)).sum::<f64>() * 0.5).max(0.25);
     let offset = std::array::from_fn(|axis| transform[12 + axis] - origin[axis]);
     let along = dot(offset, direction);
     // |offset × direction|² avoids subtracting large nearly equal squared lengths.
@@ -371,7 +420,9 @@ fn sphere_hit(transform: &Matrix, origin: [f64; 3], direction: [f64; 3]) -> Opti
         return None;
     }
     let half_chord = discriminant.sqrt();
-    [along - half_chord, along + half_chord].into_iter().find(|t| t.is_finite() && *t > 0.0)
+    [along - half_chord, along + half_chord]
+        .into_iter()
+        .find(|t| t.is_finite() && *t > 0.0 && max_t.is_none_or(|far| *t <= far))
 }
 
 fn selected_gizmo(batch: &mut LineBatch, transform: &Matrix, style: LineStyle) {
@@ -623,5 +674,42 @@ mod tests {
         assert!(overlay.build_line_scene(&frame, VIEWPORT).is_none());
         assert!(overlay.build_sdf_hud(&frame, &stats, VIEWPORT).is_none());
         assert!(overlay.apply_command("/other on").is_none());
+    }
+
+    #[test]
+    fn picking_respects_finite_far_plane_and_combined_shear() {
+        // Finite far plane at 10.0 must reject a draw sitting beyond it at z = -12.0.
+        let clipped_frame = RenderFrame {
+            view: IDENTITY,
+            projection: perspective_forward_z(FRAC_PI_2, 1.0, 0.1, 10.0),
+            draws: vec![draw_at(0.0, -12.0)],
+            ..Default::default()
+        };
+        assert_eq!(pick_draw(&clipped_frame, [100.0, 100.0], VIEWPORT), None);
+
+        // Reversed-Z with finite far plane at 10.0 must also reject z = -12.0.
+        let clipped_rz = RenderFrame {
+            projection: perspective_reversed_z(FRAC_PI_2, 1.0, 0.1, Some(10.0)),
+            ..clipped_frame.clone()
+        };
+        assert_eq!(pick_draw(&clipped_rz, [100.0, 100.0], VIEWPORT), None);
+
+        // Unit cube sheared by x' = x + y + z under orthographic [-2, 2] x [-2, 2].
+        let mut ortho = IDENTITY;
+        ortho[0] = 0.5;
+        ortho[5] = 0.5;
+        ortho[10] = -0.1;
+        ortho[14] = 0.5;
+        // Column-major: col0=(1,0,0), col1=(1,1,0), col2=(1,0,1), col3=(0,0,0)
+        let sheared_transform: Matrix =
+            [1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let sheared_frame = RenderFrame {
+            view: IDENTITY,
+            projection: ortho,
+            draws: vec![Draw { transform: sheared_transform, ..Default::default() }],
+            ..Default::default()
+        };
+        // World (1.4, 0.49) maps to NDC (0.7, 0.245) -> pixel (170.0, 75.5) on 200x200.
+        assert_eq!(pick_draw(&sheared_frame, [170.0, 75.5], VIEWPORT), Some(0));
     }
 }

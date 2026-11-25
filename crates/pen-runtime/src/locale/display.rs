@@ -153,7 +153,7 @@ fn joining(char: char) -> Joining {
         | '\u{0773}'..='\u{0774}'
         | '\u{0778}'..='\u{0779}' => Joining::Right,
         '\u{0640}' | '\u{200D}' => Joining::Causing,
-        '\u{200C}' => Joining::None,
+        '\u{200C}' | '\u{2066}'..='\u{2069}' => Joining::None,
         _ if bidi_class(char) == BidiClass::NSM || invisible(char) => Joining::Transparent,
         _ => Joining::None,
     }
@@ -355,6 +355,15 @@ mod tests {
         // Tatweel joins both sides; ZWNJ joins neither and is left out.
         assert_eq!(shown("بـ"), (vec![0x0640, 0xFE91], true));
         assert_eq!(shown("ک\u{200C}ک"), (vec![0xFB8E, 0xFB8E], true));
+    }
+
+    #[test]
+    fn arabic_isolates_break_joining_and_lam_alef_ligatures() {
+        for initiator in ['\u{2066}', '\u{2067}', '\u{2068}'] {
+            assert_eq!(shape(&format!("ل{initiator}\u{2069}ا")), format!("\u{FEDD}{initiator}\u{2069}\u{FE8D}"));
+            assert_eq!(shown(&format!("ب{initiator}\u{2069}ب")), (vec![0xFE8F, 0xFE8F], true));
+        }
+        assert_eq!(shape("ل\u{2067}ل\u{2069}ا"), "\u{FEDD}\u{2067}\u{FEDD}\u{2069}\u{FE8D}");
     }
 
     #[test]

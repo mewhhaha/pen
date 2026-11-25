@@ -123,21 +123,21 @@ pub fn lint(assets: &Path, wasm: &[u8], settings: &Settings) -> Result<Vec<Findi
     if let Some(root) = assets.parent() {
         let base = root.join("text.json");
         if base.exists() {
-            match Locales::load(&base, "en", &root.join("locales")) {
-                Ok(locales) => {
-                    for problem in locales.check(&|_| true) {
-                        let severity = problem.severity();
-                        if severity != Severity::Information {
-                            let file = if problem.base {
-                                "text.json".into()
-                            } else {
-                                format!("locales/{}.json", problem.table)
-                            };
-                            find("locale", &file, problem.to_string(), severity == Severity::Error);
-                        }
+            let loaded = Locales::load(&base, "en", &root.join("locales"));
+            for error in loaded.errors {
+                let path = error.path.strip_prefix(root).unwrap_or(&error.path);
+                let key = path.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+                find("locale", &key, error.to_string(), true);
+            }
+            if let Some(locales) = loaded.locales {
+                for problem in locales.check(&|_| true) {
+                    let severity = problem.severity();
+                    if severity != Severity::Information {
+                        let file =
+                            if problem.base { "text.json".into() } else { format!("locales/{}.json", problem.table) };
+                        find("locale", &file, problem.to_string(), severity == Severity::Error);
                     }
                 }
-                Err(error) => find("locale", "text.json", format!("{error:#}"), true),
             }
         }
     }
@@ -425,16 +425,27 @@ mod tests {
         let denied = Settings { deny: vec!["locale".into()], ..Settings::default() };
         assert!(lint(&assets, b"", &denied).unwrap().iter().all(|finding| finding.error));
 
-        for malformed in [&sv, &base] {
-            std::fs::write(malformed, "{").unwrap();
-            let findings = lint(&assets, b"", &Settings::default()).unwrap();
-            let [finding] = findings.as_slice() else { panic!("{findings:#?}") };
-            assert_eq!(finding.lint, "locale");
+        std::fs::write(&sv, "{").unwrap();
+        let findings = lint(&assets, b"", &Settings::default()).unwrap();
+        let [finding] = findings.as_slice() else { panic!("{findings:#?}") };
+        assert_eq!((finding.lint, finding.key.as_str()), ("locale", "locales/sv.json"));
+        assert!(finding.error && finding.message.contains("not JSON"), "{finding:?}");
+
+        let ar = root.join("locales/ar.json");
+        std::fs::write(&ar, "{").unwrap();
+        std::fs::write(&base, "{").unwrap();
+        let findings = lint(&assets, b"", &Settings::default()).unwrap();
+        assert_eq!(findings.len(), 3, "{findings:#?}");
+        for (key, path) in [("text.json", base), ("locales/ar.json", ar), ("locales/sv.json", sv)] {
             assert!(
-                finding.error
-                    && finding.message.contains(&*malformed.to_string_lossy())
-                    && finding.message.contains("not JSON"),
-                "{finding:?}"
+                findings.iter().any(|finding| {
+                    finding.lint == "locale"
+                        && finding.key == key
+                        && finding.error
+                        && finding.message.contains(&*path.to_string_lossy())
+                        && finding.message.contains("not JSON")
+                }),
+                "{findings:#?}"
             );
         }
         std::fs::remove_dir_all(root).unwrap();

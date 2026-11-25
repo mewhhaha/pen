@@ -651,6 +651,38 @@ mod tests {
     }
 
     #[test]
+    fn gpu_svgf_hdr_moments_stay_finite_across_frames() {
+        let (device, queue) = crate::testing::device().expect("GPU adapter required");
+        let upload = |pixels| upload_rgba16f(&device, &queue, 2, 1, pixels).create_view(&Default::default());
+        let noisy = upload(&[[1024.0; 4], [f32::INFINITY; 4]]);
+        let depth = upload(&[[0.5; 4]; 2]);
+        let normal = upload(&[[0.0, 0.0, 1.0, 0.5]; 2]);
+        let motion = upload(&[[0.0; 4]; 2]);
+        let inputs = SvgfInputs {
+            noisy_signal: &noisy,
+            depth: &depth,
+            prev_depth: &depth,
+            normal: &normal,
+            prev_normal: &normal,
+            motion: &motion,
+        };
+        let mut svgf = SvgfDenoiser::new(&device);
+        for frame in 0..2 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let params = SvgfParams { reset_history: frame == 0, specular_mode: true, ..Default::default() };
+            svgf.denoise(&device, &mut encoder, &inputs, (2, 1), &params).unwrap();
+            queue.submit([encoder.finish()]);
+            let history = &svgf.state.as_ref().unwrap().history_moments.tex;
+            let moments = read_rgba16f_tex(&device, &queue, history, 2, 1);
+            for [mean, second, len, hit] in moments {
+                assert_eq!(mean, 240.0);
+                assert_eq!(second, 57_600.0);
+                assert!(len.is_finite() && hit.is_finite());
+            }
+        }
+    }
+
+    #[test]
     fn gpu_svgf_specular_ycocg_clamp_parallax_reproj_and_roughness_atrous_witness() {
         let (device, queue) = crate::testing::device().expect("GPU adapter required");
         let (w, h) = (32u32, 32u32);

@@ -330,9 +330,11 @@ impl Browser {
         services.register(Box::new(pen_runtime::captions::CaptionsService(captions.clone())));
         let accessibility = Accessibility::new(input.clone())?;
         let has_locales = options.locales.is_some();
-        if let Some(locales) = options.locales {
-            accessibility.set_rtl(crate::services::register_locale(&mut services, locales))?;
-        }
+        let (tag, rtl) = options
+            .locales
+            .map(|locales| crate::services::register_locale(&mut services, locales))
+            .unwrap_or_else(|| ("en".into(), false));
+        accessibility.set_locale(&tag, rtl)?;
         let kernels = game_wasm.as_deref().and_then(crate::kernels::WebKernelService::maybe_new);
         let netplay = options.netplay;
         game.hash_packets(options.qualify);
@@ -1059,7 +1061,7 @@ impl Browser {
     /// A new build from `pen web`, taken while the game is idle.
     async fn reload(&mut self, update: Update) {
         self.state_adapter = crate::load_state_adapter(&self.assets).await;
-        let direction = match crate::load_locales().await {
+        let language = match crate::load_locales().await {
             Ok(Some(locales)) => {
                 self.has_locales = true;
                 Some(crate::services::register_locale(&mut self.services, locales))
@@ -1067,7 +1069,7 @@ impl Browser {
             Ok(None) if self.has_locales => {
                 self.has_locales = false;
                 self.services.register(Box::new(pen_runtime::services::Unavailable(pen_protocol::service::LOCALE)));
-                Some(false)
+                Some(("en".into(), false))
             }
             Ok(None) => None,
             Err(error) => {
@@ -1075,10 +1077,10 @@ impl Browser {
                 None
             }
         };
-        if let Some(rtl) = direction
-            && let Err(error) = self.accessibility.set_rtl(rtl)
+        if let Some((tag, rtl)) = language
+            && let Err(error) = self.accessibility.set_locale(&tag, rtl)
         {
-            say(&mut self.log, log_source::RELOAD, true, format!("interface direction: {error:#}"));
+            say(&mut self.log, log_source::RELOAD, true, format!("interface language: {error:#}"));
         }
         let catalog = update.catalog.unwrap_or_else(|| self.catalog.clone());
         if let Some(module) = update.game {

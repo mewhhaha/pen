@@ -108,7 +108,13 @@ pub struct ParticleSimCounters {
     pub bounces: u32,
 }
 
-fn encode_copy(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::Buffer, dst_offset: u64, bytes: &[u8]) {
+fn encode_copy(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    dst: &wgpu::Buffer,
+    dst_offset: u64,
+    bytes: &[u8],
+) {
     let stage = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("gpu_particles_stage"),
         size: bytes.len() as u64,
@@ -157,7 +163,9 @@ pub struct GpuParticleSystem {
     pipe_compact: wgpu::ComputePipeline,
     draw_uniform: wgpu::Buffer,
     draw_bg: wgpu::BindGroup,
-    draw_pipe: wgpu::RenderPipeline,
+    draw_module: wgpu::ShaderModule,
+    draw_layout: wgpu::PipelineLayout,
+    draw_pipelines: Vec<(PipelineTarget, wgpu::RenderPipeline)>,
     mesh_vb: wgpu::Buffer,
     mesh_ib: wgpu::Buffer,
     mesh_index_count: u32,
@@ -182,7 +190,10 @@ impl GpuParticleSystem {
             max_particles.div_ceil(64) <= limits.max_compute_workgroups_per_dimension,
             "max_particles dispatch exceeds max_compute_workgroups_per_dimension"
         );
-        ensure!(!mesh_vertices.is_empty() && !mesh_indices.is_empty() && mesh_indices.len().is_multiple_of(3), "invalid particle mesh");
+        ensure!(
+            !mesh_vertices.is_empty() && !mesh_indices.is_empty() && mesh_indices.len().is_multiple_of(3),
+            "invalid particle mesh"
+        );
         let p_bytes = u64::from(max_particles) * std::mem::size_of::<GpuParticle>() as u64;
         let vb_bytes = std::mem::size_of_val(mesh_vertices) as u64;
         let ib_bytes = std::mem::size_of_val(mesh_indices) as u64;
@@ -374,11 +385,42 @@ impl GpuParticleSystem {
             bind_group_layouts: &[Some(&draw_bgl)],
             immediate_size: 0,
         });
-        let draw_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let draw_pipe = Self::draw_pipeline(device, &draw_mod, &draw_pl, target);
+
+        Ok(Self {
+            max_particles,
+            particles,
+            spawn_queue,
+            alive_indices,
+            indirect,
+            counters,
+            sim_uniform,
+            sim_bgl,
+            pipe_simulate,
+            pipe_apply_spawns,
+            pipe_compact,
+            draw_uniform,
+            draw_bg,
+            draw_module: draw_mod,
+            draw_layout: draw_pl,
+            draw_pipelines: vec![(target, draw_pipe)],
+            mesh_vb,
+            mesh_ib,
+            mesh_index_count: mesh_indices.len() as u32,
+        })
+    }
+
+    fn draw_pipeline(
+        device: &wgpu::Device,
+        module: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+        target: PipelineTarget,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("gpu_particles_draw_pipe"),
-            layout: Some(&draw_pl),
+            layout: Some(layout),
             vertex: wgpu::VertexState {
-                module: &draw_mod,
+                module,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
@@ -405,7 +447,7 @@ impl GpuParticleSystem {
             }),
             multisample: wgpu::MultisampleState { count: target.sample_count.max(1), ..Default::default() },
             fragment: Some(wgpu::FragmentState {
-                module: &draw_mod,
+                module,
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
@@ -416,34 +458,33 @@ impl GpuParticleSystem {
             }),
             multiview_mask: None,
             cache: None,
-        });
-
-        Ok(Self {
-            max_particles,
-            particles,
-            spawn_queue,
-            alive_indices,
-            indirect,
-            counters,
-            sim_uniform,
-            sim_bgl,
-            pipe_simulate,
-            pipe_apply_spawns,
-            pipe_compact,
-            draw_uniform,
-            draw_bg,
-            draw_pipe,
-            mesh_vb,
-            mesh_ib,
-            mesh_index_count: mesh_indices.len() as u32,
         })
+    }
+
+    pub(crate) fn select_draw_target(&mut self, device: &wgpu::Device, target: PipelineTarget) {
+        if let Some(index) = self.draw_pipelines.iter().position(|(key, _)| *key == target) {
+            self.draw_pipelines.swap(0, index);
+        } else {
+            let pipeline = Self::draw_pipeline(device, &self.draw_module, &self.draw_layout, target);
+            self.draw_pipelines.push((target, pipeline));
+            let index = self.draw_pipelines.len() - 1;
+            self.draw_pipelines.swap(0, index);
+        }
     }
 
     /// Uploads an initial batch of particles into slots `0..initial.len()` in command order;
     /// remaining slots are zeroed (dead/available for GPU-resident sub-emitter allocation).
-    pub fn seed(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, initial: &[GpuParticle]) -> Result<()> {
+    pub fn seed(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        initial: &[GpuParticle],
+    ) -> Result<()> {
         ensure!(initial.len() <= self.max_particles as usize, "initial batch exceeds max_particles");
-        let zeros = vec![GpuParticle { pos_age: [0.0; 4], vel_life: [0.0; 4], color: [0.0; 4], size_rot_gen: [0.0; 4] }; self.max_particles as usize];
+        let zeros = vec![
+            GpuParticle { pos_age: [0.0; 4], vel_life: [0.0; 4], color: [0.0; 4], size_rot_gen: [0.0; 4] };
+            self.max_particles as usize
+        ];
         encode_copy(device, encoder, &self.particles, 0, bytemuck::cast_slice(&zeros));
         if !initial.is_empty() {
             encode_copy(device, encoder, &self.particles, 0, bytemuck::cast_slice(initial));
@@ -477,7 +518,12 @@ impl GpuParticleSystem {
         let u = SimUniform {
             view_projection: params.view_projection,
             inverse_view_projection: crate::matrix::invert(&params.view_projection),
-            camera_pos_and_clear: [params.camera_pos[0], params.camera_pos[1], params.camera_pos[2], params.depth_clear],
+            camera_pos_and_clear: [
+                params.camera_pos[0],
+                params.camera_pos[1],
+                params.camera_pos[2],
+                params.depth_clear,
+            ],
             gravity_dt: [params.gravity[0], params.gravity[1], params.gravity[2], params.dt.clamp(0.0, 0.1)],
             curl_drag: [params.drag.max(0.0), params.curl_strength, params.curl_frequency.max(0.05), params.time],
             collision: [
@@ -521,10 +567,8 @@ impl GpuParticleSystem {
             ("gpu_particles_apply_spawns", &self.pipe_apply_spawns),
             ("gpu_particles_compact", &self.pipe_compact),
         ] {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(label),
-                timestamp_writes: None,
-            });
+            let mut pass =
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, &sim_bg, &[]);
             pass.dispatch_workgroups(wg, 1, 1);
@@ -552,7 +596,7 @@ impl GpuParticleSystem {
     }
 
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        pass.set_pipeline(&self.draw_pipe);
+        pass.set_pipeline(&self.draw_pipelines[0].1);
         pass.set_bind_group(0, &self.draw_bg, &[]);
         pass.set_vertex_buffer(0, self.mesh_vb.slice(..));
         pass.set_index_buffer(self.mesh_ib.slice(..), wgpu::IndexFormat::Uint32);
@@ -585,12 +629,7 @@ mod tests {
         let target = PipelineTarget::standard(wgpu::TextureFormat::Rgba8Unorm, Some(wgpu::TextureFormat::Depth32Float));
         let sys = GpuParticleSystem::new(&device, 32, &verts, &indices, target).unwrap();
 
-        let vp: [f32; 16] = [
-            0.5, 0.0, 0.0, 0.0,
-            0.0, 0.0, -0.25, 0.0,
-            0.0, -0.5, 0.0, 0.0,
-            0.0, 0.0, 0.5, 1.0,
-        ];
+        let vp: [f32; 16] = [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, -0.25, 0.0, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0];
         let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("particle_depth_floor"),
             size: wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
@@ -602,7 +641,12 @@ mod tests {
             view_formats: &[],
         });
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &depth_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &depth_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             bytemuck::cast_slice(&vec![0.5f32; 32 * 32]),
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(32 * 4), rows_per_image: Some(32) },
             wgpu::Extent3d { width: 32, height: 32, depth_or_array_layers: 1 },
@@ -673,7 +717,10 @@ mod tests {
                     view: &color_view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &render_depth_view,
@@ -714,7 +761,12 @@ mod tests {
         enc.copy_buffer_to_buffer(sys.indirect_buffer(), 0, &ind_rb, 0, ind_rb.size());
         enc.copy_buffer_to_buffer(sys.counters_buffer(), 0, &cnt_rb, 0, cnt_rb.size());
         enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: &color_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &color_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::TexelCopyBufferInfo {
                 buffer: &img_rb,
                 layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(64) },

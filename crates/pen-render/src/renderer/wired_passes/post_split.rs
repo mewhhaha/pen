@@ -164,10 +164,24 @@ impl State {
                 } else if views[idx].target.size() != size || views[idx].target.format() != format {
                     views[idx].target = OffscreenRenderTarget::new(&self.device, size.0, size.1, format)?;
                 }
-                let sub = secondary_frame(frame, cam.view, cam.projection);
+                let mut sub = secondary_frame(frame, cam.view, cam.projection);
+                sub.extensions.extend(
+                    frame
+                        .extensions
+                        .iter()
+                        .filter(|ext| {
+                            matches!(
+                                ext.tag,
+                                super::GPU_PARTICLES_EXT_TAG | super::LINES_EXT_TAG | super::JFA_OUTLINE_EXT_TAG
+                            )
+                        })
+                        .cloned(),
+                );
                 let slot = &mut views[idx];
-                let (child_waiting, child_stats) =
-                    self.submit_secondary_view(&sub, catalog, &mut slot.target, &mut slot.temporal)?;
+                self.wired.split_child = true;
+                let result = self.submit_secondary_view(&sub, catalog, &mut slot.target, &mut slot.temporal);
+                self.wired.split_child = false;
+                let (child_waiting, child_stats) = result?;
                 any_waiting |= child_waiting;
                 combined.draw_calls += child_stats.draw_calls;
                 combined.instanced_draw_calls += child_stats.instanced_draw_calls;

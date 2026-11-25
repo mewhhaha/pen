@@ -47,7 +47,7 @@ pub enum LineLayer {
     OnTop,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LineStyle {
     pub width_px: f32,
     pub dash_len_px: f32,
@@ -301,7 +301,7 @@ impl LineBatch {
         self
     }
 
-    fn push(
+    pub(crate) fn push(
         &mut self,
         p0: [f32; 3],
         p1: [f32; 3],
@@ -349,6 +349,8 @@ struct Uniform {
     viewport: [f32; 2],
     xray_alpha: f32,
     xray_desaturate: f32,
+    reversed_z: u32,
+    padding: [u32; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -522,6 +524,8 @@ impl LineRenderer {
                 viewport: frame.viewport,
                 xray_alpha: frame.xray.alpha,
                 xray_desaturate: frame.xray.desaturate,
+                reversed_z: u32::from(depth == DepthMode::ReversedZ),
+                padding: [0; 3],
             };
             queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
         }

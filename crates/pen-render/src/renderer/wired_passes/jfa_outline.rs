@@ -1,13 +1,23 @@
-use super::super::{GpuAsset, State};
+use super::super::{Drawing, GpuAsset, ReadyEntry, Source, State};
 use super::{JFA_OUTLINE_EXT_TAG, WiredPasses};
-use crate::asset_store::{AssetKind, MESH_VERTEX_FLOATS};
+use crate::asset_store::MESH_VERTEX_FLOATS;
 use crate::built_in::BuiltIns;
 use crate::camera_precision::DepthMode;
+use crate::culling::CAMERA;
 use crate::jfa_outline::{JfaOutlinePass, MeshMaskParams, OUTLINE_STYLE_CAPACITY, OutlineStyle};
 use crate::matrix::multiply;
 use crate::post::SCENE_FORMAT;
 use anyhow::Result;
-use pen_protocol::{Catalog, Matrix, RenderFrame};
+use pen_protocol::{Matrix, RenderFrame};
+use std::collections::BTreeMap;
+
+// Each source has a bounded budget, leaving capacity for the other layers.
+const MASK_DRAW_BUDGET: usize = 2048;
+pub(in crate::renderer) type OutlineScenes = [Option<JfaOutlineScene>; 3];
+
+pub(in crate::renderer) fn outlined(scenes: &OutlineScenes, index: usize) -> bool {
+    scenes.iter().flatten().any(|scene| scene.targets.binary_search_by_key(&index, |target| target.draw_index).is_ok())
+}
 
 /// Selects a `RenderFrame::draws` entry for Jump-Flood silhouette outlining.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,14 +42,18 @@ pub struct JfaOutlineScene {
 #[derive(Default)]
 pub(in crate::renderer) struct JfaOutlineWiredState {
     pub scene: Option<JfaOutlineScene>,
+    pub devtools_scene: Option<JfaOutlineScene>,
     pub pass: Option<JfaOutlinePass>,
 }
 
 fn decode_ext_jfa(frame: &RenderFrame) -> Option<JfaOutlineScene> {
     let ext = frame.extensions.iter().find(|e| e.tag == JFA_OUTLINE_EXT_TAG && e.values.len() >= 3)?;
     let v = &ext.values;
+    if !v[0].is_finite() || !(1.0..=OUTLINE_STYLE_CAPACITY as f32).contains(&v[0]) {
+        return None;
+    }
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let style_count = (v[0].round().clamp(0.0, OUTLINE_STYLE_CAPACITY as f32)) as usize;
+    let style_count = v[0].round() as usize;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let max_radius_px = v[1].round().clamp(0.0, 64.0) as u32;
     let depth_bias = v[2].max(0.0);
@@ -59,55 +73,61 @@ fn decode_ext_jfa(frame: &RenderFrame) -> Option<JfaOutlineScene> {
         });
     }
     let target_pairs = (v.len() - styles_end) / 2;
-    let mut targets = Vec::with_capacity(target_pairs);
+    let mut targets = BTreeMap::new();
     for i in 0..target_pairs {
         let o = styles_end + i * 2;
-        if v[o] < 0.0 || v[o + 1] < 0.0 {
+        if !v[o].is_finite() || !v[o + 1].is_finite() || v[o] < 0.0 || v[o + 1] < 0.0 {
             continue;
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let draw_index = v[o].round() as usize;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let style_index = (v[o + 1].round() as usize).min(style_count - 1);
-        targets.push(JfaOutlineTarget { draw_index, style_index });
+        if draw_index < frame.draws.len() && (targets.len() < MASK_DRAW_BUDGET || targets.contains_key(&draw_index)) {
+            targets.insert(draw_index, JfaOutlineTarget { draw_index, style_index });
+        }
     }
-    (!targets.is_empty()).then_some(JfaOutlineScene { styles, targets, max_radius_px, depth_bias })
+    (!targets.is_empty()).then(|| JfaOutlineScene {
+        styles,
+        targets: targets.into_values().collect(),
+        max_radius_px,
+        depth_bias,
+    })
 }
 
 impl State {
-    pub(in crate::renderer) fn gather_jfa_outlines(&self, frame: &RenderFrame) -> Option<JfaOutlineScene> {
-        let mut combined = self.wired.jfa_outline.scene.clone().unwrap_or_default();
-        if let Some(ext) = decode_ext_jfa(frame) {
-            let base = combined.styles.len();
-            for s in ext.styles {
-                if combined.styles.len() < OUTLINE_STYLE_CAPACITY {
-                    combined.styles.push(s);
+    pub(in crate::renderer) fn gather_jfa_outlines(&self, frame: &RenderFrame) -> OutlineScenes {
+        let normalize = |mut scene: JfaOutlineScene| {
+            let mut unique = BTreeMap::new();
+            for target in scene.targets {
+                if target.draw_index < frame.draws.len()
+                    && target.style_index < scene.styles.len().min(OUTLINE_STYLE_CAPACITY)
+                    && (unique.len() < MASK_DRAW_BUDGET || unique.contains_key(&target.draw_index))
+                {
+                    unique.insert(target.draw_index, target);
                 }
             }
-            for t in ext.targets {
-                let idx = base + t.style_index;
-                if idx < combined.styles.len() {
-                    combined.targets.push(JfaOutlineTarget { draw_index: t.draw_index, style_index: idx });
-                }
-            }
-            combined.max_radius_px = combined.max_radius_px.max(ext.max_radius_px);
-            if combined.depth_bias <= 0.0 {
-                combined.depth_bias = ext.depth_bias;
-            }
-        }
-        (!combined.styles.is_empty() && !combined.targets.is_empty()).then_some(combined)
+            scene.targets = unique.into_values().collect();
+            (!scene.targets.is_empty()).then_some(scene)
+        };
+        [
+            self.wired.jfa_outline.scene.clone().and_then(normalize),
+            decode_ext_jfa(frame),
+            self.wired.jfa_outline.devtools_scene.clone().and_then(normalize),
+        ]
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_jfa_outlines_wired(
         wired: &mut WiredPasses,
         built_ins: &mut BuiltIns,
-        assets: &crate::asset_store::AssetStore<GpuAsset>,
+        drawing: &Drawing<'_>,
+        ready: &[ReadyEntry],
+        joints: Option<(&wgpu::Buffer, u64)>,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         frame: &RenderFrame,
-        catalog: &Catalog,
         outline_scene: &JfaOutlineScene,
         active_proj: &Matrix,
         scene_view: &wgpu::TextureView,
@@ -129,57 +149,62 @@ impl State {
         let pass_obj = wired.jfa_outline.pass.get_or_insert_with(|| JfaOutlinePass::new(device));
         pass_obj.resize(device, w, h);
         let style_slice = &outline_scene.styles[..outline_scene.styles.len().min(OUTLINE_STYLE_CAPACITY)];
-        pass_obj.set_styles(queue, style_slice);
 
         let vertex_stride = (MESH_VERTEX_FLOATS * size_of::<f32>()) as u64;
-        struct QueuedMeshDraw {
-            mesh_slot: usize,
-            first_index: u32,
-            index_count: u32,
-            prepared: crate::jfa_outline::PreparedMeshMask,
-        }
         let mut queued = Vec::new();
-        for target in &outline_scene.targets {
-            if target.style_index >= style_slice.len() {
+        for entry in ready {
+            let item = &drawing.items[entry.item];
+            let Source::Draw(index) = item.source else { continue };
+            if item.views & CAMERA == 0 || entry.persistent {
                 continue;
             }
-            let Some(draw) = frame.draws.get(target.draw_index) else { continue };
-            let Some(mesh_key) = catalog.meshes.get(draw.mesh as usize) else { continue };
-            let Some(mesh_slot) = assets.id(AssetKind::Mesh, mesh_key) else { continue };
-            let Some(GpuAsset::Mesh(mesh)) = assets.current(mesh_slot) else { continue };
-            let Some(lod0) = mesh.lods.first() else { continue };
-            if lod0.count == 0 {
+            let Ok(target) = outline_scene.targets.binary_search_by_key(&index, |target| target.draw_index) else {
+                continue;
+            };
+            let Some(GpuAsset::Mesh(mesh)) = entry.mesh.and_then(|slot| drawing.assets.current(slot)) else {
+                continue;
+            };
+            let lod = mesh.lods.get(usize::from(item.lod)).unwrap_or(&mesh.lods[0]);
+            if lod.count == 0 {
                 continue;
             }
             let params = MeshMaskParams {
                 vertex_stride,
-                model: draw.transform,
+                model: *item.transform(frame),
                 view_proj: active_vp,
-                style_index: target.style_index,
+                style_index: outline_scene.targets[target].style_index,
                 depth_mode,
                 scene_depth: Some(resolved_r32.as_ref().unwrap_or(depth_only)),
                 depth_bias: bias,
             };
-            let prepared = if resolved_r32.is_some() {
-                pass_obj.prepare_mesh_mask_r32(device, &params)
-            } else {
-                pass_obj.prepare_mesh_mask(device, &params)
+            let skin = entry.skin.zip(mesh.skin.as_ref()).zip(joints);
+            let prepared = pass_obj.prepare_scene_mask(
+                device,
+                &params,
+                resolved_r32.is_some(),
+                skin.map(|((at, _), (buffer, size))| (at, buffer, size)),
+            );
+            let vertices = match (entry.morph, drawing.morphed) {
+                (Some((start, end)), Some(morphed)) => morphed.slice(start..end),
+                _ => mesh.vertices.slice(..),
             };
-            queued.push(QueuedMeshDraw { mesh_slot, first_index: lod0.first, index_count: lod0.count, prepared });
+            queued.push((mesh, lod, vertices, skin.map(|((_, skin), _)| skin.vertices.slice(..)), prepared));
         }
         if queued.is_empty() {
             return Ok(());
         }
         {
             let mut mask_pass = pass_obj.begin_mask_pass_with_depth_mode(encoder, depth_mode);
-            for item in &queued {
-                let Some(GpuAsset::Mesh(mesh)) = assets.current(item.mesh_slot) else { continue };
+            for (mesh, lod, vertices, skin, prepared) in queued {
+                if let Some(skin) = skin {
+                    mask_pass.set_vertex_buffer(1, skin);
+                }
                 pass_obj.draw_mesh_mask(
                     &mut mask_pass,
-                    &item.prepared,
-                    mesh.vertices.slice(..),
+                    &prepared,
+                    vertices,
                     Some((mesh.indices.slice(..), wgpu::IndexFormat::Uint32)),
-                    item.first_index..item.first_index + item.index_count,
+                    lod.first..lod.first + lod.count,
                 );
             }
         }
@@ -191,8 +216,36 @@ impl State {
             .unwrap_or(1);
         let radius =
             if outline_scene.max_radius_px > 0 { outline_scene.max_radius_px } else { auto_radius }.clamp(1, 64);
+        pass_obj.encode_styles(device, encoder, style_slice);
         pass_obj.run_jfa(device, queue, encoder, radius);
         pass_obj.composite(device, queue, encoder, scene_view, SCENE_FORMAT);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pen_protocol::{Draw, Extension};
+
+    #[test]
+    fn outline_extension_rejects_excess_styles_and_deduplicates_targets() {
+        let mut values = vec![0.0; 3 + 22];
+        values[0] = 2.0;
+        values.extend([0.0, 0.0, 0.0, 1.0, 1.0, 0.0]);
+        let mut frame = RenderFrame {
+            draws: vec![Draw::default(); 2],
+            extensions: vec![Extension { tag: JFA_OUTLINE_EXT_TAG, values }],
+            ..Default::default()
+        };
+        let scene = decode_ext_jfa(&frame).unwrap();
+        assert_eq!(
+            scene.targets,
+            [JfaOutlineTarget { draw_index: 0, style_index: 1 }, JfaOutlineTarget { draw_index: 1, style_index: 0 },]
+        );
+        let values = &mut frame.extensions[0].values;
+        values.resize(3 + 257 * 11 + 2, 0.0);
+        values[0] = 257.0;
+        assert!(decode_ext_jfa(&frame).is_none());
     }
 }

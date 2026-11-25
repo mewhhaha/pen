@@ -39,6 +39,8 @@ enum Rules {
     Welsh,
     /// one: i = 0 or n = 1 (hi, fa, bn, ...).
     Hindi,
+    /// one: n = 0..1 (pa).
+    Punjabi,
     Macedonian,
     Filipino,
     Maltese,
@@ -52,7 +54,13 @@ fn rules(tag: &str) -> Rules {
     let mut subtags = tag.split(['-', '_']);
     let language = subtags.next().unwrap_or_default().to_ascii_lowercase();
     match language.as_str() {
-        "pt" if subtags.any(|subtag| subtag.eq_ignore_ascii_case("pt")) => Rules::Italian,
+        "pt" => {
+            let region = subtags.take_while(|subtag| subtag.len() != 1).find(|subtag| {
+                (subtag.len() == 2 && subtag.bytes().all(|byte| byte.is_ascii_alphabetic()))
+                    || (subtag.len() == 3 && subtag.bytes().all(|byte| byte.is_ascii_digit()))
+            });
+            if region.is_some_and(|region| region.eq_ignore_ascii_case("pt")) { Rules::Italian } else { Rules::French }
+        }
         "en" | "de" | "nl" | "sv" | "fi" | "et" | "ur" | "yi" | "sw" | "gl" | "ast" | "fy" | "ia" | "io" | "lij"
         | "sc" => Rules::English,
         "nb" | "no" | "nn" | "bg" | "el" | "hu" | "tr" | "ps" | "dv" | "ug" | "ckb" | "sd" | "sq" | "af" | "az"
@@ -62,7 +70,7 @@ fn rules(tag: &str) -> Rules {
         "is" => Rules::Icelandic,
         "es" => Rules::Spanish,
         "it" | "ca" => Rules::Italian,
-        "fr" | "pt" => Rules::French,
+        "fr" => Rules::French,
         "ru" | "uk" | "be" => Rules::Russian,
         "pl" => Rules::Polish,
         "cs" | "sk" => Rules::Czech,
@@ -76,6 +84,7 @@ fn rules(tag: &str) -> Rules {
         "ga" => Rules::Irish,
         "cy" => Rules::Welsh,
         "hi" | "fa" | "bn" | "gu" | "kn" | "zu" | "am" | "as" => Rules::Hindi,
+        "pa" => Rules::Punjabi,
         "mk" => Rules::Macedonian,
         "fil" | "tl" => Rules::Filipino,
         "mt" => Rules::Maltese,
@@ -94,6 +103,7 @@ pub fn categories(tag: &str) -> &'static [u32] {
         | Rules::Danish
         | Rules::Icelandic
         | Rules::Hindi
+        | Rules::Punjabi
         | Rules::Macedonian
         | Rules::Filipino
         | Rules::Armenian => &[ONE, OTHER],
@@ -224,6 +234,7 @@ fn category(rules: Rules, count: &Operands) -> u32 {
             (count.is(6), MANY),
         ]),
         Rules::Hindi => pick(&[(i == 0 || count.is(1), ONE)]),
+        Rules::Punjabi => pick(&[(count.range(0, 1), ONE)]),
         Rules::Macedonian => pick(&[((v == 0 && i10 == 1 && i100 != 11) || (f10 == 1 && f100 != 11), ONE)]),
         Rules::Filipino => {
             let unlucky = |digit: u64| matches!(digit, 4 | 6 | 9);
@@ -330,6 +341,26 @@ pub fn count_text(language: &str, count: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portuguese_region_precedes_extensions_and_private_use() {
+        for tag in ["pt-BR-x-pt", "pt-x-pt", "pt-u-rg-ptzzzz", "pt-t-pt", "pt-076-x-pt"] {
+            assert_eq!(plural(tag, 0.0), ONE, "{tag}");
+            assert_eq!(plural(tag, 1.0), ONE, "{tag}");
+        }
+        for tag in ["pt-PT", "pt-Latn-PT-x-br"] {
+            assert_eq!(plural(tag, 0.0), OTHER, "{tag}");
+            assert_eq!(plural(tag, 1.0), ONE, "{tag}");
+        }
+    }
+
+    #[test]
+    fn punjabi_counts_zero_and_one_as_one() {
+        assert_eq!(categories("pa"), &[ONE, OTHER]);
+        for (count, expected) in [(0.0, ONE), (1.0, ONE), (2.0, OTHER), (0.5, OTHER)] {
+            assert_eq!(plural("pa", count), expected, "{count}");
+        }
+    }
 
     /// Checks each count of `samples` is `category` in `language`.
     fn expect(language: &str, category: u32, samples: &[f64]) {

@@ -59,6 +59,7 @@ use crate::mipmaps::Mipmapper;
 use crate::packed_texture::PackedHeader;
 use crate::pipeline_cache::PipelineCache;
 use crate::post::{Post, TONED_WGSL};
+use crate::render2d::SdfShape;
 use crate::shader::{self, EXTRA_VERTEX_BYTES, PipelineContext, Pipelines, TANGENT_BYTES, Variants};
 use crate::solids::SolidBatch;
 use crate::sprites::{SpriteBatch, Sprites, sprite_group_layout};
@@ -196,11 +197,11 @@ pub(crate) struct ShaderAsset {
     /// The variants its loaded materials draw with.
     needs: Variants,
     /// Its pipelines by samples per pixel, compiled in the background.
-    made: HashMap<u32, Pipelines>,
+    made: HashMap<(u32, crate::camera_precision::DepthMode), Pipelines>,
     /// Variants compiling in the background, and those that failed, by
     /// samples per pixel.
-    compiling: HashMap<u32, Variants>,
-    failed: HashMap<u32, Variants>,
+    compiling: HashMap<(u32, crate::camera_precision::DepthMode), Variants>,
+    failed: HashMap<(u32, crate::camera_precision::DepthMode), Variants>,
     /// Its depth-only pipelines into the shadow map, plain, instanced and
     /// skinned (by `Stage`), compiled in the background when a loaded
     /// material casts shadows.
@@ -215,6 +216,7 @@ struct Staged {
     early: bool,
     /// The sample count frames drew with when it loaded.
     samples: u32,
+    depth_mode: crate::camera_precision::DepthMode,
     /// Why a compile failed, if one did.
     failure: Option<String>,
 }
@@ -392,12 +394,15 @@ struct SolidMesh {
 /// Independent per-camera temporal & history state so secondary views (RTT cameras and
 /// split-screen viewports) never corrupt the primary camera's or each other's TAA, exposure,
 /// volumetric fog, Hi-Z occlusion, or SSR history.
+#[derive(Default)]
 pub(super) struct ViewTemporalState {
     pub(super) post: Option<Post>,
     pub(super) volumetrics: Option<crate::volume::Volumetrics>,
     pub(super) hiz: Option<hiz::HiZ>,
     pub(super) reflected: Option<(wgpu::TextureView, Matrix, u64)>,
     pub(super) last_time: Option<f64>,
+    depth_mode: Option<crate::camera_precision::DepthMode>,
+    rt_history: wired_passes::RtHistory,
 }
 
 impl ViewTemporalState {
@@ -408,6 +413,8 @@ impl ViewTemporalState {
             hiz: Some(hiz::HiZ::new(device, queue)),
             reflected: None,
             last_time: None,
+            depth_mode: None,
+            rt_history: Default::default(),
         }
     }
 }
@@ -1431,9 +1438,8 @@ impl State {
             // Construct and upload into the new VideoTexture BEFORE swapping so an error
             // never invalidates a working texture.
             let video = crate::video::VideoTexture::new(&self.device, width, height)?;
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("video_upload"),
-            });
+            let mut encoder =
+                self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("video_upload") });
             video.upload_planes(&self.queue, &mut encoder, width, height, color_space, siting, y, u, v)?;
             self.queue.submit(Some(encoder.finish()));
             let id = self.view_id();
@@ -1445,7 +1451,8 @@ impl State {
                 ..Default::default()
             });
             let linear = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let asset = TextureAsset { texture, view, linear, view_id: id, resident: 0, shown: 0.0, seen: false, stream: None };
+            let asset =
+                TextureAsset { texture, view, linear, view_id: id, resident: 0, shown: 0.0, seen: false, stream: None };
             match found {
                 Some(index) => {
                     let old = std::mem::replace(&mut self.videos[index].1, asset);
@@ -1461,9 +1468,8 @@ impl State {
             return Ok(());
         }
         let index = found.unwrap();
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("video_upload"),
-        });
+        let mut encoder =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("video_upload") });
         self.videos[index].2.upload_planes(&self.queue, &mut encoder, width, height, color_space, siting, y, u, v)?;
         self.queue.submit(Some(encoder.finish()));
         Ok(())
@@ -1480,14 +1486,21 @@ impl State {
         target: &mut dyn crate::RenderTarget,
         temporal: &mut ViewTemporalState,
     ) -> Result<(bool, RenderStats)> {
-        let mut cam_vol = temporal
-            .volumetrics
-            .take()
-            .unwrap_or_else(|| crate::volume::Volumetrics::new(&self.device, &self.queue));
-        let mut cam_hiz = temporal
-            .hiz
-            .take()
-            .unwrap_or_else(|| hiz::HiZ::new(&self.device, &self.queue));
+        let parent_depth = self.depth_mode();
+        let child_depth = crate::camera_precision::detect_depth_mode(&frame.projection).unwrap_or(parent_depth);
+        if temporal.depth_mode != Some(child_depth) {
+            temporal.post = None;
+            temporal.volumetrics = None;
+            temporal.hiz = None;
+            temporal.reflected = None;
+            temporal.rt_history = Default::default();
+            temporal.depth_mode = Some(child_depth);
+        }
+        self.select_depth_mode(child_depth);
+        std::mem::swap(&mut self.wired.rt_history, &mut temporal.rt_history);
+        let mut cam_vol =
+            temporal.volumetrics.take().unwrap_or_else(|| crate::volume::Volumetrics::new(&self.device, &self.queue));
+        let mut cam_hiz = temporal.hiz.take().unwrap_or_else(|| hiz::HiZ::new(&self.device, &self.queue));
         std::mem::swap(&mut self.post, &mut temporal.post);
         std::mem::swap(&mut self.volumetrics, &mut cam_vol);
         std::mem::swap(&mut self.hiz, &mut cam_hiz);
@@ -1528,6 +1541,8 @@ impl State {
         std::mem::swap(&mut self.last_time, &mut temporal.last_time);
         temporal.volumetrics = Some(cam_vol);
         temporal.hiz = Some(cam_hiz);
+        std::mem::swap(&mut self.wired.rt_history, &mut temporal.rt_history);
+        self.select_depth_mode(parent_depth);
         res?;
         Ok((child_waiting, child_stats))
     }
@@ -1552,8 +1567,7 @@ impl State {
             "render_camera_to_texture cannot sample PQ-encoded Rgb10a2Unorm directly as material color"
         );
         let v = &frame.view;
-        let det = v[0] * (v[5] * v[10] - v[6] * v[9])
-            - v[4] * (v[1] * v[10] - v[2] * v[9])
+        let det = v[0] * (v[5] * v[10] - v[6] * v[9]) - v[4] * (v[1] * v[10] - v[2] * v[9])
             + v[8] * (v[1] * v[6] - v[2] * v[5]);
         anyhow::ensure!(
             det > 1e-6,
@@ -1608,10 +1622,7 @@ impl State {
         let idx = found.unwrap();
         let back = 1 - self.camera_targets[idx].front;
         let mut target = self.camera_targets[idx].targets[back].take().expect("camera back buffer present");
-        let mut temporal = std::mem::replace(
-            &mut self.camera_targets[idx].temporal,
-            ViewTemporalState { post: None, volumetrics: None, hiz: None, reflected: None, last_time: None },
-        );
+        let mut temporal = std::mem::take(&mut self.camera_targets[idx].temporal);
         let res = self.submit_secondary_view(frame, catalog, &mut target, &mut temporal);
         let entry = &mut self.camera_targets[idx];
         entry.targets[back] = Some(target);
@@ -1720,37 +1731,23 @@ impl State {
         if self.context.depth_mode() == mode {
             return;
         }
-        self.context.set_depth_mode(mode);
-        // Clear all depth-dependent cached pipelines so shaders, built-ins, decals, OIT and
-        // outdoor environment passes recompile cleanly for the new depth convention.
-        for slot in &mut self.assets.slots {
-            if let Some(GpuAsset::Shader(sh)) = &mut slot.current {
-                sh.made.clear();
-                sh.compiling.clear();
-                sh.failed.clear();
-            }
-        }
-        for staged in self.staging.values_mut() {
-            staged.shader.made.clear();
-            staged.shader.compiling.clear();
-            staged.shader.failed.clear();
-        }
-        self.built_ins.invalidate_depth_dependent();
+        self.select_depth_mode(mode);
         self.post = None;
-        for ct in &mut self.camera_targets {
-            ct.temporal.post = None;
+        self.wired.rt_history = Default::default();
+        self.hiz.invalidate();
+    }
+
+    fn select_depth_mode(&mut self, mode: crate::camera_precision::DepthMode) {
+        if self.depth_mode() == mode {
+            return;
         }
-        for sv in &mut self.wired.split_views {
-            sv.temporal.post = None;
-        }
+        self.context.set_depth_mode(mode);
         self.particles = None;
         self.ribbons = None;
         self.decals = None;
         self.wired.oit_pipelines.clear();
         self.wired.pbr_decals.clear();
         self.wired.env_pipelines.clear();
-        self.wired.reset_svgf_history();
-        self.hiz.invalidate();
     }
 
     pub fn upload_terrain_heightmap(
@@ -1915,7 +1912,7 @@ mod tests {
     fn a_mesh_pipelines_fragment_stage_samples_fifteen_textures_within_strict_webgpu_limits() {
         let scene = fragment_textures(&scene_layout_entries());
         let draw = fragment_textures(&draw_layout_entries());
-        let lights = fragment_textures(&crate::lights::layout_entries());
+        let lights = fragment_textures(&crate::lights::layout_entries(false));
         // The sun's map and cascades, the sky's cube and BRDF table, the reflection probes' cubes,
         // the depth and picture of screen-space reflections, the camera's depth for contact shadows,
         // and the opaque picture, its depth and the froxel volume (bindings 14 to 16, fragment only).
@@ -1927,5 +1924,31 @@ mod tests {
         let total = scene.len() + draw.len() + lights.len();
         assert_eq!(total, 15, "mesh fragment stage must stay within strict 15-texture limit");
         assert!(total <= 15);
+    }
+}
+
+impl crate::Renderer {
+    pub fn set_devtools_jfa_outlines(&mut self, scene: JfaOutlineScene) {
+        self.state.wired.jfa_outline.devtools_scene = Some(scene);
+    }
+
+    pub fn clear_devtools_jfa_outlines(&mut self) {
+        self.state.wired.jfa_outline.devtools_scene = None;
+    }
+
+    pub fn set_devtools_line_scene(&mut self, scene: LineScene) {
+        self.state.wired.lines.devtools_scene = Some(scene);
+    }
+
+    pub fn clear_devtools_line_scene(&mut self) {
+        self.state.wired.lines.devtools_scene = None;
+    }
+
+    pub fn set_devtools_sdf_overlay(&mut self, shapes: Vec<SdfShape>) {
+        self.state.wired.render2d.devtools_sdf_overlay = shapes;
+    }
+
+    pub fn clear_devtools_sdf_overlay(&mut self) {
+        self.state.wired.render2d.devtools_sdf_overlay.clear();
     }
 }

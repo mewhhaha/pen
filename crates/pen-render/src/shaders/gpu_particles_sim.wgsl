@@ -189,65 +189,69 @@ fn simulate_step(@builtin(global_invocation_id) id: vec3u) {
 
   // Swept world-space depth-buffer collision test (prevents tunneling and never bounces exiting particles).
   if (params.flags.x > 0.5) {
-    let clip_next = params.view_projection * vec4f(next_pos, 1.0);
-    if (clip_next.w > 1e-4) {
-      let ndc = clip_next.xyz / clip_next.w;
-      if (ndc.x >= -1.0 && ndc.x <= 1.0 && ndc.y >= -1.0 && ndc.y <= 1.0 && ndc.z >= 0.0 && ndc.z <= 1.0) {
-        let dims = vec2i(textureDimensions(depth_tex, 0));
-        let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        let px = clamp(vec2i(floor(uv * vec2f(dims))), vec2i(0), dims - vec2i(1));
-        let surf = load_depth_world(px, dims);
-        if (surf.valid) {
-          // Reconstruct surface normal from valid neighbors oriented toward the visible (camera) side.
-          let sr = load_depth_world(px + vec2i(1, 0), dims);
-          let sl = load_depth_world(px - vec2i(1, 0), dims);
-          let sd = load_depth_world(px + vec2i(0, 1), dims);
-          let su = load_depth_world(px - vec2i(0, 1), dims);
-          var dx = vec3f(1.0, 0.0, 0.0);
-          if (sr.valid && sl.valid) {
-            let dr = sr.world - surf.world;
-            let dl = surf.world - sl.world;
-            dx = select(dl, dr, dot(dr, dr) < dot(dl, dl));
-          } else if (sr.valid) {
-            dx = sr.world - surf.world;
-          } else if (sl.valid) {
-            dx = surf.world - sl.world;
-          }
-          var dy = vec3f(0.0, 0.0, 1.0);
-          if (sd.valid && su.valid) {
-            let dd = sd.world - surf.world;
-            let du = surf.world - su.world;
-            dy = select(du, dd, dot(dd, dd) < dot(du, du));
-          } else if (sd.valid) {
-            dy = sd.world - surf.world;
-          } else if (su.valid) {
-            dy = surf.world - su.world;
-          }
-          let raw_n = cross(dx, dy);
-          var n = select(vec3f(0.0, 1.0, 0.0), normalize(raw_n), dot(raw_n, raw_n) > 1e-12 * dot(dx, dx) * dot(dy, dy));
-          let to_cam = params.camera_pos_and_clear.xyz - surf.world;
-          if (dot(n, to_cam) < 0.0) {
-            n = -n;
-          }
+    for (var sample_index = 1u; sample_index <= 2u; sample_index += 1u) {
+      let sample_pos = mix(prev_pos, next_pos, f32(sample_index) * 0.5);
+      let clip_next = params.view_projection * vec4f(sample_pos, 1.0);
+      if (clip_next.w > 1e-4) {
+        let ndc = clip_next.xyz / clip_next.w;
+        if (ndc.x >= -1.0 && ndc.x <= 1.0 && ndc.y >= -1.0 && ndc.y <= 1.0 && ndc.z >= 0.0 && ndc.z <= 1.0) {
+          let dims = vec2i(textureDimensions(depth_tex, 0));
+          let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+          let px = clamp(vec2i(floor(uv * vec2f(dims))), vec2i(0), dims - vec2i(1));
+          let surf = load_depth_world(px, dims);
+          if (surf.valid) {
+            // Reconstruct surface normal from valid neighbors oriented toward the visible (camera) side.
+            let sr = load_depth_world(px + vec2i(1, 0), dims);
+            let sl = load_depth_world(px - vec2i(1, 0), dims);
+            let sd = load_depth_world(px + vec2i(0, 1), dims);
+            let su = load_depth_world(px - vec2i(0, 1), dims);
+            var dx = vec3f(1.0, 0.0, 0.0);
+            if (sr.valid && sl.valid) {
+              let dr = sr.world - surf.world;
+              let dl = surf.world - sl.world;
+              dx = select(dl, dr, dot(dr, dr) < dot(dl, dl));
+            } else if (sr.valid) {
+              dx = sr.world - surf.world;
+            } else if (sl.valid) {
+              dx = surf.world - sl.world;
+            }
+            var dy = vec3f(0.0, 0.0, 1.0);
+            if (sd.valid && su.valid) {
+              let dd = sd.world - surf.world;
+              let du = surf.world - su.world;
+              dy = select(du, dd, dot(dd, dd) < dot(du, du));
+            } else if (sd.valid) {
+              dy = sd.world - surf.world;
+            } else if (su.valid) {
+              dy = surf.world - su.world;
+            }
+            let raw_n = cross(dx, dy);
+            var n = select(vec3f(0.0, 1.0, 0.0), normalize(raw_n), dot(raw_n, raw_n) > 1e-12 * dot(dx, dx) * dot(dy, dy));
+            let to_cam = params.camera_pos_and_clear.xyz - surf.world;
+            if (dot(n, to_cam) < 0.0) {
+              n = -n;
+            }
 
-          // World-space signed distances to surface plane along outward normal `n`.
-          let radius = max(p.size_rot_gen.x * 0.5, 0.01);
-          let thick = max(params.collision.z, radius);
-          let d_prev = dot(prev_pos - surf.world, n);
-          let d_next = dot(next_pos - surf.world, n);
-          let vn = dot(vel, n);
-          // Accept collision only when moving into the visible surface (vn < 0) and crossing or entering the thickness slab.
-          let crossed = d_prev >= -radius && d_next <= radius && d_next >= -(thick + abs(d_prev - d_next));
-          if (vn < 0.0 && crossed) {
-            let restitution = clamp(params.collision.x, 0.0, 1.0);
-            let friction = clamp(params.collision.y, 0.0, 1.0);
-            let v_normal = n * vn;
-            let v_tangent = vel - v_normal;
-            vel = v_tangent * (1.0 - friction) - v_normal * restitution;
-            next_pos = surf.world + n * (radius + 0.01);
-            atomicAdd(&counters.bounces, 1u);
-            if (is_primary && params.flags.y > 0.5) {
-              enqueue_children(next_pos, n, vel, p.color, p.size_rot_gen.x, idx);
+            // World-space signed distances to surface plane along outward normal `n`.
+            let radius = max(p.size_rot_gen.x * 0.5, 0.01);
+            let thick = max(params.collision.z, radius);
+            let d_prev = dot(prev_pos - surf.world, n);
+            let d_next = dot(sample_pos - surf.world, n);
+            let vn = dot(vel, n);
+            // Accept collision only when moving into the visible surface (vn < 0) and crossing or entering the thickness slab.
+            let crossed = d_prev >= -radius && d_next <= radius && d_next >= -thick;
+            if (vn < 0.0 && crossed) {
+              let restitution = clamp(params.collision.x, 0.0, 1.0);
+              let friction = clamp(params.collision.y, 0.0, 1.0);
+              let v_normal = n * vn;
+              let v_tangent = vel - v_normal;
+              vel = v_tangent * (1.0 - friction) - v_normal * restitution;
+              next_pos = surf.world + n * (radius + 0.01);
+              atomicAdd(&counters.bounces, 1u);
+              if (is_primary && params.flags.y > 0.5) {
+                enqueue_children(next_pos, n, vel, p.color, p.size_rot_gen.x, idx);
+              }
+              break;
             }
           }
         }

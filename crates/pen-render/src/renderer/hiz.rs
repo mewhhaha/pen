@@ -2,6 +2,7 @@
 // (max-depth for Forward-Z, min-depth for Reversed-Z) for conservative GPU
 // occlusion culling (`cull.wgsl` and two-phase `meshlet_cull.wgsl`).
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pen_protocol::Matrix;
 
@@ -14,6 +15,7 @@ const HIZ_BASE_WGSL: &str = include_str!("../shaders/hiz_base.wgsl");
 const HIZ_REDUCE_WGSL: &str = include_str!("../shaders/hiz.wgsl");
 
 const WORKGROUP: u32 = 8;
+static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
 
 struct Pyramid {
     _texture: wgpu::Texture,
@@ -38,7 +40,6 @@ pub(crate) struct HiZ {
     pyramid: Option<Pyramid>,
     base_group: Option<(u32, bool, u64, wgpu::BindGroup)>,
     depth_serial: u64,
-    next_id: u64,
 }
 
 impl HiZ {
@@ -103,7 +104,6 @@ impl HiZ {
             pyramid: None,
             base_group: None,
             depth_serial: 0,
-            next_id: 1,
         }
     }
 
@@ -244,23 +244,19 @@ impl HiZ {
                     })
                 })
                 .collect();
-            let view_id = self.next_id;
-            self.next_id += 1;
-            self.pyramid = Some(Pyramid {
-                _texture: texture,
-                size,
-                mips,
-                full_view,
-                mip_views,
-                reduce_groups,
-                view_id,
-            });
+            let view_id = NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed);
+            self.pyramid =
+                Some(Pyramid { _texture: texture, size, mips, full_view, mip_views, reduce_groups, view_id });
             self.base_group = None;
         }
 
         let pyramid = self.pyramid.as_ref().unwrap();
         let depth_serial = self.depth_serial;
-        if self.base_group.as_ref().is_none_or(|(s, rev, ser, _)| *s != samples || *rev != reversed_z || *ser != depth_serial) {
+        if self
+            .base_group
+            .as_ref()
+            .is_none_or(|(s, rev, ser, _)| *s != samples || *rev != reversed_z || *ser != depth_serial)
+        {
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("hiz base"),
                 layout: &base_pipeline.get_bind_group_layout(0),
@@ -295,5 +291,36 @@ impl HiZ {
         self.depth_mode = depth_mode;
         self.vp = vp;
         self.valid = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cameras_get_distinct_pyramid_ids_at_the_same_resolution() {
+        let (device, queue) = crate::testing::device().expect("headless GPU adapter required");
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = depth.create_view(&Default::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let timer = GpuTimer::new(&device, &queue);
+        let mut cameras = std::array::from_fn::<_, 2, _>(|_| HiZ::new(&device, &queue));
+        for camera in &mut cameras {
+            camera.build(&device, &mut encoder, &view, (4, 4), 1, DepthMode::ForwardZ, IDENTITY, None, &timer);
+            assert!(camera.source().5);
+        }
+        let [first, second] = cameras.map(|camera| camera.source().1);
+        assert!(first > 0 && second > first);
+        queue.submit([encoder.finish()]);
     }
 }

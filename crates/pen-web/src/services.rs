@@ -40,8 +40,8 @@ pub fn with_preferences(preferences: pen_runtime::engine_preferences::Preference
     services
 }
 
-/// Installs the current tables and returns the selected language direction.
-pub fn register_locale(services: &mut Services, locales: Locales) -> bool {
+/// Installs the current tables and returns the selected BCP 47 tag and direction.
+pub fn register_locale(services: &mut Services, locales: Locales) -> (String, bool) {
     let window = web_sys::window().unwrap();
     let wanted = window
         .location()
@@ -51,9 +51,10 @@ pub fn register_locale(services: &mut Services, locales: Locales) -> bool {
         .and_then(|query| query.get("lang"))
         .unwrap_or_else(|| window.navigator().language().unwrap_or_default());
     let locale = LocaleService::new(locales, &wanted);
-    let rtl = locale.locale().right_to_left();
+    let selected = locale.locale();
+    let language = (selected.tag().replace('_', "-"), selected.right_to_left());
     services.register(Box::new(locale));
-    rtl
+    language
 }
 
 /// Opens a web address in a new tab.

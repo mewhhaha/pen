@@ -72,10 +72,36 @@ impl Default for GpuParticleScene {
 pub(in crate::renderer) struct GpuParticleWiredState {
     pub scene: Option<GpuParticleScene>,
     pub system: Option<GpuParticleSystem>,
-    pub config_key: Option<(u32, u32, bool, u64)>,
+    pub config_key: Option<(u32, u64)>,
+    last_step_frame: Option<u64>,
+    needs_seed: bool,
     pub sim_time: f32,
     pub last_ext_seed_hash: u64,
     pub last_seed_snapshot: Vec<GpuParticle>,
+}
+
+pub(in crate::renderer) struct ParticleStep {
+    frame: u64,
+    time: f32,
+    seed: Option<Vec<GpuParticle>>,
+    ext_seed_hash: Option<u64>,
+}
+
+impl GpuParticleWiredState {
+    pub fn submitted(&mut self, step: ParticleStep) {
+        self.last_step_frame = Some(step.frame);
+        self.sim_time = step.time;
+        self.needs_seed = false;
+        if let Some(seed) = step.seed {
+            self.last_seed_snapshot = seed;
+            if let Some(scene) = &mut self.scene {
+                scene.pending_seed = None;
+            }
+        }
+        if let Some(hash) = step.ext_seed_hash {
+            self.last_ext_seed_hash = hash;
+        }
+    }
 }
 
 fn mesh_hash(verts: &[GpuParticleMeshVertex], indices: &[u32]) -> u64 {
@@ -139,7 +165,7 @@ fn decode_ext_gpu_particles(frame: &RenderFrame) -> Option<(GpuParticleScene, bo
         sub_emit_speed: v[13].max(0.5),
         sub_emit_life: v[14].max(0.15),
         ambient: v[15].max(0.0),
-        pending_seed: (!seed.is_empty()).then_some(seed),
+        pending_seed: (reseed_flag || !seed.is_empty()).then_some(seed),
         ..GpuParticleScene::default()
     };
     Some((scene, reseed_flag, seed_hash))
@@ -168,70 +194,64 @@ impl State {
         size: (u32, u32),
         samples: u32,
         depth_mode: DepthMode,
-    ) -> Result<()> {
-        let ext_decoded = if wired.gpu_particles.scene.is_none() { decode_ext_gpu_particles(frame) } else { None };
-        let (scene_cfg, pending_seed) = if let Some(scene) = wired.gpu_particles.scene.as_mut() {
-            let seed = scene.pending_seed.take();
-            (scene.clone(), seed)
-        } else if let Some((mut ext_scene, force_reseed, seed_hash)) = ext_decoded {
-            let need_seed = force_reseed
-                || wired.gpu_particles.system.is_none()
-                || (seed_hash != wired.gpu_particles.last_ext_seed_hash && ext_scene.pending_seed.is_some());
-            let seed = if need_seed {
-                wired.gpu_particles.last_ext_seed_hash = seed_hash;
-                ext_scene.pending_seed.take()
-            } else {
-                None
-            };
-            (ext_scene, seed)
+        frame_number: u64,
+    ) -> Result<Option<ParticleStep>> {
+        let particles = &mut wired.gpu_particles;
+        let ext_decoded = if particles.scene.is_none() { decode_ext_gpu_particles(frame) } else { None };
+        let (scene_cfg, force_reseed, ext_hash) = if let Some(scene) = &particles.scene {
+            (scene, false, None)
+        } else if let Some((scene, force, hash)) = &ext_decoded {
+            (scene, *force, Some(*hash))
         } else {
-            return Ok(());
+            return Ok(None);
         };
 
         let samples = samples.max(1);
         let reversed_z = depth_mode == DepthMode::ReversedZ;
-        let mhash = mesh_hash(&scene_cfg.mesh_vertices, &scene_cfg.mesh_indices);
-        let key = (scene_cfg.max_particles, samples, reversed_z, mhash);
-        let recreated = wired.gpu_particles.system.is_none() || wired.gpu_particles.config_key != Some(key);
+        let key = (scene_cfg.max_particles, mesh_hash(&scene_cfg.mesh_vertices, &scene_cfg.mesh_indices));
+        let recreated = particles.system.is_none() || particles.config_key != Some(key);
+        let target = PipelineTarget {
+            color_format: SCENE_FORMAT,
+            depth_format: Some(wgpu::TextureFormat::Depth24PlusStencil8),
+            depth_compare: depth_mode.compare_nearer_or_equal(),
+            sample_count: samples,
+        };
         if recreated {
-            let target = match depth_mode {
-                DepthMode::ForwardZ => PipelineTarget {
-                    color_format: SCENE_FORMAT,
-                    depth_format: Some(wgpu::TextureFormat::Depth24PlusStencil8),
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    sample_count: samples,
-                },
-                DepthMode::ReversedZ => {
-                    PipelineTarget::reversed_z(SCENE_FORMAT, Some(wgpu::TextureFormat::Depth24PlusStencil8), samples)
-                }
-            };
-            let sys = GpuParticleSystem::new(
+            particles.system = Some(GpuParticleSystem::new(
                 device,
                 scene_cfg.max_particles,
                 &scene_cfg.mesh_vertices,
                 &scene_cfg.mesh_indices,
                 target,
-            )?;
-            wired.gpu_particles.system = Some(sys);
-            wired.gpu_particles.config_key = Some(key);
+            )?);
+            particles.config_key = Some(key);
+            particles.needs_seed = true;
         }
-
-        if let Some(seed) = pending_seed {
-            wired.gpu_particles.last_seed_snapshot = seed.clone();
-            if let Some(sys) = wired.gpu_particles.system.as_ref() {
-                let capped = seed.len().min(scene_cfg.max_particles as usize);
-                sys.seed(device, encoder, &seed[..capped])?;
+        particles.system.as_mut().unwrap().select_draw_target(device, target);
+        let scene_cfg = scene_cfg.clone();
+        let stepping = particles.last_step_frame != Some(frame_number);
+        let ext_changed = ext_hash.is_some_and(|hash| hash != particles.last_ext_seed_hash);
+        let seed = if stepping && (ext_hash.is_none() || force_reseed || ext_changed || particles.needs_seed) {
+            scene_cfg.pending_seed.as_deref()
+        } else {
+            None
+        };
+        let commit = if stepping {
+            let sys = particles.system.as_ref().unwrap();
+            let initial = seed.or_else(|| particles.needs_seed.then_some(particles.last_seed_snapshot.as_slice()));
+            if let Some(initial) = initial {
+                sys.seed(device, encoder, &initial[..initial.len().min(scene_cfg.max_particles as usize)])?;
             }
-        } else if recreated
-            && !wired.gpu_particles.last_seed_snapshot.is_empty()
-            && let Some(sys) = wired.gpu_particles.system.as_ref()
-        {
-            let snap = &wired.gpu_particles.last_seed_snapshot;
-            let capped = snap.len().min(scene_cfg.max_particles as usize);
-            sys.seed(device, encoder, &snap[..capped])?;
-        }
+            Some(ParticleStep {
+                frame: frame_number,
+                time: particles.sim_time + scene_cfg.dt.clamp(0.0, 0.1),
+                seed: seed.map(<[GpuParticle]>::to_vec),
+                ext_seed_hash: ext_hash.filter(|_| seed.is_some()),
+            })
+        } else {
+            None
+        };
 
-        let depth_r32 = wired.resolve_msaa_depth(device, built_ins, encoder, depth_only, size, samples);
         let active_vp = multiply(active_proj, &frame.view);
         let eye = invert(&frame.view);
         let cam_pos = [eye[12], eye[13], eye[14]];
@@ -240,32 +260,33 @@ impl State {
         let sun_dir = if sl > 1e-6 { [sun_raw[0] / sl, sun_raw[1] / sl, sun_raw[2] / sl] } else { [0.0, 1.0, 0.0] };
         let sun_col = [frame.light_color.x.max(0.0), frame.light_color.y.max(0.0), frame.light_color.z.max(0.0)];
 
-        let dt = scene_cfg.dt.clamp(0.0, 0.1);
-        wired.gpu_particles.sim_time += dt;
-        let sim_params = GpuParticleSimParams {
-            view_projection: active_vp,
-            camera_pos: cam_pos,
-            depth_clear: depth_mode.clear_value(),
-            gravity: scene_cfg.gravity,
-            dt,
-            drag: scene_cfg.drag,
-            curl_strength: scene_cfg.curl_strength,
-            curl_frequency: scene_cfg.curl_frequency,
-            time: wired.gpu_particles.sim_time,
-            restitution: scene_cfg.restitution,
-            friction: scene_cfg.friction,
-            depth_thickness: scene_cfg.depth_thickness,
-            reversed_z,
-            depth_collide: scene_cfg.depth_collide,
-            sub_emit_on_bounce: scene_cfg.sub_emit_on_bounce,
-            sub_emit_on_death: scene_cfg.sub_emit_on_death,
-            sub_emit_count: scene_cfg.sub_emit_count,
-            sub_emit_speed: scene_cfg.sub_emit_speed,
-            sub_emit_life: scene_cfg.sub_emit_life,
-        };
+        if let Some(step) = &commit {
+            let depth_r32 = wired.resolve_msaa_depth(device, built_ins, encoder, depth_only, size, samples);
+            let sim_params = GpuParticleSimParams {
+                view_projection: active_vp,
+                camera_pos: cam_pos,
+                depth_clear: depth_mode.clear_value(),
+                gravity: scene_cfg.gravity,
+                dt: scene_cfg.dt.clamp(0.0, 0.1),
+                drag: scene_cfg.drag,
+                curl_strength: scene_cfg.curl_strength,
+                curl_frequency: scene_cfg.curl_frequency,
+                time: step.time,
+                restitution: scene_cfg.restitution,
+                friction: scene_cfg.friction,
+                depth_thickness: scene_cfg.depth_thickness,
+                reversed_z,
+                depth_collide: scene_cfg.depth_collide,
+                sub_emit_on_bounce: scene_cfg.sub_emit_on_bounce,
+                sub_emit_on_death: scene_cfg.sub_emit_on_death,
+                sub_emit_count: scene_cfg.sub_emit_count,
+                sub_emit_speed: scene_cfg.sub_emit_speed,
+                sub_emit_life: scene_cfg.sub_emit_life,
+            };
 
+            wired.gpu_particles.system.as_ref().unwrap().step(device, encoder, &depth_r32, &sim_params)?;
+        }
         let sys = wired.gpu_particles.system.as_ref().unwrap();
-        sys.step(device, encoder, &depth_r32, &sim_params)?;
         sys.prepare_draw(device, encoder, active_vp, sun_dir, sun_col, scene_cfg.ambient, scene_cfg.velocity_align);
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -279,6 +300,6 @@ impl State {
             ..Default::default()
         });
         sys.draw(&mut pass);
-        Ok(())
+        Ok(commit)
     }
 }

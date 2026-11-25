@@ -206,11 +206,9 @@ fn load_packaged_workers(
         workers_cwasm_path.display()
     );
     let worker_engine = blot_host::bounded_engine(std::time::Duration::from_millis(2))?;
-    let meta = std::fs::read(&workers_meta_path)
-        .with_context(|| format!("reading {}", workers_meta_path.display()))?;
+    let meta = std::fs::read(&workers_meta_path).with_context(|| format!("reading {}", workers_meta_path.display()))?;
     let compiled = compiled::decode(
-        &std::fs::read(&workers_cwasm_path)
-            .with_context(|| format!("reading {}", workers_cwasm_path.display()))?,
+        &std::fs::read(&workers_cwasm_path).with_context(|| format!("reading {}", workers_cwasm_path.display()))?,
     )?;
     // SAFETY: both files ship with this executable and are written by `pen build --worker-deadlines`.
     let worker_module = unsafe { GuestModule::from_native(&worker_engine, &meta, &compiled) }?;
@@ -219,11 +217,8 @@ fn load_packaged_workers(
 
 /// Compiler-free `pen check-workers <package-dir>` verification subcommand (§5.1).
 fn check_workers(package_dir: &Path) -> Result<()> {
-    let game_dir = if package_dir.join("game.meta").is_file() {
-        package_dir.to_path_buf()
-    } else {
-        package_dir.join("game")
-    };
+    let game_dir =
+        if package_dir.join("game.meta").is_file() { package_dir.to_path_buf() } else { package_dir.join("game") };
     ensure!(
         game_dir.join("game.meta").is_file() && game_dir.join("game.cwasm").is_file(),
         "packaged game not found in {} (expected game.meta and game.cwasm)",
@@ -231,8 +226,7 @@ fn check_workers(package_dir: &Path) -> Result<()> {
     );
     let game_engine = blot_host::engine()?;
     let game_module = load_module(&game_engine, &game_dir, false, false)?;
-    let (worker_engine, worker_module, has_deadlines) =
-        load_packaged_workers(&game_dir, &game_engine, &game_module)?;
+    let (worker_engine, worker_module, has_deadlines) = load_packaged_workers(&game_dir, &game_engine, &game_module)?;
     if worker_module.abi().kernel("double_fixed").is_some() {
         let cfg = blot_host::kernels::KernelConfig {
             workers: 2,
@@ -265,15 +259,9 @@ fn check_workers(package_dir: &Path) -> Result<()> {
         };
         let mut pool = blot_host::kernels::KernelPool::open(&worker_engine, &worker_module, "spin_forever", spin_cfg)?;
         let err = pool.run_fixed(&[1, 2]).expect_err("spin_forever must time out on bounded worker engine");
-        ensure!(
-            err == blot_host::kernels::KernelError::Timeout,
-            "expected Timeout for spin_forever, got {err:?}"
-        );
+        ensure!(err == blot_host::kernels::KernelError::Timeout, "expected Timeout for spin_forever, got {err:?}");
     }
-    eprintln!(
-        "check-workers OK: worker_deadlines={has_deadlines}, kernels={}",
-        worker_module.abi().kernels.len()
-    );
+    eprintln!("check-workers OK: worker_deadlines={has_deadlines}, kernels={}", worker_module.abi().kernels.len());
     Ok(())
 }
 
@@ -1711,7 +1699,10 @@ fn listed(names: &[String]) -> String {
 #[cfg(feature = "compiler")]
 fn usage() -> String {
     let mut text = String::from(
-        "usage: pen [COMMAND] [OPTIONS]  (pen --help: this; pen --version)\n\n\\n         without a command, pen plays a packaged game: game/ beside the executable (a `pen build` package),\n\\n         or --game DIR.\n\n\\n         commands, in a checkout (a directory with pen.json and src/main.blot; or --project DIR):\n",
+        "usage: pen [COMMAND] [OPTIONS]  (pen --help: this; pen --version)\n\n\
+         without a command, pen plays a packaged game: game/ beside the executable (a `pen build` package),\n\
+         or --game DIR.\n\n\
+         commands, in a checkout (a directory with pen.json and src/main.blot; or --project DIR):\n",
     );
     let command = |text: &mut String, spec: &CommandSpec| {
         let head = format!("  {} {}", spec.name, spec.operands);
@@ -1744,13 +1735,24 @@ fn usage() -> String {
         entry(&mut text, format!("  {} {}", option.name, option.value).trim_end(), &about);
     }
     text.push_str(
-        "\ntime travel: Ctrl+Shift+P pauses and plays, Ctrl+Shift+period steps a frame, Ctrl+Shift+comma\n\\n         steps back, Ctrl+Shift+R replays the last 5 s (after a reload, on the new build); in scripts,\n\\n         pause resume step[=N] rewind=N replay=SECONDS.\n\n\\n         bug reports: Ctrl+Shift+B in a window (a script's report[=FILE]) writes the last 30 s of input,\n\\n         the state, the log and the system to a .penbug in reports/ of the data directory (pen report).\n\n\\n         dev tools (dev and run): the checkout's own program for them (devtools/main.blot) runs beside the\n\\n         game and draws over it: its console on the backquote key (/help lists what it does), and its\n\\n         diagnostics; a checkout without one runs without dev tools.\n\n\\n         environment:\n",
+        "\ntime travel: Ctrl+Shift+P pauses and plays, Ctrl+Shift+period steps a frame, Ctrl+Shift+comma\n\
+         steps back, Ctrl+Shift+R replays the last 5 s (after a reload, on the new build); in scripts,\n\
+         pause resume step[=N] rewind=N replay=SECONDS.\n\n\
+         bug reports: Ctrl+Shift+B in a window (a script's report[=FILE]) writes the last 30 s of input,\n\
+         the state, the log and the system to a .penbug in reports/ of the data directory (pen report).\n\n\
+         dev tools (dev and run): the checkout's own program for them (devtools/main.blot) runs beside the\n\
+         game and draws over it: its console on the backquote key (/help lists what it does), and its\n\
+         diagnostics; a checkout without one runs without dev tools.\n\n\
+         environment:\n",
     );
     for (name, about) in ENVIRONMENT {
         entry(&mut text, &format!("  {name}"), about);
     }
     text.push_str(
-        "\nthe game's name (its data directory, and its executable in a package) and title come from the\n\\n         checkout's pen.json, {\"game\": {\"name\": \"...\", \"title\": \"...\"}}, else its directory's name; a\n\\n         package keeps them in game/game.json. A panic, or an error that stops a package's runtime, writes\n\\n         a crash report to crashes/ in the data directory (or --data DIR).",
+        "\nthe game's name (its data directory, and its executable in a package) and title come from the\n\
+         checkout's pen.json, {\"game\": {\"name\": \"...\", \"title\": \"...\"}}, else its directory's name; a\n\
+         package keeps them in game/game.json. A panic, or an error that stops a package's runtime, writes\n\
+         a crash report to crashes/ in the data directory (or --data DIR).",
     );
     text
 }
@@ -2941,7 +2943,7 @@ mod tests {
     fn mistakes_are_refused_with_what_was_meant() {
         assert_eq!(
             error("tset"),
-            "unknown command tset (did you mean test?); the commands are dev, web, run, build, check, assets, codegen, export, test, bench, packets, test-blot, gltf, diverge, fuzz, report, new, texture, font, patch, apply, loudness, clean, serve, push and remote (pen --help)"
+            "unknown command tset (did you mean test?); the commands are tool, dev, web, run, build, check, assets, codegen, export, test, bench, packets, test-blot, gltf, import-scene, bake-lightmaps, diverge, fuzz, report, new, texture, font, patch, apply, loudness, clean, serve, relay, push, remote and check-workers (pen --help)"
         );
         assert_eq!(error("run --frame 300"), "pen run has no option --frame (did you mean --frames?) (pen --help)");
         assert_eq!(error("run --port 8000"), "--port is for pen web and pen test, not pen run");

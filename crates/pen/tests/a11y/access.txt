@@ -1,5 +1,5 @@
 Window "gdev"
-  Dialog #262146 "Settings" modal at=0,0 size=960x640
+  Dialog #262145 "Settings" modal at=0,0 size=960x640
     TabList #262150 "Sections" at=204.44443,131.2 size=551.1112x33.777786
       Tab #262160 "Graphics" selected=false at=204.44443,131.2 size=110.22223x33.77778 actions=focus,activate
       Tab #262161 "Audio" selected=false at=314.66666,131.2 size=110.22223x33.77778 actions=focus,activate

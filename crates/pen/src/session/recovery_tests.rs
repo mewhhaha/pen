@@ -55,19 +55,33 @@ fn exchange() -> Vec<u8> {
 }
 
 fn packet(red: f32) -> Vec<f32> {
+    use pen_protocol::boundary::lanes::header;
     let mut packet = vec![0.0; PACKET_HEADER_FLOATS];
-    packet[0] = PACKET_MAGIC;
-    packet[1] = 1.0;
-    for start in [20, 36, 90, 106] {
+    packet[header::MAGIC] = PACKET_MAGIC;
+    packet[header::SCHEMA] = 1.0;
+    for start in [header::VIEW, header::PROJECTION, header::SHADOW_VIEW] {
         for diagonal in [0, 5, 10, 15] {
             packet[start + diagonal] = 1.0;
         }
     }
-    packet[52] = red;
-    packet[55] = 1.0;
-    packet[60] = 1.0;
-    packet[67] = 1.0;
-    packet[69] = 1.0;
+    packet[header::CLEAR] = red;
+    packet[header::CLEAR + 3] = 1.0;
+    packet[header::LIGHT_DIRECTION + 1] = 1.0;
+    packet[header::QUALITY_MSAA] = 1.0;
+    packet[header::QUALITY_SCALE] = 1.0;
+    packet[header::FOG_HEIGHT] = 1.0;
+    packet[header::FOG_NOISE_SCALE] = 1.0;
+    packet[header::EXPOSURE_HIGH] = 1.0;
+    packet[header::EXPOSURE_RANGE_LOW] = -10.0;
+    packet[header::EXPOSURE_RANGE_HIGH] = 10.0;
+    packet[header::EXPOSURE_TARGET] = 0.18;
+    packet[header::GRADE_CONTRAST] = 1.0;
+    packet[header::GRADE_PIVOT] = 0.18;
+    packet[header::GRADE_SATURATION] = 1.0;
+    for offset in 0..3 {
+        packet[header::GRADE_GAMMA + offset] = 1.0;
+        packet[header::GRADE_GAIN + offset] = 1.0;
+    }
     packet
 }
 

@@ -179,26 +179,46 @@ fn relay_bridges_native_tcp_and_browser_websocket_clients_and_lists_rooms() {
     assert!(String::from_utf8_lossy(&resp[..header_end]).contains("101 Switching Protocols"));
     let mut ws_buf = resp[header_end + 4..].to_vec();
 
-    // Join via WebSocket as player 1, send a fragmented Forward frame (2 fragments),
-    // interleave a Ping control frame, and request the room list.
+    // Join via WebSocket as player 1 and wait until the broker registers player 1
+    // before native TCP forwards to player 1 (avoiding HashMap client poll-order races).
     let join = RelayPacket::Join { room: "cross-play".into(), player: 1, players: 2, token: 7 }.encode().unwrap();
     let list = RelayPacket::ListRooms.encode().unwrap();
     let fwd = RelayPacket::Forward { from: 1, to: 0, payload: b"FROM-BROWSER-FRAG".to_vec() }.encode().unwrap();
     send_ws_frame(&mut ws, true, 2, &join);
-    send_ws_frame(&mut ws, false, 2, &fwd[..6]);
-    send_ws_frame(&mut ws, true, 9, b"hi"); // RFC 6455 interleaved Ping control frame
-    send_ws_frame(&mut ws, true, 0, &fwd[6..]); // continuation FIN=1
-    send_ws_frame(&mut ws, true, 2, &list);
-
-    // Also forward in the reverse direction: native TCP -> WebSocket!
-    tcp_link.send(1, b"FROM-NATIVE");
 
     let mut got_tcp = None;
     let mut got_joined = false;
     let mut got_pong = false;
     let mut got_rooms = None;
     let mut got_native_on_ws = None;
-    while (got_tcp.is_none() || !got_joined || !got_pong || got_rooms.is_none() || got_native_on_ws.is_none())
+    while !got_joined && Instant::now() < deadline {
+        server.poll();
+        let mut tmp = [0u8; 256];
+        if let Ok(n) = ws.read(&mut tmp)
+            && n > 0
+        {
+            ws_buf.extend_from_slice(&tmp[..n]);
+        }
+        while let Some((opcode, payload)) = pop_server_ws_frame(&mut ws_buf) {
+            assert_eq!(opcode, 2);
+            match RelayPacket::decode(&payload).unwrap() {
+                RelayPacket::Joined { player: 1, players: 2 } => got_joined = true,
+                other => panic!("unexpected packet on WS before join completed: {other:?}"),
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(got_joined, "WebSocket client must join before cross-transport forwarding");
+
+    // Send a fragmented Forward frame (2 fragments), interleave a Ping control frame,
+    // request the room list, and forward in the reverse direction: native TCP -> WebSocket.
+    send_ws_frame(&mut ws, false, 2, &fwd[..6]);
+    send_ws_frame(&mut ws, true, 9, b"hi"); // RFC 6455 interleaved Ping control frame
+    send_ws_frame(&mut ws, true, 0, &fwd[6..]); // continuation FIN=1
+    send_ws_frame(&mut ws, true, 2, &list);
+    tcp_link.send(1, b"FROM-NATIVE");
+
+    while (got_tcp.is_none() || !got_pong || got_rooms.is_none() || got_native_on_ws.is_none())
         && Instant::now() < deadline
     {
         server.poll();

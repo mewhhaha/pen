@@ -10,7 +10,7 @@ use crate::program::{Operation, Program};
 use blot_host::{GuestModule, engine};
 use pen_protocol::boundary::{MAX_EVENTS, canonical_render_packet, decode_frame, encode_frame, parse_catalog};
 use pen_protocol::{Catalog, Frame, GameEvent, ServiceRequest, Viewport, kernel_op, service, service_status};
-use pen_runtime::game::hash_lanes;
+use pen_runtime::game::hash_render_packet;
 use pen_runtime::mods;
 use std::path::PathBuf;
 
@@ -33,10 +33,7 @@ fn compile_blot_project(entry: &std::path::Path, extra_aliases: &[(&str, &std::p
     let out = std::env::temp_dir().join(format!(
         "pen-law6-{}-{}.wasm",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     let mut cmd = std::process::Command::new(&blotc);
     cmd.args([
@@ -421,7 +418,12 @@ const application = {{
 
 type SessionRunResult = (Vec<Vec<f32>>, Vec<u64>, Vec<f32>, Vec<f32>, Vec<Vec<ServiceRequest>>);
 
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "Law 6 test harness decodes non-negative wire counts")]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Law 6 test harness decodes non-negative wire counts"
+)]
 fn drive_session_frames(
     engine: &wasmtime::Engine,
     module: &GuestModule,
@@ -467,7 +469,8 @@ fn drive_session_frames(
                 if tag == 13 || tag == 14 {
                     // ServiceAnswer / ServiceData
                     assert_ne!(
-                        input[off + 2] as u32, 0,
+                        input[off + 2] as u32,
+                        0,
                         "mod observed ephemeral request==0 kernel event on frame {idx}!"
                     );
                 }
@@ -477,11 +480,7 @@ fn drive_session_frames(
             }
         }
 
-        let cap_events = if let Some(ksvc) = svc.as_deref_mut() {
-            ksvc.splice_live_events(&mut input)
-        } else {
-            0
-        };
+        let cap_events = if let Some(ksvc) = svc.as_deref_mut() { ksvc.splice_live_events(&mut input) } else { 0 };
 
         let render_pkt = guest.send_op(Operation::Frame, &input);
 
@@ -495,10 +494,7 @@ fn drive_session_frames(
             validate_old_pen_render_packet(&render_pkt, catalog)
                 .expect("old-Pen decoder must accept replayed render packet")
         } else {
-            decode_frame(&render_pkt, 26, catalog)
-                .expect("decode render packet")
-                .render
-                .services
+            decode_frame(&render_pkt, 26, catalog).expect("decode render packet").render.services
         };
         let kernel_reqs: Vec<ServiceRequest> = reqs.iter().filter(|r| r.service == service::KERNEL).cloned().collect();
         if let Some(ksvc) = svc.as_deref_mut()
@@ -508,18 +504,13 @@ fn drive_session_frames(
         }
         all_services.push(reqs);
 
-        // Hash canonical_render_packet (exact game.rs:525 / diverge.rs:83 normalization!).
+        // Hash canonical_render_packet (exact game.rs / diverge.rs normalization, including exposure.cut!).
         let canonical = canonical_render_packet(&render_pkt);
         assert!(
-            decode_frame(&canonical, 26, catalog)
-                .unwrap()
-                .render
-                .services
-                .iter()
-                .all(|r| r.service != service::KERNEL),
+            decode_frame(&canonical, 26, catalog).unwrap().render.services.iter().all(|r| r.service != service::KERNEL),
             "canonical_render_packet must strip all service::KERNEL records"
         );
-        canonical_hashes.push(hash_lanes(&canonical));
+        canonical_hashes.push(hash_render_packet(&render_pkt));
     }
 
     let final_save = guest.send_op(Operation::Snapshot, &[]);
@@ -528,7 +519,11 @@ fn drive_session_frames(
 }
 
 #[test]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "test asserts non-negative wire tags and counts")]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "test asserts non-negative wire tags and counts"
+)]
 fn law6_end_to_end_replay_old_pen_moment_hot_reload_mods_and_equivalence() {
     let dir = std::env::temp_dir().join(format!("pen-law6-suite-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -561,18 +556,8 @@ fn law6_end_to_end_replay_old_pen_moment_hot_reload_mods_and_equivalence() {
     let mut frames: Vec<Vec<GameEvent>> = vec![vec![]; 8];
     frames[0].push(GameEvent::KeyDown("A".into()));
     // Frame 4 delivers BOTH canonical 0x800000 answer AND recorded request==0 BATCH_OK in the SAME frame (Law #6c)!
-    frames[4].push(GameEvent::ServiceAnswer {
-        request: 0x80_0000,
-        status: service_status::OK,
-        value: 99.0,
-        length: 2,
-    });
-    frames[4].push(GameEvent::ServiceData {
-        request: 0x80_0000,
-        a: 77.0,
-        b: 88.0,
-        c: 0.0,
-    });
+    frames[4].push(GameEvent::ServiceAnswer { request: 0x80_0000, status: service_status::OK, value: 99.0, length: 2 });
+    frames[4].push(GameEvent::ServiceData { request: 0x80_0000, a: 77.0, b: 88.0, c: 0.0 });
 
     // Observing/input mod injects raw KeyDown events [tag=1, code, 0, 0, 0] on frames 2 and 6.
     let mut mod_events: Vec<Vec<[f32; EVENT_FLOATS]>> = vec![vec![]; 8];
@@ -587,17 +572,8 @@ fn law6_end_to_end_replay_old_pen_moment_hot_reload_mods_and_equivalence() {
 
     // 1. Run with Worker ON (KernelService enabled, 2 workers)
     let mut ksvc_on = KernelService::new_with_workers(eng.clone(), mod_v1.clone(), false, 2);
-    let (recorded_on, hashes_on, save_on, telemetry_on, svcs_on) = drive_session_frames(
-        &eng,
-        &mod_v1,
-        &catalog,
-        Some(&mut ksvc_on),
-        &frames,
-        &mod_events,
-        None,
-        None,
-        false,
-    );
+    let (recorded_on, hashes_on, save_on, telemetry_on, svcs_on) =
+        drive_session_frames(&eng, &mod_v1, &catalog, Some(&mut ksvc_on), &frames, &mod_events, None, None, false);
 
     // FIRST assert real worker RUN_BATCH replies produced actual prewarm hits that SKIPPED sync route_into!
     let prewarm_hits = telemetry_on[0] as u32;
@@ -641,17 +617,8 @@ fn law6_end_to_end_replay_old_pen_moment_hot_reload_mods_and_equivalence() {
     );
 
     // 2. Run with Worker OFF (no KernelService, pure synchronous route_into)
-    let (_recorded_off, hashes_off, save_off, telemetry_off, svcs_off) = drive_session_frames(
-        &eng,
-        &mod_v1,
-        &catalog,
-        None,
-        &frames,
-        &mod_events,
-        None,
-        None,
-        true,
-    );
+    let (_recorded_off, hashes_off, save_off, telemetry_off, svcs_off) =
+        drive_session_frames(&eng, &mod_v1, &catalog, None, &frames, &mod_events, None, None, true);
     assert_eq!(telemetry_off[0], 0.0, "Worker OFF must have 0 prewarm_hits");
     assert_eq!(telemetry_off[1], 0.0, "Worker OFF must have 0 sync_routes_skipped");
     assert!(
@@ -679,7 +646,8 @@ fn law6_end_to_end_replay_old_pen_moment_hot_reload_mods_and_equivalence() {
             let off = FRAME_HEADER_FLOATS + ev * EVENT_FLOATS;
             if rec[off] as u32 == 13 && rec[off + 2] as u32 == 0 {
                 assert_ne!(
-                    rec[off + 3], 0.0,
+                    rec[off + 3],
+                    0.0,
                     "Law #6(d): live-only CAP (request==0, value==0.0) must NEVER appear in Recorded frame {idx}"
                 );
             }
@@ -766,17 +734,8 @@ fn law6_end_to_end_replay_old_pen_moment_hot_reload_mods_and_equivalence() {
 
     // 5. Law #6(e): Replay v1's recorded stream (with v1's BATCH_OK) into v2 (edited immutable pool only)!
     // v2 MUST reject v1's stale recorded BATCH_OK because binding_hash differs (prewarm_hits == 0)!
-    let (_, _, _, telemetry_v2_replay, _) = drive_session_frames(
-        &eng,
-        &mod_v2,
-        &catalog,
-        None,
-        &[],
-        &[],
-        None,
-        Some(&recorded_on),
-        true,
-    );
+    let (_, _, _, telemetry_v2_replay, _) =
+        drive_session_frames(&eng, &mod_v2, &catalog, None, &[], &[], None, Some(&recorded_on), true);
     assert_eq!(
         telemetry_v2_replay[0], 0.0,
         "Law #6(e): v2 must REJECT v1's recorded BATCH_OK after immutable pool edit (binding_hash mismatch)"

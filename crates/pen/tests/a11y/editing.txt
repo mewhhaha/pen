@@ -19,4 +19,4 @@ Window "gdev" <- focus
     Button #327722 "Quickload" description="F9" actions=focus,activate
   Status #327684 "Selection" value="Nothing selected" live=polite
   ListBox #327685 "Brushes"
-    ListBoxOption #328704 "Brush 0" value="120 × 0.5 × 120 m, at 0, -0.25, 0" selected=false at=93.45268,98.45791 size=773.0946x3.3584595 actions=focus,activate
+    ListBoxOption #328704 "Brush 0" value="120 × 0.5 × 120 m, at 0, -0.25, 0" selected=false at=93.4527,98.45792 size=773.0946x3.3584595 actions=focus,activate

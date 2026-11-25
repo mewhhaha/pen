@@ -277,7 +277,7 @@ pub fn hash_lanes(lanes: &[f32]) -> u64 {
 /// FNV-1a over a canonical render packet's lanes, normalizing the restore-only
 /// `exposure.cut` presentation hint so replays, spectating, and netplay rollbacks
 /// hash identically to a straight run.
-fn hash_render_packet(packet: &[f32]) -> u64 {
+pub fn hash_render_packet(packet: &[f32]) -> u64 {
     let canonical = pen_protocol::canonical_render_packet(packet);
     let cut_lane = pen_protocol::boundary::lanes::header::EXPOSURE_CUT;
     let mut hash = 0xcbf29ce484222325u64;
@@ -299,11 +299,8 @@ fn hash_resolved_frame(frame: &mut RenderFrame, schema: u32) -> u64 {
     let has_kernel = frame.services.iter().any(|request| request.service == pen_protocol::service::KERNEL);
     let saved_services = has_kernel.then(|| {
         let original = std::mem::take(&mut frame.services);
-        frame.services = original
-            .iter()
-            .filter(|request| request.service != pen_protocol::service::KERNEL)
-            .cloned()
-            .collect();
+        frame.services =
+            original.iter().filter(|request| request.service != pen_protocol::service::KERNEL).cloned().collect();
         original
     });
     let canonical = pen_protocol::boundary::canonical_render(frame, schema, &[]);
@@ -1063,10 +1060,20 @@ mod receive_tests {
             transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             parameters: None,
         };
-        let mut init = RenderFrame { retained_enabled: true, retained_reset: true, instances: vec![inst(1, 0)], ..Default::default() };
+        let mut init = RenderFrame {
+            retained_enabled: true,
+            retained_reset: true,
+            instances: vec![inst(1, 0)],
+            ..Default::default()
+        };
         let scene = crate::instances::Scene::default().resolve(&mut init).unwrap();
 
-        let mut delta = RenderFrame { retained_enabled: true, retained_reset: false, instances: vec![inst(2, 1)], ..Default::default() };
+        let mut delta = RenderFrame {
+            retained_enabled: true,
+            retained_reset: false,
+            instances: vec![inst(2, 1)],
+            ..Default::default()
+        };
         let _ = scene.resolve(&mut delta).unwrap();
         let delta_hash = hash_resolved_frame(&mut delta, 26);
 

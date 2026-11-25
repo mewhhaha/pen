@@ -34,10 +34,10 @@ impl Staging {
         let destination = resolved(destination)?;
         ensure!(!root.starts_with(&destination), "output {} contains the checkout", destination.display());
         ensure!(!destination.is_file(), "output must be a directory");
-        // Allow only build directories inside this project or another checkout.
-        // New source directories are protected without maintaining an inventory.
+        // Allow only build directories inside this project or the nearest enclosing
+        // checkout (ignoring outer dotfiles/monorepo checkouts above a valid nested one).
         for checkout in
-            std::iter::once(root.as_path()).chain(destination.ancestors().filter(|path| path.join(".git").exists()))
+            std::iter::once(root.as_path()).chain(destination.ancestors().find(|path| path.join(".git").exists()))
         {
             // The application's own build directories may sit in a parent
             // dotfiles/monorepo checkout; they were already checked against root.

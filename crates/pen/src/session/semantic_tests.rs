@@ -56,20 +56,35 @@ fn observation(tick: u32) -> Observation {
 }
 
 fn packet(tick: u32, observed: bool) -> Vec<f32> {
+    use lanes::header;
     let mut packet = vec![0.0; PACKET_HEADER_FLOATS];
-    packet[0] = PACKET_MAGIC;
-    packet[1] = 1.0;
-    for start in [20, 36, 90, 106] {
+    packet[header::MAGIC] = PACKET_MAGIC;
+    packet[header::SCHEMA] = 1.0;
+    for start in [header::VIEW, header::PROJECTION, header::SHADOW_VIEW] {
         for diagonal in [0, 5, 10, 15] {
             packet[start + diagonal] = 1.0;
         }
     }
-    for at in [55, 60, 67, 69] {
-        packet[at] = 1.0;
+    packet[header::CLEAR] = tick as f32 / 3.0;
+    packet[header::CLEAR + 3] = 1.0;
+    packet[header::LIGHT_DIRECTION + 1] = 1.0;
+    packet[header::QUALITY_MSAA] = 1.0;
+    packet[header::QUALITY_SCALE] = 1.0;
+    packet[header::FOG_HEIGHT] = 1.0;
+    packet[header::FOG_NOISE_SCALE] = 1.0;
+    packet[header::EXPOSURE_HIGH] = 1.0;
+    packet[header::EXPOSURE_RANGE_LOW] = -10.0;
+    packet[header::EXPOSURE_RANGE_HIGH] = 10.0;
+    packet[header::EXPOSURE_TARGET] = 0.18;
+    packet[header::GRADE_CONTRAST] = 1.0;
+    packet[header::GRADE_PIVOT] = 0.18;
+    packet[header::GRADE_SATURATION] = 1.0;
+    for offset in 0..3 {
+        packet[header::GRADE_GAMMA + offset] = 1.0;
+        packet[header::GRADE_GAIN + offset] = 1.0;
     }
-    packet[52] = tick as f32 / 3.0;
-    packet[lanes::header::SERVICE_COUNT] = 1.0;
-    packet[lanes::header::SERVICE_LANES] = 8.0;
+    packet[header::SERVICE_COUNT] = 1.0;
+    packet[header::SERVICE_LANES] = 8.0;
     packet.extend([
         1.0,
         pen_protocol::service::PLATFORM as f32,

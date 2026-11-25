@@ -33,6 +33,7 @@ pub fn native_metadata(wasm: &[u8]) -> Result<Vec<u8>> {
                         | pen_runtime::abi::INVOCATION_SECTION
                         | pen_runtime::abi::KERNELS_SECTION
                         | pen_runtime::abi::PROCESSES_SECTION
+                        | pen_runtime::abi::TRAPS_SECTION
                         | "name"
                         | "sourceMappingURL"
                 )

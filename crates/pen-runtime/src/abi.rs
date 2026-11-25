@@ -15,6 +15,11 @@ pub const KERNELS_SECTION: &str = "blot:kernels";
 pub const PROCESSES_SECTION: &str = "blot:processes";
 /// The custom section declaring first-class tests (version 1).
 pub const TESTS_SECTION: &str = "blot:tests";
+/// The custom section declaring runtime trap provenance sites (version 1).
+pub const TRAPS_SECTION: &str = "blot:traps";
+/// Fixed Page-0 linear-memory byte offset holding the 1-based `blot:traps`
+/// site ID written right before a guest traps (`u32` little-endian; `0` = none).
+pub const TRAP_SITE_OFFSET: usize = 772;
 /// Default logical transport packet ceiling in bytes (2 MiB).
 pub const DEFAULT_TRANSPORT_BUDGET: u32 = 2_097_152;
 /// `blot:kernels` manifest flag bit 0: kernel has a prepared context (`prepare`).
@@ -211,6 +216,34 @@ pub struct TestMetadata {
     pub line: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TrapKind {
+    Panic = 1,
+    Bounds = 2,
+    Unreachable = 3,
+}
+
+impl TrapKind {
+    fn from_byte(byte: u8) -> Result<Self> {
+        Ok(match byte {
+            1 => TrapKind::Panic,
+            2 => TrapKind::Bounds,
+            3 => TrapKind::Unreachable,
+            _ => bail!("invalid_abi: unknown {TRAPS_SECTION} kind {byte}"),
+        })
+    }
+}
+
+/// One recorded trap site from `blot:traps` v1 (1-based index == runtime `trap_id`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrapMetadata {
+    pub kind: TrapKind,
+    pub unit: u32,
+    pub start: u32,
+    pub end: u32,
+    pub message: String,
+}
+
 /// The `blot:abi` manifest: the module's exports, in declaration order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestAbi {
@@ -218,6 +251,8 @@ pub struct GuestAbi {
     pub constants: Vec<GuestConstant>,
     /// First-class test declarations, in metadata order.
     pub tests: Vec<TestMetadata>,
+    /// Runtime trap provenance sites parsed from `blot:traps` v1 (1-based index).
+    pub traps: Vec<TrapMetadata>,
     /// ABI 8: named data-stack owners and copied numeric packets, with no
     /// counted ownership hooks, resource adapters or language tasks.
     pub data_stacks: bool,
@@ -251,6 +286,7 @@ impl Default for GuestAbi {
             functions: Vec::new(),
             constants: Vec::new(),
             tests: Vec::new(),
+            traps: Vec::new(),
             data_stacks: false,
             invocation_finish: false,
             ownership: false,
@@ -393,6 +429,14 @@ impl Reader<'_> {
             }
         }
         bail!("invalid_abi: LEB128 too long")
+    }
+
+    fn u32_le(&mut self) -> Result<u32> {
+        let end = self.at.checked_add(4).filter(|end| *end <= self.bytes.len());
+        let end = end.ok_or_else(|| anyhow!("invalid_abi: truncated u32"))?;
+        let raw: [u8; 4] = self.bytes[self.at..end].try_into().unwrap();
+        self.at = end;
+        Ok(u32::from_le_bytes(raw))
     }
 
     fn u64_le(&mut self) -> Result<u64> {
@@ -556,7 +600,7 @@ pub fn read_memory_shape(wasm: &[u8]) -> Result<MemoryShape> {
 }
 
 /// Finds the single `blot:abi` custom section in a module's bytes, plus
-/// optional tasks, invocation, kernel, process, and test sections.
+/// optional tasks, invocation, kernel, process, test, and trap sections.
 pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     let mut found = None;
     let mut tasks = None;
@@ -565,6 +609,7 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     let mut kernels_payload: Option<&[u8]> = None;
     let mut processes_payload: Option<&[u8]> = None;
     let mut tests_payload: Option<&[u8]> = None;
+    let mut traps_payload: Option<&[u8]> = None;
     for (name, payload) in custom_sections(wasm)? {
         if matches!(name.as_str(), "blot:ownership" | "blot:cycles" | "blot:memory-profile" | "blot:cleanup_data") {
             counted_section = true;
@@ -587,6 +632,9 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
         } else if name == TESTS_SECTION {
             ensure!(tests_payload.is_none(), "invalid_abi: more than one {TESTS_SECTION} section");
             tests_payload = Some(payload);
+        } else if name == TRAPS_SECTION {
+            ensure!(traps_payload.is_none(), "invalid_abi: more than one {TRAPS_SECTION} section");
+            traps_payload = Some(payload);
         }
     }
     let mut abi = found.ok_or_else(|| anyhow!("invalid_abi: missing {ABI_SECTION} section"))?;
@@ -597,18 +645,15 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     ensure!(tasks.is_none() || abi.ownership, "invalid_abi: tasks need ABI 3's ownership");
     ensure!(tasks.is_some() || abi.concurrent.is_empty(), "invalid_abi: concurrent callbacks need {TASKS_SECTION}");
     ensure!(!invocation_finish || abi.data_stacks, "invalid_abi: invocation finish requires ABI 8");
-    ensure!(
-        kernels_payload.is_none() || abi.data_stacks,
-        "invalid_abi: {KERNELS_SECTION} requires ABI 8"
-    );
-    ensure!(
-        processes_payload.is_none() || abi.data_stacks,
-        "invalid_abi: {PROCESSES_SECTION} requires ABI 8"
-    );
+    ensure!(kernels_payload.is_none() || abi.data_stacks, "invalid_abi: {KERNELS_SECTION} requires ABI 8");
+    ensure!(processes_payload.is_none() || abi.data_stacks, "invalid_abi: {PROCESSES_SECTION} requires ABI 8");
     abi.tasks = tasks;
     abi.invocation_finish = invocation_finish;
     if let Some(payload) = tests_payload {
         abi.tests = parse_tests(payload)?;
+    }
+    if let Some(payload) = traps_payload {
+        abi.traps = parse_traps(payload)?;
     }
     let mut declared_budget: Option<u32> = None;
     if let Some(payload) = kernels_payload {
@@ -673,6 +718,34 @@ fn parse_tests(payload: &[u8]) -> Result<Vec<TestMetadata>> {
     }
     ensure!(reader.at == payload.len(), "invalid_abi: trailing {TESTS_SECTION} bytes");
     Ok(tests)
+}
+
+fn parse_traps(payload: &[u8]) -> Result<Vec<TrapMetadata>> {
+    let mut reader = Reader { bytes: payload, at: 0 };
+    let version = reader.byte()?;
+    ensure!(version == 1, "invalid_abi: unsupported {TRAPS_SECTION} version {version}");
+    let count = reader.u32_le()? as usize;
+    ensure!(count <= (payload.len() - reader.at) / 17, "invalid_abi: truncated {TRAPS_SECTION} entries");
+    let mut traps = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = TrapKind::from_byte(reader.byte()?)?;
+        let unit = reader.u32_le()?;
+        let start = reader.u32_le()?;
+        let end = reader.u32_le()?;
+        let message_len = reader.u32_le()? as usize;
+        let end_at = reader
+            .at
+            .checked_add(message_len)
+            .filter(|&at| at <= reader.bytes.len())
+            .ok_or_else(|| anyhow!("invalid_abi: truncated {TRAPS_SECTION} message"))?;
+        let message = std::str::from_utf8(&reader.bytes[reader.at..end_at])
+            .map_err(|_| anyhow!("invalid_abi: {TRAPS_SECTION} message is not UTF-8"))?
+            .to_owned();
+        reader.at = end_at;
+        traps.push(TrapMetadata { kind, unit, start, end, message });
+    }
+    ensure!(reader.at == payload.len(), "invalid_abi: trailing {TRAPS_SECTION} bytes");
+    Ok(traps)
 }
 
 fn parse_wire_schema(reader: &mut Reader<'_>, transport_budget: u32) -> Result<WireSchema> {
@@ -761,9 +834,8 @@ fn parse_kernels(payload: &[u8], abi: &GuestAbi) -> Result<(u32, Vec<KernelManif
                 "invalid_abi: fixed-output kernel {name} must have FlatFixed array wire"
             );
         }
-        let entry = abi
-            .function(&name)
-            .ok_or_else(|| anyhow!("invalid_abi: kernel {name} missing from {ABI_SECTION}"))?;
+        let entry =
+            abi.function(&name).ok_or_else(|| anyhow!("invalid_abi: kernel {name} missing from {ABI_SECTION}"))?;
         ensure!(
             entry.parameter == Parameter::Value(in_schema.wire_tag) && entry.result == out_schema.wire_tag,
             "invalid_abi: kernel {name} signature mismatch against {ABI_SECTION}"
@@ -779,9 +851,9 @@ fn parse_kernels(payload: &[u8], abi: &GuestAbi) -> Result<(u32, Vec<KernelManif
             );
             let ctx_name = reader.name()?;
             let clear_name = reader.name()?;
-            let ctx_fn = abi
-                .function(&ctx_name)
-                .ok_or_else(|| anyhow!("invalid_abi: kernel {name} ctx_export {ctx_name} missing from {ABI_SECTION}"))?;
+            let ctx_fn = abi.function(&ctx_name).ok_or_else(|| {
+                anyhow!("invalid_abi: kernel {name} ctx_export {ctx_name} missing from {ABI_SECTION}")
+            })?;
             ensure!(
                 ctx_fn.parameter == Parameter::Value(ctx.wire_tag) && ctx_fn.result == ValueType::Unit,
                 "invalid_abi: kernel {name} ctx_export {ctx_name} signature mismatch"
@@ -835,16 +907,16 @@ fn parse_processes(payload: &[u8], abi: &GuestAbi) -> Result<(u32, Vec<ProcessMa
         let config_schema = parse_wire_schema(&mut reader, transport_budget)?;
         let cmd_schema = parse_wire_schema(&mut reader, transport_budget)?;
         let reply_schema = parse_wire_schema(&mut reader, transport_budget)?;
-        let init_fn = abi
-            .function(&init_export)
-            .ok_or_else(|| anyhow!("invalid_abi: process {name} init_export {init_export} missing from {ABI_SECTION}"))?;
+        let init_fn = abi.function(&init_export).ok_or_else(|| {
+            anyhow!("invalid_abi: process {name} init_export {init_export} missing from {ABI_SECTION}")
+        })?;
         ensure!(
             init_fn.parameter == Parameter::Value(config_schema.wire_tag) && init_fn.result == ValueType::Unit,
             "invalid_abi: process {name} init_export {init_export} signature mismatch"
         );
-        let step_fn = abi
-            .function(&step_export)
-            .ok_or_else(|| anyhow!("invalid_abi: process {name} step_export {step_export} missing from {ABI_SECTION}"))?;
+        let step_fn = abi.function(&step_export).ok_or_else(|| {
+            anyhow!("invalid_abi: process {name} step_export {step_export} missing from {ABI_SECTION}")
+        })?;
         ensure!(
             step_fn.parameter == Parameter::Value(cmd_schema.wire_tag) && step_fn.result == reply_schema.wire_tag,
             "invalid_abi: process {name} step_export {step_export} signature mismatch"
@@ -927,6 +999,90 @@ mod tests {
             (&b"\x01\x00\xff"[..], "trailing blot:tests bytes"),
         ] {
             let error = read_abi(&module(&[abi.clone(), section(TESTS_SECTION, payload)])).unwrap_err().to_string();
+            assert!(error.starts_with("invalid_abi:") && error.contains(message), "{payload:?}: {error}");
+        }
+    }
+
+    fn trap_entry(kind: u8, unit: u32, start: u32, end: u32, message: &[u8]) -> Vec<u8> {
+        let mut out = vec![kind];
+        out.extend(unit.to_le_bytes());
+        out.extend(start.to_le_bytes());
+        out.extend(end.to_le_bytes());
+        out.extend(u32::try_from(message.len()).unwrap().to_le_bytes());
+        out.extend(message);
+        out
+    }
+
+    #[test]
+    fn reads_trap_metadata_v1() {
+        let abi = section(ABI_SECTION, &[8, 0, 0]);
+        let mut payload = vec![1];
+        payload.extend(3u32.to_le_bytes());
+        payload.extend(trap_entry(1, 1, 10, 42, "audit: lost receipt — λ".as_bytes()));
+        payload.extend(trap_entry(2, 2, 100, 108, b"index out of bounds"));
+        payload.extend(trap_entry(3, 1, 0, 0, b""));
+        let wasm = module(&[section(TRAPS_SECTION, &payload), abi.clone()]);
+        assert_eq!(
+            read_abi(&wasm).unwrap().traps,
+            [
+                TrapMetadata {
+                    kind: TrapKind::Panic,
+                    unit: 1,
+                    start: 10,
+                    end: 42,
+                    message: "audit: lost receipt — λ".into(),
+                },
+                TrapMetadata {
+                    kind: TrapKind::Bounds,
+                    unit: 2,
+                    start: 100,
+                    end: 108,
+                    message: "index out of bounds".into(),
+                },
+                TrapMetadata { kind: TrapKind::Unreachable, unit: 1, start: 0, end: 0, message: String::new() },
+            ]
+        );
+        let empty_payload = [1u8, 0, 0, 0, 0];
+        assert!(read_abi(&module(&[abi.clone(), section(TRAPS_SECTION, &empty_payload)])).unwrap().traps.is_empty());
+        assert!(read_abi(&module(&[abi])).unwrap().traps.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_trap_metadata() {
+        let abi = section(ABI_SECTION, &[8, 0, 0]);
+        let empty = section(TRAPS_SECTION, &[1, 0, 0, 0, 0]);
+        let duplicates = read_abi(&module(&[abi.clone(), empty.clone(), empty])).unwrap_err();
+        assert!(duplicates.to_string().contains("more than one blot:traps section"));
+        let unknown_kind = [&[1][..], &1u32.to_le_bytes(), &trap_entry(4, 1, 0, 0, b"")].concat();
+        let zero_kind = [&[1][..], &1u32.to_le_bytes(), &trap_entry(0, 1, 0, 0, b"")].concat();
+        let bad_utf8 = [&[1][..], &1u32.to_le_bytes(), &trap_entry(1, 1, 0, 0, &[0xff, 0xfe])].concat();
+        let trunc_msg = [
+            &[1][..],
+            &1u32.to_le_bytes(),
+            &[1],
+            &1u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &0u32.to_le_bytes(),
+            &5u32.to_le_bytes(),
+            b"ab",
+        ]
+        .concat();
+        let trailing = [&[1][..], &0u32.to_le_bytes(), &[0xff]].concat();
+        let huge_count = [&[1][..], &u32::MAX.to_le_bytes()].concat();
+        for (payload, message) in [
+            (&b""[..], "truncated"),
+            (&b"\x01\x00\x00"[..], "truncated u32"),
+            (&b"\x02\x00\x00\x00\x00"[..], "unsupported blot:traps version"),
+            (&b"\x00\x00\x00\x00\x00"[..], "unsupported blot:traps version"),
+            (unknown_kind.as_slice(), "unknown blot:traps kind"),
+            (zero_kind.as_slice(), "unknown blot:traps kind"),
+            (huge_count.as_slice(), "truncated blot:traps entries"),
+            (&b"\x01\x01\x00\x00\x00\x01\x01\x00\x00"[..], "truncated blot:traps entries"),
+            (trunc_msg.as_slice(), "truncated blot:traps message"),
+            (bad_utf8.as_slice(), "not UTF-8"),
+            (trailing.as_slice(), "trailing blot:traps bytes"),
+        ] {
+            let error = read_abi(&module(&[abi.clone(), section(TRAPS_SECTION, payload)])).unwrap_err().to_string();
             assert!(error.starts_with("invalid_abi:") && error.contains(message), "{payload:?}: {error}");
         }
     }
@@ -1143,12 +1299,7 @@ mod tests {
         assert!(!abi.is_host_internal("k"));
 
         // Mismatched transport budgets between kernels and processes rejected
-        let bad_processes = [
-            vec![1],
-            uleb(1024),
-            vec![0],
-        ]
-        .concat();
+        let bad_processes = [vec![1], uleb(1024), vec![0]].concat();
         let bad_wasm = module(&[
             custom_section(ABI_SECTION, &abi_payload),
             custom_section(KERNELS_SECTION, &kernels_payload),

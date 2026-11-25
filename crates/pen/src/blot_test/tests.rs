@@ -639,4 +639,268 @@ fn runs_the_checkouts_pilot() {
     let error = format!("{:#}", build_test_module(&mut builder, &broken).unwrap_err());
     assert!(error.contains("missing_name"), "{error}");
     assert!(error.starts_with(&format!("{}:1:", broken.path)), "{error}");
+    assert!(error.contains("in broken.blot"), "{error}");
+}
+
+#[test]
+fn reports_trap_provenance_and_source_locations() {
+    let source = concat!(
+        "let header = 1\n",
+        "test \"panic site\":\n",
+        "  panic \"audit: lost receipt\"\n",
+        "\n",
+        "test \"bounds site\":\n",
+        "  let xs = #[10, 20]\n",
+        "  return xs[9]\n",
+    );
+    let panic_start = source.find("panic \"audit: lost receipt\"").unwrap() as u32;
+    let panic_end = panic_start + "panic \"audit: lost receipt\"".len() as u32;
+    let bounds_start = source.find("xs[9]").unwrap() as u32;
+    let bounds_end = bounds_start + "xs[9]".len() as u32;
+
+    let store_trap = |trap_id: i32| -> Vec<u8> {
+        [
+            vec![0x41],
+            signed_leb(blot_host::TRAP_SITE_OFFSET as i32),
+            vec![0x41],
+            signed_leb(trap_id),
+            vec![0x36, 0x02, 0x00, 0x00, 0x0b],
+        ]
+        .concat()
+    };
+
+    // Scalar-only ABI 8 module exporting blot:memory (without blot:allocate/blot:reset) + blot:traps + blot:tests.
+    let entries: &[(&str, Vec<u8>)] = &[
+        ("test_panic", store_trap(1)),
+        ("test_bounds", store_trap(2)),
+        ("test_imported_panic", store_trap(3)),
+        ("expect_panic", store_trap(1)),
+        ("expect_bounds", store_trap(2)),
+        ("trap_legacy", store_trap(1)),
+    ];
+    let types = vector(vec![[vec![0x60, 0x01, I32, 0x01, I32]].concat()]);
+    let type_indices = vector((0..entries.len()).map(|_| leb(0)).collect());
+    let mut exports = vec![[name("blot:memory"), vec![0x02, 0]].concat()];
+    let mut manifest = Vec::new();
+    let mut bodies = Vec::new();
+    for (index, (export, body)) in entries.iter().enumerate() {
+        exports.push([name(export), vec![0x00], leb(index as u32)].concat());
+        manifest.push([name(export), vec![0, 0]].concat());
+        bodies.push([leb(body.len() as u32 + 1), vec![0], body.clone()].concat());
+    }
+    let abi_section = [name(pen_runtime::abi::ABI_SECTION), leb(8), vector(manifest), leb(0)].concat();
+
+    let mut traps_payload = name(pen_runtime::abi::TRAPS_SECTION);
+    traps_payload.push(1);
+    traps_payload.extend(3u32.to_le_bytes());
+    for (kind, unit, start, end, msg) in [
+        (1u8, 1u32, panic_start, panic_end, "audit: lost receipt"),
+        (2, 1, bounds_start, bounds_end, "index out of bounds"),
+        // Span 0..5 points at `let h` in `source` (an imported module's offset) and must not emit a bogus `at`.
+        (1, 2, 0, 5, "from imported helper"),
+    ] {
+        traps_payload.push(kind);
+        traps_payload.extend(unit.to_le_bytes());
+        traps_payload.extend(start.to_le_bytes());
+        traps_payload.extend(end.to_le_bytes());
+        traps_payload.extend((msg.len() as u32).to_le_bytes());
+        traps_payload.extend(msg.as_bytes());
+    }
+
+    let mut tests_payload = name(pen_runtime::abi::TESTS_SECTION);
+    tests_payload.push(1);
+    tests_payload.extend(leb(5));
+    for (kind, export, display, line) in [
+        (0u8, "test_panic", "panic site", 2u32),
+        (0, "test_bounds", "bounds site", 5),
+        (0, "test_imported_panic", "imported panic", 5),
+        (1, "expect_panic", "expect panic", 2),
+        (1, "expect_bounds", "expect bounds", 5),
+    ] {
+        tests_payload.push(kind);
+        tests_payload.extend(name(export));
+        tests_payload.extend(name(display));
+        tests_payload.extend(name("tests/audit.blot"));
+        tests_payload.extend(leb(line));
+    }
+
+    let wasm = [
+        b"\0asm\x01\0\0\0".to_vec(),
+        section(1, types),
+        section(3, type_indices),
+        section(5, vector(vec![vec![0x01, 1, 1]])),
+        section(7, vector(exports)),
+        section(10, vector(bodies)),
+        section(0, abi_section),
+        section(0, traps_payload),
+        section(0, tests_payload),
+    ]
+    .concat();
+
+    let engine = blot_host::engine().unwrap();
+    let slots = Slots::new(2);
+    let checks = run_tests_with_session(
+        &engine,
+        &wasm,
+        Kind::Checks,
+        "test_",
+        None,
+        &slots,
+        None,
+        Some(("tests/audit.blot", source)),
+    )
+    .unwrap();
+    let outcome = |label: &str| &checks.tests.iter().find(|(name, _)| name == label).unwrap().1;
+
+    let Outcome::Broken(panic_msg) = outcome("panic site") else {
+        panic!("expected broken panic site: {:?}", outcome("panic site"));
+    };
+    assert!(panic_msg.starts_with("panic: \"audit: lost receipt\"\n"), "{panic_msg}");
+    assert!(panic_msg.contains("at tests/audit.blot:3:3"), "{panic_msg}");
+    assert!(!panic_msg.contains("wasm `unreachable`"), "{panic_msg}");
+
+    let Outcome::Broken(bounds_msg) = outcome("bounds site") else {
+        panic!("expected broken bounds site: {:?}", outcome("bounds site"));
+    };
+    assert!(bounds_msg.starts_with("index out of bounds\n"), "{bounds_msg}");
+    assert!(bounds_msg.contains("at tests/audit.blot:7:10"), "{bounds_msg}");
+    assert!(!bounds_msg.contains("wasm `unreachable`"), "{bounds_msg}");
+
+    let Outcome::Broken(imported_msg) = outcome("imported panic") else {
+        panic!("expected broken imported panic: {:?}", outcome("imported panic"));
+    };
+    assert!(imported_msg.starts_with("panic: \"from imported helper\""), "{imported_msg}");
+    assert!(!imported_msg.contains("at tests/audit.blot:"), "{imported_msg}");
+
+    // First-class `expect_trap` still passes on both @panic and bounds traps.
+    assert_eq!(*outcome("expect panic"), Outcome::Panicked);
+    assert_eq!(*outcome("expect bounds"), Outcome::Panicked);
+
+    // Legacy `trap_` still passes on @panic (Trap::UnreachableCodeReached).
+    let legacy = run_tests_with_session(
+        &engine,
+        &wasm,
+        Kind::Traps,
+        "trap_",
+        None,
+        &slots,
+        None,
+        Some(("tests/audit.blot", source)),
+    )
+    .unwrap();
+    assert_eq!(legacy.tests, [("trap_legacy".into(), Outcome::Panicked)]);
+}
+
+#[test]
+fn runs_real_trap_provenance_tests() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let blot = repository.join("../blot2");
+    let compiler = std::env::var_os("BLOT_TEST_COMPILER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| blot.join("compiler-goose/build/blotc-goose"));
+    let component = std::env::var_os("PEN_TEST_BLOT_PLUGIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository.join("plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm"));
+    let std = blot.join("std");
+    if !compiler.is_file() || !component.is_file() || !std.is_dir() {
+        crate::fixtures::missing("trap provenance tests need blotc-goose, the WASI Blot plugin, and Blot std");
+        return;
+    }
+    struct Project(PathBuf);
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let project = Project(std::env::temp_dir().join(format!("pen-trap-provenance-{}", std::process::id())));
+    let root = &project.0;
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    let config = serde_json::json!({
+        "plugins": { "blot": { "wasm": component, "read": [&std], "run": { "blotc": compiler } } },
+        "compiler": { "plugin": "blot", "settings": { "std": std, "testMode": false, "tests": {
+            "entry": "tests/.fixture.blot", "files": ["tests/scalar_panic.blot", "tests/bounds.blot"]
+        } } }
+    });
+    std::fs::write(root.join("pen.json"), config.to_string()).unwrap();
+    std::fs::write(
+        root.join("tests/scalar_panic.blot"),
+        r#"test "unexpected scalar panic":
+  panic "audit: lost receipt"
+
+test expect_trap "expected scalar panic":
+  panic "expected scalar"
+
+#entry func trap_legacy (): U32 => @panic "legacy scalar"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tests/bounds.blot"),
+        r#"test "unexpected bounds":
+  let xs = #[10, 20]
+  let _ = xs[5]
+
+test expect_trap "expected bounds":
+  let xs = #[10]
+  let _ = xs[3]
+"#,
+    )
+    .unwrap();
+
+    let plugins = test_plugins(root).unwrap();
+    let checkout = plugins.root();
+    let engine = blot_host::dev_engine().unwrap();
+    let slots = Slots::new(2);
+    let modules: Vec<Module> = plugins
+        .tests(&checkout.join(ENTRY), &[], None)
+        .unwrap()
+        .into_iter()
+        .map(|test| Module::new(checkout, test))
+        .collect();
+    let mut builder = None;
+
+    // Scalar-only panicking module (checks + legacy trap).
+    let scalar_checks =
+        modules.iter().find(|m| m.shown == "tests/scalar_panic.blot" && m.kind == Kind::Checks).unwrap();
+    let ran = run_module(&mut builder, &plugins, &engine, scalar_checks, None, &slots, None);
+    let lines = module_lines(scalar_checks, &ran, None).join("\n");
+    let tests = ran.tests.unwrap_or_else(|_| panic!("{lines}"));
+    assert_eq!(
+        tests.tests.iter().map(|(name, outcome)| (name.as_str(), outcome.passed())).collect::<Vec<_>>(),
+        [("unexpected scalar panic", false), ("expected scalar panic", true)],
+        "{lines}"
+    );
+    assert!(lines.contains("panic: \"audit: lost receipt\""), "{lines}");
+    assert!(lines.contains("at tests/scalar_panic.blot:2:3"), "{lines}");
+
+    let scalar_traps = modules.iter().find(|m| m.shown == "tests/scalar_panic.blot" && m.kind == Kind::Traps).unwrap();
+    let ran = run_module(&mut builder, &plugins, &engine, scalar_traps, None, &slots, None);
+    let lines = module_lines(scalar_traps, &ran, None).join("\n");
+    let tests = ran.tests.unwrap_or_else(|_| panic!("{lines}"));
+    assert_eq!(tests.tests, [("trap_legacy".into(), Outcome::Panicked)], "{lines}");
+
+    // Array bounds module.
+    let bounds_mod = modules.iter().find(|m| m.shown == "tests/bounds.blot" && m.kind == Kind::Checks).unwrap();
+    let ran = run_module(&mut builder, &plugins, &engine, bounds_mod, None, &slots, None);
+    let lines = module_lines(bounds_mod, &ran, None).join("\n");
+    let tests = ran.tests.unwrap_or_else(|_| panic!("{lines}"));
+    assert_eq!(
+        tests.tests.iter().map(|(name, outcome)| (name.as_str(), outcome.passed())).collect::<Vec<_>>(),
+        [("unexpected bounds", false), ("expected bounds", true)],
+        "{lines}"
+    );
+    assert!(lines.contains("index out of bounds"), "{lines}");
+    assert!(lines.contains("at tests/bounds.blot:3:11"), "{lines}");
+
+    // Overlay diagnostic on a rejected test file names the test file on BOTH header and `in <basename>` lines.
+    let mut rejected_test = scalar_checks.test.clone();
+    rejected_test.path = root.join("tests/overlay_bad.blot").display().to_string();
+    rejected_test.overlays = vec![pen_plugins::Overlay {
+        path: rejected_test.entry.clone(),
+        contents: Some("#entry func bad (): U32 => return missing_symbol\n".into()),
+    }];
+    let diag = format!("{:#}", build_test_module(builder.as_mut().unwrap(), &rejected_test).unwrap_err());
+    assert!(diag.starts_with(&format!("{}:1:", rejected_test.path)), "{diag}");
+    assert!(diag.contains("in overlay_bad.blot"), "{diag}");
+    assert!(!diag.contains(".fixture.blot"), "{diag}");
 }

@@ -54,7 +54,8 @@ pub const ARENA_OOM_OFFSET: usize = 640;
 // The manifest is pen-runtime's: the browser reads it too.
 pub use pen_runtime::abi::{
     CallbackType, DEFAULT_TRANSPORT_BUDGET, GuestAbi, GuestConstant, GuestFunction, KernelManifest, MemoryShape,
-    Parameter, ProcessManifest, ValueType, WireSchema, WireSchemaKind, parse_abi, read_abi, read_memory_shape,
+    Parameter, ProcessManifest, TRAP_SITE_OFFSET, TRAPS_SECTION, TrapKind, TrapMetadata, ValueType, WireSchema,
+    WireSchemaKind, parse_abi, read_abi, read_memory_shape,
 };
 
 /// The Wasm type a value crosses the boundary as.
@@ -873,6 +874,53 @@ impl fmt::Display for Overrun {
     }
 }
 
+/// Structured provenance for a guest trap recorded in `blot:traps` and
+/// signaled at [`TRAP_SITE_OFFSET`] right before trapping.
+///
+/// Attached via `anyhow::Error::context` so callers can inspect both the
+/// underlying Wasm [`Trap`] (`error.downcast_ref::<Trap>()`) and this
+/// [`GuestTrap`] (`error.downcast_ref::<GuestTrap>()`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestTrap {
+    pub kind: TrapKind,
+    pub unit: u32,
+    pub start: u32,
+    pub end: u32,
+    pub message: String,
+}
+
+impl GuestTrap {
+    fn from_metadata(entry: &TrapMetadata) -> Self {
+        Self { kind: entry.kind, unit: entry.unit, start: entry.start, end: entry.end, message: entry.message.clone() }
+    }
+}
+
+impl fmt::Display for GuestTrap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            TrapKind::Panic if self.message.is_empty() => f.write_str("panic"),
+            TrapKind::Panic => write!(f, "panic: {:?}", self.message),
+            TrapKind::Bounds if self.message.is_empty() => f.write_str("index out of bounds"),
+            TrapKind::Bounds => f.write_str(&self.message),
+            TrapKind::Unreachable if self.message.is_empty() => f.write_str("unreachable"),
+            TrapKind::Unreachable => write!(f, "unreachable: {}", self.message),
+        }
+    }
+}
+
+impl std::error::Error for GuestTrap {}
+
+pub(crate) fn lookup_trap(traps: &[TrapMetadata], memory: &[u8]) -> Option<GuestTrap> {
+    if traps.is_empty() || memory.len() < TRAP_SITE_OFFSET + 4 {
+        return None;
+    }
+    let trap_id = u32::from_le_bytes(memory[TRAP_SITE_OFFSET..TRAP_SITE_OFFSET + 4].try_into().unwrap());
+    if trap_id == 0 {
+        return None;
+    }
+    traps.get((trap_id - 1) as usize).map(GuestTrap::from_metadata)
+}
+
 /// Epoch ticks of [`dev_engine`] in `time`, at least one.
 fn ticks(time: Duration) -> u64 {
     let tick = DEADLINE / DEADLINE_TICKS;
@@ -964,6 +1012,7 @@ struct WasmtimeGuest {
     instance: Instance,
     abi: Arc<GuestAbi>,
     symbols: Arc<Symbols>,
+    trap_memory: Option<Memory>,
     invocation_finish: Option<TypedFunc<(), i32>>,
     last_reclaimed_owners: Option<u32>,
     imaged: Arc<Result<Vec<String>, String>>,
@@ -1374,6 +1423,7 @@ impl WasmtimeGuest {
             };
             store.data_mut().tracing = Some(system_trace::Tracing::new(trace.clone(), globals));
         }
+        let trap_memory = instance.get_memory(&mut store, "blot:memory");
         let invocation_finish = if module.abi.invocation_finish {
             Some(instance.get_typed_func::<(), i32>(&mut store, INVOCATION_FINISH)?)
         } else {
@@ -1384,6 +1434,7 @@ impl WasmtimeGuest {
             instance,
             abi: module.abi.clone(),
             symbols: module.symbols.clone(),
+            trap_memory,
             invocation_finish,
             last_reclaimed_owners: None,
             imaged: module.imaged.clone(),
@@ -1463,13 +1514,40 @@ impl WasmtimeGuest {
         Ok(pointer)
     }
 
+    fn clear_trap_site(&mut self) {
+        if let Some(memory) = self.trap_memory {
+            let data = memory.data_mut(&mut self.store);
+            if data.len() >= TRAP_SITE_OFFSET + 4 {
+                data[TRAP_SITE_OFFSET..TRAP_SITE_OFFSET + 4].copy_from_slice(&0u32.to_le_bytes());
+            }
+        }
+    }
+
+    fn decorate_trap(&self, error: anyhow::Error) -> anyhow::Error {
+        let Some(trap) = error.downcast_ref::<Trap>() else {
+            return error;
+        };
+        if matches!(trap, Trap::Interrupt | Trap::OutOfFuel) {
+            return error;
+        }
+        let Some(memory) = self.trap_memory else {
+            return error;
+        };
+        match lookup_trap(&self.abi.traps, memory.data(&self.store)) {
+            Some(guest_trap) => error.context(guest_trap),
+            None => error,
+        }
+    }
+
     pub(crate) fn call_raw(&mut self, name: &str, param: Val) -> Result<Val> {
         let func = self
             .instance
             .get_func(&mut self.store, name)
             .ok_or_else(|| anyhow!("validated function export {name} disappeared"))?;
+        self.clear_trap_site();
         let mut results = [Val::I32(0)];
-        func.call(&mut self.store, &[param], &mut results).map_err(|error| symbolize(error, &self.symbols))?;
+        func.call(&mut self.store, &[param], &mut results)
+            .map_err(|error| self.decorate_trap(symbolize(error, &self.symbols)))?;
         Ok(results[0])
     }
 
@@ -1616,8 +1694,10 @@ impl WasmtimeGuest {
             .instance
             .get_func(&mut self.store, name)
             .ok_or_else(|| anyhow!("validated function export {name} disappeared"))?;
+        self.clear_trap_site();
         let mut results = [Val::I32(0)];
-        func.call(&mut self.store, &[parameter], &mut results).map_err(|error| symbolize(error, &self.symbols))?;
+        func.call(&mut self.store, &[parameter], &mut results)
+            .map_err(|error| self.decorate_trap(symbolize(error, &self.symbols)))?;
         let arena = self.store.data().arena.clone();
         from_wasm(&mut self.store, arena.as_ref(), function.result, &results[0])
     }
@@ -3158,5 +3238,202 @@ mod tests {
         });
         assert_eq!(guest.call("run", Argument::Callback(cb)).unwrap(), Value::U32(30));
         assert_eq!(*seen.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    #[cfg(feature = "compiler")]
+    fn traps_decode_provenance_for_scalar_and_array_modules_and_clear_stale_ids() {
+        let section_leb =
+            |id: u8, contents: &[u8]| -> Vec<u8> { [vec![id], leb(contents.len()), contents.to_vec()].concat() };
+        let signed_leb_i32 = |mut value: i32| -> Vec<u8> {
+            let mut bytes = Vec::new();
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
+                bytes.push(if done { byte } else { byte | 0x80 });
+                if done {
+                    return bytes;
+                }
+            }
+        };
+        let store_trap_and_unreachable = |trap_id: i32| -> Vec<u8> {
+            [
+                vec![0x00, 0x41],
+                signed_leb_i32(i32::try_from(TRAP_SITE_OFFSET).unwrap()),
+                vec![0x41],
+                signed_leb_i32(trap_id),
+                vec![0x36, 0x02, 0x00, 0x00, 0x0b],
+            ]
+            .concat()
+        };
+        let mut traps_payload = vec![1u8];
+        traps_payload.extend(3u32.to_le_bytes());
+        for (kind, unit, start, end, msg) in
+            [(1u8, 1u32, 10u32, 38u32, "audit: lost receipt"), (2, 1, 50, 55, "index out of bounds"), (3, 1, 0, 0, "")]
+        {
+            traps_payload.push(kind);
+            traps_payload.extend(unit.to_le_bytes());
+            traps_payload.extend(start.to_le_bytes());
+            traps_payload.extend(end.to_le_bytes());
+            traps_payload.extend(u32::try_from(msg.len()).unwrap().to_le_bytes());
+            traps_payload.extend(msg.as_bytes());
+        }
+
+        // 1. Scalar-only ABI 8 module: exports blot:memory + blot:traps without blot:allocate/blot:reset.
+        let scalar_abi = [
+            &[0x08, 0x05][..],
+            &name("do_panic"),
+            &[0x00, 0x00],
+            &name("do_bounds"),
+            &[0x00, 0x00],
+            &name("do_unreachable"),
+            &[0x00, 0x00],
+            &name("bare_trap"),
+            &[0x00, 0x00],
+            &name("div_zero"),
+            &[0x00, 0x00],
+            &[0x00],
+        ]
+        .concat();
+        let bodies = [
+            store_trap_and_unreachable(1),
+            store_trap_and_unreachable(2),
+            store_trap_and_unreachable(3),
+            vec![0x00, 0x00, 0x0b],
+            vec![0x00, 0x41, 0x01, 0x41, 0x00, 0x6d, 0x0b],
+        ];
+        let mut scalar_code = vec![u8::try_from(bodies.len()).unwrap()];
+        for body in &bodies {
+            scalar_code.extend(leb(body.len()));
+            scalar_code.extend(body);
+        }
+        let scalar_exports = [
+            &[0x06][..],
+            &name("blot:memory"),
+            &[0x02, 0x00],
+            &name("do_panic"),
+            &[0x00, 0x00],
+            &name("do_bounds"),
+            &[0x00, 0x01],
+            &name("do_unreachable"),
+            &[0x00, 0x02],
+            &name("bare_trap"),
+            &[0x00, 0x03],
+            &name("div_zero"),
+            &[0x00, 0x04],
+        ]
+        .concat();
+        let scalar_wasm = [
+            &b"\0asm\x01\0\0\0"[..],
+            &section_leb(0, &[&name(pen_runtime::abi::ABI_SECTION)[..], &scalar_abi].concat()),
+            &section_leb(0, &[&name(TRAPS_SECTION)[..], &traps_payload].concat()),
+            &section_leb(1, &[0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]),
+            &section_leb(3, &[0x05, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            &section_leb(5, &[0x01, 0x01, 0x01, 0x01]),
+            &section_leb(7, &scalar_exports),
+            &section_leb(10, &scalar_code),
+        ]
+        .concat();
+
+        let engine = engine().unwrap();
+        let module = GuestModule::new(&engine, &scalar_wasm, None).unwrap();
+        assert!(!module.abi().uses_arrays());
+        assert_eq!(module.abi().traps.len(), 3);
+        let mut guest = Guest::new(&engine, &module).unwrap();
+
+        let panic_err = guest.call("do_panic", Value::Unit).unwrap_err();
+        assert_eq!(panic_err.downcast_ref::<Trap>(), Some(&Trap::UnreachableCodeReached));
+        assert_eq!(
+            panic_err.downcast_ref::<GuestTrap>(),
+            Some(&GuestTrap {
+                kind: TrapKind::Panic,
+                unit: 1,
+                start: 10,
+                end: 38,
+                message: "audit: lost receipt".into(),
+            })
+        );
+        assert_eq!(panic_err.to_string(), "panic: \"audit: lost receipt\"");
+
+        // Second call trapping without writing TRAP_SITE_OFFSET must NOT reuse stale trap_id 1.
+        let bare_err = guest.call("bare_trap", Value::Unit).unwrap_err();
+        assert_eq!(bare_err.downcast_ref::<Trap>(), Some(&Trap::UnreachableCodeReached));
+        assert!(bare_err.downcast_ref::<GuestTrap>().is_none(), "{bare_err:#}");
+
+        let bounds_err = guest.call("do_bounds", Value::Unit).unwrap_err();
+        assert_eq!(bounds_err.downcast_ref::<Trap>(), Some(&Trap::UnreachableCodeReached));
+        assert_eq!(bounds_err.to_string(), "index out of bounds");
+        assert_eq!(bounds_err.downcast_ref::<GuestTrap>().unwrap().kind, TrapKind::Bounds);
+
+        let div_err = guest.call("div_zero", Value::Unit).unwrap_err();
+        assert_eq!(div_err.downcast_ref::<Trap>(), Some(&Trap::IntegerDivisionByZero));
+        assert!(div_err.downcast_ref::<GuestTrap>().is_none(), "{div_err:#}");
+
+        let unreachable_err = guest.call("do_unreachable", Value::Unit).unwrap_err();
+        assert_eq!(unreachable_err.downcast_ref::<Trap>(), Some(&Trap::UnreachableCodeReached));
+        assert_eq!(unreachable_err.to_string(), "unreachable");
+        assert_eq!(unreachable_err.downcast_ref::<GuestTrap>().unwrap().kind, TrapKind::Unreachable);
+
+        // Native package round-trip preserves blot:traps and scalar-only blot:memory.
+        let (metadata, precompiled) = GuestModule::native_bytes(&engine, &scalar_wasm).unwrap();
+        // SAFETY: freshly precompiled from `scalar_wasm` for this engine.
+        let native_module = unsafe { GuestModule::from_native(&engine, &metadata, &precompiled) }.unwrap();
+        let mut native_guest = Guest::new(&engine, &native_module).unwrap();
+        let native_err = native_guest.call("do_panic", Value::Unit).unwrap_err();
+        assert_eq!(native_err.to_string(), "panic: \"audit: lost receipt\"");
+        assert_eq!(native_err.downcast_ref::<Trap>(), Some(&Trap::UnreachableCodeReached));
+
+        // 2. Array-using ABI 8 module whose blot:reset zeroes TRAP_SITE_OFFSET still surfaces GuestTrap
+        // because trap decoding runs before post-call arena reset.
+        let array_abi =
+            [&[0x08, 0x02][..], &name("do_panic"), &[0x00, 0x05], &name("bare_trap"), &[0x00, 0x05], &[0x00]].concat();
+        let alloc_body = vec![0x00, 0x41, 0x10, 0x0b];
+        let reset_body = [
+            vec![0x00, 0x41],
+            signed_leb_i32(i32::try_from(TRAP_SITE_OFFSET).unwrap()),
+            vec![0x41, 0x00, 0x36, 0x02, 0x00, 0x41, 0x00, 0x0b],
+        ]
+        .concat();
+        let array_bodies = [alloc_body, reset_body, store_trap_and_unreachable(1), vec![0x00, 0x00, 0x0b]];
+        let mut array_code = vec![u8::try_from(array_bodies.len()).unwrap()];
+        for body in &array_bodies {
+            array_code.extend(leb(body.len()));
+            array_code.extend(body);
+        }
+        let array_exports = [
+            &[0x05][..],
+            &name("blot:memory"),
+            &[0x02, 0x00],
+            &name("blot:allocate"),
+            &[0x00, 0x00],
+            &name("blot:reset"),
+            &[0x00, 0x01],
+            &name("do_panic"),
+            &[0x00, 0x02],
+            &name("bare_trap"),
+            &[0x00, 0x03],
+        ]
+        .concat();
+        let array_wasm = [
+            &b"\0asm\x01\0\0\0"[..],
+            &section_leb(0, &[&name(pen_runtime::abi::ABI_SECTION)[..], &array_abi].concat()),
+            &section_leb(0, &[&name(TRAPS_SECTION)[..], &traps_payload].concat()),
+            &section_leb(1, &[0x01, 0x60, 0x01, 0x7f, 0x01, 0x7f]),
+            &section_leb(3, &[0x04, 0x00, 0x00, 0x00, 0x00]),
+            &section_leb(5, &[0x01, 0x00, 0x01]),
+            &section_leb(7, &array_exports),
+            &section_leb(10, &array_code),
+        ]
+        .concat();
+
+        let array_module = GuestModule::new(&engine, &array_wasm, None).unwrap();
+        assert!(array_module.abi().uses_arrays());
+        let mut array_guest = Guest::new(&engine, &array_module).unwrap();
+        let array_panic = array_guest.call("do_panic", Value::Unit).unwrap_err();
+        assert_eq!(array_panic.to_string(), "panic: \"audit: lost receipt\"");
+        assert_eq!(array_panic.downcast_ref::<Trap>(), Some(&Trap::UnreachableCodeReached));
+        let array_bare = array_guest.call("bare_trap", Value::Unit).unwrap_err();
+        assert!(array_bare.downcast_ref::<GuestTrap>().is_none(), "{array_bare:#}");
     }
 }

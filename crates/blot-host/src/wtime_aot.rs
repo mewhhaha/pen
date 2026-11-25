@@ -4259,7 +4259,37 @@ impl AotGuest {
         }
     }
 
+    fn clear_trap_site(&mut self) {
+        let mut p: *mut u8 = std::ptr::null_mut();
+        let mut n: usize = 0;
+        unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut n) };
+        if !p.is_null() && n >= crate::TRAP_SITE_OFFSET + 4 {
+            // SAFETY: `self.handle.0` uniquely owns guest linear memory while no guest call is active.
+            let data = unsafe { std::slice::from_raw_parts_mut(p, n) };
+            data[crate::TRAP_SITE_OFFSET..crate::TRAP_SITE_OFFSET + 4].copy_from_slice(&0u32.to_le_bytes());
+        }
+    }
+
+    fn decorate_trap(&self, error: anyhow::Error) -> anyhow::Error {
+        if self.abi.traps.is_empty() {
+            return error;
+        }
+        let mut p: *mut u8 = std::ptr::null_mut();
+        let mut n: usize = 0;
+        unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut n) };
+        if p.is_null() || n < crate::TRAP_SITE_OFFSET + 4 {
+            return error;
+        }
+        // SAFETY: `self.handle.0` uniquely owns guest linear memory while no guest call is active.
+        let data = unsafe { std::slice::from_raw_parts(p, n) };
+        match crate::lookup_trap(&self.abi.traps, data) {
+            Some(guest_trap) => error.context(guest_trap),
+            None => error,
+        }
+    }
+
     fn call_export_raw(&mut self, name: &str, arg_bits: u64) -> Result<u64> {
+        self.clear_trap_site();
         let mut res_out = 0u64;
         let mut trap_code = 0u8;
         let rc = unsafe {
@@ -4281,13 +4311,13 @@ impl AotGuest {
                 }
                 Err(self
                     .with_host_mut(|host| host.pending_error.take())
-                    .unwrap_or_else(|| self.lib.trap_error(trap_code)))
+                    .unwrap_or_else(|| self.decorate_trap(self.lib.trap_error(trap_code))))
             }
             1 => {
                 if is_oom_trap_code(trap_code) {
                     self.saw_oom = true;
                 }
-                Err(self.lib.trap_error(trap_code))
+                Err(self.decorate_trap(self.lib.trap_error(trap_code)))
             }
             _ => bail!("unknown_export: unknown function export {name}"),
         }

@@ -32,7 +32,7 @@ use std::sync::{Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use blot_host::{Guest, GuestFunction, GuestModule, Parameter, Value, ValueType};
+use blot_host::{Guest, GuestFunction, GuestModule, GuestTrap, Parameter, TrapKind, Value, ValueType};
 use pen_plugins::{Builder, Expectation, Outcome as Building, Plugins, TestModule};
 use pen_runtime::abi::TestKind;
 use wasmtime::{Engine, Trap};
@@ -331,8 +331,25 @@ fn run_module(
         Expectation::Rejected(rejects) => Ok(rejection(rejects, compiled)),
         Expectation::Checks | Expectation::Traps => {
             let run = session_tests.map(|prepared| prepared.module(Path::new(&module.test.path)));
+            let source_text = module
+                .test
+                .overlays
+                .iter()
+                .find(|overlay| overlay.path == module.test.entry)
+                .and_then(|overlay| overlay.contents.clone())
+                .or_else(|| std::fs::read_to_string(&module.test.path).ok());
+            let source = source_text.as_deref().map(|text| (module.shown.as_str(), text));
             compiled.and_then(|wasm| {
-                run_tests_with_session(engine, &wasm, module.kind, &module.test.prefix, filter, slots, run.as_ref())
+                run_tests_with_session(
+                    engine,
+                    &wasm,
+                    module.kind,
+                    &module.test.prefix,
+                    filter,
+                    slots,
+                    run.as_ref(),
+                    source,
+                )
             })
         }
     };
@@ -412,16 +429,28 @@ pub fn build_test_module(builder: &mut Builder, test: &TestModule) -> Result<Vec
     match builder.build(&test.overlays) {
         Building::Built(built) => Ok(built.wasm),
         Building::Rejected(diagnostics) => {
-            let standing_in = test
+            let entry_source = test
                 .overlays
                 .iter()
                 .find(|overlay| overlay.path == test.entry)
-                .and_then(|overlay| Some((overlay.path.as_str(), overlay.contents.as_deref()?)));
+                .and_then(|overlay| overlay.contents.clone())
+                .or_else(|| (test.path != test.entry).then(|| std::fs::read_to_string(&test.entry).ok()).flatten());
             let lines: Vec<String> = diagnostics
                 .iter()
                 .map(|diagnostic| {
-                    let line = crate::plugin_build::describe(diagnostic, standing_in);
-                    if diagnostic.file == test.entry { line.replacen(&test.entry, &test.path, 1) } else { line }
+                    if diagnostic.file == test.entry && test.path != test.entry {
+                        let mut shown = diagnostic.clone();
+                        shown.file = test.path.clone();
+                        let standing_in = entry_source.as_deref().map(|text| (test.path.as_str(), text));
+                        crate::plugin_build::describe(&shown, standing_in)
+                    } else {
+                        let standing_in = test
+                            .overlays
+                            .iter()
+                            .find(|overlay| overlay.path == diagnostic.file)
+                            .and_then(|overlay| Some((overlay.path.as_str(), overlay.contents.as_deref()?)));
+                        crate::plugin_build::describe(diagnostic, standing_in)
+                    }
                 })
                 .collect();
             bail!("{}", lines.join("\n"))
@@ -560,7 +589,7 @@ fn run_tests(
     filter: Option<&str>,
     slots: &Slots,
 ) -> Result<Tests> {
-    run_tests_with_session(engine, wasm, kind, prefix, filter, slots, None)
+    run_tests_with_session(engine, wasm, kind, prefix, filter, slots, None, None)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -587,6 +616,7 @@ struct Entry<'a> {
     kind: EntryKind,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tests_with_session(
     engine: &Engine,
     wasm: &[u8],
@@ -595,6 +625,7 @@ fn run_tests_with_session(
     filter: Option<&str>,
     slots: &Slots,
     session: Option<&session::Run<'_>>,
+    source: Option<(&str, &str)>,
 ) -> Result<Tests> {
     let started = Instant::now();
     let module = GuestModule::new(engine, wasm, None)?;
@@ -665,11 +696,11 @@ fn run_tests_with_session(
                                 Some(run) => {
                                     let started = Instant::now();
                                     (
-                                        reported(run.call(engine, &module, entry.export, slots.deadline)),
+                                        reported(run.call(engine, &module, entry.export, slots.deadline), source),
                                         Timing { took: started.elapsed(), cycle_passes: None },
                                     )
                                 }
-                                None => run_test(engine, &module, entry.kind, entry.export, slots.deadline),
+                                None => run_test(engine, &module, entry.kind, entry.export, slots.deadline, source),
                             });
                             ran.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(outcome);
                         }
@@ -709,6 +740,7 @@ fn run_test(
     kind: EntryKind,
     name: &str,
     deadline: Duration,
+    source: Option<(&str, &str)>,
 ) -> (Outcome, Timing) {
     let running = Instant::now();
     let mut cycle_passes = None;
@@ -722,14 +754,14 @@ fn run_test(
         called
     });
     let outcome = match kind {
-        EntryKind::Trap | EntryKind::LegacyTrap => trapped(called, kind == EntryKind::LegacyTrap),
-        EntryKind::Check => reported(called),
+        EntryKind::Trap | EntryKind::LegacyTrap => trapped(called, kind == EntryKind::LegacyTrap, source),
+        EntryKind::Check => reported(called, source),
     };
     (outcome, Timing { took: running.elapsed(), cycle_passes })
 }
 
 /// A check's outcome by the value it returned.
-fn reported(called: Result<Value>) -> Outcome {
+fn reported(called: Result<Value>, source: Option<(&str, &str)>) -> Outcome {
     match called {
         Ok(Value::ArrayF32(lanes)) => match decode(&lanes) {
             Ok(report) => Outcome::Reported(report),
@@ -744,18 +776,18 @@ fn reported(called: Result<Value>) -> Outcome {
         Ok(Value::Unit | Value::Bool(true)) => Outcome::Completed,
         Ok(Value::Bool(false)) => Outcome::Broken("returned false".into()),
         Ok(value) => Outcome::Broken(format!("unexpected check result: {}", value.kind())),
-        Err(error) => Outcome::Broken(explain(&error)),
+        Err(error) => Outcome::Broken(explain_with_source(&error, source)),
     }
 }
 
-fn trapped(called: Result<Value>, legacy: bool) -> Outcome {
+fn trapped(called: Result<Value>, legacy: bool, source: Option<(&str, &str)>) -> Outcome {
     match called {
         Ok(value) => Outcome::Returned(value),
         Err(error) => match error.downcast_ref::<Trap>() {
             Some(Trap::UnreachableCodeReached) => Outcome::Panicked,
-            Some(_) if legacy => Outcome::Mistrapped(explain(&error)),
+            Some(_) if legacy => Outcome::Mistrapped(explain_with_source(&error, source)),
             // Host deadlines and fuel limits do not indicate a guest trap.
-            Some(Trap::Interrupt | Trap::OutOfFuel) | None => Outcome::Broken(explain(&error)),
+            Some(Trap::Interrupt | Trap::OutOfFuel) | None => Outcome::Broken(explain_with_source(&error, source)),
             Some(_) => Outcome::Panicked,
         },
     }
@@ -933,11 +965,76 @@ fn failed_checks(report: &Report) -> impl Iterator<Item = String> + '_ {
 }
 
 /// An error's cause first (a trap's reason), then what it happened in (its
-/// backtrace), a line each.
-fn explain(error: &anyhow::Error) -> String {
+/// backtrace), a line each. When a guest trap carries `blot:traps` provenance,
+/// show that reason (and `at <shown>:<line>:<col>` when the span matches
+/// `source`) ahead of any backtrace instead of a bare `unreachable`.
+fn explain_with_source(error: &anyhow::Error, source: Option<(&str, &str)>) -> String {
+    if let Some(trap) = error.downcast_ref::<GuestTrap>() {
+        let trap_text = trap.to_string();
+        let mut lines = vec![trap_text.clone()];
+        if let Some((shown, text)) = source
+            && let Some((line, col)) = resolve_trap_location(trap, text)
+        {
+            lines.push(format!("at {shown}:{line}:{col}"));
+        }
+        let mut skipped_guest_trap = false;
+        let mut rest: Vec<String> = error
+            .chain()
+            .filter(|cause| {
+                if cause.downcast_ref::<Trap>() == Some(&Trap::UnreachableCodeReached) {
+                    return false;
+                }
+                let text = cause.to_string();
+                if !skipped_guest_trap && text == trap_text {
+                    skipped_guest_trap = true;
+                    return false;
+                }
+                true
+            })
+            .map(ToString::to_string)
+            .collect();
+        rest.reverse();
+        lines.extend(rest);
+        return lines.join("\n");
+    }
     let mut chain: Vec<String> = error.chain().map(ToString::to_string).collect();
     chain.reverse();
     chain.join("\n")
+}
+
+/// Maps a `blot:traps` UTF-8 byte span to 1-based `(line, col)` in `source`
+/// only when the slice plausibly matches the trap site, preventing wrong-file
+/// locations when a trap originates inside an imported module.
+fn resolve_trap_location(trap: &GuestTrap, source: &str) -> Option<(usize, usize)> {
+    let start = usize::try_from(trap.start).ok()?;
+    let end = usize::try_from(trap.end).ok()?;
+    if end <= start || end > source.len() || !source.is_char_boundary(start) || !source.is_char_boundary(end) {
+        return None;
+    }
+    let snippet = &source[start..end];
+    let matches = match trap.kind {
+        TrapKind::Panic => {
+            let has_panic = snippet.contains("panic");
+            let message_ok = trap.message.is_empty()
+                || trap.message.chars().any(|ch| matches!(ch, '\\' | '"' | '\n' | '\r' | '\t'))
+                || snippet.contains(&trap.message);
+            has_panic && message_ok
+        }
+        TrapKind::Bounds => {
+            (snippet.contains('[') && snippet.contains(']'))
+                || [".get", ".set", ".at", ".pop", ".slice", ".remove", ".swap_remove"]
+                    .iter()
+                    .any(|op| snippet.contains(op))
+        }
+        TrapKind::Unreachable => snippet.contains("unreachable"),
+    };
+    if !matches {
+        return None;
+    }
+    let line_start = source[..start].rfind('\n').map_or(0, |index| index + 1);
+    let line = source[..line_start].bytes().filter(|&byte| byte == b'\n').count() + 1;
+    let col = source[line_start..start].chars().count() + 1;
+    Some((line, col))
 }
 
 fn format_value(value: &Value) -> String {

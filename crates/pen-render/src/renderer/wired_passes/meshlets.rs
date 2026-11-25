@@ -1,0 +1,285 @@
+use super::super::{GpuAsset, MeshletIndirectSlot, Scratch, Shape, State, hiz, timing};
+use super::{PlannedMeshletDraw, WiredPasses};
+use crate::camera_precision::DepthMode;
+use crate::matrix::{invert, multiply};
+use crate::meshlets::{
+    MeshletBatchEntry, MeshletCullParams, MeshletCuller, MeshletIndirectDraw, MeshletTwoPhaseBatchEntry,
+};
+use anyhow::Result;
+use pen_protocol::{Matrix, RenderFrame};
+
+impl State {
+    /// Phase 1 of two-phase GPU meshlet cluster culling (local frustum + shear-safe normal-cone
+    /// backface + prior-frame Hi-Z in both Forward-Z and Reversed-Z) for opaque LOD0 mesh draws.
+    /// When prior-frame Hi-Z is active and matches `depth_mode`, records `phase2_flags` so Phase 2
+    /// can recover newly disoccluded clusters on the exact same frame (0-frame lag).
+    pub(in crate::renderer) fn encode_meshlet_culling_phase1(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+        scratch: &mut Scratch,
+        active_proj: &Matrix,
+        depth_mode: DepthMode,
+    ) -> Result<()> {
+        self.wired.last_meshlet_cull_draws = 0;
+        self.wired.meshlet_phase1_used_hiz = false;
+        self.wired.last_meshlet_phase2_active = false;
+        self.wired.meshlet_plan.clear();
+
+        let active_vp = multiply(active_proj, &frame.view);
+        let planes = frustum_planes_from_vp(&active_vp);
+        let eye = invert(&frame.view);
+        let camera_pos = [eye[12], eye[13], eye[14]];
+        let reversed_z = depth_mode == DepthMode::ReversedZ;
+        let (hiz_view_ref, hiz_view_id, hiz_vp, _, hiz_mips, hiz_active) = self.hiz.source();
+        let use_hiz = hiz_active && self.hiz.depth_mode() == depth_mode;
+        let hiz_opt = use_hiz.then_some((hiz_view_ref, hiz_view_id));
+        let has_mdi = device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
+
+        let mut slot_cursor = 0usize;
+        for &ready_idx in &scratch.opaque {
+            let entry = &scratch.ready[ready_idx];
+            if entry.skin.is_some() || entry.morph.is_some() {
+                continue;
+            }
+            let item = &scratch.items[entry.item];
+            if item.lod != 0 || !matches!(item.shape, Shape::Mesh(_)) {
+                continue;
+            }
+            let Some(mesh_slot) = entry.mesh else {
+                continue;
+            };
+            let Some(GpuAsset::Mesh(mesh)) = self.assets.current(mesh_slot) else {
+                continue;
+            };
+            if mesh.instances.is_some() {
+                continue;
+            }
+            let Some(ml) = &mesh.meshlets else {
+                continue;
+            };
+            if ml.count <= 1 || (!has_mdi && ml.count > 64) {
+                continue;
+            }
+            let need_draw_bytes = u64::from(ml.count) * size_of::<MeshletIndirectDraw>() as u64;
+            let need_flag_bytes = u64::from(ml.count) * size_of::<u32>() as u64;
+            let make_slot = |serial: u64, draw_cap: u64, flag_cap: u64| MeshletIndirectSlot {
+                count: ml.count,
+                generation: serial,
+                draws_phase1: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("meshlet_indirect_draws_p1"),
+                    size: draw_cap,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                    mapped_at_creation: false,
+                }),
+                draws_phase2: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("meshlet_indirect_draws_p2"),
+                    size: draw_cap,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                    mapped_at_creation: false,
+                }),
+                phase2_flags: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("meshlet_phase2_flags"),
+                    size: flag_cap,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                }),
+            };
+            if slot_cursor >= self.meshlet_indirect.len() {
+                self.wired.meshlet_indirect_serial += 1;
+                self.meshlet_indirect.push(make_slot(
+                    self.wired.meshlet_indirect_serial,
+                    need_draw_bytes.max(1280),
+                    need_flag_bytes.max(256),
+                ));
+            } else if self.meshlet_indirect[slot_cursor].draws_phase1.size() < need_draw_bytes
+                || self.meshlet_indirect[slot_cursor].phase2_flags.size() < need_flag_bytes
+            {
+                self.wired.meshlet_indirect_serial += 1;
+                self.meshlet_indirect[slot_cursor] = make_slot(
+                    self.wired.meshlet_indirect_serial,
+                    need_draw_bytes.next_power_of_two(),
+                    need_flag_bytes.next_power_of_two(),
+                );
+            } else {
+                self.meshlet_indirect[slot_cursor].count = ml.count;
+            }
+            let model = *item.transform(frame);
+            let det3 = model[0] * (model[5] * model[10] - model[6] * model[9])
+                - model[4] * (model[1] * model[10] - model[2] * model[9])
+                + model[8] * (model[1] * model[6] - model[2] * model[5]);
+            let rev = self.assets.slots[mesh_slot].revision;
+            let mesh_key = ((mesh_slot as u64) << 32) ^ rev;
+            self.wired.meshlet_plan.push(PlannedMeshletDraw {
+                slot: slot_cursor,
+                mesh_slot,
+                mesh_key,
+                ml_count: ml.count,
+                model,
+                backface_cull: det3 > 0.0,
+            });
+            scratch.ready[ready_idx].meshlet_slot = Some(slot_cursor);
+            slot_cursor += 1;
+        }
+        if !self.wired.meshlet_plan.is_empty() {
+            let culler = self.wired.meshlet_culler.get_or_insert_with(|| MeshletCuller::new(device));
+            if use_hiz {
+                let mut batch = Vec::with_capacity(self.wired.meshlet_plan.len());
+                for p in &self.wired.meshlet_plan {
+                    let Some(GpuAsset::Mesh(mesh)) = self.assets.current(p.mesh_slot) else { continue };
+                    let Some(ml) = &mesh.meshlets else { continue };
+                    let slot_data = &self.meshlet_indirect[p.slot];
+                    batch.push(MeshletTwoPhaseBatchEntry {
+                        mesh_key: p.mesh_key,
+                        draws_gen: slot_data.generation,
+                        meshlets_buf: &ml.descriptors,
+                        draws_phase1_buf: &slot_data.draws_phase1,
+                        draws_phase2_buf: &slot_data.draws_phase2,
+                        phase2_flags_buf: &slot_data.phase2_flags,
+                        meshlet_count: p.ml_count,
+                        params: MeshletCullParams {
+                            model: p.model,
+                            hiz_vp,
+                            frustum_planes: planes,
+                            camera_pos,
+                            hiz_enabled: true,
+                            hiz_mips,
+                            backface_cull: p.backface_cull,
+                            reversed_z,
+                        },
+                    });
+                }
+                culler.cull_batch_phase1(
+                    device,
+                    &self.queue,
+                    encoder,
+                    hiz_opt,
+                    &batch,
+                    self.timer.compute(timing::Span::Culling),
+                )?;
+                self.wired.meshlet_phase1_used_hiz = true;
+            } else {
+                let mut batch = Vec::with_capacity(self.wired.meshlet_plan.len());
+                for p in &self.wired.meshlet_plan {
+                    let Some(GpuAsset::Mesh(mesh)) = self.assets.current(p.mesh_slot) else { continue };
+                    let Some(ml) = &mesh.meshlets else { continue };
+                    let slot_data = &self.meshlet_indirect[p.slot];
+                    batch.push(MeshletBatchEntry {
+                        mesh_key: p.mesh_key,
+                        draws_gen: slot_data.generation,
+                        meshlets_buf: &ml.descriptors,
+                        draws_buf: &slot_data.draws_phase1,
+                        meshlet_count: p.ml_count,
+                        params: MeshletCullParams {
+                            model: p.model,
+                            hiz_vp: active_vp,
+                            frustum_planes: planes,
+                            camera_pos,
+                            hiz_enabled: false,
+                            hiz_mips: 0,
+                            backface_cull: p.backface_cull,
+                            reversed_z,
+                        },
+                    });
+                }
+                culler.cull_batch(
+                    device,
+                    &self.queue,
+                    encoder,
+                    None,
+                    &batch,
+                    self.timer.compute(timing::Span::Culling),
+                )?;
+            }
+        }
+        self.wired.last_meshlet_cull_draws = u32::try_from(slot_cursor).unwrap_or(u32::MAX);
+        Ok(())
+    }
+
+    /// Phase 2 of two-phase GPU meshlet occlusion culling: re-tests ONLY `phase2_flags == 1`
+    /// candidates against the fresh current-frame Hi-Z built from Phase 1 opaque depth so newly
+    /// disoccluded meshlets render in the exact same frame with zero overlap and zero popping.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_meshlet_culling_phase2(
+        wired: &mut WiredPasses,
+        hiz: &hiz::HiZ,
+        assets: &crate::asset_store::AssetStore<GpuAsset>,
+        meshlet_indirect: &[MeshletIndirectSlot],
+        timer: &timing::GpuTimer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+        active_proj: &Matrix,
+        depth_mode: DepthMode,
+    ) -> Result<()> {
+        if !wired.meshlet_phase1_used_hiz || wired.meshlet_plan.is_empty() {
+            return Ok(());
+        }
+        let Some(culler) = wired.meshlet_culler.as_mut() else {
+            return Ok(());
+        };
+        let active_vp = multiply(active_proj, &frame.view);
+        let planes = frustum_planes_from_vp(&active_vp);
+        let eye = invert(&frame.view);
+        let camera_pos = [eye[12], eye[13], eye[14]];
+        let reversed_z = depth_mode == DepthMode::ReversedZ;
+        let (hiz_view_ref, hiz_view_id, hiz_vp, _, hiz_mips, hiz_active) = hiz.source();
+        let use_hiz = hiz_active && hiz.depth_mode() == depth_mode;
+        let hiz_opt = use_hiz.then_some((hiz_view_ref, hiz_view_id));
+
+        let mut batch = Vec::with_capacity(wired.meshlet_plan.len());
+        for p in &wired.meshlet_plan {
+            let Some(GpuAsset::Mesh(mesh)) = assets.current(p.mesh_slot) else { continue };
+            let Some(ml) = &mesh.meshlets else { continue };
+            let slot_data = &meshlet_indirect[p.slot];
+            batch.push(MeshletTwoPhaseBatchEntry {
+                mesh_key: p.mesh_key,
+                draws_gen: slot_data.generation,
+                meshlets_buf: &ml.descriptors,
+                draws_phase1_buf: &slot_data.draws_phase1,
+                draws_phase2_buf: &slot_data.draws_phase2,
+                phase2_flags_buf: &slot_data.phase2_flags,
+                meshlet_count: p.ml_count,
+                params: MeshletCullParams {
+                    model: p.model,
+                    hiz_vp: if use_hiz { hiz_vp } else { active_vp },
+                    frustum_planes: planes,
+                    camera_pos,
+                    hiz_enabled: use_hiz,
+                    hiz_mips,
+                    backface_cull: p.backface_cull,
+                    reversed_z,
+                },
+            });
+        }
+        culler.cull_batch_phase2(device, queue, encoder, hiz_opt, &batch, timer.compute(timing::Span::Culling))?;
+        wired.last_meshlet_phase2_active = true;
+        Ok(())
+    }
+}
+
+/// Extracts six normalized inward-facing frustum planes from a column-major WebGPU `[0, 1]`
+/// view-projection matrix (valid for both Forward-Z and Reversed-Z projections).
+fn frustum_planes_from_vp(vp: &Matrix) -> [[f32; 4]; 6] {
+    let row = |r: usize| [vp[r], vp[4 + r], vp[8 + r], vp[12 + r]];
+    let r0 = row(0);
+    let r1 = row(1);
+    let r2 = row(2);
+    let r3 = row(3);
+    let add = |a: [f32; 4], b: [f32; 4]| [a[0] + b[0], a[1] + b[1], a[2] + b[2], a[3] + b[3]];
+    let sub = |a: [f32; 4], b: [f32; 4]| [a[0] - b[0], a[1] - b[1], a[2] - b[2], a[3] - b[3]];
+    let norm = |p: [f32; 4]| {
+        let l = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        if l > 1e-7 { [p[0] / l, p[1] / l, p[2] / l, p[3] / l] } else { [0.0; 4] }
+    };
+    [
+        norm(add(r3, r0)), // Left:   x + w >= 0
+        norm(sub(r3, r0)), // Right:  w - x >= 0
+        norm(add(r3, r1)), // Bottom: y + w >= 0
+        norm(sub(r3, r1)), // Top:    w - y >= 0
+        norm(r2),          // Near/Far z >= 0
+        norm(sub(r3, r2)), // Far/Near w - z >= 0
+    ]
+}

@@ -52,6 +52,7 @@ fn put_count(out: &mut Vec<u8>, count: usize) {
 }
 
 fn put_lanes(out: &mut Vec<u8>, lanes: &[f32]) {
+    out.reserve(4 + lanes.len() * 4);
     put_count(out, lanes.len());
     for lane in lanes {
         out.extend_from_slice(&lane.to_le_bytes());
@@ -65,7 +66,8 @@ fn put_saved(out: &mut Vec<u8>, saved: &SavedState) {
 
 /// The start of a recording: its header and the moment it starts from.
 pub fn encode_moment(moment: &Moment) -> Vec<u8> {
-    let mut out = Vec::new();
+    let scenes_bytes: usize = moment.edits.scenes.iter().map(|scene| 4 + scene.len() * 4).sum();
+    let mut out = Vec::with_capacity(MAGIC.len() + 4 + 8 + moment.saved.state.len() * 4 + 8 + scenes_bytes);
     out.extend_from_slice(MAGIC);
     put_u32(&mut out, VERSION);
     put_saved(&mut out, &moment.saved);
@@ -77,28 +79,49 @@ pub fn encode_moment(moment: &Moment) -> Vec<u8> {
     out
 }
 
-/// One frame of a recording, which follows its moment and the frames before.
-pub fn encode_frame(recorded: &Recorded) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + recorded.input.len() * 4);
-    put_lanes(&mut out, &recorded.input);
-    put_u32(&mut out, u32::from(recorded.restored));
-    put_count(&mut out, recorded.loads.len());
+/// Appends one encoded frame of a recording directly into `out`.
+pub fn encode_frame_into(out: &mut Vec<u8>, recorded: &Recorded) {
+    out.reserve(12 + recorded.input.len() * 4);
+    put_lanes(out, &recorded.input);
+    put_u32(out, u32::from(recorded.restored));
+    put_count(out, recorded.loads.len());
     for load in &recorded.loads {
         let (kind, saved) = match load {
             Load::Save(saved) => (0, saved),
             Load::Scene(saved) => (1, saved),
         };
-        put_u32(&mut out, kind);
-        put_saved(&mut out, saved);
+        put_u32(out, kind);
+        put_saved(out, saved);
     }
+}
+
+/// One frame of a recording, which follows its moment and the frames before.
+pub fn encode_frame(recorded: &Recorded) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + recorded.input.len() * 4);
+    encode_frame_into(&mut out, recorded);
     out
 }
 
 /// A whole recording, as a `.penrec` file holds it.
 pub fn encode(recording: &Recording) -> Vec<u8> {
     let mut out = encode_moment(&recording.start);
+    let extra: usize = recording
+        .frames
+        .iter()
+        .map(|frame| {
+            let loads: usize = frame
+                .loads
+                .iter()
+                .map(|load| match load {
+                    Load::Save(saved) | Load::Scene(saved) => 12 + saved.state.len() * 4,
+                })
+                .sum();
+            12 + frame.input.len() * 4 + loads
+        })
+        .sum();
+    out.reserve(extra);
     for frame in &recording.frames {
-        out.extend(encode_frame(frame));
+        encode_frame_into(&mut out, frame);
     }
     out
 }
@@ -183,7 +206,7 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded> {
         validate_state(&scene)?;
         scenes.push(Arc::<[f32]>::from(scene));
     }
-    let start = Moment { saved, edits: Edits { scenes, step: step.checked_sub(1) } };
+    let start = Moment { saved: Arc::new(saved), edits: Edits { scenes, step: step.checked_sub(1) } };
     let mut frames = Vec::new();
     let mut cut = false;
     while reader.at < bytes.len() {
@@ -249,7 +272,7 @@ mod tests {
         let saved = SavedState { schema: 7, state: vec![1.0, -2.5, 3.25] };
         let scenes: Vec<Arc<[f32]>> = vec![vec![4.0].into(), vec![5.0, 6.0].into()];
         Recording {
-            start: Moment { saved: saved.clone(), edits: Edits { scenes, step: Some(1) } },
+            start: Moment { saved: Arc::new(saved.clone()), edits: Edits { scenes, step: Some(1) } },
             frames: vec![
                 Recorded { input: vec![0.0, 960.0, 640.0, 0.0, 0.0], ..Recorded::default() },
                 Recorded {

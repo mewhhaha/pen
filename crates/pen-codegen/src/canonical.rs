@@ -227,7 +227,7 @@ pub fn rust(model: &Model) -> Vec<String> {
     out.extend("            }\n        }\n        out.push(state.len() as f32);\n        out.extend_from_slice(state);\n        out\n    }\n".split('\n').map(str::to_owned));
 
     out.extend(
-        "    /// The walk of a render packet's values that pen's tests compare with the game's\n    /// (`pen/protocol_canonical.blot`): the header's values and then the sections, each in the\n    /// schema's order, as described in pen-codegen's canonical.rs. It takes the schema and\n    /// the state, which the frame does not hold, where the packet has them.\n    pub fn canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> Vec<f32> {\n        let mut out = Vec::new();"
+        "    mod canonical_sink {\n        pub(super) trait CanonicalSink {\n            fn push(&mut self, value: f32);\n            fn extend<const N: usize>(&mut self, values: [f32; N]);\n            fn extend_from_slice(&mut self, values: &[f32]);\n        }\n\n        impl CanonicalSink for Vec<f32> {\n            #[inline]\n            fn push(&mut self, value: f32) {\n                Vec::push(self, value);\n            }\n            #[inline]\n            fn extend<const N: usize>(&mut self, values: [f32; N]) {\n                Vec::extend_from_slice(self, &values);\n            }\n            #[inline]\n            fn extend_from_slice(&mut self, values: &[f32]) {\n                Vec::extend_from_slice(self, values);\n            }\n        }\n\n        pub(super) struct Fnv1aSink(pub(super) u64);\n\n        impl Fnv1aSink {\n            #[inline]\n            fn write_lane(&mut self, lane: f32) {\n                for byte in lane.to_bits().to_le_bytes() {\n                    self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);\n                }\n            }\n        }\n\n        impl CanonicalSink for Fnv1aSink {\n            #[inline]\n            fn push(&mut self, value: f32) {\n                self.write_lane(value);\n            }\n            #[inline]\n            fn extend<const N: usize>(&mut self, values: [f32; N]) {\n                for value in values {\n                    self.write_lane(value);\n                }\n            }\n            #[inline]\n            fn extend_from_slice(&mut self, values: &[f32]) {\n                for &value in values {\n                    self.write_lane(value);\n                }\n            }\n        }\n    }\n\n    /// The walk of a render packet's values that pen's tests compare with the game's\n    /// (`pen/protocol_canonical.blot`): the header's values and then the sections, each in the\n    /// schema's order, as described in pen-codegen's canonical.rs. It takes the schema and\n    /// the state, which the frame does not hold, where the packet has them.\n    pub fn canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> Vec<f32> {\n        let mut out = Vec::new();\n        walk_canonical_render(&mut out, frame, schema, state);\n        out\n    }\n\n    /// Streaming FNV-1a hash of [`canonical_render`] without allocating a buffer.\n    pub fn hash_canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> u64 {\n        let mut out = canonical_sink::Fnv1aSink(0xcbf2_9ce4_8422_2325);\n        walk_canonical_render(&mut out, frame, schema, state);\n        out.0\n    }\n\n    fn walk_canonical_render<S: canonical_sink::CanonicalSink>(out: &mut S, frame: &RenderFrame, schema: u32, state: &[f32]) {"
             .lines()
             .map(str::to_owned),
     );
@@ -235,20 +235,12 @@ pub fn rust(model: &Model) -> Vec<String> {
     for member in members(model) {
         match member {
             Member::Lane(laid) if kind(&laid.field) == "schema" => pushes.lane("schema as f32".to_owned()),
-            Member::Lane(laid) => {
-                rust_field(model, &mut pushes, &laid.field, &format!("frame.{}", laid.name), "&mut out")
-            }
+            Member::Lane(laid) => rust_field(model, &mut pushes, &laid.field, &format!("frame.{}", laid.name), "out"),
             Member::Group(group) => {
                 let lanes = group_lanes(model, group);
                 if presence(&lanes).is_none() {
                     for laid in &lanes {
-                        rust_field(
-                            model,
-                            &mut pushes,
-                            &laid.field,
-                            &format!("frame.{group}.{}", laid.name),
-                            "&mut out",
-                        );
+                        rust_field(model, &mut pushes, &laid.field, &format!("frame.{group}.{}", laid.name), "out");
                     }
                     continue;
                 }
@@ -257,7 +249,7 @@ pub fn rust(model: &Model) -> Vec<String> {
                 let mut some = Pushes::new(16);
                 some.lane("1.0".to_owned());
                 for laid in &lanes {
-                    rust_field(model, &mut some, &laid.field, &format!("{group}.{}", laid.name), "&mut out");
+                    rust_field(model, &mut some, &laid.field, &format!("{group}.{}", laid.name), "out");
                 }
                 let mut lines =
                     vec![format!("        match &frame.{group} {{"), format!("            Some({group}) => {{")];
@@ -284,13 +276,13 @@ pub fn rust(model: &Model) -> Vec<String> {
                         pushes.lane(format!("frame.{name}.len() as f32"));
                         pushes.line(format!("out.extend_from_slice(&frame.{name});"));
                     }
-                    _ => rust_list(&mut pushes, &section["record"], &format!("frame.{name}"), "&mut out"),
+                    _ => rust_list(&mut pushes, &section["record"], &format!("frame.{name}"), "out"),
                 }
             }
         }
     }
     out.extend(pushes.finish());
-    out.extend(["        out".to_owned(), "    }".to_owned()]);
+    out.push("    }".to_owned());
 
     // Each record's walk.
     let mut emitted = HashSet::new();
@@ -307,7 +299,7 @@ pub fn rust(model: &Model) -> Vec<String> {
             let variable = snake(s(&record["name"]));
             out.push(String::new());
             out.push(format!(
-                "    fn {}(out: &mut Vec<f32>, {variable}: &{}) {{",
+                "    fn {}<S: canonical_sink::CanonicalSink>(out: &mut S, {variable}: &{}) {{",
                 rust_walker(record),
                 s(&record["name"])
             ));
@@ -449,7 +441,8 @@ fn render_stream(model: &Model) -> Vec<String> {
             out.extend(stream_record(entry));
         }
     }
-    out.extend([String::new(),
+    out.extend([
+        String::new(),
         "// Canonical render values streamed into the packet it is given and returns.".to_owned(),
         "func render_packet_from_canonical (canonical: #[F32]) -> (output: own #[F32]): #[F32] =>".to_owned(),
         "  lanes.finite canonical".to_owned(),
@@ -460,7 +453,8 @@ fn render_stream(model: &Model) -> Vec<String> {
         "  let extras: #[F32] = #[]".to_owned(),
         "  let stream: Stream = { at: 0, output, children, extras }".to_owned(),
         "  stream.output[0] := protocol.packet_magic".to_owned(),
-        "  let at: U32 = 0".to_owned()]);
+        "  let at: U32 = 0".to_owned(),
+    ]);
     for member in members(model) {
         match member {
             Member::Lane(field) => stream_header(&mut out, field, "  "),

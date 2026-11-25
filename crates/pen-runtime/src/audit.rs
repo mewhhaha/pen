@@ -57,15 +57,26 @@ pub struct Picture<'a> {
     pub rgba: &'a [u8],
 }
 
+/// Precomputed 256-entry sRGB-to-linear LUT matching WCAG 2 exact channel transfer.
+fn srgb_lut() -> &'static [f32; 256] {
+    static LUT: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        std::array::from_fn(|i| {
+            let value = i as f32 / 255.0;
+            if value <= 0.040_45 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
+        })
+    })
+}
+
 impl Picture<'_> {
     /// A pixel's relative luminance (WCAG 2), 0 to 1.
+    #[inline]
     fn luminance(&self, x: u32, y: u32) -> f32 {
+        let lut = srgb_lut();
         let at = (y as usize * self.width as usize + x as usize) * 4;
-        let channel = |value: u8| {
-            let value = f32::from(value) / 255.0;
-            if value <= 0.040_45 { value / 12.92 } else { ((value + 0.055) / 1.055).powf(2.4) }
-        };
-        let [r, g, b] = [0, 1, 2].map(|offset| channel(self.rgba.get(at + offset).copied().unwrap_or(0)));
+        let r = lut[usize::from(self.rgba.get(at).copied().unwrap_or(0))];
+        let g = lut[usize::from(self.rgba.get(at + 1).copied().unwrap_or(0))];
+        let b = lut[usize::from(self.rgba.get(at + 2).copied().unwrap_or(0))];
         0.2126 * r + 0.7152 * g + 0.0722 * b
     }
 }
@@ -281,8 +292,10 @@ fn measure(picture: &Picture, node: &UiNode) -> Option<f32> {
     if right < left + 4 || bottom < top + 4 {
         return None;
     }
-    let mut edge = Vec::new();
-    let mut inside = Vec::new();
+    let w = (right - left) as usize;
+    let h = (bottom - top) as usize;
+    let mut edge = Vec::with_capacity(2 * (w + h));
+    let mut inside = Vec::with_capacity((w - 2) * (h - 2));
     for y in top..bottom {
         for x in left..right {
             let luminance = picture.luminance(x, y);
@@ -293,14 +306,17 @@ fn measure(picture: &Picture, node: &UiNode) -> Option<f32> {
             }
         }
     }
-    edge.sort_by(f32::total_cmp);
-    let background = edge[edge.len() / 2];
-    let mut apart: Vec<(f32, f32)> =
-        inside.iter().map(|luminance| (contrast(*luminance, background), *luminance)).collect();
-    apart.sort_by(|one, other| one.0.total_cmp(&other.0));
+    let mid = edge.len() / 2;
+    let (_, &mut background, _) = edge.select_nth_unstable_by(mid, f32::total_cmp);
+    if inside.is_empty() {
+        return None;
+    }
+    for lum in &mut inside {
+        *lum = contrast(*lum, background);
+    }
     // The text: what a twentieth of the pixels inside reach.
-    let at = apart.len().saturating_sub(apart.len() / 20 + 1);
-    let (ratio, _) = *apart.get(at)?;
+    let at = inside.len().saturating_sub(inside.len() / 20 + 1);
+    let (_, &mut ratio, _) = inside.select_nth_unstable_by(at, f32::total_cmp);
     // Nothing stands out: no text drawn here to measure.
     (ratio >= 1.15).then_some(ratio)
 }

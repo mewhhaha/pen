@@ -72,16 +72,10 @@ impl SynthSpec {
         } else {
             std::f32::consts::FRAC_1_SQRT_2
         };
-        let grain_size = if v.grain_size.is_finite() && v.grain_size > 0.0 {
-            v.grain_size.clamp(0.01, 0.5)
-        } else {
-            0.06
-        };
-        let grain_pitch = if v.grain_pitch.is_finite() && v.grain_pitch > 0.0 {
-            v.grain_pitch.clamp(0.25, 4.0)
-        } else {
-            1.0
-        };
+        let grain_size =
+            if v.grain_size.is_finite() && v.grain_size > 0.0 { v.grain_size.clamp(0.01, 0.5) } else { 0.06 };
+        let grain_pitch =
+            if v.grain_pitch.is_finite() && v.grain_pitch > 0.0 { v.grain_pitch.clamp(0.25, 4.0) } else { 1.0 };
         Self {
             id: v.id,
             mode: SynthMode::from_u32(v.mode),
@@ -183,7 +177,13 @@ impl Adsr {
         if attack <= 1e-4 {
             Self { stage: EnvStage::Decay, level: 1.0, release_start: 1.0, release_pos: 0.0, retrigger_min_attack: 0.0 }
         } else {
-            Self { stage: EnvStage::Attack, level: 0.0, release_start: 0.0, release_pos: 0.0, retrigger_min_attack: 0.0 }
+            Self {
+                stage: EnvStage::Attack,
+                level: 0.0,
+                release_start: 0.0,
+                release_pos: 0.0,
+                retrigger_min_attack: 0.0,
+            }
         }
     }
 
@@ -203,7 +203,7 @@ impl Adsr {
         }
     }
 
-    fn step(&mut self, spec: &SynthSpec, rate: f64) -> f64 {
+    fn step(&mut self, spec: &SynthSpec, rate: f64, sustain_coeff: f64) -> f64 {
         match self.stage {
             EnvStage::Attack => {
                 let atk_sec = f64::from(spec.attack).max(self.retrigger_min_attack);
@@ -231,7 +231,7 @@ impl Adsr {
             }
             EnvStage::Sustain => {
                 let target = f64::from(spec.sustain);
-                self.level += (target - self.level) * (1.0 - (-1.0 / (0.015 * rate)).exp());
+                self.level += (target - self.level) * sustain_coeff;
             }
             EnvStage::Release => {
                 let dur = (f64::from(spec.release.max(0.005)) * rate).max(1.0);
@@ -258,19 +258,26 @@ impl Adsr {
 struct ZdfLowpass {
     ic1eq: [f64; 2],
     ic2eq: [f64; 2],
+    a1: f64,
+    a2: f64,
+    a3: f64,
 }
 
 impl ZdfLowpass {
-    fn process(&mut self, ch: usize, input: f64, cutoff: f64, resonance: f64, rate: f64) -> f64 {
+    fn set_params(&mut self, cutoff: f64, resonance: f64, rate: f64) {
         let norm = (cutoff / rate).clamp(1e-4, 0.48);
         let g = (PI * norm).tan();
         let k = 1.0 / resonance.clamp(0.5, 20.0);
-        let a1 = 1.0 / (1.0 + g * (g + k));
-        let a2 = g * a1;
-        let a3 = g * a2;
+        self.a1 = 1.0 / (1.0 + g * (g + k));
+        self.a2 = g * self.a1;
+        self.a3 = g * self.a2;
+    }
+
+    #[inline]
+    fn process(&mut self, ch: usize, input: f64) -> f64 {
         let v3 = input - self.ic2eq[ch];
-        let v1 = a1 * self.ic1eq[ch] + a2 * v3;
-        let v2 = self.ic2eq[ch] + a2 * self.ic1eq[ch] + a3 * v3;
+        let v1 = self.a1 * self.ic1eq[ch] + self.a2 * v3;
+        let v2 = self.ic2eq[ch] + self.a2 * self.ic1eq[ch] + self.a3 * v3;
         let next1 = 2.0 * v1 - self.ic1eq[ch];
         let next2 = 2.0 * v2 - self.ic2eq[ch];
         self.ic1eq[ch] = if next1.abs() < 1e-30 { 0.0 } else { next1 };
@@ -303,6 +310,13 @@ struct ActiveSynth {
     grain_cooldown: u32,
     seen: bool,
     filter_enabled: bool,
+    /// Rate for which cached DSP coefficients were computed (0.0 forces recompute).
+    cached_rate: f64,
+    dt: f64,
+    pan_l: f64,
+    pan_r: f64,
+    sustain_coeff: f64,
+    grain_hop: u32,
 }
 
 impl ActiveSynth {
@@ -321,13 +335,40 @@ impl ActiveSynth {
             seen: true,
             filter_enabled,
             spec,
+            cached_rate: 0.0,
+            dt: 0.0,
+            pan_l: 0.0,
+            pan_r: 0.0,
+            sustain_coeff: 0.0,
+            grain_hop: 32,
         }
     }
 
     fn update(&mut self, spec: SynthSpec) {
         self.seen = true;
-        self.spec = spec;
+        if self.spec != spec {
+            self.spec = spec;
+            self.cached_rate = 0.0;
+        }
         self.adsr.retrigger(spec.attack);
+    }
+
+    fn sync_params(&mut self, rate: f64) {
+        if self.cached_rate == rate {
+            return;
+        }
+        self.cached_rate = rate;
+        let detune_ratio = 2f64.powf(f64::from(self.spec.detune_cents) / 1200.0);
+        let freq = (f64::from(self.spec.frequency) * detune_ratio).clamp(10.0, rate * 0.48);
+        self.dt = freq / rate;
+        let theta = (f64::from(self.spec.pan) + 1.0) * 0.5 * FRAC_PI_2;
+        self.pan_l = theta.cos();
+        self.pan_r = theta.sin();
+        self.sustain_coeff = 1.0 - (-1.0 / (0.015 * rate)).exp();
+        self.grain_hop = (f64::from(self.spec.grain_size) * rate * 0.25).round().clamp(32.0, rate * 0.25) as u32;
+        if self.filter_enabled {
+            self.filter.set_params(f64::from(self.spec.cutoff), f64::from(self.spec.resonance), rate);
+        }
     }
 
     fn is_releasing(&self) -> bool {
@@ -343,9 +384,7 @@ impl ActiveSynth {
         let len = (f64::from(self.spec.grain_size) * rate).round().clamp(64.0, rate * 0.5) as u32;
         let spread = f64::from(self.spec.detune_cents.abs().max(15.0));
         let cents = self.rng.bipolar() * spread;
-        let freq = f64::from(self.spec.frequency)
-            * f64::from(self.spec.grain_pitch)
-            * 2f64.powf(cents / 1200.0);
+        let freq = f64::from(self.spec.frequency) * f64::from(self.spec.grain_pitch) * 2f64.powf(cents / 1200.0);
         let freq = freq.clamp(20.0, rate * 0.45);
         // Smoothly roll off the 2nd harmonic before it reaches Nyquist so grains never fold back.
         let h2_weight = ((0.46 * rate - 2.0 * freq) / (0.08 * rate)).clamp(0.0, 1.0) * 0.25;
@@ -364,19 +403,17 @@ impl ActiveSynth {
     }
 
     fn next_sample(&mut self, rate: f64) -> (f32, f32, f32) {
-        let env = self.adsr.step(&self.spec, rate);
+        self.sync_params(rate);
+        let env = self.adsr.step(&self.spec, rate, self.sustain_coeff);
         if env <= 0.0 {
             return (0.0, 0.0, 0.0);
         }
-        let detune_ratio = 2f64.powf(f64::from(self.spec.detune_cents) / 1200.0);
-        let freq = (f64::from(self.spec.frequency) * detune_ratio).clamp(10.0, rate * 0.48);
-        let dt = freq / rate;
+        let dt = self.dt;
         let (raw_l, raw_r) = match self.spec.mode {
             SynthMode::Granular => {
                 if self.grain_cooldown == 0 {
                     self.spawn_grain(rate);
-                    let hop = (f64::from(self.spec.grain_size) * rate * 0.25).round().clamp(32.0, rate * 0.25) as u32;
-                    self.grain_cooldown = hop;
+                    self.grain_cooldown = self.grain_hop;
                 } else {
                     self.grain_cooldown -= 1;
                 }
@@ -388,8 +425,7 @@ impl ActiveSynth {
                     }
                     let u = f64::from(g.age) / f64::from(g.length.max(1));
                     let win = 0.5 * (1.0 - (TAU * u).cos());
-                    let osc = (1.0 - g.h2_weight) * (TAU * g.phase).sin()
-                        + g.h2_weight * (2.0 * TAU * g.phase).sin();
+                    let osc = (1.0 - g.h2_weight) * (TAU * g.phase).sin() + g.h2_weight * (2.0 * TAU * g.phase).sin();
                     let sample = osc * win * 0.5;
                     sum_l += sample * g.pan_l;
                     sum_r += sample * g.pan_r;
@@ -420,14 +456,11 @@ impl ActiveSynth {
                     SynthMode::Granular => 0.0,
                 };
                 self.phase = (self.phase + dt) % 1.0;
-                let theta = (f64::from(self.spec.pan) + 1.0) * 0.5 * FRAC_PI_2;
-                (mono * theta.cos(), mono * theta.sin())
+                (mono * self.pan_l, mono * self.pan_r)
             }
         };
         let (fl, fr) = if self.filter_enabled {
-            let cutoff = f64::from(self.spec.cutoff);
-            let q = f64::from(self.spec.resonance);
-            (self.filter.process(0, raw_l, cutoff, q, rate), self.filter.process(1, raw_r, cutoff, q, rate))
+            (self.filter.process(0, raw_l), self.filter.process(1, raw_r))
         } else {
             (raw_l, raw_r)
         };
@@ -643,7 +676,10 @@ mod tests {
         };
         let open = render_rms(20_000.0, 0.707);
         let muffled = render_rms(250.0, 0.707);
-        assert!(open > muffled * 3.0, "250 Hz lowpass must strongly attenuate 880 Hz saw: open={open} muffled={muffled}");
+        assert!(
+            open > muffled * 3.0,
+            "250 Hz lowpass must strongly attenuate 880 Hz saw: open={open} muffled={muffled}"
+        );
         let extreme = render_rms(23_900.0, 20.0);
         assert!(extreme.is_finite() && extreme < 10.0, "extreme ZDF SVF must remain bounded: {extreme}");
     }

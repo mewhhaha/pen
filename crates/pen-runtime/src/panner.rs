@@ -254,9 +254,8 @@ impl Placement {
         let v_l = f64::from(self.ear_velocity[0]) * ux
             + f64::from(self.ear_velocity[1]) * uy
             + f64::from(self.ear_velocity[2]) * uz;
-        let v_s = f64::from(self.velocity[0]) * ux
-            + f64::from(self.velocity[1]) * uy
-            + f64::from(self.velocity[2]) * uz;
+        let v_s =
+            f64::from(self.velocity[0]) * ux + f64::from(self.velocity[1]) * uy + f64::from(self.velocity[2]) * uz;
         let max_v = 0.9 * SPEED_OF_SOUND;
         let vl_eff = (v_l * self.doppler).clamp(-max_v, max_v);
         let vs_eff = (v_s * self.doppler).clamp(-max_v, max_v);
@@ -315,34 +314,63 @@ impl Default for Placements {
     }
 }
 
+struct EarBasis {
+    position: Vec3,
+    right: Vec3,
+    up: Vec3,
+    forward: Vec3,
+    ear_velocity: Vec3,
+}
+
+impl EarBasis {
+    fn new(ear: &Ear) -> Self {
+        let right = normalize(cross(ear.forward, ear.up));
+        let forward = normalize(ear.forward);
+        let up = cross(right, forward);
+        let ear_velocity = [dot(ear.velocity, right), dot(ear.velocity, up), -dot(ear.velocity, forward)];
+        Self { position: ear.position, right, up, forward, ear_velocity }
+    }
+
+    #[inline]
+    fn local(&self, vector: Vec3) -> Vec3 {
+        [dot(vector, self.right), dot(vector, self.up), -dot(vector, self.forward)]
+    }
+}
+
+impl Placement {
+    fn heard_from_basis(self, basis: &EarBasis) -> Placement {
+        Placement {
+            position: basis.local(sub(self.position, basis.position)),
+            orientation: basis.local(self.orientation),
+            velocity: basis.local(self.velocity),
+            ear_velocity: basis.ear_velocity,
+            ..self
+        }
+    }
+}
+
 impl Placements {
     pub fn of(frame: &RenderFrame) -> Placements {
         let ear = Ear::of_frame(frame.listener.first(), &frame.view);
-        let zone_mix = crate::reverb::blend_zones(
-            ear.position,
-            frame.reverb.decay,
-            frame.reverb.damping,
-            &frame.reverb_zones,
-        );
+        let zone_mix =
+            crate::reverb::blend_zones(ear.position, frame.reverb.decay, frame.reverb.damping, &frame.reverb_zones);
         let acoustics = crate::reverb::AcousticProfile::from_extensions(&frame.extensions);
+        if frame.panners.is_empty() {
+            return Placements { voices: HashMap::new(), sounds: Vec::new(), zone_mix, acoustics };
+        }
+        let basis = EarBasis::new(&ear);
+        let listener_weights: Vec<f64> =
+            frame.reverb_zones.iter().map(|z| crate::reverb::zone_weight(ear.position, z)).collect();
         let placed = |panner: &Panner| {
             let mut p = Placement::new(panner);
-            let (portal, wet_scale) = crate::reverb::source_zone_acoustics(
-                p.position,
-                p.zone,
-                ear.position,
-                &frame.reverb_zones,
-            );
+            let (portal, wet_scale) =
+                crate::reverb::source_zone_acoustics_cached(p.position, p.zone, &listener_weights, &frame.reverb_zones);
             p.portal_occlusion = f64::from(portal);
             p.wet_scale = wet_scale;
-            p.heard_from(&ear)
+            p.heard_from_basis(&basis)
         };
-        let mut placements = Placements {
-            voices: HashMap::new(),
-            sounds: vec![None; frame.sounds.len()],
-            zone_mix,
-            acoustics,
-        };
+        let mut placements =
+            Placements { voices: HashMap::new(), sounds: vec![None; frame.sounds.len()], zone_mix, acoustics };
         for panner in &frame.panners {
             if panner.voice != 0 {
                 placements.voices.entry(panner.voice).or_insert_with(|| placed(panner));
@@ -368,6 +396,18 @@ impl Placements {
     pub fn sound(&self, index: usize) -> Option<Placement> {
         self.sounds.get(index).copied().flatten()
     }
+}
+
+/// The azimuth, in degrees, of a source at `position` around [`DEFAULT_EAR`]
+/// (origin, facing -z, up +y): 0 ahead, 90 to the right, -90 to the left, ±180 behind.
+#[inline]
+pub fn azimuth_default_ear(position: Vec3) -> f64 {
+    let x = f64::from(position[0]);
+    let z = f64::from(position[2]);
+    if x == 0.0 && z == 0.0 {
+        return 0.0;
+    }
+    x.atan2(-z).to_degrees()
 }
 
 /// The azimuth, in degrees, of a source at `position` around `ear`: 0

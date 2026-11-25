@@ -435,15 +435,39 @@ impl Timeline {
     }
 
     /// Goes back (or forward, within the record) to `target`: restores the
-    /// nearest moment before it and runs the recorded frames from there
-    /// unseen. Returns the frame `target - 1` showed, and where the
-    /// restored moment was.
+    /// nearest moment before it in a fresh program instance and runs the
+    /// recorded frames from there unseen. Returns the frame `target - 1`
+    /// showed, and where the restored moment was.
     pub async fn rewind<B: Backend>(
         &mut self,
         runtime: &mut GameRuntime<B>,
         host: &dyn Host,
         target: u64,
         unseen: &mut Unseen<'_, B>,
+    ) -> Result<(RenderFrame, u64)> {
+        self.rewind_inner(runtime, host, target, unseen, false).await
+    }
+
+    /// Like [`Self::rewind`], but restores the live program instance in place
+    /// (falling back to a fresh instance on error/migration). Safe for netplay
+    /// rollbacks where the game keeps all state inside `SavedState`.
+    pub async fn rewind_in_place<B: Backend>(
+        &mut self,
+        runtime: &mut GameRuntime<B>,
+        host: &dyn Host,
+        target: u64,
+        unseen: &mut Unseen<'_, B>,
+    ) -> Result<(RenderFrame, u64)> {
+        self.rewind_inner(runtime, host, target, unseen, true).await
+    }
+
+    async fn rewind_inner<B: Backend>(
+        &mut self,
+        runtime: &mut GameRuntime<B>,
+        host: &dyn Host,
+        target: u64,
+        unseen: &mut Unseen<'_, B>,
+        in_place: bool,
     ) -> Result<(RenderFrame, u64)> {
         let earliest = self.earliest().context("there is no history to travel in")?;
         ensure!(target >= earliest, "the history starts at frame {earliest}");
@@ -452,18 +476,30 @@ impl Timeline {
         // target followed; the target itself only when it is the earliest.
         let at = self.moments.range(..target).next_back().map_or(earliest, |(position, _)| *position);
         let moment = self.seek(at);
-        let mut shown = runtime.restore(&mut Quiet(host), &moment).await?;
+        let mut shown = if self.cursor < target {
+            if in_place {
+                runtime.restore_for_replay(&mut Quiet(host), &moment).await?;
+            } else {
+                runtime.restore_fresh_for_replay(&mut Quiet(host), &moment).await?;
+            }
+            None
+        } else {
+            Some(runtime.restore(&mut Quiet(host), &moment).await?)
+        };
         self.restored();
         while self.cursor < target {
+            if let Some(discarded) = shown.take() {
+                runtime.recycle(discarded);
+            }
             self.prepare(runtime, host).await?;
             let recorded = self.frames[self.index(self.cursor)].clone();
             let (frame, replaced) = run_unseen(runtime, host, &recorded).await?;
-            shown = frame;
-            self.observations.replayed(self.cursor + 1, &shown, recorded.restored || replaced);
+            self.observations.replayed(self.cursor + 1, &frame, recorded.restored || replaced);
             unseen(self.cursor, &recorded, runtime)?;
+            shown = Some(frame);
             self.ran(recorded);
         }
-        Ok((shown, at))
+        Ok((shown.expect("rewind either restored at target or replayed at least one frame"), at))
     }
 
     /// Restores the latest moment at or before `from`, for the recorded

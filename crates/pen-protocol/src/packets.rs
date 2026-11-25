@@ -3886,7 +3886,7 @@ pub mod codec {
         // The game's own sections, after the rest: the marker, their count, then each
         // one's tag, length and values.
         let mut extensions = std::mem::take(&mut frame.extensions);
-        extensions.clear();
+        let mut ext_len = 0usize;
         let mut extensions_end = extras_end;
         let mut provenance_seen = false;
         if packet.len() > extensions_end {
@@ -3906,11 +3906,19 @@ pub mod codec {
                     provenance_seen = true;
                     crate::diagnostic::read_provenance(&packet[first..first + length], extras_end).map_err(|_| anyhow::anyhow!("invalid development provenance"))?;
                 } else {
-                    extensions.push(Extension { tag: tag as u32, values: packet[first..first + length].to_vec() });
+                    if let Some(slot) = extensions.get_mut(ext_len) {
+                        slot.tag = tag as u32;
+                        slot.values.clear();
+                        slot.values.extend_from_slice(&packet[first..first + length]);
+                    } else {
+                        extensions.push(Extension { tag: tag as u32, values: packet[first..first + length].to_vec() });
+                    }
+                    ext_len += 1;
                 }
                 extensions_end = first + length;
             }
         }
+        extensions.truncate(ext_len);
         ensure!(packet.len() == extensions_end, truncated);
         reader.inset_draws_at = inset_draws_start;
         reader.inset_draws_end = inset_draws_end;
@@ -5376,12 +5384,77 @@ pub mod codec {
         out
     }
 
+    mod canonical_sink {
+        pub(super) trait CanonicalSink {
+            fn push(&mut self, value: f32);
+            fn extend<const N: usize>(&mut self, values: [f32; N]);
+            fn extend_from_slice(&mut self, values: &[f32]);
+        }
+
+        impl CanonicalSink for Vec<f32> {
+            #[inline]
+            fn push(&mut self, value: f32) {
+                Vec::push(self, value);
+            }
+            #[inline]
+            fn extend<const N: usize>(&mut self, values: [f32; N]) {
+                Vec::extend_from_slice(self, &values);
+            }
+            #[inline]
+            fn extend_from_slice(&mut self, values: &[f32]) {
+                Vec::extend_from_slice(self, values);
+            }
+        }
+
+        pub(super) struct Fnv1aSink(pub(super) u64);
+
+        impl Fnv1aSink {
+            #[inline]
+            fn write_lane(&mut self, lane: f32) {
+                for byte in lane.to_bits().to_le_bytes() {
+                    self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+        }
+
+        impl CanonicalSink for Fnv1aSink {
+            #[inline]
+            fn push(&mut self, value: f32) {
+                self.write_lane(value);
+            }
+            #[inline]
+            fn extend<const N: usize>(&mut self, values: [f32; N]) {
+                for value in values {
+                    self.write_lane(value);
+                }
+            }
+            #[inline]
+            fn extend_from_slice(&mut self, values: &[f32]) {
+                for &value in values {
+                    self.write_lane(value);
+                }
+            }
+        }
+    }
+
     /// The walk of a render packet's values that pen's tests compare with the game's
     /// (`pen/protocol_canonical.blot`): the header's values and then the sections, each in the
     /// schema's order, as described in pen-codegen's canonical.rs. It takes the schema and
     /// the state, which the frame does not hold, where the packet has them.
     pub fn canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> Vec<f32> {
         let mut out = Vec::new();
+        walk_canonical_render(&mut out, frame, schema, state);
+        out
+    }
+
+    /// Streaming FNV-1a hash of [`canonical_render`] without allocating a buffer.
+    pub fn hash_canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> u64 {
+        let mut out = canonical_sink::Fnv1aSink(0xcbf2_9ce4_8422_2325);
+        walk_canonical_render(&mut out, frame, schema, state);
+        out.0
+    }
+
+    fn walk_canonical_render<S: canonical_sink::CanonicalSink>(out: &mut S, frame: &RenderFrame, schema: u32, state: &[f32]) {
         out.extend([
             schema as f32, f32::from(frame.save_requested), f32::from(frame.load_requested),
             f32::from(frame.scene_save_requested), f32::from(frame.scene_load_requested),
@@ -5440,27 +5513,27 @@ pub mod codec {
         out.extend_from_slice(state);
         out.push(frame.draws.len() as f32);
         for draw in &frame.draws {
-            canonical_draw(&mut out, draw);
+            canonical_draw(out, draw);
         }
         out.push(frame.solids.len() as f32);
         for solid in &frame.solids {
-            canonical_solid(&mut out, solid);
+            canonical_solid(out, solid);
         }
         out.push(frame.decals.len() as f32);
         for decal in &frame.decals {
-            canonical_decal(&mut out, decal);
+            canonical_decal(out, decal);
         }
         out.push(frame.sounds.len() as f32);
         for sound in &frame.sounds {
-            canonical_sound(&mut out, sound);
+            canonical_sound(out, sound);
         }
         out.push(frame.sprites.len() as f32);
         for sprite in &frame.sprites {
-            canonical_sprite(&mut out, sprite);
+            canonical_sprite(out, sprite);
         }
         out.push(frame.insets.len() as f32);
         for inset in &frame.insets {
-            canonical_inset(&mut out, inset);
+            canonical_inset(out, inset);
         }
         match &frame.preferences {
             Some(values) => {
@@ -5471,116 +5544,115 @@ pub mod codec {
         }
         out.push(frame.fields.len() as f32);
         for field_patch in &frame.fields {
-            canonical_field_patch(&mut out, field_patch);
+            canonical_field_patch(out, field_patch);
         }
         out.push(frame.ui.len() as f32);
         for ui_node in &frame.ui {
-            canonical_ui_node(&mut out, ui_node);
+            canonical_ui_node(out, ui_node);
         }
         out.push(frame.services.len() as f32);
         for service_request in &frame.services {
-            canonical_service_request(&mut out, service_request);
+            canonical_service_request(out, service_request);
         }
         out.push(frame.buses.len() as f32);
         for bus in &frame.buses {
-            canonical_bus(&mut out, bus);
+            canonical_bus(out, bus);
         }
         out.push(frame.voices.len() as f32);
         for voice in &frame.voices {
-            canonical_voice(&mut out, voice);
+            canonical_voice(out, voice);
         }
         out.push(frame.poses.len() as f32);
         for pose in &frame.poses {
-            canonical_pose(&mut out, pose);
+            canonical_pose(out, pose);
         }
         out.push(frame.emitters.len() as f32);
         for emitter in &frame.emitters {
-            canonical_emitter(&mut out, emitter);
+            canonical_emitter(out, emitter);
         }
         out.push(frame.lights.len() as f32);
         for light in &frame.lights {
-            canonical_light(&mut out, light);
+            canonical_light(out, light);
         }
         out.push(frame.cascades.len() as f32);
         for cascade in &frame.cascades {
-            canonical_cascade(&mut out, cascade);
+            canonical_cascade(out, cascade);
         }
         out.push(frame.probes.len() as f32);
         for probe in &frame.probes {
-            canonical_probe(&mut out, probe);
+            canonical_probe(out, probe);
         }
         out.push(frame.reflection_probes.len() as f32);
         for reflection_probe in &frame.reflection_probes {
-            canonical_reflection_probe(&mut out, reflection_probe);
+            canonical_reflection_probe(out, reflection_probe);
         }
         out.push(frame.fog_volumes.len() as f32);
         for fog_volume in &frame.fog_volumes {
-            canonical_fog_volume(&mut out, fog_volume);
+            canonical_fog_volume(out, fog_volume);
         }
         out.push(frame.listener.len() as f32);
         for listener in &frame.listener {
-            canonical_listener(&mut out, listener);
+            canonical_listener(out, listener);
         }
         out.push(frame.panners.len() as f32);
         for panner in &frame.panners {
-            canonical_panner(&mut out, panner);
+            canonical_panner(out, panner);
         }
         out.push(frame.instances.len() as f32);
         for instance in &frame.instances {
-            canonical_instance(&mut out, instance);
+            canonical_instance(out, instance);
         }
         out.push(frame.instance_removals.len() as f32);
         for instance_removal in &frame.instance_removals {
-            canonical_instance_removal(&mut out, instance_removal);
+            canonical_instance_removal(out, instance_removal);
         }
         out.push(frame.bone_matrices.len() as f32);
         for bone_matrix in &frame.bone_matrices {
-            canonical_bone_matrix(&mut out, bone_matrix);
+            canonical_bone_matrix(out, bone_matrix);
         }
         out.push(frame.morph_weights.len() as f32);
         for morph_weight in &frame.morph_weights {
-            canonical_morph_weight(&mut out, morph_weight);
+            canonical_morph_weight(out, morph_weight);
         }
         out.push(frame.motions.len() as f32);
         for motion in &frame.motions {
-            canonical_motion(&mut out, motion);
+            canonical_motion(out, motion);
         }
         out.push(frame.ribbons.len() as f32);
         for ribbon_point in &frame.ribbons {
-            canonical_ribbon_point(&mut out, ribbon_point);
+            canonical_ribbon_point(out, ribbon_point);
         }
         out.push(frame.haptics.len() as f32);
         for haptic in &frame.haptics {
-            canonical_haptic(&mut out, haptic);
+            canonical_haptic(out, haptic);
         }
         out.push(frame.reverb_zones.len() as f32);
         for reverb_zone in &frame.reverb_zones {
-            canonical_reverb_zone(&mut out, reverb_zone);
+            canonical_reverb_zone(out, reverb_zone);
         }
         out.push(frame.synths.len() as f32);
         for synth_voice in &frame.synths {
-            canonical_synth_voice(&mut out, synth_voice);
+            canonical_synth_voice(out, synth_voice);
         }
         out.push(frame.area_lights.len() as f32);
         for area_light_spec in &frame.area_lights {
-            canonical_area_light_spec(&mut out, area_light_spec);
+            canonical_area_light_spec(out, area_light_spec);
         }
         out.push(frame.pbr_decals.len() as f32);
         for pbr_decal_spec in &frame.pbr_decals {
-            canonical_pbr_decal_spec(&mut out, pbr_decal_spec);
+            canonical_pbr_decal_spec(out, pbr_decal_spec);
         }
         out.push(frame.camera_targets.len() as f32);
         for camera_target_spec in &frame.camera_targets {
-            canonical_camera_target_spec(&mut out, camera_target_spec);
+            canonical_camera_target_spec(out, camera_target_spec);
         }
         out.push(frame.video_streams.len() as f32);
         for video_stream_spec in &frame.video_streams {
-            canonical_video_stream_spec(&mut out, video_stream_spec);
+            canonical_video_stream_spec(out, video_stream_spec);
         }
-        out
     }
 
-    fn canonical_draw(out: &mut Vec<f32>, draw: &Draw) {
+    fn canonical_draw<S: canonical_sink::CanonicalSink>(out: &mut S, draw: &Draw) {
         out.extend([draw.mesh as f32, draw.material as f32]);
         out.extend_from_slice(&draw.transform);
         match &draw.parameters {
@@ -5599,33 +5671,33 @@ pub mod codec {
         }
     }
 
-    fn canonical_solid_face(out: &mut Vec<f32>, solid_face: &SolidFace) {
+    fn canonical_solid_face<S: canonical_sink::CanonicalSink>(out: &mut S, solid_face: &SolidFace) {
         out.extend([
             solid_face.normal.x, solid_face.normal.y, solid_face.normal.z, solid_face.distance,
             solid_face.material as f32,
         ]);
     }
 
-    fn canonical_solid(out: &mut Vec<f32>, solid: &Solid) {
+    fn canonical_solid<S: canonical_sink::CanonicalSink>(out: &mut S, solid: &Solid) {
         out.push(solid.faces.len() as f32);
         for solid_face in &solid.faces {
             canonical_solid_face(out, solid_face);
         }
     }
 
-    fn canonical_decal(out: &mut Vec<f32>, decal: &Decal) {
+    fn canonical_decal<S: canonical_sink::CanonicalSink>(out: &mut S, decal: &Decal) {
         out.push(decal.material as f32);
         out.extend_from_slice(&decal.transform);
         out.push(decal.opacity);
     }
 
-    fn canonical_sound(out: &mut Vec<f32>, sound: &Sound) {
+    fn canonical_sound<S: canonical_sink::CanonicalSink>(out: &mut S, sound: &Sound) {
         out.extend([
             sound.clip as f32, sound.bus as f32, sound.gain, sound.pan, sound.pitch, sound.lowpass, sound.reverb,
         ]);
     }
 
-    fn canonical_sprite(out: &mut Vec<f32>, sprite: &Sprite) {
+    fn canonical_sprite<S: canonical_sink::CanonicalSink>(out: &mut S, sprite: &Sprite) {
         out.extend([
             sprite.x, sprite.y, sprite.width, sprite.height, sprite.u0, sprite.v0, sprite.u1, sprite.v1,
         ]);
@@ -5634,7 +5706,7 @@ pub mod codec {
         out.extend_from_slice(&sprite.parameters);
     }
 
-    fn canonical_inset(out: &mut Vec<f32>, inset: &Inset) {
+    fn canonical_inset<S: canonical_sink::CanonicalSink>(out: &mut S, inset: &Inset) {
         out.extend([inset.x, inset.y, inset.width, inset.height]);
         out.extend_from_slice(&inset.view);
         out.extend_from_slice(&inset.projection);
@@ -5649,7 +5721,7 @@ pub mod codec {
         out.extend([inset.pixel_size, inset.after_sprites as f32]);
     }
 
-    fn canonical_field_patch(out: &mut Vec<f32>, field_patch: &FieldPatch) {
+    fn canonical_field_patch<S: canonical_sink::CanonicalSink>(out: &mut S, field_patch: &FieldPatch) {
         out.extend([
             field_patch.material as f32, field_patch.width as f32, field_patch.height as f32,
             field_patch.x as f32, field_patch.z as f32, field_patch.columns as f32, field_patch.rows as f32,
@@ -5658,7 +5730,7 @@ pub mod codec {
         out.extend_from_slice(&field_patch.values);
     }
 
-    fn canonical_ui_node(out: &mut Vec<f32>, ui_node: &UiNode) {
+    fn canonical_ui_node<S: canonical_sink::CanonicalSink>(out: &mut S, ui_node: &UiNode) {
         out.extend([
             ui_node.id as f32, ui_node.parent as f32, ui_node.role as f32, ui_node.x, ui_node.y, ui_node.width,
             ui_node.height, f32::from(ui_node.focusable), f32::from(ui_node.focused),
@@ -5671,7 +5743,7 @@ pub mod codec {
         out.extend_from_slice(&ui_node.text);
     }
 
-    fn canonical_service_request(out: &mut Vec<f32>, service_request: &ServiceRequest) {
+    fn canonical_service_request<S: canonical_sink::CanonicalSink>(out: &mut S, service_request: &ServiceRequest) {
         out.extend([
             service_request.request as f32, service_request.service as f32, service_request.operation as f32,
             service_request.a, service_request.b, service_request.c, service_request.d,
@@ -5680,25 +5752,25 @@ pub mod codec {
         out.extend_from_slice(&service_request.values);
     }
 
-    fn canonical_bus(out: &mut Vec<f32>, bus: &Bus) {
+    fn canonical_bus<S: canonical_sink::CanonicalSink>(out: &mut S, bus: &Bus) {
         out.extend([
             bus.gain, bus.lowpass, bus.reverb, bus.comp_threshold, bus.comp_ratio, bus.duck_bus as f32,
             bus.duck_amount, bus.eq_low_db, bus.eq_mid_db, bus.eq_high_db,
         ]);
     }
 
-    fn canonical_voice(out: &mut Vec<f32>, voice: &Voice) {
+    fn canonical_voice<S: canonical_sink::CanonicalSink>(out: &mut S, voice: &Voice) {
         out.extend([
             voice.id as f32, voice.clip as f32, voice.bus as f32, voice.gain, voice.pan, voice.pitch,
             voice.lowpass, voice.reverb, f32::from(voice.looping), voice.start, voice.fade_in, voice.fade_out,
         ]);
     }
 
-    fn canonical_pose(out: &mut Vec<f32>, pose: &Pose) {
+    fn canonical_pose<S: canonical_sink::CanonicalSink>(out: &mut S, pose: &Pose) {
         out.extend([pose.draw as f32, pose.clip as f32, pose.time, pose.weight, pose.inset as f32]);
     }
 
-    fn canonical_emitter(out: &mut Vec<f32>, emitter: &Emitter) {
+    fn canonical_emitter<S: canonical_sink::CanonicalSink>(out: &mut S, emitter: &Emitter) {
         out.push(emitter.material as f32);
         out.extend_from_slice(&emitter.transform);
         out.extend([
@@ -5712,7 +5784,7 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_light(out: &mut Vec<f32>, light: &Light) {
+    fn canonical_light<S: canonical_sink::CanonicalSink>(out: &mut S, light: &Light) {
         out.extend([
             light.position.x, light.position.y, light.position.z, light.radius, light.color.x, light.color.y,
             light.color.z, light.direction.x, light.direction.y, light.direction.z, light.inner, light.outer,
@@ -5720,12 +5792,12 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_cascade(out: &mut Vec<f32>, cascade: &Cascade) {
+    fn canonical_cascade<S: canonical_sink::CanonicalSink>(out: &mut S, cascade: &Cascade) {
         out.extend_from_slice(&cascade.projection);
         out.extend([cascade.texel, cascade.far]);
     }
 
-    fn canonical_probe(out: &mut Vec<f32>, probe: &Probe) {
+    fn canonical_probe<S: canonical_sink::CanonicalSink>(out: &mut S, probe: &Probe) {
         out.extend([
             probe.sh0.x, probe.sh0.y, probe.sh0.z, probe.sh1.x, probe.sh1.y, probe.sh1.z, probe.sh2.x,
             probe.sh2.y, probe.sh2.z, probe.sh3.x, probe.sh3.y, probe.sh3.z, probe.sh4.x, probe.sh4.y,
@@ -5734,7 +5806,7 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_reflection_probe(out: &mut Vec<f32>, reflection_probe: &ReflectionProbe) {
+    fn canonical_reflection_probe<S: canonical_sink::CanonicalSink>(out: &mut S, reflection_probe: &ReflectionProbe) {
         out.extend([
             reflection_probe.id as f32, reflection_probe.revision as f32, reflection_probe.priority as f32,
             f32::from(reflection_probe.capture), reflection_probe.position.x, reflection_probe.position.y,
@@ -5747,7 +5819,7 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_fog_volume(out: &mut Vec<f32>, fog_volume: &FogVolume) {
+    fn canonical_fog_volume<S: canonical_sink::CanonicalSink>(out: &mut S, fog_volume: &FogVolume) {
         out.extend([
             fog_volume.shape as f32, fog_volume.center.x, fog_volume.center.y, fog_volume.center.z,
             fog_volume.extent.x, fog_volume.extent.y, fog_volume.extent.z, fog_volume.density,
@@ -5756,7 +5828,7 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_listener(out: &mut Vec<f32>, listener: &Listener) {
+    fn canonical_listener<S: canonical_sink::CanonicalSink>(out: &mut S, listener: &Listener) {
         out.extend([
             listener.position.x, listener.position.y, listener.position.z, listener.forward.x,
             listener.forward.y, listener.forward.z, listener.up.x, listener.up.y, listener.up.z,
@@ -5764,7 +5836,7 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_panner(out: &mut Vec<f32>, panner: &Panner) {
+    fn canonical_panner<S: canonical_sink::CanonicalSink>(out: &mut S, panner: &Panner) {
         out.extend([
             panner.voice as f32, panner.sound as f32, panner.position.x, panner.position.y, panner.position.z,
             panner.orientation.x, panner.orientation.y, panner.orientation.z, panner.distance_model as f32,
@@ -5774,7 +5846,7 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_instance(out: &mut Vec<f32>, instance: &Instance) {
+    fn canonical_instance<S: canonical_sink::CanonicalSink>(out: &mut S, instance: &Instance) {
         out.extend([
             instance.id_low as f32, instance.id_high as f32, instance.order as f32, instance.mesh as f32,
             instance.material as f32,
@@ -5789,27 +5861,27 @@ pub mod codec {
         }
     }
 
-    fn canonical_instance_removal(out: &mut Vec<f32>, instance_removal: &InstanceRemoval) {
+    fn canonical_instance_removal<S: canonical_sink::CanonicalSink>(out: &mut S, instance_removal: &InstanceRemoval) {
         out.extend([instance_removal.id_low as f32, instance_removal.id_high as f32]);
     }
 
-    fn canonical_bone_matrix(out: &mut Vec<f32>, bone_matrix: &BoneMatrix) {
+    fn canonical_bone_matrix<S: canonical_sink::CanonicalSink>(out: &mut S, bone_matrix: &BoneMatrix) {
         out.extend([bone_matrix.inset as f32, bone_matrix.draw as f32, bone_matrix.joint as f32]);
         out.extend_from_slice(&bone_matrix.matrix);
     }
 
-    fn canonical_morph_weight(out: &mut Vec<f32>, morph_weight: &MorphWeight) {
+    fn canonical_morph_weight<S: canonical_sink::CanonicalSink>(out: &mut S, morph_weight: &MorphWeight) {
         out.extend([
             morph_weight.inset as f32, morph_weight.draw as f32, morph_weight.target as f32, morph_weight.weight,
         ]);
     }
 
-    fn canonical_motion(out: &mut Vec<f32>, motion: &Motion) {
+    fn canonical_motion<S: canonical_sink::CanonicalSink>(out: &mut S, motion: &Motion) {
         out.push(motion.draw as f32);
         out.extend_from_slice(&motion.previous);
     }
 
-    fn canonical_ribbon_point(out: &mut Vec<f32>, ribbon_point: &RibbonPoint) {
+    fn canonical_ribbon_point<S: canonical_sink::CanonicalSink>(out: &mut S, ribbon_point: &RibbonPoint) {
         out.extend([
             ribbon_point.ribbon as f32, ribbon_point.material as f32, f32::from(ribbon_point.additive),
             ribbon_point.position.x, ribbon_point.position.y, ribbon_point.position.z, ribbon_point.width,
@@ -5818,11 +5890,11 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_haptic(out: &mut Vec<f32>, haptic: &Haptic) {
+    fn canonical_haptic<S: canonical_sink::CanonicalSink>(out: &mut S, haptic: &Haptic) {
         out.extend([haptic.pad as f32, haptic.low, haptic.high, haptic.duration]);
     }
 
-    fn canonical_reverb_zone(out: &mut Vec<f32>, reverb_zone: &ReverbZone) {
+    fn canonical_reverb_zone<S: canonical_sink::CanonicalSink>(out: &mut S, reverb_zone: &ReverbZone) {
         out.extend([
             reverb_zone.id as f32, reverb_zone.position.x, reverb_zone.position.y, reverb_zone.position.z,
             reverb_zone.half_extents.x, reverb_zone.half_extents.y, reverb_zone.half_extents.z,
@@ -5831,7 +5903,7 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_synth_voice(out: &mut Vec<f32>, synth_voice: &SynthVoice) {
+    fn canonical_synth_voice<S: canonical_sink::CanonicalSink>(out: &mut S, synth_voice: &SynthVoice) {
         out.extend([
             synth_voice.id as f32, synth_voice.mode as f32, synth_voice.bus as f32, synth_voice.frequency,
             synth_voice.gain, synth_voice.pan, synth_voice.detune, synth_voice.attack, synth_voice.decay,
@@ -5840,7 +5912,7 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_area_light_spec(out: &mut Vec<f32>, area_light_spec: &AreaLightSpec) {
+    fn canonical_area_light_spec<S: canonical_sink::CanonicalSink>(out: &mut S, area_light_spec: &AreaLightSpec) {
         out.extend([
             area_light_spec.kind as f32, area_light_spec.position.x, area_light_spec.position.y,
             area_light_spec.position.z, area_light_spec.right.x, area_light_spec.right.y,
@@ -5851,7 +5923,7 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_pbr_decal_spec(out: &mut Vec<f32>, pbr_decal_spec: &PbrDecalSpec) {
+    fn canonical_pbr_decal_spec<S: canonical_sink::CanonicalSink>(out: &mut S, pbr_decal_spec: &PbrDecalSpec) {
         out.push(pbr_decal_spec.material as f32);
         out.extend_from_slice(&pbr_decal_spec.transform);
         out.extend([
@@ -5861,7 +5933,7 @@ pub mod codec {
         ]);
     }
 
-    fn canonical_camera_target_spec(out: &mut Vec<f32>, camera_target_spec: &CameraTargetSpec) {
+    fn canonical_camera_target_spec<S: canonical_sink::CanonicalSink>(out: &mut S, camera_target_spec: &CameraTargetSpec) {
         out.extend([
             camera_target_spec.material as f32, camera_target_spec.width as f32,
             camera_target_spec.height as f32, camera_target_spec.viewport_x, camera_target_spec.viewport_y,
@@ -5872,7 +5944,7 @@ pub mod codec {
         out.extend_from_slice(&camera_target_spec.projection);
     }
 
-    fn canonical_video_stream_spec(out: &mut Vec<f32>, video_stream_spec: &VideoStreamSpec) {
+    fn canonical_video_stream_spec<S: canonical_sink::CanonicalSink>(out: &mut S, video_stream_spec: &VideoStreamSpec) {
         out.extend([
             video_stream_spec.material as f32, video_stream_spec.time, f32::from(video_stream_spec.playing),
             f32::from(video_stream_spec.looping), video_stream_spec.speed,

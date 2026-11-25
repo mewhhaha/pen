@@ -88,6 +88,8 @@ pub struct Track {
     showing: Vec<Showing>,
     /// The last frame's voices: their clips, by id.
     voices: HashMap<u32, u32>,
+    /// Double-buffered voice map swapped in place to avoid per-frame HashMap allocations.
+    next_voices: HashMap<u32, u32>,
 }
 
 impl Track {
@@ -106,22 +108,31 @@ impl Track {
     /// A frame plays at `now` seconds: the captions of its sounds, and of
     /// its voices that start (a new id, or another clip), show.
     pub fn frame(&mut self, frame: &RenderFrame, catalog: &Catalog, captions: &Captions, now: f64) {
+        if captions.is_empty() {
+            if !self.voices.is_empty() {
+                self.voices.clear();
+            }
+            if !self.showing.is_empty() {
+                self.showing.retain(|showing| showing.until > now);
+            }
+            return;
+        }
         let caption = |clip: u32| catalog.sounds.get(clip as usize).and_then(|key| captions.get(key));
         for sound in &frame.sounds {
             if let Some(caption) = caption(sound.clip) {
                 self.show(caption, now);
             }
         }
-        let mut voices = HashMap::with_capacity(frame.voices.len());
+        self.next_voices.clear();
         for voice in &frame.voices {
             if self.voices.get(&voice.id) != Some(&voice.clip)
                 && let Some(caption) = caption(voice.clip)
             {
                 self.show(caption, now);
             }
-            voices.insert(voice.id, voice.clip);
+            self.next_voices.insert(voice.id, voice.clip);
         }
-        self.voices = voices;
+        std::mem::swap(&mut self.voices, &mut self.next_voices);
         self.showing.retain(|showing| showing.until > now);
     }
 
@@ -160,6 +171,12 @@ impl State {
 
     /// A frame shown: the captions its sounds and voices bring.
     pub fn frame(&mut self, frame: &RenderFrame, catalog: &Catalog) {
+        if self.captions.is_empty() && self.track.showing.is_empty() {
+            if !self.track.voices.is_empty() {
+                self.track.voices.clear();
+            }
+            return;
+        }
         if self.sounds != catalog.sounds {
             self.sounds.clone_from(&catalog.sounds);
         }

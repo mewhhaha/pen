@@ -245,7 +245,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         let saved = SavedState { schema: 26, state: vec![1.0, 2.0] };
         let recording = Recording {
-            start: Moment { saved: saved.clone(), edits: Edits::default() },
+            start: Moment { saved: std::sync::Arc::new(saved.clone()), edits: Edits::default() },
             frames: vec![Recorded { input: vec![0.5, 960.0, 640.0, 0.0, 0.0], ..Recorded::default() }],
         };
         let capture =

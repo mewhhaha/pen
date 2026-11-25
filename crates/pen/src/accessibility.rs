@@ -33,6 +33,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use accesskit::{
@@ -359,6 +360,9 @@ fn program_tree(ui: &[UiNode]) -> TreeUpdate {
 
 /// Whether one of the dev tools program's nodes has the keyboard.
 fn program_focused(ui: &[UiNode]) -> bool {
+    if !ui.iter().any(|node| node.focused) {
+        return false;
+    }
     ui.iter()
         .zip(AccessibilityTree::new(ui).nodes())
         .any(|(node, info)| info.exposed() && !info.disabled && node.focused)
@@ -482,6 +486,15 @@ fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Lock-free signals from adapter handler threads so steady-state frames with
+/// no active assistive technology or pending actions take zero mutex locks.
+#[derive(Default)]
+struct Flags {
+    active: AtomicBool,
+    activated: AtomicBool,
+    has_requests: AtomicBool,
+}
+
 /// What the adapter's handlers share with the window's thread; they run on
 /// other threads.
 #[derive(Default)]
@@ -499,13 +512,15 @@ struct Shared {
 
 /// Gives the adapter the whole tree as it stands when an assistive
 /// technology starts, so it has no placeholder.
-struct Activation(Arc<Mutex<Shared>>);
+struct Activation(Arc<Mutex<Shared>>, Arc<Flags>);
 
 impl ActivationHandler for Activation {
     fn request_initial_tree(&mut self) -> Option<TreeUpdate> {
         let latest = {
             let mut shared = lock(&self.0);
             shared.activated = true;
+            self.1.active.store(true, Ordering::Release);
+            self.1.activated.store(true, Ordering::Release);
             shared.latest.clone()
         };
         latest.map(|interface| build(&interface, false))
@@ -513,18 +528,21 @@ impl ActivationHandler for Activation {
 }
 
 /// Keeps the requests for the window's thread.
-struct Requests(Arc<Mutex<Shared>>);
+struct Requests(Arc<Mutex<Shared>>, Arc<Flags>);
 
 impl ActionHandler for Requests {
     fn do_action(&mut self, request: ActionRequest) {
         lock(&self.0).requests.push(request);
+        self.1.has_requests.store(true, Ordering::Release);
     }
 }
 
-struct Deactivation;
+struct Deactivation(Arc<Flags>);
 
 impl DeactivationHandler for Deactivation {
-    fn deactivate_accessibility(&mut self) {}
+    fn deactivate_accessibility(&mut self) {
+        self.0.active.store(false, Ordering::Release);
+    }
 }
 
 /// What the adapter has, as far as the window's thread knows.
@@ -536,6 +554,11 @@ struct Sent {
     grafted: bool,
     /// The focus of the adapter's tree.
     focus: Option<NodeId>,
+    /// Whether the adapter has received at least one full root tree since the
+    /// latest activation.
+    initialized: bool,
+    /// Last full node set sent to the adapter, for incremental diffing.
+    nodes: HashMap<NodeId, Node>,
 }
 
 /// Whether an assistive technology started since the last update (see
@@ -544,19 +567,37 @@ fn started(sent: &mut Sent, shared: &Mutex<Shared>) -> bool {
     let started = std::mem::take(&mut lock(shared).activated);
     if started {
         sent.grafted = false;
+        sent.initialized = false;
+        sent.nodes.clear();
     }
     started
 }
 
-/// The whole tree, the focus off the overlay until the adapter has its subtree.
+/// Builds a tree update for the adapter: full tree on initial sync or after
+/// activation, or a minimal incremental diff of changed/added nodes thereafter.
 fn whole(sent: &mut Sent, shared: &Mutex<Shared>, interface: &Interface) -> TreeUpdate {
-    started(sent, shared);
+    let just_started = started(sent, shared);
     if interface.overlay.is_none() {
         sent.grafted = false;
     }
-    let update = build(interface, sent.grafted);
-    sent.focus = Some(update.focus);
-    update
+    let full = build(interface, sent.grafted);
+    sent.focus = Some(full.focus);
+    if !just_started && sent.initialized {
+        let mut diff_nodes = Vec::new();
+        let mut next_nodes = HashMap::with_capacity(full.nodes.len());
+        for (id, node) in full.nodes {
+            if sent.nodes.get(&id) != Some(&node) {
+                diff_nodes.push((id, node.clone()));
+            }
+            next_nodes.insert(id, node);
+        }
+        sent.nodes = next_nodes;
+        TreeUpdate { nodes: diff_nodes, tree: None, tree_id: full.tree_id, focus: full.focus }
+    } else {
+        sent.nodes = full.nodes.iter().map(|(id, node)| (*id, node.clone())).collect();
+        sent.initialized = true;
+        full
+    }
 }
 
 /// Brings the adapter's tree up to date: the whole tree when it changed,
@@ -640,6 +681,7 @@ pub struct Accessibility {
     /// None headless, unless on the AT-SPI bus.
     adapter: Option<Platform>,
     shared: Arc<Mutex<Shared>>,
+    flags: Arc<Flags>,
     /// What the tree was last built from.
     current: Option<Arc<Interface>>,
     /// The dev tools' interface as last seen, their subtree's.
@@ -653,6 +695,7 @@ impl Accessibility {
         Accessibility {
             adapter: None,
             shared: Arc::default(),
+            flags: Arc::default(),
             current: None,
             program: None,
             sent: Sent::default(),
@@ -665,12 +708,13 @@ impl Accessibility {
     pub fn windowed(event_loop: &ActiveEventLoop, window: &Window) -> Result<Accessibility> {
         let mut accessibility = Accessibility::new(Dump::from_env()?);
         let shared = &accessibility.shared;
+        let flags = &accessibility.flags;
         accessibility.adapter = Some(Platform::Window(accesskit_winit::Adapter::with_direct_handlers(
             event_loop,
             window,
-            Activation(shared.clone()),
-            Requests(shared.clone()),
-            Deactivation,
+            Activation(shared.clone(), flags.clone()),
+            Requests(shared.clone(), flags.clone()),
+            Deactivation(flags.clone()),
         )));
         Ok(accessibility)
     }
@@ -684,7 +728,12 @@ impl Accessibility {
         }
         let mut accessibility = Accessibility::new(dump);
         let shared = &accessibility.shared;
-        accessibility.adapter = platform::bus(Activation(shared.clone()), Requests(shared.clone()), Deactivation);
+        let flags = &accessibility.flags;
+        accessibility.adapter = platform::bus(
+            Activation(shared.clone(), flags.clone()),
+            Requests(shared.clone(), flags.clone()),
+            Deactivation(flags.clone()),
+        );
         Ok(Some(accessibility))
     }
 
@@ -720,24 +769,37 @@ impl Accessibility {
         let changed = previous.is_none_or(|previous| {
             previous.scale != scale || previous.overlay != overlay || previous.ui != ui || previous.captions != captions
         });
-        if changed {
-            let interface = Arc::new(Interface { ui: ui.to_vec(), scale, overlay, captions });
-            lock(&self.shared).latest = Some(interface.clone());
-            if let Some(dump) = &mut self.dump {
-                dump.write(session.timeline().frame.saturating_sub(1), tree(&interface));
+        let need_lock =
+            changed || self.flags.activated.load(Ordering::Acquire) || self.flags.has_requests.load(Ordering::Acquire);
+        let requests = if need_lock {
+            let new_interface = changed.then(|| Arc::new(Interface { ui: ui.to_vec(), scale, overlay, captions }));
+            let requests = {
+                let mut shared = lock(&self.shared);
+                if let Some(interface) = &new_interface {
+                    shared.latest = Some(interface.clone());
+                }
+                self.sent.stale |= shared.activated;
+                self.flags.activated.store(false, Ordering::Relaxed);
+                self.flags.has_requests.store(false, Ordering::Relaxed);
+                std::mem::take(&mut shared.requests)
+            };
+            if let Some(interface) = new_interface {
+                if let Some(dump) = &mut self.dump {
+                    dump.write(session.timeline().frame.saturating_sub(1), tree(&interface));
+                }
+                self.current = Some(interface);
+                self.sent.stale = true;
             }
-            self.current = Some(interface);
-            self.sent.stale = true;
-        }
-        let requests = {
-            let mut shared = lock(&self.shared);
-            self.sent.stale |= shared.activated;
-            std::mem::take(&mut shared.requests)
+            requests
+        } else {
+            Vec::new()
         };
         if let (Some(adapter), None) = (&mut self.adapter, window) {
             adapter.frame_size(session.gpu.size);
         }
-        if let (Some(adapter), Some(interface)) = (&mut self.adapter, &self.current) {
+        if self.flags.active.load(Ordering::Acquire)
+            && let (Some(adapter), Some(interface)) = (&mut self.adapter, &self.current)
+        {
             let program = self.program.as_deref().map(|ui| (ui, program_changed));
             sync(&mut self.sent, &self.shared, interface, program, &mut |update| adapter.update_if_active(update));
         }
@@ -1116,7 +1178,7 @@ mod tests {
         /// As platform adapters do when an assistive technology starts.
         fn activate(&mut self, shared: &Arc<Mutex<Shared>>) {
             self.active = true;
-            let initial = Activation(shared.clone()).request_initial_tree();
+            let initial = Activation(shared.clone(), Arc::default()).request_initial_tree();
             self.tree = initial.map(|update| accesskit_consumer::Tree::new(update, true));
         }
 
@@ -1258,6 +1320,52 @@ mod tests {
         // The dev tools' subtree may not come first.
         frame(&mut sent, &shared, &mut adapter, &game, Some((&console(true), true)));
         assert_eq!(adapter.focus(), INPUT);
+    }
+
+    #[test]
+    fn incremental_updates_emit_only_changed_nodes() {
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let mut sent = Sent::default();
+        let mut game = interface(menu());
+        lock(&shared).latest = Some(Arc::new(game.clone()));
+        let initial = Activation(shared.clone(), Arc::default()).request_initial_tree().unwrap();
+        let mut consumer = accesskit_consumer::Tree::new(initial, true);
+
+        // First sync after activation sends the full tree and populates `sent.nodes`.
+        let first = whole(&mut sent, &shared, &game);
+        assert!(first.tree.is_some());
+        assert_eq!(first.nodes.len(), 6);
+        consumer.update_and_process_changes(first, &mut Ignore);
+
+        // Focus-only change emits zero nodes and updates focus cleanly.
+        game.ui[2].focused = false;
+        game.ui[3].focused = true;
+        let focus_only = whole(&mut sent, &shared, &game);
+        assert!(focus_only.tree.is_none());
+        assert!(focus_only.nodes.is_empty());
+        consumer.update_and_process_changes(focus_only, &mut Ignore);
+        assert_eq!(consumer.state().focus().unwrap().locate(), (game_node(13), TreeId::ROOT));
+
+        // Changing one slider's numeric value emits ONLY that single node.
+        game.ui[3].value = 0.5;
+        let single_node = whole(&mut sent, &shared, &game);
+        assert!(single_node.tree.is_none());
+        assert_eq!(single_node.nodes.len(), 1);
+        assert_eq!(single_node.nodes[0].0, game_node(13));
+        consumer.update_and_process_changes(single_node, &mut Ignore);
+        assert_eq!(
+            consumer.state().node_by_tree_local_id(game_node(13), TreeId::ROOT).unwrap().numeric_value(),
+            Some(0.5)
+        );
+
+        // Removing the checkbox emits ONLY its parent dialog (with updated children).
+        game.ui.pop();
+        let removed = whole(&mut sent, &shared, &game);
+        assert!(removed.tree.is_none());
+        assert_eq!(removed.nodes.len(), 1);
+        assert_eq!(removed.nodes[0].0, game_node(10));
+        consumer.update_and_process_changes(removed, &mut Ignore);
+        assert!(consumer.state().node_by_tree_local_id(game_node(16), TreeId::ROOT).is_none());
     }
 
     #[test]

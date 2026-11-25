@@ -124,7 +124,7 @@ impl Stream {
         let (report, errors) = channel();
         let stream = device.build_output_stream(
             config,
-            move |out: &mut [f32], info: &cpal::OutputCallbackInfo| match callback.lock() {
+            move |out: &mut [f32], info: &cpal::OutputCallbackInfo| match callback.try_lock() {
                 Ok(mut live) => {
                     live.played(ahead(info), out.len() / channels.max(1));
                     live.fill(out, channels);

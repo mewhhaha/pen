@@ -161,6 +161,8 @@ pub struct Netplay {
     unsent: bool,
     now: u64,
     stats: Stats,
+    /// Reusable wire serialization buffer for outbound datagrams.
+    tx_buf: Vec<u8>,
 }
 
 impl Netplay {
@@ -198,6 +200,7 @@ impl Netplay {
             unsent: false,
             now: 0,
             stats: Stats::default(),
+            tx_buf: Vec::with_capacity(DATAGRAM_BYTES),
         })
     }
 
@@ -227,7 +230,8 @@ impl Netplay {
     }
 
     fn send(&mut self, player: usize, message: &Message) {
-        self.link.send(player, &message.encode());
+        message.encode_into(&mut self.tx_buf);
+        self.link.send(player, &self.tx_buf);
         self.stats.sent += 1;
     }
 
@@ -294,17 +298,23 @@ impl Netplay {
             start: self.start_hash,
             heard,
         };
+        let hello_msg = Message::Hello(hello);
+        hello_msg.encode_into(&mut self.tx_buf);
         for player in self.others() {
-            self.send(player, &Message::Hello(hello.clone()));
-            // A peer that started elsewhere takes the host's moment.
-            if settings.player == 0
-                && self.peers[player].hello.as_ref().is_some_and(|hello| hello.start != self.start_hash)
-            {
-                let total = u32::try_from(self.start.len()).expect("moments are bounded");
-                for (index, chunk) in self.start.clone().chunks(CHUNK_BYTES).enumerate() {
-                    let offset = u32::try_from(index * CHUNK_BYTES).expect("moments are bounded");
-                    let message = Message::Moment { session: self.session, total, offset, bytes: chunk.to_vec() };
-                    self.send(player, &message);
+            self.link.send(player, &self.tx_buf);
+            self.stats.sent += 1;
+        }
+        // A peer that started elsewhere takes the host's moment.
+        if settings.player == 0 {
+            for player in self.others() {
+                if self.peers[player].hello.as_ref().is_some_and(|peer_hello| peer_hello.start != self.start_hash) {
+                    let total = u32::try_from(self.start.len()).expect("moments are bounded");
+                    for (index, chunk) in self.start.chunks(CHUNK_BYTES).enumerate() {
+                        let offset = u32::try_from(index * CHUNK_BYTES).expect("moments are bounded");
+                        wire::encode_moment_chunk_into(&mut self.tx_buf, self.session, total, offset, chunk);
+                        self.link.send(player, &self.tx_buf);
+                        self.stats.sent += 1;
+                    }
                 }
             }
         }
@@ -435,31 +445,37 @@ impl Netplay {
         let Some(inputs) = &self.inputs else { return };
         let local = self.settings.player;
         let from = self.peers[player].acked.max(inputs.base(local));
-        let mut frames = Vec::new();
+        let mut slices: [&[f32]; MAX_FRAMES] = [&[]; MAX_FRAMES];
+        let mut count = 0usize;
         let mut bytes = 64;
         for records in inputs.frames_from(local, from, MAX_FRAMES) {
             bytes += wire::frame_bytes(records);
-            if !frames.is_empty() && bytes > DATAGRAM_BYTES {
+            if count > 0 && bytes > DATAGRAM_BYTES {
                 break;
             }
-            frames.push(records.to_vec());
+            slices[count] = records;
+            count += 1;
         }
         let (checked, hash) = self.checks.last_key_value().map_or((0, 0), |(frame, hash)| (*frame, *hash));
         let narrow = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
-        let message = Message::Input(wire::Inputs {
-            session: self.session,
-            player: u8::try_from(local).expect("at most 32 players"),
-            frame: narrow(inputs.next()),
-            ack: narrow(inputs.known(player)),
-            stamp: stamp(self.now),
-            echo: self.peers[player].stamp,
-            held: narrow(self.now.saturating_sub(self.peers[player].stamped)),
-            checked: narrow(checked),
-            hash,
-            first: narrow(from),
-            frames,
-        });
-        self.send(player, &message);
+        wire::encode_input_into(
+            &mut self.tx_buf,
+            wire::InputHeader {
+                session: self.session,
+                player: u8::try_from(local).expect("at most 32 players"),
+                frame: narrow(inputs.next()),
+                ack: narrow(inputs.known(player)),
+                stamp: stamp(self.now),
+                echo: self.peers[player].stamp,
+                held: narrow(self.now.saturating_sub(self.peers[player].stamped)),
+                checked: narrow(checked),
+                hash,
+                first: narrow(from),
+            },
+            slices[..count].iter().copied(),
+        );
+        self.link.send(player, &self.tx_buf);
+        self.stats.sent += 1;
     }
 
     /// Whether the next frame may run: play has begun and it is within the
@@ -549,7 +565,7 @@ impl Netplay {
                 hashes.insert(position - origin, runtime.packet_hash());
                 unseen(position, recorded, runtime)
             };
-            shown = Some(timeline.rewind(runtime, host, origin + next, &mut note).await?);
+            shown = Some(timeline.rewind_in_place(runtime, host, origin + next, &mut note).await?);
             let stats = &mut self.stats;
             stats.rollbacks += 1;
             stats.rerun += next - wrong;

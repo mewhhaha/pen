@@ -152,6 +152,8 @@ pub struct Actions {
     answered: Vec<(u32, Answer)>,
     /// Action events that come with the next frame's events (Steam's).
     pending: Vec<GameEvent>,
+    /// Reused scratch buffer for `map` so steady-state frames allocate nothing.
+    scratch: Vec<GameEvent>,
     /// The player's bindings changed since they were last saved.
     changed: bool,
 }
@@ -376,6 +378,9 @@ impl Actions {
     /// event that moved it, and Steam's first. A capture waiting takes the
     /// next press, which moves no action.
     pub fn map(&mut self, events: &mut Vec<GameEvent>) {
+        if events.is_empty() && self.pending.is_empty() {
+            return;
+        }
         if self.actions.is_empty() && self.capture.is_none() {
             // Nothing declared: only what is held is kept up.
             for event in events.iter() {
@@ -383,9 +388,28 @@ impl Actions {
             }
             return;
         }
-        let raw = std::mem::take(events);
+        if self.pending.is_empty()
+            && self.capture.is_none()
+            && !events.iter().any(|event| {
+                matches!(
+                    event,
+                    GameEvent::KeyDown(_)
+                        | GameEvent::KeyUp(_)
+                        | GameEvent::PointerDown { .. }
+                        | GameEvent::PointerUp { .. }
+                        | GameEvent::GamepadButton { .. }
+                        | GameEvent::GamepadAxis { .. }
+                        | GameEvent::FocusLost
+                )
+            })
+        {
+            return;
+        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        scratch.clear();
+        std::mem::swap(&mut scratch, events);
         events.append(&mut self.pending);
-        for event in raw {
+        for event in scratch.drain(..) {
             // The press a capture takes is not held, so its release moves nothing either.
             if let Some(capture) = self.capture
                 && let Some(binding) = Actions::captured(&event)
@@ -409,6 +433,7 @@ impl Actions {
                 }
             }
         }
+        self.scratch = scratch;
     }
 
     /// Sets binding `slot` of action `index` (one past the last adds one).

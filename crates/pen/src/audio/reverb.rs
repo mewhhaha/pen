@@ -106,12 +106,13 @@ impl Fft {
 /// channel's response, and joined again for one inverse transform.
 struct Stage {
     block: usize,
+    partitions: usize,
+    bins: usize,
     fft: Fft,
-    /// Each partition's left and right spectra, bins 0 to `block`.
-    filters: Vec<[Vec<Complex>; 2]>,
-    /// The latest input blocks' spectra, newest at `newest`, a ring as long
-    /// as `filters`.
-    history: Vec<[Vec<Complex>; 2]>,
+    /// Flat slab: `partitions * 2 * bins`, indexed as `(partition * 2 + channel) * bins + bin`.
+    filters: Vec<Complex>,
+    /// Flat slab ring: `partitions * 2 * bins`, newest at `newest`.
+    history: Vec<Complex>,
     newest: usize,
     /// The previous input block, then the current one.
     input: Vec<[f32; 2]>,
@@ -126,28 +127,28 @@ impl Stage {
         let partitions = (to.saturating_sub(from)).div_ceil(block).max(1);
         let bins = block + 1;
         let mut work = vec![Complex::default(); size];
-        let filters = (0..partitions)
-            .map(|partition| {
-                work.fill(Complex::default());
-                let start = from + partition * block;
-                for (offset, value) in work.iter_mut().take(block).enumerate() {
-                    let at = start + offset;
-                    if at < to {
-                        *value = Complex::new(response[0][at], response[1][at]);
-                    }
+        let mut filters = vec![Complex::default(); partitions * 2 * bins];
+        for partition in 0..partitions {
+            work.fill(Complex::default());
+            let start = from + partition * block;
+            for (offset, value) in work.iter_mut().take(block).enumerate() {
+                let at = start + offset;
+                if at < to {
+                    *value = Complex::new(response[0][at], response[1][at]);
                 }
-                fft.transform(&mut work, false);
-                let mut spectra = [vec![Complex::default(); bins], vec![Complex::default(); bins]];
-                let [left, right] = &mut spectra;
-                split(&work, left, right);
-                spectra
-            })
-            .collect();
+            }
+            fft.transform(&mut work, false);
+            let base = partition * 2 * bins;
+            let (left, right) = filters[base..base + 2 * bins].split_at_mut(bins);
+            split(&work, left, right);
+        }
         Stage {
             block,
+            partitions,
+            bins,
             fft,
             filters,
-            history: vec![[vec![Complex::default(); bins], vec![Complex::default(); bins]]; partitions],
+            history: vec![Complex::default(); partitions * 2 * bins],
             newest: 0,
             input: vec![[0.0; 2]; size],
             work,
@@ -155,45 +156,63 @@ impl Stage {
         }
     }
 
-    /// Takes the next input block (in the second half of `input`) and writes
-    /// the convolution's output for that block's time into `output`.
-    fn convolve(&mut self, output: &mut [[f32; 2]]) {
-        let Stage { block, fft, filters, history, newest, input, work, sums } = self;
-        let (block, size, bins) = (*block, 2 * *block, *block + 1);
-        for (value, &[left, right]) in work.iter_mut().zip(input.iter()) {
-            *value = Complex::new(left, right);
-        }
-        fft.transform(work, false);
-        let partitions = filters.len();
-        *newest = (*newest + 1) % partitions;
-        let [left, right] = &mut history[*newest];
-        split(work, left, right);
-        for sum in sums.iter_mut() {
-            sum.fill(Complex::default());
-        }
-        for (partition, filter) in filters.iter().enumerate() {
-            let spectra = &history[(*newest + partitions - partition) % partitions];
+    fn clear_sums(&mut self) {
+        self.sums[0].fill(Complex::default());
+        self.sums[1].fill(Complex::default());
+    }
+
+    /// Accumulates spectral products for `partitions_range` assuming the
+    /// upcoming input block will land at `(self.newest + 1) % self.partitions`.
+    fn accumulate_partitions(&mut self, start: usize, end: usize, next_newest: usize) {
+        let (partitions, bins) = (self.partitions, self.bins);
+        for partition in start..end {
+            let slot = (next_newest + partitions - partition) % partitions;
+            let h_base = slot * 2 * bins;
+            let f_base = partition * 2 * bins;
             for channel in 0..2 {
-                let (sum, input, response) = (&mut sums[channel], &spectra[channel], &filter[channel]);
+                let off = channel * bins;
+                let sum = &mut self.sums[channel];
+                let input = &self.history[h_base + off..h_base + off + bins];
+                let response = &self.filters[f_base + off..f_base + off + bins];
                 for bin in 0..bins {
                     sum[bin] = sum[bin].add(input[bin].mul(response[bin]));
                 }
             }
         }
+    }
+
+    /// Takes the next input block (in the second half of `input`), finishes
+    /// convolution against all partitions, and writes into `output`.
+    fn convolve(&mut self, output: &mut [[f32; 2]], preaccumulated_tail: bool) {
+        let (block, size, bins, partitions) = (self.block, 2 * self.block, self.bins, self.partitions);
+        for (value, &[left, right]) in self.work.iter_mut().zip(self.input.iter()) {
+            *value = Complex::new(left, right);
+        }
+        self.fft.transform(&mut self.work, false);
+        self.newest = (self.newest + 1) % partitions;
+        let base = self.newest * 2 * bins;
+        let (left, right) = self.history[base..base + 2 * bins].split_at_mut(bins);
+        split(&self.work, left, right);
+        if preaccumulated_tail {
+            self.accumulate_partitions(0, 1, self.newest);
+        } else {
+            self.clear_sums();
+            self.accumulate_partitions(0, partitions, self.newest);
+        }
         // Both channels' real outputs as one complex signal: left + i right.
-        for (bin, value) in work.iter_mut().enumerate() {
+        for (bin, value) in self.work.iter_mut().enumerate() {
             let (left, right) = if bin < bins {
-                (sums[0][bin], sums[1][bin])
+                (self.sums[0][bin], self.sums[1][bin])
             } else {
-                (sums[0][size - bin].conj(), sums[1][size - bin].conj())
+                (self.sums[0][size - bin].conj(), self.sums[1][size - bin].conj())
             };
             *value = Complex::new(left.re - right.im, left.im + right.re);
         }
-        fft.transform(work, true);
-        for (out, value) in output.iter_mut().zip(&work[block..]) {
+        self.fft.transform(&mut self.work, true);
+        for (out, value) in output.iter_mut().zip(&self.work[block..]) {
             *out = [value.re, value.im];
         }
-        input.copy_within(block.., 0);
+        self.input.copy_within(block.., 0);
     }
 }
 
@@ -213,6 +232,7 @@ fn split(spectrum: &[Complex], left: &mut [Complex], right: &mut [Complex]) {
 
 /// The tail's blocks: 16 quanta each.
 const TAIL_BLOCK: usize = 2048;
+const TAIL_QUANTA: usize = TAIL_BLOCK / QUANTUM;
 
 /// The reverb: stereo in, stereo out, a quantum at a time.
 pub struct Convolver {
@@ -222,6 +242,10 @@ pub struct Convolver {
     tail_output: Vec<[f32; 2]>,
     played: usize,
     head_output: Vec<[f32; 2]>,
+    /// Quanta of silence needed after the last non-zero input until all head
+    /// and tail rings and overlap buffers have flushed to exact zero.
+    ir_quanta: usize,
+    active_quanta: usize,
 }
 
 impl Convolver {
@@ -240,23 +264,36 @@ impl Convolver {
     fn from_response(response: [Vec<f32>; 2]) -> Convolver {
         let length = response[0].len();
         let split_at = TAIL_BLOCK.min(length);
+        let tail = Stage::new(TAIL_BLOCK, &response, split_at, length);
+        let ir_quanta = (tail.partitions + 3) * TAIL_QUANTA;
         Convolver {
             head: Stage::new(QUANTUM, &response, 0, split_at),
-            tail: Stage::new(TAIL_BLOCK, &response, split_at, length),
+            tail,
             tail_output: vec![[0.0; 2]; TAIL_BLOCK],
             played: 0,
             head_output: vec![[0.0; 2]; QUANTUM],
+            ir_quanta,
+            active_quanta: 0,
         }
     }
 
     /// Convolves one quantum of input, adding the output to `output`.
     pub fn process(&mut self, input: &[[f32; 2]; QUANTUM], output: &mut [[f32; 2]; QUANTUM]) {
+        let silent = input.iter().all(|&[l, r]| l == 0.0 && r == 0.0);
+        if !silent {
+            self.active_quanta = self.ir_quanta;
+        } else if self.active_quanta == 0 && self.played == 0 {
+            return;
+        } else {
+            self.active_quanta = self.active_quanta.saturating_sub(1);
+        }
         // The head: this quantum's own contribution, at once.
         self.head.input[QUANTUM..].copy_from_slice(input);
-        self.head.convolve(&mut self.head_output);
+        self.head.convolve(&mut self.head_output, false);
         // The tail: what earlier blocks have for this quantum, worked out as
         // the block before this one completed.
         let start = self.played;
+        let q = start / QUANTUM;
         for ((out, head), tail) in
             output.iter_mut().zip(&self.head_output).zip(&self.tail_output[start..start + QUANTUM])
         {
@@ -264,10 +301,25 @@ impl Convolver {
             out[1] += head[1] + tail[1];
         }
         self.tail.input[TAIL_BLOCK + start..TAIL_BLOCK + start + QUANTUM].copy_from_slice(input);
+        // Spread partitions `1..tail.partitions` (which only depend on already-
+        // completed history blocks) across quanta `0..15` so quantum 15 only
+        // runs the FFTs plus partition 0.
+        if q == 0 {
+            self.tail.clear_sums();
+        }
+        if q < TAIL_QUANTA - 1 {
+            let rest = self.tail.partitions.saturating_sub(1);
+            let p_start = 1 + (q * rest) / (TAIL_QUANTA - 1);
+            let p_end = 1 + ((q + 1) * rest) / (TAIL_QUANTA - 1);
+            if p_start < p_end {
+                let next_newest = (self.tail.newest + 1) % self.tail.partitions;
+                self.tail.accumulate_partitions(p_start, p_end, next_newest);
+            }
+        }
         self.played += QUANTUM;
         if self.played == TAIL_BLOCK {
             self.played = 0;
-            self.tail.convolve(&mut self.tail_output);
+            self.tail.convolve(&mut self.tail_output, true);
         }
     }
 }

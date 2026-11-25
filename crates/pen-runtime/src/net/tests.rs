@@ -40,8 +40,10 @@ fn ready<T>(future: impl Future<Output = T>) -> T {
 #[derive(Clone, Default)]
 struct Toy {
     leak: f32,
-    /// Programs started: the first, and one for each restore.
+    /// Programs started: the first, and one for each full restore.
     starts: Rc<std::cell::Cell<u64>>,
+    /// Restore operations processed across all instances.
+    restores: Rc<std::cell::Cell<u64>>,
 }
 
 struct Running {
@@ -49,6 +51,7 @@ struct Running {
     pending: Option<Vec<f32>>,
     request: Option<(Operation, Vec<f32>)>,
     leak: f32,
+    restores: Rc<std::cell::Cell<u64>>,
 }
 
 const MODULUS: f32 = 65521.0;
@@ -94,7 +97,13 @@ impl Backend for Toy {
     type Program = Running;
     async fn start(&self, _: &()) -> anyhow::Result<Running> {
         self.starts.set(self.starts.get() + 1);
-        Ok(Running { state: vec![0.0; 9], pending: None, request: None, leak: self.leak })
+        Ok(Running {
+            state: vec![0.0; 9],
+            pending: None,
+            request: None,
+            leak: self.leak,
+            restores: self.restores.clone(),
+        })
     }
 }
 
@@ -116,6 +125,7 @@ impl Program for Running {
         let answer = match operation {
             Operation::Create => vec![operation as u8 as f32],
             Operation::Restore => {
+                self.restores.set(self.restores.get() + 1);
                 self.pending = Some(payload);
                 vec![operation as u8 as f32]
             }
@@ -210,7 +220,7 @@ impl Link for Wire {
 }
 
 fn moment(state: Vec<f32>) -> Moment {
-    Moment { saved: SavedState { schema: 1, state }, edits: Edits::default() }
+    Moment { saved: std::sync::Arc::new(SavedState { schema: 1, state }), edits: Edits::default() }
 }
 
 /// One player's events on its `step`th frame: keys and pointer moves at
@@ -389,9 +399,11 @@ fn peers_agree_through_latency_loss_and_reordering() {
         assert!((7..=8).contains(&stats.checked), "the peers compared packets: {stats:?}");
         // 40 ms each way, give or take 12, less what the peer held it.
         assert!(stats.round_trip.is_some_and(|trip| (80..=110).contains(&trip)), "{stats:?}");
-        // A program for the start, its restore, and one a rollback: frames
-        // an earlier rollback restored at do not restore again.
-        assert_eq!(peer.toy.starts.get(), 2 + stats.rollbacks, "{stats:?}");
+        // A program for the start and its initial restore; rollbacks restore
+        // in place without re-instantiating, and frames an earlier rollback
+        // restored at do not restore again.
+        assert_eq!(peer.toy.starts.get(), 2, "{stats:?}");
+        assert_eq!(peer.toy.restores.get(), 2 + stats.rollbacks, "{stats:?}");
     }
 }
 
@@ -417,7 +429,8 @@ fn three_players_agree() {
     // One player's late input can take a rollback back past where another
     // player's began: it restores once, not again there.
     for peer in &peers {
-        assert_eq!(peer.toy.starts.get(), 2 + peer.net.stats().rollbacks, "{:?}", peer.net.stats());
+        assert_eq!(peer.toy.starts.get(), 2, "{:?}", peer.net.stats());
+        assert_eq!(peer.toy.restores.get(), 2 + peer.net.stats().rollbacks, "{:?}", peer.net.stats());
     }
 }
 

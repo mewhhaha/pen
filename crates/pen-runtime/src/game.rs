@@ -143,7 +143,7 @@ pub struct Edits {
 /// and the host's edit history (a frame may ask to undo into it).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Moment {
-    pub saved: SavedState,
+    pub saved: Arc<SavedState>,
     pub edits: Edits,
 }
 
@@ -151,7 +151,7 @@ struct Game<P: Program> {
     program: P,
     schema: u32,
     instances: crate::instances::Scene,
-    pending_instances: Option<crate::instances::Scene>,
+    pending_undo: Option<crate::instances::SceneRollback>,
 }
 
 pub struct GameRuntime<B: Backend> {
@@ -159,6 +159,9 @@ pub struct GameRuntime<B: Backend> {
     module: B::Module,
     catalog: Catalog,
     active: Game<B::Program>,
+    /// True after an in-place restore failed without succeeding in fresh
+    /// recovery: prevents reusing a potentially half-mutated guest instance.
+    poisoned: bool,
     snapshot: Option<Arc<SavedState>>,
     edits: Edits,
     previous_timestamp: Option<f64>,
@@ -184,20 +187,24 @@ pub struct GameRuntime<B: Backend> {
 async fn open_game<B: Backend>(engine: &B, module: &B::Module) -> Result<Game<B::Program>> {
     let program = engine.start(module).await?;
     let schema = program.schema();
-    Ok(Game { program, schema, instances: Default::default(), pending_instances: None })
+    Ok(Game { program, schema, instances: Default::default(), pending_undo: None })
 }
 
 impl<P: Program> Game<P> {
     fn accept(&mut self) {
         self.program.accept();
-        if let Some(scene) = self.pending_instances.take() {
-            self.instances = scene;
+        self.pending_undo = None;
+    }
+
+    fn discard_pending(&mut self) {
+        if let Some(undo) = self.pending_undo.take() {
+            self.instances.rollback(undo);
         }
     }
 }
 
 async fn state_request<P: Program>(game: &mut Game<P>, operation: Operation, payload: &[f32]) -> Result<Vec<f32>> {
-    game.pending_instances = None;
+    game.discard_pending();
     let state = game.program.request(operation, payload).await?;
     validate_state(&state)?;
     game.accept();
@@ -244,10 +251,13 @@ async fn evaluate_with_frame<P: Program>(
     let packet = game.program.request(Operation::Frame, &encode_frame(frame, 0.0, &[])?).await?;
     let mut next = decode_frame(&packet, game.schema, catalog)?;
     ensure!(next.state.is_empty(), "program frame must keep its state inside the guest");
-    game.pending_instances = None;
-    let scene = game.instances.resolve(&mut next.render)?;
-    host.validate(&next.render)?;
-    game.pending_instances = Some(scene);
+    game.discard_pending();
+    let undo = game.instances.apply(&mut next.render)?;
+    if let Err(error) = host.validate(&next.render) {
+        game.instances.rollback(undo);
+        return Err(error);
+    }
+    game.pending_undo = Some(undo);
     Ok(next.render)
 }
 
@@ -278,16 +288,7 @@ pub fn hash_lanes(lanes: &[f32]) -> u64 {
 /// `exposure.cut` presentation hint so replays, spectating, and netplay rollbacks
 /// hash identically to a straight run.
 pub fn hash_render_packet(packet: &[f32]) -> u64 {
-    let canonical = pen_protocol::canonical_render_packet(packet);
-    let cut_lane = pen_protocol::boundary::lanes::header::EXPOSURE_CUT;
-    let mut hash = 0xcbf29ce484222325u64;
-    for (index, &lane) in canonical.iter().enumerate() {
-        let value = if index == cut_lane { 0.0f32 } else { lane };
-        for byte in value.to_bits().to_le_bytes() {
-            hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
-        }
-    }
-    hash
+    pen_protocol::boundary::hash_canonical_render_packet(packet)
 }
 
 /// FNV-1a over a resolved retained frame so a live retained delta and a
@@ -303,8 +304,7 @@ fn hash_resolved_frame(frame: &mut RenderFrame, schema: u32) -> u64 {
             original.iter().filter(|request| request.service != pen_protocol::service::KERNEL).cloned().collect();
         original
     });
-    let canonical = pen_protocol::boundary::canonical_render(frame, schema, &[]);
-    let hash = hash_lanes(&canonical);
+    let hash = pen_protocol::boundary::hash_canonical_render(frame, schema, &[]);
     frame.exposure.cut = saved_cut;
     if let Some(original) = saved_services {
         frame.services = original;
@@ -359,6 +359,7 @@ impl<B: Backend> GameRuntime<B> {
             module,
             catalog,
             active,
+            poisoned: false,
             snapshot: None,
             edits: Edits::default(),
             previous_timestamp: None,
@@ -381,6 +382,11 @@ impl<B: Backend> GameRuntime<B> {
     pub fn measure_frames(&mut self, enabled: bool) {
         self.measuring = enabled;
         self.last_timings = None;
+    }
+
+    /// Whether per-frame host profiling timestamps are enabled.
+    pub fn is_measuring(&self) -> bool {
+        self.measuring
     }
 
     /// The guest, decode and validate times of the last frame received.
@@ -477,6 +483,7 @@ impl<B: Backend> GameRuntime<B> {
             }
         }
         let mut previous = std::mem::replace(&mut self.active, candidate);
+        self.poisoned = false;
         self.snapshot = None;
         self.previous_timestamp = None;
         previous.program.close().await;
@@ -485,6 +492,7 @@ impl<B: Backend> GameRuntime<B> {
     }
 
     async fn travel(&mut self, host: &mut dyn Host, forward: bool) -> Result<bool> {
+        ensure!(!self.poisoned, "game runtime is poisoned after a failed restore");
         let to = match (self.edits.step, forward) {
             (Some(step), false) if step > 0 => step - 1,
             (Some(step), true) if step + 1 < self.edits.scenes.len() => step + 1,
@@ -526,12 +534,13 @@ impl<B: Backend> GameRuntime<B> {
     /// Starts the game on a frame's input (an `input`, or one recorded
     /// earlier); `receive` takes the result.
     pub fn send(&mut self, input: &[f32]) -> Result<()> {
+        ensure!(!self.poisoned, "game runtime is poisoned after a failed restore");
         self.active.program.send(Operation::Frame, input)?;
-        self.sent = Some(Instant::now());
+        self.sent = self.measuring.then(Instant::now);
         // Sending authorizes mutation even if decoding/rendering later rejects
         // its output. Never return a stale pre-frame checkpoint from the cache.
         self.snapshot = None;
-        self.active.pending_instances = None;
+        self.active.discard_pending();
         Ok(())
     }
 
@@ -539,14 +548,14 @@ impl<B: Backend> GameRuntime<B> {
     /// and accepted. The host draws it, then `follow` does what it asked.
     /// A program that stopped answering rejects the frame as invalid.
     pub async fn receive(&mut self, host: &dyn Host) -> Result<RenderFrame> {
-        let waiting = Instant::now();
+        let waiting = self.measuring.then(Instant::now);
         let packet = self
             .active
             .program
             .response()
             .await
             .map_err(|error| if error.is::<Unresponsive>() { error.context(InvalidFrame) } else { error })?;
-        let returned = Instant::now();
+        let returned = self.measuring.then(Instant::now);
         let mut frame = self.spare.take().unwrap_or_default();
         let state = decode_into(&packet, self.active.schema, &self.catalog, &mut frame)
             .map_err(|error| error.context(InvalidFrame))?;
@@ -554,10 +563,12 @@ impl<B: Backend> GameRuntime<B> {
             return Err(anyhow::anyhow!("program frame must keep its state inside the guest").context(InvalidFrame));
         }
         let was_retained = frame.retained_enabled;
-        let scene = self.active.instances.resolve(&mut frame).map_err(|error| error.context(InvalidFrame))?;
-        let decoded = Instant::now();
-        host.validate(&frame).map_err(|error| error.context(InvalidFrame))?;
-        self.active.pending_instances = Some(scene);
+        let undo = self.active.instances.apply(&mut frame).map_err(|error| error.context(InvalidFrame))?;
+        let decoded = self.measuring.then(Instant::now);
+        if let Err(error) = host.validate(&frame) {
+            self.active.instances.rollback(undo);
+            return Err(error.context(InvalidFrame));
+        }
         self.active.accept();
         self.snapshot = None;
         if self.hashing {
@@ -571,14 +582,19 @@ impl<B: Backend> GameRuntime<B> {
         if self.keeping {
             self.received = Some(frame.clone());
         }
-        let answered = self.active.program.answered().unwrap_or(returned);
-        self.last_timings = self.measuring.then(|| FrameTimings {
-            guest_ms: ms(answered.saturating_duration_since(self.sent.unwrap_or(waiting))),
-            wait_ms: ms(returned - waiting),
-            decode_ms: ms(decoded - returned),
-            validate_ms: ms(decoded.elapsed()),
-            packet_bytes: packet.len() * 4,
-            ..FrameTimings::default()
+        self.last_timings = self.measuring.then(|| {
+            let waiting = waiting.unwrap();
+            let returned = returned.unwrap();
+            let decoded = decoded.unwrap();
+            let answered = self.active.program.answered().unwrap_or(returned);
+            FrameTimings {
+                guest_ms: ms(answered.saturating_duration_since(self.sent.unwrap_or(waiting))),
+                wait_ms: ms(returned - waiting),
+                decode_ms: ms(decoded - returned),
+                validate_ms: ms(decoded.elapsed()),
+                packet_bytes: packet.len() * 4,
+                ..FrameTimings::default()
+            }
         });
         self.active.program.recycle(packet.into_buffer());
         Ok(frame)
@@ -604,6 +620,7 @@ impl<B: Backend> GameRuntime<B> {
     /// draws a frame before it replaces the old one.
     pub async fn reload(&mut self, host: &mut dyn Host, module: B::Module, catalog: Catalog) -> ReloadResult {
         let result: Result<ReloadResult> = (async {
+            ensure!(!self.poisoned, "game runtime is poisoned after a failed restore");
             host.state_adapter().validate()?;
             let mut prepared = open_game(&self.engine, &module).await?;
             if prepared.schema != self.active.schema {
@@ -620,6 +637,7 @@ impl<B: Backend> GameRuntime<B> {
             host.render(&rendered, &catalog)?;
             prepared.accept();
             let mut previous = std::mem::replace(&mut self.active, prepared);
+            self.poisoned = false;
             self.snapshot = None;
             self.module = module;
             self.catalog = catalog;
@@ -675,6 +693,7 @@ impl<B: Backend> GameRuntime<B> {
     /// the allocation; save owners can request an owned copy with `snapshot`.
     /// Like all guest requests, call only when no frame is in flight.
     pub async fn shared_snapshot(&mut self) -> Result<Arc<SavedState>> {
+        ensure!(!self.poisoned, "game runtime is poisoned after a failed restore");
         if let Some(saved) = &self.snapshot {
             return Ok(saved.clone());
         }
@@ -688,7 +707,7 @@ impl<B: Backend> GameRuntime<B> {
 
     /// The running state and edit history, to come back to.
     pub async fn moment(&mut self) -> Result<Moment> {
-        Ok(Moment { saved: self.snapshot().await?, edits: self.edits.clone() })
+        Ok(Moment { saved: self.shared_snapshot().await?, edits: self.edits.clone() })
     }
 
     /// Returns to a moment exactly: the next frame starts from its state,
@@ -701,6 +720,68 @@ impl<B: Backend> GameRuntime<B> {
         let (rendered, _) = self.replace_state(host, &moment.saved.state, None, false, false).await?;
         self.edits = moment.edits.clone();
         Ok(rendered)
+    }
+
+    /// Returns to a moment in a fresh program instance without running a
+    /// discarded validation frame or duplicate second `Restore`. Used by
+    /// single-player rewinds when recorded frames will immediately run after
+    /// the restore, preserving fresh-instance isolation for any transient state
+    /// outside the serialized snapshot.
+    pub async fn restore_fresh_for_replay(&mut self, host: &mut dyn Host, moment: &Moment) -> Result<()> {
+        if moment.saved.schema != self.active.schema {
+            bail!("the state schema changed since that moment; it cannot be restored");
+        }
+        let mut candidate = open_game(&self.engine, &self.module).await?;
+        restore(&self.engine, &self.module, &mut candidate, &moment.saved.state, host).await?;
+        let mut previous = std::mem::replace(&mut self.active, candidate);
+        self.poisoned = false;
+        self.snapshot = None;
+        self.previous_timestamp = None;
+        self.edits = moment.edits.clone();
+        previous.program.close().await;
+        host.restored();
+        Ok(())
+    }
+
+    /// Returns to a moment for rollback netplay by issuing one in-place
+    /// `Restore` on the live program instance, avoiding a fresh instantiation
+    /// and discarded validation frame (netplay games keep all simulation state
+    /// inside `SavedState`). If in-place restore fails or an adapter requests
+    /// migration, the live instance is marked poisoned and replaced via fresh
+    /// validated recovery; if recovery also fails, the runtime remains poisoned
+    /// so the broken instance is never reused.
+    pub async fn restore_for_replay(&mut self, host: &mut dyn Host, moment: &Moment) -> Result<()> {
+        if moment.saved.schema != self.active.schema {
+            bail!("the state schema changed since that moment; it cannot be restored");
+        }
+        let adapter = host.state_adapter();
+        adapter.validate()?;
+        if self.poisoned {
+            self.replace_state(host, &moment.saved.state, None, false, false).await?;
+            self.edits = moment.edits.clone();
+            return Ok(());
+        }
+        self.active.discard_pending();
+        self.snapshot = None;
+        self.poisoned = true;
+        let in_place = async {
+            let answer = state_request(&mut self.active, Operation::Restore, &moment.saved.state).await?;
+            let migration = adapter.migrate(&moment.saved.state, &answer)?;
+            Ok::<_, anyhow::Error>(migration.is_none())
+        }
+        .await;
+        if let Ok(true) = in_place {
+            self.poisoned = false;
+            self.active.instances = Default::default();
+            self.active.pending_undo = None;
+            self.edits = moment.edits.clone();
+            self.previous_timestamp = None;
+            host.restored();
+            return Ok(());
+        }
+        self.replace_state(host, &moment.saved.state, None, false, false).await?;
+        self.edits = moment.edits.clone();
+        Ok(())
     }
 
     /// Starts a new program from the running state, as a restore does
@@ -728,6 +809,7 @@ impl<B: Backend> GameRuntime<B> {
     }
 
     pub async fn scene(&mut self) -> Result<SavedState> {
+        ensure!(!self.poisoned, "game runtime is poisoned after a failed restore");
         Ok(SavedState {
             schema: self.active.schema,
             state: state_request(&mut self.active, Operation::Scene, &[]).await?,
@@ -736,6 +818,7 @@ impl<B: Backend> GameRuntime<B> {
 
     /// Replaces the game's scene with a saved one, keeping the rest of its state.
     pub async fn load_scene(&mut self, host: &mut dyn Host, scene: &SavedState) -> Result<()> {
+        ensure!(!self.poisoned, "game runtime is poisoned after a failed restore");
         if scene.schema != self.active.schema {
             bail!("scene state schema changed; cannot load this scene");
         }
@@ -786,6 +869,7 @@ mod receive_tests {
         answers: Vec<Result<Vec<f32>>>,
         recycled: Vec<Vec<f32>>,
         requests: Vec<(Operation, Vec<f32>)>,
+        starts: usize,
     }
 
     #[derive(Clone, Default)]
@@ -808,6 +892,7 @@ mod receive_tests {
         type Module = ();
         type Program = Answering;
         async fn start(&self, _: &()) -> Result<Answering> {
+            self.0.borrow_mut().starts += 1;
             Ok(Answering(self.0.clone(), None))
         }
     }
@@ -1011,7 +1096,7 @@ mod receive_tests {
         let catalog = Catalog::default();
         let mut runtime = ready(GameRuntime::new(&backend, (), catalog.clone(), &mut Viewer, None, None)).unwrap();
         backend.0.borrow_mut().requests.clear();
-        let moment = Moment { saved: SavedState { schema: 1, state: vec![42.0] }, edits: Edits::default() };
+        let moment = Moment { saved: Arc::new(SavedState { schema: 1, state: vec![42.0] }), edits: Edits::default() };
 
         backend.answer(&[Snapshot, Restore, Frame]);
         assert_eq!(ready(runtime.reload(&mut Viewer, (), catalog)), ReloadResult::Activated);
@@ -1034,7 +1119,7 @@ mod receive_tests {
         timeline.ran(Recorded { input, ..Recorded::default() });
         assert_eq!(timeline.recording().unwrap().frames[0].input, [0.0, 64.0, 64.0, 0.0, 0.0]);
 
-        backend.answer(&[Restore, Frame, Restore, Frame]);
+        backend.answer(&[Restore, Frame]);
         ready(timeline.rewind(&mut runtime, &Viewer, 1, &mut |_, _, _| Ok(()))).unwrap();
         backend.answer(&[Restore, Frame, Restore]);
         ready(timeline.restart(&mut runtime, &Viewer, 0)).unwrap();
@@ -1042,10 +1127,42 @@ mod receive_tests {
         let script = backend.0.borrow();
         assert!(script.answers.is_empty(), "all lifecycle evaluations ran");
         let frames = script.requests.iter().filter(|(operation, _)| *operation == Frame).collect::<Vec<_>>();
-        assert_eq!(frames.len(), 9, "reload, load, scene, restore, reroot, live, rewind validation/replay, restart");
+        assert_eq!(frames.len(), 8, "reload, load, scene, restore, reroot, live, rewind replay, restart");
         for (_, input) in frames {
             assert_eq!(input, &[0.0, 64.0, 64.0, 0.0, 0.0], "only startup carries SessionStarted");
         }
+    }
+
+    #[test]
+    fn restore_for_replay_recovers_in_fresh_instance_and_poisons_if_recovery_fails() {
+        use Operation::{Create, Frame, Restore};
+        let backend = Scripted::default();
+        backend.answer(&[Create, Frame]);
+        let mut runtime = ready(GameRuntime::new(&backend, (), Catalog::default(), &mut Viewer, None, None)).unwrap();
+        let moment = Moment { saved: Arc::new(SavedState { schema: 1, state: vec![7.0] }), edits: Edits::default() };
+
+        // Case 1: in-place Restore fails -> recovers in a fresh instance via replace_state.
+        let starts_before = backend.0.borrow().starts;
+        backend.0.borrow_mut().answers.push(Err(anyhow::anyhow!("guest trapped during in-place restore")));
+        backend.answer(&[Restore, Frame, Restore]);
+        ready(runtime.restore_for_replay(&mut Viewer, &moment)).unwrap();
+        assert_eq!(backend.0.borrow().starts, starts_before + 1, "recovered in a fresh instance");
+        backend.answer(&[Frame]);
+        runtime.send(&[]).unwrap();
+        ready(runtime.receive(&Viewer)).unwrap();
+
+        // Case 2: in-place Restore AND fresh recovery both fail -> runtime stays poisoned.
+        backend.0.borrow_mut().answers.push(Err(anyhow::anyhow!("in-place failed")));
+        backend.0.borrow_mut().answers.push(Err(anyhow::anyhow!("fresh recovery also failed")));
+        assert!(ready(runtime.restore_for_replay(&mut Viewer, &moment)).is_err());
+        let requests_after_fail = backend.0.borrow().requests.len();
+        assert!(runtime.send(&[]).is_err(), "poisoned runtime refuses send");
+        assert!(ready(runtime.shared_snapshot()).is_err(), "poisoned runtime refuses snapshot");
+        assert_eq!(
+            backend.0.borrow().requests.len(),
+            requests_after_fail,
+            "poisoned runtime issues no requests to the broken instance"
+        );
     }
 
     #[test]

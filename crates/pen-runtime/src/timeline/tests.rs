@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use super::*;
 use crate::game::Edits;
 
 fn moment(value: f32) -> Moment {
-    Moment { saved: SavedState { schema: 1, state: vec![value] }, edits: Edits::default() }
+    Moment { saved: Arc::new(SavedState { schema: 1, state: vec![value] }), edits: Edits::default() }
 }
 
 fn frame(elapsed: f32) -> Recorded {

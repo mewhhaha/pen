@@ -90,7 +90,7 @@ pub const ACOUSTICS_EXT_TAG: u32 = 65_004;
 pub const MAX_ACOUSTIC_TAPS: usize = 16;
 
 /// One ray-traced early acoustic reflection tap with 3-band surface coloration (`~250 Hz`, `~1 kHz`, `~4 kHz`).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct AcousticTap {
     /// Arrival delay in seconds (`0.0005..=0.25`).
     pub delay_s: f32,
@@ -118,7 +118,8 @@ impl AcousticTap {
 }
 
 /// Ray-traced acoustic room profile carrying geometric early reflections and Eyring/Sabine late reverb tail.
-#[derive(Clone, Debug, PartialEq)]
+/// Fixed-capacity inline tap storage keeps `AcousticProfile: Copy` so real-time audio threads never allocate.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AcousticProfile {
     /// Late reverberation RT60 decay in seconds (`0.15..=6.0`, `0.0` = default 1.5 s).
     pub decay: f32,
@@ -132,11 +133,26 @@ pub struct AcousticProfile {
     pub late_gain: f32,
     /// Open-sky escape fraction (`0.0` enclosed room .. `1.0` open outdoor field).
     pub outdoor: f32,
-    /// Up to [`MAX_ACOUSTIC_TAPS`] discrete stereo early reflections.
-    pub taps: Vec<AcousticTap>,
+    /// Up to [`MAX_ACOUSTIC_TAPS`] discrete stereo early reflections (active prefix `..tap_count`).
+    pub taps: [AcousticTap; MAX_ACOUSTIC_TAPS],
+    /// Number of valid early reflection taps stored in `taps`.
+    pub tap_count: u8,
 }
 
 impl AcousticProfile {
+    /// Active early reflection taps.
+    pub fn taps(&self) -> &[AcousticTap] {
+        &self.taps[..usize::from(self.tap_count).min(MAX_ACOUSTIC_TAPS)]
+    }
+
+    /// Packs up to [`MAX_ACOUSTIC_TAPS`] taps into inline storage.
+    pub fn pack_taps(slice: &[AcousticTap]) -> ([AcousticTap; MAX_ACOUSTIC_TAPS], u8) {
+        let mut taps = [AcousticTap::default(); MAX_ACOUSTIC_TAPS];
+        let count = slice.len().min(MAX_ACOUSTIC_TAPS);
+        taps[..count].copy_from_slice(&slice[..count]);
+        (taps, count as u8)
+    }
+
     /// Parses and sanitizes the last [`ACOUSTICS_EXT_TAG`] payload from `frame.extensions`.
     pub fn from_extensions(extensions: &[pen_protocol::Extension]) -> Option<Self> {
         let ext = extensions.iter().rev().find(|e| e.tag == ACOUSTICS_EXT_TAG && e.values.len() >= 7)?;
@@ -152,40 +168,37 @@ impl AcousticProfile {
         let early_gain = f(3, 0.0, 2.0, 0.7);
         let late_gain = f(4, 0.0, 2.0, 1.0);
         let outdoor = f(5, 0.0, 1.0, 0.0);
-        let declared = if vals[6].is_finite() && vals[6] > 0.0 {
-            (vals[6].round() as usize).min(MAX_ACOUSTIC_TAPS)
-        } else {
-            0
-        };
+        let declared =
+            if vals[6].is_finite() && vals[6] > 0.0 { (vals[6].round() as usize).min(MAX_ACOUSTIC_TAPS) } else { 0 };
         let available = (vals.len().saturating_sub(7)) / 5;
         let count = declared.min(available);
-        let mut taps = Vec::with_capacity(count);
-        for i in 0..count {
+        let mut taps = [AcousticTap::default(); MAX_ACOUSTIC_TAPS];
+        for (i, slot) in taps.iter_mut().take(count).enumerate() {
             let base = 7 + i * 5;
-            taps.push(
-                AcousticTap {
-                    delay_s: vals[base],
-                    pan: vals[base + 1],
-                    gain_low: vals[base + 2],
-                    gain_mid: vals[base + 3],
-                    gain_high: vals[base + 4],
-                }
-                .sanitized(),
-            );
+            *slot = AcousticTap {
+                delay_s: vals[base],
+                pan: vals[base + 1],
+                gain_low: vals[base + 2],
+                gain_mid: vals[base + 3],
+                gain_high: vals[base + 4],
+            }
+            .sanitized();
         }
-        Some(Self { decay, damping, predelay_s, early_gain, late_gain, outdoor, taps })
+        Some(Self { decay, damping, predelay_s, early_gain, late_gain, outdoor, taps, tap_count: count as u8 })
     }
 
     /// Hysteresis predicate deciding whether two ray-traced acoustic profiles differ enough to
     /// regenerate the stereo convolution IR and crossfade convolvers without per-frame thrashing.
     pub fn differs_significantly(&self, other: &Self) -> bool {
+        let self_taps = self.taps();
+        let other_taps = other.taps();
         if (self.decay - other.decay).abs() > 0.08
             || (self.damping - other.damping).abs() > 0.05
             || (self.predelay_s - other.predelay_s).abs() > 0.006
             || (self.early_gain - other.early_gain).abs() > 0.08
             || (self.late_gain - other.late_gain).abs() > 0.08
             || (self.outdoor - other.outdoor).abs() > 0.08
-            || self.taps.len().abs_diff(other.taps.len()) > 2
+            || self_taps.len().abs_diff(other_taps.len()) > 2
         {
             return true;
         }
@@ -212,8 +225,8 @@ impl AcousticProfile {
             let hf_ratio = sum_high / (sum_low + 1e-4);
             (energy, w_delay * inv, w_pan * inv, w_abs_pan * inv, hf_ratio)
         };
-        let (e_a, d_a, p_a, w_a, hf_a) = tap_summary(&self.taps);
-        let (e_b, d_b, p_b, w_b, hf_b) = tap_summary(&other.taps);
+        let (e_a, d_a, p_a, w_a, hf_a) = tap_summary(self_taps);
+        let (e_b, d_b, p_b, w_b, hf_b) = tap_summary(other_taps);
         (e_a - e_b).abs() > 0.12
             || (d_a - d_b).abs() > 0.006
             || (p_a - p_b).abs() > 0.18
@@ -235,20 +248,14 @@ pub fn impulse_response_from_acoustics(rate: f64, profile: &AcousticProfile) -> 
     let custom_decay = profile.decay.is_finite() && profile.decay > 0.0;
     let decay = if custom_decay { f64::from(profile.decay.clamp(0.15, 6.0)) } else { DECAY };
     let damp = if profile.damping.is_finite() { f64::from(profile.damping.clamp(0.0, 1.0)) } else { 0.35 };
-    let predelay = if profile.predelay_s.is_finite() {
-        f64::from(profile.predelay_s.clamp(0.002, 0.15))
-    } else {
-        PREDELAY
-    };
+    let predelay =
+        if profile.predelay_s.is_finite() { f64::from(profile.predelay_s.clamp(0.002, 0.15)) } else { PREDELAY };
     let early_gain = if profile.early_gain.is_finite() { f64::from(profile.early_gain.clamp(0.0, 2.0)) } else { 0.7 };
     let late_gain = if profile.late_gain.is_finite() { f64::from(profile.late_gain.clamp(0.0, 2.0)) } else { 1.0 };
     let outdoor = if profile.outdoor.is_finite() { f64::from(profile.outdoor.clamp(0.0, 1.0)) } else { 0.0 };
 
-    let max_tap_s = profile
-        .taps
-        .iter()
-        .map(|t| f64::from(t.sanitized().delay_s))
-        .fold(0.0f64, f64::max);
+    let active_taps = profile.taps();
+    let max_tap_s = active_taps.iter().map(|t| f64::from(t.sanitized().delay_s)).fold(0.0f64, f64::max);
     let tail_seconds = (predelay + decay + 0.12).clamp(0.25, 6.2);
     let seconds = tail_seconds.max(max_tap_s + 0.08).clamp(0.25, 6.2);
     let length = (seconds * rate).round().max(1.0) as usize;
@@ -277,9 +284,7 @@ pub fn impulse_response_from_acoustics(rate: f64, profile: &AcousticProfile) -> 
             let envelope = if since < 0.0 {
                 0.0
             } else {
-                (SIXTY_DB * since / effective_decay).exp()
-                    * (since / 0.008).min(1.0)
-                    * ((seconds - t) / TAPER).min(1.0)
+                (SIXTY_DB * since / effective_decay).exp() * (since / 0.008).min(1.0) * ((seconds - t) / TAPER).min(1.0)
             };
             *value = low * envelope;
             late_energy += *value * *value;
@@ -293,7 +298,7 @@ pub fn impulse_response_from_acoustics(rate: f64, profile: &AcousticProfile) -> 
     let mut er_lo = [vec![0.0f64; length], vec![0.0f64; length]];
     let mut er_md = [vec![0.0f64; length], vec![0.0f64; length]];
     let mut er_hi = [vec![0.0f64; length], vec![0.0f64; length]];
-    if early_gain > 0.0 && !profile.taps.is_empty() {
+    if early_gain > 0.0 && !active_taps.is_empty() {
         let add_frac = |buf: &mut [f64], pos: f64, amp: f64| {
             if amp == 0.0 || !pos.is_finite() || pos < 0.0 {
                 return;
@@ -307,7 +312,7 @@ pub fn impulse_response_from_acoustics(rate: f64, profile: &AcousticProfile) -> 
                 buf[idx + 1] += amp * frac;
             }
         };
-        for raw_tap in profile.taps.iter().take(MAX_ACOUSTIC_TAPS) {
+        for raw_tap in active_taps {
             let tap = raw_tap.sanitized();
             let pan = f64::from(tap.pan);
             let angle = (pan + 1.0) * 0.5 * std::f64::consts::FRAC_PI_2;
@@ -434,16 +439,9 @@ pub fn blend_zones(
         } else {
             f64::from(if fallback_decay > 0.0 { fallback_decay } else { DECAY as f32 })
         };
-        let z_damp = if zone.damping.is_finite() {
-            f64::from(zone.damping.clamp(0.0, 1.0))
-        } else {
-            f64::from(fallback_damp)
-        };
-        let z_wet = if zone.wet.is_finite() && zone.wet > 0.0 {
-            f64::from(zone.wet.clamp(0.0, 2.0))
-        } else {
-            1.0
-        };
+        let z_damp =
+            if zone.damping.is_finite() { f64::from(zone.damping.clamp(0.0, 1.0)) } else { f64::from(fallback_damp) };
+        let z_wet = if zone.wet.is_finite() && zone.wet > 0.0 { f64::from(zone.wet.clamp(0.0, 2.0)) } else { 1.0 };
         sum_w += w;
         decay_acc += w * z_decay;
         damp_acc += w * z_damp;
@@ -483,23 +481,47 @@ pub fn source_zone_acoustics(
     let mut wet_w = 0.0f64;
     for z in zones {
         let wl = zone_weight(listener_pos, z);
-        let ws = if explicit_zone != 0 {
-            if z.id == explicit_zone { 1.0 } else { 0.0 }
-        } else {
-            zone_weight(source_pos, z)
-        };
+        let ws =
+            if explicit_zone != 0 { if z.id == explicit_zone { 1.0 } else { 0.0 } } else { zone_weight(source_pos, z) };
         if ws > 0.0 {
-            let z_wet = if z.wet.is_finite() && z.wet > 0.0 {
-                f64::from(z.wet.clamp(0.0, 2.0))
-            } else {
-                1.0
-            };
+            let z_wet = if z.wet.is_finite() && z.wet > 0.0 { f64::from(z.wet.clamp(0.0, 2.0)) } else { 1.0 };
             wet_sum += ws * z_wet;
             wet_w += ws;
         }
         if z.id != 0 && z.portal_attenuation.is_finite() {
             // Smooth separation: 0 when source & listener have equal membership in `z`,
             // smoothly ramping to 1 when one is inside (`w=1`) and the other is outside (`w=0`).
+            let sep = (wl - ws).abs();
+            portal = portal.max(sep * f64::from(z.portal_attenuation.clamp(0.0, 1.0)));
+        }
+    }
+    let base_w = (1.0 - wet_w).max(0.0);
+    let wet_scale = ((wet_sum + base_w) / (wet_w + base_w)) as f32;
+    (portal.clamp(0.0, 1.0) as f32, wet_scale)
+}
+
+/// Same as [`source_zone_acoustics`] using precomputed listener weights `listener_weights[i] == zone_weight(listener_pos, &zones[i])`.
+pub fn source_zone_acoustics_cached(
+    source_pos: [f32; 3],
+    explicit_zone: u32,
+    listener_weights: &[f64],
+    zones: &[pen_protocol::ReverbZone],
+) -> (f32, f32) {
+    if zones.is_empty() {
+        return (0.0, 1.0);
+    }
+    let mut portal = 0.0f64;
+    let mut wet_sum = 0.0f64;
+    let mut wet_w = 0.0f64;
+    for (z, &wl) in zones.iter().zip(listener_weights) {
+        let ws =
+            if explicit_zone != 0 { if z.id == explicit_zone { 1.0 } else { 0.0 } } else { zone_weight(source_pos, z) };
+        if ws > 0.0 {
+            let z_wet = if z.wet.is_finite() && z.wet > 0.0 { f64::from(z.wet.clamp(0.0, 2.0)) } else { 1.0 };
+            wet_sum += ws * z_wet;
+            wet_w += ws;
+        }
+        if z.id != 0 && z.portal_attenuation.is_finite() {
             let sep = (wl - ws).abs();
             portal = portal.max(sep * f64::from(z.portal_attenuation.clamp(0.0, 1.0)));
         }
@@ -596,7 +618,7 @@ mod tests {
             ],
         };
         let profile = AcousticProfile::from_extensions(&[ext]).expect("valid acoustics extension");
-        assert_eq!(profile.taps.len(), 2);
+        assert_eq!(profile.taps().len(), 2);
         assert!((profile.decay - 2.4).abs() < 1e-5);
 
         let rate = 48_000.0;
@@ -610,6 +632,13 @@ mod tests {
         assert!(e_left_l > e_left_r * 10.0, "left-wall reflection must pan strongly left: L={e_left_l}, R={e_left_r}");
 
         // Compare HF energy (first-difference RMS) of bright stone left tap vs muffled right tap!
+        let (bright_taps, bright_count) = AcousticProfile::pack_taps(&[AcousticTap {
+            delay_s: 0.010,
+            pan: 0.0,
+            gain_low: 0.7,
+            gain_mid: 0.7,
+            gain_high: 0.7,
+        }]);
         let bright_prof = AcousticProfile {
             decay: 0.5,
             damping: 0.3,
@@ -617,12 +646,17 @@ mod tests {
             early_gain: 1.0,
             late_gain: 0.0,
             outdoor: 1.0,
-            taps: vec![AcousticTap { delay_s: 0.010, pan: 0.0, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 }],
+            taps: bright_taps,
+            tap_count: bright_count,
         };
-        let dark_prof = AcousticProfile {
-            taps: vec![AcousticTap { delay_s: 0.010, pan: 0.0, gain_low: 0.7, gain_mid: 0.25, gain_high: 0.02 }],
-            ..bright_prof.clone()
-        };
+        let (dark_taps, dark_count) = AcousticProfile::pack_taps(&[AcousticTap {
+            delay_s: 0.010,
+            pan: 0.0,
+            gain_low: 0.7,
+            gain_mid: 0.25,
+            gain_high: 0.02,
+        }]);
+        let dark_prof = AcousticProfile { taps: dark_taps, tap_count: dark_count, ..bright_prof };
         let ir_bright = impulse_response_from_acoustics(rate, &bright_prof);
         let ir_dark = impulse_response_from_acoustics(rate, &dark_prof);
         let hf_win = (0.008 * rate) as usize..(0.025 * rate) as usize;
@@ -633,7 +667,7 @@ mod tests {
         );
 
         // Outdoor profile must strongly suppress late diffuse tail compared to enclosed room!
-        let mut outdoor_prof = profile.clone();
+        let mut outdoor_prof = profile;
         outdoor_prof.outdoor = 1.0;
         let ir_indoor = impulse_response_from_acoustics(rate, &profile);
         let ir_outdoor = impulse_response_from_acoustics(rate, &outdoor_prof);
@@ -647,7 +681,7 @@ mod tests {
         );
 
         // Hysteresis ignores tiny jitter, triggers on real room/tap shifts.
-        let mut jittered = profile.clone();
+        let mut jittered = profile;
         jittered.decay += 0.02;
         jittered.outdoor += 0.02;
         assert!(!profile.differs_significantly(&jittered));
@@ -657,6 +691,10 @@ mod tests {
     #[test]
     fn acoustic_hysteresis_detects_symmetric_width_spectral_shift_and_sanitizes_malformed_wire() {
         // Symmetric corridor (L/R taps at ±0.85) vs narrow center taps (±0.05): mean pan is 0 for both!
+        let (wide_taps, wide_count) = AcousticProfile::pack_taps(&[
+            AcousticTap { delay_s: 0.012, pan: -0.85, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
+            AcousticTap { delay_s: 0.012, pan: 0.85, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
+        ]);
         let wide_corridor = AcousticProfile {
             decay: 1.4,
             damping: 0.3,
@@ -664,32 +702,36 @@ mod tests {
             early_gain: 0.8,
             late_gain: 0.7,
             outdoor: 0.0,
-            taps: vec![
-                AcousticTap { delay_s: 0.012, pan: -0.85, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
-                AcousticTap { delay_s: 0.012, pan: 0.85, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
-            ],
+            taps: wide_taps,
+            tap_count: wide_count,
         };
-        let narrow_hall = AcousticProfile {
-            taps: vec![
-                AcousticTap { delay_s: 0.012, pan: -0.05, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
-                AcousticTap { delay_s: 0.012, pan: 0.05, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
-            ],
-            ..wide_corridor.clone()
-        };
+        let (narrow_taps, narrow_count) = AcousticProfile::pack_taps(&[
+            AcousticTap { delay_s: 0.012, pan: -0.05, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
+            AcousticTap { delay_s: 0.012, pan: 0.05, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
+        ]);
+        let narrow_hall = AcousticProfile { taps: narrow_taps, tap_count: narrow_count, ..wide_corridor };
         assert!(
             wide_corridor.differs_significantly(&narrow_hall),
             "hysteresis must detect stereo width change even when mean pan cancels to 0"
         );
 
         // Same mean energy (0.7) but bright stone vs muffled carpet HF/LF ratio.
-        let stone = AcousticProfile {
-            taps: vec![AcousticTap { delay_s: 0.012, pan: 0.0, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 }],
-            ..wide_corridor.clone()
-        };
-        let carpet = AcousticProfile {
-            taps: vec![AcousticTap { delay_s: 0.012, pan: 0.0, gain_low: 1.15, gain_mid: 0.8, gain_high: 0.15 }],
-            ..wide_corridor
-        };
+        let (stone_taps, stone_count) = AcousticProfile::pack_taps(&[AcousticTap {
+            delay_s: 0.012,
+            pan: 0.0,
+            gain_low: 0.7,
+            gain_mid: 0.7,
+            gain_high: 0.7,
+        }]);
+        let stone = AcousticProfile { taps: stone_taps, tap_count: stone_count, ..wide_corridor };
+        let (carpet_taps, carpet_count) = AcousticProfile::pack_taps(&[AcousticTap {
+            delay_s: 0.012,
+            pan: 0.0,
+            gain_low: 1.15,
+            gain_mid: 0.8,
+            gain_high: 0.15,
+        }]);
+        let carpet = AcousticProfile { taps: carpet_taps, tap_count: carpet_count, ..wide_corridor };
         assert!(
             stone.differs_significantly(&carpet),
             "hysteresis must detect HF/LF material coloration change at identical mean tap energy"
@@ -719,7 +761,7 @@ mod tests {
             ],
         };
         let parsed = AcousticProfile::from_extensions(&[hostile]).expect("sanitized fallback");
-        assert_eq!(parsed.taps.len(), 1);
+        assert_eq!(parsed.taps().len(), 1);
         let ir = impulse_response_from_acoustics(48_000.0, &parsed);
         assert!(ir[0].iter().chain(&ir[1]).all(|v| v.is_finite()));
     }

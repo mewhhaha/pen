@@ -197,6 +197,8 @@ struct Shell<'a> {
     capture: &'a mut Capture,
     overlay: Option<&'a mut Box<dyn Overlay>>,
     state_adapter: &'a Arc<dyn StateAdapter>,
+    cursor_visible: &'a mut Option<bool>,
+    measuring: bool,
 }
 
 impl Host for Shell<'_> {
@@ -209,7 +211,7 @@ impl Host for Shell<'_> {
     }
 
     fn render(&mut self, frame: &RenderFrame, catalog: &Catalog) -> Result<()> {
-        let started = Instant::now();
+        let started = self.measuring.then(Instant::now);
         self.gpu.draw_timings = Default::default();
         self.preferences.apply(&mut self.gpu.renderer)?;
         let capture = &mut *self.capture;
@@ -300,7 +302,10 @@ impl Host for Shell<'_> {
         } else {
             None
         };
-        gpu.draw_timings.render_ms = (started.elapsed().as_secs_f64() * 1000.0 - gpu.draw_timings.total_ms()).max(0.0);
+        if let Some(started) = started {
+            gpu.draw_timings.render_ms =
+                (started.elapsed().as_secs_f64() * 1000.0 - gpu.draw_timings.total_ms()).max(0.0);
+        }
         if let Some(texture) = clean_texture.as_ref().filter(|_| audited) {
             capture.audits.capture(gpu, texture, &frame.ui)?;
         }
@@ -336,7 +341,12 @@ impl Host for Shell<'_> {
         }
         self.input.apply_haptics(&frame.haptics);
         self.services.rendered(frame, catalog);
-        show_cursor(self.window, frame, self.overlay.as_ref().is_some_and(|overlay| overlay.wants_pointer()));
+        show_cursor(
+            self.window,
+            frame,
+            self.overlay.as_ref().is_some_and(|overlay| overlay.wants_pointer()),
+            self.cursor_visible,
+        );
         self.input.text_field(self.window, &frame.ui);
         if let Some(preferences) = &frame.preferences {
             self.preferences.store(preferences)?;
@@ -397,10 +407,14 @@ fn load_captions(assets: &Path) -> Captions {
 }
 
 /// The pointer shows unless the frame hides it, and always while the
-/// overlay wants it.
-fn show_cursor(window: Option<&Window>, frame: &RenderFrame, overlay: bool) {
+/// overlay wants it. Only notifies the window when visibility changes.
+fn show_cursor(window: Option<&Window>, frame: &RenderFrame, overlay: bool, cached: &mut Option<bool>) {
     if let Some(window) = window {
-        window.set_cursor_visible(!frame.hide_cursor || overlay);
+        let visible = !frame.hide_cursor || overlay;
+        if *cached != Some(visible) {
+            window.set_cursor_visible(visible);
+            *cached = Some(visible);
+        }
     }
 }
 
@@ -557,6 +571,11 @@ pub struct Session {
     /// The profile the game's guest is sampled into, while profiled.
     #[cfg(feature = "devtools")]
     sampling: Option<std::sync::Arc<blot_host::Profile>>,
+    /// Whether a sampling profile was attached to the running guest probe.
+    #[cfg(feature = "devtools")]
+    sampling_attached: bool,
+    /// Last cursor visibility applied to the OS window.
+    cursor_visible: Option<bool>,
     /// A net session this peer plays in (`crate::net`).
     net: Option<crate::net::Net>,
     /// Viewers this session streams to, and a stream it plays (`crate::spectate`).
@@ -591,6 +610,8 @@ macro_rules! shell {
             capture: &mut $session.capture,
             overlay: $session.overlay.as_mut(),
             state_adapter: &$session.state_adapter,
+            cursor_visible: &mut $session.cursor_visible,
+            measuring: $session.runtime.is_measuring(),
         }
     };
 }
@@ -701,6 +722,7 @@ impl Session {
         let worker_engine = engine.clone();
         let worker_deadlines = engine.get_epoch_interruption();
         let kernels = crate::kernels::KernelService::maybe_new(worker_engine.clone(), module.clone(), worker_deadlines);
+        let mut cursor_visible = None;
         let runtime = {
             let mut shell = Shell {
                 gpu: &mut gpu,
@@ -712,6 +734,8 @@ impl Session {
                 capture: &mut capture,
                 overlay: None,
                 state_adapter: &state_adapter,
+                cursor_visible: &mut cursor_visible,
+                measuring: false,
             };
             GameRuntime::new(
                 &engine,
@@ -789,6 +813,9 @@ impl Session {
             packets: pen_runtime::inspect::Packets::default(),
             #[cfg(feature = "devtools")]
             sampling: None,
+            #[cfg(feature = "devtools")]
+            sampling_attached: false,
+            cursor_visible,
             net: None,
             stream: None,
             watch: None,
@@ -1116,7 +1143,7 @@ impl Session {
     /// latest moment by then, and the frame it was kept at.
     pub fn kept_state(&self, seconds: f64) -> Option<(u64, SavedState)> {
         let position = self.timeline.frames_before(self.timeline.position(), seconds);
-        self.timeline.moment_before(position).map(|(at, moment)| (at, moment.saved.clone()))
+        self.timeline.moment_before(position).map(|(at, moment)| (at, moment.saved.as_ref().clone()))
     }
 
     #[cfg(feature = "devtools")]
@@ -1665,7 +1692,12 @@ impl Session {
                 write_png(&path, &pixels, texture.width(), texture.height(), gpu.bgra())?;
             }
         }
-        show_cursor(window, frame, self.overlay.as_ref().is_some_and(|overlay| overlay.wants_pointer()));
+        show_cursor(
+            window,
+            frame,
+            self.overlay.as_ref().is_some_and(|overlay| overlay.wants_pointer()),
+            &mut self.cursor_visible,
+        );
         match gpu.take_fault() {
             Some(fault) => Err(anyhow!(fault)),
             None => Ok(()),
@@ -1714,8 +1746,11 @@ impl Session {
         }
         // The guest running now (a rewind or reload starts another) is sampled while profiled.
         #[cfg(feature = "devtools")]
-        self.runtime.program().probe().attach(self.sampling.clone());
-        let started = Instant::now();
+        if self.sampling.is_some() || self.sampling_attached {
+            self.runtime.program().probe().attach(self.sampling.clone());
+            self.sampling_attached = self.sampling.is_some();
+        }
+        let started = self.runtime.is_measuring().then(Instant::now);
         #[cfg(feature = "compiler")]
         self.poll_dev();
         for event in self.gpu.renderer.take_events() {
@@ -1857,7 +1892,7 @@ impl Session {
         planned: Planned,
         rendered: RenderFrame,
         overlapped: bool,
-        started: Instant,
+        started: Option<Instant>,
     ) -> Result<bool> {
         self.capture.screenshots.extend(planned.shots);
         self.capture.overlay_shots.extend(planned.overlay_shots);
@@ -1995,8 +2030,11 @@ impl Session {
             stop |= self.replay_ended();
         }
         // Only while measured (a profile, or the dev tools' profiler).
-        let total_ms = started.elapsed().as_secs_f64() * 1000.0;
-        self.timings = self.runtime.last_timings().map(|timings| timings.completed(draw_timings, total_ms));
+        self.timings = self
+            .runtime
+            .last_timings()
+            .zip(started)
+            .map(|(timings, started)| timings.completed(draw_timings, started.elapsed().as_secs_f64() * 1000.0));
         if self.frame_times
             && let Some(timing) = &self.timings
         {

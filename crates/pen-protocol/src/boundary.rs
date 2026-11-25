@@ -100,6 +100,119 @@ pub fn canonical_render_packet(packet: &[f32]) -> Cow<'_, [f32]> {
     Cow::Owned(out)
 }
 
+/// Streams a canonical render packet (with `service::KERNEL` requests stripped and
+/// `exposure.cut` normalized to `0.0`) directly into FNV-1a without allocating.
+pub fn hash_canonical_render_packet(packet: &[f32]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut write_lane = |lane: f32| {
+        for byte in lane.to_bits().to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+        }
+    };
+    let cut_lane = lanes::header::EXPOSURE_CUT;
+    if packet.len() >= PACKET_HEADER_FLOATS
+        && packet[lanes::header::MAGIC] == PACKET_MAGIC
+        && let (Some(services_count), Some(services_lanes)) = (
+            whole(packet[lanes::header::SERVICE_COUNT]).map(|v| v as usize),
+            whole(packet[lanes::header::SERVICE_LANES]).map(|v| v as usize),
+        )
+        && services_count > 0
+        && services_lanes > 0
+    {
+        let count = |slot: usize| whole(packet[slot]).map(|v| v as usize);
+        let services_start = (|| -> Option<usize> {
+            let mut at = PACKET_HEADER_FLOATS;
+            at = at.checked_add(count(lanes::header::STATE_COUNT)?)?;
+            at = at.checked_add(count(lanes::header::DRAW_COUNT)?.checked_mul(DRAW_FLOATS)?)?;
+            at = at.checked_add(count(lanes::header::SOLID_LANES)?)?;
+            at = at.checked_add(count(lanes::header::DECAL_COUNT)?.checked_mul(DECAL_FLOATS)?)?;
+            at = at.checked_add(count(lanes::header::SOUND_COUNT)?.checked_mul(SOUND_FLOATS)?)?;
+            at = at.checked_add(count(lanes::header::SPRITE_COUNT)?.checked_mul(SPRITE_FLOATS)?)?;
+            at = at.checked_add(count(lanes::header::INSET_COUNT)?.checked_mul(INSET_FLOATS)?)?;
+            at = at.checked_add(count(lanes::header::INSET_DRAW_COUNT)?.checked_mul(DRAW_FLOATS)?)?;
+            at = at.checked_add(count(lanes::header::PREFERENCE_COUNT)?)?;
+            at = at.checked_add(count(lanes::header::FIELD_LANES)?)?;
+            at = at.checked_add(count(lanes::header::UI_LANES)?)?;
+            Some(at)
+        })();
+        if let Some(services_start) = services_start
+            && let Some(services_end) = services_start.checked_add(services_lanes)
+            && services_end <= packet.len()
+        {
+            let mut cursor = services_start;
+            let mut kept_count = 0usize;
+            let mut kept_lanes = 0usize;
+            let mut has_kernel = false;
+            let mut valid = true;
+            for _ in 0..services_count {
+                if cursor + SERVICE_REQUEST_FLOATS > services_end {
+                    valid = false;
+                    break;
+                }
+                let Some(service_code) = whole(packet[cursor + lanes::service_request::SERVICE]) else {
+                    valid = false;
+                    break;
+                };
+                let Some(value_count) = whole(packet[cursor + lanes::service_request::VALUE_COUNT]).map(|v| v as usize)
+                else {
+                    valid = false;
+                    break;
+                };
+                let Some(end) = cursor.checked_add(SERVICE_REQUEST_FLOATS).and_then(|v| v.checked_add(value_count))
+                else {
+                    valid = false;
+                    break;
+                };
+                if end > services_end {
+                    valid = false;
+                    break;
+                }
+                if service_code == service::KERNEL {
+                    has_kernel = true;
+                } else {
+                    kept_count += 1;
+                    kept_lanes += end - cursor;
+                }
+                cursor = end;
+            }
+            if valid && cursor == services_end && has_kernel {
+                for (index, &lane) in packet[..services_start].iter().enumerate() {
+                    let value = if index == cut_lane {
+                        0.0
+                    } else if index == lanes::header::SERVICE_COUNT {
+                        kept_count as f32
+                    } else if index == lanes::header::SERVICE_LANES {
+                        kept_lanes as f32
+                    } else {
+                        lane
+                    };
+                    write_lane(value);
+                }
+                let mut cursor = services_start;
+                for _ in 0..services_count {
+                    let service_code = whole(packet[cursor + lanes::service_request::SERVICE]).unwrap();
+                    let value_count = whole(packet[cursor + lanes::service_request::VALUE_COUNT]).unwrap() as usize;
+                    let end = cursor + SERVICE_REQUEST_FLOATS + value_count;
+                    if service_code != service::KERNEL {
+                        for &lane in &packet[cursor..end] {
+                            write_lane(lane);
+                        }
+                    }
+                    cursor = end;
+                }
+                for &lane in &packet[services_end..] {
+                    write_lane(lane);
+                }
+                return hash;
+            }
+        }
+    }
+    for (index, &lane) in packet.iter().enumerate() {
+        write_lane(if index == cut_lane { 0.0 } else { lane });
+    }
+    hash
+}
+
 /// The whole number a lane holds (an id, count, index or code point), or
 /// None for a fraction, a negative, a non-finite value or one past u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "checked whole and in range")]
@@ -541,5 +654,27 @@ mod tests {
         assert_eq!(decoded.render.services[1].request, 0x800000);
         assert_eq!(decoded.render.buses.len(), 1);
         assert_eq!(decoded.render.buses[0].gain, 0.75);
+
+        // Streaming zero-alloc hashes match the allocating FNV-1a walks bit-for-bit,
+        // including exposure.cut normalization and kernel-service stripping.
+        let mut mixed_with_cut = mixed.clone();
+        mixed_with_cut[lanes::header::EXPOSURE_CUT] = 1.0;
+        let fnv = |lanes: &[f32]| -> u64 {
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            for lane in lanes {
+                for byte in lane.to_bits().to_le_bytes() {
+                    hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+                }
+            }
+            hash
+        };
+        let expected_packet_hash = fnv(&canonical_only);
+        assert_eq!(hash_canonical_render_packet(&canonical_only), expected_packet_hash);
+        assert_eq!(hash_canonical_render_packet(&mixed), expected_packet_hash);
+        assert_eq!(hash_canonical_render_packet(&mixed_with_cut), expected_packet_hash);
+        assert_eq!(
+            hash_canonical_render(&decoded.render, 3, &[1.5, -2.0]),
+            fnv(&canonical_render(&decoded.render, 3, &[1.5, -2.0]))
+        );
     }
 }

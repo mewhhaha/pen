@@ -188,24 +188,38 @@ impl RelayPacket {
 #[derive(Default, Debug)]
 pub struct FrameDecoder {
     buffer: Vec<u8>,
+    read_pos: usize,
 }
 
 impl FrameDecoder {
     pub fn push(&mut self, chunk: &[u8]) {
+        if self.read_pos == self.buffer.len() {
+            self.buffer.clear();
+            self.read_pos = 0;
+        }
         self.buffer.extend_from_slice(chunk);
     }
 
     pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>> {
-        if self.buffer.len() < 2 {
+        let available = self.buffer.len() - self.read_pos;
+        if available < 2 {
             return Ok(None);
         }
-        let len = usize::from(u16::from_le_bytes([self.buffer[0], self.buffer[1]]));
+        let len = usize::from(u16::from_le_bytes([self.buffer[self.read_pos], self.buffer[self.read_pos + 1]]));
         ensure!(len <= MAX_FRAME_BYTES, "incoming relay frame too large ({len} bytes)");
-        if self.buffer.len() < 2 + len {
+        if available < 2 + len {
             return Ok(None);
         }
-        let payload = self.buffer[2..2 + len].to_vec();
-        self.buffer.drain(..2 + len);
+        let start = self.read_pos + 2;
+        let payload = self.buffer[start..start + len].to_vec();
+        self.read_pos = start + len;
+        if self.read_pos == self.buffer.len() {
+            self.buffer.clear();
+            self.read_pos = 0;
+        } else if self.read_pos >= 8192 {
+            self.buffer.drain(..self.read_pos);
+            self.read_pos = 0;
+        }
         Ok(Some(payload))
     }
 }
@@ -227,6 +241,7 @@ pub struct ChannelLink<T: Transport> {
     joined: bool,
     last_ack: Option<u32>,
     inbox: VecDeque<(usize, Vec<u8>)>,
+    tx_buf: Vec<u8>,
 }
 
 impl<T: Transport> ChannelLink<T> {
@@ -246,6 +261,7 @@ impl<T: Transport> ChannelLink<T> {
             joined: false,
             last_ack: None,
             inbox: VecDeque::new(),
+            tx_buf: Vec::with_capacity(super::wire::DATAGRAM_BYTES + 3),
         })
     }
 
@@ -308,9 +324,16 @@ impl<T: Transport> ChannelLink<T> {
 impl<T: Transport> Link for ChannelLink<T> {
     fn send(&mut self, player: usize, bytes: &[u8]) {
         let Ok(to) = u8::try_from(player) else { return };
-        if let Ok(encoded) = (RelayPacket::Forward { from: self.player, to, payload: bytes.to_vec() }).encode() {
-            self.transport.send_frame(&encoded);
+        if bytes.len() + 3 > MAX_FRAME_BYTES {
+            return;
         }
+        self.tx_buf.clear();
+        self.tx_buf.reserve(3 + bytes.len());
+        self.tx_buf.push(TAG_FORWARD);
+        self.tx_buf.push(self.player);
+        self.tx_buf.push(to);
+        self.tx_buf.extend_from_slice(bytes);
+        self.transport.send_frame(&self.tx_buf);
     }
 
     fn receive(&mut self) -> Option<(usize, Vec<u8>)> {
@@ -362,11 +385,8 @@ impl RelayBroker {
                 }
                 // Remove any prior room/slot membership for this client atomically.
                 self.disconnect(client);
-                let entry = self.rooms.entry(room.clone()).or_insert_with(|| Room {
-                    players,
-                    token,
-                    members: HashMap::new(),
-                });
+                let entry =
+                    self.rooms.entry(room.clone()).or_insert_with(|| Room { players, token, members: HashMap::new() });
                 entry.members.insert(player, client);
                 self.membership.insert(client, (room, player));
                 vec![(client, RelayPacket::Joined { player, players })]
@@ -543,9 +563,15 @@ mod tests {
     #[test]
     fn relay_broker_joins_atomically_rejects_slot_hijack_and_bounds_room_list() {
         let mut broker = RelayBroker::new();
-        assert!(!broker.handle(1, RelayPacket::Join { room: "alpha".into(), player: 0, players: 2, token: 5 }).is_empty());
-        assert!(broker.handle(2, RelayPacket::Join { room: "alpha".into(), player: 0, players: 2, token: 5 }).is_empty());
-        assert!(!broker.handle(1, RelayPacket::Join { room: "beta".into(), player: 1, players: 2, token: 9 }).is_empty());
+        assert!(
+            !broker.handle(1, RelayPacket::Join { room: "alpha".into(), player: 0, players: 2, token: 5 }).is_empty()
+        );
+        assert!(
+            broker.handle(2, RelayPacket::Join { room: "alpha".into(), player: 0, players: 2, token: 5 }).is_empty()
+        );
+        assert!(
+            !broker.handle(1, RelayPacket::Join { room: "beta".into(), player: 1, players: 2, token: 9 }).is_empty()
+        );
         assert_eq!(broker.room_count(), 1);
         assert_eq!(broker.list_rooms()[0].room, "beta");
         for i in 0..400u32 {

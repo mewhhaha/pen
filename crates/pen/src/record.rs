@@ -47,6 +47,8 @@ struct Offline {
     written: usize,
     /// One frame's samples, reused.
     samples: Vec<[f32; 2]>,
+    /// Packed little-endian PCM bytes for one bulk write per frame.
+    pcm_bytes: Vec<u8>,
 }
 
 impl Offline {
@@ -59,6 +61,7 @@ impl Offline {
             file: BufWriter::new(file),
             written: 0,
             samples: Vec::new(),
+            pcm_bytes: Vec::new(),
         })
     }
 
@@ -72,9 +75,13 @@ impl Offline {
         self.mixer.apply(mix);
         self.samples.resize(due.saturating_sub(self.written), [0.0; 2]);
         self.mixer.render(&mut self.samples);
-        for sample in self.samples.iter().flatten() {
-            self.file.write_all(&sample.to_le_bytes())?;
+        self.pcm_bytes.clear();
+        self.pcm_bytes.reserve(self.samples.len() * 8);
+        for &[left, right] in &self.samples {
+            self.pcm_bytes.extend_from_slice(&left.to_le_bytes());
+            self.pcm_bytes.extend_from_slice(&right.to_le_bytes());
         }
+        self.file.write_all(&self.pcm_bytes)?;
         self.written += self.samples.len();
         Ok(())
     }

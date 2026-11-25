@@ -96,14 +96,14 @@ pub struct Inputs {
     pub frames: Vec<Vec<f32>>,
 }
 
-struct Writer(Vec<u8>);
+struct Writer<'a>(&'a mut Vec<u8>);
 
-impl Writer {
-    fn new(kind: u8) -> Writer {
-        let mut bytes = Vec::with_capacity(DATAGRAM_BYTES);
-        bytes.extend_from_slice(&MAGIC);
-        bytes.extend_from_slice(&[VERSION, kind]);
-        Writer(bytes)
+impl<'a> Writer<'a> {
+    fn begin(out: &'a mut Vec<u8>, kind: u8) -> Writer<'a> {
+        out.clear();
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&[VERSION, kind]);
+        Writer(out)
     }
 
     fn u8(&mut self, value: u8) {
@@ -125,6 +125,54 @@ impl Writer {
     fn f32(&mut self, value: f32) {
         self.0.extend_from_slice(&value.to_le_bytes());
     }
+}
+
+/// Header fields of an [`Inputs`] datagram, for zero-allocation encoding.
+#[derive(Clone, Copy, Debug)]
+pub struct InputHeader {
+    pub session: u32,
+    pub player: u8,
+    pub frame: u32,
+    pub ack: u32,
+    pub stamp: u32,
+    pub echo: u32,
+    pub held: u32,
+    pub checked: u32,
+    pub hash: u64,
+    pub first: u32,
+}
+
+/// Encodes an [`Message::Input`] directly into `out` from borrowed frame slices.
+pub fn encode_input_into<'a>(out: &mut Vec<u8>, header: InputHeader, frames: impl ExactSizeIterator<Item = &'a [f32]>) {
+    let mut w = Writer::begin(out, INPUT);
+    w.u32(header.session);
+    w.u8(header.player);
+    w.u32(header.frame);
+    w.u32(header.ack);
+    w.u32(header.stamp);
+    w.u32(header.echo);
+    w.u32(header.held);
+    w.u32(header.checked);
+    w.u64(header.hash);
+    w.u32(header.first);
+    w.u8(u8::try_from(frames.len()).expect("at most MAX_FRAMES frames"));
+    for records in frames {
+        w.u16(u16::try_from(records.len() / RECORD).expect("at most MAX_FRAME_EVENTS events"));
+        w.0.reserve(records.len() * 4);
+        for lane in records {
+            w.f32(*lane);
+        }
+    }
+}
+
+/// Encodes a [`Message::Moment`] chunk directly into `out` without cloning `bytes`.
+pub fn encode_moment_chunk_into(out: &mut Vec<u8>, session: u32, total: u32, offset: u32, bytes: &[u8]) {
+    let mut w = Writer::begin(out, MOMENT);
+    w.u32(session);
+    w.u32(total);
+    w.u32(offset);
+    w.u16(u16::try_from(bytes.len()).expect("a chunk of at most CHUNK_BYTES"));
+    w.0.extend_from_slice(bytes);
 }
 
 struct Reader<'a> {
@@ -179,9 +227,15 @@ pub fn frame_bytes(records: &[f32]) -> usize {
 
 impl Message {
     pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(DATAGRAM_BYTES);
+        self.encode_into(&mut out);
+        out
+    }
+
+    pub fn encode_into(&self, buffer: &mut Vec<u8>) {
         match self {
             Message::Hello(hello) => {
-                let mut out = Writer::new(HELLO);
+                let mut out = Writer::begin(buffer, HELLO);
                 out.u32(hello.session);
                 out.u8(hello.player);
                 out.u8(hello.players);
@@ -193,43 +247,32 @@ impl Message {
                 out.u64(hello.build);
                 out.u64(hello.start);
                 out.u32(hello.heard);
-                out.0
             }
             Message::Input(inputs) => {
-                let mut out = Writer::new(INPUT);
-                out.u32(inputs.session);
-                out.u8(inputs.player);
-                out.u32(inputs.frame);
-                out.u32(inputs.ack);
-                out.u32(inputs.stamp);
-                out.u32(inputs.echo);
-                out.u32(inputs.held);
-                out.u32(inputs.checked);
-                out.u64(inputs.hash);
-                out.u32(inputs.first);
-                out.u8(u8::try_from(inputs.frames.len()).expect("at most MAX_FRAMES frames"));
-                for records in &inputs.frames {
-                    out.u16(u16::try_from(records.len() / RECORD).expect("at most MAX_FRAME_EVENTS events"));
-                    for lane in records {
-                        out.f32(*lane);
-                    }
-                }
-                out.0
+                encode_input_into(
+                    buffer,
+                    InputHeader {
+                        session: inputs.session,
+                        player: inputs.player,
+                        frame: inputs.frame,
+                        ack: inputs.ack,
+                        stamp: inputs.stamp,
+                        echo: inputs.echo,
+                        held: inputs.held,
+                        checked: inputs.checked,
+                        hash: inputs.hash,
+                        first: inputs.first,
+                    },
+                    inputs.frames.iter().map(Vec::as_slice),
+                );
             }
             Message::Moment { session, total, offset, bytes } => {
-                let mut out = Writer::new(MOMENT);
-                out.u32(*session);
-                out.u32(*total);
-                out.u32(*offset);
-                out.u16(u16::try_from(bytes.len()).expect("a chunk of at most CHUNK_BYTES"));
-                out.0.extend_from_slice(bytes);
-                out.0
+                encode_moment_chunk_into(buffer, *session, *total, *offset, bytes);
             }
             Message::Bye { session, player } => {
-                let mut out = Writer::new(BYE);
+                let mut out = Writer::begin(buffer, BYE);
                 out.u32(*session);
                 out.u8(*player);
-                out.0
             }
         }
     }
@@ -291,13 +334,16 @@ impl Message {
 /// another: the state's schema and lanes, then the edit history's scenes
 /// and which is current (+1, 0 for none).
 pub fn encode_moment(moment: &Moment) -> Vec<u8> {
-    let lanes = |out: &mut Writer, lanes: &[f32]| {
+    let lanes = |out: &mut Writer<'_>, lanes: &[f32]| {
         out.u32(u32::try_from(lanes.len()).expect("states are bounded below 2^24 lanes"));
+        out.0.reserve(lanes.len() * 4);
         for lane in lanes {
             out.f32(*lane);
         }
     };
-    let mut out = Writer::new(MOMENT);
+    let scenes_bytes: usize = moment.edits.scenes.iter().map(|scene| 4 + scene.len() * 4).sum();
+    let mut buffer = Vec::with_capacity(6 + 4 + 4 + moment.saved.state.len() * 4 + 8 + scenes_bytes);
+    let mut out = Writer::begin(&mut buffer, MOMENT);
     out.u32(moment.saved.schema);
     lanes(&mut out, &moment.saved.state);
     out.u32(u32::try_from(moment.edits.scenes.len()).expect("the edit history is bounded"));
@@ -305,7 +351,7 @@ pub fn encode_moment(moment: &Moment) -> Vec<u8> {
     for scene in &moment.edits.scenes {
         lanes(&mut out, scene);
     }
-    out.0
+    buffer
 }
 
 pub fn decode_moment(bytes: &[u8]) -> Result<Moment> {
@@ -314,7 +360,8 @@ pub fn decode_moment(bytes: &[u8]) -> Result<Moment> {
     let lanes = |input: &mut Reader| -> Result<Vec<f32>> {
         let count = input.u32()? as usize;
         ensure!(count <= MAX_STATE_FLOATS, "moment holds an oversized state");
-        let lanes = (0..count).map(|_| input.f32()).collect::<Result<Vec<f32>>>()?;
+        let raw = input.take(count * 4)?;
+        let lanes: Vec<f32> = raw.as_chunks::<4>().0.iter().map(|chunk| f32::from_le_bytes(*chunk)).collect();
         validate_state(&lanes)?;
         Ok(lanes)
     };
@@ -324,7 +371,7 @@ pub fn decode_moment(bytes: &[u8]) -> Result<Moment> {
     ensure!(count <= MAX_SCENES && step <= count, "moment holds an invalid edit history");
     let scenes = (0..count).map(|_| lanes(&mut input).map(Arc::from)).collect::<Result<Vec<Arc<[f32]>>>>()?;
     input.done()?;
-    Ok(Moment { saved: SavedState { schema, state }, edits: Edits { scenes, step: step.checked_sub(1) } })
+    Ok(Moment { saved: Arc::new(SavedState { schema, state }), edits: Edits { scenes, step: step.checked_sub(1) } })
 }
 
 /// FNV-1a over bytes: a moment's or a build's hash, the same on every peer.
@@ -421,13 +468,13 @@ mod tests {
     fn moments_round_trip() {
         let scenes: Vec<Arc<[f32]>> = vec![vec![4.0].into(), vec![5.0, 6.0].into()];
         let moment = Moment {
-            saved: SavedState { schema: 26, state: vec![1.0, -2.5, 3.25] },
+            saved: Arc::new(SavedState { schema: 26, state: vec![1.0, -2.5, 3.25] }),
             edits: Edits { scenes, step: Some(1) },
         };
         let bytes = encode_moment(&moment);
         assert_eq!(decode_moment(&bytes).unwrap(), moment);
         assert!(decode_moment(&bytes[..bytes.len() - 2]).is_err());
-        let empty = Moment { saved: SavedState { schema: 1, state: Vec::new() }, edits: Edits::default() };
+        let empty = Moment { saved: Arc::new(SavedState { schema: 1, state: Vec::new() }), edits: Edits::default() };
         assert_eq!(decode_moment(&encode_moment(&empty)).unwrap(), empty);
         assert_ne!(hash_bytes(&bytes), hash_bytes(&encode_moment(&empty)));
     }

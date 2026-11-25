@@ -7,7 +7,7 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use pen_runtime::recording::{encode_frame, encode_moment};
+use pen_runtime::recording::{encode_frame_into, encode_moment};
 
 use crate::game::Moment;
 use crate::timeline::{Recorded, Recording};
@@ -26,11 +26,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Recording> {
 
 /// A recording, its moment and all its frames, as a file holds it.
 pub fn encode(recording: &Recording) -> Vec<u8> {
-    let mut bytes = encode_moment(&recording.start);
-    for frame in &recording.frames {
-        bytes.extend(encode_frame(frame));
-    }
-    bytes
+    pen_runtime::recording::encode(recording)
 }
 
 /// Reads a recording, or the one a bug report (`bugreport`) holds.
@@ -58,6 +54,7 @@ pub struct Writer {
     /// Where each frame starts in the file.
     starts: Vec<u64>,
     length: u64,
+    scratch: Vec<u8>,
 }
 
 impl Writer {
@@ -69,14 +66,22 @@ impl Writer {
         let header = encode_moment(start);
         let mut file = BufWriter::new(File::create(path).with_context(|| format!("writing {}", path.display()))?);
         file.write_all(&header)?;
-        Ok(Writer { path: path.to_owned(), file, first: position, starts: Vec::new(), length: header.len() as u64 })
+        Ok(Writer {
+            path: path.to_owned(),
+            file,
+            first: position,
+            starts: Vec::new(),
+            length: header.len() as u64,
+            scratch: Vec::with_capacity(256),
+        })
     }
 
     pub fn frame(&mut self, recorded: &Recorded) -> Result<()> {
-        let bytes = encode_frame(recorded);
+        self.scratch.clear();
+        encode_frame_into(&mut self.scratch, recorded);
         self.starts.push(self.length);
-        self.file.write_all(&bytes).with_context(|| format!("writing {}", self.path.display()))?;
-        self.length += bytes.len() as u64;
+        self.file.write_all(&self.scratch).with_context(|| format!("writing {}", self.path.display()))?;
+        self.length += self.scratch.len() as u64;
         Ok(())
     }
 
@@ -112,7 +117,7 @@ mod tests {
         let saved = SavedState { schema: 7, state: vec![1.0, -2.5, 3.25] };
         let scenes: Vec<Arc<[f32]>> = vec![vec![4.0].into(), vec![5.0, 6.0].into()];
         Recording {
-            start: Moment { saved: saved.clone(), edits: Edits { scenes, step: Some(1) } },
+            start: Moment { saved: Arc::new(saved.clone()), edits: Edits { scenes, step: Some(1) } },
             frames: vec![
                 Recorded { input: vec![0.0, 960.0, 640.0, 0.0, 0.0], ..Recorded::default() },
                 Recorded {

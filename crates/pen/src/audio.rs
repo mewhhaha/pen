@@ -65,6 +65,64 @@ pub fn decode(path: &Path, rate: f64) -> Result<Arc<Clip>> {
     Ok(Arc::new(load_clip(path)?).at_rate(rate))
 }
 
+/// Populates `out` with a frame's sound using a pre-indexed clip lookup table,
+/// reusing `out`'s vector capacities across frames.
+fn mix_into(frame: &RenderFrame, clips_by_id: &[Option<Arc<Clip>>], out: &mut Mix) {
+    let placements = Placements::of(frame);
+    let zone = placements.zone_mix();
+    out.reverb_decay = zone.decay;
+    out.reverb_damping = zone.damping;
+    out.acoustics = placements.acoustics().copied();
+    out.synths.clear();
+    out.synths.extend(frame.synths.iter().map(pen_runtime::synth::SynthSpec::from_wire));
+    out.buses.clear();
+    out.buses.extend(frame.buses.iter().map(|bus| BusSpec {
+        gain: bus.gain,
+        lowpass: bus.lowpass,
+        reverb: bus.reverb,
+        comp_threshold: bus.comp_threshold,
+        comp_ratio: bus.comp_ratio,
+        duck_bus: bus.duck_bus as usize,
+        duck_amount: bus.duck_amount,
+        eq_low_db: bus.eq_low_db,
+        eq_mid_db: bus.eq_mid_db,
+        eq_high_db: bus.eq_high_db,
+    }));
+    out.voices.clear();
+    out.voices.extend(frame.voices.iter().filter_map(|voice| {
+        let clip = clips_by_id.get(voice.clip as usize)?.as_ref()?.clone();
+        Some(VoiceSpec {
+            id: voice.id,
+            clip,
+            bus: voice.bus as usize,
+            gain: voice.gain,
+            pan: voice.pan,
+            pitch: voice.pitch,
+            lowpass: voice.lowpass,
+            reverb: voice.reverb,
+            looping: voice.looping,
+            start: voice.start,
+            fade_in: voice.fade_in,
+            fade_out: voice.fade_out,
+            panner: placements.voice(voice.id),
+        })
+    }));
+    out.sounds.clear();
+    out.sounds.extend(frame.sounds.iter().enumerate().filter_map(|(index, sound)| {
+        let clip = clips_by_id.get(sound.clip as usize)?.as_ref()?.clone();
+        Some(SoundSpec {
+            clip,
+            bus: sound.bus as usize,
+            gain: sound.gain,
+            pan: sound.pan,
+            pitch: sound.pitch,
+            lowpass: sound.lowpass,
+            reverb: sound.reverb,
+            panner: placements.sound(index),
+        })
+    }));
+}
+
 /// A frame's sound for the mixer, with the decoded clips it plays; voices
 /// and sounds whose clip is not among them are left out.
 pub fn mix(frame: &RenderFrame, catalog: &Catalog, clips: &HashMap<String, Arc<Clip>>) -> Mix {
@@ -74,7 +132,7 @@ pub fn mix(frame: &RenderFrame, catalog: &Catalog, clips: &HashMap<String, Arc<C
     Mix {
         reverb_decay: zone.decay,
         reverb_damping: zone.damping,
-        acoustics: placements.acoustics().cloned(),
+        acoustics: placements.acoustics().copied(),
         synths: frame.synths.iter().map(pen_runtime::synth::SynthSpec::from_wire).collect(),
         buses: frame
             .buses
@@ -284,6 +342,12 @@ pub struct Audio {
     /// The output device, playing the mixer while it lives.
     _device: device::Device,
     clips: HashMap<String, Arc<Clip>>,
+    /// Direct sound-index -> clip table synced against `catalog_sounds`.
+    clips_by_id: Vec<Option<Arc<Clip>>>,
+    catalog_sounds: Vec<String>,
+    clips_dirty: bool,
+    /// Recycled `Mix` returned by the audio thread to avoid per-frame allocations.
+    spare_mix: Option<Mix>,
     /// The rate the clips are decoded for, and the output's.
     decoded_at: f64,
     rate: Rate,
@@ -326,6 +390,10 @@ impl Audio {
         let mut audio = Audio {
             _device: device,
             clips: HashMap::new(),
+            clips_by_id: Vec::new(),
+            catalog_sounds: Vec::new(),
+            clips_dirty: true,
+            spare_mix: None,
             decoded_at,
             rate,
             requests,
@@ -378,12 +446,25 @@ impl Audio {
             match result {
                 Ok(clip) => {
                     self.clips.insert(key, clip);
+                    self.clips_dirty = true;
                 }
                 Err(message) => eprintln!("{message}"),
             }
         }
-        // Mixes the audio thread is done with, freed here.
-        while self.applied.try_recv().is_ok() {}
+        // Mixes the audio thread is done with: recycle one and drop any extras here.
+        while let Ok(returned) = self.applied.try_recv() {
+            self.spare_mix = Some(returned);
+        }
+    }
+
+    fn sync_clip_table(&mut self, catalog: &Catalog) {
+        if !self.clips_dirty && self.catalog_sounds == catalog.sounds {
+            return;
+        }
+        self.catalog_sounds.clone_from(&catalog.sounds);
+        self.clips_by_id.clear();
+        self.clips_by_id.extend(catalog.sounds.iter().map(|key| self.clips.get(key).cloned()));
+        self.clips_dirty = false;
     }
 
     /// The mix as it plays, for the dev tools; its meters start again.
@@ -417,10 +498,19 @@ impl Audio {
 
     pub fn frame(&mut self, frame: &RenderFrame, catalog: &Catalog) {
         self.receive();
+        self.sync_clip_table(catalog);
+        let mut built = self.spare_mix.take().unwrap_or_default();
+        mix_into(frame, &self.clips_by_id, &mut built);
         // A full queue means the audio thread is stalled; the next frame
         // declares everything again (only its sounds played once are lost).
-        if let Err(TrySendError::Disconnected(_)) = self.mixes.try_send(mix(frame, catalog, &self.clips)) {
-            eprintln!("the audio output stopped");
+        match self.mixes.try_send(built) {
+            Ok(()) => {}
+            Err(TrySendError::Full(returned)) => {
+                self.spare_mix = Some(returned);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                eprintln!("the audio output stopped");
+            }
         }
     }
 }

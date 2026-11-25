@@ -306,19 +306,38 @@ impl Decoding {
 
     /// Fills `slot`'s ring as far as it has room; whether it wrote any.
     fn fill(&mut self, slot: &Slot) -> anyhow::Result<bool> {
+        const BATCH: usize = 128;
         let mut wrote = false;
+        let mut pending = 0usize;
+        let mut read = slot.read.load(Ordering::Acquire);
         loop {
-            let read = slot.read.load(Ordering::Acquire);
             if self.next >= read + CAPACITY {
-                return Ok(wrote);
+                read = slot.read.load(Ordering::Acquire);
+                if self.next >= read + CAPACITY {
+                    if pending > 0 {
+                        slot.written.store(self.next, Ordering::Release);
+                    }
+                    return Ok(wrote);
+                }
             }
             if self.output == self.length {
                 if !slot.looping.load(Ordering::Relaxed) || self.length == 0 {
+                    if pending > 0 {
+                        slot.written.store(self.next, Ordering::Release);
+                    }
                     return Ok(wrote);
                 }
                 self.again()?;
             }
-            let frame = self.frame()?;
+            let frame = match self.frame() {
+                Ok(frame) => frame,
+                Err(error) => {
+                    if pending > 0 {
+                        slot.written.store(self.next, Ordering::Release);
+                    }
+                    return Err(error);
+                }
+            };
             self.output += 1;
             if self.skip > 0 {
                 self.skip -= 1;
@@ -329,8 +348,13 @@ impl Decoding {
                 slot.frames[(self.next % CAPACITY) as usize].store(pack(frame), Ordering::Relaxed);
             }
             self.next += 1;
-            slot.written.store(self.next, Ordering::Release);
+            pending += 1;
             wrote = true;
+            if pending >= BATCH {
+                slot.written.store(self.next, Ordering::Release);
+                read = slot.read.load(Ordering::Acquire);
+                pending = 0;
+            }
         }
     }
 }

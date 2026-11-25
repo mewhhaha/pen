@@ -45,6 +45,7 @@ fn put_u32(out: &mut Vec<u8>, value: usize) {
 }
 
 fn put_lanes(out: &mut Vec<u8>, lanes: &[f32]) {
+    out.reserve(4 + lanes.len() * 4);
     put_u32(out, lanes.len());
     for lane in lanes {
         out.extend_from_slice(&lane.to_le_bytes());
@@ -217,12 +218,14 @@ impl Broadcast {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::game::Edits;
     use crate::timeline::Recording;
 
     fn moment(value: f32) -> Moment {
-        Moment { saved: SavedState { schema: 1, state: vec![value] }, edits: Edits::default() }
+        Moment { saved: Arc::new(SavedState { schema: 1, state: vec![value] }), edits: Edits::default() }
     }
 
     fn frame(key: f32) -> Recorded {

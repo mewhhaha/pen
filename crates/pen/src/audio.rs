@@ -74,6 +74,7 @@ pub fn mix(frame: &RenderFrame, catalog: &Catalog, clips: &HashMap<String, Arc<C
     Mix {
         reverb_decay: zone.decay,
         reverb_damping: zone.damping,
+        acoustics: placements.acoustics().cloned(),
         synths: frame.synths.iter().map(pen_runtime::synth::SynthSpec::from_wire).collect(),
         buses: frame
             .buses

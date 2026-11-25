@@ -17,7 +17,7 @@ use super::mixer::QUANTUM;
 
 #[cfg(test)]
 pub use pen_runtime::reverb::impulse_response;
-pub use pen_runtime::reverb::impulse_response_for;
+pub use pen_runtime::reverb::{AcousticProfile, impulse_response_for, impulse_response_from_acoustics};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Complex {
@@ -230,7 +230,14 @@ impl Convolver {
     }
 
     pub fn with_room(rate: f64, decay: f64, damping: f64) -> Convolver {
-        let response = impulse_response_for(rate, decay, damping);
+        Self::from_response(impulse_response_for(rate, decay, damping))
+    }
+
+    pub fn with_acoustics(rate: f64, profile: &AcousticProfile) -> Convolver {
+        Self::from_response(impulse_response_from_acoustics(rate, profile))
+    }
+
+    fn from_response(response: [Vec<f32>; 2]) -> Convolver {
         let length = response[0].len();
         let split_at = TAIL_BLOCK.min(length);
         Convolver {

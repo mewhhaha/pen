@@ -294,12 +294,14 @@ impl Placement {
 
 /// A frame's panners by what they place, in its listener's frame: the first
 /// for each voice id, and for each sound by its place in the frame's
-/// `sounds`, plus the listener's blended [`crate::reverb::ZoneMix`].
+/// `sounds`, plus the listener's blended [`crate::reverb::ZoneMix`] and any
+/// ray-traced [`crate::reverb::AcousticProfile`].
 #[derive(Debug)]
 pub struct Placements {
     voices: HashMap<u32, Placement>,
     sounds: Vec<Option<Placement>>,
     zone_mix: crate::reverb::ZoneMix,
+    acoustics: Option<crate::reverb::AcousticProfile>,
 }
 
 impl Default for Placements {
@@ -308,6 +310,7 @@ impl Default for Placements {
             voices: HashMap::new(),
             sounds: Vec::new(),
             zone_mix: crate::reverb::ZoneMix { decay: 0.0, damping: 0.0, wet_scale: 1.0, dominant_zone: 0 },
+            acoustics: None,
         }
     }
 }
@@ -321,6 +324,7 @@ impl Placements {
             frame.reverb.damping,
             &frame.reverb_zones,
         );
+        let acoustics = crate::reverb::AcousticProfile::from_extensions(&frame.extensions);
         let placed = |panner: &Panner| {
             let mut p = Placement::new(panner);
             let (portal, wet_scale) = crate::reverb::source_zone_acoustics(
@@ -337,6 +341,7 @@ impl Placements {
             voices: HashMap::new(),
             sounds: vec![None; frame.sounds.len()],
             zone_mix,
+            acoustics,
         };
         for panner in &frame.panners {
             if panner.voice != 0 {
@@ -350,6 +355,10 @@ impl Placements {
 
     pub fn zone_mix(&self) -> crate::reverb::ZoneMix {
         self.zone_mix
+    }
+
+    pub fn acoustics(&self) -> Option<&crate::reverb::AcousticProfile> {
+        self.acoustics.as_ref()
     }
 
     pub fn voice(&self, id: u32) -> Option<Placement> {

@@ -339,6 +339,7 @@ pub struct Audio {
     reverb_switch_ready: f64,
     reverb_return: Option<GainNode>,
     reverb_room: (f32, f32),
+    reverb_acoustics: Option<pen_runtime::reverb::AcousticProfile>,
     buses: Vec<BusNodes>,
     clips: Rc<RefCell<HashMap<u32, Loaded>>>,
     loading: HashSet<u32>,
@@ -368,6 +369,7 @@ impl Audio {
             reverb_switch_ready: 0.0,
             reverb_return: None,
             reverb_room: (0.0, 0.0),
+            reverb_acoustics: None,
             buses: Vec::new(),
             clips: Rc::new(RefCell::new(HashMap::new())),
             loading: HashSet::new(),
@@ -747,13 +749,18 @@ impl Audio {
         let context = self.context.as_ref().unwrap().clone();
         let now = context.current_time();
         let zone = placements.zone_mix();
+        let acoustics = placements.acoustics();
         let room = (
             if zone.decay.is_finite() { zone.decay.max(0.0) } else { 0.0 },
             if zone.damping.is_finite() { zone.damping.clamp(0.0, 1.0) } else { 0.0 },
         );
-        // Crossfade between two persistent ConvolverNodes with room hysteresis so zone
-        // transitions never truncate active convolution tails or regenerate IRs every frame.
-        let room_changed = crate::policy::reverb_room_changed(room, self.reverb_room);
+        // Crossfade between two persistent ConvolverNodes with room/acoustics hysteresis so zone
+        // transitions and ray-traced acoustic sweeps never truncate active convolution tails.
+        let room_changed = match (acoustics, self.reverb_acoustics.as_ref()) {
+            (Some(a), Some(b)) => a.differs_significantly(b),
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => crate::policy::reverb_room_changed(room, self.reverb_room),
+        };
         if room_changed
             && now >= self.reverb_switch_ready
             && let (Some(conv_a), Some(conv_b), Some(send_a), Some(send_b), Some(ret_a), Some(ret_b)) = (
@@ -765,11 +772,15 @@ impl Audio {
                 &self.reverb_ret_b,
             )
         {
-            let channels = pen_runtime::reverb::impulse_response_for(
-                f64::from(context.sample_rate()),
-                f64::from(room.0),
-                f64::from(room.1),
-            );
+            let channels = if let Some(profile) = acoustics {
+                pen_runtime::reverb::impulse_response_from_acoustics(f64::from(context.sample_rate()), profile)
+            } else {
+                pen_runtime::reverb::impulse_response_for(
+                    f64::from(context.sample_rate()),
+                    f64::from(room.0),
+                    f64::from(room.1),
+                )
+            };
             let buffer =
                 context.create_buffer(2, u32::try_from(channels[0].len())?, context.sample_rate()).map_err(error)?;
             buffer.copy_to_channel(&channels[0], 0).map_err(error)?;
@@ -793,6 +804,7 @@ impl Audio {
             self.reverb_use_b = next_b;
             self.reverb_switch_ready = now + fade;
             self.reverb_room = room;
+            self.reverb_acoustics = acoustics.cloned();
         }
         let rms_by_bus: Vec<f32> = (0..=self.buses.len())
             .map(|i| {

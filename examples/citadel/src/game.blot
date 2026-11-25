@@ -17,6 +17,7 @@
 import * as array from "std/array"
 import * as kernel from "std/kernel"
 import { Vec2, Vec3 } from "std/vector"
+import * as acoustics from "ink/audio/acoustics"
 import * as animation from "ink/animation"
 import * as bt from "ink/ai/bt"
 import * as character from "ink/character"
@@ -1183,6 +1184,36 @@ func populate_frame (world: World) -> (frame: own render.FrameAccess) -> (audio:
     audio := sound.at self sounds.pickup 0.75 1.0 world.sfx_pickup_pos
   return (frame, audio)
 
+// Live real-time acoustic ray tracing against Citadel's stone arena (`access.physics`):
+// traces multi-bounce stone wall/pillar early reflections & open-courtyard RT60 (`ACOUSTICS_EXT_TAG`),
+// and applies volumetric pillar occlusion + corner diffraction onto 3D combat hit panners.
+func emit_arena_acoustics (world: World) -> (physics: scene.Scene) -> (frame: own render.FrameAccess) -> (audio: own sound.Access) : (render.FrameAccess, sound.Access) =>
+  let shake = feel.sample_shake world.trauma
+  let cam_pos = world.follower.eye.value + shake.offset + world.recoil.value * 0.08
+  let shake_rot = math.Quat.normalized (math.Quat.mul (math.Quat.yaw shake.angles.y) (math.axis_angle math.right shake.angles.x))
+  let cam_rot = math.Quat.normalized (math.Quat.mul world.follower.rotation shake_rot)
+  let listener = $acoustics.Listener {
+    position: cam_pos,
+    forward: math.Quat.forward cam_rot,
+    up: math.Quat.up cam_rot,
+  }
+  let taps: #[acoustics.ReflectionTap] = #[]
+  let (room, room_taps) = acoustics.trace_room acoustics.light_config listener physics 4294967295 0 (acoustics.uniform_material acoustics.stone) 101 taps
+  frame := acoustics.emit_extension room (&room_taps[0..room_taps.length]) self
+  if world.sfx_hit and audio.panners.length > 0:
+    let src = $acoustics.Source {
+      position: world.sfx_hit_pos,
+      radius: 0.45,
+      reference_distance: 1.5,
+      max_distance: 45.0,
+    }
+    let src_taps: #[acoustics.ReflectionTap] = #[]
+    let (traced, _) = acoustics.trace_source acoustics.light_config listener src physics 4294967295 0 (acoustics.uniform_material acoustics.stone) 211 src_taps
+    let last_idx = audio.panners.length - 1
+    let updated = acoustics.apply_to_panner traced audio.panners[last_idx]
+    audio.panners[last_idx] := updated
+  return (frame, audio)
+
 // --- Deterministic Quicksave / Restore ---
 
 func save (world: World) : #[F32] =>
@@ -1560,6 +1591,7 @@ func execute (crowd_kernel: Kernel [#[F32], #[4; F32], #[4; F32]]) -> (access: o
       let next_hash = if queued then hash else last_hash
 
       let (next_frame, next_audio) = populate_frame w access.frame access.audio
+      let (next_frame, next_audio) = emit_arena_acoustics w access.physics next_frame next_audio
       access.frame := next_frame
       access.audio := next_audio
       let (next_lbls, next_ui) = emit_ui_tree w access.ui_labels access.ui_nodes

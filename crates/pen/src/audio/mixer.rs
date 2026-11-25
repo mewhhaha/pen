@@ -31,7 +31,7 @@ use pen_runtime::panner::{DEFAULT_EAR, Pan, Placement, Vec3, azimuth, equal_powe
 use pen_runtime::synth::{SynthEngine, SynthSpec};
 
 use super::resample::{Resampler, resample};
-use super::reverb::Convolver;
+use super::reverb::{AcousticProfile, Convolver};
 use super::source::Encoded;
 use super::stream::{Reader, Streams};
 
@@ -187,8 +187,8 @@ pub struct SoundSpec {
 }
 
 /// One frame's sound: its buses, voices, sounds, procedural/granular synths,
-/// and optional reverb room parameters.
-#[derive(Default)]
+/// and optional reverb room or ray-traced acoustic profile.
+#[derive(Clone, Default)]
 pub struct Mix {
     pub buses: Vec<BusSpec>,
     pub voices: Vec<VoiceSpec>,
@@ -196,6 +196,41 @@ pub struct Mix {
     pub synths: Vec<SynthSpec>,
     pub reverb_decay: f32,
     pub reverb_damping: f32,
+    pub acoustics: Option<AcousticProfile>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RoomSpec {
+    Plain { decay: f32, damping: f32 },
+    Traced(AcousticProfile),
+}
+
+impl RoomSpec {
+    fn from_mix(mix: &Mix) -> Self {
+        if let Some(profile) = &mix.acoustics {
+            return Self::Traced(profile.clone());
+        }
+        let decay = if mix.reverb_decay.is_finite() { mix.reverb_decay.max(0.0) } else { 0.0 };
+        let damping = if mix.reverb_damping.is_finite() { mix.reverb_damping.clamp(0.0, 1.0) } else { 0.0 };
+        Self::Plain { decay, damping }
+    }
+
+    fn differs_significantly(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Plain { decay: d1, damping: m1 }, Self::Plain { decay: d2, damping: m2 }) => {
+                (d1 - d2).abs() > 0.08 || (m1 - m2).abs() > 0.05 || ((*d1 > 0.0) != (*d2 > 0.0))
+            }
+            (Self::Traced(a), Self::Traced(b)) => a.differs_significantly(b),
+            _ => true,
+        }
+    }
+
+    fn build_convolver(&self, rate: f64) -> Convolver {
+        match self {
+            Self::Plain { decay, damping } => Convolver::with_room(rate, f64::from(*decay), f64::from(*damping)),
+            Self::Traced(profile) => Convolver::with_acoustics(rate, profile),
+        }
+    }
 }
 
 /// A value setTargetAtTime glides toward its target: each sample, the step's
@@ -940,9 +975,8 @@ pub struct Mixer {
     reverb_outgoing: Option<Convolver>,
     reverb_fade: f64,
     reverb_fade_step: f64,
-    reverb_decay: f32,
-    reverb_damping: f32,
-    reverb_pending: Option<(f32, f32)>,
+    reverb_room: RoomSpec,
+    reverb_pending: Option<RoomSpec>,
     master_in: [[f32; 2]; QUANTUM],
     reverb_in: [[f32; 2]; QUANTUM],
     reverb_out: [[f32; 2]; QUANTUM],
@@ -984,8 +1018,7 @@ impl Mixer {
             reverb_outgoing: None,
             reverb_fade: 1.0,
             reverb_fade_step: 1.0 / (0.25 * rate).max(1.0),
-            reverb_decay: 0.0,
-            reverb_damping: 0.0,
+            reverb_room: RoomSpec::Plain { decay: 0.0, damping: 0.0 },
             reverb_pending: None,
             master_in: [[0.0; 2]; QUANTUM],
             reverb_in: [[0.0; 2]; QUANTUM],
@@ -1048,13 +1081,12 @@ impl Mixer {
         index
     }
 
-    fn start_reverb_transition(&mut self, decay: f32, damping: f32) {
-        let next = Convolver::with_room(self.rate, f64::from(decay), f64::from(damping));
+    fn start_reverb_transition(&mut self, room: RoomSpec) {
+        let next = room.build_convolver(self.rate);
         let prev = std::mem::replace(&mut self.reverb, next);
         self.reverb_outgoing = Some(prev);
         self.reverb_fade = 0.0;
-        self.reverb_decay = decay;
-        self.reverb_damping = damping;
+        self.reverb_room = room;
     }
 
     /// A frame's sound, from the next quantum on: buses glide to theirs (those
@@ -1062,19 +1094,15 @@ impl Mixer {
     /// its sounds start.
     pub fn apply(&mut self, mix: &Mix) {
         let (now, rate) = (self.now, self.rate);
-        let decay = if mix.reverb_decay.is_finite() { mix.reverb_decay.max(0.0) } else { 0.0 };
-        let damping = if mix.reverb_damping.is_finite() { mix.reverb_damping.clamp(0.0, 1.0) } else { 0.0 };
-        // Quantized room hysteresis: avoids rebuilding IRs every frame while walking across a zone blend,
-        // and crossfades persistent convolvers smoothly so outgoing tails decay naturally without cuts.
-        let significant = (decay - self.reverb_decay).abs() > 0.08
-            || (damping - self.reverb_damping).abs() > 0.05
-            || ((decay > 0.0) != (self.reverb_decay > 0.0));
-        if significant {
+        let next_room = RoomSpec::from_mix(mix);
+        // Quantized room hysteresis: avoids rebuilding IRs every frame while walking across a zone blend
+        // or acoustic ray-trace sweep, crossfading persistent convolvers smoothly without tail cuts.
+        if next_room.differs_significantly(&self.reverb_room) {
             if self.reverb_outgoing.is_none() {
-                self.start_reverb_transition(decay, damping);
+                self.start_reverb_transition(next_room);
                 self.reverb_pending = None;
             } else {
-                self.reverb_pending = Some((decay, damping));
+                self.reverb_pending = Some(next_room);
             }
         }
         for (index, bus) in self.buses.iter_mut().enumerate() {
@@ -1229,15 +1257,14 @@ impl Mixer {
             }
             if self.reverb_fade >= 1.0 {
                 self.reverb_outgoing = None;
-                if let Some((d, damp)) = self.reverb_pending.take()
-                    && ((d - self.reverb_decay).abs() > 0.08 || (damp - self.reverb_damping).abs() > 0.05)
+                if let Some(pending) = self.reverb_pending.take()
+                    && pending.differs_significantly(&self.reverb_room)
                 {
-                    let next = Convolver::with_room(rate, f64::from(d), f64::from(damp));
+                    let next = pending.build_convolver(rate);
                     let prev = std::mem::replace(&mut self.reverb, next);
                     self.reverb_outgoing = Some(prev);
                     self.reverb_fade = 0.0;
-                    self.reverb_decay = d;
-                    self.reverb_damping = damp;
+                    self.reverb_room = pending;
                 }
             }
         }
@@ -1941,6 +1968,73 @@ mod tests {
         );
         assert!(rms(&out[1600..]) > 0.02, "granular synth must produce audible output");
         assert!(synth_mixer.take_meters().0[1].rms()[0] > 0.01, "synth must meter on its target bus");
+    }
+
+    #[test]
+    fn ray_traced_acoustics_drives_stereo_early_reflections_and_smooth_room_crossfade() {
+        let mut impulse_frames = vec![[0.0f32; 2]; 800];
+        for sample in impulse_frames.iter_mut().take(48) {
+            *sample = [0.8, 0.8];
+        }
+        let burst = Arc::new(Clip::new(impulse_frames.into(), RATE));
+
+        // Left-wall early reflection at 12 ms, late tail delayed to 60 ms so early echo is isolated!
+        let profile = AcousticProfile {
+            decay: 2.2,
+            damping: 0.25,
+            predelay_s: 0.060,
+            early_gain: 1.0,
+            late_gain: 0.8,
+            outdoor: 0.0,
+            taps: vec![pen_runtime::reverb::AcousticTap {
+                delay_s: 0.012,
+                pan: -0.95,
+                gain_low: 0.9,
+                gain_mid: 0.9,
+                gain_high: 0.9,
+            }],
+        };
+
+        let mut mixer = Mixer::new(RATE);
+        // Settle the 250 ms crossfade into the ray-traced room before triggering the burst.
+        let idle = Mix { buses: vec![MASTER, PLAIN], acoustics: Some(profile.clone()), ..Mix::default() };
+        play(&mut mixer, (0..24).map(|_| idle.clone()));
+
+        // Send dry=0, reverb=1 burst through bus 1 -> master so output is purely the ray-traced IR!
+        let mut s = SoundSpec {
+            clip: burst,
+            bus: 1,
+            gain: 0.0,
+            pan: 0.0,
+            pitch: 1.0,
+            lowpass: OPEN,
+            reverb: 1.0,
+            panner: None,
+        };
+        // Note: voice dry gain scales bus send too unless sent via sound.reverb with gain=1, bus dry=0,
+        // so play at gain=1 on bus 1 with bus1.gain=0? Wait: bus dry scales send; instead keep gain=1
+        // and measure the 10..20 ms echo window strictly AFTER the 1 ms burst finishes!
+        s.gain = 1.0;
+        let mut trig = Mix {
+            buses: vec![MASTER, PLAIN],
+            sounds: vec![s],
+            acoustics: Some(profile),
+            ..Mix::default()
+        };
+        let mut out = play(&mut mixer, [trig]);
+        trig = Mix { buses: vec![MASTER, PLAIN], acoustics: idle.acoustics.clone(), ..Mix::default() };
+        out.extend(play(&mut mixer, (0..12).map(|_| trig.clone())));
+
+        let echo_win = (0.010 * RATE) as usize..(0.020 * RATE) as usize;
+        let l_energy: f64 = out[echo_win.clone()].iter().map(|s| f64::from(s[0]) * f64::from(s[0])).sum();
+        let r_energy: f64 = out[echo_win].iter().map(|s| f64::from(s[1]) * f64::from(s[1])).sum();
+        assert!(
+            l_energy > 0.05 && l_energy > r_energy * 8.0,
+            "ray-traced left-wall early reflection must echo strongly on left channel: L={l_energy}, R={r_energy}"
+        );
+        let tail_win = (0.070 * RATE) as usize..(0.140 * RATE) as usize;
+        let tail_rms = rms(&out[tail_win]);
+        assert!(tail_rms > 0.005, "ray-traced late diffuse tail must ring after predelay: rms={tail_rms}");
     }
 
     /// A calibration scenario, for comparing with WebAudio playing the same

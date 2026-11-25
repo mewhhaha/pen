@@ -155,14 +155,39 @@ type FxBurst is data = $FxBurst {
   gold: Bool,
 }
 
+const beacon_pos = math.vec3 6.8 1.55 (-1.8)
+
+const default_beacon_acoustics = $acoustics.SourceAcoustics {
+  distance: 6.0,
+  direct_gain: 1.0,
+  occlusion: 0.0,
+  transmission: 1.0,
+  transmission_low: 1.0,
+  transmission_mid: 1.0,
+  transmission_high: 1.0,
+  diffraction: 0.0,
+  lowpass_hz: 20000.0,
+  wet_send: 0.25,
+  apparent_position: beacon_pos,
+  direct_pan: 0.0,
+  early_energy: 0.0,
+  tap_count: 0,
+}
+
 type World is data = $World {
   time: F32,
+  last_dt: F32,
   width: F32,
   height: F32,
   held_keys: U32,
   paused: Bool,
   victory: Bool,
   defeat: Bool,
+  acoustics_enabled: Bool,
+  acoustics_primed: Bool,
+  room_acoustics: acoustics.RoomAcoustics,
+  beacon_acoustics: acoustics.SourceAcoustics,
+  beacon_timer: F32,
   score: U32,
   hero_pos: Vec3,
   hero_walker: scene.Walker,
@@ -194,12 +219,14 @@ type World is data = $World {
   sfx_hit_pos: Vec3,
   sfx_pickup: Bool,
   sfx_pickup_pos: Vec3,
+  sfx_beacon: Bool,
   save_req: Bool,
   load_req: Bool,
 }
 
 // Builds the static physics collision geometry for the Citadel arena:
-// main stone island floor, elevated central dais, 4 corner pillars, and 4 perimeter walls.
+// main stone island floor, elevated central dais, 4 corner pillars, 4 perimeter walls,
+// and the roofed East Stone Echo Vault (west baffle wall, east wall, north wall, stone roof).
 func build_arena_physics () : scene.Scene =>
   let sources: #[scene.Source] = #[
     scene.box 1 (math.vec3 0.0 (-0.5) 0.0) (math.vec3 18.0 1.0 18.0),
@@ -213,6 +240,11 @@ func build_arena_physics () : scene.Scene =>
     scene.box 8 (math.vec3 0.0 2.4 8.8) (math.vec3 18.0 5.2 0.7),
     scene.box 9 (math.vec3 (-8.8) 2.4 0.0) (math.vec3 0.7 5.2 18.0),
     scene.box 10 (math.vec3 8.8 2.4 0.0) (math.vec3 0.7 5.2 18.0),
+    // Roofed East Stone Echo Vault: occluding west baffle wall, east wall, north wall, stone ceiling.
+    scene.box 11 (math.vec3 4.6 3.0 (-0.4)) (math.vec3 0.9 6.0 6.6),
+    scene.box 12 (math.vec3 8.6 3.0 (-0.4)) (math.vec3 0.9 6.0 6.6),
+    scene.box 13 (math.vec3 6.6 3.0 (-3.9)) (math.vec3 4.9 6.0 0.9),
+    scene.box 14 (math.vec3 6.6 6.1 (-0.4)) (math.vec3 4.9 0.6 7.6),
   ]
   return scene.build_into (scene.empty ()) sources
 
@@ -269,9 +301,9 @@ func create () : World =>
   let follower = rig.follower follow_cfg (start_pos + math.vec3 0.0 1.35 0.0) math.zero3 0.0
   let sents: #[Sentinel] = #[
     make_sentinel 1 (-3.4) (-3.4) 0.0,
-    make_sentinel 2 3.4 (-3.4) 1.57,
+    make_sentinel 2 2.4 (-5.2) 1.57,
     make_sentinel 3 (-5.6) 1.4 3.14,
-    make_sentinel 4 5.6 1.4 4.71,
+    make_sentinel 4 2.4 2.6 4.71,
   ]
   let shards: #[Shard] = #[
     $Shard { id: 1, position: math.vec3 0.0 1.15 0.0, collected: false },
@@ -284,12 +316,18 @@ func create () : World =>
   let walkable_cells = bake_arena_nav ()
   return $World {
     time: 0.0,
+    last_dt: 0.016,
     width: 1280.0,
     height: 720.0,
     held_keys: 0,
     paused: false,
     victory: false,
     defeat: false,
+    acoustics_enabled: true,
+    acoustics_primed: false,
+    room_acoustics: acoustics.default_room,
+    beacon_acoustics: default_beacon_acoustics,
+    beacon_timer: 0.45,
     score: 0,
     hero_pos: start_pos,
     hero_walker: walker,
@@ -321,6 +359,7 @@ func create () : World =>
     sfx_hit_pos: math.zero3,
     sfx_pickup: false,
     sfx_pickup_pos: math.zero3,
+    sfx_beacon: false,
     save_req: false,
     load_req: false,
   }
@@ -359,6 +398,9 @@ func apply_event (world: own World) -> (ev: events.Event) : World =>
         world.held_keys := world.held_keys | bit
       if code == keys.escape and not world.victory and not world.defeat:
         world.paused := not world.paused
+      if code == keys.k:
+        world.acoustics_enabled := not world.acoustics_enabled
+        world.acoustics_primed := false
       if code == keys.r:
         let w = world.width
         let h = world.height
@@ -378,12 +420,18 @@ func apply_event (world: own World) -> (ev: events.Event) : World =>
         for i in 0 .. fresh.crowd_sep.length:
           @storage.push world.crowd_sep fresh.crowd_sep[i]
         world.time := fresh.time
+        world.last_dt := fresh.last_dt
         world.width := w
         world.height := h
         world.held_keys := 0
         world.paused := false
         world.victory := false
         world.defeat := false
+        world.acoustics_enabled := fresh.acoustics_enabled
+        world.acoustics_primed := false
+        world.room_acoustics := fresh.room_acoustics
+        world.beacon_acoustics := fresh.beacon_acoustics
+        world.beacon_timer := fresh.beacon_timer
         world.score := 0
         world.hero_pos := fresh.hero_pos
         world.hero_walker := fresh.hero_walker
@@ -409,6 +457,7 @@ func apply_event (world: own World) -> (ev: events.Event) : World =>
         world.sfx_hit_pos := math.zero3
         world.sfx_pickup := false
         world.sfx_pickup_pos := math.zero3
+        world.sfx_beacon := false
         world.save_req := false
         world.load_req := false
       if code == keys.f6:
@@ -553,6 +602,7 @@ func step (world: own World) -> (phys: scene.Queries) -> (dt: F32) -> (width: F3
   world.sfx_swing := false
   world.sfx_hit := false
   world.sfx_pickup := false
+  world.sfx_beacon := false
   world.save_req := false
   world.load_req := false
   for ev in incoming:
@@ -561,11 +611,18 @@ func step (world: own World) -> (phys: scene.Queries) -> (dt: F32) -> (width: F3
     return world
 
   let raw_dt = clamp 0.0 0.05 dt
+  world.last_dt := raw_dt
   let (sim_dt, next_hs) = feel.step_hitstop raw_dt world.hitstop
   world.hitstop := next_hs
   world.trauma := feel.step_trauma raw_dt self
   world.recoil := feel.step_recoil raw_dt self
   world.time := world.time + sim_dt
+
+  // Periodic Arcane Chime Beacon inside the roofed Stone Echo Vault (pulses every 0.90s).
+  world.beacon_timer := world.beacon_timer - sim_dt
+  if world.beacon_timer <= 0.0:
+    world.beacon_timer := 0.90
+    world.sfx_beacon := true
 
   // Orbit camera smoothly via Q / E.
   if (world.held_keys & key_q_bit) != 0:
@@ -848,7 +905,9 @@ const c_lbl_score: #[U32] = #[83, 67, 79, 82, 69, 58] // SCORE:
 const c_lbl_bots: #[U32] = #[66, 79, 84, 83, 58] // BOTS:
 const c_lbl_shard: #[U32] = #[83, 72, 65, 82, 68, 58] // SHARD:
 const c_lbl_of3: #[U32] = #[47, 51] // /3
-const c_lbl_keys: #[U32] = #[87, 65, 83, 68, 32, 83, 80, 65, 67, 69, 58, 74, 85, 77, 80, 32, 83, 72, 73, 70, 84, 58, 68, 65, 83, 72, 32, 74, 58, 83, 76, 65, 83, 72, 32, 69, 83, 67, 58, 80, 65, 85, 83, 69]
+const c_lbl_keys: #[U32] = #[87, 65, 83, 68, 32, 83, 80, 65, 67, 69, 58, 74, 85, 77, 80, 32, 83, 72, 73, 70, 84, 58, 68, 65, 83, 72, 32, 74, 58, 83, 76, 65, 83, 72, 32, 75, 58, 65, 67, 79, 85, 83, 84, 73, 67, 83, 32, 69, 83, 67, 58, 80, 65, 85, 83, 69]
+const c_lbl_ac_on: #[U32] = #[65, 67, 79, 85, 83, 84, 73, 67, 83, 58, 32, 79, 78] // ACOUSTICS: ON
+const c_lbl_ac_off: #[U32] = #[65, 67, 79, 85, 83, 84, 73, 67, 83, 58, 32, 79, 70, 70] // ACOUSTICS: OFF
 const c_lbl_victory: #[U32] = #[86, 73, 67, 84, 79, 82, 89, 33] // VICTORY!
 const c_lbl_defeat: #[U32] = #[68, 69, 70, 69, 65, 84] // DEFEAT
 const c_lbl_paused: #[U32] = #[80, 65, 85, 83, 69, 68] // PAUSED
@@ -890,11 +949,21 @@ func emit_hud (world: World) -> (frame: own render.FrameAccess) : render.FrameAc
   frame := push_glyph (48 + got) (rx + 10.0 + step11 * 14.0) 36.0 1.1 cyan self
   frame := push_text (&c_lbl_of3[0..2]) (rx + 10.0 + step11 * 15.0) 36.0 1.1 cyan self
 
+  // Top-center live Acoustics status badge
+  let ac_x = max 184.0 (world.width * 0.5 - 78.0)
+  let ac_bg = if world.acoustics_enabled then math.vec4 0.06 0.22 0.20 0.90 else math.vec4 0.24 0.14 0.08 0.90
+  let ac_fg = if world.acoustics_enabled then math.vec4 0.45 1.0 0.82 1.0 else math.vec4 1.0 0.72 0.42 1.0
+  frame := push_panel ac_x 10.0 156.0 28.0 ac_bg 6.0 0.7 self
+  if world.acoustics_enabled:
+    frame := push_text (&c_lbl_ac_on[0..13]) (ac_x + 16.0) 19.0 1.15 ac_fg self
+  else:
+    frame := push_text (&c_lbl_ac_off[0..14]) (ac_x + 12.0) 19.0 1.15 ac_fg self
+
   // Bottom control bar
   let by = max 270.0 (world.height - 30.0)
   let bw = max 440.0 (world.width - 20.0)
   frame := push_panel 10.0 by bw 22.0 bg 5.0 0.4 self
-  frame := push_text (&c_lbl_keys[0..44]) 18.0 (by + 6.0) 1.05 dim self
+  frame := push_text (&c_lbl_keys[0..56]) 18.0 (by + 6.0) 1.05 dim self
 
   // Centered modal banner on Pause / Victory / Defeat
   if world.paused or world.victory or world.defeat:
@@ -998,7 +1067,8 @@ func populate_frame (world: World) -> (frame: own render.FrameAccess) -> (audio:
   exp.compensation := (-0.65)
   frame.settings[0].exposure := exp
 
-  // 1. Arena architecture: stone island floor, central dais, 4 pillars, 4 low parapets.
+  // 1. Arena architecture: stone island floor, central dais, 4 pillars, 4 low parapets,
+  //    plus the roofed East Stone Echo Vault & pulsing Arcane Chime Beacon inside.
   frame := push_draw meshes.box materials.stone (box_mat 0.0 (-0.5) 0.0 9.0 0.5 9.0) self
   frame := push_draw meshes.box materials.pillar (box_mat 0.0 0.2 0.0 2.5 0.2 2.5) self
   frame := push_draw meshes.box materials.pillar (box_mat (-4.8) 2.0 (-4.8) 0.7 2.0 0.7) self
@@ -1009,6 +1079,19 @@ func populate_frame (world: World) -> (frame: own render.FrameAccess) -> (audio:
   frame := push_draw meshes.box materials.pillar (box_mat 0.0 0.35 8.8 9.0 0.35 0.28) self
   frame := push_draw meshes.box materials.pillar (box_mat (-8.8) 0.35 0.0 0.28 0.35 9.0) self
   frame := push_draw meshes.box materials.pillar (box_mat 8.8 0.35 0.0 0.28 0.35 9.0) self
+  // East Stone Echo Vault walls, roof, archway lintel, and glowing Arcane Chime Beacon
+  frame := push_draw meshes.box materials.pillar (box_mat 4.6 3.0 (-0.4) 0.45 3.0 3.3) self
+  frame := push_draw meshes.box materials.pillar (box_mat 8.6 3.0 (-0.4) 0.45 3.0 3.3) self
+  frame := push_draw meshes.box materials.pillar (box_mat 6.6 3.0 (-3.9) 2.45 3.0 0.45) self
+  frame := push_draw meshes.box materials.stone (box_mat 6.6 6.1 (-0.4) 2.45 0.3 3.8) self
+  frame := push_draw meshes.box materials.pillar (box_mat 6.6 5.45 2.9 1.65 0.45 0.45) self
+  let beacon_pulse = 1.0 + 0.25 * max 0.0 (1.0 - (0.90 - world.beacon_timer) * 4.0)
+  let beacon_pose = $transform.Pose3 {
+    position: beacon_pos + math.vec3 0.0 (sin (world.time * 3.2) * 0.14) 0.0,
+    rotation: math.Quat.mul (math.Quat.yaw (world.time * 2.1)) (math.axis_angle math.right 0.52),
+    scale: math.vec3 (0.42 * beacon_pulse) (0.72 * beacon_pulse) (0.42 * beacon_pulse),
+  }
+  frame := push_draw meshes.sentinel materials.portal (transform.matrix beacon_pose) self
 
   // 2. Skinned 6-bone Hero draw + live `render.push_skin_palette` + socketed energy blade!
   let hero_draw_idx = frame.draws.length
@@ -1155,64 +1238,127 @@ func populate_frame (world: World) -> (frame: own render.FrameAccess) -> (audio:
   // 9. Live HUD & Modal overlay.
   frame := emit_hud world self
 
-  // 10. 3D Spatial Audio: listener, citadel reverb zone, adaptive DSP drone & panned combat SFX.
+  // 10. 3D Spatial Audio: hero-ear listener with camera heading, citadel reverb zone,
+  //     adaptive DSP drone & panned 3D SFX (footsteps, swings, hits, pickups, vault chime beacon).
+  let listen_pos = world.hero_pos + math.vec3 0.0 1.45 0.0
   let fwd = math.Quat.forward cam_rot
   let up_v = math.Quat.up cam_rot
-  audio := sound.set_listener self (sound.listener cam_pos fwd up_v)
-  let zone = sound.reverb_zone 1 (math.vec3 0.0 2.0 0.0) (math.vec3 10.0 6.0 10.0)
-  zone.decay := 2.6
-  zone.damping := 0.32
-  zone.wet := 0.3
+  audio := sound.set_listener self (sound.listener listen_pos fwd up_v)
+  let zone = sound.reverb_zone 1 (math.vec3 0.0 3.0 0.0) (math.vec3 14.0 8.0 14.0)
+  zone.decay := if world.acoustics_enabled then world.room_acoustics.decay else 0.45
+  zone.damping := if world.acoustics_enabled then world.room_acoustics.damping else 0.55
+  zone.wet := if world.acoustics_enabled then world.room_acoustics.wet else 0.06
   audio := sound.add_reverb_zone self zone
   let in_combat = alive_sentinel_count world > 0 and not world.paused
   let drone = sound.synth_voice 1 sound.synth_triangle sound.ambience (if in_combat then 110.0 else 82.41)
-  drone.gain := if world.paused then 0.015 else 0.045
-  drone.cutoff := if in_combat then 850.0 else 480.0
-  drone.reverb := 0.4
+  drone.gain := if world.paused then 0.01 else 0.025
+  drone.cutoff := if in_combat then 820.0 else 460.0
+  drone.reverb := 0.32
   audio := sound.play_synth self drone
   if world.sfx_step:
-    audio := sound.at self sounds.step 0.35 1.0 world.hero_pos
+    let sidx = audio.sounds.length
+    audio := sound.at self sounds.step 0.42 1.0 world.hero_pos
+    let p = sound.panner_for_sound sidx (world.hero_pos + math.vec3 0.0 0.15 0.0)
+    p.hrtf := true
+    p.zone := 1
+    audio := sound.pan self p
   if world.sfx_swing:
-    audio := sound.at self sounds.swing 0.55 1.05 world.hero_pos
+    let sidx = audio.sounds.length
+    audio := sound.at self sounds.swing 0.60 1.05 (world.hero_pos + math.vec3 0.0 1.2 0.0)
+    let p = sound.panner_for_sound sidx (world.hero_pos + math.vec3 0.0 1.2 0.0)
+    p.hrtf := true
+    p.zone := 1
+    audio := sound.pan self p
   if world.sfx_hit:
     let sidx = audio.sounds.length
     audio := sound.at self sounds.hit 0.85 1.0 world.sfx_hit_pos
     let p = sound.panner_for_sound sidx world.sfx_hit_pos
+    p.hrtf := true
     p.zone := 1
     audio := sound.pan self p
   if world.sfx_pickup:
+    let sidx = audio.sounds.length
     audio := sound.at self sounds.pickup 0.75 1.0 world.sfx_pickup_pos
+    let p = sound.panner_for_sound sidx world.sfx_pickup_pos
+    p.hrtf := true
+    p.zone := 1
+    audio := sound.pan self p
+  if world.sfx_beacon:
+    let sidx = audio.sounds.length
+    audio := sound.at self sounds.pickup 0.90 1.15 beacon_pos
+    let p = sound.panner_for_sound sidx beacon_pos
+    p.ref_distance := 2.2
+    p.max_distance := 35.0
+    p.hrtf := true
+    p.zone := 1
+    audio := sound.pan self p
   return (frame, audio)
 
-// Live real-time acoustic ray tracing against Citadel's stone arena (`access.physics`):
-// traces multi-bounce stone wall/pillar early reflections & open-courtyard RT60 (`ACOUSTICS_EXT_TAG`),
-// and applies volumetric pillar occlusion + corner diffraction onto 3D combat hit panners.
-func emit_arena_acoustics (world: World) -> (physics: scene.Scene) -> (frame: own render.FrameAccess) -> (audio: own sound.Access) : (render.FrameAccess, sound.Access) =>
+// Live real-time acoustic ray tracing against Citadel's stone arena + roofed Echo Vault:
+// traces multi-bounce stone wall/roof early reflections & Eyring RT60 (`ACOUSTICS_EXT_TAG`),
+// smooths room & beacon acoustics across frames, and applies volumetric wall occlusion,
+// edge diffraction, and wet reverb send onto every active 3D sound panner.
+func emit_arena_acoustics (world: own World) -> (physics: scene.Scene) -> (frame: own render.FrameAccess) -> (audio: own sound.Access) : (World, render.FrameAccess, sound.Access) =>
+  if not world.acoustics_enabled:
+    return (world, frame, audio)
   let shake = feel.sample_shake world.trauma
-  let cam_pos = world.follower.eye.value + shake.offset + world.recoil.value * 0.08
   let shake_rot = math.Quat.normalized (math.Quat.mul (math.Quat.yaw shake.angles.y) (math.axis_angle math.right shake.angles.x))
   let cam_rot = math.Quat.normalized (math.Quat.mul world.follower.rotation shake_rot)
+  let listen_pos = world.hero_pos + math.vec3 0.0 1.45 0.0
   let listener = $acoustics.Listener {
-    position: cam_pos,
+    position: listen_pos,
     forward: math.Quat.forward cam_rot,
     up: math.Quat.up cam_rot,
   }
   let taps: #[acoustics.ReflectionTap] = #[]
-  let (room, room_taps) = acoustics.trace_room acoustics.light_config listener physics 4294967295 0 (acoustics.uniform_material acoustics.stone) 101 taps
-  frame := acoustics.emit_extension room (&room_taps[0..room_taps.length]) self
-  if world.sfx_hit and audio.panners.length > 0:
-    let src = $acoustics.Source {
-      position: world.sfx_hit_pos,
-      radius: 0.45,
-      reference_distance: 1.5,
-      max_distance: 45.0,
-    }
-    let src_taps: #[acoustics.ReflectionTap] = #[]
-    let (traced, _) = acoustics.trace_source acoustics.light_config listener src physics 4294967295 0 (acoustics.uniform_material acoustics.stone) 211 src_taps
-    let last_idx = audio.panners.length - 1
-    let updated = acoustics.apply_to_panner traced audio.panners[last_idx]
-    audio.panners[last_idx] := updated
-  return (frame, audio)
+  let (raw_room, room_taps) = acoustics.trace_room acoustics.default_config listener physics 4294967295 0 (acoustics.uniform_material acoustics.stone) 101 taps
+  let dt = max 0.001 world.last_dt
+  let smoothed_room = if world.acoustics_primed then acoustics.smooth_room 6.0 dt world.room_acoustics raw_room else raw_room
+  world.room_acoustics := smoothed_room
+  if audio.reverb_zones.length > 0:
+    let rz = audio.reverb_zones[0]
+    rz.decay := smoothed_room.decay
+    rz.damping := smoothed_room.damping
+    rz.wet := clamp 0.05 0.95 (smoothed_room.wet * 1.35)
+    audio.reverb_zones[0] := rz
+  frame := acoustics.emit_extension smoothed_room (&room_taps[0..room_taps.length]) self
+
+  // Continuously trace & smooth the Arcane Chime Beacon inside the stone vault every frame.
+  let b_src = $acoustics.Source {
+    position: beacon_pos,
+    radius: 0.45,
+    reference_distance: 2.2,
+    max_distance: 35.0,
+  }
+  let b_taps: #[acoustics.ReflectionTap] = #[]
+  let (raw_beacon, _) = acoustics.trace_source acoustics.light_config listener b_src physics 4294967295 0 (acoustics.uniform_material acoustics.stone) 211 b_taps
+  let smoothed_beacon = if world.acoustics_primed then acoustics.smooth_source 10.0 dt world.beacon_acoustics raw_beacon else raw_beacon
+  world.beacon_acoustics := smoothed_beacon
+  world.acoustics_primed := true
+
+  // Apply ray-traced occlusion, doorway diffraction, and physical wet send to every active 3D panner.
+  let beacon_d_eps: F32 = 0.05
+  for i in 0 .. audio.panners.length:
+    let p = audio.panners[i]
+    let d_beacon = (p.position - beacon_pos).length
+    let traced = if d_beacon < beacon_d_eps then smoothed_beacon else do:
+      let s_src = $acoustics.Source {
+        position: p.position,
+        radius: 0.35,
+        reference_distance: p.ref_distance,
+        max_distance: p.max_distance,
+      }
+      let s_taps: #[acoustics.ReflectionTap] = #[]
+      let (res, _) = acoustics.trace_source acoustics.light_config listener s_src physics 4294967295 0 (acoustics.uniform_material acoustics.stone) (307 + i * 41) s_taps
+      break res
+    let updated = acoustics.apply_to_panner traced p
+    audio.panners[i] := updated
+    if p.voice == 0 and p.sound < audio.sounds.length:
+      let snd = audio.sounds[p.sound]
+      let room_boost = clamp 0.0 1.0 ((1.0 - smoothed_room.outdoor) * 0.75)
+      snd.reverb := clamp 0.0 1.0 (max snd.reverb (traced.wet_send + room_boost * 0.45))
+      audio.sounds[p.sound] := snd
+  return (world, frame, audio)
 
 // --- Deterministic Quicksave / Restore ---
 
@@ -1257,6 +1403,8 @@ func save (world: World) : #[F32] =>
   for i in 0 .. world.shards.length:
     let sh = world.shards[i]
     @storage.push out (if sh.collected then 1.0 else 0.0)
+  @storage.push out (if world.acoustics_enabled then 1.0 else 0.0)
+  @storage.push out world.beacon_timer
   return out
 
 func restore (lanes_in: &[F32]) : World =>
@@ -1298,6 +1446,9 @@ func restore (lanes_in: &[F32]) : World =>
       let sh = base.shards[i]
       sh.collected := lanes_in[sh_off + i] >= 0.5
       base.shards[i] := sh
+    if lanes_in.length >= sh_off + shc + 2:
+      base.acoustics_enabled := lanes_in[sh_off + shc] >= 0.5
+      base.beacon_timer := clamp 0.0 0.90 lanes_in[sh_off + shc + 1]
   base.follower := rig.follower follow_cfg (base.hero_pos + math.vec3 0.0 1.35 0.0) base.hero_walker.velocity base.cam_yaw
   return base
 
@@ -1305,12 +1456,18 @@ func restore (lanes_in: &[F32]) : World =>
 
 type WorldScalars is data = $WorldScalars {
   time: F32,
+  last_dt: F32,
   width: F32,
   height: F32,
   held_keys: U32,
   paused: Bool,
   victory: Bool,
   defeat: Bool,
+  acoustics_enabled: Bool,
+  acoustics_primed: Bool,
+  room_acoustics: acoustics.RoomAcoustics,
+  beacon_acoustics: acoustics.SourceAcoustics,
+  beacon_timer: F32,
   score: U32,
   hero_pos: Vec3,
   hero_walker: scene.Walker,
@@ -1336,6 +1493,7 @@ type WorldScalars is data = $WorldScalars {
   sfx_hit_pos: Vec3,
   sfx_pickup: Bool,
   sfx_pickup_pos: Vec3,
+  sfx_beacon: Bool,
   save_req: Bool,
   load_req: Bool,
   last_crowd_hash: kernel.Hash64,
@@ -1343,12 +1501,18 @@ type WorldScalars is data = $WorldScalars {
 
 func pack_world_scalars (w: World) -> (last_crowd_hash: kernel.Hash64) : WorldScalars => $WorldScalars {
   time: w.time,
+  last_dt: w.last_dt,
   width: w.width,
   height: w.height,
   held_keys: w.held_keys,
   paused: w.paused,
   victory: w.victory,
   defeat: w.defeat,
+  acoustics_enabled: w.acoustics_enabled,
+  acoustics_primed: w.acoustics_primed,
+  room_acoustics: w.room_acoustics,
+  beacon_acoustics: w.beacon_acoustics,
+  beacon_timer: w.beacon_timer,
   score: w.score,
   hero_pos: w.hero_pos,
   hero_walker: w.hero_walker,
@@ -1374,6 +1538,7 @@ func pack_world_scalars (w: World) -> (last_crowd_hash: kernel.Hash64) : WorldSc
   sfx_hit_pos: w.sfx_hit_pos,
   sfx_pickup: w.sfx_pickup,
   sfx_pickup_pos: w.sfx_pickup_pos,
+  sfx_beacon: w.sfx_beacon,
   save_req: w.save_req,
   load_req: w.load_req,
   last_crowd_hash,
@@ -1382,12 +1547,18 @@ func pack_world_scalars (w: World) -> (last_crowd_hash: kernel.Hash64) : WorldSc
 func unpack_world (s: WorldScalars) -> (sentinels: own #[Sentinel]) -> (shards: own #[Shard]) -> (trail: own #[Vec3]) -> (fx_bursts: own #[FxBurst]) -> (bt_mem: own #[bt.Slot]) -> (crowd_sep: own #[Vec3]) : World =>
   $World {
     time: s.time,
+    last_dt: s.last_dt,
     width: s.width,
     height: s.height,
     held_keys: s.held_keys,
     paused: s.paused,
     victory: s.victory,
     defeat: s.defeat,
+    acoustics_enabled: s.acoustics_enabled,
+    acoustics_primed: s.acoustics_primed,
+    room_acoustics: s.room_acoustics,
+    beacon_acoustics: s.beacon_acoustics,
+    beacon_timer: s.beacon_timer,
     score: s.score,
     hero_pos: s.hero_pos,
     hero_walker: s.hero_walker,
@@ -1419,6 +1590,7 @@ func unpack_world (s: WorldScalars) -> (sentinels: own #[Sentinel]) -> (shards: 
     sfx_hit_pos: s.sfx_hit_pos,
     sfx_pickup: s.sfx_pickup,
     sfx_pickup_pos: s.sfx_pickup_pos,
+    sfx_beacon: s.sfx_beacon,
     save_req: s.save_req,
     load_req: s.load_req,
   }
@@ -1591,7 +1763,8 @@ func execute (crowd_kernel: Kernel [#[F32], #[4; F32], #[4; F32]]) -> (access: o
       let next_hash = if queued then hash else last_hash
 
       let (next_frame, next_audio) = populate_frame w access.frame access.audio
-      let (next_frame, next_audio) = emit_arena_acoustics w access.physics next_frame next_audio
+      let (w_ac, next_frame, next_audio) = emit_arena_acoustics w access.physics next_frame next_audio
+      w := w_ac
       access.frame := next_frame
       access.audio := next_audio
       let (next_lbls, next_ui) = emit_ui_tree w access.ui_labels access.ui_nodes

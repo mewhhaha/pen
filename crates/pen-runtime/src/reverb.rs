@@ -189,25 +189,36 @@ impl AcousticProfile {
         {
             return true;
         }
-        let tap_summary = |taps: &[AcousticTap]| -> (f32, f32, f32) {
+        let tap_summary = |taps: &[AcousticTap]| -> (f32, f32, f32, f32, f32) {
             if taps.is_empty() {
-                return (0.0, 0.0, 0.0);
+                return (0.0, 0.0, 0.0, 0.0, 0.0);
             }
             let mut energy = 0.0f32;
             let mut w_delay = 0.0f32;
             let mut w_pan = 0.0f32;
+            let mut w_abs_pan = 0.0f32;
+            let mut sum_low = 0.0f32;
+            let mut sum_high = 0.0f32;
             for t in taps {
                 let g = (t.gain_low + t.gain_mid + t.gain_high) / 3.0;
                 energy += g;
                 w_delay += t.delay_s * g;
                 w_pan += t.pan * g;
+                w_abs_pan += t.pan.abs() * g;
+                sum_low += t.gain_low;
+                sum_high += t.gain_high;
             }
             let inv = if energy > 1e-4 { 1.0 / energy } else { 0.0 };
-            (energy, w_delay * inv, w_pan * inv)
+            let hf_ratio = sum_high / (sum_low + 1e-4);
+            (energy, w_delay * inv, w_pan * inv, w_abs_pan * inv, hf_ratio)
         };
-        let (e_a, d_a, p_a) = tap_summary(&self.taps);
-        let (e_b, d_b, p_b) = tap_summary(&other.taps);
-        (e_a - e_b).abs() > 0.12 || (d_a - d_b).abs() > 0.006 || (p_a - p_b).abs() > 0.18
+        let (e_a, d_a, p_a, w_a, hf_a) = tap_summary(&self.taps);
+        let (e_b, d_b, p_b, w_b, hf_b) = tap_summary(&other.taps);
+        (e_a - e_b).abs() > 0.12
+            || (d_a - d_b).abs() > 0.006
+            || (p_a - p_b).abs() > 0.18
+            || (w_a - w_b).abs() > 0.16
+            || (hf_a - hf_b).abs() > 0.18
     }
 }
 
@@ -238,14 +249,16 @@ pub fn impulse_response_from_acoustics(rate: f64, profile: &AcousticProfile) -> 
         .iter()
         .map(|t| f64::from(t.sanitized().delay_s))
         .fold(0.0f64, f64::max);
-    let tail_seconds = (predelay + decay * (1.0 - 0.55 * outdoor) + 0.12).clamp(0.25, 6.2);
+    let tail_seconds = (predelay + decay + 0.12).clamp(0.25, 6.2);
     let seconds = tail_seconds.max(max_tap_s + 0.08).clamp(0.25, 6.2);
     let length = (seconds * rate).round().max(1.0) as usize;
 
     // Stage 1: Late diffuse tail (normalized to unit channel energy before scaling by `late_scale`).
+    // Respect `profile.decay` directly (ray tracers already bake open-sky absorption into Eyring RT60)
+    // and apply a single clean open-sky late-level rolloff so outdoor spaces are never double-damped.
     let mut late = [vec![0.0f64; length], vec![0.0f64; length]];
     let mut late_energy = 0.0f64;
-    let effective_decay = (decay * (1.0 - 0.5 * outdoor)).max(0.12);
+    let effective_decay = decay.max(0.12);
     for (channel, seed) in late.iter_mut().zip(SEEDS) {
         let mut state = seed;
         let mut low = 0.0f64;
@@ -273,7 +286,7 @@ pub fn impulse_response_from_acoustics(rate: f64, profile: &AcousticProfile) -> 
         }
     }
     let late_norm = if late_energy > 0.0 { (ENERGY / (late_energy / 2.0)).sqrt() } else { 1.0 };
-    let late_scale = late_norm * late_gain * (1.0 - 0.85 * outdoor);
+    let late_scale = late_norm * late_gain * (1.0 - 0.78 * outdoor);
 
     // Stage 2: Ray-traced 3-band early reflections with Woodworth ITD (±0.65 ms) & equal-power panning.
     // Unity-reconstructing 3-band split: LP(450 Hz) + [LP(2400 Hz) - LP(450 Hz)] + [x - LP(2400 Hz)] == x!
@@ -639,5 +652,75 @@ mod tests {
         jittered.outdoor += 0.02;
         assert!(!profile.differs_significantly(&jittered));
         assert!(profile.differs_significantly(&outdoor_prof));
+    }
+
+    #[test]
+    fn acoustic_hysteresis_detects_symmetric_width_spectral_shift_and_sanitizes_malformed_wire() {
+        // Symmetric corridor (L/R taps at ±0.85) vs narrow center taps (±0.05): mean pan is 0 for both!
+        let wide_corridor = AcousticProfile {
+            decay: 1.4,
+            damping: 0.3,
+            predelay_s: 0.02,
+            early_gain: 0.8,
+            late_gain: 0.7,
+            outdoor: 0.0,
+            taps: vec![
+                AcousticTap { delay_s: 0.012, pan: -0.85, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
+                AcousticTap { delay_s: 0.012, pan: 0.85, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
+            ],
+        };
+        let narrow_hall = AcousticProfile {
+            taps: vec![
+                AcousticTap { delay_s: 0.012, pan: -0.05, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
+                AcousticTap { delay_s: 0.012, pan: 0.05, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 },
+            ],
+            ..wide_corridor.clone()
+        };
+        assert!(
+            wide_corridor.differs_significantly(&narrow_hall),
+            "hysteresis must detect stereo width change even when mean pan cancels to 0"
+        );
+
+        // Same mean energy (0.7) but bright stone vs muffled carpet HF/LF ratio.
+        let stone = AcousticProfile {
+            taps: vec![AcousticTap { delay_s: 0.012, pan: 0.0, gain_low: 0.7, gain_mid: 0.7, gain_high: 0.7 }],
+            ..wide_corridor.clone()
+        };
+        let carpet = AcousticProfile {
+            taps: vec![AcousticTap { delay_s: 0.012, pan: 0.0, gain_low: 1.15, gain_mid: 0.8, gain_high: 0.15 }],
+            ..wide_corridor
+        };
+        assert!(
+            stone.differs_significantly(&carpet),
+            "hysteresis must detect HF/LF material coloration change at identical mean tap energy"
+        );
+
+        // Malformed wire payloads (short, NaN/Inf, absurd tap count, truncated tail) never panic.
+        let short = pen_protocol::Extension { tag: ACOUSTICS_EXT_TAG, values: vec![1.0, 0.2] };
+        assert!(AcousticProfile::from_extensions(&[short]).is_none());
+
+        let hostile = pen_protocol::Extension {
+            tag: ACOUSTICS_EXT_TAG,
+            values: vec![
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                -5.0,
+                99.0,
+                f32::NAN,
+                1e20, // huge declared tap count with only 1 complete tap + 2 trailing floats
+                f32::NAN,
+                f32::INFINITY,
+                -1.0,
+                50.0,
+                f32::NAN,
+                0.01,
+                0.5,
+            ],
+        };
+        let parsed = AcousticProfile::from_extensions(&[hostile]).expect("sanitized fallback");
+        assert_eq!(parsed.taps.len(), 1);
+        let ir = impulse_response_from_acoustics(48_000.0, &parsed);
+        assert!(ir[0].iter().chain(&ir[1]).all(|v| v.is_finite()));
     }
 }

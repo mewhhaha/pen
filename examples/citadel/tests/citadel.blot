@@ -15,6 +15,7 @@ import {
   save,
   restore,
   populate_frame,
+  emit_arena_acoustics,
   emit_ui_tree,
   eval_hero_world_bones,
   compute_hero_skin_palette,
@@ -116,4 +117,56 @@ entry const test_pause_ui_tree_and_save_restore_roundtrip = func () =>
       U32.to_f32 (alive_sentinel_count w2),
     ],
     check.equal saved saved2,
+  ]
+
+entry const test_echo_vault_acoustics_occlusion_and_toggle = func () =>
+  let phys_scene = build_arena_physics ()
+  let phys = scene.queries phys_scene
+  let w = create ()
+  // 1) Behind the stone vault's west baffle wall (x = 2.8, z = -1.0): open courtyard + occluded beacon.
+  w.hero_pos := math.vec3 2.8 0.02 (-1.0)
+  w.sfx_beacon := true
+  let frame1 = render.begin_frame (render.empty_frame ())
+  let audio1 = sound.begin_frame (sound.empty_access ())
+  let (frame1, audio1) = populate_frame w frame1 audio1
+  let (w, frame1, audio1) = emit_arena_acoustics w phys_scene frame1 audio1
+  let outdoor_courtyard = w.room_acoustics.outdoor
+  let occ_behind_wall = w.beacon_acoustics.occlusion
+  let ext_count_on = frame1.extensions.length
+
+  // 2) Inside the roofed stone echo vault (x = 6.6, z = 0.0): enclosed stone reverb + clear beacon.
+  w.hero_pos := math.vec3 6.6 0.02 0.0
+  w.acoustics_primed := false
+  w.sfx_beacon := true
+  let frame2 = render.begin_frame (render.empty_frame ())
+  let audio2 = sound.begin_frame (sound.empty_access ())
+  let (frame2, audio2) = populate_frame w frame2 audio2
+  let (w, frame2, audio2) = emit_arena_acoustics w phys_scene frame2 audio2
+  let outdoor_vault = w.room_acoustics.outdoor
+  let occ_inside_vault = w.beacon_acoustics.occlusion
+  let decay_vault = w.room_acoustics.decay
+
+  // 3) Toggle acoustics OFF via KeyK: no ACOUSTICS_EXT_TAG emitted, panner stays unoccluded.
+  let press_k = #[$events.KeyDown keys.k]
+  w := step self phys 0.016 1280.0 720.0 (&press_k[0..1])
+  w.hero_pos := math.vec3 2.8 0.02 (-1.0)
+  w.sfx_beacon := true
+  let frame3 = render.begin_frame (render.empty_frame ())
+  let audio3 = sound.begin_frame (sound.empty_access ())
+  let (frame3, audio3) = populate_frame w frame3 audio3
+  let (w, frame3, audio3) = emit_arena_acoustics w phys_scene frame3 audio3
+  let ext_count_off = frame3.extensions.length
+  let panner_occ_off = if audio3.panners.length > 0 then audio3.panners[audio3.panners.length - 1].occlusion else 1.0
+
+  return check.report #[
+    check.equal #[1.0, 1.0, 1.0, 1.0, 1.0, 3.0, 2.0, 0.0] #[
+      if outdoor_vault < outdoor_courtyard - 0.15 then 1.0 else 0.0,
+      if occ_behind_wall > 0.35 then 1.0 else 0.0,
+      if occ_inside_vault < 0.15 then 1.0 else 0.0,
+      if decay_vault > 0.8 then 1.0 else 0.0,
+      if not w.acoustics_enabled then 1.0 else 0.0,
+      U32.to_f32 ext_count_on,
+      U32.to_f32 ext_count_off,
+      panner_occ_off,
+    ],
   ]

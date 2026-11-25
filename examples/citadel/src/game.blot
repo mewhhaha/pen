@@ -2,7 +2,7 @@
 //
 // Exercises the full Ink + Pen gameplay, animation, physics, AI, concurrency,
 // high-fidelity GPU rendering, and 3D spatial audio stack end-to-end:
-// - `ink/character` + `ink/scene` capsule sweep, wall slide, dais step-up & jump
+// - `ink/physics/character` + `ink/physics/scene` capsule sweep, wall slide, dais step-up & jump
 // - `ink/rig` spring-damped third-person chase camera + `ink/feel` trauma shake,
 //   hitstop impact freeze & damped weapon recoil
 // - `ink/animation` + `ink/animation/ik` 6-bone skinned hero rig (`push_skin_palette`)
@@ -20,7 +20,7 @@ import { Vec2, Vec3 } from "std/vector"
 import * as acoustics from "ink/audio/acoustics"
 import * as animation from "ink/animation"
 import * as bt from "ink/ai/bt"
-import * as character from "ink/character"
+import * as character from "ink/physics/character"
 import * as color from "ink/color"
 import * as events from "ink/events"
 import * as feel from "ink/feel"
@@ -34,7 +34,7 @@ import * as persist from "ink/persist"
 import * as preferences from "ink/preferences"
 import * as render from "ink/render"
 import * as rig from "ink/rig"
-import * as scene from "ink/scene"
+import * as scene from "ink/physics/scene"
 import * as services from "ink/services"
 import * as sound from "ink/sound"
 import * as transform from "ink/transform"
@@ -661,7 +661,7 @@ func step (world: own World) -> (phys: scene.Queries) -> (dt: F32) -> (width: F3
     let diff = math.atan2 (sin (target_yaw - world.hero_heading)) (cos (target_yaw - world.hero_heading))
     world.hero_heading := world.hero_heading + diff * min 1.0 (12.0 * sim_dt)
 
-  // Integrate gravity & horizontal velocity through `ink/character.move` against static arena physics!
+  // Integrate gravity & horizontal velocity through `ink/physics/character.move` against static arena physics!
   let wv = world.hero_walker
   let horiz_scale = if moving or world.dash_timer > 0.0 then speed else 0.0
   wv.velocity.x := wish_dir.x * horiz_scale

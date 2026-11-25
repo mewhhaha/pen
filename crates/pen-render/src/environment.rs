@@ -1140,7 +1140,7 @@ fn direction_at(pixel: vec2f) -> vec3f {{
     }
 
     /// The probe volume's light and confidence at `world` facing `n`, in f64:
-    /// the CPU interpolation `ink/probes.sample` does (bias a quarter spacing).
+    /// the CPU interpolation `ink/render/probes.sample` does (bias a quarter spacing).
     fn interpolate(probes: &[Probe], world: [f64; 3], n: [f64; 3]) -> [f64; 4] {
         let (origin, spacing, counts) = VOLUME;
         let (spacing, origin) = (f64::from(spacing), origin.map(f64::from));

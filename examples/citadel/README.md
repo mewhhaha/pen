@@ -2,7 +2,7 @@
 
 A self-contained playable 3D third-person arena vertical slice exercising the full **Ink** + **Pen** game stack end-to-end:
 
-- **Third-Person Character Controller & Physics (`ink/character`, `ink/scene`)**: Capsule sweep with pillar wall sliding, elevated dais step-up, gravity, jumping (`Space`), and stamina-gated burst dash (`Shift`).
+- **Third-Person Character Controller & Physics (`ink/physics/character`, `ink/physics/scene`)**: Capsule sweep with pillar wall sliding, elevated dais step-up, gravity, jumping (`Space`), and stamina-gated burst dash (`Shift`).
 - **Chase Camera & Game Feel (`ink/rig`, `ink/feel`)**: Spring-damped third-person follow camera (`rig.follow`) with `Q`/`E` orbit, trauma-squared camera shake (`feel.Trauma`), impact freeze hitstop (`feel.Hitstop`), and damped weapon recoil (`feel.Recoil`).
 - **Live Skinned Skeletal Animation + IK (`ink/animation`, `ink/animation/ik`)**: 6-bone articulated hero rig driven live in Blot via `animation.world`, `animation.skin_matrices`, `ik.two_bone`, and `render.push_skin_palette`, with the energy blade attached to the `sword_arm` bone via `animation.socket`.
 - **Voxel Navmesh, Behavior Tree AI & Blot 2 Concurrency (`ink/navigation/voxel`, `ink/ai/bt`, `ink/kernel_kits`, `ink/kernel_transport`)**: Arena walkable heightfield baked via `voxel.bake`, 4 sentinel guardians driven by a flat Behavior Tree (`bt.tick` patrol/chase/attack) + multi-core `entry kernel steer_crowd` separation.

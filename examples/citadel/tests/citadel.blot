@@ -5,7 +5,7 @@ import * as events from "ink/events"
 import * as keys from "ink/input/keys"
 import * as math from "ink/math"
 import * as render from "ink/render"
-import * as scene from "ink/scene"
+import * as scene from "ink/physics/scene"
 import * as sound from "ink/sound"
 import * as tree from "ink/ui/tree"
 import {

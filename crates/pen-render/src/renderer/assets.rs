@@ -428,8 +428,13 @@ impl State {
     ) -> Result<Option<(GpuAsset, Option<shader::Check>)>, String> {
         let device = self.device.clone();
         match loaded {
-            Loaded::Mesh(mesh) => {
-                let mesh = *mesh;
+            Loaded::Mesh(prepared) => {
+                let crate::mesh_cache::PreparedMesh {
+                    mesh,
+                    rt_triangles,
+                    meshlets: meshlet_data,
+                    meshlet_dag: meshlet_dag_data,
+                } = *prepared;
                 let vertex_bytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
                 let index_bytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
                 let instance_bytes: &[u8] =
@@ -481,110 +486,7 @@ impl State {
                 } else {
                     wgpu::BufferUsages::VERTEX
                 };
-                let rt_id = self.view_id();
-                let rt_source = mesh.lods.first().and_then(|lod| {
-                    let start = lod.first as usize;
-                    let end = start.saturating_add(lod.count as usize).min(mesh.indices.len());
-                    let idx_slice = mesh.indices.get(start..end)?;
-                    let tri_count = idx_slice.len() / 3;
-                    if tri_count == 0 {
-                        return None;
-                    }
-                    let mut triangles = Vec::with_capacity(tri_count);
-                    let verts = &mesh.vertices;
-                    let vlen = verts.len();
-                    let (tri_chunks, _) = idx_slice.as_chunks::<3>();
-                    for tri in tri_chunks {
-                        let o0 = tri[0] as usize * MESH_VERTEX_FLOATS;
-                        let o1 = tri[1] as usize * MESH_VERTEX_FLOATS;
-                        let o2 = tri[2] as usize * MESH_VERTEX_FLOATS;
-                        if o0 + 6 > vlen || o1 + 6 > vlen || o2 + 6 > vlen {
-                            continue;
-                        }
-                        triangles.push(crate::ray_tracing::BlasTriangle::smooth(
-                            [verts[o0], verts[o0 + 1], verts[o0 + 2]],
-                            [verts[o1], verts[o1 + 1], verts[o1 + 2]],
-                            [verts[o2], verts[o2 + 1], verts[o2 + 2]],
-                            [verts[o0 + 3], verts[o0 + 4], verts[o0 + 5]],
-                            [verts[o1 + 3], verts[o1 + 4], verts[o1 + 5]],
-                            [verts[o2 + 3], verts[o2 + 4], verts[o2 + 5]],
-                        ));
-                    }
-                    (!triangles.is_empty()).then(|| Arc::new(super::RtMeshSource { id: rt_id, triangles }))
-                });
-                let (meshlet_data, meshlet_dag_data) =
-                    if mesh.skin.is_none() && mesh.morphs.is_none() && mesh.instances.is_none() {
-                        let lod0_slice = mesh.lods.first().and_then(|lod0| {
-                            let start = lod0.first as usize;
-                            let end = start.checked_add(lod0.count as usize)?;
-                            mesh.indices.get(start..end)
-                        });
-                        if let Some(idx_slice) = lod0_slice
-                            && idx_slice.len() / 3 >= 128
-                        {
-                            let mut positions = Vec::with_capacity(mesh.vertices.len() / MESH_VERTEX_FLOATS);
-                            for v in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
-                                positions.push([v[0], v[1], v[2]]);
-                            }
-                            let ml = crate::meshlets::build_meshlets(
-                                &positions,
-                                idx_slice,
-                                crate::meshlets::DEFAULT_MAX_MESHLET_VERTICES,
-                                crate::meshlets::DEFAULT_MAX_MESHLET_TRIANGLES,
-                            )
-                            .ok()
-                            .filter(|ml| ml.meshlets.len() > 1);
-                            let dag = (idx_slice.len() / 3 >= 768)
-                                .then(|| {
-                                    let clean_indices: Vec<u32> = idx_slice
-                                        .as_chunks::<3>()
-                                        .0
-                                        .iter()
-                                        .filter(|&&[a, b, c]| {
-                                            let (Some(&pa), Some(&pb), Some(&pc)) = (
-                                                positions.get(a as usize),
-                                                positions.get(b as usize),
-                                                positions.get(c as usize),
-                                            ) else {
-                                                return false;
-                                            };
-                                            let ab = [
-                                                f64::from(pb[0]) - f64::from(pa[0]),
-                                                f64::from(pb[1]) - f64::from(pa[1]),
-                                                f64::from(pb[2]) - f64::from(pa[2]),
-                                            ];
-                                            let ac = [
-                                                f64::from(pc[0]) - f64::from(pa[0]),
-                                                f64::from(pc[1]) - f64::from(pa[1]),
-                                                f64::from(pc[2]) - f64::from(pa[2]),
-                                            ];
-                                            let nx = ab[1] * ac[2] - ab[2] * ac[1];
-                                            let ny = ab[2] * ac[0] - ab[0] * ac[2];
-                                            let nz = ab[0] * ac[1] - ab[1] * ac[0];
-                                            nx != 0.0 || ny != 0.0 || nz != 0.0
-                                        })
-                                        .flat_map(|t| *t)
-                                        .collect();
-                                    (clean_indices.len() / 3 >= 768)
-                                        .then(|| {
-                                            crate::meshlet_dag::build_meshlet_dag(
-                                                &positions,
-                                                &clean_indices,
-                                                &crate::meshlet_dag::MeshletDagConfig::default(),
-                                            )
-                                            .ok()
-                                            .filter(|d| d.level_count > 1 && d.clusters.len() > 1)
-                                        })
-                                        .flatten()
-                                })
-                                .flatten();
-                            (ml, dag)
-                        } else {
-                            (None, None)
-                        }
-                    } else {
-                        (None, None)
-                    };
+                let rt_source = rt_triangles.map(|triangles| Arc::new(super::RtMeshSource { id: self.view_id(), triangles }));
                 let (asset, check) = shader::scoped(&device, || {
                     let meshlets = meshlet_data.as_ref().map(|ml| super::MeshletGpuAsset {
                         indices: buffer(bytemuck::cast_slice(&ml.indices), wgpu::BufferUsages::INDEX),

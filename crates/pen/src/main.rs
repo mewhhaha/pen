@@ -152,7 +152,7 @@ fn cache_dir() -> Option<PathBuf> {
 /// compiled games, compiled plugins, what plugins run and keep, the GPU's
 /// compiled pipelines, what asset steps built, and tests' scratch files.
 #[cfg(feature = "compiler")]
-const CACHES: [&str; 7] = ["wasm", "components", "programs", "plugins", "pipelines", "assets", "tmp"];
+const CACHES: [&str; 8] = ["wasm", "components", "programs", "plugins", "pipelines", "meshlets", "assets", "tmp"];
 
 /// `pen clean`: deletes pen's caches, and nothing else there.
 #[cfg(feature = "compiler")]

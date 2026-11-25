@@ -1182,7 +1182,8 @@ impl State {
             depth_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
         let screen = crate::display::Screen::new(&device, options.display, options.format);
-        let loader = Loader::new(options.assets, context.clone())?;
+        let mesh_cache = crate::mesh_cache::MeshCache::from_pipeline_cache(options.pipeline_cache.as_deref());
+        let loader = Loader::new(options.assets, context.clone(), mesh_cache)?;
         let screen = crate::display::SharedScreen::new(screen);
         let mut state = Self::with(device, queue, context, loader, options.veil, screen)?;
         state.request_culling();

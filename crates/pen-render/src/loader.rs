@@ -12,9 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
-use crate::asset_store::{AssetKind, Material, Mesh, parse_material, parse_mesh, validate_asset_key};
+use crate::asset_store::{AssetKind, Material, parse_material, parse_mesh, validate_asset_key};
 use crate::built_in::BuiltIn;
 use crate::compressed::{self, LevelReader};
+use crate::mesh_cache::{MeshCache, PreparedMesh, prepare_mesh};
 use crate::packed_texture::{PackedHeader, PackedLevel};
 use crate::platform;
 use crate::prefetch::{Prefetch, Prepared};
@@ -105,7 +106,7 @@ pub(crate) enum Message {
 
 pub(crate) enum Loaded {
     // Boxed: a mesh is the largest thing a message carries, by far.
-    Mesh(Box<Mesh>),
+    Mesh(Box<PreparedMesh>),
     Material(Box<Material>),
     /// A shader's module; its pipelines compile in jobs of their own.
     Shader {
@@ -286,6 +287,8 @@ pub(crate) struct Worker {
     /// Assets read and decoded before the renderer was made, for their
     /// first loads.
     prefetch: Arc<Mutex<Option<Prefetch>>>,
+    /// On-disk cache for CPU-built meshlets and Cluster DAGs.
+    mesh_cache: MeshCache,
 }
 
 /// What a material needs of its shader: which variants, and whether it
@@ -329,23 +332,24 @@ pub(crate) struct Loader {
     pub results: Receiver<Message>,
     pub needs: Arc<Mutex<Needs>>,
     pub prefetch: Arc<Mutex<Option<Prefetch>>>,
+    mesh_cache: MeshCache,
     closed: Arc<AtomicBool>,
 }
 
 impl Loader {
-    pub fn new(root: PathBuf, context: PipelineContext) -> Result<Self> {
-        let (worker, loader) = Self::parts(root, context);
+    pub fn new(root: PathBuf, context: PipelineContext, mesh_cache: MeshCache) -> Result<Self> {
+        let (worker, loader) = Self::parts(root, context, mesh_cache);
         Ok(loader(JobQueue::new(worker)?))
     }
 
     /// A loader of assets under `root` for another renderer, on this one's
     /// threads.
     pub fn sharing(&self, root: PathBuf, context: PipelineContext) -> Self {
-        let (worker, loader) = Self::parts(root, context);
+        let (worker, loader) = Self::parts(root, context, self.mesh_cache.clone());
         loader(self.jobs.sharing(worker))
     }
 
-    fn parts(root: PathBuf, context: PipelineContext) -> (Worker, impl FnOnce(JobQueue) -> Loader) {
+    fn parts(root: PathBuf, context: PipelineContext, mesh_cache: MeshCache) -> (Worker, impl FnOnce(JobQueue) -> Loader) {
         let (sender, results) = channel();
         let closed = Arc::new(AtomicBool::new(false));
         let needs = Arc::new(Mutex::new(Needs::default()));
@@ -357,8 +361,9 @@ impl Loader {
             needs: needs.clone(),
             results: sender,
             prefetch: prefetch.clone(),
+            mesh_cache: mesh_cache.clone(),
         };
-        (worker, move |jobs| Loader { jobs, results, needs, prefetch, closed })
+        (worker, move |jobs| Loader { jobs, results, needs, prefetch, mesh_cache, closed })
     }
 }
 
@@ -494,7 +499,10 @@ impl Worker {
         };
         let bytes = match prepared {
             Some(Prepared::Bytes(bytes)) => bytes,
-            Some(Prepared::Mesh(mesh)) => return self.send(loaded(Ok(Loaded::Mesh(mesh)))),
+            Some(Prepared::Mesh(mesh)) => {
+                let prepared = prepare_mesh(*mesh, &self.mesh_cache);
+                return self.send(loaded(Ok(Loaded::Mesh(Box::new(prepared)))));
+            }
             Some(Prepared::Material(material)) => {
                 return self.send(loaded(self.material(key, Ok(*material)).map(|m| Loaded::Material(Box::new(m)))));
             }
@@ -525,7 +533,9 @@ impl Worker {
         };
         let device = &self.context.device;
         match kind {
-            AssetKind::Mesh => self.send(loaded(parse_mesh(&bytes).map(|mesh| Loaded::Mesh(Box::new(mesh))))),
+            AssetKind::Mesh => self.send(loaded(
+                parse_mesh(&bytes).map(|mesh| Loaded::Mesh(Box::new(prepare_mesh(mesh, &self.mesh_cache)))),
+            )),
             AssetKind::Material => {
                 let material = self.material(key, parse_material(&bytes));
                 self.send(loaded(material.map(|m| Loaded::Material(Box::new(m)))));

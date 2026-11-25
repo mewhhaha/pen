@@ -32,6 +32,7 @@ pub mod lines;
 mod loader;
 mod local_shadows;
 mod matrix;
+mod mesh_cache;
 pub mod meshlet_dag;
 pub mod meshlets;
 mod mipmaps;

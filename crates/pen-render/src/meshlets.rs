@@ -6,7 +6,7 @@
 //!   into baseline-WebGPU `DrawIndexedIndirect` records (`first_instance = 0`).
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "GPU meshlet buffer indices")]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use anyhow::{Result, ensure};
@@ -126,10 +126,16 @@ pub fn build_meshlets(
 
     let mut emitted = vec![false; tri_count];
     let mut in_frontier = vec![false; tri_count];
+    let mut vert_stamp = vec![0u32; positions.len()];
+    let mut stamp = 0u32;
     let mut emitted_count = 0usize;
     let mut meshlets = Vec::new();
     let mut out_indices = Vec::with_capacity(indices.len());
     let mut next_seed = 0usize;
+    let mut cluster_tris: Vec<usize> = Vec::with_capacity(max_triangles);
+    let mut cluster_verts: Vec<u32> = Vec::with_capacity(max_vertices);
+    let mut frontier: Vec<usize> = Vec::new();
+    let mut normals: Vec<[f64; 3]> = Vec::with_capacity(max_triangles);
 
     while emitted_count < tri_count {
         while next_seed < tri_count && emitted[morton_tris[next_seed]] {
@@ -139,18 +145,21 @@ pub fn build_meshlets(
             break;
         }
         let seed_tri = morton_tris[next_seed];
-        let mut cluster_tris: Vec<usize> = Vec::with_capacity(max_triangles);
-        let mut cluster_verts: HashSet<u32> = HashSet::with_capacity(max_vertices);
-        let mut frontier: Vec<usize> = Vec::new();
+        stamp += 1;
+        cluster_tris.clear();
+        cluster_verts.clear();
+        frontier.clear();
         let mut cx = 0.0f64;
         let mut cy = 0.0f64;
         let mut cz = 0.0f64;
 
         let push_tri = |t: usize,
+                        stamp: u32,
                         emitted: &mut [bool],
                         in_frontier: &mut [bool],
+                        vert_stamp: &mut [u32],
                         cluster_tris: &mut Vec<usize>,
-                        cluster_verts: &mut HashSet<u32>,
+                        cluster_verts: &mut Vec<u32>,
                         frontier: &mut Vec<usize>,
                         cx: &mut f64,
                         cy: &mut f64,
@@ -164,7 +173,9 @@ pub fn build_meshlets(
             *cz += f64::from(tc[2]);
             for k in 0..3 {
                 let v = indices[t * 3 + k];
-                if cluster_verts.insert(v) {
+                if vert_stamp[v as usize] != stamp {
+                    vert_stamp[v as usize] = stamp;
+                    cluster_verts.push(v);
                     for &nb in &adj[v as usize] {
                         if !emitted[nb] && !in_frontier[nb] {
                             in_frontier[nb] = true;
@@ -177,8 +188,10 @@ pub fn build_meshlets(
 
         push_tri(
             seed_tri,
+            stamp,
             &mut emitted,
             &mut in_frontier,
+            &mut vert_stamp,
             &mut cluster_tris,
             &mut cluster_verts,
             &mut frontier,
@@ -196,11 +209,11 @@ pub fn build_meshlets(
             for &cand in &frontier {
                 let (v0, v1, v2) = (indices[cand * 3], indices[cand * 3 + 1], indices[cand * 3 + 2]);
                 // Count DISTINCT unseen vertices even for degenerate triangles with repeated indices.
-                let mut added = usize::from(!cluster_verts.contains(&v0));
-                if v1 != v0 && !cluster_verts.contains(&v1) {
+                let mut added = usize::from(vert_stamp[v0 as usize] != stamp);
+                if v1 != v0 && vert_stamp[v1 as usize] != stamp {
                     added += 1;
                 }
-                if v2 != v0 && v2 != v1 && !cluster_verts.contains(&v2) {
+                if v2 != v0 && v2 != v1 && vert_stamp[v2 as usize] != stamp {
                     added += 1;
                 }
                 if cluster_verts.len() + added > max_vertices {
@@ -232,11 +245,11 @@ pub fn build_meshlets(
                     }
                     scanned += 1;
                     let (v0, v1, v2) = (indices[cand * 3], indices[cand * 3 + 1], indices[cand * 3 + 2]);
-                    let mut added = usize::from(!cluster_verts.contains(&v0));
-                    if v1 != v0 && !cluster_verts.contains(&v1) {
+                    let mut added = usize::from(vert_stamp[v0 as usize] != stamp);
+                    if v1 != v0 && vert_stamp[v1 as usize] != stamp {
                         added += 1;
                     }
-                    if v2 != v0 && v2 != v1 && !cluster_verts.contains(&v2) {
+                    if v2 != v0 && v2 != v1 && vert_stamp[v2 as usize] != stamp {
                         added += 1;
                     }
                     if cluster_verts.len() + added > max_vertices {
@@ -256,8 +269,10 @@ pub fn build_meshlets(
             };
             push_tri(
                 chosen,
+                stamp,
                 &mut emitted,
                 &mut in_frontier,
+                &mut vert_stamp,
                 &mut cluster_tris,
                 &mut cluster_verts,
                 &mut frontier,
@@ -299,7 +314,7 @@ pub fn build_meshlets(
         }
         let radius_f32 = (radius * (1.0 + 1e-6)) as f32 + f32::EPSILON;
 
-        let mut normals = Vec::with_capacity(cluster_tris.len());
+        normals.clear();
         let mut avg_n = [0.0f64; 3];
         for &t in &cluster_tris {
             let (i0, i1, i2) = (indices[t * 3], indices[t * 3 + 1], indices[t * 3 + 2]);

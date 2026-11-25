@@ -5,7 +5,8 @@
 //! index in the corresponding group. Follow parent group IDs to walk ancestry.
 #![allow(clippy::cast_possible_truncation, reason = "outward rounding and validated GPU counts")]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::OnceLock;
 
@@ -261,10 +262,57 @@ struct GroupGeometry {
     triangles: Vec<Triangle>,
 }
 
+#[derive(Clone, Copy)]
+struct CollapseEntry {
+    error: f64,
+    keep: u32,
+    remove: u32,
+    keep_ver: u32,
+    remove_ver: u32,
+}
+
+impl PartialEq for CollapseEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.error.to_bits() == other.error.to_bits()
+            && self.keep == other.keep
+            && self.remove == other.remove
+            && self.keep_ver == other.keep_ver
+            && self.remove_ver == other.remove_ver
+    }
+}
+
+impl Eq for CollapseEntry {}
+
+impl Ord for CollapseEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .error
+            .total_cmp(&self.error)
+            .then_with(|| (other.keep, other.remove).cmp(&(self.keep, self.remove)))
+            .then_with(|| (other.keep_ver, other.remove_ver).cmp(&(self.keep_ver, self.remove_ver)))
+    }
+}
+
+impl PartialOrd for CollapseEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Default)]
+struct CollapseScratch {
+    keep_neighbors: Vec<u32>,
+    remove_neighbors: Vec<u32>,
+    opposite: Vec<u32>,
+    faces: Vec<Triangle>,
+    affected_verts: Vec<u32>,
+    touched_edges: Vec<Edge>,
+}
+
 impl GroupGeometry {
     fn new(positions: &[[f32; 3]], tris: Vec<Triangle>) -> Self {
-        let mut original_ids = Vec::new();
-        let mut local_ids = HashMap::new();
+        let mut original_ids = Vec::with_capacity(tris.len());
+        let mut local_ids = HashMap::with_capacity(tris.len());
         let triangles = tris
             .into_iter()
             .map(|tri| {
@@ -285,76 +333,207 @@ impl GroupGeometry {
         let points: Vec<_> = self.positions.iter().map(|p| sub(p.map(f64::from), origin)).collect();
         let locked: Vec<_> = self.original_ids.iter().map(|id| locked.contains(id)).collect();
         let mut quadrics = vec![Quadric::default(); points.len()];
-        for &tri in &self.triangles {
+        let mut incident = vec![Vec::new(); points.len()];
+        let mut edge_counts: HashMap<Edge, u32> = HashMap::with_capacity(self.triangles.len() * 2);
+        for (i, &tri) in self.triangles.iter().enumerate() {
             let n = triangle_normal(&self.positions, tri);
             let length = dot(n, n).sqrt();
             let n = n.map(|x| x / length);
             let plane = [n[0], n[1], n[2], -dot(n, points[tri[0] as usize])];
             for vertex in tri {
                 quadrics[vertex as usize].add_plane(plane);
+                incident[vertex as usize].push(i);
+            }
+            for edge in edges(tri) {
+                *edge_counts.entry(edge).or_insert(0) += 1;
             }
         }
 
         let original = self.triangles.len();
         let target = original.div_ceil(2);
+        let mut tri_alive = vec![true; original];
+        let mut live_tris = original;
+        let mut vert_ver = vec![0u32; points.len()];
+        let mut heap: BinaryHeap<CollapseEntry> = BinaryHeap::with_capacity(edge_counts.len() * 2);
+
+        let push_edge = |edge: Edge,
+                         edge_counts: &HashMap<Edge, u32>,
+                         locked: &[bool],
+                         quadrics: &[Quadric],
+                         points: &[Point],
+                         vert_ver: &[u32],
+                         heap: &mut BinaryHeap<CollapseEntry>| {
+            if edge_counts.get(&edge).copied().unwrap_or(0) != 2 {
+                return;
+            }
+            let [a, b] = edge;
+            if locked[a as usize] && locked[b as usize] {
+                return;
+            }
+            let quadric = quadrics[a as usize].merged(quadrics[b as usize]);
+            for (keep, remove) in [(a, b), (b, a)] {
+                if !locked[remove as usize] {
+                    heap.push(CollapseEntry {
+                        error: quadric.error(points[keep as usize]),
+                        keep,
+                        remove,
+                        keep_ver: vert_ver[keep as usize],
+                        remove_ver: vert_ver[remove as usize],
+                    });
+                }
+            }
+        };
+
+        for &edge in edge_counts.keys() {
+            push_edge(edge, &edge_counts, &locked, &quadrics, &points, &vert_ver, &mut heap);
+        }
+
+        let mut scratch = CollapseScratch::default();
         let mut max_error: f64 = 0.0;
-        while self.triangles.len() > target {
-            let mut edge_counts = HashMap::new();
-            let mut incident = vec![Vec::new(); points.len()];
-            for (i, &tri) in self.triangles.iter().enumerate() {
-                for v in tri {
-                    incident[v as usize].push(i);
-                }
-                for edge in edges(tri) {
-                    *edge_counts.entry(edge).or_insert(0) += 1;
-                }
-            }
-            let mut candidates = Vec::new();
-            for ([a, b], count) in edge_counts {
-                if count != 2 || (locked[a as usize] && locked[b as usize]) {
-                    continue;
-                }
-                let quadric = quadrics[a as usize].merged(quadrics[b as usize]);
-                for (keep, remove) in [(a, b), (b, a)] {
-                    if !locked[remove as usize] {
-                        candidates.push((quadric.error(points[keep as usize]), keep, remove));
-                    }
-                }
-            }
-            candidates.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| (a.1, a.2).cmp(&(b.1, b.2))));
-            let Some((error, keep, remove)) =
-                candidates.into_iter().find(|&(_, keep, remove)| self.can_collapse(&incident, &locked, keep, remove))
-            else {
+        while live_tris > target {
+            let Some(entry) = heap.pop() else {
                 break;
             };
+            let keep = entry.keep;
+            let remove = entry.remove;
+            if entry.keep_ver != vert_ver[keep as usize] || entry.remove_ver != vert_ver[remove as usize] {
+                continue;
+            }
+            let edge = [keep.min(remove), keep.max(remove)];
+            if edge_counts.get(&edge).copied().unwrap_or(0) != 2 {
+                continue;
+            }
+            if !self.can_collapse(&incident, &locked, keep, remove, &mut scratch) {
+                continue;
+            }
+
+            // Collect every vertex whose incident triangles, quadric, or edge counts change.
+            scratch.affected_verts.clear();
+            scratch.affected_verts.push(keep);
+            for &ti in &incident[keep as usize] {
+                scratch.affected_verts.extend(self.triangles[ti]);
+            }
+            for &ti in &incident[remove as usize] {
+                scratch.affected_verts.extend(self.triangles[ti]);
+            }
+            scratch.affected_verts.sort_unstable();
+            scratch.affected_verts.dedup();
+
             quadrics[keep as usize] = quadrics[keep as usize].merged(quadrics[remove as usize]);
-            max_error = max_error.max(error.sqrt());
-            self.triangles.retain_mut(|tri| {
-                if tri.contains(&remove) && tri.contains(&keep) {
-                    return false;
+            max_error = max_error.max(entry.error.sqrt());
+
+            let removed_tris = std::mem::take(&mut incident[remove as usize]);
+            for ti in removed_tris {
+                if !tri_alive[ti] {
+                    continue;
                 }
-                *tri = tri.map(|v| if v == remove { keep } else { v });
-                true
-            });
+                let tri = self.triangles[ti];
+                for e in edges(tri) {
+                    if let Some(c) = edge_counts.get_mut(&e) {
+                        *c -= 1;
+                    }
+                }
+                if tri.contains(&keep) {
+                    tri_alive[ti] = false;
+                    live_tris -= 1;
+                    for v in tri {
+                        if v != remove {
+                            incident[v as usize].retain(|&x| x != ti);
+                        }
+                    }
+                } else {
+                    let updated = tri.map(|v| if v == remove { keep } else { v });
+                    self.triangles[ti] = updated;
+                    for e in edges(updated) {
+                        *edge_counts.entry(e).or_insert(0) += 1;
+                    }
+                    incident[keep as usize].push(ti);
+                }
+            }
+
+            for &v in &scratch.affected_verts {
+                vert_ver[v as usize] += 1;
+            }
+            scratch.touched_edges.clear();
+            for &v in &scratch.affected_verts {
+                for &ti in &incident[v as usize] {
+                    scratch.touched_edges.extend(edges(self.triangles[ti]));
+                }
+            }
+            scratch.touched_edges.sort_unstable();
+            scratch.touched_edges.dedup();
+            for &e in &scratch.touched_edges {
+                push_edge(e, &edge_counts, &locked, &quadrics, &points, &vert_ver, &mut heap);
+            }
         }
-        (self.triangles.len() < original).then_some(max_error)
+
+        if live_tris < original {
+            let mut write = 0;
+            for (read, &alive) in tri_alive.iter().enumerate() {
+                if alive {
+                    self.triangles[write] = self.triangles[read];
+                    write += 1;
+                }
+            }
+            self.triangles.truncate(write);
+            Some(max_error)
+        } else {
+            None
+        }
     }
 
-    fn can_collapse(&self, incident: &[Vec<usize>], locked: &[bool], keep: u32, remove: u32) -> bool {
-        let around = |vertex: u32| incident[vertex as usize].iter().map(|&i| self.triangles[i]);
-        let keep_neighbors: HashSet<_> = around(keep).flatten().filter(|&v| v != keep).collect();
-        let remove_neighbors: HashSet<_> = around(remove).flatten().filter(|&v| v != remove).collect();
+    fn can_collapse(
+        &self,
+        incident: &[Vec<usize>],
+        locked: &[bool],
+        keep: u32,
+        remove: u32,
+        scratch: &mut CollapseScratch,
+    ) -> bool {
+        scratch.keep_neighbors.clear();
+        for &i in &incident[keep as usize] {
+            for v in self.triangles[i] {
+                if v != keep && !scratch.keep_neighbors.contains(&v) {
+                    scratch.keep_neighbors.push(v);
+                }
+            }
+        }
+        scratch.remove_neighbors.clear();
+        for &i in &incident[remove as usize] {
+            for v in self.triangles[i] {
+                if v != remove && !scratch.remove_neighbors.contains(&v) {
+                    scratch.remove_neighbors.push(v);
+                }
+            }
+        }
         // A new edge between two locked vertices could already exist in a
         // neighboring group or be created there by a concurrent replacement.
         if locked[keep as usize]
-            && remove_neighbors.iter().any(|&v| v != keep && locked[v as usize] && !keep_neighbors.contains(&v))
+            && scratch
+                .remove_neighbors
+                .iter()
+                .any(|&v| v != keep && locked[v as usize] && !scratch.keep_neighbors.contains(&v))
         {
             return false;
         }
         // The link condition rules out pinching unrelated parts of the surface.
-        let opposite: HashSet<_> =
-            around(remove).filter(|tri| tri.contains(&keep)).flatten().filter(|&v| v != keep && v != remove).collect();
-        if opposite.len() != 2 || keep_neighbors.intersection(&remove_neighbors).any(|v| !opposite.contains(v)) {
+        scratch.opposite.clear();
+        for &i in &incident[remove as usize] {
+            let tri = self.triangles[i];
+            if tri.contains(&keep) {
+                for v in tri {
+                    if v != keep && v != remove && !scratch.opposite.contains(&v) {
+                        scratch.opposite.push(v);
+                    }
+                }
+            }
+        }
+        if scratch.opposite.len() != 2
+            || scratch
+                .keep_neighbors
+                .iter()
+                .any(|v| scratch.remove_neighbors.contains(v) && !scratch.opposite.contains(v))
+        {
             return false;
         }
 
@@ -362,13 +541,24 @@ impl GroupGeometry {
             tri.sort_unstable();
             tri
         };
-        let mut faces: HashSet<_> = around(keep).filter(|tri| !tri.contains(&remove)).map(face_key).collect();
-        for tri in around(remove).filter(|tri| !tri.contains(&keep)) {
-            let updated = tri.map(|v| if v == remove { keep } else { v });
-            if !faces.insert(face_key(updated))
-                || dot(triangle_normal(&self.positions, tri), triangle_normal(&self.positions, updated)) <= 0.0
-            {
-                return false;
+        scratch.faces.clear();
+        for &i in &incident[keep as usize] {
+            let tri = self.triangles[i];
+            if !tri.contains(&remove) {
+                scratch.faces.push(face_key(tri));
+            }
+        }
+        for &i in &incident[remove as usize] {
+            let tri = self.triangles[i];
+            if !tri.contains(&keep) {
+                let updated = tri.map(|v| if v == remove { keep } else { v });
+                let key = face_key(updated);
+                if scratch.faces.contains(&key)
+                    || dot(triangle_normal(&self.positions, tri), triangle_normal(&self.positions, updated)) <= 0.0
+                {
+                    return false;
+                }
+                scratch.faces.push(key);
             }
         }
         true
@@ -503,6 +693,31 @@ pub fn build_meshlet_dag(positions: &[[f32; 3]], indices: &[u32], config: &Meshl
     );
     ensure!(triangles(indices).all(|tri| triangle_normal(positions, tri) != [0.0; 3]), "mesh has degenerate triangles");
     let leaves = build_meshlets(positions, indices, config.max_vertices, config.max_triangles)?;
+    build_meshlet_dag_with_leaves(positions, leaves, config)
+}
+
+/// Builds a Cluster DAG from pre-partitioned leaf meshlets that already address
+/// finite positions and contain no degenerate triangles, avoiding a redundant
+/// leaf `build_meshlets` pass.
+pub(crate) fn build_meshlet_dag_from_leaves(
+    positions: &[[f32; 3]],
+    leaves: MeshletMesh,
+    config: &MeshletDagConfig,
+) -> Result<MeshletDagMesh> {
+    ensure!(config.max_levels >= 1, "max_levels must be at least 1");
+    ensure!(config.target_group_size >= 2, "target_group_size must be at least 2");
+    ensure!(
+        leaves.indices.iter().all(|&i| positions.get(i as usize).is_some_and(|p| p.iter().all(|x| x.is_finite()))),
+        "mesh indices must address finite positions"
+    );
+    build_meshlet_dag_with_leaves(positions, leaves, config)
+}
+
+fn build_meshlet_dag_with_leaves(
+    positions: &[[f32; 3]],
+    leaves: MeshletMesh,
+    config: &MeshletDagConfig,
+) -> Result<MeshletDagMesh> {
     let mut mesh = MeshletDagMesh {
         clusters: Vec::new(),
         indices: Vec::new(),

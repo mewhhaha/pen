@@ -65,24 +65,11 @@ fn wasm_type(value: ValueType) -> ValType {
     }
 }
 
-#[cfg(feature = "compiler")]
-struct LazyWasmtime {
-    engine: Engine,
-    wasm: Arc<[u8]>,
-    cache: Option<std::path::PathBuf>,
-    shape: MemoryShape,
-    abi: Arc<GuestAbi>,
-    compiled: std::sync::OnceLock<std::result::Result<Module, String>>,
-}
-
 #[derive(Clone)]
+#[cfg_attr(not(feature = "compiler"), allow(dead_code))]
 enum CompiledModule {
     Wasmtime(Module),
-    WtimeAot {
-        aot: wtime_aot::AotModule,
-        #[cfg(feature = "compiler")]
-        lazy_wasmtime: Option<Arc<LazyWasmtime>>,
-    },
+    WtimeAot { engine: Engine, aot: wtime_aot::AotModule },
 }
 
 /// A compiled guest module, its manifest and its debug information, ready
@@ -236,25 +223,9 @@ impl GuestModule {
             let shape = read_memory_shape(wasm)?;
             validate_memory_shape(&shape)?;
             let use_aot = if prefer_aot { wtime_aot::preferred_for_run() } else { wtime_aot::enabled() };
-            let (module, imaged) = if use_aot
-                && engine_allows_aot(engine)
-                && abi.tasks.is_none()
-                && abi.processes.is_empty()
-            {
+            let (module, imaged) = if use_aot && engine_allows_aot(engine) && abi.tasks.is_none() {
                 let (aot, imaged) = wtime_aot::AotModule::compile(wasm, &abi, cache)?;
-                let lazy_wasmtime = if !abi.kernels.is_empty() {
-                    Some(Arc::new(LazyWasmtime {
-                        engine: engine.clone(),
-                        wasm: Arc::from(wasm),
-                        cache: cache.map(Path::to_path_buf),
-                        shape,
-                        abi: Arc::clone(&abi),
-                        compiled: std::sync::OnceLock::new(),
-                    }))
-                } else {
-                    None
-                };
-                (CompiledModule::WtimeAot { aot, lazy_wasmtime }, Arc::new(imaged))
+                (CompiledModule::WtimeAot { engine: engine.clone(), aot }, Arc::new(imaged))
             } else {
                 let module = compile(engine, wasm, cache)?;
                 validate_raw_memory_shape(&module, &shape)?;
@@ -270,55 +241,28 @@ impl GuestModule {
         }
     }
 
-    /// Underlying Wasmtime [`Module`], when not executing via `wtime-aot` (or once lazily
-    /// compiled for background `KernelPool` execution).
+    /// Underlying Wasmtime [`Module`], when not executing via `wtime-aot`.
     pub fn wasmtime_module(&self) -> Option<&Module> {
         match &self.module {
             CompiledModule::Wasmtime(module) => Some(module),
-            #[cfg(feature = "compiler")]
-            CompiledModule::WtimeAot { lazy_wasmtime: Some(lazy), .. } => {
-                lazy.compiled.get().and_then(|res| res.as_ref().ok())
-            }
             CompiledModule::WtimeAot { .. } => None,
         }
     }
 
-    /// Returns the underlying Wasmtime [`Module`] matching `expected_engine`, lazily compiling
-    /// from the original Wasm bytes when a `wtime-aot` module also declares `blot:kernels`.
-    pub(crate) fn ensure_wasmtime_module(&self, expected_engine: &Engine) -> std::result::Result<&Module, kernels::KernelError> {
+    /// Whether `expected` is the exact [`Engine`] instance this module was bound to.
+    pub(crate) fn matches_engine(&self, expected: &Engine) -> bool {
         match &self.module {
-            CompiledModule::Wasmtime(module) => {
-                if !Engine::same(expected_engine, module.engine()) {
-                    return Err(kernels::KernelError::EngineMismatch);
-                }
-                Ok(module)
-            }
-            #[cfg(feature = "compiler")]
-            CompiledModule::WtimeAot { lazy_wasmtime: Some(lazy), .. } => {
-                if !Engine::same(expected_engine, &lazy.engine) {
-                    return Err(kernels::KernelError::EngineMismatch);
-                }
-                let res = lazy.compiled.get_or_init(|| {
-                    let module = compile(&lazy.engine, &lazy.wasm, lazy.cache.as_deref())
-                        .map_err(|e| format!("{e:#}"))?;
-                    validate_raw_memory_shape(&module, &lazy.shape).map_err(|e| format!("{e:#}"))?;
-                    validate_module(&module, &lazy.abi).map_err(|e| format!("{e:#}"))?;
-                    Ok(module)
-                });
-                match res {
-                    Ok(module) => Ok(module),
-                    Err(msg) => Err(kernels::KernelError::Internal(format!(
-                        "compiling Wasmtime kernel fallback: {msg}"
-                    ))),
-                }
-            }
-            CompiledModule::WtimeAot { .. } => Err(kernels::KernelError::WtimeAotUnsupported),
+            CompiledModule::Wasmtime(module) => Engine::same(expected, module.engine()),
+            CompiledModule::WtimeAot { engine, .. } => Engine::same(expected, engine),
         }
     }
 
     /// Underlying Wasmtime [`Engine`] this module was compiled/deserialized for.
     pub fn engine(&self) -> Option<&Engine> {
-        self.wasmtime_module().map(Module::engine)
+        match &self.module {
+            CompiledModule::Wasmtime(module) => Some(module.engine()),
+            CompiledModule::WtimeAot { engine, .. } => Some(engine),
+        }
     }
 
     /// Backend executing this module (`"wtime-aot"` or `"wasmtime"`).
@@ -1030,6 +974,148 @@ enum GuestBackend {
     WtimeAot(Box<wtime_aot::AotGuest>),
 }
 
+/// Unified controlled guest backend used by [`kernels::KernelPool`] and [`processes::Processes`].
+pub(crate) enum ControlledGuest {
+    Wasmtime(Box<WasmtimeGuest>),
+    WtimeAot(Box<wtime_aot::AotGuest>),
+}
+
+impl ControlledGuest {
+    pub(crate) fn start_controlled(
+        engine: &Engine,
+        module: &GuestModule,
+        limits: Option<Limits>,
+        deadline_at: Option<Instant>,
+        cancel_hook: Option<Arc<AtomicBool>>,
+        initial_fuel: Option<u64>,
+    ) -> Result<Self> {
+        match &module.module {
+            CompiledModule::Wasmtime(wt_module) => {
+                let guest = WasmtimeGuest::start_controlled(
+                    engine,
+                    wt_module,
+                    module,
+                    limits,
+                    deadline_at,
+                    cancel_hook,
+                    initial_fuel,
+                )?;
+                Ok(Self::Wasmtime(Box::new(guest)))
+            }
+            CompiledModule::WtimeAot { aot, .. } => {
+                ensure!(
+                    engine_allows_aot(engine) && deadline_at.is_none() && initial_fuel.is_none(),
+                    "wtime-aot controlled guest requires an unmetered engine without deadlines or fuel"
+                );
+                let guest = wtime_aot::AotGuest::start(aot, module.abi.clone(), module.imaged.clone(), limits)?;
+                Ok(Self::WtimeAot(Box::new(guest)))
+            }
+        }
+    }
+
+    pub(crate) fn saw_oom(&self) -> bool {
+        match self {
+            Self::Wasmtime(wt) => wt.saw_oom(),
+            Self::WtimeAot(aot) => aot.saw_oom(),
+        }
+    }
+
+    pub(crate) fn clear_saw_oom(&mut self) {
+        match self {
+            Self::Wasmtime(wt) => wt.clear_saw_oom(),
+            Self::WtimeAot(aot) => aot.clear_saw_oom(),
+        }
+    }
+
+    pub(crate) fn arena_oom_flag(&self) -> u32 {
+        match self {
+            Self::Wasmtime(wt) => wt.arena_oom_flag(),
+            Self::WtimeAot(aot) => aot.arena_oom_flag(),
+        }
+    }
+
+    pub(crate) fn has_arena(&self) -> bool {
+        match self {
+            Self::Wasmtime(wt) => wt.has_arena(),
+            Self::WtimeAot(aot) => aot.has_arena(),
+        }
+    }
+
+    pub(crate) fn arm_execution(
+        &mut self,
+        deadline_at: Option<Instant>,
+        cancel_hook: Option<Arc<AtomicBool>>,
+        fuel: Option<u64>,
+    ) -> Result<()> {
+        match self {
+            Self::Wasmtime(wt) => wt.arm_execution(deadline_at, cancel_hook, fuel),
+            Self::WtimeAot(_) => {
+                ensure!(
+                    deadline_at.is_none() && fuel.is_none(),
+                    "wtime-aot controlled guest does not support deadlines or fuel"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn reset_arena(&mut self) -> Result<()> {
+        match self {
+            Self::Wasmtime(wt) => wt.reset_arena(),
+            Self::WtimeAot(aot) => aot.reset_arena(),
+        }
+    }
+
+    pub(crate) fn write_words_packet(&mut self, words: &[u32]) -> Result<i32> {
+        match self {
+            Self::Wasmtime(wt) => wt.write_words_packet(words),
+            Self::WtimeAot(aot) => aot.write_words_packet(words),
+        }
+    }
+
+    pub(crate) fn call_raw(&mut self, name: &str, param: Val, result_is_f32: bool) -> Result<Val> {
+        match self {
+            Self::Wasmtime(wt) => wt.call_raw(name, param),
+            Self::WtimeAot(aot) => aot.call_raw(name, param, result_is_f32),
+        }
+    }
+
+    pub(crate) fn inspect_packet_header(&self, pointer: i32) -> Result<u32> {
+        match self {
+            Self::Wasmtime(wt) => wt.inspect_packet_header(pointer),
+            Self::WtimeAot(aot) => aot.inspect_packet_header(pointer),
+        }
+    }
+
+    pub(crate) fn read_packet_words_into(&self, pointer: i32, expected_words: usize, dst: &mut [u32]) -> Result<()> {
+        match self {
+            Self::Wasmtime(wt) => wt.read_packet_words_into(pointer, expected_words, dst),
+            Self::WtimeAot(aot) => aot.read_packet_words_into(pointer, expected_words, dst),
+        }
+    }
+
+    pub(crate) fn read_packet_words_vec(&self, pointer: i32, words: usize) -> Result<Vec<u32>> {
+        match self {
+            Self::Wasmtime(wt) => wt.read_packet_words_vec(pointer, words),
+            Self::WtimeAot(aot) => aot.read_packet_words_vec(pointer, words),
+        }
+    }
+
+    pub(crate) fn finish_invocation(&mut self) -> Result<Option<u32>> {
+        match self {
+            Self::Wasmtime(wt) => wt.finish_invocation(),
+            Self::WtimeAot(aot) => aot.finish_invocation(),
+        }
+    }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        match self {
+            Self::Wasmtime(wt) => wt.memory_bytes(),
+            Self::WtimeAot(aot) => aot.memory_bytes(),
+        }
+    }
+}
+
 /// One instance of a guest module.
 pub struct Guest {
     backend: GuestBackend,
@@ -1354,7 +1440,8 @@ impl WasmtimeGuest {
     }
 
     pub(crate) fn write_words_packet(&mut self, words: &[u32]) -> Result<i32> {
-        let arena = self.store.data().arena.clone().ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
+        let arena =
+            self.store.data().arena.clone().ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
         ensure!(words.len() < 1_073_741_823, "array byte count exceeds the Wasm32 address range");
         let length = u32::try_from(words.len())?;
         let byte_len = (length + 1).checked_mul(4).ok_or_else(|| anyhow!("packet byte count overflow"))?;
@@ -1389,7 +1476,8 @@ impl WasmtimeGuest {
     /// Reads the raw 32-bit header word at `pointer` directly from Wasm linear memory
     /// BEFORE allocating any host copy (enabling `[0xffffffff]` sentinel and pre-copy size inspection).
     pub(crate) fn inspect_packet_header(&self, pointer: i32) -> Result<u32> {
-        let arena = self.store.data().arena.as_ref().ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
+        let arena =
+            self.store.data().arena.as_ref().ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
         let memory = arena.memory.data(&self.store);
         let address = array_range(memory.len(), pointer, 0)?;
         let header = u32::from_le_bytes(memory[address..address + 4].try_into().unwrap());
@@ -1402,7 +1490,8 @@ impl WasmtimeGuest {
     /// Copies `expected_words` words directly from Wasm linear memory into `dst` (zero intermediate buffers).
     pub(crate) fn read_packet_words_into(&self, pointer: i32, expected_words: usize, dst: &mut [u32]) -> Result<()> {
         ensure!(dst.len() == expected_words, "destination slice length mismatch");
-        let arena = self.store.data().arena.as_ref().ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
+        let arena =
+            self.store.data().arena.as_ref().ok_or_else(|| anyhow!("invalid_abi: array value requires an arena"))?;
         let memory = arena.memory.data(&self.store);
         let address = array_range(memory.len(), pointer, expected_words)?;
         let header = u32::from_le_bytes(memory[address..address + 4].try_into().unwrap()) as usize;
@@ -1619,10 +1708,7 @@ impl WasmtimeGuest {
             ensure!(seen.insert(name.as_str()), "duplicate imaged global in snapshot: {name}");
             let global = self.instance.get_global(&mut self.store, name).context("an imaged global disappeared")?;
             let ty = global.ty(&self.store);
-            ensure!(
-                ty.mutability() == wasmtime::Mutability::Var,
-                "imaged global {name} is not mutable"
-            );
+            ensure!(ty.mutability() == wasmtime::Mutability::Var, "imaged global {name} is not mutable");
             let kind_matches = matches!(
                 (ty.content(), value),
                 (wasmtime::ValType::I32, Val::I32(_))
@@ -1702,10 +1788,8 @@ pub(crate) fn is_trap_interrupt(error: &anyhow::Error) -> bool {
 }
 
 pub(crate) fn is_unrecoverable_trap(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<Trap>(),
-        Some(Trap::Interrupt | Trap::OutOfFuel | Trap::StackOverflow)
-    )
+    matches!(error.downcast_ref::<Trap>(), Some(Trap::Interrupt | Trap::OutOfFuel | Trap::StackOverflow))
+        || wtime_aot::is_unrecoverable_aot_trap(error)
 }
 
 /// What an ABI 3 guest's runtime counts of the memory it owns, through the
@@ -3013,16 +3097,13 @@ mod tests {
         // invokes the restored active host callback once while encoding an array result.
         let abi = [&[0x02, 0x01][..], &name("run"), &[0x04, 0x01, 0x05, 0x01, 0x00]].concat();
         // Types: 0=(externref,i32)->i32, 1=(externref)->i32, 2=(i32)->i32
-        let types = [
-            0x03, 0x60, 0x02, 0x6f, 0x7f, 0x01, 0x7f, 0x60, 0x01, 0x6f, 0x01, 0x7f, 0x60, 0x01, 0x7f, 0x01, 0x7f,
-        ];
+        let types =
+            [0x03, 0x60, 0x02, 0x6f, 0x7f, 0x01, 0x7f, 0x60, 0x01, 0x6f, 0x01, 0x7f, 0x60, 0x01, 0x7f, 0x01, 0x7f];
         let imports = [&[0x01][..], &name(HOST_MODULE), &name("call_u32_array_u32"), &[0x00, 0x00]].concat();
         let funcs = [0x03, 0x01, 0x02, 0x02];
         let memory = [0x01, 0x00, 0x01];
         // Globals: 0=mut externref (cap), 1=mut i32 (cursor, non-zero), 2=mut i32 (reentry guard)
-        let globals = [
-            0x03, 0x6f, 0x01, 0xd0, 0x6f, 0x0b, 0x7f, 0x01, 0x41, 0x10, 0x0b, 0x7f, 0x01, 0x41, 0x00, 0x0b,
-        ];
+        let globals = [0x03, 0x6f, 0x01, 0xd0, 0x6f, 0x0b, 0x7f, 0x01, 0x41, 0x10, 0x0b, 0x7f, 0x01, 0x41, 0x00, 0x0b];
         let exports = [
             &[0x04][..],
             &name("run"),
@@ -3037,13 +3118,13 @@ mod tests {
         .concat();
         // fn 1 (run): local 1 i32; global.set 0(local 0); local 1 = call 0(local 0, 1); load(4) + load(8)
         let run_body = [
-            0x01, 0x01, 0x7f, 0x20, 0x00, 0x24, 0x00, 0x20, 0x00, 0x41, 0x01, 0x10, 0x00, 0x21, 0x01, 0x20, 0x01,
-            0x28, 0x02, 0x04, 0x20, 0x01, 0x28, 0x02, 0x08, 0x6a, 0x0b,
+            0x01, 0x01, 0x7f, 0x20, 0x00, 0x24, 0x00, 0x20, 0x00, 0x41, 0x01, 0x10, 0x00, 0x21, 0x01, 0x20, 0x01, 0x28,
+            0x02, 0x04, 0x20, 0x01, 0x28, 0x02, 0x08, 0x6a, 0x0b,
         ];
         // fn 2 (blot:allocate): local 1 i32; if !global2 { global2=1; drop(call 0(global0, 2)); } bump global1
         let alloc_body = [
-            0x01, 0x01, 0x7f, 0x23, 0x02, 0x45, 0x04, 0x40, 0x41, 0x01, 0x24, 0x02, 0x23, 0x00, 0x41, 0x02, 0x10,
-            0x00, 0x1a, 0x0b, 0x23, 0x01, 0x21, 0x01, 0x20, 0x01, 0x20, 0x00, 0x6a, 0x24, 0x01, 0x20, 0x01, 0x0b,
+            0x01, 0x01, 0x7f, 0x23, 0x02, 0x45, 0x04, 0x40, 0x41, 0x01, 0x24, 0x02, 0x23, 0x00, 0x41, 0x02, 0x10, 0x00,
+            0x1a, 0x0b, 0x23, 0x01, 0x21, 0x01, 0x20, 0x01, 0x20, 0x00, 0x6a, 0x24, 0x01, 0x20, 0x01, 0x0b,
         ];
         // fn 3 (blot:reset): global1 = 16; global2 = 0; return 0
         let reset_body = [0x00, 0x41, 0x10, 0x24, 0x01, 0x41, 0x00, 0x24, 0x02, 0x41, 0x00, 0x0b];

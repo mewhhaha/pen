@@ -1,4 +1,4 @@
-//! Unified warm work-stealing multi-core `KernelPool` for ABI 8 `entry kernel`
+//! Unified warm work-stealing multi-core `KernelPool` for ABI 8 `#kernel`
 //! modules (`blot2/tasks/CONCURRENCY_VNEXT.md` §5.1).
 use std::cell::UnsafeCell;
 use std::cmp::Reverse;
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use wasmtime::{Engine, Val};
 
 use crate::{
-    GUEST_STACK_BYTES, GuestModule, KernelManifest, Limits, ValueType, WasmtimeGuest, WireSchemaKind,
+    ControlledGuest, GUEST_STACK_BYTES, GuestModule, KernelManifest, Limits, ValueType, WireSchemaKind,
     ensure_engine_ticker, is_trap_interrupt, is_unrecoverable_trap,
 };
 
@@ -95,7 +95,7 @@ impl fmt::Display for KernelError {
                 write!(f, "KernelPool deadline requires an epoch-interrupted engine")
             }
             KernelError::WtimeAotUnsupported => write!(f, "KernelPool requires a Wasmtime module, not wtime-aot"),
-            KernelError::UnknownKernel(name) => write!(f, "unknown entry kernel `{name}`"),
+            KernelError::UnknownKernel(name) => write!(f, "unknown #kernel `{name}`"),
             KernelError::InvalidConfig(msg) => write!(f, "invalid KernelPool config: {msg}"),
             KernelError::ContextNotSupported => write!(f, "kernel does not accept a prepared context"),
             KernelError::ContextNotPrepared => write!(f, "prepared kernel context has not been set"),
@@ -192,7 +192,7 @@ struct PreparedContextSnapshot {
 }
 
 struct WorkerGuest {
-    guest: WasmtimeGuest,
+    guest: ControlledGuest,
     installed_snapshot_id: Option<u64>,
     store_has_prior_history: bool,
 }
@@ -215,7 +215,12 @@ impl DisjointStorage {
 
     /// # Safety
     /// Caller must hold exclusive ownership of `[start_word..end_word)` within `0..self.len`.
-    unsafe fn write_disjoint(&self, start_word: usize, end_word: usize, writer: impl FnOnce(&mut [u32]) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    unsafe fn write_disjoint(
+        &self,
+        start_word: usize,
+        end_word: usize,
+        writer: impl FnOnce(&mut [u32]) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         debug_assert!(start_word <= end_word && end_word <= self.len);
         // SAFETY: `self.data` is a heap-allocated `Box<[u32]>` whose buffer never moves;
         // caller guarantees disjointness of `[start_word..end_word)`.
@@ -249,27 +254,12 @@ enum BatchMode {
 }
 
 enum ChunkState {
-    FixedDone {
-        end_item: usize,
-    },
-    VariableBuffered {
-        end_item: usize,
-        words: Vec<u32>,
-    },
-    VariableSettled {
-        end_item: usize,
-        words: Vec<u32>,
-    },
-    OverBudgetHint {
-        result_bytes: usize,
-    },
-    CleanupFailed {
-        result_bytes: usize,
-        detail: String,
-    },
-    PrimaryError {
-        error: KernelError,
-    },
+    FixedDone { end_item: usize },
+    VariableBuffered { end_item: usize, words: Vec<u32> },
+    VariableSettled { end_item: usize, words: Vec<u32> },
+    OverBudgetHint { result_bytes: usize },
+    CleanupFailed { result_bytes: usize, detail: String },
+    PrimaryError { error: KernelError },
 }
 
 enum AdmitDecision {
@@ -306,12 +296,7 @@ struct BatchCoord {
 }
 
 impl BatchCoord {
-    fn new(
-        total_items: usize,
-        max_chunk_items: usize,
-        max_total_output_bytes: usize,
-        mode: BatchMode,
-    ) -> Self {
+    fn new(total_items: usize, max_chunk_items: usize, max_total_output_bytes: usize, mode: BatchMode) -> Self {
         let mut pending = BinaryHeap::new();
         let mut start = 0;
         while start < total_items {
@@ -345,17 +330,13 @@ impl BatchCoord {
         if start_item < self.earliest_failed_item {
             self.earliest_failed_item = start_item;
             // Drop queued unstarted ranges >= earliest_failed_item.
-            let kept: Vec<_> = self
-                .pending
-                .drain()
-                .filter(|Reverse(r)| r.start_item < self.earliest_failed_item)
-                .collect();
+            let kept: Vec<_> =
+                self.pending.drain().filter(|Reverse(r)| r.start_item < self.earliest_failed_item).collect();
             for item in kept {
                 self.pending.push(item);
             }
             // Drop any buffered chunks strictly above earliest_failed_item to free budget immediately.
-            let drop_keys: Vec<usize> =
-                self.chunks.range((start_item + 1)..).map(|(&k, _)| k).collect();
+            let drop_keys: Vec<usize> = self.chunks.range((start_item + 1)..).map(|(&k, _)| k).collect();
             for key in drop_keys {
                 if let Some(ChunkState::VariableBuffered { words, .. }) = self.chunks.remove(&key) {
                     self.higher_buffered_bytes = self.higher_buffered_bytes.saturating_sub(words.len() * 4);
@@ -381,10 +362,7 @@ impl BatchCoord {
         if let Some(ChunkState::VariableBuffered { words, .. }) = self.chunks.remove(&range.start_item) {
             self.higher_buffered_bytes = self.higher_buffered_bytes.saturating_sub(words.len() * 4);
         }
-        self.chunks.insert(
-            range.start_item,
-            ChunkState::CleanupFailed { result_bytes, detail },
-        );
+        self.chunks.insert(range.start_item, ChunkState::CleanupFailed { result_bytes, detail });
         self.tighten_failure(range.start_item);
     }
 
@@ -400,25 +378,17 @@ impl BatchCoord {
         while self.settled_prefix_bytes + self.higher_buffered_bytes + self.in_flight_copy_bytes + need_bytes
             > self.max_total_output_bytes
         {
-            let candidate = self
-                .chunks
-                .range((above_item + 1)..)
-                .rev()
-                .find_map(|(&k, state)| match state {
-                    ChunkState::VariableBuffered { end_item, .. } => Some((k, *end_item)),
-                    _ => None,
-                });
+            let candidate = self.chunks.range((above_item + 1)..).rev().find_map(|(&k, state)| match state {
+                ChunkState::VariableBuffered { end_item, .. } => Some((k, *end_item)),
+                _ => None,
+            });
             let Some((key, end_item)) = candidate else {
                 break;
             };
             if let Some(ChunkState::VariableBuffered { words, .. }) = self.chunks.remove(&key) {
                 self.higher_buffered_bytes = self.higher_buffered_bytes.saturating_sub(words.len() * 4);
                 if key < self.earliest_failed_item {
-                    self.pending.push(Reverse(WorkRange {
-                        start_item: key,
-                        end_item,
-                        retried_fresh: false,
-                    }));
+                    self.pending.push(Reverse(WorkRange { start_item: key, end_item, retried_fresh: false }));
                 }
             }
         }
@@ -549,7 +519,7 @@ struct WorkerCommand {
     busy: bool,
 }
 
-/// Unified warm work-stealing `KernelPool` for `entry kernel` modules.
+/// Unified warm work-stealing `KernelPool` for `#kernel` modules.
 pub struct KernelPool {
     ctx: PoolContext,
     max_chunk_items: usize,
@@ -565,14 +535,16 @@ pub struct KernelPool {
 }
 
 impl KernelPool {
-    /// Opens a warm [`KernelPool`] for `entry kernel` `name` on `engine` + `module`.
+    /// Opens a warm [`KernelPool`] for `#kernel` `name` on `engine` + `module`.
     pub fn open(
         engine: &Engine,
         module: &GuestModule,
         name: &str,
         config: KernelConfig,
     ) -> std::result::Result<Self, KernelError> {
-        let _wt_module = module.ensure_wasmtime_module(engine)?;
+        if !module.matches_engine(engine) {
+            return Err(KernelError::EngineMismatch);
+        }
         if engine.get_consume_fuel() {
             return Err(KernelError::FuelEngineUnsupportedForKernels);
         }
@@ -589,11 +561,7 @@ impl KernelPool {
                 "max_physical_output_bytes must be >= max_total_output_bytes".into(),
             ));
         }
-        let manifest = module
-            .abi()
-            .kernel(name)
-            .cloned()
-            .ok_or_else(|| KernelError::UnknownKernel(name.to_owned()))?;
+        let manifest = module.abi().kernel(name).cloned().ok_or_else(|| KernelError::UnknownKernel(name.to_owned()))?;
 
         // Unconditionally guarantee a live wakeable epoch ticker whenever the engine has epoch interruption,
         // even when `config.deadline.is_none()`, so epoch-timed cleanup grace can never hang!
@@ -712,10 +680,7 @@ impl KernelPool {
             return Err(KernelError::InvalidInputLength { words: words.len(), stride: max_words.max(1) });
         }
         if ctx_schema.kind == WireSchemaKind::FlatFixed && words.len() != ctx_schema.stride as usize {
-            return Err(KernelError::InvalidInputLength {
-                words: words.len(),
-                stride: ctx_schema.stride as usize,
-            });
+            return Err(KernelError::InvalidInputLength { words: words.len(), stride: ctx_schema.stride as usize });
         }
         let deadline_at = self.ctx.config.deadline.map(|d| Instant::now() + d);
         if let Some(existing) = &self.current_ctx
@@ -737,11 +702,7 @@ impl KernelPool {
         }
         let snapshot_id = self.next_snapshot_id;
         self.next_snapshot_id = self.next_snapshot_id.checked_add(1).unwrap_or(1);
-        let next = Arc::new(PreparedContextSnapshot {
-            snapshot_id,
-            revision,
-            words: Arc::from(words),
-        });
+        let next = Arc::new(PreparedContextSnapshot { snapshot_id, revision, words: Arc::from(words) });
         // ALWAYS validate new revision on a brand-new empty candidate Store so old context is
         // untouched on failure and candidate sees 0 old context bytes!
         let mut candidate: Option<WorkerGuest> = None;
@@ -770,9 +731,7 @@ impl KernelPool {
             return Err(KernelError::ContextNotSupported);
         }
         let deadline_at = self.ctx.config.deadline.map(|d| Instant::now() + d);
-        if self.ctx.config.workers == 0
-            && self.direct_guest.is_some()
-        {
+        if self.ctx.config.workers == 0 && self.direct_guest.is_some() {
             let cancel = Arc::new(AtomicBool::new(false));
             ensure_guest_snapshot(&self.ctx, &mut self.direct_guest, None, deadline_at, &cancel)?;
         }
@@ -798,18 +757,14 @@ impl KernelPool {
         let deadline_at = self.ctx.config.deadline.map(|d| Instant::now() + d);
 
         let out_stride = self.ctx.manifest.out_schema.stride as usize;
-        let total_words = count
-            .checked_mul(out_stride)
-            .ok_or(KernelError::OutputBudgetExceeded {
-                required_bytes: usize::MAX,
-                limit_bytes: self.ctx.config.max_total_output_bytes,
-            })?;
-        let total_bytes = total_words
-            .checked_mul(4)
-            .ok_or(KernelError::OutputBudgetExceeded {
-                required_bytes: usize::MAX,
-                limit_bytes: self.ctx.config.max_total_output_bytes,
-            })?;
+        let total_words = count.checked_mul(out_stride).ok_or(KernelError::OutputBudgetExceeded {
+            required_bytes: usize::MAX,
+            limit_bytes: self.ctx.config.max_total_output_bytes,
+        })?;
+        let total_bytes = total_words.checked_mul(4).ok_or(KernelError::OutputBudgetExceeded {
+            required_bytes: usize::MAX,
+            limit_bytes: self.ctx.config.max_total_output_bytes,
+        })?;
         if total_bytes > self.ctx.config.max_total_output_bytes {
             return Err(KernelError::OutputBudgetExceeded {
                 required_bytes: total_bytes,
@@ -1123,8 +1078,16 @@ impl KernelPool {
                 DirectVarOutcome::Bisect => {
                     self.ctx.stats.bisections.fetch_add(1, Ordering::Relaxed);
                     let mid = range.start_item + range.len() / 2;
-                    pending.push(Reverse(WorkRange { start_item: mid, end_item: range.end_item, retried_fresh: false }));
-                    pending.push(Reverse(WorkRange { start_item: range.start_item, end_item: mid, retried_fresh: false }));
+                    pending.push(Reverse(WorkRange {
+                        start_item: mid,
+                        end_item: range.end_item,
+                        retried_fresh: false,
+                    }));
+                    pending.push(Reverse(WorkRange {
+                        start_item: range.start_item,
+                        end_item: mid,
+                        retried_fresh: false,
+                    }));
                 }
             }
         }
@@ -1429,10 +1392,8 @@ fn ensure_guest_snapshot(
             return Err(KernelError::Timeout);
         }
         if guest_slot.is_none() {
-            let wt_module = ctx.module.wasmtime_module().expect("validated Wasmtime module");
-            match WasmtimeGuest::start_controlled(
+            match ControlledGuest::start_controlled(
                 &ctx.engine,
-                wt_module,
                 &ctx.module,
                 ctx.config.memory,
                 deadline_at,
@@ -1441,11 +1402,8 @@ fn ensure_guest_snapshot(
             ) {
                 Ok(guest) => {
                     ctx.stats.worker_starts.fetch_add(1, Ordering::Relaxed);
-                    *guest_slot = Some(WorkerGuest {
-                        guest,
-                        installed_snapshot_id: None,
-                        store_has_prior_history: false,
-                    });
+                    *guest_slot =
+                        Some(WorkerGuest { guest, installed_snapshot_id: None, store_has_prior_history: false });
                 }
                 Err(err) => {
                     if is_timed_out_or_cancelled(Some(&err), deadline_at, cancel_flag) {
@@ -1469,7 +1427,7 @@ fn ensure_guest_snapshot(
                 let clear_res = wg
                     .guest
                     .reset_arena()
-                    .and_then(|()| wg.guest.call_raw(clear_export, Val::I32(0)))
+                    .and_then(|()| wg.guest.call_raw(clear_export, Val::I32(0), false))
                     .and_then(|_| wg.guest.finish_invocation().map(|_| ()));
                 if let Err(err) = clear_res {
                     *guest_slot = None;
@@ -1502,7 +1460,7 @@ fn ensure_guest_snapshot(
             let clear_res = wg
                 .guest
                 .reset_arena()
-                .and_then(|()| wg.guest.call_raw(clear_export, Val::I32(0)))
+                .and_then(|()| wg.guest.call_raw(clear_export, Val::I32(0), false))
                 .and_then(|_| wg.guest.finish_invocation().map(|_| ()));
             if let Err(err) = clear_res {
                 *guest_slot = None;
@@ -1518,22 +1476,14 @@ fn ensure_guest_snapshot(
 
         let eligible_for_fresh_retry = wg.store_has_prior_history && !attempt_retried_fresh;
         wg.guest.clear_saw_oom();
-        let ctx_export = ctx
-            .manifest
-            .ctx_export
-            .as_deref()
-            .ok_or(KernelError::ContextNotSupported)?;
-        let ctx_schema = ctx
-            .manifest
-            .ctx_schema
-            .as_ref()
-            .ok_or(KernelError::ContextNotSupported)?;
+        let ctx_export = ctx.manifest.ctx_export.as_deref().ok_or(KernelError::ContextNotSupported)?;
+        let ctx_schema = ctx.manifest.ctx_schema.as_ref().ok_or(KernelError::ContextNotSupported)?;
 
         let install_res = (|| -> anyhow::Result<()> {
             wg.guest.arm_execution(deadline_at, Some(cancel_flag.clone()), None)?;
             wg.guest.reset_arena()?;
             let param = encode_context_param(&mut wg.guest, ctx_schema, &snap.words)?;
-            wg.guest.call_raw(ctx_export, param)?;
+            wg.guest.call_raw(ctx_export, param, false)?;
             wg.guest.finish_invocation()?;
             wg.guest.reset_arena()?;
             Ok(())
@@ -1572,7 +1522,7 @@ fn ensure_guest_snapshot(
 }
 
 fn encode_context_param(
-    guest: &mut WasmtimeGuest,
+    guest: &mut ControlledGuest,
     ctx_schema: &crate::WireSchema,
     words: &[u32],
 ) -> anyhow::Result<Val> {
@@ -1654,7 +1604,7 @@ fn run_chunk_wasm(
         }
     };
 
-    match wg.guest.call_raw(&ctx.manifest.name, Val::I32(in_ptr)) {
+    match wg.guest.call_raw(&ctx.manifest.name, Val::I32(in_ptr), false) {
         Ok(Val::I32(out_ptr)) => {
             if is_timed_out_or_cancelled(None, deadline_at, cancel_flag) {
                 *guest_slot = None;
@@ -1715,10 +1665,7 @@ fn run_chunk_wasm(
                     }
                 }
             }
-            RawRunOutcome::Failed(KernelError::RunTrap {
-                item_index: range.start_item,
-                detail: format!("{err:#}"),
-            })
+            RawRunOutcome::Failed(KernelError::RunTrap { item_index: range.start_item, detail: format!("{err:#}") })
         }
     }
 }
@@ -1765,10 +1712,7 @@ fn execute_fixed_chunk_direct(
                 if let Err(err) = copy_res {
                     *guest_slot = None;
                     ctx.stats.worker_retirements.fetch_add(1, Ordering::Relaxed);
-                    return Err(KernelError::RunTrap {
-                        item_index: range.start_item,
-                        detail: format!("{err:#}"),
-                    });
+                    return Err(KernelError::RunTrap { item_index: range.start_item, detail: format!("{err:#}") });
                 }
                 match run_cleanup(ctx, wg) {
                     Ok(keep_warm) => {
@@ -1858,10 +1802,7 @@ fn execute_variable_chunk_direct(
                     Err(err) => {
                         *guest_slot = None;
                         ctx.stats.worker_retirements.fetch_add(1, Ordering::Relaxed);
-                        return Err(KernelError::RunTrap {
-                            item_index: range.start_item,
-                            detail: format!("{err:#}"),
-                        });
+                        return Err(KernelError::RunTrap { item_index: range.start_item, detail: format!("{err:#}") });
                     }
                 };
                 match run_cleanup(ctx, wg) {
@@ -1986,10 +1927,7 @@ fn execute_chunk_parallel(
                             guard.active_ranges.remove(&range.start_item);
                             guard.record_primary_error(
                                 range.start_item,
-                                KernelError::RunTrap {
-                                    item_index: range.start_item,
-                                    detail: format!("{err:#}"),
-                                },
+                                KernelError::RunTrap { item_index: range.start_item, detail: format!("{err:#}") },
                             );
                             guard.advance_frontier();
                             batch.cvar.notify_all();
@@ -2008,7 +1946,9 @@ fn execute_chunk_parallel(
                             let mut guard = batch.state.lock().unwrap();
                             guard.active_ranges.remove(&range.start_item);
                             if range.start_item < guard.earliest_failed_item {
-                                guard.chunks.insert(range.start_item, ChunkState::FixedDone { end_item: range.end_item });
+                                guard
+                                    .chunks
+                                    .insert(range.start_item, ChunkState::FixedDone { end_item: range.end_item });
                                 guard.advance_frontier();
                             }
                             batch.cvar.notify_all();
@@ -2132,10 +2072,7 @@ fn execute_chunk_parallel(
                         // Speculative higher range > frontier_item
                         let required = guard.settled_prefix_bytes.saturating_add(result_bytes);
                         if required > guard.max_total_output_bytes {
-                            guard.chunks.insert(
-                                range.start_item,
-                                ChunkState::OverBudgetHint { result_bytes },
-                            );
+                            guard.chunks.insert(range.start_item, ChunkState::OverBudgetHint { result_bytes });
                             AdmitDecision::Discard
                         } else {
                             guard.evict_higher_buffered(range.start_item, result_bytes);
@@ -2167,10 +2104,7 @@ fn execute_chunk_parallel(
                                 guard.active_ranges.remove(&range.start_item);
                                 guard.record_primary_error(
                                     range.start_item,
-                                    KernelError::RunTrap {
-                                        item_index: range.start_item,
-                                        detail: format!("{err:#}"),
-                                    },
+                                    KernelError::RunTrap { item_index: range.start_item, detail: format!("{err:#}") },
                                 );
                                 guard.advance_frontier();
                                 batch.cvar.notify_all();
@@ -2224,33 +2158,31 @@ fn execute_chunk_parallel(
                             }
                         }
                     }
-                    AdmitDecision::Discard => {
-                        match run_cleanup(ctx, wg) {
-                            Ok(keep_warm) => {
-                                if keep_warm {
-                                    wg.store_has_prior_history = true;
-                                } else {
-                                    *guest_slot = None;
-                                    ctx.stats.worker_retirements.fetch_add(1, Ordering::Relaxed);
-                                }
-                                let mut guard = batch.state.lock().unwrap();
-                                guard.active_ranges.remove(&range.start_item);
-                                guard.advance_frontier();
-                                batch.cvar.notify_all();
-                                return;
-                            }
-                            Err(detail) => {
+                    AdmitDecision::Discard => match run_cleanup(ctx, wg) {
+                        Ok(keep_warm) => {
+                            if keep_warm {
+                                wg.store_has_prior_history = true;
+                            } else {
                                 *guest_slot = None;
                                 ctx.stats.worker_retirements.fetch_add(1, Ordering::Relaxed);
-                                let mut guard = batch.state.lock().unwrap();
-                                guard.active_ranges.remove(&range.start_item);
-                                guard.record_cleanup_failed(range, result_bytes, detail);
-                                guard.advance_frontier();
-                                batch.cvar.notify_all();
-                                return;
                             }
+                            let mut guard = batch.state.lock().unwrap();
+                            guard.active_ranges.remove(&range.start_item);
+                            guard.advance_frontier();
+                            batch.cvar.notify_all();
+                            return;
                         }
-                    }
+                        Err(detail) => {
+                            *guest_slot = None;
+                            ctx.stats.worker_retirements.fetch_add(1, Ordering::Relaxed);
+                            let mut guard = batch.state.lock().unwrap();
+                            guard.active_ranges.remove(&range.start_item);
+                            guard.record_cleanup_failed(range, result_bytes, detail);
+                            guard.advance_frontier();
+                            batch.cvar.notify_all();
+                            return;
+                        }
+                    },
                     AdmitDecision::ParkAndRequeue => {
                         match run_cleanup(ctx, wg) {
                             Ok(keep_warm) => {

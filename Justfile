@@ -5,10 +5,12 @@ pen := "cargo run --release -q -p pen --"
 # too): pnpm, run through npx, and playwright-core, which picks Chromium.
 pnpm := "npx --yes pnpm@12.8.2"
 playwright := "1.63.0"
-# Pinned wtime-aot release (Linux x86-64 Blot ABI 8 AOT compiler, default `--backend x64`).
-wtime_version := "v0.1.4"
-wtime_aot_archive_sha256 := "d3b13dfb1b7980dc33bd158d7c0c5e48feda8ff4b12d8746526a4fe27d292b7a"
-wtime_aot_bin_sha256 := "70d507ff129b168061664c27c0f414bb4fbabef6cc37c8f2f794064f01072f9e"
+# Pinned wtime-aot release (Linux x86-64 & aarch64 Blot ABI 8 AOT compiler).
+wtime_version := "v0.1.5"
+wtime_aot_x86_64_archive_sha256 := "a751918a711ad5067b66e3dc240f92f081649f37ad1cc6d7d9ad014e9f8eba82"
+wtime_aot_x86_64_bin_sha256 := "3020a809dcfba2bea0d829f38f0b89ce78d472f6587f0f284e04ad5795030364"
+wtime_aot_aarch64_archive_sha256 := "0b9094aaf71b1bd5579fa58e7d77c26c2f24e00fde8cf3eafe806486dd311472"
+wtime_aot_aarch64_bin_sha256 := "13a9af28bc21791c1b834d1d517b69a492b3efafbd88953ca5696de501ff8fe7"
 
 # Then removes what earlier installs left in plugins/ and web/ that this one
 # no longer builds, saying what it removes.
@@ -30,22 +32,38 @@ install: plugins web-host install-player install-wtime-aot
   cp LICENSE THIRD_PARTY_NOTICES.md ~/.local/lib/pen-runtime/
   ln -sf ~/.local/lib/pen-runtime/pen ~/.local/bin/pen
 
-# Install the pinned wtime-aot release binary (Linux x86-64) verified by SHA-256.
+# Install the pinned wtime-aot release binary (Linux x86-64 or aarch64) verified by SHA-256.
 install-wtime-aot:
   #!/usr/bin/env bash
   set -euo pipefail
-  if [ "$(uname -s)-$(uname -m)" != "Linux-x86_64" ]; then
-    echo "install-wtime-aot: skipping (prebuilt release asset is Linux x86_64 only)"
+  case "$(uname -s)-$(uname -m)" in
+    Linux-x86_64)
+      target="x86_64-unknown-linux-gnu"
+      archive_sha="{{wtime_aot_x86_64_archive_sha256}}"
+      bin_sha="{{wtime_aot_x86_64_bin_sha256}}"
+      ;;
+    Linux-aarch64)
+      target="aarch64-unknown-linux-gnu"
+      archive_sha="{{wtime_aot_aarch64_archive_sha256}}"
+      bin_sha="{{wtime_aot_aarch64_bin_sha256}}"
+      ;;
+    *)
+      echo "install-wtime-aot: skipping (prebuilt release assets are Linux x86_64 / aarch64 only)"
+      exit 0
+      ;;
+  esac
+  if [ -z "$archive_sha" ] || [ -z "$bin_sha" ]; then
+    echo "install-wtime-aot: skipping (no pinned SHA-256 for $target in {{wtime_version}})"
     exit 0
   fi
   mkdir -p ~/.local/lib/pen-runtime ~/.local/bin
   dest="$HOME/.local/lib/pen-runtime/wtime-aot"
-  if [ -x "$dest" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "{{wtime_aot_bin_sha256}}" ]; then
+  if [ -x "$dest" ] && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$bin_sha" ]; then
     ln -sf "$dest" "$HOME/.local/bin/wtime-aot"
     echo "wtime-aot {{wtime_version}} already installed ($dest)"
     exit 0
   fi
-  archive="wtime-aot-{{wtime_version}}-x86_64-unknown-linux-gnu.tar.gz"
+  archive="wtime-aot-{{wtime_version}}-${target}.tar.gz"
   tmp="$(mktemp -d "${TMPDIR:-/var/tmp}/pen-wtime-aot.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT
   if command -v gh > /dev/null 2>&1; then
@@ -53,13 +71,13 @@ install-wtime-aot:
   else
     curl -fsSL "https://github.com/mewhhaha/wtime/releases/download/{{wtime_version}}/$archive" -o "$tmp/$archive"
   fi
-  (cd "$tmp" && echo "{{wtime_aot_archive_sha256}}  $archive" | sha256sum -c)
+  (cd "$tmp" && echo "$archive_sha  $archive" | sha256sum -c)
   tar -xzf "$tmp/$archive" -C "$tmp" wtime-aot
-  (cd "$tmp" && echo "{{wtime_aot_bin_sha256}}  wtime-aot" | sha256sum -c)
+  (cd "$tmp" && echo "$bin_sha  wtime-aot" | sha256sum -c)
   install -m 0755 "$tmp/wtime-aot" "$dest.new"
   mv -f "$dest.new" "$dest"
   ln -sf "$dest" "$HOME/.local/bin/wtime-aot"
-  echo "installed wtime-aot {{wtime_version}} -> $dest"
+  echo "installed wtime-aot {{wtime_version}} ($target) -> $dest"
 
 plugins:
   cd plugins && cargo build --release --target wasm32-wasip2

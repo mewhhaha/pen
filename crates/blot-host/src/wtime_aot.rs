@@ -235,6 +235,31 @@ impl std::fmt::Display for X64FallbackError {
 
 impl std::error::Error for X64FallbackError {}
 
+/// Typed runtime trap returned by a `wtime-aot` guest instance, preserving the Blot ABI 8 trap code.
+#[derive(Debug)]
+pub(crate) struct AotTrap {
+    pub(crate) code: u8,
+    message: String,
+}
+
+impl std::fmt::Display for AotTrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "wtime-aot trap: {}", self.message)
+    }
+}
+
+impl std::error::Error for AotTrap {}
+
+const AOT_TRAP_CALL_STACK: u8 = 8;
+
+fn is_oom_trap_code(code: u8) -> bool {
+    matches!(code, 9..=12)
+}
+
+pub(crate) fn is_unrecoverable_aot_trap(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<AotTrap>().is_some_and(|trap| trap.code == AOT_TRAP_CALL_STACK)
+}
+
 impl AotLibrary {
     fn trap_error(&self, code: u8) -> anyhow::Error {
         let mut ptr: *const u8 = std::ptr::null();
@@ -249,7 +274,7 @@ impl AotLibrary {
         if code == 22 {
             anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedIsa(msg)))
         } else {
-            anyhow!("wtime-aot trap: {msg}")
+            anyhow::Error::new(AotTrap { code, message: msg })
         }
     }
 }
@@ -2623,15 +2648,52 @@ fn resolved_x64_isa_tag(target_cpu: &str) -> Result<&'static str> {
     }
 }
 
+#[cfg(feature = "compiler")]
+fn parse_aarch64_target_cpu_syntax(target_cpu: &str) -> Result<&'static str> {
+    match target_cpu {
+        "native" | "generic" | "armv8-a" | "armv8.1-a" | "armv8.2-a" | "armv8.3-a" | "armv8.4-a" | "armv8.5-a"
+        | "armv8.6-a" | "armv9-a" => Ok("aarch64-v8a"),
+        other
+            if other.starts_with("neoverse-")
+                || other.starts_with("cortex-")
+                || other.starts_with("apple-")
+                || other.starts_with("graviton") =>
+        {
+            Ok("aarch64-v8a")
+        }
+        other => bail!(
+            "unsupported PEN_WTIME_AOT_TARGET_CPU={other:?} for aarch64 (expected native, generic, armv8-a, neoverse-*, cortex-*, apple-*, or graviton*)"
+        ),
+    }
+}
+
+#[cfg(feature = "compiler")]
+fn resolved_aarch64_isa_tag(target_cpu: &str) -> Result<&'static str> {
+    let tag = parse_aarch64_target_cpu_syntax(target_cpu)?;
+    #[cfg(not(all(target_os = "linux", target_arch = "aarch64", target_pointer_width = "64")))]
+    {
+        let _ = tag;
+        Err(anyhow::Error::new(X64FallbackError(X64FallbackReason::UnsupportedPlatform(
+            "wtime-aot --backend aarch64 is only supported on Linux aarch64 LP64 hosts".into(),
+        ))))
+    }
+    #[cfg(all(target_os = "linux", target_arch = "aarch64", target_pointer_width = "64"))]
+    {
+        Ok(tag)
+    }
+}
+
 #[cfg(not(feature = "compiler"))]
 fn load_verified_so(_wasm: &[u8], _cache: Option<&Path>) -> Result<Library> {
     bail!("wtime-aot compilation requires blot-host's `compiler` feature")
 }
 
-/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset (`wtime` v0.1.3).
-/// Uses native Linux x86-64 (`"x64"`), falling back automatically to `"c"`
-/// (`--c-opt auto --target-cpu native`) on [`X64FallbackError`].
-#[cfg(feature = "compiler")]
+/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset (`wtime` v0.1.5).
+/// Uses native Linux `"aarch64"` on ARM64 Linux and `"x64"` elsewhere, falling back
+/// automatically to `"c"` (`--c-opt auto --target-cpu native`) on [`X64FallbackError`].
+#[cfg(all(feature = "compiler", target_os = "linux", target_arch = "aarch64", target_pointer_width = "64"))]
+const DEFAULT_AOT_BACKEND: &str = "aarch64";
+#[cfg(all(feature = "compiler", not(all(target_os = "linux", target_arch = "aarch64", target_pointer_width = "64"))))]
 const DEFAULT_AOT_BACKEND: &str = "x64";
 
 /// Explicit compilation configuration threaded into `load_verified_so_with_config` so
@@ -2701,7 +2763,9 @@ where
     match loader(wasm, cache, cfg) {
         Ok(lib) => Ok(lib),
         Err(err)
-            if cfg.backend == "x64" && !cfg.explicit_backend && err.downcast_ref::<X64FallbackError>().is_some() =>
+            if matches!(cfg.backend.as_str(), "x64" | "aarch64")
+                && !cfg.explicit_backend
+                && err.downcast_ref::<X64FallbackError>().is_some() =>
         {
             let fallback_cfg = cfg.x64_fallback_to_c();
             loader(wasm, cache, &fallback_cfg)
@@ -2712,7 +2776,7 @@ where
 
 #[cfg(feature = "compiler")]
 fn classify_build_failure(backend: &str, exit_code: Option<i32>, status_display: &str, stderr: &str) -> anyhow::Error {
-    if backend == "x64" && exit_code == Some(X64_ADMISSION_REJECTED_EXIT_CODE) {
+    if matches!(backend, "x64" | "aarch64") && exit_code == Some(X64_ADMISSION_REJECTED_EXIT_CODE) {
         anyhow::Error::new(X64FallbackError(X64FallbackReason::AdmissionRejected(stderr.trim().to_string())))
     } else {
         anyhow!("wtime-aot build failed ({status_display}): {stderr}")
@@ -2802,7 +2866,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         "invalid PEN_WTIME_AOT_TARGET_CPU={target_cpu:?}"
     );
     let deadline = Instant::now() + build_timeout()?;
-    let x64_isa = match backend.as_str() {
+    let native_isa = match backend.as_str() {
         "c" => {
             ensure!(
                 matches!(c_opt.as_str(), "auto" | "O2" | "O1" | "O0"),
@@ -2812,7 +2876,8 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         }
         "rust" => None,
         "x64" => Some(resolved_x64_isa_tag(target_cpu)?),
-        other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, or x64)"),
+        "aarch64" => Some(resolved_aarch64_isa_tag(target_cpu)?),
+        other => bail!("unsupported PEN_WTIME_AOT_BACKEND={other:?} (expected c, rust, x64, or aarch64)"),
     };
 
     let cache_dir = default_cache_dir(cache)?;
@@ -2872,7 +2937,8 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
             resolved_rust = Some((rust_id, rt_fp));
             tag
         }
-        "x64" => format!("x64-{}", x64_isa.expect("validated above")),
+        "x64" => format!("x64-{}", native_isa.expect("validated above")),
+        "aarch64" => format!("aarch64-{}", native_isa.expect("validated above")),
         _ => unreachable!(),
     };
 
@@ -2979,7 +3045,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         "rust" => {
             cmd.args(["--toolchain", toolchain.as_str()]);
         }
-        "x64" => {}
+        "x64" | "aarch64" => {}
         _ => unreachable!(),
     }
     let output =
@@ -3846,6 +3912,7 @@ pub struct AotGuest {
     abi: Arc<GuestAbi>,
     last_reclaimed_owners: Option<u32>,
     imaged: Arc<Result<Vec<String>, String>>,
+    saw_oom: bool,
     entered: bool,
     disposed: bool,
 }
@@ -3966,6 +4033,7 @@ impl AotGuest {
             abi,
             last_reclaimed_owners: None,
             imaged,
+            saw_oom: false,
             entered: false,
             disposed: false,
         })
@@ -3979,13 +4047,199 @@ impl AotGuest {
     }
 
     pub fn memory_bytes(&self) -> usize {
-        if !self.abi.uses_arrays() {
+        if self.lib.memory_limits.is_none() {
             return 0;
         }
         let mut p: *mut u8 = std::ptr::null_mut();
         let mut n: usize = 0;
         unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut n) };
         n
+    }
+
+    pub(crate) fn saw_oom(&self) -> bool {
+        self.saw_oom
+    }
+
+    pub(crate) fn clear_saw_oom(&mut self) {
+        self.saw_oom = false;
+    }
+
+    pub(crate) fn has_arena(&self) -> bool {
+        self.abi.uses_arrays() || self.abi.tasks.is_some()
+    }
+
+    pub(crate) fn arena_oom_flag(&self) -> u32 {
+        if !self.has_arena() {
+            return 0;
+        }
+        let mut p: *mut u8 = std::ptr::null_mut();
+        let mut n: usize = 0;
+        unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut n) };
+        if p.is_null() || n < crate::ARENA_OOM_OFFSET + 4 {
+            return 0;
+        }
+        // SAFETY: `self.handle.0` uniquely owns guest linear memory while no guest call is active.
+        let data = unsafe { std::slice::from_raw_parts(p, n) };
+        u32::from_le_bytes(data[crate::ARENA_OOM_OFFSET..crate::ARENA_OOM_OFFSET + 4].try_into().unwrap())
+    }
+
+    pub(crate) fn reset_arena(&mut self) -> Result<()> {
+        if self.has_arena() {
+            self.call_reset()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn write_words_packet(&mut self, words: &[u32]) -> Result<i32> {
+        ensure!(self.has_arena(), "invalid_abi: array value requires an arena");
+        ensure!(words.len() < 1_073_741_823, "array byte count exceeds the Wasm32 address range");
+        let length = u32::try_from(words.len())?;
+        let byte_len = (length + 1).checked_mul(4).ok_or_else(|| anyhow!("packet byte count overflow"))?;
+        self.with_host_mut(|host| {
+            host.pending_error = None;
+            host.pending_panic = None;
+        });
+        let mut ptr_out = 0i32;
+        let mut trap_code = 0u8;
+        let rc = unsafe {
+            (self.lib.syms.call_allocate)(self.handle.0, byte_len.cast_signed(), &mut ptr_out, &mut trap_code)
+        };
+        self.maybe_resume_panic();
+        let pointer = match rc {
+            0 => ptr_out,
+            1 => {
+                if is_oom_trap_code(trap_code) {
+                    self.saw_oom = true;
+                }
+                return Err(self.lib.trap_error(trap_code));
+            }
+            2 => {
+                if is_oom_trap_code(trap_code) {
+                    self.saw_oom = true;
+                }
+                return Err(self
+                    .with_host_mut(|host| host.pending_error.take())
+                    .unwrap_or_else(|| self.lib.trap_error(trap_code)));
+            }
+            _ => bail!("invalid_abi: missing blot:allocate"),
+        };
+        let (mut p, mut n) = (std::ptr::null_mut(), 0usize);
+        unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut n) };
+        let memory = if n == 0 || p.is_null() {
+            &mut [][..]
+        } else {
+            // SAFETY: `self.handle.0` uniquely owns guest linear memory while no guest call is active.
+            unsafe { std::slice::from_raw_parts_mut(p, n) }
+        };
+        let address = array_range(memory.len(), pointer, words.len())?;
+        memory[address..address + 4].copy_from_slice(&length.to_le_bytes());
+        let body = &mut memory[address + 4..address + 4 + words.len() * 4];
+        if cfg!(target_endian = "little") {
+            body.copy_from_slice(bytemuck::cast_slice(words));
+        } else {
+            for (chunk, word) in body.as_chunks_mut::<4>().0.iter_mut().zip(words) {
+                *chunk = word.to_le_bytes();
+            }
+        }
+        Ok(pointer)
+    }
+
+    pub(crate) fn call_raw(&mut self, name: &str, param: Val, result_is_f32: bool) -> Result<Val> {
+        self.with_host_mut(|host| {
+            host.pending_error = None;
+            host.pending_panic = None;
+        });
+        let arg_bits = match param {
+            Val::I32(v) => u64::from(v.cast_unsigned()),
+            Val::F32(bits) => u64::from(bits),
+            other => bail!("unsupported raw parameter value {other:?} for wtime-aot export {name}"),
+        };
+        let res_bits = self.call_export_raw(name, arg_bits)?;
+        let low = (res_bits & 0xffff_ffff) as u32;
+        Ok(if result_is_f32 { Val::F32(low) } else { Val::I32(low.cast_signed()) })
+    }
+
+    pub(crate) fn inspect_packet_header(&self, pointer: i32) -> Result<u32> {
+        ensure!(self.has_arena(), "invalid_abi: array value requires an arena");
+        let (mut p, mut n) = (std::ptr::null_mut(), 0usize);
+        unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut n) };
+        let memory = if n == 0 || p.is_null() { &[][..] } else { unsafe { std::slice::from_raw_parts(p, n) } };
+        let address = array_range(memory.len(), pointer, 0)?;
+        let header = u32::from_le_bytes(memory[address..address + 4].try_into().unwrap());
+        if header != u32::MAX {
+            array_range(memory.len(), pointer, header as usize)?;
+        }
+        Ok(header)
+    }
+
+    pub(crate) fn read_packet_words_into(&self, pointer: i32, expected_words: usize, dst: &mut [u32]) -> Result<()> {
+        ensure!(dst.len() == expected_words, "destination slice length mismatch");
+        ensure!(self.has_arena(), "invalid_abi: array value requires an arena");
+        let (mut p, mut n) = (std::ptr::null_mut(), 0usize);
+        unsafe { (self.lib.syms.mem_data)(self.handle.0, &mut p, &mut n) };
+        let memory = if n == 0 || p.is_null() { &[][..] } else { unsafe { std::slice::from_raw_parts(p, n) } };
+        let address = array_range(memory.len(), pointer, expected_words)?;
+        let header = u32::from_le_bytes(memory[address..address + 4].try_into().unwrap()) as usize;
+        ensure!(header == expected_words, "invalid_abi: packet length {header} != expected {expected_words}");
+        let body = &memory[address + 4..address + 4 + expected_words * 4];
+        if cfg!(target_endian = "little") {
+            match bytemuck::try_cast_slice::<u8, u32>(body) {
+                Ok(aligned) => dst.copy_from_slice(aligned),
+                Err(_) => {
+                    for (slot, chunk) in dst.iter_mut().zip(body.as_chunks::<4>().0) {
+                        *slot = u32::from_le_bytes(*chunk);
+                    }
+                }
+            }
+        } else {
+            for (slot, chunk) in dst.iter_mut().zip(body.as_chunks::<4>().0) {
+                *slot = u32::from_le_bytes(*chunk);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_packet_words_vec(&self, pointer: i32, words: usize) -> Result<Vec<u32>> {
+        let mut out = vec![0u32; words];
+        self.read_packet_words_into(pointer, words, &mut out)?;
+        Ok(out)
+    }
+
+    pub(crate) fn finish_invocation(&mut self) -> Result<Option<u32>> {
+        if !self.abi.invocation_finish {
+            return Ok(None);
+        }
+        self.last_reclaimed_owners = None;
+        self.with_host_mut(|host| {
+            host.pending_error = None;
+            host.pending_panic = None;
+        });
+        let mut released = 0i32;
+        let mut trap_code = 0u8;
+        let rc = unsafe { (self.lib.syms.call_finish_invocation)(self.handle.0, &mut released, &mut trap_code) };
+        self.maybe_resume_panic();
+        match rc {
+            0 => {
+                let released = released.cast_unsigned();
+                self.last_reclaimed_owners = Some(released);
+                Ok(Some(released))
+            }
+            1 => {
+                if is_oom_trap_code(trap_code) {
+                    self.saw_oom = true;
+                }
+                Err(self.lib.trap_error(trap_code))
+            }
+            2 => {
+                if is_oom_trap_code(trap_code) {
+                    self.saw_oom = true;
+                }
+                Err(self
+                    .with_host_mut(|host| host.pending_error.take())
+                    .unwrap_or_else(|| self.lib.trap_error(trap_code)))
+            }
+            _ => bail!("invalid_abi: missing blot:finish_invocation"),
+        }
     }
 
     pub fn last_reclaimed_owners(&self) -> Option<u32> {
@@ -4021,10 +4275,20 @@ impl AotGuest {
         self.maybe_resume_panic();
         match rc {
             0 => Ok(res_out),
-            2 => Err(self
-                .with_host_mut(|host| host.pending_error.take())
-                .unwrap_or_else(|| self.lib.trap_error(trap_code))),
-            1 => Err(self.lib.trap_error(trap_code)),
+            2 => {
+                if is_oom_trap_code(trap_code) {
+                    self.saw_oom = true;
+                }
+                Err(self
+                    .with_host_mut(|host| host.pending_error.take())
+                    .unwrap_or_else(|| self.lib.trap_error(trap_code)))
+            }
+            1 => {
+                if is_oom_trap_code(trap_code) {
+                    self.saw_oom = true;
+                }
+                Err(self.lib.trap_error(trap_code))
+            }
             _ => bail!("unknown_export: unknown function export {name}"),
         }
     }
@@ -4036,10 +4300,20 @@ impl AotGuest {
         self.maybe_resume_panic();
         match rc {
             0 => Ok(()),
-            1 => Err(self.lib.trap_error(trap_code)),
-            2 => Err(self
-                .with_host_mut(|host| host.pending_error.take())
-                .unwrap_or_else(|| self.lib.trap_error(trap_code))),
+            1 => {
+                if is_oom_trap_code(trap_code) {
+                    self.saw_oom = true;
+                }
+                Err(self.lib.trap_error(trap_code))
+            }
+            2 => {
+                if is_oom_trap_code(trap_code) {
+                    self.saw_oom = true;
+                }
+                Err(self
+                    .with_host_mut(|host| host.pending_error.take())
+                    .unwrap_or_else(|| self.lib.trap_error(trap_code)))
+            }
             _ => bail!("invalid_abi: missing blot:reset"),
         }
     }
@@ -4369,8 +4643,43 @@ mod tests {
     }
 
     #[test]
-    fn default_aot_backend_is_x64() {
+    fn default_aot_backend_matches_host_arch() {
+        #[cfg(all(target_os = "linux", target_arch = "aarch64", target_pointer_width = "64"))]
+        assert_eq!(DEFAULT_AOT_BACKEND, "aarch64");
+        #[cfg(not(all(target_os = "linux", target_arch = "aarch64", target_pointer_width = "64")))]
         assert_eq!(DEFAULT_AOT_BACKEND, "x64");
+    }
+
+    #[test]
+    fn aarch64_backend_fallback_and_classification() {
+        let mut cfg = AotCompileConfig {
+            backend: "aarch64".to_string(),
+            c_opt: "auto".to_string(),
+            toolchain: "stable".to_string(),
+            target_cpu: "native".to_string(),
+            explicit_backend: false,
+        };
+        let mut seen = Vec::new();
+        let res = load_verified_so_with_fallback(b"wasm", None, &cfg, |_w, _c, cur| {
+            seen.push(cur.backend.clone());
+            if cur.backend == "aarch64" {
+                Err(classify_build_failure("aarch64", Some(X64_ADMISSION_REJECTED_EXIT_CODE), "exit status: 4", "rej"))
+            } else {
+                Ok(cur.backend.clone())
+            }
+        })
+        .expect("implicit aarch64 admission rejection should fall back to c");
+        assert_eq!(res, "c");
+        assert_eq!(seen, vec!["aarch64", "c"]);
+
+        cfg.explicit_backend = true;
+        let err = load_verified_so_with_fallback(b"wasm", None, &cfg, |_w, _c, _cur| -> Result<()> {
+            Err(classify_build_failure("aarch64", Some(X64_ADMISSION_REJECTED_EXIT_CODE), "exit status: 4", "rej"))
+        })
+        .expect_err("explicit aarch64 backend must propagate fallback error");
+        assert!(err.downcast_ref::<X64FallbackError>().is_some());
+        assert!(parse_aarch64_target_cpu_syntax("neoverse-v2").is_ok());
+        assert!(parse_aarch64_target_cpu_syntax("bogus-cpu").is_err());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Deterministic standalone isolated `Processes` scheduler for ABI 8 `entry process`
+//! Deterministic standalone isolated `Processes` scheduler for ABI 8 `#process`
 //! modules (`blot2/tasks/CONCURRENCY_VNEXT.md` §5.2).
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use wasmtime::{Engine, Val};
 
 use crate::{
-    GUEST_STACK_BYTES, GuestModule, Limits, ProcessManifest, ValueType, WasmtimeGuest, WireSchema, WireSchemaKind,
+    ControlledGuest, GUEST_STACK_BYTES, GuestModule, Limits, ProcessManifest, ValueType, WireSchema, WireSchemaKind,
     ensure_engine_ticker, is_trap_interrupt,
 };
 
@@ -25,7 +25,7 @@ pub struct FuelPolicy {
     pub cleanup_fuel: u64,
 }
 
-/// Resource and scheduling policy bound to one `entry process` manifest.
+/// Resource and scheduling policy bound to one `#process` manifest.
 #[derive(Clone, Debug)]
 pub struct ProcessPolicy {
     pub name: String,
@@ -77,7 +77,7 @@ pub enum SendResult {
     InvalidCommand,
 }
 
-/// Wire value exchanged with an `entry process` (`Config`, `Cmd`, or `Reply`).
+/// Wire value exchanged with an `#process` (`Config`, `Cmd`, or `Reply`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProcessValue {
     Unit,
@@ -145,7 +145,7 @@ impl fmt::Display for ProcessHostError {
                 write!(f, "deadline policy requires an epoch-interrupted Wasmtime engine")
             }
             ProcessHostError::InvalidPolicy(msg) => write!(f, "invalid process policy: {msg}"),
-            ProcessHostError::UnknownProcess(name) => write!(f, "unknown entry process `{name}`"),
+            ProcessHostError::UnknownProcess(name) => write!(f, "unknown #process `{name}`"),
             ProcessHostError::Aborted => write!(f, "process scheduler is permanently aborted after an overrun"),
             ProcessHostError::Overrun { drained_events } => {
                 write!(f, "process turn overran its deadline ({} endpoints drained)", drained_events.len())
@@ -199,7 +199,7 @@ struct Child {
     status: ProcessStatus,
     init_config: Option<ProcessValue>,
     init_config_bytes: usize,
-    guest: Option<WasmtimeGuest>,
+    guest: Option<ControlledGuest>,
     memory_lease: Option<ByteLease>,
     pending: VecDeque<PendingCommand>,
     events: VecDeque<ProcessEvent>,
@@ -207,7 +207,12 @@ struct Child {
 }
 
 impl Child {
-    fn settle_terminal(&mut self, status: ProcessStatus, pending_outcome: ProcessOutcome, mailbox_gauge: &Arc<AtomicUsize>) {
+    fn settle_terminal(
+        &mut self,
+        status: ProcessStatus,
+        pending_outcome: ProcessOutcome,
+        mailbox_gauge: &Arc<AtomicUsize>,
+    ) {
         self.status = status;
         self.init_config = None;
         if self.init_config_bytes > 0 {
@@ -234,7 +239,7 @@ enum RingSlot {
     InWave(usize), // index into wave_tasks
 }
 
-/// Deterministic isolated `entry process` scheduler supporting both serial `advance`
+/// Deterministic isolated `#process` scheduler supporting both serial `advance`
 /// and serial-equivalent multi-wave `advance_all_parallel`.
 pub struct Processes {
     scheduler_id: u64,
@@ -260,10 +265,7 @@ impl Processes {
         if !module.abi().data_stacks {
             return Err(ProcessHostError::InvalidPolicy("processes require guest ABI 8".into()));
         }
-        let Some(wt_module) = module.wasmtime_module() else {
-            return Err(ProcessHostError::WtimeAotUnsupported);
-        };
-        if !Engine::same(engine, wt_module.engine()) {
+        if !module.matches_engine(engine) {
             return Err(ProcessHostError::EngineMismatch);
         }
         let any_fuel = policies.iter().any(|p| p.rust_wasmtime_fuel.is_some());
@@ -527,7 +529,7 @@ impl Processes {
 
     /// Observed Wasm linear-memory bytes across currently live guests (including unexported memories).
     pub fn memory_bytes(&self) -> usize {
-        self.children.iter().filter_map(|c| c.guest.as_ref()).map(WasmtimeGuest::memory_bytes).sum()
+        self.children.iter().filter_map(|c| c.guest.as_ref()).map(ControlledGuest::memory_bytes).sum()
     }
 
     /// Total resident memory limit bytes currently reserved across live and detached overrun guests.
@@ -614,33 +616,24 @@ impl Processes {
             } else {
                 let cmd = child.pending.pop_front().expect("runnable process has command");
                 let mut guest = child.guest.take().expect("ready process owns guest");
-                let outcome = run_process_step(
-                    &mut guest,
-                    &prog.manifest,
-                    &prog.policy,
-                    &cmd.cmd,
-                    deadline_at,
-                    &cancel_flag,
-                );
+                let outcome =
+                    run_process_step(&mut guest, &prog.manifest, &prog.policy, &cmd.cmd, deadline_at, &cancel_flag);
                 match outcome {
                     StepOutcome::Ok(reply) => {
                         child.guest = Some(guest);
                         let reply_bytes = reply.logical_bytes();
                         let old_reserve = cmd.cmd_bytes.saturating_add(cmd.max_reply_bytes);
                         // Release cmd_bytes + max_reply_bytes, charge exact logical_reply_bytes.
-                        child.charged_mailbox_bytes = child
-                            .charged_mailbox_bytes
-                            .saturating_sub(old_reserve)
-                            .saturating_add(reply_bytes);
+                        child.charged_mailbox_bytes =
+                            child.charged_mailbox_bytes.saturating_sub(old_reserve).saturating_add(reply_bytes);
                         if old_reserve > reply_bytes {
                             self.reserved_mailbox_gauge.fetch_sub(old_reserve - reply_bytes, Ordering::AcqRel);
                         } else if reply_bytes > old_reserve {
                             self.reserved_mailbox_gauge.fetch_add(reply_bytes - old_reserve, Ordering::AcqRel);
                         }
-                        child.events.push_back(ProcessEvent {
-                            ticket: cmd.ticket,
-                            outcome: ProcessOutcome::Done(reply),
-                        });
+                        child
+                            .events
+                            .push_back(ProcessEvent { ticket: cmd.ticket, outcome: ProcessOutcome::Done(reply) });
                         self.children.push_back(child);
                     }
                     StepOutcome::DeterministicFail => {
@@ -708,9 +701,7 @@ impl Processes {
                     None => break,
                     Some(RingSlot::Present(_)) => {}
                 }
-                let RingSlot::Present(child) = ring.pop_front().unwrap() else {
-                    unreachable!()
-                };
+                let RingSlot::Present(child) = ring.pop_front().unwrap() else { unreachable!() };
                 let prog = &self.programs[child.program];
                 let cost = match child.status {
                     ProcessStatus::Starting => prog.policy.init_work,
@@ -757,10 +748,10 @@ impl Processes {
             }
 
             enum WaveTaskResult {
-                InitOk(WasmtimeGuest, ByteLease),
+                InitOk(ControlledGuest, ByteLease),
                 InitFail,
                 InitOverrun,
-                StepOk(WasmtimeGuest, ByteLease, ProcessValue),
+                StepOk(ControlledGuest, ByteLease, ProcessValue),
                 StepFail,
                 StepOverrun,
             }
@@ -800,15 +791,8 @@ impl Processes {
                         .name("blot-proc-wave".into())
                         .stack_size(GUEST_STACK_BYTES + (2 << 20))
                         .spawn(move || {
-                            let res = run_process_init(
-                                &engine,
-                                &module,
-                                &manifest,
-                                &policy,
-                                &config,
-                                deadline_at,
-                                &cancel,
-                            );
+                            let res =
+                                run_process_init(&engine, &module, &manifest, &policy, &config, deadline_at, &cancel);
                             let out = match res {
                                 InitOutcome::Ok(guest) => {
                                     drop(cfg_detach_lease);
@@ -851,14 +835,7 @@ impl Processes {
                         .name("blot-proc-wave".into())
                         .stack_size(GUEST_STACK_BYTES + (2 << 20))
                         .spawn(move || {
-                            let res = run_process_step(
-                                &mut guest,
-                                &manifest,
-                                &policy,
-                                &cmd_val,
-                                deadline_at,
-                                &cancel,
-                            );
+                            let res = run_process_step(&mut guest, &manifest, &policy, &cmd_val, deadline_at, &cancel);
                             let out = match res {
                                 StepOutcome::Ok(reply) => {
                                     // Keep cmd_lease until coordinator updates reply bytes on non-overrun,
@@ -989,10 +966,9 @@ impl Processes {
                         if reply_bytes > 0 {
                             self.reserved_mailbox_gauge.fetch_add(reply_bytes, Ordering::AcqRel);
                         }
-                        slot.child_meta.events.push_back(ProcessEvent {
-                            ticket: cmd.ticket,
-                            outcome: ProcessOutcome::Done(reply),
-                        });
+                        slot.child_meta
+                            .events
+                            .push_back(ProcessEvent { ticket: cmd.ticket, outcome: ProcessOutcome::Done(reply) });
                     }
                     WaveTaskResult::StepFail => {
                         let cmd = slot.in_flight_cmd.take().unwrap();
@@ -1034,7 +1010,7 @@ impl Processes {
 }
 
 enum InitOutcome {
-    Ok(WasmtimeGuest),
+    Ok(ControlledGuest),
     DeterministicFail,
     FatalOverrun,
 }
@@ -1045,11 +1021,7 @@ enum StepOutcome {
     FatalOverrun,
 }
 
-fn is_overrun_result<T>(
-    res: &anyhow::Result<T>,
-    cancel_flag: &AtomicBool,
-    deadline_at: Option<Instant>,
-) -> bool {
+fn is_overrun_result<T>(res: &anyhow::Result<T>, cancel_flag: &AtomicBool, deadline_at: Option<Instant>) -> bool {
     if cancel_flag.load(Ordering::Acquire) {
         return true;
     }
@@ -1081,13 +1053,11 @@ fn run_process_init(
     if is_overrun_now(cancel_flag, deadline_at) {
         return InitOutcome::FatalOverrun;
     }
-    let wt_module = module.wasmtime_module().expect("validated Wasmtime module");
     let init_fuel = policy.rust_wasmtime_fuel.map(|f| f.init_fuel);
     let cleanup_fuel = policy.rust_wasmtime_fuel.map(|f| f.cleanup_fuel);
 
-    let started = WasmtimeGuest::start_controlled(
+    let started = ControlledGuest::start_controlled(
         engine,
-        wt_module,
         module,
         Some(policy.memory),
         deadline_at,
@@ -1108,7 +1078,7 @@ fn run_process_init(
             guest.reset_arena()?;
         }
         let param = encode_process_value(&mut guest, &manifest.config_schema, config)?;
-        guest.call_raw(&manifest.init_export, param)?;
+        guest.call_raw(&manifest.init_export, param, false)?;
         Ok(())
     })();
 
@@ -1139,7 +1109,7 @@ fn run_process_init(
 
 /// Dedicated Rust `proc_step` turn executor with Overrun-first precedence (§5.2).
 fn run_process_step(
-    guest: &mut WasmtimeGuest,
+    guest: &mut ControlledGuest,
     manifest: &ProcessManifest,
     policy: &ProcessPolicy,
     cmd: &ProcessValue,
@@ -1151,6 +1121,7 @@ fn run_process_step(
     }
     let step_fuel = policy.rust_wasmtime_fuel.map(|f| f.step_fuel);
     let cleanup_fuel = policy.rust_wasmtime_fuel.map(|f| f.cleanup_fuel);
+    let result_is_f32 = manifest.reply_schema.wire_tag == ValueType::F32;
 
     let primary = (|| -> anyhow::Result<Val> {
         guest.arm_execution(deadline_at, Some(cancel_flag.clone()), step_fuel)?;
@@ -1158,7 +1129,7 @@ fn run_process_step(
             guest.reset_arena()?;
         }
         let param = encode_process_value(guest, &manifest.cmd_schema, cmd)?;
-        guest.call_raw(&manifest.step_export, param)
+        guest.call_raw(&manifest.step_export, param, result_is_f32)
     })();
 
     // Post-entry Overrun-first precedence (checked BEFORE inspecting Ok/Err, closing Cranelift
@@ -1238,21 +1209,13 @@ fn validate_value_against_schema(value: &ProcessValue, schema: &WireSchema, tran
             if words.len() > max_words {
                 return false;
             }
-            if schema.kind == WireSchemaKind::FlatFixed {
-                words.len() == schema.stride as usize
-            } else {
-                true
-            }
+            if schema.kind == WireSchemaKind::FlatFixed { words.len() == schema.stride as usize } else { true }
         }
         _ => false,
     }
 }
 
-fn encode_process_value(
-    guest: &mut WasmtimeGuest,
-    schema: &WireSchema,
-    value: &ProcessValue,
-) -> anyhow::Result<Val> {
+fn encode_process_value(guest: &mut ControlledGuest, schema: &WireSchema, value: &ProcessValue) -> anyhow::Result<Val> {
     match (schema.wire_tag, value) {
         (ValueType::Unit, ProcessValue::Unit) => Ok(Val::I32(0)),
         (ValueType::U32, ProcessValue::U32(v)) => Ok(Val::I32(v.cast_signed())),
@@ -1267,7 +1230,7 @@ fn encode_process_value(
 }
 
 fn decode_process_reply(
-    guest: &WasmtimeGuest,
+    guest: &ControlledGuest,
     schema: &WireSchema,
     raw: &Val,
     max_reply_bytes: usize,
@@ -1291,7 +1254,10 @@ fn decode_process_reply(
             anyhow::ensure!(header != u32::MAX, "unexpected overflow sentinel in process reply");
             let words_len = header as usize;
             let bytes = words_len.saturating_mul(4);
-            anyhow::ensure!(bytes <= max_reply_bytes, "process reply {bytes} bytes exceeds max_reply_bytes {max_reply_bytes}");
+            anyhow::ensure!(
+                bytes <= max_reply_bytes,
+                "process reply {bytes} bytes exceeds max_reply_bytes {max_reply_bytes}"
+            );
             if schema.kind == WireSchemaKind::FlatFixed {
                 anyhow::ensure!(
                     words_len == schema.stride as usize,

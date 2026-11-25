@@ -122,9 +122,90 @@ impl MeshCache {
     }
 }
 
-/// Runs all pure-CPU mesh preparation (RT triangle list, meshlets, and Cluster DAG),
-/// using `cache` to avoid rebuilding unchanged meshlets/DAGs across launches.
-pub(crate) fn prepare_mesh(mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
+/// Builds GPU meshlets and (for meshes >= 768 triangles) a continuous LOD Cluster DAG
+/// from a static unskinned mesh's LOD0 geometry. Shared by offline packaging (`pack_mesh_with_lods`)
+/// and runtime cache misses (`prepare_mesh`).
+#[cfg(any(feature = "simplify", test))]
+pub(crate) fn build_meshlets_and_dag(mesh: &Mesh) -> (Option<MeshletMesh>, Option<MeshletDagMesh>) {
+    if mesh.skin.is_some() || mesh.morphs.is_some() || mesh.instances.is_some() {
+        return (None, None);
+    }
+    let Some(idx_slice) = mesh.lods.first().and_then(|lod0| {
+        let start = lod0.first as usize;
+        let end = start.checked_add(lod0.count as usize)?;
+        mesh.indices.get(start..end)
+    }) else {
+        return (None, None);
+    };
+    if idx_slice.len() / 3 < 128 {
+        return (None, None);
+    }
+    let mut positions = Vec::with_capacity(mesh.vertices.len() / MESH_VERTEX_FLOATS);
+    for v in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
+        positions.push([v[0], v[1], v[2]]);
+    }
+    build_meshlets_and_dag_from_slice(&positions, idx_slice, &MeshletDagConfig::default())
+}
+
+fn build_meshlets_and_dag_from_slice(
+    positions: &[[f32; 3]],
+    idx_slice: &[u32],
+    config: &MeshletDagConfig,
+) -> (Option<MeshletMesh>, Option<MeshletDagMesh>) {
+    let ml = build_meshlets(positions, idx_slice, config.max_vertices, config.max_triangles)
+        .ok()
+        .filter(|ml| ml.meshlets.len() > 1);
+    let dag = (idx_slice.len() / 3 >= 768)
+        .then(|| {
+            let clean_indices: Vec<u32> = idx_slice
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .filter(|&&[a, b, c]| {
+                    let (Some(&pa), Some(&pb), Some(&pc)) =
+                        (positions.get(a as usize), positions.get(b as usize), positions.get(c as usize))
+                    else {
+                        return false;
+                    };
+                    let ab = [
+                        f64::from(pb[0]) - f64::from(pa[0]),
+                        f64::from(pb[1]) - f64::from(pa[1]),
+                        f64::from(pb[2]) - f64::from(pa[2]),
+                    ];
+                    let ac = [
+                        f64::from(pc[0]) - f64::from(pa[0]),
+                        f64::from(pc[1]) - f64::from(pa[1]),
+                        f64::from(pc[2]) - f64::from(pa[2]),
+                    ];
+                    let nx = ab[1] * ac[2] - ab[2] * ac[1];
+                    let ny = ab[2] * ac[0] - ab[0] * ac[2];
+                    let nz = ab[0] * ac[1] - ab[1] * ac[0];
+                    nx != 0.0 || ny != 0.0 || nz != 0.0
+                })
+                .flat_map(|t| *t)
+                .collect();
+            if clean_indices.len() == idx_slice.len()
+                && let Some(leaves) = &ml
+            {
+                build_meshlet_dag_from_leaves(positions, leaves.clone(), config)
+                    .ok()
+                    .filter(|d| d.level_count > 1 && d.clusters.len() > 1)
+            } else if clean_indices.len() / 3 >= 768 {
+                build_meshlet_dag(positions, &clean_indices, config)
+                    .ok()
+                    .filter(|d| d.level_count > 1 && d.clusters.len() > 1)
+            } else {
+                None
+            }
+        })
+        .flatten();
+    (ml, dag)
+}
+
+/// Runs all pure-CPU mesh preparation (RT triangle list, meshlets, and Cluster DAG).
+/// Packaged `PMSH` meshes that already carry pre-baked meshlets/DAG skip building and
+/// disk-cache I/O completely; unpacked dev meshes use `cache` on worker threads.
+pub(crate) fn prepare_mesh(mut mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
     let rt_triangles = mesh.lods.first().and_then(|lod| {
         let start = lod.first as usize;
         let end = start.saturating_add(lod.count as usize).min(mesh.indices.len());
@@ -156,7 +237,11 @@ pub(crate) fn prepare_mesh(mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
         (!triangles.is_empty()).then_some(triangles)
     });
 
-    let (meshlets, meshlet_dag) = if mesh.skin.is_none() && mesh.morphs.is_none() && mesh.instances.is_none() {
+    let baked_ml = mesh.meshlets.take();
+    let baked_dag = mesh.meshlet_dag.take();
+    let (meshlets, meshlet_dag) = if baked_ml.is_some() || baked_dag.is_some() {
+        (baked_ml, baked_dag)
+    } else if mesh.skin.is_none() && mesh.morphs.is_none() && mesh.instances.is_none() {
         let lod0_slice = mesh.lods.first().and_then(|lod0| {
             let start = lod0.first as usize;
             let end = start.checked_add(lod0.count as usize)?;
@@ -182,53 +267,7 @@ pub(crate) fn prepare_mesh(mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
             if let Some(cached) = cached {
                 cached
             } else {
-                let ml = build_meshlets(&positions, idx_slice, config.max_vertices, config.max_triangles)
-                    .ok()
-                    .filter(|ml| ml.meshlets.len() > 1);
-                let dag = (idx_slice.len() / 3 >= 768)
-                    .then(|| {
-                        let clean_indices: Vec<u32> = idx_slice
-                            .as_chunks::<3>()
-                            .0
-                            .iter()
-                            .filter(|&&[a, b, c]| {
-                                let (Some(&pa), Some(&pb), Some(&pc)) =
-                                    (positions.get(a as usize), positions.get(b as usize), positions.get(c as usize))
-                                else {
-                                    return false;
-                                };
-                                let ab = [
-                                    f64::from(pb[0]) - f64::from(pa[0]),
-                                    f64::from(pb[1]) - f64::from(pa[1]),
-                                    f64::from(pb[2]) - f64::from(pa[2]),
-                                ];
-                                let ac = [
-                                    f64::from(pc[0]) - f64::from(pa[0]),
-                                    f64::from(pc[1]) - f64::from(pa[1]),
-                                    f64::from(pc[2]) - f64::from(pa[2]),
-                                ];
-                                let nx = ab[1] * ac[2] - ab[2] * ac[1];
-                                let ny = ab[2] * ac[0] - ab[0] * ac[2];
-                                let nz = ab[0] * ac[1] - ab[1] * ac[0];
-                                nx != 0.0 || ny != 0.0 || nz != 0.0
-                            })
-                            .flat_map(|t| *t)
-                            .collect();
-                        if clean_indices.len() == idx_slice.len()
-                            && let Some(leaves) = &ml
-                        {
-                            build_meshlet_dag_from_leaves(&positions, leaves.clone(), &config)
-                                .ok()
-                                .filter(|d| d.level_count > 1 && d.clusters.len() > 1)
-                        } else if clean_indices.len() / 3 >= 768 {
-                            build_meshlet_dag(&positions, &clean_indices, &config)
-                                .ok()
-                                .filter(|d| d.level_count > 1 && d.clusters.len() > 1)
-                        } else {
-                            None
-                        }
-                    })
-                    .flatten();
+                let (ml, dag) = build_meshlets_and_dag_from_slice(&positions, idx_slice, &config);
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(hash) = &hash {
                     cache.store(hash, ml.as_ref(), dag.as_ref());
@@ -502,6 +541,8 @@ mod tests {
             morphs: None,
             uvs1: None,
             colors: None,
+            meshlets: None,
+            meshlet_dag: None,
         }
     }
 
@@ -548,5 +589,52 @@ mod tests {
         let custom = PathBuf::from("/tmp/custom-cache");
         let custom_cache = MeshCache::from_pipeline_cache(Some(&custom));
         assert_eq!(custom_cache.dir.as_deref().map(PathBuf::as_path), Some(Path::new("/tmp/custom-cache/meshlets")));
+    }
+
+    #[cfg(feature = "simplify")]
+    #[test]
+    fn prepare_mesh_uses_prebaked_meshlets_without_cache() {
+        let mesh = sphere_mesh(28, 32);
+        let mut positions = Vec::with_capacity(mesh.vertices.len() / MESH_VERTEX_FLOATS * 3);
+        let mut normals = Vec::with_capacity(mesh.vertices.len() / MESH_VERTEX_FLOATS * 3);
+        let mut uvs = Vec::with_capacity(mesh.vertices.len() / MESH_VERTEX_FLOATS * 2);
+        for v in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
+            positions.extend_from_slice(&v[0..3]);
+            normals.extend_from_slice(&v[3..6]);
+            uvs.extend_from_slice(&v[6..8]);
+        }
+        let json = serde_json::to_vec(&serde_json::json!({
+            "positions": positions,
+            "normals": normals,
+            "uvs": uvs,
+            "indices": mesh.indices,
+        }))
+        .unwrap();
+
+        let packed = crate::simplify::pack_mesh_with_lods(&json).unwrap();
+        let parsed = crate::asset_store::parse_mesh(&packed).unwrap();
+        assert!(parsed.meshlets.is_some());
+        assert!(parsed.meshlet_dag.is_some());
+
+        let dir = std::env::temp_dir().join(format!("pen-mesh-prebaked-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = MeshCache::open(Some(&dir));
+        let prepared = prepare_mesh(parsed, &cache);
+        let cold = prepare_mesh(mesh, &MeshCache::default());
+
+        assert!(!dir.exists(), "pre-baked meshes must not write to the runtime meshlet cache");
+        let (ml_baked, ml_cold) = (prepared.meshlets.as_ref().unwrap(), cold.meshlets.as_ref().unwrap());
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&ml_baked.meshlets), bytemuck::cast_slice::<_, u8>(&ml_cold.meshlets));
+        assert_eq!(ml_baked.indices, ml_cold.indices);
+
+        let (dag_baked, dag_cold) = (prepared.meshlet_dag.as_ref().unwrap(), cold.meshlet_dag.as_ref().unwrap());
+        assert_eq!(dag_baked.level_count, dag_cold.level_count);
+        assert_eq!(dag_baked.leaf_cluster_count, dag_cold.leaf_cluster_count);
+        assert_eq!(dag_baked.root_cluster_count, dag_cold.root_cluster_count);
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&dag_baked.clusters),
+            bytemuck::cast_slice::<_, u8>(&dag_cold.clusters)
+        );
+        assert_eq!(dag_baked.indices, dag_cold.indices);
     }
 }

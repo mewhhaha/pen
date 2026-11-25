@@ -13,6 +13,8 @@ use serde_json::Value;
 use crate::animation::{Clip, JointJson, NodeJson, Rig, RigJson, read_rig, write_rig};
 use crate::culling::Sphere;
 use crate::loader::{Job, JobQueue, Priority};
+use crate::meshlet_dag::{DagClusterGpu, MeshletDagMesh};
+use crate::meshlets::{MeshletGpu, MeshletMesh};
 use crate::shader::Variants;
 
 mod instances;
@@ -80,6 +82,10 @@ pub(crate) struct Mesh {
     pub uvs1: Option<Vec<[f32; 2]>>,
     /// Optional per-vertex linear RGBA colors (`COLOR_0`) retained from mesh JSON.
     pub colors: Option<Vec<[f32; 4]>>,
+    /// Pre-baked GPU meshlets carried in packaged `PMSH` binaries (`MESH_MESHLETS`).
+    pub meshlets: Option<MeshletMesh>,
+    /// Pre-baked continuous LOD Cluster DAG carried in packaged `PMSH` binaries (`MESH_MESHLETS`).
+    pub meshlet_dag: Option<MeshletDagMesh>,
 }
 
 /// Morph targets for a mesh: `targets` blendshapes, each storing
@@ -535,6 +541,10 @@ const MESH_INSTANCES: u8 = 16;
 const MESH_TANGENTS: u8 = 32;
 // Flag: morph target count (u32) + targets * vertices * 6 f32s follow LODs.
 const MESH_MORPHS: u8 = 64;
+// Flag: pre-baked GPU meshlets and/or continuous LOD Cluster DAG follow LODs.
+const MESH_MESHLETS: u8 = 128;
+const MESHLET_SUB_CLUSTERS: u32 = 1;
+const MESHLET_SUB_DAG: u32 = 2;
 const MESH_HEADER: usize = 16;
 
 #[derive(Deserialize)]
@@ -759,6 +769,8 @@ pub(crate) fn checked_mesh(
         morphs: None,
         uvs1: None,
         colors: None,
+        meshlets: None,
+        meshlet_dag: None,
     };
     let count = mesh.vertices.len() / MESH_VERTEX_FLOATS;
     ensure!(count != 0, "mesh requires matching position/normal/UV vertices and triangle indices");
@@ -824,6 +836,84 @@ impl Mesh {
         self.morphs = morphs;
         Ok(())
     }
+
+    pub(crate) fn set_baked_meshlets(
+        &mut self,
+        meshlets: Option<MeshletMesh>,
+        dag: Option<MeshletDagMesh>,
+    ) -> Result<()> {
+        if meshlets.is_some() || dag.is_some() {
+            ensure!(
+                self.skin.is_none() && self.morphs.is_none() && self.instances.is_none(),
+                "baked meshlets require a static unskinned, non-morphed, non-instanced mesh"
+            );
+        }
+        let vertex_count = self.vertices.len() / MESH_VERTEX_FLOATS;
+        if let Some(ml) = &meshlets {
+            ensure!(ml.meshlets.len() > 1, "baked meshlets must contain more than one cluster");
+            ensure!(ml.indices.len().is_multiple_of(3), "baked meshlet index count must be a multiple of 3");
+            ensure!(
+                ml.indices.iter().all(|&index| (index as usize) < vertex_count),
+                "baked meshlet index is outside the mesh vertex array"
+            );
+            for cluster in &ml.meshlets {
+                ensure!(
+                    cluster.sphere.iter().all(|v| v.is_finite())
+                        && cluster.sphere[3] >= 0.0
+                        && cluster.cone_axis_cutoff.iter().all(|v| v.is_finite()),
+                    "baked meshlet bounds must be finite"
+                );
+                let first = cluster.counts[0] as usize;
+                let count = cluster.counts[1] as usize;
+                let tris = cluster.counts[3] as usize;
+                ensure!(
+                    count == tris.saturating_mul(3)
+                        && first.checked_add(count).is_some_and(|end| end <= ml.indices.len()),
+                    "baked meshlet index range is out of bounds"
+                );
+            }
+        }
+        if let Some(dag) = &dag {
+            ensure!(
+                dag.level_count > 1
+                    && dag.clusters.len() > 1
+                    && dag.leaf_cluster_count > 0
+                    && (dag.leaf_cluster_count as usize) <= dag.clusters.len()
+                    && dag.root_cluster_count > 0
+                    && (dag.root_cluster_count as usize) <= dag.clusters.len(),
+                "baked meshlet DAG header counts are invalid"
+            );
+            ensure!(dag.indices.len().is_multiple_of(3), "baked meshlet DAG index count must be a multiple of 3");
+            ensure!(
+                dag.indices.iter().all(|&index| (index as usize) < vertex_count),
+                "baked meshlet DAG index is outside the mesh vertex array"
+            );
+            for cluster in &dag.clusters {
+                ensure!(
+                    cluster.bounds_sphere.iter().all(|v| v.is_finite())
+                        && cluster.bounds_sphere[3] >= 0.0
+                        && cluster.cone_axis_cutoff.iter().all(|v| v.is_finite())
+                        && cluster.lod_sphere.iter().all(|v| v.is_finite())
+                        && cluster.lod_sphere[3] >= 0.0
+                        && cluster.parent_sphere.iter().all(|v| v.is_finite())
+                        && cluster.parent_sphere[3] >= 0.0
+                        && cluster.errors.iter().all(|v| v.is_finite()),
+                    "baked meshlet DAG cluster bounds must be finite"
+                );
+                let first = cluster.counts[0] as usize;
+                let count = cluster.counts[1] as usize;
+                let tris = cluster.counts[3] as usize;
+                ensure!(
+                    count == tris.saturating_mul(3)
+                        && first.checked_add(count).is_some_and(|end| end <= dag.indices.len()),
+                    "baked meshlet DAG cluster index range is out of bounds"
+                );
+            }
+        }
+        self.meshlets = meshlets;
+        self.meshlet_dag = dag;
+        Ok(())
+    }
 }
 
 /// The compact binary form of a mesh asset (JSON, or already binary), which
@@ -857,6 +947,13 @@ fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
     let attributes = vertices.iter().any(|vertex| vertex[8] != 0.0 || vertex[9] != 0.0);
     let short = count <= usize::from(u16::MAX) + 1;
     let lods = mesh.lods.len() > 1;
+    let has_meshlets = mesh.meshlets.is_some() || mesh.meshlet_dag.is_some();
+    if has_meshlets {
+        ensure!(
+            mesh.skin.is_none() && mesh.morphs.is_none() && mesh.instances.is_none(),
+            "baked meshlets cannot be packed with skinning, morphs, or persistent instances"
+        );
+    }
     let floats = if attributes { MESH_VERTEX_FLOATS } else { MESH_VERTEX_FLOATS - 2 };
     let mut packed =
         Vec::with_capacity(MESH_HEADER + count * floats * 4 + mesh.indices.len() * if short { 2 } else { 4 });
@@ -869,7 +966,8 @@ fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
             | if lods { MESH_LODS } else { 0 }
             | if mesh.instances.is_some() { MESH_INSTANCES } else { 0 }
             | if mesh.tangents.is_some() { MESH_TANGENTS } else { 0 }
-            | if mesh.morphs.is_some() { MESH_MORPHS } else { 0 },
+            | if mesh.morphs.is_some() { MESH_MORPHS } else { 0 }
+            | if has_meshlets { MESH_MESHLETS } else { 0 },
         0,
         0,
     ]);
@@ -921,6 +1019,26 @@ fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
     if let Some(instances) = &mesh.instances {
         instances.write(&mut packed)?;
     }
+    if has_meshlets {
+        let subflags = if mesh.meshlets.is_some() { MESHLET_SUB_CLUSTERS } else { 0 }
+            | if mesh.meshlet_dag.is_some() { MESHLET_SUB_DAG } else { 0 };
+        packed.extend(subflags.to_le_bytes());
+        if let Some(ml) = &mesh.meshlets {
+            packed.extend(u32::try_from(ml.meshlets.len())?.to_le_bytes());
+            packed.extend(u32::try_from(ml.indices.len())?.to_le_bytes());
+            packed.extend_from_slice(bytemuck::cast_slice(&ml.meshlets));
+            write(&mut packed, &ml.indices)?;
+        }
+        if let Some(dag) = &mesh.meshlet_dag {
+            packed.extend(u32::try_from(dag.clusters.len())?.to_le_bytes());
+            packed.extend(u32::try_from(dag.indices.len())?.to_le_bytes());
+            packed.extend(dag.level_count.to_le_bytes());
+            packed.extend(dag.leaf_cluster_count.to_le_bytes());
+            packed.extend(dag.root_cluster_count.to_le_bytes());
+            packed.extend_from_slice(bytemuck::cast_slice(&dag.clusters));
+            write(&mut packed, &dag.indices)?;
+        }
+    }
     Ok(packed)
 }
 
@@ -971,6 +1089,29 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
     mesh.set_instances(layout.instances.as_ref().map(|layout| MeshInstances::read(bytes, layout)).transpose()?)?;
     mesh.set_tangents(tangents)?;
     mesh.set_morphs(morphs)?;
+    if let Some(ml_layout) = &layout.meshlets {
+        let baked_ml = ml_layout.meshlets.as_ref().map(|(records, idx_block)| {
+            let meshlets: Vec<MeshletGpu> = bytes[records.range()]
+                .chunks_exact(records.stride)
+                .map(bytemuck::pod_read_unaligned::<MeshletGpu>)
+                .collect();
+            MeshletMesh { meshlets, indices: read_indices(idx_block) }
+        });
+        let baked_dag = ml_layout.dag.as_ref().map(|dag| {
+            let clusters: Vec<DagClusterGpu> = bytes[dag.clusters.range()]
+                .chunks_exact(dag.clusters.stride)
+                .map(bytemuck::pod_read_unaligned::<DagClusterGpu>)
+                .collect();
+            MeshletDagMesh {
+                clusters,
+                indices: read_indices(&dag.indices),
+                level_count: dag.level_count,
+                leaf_cluster_count: dag.leaf_cluster_count,
+                root_cluster_count: dag.root_cluster_count,
+            }
+        });
+        mesh.set_baked_meshlets(baked_ml, baked_dag)?;
+    }
     Ok(mesh)
 }
 
@@ -1595,6 +1736,71 @@ mod tests {
         let first = MESH_HEADER + 3 * 8 * 4;
         nan[first..first + 4].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(parse_mesh(&nan).is_err());
+    }
+
+    #[test]
+    fn baked_meshlets_and_dag_round_trip_bit_exactly_and_reject_corruption() {
+        // 32x32 bumpy grid = 2048 triangles (>= 768 -> both meshlets and Cluster DAG).
+        let side = 32u32;
+        let (mut positions, mut normals, mut uvs, mut indices) = (vec![], vec![], vec![], vec![]);
+        for z in 0..=side {
+            for x in 0..=side {
+                let (u, v) = (f64::from(x) / f64::from(side), f64::from(z) / f64::from(side));
+                positions.extend([u, 0.02 * (u * 25.0).sin() * (v * 20.0).cos(), v]);
+                normals.extend([0.0, 1.0, 0.0]);
+                uvs.extend([u, v]);
+            }
+        }
+        let at = |x: u32, z: u32| z * (side + 1) + x;
+        for z in 0..side {
+            for x in 0..side {
+                indices.extend([at(x, z), at(x, z + 1), at(x + 1, z), at(x + 1, z), at(x, z + 1), at(x + 1, z + 1)]);
+            }
+        }
+        let json = serde_json::to_vec(
+            &serde_json::json!({"positions": positions, "normals": normals, "uvs": uvs, "indices": indices}),
+        )
+        .unwrap();
+        let mut mesh = parse_mesh(&json).unwrap();
+        let (ml, dag) = crate::mesh_cache::build_meshlets_and_dag(&mesh);
+        assert!(ml.is_some() && dag.is_some());
+        mesh.set_baked_meshlets(ml.clone(), dag.clone()).unwrap();
+
+        let packed = pack(&mesh).unwrap();
+        assert_eq!(packed[5] & MESH_MESHLETS, MESH_MESHLETS);
+        let unpacked = parse_mesh(&packed).unwrap();
+        assert_eq!(pack_mesh(&packed).unwrap(), packed);
+
+        let (ml_orig, ml_back) = (ml.as_ref().unwrap(), unpacked.meshlets.as_ref().unwrap());
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&ml_orig.meshlets), bytemuck::cast_slice::<_, u8>(&ml_back.meshlets));
+        assert_eq!(ml_orig.indices, ml_back.indices);
+
+        let (dag_orig, dag_back) = (dag.as_ref().unwrap(), unpacked.meshlet_dag.as_ref().unwrap());
+        assert_eq!(
+            bytemuck::cast_slice::<_, u8>(&dag_orig.clusters),
+            bytemuck::cast_slice::<_, u8>(&dag_back.clusters)
+        );
+        assert_eq!(dag_orig.indices, dag_back.indices);
+        assert_eq!(
+            (dag_orig.level_count, dag_orig.leaf_cluster_count, dag_orig.root_cluster_count),
+            (dag_back.level_count, dag_back.leaf_cluster_count, dag_back.root_cluster_count)
+        );
+
+        // Truncated streams and corrupt uncompressed meshlet blocks are rejected.
+        for end in [0, 16, packed.len() / 2, packed.len() - 1] {
+            assert!(parse_mesh(&packed[..end]).is_err(), "truncated at {end}");
+        }
+        let mut raw = pack_uncompressed(&mesh).unwrap();
+        let layout = layout::Layout::read(&raw).unwrap();
+        let ml_start = layout.meshlets.as_ref().unwrap().meshlets.as_ref().unwrap().0.start;
+        // NaN inside first MeshletGpu bounding sphere radius.
+        raw[ml_start + 12..ml_start + 16].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(parse_mesh(&raw).is_err());
+
+        // Incompatible flag combination (skin + meshlets) is rejected.
+        let mut bad_flags = pack_uncompressed(&mesh).unwrap();
+        bad_flags[5] |= MESH_SKIN;
+        assert!(parse_mesh(&bad_flags).is_err());
     }
 
     #[test]

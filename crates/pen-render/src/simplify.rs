@@ -19,23 +19,26 @@ const LEAST_TRIANGLES: usize = 256;
 // A level is kept only with at most this share of the last one's triangles.
 const KEPT: f64 = 0.75;
 
-/// Like `pack_mesh`, with up to three simpler levels of detail: each as
-/// simple as the simplifier makes it within its error (a quarter percent,
-/// one percent and four percent of the mesh's size), kept if it leaves out a
-/// quarter of the last kept one's triangles. A mesh of fewer than 256
-/// triangles, an explicit JSON `lods` list (including empty), or an already
-/// packed mesh is preserved as authored. Shader-deformed meshes can declare an
-/// empty list when undeformed-space error cannot bound their visible surface.
+/// Like `pack_mesh`, with up to three simpler levels of detail and pre-baked
+/// GPU meshlets + continuous LOD Cluster DAG for static meshes so shipped native
+/// and browser builds skip runtime meshlet/DAG construction. A mesh with an
+/// explicit JSON `lods` list (including empty) keeps its authored LOD levels
+/// while still baking meshlets/DAG; persistent instances and already-packed
+/// binary `PMSH` meshes are preserved as authored.
 pub fn pack_mesh_with_lods(bytes: &[u8]) -> Result<Vec<u8>> {
-    let mesh = parse_mesh(bytes)?;
-    if mesh.instances.is_some()
-        || mesh.authored_lods
-        || mesh.lods.len() > 1
-        || mesh.lods[0].count as usize / 3 < LEAST_TRIANGLES
-    {
+    let mut mesh = parse_mesh(bytes)?;
+    if bytes.starts_with(b"PMSH") || mesh.instances.is_some() {
         return pack(&mesh);
     }
-    pack(&simplified(mesh)?)
+    if !mesh.authored_lods && mesh.lods.len() == 1 && mesh.lods[0].count as usize / 3 >= LEAST_TRIANGLES {
+        mesh = simplified(mesh)?;
+    }
+    if mesh.skin.is_none() && mesh.morphs.is_none() && mesh.meshlets.is_none() && mesh.meshlet_dag.is_none() {
+        let (ml, dag) = crate::mesh_cache::build_meshlets_and_dag(&mesh);
+        mesh.meshlets = ml;
+        mesh.meshlet_dag = dag;
+    }
+    pack(&mesh)
 }
 
 fn simplified(mesh: Mesh) -> Result<Mesh> {
@@ -68,8 +71,9 @@ fn simplified(mesh: Mesh) -> Result<Mesh> {
     let whole = whole.to_vec();
     let mut reduced = checked_mesh(mesh.vertices, whole, &simpler, mesh.skin)?;
     reduced.precision = mesh.precision;
-    // Its vertices are the mesh's, so each keeps its tangent.
+    // Its vertices are the mesh's, so each keeps its tangent and morph deltas.
     reduced.tangents = mesh.tangents;
+    reduced.morphs = mesh.morphs;
     Ok(reduced)
 }
 
@@ -113,11 +117,20 @@ mod tests {
         }
         assert_eq!(mesh.lods[0].count, 40 * 40 * 6);
         assert_eq!(mesh.vertices.len(), 41 * 41 * MESH_VERTEX_FLOATS);
-        // Packing it again keeps its levels.
+        // Pre-baked meshlets and continuous LOD Cluster DAG are embedded in the packaged PMSH binary.
+        assert!(mesh.meshlets.as_ref().is_some_and(|ml| ml.meshlets.len() > 1));
+        assert!(mesh.meshlet_dag.as_ref().is_some_and(|dag| dag.level_count > 1 && dag.clusters.len() > 1));
+        // Packing it again keeps its levels, meshlets, and DAG bit-for-bit.
         assert_eq!(pack_mesh_with_lods(&packed).unwrap(), packed);
-        // A small mesh is left whole.
+        // A 128-triangle mesh keeps one discrete LOD, bakes meshlets, and skips the DAG (< 768 tris).
         let small = parse_mesh(&pack_mesh_with_lods(&grid(8)).unwrap()).unwrap();
         assert_eq!(small.lods.len(), 1);
+        assert!(small.meshlets.as_ref().is_some_and(|ml| ml.meshlets.len() > 1));
+        assert!(small.meshlet_dag.is_none());
+        // A tiny mesh (< 128 tris) is left whole without meshlets or a DAG.
+        let tiny = parse_mesh(&pack_mesh_with_lods(&grid(6)).unwrap()).unwrap();
+        assert_eq!(tiny.lods.len(), 1);
+        assert!(tiny.meshlets.is_none() && tiny.meshlet_dag.is_none());
     }
 
     #[test]
@@ -188,6 +201,7 @@ mod authored_tests {
         assert_eq!(kept.vertices, plain.vertices);
         assert_eq!(kept.bounds.center, plain.bounds.center);
         assert_eq!(kept.bounds.radius, plain.bounds.radius);
+        assert!(kept.meshlets.is_some() && kept.meshlet_dag.is_some());
         assert_eq!(pack_mesh_with_lods(&packed).unwrap(), packed);
         // A packed, unsimplified asset is authoritative even if its original
         // JSON did not opt out. Repackaging must not invent new geometry.

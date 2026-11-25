@@ -538,52 +538,86 @@ impl std::fmt::Display for Shipped {
 }
 
 /// Copies the assets the game in `wasm` uses from `from` to `to`, its mesh
-/// JSON in the renderer's binary form ([`pen_render::pack_mesh`]), which
-/// loads faster and is a fraction of the size, with simpler levels of detail
-/// for large meshes where pen has the compiler.
+/// JSON in the renderer's binary form ([`pen_render::pack_mesh_with_lods`]),
+/// which loads faster, is a fraction of the size, and embeds simpler levels of
+/// detail plus pre-baked GPU meshlets and Cluster DAGs. Packs meshes in parallel
+/// across available CPU cores.
 #[cfg(feature = "compiler")]
 fn ship_assets(from: &Path, to: &Path, wasm: &[u8]) -> Result<Shipped> {
     let keys = asset_keys(from)?;
     let used = used_assets(from, &keys, wasm);
     let mut shipped = Shipped { files: used.len(), of: keys.len(), bytes: 0, of_bytes: 0, meshes: 0 };
+    let mut used_keys: Vec<(&String, u64)> = Vec::with_capacity(used.len());
     for key in &keys {
         let source = from.join(key);
-        shipped.of_bytes += std::fs::metadata(&source)?.len();
-        if !used.contains(key) {
-            continue;
+        let len = std::fs::metadata(&source)?.len();
+        shipped.of_bytes += len;
+        if used.contains(key) {
+            used_keys.push((key, len));
         }
+    }
+    // Schedule largest assets first so multi-core mesh packing avoids straggler tails.
+    used_keys.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    for &(key, _) in &used_keys {
         let target = to.join(key);
         std::fs::create_dir_all(target.parent().context("an asset has no directory")?)?;
-        #[cfg(feature = "compiler")]
-        let pack = pen_render::pack_mesh_with_lods;
-        #[cfg(not(feature = "compiler"))]
-        let pack = pen_render::pack_mesh;
-        let packed = if key.ends_with(".mesh.json") {
-            let mesh = std::fs::read(&source)?;
-            match pack(&mesh) {
-                // A package's game/, packaged again, has them packed already.
-                Err(_) if mesh.starts_with(b"PMSH") => None,
-                Ok(packed) => Some(packed),
-                Err(error) => {
-                    eprintln!("shipping {key} as it is: {error:#}");
-                    None
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let workers =
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get).min(used_keys.len().max(1));
+    let mut results: Vec<Result<(u64, usize)>> = Vec::with_capacity(workers);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(scope.spawn(|| -> Result<(u64, usize)> {
+                let mut bytes = 0u64;
+                let mut meshes = 0usize;
+                #[cfg(feature = "compiler")]
+                let pack = pen_render::pack_mesh_with_lods;
+                #[cfg(not(feature = "compiler"))]
+                let pack = pen_render::pack_mesh;
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(&(key, _)) = used_keys.get(index) else { break };
+                    let source = from.join(key);
+                    let target = to.join(key);
+                    let packed = if key.ends_with(".mesh.json") {
+                        let mesh = std::fs::read(&source)?;
+                        match pack(&mesh) {
+                            // A package's game/, packaged again, has them packed already.
+                            Err(_) if mesh.starts_with(b"PMSH") => None,
+                            Ok(packed) => Some(packed),
+                            Err(error) => {
+                                eprintln!("shipping {key} as it is: {error:#}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    // A new file, never one sharing the source's: tools rewrite assets in place.
+                    match packed {
+                        Some(packed) => {
+                            std::fs::write(&target, packed)?;
+                            meshes += 1;
+                        }
+                        None => {
+                            std::fs::copy(&source, &target).with_context(|| format!("copying {}", source.display()))?;
+                        }
+                    }
+                    bytes += std::fs::metadata(&target)?.len();
                 }
-            }
-        } else {
-            None
-        };
-        // A new file, never one sharing the source's: tools rewrite assets
-        // in place.
-        match packed {
-            Some(packed) => {
-                std::fs::write(&target, packed)?;
-                shipped.meshes += 1;
-            }
-            None => {
-                std::fs::copy(&source, &target).with_context(|| format!("copying {}", source.display()))?;
-            }
+                Ok((bytes, meshes))
+            }));
         }
-        shipped.bytes += std::fs::metadata(&target)?.len();
+        for handle in handles {
+            results.push(handle.join().expect("asset shipping worker panicked"));
+        }
+    });
+    for result in results {
+        let (bytes, meshes) = result?;
+        shipped.bytes += bytes;
+        shipped.meshes += meshes;
     }
     Ok(shipped)
 }

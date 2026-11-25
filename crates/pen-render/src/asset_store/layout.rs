@@ -6,10 +6,12 @@ use std::ops::Range;
 use anyhow::{Context, Result, ensure};
 
 use super::{
-    MAX_LODS, MAX_MORPH_TARGETS, MESH_ATTRIBUTES, MESH_HEADER, MESH_INSTANCES, MESH_LODS, MESH_MAGIC,
+    MAX_LODS, MAX_MORPH_TARGETS, MESH_ATTRIBUTES, MESH_HEADER, MESH_INSTANCES, MESH_LODS, MESH_MAGIC, MESH_MESHLETS,
     MESH_MORPH_FLOATS, MESH_MORPHS, MESH_SHORT_INDICES, MESH_SKIN, MESH_TANGENT_FLOATS, MESH_TANGENTS, MESH_VERSION,
-    MESH_VERTEX_FLOATS,
+    MESH_VERTEX_FLOATS, MESHLET_SUB_CLUSTERS, MESHLET_SUB_DAG,
 };
+use crate::meshlet_dag::DagClusterGpu;
+use crate::meshlets::MeshletGpu;
 
 pub(super) const INSTANCE_FLOATS: usize = 20;
 const SKIN_STRIDE: usize = 24;
@@ -39,6 +41,19 @@ pub(super) struct Instances {
     pub records: Block,
 }
 
+pub(super) struct DagLayout {
+    pub level_count: u32,
+    pub leaf_cluster_count: u32,
+    pub root_cluster_count: u32,
+    pub clusters: Block,
+    pub indices: Block,
+}
+
+pub(super) struct MeshletsLayout {
+    pub meshlets: Option<(Block, Block)>,
+    pub dag: Option<DagLayout>,
+}
+
 pub(super) struct Layout {
     pub vertices: Block,
     pub tangents: Option<Block>,
@@ -47,6 +62,7 @@ pub(super) struct Layout {
     pub morphs: Option<(u32, Block)>,
     pub skin: Option<(Block, Range<usize>)>,
     pub instances: Option<Instances>,
+    pub meshlets: Option<MeshletsLayout>,
 }
 
 pub(super) fn word(bytes: &[u8], at: usize) -> Result<usize> {
@@ -59,22 +75,23 @@ impl Layout {
         ensure!(bytes.len() >= MESH_HEADER, "binary mesh ends in its header");
         ensure!(&bytes[..4] == MESH_MAGIC && bytes[4] == MESH_VERSION, "unsupported binary mesh version");
         ensure!(bytes[6..8] == [0; 2], "unsupported binary mesh header");
+        const ALL_FLAGS: u8 = MESH_ATTRIBUTES
+            | MESH_SHORT_INDICES
+            | MESH_SKIN
+            | MESH_LODS
+            | MESH_INSTANCES
+            | MESH_TANGENTS
+            | MESH_MORPHS
+            | MESH_MESHLETS;
+        const _: () = assert!(ALL_FLAGS == u8::MAX);
         let flags = bytes[5];
-        ensure!(
-            flags
-                & !(MESH_ATTRIBUTES
-                    | MESH_SHORT_INDICES
-                    | MESH_SKIN
-                    | MESH_LODS
-                    | MESH_INSTANCES
-                    | MESH_TANGENTS
-                    | MESH_MORPHS)
-                == 0,
-            "unsupported binary mesh flags"
-        );
         ensure!(
             flags & (MESH_SKIN | MESH_INSTANCES) != (MESH_SKIN | MESH_INSTANCES),
             "a mesh cannot have both a skin and persistent instances"
+        );
+        ensure!(
+            flags & MESH_MESHLETS == 0 || flags & (MESH_SKIN | MESH_INSTANCES | MESH_MORPHS) == 0,
+            "baked meshlets cannot be combined with skinning, morphs, or persistent instances"
         );
         let count = word(bytes, 8)?;
         let floats = if flags & MESH_ATTRIBUTES != 0 { MESH_VERTEX_FLOATS } else { MESH_VERTEX_FLOATS - 2 };
@@ -126,8 +143,42 @@ impl Layout {
         } else {
             None
         };
+        let meshlets = if flags & MESH_MESHLETS != 0 {
+            let subflags = u32::try_from(word(bytes, at)?)?;
+            at += 4;
+            ensure!(
+                subflags != 0 && subflags & !(MESHLET_SUB_CLUSTERS | MESHLET_SUB_DAG) == 0,
+                "unsupported binary meshlet subflags"
+            );
+            let ml = if subflags & MESHLET_SUB_CLUSTERS != 0 {
+                let ml_count = word(bytes, at)?;
+                let idx_count = word(bytes, at + 4)?;
+                at += 8;
+                let records = Block::take(bytes, &mut at, ml_count, size_of::<MeshletGpu>())?;
+                let idx = Block::take(bytes, &mut at, idx_count, index_bytes)?;
+                Some((records, idx))
+            } else {
+                None
+            };
+            let dag = if subflags & MESHLET_SUB_DAG != 0 {
+                let cluster_count = word(bytes, at)?;
+                let idx_count = word(bytes, at + 4)?;
+                let level_count = u32::try_from(word(bytes, at + 8)?)?;
+                let leaf_cluster_count = u32::try_from(word(bytes, at + 12)?)?;
+                let root_cluster_count = u32::try_from(word(bytes, at + 16)?)?;
+                at += 20;
+                let clusters = Block::take(bytes, &mut at, cluster_count, size_of::<DagClusterGpu>())?;
+                let idx = Block::take(bytes, &mut at, idx_count, index_bytes)?;
+                Some(DagLayout { level_count, leaf_cluster_count, root_cluster_count, clusters, indices: idx })
+            } else {
+                None
+            };
+            Some(MeshletsLayout { meshlets: ml, dag })
+        } else {
+            None
+        };
         ensure!(at == bytes.len(), "binary mesh has trailing bytes");
-        Ok(Self { vertices, tangents, indices, lods, morphs, skin, instances })
+        Ok(Self { vertices, tangents, indices, lods, morphs, skin, instances, meshlets })
     }
 
     /// Record blocks only: counts, errors, bounds and a skin's variable
@@ -140,5 +191,11 @@ impl Layout {
             .chain(self.morphs.iter().map(|(_, block)| block))
             .chain(self.skin.iter().map(|(block, _)| block))
             .chain(self.instances.iter().map(|instances| &instances.records))
+            .chain(self.meshlets.iter().flat_map(|ml| {
+                ml.meshlets
+                    .iter()
+                    .flat_map(|(records, idx)| [records, idx])
+                    .chain(ml.dag.iter().flat_map(|dag| [&dag.clusters, &dag.indices]))
+            }))
     }
 }

@@ -572,12 +572,7 @@ impl KernelPool {
         name: &str,
         config: KernelConfig,
     ) -> std::result::Result<Self, KernelError> {
-        let Some(wt_module) = module.wasmtime_module() else {
-            return Err(KernelError::WtimeAotUnsupported);
-        };
-        if !Engine::same(engine, wt_module.engine()) {
-            return Err(KernelError::EngineMismatch);
-        }
+        let _wt_module = module.ensure_wasmtime_module(engine)?;
         if engine.get_consume_fuel() {
             return Err(KernelError::FuelEngineUnsupportedForKernels);
         }

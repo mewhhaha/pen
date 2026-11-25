@@ -302,26 +302,150 @@ const WTIME_AOT_MERKLE256K_PREFIX: &str = "merkle256k:";
 const WTIME_AOT_MERKLE256K_DOMAIN: &[u8] = b"WTIME-MERKLE256K-1";
 
 /// Computes `wtime-aot`'s deterministic 256 KiB chunk SHA-256 Merkle root (`WTIME-MERKLE256K-1`),
-/// matching `tools/wtime-aot/src/sha256.rs::parallel_merkle_digest`.
+/// matching `tools/wtime-aot/src/sha256.rs::parallel_merkle_digest`, hashing chunks in parallel
+/// when `bytes.len() > 256 KiB`.
 #[cfg(feature = "compiler")]
 fn merkle256k_sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut root = Sha256::new();
     root.update(WTIME_AOT_MERKLE256K_DOMAIN);
     root.update((bytes.len() as u64).to_le_bytes());
-    if bytes.is_empty() {
+    if bytes.len() <= WTIME_AOT_MERKLE256K_CHUNK_BYTES {
         root.update(Sha256::digest(bytes));
-    } else {
+        return format!("{:x}", root.finalize());
+    }
+    let n_chunks = bytes.len().div_ceil(WTIME_AOT_MERKLE256K_CHUNK_BYTES);
+    let n_threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16).min(n_chunks);
+    if n_threads <= 1 {
         for chunk in bytes.chunks(WTIME_AOT_MERKLE256K_CHUNK_BYTES) {
             root.update(Sha256::digest(chunk));
         }
+        return format!("{:x}", root.finalize());
+    }
+    let mut leaves = vec![[0u8; 32]; n_chunks];
+    let per = n_chunks.div_ceil(n_threads);
+    let mut unspawned: Vec<(usize, usize)> = Vec::new();
+    std::thread::scope(|s| {
+        let mut rem = leaves.as_mut_slice();
+        let mut chunk_idx = 0usize;
+        while !rem.is_empty() {
+            let take = per.min(rem.len());
+            let (slot_slice, rest) = rem.split_at_mut(take);
+            let start_chunk = chunk_idx;
+            rem = rest;
+            chunk_idx += take;
+            if rem.is_empty() {
+                for (i, slot) in slot_slice.iter_mut().enumerate() {
+                    let off = (start_chunk + i) * WTIME_AOT_MERKLE256K_CHUNK_BYTES;
+                    let end = (off + WTIME_AOT_MERKLE256K_CHUNK_BYTES).min(bytes.len());
+                    let d = Sha256::digest(&bytes[off..end]);
+                    slot.copy_from_slice(&d);
+                }
+            } else if std::thread::Builder::new()
+                .spawn_scoped(s, move || {
+                    for (i, slot) in slot_slice.iter_mut().enumerate() {
+                        let off = (start_chunk + i) * WTIME_AOT_MERKLE256K_CHUNK_BYTES;
+                        let end = (off + WTIME_AOT_MERKLE256K_CHUNK_BYTES).min(bytes.len());
+                        let d = Sha256::digest(&bytes[off..end]);
+                        slot.copy_from_slice(&d);
+                    }
+                })
+                .is_err()
+            {
+                unspawned.push((start_chunk, take));
+            }
+        }
+    });
+    for (start_chunk, take) in unspawned {
+        for (i, slot) in leaves[start_chunk..start_chunk + take].iter_mut().enumerate() {
+            let off = (start_chunk + i) * WTIME_AOT_MERKLE256K_CHUNK_BYTES;
+            let end = (off + WTIME_AOT_MERKLE256K_CHUNK_BYTES).min(bytes.len());
+            let d = Sha256::digest(&bytes[off..end]);
+            slot.copy_from_slice(&d);
+        }
+    }
+    for leaf in &leaves {
+        root.update(leaf);
     }
     format!("{:x}", root.finalize())
+}
+
+/// Content-addressing digest for a verified `.so` artifact: either legacy plain 64-hex SHA-256
+/// or parallel 256 KiB chunk Merkle SHA-256 (`merkle256k:<64-hex>`).
+#[cfg(feature = "compiler")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VerifiedSoDigest {
+    Sha256(String),
+    Merkle256k(String),
+}
+
+#[cfg(feature = "compiler")]
+impl VerifiedSoDigest {
+    fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if let Some(hex) = trimmed.strip_prefix(WTIME_AOT_MERKLE256K_PREFIX) {
+            if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Some(Self::Merkle256k(hex.to_ascii_lowercase()));
+            }
+            return None;
+        }
+        if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Some(Self::Sha256(trimmed.to_ascii_lowercase()));
+        }
+        None
+    }
+
+    fn filename(&self) -> String {
+        match self {
+            Self::Sha256(hex) => format!("{hex}.so"),
+            Self::Merkle256k(hex) => format!("m-{hex}.so"),
+        }
+    }
+
+    fn tmp_stem(&self) -> String {
+        match self {
+            Self::Sha256(hex) => hex.clone(),
+            Self::Merkle256k(hex) => format!("m-{hex}"),
+        }
+    }
+
+    fn line_text(&self) -> String {
+        match self {
+            Self::Sha256(hex) => hex.clone(),
+            Self::Merkle256k(hex) => format!("{WTIME_AOT_MERKLE256K_PREFIX}{hex}"),
+        }
+    }
+
+    fn matches_bytes(&self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Sha256(expected) => wasm_sha256_hex(bytes) == *expected,
+            Self::Merkle256k(expected) => merkle256k_sha256_hex(bytes) == *expected,
+        }
+    }
+
+    fn matches_file(&self, path: &Path) -> bool {
+        match self {
+            Self::Sha256(expected) => file_sha256_hex(path).is_ok_and(|actual| actual == *expected),
+            Self::Merkle256k(expected) => std::fs::read(path).is_ok_and(|b| merkle256k_sha256_hex(&b) == *expected),
+        }
+    }
+}
+
+/// Fast collision-resistant cache-key digest for large `.wasm` inputs (parallel `merkle256k`
+/// above 256 KiB, plain SHA-256 at or below 256 KiB).
+#[cfg(feature = "compiler")]
+fn fast_wasm_cache_digest(wasm: &[u8]) -> String {
+    if wasm.len() > WTIME_AOT_MERKLE256K_CHUNK_BYTES {
+        format!("m256k-{}", merkle256k_sha256_hex(wasm))
+    } else {
+        wasm_sha256_hex(wasm)
+    }
 }
 
 /// Verifies a `wtime-aot` `.so.sha256` integrity sidecar line: either plain 64-hex SHA-256
 /// (artifacts `<= 256 KiB`) or `merkle256k:<64-hex>` (artifacts `> 256 KiB`).
 #[cfg(feature = "compiler")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn verify_artifact_sidecar_digest(bytes: &[u8], linear_sha256: &str, expected_trimmed: &str) -> bool {
     if let Some(expected_hex) = expected_trimmed.strip_prefix(WTIME_AOT_MERKLE256K_PREFIX) {
         expected_hex.len() == 64 && merkle256k_sha256_hex(bytes) == expected_hex
@@ -600,18 +724,23 @@ fn is_immutable_regular_file(meta: &std::fs::Metadata) -> bool {
     true
 }
 
-/// Atomically publishes `bytes` into `verified_dir/<so_sha>.so` with `0o555` permissions via
+/// Atomically publishes `bytes` into `verified_dir/<digest>.so` with `0o555` permissions via
 /// `rename(&tmp, &dest)` (never `remove_file(&dest)` so there is no missing-file window).
 #[cfg(feature = "compiler")]
-fn publish_immutable_verified_so(verified_dir: &Path, so_sha: &str, bytes: &[u8], seq: u64) -> Result<PathBuf> {
-    let dest = verified_dir.join(format!("{so_sha}.so"));
+fn publish_immutable_verified_so(
+    verified_dir: &Path,
+    digest: &VerifiedSoDigest,
+    bytes: &[u8],
+    seq: u64,
+) -> Result<PathBuf> {
+    let dest = verified_dir.join(digest.filename());
     if let Ok(meta) = std::fs::symlink_metadata(&dest)
         && is_immutable_regular_file(&meta)
-        && file_sha256_hex(&dest).is_ok_and(|actual| actual == so_sha)
+        && digest.matches_file(&dest)
     {
         return Ok(dest);
     }
-    let tmp = verified_dir.join(format!(".{so_sha}.{}.{seq}.tmp", std::process::id()));
+    let tmp = verified_dir.join(format!(".{}.{}.{seq}.tmp", digest.tmp_stem(), std::process::id()));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -2590,7 +2719,7 @@ fn classify_build_failure(backend: &str, exit_code: Option<i32>, status_display:
     }
 }
 
-/// Checks `fast_link` and loads the immutable content-addressed `verified/<sha256>.so` while the
+/// Checks `fast_link` and loads the immutable content-addressed `verified/<digest>.so` while the
 /// caller holds `canon_cache/.cache.lock` (shared or exclusive), keeping the verified artifact
 /// completely stable across `dlopen`.
 #[cfg(feature = "compiler")]
@@ -2602,11 +2731,12 @@ fn try_load_warm_verified_so(
 ) -> Option<(PathBuf, Library)> {
     let recorded = std::fs::read_to_string(fast_link).ok()?;
     let mut lines = recorded.lines();
-    let (rec_key, rec_so_sha, _rec_path) = (lines.next()?, lines.next()?, lines.next()?);
-    if rec_key != fast_key || rec_so_sha.len() != 64 || !rec_so_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+    let (rec_key, rec_so_digest_str, _rec_path) = (lines.next()?, lines.next()?, lines.next()?);
+    if rec_key != fast_key {
         return None;
     }
-    let verified_so = verified_dir.join(format!("{rec_so_sha}.so"));
+    let rec_digest = VerifiedSoDigest::parse(rec_so_digest_str)?;
+    let verified_so = verified_dir.join(rec_digest.filename());
     let sym = std::fs::symlink_metadata(&verified_so).ok()?;
     if !is_immutable_regular_file(&sym) {
         return None;
@@ -2618,21 +2748,21 @@ fn try_load_warm_verified_so(
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     if require_shstk {
         let bytes = std::fs::read(&canon_verified).ok()?;
-        if wasm_sha256_hex(&bytes) != rec_so_sha || !elf64_has_x86_shstk_property(&bytes) {
+        if !rec_digest.matches_bytes(&bytes) || !elf64_has_x86_shstk_property(&bytes) {
             return None;
         }
-    } else if file_sha256_hex(&canon_verified).ok().as_deref() != Some(rec_so_sha) {
+    } else if !rec_digest.matches_file(&canon_verified) {
         return None;
     }
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
     {
         let _ = require_shstk;
-        if file_sha256_hex(&canon_verified).ok().as_deref() != Some(rec_so_sha) {
+        if !rec_digest.matches_file(&canon_verified) {
             return None;
         }
     }
     // SAFETY: `canon_verified` is an immutable `0o555` content-addressed file inside our owner-only
-    // `0o700` cache whose SHA-256 matches `rec_so_sha` while `.cache.lock` is held across `dlopen`.
+    // `0o700` cache whose digest matches `rec_digest` while `.cache.lock` is held across `dlopen`.
     let lib = unsafe { Library::new(&canon_verified) }.ok()?;
     Some((canon_verified, lib))
 }
@@ -2746,7 +2876,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
         _ => unreachable!(),
     };
 
-    let digest = wasm_sha256_hex(wasm);
+    let digest = fast_wasm_cache_digest(wasm);
     let fast_key = format!("{digest}-{profile_tag}-{bin_hash}");
     // Hash `fast_key` to a fixed 64-hex-char filename so long profile/toolchain tags never exceed
     // Linux's 255-byte `NAME_MAX`, while still checking full `fast_key` exactness on line 1.
@@ -2999,7 +3129,6 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
             canon_so.display()
         );
     }
-    let so_sha = wasm_sha256_hex(&so_bytes);
     let sidecar = canon_so.with_extension("so.sha256");
     let sidecar_meta = std::fs::symlink_metadata(&sidecar)
         .with_context(|| format!("wtime-aot build missing required digest sidecar {}", sidecar.display()))?;
@@ -3020,14 +3149,17 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
     }
     let expected_sidecar =
         std::fs::read_to_string(&sidecar).with_context(|| format!("reading digest sidecar {}", sidecar.display()))?;
+    let verified_digest = VerifiedSoDigest::parse(&expected_sidecar)
+        .ok_or_else(|| anyhow!("malformed digest sidecar {}", sidecar.display()))?;
     ensure!(
-        verify_artifact_sidecar_digest(&so_bytes, &so_sha, expected_sidecar.trim()),
+        verified_digest.matches_bytes(&so_bytes),
         "built library digest mismatch with sidecar {}",
         sidecar.display()
     );
-    let verified_so = publish_immutable_verified_so(&verified_dir, &so_sha, &so_bytes, seq)?;
+    let verified_so = publish_immutable_verified_so(&verified_dir, &verified_digest, &so_bytes, seq)?;
     if let Ok((mut link_file, tmp_link)) = create_private_temp_file(&fast_dir, &fast_link_name, ".tmp") {
-        let written = link_file.write_all(format!("{fast_key}\n{so_sha}\n{}\n", canon_so.display()).as_bytes());
+        let written = link_file
+            .write_all(format!("{fast_key}\n{}\n{}\n", verified_digest.line_text(), canon_so.display()).as_bytes());
         drop(link_file);
         if written.is_err() || std::fs::rename(&tmp_link, &fast_link).is_err() {
             let _ = std::fs::remove_file(&tmp_link);
@@ -4458,5 +4590,35 @@ mod tests {
         large[last] ^= 0x01;
         let mutated_sha = wasm_sha256_hex(&large);
         assert!(!verify_artifact_sidecar_digest(&large, &mutated_sha, &merkle_line));
+    }
+
+    #[cfg(feature = "compiler")]
+    #[test]
+    fn parallel_merkle256k_matches_serial_and_verified_so_digest_roundtrips() {
+        use sha2::{Digest, Sha256};
+        // 1.1 MiB payload across 5 chunks (4 full 256 KiB + 1 partial) exercises multi-thread path.
+        let payload: Vec<u8> =
+            (0u32..(1120 << 10)).map(|i| u8::try_from((i.wrapping_mul(17) ^ (i >> 9)) & 0xff).expect("byte")).collect();
+        let mut serial_root = Sha256::new();
+        serial_root.update(WTIME_AOT_MERKLE256K_DOMAIN);
+        serial_root.update((payload.len() as u64).to_le_bytes());
+        for chunk in payload.chunks(WTIME_AOT_MERKLE256K_CHUNK_BYTES) {
+            serial_root.update(Sha256::digest(chunk));
+        }
+        let expected_hex = format!("{:x}", serial_root.finalize());
+        assert_eq!(merkle256k_sha256_hex(&payload), expected_hex);
+
+        let line = format!("{WTIME_AOT_MERKLE256K_PREFIX}{expected_hex}");
+        let parsed = VerifiedSoDigest::parse(&line).expect("parse merkle256k");
+        assert_eq!(parsed.line_text(), line);
+        assert_eq!(parsed.filename(), format!("m-{expected_hex}.so"));
+        assert!(parsed.matches_bytes(&payload));
+
+        let plain_hex = wasm_sha256_hex(b"tiny");
+        let parsed_plain = VerifiedSoDigest::parse(&plain_hex).expect("parse plain sha256");
+        assert_eq!(parsed_plain.line_text(), plain_hex);
+        assert_eq!(parsed_plain.filename(), format!("{plain_hex}.so"));
+        assert!(parsed_plain.matches_bytes(b"tiny"));
+        assert!(VerifiedSoDigest::parse("merkle256k:short").is_none());
     }
 }

@@ -65,10 +65,24 @@ fn wasm_type(value: ValueType) -> ValType {
     }
 }
 
+#[cfg(feature = "compiler")]
+struct LazyWasmtime {
+    engine: Engine,
+    wasm: Arc<[u8]>,
+    cache: Option<std::path::PathBuf>,
+    shape: MemoryShape,
+    abi: Arc<GuestAbi>,
+    compiled: std::sync::OnceLock<std::result::Result<Module, String>>,
+}
+
 #[derive(Clone)]
 enum CompiledModule {
     Wasmtime(Module),
-    WtimeAot(wtime_aot::AotModule),
+    WtimeAot {
+        aot: wtime_aot::AotModule,
+        #[cfg(feature = "compiler")]
+        lazy_wasmtime: Option<Arc<LazyWasmtime>>,
+    },
 }
 
 /// A compiled guest module, its manifest and its debug information, ready
@@ -225,11 +239,22 @@ impl GuestModule {
             let (module, imaged) = if use_aot
                 && engine_allows_aot(engine)
                 && abi.tasks.is_none()
-                && abi.kernels.is_empty()
                 && abi.processes.is_empty()
             {
                 let (aot, imaged) = wtime_aot::AotModule::compile(wasm, &abi, cache)?;
-                (CompiledModule::WtimeAot(aot), Arc::new(imaged))
+                let lazy_wasmtime = if !abi.kernels.is_empty() {
+                    Some(Arc::new(LazyWasmtime {
+                        engine: engine.clone(),
+                        wasm: Arc::from(wasm),
+                        cache: cache.map(Path::to_path_buf),
+                        shape,
+                        abi: Arc::clone(&abi),
+                        compiled: std::sync::OnceLock::new(),
+                    }))
+                } else {
+                    None
+                };
+                (CompiledModule::WtimeAot { aot, lazy_wasmtime }, Arc::new(imaged))
             } else {
                 let module = compile(engine, wasm, cache)?;
                 validate_raw_memory_shape(&module, &shape)?;
@@ -245,11 +270,49 @@ impl GuestModule {
         }
     }
 
-    /// Underlying Wasmtime [`Module`], when not executing via `wtime-aot`.
+    /// Underlying Wasmtime [`Module`], when not executing via `wtime-aot` (or once lazily
+    /// compiled for background `KernelPool` execution).
     pub fn wasmtime_module(&self) -> Option<&Module> {
         match &self.module {
             CompiledModule::Wasmtime(module) => Some(module),
-            CompiledModule::WtimeAot(_) => None,
+            #[cfg(feature = "compiler")]
+            CompiledModule::WtimeAot { lazy_wasmtime: Some(lazy), .. } => {
+                lazy.compiled.get().and_then(|res| res.as_ref().ok())
+            }
+            CompiledModule::WtimeAot { .. } => None,
+        }
+    }
+
+    /// Returns the underlying Wasmtime [`Module`] matching `expected_engine`, lazily compiling
+    /// from the original Wasm bytes when a `wtime-aot` module also declares `blot:kernels`.
+    pub(crate) fn ensure_wasmtime_module(&self, expected_engine: &Engine) -> std::result::Result<&Module, kernels::KernelError> {
+        match &self.module {
+            CompiledModule::Wasmtime(module) => {
+                if !Engine::same(expected_engine, module.engine()) {
+                    return Err(kernels::KernelError::EngineMismatch);
+                }
+                Ok(module)
+            }
+            #[cfg(feature = "compiler")]
+            CompiledModule::WtimeAot { lazy_wasmtime: Some(lazy), .. } => {
+                if !Engine::same(expected_engine, &lazy.engine) {
+                    return Err(kernels::KernelError::EngineMismatch);
+                }
+                let res = lazy.compiled.get_or_init(|| {
+                    let module = compile(&lazy.engine, &lazy.wasm, lazy.cache.as_deref())
+                        .map_err(|e| format!("{e:#}"))?;
+                    validate_raw_memory_shape(&module, &lazy.shape).map_err(|e| format!("{e:#}"))?;
+                    validate_module(&module, &lazy.abi).map_err(|e| format!("{e:#}"))?;
+                    Ok(module)
+                });
+                match res {
+                    Ok(module) => Ok(module),
+                    Err(msg) => Err(kernels::KernelError::Internal(format!(
+                        "compiling Wasmtime kernel fallback: {msg}"
+                    ))),
+                }
+            }
+            CompiledModule::WtimeAot { .. } => Err(kernels::KernelError::WtimeAotUnsupported),
         }
     }
 
@@ -262,7 +325,7 @@ impl GuestModule {
     pub fn backend_name(&self) -> &'static str {
         match &self.module {
             CompiledModule::Wasmtime(_) => "wasmtime",
-            CompiledModule::WtimeAot(_) => "wtime-aot",
+            CompiledModule::WtimeAot { .. } => "wtime-aot",
         }
     }
 
@@ -994,7 +1057,7 @@ impl Guest {
 
     fn start(engine: &Engine, module: &GuestModule, limits: Option<Limits>) -> Result<Guest> {
         match &module.module {
-            CompiledModule::WtimeAot(aot) => {
+            CompiledModule::WtimeAot { aot, .. } => {
                 ensure!(
                     engine_allows_aot(engine),
                     "wtime-aot module cannot be instantiated on an epoch-interrupted or fuel-metered engine"

@@ -295,6 +295,42 @@ fn wasm_sha256_hex(wasm: &[u8]) -> String {
 }
 
 #[cfg(feature = "compiler")]
+const WTIME_AOT_MERKLE256K_CHUNK_BYTES: usize = 256 << 10;
+#[cfg(feature = "compiler")]
+const WTIME_AOT_MERKLE256K_PREFIX: &str = "merkle256k:";
+#[cfg(feature = "compiler")]
+const WTIME_AOT_MERKLE256K_DOMAIN: &[u8] = b"WTIME-MERKLE256K-1";
+
+/// Computes `wtime-aot`'s deterministic 256 KiB chunk SHA-256 Merkle root (`WTIME-MERKLE256K-1`),
+/// matching `tools/wtime-aot/src/sha256.rs::parallel_merkle_digest`.
+#[cfg(feature = "compiler")]
+fn merkle256k_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut root = Sha256::new();
+    root.update(WTIME_AOT_MERKLE256K_DOMAIN);
+    root.update((bytes.len() as u64).to_le_bytes());
+    if bytes.is_empty() {
+        root.update(Sha256::digest(bytes));
+    } else {
+        for chunk in bytes.chunks(WTIME_AOT_MERKLE256K_CHUNK_BYTES) {
+            root.update(Sha256::digest(chunk));
+        }
+    }
+    format!("{:x}", root.finalize())
+}
+
+/// Verifies a `wtime-aot` `.so.sha256` integrity sidecar line: either plain 64-hex SHA-256
+/// (artifacts `<= 256 KiB`) or `merkle256k:<64-hex>` (artifacts `> 256 KiB`).
+#[cfg(feature = "compiler")]
+fn verify_artifact_sidecar_digest(bytes: &[u8], linear_sha256: &str, expected_trimmed: &str) -> bool {
+    if let Some(expected_hex) = expected_trimmed.strip_prefix(WTIME_AOT_MERKLE256K_PREFIX) {
+        expected_hex.len() == 64 && merkle256k_sha256_hex(bytes) == expected_hex
+    } else {
+        expected_trimmed.len() == 64 && linear_sha256 == expected_trimmed
+    }
+}
+
+#[cfg(feature = "compiler")]
 fn reader_sha256_hex(f: &mut std::fs::File, path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -2463,7 +2499,7 @@ fn load_verified_so(_wasm: &[u8], _cache: Option<&Path>) -> Result<Library> {
     bail!("wtime-aot compilation requires blot-host's `compiler` feature")
 }
 
-/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset (`wtime` v0.1.2).
+/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset (`wtime` v0.1.3).
 /// Uses native Linux x86-64 (`"x64"`), falling back automatically to `"c"`
 /// (`--c-opt auto --target-cpu native`) on [`X64FallbackError`].
 #[cfg(feature = "compiler")]
@@ -2984,7 +3020,11 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
     }
     let expected_sidecar =
         std::fs::read_to_string(&sidecar).with_context(|| format!("reading digest sidecar {}", sidecar.display()))?;
-    ensure!(expected_sidecar.trim() == so_sha, "built library digest mismatch with sidecar {}", sidecar.display());
+    ensure!(
+        verify_artifact_sidecar_digest(&so_bytes, &so_sha, expected_sidecar.trim()),
+        "built library digest mismatch with sidecar {}",
+        sidecar.display()
+    );
     let verified_so = publish_immutable_verified_so(&verified_dir, &so_sha, &so_bytes, seq)?;
     if let Ok((mut link_file, tmp_link)) = create_private_temp_file(&fast_dir, &fast_link_name, ".tmp") {
         let written = link_file.write_all(format!("{fast_key}\n{so_sha}\n{}\n", canon_so.display()).as_bytes());
@@ -4392,5 +4432,31 @@ mod tests {
         let v_hidden = validate_aot_wasm(&hidden, &abi).expect("validate hidden");
         assert_eq!(v_hidden.imaged, crate::imaged_globals(&hidden));
         assert!(v_hidden.imaged.is_err());
+    }
+
+    #[cfg(feature = "compiler")]
+    #[test]
+    fn verify_artifact_sidecar_digest_accepts_plain_sha256_and_merkle256k_over_256kib() {
+        let small = b"small-so-artifact";
+        let small_sha = wasm_sha256_hex(small);
+        assert!(verify_artifact_sidecar_digest(small, &small_sha, &small_sha));
+        assert!(!verify_artifact_sidecar_digest(small, &small_sha, &"0".repeat(64)));
+        assert!(!verify_artifact_sidecar_digest(small, &small_sha, "short"));
+
+        // > 256 KiB payload (600 KiB = 3 chunks: 256 KiB + 256 KiB + 88 KiB) matching wtime-aot's merkle256k format.
+        let mut large: Vec<u8> = (0u32..(600 << 10))
+            .map(|i| u8::try_from((i.wrapping_mul(31) ^ (i >> 7)) & 0xff).expect("masked byte"))
+            .collect();
+        let large_sha = wasm_sha256_hex(&large);
+        let merkle_line = format!("merkle256k:{}", merkle256k_sha256_hex(&large));
+        assert!(verify_artifact_sidecar_digest(&large, &large_sha, &merkle_line));
+        assert!(verify_artifact_sidecar_digest(&large, &large_sha, &large_sha));
+        assert!(!verify_artifact_sidecar_digest(&large, &large_sha, &format!("merkle256k:{}", "0".repeat(64))));
+
+        // Flip a byte in the final partial chunk and confirm Merkle verification fails closed.
+        let last = large.len() - 1;
+        large[last] ^= 0x01;
+        let mutated_sha = wasm_sha256_hex(&large);
+        assert!(!verify_artifact_sidecar_digest(&large, &mutated_sha, &merkle_line));
     }
 }

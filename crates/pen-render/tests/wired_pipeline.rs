@@ -1089,6 +1089,55 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
         "combined RT2 + DDGI must render cleanly with vivid indirect illumination: {px_combined:?}"
     );
 
+    // 3b) Tier-3 Ultra RT (`quality.ray_tracing = 3`, `ddgi = false`): Thin G-Buffer prepass +
+    //     ReSTIR GI (spatiotemporal Jacobian Pairwise MIS + thin-wall visibility) + SVGF demodulated
+    //     denoising + full-res Thin G-Buffer `albedo * (1 - metallic)` re-modulation!
+    let mut restir_white = ddgi_off.clone();
+    restir_white.quality.ddgi = false;
+    restir_white.quality.ray_tracing = 3;
+    restir_white.exposure.cut = true;
+    renderer.submit(&restir_white, &catalog, &mut target).unwrap();
+    restir_white.exposure.cut = false;
+    for _ in 0..4 {
+        renderer.submit(&restir_white, &catalog, &mut target).unwrap();
+    }
+    let px_restir_white = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_restir_white[0] > px_no_ddgi[0].saturating_add(40)
+            && px_restir_white[0] > px_restir_white[2].saturating_add(30),
+        "quality.ray_tracing=3 must drive Thin G-Buffer + ReSTIR GI red color bleed onto white receiver: off={px_no_ddgi:?}, restir_white={px_restir_white:?}"
+    );
+
+    // Same Tier-3 ReSTIR GI scene on dark charcoal albedo [0.04]: proves demodulated SVGF + Thin G-Buffer albedo modulation!
+    let mut restir_dark = restir_white.clone();
+    restir_dark.draws[0].material = 6;
+    restir_dark.exposure.cut = true;
+    wait_ready(&mut renderer, &restir_dark, &catalog, &mut target);
+    restir_dark.exposure.cut = false;
+    for _ in 0..3 {
+        renderer.submit(&restir_dark, &catalog, &mut target).unwrap();
+    }
+    let px_restir_dark = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_restir_dark[0] * 2 < px_restir_white[0],
+        "Tier-3 ReSTIR GI must modulate demodulated GI by Thin G-Buffer albedo (no washout on dark material): white={px_restir_white:?}, dark={px_restir_dark:?}"
+    );
+
+    // Reversed-Z compatibility for Tier-3 Thin G-Buffer + ReSTIR GI.
+    let mut restir_rev = restir_white.clone();
+    restir_rev.projection = perspective_reversed_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, None);
+    restir_rev.exposure.cut = true;
+    wait_ready(&mut renderer, &restir_rev, &catalog, &mut target);
+    restir_rev.exposure.cut = false;
+    for _ in 0..3 {
+        renderer.submit(&restir_rev, &catalog, &mut target).unwrap();
+    }
+    let px_restir_rev = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_restir_rev[0] > px_restir_rev[2].saturating_add(30),
+        "Tier-3 Thin G-Buffer + ReSTIR GI must work identically under Reversed-Z: {px_restir_rev:?}"
+    );
+
     // 4) Temporal Upscaling (`quality.upscale = true`): FSR Quality + translucent auto-reactive pass,
     //    seamless Dynamic Resolution Scaling (0.67 -> 0.50 preserving full-res history), and non-TAA
     //    spatial FSR 1 EASU fallback (`scale = 0.5`, `taa = false`, `upscale = false`)!
@@ -1099,7 +1148,8 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
     upscale_frame.quality.sky = false;
     upscale_frame.quality.scale = 0.6667;
     upscale_frame.quality.upscale = true;
-    for _ in 0..6 {
+    wait_ready(&mut renderer, &upscale_frame, &catalog, &mut target);
+    for _ in 0..5 {
         renderer.submit(&upscale_frame, &catalog, &mut target).unwrap();
     }
     let passes = renderer.passes();

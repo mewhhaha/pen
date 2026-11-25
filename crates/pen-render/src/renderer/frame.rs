@@ -563,6 +563,22 @@ impl State {
                 &self.timer,
             );
         }
+        if tlas_ready && frame.quality.ray_tracing > 0 {
+            self.thin_gbuffer.encode(
+                &device,
+                &self.queue,
+                &mut encoder,
+                targets.size,
+                depth_mode,
+                frame,
+                &active_proj_for_trails,
+                scratch,
+                &drawing,
+                &self.skinning,
+                ready,
+                &self.timer,
+            );
+        }
         if shadowed {
             self.cast_shadows(
                 &mut encoder,
@@ -758,6 +774,14 @@ impl State {
         if tlas_ready && frame.quality.ray_tracing > 0 {
             let ddgi_buf = self.wired.ddgi_active_this_frame.then_some(self.environment.probe_data_buffer());
             let vel_view = targets.velocity.as_ref().map(|(v, _)| v);
+            let thin_gbuf = match (
+                self.thin_gbuffer.normal_roughness_view(),
+                self.thin_gbuffer.albedo_metallic_view(),
+                self.thin_gbuffer.depth_view(),
+            ) {
+                (Some(nr), Some(am), Some(d)) => Some((nr, am, d)),
+                _ => None,
+            };
             Self::encode_rt_wired(
                 &mut self.wired,
                 &mut self.built_ins,
@@ -770,6 +794,7 @@ impl State {
                 &targets.scene,
                 &targets.depth_only,
                 vel_view,
+                thin_gbuf,
                 ddgi_buf,
                 targets.size,
                 samples,

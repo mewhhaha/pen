@@ -43,6 +43,7 @@ mod prefetch;
 pub mod ray_tracing;
 pub mod render_targets;
 mod renderer;
+pub mod restir;
 mod shader;
 pub mod shader_graph;
 #[cfg(feature = "simplify")]
@@ -113,6 +114,7 @@ pub use ray_tracing::{
     TlasInstance, TlasInstanceGpu, TlasRayTraceParams, TlasRayTracer, TlasScene, TlasSceneGpu,
     device_supports_hardware_ray_query, supports_hardware_ray_query,
 };
+pub use restir::{RESTIR_MAX_LIGHTS, RESTIR_WGSL, RestirInputs, RestirParams, RestirRenderer};
 pub use svgf::{SVGF_WGSL, SvgfDenoiser, SvgfInputs, SvgfParams};
 pub use render_targets::{
     ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,

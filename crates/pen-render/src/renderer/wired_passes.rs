@@ -37,6 +37,7 @@ use crate::ray_tracing::{
     GpuBlasPool, MAX_RT_LOCAL_LIGHTS, RtLocalLight, TlasInstance, TlasRayTraceParams, TlasRayTracer, TlasSceneGpu,
 };
 use crate::render_targets::{ColorTransfer, OffscreenRenderTarget, SplitScreenCompositor, ViewportRect};
+use crate::restir::{RestirInputs, RestirParams, RestirRenderer};
 use crate::shader::{self, Stage};
 use crate::svgf::{SvgfDenoiser, SvgfInputs, SvgfParams};
 use crate::RenderTarget;
@@ -113,6 +114,10 @@ struct RtCompUniform {
   refl_weight: f32,
   gi_weight: f32,
   shadow_floor: f32,
+  gi_demodulated: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
 };
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
 @group(0) @binding(1) var shadow_ao_tex: texture_2d<f32>;
@@ -169,12 +174,17 @@ struct RtCompUniform {
   refl_weight: f32,
   gi_weight: f32,
   shadow_floor: f32,
+  gi_demodulated: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
 };
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
 @group(0) @binding(1) var refl_tex: texture_2d<f32>;
 @group(0) @binding(2) var gi_tex: texture_2d<f32>;
 @group(0) @binding(3) var sao_tex: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> cfg: RtCompUniform;
+@group(0) @binding(5) var gbuf_albedo_metallic: texture_2d<f32>;
 
 @vertex fn vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
   let x = f32((idx << 1u) & 2u) * 2.0 - 1.0;
@@ -229,6 +239,12 @@ struct RtCompUniform {
     gi = g_sum * inv_w;
     occlude = o_sum * inv_w;
   }
+  if (cfg.gi_weight > 0.0 && cfg.gi_demodulated > 0.5) {
+    let g_dims = vec2i(textureDimensions(gbuf_albedo_metallic, 0));
+    let g_px = clamp(vec2i((vec2f(p) + vec2f(0.5)) * vec2f(g_dims) / vec2f(dims)), vec2i(0), g_dims - vec2i(1));
+    let g_am = textureLoad(gbuf_albedo_metallic, g_px, 0);
+    gi *= max(g_am.rgb, vec3f(0.0)) * (1.0 - clamp(g_am.w, 0.0, 1.0));
+  }
   let bounce = refl * cfg.refl_weight + gi * cfg.gi_weight;
   // Premultiplied-alpha blend (`One + OneMinusSrcAlpha`) attenuates occluded sky IBL where local RT
   // reflection rays hit geometry, preventing double-counting while leaving diffuse/sky misses untouched.
@@ -241,7 +257,7 @@ struct SvgfPrepUniform {
   inv_vp: mat4x4f,
   prev_vp: mat4x4f,
   cam_and_clear: vec4f, // xyz = camera world pos, w = depth_clear (1.0 ForwardZ, 0.0 ReversedZ)
-  dims: vec4u,          // x = out_width, y = out_height, z = has_prev_vp (0 or 1), w = has_velocity_tex (0 or 1)
+  dims: vec4u,          // x = out_width, y = out_height, z = has_prev_vp (0 or 1), w = flags (bit0: velocity, bit1: thin_gbuf)
 };
 
 @group(0) @binding(0) var<uniform> u: SvgfPrepUniform;
@@ -252,6 +268,7 @@ struct SvgfPrepUniform {
 @group(0) @binding(5) var velocity_tex: texture_2d<f32>;
 @group(0) @binding(6) var rt_sao_tex: texture_2d<f32>;
 @group(0) @binding(7) var rt_refl_tex: texture_2d<f32>;
+@group(0) @binding(8) var gbuf_normal_roughness: texture_2d<f32>;
 
 struct WorldPt {
   pos: vec3f,
@@ -339,12 +356,22 @@ fn prep(@builtin(global_invocation_id) id: vec3u) {
   let to_cam = u.cam_and_clear.xyz - c.pos;
   let dist = length(to_cam);
   let view_dir = select(vec3f(0.0, 1.0, 0.0), to_cam / dist, dist > 1e-6);
+  var mat_rough = clamp(textureLoad(rt_sao_tex, px, 0).a, 0.04, 1.0);
+  if ((u.dims.w & 2u) != 0u) {
+    let g_dims = vec2i(textureDimensions(gbuf_normal_roughness, 0));
+    let g_px = clamp(vec2i((vec2f(px) + vec2f(0.5)) * vec2f(g_dims) / vec2f(out_dims)), vec2i(0), g_dims - vec2i(1));
+    let g_nr = textureLoad(gbuf_normal_roughness, g_px, 0);
+    if (dot(g_nr.xyz, g_nr.xyz) >= 0.01) {
+      n = normalize(g_nr.xyz);
+      mat_rough = clamp(g_nr.w, 0.04, 1.0);
+    }
+  }
   if (dot(n, view_dir) < 0.0) {
     n = -n;
   }
   var mv = vec2f(0.0);
   var used_obj_vel = false;
-  if (u.dims.w != 0u) {
+  if ((u.dims.w & 1u) != 0u) {
     let v_dims = vec2i(textureDimensions(velocity_tex, 0));
     let v_px = clamp(vec2i((vec2f(px) + vec2f(0.5)) * vec2f(v_dims) / vec2f(out_dims)), vec2i(0), v_dims - vec2i(1));
     let obj_v = textureLoad(velocity_tex, v_px, 0).xy;
@@ -362,7 +389,6 @@ fn prep(@builtin(global_invocation_id) id: vec3u) {
       mv = curr_uv - prev_uv;
     }
   }
-  let mat_rough = clamp(textureLoad(rt_sao_tex, px, 0).a, 0.04, 1.0);
   let hit_dist = max(textureLoad(rt_refl_tex, px, 0).a, 0.0);
   // Specular virtual hit-point parallax reprojection: virtual reflected image sits at (cam_dist + hit_dist)
   // along the incoming view ray; blend toward surface motion as surface roughness increases.
@@ -392,6 +418,8 @@ struct RtCompUniform {
     refl_weight: f32,
     gi_weight: f32,
     shadow_floor: f32,
+    gi_demodulated: f32,
+    _pad: [f32; 3],
 }
 
 #[repr(C)]
@@ -498,6 +526,7 @@ impl SvgfRtState {
                 ro_tex(5),
                 ro_tex(6),
                 ro_tex(7),
+                ro_tex(8),
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -585,6 +614,7 @@ pub(super) struct WiredPasses {
     pub tlas_gpu: Option<TlasSceneGpu>,
     pub tlas_bounds: Option<([f32; 3], [f32; 3])>,
     pub ray_tracer: Option<TlasRayTracer>,
+    pub restir: Option<RestirRenderer>,
     svgf_rt: Option<SvgfRtState>,
     rt_composite: Option<RtCompositePipelines>,
     pub ddgi_near: Option<DdgiVolume>,
@@ -604,6 +634,7 @@ pub(super) struct WiredPasses {
     pub msaa_depth_resolve: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
     pub dummy_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
     pub dummy_vel: Option<(wgpu::Texture, wgpu::TextureView)>,
+    pub dummy_rgba16f: Option<(wgpu::Texture, wgpu::TextureView)>,
     blit_shared: Option<BlitShared>,
     blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     pub in_secondary_camera: bool,
@@ -657,6 +688,9 @@ impl WiredPasses {
     pub fn reset_svgf_history(&mut self) {
         if let Some(svgf) = &mut self.svgf_rt {
             svgf.reset_history();
+        }
+        if let Some(restir) = &mut self.restir {
+            restir.reset_history();
         }
     }
 
@@ -728,6 +762,24 @@ impl WiredPasses {
             self.dummy_vel = Some((tex, view));
         }
         self.dummy_vel.as_ref().unwrap().1.clone()
+    }
+
+    pub fn dummy_rgba16f_view(&mut self, device: &wgpu::Device) -> wgpu::TextureView {
+        if self.dummy_rgba16f.is_none() {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("wired_dummy_rgba16f"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            self.dummy_rgba16f = Some((tex, view));
+        }
+        self.dummy_rgba16f.as_ref().unwrap().1.clone()
     }
 
     /// Resolves a multisampled depth view into a cached 1x `R32Float` texture via `BuiltIn::OpaqueDepth`
@@ -956,7 +1008,7 @@ impl WiredPasses {
 
             let bounce_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rt_bounce_comp_bgl"),
-                entries: &[tex_entry(0), tex_entry(1), tex_entry(2), tex_entry(3), u_entry(4)],
+                entries: &[tex_entry(0), tex_entry(1), tex_entry(2), tex_entry(3), u_entry(4), tex_entry(5)],
             });
             let bounce_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("rt_bounce_comp_pl"),
@@ -1024,17 +1076,23 @@ impl WiredPasses {
         sao_view: &wgpu::TextureView,
         refl_view: Option<&wgpu::TextureView>,
         gi_view: Option<&wgpu::TextureView>,
+        gbuf_albedo_metallic: Option<&wgpu::TextureView>,
+        gi_demodulated: bool,
         tier: u32,
         depth_clear: f32,
         ddgi_active: bool,
         has_csm: bool,
     ) {
+        let dummy_gbuf = self.dummy_rgba16f_view(device);
+        let gbuf_am_bind = gbuf_albedo_metallic.unwrap_or(&dummy_gbuf);
         let comp = self.ensure_rt_composite(device);
         let cfg = RtCompUniform {
             depth_clear,
             refl_weight: 1.0,
             gi_weight: if ddgi_active { 0.0 } else { 0.85 },
             shadow_floor: if has_csm { 0.84 } else { 0.25 },
+            gi_demodulated: if gi_demodulated && gbuf_albedo_metallic.is_some() { 1.0 } else { 0.0 },
+            _pad: [0.0; 3],
         };
         queue.write_buffer(&comp.uniform, 0, bytemuck::bytes_of(&cfg));
         let sao_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1074,6 +1132,7 @@ impl WiredPasses {
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(gv) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sao_view) },
                     wgpu::BindGroupEntry { binding: 4, resource: comp.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(gbuf_am_bind) },
                 ],
             });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2329,10 +2388,12 @@ impl State {
         Ok(())
     }
 
-    /// Runs half-resolution `TlasRayTracer` (`quality.ray_tracing >= 1`) with primary TLAS material
-    /// lookup, local lights, live DDGI multi-bounce at hit points, half-res SVGF spatiotemporal
-    /// denoising (with per-object velocity vectors when available), and depth-aware bilateral upsample
-    /// onto the resolved 1x opaque HDR scene buffer. Skips redundant RT diffuse GI when DDGI is active.
+    /// Runs half-resolution `TlasRayTracer` (`quality.ray_tracing >= 1`) fed directly by the
+    /// rasterized Thin G-Buffer (zero primary TLAS material-lookup rays, exact skinned/instanced/sheared
+    /// normals & per-instance material overrides), optional Tier-3 `RestirRenderer` ReSTIR GI
+    /// (spatiotemporal Jacobian Pairwise MIS + thin-wall visibility validation + demodulated SVGF
+    /// denoising re-modulated at full resolution), live DDGI multi-bounce at secondary hits, and
+    /// depth-aware bilateral upsample onto the resolved 1x opaque HDR scene buffer.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn encode_rt_wired(
         wired: &mut WiredPasses,
@@ -2346,6 +2407,7 @@ impl State {
         scene_view: &wgpu::TextureView,
         depth_only: &wgpu::TextureView,
         velocity_view: Option<&wgpu::TextureView>,
+        thin_gbuffer: Option<(&wgpu::TextureView, &wgpu::TextureView, &wgpu::TextureView)>,
         ddgi_packed_buf: Option<&wgpu::Buffer>,
         scene_size: (u32, u32),
         samples: u32,
@@ -2375,6 +2437,7 @@ impl State {
         let local_lights = pack_rt_local_lights(frame);
 
         let tier = frame.quality.ray_tracing;
+        let use_restir_gi = tier >= 3 && !ddgi_active && thin_gbuffer.is_some();
         let params = TlasRayTraceParams {
             view_projection: active_vp,
             camera_pos,
@@ -2390,7 +2453,7 @@ impl State {
             shadow_samples: 1,
             ao_samples: 4,
             reflection_samples: if tier >= 2 { 2 } else { 0 },
-            gi_samples: if tier >= 2 && !ddgi_active { 1 } else { 0 },
+            gi_samples: if tier >= 2 && !ddgi_active && !use_restir_gi { 1 } else { 0 },
             gi_bounce_scale: 1.0,
             frame_seed: (frames_count % 4096) as f32 * 0.618_034,
             normal_bias: 0.015,
@@ -2398,7 +2461,7 @@ impl State {
         };
         let tlas = wired.tlas_gpu.as_ref().unwrap();
         let rt = wired.ray_tracer.get_or_insert_with(|| TlasRayTracer::new(device));
-        rt.trace_with_scene_gi(
+        rt.trace_with_scene_gbuffer(
             device,
             encoder,
             tlas,
@@ -2408,14 +2471,57 @@ impl State {
             &local_lights,
             ddgi_packed_buf,
             true,
+            thin_gbuffer.map(|(nr, am, _)| (nr, am)),
         )?;
         let raw_sao = rt.shadow_ao_view().cloned();
         let raw_refl = rt.reflection_view().cloned();
-        let raw_gi = rt.gi_view().cloned();
+        let mut raw_gi = rt.gi_view().cloned();
+        let mut gi_demodulated = false;
+
+        if use_restir_gi
+            && let Some((gbuf_nr, gbuf_am, gbuf_depth)) = thin_gbuffer
+        {
+            let restir_has_prev = wired.svgf_rt.as_ref().is_some_and(|s| s.prev_vp.is_some()) && !frame.exposure.cut;
+            let restir_prev_vp = wired.svgf_rt.as_ref().and_then(|s| s.prev_vp).unwrap_or(active_vp);
+            let restir_params = RestirParams {
+                view_projection: active_vp,
+                prev_view_projection: restir_prev_vp,
+                camera_pos,
+                depth_clear,
+                sun_direction,
+                sun_color,
+                sky_zenith,
+                sky_horizon,
+                max_ray_distance: 64.0,
+                normal_bias: 0.015,
+                visibility_mask: u32::MAX,
+                frame_index: u32::try_from(frames_count & 0xffff_ffff).unwrap_or(0),
+                enable_di: false,
+                enable_gi: true,
+                reset_history: !restir_has_prev,
+                gi_bounce_scale: 1.0,
+            };
+            let restir_lights = &local_lights[..local_lights.len().min(crate::restir::RESTIR_MAX_LIGHTS)];
+            let restir_inputs = RestirInputs {
+                depth: gbuf_depth,
+                normal_roughness: gbuf_nr,
+                albedo_metallic: gbuf_am,
+                motion: velocity_view,
+                ddgi_packed: ddgi_packed_buf,
+            };
+            let restir = wired.restir.get_or_insert_with(|| RestirRenderer::new(device));
+            restir.dispatch(device, encoder, tlas, restir_inputs, rt_size, &restir_params, restir_lights)?;
+            if let Some(gv) = restir.gi_view().cloned() {
+                raw_gi = Some(gv);
+                gi_demodulated = true;
+            }
+        }
 
         if let Some(sao_raw_view) = raw_sao {
             let dummy_vel = wired.dummy_velocity_view(device);
+            let dummy_gbuf = wired.dummy_rgba16f_view(device);
             let vel_bind = velocity_view.unwrap_or(&dummy_vel);
+            let gbuf_nr_bind = thin_gbuffer.map_or(&dummy_gbuf, |(nr, _, _)| nr);
             let svgf = wired.svgf_rt.get_or_insert_with(|| SvgfRtState::new(device));
             let resized = !matches!(&svgf.buffers, Some(b) if b.size == rt_size);
             if resized {
@@ -2430,11 +2536,12 @@ impl State {
                 svgf.reset_history();
             }
             let has_prev = svgf.prev_vp.is_some() && !frame.exposure.cut;
+            let prep_flags = u32::from(velocity_view.is_some()) | (u32::from(thin_gbuffer.is_some()) << 1);
             let prep_u = SvgfPrepUniform {
                 inv_vp,
                 prev_vp: svgf.prev_vp.unwrap_or(active_vp),
                 cam_and_clear: [camera_pos[0], camera_pos[1], camera_pos[2], depth_clear],
-                dims: [rt_size.0, rt_size.1, u32::from(has_prev), u32::from(velocity_view.is_some())],
+                dims: [rt_size.0, rt_size.1, u32::from(has_prev), prep_flags],
             };
             queue.write_buffer(&svgf.prep_u, 0, bytemuck::bytes_of(&prep_u));
             let bufs = svgf.buffers.as_ref().unwrap();
@@ -2451,6 +2558,7 @@ impl State {
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(vel_bind) },
                     wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&sao_raw_view) },
                     wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(refl_bind) },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(gbuf_nr_bind) },
                 ],
             });
             {
@@ -2532,6 +2640,8 @@ impl State {
                 &denoised_sao,
                 denoised_refl.as_ref(),
                 denoised_gi.as_ref(),
+                thin_gbuffer.map(|(_, am, _)| am),
+                gi_demodulated,
                 tier,
                 depth_clear,
                 ddgi_active,

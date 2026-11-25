@@ -33,6 +33,7 @@ mod ribbons;
 mod shadow_tests;
 mod shadows;
 mod skinning;
+mod thin_gbuffer;
 mod timing;
 mod validate;
 mod veil;
@@ -919,10 +920,11 @@ pub(crate) struct State {
     // Whether something this frame draws is still on its way.
     waiting: bool,
     scratch: Scratch,
-    // Posed draws' joint matrices, GPU morph targets, velocity pass, particles, and ribbon trails.
+    // Posed draws' joint matrices, GPU morph targets, velocity & thin G-buffer prepasses, particles, and ribbon trails.
     skinning: skinning::Skinning,
     morphing: morphing::Morphing,
     velocity: velocity::Velocity,
+    thin_gbuffer: thin_gbuffer::ThinGbuffer,
     particles: Option<particles::Particles>,
     ribbons: Option<ribbons::Ribbons>,
     // Interned material render states (`MaterialAsset::state`).
@@ -1295,6 +1297,7 @@ impl State {
             skinning: skinning::Skinning::new(&device),
             morphing: morphing::Morphing::new(&device),
             velocity: velocity::Velocity::new(&device),
+            thin_gbuffer: thin_gbuffer::ThinGbuffer::new(&device),
             particles: None,
             ribbons: None,
             states: HashMap::new(),

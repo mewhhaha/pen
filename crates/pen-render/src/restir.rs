@@ -44,7 +44,8 @@ pub struct RestirInputs<'a> {
     pub depth: &'a wgpu::TextureView,
     pub normal_roughness: &'a wgpu::TextureView,
     pub albedo_metallic: &'a wgpu::TextureView,
-    /// Current UV minus previous UV. Missing motion or abs(x) >= 100 uses matrix reprojection.
+    /// Rg16Float or Rgba16Float, with current UV minus previous UV in xy.
+    /// Missing motion or abs(x) >= 100 uses matrix reprojection.
     pub motion: Option<&'a wgpu::TextureView>,
     /// Packed cascades from DDGI, with STORAGE usage.
     pub ddgi_packed: Option<&'a wgpu::Buffer>,
@@ -247,7 +248,7 @@ impl Pipelines {
         if native_depth {
             body = body
                 .replace("var depth_tex: texture_2d<f32>;", "var depth_tex: texture_depth_2d;")
-                .replace("textureLoad(depth_tex, pixel, 0).x", "textureLoad(depth_tex, pixel, 0)");
+                .replace("textureLoad(depth_tex, g_px, 0).x", "textureLoad(depth_tex, g_px, 0)");
         }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("restir"),
@@ -333,7 +334,8 @@ impl RestirRenderer {
 
     /// Encode one frame. Submit frames in dispatch order. Reset history on camera cuts,
     /// light-slot reassignment, or discontinuous changes to GI lighting or scene geometry.
-    /// Inputs are single-sampled, full-size 2D views of mip level zero.
+    /// Inputs are single-sampled 2D views of mip level zero. The G-buffer shares
+    /// one extent, and it and the motion texture may be larger than the dispatch.
     #[allow(clippy::too_many_arguments, reason = "caller supplies frame inputs and command encoder")]
     pub fn dispatch(
         &mut self,
@@ -355,11 +357,20 @@ impl RestirRenderer {
         let depth_format = inputs.depth.texture().format();
         let native_depth = depth_format == wgpu::TextureFormat::Depth32Float;
         ensure!(native_depth || depth_format == wgpu::TextureFormat::R32Float, "unsupported ReSTIR depth format");
-        validate_input(inputs.depth, size, depth_format)?;
-        validate_input(inputs.normal_roughness, size, OUT_FORMAT)?;
-        validate_input(inputs.albedo_metallic, size, OUT_FORMAT)?;
+        let gbuffer_size = validate_input(inputs.depth, &[depth_format])?;
+        ensure!(
+            gbuffer_size.0 >= size.0
+                && gbuffer_size.1 >= size.1
+                && validate_input(inputs.normal_roughness, &[OUT_FORMAT])? == gbuffer_size
+                && validate_input(inputs.albedo_metallic, &[OUT_FORMAT])? == gbuffer_size,
+            "ReSTIR G-buffer textures must share an extent of at least {size:?}"
+        );
         if let Some(motion) = inputs.motion {
-            validate_input(motion, size, OUT_FORMAT)?;
+            let motion_size = validate_input(motion, &[wgpu::TextureFormat::Rg16Float, OUT_FORMAT])?;
+            ensure!(
+                motion_size.0 >= size.0 && motion_size.1 >= size.1,
+                "ReSTIR motion extent must be at least {size:?}"
+            );
         }
         if let Some(ddgi) = inputs.ddgi_packed {
             ensure!(
@@ -520,17 +531,16 @@ impl RestirRenderer {
     }
 }
 
-fn validate_input(view: &wgpu::TextureView, size: (u32, u32), format: wgpu::TextureFormat) -> Result<()> {
+fn validate_input(view: &wgpu::TextureView, formats: &[wgpu::TextureFormat]) -> Result<(u32, u32)> {
     let texture = view.texture();
     ensure!(
-        texture.format() == format
+        formats.contains(&texture.format())
             && texture.dimension() == wgpu::TextureDimension::D2
             && texture.sample_count() == 1
-            && (texture.width(), texture.height()) == size
             && texture.usage().contains(wgpu::TextureUsages::TEXTURE_BINDING),
-        "ReSTIR input must be a single-sampled {format:?} texture of size {size:?} with TEXTURE_BINDING usage"
+        "ReSTIR input must be a single-sampled 2D texture with format in {formats:?} and TEXTURE_BINDING usage"
     );
-    Ok(())
+    Ok((texture.width(), texture.height()))
 }
 
 fn buffer_binding(buffer: &wgpu::Buffer) -> wgpu::BindingResource<'_> {
@@ -545,6 +555,7 @@ mod tests {
     use crate::testing;
 
     const SIZE: (u32, u32) = (64, 32);
+    const HALF_SIZE: (u32, u32) = (SIZE.0 / 2, SIZE.1 / 2);
     // x covers [-2, 2], z covers [-0.5, 0.5]. The floor at y = 0 has clip depth 0.5.
     const FLOOR_VP: [f32; 16] = [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.25, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0];
 
@@ -559,7 +570,7 @@ mod tests {
             sky_zenith: [0.0; 3],
             sky_horizon: [0.0; 3],
             max_ray_distance: 20.0,
-            normal_bias: 0.001,
+            normal_bias: 0.015,
             visibility_mask: u32::MAX,
             frame_index: 0,
             enable_di: false,
@@ -577,7 +588,7 @@ mod tests {
     }
 
     impl GBuffer {
-        fn new(device: &wgpu::Device, queue: &wgpu::Queue, native_depth: bool) -> Self {
+        fn new(device: &wgpu::Device, queue: &wgpu::Queue, native_depth: bool, half_res: bool) -> Self {
             let count = (SIZE.0 * SIZE.1) as usize;
             let desc = wgpu::TextureDescriptor {
                 label: Some("ReSTIR witness depth"),
@@ -617,16 +628,47 @@ mod tests {
                     )
                     .create_view(&Default::default())
             };
+            let full_pixels = (0..SIZE.1).flat_map(|y| (0..SIZE.0).map(move |x| (x, y)));
+            let sampled = |x, y| !half_res || (x % 2 == 1 && y % 2 == 1);
             let picture = |pixel| {
-                testing::picture(device, queue, SIZE.0, SIZE.1, &vec![pixel; count]).create_view(&Default::default())
+                let data: Vec<_> =
+                    full_pixels.clone().map(|(x, y)| if sampled(x, y) { pixel } else { [0.0; 4] }).collect();
+                testing::picture(device, queue, SIZE.0, SIZE.1, &data).create_view(&Default::default())
             };
-            let motion: Vec<_> =
-                (0..count).map(|i| if i % 2 == 0 { [0.0; 4] } else { [100.0, 0.0, 0.0, 0.0] }).collect();
+            let motion: Vec<_> = full_pixels
+                .clone()
+                .map(|(x, y)| {
+                    if !sampled(x, y) {
+                        [2.0, 0.0]
+                    } else if (x / 2 + y / 2) % 2 == 0 {
+                        [0.0, 0.0]
+                    } else {
+                        [100.0, 0.0]
+                    }
+                })
+                .collect();
+            let motion = if half_res {
+                let bits: Vec<_> = motion.iter().flatten().copied().map(testing::half).collect();
+                device.create_texture_with_data(
+                    queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some("ReSTIR witness velocity"),
+                        format: wgpu::TextureFormat::Rg16Float,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        ..desc
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    bytemuck::cast_slice(&bits),
+                )
+            } else {
+                let rgba: Vec<_> = motion.iter().map(|&[x, y]| [x, y, 0.0, 0.0]).collect();
+                testing::picture(device, queue, SIZE.0, SIZE.1, &rgba)
+            };
             Self {
                 depth,
                 normal: picture([0.0, 1.0, 0.0, 0.8]),
                 albedo: picture([0.8, 0.8, 0.8, 0.0]),
-                motion: testing::picture(device, queue, SIZE.0, SIZE.1, &motion).create_view(&Default::default()),
+                motion: motion.create_view(&Default::default()),
             }
         }
 
@@ -641,21 +683,25 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments, reason = "witness varies both inputs and output extent")]
     fn render(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         renderer: &mut RestirRenderer,
         scene: &TlasSceneGpu,
         gbuffer: &GBuffer,
+        size: (u32, u32),
         params: &RestirParams,
         lights: &[RtLocalLight],
     ) -> Vec<[f32; 4]> {
         let mut encoder = device.create_command_encoder(&Default::default());
-        renderer.dispatch(device, &mut encoder, scene, gbuffer.inputs(params.enable_gi), SIZE, params, lights).unwrap();
+        renderer.dispatch(device, &mut encoder, scene, gbuffer.inputs(params.enable_gi), size, params, lights).unwrap();
         let output = if params.enable_di { renderer.di_texture() } else { renderer.gi_texture() }.unwrap();
-        let row_bytes = SIZE.0 * 8;
-        assert_eq!(row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT, 0);
-        let bytes = u64::from(row_bytes * SIZE.1);
+        assert_eq!((output.width(), output.height()), size);
+        let row_bytes = size.0 * 8;
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let aligned_row_bytes = row_bytes.div_ceil(alignment) * alignment;
+        let bytes = u64::from(aligned_row_bytes * size.1);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ReSTIR witness"),
             size: bytes,
@@ -666,13 +712,18 @@ mod tests {
             output.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row_bytes), rows_per_image: None },
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(aligned_row_bytes),
+                    rows_per_image: None,
+                },
             },
             output.size(),
         );
         queue.submit([encoder.finish()]);
         let raw = testing::read(device, queue, &readback, bytes);
-        raw.chunks_exact(8)
+        raw.chunks_exact(aligned_row_bytes as usize)
+            .flat_map(|row| row[..row_bytes as usize].as_chunks::<8>().0)
             .map(|pixel| {
                 std::array::from_fn(|i| {
                     let bits = u16::from_le_bytes([pixel[2 * i], pixel[2 * i + 1]]);
@@ -691,8 +742,10 @@ mod tests {
         quad([0.0, 0.0, -2.0], [0.0, top, -2.0], [0.0, top, 2.0], [0.0, 0.0, 2.0])
     }
 
-    fn region(columns: std::ops::Range<usize>) -> impl Iterator<Item = usize> {
-        (4..28).flat_map(move |y| columns.clone().map(move |x| y * SIZE.0 as usize + x))
+    fn region(size: (u32, u32), columns: std::ops::Range<usize>) -> impl Iterator<Item = usize> {
+        let (width, height) = (size.0 as usize, size.1 as usize);
+        let y_margin = height / 8;
+        (y_margin..height - y_margin).flat_map(move |y| columns.clone().map(move |x| y * width + x))
     }
 
     #[allow(clippy::cast_precision_loss, reason = "witness averages contain at most 2048 finite pixels")]
@@ -708,7 +761,7 @@ mod tests {
         let scene = TlasScene::build(&[wall], &[TlasInstance::new(0, IDENTITY)]).unwrap();
         // Static uploads intentionally exercise software fallback even on a hardware-capable device.
         let scene = TlasSceneGpu::upload(&device, &scene).unwrap();
-        let gbuffer = GBuffer::new(&device, &queue, false);
+        let gbuffer = GBuffer::new(&device, &queue, false, false);
         let mut renderer = RestirRenderer::new(&device);
         let mut params = params();
         params.enable_di = true;
@@ -726,7 +779,7 @@ mod tests {
         let mut last = Vec::new();
         for frame in 0..=8 {
             params.frame_index = frame;
-            let pixels = render(&device, &queue, &mut renderer, &scene, &gbuffer, &params, &lights);
+            let pixels = render(&device, &queue, &mut renderer, &scene, &gbuffer, SIZE, &params, &lights);
             if frame == 0 {
                 first = pixels;
             } else if frame == 8 {
@@ -734,16 +787,34 @@ mod tests {
             }
         }
         renderer.reset_history();
-        let reference = render(&device, &queue, &mut renderer, &scene, &gbuffer, &params, &[point(26.0 + 31.0 * 0.4)]);
-        let mse = |pixels: &[[f32; 4]]| mean(region(4..25).map(|i| (pixels[i][0] / reference[i][0] - 1.0).powi(2)));
+        let reference =
+            render(&device, &queue, &mut renderer, &scene, &gbuffer, SIZE, &params, &[point(26.0 + 31.0 * 0.4)]);
+        let mse =
+            |pixels: &[[f32; 4]]| mean(region(SIZE, 4..25).map(|i| (pixels[i][0] / reference[i][0] - 1.0).powi(2)));
         let (first_error, last_error) = (mse(&first), mse(&last));
-        let lit = mean(region(4..25).map(|i| last[i][0]));
-        let expected = mean(region(4..25).map(|i| reference[i][0]));
-        let shadow = mean(region(32..48).map(|i| last[i][0]));
+        let lit = mean(region(SIZE, 4..25).map(|i| last[i][0]));
+        let expected = mean(region(SIZE, 4..25).map(|i| reference[i][0]));
+        let shadow = mean(region(SIZE, 32..48).map(|i| last[i][0]));
         eprintln!("ReSTIR DI: lit={lit}, expected={expected}, shadow={shadow}, MSE ratio={}", first_error / last_error);
         assert!(lit > 0.75 && (lit / expected - 1.0).abs() < 0.2, "lit={lit}, exact={expected}");
         assert!(shadow < lit * 0.01, "occluded region={shadow}, lit={lit}");
         assert!(last_error * 3.0 < first_error, "normalized DI MSE: frame 0={first_error}, frame 8={last_error}");
+
+        // A single light with no blockers gives the same BRDF value at the
+        // selected full-resolution texel and its corresponding half-size pixel.
+        params.visibility_mask = 0;
+        renderer.reset_history();
+        let single_light = [point(26.0 + 31.0 * 0.4)];
+        let full = render(&device, &queue, &mut renderer, &scene, &gbuffer, SIZE, &params, &single_light);
+        let patterned = GBuffer::new(&device, &queue, false, true);
+        let half = render(&device, &queue, &mut renderer, &scene, &patterned, HALF_SIZE, &params, &single_light);
+        for (i, pixel) in half.iter().enumerate() {
+            let x = i % HALF_SIZE.0 as usize;
+            let y = i / HALF_SIZE.0 as usize;
+            let texel = full[(2 * y + 1) * SIZE.0 as usize + 2 * x + 1];
+            assert_eq!(pixel[3], 1.0, "invalid geometry at half-size pixel ({x}, {y})");
+            assert!((pixel[0] - texel[0]).abs() <= 0.002, "DI mismatch at ({x}, {y}): {pixel:?} vs {texel:?}");
+        }
     }
 
     #[test]
@@ -772,32 +843,39 @@ mod tests {
         pool.update_tlas(&device, &mut encoder, &instances).unwrap();
         queue.submit([encoder.finish()]);
         let scene = pool.snapshot_scene();
-        let gbuffer = GBuffer::new(&device, &queue, true);
         let mut renderer = RestirRenderer::new(&device);
         let mut params = params();
         params.enable_gi = true;
         params.depth_clear = 1.0;
-        let frames: Vec<_> = (0..=8)
-            .map(|frame| {
-                params.frame_index = frame;
-                render(&device, &queue, &mut renderer, &scene, &gbuffer, &params, &[])
-            })
-            .collect();
-        let last = &frames[8];
-        let lit_red = mean(region(5..22).map(|i| last[i][0]));
-        let lit_green = mean(region(5..22).map(|i| last[i][1]));
-        // The tested dark strip is directly across the wall, within the reuse disk.
-        let dark_red = mean(region(32..36).map(|i| last[i][0]));
-        assert!(lit_red > 0.45 && lit_red > 10.0 * lit_green, "lit red={lit_red}, green={lit_green}");
-        assert!(dark_red < lit_red * 0.15, "red behind thin wall={dark_red}, lit red={lit_red}");
+        for (size, half_res) in [(SIZE, false), (HALF_SIZE, true)] {
+            let gbuffer = GBuffer::new(&device, &queue, true, half_res);
+            let frames: Vec<_> = (0..=8)
+                .map(|frame| {
+                    params.frame_index = frame;
+                    render(&device, &queue, &mut renderer, &scene, &gbuffer, size, &params, &[])
+                })
+                .collect();
+            let last = &frames[8];
+            assert!(last.iter().all(|pixel| pixel[3] == 1.0), "dispatch must load valid G-buffer texels");
+            let divisor = if half_res { 2 } else { 1 };
+            let lit_columns = 5 / divisor..22 / divisor;
+            let lit_red = mean(region(size, lit_columns.clone()).map(|i| last[i][0]));
+            let lit_green = mean(region(size, lit_columns.clone()).map(|i| last[i][1]));
+            // The tested dark strip is directly across the wall, within the reuse disk.
+            let dark_red = mean(region(size, 32 / divisor..36 / divisor).map(|i| last[i][0]));
+            assert!(lit_red > 0.45 && lit_red > 10.0 * lit_green, "lit red={lit_red}, green={lit_green}");
+            assert!(dark_red < lit_red * 0.15, "red behind thin wall={dark_red}, lit red={lit_red}");
 
-        let frame_delta = |a: usize, b: usize| mean(region(5..22).map(|i| (frames[a][i][0] - frames[b][i][0]).powi(2)));
-        let (early, late) = (frame_delta(0, 1), frame_delta(7, 8));
-        eprintln!(
-            "ReSTIR GI (hardware TLAS={}): lit red={lit_red}, lit green={lit_green}, dark red={dark_red}, temporal delta ratio={}",
-            scene.has_hw_tlas(),
-            early / late
-        );
-        assert!(late < early * 0.65, "GI temporal variance: first delta={early}, final delta={late}");
+            let frame_delta = |a: usize, b: usize| {
+                mean(region(size, lit_columns.clone()).map(|i| (frames[a][i][0] - frames[b][i][0]).powi(2)))
+            };
+            let (early, late) = (frame_delta(0, 1), frame_delta(7, 8));
+            eprintln!(
+                "ReSTIR GI {size:?} (hardware TLAS={}): lit red={lit_red}, lit green={lit_green}, dark red={dark_red}, temporal delta ratio={}",
+                scene.has_hw_tlas(),
+                early / late
+            );
+            assert!(late < early * 0.65, "GI temporal variance: first delta={early}, final delta={late}");
+        }
     }
 }

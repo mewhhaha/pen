@@ -1930,6 +1930,7 @@ pub struct TlasRayTracer {
     uniform: wgpu::Buffer,
     local_lights_buf: wgpu::Buffer,
     ddgi_dummy_buf: wgpu::Buffer,
+    gbuf_dummy_tex: (wgpu::Texture, wgpu::TextureView),
     scene: Option<TlasSceneGpu>,
     outputs: Option<RtOutputs>,
 }
@@ -1956,6 +1957,16 @@ impl TlasRayTracer {
             },
             count: None,
         };
+        let tex_ro = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let u_entry = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -1963,16 +1974,6 @@ impl TlasRayTracer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
                 min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<TlasRayTraceUniform>() as u64),
-            },
-            count: None,
-        };
-        let depth_entry = wgpu::BindGroupLayoutEntry {
-            binding: 5,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
             },
             count: None,
         };
@@ -1984,12 +1985,14 @@ impl TlasRayTracer {
                 storage_ro(2),
                 storage_ro(3),
                 storage_ro(4),
-                depth_entry,
+                tex_ro(5),
                 out_wo(6),
                 out_wo(7),
                 out_wo(8),
                 storage_ro(9),
                 storage_ro(10),
+                tex_ro(11),
+                tex_ro(12),
             ],
         });
         let sw_body = TLAS_RAYTRACE_WGSL.replace(
@@ -2030,12 +2033,14 @@ impl TlasRayTracer {
                     storage_ro(2),
                     storage_ro(3),
                     storage_ro(4),
-                    depth_entry,
+                    tex_ro(5),
                     out_wo(6),
                     out_wo(7),
                     out_wo(8),
                     storage_ro(9),
                     storage_ro(10),
+                    tex_ro(11),
+                    tex_ro(12),
                 ],
             });
             let hw_body = TLAS_RAYTRACE_WGSL.replace(
@@ -2083,6 +2088,20 @@ impl TlasRayTracer {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let gbuf_dummy_tex = {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("tlas_rt_gbuf_dummy"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            (tex, view)
+        };
         Self {
             pipeline,
             bgl,
@@ -2093,6 +2112,7 @@ impl TlasRayTracer {
             uniform,
             local_lights_buf,
             ddgi_dummy_buf,
+            gbuf_dummy_tex,
             scene: None,
             outputs: None,
         }
@@ -2182,6 +2202,37 @@ impl TlasRayTracer {
         ddgi_packed_buf: Option<&wgpu::Buffer>,
         use_material_gbuf: bool,
     ) -> Result<()> {
+        self.trace_with_scene_gbuffer(
+            device,
+            encoder,
+            scene,
+            depth_view,
+            out_size,
+            params,
+            local_lights,
+            ddgi_packed_buf,
+            use_material_gbuf,
+            None,
+        )
+    }
+
+    /// Like [`Self::trace_with_scene_gi`], additionally accepting optional Thin G-Buffer views
+    /// `(normal_roughness, albedo_metallic)` to supply exact smooth vertex normals and per-pixel
+    /// material parameters with zero primary TLAS material-lookup rays.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trace_with_scene_gbuffer(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &TlasSceneGpu,
+        depth_view: &wgpu::TextureView,
+        out_size: (u32, u32),
+        params: &TlasRayTraceParams,
+        local_lights: &[RtLocalLight],
+        ddgi_packed_buf: Option<&wgpu::Buffer>,
+        use_material_gbuf: bool,
+        thin_gbuffer: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
+    ) -> Result<()> {
         let max_dim = device.limits().max_texture_dimension_2d;
         ensure!(
             out_size.0 >= 1 && out_size.1 >= 1 && out_size.0 <= max_dim && out_size.1 <= max_dim,
@@ -2194,6 +2245,17 @@ impl TlasRayTracer {
             d_sz.width,
             d_sz.height
         );
+        if let Some((nr, am)) = thin_gbuffer {
+            let nr_sz = nr.texture().size();
+            let am_sz = am.texture().size();
+            ensure!(
+                nr_sz.width >= out_size.0
+                    && nr_sz.height >= out_size.1
+                    && am_sz.width == nr_sz.width
+                    && am_sz.height == nr_sz.height,
+                "TlasRayTracer thin G-buffer dimensions mismatch output {out_size:?}"
+            );
+        }
         ensure!(params.view_projection.iter().all(|v| v.is_finite()), "non-finite view_projection");
 
         if !matches!(&self.outputs, Some(o) if o.size == out_size) {
@@ -2203,7 +2265,9 @@ impl TlasRayTracer {
         if light_count > 0 {
             encode_copy(device, encoder, &self.local_lights_buf, bytemuck::cast_slice(&local_lights[..light_count]));
         }
-        let flags = u32::from(use_material_gbuf) | (u32::from(ddgi_packed_buf.is_some()) << 1);
+        let flags = u32::from(use_material_gbuf)
+            | (u32::from(ddgi_packed_buf.is_some()) << 1)
+            | (u32::from(thin_gbuffer.is_some()) << 2);
         let u = TlasRayTraceUniform {
             inverse_view_projection: crate::matrix::invert(&params.view_projection),
             camera_pos_and_clear: [params.camera_pos[0], params.camera_pos[1], params.camera_pos[2], params.depth_clear],
@@ -2249,6 +2313,7 @@ impl TlasRayTracer {
         encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u));
         let out = self.outputs.as_ref().unwrap();
         let ddgi_buf = ddgi_packed_buf.unwrap_or(&self.ddgi_dummy_buf);
+        let (gbuf_nr, gbuf_am) = thin_gbuffer.unwrap_or((&self.gbuf_dummy_tex.1, &self.gbuf_dummy_tex.1));
 
         #[allow(unused_mut)]
         let mut dispatched_hw = false;
@@ -2269,6 +2334,8 @@ impl TlasRayTracer {
                     wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&out.gi.1) },
                     wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 10, resource: ddgi_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(gbuf_nr) },
+                    wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(gbuf_am) },
                 ],
             });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2296,6 +2363,8 @@ impl TlasRayTracer {
                     wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&out.gi.1) },
                     wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 10, resource: ddgi_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(gbuf_nr) },
+                    wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(gbuf_am) },
                 ],
             });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

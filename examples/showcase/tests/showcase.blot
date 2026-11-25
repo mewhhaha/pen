@@ -55,7 +55,7 @@ entry const test_play_in_editor_snapshot_and_restore = func () =>
 
 entry const test_feature_toggles_and_frame_emission = func () =>
   let w0 = create ()
-  // Press '5' to enable TAAU temporal upscaling (0.65x scale), '2' to cycle RT 2 -> 0.
+  // Press '5' to enable TAAU temporal upscaling (0.65x scale), '2' to cycle RT 2 -> 3 (Tier 3 ReSTIR GI).
   let evs = #[$events.KeyDown 53, $events.KeyDown 50]
   let w1 = step w0 0.016 1280.0 720.0 (&evs[0..2])
   let frame = render.begin_frame (render.empty_frame ())
@@ -63,7 +63,7 @@ entry const test_feature_toggles_and_frame_emission = func () =>
   let (frame, audio) = populate_frame w1 frame audio
   let s = frame.settings[0]
   return check.report #[
-    check.equal #[1.0, 0.0, 1.0, 1.0] #[
+    check.equal #[1.0, 3.0, 1.0, 1.0] #[
       if s.features.upscale then 1.0 else 0.0,
       U32.to_f32 s.features.ray_tracing,
       if s.features.ddgi then 1.0 else 0.0,

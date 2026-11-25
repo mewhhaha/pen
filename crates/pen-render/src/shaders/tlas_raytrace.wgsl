@@ -20,7 +20,7 @@ struct TlasRayTraceUniform {
   samples_seed: vec4f,         // x = shadow_samples, y = ao_samples, z = gi_samples, w = frame_seed
   bias_and_refl: vec4f,        // x = normal_bias, y = refl_samples, z = gi_bounce_scale, w = 0
   counts: vec4u,               // x = tlas_nodes, y = tlas_instances, z = blas_tris, w = visibility_mask
-  extra_counts: vec4u,         // x = local_light_count, y = out_w, z = out_h, w = flags (bit0: mat_gbuf, bit1: ddgi_bounce)
+  extra_counts: vec4u,         // x = local_light_count, y = out_w, z = out_h, w = flags (bit0: mat_gbuf, bit1: ddgi_bounce, bit2: thin_gbuf)
 };
 
 struct RtLocalLight {
@@ -40,6 +40,8 @@ struct RtLocalLight {
 @group(0) @binding(8) var out_gi: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(9) var<storage, read> local_lights: array<RtLocalLight>;
 @group(0) @binding(10) var<storage, read> ddgi_packed: array<vec4f>;
+@group(0) @binding(11) var gbuf_normal_roughness: texture_2d<f32>;
+@group(0) @binding(12) var gbuf_albedo_metallic: texture_2d<f32>;
 
 const PI: f32 = 3.14159265359;
 
@@ -423,15 +425,36 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
     n = -n;
   }
 
-  // Optional slim primary TLAS material lookup: recovers exact smooth vertex normal,
-  // per-object albedo, roughness, and metallic without modifying any user mesh shader!
+  // Prefer rasterized Thin G-Buffer (zero primary rays, exact skinned/instanced/sheared vertex normals
+  // and per-instance material overrides); fall back to slim primary TLAS lookup when absent or uncovered.
   let use_mat_gbuf = (u.extra_counts.w & 1u) != 0u;
+  let use_thin_gbuf = (u.extra_counts.w & 4u) != 0u;
   var mat_albedo = vec3f(1.0);
   var mat_roughness = clamp(u.sun_color_and_rough.a, 0.04, 1.0);
   var mat_metallic = 0.0;
   var has_mat_hit = false;
   let mask = u.counts.w;
-  if (use_mat_gbuf && cam_dist > 1e-3) {
+  if (use_thin_gbuf) {
+    let g_dims = vec2i(textureDimensions(gbuf_normal_roughness, 0));
+    let g_px = select(
+      clamp(vec2i((vec2f(px) + vec2f(0.5)) * vec2f(g_dims) / vec2f(out_dims)), vec2i(0), g_dims - vec2i(1)),
+      px,
+      out_dims.x == g_dims.x && out_dims.y == g_dims.y,
+    );
+    let g_nr = textureLoad(gbuf_normal_roughness, g_px, 0);
+    if (dot(g_nr.xyz, g_nr.xyz) >= 0.01) {
+      let g_am = textureLoad(gbuf_albedo_metallic, g_px, 0);
+      has_mat_hit = true;
+      n = normalize(g_nr.xyz);
+      if (dot(n, view_dir) < 0.0) {
+        n = -n;
+      }
+      mat_albedo = max(g_am.rgb, vec3f(0.0));
+      mat_roughness = clamp(g_nr.w, 0.04, 1.0);
+      mat_metallic = clamp(g_am.w, 0.0, 1.0);
+    }
+  }
+  if (!has_mat_hit && use_mat_gbuf && cam_dist > 1e-3) {
     let prim_dir = -view_dir;
     let t_lo = max(cam_dist * 0.92, 1e-3);
     let t_hi = cam_dist * 1.08 + 0.05;

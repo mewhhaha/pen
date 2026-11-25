@@ -282,7 +282,7 @@ func apply_event (world: own World) -> (event: events.Event) : World =>
       if code == key_1:
         world.physical_sky := not world.physical_sky
       if code == key_2:
-        world.ray_tracing := (world.ray_tracing + 1) % 3
+        world.ray_tracing := (world.ray_tracing + 1) % 4
       if code == key_3:
         world.ddgi := not world.ddgi
       if code == key_4:
@@ -902,7 +902,7 @@ func restore (lanes_in: &[F32]) : World =>
   base.time := lanes_in[6]
   base.play_time := lanes_in[7]
   base.physical_sky := lanes_in[8] >= 0.5
-  base.ray_tracing := F32.to_u32 (max 0.0 lanes_in[9]) % 3
+  base.ray_tracing := F32.to_u32 (max 0.0 lanes_in[9]) % 4
   base.ddgi := lanes_in[10] >= 0.5
   base.oit := lanes_in[11] >= 0.5
   base.upscale := lanes_in[12] >= 0.5

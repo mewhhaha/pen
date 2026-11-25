@@ -106,6 +106,17 @@ fn in_bounds(pixel: vec2i) -> bool {
   return all(pixel >= vec2i(0)) && all(pixel < vec2i(extent()));
 }
 
+fn input_pixel(pixel: vec2i, dims: vec2i) -> vec2i {
+  let dispatch_dims = vec2i(extent());
+  let scaled = vec2i((vec2f(pixel) + 0.5) * vec2f(dims) / vec2f(dispatch_dims));
+  return select(clamp(scaled, vec2i(0), dims - 1), pixel, all(dims == dispatch_dims));
+}
+
+fn load_material(pixel: vec2i) -> vec4f {
+  let dims = vec2i(textureDimensions(normal_roughness, 0));
+  return textureLoad(albedo_metallic, input_pixel(pixel, dims), 0);
+}
+
 struct Geometry {
   pos: vec3f,
   nrm: vec3f,
@@ -113,23 +124,26 @@ struct Geometry {
   roughness: f32,
   camera: vec3f,
   valid: bool,
+  uv: vec2f,
 };
 
 fn load_geometry(pixel: vec2i) -> Geometry {
-  let depth = textureLoad(depth_tex, pixel, 0).x;
-  let nr = textureLoad(normal_roughness, pixel, 0);
+  let dims = vec2i(textureDimensions(normal_roughness, 0));
+  let g_px = input_pixel(pixel, dims);
+  let depth = textureLoad(depth_tex, g_px, 0).x;
+  let nr = textureLoad(normal_roughness, g_px, 0);
   if (!(dot(nr.xyz, nr.xyz) >= 0.01) || !(abs(depth - u.camera_and_clear.w) > 1e-6)) {
-    return Geometry(vec3f(0.0), vec3f(0.0), 0.0, 1.0, vec3f(0.0), false);
+    return Geometry(vec3f(0.0), vec3f(0.0), 0.0, 1.0, vec3f(0.0), false, vec2f(0.0));
   }
-  let uv = (vec2f(pixel) + 0.5) / vec2f(extent());
+  let uv = (vec2f(g_px) + 0.5) / vec2f(dims);
   let clip = vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), depth, 1.0);
   let world = u.inverse_view_projection * clip;
   if (!(abs(world.w) > 1e-8)) {
-    return Geometry(vec3f(0.0), vec3f(0.0), 0.0, 1.0, vec3f(0.0), false);
+    return Geometry(vec3f(0.0), vec3f(0.0), 0.0, 1.0, vec3f(0.0), false, vec2f(0.0));
   }
   let pos = world.xyz / world.w;
   return Geometry(pos, normalize(nr.xyz), length(pos - u.camera_and_clear.xyz),
-                  clamp(nr.w, 0.045, 1.0), u.camera_and_clear.xyz, true);
+                  clamp(nr.w, 0.045, 1.0), u.camera_and_clear.xyz, true, uv);
 }
 
 fn similar(geometry: Geometry, distance: f32, normal: vec3f) -> bool {
@@ -144,10 +158,11 @@ fn oct_decode(encoded: vec2f) -> vec3f {
 }
 
 fn history_pixel(pixel: vec2i, geometry: Geometry) -> vec2i {
-  var uv = (vec2f(pixel) + 0.5) / vec2f(extent());
+  var uv = geometry.uv;
   var mv = vec2f(100.0, 0.0);
   if (u.flags.z != 0u) {
-    mv = textureLoad(motion_tex, pixel, 0).xy;
+    let dims = vec2i(textureDimensions(motion_tex, 0));
+    mv = textureLoad(motion_tex, input_pixel(pixel, dims), 0).xy;
   }
   if (abs(mv.x) < 100.0) {
     uv -= mv;
@@ -176,13 +191,18 @@ fn trace(origin: vec3f, dir: vec3f, distance: f32, any_hit: bool) -> TlasHit {
                     u.scene_counts_and_mask.x, u.scene_counts_and_mask.y, u.scene_counts_and_mask.z);
 }
 
+fn ray_bias() -> f32 {
+  return max(u.sun_color_and_bias.w, RAY_MIN);
+}
+
 fn visible(pos: vec3f, nrm: vec3f, endpoint: vec3f) -> bool {
-  // Retarget from the offset origin and stop immediately before the sample itself.
-  let origin = pos + nrm * min(u.sun_color_and_bias.w, 0.001);
+  let bias = ray_bias();
+  let origin = pos + nrm * bias;
   let delta = endpoint - origin;
   let distance = length(delta);
   if (distance <= 2.0 * RAY_MIN) { return true; }
-  return !trace(origin, delta / distance, distance - RAY_MIN, true).hit;
+  let limit = max(distance - max(bias * 0.5, 2.0 * RAY_MIN), RAY_MIN);
+  return !trace(origin, delta / distance, limit, true).hit;
 }
 
 struct LightEval {
@@ -274,7 +294,7 @@ fn restir_di_initial(@builtin(global_invocation_id) id: vec3u) {
   var r = EMPTY_DI;
   let count = u.size_lights_frame.z;
   if ((u.flags.w & 1u) != 0u && g.valid && count > 0u) {
-    let mat = textureLoad(albedo_metallic, pixel, 0);
+    let mat = load_material(pixel);
     let candidates = min(8u, count);
     var rng = rng_for(index, 1u);
     let offset = u32(random(&rng) * f32(count));
@@ -303,13 +323,13 @@ fn restir_di_temporal(@builtin(global_invocation_id) id: vec3u) {
   if (g.valid && u.flags.x != 0u && current.m > 0.0) {
     let prev = history_pixel(pixel, g);
     if (in_bounds(prev)) {
-      let mat = textureLoad(albedo_metallic, pixel, 0);
+      let mat = load_material(pixel);
       let old = di_prev[pixel_index(prev)];
       let m_old = min(old.m, 20.0);
       if (m_old > 0.0) {
         let previous_geometry = textureLoad(prev_depth_nrm, prev, 0);
         let qg = Geometry(old.surface_pos_roughness.xyz, oct_decode(previous_geometry.yz),
-                          previous_geometry.x, old.surface_pos_roughness.w, u.previous_camera.xyz, true);
+                          previous_geometry.x, old.surface_pos_roughness.w, u.previous_camera.xyz, true, vec2f(0.0));
         let current_p = luma(eval_local_light_brdf(g, mat, current.light_idx));
         let old_at_current = luma(eval_local_light_brdf(g, mat, old.light_idx));
         // The validated reprojection is assumed to retain its albedo and metallic.
@@ -339,7 +359,7 @@ fn restir_di_spatial(@builtin(global_invocation_id) id: vec3u) {
   var result = EMPTY_DI;
   var rgb = vec3f(0.0);
   if (g.valid && center.m > 0.0) {
-    let mat = textureLoad(albedo_metallic, pixel, 0);
+    let mat = load_material(pixel);
     let center_p = luma(eval_local_light_brdf(g, mat, center.light_idx));
     let m_center = center.m / 4.0;
     var center_mass = 0.0;
@@ -352,7 +372,7 @@ fn restir_di_spatial(@builtin(global_invocation_id) id: vec3u) {
         let qg = load_geometry(q);
         let other = di_input[pixel_index(q)];
         if (qg.valid && similar(g, qg.distance, qg.nrm) && other.m > 0.0) {
-          let qmat = textureLoad(albedo_metallic, q, 0);
+          let qmat = load_material(q);
           let other_at_q = luma(eval_local_light_brdf(qg, qmat, other.light_idx));
           let other_at_center = luma(eval_local_light_brdf(g, mat, other.light_idx));
           let center_at_q = luma(eval_local_light_brdf(qg, qmat, center.light_idx));
@@ -548,7 +568,8 @@ fn sky(dir: vec3f) -> vec3f {
 }
 
 fn shade_bounce(pos: vec3f, nrm: vec3f, hit: TlasHit, rng: ptr<function, u32>) -> vec3f {
-  let diffuse = hit.albedo * ((1.0 - hit.metallic) / PI);
+  let diffuse_albedo = hit.albedo * (1.0 - hit.metallic);
+  let diffuse = diffuse_albedo / PI;
   let sun = u.sun_and_max_distance.xyz;
   let cosine = max(dot(nrm, sun), 0.0);
   let max_dist = u.sun_and_max_distance.w;
@@ -572,7 +593,7 @@ fn shade_bounce(pos: vec3f, nrm: vec3f, hit: TlasHit, rng: ptr<function, u32>) -
 
   if (u.sky_zenith_and_bounce.w > 0.0) {
     let ddgi = rt_sample_ddgi(pos, nrm);
-    radiance += diffuse * ddgi.rgb * (ddgi.a * u.sky_zenith_and_bounce.w);
+    radiance += diffuse_albedo * ddgi.rgb * (ddgi.a * u.sky_zenith_and_bounce.w);
   }
   return safe_rgb(radiance);
 }
@@ -628,7 +649,7 @@ fn restir_gi_initial(@builtin(global_invocation_id) id: vec3u) {
     var rng = rng_for(index, 4u);
     let dir = cosine_direction(g.nrm, &rng);
     let max_dist = u.sun_and_max_distance.w;
-    let origin = g.pos + g.nrm * u.sun_color_and_bias.w;
+    let origin = g.pos + g.nrm * ray_bias();
     let hit = trace(origin, dir, max_dist, false);
     var pos = g.pos + dir * max_dist;
     var nrm = -dir;
@@ -682,6 +703,22 @@ fn gi_jacobian(neighbor: Geometry, receiver: Geometry, sample: GiReservoir) -> f
   return clamp(cos_q / max(cos_r, 0.05) * dr2 / max(dq2, 0.01), 0.1, 10.0);
 }
 
+fn gi_sample_visible(g: Geometry, sample: GiReservoir) -> bool {
+  let bias = ray_bias();
+  let origin = g.pos + g.nrm * bias;
+  let max_dist = u.sun_and_max_distance.w;
+  if (sample.vis_pad.y >= max_dist) {
+    let dir = normalize(sample.sample_pos_m.xyz - g.pos);
+    return !trace(origin, dir, max_dist, true).hit;
+  }
+  // Offset the endpoint onto the radiating side of the hit surface.
+  let endpoint = sample.sample_pos_m.xyz + sample.sample_nrm_w.xyz * min(bias, 0.01);
+  let delta = endpoint - origin;
+  let distance = length(delta);
+  if (distance <= RAY_MIN) { return true; }
+  return !trace(origin, delta / distance, distance, true).hit;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn restir_gi_spatial(@builtin(global_invocation_id) id: vec3u) {
   if (any(id.xy >= extent())) { return; }
@@ -694,20 +731,32 @@ fn restir_gi_spatial(@builtin(global_invocation_id) id: vec3u) {
     var result = EMPTY_GI;
     var rng = rng_for(index, 6u);
     let rotation = random(&rng) * TAU;
-    gi_add(&result, center, center.sample_pos_m.w, center.radiance_wsum.w, &rng);
+    let p_c_at_c = gi_target(g, center);
+    let m_center = center.sample_pos_m.w / 4.0;
+    var center_mass = 0.0;
     for (var i = 0u; i < 4u; i++) {
       let q = neighbor_pixel(pixel, rotation, i, 24.0, &rng);
-      if (!in_bounds(q) || all(q == pixel)) { continue; }
-      let qg = load_geometry(q);
-      if (!qg.valid || !similar(g, qg.distance, qg.nrm)) { continue; }
-      let other = gi_input[pixel_index(q)];
-      let m = other.sample_pos_m.w;
-      let mass = gi_target(g, other) * other.sample_nrm_w.w * m * gi_jacobian(qg, g, other);
-      gi_add(&result, other, m, mass, &rng);
+      if (in_bounds(q) && any(q != pixel)) {
+        let qg = load_geometry(q);
+        let other = gi_input[pixel_index(q)];
+        let m_other = other.sample_pos_m.w;
+        if (qg.valid && similar(g, qg.distance, qg.nrm) && m_other > 0.0) {
+          let p_q_at_q = gi_target(qg, other);
+          let p_q_at_c = gi_target(g, other) * gi_jacobian(qg, g, other);
+          let p_c_at_q = gi_target(qg, center) * gi_jacobian(g, qg, center);
+          let neighbor_mass = pairwise_mass(p_q_at_q, p_q_at_c, m_other, m_center);
+          center_mass += pairwise_mass(p_c_at_c, p_c_at_q, m_center, m_other);
+          // Zero-radiance reservoirs still represent draws. Only their selection mass is zero.
+          gi_add(&result, other, m_other, p_q_at_c * other.sample_nrm_w.w * neighbor_mass, &rng);
+          continue;
+        }
+      }
+      center_mass += m_center;
     }
+    gi_add(&result, center, center.sample_pos_m.w, p_c_at_c * center.sample_nrm_w.w * center_mass, &rng);
     result = gi_finish(result, g);
     let weight = finite_nonnegative(result.sample_nrm_w.w, 64.0);
-    if (result.vis_pad.x > 0.5 && weight > 0.0 && visible(g.pos, g.nrm, result.sample_pos_m.xyz)) {
+    if (result.vis_pad.x > 0.5 && weight > 0.0 && gi_sample_visible(g, result)) {
       rgb = safe_rgb(result.radiance_wsum.rgb * (gi_cosine(g, result) * weight / PI));
     }
   }

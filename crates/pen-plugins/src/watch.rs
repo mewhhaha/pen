@@ -36,6 +36,7 @@ pub struct Built {
 pub struct Builder {
     plugins: Arc<Plugins>,
     entry: PathBuf,
+    test_mode: bool,
     compiler: Option<Compiler>,
     /// The paths whose changes need a new build.
     watched: BTreeSet<PathBuf>,
@@ -43,7 +44,12 @@ pub struct Builder {
 
 impl Builder {
     pub fn new(plugins: Arc<Plugins>, entry: &Path) -> Builder {
-        Builder { plugins, entry: entry.to_owned(), compiler: None, watched: BTreeSet::new() }
+        Builder { plugins, entry: entry.to_owned(), test_mode: false, compiler: None, watched: BTreeSet::new() }
+    }
+
+    /// Builds test modules with the compiler's test declarations enabled.
+    pub fn new_for_tests(plugins: Arc<Plugins>, entry: &Path) -> Builder {
+        Builder { test_mode: true, ..Self::new(plugins, entry) }
     }
 
     /// The program's entry.
@@ -114,7 +120,16 @@ impl Builder {
 
     fn compiler(&mut self) -> Result<&mut Compiler> {
         if self.compiler.is_none() {
-            self.compiler = Some(self.plugins.compiler(&self.entry)?);
+            self.compiler = Some(if self.test_mode {
+                let mut settings = self.plugins.chosen()?.settings.clone().unwrap_or_else(|| serde_json::json!({}));
+                let fields = settings
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow::anyhow!("the compiler settings are not a JSON object"))?;
+                fields.insert("testMode".into(), true.into());
+                self.plugins.compiler_with_settings(&self.entry, Some(&settings))?
+            } else {
+                self.plugins.compiler(&self.entry)?
+            });
         }
         Ok(self.compiler.as_mut().expect("opened above"))
     }

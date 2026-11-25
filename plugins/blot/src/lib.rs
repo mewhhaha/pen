@@ -52,6 +52,7 @@
 //! - `codegenTier`: `optimized` (the compiler's default) or `development`,
 //!   which skips the optional scalar and vector passes.
 //! - `semanticWorkers`: 1 to 16 workers for semantic jobs; serial without.
+//! - `testMode`: export first-class tests and their metadata (default false).
 //! - `expectedIdentity`: the only compiler identity to accept, from its
 //!   hello.
 //! - `tests`: optional `entry` (a virtual file shared by test modules) and

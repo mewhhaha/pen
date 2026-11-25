@@ -13,6 +13,8 @@ pub const ABI_SECTION: &str = "blot:abi";
 pub const KERNELS_SECTION: &str = "blot:kernels";
 /// The custom section declaring `#process` manifests (version 1).
 pub const PROCESSES_SECTION: &str = "blot:processes";
+/// The custom section declaring first-class tests (version 1).
+pub const TESTS_SECTION: &str = "blot:tests";
 /// Default logical transport packet ceiling in bytes (2 MiB).
 pub const DEFAULT_TRANSPORT_BUDGET: u32 = 2_097_152;
 /// `blot:kernels` manifest flag bit 0: kernel has a prepared context (`prepare`).
@@ -194,11 +196,28 @@ pub struct GuestConstant {
     pub value: ValueType,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestKind {
+    Check,
+    Trap,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TestMetadata {
+    pub kind: TestKind,
+    pub export_name: String,
+    pub display_name: String,
+    pub filename: String,
+    pub line: u32,
+}
+
 /// The `blot:abi` manifest: the module's exports, in declaration order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestAbi {
     pub functions: Vec<GuestFunction>,
     pub constants: Vec<GuestConstant>,
+    /// First-class test declarations, in metadata order.
+    pub tests: Vec<TestMetadata>,
     /// ABI 8: named data-stack owners and copied numeric packets, with no
     /// counted ownership hooks, resource adapters or language tasks.
     pub data_stacks: bool,
@@ -231,6 +250,7 @@ impl Default for GuestAbi {
         Self {
             functions: Vec::new(),
             constants: Vec::new(),
+            tests: Vec::new(),
             data_stacks: false,
             invocation_finish: false,
             ownership: false,
@@ -536,7 +556,7 @@ pub fn read_memory_shape(wasm: &[u8]) -> Result<MemoryShape> {
 }
 
 /// Finds the single `blot:abi` custom section in a module's bytes, plus
-/// optional `blot:tasks`, `blot:invocation`, `blot:kernels`, and `blot:processes` sections.
+/// optional tasks, invocation, kernel, process, and test sections.
 pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     let mut found = None;
     let mut tasks = None;
@@ -544,6 +564,7 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     let mut invocation_finish = false;
     let mut kernels_payload: Option<&[u8]> = None;
     let mut processes_payload: Option<&[u8]> = None;
+    let mut tests_payload: Option<&[u8]> = None;
     for (name, payload) in custom_sections(wasm)? {
         if matches!(name.as_str(), "blot:ownership" | "blot:cycles" | "blot:memory-profile" | "blot:cleanup_data") {
             counted_section = true;
@@ -563,6 +584,9 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
         } else if name == PROCESSES_SECTION {
             ensure!(processes_payload.is_none(), "invalid_abi: more than one {PROCESSES_SECTION} section");
             processes_payload = Some(payload);
+        } else if name == TESTS_SECTION {
+            ensure!(tests_payload.is_none(), "invalid_abi: more than one {TESTS_SECTION} section");
+            tests_payload = Some(payload);
         }
     }
     let mut abi = found.ok_or_else(|| anyhow!("invalid_abi: missing {ABI_SECTION} section"))?;
@@ -583,6 +607,9 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     );
     abi.tasks = tasks;
     abi.invocation_finish = invocation_finish;
+    if let Some(payload) = tests_payload {
+        abi.tests = parse_tests(payload)?;
+    }
     let mut declared_budget: Option<u32> = None;
     if let Some(payload) = kernels_payload {
         let (budget, kernels) = parse_kernels(payload, &abi)?;
@@ -616,6 +643,36 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
         abi.transport_budget = budget;
     }
     Ok(abi)
+}
+
+fn parse_tests(payload: &[u8]) -> Result<Vec<TestMetadata>> {
+    fn name(reader: &mut Reader<'_>) -> Result<String> {
+        let length = reader.leb(false)? as usize;
+        reader.text(length)
+    }
+
+    let mut reader = Reader { bytes: payload, at: 0 };
+    let version = reader.byte()?;
+    ensure!(version == 1, "invalid_abi: unsupported {TESTS_SECTION} version {version}");
+    let count = reader.leb(false)? as usize;
+    ensure!(count <= (payload.len() - reader.at) / 5, "invalid_abi: truncated {TESTS_SECTION} entries");
+    let mut tests = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = match reader.byte()? {
+            0 => TestKind::Check,
+            1 => TestKind::Trap,
+            kind => bail!("invalid_abi: unknown {TESTS_SECTION} kind {kind}"),
+        };
+        tests.push(TestMetadata {
+            kind,
+            export_name: name(&mut reader)?,
+            display_name: name(&mut reader)?,
+            filename: name(&mut reader)?,
+            line: reader.leb(false)?,
+        });
+    }
+    ensure!(reader.at == payload.len(), "invalid_abi: trailing {TESTS_SECTION} bytes");
+    Ok(tests)
 }
 
 fn parse_wire_schema(reader: &mut Reader<'_>, transport_budget: u32) -> Result<WireSchema> {
@@ -821,6 +878,57 @@ mod tests {
 
     fn module(sections: &[Vec<u8>]) -> Vec<u8> {
         [b"\0asm\x01\0\0\0".to_vec(), sections.concat()].concat()
+    }
+
+    #[test]
+    fn reads_test_metadata_v1() {
+        let abi = section(ABI_SECTION, &[8, 0, 0]);
+        let payload = b"\x01\x82\x00\x00\x04test\x02\xc3\xa9\x06a.blot\xac\x02\x01\x04trap\x00\x00\x01";
+        let wasm = module(&[section(TESTS_SECTION, payload), abi.clone()]);
+        assert_eq!(
+            read_abi(&wasm).unwrap().tests,
+            [
+                TestMetadata {
+                    kind: TestKind::Check,
+                    export_name: "test".into(),
+                    display_name: "é".into(),
+                    filename: "a.blot".into(),
+                    line: 300,
+                },
+                TestMetadata {
+                    kind: TestKind::Trap,
+                    export_name: "trap".into(),
+                    display_name: String::new(),
+                    filename: String::new(),
+                    line: 1,
+                },
+            ]
+        );
+        assert!(read_abi(&module(&[abi.clone(), section(TESTS_SECTION, &[1, 0])])).unwrap().tests.is_empty());
+        assert!(read_abi(&module(&[abi])).unwrap().tests.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_test_metadata() {
+        let abi = section(ABI_SECTION, &[8, 0, 0]);
+        let empty = section(TESTS_SECTION, &[1, 0]);
+        let duplicates = read_abi(&module(&[abi.clone(), empty.clone(), empty])).unwrap_err();
+        assert!(duplicates.to_string().contains("more than one blot:tests section"));
+        for (payload, message) in [
+            (&b""[..], "truncated"),
+            (&b"\x01"[..], "truncated"),
+            (&b"\x02\x00"[..], "unsupported blot:tests version"),
+            (&b"\x01\x01\x02\x00\x00\x00\x00"[..], "unknown blot:tests kind"),
+            (&b"\x01\x01\x00\x00\x00\x00"[..], "truncated blot:tests entries"),
+            (&b"\x01\x01\x00\x05a\x00\x00"[..], "truncated name"),
+            (&b"\x01\x01\x00\x01\xff\x00\x00\x01"[..], "not UTF-8"),
+            (&b"\x01\x01\x00\x00\x00\x00\x80"[..], "truncated"),
+            (&b"\x01\x01\x00\x00\x00\x00\xff\xff\xff\xff\x10"[..], "LEB128 exceeds u32"),
+            (&b"\x01\x00\xff"[..], "trailing blot:tests bytes"),
+        ] {
+            let error = read_abi(&module(&[abi.clone(), section(TESTS_SECTION, payload)])).unwrap_err().to_string();
+            assert!(error.starts_with("invalid_abi:") && error.contains(message), "{payload:?}: {error}");
+        }
     }
 
     #[test]

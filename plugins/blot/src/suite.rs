@@ -2,7 +2,8 @@
 //! are, how each compiles, and what its tests must do. pen builds each and
 //! runs its tests as Wasm. Every module compiles as if it stood at
 //! `test_fixture.blot` beside the program's entry, so that it imports what
-//! the program's own sources do; its directory says what its tests must do:
+//! the program's own sources do. First-class declarations carry their own
+//! expectations. For legacy exports, the directory says what they must do:
 //!
 //! - `tests/*.blot`: every `test_…` entry returns the report of its checks.
 //! - `tests/traps/*.blot`: every `test_…` entry must stop at `@panic`, which
@@ -97,15 +98,20 @@ pub fn find(
     for path in paths {
         let source = files.read(&path).map_err(|error| format!("reading {path}: {error}"))?;
         let source = String::from_utf8(source).map_err(|_| format!("{path} is not UTF-8"))?;
-        let named = match kind(&path) {
-            Kind::Rejected => stem(&path).to_owned(),
-            Kind::Checks | Kind::Traps => source.clone(),
+        let kind = kind(&path);
+        let named = match kind {
+            Kind::Rejected => stem(&path),
+            Kind::Checks | Kind::Traps => &source,
         };
-        if filter.is_some_and(|filter| !named.contains(filter)) {
+        let source_matches = filter.is_none_or(|filter| named.contains(filter));
+        let declarations = if kind == Kind::Rejected { 0 } else { test_declarations(&source) };
+        if !source_matches && !filter.is_some_and(|filter| matches_declarations(&source, declarations, filter)) {
             continue;
         }
-        let expect = match kind(&path) {
+        let inline_traps = has_entry(&source, "trap_");
+        let expect = match kind {
             Kind::Checks => Expectation::Checks,
+            Kind::Traps if declarations > 0 && !inline_traps && !has_entry(&source, PREFIX) => Expectation::Checks,
             Kind::Traps => Expectation::Traps,
             Kind::Rejected => match rejects(&source) {
                 Some(text) => Expectation::Rejected(text.to_owned()),
@@ -120,15 +126,6 @@ pub fn find(
         };
         // A module may keep expected panics beside its ordinary checks.
         // Pen runs each export in a fresh instance, including after a trap.
-        let inline_traps = kind(&path) == Kind::Checks
-            && source.lines().any(|line| {
-                line.trim_start()
-                    .strip_prefix("#entry ")
-                    .and_then(|declaration| {
-                        declaration.strip_prefix("func ").or_else(|| declaration.strip_prefix("const "))
-                    })
-                    .is_some_and(|name| name.starts_with("trap_"))
-            });
         let overlays = vec![Overlay { path: entry.clone(), contents: Some(source) }];
         found.push(TestModule {
             path: path.clone(),
@@ -137,7 +134,7 @@ pub fn find(
             prefix: PREFIX.to_owned(),
             expect,
         });
-        if inline_traps {
+        if kind == Kind::Checks && inline_traps && source_matches {
             found.push(TestModule {
                 path,
                 entry: entry.clone(),
@@ -148,6 +145,44 @@ pub fn find(
         }
     }
     Ok(found)
+}
+
+fn has_entry(source: &str, prefix: &str) -> bool {
+    source.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("#entry ")
+            .and_then(|declaration| declaration.strip_prefix("func ").or_else(|| declaration.strip_prefix("const ")))
+            .is_some_and(|name| name.starts_with(prefix))
+    })
+}
+
+/// Conservatively count declarations for discovery. The compiled metadata
+/// determines the actual names, including when a user identifier skips an ordinal.
+fn test_declarations(source: &str) -> usize {
+    source
+        .match_indices("test")
+        .filter(|&(start, keyword)| {
+            if source[..start].ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                return false;
+            }
+            let name = source[start + keyword.len()..].trim_start();
+            name.starts_with('"')
+                || name.strip_prefix("expect_trap").is_some_and(|name| name.trim_start().starts_with('"'))
+        })
+        .count()
+}
+
+fn matches_declarations(source: &str, declarations: usize, filter: &str) -> bool {
+    if declarations == 0 {
+        return false;
+    }
+    let escaped = serde_json::Value::String(filter.to_owned()).to_string();
+    if source.contains(&escaped[1..escaped.len() - 1]) {
+        return true;
+    }
+    const EXPORT_PREFIX: &str = "__blot_test_";
+    let collisions = source.matches(EXPORT_PREFIX).count();
+    (0..declarations + collisions).any(|ordinal| format!("{EXPORT_PREFIX}{ordinal}").contains(filter))
 }
 
 /// What a module's tests must do, by its directory.
@@ -331,6 +366,21 @@ mod tests {
             assert_eq!(found[0].entry, found[1].entry);
             assert_eq!(found[0].overlays, found[1].overlays);
         }
+    }
+
+    #[test]
+    fn discovers_first_class_checks_and_traps_as_one_module() {
+        let source = r#"test "a plain check" => true
+test expect_trap "an expected trap" => panic "expected"
+test "a \"quoted\" name" => true
+"#;
+        let mut files = checkout(&[("tests/a.blot", source), ("tests/traps/b.blot", source)]);
+        for filter in [None, Some("expected trap"), Some("__blot_test_1"), Some("\"quoted\"")] {
+            let found = find(&program(), &[], filter, &mut files).unwrap();
+            assert_eq!(paths(&found), ["a.blot", "traps/b.blot"]);
+            assert!(found.iter().all(|test| test.expect == Expectation::Checks && test.prefix == PREFIX));
+        }
+        assert!(find(&program(), &[], Some("unrelated"), &mut files).unwrap().is_empty());
     }
 
     #[test]

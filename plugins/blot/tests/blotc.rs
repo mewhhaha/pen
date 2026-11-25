@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pen_plugin_blot::native::{NativeChild, NativeFiles};
-use pen_plugin_blot::{Build, Diagnostic, Expectation, Overlay, Program, Session, find_tests};
+use pen_plugin_blot::{Build, Diagnostic, Expectation, Overlay, Program, Session, Settings, find_tests};
 use serde_json::{Value, json};
 
 /// The sibling checkouts: blot2 and gdev.
@@ -311,8 +311,8 @@ fn refuses_a_compiler_it_did_not_expect() {
 
 /// The sibling gdev checkout's `tests/math.blot`, laid out as pen's
 /// `test-blot` has the plugin lay it out, and compiled alone as it says: in
-/// place of `src/test_fixture.blot`, with gdev's compiler settings (its
-/// pen.json's). Skipped without the checkout.
+/// place of its configured test entry, with gdev's compiler settings.
+/// Skipped without the checkout.
 fn gdev_math() -> Option<(PathBuf, Vec<u8>)> {
     if !present() {
         return None;
@@ -333,10 +333,9 @@ fn gdev_math() -> Option<(PathBuf, Vec<u8>)> {
     let main = Program { root: root.clone(), entry: format!("{root}/src/main.blot"), settings: settings.clone() };
     let mut modules = find_tests(&main, &[math.display().to_string()], None, &mut NativeFiles).unwrap();
     let test = modules.pop().unwrap();
-    assert_eq!(
-        (test.entry.as_str(), &test.expect),
-        (format!("{root}/src/test_fixture.blot").as_str(), &Expectation::Checks)
-    );
+    let layout = Settings::parse(&settings, &root).unwrap().tests;
+    let entry = layout.entry.unwrap_or_else(|| format!("{root}/src/test_fixture.blot"));
+    assert_eq!((test.entry.as_str(), &test.expect), (entry.as_str(), &Expectation::Checks));
     let cache = Project::new(&[]);
     let program = Program { root, entry: test.entry, settings };
     let mut session = Session::open(&program, &cache.path("cache"), |_, args, env| {

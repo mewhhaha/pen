@@ -207,6 +207,23 @@ fn reads_reports() {
 }
 
 #[test]
+fn rejects_malformed_btst_reports() {
+    let magic = 0x4254_5354;
+    for (words, message) in [
+        (&[magic, 1, 0][..], "truncated BTST header"),
+        (&[0, 1, 0, 0][..], "invalid BTST magic"),
+        (&[magic, 2, 0, 0][..], "unsupported BTST version"),
+        (&[magic, 1, 0, u32::MAX][..], "truncated BTST failure records"),
+        (&[magic, 1, 0, 1, 100, 0, 0, 0, 0][..], "truncated BTST text"),
+        (&[magic, 1, 0, 1, 1, 0xd800, 0, 0, 0, 0][..], "invalid Unicode scalar"),
+        (&[magic, 1, 0, 0, 0][..], "trailing words"),
+    ] {
+        let error = decode_btst(words).unwrap_err().to_string();
+        assert!(error.contains(message), "{words:?}: {error}");
+    }
+}
+
+#[test]
 fn describes_outcomes() {
     let passed = Outcome::Reported(Report { checks: 2, failures: vec![] });
     assert_eq!(describe("test_a", &passed), ["  ok      test_a"]);
@@ -242,7 +259,7 @@ fn runs_tests_that_must_trap() {
             "    check 2: expected [2, 3] got [2, 4]",
         ]
     );
-    assert_eq!(*outcome("test_returns_lanes"), Outcome::Returned(vec![1.0, 1.0, 1.0, 5.0]));
+    assert_eq!(*outcome("test_returns_lanes"), Outcome::Returned(Value::ArrayF32(vec![1.0, 1.0, 1.0, 5.0])));
     assert_eq!(
         describe("test_returns_lanes", outcome("test_returns_lanes")),
         ["  FAILED  test_returns_lanes (returned instead of trapping)", "    it returned [1, 1, 1, 5]"]
@@ -373,7 +390,10 @@ fn runs_a_modules_tests() {
     let names: Vec<&str> = tests.tests.iter().map(|(name, _)| name.as_str()).collect();
     // Only `test_…` entries, Unit to Array F32, in the module's order.
     assert_eq!(names, ["test_passes", "test_fails", "test_traps", "test_malformed"]);
-    assert_eq!(tests.skipped, ["test_takes_f32: it is F32 -> F32, not Unit -> Array F32"]);
+    assert_eq!(
+        tests.skipped,
+        ["test_takes_f32: it is F32 -> F32, expected Unit -> Unit, Bool, Array F32, or Array U32"]
+    );
     let outcome = |name: &str| &tests.tests.iter().find(|(test, _)| test == name).unwrap().1;
     assert_eq!(*outcome("test_passes"), Outcome::Reported(Report { checks: 2, failures: vec![] }));
     assert!(outcome("test_passes").passed());
@@ -388,6 +408,180 @@ fn runs_a_modules_tests() {
     assert_eq!(filtered.tests.len(), 1);
     assert_eq!(filtered.tests[0].0, "test_fails");
     assert!(run_tests(&engine, b"\0asm\x01\0\0\0", Kind::Checks, "test_", None, &Slots::new(4)).is_err());
+}
+
+#[test]
+fn metadata_takes_precedence_over_legacy_prefixes() {
+    let mut wasm = sample();
+    let mut metadata = name(pen_runtime::abi::TESTS_SECTION);
+    metadata.extend([1, 1, 0]);
+    metadata.extend(name("test_passes"));
+    metadata.extend([0, 0, 1]); // Empty display name and filename, line 1.
+    wasm.extend(section(0, metadata));
+    let engine = blot_host::engine().unwrap();
+    let slots = Slots::new(1);
+    let tests = run_tests(&engine, &wasm, Kind::Checks, "test_", Some("passes"), &slots).unwrap();
+    assert_eq!(tests.tests, [("test_passes".into(), Outcome::Reported(Report { checks: 2, failures: vec![] }))]);
+    let secondary = run_tests(&engine, &wasm, Kind::Traps, "trap_", None, &slots).unwrap();
+    assert!(secondary.tests.is_empty());
+}
+
+#[test]
+fn runs_real_first_class_and_legacy_blot_tests_together() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let blot = repository.join("../blot2");
+    let compiler = std::env::var_os("BLOT_TEST_COMPILER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| blot.join("compiler-goose/build/blotc-goose"));
+    let component = std::env::var_os("PEN_TEST_BLOT_PLUGIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository.join("plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm"));
+    let std = blot.join("std");
+    if !compiler.is_file() || !component.is_file() || !std.is_dir() {
+        crate::fixtures::missing("first-class Blot tests need blotc-goose, the WASI Blot plugin, and Blot std");
+        return;
+    }
+    struct Project(PathBuf);
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let project = Project(std::env::temp_dir().join(format!("pen-first-class-blot-{}", std::process::id())));
+    let root = &project.0;
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    let config = serde_json::json!({
+        "plugins": { "blot": { "wasm": component, "read": [&std], "run": { "blotc": compiler } } },
+        "compiler": { "plugin": "blot", "settings": { "std": std, "testMode": false, "tests": {
+            "entry": "tests/.fixture.blot", "files": ["tests/first.blot", "tests/mixed.blot"]
+        } } }
+    });
+    std::fs::write(root.join("pen.json"), config.to_string()).unwrap();
+    std::fs::write(
+        root.join("tests/first.blot"),
+        r#"import * as test from "std/test"
+
+test "unit ok":
+  let _ = 42
+
+test "bool ok" => true
+test "bool fail" => false
+
+@[test.suite]
+test "btst ok":
+  use test.eq "equal" 42 42
+
+@[test.suite]
+test "btst fail":
+  use test.eq "equal" 42 42
+  use test.group "nested λ" (func () =>
+    use test.eq "mismatch" 41 42
+    return ())
+
+test expect_trap "panics":
+  panic "expected"
+
+test expect_trap "div zero":
+  let zero = #[0]
+  return @u32.div 1 zero[0]
+
+test expect_trap "returns u32" => 42
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tests/mixed.blot"),
+        r#"test "mixed check" => true
+test expect_trap "mixed trap" => panic "expected"
+
+#entry func test_legacy () => #[1.0, 0.0]
+#entry func trap_legacy (): U32 => @panic "legacy panic"
+"#,
+    )
+    .unwrap();
+
+    let plugins = test_plugins(root).unwrap();
+    let checkout = plugins.root();
+    let engine = blot_host::dev_engine().unwrap();
+    let slots = Slots::new(2);
+    let discover = |filter| {
+        plugins
+            .tests(&checkout.join(ENTRY), &[], filter)
+            .unwrap()
+            .into_iter()
+            .map(|test| Module::new(checkout, test))
+            .collect::<Vec<_>>()
+    };
+    let modules = discover(None);
+    assert_eq!(modules.iter().map(|module| module.kind).collect::<Vec<_>>(), [Kind::Checks, Kind::Checks, Kind::Traps]);
+    let mut builder = None;
+    let mut execute =
+        |module: &Module, filter| run_module(&mut builder, &plugins, &engine, module, filter, &slots, None);
+    let first = execute(&modules[0], None);
+    let lines = module_lines(&modules[0], &first, None).join("\n");
+    let first = first.tests.unwrap_or_else(|_| panic!("{lines}"));
+    assert_eq!(
+        first.tests.iter().map(|(name, outcome)| (name.as_str(), outcome.passed())).collect::<Vec<_>>(),
+        [
+            ("unit ok", true),
+            ("bool ok", true),
+            ("bool fail", false),
+            ("btst ok", true),
+            ("btst fail", false),
+            ("panics", true),
+            ("div zero", true),
+            ("returns u32", false),
+        ],
+        "{lines}"
+    );
+    for shown in [
+        "returned false",
+        "btst fail (1 of 2 checks)",
+        "\"nested λ\" / \"mismatch\": \"expected equal values\"",
+        "expected \"41\", got \"42\"",
+        "returns u32 (returned instead of trapping)\n    it returned 42",
+    ] {
+        assert!(lines.contains(shown), "{lines}");
+    }
+
+    for (module, expected) in
+        [(&modules[1], &["mixed check", "mixed trap", "test_legacy"][..]), (&modules[2], &["trap_legacy"][..])]
+    {
+        let ran = execute(module, None);
+        let lines = module_lines(module, &ran, None).join("\n");
+        let ran = ran.tests.unwrap_or_else(|_| panic!("{lines}"));
+        assert_eq!(ran.tests.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), expected, "{lines}");
+        assert!(ran.tests.iter().all(|(_, outcome)| outcome.passed()), "{lines}");
+    }
+
+    for (filter, expected) in [("bool ok", "bool ok"), ("__blot_test_6", "div zero")] {
+        let filtered = discover(Some(filter));
+        assert_eq!(filtered.len(), 1);
+        let ran = execute(&filtered[0], Some(filter)).tests.unwrap();
+        assert_eq!(ran.tests.len(), 1);
+        assert_eq!(ran.tests[0].0, expected);
+        assert!(ran.tests[0].1.passed());
+    }
+
+    let options = |filter: &str| Options {
+        session: None,
+        files: vec![],
+        filter: Some(filter.into()),
+        jobs: Some(1),
+        deadline: None,
+    };
+    run(root, options("mixed")).unwrap();
+    let failed = run(root, options("bool fail")).unwrap_err().to_string();
+    assert_eq!(failed, "tests failed:\n  tests/first.blot: bool fail");
+
+    let mixed = &modules[1].test;
+    let mut normal = Builder::new(plugins, Path::new(&mixed.entry));
+    let normal_wasm = build_test_module(&mut normal, mixed).unwrap();
+    let mut legacy_only = mixed.clone();
+    let source = legacy_only.overlays[0].contents.as_mut().unwrap();
+    *source = source.lines().skip_while(|line| !line.starts_with("#entry")).collect::<Vec<_>>().join("\n") + "\n";
+    assert_eq!(normal_wasm, build_test_module(&mut normal, &legacy_only).unwrap());
+    assert!(pen_runtime::abi::read_abi(&normal_wasm).unwrap().tests.is_empty());
 }
 
 #[test]
@@ -407,7 +601,7 @@ fn runs_the_checkouts_pilot() {
     assert_eq!(found.len(), 1);
     let test = found.remove(0);
     assert!(Path::new(&test.path) == pilot && matches!(test.expect, Expectation::Checks), "{}", test.path);
-    let mut builder = Builder::new(plugins, Path::new(&test.entry));
+    let mut builder = Builder::new_for_tests(plugins, Path::new(&test.entry));
     let wasm = build_test_module(&mut builder, &test).unwrap();
     let engine = blot_host::dev_engine().unwrap();
     let tests = run_tests(&engine, &wasm, Kind::Checks, &test.prefix, None, &Slots::new(4)).unwrap();

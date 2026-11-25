@@ -31,7 +31,9 @@ fn component() -> Option<PathBuf> {
 fn parts() -> Option<(PathBuf, PathBuf, PathBuf)> {
     let component = component()?;
     let blot2 = repository().join("../blot2").canonicalize().ok()?;
-    let compiler = blot2.join("generated/compiler/blotc.gz");
+    let compiler = std::env::var_os("BLOT_TEST_COMPILER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| blot2.join("generated/compiler/blotc.gz"));
     let std = blot2.join("std");
     (compiler.is_file() && std.is_dir()).then_some((component, compiler, std))
 }

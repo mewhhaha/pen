@@ -49,6 +49,8 @@ pub struct Settings {
     pub expected_identity: Option<String>,
     /// Native readers owned by blotc. Paths are resolved against the project.
     pub native_assets: Option<Value>,
+    /// Export first-class test declarations and their metadata.
+    pub test_mode: bool,
     /// Test layout, independent of a game entry.
     pub tests: TestSettings,
 }
@@ -127,7 +129,7 @@ impl Settings {
         let Value::Object(fields) = value else {
             return Err("the settings are not a JSON object".into());
         };
-        const KNOWN: [&str; 12] = [
+        const KNOWN: [&str; 13] = [
             "program",
             "imports",
             "std",
@@ -139,6 +141,7 @@ impl Settings {
             "storage",
             "expectedIdentity",
             "nativeAssets",
+            "testMode",
             "tests",
         ];
         if let Some(unknown) = fields.keys().find(|key| !KNOWN.contains(&key.as_str())) {
@@ -188,6 +191,11 @@ impl Settings {
             Some(Value::String(identity)) if is_identity(identity) => Some(identity.clone()),
             Some(_) => return Err("the settings' `expectedIdentity` is not 64 lowercase hex digits".into()),
         };
+        let test_mode = match fields.get("testMode") {
+            None => false,
+            Some(Value::Bool(enabled)) => *enabled,
+            Some(_) => return Err("the settings' `testMode` is not a boolean".into()),
+        };
         Ok(Settings {
             program,
             imports: imports(fields.get("imports"), root)?,
@@ -200,6 +208,7 @@ impl Settings {
             storage: storage(fields.get("storage"))?,
             expected_identity,
             native_assets: native_assets(fields.get("nativeAssets"), root)?,
+            test_mode,
             tests: TestSettings::parse(fields.get("tests"), root)?,
         })
     }
@@ -212,6 +221,9 @@ impl Settings {
         }
         if let Some(budget) = self.inference_budget {
             args.extend(["--inference-budget".to_string(), budget.to_string()]);
+        }
+        if self.test_mode {
+            args.push("--test".to_string());
         }
         args
     }
@@ -434,6 +446,7 @@ mod tests {
             "dependencies": "deps.blotdep",
             "codegenTier": "development",
             "semanticWorkers": 4,
+            "testMode": true,
             "expectedIdentity": "0123456789abcdef".repeat(4),
         });
         let settings = Settings::parse(&json.to_string(), "/src/gdev").unwrap();
@@ -446,7 +459,7 @@ mod tests {
         assert_eq!(settings.prelude.as_deref(), Some("/src/blot2/std/prelude.blot"));
         assert_eq!(settings.dependencies.as_deref(), Some("/src/gdev/deps.blotdep"));
         assert_eq!(settings.codegen_tier, Some(CodegenTier::Development));
-        assert_eq!(settings.args(), ["serve-project", "--semantic-workers", "4"]);
+        assert_eq!(settings.args(), ["serve-project", "--semantic-workers", "4", "--test"]);
         assert_eq!(
             settings.watched("/src/gdev/src/main.blot"),
             ["/src/gdev/src", "/elsewhere", "/src/gdev/packages", "/src/blot2/std", "/src/blot2/std/prelude.blot"]
@@ -475,6 +488,7 @@ mod tests {
             (r#"{"imports": {"gdev": "packages"}}"#, "does not end in /"),
             (r#"{"codegenTier": "fast"}"#, "`codegenTier`"),
             (r#"{"semanticWorkers": 17}"#, "`semanticWorkers`"),
+            (r#"{"testMode": "true"}"#, "`testMode` is not a boolean"),
             (r#"{"expectedIdentity": "ABC"}"#, "`expectedIdentity`"),
             (r#"{"program": ""}"#, "`program`"),
             (r#"{"tests": []}"#, "`tests` is not an object"),

@@ -3,17 +3,13 @@
 //! which modules, what each builds as, and what its tests must do. pen
 //! builds each module in a compiler session for its entry, each worker
 //! keeping its session from module to module so that each compiles
-//! incrementally, and runs its tests as Wasm. A test is an export of its
-//! module named with the prefix the plugin gives, Unit to Array F32, run in
-//! a fresh instance:
+//! incrementally, and runs each test as Wasm in a fresh instance.
 //!
-//! - In a module of checks, it returns the report of its checks (gdev's
-//!   `tests/support/check.blot`): the checks made, the failures, then each
-//!   failure's place (from 1), its expected lanes' count and lanes, and its
-//!   actual lanes' count and lanes. It passes when no check failed.
-//! - In a module whose tests must trap, it must trap at `unreachable`, as
-//!   Blot's `@panic` stops a program (a decoder refusing bad input). Any
-//!   other trap, or returning, fails.
+//! - First-class declarations name their exports and expectations in
+//!   `blot:tests`. Checks return Unit, Bool, a `std/test` report, or a
+//!   legacy `check.report`. Expected traps can be any guest Wasm trap.
+//! - Legacy tests are exports selected by the plugin's prefix. Legacy
+//!   trap tests must trap at `unreachable`, as Blot's `@panic` does.
 //! - A module that must not compile is one test, which passes when the
 //!   compiler's diagnostics contain the text the plugin gives.
 //!
@@ -28,7 +24,7 @@
 //! These GPU scenarios compile and run sequentially.
 mod session;
 pub use session::Options as SessionOptions;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,6 +34,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use blot_host::{Guest, GuestFunction, GuestModule, Parameter, Value, ValueType};
 use pen_plugins::{Builder, Expectation, Outcome as Building, Plugins, TestModule};
+use pen_runtime::abi::TestKind;
 use wasmtime::{Engine, Trap};
 
 /// The checkout's main program, which the plugin lays its tests out by.
@@ -324,7 +321,7 @@ fn run_module(
         if let Some(mut last) = session.take() {
             let _ = last.close();
         }
-        *session = Some(Builder::new(plugins.clone(), entry));
+        *session = Some(Builder::new_for_tests(plugins.clone(), entry));
     }
     let builder = session.as_mut().expect("opened above");
     let compiling = Instant::now();
@@ -437,8 +434,7 @@ pub fn build_test_module(builder: &mut Builder, test: &TestModule) -> Result<Vec
 struct Tests {
     /// Each test's name and outcome, in the module's order.
     tests: Vec<(String, Outcome)>,
-    /// The exports named as tests that are not Unit to Array F32, and what
-    /// they are.
+    /// The legacy exports whose signatures do not match their test kind.
     skipped: Vec<String>,
     /// How long each test ran, in the same order.
     times: Vec<Timing>,
@@ -451,12 +447,16 @@ struct Tests {
 enum Outcome {
     /// What it returned: it passed when no check failed.
     Reported(Report),
+    /// A report from `std/test`.
+    Btst(BtstReport),
+    /// It returned Unit or true.
+    Completed,
     /// It trapped (where it must not), or what it returned is not a report.
     Broken(String),
-    /// It trapped at `unreachable`, as a test that must trap must: passed.
+    /// It trapped as expected.
     Panicked,
-    /// A test that must trap returned these lanes instead.
-    Returned(Vec<f32>),
+    /// A test that must trap returned a value.
+    Returned(Value),
     /// A test that must trap trapped some other way: the trap.
     Mistrapped(String),
     /// A module that must not compile did not, with the diagnostics it
@@ -473,7 +473,8 @@ impl Outcome {
     fn passed(&self) -> bool {
         match self {
             Outcome::Reported(report) => report.failures.is_empty(),
-            Outcome::Panicked | Outcome::Rejected => true,
+            Outcome::Btst(report) => report.failures.is_empty(),
+            Outcome::Completed | Outcome::Panicked | Outcome::Rejected => true,
             Outcome::Broken(_)
             | Outcome::Returned(_)
             | Outcome::Mistrapped(_)
@@ -562,6 +563,30 @@ fn run_tests(
     run_tests_with_session(engine, wasm, kind, prefix, filter, slots, None)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Check,
+    Trap,
+    LegacyTrap,
+}
+
+impl EntryKind {
+    fn accepts(self, function: &GuestFunction) -> bool {
+        function.parameter == Parameter::Value(ValueType::Unit)
+            && (self != Self::Check
+                || matches!(
+                    function.result,
+                    ValueType::Unit | ValueType::Bool | ValueType::ArrayF32 | ValueType::ArrayU32
+                ))
+    }
+}
+
+struct Entry<'a> {
+    export: &'a str,
+    name: &'a str,
+    kind: EntryKind,
+}
+
 fn run_tests_with_session(
     engine: &Engine,
     wasm: &[u8],
@@ -577,8 +602,31 @@ fn run_tests_with_session(
     let started = Instant::now();
     let mut skipped = Vec::new();
     let mut runnable = Vec::new();
-    let entries = module.abi().functions.iter().filter(|function| {
-        function.name.starts_with(prefix) && filter.is_none_or(|filter| function.name.contains(filter))
+    let abi = module.abi();
+    let matches = |name: &str| filter.is_none_or(|filter| name.contains(filter));
+    let mut declared = HashSet::new();
+    if session.is_none() {
+        for test in &abi.tests {
+            declared.insert(test.export_name.as_str());
+            // Discovery can add a secondary module for inline legacy traps.
+            if prefix != "test_" || !(matches(&test.display_name) || matches(&test.export_name)) {
+                continue;
+            }
+            let kind = match test.kind {
+                TestKind::Check => EntryKind::Check,
+                TestKind::Trap => EntryKind::Trap,
+            };
+            let export = test.export_name.as_str();
+            let function =
+                abi.function(export).with_context(|| format!("invalid_abi: missing test export {export}"))?;
+            ensure!(kind.accepts(function), "invalid_abi: test export {export} has signature {}", signature(function));
+            let name = if test.display_name.is_empty() { export } else { &test.display_name };
+            runnable.push(Entry { export, name, kind });
+        }
+    }
+    let entry_kind = if kind == Kind::Traps { EntryKind::LegacyTrap } else { EntryKind::Check };
+    let entries = abi.functions.iter().filter(|function| {
+        function.name.starts_with(prefix) && matches(&function.name) && !declared.contains(function.name.as_str())
     });
     for function in entries {
         if session.is_some() {
@@ -589,11 +637,16 @@ fn run_tests_with_session(
                 "{}: session tests take the driver (Array F32 -> Array F32 ! {{ Foreign }}) and return Array F32 through pen/test.run",
                 function.name
             );
-        } else if function.parameter != Parameter::Value(ValueType::Unit) || function.result != ValueType::ArrayF32 {
-            skipped.push(format!("{}: it is {}, not Unit -> Array F32", function.name, signature(function)));
+        } else if !entry_kind.accepts(function) {
+            let expected = if entry_kind == EntryKind::Check {
+                "Unit -> Unit, Bool, Array F32, or Array U32"
+            } else {
+                "a Unit parameter"
+            };
+            skipped.push(format!("{}: it is {}, expected {expected}", function.name, signature(function)));
             continue;
         }
-        runnable.push(function.name.clone());
+        runnable.push(Entry { export: &function.name, name: &function.name, kind: entry_kind });
     }
     ensure!(session.is_none() || !runnable.is_empty(), "no runnable session tests match");
     let next = AtomicUsize::new(0);
@@ -607,16 +660,16 @@ fn run_tests_with_session(
                     .spawn_scoped(scope, || {
                         loop {
                             let index = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(name) = runnable.get(index) else { break };
+                            let Some(entry) = runnable.get(index) else { break };
                             let outcome = slots.hold(|| match session {
                                 Some(run) => {
                                     let started = Instant::now();
                                     (
-                                        reported(run.call(engine, &module, name, slots.deadline)),
+                                        reported(run.call(engine, &module, entry.export, slots.deadline)),
                                         Timing { took: started.elapsed(), cycle_passes: None },
                                     )
                                 }
-                                None => run_test(engine, &module, kind, name, slots.deadline),
+                                None => run_test(engine, &module, entry.kind, entry.export, slots.deadline),
                             });
                             ran.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(outcome);
                         }
@@ -632,9 +685,9 @@ fn run_tests_with_session(
     let (tests, times) = runnable
         .into_iter()
         .zip(ran)
-        .map(|(name, ran)| {
+        .map(|(entry, ran)| {
             let (outcome, time) = ran.expect("every test ran");
-            ((name, outcome), time)
+            ((entry.name.to_owned(), outcome), time)
         })
         .unzip();
     Ok(Tests { tests, skipped, times, compile, run: started.elapsed() })
@@ -650,7 +703,13 @@ struct Timing {
 
 /// Runs the test `name` in an instance of its own: its outcome, and how
 /// long it took.
-fn run_test(engine: &Engine, module: &GuestModule, kind: Kind, name: &str, deadline: Duration) -> (Outcome, Timing) {
+fn run_test(
+    engine: &Engine,
+    module: &GuestModule,
+    kind: EntryKind,
+    name: &str,
+    deadline: Duration,
+) -> (Outcome, Timing) {
     let running = Instant::now();
     let mut cycle_passes = None;
     let called = Guest::new(engine, module).and_then(|mut guest| {
@@ -663,36 +722,41 @@ fn run_test(engine: &Engine, module: &GuestModule, kind: Kind, name: &str, deadl
         called
     });
     let outcome = match kind {
-        Kind::Traps => trapped(called),
-        Kind::Checks | Kind::Rejected => reported(called),
+        EntryKind::Trap | EntryKind::LegacyTrap => trapped(called, kind == EntryKind::LegacyTrap),
+        EntryKind::Check => reported(called),
     };
     (outcome, Timing { took: running.elapsed(), cycle_passes })
 }
 
-/// A test's outcome by the report it returned.
+/// A check's outcome by the value it returned.
 fn reported(called: Result<Value>) -> Outcome {
-    match called.and_then(Value::into_f32_array) {
-        Ok(lanes) => match decode(&lanes) {
+    match called {
+        Ok(Value::ArrayF32(lanes)) => match decode(&lanes) {
             Ok(report) => Outcome::Reported(report),
             Err(error) => Outcome::Broken(format!("its report is malformed ({error:#}): {}", format_lanes(&lanes))),
         },
+        Ok(Value::ArrayU32(words)) => match decode_btst(&words) {
+            Ok(report) => Outcome::Btst(report),
+            Err(error) => {
+                Outcome::Broken(format!("its BTST report is malformed ({error:#}): {}", format_lanes(&words)))
+            }
+        },
+        Ok(Value::Unit | Value::Bool(true)) => Outcome::Completed,
+        Ok(Value::Bool(false)) => Outcome::Broken("returned false".into()),
+        Ok(value) => Outcome::Broken(format!("unexpected check result: {}", value.kind())),
         Err(error) => Outcome::Broken(explain(&error)),
     }
 }
 
-/// The outcome of a test that must trap at `unreachable`, as Blot's `@panic`
-/// stops a program. Wasmtime's trap code tells it from other traps
-/// (out-of-bounds memory, stack overflow, division by zero, …).
-fn trapped(called: Result<Value>) -> Outcome {
+fn trapped(called: Result<Value>, legacy: bool) -> Outcome {
     match called {
-        Ok(value) => match value.into_f32_array() {
-            Ok(lanes) => Outcome::Returned(lanes),
-            Err(error) => Outcome::Broken(explain(&error)),
-        },
+        Ok(value) => Outcome::Returned(value),
         Err(error) => match error.downcast_ref::<Trap>() {
             Some(Trap::UnreachableCodeReached) => Outcome::Panicked,
-            Some(_) => Outcome::Mistrapped(explain(&error)),
-            None => Outcome::Broken(explain(&error)),
+            Some(_) if legacy => Outcome::Mistrapped(explain(&error)),
+            // Host deadlines and fuel limits do not indicate a guest trap.
+            Some(Trap::Interrupt | Trap::OutOfFuel) | None => Outcome::Broken(explain(&error)),
+            Some(_) => Outcome::Panicked,
         },
     }
 }
@@ -761,6 +825,53 @@ fn decode(lanes: &[f32]) -> Result<Report> {
     Ok(Report { checks, failures })
 }
 
+#[derive(Debug, PartialEq)]
+struct BtstReport {
+    passed: u32,
+    failures: Vec<BtstFailure>,
+}
+
+#[derive(Debug, PartialEq)]
+struct BtstFailure {
+    group: String,
+    label: String,
+    message: String,
+    expected: String,
+    actual: String,
+}
+
+fn decode_btst(words: &[u32]) -> Result<BtstReport> {
+    fn field(words: &mut &[u32]) -> Result<String> {
+        let (&length, rest) = words.split_first().context("truncated BTST text length")?;
+        let (text, rest) = rest.split_at_checked(length as usize).context("truncated BTST text")?;
+        *words = rest;
+        text.iter()
+            .map(|&scalar| char::from_u32(scalar).with_context(|| format!("invalid Unicode scalar U+{scalar:04X}")))
+            .collect()
+    }
+
+    let [magic, version, passed, failed, tail @ ..] = words else {
+        bail!("truncated BTST header");
+    };
+    ensure!(*magic == 0x4254_5354, "invalid BTST magic");
+    ensure!(*version == 1, "unsupported BTST version {version}");
+    let failed = *failed as usize;
+    let mut words = tail;
+    ensure!(failed <= words.len() / 5, "truncated BTST failure records");
+    let mut failures = Vec::with_capacity(failed);
+    for _ in 0..failed {
+        failures.push(BtstFailure {
+            group: field(&mut words)?,
+            label: field(&mut words)?,
+            message: field(&mut words)?,
+            expected: field(&mut words)?,
+            actual: field(&mut words)?,
+        });
+    }
+    ensure!(words.is_empty(), "{} trailing words in BTST report", words.len());
+    Ok(BtstReport { passed: *passed, failures })
+}
+
 /// A test's lines: `ok` or `FAILED`, and under a failure what each failed
 /// check expected and got, the trap, what a test that must trap returned,
 /// or the diagnostics of a module that must not compile. The one test of
@@ -773,16 +884,28 @@ fn describe(name: &str, outcome: &Outcome) -> Vec<String> {
             lines.extend(failed_checks(report));
             lines
         }
+        Outcome::Btst(report) if report.failures.is_empty() => vec![format!("  ok      {name}")],
+        Outcome::Btst(report) => {
+            let failed = report.failures.len();
+            let checks = u64::from(report.passed) + failed as u64;
+            let mut lines = vec![format!("  FAILED  {name} ({failed} of {checks} checks)")];
+            for failure in &report.failures {
+                lines.push(format!("    {:?} / {:?}: {:?}", failure.group, failure.label, failure.message));
+                lines.push(format!("      expected {:?}, got {:?}", failure.expected, failure.actual));
+            }
+            lines
+        }
         Outcome::Broken(message) => vec![format!("  FAILED  {name}"), indent(message, 4)],
-        Outcome::Panicked => vec![format!("  ok      {name}")],
-        Outcome::Returned(lanes) => {
+        Outcome::Completed | Outcome::Panicked => vec![format!("  ok      {name}")],
+        Outcome::Returned(value) => {
             let mut lines = vec![format!("  FAILED  {name} (returned instead of trapping)")];
-            match decode(lanes) {
-                Ok(report) => {
-                    lines.push(format!("    its report: {} of {} checks failed", report.failures.len(), report.checks));
-                    lines.extend(failed_checks(&report));
-                }
-                Err(_) => lines.push(format!("    it returned {}", format_lanes(lanes))),
+            if let Value::ArrayF32(lanes) = value
+                && let Ok(report) = decode(lanes)
+            {
+                lines.push(format!("    its report: {} of {} checks failed", report.failures.len(), report.checks));
+                lines.extend(failed_checks(&report));
+            } else {
+                lines.push(format!("    it returned {}", format_value(value)));
             }
             lines
         }
@@ -817,8 +940,19 @@ fn explain(error: &anyhow::Error) -> String {
     chain.join("\n")
 }
 
-fn format_lanes(lanes: &[f32]) -> String {
-    let shown: Vec<String> = lanes.iter().take(64).map(f32::to_string).collect();
+fn format_value(value: &Value) -> String {
+    match value {
+        Value::Unit => "()".into(),
+        Value::Bool(value) => value.to_string(),
+        Value::U32(value) => value.to_string(),
+        Value::F32(value) => value.to_string(),
+        Value::ArrayF32(lanes) => format_lanes(lanes),
+        Value::ArrayU32(words) => format_lanes(words),
+    }
+}
+
+fn format_lanes(lanes: &[impl ToString]) -> String {
+    let shown: Vec<String> = lanes.iter().take(64).map(ToString::to_string).collect();
     let more =
         if lanes.len() > shown.len() { format!(", … {} more", lanes.len() - shown.len()) } else { String::new() };
     format!("[{}{more}]", shown.join(", "))

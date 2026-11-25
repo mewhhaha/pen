@@ -111,6 +111,33 @@ impl Drawing<'_> {
                 pass.set_vertex_buffer(if has_slot2 { 3 } else { 2 }, self.extra_attrs(mesh).slice(..));
                 if view == 0
                     && item.lod == 0
+                    && let (Some(slot), Some(dag)) = (entry.dag_slot, &mesh.meshlet_dag)
+                    && let Some(out) = self.dag_outputs.get(slot)
+                {
+                    pass.set_index_buffer(dag.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    if self.multi_draw_indirect {
+                        pass.multi_draw_indexed_indirect_count(
+                            &out.draws_buf,
+                            0,
+                            &out.draw_count_buf,
+                            0,
+                            dag.cluster_count,
+                        );
+                        if let Some(stats) = stats {
+                            stats.draw_calls += 1;
+                            stats.triangles += u64::from(lod.count / 3);
+                        }
+                    } else {
+                        for k in 0..dag.cluster_count {
+                            pass.draw_indexed_indirect(&out.draws_buf, u64::from(k) * 20);
+                        }
+                        if let Some(stats) = stats {
+                            stats.draw_calls += dag.cluster_count;
+                            stats.triangles += u64::from(lod.count / 3);
+                        }
+                    }
+                } else if view == 0
+                    && item.lod == 0
                     && let (Some(slot), Some(ml)) = (entry.meshlet_slot, &mesh.meshlets)
                     && let Some(slot_data) = self.meshlet_indirect.get(slot)
                 {
@@ -466,13 +493,18 @@ impl State {
             taa: frame.quality.taa || reflected > 0 || frame.quality.upscale,
             ..frame.quality
         };
-        // Translucent surfaces, particles and overlays draw after the opaque
-        // picture is misted, in a pass of their own; a frame without them draws
-        // the scene as one picture.
+        // Translucent surfaces, particles, overlays, 3D debug lines and JFA outlines draw
+        // after the opaque picture is misted, in a pass of their own; a frame without them
+        // draws the scene as one picture.
+        let line_scene = self.gather_line_scene(frame);
+        let has_3d_lines = line_scene.as_ref().is_some_and(|s| s.batch.has_3d());
+        let jfa_scene = self.gather_jfa_outlines(frame);
         let translucent = !scratch.translucent.is_empty()
             || !scratch.overlays.is_empty()
             || !scratch.emitters.is_empty()
-            || !scratch.ribbons.is_empty();
+            || !scratch.ribbons.is_empty()
+            || has_3d_lines
+            || jfa_scene.is_some();
         let mut opaque_mips = false;
         let mut opaque_depth = !scratch.emitters.is_empty() || !scratch.ribbons.is_empty();
         for &index in scratch.translucent.iter().chain(&scratch.overlays) {
@@ -568,7 +600,17 @@ impl State {
         }
         let restir_di_active =
             tlas_ready && frame.quality.ray_tracing >= 3 && super::wired_passes::has_active_point_spot_lights(frame);
-        self.encode_meshlet_culling_phase1(&device, &mut encoder, frame, scratch, &active_proj_for_trails, depth_mode)?;
+        #[allow(clippy::cast_precision_loss, reason = "viewport height in pixels")]
+        let dag_viewport_height = targets.size.1 as f32;
+        self.encode_meshlet_culling_phase1(
+            &device,
+            &mut encoder,
+            frame,
+            scratch,
+            &active_proj_for_trails,
+            dag_viewport_height,
+            depth_mode,
+        )?;
         let ready = &scratch.ready;
         let drawing = Drawing {
             assets: &self.assets,
@@ -582,6 +624,7 @@ impl State {
             morphed: self.morphing.output(),
             culling: &self.culling,
             meshlet_indirect: &self.meshlet_indirect,
+            dag_outputs: &self.meshlet_dag_outputs,
             multi_draw_indirect: self.device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT),
         };
         if let Some((vel_view, vel_depth)) = &targets.velocity {
@@ -680,7 +723,8 @@ impl State {
         // surfaces, particles or overlays then has its opaque picture misted, and
         // draws those over it in a second pass, with the mist and the opaque
         // picture to read.
-        let layered = !scratch.decals.is_empty() || !prepared_pbr_decals.is_empty();
+        let has_gpu_particles = self.has_active_gpu_particles(frame);
+        let layered = !scratch.decals.is_empty() || !prepared_pbr_decals.is_empty() || has_gpu_particles;
         let wants_meshlet_phase2 = self.wired.meshlet_phase1_used_hiz && !self.wired.meshlet_plan.is_empty();
         let scene_group = &self.scene_group.as_ref().unwrap().0;
         let lights = self.clusters.group();
@@ -758,7 +802,9 @@ impl State {
             )?;
         }
         let wants_hiz_build = self.hiz.enabled()
-            && ((self.culling.supported() && self.culling.from.is_some()) || self.wired.last_meshlet_cull_draws > 0);
+            && ((self.culling.supported() && self.culling.from.is_some())
+                || self.wired.last_meshlet_cull_draws > 0
+                || self.wired.last_meshlet_dag_draws > 0);
         if wants_hiz_build {
             let active_proj = jittered.unwrap_or(frame.projection);
             let active_vp = crate::matrix::multiply(&active_proj, &frame.view);
@@ -843,7 +889,11 @@ impl State {
             let decals = self.decals.get_or_insert_with(|| Decals::new(&device));
             let mut decal_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("decals"),
-                color_attachments: &[Some(targets.color(clear, false, prepared_pbr_decals.is_empty()))],
+                color_attachments: &[Some(targets.color(
+                    clear,
+                    false,
+                    prepared_pbr_decals.is_empty() && !has_gpu_particles,
+                ))],
                 timestamp_writes: self.timer.pass(Span::Scene),
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &targets.depth,
@@ -873,11 +923,27 @@ impl State {
                 &mut encoder,
                 frame,
                 &prepared_pbr_decals,
-                targets.color(clear, false, true),
+                targets.color(clear, false, !has_gpu_particles),
                 &targets.depth,
                 &targets.depth_only,
                 samples,
                 targets.size,
+                depth_mode,
+            )?;
+        }
+        if has_gpu_particles {
+            Self::encode_gpu_particles_wired(
+                &mut self.wired,
+                &mut self.built_ins,
+                &device,
+                &mut encoder,
+                frame,
+                &active_proj_for_trails,
+                targets.color(clear, false, true),
+                &targets.depth,
+                &targets.depth_only,
+                targets.size,
+                samples,
                 depth_mode,
             )?;
         }
@@ -929,7 +995,8 @@ impl State {
                 let has_after_oit = !fallback_translucent.is_empty()
                     || !scratch.emitters.is_empty()
                     || !scratch.ribbons.is_empty()
-                    || !scratch.overlays.is_empty();
+                    || !scratch.overlays.is_empty()
+                    || has_3d_lines;
                 {
                     let mut backdrop_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("translucent_backdrop"),
@@ -1000,6 +1067,20 @@ impl State {
                     ribbons::draw(&mut pass, self.ribbons.as_ref(), &scratch.ribbons);
                     let overlays = [(&scratch.overlays[..], Layer::Occluded), (&scratch.overlays[..], Layer::Visible)];
                     draw_layers(&mut pass, group, lights, &overlays, &mut stats);
+                    if let Some(lines) = &line_scene {
+                        Self::encode_lines_3d_wired(
+                            &mut self.wired,
+                            &device,
+                            &self.queue,
+                            &mut pass,
+                            lines,
+                            &frame.view,
+                            &active_proj_for_trails,
+                            targets.size,
+                            samples,
+                            depth_mode,
+                        )?;
+                    }
                 }
             } else {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1019,7 +1100,40 @@ impl State {
                 ribbons::draw(&mut pass, self.ribbons.as_ref(), &scratch.ribbons);
                 let overlays = [(&scratch.overlays[..], Layer::Occluded), (&scratch.overlays[..], Layer::Visible)];
                 draw_layers(&mut pass, group, lights, &overlays, &mut stats);
+                if let Some(lines) = &line_scene {
+                    Self::encode_lines_3d_wired(
+                        &mut self.wired,
+                        &device,
+                        &self.queue,
+                        &mut pass,
+                        lines,
+                        &frame.view,
+                        &active_proj_for_trails,
+                        targets.size,
+                        samples,
+                        depth_mode,
+                    )?;
+                }
             }
+        }
+        if let Some(jfa) = &jfa_scene {
+            Self::encode_jfa_outlines_wired(
+                &mut self.wired,
+                &mut self.built_ins,
+                &self.assets,
+                &device,
+                &self.queue,
+                &mut encoder,
+                frame,
+                catalog,
+                jfa,
+                &active_proj_for_trails,
+                &targets.scene,
+                &targets.depth_only,
+                targets.size,
+                samples,
+                depth_mode,
+            )?;
         }
         let has_filters = scratch.sprites.iter().any(|batch| batch.scene_filter);
         let wants_polish = super::wired_passes::WiredPasses::wants_post_polish(frame);
@@ -1111,6 +1225,16 @@ impl State {
         } else {
             self.post.as_mut().unwrap().finish(&mut self.built_ins, &mut encoder, frame, &output, &self.timer, &tables);
         }
+        let render2d_overlay_sdf = Self::encode_render2d_base_wired(
+            &mut self.wired,
+            &device,
+            &self.queue,
+            &mut encoder,
+            frame,
+            &output,
+            self.context.format,
+            (output_width, output_height),
+        )?;
         if !scratch.sprites.is_empty() {
             let layout = self.context.sprite_group.clone();
             let sprites = self.sprites.get_or_insert_with(|| Sprites::new(&device, layout));
@@ -1170,6 +1294,31 @@ impl State {
                     ..u32::try_from(scratch.sprite_order.len()).expect("bounded sprite count"),
                 self.timer.pass(Span::Overlay),
             );
+        }
+        if !render2d_overlay_sdf.is_empty() {
+            Self::encode_render2d_overlay_wired(
+                &mut self.wired,
+                &device,
+                &mut encoder,
+                &render2d_overlay_sdf,
+                &output,
+                self.context.format,
+                (output_width, output_height),
+            );
+        }
+        if let Some(lines) = &line_scene
+            && lines.batch.has_2d()
+        {
+            Self::encode_lines_2d_wired(
+                &mut self.wired,
+                &device,
+                &self.queue,
+                &mut encoder,
+                lines,
+                &output,
+                self.context.format,
+                (output_width, output_height),
+            )?;
         }
         if !frame.loading {
             self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);
@@ -1369,8 +1518,20 @@ impl State {
             morphed: self.morphing.output(),
             culling: &self.culling,
             meshlet_indirect: &[],
+            dag_outputs: &[],
             multi_draw_indirect: false,
         };
+        let split_line_scene = self.gather_line_scene(frame);
+        let split_render2d_overlay = Self::encode_render2d_base_wired(
+            &mut self.wired,
+            &device,
+            &self.queue,
+            &mut encoder,
+            frame,
+            &output,
+            format,
+            (output_width, output_height),
+        )?;
         let ready = &scratch.ready;
         scratch.insets.sort_by_key(|&(index, _)| frame.insets[index].after_sprites);
         let mut cursor = 0;
@@ -1415,6 +1576,31 @@ impl State {
                     ..u32::try_from(scratch.sprite_order.len()).expect("bounded sprite count"),
                 self.timer.pass(Span::Overlay),
             );
+        }
+        if !split_render2d_overlay.is_empty() {
+            Self::encode_render2d_overlay_wired(
+                &mut self.wired,
+                &device,
+                &mut encoder,
+                &split_render2d_overlay,
+                &output,
+                format,
+                (output_width, output_height),
+            );
+        }
+        if let Some(lines) = &split_line_scene
+            && lines.batch.has_2d()
+        {
+            Self::encode_lines_2d_wired(
+                &mut self.wired,
+                &device,
+                &self.queue,
+                &mut encoder,
+                lines,
+                &output,
+                format,
+                (output_width, output_height),
+            )?;
         }
         if !frame.loading {
             self.cover(&mut encoder, &output, frame, now, (output_width, output_height), false);

@@ -1698,3 +1698,357 @@ fn tier3_restir_di_many_light_shadows_sharc_and_two_phase_meshlet_disocclusion_w
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() {
+    use pen_render::{
+        Camera2d, GPU_PARTICLES_EXT_TAG, GpuParticle, GpuParticleScene, JfaOutlineScene, JfaOutlineTarget,
+        LINES_EXT_TAG, LineBatch, LineLayer, LineScene, LineStyle, OutlineStyle, RENDER2D_EXT_TAG,
+        RadianceCascades2dConfig, RadianceCascades2dLayer, Scene2d, Scene2dEmitter, SdfShape, Sprite2d, SpriteLayer2d,
+        TileCell, TilemapLayer2d, TilemapUniform, XRayStyle,
+    };
+
+    let Some((device, queue)) = common::featured_device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pen-live-five-systems-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Dense 1024-triangle UV sphere (>=768 tris -> continuous MeshletDagGpu!) + unit quad + cube.
+    let (stacks, slices) = (16u32, 32u32);
+    let (mut pos, mut norm, mut uv, mut idx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for r in 0..=stacks {
+        let v = r as f32 / stacks as f32;
+        let phi = v * std::f32::consts::PI;
+        for c in 0..=slices {
+            let u = c as f32 / slices as f32;
+            let theta = u * std::f32::consts::TAU;
+            let (x, y, z) = (phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin());
+            pos.extend_from_slice(&[x, y, z]);
+            norm.extend_from_slice(&[x, y, z]);
+            uv.extend_from_slice(&[u, v]);
+        }
+    }
+    let stride = slices + 1;
+    for r in 0..stacks {
+        for c in 0..slices {
+            let (i0, i1, i2, i3) = (r * stride + c, r * stride + c + 1, (r + 1) * stride + c, (r + 1) * stride + c + 1);
+            idx.extend_from_slice(&[i0, i1, i2, i1, i3, i2]);
+        }
+    }
+    let sphere_json = json!({ "positions": pos, "normals": norm, "uvs": uv, "indices": idx });
+    let quad_json = json!({
+        "positions": [-1.0, -1.0, 0.0,  1.0, -1.0, 0.0,  1.0, 1.0, 0.0,  -1.0, 1.0, 0.0],
+        "normals": [0.0, 0.0, 1.0,  0.0, 0.0, 1.0,  0.0, 0.0, 1.0,  0.0, 0.0, 1.0],
+        "uvs": [0.0, 1.0,  1.0, 1.0,  1.0, 0.0,  0.0, 0.0],
+        "indices": [0, 1, 2, 0, 2, 3]
+    });
+    std::fs::write(dir.join("sphere_dag.mesh.json"), serde_json::to_vec(&sphere_json).unwrap()).unwrap();
+    std::fs::write(dir.join("quad.mesh.json"), serde_json::to_vec(&quad_json).unwrap()).unwrap();
+    std::fs::write(dir.join("simple.wgsl"), SIMPLE_SHADER).unwrap();
+    write_solid_png(&dir.join("white.png"), [255, 255, 255, 255]);
+
+    let mats = [
+        ("blue.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.08, 0.25, 0.9, 1.0], "lighting": "unlit" })),
+        ("red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.9, 0.08, 0.08, 1.0], "lighting": "unlit" })),
+    ];
+    for (name, val) in &mats {
+        std::fs::write(dir.join(name), val.to_string()).unwrap();
+    }
+    let catalog = Catalog {
+        meshes: vec!["sphere_dag.mesh.json".into(), "quad.mesh.json".into()],
+        materials: mats.iter().map(|(n, _)| (*n).into()).collect(),
+        sounds: vec![],
+    };
+    let mut renderer = Renderer::new(
+        device.clone(),
+        queue.clone(),
+        RendererOptions {
+            format: common::FORMAT,
+            display: pen_render::Display::SDR,
+            assets: dir.clone(),
+            veil: None,
+            pipeline_cache: None,
+        },
+    )
+    .unwrap();
+    let mut target = common::Offscreen::new(&device, 128);
+    let proj_fwd = pen_render::perspective_forward_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
+    let proj_rev = perspective_reversed_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, None);
+
+    // 1) Continuous Meshlet DAG LOD culling in BOTH Forward-Z & Reversed-Z + fallback when disabled.
+    let sphere_draw = Draw {
+        mesh: 0,
+        material: 0,
+        transform: [
+            1.2, 0.0, 0.0, 0.0,
+            0.0, 1.2, 0.0, 0.0,
+            0.0, 0.0, 1.2, 0.0,
+            0.0, 0.0, -4.0, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    };
+    for (label, proj) in [("ForwardZ", proj_fwd), ("ReversedZ", proj_rev)] {
+        let mut f = common::frame(vec![sphere_draw.clone()]);
+        f.projection = proj;
+        f.quality.sky = false;
+        f.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        wait_ready(&mut renderer, &f, &catalog, &mut target);
+        assert_eq!(renderer.last_meshlet_dag_draws(), 1, "{label}: dense sphere must use continuous DAG LODs");
+        let mid = common::middle(&device, &queue, &target.0);
+        assert!(mid[2] > 140 && mid[0] < 90, "{label}: DAG sphere center must render blue: {mid:?}");
+    }
+    renderer.set_dag_lod_error_threshold(-1.0);
+    let mut f_nodag = common::frame(vec![sphere_draw.clone()]);
+    f_nodag.projection = proj_fwd;
+    f_nodag.quality.sky = false;
+    f_nodag.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    wait_ready(&mut renderer, &f_nodag, &catalog, &mut target);
+    assert_eq!(renderer.last_meshlet_dag_draws(), 0);
+    assert_eq!(renderer.last_meshlet_cull_draws(), 1, "disabling DAG must fall back to meshlet culling");
+    renderer.set_dag_lod_error_threshold(1.5);
+
+    // 2) Live JFA Silhouette Outlines (both 1x and MSAA 4x depth-resolve path!).
+    let center_quad = Draw {
+        mesh: 1,
+        material: 0,
+        transform: [
+            0.45, 0.0, 0.0, 0.0,
+            0.0, 0.45, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, -2.0, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    };
+    renderer.set_jfa_outlines(JfaOutlineScene {
+        styles: vec![OutlineStyle {
+            color: [2.0, 1.8, 0.05, 1.0],
+            occluded_color: [0.1, 0.5, 0.6, 1.0],
+            width_px: 5.0,
+            feather_px: 1.0,
+            fill_alpha: 0.0,
+        }],
+        targets: vec![JfaOutlineTarget { draw_index: 0, style_index: 0 }],
+        max_radius_px: 8,
+        depth_bias: 1e-4,
+    });
+    for msaa in [1u32, 4u32] {
+        let mut f_jfa = common::frame(vec![center_quad.clone()]);
+        f_jfa.projection = proj_fwd;
+        f_jfa.quality.sky = false;
+        f_jfa.quality.msaa = msaa;
+        f_jfa.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        wait_ready(&mut renderer, &f_jfa, &catalog, &mut target);
+        let px = common::pixels(&device, &queue, &target.0);
+        let at = |x: u32, y: u32| px[(y * 128 + x) as usize];
+        // Center (64,64) stays blue interior; quad half-width at z=-2 with fov=90 deg is 0.45/2 * 64 = 14.4 px -> x in [50..78].
+        let interior = at(64, 64);
+        assert!(interior[2] > 140 && interior[0] < 90, "MSAA {msaa}: JFA interior must stay blue: {interior:?}");
+        // Ring pixel 2 px right of quad edge (x=81, y=64) must glow bright yellow!
+        let ring = at(81, 64);
+        assert!(ring[0] > 180 && ring[1] > 150 && ring[2] < 90, "MSAA {msaa}: JFA ring must be yellow: {ring:?}");
+        // Far exterior (110, 64) must remain black.
+        let far = at(110, 64);
+        assert!(far[0] < 10 && far[1] < 10 && far[2] < 10, "MSAA {msaa}: far background must stay black: {far:?}");
+    }
+    renderer.clear_jfa_outlines();
+
+    // 3) Live 3D Depth-Tested + X-Ray Lines & 2D Screen-Space Lines (both API & LINES_EXT_TAG).
+    let right_blocker = Draw {
+        mesh: 1,
+        material: 1,
+        transform: [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 2.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            1.0, 0.0, -1.5, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    };
+    let mut batch = LineBatch::new();
+    batch.segment(
+        [-2.0, 0.0, -2.5],
+        [2.0, 0.0, -2.5],
+        [0.0, 1.6, 1.6, 1.0],
+        [0.0, 1.6, 1.6, 1.0],
+        LineStyle { width_px: 6.0, layer: LineLayer::XRay, ..Default::default() },
+    );
+    batch.segment_2d(
+        [8.0, 12.0],
+        [120.0, 12.0],
+        [1.0, 1.0, 0.0, 1.0],
+        [1.0, 1.0, 0.0, 1.0],
+        LineStyle { width_px: 4.0, ..Default::default() },
+    );
+    renderer.set_line_scene(LineScene {
+        batch,
+        xray: XRayStyle { alpha: 0.45, desaturate: 0.0, solid_line_dash_px: None },
+    });
+    let mut f_lines = common::frame(vec![right_blocker.clone()]);
+    f_lines.projection = proj_fwd;
+    f_lines.quality.sky = false;
+    f_lines.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    wait_ready(&mut renderer, &f_lines, &catalog, &mut target);
+    let px = common::pixels(&device, &queue, &target.0);
+    let at = |x: u32, y: u32| px[(y * 128 + x) as usize];
+    let left_line = at(32, 64);
+    let right_xray = at(96, 64);
+    let right_wall_only = at(96, 96);
+    let top_2d = at(64, 12);
+    assert!(left_line[1] > 180 && left_line[2] > 180, "unoccluded 3D line must be bright cyan: {left_line:?}");
+    assert!(
+        right_xray[1] > right_wall_only[1] + 25 && right_xray[2] > right_wall_only[2] + 25,
+        "X-ray occluded portion must shine through red blocker: xray={right_xray:?} wall={right_wall_only:?}"
+    );
+    assert!(top_2d[0] > 200 && top_2d[1] > 200 && top_2d[2] < 40, "2D overlay line must be yellow: {top_2d:?}");
+    renderer.clear_line_scene();
+
+    // Verify LINES_EXT_TAG also renders a 2D line via RenderFrame::extensions alone.
+    let mut f_line_ext = common::frame(vec![]);
+    f_line_ext.projection = proj_fwd;
+    f_line_ext.quality.sky = false;
+    f_line_ext.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    f_line_ext.extensions.push(Extension {
+        tag: LINES_EXT_TAG,
+        values: vec![
+            0.3, 0.0, // xray_alpha, desaturate
+            10.0, 64.0, 0.0, 6.0, // p0, width_px
+            118.0, 64.0, 0.0, 0.0, // p1, dash_len
+            0.0, 1.0, 0.0, 1.0, // green
+            0.0, 1.0, 0.0, 1.0, // gap, feather, layer, is_2d=1
+        ],
+    });
+    renderer.submit(&f_line_ext, &catalog, &mut target).unwrap();
+    let mid_ext_line = common::middle(&device, &queue, &target.0);
+    assert!(mid_ext_line[1] > 180 && mid_ext_line[0] < 40, "LINES_EXT_TAG must draw green 2D line: {mid_ext_line:?}");
+
+    // 4) Live GPU Mesh Particles (via API & GPU_PARTICLES_EXT_TAG).
+    let mut p_scene = GpuParticleScene {
+        max_particles: 64,
+        gravity: [0.0, -25.0, 0.0],
+        dt: 1.0 / 30.0,
+        curl_strength: 0.0,
+        depth_collide: true,
+        ambient: 1.2,
+        ..GpuParticleScene::default()
+    };
+    p_scene.pending_seed = Some(vec![GpuParticle::primary(
+        [0.0, 0.0, -2.2],
+        [0.0, 0.0, 0.0],
+        5.0,
+        0.9,
+        [1.8, 0.6, 0.05, 1.0],
+    )]);
+    renderer.set_gpu_particle_scene(p_scene);
+    let mut f_gp = common::frame(vec![]);
+    f_gp.projection = proj_fwd;
+    f_gp.quality.sky = false;
+    f_gp.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    renderer.submit(&f_gp, &catalog, &mut target).unwrap();
+    let p_mid = common::middle(&device, &queue, &target.0);
+    assert!(p_mid[0] > 140 && p_mid[1] > 50 && p_mid[2] < 60, "live GPU particle cube must render orange: {p_mid:?}");
+    renderer.clear_gpu_particle_scene();
+
+    // Smoke-check GPU_PARTICLES_EXT_TAG extension decoding as well.
+    let mut f_gp_ext = f_gp.clone();
+    let mut ext_vals = vec![
+        64.0, 1.0 / 60.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, // max, dt, gravity, drag, curl
+        0.5, 0.2, 0.3, 17.0, 0.0, 2.0, 0.5, 1.2, // rest, fric, thick, flags(collide+reseed), subemit, ambient
+    ];
+    ext_vals.extend_from_slice(&[
+        0.0, 0.0, -2.2, 0.0, // pos_age
+        0.0, 0.0, 0.0, 5.0, // vel_life
+        0.1, 1.8, 0.2, 1.0, // green color
+        0.9, 0.0, 0.0, 0.0, // size_rot_gen
+    ]);
+    f_gp_ext.extensions.push(Extension { tag: GPU_PARTICLES_EXT_TAG, values: ext_vals });
+    renderer.submit(&f_gp_ext, &catalog, &mut target).unwrap();
+    let p_ext_mid = common::middle(&device, &queue, &target.0);
+    assert!(p_ext_mid[1] > 140 && p_ext_mid[0] < 70, "GPU_PARTICLES_EXT_TAG must render green cube: {p_ext_mid:?}");
+
+    // 5) Live First-Class 2D Renderer Suite (Tilemap + Sprites2d + 2D Radiance Cascades GI + SDF UI + RENDER2D_EXT_TAG).
+    let white_atlas = renderer.upload_2d_texture_rgba8(2, 2, &[255u8; 16]);
+    let cells = renderer.upload_tilemap_cells(&[TileCell::new(1, false, false, false, 1); 4]);
+    let cam2d = Camera2d { center: [0.0, 0.0], zoom: 1.0, rotation: 0.0, viewport: [128.0, 128.0] };
+    renderer.set_scene_2d(Scene2d {
+        camera: cam2d,
+        tilemaps: vec![TilemapLayer2d {
+            uniform: TilemapUniform {
+                camera_vp: cam2d.world_to_ndc(),
+                origin_and_tile_size: [-64.0, 64.0, 64.0, 64.0],
+                grid_size_and_atlas: [2, 2, 1, 1],
+                anim_time_and_tint: [0.0, 1.0, 0.0, 0.0, 0.9, 0.9, 0.9, 1.0],
+            },
+            cells,
+            atlas: white_atlas.clone(),
+            sampler: None,
+        }],
+        sprite_layers: vec![SpriteLayer2d {
+            sprites: vec![Sprite2d {
+                pos: [-32.0, 0.0],
+                size: [12.0, 12.0],
+                color: [1.0, 1.0, 1.0, 1.0],
+                ..Default::default()
+            }],
+            atlas: white_atlas,
+            sampler: None,
+            y_sort: true,
+        }],
+        radiance_cascades: Some(RadianceCascades2dLayer {
+            emitters: vec![
+                Scene2dEmitter::Circle { center: [24.0, 64.0], radius: 10.0, material: [5.0, 3.5, 1.0, 1.0] },
+                Scene2dEmitter::Rect { rect: [60.0, 16.0, 10.0, 96.0], material: [0.0, 0.0, 0.0, 1.0] },
+            ],
+            scene_view: None,
+            config: RadianceCascades2dConfig::default(),
+            composite_weights: [0.0, 1.0, 0.0],
+            opaque_backdrop: true,
+        }),
+        sdf_shapes: vec![SdfShape {
+            rect: [8.0, 8.0, 32.0, 20.0],
+            corner_radii: [6.0; 4],
+            fill_color: [0.1, 0.2, 0.95, 1.0],
+            border_color: [1.0, 1.0, 1.0, 1.0],
+            border_width_px: 2.0,
+            ..Default::default()
+        }],
+        sdf_overlay_shapes: vec![],
+    });
+    let mut f_2d = common::frame(vec![]);
+    f_2d.projection = proj_fwd;
+    f_2d.quality.sky = false;
+    f_2d.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    // Also attach an SDF overlay badge in the bottom-right via RENDER2D_EXT_TAG!
+    f_2d.extensions.push(Extension {
+        tag: RENDER2D_EXT_TAG,
+        values: vec![
+            92.0, 92.0, 28.0, 28.0, // rect
+            4.0, 4.0, 4.0, 4.0, // corner_radii
+            0.0, 0.95, 0.2, 1.0, // fill_color (green)
+            0.0, 0.95, 0.2, 1.0, // fill_color_end
+            0.0, 0.0, 0.0, 0.0, // border_color
+            0.0, 0.0, 0.0, 0.0, // shadow_color
+            16.0, 0.0, 0.0, 0.0, // kind=16 (overlay rounded rect), border, grad
+            0.0, 0.0, 0.0, 0.0, // shadow_off, blur, clip_r
+            0.0, 0.0, 0.0, 0.0, // clip_rect
+        ],
+    });
+    renderer.submit(&f_2d, &catalog, &mut target).unwrap();
+    let px_2d = common::pixels(&device, &queue, &target.0);
+    let at2d = |x: u32, y: u32| px_2d[(y * 128 + x) as usize];
+    let rc_lit = at2d(42, 64);
+    let rc_umbra = at2d(90, 64);
+    let sdf_card = at2d(24, 18);
+    let sdf_ext = at2d(106, 106);
+    assert!(rc_lit[0] > 120 && rc_umbra[0] < 15, "2D RC GI must light left and shadow right behind wall: lit={rc_lit:?} umbra={rc_umbra:?}");
+    assert!(sdf_card[2] > 180 && sdf_card[0] < 60, "SDF UI card must render blue fill: {sdf_card:?}");
+    assert!(sdf_ext[1] > 180 && sdf_ext[0] < 40, "RENDER2D_EXT_TAG SDF badge must render green: {sdf_ext:?}");
+    renderer.clear_scene_2d();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

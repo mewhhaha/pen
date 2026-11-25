@@ -9,8 +9,12 @@
 
 mod ddgi;
 mod decals_oit;
+mod gpu_particles;
+mod jfa_outline;
+mod lines;
 mod meshlets;
 mod post_split;
+mod render2d;
 mod rt;
 mod sky_env;
 
@@ -36,13 +40,27 @@ use std::sync::Arc;
 
 pub(super) use ddgi::has_active_point_spot_lights;
 pub(super) use decals_oit::PreparedPbrDecalBatch;
+pub use gpu_particles::GpuParticleScene;
+pub(super) use gpu_particles::GpuParticleWiredState;
+pub use jfa_outline::{JfaOutlineScene, JfaOutlineTarget};
+pub(super) use jfa_outline::JfaOutlineWiredState;
+pub use lines::LineScene;
+pub(super) use lines::LineWiredState;
 pub(super) use post_split::SplitViewSlot;
+pub use render2d::{RadianceCascades2dLayer, Scene2d, SpriteLayer2d, TilemapLayer2d};
+pub(super) use render2d::Render2dWiredState;
 pub(super) use sky_env::EnvPipelines;
 
 /// Built-in optional `RenderFrame::extensions` tags driving outdoor GPU environment passes from Blot.
 pub const ENV_TERRAIN_EXT_TAG: u32 = 65_001;
 pub const ENV_WATER_EXT_TAG: u32 = 65_002;
 pub const ENV_FOLIAGE_EXT_TAG: u32 = 65_003;
+/// Built-in optional `RenderFrame::extensions` tags for GPU mesh particles, antialiased lines,
+/// JFA silhouette outlines, and the first-class 2D renderer suite.
+pub const GPU_PARTICLES_EXT_TAG: u32 = 65_004;
+pub const LINES_EXT_TAG: u32 = 65_005;
+pub const JFA_OUTLINE_EXT_TAG: u32 = 65_006;
+pub const RENDER2D_EXT_TAG: u32 = 65_007;
 
 /// CDLOD heightfield terrain descriptor attached to [`EnvironmentScene`].
 pub struct EnvironmentTerrain {
@@ -100,6 +118,18 @@ pub(super) struct PlannedMeshletDraw {
     pub backface_cull: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct DagLodSettings {
+    pub enabled: bool,
+    pub pixel_error_threshold: f32,
+}
+
+impl Default for DagLodSettings {
+    fn default() -> Self {
+        Self { enabled: true, pixel_error_threshold: 1.5 }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct WiredPasses {
     pub physical_atmosphere: Option<PhysicalAtmosphere>,
@@ -128,9 +158,16 @@ pub(super) struct WiredPasses {
     pub meshlet_phase1_used_hiz: bool,
     pub last_meshlet_phase2_active: bool,
     pub meshlet_plan: Vec<PlannedMeshletDraw>,
+    pub meshlet_dag_culler: Option<crate::meshlet_dag::MeshletDagCuller>,
+    pub last_meshlet_dag_draws: u32,
+    pub dag_lod: DagLodSettings,
     pub env_pipelines: HashMap<(u32, bool), EnvPipelines>,
     pub env_scene: Option<EnvironmentScene>,
     pub ext_terrain_hm: Option<(u64, TerrainHeightmap)>,
+    pub gpu_particles: GpuParticleWiredState,
+    pub lines: LineWiredState,
+    pub jfa_outline: JfaOutlineWiredState,
+    pub render2d: Render2dWiredState,
     pub rcas: Option<RcasSharpener>,
     pub post_fx: Option<PostFxPass>,
     pub split_screen: Option<(wgpu::TextureFormat, SplitScreenCompositor)>,

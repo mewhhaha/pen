@@ -78,7 +78,9 @@ pub(crate) use timing::{GpuTimer, Span};
 pub use validate::validate_frame;
 pub use wired_passes::{
     ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentFoliage, EnvironmentScene,
-    EnvironmentTerrain,
+    EnvironmentTerrain, GPU_PARTICLES_EXT_TAG, GpuParticleScene, JFA_OUTLINE_EXT_TAG, JfaOutlineScene,
+    JfaOutlineTarget, LINES_EXT_TAG, LineScene, RENDER2D_EXT_TAG, RadianceCascades2dLayer, Scene2d, SpriteLayer2d,
+    TilemapLayer2d,
 };
 
 pub(crate) fn velocity_sentinel_bytes() -> [u8; 4] {
@@ -144,6 +146,8 @@ pub(crate) struct MeshAsset {
     rt_source: Option<Arc<RtMeshSource>>,
     /// LOD0 meshlet clusters for GPU frustum/backface/Hi-Z cluster culling.
     meshlets: Option<MeshletGpuAsset>,
+    /// Multi-level continuous meshlet DAG for GPU screen-space error LOD cut selection.
+    meshlet_dag: Option<crate::meshlet_dag::MeshletDagGpu>,
 }
 
 pub(crate) struct MeshMorphs {
@@ -253,6 +257,7 @@ impl MeshAsset {
             + self.morphs.as_ref().map_or(0, |m| m.deltas.size())
             + self.instances.as_ref().map_or(0, |i| i.buffer.size())
             + self.meshlets.as_ref().map_or(0, |ml| ml.indices.size() + ml.descriptors.size())
+            + self.meshlet_dag.as_ref().map_or(0, |d| d.clusters_buf.size() + d.index_buf.size())
     }
 }
 
@@ -539,6 +544,8 @@ struct ReadyEntry {
     morph: Option<(u64, u64)>,
     /// Optional GPU meshlet-culled indirect buffer slot for LOD0 main-camera draws.
     meshlet_slot: Option<usize>,
+    /// Optional GPU continuous meshlet DAG LOD cut output slot for LOD0 main-camera draws.
+    dag_slot: Option<usize>,
     persistent: bool,
 }
 
@@ -627,6 +634,7 @@ struct Drawing<'a> {
     morphed: Option<&'a wgpu::Buffer>,
     culling: &'a GpuCulling,
     meshlet_indirect: &'a [MeshletIndirectSlot],
+    dag_outputs: &'a [crate::meshlet_dag::MeshletDagCullOutput],
     multi_draw_indirect: bool,
 }
 
@@ -866,6 +874,8 @@ pub(crate) struct State {
     wired: wired_passes::WiredPasses,
     // Indirect draw-command & phase-2 candidate buffers populated by two-phase GPU meshlet culling.
     meshlet_indirect: Vec<MeshletIndirectSlot>,
+    // Indirect draw-command outputs populated by continuous meshlet DAG LOD cut culling.
+    meshlet_dag_outputs: Vec<crate::meshlet_dag::MeshletDagCullOutput>,
     instance_data: Vec<f32>,
     instance_uploads: instance_upload::Uploads,
     last_stats: RenderStats,
@@ -1266,6 +1276,7 @@ impl State {
             tonemap: crate::tonemap::TonemapOperator::Shoulder,
             wired: wired_passes::WiredPasses::default(),
             meshlet_indirect: Vec::new(),
+            meshlet_dag_outputs: Vec::new(),
             instance_data: vec![0.0; 20],
             instance_uploads: instance_upload::Uploads::default(),
             last_stats: RenderStats::default(),
@@ -1759,12 +1770,99 @@ impl State {
         self.wired.env_scene = None;
     }
 
+    pub fn set_gpu_particle_scene(&mut self, scene: GpuParticleScene) {
+        self.wired.gpu_particles.scene = Some(scene);
+    }
+
+    pub fn seed_gpu_particles(&mut self, particles: Vec<crate::gpu_particles::GpuParticle>) {
+        if let Some(scene) = self.wired.gpu_particles.scene.as_mut() {
+            scene.pending_seed = Some(particles);
+        } else {
+            self.wired.gpu_particles.scene =
+                Some(GpuParticleScene { pending_seed: Some(particles), ..GpuParticleScene::default() });
+        }
+    }
+
+    pub fn clear_gpu_particle_scene(&mut self) {
+        self.wired.gpu_particles.scene = None;
+        self.wired.gpu_particles.system = None;
+        self.wired.gpu_particles.config_key = None;
+        self.wired.gpu_particles.last_seed_snapshot.clear();
+    }
+
+    pub fn set_line_scene(&mut self, scene: LineScene) {
+        self.wired.lines.scene = Some(scene);
+    }
+
+    pub fn clear_line_scene(&mut self) {
+        self.wired.lines.scene = None;
+    }
+
+    pub fn set_jfa_outlines(&mut self, scene: JfaOutlineScene) {
+        self.wired.jfa_outline.scene = Some(scene);
+    }
+
+    pub fn clear_jfa_outlines(&mut self) {
+        self.wired.jfa_outline.scene = None;
+    }
+
+    pub fn upload_tilemap_cells(&self, cells: &[crate::render2d::TileCell]) -> Arc<wgpu::Buffer> {
+        Arc::new(crate::render2d::TilemapPass::upload_cells(&self.device, cells))
+    }
+
+    pub fn upload_2d_texture_rgba8(&self, width: u32, height: u32, rgba: &[u8]) -> wgpu::TextureView {
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("render2d_rgba8_texture"),
+            size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            tex.as_image_copy(),
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width.max(1) * 4),
+                rows_per_image: Some(height.max(1)),
+            },
+            wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        );
+        tex.create_view(&Default::default())
+    }
+
+    pub fn set_scene_2d(&mut self, scene: Scene2d) {
+        self.wired.render2d.scene = Some(scene);
+    }
+
+    pub fn clear_scene_2d(&mut self) {
+        self.wired.render2d.scene = None;
+    }
+
     pub fn last_meshlet_cull_draws(&self) -> u32 {
         self.wired.last_meshlet_cull_draws
     }
 
     pub fn last_meshlet_phase2_active(&self) -> bool {
         self.wired.last_meshlet_phase2_active
+    }
+
+    pub fn set_dag_lod_error_threshold(&mut self, pixels: f32) {
+        self.wired.dag_lod.enabled = pixels >= 0.0;
+        if pixels >= 0.0 {
+            self.wired.dag_lod.pixel_error_threshold = pixels;
+        }
+    }
+
+    pub fn dag_lod_error_threshold(&self) -> f32 {
+        self.wired.dag_lod.pixel_error_threshold
+    }
+
+    pub fn last_meshlet_dag_draws(&self) -> u32 {
+        self.wired.last_meshlet_dag_draws
     }
 
     pub fn set_tonemap(&mut self, operator: crate::tonemap::TonemapOperator) {

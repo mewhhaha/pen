@@ -937,6 +937,49 @@ shader adds `MSDF_WGSL` and calls `msdf_coverage(msdf_median(field.rgb), uv,
 range, size)`, which smooths the edge over one screen pixel whatever the
 magnification.
 
+### Extended live rendering passes (`wired_passes/*`)
+
+Beyond the core protocol packet, `Renderer::draw` runs five additional GPU
+rendering systems driven either by direct `Renderer` setters or optional
+`RenderFrame::extensions` tags (preserving ABI 8 with zero wire changes):
+
+- **Continuous Meshlet DAG LODs (`meshlet_dag.rs`, `wired_passes/meshlets.rs`)**:
+  static LOD0 meshes with `>= 768` non-degenerate triangles build an
+  endpoint-preserving multi-level `MeshletDagGpu` alongside single-level
+  meshlets. `MeshletDagCuller` selects a seamless screen-space error cut on the
+  GPU (default `1.5 px`, configurable via `Renderer::set_dag_lod_error_threshold`;
+  values `< 0` fall back to two-phase Hi-Z meshlet culling) and draws via
+  `multi_draw_indexed_indirect_count` (or indirect draw loop fallback).
+- **Stateful GPU Mesh Particles (`gpu_particles.rs`, `wired_passes/gpu_particles.rs`)**:
+  3-pass race-free compute simulation (`simulate_step` -> `apply_spawns` ->
+  `compact_alive`) with 3D curl turbulence, swept depth-buffer bounce collisions
+  against resolved `R32Float` opaque depth, GPU dead-slot reclamation, and
+  `draw_indexed_indirect` 3D mesh instancing inside the HDR scene pass. Driven
+  by `Renderer::set_gpu_particle_scene` / `seed_gpu_particles` or
+  `GPU_PARTICLES_EXT_TAG` (`65_004`).
+- **3D/2D Antialiased Lines & X-Ray Debug (`lines.rs`, `wired_passes/lines.rs`)**:
+  quad-extruded capsule-SDF polylines with homogeneous near/far clipping,
+  analytic box-filtered dashing, Forward-Z & Reversed-Z depth testing, dimmed
+  occluded X-ray pass, always-on-top 3D layer, 1px hardware `LineList` pass,
+  and a color-only 2D viewport overlay layer. Driven by
+  `Renderer::set_line_scene` or `LINES_EXT_TAG` (`65_005`).
+- **Per-Object JFA Silhouette Outlines (`jfa_outline.rs`, `wired_passes/jfa_outline.rs`)**:
+  256-style `R32Uint` entity mask pass (supporting both single-sampled depth
+  and MSAA-resolved `R32Float` depth occlusion tagging in Forward-Z &
+  Reversed-Z), `O(log2 R)` Jump-Flood + JFA+1 Euclidean Voronoi compute passes
+  in portable storage buffers, and crisp antialiased alpha compositing onto the
+  HDR scene before tonemapping. Driven by `Renderer::set_jfa_outlines` or
+  `JFA_OUTLINE_EXT_TAG` (`65_006`).
+- **First-Class 2D Renderer Suite (`render2d/`, `wired_passes/render2d.rs`)**:
+  world-space rotated/Y-sorted/9-sliced sprites (`Sprites2dPass`), single-draw
+  chunked GPU tilemaps with flip/rot90/frame animation (`TilemapPass`),
+  resolution-independent analytic vector SDF UI shapes with per-corner radii,
+  linear/radial gradients, crisp borders, Abramowitz & Stegun `erfc` drop
+  shadows, and inline rounded clip rects (`SdfShapePass`), and multi-cascade 2D
+  Radiance Cascades global illumination with bilinear-fix ray marching and zero
+  wall light leak (`RadianceCascades2d`). Driven by `Renderer::set_scene_2d` or
+  `RENDER2D_EXT_TAG` (`65_007`).
+
 WGSL lives in `src/shaders/`. A `${name}` in a template is filled in with
 `str::replace`, for example the sample count or the shared `toned` function.
 Material shaders are assets, read from the asset root.

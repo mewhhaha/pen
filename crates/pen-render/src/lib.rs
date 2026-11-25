@@ -25,8 +25,10 @@ mod grade;
 mod graph;
 pub mod hdri;
 mod inspect;
+pub mod jfa_outline;
 pub mod lightmap;
 mod lights;
+pub mod lines;
 mod loader;
 mod local_shadows;
 mod matrix;
@@ -42,6 +44,7 @@ mod post;
 pub mod post_fx;
 mod prefetch;
 pub mod ray_tracing;
+pub mod render2d;
 pub mod render_targets;
 mod renderer;
 pub mod restir;
@@ -95,11 +98,19 @@ pub use hdri::{DEFAULT_HDRI_FACE_SIZE, DEFAULT_HDRI_SAMPLES, HdriCubemap, HdriIm
 pub use inspect::{
     TextureInfo, inspect_material, inspect_material_base_texture, inspect_mesh, inspect_texture, shader_draws_sprites,
 };
+pub use jfa_outline::{
+    JFA_OUTLINE_WGSL, JfaOutlinePass, MeshMaskParams, OUTLINE_OCCLUDED_BIT, OUTLINE_STYLE_CAPACITY, OutlineStyle,
+    PreparedMeshMask,
+};
 pub use lightmap::{
     BakedLightmap, GpuLightmapBaker, LIGHTMAP_BAKE_WGSL, LightmapBakeParams, LightmapTriangle, PackedLightmapMesh,
     pack_lightmap_uv2,
 };
 pub use lights::LIGHTS_WGSL;
+pub use lines::{
+    LINES_WGSL, LineBatch, LineFrame, LineLayer, LineRenderer, LineSegmentGpu, LineStyle, LineVertex, PreparedLines,
+    XRayStyle,
+};
 pub use meshlet_dag::{
     DagClusterGpu, MESHLET_DAG_CUT_WGSL, MeshletDagConfig, MeshletDagCullOutput, MeshletDagCullParams,
     MeshletDagCuller, MeshletDagGpu, MeshletDagMesh, build_meshlet_dag,
@@ -131,6 +142,10 @@ pub use sharc::{
     SharcConfig, SharcParams,
 };
 pub use svgf::{SVGF_WGSL, SvgfDenoiser, SvgfInputs, SvgfParams};
+pub use render2d::{
+    Camera2d, Draw2d, RadianceCascades2d, RadianceCascades2dConfig, Scene2dEmitter, SdfShape, SdfShapePass, Sprite2d,
+    Sprites2dPass, TileCell, TilemapPass, TilemapUniform, rasterize_scene_2d, sort_sprites,
+};
 pub use render_targets::{
     ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,
     oblique_clip_projection, planar_reflection_camera, planar_reflection_view,
@@ -152,7 +167,9 @@ pub use volume::{TRANSLUCENCY_WGSL, VolumeImage, VolumeLayer};
 pub const MSDF_WGSL: &str = include_str!("shaders/msdf.wgsl");
 pub use renderer::{
     ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentFoliage, EnvironmentScene,
-    EnvironmentTerrain, SHADOWS_WGSL, validate_frame,
+    EnvironmentTerrain, GPU_PARTICLES_EXT_TAG, GpuParticleScene, JFA_OUTLINE_EXT_TAG, JfaOutlineScene,
+    JfaOutlineTarget, LINES_EXT_TAG, LineScene, RENDER2D_EXT_TAG, RadianceCascades2dLayer, SHADOWS_WGSL, Scene2d,
+    SpriteLayer2d, TilemapLayer2d, validate_frame,
 };
 #[cfg(feature = "simplify")]
 pub use simplify::pack_mesh_with_lods;
@@ -644,6 +661,76 @@ impl Renderer {
     /// Detaches the active outdoor environment scene.
     pub fn clear_environment_scene(&mut self) {
         self.state.clear_environment_scene();
+    }
+
+    /// Attaches a GPU compute-simulated 3D mesh particle system stepped and drawn in `Renderer::draw`.
+    pub fn set_gpu_particle_scene(&mut self, scene: GpuParticleScene) {
+        self.state.set_gpu_particle_scene(scene);
+    }
+
+    /// Seeds or re-seeds live GPU particles on the next submitted frame.
+    pub fn seed_gpu_particles(&mut self, particles: Vec<GpuParticle>) {
+        self.state.seed_gpu_particles(particles);
+    }
+
+    /// Detaches and releases the active live GPU particle system.
+    pub fn clear_gpu_particle_scene(&mut self) {
+        self.state.clear_gpu_particle_scene();
+    }
+
+    /// Attaches a 3D/2D antialiased debug & vector line scene (depth-tested, X-ray, on-top, 2D overlay).
+    pub fn set_line_scene(&mut self, scene: LineScene) {
+        self.state.set_line_scene(scene);
+    }
+
+    /// Detaches the active antialiased line scene.
+    pub fn clear_line_scene(&mut self) {
+        self.state.clear_line_scene();
+    }
+
+    /// Attaches a multi-entity Jump-Flood silhouette outline scene composited onto the HDR scene.
+    pub fn set_jfa_outlines(&mut self, scene: JfaOutlineScene) {
+        self.state.set_jfa_outlines(scene);
+    }
+
+    /// Detaches the active JFA silhouette outline scene.
+    pub fn clear_jfa_outlines(&mut self) {
+        self.state.clear_jfa_outlines();
+    }
+
+    /// Uploads a GPU tilemap cell grid buffer for [`TilemapLayer2d`].
+    pub fn upload_tilemap_cells(&self, cells: &[TileCell]) -> std::sync::Arc<wgpu::Buffer> {
+        self.state.upload_tilemap_cells(cells)
+    }
+
+    /// Uploads a linear `Rgba8Unorm` 2D texture for [`SpriteLayer2d`] or [`TilemapLayer2d`].
+    pub fn upload_2d_texture_rgba8(&self, width: u32, height: u32, rgba: &[u8]) -> wgpu::TextureView {
+        self.state.upload_2d_texture_rgba8(width, height, rgba)
+    }
+
+    /// Attaches a first-class 2D world + vector SDF UI scene (tilemaps, 2D sprites, 2D Radiance Cascades GI, SDF UI).
+    pub fn set_scene_2d(&mut self, scene: Scene2d) {
+        self.state.set_scene_2d(scene);
+    }
+
+    /// Detaches the active 2D scene.
+    pub fn clear_scene_2d(&mut self) {
+        self.state.clear_scene_2d();
+    }
+
+    /// Sets the continuous meshlet DAG screen-space error threshold in pixels (`< 0.0` disables DAG LODs).
+    pub fn set_dag_lod_error_threshold(&mut self, pixels: f32) {
+        self.state.set_dag_lod_error_threshold(pixels);
+    }
+
+    /// Active continuous meshlet DAG screen-space error threshold in pixels.
+    pub fn dag_lod_error_threshold(&self) -> f32 {
+        self.state.dag_lod_error_threshold()
+    }
+
+    /// Number of LOD0 mesh draws dispatched through the continuous meshlet DAG LOD culler on the last frame.
+    pub fn last_meshlet_dag_draws(&self) -> u32 {
+        self.state.last_meshlet_dag_draws()
     }
 
     /// Number of LOD0 mesh draws dispatched through GPU meshlet cluster culling on the last frame.

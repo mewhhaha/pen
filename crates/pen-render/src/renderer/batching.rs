@@ -809,6 +809,7 @@ impl State {
                 skin,
                 morph,
                 meshlet_slot: None,
+                dag_slot: None,
                 persistent,
             });
         }

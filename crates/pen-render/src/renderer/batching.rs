@@ -91,6 +91,7 @@ impl Scratch {
         self.parameter_batches.clear();
         self.placements.clear();
         self.batches.clear();
+        self.gpu_order.clear();
         self.items.clear();
         self.ready.clear();
         self.opaque.clear();
@@ -234,26 +235,33 @@ impl State {
         scratch.group_poses(frame);
         scratch.group_morphs(frame);
         scratch.group_motions(frame);
+        let mut last_key = (u32::MAX, u32::MAX);
+        let mut last_choice = u32::MAX;
         for (index, draw) in frame.draws.iter().enumerate() {
             // A posed, morphed, or explicitly moving draw has per-draw matrices/deformations: drawn alone.
             let alone = scratch.posed(index) || scratch.morphed(index) || scratch.has_motion(index);
-            let placement = self.place(draw, catalog, samples, scratch, alone)?;
+            let placement = self.place_cached(draw, catalog, samples, scratch, alone, &mut last_key, &mut last_choice)?;
             scratch.placements.push(placement);
         }
         // Batches of many instances cull on the GPU: their instances go first
         // in the buffer, whole, once each, largest first so big static batches
         // stay at stable offsets when smaller dynamic batches change size.
         let mut instance_count = 0;
-        let mut gpu_order: Vec<usize> = (0..scratch.batches.len())
-            .filter(|&i| {
-                let batch = &scratch.batches[i];
-                batch.bounds.is_some()
-                    && matches!(self.assets.current(batch.mesh), Some(GpuAsset::Mesh(_)))
-                    && self.culling.takes(batch.count)
-            })
-            .collect();
-        gpu_order.sort_by(|&a, &b| scratch.batches[b].count.cmp(&scratch.batches[a].count).then_with(|| a.cmp(&b)));
-        for index in gpu_order {
+        scratch.gpu_order.clear();
+        for i in 0..scratch.batches.len() {
+            let batch = &scratch.batches[i];
+            if batch.bounds.is_some()
+                && matches!(self.assets.current(batch.mesh), Some(GpuAsset::Mesh(_)))
+                && self.culling.takes(batch.count)
+            {
+                scratch.gpu_order.push(i);
+            }
+        }
+        scratch.gpu_order.sort_by(|&a, &b| {
+            scratch.batches[b].count.cmp(&scratch.batches[a].count).then_with(|| a.cmp(&b))
+        });
+        for i in 0..scratch.gpu_order.len() {
+            let index = scratch.gpu_order[i];
             let batch = &mut scratch.batches[index];
             let (Some(bounds), Some(GpuAsset::Mesh(mesh))) = (batch.bounds, self.assets.current(batch.mesh)) else {
                 continue;
@@ -265,6 +273,16 @@ impl State {
                 instance_count += batch.count;
             }
         }
+        // Reserve a coarse aligned region for GPU-culled batches so fluctuating dynamic
+        // batch counts (e.g. flying bricks) do not shift all subsequent CPU-culled batches.
+        if instance_count > self.gpu_instance_base {
+            self.gpu_instance_base = instance_count.next_multiple_of(512);
+        } else if instance_count == 0 {
+            self.gpu_instance_base = 0;
+        } else if self.gpu_instance_base > instance_count + 2048 {
+            self.gpu_instance_base = instance_count.next_multiple_of(512);
+        }
+        instance_count = self.gpu_instance_base;
         // The rest cull here, but posed draws: their joints move their
         // vertices past their mesh's bounds, so every view they may be in
         // draws them, whole.
@@ -294,15 +312,21 @@ impl State {
                 }
             }
         }
-        // Each view's instances of each batch culled here together, at each
-        // level, in the order of their draws: the camera's, then the first
-        // shadow map's, and so on, after those the GPU culls.
-        for view in 0..scratch.views.count() {
-            for batch in scratch.batches.iter_mut().filter(|batch| batch.gpu.is_none()) {
-                for range in &mut batch.ranges[view] {
-                    let count = range.1;
-                    *range = (instance_count, 0);
-                    instance_count += count;
+        // Place singleton CPU-culled batches (mostly static buildings across views)
+        // in a contiguous prefix ahead of dynamic multi-instance batches so fluctuating
+        // actor counts do not shift static instances in the upload diff.
+        for single in [true, false] {
+            for view in 0..scratch.views.count() {
+                for batch in scratch
+                    .batches
+                    .iter_mut()
+                    .filter(|batch| batch.gpu.is_none() && (batch.count == 1) == single)
+                {
+                    for range in &mut batch.ranges[view] {
+                        let count = range.1;
+                        *range = (instance_count, 0);
+                        instance_count += count;
+                    }
                 }
             }
         }
@@ -449,23 +473,33 @@ impl State {
     /// mesh and material, or, with instance parameters, of its mesh and
     /// render state: only the parameters may differ, which lets animation
     /// poses share one draw. Which views see it is worked out after.
-    pub(super) fn place(
+    pub(super) fn place_cached(
         &mut self,
         draw: &Draw,
         catalog: &Catalog,
         samples: u32,
         scratch: &mut Scratch,
         alone: bool,
+        last_key: &mut (u32, u32),
+        last_choice: &mut u32,
     ) -> Result<Placement> {
-        let choice = match scratch.chosen.get(&(draw.mesh, draw.material)) {
-            Some(&choice) => choice,
-            None => {
-                let choice = self.choose(draw, catalog, samples, scratch)?;
-                scratch.choices.push(choice);
-                let index = u32::try_from(scratch.choices.len() - 1)?;
-                scratch.chosen.insert((draw.mesh, draw.material), index);
-                index
-            }
+        let key = (draw.mesh, draw.material);
+        let choice = if key == *last_key {
+            *last_choice
+        } else {
+            let c = match scratch.chosen.get(&key) {
+                Some(&choice) => choice,
+                None => {
+                    let choice = self.choose(draw, catalog, samples, scratch)?;
+                    scratch.choices.push(choice);
+                    let index = u32::try_from(scratch.choices.len() - 1)?;
+                    scratch.chosen.insert(key, index);
+                    index
+                }
+            };
+            *last_key = key;
+            *last_choice = c;
+            c
         };
         let placement = Placement { batch: ALONE, choice, parameters: [0.0; 4], views: 0, lod: 0 };
         // A draw with its own uniform data draws alone, as one its caller
@@ -559,10 +593,224 @@ impl State {
         let floats = (self.stride / 4) as usize;
         self.skinning.begin(frame.exposure.cut);
         self.morphing.begin();
+        // Fast 1-entry caches avoid repeated material/dress/bind-group and mesh lookups
+        // across contiguous runs of identical solo draws (e.g. wakes, earth patches, buildings).
+        struct MatCache {
+            index: u32,
+            material: std::sync::Arc<super::MaterialAsset>,
+            shader: usize,
+            dressed: super::materials::Dressed,
+            group: Option<wgpu::BindGroup>,
+            surface_vecs: [f32; SURFACE_FLOATS],
+            uv_maps: [f32; 8],
+            color: [f32; 4],
+            settings: [f32; 4],
+            default_params: [f32; 4],
+            maps_tail: [f32; 8],
+        }
+        let mut mat_cache: Option<MatCache> = None;
+        let mut mesh_cache: Option<(u32, usize, bool)> = None;
         for index in 0..item_count {
             let item = scratch.items[index];
-            let Some(entry) = self.ready_entry(frame, catalog, scratch, index, item, samples)? else { continue };
-            scratch.ready.push(entry);
+            if mat_cache.as_ref().is_none_or(|c| c.index != item.material) {
+                let Some(material) = self.material(catalog, item.material)? else { continue };
+                let Some(shader) = self.shader(&material.material)? else { continue };
+                let field = if self.field_ids.is_empty() {
+                    None
+                } else {
+                    self.field_ids.get(catalog.material(item.material)).copied()
+                };
+                let Some(dressed) = self.dress(&material.material, field)? else { continue };
+                let m = &material.material;
+                let (_, normal_setting, outline_setting, orm_setting, emissive_setting, tile_mask, has_base_texture) =
+                    dressed;
+                mat_cache = Some(MatCache {
+                    index: item.material,
+                    surface_vecs: m.surface.vectors(),
+                    uv_maps: m.uv_transform.vectors(orm_setting, emissive_setting),
+                    color: m.color.map(narrow),
+                    settings: [
+                        if m.lit { 1.0 } else { 0.0 },
+                        narrow(m.alpha_cutoff),
+                        normal_setting,
+                        outline_setting,
+                    ],
+                    default_params: m.instance_parameters.map(|values| values.map(narrow)).unwrap_or([0.0; 4]),
+                    maps_tail: [
+                        tile_mask as f32,
+                        has_base_texture,
+                        0.0,
+                        0.0,
+                        m.surface.iridescence,
+                        m.surface.iridescence_ior,
+                        m.surface.iridescence_thickness_min,
+                        m.surface.iridescence_thickness_max,
+                    ],
+                    material,
+                    shader,
+                    dressed,
+                    group: None,
+                });
+            }
+            let cached = mat_cache.as_mut().unwrap();
+            let (mesh, persistent) = match item.shape {
+                Shape::Mesh(m) => {
+                    if let Some((cm, slot, p)) = mesh_cache
+                        && cm == m
+                    {
+                        (Some(slot), p)
+                    } else {
+                        let slot = self.resolve(AssetKind::Mesh, catalog.mesh(m))?;
+                        let p = matches!(
+                            self.assets.current(slot),
+                            Some(GpuAsset::Mesh(mesh)) if mesh.instances.is_some()
+                        );
+                        mesh_cache = Some((m, slot, p));
+                        (Some(slot), p)
+                    }
+                }
+                _ => (None, false),
+            };
+            if persistent {
+                ensure!(cached.material.material.opaque(), "persistent mesh instances require an opaque material");
+                ensure!(
+                    matches!(self.assets.current(cached.shader), Some(GpuAsset::Shader(shader)) if shader.persistent),
+                    "persistent mesh instances require a vertex_persistent shader entry point"
+                );
+                ensure!(
+                    !scratch.target_of_source(item.source).is_some_and(|t| scratch.posed(t) || scratch.morphed(t)),
+                    "persistent mesh instances cannot be posed or morphed"
+                );
+            }
+            if item.views == 0 {
+                // Out of every view: what it draws with still loads and
+                // compiles, so that it shows as soon as it comes into view.
+                if matches!(item.shape, Shape::Mesh(_)) {
+                    self.ensure_variants(
+                        cached.shader,
+                        samples,
+                        cached.material.material.variants().without(Variants::INSTANCED),
+                    );
+                }
+                continue;
+            }
+            let group = match &cached.group {
+                Some(g) => g.clone(),
+                None => {
+                    let g = self.draw_group(cached.dressed.0);
+                    cached.group = Some(g.clone());
+                    g
+                }
+            };
+            let data = &mut self.uniform_data[index * floats..(index + 1) * floats];
+            let m = &cached.material.material;
+            let draw = item.draw(frame);
+            if matches!(item.source, Source::World) {
+                data[..16].copy_from_slice(&IDENTITY);
+                data[16..32].copy_from_slice(&IDENTITY);
+            } else {
+                let transform = item.transform(frame);
+                data[..16].copy_from_slice(transform);
+                data[16..32].copy_from_slice(&normal_matrix(transform)?);
+            }
+            data[32..36].copy_from_slice(&cached.color);
+            data[36..40].copy_from_slice(&cached.settings);
+            let parameters = draw.and_then(|draw| draw.parameters).unwrap_or(cached.default_params);
+            data[40..44].copy_from_slice(&parameters);
+            // Unused extra vectors read as zero.
+            let extra = &mut data[44..SURFACE_AT];
+            extra.fill(0.0);
+            if let Some(values) = draw.and_then(|draw| draw.extra.as_deref()) {
+                let count = values.len().min(MAX_DRAW_EXTRA * 4);
+                extra[..count].copy_from_slice(&values[..count]);
+            }
+            // Every path writes the material's surface: a batch's draws share its first's
+            // material, or one of the same render state.
+            data[SURFACE_AT..SURFACE_AT + SURFACE_FLOATS].copy_from_slice(&cached.surface_vecs);
+            data[MAPS_AT..MAPS_AT + 8].copy_from_slice(&cached.uv_maps);
+            data[MAPS_AT + 8..MAPS_AT + MAPS_FLOATS].copy_from_slice(&cached.maps_tail);
+            // Insets preserve authored coverage, separately from scene sky alpha.
+            let shader = cached.shader;
+            let (pipeline, visible) = if persistent {
+                let inset = item.inset().is_some();
+                let samples = if inset { INSET_SAMPLES } else { samples };
+                let variant = if inset { Variants::INSET_PERSISTENT } else { Variants::PERSISTENT };
+                if !self.ensure_variants(shader, samples, variant) {
+                    continue;
+                }
+                let made = self.pipelines(shader, samples);
+                (if inset { made.inset_persistent.clone() } else { made.persistent.clone() }, None)
+            } else {
+                match (item.inset(), item.shape) {
+                    (Some(_), _) => {
+                        let mut variant = Variants::INSET;
+                        if !m.opaque() {
+                            variant = Variants::INSET_BLENDED;
+                        }
+                        if !self.ensure_variants(shader, INSET_SAMPLES, variant) {
+                            continue;
+                        }
+                        let made = self.pipelines(shader, INSET_SAMPLES);
+                        let mut pipeline = made.inset.clone();
+                        if !m.opaque() {
+                            pipeline = made.inset_blended.clone();
+                        }
+                        (pipeline, None)
+                    }
+                    (None, Shape::Batch(batch)) => (Some(scratch.batches[batch].pipeline.clone()), None),
+                    (None, _) => {
+                        if !self.ensure_variants(
+                            shader,
+                            samples,
+                            m.variants().without(Variants::INSTANCED | Variants::SKINNED),
+                        ) {
+                            continue;
+                        }
+                        let made = self.pipelines(shader, samples);
+                        if m.overlay {
+                            (made.occluded.clone(), made.visible.clone())
+                        } else if m.opaque() {
+                            (made.opaque.clone(), None)
+                        } else {
+                            (made.translucent.clone(), None)
+                        }
+                    }
+                }
+            };
+            let mut pipeline = pipeline.expect("an ensured variant is compiled");
+            let mut skin = None;
+            let mut morph = None;
+            if let (Some(target), Some(mesh)) = (scratch.target_of_source(item.source), mesh) {
+                if scratch.posed(target) {
+                    match self.pose_draw(frame, scratch, target, (mesh, m, shader), samples, item.inset().is_some()) {
+                        Posed::Unskinned => {}
+                        Posed::Waiting => continue,
+                        Posed::Ready(skinned, at) => {
+                            pipeline = skinned;
+                            skin = Some(at);
+                        }
+                    }
+                }
+                if scratch.morphed(target) {
+                    morph = self.morph_draw(frame, scratch, target, mesh);
+                }
+            }
+            let offset =
+                u32::try_from(index as u64 * self.stride).context("draw uniforms lie past a dynamic offset's reach")?;
+            scratch.ready.push(ReadyEntry {
+                item: index,
+                offset,
+                group,
+                material: cached.material.clone(),
+                shader,
+                mesh,
+                pipeline,
+                visible,
+                skin,
+                morph,
+                meshlet_slot: None,
+                persistent,
+            });
         }
         self.skinning.upload(&self.device, &self.queue, &self.context.skin_group);
         self.morphing.upload(&self.device, &self.queue);
@@ -574,174 +822,6 @@ impl State {
             );
         }
         Ok(())
-    }
-
-    /// Item `index` ready to draw, its uniforms written; None while
-    /// something it draws with is on its way.
-    pub(super) fn ready_entry(
-        &mut self,
-        frame: &RenderFrame,
-        catalog: &Catalog,
-        scratch: &Scratch,
-        index: usize,
-        item: Item,
-        samples: u32,
-    ) -> Result<Option<ReadyEntry>> {
-        let Some(material) = self.material(catalog, item.material)? else { return Ok(None) };
-        let Some(shader) = self.shader(&material.material)? else { return Ok(None) };
-        let mesh = match item.shape {
-            Shape::Mesh(mesh) => Some(self.resolve(AssetKind::Mesh, catalog.mesh(mesh))?),
-            _ => None,
-        };
-        let persistent = matches!(mesh.and_then(|slot| self.assets.current(slot)), Some(GpuAsset::Mesh(mesh)) if mesh.instances.is_some());
-        if persistent {
-            ensure!(material.material.opaque(), "persistent mesh instances require an opaque material");
-            ensure!(
-                matches!(self.assets.current(shader), Some(GpuAsset::Shader(shader)) if shader.persistent),
-                "persistent mesh instances require a vertex_persistent shader entry point"
-            );
-            ensure!(
-                !scratch.target_of_source(item.source).is_some_and(|t| scratch.posed(t) || scratch.morphed(t)),
-                "persistent mesh instances cannot be posed or morphed"
-            );
-        }
-        let field = self.field_ids.get(catalog.material(item.material)).copied();
-        let Some((textures, normal_setting, outline_setting, orm_setting, emissive_setting, tile_mask, has_base_texture)) =
-            self.dress(&material.material, field)?
-        else {
-            return Ok(None);
-        };
-        if item.views == 0 {
-            // Out of every view: what it draws with still loads and
-            // compiles, so that it shows as soon as it comes into view.
-            if matches!(item.shape, Shape::Mesh(_)) {
-                self.ensure_variants(shader, samples, material.material.variants().without(Variants::INSTANCED));
-            }
-            return Ok(None);
-        }
-        let group = self.draw_group(textures);
-        let floats = (self.stride / 4) as usize;
-        let data = &mut self.uniform_data[index * floats..(index + 1) * floats];
-        let m = &material.material;
-        let draw = item.draw(frame);
-        let transform = item.transform(frame);
-        data[..16].copy_from_slice(transform);
-        data[16..32].copy_from_slice(&normal_matrix(transform)?);
-        data[32..36].copy_from_slice(&m.color.map(narrow));
-        data[36..40].copy_from_slice(&[
-            if m.lit { 1.0 } else { 0.0 },
-            narrow(m.alpha_cutoff),
-            normal_setting,
-            outline_setting,
-        ]);
-        let parameters = draw
-            .and_then(|draw| draw.parameters)
-            .or(m.instance_parameters.map(|values| values.map(narrow)))
-            .unwrap_or([0.0; 4]);
-        data[40..44].copy_from_slice(&parameters);
-        // Unused extra vectors read as zero.
-        let extra = &mut data[44..SURFACE_AT];
-        extra.fill(0.0);
-        if let Some(values) = draw.and_then(|draw| draw.extra.as_deref()) {
-            let count = values.len().min(MAX_DRAW_EXTRA * 4);
-            extra[..count].copy_from_slice(&values[..count]);
-        }
-        // Every path writes the material's surface: a batch's draws share its first's
-        // material, or one of the same render state.
-        data[SURFACE_AT..SURFACE_AT + SURFACE_FLOATS].copy_from_slice(&m.surface.vectors());
-        let uv_maps = m.uv_transform.vectors(orm_setting, emissive_setting);
-        data[MAPS_AT..MAPS_AT + 8].copy_from_slice(&uv_maps);
-        data[MAPS_AT + 8..MAPS_AT + 12].copy_from_slice(&[tile_mask as f32, has_base_texture, 0.0, 0.0]);
-        data[MAPS_AT + 12..MAPS_AT + MAPS_FLOATS].copy_from_slice(&[
-            m.surface.iridescence,
-            m.surface.iridescence_ior,
-            m.surface.iridescence_thickness_min,
-            m.surface.iridescence_thickness_max,
-        ]);
-        // Insets preserve authored coverage, separately from scene sky alpha.
-        let (pipeline, visible) = if persistent {
-            let inset = item.inset().is_some();
-            let samples = if inset { INSET_SAMPLES } else { samples };
-            let variant = if inset { Variants::INSET_PERSISTENT } else { Variants::PERSISTENT };
-            if !self.ensure_variants(shader, samples, variant) {
-                return Ok(None);
-            }
-            let made = self.pipelines(shader, samples);
-            (if inset { made.inset_persistent.clone() } else { made.persistent.clone() }, None)
-        } else {
-            match (item.inset(), item.shape) {
-                (Some(_), _) => {
-                    let mut variant = Variants::INSET;
-                    if !m.opaque() {
-                        variant = Variants::INSET_BLENDED;
-                    }
-                    if !self.ensure_variants(shader, INSET_SAMPLES, variant) {
-                        return Ok(None);
-                    }
-                    let made = self.pipelines(shader, INSET_SAMPLES);
-                    let mut pipeline = made.inset.clone();
-                    if !m.opaque() {
-                        pipeline = made.inset_blended.clone();
-                    }
-                    (pipeline, None)
-                }
-                (None, Shape::Batch(batch)) => (Some(scratch.batches[batch].pipeline.clone()), None),
-                (None, _) => {
-                    if !self.ensure_variants(
-                        shader,
-                        samples,
-                        m.variants().without(Variants::INSTANCED | Variants::SKINNED),
-                    ) {
-                        return Ok(None);
-                    }
-                    let made = self.pipelines(shader, samples);
-                    if m.overlay {
-                        (made.occluded.clone(), made.visible.clone())
-                    } else if m.opaque() {
-                        (made.opaque.clone(), None)
-                    } else {
-                        (made.translucent.clone(), None)
-                    }
-                }
-            }
-        };
-        let mut pipeline = pipeline.expect("an ensured variant is compiled");
-        // A posed draw (scene or inset, opaque or translucent) of a skinned mesh
-        // draws skinned with its joint matrices; a morphed draw schedules GPU
-        // blendshape evaluation into the frame's morphed vertex buffer.
-        let mut skin = None;
-        let mut morph = None;
-        if let (Some(target), Some(mesh)) = (scratch.target_of_source(item.source), mesh) {
-            if scratch.posed(target) {
-                match self.pose_draw(frame, scratch, target, (mesh, m, shader), samples, item.inset().is_some()) {
-                    Posed::Unskinned => {}
-                    Posed::Waiting => return Ok(None),
-                    Posed::Ready(skinned, at) => {
-                        pipeline = skinned;
-                        skin = Some(at);
-                    }
-                }
-            }
-            if scratch.morphed(target) {
-                morph = self.morph_draw(frame, scratch, target, mesh);
-            }
-        }
-        let offset =
-            u32::try_from(index as u64 * self.stride).context("draw uniforms lie past a dynamic offset's reach")?;
-        Ok(Some(ReadyEntry {
-            item: index,
-            offset,
-            group,
-            material,
-            shader,
-            mesh,
-            pipeline,
-            visible,
-            skin,
-            morph,
-            meshlet_slot: None,
-            persistent,
-        }))
     }
 
     /// Sorts what is ready into the scene's passes: opaque surfaces by

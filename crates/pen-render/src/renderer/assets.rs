@@ -609,7 +609,17 @@ impl State {
                 let state = *self.states.entry(material.state_key()).or_insert(next);
                 Ok(Some((GpuAsset::Material(Arc::new(MaterialAsset { material: *material, state })), None)))
             }
-            Loaded::Shader { module, code, instancing, skinning, persistent, margin, cascaded } => {
+            Loaded::Shader {
+                module,
+                code,
+                instancing,
+                skinning,
+                persistent,
+                margin,
+                cascaded,
+                reads_opaque_color,
+                reads_opaque_depth,
+            } => {
                 // What the materials naming it draw with compiles now, for
                 // the sample count frames draw with, each pipeline on a
                 // thread of its own; other variants and counts when a
@@ -626,6 +636,8 @@ impl State {
                     skinning,
                     persistent,
                     cascaded,
+                    reads_opaque_color,
+                    reads_opaque_depth,
                     margin,
                     needs,
                     made: HashMap::new(),

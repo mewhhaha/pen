@@ -181,6 +181,10 @@ pub(crate) struct ShaderAsset {
     persistent: bool,
     /// Whether it reads the cascaded shadow maps (`shadow_cascades`).
     cascaded: bool,
+    /// Whether it reads the opaque scene color mip chain (`opaque_color` / `opaque_behind`).
+    reads_opaque_color: bool,
+    /// Whether it reads the opaque nearest-depth texture (`opaque_depth`).
+    reads_opaque_depth: bool,
     /// How far its vertex stage moves vertices from where their mesh puts
     /// them, if it says: its draws are culled by their bounds grown by it.
     margin: Option<f32>,
@@ -556,6 +560,7 @@ struct Scratch {
     parameter_batches: HashMap<(u32, u32), usize>,
     placements: Vec<Placement>,
     batches: Vec<InstanceBatch>,
+    gpu_order: Vec<usize>,
     items: Vec<Item>,
     ready: Vec<ReadyEntry>,
     /// Ready entries (indices) by pass.
@@ -834,6 +839,7 @@ pub(crate) struct State {
     // the frame that last drew with each.
     groups: HashMap<([u64; 3], i32), (wgpu::BindGroup, u64)>,
     instance_capacity: usize,
+    gpu_instance_base: u32,
     instance_buffer: wgpu::Buffer,
     // What a mesh without tangents binds as them: a zero `vec4f` for each
     // vertex of the largest mesh loaded or meshed without (`ensure_zero_tangents`).
@@ -1239,6 +1245,7 @@ impl State {
             uniform_data: vec![0.0; (stride / 4) as usize],
             groups: HashMap::new(),
             instance_capacity: 1,
+            gpu_instance_base: 0,
             instance_buffer: batching::instance_buffer(&device, 1),
             zero_tangents: zero_tangent_buffer(&device, TANGENT_BYTES),
             default_extra_attrs: default_extra_attrs_buffer(&device, &queue, 1),

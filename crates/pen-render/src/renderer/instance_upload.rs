@@ -47,7 +47,7 @@ impl Uploads {
             }
         }
         let changed: usize = self.ranges.iter().map(|range| range.len()).sum();
-        if self.ranges.len() > MAX_WRITES || changed > words.len() / 2 {
+        if self.ranges.len() > MAX_WRITES || (self.ranges.len() > 1 && changed > words.len() * 3 / 4) {
             self.ranges.clear();
             self.ranges.push(0..words.len());
         }
@@ -88,7 +88,8 @@ mod tests {
         current.truncate(LANES * 30);
         assert_eq!(apply(&mut uploads, &mut gpu, &current), (0, 0));
         current.resize(LANES * 200, 7.0);
-        assert_eq!(apply(&mut uploads, &mut gpu, &current), (1, current.len() * 4));
+        // A single appended tail preserves the unchanged prefix instead of re-uploading it.
+        assert_eq!(apply(&mut uploads, &mut gpu, &current), (1, LANES * 170 * 4));
         uploads.invalidate();
         gpu.fill(0xdead_beef);
         assert_eq!(apply(&mut uploads, &mut gpu, &current), (1, current.len() * 4));

@@ -436,6 +436,15 @@ impl State {
             || !scratch.overlays.is_empty()
             || !scratch.emitters.is_empty()
             || !scratch.ribbons.is_empty();
+        let mut opaque_mips = false;
+        let mut opaque_depth = !scratch.emitters.is_empty() || !scratch.ribbons.is_empty();
+        for &index in scratch.translucent.iter().chain(&scratch.overlays) {
+            let entry = &scratch.ready[index];
+            if let Some(GpuAsset::Shader(shader)) = self.assets.current(entry.shader) {
+                opaque_mips |= shader.reads_opaque_color;
+                opaque_depth |= shader.reads_opaque_depth;
+            }
+        }
         let volume = self.volumetrics.prepare(&self.context, frame, &quality, target.size(), translucent);
         let planned_scene_size = crate::post::scene_size(&self.device, target.size(), quality.scale);
         let physical_sky = self.prepare_physical_sky(frame, planned_scene_size)?;
@@ -450,7 +459,7 @@ impl State {
             target.size(),
             &volume,
             physical_sky.as_ref(),
-            Extras { translucent, subsurface },
+            Extras { translucent, opaque_depth, opaque_mips, subsurface },
         );
         if targets.targets_recreated {
             self.velocity.reset_target();

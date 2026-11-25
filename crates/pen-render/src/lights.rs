@@ -48,6 +48,7 @@ impl Slicing {
 pub(crate) struct Assignment {
     pub ranges: Vec<[u32; 2]>,
     pub indices: Vec<u32>,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub slicing: Slicing,
 }
 
@@ -109,79 +110,108 @@ fn reach(light: &Light, view: &Matrix) -> ([f64; 3], f64) {
 
 /// The clusters each of `lights` may light, seen through `view` and
 /// `projection`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn assign(lights: &[Light], view: &Matrix, projection: &Matrix) -> Assignment {
-    let spheres: Vec<([f64; 3], f64)> = lights.iter().map(|light| reach(light, view)).collect();
-    let farthest = spheres.iter().map(|(center, radius)| radius - center[2]).fold(1.0, f64::max);
+    let mut scratch = AssignScratch::default();
+    let slicing = assign_into(lights, view, projection, &mut scratch);
+    Assignment { ranges: scratch.ranges, indices: scratch.indices, slicing }
+}
+
+#[derive(Default)]
+struct AssignScratch {
+    spheres: Vec<([f64; 3], f64)>,
+    boxes: Vec<Option<[u32; 6]>>,
+    counts: Vec<u32>,
+    ranges: Vec<[u32; 2]>,
+    indices: Vec<u32>,
+}
+
+fn assign_into(lights: &[Light], view: &Matrix, projection: &Matrix, scratch: &mut AssignScratch) -> Slicing {
+    scratch.spheres.clear();
+    scratch.spheres.extend(lights.iter().map(|light| reach(light, view)));
+    let farthest = scratch.spheres.iter().map(|(center, radius)| radius - center[2]).fold(1.0, f64::max);
     let slicing = slicing(projection, farthest);
     // Each light's box of clusters, if it reaches any.
-    let boxes: Vec<Option<[u32; 6]>> = spheres
-        .iter()
-        .map(|&(center, radius)| {
-            let (closest, farthest) = (-(center[2] + radius), -(center[2] - radius));
-            if farthest < slicing.near || closest > slicing.far {
-                return None;
+    scratch.boxes.clear();
+    for &(center, radius) in &scratch.spheres {
+        let (closest, farthest) = (-(center[2] + radius), -(center[2] - radius));
+        if farthest < slicing.near || closest > slicing.far {
+            scratch.boxes.push(None);
+            continue;
+        }
+        // The corners of its box, the near ones no closer than the near
+        // plane, on the picture.
+        let near_z = -closest.max(slicing.near);
+        let far_z = center[2] - radius;
+        let (mut low, mut high) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for corner in 0..8 {
+            let x = center[0] + if corner & 1 == 0 { -radius } else { radius };
+            let y = center[1] + if corner & 2 == 0 { -radius } else { radius };
+            let z = if corner & 4 == 0 { near_z } else { far_z };
+            let clip = transform(projection, [x, y, z, 1.0]);
+            let ndc = [clip[0] / clip[3], clip[1] / clip[3]];
+            for axis in 0..2 {
+                low[axis] = low[axis].min(ndc[axis]);
+                high[axis] = high[axis].max(ndc[axis]);
             }
-            // The corners of its box, the near ones no closer than the near
-            // plane, on the picture.
-            let near_z = -closest.max(slicing.near);
-            let far_z = center[2] - radius;
-            let (mut low, mut high) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
-            for corner in 0..8 {
-                let x = center[0] + if corner & 1 == 0 { -radius } else { radius };
-                let y = center[1] + if corner & 2 == 0 { -radius } else { radius };
-                let z = if corner & 4 == 0 { near_z } else { far_z };
-                let clip = transform(projection, [x, y, z, 1.0]);
-                let ndc = [clip[0] / clip[3], clip[1] / clip[3]];
-                for axis in 0..2 {
-                    low[axis] = low[axis].min(ndc[axis]);
-                    high[axis] = high[axis].max(ndc[axis]);
+        }
+        if high[0] < -1.0 || low[0] > 1.0 || high[1] < -1.0 || low[1] > 1.0 {
+            scratch.boxes.push(None);
+            continue;
+        }
+        // As the shaders find a fragment's tile; picture rows go down
+        // while clip-space y goes up.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to the tiles")]
+        let tile = |along: f64, tiles: u32| (along * f64::from(tiles)).floor().clamp(0.0, f64::from(tiles - 1)) as u32;
+        scratch.boxes.push(Some([
+            tile(low[0] * 0.5 + 0.5, TILES.0),
+            tile(high[0] * 0.5 + 0.5, TILES.0),
+            tile(0.5 - high[1] * 0.5, TILES.1),
+            tile(0.5 - low[1] * 0.5, TILES.1),
+            slicing.slice(closest.max(slicing.near)),
+            slicing.slice(farthest.min(slicing.far)),
+        ]));
+    }
+    scratch.counts.resize(CLUSTERS, 0);
+    scratch.counts.fill(0);
+    for bounds in scratch.boxes.iter().flatten() {
+        let [x0, x1, y0, y1, z0, z1] = *bounds;
+        for z in z0..=z1 {
+            let z_off = z * TILES.1;
+            for y in y0..=y1 {
+                let row = (z_off + y) * TILES.0;
+                for x in x0..=x1 {
+                    let cluster = (row + x) as usize;
+                    scratch.counts[cluster] = (scratch.counts[cluster] + 1).min(PER_CLUSTER);
                 }
-            }
-            if high[0] < -1.0 || low[0] > 1.0 || high[1] < -1.0 || low[1] > 1.0 {
-                return None;
-            }
-            // As the shaders find a fragment's tile; picture rows go down
-            // while clip-space y goes up.
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped to the tiles")]
-            let tile =
-                |along: f64, tiles: u32| (along * f64::from(tiles)).floor().clamp(0.0, f64::from(tiles - 1)) as u32;
-            Some([
-                tile(low[0] * 0.5 + 0.5, TILES.0),
-                tile(high[0] * 0.5 + 0.5, TILES.0),
-                tile(0.5 - high[1] * 0.5, TILES.1),
-                tile(0.5 - low[1] * 0.5, TILES.1),
-                slicing.slice(closest.max(slicing.near)),
-                slicing.slice(farthest.min(slicing.far)),
-            ])
-        })
-        .collect();
-    let clusters_of = |[x0, x1, y0, y1, z0, z1]: [u32; 6]| {
-        (z0..=z1).flat_map(move |z| {
-            (y0..=y1).flat_map(move |y| (x0..=x1).map(move |x| ((z * TILES.1 + y) * TILES.0 + x) as usize))
-        })
-    };
-    let mut counts = vec![0u32; CLUSTERS];
-    for cluster in boxes.iter().flatten().flat_map(|&bounds| clusters_of(bounds)) {
-        counts[cluster] = (counts[cluster] + 1).min(PER_CLUSTER);
-    }
-    let mut ranges = Vec::with_capacity(CLUSTERS);
-    let mut first = 0;
-    for &count in &counts {
-        ranges.push([first, 0]);
-        first += count;
-    }
-    let mut indices = vec![0; usize::try_from(first).unwrap_or(0)];
-    for (light, bounds) in (0u32..).zip(&boxes) {
-        let Some(bounds) = *bounds else { continue };
-        for cluster in clusters_of(bounds) {
-            let [start, taken] = &mut ranges[cluster];
-            if *taken < counts[cluster] {
-                indices[(*start + *taken) as usize] = light;
-                *taken += 1;
             }
         }
     }
-    Assignment { ranges, indices, slicing }
+    scratch.ranges.clear();
+    let mut first = 0;
+    for &count in &scratch.counts {
+        scratch.ranges.push([first, 0]);
+        first += count;
+    }
+    scratch.indices.resize(usize::try_from(first).unwrap_or(0), 0);
+    for (light, bounds) in (0u32..).zip(&scratch.boxes) {
+        let Some([x0, x1, y0, y1, z0, z1]) = *bounds else { continue };
+        for z in z0..=z1 {
+            let z_off = z * TILES.1;
+            for y in y0..=y1 {
+                let row = (z_off + y) * TILES.0;
+                for x in x0..=x1 {
+                    let cluster = (row + x) as usize;
+                    let [start, taken] = &mut scratch.ranges[cluster];
+                    if *taken < scratch.counts[cluster] {
+                        scratch.indices[(*start + *taken) as usize] = light;
+                        *taken += 1;
+                    }
+                }
+            }
+        }
+    }
+    slicing
 }
 
 /// What a frame's lights must be.
@@ -433,6 +463,7 @@ pub(crate) struct Clusters {
     data: Vec<f32>,
     face_data: Vec<f32>,
     area_data: Vec<crate::area_lights::AreaLight>,
+    assign_scratch: AssignScratch,
 }
 
 impl Clusters {
@@ -519,6 +550,7 @@ impl Clusters {
             data: Vec::new(),
             face_data: vec![0.0; MAX_FACES * 16],
             area_data: Vec::new(),
+            assign_scratch: AssignScratch::default(),
         }
     }
 
@@ -669,9 +701,13 @@ impl Clusters {
             queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&words));
             return;
         }
-        let assignment = assign(&frame.lights, &frame.view, &frame.projection);
-        let words = grid(count, area_count, &assignment.slicing, size);
-        self.upload(device, queue, &frame.lights, shadows, atlas, &assignment, words);
+        let slicing = assign_into(&frame.lights, &frame.view, &frame.projection, &mut self.assign_scratch);
+        let words = grid(count, area_count, &slicing, size);
+        let ranges = std::mem::take(&mut self.assign_scratch.ranges);
+        let indices = std::mem::take(&mut self.assign_scratch.indices);
+        self.upload_parts(device, queue, &frame.lights, shadows, atlas, &ranges, &indices, words);
+        self.assign_scratch.ranges = ranges;
+        self.assign_scratch.indices = indices;
     }
 
     /// Puts the lights that reach within `far` of `position` in one cluster
@@ -723,6 +759,21 @@ impl Clusters {
         assignment: &Assignment,
         words: [u32; 12],
     ) {
+        self.upload_parts(device, queue, lights, shadows, atlas, &assignment.ranges, &assignment.indices, words);
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "what the buffers are filled from")]
+    fn upload_parts(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        lights: &[Light],
+        shadows: &Selection,
+        atlas: Option<(&wgpu::TextureView, u64)>,
+        ranges: &[[u32; 2]],
+        indices: &[u32],
+        words: [u32; 12],
+    ) {
         self.data.clear();
         for (index, light) in lights.iter().enumerate() {
             let (p, c, d) = (&light.position, &light.color, &light.direction);
@@ -738,7 +789,7 @@ impl Clusters {
             }
         }
         let light_bytes: &[u8] = bytemuck::cast_slice(&self.data);
-        let index_bytes: &[u8] = bytemuck::cast_slice(&assignment.indices);
+        let index_bytes: &[u8] = bytemuck::cast_slice(indices);
         let mut grown = false;
         for (buffer, label, bytes) in
             [(&mut self.lights, "lights", light_bytes.len()), (&mut self.indices, "light indices", index_bytes.len())]
@@ -784,7 +835,7 @@ impl Clusters {
         if !index_bytes.is_empty() {
             queue.write_buffer(&self.indices, 0, index_bytes);
         }
-        queue.write_buffer(&self.ranges, 0, bytemuck::cast_slice(&assignment.ranges));
+        queue.write_buffer(&self.ranges, 0, bytemuck::cast_slice(ranges));
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&words));
     }
 

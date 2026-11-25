@@ -326,6 +326,10 @@ struct TargetsKey {
 pub(crate) struct Extras {
     /// Translucent surfaces, particles or overlays, drawn after the opaque picture is misted.
     pub translucent: bool,
+    /// Whether any active translucent draw, particle or ribbon reads `opaque_depth`.
+    pub opaque_depth: bool,
+    /// Whether any active translucent draw reads `opaque_color` / `opaque_behind` mip levels.
+    pub opaque_mips: bool,
     /// Opaque surfaces whose material is `subsurface`, diffused on screen.
     pub subsurface: bool,
 }
@@ -333,6 +337,8 @@ pub(crate) struct Extras {
 /// What a frame with translucent surfaces draws and reads besides the scene's
 /// own targets, made with the first such frame and kept until the targets change.
 struct Split {
+    opaque_depth: bool,
+    opaque_mips: bool,
     opaque: OpaqueTargets,
     /// Level 0 of the opaque picture, as the backdrop pass reads it.
     backdrop: wgpu::BindGroup,
@@ -555,9 +561,9 @@ enum Part<'a> {
     Whole,
     /// The opaque picture's, of a frame with translucent surfaces: the
     /// occlusion and the atmosphere into level 0 of the chain (views of each
-    /// level), the nearest depth of each pixel (its view), and each level from
+    /// level), the nearest depth of each pixel when needed, and each level from
     /// the one above.
-    Opaque(&'a [wgpu::TextureView], &'a wgpu::TextureView),
+    Opaque(&'a [wgpu::TextureView], Option<&'a wgpu::TextureView>),
     /// The ones that read what the translucent pass resolved to.
     After,
 }
@@ -791,7 +797,7 @@ impl Post {
         physical_sky: Option<&PhysicalSkyBinding>,
         extras: Extras,
     ) -> SceneTargets {
-        let Extras { translucent, subsurface } = extras;
+        let Extras { translucent, opaque_depth, opaque_mips, subsurface } = extras;
         self.quality = Some(quality);
         self.size = size;
         self.translucent = translucent;
@@ -914,8 +920,16 @@ impl Post {
             self.memory.cut();
             self.previous_vp = None;
         }
-        if translucent && self.targets.as_ref().unwrap().split.is_none() {
-            let split = self.split(built_ins, volume, physical_sky);
+        if translucent
+            && self
+                .targets
+                .as_ref()
+                .unwrap()
+                .split
+                .as_ref()
+                .is_none_or(|s| s.opaque_depth != opaque_depth || s.opaque_mips != opaque_mips)
+        {
+            let split = self.split(built_ins, volume, physical_sky, opaque_depth, opaque_mips);
             self.targets.as_mut().unwrap().split = Some(split);
         }
         if subsurface && self.targets.as_ref().unwrap().subsurface.is_none() {
@@ -950,6 +964,8 @@ impl Post {
         built_ins: &mut BuiltIns,
         volume: &crate::volume::Applied,
         physical_sky: Option<&PhysicalSkyBinding>,
+        opaque_depth: bool,
+        opaque_mips: bool,
     ) -> Split {
         let targets = self.targets.as_ref().unwrap();
         let key = targets.key;
@@ -962,8 +978,8 @@ impl Post {
         let histories = targets.histories.clone();
         let TargetsKey { width, height, samples, taa, .. } = key;
         let sampled = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
-        // Every level down to one texel.
-        let count = width.max(height).ilog2() + 1;
+        // Every level down to one texel when shaders sample `opaque_color`; level 0 alone for backdrop otherwise.
+        let count = if opaque_mips { width.max(height).ilog2() + 1 } else { 1 };
         let picture = texture(&self.device, width, height, sampled, 1, SCENE_FORMAT, count);
         let levels: Vec<wgpu::TextureView> = (0..count)
             .map(|level| {
@@ -974,7 +990,8 @@ impl Post {
                 })
             })
             .collect();
-        let nearest = texture(&self.device, width, height, sampled, 1, wgpu::TextureFormat::R32Float, 1)
+        let (depth_w, depth_h) = if opaque_depth { (width, height) } else { (1, 1) };
+        let nearest = texture(&self.device, depth_w, depth_h, sampled, 1, wgpu::TextureFormat::R32Float, 1)
             .create_view(&Default::default());
         let inputs = |read: usize| Inputs {
             depth: depth.clone(),
@@ -984,7 +1001,15 @@ impl Post {
             history: histories.as_ref().map(|textures| [textures[read].clone(), textures[1 - read].clone()]),
         };
         let before = self
-            .graph(built_ins, key, inputs(0), Part::Opaque(&levels, &nearest), volume, physical_sky, None)
+            .graph(
+                built_ins,
+                key,
+                inputs(0),
+                Part::Opaque(&levels, opaque_depth.then_some(&nearest)),
+                volume,
+                physical_sky,
+                None,
+            )
             .expect("the opaque picture's passes read only what earlier ones draw");
         log::debug!("opaque picture: {:?}, {} textures", before.names(), before.allocations());
         let mut after: Vec<Graph> = Vec::new();
@@ -1003,7 +1028,7 @@ impl Post {
         self.opaques += 1;
         let opaque =
             OpaqueTargets { serial: self.opaques, picture: picture.create_view(&Default::default()), depth: nearest };
-        Split { opaque, backdrop, before, after }
+        Split { opaque_depth, opaque_mips, opaque, backdrop, before, after }
     }
 
     /// The graph of the two passes that diffuse the marked surfaces of the resolved
@@ -1169,16 +1194,18 @@ impl Post {
             }
         }
         // The nearest depth of each pixel, and each level of the picture from the
-        // one above it.
+        // one above it, only when active translucent passes read them.
         if let Part::Opaque(chain, nearest) = part {
-            let nearest = graph.import("opaque depth", nearest.clone());
-            graph.pass(
-                "opaque depth",
-                BuiltIn::OpaqueDepth(samples),
-                vec![Binding::Texture(depth)],
-                Target::Texture(nearest),
-                false,
-            );
+            if let Some(nearest) = nearest {
+                let nearest = graph.import("opaque depth", nearest.clone());
+                graph.pass(
+                    "opaque depth",
+                    BuiltIn::OpaqueDepth(samples),
+                    vec![Binding::Texture(depth)],
+                    Target::Texture(nearest),
+                    false,
+                );
+            }
             for level in &chain[1..] {
                 let level = graph.import("opaque", level.clone());
                 let bindings = vec![Binding::Texture(lit), sampler.clone()];

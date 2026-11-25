@@ -117,6 +117,10 @@ pub(crate) enum Loaded {
         margin: Option<f32>,
         /// Whether it reads the cascaded shadow maps.
         cascaded: bool,
+        /// Whether it reads the opaque scene color mip chain (`opaque_color` / `opaque_behind`).
+        reads_opaque_color: bool,
+        /// Whether it reads the opaque nearest-depth texture (`opaque_depth`).
+        reads_opaque_depth: bool,
     },
     SpriteShader(wgpu::RenderPipeline),
     Image(DecodedImage),
@@ -541,6 +545,8 @@ impl Worker {
                     let skinning = shader::has_skinning(&code);
                     let persistent = shader::has_persistent(&code);
                     let cascaded = code.contains("shadow_cascades");
+                    let reads_opaque_color = code.contains("opaque_color") || code.contains("opaque_behind");
+                    let reads_opaque_depth = code.contains("opaque_depth");
                     let margin = shader::bounds_margin(&code);
                     Loaded::Shader {
                         module,
@@ -550,6 +556,8 @@ impl Worker {
                         persistent,
                         margin,
                         cascaded,
+                        reads_opaque_color,
+                        reads_opaque_depth,
                     }
                 });
                 self.send(loaded(shader));

@@ -885,12 +885,81 @@ impl MeshletDagTwoPhaseOutput {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct CullUniform {
     model: [f32; 16],
-    inv_model: [f32; 16],
     hiz_vp: [f32; 16],
-    planes: [[f32; 4]; 6],
+    /// Pre-transformed, unit-length local-space frustum planes (`normalize(transpose(model) * world_plane)`).
+    local_planes: [[f32; 4]; 6],
     camera_pos: [f32; 4],
+    local_cam: [f32; 4],
     counts_flags: [u32; 4],
     projection: [f32; 4],
+}
+
+fn build_cull_uniform(
+    mesh: &MeshletDagGpu,
+    params: &MeshletDagCullParams,
+    hiz: Option<&wgpu::TextureView>,
+) -> Result<CullUniform> {
+    let p = &params.cull;
+    let scale = model_scale(&p.model);
+    let proj_scale = 0.5 * params.viewport_height * params.proj[5].abs();
+    ensure!(
+        scale.is_finite()
+            && proj_scale.is_finite()
+            && proj_scale > 0.0
+            && params.near_plane.is_finite()
+            && params.near_plane > 0.0
+            && params.pixel_error_threshold.is_finite()
+            && params.pixel_error_threshold >= 0.0,
+        "invalid DAG cull scale, projection, near plane or error threshold"
+    );
+    let m = &p.model;
+    let local_planes = p.frustum_planes.map(|pl| {
+        let x = m[0] * pl[0] + m[1] * pl[1] + m[2] * pl[2] + m[3] * pl[3];
+        let y = m[4] * pl[0] + m[5] * pl[1] + m[6] * pl[2] + m[7] * pl[3];
+        let z = m[8] * pl[0] + m[9] * pl[1] + m[10] * pl[2] + m[11] * pl[3];
+        let w = m[12] * pl[0] + m[13] * pl[1] + m[14] * pl[2] + m[15] * pl[3];
+        let len = (x * x + y * y + z * z).sqrt();
+        if len > 1e-7 && len.is_finite() { [x / len, y / len, z / len, w / len] } else { [0.0, 0.0, 0.0, 1.0] }
+    });
+    let det3 =
+        m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) + m[8] * (m[1] * m[6] - m[2] * m[5]);
+    let (backface_enabled, local_cam) = if p.backface_cull && det3.is_finite() && det3 > 1e-6 {
+        let inv = crate::matrix::invert(m);
+        let cx = p.camera_pos[0];
+        let cy = p.camera_pos[1];
+        let cz = p.camera_pos[2];
+        let lc = [
+            inv[0] * cx + inv[4] * cy + inv[8] * cz + inv[12],
+            inv[1] * cx + inv[5] * cy + inv[9] * cz + inv[13],
+            inv[2] * cx + inv[6] * cy + inv[10] * cz + inv[14],
+            0.0,
+        ];
+        if lc.iter().all(|v| v.is_finite()) { (true, lc) } else { (false, [0.0; 4]) }
+    } else {
+        (false, [0.0; 4])
+    };
+    let hiz = hiz.filter(|_| p.hiz_enabled);
+    let hiz_mips = hiz.map_or(0, |v| p.hiz_mips.min(v.texture().mip_level_count()));
+    Ok(CullUniform {
+        model: p.model,
+        hiz_vp: p.hiz_vp,
+        local_planes,
+        camera_pos: [p.camera_pos[0], p.camera_pos[1], p.camera_pos[2], 0.0],
+        local_cam,
+        counts_flags: [
+            mesh.cluster_count,
+            u32::from(hiz.is_some()),
+            hiz_mips,
+            u32::from(backface_enabled) | (u32::from(p.reversed_z) << 1),
+        ],
+        projection: [scale, proj_scale, params.near_plane, params.pixel_error_threshold],
+    })
+}
+
+pub(crate) struct MeshletDagBatchEntry<'a> {
+    pub mesh: &'a MeshletDagGpu,
+    pub output: &'a MeshletDagTwoPhaseOutput,
+    pub params: MeshletDagCullParams,
 }
 
 // The maximum absolute row sum of M^T M bounds its largest eigenvalue.
@@ -924,15 +993,15 @@ pub struct MeshletDagCuller {
 
 impl MeshletDagCuller {
     fn bind_group_layout(device: &wgpu::Device, two_phase: bool) -> wgpu::BindGroupLayout {
-        let buffer = |binding, ty| wgpu::BindGroupLayoutEntry {
+        let buffer = |binding, ty, has_dynamic_offset, min_binding_size| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset, min_binding_size },
             count: None,
         };
-        let storage = |binding, read_only| buffer(binding, wgpu::BufferBindingType::Storage { read_only });
+        let storage = |binding, read_only| buffer(binding, wgpu::BufferBindingType::Storage { read_only }, false, None);
         let entries = [
-            buffer(0, wgpu::BufferBindingType::Uniform),
+            buffer(0, wgpu::BufferBindingType::Uniform, true, wgpu::BufferSize::new(size_of::<CullUniform>() as u64)),
             storage(1, true),
             storage(2, false),
             storage(3, false),
@@ -1056,6 +1125,145 @@ impl MeshletDagCuller {
         self.dispatch(device, encoder, mesh, DagCullPass::Phase2(output), params, current_hiz)
     }
 
+    pub(crate) fn cull_batch_single(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        batch: &[MeshletDagBatchEntry<'_>],
+        hiz: Option<&wgpu::TextureView>,
+    ) -> Result<()> {
+        self.dispatch_batch(device, encoder, batch, false, false, hiz)
+    }
+
+    pub(crate) fn cull_batch_phase1(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        batch: &[MeshletDagBatchEntry<'_>],
+        prior_hiz: Option<&wgpu::TextureView>,
+    ) -> Result<()> {
+        self.dispatch_batch(device, encoder, batch, true, false, prior_hiz)
+    }
+
+    pub(crate) fn cull_batch_phase2(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        batch: &[MeshletDagBatchEntry<'_>],
+        current_hiz: Option<&wgpu::TextureView>,
+    ) -> Result<()> {
+        self.dispatch_batch(device, encoder, batch, true, true, current_hiz)
+    }
+
+    fn dispatch_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        batch: &[MeshletDagBatchEntry<'_>],
+        two_phase: bool,
+        phase2: bool,
+        hiz: Option<&wgpu::TextureView>,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let (layout, pipeline) = if two_phase {
+            let pipelines = self.two_phase_pipelines(device)?;
+            (&pipelines.two_phase_layout, if phase2 { &pipelines.phase2_pipeline } else { &pipelines.phase1_pipeline })
+        } else {
+            (&self.layout, &self.pipeline)
+        };
+        let align = device.limits().min_uniform_buffer_offset_alignment.max(16);
+        let u_size = size_of::<CullUniform>() as u32;
+        let stride = u_size.next_multiple_of(align);
+        let mut uniforms = vec![0u8; stride as usize * batch.len()];
+        let mut active: Vec<(usize, u32)> = Vec::with_capacity(batch.len());
+
+        for (i, item) in batch.iter().enumerate() {
+            let (out, capacity) = if two_phase {
+                if phase2 {
+                    (&item.output.phase2, item.output.capacity())
+                } else {
+                    (&item.output.phase1, item.output.capacity())
+                }
+            } else {
+                (&item.output.phase1, item.output.phase1.capacity())
+            };
+            ensure!(capacity >= item.mesh.cluster_count, "DAG output buffer has insufficient capacity");
+            let u = build_cull_uniform(item.mesh, &item.params, hiz)?;
+            encoder.clear_buffer(&out.draw_count_buf, 0, None);
+            encoder.clear_buffer(&out.draws_buf, 0, None);
+            if item.mesh.cluster_count == 0 {
+                if two_phase && !phase2 {
+                    encoder.clear_buffer(&item.output.phase2_flags_buf, 0, None);
+                }
+                continue;
+            }
+            let off = i * stride as usize;
+            uniforms[off..off + u_size as usize].copy_from_slice(bytemuck::bytes_of(&u));
+            active.push((i, (i as u32) * stride));
+        }
+        if active.is_empty() {
+            return Ok(());
+        }
+
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("meshlet_dag_batch_uniforms"),
+            contents: &uniforms,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let u_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &uniform_buf,
+            offset: 0,
+            size: wgpu::BufferSize::new(u64::from(u_size)),
+        });
+        let max_wg_x = device.limits().max_compute_workgroups_per_dimension;
+        let mut bind_groups = Vec::with_capacity(active.len());
+        for &(i, dyn_off) in &active {
+            let item = &batch[i];
+            let out = if two_phase && phase2 { &item.output.phase2 } else { &item.output.phase1 };
+            let hiz_view = hiz.filter(|_| item.params.cull.hiz_enabled).unwrap_or(&self.dummy_hiz);
+            let entries = [
+                wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
+                wgpu::BindGroupEntry { binding: 1, resource: item.mesh.clusters_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: out.draws_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: out.draw_count_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(hiz_view) },
+                wgpu::BindGroupEntry { binding: 5, resource: out.selected_clusters_buf.as_entire_binding() },
+            ];
+            let two_phase_entries;
+            let slice = if two_phase {
+                two_phase_entries = [
+                    entries[0].clone(),
+                    entries[1].clone(),
+                    entries[2].clone(),
+                    entries[3].clone(),
+                    entries[4].clone(),
+                    entries[5].clone(),
+                    wgpu::BindGroupEntry { binding: 6, resource: item.output.phase2_flags_buf.as_entire_binding() },
+                ];
+                two_phase_entries.as_slice()
+            } else {
+                entries.as_slice()
+            };
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("meshlet_dag_cut"),
+                layout,
+                entries: slice,
+            });
+            let groups = item.mesh.cluster_count.div_ceil(WORKGROUP_SIZE);
+            let width = groups.min(max_wg_x);
+            bind_groups.push((bg, dyn_off, width, groups.div_ceil(width)));
+        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        pass.set_pipeline(pipeline);
+        for (bg, dyn_off, wx, wy) in &bind_groups {
+            pass.set_bind_group(0, bg, &[*dyn_off]);
+            pass.dispatch_workgroups(*wx, *wy, 1);
+        }
+        Ok(())
+    }
+
     fn dispatch(
         &self,
         device: &wgpu::Device,
@@ -1089,43 +1297,16 @@ impl MeshletDagCuller {
             }
         };
         ensure!(capacity >= mesh.cluster_count, "DAG output buffer has insufficient capacity");
-        let p = &params.cull;
-        let scale = model_scale(&p.model);
-        let proj_scale = 0.5 * params.viewport_height * params.proj[5].abs();
-        ensure!(
-            scale.is_finite()
-                && proj_scale.is_finite()
-                && proj_scale > 0.0
-                && params.near_plane.is_finite()
-                && params.near_plane > 0.0
-                && params.pixel_error_threshold.is_finite()
-                && params.pixel_error_threshold >= 0.0,
-            "invalid DAG cull scale, projection, near plane or error threshold"
-        );
+        let uniform = build_cull_uniform(mesh, params, hiz)?;
         encoder.clear_buffer(&output.draw_count_buf, 0, None);
         encoder.clear_buffer(&output.draws_buf, 0, None);
-        if let DagCullPass::Phase1(output) = cut {
-            encoder.clear_buffer(&output.phase2_flags_buf, 0, None);
-        }
         if mesh.cluster_count == 0 {
+            if let DagCullPass::Phase1(output) = cut {
+                encoder.clear_buffer(&output.phase2_flags_buf, 0, None);
+            }
             return Ok(());
         }
-        let hiz = hiz.filter(|_| p.hiz_enabled);
-        let hiz_mips = hiz.map_or(0, |v| p.hiz_mips.min(v.texture().mip_level_count()));
-        let uniform = CullUniform {
-            model: p.model,
-            inv_model: crate::matrix::invert(&p.model),
-            hiz_vp: p.hiz_vp,
-            planes: p.frustum_planes,
-            camera_pos: [p.camera_pos[0], p.camera_pos[1], p.camera_pos[2], 0.0],
-            counts_flags: [
-                mesh.cluster_count,
-                u32::from(hiz.is_some()),
-                hiz_mips,
-                u32::from(p.backface_cull) | (u32::from(p.reversed_z) << 1),
-            ],
-            projection: [scale, proj_scale, params.near_plane, params.pixel_error_threshold],
-        };
+        let hiz = hiz.filter(|_| params.cull.hiz_enabled);
         // A separate immutable uniform per dispatch supports multiple cuts in one encoder.
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("meshlet_dag_uniform"),
@@ -1136,7 +1317,14 @@ impl MeshletDagCuller {
             wgpu::BindGroupEntry { binding, resource: buffer.as_entire_binding() }
         }
         let entries = [
-            entry(0, &uniform),
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &uniform,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(size_of::<CullUniform>() as u64),
+                }),
+            },
             entry(1, &mesh.clusters_buf),
             entry(2, &output.draws_buf),
             entry(3, &output.draw_count_buf),
@@ -1159,7 +1347,7 @@ impl MeshletDagCuller {
         let width = groups.min(device.limits().max_compute_workgroups_per_dimension);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_bind_group(0, &bind_group, &[0]);
         pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
         Ok(())
     }

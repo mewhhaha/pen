@@ -381,63 +381,20 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
   }
 
   let pos = center.world;
-  let sr = load_world(d_px + vec2i(1, 0), depth_dims);
-  let sl = load_world(d_px - vec2i(1, 0), depth_dims);
-  let sd = load_world(d_px + vec2i(0, 1), depth_dims);
-  let su = load_world(d_px - vec2i(0, 1), depth_dims);
-
-  var dx = vec3f(1.0, 0.0, 0.0);
-  var has_dx = true;
-  if (sr.valid && sl.valid) {
-    let dr = sr.world - pos;
-    let dl = pos - sl.world;
-    dx = select(dl, dr, dot(dr, dr) < dot(dl, dl));
-  } else if (sr.valid) {
-    dx = sr.world - pos;
-  } else if (sl.valid) {
-    dx = pos - sl.world;
-  } else {
-    has_dx = false;
-  }
-
-  var dy = vec3f(0.0, 0.0, 1.0);
-  var has_dy = true;
-  if (sd.valid && su.valid) {
-    let dd = sd.world - pos;
-    let du = pos - su.world;
-    dy = select(du, dd, dot(dd, dd) < dot(du, du));
-  } else if (sd.valid) {
-    dy = sd.world - pos;
-  } else if (su.valid) {
-    dy = pos - su.world;
-  } else {
-    has_dy = false;
-  }
-
-  var n = vec3f(0.0, 1.0, 0.0);
-  if (has_dx && has_dy) {
-    let raw_n = cross(dx, dy);
-    let area2 = dot(raw_n, raw_n);
-    let ref2 = dot(dx, dx) * dot(dy, dy);
-    if (area2 > 1e-12 * ref2 && ref2 > 0.0) {
-      n = raw_n * inverseSqrt(area2);
-    }
-  }
   let to_cam = u.camera_pos_and_clear.xyz - pos;
   let cam_dist = length(to_cam);
   let view_dir = select(vec3f(0.0, 1.0, 0.0), to_cam / cam_dist, cam_dist > 1e-6);
-  if (dot(n, view_dir) < 0.0) {
-    n = -n;
-  }
 
   // Prefer rasterized Thin G-Buffer (zero primary rays, exact skinned/instanced/sheared vertex normals
-  // and per-instance material overrides); fall back to slim primary TLAS lookup when absent or uncovered.
+  // and per-instance material overrides); skip 4-neighbor depth unprojection when Thin G-Buffer hits.
   let use_mat_gbuf = (u.extra_counts.w & 1u) != 0u;
   let use_thin_gbuf = (u.extra_counts.w & 4u) != 0u;
+  var n = vec3f(0.0, 1.0, 0.0);
   var mat_albedo = vec3f(1.0);
   var mat_roughness = clamp(u.sun_color_and_rough.a, 0.04, 1.0);
   var mat_metallic = 0.0;
   var has_mat_hit = false;
+  var pixel_scale = cam_dist / f32(max(depth_dims.x, depth_dims.y)) * 0.1;
   let mask = u.counts.w;
   if (use_thin_gbuf) {
     let g_dims = vec2i(textureDimensions(gbuf_normal_roughness, 0));
@@ -458,6 +415,53 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
       mat_roughness = clamp(g_nr.w, 0.04, 1.0);
       mat_metallic = clamp(g_am.w, 0.0, 1.0);
     }
+  }
+  if (!has_mat_hit) {
+    let sr = load_world(d_px + vec2i(1, 0), depth_dims);
+    let sl = load_world(d_px - vec2i(1, 0), depth_dims);
+    let sd = load_world(d_px + vec2i(0, 1), depth_dims);
+    let su = load_world(d_px - vec2i(0, 1), depth_dims);
+
+    var dx = vec3f(1.0, 0.0, 0.0);
+    var has_dx = true;
+    if (sr.valid && sl.valid) {
+      let dr = sr.world - pos;
+      let dl = pos - sl.world;
+      dx = select(dl, dr, dot(dr, dr) < dot(dl, dl));
+    } else if (sr.valid) {
+      dx = sr.world - pos;
+    } else if (sl.valid) {
+      dx = pos - sl.world;
+    } else {
+      has_dx = false;
+    }
+
+    var dy = vec3f(0.0, 0.0, 1.0);
+    var has_dy = true;
+    if (sd.valid && su.valid) {
+      let dd = sd.world - pos;
+      let du = pos - su.world;
+      dy = select(du, dd, dot(dd, dd) < dot(du, du));
+    } else if (sd.valid) {
+      dy = sd.world - pos;
+    } else if (su.valid) {
+      dy = pos - su.world;
+    } else {
+      has_dy = false;
+    }
+
+    if (has_dx && has_dy) {
+      let raw_n = cross(dx, dy);
+      let area2 = dot(raw_n, raw_n);
+      let ref2 = dot(dx, dx) * dot(dy, dy);
+      if (area2 > 1e-12 * ref2 && ref2 > 0.0) {
+        n = raw_n * inverseSqrt(area2);
+      }
+    }
+    if (dot(n, view_dir) < 0.0) {
+      n = -n;
+    }
+    pixel_scale = max(length(dx), length(dy)) * 0.05;
   }
   if (!has_mat_hit && use_mat_gbuf && cam_dist > 1e-3) {
     let prim_dir = -view_dir;
@@ -487,7 +491,6 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
   }
 
   let min_bias = max(u.bias_and_refl.x, 1e-5);
-  let pixel_scale = max(length(dx), length(dy)) * 0.05;
   let bias = max(min_bias, min(pixel_scale, cam_dist * 2e-4));
   let ray_origin = pos + n * bias;
   let max_dist = max(u.sky_horizon.a, 1.0);

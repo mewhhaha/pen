@@ -56,6 +56,7 @@ struct GiReservoir {
 @group(0) @binding(18) var<storage, read> gi_prev: array<GiReservoir>;
 @group(0) @binding(19) var<storage, read_write> gi_output: array<GiReservoir>;
 @group(0) @binding(20) var out_gi: texture_storage_2d<rgba16float, write>;
+// __RESTIR_SHARC_DECLS__
 
 const PI: f32 = 3.14159265359;
 const TAU: f32 = 2.0 * PI;
@@ -663,6 +664,7 @@ fn restir_gi_initial(@builtin(global_invocation_id) id: vec3u) {
       let shaded = shade_bounce(pos, nrm, hit, &rng);
       radiance = shaded.rgb;
       let diff_albedo = clamp(hit.albedo * (1.0 - hit.metallic), vec3f(0.0), vec3f(1.0));
+      // __RESTIR_SHARC_BOUNCE__
       hit_albedo_ddgi = bitcast<f32>(pack4x8unorm(vec4f(diff_albedo, shaded.a)));
     }
     // A one-candidate reservoir uses the inverse cosine sampling density.
@@ -766,6 +768,7 @@ fn restir_gi_spatial(@builtin(global_invocation_id) id: vec3u) {
       rgb = safe_rgb(result.radiance_wsum.rgb * (gi_cosine(g, result) * weight / PI));
     }
   }
+  // __RESTIR_SHARC_DEPOSIT__
   textureStore(out_gi, pixel, vec4f(rgb, f32(g.valid && (u.flags.w & 2u) != 0u)));
 }
 

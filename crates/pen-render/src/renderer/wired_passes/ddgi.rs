@@ -150,8 +150,16 @@ impl State {
             let Some(bi) = pool.ensure_blas(device, encoder, source.id, &source.triangles)? else {
                 return Ok(());
             };
-            let inv = invert(&transform);
-            if !inv.iter().all(|v| v.is_finite()) {
+            if !transform.iter().all(|v| v.is_finite()) {
+                return Ok(());
+            }
+            let is_affine = transform[3] == 0.0 && transform[7] == 0.0 && transform[11] == 0.0 && transform[15] == 1.0;
+            let det3 = transform[0] * (transform[5] * transform[10] - transform[6] * transform[9])
+                - transform[4] * (transform[1] * transform[10] - transform[2] * transform[9])
+                + transform[8] * (transform[1] * transform[6] - transform[2] * transform[5]);
+            if !(is_affine && det3.is_finite() && det3.abs() > 1e-12)
+                && !invert(&transform).iter().all(|v| v.is_finite())
+            {
                 return Ok(());
             }
             let (bmin, bmax) = pool.blas_bounds(bi);
@@ -214,6 +222,8 @@ impl State {
             Ok(())
         };
 
+        let mut batch_draws: Option<Vec<Vec<usize>>> = None;
+
         for &ready_idx in &scratch.opaque {
             let entry = &scratch.ready[ready_idx];
             let item = &scratch.items[entry.item];
@@ -247,11 +257,20 @@ impl State {
                     if let Some(GpuAsset::Mesh(mesh)) = self.assets.current(batch.mesh)
                         && let Some(src) = &mesh.rt_source
                     {
-                        for (draw_idx, placement) in scratch.placements.iter().enumerate() {
-                            if placement.batch as usize == batch_idx
-                                && let Some(draw) = frame.draws.get(draw_idx)
-                            {
-                                push_inst(pool, src, draw.transform, mat, draw.parameters)?;
+                        let by_batch = batch_draws.get_or_insert_with(|| {
+                            let mut grouped = vec![Vec::new(); scratch.batches.len()];
+                            for (draw_idx, placement) in scratch.placements.iter().enumerate() {
+                                if let Some(list) = grouped.get_mut(placement.batch as usize) {
+                                    list.push(draw_idx);
+                                }
+                            }
+                            grouped
+                        });
+                        if let Some(draw_indices) = by_batch.get(batch_idx) {
+                            for &draw_idx in draw_indices {
+                                if let Some(draw) = frame.draws.get(draw_idx) {
+                                    push_inst(pool, src, draw.transform, mat, draw.parameters)?;
+                                }
                             }
                         }
                     }

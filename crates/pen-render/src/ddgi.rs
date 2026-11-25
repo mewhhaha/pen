@@ -182,12 +182,13 @@ pub struct DdgiVolume {
     trace_bgl_hw: Option<wgpu::BindGroupLayout>,
     blend_irr_pipe: wgpu::ComputePipeline,
     blend_vis_pipe: wgpu::ComputePipeline,
-    blend_bgl: wgpu::BindGroupLayout,
+    blend_bg: wgpu::BindGroup,
     relocate_pipe: wgpu::ComputePipeline,
-    relocate_bgl: wgpu::BindGroupLayout,
+    reloc_bg: wgpu::BindGroup,
     border_irr_pipe: wgpu::ComputePipeline,
     border_vis_pipe: wgpu::ComputePipeline,
-    border_bgl: wgpu::BindGroupLayout,
+    border_irr_bg: wgpu::BindGroup,
+    border_vis_bg: wgpu::BindGroup,
     eval_pipe: wgpu::ComputePipeline,
     eval_bgl: wgpu::BindGroupLayout,
     pack_pipe: wgpu::ComputePipeline,
@@ -199,9 +200,9 @@ pub struct DdgiVolume {
     probe_offsets: wgpu::Buffer,
     sampler: wgpu::Sampler,
     irr_curr: AtlasTex,
-    irr_tmp: AtlasTex,
+    _irr_tmp: AtlasTex,
     vis_curr: AtlasTex,
-    vis_tmp: AtlasTex,
+    _vis_tmp: AtlasTex,
     scroll_offset: [i32; 3],
     pending_scroll_delta: [i32; 3],
     frame_index: u32,
@@ -451,6 +452,49 @@ impl DdgiVolume {
             ..Default::default()
         });
 
+        let irr_curr = AtlasTex::new(device, "ddgi_irr_curr", irr_w, irr_h);
+        let irr_tmp = AtlasTex::new(device, "ddgi_irr_tmp", irr_w, irr_h);
+        let vis_curr = AtlasTex::new(device, "ddgi_vis_curr", vis_w, vis_h);
+        let vis_tmp = AtlasTex::new(device, "ddgi_vis_tmp", vis_w, vis_h);
+
+        let blend_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ddgi_blend_bg"),
+            layout: &blend_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: ray_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&irr_curr.view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&vis_curr.view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&irr_tmp.view) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&vis_tmp.view) },
+            ],
+        });
+        let border_irr_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ddgi_border_irr_bg"),
+            layout: &border_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&irr_tmp.view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&irr_curr.view) },
+            ],
+        });
+        let border_vis_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ddgi_border_vis_bg"),
+            layout: &border_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&vis_tmp.view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&vis_curr.view) },
+            ],
+        });
+        let reloc_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ddgi_relocate_bg"),
+            layout: &relocate_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: ray_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: probe_offsets.as_entire_binding() },
+            ],
+        });
+
         Ok(Self {
             config,
             trace_pipe,
@@ -461,12 +505,13 @@ impl DdgiVolume {
             trace_bgl_hw,
             blend_irr_pipe,
             blend_vis_pipe,
-            blend_bgl,
+            blend_bg,
             relocate_pipe,
-            relocate_bgl,
+            reloc_bg,
             border_irr_pipe,
             border_vis_pipe,
-            border_bgl,
+            border_irr_bg,
+            border_vis_bg,
             eval_pipe,
             eval_bgl,
             pack_pipe,
@@ -477,10 +522,10 @@ impl DdgiVolume {
             ray_buf,
             probe_offsets,
             sampler,
-            irr_curr: AtlasTex::new(device, "ddgi_irr_curr", irr_w, irr_h),
-            irr_tmp: AtlasTex::new(device, "ddgi_irr_tmp", irr_w, irr_h),
-            vis_curr: AtlasTex::new(device, "ddgi_vis_curr", vis_w, vis_h),
-            vis_tmp: AtlasTex::new(device, "ddgi_vis_tmp", vis_w, vis_h),
+            irr_curr,
+            _irr_tmp: irr_tmp,
+            vis_curr,
+            _vis_tmp: vis_tmp,
             scroll_offset: [0; 3],
             pending_scroll_delta: [0; 3],
             frame_index: 0,
@@ -597,9 +642,6 @@ impl DdgiVolume {
             self.frame_index = 0;
         }
         let light_count = local_lights.len().min(MAX_RT_LOCAL_LIGHTS);
-        if light_count > 0 {
-            encode_copy(device, encoder, &self.local_lights_buf, bytemuck::cast_slice(&local_lights[..light_count]));
-        }
         let scroll_delta = self.pending_scroll_delta;
         self.pending_scroll_delta = [0; 3];
         let rot = frame_rotation_matrix(self.frame_index);
@@ -654,7 +696,25 @@ impl DdgiVolume {
             ],
             scroll_delta: [scroll_delta[0], scroll_delta[1], scroll_delta[2], 0],
         };
-        encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u));
+        let u_bytes = bytemuck::bytes_of(&u);
+        if light_count > 0 {
+            let l_bytes: &[u8] = bytemuck::cast_slice(&local_lights[..light_count]);
+            let u_len = u_bytes.len() as u64;
+            let l_len = l_bytes.len() as u64;
+            let stage = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ddgi_frame_stage"),
+                size: u_len + l_len,
+                usage: wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
+            stage.slice(0..u_len).get_mapped_range_mut().unwrap().copy_from_slice(u_bytes);
+            stage.slice(u_len..u_len + l_len).get_mapped_range_mut().unwrap().copy_from_slice(l_bytes);
+            stage.unmap();
+            encoder.copy_buffer_to_buffer(&stage, 0, &self.uniform, 0, u_len);
+            encoder.copy_buffer_to_buffer(&stage, u_len, &self.local_lights_buf, 0, l_len);
+        } else {
+            encode_copy(device, encoder, &self.uniform, u_bytes);
+        }
 
         let [nx, ny, nz] = self.config.dims;
         let total_rays = nx * ny * nz * self.config.rays_per_probe;
@@ -729,24 +789,12 @@ impl DdgiVolume {
         }
 
         // 2. Blend interior octahedral texels into tmp atlases.
-        let blend_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ddgi_blend_bg"),
-            layout: &self.blend_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.ray_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.irr_curr.view) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.vis_curr.view) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&self.irr_tmp.view) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.vis_tmp.view) },
-            ],
-        });
         let cols = nx * nz;
         {
             let mut pass = encoder
                 .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ddgi_blend"), timestamp_writes: None });
             pass.set_pipeline(&self.blend_irr_pipe);
-            pass.set_bind_group(0, &blend_bg, &[]);
+            pass.set_bind_group(0, &self.blend_bg, &[]);
             pass.dispatch_workgroups(
                 (cols * DDGI_IRRADIANCE_INNER).div_ceil(8),
                 (ny * DDGI_IRRADIANCE_INNER).div_ceil(8),
@@ -754,7 +802,7 @@ impl DdgiVolume {
             );
 
             pass.set_pipeline(&self.blend_vis_pipe);
-            pass.set_bind_group(0, &blend_bg, &[]);
+            pass.set_bind_group(0, &self.blend_bg, &[]);
             pass.dispatch_workgroups(
                 (cols * DDGI_VISIBILITY_INNER).div_ceil(8),
                 (ny * DDGI_VISIBILITY_INNER).div_ceil(8),
@@ -763,29 +811,13 @@ impl DdgiVolume {
         }
 
         // 3. Copy interior + wrap borders from tmp -> curr so curr is always sampling-ready!
-        let border_irr_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ddgi_border_irr_bg"),
-            layout: &self.border_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.irr_tmp.view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.irr_curr.view) },
-            ],
-        });
-        let border_vis_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ddgi_border_vis_bg"),
-            layout: &self.border_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.vis_tmp.view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.vis_curr.view) },
-            ],
-        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ddgi_borders"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.border_irr_pipe);
-            pass.set_bind_group(0, &border_irr_bg, &[]);
+            pass.set_bind_group(0, &self.border_irr_bg, &[]);
             pass.dispatch_workgroups(
                 (cols * DDGI_IRRADIANCE_TILE).div_ceil(8),
                 (ny * DDGI_IRRADIANCE_TILE).div_ceil(8),
@@ -793,7 +825,7 @@ impl DdgiVolume {
             );
 
             pass.set_pipeline(&self.border_vis_pipe);
-            pass.set_bind_group(0, &border_vis_bg, &[]);
+            pass.set_bind_group(0, &self.border_vis_bg, &[]);
             pass.dispatch_workgroups(
                 (cols * DDGI_VISIBILITY_TILE).div_ceil(8),
                 (ny * DDGI_VISIBILITY_TILE).div_ceil(8),
@@ -803,22 +835,13 @@ impl DdgiVolume {
 
         // 4. Relocate probes trapped inside solid geometry or hugging surfaces for subsequent frames.
         let total_probes = nx * ny * nz;
-        let reloc_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ddgi_relocate_bg"),
-            layout: &self.relocate_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: self.ray_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 11, resource: self.probe_offsets.as_entire_binding() },
-            ],
-        });
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ddgi_relocate"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.relocate_pipe);
-            pass.set_bind_group(0, &reloc_bg, &[]);
+            pass.set_bind_group(0, &self.reloc_bg, &[]);
             pass.dispatch_workgroups(total_probes.div_ceil(64), 1, 1);
         }
 

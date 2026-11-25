@@ -82,6 +82,12 @@ fn trace_tlas(
   if (inst_idx >= tlas_inst_count) {
     return best;
   }
+  if (any_hit) {
+    best.hit = true;
+    best.t = inter.t;
+    best.instance_index = inst_idx;
+    return best;
+  }
   let inst = tlas_instances[inst_idx];
   let tri_idx = inst.blas_tri_offset + inter.primitive_index;
   if (tri_idx >= blas_tri_total) {

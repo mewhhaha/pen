@@ -3,7 +3,7 @@ use super::{RENDER2D_EXT_TAG, RENDER2D_WORLD_EXT_TAG, WiredPasses};
 use crate::asset_store::AssetKind;
 use crate::render2d::{
     Camera2d, RadianceCascades2d, RadianceCascades2dConfig, Scene2dEmitter, SdfShape, SdfShapePass, Sprite2d,
-    Sprites2dPass, TileCell, TilemapPass, TilemapUniform, rasterize_scene_2d, sort_sprites,
+    Sprites2dPass, TileCell, TilemapPass, TilemapUniform, sort_sprites,
 };
 use anyhow::Result;
 use pen_protocol::{Catalog, RenderFrame};
@@ -101,6 +101,87 @@ const ALPHA_BLIT_WGSL: &str = r#"
 }
 "#;
 
+const RC2D_EMITTER_RASTER_WGSL: &str = r#"
+struct EmitterGpu {
+  geom: vec4f,
+  material: vec4f,
+  kind: vec4u,
+};
+
+@group(0) @binding(0) var<uniform> viewport: vec4f;
+@group(0) @binding(1) var<storage, read> emitters: array<EmitterGpu>;
+
+struct VsOut {
+  @builtin(position) clip: vec4f,
+  @location(0) center_r2: vec4f,
+  @location(1) material: vec4f,
+  @location(2) @interpolate(flat) is_rect: u32,
+};
+
+@vertex fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+  let e = emitters[ii];
+  let is_rect = e.kind.x;
+  var p0: vec2f;
+  var p1: vec2f;
+  var r2 = 0.0;
+  if (is_rect != 0u) {
+    p0 = e.geom.xy;
+    p1 = e.geom.xy + max(e.geom.zw, vec2f(0.0));
+  } else {
+    let r = max(e.geom.z, 0.0);
+    p0 = e.geom.xy - vec2f(r + 1.0);
+    p1 = e.geom.xy + vec2f(r + 1.0);
+    r2 = r * r;
+  }
+  var corner = vec2f(0.0);
+  switch vi {
+    case 0u: { corner = vec2f(p0.x, p0.y); }
+    case 1u: { corner = vec2f(p1.x, p0.y); }
+    case 2u: { corner = vec2f(p1.x, p1.y); }
+    case 3u: { corner = vec2f(p0.x, p0.y); }
+    case 4u: { corner = vec2f(p1.x, p1.y); }
+    default: { corner = vec2f(p0.x, p1.y); }
+  }
+  let ndc = vec2f(
+    (corner.x / max(viewport.x, 1.0)) * 2.0 - 1.0,
+    1.0 - (corner.y / max(viewport.y, 1.0)) * 2.0,
+  );
+  var out: VsOut;
+  out.clip = vec4f(ndc, 0.0, 1.0);
+  out.center_r2 = vec4f(e.geom.xy, r2, 0.0);
+  out.material = e.material;
+  out.is_rect = is_rect;
+  return out;
+}
+
+@fragment fn fs(in: VsOut) -> @location(0) vec4f {
+  if (in.is_rect == 0u) {
+    let d = in.clip.xy - in.center_r2.xy;
+    if (dot(d, d) > in.center_r2.z) {
+      discard;
+    }
+  }
+  return vec4f(in.material.rgb, clamp(in.material.a, 0.0, 1.0));
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Rc2dEmitterGpu {
+    geom: [f32; 4],
+    material: [f32; 4],
+    kind: [u32; 4],
+}
+
+struct Rc2dEmitterRaster {
+    bgl: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    viewport_buf: wgpu::Buffer,
+    emitter_buf: wgpu::Buffer,
+    emitter_cap: usize,
+    bg: wgpu::BindGroup,
+}
+
 struct AlphaBlitShared {
     module: wgpu::ShaderModule,
     bgl: wgpu::BindGroupLayout,
@@ -127,32 +208,10 @@ pub(in crate::renderer) struct Render2dWiredState {
     rc_state: Option<CachedRc2d>,
     rc_targets: Option<([u32; 2], wgpu::Texture, wgpu::TextureView, wgpu::Texture, wgpu::TextureView)>,
     rc_emitter_tex: Option<([u32; 2], u64, wgpu::Texture, wgpu::TextureView)>,
+    rc_emitter_raster: Option<Rc2dEmitterRaster>,
     ext_tilemap_buffers: HashMap<u64, Arc<wgpu::Buffer>>,
     alpha_blit_shared: Option<AlphaBlitShared>,
     alpha_blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
-}
-
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "IEEE-754 binary16 bit packing")]
-fn f32_to_f16(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff).cast_signed();
-    let frac = bits & 0x007f_ffff;
-    if exp == 0xff {
-        return sign | 0x7c00 | u16::from(frac != 0);
-    }
-    let unbiased = exp - 127 + 15;
-    if unbiased >= 31 {
-        return sign | 0x7c00;
-    }
-    if unbiased <= 0 {
-        if unbiased < -10 {
-            return sign;
-        }
-        let mant = (frac | 0x0080_0000) >> (14 - unbiased);
-        return sign | (mant as u16);
-    }
-    sign | ((unbiased as u16) << 10) | ((frac >> 13) as u16)
 }
 
 fn hash_emitters(emitters: &[Scene2dEmitter]) -> u64 {
@@ -690,8 +749,10 @@ impl State {
                     view.clone()
                 } else {
                     let ehash = hash_emitters(&rc_layer.emitters);
-                    if !matches!(&wired.render2d.rc_emitter_tex, Some((s, prev, ..)) if *s == rc_size && *prev == ehash)
-                    {
+                    let need_tex = !matches!(&wired.render2d.rc_emitter_tex, Some((s, ..)) if *s == rc_size);
+                    let need_raster =
+                        need_tex || !matches!(&wired.render2d.rc_emitter_tex, Some((_, prev, ..)) if *prev == ehash);
+                    if need_tex {
                         let tex = device.create_texture(&wgpu::TextureDescriptor {
                             label: Some("wired_rc2d_emitters"),
                             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -699,28 +760,166 @@ impl State {
                             sample_count: 1,
                             dimension: wgpu::TextureDimension::D2,
                             format: wgpu::TextureFormat::Rgba16Float,
-                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                             view_formats: &[],
                         });
-                        let pixels = rasterize_scene_2d(rc_size, &rc_layer.emitters);
-                        let mut f16_bytes = Vec::with_capacity(pixels.len() * 8);
-                        for px in pixels {
-                            for ch in px {
-                                f16_bytes.extend_from_slice(&f32_to_f16(ch).to_le_bytes());
-                            }
-                        }
-                        queue.write_texture(
-                            tex.as_image_copy(),
-                            &f16_bytes,
-                            wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(w * 8),
-                                rows_per_image: Some(h),
-                            },
-                            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                        );
                         let view = tex.create_view(&Default::default());
-                        wired.render2d.rc_emitter_tex = Some((rc_size, ehash, tex, view));
+                        wired.render2d.rc_emitter_tex = Some((rc_size, ehash ^ 1, tex, view));
+                    }
+                    if need_raster {
+                        let raster = wired.render2d.rc_emitter_raster.get_or_insert_with(|| {
+                            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                                label: Some("wired_rc2d_emitter_raster"),
+                                source: wgpu::ShaderSource::Wgsl(RC2D_EMITTER_RASTER_WGSL.into()),
+                            });
+                            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                                label: Some("wired_rc2d_emitter_raster_bgl"),
+                                entries: &[
+                                    wgpu::BindGroupLayoutEntry {
+                                        binding: 0,
+                                        visibility: wgpu::ShaderStages::VERTEX,
+                                        ty: wgpu::BindingType::Buffer {
+                                            ty: wgpu::BufferBindingType::Uniform,
+                                            has_dynamic_offset: false,
+                                            min_binding_size: wgpu::BufferSize::new(16),
+                                        },
+                                        count: None,
+                                    },
+                                    wgpu::BindGroupLayoutEntry {
+                                        binding: 1,
+                                        visibility: wgpu::ShaderStages::VERTEX,
+                                        ty: wgpu::BindingType::Buffer {
+                                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                            has_dynamic_offset: false,
+                                            min_binding_size: None,
+                                        },
+                                        count: None,
+                                    },
+                                ],
+                            });
+                            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                                label: Some("wired_rc2d_emitter_raster_pl"),
+                                bind_group_layouts: &[Some(&bgl)],
+                                immediate_size: 0,
+                            });
+                            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                                label: Some("wired_rc2d_emitter_raster"),
+                                layout: Some(&pl),
+                                vertex: wgpu::VertexState {
+                                    module: &module,
+                                    entry_point: Some("vs"),
+                                    compilation_options: Default::default(),
+                                    buffers: &[],
+                                },
+                                primitive: wgpu::PrimitiveState::default(),
+                                depth_stencil: None,
+                                multisample: Default::default(),
+                                fragment: Some(wgpu::FragmentState {
+                                    module: &module,
+                                    entry_point: Some("fs"),
+                                    compilation_options: Default::default(),
+                                    targets: &[Some(wgpu::ColorTargetState {
+                                        format: wgpu::TextureFormat::Rgba16Float,
+                                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                                        write_mask: wgpu::ColorWrites::ALL,
+                                    })],
+                                }),
+                                multiview_mask: None,
+                                cache: None,
+                            });
+                            let viewport_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("wired_rc2d_emitter_vp"),
+                                size: 16,
+                                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            });
+                            let emitter_cap = 64usize;
+                            let emitter_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("wired_rc2d_emitter_buf"),
+                                size: (emitter_cap * size_of::<Rc2dEmitterGpu>()) as u64,
+                                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            });
+                            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("wired_rc2d_emitter_bg"),
+                                layout: &bgl,
+                                entries: &[
+                                    wgpu::BindGroupEntry { binding: 0, resource: viewport_buf.as_entire_binding() },
+                                    wgpu::BindGroupEntry { binding: 1, resource: emitter_buf.as_entire_binding() },
+                                ],
+                            });
+                            Rc2dEmitterRaster { bgl, pipeline, viewport_buf, emitter_buf, emitter_cap, bg }
+                        });
+                        if rc_layer.emitters.len() > raster.emitter_cap {
+                            let new_cap = rc_layer.emitters.len().next_power_of_two().max(64);
+                            raster.emitter_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("wired_rc2d_emitter_buf"),
+                                size: (new_cap * size_of::<Rc2dEmitterGpu>()) as u64,
+                                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            });
+                            raster.emitter_cap = new_cap;
+                            raster.bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("wired_rc2d_emitter_bg"),
+                                layout: &raster.bgl,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: raster.viewport_buf.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: raster.emitter_buf.as_entire_binding(),
+                                    },
+                                ],
+                            });
+                        }
+                        if !rc_layer.emitters.is_empty() {
+                            queue.write_buffer(
+                                &raster.viewport_buf,
+                                0,
+                                bytemuck::bytes_of(&[w as f32, h as f32, 0.0, 0.0]),
+                            );
+                            let gpu_emitters: Vec<Rc2dEmitterGpu> = rc_layer
+                                .emitters
+                                .iter()
+                                .map(|&e| match e {
+                                    Scene2dEmitter::Circle { center, radius, material } => Rc2dEmitterGpu {
+                                        geom: [center[0], center[1], radius, 0.0],
+                                        material,
+                                        kind: [0, 0, 0, 0],
+                                    },
+                                    Scene2dEmitter::Rect { rect, material } => {
+                                        Rc2dEmitterGpu { geom: rect, material, kind: [1, 0, 0, 0] }
+                                    }
+                                })
+                                .collect();
+                            queue.write_buffer(&raster.emitter_buf, 0, bytemuck::cast_slice(&gpu_emitters));
+                        }
+                        let emitter_entry = wired.render2d.rc_emitter_tex.as_mut().unwrap();
+                        emitter_entry.1 = ehash;
+                        let target_view = &emitter_entry.3;
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("render2d_rc_emitters"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: target_view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            ..Default::default()
+                        });
+                        if !rc_layer.emitters.is_empty() {
+                            let raster = wired.render2d.rc_emitter_raster.as_ref().unwrap();
+                            pass.set_pipeline(&raster.pipeline);
+                            pass.set_bind_group(0, &raster.bg, &[]);
+                            #[allow(clippy::cast_possible_truncation, reason = "bounded emitter count <= 4096")]
+                            let instance_count = rc_layer.emitters.len() as u32;
+                            pass.draw(0..6, 0..instance_count);
+                        }
                     }
                     wired.render2d.rc_emitter_tex.as_ref().unwrap().3.clone()
                 };

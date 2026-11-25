@@ -11,10 +11,12 @@ struct DagClusterGpu {
 
 struct CullUniform {
   model: mat4x4f,
-  inv_model: mat4x4f,
   hiz_vp: mat4x4f,
-  planes: array<vec4f, 6>,
+  // Pre-transformed, unit-length local-space frustum planes: normalize(transpose(model) * world_plane).
+  local_planes: array<vec4f, 6>,
   camera_pos: vec4f,
+  // Pre-computed inverse-transformed camera position for backface cone test.
+  local_cam: vec4f,
   // cluster count, Hi-Z enabled, Hi-Z mip count, backface/reversed-Z flags
   counts_flags: vec4u,
   // model scale bound, projection scale in pixels, near plane, pixel error threshold
@@ -37,18 +39,12 @@ struct DrawIndexedIndirect {
 @group(0) @binding(5) var<storage, read_write> selected_clusters: array<u32>;
 @group(0) @binding(6) var<storage, read_write> phase2_flags: array<u32>;
 
-// Exact local-space frustum test: transforms each world plane by transpose(model) so non-uniform
-// scaling and shear never under-estimate the projected bounding sphere radius.
+// Exact local-space frustum test using CPU-precomputed normalized local planes.
 fn in_frustum_local(local_center: vec3f, local_radius: f32) -> bool {
-  let mt = transpose(u.model);
+  let limit = -(local_radius * 1.001 + 1e-5);
   for (var i = 0u; i < 6u; i++) {
-    let lp = mt * u.planes[i];
-    let n_len = length(lp.xyz);
-    if (n_len <= 1e-7) {
-      continue;
-    }
-    let dist = (dot(lp.xyz, local_center) + lp.w) / n_len;
-    if (dist < -(local_radius * 1.001 + 1e-5)) {
+    let lp = u.local_planes[i];
+    if (dot(lp.xyz, local_center) + lp.w < limit) {
       return false;
     }
   }
@@ -118,18 +114,15 @@ fn backface_culled(m: DagClusterGpu) -> bool {
   if ((u.counts_flags.w & 1u) == 0u || m.cone_axis_cutoff.w >= 0.999) {
     return false;
   }
-  // Testing the inverse-transformed camera preserves facing under positive-
-  // determinant affine transforms. Disable the test for mirrored/singular models.
-  let det = dot(u.model[0].xyz, cross(u.model[1].xyz, u.model[2].xyz));
-  if (det <= 1e-6) {
-    return false;
-  }
-  let local_cam = (u.inv_model * vec4f(u.camera_pos.xyz, 1.0)).xyz;
-  let to_center = m.bounds_sphere.xyz - local_cam;
+  // CPU already cleared the backface bit when det3 <= 1e-6 and pre-computed local_cam.
+  let to_center = m.bounds_sphere.xyz - u.local_cam.xyz;
   let dist = length(to_center);
   return dist > m.bounds_sphere.w
     && dot(to_center, m.cone_axis_cutoff.xyz) >= m.cone_axis_cutoff.w * dist + m.bounds_sphere.w;
 }
+
+var<workgroup> wg_count: atomic<u32>;
+var<workgroup> wg_base: u32;
 
 @compute @workgroup_size(64)
 fn cull_meshlet_dag(
@@ -137,29 +130,48 @@ fn cull_meshlet_dag(
   @builtin(num_workgroups) groups: vec3u,
   @builtin(local_invocation_index) lane: u32,
 ) {
+  if (lane == 0u) {
+    atomicStore(&wg_count, 0u);
+  }
+  workgroupBarrier();
+
   let idx = (group.y * groups.x + group.x) * 64u + lane;
-  if (idx >= u.counts_flags.x) {
-    return;
-  }
-  let m = clusters[idx];
-  let lod_pass = m.errors.x <= 0.0 || screen_error(m.lod_sphere, m.errors.x) <= u.projection.w;
-  let parent_fail = m.errors.y >= 1e29 || screen_error(m.parent_sphere, m.errors.y) > u.projection.w;
-  if (!(lod_pass && parent_fail)) {
-    return;
-  }
-  let sphere = m.bounds_sphere;
-  if (!in_frustum_local(sphere.xyz, sphere.w) || backface_culled(m)) {
-    return;
-  }
-  let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
-  let reversed_z = (u.counts_flags.w & 2u) != 0u;
-  if (hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
-    return;
+  var emit = false;
+  var counts = vec4u(0u);
+  if (idx < u.counts_flags.x) {
+    let m = clusters[idx];
+    let lod_pass = m.errors.x <= 0.0 || screen_error(m.lod_sphere, m.errors.x) <= u.projection.w;
+    let parent_fail = m.errors.y >= 1e29 || screen_error(m.parent_sphere, m.errors.y) > u.projection.w;
+    if (lod_pass && parent_fail) {
+      let sphere = m.bounds_sphere;
+      if (in_frustum_local(sphere.xyz, sphere.w) && !backface_culled(m)) {
+        let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
+        let reversed_z = (u.counts_flags.w & 2u) != 0u;
+        if (!hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
+          emit = true;
+          counts = m.counts;
+        }
+      }
+    }
   }
 
-  let slot = atomicAdd(&draw_count, 1u);
-  draws[slot] = DrawIndexedIndirect(m.counts.y, 1u, m.counts.x, bitcast<i32>(m.counts.z), 0u);
-  selected_clusters[slot] = idx;
+  var local_slot = 0u;
+  if (emit) {
+    local_slot = atomicAdd(&wg_count, 1u);
+  }
+  workgroupBarrier();
+  if (lane == 0u) {
+    let total = atomicLoad(&wg_count);
+    if (total > 0u) {
+      wg_base = atomicAdd(&draw_count, total);
+    }
+  }
+  workgroupBarrier();
+  if (emit) {
+    let slot = wg_base + local_slot;
+    draws[slot] = DrawIndexedIndirect(counts.y, 1u, counts.x, bitcast<i32>(counts.z), 0u);
+    selected_clusters[slot] = idx;
+  }
 }
 
 @compute @workgroup_size(64)
@@ -168,29 +180,50 @@ fn cull_meshlet_dag_phase1(
   @builtin(num_workgroups) groups: vec3u,
   @builtin(local_invocation_index) lane: u32,
 ) {
+  if (lane == 0u) {
+    atomicStore(&wg_count, 0u);
+  }
+  workgroupBarrier();
+
   let idx = (group.y * groups.x + group.x) * 64u + lane;
-  if (idx >= u.counts_flags.x) {
-    return;
-  }
-  let m = clusters[idx];
-  let lod_pass = m.errors.x <= 0.0 || screen_error(m.lod_sphere, m.errors.x) <= u.projection.w;
-  let parent_fail = m.errors.y >= 1e29 || screen_error(m.parent_sphere, m.errors.y) > u.projection.w;
-  let sphere = m.bounds_sphere;
-  if (!(lod_pass && parent_fail) || !in_frustum_local(sphere.xyz, sphere.w) || backface_culled(m)) {
-    phase2_flags[idx] = 0u;
-    return;
-  }
-  let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
-  let reversed_z = (u.counts_flags.w & 2u) != 0u;
-  if (hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
-    phase2_flags[idx] = 1u;
-    return;
+  var emit = false;
+  var counts = vec4u(0u);
+  if (idx < u.counts_flags.x) {
+    let m = clusters[idx];
+    let lod_pass = m.errors.x <= 0.0 || screen_error(m.lod_sphere, m.errors.x) <= u.projection.w;
+    let parent_fail = m.errors.y >= 1e29 || screen_error(m.parent_sphere, m.errors.y) > u.projection.w;
+    let sphere = m.bounds_sphere;
+    var defer = 0u;
+    if (lod_pass && parent_fail && in_frustum_local(sphere.xyz, sphere.w) && !backface_culled(m)) {
+      let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
+      let reversed_z = (u.counts_flags.w & 2u) != 0u;
+      if (hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
+        defer = 1u;
+      } else {
+        emit = true;
+        counts = m.counts;
+      }
+    }
+    phase2_flags[idx] = defer;
   }
 
-  phase2_flags[idx] = 0u;
-  let slot = atomicAdd(&draw_count, 1u);
-  draws[slot] = DrawIndexedIndirect(m.counts.y, 1u, m.counts.x, bitcast<i32>(m.counts.z), 0u);
-  selected_clusters[slot] = idx;
+  var local_slot = 0u;
+  if (emit) {
+    local_slot = atomicAdd(&wg_count, 1u);
+  }
+  workgroupBarrier();
+  if (lane == 0u) {
+    let total = atomicLoad(&wg_count);
+    if (total > 0u) {
+      wg_base = atomicAdd(&draw_count, total);
+    }
+  }
+  workgroupBarrier();
+  if (emit) {
+    let slot = wg_base + local_slot;
+    draws[slot] = DrawIndexedIndirect(counts.y, 1u, counts.x, bitcast<i32>(counts.z), 0u);
+    selected_clusters[slot] = idx;
+  }
 }
 
 @compute @workgroup_size(64)
@@ -199,19 +232,40 @@ fn cull_meshlet_dag_phase2(
   @builtin(num_workgroups) groups: vec3u,
   @builtin(local_invocation_index) lane: u32,
 ) {
-  let idx = (group.y * groups.x + group.x) * 64u + lane;
-  if (idx >= u.counts_flags.x || phase2_flags[idx] == 0u) {
-    return;
+  if (lane == 0u) {
+    atomicStore(&wg_count, 0u);
   }
-  let m = clusters[idx];
-  let sphere = m.bounds_sphere;
-  let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
-  let reversed_z = (u.counts_flags.w & 2u) != 0u;
-  if (hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
-    return;
+  workgroupBarrier();
+
+  let idx = (group.y * groups.x + group.x) * 64u + lane;
+  var emit = false;
+  var counts = vec4u(0u);
+  if (idx < u.counts_flags.x && phase2_flags[idx] != 0u) {
+    let m = clusters[idx];
+    let sphere = m.bounds_sphere;
+    let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
+    let reversed_z = (u.counts_flags.w & 2u) != 0u;
+    if (!hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
+      emit = true;
+      counts = m.counts;
+    }
   }
 
-  let slot = atomicAdd(&draw_count, 1u);
-  draws[slot] = DrawIndexedIndirect(m.counts.y, 1u, m.counts.x, bitcast<i32>(m.counts.z), 0u);
-  selected_clusters[slot] = idx;
+  var local_slot = 0u;
+  if (emit) {
+    local_slot = atomicAdd(&wg_count, 1u);
+  }
+  workgroupBarrier();
+  if (lane == 0u) {
+    let total = atomicLoad(&wg_count);
+    if (total > 0u) {
+      wg_base = atomicAdd(&draw_count, total);
+    }
+  }
+  workgroupBarrier();
+  if (emit) {
+    let slot = wg_base + local_slot;
+    draws[slot] = DrawIndexedIndirect(counts.y, 1u, counts.x, bitcast<i32>(counts.z), 0u);
+    selected_clusters[slot] = idx;
+  }
 }

@@ -43,11 +43,47 @@ const CAMERA_BYTES: u64 = size_of::<Matrix>() as u64;
 const DRAW_BYTES: u64 = size_of::<DrawGbuf>() as u64;
 
 impl DrawGbuf {
+    #[allow(clippy::cast_possible_truncation, reason = "f64 cofactor inverse-transpose narrowed to f32")]
     fn new(model: Matrix, albedo_metallic: [f32; 4], roughness: f32, roughness_limit: f32) -> Self {
-        let inv = invert(&model);
-        let normal_mat = [
-            inv[0], inv[4], inv[8], 0.0, inv[1], inv[5], inv[9], 0.0, inv[2], inv[6], inv[10], 0.0, 0.0, 0.0, 0.0, 1.0,
-        ];
+        let normal_mat = if model[3] == 0.0 && model[7] == 0.0 && model[11] == 0.0 && model[15] == 1.0 {
+            let (a, b, c) = (f64::from(model[0]), f64::from(model[1]), f64::from(model[2]));
+            let (d, e, f) = (f64::from(model[4]), f64::from(model[5]), f64::from(model[6]));
+            let (g, h, i) = (f64::from(model[8]), f64::from(model[9]), f64::from(model[10]));
+            let c00 = e * i - f * h;
+            let c10 = f * g - d * i;
+            let c20 = d * h - e * g;
+            let det = a * c00 + b * c10 + c * c20;
+            if det.is_finite() && det.abs() > 1e-12 {
+                let inv_det = 1.0 / det;
+                [
+                    (c00 * inv_det) as f32,
+                    (c10 * inv_det) as f32,
+                    (c20 * inv_det) as f32,
+                    0.0,
+                    ((c * h - b * i) * inv_det) as f32,
+                    ((a * i - c * g) * inv_det) as f32,
+                    ((b * g - a * h) * inv_det) as f32,
+                    0.0,
+                    ((b * f - c * e) * inv_det) as f32,
+                    ((c * d - a * f) * inv_det) as f32,
+                    ((a * e - b * d) * inv_det) as f32,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                ]
+            } else {
+                let inv = invert(&model);
+                [
+                    inv[0], inv[4], inv[8], 0.0, inv[1], inv[5], inv[9], 0.0, inv[2], inv[6], inv[10], 0.0, 0.0, 0.0,
+                    0.0, 1.0,
+                ]
+            }
+        } else {
+            let inv = invert(&model);
+            [inv[0], inv[4], inv[8], 0.0, inv[1], inv[5], inv[9], 0.0, inv[2], inv[6], inv[10], 0.0, 0.0, 0.0, 0.0, 1.0]
+        };
         Self {
             model,
             normal_mat,

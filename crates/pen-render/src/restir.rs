@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, ensure};
+#[cfg(test)]
 use wgpu::util::DeviceExt;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -12,6 +13,28 @@ use crate::sharc::{SHARC_COMMON_WGSL, SharcCache};
 
 pub const RESTIR_WGSL: &str = include_str!("shaders/restir.wgsl");
 pub const RESTIR_MAX_LIGHTS: usize = 256;
+
+const RESTIR_SHARC_DECLS_WGSL: &str = r"
+@group(0) @binding(21) var<uniform> sharc_u: SharcUniform;
+@group(0) @binding(22) var<storage, read_write> sharc_keys: array<atomic<u32>>;
+@group(0) @binding(23) var<storage, read_write> sharc_accum: array<atomic<u32>>;
+@group(0) @binding(24) var<storage, read> sharc_resolved: array<vec4f>;
+";
+
+const RESTIR_SHARC_BOUNCE_SNIPPET: &str = r"
+      if (u.sky_zenith_and_bounce.w > 0.0 && shaded.a < 1.0) {
+        let cached = sharc_query(pos, nrm);
+        if (cached.a > 0.5) {
+          radiance = safe_rgb(radiance + diff_albedo * cached.rgb * ((1.0 - shaded.a) * u.sky_zenith_and_bounce.w));
+        }
+      }
+";
+
+const RESTIR_SHARC_DEPOSIT_SNIPPET: &str = r"
+  if (g.valid && (u.flags.w & 2u) != 0u) {
+    sharc_accumulate(g.pos, g.nrm, rgb);
+  }
+";
 
 const RESTIR_SHARC_WGSL: &str = r"
 struct RestirUniform {
@@ -289,11 +312,11 @@ impl Pass {
             .iter()
             .map(|&binding| {
                 let ty = match binding {
-                    0 => buffer(wgpu::BufferBindingType::Uniform),
+                    0 | 21 => buffer(wgpu::BufferBindingType::Uniform),
                     #[cfg(not(target_arch = "wasm32"))]
                     1 if hardware => wgpu::BindingType::AccelerationStructure { vertex_return: false },
-                    1..=4 | 9..=10 | 13..=14 | 17..=18 => storage(true),
-                    15 | 19 => storage(false),
+                    1..=4 | 9..=10 | 13..=14 | 17..=18 | 24 => storage(true),
+                    15 | 19 | 22 | 23 => storage(false),
                     5..=8 | 11 => wgpu::BindingType::Texture {
                         sample_type: if binding == 5 && native_depth {
                             wgpu::TextureSampleType::Depth
@@ -337,7 +360,7 @@ impl Pass {
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        resources: &[Option<wgpu::BindingResource<'_>>; 21],
+        resources: &[Option<wgpu::BindingResource<'_>>; 25],
         size: (u32, u32),
     ) {
         let entries: Vec<_> = self
@@ -451,10 +474,12 @@ struct Pipelines {
     gi: Option<[Pass; 3]>,
     sharc_aux: Option<SharcAuxPipelines>,
     geometry: Pass,
+    fuse_bounce: bool,
+    fuse_deposit: bool,
 }
 
 impl Pipelines {
-    fn new(device: &wgpu::Device, hardware: bool, native_depth: bool) -> Self {
+    fn new(device: &wgpu::Device, hardware: bool, native_depth: bool, fuse_bounce: bool, fuse_deposit: bool) -> Self {
         let (traversal, declaration) =
             (TLAS_TRAVERSAL_WGSL, "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;");
         #[cfg(not(target_arch = "wasm32"))]
@@ -464,46 +489,79 @@ impl Pipelines {
             (traversal, declaration)
         };
         let mut body = RESTIR_WGSL.replace("// __TLAS_BINDING_1__", declaration);
+        let has_fused_sharc = fuse_bounce || fuse_deposit;
+        if has_fused_sharc {
+            body = body.replace("// __RESTIR_SHARC_DECLS__", RESTIR_SHARC_DECLS_WGSL);
+        }
+        if fuse_bounce {
+            body = body.replace("// __RESTIR_SHARC_BOUNCE__", RESTIR_SHARC_BOUNCE_SNIPPET);
+        }
+        if fuse_deposit {
+            body = body.replace("// __RESTIR_SHARC_DEPOSIT__", RESTIR_SHARC_DEPOSIT_SNIPPET);
+        }
         if native_depth {
             body = body
                 .replace("var depth_tex: texture_2d<f32>;", "var depth_tex: texture_depth_2d;")
                 .replace("textureLoad(depth_tex, g_px, 0).x", "textureLoad(depth_tex, g_px, 0)");
         }
+        let source = if has_fused_sharc {
+            format!("{traversal}\n{SHARC_COMMON_WGSL}\n{body}")
+        } else {
+            format!("{traversal}\n{body}")
+        };
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("restir"),
-            source: wgpu::ShaderSource::Wgsl(format!("{traversal}\n{body}").into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let geometry =
             Pass::new(device, &module, "restir_store_geometry", &[0, 5, 6, 12, 16, 20], hardware, native_depth);
-        Self { module, di: None, gi: None, sharc_aux: None, geometry }
+        Self { module, di: None, gi: None, sharc_aux: None, geometry, fuse_bounce, fuse_deposit }
     }
 
     fn prepare(&mut self, device: &wgpu::Device, hardware: bool, native_depth: bool, di: bool, gi: bool, sharc: bool) {
         let make = |entry, bindings| Pass::new(device, &self.module, entry, bindings, hardware, native_depth);
         if di && self.di.is_none() {
+            let di_init: &'static [u32] =
+                if hardware { &[0, 1, 2, 4, 5, 6, 7, 9, 15] } else { &[0, 1, 2, 3, 4, 5, 6, 7, 9, 15] };
+            let di_spat: &'static [u32] =
+                if hardware { &[0, 1, 2, 4, 5, 6, 7, 9, 13, 15, 16] } else { &[0, 1, 2, 3, 4, 5, 6, 7, 9, 13, 15, 16] };
             self.di = Some([
-                make("restir_di_initial", &[0, 1, 2, 3, 4, 5, 6, 7, 9, 15]),
+                make("restir_di_initial", di_init),
                 make("restir_di_temporal", &[0, 5, 6, 7, 8, 9, 11, 13, 14, 15]),
-                make("restir_di_spatial", &[0, 1, 2, 3, 4, 5, 6, 7, 9, 13, 15, 16]),
+                make("restir_di_spatial", di_spat),
             ]);
         }
         if gi && self.gi.is_none() {
+            let gi_init: &'static [u32] = match (hardware, self.fuse_bounce) {
+                (true, true) => &[0, 1, 2, 4, 5, 6, 9, 10, 19, 21, 22, 24],
+                (true, false) => &[0, 1, 2, 4, 5, 6, 9, 10, 19],
+                (false, true) => &[0, 1, 2, 3, 4, 5, 6, 9, 10, 19, 21, 22, 24],
+                (false, false) => &[0, 1, 2, 3, 4, 5, 6, 9, 10, 19],
+            };
+            let gi_spat: &'static [u32] = match (hardware, self.fuse_deposit) {
+                (true, true) => &[0, 1, 2, 4, 5, 6, 17, 20, 21, 22, 23],
+                (true, false) => &[0, 1, 2, 4, 5, 6, 17, 20],
+                (false, true) => &[0, 1, 2, 3, 4, 5, 6, 17, 20, 21, 22, 23],
+                (false, false) => &[0, 1, 2, 3, 4, 5, 6, 17, 20],
+            };
             self.gi = Some([
-                make("restir_gi_initial", &[0, 1, 2, 3, 4, 5, 6, 9, 10, 19]),
+                make("restir_gi_initial", gi_init),
                 make("restir_gi_temporal", &[0, 5, 6, 8, 11, 17, 18, 19]),
-                make("restir_gi_spatial", &[0, 1, 2, 3, 4, 5, 6, 17, 20]),
+                make("restir_gi_spatial", gi_spat),
             ]);
         }
-        if gi && sharc && self.sharc_aux.is_none() {
+        if gi && sharc && (!self.fuse_bounce || !self.fuse_deposit) && self.sharc_aux.is_none() {
             self.sharc_aux = Some(SharcAuxPipelines::new(device, native_depth));
         }
     }
 }
 
 pub struct RestirRenderer {
-    pipelines: HashMap<(bool, bool), Pipelines>,
+    pipelines: HashMap<(bool, bool, bool, bool), Pipelines>,
     hardware_supported: bool,
     dummy: wgpu::Buffer,
+    uniform_buf: wgpu::Buffer,
+    lights_buf: wgpu::Buffer,
     frame: Option<Frame>,
     di_history_light_count: Option<u32>,
     gi_history_valid: bool,
@@ -511,6 +569,18 @@ pub struct RestirRenderer {
 
 impl RestirRenderer {
     pub fn new(device: &wgpu::Device) -> Self {
+        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("restir frame uniforms"),
+            size: std::mem::size_of::<Uniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lights_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("restir local lights"),
+            size: (RESTIR_MAX_LIGHTS * std::mem::size_of::<RtLocalLight>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             pipelines: HashMap::new(),
             hardware_supported: device_supports_hardware_ray_query(device),
@@ -520,6 +590,8 @@ impl RestirRenderer {
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             }),
+            uniform_buf,
+            lights_buf,
             frame: None,
             di_history_light_count: None,
             gi_history_valid: false,
@@ -656,34 +728,44 @@ impl RestirRenderer {
                 u32::from(params.enable_di) | (u32::from(params.enable_gi) << 1),
             ],
         };
-        // Immutable per-dispatch uploads preserve ordering even when several frames
-        // are recorded before submission.
-        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("restir frame uniforms"),
-            contents: bytemuck::bytes_of(&uniform),
-            usage: wgpu::BufferUsages::UNIFORM,
+        // Encoder-ordered upload into persistent buffers preserves ordering when several frames
+        // are recorded before submission while avoiding multiple per-frame GPU buffer allocations.
+        let uniform_bytes = bytemuck::bytes_of(&uniform);
+        let live_lights: &[u8] = bytemuck::cast_slice(local_lights);
+        let stage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("restir upload stage"),
+            size: (uniform_bytes.len() + live_lights.len()) as u64,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
         });
-        let lights = (!local_lights.is_empty()).then(|| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("restir local lights"),
-                contents: bytemuck::cast_slice(local_lights),
-                usage: wgpu::BufferUsages::STORAGE,
-            })
-        });
+        let off_l = uniform_bytes.len() as u64;
+        stage.slice(0..off_l).get_mapped_range_mut().unwrap().copy_from_slice(uniform_bytes);
+        if !live_lights.is_empty() {
+            stage.slice(off_l..).get_mapped_range_mut().unwrap().copy_from_slice(live_lights);
+        }
+        stage.unmap();
+        encoder.copy_buffer_to_buffer(&stage, 0, &self.uniform_buf, 0, off_l);
+        if !live_lights.is_empty() {
+            encoder.copy_buffer_to_buffer(&stage, off_l, &self.lights_buf, 0, live_lights.len() as u64);
+        }
+
+        let has_sharc = params.enable_gi && inputs.sharc.is_some();
+        let fuse_bounce = has_sharc && limits.max_storage_buffers_per_shader_stage >= if hardware { 7 } else { 9 };
+        let fuse_deposit = has_sharc;
 
         let pipelines = self
             .pipelines
-            .entry((hardware, native_depth))
-            .or_insert_with(|| Pipelines::new(device, hardware, native_depth));
-        pipelines.prepare(device, hardware, native_depth, params.enable_di, params.enable_gi, inputs.sharc.is_some());
+            .entry((hardware, native_depth, fuse_bounce, fuse_deposit))
+            .or_insert_with(|| Pipelines::new(device, hardware, native_depth, fuse_bounce, fuse_deposit));
+        pipelines.prepare(device, hardware, native_depth, params.enable_di, params.enable_gi, has_sharc);
         let prev = frame.previous;
         let next = 1 - prev;
         let view = |view| Some(wgpu::BindingResource::TextureView(view));
         let tlas = scene.tlas_nodes_buf.as_entire_binding();
         #[cfg(not(target_arch = "wasm32"))]
         let tlas = if hardware { scene.hw_tlas.as_ref().unwrap().as_binding() } else { tlas };
-        let mut resources = [
-            Some(buffer_binding(&uniform)),
+        let mut resources: [Option<wgpu::BindingResource<'_>>; 25] = [
+            Some(buffer_binding(&self.uniform_buf)),
             Some(tlas),
             Some(buffer_binding(&scene.tlas_instances_buf)),
             Some(buffer_binding(&scene.blas_nodes_buf)),
@@ -692,7 +774,7 @@ impl RestirRenderer {
             view(inputs.normal_roughness),
             view(inputs.albedo_metallic),
             view(inputs.motion.unwrap_or(inputs.normal_roughness)),
-            Some(buffer_binding(lights.as_ref().unwrap_or(&self.dummy))),
+            Some(buffer_binding(if local_lights.is_empty() { &self.dummy } else { &self.lights_buf })),
             Some(buffer_binding(inputs.ddgi_packed.unwrap_or(&self.dummy))),
             view(&frame.depth_nrm[prev].view),
             view(&frame.depth_nrm[next].view),
@@ -704,6 +786,10 @@ impl RestirRenderer {
             None,
             None,
             view(&frame.gi.view),
+            inputs.sharc.map(|s| buffer_binding(s.uniform_buffer())),
+            inputs.sharc.map(|s| buffer_binding(s.keys_buffer())),
+            inputs.sharc.map(|s| buffer_binding(s.accum_buffer())),
+            inputs.sharc.map(|s| buffer_binding(s.resolved_buffer())),
         ];
 
         if params.enable_di {
@@ -737,12 +823,12 @@ impl RestirRenderer {
             let [initial, temporal, spatial] = pipelines.gi.as_ref().unwrap();
             resources[19] = Some(buffer_binding(&buffers.scratch));
             initial.dispatch(device, encoder, &resources, size);
-            if let (Some(sharc), Some(aux)) = (inputs.sharc, pipelines.sharc_aux.as_ref()) {
+            if !fuse_bounce && let (Some(sharc), Some(aux)) = (inputs.sharc, pipelines.sharc_aux.as_ref()) {
                 let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("restir_gi_sharc_bounce"),
                     layout: &aux.bounce_bgl,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(inputs.depth) },
                         wgpu::BindGroupEntry {
                             binding: 2,
@@ -768,12 +854,12 @@ impl RestirRenderer {
             temporal.dispatch(device, encoder, &resources, size);
             resources[17] = Some(buffer_binding(&buffers.history[next]));
             spatial.dispatch(device, encoder, &resources, size);
-            if let (Some(sharc), Some(aux)) = (inputs.sharc, pipelines.sharc_aux.as_ref()) {
+            if !fuse_deposit && let (Some(sharc), Some(aux)) = (inputs.sharc, pipelines.sharc_aux.as_ref()) {
                 let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("restir_gi_sharc_deposit"),
                     layout: &aux.deposit_bgl,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buf.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(inputs.depth) },
                         wgpu::BindGroupEntry {
                             binding: 2,

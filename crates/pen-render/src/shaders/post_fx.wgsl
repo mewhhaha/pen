@@ -21,6 +21,22 @@ struct PostFxUniform {
 @group(0) @binding(1) var color_in: texture_2d<f32>;
 @group(0) @binding(2) var depth_in: texture_2d<f32>;
 @group(0) @binding(3) var color_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(4) var color_sampler: sampler;
+
+// Precomputed exp(-0.28 * k) for k = 0..=10.
+const FLARE_WEIGHTS = array<f32, 11>(
+  1.0,
+  0.75578374,
+  0.57120906,
+  0.43171052,
+  0.32627979,
+  0.24659696,
+  0.18637398,
+  0.14085842,
+  0.10645850,
+  0.08045961,
+  0.06081006,
+);
 
 fn hash13(p3: vec3f) -> f32 {
   var p = fract(p3 * 0.1031);
@@ -45,7 +61,15 @@ fn sample_color_zero_border(p: vec2i, dims: vec2i) -> vec3f {
   return max(textureLoad(color_in, p, 0).rgb, vec3f(0.0));
 }
 
-fn sample_color_linear_x(x_f: f32, y: i32, dims: vec2i) -> vec3f {
+fn sample_color_linear_x(x_f: f32, y: i32, dims: vec2i, inv_dims: vec2f) -> vec3f {
+  let max_x = f32(dims.x - 1);
+  if (x_f < -1.0 || x_f >= f32(dims.x)) {
+    return vec3f(0.0);
+  }
+  if (x_f >= 0.0 && x_f <= max_x) {
+    let uv = vec2f((x_f + 0.5) * inv_dims.x, (f32(y) + 0.5) * inv_dims.y);
+    return max(textureSampleLevel(color_in, color_sampler, uv, 0.0).rgb, vec3f(0.0));
+  }
   let x0 = i32(floor(x_f));
   let frac = x_f - f32(x0);
   let c0 = sample_color_zero_border(vec2i(x0, y), dims);
@@ -59,9 +83,7 @@ fn bright_pass(c: vec3f, threshold: f32) -> vec3f {
   return c * (excess / max(l, 1e-4));
 }
 
-fn load_view_pos(d_px: vec2i, d_dims: vec2i) -> vec3f {
-  let c = clamp(d_px, vec2i(0), d_dims - vec2i(1));
-  let raw_d = textureLoad(depth_in, c, 0).r;
+fn view_pos_from_raw(c: vec2i, raw_d: f32, d_dims: vec2i) -> vec3f {
   let ndc = vec2f(
     (f32(c.x) + 0.5) / f32(d_dims.x) * 2.0 - 1.0,
     1.0 - (f32(c.y) + 0.5) / f32(d_dims.y) * 2.0,
@@ -76,12 +98,13 @@ fn load_view_pos(d_px: vec2i, d_dims: vec2i) -> vec3f {
   return vec3f(ndc.x * z, ndc.y * z, -z);
 }
 
-fn view_normal_at(d_px: vec2i, d_dims: vec2i) -> vec3f {
-  let pc = load_view_pos(d_px, d_dims);
-  let pr = load_view_pos(d_px + vec2i(1, 0), d_dims);
-  let pl = load_view_pos(d_px - vec2i(1, 0), d_dims);
-  let pd = load_view_pos(d_px + vec2i(0, 1), d_dims);
-  let pu = load_view_pos(d_px - vec2i(0, 1), d_dims);
+fn load_view_pos(d_px: vec2i, d_dims: vec2i) -> vec3f {
+  let c = clamp(d_px, vec2i(0), d_dims - vec2i(1));
+  let raw_d = textureLoad(depth_in, c, 0).r;
+  return view_pos_from_raw(c, raw_d, d_dims);
+}
+
+fn view_normal_from_neighbors(d_px: vec2i, d_dims: vec2i, pc: vec3f, pr: vec3f, pl: vec3f, pd: vec3f, pu: vec3f) -> vec3f {
   let dx_r = pr - pc;
   let dx_l = pc - pl;
   let dy_d = pd - pc;
@@ -95,6 +118,14 @@ fn view_normal_at(d_px: vec2i, d_dims: vec2i) -> vec3f {
     n = -n;
   }
   return n;
+}
+
+fn view_normal_at_cached(d_px: vec2i, pc: vec3f, d_dims: vec2i) -> vec3f {
+  let pr = load_view_pos(d_px + vec2i(1, 0), d_dims);
+  let pl = load_view_pos(d_px - vec2i(1, 0), d_dims);
+  let pd = load_view_pos(d_px + vec2i(0, 1), d_dims);
+  let pu = load_view_pos(d_px - vec2i(0, 1), d_dims);
+  return view_normal_from_neighbors(d_px, d_dims, pc, pr, pl, pd, pu);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -112,15 +143,16 @@ fn post_fx(@builtin(global_invocation_id) id: vec3u) {
   if (flare_str > 1e-4) {
     let thresh = max(u.grain_flare.w, 0.0);
     let spread = clamp(u.flare_tint_spread.w, 0.5, 8.0);
+    let inv_dims = vec2f(1.0) / vec2f(dims);
+    let base = f32(p.x);
+    let step = spread * 0.5;
     var streak = vec3f(0.0);
     for (var i = -10; i <= 10; i++) {
-      let fi = f32(abs(i));
-      let w = exp(-fi * 0.28);
-      let base = f32(p.x);
-      let dx = f32(i) * (spread * 0.5);
-      let cr = bright_pass(sample_color_linear_x(base + dx * 1.08, p.y, dims), thresh).r;
-      let cg = bright_pass(sample_color_linear_x(base + dx, p.y, dims), thresh).g;
-      let cb = bright_pass(sample_color_linear_x(base + dx * 0.92, p.y, dims), thresh).b;
+      let w = FLARE_WEIGHTS[abs(i)];
+      let dx = f32(i) * step;
+      let cr = bright_pass(sample_color_linear_x(base + dx * 1.08, p.y, dims, inv_dims), thresh).r;
+      let cg = bright_pass(sample_color_linear_x(base + dx, p.y, dims, inv_dims), thresh).g;
+      let cb = bright_pass(sample_color_linear_x(base + dx * 0.92, p.y, dims, inv_dims), thresh).b;
       streak += vec3f(cr, cg, cb) * w;
     }
     let mirror_p = last - p;
@@ -136,19 +168,46 @@ fn post_fx(@builtin(global_invocation_id) id: vec3u) {
     let uv = (vec2f(p) + 0.5) / vec2f(dims);
     let d_p = clamp(vec2i(floor(uv * vec2f(d_dims))), vec2i(0), d_last);
     let r = clamp(i32(round(u.outline_params.z)), 1, 4);
-    let d00 = linearize_depth(textureLoad(depth_in, clamp(d_p + vec2i(-r, -r), vec2i(0), d_last), 0).r);
-    let d11 = linearize_depth(textureLoad(depth_in, clamp(d_p + vec2i(r, r), vec2i(0), d_last), 0).r);
-    let d10 = linearize_depth(textureLoad(depth_in, clamp(d_p + vec2i(r, -r), vec2i(0), d_last), 0).r);
-    let d01 = linearize_depth(textureLoad(depth_in, clamp(d_p + vec2i(-r, r), vec2i(0), d_last), 0).r);
+    let p00 = clamp(d_p + vec2i(-r, -r), vec2i(0), d_last);
+    let p11 = clamp(d_p + vec2i(r, r), vec2i(0), d_last);
+    let p10 = clamp(d_p + vec2i(r, -r), vec2i(0), d_last);
+    let p01 = clamp(d_p + vec2i(-r, r), vec2i(0), d_last);
+    let raw00 = textureLoad(depth_in, p00, 0).r;
+    let raw11 = textureLoad(depth_in, p11, 0).r;
+    let raw10 = textureLoad(depth_in, p10, 0).r;
+    let raw01 = textureLoad(depth_in, p01, 0).r;
+    let d00 = linearize_depth(raw00);
+    let d11 = linearize_depth(raw11);
+    let d10 = linearize_depth(raw10);
+    let d01 = linearize_depth(raw01);
     let d_ref = max(min(min(d00, d11), min(d10, d01)), 0.05);
     let depth_grad = sqrt((d00 - d11) * (d00 - d11) + (d10 - d01) * (d10 - d01)) / d_ref;
     let d_thresh = max(u.outline_params.x, 1e-4);
     let depth_edge = smoothstep(d_thresh, d_thresh * 2.0, depth_grad);
 
-    let n00 = view_normal_at(clamp(d_p + vec2i(-r, -r), vec2i(0), d_last), d_dims);
-    let n11 = view_normal_at(clamp(d_p + vec2i(r, r), vec2i(0), d_last), d_dims);
-    let n10 = view_normal_at(clamp(d_p + vec2i(r, -r), vec2i(0), d_last), d_dims);
-    let n01 = view_normal_at(clamp(d_p + vec2i(-r, r), vec2i(0), d_last), d_dims);
+    let vp00 = view_pos_from_raw(p00, raw00, d_dims);
+    let vp11 = view_pos_from_raw(p11, raw11, d_dims);
+    let vp10 = view_pos_from_raw(p10, raw10, d_dims);
+    let vp01 = view_pos_from_raw(p01, raw01, d_dims);
+    var n00: vec3f;
+    var n11: vec3f;
+    var n10: vec3f;
+    var n01: vec3f;
+    if (r == 1 && d_p.x >= 1 && d_p.x < d_last.x && d_p.y >= 1 && d_p.y < d_last.y) {
+      let pt = load_view_pos(d_p + vec2i(0, -1), d_dims);
+      let pb = load_view_pos(d_p + vec2i(0, 1), d_dims);
+      let pl_m = load_view_pos(d_p + vec2i(-1, 0), d_dims);
+      let pr_m = load_view_pos(d_p + vec2i(1, 0), d_dims);
+      n00 = view_normal_from_neighbors(p00, d_dims, vp00, pt, load_view_pos(p00 - vec2i(1, 0), d_dims), pl_m, load_view_pos(p00 - vec2i(0, 1), d_dims));
+      n10 = view_normal_from_neighbors(p10, d_dims, vp10, load_view_pos(p10 + vec2i(1, 0), d_dims), pt, pr_m, load_view_pos(p10 - vec2i(0, 1), d_dims));
+      n01 = view_normal_from_neighbors(p01, d_dims, vp01, pb, load_view_pos(p01 - vec2i(1, 0), d_dims), load_view_pos(p01 + vec2i(0, 1), d_dims), pl_m);
+      n11 = view_normal_from_neighbors(p11, d_dims, vp11, load_view_pos(p11 + vec2i(1, 0), d_dims), pb, load_view_pos(p11 + vec2i(0, 1), d_dims), pr_m);
+    } else {
+      n00 = view_normal_at_cached(p00, vp00, d_dims);
+      n11 = view_normal_at_cached(p11, vp11, d_dims);
+      n10 = view_normal_at_cached(p10, vp10, d_dims);
+      n01 = view_normal_at_cached(p01, vp01, d_dims);
+    }
     let n_diff0 = n00 - n11;
     let n_diff1 = n10 - n01;
     let norm_grad = sqrt(dot(n_diff0, n_diff0) + dot(n_diff1, n_diff1));

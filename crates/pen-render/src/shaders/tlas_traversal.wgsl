@@ -48,39 +48,32 @@ struct TlasHit {
   instance_index: u32,
 };
 
-fn tlas_ray_aabb_hit(origin: vec3f, dir: vec3f, bmin: vec3f, bmax: vec3f, t_min: f32, t_max: f32) -> f32 {
-  var t_enter = t_min;
-  var t_exit = t_max;
+struct TlasRayInv {
+  inv_dir: vec3f,
+  parallel: vec3<bool>,
+};
 
-  if (abs(dir.x) < 1e-12) {
-    if (origin.x < bmin.x || origin.x > bmax.x) { return -1.0; }
-  } else {
-    let inv = 1.0 / dir.x;
-    let t0 = (bmin.x - origin.x) * inv;
-    let t1 = (bmax.x - origin.x) * inv;
-    t_enter = max(t_enter, min(t0, t1));
-    t_exit = min(t_exit, max(t0, t1));
-  }
-  if (abs(dir.y) < 1e-12) {
-    if (origin.y < bmin.y || origin.y > bmax.y) { return -1.0; }
-  } else {
-    let inv = 1.0 / dir.y;
-    let t0 = (bmin.y - origin.y) * inv;
-    let t1 = (bmax.y - origin.y) * inv;
-    t_enter = max(t_enter, min(t0, t1));
-    t_exit = min(t_exit, max(t0, t1));
-  }
-  if (abs(dir.z) < 1e-12) {
-    if (origin.z < bmin.z || origin.z > bmax.z) { return -1.0; }
-  } else {
-    let inv = 1.0 / dir.z;
-    let t0 = (bmin.z - origin.z) * inv;
-    let t1 = (bmax.z - origin.z) * inv;
-    t_enter = max(t_enter, min(t0, t1));
-    t_exit = min(t_exit, max(t0, t1));
-  }
+fn tlas_ray_inv(dir: vec3f) -> TlasRayInv {
+  let parallel = abs(dir) < vec3f(1e-12);
+  let safe_dir = select(dir, vec3f(1.0), parallel);
+  return TlasRayInv(1.0 / safe_dir, parallel);
+}
 
+fn tlas_ray_aabb_hit_inv(origin: vec3f, ri: TlasRayInv, bmin: vec3f, bmax: vec3f, t_min: f32, t_max: f32) -> f32 {
+  if (any(ri.parallel & ((origin < bmin) | (origin > bmax)))) {
+    return -1.0;
+  }
+  let t0 = (bmin - origin) * ri.inv_dir;
+  let t1 = (bmax - origin) * ri.inv_dir;
+  let near_v = select(min(t0, t1), vec3f(t_min), ri.parallel);
+  let far_v = select(max(t0, t1), vec3f(t_max), ri.parallel);
+  let t_enter = max(t_min, max(near_v.x, max(near_v.y, near_v.z)));
+  let t_exit = min(t_max, min(far_v.x, min(far_v.y, far_v.z)));
   return select(-1.0, t_enter, t_exit >= t_enter);
+}
+
+fn tlas_ray_aabb_hit(origin: vec3f, dir: vec3f, bmin: vec3f, bmax: vec3f, t_min: f32, t_max: f32) -> f32 {
+  return tlas_ray_aabb_hit_inv(origin, tlas_ray_inv(dir), bmin, bmax, t_min, t_max);
 }
 
 struct TlasRayShear {
@@ -116,10 +109,10 @@ fn tlas_build_ray_shear(dir: vec3f) -> TlasRayShear {
 
 // Returns vec3f(t, bary_u, bary_v); t < 0.0 on miss.
 // Barycentric coordinates weight (1 - u - v) * v0 + u * v1 + v * v2.
-fn tlas_ray_tri_watertight(origin: vec3f, rs: TlasRayShear, tri: BlasTri, t_min: f32, t_max: f32) -> vec3f {
-  let a = tri.v0.xyz - origin;
-  let b = tri.v1.xyz - origin;
-  let c = tri.v2.xyz - origin;
+fn tlas_ray_tri_watertight_verts(origin: vec3f, rs: TlasRayShear, v0: vec3f, v1: vec3f, v2: vec3f, t_min: f32, t_max: f32) -> vec3f {
+  let a = v0 - origin;
+  let b = v1 - origin;
+  let c = v2 - origin;
 
   let ax = a[rs.kx] - rs.sx * a[rs.kz];
   let ay = a[rs.ky] - rs.sy * a[rs.kz];
@@ -175,6 +168,14 @@ fn trace_tlas(
     return best;
   }
 
+  let world_inv = tlas_ray_inv(dir);
+  var hit_found = false;
+  var best_t = t_max;
+  var best_u = 0.0;
+  var best_v = 0.0;
+  var best_tri = 0u;
+  var best_inst = 0u;
+
   var tlas_stack: array<u32, 24>;
   var t_sp: i32 = 0;
   tlas_stack[0] = 0u;
@@ -188,7 +189,7 @@ fn trace_tlas(
       continue;
     }
     let tn = tlas_nodes[tn_idx];
-    if (tlas_ray_aabb_hit(origin, dir, tn.aabb_min, tn.aabb_max, t_min, best.t) < 0.0) {
+    if (tlas_ray_aabb_hit_inv(origin, world_inv, tn.aabb_min, tn.aabb_max, t_min, best_t) < 0.0) {
       continue;
     }
 
@@ -196,23 +197,25 @@ fn trace_tlas(
       let i_first = tn.left_or_first;
       let i_end = min(i_first + tn.tri_count, tlas_inst_count);
       for (var ii = i_first; ii < i_end; ii++) {
-        let inst = tlas_instances[ii];
-        if ((inst.mask & mask) == 0u || inst.blas_node_count == 0u) {
+        let inst_mask = tlas_instances[ii].mask;
+        let b_cnt = tlas_instances[ii].blas_node_count;
+        if ((inst_mask & mask) == 0u || b_cnt == 0u) {
           continue;
         }
         // Transform ray to instance local space without normalizing dir so t is invariant!
-        let local_origin = (inst.inv_transform * vec4f(origin, 1.0)).xyz;
-        let local_dir = (inst.inv_transform * vec4f(dir, 0.0)).xyz;
+        let inv_xform = tlas_instances[ii].inv_transform;
+        let local_origin = (inv_xform * vec4f(origin, 1.0)).xyz;
+        let local_dir = (inv_xform * vec4f(dir, 0.0)).xyz;
         if (dot(local_dir, local_dir) < 1e-16) {
           continue;
         }
+        let local_inv = tlas_ray_inv(local_dir);
         let rs = tlas_build_ray_shear(local_dir);
 
         var b_sp: i32 = 0;
         blas_stack[0] = 0u;
-        let b_off = inst.blas_node_offset;
-        let b_cnt = inst.blas_node_count;
-        let tri_off = inst.blas_tri_offset;
+        let b_off = tlas_instances[ii].blas_node_offset;
+        let tri_off = tlas_instances[ii].blas_tri_offset;
 
         while (b_sp >= 0) {
           let bn_rel = blas_stack[b_sp];
@@ -221,40 +224,35 @@ fn trace_tlas(
             continue;
           }
           let bn = blas_nodes[b_off + bn_rel];
-          if (tlas_ray_aabb_hit(local_origin, local_dir, bn.aabb_min, bn.aabb_max, t_min, best.t) < 0.0) {
+          if (tlas_ray_aabb_hit_inv(local_origin, local_inv, bn.aabb_min, bn.aabb_max, t_min, best_t) < 0.0) {
             continue;
           }
           if (bn.tri_count > 0u) {
             let tf = tri_off + bn.left_or_first;
             let te = min(tf + bn.tri_count, blas_tri_total);
             for (var ti = tf; ti < te; ti++) {
-              let tri = blas_tris[ti];
-              let res = tlas_ray_tri_watertight(local_origin, rs, tri, t_min, best.t);
+              let res = tlas_ray_tri_watertight_verts(
+                local_origin,
+                rs,
+                blas_tris[ti].v0.xyz,
+                blas_tris[ti].v1.xyz,
+                blas_tris[ti].v2.xyz,
+                t_min,
+                best_t,
+              );
               if (res.x > 0.0) {
-                best.hit = true;
-                best.t = res.x;
-                let bu = res.y;
-                let bv = res.z;
-                let bw = max(0.0, 1.0 - bu - bv);
-                let local_n = tri.n0.xyz * bw + tri.n1.xyz * bu + tri.n2.xyz * bv;
-                let nm = mat3x3f(inst.normal_matrix_0.xyz, inst.normal_matrix_1.xyz, inst.normal_matrix_2.xyz);
-                var wn = nm * local_n;
-                let nlen2 = dot(wn, wn);
-                wn = select(vec3f(0.0, 1.0, 0.0), wn * inverseSqrt(nlen2), nlen2 > 1e-12);
-                let is_front = dot(wn, dir) <= 0.0;
-                if (!is_front) {
-                  wn = -wn;
-                }
-                best.front_face = is_front;
-                best.world_normal = wn;
-                best.albedo = inst.albedo_roughness.rgb;
-                best.roughness = inst.albedo_roughness.a;
-                best.emissive = inst.emissive_metallic.rgb;
-                best.metallic = inst.emissive_metallic.a;
-                best.instance_index = ii;
                 if (any_hit) {
+                  best.hit = true;
+                  best.t = res.x;
+                  best.instance_index = ii;
                   return best;
                 }
+                hit_found = true;
+                best_t = res.x;
+                best_u = res.y;
+                best_v = res.z;
+                best_tri = ti;
+                best_inst = ii;
               }
             }
           } else {
@@ -263,12 +261,12 @@ fn trace_tlas(
             var dl = -1.0;
             if (left < b_cnt) {
               let nl = blas_nodes[b_off + left];
-              dl = tlas_ray_aabb_hit(local_origin, local_dir, nl.aabb_min, nl.aabb_max, t_min, best.t);
+              dl = tlas_ray_aabb_hit_inv(local_origin, local_inv, nl.aabb_min, nl.aabb_max, t_min, best_t);
             }
             var dr = -1.0;
             if (right < b_cnt) {
               let nr = blas_nodes[b_off + right];
-              dr = tlas_ray_aabb_hit(local_origin, local_dir, nr.aabb_min, nr.aabb_max, t_min, best.t);
+              dr = tlas_ray_aabb_hit_inv(local_origin, local_inv, nr.aabb_min, nr.aabb_max, t_min, best_t);
             }
             if (dl >= 0.0 && dr >= 0.0) {
               let near_c = select(right, left, dl < dr);
@@ -295,12 +293,12 @@ fn trace_tlas(
       var dl = -1.0;
       if (left < tlas_node_count) {
         let nl = tlas_nodes[left];
-        dl = tlas_ray_aabb_hit(origin, dir, nl.aabb_min, nl.aabb_max, t_min, best.t);
+        dl = tlas_ray_aabb_hit_inv(origin, world_inv, nl.aabb_min, nl.aabb_max, t_min, best_t);
       }
       var dr = -1.0;
       if (right < tlas_node_count) {
         let nr = tlas_nodes[right];
-        dr = tlas_ray_aabb_hit(origin, dir, nr.aabb_min, nr.aabb_max, t_min, best.t);
+        dr = tlas_ray_aabb_hit_inv(origin, world_inv, nr.aabb_min, nr.aabb_max, t_min, best_t);
       }
       if (dl >= 0.0 && dr >= 0.0) {
         let near_c = select(right, left, dl < dr);
@@ -319,6 +317,30 @@ fn trace_tlas(
         tlas_stack[t_sp] = right;
       }
     }
+  }
+
+  if (hit_found) {
+    let inst = tlas_instances[best_inst];
+    let tri = blas_tris[best_tri];
+    let bw = max(0.0, 1.0 - best_u - best_v);
+    let local_n = tri.n0.xyz * bw + tri.n1.xyz * best_u + tri.n2.xyz * best_v;
+    let nm = mat3x3f(inst.normal_matrix_0.xyz, inst.normal_matrix_1.xyz, inst.normal_matrix_2.xyz);
+    var wn = nm * local_n;
+    let nlen2 = dot(wn, wn);
+    wn = select(vec3f(0.0, 1.0, 0.0), wn * inverseSqrt(nlen2), nlen2 > 1e-12);
+    let is_front = dot(wn, dir) <= 0.0;
+    if (!is_front) {
+      wn = -wn;
+    }
+    best.hit = true;
+    best.front_face = is_front;
+    best.t = best_t;
+    best.world_normal = wn;
+    best.albedo = inst.albedo_roughness.rgb;
+    best.roughness = inst.albedo_roughness.a;
+    best.emissive = inst.emissive_metallic.rgb;
+    best.metallic = inst.emissive_metallic.a;
+    best.instance_index = best_inst;
   }
   return best;
 }

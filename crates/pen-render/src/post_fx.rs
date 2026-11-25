@@ -351,14 +351,21 @@ impl TaauUpscaler {
     ) -> Result<()> {
         let max_dim = device.limits().max_texture_dimension_2d;
         ensure!(
-            in_size.0 >= 1 && in_size.1 >= 1 && out_size.0 >= 1 && out_size.1 >= 1 && out_size.0 <= max_dim && out_size.1 <= max_dim,
+            in_size.0 >= 1
+                && in_size.1 >= 1
+                && out_size.0 >= 1
+                && out_size.1 >= 1
+                && out_size.0 <= max_dim
+                && out_size.1 <= max_dim,
             "invalid TAAU sizes in={in_size:?} out={out_size:?}"
         );
         let c_sz = input_color.texture().size();
         let d_sz = input_depth.texture().size();
         let v_sz = input_velocity.texture().size();
         ensure!(
-            (c_sz.width, c_sz.height) == in_size && (d_sz.width, d_sz.height) == in_size && (v_sz.width, v_sz.height) == in_size,
+            (c_sz.width, c_sz.height) == in_size
+                && (d_sz.width, d_sz.height) == in_size
+                && (v_sz.width, v_sz.height) == in_size,
             "TAAU input view extents color={:?} depth={:?} vel={:?} must match in_size {in_size:?}",
             (c_sz.width, c_sz.height),
             (d_sz.width, d_sz.height),
@@ -399,10 +406,7 @@ impl TaauUpscaler {
         let read_idx = self.parity;
         let write_idx = 1 - self.parity;
         let (_, _, texs, views) = self.history.as_ref().unwrap();
-        ensure!(
-            input_color.texture() != &texs[write_idx],
-            "TAAU input_color cannot alias internal write target"
-        );
+        ensure!(input_color.texture() != &texs[write_idx], "TAAU input_color cannot alias internal write target");
         let phases = crate::taa::fsr_jitter_phase_count(in_size.0, out_size.0);
         let u = TaauUniform {
             dims: [in_size.0 as f32, in_size.1 as f32, out_size.0 as f32, out_size.1 as f32],
@@ -539,7 +543,12 @@ impl FsrEasuUpscaler {
     ) -> Result<()> {
         let max_dim = device.limits().max_texture_dimension_2d;
         ensure!(
-            in_size.0 >= 1 && in_size.1 >= 1 && out_size.0 >= 1 && out_size.1 >= 1 && out_size.0 <= max_dim && out_size.1 <= max_dim,
+            in_size.0 >= 1
+                && in_size.1 >= 1
+                && out_size.0 >= 1
+                && out_size.1 >= 1
+                && out_size.0 <= max_dim
+                && out_size.1 <= max_dim,
             "invalid EASU sizes in={in_size:?} out={out_size:?}"
         );
         let src_sz = input.texture().size();
@@ -576,10 +585,8 @@ impl FsrEasuUpscaler {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(out_view) },
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("easu_upscale"),
-            timestamp_writes: None,
-        });
+        let mut pass = encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("easu_upscale"), timestamp_writes: None });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(out_size.0.div_ceil(8), out_size.1.div_ceil(8), 1);
@@ -728,10 +735,8 @@ impl RcasSharpener {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(out_view) },
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("rcas_sharpen"),
-            timestamp_writes: None,
-        });
+        let mut pass = encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("rcas_sharpen"), timestamp_writes: None });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
@@ -799,6 +804,7 @@ struct PostFxUniform {
 pub struct PostFxPass {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
     output: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
 }
@@ -822,7 +828,7 @@ impl PostFxPass {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -848,6 +854,12 @@ impl PostFxPass {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -867,13 +879,21 @@ impl PostFxPass {
             compilation_options: Default::default(),
             cache: None,
         });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("post_fx_linear"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("post_fx_u"),
             size: std::mem::size_of::<PostFxUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { pipeline, bgl, uniform, output: None }
+        Self { pipeline, bgl, sampler, uniform, output: None }
     }
 
     pub fn output_texture(&self) -> Option<&wgpu::Texture> {
@@ -930,9 +950,24 @@ impl PostFxPass {
         };
         let u = PostFxUniform {
             inverse_projection: inv_proj,
-            grain_flare: [params.grain_strength.max(0.0), params.frame_seed, params.flare_strength.max(0.0), params.flare_threshold.max(0.0)],
-            flare_tint_spread: [params.flare_tint[0], params.flare_tint[1], params.flare_tint[2], params.flare_spread_px.clamp(0.5, 8.0)],
-            outline_color_str: [params.outline_color[0], params.outline_color[1], params.outline_color[2], params.outline_strength.clamp(0.0, 1.0)],
+            grain_flare: [
+                params.grain_strength.max(0.0),
+                params.frame_seed,
+                params.flare_strength.max(0.0),
+                params.flare_threshold.max(0.0),
+            ],
+            flare_tint_spread: [
+                params.flare_tint[0],
+                params.flare_tint[1],
+                params.flare_tint[2],
+                params.flare_spread_px.clamp(0.5, 8.0),
+            ],
+            outline_color_str: [
+                params.outline_color[0],
+                params.outline_color[1],
+                params.outline_color[2],
+                params.outline_strength.clamp(0.0, 1.0),
+            ],
             outline_params: [
                 params.depth_threshold.max(1e-4),
                 params.normal_threshold.max(1e-4),
@@ -955,12 +990,11 @@ impl PostFxPass {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(color_in) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_in) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(out_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
             ],
         });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("post_fx"),
-            timestamp_writes: None,
-        });
+        let mut pass =
+            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("post_fx"), timestamp_writes: None });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
@@ -1013,7 +1047,13 @@ mod tests {
         }
     }
 
-    fn upload_rgba16f(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, pixels: &[[f32; 4]]) -> (wgpu::Texture, wgpu::TextureView) {
+    fn upload_rgba16f(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        pixels: &[[f32; 4]],
+    ) -> (wgpu::Texture, wgpu::TextureView) {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("test_rgba16f"),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -1026,7 +1066,12 @@ mod tests {
         });
         let halfs: Vec<u16> = pixels.iter().flatten().map(|&v| f32_to_f16(v)).collect();
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             bytemuck::cast_slice(&halfs),
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -1035,7 +1080,13 @@ mod tests {
         (tex, view)
     }
 
-    fn upload_r32f(device: &wgpu::Device, queue: &wgpu::Queue, w: u32, h: u32, vals: &[f32]) -> (wgpu::Texture, wgpu::TextureView) {
+    fn upload_r32f(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        w: u32,
+        h: u32,
+        vals: &[f32],
+    ) -> (wgpu::Texture, wgpu::TextureView) {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("test_r32f"),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -1047,7 +1098,12 @@ mod tests {
             view_formats: &[],
         });
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             bytemuck::cast_slice(vals),
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
             wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -1067,7 +1123,12 @@ mod tests {
         });
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::TexelCopyBufferInfo {
                 buffer: &buf,
                 layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
@@ -1370,7 +1431,11 @@ mod tests {
         queue.submit(Some(enc_sdr.finish()));
         let sdr = read_rgba16f(&device, &queue, rcas.output_texture().unwrap());
 
-        assert!((sdr[(3 * w + 3) as usize][0] - 0.5).abs() < 2e-3, "SDR flat midtone distorted: {:?}", sdr[(3 * w + 3) as usize]);
+        assert!(
+            (sdr[(3 * w + 3) as usize][0] - 0.5).abs() < 2e-3,
+            "SDR flat midtone distorted: {:?}",
+            sdr[(3 * w + 3) as usize]
+        );
         let sdr_diff = sdr[(14 * w + 16) as usize][0] - sdr[(14 * w + 15) as usize][0];
         assert!(sdr_diff > 0.30 + 0.05, "SDR linear RCAS must sharpen edge contrast: diff={sdr_diff}");
         assert!(sdr.iter().all(|p| p[0] >= 0.0 && p[0] <= 1.001), "SDR linear RCAS must stay within [0, 1]");
@@ -1379,6 +1444,10 @@ mod tests {
         rcas.sharpen_with_knee(&device, &mut enc_hdr, &in_v, (w, h), 1.0, 1.0).unwrap();
         queue.submit(Some(enc_hdr.finish()));
         let hdr = read_rgba16f(&device, &queue, rcas.output_texture().unwrap());
-        assert!(hdr[(26 * w + 16) as usize][0] > 3.5, "HDR RCAS must preserve peaks > 1.0: {:?}", hdr[(26 * w + 16) as usize]);
+        assert!(
+            hdr[(26 * w + 16) as usize][0] > 3.5,
+            "HDR RCAS must preserve peaks > 1.0: {:?}",
+            hdr[(26 * w + 16) as usize]
+        );
     }
 }

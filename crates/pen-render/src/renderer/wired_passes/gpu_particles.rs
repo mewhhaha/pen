@@ -208,7 +208,25 @@ impl State {
 
         let samples = samples.max(1);
         let reversed_z = depth_mode == DepthMode::ReversedZ;
-        let key = (scene_cfg.max_particles, mesh_hash(&scene_cfg.mesh_vertices, &scene_cfg.mesh_indices));
+        let max_particles = scene_cfg.max_particles;
+        let dt = scene_cfg.dt.clamp(0.0, 0.1);
+        let gravity = scene_cfg.gravity;
+        let drag = scene_cfg.drag;
+        let curl_strength = scene_cfg.curl_strength;
+        let curl_frequency = scene_cfg.curl_frequency;
+        let restitution = scene_cfg.restitution;
+        let friction = scene_cfg.friction;
+        let depth_thickness = scene_cfg.depth_thickness;
+        let depth_collide = scene_cfg.depth_collide;
+        let sub_emit_on_bounce = scene_cfg.sub_emit_on_bounce;
+        let sub_emit_on_death = scene_cfg.sub_emit_on_death;
+        let sub_emit_count = scene_cfg.sub_emit_count;
+        let sub_emit_speed = scene_cfg.sub_emit_speed;
+        let sub_emit_life = scene_cfg.sub_emit_life;
+        let ambient = scene_cfg.ambient;
+        let velocity_align = scene_cfg.velocity_align;
+
+        let key = (max_particles, mesh_hash(&scene_cfg.mesh_vertices, &scene_cfg.mesh_indices));
         let recreated = particles.system.is_none() || particles.config_key != Some(key);
         let target = PipelineTarget {
             color_format: SCENE_FORMAT,
@@ -219,7 +237,7 @@ impl State {
         if recreated {
             particles.system = Some(GpuParticleSystem::new(
                 device,
-                scene_cfg.max_particles,
+                max_particles,
                 &scene_cfg.mesh_vertices,
                 &scene_cfg.mesh_indices,
                 target,
@@ -228,7 +246,6 @@ impl State {
             particles.needs_seed = true;
         }
         particles.system.as_mut().unwrap().select_draw_target(device, target);
-        let scene_cfg = scene_cfg.clone();
         let stepping = particles.last_step_frame != Some(frame_number);
         let ext_changed = ext_hash.is_some_and(|hash| hash != particles.last_ext_seed_hash);
         let seed = if stepping && (ext_hash.is_none() || force_reseed || ext_changed || particles.needs_seed) {
@@ -240,11 +257,11 @@ impl State {
             let sys = particles.system.as_ref().unwrap();
             let initial = seed.or_else(|| particles.needs_seed.then_some(particles.last_seed_snapshot.as_slice()));
             if let Some(initial) = initial {
-                sys.seed(device, encoder, &initial[..initial.len().min(scene_cfg.max_particles as usize)])?;
+                sys.seed(device, encoder, &initial[..initial.len().min(max_particles as usize)])?;
             }
             Some(ParticleStep {
                 frame: frame_number,
-                time: particles.sim_time + scene_cfg.dt.clamp(0.0, 0.1),
+                time: particles.sim_time + dt,
                 seed: seed.map(<[GpuParticle]>::to_vec),
                 ext_seed_hash: ext_hash.filter(|_| seed.is_some()),
             })
@@ -266,28 +283,28 @@ impl State {
                 view_projection: active_vp,
                 camera_pos: cam_pos,
                 depth_clear: depth_mode.clear_value(),
-                gravity: scene_cfg.gravity,
-                dt: scene_cfg.dt.clamp(0.0, 0.1),
-                drag: scene_cfg.drag,
-                curl_strength: scene_cfg.curl_strength,
-                curl_frequency: scene_cfg.curl_frequency,
+                gravity,
+                dt,
+                drag,
+                curl_strength,
+                curl_frequency,
                 time: step.time,
-                restitution: scene_cfg.restitution,
-                friction: scene_cfg.friction,
-                depth_thickness: scene_cfg.depth_thickness,
+                restitution,
+                friction,
+                depth_thickness,
                 reversed_z,
-                depth_collide: scene_cfg.depth_collide,
-                sub_emit_on_bounce: scene_cfg.sub_emit_on_bounce,
-                sub_emit_on_death: scene_cfg.sub_emit_on_death,
-                sub_emit_count: scene_cfg.sub_emit_count,
-                sub_emit_speed: scene_cfg.sub_emit_speed,
-                sub_emit_life: scene_cfg.sub_emit_life,
+                depth_collide,
+                sub_emit_on_bounce,
+                sub_emit_on_death,
+                sub_emit_count,
+                sub_emit_speed,
+                sub_emit_life,
             };
 
             wired.gpu_particles.system.as_ref().unwrap().step(device, encoder, &depth_r32, &sim_params)?;
         }
         let sys = wired.gpu_particles.system.as_ref().unwrap();
-        sys.prepare_draw(device, encoder, active_vp, sun_dir, sun_col, scene_cfg.ambient, scene_cfg.velocity_align);
+        sys.prepare_draw(device, encoder, active_vp, sun_dir, sun_col, ambient, velocity_align);
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("gpu_particles"),

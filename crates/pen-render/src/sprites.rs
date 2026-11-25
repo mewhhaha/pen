@@ -94,13 +94,17 @@ pub(crate) struct Sprites {
     screen: wgpu::Buffer,
     sampler: wgpu::Sampler,
     scene: Option<wgpu::TextureView>,
+    scene_id: u64,
+    next_scene_id: u64,
+    scene_ids: Vec<(Option<wgpu::TextureView>, u64, u64)>,
     filtered: Option<[wgpu::TextureView; 2]>,
     white: wgpu::TextureView,
+    white_ready: bool,
     capacity: usize,
     storage: Option<wgpu::Buffer>,
     data: Vec<f32>,
-    /// Bind groups by texture view, with the draw that last used each.
-    groups: HashMap<u64, (wgpu::BindGroup, u64)>,
+    /// Bind groups by `(texture_key, scene_id)`, with the draw that last used each.
+    groups: HashMap<(u64, u64), (wgpu::BindGroup, u64)>,
     draws: u64,
 }
 
@@ -126,6 +130,9 @@ impl Sprites {
                 ..Default::default()
             }),
             scene: None,
+            scene_id: 0,
+            next_scene_id: 1,
+            scene_ids: vec![(None, 0, 0)],
             filtered: None,
             white: device
                 .create_texture(&wgpu::TextureDescriptor {
@@ -139,6 +146,7 @@ impl Sprites {
                     view_formats: &[],
                 })
                 .create_view(&Default::default()),
+            white_ready: false,
             capacity: 0,
             storage: None,
             data: Vec::new(),
@@ -148,12 +156,23 @@ impl Sprites {
     }
 
     /// The scene is immutable during UI drawing, so overlapping sprites all
-    /// sample the world, not each other's ink. Resizes invalidate cached groups.
+    /// sample the world, not each other's ink. Cached bind groups are keyed by
+    /// `(texture, scene_id)` so ping-pong scene filters reuse groups across frames.
     pub fn set_scene(&mut self, scene: Option<wgpu::TextureView>) {
-        if self.scene != scene {
-            self.scene = scene;
-            self.groups.clear();
+        if self.scene == scene {
+            return;
         }
+        let draws = self.draws;
+        if let Some((_, id, last_used)) = self.scene_ids.iter_mut().find(|(v, _, _)| *v == scene) {
+            self.scene_id = *id;
+            *last_used = draws;
+        } else {
+            let id = self.next_scene_id;
+            self.next_scene_id += 1;
+            self.scene_ids.push((scene.clone(), id, draws));
+            self.scene_id = id;
+        }
+        self.scene = scene;
     }
 
     /// Ping-pong targets keep each scene filter's input immutable. The
@@ -229,18 +248,21 @@ impl Sprites {
         if count == 0 {
             return;
         }
-        if self.scene.is_none() {
+        if !self.white_ready {
             queue.write_texture(
                 self.white.texture().as_image_copy(),
                 &[255, 255, 255, 255],
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
                 wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
             );
+            self.white_ready = true;
         }
         self.draws += 1;
         if self.draws.is_multiple_of(GROUP_LIFETIME) {
             let oldest = self.draws - GROUP_LIFETIME;
             self.groups.retain(|_, (_, used)| *used >= oldest);
+            let active_id = self.scene_id;
+            self.scene_ids.retain(|(v, id, used)| v.is_none() || *id == active_id || *used >= oldest);
         }
         if count > self.capacity {
             // The groups bind the storage buffer this replaces.
@@ -315,7 +337,7 @@ impl Sprites {
                 continue;
             }
             pass.set_pipeline(&batch.pipeline);
-            let (group, used) = self.groups.entry(batch.key.0).or_insert_with(|| {
+            let (group, used) = self.groups.entry((batch.key.0, self.scene_id)).or_insert_with(|| {
                 let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
                     layout: &self.layout,

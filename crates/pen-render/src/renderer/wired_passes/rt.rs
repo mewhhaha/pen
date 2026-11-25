@@ -15,67 +15,7 @@ use crate::svgf::{SvgfDenoiser, SvgfInputs, SvgfParams};
 use anyhow::Result;
 use pen_protocol::{Matrix, RenderFrame};
 
-const RT_COMPOSITE_WGSL: &str = r#"
-struct RtCompUniform {
-  depth_clear: f32,
-  refl_weight: f32,
-  gi_weight: f32,
-  shadow_floor: f32,
-  gi_demodulated: f32,
-  di_weight: f32,
-  _pad1: f32,
-  _pad2: f32,
-};
-@group(0) @binding(0) var depth_tex: texture_2d<f32>;
-@group(0) @binding(1) var shadow_ao_tex: texture_2d<f32>;
-@group(0) @binding(2) var<uniform> cfg: RtCompUniform;
-
-@vertex fn vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
-  let x = f32((idx << 1u) & 2u) * 2.0 - 1.0;
-  let y = 1.0 - f32(idx & 2u) * 2.0;
-  return vec4f(x, y, 0.0, 1.0);
-}
-
-@fragment fn fs_shadow_ao(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-  let dims = vec2i(textureDimensions(depth_tex, 0));
-  let p = clamp(vec2i(pos.xy), vec2i(0), dims - vec2i(1));
-  let d = textureLoad(depth_tex, p, 0).r;
-  if (abs(d - cfg.depth_clear) <= 0.00001) {
-    return vec4f(1.0, 1.0, 1.0, 1.0);
-  }
-  let rt_dims = vec2i(textureDimensions(shadow_ao_tex, 0));
-  var sao: vec4f;
-  if (rt_dims.x == dims.x && rt_dims.y == dims.y) {
-    sao = textureLoad(shadow_ao_tex, p, 0);
-  } else {
-    let f_coord = (vec2f(p) + vec2f(0.5)) * vec2f(rt_dims) / vec2f(dims) - vec2f(0.5);
-    let base_h = vec2i(floor(f_coord));
-    let frac = clamp(f_coord - vec2f(base_h), vec2f(0.0), vec2f(1.0));
-    var sum = vec4f(0.0);
-    var w_sum = 0.0;
-    for (var oy = 0; oy < 2; oy++) {
-      for (var ox = 0; ox < 2; ox++) {
-        let hp = clamp(base_h + vec2i(ox, oy), vec2i(0), rt_dims - vec2i(1));
-        let fp = clamp(vec2i((vec2f(hp) + vec2f(0.5)) * vec2f(dims) / vec2f(rt_dims)), vec2i(0), dims - vec2i(1));
-        let dh = textureLoad(depth_tex, fp, 0).r;
-        let bw = select(1.0 - frac.x, frac.x, ox == 1) * select(1.0 - frac.y, frac.y, oy == 1);
-        let dz = abs(d - dh);
-        let dw = 1.0 / (1.0 + dz * 400.0);
-        let w = bw * dw + 1e-5;
-        sum += textureLoad(shadow_ao_tex, hp, 0) * w;
-        w_sum += w;
-      }
-    }
-    sao = sum / max(w_sum, 1e-5);
-  }
-  let shadow = mix(cfg.shadow_floor, 1.0, clamp(sao.r, 0.0, 1.0));
-  let ao = mix(0.58, 1.0, clamp(sao.g, 0.0, 1.0));
-  let atten = shadow * ao;
-  return vec4f(atten, atten, atten, 1.0);
-}
-"#;
-
-const RT_BOUNCE_WGSL: &str = r#"
+const RT_COMBINED_WGSL: &str = r#"
 struct RtCompUniform {
   depth_clear: f32,
   refl_weight: f32,
@@ -100,21 +40,23 @@ struct RtCompUniform {
   return vec4f(x, y, 0.0, 1.0);
 }
 
-@fragment fn fs_bounce(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+@fragment fn fs_combined(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let dims = vec2i(textureDimensions(depth_tex, 0));
   let p = clamp(vec2i(pos.xy), vec2i(0), dims - vec2i(1));
   let d = textureLoad(depth_tex, p, 0).r;
   if (abs(d - cfg.depth_clear) <= 0.00001) {
     discard;
   }
-  let rt_dims = vec2i(textureDimensions(refl_tex, 0));
+  let rt_dims = vec2i(textureDimensions(sao_tex, 0));
+  var sao = vec4f(1.0, 1.0, 0.0, 1.0);
   var refl = vec3f(0.0);
   var gi = vec3f(0.0);
   var di = vec3f(0.0);
-  var occlude = 0.0;
   if (rt_dims.x == dims.x && rt_dims.y == dims.y) {
-    refl = max(textureLoad(refl_tex, p, 0).rgb, vec3f(0.0));
-    occlude = clamp(textureLoad(sao_tex, p, 0).b, 0.0, 0.75);
+    sao = textureLoad(sao_tex, p, 0);
+    if (cfg.refl_weight > 0.0) {
+      refl = max(textureLoad(refl_tex, p, 0).rgb, vec3f(0.0));
+    }
     if (cfg.gi_weight > 0.0) {
       gi = max(textureLoad(gi_tex, p, 0).rgb, vec3f(0.0));
     }
@@ -125,10 +67,10 @@ struct RtCompUniform {
     let f_coord = (vec2f(p) + vec2f(0.5)) * vec2f(rt_dims) / vec2f(dims) - vec2f(0.5);
     let base_h = vec2i(floor(f_coord));
     let frac = clamp(f_coord - vec2f(base_h), vec2f(0.0), vec2f(1.0));
+    var s_sum = vec4f(0.0);
     var r_sum = vec3f(0.0);
     var g_sum = vec3f(0.0);
     var d_sum = vec3f(0.0);
-    var o_sum = 0.0;
     var w_sum = 0.0;
     for (var oy = 0; oy < 2; oy++) {
       for (var ox = 0; ox < 2; ox++) {
@@ -139,8 +81,10 @@ struct RtCompUniform {
         let dz = abs(d - dh);
         let dw = 1.0 / (1.0 + dz * 400.0);
         let w = bw * dw + 1e-5;
-        r_sum += max(textureLoad(refl_tex, hp, 0).rgb, vec3f(0.0)) * w;
-        o_sum += clamp(textureLoad(sao_tex, hp, 0).b, 0.0, 0.75) * w;
+        s_sum += textureLoad(sao_tex, hp, 0) * w;
+        if (cfg.refl_weight > 0.0) {
+          r_sum += max(textureLoad(refl_tex, hp, 0).rgb, vec3f(0.0)) * w;
+        }
         if (cfg.gi_weight > 0.0) {
           g_sum += max(textureLoad(gi_tex, hp, 0).rgb, vec3f(0.0)) * w;
         }
@@ -151,11 +95,15 @@ struct RtCompUniform {
       }
     }
     let inv_w = 1.0 / max(w_sum, 1e-5);
+    sao = s_sum * inv_w;
     refl = r_sum * inv_w;
     gi = g_sum * inv_w;
     di = d_sum * inv_w;
-    occlude = o_sum * inv_w;
   }
+  let shadow = mix(cfg.shadow_floor, 1.0, clamp(sao.r, 0.0, 1.0));
+  let ao = mix(0.58, 1.0, clamp(sao.g, 0.0, 1.0));
+  let atten = shadow * ao;
+  let occlude = clamp(clamp(sao.b, 0.0, 0.75) * cfg.refl_weight, 0.0, 0.75);
   if (cfg.gi_weight > 0.0 && cfg.gi_demodulated > 0.5) {
     let g_dims = vec2i(textureDimensions(gbuf_albedo_metallic, 0));
     let g_px = clamp(vec2i((vec2f(p) + vec2f(0.5)) * vec2f(g_dims) / vec2f(dims)), vec2i(0), g_dims - vec2i(1));
@@ -163,9 +111,9 @@ struct RtCompUniform {
     gi *= max(g_am.rgb, vec3f(0.0)) * (1.0 - clamp(g_am.w, 0.0, 1.0));
   }
   let bounce = refl * cfg.refl_weight + gi * cfg.gi_weight + di * cfg.di_weight;
-  // Premultiplied-alpha blend (`One + OneMinusSrcAlpha`) attenuates occluded sky IBL where local RT
-  // reflection rays hit geometry, preventing double-counting while leaving diffuse/sky misses untouched.
-  return vec4f(bounce, clamp(occlude * cfg.refl_weight, 0.0, 0.75));
+  // Single-pass blend (`One + OneMinusSrcAlpha`) combines shadow/AO attenuation and bounce:
+  // dst' = bounce + dst * (atten * (1 - occlude)) = bounce + dst * (1 - alpha).
+  return vec4f(bounce, 1.0 - atten * (1.0 - occlude));
 }
 "#;
 
@@ -231,49 +179,12 @@ fn prep(@builtin(global_invocation_id) id: vec3u) {
     textureStore(out_motion, px, vec4f(0.0, 0.0, 0.0, 0.0));
     return;
   }
-  let sr = load_world(d_px + vec2i(1, 0), depth_dims);
-  let sl = load_world(d_px - vec2i(1, 0), depth_dims);
-  let sd = load_world(d_px + vec2i(0, 1), depth_dims);
-  let su = load_world(d_px - vec2i(0, 1), depth_dims);
-  var dx = vec3f(1.0, 0.0, 0.0);
-  var has_dx = true;
-  if (sr.valid && sl.valid) {
-    let dr = sr.pos - c.pos;
-    let dl = c.pos - sl.pos;
-    dx = select(dl, dr, dot(dr, dr) < dot(dl, dl));
-  } else if (sr.valid) {
-    dx = sr.pos - c.pos;
-  } else if (sl.valid) {
-    dx = c.pos - sl.pos;
-  } else {
-    has_dx = false;
-  }
-  var dy = vec3f(0.0, 0.0, 1.0);
-  var has_dy = true;
-  if (sd.valid && su.valid) {
-    let dd = sd.pos - c.pos;
-    let du = c.pos - su.pos;
-    dy = select(du, dd, dot(dd, dd) < dot(du, du));
-  } else if (sd.valid) {
-    dy = sd.pos - c.pos;
-  } else if (su.valid) {
-    dy = c.pos - su.pos;
-  } else {
-    has_dy = false;
-  }
-  var n = vec3f(0.0, 1.0, 0.0);
-  if (has_dx && has_dy) {
-    let raw_n = cross(dx, dy);
-    let area2 = dot(raw_n, raw_n);
-    let ref2 = dot(dx, dx) * dot(dy, dy);
-    if (area2 > 1e-12 * ref2 && ref2 > 0.0) {
-      n = raw_n * inverseSqrt(area2);
-    }
-  }
   let to_cam = u.cam_and_clear.xyz - c.pos;
   let dist = length(to_cam);
   let view_dir = select(vec3f(0.0, 1.0, 0.0), to_cam / dist, dist > 1e-6);
+  var n = vec3f(0.0, 1.0, 0.0);
   var mat_rough = clamp(textureLoad(rt_sao_tex, px, 0).a, 0.04, 1.0);
+  var has_gbuf_n = false;
   if ((u.dims.w & 2u) != 0u) {
     let g_dims = vec2i(textureDimensions(gbuf_normal_roughness, 0));
     let g_px = clamp(vec2i((vec2f(px) + vec2f(0.5)) * vec2f(g_dims) / vec2f(out_dims)), vec2i(0), g_dims - vec2i(1));
@@ -281,6 +192,47 @@ fn prep(@builtin(global_invocation_id) id: vec3u) {
     if (dot(g_nr.xyz, g_nr.xyz) >= 0.01) {
       n = normalize(g_nr.xyz);
       mat_rough = clamp(g_nr.w, 0.04, 1.0);
+      has_gbuf_n = true;
+    }
+  }
+  if (!has_gbuf_n) {
+    let sr = load_world(d_px + vec2i(1, 0), depth_dims);
+    let sl = load_world(d_px - vec2i(1, 0), depth_dims);
+    let sd = load_world(d_px + vec2i(0, 1), depth_dims);
+    let su = load_world(d_px - vec2i(0, 1), depth_dims);
+    var dx = vec3f(1.0, 0.0, 0.0);
+    var has_dx = true;
+    if (sr.valid && sl.valid) {
+      let dr = sr.pos - c.pos;
+      let dl = c.pos - sl.pos;
+      dx = select(dl, dr, dot(dr, dr) < dot(dl, dl));
+    } else if (sr.valid) {
+      dx = sr.pos - c.pos;
+    } else if (sl.valid) {
+      dx = c.pos - sl.pos;
+    } else {
+      has_dx = false;
+    }
+    var dy = vec3f(0.0, 0.0, 1.0);
+    var has_dy = true;
+    if (sd.valid && su.valid) {
+      let dd = sd.pos - c.pos;
+      let du = c.pos - su.pos;
+      dy = select(du, dd, dot(dd, dd) < dot(du, du));
+    } else if (sd.valid) {
+      dy = sd.pos - c.pos;
+    } else if (su.valid) {
+      dy = c.pos - su.pos;
+    } else {
+      has_dy = false;
+    }
+    if (has_dx && has_dy) {
+      let raw_n = cross(dx, dy);
+      let area2 = dot(raw_n, raw_n);
+      let ref2 = dot(dx, dx) * dot(dy, dy);
+      if (area2 > 1e-12 * ref2 && ref2 > 0.0) {
+        n = raw_n * inverseSqrt(area2);
+      }
     }
   }
   if (dot(n, view_dir) < 0.0) {
@@ -350,15 +302,13 @@ struct SvgfPrepUniform {
 }
 
 pub(super) struct RtCompositePipelines {
-    sao_bgl: wgpu::BindGroupLayout,
-    sao_pipeline: wgpu::RenderPipeline,
-    bounce_bgl: wgpu::BindGroupLayout,
-    bounce_pipeline: wgpu::RenderPipeline,
+    combined_bgl: wgpu::BindGroupLayout,
+    combined_pipeline: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
 }
 
 struct SvgfTex {
-    tex: wgpu::Texture,
+    _tex: wgpu::Texture,
     view: wgpu::TextureView,
 }
 
@@ -371,24 +321,20 @@ impl SvgfTex {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        Self { tex, view }
+        Self { _tex: tex, view }
     }
 }
 
 struct SvgfRtBuffers {
     size: (u32, u32),
-    curr_depth: SvgfTex,
-    prev_depth: SvgfTex,
-    curr_normal: SvgfTex,
-    prev_normal: SvgfTex,
+    depth: [SvgfTex; 2],
+    normal: [SvgfTex; 2],
     motion: SvgfTex,
+    parity: usize,
 }
 
 pub(super) struct SvgfRtState {
@@ -516,58 +462,8 @@ impl WiredPasses {
                 },
                 count: None,
             };
-            let sao_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("rt_sao_comp_bgl"),
-                entries: &[tex_entry(0), tex_entry(1), u_entry(2)],
-            });
-            let sao_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("rt_sao_comp_pl"),
-                bind_group_layouts: &[Some(&sao_bgl)],
-                immediate_size: 0,
-            });
-            let sao_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("rt_sao_comp"),
-                source: wgpu::ShaderSource::Wgsl(RT_COMPOSITE_WGSL.into()),
-            });
-            let sao_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("rt_sao_comp"),
-                layout: Some(&sao_pl),
-                vertex: wgpu::VertexState {
-                    module: &sao_mod,
-                    entry_point: Some("vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &sao_mod,
-                    entry_point: Some("fs_shadow_ao"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: SCENE_FORMAT,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::Dst,
-                                dst_factor: wgpu::BlendFactor::Zero,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::Zero,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
-
-            let bounce_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("rt_bounce_comp_bgl"),
+            let combined_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rt_combined_comp_bgl"),
                 entries: &[
                     tex_entry(0),
                     tex_entry(1),
@@ -578,20 +474,20 @@ impl WiredPasses {
                     tex_entry(6),
                 ],
             });
-            let bounce_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("rt_bounce_comp_pl"),
-                bind_group_layouts: &[Some(&bounce_bgl)],
+            let combined_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("rt_combined_comp_pl"),
+                bind_group_layouts: &[Some(&combined_bgl)],
                 immediate_size: 0,
             });
-            let bounce_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("rt_bounce_comp"),
-                source: wgpu::ShaderSource::Wgsl(RT_BOUNCE_WGSL.into()),
+            let combined_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("rt_combined_comp"),
+                source: wgpu::ShaderSource::Wgsl(RT_COMBINED_WGSL.into()),
             });
-            let bounce_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("rt_bounce_comp"),
-                layout: Some(&bounce_pl),
+            let combined_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("rt_combined_comp"),
+                layout: Some(&combined_pl),
                 vertex: wgpu::VertexState {
-                    module: &bounce_mod,
+                    module: &combined_mod,
                     entry_point: Some("vs"),
                     compilation_options: Default::default(),
                     buffers: &[],
@@ -600,8 +496,8 @@ impl WiredPasses {
                 depth_stencil: None,
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
-                    module: &bounce_mod,
-                    entry_point: Some("fs_bounce"),
+                    module: &combined_mod,
+                    entry_point: Some("fs_combined"),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: SCENE_FORMAT,
@@ -629,7 +525,7 @@ impl WiredPasses {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            RtCompositePipelines { sao_bgl, sao_pipeline, bounce_bgl, bounce_pipeline, uniform }
+            RtCompositePipelines { combined_bgl, combined_pipeline, uniform }
         })
     }
 
@@ -654,74 +550,48 @@ impl WiredPasses {
     ) {
         let dummy_gbuf = self.dummy_rgba16f_view(device);
         let gbuf_am_bind = gbuf_albedo_metallic.unwrap_or(&dummy_gbuf);
-        let di_bind = di_view.unwrap_or(&dummy_gbuf);
+        let has_bounce = tier >= 2 && refl_view.is_some();
+        let rv = if has_bounce { refl_view.unwrap() } else { &dummy_gbuf };
+        let gv = if has_bounce { gi_view.unwrap_or(rv) } else { &dummy_gbuf };
+        let di_bind = if has_bounce { di_view.unwrap_or(&dummy_gbuf) } else { &dummy_gbuf };
         let comp = self.ensure_rt_composite(device);
         let cfg = RtCompUniform {
             depth_clear,
-            refl_weight: 1.0,
-            gi_weight: if ddgi_active { 0.0 } else { 0.85 },
+            refl_weight: if has_bounce { 1.0 } else { 0.0 },
+            gi_weight: if has_bounce && !ddgi_active { 0.85 } else { 0.0 },
             shadow_floor: if has_csm { 0.84 } else { 0.25 },
-            gi_demodulated: if gi_demodulated && gbuf_albedo_metallic.is_some() { 1.0 } else { 0.0 },
+            gi_demodulated: if has_bounce && gi_demodulated && gbuf_albedo_metallic.is_some() { 1.0 } else { 0.0 },
             // Pen's forward PBR (`surface_lobes.wgsl`) scales direct lights by PI relative to physical 1/PI BRDFs.
-            di_weight: if di_view.is_some() { std::f32::consts::PI } else { 0.0 },
+            di_weight: if has_bounce && di_view.is_some() { std::f32::consts::PI } else { 0.0 },
             _pad: [0.0; 2],
         };
         queue.write_buffer(&comp.uniform, 0, bytemuck::bytes_of(&cfg));
-        let sao_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rt_sao_comp_bg"),
-            layout: &comp.sao_bgl,
+        let combined_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rt_combined_comp_bg"),
+            layout: &comp.combined_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_r32f) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(sao_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: comp.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(rv) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(gv) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sao_view) },
+                wgpu::BindGroupEntry { binding: 4, resource: comp.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(gbuf_am_bind) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(di_bind) },
             ],
         });
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("rt_shadow_ao_composite"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: scene_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(&comp.sao_pipeline);
-            pass.set_bind_group(0, &sao_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
-        if tier >= 2
-            && let Some(rv) = refl_view
-        {
-            let gv = gi_view.unwrap_or(rv);
-            let bounce_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("rt_bounce_comp_bg"),
-                layout: &comp.bounce_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_r32f) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(rv) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(gv) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sao_view) },
-                    wgpu::BindGroupEntry { binding: 4, resource: comp.uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(gbuf_am_bind) },
-                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(di_bind) },
-                ],
-            });
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("rt_bounce_composite"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: scene_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(&comp.bounce_pipeline);
-            pass.set_bind_group(0, &bounce_bg, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("rt_combined_composite"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: scene_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&comp.combined_pipeline);
+        pass.set_bind_group(0, &combined_bg, &[]);
+        pass.draw(0..3, 0..1);
     }
 }
 
@@ -962,11 +832,16 @@ impl State {
             if resized {
                 svgf.buffers = Some(SvgfRtBuffers {
                     size: rt_size,
-                    curr_depth: SvgfTex::new(device, "svgf_rt_depth", rt_size),
-                    prev_depth: SvgfTex::new(device, "svgf_rt_prev_depth", rt_size),
-                    curr_normal: SvgfTex::new(device, "svgf_rt_normal", rt_size),
-                    prev_normal: SvgfTex::new(device, "svgf_rt_prev_normal", rt_size),
+                    depth: [
+                        SvgfTex::new(device, "svgf_rt_depth_0", rt_size),
+                        SvgfTex::new(device, "svgf_rt_depth_1", rt_size),
+                    ],
+                    normal: [
+                        SvgfTex::new(device, "svgf_rt_normal_0", rt_size),
+                        SvgfTex::new(device, "svgf_rt_normal_1", rt_size),
+                    ],
                     motion: SvgfTex::new(device, "svgf_rt_motion", rt_size),
+                    parity: 0,
                 });
                 svgf.reset_history();
             }
@@ -979,7 +854,9 @@ impl State {
                 dims: [rt_size.0, rt_size.1, u32::from(has_prev), prep_flags],
             };
             queue.write_buffer(&svgf.prep_u, 0, bytemuck::bytes_of(&prep_u));
-            let bufs = svgf.buffers.as_ref().unwrap();
+            let bufs = svgf.buffers.as_mut().unwrap();
+            let curr = bufs.parity;
+            let prev = 1 - curr;
             let refl_bind = raw_refl.as_ref().unwrap_or(&sao_raw_view);
             let prep_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("svgf_rt_prep_bg"),
@@ -989,11 +866,11 @@ impl State {
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_r32f) },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&bufs.curr_depth.view),
+                        resource: wgpu::BindingResource::TextureView(&bufs.depth[curr].view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&bufs.curr_normal.view),
+                        resource: wgpu::BindingResource::TextureView(&bufs.normal[curr].view),
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
@@ -1018,10 +895,10 @@ impl State {
                 SvgfParams { min_alpha: 0.1, atrous_iterations: 3, reset_history: !has_prev, ..Default::default() };
             let sao_in = SvgfInputs {
                 noisy_signal: &sao_raw_view,
-                depth: &bufs.curr_depth.view,
-                prev_depth: &bufs.prev_depth.view,
-                normal: &bufs.curr_normal.view,
-                prev_normal: &bufs.prev_normal.view,
+                depth: &bufs.depth[curr].view,
+                prev_depth: &bufs.depth[prev].view,
+                normal: &bufs.normal[curr].view,
+                prev_normal: &bufs.normal[prev].view,
                 motion: &bufs.motion.view,
             };
             svgf.sao.denoise(device, encoder, &sao_in, rt_size, &sao_params)?;
@@ -1071,17 +948,7 @@ impl State {
                     denoised_di = svgf.di.output_view().cloned();
                 }
             }
-            let copy_ext = wgpu::Extent3d { width: rt_size.0, height: rt_size.1, depth_or_array_layers: 1 };
-            encoder.copy_texture_to_texture(
-                bufs.curr_depth.tex.as_image_copy(),
-                bufs.prev_depth.tex.as_image_copy(),
-                copy_ext,
-            );
-            encoder.copy_texture_to_texture(
-                bufs.curr_normal.tex.as_image_copy(),
-                bufs.prev_normal.tex.as_image_copy(),
-                copy_ext,
-            );
+            bufs.parity = prev;
             svgf.prev_vp = Some(active_vp);
             let denoised_sao = svgf.sao.output_view().cloned().unwrap_or(sao_raw_view);
             let has_csm = !frame.cascades.is_empty() && frame.shadow.texels > 0;

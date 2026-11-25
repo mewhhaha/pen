@@ -65,10 +65,15 @@ fn trace_segment(start: vec2f, end: vec2f) -> vec4f {
         let chord = min(next, stop) - t;
         if chord > 0.0 {
             let material = textureLoad(scene, cell, 0);
-            let opacity = clamp(material.a, 0.0, 1.0);
-            let transmission = select(pow(max(1.0 - opacity, 1e-6), chord), 0.0, opacity >= 1.0);
-            let emission_scale = select(chord, (1.0 - transmission) / max(opacity, 1e-5), opacity >= 1e-5);
-            packet = compose(packet, vec4f(material.rgb * emission_scale, transmission));
+            if material.a > 0.0 || any(material.rgb != vec3f(0.0)) {
+                let opacity = clamp(material.a, 0.0, 1.0);
+                let transmission = select(pow(max(1.0 - opacity, 1e-6), chord), 0.0, opacity >= 1.0);
+                let emission_scale = select(chord, (1.0 - transmission) / max(opacity, 1e-5), opacity >= 1e-5);
+                packet = compose(packet, vec4f(material.rgb * emission_scale, transmission));
+                if packet.a <= 0.0 {
+                    break;
+                }
+            }
         }
         let advance = crossing <= vec2f(next);
         cell += select(vec2i(0), step, advance);
@@ -137,8 +142,12 @@ fn trace_cascade(@builtin(global_invocation_id) id: vec3u, @builtin(num_workgrou
             // cannot borrow radiance from paths that miss the blocker.
             let end = position(far_probe, params.far_spacing, extent) + child_ray * params.interval.y;
             let near = trace_segment(start, end);
-            let far = far_packets[packet_index(far_probe, params.far_grid, params.far_dirs, child_bin)];
-            angular += compose(near, far) * tap_weight(blend, tap);
+            let sample_pkt = select(
+                near,
+                compose(near, far_packets[packet_index(far_probe, params.far_grid, params.far_dirs, child_bin)]),
+                near.a > 0.0,
+            );
+            angular += sample_pkt * tap_weight(blend, tap);
         }
         merged += angular;
     }

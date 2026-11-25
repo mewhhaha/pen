@@ -106,6 +106,8 @@ struct MaskTargets {
 pub struct JfaOutlinePass {
     shader: wgpu::ShaderModule,
     styles: wgpu::Buffer,
+    radii: wgpu::Buffer,
+    radius_stride: u32,
     init: wgpu::ComputePipeline,
     jump: wgpu::ComputePipeline,
     mesh_pipelines: Vec<(MeshPipelineKey, wgpu::RenderPipeline)>,
@@ -126,6 +128,16 @@ impl JfaOutlinePass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let radius_stride = device.limits().min_uniform_buffer_offset_alignment.max(16);
+        let mut radius_bytes = vec![0u8; radius_stride as usize * MAX_RADIUS as usize];
+        for (r, slot) in (1u32..=MAX_RADIUS).zip(radius_bytes.chunks_exact_mut(radius_stride as usize)) {
+            slot[..4].copy_from_slice(bytemuck::bytes_of(&r));
+        }
+        let radii = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("JFA composite radii"),
+            contents: &radius_bytes,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
         let init = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("JFA init seeds"),
             layout: None,
@@ -137,9 +149,9 @@ impl JfaOutlinePass {
         let jump_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("JFA jump bindings"),
             entries: &[
-                compute_buffer_layout(3, wgpu::BufferBindingType::Storage { read_only: true }, false),
-                compute_buffer_layout(4, wgpu::BufferBindingType::Storage { read_only: false }, false),
-                compute_buffer_layout(5, wgpu::BufferBindingType::Uniform, true),
+                compute_buffer_layout(3, wgpu::BufferBindingType::Storage { read_only: true }, false, 8),
+                compute_buffer_layout(4, wgpu::BufferBindingType::Storage { read_only: false }, false, 8),
+                compute_buffer_layout(5, wgpu::BufferBindingType::Uniform, true, 16),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -158,6 +170,8 @@ impl JfaOutlinePass {
         Self {
             shader,
             styles,
+            radii,
+            radius_stride,
             init,
             jump,
             mesh_pipelines: Vec::new(),
@@ -167,8 +181,8 @@ impl JfaOutlinePass {
         }
     }
 
-    /// Allocate for a nonzero render extent. Each seed buffer uses 16 bytes per
-    /// pixel, so large targets may require higher storage-binding and buffer limits.
+    /// Allocate for a nonzero render extent. Each seed buffer uses 8 bytes per
+    /// pixel (packed 16-bit coordinates + style), so large targets use half the memory.
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         assert!(width > 0 && height > 0, "the outline extent must be nonzero");
         if self.targets.as_ref().is_some_and(|targets| targets.mask.width() == width && targets.mask.height() == height)
@@ -177,10 +191,13 @@ impl JfaOutlinePass {
         }
         let limits = device.limits();
         assert!(
-            width <= limits.max_texture_dimension_2d && height <= limits.max_texture_dimension_2d,
-            "the outline extent exceeds the device's 2D texture limit"
+            width <= limits.max_texture_dimension_2d
+                && height <= limits.max_texture_dimension_2d
+                && width <= 65535
+                && height <= 65535,
+            "the outline extent exceeds the device's 2D texture or packed seed limit"
         );
-        let seed_bytes = u64::from(width) * u64::from(height) * 16;
+        let seed_bytes = (u64::from(width) * u64::from(height) * 8).max(16);
         assert!(
             seed_bytes <= limits.max_storage_buffer_binding_size.min(limits.max_buffer_size),
             "each outline seed buffer requires {seed_bytes} bytes, exceeding the device's buffer limits"
@@ -495,11 +512,7 @@ impl JfaOutlinePass {
                 self.composite_pipelines.push((target_format, pipeline));
                 &self.composite_pipelines.last().unwrap().1
             };
-        let radius = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("JFA composite radius"),
-            contents: bytemuck::bytes_of(radius),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let radius_offset = u64::from((*radius).clamp(1, MAX_RADIUS) - 1) * u64::from(self.radius_stride);
         let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("JFA composite bindings"),
             layout: &pipeline.get_bind_group_layout(0),
@@ -507,7 +520,14 @@ impl JfaOutlinePass {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(mask) },
                 wgpu::BindGroupEntry { binding: 3, resource: targets.seeds[*seed].as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 6, resource: self.styles.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 9, resource: radius.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.radii,
+                        offset: radius_offset,
+                        size: wgpu::BufferSize::new(16),
+                    }),
+                },
             ],
         });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -646,11 +666,16 @@ fn compute_buffer_layout(
     binding: u32,
     ty: wgpu::BufferBindingType,
     has_dynamic_offset: bool,
+    min_binding_size: u64,
 ) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset, min_binding_size: wgpu::BufferSize::new(16) },
+        ty: wgpu::BindingType::Buffer {
+            ty,
+            has_dynamic_offset,
+            min_binding_size: wgpu::BufferSize::new(min_binding_size),
+        },
         count: None,
     }
 }

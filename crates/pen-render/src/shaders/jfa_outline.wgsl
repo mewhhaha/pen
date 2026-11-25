@@ -29,8 +29,8 @@ struct OutlineStyleGpu {
 @group(0) @binding(0) var<uniform> mesh: MeshDraw;
 @group(0) @binding(1) var scene_depth: texture_depth_2d;
 @group(0) @binding(2) var mask_tex: texture_2d<u32>;
-@group(0) @binding(3) var<storage, read> source: array<vec4u>;
-@group(0) @binding(4) var<storage, read_write> destination: array<vec4u>;
+@group(0) @binding(3) var<storage, read> source: array<vec2u>;
+@group(0) @binding(4) var<storage, read_write> destination: array<vec2u>;
 @group(0) @binding(5) var<uniform> flood: Flood;
 @group(0) @binding(6) var<uniform> styles: array<OutlineStyleGpu, 256>;
 @group(0) @binding(7) var scene_depth_r32: texture_2d<f32>;
@@ -83,8 +83,16 @@ fn has_style(packed: u32) -> bool {
     return style > 0u && style <= STYLE_COUNT;
 }
 
-// Each seed stores integer pixel coordinates and its original mask value.
-// A zero mask value denotes an empty seed.
+// Each seed packs integer pixel coordinates into `x = (y << 16) | x` and its original mask value into `y`.
+// A zero mask value (`y == 0`) denotes an empty seed.
+fn pack_xy(pixel: vec2u) -> u32 {
+    return (pixel.y << 16u) | pixel.x;
+}
+
+fn unpack_xy(packed_xy: u32) -> vec2u {
+    return vec2u(packed_xy & 0xffffu, packed_xy >> 16u);
+}
+
 @compute @workgroup_size(8, 8)
 fn init_seeds(@builtin(global_invocation_id) id: vec3u) {
     let size = textureDimensions(mask_tex);
@@ -93,7 +101,7 @@ fn init_seeds(@builtin(global_invocation_id) id: vec3u) {
     }
     let packed = textureLoad(mask_tex, vec2i(id.xy), 0).r;
     destination[pixel_index(id.xy, size.x)] = select(
-        vec4u(0u), vec4u(id.xy, packed, 0u), has_style(packed)
+        vec2u(0u), vec2u(pack_xy(id.xy), packed), has_style(packed)
     );
 }
 
@@ -109,12 +117,13 @@ fn jfa_step(@builtin(global_invocation_id) id: vec3u) {
     }
     let index = pixel_index(id.xy, flood.size.x);
     var best = source[index];
-    if best.z != 0u && all(best.xy == id.xy) {
+    let self_xy = pack_xy(id.xy);
+    if best.y != 0u && best.x == self_xy {
         destination[index] = best;
         return;
     }
     let pixel = vec2i(id.xy);
-    var best_distance = select(0xffffffffu, distance_squared(pixel, best.xy), best.z != 0u);
+    var best_distance = select(0xffffffffu, distance_squared(pixel, unpack_xy(best.x)), best.y != 0u);
     for (var y = -1; y <= 1; y++) {
         for (var x = -1; x <= 1; x++) {
             let neighbor = pixel + vec2i(x, y) * flood.step;
@@ -122,13 +131,12 @@ fn jfa_step(@builtin(global_invocation_id) id: vec3u) {
                 continue;
             }
             let candidate = source[pixel_index(vec2u(neighbor), flood.size.x)];
-            if candidate.z == 0u {
+            if candidate.y == 0u {
                 continue;
             }
-            let distance = distance_squared(pixel, candidate.xy);
-            // Break exact ties in row-major order, independent of style and dispatch order.
-            let earlier = pixel_index(candidate.xy, flood.size.x) < pixel_index(best.xy, flood.size.x);
-            if distance < best_distance || (distance == best_distance && earlier) {
+            let distance = distance_squared(pixel, unpack_xy(candidate.x));
+            // Break exact ties in row-major order: `(y << 16) | x` compares identically to `y * width + x`.
+            if distance < best_distance || (distance == best_distance && candidate.x < best.x) {
                 best = candidate;
                 best_distance = distance;
             }
@@ -162,14 +170,14 @@ fn composite(@builtin(position) position: vec4f) -> @location(0) vec4f {
     }
 
     let seed = source[pixel_index(pixel, size.x)];
-    if seed.z == 0u {
+    if seed.y == 0u {
         return vec4f(0.0);
     }
-    let style = styles[(seed.z & STYLE_MASK) - 1u];
+    let style = styles[(seed.y & STYLE_MASK) - 1u];
     if style.width_px <= 0.0 {
         return vec4f(0.0);
     }
-    let distance_sq = distance_squared(vec2i(pixel), seed.xy);
+    let distance_sq = distance_squared(vec2i(pixel), unpack_xy(seed.x));
     if distance_sq > max_radius * max_radius {
         return vec4f(0.0);
     }
@@ -182,6 +190,6 @@ fn composite(@builtin(position) position: vec4f) -> @location(0) vec4f {
             coverage = 1.0 - smoothstep(inner, outer, distance);
         }
     }
-    let color = style_color(style, seed.z);
+    let color = style_color(style, seed.y);
     return vec4f(color.rgb, clamp(color.a, 0.0, 1.0) * coverage);
 }

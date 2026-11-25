@@ -2,7 +2,7 @@ use super::super::{GpuAsset, MeshletIndirectSlot, Scratch, Shape, Source, State,
 use super::{OutlineScenes, PlannedDagDraw, PlannedMeshletDraw, WiredPasses, outlined};
 use crate::camera_precision::DepthMode;
 use crate::matrix::{invert, multiply};
-use crate::meshlet_dag::{MeshletDagCullParams, MeshletDagCuller, MeshletDagTwoPhaseOutput};
+use crate::meshlet_dag::{MeshletDagBatchEntry, MeshletDagCullParams, MeshletDagCuller, MeshletDagTwoPhaseOutput};
 use crate::meshlets::{
     MeshletBatchEntry, MeshletCullParams, MeshletCuller, MeshletIndirectDraw, MeshletTwoPhaseBatchEntry,
 };
@@ -185,37 +185,35 @@ impl State {
         {
             let dag_culler = self.wired.meshlet_dag_culler.get_or_insert_with(|| MeshletDagCuller::new(device));
             let dag_two_phase = use_hiz && device.limits().max_storage_buffers_per_shader_stage >= 5;
+            let mut dag_batch = Vec::with_capacity(self.wired.dag_plan.len());
             for p in &self.wired.dag_plan {
                 let Some(GpuAsset::Mesh(mesh)) = self.assets.current(p.mesh_slot) else { continue };
                 let Some(dag) = &mesh.meshlet_dag else { continue };
-                let params = MeshletDagCullParams {
-                    cull: MeshletCullParams {
-                        model: p.model,
-                        hiz_vp: if dag_two_phase { hiz_vp } else { active_vp },
-                        frustum_planes: planes,
-                        camera_pos,
-                        hiz_enabled: dag_two_phase,
-                        hiz_mips: if dag_two_phase { hiz_mips } else { 0 },
-                        backface_cull: p.backface_cull,
-                        reversed_z,
+                dag_batch.push(MeshletDagBatchEntry {
+                    mesh: dag,
+                    output: &self.meshlet_dag_outputs[p.slot],
+                    params: MeshletDagCullParams {
+                        cull: MeshletCullParams {
+                            model: p.model,
+                            hiz_vp: if dag_two_phase { hiz_vp } else { active_vp },
+                            frustum_planes: planes,
+                            camera_pos,
+                            hiz_enabled: dag_two_phase,
+                            hiz_mips: if dag_two_phase { hiz_mips } else { 0 },
+                            backface_cull: p.backface_cull,
+                            reversed_z,
+                        },
+                        proj: *active_proj,
+                        viewport_height: viewport_height.max(1.0),
+                        near_plane,
+                        pixel_error_threshold: self.wired.dag_lod.pixel_error_threshold,
                     },
-                    proj: *active_proj,
-                    viewport_height: viewport_height.max(1.0),
-                    near_plane,
-                    pixel_error_threshold: self.wired.dag_lod.pixel_error_threshold,
-                };
-                if dag_two_phase {
-                    dag_culler.cull_phase1(
-                        device,
-                        encoder,
-                        dag,
-                        &self.meshlet_dag_outputs[p.slot],
-                        &params,
-                        Some(hiz_view_ref),
-                    )?;
-                } else {
-                    dag_culler.cull(device, encoder, dag, &self.meshlet_dag_outputs[p.slot].phase1, &params, None)?;
-                }
+                });
+            }
+            if dag_two_phase {
+                dag_culler.cull_batch_phase1(device, encoder, &dag_batch, Some(hiz_view_ref))?;
+            } else {
+                dag_culler.cull_batch_single(device, encoder, &dag_batch, None)?;
             }
             self.wired.dag_phase1_used_hiz = dag_two_phase;
         }
@@ -361,34 +359,32 @@ impl State {
             && let Some(near_plane) = perspective_near_plane(active_proj, depth_mode)
             && let Some(dag_culler) = wired.meshlet_dag_culler.as_ref()
         {
+            let mut dag_batch = Vec::with_capacity(wired.dag_plan.len());
             for p in &wired.dag_plan {
                 let Some(GpuAsset::Mesh(mesh)) = assets.current(p.mesh_slot) else { continue };
                 let Some(dag) = &mesh.meshlet_dag else { continue };
-                let params = MeshletDagCullParams {
-                    cull: MeshletCullParams {
-                        model: p.model,
-                        hiz_vp: if use_hiz { hiz_vp } else { active_vp },
-                        frustum_planes: planes,
-                        camera_pos,
-                        hiz_enabled: use_hiz,
-                        hiz_mips: if use_hiz { hiz_mips } else { 0 },
-                        backface_cull: p.backface_cull,
-                        reversed_z,
+                dag_batch.push(MeshletDagBatchEntry {
+                    mesh: dag,
+                    output: &meshlet_dag_outputs[p.slot],
+                    params: MeshletDagCullParams {
+                        cull: MeshletCullParams {
+                            model: p.model,
+                            hiz_vp: if use_hiz { hiz_vp } else { active_vp },
+                            frustum_planes: planes,
+                            camera_pos,
+                            hiz_enabled: use_hiz,
+                            hiz_mips: if use_hiz { hiz_mips } else { 0 },
+                            backface_cull: p.backface_cull,
+                            reversed_z,
+                        },
+                        proj: *active_proj,
+                        viewport_height: viewport_height.max(1.0),
+                        near_plane,
+                        pixel_error_threshold: wired.dag_lod.pixel_error_threshold,
                     },
-                    proj: *active_proj,
-                    viewport_height: viewport_height.max(1.0),
-                    near_plane,
-                    pixel_error_threshold: wired.dag_lod.pixel_error_threshold,
-                };
-                dag_culler.cull_phase2(
-                    device,
-                    encoder,
-                    dag,
-                    &meshlet_dag_outputs[p.slot],
-                    &params,
-                    use_hiz.then_some(hiz_view_ref),
-                )?;
+                });
             }
+            dag_culler.cull_batch_phase2(device, encoder, &dag_batch, use_hiz.then_some(hiz_view_ref))?;
             wired.last_meshlet_phase2_active = true;
         }
         Ok(())

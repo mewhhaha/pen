@@ -101,12 +101,11 @@ impl Target {
 
 struct SvgfState {
     size: (u32, u32),
-    history_color: Target,
-    history_moments: Target,
-    curr_moments: Target,
-    ping: Target,
-    pong: Target,
-    output_is_pong: bool,
+    color_bufs: [Target; 3],
+    moments: [Target; 2],
+    history_color_idx: usize,
+    output_idx: usize,
+    moments_idx: usize,
     has_history: bool,
 }
 
@@ -117,6 +116,7 @@ pub struct SvgfDenoiser {
     atrous_pipe: wgpu::ComputePipeline,
     atrous_bgl: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
+    uniform_stride: u32,
     state: Option<SvgfState>,
 }
 
@@ -160,13 +160,16 @@ fn encode_copy(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, dst: &
 
 impl SvgfDenoiser {
     pub fn new(device: &wgpu::Device) -> Self {
+        let uniform_size = std::mem::size_of::<SvgfUniform>() as u32;
+        let align = device.limits().min_uniform_buffer_offset_alignment.max(16);
+        let uniform_stride = uniform_size.next_multiple_of(align);
         let u_entry = wgpu::BindGroupLayoutEntry {
             binding: 0,
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<SvgfUniform>() as u64),
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(u64::from(uniform_size)),
             },
             count: None,
         };
@@ -220,13 +223,14 @@ impl SvgfDenoiser {
             compilation_options: Default::default(),
             cache: None,
         });
+        // 6 dynamic uniform slots: 1 temporal + up to 5 A-Trous iterations uploaded in one copy.
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("svgf_u"),
-            size: std::mem::size_of::<SvgfUniform>() as u64,
+            size: u64::from(uniform_stride) * 6,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { temporal_pipe, temporal_bgl, atrous_pipe, atrous_bgl, uniform, state: None }
+        Self { temporal_pipe, temporal_bgl, atrous_pipe, atrous_bgl, uniform, uniform_stride, state: None }
     }
 
     /// Invalidates temporal history on the next call to [`denoise`].
@@ -237,11 +241,11 @@ impl SvgfDenoiser {
     }
 
     pub fn output_texture(&self) -> Option<&wgpu::Texture> {
-        self.state.as_ref().map(|s| if s.output_is_pong { &s.pong.tex } else { &s.ping.tex })
+        self.state.as_ref().map(|s| &s.color_bufs[s.output_idx].tex)
     }
 
     pub fn output_view(&self) -> Option<&wgpu::TextureView> {
-        self.state.as_ref().map(|s| if s.output_is_pong { &s.pong.view } else { &s.ping.view })
+        self.state.as_ref().map(|s| &s.color_bufs[s.output_idx].view)
     }
 
     /// Runs temporal accumulation + multi-pass À-Trous edge-stopping filtering.
@@ -271,12 +275,15 @@ impl SvgfDenoiser {
         if need_alloc {
             self.state = Some(SvgfState {
                 size,
-                history_color: Target::new(device, "svgf_hist_color", size),
-                history_moments: Target::new(device, "svgf_hist_moments", size),
-                curr_moments: Target::new(device, "svgf_curr_moments", size),
-                ping: Target::new(device, "svgf_ping", size),
-                pong: Target::new(device, "svgf_pong", size),
-                output_is_pong: false,
+                color_bufs: [
+                    Target::new(device, "svgf_color_0", size),
+                    Target::new(device, "svgf_color_1", size),
+                    Target::new(device, "svgf_color_2", size),
+                ],
+                moments: [Target::new(device, "svgf_moments_0", size), Target::new(device, "svgf_moments_1", size)],
+                history_color_idx: 0,
+                output_idx: 1,
+                moments_idx: 0,
                 has_history: false,
             });
         }
@@ -284,6 +291,7 @@ impl SvgfDenoiser {
         let reset = params.reset_history || !st.has_history;
         let spec_flags = (u32::from(params.specular_mode) << 1)
             | (u32::from(params.specular_mode && params.hit_distance_adaptive) << 2);
+        let iters = params.atrous_iterations.clamp(1, 5);
 
         let u_temporal = SvgfUniform {
             dims: [size.0, size.1, 1, u32::from(reset) | spec_flags],
@@ -300,31 +308,56 @@ impl SvgfDenoiser {
                 params.variance_boost.max(1.0),
             ],
         };
-        encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u_temporal));
+        let stride = self.uniform_stride as usize;
+        let u_size = std::mem::size_of::<SvgfUniform>();
+        let slots = 1 + iters as usize;
+        let mut staged = vec![0u8; slots * stride];
+        staged[..u_size].copy_from_slice(bytemuck::bytes_of(&u_temporal));
+        for iter in 0..iters {
+            let step = 1u32 << iter;
+            let u_iter = SvgfUniform { dims: [size.0, size.1, step, spec_flags], ..u_temporal };
+            let off = (1 + iter as usize) * stride;
+            staged[off..off + u_size].copy_from_slice(bytemuck::bytes_of(&u_iter));
+        }
+        encode_copy(device, encoder, &self.uniform, &staged);
 
+        let hist_c = st.history_color_idx;
+        let slot_a = (hist_c + 1) % 3;
+        let slot_b = (hist_c + 2) % 3;
+        let prev_m = st.moments_idx;
+        let curr_m = 1 - prev_m;
+
+        let u_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &self.uniform,
+            offset: 0,
+            size: wgpu::BufferSize::new(u_size as u64),
+        });
         let tbg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("svgf_temporal_bg"),
             layout: &self.temporal_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(inputs.noisy_signal) },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&st.history_color.view),
+                    resource: wgpu::BindingResource::TextureView(&st.color_bufs[hist_c].view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&st.history_moments.view),
+                    resource: wgpu::BindingResource::TextureView(&st.moments[prev_m].view),
                 },
                 wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(inputs.depth) },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(inputs.prev_depth) },
                 wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(inputs.normal) },
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(inputs.prev_normal) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(inputs.motion) },
-                wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&st.ping.view) },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&st.color_bufs[slot_a].view),
+                },
                 wgpu::BindGroupEntry {
                     binding: 10,
-                    resource: wgpu::BindingResource::TextureView(&st.curr_moments.view),
+                    resource: wgpu::BindingResource::TextureView(&st.moments[curr_m].view),
                 },
             ],
         });
@@ -335,63 +368,61 @@ impl SvgfDenoiser {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.temporal_pipe);
-            pass.set_bind_group(0, &tbg, &[]);
+            pass.set_bind_group(0, &tbg, &[0]);
             pass.dispatch_workgroups(gx, gy, 1);
         }
 
-        // Preserve temporal moments for next frame.
-        let copy_ext = wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 };
-        encoder.copy_texture_to_texture(
-            st.curr_moments.tex.as_image_copy(),
-            st.history_moments.tex.as_image_copy(),
-            copy_ext,
-        );
-
-        let iters = params.atrous_iterations.clamp(1, 5);
-        let mut src_is_pong = false;
+        // Iter 0 writes `slot_b` which stays preserved as next frame's temporal history color
+        // (SVGF Section 4.1) with zero texture copy; subsequent iterations ping-pong `slot_a` <-> `hist_c`.
+        let mut src_idx = slot_a;
+        let mut dst_idx = slot_b;
         for iter in 0..iters {
-            let step = 1u32 << iter;
-            let u_iter = SvgfUniform { dims: [size.0, size.1, step, spec_flags], ..u_temporal };
-            encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u_iter));
-            let (src_view, dst_view) =
-                if src_is_pong { (&st.pong.view, &st.ping.view) } else { (&st.ping.view, &st.pong.view) };
             let abg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("svgf_atrous_bg"),
                 layout: &self.atrous_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(src_view) },
+                    wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&st.color_bufs[src_idx].view),
+                    },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(inputs.depth) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(inputs.normal) },
-                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(dst_view) },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&st.color_bufs[dst_idx].view),
+                    },
                     wgpu::BindGroupEntry {
                         binding: 5,
-                        resource: wgpu::BindingResource::TextureView(&st.curr_moments.view),
+                        resource: wgpu::BindingResource::TextureView(&st.moments[curr_m].view),
                     },
                 ],
             });
+            let dyn_off = (1 + iter) * self.uniform_stride;
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("svgf_atrous"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.atrous_pipe);
-                pass.set_bind_group(0, &abg, &[]);
+                pass.set_bind_group(0, &abg, &[dyn_off]);
                 pass.dispatch_workgroups(gx, gy, 1);
             }
-            // Feedback 1st A-Trous pass into temporal history (per SVGF Section 4.1) to stabilize
-            // temporal accumulation without cascading multi-iteration blur.
-            if iter == 0 {
-                let first_out = if src_is_pong { &st.ping.tex } else { &st.pong.tex };
-                encoder.copy_texture_to_texture(
-                    first_out.as_image_copy(),
-                    st.history_color.tex.as_image_copy(),
-                    copy_ext,
-                );
+            if iter + 1 < iters {
+                if iter == 0 {
+                    // Keep `slot_b` untouched for next frame's history; read `slot_b` -> write `slot_a`.
+                    src_idx = slot_b;
+                    dst_idx = slot_a;
+                } else {
+                    // Ping-pong between `slot_a` and `hist_c` (`slot_b` stays untouched).
+                    src_idx = dst_idx;
+                    dst_idx = if dst_idx == slot_a { hist_c } else { slot_a };
+                }
             }
-            src_is_pong = !src_is_pong;
         }
-        st.output_is_pong = src_is_pong;
+        st.output_idx = dst_idx;
+        st.history_color_idx = slot_b;
+        st.moments_idx = curr_m;
         st.has_history = true;
         Ok(())
     }
@@ -672,7 +703,8 @@ mod tests {
             let params = SvgfParams { reset_history: frame == 0, specular_mode: true, ..Default::default() };
             svgf.denoise(&device, &mut encoder, &inputs, (2, 1), &params).unwrap();
             queue.submit([encoder.finish()]);
-            let history = &svgf.state.as_ref().unwrap().history_moments.tex;
+            let st = svgf.state.as_ref().unwrap();
+            let history = &st.moments[st.moments_idx].tex;
             let moments = read_rgba16f_tex(&device, &queue, history, 2, 1);
             for [mean, second, len, hit] in moments {
                 assert_eq!(mean, 240.0);
@@ -930,7 +962,8 @@ mod tests {
                     output = read_rgba16f_tex(&device, &queue, denoiser.output_texture().unwrap(), w, h);
                 }
             }
-            let moments = &denoiser.state.as_ref().unwrap().curr_moments.tex;
+            let st = denoiser.state.as_ref().unwrap();
+            let moments = &st.moments[st.moments_idx].tex;
             let filtered = read_rgba16f_tex(&device, &queue, moments, w, h);
             let expected = distance * 1.1;
             assert!((filtered[0][3] - expected).abs() < expected * 0.002, "filtered hit distance={}", filtered[0][3]);

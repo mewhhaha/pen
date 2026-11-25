@@ -111,7 +111,7 @@ fn spec_response(n: vec3f, v: vec3f, l: vec3f, f0: vec3f, roughness: f32) -> vec
   return fresnel * (0.25 * spec_d(n, h, alpha2) * masking);
 }
 
-fn spec_hit_radiance(pos: vec3f, n: vec3f, v: vec3f, hit: TlasHit) -> vec3f {
+fn spec_hit_radiance(pos: vec3f, n: vec3f, v: vec3f, hit: TlasHit, rng: ptr<function, u32>) -> vec3f {
   let albedo = clamp(hit.albedo, vec3f(0.0), vec3f(1.0));
   let metal = clamp(hit.metallic, 0.0, 1.0);
   let diffuse_albedo = albedo * (1.0 - metal);
@@ -125,13 +125,19 @@ fn spec_hit_radiance(pos: vec3f, n: vec3f, v: vec3f, hit: TlasHit) -> vec3f {
       visible(pos, n, pos + sun * u.sun_and_max_distance.w)) {
     radiance += (diffuse * nl + spec_response(n, v, sun, f0, rough)) * u.sun_color_and_bias.rgb;
   }
-  for (var i = 0u; i < u.size_lights_frame.z; i++) {
-    let light = spec_lights[i];
-    let incident = local_light(pos, n, light);
-    if (incident.cosine > 0.0 && luma(incident.rgb) > 0.0 &&
-        visible(pos, n, light.position_range.xyz)) {
-      let response = spec_response(n, v, incident.dir, f0, rough);
-      radiance += (diffuse * incident.cosine + response) * incident.rgb;
+  let count = u.size_lights_frame.z;
+  if (count > 0u) {
+    let candidates = min(8u, count);
+    let offset = u32(random(rng) * f32(count));
+    let scale = f32(count) / f32(candidates);
+    for (var i = 0u; i < candidates; i++) {
+      let light = spec_lights[stratified_light(i, count, candidates, offset, rng)];
+      let incident = local_light(pos, n, light);
+      if (incident.cosine > 0.0 && luma(incident.rgb) > 0.0 &&
+          visible(pos, n, light.position_range.xyz)) {
+        let response = spec_response(n, v, incident.dir, f0, rough);
+        radiance += (diffuse * incident.cosine + response) * (incident.rgb * scale);
+      }
     }
   }
   if (u.sky_zenith_and_bounce.w > 0.0) {
@@ -279,7 +285,7 @@ fn spec_initial(@builtin(global_invocation_id) id: vec3u) {
         let n = select(-hit.world_normal, hit.world_normal, dot(hit.world_normal, l) < 0.0);
         r.hit_pos_m = vec4f(pos, 1.0);
         r.hit_nrm_w = vec4f(n, 0.0);
-        r.radiance_wsum = vec4f(spec_hit_radiance(pos, n, -l, hit), 0.0);
+        r.radiance_wsum = vec4f(spec_hit_radiance(pos, n, -l, hit, &rng), 0.0);
         r.sample_meta.x = length(pos - g.pos);
         r.sample_meta.y = 1.0;
       } else {

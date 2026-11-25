@@ -143,18 +143,14 @@ fn sharc_accumulate(pos: vec3f, nrm: vec3f, radiance: vec3f) {
     }
 
     let base = slot * 4u;
-    var count = atomicLoad(&sharc_accum[base + 3u]);
-    // Reserve a sample before touching the sums. At most 256 accepted samples
-    // reach each bucket even when many invocations deposit concurrently.
-    loop {
-        if (count >= SHARC_MAX_SAMPLES) {
-            return;
-        }
-        let ticket = atomicCompareExchangeWeak(&sharc_accum[base + 3u], count, count + 1u);
-        if (ticket.exchanged) {
-            break;
-        }
-        count = ticket.old_value;
+    // Wait-free ticket reservation: at most SHARC_MAX_SAMPLES invocations
+    // accumulate into the fixed-point sums before the next sharc_resolve pass.
+    if (atomicLoad(&sharc_accum[base + 3u]) >= SHARC_MAX_SAMPLES) {
+        return;
+    }
+    let ticket = atomicAdd(&sharc_accum[base + 3u], 1u);
+    if (ticket >= SHARC_MAX_SAMPLES) {
+        return;
     }
     let fixed = vec3u(safe_rad * sharc_u.params.y);
     atomicAdd(&sharc_accum[base], fixed.x);
@@ -185,8 +181,9 @@ fn sharc_resolve(@builtin(global_invocation_id) id: vec3u) {
     let b = atomicExchange(&sharc_accum[base + 2u], 0u);
     let count = atomicExchange(&sharc_accum[base + 3u], 0u);
     let prev = sharc_resolved[slot];
-    if (count > 0u) {
-        let avg = vec3f(f32(r), f32(g), f32(b)) / (sharc_u.params.y * f32(count));
+    let accepted = min(count, SHARC_MAX_SAMPLES);
+    if (accepted > 0u) {
+        let avg = vec3f(f32(r), f32(g), f32(b)) / (sharc_u.params.y * f32(accepted));
         let filtered = select(avg, mix(prev.rgb, avg, sharc_u.params.x), prev.a > 0.5);
         sharc_resolved[slot] = vec4f(filtered, 1.0);
     } else if (prev.a > 0.5) {

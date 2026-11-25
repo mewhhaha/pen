@@ -142,12 +142,7 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
 
 /// Encodes a command-ordered uniform upload via a mapped-at-creation staging buffer so multiple
 /// dispatches recorded into the same `CommandEncoder` never overwrite each other's inputs.
-fn encode_uniform_upload(
-    device: &wgpu::Device,
-    encoder: &mut wgpu::CommandEncoder,
-    dst: &wgpu::Buffer,
-    bytes: &[u8],
-) {
+fn encode_uniform_upload(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::Buffer, bytes: &[u8]) {
     let stage = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("atmo_stage"),
         size: bytes.len() as u64,
@@ -186,6 +181,8 @@ pub struct PhysicalAtmosphere {
     cloud_uniform: wgpu::Buffer,
     cloud_tex: Option<(u32, u32, wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
     cloud_serial: u64,
+    last_medium_key: Option<[u32; 19]>,
+    last_sky_key: Option<[u32; 8]>,
 }
 
 impl PhysicalAtmosphere {
@@ -281,7 +278,11 @@ impl PhysicalAtmosphere {
                 },
             ],
         });
-        let make_bg = |label, ubuf: &wgpu::Buffer, t_in: &wgpu::TextureView, m_in: &wgpu::TextureView, out: &wgpu::TextureView| {
+        let make_bg = |label,
+                       ubuf: &wgpu::Buffer,
+                       t_in: &wgpu::TextureView,
+                       m_in: &wgpu::TextureView,
+                       out: &wgpu::TextureView| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
                 layout: &bgl,
@@ -390,6 +391,8 @@ impl PhysicalAtmosphere {
             cloud_uniform,
             cloud_tex: None,
             cloud_serial: 0,
+            last_medium_key: None,
+            last_sky_key: None,
         }
     }
 
@@ -458,8 +461,14 @@ impl PhysicalAtmosphere {
         Ok(self.cloud_serial)
     }
 
-    /// Dispatches Transmittance -> Multi-Scattering -> Sky-View LUT updates in command order into `encoder`.
-    pub fn update_luts(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, params: &AtmosphereParams) {
+    /// Dispatches Transmittance -> Multi-Scattering -> Sky-View LUT updates in command order into `encoder`,
+    /// skipping unchanged medium LUTs (transmittance + multi-scattering) and unchanged sky-view frames.
+    pub fn update_luts(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &AtmosphereParams,
+    ) {
         let sun = normalize3(params.sun_direction);
         let rb = finite_or(params.planet_radius_km, 6360.0).max(100.0);
         let rt = finite_or(params.atmo_radius_km, rb + 100.0).max(rb + 10.0);
@@ -505,19 +514,81 @@ impl PhysicalAtmosphere {
             ],
             dims: [w as f32, h as f32, TRANSMITTANCE_SIZE.0 as f32, TRANSMITTANCE_SIZE.1 as f32],
         };
-        encode_uniform_upload(device, encoder, &self.uniform_trans, bytemuck::bytes_of(&make_u(TRANSMITTANCE_SIZE)));
-        encode_uniform_upload(device, encoder, &self.uniform_ms, bytemuck::bytes_of(&make_u(MULTISCATTER_SIZE)));
-        encode_uniform_upload(device, encoder, &self.uniform_sky, bytemuck::bytes_of(&make_u(SKY_VIEW_SIZE)));
+        let u_sky = make_u(SKY_VIEW_SIZE);
+        let medium_key = [
+            u_sky.radii[0].to_bits(),
+            u_sky.radii[1].to_bits(),
+            u_sky.radii[3].to_bits(),
+            u_sky.rayleigh[0].to_bits(),
+            u_sky.rayleigh[1].to_bits(),
+            u_sky.rayleigh[2].to_bits(),
+            u_sky.rayleigh[3].to_bits(),
+            u_sky.mie[0].to_bits(),
+            u_sky.mie[1].to_bits(),
+            u_sky.mie[2].to_bits(),
+            u_sky.mie[3].to_bits(),
+            u_sky.ozone[0].to_bits(),
+            u_sky.ozone[1].to_bits(),
+            u_sky.ozone[2].to_bits(),
+            u_sky.sun_color[3].to_bits(),
+            u_sky.ground[0].to_bits(),
+            u_sky.ground[1].to_bits(),
+            u_sky.ground[2].to_bits(),
+            u_sky.ground[3].to_bits(),
+        ];
+        let sky_key = [
+            u_sky.radii[2].to_bits(),
+            u_sky.ozone[3].to_bits(),
+            u_sky.sun_dir[0].to_bits(),
+            u_sky.sun_dir[1].to_bits(),
+            u_sky.sun_dir[2].to_bits(),
+            u_sky.sun_color[0].to_bits(),
+            u_sky.sun_color[1].to_bits(),
+            u_sky.sun_color[2].to_bits(),
+        ];
+        let medium_dirty = self.last_medium_key != Some(medium_key);
+        let sky_dirty = medium_dirty || self.last_sky_key != Some(sky_key);
+        if !sky_dirty {
+            return;
+        }
 
-        let dispatch = |enc: &mut wgpu::CommandEncoder, label, pipe: &wgpu::ComputePipeline, bg: &wgpu::BindGroup, (w, h): (u32, u32)| {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+        let dispatch = |enc: &mut wgpu::CommandEncoder,
+                        label,
+                        pipe: &wgpu::ComputePipeline,
+                        bg: &wgpu::BindGroup,
+                        (w, h): (u32, u32)| {
+            let mut pass =
+                enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
         };
-        dispatch(encoder, "atmo_transmittance", &self.pipe_trans, &self.bg_trans, TRANSMITTANCE_SIZE);
-        dispatch(encoder, "atmo_multiscatter", &self.pipe_ms, &self.bg_ms, MULTISCATTER_SIZE);
-        dispatch(encoder, "atmo_sky_view", &self.pipe_sky, &self.bg_sky, SKY_VIEW_SIZE);
+        if medium_dirty {
+            let u_trans = make_u(TRANSMITTANCE_SIZE);
+            let u_ms = make_u(MULTISCATTER_SIZE);
+            let u_sz = std::mem::size_of::<AtmoUniform>() as u64;
+            let stage = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("atmo_lut_stage"),
+                size: u_sz * 3,
+                usage: wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
+            stage.slice(0..u_sz).get_mapped_range_mut().unwrap().copy_from_slice(bytemuck::bytes_of(&u_trans));
+            stage.slice(u_sz..u_sz * 2).get_mapped_range_mut().unwrap().copy_from_slice(bytemuck::bytes_of(&u_ms));
+            stage.slice(u_sz * 2..u_sz * 3).get_mapped_range_mut().unwrap().copy_from_slice(bytemuck::bytes_of(&u_sky));
+            stage.unmap();
+            encoder.copy_buffer_to_buffer(&stage, 0, &self.uniform_trans, 0, u_sz);
+            encoder.copy_buffer_to_buffer(&stage, u_sz, &self.uniform_ms, 0, u_sz);
+            encoder.copy_buffer_to_buffer(&stage, u_sz * 2, &self.uniform_sky, 0, u_sz);
+            dispatch(encoder, "atmo_transmittance", &self.pipe_trans, &self.bg_trans, TRANSMITTANCE_SIZE);
+            dispatch(encoder, "atmo_multiscatter", &self.pipe_ms, &self.bg_ms, MULTISCATTER_SIZE);
+            dispatch(encoder, "atmo_sky_view", &self.pipe_sky, &self.bg_sky, SKY_VIEW_SIZE);
+        } else {
+            encode_uniform_upload(device, encoder, &self.uniform_sky, bytemuck::bytes_of(&u_sky));
+            dispatch(encoder, "atmo_sky_view", &self.pipe_sky, &self.bg_sky, SKY_VIEW_SIZE);
+        }
+        self.last_medium_key = Some(medium_key);
+        self.last_sky_key = Some(sky_key);
     }
 
     /// Raymarches the 3D volumetric cloud layer at `(width, height)` into an `Rgba16Float` texture.
@@ -709,7 +780,8 @@ mod tests {
         assert!(ms[16 * 32 + 24][2] > 0.005, "multi-scattering LUT must be positive in daylight");
         let sky_noon = read_rgba16f(&device, &queue, atmo.sky_view_texture());
         assert!(sky_noon.iter().all(|p| p.iter().all(|c| c.is_finite() && *c >= 0.0)));
-        let zenith = sky_noon[(SKY_VIEW_SIZE.1 as usize - 1) * SKY_VIEW_SIZE.0 as usize + (SKY_VIEW_SIZE.0 as usize / 2)];
+        let zenith =
+            sky_noon[(SKY_VIEW_SIZE.1 as usize - 1) * SKY_VIEW_SIZE.0 as usize + (SKY_VIEW_SIZE.0 as usize / 2)];
         assert!(zenith[2] > zenith[0] * 1.4, "Rayleigh noon zenith must be blue: {zenith:?}");
 
         // 2. Sunset sky: sun near horizon -> horizon toward sun shifts warm red/orange (R > B).
@@ -718,7 +790,8 @@ mod tests {
         atmo.update_luts(&device, &mut enc2, &sunset);
         queue.submit(Some(enc2.finish()));
         let sky_sunset = read_rgba16f(&device, &queue, atmo.sky_view_texture());
-        let sunset_horiz = sky_sunset[(SKY_VIEW_SIZE.1 as usize * 56 / 100) * SKY_VIEW_SIZE.0 as usize + (SKY_VIEW_SIZE.0 as usize / 2)];
+        let sunset_horiz = sky_sunset
+            [(SKY_VIEW_SIZE.1 as usize * 56 / 100) * SKY_VIEW_SIZE.0 as usize + (SKY_VIEW_SIZE.0 as usize / 2)];
         assert!(sunset_horiz[0] > sunset_horiz[2] * 1.2, "sunset horizon toward sun must redden: {sunset_horiz:?}");
 
         // 3. Volumetric clouds viewed from below: optical absorption + forward silver lining > backscatter.
@@ -728,15 +801,10 @@ mod tests {
             cloud_density: 1.2,
             ..AtmosphereParams::default()
         };
-        let inv_vp_toward_sun: [f32; 16] = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 0.8, 0.0, 0.0,
-            0.0, 0.6, -1.0, 0.0,
-            0.0, 0.2, 0.0, 1.0,
-        ];
+        let inv_vp_toward_sun: [f32; 16] =
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.0, 0.6, -1.0, 0.0, 0.0, 0.2, 0.0, 1.0];
         let mut enc3 = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        atmo.render_clouds(&device, &mut enc3, &cloud_params, inv_vp_toward_sun, [0.0, 0.2, 0.0], (64, 64))
-            .unwrap();
+        atmo.render_clouds(&device, &mut enc3, &cloud_params, inv_vp_toward_sun, [0.0, 0.2, 0.0], (64, 64)).unwrap();
         queue.submit(Some(enc3.finish()));
         let toward = read_rgba16f(&device, &queue, atmo.cloud_texture().unwrap());
         let min_t = toward.iter().map(|p| p[3]).fold(1.0f32, f32::min);
@@ -746,8 +814,7 @@ mod tests {
 
         let back_params = AtmosphereParams { sun_direction: [0.0, 0.45, 0.893], ..cloud_params };
         let mut enc4 = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        atmo.render_clouds(&device, &mut enc4, &back_params, inv_vp_toward_sun, [0.0, 0.2, 0.0], (64, 64))
-            .unwrap();
+        atmo.render_clouds(&device, &mut enc4, &back_params, inv_vp_toward_sun, [0.0, 0.2, 0.0], (64, 64)).unwrap();
         queue.submit(Some(enc4.finish()));
         let away = read_rgba16f(&device, &queue, atmo.cloud_texture().unwrap());
         let avg_lum_back: f32 = away.iter().map(|p| p[0] + p[1] + p[2]).sum::<f32>() / away.len() as f32;
@@ -758,15 +825,10 @@ mod tests {
 
         // 4. Clouds viewed from ABOVE (altitude 6 km looking straight down -Y through 1.5..4.0 km shell).
         // World point for NDC (x, y, 0.5): (x, 5.0, y), camera at (0, 6.0, 0) -> ray dir = (x, -1, y).
-        let inv_vp_downward: [f32; 16] = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, -2.0, 0.0, 0.0,
-            0.0, 6.0, 0.0, 1.0,
-        ];
+        let inv_vp_downward: [f32; 16] =
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, -2.0, 0.0, 0.0, 0.0, 6.0, 0.0, 1.0];
         let mut enc5 = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        atmo.render_clouds(&device, &mut enc5, &cloud_params, inv_vp_downward, [0.0, 6.0, 0.0], (32, 32))
-            .unwrap();
+        atmo.render_clouds(&device, &mut enc5, &cloud_params, inv_vp_downward, [0.0, 6.0, 0.0], (32, 32)).unwrap();
         queue.submit(Some(enc5.finish()));
         let from_above = read_rgba16f(&device, &queue, atmo.cloud_texture().unwrap());
         let min_t_above = from_above.iter().map(|p| p[3]).fold(1.0f32, f32::min);

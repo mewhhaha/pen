@@ -52,7 +52,9 @@ pub struct RadianceCascades2d {
     empty_packet: wgpu::Buffer,
     trace: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
+    resolve_bg: wgpu::BindGroup,
     composite: wgpu::ComputePipeline,
+    composite_uniform: wgpu::Buffer,
     irradiance: wgpu::Texture,
     irradiance_view: wgpu::TextureView,
 }
@@ -150,17 +152,34 @@ impl RadianceCascades2d {
             view_formats: &[],
         });
         let irradiance_view = irradiance.create_view(&Default::default());
+        let packets =
+            [packet_buffer("2D RC even cascades", packet_bytes), packet_buffer("2D RC odd cascades", packet_bytes)];
+        let resolve = pipeline("resolve_cascade");
+        let resolve_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("2D RC resolve bg"),
+            layout: &resolve.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: cascades[0].params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: packets[0].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&irradiance_view) },
+            ],
+        });
+        let composite_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("2D RC composite weights"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Ok(Self {
             size,
             cascades,
-            packets: [
-                packet_buffer("2D RC even cascades", packet_bytes),
-                packet_buffer("2D RC odd cascades", packet_bytes),
-            ],
+            packets,
             empty_packet: packet_buffer("2D RC far boundary", 16),
             trace: pipeline("trace_cascade"),
-            resolve: pipeline("resolve_cascade"),
+            resolve,
+            resolve_bg,
             composite: pipeline("composite_irradiance"),
+            composite_uniform,
             irradiance,
             irradiance_view,
         })
@@ -203,17 +222,10 @@ impl RadianceCascades2d {
                 cascade.workgroups,
             );
         }
-        dispatch(
-            device,
-            &mut pass,
-            &self.resolve,
-            &[
-                (0, self.cascades[0].params.as_entire_binding()),
-                (2, self.packets[0].as_entire_binding()),
-                (4, wgpu::BindingResource::TextureView(&self.irradiance_view)),
-            ],
-            self.size.map(|side| side.div_ceil(8)),
-        );
+        let resolve_groups = self.size.map(|side| side.div_ceil(8));
+        pass.set_pipeline(&self.resolve);
+        pass.set_bind_group(0, &self.resolve_bg, &[]);
+        pass.dispatch_workgroups(resolve_groups[0], resolve_groups[1], 1);
     }
 
     /// Apply `albedo.rgb * (ambient + irradiance * multiply) + irradiance * add`
@@ -241,12 +253,9 @@ impl RadianceCascades2d {
         premultiplied: bool,
     ) {
         let [ambient, multiply, add] = weights;
-        let uniform = buffer(
-            device,
-            "2D RC composite weights",
-            bytemuck::bytes_of(&[ambient, multiply, add, f32::from(premultiplied)]),
-            wgpu::BufferUsages::UNIFORM,
-        );
+        let data = [ambient, multiply, add, f32::from(premultiplied)];
+        let stage = buffer(device, "2D RC composite stage", bytemuck::bytes_of(&data), wgpu::BufferUsages::COPY_SRC);
+        encoder.copy_buffer_to_buffer(&stage, 0, &self.composite_uniform, 0, 16);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("2D RC composite"),
             timestamp_writes: None,
@@ -259,7 +268,7 @@ impl RadianceCascades2d {
                 (4, wgpu::BindingResource::TextureView(output)),
                 (5, wgpu::BindingResource::TextureView(&self.irradiance_view)),
                 (6, wgpu::BindingResource::TextureView(albedo)),
-                (7, uniform.as_entire_binding()),
+                (7, self.composite_uniform.as_entire_binding()),
             ],
             self.size.map(|side| side.div_ceil(8)),
         );

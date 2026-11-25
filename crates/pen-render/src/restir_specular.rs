@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Result, ensure};
+#[cfg(test)]
 use wgpu::util::DeviceExt;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -311,6 +312,9 @@ pub struct RestirSpecularRenderer {
     pipelines: HashMap<(bool, bool), [Pass; 3]>,
     hardware_supported: bool,
     dummy: wgpu::Buffer,
+    lighting_buf: wgpu::Buffer,
+    transforms_buf: wgpu::Buffer,
+    lights_buf: wgpu::Buffer,
     frame: Option<Frame>,
     history_valid: bool,
 }
@@ -323,10 +327,31 @@ impl RestirSpecularRenderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM,
             mapped_at_creation: false,
         });
+        let lighting_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ReSTIR specular lighting"),
+            size: std::mem::size_of::<LightingUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let transforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ReSTIR specular transforms"),
+            size: std::mem::size_of::<SpecTransforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lights_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ReSTIR specular lights"),
+            size: LIGHT_BUFFER_BYTES as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             pipelines: HashMap::new(),
             hardware_supported: device_supports_hardware_ray_query(device),
             dummy,
+            lighting_buf,
+            transforms_buf,
+            lights_buf,
             frame: None,
             history_valid: false,
         }
@@ -440,21 +465,31 @@ impl RestirSpecularRenderer {
             view_projection: params.view_projection,
             inverse_prev_view_projection: crate::matrix::invert(&params.prev_view_projection),
         };
-        // Immutable uploads preserve dispatch order even when multiple frames share a submission.
-        let uniform = |label, contents| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents,
-                usage: wgpu::BufferUsages::UNIFORM,
-            })
-        };
-        let lighting = uniform("ReSTIR specular lighting", bytemuck::bytes_of(&lighting));
-        let transforms = uniform("ReSTIR specular transforms", bytemuck::bytes_of(&transforms));
-        // A uniform array leaves the storage-buffer budget available for DDGI and SHaRC.
-        let mut light_bytes = [0u8; LIGHT_BUFFER_BYTES];
-        let live_lights = bytemuck::cast_slice(local_lights);
-        light_bytes[..live_lights.len()].copy_from_slice(live_lights);
-        let lights = uniform("ReSTIR specular lights", &light_bytes);
+        // Pack lighting, transforms, and live local lights into a single encoder-ordered staging copy
+        // so multiple frames recorded into one encoder execute in order without allocating 12 KiB per frame.
+        let lighting_bytes = bytemuck::bytes_of(&lighting);
+        let transforms_bytes = bytemuck::bytes_of(&transforms);
+        let live_lights: &[u8] = bytemuck::cast_slice(local_lights);
+        let total_stage = lighting_bytes.len() + transforms_bytes.len() + live_lights.len();
+        let stage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ReSTIR specular upload stage"),
+            size: total_stage as u64,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        let off_t = lighting_bytes.len() as u64;
+        let off_l = off_t + transforms_bytes.len() as u64;
+        stage.slice(0..off_t).get_mapped_range_mut().unwrap().copy_from_slice(lighting_bytes);
+        stage.slice(off_t..off_l).get_mapped_range_mut().unwrap().copy_from_slice(transforms_bytes);
+        if !live_lights.is_empty() {
+            stage.slice(off_l..).get_mapped_range_mut().unwrap().copy_from_slice(live_lights);
+        }
+        stage.unmap();
+        encoder.copy_buffer_to_buffer(&stage, 0, &self.lighting_buf, 0, off_t);
+        encoder.copy_buffer_to_buffer(&stage, off_t, &self.transforms_buf, 0, transforms_bytes.len() as u64);
+        if !live_lights.is_empty() {
+            encoder.copy_buffer_to_buffer(&stage, off_l, &self.lights_buf, 0, live_lights.len() as u64);
+        }
 
         let [initial, temporal, spatial] = self
             .pipelines
@@ -471,7 +506,7 @@ impl RestirSpecularRenderer {
         };
         let mut resources = std::array::from_fn(|_| None);
         for (binding, resource) in [
-            (0, lighting.as_entire_binding()),
+            (0, self.lighting_buf.as_entire_binding()),
             (1, tlas),
             (2, scene.tlas_instances_buf.as_entire_binding()),
             (3, scene.blas_nodes_buf.as_entire_binding()),
@@ -481,8 +516,8 @@ impl RestirSpecularRenderer {
             (7, view(inputs.albedo_metallic)),
             (8, view(inputs.motion.unwrap_or(inputs.normal_roughness))),
             (10, inputs.ddgi_buf.unwrap_or(&self.dummy).as_entire_binding()),
-            (21, transforms.as_entire_binding()),
-            (22, lights.as_entire_binding()),
+            (21, self.transforms_buf.as_entire_binding()),
+            (22, self.lights_buf.as_entire_binding()),
             (23, view(&frame.geometry[previous])),
             (24, view(&frame.geometry[next])),
             (26, frame.history[previous].as_entire_binding()),

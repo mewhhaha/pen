@@ -481,13 +481,13 @@ impl GpuParticleSystem {
         initial: &[GpuParticle],
     ) -> Result<()> {
         ensure!(initial.len() <= self.max_particles as usize, "initial batch exceeds max_particles");
-        let zeros = vec![
-            GpuParticle { pos_age: [0.0; 4], vel_life: [0.0; 4], color: [0.0; 4], size_rot_gen: [0.0; 4] };
-            self.max_particles as usize
-        ];
-        encode_copy(device, encoder, &self.particles, 0, bytemuck::cast_slice(&zeros));
+        let init_bytes = std::mem::size_of_val(initial) as u64;
         if !initial.is_empty() {
             encode_copy(device, encoder, &self.particles, 0, bytemuck::cast_slice(initial));
+        }
+        let total_bytes = u64::from(self.max_particles) * std::mem::size_of::<GpuParticle>() as u64;
+        if init_bytes < total_bytes {
+            encoder.clear_buffer(&self.particles, init_bytes, None);
         }
         Ok(())
     }
@@ -512,9 +512,6 @@ impl GpuParticleSystem {
             first_instance: 0,
         };
         let reset_counters = ParticleSimCounters::default();
-        encode_copy(device, encoder, &self.indirect, 0, bytemuck::bytes_of(&reset_indirect));
-        encode_copy(device, encoder, &self.counters, 0, bytemuck::bytes_of(&reset_counters));
-
         let u = SimUniform {
             view_projection: params.view_projection,
             inverse_view_projection: crate::matrix::invert(&params.view_projection),
@@ -545,7 +542,27 @@ impl GpuParticleSystem {
                 self.mesh_index_count as f32,
             ],
         };
-        encode_copy(device, encoder, &self.sim_uniform, 0, bytemuck::bytes_of(&u));
+        let ind_bytes = bytemuck::bytes_of(&reset_indirect);
+        let cnt_bytes = bytemuck::bytes_of(&reset_counters);
+        let u_bytes = bytemuck::bytes_of(&u);
+        let ind_len = ind_bytes.len() as u64;
+        let cnt_len = cnt_bytes.len() as u64;
+        let u_len = u_bytes.len() as u64;
+        let cnt_off = ind_len.next_multiple_of(8);
+        let u_off = (cnt_off + cnt_len).next_multiple_of(8);
+        let stage = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu_particles_step_stage"),
+            size: u_off + u_len,
+            usage: wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        stage.slice(0..ind_len).get_mapped_range_mut().unwrap().copy_from_slice(ind_bytes);
+        stage.slice(cnt_off..cnt_off + cnt_len).get_mapped_range_mut().unwrap().copy_from_slice(cnt_bytes);
+        stage.slice(u_off..u_off + u_len).get_mapped_range_mut().unwrap().copy_from_slice(u_bytes);
+        stage.unmap();
+        encoder.copy_buffer_to_buffer(&stage, 0, &self.indirect, 0, ind_len);
+        encoder.copy_buffer_to_buffer(&stage, cnt_off, &self.counters, 0, cnt_len);
+        encoder.copy_buffer_to_buffer(&stage, u_off, &self.sim_uniform, 0, u_len);
 
         let sim_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("gpu_particles_sim_bg"),

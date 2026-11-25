@@ -157,11 +157,11 @@ fn simulate_step(@builtin(global_invocation_id) id: vec3u) {
   if (idx >= max_p) {
     return;
   }
-  var p = particles[idx];
-  let life = p.vel_life.w;
+  let life = particles[idx].vel_life.w;
   if (life <= 0.0) {
     return;
   }
+  var p = particles[idx];
   let dt = clamp(params.gravity_dt.w, 0.0, 0.1);
   let new_age = p.pos_age.w + dt;
   let is_primary = p.size_rot_gen.w < 0.5;
@@ -286,15 +286,34 @@ fn apply_spawns(@builtin(global_invocation_id) id: vec3u) {
   }
 }
 
+var<workgroup> wg_alive_count: atomic<u32>;
+var<workgroup> wg_alive_base: u32;
+
 @compute @workgroup_size(64)
-fn compact_alive(@builtin(global_invocation_id) id: vec3u) {
+fn compact_alive(
+  @builtin(global_invocation_id) id: vec3u,
+  @builtin(local_invocation_index) lane: u32,
+) {
+  if (lane == 0u) {
+    atomicStore(&wg_alive_count, 0u);
+  }
+  workgroupBarrier();
   let idx = id.x;
   let max_p = u32(params.sub_emit.x);
-  if (idx >= max_p) {
-    return;
+  let alive = idx < max_p && particles[idx].vel_life.w > 0.0;
+  var local_slot = 0u;
+  if (alive) {
+    local_slot = atomicAdd(&wg_alive_count, 1u);
   }
-  if (particles[idx].vel_life.w > 0.0) {
-    let slot = atomicAdd(&indirect.instance_count, 1u);
-    alive_indices[slot] = idx;
+  workgroupBarrier();
+  if (lane == 0u) {
+    let count = atomicLoad(&wg_alive_count);
+    if (count > 0u) {
+      wg_alive_base = atomicAdd(&indirect.instance_count, count);
+    }
+  }
+  workgroupBarrier();
+  if (alive) {
+    alive_indices[wg_alive_base + local_slot] = idx;
   }
 }

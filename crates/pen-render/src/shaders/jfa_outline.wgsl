@@ -49,14 +49,18 @@ fn mask_fs() -> @location(0) u32 {
 fn depth_mask_fs(@builtin(position) position: vec4f) -> @location(0) u32 {
     let depth = textureLoad(scene_depth, vec2i(position.xy), 0);
     let behind = select(position.z - depth, depth - position.z, mesh.reversed_z != 0u);
-    return mesh.packed_style | select(0u, OCCLUDED, behind > mesh.depth_bias);
+    let slope_bias = max(abs(dpdx(position.z)), abs(dpdy(position.z))) * 1.5;
+    let bias = max(mesh.depth_bias, slope_bias);
+    return mesh.packed_style | select(0u, OCCLUDED, behind > bias);
 }
 
 @fragment
 fn depth_r32_mask_fs(@builtin(position) position: vec4f) -> @location(0) u32 {
     let depth = textureLoad(scene_depth_r32, vec2i(position.xy), 0).r;
     let behind = select(position.z - depth, depth - position.z, mesh.reversed_z != 0u);
-    return mesh.packed_style | select(0u, OCCLUDED, behind > mesh.depth_bias);
+    let slope_bias = max(abs(dpdx(position.z)), abs(dpdy(position.z))) * 1.5;
+    let bias = max(mesh.depth_bias, slope_bias);
+    return mesh.packed_style | select(0u, OCCLUDED, behind > bias);
 }
 
 fn pixel_index(pixel: vec2u, width: u32) -> u32 {

@@ -956,20 +956,20 @@ rendering systems driven either by direct `Renderer` setters or optional
   against resolved `R32Float` opaque depth, GPU dead-slot reclamation, and
   `draw_indexed_indirect` 3D mesh instancing inside the HDR scene pass. Driven
   by `Renderer::set_gpu_particle_scene` / `seed_gpu_particles` or
-  `GPU_PARTICLES_EXT_TAG` (`65_004`).
+  `GPU_PARTICLES_EXT_TAG` (`65_005`; `65_004` is reserved by `ACOUSTICS_EXT_TAG`).
 - **3D/2D Antialiased Lines & X-Ray Debug (`lines.rs`, `wired_passes/lines.rs`)**:
   quad-extruded capsule-SDF polylines with homogeneous near/far clipping,
   analytic box-filtered dashing, Forward-Z & Reversed-Z depth testing, dimmed
   occluded X-ray pass, always-on-top 3D layer, 1px hardware `LineList` pass,
   and a color-only 2D viewport overlay layer. Driven by
-  `Renderer::set_line_scene` or `LINES_EXT_TAG` (`65_005`).
+  `Renderer::set_line_scene` or `LINES_EXT_TAG` (`65_006`).
 - **Per-Object JFA Silhouette Outlines (`jfa_outline.rs`, `wired_passes/jfa_outline.rs`)**:
   256-style `R32Uint` entity mask pass (supporting both single-sampled depth
   and MSAA-resolved `R32Float` depth occlusion tagging in Forward-Z &
   Reversed-Z), `O(log2 R)` Jump-Flood + JFA+1 Euclidean Voronoi compute passes
   in portable storage buffers, and crisp antialiased alpha compositing onto the
   HDR scene before tonemapping. Driven by `Renderer::set_jfa_outlines` or
-  `JFA_OUTLINE_EXT_TAG` (`65_006`).
+  `JFA_OUTLINE_EXT_TAG` (`65_007`).
 - **First-Class 2D Renderer Suite (`render2d/`, `wired_passes/render2d.rs`)**:
   world-space rotated/Y-sorted/9-sliced sprites (`Sprites2dPass`), single-draw
   chunked GPU tilemaps with flip/rot90/frame animation (`TilemapPass`),
@@ -977,8 +977,9 @@ rendering systems driven either by direct `Renderer` setters or optional
   linear/radial gradients, crisp borders, Abramowitz & Stegun `erfc` drop
   shadows, and inline rounded clip rects (`SdfShapePass`), and multi-cascade 2D
   Radiance Cascades global illumination with bilinear-fix ray marching and zero
-  wall light leak (`RadianceCascades2d`). Driven by `Renderer::set_scene_2d` or
-  `RENDER2D_EXT_TAG` (`65_007`).
+  wall light leak (`RadianceCascades2d`). Driven by `Renderer::set_scene_2d`,
+  `RENDER2D_EXT_TAG` (`65_008`, vector SDF UI), or `RENDER2D_WORLD_EXT_TAG`
+  (`65_009`, 2D camera, atlas-keyed tilemaps, sprites, and 2D Radiance Cascades GI).
 
 WGSL lives in `src/shaders/`. A `${name}` in a template is filled in with
 `str::replace`, for example the sample count or the shared `toned` function.

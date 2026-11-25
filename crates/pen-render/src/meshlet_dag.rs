@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use anyhow::{Result, ensure};
 use wgpu::util::DeviceExt;
@@ -632,6 +633,37 @@ impl MeshletDagCullOutput {
             capacity,
         }
     }
+
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+}
+
+/// Packed draw streams and deferred-cluster flags for one two-phase DAG cut.
+pub struct MeshletDagTwoPhaseOutput {
+    pub phase1: MeshletDagCullOutput,
+    pub phase2: MeshletDagCullOutput,
+    /// One flag per cluster. Phase 1 sets it for clusters deferred by prior Hi-Z.
+    pub phase2_flags_buf: wgpu::Buffer,
+}
+
+impl MeshletDagTwoPhaseOutput {
+    pub fn new(device: &wgpu::Device, mesh: &MeshletDagGpu) -> Self {
+        let phase1 = MeshletDagCullOutput::new(device, mesh);
+        let phase2 = MeshletDagCullOutput::new(device, mesh);
+        let phase2_flags_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("meshlet_dag_phase2_flags"),
+            size: u64::from(mesh.cluster_count.max(1)) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self { phase1, phase2, phase2_flags_buf }
+    }
+
+    pub fn capacity(&self) -> u32 {
+        let draws_capacity = self.phase1.capacity().min(self.phase2.capacity());
+        u64::from(draws_capacity).min(self.phase2_flags_buf.size() / 4) as u32
+    }
 }
 
 #[repr(C, align(16))]
@@ -655,14 +687,28 @@ fn model_scale(model: &[f32; 16]) -> f32 {
     (bound as f32).next_up()
 }
 
+enum DagCullPass<'a> {
+    Single(&'a MeshletDagCullOutput),
+    Phase1(&'a MeshletDagTwoPhaseOutput),
+    Phase2(&'a MeshletDagTwoPhaseOutput),
+}
+
+struct DagTwoPhasePipelines {
+    two_phase_layout: wgpu::BindGroupLayout,
+    phase1_pipeline: wgpu::ComputePipeline,
+    phase2_pipeline: wgpu::ComputePipeline,
+}
+
 pub struct MeshletDagCuller {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
+    shader: wgpu::ShaderModule,
+    two_phase: OnceLock<DagTwoPhasePipelines>,
     dummy_hiz: wgpu::TextureView,
 }
 
 impl MeshletDagCuller {
-    pub fn new(device: &wgpu::Device) -> Self {
+    fn bind_group_layout(device: &wgpu::Device, two_phase: bool) -> wgpu::BindGroupLayout {
         let buffer = |binding, ty| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -670,43 +716,60 @@ impl MeshletDagCuller {
             count: None,
         };
         let storage = |binding, read_only| buffer(binding, wgpu::BufferBindingType::Storage { read_only });
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("meshlet_dag_bindings"),
-            entries: &[
-                buffer(0, wgpu::BufferBindingType::Uniform),
-                storage(1, true),
-                storage(2, false),
-                storage(3, false),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+        let entries = [
+            buffer(0, wgpu::BufferBindingType::Uniform),
+            storage(1, true),
+            storage(2, false),
+            storage(3, false),
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                storage(5, false),
-            ],
-        });
+                count: None,
+            },
+            storage(5, false),
+            storage(6, false),
+        ];
+        let (label, entries) = if two_phase {
+            ("meshlet_dag_two_phase_bindings", &entries[..])
+        } else {
+            ("meshlet_dag_bindings", &entries[..6])
+        };
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries })
+    }
+
+    fn make_pipeline(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::BindGroupLayout,
+        entry_point: &str,
+    ) -> wgpu::ComputePipeline {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("meshlet_dag_pipeline_layout"),
-            bind_group_layouts: &[Some(&layout)],
+            label: Some(entry_point),
+            bind_group_layouts: &[Some(layout)],
             immediate_size: 0,
         });
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry_point),
+            layout: Some(&pipeline_layout),
+            module: shader,
+            entry_point: Some(entry_point),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    }
+
+    pub fn new(device: &wgpu::Device) -> Self {
+        let layout = Self::bind_group_layout(device, false);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("meshlet_dag_cut.wgsl"),
             source: wgpu::ShaderSource::Wgsl(MESHLET_DAG_CUT_WGSL.into()),
         });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("meshlet_dag_cut"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("cull_meshlet_dag"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let pipeline = Self::make_pipeline(device, &shader, &layout, "cull_meshlet_dag");
         let dummy_hiz = device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("meshlet_dag_dummy_hiz"),
@@ -719,7 +782,22 @@ impl MeshletDagCuller {
                 view_formats: &[],
             })
             .create_view(&wgpu::TextureViewDescriptor::default());
-        Self { layout, pipeline, dummy_hiz }
+        Self { layout, pipeline, shader, two_phase: OnceLock::new(), dummy_hiz }
+    }
+
+    fn two_phase_pipelines(&self, device: &wgpu::Device) -> Result<&DagTwoPhasePipelines> {
+        ensure!(
+            device.limits().max_storage_buffers_per_shader_stage >= 5,
+            "two-phase DAG culling requires five compute storage bindings"
+        );
+        Ok(self.two_phase.get_or_init(|| {
+            let two_phase_layout = Self::bind_group_layout(device, true);
+            let phase1_pipeline =
+                Self::make_pipeline(device, &self.shader, &two_phase_layout, "cull_meshlet_dag_phase1");
+            let phase2_pipeline =
+                Self::make_pipeline(device, &self.shader, &two_phase_layout, "cull_meshlet_dag_phase2");
+            DagTwoPhasePipelines { two_phase_layout, phase1_pipeline, phase2_pipeline }
+        }))
     }
 
     /// Encode one cut for an affine model. A Hi-Z view, when supplied, uses the
@@ -733,7 +811,69 @@ impl MeshletDagCuller {
         params: &MeshletDagCullParams,
         hiz: Option<&wgpu::TextureView>,
     ) -> Result<()> {
-        ensure!(output.capacity >= mesh.cluster_count, "DAG output buffer has insufficient capacity");
+        self.dispatch(device, encoder, mesh, DagCullPass::Single(output), params, hiz)
+    }
+
+    /// Encode the continuous cut against prior-frame Hi-Z, deferring occluded clusters.
+    pub fn cull_phase1(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh: &MeshletDagGpu,
+        output: &MeshletDagTwoPhaseOutput,
+        params: &MeshletDagCullParams,
+        prior_hiz: Option<&wgpu::TextureView>,
+    ) -> Result<()> {
+        self.dispatch(device, encoder, mesh, DagCullPass::Phase1(output), params, prior_hiz)
+    }
+
+    /// Retest deferred clusters using Hi-Z built from this frame's Phase 1 opaque depth.
+    /// Encode after Phase 1 with the same mesh and output.
+    pub fn cull_phase2(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh: &MeshletDagGpu,
+        output: &MeshletDagTwoPhaseOutput,
+        params: &MeshletDagCullParams,
+        current_hiz: Option<&wgpu::TextureView>,
+    ) -> Result<()> {
+        self.dispatch(device, encoder, mesh, DagCullPass::Phase2(output), params, current_hiz)
+    }
+
+    fn dispatch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        mesh: &MeshletDagGpu,
+        cut: DagCullPass<'_>,
+        params: &MeshletDagCullParams,
+        hiz: Option<&wgpu::TextureView>,
+    ) -> Result<()> {
+        let (output, capacity, layout, pipeline, flags) = match cut {
+            DagCullPass::Single(output) => (output, output.capacity(), &self.layout, &self.pipeline, None),
+            DagCullPass::Phase1(output) => {
+                let pipelines = self.two_phase_pipelines(device)?;
+                (
+                    &output.phase1,
+                    output.capacity(),
+                    &pipelines.two_phase_layout,
+                    &pipelines.phase1_pipeline,
+                    Some(&output.phase2_flags_buf),
+                )
+            }
+            DagCullPass::Phase2(output) => {
+                let pipelines = self.two_phase_pipelines(device)?;
+                (
+                    &output.phase2,
+                    output.capacity(),
+                    &pipelines.two_phase_layout,
+                    &pipelines.phase2_pipeline,
+                    Some(&output.phase2_flags_buf),
+                )
+            }
+        };
+        ensure!(capacity >= mesh.cluster_count, "DAG output buffer has insufficient capacity");
         let p = &params.cull;
         let scale = model_scale(&p.model);
         let proj_scale = 0.5 * params.viewport_height * params.proj[5].abs();
@@ -749,6 +889,9 @@ impl MeshletDagCuller {
         );
         encoder.clear_buffer(&output.draw_count_buf, 0, None);
         encoder.clear_buffer(&output.draws_buf, 0, None);
+        if let DagCullPass::Phase1(output) = cut {
+            encoder.clear_buffer(&output.phase2_flags_buf, 0, None);
+        }
         if mesh.cluster_count == 0 {
             return Ok(());
         }
@@ -777,25 +920,30 @@ impl MeshletDagCuller {
         fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
             wgpu::BindGroupEntry { binding, resource: buffer.as_entire_binding() }
         }
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("meshlet_dag_cut"),
-            layout: &self.layout,
-            entries: &[
-                entry(0, &uniform),
-                entry(1, &mesh.clusters_buf),
-                entry(2, &output.draws_buf),
-                entry(3, &output.draw_count_buf),
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(hiz.unwrap_or(&self.dummy_hiz)),
-                },
-                entry(5, &output.selected_clusters_buf),
-            ],
-        });
+        let entries = [
+            entry(0, &uniform),
+            entry(1, &mesh.clusters_buf),
+            entry(2, &output.draws_buf),
+            entry(3, &output.draw_count_buf),
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(hiz.unwrap_or(&self.dummy_hiz)),
+            },
+            entry(5, &output.selected_clusters_buf),
+        ];
+        let two_phase_entries;
+        let entries = if let Some(flags) = flags {
+            two_phase_entries = [entries.as_slice(), &[entry(6, flags)]].concat();
+            two_phase_entries.as_slice()
+        } else {
+            entries.as_slice()
+        };
+        let bind_group =
+            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("meshlet_dag_cut"), layout, entries });
         let groups = mesh.cluster_count.div_ceil(WORKGROUP_SIZE);
         let width = groups.min(device.limits().max_compute_workgroups_per_dimension);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(width, groups.div_ceil(width), 1);
         Ok(())
@@ -967,6 +1115,41 @@ mod tests {
         values
     }
 
+    fn capture_draws(
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &MeshletDagCullOutput,
+    ) -> [wgpu::Buffer; 3] {
+        [
+            readback(device, encoder, &output.draw_count_buf),
+            readback(device, encoder, &output.selected_clusters_buf),
+            readback(device, encoder, &output.draws_buf),
+        ]
+    }
+
+    fn read_draws(
+        device: &wgpu::Device,
+        mesh: &MeshletDagMesh,
+        [count, ids, draws]: &[wgpu::Buffer; 3],
+    ) -> (Vec<u32>, u32) {
+        let count = read::<u32>(device, count)[0] as usize;
+        let ids = read::<u32>(device, ids)[..count].to_vec();
+        let draws = read::<MeshletIndirectDraw>(device, draws);
+        let mut tris = 0;
+        for (&id, draw) in ids.iter().zip(&draws) {
+            let cluster = mesh.clusters[id as usize];
+            assert_ne!(draw.index_count, 0);
+            assert_eq!(draw.index_count, cluster.counts[1]);
+            assert_eq!(draw.first_index, cluster.counts[0]);
+            assert_eq!(draw.base_vertex, 0);
+            assert_eq!(draw.instance_count, 1);
+            assert_eq!(draw.first_instance, 0);
+            tris += draw.index_count / 3;
+        }
+        assert!(draws[count..].iter().all(|draw| draw.instance_count == 0));
+        (ids, tris)
+    }
+
     fn dispatch(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -981,35 +1164,11 @@ mod tests {
             .iter()
             .map(|(params, hiz)| {
                 culler.cull(device, &mut encoder, &gpu, &output, params, *hiz).unwrap();
-                [
-                    readback(device, &mut encoder, &output.draw_count_buf),
-                    readback(device, &mut encoder, &output.selected_clusters_buf),
-                    readback(device, &mut encoder, &output.draws_buf),
-                ]
+                capture_draws(device, &mut encoder, &output)
             })
             .collect();
         queue.submit(Some(encoder.finish()));
-        results
-            .iter()
-            .map(|[count, ids, draws]| {
-                let count = read::<u32>(device, count)[0] as usize;
-                let ids = read::<u32>(device, ids)[..count].to_vec();
-                let draws = read::<MeshletIndirectDraw>(device, draws);
-                let mut tris = 0;
-                for (&id, draw) in ids.iter().zip(&draws) {
-                    let cluster = mesh.clusters[id as usize];
-                    assert_ne!(draw.index_count, 0);
-                    assert_eq!(draw.index_count, cluster.counts[1]);
-                    assert_eq!(draw.first_index, cluster.counts[0]);
-                    assert_eq!(draw.base_vertex, 0);
-                    assert_eq!(draw.instance_count, 1);
-                    assert_eq!(draw.first_instance, 0);
-                    tris += draw.index_count / 3;
-                }
-                assert!(draws[count..].iter().all(|draw| draw.instance_count == 0));
-                (ids, tris)
-            })
-            .collect()
+        results.iter().map(|result| read_draws(device, mesh, result)).collect()
     }
 
     fn exact_cut(mesh: &MeshletDagMesh, selected: &[u32]) {
@@ -1066,35 +1225,36 @@ mod tests {
         }
     }
 
+    fn hiz_texture(device: &wgpu::Device, queue: &wgpu::Queue, depths: [f32; 4]) -> wgpu::TextureView {
+        let size = wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            bytemuck::cast_slice(&depths),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: None },
+            size,
+        );
+        texture.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
     #[test]
     fn vulkan_culls_backfaces_and_respects_hiz_holes_in_both_depth_conventions() {
         let (device, queue) = vulkan_device();
         let positions = [[-0.05, -0.05, 0.0], [0.0, 0.05, 0.0], [0.05, -0.05, 0.0]];
         let mesh = build_meshlet_dag(&positions, &[0, 1, 2], &MeshletDagConfig::default()).unwrap();
-        let texture = |depths: [f32; 4]| {
-            let size = wgpu::Extent3d { width: 2, height: 2, depth_or_array_layers: 1 };
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R32Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            queue.write_texture(
-                texture.as_image_copy(),
-                bytemuck::cast_slice(&depths),
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: None },
-                size,
-            );
-            texture.create_view(&wgpu::TextureViewDescriptor::default())
-        };
         for reversed_z in [false, true] {
             let (near_depth, clear_depth) = if reversed_z { (0.9, 0.0) } else { (0.1, 1.0) };
-            let occluder = texture([near_depth; 4]);
-            let hole = texture([near_depth, near_depth, near_depth, clear_depth]);
+            let occluder = hiz_texture(&device, &queue, [near_depth; 4]);
+            let hole = hiz_texture(&device, &queue, [near_depth, near_depth, near_depth, clear_depth]);
             let mut front = view(1.0, 0.0);
             front.cull.model[0] = 2.0;
             front.cull.model[4] = 1.0;
@@ -1113,6 +1273,119 @@ mod tests {
             let views = [(front, None), (back, None), (depth, Some(&occluder)), (depth, Some(&hole))];
             let results = dispatch(&device, &queue, &mesh, &views);
             assert_eq!(results.iter().map(|(_, tris)| *tris).collect::<Vec<_>>(), [1, 0, 0, 1]);
+        }
+    }
+
+    fn two_separate_sphere_dags() -> MeshletDagMesh {
+        let (positions, indices) = uv_sphere();
+        let sphere = build_meshlet_dag(&positions, &indices, &MeshletDagConfig::default()).unwrap();
+        let leaves = sphere.leaf_cluster_count;
+        let interiors = sphere.clusters.len() as u32 - leaves;
+        let index_count = sphere.indices.len() as u32;
+        let vertex_count = positions.len() as u32;
+        // Keep each cluster on its own side of the wall. A joint build can pack
+        // disconnected triangles into a single cluster spanning both halves.
+        let mut clusters = Vec::with_capacity(sphere.clusters.len() * 2);
+        for range in [&sphere.clusters[..leaves as usize], &sphere.clusters[leaves as usize..]] {
+            for (side, offset) in [(0, -3.0), (1, 3.0)] {
+                let remap = |id| match id {
+                    NO_PARENT => NO_PARENT,
+                    i if i < leaves => i + side * leaves,
+                    i => i + leaves + side * interiors,
+                };
+                clusters.extend(range.iter().copied().map(|mut cluster| {
+                    cluster.bounds_sphere[0] += offset;
+                    cluster.lod_sphere[0] += offset;
+                    cluster.parent_sphere[0] += offset;
+                    cluster.counts[0] += side * index_count;
+                    cluster.meta[0] = remap(cluster.meta[0]);
+                    cluster.meta[1] = remap(cluster.meta[1]);
+                    cluster
+                }));
+            }
+        }
+        let mut indices = sphere.indices.clone();
+        indices.extend(sphere.indices.into_iter().map(|i| i + vertex_count));
+        MeshletDagMesh {
+            clusters,
+            indices,
+            level_count: sphere.level_count,
+            leaf_cluster_count: leaves * 2,
+            root_cluster_count: sphere.root_cluster_count * 2,
+        }
+    }
+
+    #[test]
+    fn vulkan_two_phase_dag_recovers_disoccluded_clusters_with_zero_overlap_in_both_depth_modes() {
+        let mesh = two_separate_sphere_dags();
+        let (device, queue) = vulkan_device();
+        let gpu = MeshletDagGpu::upload(&device, &mesh).unwrap();
+        let output = MeshletDagTwoPhaseOutput::new(&device, &gpu);
+        let culler = MeshletDagCuller::new(&device);
+        assert_eq!(output.capacity(), gpu.cluster_count);
+
+        let mut params = view(250.0, 0.0);
+        let full = dispatch(&device, &queue, &mesh, &[(params, None)]).pop().unwrap().0;
+        exact_cut(&mesh, &full);
+        let levels: HashSet<_> = full.iter().map(|&i| mesh.clusters[i as usize].meta[2]).collect();
+        assert!(levels.len() > 1, "the unoccluded cut must select mixed LODs");
+        let (left, right): (HashSet<_>, HashSet<_>) =
+            full.iter().copied().partition(|&i| mesh.clusters[i as usize].bounds_sphere[0] < 0.0);
+        assert!(!left.is_empty() && !right.is_empty());
+        let full: HashSet<_> = full.into_iter().collect();
+
+        // Map each sphere fully inside its own Hi-Z half, with depth between wall and sky.
+        params.cull.hiz_enabled = true;
+        params.cull.hiz_mips = 1;
+        params.cull.hiz_vp[0] = 0.125;
+        params.cull.hiz_vp[5] = 0.125;
+        params.cull.hiz_vp[14] = 0.5;
+        for reversed_z in [false, true] {
+            params.cull.reversed_z = reversed_z;
+            params.cull.hiz_vp[10] = if reversed_z { -0.08 } else { 0.08 };
+            let (near_wall, clear) = if reversed_z { (0.9, 0.0) } else { (0.1, 1.0) };
+            let prior_wall = hiz_texture(&device, &queue, [near_wall, clear, near_wall, clear]);
+            let current_sky = hiz_texture(&device, &queue, [clear; 4]);
+            let current_wall = hiz_texture(&device, &queue, [near_wall, clear, near_wall, clear]);
+
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            culler.cull_phase1(&device, &mut encoder, &gpu, &output, &params, Some(&prior_wall)).unwrap();
+            let flags = readback(&device, &mut encoder, &output.phase2_flags_buf);
+            culler.cull_phase2(&device, &mut encoder, &gpu, &output, &params, Some(&current_sky)).unwrap();
+            let recovered = capture_draws(&device, &mut encoder, &output.phase2);
+            // Reuse Phase 2 storage to exercise clearing draws left by the successful recovery.
+            culler.cull_phase2(&device, &mut encoder, &gpu, &output, &params, Some(&current_wall)).unwrap();
+            let still_occluded = capture_draws(&device, &mut encoder, &output.phase2);
+            let visible = capture_draws(&device, &mut encoder, &output.phase1);
+            queue.submit(Some(encoder.finish()));
+
+            for (i, flag) in read::<u32>(&device, &flags).into_iter().enumerate() {
+                assert_eq!(
+                    flag,
+                    u32::from(left.contains(&(i as u32))),
+                    "cluster {i}, sphere {:?}, reversed_z={reversed_z}",
+                    mesh.clusters[i].bounds_sphere,
+                );
+            }
+            let (visible, _) = read_draws(&device, &mesh, &visible);
+            let (recovered, _) = read_draws(&device, &mesh, &recovered);
+            let (still_occluded, _) = read_draws(&device, &mesh, &still_occluded);
+            assert_eq!(visible.len(), right.len());
+            assert_eq!(recovered.len(), left.len());
+            let phase1: HashSet<_> = visible.into_iter().collect();
+            let phase2: HashSet<_> = recovered.into_iter().collect();
+            assert_eq!(phase1, right);
+            assert_eq!(phase2, left);
+            assert!(phase1.is_disjoint(&phase2));
+            assert_eq!(phase1.union(&phase2).copied().collect::<HashSet<_>>(), full);
+            assert!(still_occluded.is_empty());
+            eprintln!(
+                "reversed_z={reversed_z}: phase1={}, flags={}, recovered={}, overlap=0, cut={}, wall_stays=0",
+                phase1.len(),
+                left.len(),
+                phase2.len(),
+                full.len(),
+            );
         }
     }
 }

@@ -79,8 +79,8 @@ pub use validate::validate_frame;
 pub use wired_passes::{
     ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentFoliage, EnvironmentScene,
     EnvironmentTerrain, GPU_PARTICLES_EXT_TAG, GpuParticleScene, JFA_OUTLINE_EXT_TAG, JfaOutlineScene,
-    JfaOutlineTarget, LINES_EXT_TAG, LineScene, RENDER2D_EXT_TAG, RadianceCascades2dLayer, Scene2d, SpriteLayer2d,
-    TilemapLayer2d,
+    JfaOutlineTarget, LINES_EXT_TAG, LineScene, RENDER2D_EXT_TAG, RENDER2D_WORLD_EXT_TAG, RadianceCascades2dLayer,
+    Scene2d, SpriteLayer2d, TilemapLayer2d,
 };
 
 pub(crate) fn velocity_sentinel_bytes() -> [u8; 4] {
@@ -634,7 +634,7 @@ struct Drawing<'a> {
     morphed: Option<&'a wgpu::Buffer>,
     culling: &'a GpuCulling,
     meshlet_indirect: &'a [MeshletIndirectSlot],
-    dag_outputs: &'a [crate::meshlet_dag::MeshletDagCullOutput],
+    dag_outputs: &'a [crate::meshlet_dag::MeshletDagTwoPhaseOutput],
     multi_draw_indirect: bool,
 }
 
@@ -874,8 +874,8 @@ pub(crate) struct State {
     wired: wired_passes::WiredPasses,
     // Indirect draw-command & phase-2 candidate buffers populated by two-phase GPU meshlet culling.
     meshlet_indirect: Vec<MeshletIndirectSlot>,
-    // Indirect draw-command outputs populated by continuous meshlet DAG LOD cut culling.
-    meshlet_dag_outputs: Vec<crate::meshlet_dag::MeshletDagCullOutput>,
+    // Indirect draw-command outputs populated by continuous meshlet DAG LOD cut culling (two-phase Hi-Z).
+    meshlet_dag_outputs: Vec<crate::meshlet_dag::MeshletDagTwoPhaseOutput>,
     instance_data: Vec<f32>,
     instance_uploads: instance_upload::Uploads,
     last_stats: RenderStats,

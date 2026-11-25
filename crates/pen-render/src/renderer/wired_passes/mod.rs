@@ -55,12 +55,14 @@ pub(super) use sky_env::EnvPipelines;
 pub const ENV_TERRAIN_EXT_TAG: u32 = 65_001;
 pub const ENV_WATER_EXT_TAG: u32 = 65_002;
 pub const ENV_FOLIAGE_EXT_TAG: u32 = 65_003;
+// Note: tag 65_004 is reserved by `pen_runtime::reverb::ACOUSTICS_EXT_TAG`.
 /// Built-in optional `RenderFrame::extensions` tags for GPU mesh particles, antialiased lines,
-/// JFA silhouette outlines, and the first-class 2D renderer suite.
-pub const GPU_PARTICLES_EXT_TAG: u32 = 65_004;
-pub const LINES_EXT_TAG: u32 = 65_005;
-pub const JFA_OUTLINE_EXT_TAG: u32 = 65_006;
-pub const RENDER2D_EXT_TAG: u32 = 65_007;
+/// JFA silhouette outlines, vector SDF UI, and full 2D world/GI scenes.
+pub const GPU_PARTICLES_EXT_TAG: u32 = 65_005;
+pub const LINES_EXT_TAG: u32 = 65_006;
+pub const JFA_OUTLINE_EXT_TAG: u32 = 65_007;
+pub const RENDER2D_EXT_TAG: u32 = 65_008;
+pub const RENDER2D_WORLD_EXT_TAG: u32 = 65_009;
 
 /// CDLOD heightfield terrain descriptor attached to [`EnvironmentScene`].
 pub struct EnvironmentTerrain {
@@ -119,6 +121,14 @@ pub(super) struct PlannedMeshletDraw {
 }
 
 #[derive(Clone, Copy)]
+pub(super) struct PlannedDagDraw {
+    pub slot: usize,
+    pub mesh_slot: usize,
+    pub model: Matrix,
+    pub backface_cull: bool,
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct DagLodSettings {
     pub enabled: bool,
     pub pixel_error_threshold: f32,
@@ -160,6 +170,8 @@ pub(super) struct WiredPasses {
     pub meshlet_plan: Vec<PlannedMeshletDraw>,
     pub meshlet_dag_culler: Option<crate::meshlet_dag::MeshletDagCuller>,
     pub last_meshlet_dag_draws: u32,
+    pub dag_phase1_used_hiz: bool,
+    pub dag_plan: Vec<PlannedDagDraw>,
     pub dag_lod: DagLodSettings,
     pub env_pipelines: HashMap<(u32, bool), EnvPipelines>,
     pub env_scene: Option<EnvironmentScene>,

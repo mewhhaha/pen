@@ -37,20 +37,52 @@ pub(super) fn stencil(material: &Material) -> u32 {
 }
 
 impl Drawing<'_> {
-    /// Draws newly disoccluded Phase-2 meshlet clusters for `entry` (`draws_phase2` buffer),
+    /// Draws newly disoccluded Phase-2 meshlet or continuous DAG clusters for `entry`,
     /// emitting zero overlapping triangles with Phase 1.
-    pub(super) fn draw_meshlet_phase2(&self, pass: &mut wgpu::RenderPass<'_>, entry: &ReadyEntry) -> bool {
-        let Some(slot) = entry.meshlet_slot else {
-            return false;
-        };
-        let Some(slot_data) = self.meshlet_indirect.get(slot) else {
-            return false;
-        };
+    pub(super) fn draw_meshlet_phase2(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        entry: &ReadyEntry,
+        draw_meshlets: bool,
+        draw_dag: bool,
+    ) -> bool {
         let item = &self.items[entry.item];
         if item.lod != 0 || !matches!(item.shape, Shape::Mesh(_)) {
             return false;
         }
         let Some(GpuAsset::Mesh(mesh)) = entry.mesh.and_then(|m| self.assets.current(m)) else {
+            return false;
+        };
+        if draw_dag
+            && let (Some(slot), Some(dag)) = (entry.dag_slot, &mesh.meshlet_dag)
+            && let Some(out) = self.dag_outputs.get(slot)
+        {
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_vertex_buffer(1, self.tangents(mesh).slice(..));
+            pass.set_vertex_buffer(2, self.extra_attrs(mesh).slice(..));
+            pass.set_index_buffer(dag.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            if self.multi_draw_indirect {
+                pass.multi_draw_indexed_indirect_count(
+                    &out.phase2.draws_buf,
+                    0,
+                    &out.phase2.draw_count_buf,
+                    0,
+                    dag.cluster_count,
+                );
+            } else {
+                for k in 0..dag.cluster_count {
+                    pass.draw_indexed_indirect(&out.phase2.draws_buf, u64::from(k) * 20);
+                }
+            }
+            return true;
+        }
+        if !draw_meshlets {
+            return false;
+        }
+        let Some(slot) = entry.meshlet_slot else {
+            return false;
+        };
+        let Some(slot_data) = self.meshlet_indirect.get(slot) else {
             return false;
         };
         let Some(ml) = &mesh.meshlets else {
@@ -117,9 +149,9 @@ impl Drawing<'_> {
                     pass.set_index_buffer(dag.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     if self.multi_draw_indirect {
                         pass.multi_draw_indexed_indirect_count(
-                            &out.draws_buf,
+                            &out.phase1.draws_buf,
                             0,
-                            &out.draw_count_buf,
+                            &out.phase1.draw_count_buf,
                             0,
                             dag.cluster_count,
                         );
@@ -129,7 +161,7 @@ impl Drawing<'_> {
                         }
                     } else {
                         for k in 0..dag.cluster_count {
-                            pass.draw_indexed_indirect(&out.draws_buf, u64::from(k) * 20);
+                            pass.draw_indexed_indirect(&out.phase1.draws_buf, u64::from(k) * 20);
                         }
                         if let Some(stats) = stats {
                             stats.draw_calls += dag.cluster_count;
@@ -725,7 +757,9 @@ impl State {
         // picture to read.
         let has_gpu_particles = self.has_active_gpu_particles(frame);
         let layered = !scratch.decals.is_empty() || !prepared_pbr_decals.is_empty() || has_gpu_particles;
-        let wants_meshlet_phase2 = self.wired.meshlet_phase1_used_hiz && !self.wired.meshlet_plan.is_empty();
+        let has_meshlet_phase2 = self.wired.meshlet_phase1_used_hiz && !self.wired.meshlet_plan.is_empty();
+        let has_dag_phase2 = self.wired.dag_phase1_used_hiz && !self.wired.dag_plan.is_empty();
+        let wants_meshlet_phase2 = has_meshlet_phase2 || has_dag_phase2;
         let scene_group = &self.scene_group.as_ref().unwrap().0;
         let lights = self.clusters.group();
         let opaque_lights = if restir_di_active { self.clusters.area_only_group() } else { lights };
@@ -826,12 +860,14 @@ impl State {
                 &self.hiz,
                 &self.assets,
                 &self.meshlet_indirect,
+                &self.meshlet_dag_outputs,
                 &self.timer,
                 &device,
                 &self.queue,
                 &mut encoder,
                 frame,
                 &active_proj_for_trails,
+                targets.size.1 as f32,
                 depth_mode,
             )?;
             {
@@ -853,7 +889,9 @@ impl State {
                 let mut current: Option<&wgpu::RenderPipeline> = None;
                 for &index in &scratch.opaque {
                     let entry = &ready[index];
-                    if entry.meshlet_slot.is_none() {
+                    let draw_ml = has_meshlet_phase2 && entry.meshlet_slot.is_some();
+                    let draw_dag = has_dag_phase2 && entry.dag_slot.is_some();
+                    if !draw_ml && !draw_dag {
                         continue;
                     }
                     let wanted = stencil(&entry.material.material);
@@ -866,7 +904,7 @@ impl State {
                         phase2.set_pipeline(&entry.pipeline);
                     }
                     phase2.set_bind_group(1, &entry.group, &[entry.offset]);
-                    drawing.draw_meshlet_phase2(&mut phase2, entry);
+                    drawing.draw_meshlet_phase2(&mut phase2, entry, draw_ml, draw_dag);
                 }
             }
             if wants_hiz_build {
@@ -1227,10 +1265,13 @@ impl State {
         }
         let render2d_overlay_sdf = Self::encode_render2d_base_wired(
             &mut self.wired,
+            &self.assets,
+            &self.white,
             &device,
             &self.queue,
             &mut encoder,
             frame,
+            catalog,
             &output,
             self.context.format,
             (output_width, output_height),
@@ -1524,10 +1565,13 @@ impl State {
         let split_line_scene = self.gather_line_scene(frame);
         let split_render2d_overlay = Self::encode_render2d_base_wired(
             &mut self.wired,
+            &self.assets,
+            &self.white,
             &device,
             &self.queue,
             &mut encoder,
             frame,
+            catalog,
             &output,
             format,
             (output_width, output_height),

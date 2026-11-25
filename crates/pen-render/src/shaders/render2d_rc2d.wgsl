@@ -48,7 +48,7 @@ fn trace_segment(start: vec2f, end: vec2f) -> vec4f {
     let leave = max(low, high);
     var t = max(0.0, max(enter.x, enter.y));
     let stop = min(segment_length, min(leave.x, leave.y));
-    let parallel_outside = abs(dir) < vec2f(1e-8)
+    let parallel_outside = (abs(dir) < vec2f(1e-8))
                            & ((start < vec2f(0)) | (start >= vec2f(size)));
     if t >= stop || any(parallel_outside) {
         return VACUUM;

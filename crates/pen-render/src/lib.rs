@@ -113,7 +113,7 @@ pub use lines::{
 };
 pub use meshlet_dag::{
     DagClusterGpu, MESHLET_DAG_CUT_WGSL, MeshletDagConfig, MeshletDagCullOutput, MeshletDagCullParams,
-    MeshletDagCuller, MeshletDagGpu, MeshletDagMesh, build_meshlet_dag,
+    MeshletDagCuller, MeshletDagGpu, MeshletDagMesh, MeshletDagTwoPhaseOutput, build_meshlet_dag,
 };
 pub use meshlets::{
     DEFAULT_MAX_MESHLET_TRIANGLES, DEFAULT_MAX_MESHLET_VERTICES, MESHLET_CULL_WGSL, MeshletBatchEntry,
@@ -168,8 +168,8 @@ pub const MSDF_WGSL: &str = include_str!("shaders/msdf.wgsl");
 pub use renderer::{
     ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentFoliage, EnvironmentScene,
     EnvironmentTerrain, GPU_PARTICLES_EXT_TAG, GpuParticleScene, JFA_OUTLINE_EXT_TAG, JfaOutlineScene,
-    JfaOutlineTarget, LINES_EXT_TAG, LineScene, RENDER2D_EXT_TAG, RadianceCascades2dLayer, SHADOWS_WGSL, Scene2d,
-    SpriteLayer2d, TilemapLayer2d, validate_frame,
+    JfaOutlineTarget, LINES_EXT_TAG, LineScene, RENDER2D_EXT_TAG, RENDER2D_WORLD_EXT_TAG, RadianceCascades2dLayer,
+    SHADOWS_WGSL, Scene2d, SpriteLayer2d, TilemapLayer2d, validate_frame,
 };
 #[cfg(feature = "simplify")]
 pub use simplify::pack_mesh_with_lods;

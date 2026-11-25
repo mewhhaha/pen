@@ -1,20 +1,13 @@
 use super::super::{GpuAsset, MeshletIndirectSlot, Scratch, Shape, State, hiz, timing};
-use super::{PlannedMeshletDraw, WiredPasses};
+use super::{PlannedDagDraw, PlannedMeshletDraw, WiredPasses};
 use crate::camera_precision::DepthMode;
 use crate::matrix::{invert, multiply};
-use crate::meshlet_dag::{MeshletDagCullOutput, MeshletDagCullParams, MeshletDagCuller};
+use crate::meshlet_dag::{MeshletDagCullParams, MeshletDagCuller, MeshletDagTwoPhaseOutput};
 use crate::meshlets::{
     MeshletBatchEntry, MeshletCullParams, MeshletCuller, MeshletIndirectDraw, MeshletTwoPhaseBatchEntry,
 };
 use anyhow::Result;
 use pen_protocol::{Matrix, RenderFrame};
-
-struct PlannedDagDraw {
-    slot: usize,
-    mesh_slot: usize,
-    model: Matrix,
-    backface_cull: bool,
-}
 
 fn perspective_near_plane(proj: &Matrix, depth_mode: DepthMode) -> Option<f32> {
     if !proj.iter().all(|v| v.is_finite()) || proj[11] >= -0.5 || proj[15].abs() > 0.5 || proj[5].abs() <= 1e-5 {
@@ -26,7 +19,11 @@ fn perspective_near_plane(proj: &Matrix, depth_mode: DepthMode) -> Option<f32> {
             if denom.abs() > 1e-6 { proj[14] / denom } else { return None }
         }
         DepthMode::ForwardZ => {
-            if proj[10].abs() > 1e-6 { proj[14] / proj[10] } else { return None }
+            if proj[10].abs() > 1e-6 {
+                proj[14] / proj[10]
+            } else {
+                return None;
+            }
         }
     };
     (near.is_finite() && near > 1e-5).then_some(near)
@@ -52,8 +49,10 @@ impl State {
         self.wired.last_meshlet_cull_draws = 0;
         self.wired.last_meshlet_dag_draws = 0;
         self.wired.meshlet_phase1_used_hiz = false;
+        self.wired.dag_phase1_used_hiz = false;
         self.wired.last_meshlet_phase2_active = false;
         self.wired.meshlet_plan.clear();
+        self.wired.dag_plan.clear();
 
         let active_vp = multiply(active_proj, &frame.view);
         let planes = frustum_planes_from_vp(&active_vp);
@@ -68,7 +67,6 @@ impl State {
 
         let mut slot_cursor = 0usize;
         let mut dag_cursor = 0usize;
-        let mut dag_plan: Vec<PlannedDagDraw> = Vec::new();
         for &ready_idx in &scratch.opaque {
             let entry = &scratch.ready[ready_idx];
             if entry.skin.is_some() || entry.morph.is_some() {
@@ -97,13 +95,17 @@ impl State {
                 && dag.cluster_count > 1
                 && (has_mdi || dag.cluster_count <= 64)
             {
-                let need_bytes = u64::from(dag.cluster_count) * size_of::<MeshletIndirectDraw>() as u64;
                 if dag_cursor >= self.meshlet_dag_outputs.len() {
-                    self.meshlet_dag_outputs.push(MeshletDagCullOutput::new(device, dag));
-                } else if self.meshlet_dag_outputs[dag_cursor].draws_buf.size() < need_bytes {
-                    self.meshlet_dag_outputs[dag_cursor] = MeshletDagCullOutput::new(device, dag);
+                    self.meshlet_dag_outputs.push(MeshletDagTwoPhaseOutput::new(device, dag));
+                } else if self.meshlet_dag_outputs[dag_cursor].capacity() < dag.cluster_count {
+                    self.meshlet_dag_outputs[dag_cursor] = MeshletDagTwoPhaseOutput::new(device, dag);
                 }
-                dag_plan.push(PlannedDagDraw { slot: dag_cursor, mesh_slot, model, backface_cull: det3 > 0.0 });
+                self.wired.dag_plan.push(PlannedDagDraw {
+                    slot: dag_cursor,
+                    mesh_slot,
+                    model,
+                    backface_cull: det3 > 0.0,
+                });
                 scratch.ready[ready_idx].dag_slot = Some(dag_cursor);
                 dag_cursor += 1;
                 continue;
@@ -171,20 +173,21 @@ impl State {
             slot_cursor += 1;
         }
         if let Some(near_plane) = perspective_near
-            && !dag_plan.is_empty()
+            && !self.wired.dag_plan.is_empty()
         {
             let dag_culler = self.wired.meshlet_dag_culler.get_or_insert_with(|| MeshletDagCuller::new(device));
-            for p in &dag_plan {
+            let dag_two_phase = use_hiz && device.limits().max_storage_buffers_per_shader_stage >= 5;
+            for p in &self.wired.dag_plan {
                 let Some(GpuAsset::Mesh(mesh)) = self.assets.current(p.mesh_slot) else { continue };
                 let Some(dag) = &mesh.meshlet_dag else { continue };
                 let params = MeshletDagCullParams {
                     cull: MeshletCullParams {
                         model: p.model,
-                        hiz_vp: active_vp,
+                        hiz_vp: if dag_two_phase { hiz_vp } else { active_vp },
                         frustum_planes: planes,
                         camera_pos,
-                        hiz_enabled: false,
-                        hiz_mips: 0,
+                        hiz_enabled: dag_two_phase,
+                        hiz_mips: if dag_two_phase { hiz_mips } else { 0 },
                         backface_cull: p.backface_cull,
                         reversed_z,
                     },
@@ -193,8 +196,20 @@ impl State {
                     near_plane,
                     pixel_error_threshold: self.wired.dag_lod.pixel_error_threshold,
                 };
-                dag_culler.cull(device, encoder, dag, &self.meshlet_dag_outputs[p.slot], &params, None)?;
+                if dag_two_phase {
+                    dag_culler.cull_phase1(
+                        device,
+                        encoder,
+                        dag,
+                        &self.meshlet_dag_outputs[p.slot],
+                        &params,
+                        Some(hiz_view_ref),
+                    )?;
+                } else {
+                    dag_culler.cull(device, encoder, dag, &self.meshlet_dag_outputs[p.slot].phase1, &params, None)?;
+                }
             }
+            self.wired.dag_phase1_used_hiz = dag_two_phase;
         }
         self.wired.last_meshlet_dag_draws = u32::try_from(dag_cursor).unwrap_or(u32::MAX);
         if !self.wired.meshlet_plan.is_empty() {
@@ -272,29 +287,30 @@ impl State {
         Ok(())
     }
 
-    /// Phase 2 of two-phase GPU meshlet occlusion culling: re-tests ONLY `phase2_flags == 1`
-    /// candidates against the fresh current-frame Hi-Z built from Phase 1 opaque depth so newly
-    /// disoccluded meshlets render in the exact same frame with zero overlap and zero popping.
+    /// Phase 2 of two-phase GPU meshlet and continuous DAG occlusion culling: re-tests ONLY
+    /// `phase2_flags == 1` candidates against the fresh current-frame Hi-Z built from Phase 1
+    /// opaque depth so newly disoccluded clusters render in the exact same frame with zero overlap.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_meshlet_culling_phase2(
         wired: &mut WiredPasses,
         hiz: &hiz::HiZ,
         assets: &crate::asset_store::AssetStore<GpuAsset>,
         meshlet_indirect: &[MeshletIndirectSlot],
+        meshlet_dag_outputs: &[MeshletDagTwoPhaseOutput],
         timer: &timing::GpuTimer,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         frame: &RenderFrame,
         active_proj: &Matrix,
+        viewport_height: f32,
         depth_mode: DepthMode,
     ) -> Result<()> {
-        if !wired.meshlet_phase1_used_hiz || wired.meshlet_plan.is_empty() {
+        let run_meshlets = wired.meshlet_phase1_used_hiz && !wired.meshlet_plan.is_empty();
+        let run_dag = wired.dag_phase1_used_hiz && !wired.dag_plan.is_empty();
+        if !run_meshlets && !run_dag {
             return Ok(());
         }
-        let Some(culler) = wired.meshlet_culler.as_mut() else {
-            return Ok(());
-        };
         let active_vp = multiply(active_proj, &frame.view);
         let planes = frustum_planes_from_vp(&active_vp);
         let eye = invert(&frame.view);
@@ -304,33 +320,69 @@ impl State {
         let use_hiz = hiz_active && hiz.depth_mode() == depth_mode;
         let hiz_opt = use_hiz.then_some((hiz_view_ref, hiz_view_id));
 
-        let mut batch = Vec::with_capacity(wired.meshlet_plan.len());
-        for p in &wired.meshlet_plan {
-            let Some(GpuAsset::Mesh(mesh)) = assets.current(p.mesh_slot) else { continue };
-            let Some(ml) = &mesh.meshlets else { continue };
-            let slot_data = &meshlet_indirect[p.slot];
-            batch.push(MeshletTwoPhaseBatchEntry {
-                mesh_key: p.mesh_key,
-                draws_gen: slot_data.generation,
-                meshlets_buf: &ml.descriptors,
-                draws_phase1_buf: &slot_data.draws_phase1,
-                draws_phase2_buf: &slot_data.draws_phase2,
-                phase2_flags_buf: &slot_data.phase2_flags,
-                meshlet_count: p.ml_count,
-                params: MeshletCullParams {
-                    model: p.model,
-                    hiz_vp: if use_hiz { hiz_vp } else { active_vp },
-                    frustum_planes: planes,
-                    camera_pos,
-                    hiz_enabled: use_hiz,
-                    hiz_mips,
-                    backface_cull: p.backface_cull,
-                    reversed_z,
-                },
-            });
+        if run_meshlets && let Some(culler) = wired.meshlet_culler.as_mut() {
+            let mut batch = Vec::with_capacity(wired.meshlet_plan.len());
+            for p in &wired.meshlet_plan {
+                let Some(GpuAsset::Mesh(mesh)) = assets.current(p.mesh_slot) else { continue };
+                let Some(ml) = &mesh.meshlets else { continue };
+                let slot_data = &meshlet_indirect[p.slot];
+                batch.push(MeshletTwoPhaseBatchEntry {
+                    mesh_key: p.mesh_key,
+                    draws_gen: slot_data.generation,
+                    meshlets_buf: &ml.descriptors,
+                    draws_phase1_buf: &slot_data.draws_phase1,
+                    draws_phase2_buf: &slot_data.draws_phase2,
+                    phase2_flags_buf: &slot_data.phase2_flags,
+                    meshlet_count: p.ml_count,
+                    params: MeshletCullParams {
+                        model: p.model,
+                        hiz_vp: if use_hiz { hiz_vp } else { active_vp },
+                        frustum_planes: planes,
+                        camera_pos,
+                        hiz_enabled: use_hiz,
+                        hiz_mips,
+                        backface_cull: p.backface_cull,
+                        reversed_z,
+                    },
+                });
+            }
+            culler.cull_batch_phase2(device, queue, encoder, hiz_opt, &batch, timer.compute(timing::Span::Culling))?;
+            wired.last_meshlet_phase2_active = true;
         }
-        culler.cull_batch_phase2(device, queue, encoder, hiz_opt, &batch, timer.compute(timing::Span::Culling))?;
-        wired.last_meshlet_phase2_active = true;
+        if run_dag
+            && let Some(near_plane) = perspective_near_plane(active_proj, depth_mode)
+            && let Some(dag_culler) = wired.meshlet_dag_culler.as_ref()
+        {
+            for p in &wired.dag_plan {
+                let Some(GpuAsset::Mesh(mesh)) = assets.current(p.mesh_slot) else { continue };
+                let Some(dag) = &mesh.meshlet_dag else { continue };
+                let params = MeshletDagCullParams {
+                    cull: MeshletCullParams {
+                        model: p.model,
+                        hiz_vp: if use_hiz { hiz_vp } else { active_vp },
+                        frustum_planes: planes,
+                        camera_pos,
+                        hiz_enabled: use_hiz,
+                        hiz_mips: if use_hiz { hiz_mips } else { 0 },
+                        backface_cull: p.backface_cull,
+                        reversed_z,
+                    },
+                    proj: *active_proj,
+                    viewport_height: viewport_height.max(1.0),
+                    near_plane,
+                    pixel_error_threshold: wired.dag_lod.pixel_error_threshold,
+                };
+                dag_culler.cull_phase2(
+                    device,
+                    encoder,
+                    dag,
+                    &meshlet_dag_outputs[p.slot],
+                    &params,
+                    use_hiz.then_some(hiz_view_ref),
+                )?;
+            }
+            wired.last_meshlet_phase2_active = true;
+        }
         Ok(())
     }
 }

@@ -26,7 +26,8 @@ export async function launch({ gpu = true } = {}) {
   } else if (gpu) {
     args = ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-vulkan=native', '--use-angle=vulkan', '--disable-vulkan-surface'];
   }
-  return playwright.chromium.launch({ headless: true, args });
+  const executablePath = process.env.PEN_WEB_EXECUTABLE || undefined;
+  return playwright.chromium.launch({ headless: true, executablePath, args });
 }
 
 // Takes what PEN_WEB_WITHOUT names away from `target`'s pages (a page or a

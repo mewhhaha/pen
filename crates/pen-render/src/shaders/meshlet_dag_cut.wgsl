@@ -35,6 +35,7 @@ struct DrawIndexedIndirect {
 @group(0) @binding(3) var<storage, read_write> draw_count: atomic<u32>;
 @group(0) @binding(4) var hiz_tex: texture_2d<f32>;
 @group(0) @binding(5) var<storage, read_write> selected_clusters: array<u32>;
+@group(0) @binding(6) var<storage, read_write> phase2_flags: array<u32>;
 
 // Exact local-space frustum test: transforms each world plane by transpose(model) so non-uniform
 // scaling and shear never under-estimate the projected bounding sphere radius.
@@ -150,6 +151,60 @@ fn cull_meshlet_dag(
   if (!in_frustum_local(sphere.xyz, sphere.w) || backface_culled(m)) {
     return;
   }
+  let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
+  let reversed_z = (u.counts_flags.w & 2u) != 0u;
+  if (hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
+    return;
+  }
+
+  let slot = atomicAdd(&draw_count, 1u);
+  draws[slot] = DrawIndexedIndirect(m.counts.y, 1u, m.counts.x, bitcast<i32>(m.counts.z), 0u);
+  selected_clusters[slot] = idx;
+}
+
+@compute @workgroup_size(64)
+fn cull_meshlet_dag_phase1(
+  @builtin(workgroup_id) group: vec3u,
+  @builtin(num_workgroups) groups: vec3u,
+  @builtin(local_invocation_index) lane: u32,
+) {
+  let idx = (group.y * groups.x + group.x) * 64u + lane;
+  if (idx >= u.counts_flags.x) {
+    return;
+  }
+  let m = clusters[idx];
+  let lod_pass = m.errors.x <= 0.0 || screen_error(m.lod_sphere, m.errors.x) <= u.projection.w;
+  let parent_fail = m.errors.y >= 1e29 || screen_error(m.parent_sphere, m.errors.y) > u.projection.w;
+  let sphere = m.bounds_sphere;
+  if (!(lod_pass && parent_fail) || !in_frustum_local(sphere.xyz, sphere.w) || backface_culled(m)) {
+    phase2_flags[idx] = 0u;
+    return;
+  }
+  let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
+  let reversed_z = (u.counts_flags.w & 2u) != 0u;
+  if (hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
+    phase2_flags[idx] = 1u;
+    return;
+  }
+
+  phase2_flags[idx] = 0u;
+  let slot = atomicAdd(&draw_count, 1u);
+  draws[slot] = DrawIndexedIndirect(m.counts.y, 1u, m.counts.x, bitcast<i32>(m.counts.z), 0u);
+  selected_clusters[slot] = idx;
+}
+
+@compute @workgroup_size(64)
+fn cull_meshlet_dag_phase2(
+  @builtin(workgroup_id) group: vec3u,
+  @builtin(num_workgroups) groups: vec3u,
+  @builtin(local_invocation_index) lane: u32,
+) {
+  let idx = (group.y * groups.x + group.x) * 64u + lane;
+  if (idx >= u.counts_flags.x || phase2_flags[idx] == 0u) {
+    return;
+  }
+  let m = clusters[idx];
+  let sphere = m.bounds_sphere;
   let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
   let reversed_z = (u.counts_flags.w & 2u) != 0u;
   if (hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {

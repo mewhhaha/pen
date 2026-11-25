@@ -884,6 +884,7 @@ fn render_frame_end_to_end_drives_agx_hdri_physical_sky_pbr_decals_polish_and_sp
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
 #[test]
 fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
     let Some((device, queue)) = common::device() else {
@@ -1182,6 +1183,7 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
 
 #[test]
 fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
@@ -1487,6 +1489,7 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
 #[test]
 fn tier3_restir_di_many_light_shadows_sharc_and_two_phase_meshlet_disocclusion_witness() {
     let Some((device, queue)) = common::featured_device() else {
@@ -1699,13 +1702,14 @@ fn tier3_restir_di_many_light_shadows_sharc_and_two_phase_meshlet_disocclusion_w
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
 #[test]
 fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() {
     use pen_render::{
         Camera2d, GPU_PARTICLES_EXT_TAG, GpuParticle, GpuParticleScene, JfaOutlineScene, JfaOutlineTarget,
         LINES_EXT_TAG, LineBatch, LineLayer, LineScene, LineStyle, OutlineStyle, RENDER2D_EXT_TAG,
-        RadianceCascades2dConfig, RadianceCascades2dLayer, Scene2d, Scene2dEmitter, SdfShape, Sprite2d, SpriteLayer2d,
-        TileCell, TilemapLayer2d, TilemapUniform, XRayStyle,
+        RENDER2D_WORLD_EXT_TAG, RadianceCascades2dConfig, RadianceCascades2dLayer, Scene2d, Scene2dEmitter, SdfShape,
+        Sprite2d, SpriteLayer2d, TileCell, TilemapLayer2d, TilemapUniform, XRayStyle,
     };
 
     let Some((device, queue)) = common::featured_device() else {
@@ -2049,6 +2053,176 @@ fn live_renderer_wires_dag_lods_gpu_particles_lines_jfa_outlines_and_render2d() 
     assert!(sdf_card[2] > 180 && sdf_card[0] < 60, "SDF UI card must render blue fill: {sdf_card:?}");
     assert!(sdf_ext[1] > 180 && sdf_ext[0] < 40, "RENDER2D_EXT_TAG SDF badge must render green: {sdf_ext:?}");
     renderer.clear_scene_2d();
+
+    // 5b) Verify RENDER2D_WORLD_EXT_TAG (65_009) drives full 2D tilemap + sprite + 2D Radiance Cascades GI
+    //     purely from RenderFrame::extensions (zero Rust set_scene_2d!).
+    let mut world_ext: Vec<f32> = vec![
+        0.0, 0.0, 1.0, 0.0, // camera center, zoom, rot
+        1.0, 1.0, 2.0, 5.0, // 1 tilemap, 1 sprite, 2 RC emitters, flags=1(opaque RC) | 4(y_sort)
+        2.0, 4.0, 0.0, 0.0, 1.0, 0.0, // RC config: spacing=2, dirs=4, auto cascades, ambient=0, mul=1, add=0
+        // Tilemap header (15 floats): mat=-1 (white), origin(-64,64), tile(64,64), grid(2,2), atlas(1,1), anim(0,1), tint(0.9)
+        -1.0, -64.0, 64.0, 64.0, 64.0, 2.0, 2.0, 1.0, 1.0, 0.0, 1.0, 0.9, 0.9, 0.9, 1.0,
+        // 4 cells (id=1, packed as f32)
+        1.0, 1.0, 1.0, 1.0,
+        // 1 sprite (25 floats): white mat=-1, pos(-32,0), size(12,12), pivot(0.5,0.5), rot=0, layer=0, uv(0,0,1,1), color(1), slice(0), flags(0)
+        -1.0, -32.0, 0.0, 12.0, 12.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        // 2 RC emitters (9 floats each): Circle light left + opaque Rect wall center
+        0.0, 24.0, 64.0, 10.0, 0.0, 5.0, 3.5, 1.0, 1.0,
+        1.0, 60.0, 16.0, 10.0, 96.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    let mut f_2d_ext = common::frame(vec![]);
+    f_2d_ext.projection = proj_fwd;
+    f_2d_ext.quality.sky = false;
+    f_2d_ext.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    f_2d_ext.extensions.push(Extension { tag: RENDER2D_WORLD_EXT_TAG, values: std::mem::take(&mut world_ext) });
+    renderer.submit(&f_2d_ext, &catalog, &mut target).unwrap();
+    let px_2d_ext = common::pixels(&device, &queue, &target.0);
+    let ext_lit = px_2d_ext[(64 * 128 + 42) as usize];
+    let ext_umbra = px_2d_ext[(64 * 128 + 90) as usize];
+    assert!(
+        ext_lit[0] > 120 && ext_umbra[0] < 15,
+        "RENDER2D_WORLD_EXT_TAG must drive 2D tilemap + RC2D GI purely from extensions: lit={ext_lit:?} umbra={ext_umbra:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn live_renderer_dag_two_phase_hiz_recovers_disocclusion_same_frame() {
+    let Some((device, queue)) = common::featured_device() else {
+        eprintln!("skipping live_renderer_dag_two_phase_hiz_recovers_disocclusion_same_frame: no Vulkan GPU");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pen_dag2p_live_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 1024-triangle UV sphere (16 stacks x 32 slices -> auto-builds continuous MeshletDagGpu).
+    let (stacks, slices) = (16u32, 32u32);
+    let mut pos = Vec::new();
+    let mut norm = Vec::new();
+    let mut uv = Vec::new();
+    let mut idx = Vec::new();
+    for r in 0..=stacks {
+        let v = r as f32 / stacks as f32;
+        let phi = v * std::f32::consts::PI;
+        for c in 0..=slices {
+            let u = c as f32 / slices as f32;
+            let theta = u * std::f32::consts::TAU;
+            let (x, y, z) = (phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin());
+            pos.extend_from_slice(&[x, y, z]);
+            norm.extend_from_slice(&[x, y, z]);
+            uv.extend_from_slice(&[u, v]);
+        }
+    }
+    let stride = slices + 1;
+    for r in 0..stacks {
+        for c in 0..slices {
+            let (i0, i1, i2, i3) = (r * stride + c, r * stride + c + 1, (r + 1) * stride + c, (r + 1) * stride + c + 1);
+            idx.extend_from_slice(&[i0, i1, i2, i1, i3, i2]);
+        }
+    }
+    let sphere_json = json!({ "positions": pos, "normals": norm, "uvs": uv, "indices": idx });
+    let quad_json = json!({
+        "positions": [-1.0, -1.0, 0.0,  1.0, -1.0, 0.0,  1.0, 1.0, 0.0,  -1.0, 1.0, 0.0],
+        "normals": [0.0, 0.0, 1.0,  0.0, 0.0, 1.0,  0.0, 0.0, 1.0,  0.0, 0.0, 1.0],
+        "uvs": [0.0, 1.0,  1.0, 1.0,  1.0, 0.0,  0.0, 0.0],
+        "indices": [0, 1, 2, 0, 2, 3]
+    });
+    std::fs::write(dir.join("sphere_dag.mesh.json"), serde_json::to_vec(&sphere_json).unwrap()).unwrap();
+    std::fs::write(dir.join("quad.mesh.json"), serde_json::to_vec(&quad_json).unwrap()).unwrap();
+    std::fs::write(dir.join("simple.wgsl"), SIMPLE_SHADER).unwrap();
+    write_solid_png(&dir.join("white.png"), [255, 255, 255, 255]);
+    std::fs::write(
+        dir.join("green.mat.json"),
+        json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.08, 0.92, 0.15, 1.0], "lighting": "unlit" })
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("red.mat.json"),
+        json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.92, 0.08, 0.08, 1.0], "lighting": "unlit" })
+            .to_string(),
+    )
+    .unwrap();
+
+    let catalog = Catalog {
+        meshes: vec!["sphere_dag.mesh.json".into(), "quad.mesh.json".into()],
+        materials: vec!["green.mat.json".into(), "red.mat.json".into()],
+        sounds: vec![],
+    };
+    let mut renderer = Renderer::new(
+        device.clone(),
+        queue.clone(),
+        RendererOptions {
+            format: common::FORMAT,
+            display: pen_render::Display::SDR,
+            assets: dir.clone(),
+            veil: None,
+            pipeline_cache: None,
+        },
+    )
+    .unwrap();
+    let mut target = common::Offscreen::new(&device, 128);
+    let proj_fwd = pen_render::perspective_forward_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
+    let proj_rev = perspective_reversed_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, None);
+
+    let dag_sphere = Draw {
+        mesh: 0,
+        material: 0,
+        transform: [
+            1.1, 0.0, 0.0, 0.0,
+            0.0, 1.1, 0.0, 0.0,
+            0.0, 0.0, 1.1, 0.0,
+            0.0, 0.0, -4.5, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    };
+    let blocker = Draw {
+        mesh: 1,
+        material: 1,
+        transform: [
+            2.5, 0.0, 0.0, 0.0,
+            0.0, 2.5, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, -1.5, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    };
+
+    for (label, proj) in [("ForwardZ", proj_fwd), ("ReversedZ", proj_rev)] {
+        // Frame 1: red wall completely occludes the green DAG sphere & primes Hi-Z with close depth.
+        let mut f_occluded = common::frame(vec![blocker.clone(), dag_sphere.clone()]);
+        f_occluded.projection = proj;
+        f_occluded.quality.sky = false;
+        f_occluded.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        wait_ready(&mut renderer, &f_occluded, &catalog, &mut target);
+        // Submit one settled occluded frame to ensure Hi-Z pyramid matches `proj`'s depth mode.
+        renderer.submit(&f_occluded, &catalog, &mut target).unwrap();
+        let occ_mid = common::middle(&device, &queue, &target.0);
+        assert!(occ_mid[0] > 180 && occ_mid[1] < 90, "{label}: frame 1 must show red blocker: {occ_mid:?}");
+
+        // Frame 2: blocker disappears. Phase 1 sees stale near Hi-Z and defers DAG clusters;
+        // Phase 2 rebuilds current-frame Hi-Z and recovers the green DAG sphere on the SAME frame (0-frame lag).
+        let mut f_disoccluded = common::frame(vec![dag_sphere.clone()]);
+        f_disoccluded.projection = proj;
+        f_disoccluded.quality.sky = false;
+        f_disoccluded.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        renderer.submit(&f_disoccluded, &catalog, &mut target).unwrap();
+        assert_eq!(renderer.last_meshlet_dag_draws(), 1, "{label}: sphere must render via continuous DAG");
+        assert!(
+            renderer.last_meshlet_phase2_active(),
+            "{label}: two-phase Hi-Z DAG disocclusion recovery must be active on frame 2"
+        );
+        let rec_mid = common::middle(&device, &queue, &target.0);
+        assert!(
+            rec_mid[1] > 160 && rec_mid[0] < 90,
+            "{label}: disoccluded DAG sphere must appear green on the exact same frame: {rec_mid:?}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

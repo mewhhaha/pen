@@ -132,6 +132,17 @@ pub trait Overlay {
     /// A line for its console, as if typed there (a script's `overlay=`),
     /// run on the next update.
     fn command(&mut self, _line: String) {}
+    /// Prepares renderer-native viewport overlays (JFA outlines, 3D/2D gizmos, SDF HUD)
+    /// right before `frame` is submitted. When `show` is false (clean capture/recording),
+    /// any previously attached overlay scenes are suspended without changing user toggle state.
+    fn prepare_scene(
+        &mut self,
+        _renderer: &mut pen_render::Renderer,
+        _frame: &RenderFrame,
+        _viewport: [f32; 2],
+        _show: bool,
+    ) {
+    }
     /// Draws what was laid out last over `target`, an image about to be shown.
     fn paint(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::Texture);
     /// The pointer is the overlay's (over one of its dialogs), so it shows
@@ -210,6 +221,15 @@ impl Host for Shell<'_> {
         #[cfg(feature = "devtools")]
         {
             gpu.drawn = Drawn { meshes: frame.draws.len(), brushes: frame.solids.len() };
+        }
+        if let Some(overlay) = self.overlay.as_deref_mut() {
+            let show_viewport_overlay = !offscreen || !capture.overlay_shots.is_empty();
+            overlay.prepare_scene(
+                &mut gpu.renderer,
+                frame,
+                [gpu.size.0.max(1) as f32, gpu.size.1.max(1) as f32],
+                show_viewport_overlay,
+            );
         }
         let output = Output {
             device: &gpu.device,
@@ -431,7 +451,7 @@ pub struct Session {
     /// What the game asks of the platform and native libraries: called for
     /// live frames only, their answers the next live frame's input.
     pub services: Services,
-    /// Native `service::KERNEL` host service (live local sessions with `entry kernel` modules).
+    /// Native `service::KERNEL` host service (live local sessions with `#kernel` modules).
     kernels: Option<crate::kernels::KernelService>,
     /// Engine used to re-open worker pools on hot reload.
     worker_engine: wasmtime::Engine,

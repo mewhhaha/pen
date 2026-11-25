@@ -30,6 +30,7 @@
 //! (`pen_runtime::inspect`), and edits tunable presets and materials in the
 //! checkout for them (`tunables`, `materials`).
 mod pictures;
+pub mod viewport;
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -46,7 +47,7 @@ use pen_runtime::devtools::{
 };
 use pen_runtime::inspect::{self, Packets};
 use pen_runtime::mix::AudioReport;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
 
@@ -157,6 +158,10 @@ pub struct Devtools {
     swapped: HashMap<(u32, u32), String>,
     /// Remote dev tools it answers too (`crate::remote`).
     remote: Option<crate::remote::Remote>,
+    /// Renderer-native viewport inspection overlay (JFA outlines, gizmos, UI bounds, SDF HUD).
+    viewport_overlay: viewport::ViewportOverlay,
+    /// Deferred left-click position in logical pixels for viewport draw picking on next render.
+    pending_viewport_click: Option<[f32; 2]>,
 }
 
 /// The date and time `since` the Unix epoch, in UTC, as a file name sorts
@@ -295,6 +300,8 @@ impl Devtools {
             atlas: pictures::Atlas::new(gpu.format),
             swapped: HashMap::new(),
             remote: settings.listen.as_deref().map(crate::remote::Remote::listen).transpose()?,
+            viewport_overlay: viewport::ViewportOverlay::new(),
+            pending_viewport_click: None,
         };
         if settings.open {
             devtools.typed.push_back(tap("`").to_vec());
@@ -950,6 +957,23 @@ impl Overlay for Devtools {
         {
             return false;
         }
+        // F8 toggles the renderer-native viewport inspection overlay.
+        if let WindowEvent::KeyboardInput { event: key, .. } = event
+            && key.physical_key == PhysicalKey::Code(KeyCode::F8)
+        {
+            if key.state == ElementState::Pressed && !key.repeat {
+                let on = self.viewport_overlay.toggle();
+                devlog::info(Source::Session, format!("Viewport overlay {}", if on { "on" } else { "off" }));
+            }
+            return false;
+        }
+        if let WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } = event
+            && self.viewport_overlay.is_enabled()
+            && !self.routing.over
+            && self.routing.buttons == 0
+        {
+            self.pending_viewport_click = Some([self.routing.pointer.0, self.routing.pointer.1]);
+        }
         if self.runtime.is_none() {
             return true;
         }
@@ -1006,6 +1030,10 @@ impl Overlay for Devtools {
     }
 
     fn command(&mut self, line: String) {
+        if let Some(reply) = self.viewport_overlay.apply_command(&line) {
+            devlog::info(Source::Session, reply);
+            return;
+        }
         // Typed into its console, opened first unless its text box has the
         // keyboard or it is opening already.
         let opening = self.typed.iter().any(|typed| typed.first() == Some(&GameEvent::KeyDown("`".to_owned())));
@@ -1013,6 +1041,30 @@ impl Overlay for Devtools {
             frame.ui.iter().any(|node| node.role == pen_protocol::ui_role::TEXTBOX && node.focused)
         });
         self.typed.extend(typed_line(&line, console_focused || opening));
+    }
+
+    fn prepare_scene(
+        &mut self,
+        renderer: &mut pen_render::Renderer,
+        frame: &RenderFrame,
+        viewport: [f32; 2],
+        show: bool,
+    ) {
+        if !show {
+            self.viewport_overlay.suspend_on_renderer(renderer);
+            return;
+        }
+        if self.viewport_overlay.is_enabled() {
+            let pointer = [self.routing.pointer.0, self.routing.pointer.1];
+            self.viewport_overlay.update_pointer(frame, pointer, viewport);
+            if let Some(click) = self.pending_viewport_click.take() {
+                self.viewport_overlay.click_select(frame, click, viewport);
+            }
+        } else {
+            self.pending_viewport_click = None;
+        }
+        let stats = renderer.stats();
+        self.viewport_overlay.apply_to_renderer(renderer, frame, &stats, viewport);
     }
 
     fn paint(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue, target: &wgpu::Texture) {

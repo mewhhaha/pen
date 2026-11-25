@@ -426,7 +426,13 @@ fn main() -> Result<()> {
     }))?;
     eprintln!("adapter: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
     let features = pen_render::optional_features(&adapter);
-    let descriptor = wgpu::DeviceDescriptor { required_features: features, ..Default::default() };
+    let limits = pen_render::optional_limits(&adapter);
+    let descriptor = wgpu::DeviceDescriptor {
+        required_features: features,
+        required_limits: limits,
+        experimental_features: pen_render::optional_experimental_features(&adapter),
+        ..Default::default()
+    };
     let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))?;
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("output"),

@@ -72,8 +72,8 @@ pub use camera_precision::{
     CameraRelativeFrame, DepthMode, detect_depth_mode, perspective_forward_z, perspective_reversed_z,
 };
 pub use ddgi::{
-    DDGI_IRRADIANCE_INNER, DDGI_IRRADIANCE_TILE, DDGI_VISIBILITY_INNER, DDGI_VISIBILITY_TILE, DDGI_WGSL,
-    DdgiFrameParams, DdgiGridConfig, DdgiQueryPoint, DdgiVolume,
+    DDGI_IRRADIANCE_INNER, DDGI_IRRADIANCE_TILE, DDGI_PACKED_HEADER_VEC4S, DDGI_VISIBILITY_INNER,
+    DDGI_VISIBILITY_TILE, DDGI_WGSL, DdgiFrameParams, DdgiGridConfig, DdgiQueryPoint, DdgiVolume,
 };
 pub use decals::{PBR_DECAL_WGSL, PbrDecal, PbrDecalPass, PbrDecalView};
 pub use display::{DEFAULT_HEADROOM, Display, REFERENCE_WHITE_NITS, choose_surface};
@@ -107,9 +107,10 @@ pub use post_fx::{
 };
 pub use prefetch::Prefetch;
 pub use ray_tracing::{
-    BVH_RAYTRACE_WGSL, Blas, BlasTriGpu, BlasTriangle, BvhNodeGpu, BvhScene, BvhTriGpu, BvhTriangle, GpuRayTracer,
-    RayTraceParams, TLAS_RAYTRACE_WGSL, TLAS_TRAVERSAL_WGSL, TlasInstance, TlasInstanceGpu, TlasRayTraceParams,
-    TlasRayTracer, TlasScene, TlasSceneGpu, supports_hardware_ray_query,
+    BVH_RAYTRACE_WGSL, Blas, BlasTriGpu, BlasTriangle, BvhNodeGpu, BvhScene, BvhTriGpu, BvhTriangle, GpuBlasPool,
+    GpuRayTracer, MAX_RT_LOCAL_LIGHTS, RayTraceParams, RtLocalLight, TLAS_RAYTRACE_WGSL, TLAS_TRAVERSAL_WGSL,
+    TlasInstance, TlasInstanceGpu, TlasRayTraceParams, TlasRayTracer, TlasScene, TlasSceneGpu,
+    device_supports_hardware_ray_query, supports_hardware_ray_query,
 };
 pub use svgf::{SVGF_WGSL, SvgfDenoiser, SvgfInputs, SvgfParams};
 pub use render_targets::{
@@ -161,14 +162,59 @@ pub struct RendererOptions {
 /// compiled pipelines between runs; `TIMESTAMP_QUERY` times the GPU's passes
 /// (`RenderStats::gpu`); the texture compression families pick which KTX2
 /// variant of a texture loads.
+/// Device features the renderer uses when the adapter offers them. Pass to
+/// `DeviceDescriptor::required_features` alongside [`optional_limits`].
 pub fn optional_features(adapter: &wgpu::Adapter) -> wgpu::Features {
-    adapter.features()
-        & (wgpu::Features::PIPELINE_CACHE
-            | wgpu::Features::TIMESTAMP_QUERY
-            | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
-            | wgpu::Features::TEXTURE_COMPRESSION_BC
-            | wgpu::Features::TEXTURE_COMPRESSION_ASTC
-            | wgpu::Features::TEXTURE_COMPRESSION_ETC2)
+    #[allow(unused_mut)]
+    let mut wanted = wgpu::Features::PIPELINE_CACHE
+        | wgpu::Features::TIMESTAMP_QUERY
+        | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+        | wgpu::Features::TEXTURE_COMPRESSION_BC
+        | wgpu::Features::TEXTURE_COMPRESSION_ASTC
+        | wgpu::Features::TEXTURE_COMPRESSION_ETC2;
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let limits = adapter.limits();
+        if limits.max_blas_primitive_count > 0 && limits.max_tlas_instance_count > 0 {
+            wanted |= wgpu::Features::EXPERIMENTAL_RAY_QUERY;
+        }
+    }
+    adapter.features() & wanted
+}
+
+/// Device limits matching [`optional_features`] (enables hardware acceleration
+/// structure limits on native GPUs supporting `EXPERIMENTAL_RAY_QUERY`, while
+/// keeping strict core WebGPU default limits in browsers / WASM).
+#[allow(unused_variables)]
+pub fn optional_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    let base = wgpu::Limits::default();
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let al = adapter.limits();
+        if adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY)
+            && al.max_blas_primitive_count > 0
+            && al.max_tlas_instance_count > 0
+        {
+            return base.using_acceleration_structure_values(al);
+        }
+    }
+    base
+}
+
+/// Experimental-feature opt-in token matching [`optional_features`] (enables
+/// `EXPERIMENTAL_RAY_QUERY` on native adapters that support hardware RT;
+/// remains disabled on WASM / adapters without hardware RT).
+#[allow(unused_variables)]
+pub fn optional_experimental_features(adapter: &wgpu::Adapter) -> wgpu::ExperimentalFeatures {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if optional_features(adapter).contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            // SAFETY: requested only on native adapters advertising EXPERIMENTAL_RAY_QUERY
+            // with non-zero acceleration structure limits, via validated wgpu ray-query APIs.
+            return unsafe { wgpu::ExperimentalFeatures::enabled() };
+        }
+    }
+    wgpu::ExperimentalFeatures::disabled()
 }
 
 /// Where frames are drawn: a window's surface, or an offscreen texture.

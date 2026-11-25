@@ -1,10 +1,14 @@
-// 2-Level TLAS/BLAS GPU Compute Ray Tracer:
+// 2-Level TLAS/BLAS GPU Ray Tracer (native hardware `wgpu_ray_query` or portable compute BVH):
+// Supports full-res (1:1) and half-res (2:1) tracing, primary TLAS material lookup (smooth normal,
+// albedo, roughness, metallic + Schlick Fresnel), dynamic local lights, and live DDGI multi-bounce
+// shading inside secondary reflection/GI hits.
+//
 // Outputs:
 //  - out_shadow_ao  (Rgba16Float): (rt_shadow, rtao, hit_dist, 1.0)
-//  - out_reflection (Rgba16Float): (ggx_refl.rgb, hit_dist)
+//  - out_reflection (Rgba16Float): (fresnel_ggx_refl.rgb, hit_dist)
 //  - out_gi         (Rgba16Float): (one_bounce_diffuse_gi.rgb, 1.0)
 //
-// Prefixed at compile time with tlas_traversal.wgsl.
+// Prefixed at compile time with tlas_traversal.wgsl or tlas_traversal_hw.wgsl.
 
 struct TlasRayTraceUniform {
   inverse_view_projection: mat4x4f,
@@ -14,12 +18,19 @@ struct TlasRayTraceUniform {
   sky_zenith: vec4f,           // rgb = sky zenith radiance, a = ao_radius
   sky_horizon: vec4f,          // rgb = sky horizon radiance, a = max_ray_dist
   samples_seed: vec4f,         // x = shadow_samples, y = ao_samples, z = gi_samples, w = frame_seed
-  bias_and_refl: vec4f,        // x = normal_bias, y = refl_samples, z = gi_bounce_scale, w = visibility_mask_f32
+  bias_and_refl: vec4f,        // x = normal_bias, y = refl_samples, z = gi_bounce_scale, w = 0
   counts: vec4u,               // x = tlas_nodes, y = tlas_instances, z = blas_tris, w = visibility_mask
+  extra_counts: vec4u,         // x = local_light_count, y = out_w, z = out_h, w = flags (bit0: mat_gbuf, bit1: ddgi_bounce)
+};
+
+struct RtLocalLight {
+  position_range: vec4f,
+  color_outer_cos: vec4f,
+  direction_inner_cos: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> u: TlasRayTraceUniform;
-@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;
+// __TLAS_BINDING_1__
 @group(0) @binding(2) var<storage, read> tlas_instances: array<TlasInstance>;
 @group(0) @binding(3) var<storage, read> blas_nodes: array<BvhNode>;
 @group(0) @binding(4) var<storage, read> blas_tris: array<BlasTri>;
@@ -27,6 +38,8 @@ struct TlasRayTraceUniform {
 @group(0) @binding(6) var out_shadow_ao: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(7) var out_reflection: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(8) var out_gi: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(9) var<storage, read> local_lights: array<RtLocalLight>;
+@group(0) @binding(10) var<storage, read> ddgi_packed: array<vec4f>;
 
 const PI: f32 = 3.14159265359;
 
@@ -50,6 +63,125 @@ fn eval_sky(dir: vec3f) -> vec3f {
   return select(mix(ground, u.sky_horizon.rgb, t * 2.0), upper, dir.y >= 0.0);
 }
 
+// --- Packed DDGI Multi-Bounce Sampling at RT Hit Points ---
+fn rt_ddgi_sign_nz(v: vec2f) -> vec2f {
+  return vec2f(select(-1.0, 1.0, v.x >= 0.0), select(-1.0, 1.0, v.y >= 0.0));
+}
+
+fn rt_ddgi_oct_encode(v: vec3f) -> vec2f {
+  let l1 = abs(v.x) + abs(v.y) + abs(v.z);
+  var p = v.xy / max(l1, 1e-8);
+  if (v.z < 0.0) {
+    p = (1.0 - abs(p.yx)) * rt_ddgi_sign_nz(p);
+  }
+  return p;
+}
+
+fn rt_ddgi_wrap(v: i32, n: u32) -> u32 {
+  let ni = max(i32(n), 1);
+  return u32(((v % ni) + ni) % ni);
+}
+
+fn rt_ddgi_sample_irr(irr_off: u32, w: u32, h: u32, fpx: vec2f) -> vec4f {
+  let p = fpx - vec2f(0.5);
+  let x0 = u32(clamp(floor(p.x), 0.0, f32(w - 1u)));
+  let y0 = u32(clamp(floor(p.y), 0.0, f32(h - 1u)));
+  let x1 = min(x0 + 1u, w - 1u);
+  let y1 = min(y0 + 1u, h - 1u);
+  let fx = clamp(p.x - f32(x0), 0.0, 1.0);
+  let fy = clamp(p.y - f32(y0), 0.0, 1.0);
+  let c00 = ddgi_packed[irr_off + y0 * w + x0];
+  let c10 = ddgi_packed[irr_off + y0 * w + x1];
+  let c01 = ddgi_packed[irr_off + y1 * w + x0];
+  let c11 = ddgi_packed[irr_off + y1 * w + x1];
+  return mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
+}
+
+fn rt_ddgi_cascade(cascade_idx: u32, world: vec3f, normal: vec3f) -> vec4f {
+  let base = 1u + cascade_idx * 6u;
+  let h0 = ddgi_packed[base + 0u];
+  let h1 = ddgi_packed[base + 1u];
+  let h2 = ddgi_packed[base + 2u];
+  let h3 = ddgi_packed[base + 3u];
+  let h4 = ddgi_packed[base + 4u];
+  let dims = vec3u(u32(max(h2.x, 0.0)), u32(max(h2.y, 0.0)), u32(max(h2.z, 0.0)));
+  if (dims.x < 2u || dims.y < 2u || dims.z < 2u) {
+    return vec4f(0.0);
+  }
+  let origin = h0.xyz;
+  let gamma = max(h0.w, 1.0);
+  let spacing = max(h1.xyz, vec3f(1e-4));
+  let min_sp = min(spacing.x, min(spacing.y, spacing.z));
+  let biased_pos = world + normal * (h1.w * min_sp);
+  let rel = (biased_pos - origin) / spacing;
+  let max_c = vec3f(f32(dims.x - 1u), f32(dims.y - 1u), f32(dims.z - 1u));
+  let edge = min(min(min(rel.x, max_c.x - rel.x), min(rel.y, max_c.y - rel.y)), min(rel.z, max_c.z - rel.z));
+  let reach = clamp(edge + 0.5, 0.0, 1.0);
+  if (reach <= 0.0) {
+    return vec4f(0.0);
+  }
+  let scroll = vec3i(i32(round(h3.x)), i32(round(h3.y)), i32(round(h3.z)));
+  let irr_off = u32(max(h3.w, 0.0));
+  let strength = max(h4.y, 0.0);
+  let irr_w = u32(max(h4.z, 1.0));
+  let irr_h = u32(max(h4.w, 1.0));
+
+  let clamped = clamp(rel, vec3f(0.0), max_c);
+  let base_i = vec3u(floor(clamped));
+  let alpha = clamped - vec3f(base_i);
+  let oct_n = rt_ddgi_oct_encode(normalize(normal)) * 0.5 + vec2f(0.5);
+
+  var sum_irr = vec3f(0.0);
+  var sum_w = 0.0;
+  for (var i = 0u; i < 8u; i++) {
+    let off = vec3u(i & 1u, (i >> 1u) & 1u, (i >> 2u) & 1u);
+    let coord = min(base_i + off, dims - vec3u(1u));
+    let sc = vec3u(
+      rt_ddgi_wrap(i32(coord.x) + scroll.x, dims.x),
+      rt_ddgi_wrap(i32(coord.y) + scroll.y, dims.y),
+      rt_ddgi_wrap(i32(coord.z) + scroll.z, dims.z),
+    );
+    let tri_v = mix(vec3f(1.0) - alpha, alpha, vec3f(off));
+    var w = max(tri_v.x * tri_v.y * tri_v.z, 1e-4);
+    let probe_pos = origin + vec3f(coord) * spacing;
+    let to_probe = probe_pos - world;
+    let d_u = length(to_probe);
+    let dir_p = select(normal, to_probe / d_u, d_u > 1e-5);
+    let wrap = (dot(dir_p, normal) + 1.0) * 0.5;
+    w *= wrap * wrap + 0.05;
+
+    let s_col = sc.z * dims.x + sc.x;
+    let s_row = sc.y;
+    let irr_px = vec2f(f32(s_col * 10u + 1u), f32(s_row * 10u + 1u)) + oct_n * 8.0;
+    let texel = rt_ddgi_sample_irr(irr_off, irr_w, irr_h, irr_px);
+    w *= clamp(texel.a, 0.0, 1.0);
+    if (w <= 1e-6) {
+      continue;
+    }
+    let irr = pow(max(texel.rgb, vec3f(0.0)), vec3f(gamma * 0.5));
+    sum_irr += irr * w;
+    sum_w += w;
+  }
+  if (sum_w <= 1e-6) {
+    return vec4f(0.0);
+  }
+  let avg = sum_irr / sum_w;
+  return vec4f(avg * avg * strength, reach);
+}
+
+fn rt_sample_ddgi(world: vec3f, normal: vec3f) -> vec4f {
+  let count = u32(clamp(round(ddgi_packed[0u].x), 0.0, 2.0));
+  if (count == 0u) {
+    return vec4f(0.0);
+  }
+  let c0 = rt_ddgi_cascade(0u, world, normal);
+  if (count == 1u || c0.a >= 0.999) {
+    return c0;
+  }
+  let c1 = rt_ddgi_cascade(1u, world, normal);
+  return vec4f(mix(c1.rgb, c0.rgb, c0.a), max(c0.a, c1.a));
+}
+
 fn shade_hit(
   hit_pos: vec3f,
   hit: TlasHit,
@@ -58,7 +190,10 @@ fn shade_hit(
   bias: f32,
   mask: u32,
 ) -> vec3f {
+  let diffuse_albedo = hit.albedo * (1.0 - hit.metallic);
   var rad = hit.emissive;
+
+  // 1. Direct sun + TLAS shadow ray.
   let ndl = max(0.0, dot(hit.world_normal, sun_dir));
   if (ndl > 0.0) {
     let sh = trace_tlas(
@@ -73,12 +208,60 @@ fn shade_hit(
       u.counts.z,
     );
     if (!sh.hit) {
-      let diffuse_albedo = hit.albedo * (1.0 - hit.metallic);
       rad += (diffuse_albedo / PI) * sun_color * ndl;
     }
   }
-  let amb_sky = mix(u.sky_horizon.rgb * 0.4, u.sky_zenith.rgb, clamp(hit.world_normal.y * 0.5 + 0.5, 0.0, 1.0));
-  rad += hit.albedo * (1.0 - hit.metallic) * amb_sky * 0.25;
+
+  // 2. Dynamic point, spot, and area lights with TLAS shadows.
+  let n_lights = u.extra_counts.x;
+  for (var li = 0u; li < n_lights; li++) {
+    let lt = local_lights[li];
+    let to_light = lt.position_range.xyz - hit_pos;
+    let dist = length(to_light);
+    let reach = lt.position_range.w;
+    if (dist <= 1e-4 || dist >= reach) {
+      continue;
+    }
+    let ldir = to_light / dist;
+    let l_ndl = max(0.0, dot(hit.world_normal, ldir));
+    if (l_ndl <= 0.0) {
+      continue;
+    }
+    let ratio = dist / reach;
+    let r2 = ratio * ratio;
+    let win = clamp(1.0 - r2 * r2, 0.0, 1.0);
+    var atten = (win * win) / (dist * dist + 1.0);
+    if (lt.color_outer_cos.w > -0.999) {
+      let cone = dot(-ldir, lt.direction_inner_cos.xyz);
+      atten *= smoothstep(lt.color_outer_cos.w, max(lt.direction_inner_cos.w, lt.color_outer_cos.w + 1e-4), cone);
+    }
+    if (atten <= 1e-5) {
+      continue;
+    }
+    let lsh = trace_tlas(
+      hit_pos + hit.world_normal * bias,
+      ldir,
+      1e-4,
+      max(dist - 0.03, 2e-3),
+      mask,
+      true,
+      u.counts.x,
+      u.counts.y,
+      u.counts.z,
+    );
+    if (!lsh.hit) {
+      rad += (diffuse_albedo / PI) * lt.color_outer_cos.rgb * (atten * l_ndl);
+    }
+  }
+
+  // 3. Multi-bounce indirect diffuse at hit point: live DDGI when active, else sky ambient fallback.
+  let amb_sky = mix(u.sky_horizon.rgb * 0.4, u.sky_zenith.rgb, clamp(hit.world_normal.y * 0.5 + 0.5, 0.0, 1.0)) * 0.25;
+  if ((u.extra_counts.w & 2u) != 0u) {
+    let ddgi = rt_sample_ddgi(hit_pos, hit.world_normal);
+    rad += diffuse_albedo * mix(amb_sky, ddgi.rgb, ddgi.a);
+  } else {
+    rad += diffuse_albedo * amb_sky;
+  }
   return rad;
 }
 
@@ -116,12 +299,18 @@ fn sample_ggx_half(rnd: vec2f, roughness: f32) -> vec3f {
 
 @compute @workgroup_size(8, 8, 1)
 fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
-  let dims = vec2i(textureDimensions(depth_tex, 0));
-  if (i32(id.x) >= dims.x || i32(id.y) >= dims.y) {
+  let out_dims = vec2i(i32(u.extra_counts.y), i32(u.extra_counts.z));
+  let depth_dims = vec2i(textureDimensions(depth_tex, 0));
+  if (i32(id.x) >= out_dims.x || i32(id.y) >= out_dims.y) {
     return;
   }
   let px = vec2i(id.xy);
-  let center = load_world(px, dims);
+  let d_px = select(
+    clamp(vec2i((vec2f(px) + vec2f(0.5)) * vec2f(depth_dims) / vec2f(out_dims)), vec2i(0), depth_dims - vec2i(1)),
+    px,
+    out_dims.x == depth_dims.x && out_dims.y == depth_dims.y,
+  );
+  let center = load_world(d_px, depth_dims);
   if (!center.valid) {
     textureStore(out_shadow_ao, px, vec4f(1.0, 1.0, 1.0, 1.0));
     textureStore(out_reflection, px, vec4f(0.0, 0.0, 0.0, 0.0));
@@ -130,10 +319,10 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
   }
 
   let pos = center.world;
-  let sr = load_world(px + vec2i(1, 0), dims);
-  let sl = load_world(px - vec2i(1, 0), dims);
-  let sd = load_world(px + vec2i(0, 1), dims);
-  let su = load_world(px - vec2i(0, 1), dims);
+  let sr = load_world(d_px + vec2i(1, 0), depth_dims);
+  let sl = load_world(d_px - vec2i(1, 0), depth_dims);
+  let sd = load_world(d_px + vec2i(0, 1), depth_dims);
+  let su = load_world(d_px - vec2i(0, 1), depth_dims);
 
   var dx = vec3f(1.0, 0.0, 0.0);
   var has_dx = true;
@@ -179,11 +368,45 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
     n = -n;
   }
 
+  // Optional slim primary TLAS material lookup: recovers exact smooth vertex normal,
+  // per-object albedo, roughness, and metallic without modifying any user mesh shader!
+  let use_mat_gbuf = (u.extra_counts.w & 1u) != 0u;
+  var mat_albedo = vec3f(1.0);
+  var mat_roughness = clamp(u.sun_color_and_rough.a, 0.04, 1.0);
+  var mat_metallic = 0.0;
+  var has_mat_hit = false;
+  let mask = u.counts.w;
+  if (use_mat_gbuf && cam_dist > 1e-3) {
+    let prim_dir = -view_dir;
+    let t_lo = max(cam_dist * 0.92, 1e-3);
+    let t_hi = cam_dist * 1.08 + 0.05;
+    let ph = trace_tlas(
+      u.camera_pos_and_clear.xyz,
+      prim_dir,
+      t_lo,
+      t_hi,
+      mask,
+      false,
+      u.counts.x,
+      u.counts.y,
+      u.counts.z,
+    );
+    if (ph.hit) {
+      has_mat_hit = true;
+      n = ph.world_normal;
+      if (dot(n, view_dir) < 0.0) {
+        n = -n;
+      }
+      mat_albedo = ph.albedo;
+      mat_roughness = clamp(ph.roughness, 0.04, 1.0);
+      mat_metallic = clamp(ph.metallic, 0.0, 1.0);
+    }
+  }
+
   let min_bias = max(u.bias_and_refl.x, 1e-5);
   let pixel_scale = max(length(dx), length(dy)) * 0.05;
   let bias = max(min_bias, min(pixel_scale, cam_dist * 2e-4));
   let ray_origin = pos + n * bias;
-  let mask = u.counts.w;
   let max_dist = max(u.sky_horizon.a, 1.0);
 
   let sun_raw = u.sun_dir_and_radius.xyz;
@@ -224,7 +447,7 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
       let rnd = hash23(vec3f(vec2f(id.xy) + vec2f(19.1, 7.3), u.samples_seed.w * 17.3 + f32(s) * 11.1));
       let phi = 2.0 * PI * ((f32(s) + rnd.x) / f32(ao_samples));
       let cos_t = sqrt(clamp(1.0 - rnd.y, 0.0, 1.0));
-      let sin_t = sqrt(max(1.0 - cos_t * cos_t, 0.0));
+      let sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
       let d_ray = normalize(n_basis * vec3f(cos(phi) * sin_t, sin(phi) * sin_t, cos_t));
       let h = trace_tlas(ray_origin, d_ray, 1e-4, ao_radius, mask, false, u.counts.x, u.counts.y, u.counts.z);
       if (!h.hit) {
@@ -241,9 +464,9 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
   }
   textureStore(out_shadow_ao, px, vec4f(sun_vis, ao_vis, dist_sum, 1.0));
 
-  // 3. GGX Specular Ray-Traced Reflections.
+  // 3. GGX Specular Ray-Traced Reflections (with per-pixel roughness & Schlick Fresnel when material lookup active).
   let refl_samples = clamp(u32(round(u.bias_and_refl.y)), 0u, 8u);
-  let roughness = clamp(u.sun_color_and_rough.a, 0.0, 1.0);
+  let roughness = select(clamp(u.sun_color_and_rough.a, 0.0, 1.0), mat_roughness, use_mat_gbuf);
   var refl_acc = vec3f(0.0);
   var refl_dist = 0.0;
   var refl_valid = 0.0;
@@ -266,8 +489,11 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
         let hp = ray_origin + r_dir * h.t;
         refl_acc += shade_hit(hp, h, sun_dir, sun_color, bias, mask);
         refl_dist += h.t;
-      } else {
+      } else if (!use_mat_gbuf) {
         refl_acc += eval_sky(r_dir);
+        refl_dist += max_dist;
+      } else {
+        // Forward PBR (`surface_sky`) already supplies sky IBL reflection; add local RT hits only.
         refl_dist += max_dist;
       }
       refl_valid += 1.0;
@@ -276,10 +502,17 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
       refl_acc /= refl_valid;
       refl_dist /= refl_valid;
     }
+    if (use_mat_gbuf) {
+      let f0 = select(vec3f(0.04), mix(vec3f(0.04), mat_albedo, mat_metallic), has_mat_hit);
+      let ndv = clamp(dot(n, view_dir), 0.0, 1.0);
+      let fresnel = f0 + (vec3f(1.0) - f0) * pow(1.0 - ndv, 5.0);
+      let rough_scale = clamp(1.0 - roughness * 0.72, 0.12, 1.0);
+      refl_acc *= fresnel * rough_scale;
+    }
   }
   textureStore(out_reflection, px, vec4f(refl_acc, refl_dist));
 
-  // 4. 1-Bounce Cosine-Weighted Diffuse GI.
+  // 4. 1-Bounce Cosine-Weighted Diffuse GI (skipped when DDGI supplies multi-bounce diffuse in-shader).
   let gi_samples = clamp(u32(round(u.samples_seed.z)), 0u, 8u);
   var gi_acc = vec3f(0.0);
   if (gi_samples > 0u) {
@@ -287,7 +520,7 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
       let rnd = hash23(vec3f(vec2f(id.xy) + vec2f(73.3, 29.9), u.samples_seed.w * 31.7 + f32(s) * 13.3));
       let phi = 2.0 * PI * ((f32(s) + rnd.x) / f32(gi_samples));
       let cos_t = sqrt(clamp(1.0 - rnd.y, 0.0, 1.0));
-      let sin_t = sqrt(max(1.0 - cos_t * cos_t, 0.0));
+      let sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
       let d_ray = normalize(n_basis * vec3f(cos(phi) * sin_t, sin(phi) * sin_t, cos_t));
       let h = trace_tlas(ray_origin, d_ray, 1e-4, max_dist, mask, false, u.counts.x, u.counts.y, u.counts.z);
       if (h.hit) {
@@ -299,6 +532,9 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
     }
     // Cosine-weighted hemisphere PDF = cos(theta)/PI; multiplying by PI cancels 1/PI.
     gi_acc = (gi_acc / f32(gi_samples)) * max(u.bias_and_refl.z, 0.0);
+    if (use_mat_gbuf && has_mat_hit) {
+      gi_acc *= mat_albedo * (1.0 - mat_metallic);
+    }
   }
   textureStore(out_gi, px, vec4f(gi_acc, 1.0));
 }

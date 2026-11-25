@@ -516,7 +516,10 @@ impl State {
         };
         let capture = self.prepare_capture(frame, scratch, samples);
         let oit_pipelines = self.prepare_oit_pipelines(frame, scratch, samples);
-        let tlas_ready = self.prepare_tlas_scene(frame, scratch)?;
+        let tlas_ready = self.prepare_tlas_scene(&mut encoder, frame, scratch)?;
+        if tlas_ready && frame.quality.ddgi {
+            self.encode_ddgi_prepass(&mut encoder, frame)?;
+        }
         self.encode_meshlet_culling(&device, &mut encoder, frame, scratch, &active_proj_for_trails, depth_mode)?;
         let ready = &scratch.ready;
         let drawing = Drawing {
@@ -743,8 +746,10 @@ impl State {
                 depth_mode,
             )?;
         }
-        if tlas_ready && (frame.quality.ray_tracing > 0 || frame.quality.ddgi) {
-            Self::encode_rt_and_ddgi_wired(
+        if tlas_ready && frame.quality.ray_tracing > 0 {
+            let ddgi_buf = self.wired.ddgi_active_this_frame.then_some(self.environment.probe_data_buffer());
+            let vel_view = targets.velocity.as_ref().map(|(v, _)| v);
+            Self::encode_rt_wired(
                 &mut self.wired,
                 &mut self.built_ins,
                 &device,
@@ -755,6 +760,8 @@ impl State {
                 &active_proj_for_trails,
                 &targets.scene,
                 &targets.depth_only,
+                vel_view,
+                ddgi_buf,
                 targets.size,
                 samples,
                 depth_mode,

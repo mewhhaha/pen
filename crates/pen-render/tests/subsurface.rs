@@ -194,9 +194,13 @@ impl Rig {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
         let features = pen_render::optional_features(&adapter);
-        let (device, queue) = pollster::block_on(
-            adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() }),
-        )
+        let limits = pen_render::optional_limits(&adapter);
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: features,
+            required_limits: limits,
+            experimental_features: pen_render::optional_experimental_features(&adapter),
+            ..Default::default()
+        }))
         .ok()?;
         let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("subsurface-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);

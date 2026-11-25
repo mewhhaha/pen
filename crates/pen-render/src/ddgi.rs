@@ -8,9 +8,14 @@
 
 use anyhow::{Result, ensure};
 
-use crate::ray_tracing::{TLAS_TRAVERSAL_WGSL, TlasSceneGpu};
+use crate::ray_tracing::{MAX_RT_LOCAL_LIGHTS, RtLocalLight, TLAS_TRAVERSAL_WGSL, TlasSceneGpu};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::ray_tracing::{TLAS_TRAVERSAL_HW_WGSL, device_supports_hardware_ray_query};
 
 pub const DDGI_WGSL: &str = include_str!("shaders/ddgi.wgsl");
+
+/// Number of `vec4f` header slots reserved at the start of the packed DDGI storage buffer (1 global + 2 cascades * 6).
+pub const DDGI_PACKED_HEADER_VEC4S: u32 = 16;
 
 pub const DDGI_IRRADIANCE_INNER: u32 = 8;
 pub const DDGI_IRRADIANCE_TILE: u32 = 10;
@@ -98,6 +103,15 @@ struct DdgiUniform {
     rot_col2: [f32; 4],
     grid_dims: [u32; 4],
     tlas_counts: [u32; 4],
+    scroll_and_lights: [i32; 4],
+    scroll_delta: [i32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DdgiPackUniform {
+    meta: [u32; 4],
+    strength: [f32; 4],
 }
 
 struct AtlasTex {
@@ -156,11 +170,16 @@ fn encode_copy(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, dst: &
     encoder.copy_buffer_to_buffer(&stage, 0, dst, 0, bytes.len() as u64);
 }
 
-/// GPU 3D DDGI probe volume with octahedral irradiance and Chebyshev visibility atlases.
+/// GPU 3D DDGI probe volume with octahedral irradiance and Chebyshev visibility atlases,
+/// dynamic local-light injection, toroidal camera scrolling, and optional native hardware ray-query tracing.
 pub struct DdgiVolume {
     config: DdgiGridConfig,
     trace_pipe: wgpu::ComputePipeline,
     trace_bgl: wgpu::BindGroupLayout,
+    #[cfg(not(target_arch = "wasm32"))]
+    trace_pipe_hw: Option<wgpu::ComputePipeline>,
+    #[cfg(not(target_arch = "wasm32"))]
+    trace_bgl_hw: Option<wgpu::BindGroupLayout>,
     blend_irr_pipe: wgpu::ComputePipeline,
     blend_vis_pipe: wgpu::ComputePipeline,
     blend_bgl: wgpu::BindGroupLayout,
@@ -169,13 +188,19 @@ pub struct DdgiVolume {
     border_bgl: wgpu::BindGroupLayout,
     eval_pipe: wgpu::ComputePipeline,
     eval_bgl: wgpu::BindGroupLayout,
+    pack_pipe: wgpu::ComputePipeline,
+    pack_bgl: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
+    pack_uniform: wgpu::Buffer,
+    local_lights_buf: wgpu::Buffer,
     ray_buf: wgpu::Buffer,
     sampler: wgpu::Sampler,
     irr_curr: AtlasTex,
     irr_tmp: AtlasTex,
     vis_curr: AtlasTex,
     vis_tmp: AtlasTex,
+    scroll_offset: [i32; 3],
+    pending_scroll_delta: [i32; 3],
     frame_index: u32,
 }
 
@@ -198,6 +223,16 @@ impl DdgiVolume {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
                 min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<DdgiUniform>() as u64),
+            },
+            count: None,
+        };
+        let pack_u_entry = wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<DdgiPackUniform>() as u64),
             },
             count: None,
         };
@@ -260,6 +295,7 @@ impl DdgiVolume {
                 tex_ro(6, true),
                 samp_entry(7),
                 storage_rw(8),
+                storage_ro(9),
             ],
         });
         let blend_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -274,13 +310,21 @@ impl DdgiVolume {
             label: Some("ddgi_eval_bgl"),
             entries: &[u_entry, tex_ro(1, true), tex_ro(2, true), samp_entry(3), storage_ro(4), storage_rw(5)],
         });
+        let pack_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ddgi_pack_bgl"),
+            entries: &[u_entry, pack_u_entry, tex_ro(2, false), tex_ro(3, false), storage_rw(4)],
+        });
 
-        let source = format!("{TLAS_TRAVERSAL_WGSL}\n{DDGI_WGSL}");
+        let sw_body = DDGI_WGSL.replace(
+            "// __TLAS_BINDING_1__",
+            "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;",
+        );
+        let source = format!("{TLAS_TRAVERSAL_WGSL}\n{sw_body}");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ddgi_wgsl"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
-        let make_pipe = |label: &str, bgl: &wgpu::BindGroupLayout, entry: &str| {
+        let make_pipe = |label: &str, m: &wgpu::ShaderModule, bgl: &wgpu::BindGroupLayout, entry: &str| {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
                 bind_group_layouts: &[Some(bgl)],
@@ -289,24 +333,74 @@ impl DdgiVolume {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pl),
-                module: &module,
+                module: m,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
                 cache: None,
             })
         };
 
-        let trace_pipe = make_pipe("ddgi_trace", &trace_bgl, "ddgi_trace_probes");
-        let blend_irr_pipe = make_pipe("ddgi_blend_irr", &blend_bgl, "ddgi_blend_irradiance");
-        let blend_vis_pipe = make_pipe("ddgi_blend_vis", &blend_bgl, "ddgi_blend_visibility");
-        let border_irr_pipe = make_pipe("ddgi_border_irr", &border_bgl, "ddgi_border_irradiance");
-        let border_vis_pipe = make_pipe("ddgi_border_vis", &border_bgl, "ddgi_border_visibility");
-        let eval_pipe = make_pipe("ddgi_eval", &eval_bgl, "ddgi_eval_points");
+        let trace_pipe = make_pipe("ddgi_trace", &module, &trace_bgl, "ddgi_trace_probes");
+        let blend_irr_pipe = make_pipe("ddgi_blend_irr", &module, &blend_bgl, "ddgi_blend_irradiance");
+        let blend_vis_pipe = make_pipe("ddgi_blend_vis", &module, &blend_bgl, "ddgi_blend_visibility");
+        let border_irr_pipe = make_pipe("ddgi_border_irr", &module, &border_bgl, "ddgi_border_irradiance");
+        let border_vis_pipe = make_pipe("ddgi_border_vis", &module, &border_bgl, "ddgi_border_visibility");
+        let eval_pipe = make_pipe("ddgi_eval", &module, &eval_bgl, "ddgi_eval_points");
+        let pack_pipe = make_pipe("ddgi_pack", &module, &pack_bgl, "ddgi_pack_cascade");
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let (trace_pipe_hw, trace_bgl_hw) = if device_supports_hardware_ray_query(device) {
+            let bgl_hw = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ddgi_trace_bgl_hw"),
+                entries: &[
+                    u_entry,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::AccelerationStructure { vertex_return: false },
+                        count: None,
+                    },
+                    storage_ro(2),
+                    storage_ro(3),
+                    storage_ro(4),
+                    tex_ro(5, true),
+                    tex_ro(6, true),
+                    samp_entry(7),
+                    storage_rw(8),
+                    storage_ro(9),
+                ],
+            });
+            let hw_body = DDGI_WGSL.replace(
+                "// __TLAS_BINDING_1__",
+                "@group(0) @binding(1) var hw_tlas: acceleration_structure;",
+            );
+            let hw_src = format!("{TLAS_TRAVERSAL_HW_WGSL}\n{hw_body}");
+            let hw_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("ddgi_wgsl_hw"),
+                source: wgpu::ShaderSource::Wgsl(hw_src.into()),
+            });
+            let p_hw = make_pipe("ddgi_trace_hw", &hw_mod, &bgl_hw, "ddgi_trace_probes");
+            (Some(p_hw), Some(bgl_hw))
+        } else {
+            (None, None)
+        };
 
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ddgi_u"),
             size: std::mem::size_of::<DdgiUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let pack_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ddgi_pack_u"),
+            size: std::mem::size_of::<DdgiPackUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let local_lights_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ddgi_local_lights"),
+            size: (MAX_RT_LOCAL_LIGHTS * std::mem::size_of::<RtLocalLight>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let total_rays = u64::from(nx) * u64::from(ny) * u64::from(nz) * u64::from(config.rays_per_probe);
@@ -330,6 +424,10 @@ impl DdgiVolume {
             config,
             trace_pipe,
             trace_bgl,
+            #[cfg(not(target_arch = "wasm32"))]
+            trace_pipe_hw,
+            #[cfg(not(target_arch = "wasm32"))]
+            trace_bgl_hw,
             blend_irr_pipe,
             blend_vis_pipe,
             blend_bgl,
@@ -338,19 +436,70 @@ impl DdgiVolume {
             border_bgl,
             eval_pipe,
             eval_bgl,
+            pack_pipe,
+            pack_bgl,
             uniform,
+            pack_uniform,
+            local_lights_buf,
             ray_buf,
             sampler,
             irr_curr: AtlasTex::new(device, "ddgi_irr_curr", irr_w, irr_h),
             irr_tmp: AtlasTex::new(device, "ddgi_irr_tmp", irr_w, irr_h),
             vis_curr: AtlasTex::new(device, "ddgi_vis_curr", vis_w, vis_h),
             vis_tmp: AtlasTex::new(device, "ddgi_vis_tmp", vis_w, vis_h),
+            scroll_offset: [0; 3],
+            pending_scroll_delta: [0; 3],
             frame_index: 0,
         })
     }
 
     pub fn config(&self) -> DdgiGridConfig {
         self.config
+    }
+
+    pub fn scroll_offset(&self) -> [i32; 3] {
+        self.scroll_offset
+    }
+
+    pub fn uses_hardware_ray_query(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.trace_pipe_hw.is_some()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+
+    /// Toroidally scrolls the probe grid so its center tracks `target_center` in discrete cell steps,
+    /// preserving temporal history for all probes that remain inside the volume and resetting only
+    /// newly entered boundary slices.
+    pub fn scroll_to_center(&mut self, target_center: [f32; 3]) {
+        for (axis, &tc) in target_center.iter().enumerate() {
+            let sp = self.config.spacing[axis].max(1e-3);
+            let half_ext = 0.5 * (self.config.dims[axis].saturating_sub(1) as f32) * sp;
+            let curr_center = self.config.origin[axis] + half_ext;
+            let steps = ((tc - curr_center) / sp).round() as i32;
+            if steps != 0 {
+                self.config.origin[axis] += steps as f32 * sp;
+                self.scroll_offset[axis] = self.scroll_offset[axis].wrapping_add(steps);
+                self.pending_scroll_delta[axis] = self.pending_scroll_delta[axis].saturating_add(steps);
+            }
+        }
+    }
+
+    /// Number of `vec4f` texel entries this cascade occupies in a flat packed DDGI storage buffer
+    /// (irradiance `10x10` + paired visibility `18x18 / 2` per probe).
+    pub fn packed_data_vec4_counts(&self) -> (u32, u32) {
+        let [nx, ny, nz] = self.config.dims;
+        let irr_w = nx * nz * DDGI_IRRADIANCE_TILE;
+        let irr_h = ny * DDGI_IRRADIANCE_TILE;
+        let vis_w = nx * nz * DDGI_VISIBILITY_TILE;
+        let vis_h = ny * DDGI_VISIBILITY_TILE;
+        let irr_vec4s = irr_w * irr_h;
+        let vis_vec4s = (vis_w * vis_h).div_ceil(2);
+        (irr_vec4s, vis_vec4s)
     }
 
     pub fn irradiance_view(&self) -> &wgpu::TextureView {
@@ -379,6 +528,7 @@ impl DdgiVolume {
 
     pub fn reset(&mut self) {
         self.frame_index = 0;
+        self.pending_scroll_delta = [0; 3];
     }
 
     /// Traces rotated Spherical Fibonacci rays per probe, updates irradiance and Chebyshev
@@ -390,9 +540,28 @@ impl DdgiVolume {
         scene: &TlasSceneGpu,
         params: &DdgiFrameParams,
     ) {
+        self.update_with_lights(device, encoder, scene, params, &[]);
+    }
+
+    /// Same as [`DdgiVolume::update`], additionally injecting dynamic point, spot, and area
+    /// lights into secondary bounce hit shading.
+    pub fn update_with_lights(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &TlasSceneGpu,
+        params: &DdgiFrameParams,
+        local_lights: &[RtLocalLight],
+    ) {
         if params.reset_history {
             self.frame_index = 0;
         }
+        let light_count = local_lights.len().min(MAX_RT_LOCAL_LIGHTS);
+        if light_count > 0 {
+            encode_copy(device, encoder, &self.local_lights_buf, bytemuck::cast_slice(&local_lights[..light_count]));
+        }
+        let scroll_delta = self.pending_scroll_delta;
+        self.pending_scroll_delta = [0; 3];
         let rot = frame_rotation_matrix(self.frame_index);
         let h = if self.frame_index == 0 { 0.0 } else { self.config.hysteresis.clamp(0.0, 0.99) };
         let u = DdgiUniform {
@@ -437,29 +606,66 @@ impl DdgiVolume {
                 scene.blas_tri_count,
                 params.visibility_mask,
             ],
+            scroll_and_lights: [
+                self.scroll_offset[0],
+                self.scroll_offset[1],
+                self.scroll_offset[2],
+                i32::try_from(light_count).unwrap_or(0),
+            ],
+            scroll_delta: [scroll_delta[0], scroll_delta[1], scroll_delta[2], 0],
         };
         encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u));
 
         let [nx, ny, nz] = self.config.dims;
         let total_rays = nx * ny * nz * self.config.rays_per_probe;
 
-        // 1. Trace probe rays.
-        let trace_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ddgi_trace_bg"),
-            layout: &self.trace_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: scene.tlas_nodes_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: scene.tlas_instances_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: scene.blas_nodes_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: scene.blas_tris_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.irr_curr.view) },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.vis_curr.view) },
-                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 8, resource: self.ray_buf.as_entire_binding() },
-            ],
-        });
-        {
+        // 1. Trace probe rays (hardware ray-query on native RT GPUs when available, else portable compute BVH).
+        #[allow(unused_mut)]
+        let mut dispatched_hw = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let (Some(pipe_hw), Some(bgl_hw), Some(hw_tlas)) = (&self.trace_pipe_hw, &self.trace_bgl_hw, &scene.hw_tlas) {
+            let trace_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ddgi_trace_bg_hw"),
+                layout: bgl_hw,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: hw_tlas.as_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: scene.tlas_instances_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: scene.blas_nodes_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: scene.blas_tris_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.irr_curr.view) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.vis_curr.view) },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 8, resource: self.ray_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
+                ],
+            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ddgi_trace_hw"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipe_hw);
+            pass.set_bind_group(0, &trace_bg, &[]);
+            pass.dispatch_workgroups(total_rays.div_ceil(64), 1, 1);
+            dispatched_hw = true;
+        }
+        if !dispatched_hw {
+            let trace_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("ddgi_trace_bg"),
+                layout: &self.trace_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: scene.tlas_nodes_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: scene.tlas_instances_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: scene.blas_nodes_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: scene.blas_tris_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&self.irr_curr.view) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.vis_curr.view) },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 8, resource: self.ray_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
+                ],
+            });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ddgi_trace"),
                 timestamp_writes: None,
@@ -529,6 +735,48 @@ impl DdgiVolume {
         }
 
         self.frame_index = self.frame_index.saturating_add(1);
+    }
+
+    /// Packs this cascade's metadata, irradiance atlas, and visibility atlas into a flat `array<vec4f>`
+    /// storage buffer so forward PBR materials (`environment.wgsl`) and RT reflections can sample DDGI
+    /// directly without consuming any extra sampled-texture slots.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_cascade(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        dst_buf: &wgpu::Buffer,
+        cascade_idx: u32,
+        cascade_count: u32,
+        irr_offset_vec4s: u32,
+        vis_offset_vec4s: u32,
+        strength: f32,
+    ) {
+        let pu = DdgiPackUniform {
+            meta: [cascade_idx, cascade_count, irr_offset_vec4s, vis_offset_vec4s],
+            strength: [strength.max(0.0), 0.0, 0.0, 0.0],
+        };
+        encode_copy(device, encoder, &self.pack_uniform, bytemuck::bytes_of(&pu));
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ddgi_pack_bg"),
+            layout: &self.pack_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.pack_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.irr_curr.view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.vis_curr.view) },
+                wgpu::BindGroupEntry { binding: 4, resource: dst_buf.as_entire_binding() },
+            ],
+        });
+        let (irr_v4, vis_v4) = self.packed_data_vec4_counts();
+        let work = irr_v4.max(vis_v4).max(1);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("ddgi_pack_cascade"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pack_pipe);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(work.div_ceil(64), 1, 1);
     }
 
     /// Evaluates indirect diffuse irradiance on the GPU at a batch of world-space points.
@@ -621,27 +869,33 @@ mod tests {
     fn gpu_ddgi_cornell_color_bleeding_and_chebyshev_thin_wall_leak_suppression() {
         let (device, queue) = crate::testing::device().expect("GPU adapter required");
 
-        // Two-chamber scene divided by an opaque vertical wall at x = 0:
+        // Two-chamber scene divided by an opaque vertical wall at x = 0 (all outer walls face INWARD):
         // Left chamber (x in [-4, 0], y in [0, 4], z in [-4, 4]):
-        //   - Bright emissive red wall at x = -4
+        //   - Bright emissive red wall at x = -4 (normal +X)
         //   - Closed white floor/ceiling/back/front
         // Right chamber (x in [0, 4], y in [0, 4], z in [-4, 4]):
         //   - Completely dark closed box separated by thin dividing wall at x = 0!
         let blases = vec![
-            // 0: Floor y = 0, x in [-4, 4], z in [-4, 4]
-            quad_blas([-4.0, 0.0, -4.0], [4.0, 0.0, -4.0], [4.0, 0.0, 4.0], [-4.0, 0.0, 4.0]),
-            // 1: Ceiling y = 4
-            quad_blas([-4.0, 4.0, -4.0], [-4.0, 4.0, 4.0], [4.0, 4.0, 4.0], [4.0, 4.0, -4.0]),
-            // 2: Left emissive RED wall x = -4
-            quad_blas([-4.0, 0.0, -4.0], [-4.0, 0.0, 4.0], [-4.0, 4.0, 4.0], [-4.0, 4.0, -4.0]),
-            // 3: Dividing opaque wall at x = 0 (separating lit red room from dark room!)
-            quad_blas([0.0, 0.0, -4.0], [0.0, 0.0, 4.0], [0.0, 4.0, 4.0], [0.0, 4.0, -4.0]),
-            // 4: Right dark wall x = 4
-            quad_blas([4.0, 0.0, -4.0], [4.0, 4.0, -4.0], [4.0, 4.0, 4.0], [4.0, 0.0, 4.0]),
-            // 5: Back wall z = -4
-            quad_blas([-4.0, 0.0, -4.0], [-4.0, 4.0, -4.0], [4.0, 4.0, -4.0], [4.0, 0.0, -4.0]),
-            // 6: Front wall z = 4
-            quad_blas([-4.0, 0.0, 4.0], [4.0, 0.0, 4.0], [4.0, 4.0, 4.0], [-4.0, 4.0, 4.0]),
+            // 0: Floor y = 0, normal +Y
+            quad_blas([-4.0, 0.0, -4.0], [-4.0, 0.0, 4.0], [4.0, 0.0, 4.0], [4.0, 0.0, -4.0]),
+            // 1: Ceiling y = 4, normal -Y
+            quad_blas([-4.0, 4.0, -4.0], [4.0, 4.0, -4.0], [4.0, 4.0, 4.0], [-4.0, 4.0, 4.0]),
+            // 2: Left emissive RED wall x = -4, normal +X
+            quad_blas([-4.0, 0.0, -4.0], [-4.0, 4.0, -4.0], [-4.0, 4.0, 4.0], [-4.0, 0.0, 4.0]),
+            // 3: Dividing opaque wall at x = 0 (two opposing faces so both chambers hit front faces)
+            Blas::build(&[
+                BlasTriangle::flat([-0.02, 0.0, -4.0], [-0.02, 0.0, 4.0], [-0.02, 4.0, 4.0]),
+                BlasTriangle::flat([-0.02, 0.0, -4.0], [-0.02, 4.0, 4.0], [-0.02, 4.0, -4.0]),
+                BlasTriangle::flat([0.02, 0.0, -4.0], [0.02, 4.0, -4.0], [0.02, 4.0, 4.0]),
+                BlasTriangle::flat([0.02, 0.0, -4.0], [0.02, 4.0, 4.0], [0.02, 0.0, 4.0]),
+            ])
+            .unwrap(),
+            // 4: Right dark wall x = 4, normal -X
+            quad_blas([4.0, 0.0, -4.0], [4.0, 0.0, 4.0], [4.0, 4.0, 4.0], [4.0, 4.0, -4.0]),
+            // 5: Back wall z = -4, normal +Z
+            quad_blas([-4.0, 0.0, -4.0], [4.0, 0.0, -4.0], [4.0, 4.0, -4.0], [-4.0, 4.0, -4.0]),
+            // 6: Front wall z = 4, normal -Z
+            quad_blas([-4.0, 0.0, 4.0], [-4.0, 4.0, 4.0], [4.0, 4.0, 4.0], [4.0, 0.0, 4.0]),
         ];
         let mut red_wall = TlasInstance::new(2, ID);
         red_wall.albedo = [0.9, 0.05, 0.05];
@@ -726,6 +980,134 @@ mod tests {
         assert!(
             dark_room[0] < lit_room[0] * 0.15,
             "Chebyshev visibility must suppress red light leaking across the dividing wall: lit={lit_room:?}, dark={dark_room:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_ddgi_local_light_bounce_toroidal_scroll_and_inside_solid_classification() {
+        let (device, queue) = crate::testing::device_with_optional().expect("GPU adapter required");
+        use crate::ray_tracing::GpuBlasPool;
+
+        // Open-ceiling white room with a bright green local point light (zero sun, zero emissive geometry!)
+        // PLUS a closed solid box surrounding probe (x=2, y=1, z=0) to verify backface inside-solid classification.
+        let floor_tris = [
+            BlasTriangle::flat([-8.0, 0.0, -8.0], [-8.0, 0.0, 8.0], [8.0, 0.0, 8.0]),
+            BlasTriangle::flat([-8.0, 0.0, -8.0], [8.0, 0.0, 8.0], [8.0, 0.0, -8.0]),
+        ];
+        // Closed solid cube centered at origin with outward normals (half-extent 0.75).
+        let s = 0.75f32;
+        let cube_tris = [
+            // +X
+            BlasTriangle::flat([s, -s, -s], [s, s, -s], [s, s, s]),
+            BlasTriangle::flat([s, -s, -s], [s, s, s], [s, -s, s]),
+            // -X
+            BlasTriangle::flat([-s, -s, s], [-s, s, s], [-s, s, -s]),
+            BlasTriangle::flat([-s, -s, s], [-s, s, -s], [-s, -s, -s]),
+            // +Y
+            BlasTriangle::flat([-s, s, -s], [-s, s, s], [s, s, s]),
+            BlasTriangle::flat([-s, s, -s], [s, s, s], [s, s, -s]),
+            // -Y
+            BlasTriangle::flat([-s, -s, s], [-s, -s, -s], [s, -s, -s]),
+            BlasTriangle::flat([-s, -s, s], [s, -s, -s], [s, -s, s]),
+            // +Z
+            BlasTriangle::flat([-s, -s, s], [s, -s, s], [s, s, s]),
+            BlasTriangle::flat([-s, -s, s], [s, s, s], [-s, s, s]),
+            // -Z
+            BlasTriangle::flat([s, -s, -s], [-s, -s, -s], [-s, s, -s]),
+            BlasTriangle::flat([s, -s, -s], [-s, s, -s], [s, s, -s]),
+        ];
+
+        let mut pool = GpuBlasPool::new(&device);
+        let mut enc0 = device.create_command_encoder(&Default::default());
+        let bi_floor = pool.ensure_blas(&device, &mut enc0, 1, &floor_tris).unwrap().unwrap();
+        let bi_cube = pool.ensure_blas(&device, &mut enc0, 2, &cube_tris).unwrap().unwrap();
+        let mut floor_inst = TlasInstance::new(bi_floor, ID);
+        floor_inst.albedo = [0.9, 0.9, 0.9];
+        // Solid cube centered right on probe (2.0, 1.0, 0.0).
+        let cube_xform = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 2.0, 1.0, 0.0, 1.0];
+        let mut cube_inst = TlasInstance::new(bi_cube, cube_xform);
+        cube_inst.albedo = [0.1, 0.1, 0.1];
+        pool.update_tlas(&device, &mut enc0, &[floor_inst, cube_inst]).unwrap();
+        queue.submit(Some(enc0.finish()));
+        let scene_gpu = pool.snapshot_scene();
+
+        let cfg = DdgiGridConfig {
+            origin: [-2.0, 1.0, -2.0],
+            spacing: [2.0, 2.0, 2.0],
+            dims: [4, 2, 3],
+            rays_per_probe: 128,
+            hysteresis: 0.7,
+            max_ray_distance: 20.0,
+            ..Default::default()
+        };
+        let mut ddgi = DdgiVolume::new(&device, cfg).unwrap();
+        let frame_params = DdgiFrameParams {
+            sun_direction: [0.0, 1.0, 0.0],
+            sun_color: [0.0, 0.0, 0.0],
+            sky_zenith: [0.0, 0.0, 0.0],
+            sky_horizon: [0.0, 0.0, 0.0],
+            visibility_mask: u32::MAX,
+            reset_history: false,
+        };
+        // Green point light hovering above the white floor at (0, 2, 0).
+        let green_point = RtLocalLight {
+            position_range: [0.0, 2.0, 0.0, 12.0],
+            color_outer_cos: [0.0, 24.0, 0.0, -1.0],
+            direction_inner_cos: [0.0, -1.0, 0.0, -1.0],
+        };
+
+        for _ in 0..4 {
+            let mut enc = device.create_command_encoder(&Default::default());
+            ddgi.update_with_lights(&device, &mut enc, &scene_gpu, &frame_params, &[green_point]);
+            queue.submit(Some(enc.finish()));
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+
+        // Query a downward-facing ceiling surface above the floor: receives bounced green light from the floor!
+        let bounce = ddgi
+            .evaluate_points(
+                &device,
+                &queue,
+                &[DdgiQueryPoint {
+                    pos: [0.0, 2.5, 0.0, 0.0],
+                    normal: [0.0, -1.0, 0.0, 0.0],
+                    view: [0.0, -1.0, 0.0, 0.0],
+                }],
+            )
+            .unwrap()[0];
+        assert!(
+            bounce[1] > 0.2 && bounce[1] > bounce[0] * 3.0 && bounce[1] > bounce[2] * 3.0,
+            "local point light must inject colored indirect bounce into DDGI (hw_rt={}): {bounce:?}",
+            ddgi.uses_hardware_ray_query()
+        );
+
+        // Toroidally scroll the probe volume by +2m on X without recreating the volume!
+        let prev_origin = ddgi.config().origin;
+        ddgi.scroll_to_center([prev_origin[0] + 5.0, prev_origin[1] + 1.0, prev_origin[2] + 2.0]);
+        assert!(
+            ddgi.scroll_offset()[0] > 0 && ddgi.config().origin[0] > prev_origin[0],
+            "toroidal scroll must advance origin and scroll_offset in discrete steps"
+        );
+        for _ in 0..3 {
+            let mut enc = device.create_command_encoder(&Default::default());
+            ddgi.update_with_lights(&device, &mut enc, &scene_gpu, &frame_params, &[green_point]);
+            queue.submit(Some(enc.finish()));
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        let scrolled_bounce = ddgi
+            .evaluate_points(
+                &device,
+                &queue,
+                &[DdgiQueryPoint {
+                    pos: [1.0, 2.5, 0.0, 0.0],
+                    normal: [0.0, -1.0, 0.0, 0.0],
+                    view: [0.0, -1.0, 0.0, 0.0],
+                }],
+            )
+            .unwrap()[0];
+        assert!(
+            scrolled_bounce[1] > 0.15 && scrolled_bounce[1] > scrolled_bounce[0] * 2.5,
+            "toroidally scrolled DDGI volume must maintain accurate green bounce irradiance: {scrolled_bounce:?}"
         );
     }
 }

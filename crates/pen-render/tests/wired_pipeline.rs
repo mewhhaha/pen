@@ -901,20 +901,25 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
     });
     std::fs::write(dir.join("quad.mesh.json"), serde_json::to_vec(&quad).unwrap()).unwrap();
     std::fs::write(dir.join("simple.wgsl"), SIMPLE_SHADER).unwrap();
+    std::fs::write(dir.join("lit.wgsl"), STOCK_LIT_SHADER).unwrap();
     write_solid_png(&dir.join("white.png"), [255, 255, 255, 255]);
 
     // Materials:
-    // 0: opaque white lit (receiver)
+    // 0: opaque white lit (receiver, simple.wgsl)
     // 1: translucent red (alpha 0.5)
     // 2: translucent blue (alpha 0.6)
     // 3: unlit emissive red wall (for RT GI/reflection & DDGI color bleeding)
-    // 4: opaque dark receiver / blocker
+    // 4: opaque dark receiver / blocker (simple.wgsl)
+    // 5: stock PBR lit white receiver (lit.wgsl — samples packed in-shader DDGI!)
+    // 6: stock PBR lit dark charcoal receiver (lit.wgsl — verifies albedo-modulated DDGI!)
     let mats = [
         ("white.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.85, 0.85, 0.85, 1.0], "lighting": "lit" })),
         ("red_trans.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.95, 0.08, 0.05, 0.5], "blend": true, "lighting": "unlit" })),
         ("blue_trans.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.05, 0.15, 0.95, 0.6], "blend": true, "lighting": "unlit" })),
         ("emissive_red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [1.0, 0.0, 0.0, 1.0], "lighting": "unlit", "surface": { "emissiveStrength": 6.0 } })),
         ("blocker.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.06, 0.06, 0.06, 1.0], "lighting": "lit" })),
+        ("lit_white.mat.json", json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.85, 0.85, 0.85, 1.0], "lighting": "lit", "instanceParameters": [0.0, 0.85, 0.0, 0.0] })),
+        ("lit_dark.mat.json", json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.04, 0.04, 0.04, 1.0], "lighting": "lit", "instanceParameters": [0.0, 0.85, 0.0, 0.0] })),
     ];
     for (name, val) in &mats {
         std::fs::write(dir.join(name), val.to_string()).unwrap();
@@ -1016,14 +1021,29 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
         "quality.ray_tracing=2 must inject colored RT reflection + 1-bounce GI from emissive wall: rt1={px_dark_rt1:?}, rt2={px_rt2:?}"
     );
 
-    // 3) Dynamic Diffuse GI (`quality.ddgi = true`) bleeds colored indirect light onto a dark receiver!
+    // 3) Dynamic Diffuse GI (`quality.ddgi = true`) evaluates inside forward PBR (`lit.wgsl` via packed
+    //    `probe_data` at group 0 binding 8) with proper albedo modulation — bright diffuse receiver bleeds
+    //    vivid red from the front-facing emissive wall while a dark charcoal receiver stays dark!
+    let facing_emissive = Draw {
+        mesh: 0,
+        material: 3,
+        transform: [
+            -4.0, 0.0, 0.0, 0.0,
+            0.0, 4.0, 0.0, 0.0,
+            0.0, 0.0, -1.0, 0.0,
+            0.0, 0.0, 1.0, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    };
     let mut ddgi_off = common::frame(vec![
-        Draw { mesh: 0, material: 4, transform: scale_at(4.0, -2.0), parameters: None, extra: None },
-        emissive_panel,
+        Draw { mesh: 0, material: 5, transform: scale_at(4.0, -2.0), parameters: None, extra: None },
+        facing_emissive.clone(),
     ]);
     ddgi_off.projection = proj;
     ddgi_off.light_direction = Vector { x: 0.0, y: -1.0, z: 0.0 };
     ddgi_off.light_color = Vector { x: 0.0, y: 0.0, z: 0.0 };
+    ddgi_off.ambient = Vector { x: 0.0, y: 0.0, z: 0.0 };
     ddgi_off.sky = Default::default();
     ddgi_off.quality.sky = false;
     ddgi_off.probe_volume = pen_protocol::ProbeVolume {
@@ -1035,7 +1055,7 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
         origin: Vector { x: -1.5, y: -1.5, z: -2.0 },
     };
     ddgi_off.quality.ddgi = false;
-    renderer.submit(&ddgi_off, &catalog, &mut target).unwrap();
+    wait_ready(&mut renderer, &ddgi_off, &catalog, &mut target);
     let px_no_ddgi = common::middle(&device, &queue, &target.0);
 
     let mut ddgi_on = ddgi_off.clone();
@@ -1045,8 +1065,28 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
     }
     let px_ddgi = common::middle(&device, &queue, &target.0);
     assert!(
-        px_ddgi[0] > px_no_ddgi[0].saturating_add(25) && px_ddgi[0] > px_ddgi[2].saturating_add(20),
-        "quality.ddgi=true must illuminate receiver with red indirect diffuse color bleed: off={px_no_ddgi:?}, on={px_ddgi:?}"
+        px_ddgi[0] > px_no_ddgi[0].saturating_add(40) && px_ddgi[0] > px_ddgi[2].saturating_add(30),
+        "quality.ddgi=true must illuminate lit PBR receiver with red indirect color bleed: off={px_no_ddgi:?}, on={px_ddgi:?}"
+    );
+
+    // Same DDGI field on dark charcoal albedo [0.04]: proves PBR albedo modulation (no additive washout!).
+    let mut ddgi_dark = ddgi_on.clone();
+    ddgi_dark.draws[0].material = 6;
+    wait_ready(&mut renderer, &ddgi_dark, &catalog, &mut target);
+    let px_dark_ddgi = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_dark_ddgi[0] * 2 < px_ddgi[0],
+        "in-shader PBR DDGI must modulate indirect light by surface albedo (no additive washout on dark material): white={px_ddgi:?}, dark={px_dark_ddgi:?}"
+    );
+
+    // Combined RT2 + DDGI: exercises half-res/full-res RT reflections sampling live packed DDGI with zero redundant RT GI.
+    let mut combined = ddgi_on.clone();
+    combined.quality.ray_tracing = 2;
+    renderer.submit(&combined, &catalog, &mut target).unwrap();
+    let px_combined = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_combined[0] > px_combined[2].saturating_add(30),
+        "combined RT2 + DDGI must render cleanly with vivid indirect illumination: {px_combined:?}"
     );
 
     // 4) Temporal Upscaling (`quality.upscale = true`, `scale = 0.5`) accumulates into full-res TAA history + RCAS!

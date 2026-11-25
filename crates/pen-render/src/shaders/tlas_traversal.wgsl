@@ -38,6 +38,7 @@ struct TlasInstance {
 
 struct TlasHit {
   hit: bool,
+  front_face: bool,
   t: f32,
   world_normal: vec3f,
   albedo: vec3f,
@@ -169,7 +170,7 @@ fn trace_tlas(
   tlas_inst_count: u32,
   blas_tri_total: u32,
 ) -> TlasHit {
-  var best = TlasHit(false, t_max, vec3f(0.0, 1.0, 0.0), vec3f(0.0), 0.5, vec3f(0.0), 0.0, 0u);
+  var best = TlasHit(false, true, t_max, vec3f(0.0, 1.0, 0.0), vec3f(0.0), 0.5, vec3f(0.0), 0.0, 0u);
   if (tlas_node_count == 0u || tlas_inst_count == 0u || blas_tri_total == 0u) {
     return best;
   }
@@ -240,9 +241,11 @@ fn trace_tlas(
                 var wn = nm * local_n;
                 let nlen2 = dot(wn, wn);
                 wn = select(vec3f(0.0, 1.0, 0.0), wn * inverseSqrt(nlen2), nlen2 > 1e-12);
-                if (dot(wn, dir) > 0.0) {
+                let is_front = dot(wn, dir) <= 0.0;
+                if (!is_front) {
                   wn = -wn;
                 }
+                best.front_face = is_front;
                 best.world_normal = wn;
                 best.albedo = inst.albedo_roughness.rgb;
                 best.roughness = inst.albedo_roughness.a;

@@ -21,7 +21,7 @@ use crate::atmosphere_lut::{
 };
 use crate::built_in::{BuiltIn, BuiltIns};
 use crate::camera_precision::DepthMode;
-use crate::ddgi::{DDGI_WGSL, DdgiFrameParams, DdgiGridConfig, DdgiVolume};
+use crate::ddgi::{DDGI_PACKED_HEADER_VEC4S, DdgiFrameParams, DdgiGridConfig, DdgiVolume};
 use crate::decals::{PbrDecal, PbrDecalPass, PbrDecalView};
 use crate::environment_passes::{
     FoliageInstance, FoliagePipeline, FoliageUniform, PipelineTarget, TerrainHeightmap, TerrainPatch, TerrainPipeline,
@@ -33,7 +33,9 @@ use crate::meshlets::{MeshletBatchEntry, MeshletCullParams, MeshletCuller, Meshl
 use crate::oit::OitPass;
 use crate::post::{PhysicalSkyBinding, SCENE_FORMAT};
 use crate::post_fx::{PostFxParams, PostFxPass, RcasSharpener};
-use crate::ray_tracing::{Blas, TLAS_TRAVERSAL_WGSL, TlasInstance, TlasRayTraceParams, TlasRayTracer, TlasScene, TlasSceneGpu};
+use crate::ray_tracing::{
+    GpuBlasPool, MAX_RT_LOCAL_LIGHTS, RtLocalLight, TlasInstance, TlasRayTraceParams, TlasRayTracer, TlasSceneGpu,
+};
 use crate::render_targets::{ColorTransfer, OffscreenRenderTarget, SplitScreenCompositor, ViewportRect};
 use crate::shader::{self, Stage};
 use crate::svgf::{SvgfDenoiser, SvgfInputs, SvgfParams};
@@ -108,9 +110,9 @@ pub(super) struct SplitViewSlot {
 const RT_COMPOSITE_WGSL: &str = r#"
 struct RtCompUniform {
   depth_clear: f32,
-  _p0: f32,
-  _p1: f32,
-  _p2: f32,
+  refl_weight: f32,
+  gi_weight: f32,
+  shadow_floor: f32,
 };
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
 @group(0) @binding(1) var shadow_ao_tex: texture_2d<f32>;
@@ -129,9 +131,33 @@ struct RtCompUniform {
   if (abs(d - cfg.depth_clear) <= 0.00001) {
     return vec4f(1.0, 1.0, 1.0, 1.0);
   }
-  let sao = textureLoad(shadow_ao_tex, p, 0);
-  let shadow = mix(0.25, 1.0, clamp(sao.r, 0.0, 1.0));
-  let ao = mix(0.35, 1.0, clamp(sao.g, 0.0, 1.0));
+  let rt_dims = vec2i(textureDimensions(shadow_ao_tex, 0));
+  var sao: vec4f;
+  if (rt_dims.x == dims.x && rt_dims.y == dims.y) {
+    sao = textureLoad(shadow_ao_tex, p, 0);
+  } else {
+    let f_coord = (vec2f(p) + vec2f(0.5)) * vec2f(rt_dims) / vec2f(dims) - vec2f(0.5);
+    let base_h = vec2i(floor(f_coord));
+    let frac = clamp(f_coord - vec2f(base_h), vec2f(0.0), vec2f(1.0));
+    var sum = vec4f(0.0);
+    var w_sum = 0.0;
+    for (var oy = 0; oy < 2; oy++) {
+      for (var ox = 0; ox < 2; ox++) {
+        let hp = clamp(base_h + vec2i(ox, oy), vec2i(0), rt_dims - vec2i(1));
+        let fp = clamp(vec2i((vec2f(hp) + vec2f(0.5)) * vec2f(dims) / vec2f(rt_dims)), vec2i(0), dims - vec2i(1));
+        let dh = textureLoad(depth_tex, fp, 0).r;
+        let bw = select(1.0 - frac.x, frac.x, ox == 1) * select(1.0 - frac.y, frac.y, oy == 1);
+        let dz = abs(d - dh);
+        let dw = 1.0 / (1.0 + dz * 400.0);
+        let w = bw * dw + 1e-5;
+        sum += textureLoad(shadow_ao_tex, hp, 0) * w;
+        w_sum += w;
+      }
+    }
+    sao = sum / max(w_sum, 1e-5);
+  }
+  let shadow = mix(cfg.shadow_floor, 1.0, clamp(sao.r, 0.0, 1.0));
+  let ao = mix(0.58, 1.0, clamp(sao.g, 0.0, 1.0));
   let atten = shadow * ao;
   return vec4f(atten, atten, atten, 1.0);
 }
@@ -140,9 +166,9 @@ struct RtCompUniform {
 const RT_BOUNCE_WGSL: &str = r#"
 struct RtCompUniform {
   depth_clear: f32,
-  _p0: f32,
-  _p1: f32,
-  _p2: f32,
+  refl_weight: f32,
+  gi_weight: f32,
+  shadow_floor: f32,
 };
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
 @group(0) @binding(1) var refl_tex: texture_2d<f32>;
@@ -162,9 +188,41 @@ struct RtCompUniform {
   if (abs(d - cfg.depth_clear) <= 0.00001) {
     discard;
   }
-  let refl = max(textureLoad(refl_tex, p, 0).rgb, vec3f(0.0));
-  let gi = max(textureLoad(gi_tex, p, 0).rgb, vec3f(0.0));
-  let bounce = refl * 0.35 + gi * 0.65;
+  let rt_dims = vec2i(textureDimensions(refl_tex, 0));
+  var refl = vec3f(0.0);
+  var gi = vec3f(0.0);
+  if (rt_dims.x == dims.x && rt_dims.y == dims.y) {
+    refl = max(textureLoad(refl_tex, p, 0).rgb, vec3f(0.0));
+    if (cfg.gi_weight > 0.0) {
+      gi = max(textureLoad(gi_tex, p, 0).rgb, vec3f(0.0));
+    }
+  } else {
+    let f_coord = (vec2f(p) + vec2f(0.5)) * vec2f(rt_dims) / vec2f(dims) - vec2f(0.5);
+    let base_h = vec2i(floor(f_coord));
+    let frac = clamp(f_coord - vec2f(base_h), vec2f(0.0), vec2f(1.0));
+    var r_sum = vec3f(0.0);
+    var g_sum = vec3f(0.0);
+    var w_sum = 0.0;
+    for (var oy = 0; oy < 2; oy++) {
+      for (var ox = 0; ox < 2; ox++) {
+        let hp = clamp(base_h + vec2i(ox, oy), vec2i(0), rt_dims - vec2i(1));
+        let fp = clamp(vec2i((vec2f(hp) + vec2f(0.5)) * vec2f(dims) / vec2f(rt_dims)), vec2i(0), dims - vec2i(1));
+        let dh = textureLoad(depth_tex, fp, 0).r;
+        let bw = select(1.0 - frac.x, frac.x, ox == 1) * select(1.0 - frac.y, frac.y, oy == 1);
+        let dz = abs(d - dh);
+        let dw = 1.0 / (1.0 + dz * 400.0);
+        let w = bw * dw + 1e-5;
+        r_sum += max(textureLoad(refl_tex, hp, 0).rgb, vec3f(0.0)) * w;
+        if (cfg.gi_weight > 0.0) {
+          g_sum += max(textureLoad(gi_tex, hp, 0).rgb, vec3f(0.0)) * w;
+        }
+        w_sum += w;
+      }
+    }
+    refl = r_sum / max(w_sum, 1e-5);
+    gi = g_sum / max(w_sum, 1e-5);
+  }
+  let bounce = refl * cfg.refl_weight + gi * cfg.gi_weight;
   return vec4f(bounce, 0.0);
 }
 "#;
@@ -174,7 +232,7 @@ struct SvgfPrepUniform {
   inv_vp: mat4x4f,
   prev_vp: mat4x4f,
   cam_and_clear: vec4f, // xyz = camera world pos, w = depth_clear (1.0 ForwardZ, 0.0 ReversedZ)
-  dims: vec4u,          // x = width, y = height, z = has_prev_vp (0 or 1), w = 0
+  dims: vec4u,          // x = out_width, y = out_height, z = has_prev_vp (0 or 1), w = has_velocity_tex (0 or 1)
 };
 
 @group(0) @binding(0) var<uniform> u: SvgfPrepUniform;
@@ -182,6 +240,7 @@ struct SvgfPrepUniform {
 @group(0) @binding(2) var out_depth: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(3) var out_normal: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var out_motion: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var velocity_tex: texture_2d<f32>;
 
 struct WorldPt {
   pos: vec3f,
@@ -209,22 +268,28 @@ fn load_world(px: vec2i, dims: vec2i) -> WorldPt {
 
 @compute @workgroup_size(8, 8, 1)
 fn prep(@builtin(global_invocation_id) id: vec3u) {
-  let dims = vec2i(i32(u.dims.x), i32(u.dims.y));
+  let out_dims = vec2i(i32(u.dims.x), i32(u.dims.y));
+  let depth_dims = vec2i(textureDimensions(depth_tex, 0));
   let px = vec2i(id.xy);
-  if (px.x >= dims.x || px.y >= dims.y) {
+  if (px.x >= out_dims.x || px.y >= out_dims.y) {
     return;
   }
-  let c = load_world(px, dims);
+  let d_px = select(
+    clamp(vec2i((vec2f(px) + vec2f(0.5)) * vec2f(depth_dims) / vec2f(out_dims)), vec2i(0), depth_dims - vec2i(1)),
+    px,
+    out_dims.x == depth_dims.x && out_dims.y == depth_dims.y,
+  );
+  let c = load_world(d_px, depth_dims);
   if (!c.valid) {
     textureStore(out_depth, px, vec4f(10000.0, 0.0, 0.0, 1.0));
     textureStore(out_normal, px, vec4f(0.0, 1.0, 0.0, 1.0));
     textureStore(out_motion, px, vec4f(0.0, 0.0, 0.0, 0.0));
     return;
   }
-  let sr = load_world(px + vec2i(1, 0), dims);
-  let sl = load_world(px - vec2i(1, 0), dims);
-  let sd = load_world(px + vec2i(0, 1), dims);
-  let su = load_world(px - vec2i(0, 1), dims);
+  let sr = load_world(d_px + vec2i(1, 0), depth_dims);
+  let sl = load_world(d_px - vec2i(1, 0), depth_dims);
+  let sd = load_world(d_px + vec2i(0, 1), depth_dims);
+  let su = load_world(d_px - vec2i(0, 1), depth_dims);
   var dx = vec3f(1.0, 0.0, 0.0);
   var has_dx = true;
   if (sr.valid && sl.valid) {
@@ -267,8 +332,18 @@ fn prep(@builtin(global_invocation_id) id: vec3u) {
     n = -n;
   }
   var mv = vec2f(0.0);
-  if (u.dims.z != 0u) {
-    let curr_uv = (vec2f(px) + vec2f(0.5)) / vec2f(f32(dims.x), f32(dims.y));
+  var used_obj_vel = false;
+  if (u.dims.w != 0u) {
+    let v_dims = vec2i(textureDimensions(velocity_tex, 0));
+    let v_px = clamp(vec2i((vec2f(px) + vec2f(0.5)) * vec2f(v_dims) / vec2f(out_dims)), vec2i(0), v_dims - vec2i(1));
+    let obj_v = textureLoad(velocity_tex, v_px, 0).xy;
+    if (abs(obj_v.x) < 100.0 && abs(obj_v.y) < 100.0) {
+      mv = obj_v;
+      used_obj_vel = true;
+    }
+  }
+  if (!used_obj_vel && u.dims.z != 0u) {
+    let curr_uv = (vec2f(d_px) + vec2f(0.5)) / vec2f(f32(depth_dims.x), f32(depth_dims.y));
     let pclip = u.prev_vp * vec4f(c.pos, 1.0);
     if (abs(pclip.w) > 1e-6) {
       let pndc = pclip.xy / pclip.w;
@@ -282,123 +357,13 @@ fn prep(@builtin(global_invocation_id) id: vec3u) {
 }
 "#;
 
-const DDGI_COMPOSITE_SUFFIX_WGSL: &str = r#"
-struct DdgiCompCam {
-  inverse_view_projection: mat4x4f,
-  camera_pos_and_strength: vec4f, // xyz = camera world pos, w = indirect strength
-  depth_cfg: vec4f,               // x = depth_clear (1.0 ForwardZ, 0.0 ReversedZ)
-};
-
-@group(1) @binding(0) var<uniform> ddgi_cam: DdgiCompCam;
-@group(1) @binding(1) var ddgi_depth_tex: texture_2d<f32>;
-@group(1) @binding(2) var ddgi_irr_tex: texture_2d<f32>;
-@group(1) @binding(3) var ddgi_vis_tex: texture_2d<f32>;
-@group(1) @binding(4) var ddgi_samp: sampler;
-
-struct DdgiDepthPt {
-  world: vec3f,
-  valid: bool,
-};
-
-fn ddgi_load_world(px: vec2i, dims: vec2i) -> DdgiDepthPt {
-  if (px.x < 0 || px.y < 0 || px.x >= dims.x || px.y >= dims.y) {
-    return DdgiDepthPt(vec3f(0.0), false);
-  }
-  let d = textureLoad(ddgi_depth_tex, px, 0).r;
-  if (abs(d - ddgi_cam.depth_cfg.x) <= 0.00001) {
-    return DdgiDepthPt(vec3f(0.0), false);
-  }
-  let ndc = vec2f(
-    (f32(px.x) + 0.5) / f32(dims.x) * 2.0 - 1.0,
-    1.0 - (f32(px.y) + 0.5) / f32(dims.y) * 2.0,
-  );
-  let clip = ddgi_cam.inverse_view_projection * vec4f(ndc, d, 1.0);
-  if (abs(clip.w) <= 1e-6) {
-    return DdgiDepthPt(vec3f(0.0), false);
-  }
-  return DdgiDepthPt(clip.xyz / clip.w, true);
-}
-
-@vertex fn ddgi_comp_vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
-  let x = f32((idx << 1u) & 2u) * 2.0 - 1.0;
-  let y = 1.0 - f32(idx & 2u) * 2.0;
-  return vec4f(x, y, 0.0, 1.0);
-}
-
-@fragment fn ddgi_comp_fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
-  let dims = vec2i(textureDimensions(ddgi_depth_tex, 0));
-  let px = clamp(vec2i(pos.xy), vec2i(0), dims - vec2i(1));
-  let center = ddgi_load_world(px, dims);
-  if (!center.valid) {
-    discard;
-  }
-  let sr = ddgi_load_world(px + vec2i(1, 0), dims);
-  let sl = ddgi_load_world(px - vec2i(1, 0), dims);
-  let sd = ddgi_load_world(px + vec2i(0, 1), dims);
-  let su = ddgi_load_world(px - vec2i(0, 1), dims);
-
-  var dx = vec3f(1.0, 0.0, 0.0);
-  var has_dx = true;
-  if (sr.valid && sl.valid) {
-    let dr = sr.world - center.world;
-    let dl = center.world - sl.world;
-    dx = select(dl, dr, dot(dr, dr) < dot(dl, dl));
-  } else if (sr.valid) {
-    dx = sr.world - center.world;
-  } else if (sl.valid) {
-    dx = center.world - sl.world;
-  } else {
-    has_dx = false;
-  }
-
-  var dy = vec3f(0.0, 0.0, 1.0);
-  var has_dy = true;
-  if (sd.valid && su.valid) {
-    let dd = sd.world - center.world;
-    let du = center.world - su.world;
-    dy = select(du, dd, dot(dd, dd) < dot(du, du));
-  } else if (sd.valid) {
-    dy = sd.world - center.world;
-  } else if (su.valid) {
-    dy = center.world - su.world;
-  } else {
-    has_dy = false;
-  }
-
-  var n = vec3f(0.0, 1.0, 0.0);
-  if (has_dx && has_dy) {
-    let raw_n = cross(dx, dy);
-    let area2 = dot(raw_n, raw_n);
-    let ref2 = dot(dx, dx) * dot(dy, dy);
-    if (area2 > 1e-12 * ref2 && ref2 > 0.0) {
-      n = raw_n * inverseSqrt(area2);
-    }
-  }
-  let to_cam = ddgi_cam.camera_pos_and_strength.xyz - center.world;
-  let cam_dist = length(to_cam);
-  let view_dir = select(vec3f(0.0, 1.0, 0.0), to_cam / cam_dist, cam_dist > 1e-6);
-  if (dot(n, view_dir) < 0.0) {
-    n = -n;
-  }
-  let irr = ddgi_sample_irradiance(
-    center.world,
-    n,
-    view_dir,
-    u,
-    ddgi_irr_tex,
-    ddgi_vis_tex,
-    ddgi_samp,
-  );
-  let indirect = max(irr, vec3f(0.0)) * ddgi_cam.camera_pos_and_strength.w;
-  return vec4f(indirect, 0.0);
-}
-"#;
-
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RtCompUniform {
     depth_clear: f32,
-    _p: [f32; 3],
+    refl_weight: f32,
+    gi_weight: f32,
+    shadow_floor: f32,
 }
 
 #[repr(C)]
@@ -408,14 +373,6 @@ struct SvgfPrepUniform {
     prev_vp: [f32; 16],
     cam_and_clear: [f32; 4],
     dims: [u32; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct DdgiCompCamUniform {
-    inverse_view_projection: [f32; 16],
-    camera_pos_and_strength: [f32; 4],
-    depth_cfg: [f32; 4],
 }
 
 struct RtCompositePipelines {
@@ -510,6 +467,7 @@ impl SvgfRtState {
                 wo_tex(2),
                 wo_tex(3),
                 wo_tex(4),
+                ro_tex(5),
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -584,13 +542,6 @@ impl EnvPipelines {
     }
 }
 
-struct DdgiCompositePipeline {
-    u_bgl: wgpu::BindGroupLayout,
-    cam_bgl: wgpu::BindGroupLayout,
-    pipeline: wgpu::RenderPipeline,
-    cam_uniform: wgpu::Buffer,
-}
-
 #[derive(Default)]
 pub(super) struct WiredPasses {
     pub physical_atmosphere: Option<PhysicalAtmosphere>,
@@ -599,15 +550,16 @@ pub(super) struct WiredPasses {
     pub pbr_decals: HashMap<u32, PbrDecalPass>,
     pub oit_pass: Option<OitPass>,
     pub oit_pipelines: HashMap<(usize, u64, u32, bool), Option<wgpu::RenderPipeline>>,
-    pub blas_cache: HashMap<u64, Arc<Blas>>,
+    pub blas_pool: Option<GpuBlasPool>,
     pub tlas_hash: u64,
     pub tlas_gpu: Option<TlasSceneGpu>,
     pub tlas_bounds: Option<([f32; 3], [f32; 3])>,
     pub ray_tracer: Option<TlasRayTracer>,
     svgf_rt: Option<SvgfRtState>,
     rt_composite: Option<RtCompositePipelines>,
-    pub ddgi: Option<DdgiVolume>,
-    ddgi_composite: Option<DdgiCompositePipeline>,
+    pub ddgi_near: Option<DdgiVolume>,
+    pub ddgi_far: Option<DdgiVolume>,
+    pub ddgi_active_this_frame: bool,
     pub meshlet_culler: Option<MeshletCuller>,
     pub meshlet_indirect_serial: u64,
     pub last_meshlet_cull_draws: u32,
@@ -621,6 +573,7 @@ pub(super) struct WiredPasses {
     pub polish_input: Option<(u32, u32, wgpu::TextureFormat, wgpu::Texture, wgpu::TextureView)>,
     pub msaa_depth_resolve: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
     pub dummy_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
+    pub dummy_vel: Option<(wgpu::Texture, wgpu::TextureView)>,
     blit_shared: Option<BlitShared>,
     blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     pub in_secondary_camera: bool,
@@ -727,6 +680,24 @@ impl WiredPasses {
             self.dummy_depth = Some((tex, view));
         }
         self.dummy_depth.as_ref().unwrap().1.clone()
+    }
+
+    pub fn dummy_velocity_view(&mut self, device: &wgpu::Device) -> wgpu::TextureView {
+        if self.dummy_vel.is_none() {
+            let tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("wired_dummy_vel"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&Default::default());
+            self.dummy_vel = Some((tex, view));
+        }
+        self.dummy_vel.as_ref().unwrap().1.clone()
     }
 
     /// Resolves a multisampled depth view into a cached 1x `R32Float` texture via `BuiltIn::OpaqueDepth`
@@ -1012,111 +983,6 @@ impl WiredPasses {
         })
     }
 
-    fn ensure_ddgi_composite(&mut self, device: &wgpu::Device) -> &DdgiCompositePipeline {
-        self.ddgi_composite.get_or_insert_with(|| {
-            let u_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("ddgi_comp_u_bgl"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
-            let tex_entry = |binding: u32, filterable: bool| wgpu::BindGroupLayoutEntry {
-                binding,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            };
-            let cam_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("ddgi_comp_cam_bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: wgpu::BufferSize::new(size_of::<DdgiCompCamUniform>() as u64),
-                        },
-                        count: None,
-                    },
-                    tex_entry(1, false),
-                    tex_entry(2, true),
-                    tex_entry(3, true),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 4,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("ddgi_comp_pl"),
-                bind_group_layouts: &[Some(&u_bgl), Some(&cam_bgl)],
-                immediate_size: 0,
-            });
-            let source = format!("{TLAS_TRAVERSAL_WGSL}\n{DDGI_WGSL}\n{DDGI_COMPOSITE_SUFFIX_WGSL}");
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("ddgi_composite"),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
-            });
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("ddgi_composite"),
-                layout: Some(&pl),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some("ddgi_comp_vs"),
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                primitive: Default::default(),
-                depth_stencil: None,
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("ddgi_comp_fs"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: SCENE_FORMAT,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::Zero,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
-            let cam_uniform = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("ddgi_comp_cam_u"),
-                size: size_of::<DdgiCompCamUniform>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            DdgiCompositePipeline { u_bgl, cam_bgl, pipeline, cam_uniform }
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn composite_ray_tracing(
         &mut self,
@@ -1130,9 +996,16 @@ impl WiredPasses {
         gi_view: Option<&wgpu::TextureView>,
         tier: u32,
         depth_clear: f32,
+        ddgi_active: bool,
+        has_csm: bool,
     ) {
         let comp = self.ensure_rt_composite(device);
-        let cfg = RtCompUniform { depth_clear, _p: [0.0; 3] };
+        let cfg = RtCompUniform {
+            depth_clear,
+            refl_weight: 1.0,
+            gi_weight: if ddgi_active { 0.0 } else { 0.85 },
+            shadow_floor: if has_csm { 0.84 } else { 0.25 },
+        };
         queue.write_buffer(&comp.uniform, 0, bytemuck::bytes_of(&cfg));
         let sao_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rt_sao_comp_bg"),
@@ -1159,8 +1032,9 @@ impl WiredPasses {
             pass.draw(0..3, 0..1);
         }
         if tier >= 2
-            && let (Some(rv), Some(gv)) = (refl_view, gi_view)
+            && let Some(rv) = refl_view
         {
+            let gv = gi_view.unwrap_or(rv);
             let bounce_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("rt_bounce_comp_bg"),
                 layout: &comp.bounce_bgl,
@@ -1186,62 +1060,84 @@ impl WiredPasses {
             pass.draw(0..3, 0..1);
         }
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn composite_ddgi(
-        &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        scene_view: &wgpu::TextureView,
-        depth_r32f: &wgpu::TextureView,
-        inv_vp: [f32; 16],
-        camera_pos: [f32; 3],
-        depth_clear: f32,
-    ) {
-        if self.ddgi.is_none() {
-            return;
-        }
-        let _ = self.ensure_ddgi_composite(device);
-        let comp = self.ddgi_composite.as_ref().unwrap();
-        let ddgi = self.ddgi.as_ref().unwrap();
-        let cam_u = DdgiCompCamUniform {
-            inverse_view_projection: inv_vp,
-            camera_pos_and_strength: [camera_pos[0], camera_pos[1], camera_pos[2], 0.55],
-            depth_cfg: [depth_clear, 0.0, 0.0, 0.0],
-        };
-        queue.write_buffer(&comp.cam_uniform, 0, bytemuck::bytes_of(&cam_u));
-        let u_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ddgi_comp_u_bg"),
-            layout: &comp.u_bgl,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: ddgi.uniform_buffer().as_entire_binding() }],
-        });
-        let cam_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ddgi_comp_cam_bg"),
-            layout: &comp.cam_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: comp.cam_uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_r32f) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(ddgi.irradiance_view()) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(ddgi.visibility_view()) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(ddgi.sampler()) },
-            ],
-        });
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("ddgi_composite"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: scene_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-            })],
-            ..Default::default()
-        });
-        pass.set_pipeline(&comp.pipeline);
-        pass.set_bind_group(0, &u_bg, &[]);
-        pass.set_bind_group(1, &cam_bg, &[]);
-        pass.draw(0..3, 0..1);
+/// Resolves sky zenith/horizon colors for DDGI and RT miss rays.
+/// Falls back to `frame.ambient` (and subtle sky gradient when `physical_sky` is active) whenever
+/// `frame.sky` was left at default zeros, matching `environment.rs::sky_floats`.
+fn resolve_rt_sky_colors(frame: &RenderFrame) -> ([f32; 3], [f32; 3]) {
+    let z = [frame.sky.zenith.x.max(0.0), frame.sky.zenith.y.max(0.0), frame.sky.zenith.z.max(0.0)];
+    let h = [frame.sky.horizon.x.max(0.0), frame.sky.horizon.y.max(0.0), frame.sky.horizon.z.max(0.0)];
+    if z[0] + z[1] + z[2] + h[0] + h[1] + h[2] > 1e-4 {
+        return (z, h);
     }
+    let a = [frame.ambient.x.max(0.0), frame.ambient.y.max(0.0), frame.ambient.z.max(0.0)];
+    let a_sum = a[0] + a[1] + a[2];
+    if frame.quality.physical_sky && a_sum > 1e-4 {
+        let zenith = [a[0] * 0.85, a[1] * 1.05, a[2] * 1.35];
+        let horizon = [a[0] * 1.15, a[1] * 1.12, a[2] * 1.05];
+        return (zenith, horizon);
+    }
+    (a, a)
+}
+
+/// Packs dynamic point, spot, and area lights from `RenderFrame` into compact `RtLocalLight` records
+/// injected into DDGI probe hit shading and RT reflection/GI bounce hits.
+fn pack_rt_local_lights(frame: &RenderFrame) -> Vec<RtLocalLight> {
+    let mut out = Vec::with_capacity((frame.lights.len() + frame.area_lights.len()).min(MAX_RT_LOCAL_LIGHTS));
+    for lt in &frame.lights {
+        if out.len() >= MAX_RT_LOCAL_LIGHTS {
+            break;
+        }
+        let reach = lt.radius.max(0.0);
+        if reach <= 1e-4 {
+            continue;
+        }
+        let dir_raw = [lt.direction.x, lt.direction.y, lt.direction.z];
+        let dlen = (dir_raw[0] * dir_raw[0] + dir_raw[1] * dir_raw[1] + dir_raw[2] * dir_raw[2]).sqrt();
+        let dir = if dlen > 1e-6 { [dir_raw[0] / dlen, dir_raw[1] / dlen, dir_raw[2] / dlen] } else { [0.0, -1.0, 0.0] };
+        let outer = if lt.outer > 0.0 && dlen > 1e-6 { lt.outer } else { -1.0 };
+        let inner = if outer > -1.0 { lt.inner.max(outer + 1e-4) } else { -1.0 };
+        out.push(RtLocalLight {
+            position_range: [lt.position.x, lt.position.y, lt.position.z, reach],
+            color_outer_cos: [lt.color.x.max(0.0), lt.color.y.max(0.0), lt.color.z.max(0.0), outer],
+            direction_inner_cos: [dir[0], dir[1], dir[2], inner],
+        });
+    }
+    for al in &frame.area_lights {
+        if out.len() >= MAX_RT_LOCAL_LIGHTS {
+            break;
+        }
+        let reach = al.range.max(0.0);
+        let gain = al.intensity.max(0.0);
+        if reach <= 1e-4 || gain <= 1e-5 {
+            continue;
+        }
+        let area_scale = (al.width.max(0.1) * al.height.max(0.1)).clamp(0.25, 8.0) * 0.5;
+        let rx = al.right.x;
+        let ry = al.right.y;
+        let rz = al.right.z;
+        let ux = al.up.x;
+        let uy = al.up.y;
+        let uz = al.up.z;
+        let nx = ry * uz - rz * uy;
+        let ny = rz * ux - rx * uz;
+        let nz = rx * uy - ry * ux;
+        let nlen = (nx * nx + ny * ny + nz * nz).sqrt();
+        let n = if nlen > 1e-6 { [nx / nlen, ny / nlen, nz / nlen] } else { [0.0, -1.0, 0.0] };
+        let (outer, inner) = if al.two_sided || al.kind == 2 { (-1.0, -1.0) } else { (0.0, 0.25) };
+        out.push(RtLocalLight {
+            position_range: [al.position.x, al.position.y, al.position.z, reach],
+            color_outer_cos: [
+                al.color.x.max(0.0) * gain * area_scale,
+                al.color.y.max(0.0) * gain * area_scale,
+                al.color.z.max(0.0) * gain * area_scale,
+                outer,
+            ],
+            direction_inner_cos: [n[0], n[1], n[2], inner],
+        });
+    }
+    out
 }
 
 impl State {
@@ -1763,40 +1659,38 @@ impl State {
         out
     }
 
-    /// Lazily builds per-mesh BLASes and updates the cached 2-level `TlasSceneGpu` whenever
-    /// `frame.quality.ray_tracing > 0 || frame.quality.ddgi` and opaque geometry changed.
-    pub(super) fn prepare_tlas_scene(&mut self, frame: &RenderFrame, scratch: &Scratch) -> Result<bool> {
+    /// Ensures every opaque mesh has a resident BLAS in the persistent `GpuBlasPool` (building &
+    /// uploading each unique mesh ID once) and rebuilds ONLY the lightweight TLAS + hardware
+    /// `wgpu::Tlas` when instance transforms or material properties change.
+    pub(super) fn prepare_tlas_scene(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+        scratch: &Scratch,
+    ) -> Result<bool> {
+        self.wired.ddgi_active_this_frame = false;
         if frame.quality.ray_tracing == 0 && !frame.quality.ddgi {
             return Ok(false);
         }
-        let mut blas_id_to_idx: HashMap<u64, u32> = HashMap::new();
-        let mut blas_ids: Vec<u64> = Vec::new();
+        let device = &self.device;
+        let pool = self.wired.blas_pool.get_or_insert_with(|| GpuBlasPool::new(device));
         let mut instances: Vec<TlasInstance> = Vec::new();
         let mut world_min = [f32::INFINITY; 3];
         let mut world_max = [f32::NEG_INFINITY; 3];
 
-        let mut push_inst = |blas_cache: &mut HashMap<u64, Arc<Blas>>,
+        let mut push_inst = |pool: &mut GpuBlasPool,
                              source: &Arc<super::RtMeshSource>,
                              transform: [f32; 16],
                              m: &crate::asset_store::Material|
          -> Result<()> {
-            let blas = match blas_cache.entry(source.id) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(Arc::new(Blas::build(&source.triangles)?)),
-            };
-            if blas.nodes().is_empty() {
+            let Some(bi) = pool.ensure_blas(device, encoder, source.id, &source.triangles)? else {
                 return Ok(());
-            }
+            };
             let inv = invert(&transform);
             if !inv.iter().all(|v| v.is_finite()) {
                 return Ok(());
             }
-            let bi = *blas_id_to_idx.entry(source.id).or_insert_with(|| {
-                let idx = u32::try_from(blas_ids.len()).unwrap_or(u32::MAX);
-                blas_ids.push(source.id);
-                idx
-            });
-            let (bmin, bmax) = blas.bounds();
+            let (bmin, bmax) = pool.blas_bounds(bi);
             for &x in &[bmin[0], bmax[0]] {
                 for &y in &[bmin[1], bmax[1]] {
                     for &z in &[bmin[2], bmax[2]] {
@@ -1827,11 +1721,23 @@ impl State {
             } else {
                 [0.0; 3]
             };
+            #[allow(clippy::cast_possible_truncation, reason = "finite material parameters")]
+            let (metallic, mut roughness) = match m.instance_parameters {
+                Some(p) => {
+                    let met = (p[0] as f32).clamp(0.0, 1.0);
+                    let rgh = if p[1] > 0.0 { (p[1] as f32).clamp(0.04, 1.0) } else { 0.5 };
+                    (met, rgh)
+                }
+                None => (0.0, 0.5),
+            };
+            if m.surface.clearcoat > 0.0 {
+                roughness = roughness.min(m.surface.clearcoat_roughness.clamp(0.04, 0.35));
+            }
             let mut inst = TlasInstance::new(bi, transform);
             inst.albedo = albedo;
             inst.emissive = emissive;
-            inst.roughness = if m.surface.clearcoat > 0.0 { 0.2 } else { 0.45 };
-            inst.metallic = 0.0;
+            inst.roughness = roughness;
+            inst.metallic = metallic;
             instances.push(inst);
             Ok(())
         };
@@ -1845,14 +1751,14 @@ impl State {
                     if let Some(GpuAsset::Mesh(mesh)) = entry.mesh.and_then(|slot| self.assets.current(slot))
                         && let Some(src) = &mesh.rt_source
                     {
-                        push_inst(&mut self.wired.blas_cache, src, *item.transform(frame), mat)?;
+                        push_inst(pool, src, *item.transform(frame), mat)?;
                     }
                 }
                 Shape::Solid(idx) => {
                     if let Some(solid) = self.solid_meshes.get(idx)
                         && let Some(src) = &solid.rt_source
                     {
-                        push_inst(&mut self.wired.blas_cache, src, IDENTITY, mat)?;
+                        push_inst(pool, src, IDENTITY, mat)?;
                     }
                 }
                 Shape::Batch(batch_idx) => {
@@ -1864,7 +1770,7 @@ impl State {
                             if placement.batch as usize == batch_idx
                                 && let Some(draw) = frame.draws.get(draw_idx)
                             {
-                                push_inst(&mut self.wired.blas_cache, src, draw.transform, mat)?;
+                                push_inst(pool, src, draw.transform, mat)?;
                             }
                         }
                     }
@@ -1879,7 +1785,6 @@ impl State {
         }
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        blas_ids.hash(&mut hasher);
         instances.len().hash(&mut hasher);
         for inst in &instances {
             inst.blas_index.hash(&mut hasher);
@@ -1892,19 +1797,204 @@ impl State {
             for v in inst.emissive {
                 v.to_bits().hash(&mut hasher);
             }
+            inst.roughness.to_bits().hash(&mut hasher);
+            inst.metallic.to_bits().hash(&mut hasher);
         }
         let scene_hash = hasher.finish();
         if self.wired.tlas_gpu.is_none() || self.wired.tlas_hash != scene_hash {
-            let blases: Vec<Blas> = blas_ids
-                .iter()
-                .map(|id| (**self.wired.blas_cache.get(id).expect("cached BLAS")).clone())
-                .collect();
-            let tlas = TlasScene::build(&blases, &instances)?;
-            self.wired.tlas_gpu = Some(TlasSceneGpu::upload(&self.device, &tlas)?);
+            pool.update_tlas(device, encoder, &instances)?;
+            self.wired.tlas_gpu = Some(pool.snapshot_scene());
             self.wired.tlas_hash = scene_hash;
         }
         self.wired.tlas_bounds = Some((world_min, world_max));
         Ok(true)
+    }
+
+    /// Updates live GPU DDGI probe cascade(s) BEFORE the forward PBR scene, reflection-probe
+    /// capture, and volumetric fog passes, and packs them into `environment.probe_data_buffer()`
+    /// so every lit surface receives albedo-modulated, normal-mapped, Fresnel-correct multi-bounce GI
+    /// without consuming extra sampled textures or double-counting ambient.
+    pub(super) fn encode_ddgi_prepass(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+    ) -> Result<()> {
+        let Some(tlas) = self.wired.tlas_gpu.as_ref() else {
+            return Ok(());
+        };
+        let eye = invert(&frame.view);
+        let camera_pos = [eye[12], eye[13], eye[14]];
+        let sun_raw = [-frame.light_direction.x, -frame.light_direction.y, -frame.light_direction.z];
+        let sun_len = (sun_raw[0] * sun_raw[0] + sun_raw[1] * sun_raw[1] + sun_raw[2] * sun_raw[2]).sqrt();
+        let sun_direction =
+            if sun_len > 1e-6 { [sun_raw[0] / sun_len, sun_raw[1] / sun_len, sun_raw[2] / sun_len] } else { [0.0, 1.0, 0.0] };
+        let sun_color = [frame.light_color.x.max(0.0), frame.light_color.y.max(0.0), frame.light_color.z.max(0.0)];
+        let (sky_zenith, sky_horizon) = resolve_rt_sky_colors(frame);
+        let local_lights = pack_rt_local_lights(frame);
+
+        let ddgi_params = DdgiFrameParams {
+            sun_direction,
+            sun_color,
+            sky_zenith,
+            sky_horizon,
+            visibility_mask: u32::MAX,
+            reset_history: frame.exposure.cut,
+        };
+
+        let pv = frame.probe_volume;
+        let explicit_pv = pv.nx > 0 && pv.ny > 0 && pv.nz > 0 && pv.spacing > 0.0;
+        let use_dual_cascade = !explicit_pv
+            && self
+                .wired
+                .tlas_bounds
+                .is_some_and(|(bmin, bmax)| (bmax[0] - bmin[0]).max(bmax[2] - bmin[2]) > 16.0);
+
+        if explicit_pv {
+            let dims = [pv.nx.clamp(2, 8), pv.ny.clamp(2, 4), pv.nz.clamp(2, 8)];
+            let origin = [pv.origin.x, pv.origin.y, pv.origin.z];
+            let sp = pv.spacing.max(0.25);
+            let desired = DdgiGridConfig {
+                origin,
+                spacing: [sp, sp, sp],
+                dims,
+                rays_per_probe: 96,
+                hysteresis: 0.85,
+                ..Default::default()
+            };
+            let need_recreate = match &self.wired.ddgi_near {
+                None => true,
+                Some(existing) => {
+                    let c = existing.config();
+                    c.dims != desired.dims
+                        || (0..3).any(|k| (c.origin[k] - desired.origin[k]).abs() > 1e-2)
+                        || (0..3).any(|k| (c.spacing[k] - desired.spacing[k]).abs() > 1e-2)
+                }
+            };
+            if need_recreate {
+                self.wired.ddgi_near = Some(DdgiVolume::new(&self.device, desired)?);
+            }
+            self.wired.ddgi_far = None;
+        } else if use_dual_cascade {
+            let (bmin, bmax) = self.wired.tlas_bounds.unwrap();
+            let near_dims = [6u32, 3, 6];
+            let near_sp = [2.5f32, 2.0, 2.5];
+            let cam_y = camera_pos[1].clamp(bmin[1] + 0.5, bmax[1].max(bmin[1] + 1.0));
+            let target_center = [camera_pos[0], cam_y, camera_pos[2]];
+            let need_near = !matches!(&self.wired.ddgi_near, Some(v) if v.config().dims == near_dims
+                && (v.config().spacing[0] - near_sp[0]).abs() < 1e-2
+                && (v.config().spacing[1] - near_sp[1]).abs() < 1e-2);
+            if need_near {
+                let origin = [
+                    target_center[0] - 0.5 * (near_dims[0] - 1) as f32 * near_sp[0],
+                    target_center[1] - 0.5 * (near_dims[1] - 1) as f32 * near_sp[1],
+                    target_center[2] - 0.5 * (near_dims[2] - 1) as f32 * near_sp[2],
+                ];
+                let cfg = DdgiGridConfig {
+                    origin,
+                    spacing: near_sp,
+                    dims: near_dims,
+                    rays_per_probe: 64,
+                    hysteresis: 0.88,
+                    ..Default::default()
+                };
+                self.wired.ddgi_near = Some(DdgiVolume::new(&self.device, cfg)?);
+            } else if let Some(near) = &mut self.wired.ddgi_near {
+                near.scroll_to_center(target_center);
+            }
+
+            let far_dims = [5u32, 3, 5];
+            let y_span = (bmax[1] - bmin[1]).max(1.0);
+            let pad = [
+                ((bmax[0] - bmin[0]) * 0.08).max(0.5),
+                (y_span * 0.1).max(0.4),
+                ((bmax[2] - bmin[2]) * 0.08).max(0.5),
+            ];
+            let lo = [bmin[0] - pad[0], bmin[1] + (y_span * 0.1).min(0.55), bmin[2] - pad[2]];
+            let hi = [bmax[0] + pad[0], bmax[1] + pad[1], bmax[2] + pad[2]];
+            let far_sp = [
+                ((hi[0] - lo[0]) / (far_dims[0] - 1) as f32).max(1.0),
+                ((hi[1] - lo[1]) / (far_dims[1] - 1) as f32).max(0.75),
+                ((hi[2] - lo[2]) / (far_dims[2] - 1) as f32).max(1.0),
+            ];
+            let need_far = match &self.wired.ddgi_far {
+                None => true,
+                Some(existing) => {
+                    let c = existing.config();
+                    c.dims != far_dims
+                        || (0..3).any(|k| (c.origin[k] - lo[k]).abs() > 2.0)
+                        || (0..3).any(|k| (c.spacing[k] - far_sp[k]).abs() > 1.0)
+                }
+            };
+            if need_far {
+                let cfg = DdgiGridConfig {
+                    origin: lo,
+                    spacing: far_sp,
+                    dims: far_dims,
+                    rays_per_probe: 64,
+                    hysteresis: 0.90,
+                    ..Default::default()
+                };
+                self.wired.ddgi_far = Some(DdgiVolume::new(&self.device, cfg)?);
+            }
+        } else {
+            let desired = if let Some((bmin, bmax)) = self.wired.tlas_bounds {
+                let dims = [8u32, 4, 8];
+                let y_span = (bmax[1] - bmin[1]).max(1.0);
+                let pad_x = ((bmax[0] - bmin[0]) * 0.04).max(0.25);
+                let pad_z = ((bmax[2] - bmin[2]) * 0.04).max(0.25);
+                let pad_top = (y_span * 0.08).max(0.35);
+                // Keep bottom probe layer safely above solid floor slabs rather than underground.
+                let lo_y = bmin[1] + (y_span * 0.13).min(0.55);
+                let lo = [bmin[0] - pad_x, lo_y, bmin[2] - pad_z];
+                let hi = [bmax[0] + pad_x, bmax[1] + pad_top, bmax[2] + pad_z];
+                let spacing = [
+                    ((hi[0] - lo[0]) / (dims[0] - 1) as f32).max(0.45),
+                    ((hi[1] - lo[1]) / (dims[1] - 1) as f32).max(0.45),
+                    ((hi[2] - lo[2]) / (dims[2] - 1) as f32).max(0.45),
+                ];
+                DdgiGridConfig { origin: lo, spacing, dims, rays_per_probe: 128, hysteresis: 0.85, ..Default::default() }
+            } else {
+                DdgiGridConfig { rays_per_probe: 128, hysteresis: 0.85, ..Default::default() }
+            };
+            let need_recreate = match &self.wired.ddgi_near {
+                None => true,
+                Some(existing) => {
+                    let c = existing.config();
+                    c.dims != desired.dims
+                        || (0..3).any(|k| (c.origin[k] - desired.origin[k]).abs() > 0.5)
+                        || (0..3).any(|k| (c.spacing[k] - desired.spacing[k]).abs() > 0.25)
+                }
+            };
+            if need_recreate {
+                self.wired.ddgi_near = Some(DdgiVolume::new(&self.device, desired)?);
+            }
+            self.wired.ddgi_far = None;
+        }
+
+        let probe_buf = self.environment.probe_data_buffer();
+        let cap_vec4s = self.environment.probe_data_capacity_vec4s();
+        let cascade_count = if self.wired.ddgi_far.is_some() { 2u32 } else { 1u32 };
+
+        let mut cursor = DDGI_PACKED_HEADER_VEC4S;
+        if let Some(near) = &mut self.wired.ddgi_near {
+            near.update_with_lights(&self.device, encoder, tlas, &ddgi_params, &local_lights);
+            let (irr_n, vis_n) = near.packed_data_vec4_counts();
+            if cursor + irr_n + vis_n <= cap_vec4s {
+                near.pack_cascade(&self.device, encoder, probe_buf, 0, cascade_count, cursor, cursor + irr_n, 1.0);
+                cursor += irr_n + vis_n;
+            }
+        }
+        if let Some(far) = &mut self.wired.ddgi_far {
+            far.update_with_lights(&self.device, encoder, tlas, &ddgi_params, &local_lights);
+            let (irr_f, vis_f) = far.packed_data_vec4_counts();
+            if cursor + irr_f + vis_f <= cap_vec4s {
+                far.pack_cascade(&self.device, encoder, probe_buf, 1, cascade_count, cursor, cursor + irr_f, 1.0);
+            }
+        }
+
+        self.environment.set_ddgi_active(&self.queue, true);
+        self.wired.ddgi_active_this_frame = true;
+        Ok(())
     }
 
     /// Dispatches GPU meshlet cluster culling (local frustum + shear-safe normal-cone backface +
@@ -2185,10 +2275,12 @@ impl State {
         Ok(())
     }
 
-    /// Runs `TlasRayTracer` (`quality.ray_tracing >= 1`) with SVGF spatiotemporal denoising and/or
-    /// `DdgiVolume` (`quality.ddgi`) against the resolved 1x opaque HDR scene buffer and 1x R32Float depth.
+    /// Runs half-resolution `TlasRayTracer` (`quality.ray_tracing >= 1`) with primary TLAS material
+    /// lookup, local lights, live DDGI multi-bounce at hit points, half-res SVGF spatiotemporal
+    /// denoising (with per-object velocity vectors when available), and depth-aware bilateral upsample
+    /// onto the resolved 1x opaque HDR scene buffer. Skips redundant RT diffuse GI when DDGI is active.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn encode_rt_and_ddgi_wired(
+    pub(super) fn encode_rt_wired(
         wired: &mut WiredPasses,
         built_ins: &mut BuiltIns,
         device: &wgpu::Device,
@@ -2199,17 +2291,23 @@ impl State {
         active_proj: &Matrix,
         scene_view: &wgpu::TextureView,
         depth_only: &wgpu::TextureView,
+        velocity_view: Option<&wgpu::TextureView>,
+        ddgi_packed_buf: Option<&wgpu::Buffer>,
         scene_size: (u32, u32),
         samples: u32,
         depth_mode: DepthMode,
     ) -> Result<()> {
-        let wants_rt = frame.quality.ray_tracing > 0;
-        let wants_ddgi = frame.quality.ddgi;
-        if (!wants_rt && !wants_ddgi) || wired.tlas_gpu.is_none() {
+        if frame.quality.ray_tracing == 0 || wired.tlas_gpu.is_none() {
             return Ok(());
         }
+        let ddgi_active = ddgi_packed_buf.is_some();
         let depth_clear = depth_mode.clear_value();
         let depth_r32f = wired.resolve_msaa_depth(device, built_ins, encoder, depth_only, scene_size, samples);
+        let rt_size = if scene_size.0 > 128 || scene_size.1 > 128 {
+            (scene_size.0.div_ceil(2), scene_size.1.div_ceil(2))
+        } else {
+            scene_size
+        };
         let active_vp = multiply(active_proj, &frame.view);
         let inv_vp = invert(&active_vp);
         let eye = invert(&frame.view);
@@ -2219,194 +2317,160 @@ impl State {
         let sun_direction =
             if sun_len > 1e-6 { [sun_raw[0] / sun_len, sun_raw[1] / sun_len, sun_raw[2] / sun_len] } else { [0.0, 1.0, 0.0] };
         let sun_color = [frame.light_color.x.max(0.0), frame.light_color.y.max(0.0), frame.light_color.z.max(0.0)];
-        let sky_zenith = [frame.sky.zenith.x.max(0.0), frame.sky.zenith.y.max(0.0), frame.sky.zenith.z.max(0.0)];
-        let sky_horizon = [frame.sky.horizon.x.max(0.0), frame.sky.horizon.y.max(0.0), frame.sky.horizon.z.max(0.0)];
+        let (sky_zenith, sky_horizon) = resolve_rt_sky_colors(frame);
+        let local_lights = pack_rt_local_lights(frame);
 
-        if wants_rt {
-            let tier = frame.quality.ray_tracing;
-            let params = TlasRayTraceParams {
-                view_projection: active_vp,
-                camera_pos,
-                depth_clear,
-                sun_direction,
-                sun_angular_radius: 0.015,
-                sun_color,
-                sky_zenith,
-                sky_horizon,
-                surface_roughness: if tier >= 2 { 0.12 } else { 0.45 },
-                ao_radius: 2.0,
-                max_ray_distance: 64.0,
-                shadow_samples: 2,
-                ao_samples: 4,
-                reflection_samples: if tier >= 2 { 2 } else { 0 },
-                gi_samples: if tier >= 2 { 2 } else { 0 },
-                gi_bounce_scale: 1.0,
-                frame_seed: (frames_count % 4096) as f32 * 0.618_034,
-                normal_bias: 0.015,
-                visibility_mask: u32::MAX,
-            };
-            let tlas = wired.tlas_gpu.as_ref().unwrap();
-            let rt = wired.ray_tracer.get_or_insert_with(|| TlasRayTracer::new(device));
-            rt.trace_with_scene(device, encoder, tlas, &depth_r32f, scene_size, &params)?;
-            let raw_sao = rt.shadow_ao_view().cloned();
-            let raw_refl = rt.reflection_view().cloned();
-            let raw_gi = rt.gi_view().cloned();
+        let tier = frame.quality.ray_tracing;
+        let params = TlasRayTraceParams {
+            view_projection: active_vp,
+            camera_pos,
+            depth_clear,
+            sun_direction,
+            sun_angular_radius: 0.015,
+            sun_color,
+            sky_zenith,
+            sky_horizon,
+            surface_roughness: if tier >= 2 { 0.12 } else { 0.45 },
+            ao_radius: 2.0,
+            max_ray_distance: 64.0,
+            shadow_samples: 1,
+            ao_samples: 4,
+            reflection_samples: if tier >= 2 { 2 } else { 0 },
+            gi_samples: if tier >= 2 && !ddgi_active { 1 } else { 0 },
+            gi_bounce_scale: 1.0,
+            frame_seed: (frames_count % 4096) as f32 * 0.618_034,
+            normal_bias: 0.015,
+            visibility_mask: u32::MAX,
+        };
+        let tlas = wired.tlas_gpu.as_ref().unwrap();
+        let rt = wired.ray_tracer.get_or_insert_with(|| TlasRayTracer::new(device));
+        rt.trace_with_scene_gi(
+            device,
+            encoder,
+            tlas,
+            &depth_r32f,
+            rt_size,
+            &params,
+            &local_lights,
+            ddgi_packed_buf,
+            true,
+        )?;
+        let raw_sao = rt.shadow_ao_view().cloned();
+        let raw_refl = rt.reflection_view().cloned();
+        let raw_gi = rt.gi_view().cloned();
 
-            if let Some(sao_raw_view) = raw_sao {
-                // Prepare linear depth, world normals and screen motion vectors, then run SVGF
-                // spatiotemporal denoising on shadow/AO (and reflections + GI at tier 2).
-                let svgf = wired.svgf_rt.get_or_insert_with(|| SvgfRtState::new(device));
-                let resized = !matches!(&svgf.buffers, Some(b) if b.size == scene_size);
-                if resized {
-                    svgf.buffers = Some(SvgfRtBuffers {
-                        size: scene_size,
-                        curr_depth: SvgfTex::new(device, "svgf_rt_depth", scene_size),
-                        prev_depth: SvgfTex::new(device, "svgf_rt_prev_depth", scene_size),
-                        curr_normal: SvgfTex::new(device, "svgf_rt_normal", scene_size),
-                        prev_normal: SvgfTex::new(device, "svgf_rt_prev_normal", scene_size),
-                        motion: SvgfTex::new(device, "svgf_rt_motion", scene_size),
-                    });
-                    svgf.reset_history();
-                }
-                let has_prev = svgf.prev_vp.is_some() && !frame.exposure.cut;
-                let prep_u = SvgfPrepUniform {
-                    inv_vp,
-                    prev_vp: svgf.prev_vp.unwrap_or(active_vp),
-                    cam_and_clear: [camera_pos[0], camera_pos[1], camera_pos[2], depth_clear],
-                    dims: [scene_size.0, scene_size.1, u32::from(has_prev), 0],
-                };
-                queue.write_buffer(&svgf.prep_u, 0, bytemuck::bytes_of(&prep_u));
-                let bufs = svgf.buffers.as_ref().unwrap();
-                let prep_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("svgf_rt_prep_bg"),
-                    layout: &svgf.prep_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: svgf.prep_u.as_entire_binding() },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_r32f) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&bufs.curr_depth.view) },
-                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&bufs.curr_normal.view) },
-                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&bufs.motion.view) },
-                    ],
+        if let Some(sao_raw_view) = raw_sao {
+            let dummy_vel = wired.dummy_velocity_view(device);
+            let vel_bind = velocity_view.unwrap_or(&dummy_vel);
+            let svgf = wired.svgf_rt.get_or_insert_with(|| SvgfRtState::new(device));
+            let resized = !matches!(&svgf.buffers, Some(b) if b.size == rt_size);
+            if resized {
+                svgf.buffers = Some(SvgfRtBuffers {
+                    size: rt_size,
+                    curr_depth: SvgfTex::new(device, "svgf_rt_depth", rt_size),
+                    prev_depth: SvgfTex::new(device, "svgf_rt_prev_depth", rt_size),
+                    curr_normal: SvgfTex::new(device, "svgf_rt_normal", rt_size),
+                    prev_normal: SvgfTex::new(device, "svgf_rt_prev_normal", rt_size),
+                    motion: SvgfTex::new(device, "svgf_rt_motion", rt_size),
                 });
-                {
-                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("svgf_rt_prep"),
-                        timestamp_writes: None,
-                    });
-                    pass.set_pipeline(&svgf.prep_pipe);
-                    pass.set_bind_group(0, &prep_bg, &[]);
-                    pass.dispatch_workgroups(scene_size.0.div_ceil(8), scene_size.1.div_ceil(8), 1);
-                }
-                let sao_params = SvgfParams {
+                svgf.reset_history();
+            }
+            let has_prev = svgf.prev_vp.is_some() && !frame.exposure.cut;
+            let prep_u = SvgfPrepUniform {
+                inv_vp,
+                prev_vp: svgf.prev_vp.unwrap_or(active_vp),
+                cam_and_clear: [camera_pos[0], camera_pos[1], camera_pos[2], depth_clear],
+                dims: [rt_size.0, rt_size.1, u32::from(has_prev), u32::from(velocity_view.is_some())],
+            };
+            queue.write_buffer(&svgf.prep_u, 0, bytemuck::bytes_of(&prep_u));
+            let bufs = svgf.buffers.as_ref().unwrap();
+            let prep_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("svgf_rt_prep_bg"),
+                layout: &svgf.prep_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: svgf.prep_u.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_r32f) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&bufs.curr_depth.view) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&bufs.curr_normal.view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&bufs.motion.view) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(vel_bind) },
+                ],
+            });
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("svgf_rt_prep"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&svgf.prep_pipe);
+                pass.set_bind_group(0, &prep_bg, &[]);
+                pass.dispatch_workgroups(rt_size.0.div_ceil(8), rt_size.1.div_ceil(8), 1);
+            }
+            let sao_params = SvgfParams {
+                min_alpha: 0.1,
+                atrous_iterations: 3,
+                reset_history: !has_prev,
+                ..Default::default()
+            };
+            let sao_in = SvgfInputs {
+                noisy_signal: &sao_raw_view,
+                depth: &bufs.curr_depth.view,
+                prev_depth: &bufs.prev_depth.view,
+                normal: &bufs.curr_normal.view,
+                prev_normal: &bufs.prev_normal.view,
+                motion: &bufs.motion.view,
+            };
+            svgf.sao.denoise(device, encoder, &sao_in, rt_size, &sao_params)?;
+            let mut denoised_refl = None;
+            let mut denoised_gi = None;
+            if tier >= 2 {
+                let bounce_params = SvgfParams {
                     min_alpha: 0.1,
-                    atrous_iterations: 2,
+                    phi_color: 4.5,
+                    atrous_iterations: 3,
                     reset_history: !has_prev,
                     ..Default::default()
                 };
-                let sao_in = SvgfInputs {
-                    noisy_signal: &sao_raw_view,
-                    depth: &bufs.curr_depth.view,
-                    prev_depth: &bufs.prev_depth.view,
-                    normal: &bufs.curr_normal.view,
-                    prev_normal: &bufs.prev_normal.view,
-                    motion: &bufs.motion.view,
-                };
-                svgf.sao.denoise(device, encoder, &sao_in, scene_size, &sao_params)?;
-                let mut denoised_refl = None;
-                let mut denoised_gi = None;
-                if tier >= 2
-                    && let (Some(rv), Some(gv)) = (raw_refl.as_ref(), raw_gi.as_ref())
-                {
-                    let bounce_params = SvgfParams {
-                        min_alpha: 0.1,
-                        phi_color: 4.5,
-                        atrous_iterations: 3,
-                        reset_history: !has_prev,
-                        ..Default::default()
-                    };
+                if let Some(rv) = raw_refl.as_ref() {
                     let refl_in = SvgfInputs { noisy_signal: rv, ..sao_in };
-                    svgf.refl.denoise(device, encoder, &refl_in, scene_size, &bounce_params)?;
-                    let gi_in = SvgfInputs { noisy_signal: gv, ..sao_in };
-                    svgf.gi.denoise(device, encoder, &gi_in, scene_size, &bounce_params)?;
+                    svgf.refl.denoise(device, encoder, &refl_in, rt_size, &bounce_params)?;
                     denoised_refl = svgf.refl.output_view().cloned();
+                }
+                if !ddgi_active
+                    && let Some(gv) = raw_gi.as_ref()
+                {
+                    let gi_in = SvgfInputs { noisy_signal: gv, ..sao_in };
+                    svgf.gi.denoise(device, encoder, &gi_in, rt_size, &bounce_params)?;
                     denoised_gi = svgf.gi.output_view().cloned();
                 }
-                let copy_ext = wgpu::Extent3d { width: scene_size.0, height: scene_size.1, depth_or_array_layers: 1 };
-                encoder.copy_texture_to_texture(
-                    bufs.curr_depth.tex.as_image_copy(),
-                    bufs.prev_depth.tex.as_image_copy(),
-                    copy_ext,
-                );
-                encoder.copy_texture_to_texture(
-                    bufs.curr_normal.tex.as_image_copy(),
-                    bufs.prev_normal.tex.as_image_copy(),
-                    copy_ext,
-                );
-                svgf.prev_vp = Some(active_vp);
-                let denoised_sao = svgf.sao.output_view().cloned().unwrap_or(sao_raw_view);
-                wired.composite_ray_tracing(
-                    device,
-                    queue,
-                    encoder,
-                    scene_view,
-                    &depth_r32f,
-                    &denoised_sao,
-                    denoised_refl.as_ref(),
-                    denoised_gi.as_ref(),
-                    tier,
-                    depth_clear,
-                );
             }
-        }
-
-        if wants_ddgi {
-            let pv = frame.probe_volume;
-            let desired_cfg = if pv.nx > 0 && pv.ny > 0 && pv.nz > 0 && pv.spacing > 0.0 {
-                let dims = [pv.nx.clamp(2, 8), pv.ny.clamp(2, 4), pv.nz.clamp(2, 8)];
-                let origin = [pv.origin.x, pv.origin.y, pv.origin.z];
-                let sp = pv.spacing.max(0.25);
-                DdgiGridConfig { origin, spacing: [sp, sp, sp], dims, rays_per_probe: 96, hysteresis: 0.85, ..Default::default() }
-            } else if let Some((bmin, bmax)) = wired.tlas_bounds {
-                let dims = [5, 3, 5];
-                let pad = [
-                    ((bmax[0] - bmin[0]) * 0.1).max(0.35),
-                    ((bmax[1] - bmin[1]) * 0.1).max(0.35),
-                    ((bmax[2] - bmin[2]) * 0.1).max(0.35),
-                ];
-                let lo = [bmin[0] - pad[0], bmin[1] - pad[1], bmin[2] - pad[2]];
-                let hi = [bmax[0] + pad[0], bmax[1] + pad[1], bmax[2] + pad[2]];
-                let spacing = [
-                    ((hi[0] - lo[0]) / (dims[0] - 1) as f32).max(0.5),
-                    ((hi[1] - lo[1]) / (dims[1] - 1) as f32).max(0.5),
-                    ((hi[2] - lo[2]) / (dims[2] - 1) as f32).max(0.5),
-                ];
-                DdgiGridConfig { origin: lo, spacing, dims, rays_per_probe: 96, hysteresis: 0.85, ..Default::default() }
-            } else {
-                DdgiGridConfig { rays_per_probe: 96, hysteresis: 0.85, ..Default::default() }
-            };
-            let need_recreate = match &wired.ddgi {
-                None => true,
-                Some(existing) => {
-                    let c = existing.config();
-                    c.dims != desired_cfg.dims
-                        || (0..3).any(|k| (c.origin[k] - desired_cfg.origin[k]).abs() > 1e-2)
-                        || (0..3).any(|k| (c.spacing[k] - desired_cfg.spacing[k]).abs() > 1e-2)
-                }
-            };
-            if need_recreate {
-                wired.ddgi = Some(DdgiVolume::new(device, desired_cfg)?);
-            }
-            let ddgi_params = DdgiFrameParams {
-                sun_direction,
-                sun_color,
-                sky_zenith,
-                sky_horizon,
-                visibility_mask: u32::MAX,
-                reset_history: frame.exposure.cut,
-            };
-            let tlas = wired.tlas_gpu.as_ref().unwrap();
-            wired.ddgi.as_mut().unwrap().update(device, encoder, tlas, &ddgi_params);
-            wired.composite_ddgi(device, queue, encoder, scene_view, &depth_r32f, inv_vp, camera_pos, depth_clear);
+            let copy_ext = wgpu::Extent3d { width: rt_size.0, height: rt_size.1, depth_or_array_layers: 1 };
+            encoder.copy_texture_to_texture(
+                bufs.curr_depth.tex.as_image_copy(),
+                bufs.prev_depth.tex.as_image_copy(),
+                copy_ext,
+            );
+            encoder.copy_texture_to_texture(
+                bufs.curr_normal.tex.as_image_copy(),
+                bufs.prev_normal.tex.as_image_copy(),
+                copy_ext,
+            );
+            svgf.prev_vp = Some(active_vp);
+            let denoised_sao = svgf.sao.output_view().cloned().unwrap_or(sao_raw_view);
+            let has_csm = !frame.cascades.is_empty() && frame.shadow.texels > 0;
+            wired.composite_ray_tracing(
+                device,
+                queue,
+                encoder,
+                scene_view,
+                &depth_r32f,
+                &denoised_sao,
+                denoised_refl.as_ref(),
+                denoised_gi.as_ref(),
+                tier,
+                depth_clear,
+                ddgi_active,
+                has_csm,
+            );
         }
 
         Ok(())

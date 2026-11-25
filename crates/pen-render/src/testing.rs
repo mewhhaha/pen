@@ -14,6 +14,20 @@ pub fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     pollster::block_on(adapter.request_device(&Default::default())).ok()
 }
 
+pub fn device_with_optional() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+    let features = crate::optional_features(&adapter);
+    let limits = crate::optional_limits(&adapter);
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: features,
+        required_limits: limits,
+        experimental_features: crate::optional_experimental_features(&adapter),
+        ..Default::default()
+    }))
+    .ok()
+}
+
 /// `value` as IEEE half-float bits, rounded to nearest even (finite values within
 /// the half range).
 pub fn half(value: f32) -> u16 {

@@ -142,6 +142,10 @@ fn medium_at(p: vec3f) -> Medium {
 // has one, the sky's past its edge).
 fn medium_ambient(world: vec3f) -> vec3f {
   let sky = sky_light.sh[0].rgb * 0.2820947918;
+  if (sky_light.probe_counts.w >= 1.5) {
+    let ddgi = ddgi_packed_ambient(world, vec3f(0.0, 1.0, 0.0), vec3f(0.0, 1.0, 0.0));
+    return mix(sky, ddgi.rgb, ddgi.a);
+  }
   if (sky_light.probe_counts.w < 0.5) {
     return sky;
   }

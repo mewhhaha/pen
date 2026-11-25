@@ -75,8 +75,12 @@ fn open_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue, Fa
     let info = adapter.get_info();
     eprintln!("GPU: {} ({:?})", info.name, info.backend);
     crate::crash::gpu(&info);
-    let descriptor =
-        wgpu::DeviceDescriptor { required_features: pen_render::optional_features(adapter), ..Default::default() };
+    let descriptor = wgpu::DeviceDescriptor {
+        required_features: pen_render::optional_features(adapter),
+        required_limits: pen_render::optional_limits(adapter),
+        experimental_features: pen_render::optional_experimental_features(adapter),
+        ..Default::default()
+    };
     let (device, queue) = pollster::block_on(adapter.request_device(&descriptor))?;
     crate::startup::mark("GPU device open");
     let fault = Fault::default();

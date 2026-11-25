@@ -161,17 +161,196 @@ fn probe_ambient(world: vec3f, normal: vec3f) -> vec4f {
   return vec4f(sum / weight, reach * reach * (3.0 - 2.0 * reach) * (share / total));
 }
 
-// The light all round a surface at `world` facing `normal` (unit length), to
-// multiply by albedo: the baked probe volume's where the frame has one, else
-// (and past its edge, blending smoothly) the whole sky's. This is the one
-// place a material asks for diffuse sky light.
-fn ambient_light(world: vec3f, normal: vec3f) -> vec3f {
+// Live GPU DDGI dual-cascade lookup packed into `probe_data` (activated when `sky_light.probe_counts.w >= 1.5`).
+fn ddgi_env_sign_nz(v: vec2f) -> vec2f {
+  return vec2f(select(-1.0, 1.0, v.x >= 0.0), select(-1.0, 1.0, v.y >= 0.0));
+}
+
+fn ddgi_env_oct_encode(v: vec3f) -> vec2f {
+  let l1 = abs(v.x) + abs(v.y) + abs(v.z);
+  var p = v.xy / max(l1, 1e-8);
+  if (v.z < 0.0) {
+    p = (1.0 - abs(p.yx)) * ddgi_env_sign_nz(p);
+  }
+  return p;
+}
+
+fn ddgi_env_wrap(v: i32, n: u32) -> u32 {
+  let ni = max(i32(n), 1);
+  return u32(((v % ni) + ni) % ni);
+}
+
+fn ddgi_env_sample_irr(irr_off: u32, w: u32, h: u32, fpx: vec2f) -> vec4f {
+  let p = fpx - vec2f(0.5);
+  let x0 = u32(clamp(floor(p.x), 0.0, f32(w - 1u)));
+  let y0 = u32(clamp(floor(p.y), 0.0, f32(h - 1u)));
+  let x1 = min(x0 + 1u, w - 1u);
+  let y1 = min(y0 + 1u, h - 1u);
+  let fx = clamp(p.x - f32(x0), 0.0, 1.0);
+  let fy = clamp(p.y - f32(y0), 0.0, 1.0);
+  let c00 = probe_data[irr_off + y0 * w + x0];
+  let c10 = probe_data[irr_off + y0 * w + x1];
+  let c01 = probe_data[irr_off + y1 * w + x0];
+  let c11 = probe_data[irr_off + y1 * w + x1];
+  return mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
+}
+
+fn ddgi_env_vis_at(vis_off: u32, w: u32, x: u32, y: u32) -> vec2f {
+  let idx = y * w + x;
+  let packed = probe_data[vis_off + (idx >> 1u)];
+  return select(packed.xy, packed.zw, (idx & 1u) != 0u);
+}
+
+fn ddgi_env_sample_vis(vis_off: u32, w: u32, h: u32, fpx: vec2f) -> vec2f {
+  let p = fpx - vec2f(0.5);
+  let x0 = u32(clamp(floor(p.x), 0.0, f32(w - 1u)));
+  let y0 = u32(clamp(floor(p.y), 0.0, f32(h - 1u)));
+  let x1 = min(x0 + 1u, w - 1u);
+  let y1 = min(y0 + 1u, h - 1u);
+  let fx = clamp(p.x - f32(x0), 0.0, 1.0);
+  let fy = clamp(p.y - f32(y0), 0.0, 1.0);
+  let c00 = ddgi_env_vis_at(vis_off, w, x0, y0);
+  let c10 = ddgi_env_vis_at(vis_off, w, x1, y0);
+  let c01 = ddgi_env_vis_at(vis_off, w, x0, y1);
+  let c11 = ddgi_env_vis_at(vis_off, w, x1, y1);
+  return mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
+}
+
+fn ddgi_env_cascade(cascade_idx: u32, world: vec3f, normal: vec3f, view_dir: vec3f) -> vec4f {
+  let base = 1u + cascade_idx * 6u;
+  let h0 = probe_data[base + 0u];
+  let h1 = probe_data[base + 1u];
+  let h2 = probe_data[base + 2u];
+  let h3 = probe_data[base + 3u];
+  let h4 = probe_data[base + 4u];
+  let h5 = probe_data[base + 5u];
+  let dims = vec3u(u32(max(h2.x, 0.0)), u32(max(h2.y, 0.0)), u32(max(h2.z, 0.0)));
+  if (dims.x < 2u || dims.y < 2u || dims.z < 2u) {
+    return vec4f(0.0);
+  }
+  let origin = h0.xyz;
+  let gamma = max(h0.w, 1.0);
+  let spacing = max(h1.xyz, vec3f(1e-4));
+  let nbias = h1.w;
+  let vbias = h2.w;
+  let scroll = vec3i(i32(round(h3.x)), i32(round(h3.y)), i32(round(h3.z)));
+  let irr_off = u32(max(h3.w, 0.0));
+  let vis_off = u32(max(h4.x, 0.0));
+  let strength = max(h4.y, 0.0);
+  let irr_w = u32(max(h4.z, 1.0));
+  let irr_h = u32(max(h4.w, 1.0));
+  let vis_w = u32(max(h5.x, 1.0));
+  let vis_h = u32(max(h5.y, 1.0));
+
+  let min_sp = min(spacing.x, min(spacing.y, spacing.z));
+  let biased_pos = world + (normal * nbias + view_dir * vbias) * min_sp;
+  let rel = (biased_pos - origin) / spacing;
+  let max_c = vec3f(f32(dims.x - 1u), f32(dims.y - 1u), f32(dims.z - 1u));
+  let edge = min(min(min(rel.x, max_c.x - rel.x), min(rel.y, max_c.y - rel.y)), min(rel.z, max_c.z - rel.z));
+  let reach = clamp(edge + 1.0, 0.0, 1.0);
+  if (reach <= 0.0) {
+    return vec4f(0.0);
+  }
+  let clamped = clamp(rel, vec3f(0.0), max_c);
+  let base_i = vec3u(floor(clamped));
+  let alpha = clamped - vec3f(base_i);
+  let oct_n = ddgi_env_oct_encode(normalize(normal)) * 0.5 + vec2f(0.5);
+
+  var sum_irr = vec3f(0.0);
+  var sum_w = 0.0;
+  var share = 0.0;
+  var total = 0.0;
+  for (var i = 0u; i < 8u; i++) {
+    let off = vec3u(i & 1u, (i >> 1u) & 1u, (i >> 2u) & 1u);
+    let coord = min(base_i + off, dims - vec3u(1u));
+    let sc = vec3u(
+      ddgi_env_wrap(i32(coord.x) + scroll.x, dims.x),
+      ddgi_env_wrap(i32(coord.y) + scroll.y, dims.y),
+      ddgi_env_wrap(i32(coord.z) + scroll.z, dims.z),
+    );
+    let trilinear = mix(vec3f(1.0) - alpha, alpha, vec3f(off));
+    let tri = max(trilinear.x * trilinear.y * trilinear.z, 1e-4);
+    var w = tri;
+
+    let probe_pos = origin + vec3f(coord) * spacing;
+    let to_probe = probe_pos - world;
+    let dist_u = length(to_probe);
+    let dir_to_probe = select(normal, to_probe / dist_u, dist_u > 1e-5);
+    let wrap = (dot(dir_to_probe, normal) + 1.0) * 0.5;
+    w *= wrap * wrap + 0.05;
+
+    let p2pt = biased_pos - probe_pos;
+    let d_pt = length(p2pt);
+    let dir_from_probe = select(-normal, p2pt / d_pt, d_pt > 1e-5);
+    let oct_v = ddgi_env_oct_encode(dir_from_probe) * 0.5 + vec2f(0.5);
+    let s_col = sc.z * dims.x + sc.x;
+    let s_row = sc.y;
+    let vis_px = vec2f(f32(s_col * 18u + 1u), f32(s_row * 18u + 1u)) + oct_v * 16.0;
+    let moments = ddgi_env_sample_vis(vis_off, vis_w, vis_h, vis_px);
+    if (d_pt > moments.x) {
+      let variance = max(abs(moments.y - moments.x * moments.x), 1e-4);
+      let d = d_pt - moments.x;
+      var cheb = variance / (variance + d * d);
+      cheb = max(cheb * cheb * cheb, 0.0);
+      w *= cheb;
+    }
+
+    let irr_px = vec2f(f32(s_col * 10u + 1u), f32(s_row * 10u + 1u)) + oct_n * 8.0;
+    let texel = ddgi_env_sample_irr(irr_off, irr_w, irr_h, irr_px);
+    let valid = clamp(texel.a, 0.0, 1.0);
+    total += tri;
+    share += tri * valid;
+    w *= valid;
+    if (w <= 1e-6) {
+      continue;
+    }
+    let irr = pow(max(texel.rgb, vec3f(0.0)), vec3f(gamma * 0.5));
+    sum_irr += irr * w;
+    sum_w += w;
+  }
+  if (sum_w <= 1e-6 || total <= 0.0) {
+    return vec4f(0.0);
+  }
+  let avg = sum_irr / sum_w;
+  let trust = reach * reach * (3.0 - 2.0 * reach) * clamp(share / total, 0.0, 1.0);
+  return vec4f(avg * avg * strength, trust);
+}
+
+fn ddgi_packed_ambient(world: vec3f, normal: vec3f, view_dir: vec3f) -> vec4f {
+  let count = u32(clamp(round(probe_data[0u].x), 0.0, 2.0));
+  if (count == 0u) {
+    return vec4f(0.0);
+  }
+  let c0 = ddgi_env_cascade(0u, world, normal, view_dir);
+  if (count == 1u || c0.a >= 0.999) {
+    return c0;
+  }
+  let c1 = ddgi_env_cascade(1u, world, normal, view_dir);
+  let blended = mix(c1.rgb, c0.rgb, c0.a);
+  return vec4f(blended, max(c0.a, c1.a));
+}
+
+// The light all round a surface at `world` facing `normal` (unit length), seen
+// from `view` (unit length toward eye), to multiply by diffuse albedo:
+// live GPU DDGI cascades when enabled (`probe_counts.w >= 1.5`), else baked SH
+// probe volume (`>= 0.5`), blending smoothly to sky SH past the volume's edge.
+fn ambient_light_view(world: vec3f, normal: vec3f, view: vec3f) -> vec3f {
   let sky = sky_ambient(normal);
+  if (sky_light.probe_counts.w >= 1.5) {
+    let ddgi = ddgi_packed_ambient(world, normal, view);
+    return mix(sky, ddgi.rgb, ddgi.a);
+  }
   if (sky_light.probe_counts.w < 0.5) {
     return sky;
   }
   let probes = probe_ambient(world, normal);
   return mix(sky, probes.rgb, probes.a);
+}
+
+// The light all round a surface at `world` facing `normal` (unit length), to
+// multiply by albedo: live DDGI cascades, baked SH probe volume, or sky SH.
+fn ambient_light(world: vec3f, normal: vec3f) -> vec3f {
+  return ambient_light_view(world, normal, normal);
 }
 
 // The mean of the light all round `world`, as a luminance: the average of
@@ -181,6 +360,10 @@ fn ambient_light(world: vec3f, normal: vec3f) -> vec3f {
 fn ambient_mean(world: vec3f) -> f32 {
   let weights = vec3f(0.2126, 0.7152, 0.0722);
   let sky = dot(sky_light.sh[0].rgb, weights) * 0.2820947918;
+  if (sky_light.probe_counts.w >= 1.5) {
+    let up = ddgi_packed_ambient(world, vec3f(0.0, 1.0, 0.0), vec3f(0.0, 1.0, 0.0));
+    return mix(sky, dot(up.rgb, weights), up.a);
+  }
   if (sky_light.probe_counts.w < 0.5) {
     return sky;
   }

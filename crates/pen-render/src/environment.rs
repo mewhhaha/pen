@@ -46,9 +46,10 @@ pub(crate) const SCREEN_FLOATS: usize = 60;
 const SCREEN_AT: usize = LIGHT_FLOATS - SCREEN_FLOATS;
 /// Floats of one probe on the GPU: nine RGB terms and a validity weight.
 pub(crate) const PROBE_FLOATS: usize = 28;
-/// The most probes the volume buffer holds (`MAX_PROBES`, as one volume).
+/// The most probes the volume buffer holds (`MAX_PROBES`, as one volume),
+/// sized with headroom for packed dual-cascade GPU DDGI storage (`160k vec4f`).
 const MAX_PROBES: usize = 16384;
-const PROBE_BYTES: u64 = (MAX_PROBES * PROBE_FLOATS * 4) as u64;
+const PROBE_BYTES: u64 = 160_000 * 16;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 pub(crate) struct Environment {
@@ -356,6 +357,29 @@ impl Environment {
 
     pub fn empty(&self) -> &wgpu::Buffer {
         &self.empty
+    }
+
+    /// Storage buffer bound at `@group(0) @binding(8)` (`probe_data`), reused by live GPU DDGI
+    /// cascade packing when `quality.ddgi` is active so forward PBR shaders need zero extra textures.
+    pub(crate) fn probe_data_buffer(&self) -> &wgpu::Buffer {
+        &self.probe_data
+    }
+
+    /// Capacity of `probe_data` in `vec4f` elements.
+    pub(crate) fn probe_data_capacity_vec4s(&self) -> u32 {
+        u32::try_from(PROBE_BYTES / 16).expect("probe_data capacity fits in u32")
+    }
+
+    /// Switches `sky_light.probe_counts.w` into live GPU DDGI mode (`2.0`) for the current frame
+    /// (invalidating any cached CPU SH probe resident tag so turning DDGI off cleanly re-uploads SH probes).
+    pub(crate) fn set_ddgi_active(&mut self, queue: &wgpu::Queue, active: bool) {
+        if active {
+            self.resident = None;
+            let flag: [f32; 1] = [2.0];
+            // `probe_counts` sits at floats 48..52 (`w` is float 51, byte offset 204).
+            queue.write_buffer(&self.light, 51 * 4, bytemuck::cast_slice(&flag));
+            queue.write_buffer(&self.capture_light, 51 * 4, bytemuck::cast_slice(&flag));
+        }
     }
 
     /// Takes the frame's sky: writes its light, and notes whether the cube

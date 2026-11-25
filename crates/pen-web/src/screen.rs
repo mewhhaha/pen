@@ -133,8 +133,12 @@ impl Screen {
         let info = adapter.get_info();
         // With the texture compression the adapter offers, and timestamps,
         // which time the GPU's passes for the dev tools, where it has them.
-        let descriptor =
-            wgpu::DeviceDescriptor { required_features: pen_render::optional_features(&adapter), ..Default::default() };
+        let descriptor = wgpu::DeviceDescriptor {
+            required_features: pen_render::optional_features(&adapter),
+            required_limits: pen_render::optional_limits(&adapter),
+            experimental_features: pen_render::optional_experimental_features(&adapter),
+            ..Default::default()
+        };
         let (device, queue) = adapter.request_device(&descriptor).await?;
         // The API first: the diagnostics cut long names short.
         let name = if info.name.is_empty() { "WebGPU".to_owned() } else { format!("WebGPU: {}", info.name) };

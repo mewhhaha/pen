@@ -1,11 +1,13 @@
-// Dynamic Diffuse Global Illumination (DDGI, Majercik et al., JCGT 2019).
-// Prefixed at compile time with tlas_traversal.wgsl.
+// Dynamic Diffuse Global Illumination (DDGI, Majercik et al., JCGT 2019)
+// with dynamic local-light bounce injection, backface inside-wall probe classification,
+// toroidal camera scrolling, and flat-buffer cascade packing for zero-sampler PBR lookup.
+// Prefixed at compile time with tlas_traversal.wgsl or tlas_traversal_hw.wgsl.
 //
 // Atlas layout:
-//  - Probe (ix, iy, iz) -> linear index = (iy * nz + iz) * nx + ix
-//  - 2D tile grid: col = iz * nx + ix (0 .. nx*nz), row = iy (0 .. ny)
-//  - Irradiance tile: 8x8 interior + 1px octahedral wrap border = 10x10 per probe
-//  - Visibility tile: 16x16 interior + 1px octahedral wrap border = 18x18 per probe
+//  - Physical storage coord (sx, sy, sz) wraps logical (ix, iy, iz) by scroll_offset
+//  - 2D tile grid: col = sz * nx + sx (0 .. nx*nz), row = sy (0 .. ny)
+//  - Irradiance tile: 8x8 interior + 1px octahedral wrap border = 10x10 per probe (rgb = gamma irr, a = validity)
+//  - Visibility tile: 16x16 interior + 1px octahedral wrap border = 18x18 per probe (rg = mean, mean^2)
 
 struct DdgiUniform {
   origin_and_hysteresis: vec4f,   // xyz = grid origin, w = hysteresis (0.0 on reset)
@@ -19,6 +21,14 @@ struct DdgiUniform {
   rot_col2: vec4f,                // SO(3) random rotation matrix col 2, w = 0
   grid_dims: vec4u,               // x = nx, y = ny, z = nz, w = rays_per_probe
   tlas_counts: vec4u,             // x = tlas_nodes, y = tlas_insts, z = blas_tris, w = visibility_mask
+  scroll_and_lights: vec4i,       // xyz = toroidal scroll offset, w = local_light_count
+  scroll_delta: vec4i,            // xyz = cells scrolled this frame (dx, dy, dz), w = 0
+};
+
+struct RtLocalLight {
+  position_range: vec4f,      // xyz = world position, w = reach/range
+  color_outer_cos: vec4f,     // rgb = linear color * intensity, w = outer_cos (-1 for point)
+  direction_inner_cos: vec4f, // xyz = unit spot/area direction, w = inner_cos
 };
 
 const DDGI_PI: f32 = 3.14159265359;
@@ -26,6 +36,35 @@ const IRR_INNER: u32 = 8u;
 const IRR_TILE: u32 = 10u;
 const VIS_INNER: u32 = 16u;
 const VIS_TILE: u32 = 18u;
+
+fn ddgi_wrap_coord(v: i32, n: u32) -> u32 {
+  let ni = max(i32(n), 1);
+  return u32(((v % ni) + ni) % ni);
+}
+
+fn ddgi_storage_coord(logical: vec3u, dims: vec3u, scroll: vec3i) -> vec3u {
+  return vec3u(
+    ddgi_wrap_coord(i32(logical.x) + scroll.x, dims.x),
+    ddgi_wrap_coord(i32(logical.y) + scroll.y, dims.y),
+    ddgi_wrap_coord(i32(logical.z) + scroll.z, dims.z),
+  );
+}
+
+fn ddgi_is_scrolled_in(logical: vec3u, dims: vec3u, delta: vec3i) -> bool {
+  let ix = i32(logical.x);
+  let iy = i32(logical.y);
+  let iz = i32(logical.z);
+  let nx = i32(dims.x);
+  let ny = i32(dims.y);
+  let nz = i32(dims.z);
+  if (delta.x > 0 && ix >= nx - delta.x) { return true; }
+  if (delta.x < 0 && ix < -delta.x) { return true; }
+  if (delta.y > 0 && iy >= ny - delta.y) { return true; }
+  if (delta.y < 0 && iy < -delta.y) { return true; }
+  if (delta.z > 0 && iz >= nz - delta.z) { return true; }
+  if (delta.z < 0 && iz < -delta.z) { return true; }
+  return false;
+}
 
 fn ddgi_sign_not_zero(v: vec2f) -> vec2f {
   return vec2f(select(-1.0, 1.0, v.x >= 0.0), select(-1.0, 1.0, v.y >= 0.0));
@@ -65,14 +104,14 @@ fn ddgi_probe_world_pos(grid_coord: vec3u, u: DdgiUniform) -> vec3f {
 }
 
 fn ddgi_probe_uv(
-  grid_coord: vec3u,
+  storage_coord: vec3u,
   dir: vec3f,
   dims: vec3u,
   inner: u32,
   tile: u32,
 ) -> vec2f {
-  let col = grid_coord.z * dims.x + grid_coord.x;
-  let row = grid_coord.y;
+  let col = storage_coord.z * dims.x + storage_coord.x;
+  let row = storage_coord.y;
   let atlas_w = f32(dims.x * dims.z * tile);
   let atlas_h = f32(dims.y * tile);
   let oct = ddgi_oct_encode(normalize(dir)) * 0.5 + vec2f(0.5);
@@ -112,6 +151,7 @@ fn ddgi_sample_irradiance(
   let base_i = vec3u(floor(clamped));
   let alpha = clamped - vec3f(base_i);
   let gamma = max(u.sun_dir_and_gamma.w, 1.0);
+  let scroll = u.scroll_and_lights.xyz;
 
   var sum_irr = vec3f(0.0);
   var sum_w = 0.0;
@@ -119,6 +159,7 @@ fn ddgi_sample_irradiance(
   for (var i = 0u; i < 8u; i++) {
     let off = vec3u(i & 1u, (i >> 1u) & 1u, (i >> 2u) & 1u);
     let coord = min(base_i + off, dims - vec3u(1u));
+    let sc = ddgi_storage_coord(coord, dims, scroll);
     let trilinear = mix(vec3f(1.0) - alpha, alpha, vec3f(off));
     var w = max(trilinear.x * trilinear.y * trilinear.z, 1e-4);
 
@@ -135,7 +176,7 @@ fn ddgi_sample_irradiance(
     let probe_to_pt = biased_pos - probe_pos;
     let dist_to_pt = length(probe_to_pt);
     let dir_from_probe = select(-normal, probe_to_pt / dist_to_pt, dist_to_pt > 1e-5);
-    let vis_uv = ddgi_probe_uv(coord, dir_from_probe, dims, VIS_INNER, VIS_TILE);
+    let vis_uv = ddgi_probe_uv(sc, dir_from_probe, dims, VIS_INNER, VIS_TILE);
     let moments = textureSampleLevel(vis_atlas, atlas_samp, vis_uv, 0.0).rg;
     let mean = moments.x;
     let mean2 = moments.y;
@@ -148,9 +189,15 @@ fn ddgi_sample_irradiance(
       w *= chebyshev;
     }
 
-    w = max(w, 1e-6);
-    let irr_uv = ddgi_probe_uv(coord, normal, dims, IRR_INNER, IRR_TILE);
-    let encoded = max(textureSampleLevel(irr_atlas, atlas_samp, irr_uv, 0.0).rgb, vec3f(0.0));
+    let irr_uv = ddgi_probe_uv(sc, normal, dims, IRR_INNER, IRR_TILE);
+    let irr_texel = textureSampleLevel(irr_atlas, atlas_samp, irr_uv, 0.0);
+    // Probe classification validity (0.0 for probes trapped inside solid geometry).
+    let validity = clamp(irr_texel.a, 0.0, 1.0);
+    w *= validity;
+    if (w <= 1e-6) {
+      continue;
+    }
+    let encoded = max(irr_texel.rgb, vec3f(0.0));
     let irr = pow(encoded, vec3f(gamma * 0.5));
     sum_irr += irr * w;
     sum_w += w;
@@ -165,7 +212,7 @@ fn ddgi_sample_irradiance(
 
 // ---------------- Pass 1: Trace Probe Rays ----------------
 @group(0) @binding(0) var<uniform> u: DdgiUniform;
-@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;
+// __TLAS_BINDING_1__
 @group(0) @binding(2) var<storage, read> tlas_instances: array<TlasInstance>;
 @group(0) @binding(3) var<storage, read> blas_nodes: array<BvhNode>;
 @group(0) @binding(4) var<storage, read> blas_tris: array<BlasTri>;
@@ -173,6 +220,7 @@ fn ddgi_sample_irradiance(
 @group(0) @binding(6) var prev_vis_tex: texture_2d<f32>;
 @group(0) @binding(7) var atlas_sampler: sampler;
 @group(0) @binding(8) var<storage, read_write> ray_radiance: array<vec4f>;
+@group(0) @binding(9) var<storage, read> local_lights: array<RtLocalLight>;
 
 @compute @workgroup_size(64, 1, 1)
 fn ddgi_trace_probes(@builtin(global_invocation_id) id: vec3u) {
@@ -214,6 +262,12 @@ fn ddgi_trace_probes(@builtin(global_invocation_id) id: vec3u) {
     return;
   }
 
+  // Flag backface hits with negative distance so blend pass classifies probes trapped inside walls.
+  if (!h.front_face) {
+    ray_radiance[global_idx] = vec4f(0.0, 0.0, 0.0, -h.t);
+    return;
+  }
+
   let hit_pos = probe_pos + ray_dir * h.t;
   let sun_raw = u.sun_dir_and_gamma.xyz;
   let sun_dir = select(vec3f(0.0, 1.0, 0.0), normalize(sun_raw), length(sun_raw) > 1e-6);
@@ -235,6 +289,48 @@ fn ddgi_trace_probes(@builtin(global_invocation_id) id: vec3u) {
     );
     if (!sh.hit) {
       rad += (diffuse_albedo / DDGI_PI) * u.sun_color_and_sharp.rgb * ndl;
+    }
+  }
+
+  // Dynamic point, spot, and area lights injected directly into DDGI secondary bounces!
+  let n_lights = u32(max(u.scroll_and_lights.w, 0));
+  for (var li = 0u; li < n_lights; li++) {
+    let lt = local_lights[li];
+    let to_light = lt.position_range.xyz - hit_pos;
+    let dist = length(to_light);
+    let reach = lt.position_range.w;
+    if (dist <= 1e-4 || dist >= reach) {
+      continue;
+    }
+    let ldir = to_light / dist;
+    let l_ndl = max(0.0, dot(h.world_normal, ldir));
+    if (l_ndl <= 0.0) {
+      continue;
+    }
+    let ratio = dist / reach;
+    let r2 = ratio * ratio;
+    let win = clamp(1.0 - r2 * r2, 0.0, 1.0);
+    var atten = (win * win) / (dist * dist + 1.0);
+    if (lt.color_outer_cos.w > -0.999) {
+      let cone = dot(-ldir, lt.direction_inner_cos.xyz);
+      atten *= smoothstep(lt.color_outer_cos.w, max(lt.direction_inner_cos.w, lt.color_outer_cos.w + 1e-4), cone);
+    }
+    if (atten <= 1e-5) {
+      continue;
+    }
+    let lsh = trace_tlas(
+      hit_pos + h.world_normal * 0.015,
+      ldir,
+      1e-3,
+      max(dist - 0.03, 2e-3),
+      mask,
+      true,
+      u.tlas_counts.x,
+      u.tlas_counts.y,
+      u.tlas_counts.z,
+    );
+    if (!lsh.hit) {
+      rad += (diffuse_albedo / DDGI_PI) * lt.color_outer_cos.rgb * (atten * l_ndl);
     }
   }
 
@@ -278,6 +374,7 @@ fn ddgi_blend_irradiance(@builtin(global_invocation_id) id: vec3u) {
   let ix = col % dims.x;
   let iz = col / dims.x;
   let iy = row;
+  let logical = vec3u(ix, iy, iz);
   let probe_idx = (iy * dims.z + iz) * dims.x + ix;
   let rays_per_probe = max(u.grid_dims.w, 1u);
   let rot = mat3x3f(u.rot_col0.xyz, u.rot_col1.xyz, u.rot_col2.xyz);
@@ -287,25 +384,38 @@ fn ddgi_blend_irradiance(@builtin(global_invocation_id) id: vec3u) {
 
   var acc = vec3f(0.0);
   var weight_sum = 0.0;
+  var backface_count = 0u;
   let base_ray = probe_idx * rays_per_probe;
   for (var r = 0u; r < rays_per_probe; r++) {
+    let ray_val = blend_rays[base_ray + r];
+    if (ray_val.w < 0.0) {
+      backface_count += 1u;
+      continue;
+    }
     let ray_dir = normalize(rot * ddgi_spherical_fibonacci(r, rays_per_probe));
     let w = max(0.0, dot(texel_dir, ray_dir));
     if (w > 1e-4) {
-      let sample_rad = blend_rays[base_ray + r].rgb;
-      acc += sample_rad * w;
+      acc += ray_val.rgb * w;
       weight_sum += w;
     }
   }
+
+  // Classify probe as inactive when >= 25% of rays hit backfaces (trapped inside solid geometry).
+  let valid = select(1.0, 0.0, backface_count * 4u >= rays_per_probe);
   var new_irr = select(vec3f(0.0), acc / weight_sum, weight_sum > 1e-5);
   let gamma = max(u.sun_dir_and_gamma.w, 1.0);
   new_irr = pow(max(new_irr, vec3f(0.0)), vec3f(1.0 / gamma));
 
-  let px = vec2i(i32(col * IRR_TILE + 1u + tx), i32(row * IRR_TILE + 1u + ty));
-  let prev = textureLoad(blend_prev_irr, px, 0).rgb;
-  let h = clamp(u.origin_and_hysteresis.w, 0.0, 0.99);
-  let blended = mix(new_irr, prev, h);
-  textureStore(blend_out_irr, px, vec4f(blended, 1.0));
+  let sc = ddgi_storage_coord(logical, dims, u.scroll_and_lights.xyz);
+  let s_col = sc.z * dims.x + sc.x;
+  let s_row = sc.y;
+  let px = vec2i(i32(s_col * IRR_TILE + 1u + tx), i32(s_row * IRR_TILE + 1u + ty));
+  let prev = textureLoad(blend_prev_irr, px, 0);
+  let scrolled_in = ddgi_is_scrolled_in(logical, dims, u.scroll_delta.xyz);
+  let h = select(clamp(u.origin_and_hysteresis.w, 0.0, 0.99), 0.0, scrolled_in);
+  let blended_rgb = mix(new_irr, prev.rgb, h);
+  let blended_v = mix(valid, prev.a, h);
+  textureStore(blend_out_irr, px, vec4f(blended_rgb, blended_v));
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -324,6 +434,7 @@ fn ddgi_blend_visibility(@builtin(global_invocation_id) id: vec3u) {
   let ix = col % dims.x;
   let iz = col / dims.x;
   let iy = row;
+  let logical = vec3u(ix, iy, iz);
   let probe_idx = (iy * dims.z + iz) * dims.x + ix;
   let rays_per_probe = max(u.grid_dims.w, 1u);
   let rot = mat3x3f(u.rot_col0.xyz, u.rot_col1.xyz, u.rot_col2.xyz);
@@ -343,7 +454,8 @@ fn ddgi_blend_visibility(@builtin(global_invocation_id) id: vec3u) {
     let ray_dir = normalize(rot * ddgi_spherical_fibonacci(r, rays_per_probe));
     let w = pow(max(0.0, dot(texel_dir, ray_dir)), sharp);
     if (w > 1e-6) {
-      let dist = min(abs(blend_rays[base_ray + r].w), min(max_dist, max_probe_dist));
+      let raw_d = blend_rays[base_ray + r].w;
+      let dist = select(min(raw_d, min(max_dist, max_probe_dist)), min(-raw_d * 0.2, max_probe_dist), raw_d < 0.0);
       acc_d += dist * w;
       acc_d2 += dist * dist * w;
       weight_sum += w;
@@ -351,9 +463,13 @@ fn ddgi_blend_visibility(@builtin(global_invocation_id) id: vec3u) {
   }
   let new_m = select(vec2f(max_probe_dist, max_probe_dist * max_probe_dist), vec2f(acc_d, acc_d2) / weight_sum, weight_sum > 1e-6);
 
-  let px = vec2i(i32(col * VIS_TILE + 1u + tx), i32(row * VIS_TILE + 1u + ty));
+  let sc = ddgi_storage_coord(logical, dims, u.scroll_and_lights.xyz);
+  let s_col = sc.z * dims.x + sc.x;
+  let s_row = sc.y;
+  let px = vec2i(i32(s_col * VIS_TILE + 1u + tx), i32(s_row * VIS_TILE + 1u + ty));
   let prev = textureLoad(blend_prev_vis, px, 0).rg;
-  let h = clamp(u.origin_and_hysteresis.w, 0.0, 0.99);
+  let scrolled_in = ddgi_is_scrolled_in(logical, dims, u.scroll_delta.xyz);
+  let h = select(clamp(u.origin_and_hysteresis.w, 0.0, 0.99), 0.0, scrolled_in);
   let blended = mix(new_m, prev, h);
   textureStore(blend_out_vis, px, vec4f(blended.x, blended.y, 0.0, 1.0));
 }
@@ -433,4 +549,72 @@ fn ddgi_eval_points(@builtin(global_invocation_id) id: vec3u) {
   let v = select(n, normalize(q.view.xyz), length(q.view.xyz) > 1e-5);
   let irr = ddgi_sample_irradiance(q.pos.xyz, n, v, u, eval_irr_tex, eval_vis_tex, eval_samp);
   query_out[id.x] = vec4f(irr, 1.0);
+}
+
+// ---------------- Pass 5: Pack Cascade into Flat Storage Buffer for In-Shader PBR Lookup ----------------
+// Packed buffer layout (`array<vec4f>` bound at `@group(0) @binding(8)` in `environment.wgsl`):
+//   [0]:          vec4f(cascade_count, 0, 0, 0)
+//   [1 + c*6 +0]: vec4f(origin.xyz, gamma)
+//   [1 + c*6 +1]: vec4f(spacing.xyz, normal_bias)
+//   [1 + c*6 +2]: vec4f(nx, ny, nz, view_bias)
+//   [1 + c*6 +3]: vec4f(scroll_x, scroll_y, scroll_z, irr_offset_vec4s)
+//   [1 + c*6 +4]: vec4f(vis_offset_vec4s, strength, irr_w, irr_h)
+//   [1 + c*6 +5]: vec4f(vis_w, vis_h, 0, 0)
+//   [irr_offset .. +irr_w*irr_h]:              vec4f(irr.rgb, validity) per irradiance atlas texel
+//   [vis_offset .. +(vis_w*vis_h + 1)/2]:      vec4f(m0.x, m0.y, m1.x, m1.y) (2 visibility texels per vec4f)
+struct DdgiPackUniform {
+  pack_info: vec4u, // x = cascade_idx, y = cascade_count, z = irr_offset_vec4s, w = vis_offset_vec4s
+  strength: vec4f,  // x = indirect_strength, yzw = 0
+};
+
+@group(0) @binding(1) var<uniform> pack_u: DdgiPackUniform;
+@group(0) @binding(2) var pack_irr_tex: texture_2d<f32>;
+@group(0) @binding(3) var pack_vis_tex: texture_2d<f32>;
+@group(0) @binding(4) var<storage, read_write> packed_out: array<vec4f>;
+
+@compute @workgroup_size(64, 1, 1)
+fn ddgi_pack_cascade(@builtin(global_invocation_id) id: vec3u) {
+  let irr_dims = vec2u(textureDimensions(pack_irr_tex, 0));
+  let vis_dims = vec2u(textureDimensions(pack_vis_tex, 0));
+  let irr_count = irr_dims.x * irr_dims.y;
+  let vis_total = vis_dims.x * vis_dims.y;
+  let vis_pairs = (vis_total + 1u) / 2u;
+
+  if (id.x == 0u) {
+    let base = 1u + pack_u.pack_info.x * 6u;
+    if (pack_u.pack_info.x == 0u) {
+      packed_out[0u] = vec4f(f32(pack_u.pack_info.y), 0.0, 0.0, 0.0);
+    }
+    packed_out[base + 0u] = vec4f(u.origin_and_hysteresis.xyz, u.sun_dir_and_gamma.w);
+    packed_out[base + 1u] = vec4f(u.spacing_and_max_dist.xyz, u.sky_zenith_and_nbias.w);
+    packed_out[base + 2u] = vec4f(f32(u.grid_dims.x), f32(u.grid_dims.y), f32(u.grid_dims.z), u.sky_horizon_and_vbias.w);
+    packed_out[base + 3u] = vec4f(
+      f32(u.scroll_and_lights.x),
+      f32(u.scroll_and_lights.y),
+      f32(u.scroll_and_lights.z),
+      f32(pack_u.pack_info.z),
+    );
+    packed_out[base + 4u] = vec4f(
+      f32(pack_u.pack_info.w),
+      pack_u.strength.x,
+      f32(irr_dims.x),
+      f32(irr_dims.y),
+    );
+    packed_out[base + 5u] = vec4f(f32(vis_dims.x), f32(vis_dims.y), 0.0, 0.0);
+  }
+
+  let idx = id.x;
+  if (idx < irr_count) {
+    let px = vec2i(i32(idx % irr_dims.x), i32(idx / irr_dims.x));
+    packed_out[pack_u.pack_info.z + idx] = textureLoad(pack_irr_tex, px, 0);
+  }
+  if (idx < vis_pairs) {
+    let i0 = idx * 2u;
+    let i1 = min(i0 + 1u, vis_total - 1u);
+    let p0 = vec2i(i32(i0 % vis_dims.x), i32(i0 / vis_dims.x));
+    let p1 = vec2i(i32(i1 % vis_dims.x), i32(i1 / vis_dims.x));
+    let m0 = textureLoad(pack_vis_tex, p0, 0).rg;
+    let m1 = textureLoad(pack_vis_tex, p1, 0).rg;
+    packed_out[pack_u.pack_info.w + idx] = vec4f(m0.x, m0.y, m1.x, m1.y);
+  }
 }

@@ -9,6 +9,7 @@ use crate::matrix::{invert, multiply};
 use crate::post::SCENE_FORMAT;
 use crate::ray_tracing::{RtLocalLight, TlasRayTraceParams, TlasRayTracer};
 use crate::restir::{RESTIR_MAX_LIGHTS, RestirInputs, RestirParams, RestirRenderer};
+use crate::restir_specular::{RestirSpecularInputs, RestirSpecularParams, RestirSpecularRenderer};
 use crate::sharc::{SharcCache, SharcConfig, SharcParams};
 use crate::svgf::{SvgfDenoiser, SvgfInputs, SvgfParams};
 use anyhow::Result;
@@ -779,6 +780,7 @@ impl State {
         let tier = frame.quality.ray_tracing;
         let use_restir_di = tier >= 3 && thin_gbuffer.is_some() && has_active_point_spot_lights(frame);
         let use_restir_gi = tier >= 3 && !ddgi_active && thin_gbuffer.is_some();
+        let use_restir_specular = tier >= 3 && thin_gbuffer.is_some();
         let use_sharc = use_restir_gi;
         if use_sharc {
             if wired.sharc.is_none() {
@@ -816,7 +818,7 @@ impl State {
             max_ray_distance: 64.0,
             shadow_samples: 1,
             ao_samples: 4,
-            reflection_samples: if tier >= 2 { 2 } else { 0 },
+            reflection_samples: if tier >= 2 && !use_restir_specular { 2 } else { 0 },
             gi_samples: if tier >= 2 && !ddgi_active && !use_restir_gi { 1 } else { 0 },
             gi_bounce_scale: 1.0,
             frame_seed: (frames_count % 4096) as f32 * 0.618_034,
@@ -839,59 +841,97 @@ impl State {
             sharc_ref,
         )?;
         let raw_sao = rt.shadow_ao_view().cloned();
-        let raw_refl = rt.reflection_view().cloned();
+        let mut raw_refl = rt.reflection_view().cloned();
+        let mut raw_refl_motion: Option<wgpu::TextureView> = None;
         let mut raw_gi = rt.gi_view().cloned();
         let mut raw_di: Option<wgpu::TextureView> = None;
         let mut gi_demodulated = false;
 
-        if (use_restir_di || use_restir_gi)
+        if (use_restir_di || use_restir_gi || use_restir_specular)
             && let Some((gbuf_nr, gbuf_am, gbuf_depth)) = thin_gbuffer
         {
             let restir_has_prev = wired.svgf_rt.as_ref().is_some_and(|s| s.prev_vp.is_some()) && !frame.exposure.cut;
             let restir_prev_vp = wired.svgf_rt.as_ref().and_then(|s| s.prev_vp).unwrap_or(active_vp);
-            let restir_params = RestirParams {
-                view_projection: active_vp,
-                prev_view_projection: restir_prev_vp,
-                camera_pos,
-                depth_clear,
-                sun_direction,
-                sun_color,
-                sky_zenith,
-                sky_horizon,
-                max_ray_distance: 64.0,
-                normal_bias: 0.015,
-                visibility_mask: u32::MAX,
-                frame_index: u32::try_from(frames_count & 0xffff_ffff).unwrap_or(0),
-                enable_di: use_restir_di,
-                enable_gi: use_restir_gi,
-                reset_history: !restir_has_prev,
-                gi_bounce_scale: 1.0,
-            };
-            // When ReSTIR DI is active, supply ONLY point/spot lights so LTC area lights (still shaded
-            // analytically on opaque pixels via `Clusters::area_only_group()`) are never double-counted.
-            let point_spot_lights;
-            let restir_lights: &[RtLocalLight] = if use_restir_di {
-                point_spot_lights = pack_rt_point_spot_lights(frame);
-                &point_spot_lights
-            } else {
-                &local_lights[..local_lights.len().min(RESTIR_MAX_LIGHTS)]
-            };
-            let restir_inputs = RestirInputs {
-                depth: gbuf_depth,
-                normal_roughness: gbuf_nr,
-                albedo_metallic: gbuf_am,
-                motion: velocity_view,
-                ddgi_packed: ddgi_packed_buf,
-                sharc: sharc_ref,
-            };
-            let restir = wired.restir.get_or_insert_with(|| RestirRenderer::new(device));
-            restir.dispatch(device, encoder, tlas, restir_inputs, rt_size, &restir_params, restir_lights)?;
-            if use_restir_di {
-                raw_di = restir.di_view().cloned();
+            let frame_idx = u32::try_from(frames_count & 0xffff_ffff).unwrap_or(0);
+            if use_restir_di || use_restir_gi {
+                let restir_params = RestirParams {
+                    view_projection: active_vp,
+                    prev_view_projection: restir_prev_vp,
+                    camera_pos,
+                    depth_clear,
+                    sun_direction,
+                    sun_color,
+                    sky_zenith,
+                    sky_horizon,
+                    max_ray_distance: 64.0,
+                    normal_bias: 0.015,
+                    visibility_mask: u32::MAX,
+                    frame_index: frame_idx,
+                    enable_di: use_restir_di,
+                    enable_gi: use_restir_gi,
+                    reset_history: !restir_has_prev,
+                    gi_bounce_scale: 1.0,
+                };
+                // When ReSTIR DI is active, supply ONLY point/spot lights so LTC area lights (still shaded
+                // analytically on opaque pixels via `Clusters::area_only_group()`) are never double-counted.
+                let point_spot_lights;
+                let restir_lights: &[RtLocalLight] = if use_restir_di {
+                    point_spot_lights = pack_rt_point_spot_lights(frame);
+                    &point_spot_lights
+                } else {
+                    &local_lights[..local_lights.len().min(RESTIR_MAX_LIGHTS)]
+                };
+                let restir_inputs = RestirInputs {
+                    depth: gbuf_depth,
+                    normal_roughness: gbuf_nr,
+                    albedo_metallic: gbuf_am,
+                    motion: velocity_view,
+                    ddgi_packed: ddgi_packed_buf,
+                    sharc: sharc_ref,
+                };
+                let restir = wired.restir.get_or_insert_with(|| RestirRenderer::new(device));
+                restir.dispatch(device, encoder, tlas, restir_inputs, rt_size, &restir_params, restir_lights)?;
+                if use_restir_di {
+                    raw_di = restir.di_view().cloned();
+                }
+                if use_restir_gi && let Some(gv) = restir.gi_view().cloned() {
+                    raw_gi = Some(gv);
+                    gi_demodulated = true;
+                }
             }
-            if use_restir_gi && let Some(gv) = restir.gi_view().cloned() {
-                raw_gi = Some(gv);
-                gi_demodulated = true;
+            if use_restir_specular {
+                // Zero sky on additive composite so forward sky IBL is never double-counted while
+                // local glossy reflections, sun/local-light specular hits, and SHaRC/DDGI bounce shine.
+                let spec_params = RestirSpecularParams {
+                    view_projection: active_vp,
+                    prev_view_projection: restir_prev_vp,
+                    camera_pos,
+                    depth_clear,
+                    sun_direction,
+                    sun_color,
+                    sky_zenith: [0.0; 3],
+                    sky_horizon: [0.0; 3],
+                    max_ray_distance: 64.0,
+                    normal_bias: 0.015,
+                    visibility_mask: u32::MAX,
+                    frame_index: frame_idx,
+                    max_roughness: 0.72,
+                    reset_history: !restir_has_prev,
+                    gi_bounce_scale: 1.0,
+                };
+                let spec_inputs = RestirSpecularInputs {
+                    depth: gbuf_depth,
+                    normal_roughness: gbuf_nr,
+                    albedo_metallic: gbuf_am,
+                    motion: velocity_view,
+                    ddgi_buf: ddgi_packed_buf,
+                    sharc: sharc_ref,
+                };
+                let restir_spec = wired.restir_specular.get_or_insert_with(|| RestirSpecularRenderer::new(device));
+                let spec_lights = &local_lights[..local_lights.len().min(RESTIR_MAX_LIGHTS)];
+                let out = restir_spec.dispatch(device, encoder, tlas, spec_inputs, rt_size, &spec_params, spec_lights)?;
+                raw_refl = Some(out.specular_view.clone());
+                raw_refl_motion = Some(out.motion_view.clone());
             }
             if let Some(sharc) = sharc_ref {
                 sharc.resolve_uploaded(encoder, true);
@@ -981,6 +1021,7 @@ impl State {
                     atrous_iterations: 3,
                     reset_history: !has_prev,
                     specular_mode: true,
+                    hit_distance_adaptive: use_restir_specular,
                     ..Default::default()
                 };
                 let gi_params = SvgfParams {
@@ -992,7 +1033,8 @@ impl State {
                     ..Default::default()
                 };
                 if let Some(rv) = raw_refl.as_ref() {
-                    let refl_in = SvgfInputs { noisy_signal: rv, ..sao_in };
+                    let refl_motion = raw_refl_motion.as_ref().unwrap_or(sao_in.motion);
+                    let refl_in = SvgfInputs { noisy_signal: rv, motion: refl_motion, ..sao_in };
                     svgf.refl.denoise(device, encoder, &refl_in, rt_size, &refl_params)?;
                     denoised_refl = svgf.refl.output_view().cloned();
                 }

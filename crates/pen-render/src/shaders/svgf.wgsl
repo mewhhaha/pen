@@ -6,7 +6,7 @@
 //                         guided by depth, normal, roughness (`normal.w` in specular mode), and variance.
 
 struct SvgfUniform {
-  dims: vec4u,           // x = width, y = height, z = step_size, w = flags (bit0: reset, bit1: specular_mode)
+  dims: vec4u,           // x = width, y = height, z = step_size, w = flags (bit0: reset, bit1: specular_mode, bit2: hit_distance_adaptive)
   temporal_params: vec4f, // x = min_alpha, y = max_history, z = depth_threshold, w = normal_threshold
   atrous_params: vec4f,  // x = phi_color, y = phi_normal, z = phi_depth, w = variance_boost
 };
@@ -67,7 +67,10 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
   let reset_hist = (u.dims.w & 1u) != 0u;
   let spec_mode = (u.dims.w & 2u) != 0u;
 
-  let sample_c = textureLoad(curr_noisy, px, 0).rgb;
+  let adaptive_hit_dist = (u.dims.w & 4u) != 0u;
+  let noisy = textureLoad(curr_noisy, px, 0);
+  let sample_c = noisy.rgb;
+  let hit_dist = select(0.0, clamp(noisy.a, 0.0, 65504.0), adaptive_hit_dist);
   let z_c = textureLoad(curr_depth, px, 0).r;
   let n_raw = textureLoad(curr_normal, px, 0);
   let n_l2 = dot(n_raw.xyz, n_raw.xyz);
@@ -79,6 +82,7 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
   var acc_color = sample_c;
   var acc_moments = moments_c;
   var hist_len = 1.0;
+  var filtered_hit_dist = hit_dist;
 
   if (!reset_hist) {
     let raw_mv = textureLoad(motion_tex, px, 0);
@@ -105,6 +109,8 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
     var hist_c = vec3f(0.0);
     var hist_m = vec2f(0.0);
     var hist_l = 0.0;
+    var hist_hit_dist = 0.0;
+    var hit_dist_w = 0.0;
 
     for (var i = 0; i < 4; i++) {
       let q = base + offsets[i];
@@ -119,6 +125,11 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
         let pm = textureLoad(prev_moments, q, 0);
         hist_m += pm.xy * bw;
         hist_l += pm.z * bw;
+        // Zero encodes sky or an invalid sample. Keep it out of surface distance history.
+        if (adaptive_hit_dist && hit_dist > 0.0 && pm.w > 0.0) {
+          hist_hit_dist += pm.w * bw;
+          hit_dist_w += bw;
+        }
         sum_w += bw;
       }
     }
@@ -171,6 +182,9 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
       let alpha = max(min_a, 1.0 / hist_len);
       acc_color = mix(hist_c, sample_c, alpha);
       acc_moments = mix(hist_m, moments_c, alpha);
+      if (hit_dist_w > 1e-4) {
+        filtered_hit_dist = mix(hist_hit_dist / hit_dist_w, hit_dist, alpha);
+      }
     }
   }
 
@@ -208,7 +222,7 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
   }
 
   textureStore(out_color, px, vec4f(acc_color, variance));
-  textureStore(out_moments, px, vec4f(acc_moments.x, acc_moments.y, hist_len, 0.0));
+  textureStore(out_moments, px, vec4f(acc_moments.x, acc_moments.y, hist_len, filtered_hit_dist));
 }
 
 // A-Trous pass bindings (separate bind group layout for minimal bindings).
@@ -216,6 +230,7 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
 @group(0) @binding(2) var atrous_depth: texture_2d<f32>;
 @group(0) @binding(3) var atrous_normal: texture_2d<f32>;
 @group(0) @binding(4) var atrous_out: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(5) var hit_dist_tex: texture_2d<f32>;
 
 @compute @workgroup_size(8, 8, 1)
 fn svgf_atrous(@builtin(global_invocation_id) id: vec3u) {
@@ -257,10 +272,20 @@ fn svgf_atrous(@builtin(global_invocation_id) id: vec3u) {
   // Roughness-scaled specular edge stopping: keeps mirror reflections sharp while smoothing glossy lobes.
   let rough_l_scale = select(1.0, mix(0.40, 1.0, smoothstep(0.04, 0.45, rough_p)), spec_mode);
   let rough_n_scale = select(1.0, mix(2.5, 1.0, smoothstep(0.05, 0.50, rough_p)), spec_mode);
-  let sigma_l = max(u.atrous_params.x, 0.05) * rough_l_scale * sqrt(max(filtered_var, 0.0)) + 1e-4;
+  var contact = 0.0;
+  if ((u.dims.w & 4u) != 0u) {
+    let hit_dist = textureLoad(hit_dist_tex, px, 0).w;
+    if (hit_dist > 0.0) {
+      let cone_footprint = rough_p * rough_p * clamp(hit_dist, 0.02, 20.0);
+      contact = 1.0 - smoothstep(0.01, 0.8, cone_footprint);
+    }
+  }
+  let sigma_l = max(u.atrous_params.x, 0.05) * rough_l_scale * mix(1.0, 0.45, contact)
+      * sqrt(max(filtered_var, 0.0)) + 1e-4;
   let phi_n = max(u.atrous_params.y, 1.0) * rough_n_scale;
   let phi_z = max(u.atrous_params.z, 1e-4);
-  let mirror_taper = select(0.0, (1.0 - rough_p) * (1.0 - rough_p) * 0.45, spec_mode);
+  let mirror_taper = select(0.0, (1.0 - rough_p) * (1.0 - rough_p) * 0.45, spec_mode) + contact * 0.65;
+  let phi_rough = mix(10.0, 24.0, contact);
 
   // 5x5 B3-spline wavelet weights.
   let k5 = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
@@ -291,7 +316,7 @@ fn svgf_atrous(@builtin(global_invocation_id) id: vec3u) {
         let wz = exp(-abs(z_p - z_q) / denom_z);
         let wn = pow(max(0.0, dot(n_p, n_q)), phi_n);
         let wl = exp(-abs(l_p - l_q) / sigma_l);
-        let wr = select(1.0, exp(-abs(rough_p - rough_q) * 10.0) * exp(-dist_steps * mirror_taper), spec_mode);
+        let wr = select(1.0, exp(-abs(rough_p - rough_q) * phi_rough) * exp(-dist_steps * mirror_taper), spec_mode);
         wt = kw * wz * wn * wl * wr;
       }
       sum_c += sample_q.rgb * wt;

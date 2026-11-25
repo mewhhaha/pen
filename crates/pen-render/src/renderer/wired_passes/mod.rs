@@ -27,6 +27,7 @@ use crate::post_fx::{PostFxPass, RcasSharpener};
 use crate::ray_tracing::{GpuBlasPool, TlasRayTracer, TlasSceneGpu};
 use crate::render_targets::SplitScreenCompositor;
 use crate::restir::RestirRenderer;
+use crate::restir_specular::RestirSpecularRenderer;
 use crate::sharc::SharcCache;
 use pen_protocol::{Matrix, RenderFrame};
 use rt::{RtCompositePipelines, SvgfRtState};
@@ -113,6 +114,7 @@ pub(super) struct WiredPasses {
     pub tlas_bounds: Option<([f32; 3], [f32; 3])>,
     pub ray_tracer: Option<TlasRayTracer>,
     pub restir: Option<RestirRenderer>,
+    pub restir_specular: Option<RestirSpecularRenderer>,
     pub sharc: Option<SharcCache>,
     pub sharc_needs_clear: bool,
     svgf_rt: Option<SvgfRtState>,

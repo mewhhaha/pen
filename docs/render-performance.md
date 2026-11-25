@@ -410,3 +410,35 @@ without a pane is the one it was. Measured with
 cargo test --release -p pen-render --test translucency \
   the_translucent_pass_costs -- --ignored --nocapture
 ```
+
+## Tier-3 ReSTIR DI/GI/Specular, SHaRC, Two-Phase Meshlets, and Cluster DAG LODs
+
+Measured on Linux with an NVIDIA GeForce RTX 4080 SUPER (Vulkan, wgpu 30, hardware
+ray queries active), release `pen` binary, running `examples/showcase` in
+64-Light Night mode (`7:64L`, DDGI off so ReSTIR GI + SHaRC run alongside ReSTIR DI
+and ReSTIR Specular + hit-distance-adaptive specular SVGF) at 1280×720 (`--headless
+--mute --fps 60`, `PEN_PROFILE_WARMUP=30 PEN_PROFILE_FRAMES=60`, median milliseconds):
+
+| Mode (64 dynamic point/spot lights, 1280×720) | Guest (ms) | Render (ms) | Frame total (ms) | Headless FPS (incl. readback) |
+| --- | ---: | ---: | ---: | ---: |
+| `RT=0` (raster only, unshadowed local lights) | 0.09 | 1.61 | 1.71 | 188 |
+| `RT=2` (standard TLAS RT reflections + GI + SVGF) | 0.10 | 2.26 | 2.38 | 163 |
+| `RT=3` (Thin G-Buffer + ReSTIR DI/GI/Specular + SHaRC + adaptive SVGF) | 0.10 | 2.63 | 2.74 | 150 |
+| `RT=3 + FSR Quality` (temporal upscale + RCAS) | 0.08 | 1.78 | 1.89 | 210 |
+
+Key verification witnesses (`cargo test -p pen-render -- --test-threads=1`):
+
+- **ReSTIR DI + GI + SHaRC (`restir.rs`, `sharc.rs`)**: 6.43× lower DI NMSE by frame 8
+  on many-light scenes with zero shadow-region leak; 3.98× lower half-resolution GI
+  frame-to-frame variance with zero thin-wall divider leak; SHaRC face-tagged hash cache
+  separates opposite thin-wall faces and adapts grid spacing up to 150 m.
+- **ReSTIR Specular + Hit-Distance-Adaptive SVGF (`restir_specular.rs`, `svgf.rs`)**:
+  3.93× lower glossy temporal variance by frame 8; divider leak drops from `0.1552`
+  without visibility validation to `0.000008` with validation; contact reflections at
+  `0.1 m` preserve strictly sharper edges than `15 m` distant reflections at equal
+  roughness `0.35`.
+- **Two-Phase Meshlet Occlusion & Cluster DAG LODs (`meshlets.rs`, `meshlet_dag.rs`)**:
+  Two-phase Hi-Z culling recovers disoccluded meshlets in a single submission with zero
+  draw overlap across Forward-Z and Reversed-Z; 5-level endpoint-preserving QEM Cluster
+  DAG reduces a 1,728-triangle sphere smoothly to 578 triangles (mixed LOD cut with exact
+  1-to-1 leaf ancestry exclusivity and locked seams) and 114 triangles at far distance.

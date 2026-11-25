@@ -215,6 +215,28 @@ in `renderer/`:
 - `veil.rs`: the loading veil. It shows the frame's sky with a turning arc,
   and clears once nothing the frame draws is still on its way (or after 12 s).
 - `validate.rs`: what a frame must be for the renderer to draw it.
+- `thin_gbuffer.rs`: rasterized Thin G-Buffer prepass (`normal_roughness` and
+  `albedo_metallic` in `Rgba16Float` plus sampleable `Depth32Float`, supporting
+  Forward-Z and Reversed-Z, plain/morphed, instanced, skinned, and brush draws)
+  feeding ray tracing and ReSTIR without primary TLAS lookup rays.
+- `wired_passes/`: modular high-fidelity render passes wired into `frame.rs`:
+  - `sky_env.rs`: Hillaire physical atmosphere LUTs, volumetric clouds, and
+    outdoor CDLOD terrain / Gerstner water / instanced foliage passes.
+  - `decals_oit.rs`: PBR deferred decals and weighted-blended OIT.
+  - `ddgi.rs`: Dynamic Diffuse Global Illumination probe grid updates and
+    packed cascade upload.
+  - `rt.rs`: Hardware ray-query / software BVH TLAS tracing (`ray_tracing/`),
+    Tier-3 `RestirRenderer` (ReSTIR DI + GI with Jacobian-aware Pairwise MIS),
+    `RestirSpecularRenderer` (glossy VNDF reservoir reuse with virtual
+    reflected-point parallax motion & thin-wall visibility validation),
+    `SharcCache` (spatial hash radiance cache for multi-bounce GI), and
+    `SvgfDenoiser` (with hit-distance-adaptive specular A-Trous denoising).
+  - `meshlets.rs`: Two-phase GPU meshlet occlusion culling (`meshlets.rs`) with
+    Hi-Z re-testing of disoccluded clusters in a single submission, alongside
+    standalone continuous LODs in `meshlet_dag.rs` (boundary-locked QEM cluster
+    DAG + GPU screen-space error cut).
+  - `post_split.rs`: AMD FSR 1/2 temporal upscaling + RCAS sharpening, polish
+    post-FX, and render-to-texture / split-screen secondary cameras.
 - `frame.rs`: `submit` puts the frame together and encodes its passes. The
   culling compute pass comes first, then the shadow passes, then the
   particles' compute pass. The scene draws opaque surfaces, then decals over

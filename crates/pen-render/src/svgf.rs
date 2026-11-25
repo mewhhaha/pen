@@ -33,6 +33,8 @@ pub struct SvgfParams {
     /// applies 3x3 YCoCg temporal neighborhood clamping to suppress mirror ghosting, and scales
     /// A-Trous edge-stopping weights by surface roughness (`normal.w`).
     pub specular_mode: bool,
+    /// In specular mode, use noisy signal alpha (hit distance in meters) to guide filtering.
+    pub hit_distance_adaptive: bool,
 }
 
 impl Default for SvgfParams {
@@ -49,6 +51,7 @@ impl Default for SvgfParams {
             atrous_iterations: 4,
             reset_history: false,
             specular_mode: false,
+            hit_distance_adaptive: false,
         }
     }
 }
@@ -185,7 +188,7 @@ impl SvgfDenoiser {
         });
         let atrous_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("svgf_atrous_bgl"),
-            entries: &[u_entry, tex_ro(1), tex_ro(2), tex_ro(3), storage_wo(4)],
+            entries: &[u_entry, tex_ro(1), tex_ro(2), tex_ro(3), storage_wo(4), tex_ro(5)],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("svgf_wgsl"),
@@ -279,10 +282,11 @@ impl SvgfDenoiser {
         }
         let st = self.state.as_mut().unwrap();
         let reset = params.reset_history || !st.has_history;
-        let spec_bit = if params.specular_mode { 2u32 } else { 0u32 };
+        let spec_flags = (u32::from(params.specular_mode) << 1)
+            | (u32::from(params.specular_mode && params.hit_distance_adaptive) << 2);
 
         let u_temporal = SvgfUniform {
-            dims: [size.0, size.1, 1, u32::from(reset) | spec_bit],
+            dims: [size.0, size.1, 1, u32::from(reset) | spec_flags],
             temporal_params: [
                 params.min_alpha.clamp(0.01, 1.0),
                 params.max_history.clamp(1.0, 256.0),
@@ -347,13 +351,10 @@ impl SvgfDenoiser {
         let mut src_is_pong = false;
         for iter in 0..iters {
             let step = 1u32 << iter;
-            let u_iter = SvgfUniform { dims: [size.0, size.1, step, spec_bit], ..u_temporal };
+            let u_iter = SvgfUniform { dims: [size.0, size.1, step, spec_flags], ..u_temporal };
             encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u_iter));
-            let (src_view, dst_view) = if src_is_pong {
-                (&st.pong.view, &st.ping.view)
-            } else {
-                (&st.ping.view, &st.pong.view)
-            };
+            let (src_view, dst_view) =
+                if src_is_pong { (&st.pong.view, &st.ping.view) } else { (&st.ping.view, &st.pong.view) };
             let abg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("svgf_atrous_bg"),
                 layout: &self.atrous_bgl,
@@ -363,6 +364,10 @@ impl SvgfDenoiser {
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(inputs.depth) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(inputs.normal) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(dst_view) },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&st.curr_moments.view),
+                    },
                 ],
             });
             {
@@ -596,7 +601,13 @@ mod tests {
         rb.unmap();
     }
 
-    fn read_rgba16f_tex(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, w: u32, h: u32) -> Vec<[f32; 4]> {
+    fn read_rgba16f_tex(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tex: &wgpu::Texture,
+        w: u32,
+        h: u32,
+    ) -> Vec<[f32; 4]> {
         let bpr = (w * 8).next_multiple_of(256);
         let rb = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("svgf_spec_rb"),
@@ -723,7 +734,8 @@ mod tests {
         let sq1_t = upload_rgba16f(&device, &queue, w, h, &sq1);
         let sq0_v = sq0_t.create_view(&Default::default());
         let sq1_v = sq1_t.create_view(&Default::default());
-        let parallax_m = upload_rgba16f(&device, &queue, w, h, &vec![[0.0, 0.0, 4.0 / w as f32, 0.0]; (w * h) as usize]);
+        let parallax_m =
+            upload_rgba16f(&device, &queue, w, h, &vec![[0.0, 0.0, 4.0 / w as f32, 0.0]; (w * h) as usize]);
         let parallax_mv = parallax_m.create_view(&Default::default());
         let mut para = SvgfDenoiser::new(&device);
         let mut enc_p = device.create_command_encoder(&Default::default());
@@ -759,7 +771,10 @@ mod tests {
         .unwrap();
         queue.submit(Some(enc_p.finish()));
         let p_hit = read_rgba16f_tex(&device, &queue, para.output_texture().unwrap(), w, h)[(16 * w + 16) as usize];
-        assert!(p_hit[2] > 0.85, "specular parallax reprojection via motion.zw must track shifted highlight: {p_hit:?}");
+        assert!(
+            p_hit[2] > 0.85,
+            "specular parallax reprojection via motion.zw must track shifted highlight: {p_hit:?}"
+        );
 
         // 3. Roughness-scaled A-Trous keeps mirror reflection peaks much sharper than rough glossy lobes.
         let mut impulse = vec![[0.05f32, 0.05, 0.05, 1.0]; (w * h) as usize];
@@ -768,7 +783,13 @@ mod tests {
         let imp_v = imp_t.create_view(&Default::default());
         let mut d_mirror = SvgfDenoiser::new(&device);
         let mut d_rough = SvgfDenoiser::new(&device);
-        let rp = SvgfParams { atrous_iterations: 3, reset_history: true, specular_mode: true, phi_color: 4.0, ..Default::default() };
+        let rp = SvgfParams {
+            atrous_iterations: 3,
+            reset_history: true,
+            specular_mode: true,
+            phi_color: 4.0,
+            ..Default::default()
+        };
         let mut enc_r = device.create_command_encoder(&Default::default());
         d_mirror
             .denoise(
@@ -803,11 +824,109 @@ mod tests {
             )
             .unwrap();
         queue.submit(Some(enc_r.finish()));
-        let mirror_peak = read_rgba16f_tex(&device, &queue, d_mirror.output_texture().unwrap(), w, h)[(16 * w + 16) as usize][0];
-        let rough_peak = read_rgba16f_tex(&device, &queue, d_rough.output_texture().unwrap(), w, h)[(16 * w + 16) as usize][0];
+        let mirror_peak =
+            read_rgba16f_tex(&device, &queue, d_mirror.output_texture().unwrap(), w, h)[(16 * w + 16) as usize][0];
+        let rough_peak =
+            read_rgba16f_tex(&device, &queue, d_rough.output_texture().unwrap(), w, h)[(16 * w + 16) as usize][0];
         assert!(
             mirror_peak > rough_peak + 0.08,
             "roughness-scaled A-Trous must preserve mirror peak sharper than rough glossy: mirror={mirror_peak:.4}, rough={rough_peak:.4}"
         );
+    }
+
+    #[test]
+    fn gpu_svgf_hit_distance_adaptive_preserves_contact_reflection_sharpness() {
+        let (device, queue) = crate::testing::device().expect("headless GPU adapter required");
+        let (w, h) = (64u32, 32u32);
+        let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SVGF hit distance witness depth"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let count = (w * h) as usize;
+        queue.write_texture(
+            depth.as_image_copy(),
+            bytemuck::cast_slice(&vec![0.5f32; count]),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: None },
+            size,
+        );
+        let depth = depth.create_view(&Default::default());
+        let normal =
+            upload_rgba16f(&device, &queue, w, h, &vec![[0.0, 1.0, 0.0, 0.35]; count]).create_view(&Default::default());
+        let motion = upload_rgba16f(&device, &queue, w, h, &vec![[0.0; 4]; count]).create_view(&Default::default());
+        let make_signal = |distance| {
+            (0..w * h)
+                .map(|i| {
+                    let hash = (i ^ (i >> 4)).wrapping_mul(0x9e3779b9).rotate_left(11).wrapping_mul(0x85ebca6b);
+                    let noise = ((hash >> 24) as f32 / 255.0 - 0.5) * 0.4;
+                    let value = if i % w < w / 2 { 0.28 } else { 0.80 } + noise;
+                    [value, value, value, distance]
+                })
+                .collect::<Vec<_>>()
+        };
+        let params = SvgfParams {
+            specular_mode: true,
+            hit_distance_adaptive: true,
+            atrous_iterations: 3,
+            phi_color: 8.0,
+            ..Default::default()
+        };
+        let denoise = |distance: f32| {
+            let mut denoiser = SvgfDenoiser::new(&device);
+            let mut output = Vec::new();
+            for (frame, sample_distance) in [distance, distance * 1.2].into_iter().enumerate() {
+                let mut encoder = device.create_command_encoder(&Default::default());
+                let noisy = upload_rgba16f(&device, &queue, w, h, &make_signal(sample_distance))
+                    .create_view(&Default::default());
+                let inputs = SvgfInputs {
+                    noisy_signal: &noisy,
+                    depth: &depth,
+                    prev_depth: &depth,
+                    normal: &normal,
+                    prev_normal: &normal,
+                    motion: &motion,
+                };
+                denoiser.denoise(&device, &mut encoder, &inputs, (w, h), &params).unwrap();
+                queue.submit([encoder.finish()]);
+                if frame == 0 {
+                    output = read_rgba16f_tex(&device, &queue, denoiser.output_texture().unwrap(), w, h);
+                }
+            }
+            let moments = &denoiser.state.as_ref().unwrap().curr_moments.tex;
+            let filtered = read_rgba16f_tex(&device, &queue, moments, w, h);
+            let expected = distance * 1.1;
+            assert!((filtered[0][3] - expected).abs() < expected * 0.002, "filtered hit distance={}", filtered[0][3]);
+            output
+        };
+
+        let contact = denoise(0.1);
+        let distant = denoise(15.0);
+        let mean = |values: &[f32]| values.iter().sum::<f32>() / values.len() as f32;
+        let gradient = |image: &[[f32; 4]]| {
+            let differences: Vec<_> = (4..h - 4)
+                .map(|y| image[(y * w + w / 2) as usize][0] - image[(y * w + w / 2 - 1) as usize][0])
+                .collect();
+            mean(&differences)
+        };
+        let flat_variance = |image: &[[f32; 4]]| {
+            let samples: Vec<_> =
+                (4..h - 4).flat_map(|y| (4..20).map(move |x| image[(y * w + x) as usize][0])).collect();
+            let avg = mean(&samples);
+            mean(&samples.iter().map(|v| (v - avg).powi(2)).collect::<Vec<_>>())
+        };
+        let noisy_var = flat_variance(&make_signal(0.1));
+        let (contact_gradient, distant_gradient) = (gradient(&contact), gradient(&distant));
+        let (contact_var, distant_var) = (flat_variance(&contact), flat_variance(&distant));
+        eprintln!(
+            "SVGF edge gradient: contact={contact_gradient:.4}, distant={distant_gradient:.4}; variance: input={noisy_var:.5}, contact={contact_var:.5}, distant={distant_var:.5}"
+        );
+        assert!(contact_gradient > distant_gradient + 0.03, "contact={contact_gradient}, distant={distant_gradient}");
+        assert!(contact_var < noisy_var * 0.8 && distant_var < noisy_var * 0.8);
     }
 }

@@ -30,6 +30,7 @@ mod lights;
 mod loader;
 mod local_shadows;
 mod matrix;
+pub mod meshlet_dag;
 pub mod meshlets;
 mod mipmaps;
 mod motion_blur;
@@ -44,6 +45,7 @@ pub mod ray_tracing;
 pub mod render_targets;
 mod renderer;
 pub mod restir;
+pub mod restir_specular;
 mod shader;
 pub mod shader_graph;
 pub mod sharc;
@@ -98,6 +100,10 @@ pub use lightmap::{
     pack_lightmap_uv2,
 };
 pub use lights::LIGHTS_WGSL;
+pub use meshlet_dag::{
+    DagClusterGpu, MESHLET_DAG_CUT_WGSL, MeshletDagConfig, MeshletDagCullOutput, MeshletDagCullParams,
+    MeshletDagCuller, MeshletDagGpu, MeshletDagMesh, build_meshlet_dag,
+};
 pub use meshlets::{
     DEFAULT_MAX_MESHLET_TRIANGLES, DEFAULT_MAX_MESHLET_VERTICES, MESHLET_CULL_WGSL, MeshletBatchEntry,
     MeshletCullParams, MeshletCullStats, MeshletCuller, MeshletGpu, MeshletIndirectDraw, MeshletMesh,
@@ -117,6 +123,9 @@ pub use ray_tracing::{
     device_supports_hardware_ray_query, supports_hardware_ray_query,
 };
 pub use restir::{RESTIR_MAX_LIGHTS, RESTIR_WGSL, RestirInputs, RestirParams, RestirRenderer};
+pub use restir_specular::{
+    RESTIR_SPECULAR_WGSL, RestirSpecularInputs, RestirSpecularOutputs, RestirSpecularParams, RestirSpecularRenderer,
+};
 pub use sharc::{
     SHARC_COMMON_WGSL, SHARC_DEFAULT_CAPACITY, SHARC_HASH_WGSL, SHARC_QUERY_RO_FN_WGSL, SHARC_WGSL, SharcCache,
     SharcConfig, SharcParams,

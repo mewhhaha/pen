@@ -1451,7 +1451,7 @@ impl State {
         let sharp = if frame.grade.sharpness > 0.0 {
             frame.grade.sharpness.clamp(0.0, 1.0)
         } else if frame.quality.upscale {
-            0.35
+            crate::post_fx::FsrQualityPreset::from_scale(frame.quality.scale).default_sharpness()
         } else {
             0.0
         };

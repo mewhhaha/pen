@@ -814,7 +814,7 @@ impl ShaderGraph {
                     if material_mode {
                         writeln!(
                             body,
-                            "  let {vname}_tex: vec4f = textureSample(sg_base_tex, sg_base_samp, {uv_e});"
+                            "  let {vname}_tex: vec4f = textureSampleBias(sg_base_tex, sg_base_samp, {uv_e}, scene.shadow_params.w);"
                         )?;
                         writeln!(
                             body,

@@ -11,11 +11,34 @@ use pen_protocol::Matrix;
 
 use crate::matrix::{invert, multiply};
 
-/// Frames before the jitter repeats.
+/// Default native-resolution frames before the jitter repeats.
 const SEQUENCE: u64 = 8;
 
-/// This frame's share of the blend.
+/// This frame's baseline share of the temporal blend.
 const BLEND: f32 = 0.1;
+
+/// AMD FSR 2.2 / 3.1 jitter phase count scaling: `ceil(8 * (out_w / in_w)^2)` clamped to `8..=72`.
+/// Returns `8` at native resolution (`1.0x`), `18` at Quality (`1.5x`), `24` at Balanced (`1.7x`),
+/// `32` at Performance (`2.0x`), and `72` at Ultra Performance (`3.0x`).
+pub fn fsr_jitter_phase_count(in_width: u32, out_width: u32) -> u32 {
+    if in_width == 0 || out_width <= in_width {
+        return 8;
+    }
+    let ratio = f64::from(out_width) / f64::from(in_width);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped positive phase count")]
+    let phases = (8.0 * ratio * ratio).ceil() as u32;
+    phases.clamp(8, 72)
+}
+
+/// AMD FSR 2.2 / 3.1 negative texture LOD mip bias (`-log2(out_w / in_w)`, clamped to `[-2.5, 0.0]`)
+/// so textures sampled at reduced internal render scale retain full native sharpness.
+pub fn fsr_mip_bias(in_width: u32, out_width: u32) -> f32 {
+    if in_width == 0 || out_width <= in_width {
+        return 0.0;
+    }
+    let ratio = (out_width as f32) / (in_width as f32);
+    (-ratio.log2()).clamp(-2.5, 0.0)
+}
 
 const SHADER: &str = include_str!("shaders/taa.wgsl");
 
@@ -36,12 +59,19 @@ fn halton(mut index: u64, base: u64) -> f64 {
     result
 }
 
+/// Where frame `frame`'s samples sit within their pixels across a `phase_count`-frame Halton(2, 3) cycle.
+pub(crate) fn jitter_for(frame: u64, phase_count: u32) -> (f64, f64) {
+    let phases = u64::from(phase_count.max(1));
+    let index = frame % phases + 1;
+    (halton(index, 2) - 0.5, halton(index, 3) - 0.5)
+}
+
 /// Where frame `frame`'s samples sit within their pixels, in pixels from
 /// the middle: the Halton (2, 3) points, which spread evenly however many of
 /// them are taken.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn jitter(frame: u64) -> (f64, f64) {
-    let index = frame % SEQUENCE + 1;
-    (halton(index, 2) - 0.5, halton(index, 3) - 0.5)
+    jitter_for(frame, u32::try_from(SEQUENCE).unwrap_or(8))
 }
 
 /// `projection` with its picture moved by `offset` pixels across and down a
@@ -86,10 +116,10 @@ impl Memory {
         usize::from(self.frames % 2 == 1)
     }
 
-    /// The TAA pass's uniform for a frame seen through `view` and
-    /// `projection`, jittered by `offset` pixels (across and down) into
-    /// `jittered`, rendered at `scene_size` and accumulated into `output_size`;
-    /// the frame is then remembered.
+    /// The TAA / FSR 2.2-class temporal upscaler uniform for a frame seen through `view` and
+    /// `projection`, jittered by `offset` pixels (across and down) into `jittered`, rendered at
+    /// `scene_size` and accumulated into `output_size`; the frame is then remembered.
+    #[allow(clippy::too_many_arguments)]
     pub fn uniform(
         &mut self,
         view: &Matrix,
@@ -97,16 +127,19 @@ impl Memory {
         (jittered, offset): (&Matrix, (f64, f64)),
         scene_size: (u32, u32),
         output_size: (u32, u32),
-    ) -> [f32; 40] {
+        reversed_z: bool,
+        has_opaque_reactive: bool,
+    ) -> [f32; 44] {
         let now = multiply(projection, view);
         let fresh = self.previous.is_none();
-        let mut data = [0.0; 40];
+        let mut data = [0.0; 44];
         data[..16].copy_from_slice(&invert(&multiply(jittered, view)));
         data[16..32].copy_from_slice(&self.previous.unwrap_or(now));
         let reset = if fresh { 1.0 } else { 0.0 };
         let (across, down) = (offset.0 / f64::from(scene_size.0.max(1)), offset.1 / f64::from(scene_size.1.max(1)));
         let (across, down) = (crate::matrix::narrow(across), crate::matrix::narrow(down));
-        data[32..].copy_from_slice(&[
+        let phases = fsr_jitter_phase_count(scene_size.0, output_size.0);
+        data[32..40].copy_from_slice(&[
             across,
             down,
             BLEND,
@@ -115,6 +148,12 @@ impl Memory {
             output_size.1 as f32,
             scene_size.0 as f32,
             scene_size.1 as f32,
+        ]);
+        data[40..44].copy_from_slice(&[
+            if reversed_z { 1.0 } else { 0.0 },
+            phases as f32,
+            if has_opaque_reactive { 1.0 } else { 0.0 },
+            if reversed_z { 0.0 } else { 1.0 },
         ]);
         self.previous = Some(now);
         self.frames += 1;
@@ -189,9 +228,9 @@ mod tests {
         let mut memory = Memory::default();
         let mut moved = IDENTITY;
         moved[12] = 1.0;
-        let first = memory.uniform(&IDENTITY, &IDENTITY, (&IDENTITY, (0.0, 0.0)), (8, 8), (8, 8));
+        let first = memory.uniform(&IDENTITY, &IDENTITY, (&IDENTITY, (0.0, 0.0)), (8, 8), (8, 8), false, false);
         assert_eq!((first[35], memory.read()), (1.0, 1));
-        let second = memory.uniform(&moved, &IDENTITY, (&IDENTITY, (0.25, -0.5)), (8, 8), (16, 16));
+        let second = memory.uniform(&moved, &IDENTITY, (&IDENTITY, (0.25, -0.5)), (8, 8), (16, 16), false, true);
         assert_eq!((second[35], memory.read()), (0.0, 0));
         // The jitter, in texture coordinates.
         assert_eq!(&second[32..34], &[0.25 / 8.0, -0.5 / 8.0]);
@@ -199,5 +238,17 @@ mod tests {
         assert_eq!(&second[16..32], &IDENTITY);
         assert_eq!(second[12], -1.0);
         assert_eq!(&second[36..40], &[16.0, 16.0, 8.0, 8.0]);
+        assert_eq!(&second[40..44], &[0.0, 32.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn fsr_jitter_phases_and_mip_bias_follow_upscale_ratio() {
+        assert_eq!(fsr_jitter_phase_count(1920, 1920), 8);
+        assert_eq!(fsr_jitter_phase_count(1280, 1920), 18); // 1.5x Quality
+        assert_eq!(fsr_jitter_phase_count(960, 1920), 32); // 2.0x Performance
+        assert_eq!(fsr_jitter_phase_count(640, 1920), 72); // 3.0x Ultra Performance
+        assert!((fsr_mip_bias(1920, 1920) - 0.0).abs() < 1e-6);
+        assert!((fsr_mip_bias(960, 1920) - (-1.0)).abs() < 1e-5);
+        assert!((fsr_mip_bias(1280, 1920) - (-1.5f32.log2())).abs() < 1e-5);
     }
 }

@@ -475,6 +475,15 @@ impl State {
         if let Some(projection) = jittered {
             self.queue.write_buffer(&self.scene_uniform, 64, bytemuck::cast_slice(&projection));
         }
+        // FSR 2.2/3.1 negative texture mip-bias (`-log2(out_w / in_w)`) stored in `scene.shadow_params.w`
+        // so textured surfaces rendered at reduced scale retain full native detail.
+        let mip_bias = if quality.upscale {
+            crate::taa::fsr_mip_bias(targets.size.0, output_width)
+        } else {
+            0.0
+        };
+        let mip_bias_offset = ((super::SCENE_FLOATS - 1) * 4) as u64;
+        self.queue.write_buffer(&self.scene_uniform, mip_bias_offset, bytemuck::bytes_of(&mip_bias));
         self.volumetrics.set_projection(&frame.view, &jittered.unwrap_or(frame.projection));
         self.prepare_screen(reflected);
         self.prepare_contact(frame, targets.size, reflected > 0);

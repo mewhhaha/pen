@@ -102,9 +102,10 @@ pub use meshlets::{
 };
 pub use oit::{OIT_SHADER_HELPERS_WGSL, OitPass, oit_color_targets};
 pub use post_fx::{
-    POST_FX_WGSL, PostFxParams, PostFxPass, RcasSharpener, TaauUpscaler, UPSCALE_RCAS_WGSL, apply_projection_jitter,
-    halton_jitter,
+    FsrEasuUpscaler, FsrQualityPreset, POST_FX_WGSL, PostFxParams, PostFxPass, RcasSharpener, TaauUpscaler,
+    UPSCALE_RCAS_WGSL, apply_projection_jitter, fsr_halton_jitter, halton_jitter,
 };
+pub use taa::{fsr_jitter_phase_count, fsr_mip_bias};
 pub use prefetch::Prefetch;
 pub use ray_tracing::{
     BVH_RAYTRACE_WGSL, Blas, BlasTriGpu, BlasTriangle, BvhNodeGpu, BvhScene, BvhTriGpu, BvhTriangle, GpuBlasPool,

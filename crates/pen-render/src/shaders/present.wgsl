@@ -1,4 +1,5 @@
 struct Present {
+  // xy: 1/output_size, z: radial blur, w: >0.5 enables AMD FidelityFX FSR 1 EASU spatial upscaling.
   output: vec4f,
   source: vec4f,
   split: vec4f,
@@ -30,11 +31,137 @@ fn marked(uv: vec2f) -> bool {
   return (textureLoad(marks, pixel, 0).x & 1u) != 0u;
 }
 
+// --- AMD FidelityFX FSR 1 EASU (12-Tap Edge-Adaptive Spatial Upsampling) ---
+fn easu_compress(c: vec3f) -> vec3f {
+  let p = max(c, vec3f(0.0));
+  return p / (p + vec3f(1.0));
+}
+
+fn easu_decompress(c: vec3f) -> vec3f {
+  let clamped = clamp(c, vec3f(0.0), vec3f(0.9999));
+  return clamped / max(vec3f(1.0) - clamped, vec3f(1e-4));
+}
+
+fn easu_luma(c: vec3f) -> f32 {
+  return 0.25 * c.r + 0.5 * c.g + 0.25 * c.b;
+}
+
+fn easu_load(p: vec2i, last: vec2i) -> vec3f {
+  return easu_compress(textureLoad(source, clamp(p, vec2i(0), last), 0).rgb);
+}
+
+fn easu_tap(
+  ac: ptr<function, vec3f>,
+  aw: ptr<function, f32>,
+  off: vec2f,
+  dir: vec2f,
+  len_scale: vec2f,
+  lob: f32,
+  clmp: f32,
+  col: vec3f,
+) {
+  let vx = off.x * dir.x + off.y * dir.y;
+  let vy = -off.x * dir.y + off.y * dir.x;
+  let sx = vx * len_scale.x;
+  let sy = vy * len_scale.y;
+  let d2 = min(sx * sx + sy * sy, clmp);
+  var wb = 0.4 * d2 - 1.0;
+  var wa = lob * d2 - 1.0;
+  wb = wb * wb;
+  wa = wa * wa;
+  wb = 1.5625 * wb - 0.5625;
+  let w = wb * wa;
+  *ac += col * w;
+  *aw += w;
+}
+
+fn easu_dir_set(
+  dir: ptr<function, vec2f>,
+  aniso_acc: ptr<function, f32>,
+  w: f32,
+  lb: f32,
+  le: f32,
+  lf: f32,
+  lg: f32,
+  lj: f32,
+) {
+  let dcx = lg - le;
+  let dcy = lj - lb;
+  var lx = max(abs(lg - lf), abs(lf - le));
+  var ly = max(abs(lj - lf), abs(lf - lb));
+  lx = clamp(abs(dcx) / max(lx, 1e-4), 0.0, 1.0);
+  ly = clamp(abs(dcy) / max(ly, 1e-4), 0.0, 1.0);
+  *dir += vec2f(dcx, dcy) * w;
+  *aniso_acc += (lx * lx + ly * ly) * w;
+}
+
+fn easu_sample_source(uv: vec2f) -> vec3f {
+  let dims = vec2f(textureDimensions(source, 0));
+  let last = vec2i(dims) - vec2i(1);
+  let pp_full = uv * dims - 0.5;
+  let fp = vec2i(floor(pp_full));
+  let pp = pp_full - vec2f(fp);
+
+  let b = easu_load(fp + vec2i(0, -1), last);
+  let c = easu_load(fp + vec2i(1, -1), last);
+  let e = easu_load(fp + vec2i(-1, 0), last);
+  let f = easu_load(fp + vec2i(0, 0), last);
+  let g = easu_load(fp + vec2i(1, 0), last);
+  let h = easu_load(fp + vec2i(2, 0), last);
+  let i = easu_load(fp + vec2i(-1, 1), last);
+  let j = easu_load(fp + vec2i(0, 1), last);
+  let k = easu_load(fp + vec2i(1, 1), last);
+  let l = easu_load(fp + vec2i(2, 1), last);
+  let n = easu_load(fp + vec2i(0, 2), last);
+  let o = easu_load(fp + vec2i(1, 2), last);
+
+  var dir = vec2f(0.0);
+  var aniso = 0.0;
+  easu_dir_set(&dir, &aniso, (1.0 - pp.x) * (1.0 - pp.y), easu_luma(b), easu_luma(e), easu_luma(f), easu_luma(g), easu_luma(j));
+  easu_dir_set(&dir, &aniso, pp.x * (1.0 - pp.y), easu_luma(c), easu_luma(f), easu_luma(g), easu_luma(h), easu_luma(k));
+  easu_dir_set(&dir, &aniso, (1.0 - pp.x) * pp.y, easu_luma(f), easu_luma(i), easu_luma(j), easu_luma(k), easu_luma(n));
+  easu_dir_set(&dir, &aniso, pp.x * pp.y, easu_luma(g), easu_luma(j), easu_luma(k), easu_luma(l), easu_luma(o));
+
+  let dir2 = dot(dir, dir);
+  dir = select(dir * inverseSqrt(max(dir2, 1e-6)), vec2f(1.0, 0.0), dir2 < 1e-6);
+  aniso = clamp(aniso * 0.5, 0.0, 1.0);
+  aniso = aniso * aniso;
+
+  let stretch = 1.0 / max(abs(dir.x), abs(dir.y));
+  let len_scale = vec2f(1.0 + (stretch - 1.0) * aniso, 1.0 - 0.5 * aniso);
+  let lob = 0.5 + (0.25 - 0.04 - 0.5) * aniso;
+  let clmp = 1.0 / max(lob, 0.1);
+
+  var ac = vec3f(0.0);
+  var aw = 0.0;
+  easu_tap(&ac, &aw, vec2f(0.0, -1.0) - pp, dir, len_scale, lob, clmp, b);
+  easu_tap(&ac, &aw, vec2f(1.0, -1.0) - pp, dir, len_scale, lob, clmp, c);
+  easu_tap(&ac, &aw, vec2f(-1.0, 0.0) - pp, dir, len_scale, lob, clmp, e);
+  easu_tap(&ac, &aw, vec2f(0.0, 0.0) - pp, dir, len_scale, lob, clmp, f);
+  easu_tap(&ac, &aw, vec2f(1.0, 0.0) - pp, dir, len_scale, lob, clmp, g);
+  easu_tap(&ac, &aw, vec2f(2.0, 0.0) - pp, dir, len_scale, lob, clmp, h);
+  easu_tap(&ac, &aw, vec2f(-1.0, 1.0) - pp, dir, len_scale, lob, clmp, i);
+  easu_tap(&ac, &aw, vec2f(0.0, 1.0) - pp, dir, len_scale, lob, clmp, j);
+  easu_tap(&ac, &aw, vec2f(1.0, 1.0) - pp, dir, len_scale, lob, clmp, k);
+  easu_tap(&ac, &aw, vec2f(2.0, 1.0) - pp, dir, len_scale, lob, clmp, l);
+  easu_tap(&ac, &aw, vec2f(0.0, 2.0) - pp, dir, len_scale, lob, clmp, n);
+  easu_tap(&ac, &aw, vec2f(1.0, 2.0) - pp, dir, len_scale, lob, clmp, o);
+
+  let mn4 = min(min(f, g), min(j, k));
+  let mx4 = max(max(f, g), max(j, k));
+  return easu_decompress(clamp(ac / max(aw, 1e-5), mn4, mx4));
+}
+
 // The picture at uv as the screen shows it: the scene's light as the camera
 // exposes it and its bloom (drawn from the exposed light), graded, then toned.
 // A picture already shown (a scene filter's) is kept as it is.
 fn fetch(uv: vec2f) -> vec3f {
-  let scene = textureSampleLevel(source, source_sampler, uv, 0.0).rgb;
+  var scene: vec3f;
+  if (present.output.w > 0.5) {
+    scene = easu_sample_source(uv);
+  } else {
+    scene = textureSampleLevel(source, source_sampler, uv, 0.0).rgb;
+  }
   let glow_light = textureSampleLevel(glow, source_sampler, uv, 0.0).rgb * present.bloom.x;
   if (present.source.w > 0.5) { return scene; }
   var light = exposed(scene, exposure[0]);

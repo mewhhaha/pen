@@ -1089,19 +1089,46 @@ fn gpu_render_frame_drives_oit_ray_tracing_ddgi_and_temporal_upscale() {
         "combined RT2 + DDGI must render cleanly with vivid indirect illumination: {px_combined:?}"
     );
 
-    // 4) Temporal Upscaling (`quality.upscale = true`, `scale = 0.5`) accumulates into full-res TAA history + RCAS!
-    let mut upscale_frame = common::frame(vec![receiver]);
+    // 4) Temporal Upscaling (`quality.upscale = true`): FSR Quality + translucent auto-reactive pass,
+    //    seamless Dynamic Resolution Scaling (0.67 -> 0.50 preserving full-res history), and non-TAA
+    //    spatial FSR 1 EASU fallback (`scale = 0.5`, `taa = false`, `upscale = false`)!
+    let red_front = Draw { mesh: 0, material: 1, transform: scale_at(3.0, -1.5), parameters: None, extra: None };
+    let dark_back = Draw { mesh: 0, material: 4, transform: scale_at(4.0, -2.0), parameters: None, extra: None };
+    let mut upscale_frame = common::frame(vec![dark_back, red_front]);
     upscale_frame.projection = proj;
     upscale_frame.quality.sky = false;
-    upscale_frame.quality.scale = 0.5;
+    upscale_frame.quality.scale = 0.6667;
     upscale_frame.quality.upscale = true;
-    for _ in 0..8 {
+    for _ in 0..6 {
         renderer.submit(&upscale_frame, &catalog, &mut target).unwrap();
     }
     let passes = renderer.passes();
     assert!(passes.contains(&"taa"), "quality.upscale=true must enable temporal accumulation pass: {passes:?}");
+    let px_fsr_q = common::middle(&device, &queue, &target.0);
+    assert!(
+        px_fsr_q[0] > 100 && px_fsr_q[0] > px_fsr_q[2].saturating_add(30),
+        "FSR Quality upscale with translucent auto-reactive overlay must render cleanly: {px_fsr_q:?}"
+    );
+
+    // Seamless DRS transition (0.6667 -> 0.50) preserves full-res history without artifacts.
+    upscale_frame.quality.scale = 0.5;
+    upscale_frame.draws = vec![receiver.clone()];
+    for _ in 0..4 {
+        renderer.submit(&upscale_frame, &catalog, &mut target).unwrap();
+    }
     let px_up = common::middle(&device, &queue, &target.0);
-    assert!(px_up[0] > 100 && px_up[1] > 100 && px_up[2] > 100, "upscaled receiver must render cleanly: {px_up:?}");
+    assert!(px_up[0] > 100 && px_up[1] > 100 && px_up[2] > 100, "DRS FSR Performance receiver must render cleanly: {px_up:?}");
+
+    // Non-TAA reduced-scale spatial FSR 1 EASU path in present.wgsl.
+    let mut easu_frame = common::frame(vec![receiver]);
+    easu_frame.projection = proj;
+    easu_frame.quality.sky = false;
+    easu_frame.quality.scale = 0.5;
+    easu_frame.quality.taa = false;
+    easu_frame.quality.upscale = false;
+    renderer.submit(&easu_frame, &catalog, &mut target).unwrap();
+    let px_easu = common::middle(&device, &queue, &target.0);
+    assert!(px_easu[0] > 100 && px_easu[1] > 100 && px_easu[2] > 100, "non-TAA FSR 1 EASU present path must render cleanly: {px_easu:?}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

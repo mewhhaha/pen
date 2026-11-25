@@ -552,6 +552,9 @@ struct Inputs {
     velocity: wgpu::TextureView,
     /// With TAA, the history texture read and the one drawn.
     history: Option<[wgpu::TextureView; 2]>,
+    /// Opaque-only lit backdrop (for Part::After) so TAA/FSR computes an automatic reactive mask
+    /// over translucents, particles, ribbons, and overlays with zero extra passes.
+    opaque_color: Option<wgpu::TextureView>,
 }
 
 /// Which of the passes after the scene a graph holds.
@@ -850,7 +853,20 @@ impl Post {
         };
         let mut targets_recreated = false;
         if self.targets.as_ref().is_none_or(|targets| targets.key != key) {
-            self.targets = None;
+            // Preserve full-resolution TAA/FSR history textures and camera memory across dynamic
+            // resolution scale changes (`--frame-budget` / FSR DRS) when output dimensions stay constant.
+            let reusable_histories = self.targets.take().and_then(|prev| {
+                if taa
+                    && prev.key.taa
+                    && prev.key.taa_width == taa_width
+                    && prev.key.taa_height == taa_height
+                    && !frame.exposure.cut
+                {
+                    prev.histories
+                } else {
+                    None
+                }
+            });
             targets_recreated = true;
             let attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
             let sampled = attachment | wgpu::TextureUsages::TEXTURE_BINDING;
@@ -880,21 +896,28 @@ impl Post {
                 .as_ref()
                 .map(|(v, _)| v.clone())
                 .unwrap_or_else(|| self.no_velocity.create_view(&Default::default()));
-            // With TAA, a graph for each history texture read, sharing the
-            // rest; a new history starts afresh.
-            self.memory = Default::default();
-            self.previous_vp = None;
-            let histories =
-                taa.then(|| [0, 1].map(|_| crate::taa::history(device, taa_width, taa_height, SCENE_FORMAT)));
+            let kept = if let Some(prev_views) = reusable_histories {
+                Some(prev_views)
+            } else {
+                // With TAA, a graph for each history texture read, sharing the
+                // rest; a new history starts afresh.
+                self.memory = Default::default();
+                self.previous_vp = None;
+                taa.then(|| {
+                    let textures = [0, 1].map(|_| crate::taa::history(device, taa_width, taa_height, SCENE_FORMAT));
+                    [view(&textures[0]), view(&textures[1])]
+                })
+            };
             let mut graphs: Vec<Graph> = Vec::new();
             for read in 0..if taa { 2 } else { 1 } {
-                let history = histories.as_ref().map(|textures| [view(&textures[read]), view(&textures[1 - read])]);
+                let history = kept.as_ref().map(|views| [views[read].clone(), views[1 - read].clone()]);
                 let inputs = Inputs {
                     depth: depth_only(),
                     scene: view(&scene),
                     marks: marks.clone(),
                     velocity: vel_view.clone(),
                     history,
+                    opaque_color: None,
                 };
                 let graph = self
                     .graph(built_ins, key, inputs, Part::Whole, volume, physical_sky, graphs.first())
@@ -902,7 +925,6 @@ impl Post {
                 log::debug!("passes after the scene: {:?}, {} textures", graph.names(), graph.allocations());
                 graphs.push(graph);
             }
-            let kept = histories.as_ref().map(|textures| [view(&textures[0]), view(&textures[1])]);
             self.targets = Some(Targets {
                 key,
                 histories: kept,
@@ -936,10 +958,11 @@ impl Post {
             let diffusion = self.diffusion(built_ins);
             self.targets.as_mut().unwrap().subsurface = Some(diffusion);
         }
-        // The scene's samples move within their pixels from frame to frame.
+        // The scene's samples move within their pixels from frame to frame across an FSR-scaled Halton cycle.
         self.jittered = taa.then(|| {
             self.jitters += 1;
-            let offset = crate::taa::jitter(self.jitters);
+            let phases = crate::taa::fsr_jitter_phase_count(width, taa_width);
+            let offset = crate::taa::jitter_for(self.jitters, phases);
             (crate::taa::jittered(&frame.projection, offset, (width, height)), offset)
         });
         let current = self.targets.as_ref().unwrap();
@@ -993,18 +1016,19 @@ impl Post {
         let (depth_w, depth_h) = if opaque_depth { (width, height) } else { (1, 1) };
         let nearest = texture(&self.device, depth_w, depth_h, sampled, 1, wgpu::TextureFormat::R32Float, 1)
             .create_view(&Default::default());
-        let inputs = |read: usize| Inputs {
+        let inputs = |read: usize, opaque_color: Option<wgpu::TextureView>| Inputs {
             depth: depth.clone(),
             scene: scene.clone(),
             marks: marks.clone(),
             velocity: velocity.clone(),
             history: histories.as_ref().map(|textures| [textures[read].clone(), textures[1 - read].clone()]),
+            opaque_color,
         };
         let before = self
             .graph(
                 built_ins,
                 key,
-                inputs(0),
+                inputs(0, None),
                 Part::Opaque(&levels, opaque_depth.then_some(&nearest)),
                 volume,
                 physical_sky,
@@ -1015,7 +1039,15 @@ impl Post {
         let mut after: Vec<Graph> = Vec::new();
         for read in 0..if taa { 2 } else { 1 } {
             let graph = self
-                .graph(built_ins, key, inputs(read), Part::After, volume, physical_sky, after.first())
+                .graph(
+                    built_ins,
+                    key,
+                    inputs(read, Some(levels[0].clone())),
+                    Part::After,
+                    volume,
+                    physical_sky,
+                    after.first(),
+                )
                 .expect("the passes after the translucent pass read only what earlier ones draw");
             log::debug!("passes after the translucent pass: {:?}, {} textures", graph.names(), graph.allocations());
             after.push(graph);
@@ -1214,11 +1246,15 @@ impl Post {
             }
             return graph.compile(&self.device, built_ins, sharing);
         }
-        // TAA blends the lit picture into the history, which the passes
-        // after it read.
+        // TAA / FSR 2.2-class temporal super resolution blends the lit picture into the history,
+        // deriving an auto-reactive mask against `opaque_color` when translucents/particles are present.
         if let Some([read, drawn]) = inputs.history {
             let (read, drawn) = (graph.import("history", read), graph.import("history", drawn));
-            let uniform = Binding::Uniform(self.uniform("taa", 160));
+            let opaque_reactive = match inputs.opaque_color {
+                Some(view) => graph.import("opaque_reactive", view),
+                None => lit,
+            };
+            let uniform = Binding::Uniform(self.uniform("taa", 176));
             let bindings = vec![
                 uniform,
                 Binding::Texture(lit),
@@ -1226,6 +1262,7 @@ impl Post {
                 Binding::Texture(depth),
                 sampler.clone(),
                 Binding::Texture(velocity),
+                Binding::Texture(opaque_reactive),
             ];
             graph.pass("taa", BuiltIn::Taa(samples), bindings, Target::Texture(drawn), false);
             lit = drawn;
@@ -1408,13 +1445,17 @@ impl Post {
         // The graph reading the history this frame reads.
         let graph = if taa { self.memory.read() } else { 0 };
         if taa {
-            let uniform = self.uniform("taa", 160);
+            let uniform = self.uniform("taa", 176);
+            let reversed_z =
+                crate::camera_precision::detect_depth_mode(&frame.projection) == Some(crate::camera_precision::DepthMode::ReversedZ);
             let data = self.memory.uniform(
                 &frame.view,
                 &frame.projection,
                 (&projection, offset),
                 (width, height),
                 (taa_width, taa_height),
+                reversed_z,
+                self.translucent,
             );
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
@@ -1436,6 +1477,7 @@ impl Post {
         }
         let uniform = self.uniform("present", 64);
         let (output_width, output_height) = (size.0 as f32, size.1 as f32);
+        let use_easu = !quality.fxaa && (taa_width < size.0 || taa_height < size.1);
         self.queue.write_buffer(
             &uniform,
             0,
@@ -1443,7 +1485,7 @@ impl Post {
                 1.0 / output_width,
                 1.0 / output_height,
                 if quality.effects && !filtered { frame.blur } else { 0.0 },
-                0.0,
+                if use_easu { 1.0 } else { 0.0 },
                 1.0 / taa_width as f32,
                 1.0 / taa_height as f32,
                 if quality.fxaa { 1.0 } else { 0.0 },

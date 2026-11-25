@@ -58,10 +58,23 @@ pub(crate) enum Binding {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
     Texture(Handle),
+    /// Two color targets written in one render pass (MRT, e.g. TAA color + lock status).
+    Pair(Handle, Handle),
     /// The frame's output, which `execute` is given.
     Output,
     /// Nothing: a hook's.
     Nothing,
+}
+
+impl Target {
+    fn handles(self) -> impl Iterator<Item = Handle> {
+        let (first, second) = match self {
+            Target::Texture(h) => (Some(h), None),
+            Target::Pair(h0, h1) => (Some(h0), Some(h1)),
+            Target::Output | Target::Nothing => (None, None),
+        };
+        first.into_iter().chain(second)
+    }
 }
 
 struct Pass {
@@ -143,7 +156,10 @@ impl GraphBuilder {
             for read in pass.reads() {
                 ensure!(drawn[read.0], "{} reads {} before a pass draws it", pass.name, self.textures[read.0].name);
             }
-            if let Target::Texture(target) = pass.target {
+            if let Target::Pair(a, b) = pass.target {
+                ensure!(a != b, "{} draws into {} twice", pass.name, self.textures[a.0].name);
+            }
+            for target in pass.target.handles() {
                 let name = self.textures[target.0].name;
                 ensure!(pass.reads().all(|read| read != target), "{} reads {name}, which it draws into", pass.name);
                 ensure!(!pass.over || drawn[target.0], "{} draws over {name} before a pass draws it", pass.name);
@@ -155,15 +171,12 @@ impl GraphBuilder {
         let mut needed = vec![false; self.textures.len()];
         let mut live = vec![false; self.passes.len()];
         for (index, pass) in self.passes.iter().enumerate().rev() {
-            let target = match pass.target {
-                Target::Output | Target::Nothing => None,
-                Target::Texture(target) => Some(target),
-            };
-            if target.is_some_and(|target| !needed[target.0] && !self.imported(target)) {
+            let has_targets = !matches!(pass.target, Target::Output | Target::Nothing);
+            if has_targets && pass.target.handles().all(|target| !needed[target.0] && !self.imported(target)) {
                 continue;
             }
             live[index] = true;
-            if let Some(target) = target {
+            for target in pass.target.handles() {
                 // Drawing over it needs what was there.
                 needed[target.0] = pass.over;
             }
@@ -176,11 +189,7 @@ impl GraphBuilder {
         let mut uses: Vec<Option<(usize, usize)>> = vec![None; self.textures.len()];
         for (place, &index) in passes.iter().enumerate() {
             let pass = &self.passes[index];
-            let target = match pass.target {
-                Target::Texture(target) => Some(target),
-                Target::Output | Target::Nothing => None,
-            };
-            for handle in pass.reads().chain(target) {
+            for handle in pass.reads().chain(pass.target.handles()) {
                 let span = uses[handle.0].get_or_insert((place, place));
                 span.1 = place;
             }
@@ -255,7 +264,7 @@ impl GraphBuilder {
                     name: pass.name,
                     pipeline: None,
                     group: None,
-                    target: None,
+                    targets: Vec::new(),
                     over: false,
                     hook: Some(view(*read).clone()),
                 });
@@ -278,15 +287,12 @@ impl GraphBuilder {
                 layout: &pipeline.get_bind_group_layout(0),
                 entries: &entries,
             });
-            let target = match pass.target {
-                Target::Texture(handle) => Some(view(handle).clone()),
-                Target::Output | Target::Nothing => None,
-            };
+            let targets = pass.target.handles().map(|handle| view(handle).clone()).collect();
             passes.push(CompiledPass {
                 name: pass.name,
                 pipeline: Some(which),
                 group: Some(group),
-                target,
+                targets,
                 over: pass.over,
                 hook: None,
             });
@@ -299,8 +305,8 @@ struct CompiledPass {
     name: &'static str,
     pipeline: Option<BuiltIn>,
     group: Option<wgpu::BindGroup>,
-    /// None for the output.
-    target: Option<wgpu::TextureView>,
+    /// Empty for the output.
+    targets: Vec<wgpu::TextureView>,
     over: bool,
     /// The texture a hook reads.
     hook: Option<wgpu::TextureView>,
@@ -336,18 +342,32 @@ impl Graph {
                 hook(pass.hook.as_ref().expect("a hook has its texture"), encoder);
                 continue;
             };
+            let load = if pass.over { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::BLACK) };
+            let ops = wgpu::Operations { load, store: wgpu::StoreOp::Store };
+            let attachments: Vec<Option<wgpu::RenderPassColorAttachment<'_>>> = if pass.targets.is_empty() {
+                vec![Some(wgpu::RenderPassColorAttachment {
+                    view: output.expect("a pass that draws into the output has one"),
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops,
+                })]
+            } else {
+                pass.targets
+                    .iter()
+                    .map(|view| {
+                        Some(wgpu::RenderPassColorAttachment {
+                            view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops,
+                        })
+                    })
+                    .collect()
+            };
             let mut drawing = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(pass.name),
                 timestamp_writes: timer.pass(span),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: pass.target.as_ref().or(output).expect("a pass that draws into the output has one"),
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: if pass.over { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::BLACK) },
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                color_attachments: &attachments,
                 ..Default::default()
             });
             drawing.set_pipeline(built_ins.get(which));
@@ -444,5 +464,22 @@ mod tests {
         pass(&mut graph, "draw", &[], Target::Texture(a), false);
         pass(&mut graph, "feedback", &[a], Target::Texture(a), false);
         assert_eq!(graph.plan().unwrap_err().to_string(), "feedback reads a, which it draws into");
+    }
+
+    #[test]
+    fn mrt_pair_plans_both_targets_and_rejects_alias() {
+        let mut graph = GraphBuilder::default();
+        let color = graph.texture("color", spec(8));
+        let lock = graph.texture("lock", spec(8));
+        pass(&mut graph, "taa", &[], Target::Pair(color, lock), false);
+        pass(&mut graph, "present", &[color, lock], Target::Output, false);
+        let plan = graph.plan().unwrap();
+        assert_eq!(names(&graph, &plan), ["taa", "present"]);
+        assert_eq!(plan.allocations.len(), 2, "distinct live MRT targets cannot alias one allocation");
+
+        let mut dup = GraphBuilder::default();
+        let same = dup.texture("same", spec(8));
+        pass(&mut dup, "bad_mrt", &[], Target::Pair(same, same), false);
+        assert_eq!(dup.plan().unwrap_err().to_string(), "bad_mrt draws into same twice");
     }
 }

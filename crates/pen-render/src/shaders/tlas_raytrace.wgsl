@@ -97,6 +97,27 @@ fn rt_ddgi_sample_irr(irr_off: u32, w: u32, h: u32, fpx: vec2f) -> vec4f {
   return mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
 }
 
+fn rt_ddgi_vis_at(vis_off: u32, w: u32, x: u32, y: u32) -> vec2f {
+  let idx = y * w + x;
+  let packed = ddgi_packed[vis_off + (idx >> 1u)];
+  return select(packed.xy, packed.zw, (idx & 1u) != 0u);
+}
+
+fn rt_ddgi_sample_vis(vis_off: u32, w: u32, h: u32, fpx: vec2f) -> vec2f {
+  let p = fpx - vec2f(0.5);
+  let x0 = u32(clamp(floor(p.x), 0.0, f32(w - 1u)));
+  let y0 = u32(clamp(floor(p.y), 0.0, f32(h - 1u)));
+  let x1 = min(x0 + 1u, w - 1u);
+  let y1 = min(y0 + 1u, h - 1u);
+  let fx = clamp(p.x - f32(x0), 0.0, 1.0);
+  let fy = clamp(p.y - f32(y0), 0.0, 1.0);
+  let c00 = rt_ddgi_vis_at(vis_off, w, x0, y0);
+  let c10 = rt_ddgi_vis_at(vis_off, w, x1, y0);
+  let c01 = rt_ddgi_vis_at(vis_off, w, x0, y1);
+  let c11 = rt_ddgi_vis_at(vis_off, w, x1, y1);
+  return mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
+}
+
 fn rt_ddgi_cascade(cascade_idx: u32, world: vec3f, normal: vec3f) -> vec4f {
   let base = 1u + cascade_idx * 6u;
   let h0 = ddgi_packed[base + 0u];
@@ -104,6 +125,7 @@ fn rt_ddgi_cascade(cascade_idx: u32, world: vec3f, normal: vec3f) -> vec4f {
   let h2 = ddgi_packed[base + 2u];
   let h3 = ddgi_packed[base + 3u];
   let h4 = ddgi_packed[base + 4u];
+  let h5 = ddgi_packed[base + 5u];
   let dims = vec3u(u32(max(h2.x, 0.0)), u32(max(h2.y, 0.0)), u32(max(h2.z, 0.0)));
   if (dims.x < 2u || dims.y < 2u || dims.z < 2u) {
     return vec4f(0.0);
@@ -122,9 +144,13 @@ fn rt_ddgi_cascade(cascade_idx: u32, world: vec3f, normal: vec3f) -> vec4f {
   }
   let scroll = vec3i(i32(round(h3.x)), i32(round(h3.y)), i32(round(h3.z)));
   let irr_off = u32(max(h3.w, 0.0));
+  let vis_off = u32(max(h4.x, 0.0));
   let strength = max(h4.y, 0.0);
   let irr_w = u32(max(h4.z, 1.0));
   let irr_h = u32(max(h4.w, 1.0));
+  let vis_w = u32(max(h5.x, 1.0));
+  let vis_h = u32(max(h5.y, 1.0));
+  let offsets_off = u32(max(h5.z, 0.0));
 
   let clamped = clamp(rel, vec3f(0.0), max_c);
   let base_i = vec3u(floor(clamped));
@@ -143,7 +169,9 @@ fn rt_ddgi_cascade(cascade_idx: u32, world: vec3f, normal: vec3f) -> vec4f {
     );
     let tri_v = mix(vec3f(1.0) - alpha, alpha, vec3f(off));
     var w = max(tri_v.x * tri_v.y * tri_v.z, 1e-4);
-    let probe_pos = origin + vec3f(coord) * spacing;
+    let s_idx = (sc.y * dims.z + sc.z) * dims.x + sc.x;
+    let probe_off = select(vec3f(0.0), ddgi_packed[offsets_off + s_idx].xyz, offsets_off > 0u);
+    let probe_pos = origin + vec3f(coord) * spacing + probe_off;
     let to_probe = probe_pos - world;
     let d_u = length(to_probe);
     let dir_p = select(normal, to_probe / d_u, d_u > 1e-5);
@@ -152,6 +180,23 @@ fn rt_ddgi_cascade(cascade_idx: u32, world: vec3f, normal: vec3f) -> vec4f {
 
     let s_col = sc.z * dims.x + sc.x;
     let s_row = sc.y;
+    // Chebyshev visibility test from probe toward biased surface point (prevents thin-wall GI leaks in reflections).
+    if (vis_off > 0u) {
+      let p2pt = biased_pos - probe_pos;
+      let d_pt = length(p2pt);
+      let dir_from_probe = select(-normal, p2pt / d_pt, d_pt > 1e-5);
+      let oct_v = rt_ddgi_oct_encode(dir_from_probe) * 0.5 + vec2f(0.5);
+      let vis_px = vec2f(f32(s_col * 18u + 1u), f32(s_row * 18u + 1u)) + oct_v * 16.0;
+      let moments = rt_ddgi_sample_vis(vis_off, vis_w, vis_h, vis_px);
+      if (d_pt > moments.x) {
+        let variance = max(abs(moments.y - moments.x * moments.x), 1e-4);
+        let d = d_pt - moments.x;
+        var cheb = variance / (variance + d * d);
+        cheb = max(cheb * cheb * cheb, 0.0);
+        w *= cheb;
+      }
+    }
+
     let irr_px = vec2f(f32(s_col * 10u + 1u), f32(s_row * 10u + 1u)) + oct_n * 8.0;
     let texel = rt_ddgi_sample_irr(irr_off, irr_w, irr_h, irr_px);
     w *= clamp(texel.a, 0.0, 1.0);
@@ -289,12 +334,22 @@ fn load_world(px: vec2i, dims: vec2i) -> DepthPt {
   return DepthPt(clip.xyz / clip.w, true);
 }
 
-fn sample_ggx_half(rnd: vec2f, roughness: f32) -> vec3f {
-  let a = max(roughness * roughness, 0.002);
-  let phi = 2.0 * PI * rnd.x;
-  let cos_t = sqrt(clamp((1.0 - rnd.y) / (1.0 + (a * a - 1.0) * rnd.y), 0.0, 1.0));
-  let sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
-  return vec3f(cos(phi) * sin_t, sin(phi) * sin_t, cos_t);
+// Eric Heitz (JCGT 2018): Sampling the GGX Distribution of Visible Normals (VNDF).
+// Dramatically reduces grazing-angle fireflies and eliminates invalid below-horizon samples.
+fn sample_ggx_vndf(v_local: vec3f, roughness: f32, rnd: vec2f) -> vec3f {
+  let alpha = max(roughness * roughness, 0.002);
+  let vh = normalize(vec3f(alpha * v_local.x, alpha * v_local.y, max(v_local.z, 1e-4)));
+  let lensq = vh.x * vh.x + vh.y * vh.y;
+  let t1 = select(vec3f(1.0, 0.0, 0.0), vec3f(-vh.y, vh.x, 0.0) * inverseSqrt(lensq), lensq > 1e-8);
+  let t2 = cross(vh, t1);
+  let r = sqrt(clamp(rnd.x, 0.0, 0.99999));
+  let phi = 2.0 * PI * rnd.y;
+  let t1_c = r * cos(phi);
+  var t2_c = r * sin(phi);
+  let s = 0.5 * (1.0 + vh.z);
+  t2_c = (1.0 - s) * sqrt(max(0.0, 1.0 - t1_c * t1_c)) + s * t2_c;
+  let nh = t1_c * t1 + t2_c * t2 + sqrt(max(0.0, 1.0 - t1_c * t1_c - t2_c * t2_c)) * vh;
+  return normalize(vec3f(alpha * nh.x, alpha * nh.y, max(0.0, nh.z)));
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -462,22 +517,26 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
     ao_vis = clamp(open / f32(ao_samples), 0.0, 1.0);
     dist_sum /= f32(ao_samples);
   }
-  textureStore(out_shadow_ao, px, vec4f(sun_vis, ao_vis, dist_sum, 1.0));
-
-  // 3. GGX Specular Ray-Traced Reflections (with per-pixel roughness & Schlick Fresnel when material lookup active).
+  // 3. Heitz VNDF GGX Specular Ray-Traced Reflections with matte roughness cutoff (> 0.75)
+  //    and energy-conserving local-hit coverage for sky IBL attenuation.
   let refl_samples = clamp(u32(round(u.bias_and_refl.y)), 0u, 8u);
   let roughness = select(clamp(u.sun_color_and_rough.a, 0.0, 1.0), mat_roughness, use_mat_gbuf);
+  let skip_matte = use_mat_gbuf && (roughness > 0.75);
   var refl_acc = vec3f(0.0);
-  var refl_dist = 0.0;
+  var refl_dist = max_dist;
   var refl_valid = 0.0;
-  if (refl_samples > 0u) {
+  var refl_hits = 0.0;
+  var refl_occlude = 0.0;
+  if (refl_samples > 0u && !skip_matte) {
+    refl_dist = 0.0;
+    let v_local = transpose(n_basis) * view_dir;
     for (var s = 0u; s < refl_samples; s++) {
       var r_dir: vec3f;
       if (roughness < 0.02) {
         r_dir = reflect(-view_dir, n);
       } else {
         let rnd = hash23(vec3f(vec2f(id.xy) + vec2f(41.7, 3.1), u.samples_seed.w * 23.1 + f32(s) * 7.9));
-        let h_local = sample_ggx_half(rnd, roughness);
+        let h_local = sample_ggx_vndf(v_local, roughness, rnd);
         let h_world = normalize(n_basis * h_local);
         r_dir = reflect(-view_dir, h_world);
       }
@@ -489,6 +548,7 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
         let hp = ray_origin + r_dir * h.t;
         refl_acc += shade_hit(hp, h, sun_dir, sun_color, bias, mask);
         refl_dist += h.t;
+        refl_hits += 1.0;
       } else if (!use_mat_gbuf) {
         refl_acc += eval_sky(r_dir);
         refl_dist += max_dist;
@@ -501,15 +561,29 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
     if (refl_valid > 0.0) {
       refl_acc /= refl_valid;
       refl_dist /= refl_valid;
+    } else {
+      refl_dist = max_dist;
     }
     if (use_mat_gbuf) {
       let f0 = select(vec3f(0.04), mix(vec3f(0.04), mat_albedo, mat_metallic), has_mat_hit);
       let ndv = clamp(dot(n, view_dir), 0.0, 1.0);
       let fresnel = f0 + (vec3f(1.0) - f0) * pow(1.0 - ndv, 5.0);
-      let rough_scale = clamp(1.0 - roughness * 0.72, 0.12, 1.0);
+      let rough_fade = smoothstep(0.75, 0.58, roughness);
+      let rough_scale = clamp(1.0 - roughness * 0.65, 0.15, 1.0) * rough_fade;
       refl_acc *= fresnel * rough_scale;
+      let hit_cov = select(0.0, refl_hits / refl_valid, refl_valid > 0.0);
+      let fresnel_luma = dot(fresnel, vec3f(0.2126, 0.7152, 0.0722));
+      refl_occlude = clamp(hit_cov * fresnel_luma * rough_fade, 0.0, 0.75);
     }
   }
+  // When primary material lookup is active, pack denoised reflection sky-occlusion into `out_shadow_ao.b`
+  // and per-pixel material roughness into `out_shadow_ao.a` for specular SVGF + energy-conserving composite.
+  let sao_out = select(
+    vec4f(sun_vis, ao_vis, dist_sum, 1.0),
+    vec4f(sun_vis, ao_vis, refl_occlude, roughness),
+    use_mat_gbuf,
+  );
+  textureStore(out_shadow_ao, px, sao_out);
   textureStore(out_reflection, px, vec4f(refl_acc, refl_dist));
 
   // 4. 1-Bounce Cosine-Weighted Diffuse GI (skipped when DDGI supplies multi-bounce diffuse in-shader).

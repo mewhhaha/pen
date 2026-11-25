@@ -29,6 +29,10 @@ pub struct SvgfParams {
     pub atrous_iterations: u32,
     /// Force-discard temporal history on camera cuts / teleports.
     pub reset_history: bool,
+    /// Specular reflection denoising mode: reprojects via virtual hit-point parallax motion (`motion.zw`),
+    /// applies 3x3 YCoCg temporal neighborhood clamping to suppress mirror ghosting, and scales
+    /// A-Trous edge-stopping weights by surface roughness (`normal.w`).
+    pub specular_mode: bool,
 }
 
 impl Default for SvgfParams {
@@ -44,6 +48,7 @@ impl Default for SvgfParams {
             variance_boost: 4.0,
             atrous_iterations: 4,
             reset_history: false,
+            specular_mode: false,
         }
     }
 }
@@ -274,9 +279,10 @@ impl SvgfDenoiser {
         }
         let st = self.state.as_mut().unwrap();
         let reset = params.reset_history || !st.has_history;
+        let spec_bit = if params.specular_mode { 2u32 } else { 0u32 };
 
         let u_temporal = SvgfUniform {
-            dims: [size.0, size.1, 1, u32::from(reset)],
+            dims: [size.0, size.1, 1, u32::from(reset) | spec_bit],
             temporal_params: [
                 params.min_alpha.clamp(0.01, 1.0),
                 params.max_history.clamp(1.0, 256.0),
@@ -341,7 +347,7 @@ impl SvgfDenoiser {
         let mut src_is_pong = false;
         for iter in 0..iters {
             let step = 1u32 << iter;
-            let u_iter = SvgfUniform { dims: [size.0, size.1, step, 0], ..u_temporal };
+            let u_iter = SvgfUniform { dims: [size.0, size.1, step, spec_bit], ..u_temporal };
             encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u_iter));
             let (src_view, dst_view) = if src_is_pong {
                 (&st.pong.view, &st.ping.view)
@@ -588,5 +594,220 @@ mod tests {
         );
         drop(data);
         rb.unmap();
+    }
+
+    fn read_rgba16f_tex(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, w: u32, h: u32) -> Vec<[f32; 4]> {
+        let bpr = (w * 8).next_multiple_of(256);
+        let rb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("svgf_spec_rb"),
+            size: u64::from(bpr * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &rb,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit(Some(enc.finish()));
+        let slice = rb.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap().unwrap();
+        let data = slice.get_mapped_range().unwrap();
+        let mut out = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * bpr + x * 8) as usize;
+                out.push([
+                    f16_to_f32(u16::from_le_bytes([data[o], data[o + 1]])),
+                    f16_to_f32(u16::from_le_bytes([data[o + 2], data[o + 3]])),
+                    f16_to_f32(u16::from_le_bytes([data[o + 4], data[o + 5]])),
+                    f16_to_f32(u16::from_le_bytes([data[o + 6], data[o + 7]])),
+                ]);
+            }
+        }
+        drop(data);
+        rb.unmap();
+        out
+    }
+
+    #[test]
+    fn gpu_svgf_specular_ycocg_clamp_parallax_reproj_and_roughness_atrous_witness() {
+        let (device, queue) = crate::testing::device().expect("GPU adapter required");
+        let (w, h) = (32u32, 32u32);
+        let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("svgf_spec_d"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            depth_tex.as_image_copy(),
+            bytemuck::cast_slice(&vec![0.5f32; (w * h) as usize]),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let depth_v = depth_tex.create_view(&Default::default());
+        let mirror_n = upload_rgba16f(&device, &queue, w, h, &vec![[0.0, 1.0, 0.0, 0.06]; (w * h) as usize]);
+        let rough_n = upload_rgba16f(&device, &queue, w, h, &vec![[0.0, 1.0, 0.0, 0.70]; (w * h) as usize]);
+        let zero_m = upload_rgba16f(&device, &queue, w, h, &vec![[0.0; 4]; (w * h) as usize]);
+        let mirror_nv = mirror_n.create_view(&Default::default());
+        let rough_nv = rough_n.create_view(&Default::default());
+        let zero_mv = zero_m.create_view(&Default::default());
+
+        // 1. YCoCg neighborhood clamping suppresses stale mirror reflection ghosting immediately on color flip.
+        let green = upload_rgba16f(&device, &queue, w, h, &vec![[0.0, 1.0, 0.0, 1.0]; (w * h) as usize]);
+        let red = upload_rgba16f(&device, &queue, w, h, &vec![[1.0, 0.0, 0.0, 1.0]; (w * h) as usize]);
+        let green_v = green.create_view(&Default::default());
+        let red_v = red.create_view(&Default::default());
+
+        let mut spec = SvgfDenoiser::new(&device);
+        let mut diff = SvgfDenoiser::new(&device);
+        let spec_p = SvgfParams { min_alpha: 0.05, atrous_iterations: 2, specular_mode: true, ..Default::default() };
+        let diff_p = SvgfParams { min_alpha: 0.05, atrous_iterations: 2, specular_mode: false, ..Default::default() };
+        for _ in 0..8 {
+            let mut enc = device.create_command_encoder(&Default::default());
+            let inp = SvgfInputs {
+                noisy_signal: &green_v,
+                depth: &depth_v,
+                prev_depth: &depth_v,
+                normal: &mirror_nv,
+                prev_normal: &mirror_nv,
+                motion: &zero_mv,
+            };
+            spec.denoise(&device, &mut enc, &inp, (w, h), &spec_p).unwrap();
+            diff.denoise(&device, &mut enc, &inp, (w, h), &diff_p).unwrap();
+            queue.submit(Some(enc.finish()));
+        }
+        let mut enc_flip = device.create_command_encoder(&Default::default());
+        let flip_in = SvgfInputs {
+            noisy_signal: &red_v,
+            depth: &depth_v,
+            prev_depth: &depth_v,
+            normal: &mirror_nv,
+            prev_normal: &mirror_nv,
+            motion: &zero_mv,
+        };
+        spec.denoise(&device, &mut enc_flip, &flip_in, (w, h), &spec_p).unwrap();
+        diff.denoise(&device, &mut enc_flip, &flip_in, (w, h), &diff_p).unwrap();
+        queue.submit(Some(enc_flip.finish()));
+        let s_px = read_rgba16f_tex(&device, &queue, spec.output_texture().unwrap(), w, h)[(16 * w + 16) as usize];
+        let d_px = read_rgba16f_tex(&device, &queue, diff.output_texture().unwrap(), w, h)[(16 * w + 16) as usize];
+        assert!(
+            s_px[0] > 0.85 && s_px[1] < 0.05 && d_px[1] > 0.80,
+            "specular YCoCg clamp must wipe stale green reflection immediately: spec={s_px:?}, diff={d_px:?}"
+        );
+
+        // 2. Virtual parallax motion (`motion.zw`) reprojects shifted mirror highlights while `motion.xy == 0`.
+        let mut sq0 = vec![[0.02f32, 0.02, 0.02, 1.0]; (w * h) as usize];
+        let mut sq1 = vec![[0.02f32, 0.02, 0.02, 1.0]; (w * h) as usize];
+        for y in 12..20 {
+            for x in 8..16 {
+                sq0[(y * w + x) as usize] = [0.1, 0.9, 1.0, 1.0];
+                sq1[(y * w + (x + 4)) as usize] = [0.1, 0.9, 1.0, 1.0];
+            }
+        }
+        let sq0_t = upload_rgba16f(&device, &queue, w, h, &sq0);
+        let sq1_t = upload_rgba16f(&device, &queue, w, h, &sq1);
+        let sq0_v = sq0_t.create_view(&Default::default());
+        let sq1_v = sq1_t.create_view(&Default::default());
+        let parallax_m = upload_rgba16f(&device, &queue, w, h, &vec![[0.0, 0.0, 4.0 / w as f32, 0.0]; (w * h) as usize]);
+        let parallax_mv = parallax_m.create_view(&Default::default());
+        let mut para = SvgfDenoiser::new(&device);
+        let mut enc_p = device.create_command_encoder(&Default::default());
+        para.denoise(
+            &device,
+            &mut enc_p,
+            &SvgfInputs {
+                noisy_signal: &sq0_v,
+                depth: &depth_v,
+                prev_depth: &depth_v,
+                normal: &mirror_nv,
+                prev_normal: &mirror_nv,
+                motion: &zero_mv,
+            },
+            (w, h),
+            &SvgfParams { reset_history: true, atrous_iterations: 1, specular_mode: true, ..Default::default() },
+        )
+        .unwrap();
+        para.denoise(
+            &device,
+            &mut enc_p,
+            &SvgfInputs {
+                noisy_signal: &sq1_v,
+                depth: &depth_v,
+                prev_depth: &depth_v,
+                normal: &mirror_nv,
+                prev_normal: &mirror_nv,
+                motion: &parallax_mv,
+            },
+            (w, h),
+            &SvgfParams { reset_history: false, atrous_iterations: 1, specular_mode: true, ..Default::default() },
+        )
+        .unwrap();
+        queue.submit(Some(enc_p.finish()));
+        let p_hit = read_rgba16f_tex(&device, &queue, para.output_texture().unwrap(), w, h)[(16 * w + 16) as usize];
+        assert!(p_hit[2] > 0.85, "specular parallax reprojection via motion.zw must track shifted highlight: {p_hit:?}");
+
+        // 3. Roughness-scaled A-Trous keeps mirror reflection peaks much sharper than rough glossy lobes.
+        let mut impulse = vec![[0.05f32, 0.05, 0.05, 1.0]; (w * h) as usize];
+        impulse[(16 * w + 16) as usize] = [1.0, 1.0, 1.0, 1.0];
+        let imp_t = upload_rgba16f(&device, &queue, w, h, &impulse);
+        let imp_v = imp_t.create_view(&Default::default());
+        let mut d_mirror = SvgfDenoiser::new(&device);
+        let mut d_rough = SvgfDenoiser::new(&device);
+        let rp = SvgfParams { atrous_iterations: 3, reset_history: true, specular_mode: true, phi_color: 4.0, ..Default::default() };
+        let mut enc_r = device.create_command_encoder(&Default::default());
+        d_mirror
+            .denoise(
+                &device,
+                &mut enc_r,
+                &SvgfInputs {
+                    noisy_signal: &imp_v,
+                    depth: &depth_v,
+                    prev_depth: &depth_v,
+                    normal: &mirror_nv,
+                    prev_normal: &mirror_nv,
+                    motion: &zero_mv,
+                },
+                (w, h),
+                &rp,
+            )
+            .unwrap();
+        d_rough
+            .denoise(
+                &device,
+                &mut enc_r,
+                &SvgfInputs {
+                    noisy_signal: &imp_v,
+                    depth: &depth_v,
+                    prev_depth: &depth_v,
+                    normal: &rough_nv,
+                    prev_normal: &rough_nv,
+                    motion: &zero_mv,
+                },
+                (w, h),
+                &rp,
+            )
+            .unwrap();
+        queue.submit(Some(enc_r.finish()));
+        let mirror_peak = read_rgba16f_tex(&device, &queue, d_mirror.output_texture().unwrap(), w, h)[(16 * w + 16) as usize][0];
+        let rough_peak = read_rgba16f_tex(&device, &queue, d_rough.output_texture().unwrap(), w, h)[(16 * w + 16) as usize][0];
+        assert!(
+            mirror_peak > rough_peak + 0.08,
+            "roughness-scaled A-Trous must preserve mirror peak sharper than rough glossy: mirror={mirror_peak:.4}, rough={rough_peak:.4}"
+        );
     }
 }

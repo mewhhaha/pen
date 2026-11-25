@@ -1354,3 +1354,110 @@ fn probe_room_shots() {
     eprintln!("{changed} pixels differ with probes");
     assert!(changed > 5000, "the probes should change the lighting of the room");
 }
+
+#[test]
+fn taa_fsr_pre_exposure_depth_disocclusion_and_easu_fxaa_witness() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let quad = |z: f32| {
+        format!(
+            r#"{{"positions":[-2,-2,{z}, 2,-2,{z}, -2,2,{z}, 2,2,{z}],"normals":[0,0,1,0,0,1,0,0,1,0,0,1],
+                "uvs":[0,0,1,0,0,1,1,1],"indices":[0,1,2,2,1,3]}}"#
+        )
+    };
+    let slanted = br#"{"positions":[-3,-1.0,0.5, 3,1.22,0.5, -3,3,0.5, 3,3,0.5],"normals":[0,0,1,0,0,1,0,0,1,0,0,1],
+        "uvs":[0,0,1,0,0,1,1,1],"indices":[0,1,2,2,1,3]}"#;
+    let near_q = quad(0.2);
+    let far_q = quad(0.8);
+    let root = assets(
+        "fsr-v2",
+        &[
+            (
+                "catalog.json",
+                br#"{"meshes":["near.mesh.json","far.mesh.json","slanted.mesh.json"],
+                    "materials":["green.material.json","dim_green.material.json","dark.material.json"]}"#,
+            ),
+            ("near.mesh.json", near_q.as_bytes()),
+            ("far.mesh.json", far_q.as_bytes()),
+            ("slanted.mesh.json", slanted),
+            ("flat.wgsl", FLAT.as_bytes()),
+            ("green.material.json", br#"{"shader":"flat.wgsl","color":[0,0.8,0,1],"lighting":"unlit"}"#),
+            ("dim_green.material.json", br#"{"shader":"flat.wgsl","color":[0,0.0125,0,1],"lighting":"unlit"}"#),
+            ("dark.material.json", br#"{"shader":"flat.wgsl","color":[0.4,0.0,0.0,1],"lighting":"unlit"}"#),
+        ],
+    );
+    let catalog = boundary::read_catalog(&root).unwrap();
+    let mut renderer = renderer(&device, &queue, root, FORMAT, Display::SDR);
+    let mut target = Target::new(&device, SIZE, SIZE, FORMAT);
+
+    // 1. Pre-exposure stability: dim scene at +6 stops matches non-TAA reference cleanly and survives
+    //    a sudden exposure change (+6 -> +4 stops) on a static scene with zero ghosting/flash.
+    let mut f = frame(vec![Draw { mesh: 0, material: 1, transform: IDENTITY, parameters: None, extra: None }]);
+    f.exposure.compensation = 6.0;
+    f.quality.taa = false;
+    settle(&mut renderer, &f, &catalog, &mut target, 1);
+    let mid = ((SIZE / 2) * SIZE + (SIZE / 2)) as usize;
+    let ref_plus6 = target.greens(&device, &queue)[mid];
+    f.quality.taa = true;
+    for _ in 0..8 {
+        renderer.submit(&f, &catalog, &mut target).unwrap();
+    }
+    let taa_plus6 = target.greens(&device, &queue)[mid];
+    assert!(
+        ref_plus6 > 0.20 && (taa_plus6 - ref_plus6).abs() < 0.02,
+        "pre-exposed TAA at +6 stops must match reference cleanly: ref={ref_plus6:.4}, taa={taa_plus6:.4}"
+    );
+    f.exposure.compensation = 4.0;
+    renderer.submit(&f, &catalog, &mut target).unwrap();
+    let taa_plus4 = target.greens(&device, &queue)[mid];
+    f.quality.taa = false;
+    renderer.submit(&f, &catalog, &mut target).unwrap();
+    let ref_plus4 = target.greens(&device, &queue)[mid];
+    assert!(
+        (taa_plus4 - ref_plus4).abs() < 0.02,
+        "pre-exposed TAA must track exposure jumps (+6 -> +4) in 1 frame without ghosting: ref={ref_plus4:.4}, taa={taa_plus4:.4}"
+    );
+    f.quality.taa = true;
+
+    // 2. Geometric prev_depth disocclusion: foreground near green quad (z=0.2) disappears exposing far
+    //    dark-red background (z=0.8) -> stale green history must drop in a single frame!
+    f.exposure.compensation = 0.0;
+    f.exposure.cut = true;
+    f.draws = vec![
+        Draw { mesh: 0, material: 0, transform: IDENTITY, parameters: None, extra: None },
+        Draw { mesh: 1, material: 2, transform: IDENTITY, parameters: None, extra: None },
+    ];
+    renderer.submit(&f, &catalog, &mut target).unwrap();
+    f.exposure.cut = false;
+    for _ in 0..8 {
+        renderer.submit(&f, &catalog, &mut target).unwrap();
+    }
+    let before_disocc = target.greens(&device, &queue)[mid];
+    assert!(before_disocc > 0.70, "foreground green must settle before disocclusion: {before_disocc}");
+
+    // Foreground abruptly moves away -> only far background (z=0.8, green=0.0) remains.
+    f.draws = vec![Draw { mesh: 1, material: 2, transform: IDENTITY, parameters: None, extra: None }];
+    renderer.submit(&f, &catalog, &mut target).unwrap();
+    let after_disocc = target.greens(&device, &queue)[mid];
+    assert!(
+        after_disocc < 0.12,
+        "prev_depth geometric disocclusion must clear stale foreground ghosting in 1 frame: {before_disocc} -> {after_disocc}"
+    );
+
+    // 3. EASU + FXAA coexistence (spatial upscale 0.5x + FXAA enabled, TAA off).
+    let mut f_easu = frame(vec![Draw { mesh: 2, material: 0, transform: IDENTITY, parameters: None, extra: None }]);
+    f_easu.quality.taa = false;
+    f_easu.quality.upscale = true;
+    f_easu.quality.scale = 0.5;
+    f_easu.quality.fxaa = true;
+    settle(&mut renderer, &f_easu, &catalog, &mut target, 1);
+    let easu_fxaa = target.greens(&device, &queue);
+    let top_green = easu_fxaa[(2 * SIZE + SIZE / 2) as usize];
+    let bot_black = easu_fxaa[((SIZE - 3) * SIZE + SIZE / 2) as usize];
+    assert!(
+        top_green > 0.72 && bot_black < 0.05,
+        "EASU + FXAA coexistence must render clean upscaled edges: top={top_green}, bot={bot_black}"
+    );
+}

@@ -241,6 +241,7 @@ fn ddgi_env_cascade(cascade_idx: u32, world: vec3f, normal: vec3f, view_dir: vec
   let irr_h = u32(max(h4.w, 1.0));
   let vis_w = u32(max(h5.x, 1.0));
   let vis_h = u32(max(h5.y, 1.0));
+  let offsets_off = u32(max(h5.z, 0.0));
 
   let min_sp = min(spacing.x, min(spacing.y, spacing.z));
   let biased_pos = world + (normal * nbias + view_dir * vbias) * min_sp;
@@ -272,7 +273,9 @@ fn ddgi_env_cascade(cascade_idx: u32, world: vec3f, normal: vec3f, view_dir: vec
     let tri = max(trilinear.x * trilinear.y * trilinear.z, 1e-4);
     var w = tri;
 
-    let probe_pos = origin + vec3f(coord) * spacing;
+    let s_idx = (sc.y * dims.z + sc.z) * dims.x + sc.x;
+    let probe_off = select(vec3f(0.0), probe_data[offsets_off + s_idx].xyz, offsets_off > 0u);
+    let probe_pos = origin + vec3f(coord) * spacing + probe_off;
     let to_probe = probe_pos - world;
     let dist_u = length(to_probe);
     let dir_to_probe = select(normal, to_probe / dist_u, dist_u > 1e-5);

@@ -155,13 +155,7 @@ fn easu_sample_source(uv: vec2f) -> vec3f {
 // The picture at uv as the screen shows it: the scene's light as the camera
 // exposes it and its bloom (drawn from the exposed light), graded, then toned.
 // A picture already shown (a scene filter's) is kept as it is.
-fn fetch(uv: vec2f) -> vec3f {
-  var scene: vec3f;
-  if (present.output.w > 0.5) {
-    scene = easu_sample_source(uv);
-  } else {
-    scene = textureSampleLevel(source, source_sampler, uv, 0.0).rgb;
-  }
+fn grade_and_tone(uv: vec2f, scene: vec3f) -> vec3f {
   let glow_light = textureSampleLevel(glow, source_sampler, uv, 0.0).rgb * present.bloom.x;
   if (present.source.w > 0.5) { return scene; }
   var light = exposed(scene, exposure[0]);
@@ -180,6 +174,23 @@ fn fetch(uv: vec2f) -> vec3f {
     return toned(light);
   }
   return toned_with_mode(light, tonemap_mode, hdr_peak);
+}
+
+fn fetch(uv: vec2f) -> vec3f {
+  var scene: vec3f;
+  if (present.output.w > 0.5) {
+    scene = easu_sample_source(uv);
+  } else {
+    scene = textureSampleLevel(source, source_sampler, uv, 0.0).rgb;
+  }
+  return grade_and_tone(uv, scene);
+}
+
+// Fast bilinear probe used for FXAA edge-detection neighborhood taps so EASU
+// 12-tap spatial upscaling and FXAA coexist without multiplying EASU taps.
+fn fetch_fast(uv: vec2f) -> vec3f {
+  let scene = textureSampleLevel(source, source_sampler, uv, 0.0).rgb;
+  return grade_and_tone(uv, scene);
 }
 
 fn luma(color: vec3f) -> f32 {

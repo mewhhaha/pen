@@ -34,20 +34,20 @@ fn fxaa(uv: vec2f) -> vec3f {
   let texel = present.source.xy;
   let color = fetch(uv);
   let m = luma(color);
-  let n = luma(fetch(uv - vec2f(0.0, texel.y)));
-  let s = luma(fetch(uv + vec2f(0.0, texel.y)));
-  let w = luma(fetch(uv - vec2f(texel.x, 0.0)));
-  let e = luma(fetch(uv + vec2f(texel.x, 0.0)));
+  let n = luma(fetch_fast(uv - vec2f(0.0, texel.y)));
+  let s = luma(fetch_fast(uv + vec2f(0.0, texel.y)));
+  let w = luma(fetch_fast(uv - vec2f(texel.x, 0.0)));
+  let e = luma(fetch_fast(uv + vec2f(texel.x, 0.0)));
   let low = min(m, min(min(n, s), min(w, e)));
   let high = max(m, max(max(n, s), max(w, e)));
   let contrast = high - low;
   if (contrast < max(0.0312, high * 0.125)) {
     return color;
   }
-  let nw = luma(fetch(uv - texel));
-  let ne = luma(fetch(uv + vec2f(texel.x, -texel.y)));
-  let sw = luma(fetch(uv + vec2f(-texel.x, texel.y)));
-  let se = luma(fetch(uv + texel));
+  let nw = luma(fetch_fast(uv - texel));
+  let ne = luma(fetch_fast(uv + vec2f(texel.x, -texel.y)));
+  let sw = luma(fetch_fast(uv + vec2f(-texel.x, texel.y)));
+  let se = luma(fetch_fast(uv + texel));
   let horizontal = abs(nw + sw - 2.0 * w) + 2.0 * abs(n + s - 2.0 * m) + abs(ne + se - 2.0 * e);
   let vertical = abs(nw + ne - 2.0 * n) + 2.0 * abs(w + e - 2.0 * m) + abs(sw + se - 2.0 * s);
   var across = vec2f(texel.x, 0.0);
@@ -80,12 +80,12 @@ fn fxaa(uv: vec2f) -> vec3f {
   for (var index = 0u; index < 4u; index++) {
     if (!done_n) {
       distance_n += steps[index];
-      endpoint_n = luma(fetch(edge - along * distance_n)) - edge_luma;
+      endpoint_n = luma(fetch_fast(edge - along * distance_n)) - edge_luma;
       done_n = abs(endpoint_n) + epsilon >= gradient;
     }
     if (!done_p) {
       distance_p += steps[index];
-      endpoint_p = luma(fetch(edge + along * distance_p)) - edge_luma;
+      endpoint_p = luma(fetch_fast(edge + along * distance_p)) - edge_luma;
       done_p = abs(endpoint_p) + epsilon >= gradient;
     }
     if (done_n && done_p) {

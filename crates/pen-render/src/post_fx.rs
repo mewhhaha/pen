@@ -674,6 +674,21 @@ impl RcasSharpener {
         size: (u32, u32),
         sharpness: f32,
     ) -> Result<()> {
+        self.sharpen_with_knee(device, encoder, input, size, sharpness, 1.0)
+    }
+
+    /// Runs RCAS sharpening with explicit tone-compression control:
+    /// - `hdr_knee > 0.0`: HDR-safe Reinhard compression (`c / (c + knee)`) preserving highlights `> 1.0`.
+    /// - `hdr_knee <= 0.0`: direct SDR linear sharpening on `[0, 1]` without Reinhard midtone distortion.
+    pub fn sharpen_with_knee(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        input: &wgpu::TextureView,
+        size: (u32, u32),
+        sharpness: f32,
+        hdr_knee: f32,
+    ) -> Result<()> {
         let max_dim = device.limits().max_texture_dimension_2d;
         ensure!(size.0 >= 1 && size.1 >= 1 && size.0 <= max_dim && size.1 <= max_dim, "invalid RCAS size {size:?}");
         let in_sz = input.texture().size();
@@ -702,7 +717,8 @@ impl RcasSharpener {
         let (_, _, out_tex, out_view) = self.output.as_ref().unwrap();
         ensure!(input.texture() != out_tex, "RCAS input cannot alias internal output texture");
         let s = if sharpness.is_finite() { sharpness.clamp(0.0, 1.0) } else { 0.0 };
-        encode_stage_copy(device, encoder, &self.uniform, bytemuck::cast_slice(&[s, 1.0f32, 0.0, 0.0]));
+        let knee = if hdr_knee.is_finite() && hdr_knee > 0.0 { hdr_knee.max(0.25) } else { 0.0 };
+        encode_stage_copy(device, encoder, &self.uniform, bytemuck::cast_slice(&[s, knee, 0.0, 0.0]));
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("rcas_bg"),
             layout: &self.bgl,
@@ -1325,5 +1341,44 @@ mod tests {
             left_reactive > right_inert + 0.25,
             "FSR reactive mask must suppress ghosting on sudden color changes: reactive={left_reactive}, opaque={right_inert}"
         );
+    }
+
+    #[test]
+    fn gpu_rcas_sdr_linear_vs_hdr_reinhard_witness() {
+        let (device, queue) = crate::testing::device().expect("GPU adapter required");
+        let (w, h) = (32u32, 32u32);
+        // Top half: flat midtone 0.5 + SDR ridge (0.2 -> 0.5 -> 0.8); bottom row: HDR peak 4.0.
+        let mut img = vec![[0.5f32, 0.5, 0.5, 1.0]; (w * h) as usize];
+        for y in 8..20 {
+            for x in 0..w {
+                let v = if x == 16 {
+                    0.8
+                } else if x == 15 || x == 17 {
+                    0.5
+                } else {
+                    0.2
+                };
+                img[(y * w + x) as usize] = [v, v, v, 1.0];
+            }
+        }
+        img[(26 * w + 16) as usize] = [4.0, 4.0, 4.0, 1.0];
+        let (_t, in_v) = upload_rgba16f(&device, &queue, w, h, &img);
+
+        let mut rcas = RcasSharpener::new(&device);
+        let mut enc_sdr = device.create_command_encoder(&Default::default());
+        rcas.sharpen_with_knee(&device, &mut enc_sdr, &in_v, (w, h), 1.0, 0.0).unwrap();
+        queue.submit(Some(enc_sdr.finish()));
+        let sdr = read_rgba16f(&device, &queue, rcas.output_texture().unwrap());
+
+        assert!((sdr[(3 * w + 3) as usize][0] - 0.5).abs() < 2e-3, "SDR flat midtone distorted: {:?}", sdr[(3 * w + 3) as usize]);
+        let sdr_diff = sdr[(14 * w + 16) as usize][0] - sdr[(14 * w + 15) as usize][0];
+        assert!(sdr_diff > 0.30 + 0.05, "SDR linear RCAS must sharpen edge contrast: diff={sdr_diff}");
+        assert!(sdr.iter().all(|p| p[0] >= 0.0 && p[0] <= 1.001), "SDR linear RCAS must stay within [0, 1]");
+
+        let mut enc_hdr = device.create_command_encoder(&Default::default());
+        rcas.sharpen_with_knee(&device, &mut enc_hdr, &in_v, (w, h), 1.0, 1.0).unwrap();
+        queue.submit(Some(enc_hdr.finish()));
+        let hdr = read_rgba16f(&device, &queue, rcas.output_texture().unwrap());
+        assert!(hdr[(26 * w + 16) as usize][0] > 3.5, "HDR RCAS must preserve peaks > 1.0: {:?}", hdr[(26 * w + 16) as usize]);
     }
 }

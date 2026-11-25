@@ -356,9 +356,9 @@ fn easu_upscale(@builtin(global_invocation_id) id: vec3u) {
   textureStore(easu_out, vec2i(id.xy), vec4f(easu_decompress(res_comp), 1.0));
 }
 
-// --- AMD FidelityFX RCAS (Per-Channel HDR-Safe Robust Contrast Adaptive Sharpening) ---
+// --- AMD FidelityFX RCAS (Per-Channel SDR Linear & HDR-Safe Robust Contrast Adaptive Sharpening) ---
 struct RcasUniform {
-  params: vec4f, // x = sharpness [0..1], y = hdr_knee (default 1.0 -> Reinhard c/(c+knee))
+  params: vec4f, // x = sharpness [0..1], y = hdr_knee (>0 -> Reinhard c/(c+knee); <=0 -> linear SDR [0, 1])
 };
 
 @group(0) @binding(0) var<uniform> rcas_u: RcasUniform;
@@ -393,13 +393,20 @@ fn rcas_sharpen(@builtin(global_invocation_id) id: vec3u) {
     textureStore(rcas_out, p, vec4f(e_raw, 1.0));
     return;
   }
-  // Map HDR [0, +inf) cleanly into [0, 1) per-channel so HDR peaks > 1.0 still sharpen with anti-ringing.
+  // When hdr_knee > 0, map HDR [0, +inf) into [0, 1) per-channel so HDR peaks > 1.0 sharpen with anti-ringing.
+  // When hdr_knee <= 0, operate directly in SDR [0, 1] without nonlinear Reinhard midtone distortion.
+  let use_hdr = rcas_u.params.y > 0.0;
   let knee = max(rcas_u.params.y, 0.25);
-  let e = rcas_compress(e_raw, knee);
-  let b = rcas_compress(textureLoad(rcas_in, clamp(p + vec2i(0, -1), vec2i(0), last), 0).rgb, knee);
-  let d = rcas_compress(textureLoad(rcas_in, clamp(p + vec2i(-1, 0), vec2i(0), last), 0).rgb, knee);
-  let f = rcas_compress(textureLoad(rcas_in, clamp(p + vec2i(1, 0), vec2i(0), last), 0).rgb, knee);
-  let h = rcas_compress(textureLoad(rcas_in, clamp(p + vec2i(0, 1), vec2i(0), last), 0).rgb, knee);
+  let b_raw = max(textureLoad(rcas_in, clamp(p + vec2i(0, -1), vec2i(0), last), 0).rgb, vec3f(0.0));
+  let d_raw = max(textureLoad(rcas_in, clamp(p + vec2i(-1, 0), vec2i(0), last), 0).rgb, vec3f(0.0));
+  let f_raw = max(textureLoad(rcas_in, clamp(p + vec2i(1, 0), vec2i(0), last), 0).rgb, vec3f(0.0));
+  let h_raw = max(textureLoad(rcas_in, clamp(p + vec2i(0, 1), vec2i(0), last), 0).rgb, vec3f(0.0));
+
+  let e = select(clamp(e_raw, vec3f(0.0), vec3f(1.0)), rcas_compress(e_raw, knee), use_hdr);
+  let b = select(clamp(b_raw, vec3f(0.0), vec3f(1.0)), rcas_compress(b_raw, knee), use_hdr);
+  let d = select(clamp(d_raw, vec3f(0.0), vec3f(1.0)), rcas_compress(d_raw, knee), use_hdr);
+  let f = select(clamp(f_raw, vec3f(0.0), vec3f(1.0)), rcas_compress(f_raw, knee), use_hdr);
+  let h = select(clamp(h_raw, vec3f(0.0), vec3f(1.0)), rcas_compress(h_raw, knee), use_hdr);
 
   // Per-channel min/max anti-ringing limits (exact AMD FSR1 RCAS per-channel formulation).
   let mn4 = min(min(b, d), min(f, h));
@@ -424,7 +431,11 @@ fn rcas_sharpen(@builtin(global_invocation_id) id: vec3u) {
 
   let w = clamp(lobe, -0.1875, 0.0) * sharp * noise_damp;
   let inv_norm = 1.0 / (1.0 + 4.0 * w);
-  let sharp_comp = clamp((e + (b + d + f + h) * w) * inv_norm, vec3f(0.0), vec3f(0.9999));
-  let out_hdr = rcas_decompress(sharp_comp, knee);
-  textureStore(rcas_out, p, vec4f(max(out_hdr, vec3f(0.0)), 1.0));
+  let sharp_val = (e + (b + d + f + h) * w) * inv_norm;
+  let out_rgb = select(
+    clamp(sharp_val, vec3f(0.0), vec3f(1.0)),
+    rcas_decompress(clamp(sharp_val, vec3f(0.0), vec3f(0.9999)), knee),
+    use_hdr,
+  );
+  textureStore(rcas_out, p, vec4f(max(out_rgb, vec3f(0.0)), 1.0));
 }

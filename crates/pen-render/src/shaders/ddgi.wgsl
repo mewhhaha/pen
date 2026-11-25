@@ -99,8 +99,17 @@ fn ddgi_spherical_fibonacci(idx: u32, count: u32) -> vec3f {
   return vec3f(cos(theta) * sin_t, sin(theta) * sin_t, cos_t);
 }
 
+@group(0) @binding(10) var<storage, read> probe_offsets_ro: array<vec4f>;
+
+fn ddgi_storage_index(sc: vec3u, dims: vec3u) -> u32 {
+  return (sc.y * dims.z + sc.z) * dims.x + sc.x;
+}
+
 fn ddgi_probe_world_pos(grid_coord: vec3u, u: DdgiUniform) -> vec3f {
-  return u.origin_and_hysteresis.xyz + vec3f(grid_coord) * u.spacing_and_max_dist.xyz;
+  let dims = u.grid_dims.xyz;
+  let sc = ddgi_storage_coord(grid_coord, dims, u.scroll_and_lights.xyz);
+  let off = probe_offsets_ro[ddgi_storage_index(sc, dims)].xyz;
+  return u.origin_and_hysteresis.xyz + vec3f(grid_coord) * u.spacing_and_max_dist.xyz + off;
 }
 
 fn ddgi_probe_uv(
@@ -412,10 +421,101 @@ fn ddgi_blend_irradiance(@builtin(global_invocation_id) id: vec3u) {
   let px = vec2i(i32(s_col * IRR_TILE + 1u + tx), i32(s_row * IRR_TILE + 1u + ty));
   let prev = textureLoad(blend_prev_irr, px, 0);
   let scrolled_in = ddgi_is_scrolled_in(logical, dims, u.scroll_delta.xyz);
-  let h = select(clamp(u.origin_and_hysteresis.w, 0.0, 0.99), 0.0, scrolled_in);
+  let base_h = select(clamp(u.origin_and_hysteresis.w, 0.0, 0.99), 0.0, scrolled_in);
+  // Adaptive perceptual hysteresis (RTXGI DDGI): drop hysteresis sharply on large gamma-space
+  // radiance shifts so dynamic sun/torch/door transitions converge in ~4 frames while static areas stay smooth.
+  let delta_rgb = abs(new_irr - prev.rgb);
+  let max_delta = max(delta_rgb.r, max(delta_rgb.g, delta_rgb.b));
+  let h = select(base_h, base_h * 0.25, max_delta > 0.25);
   let blended_rgb = mix(new_irr, prev.rgb, h);
-  let blended_v = mix(valid, prev.a, h);
+  let blended_v = mix(valid, prev.a, base_h);
   textureStore(blend_out_irr, px, vec4f(blended_rgb, blended_v));
+}
+
+// ---------------- Pass 2b: Probe Offset Relocation (Escape Solid Geometry & Surface Grazing) ----------------
+@group(0) @binding(11) var<storage, read_write> probe_offsets_rw: array<vec4f>;
+
+@compute @workgroup_size(64, 1, 1)
+fn ddgi_relocate_probes(@builtin(global_invocation_id) id: vec3u) {
+  let dims = u.grid_dims.xyz;
+  let total_probes = dims.x * dims.y * dims.z;
+  let probe_idx = id.x;
+  if (probe_idx >= total_probes) {
+    return;
+  }
+
+  let ix = probe_idx % dims.x;
+  let iz = (probe_idx / dims.x) % dims.z;
+  let iy = probe_idx / (dims.x * dims.z);
+  let logical = vec3u(ix, iy, iz);
+  let sc = ddgi_storage_coord(logical, dims, u.scroll_and_lights.xyz);
+  let s_idx = ddgi_storage_index(sc, dims);
+  let rays_per_probe = max(u.grid_dims.w, 1u);
+  let rot = mat3x3f(u.rot_col0.xyz, u.rot_col1.xyz, u.rot_col2.xyz);
+
+  let scrolled_in = ddgi_is_scrolled_in(logical, dims, u.scroll_delta.xyz);
+  let reset = (u.rot_col1.w < 0.5) || scrolled_in;
+  let offset = select(probe_offsets_rw[s_idx].xyz, vec3f(0.0), reset);
+
+  var closest_back_dist = 1e9;
+  var closest_back_dir = vec3f(0.0);
+  var closest_front_dist = 1e9;
+  var closest_front_dir = vec3f(0.0);
+  var farthest_front_dist = 0.0;
+  var farthest_front_dir = vec3f(0.0);
+  var backface_count = 0u;
+
+  let base_ray = probe_idx * rays_per_probe;
+  for (var r = 0u; r < rays_per_probe; r++) {
+    let raw_d = blend_rays[base_ray + r].w;
+    let ray_dir = normalize(rot * ddgi_spherical_fibonacci(r, rays_per_probe));
+    if (raw_d < 0.0) {
+      backface_count += 1u;
+      let bd = -raw_d;
+      if (bd < closest_back_dist) {
+        closest_back_dist = bd;
+        closest_back_dir = ray_dir;
+      }
+    } else {
+      if (raw_d < closest_front_dist) {
+        closest_front_dist = raw_d;
+        closest_front_dir = ray_dir;
+      }
+      if (raw_d > farthest_front_dist) {
+        farthest_front_dist = raw_d;
+        farthest_front_dir = ray_dir;
+      }
+    }
+  }
+
+  let spacing = max(u.spacing_and_max_dist.xyz, vec3f(1e-3));
+  let min_sp = min(spacing.x, min(spacing.y, spacing.z));
+  let min_front = 0.25 * min_sp;
+  var full_offset = offset;
+  var state = 1.0;
+
+  if (backface_count * 4u >= rays_per_probe && closest_back_dist < 1e8) {
+    // Trapped inside geometry: push through nearest backface toward open space.
+    full_offset = offset + closest_back_dir * (closest_back_dist + 0.15 * min_sp);
+    state = 0.0;
+  } else if (closest_front_dist < min_front && farthest_front_dist > closest_front_dist + 0.05 * min_sp) {
+    // Grazing a surface: nudge away from the closest frontface toward open space.
+    let nudge_raw = farthest_front_dir - closest_front_dir * 0.5;
+    let nudge_len = length(nudge_raw);
+    if (nudge_len > 1e-4) {
+      let push = min(min_front - closest_front_dist, 0.20 * min_sp);
+      full_offset = offset + (nudge_raw / nudge_len) * push;
+    }
+  }
+
+  // Keep relocated probes strictly inside their cell ellipsoid (<= 0.45 * spacing) so grid topology never flips.
+  let max_off = spacing * 0.45;
+  let norm_off = full_offset / max_off;
+  let norm_len = length(norm_off);
+  if (norm_len > 1.0) {
+    full_offset = (norm_off / norm_len) * max_off;
+  }
+  probe_offsets_rw[s_idx] = vec4f(full_offset, state);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -579,6 +679,8 @@ fn ddgi_pack_cascade(@builtin(global_invocation_id) id: vec3u) {
   let irr_count = irr_dims.x * irr_dims.y;
   let vis_total = vis_dims.x * vis_dims.y;
   let vis_pairs = (vis_total + 1u) / 2u;
+  let offsets_off = pack_u.pack_info.w + vis_pairs;
+  let total_probes = u.grid_dims.x * u.grid_dims.y * u.grid_dims.z;
 
   if (id.x == 0u) {
     let base = 1u + pack_u.pack_info.x * 6u;
@@ -600,7 +702,7 @@ fn ddgi_pack_cascade(@builtin(global_invocation_id) id: vec3u) {
       f32(irr_dims.x),
       f32(irr_dims.y),
     );
-    packed_out[base + 5u] = vec4f(f32(vis_dims.x), f32(vis_dims.y), 0.0, 0.0);
+    packed_out[base + 5u] = vec4f(f32(vis_dims.x), f32(vis_dims.y), f32(offsets_off), 0.0);
   }
 
   let idx = id.x;
@@ -616,5 +718,8 @@ fn ddgi_pack_cascade(@builtin(global_invocation_id) id: vec3u) {
     let m0 = textureLoad(pack_vis_tex, p0, 0).rg;
     let m1 = textureLoad(pack_vis_tex, p1, 0).rg;
     packed_out[pack_u.pack_info.w + idx] = vec4f(m0.x, m0.y, m1.x, m1.y);
+  }
+  if (idx < total_probes) {
+    packed_out[offsets_off + idx] = probe_offsets_ro[idx];
   }
 }

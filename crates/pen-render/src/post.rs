@@ -378,6 +378,8 @@ struct Targets {
     graphs: Vec<Graph>,
     /// With TAA, the history textures: the picture each frame resolved to.
     histories: Option<[wgpu::TextureView; 2]>,
+    /// With TAA, ping-pong lock status + previous NDC depth (`Rgba16Float`: `.r=lock`, `.g=prev_depth`, `.b=lock_luma`, `.a=valid`).
+    locks: Option<[wgpu::TextureView; 2]>,
     /// With TAA or velocity motion blur, the 1x Rg16Float velocity target and its Depth32Float buffer.
     velocity: Option<(wgpu::TextureView, wgpu::TextureView)>,
     /// What frames with translucent surfaces add, once one has come.
@@ -481,6 +483,14 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
         label: Some(&label),
         source: wgpu::ShaderSource::Wgsl(code.into()),
     });
+    let mut color_targets = vec![Some(wgpu::ColorTargetState { format: target, blend, write_mask: wgpu::ColorWrites::ALL })];
+    if matches!(which, BuiltIn::Taa(_)) {
+        color_targets.push(Some(wgpu::ColorTargetState {
+            format: wgpu::TextureFormat::Rgba16Float,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        }));
+    }
     context.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(&label),
         layout: None,
@@ -497,7 +507,7 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
             module: &module,
             entry_point: None,
             compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState { format: target, blend, write_mask: wgpu::ColorWrites::ALL })],
+            targets: &color_targets,
         }),
         multiview_mask: None,
         cache: context.cache.get(),
@@ -552,6 +562,8 @@ struct Inputs {
     velocity: wgpu::TextureView,
     /// With TAA, the history texture read and the one drawn.
     history: Option<[wgpu::TextureView; 2]>,
+    /// With TAA, the lock/prev-depth status texture read and the one drawn.
+    lock: Option<[wgpu::TextureView; 2]>,
     /// Opaque-only lit backdrop (for Part::After) so TAA/FSR computes an automatic reactive mask
     /// over translucents, particles, ribbons, and overlays with zero extra passes.
     opaque_color: Option<wgpu::TextureView>,
@@ -853,16 +865,16 @@ impl Post {
         };
         let mut targets_recreated = false;
         if self.targets.as_ref().is_none_or(|targets| targets.key != key) {
-            // Preserve full-resolution TAA/FSR history textures and camera memory across dynamic
+            // Preserve full-resolution TAA/FSR history + lock textures and camera memory across dynamic
             // resolution scale changes (`--frame-budget` / FSR DRS) when output dimensions stay constant.
-            let reusable_histories = self.targets.take().and_then(|prev| {
+            let reusable_temporal = self.targets.take().and_then(|prev| {
                 if taa
                     && prev.key.taa
                     && prev.key.taa_width == taa_width
                     && prev.key.taa_height == taa_height
                     && !frame.exposure.cut
                 {
-                    prev.histories
+                    prev.histories.zip(prev.locks)
                 } else {
                     None
                 }
@@ -896,27 +908,36 @@ impl Post {
                 .as_ref()
                 .map(|(v, _)| v.clone())
                 .unwrap_or_else(|| self.no_velocity.create_view(&Default::default()));
-            let kept = if let Some(prev_views) = reusable_histories {
-                Some(prev_views)
+            let (kept, kept_locks) = if let Some((prev_views, prev_locks)) = reusable_temporal {
+                (Some(prev_views), Some(prev_locks))
             } else {
                 // With TAA, a graph for each history texture read, sharing the
                 // rest; a new history starts afresh.
                 self.memory = Default::default();
                 self.previous_vp = None;
-                taa.then(|| {
+                let histories = taa.then(|| {
                     let textures = [0, 1].map(|_| crate::taa::history(device, taa_width, taa_height, SCENE_FORMAT));
                     [view(&textures[0]), view(&textures[1])]
-                })
+                });
+                let locks = taa.then(|| {
+                    let textures = [0, 1].map(|_| {
+                        crate::taa::history(device, taa_width, taa_height, wgpu::TextureFormat::Rgba16Float)
+                    });
+                    [view(&textures[0]), view(&textures[1])]
+                });
+                (histories, locks)
             };
             let mut graphs: Vec<Graph> = Vec::new();
             for read in 0..if taa { 2 } else { 1 } {
                 let history = kept.as_ref().map(|views| [views[read].clone(), views[1 - read].clone()]);
+                let lock = kept_locks.as_ref().map(|views| [views[read].clone(), views[1 - read].clone()]);
                 let inputs = Inputs {
                     depth: depth_only(),
                     scene: view(&scene),
                     marks: marks.clone(),
                     velocity: vel_view.clone(),
                     history,
+                    lock,
                     opaque_color: None,
                 };
                 let graph = self
@@ -928,6 +949,7 @@ impl Post {
             self.targets = Some(Targets {
                 key,
                 histories: kept,
+                locks: kept_locks,
                 velocity,
                 depth: view(&depth),
                 depth_only: depth_only(),
@@ -999,6 +1021,7 @@ impl Post {
             .map(|(v, _)| v.clone())
             .unwrap_or_else(|| self.no_velocity.create_view(&Default::default()));
         let histories = targets.histories.clone();
+        let locks = targets.locks.clone();
         let TargetsKey { width, height, samples, taa, .. } = key;
         let sampled = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
         // Every level down to one texel when shaders sample `opaque_color`; level 0 alone for backdrop otherwise.
@@ -1022,6 +1045,7 @@ impl Post {
             marks: marks.clone(),
             velocity: velocity.clone(),
             history: histories.as_ref().map(|textures| [textures[read].clone(), textures[1 - read].clone()]),
+            lock: locks.as_ref().map(|textures| [textures[read].clone(), textures[1 - read].clone()]),
             opaque_color,
         };
         let before = self
@@ -1246,15 +1270,18 @@ impl Post {
             }
             return graph.compile(&self.device, built_ins, sharing);
         }
-        // TAA / FSR 2.2-class temporal super resolution blends the lit picture into the history,
-        // deriving an auto-reactive mask against `opaque_color` when translucents/particles are present.
-        if let Some([read, drawn]) = inputs.history {
+        // TAA / FSR 2.2/3.1-class temporal super resolution blends the lit picture into the history,
+        // deriving a 3x3 dilated auto-reactive mask against `opaque_color`, applying pre-exposure,
+        // checking geometric depth disocclusion, and maintaining dedicated thin-feature lock status.
+        if let (Some([read, drawn]), Some([lock_read, lock_drawn])) = (inputs.history, inputs.lock) {
             let (read, drawn) = (graph.import("history", read), graph.import("history", drawn));
+            let (lock_read, lock_drawn) = (graph.import("taa_lock", lock_read), graph.import("taa_lock", lock_drawn));
             let opaque_reactive = match inputs.opaque_color {
                 Some(view) => graph.import("opaque_reactive", view),
                 None => lit,
             };
             let uniform = Binding::Uniform(self.uniform("taa", 176));
+            let exposure = Binding::Storage(self.exposure.state().clone());
             let bindings = vec![
                 uniform,
                 Binding::Texture(lit),
@@ -1263,8 +1290,10 @@ impl Post {
                 sampler.clone(),
                 Binding::Texture(velocity),
                 Binding::Texture(opaque_reactive),
+                exposure,
+                Binding::Texture(lock_read),
             ];
-            graph.pass("taa", BuiltIn::Taa(samples), bindings, Target::Texture(drawn), false);
+            graph.pass("taa", BuiltIn::Taa(samples), bindings, Target::Pair(drawn, lock_drawn), false);
             lit = drawn;
         }
         if dof {
@@ -1477,7 +1506,9 @@ impl Post {
         }
         let uniform = self.uniform("present", 64);
         let (output_width, output_height) = (size.0 as f32, size.1 as f32);
-        let use_easu = !quality.fxaa && (taa_width < size.0 || taa_height < size.1);
+        // EASU spatial upscaling now coexists cleanly with FXAA (FXAA uses cheap bilinear edge probes
+        // via `fetch_fast` and reserves 12-tap EASU reconstruction for the center & final shifted read).
+        let use_easu = taa_width < size.0 || taa_height < size.1;
         self.queue.write_buffer(
             &uniform,
             0,

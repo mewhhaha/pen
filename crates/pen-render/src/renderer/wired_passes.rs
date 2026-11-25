@@ -173,7 +173,8 @@ struct RtCompUniform {
 @group(0) @binding(0) var depth_tex: texture_2d<f32>;
 @group(0) @binding(1) var refl_tex: texture_2d<f32>;
 @group(0) @binding(2) var gi_tex: texture_2d<f32>;
-@group(0) @binding(3) var<uniform> cfg: RtCompUniform;
+@group(0) @binding(3) var sao_tex: texture_2d<f32>;
+@group(0) @binding(4) var<uniform> cfg: RtCompUniform;
 
 @vertex fn vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
   let x = f32((idx << 1u) & 2u) * 2.0 - 1.0;
@@ -191,8 +192,10 @@ struct RtCompUniform {
   let rt_dims = vec2i(textureDimensions(refl_tex, 0));
   var refl = vec3f(0.0);
   var gi = vec3f(0.0);
+  var occlude = 0.0;
   if (rt_dims.x == dims.x && rt_dims.y == dims.y) {
     refl = max(textureLoad(refl_tex, p, 0).rgb, vec3f(0.0));
+    occlude = clamp(textureLoad(sao_tex, p, 0).b, 0.0, 0.75);
     if (cfg.gi_weight > 0.0) {
       gi = max(textureLoad(gi_tex, p, 0).rgb, vec3f(0.0));
     }
@@ -202,6 +205,7 @@ struct RtCompUniform {
     let frac = clamp(f_coord - vec2f(base_h), vec2f(0.0), vec2f(1.0));
     var r_sum = vec3f(0.0);
     var g_sum = vec3f(0.0);
+    var o_sum = 0.0;
     var w_sum = 0.0;
     for (var oy = 0; oy < 2; oy++) {
       for (var ox = 0; ox < 2; ox++) {
@@ -213,17 +217,22 @@ struct RtCompUniform {
         let dw = 1.0 / (1.0 + dz * 400.0);
         let w = bw * dw + 1e-5;
         r_sum += max(textureLoad(refl_tex, hp, 0).rgb, vec3f(0.0)) * w;
+        o_sum += clamp(textureLoad(sao_tex, hp, 0).b, 0.0, 0.75) * w;
         if (cfg.gi_weight > 0.0) {
           g_sum += max(textureLoad(gi_tex, hp, 0).rgb, vec3f(0.0)) * w;
         }
         w_sum += w;
       }
     }
-    refl = r_sum / max(w_sum, 1e-5);
-    gi = g_sum / max(w_sum, 1e-5);
+    let inv_w = 1.0 / max(w_sum, 1e-5);
+    refl = r_sum * inv_w;
+    gi = g_sum * inv_w;
+    occlude = o_sum * inv_w;
   }
   let bounce = refl * cfg.refl_weight + gi * cfg.gi_weight;
-  return vec4f(bounce, 0.0);
+  // Premultiplied-alpha blend (`One + OneMinusSrcAlpha`) attenuates occluded sky IBL where local RT
+  // reflection rays hit geometry, preventing double-counting while leaving diffuse/sky misses untouched.
+  return vec4f(bounce, clamp(occlude * cfg.refl_weight, 0.0, 0.75));
 }
 "#;
 
@@ -241,6 +250,8 @@ struct SvgfPrepUniform {
 @group(0) @binding(3) var out_normal: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(4) var out_motion: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var velocity_tex: texture_2d<f32>;
+@group(0) @binding(6) var rt_sao_tex: texture_2d<f32>;
+@group(0) @binding(7) var rt_refl_tex: texture_2d<f32>;
 
 struct WorldPt {
   pos: vec3f,
@@ -351,9 +362,26 @@ fn prep(@builtin(global_invocation_id) id: vec3u) {
       mv = curr_uv - prev_uv;
     }
   }
+  let mat_rough = clamp(textureLoad(rt_sao_tex, px, 0).a, 0.04, 1.0);
+  let hit_dist = max(textureLoad(rt_refl_tex, px, 0).a, 0.0);
+  // Specular virtual hit-point parallax reprojection: virtual reflected image sits at (cam_dist + hit_dist)
+  // along the incoming view ray; blend toward surface motion as surface roughness increases.
+  var spec_mv = mv;
+  if (!used_obj_vel && u.dims.z != 0u && hit_dist > 1e-3 && hit_dist < 50.0) {
+    let curr_uv = (vec2f(d_px) + vec2f(0.5)) / vec2f(f32(depth_dims.x), f32(depth_dims.y));
+    let virt_pos = u.cam_and_clear.xyz - view_dir * (dist + hit_dist);
+    let vclip = u.prev_vp * vec4f(virt_pos, 1.0);
+    if (abs(vclip.w) > 1e-6) {
+      let vndc = vclip.xy / vclip.w;
+      let prev_vuv = vec2f(vndc.x * 0.5 + 0.5, 0.5 - vndc.y * 0.5);
+      let virt_mv = curr_uv - prev_vuv;
+      let mirror_w = clamp((1.0 - mat_rough) * (1.0 - mat_rough), 0.0, 1.0);
+      spec_mv = mix(mv, virt_mv, mirror_w);
+    }
+  }
   textureStore(out_depth, px, vec4f(min(dist, 65000.0), 0.0, 0.0, 1.0));
-  textureStore(out_normal, px, vec4f(n, 1.0));
-  textureStore(out_motion, px, vec4f(mv, 0.0, 0.0));
+  textureStore(out_normal, px, vec4f(n, mat_rough));
+  textureStore(out_motion, px, vec4f(mv, spec_mv));
 }
 "#;
 
@@ -468,6 +496,8 @@ impl SvgfRtState {
                 wo_tex(3),
                 wo_tex(4),
                 ro_tex(5),
+                ro_tex(6),
+                ro_tex(7),
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -926,7 +956,7 @@ impl WiredPasses {
 
             let bounce_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rt_bounce_comp_bgl"),
-                entries: &[tex_entry(0), tex_entry(1), tex_entry(2), u_entry(3)],
+                entries: &[tex_entry(0), tex_entry(1), tex_entry(2), tex_entry(3), u_entry(4)],
             });
             let bounce_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("rt_bounce_comp_pl"),
@@ -958,7 +988,7 @@ impl WiredPasses {
                         blend: Some(wgpu::BlendState {
                             color: wgpu::BlendComponent {
                                 src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
                                 operation: wgpu::BlendOperation::Add,
                             },
                             alpha: wgpu::BlendComponent {
@@ -1042,7 +1072,8 @@ impl WiredPasses {
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_r32f) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(rv) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(gv) },
-                    wgpu::BindGroupEntry { binding: 3, resource: comp.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sao_view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: comp.uniform.as_entire_binding() },
                 ],
             });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1457,7 +1488,10 @@ impl State {
         };
         if sharp > 0.0 {
             let rcas = wired.rcas.get_or_insert_with(|| RcasSharpener::new(device));
-            rcas.sharpen(device, encoder, &current, size, sharp)?;
+            // `polish_src` is already display-tonemapped for SDR targets (skip Reinhard distortion),
+            // while HDR Rgba16Float targets keep the HDR-safe Reinhard compression knee.
+            let hdr_knee = if target_format == wgpu::TextureFormat::Rgba16Float { 1.0 } else { 0.0 };
+            rcas.sharpen_with_knee(device, encoder, &current, size, sharp, hdr_knee)?;
             if let Some(view) = rcas.output_view() {
                 current = view.clone();
             }
@@ -1681,7 +1715,8 @@ impl State {
         let mut push_inst = |pool: &mut GpuBlasPool,
                              source: &Arc<super::RtMeshSource>,
                              transform: [f32; 16],
-                             m: &crate::asset_store::Material|
+                             m: &crate::asset_store::Material,
+                             draw_params: Option<[f32; 4]>|
          -> Result<()> {
             let Some(bi) = pool.ensure_blas(device, encoder, source.id, &source.triangles)? else {
                 return Ok(());
@@ -1722,7 +1757,7 @@ impl State {
                 [0.0; 3]
             };
             #[allow(clippy::cast_possible_truncation, reason = "finite material parameters")]
-            let (metallic, mut roughness) = match m.instance_parameters {
+            let (mut metallic, mut roughness) = match m.instance_parameters {
                 Some(p) => {
                     let met = (p[0] as f32).clamp(0.0, 1.0);
                     let rgh = if p[1] > 0.0 { (p[1] as f32).clamp(0.04, 1.0) } else { 0.5 };
@@ -1730,6 +1765,14 @@ impl State {
                 }
                 None => (0.0, 0.5),
             };
+            if let Some(p) = draw_params {
+                if p[0].is_finite() {
+                    metallic = p[0].clamp(0.0, 1.0);
+                }
+                if p[1].is_finite() && p[1] > 0.0 {
+                    roughness = p[1].clamp(0.04, 1.0);
+                }
+            }
             if m.surface.clearcoat > 0.0 {
                 roughness = roughness.min(m.surface.clearcoat_roughness.clamp(0.04, 0.35));
             }
@@ -1751,14 +1794,23 @@ impl State {
                     if let Some(GpuAsset::Mesh(mesh)) = entry.mesh.and_then(|slot| self.assets.current(slot))
                         && let Some(src) = &mesh.rt_source
                     {
-                        push_inst(pool, src, *item.transform(frame), mat)?;
+                        let draw_params = match item.source {
+                            super::Source::Draw(idx) => frame.draws.get(idx).and_then(|d| d.parameters),
+                            super::Source::Inset(inset_idx, idx) => frame
+                                .insets
+                                .get(inset_idx)
+                                .and_then(|ins| ins.draws.get(idx))
+                                .and_then(|d| d.parameters),
+                            super::Source::World => None,
+                        };
+                        push_inst(pool, src, *item.transform(frame), mat, draw_params)?;
                     }
                 }
                 Shape::Solid(idx) => {
                     if let Some(solid) = self.solid_meshes.get(idx)
                         && let Some(src) = &solid.rt_source
                     {
-                        push_inst(pool, src, IDENTITY, mat)?;
+                        push_inst(pool, src, IDENTITY, mat, None)?;
                     }
                 }
                 Shape::Batch(batch_idx) => {
@@ -1770,7 +1822,7 @@ impl State {
                             if placement.batch as usize == batch_idx
                                 && let Some(draw) = frame.draws.get(draw_idx)
                             {
-                                push_inst(pool, src, draw.transform, mat)?;
+                                push_inst(pool, src, draw.transform, mat, draw.parameters)?;
                             }
                         }
                     }
@@ -1979,15 +2031,17 @@ impl State {
         if let Some(near) = &mut self.wired.ddgi_near {
             near.update_with_lights(&self.device, encoder, tlas, &ddgi_params, &local_lights);
             let (irr_n, vis_n) = near.packed_data_vec4_counts();
-            if cursor + irr_n + vis_n <= cap_vec4s {
+            let off_n = near.packed_probe_offset_vec4_count();
+            if cursor + irr_n + vis_n + off_n <= cap_vec4s {
                 near.pack_cascade(&self.device, encoder, probe_buf, 0, cascade_count, cursor, cursor + irr_n, 1.0);
-                cursor += irr_n + vis_n;
+                cursor += irr_n + vis_n + off_n;
             }
         }
         if let Some(far) = &mut self.wired.ddgi_far {
             far.update_with_lights(&self.device, encoder, tlas, &ddgi_params, &local_lights);
             let (irr_f, vis_f) = far.packed_data_vec4_counts();
-            if cursor + irr_f + vis_f <= cap_vec4s {
+            let off_f = far.packed_probe_offset_vec4_count();
+            if cursor + irr_f + vis_f + off_f <= cap_vec4s {
                 far.pack_cascade(&self.device, encoder, probe_buf, 1, cascade_count, cursor, cursor + irr_f, 1.0);
             }
         }
@@ -2384,6 +2438,7 @@ impl State {
             };
             queue.write_buffer(&svgf.prep_u, 0, bytemuck::bytes_of(&prep_u));
             let bufs = svgf.buffers.as_ref().unwrap();
+            let refl_bind = raw_refl.as_ref().unwrap_or(&sao_raw_view);
             let prep_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("svgf_rt_prep_bg"),
                 layout: &svgf.prep_bgl,
@@ -2394,6 +2449,8 @@ impl State {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&bufs.curr_normal.view) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&bufs.motion.view) },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(vel_bind) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&sao_raw_view) },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(refl_bind) },
                 ],
             });
             {
@@ -2423,23 +2480,32 @@ impl State {
             let mut denoised_refl = None;
             let mut denoised_gi = None;
             if tier >= 2 {
-                let bounce_params = SvgfParams {
+                let refl_params = SvgfParams {
+                    min_alpha: 0.12,
+                    phi_color: 4.0,
+                    atrous_iterations: 3,
+                    reset_history: !has_prev,
+                    specular_mode: true,
+                    ..Default::default()
+                };
+                let gi_params = SvgfParams {
                     min_alpha: 0.1,
                     phi_color: 4.5,
                     atrous_iterations: 3,
                     reset_history: !has_prev,
+                    specular_mode: false,
                     ..Default::default()
                 };
                 if let Some(rv) = raw_refl.as_ref() {
                     let refl_in = SvgfInputs { noisy_signal: rv, ..sao_in };
-                    svgf.refl.denoise(device, encoder, &refl_in, rt_size, &bounce_params)?;
+                    svgf.refl.denoise(device, encoder, &refl_in, rt_size, &refl_params)?;
                     denoised_refl = svgf.refl.output_view().cloned();
                 }
                 if !ddgi_active
                     && let Some(gv) = raw_gi.as_ref()
                 {
                     let gi_in = SvgfInputs { noisy_signal: gv, ..sao_in };
-                    svgf.gi.denoise(device, encoder, &gi_in, rt_size, &bounce_params)?;
+                    svgf.gi.denoise(device, encoder, &gi_in, rt_size, &gi_params)?;
                     denoised_gi = svgf.gi.output_view().cloned();
                 }
             }

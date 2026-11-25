@@ -1,11 +1,12 @@
-// Spatiotemporal Variance-Guided Filter (SVGF, Schied et al., HPG 2017).
-// Pass 1 (svgf_temporal): motion-reprojected temporal accumulation + 1st/2nd luminance moments
-//                         + spatial fallback variance initialization on disocclusion.
+// Spatiotemporal Variance-Guided Filter (SVGF, Schied et al., HPG 2017) with Specular Reflection mode.
+// Pass 1 (svgf_temporal): motion-reprojected temporal accumulation (using virtual hit-point parallax
+//                         motion `motion.zw` + 3x3 YCoCg neighborhood clamping in specular mode)
+//                         + 1st/2nd luminance moments + spatial fallback variance on disocclusion.
 // Pass 2 (svgf_atrous):   multi-scale 5x5 B3-spline A-Trous edge-stopping wavelet filter
-//                         guided by depth, normal, and 3x3-filtered luminance variance.
+//                         guided by depth, normal, roughness (`normal.w` in specular mode), and variance.
 
 struct SvgfUniform {
-  dims: vec4u,           // x = width, y = height, z = step_size, w = reset_history (0 or 1)
+  dims: vec4u,           // x = width, y = height, z = step_size, w = flags (bit0: reset, bit1: specular_mode)
   temporal_params: vec4f, // x = min_alpha, y = max_history, z = depth_threshold, w = normal_threshold
   atrous_params: vec4f,  // x = phi_color, y = phi_normal, z = phi_depth, w = variance_boost
 };
@@ -26,6 +27,18 @@ struct SvgfUniform {
 
 fn luminance(c: vec3f) -> f32 {
   return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+fn rgb_to_ycocg(c: vec3f) -> vec3f {
+  return vec3f(
+    dot(c, vec3f(0.25, 0.5, 0.25)),
+    dot(c, vec3f(0.5, 0.0, -0.5)),
+    dot(c, vec3f(-0.25, 0.5, -0.25)),
+  );
+}
+
+fn ycocg_to_rgb(y: vec3f) -> vec3f {
+  return max(vec3f(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z), vec3f(0.0));
 }
 
 fn load_normal(tex: texture_2d<f32>, px: vec2i) -> vec3f {
@@ -51,9 +64,15 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
     return;
   }
 
+  let reset_hist = (u.dims.w & 1u) != 0u;
+  let spec_mode = (u.dims.w & 2u) != 0u;
+
   let sample_c = textureLoad(curr_noisy, px, 0).rgb;
   let z_c = textureLoad(curr_depth, px, 0).r;
-  let n_c = load_normal(curr_normal, px);
+  let n_raw = textureLoad(curr_normal, px, 0);
+  let n_l2 = dot(n_raw.xyz, n_raw.xyz);
+  let n_c = select(vec3f(0.0, 1.0, 0.0), n_raw.xyz * inverseSqrt(n_l2), n_l2 > 1e-8);
+  let rough_c = clamp(n_raw.w, 0.04, 1.0);
   let lum_c = luminance(sample_c);
   let moments_c = vec2f(lum_c, lum_c * lum_c);
 
@@ -61,8 +80,9 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
   var acc_moments = moments_c;
   var hist_len = 1.0;
 
-  if (u.dims.w == 0u) {
-    let mv = textureLoad(motion_tex, px, 0).xy;
+  if (!reset_hist) {
+    let raw_mv = textureLoad(motion_tex, px, 0);
+    let mv = select(raw_mv.xy, raw_mv.zw, spec_mode);
     let prev_uv = (vec2f(px) + vec2f(0.5)) / vec2f(f32(w), f32(h)) - mv;
     let prev_pos = prev_uv * vec2f(f32(w), f32(h)) - vec2f(0.5);
     let base = vec2i(floor(prev_pos));
@@ -107,8 +127,48 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
       hist_c /= sum_w;
       hist_m /= sum_w;
       hist_l /= sum_w;
+
+      // Specular mode: 3x3 YCoCg variance neighborhood clamping eliminates mirror ghosting
+      // when reflected objects or dynamic lights move across reflective surfaces.
+      if (spec_mode) {
+        var yc_m1 = vec3f(0.0);
+        var yc_m2 = vec3f(0.0);
+        var yc_w = 0.0;
+        for (var dy = -1; dy <= 1; dy++) {
+          for (var dx = -1; dx <= 1; dx++) {
+            let q = clamp(px + vec2i(dx, dy), vec2i(0), vec2i(w - 1, h - 1));
+            let z_q = textureLoad(curr_depth, q, 0).r;
+            let n_q = load_normal(curr_normal, q);
+            if (dx == 0 && dy == 0 || is_consistent(z_c, z_q, n_c, n_q)) {
+              let yc = rgb_to_ycocg(max(textureLoad(curr_noisy, q, 0).rgb, vec3f(0.0)));
+              yc_m1 += yc;
+              yc_m2 += yc * yc;
+              yc_w += 1.0;
+            }
+          }
+        }
+        if (yc_w > 0.0) {
+          let mu = yc_m1 / yc_w;
+          let sigma = sqrt(max(yc_m2 / yc_w - mu * mu, vec3f(0.0)));
+          let gamma = mix(1.15, 2.25, rough_c);
+          let box_lo = mu - sigma * gamma;
+          let box_hi = mu + sigma * gamma;
+          let hist_yc = rgb_to_ycocg(max(hist_c, vec3f(0.0)));
+          let clamped_yc = clamp(hist_yc, box_lo, box_hi);
+          let clip_err = length(hist_yc - clamped_yc);
+          hist_c = ycocg_to_rgb(clamped_yc);
+          // Drop stale accumulated history count proportionally when history was heavily clipped.
+          hist_l *= clamp(1.0 - clip_err * 2.5, 0.15, 1.0);
+        }
+      }
+
       hist_len = min(hist_l + 1.0, max(u.temporal_params.y, 1.0));
-      let alpha = max(u.temporal_params.x, 1.0 / hist_len);
+      let min_a = select(
+        u.temporal_params.x,
+        mix(max(u.temporal_params.x, 0.14), u.temporal_params.x, rough_c),
+        spec_mode,
+      );
+      let alpha = max(min_a, 1.0 / hist_len);
       acc_color = mix(hist_c, sample_c, alpha);
       acc_moments = mix(hist_m, moments_c, alpha);
     }
@@ -141,7 +201,8 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
       let spatial_var = max(0.0, sm.y - sm.x * sm.x);
       variance = max(variance, spatial_var * max(u.atrous_params.w, 1.0) / hist_len);
       if (hist_len <= 1.01) {
-        acc_color = mix(acc_color, sc / sw, 0.35);
+        let fallback_blend = select(0.35, mix(0.10, 0.35, rough_c), spec_mode);
+        acc_color = mix(acc_color, sc / sw, fallback_blend);
       }
     }
   }
@@ -165,12 +226,16 @@ fn svgf_atrous(@builtin(global_invocation_id) id: vec3u) {
     return;
   }
 
+  let spec_mode = (u.dims.w & 2u) != 0u;
   let step_size = max(i32(u.dims.z), 1);
   let center = textureLoad(atrous_in, px, 0);
   let c_p = center.rgb;
   let l_p = luminance(c_p);
   let z_p = textureLoad(atrous_depth, px, 0).r;
-  let n_p = load_normal(atrous_normal, px);
+  let n_raw_p = textureLoad(atrous_normal, px, 0);
+  let n_l2_p = dot(n_raw_p.xyz, n_raw_p.xyz);
+  let n_p = select(vec3f(0.0, 1.0, 0.0), n_raw_p.xyz * inverseSqrt(n_l2_p), n_l2_p > 1e-8);
+  let rough_p = clamp(n_raw_p.w, 0.04, 1.0);
 
   // 3x3 Gaussian variance pre-filter (SVGF Section 4.3).
   let g3 = array<f32, 3>(0.25, 0.5, 0.25);
@@ -189,9 +254,13 @@ fn svgf_atrous(@builtin(global_invocation_id) id: vec3u) {
   let z_uy = textureLoad(atrous_depth, clamp(px - vec2i(0, 1), vec2i(0), vec2i(w - 1, h - 1)), 0).r;
   let grad_z = max(max(abs(z_rx - z_p), abs(z_p - z_lx)), max(abs(z_dy - z_p), abs(z_p - z_uy)));
 
-  let sigma_l = max(u.atrous_params.x, 0.05) * sqrt(max(filtered_var, 0.0)) + 1e-4;
-  let phi_n = max(u.atrous_params.y, 1.0);
+  // Roughness-scaled specular edge stopping: keeps mirror reflections sharp while smoothing glossy lobes.
+  let rough_l_scale = select(1.0, mix(0.40, 1.0, smoothstep(0.04, 0.45, rough_p)), spec_mode);
+  let rough_n_scale = select(1.0, mix(2.5, 1.0, smoothstep(0.05, 0.50, rough_p)), spec_mode);
+  let sigma_l = max(u.atrous_params.x, 0.05) * rough_l_scale * sqrt(max(filtered_var, 0.0)) + 1e-4;
+  let phi_n = max(u.atrous_params.y, 1.0) * rough_n_scale;
   let phi_z = max(u.atrous_params.z, 1e-4);
+  let mirror_taper = select(0.0, (1.0 - rough_p) * (1.0 - rough_p) * 0.45, spec_mode);
 
   // 5x5 B3-spline wavelet weights.
   let k5 = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
@@ -211,7 +280,10 @@ fn svgf_atrous(@builtin(global_invocation_id) id: vec3u) {
       var wt = kw;
       if (kx != 0 || ky != 0) {
         let z_q = textureLoad(atrous_depth, q, 0).r;
-        let n_q = load_normal(atrous_normal, q);
+        let n_raw_q = textureLoad(atrous_normal, q, 0);
+        let n_l2_q = dot(n_raw_q.xyz, n_raw_q.xyz);
+        let n_q = select(vec3f(0.0, 1.0, 0.0), n_raw_q.xyz * inverseSqrt(n_l2_q), n_l2_q > 1e-8);
+        let rough_q = clamp(n_raw_q.w, 0.04, 1.0);
         let l_q = luminance(sample_q.rgb);
 
         let dist_steps = length(vec2f(f32(kx * step_size), f32(ky * step_size)));
@@ -219,7 +291,8 @@ fn svgf_atrous(@builtin(global_invocation_id) id: vec3u) {
         let wz = exp(-abs(z_p - z_q) / denom_z);
         let wn = pow(max(0.0, dot(n_p, n_q)), phi_n);
         let wl = exp(-abs(l_p - l_q) / sigma_l);
-        wt = kw * wz * wn * wl;
+        let wr = select(1.0, exp(-abs(rough_p - rough_q) * 10.0) * exp(-dist_steps * mirror_taper), spec_mode);
+        wt = kw * wz * wn * wl * wr;
       }
       sum_c += sample_q.rgb * wt;
       sum_v += sample_q.a * wt * wt;

@@ -183,6 +183,8 @@ pub struct DdgiVolume {
     blend_irr_pipe: wgpu::ComputePipeline,
     blend_vis_pipe: wgpu::ComputePipeline,
     blend_bgl: wgpu::BindGroupLayout,
+    relocate_pipe: wgpu::ComputePipeline,
+    relocate_bgl: wgpu::BindGroupLayout,
     border_irr_pipe: wgpu::ComputePipeline,
     border_vis_pipe: wgpu::ComputePipeline,
     border_bgl: wgpu::BindGroupLayout,
@@ -194,6 +196,7 @@ pub struct DdgiVolume {
     pack_uniform: wgpu::Buffer,
     local_lights_buf: wgpu::Buffer,
     ray_buf: wgpu::Buffer,
+    probe_offsets: wgpu::Buffer,
     sampler: wgpu::Sampler,
     irr_curr: AtlasTex,
     irr_tmp: AtlasTex,
@@ -296,11 +299,16 @@ impl DdgiVolume {
                 samp_entry(7),
                 storage_rw(8),
                 storage_ro(9),
+                storage_ro(10),
             ],
         });
         let blend_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ddgi_blend_bgl"),
             entries: &[u_entry, storage_ro(1), tex_ro(2, false), tex_ro(3, false), storage_tex(4), storage_tex(5)],
+        });
+        let relocate_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ddgi_relocate_bgl"),
+            entries: &[u_entry, storage_ro(1), storage_rw(11)],
         });
         let border_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ddgi_border_bgl"),
@@ -308,11 +316,19 @@ impl DdgiVolume {
         });
         let eval_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ddgi_eval_bgl"),
-            entries: &[u_entry, tex_ro(1, true), tex_ro(2, true), samp_entry(3), storage_ro(4), storage_rw(5)],
+            entries: &[
+                u_entry,
+                tex_ro(1, true),
+                tex_ro(2, true),
+                samp_entry(3),
+                storage_ro(4),
+                storage_rw(5),
+                storage_ro(10),
+            ],
         });
         let pack_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ddgi_pack_bgl"),
-            entries: &[u_entry, pack_u_entry, tex_ro(2, false), tex_ro(3, false), storage_rw(4)],
+            entries: &[u_entry, pack_u_entry, tex_ro(2, false), tex_ro(3, false), storage_rw(4), storage_ro(10)],
         });
 
         let sw_body = DDGI_WGSL.replace(
@@ -343,6 +359,7 @@ impl DdgiVolume {
         let trace_pipe = make_pipe("ddgi_trace", &module, &trace_bgl, "ddgi_trace_probes");
         let blend_irr_pipe = make_pipe("ddgi_blend_irr", &module, &blend_bgl, "ddgi_blend_irradiance");
         let blend_vis_pipe = make_pipe("ddgi_blend_vis", &module, &blend_bgl, "ddgi_blend_visibility");
+        let relocate_pipe = make_pipe("ddgi_relocate", &module, &relocate_bgl, "ddgi_relocate_probes");
         let border_irr_pipe = make_pipe("ddgi_border_irr", &module, &border_bgl, "ddgi_border_irradiance");
         let border_vis_pipe = make_pipe("ddgi_border_vis", &module, &border_bgl, "ddgi_border_visibility");
         let eval_pipe = make_pipe("ddgi_eval", &module, &eval_bgl, "ddgi_eval_points");
@@ -368,6 +385,7 @@ impl DdgiVolume {
                     samp_entry(7),
                     storage_rw(8),
                     storage_ro(9),
+                    storage_ro(10),
                 ],
             });
             let hw_body = DDGI_WGSL.replace(
@@ -403,13 +421,26 @@ impl DdgiVolume {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let total_rays = u64::from(nx) * u64::from(ny) * u64::from(nz) * u64::from(config.rays_per_probe);
+        let total_probes = u64::from(nx) * u64::from(ny) * u64::from(nz);
+        let total_rays = total_probes * u64::from(config.rays_per_probe);
         let ray_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ddgi_rays"),
             size: total_rays * 16,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let probe_offsets = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ddgi_probe_offsets"),
+            size: total_probes * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        {
+            let mut mapped = probe_offsets.slice(..).get_mapped_range_mut().unwrap();
+            let init: Vec<[f32; 4]> = vec![[0.0, 0.0, 0.0, 1.0]; total_probes as usize];
+            mapped.copy_from_slice(bytemuck::cast_slice(&init));
+        }
+        probe_offsets.unmap();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ddgi_linear_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -431,6 +462,8 @@ impl DdgiVolume {
             blend_irr_pipe,
             blend_vis_pipe,
             blend_bgl,
+            relocate_pipe,
+            relocate_bgl,
             border_irr_pipe,
             border_vis_pipe,
             border_bgl,
@@ -442,6 +475,7 @@ impl DdgiVolume {
             pack_uniform,
             local_lights_buf,
             ray_buf,
+            probe_offsets,
             sampler,
             irr_curr: AtlasTex::new(device, "ddgi_irr_curr", irr_w, irr_h),
             irr_tmp: AtlasTex::new(device, "ddgi_irr_tmp", irr_w, irr_h),
@@ -500,6 +534,12 @@ impl DdgiVolume {
         let irr_vec4s = irr_w * irr_h;
         let vis_vec4s = (vis_w * vis_h).div_ceil(2);
         (irr_vec4s, vis_vec4s)
+    }
+
+    /// Number of `vec4f` probe-offset entries appended immediately after visibility data in packed storage.
+    pub fn packed_probe_offset_vec4_count(&self) -> u32 {
+        let [nx, ny, nz] = self.config.dims;
+        nx * ny * nz
     }
 
     pub fn irradiance_view(&self) -> &wgpu::TextureView {
@@ -638,6 +678,7 @@ impl DdgiVolume {
                     wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     wgpu::BindGroupEntry { binding: 8, resource: self.ray_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: self.probe_offsets.as_entire_binding() },
                 ],
             });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -664,6 +705,7 @@ impl DdgiVolume {
                     wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                     wgpu::BindGroupEntry { binding: 8, resource: self.ray_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: self.probe_offsets.as_entire_binding() },
                 ],
             });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -734,12 +776,61 @@ impl DdgiVolume {
             pass.dispatch_workgroups((cols * DDGI_VISIBILITY_TILE).div_ceil(8), (ny * DDGI_VISIBILITY_TILE).div_ceil(8), 1);
         }
 
+        // 4. Relocate probes trapped inside solid geometry or hugging surfaces for subsequent frames.
+        let total_probes = nx * ny * nz;
+        let reloc_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ddgi_relocate_bg"),
+            layout: &self.relocate_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: self.ray_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: self.probe_offsets.as_entire_binding() },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ddgi_relocate"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.relocate_pipe);
+            pass.set_bind_group(0, &reloc_bg, &[]);
+            pass.dispatch_workgroups(total_probes.div_ceil(64), 1, 1);
+        }
+
         self.frame_index = self.frame_index.saturating_add(1);
     }
 
-    /// Packs this cascade's metadata, irradiance atlas, and visibility atlas into a flat `array<vec4f>`
-    /// storage buffer so forward PBR materials (`environment.wgsl`) and RT reflections can sample DDGI
-    /// directly without consuming any extra sampled-texture slots.
+    /// Reads back the current GPU probe relocation offsets (`[dx, dy, dz, active]`) in storage index order.
+    pub fn read_probe_offsets(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<Vec<[f32; 4]>> {
+        let [nx, ny, nz] = self.config.dims;
+        let total_probes = (nx * ny * nz) as usize;
+        let size = (total_probes * 16) as u64;
+        let rb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ddgi_offsets_rb"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_buffer_to_buffer(&self.probe_offsets, 0, &rb, 0, size);
+        queue.submit(Some(enc.finish()));
+        let slice = rb.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv().unwrap()?;
+        let data = slice.get_mapped_range()?;
+        let out = bytemuck::cast_slice::<u8, [f32; 4]>(&data).to_vec();
+        drop(data);
+        rb.unmap();
+        Ok(out)
+    }
+
+    /// Packs this cascade's metadata, irradiance atlas, visibility atlas, and probe offsets into a
+    /// flat `array<vec4f>` storage buffer so forward PBR materials (`environment.wgsl`) and RT
+    /// reflections can sample DDGI directly without consuming any extra sampled-texture slots.
     #[allow(clippy::too_many_arguments)]
     pub fn pack_cascade(
         &self,
@@ -766,10 +857,12 @@ impl DdgiVolume {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.irr_curr.view) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.vis_curr.view) },
                 wgpu::BindGroupEntry { binding: 4, resource: dst_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: self.probe_offsets.as_entire_binding() },
             ],
         });
         let (irr_v4, vis_v4) = self.packed_data_vec4_counts();
-        let work = irr_v4.max(vis_v4).max(1);
+        let off_v4 = self.packed_probe_offset_vec4_count();
+        let work = irr_v4.max(vis_v4).max(off_v4).max(1);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("ddgi_pack_cascade"),
             timestamp_writes: None,
@@ -823,6 +916,7 @@ impl DdgiVolume {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 wgpu::BindGroupEntry { binding: 4, resource: in_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: out_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: self.probe_offsets.as_entire_binding() },
             ],
         });
         let mut enc = device.create_command_encoder(&Default::default());
@@ -1108,6 +1202,112 @@ mod tests {
         assert!(
             scrolled_bounce[1] > 0.15 && scrolled_bounce[1] > scrolled_bounce[0] * 2.5,
             "toroidally scrolled DDGI volume must maintain accurate green bounce irradiance: {scrolled_bounce:?}"
+        );
+    }
+
+    #[test]
+    fn gpu_ddgi_probe_relocation_and_adaptive_hysteresis_witness() {
+        let (device, queue) = crate::testing::device().expect("GPU adapter required");
+
+        // Closed solid wall slab spanning x in [-0.25, +0.25], y in [0, 3], z in [-3, 3] with outward normals.
+        let (hx, hy0, hy1, hz) = (0.25f32, 0.0f32, 3.0f32, 3.0f32);
+        let wall_tris = [
+            // +X
+            BlasTriangle::flat([hx, hy0, -hz], [hx, hy1, -hz], [hx, hy1, hz]),
+            BlasTriangle::flat([hx, hy0, -hz], [hx, hy1, hz], [hx, hy0, hz]),
+            // -X
+            BlasTriangle::flat([-hx, hy0, hz], [-hx, hy1, hz], [-hx, hy1, -hz]),
+            BlasTriangle::flat([-hx, hy0, hz], [-hx, hy1, -hz], [-hx, hy0, -hz]),
+            // +Y
+            BlasTriangle::flat([-hx, hy1, -hz], [-hx, hy1, hz], [hx, hy1, hz]),
+            BlasTriangle::flat([-hx, hy1, -hz], [hx, hy1, hz], [hx, hy1, -hz]),
+            // -Y
+            BlasTriangle::flat([-hx, hy0, hz], [-hx, hy0, -hz], [hx, hy0, -hz]),
+            BlasTriangle::flat([-hx, hy0, hz], [hx, hy0, -hz], [hx, hy0, hz]),
+            // +Z
+            BlasTriangle::flat([-hx, hy0, hz], [hx, hy0, hz], [hx, hy1, hz]),
+            BlasTriangle::flat([-hx, hy0, hz], [hx, hy1, hz], [-hx, hy1, hz]),
+            // -Z
+            BlasTriangle::flat([hx, hy0, -hz], [-hx, hy0, -hz], [-hx, hy1, -hz]),
+            BlasTriangle::flat([hx, hy0, -hz], [-hx, hy1, -hz], [hx, hy1, -hz]),
+        ];
+        let floor_blas = quad_blas([-6.0, 0.0, -6.0], [-6.0, 0.0, 6.0], [6.0, 0.0, 6.0], [6.0, 0.0, -6.0]);
+        let wall_blas = Blas::build(&wall_tris).unwrap();
+        let mut floor_inst = TlasInstance::new(0, ID);
+        floor_inst.albedo = [0.85, 0.85, 0.85];
+        let mut wall_inst = TlasInstance::new(1, ID);
+        wall_inst.albedo = [0.5, 0.5, 0.5];
+        let scene = TlasScene::build(&[floor_blas, wall_blas], &[floor_inst, wall_inst]).unwrap();
+        let scene_gpu = TlasSceneGpu::upload(&device, &scene).unwrap();
+
+        // Probe (1, 0, 1) sits at (0.0, 1.0, 0.0) -- dead center inside the solid wall slab!
+        let cfg = DdgiGridConfig {
+            origin: [-2.0, 1.0, -2.0],
+            spacing: [2.0, 2.0, 2.0],
+            dims: [3, 2, 3],
+            rays_per_probe: 128,
+            hysteresis: 0.95,
+            max_ray_distance: 20.0,
+            ..Default::default()
+        };
+        let mut ddgi = DdgiVolume::new(&device, cfg).unwrap();
+        let dark_params = DdgiFrameParams {
+            sun_direction: [0.0, 1.0, 0.0],
+            sun_color: [0.0, 0.0, 0.0],
+            sky_zenith: [0.02, 0.02, 0.02],
+            sky_horizon: [0.02, 0.02, 0.02],
+            visibility_mask: u32::MAX,
+            reset_history: false,
+        };
+        for _ in 0..4 {
+            let mut enc = device.create_command_encoder(&Default::default());
+            ddgi.update(&device, &mut enc, &scene_gpu, &dark_params);
+            queue.submit(Some(enc.finish()));
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        let offsets = ddgi.read_probe_offsets(&device, &queue).unwrap();
+        let trapped_idx = 3 + 1; // (ix=1, iy=0, iz=1) -> (0*3 + 1)*3 + 1 = 4
+        let trapped_off = offsets[trapped_idx];
+        assert!(
+            trapped_off[0].abs() > hx && trapped_off[0].abs() <= 0.45 * 2.0 + 1e-3,
+            "DDGI relocation must push probe outside thin wall [-{hx}, +{hx}] within cell bound: {trapped_off:?}"
+        );
+        assert!(
+            trapped_off[3] > 0.5,
+            "relocated probe must become active after escaping solid geometry: {trapped_off:?}"
+        );
+
+        // Adaptive perceptual hysteresis witness: flip sun ON brightly with hysteresis=0.95!
+        let bright_params = DdgiFrameParams {
+            sun_direction: [0.2, 0.95, 0.2],
+            sun_color: [12.0, 12.0, 12.0],
+            sky_zenith: [0.6, 0.8, 1.2],
+            sky_horizon: [0.8, 0.9, 1.0],
+            visibility_mask: u32::MAX,
+            reset_history: false,
+        };
+        for _ in 0..2 {
+            let mut enc = device.create_command_encoder(&Default::default());
+            ddgi.update(&device, &mut enc, &scene_gpu, &bright_params);
+            queue.submit(Some(enc.finish()));
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        let q = [DdgiQueryPoint {
+            pos: [-2.0, 2.0, 0.0, 0.0],
+            normal: [0.0, -1.0, 0.0, 0.0],
+            view: [0.0, -1.0, 0.0, 0.0],
+        }];
+        let after_2 = ddgi.evaluate_points(&device, &queue, &q).unwrap()[0];
+        for _ in 0..14 {
+            let mut enc = device.create_command_encoder(&Default::default());
+            ddgi.update(&device, &mut enc, &scene_gpu, &bright_params);
+            queue.submit(Some(enc.finish()));
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        }
+        let steady = ddgi.evaluate_points(&device, &queue, &q).unwrap()[0];
+        assert!(
+            steady[0] > 0.5 && after_2[0] > steady[0] * 0.40,
+            "adaptive perceptual hysteresis must converge rapidly after large lighting jump (h=0.95): after_2={after_2:?}, steady={steady:?}"
         );
     }
 }

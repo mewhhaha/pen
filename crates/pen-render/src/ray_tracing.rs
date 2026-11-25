@@ -1537,8 +1537,12 @@ impl GpuBlasPool {
         instances: &[TlasInstance],
     ) -> Result<()> {
         let mut prepared = Vec::with_capacity(instances.len());
-        let mut inst_boxes = Vec::with_capacity(instances.len());
-        let mut centroids = Vec::with_capacity(instances.len());
+        #[cfg(not(target_arch = "wasm32"))]
+        let hw_only = self.use_hw_rt;
+        #[cfg(target_arch = "wasm32")]
+        let hw_only = false;
+        let mut inst_boxes = Vec::with_capacity(if hw_only { 0 } else { instances.len() });
+        let mut centroids = Vec::with_capacity(if hw_only { 0 } else { instances.len() });
         let mut world_transforms = Vec::with_capacity(instances.len());
         let mut blas_indices = Vec::with_capacity(instances.len());
 
@@ -1558,13 +1562,15 @@ impl GpuBlasPool {
             let nm0 = [inv[0], inv[4], inv[8], 0.0];
             let nm1 = [inv[1], inv[5], inv[9], 0.0];
             let nm2 = [inv[2], inv[6], inv[10], 0.0];
-            let wb = transform_aabb(&inst.transform, entry.aabb_min, entry.aabb_max);
-            centroids.push([
-                0.5 * (wb.min[0] + wb.max[0]),
-                0.5 * (wb.min[1] + wb.max[1]),
-                0.5 * (wb.min[2] + wb.max[2]),
-            ]);
-            inst_boxes.push(wb);
+            if !hw_only {
+                let wb = transform_aabb(&inst.transform, entry.aabb_min, entry.aabb_max);
+                centroids.push([
+                    0.5 * (wb.min[0] + wb.max[0]),
+                    0.5 * (wb.min[1] + wb.max[1]),
+                    0.5 * (wb.min[2] + wb.max[2]),
+                ]);
+                inst_boxes.push(wb);
+            }
             world_transforms.push(inst.transform);
             blas_indices.push(bi);
             prepared.push(TlasInstanceGpu {
@@ -1594,6 +1600,65 @@ impl GpuBlasPool {
         if prepared.is_empty() {
             self.tlas_nodes_len = 0;
             self.tlas_instances_len = 0;
+            return Ok(());
+        }
+
+        // Native hardware ray-query (`tlas_traversal_hw.wgsl`) indexes `tlas_instances[custom_data]`
+        // directly from `hw_tlas` and never reads `tlas_nodes`, so skip the CPU SW BVH build & upload!
+        #[cfg(not(target_arch = "wasm32"))]
+        if hw_only {
+            let n_insts = prepared.len() as u32;
+            Self::grow_buffer(
+                device,
+                encoder,
+                &mut self.tlas_instances_buf,
+                &mut self.tlas_instances_cap,
+                0,
+                n_insts,
+                std::mem::size_of::<TlasInstanceGpu>(),
+                "pool_tlas_instances",
+            )?;
+            encode_copy(device, encoder, &self.tlas_instances_buf, bytemuck::cast_slice(&prepared));
+            self.tlas_nodes_len = 0;
+            self.tlas_instances_len = n_insts;
+            self.tlas_update_count += 1;
+
+            let needed = n_insts.max(1);
+            if self.hw_tlas.is_none() || self.hw_tlas_cap < needed {
+                let cap = needed.next_power_of_two().max(64);
+                self.hw_tlas = Some(device.create_tlas(&wgpu::CreateTlasDescriptor {
+                    label: Some("hw_tlas"),
+                    max_instances: cap,
+                    flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                    update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                }));
+                self.hw_tlas_cap = cap;
+            }
+            if let Some(hw_tlas) = &mut self.hw_tlas {
+                let total_slots = self.hw_tlas_cap as usize;
+                for slot in 0..total_slots {
+                    if slot < prepared.len() {
+                        let bi = blas_indices[slot];
+                        let m = world_transforms[slot];
+                        let row_major_3x4 = [
+                            m[0], m[4], m[8], m[12],
+                            m[1], m[5], m[9], m[13],
+                            m[2], m[6], m[10], m[14],
+                        ];
+                        let mask = (prepared[slot].mask & 0xff) as u8;
+                        let mask = if mask == 0 { 0xff } else { mask };
+                        if let Some(hw_blas) = &self.entries[bi].hw_blas {
+                            *hw_tlas.get_mut_single(slot).unwrap() =
+                                Some(wgpu::TlasInstance::new(hw_blas, row_major_3x4, slot as u32, mask));
+                        } else {
+                            *hw_tlas.get_mut_single(slot).unwrap() = None;
+                        }
+                    } else {
+                        *hw_tlas.get_mut_single(slot).unwrap() = None;
+                    }
+                }
+                encoder.build_acceleration_structures(std::iter::empty(), std::iter::once(&*hw_tlas));
+            }
             return Ok(());
         }
 
@@ -2646,5 +2711,110 @@ mod tests {
             pool.uses_hardware_ray_query(),
             last_refl[idx_right]
         );
+    }
+
+    #[test]
+    fn gpu_tlas_vndf_matte_cutoff_energy_conserving_occlude_and_hw_rt_skips_sw_tlas() {
+        let (device, queue) = crate::testing::device_with_optional().expect("GPU adapter required");
+        let half_floor = |x0: f32, x1: f32| {
+            [
+                BlasTriangle::flat([x0, 0.0, -2.5], [x0, 0.0, 2.5], [x1, 0.0, 2.5]),
+                BlasTriangle::flat([x0, 0.0, -2.5], [x1, 0.0, 2.5], [x1, 0.0, -2.5]),
+            ]
+        };
+        let roof = [
+            BlasTriangle::flat([-2.5, 2.0, -2.5], [2.5, 2.0, -2.5], [2.5, 2.0, 2.5]),
+            BlasTriangle::flat([-2.5, 2.0, -2.5], [2.5, 2.0, 2.5], [-2.5, 2.0, 2.5]),
+        ];
+        let id = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+
+        let mut pool = GpuBlasPool::new(&device);
+        let mut enc0 = device.create_command_encoder(&Default::default());
+        let bi_left = pool.ensure_blas(&device, &mut enc0, 100, &half_floor(-2.5, 0.0)).unwrap().unwrap();
+        let bi_right = pool.ensure_blas(&device, &mut enc0, 101, &half_floor(0.0, 2.5)).unwrap().unwrap();
+        let bi_roof = pool.ensure_blas(&device, &mut enc0, 102, &roof).unwrap().unwrap();
+
+        let mut left_matte = TlasInstance::new(bi_left, id);
+        left_matte.albedo = [0.8, 0.8, 0.8];
+        left_matte.roughness = 0.90; // > 0.75 matte cutoff!
+        left_matte.metallic = 0.0;
+
+        let mut right_metal = TlasInstance::new(bi_right, id);
+        right_metal.albedo = [0.95, 0.95, 0.95];
+        right_metal.roughness = 0.08; // glossy mirror!
+        right_metal.metallic = 0.95;
+
+        let mut roof_inst = TlasInstance::new(bi_roof, id);
+        roof_inst.albedo = [0.9, 0.05, 0.05];
+        roof_inst.emissive = [4.0, 0.05, 0.05];
+
+        pool.update_tlas(&device, &mut enc0, &[left_matte, right_metal, roof_inst]).unwrap();
+        let snap = pool.snapshot_scene();
+        if pool.uses_hardware_ray_query() {
+            assert_eq!(snap.tlas_node_count, 0, "HW ray-query path must skip CPU SW TLAS BVH build");
+        }
+        assert_eq!(snap.tlas_instance_count, 3);
+
+        let vp: [f32; 16] = [
+            0.5, 0.0, 0.0, 0.0,
+            0.0, 0.0, -0.25, 0.0,
+            0.0, -0.5, 0.0, 0.0,
+            0.0, 0.0, 0.5, 1.0,
+        ];
+        let (w, h) = (32u32, 32u32);
+        let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("vndf_depth"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            depth_tex.as_image_copy(),
+            bytemuck::cast_slice(&vec![0.5f32; (w * h) as usize]),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let depth_v = depth_tex.create_view(&Default::default());
+        let params = TlasRayTraceParams {
+            view_projection: vp,
+            camera_pos: [0.0, 4.0, 0.0],
+            depth_clear: 1.0,
+            sun_direction: [0.0, 1.0, 0.0],
+            sun_angular_radius: 0.0,
+            sun_color: [0.0, 0.0, 0.0],
+            sky_zenith: [0.05, 0.1, 0.2],
+            sky_horizon: [0.05, 0.1, 0.2],
+            surface_roughness: 0.5,
+            ao_radius: 2.0,
+            max_ray_distance: 64.0,
+            shadow_samples: 1,
+            ao_samples: 2,
+            reflection_samples: 4,
+            gi_samples: 0,
+            gi_bounce_scale: 1.0,
+            frame_seed: 1.0,
+            normal_bias: 0.01,
+            visibility_mask: u32::MAX,
+        };
+        let mut rt = TlasRayTracer::new(&device);
+        rt.trace_with_scene_gi(&device, &mut enc0, &snap, &depth_v, (w, h), &params, &[], None, true).unwrap();
+        queue.submit(Some(enc0.finish()));
+
+        let sao = read_rgba16f(&device, &queue, rt.shadow_ao_texture().unwrap(), w, h);
+        let refl = read_rgba16f(&device, &queue, rt.reflection_texture().unwrap(), w, h);
+        let idx_matte = (16 * w + 8) as usize;
+        let idx_metal = (16 * w + 24) as usize;
+
+        assert!(refl[idx_matte][0] < 0.01, "matte floor (rough=0.90 > 0.75) must skip reflection rays: {:?}", refl[idx_matte]);
+        assert!(sao[idx_matte][2] < 0.01, "matte floor must report zero sky IBL occlusion: {:?}", sao[idx_matte]);
+        assert!((sao[idx_matte][3] - 0.90).abs() < 0.03, "primary lookup must export roughness 0.90 in sao.a: {:?}", sao[idx_matte]);
+
+        assert!(refl[idx_metal][0] > 0.8, "glossy metal floor must reflect emissive red roof via Heitz VNDF: {:?}", refl[idx_metal]);
+        assert!(sao[idx_metal][2] > 0.40, "glossy metal hit must export energy-conserving sky occlusion in sao.b: {:?}", sao[idx_metal]);
+        assert!((sao[idx_metal][3] - 0.08).abs() < 0.03, "primary lookup must export roughness 0.08 in sao.a: {:?}", sao[idx_metal]);
     }
 }

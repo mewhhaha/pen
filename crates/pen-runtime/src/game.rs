@@ -290,6 +290,31 @@ fn hash_render_packet(packet: &[f32]) -> u64 {
     hash
 }
 
+/// FNV-1a over a resolved retained frame so a live retained delta and a
+/// post-restore retained reset that produce the exact same scene hash identically,
+/// while preserving `exposure.cut` normalization and ephemeral `service::KERNEL` filtering.
+fn hash_resolved_frame(frame: &mut RenderFrame, schema: u32) -> u64 {
+    let saved_cut = frame.exposure.cut;
+    frame.exposure.cut = false;
+    let has_kernel = frame.services.iter().any(|request| request.service == pen_protocol::service::KERNEL);
+    let saved_services = has_kernel.then(|| {
+        let original = std::mem::take(&mut frame.services);
+        frame.services = original
+            .iter()
+            .filter(|request| request.service != pen_protocol::service::KERNEL)
+            .cloned()
+            .collect();
+        original
+    });
+    let canonical = pen_protocol::boundary::canonical_render(frame, schema, &[]);
+    let hash = hash_lanes(&canonical);
+    frame.exposure.cut = saved_cut;
+    if let Some(original) = saved_services {
+        frame.services = original;
+    }
+    hash
+}
+
 impl<B: Backend> GameRuntime<B> {
     pub async fn new(
         engine: &B,
@@ -531,6 +556,7 @@ impl<B: Backend> GameRuntime<B> {
         if !state.is_empty() {
             return Err(anyhow::anyhow!("program frame must keep its state inside the guest").context(InvalidFrame));
         }
+        let was_retained = frame.retained_enabled;
         let scene = self.active.instances.resolve(&mut frame).map_err(|error| error.context(InvalidFrame))?;
         let decoded = Instant::now();
         host.validate(&frame).map_err(|error| error.context(InvalidFrame))?;
@@ -538,7 +564,11 @@ impl<B: Backend> GameRuntime<B> {
         self.active.accept();
         self.snapshot = None;
         if self.hashing {
-            self.packet_hash = hash_render_packet(&packet);
+            self.packet_hash = if was_retained {
+                hash_resolved_frame(&mut frame, self.active.schema)
+            } else {
+                hash_render_packet(&packet)
+            };
         }
         self.packet_lanes = packet.len();
         if self.keeping {
@@ -1019,5 +1049,40 @@ mod receive_tests {
         for (_, input) in frames {
             assert_eq!(input, &[0.0, 64.0, 64.0, 0.0, 0.0], "only startup carries SessionStarted");
         }
+    }
+
+    #[test]
+    fn resolved_retained_hash_matches_across_delta_and_reset_and_normalizes_cut_and_kernel() {
+        use pen_protocol::{Instance, ServiceRequest, service};
+        let inst = |id: u32, mesh: u32| Instance {
+            id_low: id,
+            id_high: 0,
+            order: id,
+            mesh,
+            material: 0,
+            transform: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            parameters: None,
+        };
+        let mut init = RenderFrame { retained_enabled: true, retained_reset: true, instances: vec![inst(1, 0)], ..Default::default() };
+        let scene = crate::instances::Scene::default().resolve(&mut init).unwrap();
+
+        let mut delta = RenderFrame { retained_enabled: true, retained_reset: false, instances: vec![inst(2, 1)], ..Default::default() };
+        let _ = scene.resolve(&mut delta).unwrap();
+        let delta_hash = hash_resolved_frame(&mut delta, 26);
+
+        let mut reset = RenderFrame {
+            retained_enabled: true,
+            retained_reset: true,
+            instances: vec![inst(1, 0), inst(2, 1)],
+            services: vec![ServiceRequest { service: service::KERNEL, values: vec![1.0, 2.0], ..Default::default() }],
+            ..Default::default()
+        };
+        reset.exposure.cut = true;
+        let _ = crate::instances::Scene::default().resolve(&mut reset).unwrap();
+        let reset_hash = hash_resolved_frame(&mut reset, 26);
+
+        assert_eq!(delta_hash, reset_hash);
+        assert!(reset.exposure.cut, "hashing must not clobber exposure.cut for the renderer");
+        assert_eq!(reset.services.len(), 1, "hashing must preserve kernel requests for the host");
     }
 }

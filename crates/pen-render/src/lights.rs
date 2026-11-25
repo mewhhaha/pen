@@ -445,6 +445,7 @@ fn storage(device: &wgpu::Device, label: &str, bytes: u64) -> wgpu::Buffer {
 pub(crate) struct Clusters {
     layout: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
+    area_only_uniform: wgpu::Buffer,
     lights: wgpu::Buffer,
     ranges: wgpu::Buffer,
     indices: wgpu::Buffer,
@@ -459,6 +460,7 @@ pub(crate) struct Clusters {
     atlas: wgpu::TextureView,
     atlas_id: u64,
     group: wgpu::BindGroup,
+    area_only_group: wgpu::BindGroup,
     empty: wgpu::BindGroup,
     data: Vec<f32>,
     face_data: Vec<f32>,
@@ -529,12 +531,26 @@ impl Clusters {
         let empty_uniform = uniform("no lights");
         let empty =
             Self::bind(device, layout, &empty_uniform, &lights, &ranges, &indices, &stand_in, &sampler, &faces, &area);
+        let area_only_uniform = uniform("area-only light grid");
+        let area_only_group = Self::bind(
+            device,
+            layout,
+            &area_only_uniform,
+            &lights,
+            &ranges,
+            &indices,
+            &stand_in,
+            &sampler,
+            &faces,
+            &area,
+        );
         let uniform = uniform("light grid");
         let group =
             Self::bind(device, layout, &uniform, &lights, &ranges, &indices, &stand_in, &sampler, &faces, &area);
         Self {
             layout: layout.clone(),
             uniform,
+            area_only_uniform,
             lights,
             ranges,
             indices,
@@ -546,6 +562,7 @@ impl Clusters {
             atlas: stand_in.clone(),
             atlas_id: 0,
             group,
+            area_only_group,
             empty,
             data: Vec::new(),
             face_data: vec![0.0; MAX_FACES * 16],
@@ -694,11 +711,12 @@ impl Clusters {
         cookie_slots: &[Option<u32>],
     ) {
         let area_count = self.upload_area_lights(queue, frame, cookie_slots);
+        let mut area_only_words = [0u32; 12];
+        area_only_words[9] = crate::matrix::narrow(f64::from(area_count)).to_bits();
+        queue.write_buffer(&self.area_only_uniform, 0, bytemuck::cast_slice(&area_only_words));
         let count = u32::try_from(frame.lights.len()).unwrap_or(u32::MAX);
         if count == 0 {
-            let mut words = [0u32; 12];
-            words[9] = crate::matrix::narrow(f64::from(area_count)).to_bits();
-            queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&words));
+            queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&area_only_words));
             return;
         }
         let slicing = assign_into(&frame.lights, &frame.view, &frame.projection, &mut self.assign_scratch);
@@ -820,6 +838,18 @@ impl Clusters {
                 &self.faces,
                 &self.area,
             );
+            self.area_only_group = Self::bind(
+                device,
+                &self.layout,
+                &self.area_only_uniform,
+                &self.lights,
+                &self.ranges,
+                &self.indices,
+                &self.atlas,
+                &self.sampler,
+                &self.faces,
+                &self.area,
+            );
         }
         if !shadows.casters.is_empty() {
             self.face_data.fill(0.0);
@@ -842,6 +872,12 @@ impl Clusters {
     /// The frame's lights.
     pub fn group(&self) -> &wgpu::BindGroup {
         &self.group
+    }
+
+    /// Zero clustered point/spot lights while keeping LTC area lights & cookies active
+    /// (used by the Tier-3 opaque pass when ReSTIR DI shades all point & spot lights).
+    pub fn area_only_group(&self) -> &wgpu::BindGroup {
+        &self.area_only_group
     }
 
     /// No lights, for what another camera sees.

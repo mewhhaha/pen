@@ -1486,3 +1486,215 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn tier3_restir_di_many_light_shadows_sharc_and_two_phase_meshlet_disocclusion_witness() {
+    let Some((device, queue)) = common::featured_device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("pen-tier3-restir-di-sharc-2p-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Dense 512-triangle UV sphere (>124 tris -> multiple meshlets!) + unit quad.
+    let (stacks, slices) = (16u32, 16u32);
+    let (mut pos, mut norm, mut uv, mut idx) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for r in 0..=stacks {
+        let v = r as f32 / stacks as f32;
+        let phi = v * std::f32::consts::PI;
+        for c in 0..=slices {
+            let u = c as f32 / slices as f32;
+            let theta = u * std::f32::consts::TAU;
+            let (x, y, z) = (phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin());
+            pos.extend_from_slice(&[x, y, z]);
+            norm.extend_from_slice(&[x, y, z]);
+            uv.extend_from_slice(&[u, v]);
+        }
+    }
+    let stride = slices + 1;
+    for r in 0..stacks {
+        for c in 0..slices {
+            let (i0, i1, i2, i3) = (r * stride + c, r * stride + c + 1, (r + 1) * stride + c, (r + 1) * stride + c + 1);
+            idx.extend_from_slice(&[i0, i1, i2, i1, i3, i2]);
+        }
+    }
+    let sphere_json = json!({ "positions": pos, "normals": norm, "uvs": uv, "indices": idx });
+    let quad_json = json!({
+        "positions": [-1.0, -1.0, 0.0,  1.0, -1.0, 0.0,  1.0, 1.0, 0.0,  -1.0, 1.0, 0.0],
+        "normals": [0.0, 0.0, 1.0,  0.0, 0.0, 1.0,  0.0, 0.0, 1.0,  0.0, 0.0, 1.0],
+        "uvs": [0.0, 1.0,  1.0, 1.0,  1.0, 0.0,  0.0, 0.0],
+        "indices": [0, 1, 2, 0, 2, 3]
+    });
+    std::fs::write(dir.join("sphere.mesh.json"), serde_json::to_vec(&sphere_json).unwrap()).unwrap();
+    std::fs::write(dir.join("quad.mesh.json"), serde_json::to_vec(&quad_json).unwrap()).unwrap();
+    std::fs::write(dir.join("simple.wgsl"), SIMPLE_SHADER).unwrap();
+    std::fs::write(dir.join("lit.wgsl"), STOCK_LIT_SHADER).unwrap();
+    write_solid_png(&dir.join("white.png"), [255, 255, 255, 255]);
+
+    let mats = [
+        ("green.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.1, 0.9, 0.15, 1.0], "lighting": "unlit" })),
+        ("red.mat.json", json!({ "shader": "simple.wgsl", "texture": "white.png", "color": [0.95, 0.1, 0.1, 1.0], "lighting": "unlit" })),
+        ("white_lit.mat.json", json!({ "shader": "lit.wgsl", "texture": "white.png", "color": [0.85, 0.85, 0.85, 1.0], "lighting": "lit", "instanceParameters": [0.0, 0.75, 1.0, 0.0] })),
+    ];
+    for (name, val) in &mats {
+        std::fs::write(dir.join(name), val.to_string()).unwrap();
+    }
+    let catalog = Catalog {
+        meshes: vec!["sphere.mesh.json".into(), "quad.mesh.json".into()],
+        materials: mats.iter().map(|(n, _)| (*n).into()).collect(),
+        sounds: vec![],
+    };
+    let mut renderer = Renderer::new(
+        device.clone(),
+        queue.clone(),
+        RendererOptions {
+            format: common::FORMAT,
+            display: pen_render::Display::SDR,
+            assets: dir.clone(),
+            veil: None,
+            pipeline_cache: None,
+        },
+    )
+    .unwrap();
+    let mut target = common::Offscreen::new(&device, 64);
+
+    // 1) Two-phase GPU meshlet occlusion culling: 0-frame disocclusion recovery in BOTH Forward-Z & Reversed-Z!
+    let proj_fwd = pen_render::perspective_forward_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);
+    let proj_rev = perspective_reversed_z(std::f32::consts::FRAC_PI_2, 1.0, 0.1, None);
+    let sphere_draw = Draw {
+        mesh: 0,
+        material: 0,
+        transform: [
+            1.4, 0.0, 0.0, 0.0,
+            0.0, 1.4, 0.0, 0.0,
+            0.0, 0.0, 1.4, 0.0,
+            0.0, 0.0, -5.0, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    };
+    let blocker_draw = Draw {
+        mesh: 1,
+        material: 1,
+        transform: [
+            3.0, 0.0, 0.0, 0.0,
+            0.0, 3.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, -1.5, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    };
+    for (label, proj) in [("ForwardZ", proj_fwd), ("ReversedZ", proj_rev)] {
+        let mut occluded = common::frame(vec![blocker_draw.clone(), sphere_draw.clone()]);
+        occluded.projection = proj;
+        occluded.quality.sky = false;
+        occluded.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        wait_ready(&mut renderer, &occluded, &catalog, &mut target);
+        // Submit once more so Hi-Z definitely holds the foreground red blocker depth!
+        renderer.submit(&occluded, &catalog, &mut target).unwrap();
+        let px_occ = common::middle(&device, &queue, &target.0);
+        assert!(px_occ[0] > 150 && px_occ[1] < 80, "{label}: blocker must occlude sphere: {px_occ:?}");
+
+        // Next frame: remove blocker! Phase 1 rejects the sphere against prior-frame Hi-Z, and Phase 2 MUST
+        // recover it on the EXACT SAME FRAME (0-frame disocclusion lag, no 1-frame black hole!).
+        let mut revealed = common::frame(vec![sphere_draw.clone()]);
+        revealed.projection = proj;
+        revealed.quality.sky = false;
+        revealed.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+        renderer.submit(&revealed, &catalog, &mut target).unwrap();
+        assert!(
+            renderer.last_meshlet_phase2_active(),
+            "{label}: two-phase meshlet recovery must execute when prior-frame Hi-Z was active"
+        );
+        let px_rev = common::middle(&device, &queue, &target.0);
+        assert!(
+            px_rev[1] > 140 && px_rev[0] < 80,
+            "{label}: disoccluded meshlet sphere must appear on the EXACT same frame (0-frame lag): {px_rev:?}"
+        );
+    }
+
+    // 2) Live Tier-3 ReSTIR DI many-light ray-traced shadows + SHaRC multi-bounce GI:
+    //    Backlit white wall at z=-3.0 facing +Z; vertical blocker at x=0 protruding toward +Z divides
+    //    the wall into left (x < 0, lit by 16 point lights on the left) and right (x > 0, shadowed!).
+    let back_wall = Draw {
+        mesh: 1,
+        material: 2,
+        transform: [
+            4.0, 0.0, 0.0, 0.0,
+            0.0, 4.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, -3.0, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    };
+    // Vertical divider perpendicular to the back wall at x=0, spanning z in [-3.0, -0.5]
+    let divider = Draw {
+        mesh: 1,
+        material: 2,
+        transform: [
+            0.0, 0.0, -1.5, 0.0,
+            0.0, 4.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, -1.8, 1.0,
+        ],
+        parameters: None,
+        extra: None,
+    };
+    let mut lights = Vec::new();
+    for i in 0u32..16 {
+        let f = i as f32;
+        lights.push(pen_protocol::Light {
+            position: Vector { x: -1.6 + (f % 4.0) * 0.15, y: -0.6 + (f / 4.0).floor() * 0.4, z: -1.8 },
+            color: Vector { x: 1.4, y: 1.1, z: 0.7 },
+            radius: 12.0,
+            direction: Vector { x: 0.0, y: 0.0, z: -1.0 },
+            inner: -1.0,
+            outer: -1.0,
+            shadow: false,
+            id: i + 1,
+        });
+    }
+    let mut base = common::frame(vec![back_wall, divider]);
+    base.projection = proj_fwd;
+    base.ambient = Vector { x: 0.0, y: 0.0, z: 0.0 };
+    base.light_color = Vector { x: 0.0, y: 0.0, z: 0.0 };
+    base.sky = Default::default();
+    base.quality.sky = false;
+    base.clear = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+    base.lights = lights;
+
+    // RT=0 (Forward+ unshadowed point lights): right side is illuminated through the divider!
+    let mut f_rt0 = base.clone();
+    f_rt0.quality.ray_tracing = 0;
+    wait_ready(&mut renderer, &f_rt0, &catalog, &mut target);
+    let img_rt0 = common::pixels(&device, &queue, &target.0);
+    let luma_at = |img: &[[u8; 4]], x: u32, y: u32| -> f32 {
+        let p = img[(y * 64 + x) as usize];
+        0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32
+    };
+    let rt0_right = luma_at(&img_rt0, 48, 32);
+
+    // RT=3 (ReSTIR DI + ReSTIR GI + SHaRC + SVGF, opaque clusters zeroed via area_only_group):
+    // left side stays brightly lit while right side behind the divider receives crisp RT local shadows!
+    let mut f_rt3 = base.clone();
+    f_rt3.quality.ray_tracing = 3;
+    f_rt3.quality.ddgi = false;
+    f_rt3.exposure.cut = true;
+    renderer.submit(&f_rt3, &catalog, &mut target).unwrap();
+    f_rt3.exposure.cut = false;
+    for _ in 0..5 {
+        renderer.submit(&f_rt3, &catalog, &mut target).unwrap();
+    }
+    let img_rt3 = common::pixels(&device, &queue, &target.0);
+    let rt3_left = luma_at(&img_rt3, 16, 32);
+    let rt3_right = luma_at(&img_rt3, 48, 32);
+    assert!(
+        rt3_left > 80.0 && rt3_right < rt3_left * 0.45 && rt3_right < rt0_right * 0.65,
+        "Tier-3 ReSTIR DI + SHaRC must illuminate lit side brightly and cast RT local shadow behind divider (zero Forward+ leak!): rt0_right={rt0_right:.1}, rt3_left={rt3_left:.1}, rt3_right={rt3_right:.1}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

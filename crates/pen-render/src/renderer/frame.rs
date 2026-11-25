@@ -37,6 +37,41 @@ pub(super) fn stencil(material: &Material) -> u32 {
 }
 
 impl Drawing<'_> {
+    /// Draws newly disoccluded Phase-2 meshlet clusters for `entry` (`draws_phase2` buffer),
+    /// emitting zero overlapping triangles with Phase 1.
+    pub(super) fn draw_meshlet_phase2(&self, pass: &mut wgpu::RenderPass<'_>, entry: &ReadyEntry) -> bool {
+        let Some(slot) = entry.meshlet_slot else {
+            return false;
+        };
+        let Some(slot_data) = self.meshlet_indirect.get(slot) else {
+            return false;
+        };
+        let item = &self.items[entry.item];
+        if item.lod != 0 || !matches!(item.shape, Shape::Mesh(_)) {
+            return false;
+        }
+        let Some(GpuAsset::Mesh(mesh)) = entry.mesh.and_then(|m| self.assets.current(m)) else {
+            return false;
+        };
+        let Some(ml) = &mesh.meshlets else {
+            return false;
+        };
+        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+        pass.set_vertex_buffer(1, self.tangents(mesh).slice(..));
+        pass.set_vertex_buffer(2, self.extra_attrs(mesh).slice(..));
+        pass.set_index_buffer(ml.indices.slice(..), wgpu::IndexFormat::Uint32);
+        let ml_count = slot_data.count;
+        let ind_buf = &slot_data.draws_phase2;
+        if self.multi_draw_indirect {
+            pass.multi_draw_indexed_indirect(ind_buf, 0, ml_count);
+        } else {
+            for k in 0..ml_count {
+                pass.draw_indexed_indirect(ind_buf, u64::from(k) * 20);
+            }
+        }
+        true
+    }
+
     /// Draws `entry`'s item into `pass` as `view` sees it (a batch's
     /// instances in that view), counting it into `stats` if given.
     pub(super) fn draw(
@@ -77,8 +112,10 @@ impl Drawing<'_> {
                 if view == 0
                     && item.lod == 0
                     && let (Some(slot), Some(ml)) = (entry.meshlet_slot, &mesh.meshlets)
-                    && let Some(&(ml_count, _, ref ind_buf)) = self.meshlet_indirect.get(slot)
+                    && let Some(slot_data) = self.meshlet_indirect.get(slot)
                 {
+                    let ml_count = slot_data.count;
+                    let ind_buf = &slot_data.draws_phase1;
                     pass.set_index_buffer(ml.indices.slice(..), wgpu::IndexFormat::Uint32);
                     if self.multi_draw_indirect {
                         pass.multi_draw_indexed_indirect(ind_buf, 0, ml_count);
@@ -529,7 +566,9 @@ impl State {
         if tlas_ready && frame.quality.ddgi {
             self.encode_ddgi_prepass(&mut encoder, frame)?;
         }
-        self.encode_meshlet_culling(&device, &mut encoder, frame, scratch, &active_proj_for_trails, depth_mode)?;
+        let restir_di_active =
+            tlas_ready && frame.quality.ray_tracing >= 3 && super::wired_passes::has_active_point_spot_lights(frame);
+        self.encode_meshlet_culling_phase1(&device, &mut encoder, frame, scratch, &active_proj_for_trails, depth_mode)?;
         let ready = &scratch.ready;
         let drawing = Drawing {
             assets: &self.assets,
@@ -642,14 +681,17 @@ impl State {
         // draws those over it in a second pass, with the mist and the opaque
         // picture to read.
         let layered = !scratch.decals.is_empty() || !prepared_pbr_decals.is_empty();
+        let wants_meshlet_phase2 = self.wired.meshlet_phase1_used_hiz && !self.wired.meshlet_plan.is_empty();
         let scene_group = &self.scene_group.as_ref().unwrap().0;
         let lights = self.clusters.group();
+        let opaque_lights = if restir_di_active { self.clusters.area_only_group() } else { lights };
         let draw_layers = |pass: &mut wgpu::RenderPass<'_>,
                            group: &wgpu::BindGroup,
+                           light_group: &wgpu::BindGroup,
                            layers: &[(&[usize], Layer)],
                            stats: &mut RenderStats| {
             pass.set_bind_group(0, group, &[]);
-            pass.set_bind_group(2, lights, &[]);
+            pass.set_bind_group(2, light_group, &[]);
             pass.set_blend_constant(wgpu::Color {
                 r: OCCLUDED_STRENGTH,
                 g: OCCLUDED_STRENGTH,
@@ -691,7 +733,7 @@ impl State {
         {
             let mut first = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
-                color_attachments: &[Some(targets.color(clear, true, !layered))],
+                color_attachments: &[Some(targets.color(clear, true, !layered && !wants_meshlet_phase2))],
                 timestamp_writes: self.timer.pass(Span::Scene),
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &targets.depth,
@@ -703,7 +745,7 @@ impl State {
                 }),
                 ..Default::default()
             });
-            draw_layers(&mut first, scene_group, &[(&scratch.opaque, Layer::Opaque)], &mut stats);
+            draw_layers(&mut first, scene_group, opaque_lights, &[(&scratch.opaque, Layer::Opaque)], &mut stats);
             Self::encode_environment_passes(
                 &mut self.wired,
                 &device,
@@ -715,7 +757,9 @@ impl State {
                 depth_mode,
             )?;
         }
-        if self.hiz.enabled() && self.culling.supported() && self.culling.from.is_some() {
+        let wants_hiz_build = self.hiz.enabled()
+            && ((self.culling.supported() && self.culling.from.is_some()) || self.wired.last_meshlet_cull_draws > 0);
+        if wants_hiz_build {
             let active_proj = jittered.unwrap_or(frame.projection);
             let active_vp = crate::matrix::multiply(&active_proj, &frame.view);
             self.hiz.build(
@@ -724,10 +768,76 @@ impl State {
                 &targets.depth_only,
                 targets.size,
                 samples,
+                depth_mode,
                 active_vp,
                 self.context.cache.get(),
                 &self.timer,
             );
+        }
+        if wants_meshlet_phase2 {
+            Self::encode_meshlet_culling_phase2(
+                &mut self.wired,
+                &self.hiz,
+                &self.assets,
+                &self.meshlet_indirect,
+                &self.timer,
+                &device,
+                &self.queue,
+                &mut encoder,
+                frame,
+                &active_proj_for_trails,
+                depth_mode,
+            )?;
+            {
+                let mut phase2 = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scene_meshlet_phase2"),
+                    color_attachments: &[Some(targets.color(clear, false, !layered))],
+                    timestamp_writes: self.timer.pass(Span::Scene),
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &targets.depth,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    }),
+                    ..Default::default()
+                });
+                phase2.set_bind_group(0, scene_group, &[]);
+                phase2.set_bind_group(2, opaque_lights, &[]);
+                phase2.set_stencil_reference(0);
+                let mut mark = 0;
+                let mut current: Option<&wgpu::RenderPipeline> = None;
+                for &index in &scratch.opaque {
+                    let entry = &ready[index];
+                    if entry.meshlet_slot.is_none() {
+                        continue;
+                    }
+                    let wanted = stencil(&entry.material.material);
+                    if mark != wanted {
+                        mark = wanted;
+                        phase2.set_stencil_reference(mark);
+                    }
+                    if current != Some(&entry.pipeline) {
+                        current = Some(&entry.pipeline);
+                        phase2.set_pipeline(&entry.pipeline);
+                    }
+                    phase2.set_bind_group(1, &entry.group, &[entry.offset]);
+                    drawing.draw_meshlet_phase2(&mut phase2, entry);
+                }
+            }
+            if wants_hiz_build {
+                let active_proj = jittered.unwrap_or(frame.projection);
+                let active_vp = crate::matrix::multiply(&active_proj, &frame.view);
+                self.hiz.build(
+                    &device,
+                    &mut encoder,
+                    &targets.depth_only,
+                    targets.size,
+                    samples,
+                    depth_mode,
+                    active_vp,
+                    self.context.cache.get(),
+                    &self.timer,
+                );
+            }
         }
         if !scratch.decals.is_empty() {
             let decals = self.decals.get_or_insert_with(|| Decals::new(&device));
@@ -884,12 +994,12 @@ impl State {
                         ..Default::default()
                     });
                     if !fallback_translucent.is_empty() {
-                        draw_layers(&mut pass, group, &[(&fallback_translucent, Layer::Translucent)], &mut stats);
+                        draw_layers(&mut pass, group, lights, &[(&fallback_translucent, Layer::Translucent)], &mut stats);
                     }
                     particles::draw(&mut pass, &scratch.emitters);
                     ribbons::draw(&mut pass, self.ribbons.as_ref(), &scratch.ribbons);
                     let overlays = [(&scratch.overlays[..], Layer::Occluded), (&scratch.overlays[..], Layer::Visible)];
-                    draw_layers(&mut pass, group, &overlays, &mut stats);
+                    draw_layers(&mut pass, group, lights, &overlays, &mut stats);
                 }
             } else {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -904,11 +1014,11 @@ impl State {
                     ..Default::default()
                 });
                 post.draw_backdrop(&mut self.built_ins, &mut pass);
-                draw_layers(&mut pass, group, &[(&scratch.translucent, Layer::Translucent)], &mut stats);
+                draw_layers(&mut pass, group, lights, &[(&scratch.translucent, Layer::Translucent)], &mut stats);
                 particles::draw(&mut pass, &scratch.emitters);
                 ribbons::draw(&mut pass, self.ribbons.as_ref(), &scratch.ribbons);
                 let overlays = [(&scratch.overlays[..], Layer::Occluded), (&scratch.overlays[..], Layer::Visible)];
-                draw_layers(&mut pass, group, &overlays, &mut stats);
+                draw_layers(&mut pass, group, lights, &overlays, &mut stats);
             }
         }
         let has_filters = scratch.sprites.iter().any(|batch| batch.scene_filter);

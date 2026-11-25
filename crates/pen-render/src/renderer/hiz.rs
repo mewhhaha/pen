@@ -1,10 +1,12 @@
-// Hierarchical-Z (Hi-Z) max-depth pyramid built after the opaque scene pass
-// for conservative GPU occlusion culling on the next frame (shaders/cull.wgsl).
+// Hierarchical-Z (Hi-Z) farthest-depth pyramid built from opaque depth
+// (max-depth for Forward-Z, min-depth for Reversed-Z) for conservative GPU
+// occlusion culling (`cull.wgsl` and two-phase `meshlet_cull.wgsl`).
 use std::collections::HashMap;
 
 use pen_protocol::Matrix;
 
 use super::timing::{GpuTimer, Span};
+use crate::camera_precision::DepthMode;
 use crate::matrix::IDENTITY;
 use crate::packed_texture::mip_levels;
 
@@ -26,12 +28,15 @@ struct Pyramid {
 pub(crate) struct HiZ {
     enabled: bool,
     valid: bool,
+    depth_mode: DepthMode,
     vp: Matrix,
     fallback: wgpu::TextureView,
-    base_pipelines: HashMap<u32, wgpu::ComputePipeline>,
-    reduce_pipeline: Option<wgpu::ComputePipeline>,
+    base_pipelines: HashMap<(u32, bool), wgpu::ComputePipeline>,
+    reduce_bgl: wgpu::BindGroupLayout,
+    reduce_pl: wgpu::PipelineLayout,
+    reduce_pipelines: [Option<wgpu::ComputePipeline>; 2],
     pyramid: Option<Pyramid>,
-    base_group: Option<(u32, u64, wgpu::BindGroup)>,
+    base_group: Option<(u32, bool, u64, wgpu::BindGroup)>,
     depth_serial: u64,
     next_id: u64,
 }
@@ -55,13 +60,46 @@ impl HiZ {
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
         );
         let fallback = fallback_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let reduce_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("hiz reduce bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::R32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let reduce_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("hiz reduce pl"),
+            bind_group_layouts: &[Some(&reduce_bgl)],
+            immediate_size: 0,
+        });
         Self {
             enabled: true,
             valid: false,
+            depth_mode: DepthMode::ForwardZ,
             vp: IDENTITY,
             fallback,
             base_pipelines: HashMap::new(),
-            reduce_pipeline: None,
+            reduce_bgl,
+            reduce_pl,
+            reduce_pipelines: [None, None],
             pyramid: None,
             base_group: None,
             depth_serial: 0,
@@ -80,6 +118,10 @@ impl HiZ {
         self.enabled
     }
 
+    pub fn depth_mode(&self) -> DepthMode {
+        self.depth_mode
+    }
+
     /// Drops the prior-frame pyramid's validity (e.g., on camera cut or resize)
     /// so the next frame does not cull against stale depth.
     pub fn invalidate(&mut self) {
@@ -93,7 +135,7 @@ impl HiZ {
         self.depth_serial += 1;
     }
 
-    /// Returns `(view, view_id, vp, size, mips, active)` for `GpuCulling::dispatch`.
+    /// Returns `(view, view_id, vp, size, mips, active)` for `GpuCulling::dispatch` & `MeshletCuller`.
     pub fn source(&self) -> (&wgpu::TextureView, u64, Matrix, (u32, u32), u32, bool) {
         if self.enabled
             && self.valid
@@ -104,7 +146,7 @@ impl HiZ {
         (&self.fallback, 0, IDENTITY, (1, 1), 1, false)
     }
 
-    /// Builds the max-depth pyramid from the opaque pass's depth texture.
+    /// Builds the farthest-depth pyramid from the opaque pass's depth texture (`max` for Forward-Z, `min` for Reversed-Z).
     #[allow(clippy::too_many_arguments, reason = "explicit render-pass inputs")]
     pub fn build(
         &mut self,
@@ -113,6 +155,7 @@ impl HiZ {
         depth_only: &wgpu::TextureView,
         size: (u32, u32),
         samples: u32,
+        depth_mode: DepthMode,
         vp: Matrix,
         cache: Option<&wgpu::PipelineCache>,
         timer: &GpuTimer,
@@ -121,25 +164,31 @@ impl HiZ {
             self.valid = false;
             return;
         }
-        let reduce_pipeline = self.reduce_pipeline.get_or_insert_with(|| {
+        let reversed_z = depth_mode == DepthMode::ReversedZ;
+        let (init_depth, far_op) = if reversed_z { ("1.0", "min") } else { ("0.0", "max") };
+        let reduce_pl = &self.reduce_pl;
+        let reduce_pipeline = self.reduce_pipelines[usize::from(reversed_z)].get_or_insert_with(|| {
+            let source = HIZ_REDUCE_WGSL.replace("${far_op}", far_op);
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("hiz reduce"),
-                source: wgpu::ShaderSource::Wgsl(HIZ_REDUCE_WGSL.into()),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
             });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("hiz reduce"),
-                layout: None,
+                layout: Some(reduce_pl),
                 module: &module,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache,
             })
         });
-        let base_pipeline = self.base_pipelines.entry(samples).or_insert_with(|| {
+        let base_pipeline = self.base_pipelines.entry((samples, reversed_z)).or_insert_with(|| {
             let depth_ty = if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" };
             let source = HIZ_BASE_WGSL
                 .replace("${depth_texture}", depth_ty)
-                .replace("${samples}", &samples.to_string());
+                .replace("${samples}", &samples.to_string())
+                .replace("${init_depth}", init_depth)
+                .replace("${far_op}", far_op);
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("hiz base"),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -177,12 +226,11 @@ impl HiZ {
                     })
                 })
                 .collect();
-            let reduce_layout = reduce_pipeline.get_bind_group_layout(0);
             let reduce_groups: Vec<_> = (1..mips as usize)
                 .map(|mip| {
                     device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("hiz reduce"),
-                        layout: &reduce_layout,
+                        layout: &self.reduce_bgl,
                         entries: &[
                             wgpu::BindGroupEntry {
                                 binding: 0,
@@ -212,7 +260,7 @@ impl HiZ {
 
         let pyramid = self.pyramid.as_ref().unwrap();
         let depth_serial = self.depth_serial;
-        if self.base_group.as_ref().is_none_or(|(s, ser, _)| *s != samples || *ser != depth_serial) {
+        if self.base_group.as_ref().is_none_or(|(s, rev, ser, _)| *s != samples || *rev != reversed_z || *ser != depth_serial) {
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("hiz base"),
                 layout: &base_pipeline.get_bind_group_layout(0),
@@ -224,7 +272,7 @@ impl HiZ {
                     },
                 ],
             });
-            self.base_group = Some((samples, depth_serial, group));
+            self.base_group = Some((samples, reversed_z, depth_serial, group));
         }
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -232,7 +280,7 @@ impl HiZ {
             timestamp_writes: timer.compute(Span::Culling),
         });
         pass.set_pipeline(base_pipeline);
-        pass.set_bind_group(0, &self.base_group.as_ref().unwrap().2, &[]);
+        pass.set_bind_group(0, &self.base_group.as_ref().unwrap().3, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(WORKGROUP), size.1.div_ceil(WORKGROUP), 1);
 
         pass.set_pipeline(reduce_pipeline);
@@ -244,6 +292,7 @@ impl HiZ {
             pass.dispatch_workgroups(w.div_ceil(WORKGROUP), h.div_ceil(WORKGROUP), 1);
         }
 
+        self.depth_mode = depth_mode;
         self.vp = vp;
         self.valid = true;
     }

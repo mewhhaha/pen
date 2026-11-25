@@ -296,6 +296,7 @@ impl GpuCulling {
         }
         let device = &self.device;
         let (hiz_view, hiz_view_id, hiz_vp, hiz_size, hiz_mips, hiz_active) = hiz.source();
+        let hiz_active = hiz_active && hiz.depth_mode() == crate::camera_precision::DepthMode::ForwardZ;
         let mut uniform = Vec::with_capacity(UNIFORM_WORDS);
         let view_count = u32::try_from(self.views.count()).expect("at most MAX_VIEWS");
         uniform.extend([view_count, self.detail.pixels.to_bits(), u32::from(hiz_active), hiz_mips]);

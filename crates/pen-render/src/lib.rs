@@ -46,6 +46,7 @@ mod renderer;
 pub mod restir;
 mod shader;
 pub mod shader_graph;
+pub mod sharc;
 #[cfg(feature = "simplify")]
 mod simplify;
 mod solids;
@@ -98,8 +99,9 @@ pub use lightmap::{
 };
 pub use lights::LIGHTS_WGSL;
 pub use meshlets::{
-    DEFAULT_MAX_MESHLET_TRIANGLES, DEFAULT_MAX_MESHLET_VERTICES, MESHLET_CULL_WGSL, MeshletCullParams,
-    MeshletCullStats, MeshletCuller, MeshletGpu, MeshletIndirectDraw, MeshletMesh, build_meshlets,
+    DEFAULT_MAX_MESHLET_TRIANGLES, DEFAULT_MAX_MESHLET_VERTICES, MESHLET_CULL_WGSL, MeshletBatchEntry,
+    MeshletCullParams, MeshletCullStats, MeshletCuller, MeshletGpu, MeshletIndirectDraw, MeshletMesh,
+    MeshletTwoPhaseBatchEntry, build_meshlets,
 };
 pub use oit::{OIT_SHADER_HELPERS_WGSL, OitPass, oit_color_targets};
 pub use post_fx::{
@@ -115,6 +117,10 @@ pub use ray_tracing::{
     device_supports_hardware_ray_query, supports_hardware_ray_query,
 };
 pub use restir::{RESTIR_MAX_LIGHTS, RESTIR_WGSL, RestirInputs, RestirParams, RestirRenderer};
+pub use sharc::{
+    SHARC_COMMON_WGSL, SHARC_DEFAULT_CAPACITY, SHARC_HASH_WGSL, SHARC_QUERY_RO_FN_WGSL, SHARC_WGSL, SharcCache,
+    SharcConfig, SharcParams,
+};
 pub use svgf::{SVGF_WGSL, SvgfDenoiser, SvgfInputs, SvgfParams};
 pub use render_targets::{
     ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,
@@ -634,6 +640,11 @@ impl Renderer {
     /// Number of LOD0 mesh draws dispatched through GPU meshlet cluster culling on the last frame.
     pub fn last_meshlet_cull_draws(&self) -> u32 {
         self.state.last_meshlet_cull_draws()
+    }
+
+    /// Whether Phase-2 disocclusion recovery ran on the last frame's meshlet-culled opaque pass.
+    pub fn last_meshlet_phase2_active(&self) -> bool {
+        self.state.last_meshlet_phase2_active()
     }
 
     /// Selects the display tonemapping operator (`Shoulder`, `AgX`, `AcesFilmic`, `PbrNeutral`).

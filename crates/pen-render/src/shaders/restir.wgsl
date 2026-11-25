@@ -567,7 +567,7 @@ fn sky(dir: vec3f) -> vec3f {
   return select(lower, upper, dir.y >= 0.0);
 }
 
-fn shade_bounce(pos: vec3f, nrm: vec3f, hit: TlasHit, rng: ptr<function, u32>) -> vec3f {
+fn shade_bounce(pos: vec3f, nrm: vec3f, hit: TlasHit, rng: ptr<function, u32>) -> vec4f {
   let diffuse_albedo = hit.albedo * (1.0 - hit.metallic);
   let diffuse = diffuse_albedo / PI;
   let sun = u.sun_and_max_distance.xyz;
@@ -591,11 +591,13 @@ fn shade_bounce(pos: vec3f, nrm: vec3f, hit: TlasHit, rng: ptr<function, u32>) -
     }
   }
 
+  var ddgi_cov = 0.0;
   if (u.sky_zenith_and_bounce.w > 0.0) {
     let ddgi = rt_sample_ddgi(pos, nrm);
-    radiance += diffuse_albedo * ddgi.rgb * (ddgi.a * u.sky_zenith_and_bounce.w);
+    ddgi_cov = clamp(ddgi.a, 0.0, 1.0);
+    radiance += diffuse_albedo * ddgi.rgb * (ddgi_cov * u.sky_zenith_and_bounce.w);
   }
-  return safe_rgb(radiance);
+  return vec4f(safe_rgb(radiance), ddgi_cov);
 }
 
 fn cosine_direction(nrm: vec3f, rng: ptr<function, u32>) -> vec3f {
@@ -654,16 +656,20 @@ fn restir_gi_initial(@builtin(global_invocation_id) id: vec3u) {
     var pos = g.pos + dir * max_dist;
     var nrm = -dir;
     var radiance = safe_rgb(sky(dir));
+    var hit_albedo_ddgi = 0.0;
     if (hit.hit) {
       pos = origin + dir * hit.t;
       nrm = select(-hit.world_normal, hit.world_normal, dot(hit.world_normal, dir) < 0.0);
-      radiance = shade_bounce(pos, nrm, hit, &rng);
+      let shaded = shade_bounce(pos, nrm, hit, &rng);
+      radiance = shaded.rgb;
+      let diff_albedo = clamp(hit.albedo * (1.0 - hit.metallic), vec3f(0.0), vec3f(1.0));
+      hit_albedo_ddgi = bitcast<f32>(pack4x8unorm(vec4f(diff_albedo, shaded.a)));
     }
     // A one-candidate reservoir uses the inverse cosine sampling density.
     // The luminance-weighted target enters w_sum and cancels when M = 1.
     let pdf = max(dot(g.nrm, dir) / PI, EPS);
     r = GiReservoir(vec4f(pos, 1.0), vec4f(nrm, 1.0 / pdf), vec4f(radiance, 0.0),
-                    vec4f(1.0, select(max_dist, hit.t, hit.hit), 0.0, 0.0));
+                    vec4f(1.0, select(max_dist, hit.t, hit.hit), hit_albedo_ddgi, 0.0));
     r.radiance_wsum.w = gi_target(g, r) / pdf;
   }
   gi_output[index] = r;

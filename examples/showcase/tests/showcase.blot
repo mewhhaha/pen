@@ -136,3 +136,26 @@ entry const test_authoring_hotkeys_hud_and_scene_codec = func () =>
       U32.to_f32 dec_len,
     ],
   ]
+
+entry const test_night_64_lights_toggle_and_roundtrip = func () =>
+  let w0 = create ()
+  let ev_night = #[$events.KeyDown 55]
+  let w1 = step w0 0.016 1280.0 720.0 (&ev_night[0..1])
+  let frame = render.begin_frame (render.empty_frame ())
+  let audio = sound.begin_frame (sound.empty_access ())
+  let (frame, audio) = populate_frame w1 frame audio
+  let saved = save w1
+  let w_restored = restore (&saved[0..saved.length])
+  let restored_night = w_restored.night_lights
+  let w2 = step w_restored 0.016 1280.0 720.0 (&ev_night[0..1])
+  let frame2 = render.begin_frame (render.empty_frame ())
+  let audio2 = sound.begin_frame (sound.empty_access ())
+  let (frame2, audio2) = populate_frame w2 frame2 audio2
+  return check.report #[
+    check.equal #[1.0, 64.0, 1.0, 0.0] #[
+      if w1.night_lights then 1.0 else 0.0,
+      U32.to_f32 frame.lights.length,
+      if restored_night then 1.0 else 0.0,
+      U32.to_f32 frame2.lights.length,
+    ],
+  ]

@@ -601,6 +601,15 @@ struct Scratch {
     ribbons: Vec<ribbons::Ready>,
 }
 
+/// Indirect draw and two-phase occlusion candidate buffers for one meshlet-culled draw slot.
+pub(super) struct MeshletIndirectSlot {
+    pub count: u32,
+    pub generation: u64,
+    pub draws_phase1: wgpu::Buffer,
+    pub draws_phase2: wgpu::Buffer,
+    pub phase2_flags: wgpu::Buffer,
+}
+
 /// What drawing an item reads.
 struct Drawing<'a> {
     assets: &'a AssetStore<GpuAsset>,
@@ -617,7 +626,7 @@ struct Drawing<'a> {
     /// The frame's GPU-morphed vertex buffer, for draws with active morph weights.
     morphed: Option<&'a wgpu::Buffer>,
     culling: &'a GpuCulling,
-    meshlet_indirect: &'a [(u32, u64, wgpu::Buffer)],
+    meshlet_indirect: &'a [MeshletIndirectSlot],
     multi_draw_indirect: bool,
 }
 
@@ -855,8 +864,8 @@ pub(crate) struct State {
     tonemap: crate::tonemap::TonemapOperator,
     // Wired end-to-end passes driven directly by RenderFrame (physical sky, area lights, PBR decals, RCAS/post-FX, OIT, split-screen).
     wired: wired_passes::WiredPasses,
-    // Indirect draw-command buffers `(meshlet_count, buffer_generation, buffer)` populated by GPU meshlet cluster culling.
-    meshlet_indirect: Vec<(u32, u64, wgpu::Buffer)>,
+    // Indirect draw-command & phase-2 candidate buffers populated by two-phase GPU meshlet culling.
+    meshlet_indirect: Vec<MeshletIndirectSlot>,
     instance_data: Vec<f32>,
     instance_uploads: instance_upload::Uploads,
     last_stats: RenderStats,
@@ -1752,6 +1761,10 @@ impl State {
 
     pub fn last_meshlet_cull_draws(&self) -> u32 {
         self.wired.last_meshlet_cull_draws
+    }
+
+    pub fn last_meshlet_phase2_active(&self) -> bool {
+        self.wired.last_meshlet_phase2_active
     }
 
     pub fn set_tonemap(&mut self, operator: crate::tonemap::TonemapOperator) {

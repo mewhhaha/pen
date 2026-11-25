@@ -7,6 +7,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "GPU meshlet buffer indices")]
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use anyhow::{Result, ensure};
 
@@ -404,103 +405,241 @@ pub struct MeshletBatchEntry<'a> {
     pub params: MeshletCullParams,
 }
 
+/// One draw shared by both phases of GPU meshlet culling.
+/// Advance `draws_gen` whenever any of the bound buffers changes for this mesh key.
+pub struct MeshletTwoPhaseBatchEntry<'a> {
+    pub mesh_key: u64,
+    pub draws_gen: u64,
+    pub meshlets_buf: &'a wgpu::Buffer,
+    pub draws_phase1_buf: &'a wgpu::Buffer,
+    pub draws_phase2_buf: &'a wgpu::Buffer,
+    /// Storage buffer with one `u32` candidate flag per meshlet.
+    pub phase2_flags_buf: &'a wgpu::Buffer,
+    pub meshlet_count: u32,
+    pub params: MeshletCullParams,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CullPhase {
+    First,
+    Second,
+}
+
+impl CullPhase {
+    fn select<T>(self, first: T, second: T) -> T {
+        match self {
+            Self::First => first,
+            Self::Second => second,
+        }
+    }
+}
+
+struct TwoPhasePipelines {
+    bgl: wgpu::BindGroupLayout,
+    first: wgpu::ComputePipeline,
+    second: wgpu::ComputePipeline,
+}
+
+type BatchGroupKey = (u64, u64, u32, Option<u64>);
+
+struct BatchBuffers {
+    uniform: wgpu::Buffer,
+    capacity: usize,
+    bytes: Vec<u8>,
+    groups: HashMap<BatchGroupKey, wgpu::BindGroup>,
+}
+
+impl BatchBuffers {
+    fn uniform_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("meshlet_cull_u"),
+            size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    fn new(device: &wgpu::Device, stride: u64) -> Self {
+        let capacity = 16;
+        Self {
+            uniform: Self::uniform_buffer(device, stride * capacity as u64),
+            capacity,
+            bytes: Vec::new(),
+            groups: HashMap::new(),
+        }
+    }
+}
+
+struct CullDispatch<'a> {
+    meshlets: &'a wgpu::Buffer,
+    draws: &'a wgpu::Buffer,
+    flags: Option<&'a wgpu::Buffer>,
+    count: u32,
+    params: &'a MeshletCullParams,
+}
+
+impl CullDispatch<'_> {
+    fn storage_sizes(&self) -> [u64; 3] {
+        let count = u64::from(self.count);
+        [
+            count * std::mem::size_of::<MeshletGpu>() as u64,
+            count * std::mem::size_of::<MeshletIndirectDraw>() as u64,
+            count * std::mem::size_of::<u32>() as u64,
+        ]
+    }
+
+    fn validate(&self, limits: &wgpu::Limits) -> Result<()> {
+        let [meshlet_bytes, draw_bytes, flag_bytes] = self.storage_sizes();
+        for (buffer, bytes, name) in [
+            (Some(self.meshlets), meshlet_bytes, "meshlets_buf"),
+            (Some(self.draws), draw_bytes, "draws_buf"),
+            (self.flags, flag_bytes, "phase2_flags_buf"),
+        ] {
+            if let Some(buffer) = buffer {
+                ensure!(
+                    buffer.usage().contains(wgpu::BufferUsages::STORAGE) && buffer.size() >= bytes,
+                    "{name} must have STORAGE usage and at least {bytes} bytes"
+                );
+                ensure!(
+                    bytes <= limits.max_storage_buffer_binding_size,
+                    "{name} exceeds device max_storage_buffer_binding_size"
+                );
+            }
+        }
+        let groups = self.count.div_ceil(64);
+        ensure!(
+            groups <= limits.max_compute_workgroups_per_dimension,
+            "meshlet workgroup count {groups} exceeds device limit {}",
+            limits.max_compute_workgroups_per_dimension
+        );
+        Ok(())
+    }
+
+    fn bind_group(
+        &self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        uniform: &wgpu::Buffer,
+        stats: &wgpu::Buffer,
+        hiz: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        let buffer_entry = |binding, buffer, size| wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(size),
+            }),
+        };
+        let [meshlet_bytes, draw_bytes, flag_bytes] = self.storage_sizes();
+        let entries = [
+            buffer_entry(0, uniform, std::mem::size_of::<CullUniform>() as u64),
+            buffer_entry(1, self.meshlets, meshlet_bytes),
+            buffer_entry(2, self.draws, draw_bytes),
+            wgpu::BindGroupEntry { binding: 3, resource: stats.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(hiz) },
+            buffer_entry(5, self.flags.unwrap_or(self.draws), flag_bytes),
+        ];
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("meshlet_cull_bg"),
+            layout,
+            entries: &entries[..5 + usize::from(self.flags.is_some())],
+        })
+    }
+}
+
+const BINDINGS: [wgpu::BindGroupLayoutEntry; 6] = [
+    wgpu::BindGroupLayoutEntry {
+        binding: 0,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: true,
+            min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<CullUniform>() as u64),
+        },
+        count: None,
+    },
+    wgpu::BindGroupLayoutEntry {
+        binding: 1,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    },
+    wgpu::BindGroupLayoutEntry {
+        binding: 2,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    },
+    wgpu::BindGroupLayoutEntry {
+        binding: 3,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    },
+    wgpu::BindGroupLayoutEntry {
+        binding: 4,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    },
+    wgpu::BindGroupLayoutEntry {
+        binding: 5,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    },
+];
+
 /// GPU compute meshlet cluster culler (local-space frustum + shear-safe normal-cone backface + full-footprint Hi-Z).
 pub struct MeshletCuller {
     pipeline: wgpu::ComputePipeline,
     bgl: wgpu::BindGroupLayout,
-    uniform: wgpu::Buffer,
+    shader: wgpu::ShaderModule,
     uniform_stride: u64,
-    uniform_capacity: usize,
-    uniform_bytes: Vec<u8>,
+    batch: BatchBuffers,
+    batch_phase1: Option<BatchBuffers>,
+    batch_phase2: Option<BatchBuffers>,
+    two_phase: OnceLock<TwoPhasePipelines>,
     stats: wgpu::Buffer,
     dummy_hiz: wgpu::Texture,
     dummy_hiz_view: wgpu::TextureView,
-    batch_groups: HashMap<(u64, u64, u32, u64), wgpu::BindGroup>,
 }
 
 impl MeshletCuller {
     pub fn new(device: &wgpu::Device) -> Self {
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("meshlet_cull_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<CullUniform>() as u64),
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
+            entries: &BINDINGS[..5],
         });
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("meshlet_cull_shader"),
             source: wgpu::ShaderSource::Wgsl(MESHLET_CULL_WGSL.into()),
         });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("meshlet_cull_pl"),
-            bind_group_layouts: &[Some(&bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("meshlet_cull_pipe"),
-            layout: Some(&pl),
-            module: &module,
-            entry_point: Some("cull_meshlets"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let layout = Self::pipeline_layout(device, &bgl);
+        let pipeline = Self::pipeline(device, &shader, &layout, "cull_meshlets");
         let align = u64::from(device.limits().min_uniform_buffer_offset_alignment).max(1);
         let uniform_stride = (std::mem::size_of::<CullUniform>() as u64).next_multiple_of(align);
-        let uniform_capacity = 16usize;
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("meshlet_cull_u"),
-            size: uniform_stride * uniform_capacity as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         let stats = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("meshlet_cull_stats"),
             size: std::mem::size_of::<MeshletCullStats>() as u64,
@@ -521,22 +660,70 @@ impl MeshletCuller {
         Self {
             pipeline,
             bgl,
-            uniform,
+            shader,
             uniform_stride,
-            uniform_capacity,
-            uniform_bytes: Vec::new(),
+            batch: BatchBuffers::new(device, uniform_stride),
+            batch_phase1: None,
+            batch_phase2: None,
+            two_phase: OnceLock::new(),
             stats,
             dummy_hiz,
             dummy_hiz_view,
-            batch_groups: HashMap::new(),
         }
+    }
+
+    fn pipeline_layout(device: &wgpu::Device, bgl: &wgpu::BindGroupLayout) -> wgpu::PipelineLayout {
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("meshlet_cull_pl"),
+            bind_group_layouts: &[Some(bgl)],
+            immediate_size: 0,
+        })
+    }
+
+    fn pipeline(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+        entry_point: &str,
+    ) -> wgpu::ComputePipeline {
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(entry_point),
+            layout: Some(layout),
+            module: shader,
+            entry_point: Some(entry_point),
+            compilation_options: Default::default(),
+            cache: None,
+        })
+    }
+
+    fn two_phase_pipelines<'a>(
+        device: &wgpu::Device,
+        shader: &wgpu::ShaderModule,
+        pipelines: &'a OnceLock<TwoPhasePipelines>,
+    ) -> &'a TwoPhasePipelines {
+        pipelines.get_or_init(|| {
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("meshlet_cull_twophase_bgl"),
+                entries: &BINDINGS,
+            });
+            let layout = Self::pipeline_layout(device, &bgl);
+            TwoPhasePipelines {
+                first: Self::pipeline(device, shader, &layout, "cull_meshlets_phase1"),
+                second: Self::pipeline(device, shader, &layout, "cull_meshlets_phase2"),
+                bgl,
+            }
+        })
     }
 
     pub fn stats_buffer(&self) -> &wgpu::Buffer {
         &self.stats
     }
 
-    fn build_uniform(meshlet_count: u32, hiz_view: Option<&wgpu::TextureView>, params: &MeshletCullParams) -> CullUniform {
+    fn build_uniform(
+        meshlet_count: u32,
+        hiz_view: Option<&wgpu::TextureView>,
+        params: &MeshletCullParams,
+    ) -> CullUniform {
         let flags = u32::from(params.backface_cull) | (u32::from(params.reversed_z) << 1);
         let hiz_mips = hiz_view.map_or(0, |v| params.hiz_mips.min(v.texture().mip_level_count()));
         CullUniform {
@@ -545,12 +732,7 @@ impl MeshletCuller {
             hiz_vp: params.hiz_vp,
             planes: params.frustum_planes,
             camera_pos: [params.camera_pos[0], params.camera_pos[1], params.camera_pos[2], 0.0],
-            counts_flags: [
-                meshlet_count,
-                u32::from(params.hiz_enabled && hiz_view.is_some()),
-                hiz_mips,
-                flags,
-            ],
+            counts_flags: [meshlet_count, u32::from(params.hiz_enabled && hiz_view.is_some()), hiz_mips, flags],
         }
     }
 
@@ -570,109 +752,192 @@ impl MeshletCuller {
         if entries.is_empty() {
             return Ok(());
         }
+        let dispatches = entries.iter().map(|entry| {
+            (
+                entry.mesh_key,
+                entry.draws_gen,
+                CullDispatch {
+                    meshlets: entry.meshlets_buf,
+                    draws: entry.draws_buf,
+                    flags: None,
+                    count: entry.meshlet_count,
+                    params: &entry.params,
+                },
+            )
+        });
+        Self::dispatch_batch(
+            device,
+            queue,
+            encoder,
+            hiz,
+            dispatches,
+            timestamp_writes,
+            &self.bgl,
+            &self.pipeline,
+            &mut self.batch,
+            self.uniform_stride,
+            &self.stats,
+            &self.dummy_hiz_view,
+            true,
+        )
+    }
+
+    /// Clears the cull stats and emits the draws that survive the previous frame's Hi-Z.
+    /// Set each entry's `params.hiz_vp` to the projection used to build `prev_hiz`.
+    /// Batch all Phase 1 draws for this culler into one call per queue submission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cull_batch_phase1(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        prev_hiz: Option<(&wgpu::TextureView, u64)>,
+        entries: &[MeshletTwoPhaseBatchEntry<'_>],
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) -> Result<()> {
+        self.cull_two_phase_batch(device, queue, encoder, prev_hiz, entries, timestamp_writes, CullPhase::First)
+    }
+
+    /// Retests Phase 1 candidates and adds their results to the existing cull stats.
+    /// Set each entry's `params.hiz_vp` to the current projection used to build `curr_hiz`.
+    /// When current Hi-Z is unavailable, all candidates are emitted.
+    /// Batch all Phase 2 draws for this culler into one call per queue submission.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cull_batch_phase2(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        curr_hiz: Option<(&wgpu::TextureView, u64)>,
+        entries: &[MeshletTwoPhaseBatchEntry<'_>],
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+    ) -> Result<()> {
+        self.cull_two_phase_batch(device, queue, encoder, curr_hiz, entries, timestamp_writes, CullPhase::Second)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cull_two_phase_batch(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        hiz: Option<(&wgpu::TextureView, u64)>,
+        entries: &[MeshletTwoPhaseBatchEntry<'_>],
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+        phase: CullPhase,
+    ) -> Result<()> {
+        let clear_stats = phase == CullPhase::First;
+        if entries.is_empty() {
+            if clear_stats {
+                encoder.clear_buffer(&self.stats, 0, None);
+            }
+            return Ok(());
+        }
+
+        let pipelines = Self::two_phase_pipelines(device, &self.shader, &self.two_phase);
+        // Queue writes happen before encoder execution. Each phase needs its own uniform slots.
+        let batch = phase
+            .select(&mut self.batch_phase1, &mut self.batch_phase2)
+            .get_or_insert_with(|| BatchBuffers::new(device, self.uniform_stride));
+        let dispatches = entries.iter().map(|entry| {
+            (
+                entry.mesh_key,
+                entry.draws_gen,
+                CullDispatch {
+                    meshlets: entry.meshlets_buf,
+                    draws: phase.select(entry.draws_phase1_buf, entry.draws_phase2_buf),
+                    flags: Some(entry.phase2_flags_buf),
+                    count: entry.meshlet_count,
+                    params: &entry.params,
+                },
+            )
+        });
+        Self::dispatch_batch(
+            device,
+            queue,
+            encoder,
+            hiz,
+            dispatches,
+            timestamp_writes,
+            &pipelines.bgl,
+            phase.select(&pipelines.first, &pipelines.second),
+            batch,
+            self.uniform_stride,
+            &self.stats,
+            &self.dummy_hiz_view,
+            clear_stats,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_batch<'a>(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        hiz: Option<(&wgpu::TextureView, u64)>,
+        dispatches: impl ExactSizeIterator<Item = (u64, u64, CullDispatch<'a>)> + Clone,
+        timestamp_writes: Option<wgpu::ComputePassTimestampWrites<'_>>,
+        layout: &wgpu::BindGroupLayout,
+        pipeline: &wgpu::ComputePipeline,
+        batch: &mut BatchBuffers,
+        uniform_stride: u64,
+        stats: &wgpu::Buffer,
+        dummy_hiz_view: &wgpu::TextureView,
+        clear_stats: bool,
+    ) -> Result<()> {
         let limits = device.limits();
-        let stride = self.uniform_stride as usize;
-        if entries.len() > self.uniform_capacity {
-            let cap = entries.len().next_power_of_two();
+        let stride = uniform_stride as usize;
+        let count = dispatches.len();
+        u32::try_from((count - 1) as u64 * uniform_stride)?;
+        if count > batch.capacity {
+            let capacity = count.next_power_of_two();
             ensure!(
-                cap as u64 * self.uniform_stride <= limits.max_buffer_size,
+                capacity as u64 * uniform_stride <= limits.max_buffer_size,
                 "meshlet cull uniform buffer exceeds device max_buffer_size"
             );
-            self.uniform = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("meshlet_cull_u"),
-                size: cap as u64 * self.uniform_stride,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.uniform_capacity = cap;
-            self.batch_groups.clear();
+            batch.uniform = BatchBuffers::uniform_buffer(device, capacity as u64 * uniform_stride);
+            batch.capacity = capacity;
+            batch.groups.clear();
         }
-        if self.batch_groups.len() > 2048 {
-            self.batch_groups.clear();
+        if batch.groups.len() > 2048 {
+            batch.groups.clear();
         }
-        let total_bytes = entries.len() * stride;
-        if self.uniform_bytes.len() < total_bytes {
-            self.uniform_bytes.resize(total_bytes, 0);
+        let total_bytes = count * stride;
+        if batch.bytes.len() < total_bytes {
+            batch.bytes.resize(total_bytes, 0);
         }
-        let hiz_view_opt = hiz.map(|(v, _)| v);
-        let hiz_id = hiz.map_or(0, |(_, id)| id);
-        let bound_hiz = hiz_view_opt.unwrap_or(&self.dummy_hiz_view);
+        let hiz_view = hiz.map(|(view, _)| view);
+        let hiz_id = hiz.map(|(_, id)| id);
+        let bound_hiz = hiz_view.unwrap_or(dummy_hiz_view);
         let u_size = std::mem::size_of::<CullUniform>();
-        for (i, entry) in entries.iter().enumerate() {
-            if entry.meshlet_count == 0 {
+        for (i, (mesh_key, draws_gen, dispatch)) in dispatches.clone().enumerate() {
+            if dispatch.count == 0 {
                 continue;
             }
-            let req_m_bytes = u64::from(entry.meshlet_count) * std::mem::size_of::<MeshletGpu>() as u64;
-            let req_d_bytes = u64::from(entry.meshlet_count) * std::mem::size_of::<MeshletIndirectDraw>() as u64;
-            ensure!(
-                req_m_bytes <= limits.max_storage_buffer_binding_size
-                    && req_d_bytes <= limits.max_storage_buffer_binding_size,
-                "meshlet buffers exceed device max_storage_buffer_binding_size"
-            );
-            let wg = entry.meshlet_count.div_ceil(64);
-            ensure!(
-                wg <= limits.max_compute_workgroups_per_dimension,
-                "meshlet workgroup count {wg} exceeds device limit {}",
-                limits.max_compute_workgroups_per_dimension
-            );
-            let u = Self::build_uniform(entry.meshlet_count, hiz_view_opt, &entry.params);
-            let off = i * stride;
-            self.uniform_bytes[off..off + u_size].copy_from_slice(bytemuck::bytes_of(&u));
-            let key = (entry.mesh_key, entry.draws_gen, entry.meshlet_count, hiz_id);
-            self.batch_groups.entry(key).or_insert_with(|| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("meshlet_cull_bg"),
-                    layout: &self.bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &self.uniform,
-                                offset: 0,
-                                size: wgpu::BufferSize::new(u_size as u64),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: entry.meshlets_buf,
-                                offset: 0,
-                                size: wgpu::BufferSize::new(req_m_bytes),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: entry.draws_buf,
-                                offset: 0,
-                                size: wgpu::BufferSize::new(req_d_bytes),
-                            }),
-                        },
-                        wgpu::BindGroupEntry { binding: 3, resource: self.stats.as_entire_binding() },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: wgpu::BindingResource::TextureView(bound_hiz),
-                        },
-                    ],
-                })
-            });
+            dispatch.validate(&limits)?;
+            let uniform = Self::build_uniform(dispatch.count, hiz_view, dispatch.params);
+            let offset = i * stride;
+            batch.bytes[offset..offset + u_size].copy_from_slice(bytemuck::bytes_of(&uniform));
+            let key = (mesh_key, draws_gen, dispatch.count, hiz_id);
+            batch
+                .groups
+                .entry(key)
+                .or_insert_with(|| dispatch.bind_group(device, layout, &batch.uniform, stats, bound_hiz));
         }
-        queue.write_buffer(&self.uniform, 0, &self.uniform_bytes[..total_bytes]);
-        encoder.clear_buffer(&self.stats, 0, None);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("meshlet_cull_batch"),
-            timestamp_writes,
-        });
-        pass.set_pipeline(&self.pipeline);
-        for (i, entry) in entries.iter().enumerate() {
-            if entry.meshlet_count == 0 {
+        queue.write_buffer(&batch.uniform, 0, &batch.bytes[..total_bytes]);
+        if clear_stats {
+            encoder.clear_buffer(stats, 0, None);
+        }
+        let mut pass = encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("meshlet_cull_batch"), timestamp_writes });
+        pass.set_pipeline(pipeline);
+        for (i, (mesh_key, draws_gen, dispatch)) in dispatches.enumerate() {
+            if dispatch.count == 0 {
                 continue;
             }
-            let key = (entry.mesh_key, entry.draws_gen, entry.meshlet_count, hiz_id);
-            let bg = &self.batch_groups[&key];
-            let dyn_offset = u32::try_from(i as u64 * self.uniform_stride)?;
-            pass.set_bind_group(0, bg, &[dyn_offset]);
-            pass.dispatch_workgroups(entry.meshlet_count.div_ceil(64), 1, 1);
+            let group = &batch.groups[&(mesh_key, draws_gen, dispatch.count, hiz_id)];
+            pass.set_bind_group(0, group, &[(i as u64 * uniform_stride) as u32]);
+            pass.dispatch_workgroups(dispatch.count.div_ceil(64), 1, 1);
         }
         Ok(())
     }
@@ -688,76 +953,99 @@ impl MeshletCuller {
         hiz_view: Option<&wgpu::TextureView>,
         params: &MeshletCullParams,
     ) -> Result<()> {
-        if meshlet_count == 0 {
+        let dispatch =
+            CullDispatch { meshlets: meshlets_buf, draws: draws_buf, flags: None, count: meshlet_count, params };
+        self.dispatch_single(device, encoder, &dispatch, hiz_view, None)
+    }
+
+    /// Clears the cull stats and culls one draw against the previous frame's Hi-Z.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cull_phase1(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        meshlets_buf: &wgpu::Buffer,
+        draws_phase1_buf: &wgpu::Buffer,
+        phase2_flags_buf: &wgpu::Buffer,
+        meshlet_count: u32,
+        prev_hiz: Option<&wgpu::TextureView>,
+        params: &MeshletCullParams,
+    ) -> Result<()> {
+        let dispatch = CullDispatch {
+            meshlets: meshlets_buf,
+            draws: draws_phase1_buf,
+            flags: Some(phase2_flags_buf),
+            count: meshlet_count,
+            params,
+        };
+        self.dispatch_single(device, encoder, &dispatch, prev_hiz, Some(CullPhase::First))
+    }
+
+    /// Retests one draw's Phase 1 candidates against the current frame's Hi-Z and accumulates stats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cull_phase2(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        meshlets_buf: &wgpu::Buffer,
+        draws_phase2_buf: &wgpu::Buffer,
+        phase2_flags_buf: &wgpu::Buffer,
+        meshlet_count: u32,
+        curr_hiz: Option<&wgpu::TextureView>,
+        params: &MeshletCullParams,
+    ) -> Result<()> {
+        let dispatch = CullDispatch {
+            meshlets: meshlets_buf,
+            draws: draws_phase2_buf,
+            flags: Some(phase2_flags_buf),
+            count: meshlet_count,
+            params,
+        };
+        self.dispatch_single(device, encoder, &dispatch, curr_hiz, Some(CullPhase::Second))
+    }
+
+    fn dispatch_single(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        dispatch: &CullDispatch<'_>,
+        hiz_view: Option<&wgpu::TextureView>,
+        phase: Option<CullPhase>,
+    ) -> Result<()> {
+        if dispatch.count == 0 {
+            if phase == Some(CullPhase::First) {
+                encoder.clear_buffer(&self.stats, 0, None);
+            }
             return Ok(());
         }
-        let limits = device.limits();
-        let req_m_bytes = u64::from(meshlet_count) * std::mem::size_of::<MeshletGpu>() as u64;
-        let req_d_bytes = u64::from(meshlet_count) * std::mem::size_of::<MeshletIndirectDraw>() as u64;
-        ensure!(
-            meshlets_buf.usage().contains(wgpu::BufferUsages::STORAGE) && meshlets_buf.size() >= req_m_bytes,
-            "meshlets_buf must have STORAGE usage and at least {req_m_bytes} bytes"
-        );
-        ensure!(
-            draws_buf.usage().contains(wgpu::BufferUsages::STORAGE) && draws_buf.size() >= req_d_bytes,
-            "draws_buf must have STORAGE usage and at least {req_d_bytes} bytes"
-        );
-        ensure!(
-            req_m_bytes <= limits.max_storage_buffer_binding_size && req_d_bytes <= limits.max_storage_buffer_binding_size,
-            "meshlet buffers exceed device max_storage_buffer_binding_size"
-        );
-        let wg = meshlet_count.div_ceil(64);
-        ensure!(
-            wg <= limits.max_compute_workgroups_per_dimension,
-            "meshlet workgroup count {wg} exceeds device limit {}",
-            limits.max_compute_workgroups_per_dimension
-        );
-        let u = Self::build_uniform(meshlet_count, hiz_view, params);
-        encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u));
-        encode_copy(device, encoder, &self.stats, bytemuck::bytes_of(&MeshletCullStats::default()));
-
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("meshlet_cull_bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.uniform,
-                        offset: 0,
-                        size: wgpu::BufferSize::new(std::mem::size_of::<CullUniform>() as u64),
-                    }),
+        dispatch.validate(&device.limits())?;
+        let data = Self::build_uniform(dispatch.count, hiz_view, dispatch.params);
+        let uniform;
+        let (layout, pipeline, bound_uniform) = if let Some(phase) = phase {
+            let pipelines = Self::two_phase_pipelines(device, &self.shader, &self.two_phase);
+            uniform = wgpu::util::DeviceExt::create_buffer_init(
+                device,
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("meshlet_cull_single_u"),
+                    contents: bytemuck::bytes_of(&data),
+                    usage: wgpu::BufferUsages::UNIFORM,
                 },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: meshlets_buf,
-                        offset: 0,
-                        size: wgpu::BufferSize::new(req_m_bytes),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: draws_buf,
-                        offset: 0,
-                        size: wgpu::BufferSize::new(req_d_bytes),
-                    }),
-                },
-                wgpu::BindGroupEntry { binding: 3, resource: self.stats.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(hiz_view.unwrap_or(&self.dummy_hiz_view)),
-                },
-            ],
-        });
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("meshlet_cull"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bg, &[0]);
-        pass.dispatch_workgroups(wg, 1, 1);
+            );
+            (&pipelines.bgl, phase.select(&pipelines.first, &pipelines.second), &uniform)
+        } else {
+            encode_copy(device, encoder, &self.batch.uniform, bytemuck::bytes_of(&data));
+            (&self.bgl, &self.pipeline, &self.batch.uniform)
+        };
+        if phase != Some(CullPhase::Second) {
+            encoder.clear_buffer(&self.stats, 0, None);
+        }
+        let group =
+            dispatch.bind_group(device, layout, bound_uniform, &self.stats, hiz_view.unwrap_or(&self.dummy_hiz_view));
+        let mut pass = encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("meshlet_cull"), timestamp_writes: None });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &group, &[0]);
+        pass.dispatch_workgroups(dispatch.count.div_ceil(64), 1, 1);
         Ok(())
     }
 
@@ -1064,5 +1352,204 @@ mod tests {
         // Verify meshlet 1 actually rasterized green pixels at screen center!
         let center_o = (8 * bpr + 8 * 4) as usize;
         assert_eq!(img[center_o + 1], 255, "indirect draw of meshlet index 1 must render green pixels");
+    }
+
+    #[test]
+    fn gpu_two_phase_meshlet_occlusion_recovers_disoccluded_clusters_same_frame_witness() {
+        use wgpu::util::{BufferInitDescriptor, DeviceExt};
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("GPU adapter required");
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let mut culler = MeshletCuller::new(&device);
+
+        let (rings, sectors) = (32u32, 40u32);
+        let mut positions = Vec::new();
+        let mut indices = Vec::new();
+        for ring in 0..=rings {
+            let (sin_phi, cos_phi) = (std::f32::consts::PI * ring as f32 / rings as f32).sin_cos();
+            for sector in 0..sectors {
+                let (sin_theta, cos_theta) = (std::f32::consts::TAU * sector as f32 / sectors as f32).sin_cos();
+                positions.push([0.075 * sin_phi * cos_theta, 0.075 * sin_phi * sin_theta, 0.075 * cos_phi]);
+                if ring < rings {
+                    let a = ring * sectors + sector;
+                    let b = ring * sectors + (sector + 1) % sectors;
+                    indices.extend_from_slice(&[a, a + sectors, b, b, a + sectors, b + sectors]);
+                }
+            }
+        }
+        let sphere = build_meshlets(&positions, &indices, 32, 32).unwrap().meshlets;
+        assert!(sphere.len() > 64, "exercise more than one workgroup per sphere");
+        let mut recovered = sphere.clone();
+        // Cover a Phase 1 draw, a candidate that the current VP projects offscreen, and a frustum rejection.
+        // If the Phase 2 uniform clobbers Phase 1, that candidate survives Phase 1 incorrectly.
+        for (x, z) in [(0.0, -0.47), (1.0, 0.0), (2.0, 0.0)] {
+            recovered.push(MeshletGpu {
+                sphere: [x, 0.0, z, 0.01],
+                cone_axis_cutoff: [0.0, 0.0, 1.0, 1.0],
+                counts: [3, 6, 0, 2],
+                meta: [4, 0, 0, 0],
+            });
+        }
+        let buffer = |size, usage| {
+            device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage, mapped_at_creation: false })
+        };
+        let fixtures = [(&sphere, -0.65), (&recovered, -0.25)].map(|(meshlets, x)| {
+            let count = meshlets.len() as u32;
+            let draws_size = u64::from(count) * std::mem::size_of::<MeshletIndirectDraw>() as u64;
+            let draws_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_SRC;
+            // Fill both outputs with nonzero data to catch untouched flags or indirect draws.
+            let nonzero_buffer = |words, usage| {
+                device.create_buffer_init(&BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(&vec![1u32; words]),
+                    usage,
+                })
+            };
+            (
+                x,
+                count,
+                device.create_buffer_init(&BufferInitDescriptor {
+                    label: None,
+                    contents: bytemuck::cast_slice(meshlets),
+                    usage: wgpu::BufferUsages::STORAGE,
+                }),
+                buffer(draws_size, draws_usage),
+                nonzero_buffer(draws_size as usize / 4, draws_usage),
+                nonzero_buffer(count as usize, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),
+            )
+        });
+        let hiz = |depth: [f32; 2]| {
+            let size = wgpu::Extent3d { width: 2, height: 1, depth_or_array_layers: 1 };
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                texture.as_image_copy(),
+                bytemuck::cast_slice(&depth),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(8), rows_per_image: None },
+                size,
+            );
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+
+        for reversed_z in [false, true] {
+            let (near_depth, clear_depth) = if reversed_z { (0.9, 0.0) } else { (0.1, 1.0) };
+            let prev_hiz = hiz([near_depth; 2]);
+            let curr_hiz = hiz([near_depth, clear_depth]);
+            let mut vp = crate::matrix::IDENTITY;
+            if reversed_z {
+                vp[10] = -1.0;
+                vp[14] = 1.0;
+            }
+            let mut entries = std::array::from_fn::<_, 2, _>(|i| {
+                let (x, count, meshlets, draws1, draws2, flags) = &fixtures[i];
+                let mut model = crate::matrix::IDENTITY;
+                model[12] = *x;
+                model[14] = 0.5;
+                let mut planes = [[0.0; 4]; 6];
+                planes[0] = [-1.0, 0.0, 0.0, 1.0];
+                MeshletTwoPhaseBatchEntry {
+                    mesh_key: i as u64,
+                    draws_gen: 0,
+                    meshlets_buf: meshlets,
+                    draws_phase1_buf: draws1,
+                    draws_phase2_buf: draws2,
+                    phase2_flags_buf: flags,
+                    meshlet_count: *count,
+                    params: MeshletCullParams {
+                        model,
+                        hiz_vp: vp,
+                        frustum_planes: planes,
+                        camera_pos: [0.0, 0.0, -1.0],
+                        hiz_enabled: true,
+                        hiz_mips: 1,
+                        backface_cull: true,
+                        reversed_z,
+                    },
+                }
+            });
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let readback = |encoder: &mut wgpu::CommandEncoder, source: &wgpu::Buffer| {
+                let dest = buffer(source.size(), wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ);
+                encoder.copy_buffer_to_buffer(source, 0, &dest, 0, source.size());
+                dest
+            };
+            let hiz_id = u64::from(reversed_z);
+            culler.cull_batch_phase1(&device, &queue, &mut encoder, Some((&prev_hiz, hiz_id)), &entries, None).unwrap();
+            let stats1 = readback(&mut encoder, culler.stats_buffer());
+            for entry in &mut entries {
+                entry.params.hiz_vp[12] = 0.5;
+            }
+            culler.cull_batch_phase2(&device, &queue, &mut encoder, Some((&curr_hiz, hiz_id)), &entries, None).unwrap();
+            let stats2 = readback(&mut encoder, culler.stats_buffer());
+            let draw_readbacks = entries.map(|entry| {
+                (
+                    readback(&mut encoder, entry.draws_phase1_buf),
+                    readback(&mut encoder, entry.draws_phase2_buf),
+                    readback(&mut encoder, entry.phase2_flags_buf),
+                )
+            });
+            queue.submit(Some(encoder.finish()));
+
+            let read = |buffer: &wgpu::Buffer| {
+                let slice = buffer.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |result| tx.send(result).unwrap());
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                rx.recv().unwrap().unwrap();
+                let bytes = slice.get_mapped_range().unwrap().to_vec();
+                buffer.unmap();
+                bytes
+            };
+            let mut candidates = [0u32; 2];
+            let mut backface_culled = 0;
+            for (i, (draws1, draws2, flags)) in draw_readbacks.iter().enumerate() {
+                let draws1 = read(draws1);
+                let draws2 = read(draws2);
+                let flags = read(flags);
+                let draws1 = bytemuck::cast_slice::<_, MeshletIndirectDraw>(&draws1);
+                let draws2 = bytemuck::cast_slice::<_, MeshletIndirectDraw>(&draws2);
+                let flags = bytemuck::cast_slice::<_, u32>(&flags);
+                for (idx, ((draw1, draw2), &flag)) in draws1.iter().zip(draws2).zip(flags).enumerate() {
+                    let already_visible = i == 1 && idx == sphere.len();
+                    assert!(flag <= 1);
+                    assert_eq!(draw1.instance_count, u32::from(already_visible));
+                    assert_eq!(draw2.instance_count, if i == 0 { 0 } else { flag });
+                    assert_eq!(draw1.first_instance, 0);
+                    assert_eq!(draw2.first_instance, 0);
+                    if flag == 1 {
+                        assert_eq!(draw2.first_index, draw1.first_index);
+                        assert_eq!(draw2.index_count, draw1.index_count);
+                        assert_eq!(draw2.base_vertex, draw1.base_vertex);
+                    }
+                    candidates[i] += flag;
+                    backface_culled += u32::from(flag == 0 && idx < sphere.len());
+                }
+                assert!(candidates[i] > 1, "sphere must have multiple Hi-Z candidates");
+                if i == 1 {
+                    assert_eq!(&flags[sphere.len()..], &[0, 1, 0]);
+                }
+            }
+            assert!(backface_culled > 0, "backfaces must skip both draws");
+            let stats1 = bytemuck::pod_read_unaligned::<MeshletCullStats>(&read(&stats1));
+            let stats2 = bytemuck::pod_read_unaligned::<MeshletCullStats>(&read(&stats2));
+            assert_eq!(
+                [stats1.visible, stats1.frustum_culled, stats1.backface_culled, stats1.hiz_culled],
+                [1, 1, backface_culled, 0]
+            );
+            assert_eq!(
+                [stats2.visible, stats2.frustum_culled, stats2.backface_culled, stats2.hiz_culled],
+                [1 + candidates[1], 1, backface_culled, candidates[0]]
+            );
+        }
     }
 }

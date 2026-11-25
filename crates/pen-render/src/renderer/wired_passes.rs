@@ -29,7 +29,9 @@ use crate::environment_passes::{
 };
 use crate::lights::MAX_AREA_COOKIES;
 use crate::matrix::{IDENTITY, invert, multiply};
-use crate::meshlets::{MeshletBatchEntry, MeshletCullParams, MeshletCuller, MeshletIndirectDraw};
+use crate::meshlets::{
+    MeshletBatchEntry, MeshletCullParams, MeshletCuller, MeshletIndirectDraw, MeshletTwoPhaseBatchEntry,
+};
 use crate::oit::OitPass;
 use crate::post::{PhysicalSkyBinding, SCENE_FORMAT};
 use crate::post_fx::{PostFxParams, PostFxPass, RcasSharpener};
@@ -37,8 +39,9 @@ use crate::ray_tracing::{
     GpuBlasPool, MAX_RT_LOCAL_LIGHTS, RtLocalLight, TlasInstance, TlasRayTraceParams, TlasRayTracer, TlasSceneGpu,
 };
 use crate::render_targets::{ColorTransfer, OffscreenRenderTarget, SplitScreenCompositor, ViewportRect};
-use crate::restir::{RestirInputs, RestirParams, RestirRenderer};
+use crate::restir::{RESTIR_MAX_LIGHTS, RestirInputs, RestirParams, RestirRenderer};
 use crate::shader::{self, Stage};
+use crate::sharc::{SharcCache, SharcConfig, SharcParams};
 use crate::svgf::{SvgfDenoiser, SvgfInputs, SvgfParams};
 use crate::RenderTarget;
 
@@ -115,7 +118,7 @@ struct RtCompUniform {
   gi_weight: f32,
   shadow_floor: f32,
   gi_demodulated: f32,
-  _pad0: f32,
+  di_weight: f32,
   _pad1: f32,
   _pad2: f32,
 };
@@ -175,7 +178,7 @@ struct RtCompUniform {
   gi_weight: f32,
   shadow_floor: f32,
   gi_demodulated: f32,
-  _pad0: f32,
+  di_weight: f32,
   _pad1: f32,
   _pad2: f32,
 };
@@ -185,6 +188,7 @@ struct RtCompUniform {
 @group(0) @binding(3) var sao_tex: texture_2d<f32>;
 @group(0) @binding(4) var<uniform> cfg: RtCompUniform;
 @group(0) @binding(5) var gbuf_albedo_metallic: texture_2d<f32>;
+@group(0) @binding(6) var di_tex: texture_2d<f32>;
 
 @vertex fn vs(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4f {
   let x = f32((idx << 1u) & 2u) * 2.0 - 1.0;
@@ -202,6 +206,7 @@ struct RtCompUniform {
   let rt_dims = vec2i(textureDimensions(refl_tex, 0));
   var refl = vec3f(0.0);
   var gi = vec3f(0.0);
+  var di = vec3f(0.0);
   var occlude = 0.0;
   if (rt_dims.x == dims.x && rt_dims.y == dims.y) {
     refl = max(textureLoad(refl_tex, p, 0).rgb, vec3f(0.0));
@@ -209,12 +214,16 @@ struct RtCompUniform {
     if (cfg.gi_weight > 0.0) {
       gi = max(textureLoad(gi_tex, p, 0).rgb, vec3f(0.0));
     }
+    if (cfg.di_weight > 0.0) {
+      di = max(textureLoad(di_tex, p, 0).rgb, vec3f(0.0));
+    }
   } else {
     let f_coord = (vec2f(p) + vec2f(0.5)) * vec2f(rt_dims) / vec2f(dims) - vec2f(0.5);
     let base_h = vec2i(floor(f_coord));
     let frac = clamp(f_coord - vec2f(base_h), vec2f(0.0), vec2f(1.0));
     var r_sum = vec3f(0.0);
     var g_sum = vec3f(0.0);
+    var d_sum = vec3f(0.0);
     var o_sum = 0.0;
     var w_sum = 0.0;
     for (var oy = 0; oy < 2; oy++) {
@@ -231,12 +240,16 @@ struct RtCompUniform {
         if (cfg.gi_weight > 0.0) {
           g_sum += max(textureLoad(gi_tex, hp, 0).rgb, vec3f(0.0)) * w;
         }
+        if (cfg.di_weight > 0.0) {
+          d_sum += max(textureLoad(di_tex, hp, 0).rgb, vec3f(0.0)) * w;
+        }
         w_sum += w;
       }
     }
     let inv_w = 1.0 / max(w_sum, 1e-5);
     refl = r_sum * inv_w;
     gi = g_sum * inv_w;
+    di = d_sum * inv_w;
     occlude = o_sum * inv_w;
   }
   if (cfg.gi_weight > 0.0 && cfg.gi_demodulated > 0.5) {
@@ -245,7 +258,7 @@ struct RtCompUniform {
     let g_am = textureLoad(gbuf_albedo_metallic, g_px, 0);
     gi *= max(g_am.rgb, vec3f(0.0)) * (1.0 - clamp(g_am.w, 0.0, 1.0));
   }
-  let bounce = refl * cfg.refl_weight + gi * cfg.gi_weight;
+  let bounce = refl * cfg.refl_weight + gi * cfg.gi_weight + di * cfg.di_weight;
   // Premultiplied-alpha blend (`One + OneMinusSrcAlpha`) attenuates occluded sky IBL where local RT
   // reflection rays hit geometry, preventing double-counting while leaving diffuse/sky misses untouched.
   return vec4f(bounce, clamp(occlude * cfg.refl_weight, 0.0, 0.75));
@@ -419,7 +432,8 @@ struct RtCompUniform {
     gi_weight: f32,
     shadow_floor: f32,
     gi_demodulated: f32,
-    _pad: [f32; 3],
+    di_weight: f32,
+    _pad: [f32; 2],
 }
 
 #[repr(C)]
@@ -480,6 +494,7 @@ struct SvgfRtState {
     sao: SvgfDenoiser,
     refl: SvgfDenoiser,
     gi: SvgfDenoiser,
+    di: SvgfDenoiser,
     buffers: Option<SvgfRtBuffers>,
     prev_vp: Option<[f32; 16]>,
 }
@@ -559,6 +574,7 @@ impl SvgfRtState {
             sao: SvgfDenoiser::new(device),
             refl: SvgfDenoiser::new(device),
             gi: SvgfDenoiser::new(device),
+            di: SvgfDenoiser::new(device),
             buffers: None,
             prev_vp: None,
         }
@@ -568,6 +584,7 @@ impl SvgfRtState {
         self.sao.reset_history();
         self.refl.reset_history();
         self.gi.reset_history();
+        self.di.reset_history();
         self.prev_vp = None;
     }
 }
@@ -601,6 +618,16 @@ impl EnvPipelines {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PlannedMeshletDraw {
+    pub slot: usize,
+    pub mesh_slot: usize,
+    pub mesh_key: u64,
+    pub ml_count: u32,
+    pub model: Matrix,
+    pub backface_cull: bool,
+}
+
 #[derive(Default)]
 pub(super) struct WiredPasses {
     pub physical_atmosphere: Option<PhysicalAtmosphere>,
@@ -615,6 +642,8 @@ pub(super) struct WiredPasses {
     pub tlas_bounds: Option<([f32; 3], [f32; 3])>,
     pub ray_tracer: Option<TlasRayTracer>,
     pub restir: Option<RestirRenderer>,
+    pub sharc: Option<SharcCache>,
+    pub sharc_needs_clear: bool,
     svgf_rt: Option<SvgfRtState>,
     rt_composite: Option<RtCompositePipelines>,
     pub ddgi_near: Option<DdgiVolume>,
@@ -623,6 +652,9 @@ pub(super) struct WiredPasses {
     pub meshlet_culler: Option<MeshletCuller>,
     pub meshlet_indirect_serial: u64,
     pub last_meshlet_cull_draws: u32,
+    pub meshlet_phase1_used_hiz: bool,
+    pub last_meshlet_phase2_active: bool,
+    pub meshlet_plan: Vec<PlannedMeshletDraw>,
     pub env_pipelines: HashMap<(u32, bool), EnvPipelines>,
     pub env_scene: Option<EnvironmentScene>,
     pub ext_terrain_hm: Option<(u64, TerrainHeightmap)>,
@@ -692,6 +724,7 @@ impl WiredPasses {
         if let Some(restir) = &mut self.restir {
             restir.reset_history();
         }
+        self.sharc_needs_clear = true;
     }
 
     pub fn wants_post_polish(frame: &RenderFrame) -> bool {
@@ -1008,7 +1041,15 @@ impl WiredPasses {
 
             let bounce_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("rt_bounce_comp_bgl"),
-                entries: &[tex_entry(0), tex_entry(1), tex_entry(2), tex_entry(3), u_entry(4), tex_entry(5)],
+                entries: &[
+                    tex_entry(0),
+                    tex_entry(1),
+                    tex_entry(2),
+                    tex_entry(3),
+                    u_entry(4),
+                    tex_entry(5),
+                    tex_entry(6),
+                ],
             });
             let bounce_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("rt_bounce_comp_pl"),
@@ -1076,6 +1117,7 @@ impl WiredPasses {
         sao_view: &wgpu::TextureView,
         refl_view: Option<&wgpu::TextureView>,
         gi_view: Option<&wgpu::TextureView>,
+        di_view: Option<&wgpu::TextureView>,
         gbuf_albedo_metallic: Option<&wgpu::TextureView>,
         gi_demodulated: bool,
         tier: u32,
@@ -1085,6 +1127,7 @@ impl WiredPasses {
     ) {
         let dummy_gbuf = self.dummy_rgba16f_view(device);
         let gbuf_am_bind = gbuf_albedo_metallic.unwrap_or(&dummy_gbuf);
+        let di_bind = di_view.unwrap_or(&dummy_gbuf);
         let comp = self.ensure_rt_composite(device);
         let cfg = RtCompUniform {
             depth_clear,
@@ -1092,7 +1135,9 @@ impl WiredPasses {
             gi_weight: if ddgi_active { 0.0 } else { 0.85 },
             shadow_floor: if has_csm { 0.84 } else { 0.25 },
             gi_demodulated: if gi_demodulated && gbuf_albedo_metallic.is_some() { 1.0 } else { 0.0 },
-            _pad: [0.0; 3],
+            // Pen's forward PBR (`surface_lobes.wgsl`) scales direct lights by PI relative to physical 1/PI BRDFs.
+            di_weight: if di_view.is_some() { std::f32::consts::PI } else { 0.0 },
+            _pad: [0.0; 2],
         };
         queue.write_buffer(&comp.uniform, 0, bytemuck::bytes_of(&cfg));
         let sao_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1133,6 +1178,7 @@ impl WiredPasses {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sao_view) },
                     wgpu::BindGroupEntry { binding: 4, resource: comp.uniform.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(gbuf_am_bind) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(di_bind) },
                 ],
             });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1169,6 +1215,37 @@ fn resolve_rt_sky_colors(frame: &RenderFrame) -> ([f32; 3], [f32; 3]) {
         return (zenith, horizon);
     }
     (a, a)
+}
+
+/// Whether `frame` contains at least one active point or spot light suitable for ReSTIR DI.
+pub(super) fn has_active_point_spot_lights(frame: &RenderFrame) -> bool {
+    frame.lights.iter().any(|lt| lt.radius > 1e-4)
+}
+
+/// Packs ONLY dynamic point and spot lights (`frame.lights`) up to `RESTIR_MAX_LIGHTS`
+/// so Tier-3 ReSTIR DI shades them with per-pixel RT shadows without double-lighting LTC area lights.
+fn pack_rt_point_spot_lights(frame: &RenderFrame) -> Vec<RtLocalLight> {
+    let mut out = Vec::with_capacity(frame.lights.len().min(RESTIR_MAX_LIGHTS));
+    for lt in &frame.lights {
+        if out.len() >= RESTIR_MAX_LIGHTS {
+            break;
+        }
+        let reach = lt.radius.max(0.0);
+        if reach <= 1e-4 {
+            continue;
+        }
+        let dir_raw = [lt.direction.x, lt.direction.y, lt.direction.z];
+        let dlen = (dir_raw[0] * dir_raw[0] + dir_raw[1] * dir_raw[1] + dir_raw[2] * dir_raw[2]).sqrt();
+        let dir = if dlen > 1e-6 { [dir_raw[0] / dlen, dir_raw[1] / dlen, dir_raw[2] / dlen] } else { [0.0, -1.0, 0.0] };
+        let outer = if lt.outer > 0.0 && dlen > 1e-6 { lt.outer } else { -1.0 };
+        let inner = if outer > -1.0 { lt.inner.max(outer + 1e-4) } else { -1.0 };
+        out.push(RtLocalLight {
+            position_range: [lt.position.x, lt.position.y, lt.position.z, reach],
+            color_outer_cos: [lt.color.x.max(0.0), lt.color.y.max(0.0), lt.color.z.max(0.0), outer],
+            direction_inner_cos: [dir[0], dir[1], dir[2], inner],
+        });
+    }
+    out
 }
 
 /// Packs dynamic point, spot, and area lights from `RenderFrame` into compact `RtLocalLight` records
@@ -2110,9 +2187,11 @@ impl State {
         Ok(())
     }
 
-    /// Dispatches GPU meshlet cluster culling (local frustum + shear-safe normal-cone backface +
-    /// optional prior-frame Hi-Z) for opaque LOD0 mesh draws with `MeshAsset::meshlets`.
-    pub(super) fn encode_meshlet_culling(
+    /// Phase 1 of two-phase GPU meshlet cluster culling (local frustum + shear-safe normal-cone
+    /// backface + prior-frame Hi-Z in both Forward-Z and Reversed-Z) for opaque LOD0 mesh draws.
+    /// When prior-frame Hi-Z is active and matches `depth_mode`, records `phase2_flags` so Phase 2
+    /// can recover newly disoccluded clusters on the exact same frame (0-frame lag).
+    pub(super) fn encode_meshlet_culling_phase1(
         &mut self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
@@ -2122,17 +2201,20 @@ impl State {
         depth_mode: DepthMode,
     ) -> Result<()> {
         self.wired.last_meshlet_cull_draws = 0;
+        self.wired.meshlet_phase1_used_hiz = false;
+        self.wired.last_meshlet_phase2_active = false;
+        self.wired.meshlet_plan.clear();
+
         let active_vp = multiply(active_proj, &frame.view);
         let planes = frustum_planes_from_vp(&active_vp);
         let eye = invert(&frame.view);
         let camera_pos = [eye[12], eye[13], eye[14]];
         let reversed_z = depth_mode == DepthMode::ReversedZ;
         let (hiz_view_ref, hiz_view_id, hiz_vp, _, hiz_mips, hiz_active) = self.hiz.source();
-        let use_hiz = hiz_active && !reversed_z;
+        let use_hiz = hiz_active && self.hiz.depth_mode() == depth_mode;
         let hiz_opt = use_hiz.then_some((hiz_view_ref, hiz_view_id));
         let has_mdi = device.features().contains(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT);
 
-        let mut planned: Vec<(usize, usize, u64, u32, MeshletCullParams)> = Vec::new();
         let mut slot_cursor = 0usize;
         for &ready_idx in &scratch.opaque {
             let entry = &scratch.ready[ready_idx];
@@ -2158,74 +2240,200 @@ impl State {
             if ml.count <= 1 || (!has_mdi && ml.count > 64) {
                 continue;
             }
-            let need_bytes = u64::from(ml.count) * size_of::<MeshletIndirectDraw>() as u64;
+            let need_draw_bytes = u64::from(ml.count) * size_of::<MeshletIndirectDraw>() as u64;
+            let need_flag_bytes = u64::from(ml.count) * size_of::<u32>() as u64;
+            let make_slot = |serial: u64, draw_cap: u64, flag_cap: u64| super::MeshletIndirectSlot {
+                count: ml.count,
+                generation: serial,
+                draws_phase1: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("meshlet_indirect_draws_p1"),
+                    size: draw_cap,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                    mapped_at_creation: false,
+                }),
+                draws_phase2: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("meshlet_indirect_draws_p2"),
+                    size: draw_cap,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+                    mapped_at_creation: false,
+                }),
+                phase2_flags: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("meshlet_phase2_flags"),
+                    size: flag_cap,
+                    usage: wgpu::BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                }),
+            };
             if slot_cursor >= self.meshlet_indirect.len() {
                 self.wired.meshlet_indirect_serial += 1;
-                let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("meshlet_indirect_draws"),
-                    size: need_bytes.max(1280),
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
-                    mapped_at_creation: false,
-                });
-                self.meshlet_indirect.push((ml.count, self.wired.meshlet_indirect_serial, buf));
-            } else if self.meshlet_indirect[slot_cursor].2.size() < need_bytes {
+                self.meshlet_indirect.push(make_slot(
+                    self.wired.meshlet_indirect_serial,
+                    need_draw_bytes.max(1280),
+                    need_flag_bytes.max(256),
+                ));
+            } else if self.meshlet_indirect[slot_cursor].draws_phase1.size() < need_draw_bytes
+                || self.meshlet_indirect[slot_cursor].phase2_flags.size() < need_flag_bytes
+            {
                 self.wired.meshlet_indirect_serial += 1;
-                let buf = device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("meshlet_indirect_draws"),
-                    size: need_bytes.next_power_of_two(),
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
-                    mapped_at_creation: false,
-                });
-                self.meshlet_indirect[slot_cursor] = (ml.count, self.wired.meshlet_indirect_serial, buf);
+                self.meshlet_indirect[slot_cursor] = make_slot(
+                    self.wired.meshlet_indirect_serial,
+                    need_draw_bytes.next_power_of_two(),
+                    need_flag_bytes.next_power_of_two(),
+                );
             } else {
-                self.meshlet_indirect[slot_cursor].0 = ml.count;
+                self.meshlet_indirect[slot_cursor].count = ml.count;
             }
             let model = *item.transform(frame);
             let det3 = model[0] * (model[5] * model[10] - model[6] * model[9])
                 - model[4] * (model[1] * model[10] - model[2] * model[9])
                 + model[8] * (model[1] * model[6] - model[2] * model[5]);
-            let params = MeshletCullParams {
-                model,
-                hiz_vp: if use_hiz { hiz_vp } else { active_vp },
-                frustum_planes: planes,
-                camera_pos,
-                hiz_enabled: use_hiz,
-                hiz_mips,
-                backface_cull: det3 > 0.0,
-                reversed_z,
-            };
             let rev = self.assets.slots[mesh_slot].revision;
             let mesh_key = ((mesh_slot as u64) << 32) ^ rev;
-            planned.push((slot_cursor, mesh_slot, mesh_key, ml.count, params));
+            self.wired.meshlet_plan.push(PlannedMeshletDraw {
+                slot: slot_cursor,
+                mesh_slot,
+                mesh_key,
+                ml_count: ml.count,
+                model,
+                backface_cull: det3 > 0.0,
+            });
             scratch.ready[ready_idx].meshlet_slot = Some(slot_cursor);
             slot_cursor += 1;
         }
-        if !planned.is_empty() {
+        if !self.wired.meshlet_plan.is_empty() {
             let culler = self.wired.meshlet_culler.get_or_insert_with(|| MeshletCuller::new(device));
-            let mut batch = Vec::with_capacity(planned.len());
-            for &(slot, mesh_slot, mesh_key, ml_count, params) in &planned {
-                let Some(GpuAsset::Mesh(mesh)) = self.assets.current(mesh_slot) else { continue };
-                let Some(ml) = &mesh.meshlets else { continue };
-                let &(_, draws_gen, ref draws_buf) = &self.meshlet_indirect[slot];
-                batch.push(MeshletBatchEntry {
-                    mesh_key,
-                    draws_gen,
-                    meshlets_buf: &ml.descriptors,
-                    draws_buf,
-                    meshlet_count: ml_count,
-                    params,
-                });
+            if use_hiz {
+                let mut batch = Vec::with_capacity(self.wired.meshlet_plan.len());
+                for p in &self.wired.meshlet_plan {
+                    let Some(GpuAsset::Mesh(mesh)) = self.assets.current(p.mesh_slot) else { continue };
+                    let Some(ml) = &mesh.meshlets else { continue };
+                    let slot_data = &self.meshlet_indirect[p.slot];
+                    batch.push(MeshletTwoPhaseBatchEntry {
+                        mesh_key: p.mesh_key,
+                        draws_gen: slot_data.generation,
+                        meshlets_buf: &ml.descriptors,
+                        draws_phase1_buf: &slot_data.draws_phase1,
+                        draws_phase2_buf: &slot_data.draws_phase2,
+                        phase2_flags_buf: &slot_data.phase2_flags,
+                        meshlet_count: p.ml_count,
+                        params: MeshletCullParams {
+                            model: p.model,
+                            hiz_vp,
+                            frustum_planes: planes,
+                            camera_pos,
+                            hiz_enabled: true,
+                            hiz_mips,
+                            backface_cull: p.backface_cull,
+                            reversed_z,
+                        },
+                    });
+                }
+                culler.cull_batch_phase1(
+                    device,
+                    &self.queue,
+                    encoder,
+                    hiz_opt,
+                    &batch,
+                    self.timer.compute(super::timing::Span::Culling),
+                )?;
+                self.wired.meshlet_phase1_used_hiz = true;
+            } else {
+                let mut batch = Vec::with_capacity(self.wired.meshlet_plan.len());
+                for p in &self.wired.meshlet_plan {
+                    let Some(GpuAsset::Mesh(mesh)) = self.assets.current(p.mesh_slot) else { continue };
+                    let Some(ml) = &mesh.meshlets else { continue };
+                    let slot_data = &self.meshlet_indirect[p.slot];
+                    batch.push(MeshletBatchEntry {
+                        mesh_key: p.mesh_key,
+                        draws_gen: slot_data.generation,
+                        meshlets_buf: &ml.descriptors,
+                        draws_buf: &slot_data.draws_phase1,
+                        meshlet_count: p.ml_count,
+                        params: MeshletCullParams {
+                            model: p.model,
+                            hiz_vp: active_vp,
+                            frustum_planes: planes,
+                            camera_pos,
+                            hiz_enabled: false,
+                            hiz_mips: 0,
+                            backface_cull: p.backface_cull,
+                            reversed_z,
+                        },
+                    });
+                }
+                culler.cull_batch(
+                    device,
+                    &self.queue,
+                    encoder,
+                    None,
+                    &batch,
+                    self.timer.compute(super::timing::Span::Culling),
+                )?;
             }
-            culler.cull_batch(
-                device,
-                &self.queue,
-                encoder,
-                hiz_opt,
-                &batch,
-                self.timer.compute(super::timing::Span::Culling),
-            )?;
         }
         self.wired.last_meshlet_cull_draws = u32::try_from(slot_cursor).unwrap_or(u32::MAX);
+        Ok(())
+    }
+
+    /// Phase 2 of two-phase GPU meshlet occlusion culling: re-tests ONLY `phase2_flags == 1`
+    /// candidates against the fresh current-frame Hi-Z built from Phase 1 opaque depth so newly
+    /// disoccluded meshlets render in the exact same frame with zero overlap and zero popping.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn encode_meshlet_culling_phase2(
+        wired: &mut WiredPasses,
+        hiz: &super::hiz::HiZ,
+        assets: &crate::asset_store::AssetStore<GpuAsset>,
+        meshlet_indirect: &[super::MeshletIndirectSlot],
+        timer: &super::timing::GpuTimer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &RenderFrame,
+        active_proj: &Matrix,
+        depth_mode: DepthMode,
+    ) -> Result<()> {
+        if !wired.meshlet_phase1_used_hiz || wired.meshlet_plan.is_empty() {
+            return Ok(());
+        }
+        let Some(culler) = wired.meshlet_culler.as_mut() else {
+            return Ok(());
+        };
+        let active_vp = multiply(active_proj, &frame.view);
+        let planes = frustum_planes_from_vp(&active_vp);
+        let eye = invert(&frame.view);
+        let camera_pos = [eye[12], eye[13], eye[14]];
+        let reversed_z = depth_mode == DepthMode::ReversedZ;
+        let (hiz_view_ref, hiz_view_id, hiz_vp, _, hiz_mips, hiz_active) = hiz.source();
+        let use_hiz = hiz_active && hiz.depth_mode() == depth_mode;
+        let hiz_opt = use_hiz.then_some((hiz_view_ref, hiz_view_id));
+
+        let mut batch = Vec::with_capacity(wired.meshlet_plan.len());
+        for p in &wired.meshlet_plan {
+            let Some(GpuAsset::Mesh(mesh)) = assets.current(p.mesh_slot) else { continue };
+            let Some(ml) = &mesh.meshlets else { continue };
+            let slot_data = &meshlet_indirect[p.slot];
+            batch.push(MeshletTwoPhaseBatchEntry {
+                mesh_key: p.mesh_key,
+                draws_gen: slot_data.generation,
+                meshlets_buf: &ml.descriptors,
+                draws_phase1_buf: &slot_data.draws_phase1,
+                draws_phase2_buf: &slot_data.draws_phase2,
+                phase2_flags_buf: &slot_data.phase2_flags,
+                meshlet_count: p.ml_count,
+                params: MeshletCullParams {
+                    model: p.model,
+                    hiz_vp: if use_hiz { hiz_vp } else { active_vp },
+                    frustum_planes: planes,
+                    camera_pos,
+                    hiz_enabled: use_hiz,
+                    hiz_mips,
+                    backface_cull: p.backface_cull,
+                    reversed_z,
+                },
+            });
+        }
+        culler.cull_batch_phase2(device, queue, encoder, hiz_opt, &batch, timer.compute(super::timing::Span::Culling))?;
+        wired.last_meshlet_phase2_active = true;
         Ok(())
     }
 
@@ -2437,7 +2645,31 @@ impl State {
         let local_lights = pack_rt_local_lights(frame);
 
         let tier = frame.quality.ray_tracing;
+        let use_restir_di = tier >= 3 && thin_gbuffer.is_some() && has_active_point_spot_lights(frame);
         let use_restir_gi = tier >= 3 && !ddgi_active && thin_gbuffer.is_some();
+        let use_sharc = use_restir_gi;
+        if use_sharc {
+            if wired.sharc.is_none() {
+                wired.sharc = Some(SharcCache::new(device, SharcConfig::default())?);
+                wired.sharc_needs_clear = true;
+            }
+            if let Some(sharc) = wired.sharc.as_ref() {
+                let sharc_reset = frame.exposure.cut || wired.sharc_needs_clear;
+                let sharc_params = SharcParams {
+                    camera_pos,
+                    frame_index: u32::try_from(frames_count & 0xffff_ffff).unwrap_or(0),
+                    reset: sharc_reset,
+                    enabled: true,
+                };
+                sharc.update_uniform(queue, &sharc_params);
+                if sharc_reset {
+                    sharc.clear(encoder);
+                    wired.sharc_needs_clear = false;
+                }
+            }
+        }
+        let sharc_ref = if use_sharc { wired.sharc.as_ref() } else { None };
+
         let params = TlasRayTraceParams {
             view_projection: active_vp,
             camera_pos,
@@ -2461,7 +2693,7 @@ impl State {
         };
         let tlas = wired.tlas_gpu.as_ref().unwrap();
         let rt = wired.ray_tracer.get_or_insert_with(|| TlasRayTracer::new(device));
-        rt.trace_with_scene_gbuffer(
+        rt.trace_with_scene_gbuffer_sharc(
             device,
             encoder,
             tlas,
@@ -2472,13 +2704,15 @@ impl State {
             ddgi_packed_buf,
             true,
             thin_gbuffer.map(|(nr, am, _)| (nr, am)),
+            sharc_ref,
         )?;
         let raw_sao = rt.shadow_ao_view().cloned();
         let raw_refl = rt.reflection_view().cloned();
         let mut raw_gi = rt.gi_view().cloned();
+        let mut raw_di: Option<wgpu::TextureView> = None;
         let mut gi_demodulated = false;
 
-        if use_restir_gi
+        if (use_restir_di || use_restir_gi)
             && let Some((gbuf_nr, gbuf_am, gbuf_depth)) = thin_gbuffer
         {
             let restir_has_prev = wired.svgf_rt.as_ref().is_some_and(|s| s.prev_vp.is_some()) && !frame.exposure.cut;
@@ -2496,24 +2730,41 @@ impl State {
                 normal_bias: 0.015,
                 visibility_mask: u32::MAX,
                 frame_index: u32::try_from(frames_count & 0xffff_ffff).unwrap_or(0),
-                enable_di: false,
-                enable_gi: true,
+                enable_di: use_restir_di,
+                enable_gi: use_restir_gi,
                 reset_history: !restir_has_prev,
                 gi_bounce_scale: 1.0,
             };
-            let restir_lights = &local_lights[..local_lights.len().min(crate::restir::RESTIR_MAX_LIGHTS)];
+            // When ReSTIR DI is active, supply ONLY point/spot lights so LTC area lights (still shaded
+            // analytically on opaque pixels via `Clusters::area_only_group()`) are never double-counted.
+            let point_spot_lights;
+            let restir_lights: &[RtLocalLight] = if use_restir_di {
+                point_spot_lights = pack_rt_point_spot_lights(frame);
+                &point_spot_lights
+            } else {
+                &local_lights[..local_lights.len().min(RESTIR_MAX_LIGHTS)]
+            };
             let restir_inputs = RestirInputs {
                 depth: gbuf_depth,
                 normal_roughness: gbuf_nr,
                 albedo_metallic: gbuf_am,
                 motion: velocity_view,
                 ddgi_packed: ddgi_packed_buf,
+                sharc: sharc_ref,
             };
             let restir = wired.restir.get_or_insert_with(|| RestirRenderer::new(device));
             restir.dispatch(device, encoder, tlas, restir_inputs, rt_size, &restir_params, restir_lights)?;
-            if let Some(gv) = restir.gi_view().cloned() {
+            if use_restir_di {
+                raw_di = restir.di_view().cloned();
+            }
+            if use_restir_gi
+                && let Some(gv) = restir.gi_view().cloned()
+            {
                 raw_gi = Some(gv);
                 gi_demodulated = true;
+            }
+            if let Some(sharc) = sharc_ref {
+                sharc.resolve_uploaded(encoder, true);
             }
         }
 
@@ -2587,6 +2838,7 @@ impl State {
             svgf.sao.denoise(device, encoder, &sao_in, rt_size, &sao_params)?;
             let mut denoised_refl = None;
             let mut denoised_gi = None;
+            let mut denoised_di = None;
             if tier >= 2 {
                 let refl_params = SvgfParams {
                     min_alpha: 0.12,
@@ -2616,6 +2868,19 @@ impl State {
                     svgf.gi.denoise(device, encoder, &gi_in, rt_size, &gi_params)?;
                     denoised_gi = svgf.gi.output_view().cloned();
                 }
+                if let Some(dv) = raw_di.as_ref() {
+                    let di_params = SvgfParams {
+                        min_alpha: 0.12,
+                        phi_color: 4.0,
+                        atrous_iterations: 2,
+                        reset_history: !has_prev,
+                        specular_mode: false,
+                        ..Default::default()
+                    };
+                    let di_in = SvgfInputs { noisy_signal: dv, ..sao_in };
+                    svgf.di.denoise(device, encoder, &di_in, rt_size, &di_params)?;
+                    denoised_di = svgf.di.output_view().cloned();
+                }
             }
             let copy_ext = wgpu::Extent3d { width: rt_size.0, height: rt_size.1, depth_or_array_layers: 1 };
             encoder.copy_texture_to_texture(
@@ -2640,6 +2905,7 @@ impl State {
                 &denoised_sao,
                 denoised_refl.as_ref(),
                 denoised_gi.as_ref(),
+                denoised_di.as_ref(),
                 thin_gbuffer.map(|(_, am, _)| am),
                 gi_demodulated,
                 tier,

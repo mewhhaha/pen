@@ -42,6 +42,9 @@ struct RtLocalLight {
 @group(0) @binding(10) var<storage, read> ddgi_packed: array<vec4f>;
 @group(0) @binding(11) var gbuf_normal_roughness: texture_2d<f32>;
 @group(0) @binding(12) var gbuf_albedo_metallic: texture_2d<f32>;
+@group(0) @binding(13) var<storage, read> sharc_keys: array<u32>;
+@group(0) @binding(14) var<storage, read> sharc_resolved: array<vec4f>;
+@group(0) @binding(15) var<uniform> sharc_u: SharcUniform;
 
 const PI: f32 = 3.14159265359;
 
@@ -301,13 +304,15 @@ fn shade_hit(
     }
   }
 
-  // 3. Multi-bounce indirect diffuse at hit point: live DDGI when active, else sky ambient fallback.
+  // 3. Multi-bounce indirect diffuse at hit point: DDGI where covered, else unbounded SHaRC cache, else sky ambient.
   let amb_sky = mix(u.sky_horizon.rgb * 0.4, u.sky_zenith.rgb, clamp(hit.world_normal.y * 0.5 + 0.5, 0.0, 1.0)) * 0.25;
+  let sharc_hit = sharc_query_ro(hit_pos, hit.world_normal);
+  let fallback_gi = select(amb_sky, sharc_hit.rgb * u.bias_and_refl.z, sharc_hit.a > 0.5);
   if ((u.extra_counts.w & 2u) != 0u) {
     let ddgi = rt_sample_ddgi(hit_pos, hit.world_normal);
-    rad += diffuse_albedo * mix(amb_sky, ddgi.rgb, ddgi.a);
+    rad += diffuse_albedo * mix(fallback_gi, ddgi.rgb, ddgi.a);
   } else {
-    rad += diffuse_albedo * amb_sky;
+    rad += diffuse_albedo * fallback_gi;
   }
   return rad;
 }

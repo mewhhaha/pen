@@ -1,7 +1,7 @@
 // GPU Meshlet Cluster Culling Compute Shader:
 // - Exact local-space frustum sphere test (conservative under arbitrary shear and non-uniform scale)
 // - Exact local-space perspective normal-cone backface cluster test (invariant under shear/scale)
-// - Conservative prior-frame Hi-Z occlusion test (covers full texel footprint, never skips holes)
+// - Conservative Hi-Z occlusion test (covers full texel footprint, never skips holes)
 // - Writes baseline-WebGPU-compatible DrawIndexedIndirect args (`first_instance = 0u`).
 
 struct MeshletGpu {
@@ -46,6 +46,7 @@ struct CullStats {
 @group(0) @binding(2) var<storage, read_write> draws: array<DrawIndexedIndirect>;
 @group(0) @binding(3) var<storage, read_write> stats: CullStats;
 @group(0) @binding(4) var hiz_tex: texture_2d<f32>;
+@group(0) @binding(5) var<storage, read_write> phase2_flags: array<u32>;
 
 // Exact local-space frustum test: transforms each world plane by transpose(model) so non-uniform
 // scaling and shear never under-estimate the projected bounding sphere radius.
@@ -131,57 +132,90 @@ fn hiz_occluded(world_center: vec3f, world_radius: f32, rev_z: bool) -> bool {
   return near_z > bound_d + 0.0005;
 }
 
-@compute @workgroup_size(64)
-fn cull_meshlets(@builtin(global_invocation_id) id: vec3u) {
-  let idx = id.x;
-  let count = u.counts_flags.x;
-  if (idx >= count) {
-    return;
-  }
-  let m = meshlets[idx];
-  let backface_enabled = (u.counts_flags.w & 1u) != 0u;
-  let rev_z = (u.counts_flags.w & 2u) != 0u;
-
-  var visible = true;
+fn passes_geometry_culling(m: MeshletGpu) -> bool {
   if (!in_frustum_local(m.sphere.xyz, m.sphere.w)) {
-    visible = false;
     atomicAdd(&stats.frustum_culled, 1u);
+    return false;
   }
 
   // Exact local-space perspective normal-cone backface cluster test (exact under arbitrary shear/scale):
   // Since (M * v) . (adj(M)^T * n) = det(M) * (v . n), testing in local space using inverse-transformed
   // camera preserves backface orientation identically for any positive-determinant affine matrix.
-  if (visible && backface_enabled && m.cone_axis_cutoff.w < 0.999) {
+  let backface_enabled = (u.counts_flags.w & 1u) != 0u;
+  if (backface_enabled && m.cone_axis_cutoff.w < 0.999) {
     let det = dot(u.model[0].xyz, cross(u.model[1].xyz, u.model[2].xyz));
     if (det > 1e-6) {
       let local_cam = (u.inv_model * vec4f(u.camera_pos.xyz, 1.0)).xyz;
       let to_center = m.sphere.xyz - local_cam;
       let dist = length(to_center);
       if (dist > m.sphere.w && dot(to_center, m.cone_axis_cutoff.xyz) >= m.cone_axis_cutoff.w * dist + m.sphere.w) {
-        visible = false;
         atomicAdd(&stats.backface_culled, 1u);
+        return false;
       }
     }
   }
+  return true;
+}
 
-  if (visible) {
-    let world_center = (u.model * vec4f(m.sphere.xyz, 1.0)).xyz;
-    let world_radius = conservative_world_radius(m.sphere.w);
-    if (hiz_occluded(world_center, world_radius, rev_z)) {
-      visible = false;
-      atomicAdd(&stats.hiz_culled, 1u);
-    }
-  }
+fn meshlet_hiz_occluded(m: MeshletGpu) -> bool {
+  let world_center = (u.model * vec4f(m.sphere.xyz, 1.0)).xyz;
+  let world_radius = conservative_world_radius(m.sphere.w);
+  let rev_z = (u.counts_flags.w & 2u) != 0u;
+  return hiz_occluded(world_center, world_radius, rev_z);
+}
 
+fn write_draw(idx: u32, m: MeshletGpu, visible: bool) {
   if (visible) {
     atomicAdd(&stats.visible, 1u);
   }
-  // Emit `first_instance = 0u` so indirect draws execute cleanly on baseline WebGPU without INDIRECT_FIRST_INSTANCE.
-  draws[idx] = DrawIndexedIndirect(
-    m.counts.y,
-    select(0u, 1u, visible),
-    m.counts.x,
-    bitcast<i32>(m.counts.z),
-    0u,
-  );
+  // Emit first_instance = 0u for baseline WebGPU without INDIRECT_FIRST_INSTANCE.
+  draws[idx] = DrawIndexedIndirect(m.counts.y, select(0u, 1u, visible), m.counts.x, bitcast<i32>(m.counts.z), 0u);
+}
+
+// Returns true only for meshlets rejected by Hi-Z after passing geometry culling.
+fn cull_primary(idx: u32) -> bool {
+  let m = meshlets[idx];
+  let passes_geometry = passes_geometry_culling(m);
+  let occluded = passes_geometry && meshlet_hiz_occluded(m);
+  write_draw(idx, m, passes_geometry && !occluded);
+  return occluded;
+}
+
+@compute @workgroup_size(64)
+fn cull_meshlets(@builtin(global_invocation_id) id: vec3u) {
+  let idx = id.x;
+  if (idx >= u.counts_flags.x) {
+    return;
+  }
+  if (cull_primary(idx)) {
+    atomicAdd(&stats.hiz_culled, 1u);
+  }
+}
+
+@compute @workgroup_size(64)
+fn cull_meshlets_phase1(@builtin(global_invocation_id) id: vec3u) {
+  let idx = id.x;
+  if (idx >= u.counts_flags.x) {
+    return;
+  }
+  // Phase 2 decides whether these meshlets count as Hi-Z culled.
+  phase2_flags[idx] = select(0u, 1u, cull_primary(idx));
+}
+
+@compute @workgroup_size(64)
+fn cull_meshlets_phase2(@builtin(global_invocation_id) id: vec3u) {
+  let idx = id.x;
+  if (idx >= u.counts_flags.x) {
+    return;
+  }
+  if (phase2_flags[idx] == 0u) {
+    draws[idx] = DrawIndexedIndirect(0u, 0u, 0u, 0, 0u);
+    return;
+  }
+  let m = meshlets[idx];
+  let occluded = meshlet_hiz_occluded(m);
+  if (occluded) {
+    atomicAdd(&stats.hiz_culled, 1u);
+  }
+  write_draw(idx, m, !occluded);
 }

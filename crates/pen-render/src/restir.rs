@@ -8,9 +8,138 @@ use wgpu::util::DeviceExt;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::ray_tracing::TLAS_TRAVERSAL_HW_WGSL;
 use crate::ray_tracing::{RtLocalLight, TLAS_TRAVERSAL_WGSL, TlasSceneGpu, device_supports_hardware_ray_query};
+use crate::sharc::{SHARC_COMMON_WGSL, SharcCache};
 
 pub const RESTIR_WGSL: &str = include_str!("shaders/restir.wgsl");
 pub const RESTIR_MAX_LIGHTS: usize = 256;
+
+const RESTIR_SHARC_WGSL: &str = r"
+struct RestirUniform {
+  inverse_view_projection: mat4x4f,
+  prev_view_projection: mat4x4f,
+  camera_and_clear: vec4f,
+  previous_camera: vec4f,
+  sun_and_max_distance: vec4f,
+  sun_color_and_bias: vec4f,
+  sky_zenith_and_bounce: vec4f,
+  sky_horizon: vec4f,
+  scene_counts_and_mask: vec4u,
+  size_lights_frame: vec4u,
+  flags: vec4u,
+};
+
+struct GiReservoir {
+  sample_pos_m: vec4f,
+  sample_nrm_w: vec4f,
+  radiance_wsum: vec4f,
+  vis_pad: vec4f,
+};
+
+@group(0) @binding(0) var<uniform> u: RestirUniform;
+@group(0) @binding(1) var depth_tex: texture_2d<f32>;
+@group(0) @binding(2) var normal_roughness: texture_2d<f32>;
+@group(0) @binding(3) var<storage, read_write> gi_reservoirs: array<GiReservoir>;
+@group(0) @binding(4) var<uniform> sharc_u: SharcUniform;
+@group(0) @binding(5) var<storage, read_write> sharc_keys: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> sharc_accum: array<atomic<u32>>;
+@group(0) @binding(7) var<storage, read> sharc_resolved: array<vec4f>;
+@group(0) @binding(8) var out_gi_tex: texture_2d<f32>;
+
+const EPS: f32 = 1e-6;
+
+fn rs_finite_nonnegative(x: f32, ceiling: f32) -> f32 {
+  return select(clamp(x, 0.0, ceiling), 0.0, (bitcast<u32>(x) & 0x7f800000u) == 0x7f800000u);
+}
+
+fn rs_safe_rgb(rgb: vec3f) -> vec3f {
+  return vec3f(rs_finite_nonnegative(rgb.x, 16384.0), rs_finite_nonnegative(rgb.y, 16384.0),
+               rs_finite_nonnegative(rgb.z, 16384.0));
+}
+
+fn rs_luma(rgb: vec3f) -> f32 {
+  return dot(rgb, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+fn rs_input_pixel(pixel: vec2i, dims: vec2i) -> vec2i {
+  let dispatch_dims = vec2i(u.size_lights_frame.xy);
+  let scaled = vec2i((vec2f(pixel) + 0.5) * vec2f(dims) / vec2f(dispatch_dims));
+  return select(clamp(scaled, vec2i(0), dims - 1), pixel, all(dims == dispatch_dims));
+}
+
+struct RsGeom {
+  pos: vec3f,
+  nrm: vec3f,
+  valid: bool,
+};
+
+fn rs_load_geometry(pixel: vec2i) -> RsGeom {
+  let dims = vec2i(textureDimensions(normal_roughness, 0));
+  let g_px = rs_input_pixel(pixel, dims);
+  let depth = textureLoad(depth_tex, g_px, 0).x;
+  let nr = textureLoad(normal_roughness, g_px, 0);
+  if (!(dot(nr.xyz, nr.xyz) >= 0.01) || !(abs(depth - u.camera_and_clear.w) > 1e-6)) {
+    return RsGeom(vec3f(0.0), vec3f(0.0), false);
+  }
+  let uv = (vec2f(g_px) + 0.5) / vec2f(dims);
+  let clip = vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), depth, 1.0);
+  let world = u.inverse_view_projection * clip;
+  if (!(abs(world.w) > 1e-8)) {
+    return RsGeom(vec3f(0.0), vec3f(0.0), false);
+  }
+  return RsGeom(world.xyz / world.w, normalize(nr.xyz), true);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn restir_gi_sharc_bounce(@builtin(global_invocation_id) id: vec3u) {
+  let ext = u.size_lights_frame.xy;
+  if (any(id.xy >= ext) || u.sky_zenith_and_bounce.w <= 0.0) {
+    return;
+  }
+  let pixel = vec2i(id.xy);
+  let index = id.y * ext.x + id.x;
+  var r = gi_reservoirs[index];
+  if (r.vis_pad.x <= 0.5 || r.vis_pad.y >= u.sun_and_max_distance.w) {
+    return;
+  }
+  let cached = sharc_query(r.sample_pos_m.xyz, r.sample_nrm_w.xyz);
+  if (cached.a <= 0.5) {
+    return;
+  }
+  let packed = unpack4x8unorm(bitcast<u32>(r.vis_pad.z));
+  let add = packed.rgb * cached.rgb * ((1.0 - packed.a) * u.sky_zenith_and_bounce.w);
+  let new_rad = rs_safe_rgb(r.radiance_wsum.rgb + add);
+  let g = rs_load_geometry(pixel);
+  if (!g.valid) {
+    return;
+  }
+  let delta = r.sample_pos_m.xyz - g.pos;
+  let dir = delta / max(length(delta), EPS);
+  var cos_term = max(dot(g.nrm, dir), 0.0);
+  if (dot(r.sample_nrm_w.xyz, -dir) <= 0.0) {
+    cos_term = 0.0;
+  }
+  r.radiance_wsum = vec4f(new_rad, rs_luma(new_rad) * cos_term * r.sample_nrm_w.w);
+  gi_reservoirs[index] = r;
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn restir_gi_sharc_deposit(@builtin(global_invocation_id) id: vec3u) {
+  let ext = u.size_lights_frame.xy;
+  if (any(id.xy >= ext)) {
+    return;
+  }
+  let pixel = vec2i(id.xy);
+  let gi_val = textureLoad(out_gi_tex, pixel, 0);
+  if (gi_val.a <= 0.5) {
+    return;
+  }
+  let g = rs_load_geometry(pixel);
+  if (!g.valid) {
+    return;
+  }
+  sharc_accumulate(g.pos, g.nrm, gi_val.rgb);
+}
+";
 
 const OUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const DI_STRIDE: u64 = 32;
@@ -49,6 +178,8 @@ pub struct RestirInputs<'a> {
     pub motion: Option<&'a wgpu::TextureView>,
     /// Packed cascades from DDGI, with STORAGE usage.
     pub ddgi_packed: Option<&'a wgpu::Buffer>,
+    /// Optional world-space SHaRC cache for unbounded multi-bounce GI lookup & deposit.
+    pub sharc: Option<&'a SharcCache>,
 }
 
 #[repr(C)]
@@ -227,10 +358,98 @@ impl Pass {
     }
 }
 
+struct SharcAuxPipelines {
+    bounce_bgl: wgpu::BindGroupLayout,
+    bounce_pipe: wgpu::ComputePipeline,
+    deposit_bgl: wgpu::BindGroupLayout,
+    deposit_pipe: wgpu::ComputePipeline,
+}
+
+impl SharcAuxPipelines {
+    fn new(device: &wgpu::Device, native_depth: bool) -> Self {
+        let mut body = RESTIR_SHARC_WGSL.to_string();
+        if native_depth {
+            body = body
+                .replace("var depth_tex: texture_2d<f32>;", "var depth_tex: texture_depth_2d;")
+                .replace("textureLoad(depth_tex, g_px, 0).x", "textureLoad(depth_tex, g_px, 0)");
+        }
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("restir sharc"),
+            source: wgpu::ShaderSource::Wgsl(format!("{SHARC_COMMON_WGSL}\n{body}").into()),
+        });
+        let buf = |binding, ty| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let tex = |binding, depth| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: if depth {
+                    wgpu::TextureSampleType::Depth
+                } else {
+                    wgpu::TextureSampleType::Float { filterable: false }
+                },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let bounce_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("restir_gi_sharc_bounce"),
+            entries: &[
+                buf(0, wgpu::BufferBindingType::Uniform),
+                tex(1, native_depth),
+                tex(2, false),
+                buf(3, wgpu::BufferBindingType::Storage { read_only: false }),
+                buf(4, wgpu::BufferBindingType::Uniform),
+                buf(5, wgpu::BufferBindingType::Storage { read_only: false }),
+                buf(7, wgpu::BufferBindingType::Storage { read_only: true }),
+            ],
+        });
+        let deposit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("restir_gi_sharc_deposit"),
+            entries: &[
+                buf(0, wgpu::BufferBindingType::Uniform),
+                tex(1, native_depth),
+                tex(2, false),
+                buf(4, wgpu::BufferBindingType::Uniform),
+                buf(5, wgpu::BufferBindingType::Storage { read_only: false }),
+                buf(6, wgpu::BufferBindingType::Storage { read_only: false }),
+                tex(8, false),
+            ],
+        });
+        let make = |label, layout: &wgpu::BindGroupLayout| {
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(layout)],
+                immediate_size: 0,
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some(label),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        Self {
+            bounce_pipe: make("restir_gi_sharc_bounce", &bounce_bgl),
+            deposit_pipe: make("restir_gi_sharc_deposit", &deposit_bgl),
+            bounce_bgl,
+            deposit_bgl,
+        }
+    }
+}
+
 struct Pipelines {
     module: wgpu::ShaderModule,
     di: Option<[Pass; 3]>,
     gi: Option<[Pass; 3]>,
+    sharc_aux: Option<SharcAuxPipelines>,
     geometry: Pass,
 }
 
@@ -256,10 +475,10 @@ impl Pipelines {
         });
         let geometry =
             Pass::new(device, &module, "restir_store_geometry", &[0, 5, 6, 12, 16, 20], hardware, native_depth);
-        Self { module, di: None, gi: None, geometry }
+        Self { module, di: None, gi: None, sharc_aux: None, geometry }
     }
 
-    fn prepare(&mut self, device: &wgpu::Device, hardware: bool, native_depth: bool, di: bool, gi: bool) {
+    fn prepare(&mut self, device: &wgpu::Device, hardware: bool, native_depth: bool, di: bool, gi: bool, sharc: bool) {
         let make = |entry, bindings| Pass::new(device, &self.module, entry, bindings, hardware, native_depth);
         if di && self.di.is_none() {
             self.di = Some([
@@ -274,6 +493,9 @@ impl Pipelines {
                 make("restir_gi_temporal", &[0, 5, 6, 8, 11, 17, 18, 19]),
                 make("restir_gi_spatial", &[0, 1, 2, 3, 4, 5, 6, 17, 20]),
             ]);
+        }
+        if gi && sharc && self.sharc_aux.is_none() {
+            self.sharc_aux = Some(SharcAuxPipelines::new(device, native_depth));
         }
     }
 }
@@ -453,7 +675,7 @@ impl RestirRenderer {
             .pipelines
             .entry((hardware, native_depth))
             .or_insert_with(|| Pipelines::new(device, hardware, native_depth));
-        pipelines.prepare(device, hardware, native_depth, params.enable_di, params.enable_gi);
+        pipelines.prepare(device, hardware, native_depth, params.enable_di, params.enable_gi, inputs.sharc.is_some());
         let prev = frame.previous;
         let next = 1 - prev;
         let view = |view| Some(wgpu::BindingResource::TextureView(view));
@@ -515,12 +737,65 @@ impl RestirRenderer {
             let [initial, temporal, spatial] = pipelines.gi.as_ref().unwrap();
             resources[19] = Some(buffer_binding(&buffers.scratch));
             initial.dispatch(device, encoder, &resources, size);
+            if let (Some(sharc), Some(aux)) = (inputs.sharc, pipelines.sharc_aux.as_ref()) {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("restir_gi_sharc_bounce"),
+                    layout: &aux.bounce_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(inputs.depth) },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(inputs.normal_roughness),
+                        },
+                        wgpu::BindGroupEntry { binding: 3, resource: buffers.scratch.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: sharc.uniform_buffer().as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: sharc.keys_buffer().as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 7, resource: sharc.resolved_buffer().as_entire_binding() },
+                    ],
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("restir_gi_sharc_bounce"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&aux.bounce_pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
+            }
             resources[17] = Some(buffer_binding(&buffers.scratch));
             resources[18] = Some(buffer_binding(&buffers.history[prev]));
             resources[19] = Some(buffer_binding(&buffers.history[next]));
             temporal.dispatch(device, encoder, &resources, size);
             resources[17] = Some(buffer_binding(&buffers.history[next]));
             spatial.dispatch(device, encoder, &resources, size);
+            if let (Some(sharc), Some(aux)) = (inputs.sharc, pipelines.sharc_aux.as_ref()) {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("restir_gi_sharc_deposit"),
+                    layout: &aux.deposit_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(inputs.depth) },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(inputs.normal_roughness),
+                        },
+                        wgpu::BindGroupEntry { binding: 4, resource: sharc.uniform_buffer().as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: sharc.keys_buffer().as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 6, resource: sharc.accum_buffer().as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(&frame.gi.view),
+                        },
+                    ],
+                });
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("restir_gi_sharc_deposit"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&aux.deposit_pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
+            }
         }
         pipelines.geometry.dispatch(device, encoder, &resources, size);
         frame.previous = next;
@@ -679,6 +954,7 @@ mod tests {
                 albedo_metallic: &self.albedo,
                 motion: motion.then_some(&self.motion),
                 ddgi_packed: None,
+                sharc: None,
             }
         }
     }

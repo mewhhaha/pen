@@ -56,6 +56,7 @@ const key_3: U32 = 51
 const key_4: U32 = 52
 const key_5: U32 = 53
 const key_6: U32 = 54
+const key_7: U32 = 55
 
 const env_water_ext_tag: U32 = 65002
 const env_foliage_ext_tag: U32 = 65003
@@ -123,6 +124,7 @@ type World is data = $World {
   oit: Bool,
   upscale: Bool,
   outdoor_env: Bool,
+  night_lights: Bool,
   spawn_seq: U32,
   chime_pending: Bool,
   scene_save_pending: Bool,
@@ -190,6 +192,7 @@ func create () : World =>
     oit: true,
     upscale: false,
     outdoor_env: true,
+    night_lights: false,
     spawn_seq: 0,
     chime_pending: false,
     scene_save_pending: false,
@@ -291,6 +294,8 @@ func apply_event (world: own World) -> (event: events.Event) : World =>
         world.upscale := not world.upscale
       if code == key_6:
         world.outdoor_env := not world.outdoor_env
+      if code == key_7:
+        world.night_lights := not world.night_lights
       // Node authoring: N = spawn, D = duplicate, F = spawn prefab, Delete/Backspace = delete.
       if code == keys.n and not world.editor_state.playing:
         let new_id = editor.next_free_id (&world.nodes[0..world.nodes.length])
@@ -540,6 +545,7 @@ const lbl_gi: #[U32] = #[51, 58, 71, 73] // 3:GI
 const lbl_oit: #[U32] = #[52, 58, 79, 73, 84] // 4:OIT
 const lbl_up: #[U32] = #[53, 58, 85, 80] // 5:UP
 const lbl_env: #[U32] = #[54, 58, 69, 78, 86] // 6:ENV
+const lbl_night: #[U32] = #[55, 58, 54, 52, 76] // 7:64L
 const lbl_scene: #[U32] = #[83, 67, 69, 78, 69] // SCENE
 const lbl_node: #[U32] = #[78, 79, 68, 69, 32] // NODE
 const lbl_sel: #[U32] = #[83, 69, 76, 58] // SEL:
@@ -561,7 +567,7 @@ func emit_hud_sprites (world: World) -> (resolved: &[scene_graph.WorldNode]) -> 
   let pill_play = if world.editor_state.playing then math.vec4 0.16 0.68 0.34 0.95 else math.vec4 0.76 0.48 0.12 0.95
 
   // Top toolbar strip
-  let top_w = max 440.0 (world.width - 20.0)
+  let top_w = max 492.0 (world.width - 20.0)
   frame := push_panel 10.0 8.0 top_w 32.0 panel_bg 6.0 0.6 self
 
   // Mode badge (MOVE / ROT / SCALE)
@@ -600,6 +606,9 @@ func emit_hud_sprites (world: World) -> (resolved: &[scene_graph.WorldNode]) -> 
 
   frame := push_panel 386.0 13.0 50.0 22.0 (if world.outdoor_env then pill_on else pill_off) 4.0 0.4 self
   frame := push_text (&lbl_env[0..5]) 391.0 18.0 1.1 text_hi self
+
+  frame := push_panel 440.0 13.0 50.0 22.0 (if world.night_lights then pill_on else pill_off) 4.0 0.4 self
+  frame := push_text (&lbl_night[0..5]) 445.0 18.0 1.1 text_hi self
 
   // Left Scene Hierarchy panel (hidden during PLAY)
   if not world.editor_state.playing:
@@ -691,12 +700,20 @@ func populate_frame (world: World) -> (frame: own render.FrameAccess) -> (audio:
   frame.settings[0].taa := true
   frame.settings[0].ssgi := true
   frame.settings[0].render_scale := if world.upscale then 0.65 else 1.0
-  frame.settings[0].lighting := $render.Lighting {
-    clear: math.vec4 0.14 0.24 0.42 1.0,
-    ambient: math.vec3 0.22 0.25 0.32,
-    direction: (math.vec3 (-0.52) (-0.68) (-0.52)).normalized,
-    color: math.vec3 2.4 2.15 1.85,
-  }
+  if world.night_lights:
+    frame.settings[0].lighting := $render.Lighting {
+      clear: math.vec4 0.015 0.025 0.055 1.0,
+      ambient: math.vec3 0.018 0.024 0.042,
+      direction: (math.vec3 (-0.52) (-0.68) (-0.52)).normalized,
+      color: math.vec3 0.09 0.12 0.2,
+    }
+  else:
+    frame.settings[0].lighting := $render.Lighting {
+      clear: math.vec4 0.14 0.24 0.42 1.0,
+      ambient: math.vec3 0.22 0.25 0.32,
+      direction: (math.vec3 (-0.52) (-0.68) (-0.52)).normalized,
+      color: math.vec3 2.4 2.15 1.85,
+    }
   frame.settings[0].clouds := $render.Clouds {
     cover: if world.physical_sky then 0.45 else 0.0,
     drift: math.vec2 (world.time * 0.22) (world.time * 0.11),
@@ -741,13 +758,15 @@ func populate_frame (world: World) -> (frame: own render.FrameAccess) -> (audio:
       })
 
   // LTC rectangular ceiling softbox light + stained-glass cookie spotlight projector.
+  let area_softbox_gain = if world.night_lights then 0.02 else 6.5
+  let area_cookie_gain = if world.night_lights then 0.35 else 10.0
   @storage.push frame.area_lights ($render.AreaLight {
     kind: render.area_light_rect,
     position: math.vec3 0.0 5.4 0.5,
     right: math.right,
     up: math.forward,
     color: math.vec3 1.0 0.88 0.72,
-    intensity: 6.5,
+    intensity: area_softbox_gain,
     width: 3.0,
     height: 1.8,
     range: 18.0,
@@ -760,13 +779,66 @@ func populate_frame (world: World) -> (frame: own render.FrameAccess) -> (audio:
     right: (math.vec3 (-0.5) 0.0 0.866).normalized,
     up: (math.vec3 (-0.43) 0.86 (-0.25)).normalized,
     color: math.vec3 0.85 0.95 1.0,
-    intensity: 10.0,
+    intensity: area_cookie_gain,
     width: 2.2,
     height: 2.2,
     range: 16.0,
     cookie_material: materials.cookie + 1,
     two_sided: false,
   })
+
+  // 64-light dynamic Night Showcase mode (Digit7): 3 dramatic directional clusters of colored
+  // orbiting point lights showcasing Tier-3 ReSTIR DI per-pixel RT shadows + ReSTIR GI + SHaRC.
+  if world.night_lights:
+    for li in 0 .. 64:
+      let fi = U32.to_f32 li
+      let bob = sin (world.time * 1.4 + fi * 0.85) * 0.25
+      let pos = math.vec3 0.0 1.0 0.0
+      let tint = math.vec3 1.0 1.0 1.0
+      let reach = 5.5
+      if li < 24:
+        // Cluster A (24 lights): warm amber/crimson sanctuary lanterns behind & left of monolith
+        // casting long dramatic shadows across the central floor and front pillars.
+        let t = fi / 24.0
+        let ang = 2.15 + t * 1.95 + sin (world.time * 0.4 + fi) * 0.08
+        let (sa, ca) = sin_cos ang
+        let r = 1.65 + U32.to_f32 (li % 3) * 0.55
+        let ly = 0.75 + U32.to_f32 (li % 4) * 0.38 + bob
+        pos := math.vec3 (ca * r) ly (sa * r)
+        tint := if li % 2 == 0 then math.vec3 0.28 0.11 0.02 else math.vec3 0.26 0.05 0.08
+        reach := 6.8
+      else:
+        if li < 44:
+          // Cluster B (20 lights): cool cyan/sapphire arcane orbs on the far right behind stained glass
+          let lf = fi - 24.0
+          let t = lf / 20.0
+          let ang = (-0.95) + t * 1.55 - sin (world.time * 0.35 + lf) * 0.08
+          let (sa, ca) = sin_cos ang
+          let r = 2.6 + U32.to_f32 (li % 3) * 0.6
+          let ly = 0.85 + U32.to_f32 (li % 4) * 0.4 + bob
+          pos := math.vec3 (ca * r) ly (sa * r)
+          tint := if li % 2 == 0 then math.vec3 0.03 0.22 0.32 else math.vec3 0.10 0.12 0.34
+          reach := 6.2
+        else:
+          // Cluster C (20 lights): emerald/violet low perimeter torches around outer pillars & water
+          let lf = fi - 44.0
+          let ang = (lf / 20.0) * 6.2831853 + world.time * 0.12
+          let (sa, ca) = sin_cos ang
+          let r = 4.85 + U32.to_f32 (li % 2) * 0.5
+          let ly = 0.55 + U32.to_f32 (li % 3) * 0.35 + bob
+          pos := math.vec3 (ca * r) ly (sa * r)
+          tint := if li % 2 == 0 then math.vec3 0.04 0.20 0.12 else math.vec3 0.18 0.06 0.24
+          reach := 4.8
+      @storage.push frame.lights ($render.PointLight {
+        position: pos,
+        radius: reach,
+        intensity: tint,
+        direction: math.up,
+        inner: 1.0,
+        outer: (-1.0),
+        shadow: false,
+        id: li + 1,
+      })
 
   // Deferred PBR floor emblem decal (albedo + normal + ORM + cyan glow).
   @storage.push frame.pbr_decals ($render.PbrDecal {
@@ -864,6 +936,7 @@ func save (world: World) : #[F32] =>
     if world.oit then 1.0 else 0.0,
     if world.upscale then 1.0 else 0.0,
     if world.outdoor_env then 1.0 else 0.0,
+    if world.night_lights then 1.0 else 0.0,
     U32.to_f32 world.spawn_seq,
     sel,
     U32.to_f32 world.editor_state.mode,
@@ -893,7 +966,7 @@ func save (world: World) : #[F32] =>
 
 func restore (lanes_in: &[F32]) : World =>
   let base = create ()
-  if lanes_in.length < 20:
+  if lanes_in.length < 21:
     return base
   base.yaw := lanes_in[0]
   base.pitch := lanes_in[1]
@@ -907,17 +980,18 @@ func restore (lanes_in: &[F32]) : World =>
   base.oit := lanes_in[11] >= 0.5
   base.upscale := lanes_in[12] >= 0.5
   base.outdoor_env := lanes_in[13] >= 0.5
-  base.spawn_seq := F32.to_u32 (max 0.0 lanes_in[14])
-  let sel_raw = F32.to_u32 (max 0.0 lanes_in[15])
+  base.night_lights := lanes_in[14] >= 0.5
+  base.spawn_seq := F32.to_u32 (max 0.0 lanes_in[15])
+  let sel_raw = F32.to_u32 (max 0.0 lanes_in[16])
   base.editor_state.selected_id := if sel_raw == 0 then $Nothing else $Some sel_raw
-  base.editor_state.mode := F32.to_u32 (max 0.0 lanes_in[16]) % 3
-  base.editor_state.playing := lanes_in[17] >= 0.5
-  base.terrain_height_sum := lanes_in[18]
-  let count = F32.to_u32 (max 0.0 lanes_in[19])
-  if count > 0 and lanes_in.length >= 20 + count * 16:
+  base.editor_state.mode := F32.to_u32 (max 0.0 lanes_in[17]) % 3
+  base.editor_state.playing := lanes_in[18] >= 0.5
+  base.terrain_height_sum := lanes_in[19]
+  let count = F32.to_u32 (max 0.0 lanes_in[20])
+  if count > 0 and lanes_in.length >= 21 + count * 16:
     let nodes: #[scene_graph.Node] = #[]
     for i in 0 .. count:
-      let o = 20 + i * 16
+      let o = 21 + i * 16
       let p_raw = lanes_in[o + 1]
       let parent = if p_raw < 0.0 then scene_graph.no_parent else F32.to_u32 p_raw
       let local = $transform.Pose3 {
@@ -955,6 +1029,7 @@ type WorldScalars is data = $WorldScalars {
   oit: Bool,
   upscale: Bool,
   outdoor_env: Bool,
+  night_lights: Bool,
   spawn_seq: U32,
   chime_pending: Bool,
   scene_save_pending: Bool,
@@ -986,6 +1061,7 @@ func pack_world_scalars (w: World) : WorldScalars => $WorldScalars {
   oit: w.oit,
   upscale: w.upscale,
   outdoor_env: w.outdoor_env,
+  night_lights: w.night_lights,
   spawn_seq: w.spawn_seq,
   chime_pending: w.chime_pending,
   scene_save_pending: w.scene_save_pending,
@@ -1018,6 +1094,7 @@ func unpack_world (s: WorldScalars) -> (nodes: own #[scene_graph.Node]) -> (hist
     oit: s.oit,
     upscale: s.upscale,
     outdoor_env: s.outdoor_env,
+    night_lights: s.night_lights,
     spawn_seq: s.spawn_seq,
     chime_pending: s.chime_pending,
     scene_save_pending: s.scene_save_pending,

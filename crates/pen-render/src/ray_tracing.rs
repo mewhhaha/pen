@@ -1930,6 +1930,7 @@ pub struct TlasRayTracer {
     uniform: wgpu::Buffer,
     local_lights_buf: wgpu::Buffer,
     ddgi_dummy_buf: wgpu::Buffer,
+    sharc_dummy: crate::sharc::SharcCache,
     gbuf_dummy_tex: (wgpu::Texture, wgpu::TextureView),
     scene: Option<TlasSceneGpu>,
     outputs: Option<RtOutputs>,
@@ -1977,6 +1978,16 @@ impl TlasRayTracer {
             },
             count: None,
         };
+        let sharc_u_entry = wgpu::BindGroupLayoutEntry {
+            binding: 15,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tlas_rt_bgl"),
             entries: &[
@@ -1993,13 +2004,18 @@ impl TlasRayTracer {
                 storage_ro(10),
                 tex_ro(11),
                 tex_ro(12),
+                storage_ro(13),
+                storage_ro(14),
+                sharc_u_entry,
             ],
         });
         let sw_body = TLAS_RAYTRACE_WGSL.replace(
             "// __TLAS_BINDING_1__",
             "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;",
         );
-        let source = format!("{TLAS_TRAVERSAL_WGSL}\n{sw_body}");
+        let sharc_hash = crate::sharc::SHARC_HASH_WGSL;
+        let sharc_ro = crate::sharc::SHARC_QUERY_RO_FN_WGSL;
+        let source = format!("{TLAS_TRAVERSAL_WGSL}\n{sharc_hash}\n{sharc_ro}\n{sw_body}");
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tlas_raytrace"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -2041,13 +2057,16 @@ impl TlasRayTracer {
                     storage_ro(10),
                     tex_ro(11),
                     tex_ro(12),
+                    storage_ro(13),
+                    storage_ro(14),
+                    sharc_u_entry,
                 ],
             });
             let hw_body = TLAS_RAYTRACE_WGSL.replace(
                 "// __TLAS_BINDING_1__",
                 "@group(0) @binding(1) var hw_tlas: acceleration_structure;",
             );
-            let hw_src = format!("{TLAS_TRAVERSAL_HW_WGSL}\n{hw_body}");
+            let hw_src = format!("{TLAS_TRAVERSAL_HW_WGSL}\n{sharc_hash}\n{sharc_ro}\n{hw_body}");
             let hw_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("tlas_raytrace_hw"),
                 source: wgpu::ShaderSource::Wgsl(hw_src.into()),
@@ -2088,6 +2107,7 @@ impl TlasRayTracer {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let sharc_dummy = crate::sharc::SharcCache::new_disabled(device).expect("dummy SHaRC cache");
         let gbuf_dummy_tex = {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("tlas_rt_gbuf_dummy"),
@@ -2112,6 +2132,7 @@ impl TlasRayTracer {
             uniform,
             local_lights_buf,
             ddgi_dummy_buf,
+            sharc_dummy,
             gbuf_dummy_tex,
             scene: None,
             outputs: None,
@@ -2233,6 +2254,38 @@ impl TlasRayTracer {
         use_material_gbuf: bool,
         thin_gbuffer: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
     ) -> Result<()> {
+        self.trace_with_scene_gbuffer_sharc(
+            device,
+            encoder,
+            scene,
+            depth_view,
+            out_size,
+            params,
+            local_lights,
+            ddgi_packed_buf,
+            use_material_gbuf,
+            thin_gbuffer,
+            None,
+        )
+    }
+
+    /// Like [`Self::trace_with_scene_gbuffer`], additionally binding an optional world-space
+    /// [`crate::sharc::SharcCache`] for unbounded multi-bounce diffuse lookup at reflection/GI hits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trace_with_scene_gbuffer_sharc(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &TlasSceneGpu,
+        depth_view: &wgpu::TextureView,
+        out_size: (u32, u32),
+        params: &TlasRayTraceParams,
+        local_lights: &[RtLocalLight],
+        ddgi_packed_buf: Option<&wgpu::Buffer>,
+        use_material_gbuf: bool,
+        thin_gbuffer: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
+        sharc: Option<&crate::sharc::SharcCache>,
+    ) -> Result<()> {
         let max_dim = device.limits().max_texture_dimension_2d;
         ensure!(
             out_size.0 >= 1 && out_size.1 >= 1 && out_size.0 <= max_dim && out_size.1 <= max_dim,
@@ -2313,6 +2366,7 @@ impl TlasRayTracer {
         encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u));
         let out = self.outputs.as_ref().unwrap();
         let ddgi_buf = ddgi_packed_buf.unwrap_or(&self.ddgi_dummy_buf);
+        let sharc_bind = sharc.unwrap_or(&self.sharc_dummy);
         let (gbuf_nr, gbuf_am) = thin_gbuffer.unwrap_or((&self.gbuf_dummy_tex.1, &self.gbuf_dummy_tex.1));
 
         #[allow(unused_mut)]
@@ -2336,6 +2390,9 @@ impl TlasRayTracer {
                     wgpu::BindGroupEntry { binding: 10, resource: ddgi_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(gbuf_nr) },
                     wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(gbuf_am) },
+                    wgpu::BindGroupEntry { binding: 13, resource: sharc_bind.keys_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 14, resource: sharc_bind.resolved_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 15, resource: sharc_bind.uniform_buffer().as_entire_binding() },
                 ],
             });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2365,6 +2422,9 @@ impl TlasRayTracer {
                     wgpu::BindGroupEntry { binding: 10, resource: ddgi_buf.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(gbuf_nr) },
                     wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(gbuf_am) },
+                    wgpu::BindGroupEntry { binding: 13, resource: sharc_bind.keys_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 14, resource: sharc_bind.resolved_buffer().as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 15, resource: sharc_bind.uniform_buffer().as_entire_binding() },
                 ],
             });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

@@ -6,9 +6,29 @@ use std::path::Path;
 
 use pen_runtime::locale::{LocaleService, Locales};
 
-/// Copies the string tables beside `assets` (a checkout's `src/`) into
-/// `into`, beside the bundle's own assets, for a package or bundle to
-/// answer from: `text.json`, and `locales/` when there is one.
+/// Finds the sorted translation tags beside the base table in `root`.
+#[cfg(feature = "compiler")]
+pub fn locale_tags(root: &Path) -> Vec<String> {
+    let Ok(source) = root.canonicalize() else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(root.join("locales")) else { return Vec::new() };
+    let mut tags: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let tag = path.file_stem()?.to_str()?;
+            if tag == "index" || path.extension()? != "json" {
+                return None;
+            }
+            let file = path.canonicalize().ok()?;
+            (file.starts_with(&source) && file.is_file()).then(|| tag.to_owned())
+        })
+        .collect();
+    tags.sort();
+    tags
+}
+
+/// Copies the string tables beside `assets` into `into`, with an index for
+/// browser hosts to discover the translations.
 #[cfg(feature = "compiler")]
 pub fn ship_tables(assets: &Path, into: &Path) -> std::io::Result<()> {
     let Some(root) = assets.parent() else { return Ok(()) };
@@ -16,14 +36,15 @@ pub fn ship_tables(assets: &Path, into: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::copy(root.join("text.json"), into.join("text.json"))?;
-    let Ok(entries) = std::fs::read_dir(root.join("locales")) else { return Ok(()) };
-    std::fs::create_dir_all(into.join("locales"))?;
-    for entry in entries {
-        let path = entry?.path();
-        if path.extension().is_some_and(|extension| extension == "json") {
-            std::fs::copy(&path, into.join("locales").join(path.file_name().unwrap_or_default()))?;
-        }
+    let tags = locale_tags(root);
+    let directory = into.join("locales");
+    std::fs::create_dir_all(&directory)?;
+    for tag in &tags {
+        let file = format!("{tag}.json");
+        std::fs::copy(root.join("locales").join(&file), directory.join(file))?;
     }
+    let index = std::fs::File::create(directory.join("index.json"))?;
+    serde_json::to_writer(index, &tags)?;
     Ok(())
 }
 
@@ -64,6 +85,35 @@ mod tests {
     use pen_runtime::services::{Services, code_points};
 
     use super::*;
+
+    #[cfg(feature = "compiler")]
+    #[test]
+    fn ships_the_base_and_an_index_of_the_copied_translations() {
+        let root = crate::store::scratch("locale-shipping");
+        let source = root.join("src");
+        let site = root.join("site");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&site).unwrap();
+        ship_tables(&source.join("assets"), &site).unwrap();
+        assert!(!site.join("locales").exists());
+
+        std::fs::write(source.join("text.json"), r#"{"title":"Continue"}"#).unwrap();
+        ship_tables(&source.join("assets"), &site).unwrap();
+        assert_eq!(std::fs::read_to_string(site.join("locales/index.json")).unwrap(), "[]");
+
+        std::fs::create_dir_all(source.join("locales/dir.json")).unwrap();
+        std::fs::write(source.join("locales/sv.json"), r#"{"title":"Fortsätt"}"#).unwrap();
+        std::fs::write(source.join("locales/ar.json"), "{}").unwrap();
+        std::fs::write(source.join("locales/index.json"), "[]").unwrap();
+        std::fs::write(source.join("locales/notes.txt"), "notes").unwrap();
+        ship_tables(&source.join("assets"), &site).unwrap();
+        assert_eq!(std::fs::read_to_string(site.join("locales/index.json")).unwrap(), r#"["ar","sv"]"#);
+        let locales = Locales::load(&site.join("text.json"), "en", &site.join("locales")).unwrap();
+        assert_eq!(locales.tags().collect::<Vec<_>>(), ["ar", "sv"]);
+        assert_eq!(locales.select("sv").text("title", None).unwrap().spoken, "Fortsätt");
+        assert_eq!(locales.select("en").text("title", None).unwrap().spoken, "Continue");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn answers_from_the_tables_beside_the_assets() {

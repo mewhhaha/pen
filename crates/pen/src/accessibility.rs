@@ -26,6 +26,7 @@
 mod platform;
 #[cfg(test)]
 mod snapshots;
+pub mod testing;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;

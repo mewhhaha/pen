@@ -18,6 +18,8 @@
 //!   theirs on the GPU, and a packed texture's `exact` and `raw` kinds are
 //!   single on purpose (indices, palettes and data are read, not averaged);
 //!   a block-compressed texture (KTX2) must carry its own.
+//! - **locale**: invalid string tables, unknown translation keys, and
+//!   mismatched placeholders or plural forms.
 //!
 //! A checkout's `pen.json` tunes them under `assets.lints`: the two limits,
 //! `allow` (each lint's globs of asset keys it lets be) and `deny` (lints
@@ -26,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
+use pen_runtime::locale::{Locales, Severity};
 use serde::Deserialize;
 
 use crate::pipeline::matches;
@@ -64,7 +67,7 @@ fn default_file_size() -> u64 {
     16_000_000
 }
 
-const LINTS: [&str; 5] = ["format", "missing", "unused", "oversized", "mips"];
+const LINTS: [&str; 6] = ["format", "missing", "unused", "oversized", "mips", "locale"];
 /// The largest texture side WebGPU promises every adapter loads.
 const WEB_TEXTURE_SIZE: u32 = 8192;
 /// Single-level textures up to this size are not worth a warning.
@@ -116,6 +119,28 @@ pub fn lint(assets: &Path, wasm: &[u8], settings: &Settings) -> Result<Vec<Findi
         let error = error || settings.deny.iter().any(|denied| denied == lint);
         findings.push(Finding { lint, key: key.to_owned(), message, error });
     };
+
+    if let Some(root) = assets.parent() {
+        let base = root.join("text.json");
+        if base.exists() {
+            match Locales::load(&base, "en", &root.join("locales")) {
+                Ok(locales) => {
+                    for problem in locales.check(&|_| true) {
+                        let severity = problem.severity();
+                        if severity != Severity::Information {
+                            let file = if problem.base {
+                                "text.json".into()
+                            } else {
+                                format!("locales/{}.json", problem.table)
+                            };
+                            find("locale", &file, problem.to_string(), severity == Severity::Error);
+                        }
+                    }
+                }
+                Err(error) => find("locale", "text.json", format!("{error:#}"), true),
+            }
+        }
+    }
 
     // What the catalog and the materials name, and which textures meshes draw.
     let mut named: Vec<(String, String)> = Vec::new();
@@ -371,6 +396,48 @@ mod tests {
         let started = std::time::Instant::now();
         let findings = lint(&root.join("assets"), &wasm, &Settings::default()).unwrap();
         eprintln!("{} findings in {:.0} ms", findings.len(), started.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    #[test]
+    fn lints_translation_placeholders_keys_and_invalid_json() {
+        let root = crate::store::scratch("asset-lint-locale");
+        let assets = root.join("assets");
+        let base = root.join("text.json");
+        let sv = root.join("locales/sv.json");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::create_dir_all(root.join("locales")).unwrap();
+        std::fs::write(&base, r#"{"greeting":"Hello {name}","credits":"Credits"}"#).unwrap();
+        std::fs::write(&sv, r#"{"greeting":"Hej {guest}","surprise":"Hej"}"#).unwrap();
+
+        let findings = lint(&assets, b"", &Settings::default()).unwrap();
+        assert_eq!(findings.len(), 3, "{findings:#?}");
+        for (message, error) in [("has {guest}", true), ("lacks {name}", false), ("no such key", true)] {
+            assert!(
+                findings.iter().any(|finding| {
+                    finding.lint == "locale"
+                        && finding.key == "locales/sv.json"
+                        && finding.error == error
+                        && finding.message.contains(message)
+                }),
+                "{findings:#?}"
+            );
+        }
+        let denied = Settings { deny: vec!["locale".into()], ..Settings::default() };
+        assert!(lint(&assets, b"", &denied).unwrap().iter().all(|finding| finding.error));
+
+        for malformed in [&sv, &base] {
+            std::fs::write(malformed, "{").unwrap();
+            let findings = lint(&assets, b"", &Settings::default()).unwrap();
+            let [finding] = findings.as_slice() else { panic!("{findings:#?}") };
+            assert_eq!(finding.lint, "locale");
+            assert!(
+                finding.error
+                    && finding.message.contains(&*malformed.to_string_lossy())
+                    && finding.message.contains("not JSON"),
+                "{finding:?}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

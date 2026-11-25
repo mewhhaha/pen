@@ -231,6 +231,8 @@ pub struct Options {
     pub assets: String,
     /// The captions the game's sounds carry (the assets' captions.json).
     pub captions: pen_runtime::captions::Captions,
+    /// The base string table and translations, when the game supplies them.
+    pub locales: Option<pen_runtime::locale::Locales>,
     /// The game's name, which the files it hands the player are named after.
     pub name: String,
     /// Where the page's link has a recording to play (`replay::linked`).
@@ -250,6 +252,7 @@ pub struct Browser {
     captions: pen_runtime::captions::Shared,
     tools: Option<Tools>,
     services: Services,
+    has_locales: bool,
     kernels: Option<crate::kernels::WebKernelService>,
     preferences: Preferences,
     /// The game's actions, which live frames' events move.
@@ -324,8 +327,12 @@ impl Browser {
         }
         let hooks = options.qualify.then(|| Hooks::new(screen.canvas.element.clone()));
         let captions = options.captions.shared();
-        let mut services = crate::services::standard();
         services.register(Box::new(pen_runtime::captions::CaptionsService(captions.clone())));
+        let accessibility = Accessibility::new(input.clone())?;
+        let has_locales = options.locales.is_some();
+        if let Some(locales) = options.locales {
+            accessibility.set_rtl(crate::services::register_locale(&mut services, locales))?;
+        }
         let kernels = game_wasm.as_deref().and_then(crate::kernels::WebKernelService::maybe_new);
         let netplay = options.netplay;
         game.hash_packets(options.qualify);
@@ -334,11 +341,12 @@ impl Browser {
             catalog: game.catalog().clone(),
             game,
             screen,
-            accessibility: Accessibility::new(input.clone())?,
+            accessibility,
             input,
             audio,
             tools,
             services,
+            has_locales,
             kernels,
             captions,
             events: preferences.events().collect(),
@@ -1051,6 +1059,27 @@ impl Browser {
     /// A new build from `pen web`, taken while the game is idle.
     async fn reload(&mut self, update: Update) {
         self.state_adapter = crate::load_state_adapter(&self.assets).await;
+        let direction = match crate::load_locales().await {
+            Ok(Some(locales)) => {
+                self.has_locales = true;
+                Some(crate::services::register_locale(&mut self.services, locales))
+            }
+            Ok(None) if self.has_locales => {
+                self.has_locales = false;
+                self.services.register(Box::new(pen_runtime::services::Unavailable(pen_protocol::service::LOCALE)));
+                Some(false)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                say(&mut self.log, log_source::RELOAD, true, format!("the game's string tables: {error:#}"));
+                None
+            }
+        };
+        if let Some(rtl) = direction
+            && let Err(error) = self.accessibility.set_rtl(rtl)
+        {
+            say(&mut self.log, log_source::RELOAD, true, format!("interface direction: {error:#}"));
+        }
         let catalog = update.catalog.unwrap_or_else(|| self.catalog.clone());
         if let Some(module) = update.game {
             let kernel_bytes = module.clone();

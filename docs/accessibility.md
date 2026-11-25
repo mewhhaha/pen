@@ -10,7 +10,14 @@ declares and how hosts show it to assistive technology; this is the rest.
 The game's interface reaches assistive technology through AccessKit: AT-SPI on
 Linux, UI Automation on Windows, NSAccessibility on macOS
 (`crates/pen/src/accessibility.rs`), and the browser's DOM mirror
-(`crates/pen-web/src/accessibility.rs`).
+(`crates/pen-web/src/accessibility.rs`), which mirrors roles (including
+`listbox`/`option` promotion), `aria-label`, `aria-description`,
+`aria-valuetext`, `aria-checked`, `aria-expanded`, `aria-selected`,
+`aria-disabled`, `aria-modal`, `aria-live` (`polite` and `assertive`), range
+values on sliders/spinbuttons/progressbars, reading direction (`dir="rtl"` /
+`dir="ltr"`), focus preservation across DOM updates, and assistive-technology
+action dispatch (`focus`, `blur`, `click`/`activate`/`expand`/`collapse`, and
+`keydown` `increment`/`decrement`).
 
 **Headless, on Linux, a screen reader's view is tested for real.**
 `PEN_A11Y_ATSPI=1` puts a headless run's tree on the AT-SPI bus with an adapter
@@ -48,6 +55,21 @@ without a GPU through the editor, the pause menu and the settings' Accessibility
 page, and compares the tree as AccessKit gets it, and the audit's findings, with
 `crates/pen/tests/a11y/*.txt`. A change to the game's interface shows as a diff;
 `PEN_UPDATE_A11Y=1` writes the files.
+
+**Testing Library-style role queries.** Both Rust and Blot tests can query and
+drive interfaces strictly by ARIA role and accessible name:
+- In Rust (`pen_runtime::role_testing` for `&[UiNode]` frames, and
+  `pen::accessibility::testing::SessionTester` for live headless `Session`s):
+  `screen.by_role("button").name("Play").get()`, `query_by_role`, `get_all_by_role`,
+  `get_by_label_text`, `within(container_id)`, state filters (`checked`,
+  `checked_state`, `selected`, `expanded`, `disabled`, `focused`, `value_text`),
+  `listbox`/`option` promotion, active modal trapping, action builders
+  (`click`, `focus`, `blur`, `increment`, `decrement`, `set_value`, `expand`,
+  `collapse`), and `assert_audit_clean()`, with formatted accessible tree dumps
+  on `NotFound` / `MultipleMatches`.
+- In pure Blot (`ink/ui/testing`): matching `by_role`, `get_by_role`,
+  `query_by_role`, `within`, `user_click_role`, `user_expand`, `user_set_value`,
+  `user_type`, and `audit_tree` for host-independent `pen test-blot` suites.
 
 ## The engine's preferences
 
@@ -99,8 +121,15 @@ The game's words come from string tables (`pen_runtime::locale`): the game's
 each of CLDR's plural categories, chosen by the language's cardinal rules for a
 count (CLDR 47; when written they were checked against ICU's, through Node's
 Intl.PluralRules, on 51,414 sample counts across 82 languages), with `{count}`
-filled in as the language writes numbers. The host chooses a table by BCP 47
-lookup for `PEN_LOCALE`, else the system's locale.
+filled in as the language writes numbers. The host chooses a table by BCP 47 lookup for `PEN_LOCALE` natively (or `?lang=`
+and `navigator.language` in the browser), else the system's locale, and supports
+runtime language switching via `LocaleService::set_tag`. Named and positional
+placeholders (`{player}`, `{0}`) format safely in a single pass via
+`Locale::text_with_args` and `format_args` before BiDi reordering and Arabic
+shaping. `pen build --web` and `pen web` ship and serve `text.json`,
+`locales/*.json`, and a generated `locales/index.json` discovery manifest (with
+hot reload in `pen web`), and `pen check` lints `src/text.json` and
+`src/locales/*.json` automatically via `Locales::check` under the `locale` lint.
 
 The game's glyph drawer draws code points left to right, one after another, from
 an SDF atlas: it cannot shape or reorder text. So the `locale` service answers
@@ -124,15 +153,12 @@ each font's own baseline.
 editor toolbar once (`text.locale_keys`), keeps them in its state, and shows its
 own until they come; it draws the drawn text and names its nodes with the read
 text; the HUD's gnorp count is said in the language's plural form, asked again
-as it changes. It ships English, Swedish, Russian and Arabic. Packages and
-bundles carry the tables beside their assets.
+as it changes. It ships English, Swedish, Russian and Arabic. Packages, bundles,
+and browser exports carry the tables beside their assets.
 
-Not yet: the browser host has no locale service (its game shows its own words);
-right-to-left layouts are not mirrored (ink's menus lay rows out left to right,
-so Arabic labels read correctly but sit on the left); text the game composes
-from several pieces (the editor's "1 of 6") is laid out piece by piece; speech
-bubbles, the build bar, the tutorial and the dev tools are not translated; and
-the translations are a developer's, unreviewed.
+Not yet: speech bubbles, the build bar, the tutorial and the dev tools in gdev
+are not yet translated into all locales, and the sample translations are a
+developer's, unreviewed.
 
 ## The audit
 

@@ -965,6 +965,7 @@ pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: b
     let staging = crate::staging::Staging::new(&project.root, out)?;
     let site = &staging.directory;
     let PreparedGame { assets, .. } = prepare_game(&GameSource::Checkout(project), site, optimize)?;
+    crate::services::locale::ship_tables(&project.assets(), site)?;
     project.compile_devtools(site)?;
     if site.join("devtools.wasm").is_file() {
         shipping_wasm(&site.join("devtools.wasm"), optimize)?;

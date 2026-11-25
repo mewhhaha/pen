@@ -76,6 +76,19 @@ impl Locales {
         Locales { base, base_language: base_language.to_owned(), tables }
     }
 
+    /// Parses the base table and translations from JSON held in memory.
+    pub fn from_json(base_json: &str, base_language: &str, translations: &[(&str, &str)]) -> anyhow::Result<Locales> {
+        let base = Table::parse(base_json).context("text.json")?;
+        let tables = translations
+            .iter()
+            .map(|&(tag, json)| {
+                let table = Table::parse(json).with_context(|| format!("locales/{tag}.json"))?;
+                Ok((tag.to_owned(), table))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Locales::new(base, base_language, tables))
+    }
+
     /// Reads the base table from `base` (the game's `text.json`), in
     /// `language`, and a translation from each `*.json` in `directory`, its
     /// file name its tag (`sv.json`, `pt-BR.json`). Without the directory
@@ -96,7 +109,11 @@ impl Locales {
         let mut tables = Vec::new();
         for entry in entries {
             let path = entry.with_context(|| format!("reading {}", directory.display()))?.path();
-            if path.extension().is_none_or(|extension| extension != "json") {
+            // Exported sites reserve index.json for translation discovery.
+            if path.extension().is_none_or(|extension| extension != "json")
+                || path.file_name().is_some_and(|name| name == "index.json")
+                || path.is_dir()
+            {
                 continue;
             }
             if let Some(tag) = path.file_stem().and_then(|stem| stem.to_str()) {
@@ -201,6 +218,38 @@ pub fn right_to_left(tag: &str) -> bool {
     matches!(language.as_str(), "ar" | "fa" | "he" | "iw" | "ur" | "ps" | "yi" | "dv" | "ug" | "ckb" | "sd")
 }
 
+/// Substitutes named or positional placeholders, copying argument values verbatim.
+/// Unknown placeholders and an unfinished placeholder stay as written.
+pub fn format_args(template: &str, args: &[(&str, &str)]) -> String {
+    substitute(template, args, None)
+}
+
+fn substitute(template: &str, args: &[(&str, &str)], count: Option<&str>) -> String {
+    if args.is_empty() && count.is_none() {
+        return template.to_owned();
+    }
+    let mut text = String::with_capacity(template.len());
+    let mut open = None;
+    let mut copied = 0;
+    for (index, brace) in template.match_indices(['{', '}']) {
+        if brace == "{" {
+            open = Some(index);
+        } else if let Some(start) = open.take() {
+            let name = &template[start + 1..index];
+            let value = count
+                .filter(|_| name == "count")
+                .or_else(|| args.iter().find_map(|&(key, value)| (key == name).then_some(value)));
+            if let Some(value) = value {
+                text.push_str(&template[copied..start]);
+                text.push_str(value);
+                copied = index + 1;
+            }
+        }
+    }
+    text.push_str(&template[copied..]);
+    text
+}
+
 /// A language chosen from [`Locales`]: a translation, or the base.
 #[derive(Clone, Copy, Debug)]
 pub struct Locale<'a> {
@@ -230,13 +279,20 @@ impl<'a> Locale<'a> {
     /// `{count}` filled in, both by the language of the table the string
     /// came from; without one, the `other` form as written.
     pub fn text(&self, key: &str, count: Option<f64>) -> Option<Shown> {
+        self.text_with_args(key, count, &[])
+    }
+
+    /// Resolves the string and formats its arguments before shaping it.
+    /// A supplied count takes precedence over a `count` argument.
+    pub fn text_with_args(&self, key: &str, count: Option<f64>, args: &[(&str, &str)]) -> Option<Shown> {
         let (entry, language) = match self.table.and_then(|table| table.get(key)) {
             Some(entry) => (entry, self.tag),
             None => (self.locales.base.get(key)?, self.locales.base_language.as_str()),
         };
+        let template = entry.form(count.map_or(OTHER, |count| plural(language, count)));
         let text = match count {
-            Some(count) => entry.form(plural(language, count)).replace("{count}", &count_text(language, count)),
-            None => entry.form(OTHER).to_owned(),
+            Some(count) => substitute(template, args, Some(&count_text(language, count))),
+            None => format_args(template, args),
         };
         let (shown, right_to_left) = display(&text);
         Some(Shown { text: shown, right_to_left, spoken: text })
@@ -339,6 +395,20 @@ impl LocaleService {
         LocaleService { locales, wanted: wanted.to_owned() }
     }
 
+    /// Changes the requested language for subsequent answers.
+    pub fn set_tag(&mut self, tag: &str) {
+        tag.clone_into(&mut self.wanted);
+    }
+
+    pub fn wanted(&self) -> &str {
+        &self.wanted
+    }
+
+    /// The base language followed by the loaded translation tags.
+    pub fn available_tags(&self) -> Vec<&str> {
+        std::iter::once(self.locales.base_language.as_str()).chain(self.locales.tags()).collect()
+    }
+
     /// The language it answers in.
     pub fn locale(&self) -> Locale<'_> {
         self.locales.select(&self.wanted)
@@ -381,6 +451,66 @@ mod tests {
     use crate::services::{code_points, text};
     use pen_protocol::plural_category::{FEW, MANY, ONE};
     use pen_protocol::service_status;
+
+    #[test]
+    fn parses_in_memory_tables_with_their_language_and_tag() {
+        let base = r#"{"title":"Pausa","settings":"Inställningar"}"#;
+        let locales = Locales::from_json(base, "sv", &[("fr", r#"{"title":"Pause"}"#), ("ar", "{}")]).unwrap();
+        assert_eq!(locales.tags().collect::<Vec<_>>(), ["ar", "fr"]);
+        assert_eq!(locales.select("de").tag(), "sv");
+        assert_eq!(locales.select("fr-CA").text("title", None).unwrap().spoken, "Pause");
+        assert_eq!(locales.select("fr").text("settings", None).unwrap().spoken, "Inställningar");
+        assert_eq!(Locales::from_json("{", "sv", &[]).unwrap_err().to_string(), "text.json");
+        assert_eq!(Locales::from_json(base, "sv", &[("de", "[]")]).unwrap_err().to_string(), "locales/de.json");
+    }
+
+    #[test]
+    fn substitutes_named_and_positional_arguments_once() {
+        let args = [("name", "{0}"), ("0", "world"), ("1", ""), ("other", "🌍")];
+        assert_eq!(
+            format_args("Hello {name}, {0}! {1}{other} {missing} {name} {unfinished", &args),
+            "Hello {0}, world! 🌍 {missing} {0} {unfinished"
+        );
+        assert_eq!(format_args("An unclosed { before {0}", &args), "An unclosed { before world");
+        assert_eq!(format_args("Already plain } and {missing}", &[]), "Already plain } and {missing}");
+    }
+
+    #[test]
+    fn formats_count_and_arguments_before_shaping_each_string() {
+        let tables = Locales::from_json(
+            r#"{"coins":{"one":"{0} has {count} coin","other":"{0} has {count} coins"},"name":"{name}"}"#,
+            "en",
+            &[("ar", r#"{"name":"مرحبا {name}"}"#)],
+        )
+        .unwrap();
+        let locale = tables.select("ar");
+        let args = [("0", "{count}"), ("count", "many")];
+        assert_eq!(locale.text_with_args("coins", Some(1.0), &args).unwrap().spoken, "{count} has 1 coin");
+        assert_eq!(locale.text_with_args("coins", Some(2.0), &args).unwrap().spoken, "{count} has 2 coins");
+        assert_eq!(locale.text_with_args("coins", None, &args).unwrap().spoken, "{count} has many coins");
+        assert!(locale.text_with_args("missing", None, &[]).is_none());
+        let shown = locale.text_with_args("name", None, &[("name", "علي")]).unwrap();
+        assert_eq!(shown.spoken, "مرحبا علي");
+        assert_eq!(shown.text, display("مرحبا علي").0);
+        assert_ne!(shown.text, shown.spoken);
+        assert!(shown.right_to_left);
+    }
+
+    #[test]
+    fn switching_the_service_tag_updates_its_answers() {
+        let mut service = LocaleService::new(locales(), "sv-SE");
+        assert_eq!(service.available_tags(), ["en", "ar", "ru", "sv", "zh-Hant"]);
+        assert_eq!(service.wanted(), "sv-SE");
+        assert_eq!(service.locale().text("resume", None).unwrap().spoken, "Fortsätt");
+        service.set_tag("ar");
+        assert_eq!(service.wanted(), "ar");
+        let answer = ask(&mut service, locale_op::LANGUAGE, [0.0; 4], "");
+        assert_eq!(text(&answer.values), "ar");
+        assert_eq!(answer.value, 1.0);
+        service.set_tag("de-DE");
+        assert_eq!(service.locale().tag(), "en");
+        assert_eq!(service.locale().text("resume", None).unwrap().spoken, "Continue");
+    }
 
     fn table(json: &str) -> Table {
         Table::parse(json).unwrap()
@@ -566,6 +696,7 @@ mod tests {
         assert_eq!(missing.tags().count(), 0);
         std::fs::write(directory.join("pt-BR.json"), r#"{"resume": "Continuar"}"#).unwrap();
         std::fs::write(directory.join("sv.json"), r#"{"resume": "Fortsätt"}"#).unwrap();
+        std::fs::write(directory.join("index.json"), r#"["pt-BR","sv"]"#).unwrap();
         std::fs::write(directory.join("notes.txt"), "not a table").unwrap();
         let locales = Locales::load(&root.join("text.json"), "en", &directory).unwrap();
         assert_eq!(locales.tags().collect::<Vec<_>>(), ["pt-BR", "sv"]);

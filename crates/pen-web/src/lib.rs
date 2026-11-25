@@ -71,14 +71,41 @@ use tools::Tools;
 /// Fetches `path`, relative to the page.
 #[cfg(target_arch = "wasm32")]
 pub async fn fetch(path: &str) -> Result<Vec<u8>> {
-    let response: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str(path))
-        .await
-        .map_err(error)?
-        .dyn_into()
-        .map_err(error)?;
+    read_response(path, get_response(path).await?).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_response(path: &str) -> Result<Response> {
+    JsFuture::from(web_sys::window().unwrap().fetch_with_str(path)).await.map_err(error)?.dyn_into().map_err(error)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn read_response(path: &str, response: Response) -> Result<Vec<u8>> {
     anyhow::ensure!(response.ok(), "fetch {path}: HTTP {}", response.status());
     let bytes = JsFuture::from(response.array_buffer().map_err(error)?).await.map_err(error)?;
     Ok(Uint8Array::new(&bytes).to_vec())
+}
+
+/// Loads the game's string tables through the translation index beside the page.
+#[cfg(target_arch = "wasm32")]
+async fn load_locales() -> Result<Option<pen_runtime::locale::Locales>> {
+    use anyhow::Context;
+
+    let response = get_response("text.json").await?;
+    if response.status() == 404 {
+        return Ok(None);
+    }
+    let base = read_response("text.json", response).await?;
+    let base = std::str::from_utf8(&base).context("text.json")?;
+    let tags: Vec<String> =
+        serde_json::from_slice(&fetch("locales/index.json").await?).context("locales/index.json")?;
+    let mut texts = Vec::with_capacity(tags.len());
+    for tag in &tags {
+        let path = format!("locales/{}.json", js_sys::encode_uri_component(tag));
+        texts.push(String::from_utf8(fetch(&path).await?).with_context(|| path)?);
+    }
+    let translations: Vec<_> = tags.iter().zip(&texts).map(|(tag, json)| (tag.as_str(), json.as_str())).collect();
+    Ok(Some(pen_runtime::locale::Locales::from_json(base, "en", &translations)?))
 }
 
 /// Fetches `path`, rejecting responses whose `Content-Length` or payload exceeds `max_bytes`
@@ -218,6 +245,10 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         }),
         Err(_) => Default::default(),
     };
+    let locales = load_locales().await.unwrap_or_else(|error| {
+        web_sys::console::warn_1(&format!("the game's string tables: {error:#}").into());
+        None
+    });
     let relay_config = js_sys::Reflect::get(&options, &"netRelay".into())
         .ok()
         .filter(|v| v.is_object())
@@ -244,6 +275,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         state_adapter: state_adapter.clone(),
         assets: assets.clone(),
         captions,
+        locales,
         netplay: None,
     };
     let mut screen = Screen::new(canvas.clone(), assets.clone()).await.map_err(failed)?;

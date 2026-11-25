@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use pen_protocol::{clipboard_op, service, url_op};
+use pen_runtime::locale::{LocaleService, Locales};
 use pen_runtime::services::{Answer, Platform, Request, Service, Services, Unavailable, openable};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
@@ -37,6 +38,22 @@ pub fn with_preferences(preferences: pen_runtime::engine_preferences::Preference
     let mut services = standard();
     services.register(Box::new(preferences));
     services
+}
+
+/// Installs the current tables and returns the selected language direction.
+pub fn register_locale(services: &mut Services, locales: Locales) -> bool {
+    let window = web_sys::window().unwrap();
+    let wanted = window
+        .location()
+        .search()
+        .ok()
+        .and_then(|search| web_sys::UrlSearchParams::new_with_str(&search).ok())
+        .and_then(|query| query.get("lang"))
+        .unwrap_or_else(|| window.navigator().language().unwrap_or_default());
+    let locale = LocaleService::new(locales, &wanted);
+    let rtl = locale.locale().right_to_left();
+    services.register(Box::new(locale));
+    rtl
 }
 
 /// Opens a web address in a new tab.

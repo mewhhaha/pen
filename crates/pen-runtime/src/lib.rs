@@ -23,6 +23,7 @@ pub mod program;
 pub mod recording;
 pub mod remote;
 pub mod reverb;
+pub mod role_testing;
 pub mod scale;
 pub mod semantic;
 pub mod services;

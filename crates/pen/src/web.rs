@@ -15,6 +15,7 @@ use anyhow::{Context, Result, bail, ensure};
 use notify::{RecursiveMode, Watcher};
 
 use crate::project::Project;
+use crate::services::locale::locale_tags;
 
 /// What the server serves, all canonical paths.
 struct Site {
@@ -27,12 +28,16 @@ struct Site {
 }
 
 impl Site {
+    fn source(&self) -> PathBuf {
+        self.root.join("src")
+    }
+
     fn assets(&self) -> PathBuf {
-        self.root.join("src/assets")
+        self.source().join("assets")
     }
 
     fn scene(&self) -> PathBuf {
-        self.root.join("src/main.scene")
+        self.source().join("main.scene")
     }
 
     /// Whether `host` (a Host header, or an Origin without its scheme) is
@@ -44,14 +49,20 @@ impl Site {
             .any(|name| host.eq_ignore_ascii_case(&format!("{name}:{}", self.port)))
     }
 
-    /// Whether a change to `path` reloads the page: a program's new build,
-    /// or an asset or the scene, but not an editor's or Blender's temporary
-    /// files beside them.
+    /// Whether a changed build, asset, scene or string table reloads the page.
     fn reloads(&self, path: &Path) -> bool {
         if path == self.out.join("game.wasm") || path == self.out.join("devtools.wasm") {
             return true;
         }
-        (path == self.scene() || path.starts_with(self.assets()))
+        let source = self.source();
+        let locales = source.join("locales");
+        let translation =
+            path.parent() == Some(locales.as_path()) && path.extension().is_some_and(|extension| extension == "json");
+        (path == self.scene()
+            || path.starts_with(self.assets())
+            || path == source.join("text.json")
+            || path == locales
+            || translation)
             && path.file_name().is_some_and(|name| !temporary(&name.to_string_lossy()))
     }
 }
@@ -106,9 +117,9 @@ pub fn serve(project: Project, port: Option<u16>) -> Result<()> {
         }
     })?;
     watcher.watch(&site.out, RecursiveMode::NonRecursive)?;
-    watcher.watch(&site.assets(), RecursiveMode::Recursive)?;
-    // The scene, through its directory: a save replaces the file.
-    watcher.watch(&site.root.join("src"), RecursiveMode::NonRecursive)?;
+    // Watch through the containing directory so replacements and a newly
+    // created locales directory are visible.
+    watcher.watch(&site.source(), RecursiveMode::Recursive)?;
     eprintln!("pen web: http://{}/?dev (Ctrl+C to stop)", listener.local_addr()?);
     for socket in listener.incoming() {
         let mut socket = socket?;
@@ -253,7 +264,28 @@ fn route(site: &Site, request: &Request, revision: u64) -> Reply {
     let Ok(relative) = decode_path(&request.path) else {
         return Reply::text("400 Bad Request", "invalid path");
     };
-    let file = if let Ok(asset) = relative.strip_prefix("assets") {
+    let source = site.source();
+    let table = relative == Path::new("text.json");
+    let translations = relative.strip_prefix("locales").ok();
+    if relative == Path::new("locales/index.json") {
+        let base = source.join("text.json").canonicalize();
+        if !base.is_ok_and(|file| file.starts_with(&source) && file.is_file()) {
+            return Reply::text("404 Not Found", "file unavailable");
+        }
+        return Reply {
+            status: "200 OK",
+            content_type: "application/json",
+            body: serde_json::to_vec(&locale_tags(&source)).expect("serializing a list of strings"),
+        };
+    }
+    let file = if table || translations.is_some() {
+        if translations.is_some_and(|file| {
+            file.components().count() != 1 || file.extension().is_none_or(|extension| extension != "json")
+        }) {
+            return Reply::text("404 Not Found", "file unavailable");
+        }
+        source.join(&relative)
+    } else if let Ok(asset) = relative.strip_prefix("assets") {
         site.assets().join(asset)
     } else if relative == Path::new("catalog.json") {
         site.assets().join("catalog.json")
@@ -265,8 +297,10 @@ fn route(site: &Site, request: &Request, revision: u64) -> Reply {
         site.out.join(&relative)
     };
     // Symlinked files must stay inside the served roots.
-    let served =
-        file.canonicalize().ok().filter(|file| file.starts_with(&site.out) || file.starts_with(site.root.join("src")));
+    let served = file
+        .canonicalize()
+        .ok()
+        .filter(|file| file.starts_with(&source) || (!table && translations.is_none() && file.starts_with(&site.out)));
     let Some(body) = served.as_ref().and_then(|file| std::fs::read(file).ok()) else {
         // A game that declares no saved types, as the page asks whatever.
         if relative == Path::new("assets").join(pen_runtime::state::CONFIG_FILE) {
@@ -278,8 +312,12 @@ fn route(site: &Site, request: &Request, revision: u64) -> Reply {
         }
         return Reply::text("404 Not Found", "file unavailable");
     };
-    let content_type = match served.as_ref().and_then(|file| file.extension()).and_then(|extension| extension.to_str())
-    {
+    let extension = if table || translations.is_some() {
+        Some("json")
+    } else {
+        served.as_ref().and_then(|file| file.extension()).and_then(|extension| extension.to_str())
+    };
+    let content_type = match extension {
         Some("html") => "text/html; charset=utf-8",
         Some("js") => "text/javascript",
         Some("wasm") => "application/wasm",
@@ -411,6 +449,41 @@ mod tests {
     }
 
     #[test]
+    fn routes_string_tables_and_discovers_translations() {
+        let site = site("locales");
+        let answer = |path| route(&site, &get(path), 1);
+        let base = site.source().join("text.json");
+        let locales = site.source().join("locales");
+        assert_eq!(answer("/text.json").status, "404 Not Found");
+        assert_eq!(answer("/locales/index.json").status, "404 Not Found");
+
+        let text = r#"{"title":"Continue"}"#;
+        std::fs::write(&base, text).unwrap();
+        assert_eq!(answer("/text.json").body, text.as_bytes());
+        assert_eq!(answer("/locales/index.json").body, b"[]");
+        std::fs::create_dir(&locales).unwrap();
+        std::fs::write(locales.join("sv.json"), r#"{"title":"Fortsätt"}"#).unwrap();
+        std::fs::write(locales.join("ar.json"), "{}").unwrap();
+        std::fs::write(locales.join("notes.txt"), "notes").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(site.root.join("pen.json"), locales.join("escape.json")).unwrap();
+            std::os::unix::fs::symlink(site.out.join("game.wasm"), locales.join("build.json")).unwrap();
+            assert_eq!(answer("/locales/escape.json").status, "404 Not Found");
+            assert_eq!(answer("/locales/build.json").status, "404 Not Found");
+        }
+        let index = answer("/locales/index.json");
+        assert_eq!((index.status, index.content_type), ("200 OK", "application/json"));
+        assert_eq!(index.body, br#"["ar","sv"]"#);
+        let sv = answer("/locales/sv.json");
+        assert_eq!((sv.status, sv.content_type), ("200 OK", "application/json"));
+        assert_eq!(sv.body, r#"{"title":"Fortsätt"}"#.as_bytes());
+        assert_eq!(answer("/locales/notes.txt").status, "404 Not Found");
+        assert_eq!(answer("/locales/%2e%2e/tunables.json").status, "400 Bad Request");
+        std::fs::remove_dir_all(&site.root).unwrap();
+    }
+
+    #[test]
     fn bakes_come_from_the_servers_own_page_as_json() {
         let site = site("bake");
         let tunables = site.root.join("src/tunables.json");
@@ -453,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn the_page_reloads_for_builds_assets_and_the_scene_only() {
+    fn the_page_reloads_for_builds_assets_the_scene_and_string_tables() {
         let site = Site { root: PathBuf::from("/c"), out: PathBuf::from("/c/.pen/web"), port: 8000 };
         for path in [
             "/c/.pen/web/game.wasm",
@@ -461,6 +534,9 @@ mod tests {
             "/c/src/assets/rock.png",
             "/c/src/assets/a/b.json",
             "/c/src/main.scene",
+            "/c/src/text.json",
+            "/c/src/locales",
+            "/c/src/locales/sv.json",
         ] {
             assert!(site.reloads(Path::new(path)), "{path}");
         }
@@ -469,6 +545,10 @@ mod tests {
             "/c/target/debug/pen",
             "/c/node_modules/x/index.js",
             "/c/src/game.blot",
+            "/c/src/.text.json",
+            "/c/src/locales/.sv.json",
+            "/c/src/locales/sv.json~",
+            "/c/src/locales/sub/part.json",
             "/c/models/rock.blend1",
             "/c/src/assets/rock.blend",
             "/c/src/assets/rock.blend1",

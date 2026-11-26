@@ -561,7 +561,8 @@ mod tests {
     use pen_protocol::{Draw, UiNode};
     use pen_render::{
         ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, GPU_PARTICLES_EXT_TAG, JFA_OUTLINE_EXT_TAG,
-        LINES_EXT_TAG, RENDER2D_EXT_TAG, RENDER2D_WORLD_EXT_TAG, perspective_forward_z, perspective_reversed_z,
+        LINES_EXT_TAG, NANITE_EXT_TAG, RENDER2D_EXT_TAG, RENDER2D_WORLD_EXT_TAG, perspective_forward_z,
+        perspective_reversed_z,
     };
     use pen_runtime::reverb::ACOUSTICS_EXT_TAG;
 
@@ -598,9 +599,10 @@ mod tests {
             JFA_OUTLINE_EXT_TAG,
             RENDER2D_EXT_TAG,
             RENDER2D_WORLD_EXT_TAG,
+            NANITE_EXT_TAG,
         ]);
-        assert_eq!(tags.len(), 9);
-        assert_eq!(tags, (65_001..=65_009).collect());
+        assert_eq!(tags.len(), 10);
+        assert_eq!(tags, (65_001..=65_010).collect());
     }
 
     #[test]

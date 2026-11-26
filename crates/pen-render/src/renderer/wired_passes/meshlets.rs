@@ -1,5 +1,5 @@
 use super::super::{GpuAsset, MeshletIndirectSlot, Scratch, Shape, Source, State, hiz, timing};
-use super::{OutlineScenes, PlannedDagDraw, PlannedMeshletDraw, WiredPasses, outlined};
+use super::{DagLodSettings, NANITE_EXT_TAG, OutlineScenes, PlannedDagDraw, PlannedMeshletDraw, WiredPasses, outlined};
 use crate::camera_precision::DepthMode;
 use crate::matrix::{invert, multiply};
 use crate::meshlet_dag::{MeshletDagBatchEntry, MeshletDagCullParams, MeshletDagCuller, MeshletDagTwoPhaseOutput};
@@ -8,6 +8,26 @@ use crate::meshlets::{
 };
 use anyhow::Result;
 use pen_protocol::{Matrix, RenderFrame};
+
+fn resolve_nanite_override(frame: &RenderFrame, defaults: DagLodSettings) -> (bool, bool, f32) {
+    let Some(ext) = frame.extensions.iter().rev().find(|e| e.tag == NANITE_EXT_TAG && !e.values.is_empty()) else {
+        return (true, defaults.enabled, defaults.pixel_error_threshold);
+    };
+    let mode = ext.values[0];
+    if !mode.is_finite() || mode < 0.5 {
+        return (false, false, defaults.pixel_error_threshold);
+    }
+    if mode < 1.5 {
+        return (true, false, defaults.pixel_error_threshold);
+    }
+    let threshold = ext
+        .values
+        .get(1)
+        .copied()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map_or(defaults.pixel_error_threshold, |v| v.clamp(0.25, 16.0));
+    (true, true, threshold)
+}
 
 fn perspective_near_plane(proj: &Matrix, depth_mode: DepthMode) -> Option<f32> {
     if !proj.iter().all(|v| v.is_finite()) || proj[11] >= -0.5 || proj[15].abs() > 0.5 || proj[5].abs() <= 1e-5 {
@@ -55,6 +75,12 @@ impl State {
         self.wired.meshlet_plan.clear();
         self.wired.dag_plan.clear();
 
+        let (allow_meshlets, allow_dag, pixel_error) = resolve_nanite_override(frame, self.wired.dag_lod);
+        self.wired.dag_lod.frame_pixel_error = pixel_error;
+        if !allow_meshlets && !allow_dag {
+            return Ok(());
+        }
+
         let active_vp = multiply(active_proj, &frame.view);
         let planes = frustum_planes_from_vp(&active_vp);
         let eye = invert(&frame.view);
@@ -97,7 +123,7 @@ impl State {
             let det3 = model[0] * (model[5] * model[10] - model[6] * model[9])
                 - model[4] * (model[1] * model[10] - model[2] * model[9])
                 + model[8] * (model[1] * model[6] - model[2] * model[5]);
-            if self.wired.dag_lod.enabled
+            if allow_dag
                 && perspective_near.is_some()
                 && let Some(dag) = &mesh.meshlet_dag
                 && dag.cluster_count > 1
@@ -116,6 +142,9 @@ impl State {
                 });
                 scratch.ready[ready_idx].dag_slot = Some(dag_cursor);
                 dag_cursor += 1;
+                continue;
+            }
+            if !allow_meshlets {
                 continue;
             }
             let Some(ml) = &mesh.meshlets else {
@@ -206,7 +235,7 @@ impl State {
                         proj: *active_proj,
                         viewport_height: viewport_height.max(1.0),
                         near_plane,
-                        pixel_error_threshold: self.wired.dag_lod.pixel_error_threshold,
+                        pixel_error_threshold: self.wired.dag_lod.frame_pixel_error,
                     },
                 });
             }
@@ -380,7 +409,7 @@ impl State {
                         proj: *active_proj,
                         viewport_height: viewport_height.max(1.0),
                         near_plane,
-                        pixel_error_threshold: wired.dag_lod.pixel_error_threshold,
+                        pixel_error_threshold: wired.dag_lod.frame_pixel_error,
                     },
                 });
             }
@@ -413,4 +442,36 @@ fn frustum_planes_from_vp(vp: &Matrix) -> [[f32; 4]; 6] {
         norm(r2),          // Near/Far z >= 0
         norm(sub(r3, r2)), // Far/Near w - z >= 0
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pen_protocol::Extension;
+
+    #[test]
+    fn nanite_extension_overrides_meshlet_and_dag_modes() {
+        let defaults = DagLodSettings::default();
+        let plain = RenderFrame::default();
+        assert_eq!(resolve_nanite_override(&plain, defaults), (true, true, 1.5));
+
+        let off = RenderFrame { extensions: vec![Extension { tag: NANITE_EXT_TAG, values: vec![0.0] }], ..Default::default() };
+        assert_eq!(resolve_nanite_override(&off, defaults), (false, false, 1.5));
+
+        let meshlets_only =
+            RenderFrame { extensions: vec![Extension { tag: NANITE_EXT_TAG, values: vec![1.0] }], ..Default::default() };
+        assert_eq!(resolve_nanite_override(&meshlets_only, defaults), (true, false, 1.5));
+
+        let dag_quality = RenderFrame {
+            extensions: vec![Extension { tag: NANITE_EXT_TAG, values: vec![2.0, 0.75] }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_nanite_override(&dag_quality, defaults), (true, true, 0.75));
+
+        let dag_clamped = RenderFrame {
+            extensions: vec![Extension { tag: NANITE_EXT_TAG, values: vec![2.0, 99.0] }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_nanite_override(&dag_clamped, defaults), (true, true, 16.0));
+    }
 }

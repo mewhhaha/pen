@@ -57,12 +57,18 @@ pub const ENV_WATER_EXT_TAG: u32 = 65_002;
 pub const ENV_FOLIAGE_EXT_TAG: u32 = 65_003;
 // Note: tag 65_004 is reserved by `pen_runtime::reverb::ACOUSTICS_EXT_TAG`.
 /// Built-in optional `RenderFrame::extensions` tags for GPU mesh particles, antialiased lines,
-/// JFA silhouette outlines, vector SDF UI, and full 2D world/GI scenes.
+/// JFA silhouette outlines, vector SDF UI, full 2D world/GI scenes, and Nanite meshlet/DAG LOD control.
 pub const GPU_PARTICLES_EXT_TAG: u32 = 65_005;
 pub const LINES_EXT_TAG: u32 = 65_006;
 pub const JFA_OUTLINE_EXT_TAG: u32 = 65_007;
 pub const RENDER2D_EXT_TAG: u32 = 65_008;
 pub const RENDER2D_WORLD_EXT_TAG: u32 = 65_009;
+/// Per-frame GPU meshlet / Cluster DAG ("Nanite") override:
+/// `[mode]` or `[mode, pixel_error_threshold]`:
+/// - `mode == 0`: Off (bypass GPU meshlet & Cluster DAG culling; draw standard indexed meshes)
+/// - `mode == 1`: Meshlets only (two-phase GPU meshlet culling at full LOD0, no DAG simplification)
+/// - `mode >= 2`: Cluster DAG continuous LOD + two-phase Hi-Z occlusion culling (optional `pixel_error_threshold` in px)
+pub const NANITE_EXT_TAG: u32 = 65_010;
 
 /// CDLOD heightfield terrain descriptor attached to [`EnvironmentScene`].
 pub struct EnvironmentTerrain {
@@ -132,11 +138,12 @@ pub(super) struct PlannedDagDraw {
 pub(super) struct DagLodSettings {
     pub enabled: bool,
     pub pixel_error_threshold: f32,
+    pub frame_pixel_error: f32,
 }
 
 impl Default for DagLodSettings {
     fn default() -> Self {
-        Self { enabled: true, pixel_error_threshold: 1.5 }
+        Self { enabled: true, pixel_error_threshold: 1.5, frame_pixel_error: 1.5 }
     }
 }
 

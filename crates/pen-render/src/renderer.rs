@@ -81,8 +81,8 @@ pub use validate::validate_frame;
 pub use wired_passes::{
     ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentFoliage, EnvironmentScene,
     EnvironmentTerrain, GPU_PARTICLES_EXT_TAG, GpuParticleScene, JFA_OUTLINE_EXT_TAG, JfaOutlineScene,
-    JfaOutlineTarget, LINES_EXT_TAG, LineScene, RENDER2D_EXT_TAG, RENDER2D_WORLD_EXT_TAG, RadianceCascades2dLayer,
-    Scene2d, SpriteLayer2d, TilemapLayer2d,
+    JfaOutlineTarget, LINES_EXT_TAG, LineScene, NANITE_EXT_TAG, RENDER2D_EXT_TAG, RENDER2D_WORLD_EXT_TAG,
+    RadianceCascades2dLayer, Scene2d, SpriteLayer2d, TilemapLayer2d,
 };
 
 pub(crate) fn velocity_sentinel_bytes() -> [u8; 4] {

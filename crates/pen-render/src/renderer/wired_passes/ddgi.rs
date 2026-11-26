@@ -194,15 +194,21 @@ impl State {
                 [0.0; 3]
             };
             #[allow(clippy::cast_possible_truncation, reason = "finite material parameters")]
-            let (mut metallic, mut roughness) = match m.instance_parameters {
-                Some(p) => {
-                    let met = (p[0] as f32).clamp(0.0, 1.0);
-                    let rgh = if p[1] > 0.0 { (p[1] as f32).clamp(0.04, 1.0) } else { 0.5 };
-                    (met, rgh)
+            let pbr_params = super::super::thin_gbuffer::uses_pbr_parameters(m);
+            #[allow(clippy::cast_possible_truncation, reason = "finite material parameters")]
+            let (mut metallic, mut roughness) = if pbr_params {
+                match m.instance_parameters {
+                    Some(p) => {
+                        let met = (p[0] as f32).clamp(0.0, 1.0);
+                        let rgh = if p[1] > 0.0 { (p[1] as f32).clamp(0.04, 1.0) } else { 0.5 };
+                        (met, rgh)
+                    }
+                    None => (0.0, 0.5),
                 }
-                None => (0.0, 0.5),
+            } else {
+                (0.0, 0.85)
             };
-            if let Some(p) = draw_params {
+            if pbr_params && let Some(p) = draw_params {
                 if p[0].is_finite() {
                     metallic = p[0].clamp(0.0, 1.0);
                 }

@@ -60,11 +60,13 @@ fn project(world: vec4f, normal: vec3f, metallic_roughness: vec2f) -> VertexOut 
   let model = mat4x4f(m0, m1, m2, m3);
   var metallic = draw.albedo_metallic.a;
   var roughness = draw.roughness_pad.x;
-  if (finite(parameters.x)) {
-    metallic = clamp(parameters.x, 0.0, 1.0);
-  }
-  if (finite(parameters.y) && parameters.y > 0.0) {
-    roughness = min(clamp(parameters.y, 0.04, 1.0), draw.roughness_pad.y);
+  if (draw.roughness_pad.z > 0.5) {
+    if (finite(parameters.x)) {
+      metallic = clamp(parameters.x, 0.0, 1.0);
+    }
+    if (finite(parameters.y) && parameters.y > 0.0) {
+      roughness = min(clamp(parameters.y, 0.04, 1.0), draw.roughness_pad.y);
+    }
   }
   return project(
     model * vec4f(position, 1.0),

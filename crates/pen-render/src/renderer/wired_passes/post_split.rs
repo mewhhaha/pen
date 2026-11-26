@@ -172,7 +172,10 @@ impl State {
                         .filter(|ext| {
                             matches!(
                                 ext.tag,
-                                super::GPU_PARTICLES_EXT_TAG | super::LINES_EXT_TAG | super::JFA_OUTLINE_EXT_TAG
+                                super::GPU_PARTICLES_EXT_TAG
+                                    | super::LINES_EXT_TAG
+                                    | super::JFA_OUTLINE_EXT_TAG
+                                    | super::NANITE_EXT_TAG
                             )
                         })
                         .cloned(),

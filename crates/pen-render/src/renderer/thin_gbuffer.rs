@@ -88,17 +88,22 @@ impl DrawGbuf {
             model,
             normal_mat,
             albedo_metallic,
-            roughness_pad: [roughness.min(roughness_limit), roughness_limit, 0.0, 0.0],
+            roughness_pad: [roughness.min(roughness_limit), roughness_limit, 1.0, 0.0],
         }
     }
 
     #[allow(clippy::cast_possible_truncation, reason = "same narrowing as the TLAS material constants")]
     fn material(model: Matrix, m: &Material, draw_params: Option<[f32; 4]>) -> Self {
-        let (mut metallic, mut roughness) = match m.instance_parameters {
-            Some(p) => ((p[0] as f32).clamp(0.0, 1.0), if p[1] > 0.0 { (p[1] as f32).clamp(0.04, 1.0) } else { 0.5 }),
-            None => (0.0, 0.5),
+        let pbr_params = uses_pbr_parameters(m);
+        let (mut metallic, mut roughness) = if pbr_params {
+            match m.instance_parameters {
+                Some(p) => ((p[0] as f32).clamp(0.0, 1.0), if p[1] > 0.0 { (p[1] as f32).clamp(0.04, 1.0) } else { 0.5 }),
+                None => (0.0, 0.5),
+            }
+        } else {
+            (0.0, 0.85)
         };
-        if let Some(p) = draw_params {
+        if pbr_params && let Some(p) = draw_params {
             if p[0].is_finite() {
                 metallic = p[0].clamp(0.0, 1.0);
             }
@@ -108,7 +113,7 @@ impl DrawGbuf {
         }
         let roughness_limit =
             if m.surface.clearcoat > 0.0 { m.surface.clearcoat_roughness.clamp(0.04, 0.35) } else { 1.0 };
-        Self::new(
+        let mut out = Self::new(
             model,
             [
                 m.color[0].clamp(0.0, 10.0) as f32,
@@ -118,8 +123,17 @@ impl DrawGbuf {
             ],
             roughness,
             roughness_limit,
-        )
+        );
+        if !pbr_params {
+            out.roughness_pad[2] = 0.0;
+        }
+        out
     }
+}
+
+pub(super) fn uses_pbr_parameters(m: &Material) -> bool {
+    let name = m.shader.rsplit('/').next().unwrap_or(&m.shader);
+    matches!(name, "lit.wgsl" | "standard.wgsl" | "pbr.wgsl")
 }
 
 struct Targets {
@@ -726,5 +740,26 @@ mod tests {
         };
         render_witness(&device, &queue, DepthMode::ForwardZ);
         render_witness(&device, &queue, DepthMode::ReversedZ);
+    }
+
+    #[test]
+    fn custom_shader_parameters_do_not_override_pbr_metallic_roughness() {
+        let lit = crate::asset_store::parse_material(
+            br#"{"shader":"lit.wgsl","color":[1,1,1,1],"lighting":"lit","instanceParameters":[0.0,0.5,0.0,0.0]}"#,
+        )
+        .unwrap();
+        let lit_gbuf = DrawGbuf::material(IDENTITY, &lit, Some([0.9, 0.15, 0.0, 0.0]));
+        assert_eq!(lit_gbuf.albedo_metallic[3], 0.9);
+        assert_eq!(lit_gbuf.roughness_pad[0], 0.15);
+        assert_eq!(lit_gbuf.roughness_pad[2], 1.0);
+
+        let custom = crate::asset_store::parse_material(
+            br#"{"shader":"salt.wgsl","color":[1,1,1,1],"lighting":"lit","instanceParameters":[1.0,0.0,100.0,0.0]}"#,
+        )
+        .unwrap();
+        let custom_gbuf = DrawGbuf::material(IDENTITY, &custom, Some([1.0, 0.0, 100.0, 0.0]));
+        assert_eq!(custom_gbuf.albedo_metallic[3], 0.0);
+        assert_eq!(custom_gbuf.roughness_pad[0], 0.85);
+        assert_eq!(custom_gbuf.roughness_pad[2], 0.0);
     }
 }

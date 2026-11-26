@@ -272,7 +272,6 @@ struct BatchShared {
     mode: BatchMode,
     input: Arc<[u32]>,
     snapshot: Option<Arc<PreparedContextSnapshot>>,
-    fixed_storage: Option<Arc<DisjointStorage>>,
     deadline_at: Option<Instant>,
     cancel_flag: Arc<AtomicBool>,
     state: Mutex<BatchCoord>,
@@ -512,8 +511,13 @@ struct SyncSnapshotJob {
     cvar: Condvar,
 }
 
+struct BatchJob {
+    shared: Arc<BatchShared>,
+    fixed_storage: Option<Arc<DisjointStorage>>,
+}
+
 struct WorkerCommand {
-    batch: Option<Arc<BatchShared>>,
+    batch: Option<BatchJob>,
     sync_snapshot: Option<Arc<SyncSnapshotJob>>,
     shutdown: bool,
     busy: bool,
@@ -789,14 +793,7 @@ impl KernelPool {
         if self.ctx.config.workers == 0 {
             self.run_fixed_direct(input_words, count, snapshot.as_ref(), &storage, deadline_at)?;
         } else {
-            self.run_batch_parallel(
-                BatchMode::Fixed,
-                input_words,
-                count,
-                snapshot,
-                Some(storage.clone()),
-                deadline_at,
-            )?;
+            self.run_batch_parallel(BatchMode::Fixed, input_words, count, snapshot, Some(&storage), deadline_at)?;
         }
 
         if let Some(deadline) = deadline_at
@@ -1100,7 +1097,7 @@ impl KernelPool {
         input_words: &[u32],
         count: usize,
         snapshot: Option<Arc<PreparedContextSnapshot>>,
-        fixed_storage: Option<Arc<DisjointStorage>>,
+        fixed_storage: Option<&Arc<DisjointStorage>>,
         deadline_at: Option<Instant>,
     ) -> std::result::Result<Vec<Vec<u32>>, KernelError> {
         self.ensure_workers()?;
@@ -1109,7 +1106,6 @@ impl KernelPool {
             mode,
             input: Arc::from(input_words),
             snapshot,
-            fixed_storage,
             deadline_at,
             cancel_flag: cancel_flag.clone(),
             state: Mutex::new(BatchCoord::new(
@@ -1129,7 +1125,7 @@ impl KernelPool {
         for slot in &self.workers {
             let (lock, cvar) = &*slot.dispatch;
             let mut cmd = lock.lock().unwrap();
-            cmd.batch = Some(batch.clone());
+            cmd.batch = Some(BatchJob { shared: batch.clone(), fixed_storage: fixed_storage.cloned() });
             cmd.busy = true;
             cvar.notify_one();
         }
@@ -1312,9 +1308,12 @@ fn spawn_worker_thread(
                     *job.result.lock().unwrap() = Some(res);
                     job.cvar.notify_all();
                 }
-                if let Some(batch) = batch {
-                    run_worker_on_batch(&ctx, &mut guest_slot, &batch);
-                }
+                let completed_batch = batch.map(|job| {
+                    run_worker_on_batch(&ctx, &mut guest_slot, &job.shared, job.fixed_storage.as_deref());
+                    // Release the output buffer before the caller can take it back.
+                    drop(job.fixed_storage);
+                    job.shared
+                });
                 let should_exit = {
                     let (lock, cvar) = &*t_dispatch;
                     let mut cmd = lock.lock().unwrap();
@@ -1322,6 +1321,11 @@ fn spawn_worker_thread(
                     cvar.notify_all();
                     cmd.shutdown
                 };
+                if let Some(batch) = completed_batch {
+                    let mut guard = batch.state.lock().unwrap();
+                    guard.active_workers_on_batch -= 1;
+                    batch.cvar.notify_all();
+                }
                 if should_exit {
                     break;
                 }
@@ -1828,7 +1832,12 @@ fn execute_variable_chunk_direct(
     }
 }
 
-fn run_worker_on_batch(ctx: &PoolContext, guest_slot: &mut Option<WorkerGuest>, batch: &Arc<BatchShared>) {
+fn run_worker_on_batch(
+    ctx: &PoolContext,
+    guest_slot: &mut Option<WorkerGuest>,
+    batch: &BatchShared,
+    fixed_storage: Option<&DisjointStorage>,
+) {
     loop {
         let range = {
             let mut guard = batch.state.lock().unwrap();
@@ -1840,18 +1849,15 @@ fn run_worker_on_batch(ctx: &PoolContext, guest_slot: &mut Option<WorkerGuest>, 
                 None => break,
             }
         };
-        execute_chunk_parallel(ctx, guest_slot, batch, range);
+        execute_chunk_parallel(ctx, guest_slot, batch, fixed_storage, range);
     }
-
-    let mut guard = batch.state.lock().unwrap();
-    guard.active_workers_on_batch = guard.active_workers_on_batch.saturating_sub(1);
-    batch.cvar.notify_all();
 }
 
 fn execute_chunk_parallel(
     ctx: &PoolContext,
     guest_slot: &mut Option<WorkerGuest>,
-    batch: &Arc<BatchShared>,
+    batch: &BatchShared,
+    fixed_storage: Option<&DisjointStorage>,
     mut range: WorkRange,
 ) {
     loop {
@@ -1889,7 +1895,7 @@ fn execute_chunk_parallel(
                 if batch.mode == BatchMode::Fixed {
                     let out_stride = ctx.manifest.out_schema.stride as usize;
                     let expected_words = range.len() * out_stride;
-                    let storage = batch.fixed_storage.as_ref().expect("fixed storage");
+                    let storage = fixed_storage.expect("fixed storage");
                     if header as usize != expected_words {
                         *guest_slot = None;
                         ctx.stats.worker_retirements.fetch_add(1, Ordering::Relaxed);

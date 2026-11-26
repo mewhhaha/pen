@@ -147,6 +147,9 @@ pub(crate) struct Material {
     /// Shader data that may vary per instance without splitting a draw batch.
     pub instance_parameters: Option<[f64; 4]>,
     pub color: [f64; 4],
+    /// Optional diffuse bounce RGB tint for GPU ray-tracing TLAS / DDGI probes when the material's
+    /// visual color lives in textures or custom shaders rather than `color`.
+    pub bounce_color: Option<[f64; 3]>,
     /// "lit" rather than "unlit".
     pub lit: bool,
     /// Blend shader-provided coverage even when the material color is opaque.
@@ -1150,6 +1153,17 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
     let emissive_texture = optional_key("emissiveTexture")?;
     let uv_transform = UvTransform::parse(material.get("uvTransform"))?;
     let color = numbers(material.get("color"), "color")?;
+    let bounce_color = match material.get("bounceColor") {
+        None | Some(Value::Null) => None,
+        value => {
+            let rgb = numbers(value, "bounceColor")?;
+            ensure!(
+                rgb.len() == 3 && rgb.iter().all(|&channel| (0.0..=10.0).contains(&channel)),
+                "material bounceColor must be three 0..10 channels"
+            );
+            Some([rgb[0], rgb[1], rgb[2]])
+        }
+    };
     let instance_parameters = match material.get("instanceParameters") {
         None | Some(Value::Null) => None,
         value => {
@@ -1213,6 +1227,7 @@ pub(crate) fn parse_material(bytes: &[u8]) -> Result<Material> {
         indexed,
         instance_parameters,
         color: [color[0], color[1], color[2], color[3]],
+        bounce_color,
         lit,
         blend,
         alpha_cutoff,
@@ -1670,6 +1685,25 @@ mod tests {
         );
         assert_ne!(plain, state(r#","surface":{"ior":1.4}"#, "[0,0,0,0]"));
         assert_ne!(plain, state(r#","surface":{"emissiveStrength":2}"#, "[0,0,0,0]"));
+    }
+
+    #[test]
+    fn bounce_color_parses_optionally_for_gi_albedo() {
+        let plain = parse_material(br#"{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit"}"#).unwrap();
+        assert_eq!(plain.bounce_color, None);
+        let tinted = parse_material(
+            br#"{"shader":"s.wgsl","color":[1,1,1,1],"bounceColor":[0.85,0.45,0.2],"lighting":"lit"}"#,
+        )
+        .unwrap();
+        assert_eq!(tinted.bounce_color, Some([0.85, 0.45, 0.2]));
+        assert!(parse_material(
+            br#"{"shader":"s.wgsl","color":[1,1,1,1],"bounceColor":[1,0],"lighting":"lit"}"#
+        )
+        .is_err());
+        assert!(parse_material(
+            br#"{"shader":"s.wgsl","color":[1,1,1,1],"bounceColor":[-0.1,0,0],"lighting":"lit"}"#
+        )
+        .is_err());
     }
 
     #[test]

@@ -113,12 +113,13 @@ impl DrawGbuf {
         }
         let roughness_limit =
             if m.surface.clearcoat > 0.0 { m.surface.clearcoat_roughness.clamp(0.04, 0.35) } else { 1.0 };
+        let base_rgb = m.bounce_color.unwrap_or([m.color[0], m.color[1], m.color[2]]);
         let mut out = Self::new(
             model,
             [
-                m.color[0].clamp(0.0, 10.0) as f32,
-                m.color[1].clamp(0.0, 10.0) as f32,
-                m.color[2].clamp(0.0, 10.0) as f32,
+                base_rgb[0].clamp(0.0, 10.0) as f32,
+                base_rgb[1].clamp(0.0, 10.0) as f32,
+                base_rgb[2].clamp(0.0, 10.0) as f32,
                 metallic,
             ],
             roughness,

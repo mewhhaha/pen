@@ -179,10 +179,12 @@ impl State {
                 }
             }
             #[allow(clippy::cast_possible_truncation, reason = "clamped finite material color")]
+            let base_rgb = m.bounce_color.unwrap_or([m.color[0], m.color[1], m.color[2]]);
+            #[allow(clippy::cast_possible_truncation, reason = "clamped finite material color")]
             let albedo = [
-                m.color[0].clamp(0.0, 10.0) as f32,
-                m.color[1].clamp(0.0, 10.0) as f32,
-                m.color[2].clamp(0.0, 10.0) as f32,
+                base_rgb[0].clamp(0.0, 10.0) as f32,
+                base_rgb[1].clamp(0.0, 10.0) as f32,
+                base_rgb[2].clamp(0.0, 10.0) as f32,
             ];
             let emissive = if !m.lit {
                 let s = m.surface.emissive_strength.max(1.0);

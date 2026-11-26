@@ -201,12 +201,12 @@ impl Meter {
         splitter.connect_with_audio_node_and_output(&right, 1).map_err(error)?;
         Ok(Meter { left, right })
     }
-    /// The peak and RMS of the samples the analysers hold.
+    /// The peak and RMS of the samples the analysers hold, reusing `samples`.
     #[allow(clippy::cast_possible_truncation, reason = "a level to show")]
-    fn read(&self) -> ([f32; 2], [f32; 2]) {
-        let mut samples = vec![0.0f32; self.left.fft_size() as usize];
+    fn read_into(&self, samples: &mut Vec<f32>) -> ([f32; 2], [f32; 2]) {
+        samples.resize(self.left.fft_size() as usize, 0.0);
         let mut side = |analyser: &AnalyserNode| {
-            analyser.get_float_time_domain_data(&mut samples);
+            analyser.get_float_time_domain_data(samples);
             let peak = samples.iter().fold(0.0f32, |peak, sample| peak.max(sample.abs()));
             let squares: f64 = samples.iter().map(|&sample| f64::from(sample) * f64::from(sample)).sum();
             (peak, (squares / samples.len().max(1) as f64).sqrt() as f32)
@@ -226,6 +226,12 @@ struct BusNodes {
     send_gain: GainNode,
     reverb: GainNode,
     meter: Meter,
+    last_level: Cell<f32>,
+    last_lowpass: Cell<f32>,
+    last_eq: [Cell<f32>; 3],
+    last_comp_thresh: Cell<f32>,
+    last_comp_ratio: Cell<f32>,
+    last_reverb: Cell<f32>,
 }
 struct Playing {
     source: Source,
@@ -238,6 +244,12 @@ struct Playing {
     ended: Rc<RefCell<bool>>,
     leaving: Option<f64>,
     ramp: (f32, f32, f64, f64),
+    last_gain: f32,
+    last_pitch: f32,
+    last_lowpass: f32,
+    last_reverb: f32,
+    last_pan: f32,
+    last_placement: Option<Placement>,
 }
 impl Playing {
     #[allow(clippy::cast_possible_truncation, reason = "a gain")]
@@ -300,6 +312,13 @@ struct PlayingSynth {
     /// Start time of attack/decay schedule so interrupting mid-ADSR computes exact held level.
     started_at: f64,
     leaving: Option<f64>,
+    last_freq: f32,
+    last_detune: f32,
+    last_cutoff: f32,
+    last_q: f32,
+    last_gain: f32,
+    last_pan: f32,
+    last_reverb: f32,
 }
 impl PlayingSynth {
     fn current_env(&self, now: f64) -> f32 {
@@ -352,6 +371,7 @@ pub struct Audio {
     retiring: Vec<Playing>,
     /// The developer's mute and solo.
     monitor: Monitor,
+    meter_scratch: RefCell<Vec<f32>>,
 }
 impl Audio {
     pub fn new(canvas: &HtmlCanvasElement, assets: String) -> Self {
@@ -381,6 +401,7 @@ impl Audio {
             pending_sounds: Vec::new(),
             retiring: Vec::new(),
             monitor: Monitor::default(),
+            meter_scratch: RefCell::new(Vec::new()),
         };
         match audio.setup() {
             Ok(()) => {}
@@ -445,6 +466,7 @@ impl Audio {
         let send = filter(&context, AUDIO_OPEN as f32)?;
         send.connect_with_audio_node(&input).map_err(error)?;
         let meter = Meter::new(&context, &output)?;
+        let nyquist = context.sample_rate() / 2.0;
         self.master = Some(BusNodes {
             dry,
             eq_low,
@@ -456,6 +478,12 @@ impl Audio {
             send_gain: output,
             reverb: return_gain.clone(),
             meter,
+            last_level: Cell::new(1.0),
+            last_lowpass: Cell::new((AUDIO_OPEN as f32).min(nyquist)),
+            last_eq: [Cell::new(0.0), Cell::new(0.0), Cell::new(0.0)],
+            last_comp_thresh: Cell::new(0.0),
+            last_comp_ratio: Cell::new(1.0),
+            last_reverb: Cell::new(1.0),
         });
         self.reverb_in = Some(input);
         self.reverb_convolver = Some(convolver);
@@ -505,6 +533,7 @@ impl Audio {
             send.connect_with_audio_node(&send_gain).map_err(error)?;
             send_gain.connect_with_audio_node(self.reverb_in.as_ref().unwrap()).map_err(error)?;
             let meter = Meter::new(context, &level)?;
+            let nyquist = context.sample_rate() / 2.0;
             self.buses.push(BusNodes {
                 dry,
                 eq_low,
@@ -516,6 +545,12 @@ impl Audio {
                 send_gain,
                 reverb,
                 meter,
+                last_level: Cell::new(1.0),
+                last_lowpass: Cell::new((AUDIO_OPEN as f32).min(nyquist)),
+                last_eq: [Cell::new(0.0), Cell::new(0.0), Cell::new(0.0)],
+                last_comp_thresh: Cell::new(0.0),
+                last_comp_ratio: Cell::new(1.0),
+                last_reverb: Cell::new(0.0),
             });
         }
         Ok(())
@@ -641,6 +676,12 @@ impl Audio {
             ended,
             leaving: None,
             ramp: (0.0, 1.0, now, f64::from(spec.fade_in)),
+            last_gain: eff_gain,
+            last_pitch: eff_pitch,
+            last_lowpass: eff_lowpass.min(context.sample_rate() / 2.0),
+            last_reverb: eff_reverb,
+            last_pan: spec.pan.clamp(-1.0, 1.0),
+            last_placement: placement,
         }))
     }
     pub async fn submit(&mut self, frame: &RenderFrame, catalog: &Catalog) {
@@ -735,7 +776,27 @@ impl Audio {
         pan.connect_with_audio_node(&bus.dry).map_err(error)?;
         pan.connect_with_audio_node(&send).map_err(error)?;
         send.connect_with_audio_node(&bus.send).map_err(error)?;
-        Ok(PlayingSynth { source, filter: flt, env, gain: level, pan, send, spec, started_at: now, leaving: None })
+        let cutoff = spec.cutoff.min(context.sample_rate() / 2.0);
+        let q = linear_q_to_db(spec.resonance);
+        let pan_val = spec.pan.clamp(-1.0, 1.0);
+        Ok(PlayingSynth {
+            source,
+            filter: flt,
+            env,
+            gain: level,
+            pan,
+            send,
+            spec,
+            started_at: now,
+            leaving: None,
+            last_freq: spec.frequency,
+            last_detune: spec.detune_cents,
+            last_cutoff: cutoff,
+            last_q: q,
+            last_gain: spec.gain,
+            last_pan: pan_val,
+            last_reverb: spec.reverb,
+        })
     }
     fn mix(&mut self, frame: &RenderFrame, placements: &Placements) -> Result<()> {
         let needed = frame
@@ -786,11 +847,8 @@ impl Audio {
             buffer.copy_to_channel(&channels[0], 0).map_err(error)?;
             buffer.copy_to_channel(&channels[1], 1).map_err(error)?;
             let next_b = !self.reverb_use_b;
-            let (in_conv, in_send, out_send, in_ret, out_ret) = if next_b {
-                (conv_b, send_b, send_a, ret_b, ret_a)
-            } else {
-                (conv_a, send_a, send_b, ret_a, ret_b)
-            };
+            let (in_conv, in_send, out_send, in_ret, out_ret) =
+                if next_b { (conv_b, send_b, send_a, ret_b, ret_a) } else { (conv_a, send_a, send_b, ret_a, ret_b) };
             in_conv.set_buffer(Some(&buffer));
             let fade = 0.25;
             let _ = in_send.gain().set_value_at_time(1.0, now);
@@ -806,42 +864,84 @@ impl Audio {
             self.reverb_room = room;
             self.reverb_acoustics = acoustics.cloned();
         }
-        let rms_by_bus: Vec<f32> = (0..=self.buses.len())
-            .map(|i| {
-                let (_, rms) = self.bus(i).meter.read();
-                rms[0].max(rms[1])
-            })
-            .collect();
-        for index in 0..=self.buses.len() {
+        let nyquist = context.sample_rate() / 2.0;
+        let bus_count = self.buses.len() + 1;
+        let mut duck_rms: Vec<Option<f32>> = vec![None; bus_count];
+        for index in 0..bus_count {
+            if let Some(spec) = frame.buses.get(index)
+                && spec.duck_amount.is_finite()
+                && spec.duck_amount > 0.0
+            {
+                let sc_idx = spec.duck_bus as usize;
+                if sc_idx < bus_count && duck_rms[sc_idx].is_none() {
+                    let mut scratch = self.meter_scratch.borrow_mut();
+                    let (_, rms) = self.bus(sc_idx).meter.read_into(&mut scratch);
+                    duck_rms[sc_idx] = Some(rms[0].max(rms[1]));
+                }
+            }
+        }
+        for index in 0..bus_count {
             let mut fallback = Bus { gain: 1.0, lowpass: AUDIO_OPEN as f32, reverb: 0.0, ..Bus::default() };
             if index == 0 {
                 fallback.reverb = 1.0;
             }
             let spec = frame.buses.get(index).unwrap_or(&fallback);
             let bus = self.bus(index);
-            let sc = rms_by_bus.get(spec.duck_bus as usize).copied().unwrap_or(0.0);
+            let sc = if spec.duck_amount.is_finite() && spec.duck_amount > 0.0 {
+                duck_rms.get(spec.duck_bus as usize).and_then(|v| *v).unwrap_or(0.0)
+            } else {
+                0.0
+            };
             let duck = crate::policy::sidechain_duck_gain(spec.duck_amount, sc);
             let level = if self.monitor.audible(index) { spec.gain * duck } else { 0.0 };
-            glide(&bus.gain.gain(), level, &context);
-            if index != 0 {
-                glide(&bus.send_gain.gain(), level, &context);
+            if level.to_bits() != bus.last_level.get().to_bits() {
+                bus.last_level.set(level);
+                glide(&bus.gain.gain(), level, &context);
+                if index != 0 {
+                    glide(&bus.send_gain.gain(), level, &context);
+                }
             }
-            glide(&bus.dry.frequency(), spec.lowpass.min(context.sample_rate() / 2.0), &context);
-            if index != 0 {
-                glide(&bus.send.frequency(), spec.lowpass.min(context.sample_rate() / 2.0), &context);
+            let lp = spec.lowpass.min(nyquist);
+            if lp.to_bits() != bus.last_lowpass.get().to_bits() {
+                bus.last_lowpass.set(lp);
+                glide(&bus.dry.frequency(), lp, &context);
+                if index != 0 {
+                    glide(&bus.send.frequency(), lp, &context);
+                }
             }
-            glide(&bus.eq_low.gain(), if spec.eq_low_db.is_finite() { spec.eq_low_db.clamp(-24.0, 24.0) } else { 0.0 }, &context);
-            glide(&bus.eq_mid.gain(), if spec.eq_mid_db.is_finite() { spec.eq_mid_db.clamp(-24.0, 24.0) } else { 0.0 }, &context);
-            glide(&bus.eq_high.gain(), if spec.eq_high_db.is_finite() { spec.eq_high_db.clamp(-24.0, 24.0) } else { 0.0 }, &context);
-            if spec.comp_threshold.is_finite() && spec.comp_threshold > 0.0 && spec.comp_ratio.is_finite() && spec.comp_ratio > 1.0 {
-                let thresh_db = (20.0 * spec.comp_threshold.max(1e-4).log10()).clamp(-100.0, 0.0);
-                bus.compressor.threshold().set_value(thresh_db);
-                bus.compressor.ratio().set_value(spec.comp_ratio.clamp(1.0, 20.0));
+            let eq_vals = [
+                if spec.eq_low_db.is_finite() { spec.eq_low_db.clamp(-24.0, 24.0) } else { 0.0 },
+                if spec.eq_mid_db.is_finite() { spec.eq_mid_db.clamp(-24.0, 24.0) } else { 0.0 },
+                if spec.eq_high_db.is_finite() { spec.eq_high_db.clamp(-24.0, 24.0) } else { 0.0 },
+            ];
+            let eq_nodes = [&bus.eq_low, &bus.eq_mid, &bus.eq_high];
+            for band in 0..3 {
+                if eq_vals[band].to_bits() != bus.last_eq[band].get().to_bits() {
+                    bus.last_eq[band].set(eq_vals[band]);
+                    glide(&eq_nodes[band].gain(), eq_vals[band], &context);
+                }
+            }
+            let (thresh_db, ratio) = if spec.comp_threshold.is_finite()
+                && spec.comp_threshold > 0.0
+                && spec.comp_ratio.is_finite()
+                && spec.comp_ratio > 1.0
+            {
+                ((20.0 * spec.comp_threshold.max(1e-4).log10()).clamp(-100.0, 0.0), spec.comp_ratio.clamp(1.0, 20.0))
             } else {
-                bus.compressor.threshold().set_value(0.0);
-                bus.compressor.ratio().set_value(1.0);
+                (0.0, 1.0)
+            };
+            if thresh_db.to_bits() != bus.last_comp_thresh.get().to_bits() {
+                bus.last_comp_thresh.set(thresh_db);
+                bus.compressor.threshold().set_value(thresh_db);
             }
-            glide(&bus.reverb.gain(), spec.reverb, &context);
+            if ratio.to_bits() != bus.last_comp_ratio.get().to_bits() {
+                bus.last_comp_ratio.set(ratio);
+                bus.compressor.ratio().set_value(ratio);
+            }
+            if spec.reverb.to_bits() != bus.last_reverb.get().to_bits() {
+                bus.last_reverb.set(spec.reverb);
+                glide(&bus.reverb.gain(), spec.reverb, &context);
+            }
         }
         self.retiring.retain(|playing| !*playing.ended.borrow() && !playing.source.stopped(now, &context));
         self.voices.retain(|_, playing| {
@@ -879,17 +979,42 @@ impl Audio {
                 if !*playing.ended.borrow() {
                     let eff_gain = placement.map_or(spec.gain, |p| spec.gain * p.occlusion_gain());
                     let eff_pitch = placement.map_or(spec.pitch, |p| spec.pitch * p.doppler_ratio(p.position));
-                    let eff_lp = placement.map_or(spec.lowpass, |p| spec.lowpass.min(p.occlusion_lowpass(AUDIO_OPEN as f32)));
+                    let eff_lp = placement
+                        .map_or(spec.lowpass, |p| spec.lowpass.min(p.occlusion_lowpass(AUDIO_OPEN as f32)))
+                        .min(nyquist);
                     let eff_rev = placement.map_or(spec.reverb, |p| spec.reverb * p.wet_scale);
-                    glide(&playing.gain.gain(), eff_gain, &context);
+                    if eff_gain.to_bits() != playing.last_gain.to_bits() {
+                        playing.last_gain = eff_gain;
+                        glide(&playing.gain.gain(), eff_gain, &context);
+                    }
                     match (&playing.pan, &placement) {
-                        (Panning::Placed(node), Some(placement)) => place(node, placement, &context, false),
-                        (Panning::Stereo(node), _) => glide(&node.pan(), spec.pan.clamp(-1.0, 1.0), &context),
+                        (Panning::Placed(node), Some(placement)) => {
+                            if playing.last_placement.as_ref() != Some(placement) {
+                                playing.last_placement = Some(*placement);
+                                place(node, placement, &context, false);
+                            }
+                        }
+                        (Panning::Stereo(node), _) => {
+                            let pan = spec.pan.clamp(-1.0, 1.0);
+                            if pan.to_bits() != playing.last_pan.to_bits() {
+                                playing.last_pan = pan;
+                                glide(&node.pan(), pan, &context);
+                            }
+                        }
                         (Panning::Placed(_), None) => {}
                     }
-                    playing.source.pitch(eff_pitch, &context);
-                    glide(&playing.filter.frequency(), eff_lp.min(context.sample_rate() / 2.0), &context);
-                    glide(&playing.send.gain(), eff_rev, &context);
+                    if eff_pitch.to_bits() != playing.last_pitch.to_bits() {
+                        playing.last_pitch = eff_pitch;
+                        playing.source.pitch(eff_pitch, &context);
+                    }
+                    if eff_lp.to_bits() != playing.last_lowpass.to_bits() {
+                        playing.last_lowpass = eff_lp;
+                        glide(&playing.filter.frequency(), eff_lp, &context);
+                    }
+                    if eff_rev.to_bits() != playing.last_reverb.to_bits() {
+                        playing.last_reverb = eff_rev;
+                        glide(&playing.send.gain(), eff_rev, &context);
+                    }
                     playing.spec = *spec;
                 }
             } else if let Some(playing) = self.start_voice(*spec, placement)? {
@@ -928,12 +1053,8 @@ impl Audio {
         };
         // Move omitted synths immediately into `retiring_synths` so a returning ID starts a
         // fresh crossfading node instead of dying at its old irreversible WebAudio stop deadline.
-        let omitted: Vec<u32> = self
-            .synths
-            .keys()
-            .copied()
-            .filter(|id| !frame.synths.iter().any(|s| s.id == *id))
-            .collect();
+        let omitted: Vec<u32> =
+            self.synths.keys().copied().filter(|id| !frame.synths.iter().any(|s| s.id == *id)).collect();
         for id in omitted {
             if let Some(old) = self.synths.remove(&id) {
                 retire(&mut self.retiring_synths, old);
@@ -967,14 +1088,38 @@ impl Audio {
             }
             if let Some(playing) = self.synths.get_mut(&spec.id) {
                 if let SynthSource::Osc(osc) = &playing.source {
-                    glide(&osc.frequency(), spec.frequency, &context);
-                    glide(&osc.detune(), spec.detune_cents, &context);
+                    if spec.frequency.to_bits() != playing.last_freq.to_bits() {
+                        playing.last_freq = spec.frequency;
+                        glide(&osc.frequency(), spec.frequency, &context);
+                    }
+                    if spec.detune_cents.to_bits() != playing.last_detune.to_bits() {
+                        playing.last_detune = spec.detune_cents;
+                        glide(&osc.detune(), spec.detune_cents, &context);
+                    }
                 }
-                glide(&playing.filter.frequency(), spec.cutoff.min(context.sample_rate() / 2.0), &context);
-                glide(&playing.filter.q(), linear_q_to_db(spec.resonance), &context);
-                glide(&playing.gain.gain(), spec.gain, &context);
-                glide(&playing.pan.pan(), spec.pan.clamp(-1.0, 1.0), &context);
-                glide(&playing.send.gain(), spec.reverb, &context);
+                let cutoff = spec.cutoff.min(nyquist);
+                if cutoff.to_bits() != playing.last_cutoff.to_bits() {
+                    playing.last_cutoff = cutoff;
+                    glide(&playing.filter.frequency(), cutoff, &context);
+                }
+                let q = linear_q_to_db(spec.resonance);
+                if q.to_bits() != playing.last_q.to_bits() {
+                    playing.last_q = q;
+                    glide(&playing.filter.q(), q, &context);
+                }
+                if spec.gain.to_bits() != playing.last_gain.to_bits() {
+                    playing.last_gain = spec.gain;
+                    glide(&playing.gain.gain(), spec.gain, &context);
+                }
+                let pan = spec.pan.clamp(-1.0, 1.0);
+                if pan.to_bits() != playing.last_pan.to_bits() {
+                    playing.last_pan = pan;
+                    glide(&playing.pan.pan(), pan, &context);
+                }
+                if spec.reverb.to_bits() != playing.last_reverb.to_bits() {
+                    playing.last_reverb = spec.reverb;
+                    glide(&playing.send.gain(), spec.reverb, &context);
+                }
                 playing.spec = spec;
             } else {
                 let playing = self.start_synth(spec)?;
@@ -1005,13 +1150,14 @@ impl Audio {
             (None, None) => None,
             (base, output) => Some((base.unwrap_or(0.0) + output.unwrap_or(0.0)) * 1000.0),
         };
+        let mut scratch = self.meter_scratch.borrow_mut();
         let buses = (0..pen_protocol::boundary::MAX_BUSES)
             .map(|index| {
                 let bit = 1u32 << index;
                 let (muted, soloed) = (self.monitor.muted & bit != 0, self.monitor.soloed & bit != 0);
                 match (index <= self.buses.len()).then(|| self.bus(index)) {
                     Some(bus) => {
-                        let (peak, rms) = bus.meter.read();
+                        let (peak, rms) = bus.meter.read_into(&mut scratch);
                         BusReport { peak, rms, used: true, muted, soloed }
                     }
                     None => BusReport { muted, soloed, ..BusReport::default() },
@@ -1195,7 +1341,10 @@ pub async fn qualify() -> Result<()> {
     anyhow::ensure!(audio.synths.len() == 2, "both procedural and granular synth voices must start");
     frame.synths.clear();
     audio.mix(&frame, &Placements::of(&frame))?;
-    anyhow::ensure!(audio.synths.is_empty() && audio.retiring_synths.len() == 2, "omitted synths must enter retiring pool");
+    anyhow::ensure!(
+        audio.synths.is_empty() && audio.retiring_synths.len() == 2,
+        "omitted synths must enter retiring pool"
+    );
     frame.voices.clear();
     audio.mix(&frame, &Placements::of(&frame))?;
     let _ = audio.context.as_ref().unwrap().close();

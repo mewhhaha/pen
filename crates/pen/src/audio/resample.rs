@@ -71,12 +71,39 @@ impl Resampler {
         let which = (offset as usize).min(OFFSETS - 1);
         let blend = offset - which as f64;
         let (first, second) = (&self.kernels[which], &self.kernels[which + 1]);
-        let start = self.first(j);
+        let start = base as i64 - (TAPS / 2) as i64;
         let (mut sum1, mut sum2) = (0.0f32, 0.0f32);
         for i in 0..TAPS {
             let x = at(start + i as i64);
             sum1 += x * first[i];
             sum2 += x * second[i];
+        }
+        ((1.0 - blend) * f64::from(sum1) + blend * f64::from(sum2)) as f32
+    }
+
+    fn sample_slice(&self, j: usize, input: &[f32]) -> f32 {
+        let position = j as f64 * self.ratio;
+        let base = position.floor();
+        let start = base as i64 - (TAPS / 2) as i64;
+        let offset = (position - base) * OFFSETS as f64;
+        let which = (offset as usize).min(OFFSETS - 1);
+        let blend = offset - which as f64;
+        let (first, second) = (&self.kernels[which], &self.kernels[which + 1]);
+        let (mut sum1, mut sum2) = (0.0f32, 0.0f32);
+        if start >= 0 && (start as usize) + TAPS <= input.len() {
+            let window = &input[start as usize..start as usize + TAPS];
+            for i in 0..TAPS {
+                let x = window[i];
+                sum1 += x * first[i];
+                sum2 += x * second[i];
+            }
+        } else {
+            for i in 0..TAPS {
+                let index = start + i as i64;
+                let x = if index >= 0 && (index as usize) < input.len() { input[index as usize] } else { 0.0 };
+                sum1 += x * first[i];
+                sum2 += x * second[i];
+            }
         }
         ((1.0 - blend) * f64::from(sum1) + blend * f64::from(sum2)) as f32
     }
@@ -86,8 +113,7 @@ impl Resampler {
 /// whole samples (`len * to / from`, truncated).
 pub fn resample(input: &[f32], from: f64, to: f64) -> Vec<f32> {
     let resampler = Resampler::new(from, to);
-    let at = |index: i64| if index >= 0 && (index as usize) < input.len() { input[index as usize] } else { 0.0 };
-    (0..resampler.length(input.len())).map(|j| resampler.sample(j, at)).collect()
+    (0..resampler.length(input.len())).map(|j| resampler.sample_slice(j, input)).collect()
 }
 
 #[cfg(test)]

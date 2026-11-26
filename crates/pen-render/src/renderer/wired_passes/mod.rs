@@ -144,7 +144,7 @@ impl Default for DagLodSettings {
 pub(super) struct RtHistory {
     restir: Option<RestirRenderer>,
     restir_specular: Option<RestirSpecularRenderer>,
-    svgf_rt: Option<SvgfRtState>,
+    svgf_rt: Option<Box<SvgfRtState>>,
 }
 
 #[derive(Default)]

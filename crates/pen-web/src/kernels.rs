@@ -7,6 +7,7 @@
 //! - Async `join_live_kernels_async` called in `Browser::step` AFTER `timeline.prepare`
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use js_sys::{Object, Promise, Reflect, Uint8Array, Uint32Array};
 use pen_protocol::boundary::{EVENT_FLOATS, FRAME_HEADER_FLOATS, MAX_EVENTS, MAX_SERVICE_DATA, event_tags, whole};
@@ -87,7 +88,7 @@ struct ActiveUpload {
 
 struct LruEntry {
     key: CtxKey,
-    words: Vec<u32>,
+    words: Rc<[u32]>,
     revision: u64,
     committed_upload_key: (u64, u32, usize),
     last_used_tick: u64,
@@ -152,13 +153,7 @@ impl KernelReply {
 
     fn encode_events(&self, out: &mut Vec<[f32; EVENT_FLOATS]>) {
         let len = self.values.len().min(MAX_SERVICE_DATA);
-        out.push([
-            event_tags::SERVICE_ANSWER as f32,
-            self.status as f32,
-            0.0,
-            self.request_id as f32,
-            len as f32,
-        ]);
+        out.push([event_tags::SERVICE_ANSWER as f32, self.status as f32, 0.0, self.request_id as f32, len as f32]);
         for chunk in self.values[..len].chunks(3) {
             let at = |i: usize| chunk.get(i).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
             out.push([event_tags::SERVICE_DATA as f32, 0.0, at(0), at(1), at(2)]);
@@ -174,7 +169,7 @@ struct PendingBatch {
     binding_hash: u64,
     geom_hash: u64,
     item_count: u32,
-    ctx: Option<(u64, Vec<u32>)>,
+    ctx: Option<(u64, Rc<[u32]>)>,
     items: Vec<u32>,
 }
 
@@ -427,9 +422,7 @@ fn js_error_code(err: &JsValue) -> Option<String> {
 
 fn browser_worker_count() -> usize {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped browser hardware concurrency")]
-    web_sys::window()
-        .map(|w| w.navigator().hardware_concurrency().clamp(1.0, 4.0) as usize)
-        .unwrap_or(2)
+    web_sys::window().map(|w| w.navigator().hardware_concurrency().clamp(1.0, 4.0) as usize).unwrap_or(2)
 }
 
 pub struct WebKernelService {
@@ -528,18 +521,13 @@ impl WebKernelService {
         self.lru[idx].last_used_tick = self.lru_clock;
     }
 
-    fn insert_lru(
-        &mut self,
-        key: CtxKey,
-        words: Vec<u32>,
-        committed_upload_key: (u64, u32, usize),
-    ) -> Result<(), u32> {
+    fn insert_lru(&mut self, key: CtxKey, words: Vec<u32>, committed_upload_key: (u64, u32, usize)) -> Result<(), u32> {
         let new_bytes = words.len().saturating_mul(4);
         if new_bytes > MAX_LRU_TOTAL_BYTES {
             return Err(ERR_UPLOAD_TOO_LARGE);
         }
         if let Some(pos) = self.lru.iter().position(|entry| entry.key == key) {
-            if self.lru[pos].words != words {
+            if self.lru[pos].words.as_ref() != words.as_slice() {
                 return Err(ERR_HASH_MISMATCH);
             }
             self.lru[pos].committed_upload_key = committed_upload_key;
@@ -573,7 +561,7 @@ impl WebKernelService {
         self.next_revision += 1;
         self.lru.push(LruEntry {
             key,
-            words,
+            words: Rc::from(words),
             revision,
             committed_upload_key,
             last_used_tick: self.lru_clock,
@@ -804,8 +792,7 @@ impl WebKernelService {
             ));
             return;
         }
-        let (Some(binding_hash), Some(geom_hash)) =
-            (unpack_u64(&req.values[0..4]), unpack_u64(&req.values[4..8]))
+        let (Some(binding_hash), Some(geom_hash)) = (unpack_u64(&req.values[0..4]), unpack_u64(&req.values[4..8]))
         else {
             self.ready_replies.push(KernelReply::batch_err(
                 req.request,
@@ -836,12 +823,7 @@ impl WebKernelService {
         let items = match decode_items(&manifest.in_schema, item_count as usize, &req.values[8..]) {
             Ok(items) => items,
             Err(code) => {
-                self.ready_replies.push(KernelReply::batch_err(
-                    req.request,
-                    service_status::FAILED,
-                    code,
-                    kernel_id,
-                ));
+                self.ready_replies.push(KernelReply::batch_err(req.request, service_status::FAILED, code, kernel_id));
                 return;
             }
         };
@@ -899,7 +881,8 @@ impl WebKernelService {
         let mut faulted = false;
         let result: Result<Vec<u32>, u32> = async {
             if let Some((revision, ref words)) = job.ctx {
-                let needs_install = self.pools.get(&job.kernel_id).is_some_and(|s| s.installed_revision != Some(revision));
+                let needs_install =
+                    self.pools.get(&job.kernel_id).is_some_and(|s| s.installed_revision != Some(revision));
                 if needs_install {
                     let bytes = words_to_u8(words);
                     let u8_arr = Uint8Array::from(bytes.as_slice());
@@ -925,12 +908,9 @@ impl WebKernelService {
             }
             let items_arr = Uint32Array::from(job.items.as_slice());
             let pool = &self.pools.get(&job.kernel_id).unwrap().pool;
-            let promise = if job.manifest.variable_output() {
-                pool.run_variable(&items_arr)
-            } else {
-                pool.run_fixed(&items_arr)
-            }
-            .map_err(|_| ERR_EXECUTION_FAILED)?;
+            let promise =
+                if job.manifest.variable_output() { pool.run_variable(&items_arr) } else { pool.run_fixed(&items_arr) }
+                    .map_err(|_| ERR_EXECUTION_FAILED)?;
             match JsFuture::from(promise).await {
                 Ok(val) => Ok(Uint32Array::new(&val).to_vec()),
                 Err(err) => {
@@ -950,9 +930,7 @@ impl WebKernelService {
             }
         }
         .await;
-        if faulted
-            && let Some(slot) = self.pools.remove(&job.kernel_id)
-        {
+        if faulted && let Some(slot) = self.pools.remove(&job.kernel_id) {
             let promise = slot.pool.close();
             spawn_local(async move {
                 let _ = JsFuture::from(promise).await;
@@ -1013,12 +991,8 @@ impl WebKernelService {
                 reply.encode_events(&mut events);
                 used += needed;
             } else if reply.is_batch_ok && used + 2 <= reply_budget {
-                let downgraded = KernelReply::batch_err(
-                    reply.request_id,
-                    service_status::FAILED,
-                    ERR_EVENT_BUDGET,
-                    reply.kernel_id,
-                );
+                let downgraded =
+                    KernelReply::batch_err(reply.request_id, service_status::FAILED, ERR_EVENT_BUDGET, reply.kernel_id);
                 downgraded.encode_events(&mut events);
                 used += 2;
             }

@@ -23,6 +23,8 @@ pub(crate) struct Scene {
     touched: HashSet<u32>,
     /// Reusable scratch buffer for resolved `(draw_index, previous_transform)` motions.
     moved_buf: Vec<(u32, Matrix)>,
+    /// Reusable buffer for in-place rollback records to avoid per-frame allocations.
+    rollback_scratch: Vec<(usize, Draw)>,
 }
 
 pub(crate) enum SceneRollback {
@@ -80,7 +82,9 @@ impl Scene {
             }
             if in_place_ok {
                 let prev_started = self.started;
-                let mut changes = Vec::with_capacity(frame.instances.len());
+                let mut changes = std::mem::take(&mut self.rollback_scratch);
+                changes.clear();
+                changes.reserve(frame.instances.len());
                 for value in &frame.instances {
                     let id = value.id_low | (value.id_high << 16);
                     let pos = self.pos_by_id[&id];
@@ -147,15 +151,24 @@ impl Scene {
         Ok(undo)
     }
 
+    /// Recycles rollback scratch memory once a frame has been accepted.
+    pub fn commit(&mut self, undo: SceneRollback) {
+        if let SceneRollback::InPlace { mut changes, .. } = undo {
+            changes.clear();
+            self.rollback_scratch = changes;
+        }
+    }
+
     /// Reverts the scene to its state before the matching [`Self::apply`] call.
     pub fn rollback(&mut self, undo: SceneRollback) {
         match undo {
             SceneRollback::None => {}
-            SceneRollback::InPlace { prev_started, changes } => {
+            SceneRollback::InPlace { prev_started, mut changes } => {
                 self.started = prev_started;
-                for (pos, old_draw) in changes.into_iter().rev() {
+                for (pos, old_draw) in changes.drain(..).rev() {
                     self.ordered[pos] = old_draw;
                 }
+                self.rollback_scratch = changes;
             }
             SceneRollback::Full { prev_started, entries, ordered, pos_by_id } => {
                 self.started = prev_started;

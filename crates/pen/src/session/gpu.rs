@@ -40,12 +40,12 @@ pub struct Gpu {
     /// A frame size the window does not change (a recording's).
     pinned: Option<(u32, u32)>,
     /// The offscreen image frames are captured from.
-    capture: Option<wgpu::Texture>,
+    capture: Option<(wgpu::Texture, wgpu::TextureView)>,
     /// Offscreen image for viewport-overlay shots and overlay presentation when
     /// a clean capture/recording also needs uncontaminated game pixels.
-    overlay_capture: Option<wgpu::Texture>,
+    overlay_capture: Option<(wgpu::Texture, wgpu::TextureView)>,
     /// The paused frame's image, shown again without drawing it again.
-    pub(super) still: Option<wgpu::Texture>,
+    pub(super) still: Option<(wgpu::Texture, wgpu::TextureView)>,
     fault: Fault,
 }
 
@@ -233,15 +233,15 @@ impl Gpu {
         self.fault.lock().unwrap().take()
     }
 
-    pub(super) fn capture_texture(&mut self) -> wgpu::Texture {
+    pub(super) fn capture_texture(&mut self) -> (wgpu::Texture, wgpu::TextureView) {
         offscreen(&self.device, &mut self.capture, self.size, self.format, "capture")
     }
 
-    pub(super) fn overlay_capture_texture(&mut self) -> wgpu::Texture {
+    pub(super) fn overlay_capture_texture(&mut self) -> (wgpu::Texture, wgpu::TextureView) {
         offscreen(&self.device, &mut self.overlay_capture, self.size, self.format, "overlay capture")
     }
 
-    pub(super) fn still_texture(&mut self) -> wgpu::Texture {
+    pub(super) fn still_texture(&mut self) -> (wgpu::Texture, wgpu::TextureView) {
         offscreen(&self.device, &mut self.still, self.size, self.format, "still")
     }
 
@@ -392,17 +392,19 @@ impl Readback {
     }
 }
 
-/// The texture in `slot` if it has `size`, else a new one there: an image
-/// to draw frames into, copy to the window and read back.
+/// The texture and cached view in `slot` if it has `size`, else a new one there:
+/// an image to draw frames into, copy to the window and read back.
 fn offscreen(
     device: &wgpu::Device,
-    slot: &mut Option<wgpu::Texture>,
+    slot: &mut Option<(wgpu::Texture, wgpu::TextureView)>,
     (width, height): (u32, u32),
     format: wgpu::TextureFormat,
     label: &str,
-) -> wgpu::Texture {
-    if let Some(texture) = slot.as_ref().filter(|texture| (texture.width(), texture.height()) == (width, height)) {
-        return texture.clone();
+) -> (wgpu::Texture, wgpu::TextureView) {
+    if let Some((texture, view)) =
+        slot.as_ref().filter(|(texture, _)| (texture.width(), texture.height()) == (width, height))
+    {
+        return (texture.clone(), view.clone());
     }
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -416,8 +418,9 @@ fn offscreen(
             | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
-    *slot = Some(texture.clone());
-    texture
+    let view = texture.create_view(&Default::default());
+    *slot = Some((texture.clone(), view.clone()));
+    (texture, view)
 }
 
 /// What a frame is presented to: the GPU fields a target needs, borrowed
@@ -491,6 +494,7 @@ impl RenderTarget for SurfaceTarget<'_> {
 pub(super) struct CaptureTarget<'a> {
     pub(super) output: Output<'a>,
     pub(super) texture: wgpu::Texture,
+    pub(super) view: wgpu::TextureView,
 }
 
 impl RenderTarget for CaptureTarget<'_> {
@@ -499,19 +503,14 @@ impl RenderTarget for CaptureTarget<'_> {
     }
 
     fn view(&mut self) -> Option<wgpu::TextureView> {
-        Some(self.texture.create_view(&Default::default()))
+        Some(self.view.clone())
     }
 
     fn present(&mut self) {
         let Some(blitter) = self.output.blitter else { return };
         let Some(swapchain) = self.output.acquire() else { return };
         let mut encoder = self.output.device.create_command_encoder(&Default::default());
-        blitter.copy(
-            self.output.device,
-            &mut encoder,
-            &self.texture.create_view(&Default::default()),
-            &swapchain.texture.create_view(&Default::default()),
-        );
+        blitter.copy(self.output.device, &mut encoder, &self.view, &swapchain.texture.create_view(&Default::default()));
         self.output.queue.submit([encoder.finish()]);
         // Over the window's copy only: what is captured stays the game's.
         if let Some(overlay) = self.output.overlay.as_deref_mut() {
@@ -582,7 +581,7 @@ pub(super) fn settle(gpu: &mut Gpu, frame: &RenderFrame, catalog: &Catalog) -> R
             eprintln!("settle: assets still loading after {} s; starting anyway", patience.as_secs());
             return Ok(());
         }
-        let texture = gpu.capture_texture();
+        let (texture, view) = gpu.capture_texture();
         let output = Output {
             device: &gpu.device,
             queue: &gpu.queue,
@@ -592,7 +591,7 @@ pub(super) fn settle(gpu: &mut Gpu, frame: &RenderFrame, catalog: &Catalog) -> R
             overlay: None,
             timings: &mut DrawTimings::default(),
         };
-        gpu.renderer.submit(frame, catalog, &mut CaptureTarget { output, texture })?;
+        gpu.renderer.submit(frame, catalog, &mut CaptureTarget { output, texture, view })?;
         crate::startup::drawn(&gpu.renderer);
         gpu.device.poll(wgpu::PollType::wait_indefinitely())?;
         if let Some(fault) = gpu.take_fault() {

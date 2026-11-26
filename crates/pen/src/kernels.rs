@@ -11,7 +11,7 @@
 //!   - `REPLY_KIND_BATCH_OK = 3.0` (`length = 13 + payload`):
 //!     `[3.0, kernel_id_lo16, kernel_id_hi16, binding_w0..w3, geom_w0..w3, count_lo16, count_hi16, outputs...]`
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -144,13 +144,7 @@ impl KernelReply {
 
     fn encode_events(&self, out: &mut Vec<[f32; EVENT_FLOATS]>) {
         let len = self.values.len().min(MAX_SERVICE_DATA);
-        out.push([
-            event_tags::SERVICE_ANSWER as f32,
-            self.status as f32,
-            0.0,
-            self.request_id as f32,
-            len as f32,
-        ]);
+        out.push([event_tags::SERVICE_ANSWER as f32, self.status as f32, 0.0, self.request_id as f32, len as f32]);
         for chunk in self.values[..len].chunks(3) {
             let at = |i: usize| chunk.get(i).copied().filter(|v| v.is_finite()).unwrap_or(0.0);
             out.push([event_tags::SERVICE_DATA as f32, 0.0, at(0), at(1), at(2)]);
@@ -187,7 +181,7 @@ struct RunnerState {
     worker_count: usize,
     has_deadlines: bool,
     module_generation: u64,
-    pending_jobs: Vec<BatchJob>,
+    pending_jobs: VecDeque<BatchJob>,
     active_jobs: usize,
     completed: Vec<(u64, KernelReply)>,
     shutdown: bool,
@@ -439,8 +433,7 @@ fn runner_loop(shared: Arc<RunnerShared>) {
                 if state.shutdown {
                     return;
                 }
-                if !state.pending_jobs.is_empty() {
-                    let job = state.pending_jobs.remove(0);
+                if let Some(job) = state.pending_jobs.pop_front() {
                     state.active_jobs += 1;
                     break (
                         job,
@@ -612,7 +605,7 @@ impl KernelService {
                 worker_count,
                 has_deadlines,
                 module_generation: 1,
-                pending_jobs: Vec::new(),
+                pending_jobs: VecDeque::new(),
                 active_jobs: 0,
                 completed: Vec::new(),
                 shutdown: false,
@@ -745,13 +738,7 @@ impl KernelService {
         self.lru_clock += 1;
         let revision = self.next_revision;
         self.next_revision += 1;
-        self.lru.push(LruEntry {
-            key,
-            words,
-            revision,
-            committed_upload_key,
-            last_used_tick: self.lru_clock,
-        });
+        self.lru.push(LruEntry { key, words, revision, committed_upload_key, last_used_tick: self.lru_clock });
         Ok(())
     }
 
@@ -1003,8 +990,7 @@ impl KernelService {
             ));
             return None;
         }
-        let (Some(binding_hash), Some(geom_hash)) =
-            (unpack_u64(&req.values[0..4]), unpack_u64(&req.values[4..8]))
+        let (Some(binding_hash), Some(geom_hash)) = (unpack_u64(&req.values[0..4]), unpack_u64(&req.values[4..8]))
         else {
             self.ready_replies.push(KernelReply::batch_err(
                 req.request,
@@ -1035,12 +1021,7 @@ impl KernelService {
         let items = match decode_items(&manifest.in_schema, item_count as usize, &req.values[8..]) {
             Ok(items) => items,
             Err(code) => {
-                self.ready_replies.push(KernelReply::batch_err(
-                    req.request,
-                    service_status::FAILED,
-                    code,
-                    kernel_id,
-                ));
+                self.ready_replies.push(KernelReply::batch_err(req.request, service_status::FAILED, code, kernel_id));
                 return None;
             }
         };
@@ -1113,12 +1094,8 @@ impl KernelService {
                 reply.encode_events(&mut events);
                 used += needed;
             } else if reply.is_batch_ok && used + 2 <= reply_budget {
-                let downgraded = KernelReply::batch_err(
-                    reply.request_id,
-                    service_status::FAILED,
-                    ERR_EVENT_BUDGET,
-                    reply.kernel_id,
-                );
+                let downgraded =
+                    KernelReply::batch_err(reply.request_id, service_status::FAILED, ERR_EVENT_BUDGET, reply.kernel_id);
                 downgraded.encode_events(&mut events);
                 used += 2;
             }
@@ -1168,13 +1145,7 @@ mod tests {
         let wasm_path = tmp.with_extension("wasm");
         std::fs::write(&tmp, source).unwrap();
         let status = std::process::Command::new(&blotc)
-            .args([
-                "build",
-                tmp.to_str().unwrap(),
-                wasm_path.to_str().unwrap(),
-                "--prelude",
-                prelude.to_str().unwrap(),
-            ])
+            .args(["build", tmp.to_str().unwrap(), wasm_path.to_str().unwrap(), "--prelude", prelude.to_str().unwrap()])
             .status()
             .unwrap();
         assert!(status.success(), "blotc failed");

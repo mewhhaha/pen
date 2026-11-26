@@ -19,9 +19,7 @@ use std::io::{Read as _, Seek as _, SeekFrom};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(feature = "compiler")]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "compiler")]
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -3635,6 +3633,8 @@ struct AotHostState {
 /// during result encoding) with zero `UnsafeCell` aliasing UB.
 struct AotHostBox {
     state: Mutex<AotHostState>,
+    has_pending_error: AtomicBool,
+    has_pending_panic: AtomicBool,
 }
 
 struct SendHostPtr(*mut AotHostBox);
@@ -3668,6 +3668,7 @@ unsafe extern "C" fn host_callback_trampoline(
                 && state.pending_error.is_none()
             {
                 state.pending_error = Some(err);
+                host_box.has_pending_error.store(true, Ordering::Release);
             }
             1
         }
@@ -3677,6 +3678,7 @@ unsafe extern "C" fn host_callback_trampoline(
                 && state.pending_panic.is_none()
             {
                 state.pending_panic = Some(payload);
+                host_box.has_pending_panic.store(true, Ordering::Release);
             }
             1
         }
@@ -3779,26 +3781,32 @@ fn invoke_aot_import(
     token: u64,
     arg_bits: u64,
 ) -> Result<u64> {
-    // Short lock #1: extract metadata and move `spare` out so NO lock/reference to `AotHostState`
-    // is held across any FFI call (`active_mem_data`, `active_get_global`, `callback`, or `active_allocate`).
-    let (signature, export, lib, uses_arrays, memory_gauge, probe, mut spare) = {
+    // Short lock #1: extract metadata, callback, and `spare` in one lock so NO lock/reference to
+    // `AotHostState` is held across any FFI call (`active_mem_data`, `active_get_global`,
+    // `callback`, or `active_allocate`).
+    let (signature, lib, uses_arrays, memory_gauge, probe, mut spare, mut callback) = {
         let mut state =
             host_box.state.try_lock().map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
         let signature =
             *state.lib.imports.get(import_idx as usize).ok_or_else(|| anyhow!("unknown import index {import_idx}"))?;
-        let (export, expected) = match &state.active {
-            Some(active) if token != 0 && active.token == token => (active.export.clone(), active.signature),
+        let expected = match &state.active {
+            Some(active) if token != 0 && active.token == token => active.signature,
             _ => bail!("stale_capability: host call has no active capability reference"),
         };
         ensure!(expected == signature, "capability_signature: host call signature does not match its capability");
+        let callback = state
+            .active
+            .as_mut()
+            .and_then(|active| active.callback.take())
+            .ok_or_else(|| anyhow!("reentrant_call: cannot reenter an active guest instance"))?;
         (
             signature,
-            export,
             state.lib.clone(),
             state.uses_arrays,
             state.memory.clone(),
             state.probe.clone(),
             std::mem::take(&mut state.spare),
+            callback,
         )
     };
 
@@ -3816,7 +3824,14 @@ fn invoke_aot_import(
     let argument = match aot_from_bits(mem_slice, uses_arrays, &mut spare, signature.parameter, arg_bits) {
         Ok(arg) => arg,
         Err(err) => {
-            restore_spare(host_box, spare);
+            if let Ok(mut state) = host_box.state.lock() {
+                if let Some(active) = state.active.as_mut() {
+                    active.callback = Some(callback);
+                }
+                if spare.capacity() > state.spare.capacity() {
+                    state.spare = spare;
+                }
+            }
             return Err(err);
         }
     };
@@ -3835,30 +3850,27 @@ fn invoke_aot_import(
         probe.called_host(if uses_arrays { mem_len } else { 0 }, vals.into_iter());
     }
 
-    // Short lock #2: take callback out before invoking it.
-    let mut callback = {
-        let mut state =
-            host_box.state.try_lock().map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
-        match state.active.as_mut().and_then(|active| active.callback.take()) {
-            Some(cb) => cb,
-            None => {
-                if spare.capacity() > state.spare.capacity() {
-                    state.spare = spare;
-                }
-                bail!("reentrant_call: cannot reenter an active guest instance");
-            }
-        }
-    };
     let result = callback(argument);
-    // Short lock #3: restore callback immediately after invocation, matching Wasmtime so guest
-    // `blot:allocate` during result encoding may legally invoke the active callback.
-    {
+    // Short lock #2: restore callback immediately after invocation, matching Wasmtime so guest
+    // `blot:allocate` during result encoding may legally invoke the active callback. Only clone
+    // the export name if formatting an error message.
+    let needs_export = match &result {
+        Ok(val) => val.kind() != signature.result,
+        Err(_) => true,
+    };
+    let export = {
         let mut state =
             host_box.state.try_lock().map_err(|_| anyhow!("reentrant_call: host state lock unexpectedly contended"))?;
+        let export = if needs_export {
+            state.active.as_ref().map(|active| active.export.clone()).unwrap_or_default()
+        } else {
+            String::new()
+        };
         if let Some(active) = state.active.as_mut() {
             active.callback = Some(callback);
         }
-    }
+        export
+    };
     let result = match result.with_context(|| format!("host_exception: host callback failed during {export}")) {
         Ok(val) => val,
         Err(err) => {
@@ -3900,7 +3912,7 @@ fn invoke_aot_import(
             write(slice)
         },
     );
-    // Short lock #4: restore `spare` buffer.
+    // Short lock #3: restore `spare` buffer.
     restore_spare(host_box, spare);
     encoded
 }
@@ -3996,6 +4008,8 @@ impl AotGuest {
                 pending_panic: None,
                 uses_arrays: abi.uses_arrays(),
             }),
+            has_pending_error: AtomicBool::new(false),
+            has_pending_panic: AtomicBool::new(false),
         }));
         let mut trap_code = 0u8;
         let handle = unsafe {
@@ -4095,10 +4109,7 @@ impl AotGuest {
         ensure!(words.len() < 1_073_741_823, "array byte count exceeds the Wasm32 address range");
         let length = u32::try_from(words.len())?;
         let byte_len = (length + 1).checked_mul(4).ok_or_else(|| anyhow!("packet byte count overflow"))?;
-        self.with_host_mut(|host| {
-            host.pending_error = None;
-            host.pending_panic = None;
-        });
+        self.clear_pending();
         let mut ptr_out = 0i32;
         let mut trap_code = 0u8;
         let rc = unsafe {
@@ -4117,9 +4128,7 @@ impl AotGuest {
                 if is_oom_trap_code(trap_code) {
                     self.saw_oom = true;
                 }
-                return Err(self
-                    .with_host_mut(|host| host.pending_error.take())
-                    .unwrap_or_else(|| self.lib.trap_error(trap_code)));
+                return Err(self.take_pending_error().unwrap_or_else(|| self.lib.trap_error(trap_code)));
             }
             _ => bail!("invalid_abi: missing blot:allocate"),
         };
@@ -4145,10 +4154,7 @@ impl AotGuest {
     }
 
     pub(crate) fn call_raw(&mut self, name: &str, param: Val, result_is_f32: bool) -> Result<Val> {
-        self.with_host_mut(|host| {
-            host.pending_error = None;
-            host.pending_panic = None;
-        });
+        self.clear_pending();
         let arg_bits = match param {
             Val::I32(v) => u64::from(v.cast_unsigned()),
             Val::F32(bits) => u64::from(bits),
@@ -4210,10 +4216,7 @@ impl AotGuest {
             return Ok(None);
         }
         self.last_reclaimed_owners = None;
-        self.with_host_mut(|host| {
-            host.pending_error = None;
-            host.pending_panic = None;
-        });
+        self.clear_pending();
         let mut released = 0i32;
         let mut trap_code = 0u8;
         let rc = unsafe { (self.lib.syms.call_finish_invocation)(self.handle.0, &mut released, &mut trap_code) };
@@ -4234,9 +4237,7 @@ impl AotGuest {
                 if is_oom_trap_code(trap_code) {
                     self.saw_oom = true;
                 }
-                Err(self
-                    .with_host_mut(|host| host.pending_error.take())
-                    .unwrap_or_else(|| self.lib.trap_error(trap_code)))
+                Err(self.take_pending_error().unwrap_or_else(|| self.lib.trap_error(trap_code)))
             }
             _ => bail!("invalid_abi: missing blot:finish_invocation"),
         }
@@ -4251,8 +4252,44 @@ impl AotGuest {
         self.with_host_mut(|host| host.memory = Some(gauge));
     }
 
+    #[inline]
+    fn clear_pending(&mut self) {
+        // SAFETY: `self.host.0` points to the live `AotHostBox` owned by `self`.
+        let host_box = unsafe { &*self.host.0 };
+        if host_box.has_pending_error.load(Ordering::Acquire) || host_box.has_pending_panic.load(Ordering::Acquire) {
+            let mut host = host_box.state.lock().unwrap_or_else(|e| e.into_inner());
+            host.pending_error = None;
+            host.pending_panic = None;
+            host_box.has_pending_error.store(false, Ordering::Release);
+            host_box.has_pending_panic.store(false, Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn take_pending_error(&mut self) -> Option<anyhow::Error> {
+        // SAFETY: `self.host.0` points to the live `AotHostBox` owned by `self`.
+        let host_box = unsafe { &*self.host.0 };
+        if !host_box.has_pending_error.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut host = host_box.state.lock().unwrap_or_else(|e| e.into_inner());
+        host_box.has_pending_error.store(false, Ordering::Release);
+        host.pending_error.take()
+    }
+
+    #[inline]
     fn maybe_resume_panic(&mut self) {
-        if let Some(payload) = self.with_host_mut(|host| host.pending_panic.take()) {
+        // SAFETY: `self.host.0` points to the live `AotHostBox` owned by `self`.
+        let host_box = unsafe { &*self.host.0 };
+        if !host_box.has_pending_panic.load(Ordering::Acquire) {
+            return;
+        }
+        let payload = {
+            let mut host = host_box.state.lock().unwrap_or_else(|e| e.into_inner());
+            host_box.has_pending_panic.store(false, Ordering::Release);
+            host.pending_panic.take()
+        };
+        if let Some(payload) = payload {
             // Poison the guest handle before resuming unwind so partially unwound state cannot be reused.
             self.disposed = true;
             resume_unwind(payload);
@@ -4309,9 +4346,7 @@ impl AotGuest {
                 if is_oom_trap_code(trap_code) {
                     self.saw_oom = true;
                 }
-                Err(self
-                    .with_host_mut(|host| host.pending_error.take())
-                    .unwrap_or_else(|| self.decorate_trap(self.lib.trap_error(trap_code))))
+                Err(self.take_pending_error().unwrap_or_else(|| self.decorate_trap(self.lib.trap_error(trap_code))))
             }
             1 => {
                 if is_oom_trap_code(trap_code) {
@@ -4340,9 +4375,7 @@ impl AotGuest {
                 if is_oom_trap_code(trap_code) {
                     self.saw_oom = true;
                 }
-                Err(self
-                    .with_host_mut(|host| host.pending_error.take())
-                    .unwrap_or_else(|| self.lib.trap_error(trap_code)))
+                Err(self.take_pending_error().unwrap_or_else(|| self.lib.trap_error(trap_code)))
             }
             _ => bail!("invalid_abi: missing blot:reset"),
         }
@@ -4364,10 +4397,7 @@ impl AotGuest {
 
     fn begin_and_run(&mut self, function: &GuestFunction, argument: Argument) -> Result<Value> {
         let name = &function.name;
-        self.with_host_mut(|host| {
-            host.pending_error = None;
-            host.pending_panic = None;
-        });
+        self.clear_pending();
         if self.abi.ownership {
             self.call_export_raw(OWNERSHIP_ENTER, 0)?;
             self.entered = true;
@@ -4418,10 +4448,17 @@ impl AotGuest {
                         write(slice)
                     },
                 );
-                let pending = self.with_host_mut(|host| {
+                let pending = {
+                    let host_box = unsafe { &*self.host.0 };
+                    let mut host = host_box.state.lock().unwrap_or_else(|e| e.into_inner());
                     host.spare = spare;
-                    if alloc_host_err { host.pending_error.take() } else { None }
-                });
+                    if alloc_host_err {
+                        host_box.has_pending_error.store(false, Ordering::Release);
+                        host.pending_error.take()
+                    } else {
+                        None
+                    }
+                };
                 self.maybe_resume_panic();
                 if let Some(err) = pending {
                     return Err(err);
@@ -4467,9 +4504,7 @@ impl AotGuest {
                     Ok(())
                 }
                 1 => Err(self.lib.trap_error(trap_code)),
-                2 => Err(self
-                    .with_host_mut(|host| host.pending_error.take())
-                    .unwrap_or_else(|| self.lib.trap_error(trap_code))),
+                2 => Err(self.take_pending_error().unwrap_or_else(|| self.lib.trap_error(trap_code))),
                 _ => bail!("invalid_abi: missing blot:finish_invocation"),
             }
         } else {
@@ -4487,10 +4522,7 @@ impl AotGuest {
         if std::mem::replace(&mut self.disposed, true) {
             return Ok(());
         }
-        self.with_host_mut(|host| {
-            host.pending_error = None;
-            host.pending_panic = None;
-        });
+        self.clear_pending();
         let mut left = Ok(());
         if self.abi.ownership {
             left = self.call_export_raw(OWNERSHIP_LEAVE, u64::from(TEARDOWN.cast_unsigned())).map(|_| ());

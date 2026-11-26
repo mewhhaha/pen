@@ -3135,9 +3135,25 @@ pub mod codec {
         pub const GAME: u32 = 100;
     }
 
+    #[inline]
+    fn all_finite(values: &[f32]) -> bool {
+        const EXP_MASK: u32 = 0x7f80_0000;
+        let (chunks, rest) = values.as_chunks::<16>();
+        for chunk in chunks {
+            let mut nonfinite = 0u32;
+            for &value in chunk {
+                nonfinite |= u32::from((value.to_bits() & EXP_MASK) == EXP_MASK);
+            }
+            if nonfinite != 0 {
+                return false;
+            }
+        }
+        rest.iter().all(|value| value.is_finite())
+    }
+
     pub fn validate_state(state: &[f32]) -> Result<()> {
         ensure!(
-            state.len() <= MAX_STATE_FLOATS && state.iter().all(|value| value.is_finite()),
+            state.len() <= MAX_STATE_FLOATS && all_finite(state),
             "game state must be a bounded array of finite float32 values"
         );
         Ok(())
@@ -3264,7 +3280,7 @@ pub mod codec {
             packet.extend_from_slice(&event_record(event));
         }
         packet.extend_from_slice(state);
-        ensure!(packet.iter().all(|value| value.is_finite()), "frame contains a nonfinite float32 value");
+        ensure!(all_finite(&packet[..packet.len() - state.len()]), "frame contains a nonfinite float32 value");
         Ok(packet)
     }
 
@@ -3287,7 +3303,7 @@ pub mod codec {
         #[inline]
         fn count(&self, index: usize, maximum: usize) -> Result<usize> {
             let value = self.packet[index];
-            if value.fract() != 0.0 || value < 0.0 || value > maximum as f32 {
+            if !(0.0..=maximum as f32).contains(&value) || (value < 8_388_608.0 && (value as u32) as f32 != value) {
                 bail!("game returned an invalid frame count or flag");
             }
             Ok(value as usize)
@@ -3295,7 +3311,14 @@ pub mod codec {
 
         #[inline]
         fn flag(&self, index: usize) -> Result<bool> {
-            Ok(self.count(index, 1)? == 1)
+            let value = self.packet[index];
+            if value == 0.0 {
+                Ok(false)
+            } else if value == 1.0 {
+                Ok(true)
+            } else {
+                bail!("game returned an invalid frame count or flag");
+            }
         }
 
         #[inline]
@@ -3322,6 +3345,7 @@ pub mod codec {
         }
 
         fn decode_draw(&mut self, lane: usize, draw: &mut Draw) -> Result<()> {
+            let _ = &self.packet[lane..lane + DRAW_FLOATS];
             let mesh = self.mesh_at(lane)?;
             let material = self.material_at(lane + 1)?;
             let transform = self.matrix(lane + 2);
@@ -3338,6 +3362,7 @@ pub mod codec {
         }
 
         fn decode_solid_face(&mut self, lane: usize, solid_face: &mut SolidFace) -> Result<()> {
+            let _ = &self.packet[lane..lane + SOLID_FACE_FLOATS];
             let normal = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
             let distance = self.packet[lane + 3];
             let material = self.material_at(lane + 4)?;
@@ -3346,6 +3371,7 @@ pub mod codec {
         }
 
         fn decode_decal(&mut self, lane: usize, decal: &mut Decal) -> Result<()> {
+            let _ = &self.packet[lane..lane + DECAL_FLOATS];
             let material = self.material_at(lane)?;
             let transform = self.matrix(lane + 1);
             let opacity = self.packet[lane + 17];
@@ -3354,6 +3380,7 @@ pub mod codec {
         }
 
         fn decode_sound(&mut self, lane: usize, sound: &mut Sound) -> Result<()> {
+            let _ = &self.packet[lane..lane + SOUND_FLOATS];
             let clip = self.sound_at(lane)?;
             let bus = self.count(lane + 1, 15)?;
             let gain = self.packet[lane + 2];
@@ -3366,6 +3393,7 @@ pub mod codec {
         }
 
         fn decode_sprite(&mut self, lane: usize, sprite: &mut Sprite) -> Result<()> {
+            let _ = &self.packet[lane..lane + SPRITE_FLOATS];
             let x = self.packet[lane];
             let y = self.packet[lane + 1];
             let width = self.packet[lane + 2];
@@ -3382,6 +3410,7 @@ pub mod codec {
         }
 
         fn decode_inset(&mut self, lane: usize, inset: &mut Inset) -> Result<()> {
+            let _ = &self.packet[lane..lane + INSET_FLOATS];
             let x = self.packet[lane];
             let y = self.packet[lane + 1];
             let width = self.packet[lane + 2];
@@ -3407,6 +3436,7 @@ pub mod codec {
         }
 
         fn decode_bus(&mut self, lane: usize, bus: &mut Bus) -> Result<()> {
+            let _ = &self.packet[lane..lane + BUS_FLOATS];
             let gain = self.packet[lane];
             let lowpass = self.packet[lane + 1];
             let reverb = self.packet[lane + 2];
@@ -3422,6 +3452,7 @@ pub mod codec {
         }
 
         fn decode_voice(&mut self, lane: usize, voice: &mut Voice) -> Result<()> {
+            let _ = &self.packet[lane..lane + VOICE_FLOATS];
             let id = self.count(lane, MAX_VOICE_ID)?;
             let clip = self.sound_at(lane + 1)?;
             let bus = self.count(lane + 2, 15)?;
@@ -3439,6 +3470,7 @@ pub mod codec {
         }
 
         fn decode_pose(&mut self, lane: usize, pose: &mut Pose) -> Result<()> {
+            let _ = &self.packet[lane..lane + POSE_FLOATS];
             let draw = self.count(lane, MAX_DRAWS)?;
             let clip = self.count(lane + 1, 65535)?;
             let time = self.packet[lane + 2];
@@ -3449,6 +3481,7 @@ pub mod codec {
         }
 
         fn decode_emitter(&mut self, lane: usize, emitter: &mut Emitter) -> Result<()> {
+            let _ = &self.packet[lane..lane + EMITTER_FLOATS];
             let material = self.material_at(lane)?;
             let transform = self.matrix(lane + 1);
             let seed = self.count(lane + 17, 16777215)?;
@@ -3476,6 +3509,7 @@ pub mod codec {
         }
 
         fn decode_light(&mut self, lane: usize, light: &mut Light) -> Result<()> {
+            let _ = &self.packet[lane..lane + LIGHT_FLOATS];
             let position = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
             let radius = self.packet[lane + 3];
             let color = Vector { x: self.packet[lane + 4], y: self.packet[lane + 5], z: self.packet[lane + 6] };
@@ -3489,6 +3523,7 @@ pub mod codec {
         }
 
         fn decode_cascade(&mut self, lane: usize, cascade: &mut Cascade) -> Result<()> {
+            let _ = &self.packet[lane..lane + CASCADE_FLOATS];
             let projection = self.matrix(lane);
             let texel = self.packet[lane + 16];
             let far = self.packet[lane + 17];
@@ -3497,6 +3532,7 @@ pub mod codec {
         }
 
         fn decode_probe(&mut self, lane: usize, probe: &mut Probe) -> Result<()> {
+            let _ = &self.packet[lane..lane + PROBE_FLOATS];
             let sh0 = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
             let sh1 = Vector { x: self.packet[lane + 3], y: self.packet[lane + 4], z: self.packet[lane + 5] };
             let sh2 = Vector { x: self.packet[lane + 6], y: self.packet[lane + 7], z: self.packet[lane + 8] };
@@ -3512,6 +3548,7 @@ pub mod codec {
         }
 
         fn decode_reflection_probe(&mut self, lane: usize, reflection_probe: &mut ReflectionProbe) -> Result<()> {
+            let _ = &self.packet[lane..lane + REFLECTION_PROBE_FLOATS];
             let id = self.count(lane, 16777215)?;
             let revision = self.count(lane + 1, 16777215)?;
             let priority = self.count(lane + 2, 255)?;
@@ -3528,6 +3565,7 @@ pub mod codec {
         }
 
         fn decode_fog_volume(&mut self, lane: usize, fog_volume: &mut FogVolume) -> Result<()> {
+            let _ = &self.packet[lane..lane + FOG_VOLUME_FLOATS];
             let shape = self.count(lane, 1)?;
             let center = Vector { x: self.packet[lane + 1], y: self.packet[lane + 2], z: self.packet[lane + 3] };
             let extent = Vector { x: self.packet[lane + 4], y: self.packet[lane + 5], z: self.packet[lane + 6] };
@@ -3540,6 +3578,7 @@ pub mod codec {
         }
 
         fn decode_listener(&mut self, lane: usize, listener: &mut Listener) -> Result<()> {
+            let _ = &self.packet[lane..lane + LISTENER_FLOATS];
             let position = Vector { x: self.packet[lane], y: self.packet[lane + 1], z: self.packet[lane + 2] };
             let forward = Vector { x: self.packet[lane + 3], y: self.packet[lane + 4], z: self.packet[lane + 5] };
             let up = Vector { x: self.packet[lane + 6], y: self.packet[lane + 7], z: self.packet[lane + 8] };
@@ -3549,6 +3588,7 @@ pub mod codec {
         }
 
         fn decode_panner(&mut self, lane: usize, panner: &mut Panner) -> Result<()> {
+            let _ = &self.packet[lane..lane + PANNER_FLOATS];
             let voice = self.count(lane, MAX_VOICE_ID)?;
             let sound = self.count(lane + 1, 255)?;
             let position = Vector { x: self.packet[lane + 2], y: self.packet[lane + 3], z: self.packet[lane + 4] };
@@ -3570,6 +3610,7 @@ pub mod codec {
         }
 
         fn decode_instance(&mut self, lane: usize, instance: &mut Instance) -> Result<()> {
+            let _ = &self.packet[lane..lane + INSTANCE_FLOATS];
             let id_low = self.count(lane, 65535)?;
             let id_high = self.count(lane + 1, 65535)?;
             let order = self.count(lane + 2, 16777215)?;
@@ -3584,6 +3625,7 @@ pub mod codec {
         }
 
         fn decode_instance_removal(&mut self, lane: usize, instance_removal: &mut InstanceRemoval) -> Result<()> {
+            let _ = &self.packet[lane..lane + INSTANCE_REMOVAL_FLOATS];
             let id_low = self.count(lane, 65535)?;
             let id_high = self.count(lane + 1, 65535)?;
             *instance_removal = InstanceRemoval { id_low: id_low as u32, id_high: id_high as u32 };
@@ -3591,6 +3633,7 @@ pub mod codec {
         }
 
         fn decode_bone_matrix(&mut self, lane: usize, bone_matrix: &mut BoneMatrix) -> Result<()> {
+            let _ = &self.packet[lane..lane + BONE_MATRIX_FLOATS];
             let inset = self.count(lane, 16)?;
             let draw = self.count(lane + 1, MAX_DRAWS)?;
             let joint = self.count(lane + 2, 1024)?;
@@ -3600,6 +3643,7 @@ pub mod codec {
         }
 
         fn decode_morph_weight(&mut self, lane: usize, morph_weight: &mut MorphWeight) -> Result<()> {
+            let _ = &self.packet[lane..lane + MORPH_WEIGHT_FLOATS];
             let inset = self.count(lane, 16)?;
             let draw = self.count(lane + 1, MAX_DRAWS)?;
             let target = self.count(lane + 2, 256)?;
@@ -3609,6 +3653,7 @@ pub mod codec {
         }
 
         fn decode_motion(&mut self, lane: usize, motion: &mut Motion) -> Result<()> {
+            let _ = &self.packet[lane..lane + MOTION_FLOATS];
             let draw = self.count(lane, MAX_DRAWS)?;
             let previous = self.matrix(lane + 1);
             *motion = Motion { draw: draw as u32, previous };
@@ -3616,6 +3661,7 @@ pub mod codec {
         }
 
         fn decode_ribbon_point(&mut self, lane: usize, ribbon_point: &mut RibbonPoint) -> Result<()> {
+            let _ = &self.packet[lane..lane + RIBBON_FLOATS];
             let ribbon = self.count(lane, 65535)?;
             let material = self.material_at(lane + 1)?;
             let additive = self.flag(lane + 2)?;
@@ -3628,6 +3674,7 @@ pub mod codec {
         }
 
         fn decode_haptic(&mut self, lane: usize, haptic: &mut Haptic) -> Result<()> {
+            let _ = &self.packet[lane..lane + HAPTIC_FLOATS];
             let pad = self.count(lane, 15)?;
             let low = self.packet[lane + 1];
             let high = self.packet[lane + 2];
@@ -3637,6 +3684,7 @@ pub mod codec {
         }
 
         fn decode_reverb_zone(&mut self, lane: usize, reverb_zone: &mut ReverbZone) -> Result<()> {
+            let _ = &self.packet[lane..lane + REVERB_ZONE_FLOATS];
             let id = self.count(lane, 64)?;
             let position = Vector { x: self.packet[lane + 1], y: self.packet[lane + 2], z: self.packet[lane + 3] };
             let half_extents = Vector { x: self.packet[lane + 4], y: self.packet[lane + 5], z: self.packet[lane + 6] };
@@ -3650,6 +3698,7 @@ pub mod codec {
         }
 
         fn decode_synth_voice(&mut self, lane: usize, synth_voice: &mut SynthVoice) -> Result<()> {
+            let _ = &self.packet[lane..lane + SYNTH_VOICE_FLOATS];
             let id = self.count(lane, MAX_VOICE_ID)?;
             let mode = self.count(lane + 1, 5)?;
             let bus = self.count(lane + 2, 15)?;
@@ -3671,6 +3720,7 @@ pub mod codec {
         }
 
         fn decode_area_light_spec(&mut self, lane: usize, area_light_spec: &mut AreaLightSpec) -> Result<()> {
+            let _ = &self.packet[lane..lane + AREA_LIGHT_FLOATS];
             let kind = self.count(lane, 3)?;
             let position = Vector { x: self.packet[lane + 1], y: self.packet[lane + 2], z: self.packet[lane + 3] };
             let right = Vector { x: self.packet[lane + 4], y: self.packet[lane + 5], z: self.packet[lane + 6] };
@@ -3687,6 +3737,7 @@ pub mod codec {
         }
 
         fn decode_pbr_decal_spec(&mut self, lane: usize, pbr_decal_spec: &mut PbrDecalSpec) -> Result<()> {
+            let _ = &self.packet[lane..lane + PBR_DECAL_FLOATS];
             let material = self.material_at(lane)?;
             let transform = self.matrix(lane + 1);
             let albedo = Color { r: self.packet[lane + 17], g: self.packet[lane + 18], b: self.packet[lane + 19], a: self.packet[lane + 20] };
@@ -3700,6 +3751,7 @@ pub mod codec {
         }
 
         fn decode_camera_target_spec(&mut self, lane: usize, camera_target_spec: &mut CameraTargetSpec) -> Result<()> {
+            let _ = &self.packet[lane..lane + CAMERA_TARGET_FLOATS];
             let material = self.material_at(lane)?;
             let width = self.count(lane + 1, 4096)?;
             let height = self.count(lane + 2, 4096)?;
@@ -3715,6 +3767,7 @@ pub mod codec {
         }
 
         fn decode_video_stream_spec(&mut self, lane: usize, video_stream_spec: &mut VideoStreamSpec) -> Result<()> {
+            let _ = &self.packet[lane..lane + VIDEO_STREAM_FLOATS];
             let material = self.material_at(lane)?;
             let time = self.packet[lane + 1];
             let playing = self.flag(lane + 2)?;
@@ -3873,7 +3926,7 @@ pub mod codec {
         let video_streams_end = video_streams_start + video_streams_count * VIDEO_STREAM_FLOATS;
         let extras_start = video_streams_end;
         let truncated = "game returned a truncated, oversized or nonfinite frame";
-        ensure!(packet.len() >= video_streams_end && packet.iter().all(|value| value.is_finite()), truncated);
+        ensure!(packet.len() >= video_streams_end && all_finite(packet), truncated);
         // What the records' tails claim of extras, in order.
         let mut extras_lanes = 0;
         for index in 0..draws_count {

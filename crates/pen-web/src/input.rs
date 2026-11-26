@@ -44,24 +44,23 @@ fn listen(target: &EventTarget, name: &str, call: impl FnMut(Event) + 'static) {
     callback.forget();
 }
 
-/// The canvas's backing pixels per CSS pixel.
-fn ratio(canvas: &HtmlCanvasElement) -> f64 {
-    let rect = canvas.get_bounding_client_rect();
-    if rect.width() > 0.0 { f64::from(canvas.width()) / rect.width() } else { 1.0 }
+/// CSS pixels on the canvas as its backing pixels, using an already-fetched bounding rect.
+fn to_backing_with_rect(canvas: &HtmlCanvasElement, rect: &web_sys::DomRect, x: f64, y: f64) -> (f32, f32) {
+    let (x, y) = pen_runtime::scale::to_frame((x, y), (rect.width(), rect.height()), (canvas.width(), canvas.height()));
+    (x as f32, y as f32)
 }
 
 /// CSS pixels on the canvas as its backing pixels, which the game lays out
 /// on, each axis apart (`pen_runtime::scale`).
 fn to_backing(canvas: &HtmlCanvasElement, x: f64, y: f64) -> (f32, f32) {
     let rect = canvas.get_bounding_client_rect();
-    let (x, y) = pen_runtime::scale::to_frame((x, y), (rect.width(), rect.height()), (canvas.width(), canvas.height()));
-    (x as f32, y as f32)
+    to_backing_with_rect(canvas, &rect, x, y)
 }
 
 /// Where a mouse or pointer event is, in the canvas's backing pixels.
 fn place(canvas: &HtmlCanvasElement, mouse: &MouseEvent) -> (f32, f32) {
     let rect = canvas.get_bounding_client_rect();
-    to_backing(canvas, f64::from(mouse.client_x()) - rect.x(), f64::from(mouse.client_y()) - rect.y())
+    to_backing_with_rect(canvas, &rect, f64::from(mouse.client_x()) - rect.x(), f64::from(mouse.client_y()) - rect.y())
 }
 
 /// A gamepad as the standard layout reads it: the first buttons and axes,
@@ -361,7 +360,7 @@ impl Input {
         // Backing pixels to the page's CSS pixels.
         let window = web_sys::window().unwrap();
         let rect = self.canvas.get_bounding_client_rect();
-        let ratio = ratio(&self.canvas);
+        let ratio = if rect.width() > 0.0 { f64::from(self.canvas.width()) / rect.width() } else { 1.0 };
         let left = rect.x() + window.scroll_x().unwrap_or(0.0) + f64::from(x) / ratio;
         let top = rect.y() + window.scroll_y().unwrap_or(0.0) + f64::from(y) / ratio;
         let style = self.field.style();

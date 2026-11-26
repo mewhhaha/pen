@@ -36,6 +36,7 @@ pub struct Seen {
 pub struct Probe {
     seen: Mutex<Seen>,
     profile: Mutex<Option<Arc<Profile>>>,
+    attached: AtomicBool,
 }
 
 impl Probe {
@@ -49,11 +50,25 @@ impl Probe {
 
     /// Samples the guest into `profile` from now on, or stops with None.
     pub fn attach(&self, profile: Option<Arc<Profile>>) {
-        *self.profile.lock().unwrap() = profile;
+        let mut slot = self.profile.lock().unwrap();
+        self.attached.store(profile.is_some(), Ordering::Release);
+        *slot = profile;
+    }
+
+    /// Fast check whether an attached profile is currently sampling, without cloning `Arc<Profile>`.
+    #[inline]
+    pub(crate) fn is_sampling(&self) -> bool {
+        if !self.attached.load(Ordering::Acquire) {
+            return false;
+        }
+        self.profile.lock().unwrap().as_ref().is_some_and(|profile| profile.sampling())
     }
 
     /// The profile its guest is sampled into, while it samples.
     pub(crate) fn sampling(&self) -> Option<Arc<Profile>> {
+        if !self.attached.load(Ordering::Acquire) {
+            return None;
+        }
         self.profile.lock().unwrap().clone().filter(|profile| profile.sampling())
     }
 

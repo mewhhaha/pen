@@ -77,7 +77,7 @@ impl Accessibility {
     }
     /// Shows `nodes`, the dev tools' interface when `tools`, else the game's.
     pub fn update(&mut self, nodes: &[UiNode], tools: bool) -> Result<()> {
-        if self.last == nodes && self.tools == tools {
+        if self.tools == tools && a11y_nodes_equal(&self.last, nodes) {
             return Ok(());
         }
         let document = web_sys::window().unwrap().document().unwrap();
@@ -290,6 +290,32 @@ impl Drop for Accessibility {
             captions.remove();
         }
     }
+}
+
+fn a11y_nodes_equal(a: &[UiNode], b: &[UiNode]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.id == y.id
+                && x.parent == y.parent
+                && x.role == y.role
+                && x.focusable == y.focusable
+                && x.focused == y.focused
+                && x.disabled == y.disabled
+                && x.hidden == y.hidden
+                && x.modal == y.modal
+                && x.checked == y.checked
+                && x.expanded == y.expanded
+                && x.selected == y.selected
+                && x.live == y.live
+                && x.value.to_bits() == y.value.to_bits()
+                && x.minimum.to_bits() == y.minimum.to_bits()
+                && x.maximum.to_bits() == y.maximum.to_bits()
+                && x.actions == y.actions
+                && x.text_length == y.text_length
+                && x.name_length == y.name_length
+                && x.description_length == y.description_length
+                && x.text == y.text
+        })
 }
 
 fn takes(node: &UiNode, action: u32) -> bool {

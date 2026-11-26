@@ -335,6 +335,7 @@ impl Glide {
     }
 
     /// This sample's value, then a step on.
+    #[inline]
     fn next(&mut self, step: f64) -> f32 {
         let value = self.value;
         if value != self.target {
@@ -348,6 +349,16 @@ impl Glide {
         }
         value as f32
     }
+
+    #[inline]
+    fn is_settled(&self) -> bool {
+        self.value == self.target
+    }
+
+    #[inline]
+    fn current(&self) -> f32 {
+        self.value as f32
+    }
 }
 
 /// A fade: linearRampToValueAtTime from `from` at sample `start` to `to`
@@ -358,13 +369,19 @@ struct Ramp {
     to: f64,
     start: u64,
     length: f64,
+    inv_length: f64,
 }
 
 impl Ramp {
-    fn hold(value: f64) -> Ramp {
-        Ramp { from: value, to: value, start: 0, length: 0.0 }
+    fn new(from: f64, to: f64, start: u64, length: f64) -> Ramp {
+        Ramp { from, to, start, length, inv_length: if length > 0.0 { 1.0 / length } else { 0.0 } }
     }
 
+    fn hold(value: f64) -> Ramp {
+        Ramp { from: value, to: value, start: 0, length: 0.0, inv_length: 0.0 }
+    }
+
+    #[inline]
     fn at(&self, sample: u64) -> f64 {
         let since = sample.saturating_sub(self.start) as f64;
         if sample < self.start {
@@ -372,7 +389,18 @@ impl Ramp {
         } else if since >= self.length {
             self.to
         } else {
-            self.from + (self.to - self.from) * since / self.length
+            self.from + (self.to - self.from) * (since * self.inv_length)
+        }
+    }
+
+    #[inline]
+    fn settled_at(&self, start_sample: u64, end_sample: u64) -> Option<f32> {
+        if start_sample >= self.start && (start_sample - self.start) as f64 >= self.length {
+            Some(self.to as f32)
+        } else if end_sample <= self.start {
+            Some(self.from as f32)
+        } else {
+            None
         }
     }
 
@@ -434,6 +462,7 @@ impl Lowpass {
     }
 
     /// The cutoff for this sample, and the coefficients with it.
+    #[inline]
     fn step(&mut self, glide: f64, rate: f64) {
         let cutoff = self.cutoff.next(glide);
         if cutoff.to_bits() != self.computed.to_bits() {
@@ -441,6 +470,19 @@ impl Lowpass {
         }
     }
 
+    #[inline]
+    fn is_open_settled(&self) -> bool {
+        self.open && self.cutoff.is_settled()
+    }
+
+    #[inline]
+    fn seed_open_pair(&mut self, channel: usize, prev: f32, last: f32) {
+        let x2 = f64::from(prev);
+        let x1 = f64::from(last);
+        self.state[channel] = [x1, x2, x1, x2];
+    }
+
+    #[inline]
     fn run(&mut self, channel: usize, input: f32) -> f32 {
         if self.open {
             let x = f64::from(input);
@@ -498,7 +540,10 @@ struct Binaural {
     ring: [[f32; 64]; 2],
     write: usize,
     shadow: [f64; 2],
-    itd_samples: f64,
+    delay_l_i0: usize,
+    delay_l_frac: f32,
+    delay_r_i0: usize,
+    delay_r_frac: f32,
     alpha_left: f64,
     alpha_right: f64,
     initialized: bool,
@@ -510,7 +555,10 @@ impl Binaural {
             ring: [[0.0; 64]; 2],
             write: 0,
             shadow: [0.0; 2],
-            itd_samples: 0.0,
+            delay_l_i0: 0,
+            delay_l_frac: 0.0,
+            delay_r_i0: 0,
+            delay_r_frac: 0.0,
             alpha_left: 1.0,
             alpha_right: 1.0,
             initialized: false,
@@ -522,7 +570,14 @@ impl Binaural {
         let az_rad = azimuth_deg.to_radians();
         let lateral = az_rad.sin().clamp(-1.0, 1.0);
         let itd_sec = (0.0875 / 343.0) * (lateral + lateral.asin());
-        self.itd_samples = (itd_sec * rate).clamp(-56.0, 56.0);
+        let itd_samples = (itd_sec * rate).clamp(-56.0, 56.0);
+        let (delay_l, delay_r) = if itd_samples >= 0.0 { (itd_samples, 0.0) } else { (0.0, -itd_samples) };
+        let dl = delay_l.clamp(0.0, 60.0);
+        let dr = delay_r.clamp(0.0, 60.0);
+        self.delay_l_i0 = dl.floor() as usize;
+        self.delay_l_frac = (dl - self.delay_l_i0 as f64) as f32;
+        self.delay_r_i0 = dr.floor() as usize;
+        self.delay_r_frac = (dr - self.delay_r_i0 as f64) as f32;
         // Rear hemisphere (z > 0 in listener space) adds subtle pinna high-frequency dulling.
         let dist = (f64::from(position[0]).powi(2) + f64::from(position[1]).powi(2) + f64::from(position[2]).powi(2))
             .sqrt()
@@ -542,22 +597,17 @@ impl Binaural {
         self.initialized = true;
     }
 
+    #[inline]
     fn process(&mut self, left: f32, right: f32) -> (f32, f32) {
         let w = self.write;
         self.ring[0][w] = left;
         self.ring[1][w] = right;
-        let read_delayed = |ch: usize, delay: f64| -> f32 {
-            let d = delay.clamp(0.0, 60.0);
-            let i0 = d.floor() as usize;
-            let frac = (d - i0 as f64) as f32;
-            let idx0 = (w + 64 - i0) & 63;
-            let idx1 = (w + 64 - i0 - 1) & 63;
-            self.ring[ch][idx0] * (1.0 - frac) + self.ring[ch][idx1] * frac
-        };
-        let (delay_l, delay_r) =
-            if self.itd_samples >= 0.0 { (self.itd_samples, 0.0) } else { (0.0, -self.itd_samples) };
-        let dl = f64::from(read_delayed(0, delay_l));
-        let dr = f64::from(read_delayed(1, delay_r));
+        let l0 = (w + 64 - self.delay_l_i0) & 63;
+        let l1 = (l0.wrapping_sub(1)) & 63;
+        let dl = f64::from(self.ring[0][l0] * (1.0 - self.delay_l_frac) + self.ring[0][l1] * self.delay_l_frac);
+        let r0 = (w + 64 - self.delay_r_i0) & 63;
+        let r1 = (r0.wrapping_sub(1)) & 63;
+        let dr = f64::from(self.ring[1][r0] * (1.0 - self.delay_r_frac) + self.ring[1][r1] * self.delay_r_frac);
         self.shadow[0] += self.alpha_left * (dl - self.shadow[0]);
         self.shadow[1] += self.alpha_right * (dr - self.shadow[1]);
         if self.shadow[0].abs() < 1e-30 {
@@ -691,12 +741,19 @@ struct Voice {
 }
 
 impl Voice {
-    /// Starts at sample `now`, at the values of `sound`, `start` seconds
-    /// into its clip, its stream from `streams` if it streams.
+    /// Starts at sample `now`, `start` seconds into `clip`, its stream from
+    /// `streams` if it streams.
     #[allow(clippy::too_many_arguments, reason = "a voice's start")]
     fn new(
         id: Option<u32>,
-        sound: &SoundSpec,
+        clip: Arc<Clip>,
+        bus: usize,
+        gain: f32,
+        pan: f32,
+        pitch: f32,
+        lowpass: f32,
+        reverb: f32,
+        panner: Option<Placement>,
         looping: bool,
         start: f32,
         fade_in: f32,
@@ -704,15 +761,10 @@ impl Voice {
         rate: f64,
         streams: &mut Streams,
     ) -> Voice {
-        let SoundSpec { ref clip, bus, gain, pan, pitch, lowpass, reverb, panner } = *sound;
         let length = clip.len() as f64;
         let offset = f64::from(start) * clip.rate;
         let position = if looping && length > 0.0 { offset.rem_euclid(length) } else { offset.max(0.0) };
-        let fade = if fade_in > 0.0 {
-            Ramp { from: 0.0, to: 1.0, start: now, length: f64::from(fade_in) * rate }
-        } else {
-            Ramp::hold(1.0)
-        };
+        let fade = if fade_in > 0.0 { Ramp::new(0.0, 1.0, now, f64::from(fade_in) * rate) } else { Ramp::hold(1.0) };
         let first = position as usize;
         let stream = match &clip.streamed {
             Some(encoded) if position < length => streams.open(encoded, clip.rate, first),
@@ -722,7 +774,7 @@ impl Voice {
             id,
             // A clip that streams but finds no stream free plays nothing.
             ended: position >= length || (clip.streamed.is_some() && stream.is_none()),
-            clip: clip.clone(),
+            clip,
             bus,
             position,
             looping,
@@ -751,7 +803,7 @@ impl Voice {
     fn leave(&mut self, now: u64, rate: f64) {
         let current = self.fade.at(now);
         let seconds = f64::from(self.fade_out).max(FADE_SECONDS);
-        self.fade = Ramp { from: current, to: 0.0, start: now, length: seconds * rate };
+        self.fade = Ramp::new(current, 0.0, now, seconds * rate);
         self.leaving = true;
     }
 
@@ -787,6 +839,96 @@ impl Voice {
         let wet_scale = self.spatial.as_ref().map_or(1.0, Spatial::wet_scale);
         let step = f64::from(self.pitch.next(quantum_glide)) * doppler * self.clip.rate / rate;
         let mono = self.clip.mono;
+        // Fast path: non-streamed, non-spatial, settled 1:1 playback with open lowpass inside clip bounds.
+        if self.stream.is_none()
+            && self.spatial.is_none()
+            && self.lowpass.is_open_settled()
+            && self.gain.is_settled()
+            && self.pan.is_settled()
+            && self.send.is_settled()
+            && step == 1.0
+            && let Some(fade) = self.fade.settled_at(now, now + QUANTUM as u64)
+            && self.position >= 0.0
+            && self.position == (self.position as usize) as f64
+        {
+            let start_idx = self.position as usize;
+            if start_idx + QUANTUM <= length {
+                let pan = self.pan.current();
+                if pan.to_bits() != self.panned.to_bits() {
+                    self.panned = pan;
+                    let (left, right) = if mono { mono_gains(pan) } else { pan_gains(pan) };
+                    self.gains = Pan { left, right, rightward: pan > 0.0 };
+                }
+                let gains = self.gains;
+                let voice_gain = self.gain.current();
+                let rev = self.send.current() * wet_scale;
+                let src = &frames[start_idx..start_idx + QUANTUM];
+                if mono {
+                    if rev == 0.0 {
+                        for i in 0..QUANTUM {
+                            let x = src[i][0] * fade * voice_gain;
+                            dry[i][0] += x * gains.left;
+                            dry[i][1] += x * gains.right;
+                        }
+                    } else {
+                        for i in 0..QUANTUM {
+                            let x = src[i][0] * fade * voice_gain;
+                            let ol = x * gains.left;
+                            let or = x * gains.right;
+                            dry[i][0] += ol;
+                            dry[i][1] += or;
+                            send[i][0] += ol * rev;
+                            send[i][1] += or * rev;
+                        }
+                    }
+                    self.lowpass.seed_open_pair(0, src[QUANTUM - 2][0], src[QUANTUM - 1][0]);
+                } else {
+                    if gains.rightward {
+                        if rev == 0.0 {
+                            for i in 0..QUANTUM {
+                                let l = src[i][0] * fade * voice_gain;
+                                let r = src[i][1] * fade * voice_gain;
+                                dry[i][0] += l * gains.left;
+                                dry[i][1] += r + l * gains.right;
+                            }
+                        } else {
+                            for i in 0..QUANTUM {
+                                let l = src[i][0] * fade * voice_gain;
+                                let r = src[i][1] * fade * voice_gain;
+                                let ol = l * gains.left;
+                                let or = r + l * gains.right;
+                                dry[i][0] += ol;
+                                dry[i][1] += or;
+                                send[i][0] += ol * rev;
+                                send[i][1] += or * rev;
+                            }
+                        }
+                    } else if rev == 0.0 {
+                        for i in 0..QUANTUM {
+                            let l = src[i][0] * fade * voice_gain;
+                            let r = src[i][1] * fade * voice_gain;
+                            dry[i][0] += l + r * gains.left;
+                            dry[i][1] += r * gains.right;
+                        }
+                    } else {
+                        for i in 0..QUANTUM {
+                            let l = src[i][0] * fade * voice_gain;
+                            let r = src[i][1] * fade * voice_gain;
+                            let ol = l + r * gains.left;
+                            let or = r * gains.right;
+                            dry[i][0] += ol;
+                            dry[i][1] += or;
+                            send[i][0] += ol * rev;
+                            send[i][1] += or * rev;
+                        }
+                    }
+                    self.lowpass.seed_open_pair(0, src[QUANTUM - 2][0], src[QUANTUM - 1][0]);
+                    self.lowpass.seed_open_pair(1, src[QUANTUM - 2][1], src[QUANTUM - 1][1]);
+                }
+                self.position = (start_idx + QUANTUM) as f64;
+                return;
+            }
+        }
         // Frame `index` of a streamed clip, by its place in the stream.
         let (first, whole) = (self.first as u64, length as u64);
         for i in 0..QUANTUM {
@@ -971,10 +1113,14 @@ struct Bus {
     eq_low: EqBand,
     eq_mid: EqBand,
     eq_high: EqBand,
-    comp_threshold: f32,
-    comp_ratio: f32,
+    eq_any: bool,
+    comp_threshold: f64,
+    inv_comp_threshold: f64,
+    comp_exp: f64,
+    comp_on: bool,
     duck_bus: usize,
-    duck_amount: f32,
+    duck_amount: f64,
+    duck_on: bool,
     dyn_attack: f64,
     dyn_release: f64,
     env: f64,
@@ -995,10 +1141,14 @@ impl Bus {
             eq_low: EqBand::new(EqKind::LowShelf, 200.0),
             eq_mid: EqBand::new(EqKind::Peaking, 1000.0),
             eq_high: EqBand::new(EqKind::HighShelf, 4000.0),
+            eq_any: false,
             comp_threshold: 0.0,
-            comp_ratio: 1.0,
+            inv_comp_threshold: 0.0,
+            comp_exp: 0.0,
+            comp_on: false,
             duck_bus: 0,
             duck_amount: 0.0,
+            duck_on: false,
             dyn_attack: 1.0 - (-1.0 / (0.010 * rate)).exp(),
             dyn_release: 1.0 - (-1.0 / (0.120 * rate)).exp(),
             env: 0.0,
@@ -1010,13 +1160,19 @@ impl Bus {
     }
 
     fn apply_processing(&mut self, spec: BusSpec, rate: f64) {
-        self.comp_threshold = if spec.comp_threshold.is_finite() { spec.comp_threshold.clamp(0.0, 4.0) } else { 0.0 };
-        self.comp_ratio = if spec.comp_ratio.is_finite() { spec.comp_ratio.max(1.0) } else { 1.0 };
+        let thresh = if spec.comp_threshold.is_finite() { f64::from(spec.comp_threshold.clamp(0.0, 4.0)) } else { 0.0 };
+        let ratio = if spec.comp_ratio.is_finite() { f64::from(spec.comp_ratio.max(1.0)) } else { 1.0 };
+        self.comp_threshold = thresh;
+        self.comp_on = thresh > 0.0 && ratio > 1.0;
+        self.inv_comp_threshold = if self.comp_on { 1.0 / thresh } else { 0.0 };
+        self.comp_exp = if self.comp_on { 1.0 / ratio - 1.0 } else { 0.0 };
         self.duck_bus = spec.duck_bus.min(MAX_BUSES - 1);
-        self.duck_amount = if spec.duck_amount.is_finite() { spec.duck_amount.clamp(0.0, 1.0) } else { 0.0 };
+        self.duck_amount = if spec.duck_amount.is_finite() { f64::from(spec.duck_amount.clamp(0.0, 1.0)) } else { 0.0 };
+        self.duck_on = self.duck_amount > 0.0;
         self.eq_low.set_gain(spec.eq_low_db, rate);
         self.eq_mid.set_gain(spec.eq_mid_db, rate);
         self.eq_high.set_gain(spec.eq_high_db, rate);
+        self.eq_any = self.eq_low.active || self.eq_mid.active || self.eq_high.active;
     }
 
     /// Starts it at `spec` at once, as a new bus's nodes do, silent if it
@@ -1038,33 +1194,46 @@ impl Bus {
         self.apply_processing(spec, rate);
     }
 
+    #[inline]
     fn run_eq(&mut self, left: f32, right: f32) -> (f32, f32) {
+        if !self.eq_any {
+            return (left, right);
+        }
         let l = self.eq_high.run(0, self.eq_mid.run(0, self.eq_low.run(0, left)));
         let r = self.eq_high.run(1, self.eq_mid.run(1, self.eq_low.run(1, right)));
         (l, r)
     }
 
+    #[inline]
     fn step_dynamics(&mut self, peak: f64, sidechain_rms: f64) -> f32 {
-        let comp_on = self.comp_threshold > 0.0 && self.comp_ratio > 1.0;
-        let duck_on = self.duck_amount > 0.0;
-        if !comp_on && !duck_on {
+        if !self.comp_on && !self.duck_on {
             self.dyn_gain = 1.0;
             return 1.0;
         }
         let coeff = if peak > self.env { self.dyn_attack } else { self.dyn_release };
         self.env += (peak - self.env) * coeff;
         let mut target = 1.0;
-        if comp_on && self.env > f64::from(self.comp_threshold) {
-            let over = self.env / f64::from(self.comp_threshold);
-            target *= over.powf(1.0 / f64::from(self.comp_ratio) - 1.0);
+        if self.comp_on && self.env > self.comp_threshold {
+            let over = self.env * self.inv_comp_threshold;
+            target *= over.powf(self.comp_exp);
         }
-        if duck_on {
-            let duck = (1.0 - f64::from(self.duck_amount) * (sidechain_rms * 2.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        if self.duck_on {
+            let duck = (1.0 - self.duck_amount * (sidechain_rms * 2.0).clamp(0.0, 1.0)).clamp(0.0, 1.0);
             target *= duck;
         }
         let g_coeff = if target < self.dyn_gain { self.dyn_attack } else { self.dyn_release };
         self.dyn_gain += (target - self.dyn_gain) * g_coeff;
         self.dyn_gain as f32
+    }
+
+    #[inline]
+    fn is_plain_settled(&self) -> bool {
+        !self.comp_on
+            && !self.duck_on
+            && !self.eq_any
+            && self.lowpass.is_open_settled()
+            && self.gain.is_settled()
+            && self.reverb.is_settled()
     }
 }
 
@@ -1295,7 +1464,7 @@ impl Mixer {
                     if voice.leaving {
                         let current = voice.fade.at(now);
                         let seconds = f64::from(spec.fade_in).max(FADE_SECONDS);
-                        voice.fade = Ramp { from: current, to: 1.0, start: now, length: seconds * rate };
+                        voice.fade = Ramp::new(current, 1.0, now, seconds * rate);
                         voice.leaving = false;
                     }
                     continue;
@@ -1306,18 +1475,23 @@ impl Mixer {
                 voice.fade_out = spec.fade_out;
                 voice.leave(now, rate);
             }
-            let sound = SoundSpec {
-                clip: spec.clip.clone(),
+            let mut voice = Voice::new(
+                Some(spec.id),
+                spec.clip.clone(),
                 bus,
-                gain: spec.gain,
-                pan: spec.pan,
-                pitch: spec.pitch,
-                lowpass: spec.lowpass,
-                reverb: spec.reverb,
-                panner: spec.panner,
-            };
-            let mut voice =
-                Voice::new(Some(spec.id), &sound, spec.looping, spec.start, spec.fade_in, now, rate, &mut self.streams);
+                spec.gain,
+                spec.pan,
+                spec.pitch,
+                spec.lowpass,
+                spec.reverb,
+                spec.panner,
+                spec.looping,
+                spec.start,
+                spec.fade_in,
+                now,
+                rate,
+                &mut self.streams,
+            );
             voice.fade_out = spec.fade_out;
             let new_index = self.voices.len();
             self.voices.push(voice);
@@ -1330,8 +1504,23 @@ impl Mixer {
         }
         for sound in &mix.sounds {
             let bus = self.bus(sound.bus);
-            let sound = SoundSpec { bus, ..sound.clone() };
-            self.voices.push(Voice::new(None, &sound, false, 0.0, 0.0, now, rate, &mut self.streams));
+            self.voices.push(Voice::new(
+                None,
+                sound.clip.clone(),
+                bus,
+                sound.gain,
+                sound.pan,
+                sound.pitch,
+                sound.lowpass,
+                sound.reverb,
+                sound.panner,
+                false,
+                0.0,
+                0.0,
+                now,
+                rate,
+                &mut self.streams,
+            ));
         }
         for synth in &mix.synths {
             let _ = self.bus(synth.bus);
@@ -1360,14 +1549,22 @@ impl Mixer {
             bus.send[i][1] += r * rev;
         });
         let end = now + QUANTUM as u64;
-        let prev_len = self.voices.len();
-        self.voices.retain(|voice| !voice.gone(end));
-        if self.voices.len() != prev_len {
-            self.voice_by_id.clear();
-            for (index, voice) in self.voices.iter().enumerate() {
-                if let Some(id) = voice.id {
-                    self.voice_by_id.insert(id, index);
+        let mut i = 0;
+        while i < self.voices.len() {
+            if self.voices[i].gone(end) {
+                let removed = self.voices.swap_remove(i);
+                if let Some(id) = removed.id
+                    && self.voice_by_id.get(&id) == Some(&i)
+                {
+                    self.voice_by_id.remove(&id);
                 }
+                if let Some(moved) = self.voices.get(i)
+                    && let Some(id) = moved.id
+                {
+                    self.voice_by_id.insert(id, i);
+                }
+            } else {
+                i += 1;
             }
         }
         let prev_rms: [f64; MAX_BUSES] = std::array::from_fn(|i| self.buses[i].last_rms);
@@ -1377,29 +1574,51 @@ impl Mixer {
             self.master_in = master.dry;
             self.reverb_in = master.send;
             for (bus, meter) in buses.iter_mut().zip(&mut self.meters[1..]).filter(|(bus, _)| bus.active) {
-                let sc_rms = prev_rms[bus.duck_bus];
                 let mut sq_sum = 0.0f64;
-                for i in 0..QUANTUM {
-                    bus.lowpass.step(glide, rate);
-                    let gain = bus.gain.next(glide);
-                    let reverb = bus.reverb.next(glide);
-                    let [dry_left, dry_right] = bus.dry[i];
-                    let [send_left, send_right] = bus.send[i];
-                    let lp_l = bus.lowpass.run(0, dry_left);
-                    let lp_r = bus.lowpass.run(1, dry_right);
-                    let (eq_l, eq_r) = bus.run_eq(lp_l, lp_r);
-                    let peak = f64::from(eq_l.abs().max(eq_r.abs())) * f64::from(gain.abs());
-                    let dyn_gain = bus.step_dynamics(peak, sc_rms);
-                    let left = eq_l * gain * dyn_gain;
-                    let right = eq_r * gain * dyn_gain;
-                    let wet_left = bus.lowpass.run(2, send_left) * gain;
-                    let wet_right = bus.lowpass.run(3, send_right) * gain;
-                    sq_sum += f64::from(left) * f64::from(left) + f64::from(right) * f64::from(right);
-                    meter.add([left, right]);
-                    self.master_in[i][0] += left;
-                    self.master_in[i][1] += right;
-                    self.reverb_in[i][0] += wet_left + left * reverb;
-                    self.reverb_in[i][1] += wet_right + right * reverb;
+                if bus.is_plain_settled() {
+                    bus.dyn_gain = 1.0;
+                    let gain = bus.gain.current();
+                    let reverb = bus.reverb.current();
+                    for i in 0..QUANTUM {
+                        let left = bus.dry[i][0] * gain;
+                        let right = bus.dry[i][1] * gain;
+                        let wet_left = bus.send[i][0] * gain;
+                        let wet_right = bus.send[i][1] * gain;
+                        sq_sum += f64::from(left) * f64::from(left) + f64::from(right) * f64::from(right);
+                        meter.add([left, right]);
+                        self.master_in[i][0] += left;
+                        self.master_in[i][1] += right;
+                        self.reverb_in[i][0] += wet_left + left * reverb;
+                        self.reverb_in[i][1] += wet_right + right * reverb;
+                    }
+                    bus.lowpass.seed_open_pair(0, bus.dry[QUANTUM - 2][0], bus.dry[QUANTUM - 1][0]);
+                    bus.lowpass.seed_open_pair(1, bus.dry[QUANTUM - 2][1], bus.dry[QUANTUM - 1][1]);
+                    bus.lowpass.seed_open_pair(2, bus.send[QUANTUM - 2][0], bus.send[QUANTUM - 1][0]);
+                    bus.lowpass.seed_open_pair(3, bus.send[QUANTUM - 2][1], bus.send[QUANTUM - 1][1]);
+                } else {
+                    let sc_rms = prev_rms[bus.duck_bus];
+                    for i in 0..QUANTUM {
+                        bus.lowpass.step(glide, rate);
+                        let gain = bus.gain.next(glide);
+                        let reverb = bus.reverb.next(glide);
+                        let [dry_left, dry_right] = bus.dry[i];
+                        let [send_left, send_right] = bus.send[i];
+                        let lp_l = bus.lowpass.run(0, dry_left);
+                        let lp_r = bus.lowpass.run(1, dry_right);
+                        let (eq_l, eq_r) = bus.run_eq(lp_l, lp_r);
+                        let peak = f64::from(eq_l.abs().max(eq_r.abs())) * f64::from(gain.abs());
+                        let dyn_gain = bus.step_dynamics(peak, sc_rms);
+                        let left = eq_l * gain * dyn_gain;
+                        let right = eq_r * gain * dyn_gain;
+                        let wet_left = bus.lowpass.run(2, send_left) * gain;
+                        let wet_right = bus.lowpass.run(3, send_right) * gain;
+                        sq_sum += f64::from(left) * f64::from(left) + f64::from(right) * f64::from(right);
+                        meter.add([left, right]);
+                        self.master_in[i][0] += left;
+                        self.master_in[i][1] += right;
+                        self.reverb_in[i][0] += wet_left + left * reverb;
+                        self.reverb_in[i][1] += wet_right + right * reverb;
+                    }
                 }
                 bus.last_rms = (sq_sum / (2 * QUANTUM) as f64).sqrt();
             }
@@ -1432,24 +1651,52 @@ impl Mixer {
         }
         self.poll_reverb_worker();
         let master = &mut self.buses[0];
-        let master_sc = prev_rms[master.duck_bus];
         let mut master_sq = 0.0f64;
-        for i in 0..QUANTUM {
-            let back = master.reverb.next(glide);
-            master.lowpass.step(glide, rate);
-            let gain = master.gain.next(glide);
-            let left = self.master_in[i][0] + self.reverb_out[i][0] * back;
-            let right = self.master_in[i][1] + self.reverb_out[i][1] * back;
-            let lp_l = master.lowpass.run(0, left);
-            let lp_r = master.lowpass.run(1, right);
-            let (eq_l, eq_r) = master.run_eq(lp_l, lp_r);
-            let peak = f64::from(eq_l.abs().max(eq_r.abs())) * f64::from(gain.abs());
-            let dyn_gain = master.step_dynamics(peak, master_sc);
-            let out_l = eq_l * gain * dyn_gain;
-            let out_r = eq_r * gain * dyn_gain;
-            master_sq += f64::from(out_l) * f64::from(out_l) + f64::from(out_r) * f64::from(out_r);
-            self.out[i] = [out_l, out_r];
-            self.meters[0].add(self.out[i]);
+        if master.is_plain_settled() {
+            master.dyn_gain = 1.0;
+            let back = master.reverb.current();
+            let gain = master.gain.current();
+            let mut prev_l = 0.0f32;
+            let mut prev_r = 0.0f32;
+            let mut last_l = 0.0f32;
+            let mut last_r = 0.0f32;
+            for i in 0..QUANTUM {
+                let left = self.master_in[i][0] + self.reverb_out[i][0] * back;
+                let right = self.master_in[i][1] + self.reverb_out[i][1] * back;
+                if i == QUANTUM - 2 {
+                    prev_l = left;
+                    prev_r = right;
+                } else if i == QUANTUM - 1 {
+                    last_l = left;
+                    last_r = right;
+                }
+                let out_l = left * gain;
+                let out_r = right * gain;
+                master_sq += f64::from(out_l) * f64::from(out_l) + f64::from(out_r) * f64::from(out_r);
+                self.out[i] = [out_l, out_r];
+                self.meters[0].add(self.out[i]);
+            }
+            master.lowpass.seed_open_pair(0, prev_l, last_l);
+            master.lowpass.seed_open_pair(1, prev_r, last_r);
+        } else {
+            let master_sc = prev_rms[master.duck_bus];
+            for i in 0..QUANTUM {
+                let back = master.reverb.next(glide);
+                master.lowpass.step(glide, rate);
+                let gain = master.gain.next(glide);
+                let left = self.master_in[i][0] + self.reverb_out[i][0] * back;
+                let right = self.master_in[i][1] + self.reverb_out[i][1] * back;
+                let lp_l = master.lowpass.run(0, left);
+                let lp_r = master.lowpass.run(1, right);
+                let (eq_l, eq_r) = master.run_eq(lp_l, lp_r);
+                let peak = f64::from(eq_l.abs().max(eq_r.abs())) * f64::from(gain.abs());
+                let dyn_gain = master.step_dynamics(peak, master_sc);
+                let out_l = eq_l * gain * dyn_gain;
+                let out_r = eq_r * gain * dyn_gain;
+                master_sq += f64::from(out_l) * f64::from(out_l) + f64::from(out_r) * f64::from(out_r);
+                self.out[i] = [out_l, out_r];
+                self.meters[0].add(self.out[i]);
+            }
         }
         master.last_rms = (master_sq / (2 * QUANTUM) as f64).sqrt();
         self.now = end;

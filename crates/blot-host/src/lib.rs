@@ -932,7 +932,10 @@ fn ticks(time: Duration) -> u64 {
 /// looks at the next tick.
 fn resume(mut store: impl AsContextMut<Data = State>) {
     let mut store = store.as_context_mut();
-    let sampled = store.data().probe.as_ref().is_some_and(|probe| probe.sampling().is_some());
+    if !store.engine().get_epoch_interruption() {
+        return;
+    }
+    let sampled = store.data().probe.as_ref().is_some_and(|probe| probe.is_sampling());
     let mode = store.data().deadline_mode;
     let no_relative = store.data().no_relative_deadline;
     let deadline_ticks = match mode {
@@ -1016,6 +1019,7 @@ struct WasmtimeGuest {
     invocation_finish: Option<TypedFunc<(), i32>>,
     last_reclaimed_owners: Option<u32>,
     imaged: Arc<Result<Vec<String>, String>>,
+    func_cache: std::collections::HashMap<String, wasmtime::Func>,
 }
 
 enum GuestBackend {
@@ -1438,6 +1442,7 @@ impl WasmtimeGuest {
             invocation_finish,
             last_reclaimed_owners: None,
             imaged: module.imaged.clone(),
+            func_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -1540,10 +1545,16 @@ impl WasmtimeGuest {
     }
 
     pub(crate) fn call_raw(&mut self, name: &str, param: Val) -> Result<Val> {
-        let func = self
-            .instance
-            .get_func(&mut self.store, name)
-            .ok_or_else(|| anyhow!("validated function export {name} disappeared"))?;
+        let func = if let Some(&cached) = self.func_cache.get(name) {
+            cached
+        } else {
+            let looked_up = self
+                .instance
+                .get_func(&mut self.store, name)
+                .ok_or_else(|| anyhow!("validated function export {name} disappeared"))?;
+            self.func_cache.insert(name.to_owned(), looked_up);
+            looked_up
+        };
         self.clear_trap_site();
         let mut results = [Val::I32(0)];
         func.call(&mut self.store, &[param], &mut results)

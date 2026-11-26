@@ -19,37 +19,24 @@ use super::mixer::QUANTUM;
 pub use pen_runtime::reverb::impulse_response;
 pub use pen_runtime::reverb::{AcousticProfile, impulse_response_for, impulse_response_from_acoustics};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Complex {
-    re: f32,
-    im: f32,
+/// Precomputed stage-contiguous twiddles for one radix-4 butterfly stage (`m > 1`).
+struct Radix4Stage {
+    m: usize,
+    w1_re: Vec<f32>,
+    w1_im: Vec<f32>,
+    w2_re: Vec<f32>,
+    w2_im: Vec<f32>,
+    w3_re: Vec<f32>,
+    w3_im: Vec<f32>,
 }
 
-impl Complex {
-    fn new(re: f32, im: f32) -> Complex {
-        Complex { re, im }
-    }
-    fn conj(self) -> Complex {
-        Complex::new(self.re, -self.im)
-    }
-    fn add(self, other: Complex) -> Complex {
-        Complex::new(self.re + other.re, self.im + other.im)
-    }
-    fn sub(self, other: Complex) -> Complex {
-        Complex::new(self.re - other.re, self.im - other.im)
-    }
-    fn mul(self, other: Complex) -> Complex {
-        Complex::new(self.re * other.re - self.im * other.im, self.re * other.im + self.im * other.re)
-    }
-    fn scale(self, by: f32) -> Complex {
-        Complex::new(self.re * by, self.im * by)
-    }
-}
-
-/// An iterative radix-2 FFT of one power-of-two size.
+/// An iterative split-SoA radix-4 FFT (with an initial radix-2 pass for odd
+/// powers of two) operating directly on separate real and imaginary slices so
+/// butterflies and spectral MACs auto-vectorize without shuffle overhead.
 struct Fft {
     size: usize,
-    twiddles: Vec<Complex>,
+    odd_bits: bool,
+    stages: Vec<Radix4Stage>,
     reversed: Vec<usize>,
 }
 
@@ -57,44 +44,163 @@ impl Fft {
     fn new(size: usize) -> Fft {
         assert!(size.is_power_of_two() && size >= 2);
         let bits = size.trailing_zeros();
+        let odd_bits = (bits & 1) == 1;
+        let mut stages = Vec::new();
+        let mut m = if odd_bits { 2 } else { 1 };
         #[allow(clippy::cast_possible_truncation, reason = "f32 twiddles")]
-        let twiddles = (0..size / 2)
-            .map(|k| {
-                let angle = -TAU * k as f64 / size as f64;
-                Complex::new(angle.cos() as f32, angle.sin() as f32)
-            })
-            .collect();
+        while m < size {
+            if m > 1 {
+                let mut w1_re = Vec::with_capacity(m);
+                let mut w1_im = Vec::with_capacity(m);
+                let mut w2_re = Vec::with_capacity(m);
+                let mut w2_im = Vec::with_capacity(m);
+                let mut w3_re = Vec::with_capacity(m);
+                let mut w3_im = Vec::with_capacity(m);
+                let base = -TAU / (4 * m) as f64;
+                for j in 0..m {
+                    let a1 = base * j as f64;
+                    let a2 = base * (2 * j) as f64;
+                    let a3 = base * (3 * j) as f64;
+                    let (s1, c1) = a1.sin_cos();
+                    let (s2, c2) = a2.sin_cos();
+                    let (s3, c3) = a3.sin_cos();
+                    w1_re.push(c1 as f32);
+                    w1_im.push(s1 as f32);
+                    w2_re.push(c2 as f32);
+                    w2_im.push(s2 as f32);
+                    w3_re.push(c3 as f32);
+                    w3_im.push(s3 as f32);
+                }
+                stages.push(Radix4Stage { m, w1_re, w1_im, w2_re, w2_im, w3_re, w3_im });
+            }
+            m *= 4;
+        }
         let reversed = (0..size).map(|index| index.reverse_bits() >> (usize::BITS - bits)).collect();
-        Fft { size, twiddles, reversed }
+        Fft { size, odd_bits, stages, reversed }
     }
 
-    fn transform(&self, data: &mut [Complex], inverse: bool) {
-        debug_assert_eq!(data.len(), self.size);
-        for index in 0..self.size {
+    fn transform(&self, re: &mut [f32], im: &mut [f32], inverse: bool) {
+        if inverse {
+            self.transform_inner::<true>(re, im);
+        } else {
+            self.transform_inner::<false>(re, im);
+        }
+    }
+
+    fn transform_inner<const INVERSE: bool>(&self, re: &mut [f32], im: &mut [f32]) {
+        let size = self.size;
+        debug_assert_eq!(re.len(), size);
+        debug_assert_eq!(im.len(), size);
+        for index in 0..size {
             let other = self.reversed[index];
             if index < other {
-                data.swap(index, other);
+                re.swap(index, other);
+                im.swap(index, other);
             }
         }
-        let mut half = 1;
-        while half < self.size {
-            let step = self.size / (2 * half);
-            for start in (0..self.size).step_by(2 * half) {
-                for j in 0..half {
-                    let twiddle = self.twiddles[j * step];
-                    let twiddle = if inverse { twiddle.conj() } else { twiddle };
-                    let a = data[start + j];
-                    let b = data[start + j + half].mul(twiddle);
-                    data[start + j] = a.add(b);
-                    data[start + j + half] = a.sub(b);
+        if self.odd_bits {
+            for s in (0..size).step_by(2) {
+                let (ar, ai) = (re[s], im[s]);
+                let (br, bi) = (re[s + 1], im[s + 1]);
+                re[s] = ar + br;
+                im[s] = ai + bi;
+                re[s + 1] = ar - br;
+                im[s + 1] = ai - bi;
+            }
+        } else {
+            // m = 1 radix-4 stage: all twiddles are 1.
+            for s in (0..size).step_by(4) {
+                let (a0r, a0i) = (re[s], im[s]);
+                let (a1r, a1i) = (re[s + 1], im[s + 1]);
+                let (a2r, a2i) = (re[s + 2], im[s + 2]);
+                let (a3r, a3i) = (re[s + 3], im[s + 3]);
+                let (v0r, v0i) = (a0r + a1r, a0i + a1i);
+                let (v1r, v1i) = (a0r - a1r, a0i - a1i);
+                let (v2r, v2i) = (a2r + a3r, a2i + a3i);
+                let (v3r, v3i) = (a2r - a3r, a2i - a3i);
+                re[s] = v0r + v2r;
+                im[s] = v0i + v2i;
+                re[s + 2] = v0r - v2r;
+                im[s + 2] = v0i - v2i;
+                if INVERSE {
+                    re[s + 1] = v1r - v3i;
+                    im[s + 1] = v1i + v3r;
+                    re[s + 3] = v1r + v3i;
+                    im[s + 3] = v1i - v3r;
+                } else {
+                    re[s + 1] = v1r + v3i;
+                    im[s + 1] = v1i - v3r;
+                    re[s + 3] = v1r - v3i;
+                    im[s + 3] = v1i + v3r;
                 }
             }
-            half *= 2;
         }
-        if inverse {
-            let scale = 1.0 / self.size as f32;
-            for value in data {
-                *value = value.scale(scale);
+        for stage in &self.stages {
+            let m = stage.m;
+            let span = 4 * m;
+            let (w1_re, w1_im) = (&stage.w1_re, &stage.w1_im);
+            let (w2_re, w2_im) = (&stage.w2_re, &stage.w2_im);
+            let (w3_re, w3_im) = (&stage.w3_re, &stage.w3_im);
+            for s in (0..size).step_by(span) {
+                let (r0, rest_r) = re[s..s + span].split_at_mut(m);
+                let (r1, rest_r) = rest_r.split_at_mut(m);
+                let (r2, r3) = rest_r.split_at_mut(m);
+                let (i0, rest_i) = im[s..s + span].split_at_mut(m);
+                let (i1, rest_i) = rest_i.split_at_mut(m);
+                let (i2, i3) = rest_i.split_at_mut(m);
+                for j in 0..m {
+                    let (a0r, a0i) = (r0[j], i0[j]);
+                    let (b1r, b1i) = (r1[j], i1[j]);
+                    let (b2r, b2i) = (r2[j], i2[j]);
+                    let (b3r, b3i) = (r3[j], i3[j]);
+                    let (t1r, t1i, t2r, t2i, t3r, t3i) = if INVERSE {
+                        (
+                            b1r * w2_re[j] + b1i * w2_im[j],
+                            b1i * w2_re[j] - b1r * w2_im[j],
+                            b2r * w1_re[j] + b2i * w1_im[j],
+                            b2i * w1_re[j] - b2r * w1_im[j],
+                            b3r * w3_re[j] + b3i * w3_im[j],
+                            b3i * w3_re[j] - b3r * w3_im[j],
+                        )
+                    } else {
+                        (
+                            b1r * w2_re[j] - b1i * w2_im[j],
+                            b1r * w2_im[j] + b1i * w2_re[j],
+                            b2r * w1_re[j] - b2i * w1_im[j],
+                            b2r * w1_im[j] + b2i * w1_re[j],
+                            b3r * w3_re[j] - b3i * w3_im[j],
+                            b3r * w3_im[j] + b3i * w3_re[j],
+                        )
+                    };
+                    let (v0r, v0i) = (a0r + t1r, a0i + t1i);
+                    let (v1r, v1i) = (a0r - t1r, a0i - t1i);
+                    let (v2r, v2i) = (t2r + t3r, t2i + t3i);
+                    let (v3r, v3i) = (t2r - t3r, t2i - t3i);
+                    r0[j] = v0r + v2r;
+                    i0[j] = v0i + v2i;
+                    r2[j] = v0r - v2r;
+                    i2[j] = v0i - v2i;
+                    if INVERSE {
+                        r1[j] = v1r - v3i;
+                        i1[j] = v1i + v3r;
+                        r3[j] = v1r + v3i;
+                        i3[j] = v1i - v3r;
+                    } else {
+                        r1[j] = v1r + v3i;
+                        i1[j] = v1i - v3r;
+                        r3[j] = v1r - v3i;
+                        i3[j] = v1i + v3r;
+                    }
+                }
+            }
+        }
+        if INVERSE {
+            let scale = 1.0 / size as f32;
+            for value in re.iter_mut() {
+                *value *= scale;
+            }
+            for value in im.iter_mut() {
+                *value *= scale;
             }
         }
     }
@@ -109,15 +215,19 @@ struct Stage {
     partitions: usize,
     bins: usize,
     fft: Fft,
-    /// Flat slab: `partitions * 2 * bins`, indexed as `(partition * 2 + channel) * bins + bin`.
-    filters: Vec<Complex>,
-    /// Flat slab ring: `partitions * 2 * bins`, newest at `newest`.
-    history: Vec<Complex>,
+    /// Flat SoA slabs: `partitions * 2 * bins`, indexed as `(partition * 2 + channel) * bins + bin`.
+    filters_re: Vec<f32>,
+    filters_im: Vec<f32>,
+    /// Flat SoA slab rings: `partitions * 2 * bins`, newest at `newest`.
+    history_re: Vec<f32>,
+    history_im: Vec<f32>,
     newest: usize,
     /// The previous input block, then the current one.
     input: Vec<[f32; 2]>,
-    work: Vec<Complex>,
-    sums: [Vec<Complex>; 2],
+    work_re: Vec<f32>,
+    work_im: Vec<f32>,
+    sums_re: [Vec<f32>; 2],
+    sums_im: [Vec<f32>; 2],
 }
 
 impl Stage {
@@ -126,43 +236,54 @@ impl Stage {
         let fft = Fft::new(size);
         let partitions = (to.saturating_sub(from)).div_ceil(block).max(1);
         let bins = block + 1;
-        let mut work = vec![Complex::default(); size];
-        let mut filters = vec![Complex::default(); partitions * 2 * bins];
+        let mut work_re = vec![0.0f32; size];
+        let mut work_im = vec![0.0f32; size];
+        let mut filters_re = vec![0.0f32; partitions * 2 * bins];
+        let mut filters_im = vec![0.0f32; partitions * 2 * bins];
         for partition in 0..partitions {
-            work.fill(Complex::default());
+            work_re.fill(0.0);
+            work_im.fill(0.0);
             let start = from + partition * block;
-            for (offset, value) in work.iter_mut().take(block).enumerate() {
+            for offset in 0..block {
                 let at = start + offset;
                 if at < to {
-                    *value = Complex::new(response[0][at], response[1][at]);
+                    work_re[offset] = response[0][at];
+                    work_im[offset] = response[1][at];
                 }
             }
-            fft.transform(&mut work, false);
+            fft.transform(&mut work_re, &mut work_im, false);
             let base = partition * 2 * bins;
-            let (left, right) = filters[base..base + 2 * bins].split_at_mut(bins);
-            split(&work, left, right);
+            let (l_re, r_re) = filters_re[base..base + 2 * bins].split_at_mut(bins);
+            let (l_im, r_im) = filters_im[base..base + 2 * bins].split_at_mut(bins);
+            split(&work_re, &work_im, l_re, l_im, r_re, r_im);
         }
         Stage {
             block,
             partitions,
             bins,
             fft,
-            filters,
-            history: vec![Complex::default(); partitions * 2 * bins],
+            filters_re,
+            filters_im,
+            history_re: vec![0.0f32; partitions * 2 * bins],
+            history_im: vec![0.0f32; partitions * 2 * bins],
             newest: 0,
             input: vec![[0.0; 2]; size],
-            work,
-            sums: [vec![Complex::default(); bins], vec![Complex::default(); bins]],
+            work_re,
+            work_im,
+            sums_re: [vec![0.0f32; bins], vec![0.0f32; bins]],
+            sums_im: [vec![0.0f32; bins], vec![0.0f32; bins]],
         }
     }
 
     fn clear_sums(&mut self) {
-        self.sums[0].fill(Complex::default());
-        self.sums[1].fill(Complex::default());
+        self.sums_re[0].fill(0.0);
+        self.sums_re[1].fill(0.0);
+        self.sums_im[0].fill(0.0);
+        self.sums_im[1].fill(0.0);
     }
 
-    /// Accumulates spectral products for `partitions_range` assuming the
-    /// upcoming input block will land at `(self.newest + 1) % self.partitions`.
+    /// Accumulates spectral products for `start..end` assuming the
+    /// upcoming input block will land at `next_newest`.
     fn accumulate_partitions(&mut self, start: usize, end: usize, next_newest: usize) {
         let (partitions, bins) = (self.partitions, self.bins);
         for partition in start..end {
@@ -171,11 +292,19 @@ impl Stage {
             let f_base = partition * 2 * bins;
             for channel in 0..2 {
                 let off = channel * bins;
-                let sum = &mut self.sums[channel];
-                let input = &self.history[h_base + off..h_base + off + bins];
-                let response = &self.filters[f_base + off..f_base + off + bins];
+                let sum_re = &mut self.sums_re[channel][..bins];
+                let sum_im = &mut self.sums_im[channel][..bins];
+                let in_re = &self.history_re[h_base + off..h_base + off + bins];
+                let in_im = &self.history_im[h_base + off..h_base + off + bins];
+                let flt_re = &self.filters_re[f_base + off..f_base + off + bins];
+                let flt_im = &self.filters_im[f_base + off..f_base + off + bins];
                 for bin in 0..bins {
-                    sum[bin] = sum[bin].add(input[bin].mul(response[bin]));
+                    let ar = in_re[bin];
+                    let ai = in_im[bin];
+                    let br = flt_re[bin];
+                    let bi = flt_im[bin];
+                    sum_re[bin] += ar * br - ai * bi;
+                    sum_im[bin] += ar * bi + ai * br;
                 }
             }
         }
@@ -185,14 +314,16 @@ impl Stage {
     /// convolution against all partitions, and writes into `output`.
     fn convolve(&mut self, output: &mut [[f32; 2]], preaccumulated_tail: bool) {
         let (block, size, bins, partitions) = (self.block, 2 * self.block, self.bins, self.partitions);
-        for (value, &[left, right]) in self.work.iter_mut().zip(self.input.iter()) {
-            *value = Complex::new(left, right);
+        for (i, &[left, right]) in self.input.iter().enumerate() {
+            self.work_re[i] = left;
+            self.work_im[i] = right;
         }
-        self.fft.transform(&mut self.work, false);
+        self.fft.transform(&mut self.work_re, &mut self.work_im, false);
         self.newest = (self.newest + 1) % partitions;
         let base = self.newest * 2 * bins;
-        let (left, right) = self.history[base..base + 2 * bins].split_at_mut(bins);
-        split(&self.work, left, right);
+        let (l_re, r_re) = self.history_re[base..base + 2 * bins].split_at_mut(bins);
+        let (l_im, r_im) = self.history_im[base..base + 2 * bins].split_at_mut(bins);
+        split(&self.work_re, &self.work_im, l_re, l_im, r_re, r_im);
         if preaccumulated_tail {
             self.accumulate_partitions(0, 1, self.newest);
         } else {
@@ -200,33 +331,42 @@ impl Stage {
             self.accumulate_partitions(0, partitions, self.newest);
         }
         // Both channels' real outputs as one complex signal: left + i right.
-        for (bin, value) in self.work.iter_mut().enumerate() {
-            let (left, right) = if bin < bins {
-                (self.sums[0][bin], self.sums[1][bin])
-            } else {
-                (self.sums[0][size - bin].conj(), self.sums[1][size - bin].conj())
-            };
-            *value = Complex::new(left.re - right.im, left.im + right.re);
+        let (s0_re, s1_re) = (&self.sums_re[0], &self.sums_re[1]);
+        let (s0_im, s1_im) = (&self.sums_im[0], &self.sums_im[1]);
+        for bin in 0..bins {
+            self.work_re[bin] = s0_re[bin] - s1_im[bin];
+            self.work_im[bin] = s0_im[bin] + s1_re[bin];
         }
-        self.fft.transform(&mut self.work, true);
-        for (out, value) in output.iter_mut().zip(&self.work[block..]) {
-            *out = [value.re, value.im];
+        for bin in bins..size {
+            let m = size - bin;
+            self.work_re[bin] = s0_re[m] + s1_im[m];
+            self.work_im[bin] = -s0_im[m] + s1_re[m];
+        }
+        self.fft.transform(&mut self.work_re, &mut self.work_im, true);
+        for (i, out) in output.iter_mut().enumerate() {
+            *out = [self.work_re[block + i], self.work_im[block + i]];
         }
         self.input.copy_within(block.., 0);
     }
 }
 
-/// The left and right spectra, bins 0 to `left.len() - 1`, of two real
+/// The left and right spectra, bins 0 to `left_re.len() - 1`, of two real
 /// signals transformed together as left + i right.
-fn split(spectrum: &[Complex], left: &mut [Complex], right: &mut [Complex]) {
-    let size = spectrum.len();
-    for (bin, (left, right)) in left.iter_mut().zip(right.iter_mut()).enumerate() {
-        let z = spectrum[bin];
-        let mirror = spectrum[(size - bin) % size].conj();
-        *left = z.add(mirror).scale(0.5);
-        // (z - mirror) / 2i
-        let difference = z.sub(mirror);
-        *right = Complex::new(difference.im * 0.5, -difference.re * 0.5);
+fn split(re: &[f32], im: &[f32], left_re: &mut [f32], left_im: &mut [f32], right_re: &mut [f32], right_im: &mut [f32]) {
+    let size = re.len();
+    let bins = left_re.len();
+    left_re[0] = re[0];
+    left_im[0] = 0.0;
+    right_re[0] = im[0];
+    right_im[0] = 0.0;
+    for bin in 1..bins {
+        let m = size - bin;
+        let (zr, zi) = (re[bin], im[bin]);
+        let (mr, mi) = (re[m], im[m]);
+        left_re[bin] = (zr + mr) * 0.5;
+        left_im[bin] = (zi - mi) * 0.5;
+        right_re[bin] = (zi + mi) * 0.5;
+        right_im[bin] = (mr - zr) * 0.5;
     }
 }
 
@@ -244,6 +384,8 @@ pub struct Convolver {
     head_output: Vec<[f32; 2]>,
     /// Quanta of silence needed after the last non-zero input until all head
     /// and tail rings and overlap buffers have flushed to exact zero.
+    head_ir_quanta: usize,
+    head_active_quanta: usize,
     ir_quanta: usize,
     active_quanta: usize,
 }
@@ -264,14 +406,18 @@ impl Convolver {
     fn from_response(response: [Vec<f32>; 2]) -> Convolver {
         let length = response[0].len();
         let split_at = TAIL_BLOCK.min(length);
+        let head = Stage::new(QUANTUM, &response, 0, split_at);
         let tail = Stage::new(TAIL_BLOCK, &response, split_at, length);
+        let head_ir_quanta = head.partitions + 2;
         let ir_quanta = (tail.partitions + 3) * TAIL_QUANTA;
         Convolver {
-            head: Stage::new(QUANTUM, &response, 0, split_at),
+            head,
             tail,
             tail_output: vec![[0.0; 2]; TAIL_BLOCK],
             played: 0,
             head_output: vec![[0.0; 2]; QUANTUM],
+            head_ir_quanta,
+            head_active_quanta: 0,
             ir_quanta,
             active_quanta: 0,
         }
@@ -282,23 +428,32 @@ impl Convolver {
         let silent = input.iter().all(|&[l, r]| l == 0.0 && r == 0.0);
         if !silent {
             self.active_quanta = self.ir_quanta;
+            self.head_active_quanta = self.head_ir_quanta;
         } else if self.active_quanta == 0 && self.played == 0 {
             return;
         } else {
             self.active_quanta = self.active_quanta.saturating_sub(1);
         }
-        // The head: this quantum's own contribution, at once.
-        self.head.input[QUANTUM..].copy_from_slice(input);
-        self.head.convolve(&mut self.head_output, false);
-        // The tail: what earlier blocks have for this quantum, worked out as
-        // the block before this one completed.
         let start = self.played;
         let q = start / QUANTUM;
-        for ((out, head), tail) in
-            output.iter_mut().zip(&self.head_output).zip(&self.tail_output[start..start + QUANTUM])
-        {
-            out[0] += head[0] + tail[0];
-            out[1] += head[1] + tail[1];
+        if self.head_active_quanta > 0 {
+            // The head: this quantum's own contribution, at once.
+            self.head.input[QUANTUM..].copy_from_slice(input);
+            self.head.convolve(&mut self.head_output, false);
+            if silent {
+                self.head_active_quanta -= 1;
+            }
+            for ((out, head), tail) in
+                output.iter_mut().zip(&self.head_output).zip(&self.tail_output[start..start + QUANTUM])
+            {
+                out[0] += head[0] + tail[0];
+                out[1] += head[1] + tail[1];
+            }
+        } else {
+            for (out, tail) in output.iter_mut().zip(&self.tail_output[start..start + QUANTUM]) {
+                out[0] += tail[0];
+                out[1] += tail[1];
+            }
         }
         self.tail.input[TAIL_BLOCK + start..TAIL_BLOCK + start + QUANTUM].copy_from_slice(input);
         // Spread partitions `1..tail.partitions` (which only depend on already-
@@ -345,15 +500,26 @@ mod tests {
 
     #[test]
     fn fft_round_trips() {
-        let fft = Fft::new(16);
-        let original: Vec<Complex> = (0..16).map(|i| Complex::new(i as f32, (i * i % 7) as f32)).collect();
-        let mut data = original.clone();
-        fft.transform(&mut data, false);
-        // Bin 0 is the sum.
-        assert!((data[0].re - (0..16).sum::<i32>() as f32).abs() < 1e-3);
-        fft.transform(&mut data, true);
-        for (a, b) in data.iter().zip(&original) {
-            assert!((a.re - b.re).abs() < 1e-4 && (a.im - b.im).abs() < 1e-4, "{a:?} {b:?}");
+        for size in [16usize, 32, 256] {
+            let fft = Fft::new(size);
+            let orig_re: Vec<f32> = (0..size).map(|i| i as f32).collect();
+            let orig_im: Vec<f32> = (0..size).map(|i| (i * i % 7) as f32).collect();
+            let (mut re, mut im) = (orig_re.clone(), orig_im.clone());
+            fft.transform(&mut re, &mut im, false);
+            // Bin 0 is the sum.
+            let expected_dc = (0..size).sum::<usize>() as f32;
+            assert!((re[0] - expected_dc).abs() < 1e-2, "size {size}: {} != {expected_dc}", re[0]);
+            fft.transform(&mut re, &mut im, true);
+            for i in 0..size {
+                assert!(
+                    (re[i] - orig_re[i]).abs() < 1e-3 && (im[i] - orig_im[i]).abs() < 1e-3,
+                    "size {size} idx {i}: ({}, {}) vs ({}, {})",
+                    re[i],
+                    im[i],
+                    orig_re[i],
+                    orig_im[i]
+                );
+            }
         }
     }
 

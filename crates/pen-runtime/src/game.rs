@@ -193,7 +193,9 @@ async fn open_game<B: Backend>(engine: &B, module: &B::Module) -> Result<Game<B:
 impl<P: Program> Game<P> {
     fn accept(&mut self) {
         self.program.accept();
-        self.pending_undo = None;
+        if let Some(undo) = self.pending_undo.take() {
+            self.instances.commit(undo);
+        }
     }
 
     fn discard_pending(&mut self) {
@@ -569,6 +571,7 @@ impl<B: Backend> GameRuntime<B> {
             self.active.instances.rollback(undo);
             return Err(error.context(InvalidFrame));
         }
+        self.active.instances.commit(undo);
         self.active.accept();
         self.snapshot = None;
         if self.hashing {

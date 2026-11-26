@@ -176,7 +176,7 @@ pub fn hash_canonical_render_packet(packet: &[f32]) -> u64 {
                 cursor = end;
             }
             if valid && cursor == services_end && has_kernel {
-                for (index, &lane) in packet[..services_start].iter().enumerate() {
+                for (index, &lane) in packet[..PACKET_HEADER_FLOATS].iter().enumerate() {
                     let value = if index == cut_lane {
                         0.0
                     } else if index == lanes::header::SERVICE_COUNT {
@@ -187,6 +187,9 @@ pub fn hash_canonical_render_packet(packet: &[f32]) -> u64 {
                         lane
                     };
                     write_lane(value);
+                }
+                for &lane in &packet[PACKET_HEADER_FLOATS..services_start] {
+                    write_lane(lane);
                 }
                 let mut cursor = services_start;
                 for _ in 0..services_count {
@@ -207,8 +210,18 @@ pub fn hash_canonical_render_packet(packet: &[f32]) -> u64 {
             }
         }
     }
-    for (index, &lane) in packet.iter().enumerate() {
-        write_lane(if index == cut_lane { 0.0 } else { lane });
+    if cut_lane < packet.len() {
+        for &lane in &packet[..cut_lane] {
+            write_lane(lane);
+        }
+        write_lane(0.0);
+        for &lane in &packet[cut_lane + 1..] {
+            write_lane(lane);
+        }
+    } else {
+        for &lane in packet {
+            write_lane(lane);
+        }
     }
     hash
 }
@@ -216,8 +229,10 @@ pub fn hash_canonical_render_packet(packet: &[f32]) -> u64 {
 /// The whole number a lane holds (an id, count, index or code point), or
 /// None for a fraction, a negative, a non-finite value or one past u32.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "checked whole and in range")]
+#[inline]
 pub fn whole(lane: f32) -> Option<u32> {
-    (lane.fract() == 0.0 && (0.0..4_294_967_296.0).contains(&lane)).then_some(lane as u32)
+    ((0.0..4_294_967_296.0).contains(&lane) && (lane >= 8_388_608.0 || (lane as u32) as f32 == lane))
+        .then_some(lane as u32)
 }
 
 /// A game's catalog: its `meshes` and `materials`, and `sounds` if it has

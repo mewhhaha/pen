@@ -56,6 +56,8 @@ pub struct BrowserProgram {
     answered: Option<Instant>,
     failure: Option<String>,
     symbols: Rc<Symbols>,
+    request_buf: Vec<f32>,
+    spare_response: Vec<f32>,
 }
 
 impl Backend for BrowserBackend {
@@ -87,6 +89,8 @@ impl Backend for BrowserBackend {
             answered: None,
             failure: None,
             symbols,
+            request_buf: Vec::new(),
+            spare_response: Vec::new(),
         })
     }
 }
@@ -104,8 +108,8 @@ impl Program for BrowserProgram {
         ensure!(!self.stopping, "game program is closed");
         ensure!(self.pending.is_none(), "game program already has a request in flight");
         ensure!(self.failure.is_none(), "game program failed: {:?}", self.failure);
-        let packet = program::request(self.published, operation, payload);
-        let promise = self.guest.next(&Float32Array::from(packet.as_slice())).map_err(error)?;
+        program::write_request(&mut self.request_buf, self.published, operation, payload);
+        let promise = self.guest.next(&Float32Array::from(self.request_buf.as_slice())).map_err(error)?;
         self.pending = Some((operation, promise));
         self.published = false;
         Ok(())
@@ -117,12 +121,22 @@ impl Program for BrowserProgram {
         let result = JsFuture::from(promise).await.map_err(|value| failure(value, &self.symbols));
         self.answered = Some(Instant::now());
         match result {
-            Ok(value) => program::response(operation, Float32Array::new(&value).to_vec()),
+            Ok(value) => {
+                let array = Float32Array::new(&value);
+                let mut buffer = std::mem::take(&mut self.spare_response);
+                buffer.resize(array.length() as usize, 0.0);
+                array.copy_to(&mut buffer);
+                program::response(operation, buffer)
+            }
             Err(error) => {
                 self.failure = Some(format!("{error:#}"));
                 Err(error)
             }
         }
+    }
+
+    fn recycle(&mut self, buffer: Vec<f32>) {
+        self.spare_response = buffer;
     }
 
     fn accept(&mut self) {

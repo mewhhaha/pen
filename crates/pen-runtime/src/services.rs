@@ -94,17 +94,25 @@ impl Answer {
         Answer { status: service_status::UNKNOWN, value: 0.0, values: Vec::new() }
     }
 
-    /// The events that carry it to the game: a ServiceAnswer, then its
-    /// values three to a ServiceData, the last padded with zeros.
-    pub fn events(&self, request: u32) -> Vec<GameEvent> {
+    /// Appends the events carrying this answer directly into `out`: a ServiceAnswer,
+    /// then its values three to a ServiceData, the last padded with zeros.
+    pub fn push_events(&self, request: u32, out: &mut Vec<GameEvent>) {
         let values = &self.values[..self.values.len().min(MAX_SERVICE_DATA)];
         let value = if self.value.is_finite() { self.value } else { 0.0 };
         let length = u32::try_from(values.len()).expect("at most MAX_SERVICE_DATA values");
-        let mut events = vec![GameEvent::ServiceAnswer { request, status: self.status, value, length }];
+        out.reserve(1 + values.len().div_ceil(3));
+        out.push(GameEvent::ServiceAnswer { request, status: self.status, value, length });
         for chunk in values.chunks(3) {
             let at = |index: usize| chunk.get(index).copied().filter(|value| value.is_finite()).unwrap_or(0.0);
-            events.push(GameEvent::ServiceData { request, a: at(0), b: at(1), c: at(2) });
+            out.push(GameEvent::ServiceData { request, a: at(0), b: at(1), c: at(2) });
         }
+    }
+
+    /// The events that carry it to the game: a ServiceAnswer, then its
+    /// values three to a ServiceData, the last padded with zeros.
+    pub fn events(&self, request: u32) -> Vec<GameEvent> {
+        let mut events = Vec::new();
+        self.push_events(request, &mut events);
         events
     }
 }
@@ -220,7 +228,7 @@ impl<Input> Services<Input> {
                 if self.log {
                     eprintln!("service: request {id} answered {}", service_status::NAMES[answer.status as usize]);
                 }
-                self.answers.extend(answer.events(id));
+                answer.push_events(id, &mut self.answers);
             }
         }
     }
@@ -247,7 +255,7 @@ impl<Input> Services<Input> {
                 eprintln!("service: request {} {} -> {outcome}", asked.id, describe(request));
             }
             if let Some(answer) = answer {
-                self.answers.extend(answer.events(asked.id));
+                answer.push_events(asked.id, &mut self.answers);
             }
         }
     }

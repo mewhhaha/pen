@@ -838,7 +838,7 @@ impl State {
             let dummy_gbuf = wired.dummy_rgba16f_view(device);
             let vel_bind = velocity_view.unwrap_or(&dummy_vel);
             let gbuf_nr_bind = thin_gbuffer.map_or(&dummy_gbuf, |(nr, _, _)| nr);
-            let svgf = wired.rt_history.svgf_rt.get_or_insert_with(|| SvgfRtState::new(device));
+            let svgf = wired.rt_history.svgf_rt.get_or_insert_with(|| Box::new(SvgfRtState::new(device)));
             let resized = !matches!(&svgf.buffers, Some(b) if b.size == rt_size);
             if resized {
                 svgf.buffers = Some(SvgfRtBuffers {

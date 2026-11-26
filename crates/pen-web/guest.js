@@ -11,13 +11,13 @@
 // host call on a SharedArrayBuffer until the page sends the next request.
 import { openStructured, runStructuredSync } from './structured.js';
 
-async function hasTasks(bytes) {
-  const module = await WebAssembly.compile(bytes);
+function hasTasksSection(module) {
   return WebAssembly.Module.customSections(module, 'blot:tasks').length !== 0;
 }
 export async function openGuest(bytes, ownership) {
   if (WebAssembly.Suspending && WebAssembly.promising) {
-    return await hasTasks(bytes) ? openStructured(bytes) : openSuspending(bytes, ownership);
+    const module = await WebAssembly.compile(bytes);
+    return hasTasksSection(module) ? openStructured(bytes) : openSuspending(module, ownership);
   }
   if (globalThis.crossOriginIsolated && typeof SharedArrayBuffer === 'function') return openWorker(bytes, ownership);
   throw new Error('This browser needs WebAssembly JS Promise Integration (JSPI), or a cross-origin isolated page '
@@ -26,8 +26,7 @@ export async function openGuest(bytes, ownership) {
 
 // Instantiates the guest with `exchange` as its host call and checks its
 // array arena and ownership hooks.
-async function instantiate(bytes, ownership, exchange) {
-  const module = await WebAssembly.compile(bytes);
+async function instantiate(module, ownership, exchange) {
   const instance = await WebAssembly.instantiate(module, { 'blot:host/1': { call_array_f32_array_f32: exchange } });
   const exports = instance.exports;
   if (!(exports['blot:memory'] instanceof WebAssembly.Memory)
@@ -99,7 +98,7 @@ function arrays(exports) {
   };
 }
 
-async function openSuspending(bytes, ownership) {
+async function openSuspending(module, ownership) {
   const capability = Object.freeze({});
   let guest;
   let incoming;
@@ -113,7 +112,7 @@ async function openSuspending(bytes, ownership) {
     response.resolve(packet);
     return guest.write(await incoming.promise);
   });
-  const exports = await instantiate(bytes, ownership, exchange);
+  const exports = await instantiate(module, ownership, exchange);
   guest = arrays(exports);
   if (ownership) exports['blot:ownership_enter']();
   exports['blot:reset'](0);
@@ -268,11 +267,12 @@ function serveWorker() {
     let outcome = 0;
     let structured = false;
     try {
-      structured = await hasTasks(bytes);
+      const module = await WebAssembly.compile(bytes);
+      structured = hasTasksSection(module);
       if (structured) {
         await runStructuredSync(bytes, exchangeValues);
       } else {
-        exports = await instantiate(bytes, ownership, exchange);
+        exports = await instantiate(module, ownership, exchange);
         guest = arrays(exports);
         if (ownership) exports['blot:ownership_enter']();
         exports['blot:reset'](0);

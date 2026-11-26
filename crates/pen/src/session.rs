@@ -232,8 +232,8 @@ impl Host for Shell<'_> {
         }
         let separate_overlay_pass =
             need_clean_texture && viewport_overlay_active && (has_overlay_shots || gpu.surface.is_some());
-        let clean_texture = need_clean_texture.then(|| gpu.capture_texture());
-        if let Some(texture) = &clean_texture {
+        let clean_capture = need_clean_texture.then(|| gpu.capture_texture());
+        if let Some((texture, view)) = &clean_capture {
             if let Some(overlay) = self.overlay.as_deref_mut() {
                 overlay.prepare_scene(&mut gpu.renderer, frame, viewport, false);
             }
@@ -246,15 +246,16 @@ impl Host for Shell<'_> {
                 overlay: (!separate_overlay_pass).then_some(self.overlay.as_deref_mut()).flatten(),
                 timings: &mut gpu.draw_timings,
             };
-            let mut target = CaptureTarget { output, texture: texture.clone() };
+            let mut target = CaptureTarget { output, texture: texture.clone(), view: view.clone() };
             gpu.renderer.submit(frame, catalog, &mut target)?;
         }
+        let clean_texture = clean_capture.map(|(texture, _)| texture);
         let overlay_texture = if separate_overlay_pass || (!need_clean_texture && has_overlay_shots) {
             if let Some(overlay) = self.overlay.as_deref_mut() {
                 overlay.prepare_scene(&mut gpu.renderer, frame, viewport, true);
             }
             if has_overlay_shots {
-                let texture = gpu.overlay_capture_texture();
+                let (texture, view) = gpu.overlay_capture_texture();
                 let output = Output {
                     device: &gpu.device,
                     queue: &gpu.queue,
@@ -264,7 +265,7 @@ impl Host for Shell<'_> {
                     overlay: self.overlay.as_deref_mut(),
                     timings: &mut gpu.draw_timings,
                 };
-                let mut target = CaptureTarget { output, texture: texture.clone() };
+                let mut target = CaptureTarget { output, texture: texture.clone(), view };
                 gpu.renderer.submit(frame, catalog, &mut target)?;
                 Some(texture)
             } else {
@@ -1620,7 +1621,7 @@ impl Session {
         let Some(frame) = &self.last else { return Ok(()) };
         let gpu = &mut self.gpu;
         let current = self.still
-            && gpu.still.as_ref().is_some_and(|still| (still.width(), still.height()) == gpu.size)
+            && gpu.still.as_ref().is_some_and(|(still, _)| (still.width(), still.height()) == gpu.size)
             && gpu.renderer.quiet()
             && gpu.renderer.pending() == 0;
         let capture = &mut self.capture;
@@ -1631,7 +1632,7 @@ impl Session {
         let viewport = [gpu.size.0.max(1) as f32, gpu.size.1.max(1) as f32];
         let viewport_overlay_active = self.overlay.as_ref().is_some_and(|overlay| overlay.viewport_overlay_enabled());
         let need_overlay_pass = viewport_overlay_active && (gpu.surface.is_some() || !capture.overlay_shots.is_empty());
-        let texture = gpu.still_texture();
+        let (texture, view) = gpu.still_texture();
         if !current {
             if let Some(overlay) = self.overlay.as_mut() {
                 overlay.prepare_scene(&mut gpu.renderer, frame, viewport, false);
@@ -1645,7 +1646,7 @@ impl Session {
                 overlay: (!need_overlay_pass).then_some(self.overlay.as_mut()).flatten(),
                 timings: &mut Default::default(),
             };
-            let mut target = CaptureTarget { output, texture: texture.clone() };
+            let mut target = CaptureTarget { output, texture: texture.clone(), view: view.clone() };
             gpu.renderer.submit(frame, self.runtime.catalog(), &mut target)?;
             self.still = true;
         }
@@ -1653,7 +1654,7 @@ impl Session {
             if let Some(overlay) = self.overlay.as_mut() {
                 overlay.prepare_scene(&mut gpu.renderer, frame, viewport, true);
             }
-            let overlay_tex = gpu.overlay_capture_texture();
+            let (overlay_tex, overlay_view) = gpu.overlay_capture_texture();
             let output = Output {
                 device: &gpu.device,
                 queue: &gpu.queue,
@@ -1663,7 +1664,7 @@ impl Session {
                 overlay: self.overlay.as_mut(),
                 timings: &mut Default::default(),
             };
-            let mut target = CaptureTarget { output, texture: overlay_tex.clone() };
+            let mut target = CaptureTarget { output, texture: overlay_tex.clone(), view: overlay_view };
             gpu.renderer.submit(frame, self.runtime.catalog(), &mut target)?;
             Some(overlay_tex)
         } else {
@@ -1677,7 +1678,7 @@ impl Session {
                     overlay: self.overlay.as_mut(),
                     timings: &mut Default::default(),
                 };
-                let mut target = CaptureTarget { output, texture: texture.clone() };
+                let mut target = CaptureTarget { output, texture: texture.clone(), view };
                 target.present();
             }
             None

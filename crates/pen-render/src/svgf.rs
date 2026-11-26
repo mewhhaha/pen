@@ -122,7 +122,7 @@ pub struct SvgfDenoiser {
     uniform: wgpu::Buffer,
     uniform_stride: u32,
     staged: Vec<u8>,
-    state: Option<SvgfState>,
+    state: Option<Box<SvgfState>>,
 }
 
 fn tex_ro(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -287,7 +287,7 @@ impl SvgfDenoiser {
 
         let need_alloc = !matches!(&self.state, Some(st) if st.size == size);
         if need_alloc {
-            self.state = Some(SvgfState {
+            self.state = Some(Box::new(SvgfState {
                 size,
                 color_bufs: [
                     Target::new(device, "svgf_color_0", size),
@@ -301,7 +301,7 @@ impl SvgfDenoiser {
                 has_history: false,
                 temporal_bgs: std::array::from_fn(|_| None),
                 atrous_bgs: std::array::from_fn(|_| None),
-            });
+            }));
         }
         let st = self.state.as_mut().unwrap();
         let reset = params.reset_history || !st.has_history;

@@ -360,6 +360,16 @@ fn draw_hit(transform: &Matrix, origin: [f64; 3], direction: [f64; 3], max_t: Op
     if !transform.iter().all(|lane| lane.is_finite()) {
         return None;
     }
+    // Conservative bounding-sphere reject for standard affine transforms before 4x4 inversion:
+    // half the sum of column norms bounds every corner of `[-0.5, 0.5]^3` even under shear.
+    if transform[3] == 0.0
+        && transform[7] == 0.0
+        && transform[11] == 0.0
+        && transform[15] == 1.0
+        && !sphere_overlaps_ray(transform, origin, direction, max_t)
+    {
+        return None;
+    }
     let matrix = std::array::from_fn(|row| std::array::from_fn(|column| f64::from(transform[column * 4 + row])));
     if let Some(inverse) = invert(matrix) {
         let local_origin: [f64; 3] =
@@ -371,6 +381,28 @@ fn draw_hit(transform: &Matrix, origin: [f64; 3], direction: [f64; 3], max_t: Op
         }
     }
     sphere_hit(transform, origin, direction, max_t)
+}
+
+fn sphere_overlaps_ray(transform: &Matrix, origin: [f64; 3], direction: [f64; 3], max_t: Option<f64>) -> bool {
+    let transform = transform.map(f64::from);
+    let (columns, _) = transform[..12].as_chunks::<4>();
+    let radius = (columns.iter().map(|&[x, y, z, _]| x.hypot(y).hypot(z)).sum::<f64>() * 0.5).max(0.25) * (1.0 + 1e-6);
+    let offset = std::array::from_fn(|axis| transform[12 + axis] - origin[axis]);
+    let along = dot(offset, direction);
+    let perpendicular: [f64; 3] = std::array::from_fn(|axis| {
+        let b = (axis + 1) % 3;
+        let c = (axis + 2) % 3;
+        offset[b] * direction[c] - offset[c] * direction[b]
+    });
+    let discriminant = radius * radius - dot(perpendicular, perpendicular);
+    if discriminant < 0.0 {
+        return false;
+    }
+    let half_chord = discriminant.sqrt();
+    if along + half_chord <= 0.0 {
+        return false;
+    }
+    max_t.is_none_or(|far| along - half_chord <= far)
 }
 
 fn local_unit_box_hit(origin: [f64; 3], direction: [f64; 3], max_t: Option<f64>) -> Option<f64> {

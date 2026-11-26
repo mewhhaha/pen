@@ -408,11 +408,11 @@ fn input(model: &Model) -> Vec<String> {
     let input = &model.protocol["input"];
     let state = &model.protocol["state"];
     let mut out = Vec::new();
-    lines(&mut out, "    pub fn validate_state(state: &[f32]) -> Result<()> {\n        ensure!(");
-    out.push(format!(
-        "            state.len() <= {} && state.iter().all(|value| value.is_finite()),",
-        s(&state["max"]["limit"])
-    ));
+    lines(
+        &mut out,
+        "    #[inline]\n    fn all_finite(values: &[f32]) -> bool {\n        const EXP_MASK: u32 = 0x7f80_0000;\n        let (chunks, rest) = values.as_chunks::<16>();\n        for chunk in chunks {\n            let mut nonfinite = 0u32;\n            for &value in chunk {\n                nonfinite |= u32::from((value.to_bits() & EXP_MASK) == EXP_MASK);\n            }\n            if nonfinite != 0 {\n                return false;\n            }\n        }\n        rest.iter().all(|value| value.is_finite())\n    }\n\n    pub fn validate_state(state: &[f32]) -> Result<()> {\n        ensure!(",
+    );
+    out.push(format!("            state.len() <= {} && all_finite(state),", s(&state["max"]["limit"])));
     out.push(format!("            {}", quote(&state["message"])));
     lines(
         &mut out,
@@ -483,7 +483,7 @@ fn input(model: &Model) -> Vec<String> {
         "        );\n        let mut packet = Vec::with_capacity(FRAME_HEADER_FLOATS + frame.events.len() * EVENT_FLOATS + state.len());\n        packet.extend_from_slice(&[\n            elapsed as f32,\n            frame.viewport.width as f32,\n            frame.viewport.height as f32,\n            frame.events.len() as f32,\n            state.len() as f32,\n        ]);\n        for event in &frame.events {\n            packet.extend_from_slice(&event_record(event));\n        }\n        packet.extend_from_slice(state);",
     );
     out.push(format!(
-        "        ensure!(packet.iter().all(|value| value.is_finite()), {});",
+        "        ensure!(all_finite(&packet[..packet.len() - state.len()]), {});",
         quote(&input["messages"]["nonfinite"])
     ));
     lines(&mut out, "        Ok(packet)\n    }");
@@ -622,12 +622,17 @@ fn render(model: &Model) -> Vec<String> {
     }
     lines(
         &mut out,
-        "    }\n\n    impl Reader<'_> {\n        #[inline]\n        fn count(&self, index: usize, maximum: usize) -> Result<usize> {\n            let value = self.packet[index];\n            if value.fract() != 0.0 || value < 0.0 || value > maximum as f32 {",
+        "    }\n\n    impl Reader<'_> {\n        #[inline]\n        fn count(&self, index: usize, maximum: usize) -> Result<usize> {\n            let value = self.packet[index];\n            if !(0.0..=maximum as f32).contains(&value) || (value < 8_388_608.0 && (value as u32) as f32 != value) {",
     );
     out.push(format!("                bail!({});", quote(&messages["count"])));
     lines(
         &mut out,
-        "            }\n            Ok(value as usize)\n        }\n\n        #[inline]\n        fn flag(&self, index: usize) -> Result<bool> {\n            Ok(self.count(index, 1)? == 1)\n        }\n\n        #[inline]\n        fn matrix(&self, index: usize) -> Matrix {\n            self.packet[index..index + 16].try_into().unwrap()\n        }",
+        "            }\n            Ok(value as usize)\n        }\n\n        #[inline]\n        fn flag(&self, index: usize) -> Result<bool> {\n            let value = self.packet[index];\n            if value == 0.0 {\n                Ok(false)\n            } else if value == 1.0 {\n                Ok(true)\n            } else {",
+    );
+    out.push(format!("                bail!({});", quote(&messages["count"])));
+    lines(
+        &mut out,
+        "            }\n        }\n\n        #[inline]\n        fn matrix(&self, index: usize) -> Matrix {\n            self.packet[index..index + 16].try_into().unwrap()\n        }",
     );
     for (name, list) in object(&protocol["catalog"]) {
         out.extend([
@@ -663,6 +668,7 @@ fn render(model: &Model) -> Vec<String> {
                 "        fn {}(&mut self, lane: usize, {target}: &mut {record}) -> Result<()> {{",
                 decoder(&layout.record),
             ));
+            out.push(format!("            let _ = &self.packet[lane..lane + {}];", floats(&layout.record)));
             let mut fields = Vec::new();
             for laid in &layout.fields {
                 let (statements, value) = decode_field(model, "lane", laid, "self.", &target);
@@ -752,9 +758,7 @@ fn render(model: &Model) -> Vec<String> {
         previous = format!("{name}_end");
     }
     out.push(format!("        let truncated = {};", quote(&messages["length"])));
-    out.push(format!(
-        "        ensure!(packet.len() >= {previous} && packet.iter().all(|value| value.is_finite()), truncated);"
-    ));
+    out.push(format!("        ensure!(packet.len() >= {previous} && all_finite(packet), truncated);"));
     let mut packet_end = previous;
     if let Some(trailing) = trailing {
         out.push(format!("        // What the records' tails claim of {trailing}, in order."));

@@ -492,12 +492,14 @@ impl Timeline {
                 runtime.recycle(discarded);
             }
             self.prepare(runtime, host).await?;
-            let recorded = self.frames[self.index(self.cursor)].clone();
-            let (frame, replaced) = run_unseen(runtime, host, &recorded).await?;
-            self.observations.replayed(self.cursor + 1, &frame, recorded.restored || replaced);
-            unseen(self.cursor, &recorded, runtime)?;
+            let idx = self.index(self.cursor);
+            let (frame, replaced) = run_unseen(runtime, host, &self.frames[idx]).await?;
+            let restored = self.frames[idx].restored;
+            self.observations.replayed(self.cursor + 1, &frame, restored || replaced);
+            unseen(self.cursor, &self.frames[idx], runtime)?;
             shown = Some(frame);
-            self.ran(recorded);
+            self.cursor += 1;
+            self.fresh = None;
         }
         Ok((shown.expect("rewind either restored at target or replayed at least one frame"), at))
     }

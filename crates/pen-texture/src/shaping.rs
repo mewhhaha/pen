@@ -8,6 +8,7 @@
     clippy::cast_precision_loss,
     reason = "glyph metrics and cluster indices"
 )]
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
@@ -63,6 +64,9 @@ pub struct ShapedLine {
 pub struct FontChain<'a> {
     fonts: Vec<FontRef<'a>>,
     font_ids: Vec<u64>,
+    upems: Vec<f32>,
+    gsub_lookups: Vec<Vec<u16>>,
+    gpos_kern_lookups: Vec<Vec<u16>>,
 }
 
 fn hash_font_bytes(bytes: &[u8]) -> u64 {
@@ -77,13 +81,33 @@ fn hash_font_bytes(bytes: &[u8]) -> u64 {
 
 impl<'a> FontChain<'a> {
     pub fn new(font_bytes: &[&'a [u8]]) -> Result<Self> {
+        let active_gsub = [Tag::new(b"ccmp"), Tag::new(b"rlig"), Tag::new(b"liga"), Tag::new(b"calt")];
+        let kern_tag = [Tag::new(b"kern")];
         let mut fonts = Vec::with_capacity(font_bytes.len());
         let mut font_ids = Vec::with_capacity(font_bytes.len());
+        let mut upems = Vec::with_capacity(font_bytes.len());
+        let mut gsub_lookups = Vec::with_capacity(font_bytes.len());
+        let mut gpos_kern_lookups = Vec::with_capacity(font_bytes.len());
         for (i, bytes) in font_bytes.iter().enumerate() {
-            fonts.push(FontRef::new(bytes).with_context(|| format!("parsing font {i} in fallback chain"))?);
+            let font = FontRef::new(bytes).with_context(|| format!("parsing font {i} in fallback chain"))?;
+            let upem = f32::from(font.head().map_or(1000, |h| h.units_per_em()).max(1));
+            let gsub = font
+                .gsub()
+                .ok()
+                .and_then(|g| g.feature_list().ok())
+                .map_or_else(Vec::new, |f| feature_lookups(&f, &active_gsub));
+            let gpos = font
+                .gpos()
+                .ok()
+                .and_then(|g| g.feature_list().ok())
+                .map_or_else(Vec::new, |f| feature_lookups(&f, &kern_tag));
+            fonts.push(font);
             font_ids.push(hash_font_bytes(bytes));
+            upems.push(upem);
+            gsub_lookups.push(gsub);
+            gpos_kern_lookups.push(gpos);
         }
-        Ok(Self { fonts, font_ids })
+        Ok(Self { fonts, font_ids, upems, gsub_lookups, gpos_kern_lookups })
     }
 
     pub fn len(&self) -> usize {
@@ -241,11 +265,16 @@ struct LogicalChar {
 
 /// Resolves BiDi embedding levels and returns characters in visual LTR order.
 pub fn reorder_visual(text: &str, direction: Direction) -> (Vec<(char, u32, bool)>, bool) {
-    let raw: Vec<(char, u32, BidiClass)> =
-        text.char_indices().map(|(idx, ch)| (ch, idx as u32, bidi_class(ch))).collect();
-    if raw.is_empty() {
+    if text.is_empty() {
         return (Vec::new(), direction == Direction::Rtl);
     }
+    // Pure ASCII under LTR/Auto has no RTL characters, BiDi controls, or odd levels.
+    if direction != Direction::Rtl && text.is_ascii() {
+        let out = text.bytes().enumerate().map(|(idx, b)| (char::from(b), idx as u32, false)).collect();
+        return (out, false);
+    }
+    let raw: Vec<(char, u32, BidiClass)> =
+        text.char_indices().map(|(idx, ch)| (ch, idx as u32, bidi_class(ch))).collect();
     let base_rtl = match direction {
         Direction::Ltr => false,
         Direction::Rtl => true,
@@ -414,11 +443,8 @@ pub fn reorder_visual(text: &str, direction: Direction) -> (Vec<(char, u32, bool
     }
 
     // L1: trailing whitespace resets to paragraph embedding level.
-    let orig_classes: Vec<BidiClass> = raw
-        .iter()
-        .filter(|(ch, _, _)| !is_bidi_control(*ch))
-        .map(|&(_, _, orig_class)| orig_class)
-        .collect();
+    let orig_classes: Vec<BidiClass> =
+        raw.iter().filter(|(ch, _, _)| !is_bidi_control(*ch)).map(|&(_, _, orig_class)| orig_class).collect();
     for (idx, &orig_class) in orig_classes.iter().enumerate().rev() {
         if idx < items.len() && orig_class == BidiClass::Ws {
             items[idx].level = base_level;
@@ -528,10 +554,14 @@ fn join_type(ch: char) -> JoinType {
 
 /// Applies Arabic contextual joining & mandatory Lam-Alef ligatures on logical text.
 pub fn shape_arabic_logical(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if !chars.iter().any(|&c| arabic_forms(c).is_some()) {
-        return text.to_owned();
+    shape_arabic_logical_cow(text).into_owned()
+}
+
+fn shape_arabic_logical_cow(text: &str) -> Cow<'_, str> {
+    if text.is_ascii() || !text.chars().any(|c| arabic_forms(c).is_some()) {
+        return Cow::Borrowed(text);
     }
+    let chars: Vec<char> = text.chars().collect();
     // Step 1: fold mandatory Lam + Alef variants into Presentation Forms-B ligatures.
     let mut folded: Vec<char> = Vec::with_capacity(chars.len());
     let mut i = 0;
@@ -584,7 +614,7 @@ pub fn shape_arabic_logical(text: &str) -> String {
         };
         out.push(form);
     }
-    out
+    Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -611,14 +641,14 @@ fn feature_lookups(features: &read_fonts::tables::layout::FeatureList<'_>, tags:
     lookups
 }
 
-fn apply_gsub(font: &FontRef<'_>, glyphs: &mut Vec<(GlyphId, u32)>) {
+fn apply_gsub(font: &FontRef<'_>, lookup_indices: &[u16], glyphs: &mut Vec<(GlyphId, u32)>) {
+    if lookup_indices.is_empty() {
+        return;
+    }
     let Ok(gsub) = font.gsub() else { return };
-    let Ok(features) = gsub.feature_list() else { return };
     let Ok(lookup_list) = gsub.lookup_list() else { return };
-    let active_tags = [Tag::new(b"ccmp"), Tag::new(b"rlig"), Tag::new(b"liga"), Tag::new(b"calt")];
-    let lookup_indices = feature_lookups(&features, &active_tags);
 
-    for idx in lookup_indices {
+    for &idx in lookup_indices {
         let Ok(lookup) = lookup_list.lookups().get(usize::from(idx)) else { continue };
         match lookup {
             SubstitutionLookup::Single(table) => {
@@ -683,19 +713,24 @@ fn apply_gsub(font: &FontRef<'_>, glyphs: &mut Vec<(GlyphId, u32)>) {
     }
 }
 
-/// Reads pair kerning in font design units between `(left, right)` from `GPOS` (`kern`)
-/// or legacy TrueType `kern` Format 0.
-fn pair_kern_units(font: &FontRef<'_>, left: GlyphId, right: GlyphId) -> i32 {
+/// Reads pair kerning in font design units between `(left, right)` from pre-resolved
+/// `GPOS` (`kern`) lookup tables or legacy TrueType `kern` Format 0.
+fn pair_kern_units(
+    gpos_lookups: Option<&read_fonts::tables::gpos::PositionLookupList<'_>>,
+    kern_lookup_indices: &[u16],
+    legacy_kern: Option<&read_fonts::tables::kern::Kern<'_>>,
+    left: GlyphId,
+    right: GlyphId,
+) -> i32 {
     let (Ok(l16), Ok(r16)) = (GlyphId16::try_from(left), GlyphId16::try_from(right)) else {
         return 0;
     };
-    if let Ok(gpos) = font.gpos()
-        && let (Ok(features), Ok(lookup_list)) = (gpos.feature_list(), gpos.lookup_list())
+    if let Some(lookup_list) = gpos_lookups
+        && !kern_lookup_indices.is_empty()
     {
-        let kern_lookups = feature_lookups(&features, &[Tag::new(b"kern")]);
         let mut total = 0i32;
         let mut found = false;
-        for idx in kern_lookups {
+        for &idx in kern_lookup_indices {
             let Ok(PositionLookup::Pair(table)) = lookup_list.lookups().get(usize::from(idx)) else { continue };
             for subtable in table.subtables().iter().flatten() {
                 match subtable {
@@ -703,8 +738,11 @@ fn pair_kern_units(font: &FontRef<'_>, left: GlyphId, right: GlyphId) -> i32 {
                         let Some(cov_idx) = f1.coverage().ok().and_then(|c| c.get(l16)) else { continue };
                         let Ok(pair_set) = f1.pair_sets().get(usize::from(cov_idx)) else { continue };
                         for rec in pair_set.pair_value_records().iter().flatten() {
-                            if rec.second_glyph() == r16 {
-                                if let Some(dx) = rec.value_record1().x_advance() {
+                            let second = rec.second_glyph();
+                            if second >= r16 {
+                                if second == r16
+                                    && let Some(dx) = rec.value_record1().x_advance()
+                                {
                                     total += i32::from(dx);
                                     found = true;
                                 }
@@ -734,7 +772,7 @@ fn pair_kern_units(font: &FontRef<'_>, left: GlyphId, right: GlyphId) -> i32 {
         }
     }
     // Fallback to legacy TrueType `kern` Format 0 subtables.
-    if let Ok(kern) = font.kern() {
+    if let Some(kern) = legacy_kern {
         for subtable in kern.subtables().flatten() {
             if let Ok(SubtableKind::Format0(f0)) = subtable.kind()
                 && let Some(val) = f0.kerning(left, right)
@@ -752,7 +790,7 @@ pub fn shape(chain: &FontChain<'_>, text: &str, direction: Direction) -> ShapedL
     if chain.is_empty() || text.is_empty() {
         return ShapedLine { glyphs: Vec::new(), width: 0.0, base_rtl: direction == Direction::Rtl };
     }
-    let arabic_shaped = shape_arabic_logical(text);
+    let arabic_shaped = shape_arabic_logical_cow(text);
     let (visual, base_rtl) = reorder_visual(&arabic_shaped, direction);
 
     // Resolve each visual character through the fallback chain, falling back to base
@@ -776,7 +814,7 @@ pub fn shape(chain: &FontChain<'_>, text: &str, direction: Direction) -> ShapedL
             end += 1;
         }
         let font = &chain.fonts[font_index];
-        let upem = f32::from(font.head().map_or(1000, |h| h.units_per_em()).max(1));
+        let inv_upem = 1.0 / chain.upems[font_index];
         let metrics = font.glyph_metrics(Size::unscaled(), LocationRef::default());
 
         // For GSUB ligatures, run in logical order within the run (reverse back for RTL).
@@ -784,20 +822,26 @@ pub fn shape(chain: &FontChain<'_>, text: &str, direction: Direction) -> ShapedL
         if rtl {
             run_glyphs.reverse();
         }
-        apply_gsub(font, &mut run_glyphs);
+        apply_gsub(font, &chain.gsub_lookups[font_index], &mut run_glyphs);
         if rtl {
             run_glyphs.reverse();
         }
+
+        let kern_indices = &chain.gpos_kern_lookups[font_index];
+        let gpos_lookups =
+            if kern_indices.is_empty() { None } else { font.gpos().ok().and_then(|g| g.lookup_list().ok()) };
+        let legacy_kern = font.kern().ok();
 
         for i in 0..run_glyphs.len() {
             let (gid, cluster) = run_glyphs[i];
             let base_adv = metrics.advance_width(gid).unwrap_or(0.0);
             let kern = if i + 1 < run_glyphs.len() {
-                pair_kern_units(font, gid, run_glyphs[i + 1].0) as f32
+                pair_kern_units(gpos_lookups.as_ref(), kern_indices, legacy_kern.as_ref(), gid, run_glyphs[i + 1].0)
+                    as f32
             } else {
                 0.0
             };
-            let x_advance = (base_adv + kern) / upem;
+            let x_advance = (base_adv + kern) * inv_upem;
             width += x_advance;
             out.push(ShapedGlyph {
                 font_index,
@@ -829,13 +873,8 @@ mod tests {
         gsub_ligas: &[(u16, u16, u16)], // (first, second, ligature_gid)
         gpos_kerns: &[(u16, u16, i16)],
     ) -> Vec<u8> {
-        let num_glyphs = chars
-            .iter()
-            .map(|&(_, g, _)| g)
-            .chain(gsub_ligas.iter().map(|&(_, _, l)| l))
-            .max()
-            .unwrap_or(0)
-            + 1;
+        let num_glyphs =
+            chars.iter().map(|&(_, g, _)| g).chain(gsub_ligas.iter().map(|&(_, _, l)| l)).max().unwrap_or(0) + 1;
 
         let mut head = vec![0u8; 54];
         head[0..4].copy_from_slice(&0x0001_0000u32.to_be_bytes());
@@ -901,13 +940,8 @@ mod tests {
         cmap.extend_from_slice(&12u32.to_be_bytes());
         cmap.extend_from_slice(&fmt4);
 
-        let mut tables: Vec<([u8; 4], Vec<u8>)> = vec![
-            (*b"cmap", cmap),
-            (*b"head", head),
-            (*b"hhea", hhea),
-            (*b"hmtx", hmtx),
-            (*b"maxp", maxp),
-        ];
+        let mut tables: Vec<([u8; 4], Vec<u8>)> =
+            vec![(*b"cmap", cmap), (*b"head", head), (*b"hhea", hhea), (*b"hmtx", hmtx), (*b"maxp", maxp)];
 
         if !legacy_kern.is_empty() {
             let mut pairs = legacy_kern.to_vec();

@@ -84,18 +84,23 @@ fn occluded(center: vec3f, radius: f32) -> bool {
     return false;
   }
   let r = radius * 1.02 + 0.01;
+  let clip0 = cull.hiz_vp * vec4f(center - vec3f(r), 1.0);
+  let dx = cull.hiz_vp[0] * (2.0 * r);
+  let dy = cull.hiz_vp[1] * (2.0 * r);
+  let dz = cull.hiz_vp[2] * (2.0 * r);
   var min_uv = vec2f(1e9, 1e9);
   var max_uv = vec2f(-1e9, -1e9);
   var min_z = 1.0;
   for (var corner = 0u; corner < 8u; corner++) {
-    let sx = select(-r, r, (corner & 1u) != 0u);
-    let sy = select(-r, r, (corner & 2u) != 0u);
-    let sz = select(-r, r, (corner & 4u) != 0u);
-    let clip = cull.hiz_vp * vec4f(center + vec3f(sx, sy, sz), 1.0);
+    var clip = clip0;
+    if ((corner & 1u) != 0u) { clip += dx; }
+    if ((corner & 2u) != 0u) { clip += dy; }
+    if ((corner & 4u) != 0u) { clip += dz; }
     if (clip.w <= 0.0001) {
       return false;
     }
-    let ndc = clip.xyz / clip.w;
+    let inv_w = 1.0 / clip.w;
+    let ndc = clip.xyz * inv_w;
     let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     min_uv = min(min_uv, uv);
     max_uv = max(max_uv, uv);

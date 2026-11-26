@@ -211,9 +211,9 @@ impl State {
                 });
             }
             if dag_two_phase {
-                dag_culler.cull_batch_phase1(device, encoder, &dag_batch, Some(hiz_view_ref))?;
+                dag_culler.cull_batch_phase1(device, &self.queue, encoder, &dag_batch, Some(hiz_view_ref))?;
             } else {
-                dag_culler.cull_batch_single(device, encoder, &dag_batch, None)?;
+                dag_culler.cull_batch_single(device, &self.queue, encoder, &dag_batch, None)?;
             }
             self.wired.dag_phase1_used_hiz = dag_two_phase;
         }
@@ -357,7 +357,7 @@ impl State {
         }
         if run_dag
             && let Some(near_plane) = perspective_near_plane(active_proj, depth_mode)
-            && let Some(dag_culler) = wired.meshlet_dag_culler.as_ref()
+            && let Some(dag_culler) = wired.meshlet_dag_culler.as_mut()
         {
             let mut dag_batch = Vec::with_capacity(wired.dag_plan.len());
             for p in &wired.dag_plan {
@@ -384,7 +384,7 @@ impl State {
                     },
                 });
             }
-            dag_culler.cull_batch_phase2(device, encoder, &dag_batch, use_hiz.then_some(hiz_view_ref))?;
+            dag_culler.cull_batch_phase2(device, queue, encoder, &dag_batch, use_hiz.then_some(hiz_view_ref))?;
             wired.last_meshlet_phase2_active = true;
         }
         Ok(())

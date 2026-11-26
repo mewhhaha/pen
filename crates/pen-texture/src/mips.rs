@@ -5,19 +5,52 @@
 // so nothing shifts. Colour averages in linear light, weighted by alpha so
 // transparent texels lend no colour (no dark fringes); data averages as
 // stored.
+use std::sync::OnceLock;
+
 use crate::encode::to_u8;
 use crate::ktx2;
+
+const SRGB_LUT_LEN: usize = 4096;
+
+struct SrgbTables {
+    to_linear: [f32; 256],
+    to_srgb_255: Vec<f32>,
+}
+
+fn srgb_tables() -> &'static SrgbTables {
+    static TABLES: OnceLock<SrgbTables> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        let to_linear = std::array::from_fn(|value| srgb_to_linear(value as f32 / 255.0));
+        let mut to_srgb_255 = Vec::with_capacity(SRGB_LUT_LEN + 1);
+        for i in 0..=SRGB_LUT_LEN {
+            let v = i as f32 / SRGB_LUT_LEN as f32;
+            to_srgb_255.push(linear_to_srgb(v) * 255.0);
+        }
+        SrgbTables { to_linear, to_srgb_255 }
+    })
+}
+
+#[inline]
+fn linear_to_srgb_u8(value: f32, lut: &[f32]) -> u8 {
+    if value <= 0.003_130_8 {
+        return to_u8(value * (12.92 * 255.0));
+    }
+    let scaled = value.clamp(0.0, 1.0) * SRGB_LUT_LEN as f32;
+    let idx = (scaled as usize).min(SRGB_LUT_LEN - 1);
+    let frac = scaled - idx as f32;
+    to_u8(lut[idx] + (lut[idx + 1] - lut[idx]) * frac)
+}
 
 /// Every mip level of `rgba` (`width` x `height` RGBA8), level 0 (a copy)
 /// down to 1 x 1, each from the one above. `color`: RGB is sRGB-encoded and
 /// alpha straight; otherwise every channel is data.
 pub fn mip_chain(rgba: &[u8], width: u32, height: u32, color: bool) -> Vec<Vec<u8>> {
-    let linear: [f32; 256] = std::array::from_fn(|value| srgb_to_linear(value as f32 / 255.0));
+    let tables = color.then(srgb_tables);
     let mut levels = vec![rgba.to_vec()];
     for level in 1..ktx2::mip_levels(width, height) {
         let (above_width, above_height) = (ktx2::level_size(width, level - 1), ktx2::level_size(height, level - 1));
         let above = &levels[levels.len() - 1];
-        let next = downsample(above, above_width, above_height, color.then_some(&linear));
+        let next = downsample(above, above_width, above_height, tables);
         levels.push(next);
     }
     levels
@@ -50,13 +83,93 @@ fn taps(size: u32) -> Vec<[(usize, f32); 3]> {
         .collect()
 }
 
-/// The level below `rgba` (`width` x `height`). With `linear` (sRGB to
-/// linear for each 8-bit value), RGB averages in linear light weighted by
-/// alpha; without, every channel averages as it is.
-fn downsample(rgba: &[u8], width: u32, height: u32, linear: Option<&[f32; 256]>) -> Vec<u8> {
+/// The level below `rgba` (`width` x `height`). With `tables` (sRGB LUTs),
+/// RGB averages in linear light weighted by alpha; without, every channel
+/// averages as it is.
+fn downsample(rgba: &[u8], width: u32, height: u32, tables: Option<&SrgbTables>) -> Vec<u8> {
+    // Even 2x2 box fast path (power-of-two and even dimensions): avoids tap tables and inner 3x3 branching.
+    if width >= 2 && height >= 2 && width.is_multiple_of(2) && height.is_multiple_of(2) {
+        let w = width as usize;
+        let out_w = w / 2;
+        let out_h = (height as usize) / 2;
+        let row_stride = w * 4;
+        let mut out = vec![0u8; out_w * out_h * 4];
+        match tables {
+            None => {
+                for y in 0..out_h {
+                    let row0 = &rgba[(y * 2) * row_stride..(y * 2 + 1) * row_stride];
+                    let row1 = &rgba[(y * 2 + 1) * row_stride..(y * 2 + 2) * row_stride];
+                    let dst = &mut out[y * out_w * 4..(y + 1) * out_w * 4];
+                    for x in 0..out_w {
+                        let s0 = x * 8;
+                        let s1 = s0 + 4;
+                        let d = x * 4;
+                        for c in 0..4 {
+                            let sum = u16::from(row0[s0 + c])
+                                + u16::from(row0[s1 + c])
+                                + u16::from(row1[s0 + c])
+                                + u16::from(row1[s1 + c]);
+                            dst[d + c] = ((sum + 2) >> 2) as u8;
+                        }
+                    }
+                }
+            }
+            Some(tables) => {
+                let linear = &tables.to_linear;
+                let srgb_lut = &tables.to_srgb_255;
+                let inv_255 = 1.0 / 255.0;
+                for y in 0..out_h {
+                    let row0 = &rgba[(y * 2) * row_stride..(y * 2 + 1) * row_stride];
+                    let row1 = &rgba[(y * 2 + 1) * row_stride..(y * 2 + 2) * row_stride];
+                    let dst = &mut out[y * out_w * 4..(y + 1) * out_w * 4];
+                    for x in 0..out_w {
+                        let s0 = x * 8;
+                        let s1 = s0 + 4;
+                        let t0 = &row0[s0..s0 + 4];
+                        let t1 = &row0[s1..s1 + 4];
+                        let t2 = &row1[s0..s0 + 4];
+                        let t3 = &row1[s1..s1 + 4];
+                        let a0 = f32::from(t0[3]);
+                        let a1 = f32::from(t1[3]);
+                        let a2 = f32::from(t2[3]);
+                        let a3 = f32::from(t3[3]);
+                        let a_sum = a0 + a1 + a2 + a3;
+                        let d = x * 4;
+                        if a_sum > 0.0 {
+                            let inv_a = 1.0 / a_sum;
+                            for c in 0..3 {
+                                let v = (a0 * linear[usize::from(t0[c])]
+                                    + a1 * linear[usize::from(t1[c])]
+                                    + a2 * linear[usize::from(t2[c])]
+                                    + a3 * linear[usize::from(t3[c])])
+                                    * inv_a;
+                                dst[d + c] = linear_to_srgb_u8(v, srgb_lut);
+                            }
+                            dst[d + 3] = to_u8(a_sum * 0.25);
+                        } else {
+                            for c in 0..3 {
+                                let v = (linear[usize::from(t0[c])]
+                                    + linear[usize::from(t1[c])]
+                                    + linear[usize::from(t2[c])]
+                                    + linear[usize::from(t3[c])])
+                                    * 0.25;
+                                dst[d + c] = linear_to_srgb_u8(v, srgb_lut);
+                            }
+                            dst[d + 3] = 0;
+                        }
+                        let _ = inv_255;
+                    }
+                }
+            }
+        }
+        return out;
+    }
+
     let (columns, rows) = (taps(width), taps(height));
     let width = width as usize;
     let mut out = Vec::with_capacity(columns.len() * rows.len() * 4);
+    let linear = tables.map(|t| &t.to_linear);
+    let srgb_lut = tables.map(|t| t.to_srgb_255.as_slice());
     for row in &rows {
         for column in &columns {
             // Weighted sums: of each channel, or for colour of alpha-weighted
@@ -86,14 +199,14 @@ fn downsample(rgba: &[u8], width: u32, height: u32, linear: Option<&[f32; 256]>)
                     sum[3] += alpha;
                 }
             }
-            if linear.is_none() {
+            let Some(srgb_lut) = srgb_lut else {
                 out.extend(sum.map(to_u8));
                 continue;
-            }
+            };
             let alpha = sum[3];
             for c in 0..3 {
                 let value = if alpha > 0.0 { sum[c] / alpha } else { plain[c] };
-                out.push(to_u8(linear_to_srgb(value) * 255.0));
+                out.push(linear_to_srgb_u8(value, srgb_lut));
             }
             out.push(to_u8(alpha * 255.0));
         }

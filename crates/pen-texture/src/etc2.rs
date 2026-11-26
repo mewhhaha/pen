@@ -247,10 +247,15 @@ fn best_half(texels: &[[i32; 3]; 8], bits: u32) -> Half {
     let mut best = Half { base: [0; 3], table: 0, selectors: [0; 8], error: u32::MAX };
     let start = mean.map(|value| quantize(value, bits));
     let tables = consider(texels, start, bits, &mut best);
-    let mut tried = vec![start];
+    let mut tried = [[0u8; 3]; 5];
+    tried[0] = start;
+    let mut tried_len = 1usize;
     let mut try_base = |base: [u8; 3], best: &mut Half| {
-        if !tried.contains(&base) {
-            tried.push(base);
+        if !tried[..tried_len].contains(&base) {
+            if tried_len < tried.len() {
+                tried[tried_len] = base;
+                tried_len += 1;
+            }
             consider(texels, base, bits, best);
         }
     };
@@ -571,11 +576,18 @@ fn two_colors(texels: &Block) -> (u32, u64) {
     let colors = texels.map(|texel| [texel[0], texel[1], texel[2]].map(i32::from));
     let second = split(&colors);
     let [a, b] = [false, true].map(|part| {
-        let members: Vec<&[i32; 3]> =
-            (0..16).filter(|&texel| (second >> texel & 1 == 1) == part).map(|texel| &colors[texel]).collect();
-        std::array::from_fn(|c| {
-            quantize(members.iter().map(|color| color[c] as f32).sum::<f32>() / members.len().max(1) as f32, 4)
-        })
+        let mut sums = [0.0f32; 3];
+        let mut count = 0u32;
+        for (texel, color) in colors.iter().enumerate() {
+            if ((second >> texel) & 1 == 1) == part {
+                sums[0] += color[0] as f32;
+                sums[1] += color[1] as f32;
+                sums[2] += color[2] as f32;
+                count += 1;
+            }
+        }
+        let inv = 1.0 / count.max(1) as f32;
+        std::array::from_fn(|c| quantize(sums[c] * inv, 4))
     });
     let mut best: Option<Paint> = None;
     for (t, bases) in [(true, [a, b]), (true, [b, a]), (false, [a, b])] {

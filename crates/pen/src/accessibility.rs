@@ -559,6 +559,8 @@ struct Sent {
     initialized: bool,
     /// Last full node set sent to the adapter, for incremental diffing.
     nodes: HashMap<NodeId, Node>,
+    /// Reusable scratch map swapped with `nodes` to avoid per-update table allocation.
+    scratch_nodes: HashMap<NodeId, Node>,
 }
 
 /// Whether an assistive technology started since the last update (see
@@ -584,17 +586,21 @@ fn whole(sent: &mut Sent, shared: &Mutex<Shared>, interface: &Interface) -> Tree
     sent.focus = Some(full.focus);
     if !just_started && sent.initialized {
         let mut diff_nodes = Vec::new();
-        let mut next_nodes = HashMap::with_capacity(full.nodes.len());
+        sent.scratch_nodes.clear();
+        if sent.scratch_nodes.capacity() < full.nodes.len() {
+            sent.scratch_nodes.reserve(full.nodes.len() - sent.scratch_nodes.capacity());
+        }
         for (id, node) in full.nodes {
             if sent.nodes.get(&id) != Some(&node) {
                 diff_nodes.push((id, node.clone()));
             }
-            next_nodes.insert(id, node);
+            sent.scratch_nodes.insert(id, node);
         }
-        sent.nodes = next_nodes;
+        std::mem::swap(&mut sent.nodes, &mut sent.scratch_nodes);
         TreeUpdate { nodes: diff_nodes, tree: None, tree_id: full.tree_id, focus: full.focus }
     } else {
-        sent.nodes = full.nodes.iter().map(|(id, node)| (*id, node.clone())).collect();
+        sent.nodes.clear();
+        sent.nodes.extend(full.nodes.iter().map(|(id, node)| (*id, node.clone())));
         sent.initialized = true;
         full
     }
@@ -686,6 +692,8 @@ pub struct Accessibility {
     current: Option<Arc<Interface>>,
     /// The dev tools' interface as last seen, their subtree's.
     program: Option<Vec<UiNode>>,
+    /// Cached `program_focused` result for `program`, recomputed only when `program` changes.
+    program_focused: Option<bool>,
     sent: Sent,
     dump: Option<Dump>,
 }
@@ -698,6 +706,7 @@ impl Accessibility {
             flags: Arc::default(),
             current: None,
             program: None,
+            program_focused: None,
             sent: Sent::default(),
             dump,
         }
@@ -759,11 +768,12 @@ impl Accessibility {
             None => [1.0, 1.0],
         };
         let program = session.overlay_interface();
-        let overlay = program.map(program_focused);
         let program_changed = program != self.program.as_deref();
         if program_changed {
+            self.program_focused = program.map(program_focused);
             self.program = program.map(<[UiNode]>::to_vec);
         }
+        let overlay = self.program_focused;
         let ui = session.interface();
         let captions = session.captions();
         let changed = previous.is_none_or(|previous| {

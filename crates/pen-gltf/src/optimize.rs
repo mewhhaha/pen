@@ -5,26 +5,44 @@
 //!   attribute buffer in first-use order);
 //! - `EXT_meshopt_compression` post-filters (`OCTAHEDRAL` 8/16-bit, `QUATERNION`
 //!   16-bit, `EXPONENTIAL` 32-bit).
+use std::sync::OnceLock;
+
 use anyhow::{Result, ensure};
 
 use crate::Geometry;
 
 const CACHE_SIZE: usize = 32;
+const VALENCE_LUT_LEN: usize = 64;
 
-fn vertex_score(cache_pos: i32, active_tris: u32) -> f32 {
+struct ScoreTables {
+    cache: [f32; CACHE_SIZE],
+    valence: [f32; VALENCE_LUT_LEN],
+}
+
+fn score_tables() -> &'static ScoreTables {
+    static TABLES: OnceLock<ScoreTables> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        let scaler = 1.0 / (CACHE_SIZE - 3) as f32;
+        let cache = std::array::from_fn(|pos| {
+            if pos < 3 { 0.75 } else { (1.0 - (pos - 3) as f32 * scaler).clamp(0.0, 1.0).powf(1.5) }
+        });
+        let valence = std::array::from_fn(|c| if c == 0 { 0.0 } else { 2.0 * (c as f32).powf(-0.5) });
+        ScoreTables { cache, valence }
+    })
+}
+
+#[inline]
+fn vertex_score_lut(tables: &ScoreTables, cache_pos: i32, active_tris: u32) -> f32 {
     if active_tris == 0 {
         return -1.0;
     }
-    let mut score = if cache_pos < 0 {
-        0.0
-    } else if cache_pos < 3 {
-        0.75
+    let cache = usize::try_from(cache_pos).map_or(0.0, |p| tables.cache[p]);
+    let val = if (active_tris as usize) < VALENCE_LUT_LEN {
+        tables.valence[active_tris as usize]
     } else {
-        let scaler = 1.0 / (CACHE_SIZE - 3) as f32;
-        (1.0 - (cache_pos - 3) as f32 * scaler).clamp(0.0, 1.0).powf(1.5)
+        2.0 / (active_tris as f32).sqrt()
     };
-    score += 2.0 * (active_tris as f32).powf(-0.5);
-    score
+    cache + val
 }
 
 /// Reorders triangle indices using Tom Forsyth's linear-speed vertex cache
@@ -61,9 +79,10 @@ pub fn optimize_vertex_cache(indices: &[u32], vertex_count: usize) -> Vec<u32> {
 
     // Live per-vertex adjacency lengths: emitted triangles are swap-removed from
     // `adj[offsets[v] .. offsets[v] + live[v]]` so emitted faces are never scanned again.
+    let tables = score_tables();
     let mut live = counts;
     let mut cache_pos = vec![-1i32; vertex_count];
-    let mut v_score: Vec<f32> = live.iter().map(|&c| vertex_score(-1, c)).collect();
+    let mut v_score: Vec<f32> = live.iter().map(|&c| vertex_score_lut(tables, -1, c)).collect();
     let mut emitted = vec![false; tri_count];
     let mut tri_score: Vec<f32> = (0..tri_count)
         .map(|t| {
@@ -73,7 +92,8 @@ pub fn optimize_vertex_cache(indices: &[u32], vertex_count: usize) -> Vec<u32> {
         })
         .collect();
 
-    let mut cache: Vec<u32> = Vec::with_capacity(CACHE_SIZE + 3);
+    let mut cache = [0u32; CACHE_SIZE + 3];
+    let mut cache_len = 0usize;
     let mut out = Vec::with_capacity(indices.len());
     let mut scan = 0usize;
     let mut best_tri = (0..tri_count).max_by(|&a, &b| tri_score[a].total_cmp(&tri_score[b])).unwrap_or(0);
@@ -102,38 +122,41 @@ pub fn optimize_vertex_cache(indices: &[u32], vertex_count: usize) -> Vec<u32> {
                 adj.swap(start + pos, start + last);
                 live[vi] = u32::try_from(last).unwrap_or(0);
             }
-            if let Some(pos) = cache.iter().position(|&c| c == v) {
-                cache.remove(pos);
+            if let Some(pos) = cache[..cache_len].iter().position(|&c| c == v) {
+                cache.copy_within(0..pos, 1);
+                cache[0] = v;
+            } else {
+                cache.copy_within(0..cache_len, 1);
+                cache[0] = v;
+                cache_len += 1;
             }
-            cache.insert(0, v);
         }
         // Evict tail beyond CACHE_SIZE.
-        while cache.len() > CACHE_SIZE {
-            if let Some(evicted) = cache.pop() {
-                let ei = evicted as usize;
-                cache_pos[ei] = -1;
-                let old = v_score[ei];
-                let new = vertex_score(-1, live[ei]);
-                v_score[ei] = new;
-                let delta = new - old;
-                let start = offsets[ei];
-                let end = start + live[ei] as usize;
-                for &t in &adj[start..end] {
-                    tri_score[t] += delta;
-                }
+        while cache_len > CACHE_SIZE {
+            cache_len -= 1;
+            let ei = cache[cache_len] as usize;
+            cache_pos[ei] = -1;
+            let old = v_score[ei];
+            let new = vertex_score_lut(tables, -1, live[ei]);
+            v_score[ei] = new;
+            let delta = new - old;
+            let start = offsets[ei];
+            let end = start + live[ei] as usize;
+            for &t in &adj[start..end] {
+                tri_score[t] += delta;
             }
         }
         // Update scores for vertices currently in the cache and pick next best adjacent triangle.
         // Cap per-vertex scan at 64 live triangles on extreme high-valence hubs to stay strictly O(T).
         let mut next_best = usize::MAX;
         let mut next_score = f32::NEG_INFINITY;
-        for (pos, &v) in cache.iter().enumerate() {
+        for (pos, &v) in cache[..cache_len].iter().enumerate() {
             let vi = v as usize;
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, reason = "cache <= 32")]
             let p = pos as i32;
             cache_pos[vi] = p;
             let old = v_score[vi];
-            let new = vertex_score(p, live[vi]);
+            let new = vertex_score_lut(tables, p, live[vi]);
             v_score[vi] = new;
             let delta = new - old;
             let start = offsets[vi];
@@ -376,7 +399,13 @@ mod tests {
             normals: vec![[0.0, 0.0, 1.0]; 5],
             uvs: vec![[0.0, 0.0], [0.5, 0.0], [1.0, 0.0], [0.0, 1.0], [0.5, 1.0]],
             uvs1: vec![[1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0], [5.0, 0.0]],
-            colors: vec![[0.0, 0.0, 0.0, 1.0], [0.1, 0.0, 0.0, 1.0], [0.2, 0.0, 0.0, 1.0], [0.3, 0.0, 0.0, 1.0], [0.4, 0.0, 0.0, 1.0]],
+            colors: vec![
+                [0.0, 0.0, 0.0, 1.0],
+                [0.1, 0.0, 0.0, 1.0],
+                [0.2, 0.0, 0.0, 1.0],
+                [0.3, 0.0, 0.0, 1.0],
+                [0.4, 0.0, 0.0, 1.0],
+            ],
             indices: vec![4, 3, 2, 2, 1, 0, 4, 2, 1],
             joints: vec![[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0]],
             weights: vec![[1.0, 0.0, 0.0, 0.0]; 5],

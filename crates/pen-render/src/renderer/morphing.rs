@@ -27,6 +27,7 @@ pub(super) struct Morphing {
     params_buffer: Option<wgpu::Buffer>,
     weights_buffer: Option<wgpu::Buffer>,
     output_buffer: Option<wgpu::Buffer>,
+    bg_cache: std::sync::Mutex<Vec<(wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup)>>,
 }
 
 impl Morphing {
@@ -115,6 +116,7 @@ impl Morphing {
             params_buffer: None,
             weights_buffer: None,
             output_buffer: None,
+            bg_cache: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -172,6 +174,7 @@ impl Morphing {
         if self.jobs.is_empty() {
             return;
         }
+        let mut reallocated = false;
         let params_size = (self.params_data.len() as u64).max(16);
         if self.params_buffer.as_ref().is_none_or(|b| b.size() < params_size) {
             self.params_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
@@ -180,6 +183,7 @@ impl Morphing {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
+            reallocated = true;
         }
         queue.write_buffer(self.params_buffer.as_ref().unwrap(), 0, &self.params_data);
 
@@ -192,6 +196,7 @@ impl Morphing {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
+            reallocated = true;
         }
         queue.write_buffer(self.weights_buffer.as_ref().unwrap(), 0, weights_bytes);
 
@@ -203,6 +208,10 @@ impl Morphing {
                 usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             }));
+            reallocated = true;
+        }
+        if reallocated {
+            self.bg_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
         }
     }
 
@@ -219,6 +228,10 @@ impl Morphing {
         else {
             return;
         };
+        let mut cache = self.bg_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() > 64 {
+            cache.clear();
+        }
         let mut pass =
             encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("morph"), timestamp_writes: None });
         pass.set_pipeline(&self.pipeline);
@@ -227,25 +240,31 @@ impl Morphing {
             else {
                 continue;
             };
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("morph"),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: params_buf,
-                            offset: 0,
-                            size: wgpu::BufferSize::new(16),
-                        }),
-                    },
-                    wgpu::BindGroupEntry { binding: 1, resource: vertices.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: morphs.deltas.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: weights_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: output_buf.as_entire_binding() },
-                ],
-            });
-            pass.set_bind_group(0, &group, &[job.params_offset]);
+            let idx = if let Some(idx) = cache.iter().position(|(v, d, _)| v == vertices && d == &morphs.deltas) {
+                idx
+            } else {
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("morph"),
+                    layout: &self.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: params_buf,
+                                offset: 0,
+                                size: wgpu::BufferSize::new(16),
+                            }),
+                        },
+                        wgpu::BindGroupEntry { binding: 1, resource: vertices.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: morphs.deltas.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: weights_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: output_buf.as_entire_binding() },
+                    ],
+                });
+                cache.push((vertices.clone(), morphs.deltas.clone(), group));
+                cache.len() - 1
+            };
+            pass.set_bind_group(0, &cache[idx].2, &[job.params_offset]);
             pass.dispatch_workgroups(job.vertex_count.div_ceil(64), 1, 1);
         }
     }

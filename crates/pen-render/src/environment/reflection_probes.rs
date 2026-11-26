@@ -366,6 +366,15 @@ struct Pipelines {
     downsample_layout: wgpu::BindGroupLayout,
     prefilter: wgpu::RenderPipeline,
     prefilter_layout: wgpu::BindGroupLayout,
+    filter_sampler: wgpu::Sampler,
+    /// Cached per-(level, face) 2D views of `scratch` (`SCRATCH_LEVELS * 6`).
+    scratch_views: Vec<wgpu::TextureView>,
+    /// Cached downsample bind groups for `(level - 1, face)` (`(SCRATCH_LEVELS - 1) * 6`).
+    downsample_groups: Vec<wgpu::BindGroup>,
+    /// Cached single prefilter bind group reading `scratch_cube` + dynamic pass uniform.
+    prefilter_group: wgpu::BindGroup,
+    /// Cached per-(slot, level, face) 2D target views of `cubes` (`SLOTS * (LEVELS - 1) * 6`).
+    slot_filter_views: Vec<wgpu::TextureView>,
 }
 
 fn pass_uniform(entry: u32, visibility: wgpu::ShaderStages, size: u64) -> wgpu::BindGroupLayoutEntry {
@@ -584,6 +593,75 @@ impl Environment {
             };
         let finishing = module("reflection finish", format!("{}\n{FINALISE}", super::ENVIRONMENT_WGSL));
         let filtering = module("reflection filter", FILTER.to_string());
+        let filter_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("reflection filter"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let face_view = |texture: &wgpu::Texture, level: u32, layer: u32| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_mip_level: level,
+                mip_level_count: Some(1),
+                base_array_layer: layer,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        };
+        let mut scratch_views = Vec::with_capacity((SCRATCH_LEVELS * 6) as usize);
+        for level in 0..SCRATCH_LEVELS {
+            for face in 0..6u32 {
+                scratch_views.push(face_view(&self.reflections.scratch, level, face));
+            }
+        }
+        let pass_uniform_entry = wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &self.reflections.passes,
+                offset: 0,
+                size: wgpu::BufferSize::new(32),
+            }),
+        };
+        let mut downsample_groups = Vec::with_capacity(((SCRATCH_LEVELS - 1) * 6) as usize);
+        for level in 1..SCRATCH_LEVELS {
+            for face in 0..6u32 {
+                let from = &scratch_views[((level - 1) * 6 + face) as usize];
+                downsample_groups.push(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("reflection halving"),
+                    layout: &downsample_layout,
+                    entries: &[
+                        pass_uniform_entry.clone(),
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(from) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&filter_sampler) },
+                    ],
+                }));
+            }
+        }
+        let prefilter_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("reflection filter"),
+            layout: &prefilter_layout,
+            entries: &[
+                pass_uniform_entry,
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.reflections.scratch_cube),
+                },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&filter_sampler) },
+            ],
+        });
+        let mut slot_filter_views = Vec::with_capacity(SLOTS * ((LEVELS - 1) * 6) as usize);
+        for slot in 0..SLOT_COUNT {
+            for level in 1..LEVELS {
+                for face in 0..6u32 {
+                    slot_filter_views.push(face_view(&self.reflections.cubes, level, slot * 6 + face));
+                }
+            }
+        }
         self.reflections.pipelines = Some(Pipelines {
             finalise: make("reflection finish", &finishing, "fragment", &[Some(&environment), Some(&face)]),
             downsample: make("reflection halving", &filtering, "downsample", &[Some(&downsample_layout)]),
@@ -592,6 +670,11 @@ impl Environment {
             face,
             downsample_layout,
             prefilter_layout,
+            filter_sampler,
+            scratch_views,
+            downsample_groups,
+            prefilter_group,
+            slot_filter_views,
         });
     }
 
@@ -672,17 +755,10 @@ impl Environment {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&targets.resolved) },
             ],
         });
-        let view = self.reflections.scratch.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2),
-            base_mip_level: 0,
-            mip_level_count: Some(1),
-            base_array_layer: face,
-            array_layer_count: Some(1),
-            ..Default::default()
-        });
+        let view = &pipelines.scratch_views[face as usize];
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("reflection finish"),
-            color_attachments: &[Some(clear(&view))],
+            color_attachments: &[Some(clear(view))],
             ..Default::default()
         });
         pass.set_pipeline(&pipelines.finalise);
@@ -705,56 +781,21 @@ impl Environment {
         self.write_statics(queue);
         let reflections = &self.reflections;
         let pipelines = reflections.pipelines.as_ref().unwrap();
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("reflection filter"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        });
-        let uniform = wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: &reflections.passes,
-                offset: 0,
-                size: wgpu::BufferSize::new(32),
-            }),
-        };
-        let face_view = |texture: &wgpu::Texture, level: u32, layer: u32| {
-            texture.create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                base_mip_level: level,
-                mip_level_count: Some(1),
-                base_array_layer: layer,
-                array_layer_count: Some(1),
-                ..Default::default()
-            })
-        };
+        let _ = &pipelines.filter_sampler;
+        let _ = (&pipelines.downsample_layout, &pipelines.prefilter_layout);
         // The scratch cube, halved level by level.
         for level in 1..SCRATCH_LEVELS {
             for face in 0..6u32 {
-                let from = face_view(&reflections.scratch, level - 1, face);
-                let to = face_view(&reflections.scratch, level, face);
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("reflection halving"),
-                    layout: &pipelines.downsample_layout,
-                    entries: &[
-                        uniform.clone(),
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&from) },
-                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sampler) },
-                    ],
-                });
+                let to = &pipelines.scratch_views[(level * 6 + face) as usize];
+                let group = &pipelines.downsample_groups[((level - 1) * 6 + face) as usize];
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("reflection halving"),
-                    color_attachments: &[Some(clear(&to))],
+                    color_attachments: &[Some(clear(to))],
                     ..Default::default()
                 });
                 pass.set_pipeline(&pipelines.downsample);
                 let index = DOWNSAMPLE_FIRST + u64::from(level - 1) * 6 + u64::from(face);
-                pass.set_bind_group(0, &group, &[ReflectionProbes::offset(index)]);
+                pass.set_bind_group(0, group, &[ReflectionProbes::offset(index)]);
                 pass.draw(0..3, 0..1);
             }
         }
@@ -776,29 +817,18 @@ impl Environment {
                 wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
             );
         }
+        let slot_stride = ((LEVELS - 1) * 6) as usize;
         for level in 1..LEVELS {
             for face in 0..6u32 {
-                let to = face_view(&reflections.cubes, level, u32::try_from(slot).expect("at most SLOTS") * 6 + face);
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("reflection filter"),
-                    layout: &pipelines.prefilter_layout,
-                    entries: &[
-                        uniform.clone(),
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&reflections.scratch_cube),
-                        },
-                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sampler) },
-                    ],
-                });
+                let to = &pipelines.slot_filter_views[slot * slot_stride + ((level - 1) * 6 + face) as usize];
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("reflection filter"),
-                    color_attachments: &[Some(clear(&to))],
+                    color_attachments: &[Some(clear(to))],
                     ..Default::default()
                 });
                 pass.set_pipeline(&pipelines.prefilter);
                 let index = FILTER_FIRST + u64::from(level - 1) * 6 + u64::from(face);
-                pass.set_bind_group(0, &group, &[ReflectionProbes::offset(index)]);
+                pass.set_bind_group(0, &pipelines.prefilter_group, &[ReflectionProbes::offset(index)]);
                 pass.draw(0..3, 0..1);
             }
         }

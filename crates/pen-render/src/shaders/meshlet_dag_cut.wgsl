@@ -57,18 +57,23 @@ fn hiz_occluded(world_center: vec3f, world_radius: f32, rev_z: bool) -> bool {
   }
   let mips = min(u.counts_flags.z, textureNumLevels(hiz_tex));
   let r = world_radius * 1.02 + 0.005;
+  let clip0 = u.hiz_vp * vec4f(world_center - vec3f(r), 1.0);
+  let dx = u.hiz_vp[0] * (2.0 * r);
+  let dy = u.hiz_vp[1] * (2.0 * r);
+  let dz = u.hiz_vp[2] * (2.0 * r);
   var min_uv = vec2f(1e9);
   var max_uv = vec2f(-1e9);
   var near_z = select(1.0, 0.0, rev_z);
   for (var c = 0u; c < 8u; c++) {
-    let sx = select(-r, r, (c & 1u) != 0u);
-    let sy = select(-r, r, (c & 2u) != 0u);
-    let sz = select(-r, r, (c & 4u) != 0u);
-    let clip = u.hiz_vp * vec4f(world_center + vec3f(sx, sy, sz), 1.0);
+    var clip = clip0;
+    if ((c & 1u) != 0u) { clip += dx; }
+    if ((c & 2u) != 0u) { clip += dy; }
+    if ((c & 4u) != 0u) { clip += dz; }
     if (clip.w <= 1e-4) {
       return false;
     }
-    let ndc = clip.xyz / clip.w;
+    let inv_w = 1.0 / clip.w;
+    let ndc = clip.xyz * inv_w;
     let uv = vec2f(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
     min_uv = min(min_uv, uv);
     max_uv = max(max_uv, uv);
@@ -140,11 +145,10 @@ fn cull_meshlet_dag(
   var counts = vec4u(0u);
   if (idx < u.counts_flags.x) {
     let m = clusters[idx];
-    let lod_pass = m.errors.x <= 0.0 || screen_error(m.lod_sphere, m.errors.x) <= u.projection.w;
-    let parent_fail = m.errors.y >= 1e29 || screen_error(m.parent_sphere, m.errors.y) > u.projection.w;
-    if (lod_pass && parent_fail) {
-      let sphere = m.bounds_sphere;
-      if (in_frustum_local(sphere.xyz, sphere.w) && !backface_culled(m)) {
+    let sphere = m.bounds_sphere;
+    if (in_frustum_local(sphere.xyz, sphere.w) && !backface_culled(m)) {
+      let lod_pass = m.errors.x <= 0.0 || screen_error(m.lod_sphere, m.errors.x) <= u.projection.w;
+      if (lod_pass && (m.errors.y >= 1e29 || screen_error(m.parent_sphere, m.errors.y) > u.projection.w)) {
         let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
         let reversed_z = (u.counts_flags.w & 2u) != 0u;
         if (!hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
@@ -190,18 +194,19 @@ fn cull_meshlet_dag_phase1(
   var counts = vec4u(0u);
   if (idx < u.counts_flags.x) {
     let m = clusters[idx];
-    let lod_pass = m.errors.x <= 0.0 || screen_error(m.lod_sphere, m.errors.x) <= u.projection.w;
-    let parent_fail = m.errors.y >= 1e29 || screen_error(m.parent_sphere, m.errors.y) > u.projection.w;
     let sphere = m.bounds_sphere;
     var defer = 0u;
-    if (lod_pass && parent_fail && in_frustum_local(sphere.xyz, sphere.w) && !backface_culled(m)) {
-      let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
-      let reversed_z = (u.counts_flags.w & 2u) != 0u;
-      if (hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
-        defer = 1u;
-      } else {
-        emit = true;
-        counts = m.counts;
+    if (in_frustum_local(sphere.xyz, sphere.w) && !backface_culled(m)) {
+      let lod_pass = m.errors.x <= 0.0 || screen_error(m.lod_sphere, m.errors.x) <= u.projection.w;
+      if (lod_pass && (m.errors.y >= 1e29 || screen_error(m.parent_sphere, m.errors.y) > u.projection.w)) {
+        let world_center = (u.model * vec4f(sphere.xyz, 1.0)).xyz;
+        let reversed_z = (u.counts_flags.w & 2u) != 0u;
+        if (hiz_occluded(world_center, sphere.w * u.projection.x, reversed_z)) {
+          defer = 1u;
+        } else {
+          emit = true;
+          counts = m.counts;
+        }
       }
     }
     phase2_flags[idx] = defer;

@@ -54,15 +54,18 @@ fn unpack(bits: u64) -> [f32; 2] {
     [f32::from_bits((bits & 0xffff_ffff) as u32), f32::from_bits((bits >> 32) as u32)]
 }
 
+#[repr(align(64))]
+struct CacheAligned<T>(T);
+
 /// What a voice and the streamer share: the ring, how far each has got in
 /// it, and whether the voice loops.
 pub struct Slot {
     state: AtomicU8,
     frames: Box<[AtomicU64]>,
     /// Frames written, in the order the voice plays them.
-    written: AtomicU64,
+    written: CacheAligned<AtomicU64>,
     /// Frames the voice is done with: it plays on from here.
-    read: AtomicU64,
+    read: CacheAligned<AtomicU64>,
     looping: AtomicBool,
 }
 
@@ -71,8 +74,8 @@ impl Slot {
         Slot {
             state: AtomicU8::new(FREE),
             frames: (0..CAPACITY).map(|_| AtomicU64::new(0)).collect(),
-            written: AtomicU64::new(0),
-            read: AtomicU64::new(0),
+            written: CacheAligned(AtomicU64::new(0)),
+            read: CacheAligned(AtomicU64::new(0)),
             looping: AtomicBool::new(false),
         }
     }
@@ -100,13 +103,13 @@ pub struct Reader {
 impl Reader {
     /// Whether the stream has begun.
     pub fn begun(&self) -> bool {
-        self.slot.written.load(Ordering::Acquire) > 0
+        self.slot.written.0.load(Ordering::Acquire) > 0
     }
 
     /// A quantum begins: what has been written so far is what it plays.
     pub fn begin(&mut self, looping: bool) {
         self.slot.looping.store(looping, Ordering::Relaxed);
-        self.written = self.slot.written.load(Ordering::Acquire);
+        self.written = self.slot.written.0.load(Ordering::Acquire);
         self.dry = false;
     }
 
@@ -123,7 +126,7 @@ impl Reader {
 
     /// The quantum is over: the voice plays on from frame `index`.
     pub fn end(&mut self, index: u64) {
-        self.slot.read.store(index, Ordering::Release);
+        self.slot.read.0.store(index, Ordering::Release);
         if self.dry {
             self.underruns.fetch_add(1, Ordering::Relaxed);
         }
@@ -185,8 +188,8 @@ impl Streams {
             slot.state.compare_exchange(FREE, CLAIMED, Ordering::Acquire, Ordering::Relaxed).is_ok()
         })?;
         let slot = self.slots[index].clone();
-        slot.written.store(0, Ordering::Relaxed);
-        slot.read.store(0, Ordering::Relaxed);
+        slot.written.0.store(0, Ordering::Relaxed);
+        slot.read.0.store(0, Ordering::Relaxed);
         let reader = Reader { slot, underruns: self.underruns.clone(), written: 0, dry: false };
         // A full queue lets the slot go again: the voice plays silence.
         self.requests.try_send(Request { slot: index, clip: clip.clone(), rate, first }).ok()?;
@@ -269,20 +272,11 @@ impl Decoding {
         if let Ok(last) = usize::try_from(first + TAPS as i64 - 1) {
             self.input(last)?;
         }
-        let (input, start, frames) = (&self.input, self.input_start, self.clip.frames);
-        let at = |side: usize| {
-            move |index: i64| match usize::try_from(index) {
-                Ok(index) if index < frames && index >= start => {
-                    input.get(index - start).map_or(0.0, |frame| frame[side])
-                }
-                _ => 0.0,
-            }
-        };
         let resampler = self.resampler.as_ref().expect("a resampler");
-        let left = resampler.sample(j, at(0));
-        let right = if self.clip.channels == 1 { left } else { resampler.sample(j, at(1)) };
+        let out =
+            resampler.sample_stereo_window(j, &self.input, self.input_start, self.clip.frames, self.clip.channels == 1);
         self.forget(usize::try_from(keep).unwrap_or(0));
-        Ok([left, right])
+        Ok(out)
     }
 
     /// Input frames before `index` are needed no more.
@@ -309,13 +303,13 @@ impl Decoding {
         const BATCH: usize = 128;
         let mut wrote = false;
         let mut pending = 0usize;
-        let mut read = slot.read.load(Ordering::Acquire);
+        let mut read = slot.read.0.load(Ordering::Acquire);
         loop {
             if self.next >= read + CAPACITY {
-                read = slot.read.load(Ordering::Acquire);
+                read = slot.read.0.load(Ordering::Acquire);
                 if self.next >= read + CAPACITY {
                     if pending > 0 {
-                        slot.written.store(self.next, Ordering::Release);
+                        slot.written.0.store(self.next, Ordering::Release);
                     }
                     return Ok(wrote);
                 }
@@ -323,7 +317,7 @@ impl Decoding {
             if self.output == self.length {
                 if !slot.looping.load(Ordering::Relaxed) || self.length == 0 {
                     if pending > 0 {
-                        slot.written.store(self.next, Ordering::Release);
+                        slot.written.0.store(self.next, Ordering::Release);
                     }
                     return Ok(wrote);
                 }
@@ -333,7 +327,7 @@ impl Decoding {
                 Ok(frame) => frame,
                 Err(error) => {
                     if pending > 0 {
-                        slot.written.store(self.next, Ordering::Release);
+                        slot.written.0.store(self.next, Ordering::Release);
                     }
                     return Err(error);
                 }
@@ -351,8 +345,8 @@ impl Decoding {
             pending += 1;
             wrote = true;
             if pending >= BATCH {
-                slot.written.store(self.next, Ordering::Release);
-                read = slot.read.load(Ordering::Acquire);
+                slot.written.0.store(self.next, Ordering::Release);
+                read = slot.read.0.load(Ordering::Acquire);
                 pending = 0;
             }
         }

@@ -96,11 +96,12 @@ fn history_at_rgba(uv: vec2f) -> vec4f {
   let w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
   let w3 = 0.5 * f3 - 0.5 * f2;
   let w12 = w1 + w2;
-  let half_px = vec2f(0.5) / size;
+  let inv_size = 1.0 / size;
+  let half_px = vec2f(0.5) * inv_size;
   let max_uv = vec2f(1.0) - half_px;
-  let at0 = clamp((center - 1.0) / size, half_px, max_uv);
-  let at3 = clamp((center + 2.0) / size, half_px, max_uv);
-  let at12 = clamp((center + w2 / max(w12, vec2f(1e-5))) / size, half_px, max_uv);
+  let at0 = clamp((center - 1.0) * inv_size, half_px, max_uv);
+  let at3 = clamp((center + 2.0) * inv_size, half_px, max_uv);
+  let at12 = clamp((center + w2 / max(w12, vec2f(1e-5))) * inv_size, half_px, max_uv);
   let sum = textureSampleLevel(history, filtering, vec2f(at12.x, at0.y), 0.0).rgb * (w12.x * w0.y)
     + textureSampleLevel(history, filtering, vec2f(at0.x, at12.y), 0.0).rgb * (w0.x * w12.y)
     + textureSampleLevel(history, filtering, at12, 0.0).rgb * (w12.x * w12.y)
@@ -187,7 +188,7 @@ fn clipped(color: vec3f, low: vec3f, high: vec3f) -> vec3f {
         lanczos_w += w;
       }
 
-      let d = textureLoad(depth, at, 0);
+      let d = select(textureLoad(depth, at, 0), center_depth, x == 0 && y == 0);
       let is_nearer = select((d < nearest), (d > nearest), rev_z);
       if (is_nearer) {
         nearest = d;

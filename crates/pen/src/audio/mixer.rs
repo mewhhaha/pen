@@ -33,7 +33,7 @@ use pen_runtime::mix::{Meter, Monitor};
 use pen_runtime::panner::{DEFAULT_EAR, Pan, Placement, Vec3, azimuth_default_ear, equal_power};
 use pen_runtime::synth::{SynthEngine, SynthSpec};
 
-use super::resample::{Resampler, resample};
+use super::resample::{Resampler, resample_stereo};
 use super::reverb::{AcousticProfile, Convolver};
 use super::source::Encoded;
 use super::stream::{Reader, Streams};
@@ -75,7 +75,7 @@ impl Clip {
     pub fn len(&self) -> usize {
         match &self.streamed {
             Some(encoded) if (encoded.rate - self.rate).abs() >= 0.5 => {
-                Resampler::new(encoded.rate, self.rate).length(encoded.frames)
+                Resampler::output_length(encoded.frames, encoded.rate, self.rate)
             }
             Some(encoded) => encoded.frames,
             None => self.frames.len(),
@@ -93,16 +93,7 @@ impl Clip {
         if (self.rate - rate).abs() < 0.5 || self.frames.is_empty() {
             return self;
         }
-        let channel = |index: usize| {
-            let samples: Vec<f32> = self.frames.iter().map(|frame| frame[index]).collect();
-            resample(&samples, self.rate, rate)
-        };
-        let left = channel(0);
-        let frames: Arc<[[f32; 2]]> = if self.mono {
-            left.into_iter().map(|value| [value, value]).collect()
-        } else {
-            left.into_iter().zip(channel(1)).map(|(left, right)| [left, right]).collect()
-        };
+        let frames: Arc<[[f32; 2]]> = resample_stereo(&self.frames, self.mono, self.rate, rate).into();
         Arc::new(Clip { frames, rate, mono: self.mono, streamed: None })
     }
 }

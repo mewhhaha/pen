@@ -236,8 +236,8 @@ pub(crate) struct Particles {
     emitters: Option<wgpu::Buffer>,
     particles: Option<wgpu::Buffer>,
     simulate: Option<wgpu::ComputePipeline>,
-    /// This frame's compute bind group, and its particles.
-    group: Option<wgpu::BindGroup>,
+    /// Cached compute bind group with `(emitter_bytes, particle_bytes, emitters_buf, particles_buf)`.
+    group_cache: Option<(u64, u64, wgpu::Buffer, wgpu::Buffer, wgpu::BindGroup)>,
     total: u32,
 }
 
@@ -270,14 +270,17 @@ impl Particles {
             emitters: None,
             particles: None,
             simulate: None,
-            group: None,
+            group_cache: None,
             total: 0,
         })
     }
 
     /// The compute pass placing this frame's particles, if it has any.
     pub fn simulate(&self, encoder: &mut wgpu::CommandEncoder) {
-        let (Some(group), Some(pipeline)) = (&self.group, &self.simulate) else { return };
+        if self.total == 0 {
+            return;
+        }
+        let (Some((_, _, _, _, group)), Some(pipeline)) = (&self.group_cache, &self.simulate) else { return };
         let mut pass = encoder
             .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("particles"), timestamp_writes: None });
         pass.set_pipeline(pipeline);
@@ -320,7 +323,6 @@ impl State {
         scratch: &mut Scratch,
     ) -> Result<()> {
         if let Some(particles) = &mut self.particles {
-            particles.group = None;
             particles.total = 0;
         }
         if frame.emitters.is_empty() {
@@ -401,10 +403,10 @@ impl State {
         let view_projection = multiply(&frame.projection, &frame.view);
         let inv_projection = crate::matrix::invert(&frame.projection);
         let v = &frame.view;
-        let mut view = Vec::with_capacity(56);
-        view.extend_from_slice(&view_projection);
-        view.extend_from_slice(&inv_projection);
-        view.extend_from_slice(&[
+        let mut view = [0.0f32; 56];
+        view[..16].copy_from_slice(&view_projection);
+        view[16..32].copy_from_slice(&inv_projection);
+        view[32..].copy_from_slice(&[
             v[0],
             v[4],
             v[8],
@@ -445,17 +447,29 @@ impl State {
                 cache: self.context.cache.get(),
             })
         });
-        fn binding(buffer: &wgpu::Buffer, size: u64) -> wgpu::BindingResource<'_> {
-            wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer, offset: 0, size: wgpu::BufferSize::new(size) })
+        let cache_hit = matches!(
+            &particles.group_cache,
+            Some((eb, pb, eb_buf, pb_buf, _))
+                if *eb == emitter_bytes && *pb == particle_bytes && eb_buf == emitters && pb_buf == buffer
+        );
+        if !cache_hit {
+            fn binding(buffer: &wgpu::Buffer, size: u64) -> wgpu::BindingResource<'_> {
+                wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(size),
+                })
+            }
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("particles"),
+                layout: &simulate.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: binding(emitters, emitter_bytes) },
+                    wgpu::BindGroupEntry { binding: 1, resource: binding(buffer, particle_bytes) },
+                ],
+            });
+            particles.group_cache = Some((emitter_bytes, particle_bytes, emitters.clone(), buffer.clone(), group));
         }
-        particles.group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("particles"),
-            layout: &simulate.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: binding(emitters, emitter_bytes) },
-                wgpu::BindGroupEntry { binding: 1, resource: binding(buffer, particle_bytes) },
-            ],
-        }));
         particles.total = total;
         for (which, shape, first, count) in placed {
             let pipeline = self.built_ins.get(which).clone();

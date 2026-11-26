@@ -163,6 +163,31 @@ enum EnvStage {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct AdsrRates {
+    attack_inc: f64,
+    retrigger_attack_inc: f64,
+    decay_instant: bool,
+    decay_inc: f64,
+    sustain_target: f64,
+    sustain_coeff: f64,
+    release_inc: f64,
+}
+
+impl Default for AdsrRates {
+    fn default() -> Self {
+        Self {
+            attack_inc: 1.0,
+            retrigger_attack_inc: 1.0,
+            decay_instant: true,
+            decay_inc: 0.0,
+            sustain_target: 0.0,
+            sustain_coeff: 0.0,
+            release_inc: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct Adsr {
     stage: EnvStage,
     level: f64,
@@ -203,12 +228,12 @@ impl Adsr {
         }
     }
 
-    fn step(&mut self, spec: &SynthSpec, rate: f64, sustain_coeff: f64) -> f64 {
+    #[inline]
+    fn step(&mut self, rates: AdsrRates) -> f64 {
         match self.stage {
             EnvStage::Attack => {
-                let atk_sec = f64::from(spec.attack).max(self.retrigger_min_attack);
-                let dur = (atk_sec * rate).max(1.0);
-                self.level += 1.0 / dur;
+                let inc = if self.retrigger_min_attack > 0.0 { rates.retrigger_attack_inc } else { rates.attack_inc };
+                self.level += inc;
                 if self.level >= 1.0 {
                     self.level = 1.0;
                     self.retrigger_min_attack = 0.0;
@@ -216,26 +241,22 @@ impl Adsr {
                 }
             }
             EnvStage::Decay => {
-                let sustain = f64::from(spec.sustain);
-                if spec.decay <= 1e-4 {
-                    self.level = sustain;
+                if rates.decay_instant {
+                    self.level = rates.sustain_target;
                     self.stage = EnvStage::Sustain;
                 } else {
-                    let dur = (f64::from(spec.decay) * rate).max(1.0);
-                    self.level -= (1.0 - sustain) / dur;
-                    if self.level <= sustain {
-                        self.level = sustain;
+                    self.level -= rates.decay_inc;
+                    if self.level <= rates.sustain_target {
+                        self.level = rates.sustain_target;
                         self.stage = EnvStage::Sustain;
                     }
                 }
             }
             EnvStage::Sustain => {
-                let target = f64::from(spec.sustain);
-                self.level += (target - self.level) * sustain_coeff;
+                self.level += (rates.sustain_target - self.level) * rates.sustain_coeff;
             }
             EnvStage::Release => {
-                let dur = (f64::from(spec.release.max(0.005)) * rate).max(1.0);
-                self.release_pos += 1.0 / dur;
+                self.release_pos += rates.release_inc;
                 if self.release_pos >= 1.0 {
                     self.level = 0.0;
                     self.stage = EnvStage::Done;
@@ -293,8 +314,14 @@ struct Grain {
     active: bool,
     age: u32,
     length: u32,
-    phase: f64,
-    phase_inc: f64,
+    osc_re: f64,
+    osc_im: f64,
+    osc_dre: f64,
+    osc_dim: f64,
+    win_re: f64,
+    win_im: f64,
+    win_dre: f64,
+    win_dim: f64,
     h2_weight: f64,
     pan_l: f64,
     pan_r: f64,
@@ -315,7 +342,8 @@ struct ActiveSynth {
     dt: f64,
     pan_l: f64,
     pan_r: f64,
-    sustain_coeff: f64,
+    gain_f64: f64,
+    rates: AdsrRates,
     grain_hop: u32,
 }
 
@@ -339,7 +367,8 @@ impl ActiveSynth {
             dt: 0.0,
             pan_l: 0.0,
             pan_r: 0.0,
-            sustain_coeff: 0.0,
+            gain_f64: 0.0,
+            rates: AdsrRates::default(),
             grain_hop: 32,
         }
     }
@@ -364,7 +393,22 @@ impl ActiveSynth {
         let theta = (f64::from(self.spec.pan) + 1.0) * 0.5 * FRAC_PI_2;
         self.pan_l = theta.cos();
         self.pan_r = theta.sin();
-        self.sustain_coeff = 1.0 - (-1.0 / (0.015 * rate)).exp();
+        self.gain_f64 = f64::from(self.spec.gain);
+        let sustain_target = f64::from(self.spec.sustain);
+        let decay_instant = self.spec.decay <= 1e-4;
+        self.rates = AdsrRates {
+            attack_inc: 1.0 / (f64::from(self.spec.attack) * rate).max(1.0),
+            retrigger_attack_inc: 1.0 / (f64::from(self.spec.attack).max(0.003) * rate).max(1.0),
+            decay_instant,
+            decay_inc: if decay_instant {
+                0.0
+            } else {
+                (1.0 - sustain_target) / (f64::from(self.spec.decay) * rate).max(1.0)
+            },
+            sustain_target,
+            sustain_coeff: 1.0 - (-1.0 / (0.015 * rate)).exp(),
+            release_inc: 1.0 / (f64::from(self.spec.release.max(0.005)) * rate).max(1.0),
+        };
         self.grain_hop = (f64::from(self.spec.grain_size) * rate * 0.25).round().clamp(32.0, rate * 0.25) as u32;
         if self.filter_enabled {
             self.filter.set_params(f64::from(self.spec.cutoff), f64::from(self.spec.resonance), rate);
@@ -390,84 +434,111 @@ impl ActiveSynth {
         let h2_weight = ((0.46 * rate - 2.0 * freq) / (0.08 * rate)).clamp(0.0, 1.0) * 0.25;
         let pan = (f64::from(self.spec.pan) + self.rng.bipolar() * 0.35).clamp(-1.0, 1.0);
         let theta = (pan + 1.0) * 0.5 * FRAC_PI_2;
+        let init_phase = self.rng.bipolar() * 0.5 + 0.5;
+        let (osc_im, osc_re) = (TAU * init_phase).sin_cos();
+        let (osc_dim, osc_dre) = (TAU * (freq / rate)).sin_cos();
+        let (win_dim, win_dre) = (TAU / f64::from(len.max(1))).sin_cos();
         *slot = Grain {
             active: true,
             age: 0,
             length: len,
-            phase: self.rng.bipolar() * 0.5 + 0.5,
-            phase_inc: freq / rate,
+            osc_re,
+            osc_im,
+            osc_dre,
+            osc_dim,
+            win_re: 1.0,
+            win_im: 0.0,
+            win_dre,
+            win_dim,
             h2_weight,
             pan_l: theta.cos(),
             pan_r: theta.sin(),
         };
     }
 
-    fn next_sample(&mut self, rate: f64) -> (f32, f32, f32) {
-        self.sync_params(rate);
-        let env = self.adsr.step(&self.spec, rate, self.sustain_coeff);
+    #[inline]
+    fn step_adsr(&mut self) -> f64 {
+        self.adsr.step(self.rates)
+    }
+
+    #[inline]
+    fn next_sample_synced(&mut self, rate: f64) -> (f32, f32, f32) {
+        let env = self.step_adsr();
         if env <= 0.0 {
             return (0.0, 0.0, 0.0);
         }
-        let dt = self.dt;
-        let (raw_l, raw_r) = match self.spec.mode {
-            SynthMode::Granular => {
-                if self.grain_cooldown == 0 {
-                    self.spawn_grain(rate);
-                    self.grain_cooldown = self.grain_hop;
-                } else {
-                    self.grain_cooldown -= 1;
+        let scale = env * self.gain_f64;
+        if self.spec.mode == SynthMode::Granular {
+            if self.grain_cooldown == 0 {
+                self.spawn_grain(rate);
+                self.grain_cooldown = self.grain_hop;
+            } else {
+                self.grain_cooldown -= 1;
+            }
+            let mut sum_l = 0.0;
+            let mut sum_r = 0.0;
+            for g in &mut self.grains {
+                if !g.active {
+                    continue;
                 }
-                let mut sum_l = 0.0;
-                let mut sum_r = 0.0;
-                for g in &mut self.grains {
-                    if !g.active {
-                        continue;
-                    }
-                    let u = f64::from(g.age) / f64::from(g.length.max(1));
-                    let win = 0.5 * (1.0 - (TAU * u).cos());
-                    let osc = (1.0 - g.h2_weight) * (TAU * g.phase).sin() + g.h2_weight * (2.0 * TAU * g.phase).sin();
-                    let sample = osc * win * 0.5;
-                    sum_l += sample * g.pan_l;
-                    sum_r += sample * g.pan_r;
-                    g.phase = (g.phase + g.phase_inc) % 1.0;
-                    g.age += 1;
-                    if g.age >= g.length {
-                        g.active = false;
-                    }
+                let win = 0.5 * (1.0 - g.win_re);
+                let s1 = g.osc_im;
+                let s2 = 2.0 * s1 * g.osc_re;
+                let osc = (1.0 - g.h2_weight) * s1 + g.h2_weight * s2;
+                let sample = osc * win * 0.5;
+                sum_l += sample * g.pan_l;
+                sum_r += sample * g.pan_r;
+                let next_re = g.osc_re * g.osc_dre - g.osc_im * g.osc_dim;
+                let next_im = g.osc_im * g.osc_dre + g.osc_re * g.osc_dim;
+                g.osc_re = next_re;
+                g.osc_im = next_im;
+                let next_wre = g.win_re * g.win_dre - g.win_im * g.win_dim;
+                let next_wim = g.win_im * g.win_dre + g.win_re * g.win_dim;
+                g.win_re = next_wre;
+                g.win_im = next_wim;
+                g.age += 1;
+                if g.age >= g.length {
+                    g.active = false;
                 }
+            }
+            let (fl, fr) = if self.filter_enabled {
+                (self.filter.process(0, sum_l), self.filter.process(1, sum_r))
+            } else {
                 (sum_l, sum_r)
+            };
+            return ((fl * scale) as f32, (fr * scale) as f32, self.spec.reverb);
+        }
+        let dt = self.dt;
+        let phase = self.phase;
+        let mono = match self.spec.mode {
+            SynthMode::Sine => (TAU * phase).sin(),
+            SynthMode::Saw => (2.0 * phase - 1.0) - poly_blep(phase, dt),
+            SynthMode::Square => {
+                let half = if phase >= 0.5 { phase - 0.5 } else { phase + 0.5 };
+                let base = if phase < 0.5 { 1.0 } else { -1.0 };
+                base + poly_blep(phase, dt) - poly_blep(half, dt)
             }
-            mode => {
-                let mono = match mode {
-                    SynthMode::Sine => (TAU * self.phase).sin(),
-                    SynthMode::Saw => (2.0 * self.phase - 1.0) - poly_blep(self.phase, dt),
-                    SynthMode::Square => {
-                        let base = if self.phase < 0.5 { 1.0 } else { -1.0 };
-                        base + poly_blep(self.phase, dt) - poly_blep((self.phase + 0.5) % 1.0, dt)
-                    }
-                    SynthMode::Triangle => {
-                        // PolyBLAMP-smoothed triangle: slope changes by +8 at phase=0 and -8 at phase=0.5.
-                        let naive = 1.0 - 4.0 * (self.phase - 0.5).abs();
-                        let t0 = poly_blamp(self.phase, dt);
-                        let t1 = poly_blamp((self.phase + 0.5) % 1.0, dt);
-                        (naive + 4.0 * dt * (t0 - t1)).clamp(-1.0, 1.0)
-                    }
-                    SynthMode::Noise => self.rng.bipolar(),
-                    SynthMode::Granular => 0.0,
-                };
-                self.phase = (self.phase + dt) % 1.0;
-                (mono * self.pan_l, mono * self.pan_r)
+            SynthMode::Triangle => {
+                // PolyBLAMP-smoothed triangle: slope changes by +8 at phase=0 and -8 at phase=0.5.
+                let half = if phase >= 0.5 { phase - 0.5 } else { phase + 0.5 };
+                let naive = 1.0 - 4.0 * (phase - 0.5).abs();
+                let t0 = poly_blamp(phase, dt);
+                let t1 = poly_blamp(half, dt);
+                (naive + 4.0 * dt * (t0 - t1)).clamp(-1.0, 1.0)
             }
+            SynthMode::Noise => self.rng.bipolar(),
+            SynthMode::Granular => 0.0,
         };
-        let (fl, fr) = if self.filter_enabled {
-            (self.filter.process(0, raw_l), self.filter.process(1, raw_r))
-        } else {
-            (raw_l, raw_r)
-        };
-        let scale = env * f64::from(self.spec.gain);
-        let out_l = (fl * scale) as f32;
-        let out_r = (fr * scale) as f32;
-        (out_l, out_r, self.spec.reverb)
+        let next_phase = phase + dt;
+        self.phase = if next_phase >= 1.0 { next_phase - 1.0 } else { next_phase };
+        let filtered = if self.filter_enabled { self.filter.process(0, mono) } else { mono };
+        let scaled = filtered * scale;
+        ((scaled * self.pan_l) as f32, (scaled * self.pan_r) as f32, self.spec.reverb)
+    }
+
+    fn next_sample(&mut self, rate: f64) -> (f32, f32, f32) {
+        self.sync_params(rate);
+        self.next_sample_synced(rate)
     }
 }
 
@@ -535,9 +606,10 @@ impl SynthEngine {
         F: FnMut(usize, usize, f32, f32, f32),
     {
         for voice in &mut self.voices {
+            voice.sync_params(rate);
             let bus = voice.spec.bus;
             for i in 0..frames {
-                let (l, r, rev) = voice.next_sample(rate);
+                let (l, r, rev) = voice.next_sample_synced(rate);
                 accumulate(bus, i, l, r, rev);
             }
         }

@@ -130,6 +130,7 @@ pub(crate) struct Decals {
     capacity: usize,
     storage: Option<wgpu::Buffer>,
     data: Vec<f32>,
+    bg_cache: Vec<(u32, bool, u64, wgpu::TextureView, wgpu::BindGroup)>,
 }
 
 impl Decals {
@@ -149,6 +150,7 @@ impl Decals {
             capacity: 0,
             storage: None,
             data: Vec::new(),
+            bg_cache: Vec::new(),
         }
     }
 
@@ -181,6 +183,7 @@ impl Decals {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }));
+            self.bg_cache.clear();
         }
         let data = &mut self.data;
         data.clear();
@@ -193,29 +196,47 @@ impl Decals {
                 data.extend([red, green, blue, alpha * f64::from(decal.opacity)].map(narrow));
             }
         }
-        let storage = self.storage.clone().unwrap();
-        queue.write_buffer(&storage, 0, bytemuck::cast_slice(data));
+        let storage = self.storage.as_ref().unwrap();
+        queue.write_buffer(storage, 0, bytemuck::cast_slice(data));
         let view_projection = multiply(&frame.projection, &frame.view);
-        let mut view = view_projection.to_vec();
-        view.extend(invert(&view_projection));
-        view.extend([size.0 as f32, size.1 as f32, 0.0, 0.0]);
+        let inv_vp = invert(&view_projection);
+        let mut view = [0.0f32; 36];
+        view[..16].copy_from_slice(&view_projection);
+        view[16..32].copy_from_slice(&inv_vp);
+        view[32] = size.0 as f32;
+        view[33] = size.1 as f32;
         queue.write_buffer(&self.view_uniform, 0, bytemuck::cast_slice(&view));
+        if self.bg_cache.len() > 64 {
+            self.bg_cache.clear();
+        }
         pass.set_stencil_reference(DECAL_MARK);
         for batch in batches {
             let selected = built_ins.get(BuiltIn::Decal { samples, paint: batch.paint });
             pass.set_pipeline(selected);
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &selected.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.view_uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: storage.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&batch.texture) },
-                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                ],
+            let cached_idx = self.bg_cache.iter().position(|(s, p, tid, cached_depth, _)| {
+                *s == samples && *p == batch.paint && *tid == batch.texture_id && cached_depth == depth
             });
-            pass.set_bind_group(0, &group, &[]);
+            let idx = if let Some(idx) = cached_idx {
+                idx
+            } else {
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &selected.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: self.view_uniform.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: storage.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth) },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&batch.texture),
+                        },
+                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    ],
+                });
+                self.bg_cache.push((samples, batch.paint, batch.texture_id, depth.clone(), group));
+                self.bg_cache.len() - 1
+            };
+            pass.set_bind_group(0, &self.bg_cache[idx].4, &[]);
             pass.draw(0..36, batch.first..batch.first + batch.count);
         }
     }
@@ -239,8 +260,7 @@ fn mat3_det(m: &[f32; 16]) -> f32 {
     let c0 = [m[0], m[1], m[2]];
     let c1 = [m[4], m[5], m[6]];
     let c2 = [m[8], m[9], m[10]];
-    c0[0] * (c1[1] * c2[2] - c1[2] * c2[1])
-        - c1[0] * (c0[1] * c2[2] - c0[2] * c2[1])
+    c0[0] * (c1[1] * c2[2] - c1[2] * c2[1]) - c1[0] * (c0[1] * c2[2] - c0[2] * c2[1])
         + c2[0] * (c0[1] * c1[2] - c0[2] * c1[1])
 }
 
@@ -488,7 +508,8 @@ impl PbrDecalPass {
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
-        let pipeline = create_pbr_pipeline_raw(device, samples, color_format, depth_format, use_stencil, Some(&pl), None);
+        let pipeline =
+            create_pbr_pipeline_raw(device, samples, color_format, depth_format, use_stencil, Some(&pl), None);
         let align = device.limits().min_uniform_buffer_offset_alignment.max(256);
         let uniform_stride = u32::try_from(std::mem::size_of::<PbrViewUniform>())?.next_multiple_of(align);
         let view_uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -549,7 +570,8 @@ impl PbrDecalPass {
         anyhow::ensure!(view.view_projection.iter().all(|v| v.is_finite()), "non-finite decal view_projection");
         let rec_bytes = std::mem::size_of::<PbrDecal>();
         let max_storage = device.limits().max_storage_buffer_binding_size;
-        let needed_total = self.storage_cursor.checked_add(decals.len()).ok_or_else(|| anyhow::anyhow!("decal count overflow"))?;
+        let needed_total =
+            self.storage_cursor.checked_add(decals.len()).ok_or_else(|| anyhow::anyhow!("decal count overflow"))?;
         if needed_total > self.capacity {
             let new_cap = needed_total.next_power_of_two().max(64);
             let new_bytes = (new_cap as u64)
@@ -626,7 +648,11 @@ impl PbrDecalPass {
 mod tests {
     use super::*;
 
-    fn upload_1x1_rgba8(device: &wgpu::Device, queue: &wgpu::Queue, rgba: [u8; 4]) -> (wgpu::Texture, wgpu::TextureView) {
+    fn upload_1x1_rgba8(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        rgba: [u8; 4],
+    ) -> (wgpu::Texture, wgpu::TextureView) {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("decal_1x1"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -660,17 +686,15 @@ mod tests {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
 
         // Reject invalid stencil + depth-only combination; verify 4x MSAA stencil pipeline compiles cleanly.
-        assert!(PbrDecalPass::new(&device, 1, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Depth32Float, true).is_err());
+        assert!(
+            PbrDecalPass::new(&device, 1, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Depth32Float, true)
+                .is_err()
+        );
         assert!(PbrDecalPass::new(&device, 4, SCENE_FORMAT, wgpu::TextureFormat::Depth24PlusStencil8, true).is_ok());
 
         let (w, h) = (32u32, 32u32);
         // Orthographic top-down camera looking straight down -Y at a flat floor at y = 0.
-        let vp: [f32; 16] = [
-            0.5, 0.0, 0.0, 0.0,
-            0.0, 0.0, -0.25, 0.0,
-            0.0, -0.5, 0.0, 0.0,
-            0.0, 0.0, 0.5, 1.0,
-        ];
+        let vp: [f32; 16] = [0.5, 0.0, 0.0, 0.0, 0.0, 0.0, -0.25, 0.0, 0.0, -0.5, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0];
         let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("pbr_decal_depth"),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -694,7 +718,9 @@ mod tests {
         });
         let color_view = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut pass_obj = PbrDecalPass::new(&device, 1, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Depth32Float, false).unwrap();
+        let mut pass_obj =
+            PbrDecalPass::new(&device, 1, wgpu::TextureFormat::Rgba8Unorm, wgpu::TextureFormat::Depth32Float, false)
+                .unwrap();
         let (_a_t, albedo_v) = upload_1x1_rgba8(&device, &queue, [220, 220, 220, 255]);
         let (_n_pos_u, n_pos_u_v) = upload_1x1_rgba8(&device, &queue, [240, 128, 180, 255]); // tilted +U (+X)
         let (_n_neg_u, n_neg_u_v) = upload_1x1_rgba8(&device, &queue, [15, 128, 180, 255]); // tilted -U (-X)
@@ -714,85 +740,91 @@ mod tests {
             viewport: None,
         };
         let view_sun_z = PbrDecalView { sun_direction: [0.0, 0.5268, 0.85], ..view_sun_x }; // Sun from +Z (+V)
-        let box_model: [f32; 16] = [
-            1.5, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.5, 0.0,
-            0.0, 0.0, 0.0, 1.0,
-        ];
+        let box_model: [f32; 16] = [1.5, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 1.0];
 
-        let run_decal = |p: &mut PbrDecalPass, view: &PbrDecalView, decal: PbrDecal, n_view: &wgpu::TextureView| -> [u8; 4] {
-            p.begin_frame();
-            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            {
-                let _clear = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("clear_depth"),
-                    color_attachments: &[],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &depth_view,
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.5), store: wgpu::StoreOp::Store }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
+        let run_decal =
+            |p: &mut PbrDecalPass, view: &PbrDecalView, decal: PbrDecal, n_view: &wgpu::TextureView| -> [u8; 4] {
+                p.begin_frame();
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                {
+                    let _clear = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("clear_depth"),
+                        color_attachments: &[],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(0.5),
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                }
+                {
+                    let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("pbr_decal_draw"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &color_view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: None,
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    p.draw(&device, &queue, &mut rp, view, &[decal], &depth_view, &albedo_v, n_view, &orm_v).unwrap();
+                }
+                let bpr = (w * 4).next_multiple_of(256);
+                let rb = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("pbr_decal_rb"),
+                    size: u64::from(bpr * h),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
                 });
-            }
-            {
-                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("pbr_decal_draw"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &color_view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &depth_view,
-                        depth_ops: None,
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
+                enc.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &color_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &rb,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(bpr),
+                            rows_per_image: Some(h),
+                        },
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+                queue.submit(Some(enc.finish()));
+                let slice = rb.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
                 });
-                p.draw(&device, &queue, &mut rp, view, &[decal], &depth_view, &albedo_v, n_view, &orm_v).unwrap();
-            }
-            let bpr = (w * 4).next_multiple_of(256);
-            let rb = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("pbr_decal_rb"),
-                size: u64::from(bpr * h),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            enc.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &color_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &rb,
-                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
-                },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
-            queue.submit(Some(enc.finish()));
-            let slice = rb.slice(..);
-            let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            rx.recv().unwrap().unwrap();
-            let bytes = slice.get_mapped_range().unwrap();
-            let o = ((h / 2) * bpr + (w / 2) * 4) as usize;
-            let px = [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
-            drop(bytes);
-            rb.unmap();
-            px
-        };
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                rx.recv().unwrap().unwrap();
+                let bytes = slice.get_mapped_range().unwrap();
+                let o = ((h / 2) * bpr + (w / 2) * 4) as usize;
+                let px = [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]];
+                drop(bytes);
+                rb.unmap();
+                px
+            };
 
         let lit_decal = PbrDecal::from_transform(box_model, [1.0, 1.0, 1.0, 1.0], [0.0; 3], 1.0, 0.7, 0.0);
         let px_u_pos = run_decal(&mut pass_obj, &view_sun_x, lit_decal, &n_pos_u_v);
@@ -811,18 +843,8 @@ mod tests {
 
         // Two distinct draws in ONE submission (left red emissive, right blue emissive) must not overwrite each other.
         pass_obj.begin_frame();
-        let left_box: [f32; 16] = [
-            0.8, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.5, 0.0,
-            -1.0, 0.0, 0.0, 1.0,
-        ];
-        let right_box: [f32; 16] = [
-            0.8, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.5, 0.0,
-            1.0, 0.0, 0.0, 1.0,
-        ];
+        let left_box: [f32; 16] = [0.8, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, -1.0, 0.0, 0.0, 1.0];
+        let right_box: [f32; 16] = [0.8, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 1.0, 0.0, 0.0, 1.0];
         let d_red = PbrDecal::from_transform(left_box, [0.0, 0.0, 0.0, 1.0], [0.9, 0.0, 0.0], 1.0, 0.8, 0.0);
         let d_blue = PbrDecal::from_transform(right_box, [0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.9], 1.0, 0.8, 0.0);
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -847,7 +869,10 @@ mod tests {
                     view: &color_view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &depth_view,
@@ -858,8 +883,12 @@ mod tests {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass_obj.draw(&device, &queue, &mut rp, &view_sun_x, &[d_red], &depth_view, &albedo_v, &n_pos_u_v, &orm_v).unwrap();
-            pass_obj.draw(&device, &queue, &mut rp, &view_sun_z, &[d_blue], &depth_view, &albedo_v, &n_pos_v_v, &orm_v).unwrap();
+            pass_obj
+                .draw(&device, &queue, &mut rp, &view_sun_x, &[d_red], &depth_view, &albedo_v, &n_pos_u_v, &orm_v)
+                .unwrap();
+            pass_obj
+                .draw(&device, &queue, &mut rp, &view_sun_z, &[d_blue], &depth_view, &albedo_v, &n_pos_v_v, &orm_v)
+                .unwrap();
         }
         let bpr = (w * 4).next_multiple_of(256);
         let rb = device.create_buffer(&wgpu::BufferDescriptor {
@@ -869,7 +898,12 @@ mod tests {
             mapped_at_creation: false,
         });
         enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: &color_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &color_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::TexelCopyBufferInfo {
                 buffer: &rb,
                 layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },

@@ -75,11 +75,11 @@ struct SunMap {
   // How far inside the map's edge the filter's reach still is, in texture
   // coordinates: negative when it reaches past it.
   inside: f32,
-  // The depth a step of one world unit along the map's x and y adds on the
-  // receiver's plane, and a world unit's depth.
-  slope: vec2f,
+  // Pre-scaled receiver plane depth change per texel offset, and biased base depth.
+  slope_texel: vec2f,
+  base_depth: f32,
+  // A world unit's depth, and a texel's width in world units.
   unit: f32,
-  // A texel's width in world units, and the unit of x and y in texture coordinates.
   texel: f32,
 };
 
@@ -108,9 +108,11 @@ fn sun_map_of(map: u32, world: vec3f, normal: vec3f, reach: f32) -> SunMap {
   let sx = clamp(-dot(normal, row_x / length(row_x)) / flat_, -sun_max_slope, sun_max_slope);
   let sy = clamp(-dot(normal, row_y / length(row_y)) / flat_, -sun_max_slope, sun_max_slope);
   result.unit = unit_z;
-  // The plane's depth change per world unit across: the sign follows from
-  // the plane through the receiver, whose normal faces the light.
-  result.slope = vec2f(sx, sy) * unit_z;
+  // The plane's depth change per texel across, and receiver bias pre-subtracted once.
+  let slope = vec2f(sx, sy) * unit_z;
+  result.slope_texel = slope * texel.y;
+  let bias = (sun_bias_base * unit_z + sun_bias_slope * (abs(slope.x) + abs(slope.y))) * texel.y;
+  result.base_depth = ndc.z - bias;
   result.texel = texel.y;
   return result;
 }
@@ -118,10 +120,7 @@ fn sun_map_of(map: u32, world: vec3f, normal: vec3f, reach: f32) -> SunMap {
 // The depth a tap offset by `offset` texels from the receiver compares
 // against: the receiver's plane there, and a bias that grows with its slope.
 fn sun_tap_depth(m: SunMap, offset: vec2f) -> f32 {
-  let world = offset * m.texel;
-  let plane = dot(m.slope, world);
-  let bias = (sun_bias_base + sun_bias_slope * (abs(m.slope.x) + abs(m.slope.y)) / m.unit) * m.texel * m.unit;
-  return m.depth + plane - bias;
+  return m.base_depth + dot(m.slope_texel, offset);
 }
 
 // The share of sun a filter of `radius` texels, turned by `spin`, lets through.
@@ -151,7 +150,7 @@ fn sun_in(map: u32, world: vec3f, normal: vec3f, spin: vec2f) -> vec2f {
     return vec2f(1.0, -1.0);
   }
   if (mode == 0u) {
-    return vec2f(textureSampleCompareLevel(shadow_cascades, shadow_sampler, m.uv, map, sun_tap_depth(m, vec2f(0.0))), m.inside);
+    return vec2f(textureSampleCompareLevel(shadow_cascades, shadow_sampler, m.uv, map, m.base_depth), m.inside);
   }
   if (mode == 1u) {
     return vec2f(sun_filtered(map, m, sun_filter_radius, spin, 16u), m.inside);
@@ -161,24 +160,25 @@ fn sun_in(map: u32, world: vec3f, normal: vec3f, spin: vec2f) -> vec2f {
   // the penumbra there.
   let softness = scene.shadow_params.x;
   let size = vec2f(textureDimensions(shadow_cascades));
+  let texel_uv = scene.cascade_texels[map].x;
   let search = clamp(softness * sun_blocker_reach * 0.5 / m.texel, 1.0, sun_max_radius - 1.0);
   var gap = 0.0;
   var blockers = 0.0;
   for (var i = 0u; i < 12u; i++) {
     let tap = shadow_taps[i];
     let offset = vec2f(tap.x * spin.x - tap.y * spin.y, tap.x * spin.y + tap.y * spin.x) * search;
-    let at = vec2i(floor((m.uv + offset * scene.cascade_texels[map].x) * size));
+    let at = vec2i(floor((m.uv + offset * texel_uv) * size));
     let seen = textureLoad(shadow_cascades, at, map, 0);
     let wanted = sun_tap_depth(m, vec2f(offset.x, -offset.y));
     if (seen < wanted) {
-      gap += (wanted - seen) / m.unit;
+      gap += wanted - seen;
       blockers += 1.0;
     }
   }
   if (blockers == 0.0) {
     return vec2f(1.0, m.inside);
   }
-  let blocked = gap / blockers;
+  let blocked = gap / (blockers * m.unit);
   let radius = clamp(softness * blocked * 0.5 / m.texel, sun_filter_radius, sun_max_radius);
   return vec2f(sun_filtered(map, m, radius, spin, 16u), m.inside);
 }
@@ -243,11 +243,13 @@ fn contact_shadow(world: vec3f, normal: vec3f, jitter: f32) -> f32 {
   let eye_depth = -(scene.view * vec4f(world, 1.0)).z;
   // Start off the surface by a little along its normal, so it does not hit itself.
   let origin = world + normal * (0.01 + 0.003 * eye_depth);
+  let clip_origin = scene.projection * (scene.view * vec4f(origin, 1.0));
+  let clip_delta = scene.projection * (scene.view * vec4f(toward * length, 0.0));
+  let inv_steps = 1.0 / f32(steps);
   var shadowed = 0.0;
   for (var i = 0u; i < steps; i++) {
-    let along = (f32(i) + 0.25 + 0.75 * jitter) / f32(steps);
-    let point = origin + toward * (along * length);
-    let clip = scene.projection * (scene.view * vec4f(point, 1.0));
+    let along = (f32(i) + 0.25 + 0.75 * jitter) * inv_steps;
+    let clip = clip_origin + clip_delta * along;
     if (clip.w <= 0.0) {
       break;
     }
@@ -273,9 +275,16 @@ fn contact_shadow(world: vec3f, normal: vec3f, jitter: f32) -> f32 {
 // The sun's visibility at a fragment: `position` is its @builtin(position).
 // The cascades' filter and the contact shadows, whichever the frame asks for.
 fn sun_shadow(world: vec3f, normal: vec3f, position: vec4f) -> f32 {
+  if (scene.shadow.x < 0.5) {
+    return 1.0;
+  }
   let noise = shadow_noise(position.xy);
-  let angle = 6.2831853 * noise;
-  let cascaded = sun_visibility(world, normal, vec2f(cos(angle), sin(angle)));
+  var spin = vec2f(1.0, 0.0);
+  if (u32(scene.cascades.x) > 0u && u32(scene.cascades.z) > 0u) {
+    let angle = 6.2831853 * noise;
+    spin = vec2f(cos(angle), sin(angle));
+  }
+  let cascaded = sun_visibility(world, normal, spin);
   if (cascaded <= 0.0) {
     return 0.0;
   }

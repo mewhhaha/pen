@@ -603,7 +603,7 @@ fn take_group(
 
 fn append_group(
     mesh: &mut MeshletDagMesh,
-    partition: MeshletMesh,
+    partition: &MeshletMesh,
     positions: &[[f32; 3]],
     lod: Option<([f32; 4], f32)>,
     level: u32,
@@ -612,7 +612,7 @@ fn append_group(
     let offset = u32::try_from(mesh.indices.len())?;
     ensure!(u32::try_from(start + partition.meshlets.len()).is_ok(), "DAG cluster count exceeds u32");
     ensure!(u32::try_from(mesh.indices.len() + partition.indices.len()).is_ok(), "DAG index count exceeds u32");
-    for cluster in partition.meshlets {
+    for cluster in &partition.meshlets {
         let bounds = cluster.sphere;
         ensure!(bounds.into_iter().all(f32::is_finite), "meshlet bounds exceed f32");
         let indices = cluster_indices(&partition.indices, cluster.counts);
@@ -630,7 +630,7 @@ fn append_group(
             meta: [if lod.is_some() { start as u32 } else { index }, NO_PARENT, level, cluster.meta[0]],
         });
     }
-    mesh.indices.extend(partition.indices);
+    mesh.indices.extend_from_slice(&partition.indices);
     Ok(start..mesh.clusters.len())
 }
 
@@ -672,7 +672,7 @@ fn replace_group(
     for i in &mut partition.indices {
         *i = geometry.original_ids[*i as usize];
     }
-    let parents = append_group(mesh, partition, positions, Some((sphere, error)), level)?;
+    let parents = append_group(mesh, &partition, positions, Some((sphere, error)), level)?;
     for i in children {
         let child = &mut mesh.clusters[i];
         child.parent_sphere = sphere;
@@ -693,7 +693,7 @@ pub fn build_meshlet_dag(positions: &[[f32; 3]], indices: &[u32], config: &Meshl
     );
     ensure!(triangles(indices).all(|tri| triangle_normal(positions, tri) != [0.0; 3]), "mesh has degenerate triangles");
     let leaves = build_meshlets(positions, indices, config.max_vertices, config.max_triangles)?;
-    build_meshlet_dag_with_leaves(positions, leaves, config)
+    build_meshlet_dag_with_leaves(positions, &leaves, config)
 }
 
 /// Builds a Cluster DAG from pre-partitioned leaf meshlets that already address
@@ -701,7 +701,7 @@ pub fn build_meshlet_dag(positions: &[[f32; 3]], indices: &[u32], config: &Meshl
 /// leaf `build_meshlets` pass.
 pub(crate) fn build_meshlet_dag_from_leaves(
     positions: &[[f32; 3]],
-    leaves: MeshletMesh,
+    leaves: &MeshletMesh,
     config: &MeshletDagConfig,
 ) -> Result<MeshletDagMesh> {
     ensure!(config.max_levels >= 1, "max_levels must be at least 1");
@@ -715,12 +715,12 @@ pub(crate) fn build_meshlet_dag_from_leaves(
 
 fn build_meshlet_dag_with_leaves(
     positions: &[[f32; 3]],
-    leaves: MeshletMesh,
+    leaves: &MeshletMesh,
     config: &MeshletDagConfig,
 ) -> Result<MeshletDagMesh> {
     let mut mesh = MeshletDagMesh {
-        clusters: Vec::new(),
-        indices: Vec::new(),
+        clusters: Vec::with_capacity(leaves.meshlets.len()),
+        indices: Vec::with_capacity(leaves.indices.len()),
         level_count: 0,
         leaf_cluster_count: 0,
         root_cluster_count: 0,
@@ -983,12 +983,27 @@ struct DagTwoPhasePipelines {
     phase2_pipeline: wgpu::ComputePipeline,
 }
 
+#[derive(Default)]
+struct DagBatchSlot {
+    uniform_buf: Option<wgpu::Buffer>,
+    bg_cache: Vec<(bool, wgpu::Buffer, wgpu::Buffer, wgpu::TextureView, wgpu::BindGroup)>,
+}
+
+#[derive(Default)]
+struct DagBatchCache {
+    phase1: DagBatchSlot,
+    phase2: DagBatchSlot,
+    uniform_scratch: Vec<u8>,
+    active_scratch: Vec<(usize, u32)>,
+}
+
 pub struct MeshletDagCuller {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     shader: wgpu::ShaderModule,
     two_phase: OnceLock<DagTwoPhasePipelines>,
     dummy_hiz: wgpu::TextureView,
+    batch_cache: Box<DagBatchCache>,
 }
 
 impl MeshletDagCuller {
@@ -1066,7 +1081,7 @@ impl MeshletDagCuller {
                 view_formats: &[],
             })
             .create_view(&wgpu::TextureViewDescriptor::default());
-        Self { layout, pipeline, shader, two_phase: OnceLock::new(), dummy_hiz }
+        Self { layout, pipeline, shader, two_phase: OnceLock::new(), dummy_hiz, batch_cache: Box::default() }
     }
 
     fn two_phase_pipelines(&self, device: &wgpu::Device) -> Result<&DagTwoPhasePipelines> {
@@ -1126,38 +1141,43 @@ impl MeshletDagCuller {
     }
 
     pub(crate) fn cull_batch_single(
-        &self,
+        &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         batch: &[MeshletDagBatchEntry<'_>],
         hiz: Option<&wgpu::TextureView>,
     ) -> Result<()> {
-        self.dispatch_batch(device, encoder, batch, false, false, hiz)
+        self.dispatch_batch(device, queue, encoder, batch, false, false, hiz)
     }
 
     pub(crate) fn cull_batch_phase1(
-        &self,
+        &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         batch: &[MeshletDagBatchEntry<'_>],
         prior_hiz: Option<&wgpu::TextureView>,
     ) -> Result<()> {
-        self.dispatch_batch(device, encoder, batch, true, false, prior_hiz)
+        self.dispatch_batch(device, queue, encoder, batch, true, false, prior_hiz)
     }
 
     pub(crate) fn cull_batch_phase2(
-        &self,
+        &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         batch: &[MeshletDagBatchEntry<'_>],
         current_hiz: Option<&wgpu::TextureView>,
     ) -> Result<()> {
-        self.dispatch_batch(device, encoder, batch, true, true, current_hiz)
+        self.dispatch_batch(device, queue, encoder, batch, true, true, current_hiz)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_batch(
-        &self,
+        &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         batch: &[MeshletDagBatchEntry<'_>],
         two_phase: bool,
@@ -1167,8 +1187,11 @@ impl MeshletDagCuller {
         if batch.is_empty() {
             return Ok(());
         }
+        if two_phase {
+            let _ = self.two_phase_pipelines(device)?;
+        }
         let (layout, pipeline) = if two_phase {
-            let pipelines = self.two_phase_pipelines(device)?;
+            let pipelines = self.two_phase.get().expect("initialized above");
             (&pipelines.two_phase_layout, if phase2 { &pipelines.phase2_pipeline } else { &pipelines.phase1_pipeline })
         } else {
             (&self.layout, &self.pipeline)
@@ -1176,8 +1199,11 @@ impl MeshletDagCuller {
         let align = device.limits().min_uniform_buffer_offset_alignment.max(16);
         let u_size = size_of::<CullUniform>() as u32;
         let stride = u_size.next_multiple_of(align);
-        let mut uniforms = vec![0u8; stride as usize * batch.len()];
-        let mut active: Vec<(usize, u32)> = Vec::with_capacity(batch.len());
+        let cache = &mut *self.batch_cache;
+        let total_bytes = stride as usize * batch.len();
+        cache.uniform_scratch.clear();
+        cache.uniform_scratch.resize(total_bytes, 0);
+        cache.active_scratch.clear();
 
         for (i, item) in batch.iter().enumerate() {
             let (out, capacity) = if two_phase {
@@ -1200,66 +1226,91 @@ impl MeshletDagCuller {
                 continue;
             }
             let off = i * stride as usize;
-            uniforms[off..off + u_size as usize].copy_from_slice(bytemuck::bytes_of(&u));
-            active.push((i, (i as u32) * stride));
+            cache.uniform_scratch[off..off + u_size as usize].copy_from_slice(bytemuck::bytes_of(&u));
+            cache.active_scratch.push((i, (i as u32) * stride));
         }
-        if active.is_empty() {
+        if cache.active_scratch.is_empty() {
             return Ok(());
         }
 
-        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("meshlet_dag_batch_uniforms"),
-            contents: &uniforms,
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let slot = if phase2 { &mut cache.phase2 } else { &mut cache.phase1 };
+        let needed = (total_bytes as u64).max(u64::from(stride));
+        if slot.uniform_buf.as_ref().is_none_or(|b| b.size() < needed) {
+            slot.uniform_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(if phase2 { "meshlet_dag_batch_phase2_uniforms" } else { "meshlet_dag_batch_uniforms" }),
+                size: needed.next_power_of_two(),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            slot.bg_cache.clear();
+        }
+        let uniform_buf = slot.uniform_buf.as_ref().unwrap();
+        queue.write_buffer(uniform_buf, 0, &cache.uniform_scratch);
         let u_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-            buffer: &uniform_buf,
+            buffer: uniform_buf,
             offset: 0,
             size: wgpu::BufferSize::new(u64::from(u_size)),
         });
+        if slot.bg_cache.len() > 256 {
+            slot.bg_cache.clear();
+        }
         let max_wg_x = device.limits().max_compute_workgroups_per_dimension;
-        let mut bind_groups = Vec::with_capacity(active.len());
-        for &(i, dyn_off) in &active {
+        let mut dispatches: Vec<(usize, u32, u32, u32)> = Vec::with_capacity(cache.active_scratch.len());
+        for &(i, dyn_off) in &cache.active_scratch {
             let item = &batch[i];
             let out = if two_phase && phase2 { &item.output.phase2 } else { &item.output.phase1 };
             let hiz_view = hiz.filter(|_| item.params.cull.hiz_enabled).unwrap_or(&self.dummy_hiz);
-            let entries = [
-                wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
-                wgpu::BindGroupEntry { binding: 1, resource: item.mesh.clusters_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: out.draws_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: out.draw_count_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(hiz_view) },
-                wgpu::BindGroupEntry { binding: 5, resource: out.selected_clusters_buf.as_entire_binding() },
-            ];
-            let two_phase_entries;
-            let slice = if two_phase {
-                two_phase_entries = [
-                    entries[0].clone(),
-                    entries[1].clone(),
-                    entries[2].clone(),
-                    entries[3].clone(),
-                    entries[4].clone(),
-                    entries[5].clone(),
-                    wgpu::BindGroupEntry { binding: 6, resource: item.output.phase2_flags_buf.as_entire_binding() },
-                ];
-                two_phase_entries.as_slice()
+            let bg_idx = if let Some(idx) = slot.bg_cache.iter().position(|(tp, cb, db, hv, _)| {
+                *tp == two_phase && cb == &item.mesh.clusters_buf && db == &out.draws_buf && hv == hiz_view
+            }) {
+                idx
             } else {
-                entries.as_slice()
+                let entries = [
+                    wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
+                    wgpu::BindGroupEntry { binding: 1, resource: item.mesh.clusters_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: out.draws_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: out.draw_count_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(hiz_view) },
+                    wgpu::BindGroupEntry { binding: 5, resource: out.selected_clusters_buf.as_entire_binding() },
+                ];
+                let two_phase_entries;
+                let slice = if two_phase {
+                    two_phase_entries = [
+                        entries[0].clone(),
+                        entries[1].clone(),
+                        entries[2].clone(),
+                        entries[3].clone(),
+                        entries[4].clone(),
+                        entries[5].clone(),
+                        wgpu::BindGroupEntry { binding: 6, resource: item.output.phase2_flags_buf.as_entire_binding() },
+                    ];
+                    two_phase_entries.as_slice()
+                } else {
+                    entries.as_slice()
+                };
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("meshlet_dag_cut"),
+                    layout,
+                    entries: slice,
+                });
+                slot.bg_cache.push((
+                    two_phase,
+                    item.mesh.clusters_buf.clone(),
+                    out.draws_buf.clone(),
+                    hiz_view.clone(),
+                    bg,
+                ));
+                slot.bg_cache.len() - 1
             };
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("meshlet_dag_cut"),
-                layout,
-                entries: slice,
-            });
             let groups = item.mesh.cluster_count.div_ceil(WORKGROUP_SIZE);
             let width = groups.min(max_wg_x);
-            bind_groups.push((bg, dyn_off, width, groups.div_ceil(width)));
+            dispatches.push((bg_idx, dyn_off, width, groups.div_ceil(width)));
         }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
         pass.set_pipeline(pipeline);
-        for (bg, dyn_off, wx, wy) in &bind_groups {
-            pass.set_bind_group(0, bg, &[*dyn_off]);
-            pass.dispatch_workgroups(*wx, *wy, 1);
+        for (bg_idx, dyn_off, wx, wy) in dispatches {
+            pass.set_bind_group(0, &slot.bg_cache[bg_idx].4, &[dyn_off]);
+            pass.dispatch_workgroups(wx, wy, 1);
         }
         Ok(())
     }

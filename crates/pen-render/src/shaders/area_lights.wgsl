@@ -160,6 +160,37 @@ fn eval_area_light(
     cookie_tex: texture_2d<f32>,
     lut_sampler: sampler,
 ) -> vec3f {
+    // Early-out range, degeneracy, and one-sided backface culls BEFORE LTC LUT texture fetches & basis setup.
+    let center = light.position_kind.xyz;
+    let reach = light.color_reach.w;
+    let dist_center = length(center - world);
+    let atten = ltc_range_window(dist_center, reach);
+    if (atten <= 0.0) {
+        return vec3f(0.0);
+    }
+    let right_len = length(light.right_extent.xyz);
+    let up_len = length(light.up_extent.xyz);
+    if (right_len <= 1e-5 || up_len <= 1e-5) {
+        return vec3f(0.0);
+    }
+    let right = light.right_extent.xyz / right_len;
+    let up = light.up_extent.xyz / up_len;
+    let two_sided = light.flags.x > 0.5;
+    let kind = u32(round(light.position_kind.w));
+
+    if (kind == 0u || kind == 1u) {
+        // One-sided facing test against emitter normal = cross(right, up).
+        let emit_raw = cross(right, up);
+        let emit_len = length(emit_raw);
+        if (emit_len <= 1e-5) {
+            return vec3f(0.0);
+        }
+        let emit_n = emit_raw / emit_len;
+        if (!two_sided && dot(emit_n, world - center) <= 0.0) {
+            return vec3f(0.0);
+        }
+    }
+
     let n = normalize(normal);
     let v = normalize(view);
     let ndotv = clamp(dot(n, v), 0.0, 1.0);
@@ -175,39 +206,9 @@ fn eval_area_light(
     );
     let basis = ltc_basis(n, v);
     let spec_xf = minv * basis;
-    let two_sided = light.flags.x > 0.5;
-    let kind = u32(round(light.position_kind.w));
-
-    let center = light.position_kind.xyz;
-    let right_len = length(light.right_extent.xyz);
-    let up_len = length(light.up_extent.xyz);
-    if (right_len <= 1e-5 || up_len <= 1e-5) {
-        return vec3f(0.0);
-    }
-    let right = light.right_extent.xyz / right_len;
-    let up = light.up_extent.xyz / up_len;
-    let reach = light.color_reach.w;
-    let dist_center = length(center - world);
-    let atten = ltc_range_window(dist_center, reach);
-    if (atten <= 0.0) {
-        return vec3f(0.0);
-    }
 
     var diff_form = 0.0;
     var spec_form = 0.0;
-
-    if (kind == 0u || kind == 1u) {
-        // One-sided facing test against emitter normal = cross(right, up).
-        let emit_raw = cross(right, up);
-        let emit_len = length(emit_raw);
-        if (emit_len <= 1e-5) {
-            return vec3f(0.0);
-        }
-        let emit_n = emit_raw / emit_len;
-        if (!two_sided && dot(emit_n, world - center) <= 0.0) {
-            return vec3f(0.0);
-        }
-    }
 
     if (kind == 0u) {
         let ex = right * light.right_extent.w;

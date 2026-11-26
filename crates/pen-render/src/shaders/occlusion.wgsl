@@ -14,38 +14,39 @@ ${fullscreen}
 const PI: f32 = 3.14159265359;
 const HALF_PI: f32 = 1.57079632679;
 
-fn depth_at(pixel: vec2i) -> f32 {
-  let size = vec2i(occlusion.size.xy);
-  return textureLoad(scene_depth, clamp(pixel, vec2i(0), size - 1), 0);
+fn depth_at(pixel: vec2i, last: vec2i) -> f32 {
+  return textureLoad(scene_depth, clamp(pixel, vec2i(0), last), 0);
 }
 
-fn view_at(pixel: vec2f, depth: f32) -> vec3f {
-  let ndc = vec2f(pixel.x / occlusion.size.x * 2.0 - 1.0, 1.0 - pixel.y / occlusion.size.y * 2.0);
+fn view_at(pixel: vec2f, depth: f32, inv_size: vec2f) -> vec3f {
+  let ndc = vec2f(pixel.x * inv_size.x * 2.0 - 1.0, 1.0 - pixel.y * inv_size.y * 2.0);
   let point = occlusion.inverse_projection * vec4f(ndc, depth, 1.0);
   return point.xyz / point.w;
 }
 
-fn neighbour(pixel: vec2f, step: vec2i) -> vec3f {
-  return view_at(pixel + vec2f(step), depth_at(vec2i(pixel) + step));
+fn neighbour(pixel: vec2f, step: vec2i, last: vec2i, inv_size: vec2f) -> vec3f {
+  return view_at(pixel + vec2f(step), depth_at(vec2i(pixel) + step, last), inv_size);
 }
 
-fn gtao_arc(theta: f32, gamma: f32) -> f32 {
-  return 0.25 * (-cos(2.0 * theta - gamma) + cos(gamma) + 2.0 * theta * sin(gamma));
+fn gtao_arc_cs(theta: f32, gamma: f32, cos_g: f32, sin_g: f32) -> f32 {
+  return 0.25 * (-cos(2.0 * theta - gamma) + cos_g + 2.0 * theta * sin_g);
 }
 
 @fragment fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
-  let depth = depth_at(vec2i(position.xy));
+  let last = vec2i(occlusion.size.xy) - 1;
+  let inv_size = 1.0 / occlusion.size.xy;
+  let depth = depth_at(vec2i(position.xy), last);
   if (depth >= 1.0) {
     return vec4f(1.0);
   }
-  let middle = view_at(position.xy, depth);
+  let middle = view_at(position.xy, depth, inv_size);
   let view_dir = normalize(-middle);
 
   // Edge-preserving view-space normal from the closer neighbour on each axis.
-  let right = neighbour(position.xy, vec2i(1, 0)) - middle;
-  let left = middle - neighbour(position.xy, vec2i(-1, 0));
-  let down = neighbour(position.xy, vec2i(0, 1)) - middle;
-  let up = middle - neighbour(position.xy, vec2i(0, -1));
+  let right = neighbour(position.xy, vec2i(1, 0), last, inv_size) - middle;
+  let left = middle - neighbour(position.xy, vec2i(-1, 0), last, inv_size);
+  let down = neighbour(position.xy, vec2i(0, 1), last, inv_size) - middle;
+  let up = middle - neighbour(position.xy, vec2i(0, -1), last, inv_size);
   let across = select(left, right, abs(right.z) < abs(left.z));
   let along = select(up, down, abs(down.z) < abs(up.z));
   var normal = normalize(cross(across, along));
@@ -54,7 +55,11 @@ fn gtao_arc(theta: f32, gamma: f32) -> f32 {
   }
 
   let radius = occlusion.settings.x;
+  let inv_radius = 1.0 / max(radius, 1e-6);
   let bias = occlusion.settings.z;
+  let bias2 = bias * bias;
+  let max_r = radius * 1.5;
+  let max_r2 = max_r * max_r;
   let proj_scale = abs(occlusion.projection[1][1]) * 0.5 * occlusion.size.y;
   let screen_radius = clamp(radius * proj_scale / max(-middle.z, 0.05), 2.0, 64.0);
 
@@ -85,7 +90,9 @@ fn gtao_arc(theta: f32, gamma: f32) -> f32 {
       continue;
     }
     let cos_gamma = clamp(dot(n_proj, view_dir) / n_proj_len, -1.0, 1.0);
-    let gamma = acos(cos_gamma) * select(-1.0, 1.0, dot(n_proj, tangent) >= 0.0);
+    let gamma_sign = select(-1.0, 1.0, dot(n_proj, tangent) >= 0.0);
+    let gamma = acos(cos_gamma) * gamma_sign;
+    let sin_gamma = sqrt(max(1.0 - cos_gamma * cos_gamma, 0.0)) * gamma_sign;
 
     var max_cos_pos = -1.0;
     var max_cos_neg = -1.0;
@@ -95,26 +102,30 @@ fn gtao_arc(theta: f32, gamma: f32) -> f32 {
 
       // +side horizon search
       let p_pos = position.xy + offset_px;
-      let d_pos = depth_at(vec2i(p_pos));
+      let d_pos = depth_at(vec2i(p_pos), last);
       if (d_pos < 1.0) {
-        let delta = view_at(p_pos, d_pos) - middle;
-        let dist = length(delta);
-        if (dist > bias && dist < radius * 1.5) {
-          let falloff = clamp((radius - dist) / radius, 0.0, 1.0);
-          let h = dot(delta / dist, view_dir);
+        let delta = view_at(p_pos, d_pos, inv_size) - middle;
+        let dist2 = dot(delta, delta);
+        if (dist2 > bias2 && dist2 < max_r2) {
+          let inv_dist = inverseSqrt(dist2);
+          let dist = dist2 * inv_dist;
+          let falloff = clamp((radius - dist) * inv_radius, 0.0, 1.0);
+          let h = dot(delta, view_dir) * inv_dist;
           max_cos_pos = max(max_cos_pos, mix(-1.0, h, falloff));
         }
       }
 
       // -side horizon search
       let p_neg = position.xy - offset_px;
-      let d_neg = depth_at(vec2i(p_neg));
+      let d_neg = depth_at(vec2i(p_neg), last);
       if (d_neg < 1.0) {
-        let delta = view_at(p_neg, d_neg) - middle;
-        let dist = length(delta);
-        if (dist > bias && dist < radius * 1.5) {
-          let falloff = clamp((radius - dist) / radius, 0.0, 1.0);
-          let h = dot(delta / dist, view_dir);
+        let delta = view_at(p_neg, d_neg, inv_size) - middle;
+        let dist2 = dot(delta, delta);
+        if (dist2 > bias2 && dist2 < max_r2) {
+          let inv_dist = inverseSqrt(dist2);
+          let dist = dist2 * inv_dist;
+          let falloff = clamp((radius - dist) * inv_radius, 0.0, 1.0);
+          let h = dot(delta, view_dir) * inv_dist;
           max_cos_neg = max(max_cos_neg, mix(-1.0, h, falloff));
         }
       }
@@ -124,8 +135,8 @@ fn gtao_arc(theta: f32, gamma: f32) -> f32 {
     let h_hi = gamma + HALF_PI;
     let theta2 = clamp(acos(clamp(max_cos_pos, -1.0, 1.0)), h_lo, h_hi);
     let theta1 = clamp(-acos(clamp(max_cos_neg, -1.0, 1.0)), h_lo, h_hi);
-    let full_slice = max(cos(gamma) + gamma * sin(gamma), 1e-4);
-    let slice_vis = clamp((gtao_arc(theta1, gamma) + gtao_arc(theta2, gamma)) / full_slice, 0.0, 1.0);
+    let full_slice = max(cos_gamma + gamma * sin_gamma, 1e-4);
+    let slice_vis = clamp((gtao_arc_cs(theta1, gamma, cos_gamma, sin_gamma) + gtao_arc_cs(theta2, gamma, cos_gamma, sin_gamma)) / full_slice, 0.0, 1.0);
     visibility += slice_vis;
   }
 

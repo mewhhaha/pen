@@ -19,9 +19,14 @@ pub fn find(columns: usize, open: &[bool], start: usize, goal: usize) -> Option<
     // By estimated length, then nearness to the goal, then cell: the same
     // order on every machine.
     let mut frontier = BinaryHeap::new();
+    let start_h = estimate(start);
     cost[start] = 0;
-    frontier.push(Reverse((estimate(start), estimate(start), start)));
-    while let Some(Reverse((_, _, cell))) = frontier.pop() {
+    frontier.push(Reverse((start_h, start_h, start)));
+    while let Some(Reverse((f, h, cell))) = frontier.pop() {
+        let g = f - h;
+        if g > cost[cell] {
+            continue;
+        }
         if cell == goal {
             let mut path = vec![goal];
             while let Some(&last) = path.last()
@@ -33,18 +38,19 @@ pub fn find(columns: usize, open: &[bool], start: usize, goal: usize) -> Option<
             return Some(path);
         }
         let (x, y) = place(cell);
+        let through = g + 1;
         let neighbours = [
-            (y > 0).then(|| cell - columns),
-            (x > 0).then(|| cell - 1),
-            (x + 1 < columns).then(|| cell + 1),
-            (y + 1 < rows).then(|| cell + columns),
+            (y > 0).then(|| (cell - columns, x, y - 1)),
+            (x > 0).then(|| (cell - 1, x - 1, y)),
+            (x + 1 < columns).then(|| (cell + 1, x + 1, y)),
+            (y + 1 < rows).then(|| (cell + columns, x, y + 1)),
         ];
-        for next in neighbours.into_iter().flatten() {
-            let through = cost[cell] + 1;
+        for (next, nx, ny) in neighbours.into_iter().flatten() {
             if open[next] && through < cost[next] {
                 cost[next] = through;
                 from[next] = cell;
-                frontier.push(Reverse((through + estimate(next), estimate(next), next)));
+                let nh = nx.abs_diff(goal_x) + ny.abs_diff(goal_y);
+                frontier.push(Reverse((through + nh, nh, next)));
             }
         }
     }

@@ -37,39 +37,73 @@ pub fn impulse_response_for(rate: f64, decay: f64, damping: f64) -> [Vec<f32>; 2
     let seconds = if custom_decay { (decay + 0.1).clamp(0.25, 6.2) } else { SECONDS };
     let damp = if custom_damping { damping.clamp(0.0, 1.0) } else { -1.0 };
     let length = (seconds * rate).round().max(1.0) as usize;
-    let mut channels = [vec![0.0f64; length], vec![0.0f64; length]];
+    let mut left = vec![0.0f64; length];
+    let mut right = vec![0.0f64; length];
     let mut energy = 0.0f64;
-    for (channel, seed) in channels.iter_mut().zip(SEEDS) {
-        let mut state = seed;
-        let mut low = 0.0f64;
-        for (index, value) in channel.iter_mut().enumerate() {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            let noise = f64::from(state) / 4_294_967_296.0 * 2.0 - 1.0;
-            let t = index as f64 / rate;
-            let cutoff = if damp < 0.0 {
-                1200.0 + 7000.0 * (-t / 0.3).exp()
-            } else {
-                // High damping closes down faster toward 400 Hz; low damping stays bright up to 11 kHz.
-                let floor_hz = 2400.0 - 2000.0 * damp;
-                let span_hz = 9000.0 * (1.0 - 0.7 * damp);
-                let tau_hf = 0.55 - 0.42 * damp;
-                floor_hz + span_hz * (-t / tau_hf).exp()
-            };
-            low += (1.0 - (-TAU * cutoff / rate).exp()) * (noise - low);
-            let since = t - PREDELAY;
-            let envelope = if since < 0.0 {
-                0.0
-            } else {
-                (SIXTY_DB * since / decay).exp() * (since / ONSET).min(1.0) * ((seconds - t) / TAPER).min(1.0)
-            };
-            *value = low * envelope;
-            energy += *value * *value;
+    let inv_rate = 1.0 / rate;
+    let (floor_hz, span_hz, tau_hf) = if damp < 0.0 {
+        (1200.0, 7000.0, 0.3)
+    } else {
+        // High damping closes down faster toward 400 Hz; low damping stays bright up to 11 kHz.
+        (2400.0 - 2000.0 * damp, 9000.0 * (1.0 - 0.7 * damp), 0.55 - 0.42 * damp)
+    };
+    let hf_step = (-inv_rate / tau_hf).exp();
+    let env_step = (SIXTY_DB * inv_rate / decay).exp();
+    let inv_onset = 1.0 / ONSET;
+    let inv_taper = 1.0 / TAPER;
+    let neg_tau_inv_rate = -TAU * inv_rate;
+
+    let mut state_l = SEEDS[0];
+    let mut state_r = SEEDS[1];
+    let mut low_l = 0.0f64;
+    let mut low_r = 0.0f64;
+    let mut hf_decay = 1.0f64;
+    let mut env_decay = 0.0f64;
+    let mut env_started = false;
+
+    for (index, (dst_l, dst_r)) in left.iter_mut().zip(&mut right).enumerate() {
+        state_l ^= state_l << 13;
+        state_l ^= state_l >> 17;
+        state_l ^= state_l << 5;
+        state_r ^= state_r << 13;
+        state_r ^= state_r >> 17;
+        state_r ^= state_r << 5;
+        let noise_l = f64::from(state_l) * (2.0 / 4_294_967_296.0) - 1.0;
+        let noise_r = f64::from(state_r) * (2.0 / 4_294_967_296.0) - 1.0;
+
+        let t = index as f64 * inv_rate;
+        if (index & 4095) == 0 {
+            hf_decay = (-t / tau_hf).exp();
         }
+        let cutoff = floor_hz + span_hz * hf_decay;
+        hf_decay *= hf_step;
+        let alpha = 1.0 - (neg_tau_inv_rate * cutoff).exp();
+        low_l += alpha * (noise_l - low_l);
+        low_r += alpha * (noise_r - low_r);
+
+        let since = t - PREDELAY;
+        let envelope = if since < 0.0 {
+            0.0
+        } else {
+            if !env_started || (index & 4095) == 0 {
+                env_decay = (SIXTY_DB * since / decay).exp();
+                env_started = true;
+            }
+            let e = env_decay * (since * inv_onset).min(1.0) * ((seconds - t) * inv_taper).min(1.0);
+            env_decay *= env_step;
+            e
+        };
+        let vl = low_l * envelope;
+        let vr = low_r * envelope;
+        *dst_l = vl;
+        *dst_r = vr;
+        energy += vl * vl + vr * vr;
     }
     let scale = if energy > 0.0 { (ENERGY / (energy / 2.0)).sqrt() } else { 1.0 };
-    channels.map(|channel| channel.into_iter().map(|value| (value * scale) as f32).collect())
+    [
+        left.into_iter().map(|value| (value * scale) as f32).collect(),
+        right.into_iter().map(|value| (value * scale) as f32).collect(),
+    ]
 }
 
 /// Extension tag (`render.Extension.tag`) carrying ray-traced acoustic room parameters and
@@ -266,76 +300,108 @@ pub fn impulse_response_from_acoustics(rate: f64, profile: &AcousticProfile) -> 
     let mut late = [vec![0.0f64; length], vec![0.0f64; length]];
     let mut late_energy = 0.0f64;
     let effective_decay = decay.max(0.12);
-    for (channel, seed) in late.iter_mut().zip(SEEDS) {
-        let mut state = seed;
-        let mut low = 0.0f64;
-        for (index, value) in channel.iter_mut().enumerate() {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            let noise = f64::from(state) / 4_294_967_296.0 * 2.0 - 1.0;
-            let t = index as f64 / rate;
-            let floor_hz = 2400.0 - 2000.0 * damp;
-            let span_hz = 9000.0 * (1.0 - 0.7 * damp);
-            let tau_hf = 0.55 - 0.42 * damp;
-            let cutoff = floor_hz + span_hz * (-t / tau_hf).exp();
-            low += (1.0 - (-TAU * cutoff / rate).exp()) * (noise - low);
-            let since = t - predelay;
-            let envelope = if since < 0.0 {
-                0.0
-            } else {
-                (SIXTY_DB * since / effective_decay).exp() * (since / 0.008).min(1.0) * ((seconds - t) / TAPER).min(1.0)
-            };
-            *value = low * envelope;
-            late_energy += *value * *value;
+    let inv_rate = 1.0 / rate;
+    let floor_hz = 2400.0 - 2000.0 * damp;
+    let span_hz = 9000.0 * (1.0 - 0.7 * damp);
+    let tau_hf = 0.55 - 0.42 * damp;
+    let hf_step = (-inv_rate / tau_hf).exp();
+    let env_step = (SIXTY_DB * inv_rate / effective_decay).exp();
+    let neg_tau_inv_rate = -TAU * inv_rate;
+    let inv_onset = 1.0 / 0.008;
+    let inv_taper = 1.0 / TAPER;
+
+    let mut state_l = SEEDS[0];
+    let mut state_r = SEEDS[1];
+    let mut low_l = 0.0f64;
+    let mut low_r = 0.0f64;
+    let mut hf_decay = 1.0f64;
+    let mut env_decay = 0.0f64;
+    let mut env_started = false;
+    let [late_l, late_r] = &mut late;
+    for (index, (dst_l, dst_r)) in late_l.iter_mut().zip(late_r.iter_mut()).enumerate() {
+        state_l ^= state_l << 13;
+        state_l ^= state_l >> 17;
+        state_l ^= state_l << 5;
+        state_r ^= state_r << 13;
+        state_r ^= state_r >> 17;
+        state_r ^= state_r << 5;
+        let noise_l = f64::from(state_l) * (2.0 / 4_294_967_296.0) - 1.0;
+        let noise_r = f64::from(state_r) * (2.0 / 4_294_967_296.0) - 1.0;
+        let t = index as f64 * inv_rate;
+        if (index & 4095) == 0 {
+            hf_decay = (-t / tau_hf).exp();
         }
+        let cutoff = floor_hz + span_hz * hf_decay;
+        hf_decay *= hf_step;
+        let alpha = 1.0 - (neg_tau_inv_rate * cutoff).exp();
+        low_l += alpha * (noise_l - low_l);
+        low_r += alpha * (noise_r - low_r);
+        let since = t - predelay;
+        let envelope = if since < 0.0 {
+            0.0
+        } else {
+            if !env_started || (index & 4095) == 0 {
+                env_decay = (SIXTY_DB * since / effective_decay).exp();
+                env_started = true;
+            }
+            let e = env_decay * (since * inv_onset).min(1.0) * ((seconds - t) * inv_taper).min(1.0);
+            env_decay *= env_step;
+            e
+        };
+        let vl = low_l * envelope;
+        let vr = low_r * envelope;
+        *dst_l = vl;
+        *dst_r = vr;
+        late_energy += vl * vl + vr * vr;
     }
     let late_norm = if late_energy > 0.0 { (ENERGY / (late_energy / 2.0)).sqrt() } else { 1.0 };
     let late_scale = late_norm * late_gain * (1.0 - 0.78 * outdoor);
 
-    // Stage 2: Ray-traced 3-band early reflections with Woodworth ITD (±0.65 ms) & equal-power panning.
-    // Unity-reconstructing 3-band split: LP(450 Hz) + [LP(2400 Hz) - LP(450 Hz)] + [x - LP(2400 Hz)] == x!
-    let mut er_lo = [vec![0.0f64; length], vec![0.0f64; length]];
-    let mut er_md = [vec![0.0f64; length], vec![0.0f64; length]];
-    let mut er_hi = [vec![0.0f64; length], vec![0.0f64; length]];
-    if early_gain > 0.0 && !active_taps.is_empty() {
-        let add_frac = |buf: &mut [f64], pos: f64, amp: f64| {
-            if amp == 0.0 || !pos.is_finite() || pos < 0.0 {
-                return;
-            }
-            let idx = pos.floor() as usize;
-            let frac = pos - pos.floor();
-            if idx < buf.len() {
-                buf[idx] += amp * (1.0 - frac);
-            }
-            if idx + 1 < buf.len() {
-                buf[idx + 1] += amp * frac;
-            }
-        };
-        for raw_tap in active_taps {
-            let tap = raw_tap.sanitized();
-            let pan = f64::from(tap.pan);
-            let angle = (pan + 1.0) * 0.5 * std::f64::consts::FRAC_PI_2;
-            let pan_l = angle.cos();
-            let pan_r = angle.sin();
-            // Woodworth spherical head ITD: sound from +1 (right) hits right ear up to 0.65 ms earlier.
-            let itd_s = 0.000_65 * pan;
-            let delay_l = (f64::from(tap.delay_s) + itd_s.max(0.0)).max(0.0005) * rate;
-            let delay_r = (f64::from(tap.delay_s) + (-itd_s).max(0.0)).max(0.0005) * rate;
-            let gl = f64::from(tap.gain_low) * early_gain;
-            let gm = f64::from(tap.gain_mid) * early_gain;
-            let gh = f64::from(tap.gain_high) * early_gain;
-            add_frac(&mut er_lo[0], delay_l, gl * pan_l);
-            add_frac(&mut er_lo[1], delay_r, gl * pan_r);
-            add_frac(&mut er_md[0], delay_l, gm * pan_l);
-            add_frac(&mut er_md[1], delay_r, gm * pan_r);
-            add_frac(&mut er_hi[0], delay_l, gh * pan_l);
-            add_frac(&mut er_hi[1], delay_r, gh * pan_r);
-        }
+    if early_gain <= 0.0 || active_taps.is_empty() {
+        return late.map(|channel| channel.into_iter().map(|v| (v * late_scale) as f32).collect());
     }
 
-    let a_lo = 1.0 - (-TAU * 450.0 / rate).exp();
-    let a_hi = 1.0 - (-TAU * 2400.0 / rate).exp();
+    // Stage 2: Ray-traced 3-band early reflections with Woodworth ITD (±0.65 ms) & equal-power panning.
+    // Unity-reconstructing 3-band split: LP(450 Hz) + [LP(2400 Hz) - LP(450 Hz)] + [x - LP(2400 Hz)] == x!
+    let tap_len = (((max_tap_s + 0.001) * rate).ceil() as usize + 2).min(length);
+    let mut er_lo = [vec![0.0f64; tap_len], vec![0.0f64; tap_len]];
+    let mut er_md = [vec![0.0f64; tap_len], vec![0.0f64; tap_len]];
+    let mut er_hi = [vec![0.0f64; tap_len], vec![0.0f64; tap_len]];
+    let add_frac = |buf: &mut [f64], pos: f64, amp: f64| {
+        if amp == 0.0 || !pos.is_finite() || pos < 0.0 {
+            return;
+        }
+        let idx = pos.floor() as usize;
+        let frac = pos - pos.floor();
+        if idx < buf.len() {
+            buf[idx] += amp * (1.0 - frac);
+        }
+        if idx + 1 < buf.len() {
+            buf[idx + 1] += amp * frac;
+        }
+    };
+    for raw_tap in active_taps {
+        let tap = raw_tap.sanitized();
+        let pan = f64::from(tap.pan);
+        let angle = (pan + 1.0) * 0.5 * std::f64::consts::FRAC_PI_2;
+        let (pan_r, pan_l) = angle.sin_cos();
+        // Woodworth spherical head ITD: sound from +1 (right) hits right ear up to 0.65 ms earlier.
+        let itd_s = 0.000_65 * pan;
+        let delay_l = (f64::from(tap.delay_s) + itd_s.max(0.0)).max(0.0005) * rate;
+        let delay_r = (f64::from(tap.delay_s) + (-itd_s).max(0.0)).max(0.0005) * rate;
+        let gl = f64::from(tap.gain_low) * early_gain;
+        let gm = f64::from(tap.gain_mid) * early_gain;
+        let gh = f64::from(tap.gain_high) * early_gain;
+        add_frac(&mut er_lo[0], delay_l, gl * pan_l);
+        add_frac(&mut er_lo[1], delay_r, gl * pan_r);
+        add_frac(&mut er_md[0], delay_l, gm * pan_l);
+        add_frac(&mut er_md[1], delay_r, gm * pan_r);
+        add_frac(&mut er_hi[0], delay_l, gh * pan_l);
+        add_frac(&mut er_hi[1], delay_r, gh * pan_r);
+    }
+
+    let a_lo = 1.0 - (-TAU * 450.0 * inv_rate).exp();
+    let a_hi = 1.0 - (-TAU * 2400.0 * inv_rate).exp();
     let mut out = [vec![0.0f64; length], vec![0.0f64; length]];
     let mut er_energy = 0.0f64;
     for ch in 0..2 {
@@ -343,13 +409,30 @@ pub fn impulse_response_from_acoustics(rate: f64, profile: &AcousticProfile) -> 
         let mut s_md_lo = 0.0f64;
         let mut s_md_hi = 0.0f64;
         let mut s_hi_lp = 0.0f64;
-        for i in 0..length {
-            s_lo += a_lo * (er_lo[ch][i] - s_lo);
-            s_md_lo += a_lo * (er_md[ch][i] - s_md_lo);
-            s_md_hi += a_hi * (er_md[ch][i] - s_md_hi);
-            s_hi_lp += a_hi * (er_hi[ch][i] - s_hi_lp);
-            let er_sample = s_lo + (s_md_hi - s_md_lo) + (er_hi[ch][i] - s_hi_lp);
+        for i in 0..tap_len {
+            let lo = er_lo[ch][i];
+            let md = er_md[ch][i];
+            let hi = er_hi[ch][i];
+            s_lo += a_lo * (lo - s_lo);
+            s_md_lo += a_lo * (md - s_md_lo);
+            s_md_hi += a_hi * (md - s_md_hi);
+            s_hi_lp += a_hi * (hi - s_hi_lp);
+            let er_sample = s_lo + (s_md_hi - s_md_lo) + (hi - s_hi_lp);
             out[ch][i] = er_sample;
+            er_energy += er_sample * er_sample;
+        }
+        let decay_lo = 1.0 - a_lo;
+        let decay_hi = 1.0 - a_hi;
+        for dst in &mut out[ch][tap_len..length] {
+            s_lo *= decay_lo;
+            s_md_lo *= decay_lo;
+            s_md_hi *= decay_hi;
+            s_hi_lp *= decay_hi;
+            let er_sample = s_lo + (s_md_hi - s_md_lo) - s_hi_lp;
+            if er_sample.abs() < 1e-18 && s_lo.abs() < 1e-18 && s_md_lo.abs() < 1e-18 {
+                break;
+            }
+            *dst = er_sample;
             er_energy += er_sample * er_sample;
         }
     }

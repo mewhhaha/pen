@@ -32,7 +32,7 @@ struct Box {
 
 @vertex fn vertex(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: u32) -> Box {
   let corner = corners[faces[vertex]];
-  return Box(view.view_projection * decals[index].model * vec4f(corner, 1.0), index);
+  return Box(view.view_projection * (decals[index].model * vec4f(corner, 1.0)), index);
 }
 
 // The decal's tinted texture where the surface behind the box lies in it, its

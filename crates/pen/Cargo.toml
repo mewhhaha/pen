@@ -1,6 +1,6 @@
 [package]
 name = "pen"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 license.workspace = true
 description = "Native runtime for games compiled to Wasm: winit window, wgpu renderer, wasmtime guest"

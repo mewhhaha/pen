@@ -1041,22 +1041,11 @@ impl State {
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 }),
             };
-            let rt_id = self.view_id();
-            let rt_source = {
-                let stride = crate::asset_store::MESH_VERTEX_FLOATS;
-                let mut tris = Vec::with_capacity((count as usize) / 3);
-                for tri in batch.vertices.chunks_exact(stride * 3) {
-                    tris.push(crate::ray_tracing::BlasTriangle::smooth(
-                        [tri[0], tri[1], tri[2]],
-                        [tri[stride], tri[stride + 1], tri[stride + 2]],
-                        [tri[stride * 2], tri[stride * 2 + 1], tri[stride * 2 + 2]],
-                        [tri[3], tri[4], tri[5]],
-                        [tri[stride + 3], tri[stride + 4], tri[stride + 5]],
-                        [tri[stride * 2 + 3], tri[stride * 2 + 4], tri[stride * 2 + 5]],
-                    ));
-                }
-                (!tris.is_empty()).then(|| std::sync::Arc::new(super::RtMeshSource { id: rt_id, triangles: tris }))
-            };
+            let rt_source = Some(std::sync::Arc::new(super::RtMeshSource {
+                id: self.view_id(),
+                vertices: batch.vertices,
+                indices: None,
+            }));
             self.solid_meshes.push(SolidMesh { material: batch.material, buffer, count, rt_source });
         }
     }

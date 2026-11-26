@@ -147,7 +147,7 @@ impl State {
                              m: &crate::asset_store::Material,
                              draw_params: Option<[f32; 4]>|
          -> Result<()> {
-            let Some(bi) = pool.ensure_blas(device, encoder, source.id, &source.triangles)? else {
+            let Some(bi) = pool.ensure_blas_with(device, encoder, source.id, || source.triangles())? else {
                 return Ok(());
             };
             if !transform.iter().all(|v| v.is_finite()) {

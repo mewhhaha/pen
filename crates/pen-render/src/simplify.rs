@@ -6,7 +6,9 @@
 // they look, is under a pixel.
 use anyhow::Result;
 
-use crate::asset_store::{MAX_LODS, MESH_VERTEX_FLOATS, Mesh, checked_mesh, pack, parse_mesh};
+use crate::asset_store::{
+    MAX_LODS, MESH_VERTEX_FLOATS, Mesh, is_packed_mesh, pack, parse_mesh, push_lod, quantize_mesh,
+};
 
 // The errors the simpler levels are made within, a share of the mesh's size
 // (its bounding box's longest side): a level is drawn once its error is
@@ -26,8 +28,12 @@ const KEPT: f64 = 0.75;
 /// while still baking meshlets/DAG; persistent instances and already-packed
 /// binary `PMSH` meshes are preserved as authored.
 pub fn pack_mesh_with_lods(bytes: &[u8]) -> Result<Vec<u8>> {
+    if is_packed_mesh(bytes)? {
+        return Ok(bytes.to_vec());
+    }
     let mut mesh = parse_mesh(bytes)?;
-    if bytes.starts_with(b"PMSH") || mesh.instances.is_some() {
+    quantize_mesh(&mut mesh);
+    if mesh.instances.is_some() {
         return pack(&mesh);
     }
     if !mesh.authored_lods && mesh.lods.len() == 1 && mesh.lods[0].count as usize / 3 >= LEAST_TRIANGLES {
@@ -41,7 +47,7 @@ pub fn pack_mesh_with_lods(bytes: &[u8]) -> Result<Vec<u8>> {
     pack(&mesh)
 }
 
-fn simplified(mesh: Mesh) -> Result<Mesh> {
+fn simplified(mut mesh: Mesh) -> Result<Mesh> {
     let positions: Vec<[f32; 3]> = mesh
         .vertices
         .as_chunks::<MESH_VERTEX_FLOATS>()
@@ -49,32 +55,30 @@ fn simplified(mesh: Mesh) -> Result<Mesh> {
         .iter()
         .map(|vertex| [vertex[0], vertex[1], vertex[2]])
         .collect();
-    let size = (0..3)
-        .map(|axis| {
-            let along = positions.iter().map(|position| position[axis]);
-            along.clone().fold(f32::NEG_INFINITY, f32::max) - along.fold(f32::INFINITY, f32::min)
-        })
-        .fold(0.0, f32::max);
-    let whole = &mesh.indices[..mesh.lods[0].count as usize];
-    let mut simpler: Vec<(f32, Vec<u32>)> = Vec::new();
-    let mut last = whole.len();
-    let mut scratch = vec![0; whole.len()];
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for p in &positions {
+        for axis in 0..3 {
+            min[axis] = min[axis].min(p[axis]);
+            max[axis] = max[axis].max(p[axis]);
+        }
+    }
+    let size = (0..3).map(|axis| max[axis] - min[axis]).fold(0.0, f32::max);
+    let whole = mesh.lods[0].count as usize;
+    let mut last = whole;
+    let mut scratch = vec![0; whole];
     for error in ERRORS {
-        let count = meshopt_rs::simplify::simplify(&mut scratch, whole, &positions, 0, error);
+        let count = meshopt_rs::simplify::simplify(&mut scratch, &mesh.indices[..whole], &positions, 0, error);
         #[allow(clippy::cast_precision_loss, reason = "a ratio of index counts")]
         let fewer = (count as f64) <= last as f64 * KEPT;
         if count >= 3 && fewer {
-            simpler.push((error * size, scratch[..count].to_vec()));
+            push_lod(&mut mesh.lods, mesh.indices.len(), count, error * size)?;
+            mesh.indices.extend_from_slice(&scratch[..count]);
             last = count;
         }
     }
-    let whole = whole.to_vec();
-    let mut reduced = checked_mesh(mesh.vertices, whole, &simpler, mesh.skin)?;
-    reduced.precision = mesh.precision;
-    // Its vertices are the mesh's, so each keeps its tangent and morph deltas.
-    reduced.tangents = mesh.tangents;
-    reduced.morphs = mesh.morphs;
-    Ok(reduced)
+    // Every LOD addresses the original vertices and all of their attributes.
+    Ok(mesh)
 }
 
 #[cfg(test)]
@@ -145,6 +149,99 @@ mod tests {
         assert!(mesh.lods.len() > 1, "{:?}", mesh.lods);
         assert_eq!(mesh.tangents.as_deref(), Some(&tangents[..]));
         assert_eq!(pack_mesh_with_lods(&packed).unwrap(), packed);
+    }
+
+    #[test]
+    fn precision_16_bakes_bounds_and_cones_from_the_decoded_geometry() {
+        let mut json: serde_json::Value = serde_json::from_slice(&grid(40)).unwrap();
+        // Tilt the vertex normals so the precision pass changes those as well as the positions.
+        json["normals"] = serde_json::json!([0.001234567, 1.0, -0.002345678].repeat(41 * 41));
+        json["precision"] = 16.into();
+        let json = serde_json::to_vec(&json).unwrap();
+        let original = parse_mesh(&json).unwrap();
+        let packed = pack_mesh_with_lods(&json).unwrap();
+        let mesh = parse_mesh(&packed).unwrap();
+        let vertices = mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0;
+        assert!(
+            original.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0.iter().zip(vertices).any(|(a, b)| a[..3] != b[..3])
+        );
+        assert_ne!(original.vertices[3..6], mesh.vertices[3..6]);
+
+        let position = |i: u32| {
+            let v = vertices[i as usize];
+            [v[0], v[1], v[2]].map(f64::from)
+        };
+        let sub = |a: [f64; 3], b: [f64; 3]| std::array::from_fn(|axis| a[axis] - b[axis]);
+        let length = |v: [f64; 3]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let epsilon = f64::from(f32::EPSILON);
+        let check_sphere = |indices: &[u32], sphere: [f32; 4]| {
+            let center = [sphere[0], sphere[1], sphere[2]].map(f64::from);
+            for &index in indices {
+                let distance = length(sub(position(index), center));
+                assert!(distance <= f64::from(sphere[3]) + epsilon, "vertex {index} lies outside {sphere:?}");
+            }
+        };
+        let check_cone = |indices: &[u32], cone: [f32; 4]| {
+            // The culling cone bounds triangle normals from positions, not shading normals.
+            if cone[3] >= 1.0 {
+                return false;
+            }
+            let axis = [cone[0], cone[1], cone[2]].map(f64::from);
+            for &[a, b, c] in indices.as_chunks::<3>().0 {
+                let [x, y, z] = sub(position(b), position(a));
+                let [u, v, w] = sub(position(c), position(a));
+                let normal = [y * w - z * v, z * u - x * w, x * v - y * u];
+                let cos_angle =
+                    axis.iter().zip(normal).map(|(a, b)| a * b).sum::<f64>() / (length(normal) * length(axis));
+                let sin_angle = (1.0 - cos_angle * cos_angle).max(0.0).sqrt();
+                assert!(
+                    cos_angle > 0.0 && sin_angle <= f64::from(cone[3]) + epsilon,
+                    "triangle [{a}, {b}, {c}] lies outside {cone:?}"
+                );
+            }
+            true
+        };
+        let range = |counts: [u32; 4]| counts[0] as usize..(counts[0] + counts[1]) as usize;
+        let meshlets = mesh.meshlets.unwrap();
+        let mut covered = vec![false; vertices.len()];
+        let mut active_meshlet_cones = 0;
+        let mut active_dag_cones = 0;
+        for cluster in meshlets.meshlets {
+            let indices = &meshlets.indices[range(cluster.counts)];
+            check_sphere(indices, cluster.sphere);
+            active_meshlet_cones += usize::from(check_cone(indices, cluster.cone_axis_cutoff));
+            for &index in indices {
+                covered[index as usize] = true;
+            }
+        }
+        assert!(covered.into_iter().all(|seen| seen));
+
+        let dag = mesh.meshlet_dag.unwrap();
+        assert!(dag.level_count > 1);
+        for cluster in dag.clusters {
+            let indices = &dag.indices[range(cluster.counts)];
+            check_sphere(indices, cluster.bounds_sphere);
+            check_sphere(indices, cluster.parent_sphere);
+            active_dag_cones += usize::from(check_cone(indices, cluster.cone_axis_cutoff));
+        }
+        assert!(active_meshlet_cones > 0 && active_dag_cones > 0);
+    }
+
+    #[test]
+    fn simpler_levels_keep_secondary_uvs_and_vertex_colors() {
+        let mut json: serde_json::Value = serde_json::from_slice(&grid(40)).unwrap();
+        let uvs1: Vec<_> = (0..41 * 41).map(|i| [f64::from(i) / 1681.0, 0.25]).collect();
+        let colors: Vec<_> = (0..41 * 41).map(|i| [0.25, f64::from(i) / 1681.0, 0.5, 1.0]).collect();
+        json["uvs1"] = serde_json::json!(uvs1.as_flattened());
+        json["colors"] = serde_json::json!(colors.as_flattened());
+        let mesh = parse_mesh(&serde_json::to_vec(&json).unwrap()).unwrap();
+        let (vertices, uvs1, colors) =
+            (mesh.vertices.clone(), mesh.uvs1.clone().unwrap(), mesh.colors.clone().unwrap());
+        let reduced = simplified(mesh).unwrap();
+        assert!(reduced.lods.len() > 1);
+        assert_eq!(reduced.vertices, vertices);
+        assert_eq!(reduced.uvs1.unwrap(), uvs1);
+        assert_eq!(reduced.colors.unwrap(), colors);
     }
 
     /// The levels the game's meshes get, and how long making them takes

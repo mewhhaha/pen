@@ -42,6 +42,7 @@ struct Shared {
 }
 
 /// Assets being read and decoded ahead of a renderer.
+#[derive(Clone)]
 pub struct Prefetch {
     shared: Arc<Shared>,
 }
@@ -99,12 +100,13 @@ impl Prefetch {
         let asset = (kind, key.to_owned());
         let mut states = self.shared.states.lock().unwrap();
         loop {
-            match states.remove(&asset)? {
-                State::Done(prepared) => return prepared,
-                State::Waiting => return None,
-                State::Working => {
-                    states.insert(asset.clone(), State::Working);
-                    states = self.shared.done.wait(states).unwrap();
+            match states.get(&asset)? {
+                State::Working => states = self.shared.done.wait(states).unwrap(),
+                State::Waiting | State::Done(_) => {
+                    return match states.remove(&asset) {
+                        Some(State::Done(prepared)) => prepared,
+                        _ => None,
+                    };
                 }
             }
         }

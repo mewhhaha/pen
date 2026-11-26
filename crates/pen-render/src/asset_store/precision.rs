@@ -1,9 +1,7 @@
 //! Optional author-approved rounding before the existing byte-plane codec.
 //! No new runtime format: discarded fraction bits become compressible zero
 //! planes. UVs, shader attributes, indices, skinning and instances stay exact.
-use anyhow::Result;
-
-use super::layout::Layout;
+use super::{MESH_VERTEX_FLOATS, Mesh, Sphere, valid_normal};
 
 fn rounded(value: f32, bits: u8) -> f32 {
     let dropped = 23 - u32::from(bits);
@@ -17,34 +15,38 @@ fn rounded(value: f32, bits: u8) -> f32 {
     if reduced.is_finite() { reduced } else { value }
 }
 
-pub(super) fn reduce(mut raw: Vec<u8>, bits: u8) -> Result<Vec<u8>> {
-    let layout = Layout::read(&raw)?;
+pub(super) fn reduce(mesh: &mut Mesh, bits: u8) {
+    let (vertices, _) = mesh.vertices.as_chunks_mut::<MESH_VERTEX_FLOATS>();
     let mut min = [f32::INFINITY; 3];
     let mut max = [f32::NEG_INFINITY; 3];
-    let coordinate = |row: &[u8], axis: usize| f32::from_le_bytes(row[axis * 4..axis * 4 + 4].try_into().unwrap());
-    for row in raw[layout.vertices.range()].chunks_exact(layout.vertices.stride) {
+    for row in &*vertices {
         for axis in 0..3 {
-            min[axis] = min[axis].min(coordinate(row, axis));
-            max[axis] = max[axis].max(coordinate(row, axis));
+            min[axis] = min[axis].min(row[axis]);
+            max[axis] = max[axis].max(row[axis]);
         }
     }
-    for row in raw[layout.vertices.range()].chunks_exact_mut(layout.vertices.stride) {
-        for axis in 0..6 {
-            let value = coordinate(row, axis);
+    for row in vertices {
+        for axis in 0..3 {
+            let value = row[axis];
             // Retaining extrema keeps the authored bounding box exactly.
-            if axis < 3 && (value == min[axis] || value == max[axis]) {
-                continue;
+            if value != min[axis] && value != max[axis] {
+                row[axis] = rounded(value, bits).clamp(min[axis], max[axis]);
             }
-            row[axis * 4..axis * 4 + 4].copy_from_slice(&rounded(value, bits).to_le_bytes());
+        }
+        let normal = [row[3], row[4], row[5]].map(|value| rounded(value, bits));
+        if valid_normal(&normal) {
+            row[3..6].copy_from_slice(&normal);
         }
     }
-    Ok(raw)
+    if mesh.instances.is_none() {
+        mesh.bounds = Sphere::around(&mesh.vertices, MESH_VERTEX_FLOATS);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asset_store::{MESH_VERTEX_FLOATS, pack_mesh, pack_uncompressed, parse_mesh, tests::skinned_triangle};
+    use crate::asset_store::{layout::Layout, pack_mesh, pack_uncompressed, parse_mesh, tests::skinned_triangle};
 
     #[test]
     fn relative_error_is_bounded_and_rounding_is_stable() {
@@ -73,7 +75,9 @@ mod tests {
         source["normals"] = serde_json::json!([0.123456, 1, 0, 0.123456, 1, 0, 0.123456, 1, 0]);
         let original = parse_mesh(&serde_json::to_vec(&source).unwrap()).unwrap();
         let raw = pack_uncompressed(&original).unwrap();
-        let reduced = reduce(raw.clone(), 16).unwrap();
+        let mut mesh = parse_mesh(&serde_json::to_vec(&source).unwrap()).unwrap();
+        reduce(&mut mesh, 16);
+        let reduced = pack_uncompressed(&mesh).unwrap();
         let layout = Layout::read(&raw).unwrap();
         assert_eq!(&raw[layout.vertices.range().end..], &reduced[layout.vertices.range().end..]);
         let decoded = parse_mesh(&reduced).unwrap();
@@ -91,7 +95,7 @@ mod tests {
         assert_eq!(parse_mesh(&plain).unwrap().vertices, original.vertices);
         source["precision"] = 16.into();
         let packed = pack_mesh(&serde_json::to_vec(&source).unwrap()).unwrap();
-        assert!(packed.len() <= plain.len());
+        assert_eq!(parse_mesh(&packed).unwrap().vertices, decoded.vertices);
         assert_eq!(pack_mesh(&packed).unwrap(), packed);
         for value in [0, 15, 24, 255] {
             source["precision"] = value.into();

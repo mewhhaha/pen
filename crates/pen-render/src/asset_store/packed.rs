@@ -84,10 +84,27 @@ pub(super) fn encode(mut raw: Vec<u8>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-pub(super) fn decode(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
+pub(super) fn decode(bytes: &[u8]) -> Result<(Cow<'_, [u8]>, Layout)> {
     if bytes.get(4) != Some(&VERSION) {
-        return Ok(Cow::Borrowed(bytes));
+        return Ok((Cow::Borrowed(bytes), Layout::read(bytes)?));
     }
+    let mut raw = inflate(bytes)?;
+    let layout = Layout::read(&raw)?;
+    transpose(&mut raw, &layout, &mut Vec::new(), true);
+    Ok((Cow::Owned(raw), layout))
+}
+
+#[cfg(feature = "simplify")]
+pub(super) fn validate_layout(bytes: &[u8]) -> Result<()> {
+    if bytes.get(4) == Some(&VERSION) {
+        Layout::read(&inflate(bytes)?)?;
+    } else {
+        Layout::read(bytes)?;
+    }
+    Ok(())
+}
+
+fn inflate(bytes: &[u8]) -> Result<Vec<u8>> {
     ensure!(bytes.len() >= MESH_HEADER, "compressed mesh ends in its header");
     ensure!(bytes[6..8] == [0; 2] && bytes[12..16] == [0; 4], "unsupported compressed mesh header");
     let length = word(bytes, 8)?;
@@ -108,9 +125,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
     );
     raw.truncate(length);
     ensure!(&raw[..4] == MESH_MAGIC && raw[4] == 1 && raw[5] == bytes[5], "invalid compressed mesh contents");
-    let layout = Layout::read(&raw)?;
-    transpose(&mut raw, &layout, &mut Vec::new(), true);
-    Ok(Cow::Owned(raw))
+    Ok(raw)
 }
 
 fn transpose(bytes: &mut [u8], layout: &Layout, scratch: &mut Vec<u8>, inverse: bool) {
@@ -148,11 +163,38 @@ mod tests {
         let packed = encode(raw.clone()).unwrap();
         assert_eq!(packed[4], VERSION);
         assert!(packed.len() < raw.len());
-        assert_eq!(decode(&packed).unwrap().as_ref(), raw);
+        assert_eq!(decode(&packed).unwrap().0.as_ref(), raw);
         let parsed = parse_mesh(&packed).unwrap();
         assert_eq!(parsed.vertices[0].to_bits(), (-0.0f32).to_bits());
         assert_eq!(parsed.vertices[1].to_bits(), 1);
         assert_eq!(pack_mesh(&packed).unwrap(), packed);
+    }
+
+    #[cfg(feature = "simplify")]
+    #[test]
+    fn packaging_keeps_existing_packed_layout_and_compression() {
+        use crate::pack_mesh_with_lods;
+
+        let raw = pack_uncompressed(&parse_mesh(skinned_triangle().as_bytes()).unwrap()).unwrap();
+        let compressed = encode(raw.clone()).unwrap();
+        assert_eq!(raw[4], 1);
+        assert_eq!(compressed[4], VERSION);
+        // Re-encoding this v1 asset normally chooses v2.
+        assert_eq!(pack_mesh(&raw).unwrap(), compressed);
+        for bytes in [raw, compressed] {
+            assert_eq!(pack_mesh_with_lods(&bytes).unwrap(), bytes);
+            let mut bad_header = bytes.clone();
+            bad_header[6] = 1;
+            assert!(pack_mesh_with_lods(&bad_header).is_err());
+
+            let mut trailing = bytes;
+            trailing.push(0);
+            if trailing[4] == 1 {
+                // A v1 skin's variable-length rig occupies the rest of the layout.
+                trailing[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+            }
+            assert!(pack_mesh_with_lods(&trailing).is_err());
+        }
     }
 
     #[test]
@@ -163,7 +205,7 @@ mod tests {
         mesh.set_tangents(Some(tangents.clone())).unwrap();
         let raw = pack_uncompressed(&mesh).unwrap();
         let packed = encode(raw.clone()).unwrap();
-        assert_eq!(decode(&packed).unwrap().as_ref(), raw);
+        assert_eq!(decode(&packed).unwrap().0.as_ref(), raw);
         let parsed = parse_mesh(&packed).unwrap();
         let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(parsed.tangents.as_ref().unwrap()), bits(&tangents));
@@ -196,7 +238,7 @@ mod tests {
         mesh.set_morphs(Some(crate::asset_store::MorphTargets { targets: 1, deltas: deltas.clone() })).unwrap();
         let raw = pack_uncompressed(&mesh).unwrap();
         let packed = encode(raw.clone()).unwrap();
-        assert_eq!(decode(&packed).unwrap().as_ref(), raw);
+        assert_eq!(decode(&packed).unwrap().0.as_ref(), raw);
         let parsed = parse_mesh(&packed).unwrap();
         let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
         assert_eq!(parsed.morphs.as_ref().unwrap().targets, 1);

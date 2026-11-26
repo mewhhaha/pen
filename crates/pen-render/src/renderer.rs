@@ -48,7 +48,7 @@ use anyhow::Result;
 use pen_protocol::boundary::MAX_DRAW_EXTRA;
 use pen_protocol::{GameEvent, Matrix, Sky, Solid, Vector};
 
-use crate::asset_store::{AssetStore, Lod, MAPS_FLOATS, MAX_LODS, Material, SURFACE_FLOATS};
+use crate::asset_store::{AssetStore, Lod, MAPS_FLOATS, MAX_LODS, MESH_VERTEX_FLOATS, Material, SURFACE_FLOATS};
 use crate::built_in::{BuiltIn, BuiltIns};
 use crate::culling::{Detail, MAX_VIEWS, Sphere, ViewMask, Views};
 use crate::decals::{DecalBatch, Decals};
@@ -59,6 +59,7 @@ use crate::mipmaps::Mipmapper;
 use crate::packed_texture::PackedHeader;
 use crate::pipeline_cache::PipelineCache;
 use crate::post::{Post, TONED_WGSL};
+use crate::ray_tracing::BlasTriangle;
 use crate::render2d::SdfShape;
 use crate::shader::{self, EXTRA_VERTEX_BYTES, PipelineContext, Pipelines, TANGENT_BYTES, Variants};
 use crate::solids::SolidBatch;
@@ -110,11 +111,28 @@ const SURFACE_AT: usize = 44 + MAX_DRAW_EXTRA * 4;
 const MAPS_AT: usize = SURFACE_AT + SURFACE_FLOATS;
 const DRAW_BYTES: u64 = (MAPS_AT + MAPS_FLOATS) as u64 * 4;
 
-/// CPU LOD0 triangle snapshot retained on a loaded mesh for lazy BLAS construction when
-/// `quality.ray_tracing > 0` or `quality.ddgi` is active.
+/// CPU geometry retained for BLAS construction on the first RT or DDGI use.
 pub(crate) struct RtMeshSource {
-    pub id: u64,
-    pub triangles: Vec<crate::ray_tracing::BlasTriangle>,
+    id: u64,
+    vertices: Vec<f32>,
+    /// LOD0 triangle indices for mesh assets. Brush solids are already in triangle order.
+    indices: Option<Vec<u32>>,
+}
+
+impl RtMeshSource {
+    fn triangles(&self) -> Vec<BlasTriangle> {
+        let vertices = self.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0;
+        let triangle = |[a, b, c]: [&[f32; MESH_VERTEX_FLOATS]; 3]| {
+            let position = |v: &[f32; MESH_VERTEX_FLOATS]| [v[0], v[1], v[2]];
+            let normal = |v: &[f32; MESH_VERTEX_FLOATS]| [v[3], v[4], v[5]];
+            BlasTriangle::smooth(position(a), position(b), position(c), normal(a), normal(b), normal(c))
+        };
+        if let Some(indices) = &self.indices {
+            indices.as_chunks::<3>().0.iter().map(|indices| triangle(indices.map(|i| &vertices[i as usize]))).collect()
+        } else {
+            vertices.as_chunks::<3>().0.iter().map(|[a, b, c]| triangle([a, b, c])).collect()
+        }
+    }
 }
 
 /// GPU meshlet cluster descriptors + cluster-ordered index buffer for LOD0 indirect culling.

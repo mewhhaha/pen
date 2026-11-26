@@ -596,16 +596,16 @@ fn ship_assets(from: &Path, to: &Path, wasm: &[u8]) -> Result<Shipped> {
                         None
                     };
                     // A new file, never one sharing the source's: tools rewrite assets in place.
-                    match packed {
+                    bytes += match packed {
                         Some(packed) => {
-                            std::fs::write(&target, packed)?;
+                            std::fs::write(&target, &packed)?;
                             meshes += 1;
+                            packed.len() as u64
                         }
                         None => {
-                            std::fs::copy(&source, &target).with_context(|| format!("copying {}", source.display()))?;
+                            std::fs::copy(&source, &target).with_context(|| format!("copying {}", source.display()))?
                         }
-                    }
-                    bytes += std::fs::metadata(&target)?.len();
+                    };
                 }
                 Ok((bytes, meshes))
             }));

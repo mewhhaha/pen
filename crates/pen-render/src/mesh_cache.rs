@@ -1,8 +1,7 @@
 //! Content-hashed disk cache and background CPU preparation for mesh assets.
 //!
-//! Building meshlet partitions, QEM Cluster DAGs, and ray-tracing triangle lists
-//! is pure CPU work that belongs on the asset loader's worker threads rather than
-//! the frame thread. Cached meshlets and DAGs are keyed by a 128-bit content hash
+//! Loader workers build meshlet partitions and QEM Cluster DAGs. Cached
+//! meshlets and DAGs are keyed by a 128-bit content hash
 //! of the LOD0 vertex positions, indices, and builder configuration, stored in
 //! `~/.cache/pen/meshlets/` (when a cache directory is configured) via atomic
 //! rename so concurrent runs never observe partial files.
@@ -21,7 +20,6 @@ use crate::meshlet_dag::{MeshletDagConfig, MeshletDagMesh, build_meshlet_dag, bu
 #[cfg(any(not(target_arch = "wasm32"), test))]
 use crate::meshlets::{DEFAULT_MAX_MESHLET_TRIANGLES, DEFAULT_MAX_MESHLET_VERTICES, MeshletGpu};
 use crate::meshlets::{MeshletMesh, build_meshlets};
-use crate::ray_tracing::BlasTriangle;
 
 #[cfg(any(not(target_arch = "wasm32"), test))]
 const CACHE_MAGIC: [u8; 8] = *b"PENMLC01";
@@ -34,7 +32,6 @@ const FLAG_MESHLET_DAG: u32 = 1 << 1;
 /// built off the main thread and ready for GPU buffer upload.
 pub(crate) struct PreparedMesh {
     pub mesh: Mesh,
-    pub rt_triangles: Option<Vec<BlasTriangle>>,
     pub meshlets: Option<MeshletMesh>,
     pub meshlet_dag: Option<MeshletDagMesh>,
 }
@@ -140,11 +137,11 @@ pub(crate) fn build_meshlets_and_dag(mesh: &Mesh) -> (Option<MeshletMesh>, Optio
     if idx_slice.len() / 3 < 128 {
         return (None, None);
     }
-    let mut positions = Vec::with_capacity(mesh.vertices.len() / MESH_VERTEX_FLOATS);
-    for v in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
-        positions.push([v[0], v[1], v[2]]);
-    }
-    build_meshlets_and_dag_from_slice(&positions, idx_slice, &MeshletDagConfig::default())
+    build_meshlets_and_dag_from_slice(&mesh_positions(&mesh.vertices), idx_slice, &MeshletDagConfig::default())
+}
+
+fn mesh_positions(vertices: &[f32]) -> Vec<[f32; 3]> {
+    vertices.as_chunks::<MESH_VERTEX_FLOATS>().0.iter().map(|v| [v[0], v[1], v[2]]).collect()
 }
 
 fn build_meshlets_and_dag_from_slice(
@@ -157,86 +154,44 @@ fn build_meshlets_and_dag_from_slice(
         .filter(|ml| ml.meshlets.len() > 1);
     let dag = (idx_slice.len() / 3 >= 768)
         .then(|| {
-            let clean_indices: Vec<u32> = idx_slice
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .filter(|&&[a, b, c]| {
-                    let (Some(&pa), Some(&pb), Some(&pc)) =
-                        (positions.get(a as usize), positions.get(b as usize), positions.get(c as usize))
-                    else {
-                        return false;
-                    };
-                    let ab = [
-                        f64::from(pb[0]) - f64::from(pa[0]),
-                        f64::from(pb[1]) - f64::from(pa[1]),
-                        f64::from(pb[2]) - f64::from(pa[2]),
-                    ];
-                    let ac = [
-                        f64::from(pc[0]) - f64::from(pa[0]),
-                        f64::from(pc[1]) - f64::from(pa[1]),
-                        f64::from(pc[2]) - f64::from(pa[2]),
-                    ];
-                    let nx = ab[1] * ac[2] - ab[2] * ac[1];
-                    let ny = ab[2] * ac[0] - ab[0] * ac[2];
-                    let nz = ab[0] * ac[1] - ab[1] * ac[0];
-                    nx != 0.0 || ny != 0.0 || nz != 0.0
-                })
-                .flat_map(|t| *t)
-                .collect();
-            if clean_indices.len() == idx_slice.len()
-                && let Some(leaves) = &ml
-            {
-                build_meshlet_dag_from_leaves(positions, leaves.clone(), config)
-                    .ok()
-                    .filter(|d| d.level_count > 1 && d.clusters.len() > 1)
-            } else if clean_indices.len() / 3 >= 768 {
+            let usable = |&[a, b, c]: &[u32; 3]| {
+                let (Some(&pa), Some(&pb), Some(&pc)) =
+                    (positions.get(a as usize), positions.get(b as usize), positions.get(c as usize))
+                else {
+                    return false;
+                };
+                let ab = std::array::from_fn::<_, 3, _>(|axis| f64::from(pb[axis]) - f64::from(pa[axis]));
+                let ac = std::array::from_fn::<_, 3, _>(|axis| f64::from(pc[axis]) - f64::from(pa[axis]));
+                let nx = ab[1] * ac[2] - ab[2] * ac[1];
+                let ny = ab[2] * ac[0] - ab[0] * ac[2];
+                let nz = ab[0] * ac[1] - ab[1] * ac[0];
+                nx != 0.0 || ny != 0.0 || nz != 0.0
+            };
+            let mut triangles = idx_slice.as_chunks::<3>().0.iter();
+            if let Some(first_bad) = triangles.position(|tri| !usable(tri)) {
+                let mut clean_indices = Vec::with_capacity(idx_slice.len() - 3);
+                clean_indices.extend_from_slice(&idx_slice[..first_bad * 3]);
+                clean_indices.extend(triangles.filter(|tri| usable(tri)).flatten().copied());
+                if clean_indices.len() / 3 < 768 {
+                    return None;
+                }
                 build_meshlet_dag(positions, &clean_indices, config)
-                    .ok()
-                    .filter(|d| d.level_count > 1 && d.clusters.len() > 1)
+            } else if let Some(leaves) = &ml {
+                build_meshlet_dag_from_leaves(positions, leaves, config)
             } else {
-                None
+                build_meshlet_dag(positions, idx_slice, config)
             }
+            .ok()
+            .filter(|d| d.level_count > 1 && d.clusters.len() > 1)
         })
         .flatten();
     (ml, dag)
 }
 
-/// Runs all pure-CPU mesh preparation (RT triangle list, meshlets, and Cluster DAG).
+/// Prepares meshlets and the Cluster DAG for GPU upload.
 /// Packaged `PMSH` meshes that already carry pre-baked meshlets/DAG skip building and
 /// disk-cache I/O completely; unpacked dev meshes use `cache` on worker threads.
 pub(crate) fn prepare_mesh(mut mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
-    let rt_triangles = mesh.lods.first().and_then(|lod| {
-        let start = lod.first as usize;
-        let end = start.saturating_add(lod.count as usize).min(mesh.indices.len());
-        let idx_slice = mesh.indices.get(start..end)?;
-        let tri_count = idx_slice.len() / 3;
-        if tri_count == 0 {
-            return None;
-        }
-        let mut triangles = Vec::with_capacity(tri_count);
-        let verts = &mesh.vertices;
-        let vlen = verts.len();
-        let (tri_chunks, _) = idx_slice.as_chunks::<3>();
-        for tri in tri_chunks {
-            let o0 = tri[0] as usize * MESH_VERTEX_FLOATS;
-            let o1 = tri[1] as usize * MESH_VERTEX_FLOATS;
-            let o2 = tri[2] as usize * MESH_VERTEX_FLOATS;
-            if o0 + 6 > vlen || o1 + 6 > vlen || o2 + 6 > vlen {
-                continue;
-            }
-            triangles.push(BlasTriangle::smooth(
-                [verts[o0], verts[o0 + 1], verts[o0 + 2]],
-                [verts[o1], verts[o1 + 1], verts[o1 + 2]],
-                [verts[o2], verts[o2 + 1], verts[o2 + 2]],
-                [verts[o0 + 3], verts[o0 + 4], verts[o0 + 5]],
-                [verts[o1 + 3], verts[o1 + 4], verts[o1 + 5]],
-                [verts[o2 + 3], verts[o2 + 4], verts[o2 + 5]],
-            ));
-        }
-        (!triangles.is_empty()).then_some(triangles)
-    });
-
     let baked_ml = mesh.meshlets.take();
     let baked_dag = mesh.meshlet_dag.take();
     let (meshlets, meshlet_dag) = if baked_ml.is_some() || baked_dag.is_some() {
@@ -250,13 +205,9 @@ pub(crate) fn prepare_mesh(mut mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
         if let Some(idx_slice) = lod0_slice
             && idx_slice.len() / 3 >= 128
         {
-            let mut positions = Vec::with_capacity(mesh.vertices.len() / MESH_VERTEX_FLOATS);
-            for v in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
-                positions.push([v[0], v[1], v[2]]);
-            }
             let config = MeshletDagConfig::default();
             #[cfg(not(target_arch = "wasm32"))]
-            let hash = cache.enabled().then(|| hash_mesh_inputs(&positions, idx_slice, &config));
+            let hash = cache.enabled().then(|| hash_mesh_inputs(&mesh.vertices, idx_slice, &config));
             #[cfg(not(target_arch = "wasm32"))]
             let cached = hash.as_ref().and_then(|hash| cache.load(hash));
             #[cfg(target_arch = "wasm32")]
@@ -267,7 +218,7 @@ pub(crate) fn prepare_mesh(mut mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
             if let Some(cached) = cached {
                 cached
             } else {
-                let (ml, dag) = build_meshlets_and_dag_from_slice(&positions, idx_slice, &config);
+                let (ml, dag) = build_meshlets_and_dag_from_slice(&mesh_positions(&mesh.vertices), idx_slice, &config);
                 #[cfg(not(target_arch = "wasm32"))]
                 if let Some(hash) = &hash {
                     cache.store(hash, ml.as_ref(), dag.as_ref());
@@ -281,7 +232,7 @@ pub(crate) fn prepare_mesh(mut mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
         (None, None)
     };
 
-    PreparedMesh { mesh, rt_triangles, meshlets, meshlet_dag }
+    PreparedMesh { mesh, meshlets, meshlet_dag }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -391,7 +342,8 @@ impl Hasher128 {
 }
 
 #[cfg(any(not(target_arch = "wasm32"), test))]
-fn hash_mesh_inputs(positions: &[[f32; 3]], indices: &[u32], config: &MeshletDagConfig) -> [u8; 16] {
+fn hash_mesh_inputs(vertices: &[f32], indices: &[u32], config: &MeshletDagConfig) -> [u8; 16] {
+    let positions = vertices.as_chunks::<MESH_VERTEX_FLOATS>().0;
     let mut hasher = Hasher128::new(0x5045_4e4d_4c43_3031);
     hasher.update(&CACHE_MAGIC);
     let header: [u64; 8] = [
@@ -405,7 +357,9 @@ fn hash_mesh_inputs(positions: &[[f32; 3]], indices: &[u32], config: &MeshletDag
         indices.len() as u64,
     ];
     hasher.update(bytemuck::cast_slice(&header));
-    hasher.update(bytemuck::cast_slice(positions));
+    for vertex in positions {
+        hasher.update(bytemuck::cast_slice(&vertex[..3]));
+    }
     hasher.update(bytemuck::cast_slice(indices));
     hasher.finish()
 }

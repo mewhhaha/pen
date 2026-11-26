@@ -493,7 +493,8 @@ impl Worker {
         };
         // An asset's first load takes what was read and decoded ahead.
         let prepared = if revision == 1 {
-            self.prefetch.lock().unwrap().as_ref().and_then(|prefetch| prefetch.take(kind, key))
+            let prefetch = self.prefetch.lock().unwrap().clone();
+            prefetch.and_then(|prefetch| prefetch.take(kind, key))
         } else {
             None
         };

@@ -716,52 +716,46 @@ pub fn mesh_bounds(bytes: &[u8]) -> Result<([f32; 3], [f32; 3])> {
     Ok(bounds)
 }
 
-/// The whole mesh's level of detail, then each of `simpler`'s (its error
-/// and indices), their indices after the mesh's in `indices`.
-fn levels(indices: &mut Vec<u32>, simpler: &[(f32, Vec<u32>)]) -> Result<Vec<Lod>> {
-    let count = |indices: &[u32]| u32::try_from(indices.len()).context("mesh has more indices than a u32 counts");
-    let mut lods = vec![Lod { first: 0, count: count(indices)?, error: 0.0 }];
-    for (error, lod) in simpler {
-        lods.push(Lod { first: count(indices)?, count: count(lod)?, error: *error });
-        indices.extend_from_slice(lod);
-    }
-    count(indices)?;
-    Ok(lods)
+/// Describes an index range to append to the mesh's contiguous index buffer.
+pub(crate) fn push_lod(lods: &mut Vec<Lod>, first: usize, count: usize, error: f32) -> Result<()> {
+    ensure!(lods.len() < MAX_LODS, "mesh has more than {} levels of detail", MAX_LODS);
+    ensure!(
+        error.is_finite() && error >= lods.last().map_or(0.0, |lod| lod.error) && count != 0 && count.is_multiple_of(3),
+        "mesh level of detail requires triangles and a finite error no smaller than the last's"
+    );
+    ensure!(
+        first.checked_add(count).is_some_and(|end| u32::try_from(end).is_ok()),
+        "mesh has more indices than a u32 counts"
+    );
+    lods.push(Lod { first: u32::try_from(first)?, count: u32::try_from(count)?, error });
+    Ok(())
 }
 
-/// The mesh, if its vertices and triangles are whole: some vertices, every
-/// index one of them, nonzero normals and coordinates float32 can hold; if
-/// its simpler levels of detail (their errors and indices) are triangles of
-/// its vertices too, at most `MAX_LODS` in all, their errors finite and
-/// growing; and if a skin's joints are its rig's and each vertex's weights
-/// add up to something.
-pub(crate) fn checked_mesh(
+fn checked_mesh(
     vertices: Vec<f32>,
     mut indices: Vec<u32>,
     simpler: &[(f32, Vec<u32>)],
     skin: Option<Skin>,
 ) -> Result<Mesh> {
-    ensure!(
-        !indices.is_empty() && indices.len().is_multiple_of(3),
-        "mesh requires matching position/normal/UV vertices and triangle indices"
-    );
-    ensure!(simpler.len() < MAX_LODS, "mesh has more than {} simpler levels of detail", MAX_LODS - 1);
-    let mut least = 0.0;
+    let mut lods = Vec::with_capacity(1 + simpler.len().min(MAX_LODS - 1));
+    push_lod(&mut lods, 0, indices.len(), 0.0)?;
     for (error, lod) in simpler {
-        ensure!(
-            error.is_finite() && *error >= least && !lod.is_empty() && lod.len().is_multiple_of(3),
-            "mesh level of detail requires triangles and a finite error no smaller than the last's"
-        );
-        least = *error;
+        push_lod(&mut lods, indices.len(), lod.len(), *error)?;
+        indices.extend_from_slice(lod);
     }
-    let lods = levels(&mut indices, simpler)?;
+    checked_mesh_parts(vertices, indices, lods, skin)
+}
+
+/// Checks the shared vertex and skin data after the LOD ranges are validated.
+fn checked_mesh_parts(vertices: Vec<f32>, indices: Vec<u32>, lods: Vec<Lod>, skin: Option<Skin>) -> Result<Mesh> {
     let bounds = Sphere::around(&vertices, MESH_VERTEX_FLOATS);
+    let authored_lods = lods.len() > 1;
     let mut mesh = Mesh {
         vertices,
         indices,
         bounds,
         lods,
-        authored_lods: !simpler.is_empty(),
+        authored_lods,
         skin,
         instances: None,
         precision: None,
@@ -777,9 +771,7 @@ pub(crate) fn checked_mesh(
     ensure!(mesh.indices.iter().all(|&index| (index as usize) < count), "mesh index is outside its vertex array");
     ensure!(mesh.vertices.iter().all(|value| value.is_finite()), "mesh coordinates exceed float32 range");
     for vertex in mesh.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0 {
-        let normal = &vertex[3..6];
-        let length = normal.iter().map(|&value| f64::from(value) * f64::from(value)).sum::<f64>().sqrt();
-        ensure!(length >= 1e-8, "mesh normal must be nonzero");
+        ensure!(valid_normal(&vertex[3..6]), "mesh normal must be nonzero");
     }
     if let Some(skin) = &mut mesh.skin {
         let joints = skin.rig.joints.len();
@@ -803,6 +795,10 @@ pub(crate) fn checked_mesh(
         }
     }
     Ok(mesh)
+}
+
+fn valid_normal(normal: &[f32]) -> bool {
+    normal.iter().map(|&value| f64::from(value).powi(2)).sum::<f64>().sqrt() >= 1e-8
 }
 
 impl Mesh {
@@ -927,18 +923,34 @@ impl Mesh {
 /// weights (f32s) and its rig; or persistent instance count, min/max bounds,
 /// and 20 f32s per record. All little-endian.
 pub fn pack_mesh(bytes: &[u8]) -> Result<Vec<u8>> {
-    pack(&parse_mesh(bytes)?)
+    let mut mesh = parse_mesh(bytes)?;
+    quantize_mesh(&mut mesh);
+    pack(&mesh)
+}
+
+/// Applies the author’s precision setting before generating any derived geometry.
+pub(crate) fn quantize_mesh(mesh: &mut Mesh) {
+    if let Some(bits) = mesh.precision.take().filter(|&bits| bits < 23)
+        && !mesh.instances.as_ref().is_some_and(|instances| instances.recipe.is_some())
+    {
+        precision::reduce(mesh, bits);
+    }
+}
+
+#[cfg(feature = "simplify")]
+pub(crate) fn is_packed_mesh(bytes: &[u8]) -> Result<bool> {
+    if !bytes.starts_with(MESH_MAGIC) {
+        return Ok(false);
+    }
+    packed::validate_layout(bytes)?;
+    Ok(true)
 }
 
 pub(crate) fn pack(mesh: &Mesh) -> Result<Vec<u8>> {
     if mesh.instances.as_ref().is_some_and(|instances| instances.recipe.is_some()) {
         return packed::encode_recipe(mesh);
     }
-    let raw = pack_uncompressed(mesh)?;
-    let Some(bits) = mesh.precision.filter(|&bits| bits < 23) else { return packed::encode(raw) };
-    let full = packed::encode(raw.clone())?;
-    let smaller = packed::encode(precision::reduce(raw, bits)?)?;
-    Ok(if smaller.len() < full.len() { smaller } else { full })
+    packed::encode(pack_uncompressed(mesh)?)
 }
 
 fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
@@ -1043,9 +1055,8 @@ fn pack_uncompressed(mesh: &Mesh) -> Result<Vec<u8>> {
 }
 
 fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
-    let decoded = packed::decode(bytes)?;
+    let (decoded, layout) = packed::decode(bytes)?;
     let bytes = decoded.as_ref();
-    let layout = layout::Layout::read(bytes)?;
     let mut vertices = Vec::with_capacity(layout.vertices.count * MESH_VERTEX_FLOATS);
     for vertex in bytes[layout.vertices.range()].chunks_exact(layout.vertices.stride) {
         vertices.extend(vertex.as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)));
@@ -1053,17 +1064,25 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
             vertices.extend([0.0, 0.0]);
         }
     }
-    let read_indices = |block: &layout::Block| -> Vec<u32> {
-        bytes[block.range()]
-            .chunks_exact(block.stride)
-            .map(|index| match index {
-                [a, b] => u32::from(u16::from_le_bytes([*a, *b])),
-                _ => u32::from_le_bytes(index.try_into().expect("checked index width")),
-            })
-            .collect()
+    let read_indices = |block: &layout::Block| {
+        bytes[block.range()].chunks_exact(block.stride).map(|index| match index {
+            [a, b] => u32::from(u16::from_le_bytes([*a, *b])),
+            _ => u32::from_le_bytes(index.try_into().expect("checked index width")),
+        })
     };
-    let indices = read_indices(&layout.indices);
-    let simpler: Vec<_> = layout.lods.iter().map(|(error, block)| (*error, read_indices(block))).collect();
+    let mut lods = Vec::with_capacity(1 + layout.lods.len());
+    let mut total = 0;
+    for (error, block) in
+        std::iter::once((0.0, &layout.indices)).chain(layout.lods.iter().map(|(error, block)| (*error, block)))
+    {
+        push_lod(&mut lods, total, block.count, error)?;
+        total += block.count;
+    }
+    let mut indices = Vec::with_capacity(total);
+    indices.extend(read_indices(&layout.indices));
+    for (_, block) in &layout.lods {
+        indices.extend(read_indices(block));
+    }
     let skin = if let Some((records, rig)) = &layout.skin {
         let (mut joints, mut weights) = (Vec::with_capacity(records.count), Vec::with_capacity(records.count));
         for vertex in bytes[records.range()].chunks_exact(records.stride) {
@@ -1084,7 +1103,7 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
             bytes[block.range()].as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)).collect::<Vec<_>>();
         MorphTargets { targets: *targets, deltas }
     });
-    let mut mesh = checked_mesh(vertices, indices, &simpler, skin)?;
+    let mut mesh = checked_mesh_parts(vertices, indices, lods, skin)?;
     mesh.authored_lods = true;
     mesh.set_instances(layout.instances.as_ref().map(|layout| MeshInstances::read(bytes, layout)).transpose()?)?;
     mesh.set_tangents(tangents)?;
@@ -1095,7 +1114,7 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
                 .chunks_exact(records.stride)
                 .map(bytemuck::pod_read_unaligned::<MeshletGpu>)
                 .collect();
-            MeshletMesh { meshlets, indices: read_indices(idx_block) }
+            MeshletMesh { meshlets, indices: read_indices(idx_block).collect() }
         });
         let baked_dag = ml_layout.dag.as_ref().map(|dag| {
             let clusters: Vec<DagClusterGpu> = bytes[dag.clusters.range()]
@@ -1104,7 +1123,7 @@ fn unpack_mesh(bytes: &[u8]) -> Result<Mesh> {
                 .collect();
             MeshletDagMesh {
                 clusters,
-                indices: read_indices(&dag.indices),
+                indices: read_indices(&dag.indices).collect(),
                 level_count: dag.level_count,
                 leaf_cluster_count: dag.leaf_cluster_count,
                 root_cluster_count: dag.root_cluster_count,

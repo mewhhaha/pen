@@ -429,23 +429,16 @@ impl State {
         let device = self.device.clone();
         match loaded {
             Loaded::Mesh(prepared) => {
-                let crate::mesh_cache::PreparedMesh {
-                    mesh,
-                    rt_triangles,
-                    meshlets: meshlet_data,
-                    meshlet_dag: meshlet_dag_data,
-                } = *prepared;
-                let vertex_bytes: &[u8] = bytemuck::cast_slice(&mesh.vertices);
-                let index_bytes: &[u8] = bytemuck::cast_slice(&mesh.indices);
+                let crate::mesh_cache::PreparedMesh { mut mesh, meshlets: meshlet_data, meshlet_dag: meshlet_dag_data } =
+                    *prepared;
                 let instance_bytes: &[u8] =
                     mesh.instances.as_ref().map_or(&[], |instances| bytemuck::cast_slice(&instances.data));
                 let vertex_count = u32::try_from(mesh.vertices.len() / MESH_VERTEX_FLOATS)
                     .map_err(|_| "mesh vertex count exceeds u32".to_owned())?;
                 let morph_bytes: Option<(u32, &[u8])> =
                     mesh.morphs.as_ref().map(|m| (m.targets, bytemuck::cast_slice(&m.deltas)));
-                if vertex_bytes
-                    .len()
-                    .max(index_bytes.len())
+                if size_of_val(mesh.vertices.as_slice())
+                    .max(size_of_val(mesh.indices.as_slice()))
                     .max(instance_bytes.len())
                     .max(morph_bytes.map_or(0, |(_, b)| b.len())) as u64
                     > device.limits().max_buffer_size
@@ -455,15 +448,15 @@ impl State {
                 if mesh.tangents.is_none() {
                     self.ensure_zero_tangents(vertex_count as usize);
                 }
-                let extra_bytes: Option<Vec<u8>> = if mesh.uvs1.is_some() || mesh.colors.is_some() {
+                let extra_attributes: Option<Vec<[f32; 6]>> = if mesh.uvs1.is_some() || mesh.colors.is_some() {
                     let count = vertex_count as usize;
-                    let mut floats = Vec::with_capacity(count * 6);
+                    let mut attributes = Vec::with_capacity(count);
                     for i in 0..count {
                         let uv1 = mesh.uvs1.as_ref().and_then(|v| v.get(i)).copied().unwrap_or([0.0, 0.0]);
                         let col = mesh.colors.as_ref().and_then(|v| v.get(i)).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]);
-                        floats.extend_from_slice(&[uv1[0], uv1[1], col[0], col[1], col[2], col[3]]);
+                        attributes.push([uv1[0], uv1[1], col[0], col[1], col[2], col[3]]);
                     }
-                    Some(bytemuck::cast_slice(&floats).to_vec())
+                    Some(attributes)
                 } else {
                     self.ensure_default_extra_attrs(vertex_count as usize);
                     None
@@ -486,7 +479,8 @@ impl State {
                 } else {
                     wgpu::BufferUsages::VERTEX
                 };
-                let rt_source = rt_triangles.map(|triangles| Arc::new(super::RtMeshSource { id: self.view_id(), triangles }));
+                let rt_id = self.view_id();
+                let lod0_count = mesh.lods[0].count as usize;
                 let (asset, check) = shader::scoped(&device, || {
                     let meshlets = meshlet_data.as_ref().map(|ml| super::MeshletGpuAsset {
                         indices: buffer(bytemuck::cast_slice(&ml.indices), wgpu::BufferUsages::INDEX),
@@ -498,15 +492,17 @@ impl State {
                         .and_then(|dag| crate::meshlet_dag::MeshletDagGpu::upload(&device, dag).ok());
                     GpuAsset::Mesh(MeshAsset {
                         vertex_count,
-                        vertices: buffer(vertex_bytes, vertex_usage),
+                        vertices: buffer(bytemuck::cast_slice(&mesh.vertices), vertex_usage),
                         tangents: mesh
                             .tangents
                             .as_ref()
                             .map(|tangents| buffer(bytemuck::cast_slice(tangents), wgpu::BufferUsages::VERTEX)),
-                        extra_attrs: extra_bytes.as_deref().map(|b| buffer(b, wgpu::BufferUsages::VERTEX)),
-                        indices: buffer(index_bytes, wgpu::BufferUsages::INDEX),
+                        extra_attrs: extra_attributes
+                            .as_deref()
+                            .map(|values| buffer(bytemuck::cast_slice(values), wgpu::BufferUsages::VERTEX)),
+                        indices: buffer(bytemuck::cast_slice(&mesh.indices), wgpu::BufferUsages::INDEX),
                         bounds: mesh.bounds,
-                        lods: mesh.lods.clone(),
+                        lods: mesh.lods,
                         instances: mesh.instances.as_ref().map(|instances| MeshInstanceBuffer {
                             buffer: buffer(instance_bytes, wgpu::BufferUsages::VERTEX),
                             count: instances.count(),
@@ -519,7 +515,14 @@ impl State {
                             targets,
                             deltas: buffer(bytes, wgpu::BufferUsages::STORAGE),
                         }),
-                        rt_source,
+                        rt_source: Some(Arc::new(super::RtMeshSource {
+                            id: rt_id,
+                            vertices: mesh.vertices,
+                            indices: {
+                                mesh.indices.truncate(lod0_count);
+                                Some(mesh.indices)
+                            },
+                        })),
                         meshlets,
                         meshlet_dag,
                     })

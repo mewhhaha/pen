@@ -151,10 +151,21 @@ impl GpuBlasPool {
         id: u64,
         triangles: &[BlasTriangle],
     ) -> Result<Option<u32>> {
+        self.ensure_blas_with(device, encoder, id, || triangles)
+    }
+
+    /// Materializes triangle data only on a pool miss.
+    pub(crate) fn ensure_blas_with<T: AsRef<[BlasTriangle]>>(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        id: u64,
+        triangles: impl FnOnce() -> T,
+    ) -> Result<Option<u32>> {
         if let Some(&idx) = self.id_to_index.get(&id) {
             return Ok((self.entries[idx as usize].node_count > 0).then_some(idx));
         }
-        let blas = Blas::build(triangles)?;
+        let blas = Blas::build(triangles().as_ref())?;
         let (aabb_min, aabb_max) = blas.bounds();
         let node_count = blas.nodes().len() as u32;
         let tri_count = blas.tris().len() as u32;

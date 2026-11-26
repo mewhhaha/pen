@@ -363,7 +363,7 @@ func s_step (st: own U32) -> (cmd: U32): (U32, U32) =>
     // Ordinary legacy ABI 8 module WITH exported blot:memory and ZERO kernels/processes still loads cleanly!
     let legacy_wasm = compile_blot(
         r#"
-#entry func echo (xs: #[U32]): #[U32] => return copy xs
+io echo (xs: #[U32]): #[U32] => return copy xs
 "#,
     )?;
     let (legacy_meta, legacy_code) = GuestModule::native_bytes(&engine, &legacy_wasm)?;

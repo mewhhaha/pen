@@ -153,10 +153,16 @@ pub fn find(
 
 fn has_entry(source: &str, prefix: &str) -> bool {
     source.lines().any(|line| {
-        line.trim_start()
-            .strip_prefix("#entry ")
-            .and_then(|declaration| declaration.strip_prefix("func ").or_else(|| declaration.strip_prefix("const ")))
-            .is_some_and(|name| name.starts_with(prefix))
+        let line = line.trim_start();
+        let line = line.strip_prefix("private ").unwrap_or(line).trim_start();
+        let Some(declaration) = line.strip_prefix("io ") else { return false };
+        let declaration = declaration.trim_start();
+        if declaration.starts_with("func ") {
+            return false;
+        }
+        let name =
+            declaration.strip_prefix("const ").or_else(|| declaration.strip_prefix("let ")).unwrap_or(declaration);
+        name.trim_start().starts_with(prefix)
     })
 }
 
@@ -288,8 +294,8 @@ mod tests {
         Program { root: "/gdev".into(), entry: "/gdev/src/main.blot".into(), settings: "{}".into() }
     }
 
-    const SAYS: &str = "// rejects: what test_d says\n#entry func test_d () => return 0\n";
-    const TEST: &str = "#entry func test_d () => return 0\n";
+    const SAYS: &str = "// rejects: what test_d says\nio test_d () => return 0\n";
+    const TEST: &str = "io test_d () => return 0\n";
 
     fn layout() -> Memory {
         checkout(&[
@@ -359,8 +365,12 @@ mod tests {
 
     #[test]
     fn expected_panics_can_share_the_check_fixture() {
-        for trap in ["#entry func trap_bad () => return @panic \"bad\"", "#entry const trap_bad = panic_callback"] {
-            let source = format!("#entry func test_ok () => return #[1.0,0.0]\n{trap}\n");
+        for trap in [
+            "io trap_bad () => return @panic \"bad\"",
+            "io const trap_bad = panic_callback",
+            "private io let trap_bad = panic_callback",
+        ] {
+            let source = format!("io test_ok () => return #[1.0,0.0]\n{trap}\n");
             let mut files = checkout(&[("tests/a.blot", &source)]);
             let found = find(&program(), &[], None, &mut files).unwrap();
             assert_eq!(found.len(), 2);
@@ -369,6 +379,10 @@ mod tests {
             assert_eq!(found[1].prefix, "trap_");
             assert_eq!(found[0].entry, found[1].entry);
             assert_eq!(found[0].overlays, found[1].overlays);
+        }
+        for source in ["io_trap_bad () => return 0", "io func trap_bad () => return 0"] {
+            let mut files = checkout(&[("tests/a.blot", source)]);
+            assert_eq!(find(&program(), &[], None, &mut files).unwrap().len(), 1);
         }
     }
 
@@ -402,7 +416,7 @@ test "a \"quoted\" name" => true
         // not compile is named for its file.
         let mut files = checkout(&[
             ("tests/a.blot", TEST),
-            ("tests/b.blot", "#entry func test_e () => return 0\n"),
+            ("tests/b.blot", "io test_e () => return 0\n"),
             ("tests/rejected/twice.blot", SAYS),
         ]);
         assert_eq!(paths(&find(&program(), &[], Some("test_d"), &mut files).unwrap()), ["a.blot"]);

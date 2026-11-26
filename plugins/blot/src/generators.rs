@@ -1,5 +1,5 @@
 //! Stage-0 Blot virtual module generators: compile plain `.blot` generators to
-//! sandboxed ABI 8 Wasm (with automatic `#entry` signature adaptation), cache
+//! sandboxed ABI 8 Wasm (with automatic `io` signature adaptation), cache
 //! compiled Stage-0 Wasm per generator source graph and generated Blot source
 //! per input digest, and emit virtual `.blot` overlays for Stage 1.
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -706,7 +706,7 @@ struct SourceToken<'a> {
 
 /// Scans Blot source into lightweight tokens while skipping `//` comments and
 /// keeping `"..."` string literals intact (so embedded Blot inside strings is
-/// never mistaken for generator imports or `#entry` markers).
+/// never mistaken for generator imports or `io` entry declarations).
 fn scan(source: &str) -> Vec<SourceToken<'_>> {
     let bytes = source.as_bytes();
     let len = bytes.len();
@@ -928,7 +928,7 @@ fn validate_stage0_wasm(wasm: &[u8], export_name: &str, generator_path: &str) ->
         }
     }
     match found {
-        None => Err(format!("Missing #entry function `{export_name}` in generator {generator_path}")),
+        None => Err(format!("Missing io entry function {export_name} in generator {generator_path}")),
         Some((true, true)) => Ok(true),
         Some(_) => Ok(false),
     }
@@ -1015,20 +1015,27 @@ where
                 return Ok(Err(enrich_compile_diagnostics(initial_diags, &provenance)));
             }
 
-            // Strip `#entry` from `export_name` and adapt rich Blot signatures
+            // Demote the `io` declaration for `export_name` and adapt rich Blot signatures
             // (`Text`, `{ path, bytes/text }`, `Result [Text, Text]`) to ABI 8
             // `Array U32 -> Array U32`, matching `blot2/host/generators.ts`.
             let tokens = scan(entry_source);
-            let bytes = entry_source.as_bytes();
             let marker = tokens.iter().enumerate().position(|(i, token)| {
-                token.text == "#"
-                    && (token.start == 0 || matches!(bytes[token.start - 1], b'\n' | b'\r'))
-                    && tokens.get(i + 1).map(|t| t.text) == Some("entry")
-                    && {
-                        let name_index =
-                            if tokens.get(i + 2).map(|t| t.text) == Some("private") { i + 4 } else { i + 3 };
-                        tokens.get(name_index).map(|t| t.text) == Some(export_name)
+                if token.text != "io" {
+                    return false;
+                }
+                if i > 0 {
+                    let prev = &tokens[i - 1];
+                    if !matches!(prev.text, "private" | "]")
+                        && !entry_source[prev.start + prev.text.len()..token.start].contains(['\r', '\n'])
+                    {
+                        return false;
                     }
+                }
+                match tokens.get(i + 1).map(|next| next.text) {
+                    Some("const" | "let") => tokens.get(i + 2).is_some_and(|name| name.text == export_name),
+                    Some(name) => name == export_name,
+                    None => false,
+                }
             });
             let Some(marker) = marker else {
                 let _ = session.close();
@@ -1036,13 +1043,19 @@ where
                     entry,
                     0,
                     0,
-                    format!("Missing #entry function `{export_name}` in generator {entry}"),
+                    format!("Missing io entry function {export_name} in generator {entry}"),
                     Some(provenance),
                 )]));
             };
+            // Keep the declaration at column one after demoting the io entry marker.
             let start = tokens[marker].start;
-            let end = tokens[marker + 2].start;
-            let stripped = format!("{}{}", &entry_source[..start], &entry_source[end..]);
+            let next = &tokens[marker + 1];
+            let (end, replacement) = if matches!(next.text, "const" | "let") {
+                (next.start, "")
+            } else {
+                (start + tokens[marker].text.len(), "func")
+            };
+            let demoted = format!("{}{replacement}{}", &entry_source[..start], &entry_source[end..]);
             let used: HashSet<&str> = tokens.iter().map(|t| t.text).collect();
             let mut adapter = "_blot_stage0".to_owned();
             while used.contains(adapter.as_str()) {
@@ -1075,8 +1088,7 @@ where
                     } else {
                         "  return generated\n"
                     };
-                    let wrapped =
-                        format!("{stripped}\n#entry func {adapter} (packet: #[U32]): #[U32] =>\n{unpack}{pack}");
+                    let wrapped = format!("{demoted}\nio {adapter} (packet: #[U32]): #[U32] =>\n{unpack}{pack}");
                     let adapted_overlays: Vec<Overlay> = snapshot
                         .sources
                         .iter()
@@ -1361,7 +1373,10 @@ const generated = "import { inner } from \"./not_an_import\"\n"
         }
         let valid = [b"\0asm\x01\0\0\0".as_slice(), &abi_custom("generate", 5, 5)].concat();
         assert_eq!(validate_stage0_wasm(&valid, "generate", "gen.blot"), Ok(true));
-        assert!(validate_stage0_wasm(&valid, "other", "gen.blot").unwrap_err().contains("Missing #entry"));
+        assert_eq!(
+            validate_stage0_wasm(&valid, "other", "gen.blot").unwrap_err(),
+            "Missing io entry function other in generator gen.blot"
+        );
 
         let wrong_sig = [b"\0asm\x01\0\0\0".as_slice(), &abi_custom("generate", 1, 5)].concat();
         assert_eq!(validate_stage0_wasm(&wrong_sig, "generate", "gen.blot"), Ok(false));

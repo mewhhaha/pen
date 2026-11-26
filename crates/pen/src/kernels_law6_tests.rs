@@ -408,7 +408,7 @@ const application = {{
   decode_scene: decode_telemetry,
 }}
 
-#entry func main (h: #[F32] -> #[F32] ! {{Foreign}}): Unit ! {{Foreign}} => return
+io main (h: #[F32] -> #[F32] ! {{Foreign}}): Unit ! {{Foreign}} => return
   host.run application (fresh_world ()) h
 "#
     );

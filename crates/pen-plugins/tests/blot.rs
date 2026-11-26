@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use pen_plugins::{BuildResult, Builder, Expectation, Level, Outcome, Overlay, Plugins};
 
-const MAIN: &str = "import * as lib from \"./lib\"\n\n#entry const answer = func () => return lib.base + 1\n";
+const MAIN: &str = "import * as lib from \"./lib\"\n\nio const answer = func () => return lib.base + 1\n";
 const LIB: &str = "const base: U32 = 41\n";
 
 fn repository() -> PathBuf {
@@ -92,7 +92,8 @@ fn builds_and_rejects_through_the_blot_plugin() {
     assert_eq!(&wasm[..4], b"\0asm");
     // An overlay that does not type checks is the program's failure, not
     // the compiler's: the session goes on.
-    let wrong = "import * as lib from \"./lib\"\n\nconst wrong: Bool = lib.base\n\n#entry const answer = func () => return wrong\n";
+    let wrong =
+        "import * as lib from \"./lib\"\n\nconst wrong: Bool = lib.base\n\nio const answer = func () => return wrong\n";
     let overlay = Overlay { path: entry.display().to_string(), contents: Some(wrong.into()) };
     let BuildResult::Rejected(diagnostics) = session.build(&[overlay]).unwrap() else { panic!("the overlay rejects") };
     assert_eq!(diagnostics[0].file, entry.display().to_string());
@@ -188,9 +189,9 @@ fn lays_out_the_checkouts_tests() {
     let root = empty();
     for (file, source) in [
         ("src/main.blot", MAIN),
-        ("tests/b.blot", "#entry const test_b = func () => return 0\n"),
-        ("tests/a.blot", "#entry const test_a = func () => return 0\n"),
-        ("tests/traps/t.blot", "#entry const test_t = func () => return 0\n"),
+        ("tests/b.blot", "io const test_b = func () => return 0\n"),
+        ("tests/a.blot", "io const test_a = func () => return 0\n"),
+        ("tests/traps/t.blot", "io const test_t = func () => return 0\n"),
         ("tests/rejected/r.blot", "// rejects: type_mismatch\nconst a: Bool = 1\n"),
         ("tests/support/check.blot", "const a = 1\n"),
     ] {
@@ -208,7 +209,7 @@ fn lays_out_the_checkouts_tests() {
     let fixture = root.join("src/test_fixture.blot").display().to_string();
     assert!(modules.iter().all(|module| module.entry == fixture && module.prefix == "test_"));
     assert_eq!(modules[0].overlays[0].path, fixture);
-    assert_eq!(modules[0].overlays[0].contents.as_deref(), Some("#entry const test_a = func () => return 0\n"));
+    assert_eq!(modules[0].overlays[0].contents.as_deref(), Some("io const test_a = func () => return 0\n"));
     assert!(matches!(modules[2].expect, Expectation::Traps));
     assert!(matches!(&modules[3].expect, Expectation::Rejected(text) if text == "type_mismatch"));
     // Given modules, and a filter.
@@ -222,7 +223,7 @@ fn lays_out_the_checkouts_tests() {
     assert!(error.contains("tests/rejected/r.blot must not compile"), "{error}");
     // Modules outside what the checkout grants are not read.
     let outside = root.with_extension("outside.blot");
-    std::fs::write(&outside, "#entry const test_o = func () => return 0\n").unwrap();
+    std::fs::write(&outside, "io const test_o = func () => return 0\n").unwrap();
     let error = plugins.tests(&entry, std::slice::from_ref(&outside), None).unwrap_err().to_string();
     let _ = std::fs::remove_file(&outside);
     assert!(error.contains("outside what pen.json lets this plugin read"), "{error}");
@@ -237,7 +238,7 @@ fn builds_a_test_module_as_its_entry() {
     };
     let root = checkout(&component, &compiler, &std);
     std::fs::create_dir_all(root.join("tests")).unwrap();
-    let test = "import * as lib from \"./lib\"\n\n#entry const test_base = func () => return lib.base\n";
+    let test = "import * as lib from \"./lib\"\n\nio const test_base = func () => return lib.base\n";
     std::fs::write(root.join("tests/base.blot"), test).unwrap();
     let (plugins, _) = plugins(&root);
     let modules = plugins.tests(&root.join("main.blot"), &[], None).unwrap();
@@ -262,7 +263,7 @@ fn library_tests_compile_relative_helpers_without_a_game() {
     std::fs::write(root.join("tests/helper.blot"), "const value: F32 = 42.0\n").unwrap();
     std::fs::write(
         root.join("tests/check.blot"),
-        "import * as helper from \"./helper\"\n#entry const test_answer = func () => return #[helper.value]\n",
+        "import * as helper from \"./helper\"\nio const test_answer = func () => return #[helper.value]\n",
     )
     .unwrap();
     // An unrelated fixture must not get compiled as a standalone test.
@@ -402,7 +403,7 @@ fn stage0_wgsl_and_csv_generators_cache_adapt_and_report_provenance() {
     std::fs::write(
         root.join("tools/path_gen.blot"),
         r#"import * as text from "std/text"
-#entry func make_meta (input: { path: Text, text: Text }): Text =>
+private io const make_meta = func (input: { path: Text, text: Text }): Text =>
   let out = text.builder ()
   out := text.append "const path_len: U32 = " self
   out := text.append_u32 input.path.length self
@@ -417,7 +418,7 @@ fn stage0_wgsl_and_csv_generators_cache_adapt_and_report_provenance() {
     std::fs::write(
         root.join("tools/bytes_gen.blot"),
         r#"import * as text from "std/text"
-#entry func generate (raw: #[U32]): Text =>
+io generate (raw: #[U32]): Text =>
   let total: U32 = 0
   for b in raw:
     total := self + b
@@ -446,7 +447,7 @@ import { specs } from "./data/units.csv"
 import { path_len, text_len } from "./data/note.txt"
 import { checksum } from "./data/blob.bin"
 
-#entry func summary (): U32 =>
+io summary (): U32 =>
   let p = $Parameters { clear: 1.0, active: true }
   let bonus = if p.active then stage_light_slot else 0
   let mark = if building_marker < 0.0 then 100 else 0
@@ -528,11 +529,8 @@ import { checksum } from "./data/blob.bin"
 
     // Verify Stage-0 runtime `@panic` and bounds trap provenance (decoded `blot:traps` v1 + exact generator spans).
     std::fs::write(root.join("assets/salt.wgsl"), wgsl).unwrap();
-    std::fs::write(
-        root.join("tools/bytes_gen.blot"),
-        "#entry func generate (raw: #[U32]): Text =>\n  @panic \"boom stage0\"\n",
-    )
-    .unwrap();
+    std::fs::write(root.join("tools/bytes_gen.blot"), "io generate (raw: #[U32]): Text =>\n  @panic \"boom stage0\"\n")
+        .unwrap();
     let BuildResult::Rejected(diags) = session.build(&[]).unwrap() else { panic!("panicking generator must reject") };
     assert_eq!(diags[0].code, "asset_import");
     assert!(diags[0].message.contains("panic: \"boom stage0\""), "{diags:?}");
@@ -544,7 +542,7 @@ import { checksum } from "./data/blob.bin"
 
     std::fs::write(
         root.join("tools/bytes_gen.blot"),
-        "#entry func generate (raw: #[U32]): Text =>\n  let _ = raw[999]\n  return \"\"\n",
+        "io generate (raw: #[U32]): Text =>\n  let _ = raw[999]\n  return \"\"\n",
     )
     .unwrap();
     let BuildResult::Rejected(diags) = session.build(&[]).unwrap() else { panic!("OOB generator must reject") };
@@ -556,7 +554,7 @@ import { checksum } from "./data/blob.bin"
     // Verify Stage-1 error inside a generated virtual module carries `virtual_source` + `provenance`.
     std::fs::write(
         root.join("tools/bytes_gen.blot"),
-        "#entry func generate (raw: #[U32]): Text => return \"const checksum: Bool = 123\\n\"\n",
+        "io generate (raw: #[U32]): Text => return \"const checksum: Bool = 123\\n\"\n",
     )
     .unwrap();
     let BuildResult::Rejected(diags) = session.build(&[]).unwrap() else { panic!("bad generated Blot must reject") };
@@ -594,7 +592,7 @@ fn stage0_watch_rebuilds_on_asset_edit_and_generator_edit() {
     std::fs::write(root.join("assets/salt.wgsl"), "const slot = 10u;\n").unwrap();
     std::fs::write(
         root.join("main.blot"),
-        "import { slot } from \"./assets/salt.wgsl\"\n#entry func answer (): U32 => return slot\n",
+        "import { slot } from \"./assets/salt.wgsl\"\nio answer (): U32 => return slot\n",
     )
     .unwrap();
     let config = serde_json::json!({

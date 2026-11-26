@@ -236,8 +236,8 @@ A checkout selects its compiler in `pen.json`:
 }
 ```
 
-Stage-0 `generators` compile pure `.blot` modules (exporting `#entry func
-generate` or `exportName`) to zero-import ABI 8 Wasm, cache both the compiled
+Stage-0 `generators` compile pure `.blot` modules with an `io` entry named
+`generate` (or `exportName`) to zero-import ABI 8 Wasm, cache both the compiled
 generator per source graph and the generated virtual `.blot` module per input
 digest, and inject the virtual modules into Stage 1 builds and `pen test-blot`
 (as well as `pen dev` hot-reload watching). Rules accept `module` + `input` or

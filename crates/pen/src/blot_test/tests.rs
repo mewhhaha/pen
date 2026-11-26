@@ -494,8 +494,8 @@ test expect_trap "returns u32" => 42
         r#"test "mixed check" => true
 test expect_trap "mixed trap" => panic "expected"
 
-#entry func test_legacy () => #[1.0, 0.0]
-#entry func trap_legacy (): U32 => @panic "legacy panic"
+io test_legacy () => #[1.0, 0.0]
+io trap_legacy (): U32 => @panic "legacy panic"
 "#,
     )
     .unwrap();
@@ -579,7 +579,7 @@ test expect_trap "mixed trap" => panic "expected"
     let normal_wasm = build_test_module(&mut normal, mixed).unwrap();
     let mut legacy_only = mixed.clone();
     let source = legacy_only.overlays[0].contents.as_mut().unwrap();
-    *source = source.lines().skip_while(|line| !line.starts_with("#entry")).collect::<Vec<_>>().join("\n") + "\n";
+    *source = source.lines().skip_while(|line| !line.starts_with("io ")).collect::<Vec<_>>().join("\n") + "\n";
     assert_eq!(normal_wasm, build_test_module(&mut normal, &legacy_only).unwrap());
     assert!(pen_runtime::abi::read_abi(&normal_wasm).unwrap().tests.is_empty());
 }
@@ -630,7 +630,7 @@ fn runs_the_checkouts_pilot() {
     }
     // A module that does not compile, in the same session, fails with the
     // compiler's diagnostics, placed in the module.
-    let source = "#entry const test_broken = func () => return missing_name\n";
+    let source = "io const test_broken = func () => return missing_name\n";
     let broken = TestModule {
         path: root.join("tests/broken.blot").display().to_string(),
         overlays: vec![pen_plugins::Overlay { path: test.entry.clone(), contents: Some(source.into()) }],
@@ -830,7 +830,7 @@ fn runs_real_trap_provenance_tests() {
 test expect_trap "expected scalar panic":
   panic "expected scalar"
 
-#entry func trap_legacy (): U32 => @panic "legacy scalar"
+io trap_legacy (): U32 => @panic "legacy scalar"
 "#,
     )
     .unwrap();
@@ -897,7 +897,7 @@ test expect_trap "expected bounds":
     rejected_test.path = root.join("tests/overlay_bad.blot").display().to_string();
     rejected_test.overlays = vec![pen_plugins::Overlay {
         path: rejected_test.entry.clone(),
-        contents: Some("#entry func bad (): U32 => return missing_symbol\n".into()),
+        contents: Some("io bad (): U32 => return missing_symbol\n".into()),
     }];
     let diag = format!("{:#}", build_test_module(builder.as_mut().unwrap(), &rejected_test).unwrap_err());
     assert!(diag.starts_with(&format!("{}:1:", rejected_test.path)), "{diag}");

@@ -90,7 +90,7 @@ pub struct GeneratorRule {
     pub match_glob: Option<(String, String)>,
     /// Stage-0 `.blot` generator entry path (absolute).
     pub generator: String,
-    /// Generator `#entry` function name (defaults to `"generate"`).
+    /// Generator `io` function name (defaults to `"generate"`).
     pub export_name: String,
     /// Raw bytes (`Bytes`, default) or strict UTF-8 scalars (`Text`).
     pub input_mode: GeneratorInputMode,

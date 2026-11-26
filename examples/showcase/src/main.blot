@@ -14,4 +14,4 @@ import { run } from "./game"
   run: kernel_kits.crowd_steer_agent,
 }
 
-#entry const main = func host => run bake_terrain host
+io const main = func host => run bake_terrain host

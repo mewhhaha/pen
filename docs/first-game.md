@@ -62,7 +62,7 @@ same script gives the same pixels every time.
 ```blot
 import { run } from "./game"
 
-#entry const main = func host => return run host
+io const main = func host => return run host
 ```
 
 `run` creates the game's world once: the `World` value and its event, draw,
@@ -145,7 +145,7 @@ tests/game.blot (checks)
   ok      test_a_saved_world_comes_back
 ```
 
-A test is an `#entry const test_...` that returns `check.report` of its
+A test is an `io const test_...` that returns `check.report` of its
 checks (`pen/check`: `equal`, `near`, `holds`). Tests call the game's
 functions directly; a test module compiles as if it were
 `src/test_fixture.blot`, so it imports the game as `./game`.

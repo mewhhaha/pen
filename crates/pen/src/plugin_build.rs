@@ -258,9 +258,12 @@ fn expand_point_span(bytes: &[u8], start: usize, end: usize) -> (usize, usize) {
 
 fn find_enclosing_scope(lines: &[&str], line_1_based: usize) -> Option<String> {
     let prefixes = [
-        "#entry func ",
-        "#entry const ",
-        "#entry let ",
+        "private io const ",
+        "private io let ",
+        "private io ",
+        "io const ",
+        "io let ",
+        "io ",
         "#kernel func ",
         "#kernel const ",
         "#process const ",
@@ -280,8 +283,8 @@ fn find_enclosing_scope(lines: &[&str], line_1_based: usize) -> Option<String> {
                 if let Some(rest) = line.strip_prefix(prefix) {
                     let name: String =
                         rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.').collect();
-                    if !name.is_empty() {
-                        let kind = prefix.trim().strip_prefix("private ").unwrap_or(prefix.trim());
+                    let kind = prefix.trim().strip_prefix("private ").unwrap_or(prefix.trim());
+                    if !name.is_empty() && !(kind == "io" && matches!(name.as_str(), "func" | "const" | "let")) {
                         return Some(format!("{kind} {name}"));
                     }
                 }
@@ -700,8 +703,11 @@ mod tests {
     }
 
     #[test]
-    fn shows_worker_declaration_names_in_diagnostics() {
+    fn shows_entry_and_worker_declaration_names_in_diagnostics() {
         for (declaration, expected) in [
+            ("io main (): U32 =>", "io main"),
+            ("io const main = func () =>", "io const main"),
+            ("private io let main = func () =>", "io let main"),
             ("#kernel func double (value: U32): U32 =>", "#kernel func double"),
             ("#kernel const plan_routes: Kernel [F32, F32, F32] = {", "#kernel const plan_routes"),
             ("#process const sim: Process [U32, U32, U32] = {", "#process const sim"),
@@ -713,7 +719,7 @@ mod tests {
 
     #[test]
     fn describes_spent_value_with_secondary_move_blame_and_copy_fix() {
-        let source = "func consume (xs: own #[U32]): U32 => return xs.length\n#entry func main (): U32 =>\n  let a = #[1, 2, 3]\n  let n = consume a\n  return n + a.length\n";
+        let source = "func consume (xs: own #[U32]): U32 => return xs.length\nio main (): U32 =>\n  let a = #[1, 2, 3]\n  let n = consume a\n  return n + a.length\n";
         let move_start = u32::try_from(source.find("consume a").unwrap()).unwrap();
         let move_end = move_start + u32::try_from("consume a".len()).unwrap();
         let subj_start = u32::try_from(source.find("a =").unwrap()).unwrap();
@@ -733,7 +739,7 @@ mod tests {
         };
         let rendered = describe(&diagnostic, Some(("/tmp/spent.blot", source)));
         assert!(rendered.starts_with("/tmp/spent.blot:5:14: [SPENT_VALUE] (spent_value)"), "{rendered}");
-        assert!(rendered.contains("in spent.blot › #entry func main"), "{rendered}");
+        assert!(rendered.lines().any(|line| line.trim() == "in spent.blot › io main"), "{rendered}");
         assert!(rendered.contains("--------- `a` moved here"), "{rendered}");
         assert!(rendered.contains("^^^^^^^^ `a` used after move"), "{rendered}");
         assert!(rendered.contains("fix: Pass `a.copy` at line 4"), "{rendered}");

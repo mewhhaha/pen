@@ -14,4 +14,4 @@ import { run } from "./game"
   run: kernel_kits.terrain_eval_cell,
 }
 
-#entry const main = func host => run steer_crowd host
+io const main = func host => run steer_crowd host

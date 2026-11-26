@@ -1,4 +1,4 @@
 // Each invocation owns its state and packet pools until the host stops it.
 import { run } from "./game"
 
-#entry const main = func host => run host
+io const main = func host => run host

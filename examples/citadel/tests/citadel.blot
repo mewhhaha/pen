@@ -23,7 +23,7 @@ import {
   collected_shard_count,
 } from "./game"
 
-#entry const test_character_movement_jump_dais_and_voxel_nav = func () =>
+io const test_character_movement_jump_dais_and_voxel_nav = func () =>
   let phys_scene = build_arena_physics ()
   let phys = scene.queries phys_scene
   let w = create ()
@@ -49,7 +49,7 @@ import {
     ],
   ]
 
-#entry const test_combat_slash_hitstop_shake_shard_and_skinned_bones = func () =>
+io const test_combat_slash_hitstop_shake_shard_and_skinned_bones = func () =>
   let phys_scene = build_arena_physics ()
   let phys = scene.queries phys_scene
   let w = create ()
@@ -98,7 +98,7 @@ import {
     ],
   ]
 
-#entry const test_pause_ui_tree_and_save_restore_roundtrip = func () =>
+io const test_pause_ui_tree_and_save_restore_roundtrip = func () =>
   let phys_scene = build_arena_physics ()
   let phys = scene.queries phys_scene
   let w0 = create ()
@@ -119,7 +119,7 @@ import {
     check.equal saved saved2,
   ]
 
-#entry const test_echo_vault_acoustics_occlusion_and_toggle = func () =>
+io const test_echo_vault_acoustics_occlusion_and_toggle = func () =>
   let phys_scene = build_arena_physics ()
   let phys = scene.queries phys_scene
   let w = create ()

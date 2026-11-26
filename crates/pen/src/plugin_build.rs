@@ -37,20 +37,30 @@ fn write(path: &Path, bytes: &[u8]) -> Result<bool> {
 /// blame from JSON `details`), actionable `fix:`, and `doc:` pointer while
 /// keeping the raw compiler `code` and `message` visible for test assertions.
 pub fn describe(diagnostic: &Diagnostic, standing_in: Option<(&str, &str)>) -> String {
-    let source = match standing_in {
-        Some((path, text)) if path == diagnostic.file => Some(text.to_owned()),
-        _ => std::fs::read_to_string(&diagnostic.file).ok(),
-    };
     let canonical = canonical_code(&diagnostic.code);
     let parsed_details: Option<serde_json::Value> =
         diagnostic.details.as_deref().and_then(|raw| serde_json::from_str(raw).ok());
+    let provenance_line = format_stage0_provenance(parsed_details.as_ref());
+    let source = match standing_in {
+        Some((path, text)) if path == diagnostic.file => Some(text.to_owned()),
+        _ => std::fs::read_to_string(&diagnostic.file).ok().or_else(|| {
+            parsed_details
+                .as_ref()
+                .and_then(|value| value.get("virtual_source"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        }),
+    };
 
     let Some(source_text) = source else {
         let mut out = format!(
             "{}:@{}: [{canonical}] ({}) {}",
             diagnostic.file, diagnostic.start, diagnostic.code, diagnostic.message
         );
-        if let Some(details) = &diagnostic.details {
+        if let Some(prov) = provenance_line {
+            out.push('\n');
+            out.push_str(&prov);
+        } else if let Some(details) = &diagnostic.details {
             out.push('\n');
             out.push_str(details);
         }
@@ -103,6 +113,9 @@ pub fn describe(diagnostic: &Diagnostic, standing_in: Option<(&str, &str)>) -> S
     } else {
         out.push(format!("in {base_name}"));
     }
+    if let Some(prov) = provenance_line {
+        out.push(prov);
+    }
 
     let mut spans: Vec<(usize, usize, char, String)> = Vec::new();
     if has_origin {
@@ -125,6 +138,23 @@ pub fn describe(diagnostic: &Diagnostic, standing_in: Option<(&str, &str)>) -> S
     }
     out.push(format!("doc: blot explain {canonical} (skills/blot-diagnostics/SKILL.md#{canonical})"));
     out.join("\n")
+}
+
+fn format_stage0_provenance(details: Option<&serde_json::Value>) -> Option<String> {
+    let prov = details?.get("provenance")?.as_object()?;
+    if prov.get("stage").and_then(serde_json::Value::as_str) != Some("stage0") {
+        return None;
+    }
+    let phase = prov.get("phase").and_then(serde_json::Value::as_str).unwrap_or("stage0");
+    let input = prov.get("input").and_then(serde_json::Value::as_str).unwrap_or("");
+    let generator = prov.get("generator").and_then(serde_json::Value::as_str).unwrap_or("");
+    if input.is_empty() && generator.is_empty() {
+        return None;
+    }
+    fn short(path: &str) -> &str {
+        Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or(path)
+    }
+    Some(format!("from {} via {} (stage0 {phase})", short(input), short(generator)))
 }
 
 #[derive(Default)]
@@ -157,7 +187,8 @@ fn extract_blame(details: Option<&serde_json::Value>) -> BlameOrigin {
     let Some(obj) = details.and_then(serde_json::Value::as_object) else {
         return BlameOrigin::default();
     };
-    let get_usize = |key: &str| obj.get(key).and_then(serde_json::Value::as_u64).and_then(|v| usize::try_from(v).ok()).unwrap_or(0);
+    let get_usize =
+        |key: &str| obj.get(key).and_then(serde_json::Value::as_u64).and_then(|v| usize::try_from(v).ok()).unwrap_or(0);
     BlameOrigin {
         origin_kind: obj.get("origin_kind").and_then(serde_json::Value::as_str).unwrap_or("").to_owned(),
         origin_start: get_usize("origin_start"),
@@ -364,7 +395,9 @@ fn build_headline_and_fix(
         "SYNTAX_ERROR" | "UNMATCHED_DELIMITER" => {
             let fix = if trimmed_line.starts_with("fn ") || snippet == "fn" {
                 "Blot uses `func`, not `fn` (e.g. `func add (a: U32) -> (b: U32): U32 => return a + b`).".to_owned()
-            } else if trimmed_line.starts_with("type ") && trimmed_line.contains('|') && !trimmed_line.contains("is data")
+            } else if trimmed_line.starts_with("type ")
+                && trimmed_line.contains('|')
+                && !trimmed_line.contains("is data")
             {
                 "Sum types require `is data` and `$`-prefixed constructors: `type Opt is data = $Some U32 | $Nothing`."
                     .to_owned()
@@ -446,7 +479,8 @@ fn build_headline_and_fix(
             } else {
                 "Check the receiver's fields or call a namespaced function directly.".to_owned()
             };
-            let label = if member.is_empty() { "missing member".to_owned() } else { format!("unknown member `.{member}`") };
+            let label =
+                if member.is_empty() { "missing member".to_owned() } else { format!("unknown member `.{member}`") };
             (headline, label, Some(fix))
         }
         "SPENT_VALUE" => {
@@ -471,7 +505,9 @@ fn build_headline_and_fix(
                 let fix = if holder_name.is_empty() {
                     format!("Take `{copy_expr}` before creating the alias, or end the borrow before mutating `{name}`.")
                 } else {
-                    format!("Snapshot with `let {holder_name} = {copy_expr}`{where_str}, or finish reading `{holder_name}` before mutating `{name}`.")
+                    format!(
+                        "Snapshot with `let {holder_name} = {copy_expr}`{where_str}, or finish reading `{holder_name}` before mutating `{name}`."
+                    )
                 };
                 return (headline, "mutated while borrowed".to_owned(), Some(fix));
             }
@@ -486,7 +522,9 @@ fn build_headline_and_fix(
             (
                 format!("Cannot mutate `{name}` in place because another alias may still observe it."),
                 "aliased in-place write".to_owned(),
-                Some(format!("Take an explicit copy (`let local = {copy_expr}`) before updating with `:=`, or remove the earlier alias.")),
+                Some(format!(
+                    "Take an explicit copy (`let local = {copy_expr}`) before updating with `:=`, or remove the earlier alias."
+                )),
             )
         }
         "OWN_ARGUMENT" => {
@@ -496,7 +534,9 @@ fn build_headline_and_fix(
             let fix = if origin_kind == "parameter" {
                 format!("Mark parameter `{name}` as `own` to forward ownership, or pass `{copy_expr}`.")
             } else {
-                format!("Pass `{copy_expr}` to give the callee a fresh owned copy, or end live borrows of `{name}` first.")
+                format!(
+                    "Pass `{copy_expr}` to give the callee a fresh owned copy, or end live borrows of `{name}` first."
+                )
             };
             (
                 format!("Argument `{name}` is not uniquely owned and cannot be moved into an `own` parameter."),
@@ -511,7 +551,9 @@ fn build_headline_and_fix(
             (
                 format!("Function result `{name}` is borrowed or aliased; returned storage must be uniquely owned."),
                 "borrowed result cannot escape".to_owned(),
-                Some(format!("Return `{copy_expr}` to hand the caller a fresh copy, or take the source parameter with `own`.")),
+                Some(format!(
+                    "Return `{copy_expr}` to hand the caller a fresh copy, or take the source parameter with `own`."
+                )),
             )
         }
         "ENTRY_TYPE" => {
@@ -541,6 +583,11 @@ fn build_headline_and_fix(
             };
             (diagnostic.message.clone(), "type mismatch here".to_owned(), Some(fix.to_owned()))
         }
+        "ASSET_IMPORT" => (
+            diagnostic.message.clone(),
+            "generator / asset error".to_owned(),
+            Some("Inspect the asset input format or Stage-0 generator module referenced above.".to_owned()),
+        ),
         _ => (diagnostic.message.clone(), canonical.to_ascii_lowercase().replace('_', " "), None),
     }
 }
@@ -691,5 +738,39 @@ mod tests {
         assert!(rendered.contains("^^^^^^^^ `a` used after move"), "{rendered}");
         assert!(rendered.contains("fix: Pass `a.copy` at line 4"), "{rendered}");
         assert!(rendered.contains("doc: blot explain SPENT_VALUE"), "{rendered}");
+    }
+
+    #[test]
+    fn describes_stage0_virtual_source_and_provenance() {
+        let virtual_source = "type Parameters is data = $Parameters { clear: F32 }\nconst bad: Bool = 123\n";
+        let start = u32::try_from(virtual_source.find("123").unwrap()).unwrap();
+        let end = start + 3;
+        let diagnostic = Diagnostic {
+            file: "/nonexistent/proj/assets/salt.wgsl.blot".to_owned(),
+            stage: "check".to_owned(),
+            code: "type_mismatch".to_owned(),
+            start,
+            end,
+            message: "expected Bool, found U32".to_owned(),
+            details: Some(
+                serde_json::json!({
+                    "virtual_source": virtual_source,
+                    "provenance": {
+                        "stage": "stage0",
+                        "phase": "generated_source",
+                        "module": "/nonexistent/proj/assets/salt.wgsl.blot",
+                        "input": "/nonexistent/proj/assets/salt.wgsl",
+                        "generator": "/nonexistent/proj/tools/wgsl_gen.blot",
+                    }
+                })
+                .to_string(),
+            ),
+        };
+        let rendered = describe(&diagnostic, None);
+        assert!(rendered.contains("salt.wgsl.blot:2:19: [TYPE_MISMATCH]"), "{rendered}");
+        assert!(rendered.contains("in salt.wgsl.blot › const bad"), "{rendered}");
+        assert!(rendered.contains("from salt.wgsl via wgsl_gen.blot (stage0 generated_source)"), "{rendered}");
+        assert!(rendered.contains("2 | const bad: Bool = 123"), "{rendered}");
+        assert!(rendered.contains("^^^ type mismatch here"), "{rendered}");
     }
 }

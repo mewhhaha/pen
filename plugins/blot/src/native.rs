@@ -169,4 +169,8 @@ impl Files for NativeFiles {
     fn is_file(&mut self, path: &str) -> bool {
         Path::new(path).is_file()
     }
+
+    fn canonical(&mut self, path: &str) -> Result<String, String> {
+        std::fs::canonicalize(path).map(|path| path.to_string_lossy().into_owned()).map_err(|error| error.to_string())
+    }
 }

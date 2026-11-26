@@ -904,3 +904,119 @@ test expect_trap "expected bounds":
     assert!(diag.contains("in overlay_bad.blot"), "{diag}");
     assert!(!diag.contains(".fixture.blot"), "{diag}");
 }
+
+#[test]
+fn runs_real_stage0_generator_tests() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let blot = repository.join("../blot2");
+    let compiler = std::env::var_os("BLOT_TEST_COMPILER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| blot.join("compiler-goose/build/blotc-goose"));
+    let component = std::env::var_os("PEN_TEST_BLOT_PLUGIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository.join("plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm"));
+    let std_root = blot.join("std");
+    let blot2_examples = blot.join("examples/generators");
+    if !compiler.is_file()
+        || !component.is_file()
+        || !std_root.is_dir()
+        || !blot2_examples.join("wgsl_gen.blot").is_file()
+    {
+        crate::fixtures::missing(
+            "stage0 generator tests need blotc-goose, the WASI Blot plugin, Blot std, and examples",
+        );
+        return;
+    }
+
+    struct Project(PathBuf);
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let project = Project(std::env::temp_dir().join(format!("pen-stage0-generators-{}", std::process::id())));
+    let root = &project.0;
+    let _ = std::fs::remove_dir_all(root);
+    std::fs::create_dir_all(root.join("tools")).unwrap();
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    std::fs::create_dir_all(root.join("raw")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::copy(blot2_examples.join("wgsl_gen.blot"), root.join("tools/wgsl_gen.blot")).unwrap();
+    std::fs::copy(blot2_examples.join("csv_gen.blot"), root.join("tools/csv_gen.blot")).unwrap();
+    std::fs::copy(blot2_examples.join("literals.blot"), root.join("tools/literals.blot")).unwrap();
+    std::fs::write(
+        root.join("assets/salt.wgsl"),
+        "struct Parameters { clear: f32, active: bool };\nconst stage_light_slot = 16u;\nconst marker = -1.5;\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("raw/units.csv"), "name,hp,speed\nScout,25,3.5\nTank,100,1.25\n").unwrap();
+
+    let pen_json = serde_json::json!({
+        "plugins": {
+            "blot": {
+                "wasm": component,
+                "read": [std_root],
+                "run": { "blotc": compiler }
+            }
+        },
+        "compiler": {
+            "plugin": "blot",
+            "settings": {
+                "std": std_root,
+                "tests": { "entry": "tests/.fixture.blot" },
+                "generators": [
+                    { "match": "assets/*.wgsl", "generator": "tools/wgsl_gen.blot", "inputMode": "text" },
+                    { "module": "assets/units.csv", "input": "raw/units.csv", "generator": "tools/csv_gen.blot", "inputMode": "text" }
+                ]
+            }
+        }
+    });
+    std::fs::write(root.join("pen.json"), pen_json.to_string()).unwrap();
+
+    std::fs::write(
+        root.join("tests/generated.blot"),
+        r#"import * as t from "std/test"
+import { Parameters, stage_light_slot, marker } from "../assets/salt.wgsl"
+import { specs } from "../assets/units.csv"
+
+test "stage0 wgsl and csv virtual modules execute in pen test-blot":
+  return t.run (func () =>
+    let p = $Parameters { clear: 0.25, active: true }
+    let count = specs.length
+    let hp0 = specs[0].hp
+    let hp1 = specs[1].hp
+    let spd1 = specs[1].speed
+    use t.holds "active" p.active
+    use t.eq "slot" 16 stage_light_slot
+    use t.near "marker" 0.0001 (-1.5) marker
+    use t.eq "unit count" 2 count
+    use t.eq "scout hp" 25 hp0
+    use t.eq "tank hp" 100 hp1
+    use t.near "tank speed" 0.0001 1.25 spd1
+    return ()
+  )
+"#,
+    )
+    .unwrap();
+
+    let plugins = test_plugins(root).unwrap();
+    let checkout = plugins.root();
+    let engine = blot_host::dev_engine().unwrap();
+    let slots = Slots::new(2);
+    let modules: Vec<Module> = plugins
+        .tests(&checkout.join(ENTRY), &[], None)
+        .unwrap()
+        .into_iter()
+        .map(|test| Module::new(checkout, test))
+        .collect();
+    assert_eq!(modules.len(), 1);
+    let mut builder = None;
+    let ran = run_module(&mut builder, &plugins, &engine, &modules[0], None, &slots, None);
+    let lines = module_lines(&modules[0], &ran, None).join("\n");
+    let tests = ran.tests.unwrap_or_else(|_| panic!("{lines}"));
+    assert_eq!(
+        tests.tests.iter().map(|(name, outcome)| (name.as_str(), outcome.passed())).collect::<Vec<_>>(),
+        [("stage0 wgsl and csv virtual modules execute in pen test-blot", true)],
+        "{lines}"
+    );
+}

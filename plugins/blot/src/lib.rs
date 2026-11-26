@@ -55,6 +55,11 @@
 //! - `testMode`: export first-class tests and their metadata (default false).
 //! - `expectedIdentity`: the only compiler identity to accept, from its
 //!   hello.
+//! - `generators`: optional array of Stage-0 Blot virtual module rules
+//!   (`{ "module", "input", "generator", "exportName"?, "inputMode"? }` or
+//!   `{ "match": "dir/*.ext", "generator", "exportName"?, "inputMode"? }`).
+//!   Each generator runs as pure, zero-import ABI 8 Wasm with two-level SHA-256
+//!   caching and emits virtual `.blot` overlays for Stage 1.
 //! - `tests`: optional `entry` (a virtual file shared by test modules) and
 //!   `files` (the default module paths, overridden by explicit CLI files).
 //!   For libraries, `{"entry":"tests/test_fixture.blot"}` keeps relative
@@ -62,6 +67,7 @@
 //!
 //! A session watches the entry's directory, every import's directory, the
 //! standard library's and the prelude.
+mod generators;
 mod session;
 mod settings;
 mod suite;
@@ -72,8 +78,32 @@ mod component;
 pub mod native;
 
 pub use session::{Child, ReadError, Session};
-pub use settings::{CodegenTier, PROGRAM, Settings, TestSettings};
+pub use settings::{CodegenTier, GeneratorInputMode, GeneratorRule, PROGRAM, Settings, TestSettings};
 pub use suite::{Expectation, Files, TestModule, find as find_tests};
+
+/// Decoded `blot:traps` v1 provenance attached to a Stage-0 runtime trap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestTrapInfo {
+    pub kind: String,
+    pub message: String,
+    pub unit: u32,
+    pub start: u32,
+    pub end: u32,
+}
+
+/// Why running a compiled Stage-0 guest module failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuestCallError {
+    Invalid(String),
+    Trapped(String, Option<GuestTrapInfo>),
+    Timeout,
+}
+
+/// Runs a pure, zero-import Blot ABI 8 `Array U32 -> Array U32` Wasm guest
+/// (implemented by pen's `guest` WIT import in the Wasm component).
+pub trait GuestRunner {
+    fn run_u32_packet(&mut self, wasm: &[u8], export_name: &str, input: &[u32]) -> Result<Vec<u32>, GuestCallError>;
+}
 
 /// A program of the checkout's: its root, its entry file (absolute) and its
 /// settings, as JSON text ("{}" when none).

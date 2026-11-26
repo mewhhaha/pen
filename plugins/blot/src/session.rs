@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
+use crate::generators::{GeneratorCache, enrich_stage1_diagnostics};
 use crate::settings::{self, Settings};
-use crate::{Build, Diagnostic, Overlay, Program};
+use crate::{Build, Diagnostic, Files, GuestRunner, Overlay, Program};
 
 /// The protocol's name and version, as the compiler's hello gives them.
 const PROTOCOL: &str = "blot-zig-project";
@@ -86,6 +87,9 @@ pub struct Session<C: Child> {
     failure: Option<String>,
     root: String,
     entry: String,
+    settings: Settings,
+    cache_directory: String,
+    generators: GeneratorCache,
     watched: Vec<String>,
     identity: String,
     overlays: bool,
@@ -118,9 +122,12 @@ impl<C: Child> Session<C> {
             root: program.root.clone(),
             watched: settings.watched(&entry),
             entry,
+            native_assets: settings.native_assets.is_some(),
+            settings: settings.clone(),
+            cache_directory: cache_directory.to_owned(),
+            generators: GeneratorCache::default(),
             identity: String::new(),
             overlays: false,
-            native_assets: settings.native_assets.is_some(),
             epoch: String::new(),
             revision: 0,
             next_id: 1,
@@ -199,6 +206,60 @@ impl<C: Child> Session<C> {
     /// for this build only. An error is the compiler's failure (it has
     /// stopped), or overlays it could not be sent.
     pub fn build(&mut self, overlays: &[Overlay]) -> Result<Build, String> {
+        if !self.settings.generators.is_empty() {
+            return Err("generators require host files and guest runner interfaces (use build_with_host)".into());
+        }
+        self.build_raw(overlays)
+    }
+
+    /// Builds the program, running any configured Stage-0 Blot generators first
+    /// (with two-level caching and virtual `.blot` overlay injection).
+    pub fn build_with_host<F, G, S>(
+        &mut self,
+        overlays: &[Overlay],
+        files: &mut F,
+        guest: &mut G,
+        spawn: &mut S,
+    ) -> Result<Build, String>
+    where
+        F: Files,
+        G: GuestRunner,
+        S: FnMut(&str, &[String], &[(String, String)]) -> Result<C, String>,
+    {
+        if self.settings.generators.is_empty() {
+            return self.build_raw(overlays);
+        }
+        if let Some(failure) = &self.failure {
+            return Err(format!("the Blot compiler stopped after an earlier failure: {failure}"));
+        }
+        if self.child.is_none() {
+            return Err("the Blot compiler is closed".into());
+        }
+        let prepared = match self.generators.prepare(
+            &self.root,
+            &self.settings,
+            &self.identity,
+            &self.cache_directory,
+            &mut self.watched,
+            files,
+            guest,
+            spawn,
+        )? {
+            Ok(prepared) => prepared,
+            Err(diagnostics) => return Ok(Build::Rejected(diagnostics)),
+        };
+        let mut merged = prepared.overlays;
+        merged.extend(overlays.iter().cloned());
+        match self.build_raw(&merged)? {
+            Build::Built(wasm) => Ok(Build::Built(wasm)),
+            Build::Rejected(mut diagnostics) => {
+                enrich_stage1_diagnostics(&mut diagnostics, &prepared.virtual_modules);
+                Ok(Build::Rejected(diagnostics))
+            }
+        }
+    }
+
+    fn build_raw(&mut self, overlays: &[Overlay]) -> Result<Build, String> {
         if let Some(failure) = &self.failure {
             return Err(format!("the Blot compiler stopped after an earlier failure: {failure}"));
         }

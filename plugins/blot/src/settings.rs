@@ -49,10 +49,51 @@ pub struct Settings {
     pub expected_identity: Option<String>,
     /// Native readers owned by blotc. Paths are resolved against the project.
     pub native_assets: Option<Value>,
+    /// Stage-0 Blot virtual module generator rules.
+    pub generators: Vec<GeneratorRule>,
     /// Export first-class test declarations and their metadata.
     pub test_mode: bool,
     /// Test layout, independent of a game entry.
     pub tests: TestSettings,
+}
+
+/// How raw asset bytes are handed to a Stage-0 Blot generator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GeneratorInputMode {
+    /// Raw byte values (`#[U32]`, one byte per element).
+    Bytes,
+    /// Strict UTF-8 decoded to Unicode scalar values (`Text`).
+    Text,
+}
+
+impl GeneratorInputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GeneratorInputMode::Bytes => "bytes",
+            GeneratorInputMode::Text => "text",
+        }
+    }
+
+    pub fn field_name(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+/// One Stage-0 Blot generator rule from `compiler.settings.generators`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratorRule {
+    /// Explicit virtual module path (absolute, inside checkout root).
+    pub module: Option<String>,
+    /// Explicit input file path (absolute, inside checkout root).
+    pub input: Option<String>,
+    /// Single-star glob `(directory, suffix)` such as `("/root/src/assets", ".wgsl")`.
+    pub match_glob: Option<(String, String)>,
+    /// Stage-0 `.blot` generator entry path (absolute).
+    pub generator: String,
+    /// Generator `#entry` function name (defaults to `"generate"`).
+    pub export_name: String,
+    /// Raw bytes (`Bytes`, default) or strict UTF-8 scalars (`Text`).
+    pub input_mode: GeneratorInputMode,
 }
 
 /// Optional test layout. Paths are absolute, resolved against the checkout.
@@ -129,7 +170,7 @@ impl Settings {
         let Value::Object(fields) = value else {
             return Err("the settings are not a JSON object".into());
         };
-        const KNOWN: [&str; 13] = [
+        const KNOWN: [&str; 14] = [
             "program",
             "imports",
             "std",
@@ -141,6 +182,7 @@ impl Settings {
             "storage",
             "expectedIdentity",
             "nativeAssets",
+            "generators",
             "testMode",
             "tests",
         ];
@@ -208,9 +250,59 @@ impl Settings {
             storage: storage(fields.get("storage"))?,
             expected_identity,
             native_assets: native_assets(fields.get("nativeAssets"), root)?,
+            generators: generators(fields.get("generators"), root)?,
             test_mode,
             tests: TestSettings::parse(fields.get("tests"), root)?,
         })
+    }
+
+    /// Serializes a copy of these settings suitable for compiling a Stage-0
+    /// generator module (keeps `program`, `imports`, `std`, `prelude`,
+    /// `dependencies`, `codegenTier`, `semanticWorkers`, `inferenceBudget`,
+    /// `storage`, `expectedIdentity`; enables `testMode` so Stage-0 `@panic`
+    /// and array bounds traps carry full `blot:traps` v1 source spans; omits
+    /// `nativeAssets`, `generators`, and `tests`).
+    pub fn for_stage0_json(&self) -> String {
+        let mut map = serde_json::Map::new();
+        map.insert("program".into(), Value::String(self.program.clone()));
+        map.insert("testMode".into(), Value::Bool(true));
+        if !self.imports.is_empty() {
+            let mut imports = serde_json::Map::new();
+            for (prefix, dir) in &self.imports {
+                imports.insert(prefix.clone(), Value::String(dir.clone()));
+            }
+            map.insert("imports".into(), Value::Object(imports));
+        }
+        if let Some(std) = &self.std {
+            map.insert("std".into(), Value::String(std.clone()));
+        }
+        match &self.prelude {
+            Some(prelude) => {
+                map.insert("prelude".into(), Value::String(prelude.clone()));
+            }
+            None => {
+                map.insert("prelude".into(), Value::Null);
+            }
+        }
+        if let Some(dependencies) = &self.dependencies {
+            map.insert("dependencies".into(), Value::String(dependencies.clone()));
+        }
+        if let Some(tier) = self.codegen_tier {
+            map.insert("codegenTier".into(), Value::String(tier.name().to_owned()));
+        }
+        if let Some(workers) = self.semantic_workers {
+            map.insert("semanticWorkers".into(), Value::from(workers));
+        }
+        if let Some(budget) = self.inference_budget {
+            map.insert("inferenceBudget".into(), Value::from(budget));
+        }
+        if let Some(storage) = &self.storage {
+            map.insert("storage".into(), storage.clone());
+        }
+        if let Some(identity) = &self.expected_identity {
+            map.insert("expectedIdentity".into(), Value::String(identity.clone()));
+        }
+        Value::Object(map).to_string()
     }
 
     /// The compiler's arguments.
@@ -251,12 +343,180 @@ impl Settings {
             }
             for import in assets["imports"].as_array().into_iter().flatten() {
                 if let Some(path) = import["path"].as_str() {
-                    watched.push(path.to_owned());
+                    let path = path.to_owned();
+                    if !watched.contains(&path) {
+                        watched.push(path);
+                    }
+                }
+            }
+        }
+        for rule in &self.generators {
+            for path in std::iter::once(&rule.generator)
+                .chain(rule.input.iter())
+                .chain(rule.match_glob.iter().map(|(dir, _)| dir))
+            {
+                if !watched.contains(path) {
+                    watched.push(path.clone());
                 }
             }
         }
         watched
     }
+}
+
+const MAX_GENERATOR_RULES: usize = 4096;
+
+const RESERVED_BLOT_IDENTIFIERS: [&str; 35] = [
+    "const", "let", "type", "data", "effect", "is", "func", "do", "use", "return", "break", "for", "ever", "continue",
+    "in", "case", "of", "if", "then", "else", "as", "import", "self", "where", "and", "or", "true", "false", "_",
+    "not", "own", "private", "export", "fork", "with",
+];
+
+fn is_valid_export_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else { return false };
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') && !RESERVED_BLOT_IDENTIFIERS.contains(&name)
+}
+
+fn check_relative_inside_root<'a>(path: &'a str, label: &str) -> Result<&'a str, String> {
+    if path.trim().is_empty()
+        || path.contains('\0')
+        || path.contains('\r')
+        || path.contains('\n')
+        || path.contains('\\')
+        || is_absolute(path)
+    {
+        return Err(format!("{label} must be a relative path inside the project"));
+    }
+    let mut depth: i32 = 0;
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+        if depth < 0 {
+            return Err(format!("{label} must stay inside the project"));
+        }
+    }
+    if depth == 0 {
+        return Err(format!("{label} must name a path inside the project"));
+    }
+    Ok(path)
+}
+
+fn check_plain_relative<'a>(path: &'a str, label: &str) -> Result<&'a str, String> {
+    let path = check_relative_inside_root(path, label)?;
+    if path.contains(['*', '?', '[', ']']) {
+        return Err(format!("{label} must name one path"));
+    }
+    Ok(path)
+}
+
+fn generators(value: Option<&Value>, root: &str) -> Result<Vec<GeneratorRule>, String> {
+    let items = match value {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) if items.len() <= MAX_GENERATOR_RULES => items,
+        Some(Value::Array(_)) => {
+            return Err(format!("generators must be an array of up to {MAX_GENERATOR_RULES} generator rules"));
+        }
+        Some(_) => return Err("the settings' `generators` is not an array".into()),
+    };
+    const FIELDS: [&str; 7] = ["module", "input", "match", "generator", "exportName", "inputMode", "reference"];
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let label = format!("generators[{index}]");
+        let Value::Object(fields) = item else {
+            return Err(format!("{label} must be an object"));
+        };
+        if let Some(unknown) = fields.keys().find(|key| !FIELDS.contains(&key.as_str())) {
+            return Err(format!("{label}: unknown field `{unknown}`"));
+        }
+        if fields.get("reference").is_some_and(|v| !v.is_null()) {
+            return Err(format!(
+                "{label}.reference is not supported in Pen; Pen references game assets through its asset catalog"
+            ));
+        }
+        let generator_raw = fields
+            .get("generator")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{label}.generator must be a path"))?;
+        if generator_raw.trim().is_empty()
+            || generator_raw.contains('\0')
+            || generator_raw.contains('\r')
+            || generator_raw.contains('\n')
+            || generator_raw.contains('\\')
+            || generator_raw.contains(['*', '?', '[', ']'])
+            || !generator_raw.ends_with(".blot")
+        {
+            return Err(format!("{label}.generator must be a .blot path"));
+        }
+        let generator = resolve(root, generator_raw);
+        let export_name = match fields.get("exportName") {
+            None | Some(Value::Null) => "generate".to_owned(),
+            Some(Value::String(name)) if is_valid_export_name(name) => name.clone(),
+            Some(_) => return Err(format!("{label}.exportName must be a Blot function name")),
+        };
+        let input_mode = match fields.get("inputMode") {
+            None | Some(Value::Null) => GeneratorInputMode::Bytes,
+            Some(Value::String(mode)) if mode == "bytes" => GeneratorInputMode::Bytes,
+            Some(Value::String(mode)) if mode == "text" => GeneratorInputMode::Text,
+            Some(_) => return Err(format!("{label}.inputMode must be \"bytes\" or \"text\"")),
+        };
+        if let Some(match_value) = fields.get("match").filter(|v| !v.is_null()) {
+            if fields.get("module").is_some_and(|v| !v.is_null()) || fields.get("input").is_some_and(|v| !v.is_null()) {
+                return Err(format!("{label} must use either `match` or `module` and `input`"));
+            }
+            let pattern =
+                match_value.as_str().ok_or_else(|| format!("{label}.match must be a pattern like dir/*.ext"))?;
+            let pattern = check_relative_inside_root(pattern, &format!("{label}.match"))?;
+            let (dir_rel, base) = match pattern.rsplit_once('/') {
+                Some((dir, base)) => (dir, base),
+                None => (".", pattern),
+            };
+            if dir_rel.contains(['*', '?', '[', ']']) {
+                return Err(format!("{label}.match must have the form dir/*.ext"));
+            }
+            let Some(suffix) = base.strip_prefix("*.") else {
+                return Err(format!("{label}.match must have the form dir/*.ext"));
+            };
+            if suffix.is_empty() || suffix.contains(['*', '?', '[', ']']) {
+                return Err(format!("{label}.match must have the form dir/*.ext"));
+            }
+            let dir = resolve(root, dir_rel);
+            out.push(GeneratorRule {
+                module: None,
+                input: None,
+                match_glob: Some((dir, format!(".{suffix}"))),
+                generator,
+                export_name,
+                input_mode,
+            });
+        } else {
+            let module = fields
+                .get("module")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{label}.module must be a relative path inside the project"))?;
+            let module = resolve(root, check_plain_relative(module, &format!("{label}.module"))?);
+            let input = fields
+                .get("input")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{label}.input must be a relative path inside the project"))?;
+            let input = resolve(root, check_plain_relative(input, &format!("{label}.input"))?);
+            out.push(GeneratorRule {
+                module: Some(module),
+                input: Some(input),
+                match_glob: None,
+                generator,
+                export_name,
+                input_mode,
+            });
+        }
+    }
+    Ok(out)
 }
 
 fn native_assets(value: Option<&Value>, root: &str) -> Result<Option<Value>, String> {
@@ -496,9 +756,85 @@ mod tests {
             (r#"{"tests": {"entry": ""}}"#, "`tests.entry` is not a path"),
             (r#"{"tests": {"files": "tests/a.blot"}}"#, "tests.files must be an array"),
             (r#"{"tests": {"files": [2]}}"#, "tests.files must be a path"),
+            (r#"{"generators": {}}"#, "`generators` is not an array"),
+            (r#"{"generators": [{"generator": "tools/g.txt", "match": "a/*.wgsl"}]}"#, ".blot path"),
+            (
+                r#"{"generators": [{"generator": "tools/g.blot", "match": "a/*.wgsl", "reference": {"type": "S", "export": "s"}}]}"#,
+                "reference is not supported in Pen",
+            ),
+            (
+                r#"{"generators": [{"generator": "tools/g.blot", "match": "a/*.wgsl", "module": "a.wgsl"}]}"#,
+                "either `match` or `module` and `input`",
+            ),
+            (
+                r#"{"generators": [{"generator": "tools/g.blot", "match": "../outside/*.wgsl"}]}"#,
+                "stay inside the project",
+            ),
+            (r#"{"generators": [{"generator": "tools/g.blot", "match": "a/*/*.wgsl"}]}"#, "dir/*.ext"),
+            (
+                r#"{"generators": [{"generator": "tools/g.blot", "module": "../escape.csv", "input": "data.csv"}]}"#,
+                "stay inside the project",
+            ),
+            (
+                r#"{"generators": [{"generator": "tools/g.blot", "module": "a.csv", "input": "data.csv", "exportName": "Bad"}]}"#,
+                "Blot function name",
+            ),
+            (
+                r#"{"generators": [{"generator": "tools/g.blot", "module": "a.csv", "input": "data.csv", "exportName": "func"}]}"#,
+                "Blot function name",
+            ),
+            (
+                r#"{"generators": [{"generator": "tools/g.blot", "module": "a.csv", "input": "data.csv", "inputMode": "json"}]}"#,
+                "inputMode",
+            ),
         ] {
             let error = Settings::parse(json, "/p").unwrap_err();
             assert!(error.contains(refusal), "{json}: {error}");
         }
+    }
+
+    #[test]
+    fn parses_stage0_generator_rules_watches_them_and_strips_them_for_stage0() {
+        let json = json!({
+            "std": "../blot2/std",
+            "imports": { "ink/": "../ink/lib/" },
+            "testMode": true,
+            "generators": [
+                {
+                    "module": "src/units.csv",
+                    "input": "data/units.csv",
+                    "generator": "tools/csv_gen.blot",
+                    "inputMode": "text"
+                },
+                {
+                    "match": "src/assets/*.wgsl",
+                    "generator": "../blot2/examples/generators/wgsl_gen.blot",
+                    "exportName": "reflect_wgsl"
+                }
+            ]
+        });
+        let settings = Settings::parse(&json.to_string(), "/proj").unwrap();
+        assert_eq!(settings.generators.len(), 2);
+        assert_eq!(settings.generators[0].module.as_deref(), Some("/proj/src/units.csv"));
+        assert_eq!(settings.generators[0].input.as_deref(), Some("/proj/data/units.csv"));
+        assert_eq!(settings.generators[0].generator, "/proj/tools/csv_gen.blot");
+        assert_eq!(settings.generators[0].export_name, "generate");
+        assert_eq!(settings.generators[0].input_mode, GeneratorInputMode::Text);
+
+        assert_eq!(settings.generators[1].match_glob, Some(("/proj/src/assets".to_owned(), ".wgsl".to_owned())));
+        assert_eq!(settings.generators[1].generator, "/blot2/examples/generators/wgsl_gen.blot");
+        assert_eq!(settings.generators[1].export_name, "reflect_wgsl");
+        assert_eq!(settings.generators[1].input_mode, GeneratorInputMode::Bytes);
+
+        let watched = settings.watched("/proj/src/main.blot");
+        assert!(watched.contains(&"/proj/tools/csv_gen.blot".to_owned()), "{watched:?}");
+        assert!(watched.contains(&"/proj/data/units.csv".to_owned()), "{watched:?}");
+        assert!(watched.contains(&"/proj/src/assets".to_owned()), "{watched:?}");
+
+        let stage0 = Settings::parse(&settings.for_stage0_json(), "/proj").unwrap();
+        assert!(stage0.generators.is_empty());
+        assert!(stage0.test_mode);
+        assert_eq!(stage0.std.as_deref(), Some("/blot2/std"));
+        assert_eq!(stage0.imports, [("ink/".to_owned(), "/ink/lib".to_owned())]);
     }
 }

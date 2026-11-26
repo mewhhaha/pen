@@ -10,7 +10,7 @@
 /// Each call into a plugin has a deadline (pen.json's `timeout`): past it,
 /// a wait on a program it runs ends as a timeout, and soon after the call
 /// traps.
-package pen:plugin@0.2.0;
+package pen:plugin@0.3.0;
 
 /// What plugins and pen exchange.
 interface types {
@@ -109,6 +109,35 @@ interface process {
     cache-directory: func() -> string;
 }
 
+/// Running a pure, zero-import Blot ABI 8 Wasm module built by the plugin
+/// (such as a Stage-0 generator), in a fresh sandboxed instance with bounded
+/// memory and the call's deadline.
+interface guest {
+    /// Decoded `blot:traps` v1 provenance attached to a runtime trap, when present.
+    record trap-info {
+        kind: string,
+        message: string,
+        unit: u32,
+        start: u32,
+        end: u32,
+    }
+
+    /// Why running the guest failed.
+    variant call-error {
+        /// Invalid Wasm, unsupported ABI, unexpected host imports, or signature mismatch.
+        invalid(string),
+        /// Guest trapped at runtime (diagnostic text and optional decoded `blot:traps` v1).
+        trapped(tuple<string, option<trap-info>>),
+        /// Exceeded the plugin call's deadline.
+        timeout,
+    }
+
+    /// Compiles `wasm` once (cached by SHA-256 across sessions in this host),
+    /// verifies it is a zero-import ABI 8 module whose `export-name` takes
+    /// `Array U32` and returns `Array U32`, and runs it in a fresh instance.
+    run-u32-packet: func(wasm: list<u8>, export-name: string, input: list<u32>) -> result<list<u32>, call-error>;
+}
+
 /// Turning a program's sources into a Wasm module. pen opens one compiler per
 /// program it builds, builds it, and builds it again whenever a file under
 /// one of its watched paths changes, until it closes it.
@@ -186,6 +215,7 @@ world compiler-plugin {
     import log;
     import files;
     import process;
+    import guest;
     export compiler;
     export tests;
 }

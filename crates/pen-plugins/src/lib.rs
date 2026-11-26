@@ -43,6 +43,7 @@ use wasmtime::{Engine, Store};
 
 pub mod api;
 pub mod cache;
+mod guest;
 mod host;
 mod watch;
 
@@ -151,6 +152,7 @@ pub struct Plugins {
     root: PathBuf,
     config: Config,
     engine: Engine,
+    guests: Arc<guest::GuestRuntime>,
     log: Logger,
     linked: Mutex<HashMap<String, bindings::CompilerPluginPre<host::State>>>,
 }
@@ -164,12 +166,16 @@ fn program(root: &Path, entry: &Path, settings: &Option<serde_json::Value>) -> b
     }
 }
 
-/// Ticks `engine`'s epoch for as long as it is used.
-fn tick(engine: &Engine) -> Result<()> {
+/// Ticks `engine` and `guest_engine`'s epochs for as long as `engine` is used.
+fn tick(engine: &Engine, guest_engine: &Engine) -> Result<()> {
     let engine = engine.weak();
+    let guest_engine = guest_engine.weak();
     std::thread::Builder::new().name("pen-plugin-epoch".into()).spawn(move || {
         while let Some(engine) = engine.upgrade() {
             engine.increment_epoch();
+            if let Some(guest_engine) = guest_engine.upgrade() {
+                guest_engine.increment_epoch();
+            }
             drop(engine);
             std::thread::sleep(TICK);
         }
@@ -221,9 +227,10 @@ impl Plugins {
         let mut engine = wasmtime::Config::new();
         engine.wasm_component_model(true).epoch_interruption(true);
         let engine = Engine::new(&engine)?;
-        tick(&engine)?;
+        let guests = Arc::new(guest::GuestRuntime::new()?);
+        tick(&engine, guests.engine())?;
         let root = root.canonicalize()?;
-        Ok(Some(Arc::new(Plugins { root, config, engine, log, linked: Mutex::new(HashMap::new()) })))
+        Ok(Some(Arc::new(Plugins { root, config, engine, guests, log, linked: Mutex::new(HashMap::new()) })))
     }
 
     pub fn config(&self) -> &Config {
@@ -303,7 +310,8 @@ impl Plugins {
         let plugin = self.config.plugins.get(name).ok_or_else(|| anyhow!("pen.json names no plugin {name}"))?;
         let cache = cache_root().join("plugins").join(name);
         let grants = host::grants(&self.root, &plugin.read, &plugin.run, cache)?;
-        let mut store = Store::new(&self.engine, host::State::new(Arc::new(grants), self.log.clone()));
+        let mut store =
+            Store::new(&self.engine, host::State::new(Arc::new(grants), self.guests.clone(), self.log.clone()));
         store.limiter(|state| &mut state.limits);
         let timeout = self.timeout(name);
         let plugin = within(&mut store, timeout, |store| linked.instantiate(store))

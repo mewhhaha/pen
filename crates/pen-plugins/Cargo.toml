@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+pen-runtime.workspace = true
 # Components and Cranelift to compile them: plugins are a development tool,
 # in the builds that compile (pen's `plugins` feature).
 wasmtime = { workspace = true, features = ["component-model", "cranelift"] }

@@ -44,6 +44,10 @@ pub trait Files {
     /// The names in a directory, sorted.
     fn read_directory(&mut self, directory: &str) -> Result<Vec<String>, String>;
     fn is_file(&mut self, path: &str) -> bool;
+    /// Canonicalizes `path` (following symlinks and verifying read grants).
+    fn canonical(&mut self, path: &str) -> Result<String, String> {
+        Ok(path.to_owned())
+    }
 }
 
 /// What a module's tests must do.

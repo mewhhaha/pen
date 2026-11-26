@@ -226,11 +226,23 @@ A checkout selects its compiler in `pen.json`:
     "settings": {
       "std": "../blot2/std",
       "imports": { "game/": "src/", "pen/": "pen/" },
-      "nativeAssets": { "roots": ["src", "devtools"] }
+      "nativeAssets": { "roots": ["src", "devtools"] },
+      "generators": [
+        { "match": "src/assets/*.wgsl", "generator": "tools/wgsl_gen.blot", "inputMode": "text" },
+        { "module": "src/units.csv", "input": "data/units.csv", "generator": "tools/csv_gen.blot", "inputMode": "text" }
+      ]
     }
   }
 }
 ```
+
+Stage-0 `generators` compile pure `.blot` modules (exporting `#entry func
+generate` or `exportName`) to zero-import ABI 8 Wasm, cache both the compiled
+generator per source graph and the generated virtual `.blot` module per input
+digest, and inject the virtual modules into Stage 1 builds and `pen test-blot`
+(as well as `pen dev` hot-reload watching). Rules accept `module` + `input` or
+a single-star `match` pattern (`dir/*.ext`) with `inputMode` `"bytes"` (default)
+or `"text"`.
 
 Ordinary `pen test-blot` also accepts a library with only `pen.json`, without
 `src/main.blot`, assets or a renderer. The Blot plugin's compiler settings can

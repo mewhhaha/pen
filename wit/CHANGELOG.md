@@ -25,6 +25,15 @@ was built for in every interface it imports from pen or exports to it
   interfaces that does not add an entry fails `cargo test -p pen-plugins`,
   saying the shape to record.
 
+## 0.3.0 (2026-11-26)
+
+Shape: `bc736c564b5563bb4afd06d1f37ad4790004dd70ceba4e188c27068788be3484`
+
+- Added the `guest` interface to `compiler-plugin` (`run-u32-packet`, `trap-info`,
+  `call-error`) so compiler plugins can execute pure, zero-import Blot ABI 8
+  Wasm modules (Stage-0 generators) in fresh sandboxed instances with host-cached
+  compilation, bounded memory, deadline enforcement, and `blot:traps` v1 decoding.
+
 ## 0.2.0 (2026-10-16, 52a55af)
 
 Shape: `1e7ba4e0252d7a27e5cc83720c87e6d6cedb2363f6fb2fd21a8776fa9b0e7625`

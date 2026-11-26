@@ -347,3 +347,308 @@ fn builds_again_on_the_changes_a_callers_watcher_sends() {
     drop(watching);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[cfg(unix)]
+#[test]
+fn stage0_wgsl_and_csv_generators_cache_adapt_and_report_provenance() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some((component, compiler, std)) = parts() else {
+        eprintln!("skipped: no Blot plugin component or blot2 checkout");
+        return;
+    };
+    let examples = repository().join("../blot2/examples/generators");
+    if !examples.join("wgsl_gen.blot").is_file() {
+        eprintln!("skipped: no blot2/examples/generators");
+        return;
+    }
+
+    let root = empty();
+    std::fs::create_dir_all(root.join("tools")).unwrap();
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    std::fs::create_dir_all(root.join("raw")).unwrap();
+    std::fs::create_dir_all(root.join("data")).unwrap();
+
+    // Unpack blotc if `.gz` so our counting wrapper runs the exact compiler binary.
+    let real_compiler = if compiler.extension().is_some_and(|e| e == "gz") {
+        let unpacked = root.join("blotc-bin");
+        let packed = std::fs::read(&compiler).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&packed[..]), &mut bytes).unwrap();
+        std::fs::write(&unpacked, bytes).unwrap();
+        std::fs::set_permissions(&unpacked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        unpacked
+    } else {
+        compiler
+    };
+    let spawn_log = root.join("spawns.log");
+    let wrapper = root.join("blotc-wrap");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf 'spawn\\n' >> '{}'\nexec '{}' \"$@\"\n",
+            spawn_log.display(),
+            real_compiler.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let spawn_count = || -> usize { std::fs::read_to_string(&spawn_log).map(|s| s.lines().count()).unwrap_or(0) };
+
+    std::fs::copy(examples.join("wgsl_gen.blot"), root.join("tools/wgsl_gen.blot")).unwrap();
+    std::fs::copy(examples.join("csv_gen.blot"), root.join("tools/csv_gen.blot")).unwrap();
+    std::fs::copy(examples.join("literals.blot"), root.join("tools/literals.blot")).unwrap();
+    // Record-input `{ path, text }` -> plain `Text` generator.
+    std::fs::write(
+        root.join("tools/path_gen.blot"),
+        r#"import * as text from "std/text"
+#entry func make_meta (input: { path: Text, text: Text }): Text =>
+  let out = text.builder ()
+  out := text.append "const path_len: U32 = " self
+  out := text.append_u32 input.path.length self
+  out := text.append "\nconst text_len: U32 = " self
+  out := text.append_u32 input.text.length self
+  out := text.append "\n" self
+  return text.finish out
+"#,
+    )
+    .unwrap();
+    // Direct `bytes` -> `Text` generator (no Result wrapper).
+    std::fs::write(
+        root.join("tools/bytes_gen.blot"),
+        r#"import * as text from "std/text"
+#entry func generate (raw: #[U32]): Text =>
+  let total: U32 = 0
+  for b in raw:
+    total := self + b
+  let out = text.builder ()
+  out := text.append "const checksum: U32 = " self
+  out := text.append_u32 total self
+  out := text.append "\n" self
+  return text.finish out
+"#,
+    )
+    .unwrap();
+
+    let wgsl = r#"struct Parameters { clear: f32, active: bool };
+const stage_light_slot = 16u;
+const building_marker = -1.0;
+"#;
+    std::fs::write(root.join("assets/salt.wgsl"), wgsl).unwrap();
+    std::fs::write(root.join("raw/units.csv"), "name,hp,speed\nScout,25,3.5\nTank,100,1.25\n").unwrap();
+    std::fs::write(root.join("raw/note.txt"), "hello").unwrap();
+    std::fs::write(root.join("raw/blob.bin"), [1u8, 2, 3, 4]).unwrap();
+
+    std::fs::write(
+        root.join("main.blot"),
+        r#"import { Parameters, stage_light_slot, building_marker } from "./assets/salt.wgsl"
+import { specs } from "./data/units.csv"
+import { path_len, text_len } from "./data/note.txt"
+import { checksum } from "./data/blob.bin"
+
+#entry func summary (): U32 =>
+  let p = $Parameters { clear: 1.0, active: true }
+  let bonus = if p.active then stage_light_slot else 0
+  let mark = if building_marker < 0.0 then 100 else 0
+  return bonus + mark + specs[0].hp + specs[1].hp + text_len + checksum + (if path_len > 0 then 1 else 0)
+"#,
+    )
+    .unwrap();
+
+    let config = serde_json::json!({
+        "plugins": {
+            "blot": {
+                "wasm": component,
+                "read": [std],
+                "run": { "blotc": wrapper },
+            },
+        },
+        "compiler": {
+            "plugin": "blot",
+            "settings": {
+                "std": std,
+                "generators": [
+                    { "match": "assets/*.wgsl", "generator": "tools/wgsl_gen.blot", "inputMode": "text" },
+                    { "module": "data/units.csv", "input": "raw/units.csv", "generator": "tools/csv_gen.blot", "inputMode": "text" },
+                    { "module": "data/note.txt", "input": "raw/note.txt", "generator": "tools/path_gen.blot", "exportName": "make_meta", "inputMode": "text" },
+                    { "module": "data/blob.bin", "input": "raw/blob.bin", "generator": "tools/bytes_gen.blot" }
+                ]
+            },
+        },
+    });
+    std::fs::write(root.join("pen.json"), config.to_string()).unwrap();
+    let root = root.canonicalize().unwrap();
+    let (plugins, _) = plugins(&root);
+    let entry = root.join("main.blot");
+    let mut session = plugins.compiler(&entry).unwrap();
+
+    // Build 1: 1 Stage-1 session + 4 Stage-0 compilations = 5 blotc spawns.
+    let BuildResult::Built(wasm1) = session.build(&[]).unwrap() else { panic!("build 1 must succeed") };
+    assert_eq!(&wasm1[..4], b"\0asm");
+    let spawns_after_1 = spawn_count();
+    assert_eq!(spawns_after_1, 5, "expected 1 Stage-1 + 4 Stage-0 spawns");
+
+    // Build 2 (unchanged): Level-1 & Level-2 cache hits -> zero extra spawns, byte-identical Wasm.
+    let BuildResult::Built(wasm2) = session.build(&[]).unwrap() else { panic!("build 2 must succeed") };
+    assert_eq!(wasm2, wasm1);
+    assert_eq!(spawn_count(), spawns_after_1);
+
+    // Build 3 (edit asset input only): Level-1 cache hit -> zero Stage-0 recompiles, updated Wasm!
+    std::fs::write(root.join("assets/salt.wgsl"), wgsl.replace("16u", "24u")).unwrap();
+    let BuildResult::Built(wasm3) = session.build(&[]).unwrap() else { panic!("build 3 must succeed") };
+    assert_ne!(wasm3, wasm1);
+    assert_eq!(spawn_count(), spawns_after_1, "editing .wgsl must reuse compiled Stage-0 Wasm");
+
+    // Build 4 (edit generator itself): recompiles only wgsl_gen.blot (+1 spawn).
+    let wgsl_gen_path = root.join("tools/wgsl_gen.blot");
+    let orig_gen = std::fs::read_to_string(&wgsl_gen_path).unwrap();
+    std::fs::write(&wgsl_gen_path, orig_gen.replace("text.from_u32 value", "text.from_u32 (value + 1)")).unwrap();
+    let BuildResult::Built(wasm4) = session.build(&[]).unwrap() else { panic!("build 4 must succeed") };
+    assert_ne!(wasm4, wasm3);
+    assert_eq!(spawn_count(), spawns_after_1 + 1, "editing wgsl_gen.blot must recompile Stage 0 once");
+
+    // Build 5 (edit transitive import `literals.blot`): invalidates generators importing it.
+    let lit_path = root.join("tools/literals.blot");
+    let orig_lit = std::fs::read_to_string(&lit_path).unwrap();
+    std::fs::write(&lit_path, orig_lit.replace("if start == 1:", "if false:")).unwrap();
+    let BuildResult::Built(wasm5) = session.build(&[]).unwrap() else { panic!("build 5 must succeed") };
+    assert_ne!(wasm5, wasm4);
+    assert!(spawn_count() > spawns_after_1 + 1, "editing transitive import must recompile Stage 0");
+
+    // Restore valid generator/helper, then verify `$Err` diagnostic provenance.
+    std::fs::write(&wgsl_gen_path, &orig_gen).unwrap();
+    std::fs::write(&lit_path, &orig_lit).unwrap();
+    std::fs::write(root.join("assets/salt.wgsl"), "struct Parameters { clear: texture_2d };\n").unwrap();
+    let BuildResult::Rejected(diags) = session.build(&[]).unwrap() else { panic!("malformed wgsl must reject") };
+    assert_eq!(diags[0].stage, "asset");
+    assert_eq!(diags[0].code, "asset_import");
+    assert!(diags[0].message.contains("Unsupported WGSL field type in Parameters"), "{diags:?}");
+    let details: serde_json::Value = serde_json::from_str(diags[0].details.as_deref().unwrap()).unwrap();
+    assert_eq!(details["provenance"]["phase"], "result");
+
+    // Verify Stage-0 runtime `@panic` and bounds trap provenance (decoded `blot:traps` v1 + exact generator spans).
+    std::fs::write(root.join("assets/salt.wgsl"), wgsl).unwrap();
+    std::fs::write(
+        root.join("tools/bytes_gen.blot"),
+        "#entry func generate (raw: #[U32]): Text =>\n  @panic \"boom stage0\"\n",
+    )
+    .unwrap();
+    let BuildResult::Rejected(diags) = session.build(&[]).unwrap() else { panic!("panicking generator must reject") };
+    assert_eq!(diags[0].code, "asset_import");
+    assert!(diags[0].message.contains("panic: \"boom stage0\""), "{diags:?}");
+    assert_eq!(Path::new(&diags[0].file), root.join("tools/bytes_gen.blot"), "{diags:?}");
+    assert!(diags[0].end > diags[0].start, "expected non-empty panic trap span: {diags:?}");
+    let details: serde_json::Value = serde_json::from_str(diags[0].details.as_deref().unwrap()).unwrap();
+    assert_eq!(details["provenance"]["phase"], "execute");
+    assert_eq!(Path::new(details["provenance"]["generator"].as_str().unwrap()), root.join("tools/bytes_gen.blot"));
+
+    std::fs::write(
+        root.join("tools/bytes_gen.blot"),
+        "#entry func generate (raw: #[U32]): Text =>\n  let _ = raw[999]\n  return \"\"\n",
+    )
+    .unwrap();
+    let BuildResult::Rejected(diags) = session.build(&[]).unwrap() else { panic!("OOB generator must reject") };
+    assert_eq!(diags[0].code, "asset_import");
+    assert!(diags[0].message.contains("index out of bounds"), "{diags:?}");
+    assert_eq!(Path::new(&diags[0].file), root.join("tools/bytes_gen.blot"), "{diags:?}");
+    assert!(diags[0].end > diags[0].start, "expected non-empty bounds trap span: {diags:?}");
+
+    // Verify Stage-1 error inside a generated virtual module carries `virtual_source` + `provenance`.
+    std::fs::write(
+        root.join("tools/bytes_gen.blot"),
+        "#entry func generate (raw: #[U32]): Text => return \"const checksum: Bool = 123\\n\"\n",
+    )
+    .unwrap();
+    let BuildResult::Rejected(diags) = session.build(&[]).unwrap() else { panic!("bad generated Blot must reject") };
+    let vdiag = diags.iter().find(|d| d.file.ends_with("data/blob.bin.blot")).expect("virtual module diag");
+    let details: serde_json::Value = serde_json::from_str(vdiag.details.as_deref().unwrap()).unwrap();
+    assert!(details["virtual_source"].as_str().unwrap().contains("const checksum: Bool = 123"));
+    assert_eq!(details["provenance"]["phase"], "generated_source");
+
+    let watched = session.watched().unwrap();
+    assert!(watched.contains(&root.join("tools/wgsl_gen.blot")), "{watched:?}");
+    assert!(watched.contains(&root.join("tools/literals.blot")), "{watched:?}");
+    assert!(watched.contains(&root.join("assets")), "{watched:?}");
+
+    drop(session);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn stage0_watch_rebuilds_on_asset_edit_and_generator_edit() {
+    let Some((component, compiler, std)) = parts() else {
+        eprintln!("skipped: no Blot plugin component or blot2 checkout");
+        return;
+    };
+    let examples = repository().join("../blot2/examples/generators");
+    if !examples.join("wgsl_gen.blot").is_file() {
+        eprintln!("skipped: no blot2/examples/generators");
+        return;
+    }
+
+    let root = empty();
+    std::fs::create_dir_all(root.join("tools")).unwrap();
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    std::fs::copy(examples.join("wgsl_gen.blot"), root.join("tools/wgsl_gen.blot")).unwrap();
+    std::fs::copy(examples.join("literals.blot"), root.join("tools/literals.blot")).unwrap();
+    std::fs::write(root.join("assets/salt.wgsl"), "const slot = 10u;\n").unwrap();
+    std::fs::write(
+        root.join("main.blot"),
+        "import { slot } from \"./assets/salt.wgsl\"\n#entry func answer (): U32 => return slot\n",
+    )
+    .unwrap();
+    let config = serde_json::json!({
+        "plugins": { "blot": { "wasm": component, "read": [std], "run": { "blotc": compiler } } },
+        "compiler": {
+            "plugin": "blot",
+            "settings": {
+                "std": std,
+                "generators": [{ "match": "assets/*.wgsl", "generator": "tools/wgsl_gen.blot", "inputMode": "text" }]
+            }
+        }
+    });
+    std::fs::write(root.join("pen.json"), config.to_string()).unwrap();
+    let root = root.canonicalize().unwrap();
+    let (plugins, _) = plugins(&root);
+    let (outcomes, built) = std::sync::mpsc::channel();
+    let (changes, changed) = std::sync::mpsc::channel();
+    let watching =
+        pen_plugins::watch_changes(plugins, &root.join("main.blot"), Vec::new(), changed, move |outcome, watched| {
+            let wasm = match outcome {
+                Outcome::Built(b) => Ok(b.wasm),
+                Outcome::Rejected(d) => Err(format!("{d:?}")),
+                Outcome::Failed(e) => Err(e),
+            };
+            let _ = outcomes.send((wasm, watched.clone()));
+        })
+        .unwrap();
+
+    let (first, watched) = built.recv_timeout(Duration::from_secs(60)).expect("initial build");
+    let wasm1 = first.expect("initial build succeeds");
+    assert!(watched.contains(&root.join("assets")), "{watched:?}");
+    assert!(watched.contains(&root.join("tools/wgsl_gen.blot")), "{watched:?}");
+    assert!(watched.contains(&root.join("tools/literals.blot")), "{watched:?}");
+
+    // Editing the WGSL file triggers an automatic rebuild with new Wasm.
+    std::fs::write(root.join("assets/salt.wgsl"), "const slot = 99u;\n").unwrap();
+    changes.send(vec![root.join("assets/salt.wgsl")]).unwrap();
+    let (second, _) = built.recv_timeout(Duration::from_secs(60)).expect("asset rebuild");
+    let wasm2 = second.expect("asset edit builds");
+    assert_ne!(wasm2, wasm1);
+
+    // Editing the Stage-0 generator itself also triggers a rebuild.
+    let gen_src = std::fs::read_to_string(root.join("tools/wgsl_gen.blot")).unwrap();
+    std::fs::write(
+        root.join("tools/wgsl_gen.blot"),
+        gen_src.replace("text.from_u32 value", "text.from_u32 (value + 5)"),
+    )
+    .unwrap();
+    changes.send(vec![root.join("tools/wgsl_gen.blot")]).unwrap();
+    let (third, _) = built.recv_timeout(Duration::from_secs(60)).expect("generator rebuild");
+    let wasm3 = third.expect("generator edit builds");
+    assert_ne!(wasm3, wasm2);
+
+    drop(changes);
+    drop(watching);
+    let _ = std::fs::remove_dir_all(&root);
+}

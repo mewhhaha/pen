@@ -2996,6 +2996,7 @@ dependencies = [
  "dirs",
  "flate2",
  "notify",
+ "pen-runtime",
  "serde",
  "serde_json",
  "sha2",

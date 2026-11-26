@@ -10,7 +10,7 @@ wit_bindgen::generate!({ path: "../../wit", world: "compiler-plugin" });
 use exports::pen::plugin::compiler::{self, BuildResult, GuestSession};
 use exports::pen::plugin::tests;
 use pen::plugin::log::{self, Level};
-use pen::plugin::{files, process, types};
+use pen::plugin::{files, guest, process, types};
 
 struct Plugin;
 
@@ -34,6 +34,37 @@ impl crate::Files for Granted {
 
     fn is_file(&mut self, path: &str) -> bool {
         files::is_file(path)
+    }
+
+    fn canonical(&mut self, path: &str) -> Result<String, String> {
+        files::canonical(path)
+    }
+}
+
+/// Runs pure, zero-import Stage-0 Blot ABI 8 modules through pen's `guest` import.
+struct HostGuest;
+
+impl crate::GuestRunner for HostGuest {
+    fn run_u32_packet(
+        &mut self,
+        wasm: &[u8],
+        export_name: &str,
+        input: &[u32],
+    ) -> Result<Vec<u32>, crate::GuestCallError> {
+        guest::run_u32_packet(wasm, export_name, input).map_err(|error| match error {
+            guest::CallError::Invalid(message) => crate::GuestCallError::Invalid(message),
+            guest::CallError::Trapped((message, trap)) => crate::GuestCallError::Trapped(
+                message,
+                trap.map(|info| crate::GuestTrapInfo {
+                    kind: info.kind,
+                    message: info.message,
+                    unit: info.unit,
+                    start: info.start,
+                    end: info.end,
+                }),
+            ),
+            guest::CallError::Timeout => crate::GuestCallError::Timeout,
+        })
     }
 }
 
@@ -115,7 +146,9 @@ impl GuestSession for Compiler {
     fn build(&self, overlays: Vec<types::Overlay>) -> Result<BuildResult, String> {
         let overlays: Vec<Overlay> =
             overlays.into_iter().map(|overlay| Overlay { path: overlay.path, contents: overlay.contents }).collect();
-        Ok(match self.0.borrow_mut().build(&overlays)? {
+        let mut spawn =
+            |name: &str, args: &[String], env: &[(String, String)]| process::spawn(name, args, env).map(Process);
+        Ok(match self.0.borrow_mut().build_with_host(&overlays, &mut Granted, &mut HostGuest, &mut spawn)? {
             Build::Built(wasm) => BuildResult::Built(wasm),
             Build::Rejected(diagnostics) => BuildResult::Rejected(
                 diagnostics

@@ -20,7 +20,8 @@ use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
 use wasmtime_wasi::p2::{OutputStream, Pollable, StreamResult};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::bindings::pen::plugin::{files, log, process, types};
+use crate::bindings::pen::plugin::{files, guest, log, process, types};
+use crate::guest::GuestRuntime;
 
 /// How much of a child's standard error is kept, and the longest line of a
 /// plugin's own output.
@@ -70,6 +71,7 @@ pub struct State {
     wasi: WasiCtx,
     table: ResourceTable,
     grants: Arc<Grants>,
+    guests: Arc<GuestRuntime>,
     log: Logger,
     pub limits: StoreLimits,
     /// When the call into the plugin under way must end: the host's waits
@@ -78,7 +80,7 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(grants: Arc<Grants>, log: Logger) -> State {
+    pub fn new(grants: Arc<Grants>, guests: Arc<GuestRuntime>, log: Logger) -> State {
         // Its output's lines reach pen's log; no files, environment or
         // network.
         let wasi = WasiCtxBuilder::new()
@@ -86,7 +88,7 @@ impl State {
             .stderr(LogOutput::new(log.clone(), Level::Error))
             .build();
         let limits = StoreLimitsBuilder::new().memory_size(MEMORY).table_elements(TABLE_ELEMENTS).build();
-        State { wasi, table: ResourceTable::new(), grants, log, limits, deadline: None }
+        State { wasi, table: ResourceTable::new(), grants, guests, log, limits, deadline: None }
     }
 
     /// How long a wait of up to `timeout_ms` (none: no end) may last: until
@@ -440,6 +442,17 @@ impl process::HostChild for State {
     }
 }
 
+impl guest::Host for State {
+    fn run_u32_packet(
+        &mut self,
+        wasm: Vec<u8>,
+        export_name: String,
+        input: Vec<u32>,
+    ) -> std::result::Result<Vec<u32>, guest::CallError> {
+        self.guests.run_u32_packet(&wasm, &export_name, &input, self.deadline)
+    }
+}
+
 /// The checkout-relative or absolute `path`, made canonical when it exists.
 pub fn resolve(root: &Path, path: &str) -> PathBuf {
     let joined = root.join(path);
@@ -483,7 +496,8 @@ mod tests {
     #[test]
     fn bounds_waits_by_the_calls_deadline() {
         let grants = Grants { root: PathBuf::new(), read: Vec::new(), run: HashMap::new(), cache: PathBuf::new() };
-        let mut state = State::new(Arc::new(grants), Arc::new(|_, _| {}));
+        let guests = Arc::new(GuestRuntime::new().unwrap());
+        let mut state = State::new(Arc::new(grants), guests, Arc::new(|_, _| {}));
         assert_eq!(state.bounded(None), None);
         assert_eq!(state.bounded(Some(20)), Some(Duration::from_millis(20)));
         state.deadline = Some(Instant::now() + Duration::from_secs(5));

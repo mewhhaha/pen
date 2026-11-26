@@ -84,26 +84,39 @@ fn lut_lookup(lut: texture_2d<f32>, size: i32, v: vec3f) -> vec3f {
 // Linear light `light` at `uv` of the picture, graded.
 fn grade_apply(g: Grade, lut_a: texture_2d<f32>, lut_b: texture_2d<f32>, light: vec3f, uv: vec2f) -> vec3f {
   var c = max(light, vec3f(0.0));
-  c = c * vignette_factor(g.vignette.x, min(g.vignette.y, 0.999), uv);
+  if (g.vignette.x > 0.0) {
+    c = c * vignette_factor(g.vignette.x, min(g.vignette.y, 0.999), uv);
+  }
   // White balance moves red and blue against each other along temperature, and
   // green against both along tint, summing to no change in stops.
   let t = g.basics.x;
   let s = g.basics.y;
-  c = c * exp2(vec3f(0.5 * t + 0.25 * s, -0.5 * s, -0.5 * t + 0.25 * s) + g.basics.z);
-  // Contrast turns the log encoding about the pivot's.
-  let pivot = cc_encode_one(g.tone.x);
-  c = cc_decode(clamp((cc_encode(c) - pivot) * g.basics.w + pivot, vec3f(CC_LOW), vec3f(CC_HIGH)));
+  if (t != 0.0 || s != 0.0 || g.basics.z != 0.0) {
+    c = c * exp2(vec3f(0.5 * t + 0.25 * s, -0.5 * s, -0.5 * t + 0.25 * s) + g.basics.z);
+  }
+  // Contrast turns the log encoding about the pivot's. Preserve the ACEScc half-float ceiling on identity.
+  if (g.basics.w != 1.0) {
+    let pivot = cc_encode_one(g.tone.x);
+    c = cc_decode(clamp((cc_encode(c) - pivot) * g.basics.w + pivot, vec3f(CC_LOW), vec3f(CC_HIGH)));
+  } else {
+    c = min(c, vec3f(65504.0));
+  }
   // ASC CDL, per channel.
-  c = pow(max(c * g.gain.xyz + g.lift.xyz, vec3f(0.0)), 1.0 / g.gamma.xyz);
+  c = max(c * g.gain.xyz + g.lift.xyz, vec3f(0.0));
+  if (any(g.gamma.xyz != vec3f(1.0))) {
+    c = pow(c, 1.0 / g.gamma.xyz);
+  }
   // Saturation about the luminance, and vibrance, which weighs it by how dull
   // (positive) or how vivid (negative) the color is.
-  let y = luminance(c);
-  let high = max(c.x, max(c.y, c.z));
-  let low = min(c.x, min(c.y, c.z));
-  let chroma = select(0.0, (high - low) / high, high > 1e-6);
-  let weight = select(chroma, 1.0 - chroma, g.tone.z > 0.0);
-  let k = g.tone.y * (1.0 + g.tone.z * weight);
-  c = max(c * k + vec3f(y * (1.0 - k)), vec3f(0.0));
+  if (g.tone.y != 1.0 || g.tone.z != 0.0) {
+    let y = luminance(c);
+    let high = max(c.x, max(c.y, c.z));
+    let low = min(c.x, min(c.y, c.z));
+    let chroma = select(0.0, (high - low) / high, high > 1e-6);
+    let weight = select(chroma, 1.0 - chroma, g.tone.z > 0.0);
+    let k = g.tone.y * (1.0 + g.tone.z * weight);
+    c = max(c * k + vec3f(y * (1.0 - k)), vec3f(0.0));
+  }
   // The tables, in log: what they do to the part of the encoding within 0..1, the
   // rest kept as it is, so black and the brightest highlights pass through.
   if (g.luts.x > 0.0 && g.tone.w > 0.0) {

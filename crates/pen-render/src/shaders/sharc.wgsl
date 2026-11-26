@@ -24,7 +24,7 @@ fn sharc_level(pos: vec3f, u: SharcUniform) -> u32 {
 }
 
 fn sharc_voxel_size(level: u32, u: SharcUniform) -> f32 {
-    return u.camera_and_voxel.w * exp2(f32(level));
+    return u.camera_and_voxel.w * f32(1u << level);
 }
 
 fn sharc_normal_face(nrm: vec3f) -> u32 {
@@ -176,13 +176,14 @@ fn sharc_resolve(@builtin(global_invocation_id) id: vec3u) {
         return;
     }
     let base = slot * 4u;
-    let r = atomicExchange(&sharc_accum[base], 0u);
-    let g = atomicExchange(&sharc_accum[base + 1u], 0u);
-    let b = atomicExchange(&sharc_accum[base + 2u], 0u);
-    let count = atomicExchange(&sharc_accum[base + 3u], 0u);
+    let count_peek = atomicLoad(&sharc_accum[base + 3u]);
     let prev = sharc_resolved[slot];
-    let accepted = min(count, SHARC_MAX_SAMPLES);
-    if (accepted > 0u) {
+    if (count_peek > 0u) {
+        let r = atomicExchange(&sharc_accum[base], 0u);
+        let g = atomicExchange(&sharc_accum[base + 1u], 0u);
+        let b = atomicExchange(&sharc_accum[base + 2u], 0u);
+        let count = atomicExchange(&sharc_accum[base + 3u], 0u);
+        let accepted = min(count, SHARC_MAX_SAMPLES);
         let avg = vec3f(f32(r), f32(g), f32(b)) / (sharc_u.params.y * f32(accepted));
         let filtered = select(avg, mix(prev.rgb, avg, sharc_u.params.x), prev.a > 0.5);
         sharc_resolved[slot] = vec4f(filtered, 1.0);

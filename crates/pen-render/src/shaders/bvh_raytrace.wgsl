@@ -43,42 +43,30 @@ fn hash23(p3: vec3f) -> vec2f {
   return fract((p.xx + p.yz) * p.zy);
 }
 
+struct BvhRayInv {
+  inv_dir: vec3f,
+  neg_origin_inv: vec3f,
+  parallel: vec3<bool>,
+};
+
+fn bvh_ray_inv(origin: vec3f, dir: vec3f) -> BvhRayInv {
+  let parallel = abs(dir) < vec3f(1e-12);
+  let safe_dir = select(dir, vec3f(1.0), parallel);
+  let inv_dir = 1.0 / safe_dir;
+  return BvhRayInv(inv_dir, -origin * inv_dir, parallel);
+}
+
 // Exact slab AABB intersection handling zero/parallel ray components without losing negative signs.
-fn ray_aabb_hit(origin: vec3f, dir: vec3f, bmin: vec3f, bmax: vec3f, t_min: f32, t_max: f32) -> f32 {
-  var t_enter = t_min;
-  var t_exit = t_max;
-
-  // X slab
-  if (abs(dir.x) < 1e-12) {
-    if (origin.x < bmin.x || origin.x > bmax.x) { return -1.0; }
-  } else {
-    let inv = 1.0 / dir.x;
-    let t0 = (bmin.x - origin.x) * inv;
-    let t1 = (bmax.x - origin.x) * inv;
-    t_enter = max(t_enter, min(t0, t1));
-    t_exit = min(t_exit, max(t0, t1));
+fn ray_aabb_hit_inv(origin: vec3f, ri: BvhRayInv, bmin: vec3f, bmax: vec3f, t_min: f32, t_max: f32) -> f32 {
+  if (any(ri.parallel & ((origin < bmin) | (origin > bmax)))) {
+    return -1.0;
   }
-  // Y slab
-  if (abs(dir.y) < 1e-12) {
-    if (origin.y < bmin.y || origin.y > bmax.y) { return -1.0; }
-  } else {
-    let inv = 1.0 / dir.y;
-    let t0 = (bmin.y - origin.y) * inv;
-    let t1 = (bmax.y - origin.y) * inv;
-    t_enter = max(t_enter, min(t0, t1));
-    t_exit = min(t_exit, max(t0, t1));
-  }
-  // Z slab
-  if (abs(dir.z) < 1e-12) {
-    if (origin.z < bmin.z || origin.z > bmax.z) { return -1.0; }
-  } else {
-    let inv = 1.0 / dir.z;
-    let t0 = (bmin.z - origin.z) * inv;
-    let t1 = (bmax.z - origin.z) * inv;
-    t_enter = max(t_enter, min(t0, t1));
-    t_exit = min(t_exit, max(t0, t1));
-  }
-
+  let t0 = bmin * ri.inv_dir + ri.neg_origin_inv;
+  let t1 = bmax * ri.inv_dir + ri.neg_origin_inv;
+  let near_v = select(min(t0, t1), vec3f(t_min), ri.parallel);
+  let far_v = select(max(t0, t1), vec3f(t_max), ri.parallel);
+  let t_enter = max(t_min, max(near_v.x, max(near_v.y, near_v.z)));
+  let t_exit = min(t_max, min(far_v.x, min(far_v.y, far_v.z)));
   return select(-1.0, t_enter, t_exit >= t_enter);
 }
 
@@ -162,23 +150,21 @@ fn trace_bvh(origin: vec3f, dir: vec3f, t_min: f32, t_max: f32, any_hit: bool) -
   if (node_count == 0u || tri_count_total == 0u) {
     return -1.0;
   }
+  let ri = bvh_ray_inv(origin, dir);
+  let root = nodes[0u];
+  if (ray_aabb_hit_inv(origin, ri, root.aabb_min, root.aabb_max, t_min, t_max) < 0.0) {
+    return -1.0;
+  }
   let rs = build_ray_shear(dir);
   var stack: array<u32, 32>;
-  var sp: i32 = 0;
-  stack[0] = 0u;
+  var stack_t: array<f32, 32>;
+  var sp: i32 = -1;
+  var cur = 0u;
   var closest = t_max;
   var found = false;
 
-  while (sp >= 0) {
-    let n_idx = stack[sp];
-    sp -= 1;
-    if (n_idx >= node_count) {
-      continue;
-    }
-    let node = nodes[n_idx];
-    if (ray_aabb_hit(origin, dir, node.aabb_min, node.aabb_max, t_min, closest) < 0.0) {
-      continue;
-    }
+  loop {
+    let node = nodes[cur];
     if (node.tri_count > 0u) {
       let first = node.left_or_first;
       let end = min(first + node.tri_count, tri_count_total);
@@ -194,33 +180,47 @@ fn trace_bvh(origin: vec3f, dir: vec3f, t_min: f32, t_max: f32, any_hit: bool) -
       }
     } else {
       let left = node.left_or_first;
-      let right = node.left_or_first + 1u;
+      let right = left + 1u;
       var dl = -1.0;
       if (left < node_count) {
         let nl = nodes[left];
-        dl = ray_aabb_hit(origin, dir, nl.aabb_min, nl.aabb_max, t_min, closest);
+        dl = ray_aabb_hit_inv(origin, ri, nl.aabb_min, nl.aabb_max, t_min, closest);
       }
       var dr = -1.0;
       if (right < node_count) {
         let nr = nodes[right];
-        dr = ray_aabb_hit(origin, dir, nr.aabb_min, nr.aabb_max, t_min, closest);
+        dr = ray_aabb_hit_inv(origin, ri, nr.aabb_min, nr.aabb_max, t_min, closest);
       }
       if (dl >= 0.0 && dr >= 0.0) {
-        let near_c = select(right, left, dl < dr);
-        let far_c = select(left, right, dl < dr);
-        if (sp + 2 < 32) {
+        let left_near = dl < dr;
+        if (sp + 1 < 32) {
           sp += 1;
-          stack[sp] = far_c;
-          sp += 1;
-          stack[sp] = near_c;
+          stack[sp] = select(left, right, left_near);
+          stack_t[sp] = select(dl, dr, left_near);
         }
-      } else if (dl >= 0.0 && sp + 1 < 32) {
-        sp += 1;
-        stack[sp] = left;
-      } else if (dr >= 0.0 && sp + 1 < 32) {
-        sp += 1;
-        stack[sp] = right;
+        cur = select(right, left, left_near);
+        continue;
+      } else if (dl >= 0.0) {
+        cur = left;
+        continue;
+      } else if (dr >= 0.0) {
+        cur = right;
+        continue;
       }
+    }
+    var popped = false;
+    while (sp >= 0) {
+      let next_n = stack[sp];
+      let next_t = stack_t[sp];
+      sp -= 1;
+      if (next_t <= closest) {
+        cur = next_n;
+        popped = true;
+        break;
+      }
+    }
+    if (!popped) {
+      break;
     }
   }
   return select(-1.0, closest, found);

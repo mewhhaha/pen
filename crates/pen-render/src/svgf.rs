@@ -107,6 +107,10 @@ struct SvgfState {
     output_idx: usize,
     moments_idx: usize,
     has_history: bool,
+    /// Cached temporal bind groups indexed by `hist_c * 2 + prev_m`, keyed on external input views.
+    temporal_bgs: [Option<([wgpu::TextureView; 6], wgpu::BindGroup)>; 6],
+    /// Cached A-Trous bind groups indexed by `(src_idx * 3 + dst_idx) * 2 + curr_m`, keyed on `(depth, normal)`.
+    atrous_bgs: [Option<([wgpu::TextureView; 2], wgpu::BindGroup)>; 18],
 }
 
 /// Stateful GPU SVGF spatiotemporal denoiser.
@@ -117,6 +121,7 @@ pub struct SvgfDenoiser {
     atrous_bgl: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
     uniform_stride: u32,
+    staged: Vec<u8>,
     state: Option<SvgfState>,
 }
 
@@ -230,7 +235,16 @@ impl SvgfDenoiser {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { temporal_pipe, temporal_bgl, atrous_pipe, atrous_bgl, uniform, uniform_stride, state: None }
+        Self {
+            temporal_pipe,
+            temporal_bgl,
+            atrous_pipe,
+            atrous_bgl,
+            uniform,
+            uniform_stride,
+            staged: Vec::new(),
+            state: None,
+        }
     }
 
     /// Invalidates temporal history on the next call to [`denoise`].
@@ -285,6 +299,8 @@ impl SvgfDenoiser {
                 output_idx: 1,
                 moments_idx: 0,
                 has_history: false,
+                temporal_bgs: std::array::from_fn(|_| None),
+                atrous_bgs: std::array::from_fn(|_| None),
             });
         }
         let st = self.state.as_mut().unwrap();
@@ -311,15 +327,16 @@ impl SvgfDenoiser {
         let stride = self.uniform_stride as usize;
         let u_size = std::mem::size_of::<SvgfUniform>();
         let slots = 1 + iters as usize;
-        let mut staged = vec![0u8; slots * stride];
-        staged[..u_size].copy_from_slice(bytemuck::bytes_of(&u_temporal));
+        self.staged.clear();
+        self.staged.resize(slots * stride, 0);
+        self.staged[..u_size].copy_from_slice(bytemuck::bytes_of(&u_temporal));
         for iter in 0..iters {
             let step = 1u32 << iter;
             let u_iter = SvgfUniform { dims: [size.0, size.1, step, spec_flags], ..u_temporal };
             let off = (1 + iter as usize) * stride;
-            staged[off..off + u_size].copy_from_slice(bytemuck::bytes_of(&u_iter));
+            self.staged[off..off + u_size].copy_from_slice(bytemuck::bytes_of(&u_iter));
         }
-        encode_copy(device, encoder, &self.uniform, &staged);
+        encode_copy(device, encoder, &self.uniform, &self.staged);
 
         let hist_c = st.history_color_idx;
         let slot_a = (hist_c + 1) % 3;
@@ -332,35 +349,67 @@ impl SvgfDenoiser {
             offset: 0,
             size: wgpu::BufferSize::new(u_size as u64),
         });
-        let tbg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("svgf_temporal_bg"),
-            layout: &self.temporal_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(inputs.noisy_signal) },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&st.color_bufs[hist_c].view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&st.moments[prev_m].view),
-                },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(inputs.depth) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(inputs.prev_depth) },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(inputs.normal) },
-                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(inputs.prev_normal) },
-                wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(inputs.motion) },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(&st.color_bufs[slot_a].view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: wgpu::BindingResource::TextureView(&st.moments[curr_m].view),
-                },
-            ],
+        let t_slot = hist_c * 2 + prev_m;
+        let t_hit = st.temporal_bgs[t_slot].as_ref().is_some_and(|(keys, _)| {
+            &keys[0] == inputs.noisy_signal
+                && &keys[1] == inputs.depth
+                && &keys[2] == inputs.prev_depth
+                && &keys[3] == inputs.normal
+                && &keys[4] == inputs.prev_normal
+                && &keys[5] == inputs.motion
         });
+        if !t_hit {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("svgf_temporal_bg"),
+                layout: &self.temporal_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(inputs.noisy_signal),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&st.color_bufs[hist_c].view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&st.moments[prev_m].view),
+                    },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(inputs.depth) },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(inputs.prev_depth),
+                    },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(inputs.normal) },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(inputs.prev_normal),
+                    },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(inputs.motion) },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::TextureView(&st.color_bufs[slot_a].view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 10,
+                        resource: wgpu::BindingResource::TextureView(&st.moments[curr_m].view),
+                    },
+                ],
+            });
+            st.temporal_bgs[t_slot] = Some((
+                [
+                    inputs.noisy_signal.clone(),
+                    inputs.depth.clone(),
+                    inputs.prev_depth.clone(),
+                    inputs.normal.clone(),
+                    inputs.prev_normal.clone(),
+                    inputs.motion.clone(),
+                ],
+                bg,
+            ));
+        }
+        let tbg = &st.temporal_bgs[t_slot].as_ref().unwrap().1;
         let (gx, gy) = (size.0.div_ceil(8), size.1.div_ceil(8));
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -368,7 +417,7 @@ impl SvgfDenoiser {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.temporal_pipe);
-            pass.set_bind_group(0, &tbg, &[0]);
+            pass.set_bind_group(0, tbg, &[0]);
             pass.dispatch_workgroups(gx, gy, 1);
         }
 
@@ -377,27 +426,38 @@ impl SvgfDenoiser {
         let mut src_idx = slot_a;
         let mut dst_idx = slot_b;
         for iter in 0..iters {
-            let abg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("svgf_atrous_bg"),
-                layout: &self.atrous_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&st.color_bufs[src_idx].view),
-                    },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(inputs.depth) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(inputs.normal) },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(&st.color_bufs[dst_idx].view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 5,
-                        resource: wgpu::BindingResource::TextureView(&st.moments[curr_m].view),
-                    },
-                ],
-            });
+            let a_slot = (src_idx * 3 + dst_idx) * 2 + curr_m;
+            let a_hit = st.atrous_bgs[a_slot]
+                .as_ref()
+                .is_some_and(|(keys, _)| &keys[0] == inputs.depth && &keys[1] == inputs.normal);
+            if !a_hit {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("svgf_atrous_bg"),
+                    layout: &self.atrous_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&st.color_bufs[src_idx].view),
+                        },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(inputs.depth) },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(inputs.normal),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&st.color_bufs[dst_idx].view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 5,
+                            resource: wgpu::BindingResource::TextureView(&st.moments[curr_m].view),
+                        },
+                    ],
+                });
+                st.atrous_bgs[a_slot] = Some(([inputs.depth.clone(), inputs.normal.clone()], bg));
+            }
+            let abg = &st.atrous_bgs[a_slot].as_ref().unwrap().1;
             let dyn_off = (1 + iter) * self.uniform_stride;
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -405,7 +465,7 @@ impl SvgfDenoiser {
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&self.atrous_pipe);
-                pass.set_bind_group(0, &abg, &[dyn_off]);
+                pass.set_bind_group(0, abg, &[dyn_off]);
                 pass.dispatch_workgroups(gx, gy, 1);
             }
             if iter + 1 < iters {

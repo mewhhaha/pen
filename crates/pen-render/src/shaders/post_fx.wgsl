@@ -146,8 +146,11 @@ fn post_fx(@builtin(global_invocation_id) id: vec3u) {
     let inv_dims = vec2f(1.0) / vec2f(dims);
     let base = f32(p.x);
     let step = spread * 0.5;
-    var streak = vec3f(0.0);
+    var streak = bright_pass(color, thresh);
     for (var i = -10; i <= 10; i++) {
+      if (i == 0) {
+        continue;
+      }
       let w = FLARE_WEIGHTS[abs(i)];
       let dx = f32(i) * step;
       let cr = bright_pass(sample_color_linear_x(base + dx * 1.08, p.y, dims, inv_dims), thresh).r;
@@ -185,34 +188,37 @@ fn post_fx(@builtin(global_invocation_id) id: vec3u) {
     let d_thresh = max(u.outline_params.x, 1e-4);
     let depth_edge = smoothstep(d_thresh, d_thresh * 2.0, depth_grad);
 
-    let vp00 = view_pos_from_raw(p00, raw00, d_dims);
-    let vp11 = view_pos_from_raw(p11, raw11, d_dims);
-    let vp10 = view_pos_from_raw(p10, raw10, d_dims);
-    let vp01 = view_pos_from_raw(p01, raw01, d_dims);
-    var n00: vec3f;
-    var n11: vec3f;
-    var n10: vec3f;
-    var n01: vec3f;
-    if (r == 1 && d_p.x >= 1 && d_p.x < d_last.x && d_p.y >= 1 && d_p.y < d_last.y) {
-      let pt = load_view_pos(d_p + vec2i(0, -1), d_dims);
-      let pb = load_view_pos(d_p + vec2i(0, 1), d_dims);
-      let pl_m = load_view_pos(d_p + vec2i(-1, 0), d_dims);
-      let pr_m = load_view_pos(d_p + vec2i(1, 0), d_dims);
-      n00 = view_normal_from_neighbors(p00, d_dims, vp00, pt, load_view_pos(p00 - vec2i(1, 0), d_dims), pl_m, load_view_pos(p00 - vec2i(0, 1), d_dims));
-      n10 = view_normal_from_neighbors(p10, d_dims, vp10, load_view_pos(p10 + vec2i(1, 0), d_dims), pt, pr_m, load_view_pos(p10 - vec2i(0, 1), d_dims));
-      n01 = view_normal_from_neighbors(p01, d_dims, vp01, pb, load_view_pos(p01 - vec2i(1, 0), d_dims), load_view_pos(p01 + vec2i(0, 1), d_dims), pl_m);
-      n11 = view_normal_from_neighbors(p11, d_dims, vp11, load_view_pos(p11 + vec2i(1, 0), d_dims), pb, load_view_pos(p11 + vec2i(0, 1), d_dims), pr_m);
-    } else {
-      n00 = view_normal_at_cached(p00, vp00, d_dims);
-      n11 = view_normal_at_cached(p11, vp11, d_dims);
-      n10 = view_normal_at_cached(p10, vp10, d_dims);
-      n01 = view_normal_at_cached(p01, vp01, d_dims);
+    var norm_edge = 0.0;
+    if (depth_edge < 0.999) {
+      let vp00 = view_pos_from_raw(p00, raw00, d_dims);
+      let vp11 = view_pos_from_raw(p11, raw11, d_dims);
+      let vp10 = view_pos_from_raw(p10, raw10, d_dims);
+      let vp01 = view_pos_from_raw(p01, raw01, d_dims);
+      var n00: vec3f;
+      var n11: vec3f;
+      var n10: vec3f;
+      var n01: vec3f;
+      if (r == 1 && d_p.x >= 1 && d_p.x < d_last.x && d_p.y >= 1 && d_p.y < d_last.y) {
+        let pt = load_view_pos(d_p + vec2i(0, -1), d_dims);
+        let pb = load_view_pos(d_p + vec2i(0, 1), d_dims);
+        let pl_m = load_view_pos(d_p + vec2i(-1, 0), d_dims);
+        let pr_m = load_view_pos(d_p + vec2i(1, 0), d_dims);
+        n00 = view_normal_from_neighbors(p00, d_dims, vp00, pt, load_view_pos(p00 - vec2i(1, 0), d_dims), pl_m, load_view_pos(p00 - vec2i(0, 1), d_dims));
+        n10 = view_normal_from_neighbors(p10, d_dims, vp10, load_view_pos(p10 + vec2i(1, 0), d_dims), pt, pr_m, load_view_pos(p10 - vec2i(0, 1), d_dims));
+        n01 = view_normal_from_neighbors(p01, d_dims, vp01, pb, load_view_pos(p01 - vec2i(1, 0), d_dims), load_view_pos(p01 + vec2i(0, 1), d_dims), pl_m);
+        n11 = view_normal_from_neighbors(p11, d_dims, vp11, load_view_pos(p11 + vec2i(1, 0), d_dims), pb, load_view_pos(p11 + vec2i(0, 1), d_dims), pr_m);
+      } else {
+        n00 = view_normal_at_cached(p00, vp00, d_dims);
+        n11 = view_normal_at_cached(p11, vp11, d_dims);
+        n10 = view_normal_at_cached(p10, vp10, d_dims);
+        n01 = view_normal_at_cached(p01, vp01, d_dims);
+      }
+      let n_diff0 = n00 - n11;
+      let n_diff1 = n10 - n01;
+      let norm_grad = sqrt(dot(n_diff0, n_diff0) + dot(n_diff1, n_diff1));
+      let n_thresh = max(u.outline_params.y, 1e-4);
+      norm_edge = smoothstep(n_thresh, n_thresh * 1.8, norm_grad);
     }
-    let n_diff0 = n00 - n11;
-    let n_diff1 = n10 - n01;
-    let norm_grad = sqrt(dot(n_diff0, n_diff0) + dot(n_diff1, n_diff1));
-    let n_thresh = max(u.outline_params.y, 1e-4);
-    let norm_edge = smoothstep(n_thresh, n_thresh * 1.8, norm_grad);
 
     let edge = clamp(max(depth_edge, norm_edge), 0.0, 1.0) * outline_str;
     color = mix(color, u.outline_color_str.rgb, edge);

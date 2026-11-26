@@ -379,34 +379,50 @@ fn rcas_decompress(c: vec3f, knee: f32) -> vec3f {
   return (clamped * knee) / max(vec3f(1.0) - clamped, vec3f(1e-4));
 }
 
+var<workgroup> wg_rcas: array<vec3f, 100>;
+
 @compute @workgroup_size(8, 8, 1)
-fn rcas_sharpen(@builtin(global_invocation_id) id: vec3u) {
+fn rcas_sharpen(
+  @builtin(global_invocation_id) id: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+  @builtin(workgroup_id) wid: vec3u,
+) {
   let dims = textureDimensions(rcas_in, 0);
-  if (id.x >= dims.x || id.y >= dims.y) {
-    return;
-  }
-  let p = vec2i(id.xy);
-  let last = vec2i(dims) - vec2i(1);
-  let e_raw = max(textureLoad(rcas_in, p, 0).rgb, vec3f(0.0));
   let sharp = clamp(rcas_u.params.x, 0.0, 1.0);
   if (sharp <= 1e-4) {
-    textureStore(rcas_out, p, vec4f(e_raw, 1.0));
+    if (id.x < dims.x && id.y < dims.y) {
+      let p = vec2i(id.xy);
+      let e_raw = max(textureLoad(rcas_in, p, 0).rgb, vec3f(0.0));
+      textureStore(rcas_out, p, vec4f(e_raw, 1.0));
+    }
     return;
   }
   // When hdr_knee > 0, map HDR [0, +inf) into [0, 1) per-channel so HDR peaks > 1.0 sharpen with anti-ringing.
   // When hdr_knee <= 0, operate directly in SDR [0, 1] without nonlinear Reinhard midtone distortion.
   let use_hdr = rcas_u.params.y > 0.0;
   let knee = max(rcas_u.params.y, 0.25);
-  let b_raw = max(textureLoad(rcas_in, clamp(p + vec2i(0, -1), vec2i(0), last), 0).rgb, vec3f(0.0));
-  let d_raw = max(textureLoad(rcas_in, clamp(p + vec2i(-1, 0), vec2i(0), last), 0).rgb, vec3f(0.0));
-  let f_raw = max(textureLoad(rcas_in, clamp(p + vec2i(1, 0), vec2i(0), last), 0).rgb, vec3f(0.0));
-  let h_raw = max(textureLoad(rcas_in, clamp(p + vec2i(0, 1), vec2i(0), last), 0).rgb, vec3f(0.0));
+  let last = vec2i(dims) - vec2i(1);
+  let tile_origin = vec2i(wid.xy * 8u) - vec2i(1);
+  let lidx = lid.y * 8u + lid.x;
+  for (var slot = lidx; slot < 100u; slot += 64u) {
+    let lx = i32(slot % 10u);
+    let ly = i32(slot / 10u);
+    let gp = clamp(tile_origin + vec2i(lx, ly), vec2i(0), last);
+    let raw = max(textureLoad(rcas_in, gp, 0).rgb, vec3f(0.0));
+    wg_rcas[slot] = select(clamp(raw, vec3f(0.0), vec3f(1.0)), rcas_compress(raw, knee), use_hdr);
+  }
+  workgroupBarrier();
 
-  let e = select(clamp(e_raw, vec3f(0.0), vec3f(1.0)), rcas_compress(e_raw, knee), use_hdr);
-  let b = select(clamp(b_raw, vec3f(0.0), vec3f(1.0)), rcas_compress(b_raw, knee), use_hdr);
-  let d = select(clamp(d_raw, vec3f(0.0), vec3f(1.0)), rcas_compress(d_raw, knee), use_hdr);
-  let f = select(clamp(f_raw, vec3f(0.0), vec3f(1.0)), rcas_compress(f_raw, knee), use_hdr);
-  let h = select(clamp(h_raw, vec3f(0.0), vec3f(1.0)), rcas_compress(h_raw, knee), use_hdr);
+  if (id.x >= dims.x || id.y >= dims.y) {
+    return;
+  }
+  let p = vec2i(id.xy);
+  let c_idx = (lid.y + 1u) * 10u + (lid.x + 1u);
+  let e = wg_rcas[c_idx];
+  let b = wg_rcas[c_idx - 10u];
+  let d = wg_rcas[c_idx - 1u];
+  let f = wg_rcas[c_idx + 1u];
+  let h = wg_rcas[c_idx + 10u];
 
   // Per-channel min/max anti-ringing limits (exact AMD FSR1 RCAS per-channel formulation).
   let mn4 = min(min(b, d), min(f, h));

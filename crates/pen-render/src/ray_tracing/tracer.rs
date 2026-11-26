@@ -54,6 +54,7 @@ pub struct GpuRayTracer {
     nodes_buf: Option<(u32, wgpu::Buffer)>,
     tris_buf: Option<(u32, wgpu::Buffer)>,
     output: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    bg: Option<(wgpu::Buffer, wgpu::Buffer, wgpu::TextureView, wgpu::TextureView, wgpu::BindGroup)>,
 }
 
 impl GpuRayTracer {
@@ -136,7 +137,7 @@ impl GpuRayTracer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { pipeline, bgl, uniform, nodes_buf: None, tris_buf: None, output: None }
+        Self { pipeline, bgl, uniform, nodes_buf: None, tris_buf: None, output: None, bg: None }
     }
 
     pub fn upload_bvh(&mut self, device: &wgpu::Device, scene: &BvhScene) -> Result<()> {
@@ -175,6 +176,7 @@ impl GpuRayTracer {
 
         self.nodes_buf = Some((scene.nodes().len() as u32, nb));
         self.tris_buf = Some((scene.tris().len() as u32, tb));
+        self.bg = None;
         Ok(())
     }
 
@@ -250,21 +252,29 @@ impl GpuRayTracer {
         };
         encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u));
         let (_, _, _, out_view) = self.output.as_ref().unwrap();
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("bvh_rt_bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: nodes_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: tris_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(out_view) },
-            ],
-        });
+        let hit = matches!(
+            &self.bg,
+            Some((nb, tb, dv, ov, _)) if nb == nodes_buf && tb == tris_buf && dv == depth_view && ov == out_view
+        );
+        if !hit {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("bvh_rt_bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: nodes_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: tris_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(depth_view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(out_view) },
+                ],
+            });
+            self.bg = Some((nodes_buf.clone(), tris_buf.clone(), depth_view.clone(), out_view.clone(), bg));
+        }
+        let (_, _, _, _, bg) = self.bg.as_ref().unwrap();
         let mut pass = encoder
             .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("bvh_raytrace"), timestamp_writes: None });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
         Ok(())
     }
@@ -343,6 +353,21 @@ impl RtOutputs {
     }
 }
 
+#[derive(PartialEq)]
+struct TlasBgKey {
+    hw_slots: Option<usize>,
+    tlas_nodes: wgpu::Buffer,
+    tlas_instances: wgpu::Buffer,
+    blas_nodes: wgpu::Buffer,
+    blas_tris: wgpu::Buffer,
+    depth: wgpu::TextureView,
+    out_sao: wgpu::TextureView,
+    ddgi: wgpu::Buffer,
+    gbuf_nr: wgpu::TextureView,
+    gbuf_am: wgpu::TextureView,
+    sharc_keys: wgpu::Buffer,
+}
+
 /// Portable 2-level TLAS/BLAS GPU ray tracer (native hardware `wgpu_ray_query` when supported,
 /// portable compute BVH on WebGPU/WASM) producing shadows/RTAO, GGX specular reflections,
 /// and 1-bounce diffuse GI in a single pass.
@@ -360,6 +385,7 @@ pub struct TlasRayTracer {
     gbuf_dummy_tex: (wgpu::Texture, wgpu::TextureView),
     scene: Option<TlasSceneGpu>,
     outputs: Option<RtOutputs>,
+    bg: Option<(TlasBgKey, wgpu::BindGroup)>,
 }
 
 impl TlasRayTracer {
@@ -562,6 +588,7 @@ impl TlasRayTracer {
             gbuf_dummy_tex,
             scene: None,
             outputs: None,
+            bg: None,
         }
     }
 
@@ -739,11 +766,9 @@ impl TlasRayTracer {
 
         if !matches!(&self.outputs, Some(o) if o.size == out_size) {
             self.outputs = Some(RtOutputs::new(device, out_size));
+            self.bg = None;
         }
         let light_count = local_lights.len().min(MAX_RT_LOCAL_LIGHTS);
-        if light_count > 0 {
-            encode_copy(device, encoder, &self.local_lights_buf, bytemuck::cast_slice(&local_lights[..light_count]));
-        }
         let flags = u32::from(use_material_gbuf)
             | (u32::from(ddgi_packed_buf.is_some()) << 1)
             | (u32::from(thin_gbuffer.is_some()) << 2);
@@ -794,7 +819,25 @@ impl TlasRayTracer {
             counts: [scene.tlas_node_count, scene.tlas_instance_count, scene.blas_tri_count, params.visibility_mask],
             extra_counts: [light_count as u32, out_size.0, out_size.1, flags],
         };
-        encode_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u));
+        let u_bytes = bytemuck::bytes_of(&u);
+        if light_count > 0 {
+            let l_bytes: &[u8] = bytemuck::cast_slice(&local_lights[..light_count]);
+            let u_len = u_bytes.len() as u64;
+            let l_len = l_bytes.len() as u64;
+            let stage = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("tlas_rt_frame_stage"),
+                size: u_len + l_len,
+                usage: wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
+            stage.slice(0..u_len).get_mapped_range_mut().unwrap().copy_from_slice(u_bytes);
+            stage.slice(u_len..u_len + l_len).get_mapped_range_mut().unwrap().copy_from_slice(l_bytes);
+            stage.unmap();
+            encoder.copy_buffer_to_buffer(&stage, 0, &self.uniform, 0, u_len);
+            encoder.copy_buffer_to_buffer(&stage, u_len, &self.local_lights_buf, 0, l_len);
+        } else {
+            encode_copy(device, encoder, &self.uniform, u_bytes);
+        }
         let out = self.outputs.as_ref().unwrap();
         let ddgi_buf = ddgi_packed_buf.unwrap_or(&self.ddgi_dummy_buf);
         let sharc_bind = sharc.unwrap_or(&self.sharc_dummy);
@@ -804,72 +847,153 @@ impl TlasRayTracer {
         let mut dispatched_hw = false;
         #[cfg(not(target_arch = "wasm32"))]
         if let (Some(pipe_hw), Some(bgl_hw), Some(hw_tlas)) = (&self.pipeline_hw, &self.bgl_hw, &scene.hw_tlas) {
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tlas_rt_bg_hw"),
-                layout: bgl_hw,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: hw_tlas.as_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: scene.tlas_instances_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: scene.blas_nodes_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: scene.blas_tris_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(depth_view) },
-                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&out.shadow_ao.1) },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: wgpu::BindingResource::TextureView(&out.reflection.1),
+            let hw_slots = Some(hw_tlas.get().len());
+            let hit = matches!(
+                &self.bg,
+                Some((k, _))
+                    if k.hw_slots == hw_slots
+                        && k.tlas_nodes == scene.tlas_nodes_buf
+                        && k.tlas_instances == scene.tlas_instances_buf
+                        && k.blas_nodes == scene.blas_nodes_buf
+                        && k.blas_tris == scene.blas_tris_buf
+                        && k.depth == *depth_view
+                        && k.out_sao == out.shadow_ao.1
+                        && k.ddgi == *ddgi_buf
+                        && k.gbuf_nr == *gbuf_nr
+                        && k.gbuf_am == *gbuf_am
+                        && k.sharc_keys == *sharc_bind.keys_buffer()
+            );
+            if !hit {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("tlas_rt_bg_hw"),
+                    layout: bgl_hw,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: hw_tlas.as_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: scene.tlas_instances_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: scene.blas_nodes_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: scene.blas_tris_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(depth_view) },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&out.shadow_ao.1),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(&out.reflection.1),
+                        },
+                        wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&out.gi.1) },
+                        wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 10, resource: ddgi_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(gbuf_nr) },
+                        wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(gbuf_am) },
+                        wgpu::BindGroupEntry { binding: 13, resource: sharc_bind.keys_buffer().as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 14,
+                            resource: sharc_bind.resolved_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry { binding: 15, resource: sharc_bind.uniform_buffer().as_entire_binding() },
+                    ],
+                });
+                self.bg = Some((
+                    TlasBgKey {
+                        hw_slots,
+                        tlas_nodes: scene.tlas_nodes_buf.clone(),
+                        tlas_instances: scene.tlas_instances_buf.clone(),
+                        blas_nodes: scene.blas_nodes_buf.clone(),
+                        blas_tris: scene.blas_tris_buf.clone(),
+                        depth: depth_view.clone(),
+                        out_sao: out.shadow_ao.1.clone(),
+                        ddgi: ddgi_buf.clone(),
+                        gbuf_nr: gbuf_nr.clone(),
+                        gbuf_am: gbuf_am.clone(),
+                        sharc_keys: sharc_bind.keys_buffer().clone(),
                     },
-                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&out.gi.1) },
-                    wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 10, resource: ddgi_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(gbuf_nr) },
-                    wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(gbuf_am) },
-                    wgpu::BindGroupEntry { binding: 13, resource: sharc_bind.keys_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 14, resource: sharc_bind.resolved_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 15, resource: sharc_bind.uniform_buffer().as_entire_binding() },
-                ],
-            });
+                    bg,
+                ));
+            }
+            let (_, bg) = self.bg.as_ref().unwrap();
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("tlas_raytrace_hw"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(pipe_hw);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(out_size.0.div_ceil(8), out_size.1.div_ceil(8), 1);
             dispatched_hw = true;
         }
         if !dispatched_hw {
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("tlas_rt_bg"),
-                layout: &self.bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: scene.tlas_nodes_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: scene.tlas_instances_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: scene.blas_nodes_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: scene.blas_tris_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(depth_view) },
-                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&out.shadow_ao.1) },
-                    wgpu::BindGroupEntry {
-                        binding: 7,
-                        resource: wgpu::BindingResource::TextureView(&out.reflection.1),
+            let hit = matches!(
+                &self.bg,
+                Some((k, _))
+                    if k.hw_slots.is_none()
+                        && k.tlas_nodes == scene.tlas_nodes_buf
+                        && k.tlas_instances == scene.tlas_instances_buf
+                        && k.blas_nodes == scene.blas_nodes_buf
+                        && k.blas_tris == scene.blas_tris_buf
+                        && k.depth == *depth_view
+                        && k.out_sao == out.shadow_ao.1
+                        && k.ddgi == *ddgi_buf
+                        && k.gbuf_nr == *gbuf_nr
+                        && k.gbuf_am == *gbuf_am
+                        && k.sharc_keys == *sharc_bind.keys_buffer()
+            );
+            if !hit {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("tlas_rt_bg"),
+                    layout: &self.bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: scene.tlas_nodes_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 2, resource: scene.tlas_instances_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 3, resource: scene.blas_nodes_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 4, resource: scene.blas_tris_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(depth_view) },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&out.shadow_ao.1),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(&out.reflection.1),
+                        },
+                        wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&out.gi.1) },
+                        wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 10, resource: ddgi_buf.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(gbuf_nr) },
+                        wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(gbuf_am) },
+                        wgpu::BindGroupEntry { binding: 13, resource: sharc_bind.keys_buffer().as_entire_binding() },
+                        wgpu::BindGroupEntry {
+                            binding: 14,
+                            resource: sharc_bind.resolved_buffer().as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry { binding: 15, resource: sharc_bind.uniform_buffer().as_entire_binding() },
+                    ],
+                });
+                self.bg = Some((
+                    TlasBgKey {
+                        hw_slots: None,
+                        tlas_nodes: scene.tlas_nodes_buf.clone(),
+                        tlas_instances: scene.tlas_instances_buf.clone(),
+                        blas_nodes: scene.blas_nodes_buf.clone(),
+                        blas_tris: scene.blas_tris_buf.clone(),
+                        depth: depth_view.clone(),
+                        out_sao: out.shadow_ao.1.clone(),
+                        ddgi: ddgi_buf.clone(),
+                        gbuf_nr: gbuf_nr.clone(),
+                        gbuf_am: gbuf_am.clone(),
+                        sharc_keys: sharc_bind.keys_buffer().clone(),
                     },
-                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&out.gi.1) },
-                    wgpu::BindGroupEntry { binding: 9, resource: self.local_lights_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 10, resource: ddgi_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(gbuf_nr) },
-                    wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(gbuf_am) },
-                    wgpu::BindGroupEntry { binding: 13, resource: sharc_bind.keys_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 14, resource: sharc_bind.resolved_buffer().as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 15, resource: sharc_bind.uniform_buffer().as_entire_binding() },
-                ],
-            });
+                    bg,
+                ));
+            }
+            let (_, bg) = self.bg.as_ref().unwrap();
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("tlas_raytrace"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(out_size.0.div_ceil(8), out_size.1.div_ceil(8), 1);
         }
         Ok(())

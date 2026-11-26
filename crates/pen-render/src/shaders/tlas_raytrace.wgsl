@@ -202,13 +202,23 @@ fn rt_ddgi_cascade(cascade_idx: u32, world: vec3f, normal: vec3f) -> vec4f {
       }
     }
 
+    if (w <= 1e-6) {
+      continue;
+    }
+
     let irr_px = vec2f(f32(s_col * 10u + 1u), f32(s_row * 10u + 1u)) + oct_n * 8.0;
     let texel = rt_ddgi_sample_irr(irr_off, irr_w, irr_h, irr_px);
     w *= clamp(texel.a, 0.0, 1.0);
     if (w <= 1e-6) {
       continue;
     }
-    let irr = pow(max(texel.rgb, vec3f(0.0)), vec3f(gamma * 0.5));
+    let encoded = max(texel.rgb, vec3f(0.0));
+    var irr: vec3f;
+    if (abs(gamma - 5.0) < 1e-4) {
+      irr = encoded * encoded * sqrt(encoded);
+    } else {
+      irr = pow(encoded, vec3f(gamma * 0.5));
+    }
     sum_irr += irr * w;
     sum_w += w;
   }
@@ -246,18 +256,17 @@ fn shade_hit(
   // 1. Direct sun + TLAS shadow ray.
   let ndl = max(0.0, dot(hit.world_normal, sun_dir));
   if (ndl > 0.0) {
-    let sh = trace_tlas(
+    let blocked = trace_tlas_any_hit(
       hit_pos + hit.world_normal * bias,
       sun_dir,
       1e-4,
       u.sky_horizon.a,
       mask,
-      true,
       u.counts.x,
       u.counts.y,
       u.counts.z,
     );
-    if (!sh.hit) {
+    if (!blocked) {
       rad += (diffuse_albedo / PI) * sun_color * ndl;
     }
   }
@@ -267,11 +276,12 @@ fn shade_hit(
   for (var li = 0u; li < n_lights; li++) {
     let lt = local_lights[li];
     let to_light = lt.position_range.xyz - hit_pos;
-    let dist = length(to_light);
     let reach = lt.position_range.w;
-    if (dist <= 1e-4 || dist >= reach) {
+    let dist2 = dot(to_light, to_light);
+    if (dist2 <= 1e-8 || dist2 >= reach * reach) {
       continue;
     }
+    let dist = sqrt(dist2);
     let ldir = to_light / dist;
     let l_ndl = max(0.0, dot(hit.world_normal, ldir));
     if (l_ndl <= 0.0) {
@@ -280,7 +290,7 @@ fn shade_hit(
     let ratio = dist / reach;
     let r2 = ratio * ratio;
     let win = clamp(1.0 - r2 * r2, 0.0, 1.0);
-    var atten = (win * win) / (dist * dist + 1.0);
+    var atten = (win * win) / (dist2 + 1.0);
     if (lt.color_outer_cos.w > -0.999) {
       let cone = dot(-ldir, lt.direction_inner_cos.xyz);
       atten *= smoothstep(lt.color_outer_cos.w, max(lt.direction_inner_cos.w, lt.color_outer_cos.w + 1e-4), cone);
@@ -288,31 +298,35 @@ fn shade_hit(
     if (atten <= 1e-5) {
       continue;
     }
-    let lsh = trace_tlas(
+    let blocked = trace_tlas_any_hit(
       hit_pos + hit.world_normal * bias,
       ldir,
       1e-4,
       max(dist - 0.03, 2e-3),
       mask,
-      true,
       u.counts.x,
       u.counts.y,
       u.counts.z,
     );
-    if (!lsh.hit) {
+    if (!blocked) {
       rad += (diffuse_albedo / PI) * lt.color_outer_cos.rgb * (atten * l_ndl);
     }
   }
 
   // 3. Multi-bounce indirect diffuse at hit point: DDGI where covered, else unbounded SHaRC cache, else sky ambient.
-  let amb_sky = mix(u.sky_horizon.rgb * 0.4, u.sky_zenith.rgb, clamp(hit.world_normal.y * 0.5 + 0.5, 0.0, 1.0)) * 0.25;
-  let sharc_hit = sharc_query_ro(hit_pos, hit.world_normal);
-  let fallback_gi = select(amb_sky, sharc_hit.rgb * u.bias_and_refl.z, sharc_hit.a > 0.5);
+  var ddgi = vec4f(0.0);
   if ((u.extra_counts.w & 2u) != 0u) {
-    let ddgi = rt_sample_ddgi(hit_pos, hit.world_normal);
-    rad += diffuse_albedo * mix(fallback_gi, ddgi.rgb, ddgi.a);
+    ddgi = rt_sample_ddgi(hit_pos, hit.world_normal);
+  }
+  if (ddgi.a >= 0.999) {
+    rad += diffuse_albedo * ddgi.rgb;
   } else {
-    rad += diffuse_albedo * fallback_gi;
+    let sharc_hit = sharc_query_ro(hit_pos, hit.world_normal);
+    var fallback_gi = sharc_hit.rgb * u.bias_and_refl.z;
+    if (sharc_hit.a <= 0.5) {
+      fallback_gi = mix(u.sky_horizon.rgb * 0.4, u.sky_zenith.rgb, clamp(hit.world_normal.y * 0.5 + 0.5, 0.0, 1.0)) * 0.25;
+    }
+    rad += diffuse_albedo * mix(fallback_gi, ddgi.rgb, ddgi.a);
   }
   return rad;
 }
@@ -513,8 +527,8 @@ fn trace_scene(@builtin(global_invocation_id) id: vec3u) {
         let phi = rnd.y * 2.0 * PI;
         d_ray = normalize(sun_basis * vec3f(r_disk * cos(phi), r_disk * sin(phi), 1.0));
       }
-      let h = trace_tlas(ray_origin, d_ray, 1e-4, max_dist, mask, true, u.counts.x, u.counts.y, u.counts.z);
-      if (!h.hit) {
+      let blocked = trace_tlas_any_hit(ray_origin, d_ray, 1e-4, max_dist, mask, u.counts.x, u.counts.y, u.counts.z);
+      if (!blocked) {
         sun_vis += 1.0;
       }
     }

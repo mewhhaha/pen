@@ -297,16 +297,26 @@ impl GpuCulling {
         let device = &self.device;
         let (hiz_view, hiz_view_id, hiz_vp, hiz_size, hiz_mips, hiz_active) = hiz.source();
         let hiz_active = hiz_active && hiz.depth_mode() == crate::camera_precision::DepthMode::ForwardZ;
-        let mut uniform = Vec::with_capacity(UNIFORM_WORDS);
+        let mut uniform = [0u32; UNIFORM_WORDS];
         let view_count = u32::try_from(self.views.count()).expect("at most MAX_VIEWS");
-        uniform.extend([view_count, self.detail.pixels.to_bits(), u32::from(hiz_active), hiz_mips]);
-        uniform.extend(self.detail.row.map(f32::to_bits));
+        uniform[0] = view_count;
+        uniform[1] = self.detail.pixels.to_bits();
+        uniform[2] = u32::from(hiz_active);
+        uniform[3] = hiz_mips;
+        for (dst, lane) in uniform[4..8].iter_mut().zip(self.detail.row) {
+            *dst = lane.to_bits();
+        }
         #[allow(clippy::cast_precision_loss, reason = "screen dimensions in pixels")]
         let (hw, hh) = (hiz_size.0.max(1) as f32, hiz_size.1.max(1) as f32);
-        uniform.extend([hw, hh, 1.0 / hw, 1.0 / hh].map(f32::to_bits));
-        uniform.extend(hiz_vp.map(f32::to_bits));
-        uniform.extend(self.views.planes().flatten().map(|lane| lane.to_bits()));
-        uniform.resize(UNIFORM_WORDS, 0);
+        for (dst, lane) in uniform[8..12].iter_mut().zip([hw, hh, 1.0 / hw, 1.0 / hh]) {
+            *dst = lane.to_bits();
+        }
+        for (dst, lane) in uniform[12..28].iter_mut().zip(hiz_vp) {
+            *dst = lane.to_bits();
+        }
+        for (dst, lane) in uniform[28..].iter_mut().zip(self.views.planes().flatten()) {
+            *dst = lane.to_bits();
+        }
         self.queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&uniform));
         let batches = self.batches.at_least(device, (self.batch_words.len() * 4) as u64).clone();
         self.queue.write_buffer(&batches, 0, bytemuck::cast_slice(&self.batch_words));
@@ -419,15 +429,16 @@ impl GpuCulling {
 /// What each view kept of the batches `counted` describes, from their
 /// draws' arguments as read back.
 fn kept(bytes: &[u8], counted: &[Counted], views: usize) -> Kept {
-    let words: Vec<u32> = bytes.as_chunks::<4>().0.iter().map(|&word| u32::from_le_bytes(word)).collect();
+    let words = bytes.as_chunks::<4>().0;
     let mut kept = Kept::default();
     let mut draw = 0;
     for batch in counted {
         for view in 0..views {
             let mut drawn = 0;
             for level in 0..batch.levels as usize {
-                let instances = words.get((draw + view * batch.levels as usize + level) * DRAW_WORDS + 1).copied();
-                let instances = instances.unwrap_or(0);
+                let instances = words
+                    .get((draw + view * batch.levels as usize + level) * DRAW_WORDS + 1)
+                    .map_or(0, |&word| u32::from_le_bytes(word));
                 drawn += instances;
                 if view == 0 {
                     kept.triangles += u64::from(instances) * u64::from(batch.indices[level] / 3);

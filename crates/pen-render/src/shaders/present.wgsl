@@ -156,13 +156,13 @@ fn easu_sample_source(uv: vec2f) -> vec3f {
 // exposes it and its bloom (drawn from the exposed light), graded, then toned.
 // A picture already shown (a scene filter's) is kept as it is.
 fn grade_and_tone(uv: vec2f, scene: vec3f) -> vec3f {
-  let glow_light = textureSampleLevel(glow, source_sampler, uv, 0.0).rgb * present.bloom.x;
   if (present.source.w > 0.5) { return scene; }
   var light = exposed(scene, exposure[0]);
   if (present.bloom.x > 0.0) {
     // Glare is light scattered, so the picture and its blur mix in linear light:
     // the blur takes `bloom.x` of the picture's light in all, and what it takes,
     // the picture gives up (`bloom.y`).
+    let glow_light = textureSampleLevel(glow, source_sampler, uv, 0.0).rgb * present.bloom.x;
     light = srgb_encode(srgb_decode(light) * present.bloom.y + glow_light);
   }
   if (grade.luts.w > 0.5) {
@@ -225,7 +225,13 @@ fn shade(uv: vec2f) -> vec3f {
   if (all(split == vec2f(0.0))) {
     return vec4f(base, 1.0);
   }
-  let red = select(base.r, shade(uv - split).r, marked(uv - split));
-  let blue = select(base.b, shade(uv + split).b, marked(uv + split));
+  var red = base.r;
+  if (marked(uv - split)) {
+    red = shade(uv - split).r;
+  }
+  var blue = base.b;
+  if (marked(uv + split)) {
+    blue = shade(uv + split).b;
+  }
   return vec4f(red, base.g, blue, 1.0);
 }

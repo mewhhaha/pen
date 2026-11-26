@@ -197,6 +197,9 @@ fn ddgi_sample_irradiance(
       chebyshev = max(chebyshev * chebyshev * chebyshev, 0.0);
       w *= chebyshev;
     }
+    if (w <= 1e-6) {
+      continue;
+    }
 
     let irr_uv = ddgi_probe_uv(sc, normal, dims, IRR_INNER, IRR_TILE);
     let irr_texel = textureSampleLevel(irr_atlas, atlas_samp, irr_uv, 0.0);
@@ -207,7 +210,12 @@ fn ddgi_sample_irradiance(
       continue;
     }
     let encoded = max(irr_texel.rgb, vec3f(0.0));
-    let irr = pow(encoded, vec3f(gamma * 0.5));
+    var irr: vec3f;
+    if (abs(gamma - 5.0) < 1e-4) {
+      irr = encoded * encoded * sqrt(encoded);
+    } else {
+      irr = pow(encoded, vec3f(gamma * 0.5));
+    }
     sum_irr += irr * w;
     sum_w += w;
   }
@@ -285,18 +293,17 @@ fn ddgi_trace_probes(@builtin(global_invocation_id) id: vec3u) {
   var rad = h.emissive;
   let ndl = max(0.0, dot(h.world_normal, sun_dir));
   if (ndl > 0.0) {
-    let sh = trace_tlas(
+    let blocked = trace_tlas_any_hit(
       hit_pos + h.world_normal * 0.01,
       sun_dir,
       1e-3,
       max_dist,
       mask,
-      true,
       u.tlas_counts.x,
       u.tlas_counts.y,
       u.tlas_counts.z,
     );
-    if (!sh.hit) {
+    if (!blocked) {
       rad += (diffuse_albedo / DDGI_PI) * u.sun_color_and_sharp.rgb * ndl;
     }
   }
@@ -306,11 +313,12 @@ fn ddgi_trace_probes(@builtin(global_invocation_id) id: vec3u) {
   for (var li = 0u; li < n_lights; li++) {
     let lt = local_lights[li];
     let to_light = lt.position_range.xyz - hit_pos;
-    let dist = length(to_light);
     let reach = lt.position_range.w;
-    if (dist <= 1e-4 || dist >= reach) {
+    let dist2 = dot(to_light, to_light);
+    if (dist2 <= 1e-8 || dist2 >= reach * reach) {
       continue;
     }
+    let dist = sqrt(dist2);
     let ldir = to_light / dist;
     let l_ndl = max(0.0, dot(h.world_normal, ldir));
     if (l_ndl <= 0.0) {
@@ -319,7 +327,7 @@ fn ddgi_trace_probes(@builtin(global_invocation_id) id: vec3u) {
     let ratio = dist / reach;
     let r2 = ratio * ratio;
     let win = clamp(1.0 - r2 * r2, 0.0, 1.0);
-    var atten = (win * win) / (dist * dist + 1.0);
+    var atten = (win * win) / (dist2 + 1.0);
     if (lt.color_outer_cos.w > -0.999) {
       let cone = dot(-ldir, lt.direction_inner_cos.xyz);
       atten *= smoothstep(lt.color_outer_cos.w, max(lt.direction_inner_cos.w, lt.color_outer_cos.w + 1e-4), cone);
@@ -327,18 +335,17 @@ fn ddgi_trace_probes(@builtin(global_invocation_id) id: vec3u) {
     if (atten <= 1e-5) {
       continue;
     }
-    let lsh = trace_tlas(
+    let blocked = trace_tlas_any_hit(
       hit_pos + h.world_normal * 0.015,
       ldir,
       1e-3,
       max(dist - 0.03, 2e-3),
       mask,
-      true,
       u.tlas_counts.x,
       u.tlas_counts.y,
       u.tlas_counts.z,
     );
-    if (!lsh.hit) {
+    if (!blocked) {
       rad += (diffuse_albedo / DDGI_PI) * lt.color_outer_cos.rgb * (atten * l_ndl);
     }
   }
@@ -367,8 +374,17 @@ fn ddgi_trace_probes(@builtin(global_invocation_id) id: vec3u) {
 @group(0) @binding(4) var blend_out_irr: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var blend_out_vis: texture_storage_2d<rgba16float, write>;
 
+// Cooperative ray staging: every 8x8 workgroup covers threads from exactly one probe
+// (both 8x8 irradiance tiles and 16x16 visibility quadrants are aligned to 8),
+// so computing ray directions and loading ray payloads once per 64-ray chunk cuts work 64x.
+var<workgroup> wg_ray_val: array<vec4f, 64>;
+var<workgroup> wg_ray_dir: array<vec3f, 64>;
+
 @compute @workgroup_size(8, 8, 1)
-fn ddgi_blend_irradiance(@builtin(global_invocation_id) id: vec3u) {
+fn ddgi_blend_irradiance(
+  @builtin(global_invocation_id) id: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+) {
   let dims = u.grid_dims.xyz;
   let cols = dims.x * dims.z;
   let rows = dims.y;
@@ -376,12 +392,10 @@ fn ddgi_blend_irradiance(@builtin(global_invocation_id) id: vec3u) {
   let ty = id.y % IRR_INNER;
   let col = id.x / IRR_INNER;
   let row = id.y / IRR_INNER;
-  if (col >= cols || row >= rows) {
-    return;
-  }
+  let in_bounds = col < cols && row < rows;
 
-  let ix = col % dims.x;
-  let iz = col / dims.x;
+  let ix = col % max(dims.x, 1u);
+  let iz = col / max(dims.x, 1u);
   let iy = row;
   let logical = vec3u(ix, iy, iz);
   let probe_idx = (iy * dims.z + iz) * dims.x + ix;
@@ -395,18 +409,35 @@ fn ddgi_blend_irradiance(@builtin(global_invocation_id) id: vec3u) {
   var weight_sum = 0.0;
   var backface_count = 0u;
   let base_ray = probe_idx * rays_per_probe;
-  for (var r = 0u; r < rays_per_probe; r++) {
-    let ray_val = blend_rays[base_ray + r];
-    if (ray_val.w < 0.0) {
-      backface_count += 1u;
-      continue;
+  let lidx = lid.y * 8u + lid.x;
+
+  for (var chunk = 0u; chunk < rays_per_probe; chunk += 64u) {
+    let r = chunk + lidx;
+    if (in_bounds && r < rays_per_probe) {
+      wg_ray_val[lidx] = blend_rays[base_ray + r];
+      wg_ray_dir[lidx] = normalize(rot * ddgi_spherical_fibonacci(r, rays_per_probe));
     }
-    let ray_dir = normalize(rot * ddgi_spherical_fibonacci(r, rays_per_probe));
-    let w = max(0.0, dot(texel_dir, ray_dir));
-    if (w > 1e-4) {
-      acc += ray_val.rgb * w;
-      weight_sum += w;
+    workgroupBarrier();
+    if (in_bounds) {
+      let count = min(64u, rays_per_probe - chunk);
+      for (var j = 0u; j < count; j++) {
+        let ray_val = wg_ray_val[j];
+        if (ray_val.w < 0.0) {
+          backface_count += 1u;
+          continue;
+        }
+        let w = dot(texel_dir, wg_ray_dir[j]);
+        if (w > 1e-4) {
+          acc += ray_val.rgb * w;
+          weight_sum += w;
+        }
+      }
     }
+    workgroupBarrier();
+  }
+
+  if (!in_bounds) {
+    return;
   }
 
   // Classify probe as inactive when >= 25% of rays hit backfaces (trapped inside solid geometry).
@@ -519,7 +550,10 @@ fn ddgi_relocate_probes(@builtin(global_invocation_id) id: vec3u) {
 }
 
 @compute @workgroup_size(8, 8, 1)
-fn ddgi_blend_visibility(@builtin(global_invocation_id) id: vec3u) {
+fn ddgi_blend_visibility(
+  @builtin(global_invocation_id) id: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+) {
   let dims = u.grid_dims.xyz;
   let cols = dims.x * dims.z;
   let rows = dims.y;
@@ -527,12 +561,10 @@ fn ddgi_blend_visibility(@builtin(global_invocation_id) id: vec3u) {
   let ty = id.y % VIS_INNER;
   let col = id.x / VIS_INNER;
   let row = id.y / VIS_INNER;
-  if (col >= cols || row >= rows) {
-    return;
-  }
+  let in_bounds = col < cols && row < rows;
 
-  let ix = col % dims.x;
-  let iz = col / dims.x;
+  let ix = col % max(dims.x, 1u);
+  let iz = col / max(dims.x, 1u);
   let iy = row;
   let logical = vec3u(ix, iy, iz);
   let probe_idx = (iy * dims.z + iz) * dims.x + ix;
@@ -544,22 +576,44 @@ fn ddgi_blend_visibility(@builtin(global_invocation_id) id: vec3u) {
 
   let max_dist = max(u.spacing_and_max_dist.w, 1.0);
   let max_probe_dist = length(u.spacing_and_max_dist.xyz) * 1.5;
+  let clamped_max = min(max_dist, max_probe_dist);
   let sharp = max(u.sun_color_and_sharp.w, 1.0);
 
   var acc_d = 0.0;
   var acc_d2 = 0.0;
   var weight_sum = 0.0;
   let base_ray = probe_idx * rays_per_probe;
-  for (var r = 0u; r < rays_per_probe; r++) {
-    let ray_dir = normalize(rot * ddgi_spherical_fibonacci(r, rays_per_probe));
-    let w = pow(max(0.0, dot(texel_dir, ray_dir)), sharp);
-    if (w > 1e-6) {
+  let lidx = lid.y * 8u + lid.x;
+
+  for (var chunk = 0u; chunk < rays_per_probe; chunk += 64u) {
+    let r = chunk + lidx;
+    if (in_bounds && r < rays_per_probe) {
       let raw_d = blend_rays[base_ray + r].w;
-      let dist = select(min(raw_d, min(max_dist, max_probe_dist)), min(-raw_d * 0.2, max_probe_dist), raw_d < 0.0);
-      acc_d += dist * w;
-      acc_d2 += dist * dist * w;
-      weight_sum += w;
+      let dist = select(min(raw_d, clamped_max), min(-raw_d * 0.2, max_probe_dist), raw_d < 0.0);
+      wg_ray_val[lidx] = vec4f(dist, dist * dist, 0.0, 0.0);
+      wg_ray_dir[lidx] = normalize(rot * ddgi_spherical_fibonacci(r, rays_per_probe));
     }
+    workgroupBarrier();
+    if (in_bounds) {
+      let count = min(64u, rays_per_probe - chunk);
+      for (var j = 0u; j < count; j++) {
+        let ndot = dot(texel_dir, wg_ray_dir[j]);
+        if (ndot > 0.0) {
+          let w = pow(ndot, sharp);
+          if (w > 1e-6) {
+            let dm = wg_ray_val[j];
+            acc_d += dm.x * w;
+            acc_d2 += dm.y * w;
+            weight_sum += w;
+          }
+        }
+      }
+    }
+    workgroupBarrier();
+  }
+
+  if (!in_bounds) {
+    return;
   }
   let new_m = select(vec2f(max_probe_dist, max_probe_dist * max_probe_dist), vec2f(acc_d, acc_d2) / weight_sum, weight_sum > 1e-6);
 

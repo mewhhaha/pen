@@ -27,27 +27,42 @@ struct CloudUniform {
 @group(0) @binding(0) var<uniform> cloud: CloudUniform;
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba16float, write>;
 
+fn pcg3(v_in: vec3u) -> vec3u {
+    var v = v_in * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> vec3u(16u);
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    return v;
+}
+
 fn hash3(p: vec3f) -> vec3f {
-    let q = vec3f(
-        dot(p, vec3f(127.1, 311.7, 74.7)),
-        dot(p, vec3f(269.5, 183.3, 246.1)),
-        dot(p, vec3f(113.5, 271.9, 124.6)),
-    );
-    return fract(sin(q) * 43758.5453);
+    return vec3f(pcg3(vec3u(vec3i(p))) >> vec3u(8u)) * (1.0 / 16777216.0);
+}
+
+fn hash1(p: vec3f) -> f32 {
+    let q = vec3u(vec3i(p));
+    var h = q.x * 374761393u + q.y * 668265263u + q.z * 2147483647u;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    h ^= h >> 16u;
+    return f32(h >> 8u) * (1.0 / 16777216.0);
 }
 
 fn value_noise3(p: vec3f) -> f32 {
     let i = floor(p);
     let f = p - i;
     let u = f * f * (3.0 - 2.0 * f);
-    let n000 = hash3(i + vec3f(0.0, 0.0, 0.0)).x;
-    let n100 = hash3(i + vec3f(1.0, 0.0, 0.0)).x;
-    let n010 = hash3(i + vec3f(0.0, 1.0, 0.0)).x;
-    let n110 = hash3(i + vec3f(1.0, 1.0, 0.0)).x;
-    let n001 = hash3(i + vec3f(0.0, 0.0, 1.0)).x;
-    let n101 = hash3(i + vec3f(1.0, 0.0, 1.0)).x;
-    let n011 = hash3(i + vec3f(0.0, 1.0, 1.0)).x;
-    let n111 = hash3(i + vec3f(1.0, 1.0, 1.0)).x;
+    let n000 = hash1(i + vec3f(0.0, 0.0, 0.0));
+    let n100 = hash1(i + vec3f(1.0, 0.0, 0.0));
+    let n010 = hash1(i + vec3f(0.0, 1.0, 0.0));
+    let n110 = hash1(i + vec3f(1.0, 1.0, 0.0));
+    let n001 = hash1(i + vec3f(0.0, 0.0, 1.0));
+    let n101 = hash1(i + vec3f(1.0, 0.0, 1.0));
+    let n011 = hash1(i + vec3f(0.0, 1.0, 1.0));
+    let n111 = hash1(i + vec3f(1.0, 1.0, 1.0));
     let nx00 = mix(n000, n100, u.x);
     let nx10 = mix(n010, n110, u.x);
     let nx01 = mix(n001, n101, u.x);
@@ -72,7 +87,7 @@ fn worley3(p: vec3f) -> f32 {
     return clamp(1.0 - sqrt(min_d2), 0.0, 1.0);
 }
 
-fn cloud_density(pos_km: vec3f) -> f32 {
+fn cloud_density(pos_km: vec3f, with_detail: bool) -> f32 {
     let rb = cloud.camera.w;
     let bottom = cloud.ambient.w;
     let top = max(cloud.wind.w, bottom + 0.1);
@@ -89,14 +104,21 @@ fn cloud_density(pos_km: vec3f) -> f32 {
     let coverage = clamp(cloud.sun_dir.w, 0.0, 1.0);
     let threshold = 1.0 - coverage;
     let raw = clamp((shape - threshold) / max(1.0 - threshold, 0.05), 0.0, 1.0);
-    let detail = worley3(p * 3.8 + vec3f(1.3, 2.7, 0.9));
-    let eroded = max(0.0, raw - (1.0 - detail) * 0.25 * (1.0 - raw));
+    if (raw <= 0.001) {
+        return 0.0;
+    }
+    var eroded = raw;
+    if (with_detail) {
+        let detail = worley3(p * 3.8 + vec3f(1.3, 2.7, 0.9));
+        eroded = max(0.0, raw - (1.0 - detail) * 0.25 * (1.0 - raw));
+    }
     return eroded * height_profile * max(cloud.sun_color.w, 0.0);
 }
 
 fn hg_phase(cos_theta: f32, g: f32) -> f32 {
     let g2 = g * g;
-    return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4), 1.5));
+    let denom = max(1.0 + g2 - 2.0 * g * cos_theta, 1e-4);
+    return (1.0 - g2) / (4.0 * PI * denom * sqrt(denom));
 }
 
 fn dual_lobe_phase(cos_theta: f32, g_fwd: f32) -> f32 {
@@ -116,14 +138,19 @@ fn ray_sphere(origin: vec3f, dir: vec3f, radius: f32) -> vec2f {
 
 // 6-step quadratic-spaced light march to the sun-facing cloud shell exit, zeroing direct
 // sunlight when the ray toward the sun is occluded by the planet body.
-fn sun_light_energy(pos_km: vec3f, sun_dir: vec3f, cos_theta: f32) -> vec3f {
-    let rb = cloud.camera.w;
+fn sun_light_energy(
+    pos_km: vec3f,
+    sun_dir: vec3f,
+    rb: f32,
+    r_bot: f32,
+    r_top: f32,
+    phase_direct: f32,
+    phase_multi: f32,
+) -> vec3f {
     let hit_planet = ray_sphere(pos_km, sun_dir, rb);
     if (hit_planet.x > 0.0) {
         return vec3f(0.0);
     }
-    let r_top = rb + max(cloud.wind.w, cloud.ambient.w + 0.1);
-    let r_bot = rb + cloud.ambient.w;
     let hit_top = ray_sphere(pos_km, sun_dir, r_top);
     let hit_bot = ray_sphere(pos_km, sun_dir, r_bot);
     let thickness = max(r_top - r_bot, 0.2);
@@ -133,22 +160,21 @@ fn sun_light_energy(pos_km: vec3f, sun_dir: vec3f, cos_theta: f32) -> vec3f {
     }
     t_exit = min(t_exit, thickness * 10.0);
     if (t_exit <= 1e-4) {
-        return cloud.sun_color.rgb * dual_lobe_phase(cos_theta, clamp(cloud.params.w, 0.0, 0.92));
+        return cloud.sun_color.rgb * phase_direct;
     }
 
     var od = 0.0;
     var t_prev = 0.0;
     for (var i = 1u; i <= 6u; i++) {
-        let frac = f32(i) / 6.0;
+        let frac = f32(i) * (1.0 / 6.0);
         let t_next = t_exit * (frac * frac);
         let ds = t_next - t_prev;
         let t_mid = 0.5 * (t_prev + t_next);
-        od += cloud_density(pos_km + sun_dir * t_mid) * ds;
+        od += cloud_density(pos_km + sun_dir * t_mid, false) * ds;
         t_prev = t_next;
     }
-    let g = clamp(cloud.params.w, 0.0, 0.92);
-    let direct = exp(-od) * dual_lobe_phase(cos_theta, g);
-    let multi = exp(-od * 0.28) * 0.45 * dual_lobe_phase(cos_theta, g * 0.45);
+    let direct = exp(-od) * phase_direct;
+    let multi = exp(-od * 0.28) * 0.45 * phase_multi;
     let powder = 1.0 - 0.65 * exp(-od * 2.0);
     return cloud.sun_color.rgb * (direct + multi) * powder;
 }
@@ -242,11 +268,15 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 
     let sun_dir = normalize(cloud.sun_dir.xyz);
     let cos_theta = dot(dir, sun_dir);
+    let g = clamp(cloud.params.w, 0.0, 0.92);
+    let phase_direct = dual_lobe_phase(cos_theta, g);
+    let phase_multi = dual_lobe_phase(cos_theta, g * 0.45);
+    let inv_shell_thick = 1.0 / max(r_top - r_bot, 0.1);
     let steps = clamp(u32(round(cloud.quality.x)), 8u, 64u);
     let dt = total_len / f32(steps);
     var transmittance = 1.0;
     var scattered = vec3f(0.0);
-    let jitter = fract(sin(dot(vec2f(id.xy), vec2f(12.9898, 78.233))) * 43758.5453);
+    let jitter = hash1(vec3f(f32(id.x), f32(id.y), 0.0));
 
     for (var i = 0u; i < steps; i++) {
         if (transmittance < 0.01) {
@@ -255,11 +285,11 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         let s = (f32(i) + jitter) * dt;
         let t = select(seg1.x + (s - len0), seg0.x + s, s < len0);
         let pos = origin + dir * t;
-        let dens = cloud_density(pos);
+        let dens = cloud_density(pos, true);
         if (dens > 0.0005) {
             let step_t = exp(-dens * dt);
-            let h = clamp((length(pos) - r_bot) / max(r_top - r_bot, 0.1), 0.0, 1.0);
-            let sun_l = sun_light_energy(pos, sun_dir, cos_theta);
+            let h = clamp((length(pos) - r_bot) * inv_shell_thick, 0.0, 1.0);
+            let sun_l = sun_light_energy(pos, sun_dir, rb, r_bot, r_top, phase_direct, phase_multi);
             let amb_l = cloud.ambient.rgb * mix(0.45, 1.0, h);
             let step_lum = (sun_l + amb_l) * (1.0 - step_t);
             scattered += transmittance * step_lum;

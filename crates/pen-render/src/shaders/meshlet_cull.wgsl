@@ -48,18 +48,67 @@ struct CullStats {
 @group(0) @binding(4) var hiz_tex: texture_2d<f32>;
 @group(0) @binding(5) var<storage, read_write> phase2_flags: array<u32>;
 
-// Exact local-space frustum test: transforms each world plane by transpose(model) so non-uniform
-// scaling and shear never under-estimate the projected bounding sphere radius.
-fn in_frustum_local(local_center: vec3f, local_radius: f32) -> bool {
-  let mt = transpose(u.model);
-  for (var i = 0u; i < 6u; i++) {
-    let lp = mt * u.planes[i];
-    let n_len = length(lp.xyz);
-    if (n_len <= 1e-7) {
-      continue;
+var<workgroup> wg_planes: array<vec4f, 6>;
+var<workgroup> wg_local_cam: vec3f;
+var<workgroup> wg_det_pos: u32;
+var<workgroup> wg_stretch: f32;
+var<workgroup> wg_visible: atomic<u32>;
+var<workgroup> wg_frustum: atomic<u32>;
+var<workgroup> wg_backface: atomic<u32>;
+var<workgroup> wg_hiz: atomic<u32>;
+
+fn init_workgroup(lane: u32) {
+  if (lane == 0u) {
+    let mt = transpose(u.model);
+    for (var i = 0u; i < 6u; i++) {
+      let lp = mt * u.planes[i];
+      let n_len = length(lp.xyz);
+      if (n_len > 1e-7) {
+        wg_planes[i] = lp / n_len;
+      } else {
+        wg_planes[i] = vec4f(0.0);
+      }
     }
-    let dist = (dot(lp.xyz, local_center) + lp.w) / n_len;
-    if (dist < -(local_radius * 1.001 + 1e-5)) {
+    let a = u.model[0].xyz;
+    let b = u.model[1].xyz;
+    let c = u.model[2].xyz;
+    let sq = vec3f(dot(a, a), dot(b, b), dot(c, c));
+    let ab = dot(a, b);
+    let ac = dot(a, c);
+    let bc = dot(b, c);
+    let ortho = ab * ab <= 1e-7 * sq.x * sq.y && ac * ac <= 1e-7 * sq.x * sq.z && bc * bc <= 1e-7 * sq.y * sq.z;
+    wg_stretch = sqrt(select(sq.x + sq.y + sq.z, max(sq.x, max(sq.y, sq.z)), ortho));
+    let det = dot(a, cross(b, c));
+    wg_det_pos = select(0u, 1u, det > 1e-6);
+    wg_local_cam = (u.inv_model * vec4f(u.camera_pos.xyz, 1.0)).xyz;
+    atomicStore(&wg_visible, 0u);
+    atomicStore(&wg_frustum, 0u);
+    atomicStore(&wg_backface, 0u);
+    atomicStore(&wg_hiz, 0u);
+  }
+  workgroupBarrier();
+}
+
+fn flush_stats(lane: u32) {
+  workgroupBarrier();
+  if (lane == 0u) {
+    let v = atomicLoad(&wg_visible);
+    if (v > 0u) { atomicAdd(&stats.visible, v); }
+    let f = atomicLoad(&wg_frustum);
+    if (f > 0u) { atomicAdd(&stats.frustum_culled, f); }
+    let b = atomicLoad(&wg_backface);
+    if (b > 0u) { atomicAdd(&stats.backface_culled, b); }
+    let h = atomicLoad(&wg_hiz);
+    if (h > 0u) { atomicAdd(&stats.hiz_culled, h); }
+  }
+}
+
+// Exact local-space frustum test using workgroup-cached normalized local planes.
+fn in_frustum_local(local_center: vec3f, local_radius: f32) -> bool {
+  let limit = -(local_radius * 1.001 + 1e-5);
+  for (var i = 0u; i < 6u; i++) {
+    let lp = wg_planes[i];
+    if (dot(lp.xyz, local_center) + lp.w < limit) {
       return false;
     }
   }
@@ -68,16 +117,7 @@ fn in_frustum_local(local_center: vec3f, local_radius: f32) -> bool {
 
 // Conservative Frobenius / spectral upper bound on how much `model` stretches a local sphere.
 fn conservative_world_radius(local_radius: f32) -> f32 {
-  let a = u.model[0].xyz;
-  let b = u.model[1].xyz;
-  let c = u.model[2].xyz;
-  let sq = vec3f(dot(a, a), dot(b, b), dot(c, c));
-  let ab = dot(a, b);
-  let ac = dot(a, c);
-  let bc = dot(b, c);
-  let ortho = ab * ab <= 1e-7 * sq.x * sq.y && ac * ac <= 1e-7 * sq.x * sq.z && bc * bc <= 1e-7 * sq.y * sq.z;
-  let stretch = sqrt(select(sq.x + sq.y + sq.z, max(sq.x, max(sq.y, sq.z)), ortho));
-  return local_radius * stretch;
+  return local_radius * wg_stretch;
 }
 
 fn hiz_occluded(world_center: vec3f, world_radius: f32, rev_z: bool) -> bool {
@@ -134,7 +174,7 @@ fn hiz_occluded(world_center: vec3f, world_radius: f32, rev_z: bool) -> bool {
 
 fn passes_geometry_culling(m: MeshletGpu) -> bool {
   if (!in_frustum_local(m.sphere.xyz, m.sphere.w)) {
-    atomicAdd(&stats.frustum_culled, 1u);
+    atomicAdd(&wg_frustum, 1u);
     return false;
   }
 
@@ -142,16 +182,12 @@ fn passes_geometry_culling(m: MeshletGpu) -> bool {
   // Since (M * v) . (adj(M)^T * n) = det(M) * (v . n), testing in local space using inverse-transformed
   // camera preserves backface orientation identically for any positive-determinant affine matrix.
   let backface_enabled = (u.counts_flags.w & 1u) != 0u;
-  if (backface_enabled && m.cone_axis_cutoff.w < 0.999) {
-    let det = dot(u.model[0].xyz, cross(u.model[1].xyz, u.model[2].xyz));
-    if (det > 1e-6) {
-      let local_cam = (u.inv_model * vec4f(u.camera_pos.xyz, 1.0)).xyz;
-      let to_center = m.sphere.xyz - local_cam;
-      let dist = length(to_center);
-      if (dist > m.sphere.w && dot(to_center, m.cone_axis_cutoff.xyz) >= m.cone_axis_cutoff.w * dist + m.sphere.w) {
-        atomicAdd(&stats.backface_culled, 1u);
-        return false;
-      }
+  if (backface_enabled && m.cone_axis_cutoff.w < 0.999 && wg_det_pos != 0u) {
+    let to_center = m.sphere.xyz - wg_local_cam;
+    let dist = length(to_center);
+    if (dist > m.sphere.w && dot(to_center, m.cone_axis_cutoff.xyz) >= m.cone_axis_cutoff.w * dist + m.sphere.w) {
+      atomicAdd(&wg_backface, 1u);
+      return false;
     }
   }
   return true;
@@ -166,7 +202,7 @@ fn meshlet_hiz_occluded(m: MeshletGpu) -> bool {
 
 fn write_draw(idx: u32, m: MeshletGpu, visible: bool) {
   if (visible) {
-    atomicAdd(&stats.visible, 1u);
+    atomicAdd(&wg_visible, 1u);
   }
   // Emit first_instance = 0u for baseline WebGPU without INDIRECT_FIRST_INSTANCE.
   draws[idx] = DrawIndexedIndirect(m.counts.y, select(0u, 1u, visible), m.counts.x, bitcast<i32>(m.counts.z), 0u);
@@ -182,40 +218,52 @@ fn cull_primary(idx: u32) -> bool {
 }
 
 @compute @workgroup_size(64)
-fn cull_meshlets(@builtin(global_invocation_id) id: vec3u) {
+fn cull_meshlets(
+  @builtin(global_invocation_id) id: vec3u,
+  @builtin(local_invocation_index) lane: u32,
+) {
+  init_workgroup(lane);
   let idx = id.x;
-  if (idx >= u.counts_flags.x) {
-    return;
+  if (idx < u.counts_flags.x) {
+    if (cull_primary(idx)) {
+      atomicAdd(&wg_hiz, 1u);
+    }
   }
-  if (cull_primary(idx)) {
-    atomicAdd(&stats.hiz_culled, 1u);
-  }
+  flush_stats(lane);
 }
 
 @compute @workgroup_size(64)
-fn cull_meshlets_phase1(@builtin(global_invocation_id) id: vec3u) {
+fn cull_meshlets_phase1(
+  @builtin(global_invocation_id) id: vec3u,
+  @builtin(local_invocation_index) lane: u32,
+) {
+  init_workgroup(lane);
   let idx = id.x;
-  if (idx >= u.counts_flags.x) {
-    return;
+  if (idx < u.counts_flags.x) {
+    // Phase 2 decides whether these meshlets count as Hi-Z culled.
+    phase2_flags[idx] = select(0u, 1u, cull_primary(idx));
   }
-  // Phase 2 decides whether these meshlets count as Hi-Z culled.
-  phase2_flags[idx] = select(0u, 1u, cull_primary(idx));
+  flush_stats(lane);
 }
 
 @compute @workgroup_size(64)
-fn cull_meshlets_phase2(@builtin(global_invocation_id) id: vec3u) {
+fn cull_meshlets_phase2(
+  @builtin(global_invocation_id) id: vec3u,
+  @builtin(local_invocation_index) lane: u32,
+) {
+  init_workgroup(lane);
   let idx = id.x;
-  if (idx >= u.counts_flags.x) {
-    return;
+  if (idx < u.counts_flags.x) {
+    if (phase2_flags[idx] == 0u) {
+      draws[idx] = DrawIndexedIndirect(0u, 0u, 0u, 0, 0u);
+    } else {
+      let m = meshlets[idx];
+      let occluded = meshlet_hiz_occluded(m);
+      if (occluded) {
+        atomicAdd(&wg_hiz, 1u);
+      }
+      write_draw(idx, m, !occluded);
+    }
   }
-  if (phase2_flags[idx] == 0u) {
-    draws[idx] = DrawIndexedIndirect(0u, 0u, 0u, 0, 0u);
-    return;
-  }
-  let m = meshlets[idx];
-  let occluded = meshlet_hiz_occluded(m);
-  if (occluded) {
-    atomicAdd(&stats.hiz_culled, 1u);
-  }
-  write_draw(idx, m, !occluded);
+  flush_stats(lane);
 }

@@ -305,6 +305,7 @@ pub(super) struct RtCompositePipelines {
     combined_bgl: wgpu::BindGroupLayout,
     combined_pipeline: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
+    combined_bg: Option<([wgpu::TextureView; 6], wgpu::BindGroup)>,
 }
 
 struct SvgfTex {
@@ -335,6 +336,7 @@ struct SvgfRtBuffers {
     normal: [SvgfTex; 2],
     motion: SvgfTex,
     parity: usize,
+    prep_bgs: [Option<([wgpu::TextureView; 5], wgpu::BindGroup)>; 2],
 }
 
 pub(super) struct SvgfRtState {
@@ -440,7 +442,7 @@ impl SvgfRtState {
 }
 
 impl WiredPasses {
-    fn ensure_rt_composite(&mut self, device: &wgpu::Device) -> &RtCompositePipelines {
+    fn ensure_rt_composite(&mut self, device: &wgpu::Device) -> &mut RtCompositePipelines {
         self.rt_composite.get_or_insert_with(|| {
             let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
                 binding,
@@ -525,7 +527,7 @@ impl WiredPasses {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            RtCompositePipelines { combined_bgl, combined_pipeline, uniform }
+            RtCompositePipelines { combined_bgl, combined_pipeline, uniform, combined_bg: None }
         })
     }
 
@@ -566,19 +568,28 @@ impl WiredPasses {
             _pad: [0.0; 2],
         };
         queue.write_buffer(&comp.uniform, 0, bytemuck::bytes_of(&cfg));
-        let combined_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rt_combined_comp_bg"),
-            layout: &comp.combined_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_r32f) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(rv) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(gv) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sao_view) },
-                wgpu::BindGroupEntry { binding: 4, resource: comp.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(gbuf_am_bind) },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(di_bind) },
-            ],
-        });
+        let key_views = [depth_r32f, rv, gv, sao_view, gbuf_am_bind, di_bind];
+        let hit = matches!(
+            &comp.combined_bg,
+            Some((cached, _)) if cached.iter().zip(key_views.iter()).all(|(a, b)| a == *b)
+        );
+        if !hit {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rt_combined_comp_bg"),
+                layout: &comp.combined_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_r32f) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(rv) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(gv) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(sao_view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: comp.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(gbuf_am_bind) },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(di_bind) },
+                ],
+            });
+            comp.combined_bg = Some((key_views.map(Clone::clone), bg));
+        }
+        let (_, combined_bg) = comp.combined_bg.as_ref().unwrap();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("rt_combined_composite"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -590,7 +601,7 @@ impl WiredPasses {
             ..Default::default()
         });
         pass.set_pipeline(&comp.combined_pipeline);
-        pass.set_bind_group(0, &combined_bg, &[]);
+        pass.set_bind_group(0, combined_bg, &[]);
         pass.draw(0..3, 0..1);
     }
 }
@@ -842,6 +853,7 @@ impl State {
                     ],
                     motion: SvgfTex::new(device, "svgf_rt_motion", rt_size),
                     parity: 0,
+                    prep_bgs: [None, None],
                 });
                 svgf.reset_history();
             }
@@ -858,37 +870,49 @@ impl State {
             let curr = bufs.parity;
             let prev = 1 - curr;
             let refl_bind = raw_refl.as_ref().unwrap_or(&sao_raw_view);
-            let prep_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("svgf_rt_prep_bg"),
-                layout: &svgf.prep_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: svgf.prep_u.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_r32f) },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&bufs.depth[curr].view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&bufs.normal[curr].view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: wgpu::BindingResource::TextureView(&bufs.motion.view),
-                    },
-                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(vel_bind) },
-                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&sao_raw_view) },
-                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(refl_bind) },
-                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(gbuf_nr_bind) },
-                ],
-            });
+            let prep_views = [&depth_r32f, vel_bind, &sao_raw_view, refl_bind, gbuf_nr_bind];
+            let prep_hit = matches!(
+                &bufs.prep_bgs[curr],
+                Some((cached, _)) if cached.iter().zip(prep_views.iter()).all(|(a, b)| a == *b)
+            );
+            if !prep_hit {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("svgf_rt_prep_bg"),
+                    layout: &svgf.prep_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: svgf.prep_u.as_entire_binding() },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_r32f) },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&bufs.depth[curr].view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(&bufs.normal[curr].view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&bufs.motion.view),
+                        },
+                        wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(vel_bind) },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&sao_raw_view),
+                        },
+                        wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(refl_bind) },
+                        wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(gbuf_nr_bind) },
+                    ],
+                });
+                bufs.prep_bgs[curr] = Some((prep_views.map(Clone::clone), bg));
+            }
+            let (_, prep_bg) = bufs.prep_bgs[curr].as_ref().unwrap();
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("svgf_rt_prep"),
                     timestamp_writes: None,
                 });
                 pass.set_pipeline(&svgf.prep_pipe);
-                pass.set_bind_group(0, &prep_bg, &[]);
+                pass.set_bind_group(0, prep_bg, &[]);
                 pass.dispatch_workgroups(rt_size.0.div_ceil(8), rt_size.1.div_ceil(8), 1);
             }
             let sao_params =

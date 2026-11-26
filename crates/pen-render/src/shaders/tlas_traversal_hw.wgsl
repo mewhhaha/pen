@@ -49,6 +49,30 @@ struct TlasHit {
   instance_index: u32,
 };
 
+fn trace_tlas_any_hit(
+  origin: vec3f,
+  dir: vec3f,
+  t_min: f32,
+  t_max: f32,
+  mask: u32,
+  tlas_node_count: u32,
+  tlas_inst_count: u32,
+  blas_tri_total: u32,
+) -> bool {
+  if (tlas_inst_count == 0u || blas_tri_total == 0u) {
+    return false;
+  }
+  var rq: ray_query;
+  rayQueryInitialize(
+    &rq,
+    hw_tlas,
+    RayDesc(RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_TERMINATE_ON_FIRST_HIT, mask & 0xffu, t_min, t_max, origin, dir),
+  );
+  rayQueryProceed(&rq);
+  let inter = rayQueryGetCommittedIntersection(&rq);
+  return inter.kind == RAY_QUERY_INTERSECTION_TRIANGLE && inter.instance_custom_data < tlas_inst_count;
+}
+
 fn trace_tlas(
   origin: vec3f,
   dir: vec3f,

@@ -151,15 +151,19 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
       // Specular mode: 3x3 YCoCg variance neighborhood clamping eliminates mirror ghosting
       // when reflected objects or dynamic lights move across reflective surfaces.
       if (spec_mode) {
-        var yc_m1 = vec3f(0.0);
-        var yc_m2 = vec3f(0.0);
-        var yc_w = 0.0;
+        let yc_center = rgb_to_ycocg(max(sample_c, vec3f(0.0)));
+        var yc_m1 = yc_center;
+        var yc_m2 = yc_center * yc_center;
+        var yc_w = 1.0;
         for (var dy = -1; dy <= 1; dy++) {
           for (var dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) {
+              continue;
+            }
             let q = clamp(px + vec2i(dx, dy), vec2i(0), vec2i(w - 1, h - 1));
             let z_q = textureLoad(curr_depth, q, 0).r;
             let n_q = load_normal(curr_normal, q);
-            if (dx == 0 && dy == 0 || is_consistent(z_c, z_q, n_c, n_q)) {
+            if (is_consistent(z_c, z_q, n_c, n_q)) {
               let yc = rgb_to_ycocg(max(finite_rgb(textureLoad(curr_noisy, q, 0).rgb), vec3f(0.0)));
               yc_m1 += yc;
               yc_m2 += yc * yc;
@@ -167,19 +171,17 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
             }
           }
         }
-        if (yc_w > 0.0) {
-          let mu = yc_m1 / yc_w;
-          let sigma = sqrt(max(yc_m2 / yc_w - mu * mu, vec3f(0.0)));
-          let gamma = mix(1.15, 2.25, rough_c);
-          let box_lo = mu - sigma * gamma;
-          let box_hi = mu + sigma * gamma;
-          let hist_yc = rgb_to_ycocg(max(hist_c, vec3f(0.0)));
-          let clamped_yc = clamp(hist_yc, box_lo, box_hi);
-          let clip_err = length(hist_yc - clamped_yc);
-          hist_c = ycocg_to_rgb(clamped_yc);
-          // Drop stale accumulated history count proportionally when history was heavily clipped.
-          hist_l *= clamp(1.0 - clip_err * 2.5, 0.15, 1.0);
-        }
+        let mu = yc_m1 / yc_w;
+        let sigma = sqrt(max(yc_m2 / yc_w - mu * mu, vec3f(0.0)));
+        let gamma = mix(1.15, 2.25, rough_c);
+        let box_lo = mu - sigma * gamma;
+        let box_hi = mu + sigma * gamma;
+        let hist_yc = rgb_to_ycocg(max(hist_c, vec3f(0.0)));
+        let clamped_yc = clamp(hist_yc, box_lo, box_hi);
+        let clip_err = length(hist_yc - clamped_yc);
+        hist_c = ycocg_to_rgb(clamped_yc);
+        // Drop stale accumulated history count proportionally when history was heavily clipped.
+        hist_l *= clamp(1.0 - clip_err * 2.5, 0.15, 1.0);
       }
 
       hist_len = min(hist_l + 1.0, max(u.temporal_params.y, 1.0));
@@ -201,16 +203,25 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
 
   // Spatial 3x3 variance estimation for newly disoccluded pixels (< 4 frames of history).
   if (hist_len < 4.0) {
-    var sw = 0.0;
-    var sm = vec2f(0.0);
-    var sc = vec3f(0.0);
+    let inv_z_denom = 1.0 / (max(u.atrous_params.z, 1e-4) * max(abs(z_c), 1e-3) + 1e-5);
+    let phi_n = max(u.atrous_params.y, 1.0);
+    var sw = 1.0;
+    var sm = moments_c;
+    var sc = sample_c;
     for (var dy = -1; dy <= 1; dy++) {
       for (var dx = -1; dx <= 1; dx++) {
+        if (dx == 0 && dy == 0) {
+          continue;
+        }
         let q = clamp(px + vec2i(dx, dy), vec2i(0), vec2i(w - 1, h - 1));
-        let z_q = textureLoad(curr_depth, q, 0).r;
         let n_q = load_normal(curr_normal, q);
-        let wz = exp(-abs(z_c - z_q) / (max(u.atrous_params.z, 1e-4) * max(abs(z_c), 1e-3) + 1e-5));
-        let wn = pow(max(0.0, dot(n_c, n_q)), max(u.atrous_params.y, 1.0));
+        let ndot = dot(n_c, n_q);
+        if (ndot <= 0.0) {
+          continue;
+        }
+        let z_q = textureLoad(curr_depth, q, 0).r;
+        let wz = exp(-abs(z_c - z_q) * inv_z_denom);
+        let wn = pow(ndot, phi_n);
         let wt = wz * wn;
         let cq = finite_rgb(textureLoad(curr_noisy, q, 0).rgb);
         let lq = finite_clamp(luminance(cq), 240.0);
@@ -244,10 +255,28 @@ fn svgf_temporal(@builtin(global_invocation_id) id: vec3u) {
 @group(0) @binding(4) var atrous_out: texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var hit_dist_tex: texture_2d<f32>;
 
+// Shared 10x10 tile (8x8 + 1px border) for 3x3 variance pre-filter and 4-neighbor depth gradient.
+var<workgroup> wg_var_z: array<vec2f, 100>;
+
 @compute @workgroup_size(8, 8, 1)
-fn svgf_atrous(@builtin(global_invocation_id) id: vec3u) {
+fn svgf_atrous(
+  @builtin(global_invocation_id) id: vec3u,
+  @builtin(local_invocation_id) lid: vec3u,
+  @builtin(workgroup_id) wid: vec3u,
+) {
   let w = i32(u.dims.x);
   let h = i32(u.dims.y);
+  let max_coord = vec2i(max(w - 1, 0), max(h - 1, 0));
+  let tile_origin = vec2i(wid.xy * 8u) - vec2i(1);
+  let lidx = lid.y * 8u + lid.x;
+  for (var slot = lidx; slot < 100u; slot += 64u) {
+    let lx = i32(slot % 10u);
+    let ly = i32(slot / 10u);
+    let gp = clamp(tile_origin + vec2i(lx, ly), vec2i(0), max_coord);
+    wg_var_z[slot] = vec2f(textureLoad(atrous_in, gp, 0).a, textureLoad(atrous_depth, gp, 0).r);
+  }
+  workgroupBarrier();
+
   let px = vec2i(id.xy);
   if (px.x >= w || px.y >= h) {
     return;
@@ -255,30 +284,32 @@ fn svgf_atrous(@builtin(global_invocation_id) id: vec3u) {
 
   let spec_mode = (u.dims.w & 2u) != 0u;
   let step_size = max(i32(u.dims.z), 1);
+  let step_f = f32(step_size);
   let center = textureLoad(atrous_in, px, 0);
   let c_p = center.rgb;
   let l_p = luminance(c_p);
-  let z_p = textureLoad(atrous_depth, px, 0).r;
+  let tile_cx = lid.x + 1u;
+  let tile_cy = lid.y + 1u;
+  let z_p = wg_var_z[tile_cy * 10u + tile_cx].y;
   let n_raw_p = textureLoad(atrous_normal, px, 0);
   let n_l2_p = dot(n_raw_p.xyz, n_raw_p.xyz);
   let n_p = select(vec3f(0.0, 1.0, 0.0), n_raw_p.xyz * inverseSqrt(n_l2_p), n_l2_p > 1e-8);
   let rough_p = clamp(n_raw_p.w, 0.04, 1.0);
 
-  // 3x3 Gaussian variance pre-filter (SVGF Section 4.3).
-  let g3 = array<f32, 3>(0.25, 0.5, 0.25);
-  var filtered_var = 0.0;
-  for (var gy = -1; gy <= 1; gy++) {
-    for (var gx = -1; gx <= 1; gx++) {
-      let q = clamp(px + vec2i(gx, gy), vec2i(0), vec2i(w - 1, h - 1));
-      filtered_var += textureLoad(atrous_in, q, 0).a * g3[gx + 1] * g3[gy + 1];
-    }
-  }
+  // 3x3 Gaussian variance pre-filter from shared tile (SVGF Section 4.3).
+  let r0 = (tile_cy - 1u) * 10u + tile_cx;
+  let r1 = tile_cy * 10u + tile_cx;
+  let r2 = (tile_cy + 1u) * 10u + tile_cx;
+  let filtered_var =
+    0.0625 * (wg_var_z[r0 - 1u].x + wg_var_z[r0 + 1u].x + wg_var_z[r2 - 1u].x + wg_var_z[r2 + 1u].x) +
+    0.125 * (wg_var_z[r0].x + wg_var_z[r1 - 1u].x + wg_var_z[r1 + 1u].x + wg_var_z[r2].x) +
+    0.25 * wg_var_z[r1].x;
 
-  // Depth gradient estimate from immediate screen neighbors.
-  let z_rx = textureLoad(atrous_depth, clamp(px + vec2i(1, 0), vec2i(0), vec2i(w - 1, h - 1)), 0).r;
-  let z_lx = textureLoad(atrous_depth, clamp(px - vec2i(1, 0), vec2i(0), vec2i(w - 1, h - 1)), 0).r;
-  let z_dy = textureLoad(atrous_depth, clamp(px + vec2i(0, 1), vec2i(0), vec2i(w - 1, h - 1)), 0).r;
-  let z_uy = textureLoad(atrous_depth, clamp(px - vec2i(0, 1), vec2i(0), vec2i(w - 1, h - 1)), 0).r;
+  // Depth gradient estimate from shared tile immediate screen neighbors.
+  let z_rx = wg_var_z[r1 + 1u].y;
+  let z_lx = wg_var_z[r1 - 1u].y;
+  let z_dy = wg_var_z[r2].y;
+  let z_uy = wg_var_z[r0].y;
   let grad_z = max(max(abs(z_rx - z_p), abs(z_p - z_lx)), max(abs(z_dy - z_p), abs(z_p - z_uy)));
 
   // Roughness-scaled specular edge stopping: keeps mirror reflections sharp while smoothing glossy lobes.
@@ -294,43 +325,54 @@ fn svgf_atrous(@builtin(global_invocation_id) id: vec3u) {
   }
   let sigma_l = max(u.atrous_params.x, 0.05) * rough_l_scale * mix(1.0, 0.45, contact)
       * sqrt(max(filtered_var, 0.0)) + 1e-4;
+  let inv_sigma_l = 1.0 / sigma_l;
   let phi_n = max(u.atrous_params.y, 1.0) * rough_n_scale;
   let phi_z = max(u.atrous_params.z, 1e-4);
+  let z_floor = max(abs(z_p) * 1e-3, 1e-5);
   let mirror_taper = select(0.0, (1.0 - rough_p) * (1.0 - rough_p) * 0.45, spec_mode) + contact * 0.65;
   let phi_rough = mix(10.0, 24.0, contact);
 
-  // 5x5 B3-spline wavelet weights.
+  // 5x5 B3-spline wavelet weights; seed with center tap (0.375 * 0.375 = 0.140625) to skip center reload.
   let k5 = array<f32, 5>(0.0625, 0.25, 0.375, 0.25, 0.0625);
 
-  var sum_w = 0.0;
-  var sum_c = vec3f(0.0);
-  var sum_v = 0.0;
+  var sum_w = 0.140625;
+  var sum_c = c_p * 0.140625;
+  var sum_v = center.a * 0.019775390625;
 
   for (var ky = -2; ky <= 2; ky++) {
+    let qy = px.y + ky * step_size;
+    if (qy < 0 || qy >= h) {
+      continue;
+    }
+    let kwy = k5[ky + 2];
     for (var kx = -2; kx <= 2; kx++) {
-      let q = px + vec2i(kx * step_size, ky * step_size);
-      if (q.x < 0 || q.y < 0 || q.x >= w || q.y >= h) {
+      if (kx == 0 && ky == 0) {
         continue;
       }
-      let kw = k5[kx + 2] * k5[ky + 2];
-      let sample_q = textureLoad(atrous_in, q, 0);
-      var wt = kw;
-      if (kx != 0 || ky != 0) {
-        let z_q = textureLoad(atrous_depth, q, 0).r;
-        let n_raw_q = textureLoad(atrous_normal, q, 0);
-        let n_l2_q = dot(n_raw_q.xyz, n_raw_q.xyz);
-        let n_q = select(vec3f(0.0, 1.0, 0.0), n_raw_q.xyz * inverseSqrt(n_l2_q), n_l2_q > 1e-8);
-        let rough_q = clamp(n_raw_q.w, 0.04, 1.0);
-        let l_q = luminance(sample_q.rgb);
-
-        let dist_steps = length(vec2f(f32(kx * step_size), f32(ky * step_size)));
-        let denom_z = phi_z * max(grad_z * dist_steps, max(abs(z_p) * 1e-3, 1e-5));
-        let wz = exp(-abs(z_p - z_q) / denom_z);
-        let wn = pow(max(0.0, dot(n_p, n_q)), phi_n);
-        let wl = exp(-abs(l_p - l_q) / sigma_l);
-        let wr = select(1.0, exp(-abs(rough_p - rough_q) * phi_rough) * exp(-dist_steps * mirror_taper), spec_mode);
-        wt = kw * wz * wn * wl * wr;
+      let qx = px.x + kx * step_size;
+      if (qx < 0 || qx >= w) {
+        continue;
       }
+      let q = vec2i(qx, qy);
+      let n_raw_q = textureLoad(atrous_normal, q, 0);
+      let n_l2_q = dot(n_raw_q.xyz, n_raw_q.xyz);
+      let n_q = select(vec3f(0.0, 1.0, 0.0), n_raw_q.xyz * inverseSqrt(n_l2_q), n_l2_q > 1e-8);
+      let ndot = dot(n_p, n_q);
+      if (ndot <= 0.0) {
+        continue;
+      }
+      let z_q = textureLoad(atrous_depth, q, 0).r;
+      let sample_q = textureLoad(atrous_in, q, 0);
+      let l_q = luminance(sample_q.rgb);
+
+      let dist_steps = sqrt(f32(kx * kx + ky * ky)) * step_f;
+      let denom_z = phi_z * max(grad_z * dist_steps, z_floor);
+      var expo = -abs(z_p - z_q) / denom_z - abs(l_p - l_q) * inv_sigma_l;
+      if (spec_mode) {
+        let rough_q = clamp(n_raw_q.w, 0.04, 1.0);
+        expo -= abs(rough_p - rough_q) * phi_rough + dist_steps * mirror_taper;
+      }
+      let wt = k5[kx + 2] * kwy * pow(ndot, phi_n) * exp(expo);
       sum_c += sample_q.rgb * wt;
       sum_v += sample_q.a * wt * wt;
       sum_w += wt;

@@ -117,18 +117,36 @@ fn ellipse_distance(point: vec2f, half_size: vec2f) -> f32 {
             hi = min(hi, uv.y / sqrt((1.0 - major) * (1.0 + major)));
         }
         hi = max(lo, hi);
-        for (var i = 0u; i < 48u; i++) {
-            let mid = (lo + hi) * 0.5;
-            if mid == lo || mid == hi {
+        let r1 = r - 1.0;
+        var t = (lo + hi) * 0.5;
+        for (var i = 0u; i < 16u; i++) {
+            let tr = t + r1;
+            let px = n / tr;
+            let py = uv.y / t;
+            let f = px * px + py * py - 1.0;
+            if abs(f) <= 1e-6 {
+                lo = t;
+                hi = t;
                 break;
             }
-            let projection = vec2f(n / (mid + (r - 1.0)), uv.y / mid);
-            let too_small = dot(projection, projection) > 1.0;
-            lo = select(lo, mid, too_small);
-            hi = select(mid, hi, too_small);
+            if f > 0.0 {
+                lo = t;
+            } else {
+                hi = t;
+            }
+            if hi - lo <= max(1e-6 * hi, 1e-7) {
+                break;
+            }
+            let df_neg = 2.0 * (px * px / tr + py * py / t);
+            let cand = t + f / max(df_neg, 1e-12);
+            if cand > lo && cand < hi {
+                t = cand;
+            } else {
+                t = (lo + hi) * 0.5;
+            }
         }
         let root = (lo + hi) * 0.5;
-        closest = axes * vec2f(n / (root + (r - 1.0)), uv.y / root);
+        closest = axes * vec2f(n / (root + r1), uv.y / root);
     } else if uv.x < 1.0 - 1.0 / r {
         let x = uv.x / (1.0 - 1.0 / r);
         closest = axes * vec2f(x, sqrt(max(1.0 - x * x, 0.0)));

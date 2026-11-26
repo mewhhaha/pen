@@ -71,6 +71,7 @@ pub(crate) struct Environment {
     /// The resident probe volume: every probe's 28 floats, and which bake it
     /// is (revision and counts).
     probe_data: wgpu::Buffer,
+    probe_scratch: Vec<f32>,
     resident: Option<(u32, [u32; 3])>,
     /// The sky colors the cube holds, or is to hold once encoded.
     drawn: Option<[u32; 9]>,
@@ -259,6 +260,7 @@ impl Environment {
             empty: buffer(device, "no sky light", LIGHT_BYTES, wgpu::BufferUsages::UNIFORM),
             passes: buffer(device, "sky passes", STRIDE * PASSES, wgpu::BufferUsages::UNIFORM),
             probe_data: buffer(device, "probes", PROBE_BYTES, wgpu::BufferUsages::STORAGE),
+            probe_scratch: Vec::new(),
             resident: None,
             drawn: None,
             stale: false,
@@ -398,16 +400,20 @@ impl Environment {
         let total = counts.iter().map(|&n| n as usize).product::<usize>();
         let fits = total > 0 && total <= MAX_PROBES;
         if fits && probes.len() == total {
-            let mut floats = Vec::with_capacity(total * PROBE_FLOATS);
+            self.probe_scratch.clear();
+            let needed = total * PROBE_FLOATS;
+            if self.probe_scratch.capacity() < needed {
+                self.probe_scratch.reserve(needed - self.probe_scratch.len());
+            }
             for probe in probes {
                 for v in
                     [probe.sh0, probe.sh1, probe.sh2, probe.sh3, probe.sh4, probe.sh5, probe.sh6, probe.sh7, probe.sh8]
                 {
-                    floats.extend([v.x, v.y, v.z]);
+                    self.probe_scratch.extend([v.x, v.y, v.z]);
                 }
-                floats.push(probe.valid);
+                self.probe_scratch.push(probe.valid);
             }
-            queue.write_buffer(&self.probe_data, 0, bytemuck::cast_slice(&floats));
+            queue.write_buffer(&self.probe_data, 0, bytemuck::cast_slice(&self.probe_scratch));
             self.resident = Some((volume.revision, counts));
         }
         fits && self.resident == Some((volume.revision, counts))

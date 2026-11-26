@@ -36,5 +36,8 @@ fn bins(@builtin(global_invocation_id) id: vec3u, @builtin(local_invocation_inde
     }
   }
   workgroupBarrier();
-  atomicAdd(&histogram[index], atomicLoad(&local[index]));
+  let count = atomicLoad(&local[index]);
+  if (count > 0u) {
+    atomicAdd(&histogram[index], count);
+  }
 }

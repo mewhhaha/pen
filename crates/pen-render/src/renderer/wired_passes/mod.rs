@@ -193,11 +193,13 @@ pub(super) struct WiredPasses {
     pub split_views: Vec<SplitViewSlot>,
     pub polish_input: Option<(u32, u32, wgpu::TextureFormat, wgpu::Texture, wgpu::TextureView)>,
     pub msaa_depth_resolve: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    msaa_depth_resolve_bg: Option<(wgpu::TextureView, u32, wgpu::BindGroup)>,
     pub dummy_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
     pub dummy_vel: Option<(wgpu::Texture, wgpu::TextureView)>,
     pub dummy_rgba16f: Option<(wgpu::Texture, wgpu::TextureView)>,
     blit_shared: Option<BlitShared>,
     blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
+    blit_bg: Option<(wgpu::TextureView, wgpu::BindGroup)>,
     pub in_secondary_camera: bool,
     pub bypass_display_output: bool,
 }
@@ -362,11 +364,18 @@ impl WiredPasses {
         }
         let dst = self.msaa_depth_resolve.as_ref().unwrap().3.clone();
         let pipeline = built_ins.get(BuiltIn::OpaqueDepth(samples));
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wired_msaa_depth_resolve_bg"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_only) }],
-        });
+        if self.msaa_depth_resolve_bg.as_ref().is_none_or(|(view, s, _)| view != depth_only || *s != samples) {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("wired_msaa_depth_resolve_bg"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(depth_only),
+                }],
+            });
+            self.msaa_depth_resolve_bg = Some((depth_only.clone(), samples, bg));
+        }
+        let bg = &self.msaa_depth_resolve_bg.as_ref().unwrap().2;
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("wired_msaa_depth_resolve"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -378,7 +387,7 @@ impl WiredPasses {
             ..Default::default()
         });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, bg, &[]);
         pass.draw(0..3, 0..1);
         dst
     }
@@ -463,14 +472,18 @@ impl WiredPasses {
         self.ensure_blit(device, target_format);
         let shared = self.blit_shared.as_ref().unwrap();
         let pipeline = self.blit_pipelines.get(&target_format).unwrap();
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wired_copy_blit_bg"),
-            layout: &shared.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&shared.sampler) },
-            ],
-        });
+        if self.blit_bg.as_ref().is_none_or(|(view, _)| view != src) {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("wired_copy_blit_bg"),
+                layout: &shared.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&shared.sampler) },
+                ],
+            });
+            self.blit_bg = Some((src.clone(), bg));
+        }
+        let bg = &self.blit_bg.as_ref().unwrap().1;
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("wired_copy_blit"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -482,7 +495,7 @@ impl WiredPasses {
             ..Default::default()
         });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, bg, &[]);
         pass.draw(0..3, 0..1);
     }
 }

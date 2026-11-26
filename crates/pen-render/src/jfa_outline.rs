@@ -114,6 +114,7 @@ pub struct JfaOutlinePass {
     composite_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     targets: Option<MaskTargets>,
     resolved: Option<(usize, wgpu::TextureView, u32)>,
+    composite_bg: Option<(usize, wgpu::TextureView, u32, wgpu::TextureFormat, wgpu::BindGroup)>,
 }
 
 impl JfaOutlinePass {
@@ -178,6 +179,7 @@ impl JfaOutlinePass {
             composite_pipelines: Vec::new(),
             targets: None,
             resolved: None,
+            composite_bg: None,
         }
     }
 
@@ -267,6 +269,7 @@ impl JfaOutlinePass {
         });
         self.targets = Some(MaskTargets { mask, mask_view, depth_view, seeds, jumps, step_stride, init });
         self.resolved = None;
+        self.composite_bg = None;
     }
 
     /// Replace the palette. Omitted palette entries become transparent.
@@ -411,29 +414,45 @@ impl JfaOutlinePass {
             contents: bytemuck::bytes_of(&draw),
             usage: wgpu::BufferUsages::UNIFORM,
         });
-        let mut entries = vec![wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }];
-        if let Some(depth) = params.scene_depth {
+        let draw_entry = wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() };
+        let depth_entry = params.scene_depth.map(|depth| {
             let binding = match scene_depth_kind {
                 SceneDepthKind::R32Float => 7,
                 _ => 1,
             };
-            entries.push(wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(depth) });
-        }
-        if let Some((offset, buffer, size)) = skin {
-            entries.push(wgpu::BindGroupEntry {
-                binding: 8,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer,
-                    offset: u64::from(offset),
-                    size: wgpu::BufferSize::new(size),
-                }),
-            });
-        }
-        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("JFA mesh draw bindings"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &entries,
+            wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(depth) }
         });
+        let skin_entry = skin.map(|(offset, buffer, size)| wgpu::BindGroupEntry {
+            binding: 8,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer,
+                offset: u64::from(offset),
+                size: wgpu::BufferSize::new(size),
+            }),
+        });
+        let layout = pipeline.get_bind_group_layout(0);
+        let bindings = match (depth_entry, skin_entry) {
+            (Some(depth), Some(skin)) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("JFA mesh draw bindings"),
+                layout: &layout,
+                entries: &[draw_entry, depth, skin],
+            }),
+            (Some(depth), None) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("JFA mesh draw bindings"),
+                layout: &layout,
+                entries: &[draw_entry, depth],
+            }),
+            (None, Some(skin)) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("JFA mesh draw bindings"),
+                layout: &layout,
+                entries: &[draw_entry, skin],
+            }),
+            (None, None) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("JFA mesh draw bindings"),
+                layout: &layout,
+                entries: &[draw_entry],
+            }),
+        };
         PreparedMeshMask { pipeline, bindings }
     }
 
@@ -512,24 +531,37 @@ impl JfaOutlinePass {
                 self.composite_pipelines.push((target_format, pipeline));
                 &self.composite_pipelines.last().unwrap().1
             };
-        let radius_offset = u64::from((*radius).clamp(1, MAX_RADIUS) - 1) * u64::from(self.radius_stride);
-        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("JFA composite bindings"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(mask) },
-                wgpu::BindGroupEntry { binding: 3, resource: targets.seeds[*seed].as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: self.styles.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.radii,
-                        offset: radius_offset,
-                        size: wgpu::BufferSize::new(16),
-                    }),
-                },
-            ],
-        });
+        let clamped_radius = (*radius).clamp(1, MAX_RADIUS);
+        let cache_hit = matches!(
+            &self.composite_bg,
+            Some((cached_seed, cached_mask, cached_radius, cached_format, _))
+                if *cached_seed == *seed
+                    && cached_mask == mask
+                    && *cached_radius == clamped_radius
+                    && *cached_format == target_format
+        );
+        if !cache_hit {
+            let radius_offset = u64::from(clamped_radius - 1) * u64::from(self.radius_stride);
+            let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("JFA composite bindings"),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(mask) },
+                    wgpu::BindGroupEntry { binding: 3, resource: targets.seeds[*seed].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: self.styles.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &self.radii,
+                            offset: radius_offset,
+                            size: wgpu::BufferSize::new(16),
+                        }),
+                    },
+                ],
+            });
+            self.composite_bg = Some((*seed, mask.clone(), clamped_radius, target_format, bindings));
+        }
+        let (_, _, _, _, bindings) = self.composite_bg.as_ref().unwrap();
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("JFA composite"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -541,7 +573,7 @@ impl JfaOutlinePass {
             ..Default::default()
         });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &bindings, &[]);
+        pass.set_bind_group(0, bindings, &[]);
         pass.draw(0..3, 0..1);
     }
 

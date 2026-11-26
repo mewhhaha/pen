@@ -50,21 +50,23 @@ struct TlasHit {
 
 struct TlasRayInv {
   inv_dir: vec3f,
+  neg_origin_inv: vec3f,
   parallel: vec3<bool>,
 };
 
-fn tlas_ray_inv(dir: vec3f) -> TlasRayInv {
+fn tlas_ray_inv(origin: vec3f, dir: vec3f) -> TlasRayInv {
   let parallel = abs(dir) < vec3f(1e-12);
   let safe_dir = select(dir, vec3f(1.0), parallel);
-  return TlasRayInv(1.0 / safe_dir, parallel);
+  let inv_dir = 1.0 / safe_dir;
+  return TlasRayInv(inv_dir, -origin * inv_dir, parallel);
 }
 
 fn tlas_ray_aabb_hit_inv(origin: vec3f, ri: TlasRayInv, bmin: vec3f, bmax: vec3f, t_min: f32, t_max: f32) -> f32 {
   if (any(ri.parallel & ((origin < bmin) | (origin > bmax)))) {
     return -1.0;
   }
-  let t0 = (bmin - origin) * ri.inv_dir;
-  let t1 = (bmax - origin) * ri.inv_dir;
+  let t0 = bmin * ri.inv_dir + ri.neg_origin_inv;
+  let t1 = bmax * ri.inv_dir + ri.neg_origin_inv;
   let near_v = select(min(t0, t1), vec3f(t_min), ri.parallel);
   let far_v = select(max(t0, t1), vec3f(t_max), ri.parallel);
   let t_enter = max(t_min, max(near_v.x, max(near_v.y, near_v.z)));
@@ -73,7 +75,7 @@ fn tlas_ray_aabb_hit_inv(origin: vec3f, ri: TlasRayInv, bmin: vec3f, bmax: vec3f
 }
 
 fn tlas_ray_aabb_hit(origin: vec3f, dir: vec3f, bmin: vec3f, bmax: vec3f, t_min: f32, t_max: f32) -> f32 {
-  return tlas_ray_aabb_hit_inv(origin, tlas_ray_inv(dir), bmin, bmax, t_min, t_max);
+  return tlas_ray_aabb_hit_inv(origin, tlas_ray_inv(origin, dir), bmin, bmax, t_min, t_max);
 }
 
 struct TlasRayShear {
@@ -152,6 +154,148 @@ fn tlas_ray_tri_watertight_verts(origin: vec3f, rs: TlasRayShear, v0: vec3f, v1:
   return vec3f(t_scaled * inv_det, v_e * inv_det, w_e * inv_det);
 }
 
+fn trace_tlas_any_hit(
+  origin: vec3f,
+  dir: vec3f,
+  t_min: f32,
+  t_max: f32,
+  mask: u32,
+  tlas_node_count: u32,
+  tlas_inst_count: u32,
+  blas_tri_total: u32,
+) -> bool {
+  if (tlas_node_count == 0u || tlas_inst_count == 0u || blas_tri_total == 0u) {
+    return false;
+  }
+  let world_inv = tlas_ray_inv(origin, dir);
+  let root_tn = tlas_nodes[0u];
+  if (tlas_ray_aabb_hit_inv(origin, world_inv, root_tn.aabb_min, root_tn.aabb_max, t_min, t_max) < 0.0) {
+    return false;
+  }
+
+  var tlas_stack: array<u32, 24>;
+  var t_sp: i32 = -1;
+  var blas_stack: array<u32, 28>;
+  var cur_tn = 0u;
+
+  loop {
+    let tn = tlas_nodes[cur_tn];
+    if (tn.tri_count > 0u) {
+      let i_first = tn.left_or_first;
+      let i_end = min(i_first + tn.tri_count, tlas_inst_count);
+      for (var ii = i_first; ii < i_end; ii++) {
+        let inst_mask = tlas_instances[ii].mask;
+        let b_cnt = tlas_instances[ii].blas_node_count;
+        if ((inst_mask & mask) == 0u || b_cnt == 0u) {
+          continue;
+        }
+        let inv_xform = tlas_instances[ii].inv_transform;
+        let local_origin = (inv_xform * vec4f(origin, 1.0)).xyz;
+        let local_dir = (inv_xform * vec4f(dir, 0.0)).xyz;
+        if (dot(local_dir, local_dir) < 1e-16) {
+          continue;
+        }
+        let local_inv = tlas_ray_inv(local_origin, local_dir);
+        let b_off = tlas_instances[ii].blas_node_offset;
+        let root_bn = blas_nodes[b_off];
+        if (tlas_ray_aabb_hit_inv(local_origin, local_inv, root_bn.aabb_min, root_bn.aabb_max, t_min, t_max) < 0.0) {
+          continue;
+        }
+        let rs = tlas_build_ray_shear(local_dir);
+        let tri_off = tlas_instances[ii].blas_tri_offset;
+        var b_sp: i32 = -1;
+        var cur_bn = 0u;
+        loop {
+          let bn = blas_nodes[b_off + cur_bn];
+          if (bn.tri_count > 0u) {
+            let tf = tri_off + bn.left_or_first;
+            let te = min(tf + bn.tri_count, blas_tri_total);
+            for (var ti = tf; ti < te; ti++) {
+              let res = tlas_ray_tri_watertight_verts(
+                local_origin,
+                rs,
+                blas_tris[ti].v0.xyz,
+                blas_tris[ti].v1.xyz,
+                blas_tris[ti].v2.xyz,
+                t_min,
+                t_max,
+              );
+              if (res.x > 0.0) {
+                return true;
+              }
+            }
+          } else {
+            let left = bn.left_or_first;
+            let right = left + 1u;
+            var dl = -1.0;
+            if (left < b_cnt) {
+              let nl = blas_nodes[b_off + left];
+              dl = tlas_ray_aabb_hit_inv(local_origin, local_inv, nl.aabb_min, nl.aabb_max, t_min, t_max);
+            }
+            var dr = -1.0;
+            if (right < b_cnt) {
+              let nr = blas_nodes[b_off + right];
+              dr = tlas_ray_aabb_hit_inv(local_origin, local_inv, nr.aabb_min, nr.aabb_max, t_min, t_max);
+            }
+            if (dl >= 0.0 && dr >= 0.0) {
+              if (b_sp + 1 < 28) {
+                b_sp += 1;
+                blas_stack[b_sp] = select(left, right, dl < dr);
+              }
+              cur_bn = select(right, left, dl < dr);
+              continue;
+            } else if (dl >= 0.0) {
+              cur_bn = left;
+              continue;
+            } else if (dr >= 0.0) {
+              cur_bn = right;
+              continue;
+            }
+          }
+          if (b_sp < 0) {
+            break;
+          }
+          cur_bn = blas_stack[b_sp];
+          b_sp -= 1;
+        }
+      }
+    } else {
+      let left = tn.left_or_first;
+      let right = left + 1u;
+      var dl = -1.0;
+      if (left < tlas_node_count) {
+        let nl = tlas_nodes[left];
+        dl = tlas_ray_aabb_hit_inv(origin, world_inv, nl.aabb_min, nl.aabb_max, t_min, t_max);
+      }
+      var dr = -1.0;
+      if (right < tlas_node_count) {
+        let nr = tlas_nodes[right];
+        dr = tlas_ray_aabb_hit_inv(origin, world_inv, nr.aabb_min, nr.aabb_max, t_min, t_max);
+      }
+      if (dl >= 0.0 && dr >= 0.0) {
+        if (t_sp + 1 < 24) {
+          t_sp += 1;
+          tlas_stack[t_sp] = select(left, right, dl < dr);
+        }
+        cur_tn = select(right, left, dl < dr);
+        continue;
+      } else if (dl >= 0.0) {
+        cur_tn = left;
+        continue;
+      } else if (dr >= 0.0) {
+        cur_tn = right;
+        continue;
+      }
+    }
+    if (t_sp < 0) {
+      break;
+    }
+    cur_tn = tlas_stack[t_sp];
+    t_sp -= 1;
+  }
+  return false;
+}
+
 fn trace_tlas(
   origin: vec3f,
   dir: vec3f,
@@ -168,7 +312,12 @@ fn trace_tlas(
     return best;
   }
 
-  let world_inv = tlas_ray_inv(dir);
+  let world_inv = tlas_ray_inv(origin, dir);
+  let root_tn = tlas_nodes[0u];
+  if (tlas_ray_aabb_hit_inv(origin, world_inv, root_tn.aabb_min, root_tn.aabb_max, t_min, t_max) < 0.0) {
+    return best;
+  }
+
   var hit_found = false;
   var best_t = t_max;
   var best_u = 0.0;
@@ -177,22 +326,15 @@ fn trace_tlas(
   var best_inst = 0u;
 
   var tlas_stack: array<u32, 24>;
-  var t_sp: i32 = 0;
-  tlas_stack[0] = 0u;
+  var tlas_stack_t: array<f32, 24>;
+  var t_sp: i32 = -1;
+  var cur_tn = 0u;
 
   var blas_stack: array<u32, 28>;
+  var blas_stack_t: array<f32, 28>;
 
-  while (t_sp >= 0) {
-    let tn_idx = tlas_stack[t_sp];
-    t_sp -= 1;
-    if (tn_idx >= tlas_node_count) {
-      continue;
-    }
-    let tn = tlas_nodes[tn_idx];
-    if (tlas_ray_aabb_hit_inv(origin, world_inv, tn.aabb_min, tn.aabb_max, t_min, best_t) < 0.0) {
-      continue;
-    }
-
+  loop {
+    let tn = tlas_nodes[cur_tn];
     if (tn.tri_count > 0u) {
       let i_first = tn.left_or_first;
       let i_end = min(i_first + tn.tri_count, tlas_inst_count);
@@ -209,24 +351,20 @@ fn trace_tlas(
         if (dot(local_dir, local_dir) < 1e-16) {
           continue;
         }
-        let local_inv = tlas_ray_inv(local_dir);
-        let rs = tlas_build_ray_shear(local_dir);
-
-        var b_sp: i32 = 0;
-        blas_stack[0] = 0u;
+        let local_inv = tlas_ray_inv(local_origin, local_dir);
         let b_off = tlas_instances[ii].blas_node_offset;
+        let root_bn = blas_nodes[b_off];
+        if (tlas_ray_aabb_hit_inv(local_origin, local_inv, root_bn.aabb_min, root_bn.aabb_max, t_min, best_t) < 0.0) {
+          continue;
+        }
+        let rs = tlas_build_ray_shear(local_dir);
         let tri_off = tlas_instances[ii].blas_tri_offset;
 
-        while (b_sp >= 0) {
-          let bn_rel = blas_stack[b_sp];
-          b_sp -= 1;
-          if (bn_rel >= b_cnt) {
-            continue;
-          }
-          let bn = blas_nodes[b_off + bn_rel];
-          if (tlas_ray_aabb_hit_inv(local_origin, local_inv, bn.aabb_min, bn.aabb_max, t_min, best_t) < 0.0) {
-            continue;
-          }
+        var b_sp: i32 = -1;
+        var cur_bn = 0u;
+
+        loop {
+          let bn = blas_nodes[b_off + cur_bn];
           if (bn.tri_count > 0u) {
             let tf = tri_off + bn.left_or_first;
             let te = min(tf + bn.tri_count, blas_tri_total);
@@ -257,7 +395,7 @@ fn trace_tlas(
             }
           } else {
             let left = bn.left_or_first;
-            let right = bn.left_or_first + 1u;
+            let right = left + 1u;
             var dl = -1.0;
             if (left < b_cnt) {
               let nl = blas_nodes[b_off + left];
@@ -269,27 +407,41 @@ fn trace_tlas(
               dr = tlas_ray_aabb_hit_inv(local_origin, local_inv, nr.aabb_min, nr.aabb_max, t_min, best_t);
             }
             if (dl >= 0.0 && dr >= 0.0) {
-              let near_c = select(right, left, dl < dr);
-              let far_c = select(left, right, dl < dr);
-              if (b_sp + 2 < 28) {
+              let left_near = dl < dr;
+              if (b_sp + 1 < 28) {
                 b_sp += 1;
-                blas_stack[b_sp] = far_c;
-                b_sp += 1;
-                blas_stack[b_sp] = near_c;
+                blas_stack[b_sp] = select(left, right, left_near);
+                blas_stack_t[b_sp] = select(dl, dr, left_near);
               }
-            } else if (dl >= 0.0 && b_sp + 1 < 28) {
-              b_sp += 1;
-              blas_stack[b_sp] = left;
-            } else if (dr >= 0.0 && b_sp + 1 < 28) {
-              b_sp += 1;
-              blas_stack[b_sp] = right;
+              cur_bn = select(right, left, left_near);
+              continue;
+            } else if (dl >= 0.0) {
+              cur_bn = left;
+              continue;
+            } else if (dr >= 0.0) {
+              cur_bn = right;
+              continue;
             }
+          }
+          var popped_b = false;
+          while (b_sp >= 0) {
+            let next_b = blas_stack[b_sp];
+            let next_bt = blas_stack_t[b_sp];
+            b_sp -= 1;
+            if (next_bt <= best_t) {
+              cur_bn = next_b;
+              popped_b = true;
+              break;
+            }
+          }
+          if (!popped_b) {
+            break;
           }
         }
       }
     } else {
       let left = tn.left_or_first;
-      let right = tn.left_or_first + 1u;
+      let right = left + 1u;
       var dl = -1.0;
       if (left < tlas_node_count) {
         let nl = tlas_nodes[left];
@@ -301,21 +453,35 @@ fn trace_tlas(
         dr = tlas_ray_aabb_hit_inv(origin, world_inv, nr.aabb_min, nr.aabb_max, t_min, best_t);
       }
       if (dl >= 0.0 && dr >= 0.0) {
-        let near_c = select(right, left, dl < dr);
-        let far_c = select(left, right, dl < dr);
-        if (t_sp + 2 < 24) {
+        let left_near = dl < dr;
+        if (t_sp + 1 < 24) {
           t_sp += 1;
-          tlas_stack[t_sp] = far_c;
-          t_sp += 1;
-          tlas_stack[t_sp] = near_c;
+          tlas_stack[t_sp] = select(left, right, left_near);
+          tlas_stack_t[t_sp] = select(dl, dr, left_near);
         }
-      } else if (dl >= 0.0 && t_sp + 1 < 24) {
-        t_sp += 1;
-        tlas_stack[t_sp] = left;
-      } else if (dr >= 0.0 && t_sp + 1 < 24) {
-        t_sp += 1;
-        tlas_stack[t_sp] = right;
+        cur_tn = select(right, left, left_near);
+        continue;
+      } else if (dl >= 0.0) {
+        cur_tn = left;
+        continue;
+      } else if (dr >= 0.0) {
+        cur_tn = right;
+        continue;
       }
+    }
+    var popped_t = false;
+    while (t_sp >= 0) {
+      let next_t = tlas_stack[t_sp];
+      let next_tt = tlas_stack_t[t_sp];
+      t_sp -= 1;
+      if (next_tt <= best_t) {
+        cur_tn = next_t;
+        popped_t = true;
+        break;
+      }
+    }
+    if (!popped_t) {
+      break;
     }
   }
 

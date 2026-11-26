@@ -47,13 +47,24 @@ struct SimCounters {
 @group(0) @binding(5) var<storage, read_write> counters: SimCounters;
 @group(0) @binding(6) var depth_tex: texture_2d<f32>;
 
+fn pcg3(v_in: vec3u) -> vec3u {
+  var v = v_in * 1664525u + 1013904223u;
+  v.x += v.y * v.z;
+  v.y += v.z * v.x;
+  v.z += v.x * v.y;
+  v ^= v >> vec3u(16u);
+  v.x += v.y * v.z;
+  v.y += v.z * v.x;
+  v.z += v.x * v.y;
+  return v;
+}
+
 fn hash3(p: vec3f) -> vec3f {
-  let q = vec3f(
-    dot(p, vec3f(127.1, 311.7, 74.7)),
-    dot(p, vec3f(269.5, 183.3, 246.1)),
-    dot(p, vec3f(113.5, 271.9, 124.6)),
-  );
-  return fract(sin(q) * 43758.5453);
+  return vec3f(pcg3(vec3u(vec3i(floor(p)))) >> vec3u(8u)) * (1.0 / 16777216.0);
+}
+
+fn hash3_float(p: vec3f) -> vec3f {
+  return vec3f(pcg3(bitcast<vec3u>(p)) >> vec3u(8u)) * (1.0 / 16777216.0);
 }
 
 fn value_noise3_vec(p: vec3f) -> vec3f {
@@ -136,7 +147,7 @@ fn enqueue_children(origin: vec3f, normal: vec3f, base_vel: vec3f, base_color: v
     if (q >= max_p) {
       break;
     }
-    let rnd = hash3(vec3f(f32(seed_id) * 0.13 + f32(k) * 7.1, params.curl_drag.w * 3.7, f32(q) * 0.29));
+    let rnd = hash3_float(vec3f(f32(seed_id) * 0.13 + f32(k) * 7.1, params.curl_drag.w * 3.7, f32(q) * 0.29));
     let angle = rnd.x * 6.2831853;
     let spread = 0.35 + 0.55 * rnd.y;
     let dir = normalize(normal * (0.6 + 0.4 * rnd.z) + (t1 * cos(angle) + t2 * sin(angle)) * spread);

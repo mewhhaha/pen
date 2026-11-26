@@ -112,9 +112,9 @@ fn unproject(pixel: vec2f, depth: f32) -> vec3f {
 // the sun in the phase the mist's anisotropy gives it and the ambient light
 // the sky gives all round or, by `volume.scatter.z`, the sky's own colour in
 // the direction looked.
-fn mist_light(direction: vec3f, point: vec3f) -> vec3f {
+fn mist_light(direction: vec3f, cloud_sh: f32) -> vec3f {
   let around = mix(volume.ambient.rgb, mist_sky(direction), volume.scatter.z) * volume.scatter.y;
-  let sun = atmosphere.sun_color.rgb * (volume.scatter.x * phase_scaled(volume.medium.w, dot(atmosphere.sun.xyz, direction)) * cloud_shadow(point));
+  let sun = atmosphere.sun_color.rgb * (volume.scatter.x * phase_scaled(volume.medium.w, dot(atmosphere.sun.xyz, direction)) * cloud_sh);
   return volume.medium.rgb * (around + sun);
 }
 
@@ -136,26 +136,29 @@ fn mist_light(direction: vec3f, point: vec3f) -> vec3f {
   let color = scene.rgb - empty * atmosphere.clear.rgb;
   let camera = atmosphere.camera.xyz;
   let direction = normalize(unproject(position.xy, 0.5) - camera);
-  let sky_mode = atmosphere.camera.w;
   var background = atmosphere.clear.rgb;
-  if (sky_mode > 1.5) {
-    background = physical_sky_background(direction, position.xy / atmosphere.size.xy, sky_mode > 2.5);
-  } else if (sky_mode > 0.5) {
-    background = sky(direction, true);
-  }
-  if (empty > 0.999) {
-    return vec4f(color + empty * background, 1.0);
+  if (empty > 0.001) {
+    let sky_mode = atmosphere.camera.w;
+    if (sky_mode > 1.5) {
+      background = physical_sky_background(direction, position.xy / atmosphere.size.xy, sky_mode > 2.5);
+    } else if (sky_mode > 0.5) {
+      background = sky(direction, true);
+    }
+    if (empty > 0.999) {
+      return vec4f(color + empty * background, 1.0);
+    }
   }
   let surface = color / (1.0 - empty) *
     mix(1.0, occlusion(position.xy), atmosphere.fog.w);
   let point = unproject(position.xy, nearest);
+  let cloud_sh = cloud_shadow(point);
   // The mist between the eye and the surface: what the froxel volume holds up
   // to its reach, then the same medium analytically, in the colour of what the
   // volume ends on.
   var scattered = vec3f(0.0);
   var optical = 0.0;
   var start = camera;
-  var tint = mist_light(direction, point);
+  var tint = mist_light(direction, cloud_sh);
   if (volume.ambient.w > 0.5) {
     let depth = -(volume.view * vec4f(point, 1.0)).z;
     let reach = min(depth, volume.grid.w);
@@ -173,7 +176,8 @@ fn mist_light(direction: vec3f, point: vec3f) -> vec3f {
   }
   let beyond = mist_beyond_arena(start, point) * atmosphere.fog.y;
   let transmitted = exp(-optical);
-  let light = scattered + transmitted * tint * (1.0 - exp(-beyond));
-  let misted = surface * cloud_shadow(point) * (transmitted * exp(-beyond)) + light;
+  let trans_beyond = exp(-beyond);
+  let light = scattered + transmitted * tint * (1.0 - trans_beyond);
+  let misted = surface * cloud_sh * (transmitted * trans_beyond) + light;
   return vec4f(misted * (1.0 - empty) + empty * background, 1.0);
 }

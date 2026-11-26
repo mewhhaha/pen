@@ -49,9 +49,12 @@ fn surface_sky(s: StandardSurface) -> vec3f {
     // The base lobe alone, written as one expression: the very arithmetic
     // `surface_ambient` always had, to the bit.
     return diffuse * ambient_light_view(s.world, s.normal, s.view)
-      + sky_reflection_lobe(s.world, s.normal, s.view, dot(s.normal, s.view), s.roughness, s.f0, s.f90);
+      + sky_reflection_lobe_split(s.world, s.normal, s.view, s.roughness, s.f0, s.f90, split);
   }
-  var irradiance = select(ambient_light_view(s.world, s.normal, s.view), s.lightmap_irradiance, lightmapped);
+  var irradiance = s.lightmap_irradiance;
+  if (!lightmapped) {
+    irradiance = ambient_light_view(s.world, s.normal, s.view);
+  }
   var lookup = s.normal;
   if (brushing) {
     lookup = lobe_bent_normal(s.normal, s.tangent, s.bitangent, s.view, s.roughness, clamp(s.anisotropy, -1.0, 1.0));
@@ -63,7 +66,7 @@ fn surface_sky(s: StandardSurface) -> vec3f {
   }
   let reflected = eff_f0 * split.x + vec3f(s.f90 * split.y);
   let diffuse = s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0)) * (vec3f(1.0) - reflected * reflecting);
-  var reflection = sky_reflection_lobe(s.world, lookup, s.view, dot(s.normal, s.view), s.roughness, eff_f0, s.f90);
+  var reflection = sky_reflection_lobe_split(s.world, lookup, s.view, s.roughness, eff_f0, s.f90, split);
   if (s.occlusion < 1.0) {
     irradiance *= s.occlusion;
     reflection *= specular_occlusion(nv, s.occlusion, s.roughness);

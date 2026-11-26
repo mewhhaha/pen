@@ -192,6 +192,11 @@ fn trace(origin: vec3f, dir: vec3f, distance: f32, any_hit: bool) -> TlasHit {
                     u.scene_counts_and_mask.x, u.scene_counts_and_mask.y, u.scene_counts_and_mask.z);
 }
 
+fn trace_any(origin: vec3f, dir: vec3f, distance: f32) -> bool {
+  return trace_tlas_any_hit(origin, dir, RAY_MIN, distance, u.scene_counts_and_mask.w,
+                            u.scene_counts_and_mask.x, u.scene_counts_and_mask.y, u.scene_counts_and_mask.z);
+}
+
 fn ray_bias() -> f32 {
   return max(u.sun_color_and_bias.w, RAY_MIN);
 }
@@ -200,10 +205,11 @@ fn visible(pos: vec3f, nrm: vec3f, endpoint: vec3f) -> bool {
   let bias = ray_bias();
   let origin = pos + nrm * bias;
   let delta = endpoint - origin;
-  let distance = length(delta);
-  if (distance <= 2.0 * RAY_MIN) { return true; }
+  let dist2 = dot(delta, delta);
+  if (dist2 <= 4.0 * RAY_MIN * RAY_MIN) { return true; }
+  let distance = sqrt(dist2);
   let limit = max(distance - max(bias * 0.5, 2.0 * RAY_MIN), RAY_MIN);
-  return !trace(origin, delta / distance, limit, true).hit;
+  return !trace_any(origin, delta / distance, limit);
 }
 
 struct LightEval {
@@ -214,16 +220,20 @@ struct LightEval {
 
 fn local_light(pos: vec3f, nrm: vec3f, light: RtLocalLight) -> LightEval {
   let delta = light.position_range.xyz - pos;
-  let distance = length(delta);
   let reach = light.position_range.w;
-  if (!(distance > RAY_MIN && distance < reach)) {
+  let dist2 = dot(delta, delta);
+  if (!(dist2 > RAY_MIN * RAY_MIN && dist2 < reach * reach)) {
     return LightEval(vec3f(0.0), vec3f(0.0), 0.0);
   }
+  let distance = sqrt(dist2);
   let dir = delta / distance;
   let cosine = max(dot(nrm, dir), 0.0);
-  let range_ratio2 = (distance / reach) * (distance / reach);
+  if (cosine <= 0.0) {
+    return LightEval(dir, vec3f(0.0), 0.0);
+  }
+  let range_ratio2 = dist2 / (reach * reach);
   let window = 1.0 - range_ratio2 * range_ratio2;
-  var attenuation = window * window / (distance * distance + 1.0);
+  var attenuation = window * window / (dist2 + 1.0);
   let outer = light.color_outer_cos.w;
   if (outer > -0.999) {
     attenuation *= smoothstep(outer, max(light.direction_inner_cos.w, outer + 1e-4),
@@ -370,18 +380,20 @@ fn restir_di_spatial(@builtin(global_invocation_id) id: vec3u) {
     for (var i = 0u; i < 4u; i++) {
       let q = neighbor_pixel(pixel, rotation, i, 20.0, &rng);
       if (in_bounds(q) && any(q != pixel)) {
-        let qg = load_geometry(q);
         let other = di_input[pixel_index(q)];
-        if (qg.valid && similar(g, qg.distance, qg.nrm) && other.m > 0.0) {
-          let qmat = load_material(q);
-          let other_at_q = luma(eval_local_light_brdf(qg, qmat, other.light_idx));
-          let other_at_center = luma(eval_local_light_brdf(g, mat, other.light_idx));
-          let center_at_q = luma(eval_local_light_brdf(qg, qmat, center.light_idx));
-          let neighbor_mass = pairwise_mass(other_at_q, other_at_center, other.m, m_center);
-          center_mass += pairwise_mass(center_p, center_at_q, m_center, other.m);
-          di_add(&result, other.light_idx, other.weight * other_at_center * neighbor_mass, &rng);
-          result.m += other.m;
-          continue;
+        if (other.m > 0.0) {
+          let qg = load_geometry(q);
+          if (qg.valid && similar(g, qg.distance, qg.nrm)) {
+            let qmat = load_material(q);
+            let other_at_q = luma(eval_local_light_brdf(qg, qmat, other.light_idx));
+            let other_at_center = luma(eval_local_light_brdf(g, mat, other.light_idx));
+            let center_at_q = luma(eval_local_light_brdf(qg, qmat, center.light_idx));
+            let neighbor_mass = pairwise_mass(other_at_q, other_at_center, other.m, m_center);
+            center_mass += pairwise_mass(center_p, center_at_q, m_center, other.m);
+            di_add(&result, other.light_idx, other.weight * other_at_center * neighbor_mass, &rng);
+            result.m += other.m;
+            continue;
+          }
         }
       }
       center_mass += m_center;
@@ -532,13 +544,23 @@ fn rt_ddgi_cascade(cascade_idx: u32, world: vec3f, normal: vec3f) -> vec4f {
       }
     }
 
+    if (w <= 1e-6) {
+      continue;
+    }
+
     let irr_px = vec2f(f32(s_col * 10u + 1u), f32(s_row * 10u + 1u)) + oct_n * 8.0;
     let texel = rt_ddgi_sample_irr(irr_off, irr_w, irr_h, irr_px);
     w *= clamp(texel.a, 0.0, 1.0);
     if (w <= 1e-6) {
       continue;
     }
-    let irr = pow(max(texel.rgb, vec3f(0.0)), vec3f(gamma * 0.5));
+    let encoded = max(texel.rgb, vec3f(0.0));
+    var irr: vec3f;
+    if (abs(gamma - 5.0) < 1e-4) {
+      irr = encoded * encoded * sqrt(encoded);
+    } else {
+      irr = pow(encoded, vec3f(gamma * 0.5));
+    }
     sum_irr += irr * w;
     sum_w += w;
   }
@@ -717,14 +739,15 @@ fn gi_sample_visible(g: Geometry, sample: GiReservoir) -> bool {
   let max_dist = u.sun_and_max_distance.w;
   if (sample.vis_pad.y >= max_dist) {
     let dir = normalize(sample.sample_pos_m.xyz - g.pos);
-    return !trace(origin, dir, max_dist, true).hit;
+    return !trace_any(origin, dir, max_dist);
   }
   // Offset the endpoint onto the radiating side of the hit surface.
   let endpoint = sample.sample_pos_m.xyz + sample.sample_nrm_w.xyz * min(bias, 0.01);
   let delta = endpoint - origin;
-  let distance = length(delta);
-  if (distance <= RAY_MIN) { return true; }
-  return !trace(origin, delta / distance, distance, true).hit;
+  let dist2 = dot(delta, delta);
+  if (dist2 <= RAY_MIN * RAY_MIN) { return true; }
+  let distance = sqrt(dist2);
+  return !trace_any(origin, delta / distance, distance);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -745,18 +768,20 @@ fn restir_gi_spatial(@builtin(global_invocation_id) id: vec3u) {
     for (var i = 0u; i < 4u; i++) {
       let q = neighbor_pixel(pixel, rotation, i, 24.0, &rng);
       if (in_bounds(q) && any(q != pixel)) {
-        let qg = load_geometry(q);
         let other = gi_input[pixel_index(q)];
         let m_other = other.sample_pos_m.w;
-        if (qg.valid && similar(g, qg.distance, qg.nrm) && m_other > 0.0) {
-          let p_q_at_q = gi_target(qg, other);
-          let p_q_at_c = gi_target(g, other) * gi_jacobian(qg, g, other);
-          let p_c_at_q = gi_target(qg, center) * gi_jacobian(g, qg, center);
-          let neighbor_mass = pairwise_mass(p_q_at_q, p_q_at_c, m_other, m_center);
-          center_mass += pairwise_mass(p_c_at_c, p_c_at_q, m_center, m_other);
-          // Zero-radiance reservoirs still represent draws. Only their selection mass is zero.
-          gi_add(&result, other, m_other, p_q_at_c * other.sample_nrm_w.w * neighbor_mass, &rng);
-          continue;
+        if (m_other > 0.0) {
+          let qg = load_geometry(q);
+          if (qg.valid && similar(g, qg.distance, qg.nrm)) {
+            let p_q_at_q = gi_target(qg, other);
+            let p_q_at_c = gi_target(g, other) * gi_jacobian(qg, g, other);
+            let p_c_at_q = gi_target(qg, center) * gi_jacobian(g, qg, center);
+            let neighbor_mass = pairwise_mass(p_q_at_q, p_q_at_c, m_other, m_center);
+            center_mass += pairwise_mass(p_c_at_c, p_c_at_q, m_center, m_other);
+            // Zero-radiance reservoirs still represent draws. Only their selection mass is zero.
+            gi_add(&result, other, m_other, p_q_at_c * other.sample_nrm_w.w * neighbor_mass, &rng);
+            continue;
+          }
         }
       }
       center_mass += m_center;

@@ -49,10 +49,16 @@ fn spec_load_surface(pixel: vec2i) -> SpecSurface {
   let dims = vec2i(textureDimensions(normal_roughness, 0));
   let g_px = input_pixel(pixel, dims);
   let depth = textureLoad(depth_tex, g_px, 0).x;
+  if (!(abs(depth - u.camera_and_clear.w) > EPS)) {
+    return SpecSurface(vec3f(0.0), vec3f(0.0), vec3f(0.0), 1.0, vec3f(0.0), 0.0, false);
+  }
   let nr = textureLoad(normal_roughness, g_px, 0);
-  let world = u.inverse_view_projection * spec_clip(spec_gbuffer_uv(pixel, dims), depth);
-  if (!(abs(depth - u.camera_and_clear.w) > EPS && dot(nr.xyz, nr.xyz) >= 0.01 &&
-        nr.w >= 0.0 && nr.w <= u.sky_horizon.w && abs(world.w) > 1e-8)) {
+  if (!(dot(nr.xyz, nr.xyz) >= 0.01 && nr.w >= 0.0 && nr.w <= u.sky_horizon.w)) {
+    return SpecSurface(vec3f(0.0), vec3f(0.0), vec3f(0.0), 1.0, vec3f(0.0), 0.0, false);
+  }
+  let g_uv = (vec2f(g_px) + 0.5) / vec2f(dims);
+  let world = u.inverse_view_projection * spec_clip(g_uv, depth);
+  if (!(abs(world.w) > 1e-8)) {
     return SpecSurface(vec3f(0.0), vec3f(0.0), vec3f(0.0), 1.0, vec3f(0.0), 0.0, false);
   }
   let pos = world.xyz / world.w;
@@ -292,12 +298,13 @@ fn spec_initial(@builtin(global_invocation_id) id: vec3u) {
         r.radiance_wsum = vec4f(safe_rgb(sky(l)), 0.0);
       }
 
-      // The initial RIS mass is p-hat / pdf. Temporal finalization divides by
-      // M * p-hat to get the contribution multiplier used by resolve.
-      let pdf = 0.25 * spec_d(g.nrm, h, alpha * alpha)
-          * spec_g1_over_cos(dot(g.nrm, g.view), alpha * alpha);
-      let p = luma(spec_response(g.nrm, g.view, l, g.f0, g.roughness) * r.radiance_wsum.rgb);
-      let mass = finite_nonnegative(p / max(pdf, EPS), 1e12);
+      // The initial RIS mass is p-hat / pdf; 0.25 * D(n, h) * G1(nv) / nv cancels
+      // algebraically, avoiding 0/0 on mirror lobes and skipping spec_d + G1(nv).
+      let nl = dot(g.nrm, l);
+      let one_minus_vh = 1.0 - clamp(dot(g.view, h), 0.0, 1.0);
+      let fresnel = mix(g.f0, vec3f(1.0), pow(one_minus_vh, 5.0));
+      let weight_rgb = fresnel * (spec_g1_over_cos(nl, alpha * alpha) * nl) * r.radiance_wsum.rgb;
+      let mass = finite_nonnegative(luma(weight_rgb), 1e12);
       r.radiance_wsum.w = mass;
       r.hit_nrm_w.w = mass;
     }
@@ -326,20 +333,22 @@ fn spec_temporal(@builtin(global_invocation_id) id: vec3u) {
     if (all(prev_uv >= vec2f(0.0)) && all(prev_uv < vec2f(1.0))) {
       let prev_px = vec2i(prev_uv * vec2f(extent()));
       let packed = textureLoad(spec_prev_geometry, prev_px, 0);
-      let prev_g_uv = spec_gbuffer_uv(prev_px, vec2i(textureDimensions(normal_roughness, 0)));
-      let prev_world = spec_transforms.inverse_prev_view_projection * spec_clip(prev_g_uv, packed.x);
-      if (packed.w > 0.0 && abs(prev_world.w) > EPS) {
-        let prev_pos = prev_world.xyz / prev_world.w;
-        if (spec_compatible(g, prev_pos, oct_decode(packed.yz), packed.w, u.previous_camera.xyz)) {
-          let prev = spec_prev[pixel_index(prev_px)];
-          let j = spec_jacobian(prev_pos, g, prev);
-          let cap = mix(4.0, 16.0, smoothstep(0.04, 0.45, g.roughness));
-          let m = min(prev.hit_pos_m.w, cap - 1.0);
-          if (prev.radiance_wsum.w == 0.0 || j > 0.0) {
-            var rng = rng_for(index, 102u);
-            result.hit_pos_m.w += m;
-            let mass = finite_nonnegative(spec_target(g, prev) * prev.hit_nrm_w.w * m * j, 1e12);
-            spec_stream(&result, prev, mass, true, &rng);
+      if (packed.w > 0.0) {
+        let prev_g_uv = spec_gbuffer_uv(prev_px, vec2i(textureDimensions(normal_roughness, 0)));
+        let prev_world = spec_transforms.inverse_prev_view_projection * spec_clip(prev_g_uv, packed.x);
+        if (abs(prev_world.w) > EPS) {
+          let prev_pos = prev_world.xyz / prev_world.w;
+          if (spec_compatible(g, prev_pos, oct_decode(packed.yz), packed.w, u.previous_camera.xyz)) {
+            let prev = spec_prev[pixel_index(prev_px)];
+            let j = spec_jacobian(prev_pos, g, prev);
+            let cap = mix(4.0, 16.0, smoothstep(0.04, 0.45, g.roughness));
+            let m = min(prev.hit_pos_m.w, cap - 1.0);
+            if (prev.radiance_wsum.w == 0.0 || j > 0.0) {
+              var rng = rng_for(index, 102u);
+              result.hit_pos_m.w += m;
+              let mass = finite_nonnegative(spec_target(g, prev) * prev.hit_nrm_w.w * m * j, 1e12);
+              spec_stream(&result, prev, mass, true, &rng);
+            }
           }
         }
       }
@@ -348,15 +357,20 @@ fn spec_temporal(@builtin(global_invocation_id) id: vec3u) {
   spec_output[index] = spec_finish(result, g);
 }
 
+fn spec_trace_any(origin: vec3f, l: vec3f, limit: f32) -> bool {
+  return trace_tlas_any_hit(origin, l, ray_bias(), limit, u.scene_counts_and_mask.w,
+                            u.scene_counts_and_mask.x, u.scene_counts_and_mask.y, u.scene_counts_and_mask.z);
+}
+
 fn spec_visible(g: SpecSurface, r: SpecReservoir) -> bool {
   if (r.sample_meta.y == 0.0) {
-    return !spec_trace(g.pos, r.hit_pos_m.xyz, u.sun_and_max_distance.w, true).hit;
+    return !spec_trace_any(g.pos, r.hit_pos_m.xyz, u.sun_and_max_distance.w);
   }
   let delta = r.hit_pos_m.xyz - g.pos;
   let dist = length(delta);
   // Stop just short of the hit, keeping the segment on the actual connection.
   let limit = dist - max(2.0 * RAY_MIN, dist * 1e-6);
-  return limit <= ray_bias() || !spec_trace(g.pos, delta / dist, limit, true).hit;
+  return limit <= ray_bias() || !spec_trace_any(g.pos, delta / dist, limit);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -398,9 +412,13 @@ fn spec_spatial_resolve(@builtin(global_invocation_id) id: vec3u) {
       continue;
     }
 
-    let qg = spec_load_surface(q);
     let other = spec_input[pixel_index(q)];
-    if (!qg.valid || other.hit_pos_m.w <= 0.0 ||
+    if (other.hit_pos_m.w <= 0.0) {
+      center_mass += center_m;
+      continue;
+    }
+    let qg = spec_load_surface(q);
+    if (!qg.valid ||
         !spec_compatible(g, qg.pos, qg.nrm, other.sample_meta.z, u.camera_and_clear.xyz)) {
       center_mass += center_m;
       continue;

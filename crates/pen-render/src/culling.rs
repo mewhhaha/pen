@@ -219,10 +219,19 @@ impl Views {
 
     /// Which views (a bit each, the camera's first) may see the sphere; a
     /// view past `count()` sees nothing.
+    #[allow(dead_code, reason = "tested helper; batching calls mask_in to skip irrelevant views")]
     pub fn mask(&self, sphere: &Sphere) -> ViewMask {
+        self.mask_in(sphere, self.all())
+    }
+
+    /// Like [`Self::mask`], testing only views whose bit is set in `candidates`.
+    pub fn mask_in(&self, sphere: &Sphere, candidates: ViewMask) -> ViewMask {
+        let mut active = candidates & self.all();
         let mut seen = 0;
-        for (index, frustum) in self.frustums[..self.count].iter().enumerate() {
-            if frustum.sees(sphere) {
+        while active != 0 {
+            let index = active.trailing_zeros() as usize;
+            active &= active - 1;
+            if self.frustums[index].sees(sphere) {
                 seen |= 1 << index;
             }
         }

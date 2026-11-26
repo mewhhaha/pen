@@ -66,10 +66,14 @@ fn seen(
     let every = if choice.casts { views.all() } else { CAMERA | capture };
     let Some(bounds) = choice.bounds else { return (every, 0) };
     let placed = bounds.placed(&draw.transform, 0.0);
-    let seen = views.mask(&placed) & every;
+    let seen = views.mask_in(&placed, every);
     stats.culled += u32::from(seen & CAMERA == 0);
     stats.shadow_culled += (every & !seen & !CAMERA & !capture).count_ones();
-    let level = detail.level(&placed, stretch(&draw.transform), &choice.errors[..usize::from(choice.levels)]);
+    let level = if choice.levels > 1 && detail.pixels > 0.0 {
+        detail.level(&placed, stretch(&draw.transform), &choice.errors[..usize::from(choice.levels)])
+    } else {
+        0
+    };
     (seen, u8::try_from(level).expect("at most MAX_LODS"))
 }
 

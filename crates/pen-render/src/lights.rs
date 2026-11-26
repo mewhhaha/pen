@@ -567,9 +567,11 @@ impl Clusters {
             mapped_at_creation: true,
         });
         {
-            let (ltc_mat, ltc_amp) = crate::area_lights::generate_ltc_luts();
-            let mat_bytes: &[u8] = bytemuck::cast_slice(&ltc_mat);
-            let amp_bytes: &[u8] = bytemuck::cast_slice(&ltc_amp);
+            type LtcLuts = (Vec<[f32; 4]>, Vec<[f32; 4]>);
+            static LTC_LUTS: std::sync::OnceLock<LtcLuts> = std::sync::OnceLock::new();
+            let (ltc_mat, ltc_amp) = LTC_LUTS.get_or_init(crate::area_lights::generate_ltc_luts);
+            let mat_bytes: &[u8] = bytemuck::cast_slice(ltc_mat);
+            let amp_bytes: &[u8] = bytemuck::cast_slice(ltc_amp);
             let mat_off = (AREA_MAT_OFFSET * 16) as u64;
             let amp_off = (AREA_AMP_OFFSET * 16) as u64;
             area.slice(mat_off..mat_off + mat_bytes.len() as u64)

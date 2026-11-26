@@ -307,7 +307,13 @@ fn ddgi_env_cascade(cascade_idx: u32, world: vec3f, normal: vec3f, view_dir: vec
     if (w <= 1e-6) {
       continue;
     }
-    let irr = pow(max(texel.rgb, vec3f(0.0)), vec3f(gamma * 0.5));
+    let encoded = max(texel.rgb, vec3f(0.0));
+    var irr: vec3f;
+    if (abs(gamma - 5.0) < 1e-4) {
+      irr = encoded * encoded * sqrt(encoded);
+    } else {
+      irr = pow(encoded, vec3f(gamma * 0.5));
+    }
     sum_irr += irr * w;
     sum_w += w;
   }
@@ -758,29 +764,44 @@ fn screen_reflection(world: vec3f, normal: vec3f, view: vec3f, roughness: f32) -
 // of these. `normal` is where to look and `normal_dot_view` how much to
 // reflect: they are the same cosine unless the lookup is bent (an anisotropic
 // surface) or belongs to another layer's normal (a clear coat).
-fn sky_reflection_lobe(world: vec3f, normal: vec3f, view: vec3f, normal_dot_view: f32, roughness: f32, f0: vec3f, f90: f32) -> vec3f {
+fn sky_reflection_lobe_split(world: vec3f, normal: vec3f, view: vec3f, roughness: f32, f0: vec3f, f90: f32, split: vec2f) -> vec3f {
   let probes = reflection_probes.counts.x > 0.5;
   let traced = sky_light.ssr.x > 0.5;
   if (sky_light.tint.w < 0.5 && !probes && !traced) {
     return vec3f(0.0);
   }
-  let nv = max(normal_dot_view, 0.0001);
-  let toward = reflect(-view, normal);
   let rough = clamp(roughness, 0.04, 1.0);
-  var radiance = vec3f(0.0);
-  if (sky_light.tint.w >= 0.5) {
-    radiance = textureSampleLevel(sky_cube, sky_sampler, toward, rough * sky_light.reflection.x).rgb * sky_light.tint.rgb;
+  let fresnel_scale = f0 * split.x + vec3f(f90 * split.y);
+  var screen = vec4f(0.0);
+  if (traced) {
+    screen = screen_reflection(world, normal, view, rough);
+    if (screen.a >= 0.999) {
+      return screen.rgb * fresnel_scale;
+    }
   }
+  let toward = reflect(-view, normal);
+  var radiance = vec3f(0.0);
+  var local_cov = 0.0;
   if (probes) {
     let local = local_reflection(world, toward, rough);
-    radiance = radiance * (1.0 - local.a) + local.rgb;
+    radiance = local.rgb;
+    local_cov = local.a;
+  }
+  if (local_cov < 0.999 && sky_light.tint.w >= 0.5) {
+    let sky_r = textureSampleLevel(sky_cube, sky_sampler, toward, rough * sky_light.reflection.x).rgb * sky_light.tint.rgb;
+    radiance += sky_r * (1.0 - local_cov);
   }
   if (traced) {
-    let screen = screen_reflection(world, normal, view, rough);
     radiance = mix(radiance, screen.rgb, screen.a);
   }
+  return radiance * fresnel_scale;
+}
+
+fn sky_reflection_lobe(world: vec3f, normal: vec3f, view: vec3f, normal_dot_view: f32, roughness: f32, f0: vec3f, f90: f32) -> vec3f {
+  let nv = max(normal_dot_view, 0.0001);
+  let rough = clamp(roughness, 0.04, 1.0);
   let split = sky_brdf(nv, rough);
-  return radiance * (f0 * split.x + vec3f(f90 * split.y));
+  return sky_reflection_lobe_split(world, normal, view, rough, f0, f90, split);
 }
 
 // The light a surface at `world` facing `normal`, seen along `view` (both unit

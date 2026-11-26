@@ -105,6 +105,15 @@ fn shade_pbr_decal(in: BoxOut, sample_idx: i32) -> vec4f {
     discard;
   }
 
+  let y_fade_start = clamp(decal.pbr_params.w, 0.0, 0.98);
+  let y_fade = 1.0 - smoothstep(y_fade_start, 1.0, abs(local.y));
+  let uv = local.xz * 0.5 + 0.5;
+  let albedo_sample = textureSampleLevel(albedo_tex, decal_sampler, uv, 0.0);
+  let cover_pre = albedo_sample.a * decal.albedo_opacity.a * y_fade;
+  if (cover_pre <= 0.001) {
+    discard;
+  }
+
   // Reconstruct geometric surface normal using only valid in-bounds non-sky neighbors.
   let sr = load_world_sample(pixel + vec2i(1, 0), sample_idx);
   let sl = load_world_sample(pixel - vec2i(1, 0), sample_idx);
@@ -159,12 +168,7 @@ fn shade_pbr_decal(in: BoxOut, sample_idx: i32) -> vec4f {
   let angle_min = decal.pbr_params.z;
   let angle_dot = abs(dot(n_geo, decal_up));
   let angle_fade = smoothstep(angle_min, min(angle_min + 0.18, 1.0), angle_dot);
-  let y_fade_start = clamp(decal.pbr_params.w, 0.0, 0.98);
-  let y_fade = 1.0 - smoothstep(y_fade_start, 1.0, abs(local.y));
-
-  let uv = local.xz * 0.5 + 0.5;
-  let albedo_sample = textureSampleLevel(albedo_tex, decal_sampler, uv, 0.0);
-  let cover = albedo_sample.a * decal.albedo_opacity.a * y_fade * angle_fade;
+  let cover = cover_pre * angle_fade;
   if (cover <= 0.001) {
     discard;
   }

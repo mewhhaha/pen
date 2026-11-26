@@ -139,5 +139,8 @@ fn mist_beyond_arena(start: vec3f, end: vec3f) -> f32 {
 // The sky's colour in `direction` as the mist takes it up (without the sun's or
 // moon's disc and the stars), or the clear colour where the frame has no sky.
 fn mist_sky(direction: vec3f) -> vec3f {
-  return select(atmosphere.clear.rgb, sky(direction, false), atmosphere.camera.w > 0.5);
+  if (atmosphere.camera.w > 0.5) {
+    return sky(direction, false);
+  }
+  return atmosphere.clear.rgb;
 }

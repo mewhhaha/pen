@@ -48,6 +48,8 @@ struct Pipelines {
     skin_layout: wgpu::BindGroupLayout,
 }
 
+type SkinBothEntry = ([wgpu::Buffer; 2], [u64; 2], wgpu::BindGroup);
+
 pub(super) struct Velocity {
     stride: u64,
     pipelines: Option<Pipelines>,
@@ -55,9 +57,12 @@ pub(super) struct Velocity {
     draw_buffer: Option<wgpu::Buffer>,
     draw_group: Option<wgpu::BindGroup>,
     draw_data: Vec<f32>,
-    /// Cached bind groups for skinned velocity: `(curr_buf, curr_size, prev_buf, prev_size)`.
-    skin_both: Option<([wgpu::Buffer; 2], [u64; 2], wgpu::BindGroup)>,
-    skin_same: Option<(wgpu::Buffer, u64, wgpu::BindGroup)>,
+    motion_slots: Vec<(usize, u32)>,
+    /// 2-slot caches matching double-buffered `Skinning` ring buffers.
+    skin_both: [Option<SkinBothEntry>; 2],
+    skin_both_next: usize,
+    skin_same: [Option<(wgpu::Buffer, u64, wgpu::BindGroup)>; 2],
+    skin_same_next: usize,
     /// Whether the current velocity target may hold non-sentinel pixels from an earlier frame.
     dirty: bool,
 }
@@ -73,8 +78,11 @@ impl Velocity {
             draw_buffer: None,
             draw_group: None,
             draw_data: Vec::new(),
-            skin_both: None,
-            skin_same: None,
+            motion_slots: Vec::new(),
+            skin_both: [None, None],
+            skin_both_next: 0,
+            skin_same: [None, None],
+            skin_same_next: 0,
             dirty: true,
         }
     }
@@ -210,12 +218,8 @@ impl Velocity {
             "vertex_plain",
             std::slice::from_ref(&pos_buf),
         );
-        let instanced = make(
-            "velocity instanced",
-            &[Some(&camera_layout)],
-            "vertex_instanced",
-            &[pos_buf.clone(), inst_buf],
-        );
+        let instanced =
+            make("velocity instanced", &[Some(&camera_layout)], "vertex_instanced", &[pos_buf.clone(), inst_buf]);
         let skinned = make(
             "velocity skinned",
             &[Some(&camera_layout), Some(&draw_layout), Some(&skin_layout)],
@@ -326,7 +330,7 @@ impl Velocity {
         queue.write_buffer(&self.pipelines.as_ref().unwrap().camera_uniform, 0, bytemuck::cast_slice(&cam_floats));
 
         // Slot 0 is always identity (used for world-space solids), followed by each opaque non-batch mesh.
-        let mut motion_slots: Vec<(usize, u32)> = Vec::new();
+        self.motion_slots.clear();
         let mut slot_count: usize = 1;
         for &idx in &scratch.opaque {
             let entry = &ready[idx];
@@ -334,7 +338,7 @@ impl Velocity {
                 continue;
             }
             if matches!(drawing.items[entry.item].shape, Shape::Mesh(_)) {
-                motion_slots.push((idx, u32::try_from(slot_count).unwrap_or(u32::MAX)));
+                self.motion_slots.push((idx, u32::try_from(slot_count).unwrap_or(u32::MAX)));
                 slot_count += 1;
             }
         }
@@ -343,7 +347,7 @@ impl Velocity {
         // Slot 0: identity current and previous.
         self.draw_data[0..16].copy_from_slice(&IDENTITY);
         self.draw_data[16..32].copy_from_slice(&IDENTITY);
-        for &(idx, slot) in &motion_slots {
+        for &(idx, slot) in &self.motion_slots {
             let entry = &ready[idx];
             let item = &drawing.items[entry.item];
             let curr = item.transform(frame);
@@ -361,11 +365,21 @@ impl Velocity {
             bytemuck::cast_slice(&self.draw_data[..slot_count * stride_floats]),
         );
 
-        // Prepare skinned velocity bind groups if any skinned buffers are live.
+        // Prepare skinned velocity bind groups if any skinned buffers are live (2-slot cache for double-buffered skins).
         let [curr_skin_buf, prev_skin_buf] = skinning.buffers();
+        let mut active_skin_same: Option<usize> = None;
+        let mut active_skin_both: Option<usize> = None;
         if let Some((curr_buf, curr_size)) = curr_skin_buf {
             let layout = &self.pipelines.as_ref().unwrap().skin_layout;
-            if self.skin_same.as_ref().is_none_or(|(b, s, _)| b != curr_buf || *s != curr_size) {
+            let same_slot = if let Some(hit) = self
+                .skin_same
+                .iter()
+                .position(|entry| entry.as_ref().is_some_and(|(b, s, _)| b == curr_buf && *s == curr_size))
+            {
+                hit
+            } else {
+                let slot = self.skin_same_next;
+                self.skin_same_next ^= 1;
                 let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("velocity skin same"),
                     layout,
@@ -388,39 +402,50 @@ impl Velocity {
                         },
                     ],
                 });
-                self.skin_same = Some((curr_buf.clone(), curr_size, group));
-            }
-            if let Some((prev_buf, prev_size)) = prev_skin_buf
-                && self
-                    .skin_both
-                    .as_ref()
-                    .is_none_or(|(b, s, _)| &b[0] != curr_buf || &b[1] != prev_buf || *s != [curr_size, prev_size])
-            {
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("velocity skin both"),
-                    layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: curr_buf,
-                                offset: 0,
-                                size: wgpu::BufferSize::new(curr_size),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: prev_buf,
-                                offset: 0,
-                                size: wgpu::BufferSize::new(prev_size),
-                            }),
-                        },
-                    ],
-                });
-                self.skin_both = Some(([curr_buf.clone(), prev_buf.clone()], [curr_size, prev_size], group));
+                self.skin_same[slot] = Some((curr_buf.clone(), curr_size, group));
+                slot
+            };
+            active_skin_same = Some(same_slot);
+            if let Some((prev_buf, prev_size)) = prev_skin_buf {
+                let both_slot = if let Some(hit) = self.skin_both.iter().position(|entry| {
+                    entry
+                        .as_ref()
+                        .is_some_and(|(b, s, _)| &b[0] == curr_buf && &b[1] == prev_buf && *s == [curr_size, prev_size])
+                }) {
+                    hit
+                } else {
+                    let slot = self.skin_both_next;
+                    self.skin_both_next ^= 1;
+                    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("velocity skin both"),
+                        layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: curr_buf,
+                                    offset: 0,
+                                    size: wgpu::BufferSize::new(curr_size),
+                                }),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: prev_buf,
+                                    offset: 0,
+                                    size: wgpu::BufferSize::new(prev_size),
+                                }),
+                            },
+                        ],
+                    });
+                    self.skin_both[slot] = Some(([curr_buf.clone(), prev_buf.clone()], [curr_size, prev_size], group));
+                    slot
+                };
+                active_skin_both = Some(both_slot);
             }
         }
+        let skin_same_group = active_skin_same.and_then(|slot| self.skin_same[slot].as_ref().map(|(_, _, g)| g));
+        let skin_both_group = active_skin_both.and_then(|slot| self.skin_both[slot].as_ref().map(|(_, _, g)| g));
 
         let pipelines = self.pipelines.as_ref().unwrap();
         let draw_group = self.draw_group.as_ref().unwrap();
@@ -451,7 +476,7 @@ impl Velocity {
             let item = &drawing.items[entry.item];
             match item.shape {
                 Shape::Mesh(_) => {
-                    let slot = motion_slots[next_slot_cursor].1;
+                    let slot = self.motion_slots[next_slot_cursor].1;
                     next_slot_cursor += 1;
                     let Some(mesh_slot) = entry.mesh else { continue };
                     let Some(GpuAsset::Mesh(mesh)) = drawing.assets.current(mesh_slot) else { continue };
@@ -461,12 +486,11 @@ impl Velocity {
                     let offset = u32::try_from(u64::from(slot) * self.stride).unwrap_or(0);
                     let lod = mesh.lods.get(usize::from(item.lod)).unwrap_or(&mesh.lods[0]);
                     if let (Some(curr_off), Some(skin)) = (entry.skin, &mesh.skin) {
-                        let prev_off = scratch
-                            .target_of_source(item.source)
-                            .and_then(|t| skinning.previous_offset(t, mesh_slot));
-                        let bound = match (prev_off, &self.skin_both, &self.skin_same) {
-                            (Some(p_off), Some((_, _, group)), _) => Some((group, p_off)),
-                            (_, _, Some((_, _, group))) => Some((group, curr_off)),
+                        let prev_off =
+                            scratch.target_of_source(item.source).and_then(|t| skinning.previous_offset(t, mesh_slot));
+                        let bound = match (prev_off, skin_both_group, skin_same_group) {
+                            (Some(p_off), Some(group), _) => Some((group, p_off)),
+                            (_, _, Some(group)) => Some((group, curr_off)),
                             _ => None,
                         };
                         if let Some((skin_group, p_off)) = bound {

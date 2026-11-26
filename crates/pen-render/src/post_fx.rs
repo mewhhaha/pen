@@ -150,6 +150,7 @@ pub struct TaauUpscaler {
     uniform: wgpu::Buffer,
     dummy_reactive: (wgpu::Texture, wgpu::TextureView),
     history: Option<(u32, u32, [wgpu::Texture; 2], [wgpu::TextureView; 2])>,
+    cached_bgs: [Option<([wgpu::TextureView; 4], wgpu::BindGroup)>; 2],
     parity: usize,
     has_history: bool,
 }
@@ -286,6 +287,7 @@ impl TaauUpscaler {
             uniform,
             dummy_reactive: (dummy_tex, dummy_view),
             history: None,
+            cached_bgs: [None, None],
             parity: 0,
             has_history: false,
         }
@@ -400,6 +402,7 @@ impl TaauUpscaler {
             let (t0, v0) = make("taau_hist_0");
             let (t1, v1) = make("taau_hist_1");
             self.history = Some((out_size.0, out_size.1, [t0, t1], [v0, v1]));
+            self.cached_bgs = [None, None];
             self.parity = 0;
             self.has_history = false;
         }
@@ -425,27 +428,41 @@ impl TaauUpscaler {
         };
         encode_stage_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u));
         let reactive_view = reactive_mask.unwrap_or(&self.dummy_reactive.1);
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("taau_bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input_color) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(input_depth) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(input_velocity) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&views[read_idx]) },
-                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&views[write_idx]) },
-                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(reactive_view) },
-            ],
+        let hit = self.cached_bgs[read_idx].as_ref().is_some_and(|(keys, _)| {
+            &keys[0] == input_color
+                && &keys[1] == input_depth
+                && &keys[2] == input_velocity
+                && &keys[3] == reactive_view
         });
+        if !hit {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("taau_bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input_color) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(input_depth) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(input_velocity) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&views[read_idx]) },
+                    wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&views[write_idx]),
+                    },
+                    wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(reactive_view) },
+                ],
+            });
+            self.cached_bgs[read_idx] =
+                Some(([input_color.clone(), input_depth.clone(), input_velocity.clone(), reactive_view.clone()], bg));
+        }
+        let bg = &self.cached_bgs[read_idx].as_ref().unwrap().1;
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("taau_upscale"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bg, &[]);
+            pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(out_size.0.div_ceil(8), out_size.1.div_ceil(8), 1);
         }
         self.parity = write_idx;
@@ -460,6 +477,7 @@ pub struct FsrEasuUpscaler {
     bgl: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
     output: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    cached_bg: Option<(wgpu::TextureView, wgpu::BindGroup)>,
 }
 
 impl FsrEasuUpscaler {
@@ -522,7 +540,7 @@ impl FsrEasuUpscaler {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { pipeline, bgl, uniform, output: None }
+        Self { pipeline, bgl, uniform, output: None, cached_bg: None }
     }
 
     pub fn output_texture(&self) -> Option<&wgpu::Texture> {
@@ -572,23 +590,28 @@ impl FsrEasuUpscaler {
             });
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
             self.output = Some((out_size.0, out_size.1, tex, view));
+            self.cached_bg = None;
         }
         let dims: [f32; 4] = [in_size.0 as f32, in_size.1 as f32, out_size.0 as f32, out_size.1 as f32];
         encode_stage_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&dims));
         let (_, _, _, out_view) = self.output.as_ref().unwrap();
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("easu_bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(out_view) },
-            ],
-        });
+        if self.cached_bg.as_ref().is_none_or(|(key, _)| key != input) {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("easu_bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(out_view) },
+                ],
+            });
+            self.cached_bg = Some((input.clone(), bg));
+        }
+        let bg = &self.cached_bg.as_ref().unwrap().1;
         let mut pass = encoder
             .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("easu_upscale"), timestamp_writes: None });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(out_size.0.div_ceil(8), out_size.1.div_ceil(8), 1);
         Ok(())
     }
@@ -600,6 +623,7 @@ pub struct RcasSharpener {
     bgl: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
     output: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    cached_bg: Option<(wgpu::TextureView, wgpu::BindGroup)>,
 }
 
 impl RcasSharpener {
@@ -662,7 +686,7 @@ impl RcasSharpener {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { pipeline, bgl, uniform, output: None }
+        Self { pipeline, bgl, uniform, output: None, cached_bg: None }
     }
 
     pub fn output_texture(&self) -> Option<&wgpu::Texture> {
@@ -720,25 +744,30 @@ impl RcasSharpener {
             });
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
             self.output = Some((size.0, size.1, tex, view));
+            self.cached_bg = None;
         }
         let (_, _, out_tex, out_view) = self.output.as_ref().unwrap();
         ensure!(input.texture() != out_tex, "RCAS input cannot alias internal output texture");
         let s = if sharpness.is_finite() { sharpness.clamp(0.0, 1.0) } else { 0.0 };
         let knee = if hdr_knee.is_finite() && hdr_knee > 0.0 { hdr_knee.max(0.25) } else { 0.0 };
         encode_stage_copy(device, encoder, &self.uniform, bytemuck::cast_slice(&[s, knee, 0.0, 0.0]));
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rcas_bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(out_view) },
-            ],
-        });
+        if self.cached_bg.as_ref().is_none_or(|(key, _)| key != input) {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("rcas_bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(out_view) },
+                ],
+            });
+            self.cached_bg = Some((input.clone(), bg));
+        }
+        let bg = &self.cached_bg.as_ref().unwrap().1;
         let mut pass = encoder
             .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("rcas_sharpen"), timestamp_writes: None });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
         Ok(())
     }
@@ -807,6 +836,7 @@ pub struct PostFxPass {
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
     output: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    cached_bg: Option<([wgpu::TextureView; 2], wgpu::BindGroup)>,
 }
 
 impl PostFxPass {
@@ -893,7 +923,7 @@ impl PostFxPass {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { pipeline, bgl, sampler, uniform, output: None }
+        Self { pipeline, bgl, sampler, uniform, output: None, cached_bg: None }
     }
 
     pub fn output_texture(&self) -> Option<&wgpu::Texture> {
@@ -938,6 +968,7 @@ impl PostFxPass {
             });
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
             self.output = Some((size.0, size.1, tex, view));
+            self.cached_bg = None;
         }
         let (_, _, out_tex, out_view) = self.output.as_ref().unwrap();
         ensure!(color_in.texture() != out_tex, "PostFxPass color_in cannot alias internal output texture");
@@ -982,21 +1013,25 @@ impl PostFxPass {
             ],
         };
         encode_stage_copy(device, encoder, &self.uniform, bytemuck::bytes_of(&u));
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("post_fx_bg"),
-            layout: &self.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(color_in) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_in) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(out_view) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-            ],
-        });
+        if self.cached_bg.as_ref().is_none_or(|(keys, _)| &keys[0] != color_in || &keys[1] != depth_in) {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("post_fx_bg"),
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(color_in) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_in) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(out_view) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            self.cached_bg = Some(([color_in.clone(), depth_in.clone()], bg));
+        }
+        let bg = &self.cached_bg.as_ref().unwrap().1;
         let mut pass =
             encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("post_fx"), timestamp_writes: None });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
+        pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
         Ok(())
     }

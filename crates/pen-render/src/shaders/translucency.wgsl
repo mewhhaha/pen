@@ -207,9 +207,9 @@ fn fog_mist_beyond(start: vec3f, end: vec3f) -> f32 {
 
 // The light the analytic mist scatters toward the eye per unit of optical depth,
 // unshadowed: the sun in the mist's phase and the ambient light.
-fn fog_light(direction: vec3f, point: vec3f) -> vec3f {
+fn fog_light(direction: vec3f, cloud_sh: f32) -> vec3f {
   let around = mix(fog_block.ambient.rgb, fog_sky(direction), fog_block.scatter.z) * fog_block.scatter.y;
-  let sun = fog_block.sun_color.rgb * (fog_block.scatter.x * fog_phase(fog_block.medium.w, dot(fog_block.sun.xyz, direction)) * fog_cloud_shadow(point));
+  let sun = fog_block.sun_color.rgb * (fog_block.scatter.x * fog_phase(fog_block.medium.w, dot(fog_block.sun.xyz, direction)) * cloud_sh);
   return fog_block.medium.rgb * (around + sun);
 }
 
@@ -226,10 +226,11 @@ fn fog_terms(world: vec3f) -> vec4f {
   }
   let camera = fog_block.camera.xyz;
   let direction = normalize(world - camera);
+  let cloud_sh = fog_cloud_shadow(world);
   var scattered = vec3f(0.0);
   var optical = 0.0;
   var start = camera;
-  var tint = fog_light(direction, world);
+  var tint = fog_light(direction, cloud_sh);
   if (fog_block.ambient.w > 0.5) {
     let depth = max(-(fog_block.view * vec4f(world, 1.0)).z, 0.0);
     let reach = min(depth, fog_block.grid.w);
@@ -247,8 +248,9 @@ fn fog_terms(world: vec3f) -> vec4f {
   }
   let beyond = fog_mist_beyond(start, world) * fog_block.fog.y;
   let transmitted = exp(-optical);
-  let light = scattered + transmitted * tint * (1.0 - exp(-beyond));
-  return vec4f(light, fog_cloud_shadow(world) * (transmitted * exp(-beyond)));
+  let trans_beyond = exp(-beyond);
+  let light = scattered + transmitted * tint * (1.0 - trans_beyond);
+  return vec4f(light, cloud_sh * (transmitted * trans_beyond));
 }
 
 // `color`, the colour of a surface at `world`, as the eye sees it through the

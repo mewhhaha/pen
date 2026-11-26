@@ -379,7 +379,7 @@ struct ClusterLight {
 @group(2) @binding(7) var<storage, read> area_light_data: array<vec4f>;
 
 // Eight points of a Poisson disk of radius 1.
-var<private> local_shadow_taps = array<vec2f, 8>(
+const local_shadow_taps = array<vec2f, 8>(
   vec2f(-0.7071, -0.7071), vec2f(0.0, -0.1), vec2f(0.7071, -0.7071), vec2f(-0.4, 0.2),
   vec2f(0.45, 0.25), vec2f(-0.85, 0.5), vec2f(0.1, 0.9), vec2f(0.9, 0.35));
 // How far a surface is moved along its normal (texels, at a right angle to
@@ -447,11 +447,15 @@ fn local_shadow(light: ClusterLight, world: vec3f, normal: vec3f, way: vec3f, di
 // at its reach (and, for a spot, outside its cone).
 fn cluster_light(light: ClusterLight, world: vec3f, normal: vec3f) -> vec3f {
   let toward = light.position.xyz - world;
-  let distance = length(toward);
   let reach = light.position.w;
-  if (distance >= reach) {
+  let dist2 = dot(toward, toward);
+  if (reach <= 0.0 || dist2 >= reach * reach) {
     return vec3f(0.0);
   }
+  if (dot(normal, toward) <= 0.0) {
+    return vec3f(0.0);
+  }
+  let distance = sqrt(dist2);
   let way = toward / max(distance, 0.0001);
   let ratio = distance / reach;
   let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);
@@ -460,9 +464,6 @@ fn cluster_light(light: ClusterLight, world: vec3f, normal: vec3f) -> vec3f {
     strength *= smoothstep(light.color.w, max(light.direction.w, light.color.w + 0.0001), dot(-way, light.direction.xyz));
   }
   let nl = max(dot(normal, way), 0.0);
-  if (nl <= 0.0) {
-    return vec3f(0.0);
-  }
   return light.color.rgb * strength * nl * local_shadow(light, world, normal, way, distance);
 }
 
@@ -508,20 +509,21 @@ struct ClusterSample {
 fn cluster_light_sample(light: ClusterLight, world: vec3f, normal: vec3f, behind: bool) -> ClusterSample {
   var taken = ClusterSample(vec3f(0.0), vec3f(0.0));
   let toward = light.position.xyz - world;
-  let distance = length(toward);
   let reach = light.position.w;
-  if (distance >= reach) {
+  let dist2 = dot(toward, toward);
+  if (reach <= 0.0 || dist2 >= reach * reach) {
     return taken;
   }
+  if (!behind && dot(normal, toward) <= 0.0) {
+    return taken;
+  }
+  let distance = sqrt(dist2);
   let way = toward / max(distance, 0.0001);
   let ratio = distance / reach;
   let window = clamp(1.0 - ratio * ratio * ratio * ratio, 0.0, 1.0);
   var strength = window * window / (distance * distance + 1.0);
   if (light.color.w > -1.0) {
     strength *= smoothstep(light.color.w, max(light.direction.w, light.color.w + 0.0001), dot(-way, light.direction.xyz));
-  }
-  if (max(dot(normal, way), 0.0) <= 0.0 && !behind) {
-    return taken;
   }
   taken.way = way;
   taken.radiance = light.color.rgb * strength * local_shadow(light, world, normal, way, distance);
@@ -683,50 +685,32 @@ fn clustered_area_lights_surface(
   let v = normalize(view);
   let ndotv = clamp(dot(n, v), 0.0, 1.0);
   let rough = clamp(roughness, 0.04, 1.0);
-  let q = sqrt(max(1.0 - ndotv, 0.0));
-  let t1 = area_sample_lut(area_mat_offset, rough, q);
-  let t2 = area_sample_lut(area_amp_offset, rough, q);
-  let minv = mat3x3f(
-    vec3f(t1.x, 0.0, t1.y),
-    vec3f(0.0, 1.0, 0.0),
-    vec3f(t1.z, 0.0, t1.w),
-  );
-  let basis = area_basis(n, v);
-  let spec_xf = minv * basis;
-  let spec_fresnel = f0 * t2.x + vec3f(f90 * t2.y);
   let metal = clamp(metallic, 0.0, 1.0);
-  // Conserve energy against the LTC directional specular albedo so a unit-radiance hemisphere stays <= 1.
-  let diff_albedo = base_color * (1.0 - metal) * max(vec3f(1.0) - spec_fresnel, vec3f(0.0)) * diff_scale;
-
-  var coat_xf = spec_xf;
-  var coat_fresnel = 0.0;
-  if (coat_weight > 0.0) {
-    let cn = normalize(coat_normal);
-    let cndv = clamp(dot(cn, v), 0.0, 1.0);
-    let cq = sqrt(max(1.0 - cndv, 0.0));
-    let cr = clamp(coat_roughness, 0.04, 1.0);
-    let ct1 = area_sample_lut(area_mat_offset, cr, cq);
-    let ct2 = area_sample_lut(area_amp_offset, cr, cq);
-    let cminv = mat3x3f(
-      vec3f(ct1.x, 0.0, ct1.y),
-      vec3f(0.0, 1.0, 0.0),
-      vec3f(ct1.z, 0.0, ct1.w),
-    );
-    coat_xf = cminv * area_basis(cn, v);
-    coat_fresnel = coat_weight * (0.04 * ct2.x + ct2.y);
-  }
   let has_sheen = dot(sheen_tint, sheen_tint) > 0.0;
+
+  var ltc_ready = false;
+  var basis = mat3x3f(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0));
+  var spec_xf = basis;
+  var spec_fresnel = vec3f(0.0);
+  var diff_albedo = vec3f(0.0);
+  var coat_xf = basis;
+  var coat_fresnel = 0.0;
   var total = vec3f(0.0);
 
   for (var i = 0u; i < count; i++) {
     let base = i * 5u;
     let pos_kind = area_light_data[base];
+    let col_reach = area_light_data[base + 3u];
+    let center = pos_kind.xyz;
+    let dist_center = length(center - world);
+    let atten = area_range_window(dist_center, col_reach.w);
+    if (atten <= 0.0) {
+      continue;
+    }
     let right_ext = area_light_data[base + 1u];
     let up_ext = area_light_data[base + 2u];
-    let col_reach = area_light_data[base + 3u];
     let flags = area_light_data[base + 4u];
 
-    let center = pos_kind.xyz;
     let kind = u32(round(pos_kind.w));
     let right_len = length(right_ext.xyz);
     let up_len = length(up_ext.xyz);
@@ -735,11 +719,6 @@ fn clustered_area_lights_surface(
     }
     let right = right_ext.xyz / right_len;
     let up = up_ext.xyz / up_len;
-    let dist_center = length(center - world);
-    let atten = area_range_window(dist_center, col_reach.w);
-    if (atten <= 0.0) {
-      continue;
-    }
     let two_sided = flags.x > 0.5;
 
     if (kind == 0u || kind == 1u) {
@@ -752,6 +731,39 @@ fn clustered_area_lights_surface(
       if (!two_sided && dot(emit_n, world - center) <= 0.0) {
         continue;
       }
+    }
+
+    if (!ltc_ready && kind != 3u) {
+      let q = sqrt(max(1.0 - ndotv, 0.0));
+      let t1 = area_sample_lut(area_mat_offset, rough, q);
+      let t2 = area_sample_lut(area_amp_offset, rough, q);
+      let minv = mat3x3f(
+        vec3f(t1.x, 0.0, t1.y),
+        vec3f(0.0, 1.0, 0.0),
+        vec3f(t1.z, 0.0, t1.w),
+      );
+      basis = area_basis(n, v);
+      spec_xf = minv * basis;
+      spec_fresnel = f0 * t2.x + vec3f(f90 * t2.y);
+      // Conserve energy against the LTC directional specular albedo so a unit-radiance hemisphere stays <= 1.
+      diff_albedo = base_color * (1.0 - metal) * max(vec3f(1.0) - spec_fresnel, vec3f(0.0)) * diff_scale;
+      coat_xf = spec_xf;
+      if (coat_weight > 0.0) {
+        let cn = normalize(coat_normal);
+        let cndv = clamp(dot(cn, v), 0.0, 1.0);
+        let cq = sqrt(max(1.0 - cndv, 0.0));
+        let cr = clamp(coat_roughness, 0.04, 1.0);
+        let ct1 = area_sample_lut(area_mat_offset, cr, cq);
+        let ct2 = area_sample_lut(area_amp_offset, cr, cq);
+        let cminv = mat3x3f(
+          vec3f(ct1.x, 0.0, ct1.y),
+          vec3f(0.0, 1.0, 0.0),
+          vec3f(ct1.z, 0.0, ct1.w),
+        );
+        coat_xf = cminv * area_basis(cn, v);
+        coat_fresnel = coat_weight * (0.04 * ct2.x + ct2.y);
+      }
+      ltc_ready = true;
     }
 
     if (kind == 3u) {
@@ -1210,7 +1222,13 @@ fn ddgi_env_cascade(cascade_idx: u32, world: vec3f, normal: vec3f, view_dir: vec
     if (w <= 1e-6) {
       continue;
     }
-    let irr = pow(max(texel.rgb, vec3f(0.0)), vec3f(gamma * 0.5));
+    let encoded = max(texel.rgb, vec3f(0.0));
+    var irr: vec3f;
+    if (abs(gamma - 5.0) < 1e-4) {
+      irr = encoded * encoded * sqrt(encoded);
+    } else {
+      irr = pow(encoded, vec3f(gamma * 0.5));
+    }
     sum_irr += irr * w;
     sum_w += w;
   }
@@ -1661,29 +1679,44 @@ fn screen_reflection(world: vec3f, normal: vec3f, view: vec3f, roughness: f32) -
 // of these. `normal` is where to look and `normal_dot_view` how much to
 // reflect: they are the same cosine unless the lookup is bent (an anisotropic
 // surface) or belongs to another layer's normal (a clear coat).
-fn sky_reflection_lobe(world: vec3f, normal: vec3f, view: vec3f, normal_dot_view: f32, roughness: f32, f0: vec3f, f90: f32) -> vec3f {
+fn sky_reflection_lobe_split(world: vec3f, normal: vec3f, view: vec3f, roughness: f32, f0: vec3f, f90: f32, split: vec2f) -> vec3f {
   let probes = reflection_probes.counts.x > 0.5;
   let traced = sky_light.ssr.x > 0.5;
   if (sky_light.tint.w < 0.5 && !probes && !traced) {
     return vec3f(0.0);
   }
-  let nv = max(normal_dot_view, 0.0001);
-  let toward = reflect(-view, normal);
   let rough = clamp(roughness, 0.04, 1.0);
-  var radiance = vec3f(0.0);
-  if (sky_light.tint.w >= 0.5) {
-    radiance = textureSampleLevel(sky_cube, sky_sampler, toward, rough * sky_light.reflection.x).rgb * sky_light.tint.rgb;
+  let fresnel_scale = f0 * split.x + vec3f(f90 * split.y);
+  var screen = vec4f(0.0);
+  if (traced) {
+    screen = screen_reflection(world, normal, view, rough);
+    if (screen.a >= 0.999) {
+      return screen.rgb * fresnel_scale;
+    }
   }
+  let toward = reflect(-view, normal);
+  var radiance = vec3f(0.0);
+  var local_cov = 0.0;
   if (probes) {
     let local = local_reflection(world, toward, rough);
-    radiance = radiance * (1.0 - local.a) + local.rgb;
+    radiance = local.rgb;
+    local_cov = local.a;
+  }
+  if (local_cov < 0.999 && sky_light.tint.w >= 0.5) {
+    let sky_r = textureSampleLevel(sky_cube, sky_sampler, toward, rough * sky_light.reflection.x).rgb * sky_light.tint.rgb;
+    radiance += sky_r * (1.0 - local_cov);
   }
   if (traced) {
-    let screen = screen_reflection(world, normal, view, rough);
     radiance = mix(radiance, screen.rgb, screen.a);
   }
+  return radiance * fresnel_scale;
+}
+
+fn sky_reflection_lobe(world: vec3f, normal: vec3f, view: vec3f, normal_dot_view: f32, roughness: f32, f0: vec3f, f90: f32) -> vec3f {
+  let nv = max(normal_dot_view, 0.0001);
+  let rough = clamp(roughness, 0.04, 1.0);
   let split = sky_brdf(nv, rough);
-  return radiance * (f0 * split.x + vec3f(f90 * split.y));
+  return sky_reflection_lobe_split(world, normal, view, rough, f0, f90, split);
 }
 
 // The light a surface at `world` facing `normal`, seen along `view` (both unit
@@ -2614,9 +2647,12 @@ fn surface_sky(s: StandardSurface) -> vec3f {
     // The base lobe alone, written as one expression: the very arithmetic
     // `surface_ambient` always had, to the bit.
     return diffuse * ambient_light_view(s.world, s.normal, s.view)
-      + sky_reflection_lobe(s.world, s.normal, s.view, dot(s.normal, s.view), s.roughness, s.f0, s.f90);
+      + sky_reflection_lobe_split(s.world, s.normal, s.view, s.roughness, s.f0, s.f90, split);
   }
-  var irradiance = select(ambient_light_view(s.world, s.normal, s.view), s.lightmap_irradiance, lightmapped);
+  var irradiance = s.lightmap_irradiance;
+  if (!lightmapped) {
+    irradiance = ambient_light_view(s.world, s.normal, s.view);
+  }
   var lookup = s.normal;
   if (brushing) {
     lookup = lobe_bent_normal(s.normal, s.tangent, s.bitangent, s.view, s.roughness, clamp(s.anisotropy, -1.0, 1.0));
@@ -2628,7 +2664,7 @@ fn surface_sky(s: StandardSurface) -> vec3f {
   }
   let reflected = eff_f0 * split.x + vec3f(s.f90 * split.y);
   let diffuse = s.base_color * (1.0 - clamp(s.metallic, 0.0, 1.0)) * (vec3f(1.0) - reflected * reflecting);
-  var reflection = sky_reflection_lobe(s.world, lookup, s.view, dot(s.normal, s.view), s.roughness, eff_f0, s.f90);
+  var reflection = sky_reflection_lobe_split(s.world, lookup, s.view, s.roughness, eff_f0, s.f90, split);
   if (s.occlusion < 1.0) {
     irradiance *= s.occlusion;
     reflection *= specular_occlusion(nv, s.occlusion, s.roughness);

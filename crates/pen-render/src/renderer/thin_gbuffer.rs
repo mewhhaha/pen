@@ -382,13 +382,22 @@ pub(super) struct ThinGbuffer {
     targets: Option<Targets>,
     resources: Option<Resources>,
     draws: Option<DrawBuffer>,
-    skin: Option<(wgpu::Buffer, u64, wgpu::BindGroup)>,
+    /// 2-slot cache matching double-buffered `Skinning` ring buffers.
+    skin: [Option<(wgpu::Buffer, u64, wgpu::BindGroup)>; 2],
+    skin_next: usize,
 }
 
 impl ThinGbuffer {
     pub fn new(device: &wgpu::Device) -> Self {
         let align = u64::from(device.limits().min_uniform_buffer_offset_alignment).max(1);
-        Self { stride: DRAW_BYTES.next_multiple_of(align), targets: None, resources: None, draws: None, skin: None }
+        Self {
+            stride: DRAW_BYTES.next_multiple_of(align),
+            targets: None,
+            resources: None,
+            draws: None,
+            skin: [None, None],
+            skin_next: 0,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -441,14 +450,24 @@ impl ThinGbuffer {
         }
         queue.write_buffer(&draws.buffer, 0, &draws.data[..usize::try_from(used).expect("draw data fits in memory")]);
 
-        if let [Some((buffer, bytes)), _] = skinning.buffers() {
-            if self.skin.as_ref().is_none_or(|(b, size, _)| b != buffer || *size != bytes) {
+        let active_skin = if let [Some((buffer, bytes)), _] = skinning.buffers() {
+            let slot = if let Some(hit) = self
+                .skin
+                .iter()
+                .position(|entry| entry.as_ref().is_some_and(|(b, size, _)| b == buffer && *size == bytes))
+            {
+                hit
+            } else {
+                let slot = self.skin_next;
+                self.skin_next ^= 1;
                 let group = buffer_group(device, "thin gbuffer joints", &resources.skin_layout, buffer, bytes);
-                self.skin = Some((buffer.clone(), bytes, group));
-            }
+                self.skin[slot] = Some((buffer.clone(), bytes, group));
+                slot
+            };
+            self.skin[slot].as_ref().map(|(_, _, group)| group)
         } else {
-            self.skin = None;
-        }
+            None
+        };
 
         resources.ensure_pipelines(device, depth_mode);
         let pipelines = resources.pipelines(depth_mode);
@@ -469,7 +488,7 @@ impl ThinGbuffer {
                         continue;
                     };
                     let lod = mesh.lods.get(usize::from(item.lod)).unwrap_or(&mesh.lods[0]);
-                    if let (Some(at), Some(skin), Some((_, _, group))) = (entry.skin, &mesh.skin, &self.skin) {
+                    if let (Some(at), Some(skin), Some(group)) = (entry.skin, &mesh.skin, active_skin) {
                         pass.set_pipeline(&pipelines.skinned);
                         pass.set_bind_group(2, group, &[at]);
                         pass.set_vertex_buffer(1, skin.vertices.slice(..));

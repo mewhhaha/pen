@@ -6,11 +6,11 @@ pen := "cargo run --release -q -p pen --"
 pnpm := "npx --yes pnpm@12.8.2"
 playwright := "1.63.0"
 # Pinned wtime-aot release (Linux x86-64 & aarch64 Blot ABI 8 AOT compiler).
-wtime_version := "v0.1.5"
-wtime_aot_x86_64_archive_sha256 := "a751918a711ad5067b66e3dc240f92f081649f37ad1cc6d7d9ad014e9f8eba82"
-wtime_aot_x86_64_bin_sha256 := "3020a809dcfba2bea0d829f38f0b89ce78d472f6587f0f284e04ad5795030364"
-wtime_aot_aarch64_archive_sha256 := "0b9094aaf71b1bd5579fa58e7d77c26c2f24e00fde8cf3eafe806486dd311472"
-wtime_aot_aarch64_bin_sha256 := "13a9af28bc21791c1b834d1d517b69a492b3efafbd88953ca5696de501ff8fe7"
+wtime_version := "v0.1.6"
+wtime_aot_x86_64_archive_sha256 := "6df0e9028c0cca72822c8317f3d9eedf9da9d81dfc9a37c616de49cf7702be02"
+wtime_aot_x86_64_bin_sha256 := "a7a96eb433d1547eae4e670e9a04322445eb7cd8a9f7de72aaf2c33c0b4f81b5"
+wtime_aot_aarch64_archive_sha256 := "6ade099fdce8164f25ff651fe367733054df17efdc1202f5bd8f4e80ab635476"
+wtime_aot_aarch64_bin_sha256 := "0a2d8d1095c9bd91ac5cf0776f33b6bc438347eb613336f163d8e023526dc53c"
 
 # Then removes what earlier installs left in plugins/ and web/ that this one
 # no longer builds, saying what it removes.

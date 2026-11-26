@@ -2686,7 +2686,7 @@ fn load_verified_so(_wasm: &[u8], _cache: Option<&Path>) -> Result<Library> {
     bail!("wtime-aot compilation requires blot-host's `compiler` feature")
 }
 
-/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset (`wtime` v0.1.5).
+/// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset (`wtime` v0.1.6).
 /// Uses native Linux `"aarch64"` on ARM64 Linux and `"x64"` elsewhere, falling back
 /// automatically to `"c"` (`--c-opt auto --target-cpu native`) on [`X64FallbackError`].
 #[cfg(all(feature = "compiler", target_os = "linux", target_arch = "aarch64", target_pointer_width = "64"))]
@@ -2885,7 +2885,7 @@ fn load_verified_so_with_config(wasm: &[u8], cache: Option<&Path>, cfg: &AotComp
 
     let bin = resolve_wtime_aot_bin().ok_or_else(|| {
         anyhow!(
-            "wtime-aot binary not found (install wtime v0.1.0 with `just install-wtime-aot`, put `wtime-aot` on PATH, or set PEN_WTIME_AOT_BIN)"
+            "wtime-aot binary not found (install wtime v0.1.6 with `just install-wtime-aot`, put `wtime-aot` on PATH, or set PEN_WTIME_AOT_BIN)"
         )
     })?;
     let (canon_bin, bin_hash) = bin_digest(&bin, &canon_cache)?;

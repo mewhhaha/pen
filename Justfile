@@ -276,11 +276,16 @@ check: plugins plugin-tests packets
   {{pen}} codegen --project {{gdev}} --rust crates/pen-protocol/src/packets.rs --check
   cargo fmt --all --check
   cd plugins && cargo fmt --all --check
+  cd plugins && cargo clippy --workspace --target wasm32-wasip2 -- -D warnings
   cargo clippy --workspace --all-targets --features pen/steam -- -D warnings
+  cargo clippy -p blot-host --no-default-features --all-targets -- -D warnings
   cargo hack clippy -p pen --feature-powerset --exclude-features default --all-targets -- -D warnings
   cargo test --workspace -- --test-threads=1
   cargo test --release -p pen-render -- --test-threads=1
   cargo clippy -p pen-web --target wasm32-unknown-unknown -- -D warnings
+  cargo clippy -p pen-web --target wasm32-unknown-unknown --no-default-features --features compact -- -D warnings
+  cargo clippy -p pen-web --target wasm32-unknown-unknown --no-default-features --features web-3d -- -D warnings
+  cargo clippy -p pen-web --target wasm32-unknown-unknown --no-default-features --features web-2d -- -D warnings
 
 # Needs cargo-deny; the policy is deny.toml.
 # Licenses, advisories, bans and sources of both lockfiles.

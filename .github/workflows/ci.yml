@@ -32,7 +32,7 @@ jobs:
     name: Linux build, clippy and tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Game tests not configured
         # The game job below needs these; without them it is skipped.
         if: ${{ vars.GDEV_REPOSITORY == '' || vars.BLOT2_REPOSITORY == '' || vars.GDEV_REF == '' || vars.BLOT2_REF == '' || vars.INK_REPOSITORY == '' || vars.INK_REF == '' }}
@@ -68,11 +68,15 @@ jobs:
       - name: Compiler component and tests
         run: |
           cargo build --manifest-path plugins/Cargo.toml --release --target wasm32-wasip2
+          cargo clippy --manifest-path plugins/Cargo.toml --workspace --target wasm32-wasip2 -- -D warnings
           cargo test --manifest-path plugins/Cargo.toml
       - name: Browser host
         run: |
           sh crates/pen-web/build.sh
           cargo clippy -p pen-web --target wasm32-unknown-unknown -- -D warnings
+          cargo clippy -p pen-web --target wasm32-unknown-unknown --no-default-features --features compact -- -D warnings
+          cargo clippy -p pen-web --target wasm32-unknown-unknown --no-default-features --features web-3d -- -D warnings
+          cargo clippy -p pen-web --target wasm32-unknown-unknown --no-default-features --features web-2d -- -D warnings
           # The simulation services in wasm32 answer with native's bits.
           node crates/pen-web/tests/services.mjs
       - name: Formatting (rustfmt.toml)
@@ -101,7 +105,7 @@ jobs:
     name: Docs site (mdBook)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: mdBook
         run: |
           cd "$RUNNER_TEMP"
@@ -112,7 +116,7 @@ jobs:
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: Build the book
         run: mdbook build docs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: docs-site
           path: docs/book
@@ -122,7 +126,7 @@ jobs:
     name: Licenses, advisories and bans
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
       - uses: taiki-e/install-action@v2
@@ -135,7 +139,7 @@ jobs:
     name: Player runtimes (Linux glibc 2.28, Windows)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: System libraries
         run: |
           sudo apt-get update
@@ -171,14 +175,14 @@ jobs:
       - name: Player size budgets
         # docs/shipping.md, "Budgets": a player that outgrows its budget fails.
         run: just size-budget
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: player-runtimes
           path: |
             target/x86_64-unknown-linux-gnu/dist/player/
             target/x86_64-pc-windows-gnu/dist/player/
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         # The same builds unstripped: what resolves their crash reports.
         with:
           name: player-runtime-symbols
@@ -199,7 +203,7 @@ jobs:
     steps:
       - name: Line endings as committed
         run: git config --global core.autocrlf false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Rust (rust-toolchain.toml)
         run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@v2
@@ -222,7 +226,7 @@ jobs:
     # ported (docs/android.md).
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Rust (rust-toolchain.toml)
         run: |
           rustup toolchain install --profile minimal
@@ -251,22 +255,22 @@ jobs:
         working-directory: pen
     steps:
       # The recipes expect the checkouts side by side: ../gdev, ../blot2.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: pen
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: ${{ vars.GDEV_REPOSITORY }}
           ref: ${{ vars.GDEV_REF }}
           token: ${{ secrets.CHECKOUTS_TOKEN }}
           path: gdev
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: ${{ vars.BLOT2_REPOSITORY }}
           ref: ${{ vars.BLOT2_REF }}
           token: ${{ secrets.CHECKOUTS_TOKEN }}
           path: blot2
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: ${{ vars.INK_REPOSITORY }}
           ref: ${{ vars.INK_REF }}
@@ -332,7 +336,7 @@ jobs:
           scripts/reproducible.sh target/release/pen ../gdev target/reproducible
           scripts/size-budget.sh dist/package/game 110
           scripts/cold-start.sh dist/package/gdev 180000 1
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: lts/*
       - name: Headless browser prerequisites
@@ -356,17 +360,17 @@ jobs:
       # golden images so that a failing image does not hold them back: the
       # exported game, this pen (which packages it for another platform's
       # runtime) and the conformance packets every platform's must equal.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: game-bundle
           path: pen/dist/gdev
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: pen-linux
           path: pen/target/release/pen
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: native-packets
           path: pen/target/browser-conformance
@@ -379,7 +383,7 @@ jobs:
         env:
           PEN_SOFTWARE: "1"
         run: just visual
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: visual-diffs
@@ -398,7 +402,7 @@ jobs:
     if: ${{ !cancelled() && needs.player.result == 'success' && needs.game.result != 'skipped' }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: binaryen
         run: |
           cd "$RUNNER_TEMP"
@@ -412,19 +416,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libasound2-dev libdbus-1-dev mesa-vulkan-drivers
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: player-runtimes
           path: runtimes
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: game-bundle
           path: bundle
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: pen-linux
           path: pen-linux
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: native-packets
           path: native-packets
@@ -436,12 +440,12 @@ jobs:
           pen-linux/pen build --game bundle --runtime runtimes/x86_64-unknown-linux-gnu/dist/player/pen --out packages/linux
       - name: Linux package on lavapipe, its packets against the checkout's
         run: scripts/smoke.sh packages/linux/gdev smoke/linux native-packets
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: package-windows
           path: packages/windows
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: smoke-linux
@@ -460,12 +464,12 @@ jobs:
     steps:
       - name: Line endings as committed
         run: git config --global core.autocrlf false
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: package-windows
           path: package
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: native-packets
           path: native-packets
@@ -474,7 +478,7 @@ jobs:
         # crash report and shows no message box; the timeout is for the rest.
         timeout-minutes: 20
         run: scripts/smoke.sh package/gdev.exe smoke native-packets
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: smoke-windows
@@ -492,7 +496,7 @@ jobs:
     env:
       WGPU_BACKEND: metal
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: binaryen
         run: |
           cd "$RUNNER_TEMP"
@@ -519,12 +523,12 @@ jobs:
         run: |
           cargo test --release -p pen-runtime -p pen-protocol -p pen-render -- --test-threads=1
           cargo test --release -p pen -- app_bundle project::
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.game.result != 'skipped'
         with:
           name: game-bundle
           path: bundle
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: needs.game.result != 'skipped'
         with:
           name: native-packets
@@ -555,13 +559,13 @@ jobs:
         # ditto keeps the signature's extended attributes.
         if: needs.game.result != 'skipped'
         run: ditto -c -k --keepParent dist/macos/gdev.app dist/gdev-macos.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: needs.game.result != 'skipped'
         with:
           name: app-macos
           path: dist/gdev-macos.zip
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always() && needs.game.result != 'skipped'
         with:
           name: smoke-macos

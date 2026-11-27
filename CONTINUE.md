@@ -2,6 +2,17 @@
 
 ## Current status
 
+Pen `v0.1.8` (`8323b16`, Linux tools bundle published on GitHub Releases) shipped
+six performance batches across `pen-render`, `pen-runtime`, `pen`, and `pen-web`
+(frame staging ring, retained-scene delta slots + incremental TLAS, 1D flattened
+GPU culling + diffed uniforms, prebaked 3D cloud noise + half-res linear-Z GTAO,
+depth-resolve dedup + fused thin-GBuffer/velocity MRT + multi-channel SVGF +
+deferred meshlets). Follow-up `main` commits clear CI/clippy failures across
+native, `--no-default-features` player, Android, Windows, all four `pen-web`
+`wasm32` tiers, and `plugins/blot`, consolidate shared `sort` helpers into
+`pen_protocol::sort`, prune dead code, and split `wtime_aot.rs`, `main.rs`, and
+`audio/mixer.rs` into focused submodules.
+
 Web exports list their startup files in `game.json`, prune unused optional JS
 glue (`structured.js`, `kernels.js`, `kernel_worker.js`), externalize heavy
 optional 3D WGSL pass shaders into lazy `shaders/*.wgsl` files

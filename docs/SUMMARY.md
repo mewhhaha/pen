@@ -32,6 +32,7 @@
 - [Services and copied-buffer workers](services-as-tasks.md)
 - [Display scale](display-scale.md)
 - [Render performance](render-performance.md)
+- [Module compilation and cache memory](compile-memory.md)
 - [Shipping](shipping.md)
 - [The browser build and itch.io](web-export.md)
 - [Android](android.md)

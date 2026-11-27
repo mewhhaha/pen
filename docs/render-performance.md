@@ -442,3 +442,29 @@ Key verification witnesses (`cargo test -p pen-render -- --test-threads=1`):
   draw overlap across Forward-Z and Reversed-Z; 5-level endpoint-preserving QEM Cluster
   DAG reduces a 1,728-triangle sphere smoothly to 578 triangles (mixed LOD cut with exact
   1-to-1 leaf ancestry exclusivity and locked seams) and 114 triangles at far distance.
+
+## v0.1.8 frame-loop, GPU culling, and retained-scene optimizations
+
+Shipped in `v0.1.8` (`73be8e8`..`8323b16`) across `pen-render`, `pen-runtime`, `pen`,
+and `pen-web` to reduce steady-state CPU/GPU frame overhead and startup work without
+changing wire layouts or visual output:
+
+- **Frame staging and upload reduction**: A pooled `FrameStaging` ring buffer (`staging.rs`,
+  `Rc<RefCell<_>>` on `wasm32`, `Arc<Mutex<_>>` natively), diffed draw-uniform uploads,
+  dirty-range instance streaming, and pooled JFA mask buffers avoid redundant per-frame
+  allocations and copies.
+- **Retained-scene deltas and incremental TLAS**: `pen-runtime` forwards sparse retained
+  draw deltas to persistent GPU slots (`renderer/retained.rs`) and incremental BLAS/TLAS
+  updates rather than rebuilding unchanged scene buffers every frame.
+- **1D flattened GPU culling and active-view compaction**: GPU culling compacts active
+  views into 1D dispatches, gates Hi-Z generation to scenes that consume it, and covers
+  all render stages under `GpuTimer`.
+- **Pass fusion and lazy geometry preparation**: Deduplicated MSAA depth resolves
+  (`WiredPasses::resolve_msaa_depth`), fused `thin_gbuffer` + velocity MRT output,
+  multi-channel SVGF passes, prebaked 3D cloud noise with depth early-out, half-res
+  linear-Z GTAO, and deferred on-demand meshlet/Cluster DAG construction
+  (`prepare_mesh_deferred` + `MeshCache::load_or_build`) keep unused passes and
+  startup builds off the critical path.
+- **Host/browser frame pacing**: Service-aware guest/host overlap, prompt kernel-worker
+  wakeups, and shared single-instantiation `pen_protocol::sort` reduce scheduling jitter
+  and `wasm32` code size.

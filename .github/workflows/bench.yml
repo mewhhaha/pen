@@ -30,24 +30,24 @@ jobs:
       run:
         working-directory: pen
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: pen
           # The base commit is built from this clone too.
           fetch-depth: 0
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: ${{ vars.GDEV_REPOSITORY }}
           ref: ${{ vars.GDEV_REF }}
           token: ${{ secrets.CHECKOUTS_TOKEN }}
           path: gdev
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: ${{ vars.BLOT2_REPOSITORY }}
           ref: ${{ vars.BLOT2_REF }}
           token: ${{ secrets.CHECKOUTS_TOKEN }}
           path: blot2
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: ${{ vars.INK_REPOSITORY }}
           ref: ${{ vars.INK_REF }}
@@ -110,7 +110,7 @@ jobs:
             exit 0
           fi
           ./pen-head bench --game game --runs "$BENCH_RUNS" --json --compare base.json > head.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: bench-${{ github.sha }}

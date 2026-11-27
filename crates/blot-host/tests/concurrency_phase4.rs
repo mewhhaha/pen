@@ -20,9 +20,8 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 fn compile_blot(source: &str) -> Result<Vec<u8>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let blot = root.join("../../../blot2");
-    let compiler = std::env::var_os("BLOTC")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| blot.join("compiler-goose/build/blotc-goose"));
+    let compiler =
+        std::env::var_os("BLOTC").map(PathBuf::from).unwrap_or_else(|| blot.join("compiler-goose/build/blotc-goose"));
     let id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp_dir = std::env::temp_dir().join(format!("pen-phase4-{}-{id}", std::process::id()));
     std::fs::create_dir_all(&tmp_dir)?;
@@ -233,15 +232,9 @@ fn crafted_var_kernel_wasm(
 /// (testing Law #5(b): successful `proc_step` followed by cleanup Overrun must NOT be masked!).
 fn crafted_spin_cleanup_process_wasm() -> Vec<u8> {
     // ABI 8 exports: `blot:proc_init:p` (U32->Unit), `blot:proc_step:p` (U32->U32), `blot:finish_invocation`
-    let abi_payload = [
-        vec![8, 2],
-        wasm_name("blot:proc_init:p"),
-        vec![1, 0],
-        wasm_name("blot:proc_step:p"),
-        vec![1, 1],
-        vec![0],
-    ]
-    .concat();
+    let abi_payload =
+        [vec![8, 2], wasm_name("blot:proc_init:p"), vec![1, 0], wasm_name("blot:proc_step:p"), vec![1, 1], vec![0]]
+            .concat();
     let mut psec = vec![1];
     psec.extend(leb_u32(blot_host::DEFAULT_TRANSPORT_BUDGET));
     psec.push(1);
@@ -355,10 +348,7 @@ func s_step (st: own U32) -> (cmd: U32): (U32, U32) =>
         .err()
         .expect("missing MemorySection on hidden-memory process package must be rejected");
     let msg = format!("{err:#}");
-    assert!(
-        msg.contains("MemorySection") && msg.contains("repackage"),
-        "unexpected error message: {msg}"
-    );
+    assert!(msg.contains("MemorySection") && msg.contains("repackage"), "unexpected error message: {msg}");
 
     // Ordinary legacy ABI 8 module WITH exported blot:memory and ZERO kernels/processes still loads cleanly!
     let legacy_wasm = compile_blot(
@@ -800,8 +790,10 @@ func run_ctx (ctx: #[U32]) -> (x: U32): U32 =>
     assert!(warm_ok.run_variable(&[16_384]).is_ok());
 
     // Witness (5): 100 repeated batches across fixed, variable, and variable-overflow pools with zero drift!
-    let mut p_fix = KernelPool::open(&engine, &module, "drift_fixed", KernelConfig { workers: 1, ..KernelConfig::default() })?;
-    let mut p_var = KernelPool::open(&engine, &module, "drift_var", KernelConfig { workers: 1, ..KernelConfig::default() })?;
+    let mut p_fix =
+        KernelPool::open(&engine, &module, "drift_fixed", KernelConfig { workers: 1, ..KernelConfig::default() })?;
+    let mut p_var =
+        KernelPool::open(&engine, &module, "drift_var", KernelConfig { workers: 1, ..KernelConfig::default() })?;
     let mut p_ov = KernelPool::open(
         &engine,
         &module,
@@ -916,7 +908,8 @@ func unit_step (st: own U32) -> (_: Unit): (U32, Unit) => return (@u32.add st 1,
     let fb_eng = blot_host::fuel_bounded_engine(Duration::from_millis(2))?;
     let fb_mod = GuestModule::new(&fb_eng, &wasm, None)?;
     let mut p_with_fuel = base_policy("fast");
-    p_with_fuel.rust_wasmtime_fuel = Some(FuelPolicy { init_fuel: 1_000_000, step_fuel: 1_000_000, cleanup_fuel: 1_000_000 });
+    p_with_fuel.rust_wasmtime_fuel =
+        Some(FuelPolicy { init_fuel: 1_000_000, step_fuel: 1_000_000, cleanup_fuel: 1_000_000 });
     p_with_fuel.deadline = Some(Duration::from_millis(500));
     let mut p_no_fuel = base_policy("slow");
     p_no_fuel.rust_wasmtime_fuel = None; // MUST be seeded u64::MAX on fuel_bounded_engine!
@@ -938,7 +931,8 @@ func unit_step (st: own U32) -> (_: Unit): (U32, Unit) => return (@u32.add st 1,
     // Give enough fuel (~50ms of spinning) that the 3ms deadline fires inside the fuel-metered loop,
     // AND also test exact post-entry Overrun precedence when OutOfFuel returns after deadline_at elapsed.
     let mut sim_p3 = base_policy("slow");
-    sim_p3.rust_wasmtime_fuel = Some(FuelPolicy { init_fuel: 5_000_000, step_fuel: 50_000_000, cleanup_fuel: 1_000_000 });
+    sim_p3.rust_wasmtime_fuel =
+        Some(FuelPolicy { init_fuel: 5_000_000, step_fuel: 50_000_000, cleanup_fuel: 1_000_000 });
     sim_p3.deadline = Some(Duration::from_millis(3));
     let mut sim_procs3 = Processes::new(&fb_eng, &fb_mod, vec![sim_p3])?;
     let AdmitResult::Admitted(hsim3) = sim_procs3.admit("slow", ProcessValue::U32(0)) else { panic!() };
@@ -1027,7 +1021,10 @@ func s_step (st: own U32) -> (cmd: U32): (U32, U32) =>
     assert_eq!(sc_procs.advance(1)?, 1);
     let _ = sc_procs.send(hp, ProcessValue::U32(2));
     let sc_res = sc_procs.advance(1);
-    assert!(matches!(sc_res, Err(ProcessHostError::Overrun { .. })), "cleanup overrun must NOT be masked, got {sc_res:?}");
+    assert!(
+        matches!(sc_res, Err(ProcessHostError::Overrun { .. })),
+        "cleanup overrun must NOT be masked, got {sc_res:?}"
+    );
 
     // 6. Mailbox-slot invariance on Unit -> Unit (0 bytes, mailbox = 1) + unpolled Done reply_bytes across close!
     let mut unit_pol = base_policy("unit_p");

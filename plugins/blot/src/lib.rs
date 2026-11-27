@@ -138,6 +138,16 @@ pub struct Diagnostic {
     pub message: String,
     /// Toolchain-specific explanation, as text or encoded JSON.
     pub details: Option<String>,
+    /// Optional language-specific fix suggestion.
+    pub fix: Option<String>,
+    /// Optional language-specific documentation pointer.
+    pub doc: Option<String>,
+}
+
+/// Generates Blot protocol bindings (`pen/*.blot`, plus `pen/extensions.blot`)
+/// from pen's `protocol/schema.json` and the checkout's `pen.json` `protocol` block.
+pub fn generate_bindings(schema_json: &str, extensions_json: &str) -> Result<pen_codegen::EmittedBindings, String> {
+    pen_codegen::emit_blot_files(schema_json, extensions_json).map_err(|error| format!("{error:#}"))
 }
 
 /// What a build made.

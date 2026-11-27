@@ -164,7 +164,9 @@ pub fn emit(model: &Model, header: &[String]) -> String {
     ]);
     for section in &model.sections {
         let name = s(&section.section["name"]);
-        if matches!(kind(&section.section), "records" | "variable") && !matches!(name, "draws" | "sprites" | "instances") {
+        if matches!(kind(&section.section), "records" | "variable")
+            && !matches!(name, "draws" | "sprites" | "instances")
+        {
             projected(section, &mut out);
         }
     }
@@ -274,7 +276,9 @@ pub fn emit(model: &Model, header: &[String]) -> String {
     ];
     for section in &model.sections {
         let name = s(&section.section["name"]);
-        if matches!(kind(&section.section), "records" | "variable") && !matches!(name, "draws" | "sprites" | "instances") {
+        if matches!(kind(&section.section), "records" | "variable")
+            && !matches!(name, "draws" | "sprites" | "instances")
+        {
             let name = singular(name);
             projections.push(format!("{name}: project_{name}"));
         }

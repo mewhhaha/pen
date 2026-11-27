@@ -238,9 +238,11 @@ impl Settings {
             Some(Value::Bool(enabled)) => *enabled,
             Some(_) => return Err("the settings' `testMode` is not a boolean".into()),
         };
+        let mut resolved_imports = imports(fields.get("imports"), root)?;
+        resolved_imports.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(Settings {
             program,
-            imports: imports(fields.get("imports"), root)?,
+            imports: resolved_imports,
             std,
             prelude,
             dependencies: path("dependencies")?,

@@ -7,6 +7,7 @@ use crate::{Build, Expectation, Overlay, Program};
 
 wit_bindgen::generate!({ path: "../../wit", world: "compiler-plugin" });
 
+use exports::pen::plugin::codegen;
 use exports::pen::plugin::compiler::{self, BuildResult, GuestSession};
 use exports::pen::plugin::tests;
 use pen::plugin::log::{self, Level};
@@ -18,6 +19,24 @@ export!(Plugin);
 
 impl compiler::Guest for Plugin {
     type Session = Compiler;
+}
+
+impl codegen::Guest for Plugin {
+    fn generate(
+        schema_json: String,
+        extensions_json: String,
+        _settings: String,
+    ) -> Result<codegen::Generation, String> {
+        let emitted = crate::generate_bindings(&schema_json, &extensions_json)?;
+        Ok(codegen::Generation {
+            files: emitted
+                .files
+                .into_iter()
+                .map(|(path, contents)| codegen::GeneratedFile { path, contents })
+                .collect(),
+            remove: emitted.remove,
+        })
+    }
 }
 
 /// The checkout's files, through what pen.json grants the plugin.
@@ -161,6 +180,8 @@ impl GuestSession for Compiler {
                         end: diagnostic.end,
                         message: diagnostic.message,
                         details: diagnostic.details,
+                        fix: diagnostic.fix,
+                        doc: diagnostic.doc,
                     })
                     .collect(),
             ),

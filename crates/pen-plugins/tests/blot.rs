@@ -650,3 +650,31 @@ fn stage0_watch_rebuilds_on_asset_edit_and_generator_edit() {
     drop(watching);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn plugin_codegen_and_web_entry_config_work_through_component() {
+    let Some(component) = component() else { return };
+    let root = empty();
+    let config = serde_json::json!({
+        "web": { "mode": "2d" },
+        "plugins": {
+            "blot": { "wasm": component }
+        },
+        "compiler": {
+            "plugin": "blot",
+            "entry": "src/game.blot",
+            "devtools": "dev/main.blot"
+        }
+    });
+    std::fs::write(root.join("pen.json"), config.to_string()).unwrap();
+    let (plugins, _) = plugins(&root);
+    assert_eq!(plugins.entry(), "src/game.blot");
+    assert_eq!(plugins.devtools(), Some("dev/main.blot"));
+
+    let schema = include_str!("../../../protocol/schema.json");
+    let ext = r#"{"events":{"Kick":{"tag":1,"fields":{"x":"f32"}}}}"#;
+    let generated = plugins.codegen(schema, ext).expect("plugin codegen succeeds");
+    assert!(generated.files.iter().any(|f| f.path == "pen/protocol.blot"));
+    assert!(generated.files.iter().any(|f| f.path == "pen/extensions.blot" && f.contents.contains("Kick")));
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -367,10 +367,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             "Append the tag, length and these {}s to a caller-owned extension packet.",
             section.name
         )));
-        out.push(format!(
-            "func append_{name} (records: #[{}]) -> (packet: own #[F32]): #[F32] =>",
-            section.name
-        ));
+        out.push(format!("func append_{name} (records: #[{}]) -> (packet: own #[F32]): #[F32] =>", section.name));
         out.push(format!("  @storage.push packet (U32.to_f32 {name}_tag)"));
         out.push(format!("  @storage.push packet (U32.to_f32 (records.length * {name}_floats))"));
         out.push("  for record in records:".to_owned());

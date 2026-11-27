@@ -25,6 +25,17 @@ was built for in every interface it imports from pen or exports to it
   interfaces that does not add an entry fails `cargo test -p pen-plugins`,
   saying the shape to record.
 
+## 0.4.0 (2026-11-27)
+
+Shape: `05ea20cd01a286a1d8e1393bbcf146aced4f6333d3944bc83724ba96e0cae4e4`
+
+- Added the `codegen` interface (`generated-file`, `generation`, `generate`) to
+  `compiler-plugin` so language plugins own protocol binding generation from
+  `protocol/schema.json` and `pen.json`'s `protocol` extensions.
+- Added optional `fix` and `doc` fields to `types.diagnostic` so language
+  plugins can provide their own fix hints and documentation links instead of
+  hardcoded Blot messages.
+
 ## 0.3.0 (2026-11-26)
 
 Shape: `bc736c564b5563bb4afd06d1f37ad4790004dd70ceba4e188c27068788be3484`

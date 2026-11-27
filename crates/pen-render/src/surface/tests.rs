@@ -1164,9 +1164,7 @@ fn lod_crossfade_dither_covers_expected_fractions_with_exact_complements() {
     }
     let body = "put(i, 0u, select(0.0, 1.0, surface_lod_dither(vec2f(arg(i, 0u), arg(i, 1u)), arg(i, 2u))));";
     let got = scalars(&gpu, body, &input, 3, 1);
-    let tile = |idx: usize| -> Vec<bool> {
-        got[idx * 16..(idx + 1) * 16].iter().map(|&v| v > 0.5).collect()
-    };
+    let tile = |idx: usize| -> Vec<bool> { got[idx * 16..(idx + 1) * 16].iter().map(|&v| v > 0.5).collect() };
     let kept = |discards: &[bool]| discards.iter().filter(|&&d| !d).count();
     assert_eq!(kept(&tile(0)), 0, "fade 0.0 discards all 16 pixels");
     assert_eq!(kept(&tile(1)), 4, "fade 0.25 keeps 4/16 pixels");

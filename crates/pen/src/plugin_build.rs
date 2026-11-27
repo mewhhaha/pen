@@ -133,10 +133,19 @@ pub fn describe(diagnostic: &Diagnostic, standing_in: Option<(&str, &str)>) -> S
     spans.push((p_start, p_end, '^', primary_label));
     out.extend(format_excerpt(bytes, &lines, &line_starts, &spans));
 
-    if let Some(fix_text) = fix {
+    let fix_text = diagnostic.fix.clone().or(fix);
+    if let Some(fix_text) = fix_text {
         out.push(format!("fix: {fix_text}"));
     }
-    out.push(format!("doc: blot explain {canonical} (skills/blot-diagnostics/SKILL.md#{canonical})"));
+    let doc_text = diagnostic.doc.clone().or_else(|| {
+        diagnostic
+            .file
+            .ends_with(".blot")
+            .then(|| format!("blot explain {canonical} (skills/blot-diagnostics/SKILL.md#{canonical})"))
+    });
+    if let Some(doc_text) = doc_text {
+        out.push(format!("doc: {doc_text}"));
+    }
     out.join("\n")
 }
 
@@ -736,6 +745,8 @@ mod tests {
             details: Some(format!(
                 "{{\"origin_kind\":\"moved\",\"origin_start\":{move_start},\"origin_end\":{move_end},\"subject_start\":{subj_start},\"subject_end\":{subj_end},\"holder_start\":0,\"holder_end\":0}}"
             )),
+            fix: None,
+            doc: None,
         };
         let rendered = describe(&diagnostic, Some(("/tmp/spent.blot", source)));
         assert!(rendered.starts_with("/tmp/spent.blot:5:14: [SPENT_VALUE] (spent_value)"), "{rendered}");
@@ -744,6 +755,28 @@ mod tests {
         assert!(rendered.contains("^^^^^^^^ `a` used after move"), "{rendered}");
         assert!(rendered.contains("fix: Pass `a.copy` at line 4"), "{rendered}");
         assert!(rendered.contains("doc: blot explain SPENT_VALUE"), "{rendered}");
+    }
+
+    #[test]
+    fn describes_non_blot_plugin_diagnostic_without_blot_doc_link() {
+        let source = "fn main() {\n    let x: u32 = true;\n}\n";
+        let start = u32::try_from(source.find("true").unwrap()).unwrap();
+        let end = start + 4;
+        let diagnostic = Diagnostic {
+            file: "/tmp/main.rs".to_owned(),
+            stage: "check".to_owned(),
+            code: "E0308".to_owned(),
+            start,
+            end,
+            message: "mismatched types".to_owned(),
+            details: None,
+            fix: Some("Use an integer literal like `1`".to_owned()),
+            doc: Some("rustc --explain E0308".to_owned()),
+        };
+        let rendered = describe(&diagnostic, Some(("/tmp/main.rs", source)));
+        assert!(rendered.contains("fix: Use an integer literal like `1`"), "{rendered}");
+        assert!(rendered.contains("doc: rustc --explain E0308"), "{rendered}");
+        assert!(!rendered.contains("blot explain"), "{rendered}");
     }
 
     #[test]
@@ -771,6 +804,8 @@ mod tests {
                 })
                 .to_string(),
             ),
+            fix: None,
+            doc: None,
         };
         let rendered = describe(&diagnostic, None);
         assert!(rendered.contains("salt.wgsl.blot:2:19: [TYPE_MISMATCH]"), "{rendered}");

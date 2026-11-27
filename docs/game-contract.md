@@ -10,35 +10,45 @@ built for. `pen new` makes the smallest checkout that has all of it.
 
 ## The checkout
 
-pen takes a directory as a checkout when it has `pen.json` and `src/main.blot`
-(`--project DIR` names one; otherwise the current directory or one above it).
+pen takes a directory as a checkout when it has `pen.json` and either its
+configured `compiler.entry` (e.g. `"compiler": { "plugin": "rust", "entry":
+"Cargo.toml" }`) or `src/main.blot` (`--project DIR` names one; otherwise the
+current directory or one above it). Prebuilt bundles (`game.wasm` + `assets/`)
+need no checkout or plugin at all: `pen --game DIR`, `pen build --game DIR`,
+and `pen build --web --game DIR` run, package, and export them directly.
 
 | File                          | Needed | What pen does with it                                                                                                                                                                                                                                                                                                     |
 | ----------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pen.json`                    | yes    | `game`: the name (data directory, executable) and title (window, assistive technology), else the directory's name. `plugins` and `compiler`: the compiler plugin that builds the game and what it may read and run. `protocol`: the game's own events and sections ([the game's own events and sections](extensions.md)). |
-| `src/main.blot`               | yes    | The program's entry, compiled by the chosen plugin into `.pen/runtime/game.wasm`.                                                                                                                                                                                                                                         |
+| `pen.json`                    | yes    | `game`: the name (data directory, executable) and title (window, assistive technology), else the directory's name. `plugins` and `compiler`: the compiler plugin that builds the game (`entry`, optional `devtools`, `settings`) and what it may read and run. `protocol`: the game's own events and sections ([the game's own events and sections](extensions.md)). `web`: optional browser export `mode` (`"2d"` / `"3d"`) or `features`. |
+| `compiler.entry` (`src/main.blot`) | yes | The program's entry, compiled by the chosen plugin into `.pen/runtime/game.wasm`.                                                                                                                                                                                                                                         |
 | `src/assets/catalog.json`     | yes    | The meshes, materials and sounds the game names by index. Each list may be empty. `pen build` ships what the catalog reaches.                                                                                                                                                                                             |
 | `src/main.scene`              | no     | A saved scene the game starts from, if the program keeps scenes.                                                                                                                                                                                                                                                          |
 | `src/tunables.json`           | no     | Live-tunable constants, for `tune=` steps and the dev tools.                                                                                                                                                                                                                                                              |
-| `devtools/main.blot`          | no     | A second program pen runs over the game as its dev tools. Without one there are none.                                                                                                                                                                                                                                     |
+| `compiler.devtools` (`devtools/main.blot`) | no | A second program pen runs over the game as its dev tools. Without one there are none.                                                                                                                                                                                                                                     |
 | `pipeline.json`               | no     | Asset recipes `pen dev` reruns as their sources change, run through `just` in the checkout.                                                                                                                                                                                                                               |
-| `tests/*.blot`                | no     | `pen test-blot`'s modules, as the Blot plugin lays them out.                                                                                                                                                                                                                                                              |
+| `tests/*`                     | no     | `pen test-guest` (alias `pen test-blot`) test modules, as the checkout's compiler plugin lays them out.                                                                                                                                                                                                                   |
 | `tests/visual/scenarios.json` | no     | `pen test`'s golden-image scenarios.                                                                                                                                                                                                                                                                                      |
 
 pen keeps what it makes under `.pen/` (builds, packages, shots, test output). It
-writes the checkout's own files only when asked to: `pen
-codegen` into `pen/`,
-the dev tools' Bake into `src/tunables.json`, `pen test
---update` into the
-golden images, and asset recipes where they write.
+writes the checkout's own files only when asked to: `pen codegen` (delegated to
+the checkout's compiler plugin when configured), the dev tools' Bake into
+`src/tunables.json`, `pen test --update` into the golden images, and asset
+recipes where they write.
 
 ## The program
 
-A game is a WebAssembly module that speaks Blot's guest ABI (blot2's
-`compiler/guest-abi.md`): a `blot:abi` custom section lists its exports, and it
-exports `main`, which takes the host, a callback from an `Array F32` to an
-`Array F32`, and returns nothing. Blot compiles to this; another language can
-write the section and the adapters itself.
+A game is a WebAssembly module speaking either:
+
+1. **The `externref`-free `pen:guest/1` ABI** (for Rust, C, C++, Zig, TinyGo,
+   AssemblyScript, etc., with no custom manifest or bytecode adapter): imports
+   `pen:guest/1::exchange: (i32) -> i32`, exports `pen:main: () -> ()`,
+   `pen:allocate: (i32) -> i32`, standard Wasm `memory`, and optionally
+   `pen:reset: (i32) -> i32`. Mods export `frame: (i32) -> i32`,
+   `pen:allocate`, and `memory` with zero imports. See
+   [examples/rust-guest](../examples/rust-guest/README.md).
+2. **Blot's guest ABI** (`blot:abi` custom section): exports `main`, which
+   takes the host capability (`externref`, `blot:host/1::call_array_f32_array_f32`)
+   and returns `Unit`.
 
 `main` runs for as long as the game does. Each call to the host hands it a
 response and gets the next request back:

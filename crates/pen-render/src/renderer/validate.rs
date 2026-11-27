@@ -110,9 +110,19 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
         validate_matrix(&d.transform)?;
         determinant4_of(&d.transform)?;
         ensure!(
-            [d.albedo.r, d.albedo.g, d.albedo.b, d.albedo.a, d.normal_strength, d.roughness, d.metallic, d.emissive_strength, d.fade]
-                .iter()
-                .all(|v| v.is_finite()),
+            [
+                d.albedo.r,
+                d.albedo.g,
+                d.albedo.b,
+                d.albedo.a,
+                d.normal_strength,
+                d.roughness,
+                d.metallic,
+                d.emissive_strength,
+                d.fade
+            ]
+            .iter()
+            .all(|v| v.is_finite()),
             "PBR decal parameters must be finite"
         );
     }

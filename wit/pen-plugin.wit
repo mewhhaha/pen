@@ -10,7 +10,7 @@
 /// Each call into a plugin has a deadline (pen.json's `timeout`): past it,
 /// a wait on a program it runs ends as a timeout, and soon after the call
 /// traps.
-package pen:plugin@0.3.0;
+package pen:plugin@0.4.0;
 
 /// What plugins and pen exchange.
 interface types {
@@ -35,6 +35,10 @@ interface types {
         message: string,
         /// Toolchain-specific explanation, as text or encoded JSON.
         details: option<string>,
+        /// Optional language-specific fix suggestion shown by pen.
+        fix: option<string>,
+        /// Optional language-specific documentation pointer shown by pen.
+        doc: option<string>,
     }
 
     /// A program of the checkout's: its root, its entry file (absolute) and
@@ -210,7 +214,29 @@ interface tests {
     find: func(program: program, paths: list<string>, filter: option<string>) -> result<list<test-module>, string>;
 }
 
-/// A plugin that compiles programs and lays out their tests.
+/// Generating language-specific bindings from pen's protocol schema and the
+/// checkout's declared protocol extensions (`pen.json`'s `protocol`).
+interface codegen {
+    /// One generated file, relative to the checkout root (`/`-separated).
+    record generated-file {
+        path: string,
+        contents: string,
+    }
+
+    /// Files to write/check and stale legacy paths to remove/flag.
+    record generation {
+        files: list<generated-file>,
+        remove: list<string>,
+    }
+
+    /// Generates bindings for `schema-json` (`protocol/schema.json`) and
+    /// `extensions-json` (`pen.json`'s `protocol` block, or `"{}"`), given
+    /// the compiler's `settings` JSON. A plugin with no generated bindings
+    /// may return empty lists.
+    generate: func(schema-json: string, extensions-json: string, settings: string) -> result<generation, string>;
+}
+
+/// A plugin that compiles programs, lays out their tests, and generates bindings.
 world compiler-plugin {
     import log;
     import files;
@@ -218,4 +244,5 @@ world compiler-plugin {
     import guest;
     export compiler;
     export tests;
+    export codegen;
 }

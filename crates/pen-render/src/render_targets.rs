@@ -235,10 +235,22 @@ pub fn planar_reflection_view(view: &[f32; 16], plane_point: [f32; 3], plane_nor
     let [nx, ny, nz] = normalize3_f64(plane_normal)?;
     let d = -(nx * f64::from(plane_point[0]) + ny * f64::from(plane_point[1]) + nz * f64::from(plane_point[2]));
     let refl = [
-        1.0 - 2.0 * nx * nx, -2.0 * ny * nx,      -2.0 * nz * nx,      0.0,
-        -2.0 * nx * ny,      1.0 - 2.0 * ny * ny, -2.0 * nz * ny,      0.0,
-        -2.0 * nx * nz,      -2.0 * ny * nz,      1.0 - 2.0 * nz * nz, 0.0,
-        -2.0 * d * nx,       -2.0 * d * ny,       -2.0 * d * nz,       1.0,
+        1.0 - 2.0 * nx * nx,
+        -2.0 * ny * nx,
+        -2.0 * nz * nx,
+        0.0,
+        -2.0 * nx * ny,
+        1.0 - 2.0 * ny * ny,
+        -2.0 * nz * ny,
+        0.0,
+        -2.0 * nx * nz,
+        -2.0 * ny * nz,
+        1.0 - 2.0 * nz * nz,
+        0.0,
+        -2.0 * d * nx,
+        -2.0 * d * ny,
+        -2.0 * d * nz,
+        1.0,
     ];
     Ok(to_f32(&mul4_f64(&to_f64(view), &refl)))
 }
@@ -531,11 +543,16 @@ impl SplitScreenCompositor {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: true,
         });
-        uniform
-            .slice(..)
-            .get_mapped_range_mut()
-            .unwrap()
-            .copy_from_slice(bytemuck::cast_slice(&[0.0f32, 0.0, 1.0, 1.0, encode_flag, 0.0, 0.0, 0.0]));
+        uniform.slice(..).get_mapped_range_mut().unwrap().copy_from_slice(bytemuck::cast_slice(&[
+            0.0f32,
+            0.0,
+            1.0,
+            1.0,
+            encode_flag,
+            0.0,
+            0.0,
+            0.0,
+        ]));
         uniform.unmap();
         Self { pipeline, bgl, sampler, uniform }
     }
@@ -633,29 +650,34 @@ mod tests {
     }
 
     fn det3(m: &[f32; 16]) -> f32 {
-        m[0] * (m[5] * m[10] - m[6] * m[9])
-            - m[4] * (m[1] * m[10] - m[2] * m[9])
-            + m[8] * (m[1] * m[6] - m[2] * m[5])
+        m[0] * (m[5] * m[10] - m[6] * m[9]) - m[4] * (m[1] * m[10] - m[2] * m[9]) + m[8] * (m[1] * m[6] - m[2] * m[5])
     }
 
     #[test]
     fn planar_reflection_proper_winding_and_oblique_clip_standard_and_reversed_z() {
-        let id = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
-        ];
+        let id = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
         let refl_v = planar_reflection_view(&id, [0.0, -2.0, 0.0], [0.0, 1.0, 0.0]).unwrap();
         let p_refl = transform_pt(&refl_v, [1.0, 3.0, -5.0]);
         assert!((p_refl[0] - 1.0).abs() < 1e-5 && (p_refl[1] - -7.0).abs() < 1e-5 && (p_refl[2] - -5.0).abs() < 1e-5);
 
         let (near, far) = (0.5f32, 100.0f32);
         let proj_std = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, far / (near - far), -1.0,
-            0.0, 0.0, (far * near) / (near - far), 0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            far / (near - far),
+            -1.0,
+            0.0,
+            0.0,
+            (far * near) / (near - far),
+            0.0,
         ];
         // Standard-Z oblique clip plane at z = -5 keeping z <= -5 (normal (0, 0, -1)).
         let obl_std = oblique_clip_projection(&proj_std, &id, [0.0, 0.0, -5.0], [0.0, 0.0, -1.0], false).unwrap();
@@ -668,10 +690,22 @@ mod tests {
 
         // Reversed-Z oblique clip (near = 1, far = 0).
         let proj_rev = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, near / (far - near), -1.0,
-            0.0, 0.0, (far * near) / (far - near), 0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            near / (far - near),
+            -1.0,
+            0.0,
+            0.0,
+            (far * near) / (far - near),
+            0.0,
         ];
         let obl_rev = oblique_clip_projection(&proj_rev, &id, [0.0, 0.0, -5.0], [0.0, 0.0, -1.0], true).unwrap();
         let on_p_rev = transform_pt(&obl_rev, [0.0, 0.0, -5.0]);
@@ -682,7 +716,8 @@ mod tests {
         assert!((0.0..1.0).contains(&(front_rev[2] / front_rev[3])));
 
         // Proper planar_reflection_camera keeps det(view) == +1 so CCW pipelines render front faces cleanly!
-        let (cam_v, _cam_p) = planar_reflection_camera(&id, &proj_std, [0.0, -2.0, 0.0], [0.0, 1.0, 0.0], false).unwrap();
+        let (cam_v, _cam_p) =
+            planar_reflection_camera(&id, &proj_std, [0.0, -2.0, 0.0], [0.0, 1.0, 0.0], false).unwrap();
         assert!((det3(&cam_v) - 1.0).abs() < 1e-5, "planar_reflection_camera must preserve det=+1 winding");
     }
 
@@ -700,9 +735,8 @@ mod tests {
             wgpu::Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 },
             wgpu::Color { r: 1.0, g: 1.0, b: 0.0, a: 1.0 },
         ];
-        let targets: Vec<OffscreenRenderTarget> = (0..4)
-            .map(|_| OffscreenRenderTarget::new(&device, 16, 16, fmt).unwrap())
-            .collect();
+        let targets: Vec<OffscreenRenderTarget> =
+            (0..4).map(|_| OffscreenRenderTarget::new(&device, 16, 16, fmt).unwrap()).collect();
         let out = OffscreenRenderTarget::new(&device, 66, 66, fmt).unwrap();
         let layout = SplitScreenLayout::quad_4p(66, 66, 2).unwrap();
         let comp = SplitScreenCompositor::new(&device, fmt, ColorTransfer::Passthrough);
@@ -710,8 +744,12 @@ mod tests {
         // Source/output aliasing must fail BEFORE encoding any pass!
         {
             let mut bad_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-            let bad_views = [out.render_view(), targets[1].render_view(), targets[2].render_view(), targets[3].render_view()];
-            assert!(comp.composite(&device, &mut bad_enc, out.render_view(), &layout, &bad_views, wgpu::Color::BLACK).is_err());
+            let bad_views =
+                [out.render_view(), targets[1].render_view(), targets[2].render_view(), targets[3].render_view()];
+            assert!(
+                comp.composite(&device, &mut bad_enc, out.render_view(), &layout, &bad_views, wgpu::Color::BLACK)
+                    .is_err()
+            );
         }
 
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -728,7 +766,15 @@ mod tests {
             });
         }
         let views: Vec<&wgpu::TextureView> = targets.iter().map(OffscreenRenderTarget::render_view).collect();
-        comp.composite(&device, &mut enc, out.render_view(), &layout, &views, wgpu::Color { r: 0.2, g: 0.2, b: 0.2, a: 1.0 }).unwrap();
+        comp.composite(
+            &device,
+            &mut enc,
+            out.render_view(),
+            &layout,
+            &views,
+            wgpu::Color { r: 0.2, g: 0.2, b: 0.2, a: 1.0 },
+        )
+        .unwrap();
 
         let bpr = (66u32 * 4).next_multiple_of(256);
         let rb = device.create_buffer(&wgpu::BufferDescriptor {
@@ -738,7 +784,12 @@ mod tests {
             mapped_at_creation: false,
         });
         enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: out.texture(), mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: out.texture(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::TexelCopyBufferInfo {
                 buffer: &rb,
                 layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(66) },
@@ -759,10 +810,18 @@ mod tests {
             [bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]
         };
         assert_eq!(px(10, 10), [255, 0, 0, 255], "P1 red");
-        assert!((i16::from(px(50, 10)[0]) - 128).abs() <= 2, "P2 mid-gray must stay ~128 under Passthrough: {:?}", px(50, 10));
+        assert!(
+            (i16::from(px(50, 10)[0]) - 128).abs() <= 2,
+            "P2 mid-gray must stay ~128 under Passthrough: {:?}",
+            px(50, 10)
+        );
         assert_eq!(px(10, 50), [0, 0, 255, 255], "P3 blue");
         assert_eq!(px(50, 50), [255, 255, 0, 255], "P4 yellow");
-        assert!((i16::from(px(32, 32)[0]) - 51).abs() <= 2, "divider strip must match clear color ~51: {:?}", px(32, 32));
+        assert!(
+            (i16::from(px(32, 32)[0]) - 51).abs() <= 2,
+            "divider strip must match clear color ~51: {:?}",
+            px(32, 32)
+        );
         drop(bytes);
         rb.unmap();
     }

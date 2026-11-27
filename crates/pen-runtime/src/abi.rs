@@ -9,6 +9,12 @@ use anyhow::{Result, anyhow, bail, ensure};
 
 /// The custom section the manifest is in.
 pub const ABI_SECTION: &str = "blot:abi";
+/// Host import module for the externref-free `pen:guest/1` guest ABI.
+pub const PEN_GUEST_MODULE: &str = "pen:guest/1";
+/// Host import function `(i32) -> i32` exchanging f32 packets without `externref`.
+pub const PEN_GUEST_EXCHANGE: &str = "exchange";
+/// Game entrypoint export `() -> ()` for the externref-free `pen:guest/1` ABI.
+pub const PEN_MAIN_EXPORT: &str = "pen:main";
 /// The custom section declaring `#kernel` manifests (version 1).
 pub const KERNELS_SECTION: &str = "blot:kernels";
 /// The custom section declaring `#process` manifests (version 1).
@@ -278,6 +284,17 @@ pub struct GuestAbi {
     /// Host-internal wrapper exports (`blot:kernel_ctx:*`, `blot:kernel_clear:*`,
     /// `blot:proc_init:*`, `blot:proc_step:*`).
     pub host_internal: Vec<String>,
+    /// True when the module speaks the `externref`-free `pen:guest/1` ABI (or plain mod exports)
+    /// rather than a `blot:abi` custom section.
+    pub simple_guest: bool,
+    /// Exported linear memory name (`"blot:memory"` for Blot ABI, `"memory"` or `"blot:memory"` for simple guests).
+    pub memory_export: String,
+    /// Exported allocator function name (`"blot:allocate"` or `"pen:allocate"`).
+    pub allocate_export: String,
+    /// Optional exported arena-reset function name (`Some("blot:reset")` for Blot ABI; optional for simple guests).
+    pub reset_export: Option<String>,
+    /// Game entrypoint export name (`"main"` for Blot ABI, `"pen:main"` for `pen:guest/1`).
+    pub main_export: String,
 }
 
 impl Default for GuestAbi {
@@ -296,6 +313,11 @@ impl Default for GuestAbi {
             processes: Vec::new(),
             transport_budget: DEFAULT_TRANSPORT_BUDGET,
             host_internal: Vec::new(),
+            simple_guest: false,
+            memory_export: "blot:memory".to_owned(),
+            allocate_export: "blot:allocate".to_owned(),
+            reset_export: Some("blot:reset".to_owned()),
+            main_export: "main".to_owned(),
         }
     }
 }
@@ -599,8 +621,132 @@ pub fn read_memory_shape(wasm: &[u8]) -> Result<MemoryShape> {
     }))
 }
 
-/// Finds the single `blot:abi` custom section in a module's bytes, plus
-/// optional tasks, invocation, kernel, process, test, and trap sections.
+/// Detects a language-agnostic, `externref`-free `pen:guest/1` game or plain `pen:allocate` mod
+/// directly from standard Wasm Import (id 2) and Export (id 7) sections when no `blot:abi` section
+/// is present.
+fn detect_simple_guest(wasm: &[u8]) -> Result<Option<GuestAbi>> {
+    let mut imports: Vec<(String, String, u8)> = Vec::new();
+    let mut exports: Vec<(String, u8)> = Vec::new();
+    for (id, contents) in sections(wasm)? {
+        if id == 2 {
+            let mut reader = Reader { bytes: contents, at: 0 };
+            let count = reader.leb(false)?;
+            for _ in 0..count {
+                let mlen = reader.leb(false)? as usize;
+                let module = reader.text(mlen)?;
+                let nlen = reader.leb(false)? as usize;
+                let field = reader.text(nlen)?;
+                let kind = reader.byte()?;
+                match kind {
+                    0 => {
+                        let _ = reader.leb(false)?;
+                    }
+                    1 => {
+                        let _ = reader.byte()?; // elemtype
+                        let flags = reader.byte()?;
+                        let _ = reader.leb(false)?;
+                        if (flags & 1) != 0 {
+                            let _ = reader.leb(false)?;
+                        }
+                    }
+                    2 => {
+                        let flags = reader.byte()?;
+                        let memory64 = (flags & 4) != 0;
+                        let _ = if memory64 { reader.leb_u64(false)? } else { u64::from(reader.leb(false)?) };
+                        if (flags & 1) != 0 {
+                            let _ = if memory64 { reader.leb_u64(false)? } else { u64::from(reader.leb(false)?) };
+                        }
+                        if (flags & 8) != 0 {
+                            let _ = reader.leb(false)?;
+                        }
+                    }
+                    3 => {
+                        let _ = reader.byte()?; // valtype
+                        let _ = reader.byte()?; // mutability
+                    }
+                    4 => {
+                        let _ = reader.byte()?; // attribute
+                        let _ = reader.leb(false)?; // typeidx
+                    }
+                    _ => return Ok(None),
+                }
+                imports.push((module, field, kind));
+            }
+        } else if id == 7 {
+            let mut reader = Reader { bytes: contents, at: 0 };
+            let count = reader.leb(false)?;
+            for _ in 0..count {
+                let nlen = reader.leb(false)? as usize;
+                let name = reader.text(nlen)?;
+                let kind = reader.byte()?;
+                let _ = reader.leb(false)?;
+                exports.push((name, kind));
+            }
+        }
+    }
+    let has_export = |name: &str, kind: u8| exports.iter().any(|(n, k)| n == name && *k == kind);
+    let memory_export = if has_export("memory", 2) {
+        Some("memory".to_owned())
+    } else if has_export("blot:memory", 2) {
+        Some("blot:memory".to_owned())
+    } else {
+        None
+    };
+    let allocate_export = if has_export("pen:allocate", 0) {
+        Some("pen:allocate".to_owned())
+    } else if has_export("blot:allocate", 0) {
+        Some("blot:allocate".to_owned())
+    } else {
+        None
+    };
+    let reset_export = if has_export("pen:reset", 0) {
+        Some("pen:reset".to_owned())
+    } else if has_export("blot:reset", 0) {
+        Some("blot:reset".to_owned())
+    } else {
+        None
+    };
+    let (Some(memory_export), Some(allocate_export)) = (memory_export, allocate_export) else {
+        return Ok(None);
+    };
+    let imports_exchange = imports
+        .iter()
+        .any(|(module, field, kind)| module == PEN_GUEST_MODULE && field == PEN_GUEST_EXCHANGE && *kind == 0);
+    if imports_exchange && has_export(PEN_MAIN_EXPORT, 0) {
+        return Ok(Some(GuestAbi {
+            functions: vec![GuestFunction {
+                name: "main".to_owned(),
+                parameter: Parameter::Callback(GAME_HOST),
+                result: ValueType::Unit,
+            }],
+            simple_guest: true,
+            memory_export,
+            allocate_export,
+            reset_export,
+            main_export: PEN_MAIN_EXPORT.to_owned(),
+            ..GuestAbi::default()
+        }));
+    }
+    if imports.is_empty() && has_export("frame", 0) && has_export("pen:allocate", 0) {
+        return Ok(Some(GuestAbi {
+            functions: vec![GuestFunction {
+                name: "frame".to_owned(),
+                parameter: Parameter::Value(ValueType::ArrayF32),
+                result: ValueType::ArrayF32,
+            }],
+            simple_guest: true,
+            memory_export,
+            allocate_export,
+            reset_export,
+            ..GuestAbi::default()
+        }));
+    }
+    Ok(None)
+}
+
+/// Finds the single `blot:abi` custom section in a module's bytes (or detects a
+/// `pen:guest/1` game / `pen:allocate` mod directly from its imports and exports),
+/// plus optional tasks, invocation, kernel, process, test, and trap sections.
 pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     let mut found = None;
     let mut tasks = None;
@@ -637,7 +783,10 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
             traps_payload = Some(payload);
         }
     }
-    let mut abi = found.ok_or_else(|| anyhow!("invalid_abi: missing {ABI_SECTION} section"))?;
+    let mut abi = match found {
+        Some(abi) => abi,
+        None => detect_simple_guest(wasm)?.ok_or_else(|| anyhow!("invalid_abi: missing {ABI_SECTION} section"))?,
+    };
     ensure!(
         !abi.data_stacks || !counted_section,
         "invalid_abi: data-stack ABI cannot declare counted runtime sections"
@@ -1306,5 +1455,56 @@ mod tests {
             custom_section(PROCESSES_SECTION, &bad_processes),
         ]);
         assert!(read_abi(&bad_wasm).is_err());
+    }
+
+    #[test]
+    fn detects_externref_free_pen_guest_v1_game_and_mod() {
+        let str_bytes = |s: &str| [&[u8::try_from(s.len()).unwrap()][..], s.as_bytes()].concat();
+        let sec = |id: u8, payload: &[u8]| -> Vec<u8> {
+            let mut out = vec![id, u8::try_from(payload.len()).unwrap()];
+            out.extend_from_slice(payload);
+            out
+        };
+        // Game: imports pen:guest/1::exchange, exports pen:main, memory, pen:allocate (no blot:abi).
+        let imports = [vec![1], str_bytes(PEN_GUEST_MODULE), str_bytes(PEN_GUEST_EXCHANGE), vec![0, 0]].concat();
+        let exports = [
+            vec![3],
+            str_bytes(PEN_MAIN_EXPORT),
+            vec![0, 1],
+            str_bytes("memory"),
+            vec![2, 0],
+            str_bytes("pen:allocate"),
+            vec![0, 2],
+        ]
+        .concat();
+        let game_wasm = module(&[sec(2, &imports), sec(7, &exports)]);
+        let abi = read_abi(&game_wasm).unwrap();
+        assert!(abi.simple_guest);
+        assert_eq!(abi.memory_export, "memory");
+        assert_eq!(abi.allocate_export, "pen:allocate");
+        assert_eq!(abi.reset_export, None);
+        assert_eq!(abi.main_export, "pen:main");
+        assert!(abi.check_game().is_ok());
+
+        // Mod: no imports, exports frame, memory, pen:allocate (no blot:abi).
+        let mod_exports = [
+            vec![3],
+            str_bytes("frame"),
+            vec![0, 0],
+            str_bytes("memory"),
+            vec![2, 0],
+            str_bytes("pen:allocate"),
+            vec![0, 1],
+        ]
+        .concat();
+        let mod_wasm = module(&[sec(7, &mod_exports)]);
+        let mod_abi = read_abi(&mod_wasm).unwrap();
+        assert!(mod_abi.simple_guest);
+        assert_eq!(mod_abi.function("frame").unwrap().result, ValueType::ArrayF32);
+        assert!(mod_abi.check_game().is_err());
+
+        // Random Wasm without blot:abi or pen:guest/1/pen:allocate is still refused.
+        let random_exports = [vec![1], str_bytes("frame"), vec![0, 0]].concat();
+        assert!(read_abi(&module(&[sec(7, &random_exports)])).is_err());
     }
 }

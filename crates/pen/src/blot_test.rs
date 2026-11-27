@@ -37,7 +37,7 @@ use pen_plugins::{Builder, Expectation, Outcome as Building, Plugins, TestModule
 use pen_runtime::abi::TestKind;
 use wasmtime::{Engine, Trap};
 
-/// The checkout's main program, which the plugin lays its tests out by.
+#[cfg(test)]
 const ENTRY: &str = "src/main.blot";
 
 pub struct Options {
@@ -128,7 +128,7 @@ pub fn run(checkout: &Path, options: Options) -> Result<()> {
     let paths: Vec<PathBuf> = options.files.iter().map(|file| locate(checkout, file)).collect::<Result<_>>()?;
     let filter = options.filter.as_deref();
     let modules: Vec<Module> = plugins
-        .tests(&checkout.join(ENTRY), &paths, filter)?
+        .tests(&checkout.join(plugins.entry()), &paths, filter)?
         .into_iter()
         .map(|test| Module::new(checkout, test))
         .collect();

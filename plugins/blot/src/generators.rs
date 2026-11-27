@@ -541,6 +541,8 @@ fn asset_diagnostic(file: &str, start: u32, end: u32, message: String, provenanc
         end,
         message,
         details,
+        fix: None,
+        doc: None,
     }
 }
 

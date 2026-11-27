@@ -272,10 +272,49 @@ impl WebConfig {
 }
 
 #[cfg(feature = "compiler")]
+fn checkout_compiler_entries(root: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
+    let file = root.join("pen.json");
+    let reading = || format!("reading {}", file.display());
+    let text = std::fs::read_to_string(&file).with_context(reading)?;
+    let config: serde_json::Value = serde_json::from_str(&text).with_context(reading)?;
+    let compiler = config.get("compiler");
+    let entry = match compiler.and_then(|c| c.get("entry")) {
+        None | Some(serde_json::Value::Null) => PathBuf::from("src/main.blot"),
+        Some(serde_json::Value::String(path)) if !path.trim().is_empty() => PathBuf::from(path),
+        Some(_) => bail!("{}: compiler.entry must be a non-empty path string", file.display()),
+    };
+    let devtools = match compiler.and_then(|c| c.get("devtools")) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(path)) if !path.trim().is_empty() => Some(PathBuf::from(path)),
+        Some(_) => bail!("{}: compiler.devtools must be a non-empty path string", file.display()),
+    };
+    Ok((entry, devtools))
+}
+
+#[cfg(feature = "compiler")]
+fn has_game_entry(directory: &Path) -> bool {
+    let pen_json = directory.join("pen.json");
+    if !pen_json.is_file() {
+        return false;
+    }
+    if let Ok(text) = std::fs::read_to_string(&pen_json)
+        && let Ok(config) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(entry) = config.get("compiler").and_then(|c| c.get("entry")).and_then(serde_json::Value::as_str)
+    {
+        return directory.join(entry).exists();
+    }
+    directory.join("src/main.blot").is_file()
+}
+
+#[cfg(feature = "compiler")]
 pub struct Project {
     pub root: PathBuf,
     pub identity: Identity,
     pub web: WebConfig,
+    /// Relative path to the game entry (from `pen.json` `compiler.entry`, else `src/main.blot`).
+    pub entry: PathBuf,
+    /// Optional relative path to the dev tools entry (from `pen.json` `compiler.devtools`).
+    pub devtools_entry: Option<PathBuf>,
     /// Its Wasm plugins, loaded when first asked for.
     #[cfg(feature = "compiler")]
     plugins: std::sync::OnceLock<Option<std::sync::Arc<pen_plugins::Plugins>>>,
@@ -299,31 +338,37 @@ impl Project {
             None => std::env::current_dir()?,
         };
         let start = std::fs::canonicalize(&start).with_context(|| format!("{} does not exist", start.display()))?;
-        let root = start.ancestors().find(|directory| {
-            directory.join("pen.json").is_file() && (!require_game || directory.join("src/main.blot").is_file())
-        });
+        let root = start
+            .ancestors()
+            .find(|directory| directory.join("pen.json").is_file() && (!require_game || has_game_entry(directory)));
         match root {
-            Some(root) => Ok(Project {
-                identity: Identity::of_checkout(root)?,
-                web: WebConfig::of_checkout(root)?,
-                root: root.to_owned(),
-                #[cfg(feature = "compiler")]
-                plugins: std::sync::OnceLock::new(),
-            }),
+            Some(root) => {
+                let (entry, devtools_entry) = checkout_compiler_entries(root)?;
+                Ok(Project {
+                    identity: Identity::of_checkout(root)?,
+                    web: WebConfig::of_checkout(root)?,
+                    entry,
+                    devtools_entry,
+                    root: root.to_owned(),
+                    #[cfg(feature = "compiler")]
+                    plugins: std::sync::OnceLock::new(),
+                })
+            }
             None => bail!(
                 "{} is not inside a checkout (a directory with {}); pass --project DIR",
                 start.display(),
-                if require_game { "pen.json and src/main.blot" } else { "pen.json" }
+                if require_game { "pen.json and its configured compiler.entry (or src/main.blot)" } else { "pen.json" }
             ),
         }
     }
 
     /// The checkout `directory` is in, if any.
     pub fn around(directory: &Path) -> Option<PathBuf> {
-        directory
-            .ancestors()
-            .find(|directory| directory.join("pen.json").is_file() && directory.join("src/main.blot").is_file())
-            .map(Path::to_owned)
+        directory.ancestors().find(|directory| has_game_entry(directory)).map(Path::to_owned)
+    }
+
+    pub fn entry_path(&self) -> PathBuf {
+        self.root.join(&self.entry)
     }
 
     pub fn assets(&self) -> PathBuf {
@@ -349,10 +394,17 @@ impl Project {
         self.root.join(".pen/runtime")
     }
 
-    /// The dev tools' program (gdev's `devtools/main.blot`), relative to
-    /// the checkout, if it has one.
-    pub fn devtools(&self) -> Option<&'static str> {
-        ["devtools/main.blot", "src/devtools/main.blot"].into_iter().find(|entry| self.root.join(entry).is_file())
+    /// The dev tools' program (`compiler.devtools` in `pen.json`, else
+    /// `devtools/main.blot` or `src/devtools/main.blot`), relative to the
+    /// checkout, if it has one.
+    pub fn devtools(&self) -> Option<PathBuf> {
+        if let Some(entry) = &self.devtools_entry {
+            return self.root.join(entry).exists().then(|| entry.clone());
+        }
+        ["devtools/main.blot", "src/devtools/main.blot"]
+            .into_iter()
+            .find(|entry| self.root.join(entry).is_file())
+            .map(PathBuf::from)
     }
 
     /// The checkout's plugins, when its `pen.json` chooses a compiler: they
@@ -402,7 +454,7 @@ impl Project {
         #[cfg(feature = "compiler")]
         {
             let plugins = self.plugins()?.context("pen.json must choose a compiler plugin")?;
-            crate::plugin_build::compile(plugins, "game", &self.root.join("src/main.blot"), &out.join("game.wasm"))
+            crate::plugin_build::compile(plugins, "game", &self.entry_path(), &out.join("game.wasm"))
         }
         #[cfg(not(feature = "compiler"))]
         bail!("this player runtime cannot build a checkout; use a full pen build")
@@ -432,7 +484,7 @@ impl Project {
             let (watching, built) = crate::plugin_build::watch(
                 plugins,
                 "game",
-                &self.root.join("src/main.blot"),
+                &self.entry_path(),
                 &out.join("game.wasm"),
                 self.written(),
             )?;
@@ -1507,23 +1559,39 @@ fn web_host_with_plan(
 /// files precompressed and a service worker; and, given `zip`, as a ZIP.
 #[cfg(feature = "compiler")]
 pub fn export_web(
-    project: &Project,
+    source: GameSource<'_>,
     out: &Path,
     zip: Option<&Path>,
     optimize: bool,
     compact: bool,
     explicit_features: Option<&str>,
 ) -> Result<()> {
-    ensure!(!compact || project.devtools().is_none(), "--web-compact cannot include a dev tools program");
-    let staging = crate::staging::Staging::new(&project.root, out)?;
+    let has_devtools = match &source {
+        GameSource::Checkout(project) => project.devtools().is_some(),
+        GameSource::Bundle(directory) => directory.join("devtools.wasm").is_file(),
+    };
+    ensure!(!compact || !has_devtools, "--web-compact cannot include a dev tools program");
+    let staging = crate::staging::Staging::new(source.root(), out)?;
     let site = &staging.directory;
-    let PreparedGame { wasm, assets } = prepare_game(&GameSource::Checkout(project), site, optimize)?;
-    crate::services::locale::ship_tables(&project.assets(), site)?;
-    project.compile_devtools(site)?;
+    let PreparedGame { wasm, assets } = prepare_game(&source, site, optimize)?;
+    crate::services::locale::ship_tables(&source.assets(), site)?;
+    match &source {
+        GameSource::Checkout(project) => project.compile_devtools(site)?,
+        GameSource::Bundle(directory) => {
+            let devtools = directory.join("devtools.wasm");
+            if devtools.is_file() {
+                std::fs::copy(&devtools, site.join("devtools.wasm"))
+                    .with_context(|| format!("copying {}", devtools.display()))?;
+            }
+        }
+    }
     if site.join("devtools.wasm").is_file() {
         shipping_wasm(&site.join("devtools.wasm"), optimize)?;
     }
-    std::fs::copy(project.assets().join("catalog.json"), site.join("catalog.json"))?;
+    let catalog = source.assets().join("catalog.json");
+    if catalog.is_file() {
+        std::fs::copy(&catalog, site.join("catalog.json")).with_context(|| format!("copying {}", catalog.display()))?;
+    }
     if site.join("main.scene").is_file() {
         std::fs::rename(site.join("main.scene"), site.join("scene.bin"))?;
     }
@@ -1535,10 +1603,21 @@ pub fn export_web(
         captions: assets_dir.join("captions.json").is_file(),
         locales: site.join("text.json").is_file(),
     };
-    let plan = WebHostPlan::detect(&wasm, &web, &assets_dir, &project.web)?;
-    let configured_features = project.web.features.as_ref().map(|list| list.join(","));
+    let web_config = match &source {
+        GameSource::Checkout(project) => project.web.clone(),
+        GameSource::Bundle(directory) => {
+            if directory.join("pen.json").is_file() {
+                WebConfig::of_checkout(directory)?
+            } else {
+                WebConfig::default()
+            }
+        }
+    };
+    let plan = WebHostPlan::detect(&wasm, &web, &assets_dir, &web_config)?;
+    let configured_features = web_config.features.as_ref().map(|list| list.join(","));
     let effective_features = explicit_features.or(configured_features.as_deref());
-    Manifest { game: project.identity.clone(), runtime: None, worker_deadlines: false, web: Some(web) }.write(site)?;
+    let identity = source.identity()?;
+    Manifest { game: identity, runtime: None, worker_deadlines: false, web: Some(web) }.write(site)?;
     web_host_with_plan(site, compact, Some(&plan), effective_features)?;
     notices(site)?;
     let hosting = crate::web_export::prepare(site)?;
@@ -1721,6 +1800,26 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/main.blot"), "").unwrap();
         assert_eq!(Project::find(Some(root.clone())).unwrap().root, found.root);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn custom_compiler_entry_and_devtools_work_without_blot_files() {
+        let root = fixture("custom-entry");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("devtools")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "").unwrap();
+        std::fs::write(root.join("devtools/Cargo.toml"), "").unwrap();
+        std::fs::write(
+            root.join("pen.json"),
+            r#"{"compiler": {"plugin": "rust", "entry": "Cargo.toml", "devtools": "devtools/Cargo.toml"}}"#,
+        )
+        .unwrap();
+        let found = Project::find(Some(root.join("src"))).unwrap();
+        assert_eq!(found.root, root.canonicalize().unwrap());
+        assert_eq!(found.entry, PathBuf::from("Cargo.toml"));
+        assert_eq!(found.devtools(), Some(PathBuf::from("devtools/Cargo.toml")));
+        assert_eq!(Project::around(&root.join("src")), Some(root.clone()));
         std::fs::remove_dir_all(root).unwrap();
     }
 

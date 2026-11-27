@@ -556,6 +556,8 @@ fn diagnostic(value: &Value) -> Result<Diagnostic, String> {
             }
             details.to_string()
         }),
+        fix: value.get("fix").and_then(Value::as_str).map(str::to_owned),
+        doc: value.get("doc").and_then(Value::as_str).map(str::to_owned),
     })
 }
 

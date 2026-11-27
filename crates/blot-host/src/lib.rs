@@ -53,9 +53,10 @@ pub const ARENA_OOM_OFFSET: usize = 640;
 
 // The manifest is pen-runtime's: the browser reads it too.
 pub use pen_runtime::abi::{
-    CallbackType, DEFAULT_TRANSPORT_BUDGET, GuestAbi, GuestConstant, GuestFunction, KernelManifest, MemoryShape,
-    Parameter, ProcessManifest, TRAP_SITE_OFFSET, TRAPS_SECTION, TrapKind, TrapMetadata, ValueType, WireSchema,
-    WireSchemaKind, parse_abi, read_abi, read_memory_shape,
+    CallbackType, DEFAULT_TRANSPORT_BUDGET, GAME_HOST, GuestAbi, GuestConstant, GuestFunction, KernelManifest,
+    MemoryShape, PEN_GUEST_EXCHANGE, PEN_GUEST_MODULE, PEN_MAIN_EXPORT, Parameter, ProcessManifest, TRAP_SITE_OFFSET,
+    TRAPS_SECTION, TrapKind, TrapMetadata, ValueType, WireSchema, WireSchemaKind, parse_abi, read_abi,
+    read_memory_shape,
 };
 
 /// The Wasm type a value crosses the boundary as.
@@ -224,7 +225,7 @@ impl GuestModule {
             let shape = read_memory_shape(wasm)?;
             validate_memory_shape(&shape)?;
             let use_aot = if prefer_aot { wtime_aot::preferred_for_run() } else { wtime_aot::enabled() };
-            let (module, imaged) = if use_aot && engine_allows_aot(engine) && abi.tasks.is_none() {
+            let (module, imaged) = if use_aot && engine_allows_aot(engine) && abi.tasks.is_none() && !abi.simple_guest {
                 let (aot, imaged) = wtime_aot::AotModule::compile(wasm, &abi, cache)?;
                 (CompiledModule::WtimeAot { engine: engine.clone(), aot }, Arc::new(imaged))
             } else {
@@ -586,15 +587,16 @@ pub(crate) fn validate_native_memory_shape(module: &Module, abi: &GuestAbi, shap
         return Ok(());
     }
     // Legacy Metadata v2 boundary: allow missing MemorySection ONLY when the module
-    // has no `blot:kernels`/`blot:processes` and exports `blot:memory` directly.
+    // has no `blot:kernels`/`blot:processes` and exports its linear memory directly.
     if abi.kernels.is_empty()
         && abi.processes.is_empty()
         && req.num_memories == 1
-        && let Some(memory) = module.get_export("blot:memory").and_then(|export| export.memory().cloned())
+        && let Some(memory) = module.get_export(&abi.memory_export).and_then(|export| export.memory().cloned())
     {
         ensure!(
             !memory.is_64() && !memory.is_shared() && memory.page_size_log2() == 16,
-            "invalid_abi: legacy exported blot:memory has unsupported memory shape"
+            "invalid_abi: legacy exported {} has unsupported memory shape",
+            abi.memory_export
         );
         return Ok(());
     }
@@ -607,6 +609,87 @@ pub(crate) fn validate_native_memory_shape(module: &Module, abi: &GuestAbi, shap
 
 fn validate_module(module: &Module, abi: &GuestAbi) -> Result<()> {
     abi.check_hostable()?;
+    if abi.simple_guest {
+        let is_game = abi.function("main").is_some();
+        for import in module.imports() {
+            if is_game {
+                ensure!(
+                    import.module() == PEN_GUEST_MODULE
+                        && import.name() == PEN_GUEST_EXCHANGE
+                        && import.ty().func().is_some_and(|ty| {
+                            ty.params().len() == 1
+                                && ty.params().next().is_some_and(|p| p.is_i32())
+                                && ty.results().len() == 1
+                                && ty.results().next().is_some_and(|r| r.is_i32())
+                        }),
+                    "invalid_abi: unexpected import {}::{}",
+                    import.module(),
+                    import.name()
+                );
+            } else {
+                bail!("invalid_abi: unexpected import {}::{}", import.module(), import.name());
+            }
+        }
+        if is_game {
+            let export = module
+                .get_export(&abi.main_export)
+                .ok_or_else(|| anyhow!("invalid_abi: missing function export {}", abi.main_export))?;
+            let main =
+                export.func().ok_or_else(|| anyhow!("invalid_abi: export {} is not a function", abi.main_export))?;
+            ensure!(
+                main.params().len() == 0 && main.results().len() == 0,
+                "invalid_abi: {} must have signature () -> ()",
+                abi.main_export
+            );
+        } else {
+            for function in &abi.functions {
+                let export = module
+                    .get_export(&function.name)
+                    .ok_or_else(|| anyhow!("invalid_abi: missing function export {}", function.name))?;
+                let func =
+                    export.func().ok_or_else(|| anyhow!("invalid_abi: export {} is not a function", function.name))?;
+                ensure!(
+                    func.params().len() == 1
+                        && func.params().next().is_some_and(|p| p.is_i32())
+                        && func.results().len() == 1
+                        && func.results().next().is_some_and(|r| r.is_i32()),
+                    "invalid_abi: {} must have signature (i32) -> (i32)",
+                    function.name
+                );
+            }
+        }
+        ensure!(
+            module.get_export(&abi.memory_export).is_some_and(|export| export.memory().is_some()),
+            "invalid_abi: missing array arena export {}",
+            abi.memory_export
+        );
+        ensure!(
+            module.get_export(&abi.allocate_export).is_some_and(|export| {
+                export.func().is_some_and(|ty| {
+                    ty.params().len() == 1
+                        && ty.params().next().is_some_and(|p| p.is_i32())
+                        && ty.results().len() == 1
+                        && ty.results().next().is_some_and(|r| r.is_i32())
+                })
+            }),
+            "invalid_abi: missing or invalid allocator export {}",
+            abi.allocate_export
+        );
+        if let Some(reset) = &abi.reset_export {
+            ensure!(
+                module.get_export(reset).is_some_and(|export| {
+                    export.func().is_some_and(|ty| {
+                        ty.params().len() == 1
+                            && ty.params().next().is_some_and(|p| p.is_i32())
+                            && ty.results().len() == 1
+                            && ty.results().next().is_some_and(|r| r.is_i32())
+                    })
+                }),
+                "invalid_abi: invalid reset export {reset}"
+            );
+        }
+        return Ok(());
+    }
     if let Some(count) = abi.tasks {
         tasks::validate(module, count)?;
     }
@@ -725,7 +808,7 @@ struct Active {
 struct Arena {
     memory: Memory,
     allocate: TypedFunc<i32, i32>,
-    reset: TypedFunc<i32, i32>,
+    reset: Option<TypedFunc<i32, i32>>,
 }
 
 /// ABI 3's hooks around each call ([`GuestAbi::ownership`]).
@@ -1386,24 +1469,36 @@ impl WasmtimeGuest {
         if module.abi.tasks.is_some() {
             tasks::link(&mut linker)?;
         }
-        for signature in module.abi.callbacks() {
-            let ty = FuncType::new(
-                engine,
-                [ValType::EXTERNREF, wasm_type(signature.parameter)],
-                [wasm_type(signature.result)],
-            );
-            linker.func_new(HOST_MODULE, &signature.import_name(), ty, move |caller, params, results| {
-                invoke_import(caller, signature, params, results).map_err(wasmtime::Error::from_anyhow)
-            })?;
+        if module.abi.simple_guest {
+            if !module.abi.callbacks().is_empty() {
+                let ty = FuncType::new(engine, [ValType::I32], [ValType::I32]);
+                linker.func_new(PEN_GUEST_MODULE, PEN_GUEST_EXCHANGE, ty, move |caller, params, results| {
+                    invoke_simple_exchange(caller, params, results).map_err(wasmtime::Error::from_anyhow)
+                })?;
+            }
+        } else {
+            for signature in module.abi.callbacks() {
+                let ty = FuncType::new(
+                    engine,
+                    [ValType::EXTERNREF, wasm_type(signature.parameter)],
+                    [wasm_type(signature.result)],
+                );
+                linker.func_new(HOST_MODULE, &signature.import_name(), ty, move |caller, params, results| {
+                    invoke_import(caller, signature, params, results).map_err(wasmtime::Error::from_anyhow)
+                })?;
+            }
         }
         let instance =
             linker.instantiate(&mut store, wt_module).map_err(|error| overran(store.data(), error.into()))?;
         if module.abi.uses_arrays() || module.abi.tasks.is_some() {
             let memory = instance
-                .get_memory(&mut store, "blot:memory")
-                .ok_or_else(|| anyhow!("invalid_abi: missing array arena exports"))?;
-            let allocate = instance.get_typed_func::<i32, i32>(&mut store, "blot:allocate")?;
-            let reset = instance.get_typed_func::<i32, i32>(&mut store, "blot:reset")?;
+                .get_memory(&mut store, &module.abi.memory_export)
+                .ok_or_else(|| anyhow!("invalid_abi: missing array arena export {}", module.abi.memory_export))?;
+            let allocate = instance.get_typed_func::<i32, i32>(&mut store, &module.abi.allocate_export)?;
+            let reset = match &module.abi.reset_export {
+                Some(name) => Some(instance.get_typed_func::<i32, i32>(&mut store, name)?),
+                None => None,
+            };
             store.data_mut().arena = Some(Arena { memory, allocate, reset });
         }
         if module.abi.ownership {
@@ -1427,7 +1522,7 @@ impl WasmtimeGuest {
             };
             store.data_mut().tracing = Some(system_trace::Tracing::new(trace.clone(), globals));
         }
-        let trap_memory = instance.get_memory(&mut store, "blot:memory");
+        let trap_memory = instance.get_memory(&mut store, &module.abi.memory_export);
         let invocation_finish = if module.abi.invocation_finish {
             Some(instance.get_typed_func::<(), i32>(&mut store, INVOCATION_FINISH)?)
         } else {
@@ -1489,8 +1584,8 @@ impl WasmtimeGuest {
     }
 
     pub(crate) fn reset_arena(&mut self) -> Result<()> {
-        if let Some(arena) = self.store.data().arena.clone() {
-            arena.reset.call(&mut self.store, 0).map_err(|error| symbolize(error, &self.symbols))?;
+        if let Some(reset) = self.store.data().arena.as_ref().and_then(|arena| arena.reset.clone()) {
+            reset.call(&mut self.store, 0).map_err(|error| symbolize(error, &self.symbols))?;
         }
         Ok(())
     }
@@ -1674,8 +1769,24 @@ impl WasmtimeGuest {
             self.store.data_mut().entered = true;
         }
         tasks::begin(&mut self.store)?;
-        if let Some(arena) = self.store.data().arena.clone() {
-            arena.reset.call(&mut self.store, 0)?;
+        if let Some(reset) = self.store.data().arena.as_ref().and_then(|arena| arena.reset.clone()) {
+            reset.call(&mut self.store, 0)?;
+        }
+        if self.abi.simple_guest && name == "main" {
+            let (Parameter::Callback(signature), Argument::Callback(callback)) = (function.parameter, argument) else {
+                bail!("invalid_capability: {name} requires a host callback");
+            };
+            let token = TOKENS.fetch_add(1, Ordering::Relaxed);
+            self.store.data_mut().active =
+                Some(Active { token, signature, callback: Some(callback), export: self.abi.main_export.clone() });
+            let func = self
+                .instance
+                .get_func(&mut self.store, &self.abi.main_export)
+                .ok_or_else(|| anyhow!("validated function export {} disappeared", self.abi.main_export))?;
+            self.clear_trap_site();
+            func.call(&mut self.store, &[], &mut [])
+                .map_err(|error| self.decorate_trap(symbolize(error, &self.symbols)))?;
+            return Ok(Value::Unit);
         }
         let parameter = match (function.parameter, argument) {
             (Parameter::Value(expected), Argument::Value(value)) => {
@@ -1732,8 +1843,8 @@ impl WasmtimeGuest {
             }
             None => Ok(()),
         };
-        if let Some(arena) = self.store.data().arena.clone() {
-            arena.reset.call(&mut self.store, 0)?;
+        if let Some(reset) = self.store.data().arena.as_ref().and_then(|arena| arena.reset.clone()) {
+            reset.call(&mut self.store, 0)?;
         }
         task_result?;
         left?;
@@ -1750,8 +1861,8 @@ impl WasmtimeGuest {
         let mut left = Ok(());
         if let Some(ownership) = self.store.data().ownership.clone() {
             left = ownership.leave.call(&mut self.store, TEARDOWN).map_err(|error| symbolize(error, &self.symbols));
-            if let Some(arena) = self.store.data().arena.clone() {
-                let reset = arena.reset.call(&mut self.store, 0);
+            if let Some(reset) = self.store.data().arena.as_ref().and_then(|arena| arena.reset.clone()) {
+                let reset = reset.call(&mut self.store, 0);
                 tasks?;
                 left?;
                 reset?;
@@ -1766,7 +1877,7 @@ impl WasmtimeGuest {
         ensure!(self.abi.tasks.is_none(), "task contexts are host state and cannot be memory-imaged");
         ensure!(!self.store.data().disposed, "disposed_guest: the guest instance is disposed");
         let names = self.imaged.as_ref().as_ref().map_err(|why| anyhow!("this guest cannot be imaged: {why}"))?;
-        let memory = self.instance.get_memory(&mut self.store, "blot:memory");
+        let memory = self.instance.get_memory(&mut self.store, &self.abi.memory_export);
         let bytes = memory.map(|memory| memory.data(&self.store)).unwrap_or_default();
         let (memory, captured) = MemoryImage::capture(bytes, previous.map(|previous| &previous.memory));
         let mut globals = Vec::with_capacity(names.len());
@@ -1811,7 +1922,7 @@ impl WasmtimeGuest {
             validated.push((global, *value));
         }
         let mut written = 0;
-        if let Some(memory) = self.instance.get_memory(&mut self.store, "blot:memory") {
+        if let Some(memory) = self.instance.get_memory(&mut self.store, &self.abi.memory_export) {
             let missing = image.memory.len().saturating_sub(memory.data_size(&self.store));
             if missing > 0 {
                 memory.grow(&mut self.store, u64::try_from(missing.div_ceil(PAGE))?)?;
@@ -1907,8 +2018,17 @@ pub struct OwnershipCounters {
     pub cycle_bytes: Option<u32>,
 }
 
+fn invoke_simple_exchange(caller: Caller<'_, State>, params: &[Val], results: &mut [Val]) -> Result<()> {
+    let (export, expected) = match &caller.data().active {
+        Some(active) => (active.export.clone(), active.signature),
+        None => bail!("stale_capability: host call has no active guest session"),
+    };
+    ensure!(expected == GAME_HOST, "capability_signature: host call signature does not match pen:guest/1");
+    invoke_callback_body(caller, export, GAME_HOST, &params[0], results)
+}
+
 fn invoke_import(
-    mut caller: Caller<'_, State>,
+    caller: Caller<'_, State>,
     signature: CallbackType,
     params: &[Val],
     results: &mut [Val],
@@ -1925,9 +2045,19 @@ fn invoke_import(
         _ => bail!("stale_capability: host call has no active capability reference"),
     };
     ensure!(expected == signature, "capability_signature: host call signature does not match its capability");
+    invoke_callback_body(caller, export, signature, &params[1], results)
+}
+
+fn invoke_callback_body(
+    mut caller: Caller<'_, State>,
+    export: String,
+    signature: CallbackType,
+    param: &Val,
+    results: &mut [Val],
+) -> Result<()> {
     let arena = caller.data().arena.clone();
     let observed = caller.data().tracing.as_ref().map(|_| Instant::now());
-    let argument = from_wasm(&mut caller, arena.as_ref(), signature.parameter, &params[1])?;
+    let argument = from_wasm(&mut caller, arena.as_ref(), signature.parameter, param)?;
     if let Some(mut tracing) = caller.data_mut().tracing.take() {
         let counts = tracing.counts(&mut caller);
         let now = observed.unwrap();

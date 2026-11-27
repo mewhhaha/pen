@@ -10,13 +10,13 @@ pub mod astc;
 #[cfg(feature = "tools")]
 pub mod bc7;
 #[cfg(feature = "tools")]
+pub mod dynamic_atlas;
+#[cfg(feature = "tools")]
 pub mod encode;
 #[cfg(feature = "tools")]
 pub mod etc2;
 #[cfg(feature = "tools")]
 pub mod mips;
-#[cfg(feature = "tools")]
-pub mod dynamic_atlas;
 #[cfg(feature = "tools")]
 pub mod msdf;
 #[cfg(feature = "tools")]

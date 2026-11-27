@@ -199,8 +199,20 @@ fn gtao_darkens_concave_corners_and_ssgi_bleeds_red_floor_onto_white_wall() {
     let mut view = IDENTITY;
     view[13] = -0.6;
     let base_draws = vec![
-        Draw { mesh: 0, material: 0, transform: translate_scale(0.0, 2.0, -3.0, 1.0, 1.0, 1.0), parameters: None, extra: None },
-        Draw { mesh: 1, material: 1, transform: translate_scale(0.0, -1.0, -0.5, 1.0, 1.0, 1.0), parameters: None, extra: None },
+        Draw {
+            mesh: 0,
+            material: 0,
+            transform: translate_scale(0.0, 2.0, -3.0, 1.0, 1.0, 1.0),
+            parameters: None,
+            extra: None,
+        },
+        Draw {
+            mesh: 1,
+            material: 1,
+            transform: translate_scale(0.0, -1.0, -0.5, 1.0, 1.0, 1.0),
+            parameters: None,
+            extra: None,
+        },
     ];
     let mut f = frame(base_draws);
     f.view = view;
@@ -271,9 +283,7 @@ fn particles_flipbook_soft_depth_lighting_and_ribbon_trails() {
         }
     }
     sheet.save(root.join("sheet.png")).unwrap();
-    image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 255, 255, 255]))
-        .save(root.join("white.png"))
-        .unwrap();
+    image::RgbaImage::from_pixel(16, 16, image::Rgba([255, 255, 255, 255])).save(root.join("white.png")).unwrap();
 
     std::fs::write(
         root.join("wall.mat.json"),
@@ -317,8 +327,8 @@ fn particles_flipbook_soft_depth_lighting_and_ribbon_trails() {
     .unwrap();
     let mut target = Offscreen::new(&device, 128);
 
-    let make_emitter = |material: u32, z: f32, time: f32, soft_depth: f32, lit: f32, cols: u32, rows: u32, fps: f32| {
-        Emitter {
+    let make_emitter =
+        |material: u32, z: f32, time: f32, soft_depth: f32, lit: f32, cols: u32, rows: u32, fps: f32| Emitter {
             material,
             transform: translate_scale(0.0, 0.0, z, 1.0, 1.0, 1.0),
             seed: 1,
@@ -337,8 +347,7 @@ fn particles_flipbook_soft_depth_lighting_and_ribbon_trails() {
             flipbook_rows: rows,
             flipbook_fps: fps,
             ..Default::default()
-        }
-    };
+        };
 
     let mut f = frame(vec![Draw {
         mesh: 0,
@@ -502,7 +511,8 @@ fn pbr_orm_emissive_and_uv_transform_maps_shade_per_pixel() {
     )
     .unwrap();
 
-    let catalog = Catalog { meshes: vec!["quad.json".into()], materials: vec!["mapped.mat.json".into()], sounds: vec![] };
+    let catalog =
+        Catalog { meshes: vec!["quad.json".into()], materials: vec!["mapped.mat.json".into()], sounds: vec![] };
     let mut renderer = Renderer::new(
         device.clone(),
         queue.clone(),

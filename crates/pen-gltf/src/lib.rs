@@ -300,10 +300,8 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
                 ("spot".to_owned(), Some(inner_cone_angle), Some(outer_cone_angle))
             }
         };
-        let lname = light
-            .name()
-            .or_else(|| node.name())
-            .map_or_else(|| format!("light{}", light.index()), str::to_owned);
+        let lname =
+            light.name().or_else(|| node.name()).map_or_else(|| format!("light{}", light.index()), str::to_owned);
         let color = light.color().map(|c| if c.is_finite() { c.max(0.0) } else { 1.0 });
         let intensity = if light.intensity().is_finite() { light.intensity().max(0.0) } else { 1.0 };
         let range = light.range().filter(|r| r.is_finite() && *r > 0.0);
@@ -352,7 +350,8 @@ pub fn import(source: &Path, out: &Path, options: &Options) -> Result<Imported> 
                 if several { format!("{name}_{base}_{}", primitive.index()) } else { format!("{name}_{base}") }
             };
             let skin = node.skin().filter(|_| primitive.get(&gltf::Semantic::Joints(0)).is_some());
-            let morph_only = skin.is_none() && primitive.morph_targets().len() > 0 && has_morph_anim && gpu_instances.is_empty();
+            let morph_only =
+                skin.is_none() && primitive.morph_targets().len() > 0 && has_morph_anim && gpu_instances.is_empty();
             let rig = if let Some(skin) = &skin {
                 let key = (Some(skin.index()), has_morph_anim.then_some(node.index()));
                 Some(&*match rigs.entry(key) {
@@ -1018,7 +1017,10 @@ fn read_gpu_instances(
     else {
         return Ok(Vec::new());
     };
-    let read_vec = |key: &str, expected_dims: gltf::accessor::Dimensions, allow_norm_int: bool| -> Result<Option<(usize, Vec<f32>)>> {
+    let read_vec = |key: &str,
+                    expected_dims: gltf::accessor::Dimensions,
+                    allow_norm_int: bool|
+     -> Result<Option<(usize, Vec<f32>)>> {
         let Some(idx) = attrs.get(key).and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok()) else {
             return Ok(None);
         };
@@ -1066,9 +1068,7 @@ fn read_gpu_instances(
                         let b = &buf[at + c * 4..at + c * 4 + 4];
                         f32::from_le_bytes([b[0], b[1], b[2], b[3]])
                     }
-                    gltf::accessor::DataType::I8 => {
-                        (f32::from(buf[at + c].cast_signed()) / 127.0).max(-1.0)
-                    }
+                    gltf::accessor::DataType::I8 => (f32::from(buf[at + c].cast_signed()) / 127.0).max(-1.0),
                     gltf::accessor::DataType::I16 => {
                         let b = &buf[at + c * 2..at + c * 2 + 2];
                         (f32::from(i16::from_le_bytes([b[0], b[1]])) / 32767.0).max(-1.0)
@@ -1084,14 +1084,11 @@ fn read_gpu_instances(
     let translations = read_vec("TRANSLATION", gltf::accessor::Dimensions::Vec3, false)?;
     let rotations = read_vec("ROTATION", gltf::accessor::Dimensions::Vec4, true)?;
     let scales = read_vec("SCALE", gltf::accessor::Dimensions::Vec3, false)?;
-    let counts: Vec<usize> = [
-        translations.as_ref().map(|(c, _)| *c),
-        rotations.as_ref().map(|(c, _)| *c),
-        scales.as_ref().map(|(c, _)| *c),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let counts: Vec<usize> =
+        [translations.as_ref().map(|(c, _)| *c), rotations.as_ref().map(|(c, _)| *c), scales.as_ref().map(|(c, _)| *c)]
+            .into_iter()
+            .flatten()
+            .collect();
     let Some(&count) = counts.first() else {
         return Ok(Vec::new());
     };
@@ -1381,7 +1378,9 @@ impl Writer<'_> {
                         self.note(format!("{tex_field} uses a secondary texCoord; UV0 is assumed"));
                     }
                     if tex_info.get("extensions").and_then(|e| e.get("KHR_texture_transform")).is_some() {
-                        self.note(format!("{tex_field} has a per-texture KHR_texture_transform which is not applied separately"));
+                        self.note(format!(
+                            "{tex_field} has a per-texture KHR_texture_transform which is not applied separately"
+                        ));
                     }
                     surface.insert(tex_field.to_owned(), json!(image_key));
                 }

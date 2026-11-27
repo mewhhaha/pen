@@ -85,10 +85,7 @@ fn kernel_pool_batches_are_bounded_ordered_and_reusable() -> Result<()> {
             assert_eq!(value, u32::try_from(index)? * 2 + 42);
         }
     }
-    assert!(matches!(
-        pool.run_fixed(&vec![0u32; 257]),
-        Err(KernelError::OutputBudgetExceeded { .. })
-    ));
+    assert!(matches!(pool.run_fixed(&vec![0u32; 257]), Err(KernelError::OutputBudgetExceeded { .. })));
     assert!(pool.run_fixed(&[])?.is_empty());
     pool.close();
     pool.close();

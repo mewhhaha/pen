@@ -38,13 +38,7 @@ fn default_one() -> f32 {
 
 impl Default for SceneImportOptions {
     fn default() -> Self {
-        Self {
-            name: None,
-            shader: default_shader(),
-            scene_path: None,
-            optimize_vertices: false,
-            root_scale: 1.0,
-        }
+        Self { name: None, shader: default_shader(), scene_path: None, optimize_vertices: false, root_scale: 1.0 }
     }
 }
 
@@ -155,16 +149,9 @@ pub struct ImportedScene {
 }
 
 fn parse_lod_suffix(name: &str) -> Option<(&str, u32)> {
-    for (suffix, level) in [
-        ("_LOD0", 0),
-        ("_LOD1", 1),
-        ("_LOD2", 2),
-        ("_LOD3", 3),
-        ("-lod0", 0),
-        ("-lod1", 1),
-        ("-lod2", 2),
-        ("-lod3", 3),
-    ] {
+    for (suffix, level) in
+        [("_LOD0", 0), ("_LOD1", 1), ("_LOD2", 2), ("_LOD3", 3), ("-lod0", 0), ("-lod1", 1), ("-lod2", 2), ("-lod3", 3)]
+    {
         if let Some(base) = name.strip_suffix(suffix)
             && !base.is_empty()
         {
@@ -317,9 +304,7 @@ pub fn import_scene(source: &Path, out_assets: &Path, options: &SceneImportOptio
             .to_owned();
 
         let mut meshes = Vec::new();
-        if !is_colonly
-            && let Some(prims) = node_mesh_map.get(&node.index())
-        {
+        if !is_colonly && let Some(prims) = node_mesh_map.get(&node.index()) {
             for (mesh_key, mat_key) in prims {
                 meshes.push(SceneMeshRef { mesh: mesh_key.clone(), material: mat_key.clone(), lods: Vec::new() });
             }
@@ -379,7 +364,16 @@ pub fn import_scene(source: &Path, out_assets: &Path, options: &SceneImportOptio
         };
 
         let this_idx = nodes.len();
-        nodes.push(SceneNodeData { name: clean_name, parent: parent_idx, transform, meshes, camera, light, collider, clips });
+        nodes.push(SceneNodeData {
+            name: clean_name,
+            parent: parent_idx,
+            transform,
+            meshes,
+            camera,
+            light,
+            collider,
+            clips,
+        });
 
         let mut children: Vec<(gltf::Node, Option<usize>)> = node.children().map(|c| (c, Some(this_idx))).collect();
         children.reverse();
@@ -436,14 +430,11 @@ pub fn import_scene(source: &Path, out_assets: &Path, options: &SceneImportOptio
 
 fn decode_base64(input: &str) -> Result<Vec<u8>> {
     const TABLE: [i8; 128] = [
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62, -1, -1, -1, 63, 52, 53, 54, 55, 56, 57, 58, 59,
+        60, 61, -1, -1, -1, -1, -1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        21, 22, 23, 24, 25, -1, -1, -1, -1, -1, -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42,
+        43, 44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1,
     ];
     let mut out = Vec::with_capacity(input.len() * 3 / 4);
     let mut buf = 0u32;

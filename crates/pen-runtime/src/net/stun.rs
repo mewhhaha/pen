@@ -79,7 +79,12 @@ fn validate_header(bytes: &[u8], expected_type: u16) -> Result<(usize, Transacti
     ensure!(msg_type == expected_type, "unexpected STUN message type {msg_type:#06x}");
     let msg_len = usize::from(u16::from_be_bytes([bytes[2], bytes[3]]));
     ensure!(msg_len.is_multiple_of(4), "STUN message length {msg_len} is not 4-byte aligned");
-    ensure!(20 + msg_len == bytes.len(), "STUN datagram length mismatch (expected {}, got {})", 20 + msg_len, bytes.len());
+    ensure!(
+        20 + msg_len == bytes.len(),
+        "STUN datagram length mismatch (expected {}, got {})",
+        20 + msg_len,
+        bytes.len()
+    );
     let cookie = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     ensure!(cookie == STUN_MAGIC_COOKIE, "invalid STUN magic cookie");
     let mut tx = [0u8; 12];

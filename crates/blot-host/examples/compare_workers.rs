@@ -17,8 +17,18 @@ fn main() -> Result<()> {
     let engine = blot_host::engine()?;
     let module = GuestModule::new(&engine, &bytes, None)?;
     let mut pools = [
-        KernelPool::open(&engine, &module, &args[1], KernelConfig { workers: 1, default_chunk_items: 4, ..KernelConfig::default() })?,
-        KernelPool::open(&engine, &module, &args[1], KernelConfig { workers: 4, default_chunk_items: 4, ..KernelConfig::default() })?,
+        KernelPool::open(
+            &engine,
+            &module,
+            &args[1],
+            KernelConfig { workers: 1, default_chunk_items: 4, ..KernelConfig::default() },
+        )?,
+        KernelPool::open(
+            &engine,
+            &module,
+            &args[1],
+            KernelConfig { workers: 4, default_chunk_items: 4, ..KernelConfig::default() },
+        )?,
     ];
     let inputs: Vec<u32> = (0..32).map(|i| size + i).collect();
     let mut reference = None;

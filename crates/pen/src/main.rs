@@ -636,13 +636,16 @@ const COMMANDS: &[CommandSpec] = &[
         about: "each frame's input and render packet, without rendering",
     },
     CommandSpec {
+        name: "test-guest",
+        operands: "[FILE...]",
+        checkout: true,
+        about: "the checkout's guest tests, compiled and laid out by its compiler plugin (pen.json)",
+    },
+    CommandSpec {
         name: "test-blot",
         operands: "[FILE...]",
         checkout: true,
-        about: "the checkout's Blot tests (default tests/*.blot, then tests/traps/ and tests/rejected/): each \
-                module's test_ entries, compiled through the checkout's compiler plugin (pen.json) as if at \
-                src/test_fixture.blot; those in traps/ must trap at `unreachable`, and a module in rejected/ \
-                must not compile, with diagnostics holding its `// rejects: TEXT`",
+        about: "alias for test-guest (Blot checkouts: tests/*.blot, tests/traps/ and tests/rejected/)",
     },
     CommandSpec {
         name: "gltf",
@@ -810,6 +813,7 @@ const CHECKOUT: &[&str] = &[
     "test",
     "bench",
     "packets",
+    "test-guest",
     "test-blot",
     "diverge",
     "fuzz",
@@ -1133,7 +1137,7 @@ const OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         name: "--update",
         value: "",
-        commands: &["test", "test-blot"],
+        commands: &["test", "test-guest", "test-blot"],
         place: Place::Command,
         about: "write the shots as the golden images",
     },
@@ -1162,35 +1166,35 @@ const OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         name: "--golden",
         value: "DIR",
-        commands: &["test", "test-blot"],
+        commands: &["test", "test-guest", "test-blot"],
         place: Place::Command,
         about: "the golden images (default golden/ beside FILE; tests/scenarios/golden for --session)",
     },
     OptionSpec {
         name: "--out",
         value: "DIR",
-        commands: &["test", "test-blot"],
+        commands: &["test", "test-guest", "test-blot"],
         place: Place::Command,
         about: "where shots and differences go (default .pen/visual; .pen/session-tests for --session)",
     },
     OptionSpec {
         name: "--session",
         value: "",
-        commands: &["test-blot"],
+        commands: &["test-guest", "test-blot"],
         place: Place::Command,
-        about: "run Blot driver tests against isolated native headless sessions, sequentially (explicit test files required)",
+        about: "run guest driver tests against isolated native headless sessions, sequentially (explicit test files required)",
     },
     OptionSpec {
         name: "--filter",
         value: "TEXT",
-        commands: &["test-blot"],
+        commands: &["test-guest", "test-blot"],
         place: Place::Command,
         about: "only the tests whose names hold TEXT",
     },
     OptionSpec {
         name: "--jobs",
         value: "N",
-        commands: &["test-blot"],
+        commands: &["test-guest", "test-blot"],
         place: Place::Command,
         about: "modules compiled at once, each worker in one compiler session, and tests run at once (default half \
                 the cores, at most 8)",
@@ -1264,7 +1268,7 @@ const OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         name: "--deadline",
         value: "SECONDS",
-        commands: &["test-blot"],
+        commands: &["test-guest", "test-blot"],
         place: Place::Command,
         about: "how long one test may run before it fails as stuck (default 600; the time it waits for a core \
                 counts)",
@@ -1437,7 +1441,7 @@ const OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         name: "--software",
         value: "",
-        commands: &["", "dev", "run", "test", "test-blot"],
+        commands: &["", "dev", "run", "test", "test-guest", "test-blot"],
         place: Place::Play,
         about: "draw on a software GPU adapter (lavapipe, WARP), as PEN_SOFTWARE=1 does",
     },
@@ -2536,7 +2540,9 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         let _ = IDENTITY.set(project::bundle_identity(&directory)?);
         (None, Some(directory))
     } else {
-        let project = if args.command == "tool" || (args.command == "test-blot" && !args.flag("--session")) {
+        let project = if args.command == "tool"
+            || (matches!(args.command, "test-guest" | "test-blot") && !args.flag("--session"))
+        {
             Project::find_tests(args.path("--project"))?
         } else {
             Project::find(args.path("--project"))?
@@ -2594,7 +2600,24 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             asset_graph::summarize(&asset_graph::run(&project.root, &options)?, options.check)
         }
         #[cfg(feature = "compiler")]
-        "codegen" => pen_codegen::generate(&checkout()?.root, args.path("--rust").as_deref(), args.flag("--check")),
+        "codegen" => {
+            let root = &checkout()?.root;
+            let rust_output = args.path("--rust");
+            let check = args.flag("--check");
+            if let Some(plugins) = plugin_build::load(root)? {
+                let extensions_json = pen_codegen::checkout_extensions_json(root)?;
+                let generated = plugins.codegen(pen_codegen::SCHEMA, &extensions_json)?;
+                let files: Vec<(String, String)> =
+                    generated.files.into_iter().map(|file| (file.path, file.contents)).collect();
+                pen_codegen::write_or_check(root, &files, &generated.remove, check)?;
+                if let Some(path) = rust_output.as_deref() {
+                    pen_codegen::generate_rust(path, check)?;
+                }
+                Ok(())
+            } else {
+                pen_codegen::generate(root, rust_output.as_deref(), check)
+            }
+        }
         #[cfg(not(feature = "compiler"))]
         "codegen" => bail!("this player runtime has no protocol generator"),
         "run" => {
@@ -2627,9 +2650,19 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
                 store: args.path("--store"),
                 worker_deadlines: args.flag("--worker-deadlines"),
             };
-            // A bundle compiled already packages as it is, for another platform's runtime.
+            // A bundle compiled already packages or exports to web as it is, with no compiler plugin needed.
             if let Some(bundle) = &bundle {
-                ensure!(!web, "pen build --web exports a checkout, not --game");
+                if web {
+                    let out = args.path("--out").context("pen build --web --game needs --out DIR")?;
+                    return project::export_web(
+                        project::GameSource::Bundle(bundle),
+                        &out,
+                        args.path("--zip").as_deref(),
+                        options.optimize,
+                        compact,
+                        web_features.as_deref(),
+                    );
+                }
                 ensure!(!args.flag("--zip"), "--zip goes with --web");
                 let out = args.path("--out").context("pen build --game needs --out DIR")?;
                 return project::package(project::GameSource::Bundle(bundle), &out, options);
@@ -2645,7 +2678,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             let out = if web {
                 let out = args.path("--out").unwrap_or_else(|| project.root.join(".pen/web-export"));
                 project::export_web(
-                    project,
+                    project::GameSource::Checkout(project),
                     &out,
                     args.path("--zip").as_deref(),
                     options.optimize,
@@ -2828,12 +2861,12 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         #[cfg(not(feature = "compiler"))]
         "tool" => bail!("this pen has no checkout tools; use a full build"),
         #[cfg(feature = "compiler")]
-        "test-blot" => {
+        "test-guest" | "test-blot" => {
             let project = checkout()?;
             let files = args.operands.iter().map(PathBuf::from).collect();
             let deadline = args.number::<u64>("--deadline")?.map(std::time::Duration::from_secs);
             let session = if args.flag("--session") {
-                ensure!(!args.operands.is_empty(), "--session requires explicit Blot scenario files");
+                ensure!(!args.operands.is_empty(), "--session requires explicit guest scenario files");
                 Some(blot_test::SessionOptions {
                     out: args.path("--out"),
                     golden: args.path("--golden"),
@@ -2846,7 +2879,8 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
                         && !args.flag("--software")
                         && args.path("--out").is_none()
                         && args.path("--golden").is_none(),
-                    "--out, --golden, --update and --software need --session for test-blot"
+                    "--out, --golden, --update and --software need --session for {}",
+                    args.command
                 );
                 None
             };
@@ -2860,7 +2894,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             blot_test::run(&project.root, options)
         }
         #[cfg(not(feature = "compiler"))]
-        "test-blot" => bail!("this pen has no plugins, which compile a checkout's Blot tests"),
+        "test-guest" | "test-blot" => bail!("this pen has no plugins, which compile a checkout's guest tests"),
         other => unreachable!("Args::parse takes only known commands, and run the rest earlier, not {other}"),
     }
 }
@@ -2968,7 +3002,7 @@ mod tests {
     fn mistakes_are_refused_with_what_was_meant() {
         assert_eq!(
             error("tset"),
-            "unknown command tset (did you mean test?); the commands are tool, dev, web, run, build, check, assets, codegen, export, test, bench, packets, test-blot, gltf, import-scene, bake-lightmaps, diverge, fuzz, report, new, texture, font, patch, apply, loudness, clean, serve, relay, push, remote and check-workers (pen --help)"
+            "unknown command tset (did you mean test?); the commands are tool, dev, web, run, build, check, assets, codegen, export, test, bench, packets, test-guest, test-blot, gltf, import-scene, bake-lightmaps, diverge, fuzz, report, new, texture, font, patch, apply, loudness, clean, serve, relay, push, remote and check-workers (pen --help)"
         );
         assert_eq!(error("run --frame 300"), "pen run has no option --frame (did you mean --frames?) (pen --help)");
         assert_eq!(error("run --port 8000"), "--port is for pen web and pen test, not pen run");

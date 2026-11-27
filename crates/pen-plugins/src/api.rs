@@ -16,7 +16,7 @@ use wasmtime::component::Component;
 pub const PACKAGE: &str = "pen:plugin";
 /// The version this pen hosts: `wit/pen-plugin.wit`'s, which the bindings
 /// are made from.
-pub const VERSION: Version = Version { major: 0, minor: 3, patch: 0 };
+pub const VERSION: Version = Version { major: 0, minor: 4, patch: 0 };
 
 /// A semantic version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

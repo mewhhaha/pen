@@ -520,7 +520,11 @@ impl RpcChannel {
     fn process_acks(&mut self, next_expected: u32, bits: u32) -> Result<()> {
         // Validate that `next_expected` does not exceed `next_send_seq` (modulo 2^32).
         let ahead = next_expected.wrapping_sub(self.next_send_seq);
-        ensure!(ahead == 0 || ahead >= 0x8000_0000, "ACK sequence {next_expected} exceeds sent sequence {}", self.next_send_seq);
+        ensure!(
+            ahead == 0 || ahead >= 0x8000_0000,
+            "ACK sequence {next_expected} exceeds sent sequence {}",
+            self.next_send_seq
+        );
         let mut freed = 0usize;
         self.pending_send.retain(|&seq, (_, payload)| {
             // Distance from `seq` to `next_expected` (positive if seq < next_expected).
@@ -625,12 +629,7 @@ mod tests {
         let mut snap = WorldSnapshot { tick: 5, entities: BTreeMap::new() };
         snap.entities.insert(1, vec![1.0]);
         server.commit(snap.clone());
-        let missing = SnapshotDelta {
-            tick: 5,
-            baseline_tick: Some(2),
-            updated: vec![],
-            removed: vec![],
-        };
+        let missing = SnapshotDelta { tick: 5, baseline_tick: Some(2), updated: vec![], removed: vec![] };
         assert_eq!(client.apply(&missing).unwrap(), ApplyOutcome::NeedsFullSnapshot);
         assert!(client.needs_resync());
         assert!(ClientReplicator::is_resync_request(&client.encode_resync_request()));

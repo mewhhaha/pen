@@ -38,13 +38,34 @@ export async function openGuest(bytes, ownership) {
     + '(COOP and COEP headers; on itch.io, "SharedArrayBuffer support") to run the game in a worker.');
 }
 
+function isSimpleGuest(module) {
+  return WebAssembly.Module.imports(module).some(i => i.module === 'pen:guest/1' && i.name === 'exchange');
+}
+
+function guestArena(exports, simple) {
+  const memory = simple ? (exports.memory ?? exports['blot:memory']) : exports['blot:memory'];
+  const allocate = simple ? (exports['pen:allocate'] ?? exports['blot:allocate']) : exports['blot:allocate'];
+  const reset = simple ? (exports['pen:reset'] ?? exports['blot:reset'] ?? null) : exports['blot:reset'];
+  if (!(memory instanceof WebAssembly.Memory) || typeof allocate !== 'function' || (!simple && typeof reset !== 'function')) {
+    throw new Error('missing guest array arena');
+  }
+  return { memory, allocate, reset };
+}
+
 // Instantiates the guest with `exchange` as its host call and checks its
 // array arena and ownership hooks.
-async function instantiate(module, ownership, exchange) {
-  const instance = await WebAssembly.instantiate(module, { 'blot:host/1': { call_array_f32_array_f32: exchange } });
+async function instantiate(module, ownership, exchange, simpleExchange) {
+  const simple = isSimpleGuest(module);
+  const imports = simple
+    ? { 'pen:guest/1': { exchange: simpleExchange } }
+    : { 'blot:host/1': { call_array_f32_array_f32: exchange } };
+  const instance = await WebAssembly.instantiate(module, imports);
   const exports = instance.exports;
-  if (!(exports['blot:memory'] instanceof WebAssembly.Memory)
-    || typeof exports['blot:allocate'] !== 'function' || typeof exports['blot:reset'] !== 'function') throw new Error('missing guest array arena');
+  const arena = guestArena(exports, simple);
+  if (simple) {
+    if (typeof exports['pen:main'] !== 'function') throw new Error('missing guest pen:main export');
+    return { exports, arena, simple };
+  }
   const enter = exports['blot:ownership_enter'];
   const leave = exports['blot:ownership_leave'];
   if (ownership && (typeof enter !== 'function' || enter.length !== 0
@@ -58,29 +79,33 @@ async function instantiate(module, ownership, exchange) {
   } else if (finish !== undefined) {
     throw new Error('undeclared guest invocation finish hook');
   }
-  return exports;
+  return { exports, arena, simple };
 }
 
-function finishInvocation(exports, ownership, outcome) {
+function finishInvocation(exports, arena, ownership, outcome) {
   try {
     if (ownership) exports['blot:ownership_leave'](outcome);
     exports['blot:finish_invocation']?.();
   } finally {
-    exports['blot:reset'](0);
+    arena.reset?.(0);
   }
 }
 
 // Finish only when the WebAssembly call has settled. A guest suspended on the
 // next frame's input still owns the state and callbacks of this invocation.
-async function runSuspending(exports, ownership, capability, stopped) {
+async function runSuspending(exports, arena, simple, ownership, capability, stopped) {
   let outcome = 1;
   try {
-    await WebAssembly.promising(exports.main)(capability);
+    if (simple) {
+      await WebAssembly.promising(exports['pen:main'])();
+    } else {
+      await WebAssembly.promising(exports.main)(capability);
+    }
     if (!stopped()) throw new Error('game main returned before shutdown');
     outcome = 0;
   } finally {
     try {
-      finishInvocation(exports, ownership, outcome);
+      finishInvocation(exports, arena, ownership, outcome);
     } catch (error) {
       if (outcome === 0) throw error;
     }
@@ -89,24 +114,24 @@ async function runSuspending(exports, ownership, capability, stopped) {
 
 // The guest's arrays: the packet at `pointer` copied out, and `values`
 // written into a new one, whose address is returned.
-function arrays(exports) {
+function arrays(arena) {
   const range = (pointer, length) => {
     const address = pointer >>> 0;
-    if (address < 4 || address % 4 || address > exports['blot:memory'].buffer.byteLength - 4
-      || length > (exports['blot:memory'].buffer.byteLength - address - 4) / 4) throw new Error('array outside guest arena');
+    if (address < 4 || address % 4 || address > arena.memory.buffer.byteLength - 4
+      || length > (arena.memory.buffer.byteLength - address - 4) / 4) throw new Error('array outside guest arena');
     return address;
   };
   return {
     read(pointer) {
       const address = range(pointer, 0);
-      const length = new DataView(exports['blot:memory'].buffer).getUint32(address, true);
+      const length = new DataView(arena.memory.buffer).getUint32(address, true);
       range(address, length);
-      return new Float32Array(exports['blot:memory'].buffer, address + 4, length).slice();
+      return new Float32Array(arena.memory.buffer, address + 4, length).slice();
     },
     write(values) {
-      const target = range(exports['blot:allocate']((values.length + 1) * 4), values.length);
-      new DataView(exports['blot:memory'].buffer).setUint32(target, values.length, true);
-      new Float32Array(exports['blot:memory'].buffer, target + 4, values.length).set(values);
+      const target = range(arena.allocate((values.length + 1) * 4), values.length);
+      new DataView(arena.memory.buffer).setUint32(target, values.length, true);
+      new Float32Array(arena.memory.buffer, target + 4, values.length).set(values);
       return target;
     }
   };
@@ -119,23 +144,27 @@ async function openSuspending(module, ownership) {
   let response = Promise.withResolvers();
   let failure;
   let stopping = false;
-  const exchange = new WebAssembly.Suspending(async (reference, pointer) => {
-    if (reference !== capability) throw new Error('stale guest capability');
+  const exchangePacket = async pointer => {
     const packet = guest.read(pointer);
     incoming = Promise.withResolvers();
     response.resolve(packet);
     return guest.write(await incoming.promise);
+  };
+  const exchange = new WebAssembly.Suspending(async (reference, pointer) => {
+    if (reference !== capability) throw new Error('stale guest capability');
+    return exchangePacket(pointer);
   });
-  const exports = await instantiate(module, ownership, exchange);
-  guest = arrays(exports);
+  const simpleExchange = new WebAssembly.Suspending(async pointer => exchangePacket(pointer));
+  const { exports, arena, simple } = await instantiate(module, ownership, exchange, simpleExchange);
+  guest = arrays(arena);
   if (ownership) exports['blot:ownership_enter']();
-  exports['blot:reset'](0);
-  const done = runSuspending(exports, ownership, capability, () => stopping);
+  arena.reset?.(0);
+  const done = runSuspending(exports, arena, simple, ownership, capability, () => stopping);
   void done.catch(error => { failure = error; response.reject(error); });
   const description = await response.promise;
   return {
     description,
-    memoryBytes() { return exports['blot:memory'].buffer.byteLength; },
+    memoryBytes() { return arena.memory.buffer.byteLength; },
     next(values) {
       if (failure) return Promise.reject(failure);
       response = Promise.withResolvers();
@@ -151,7 +180,7 @@ async function openSuspending(module, ownership) {
       // releases its roots now rather than whenever the instance is collected.
       if (ownership) {
         exports['blot:ownership_leave'](2);
-        exports['blot:reset'](0);
+        arena.reset?.(0);
       }
     }
   };
@@ -258,6 +287,8 @@ function serveWorker() {
     const data = new Float32Array(channel, SIGNALS * 4, CHUNK);
     const capability = Object.freeze({});
     let exports;
+    let arena;
+    let simple = false;
     let guest;
     const exchangeValues = (packet, memory) => {
       postMessage({ packet, memory }, [packet.buffer]);
@@ -274,9 +305,10 @@ function serveWorker() {
       }
       return values;
     };
+    const simpleExchange = pointer => guest.write(exchangeValues(guest.read(pointer), arena.memory.buffer.byteLength));
     const exchange = (reference, pointer) => {
       if (reference !== capability) throw new Error('stale guest capability');
-      return guest.write(exchangeValues(guest.read(pointer), exports['blot:memory'].buffer.byteLength));
+      return simpleExchange(pointer);
     };
     let outcome = 0;
     let structured = false;
@@ -287,18 +319,22 @@ function serveWorker() {
         const { runStructuredSync } = await import('./structured.js');
         await runStructuredSync(bytes, exchangeValues);
       } else {
-        exports = await instantiate(module, ownership, exchange);
-        guest = arrays(exports);
+        ({ exports, arena, simple } = await instantiate(module, ownership, exchange, simpleExchange));
+        guest = arrays(arena);
         if (ownership) exports['blot:ownership_enter']();
-        exports['blot:reset'](0);
+        arena.reset?.(0);
         let invocationOutcome = 1;
         try {
-          exports.main(capability);
+          if (simple) {
+            exports['pen:main']();
+          } else {
+            exports.main(capability);
+          }
           if (!Atomics.load(signals, STOPPING)) throw new Error('game main returned before shutdown');
           invocationOutcome = 0;
         } finally {
           try {
-            finishInvocation(exports, ownership, invocationOutcome);
+            finishInvocation(exports, arena, ownership, invocationOutcome);
           } catch (error) {
             if (invocationOutcome === 0) throw error;
           }
@@ -320,7 +356,7 @@ function serveWorker() {
     // releases its roots now rather than whenever the instance is collected.
     if (ownership) {
       exports['blot:ownership_leave'](2);
-      exports['blot:reset'](0);
+      arena.reset?.(0);
     }
     postMessage({ closed: outcome });
   };

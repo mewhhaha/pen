@@ -193,12 +193,8 @@ fn the_textures_of_the_extensions_are_imported_when_backing_images_exist() {
 fn punctual_lights_and_gpu_instancing_and_extra_attributes_are_imported() {
     let directory = directory("lights_instances_attrs");
     let out = directory.join("assets");
-    let (mut document, mut bytes) = model(
-        &square(),
-        json!({"name": "inst"}),
-        &["KHR_lights_punctual", "EXT_mesh_gpu_instancing"],
-        json!({}),
-    );
+    let (mut document, mut bytes) =
+        model(&square(), json!({"name": "inst"}), &["KHR_lights_punctual", "EXT_mesh_gpu_instancing"], json!({}));
     let mut push_f32_accessor = |doc: &mut Value, data: &[f32], acc_type: &str, count: usize| -> usize {
         while !bytes.len().is_multiple_of(4) {
             bytes.push(0);
@@ -271,12 +267,8 @@ fn instancing_applies_node_world_times_trs_and_validates_normalized_rotations_an
     // Parent node rotated 90° around +Z: (x, y, z) -> (-y, x, z).
     // Instance translated by (10, 0, 0) in node-local space -> world translation MUST be (0, 10, 0)!
     let s = std::f32::consts::FRAC_1_SQRT_2;
-    let (mut document, mut bytes) = model(
-        &square(),
-        json!({"name": "inst_order"}),
-        &["KHR_lights_punctual", "EXT_mesh_gpu_instancing"],
-        json!({}),
-    );
+    let (mut document, mut bytes) =
+        model(&square(), json!({"name": "inst_order"}), &["KHR_lights_punctual", "EXT_mesh_gpu_instancing"], json!({}));
     document["extensionsRequired"] = json!(["KHR_lights_punctual", "EXT_mesh_gpu_instancing"]);
     while !bytes.len().is_multiple_of(4) {
         bytes.push(0);
@@ -320,7 +312,8 @@ fn instancing_applies_node_world_times_trs_and_validates_normalized_rotations_an
     let imported = import(&file, &out, &Options::default()).unwrap();
     let mesh = read_json(&out.join(&imported.meshes[0].mesh));
     #[allow(clippy::cast_possible_truncation, reason = "test JSON f32")]
-    let data: Vec<f32> = mesh["instances"]["data"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
+    let data: Vec<f32> =
+        mesh["instances"]["data"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap() as f32).collect();
     // Column 3 of composed matrix (indices 12, 13, 14) must be (0, 10, 0) from Rz(90°) * (10, 0, 0).
     assert!(data[12].abs() < 1e-4 && (data[13] - 10.0).abs() < 1e-4 && data[14].abs() < 1e-4, "{data:?}");
     // Spot defaults: inner = 0.0, outer = PI/4; direction = (-1, 0, 0) despite 1e-10 node scale!
@@ -343,7 +336,10 @@ fn unskinned_morph_weight_animations_are_preserved_per_mesh_node() {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         let bv = doc["bufferViews"].as_array().unwrap().len();
-        doc["bufferViews"].as_array_mut().unwrap().push(json!({"buffer": 0, "byteOffset": off, "byteLength": data.len() * 4}));
+        doc["bufferViews"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"buffer": 0, "byteOffset": off, "byteLength": data.len() * 4}));
         let acc = doc["accessors"].as_array().unwrap().len();
         doc["accessors"].as_array_mut().unwrap().push(json!({
             "bufferView": bv, "componentType": 5126, "count": count, "type": acc_type,

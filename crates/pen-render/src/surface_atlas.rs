@@ -417,7 +417,10 @@ mod tests {
         };
         let cc_px = px(3, 0);
         let lm_px = px(2, 2);
-        assert!((i32::from(cc_px[0]) - 200).abs() <= 2 && (i32::from(cc_px[1]) - 100).abs() <= 2, "clearcoat={cc_px:?}");
+        assert!(
+            (i32::from(cc_px[0]) - 200).abs() <= 2 && (i32::from(cc_px[1]) - 100).abs() <= 2,
+            "clearcoat={cc_px:?}"
+        );
         assert!(
             (i32::from(lm_px[0]) - 50).abs() <= 2
                 && (i32::from(lm_px[1]) - 150).abs() <= 2

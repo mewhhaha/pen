@@ -71,14 +71,7 @@ pub struct Yuv420Frame {
 }
 
 impl Yuv420Frame {
-    pub fn new(
-        width: u32,
-        height: u32,
-        color_space: ColorSpace,
-        y: Vec<u8>,
-        u: Vec<u8>,
-        v: Vec<u8>,
-    ) -> Result<Self> {
+    pub fn new(width: u32, height: u32, color_space: ColorSpace, y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> Result<Self> {
         Self::with_siting(width, height, color_space, ChromaSiting::Left, y, u, v)
     }
 
@@ -112,9 +105,8 @@ impl Yuv420Frame {
             self.height
         );
         let y_len = (self.width as usize).checked_mul(self.height as usize).context("video plane overflow")?;
-        let uv_len = ((self.width / 2) as usize)
-            .checked_mul((self.height / 2) as usize)
-            .context("video chroma overflow")?;
+        let uv_len =
+            ((self.width / 2) as usize).checked_mul((self.height / 2) as usize).context("video chroma overflow")?;
         ensure!(self.y.len() == y_len, "Y plane size {} != expected {y_len}", self.y.len());
         ensure!(self.u.len() == uv_len, "U plane size {} != expected {uv_len}", self.u.len());
         ensure!(self.v.len() == uv_len, "V plane size {} != expected {uv_len}", self.v.len());
@@ -161,11 +153,7 @@ pub struct Y4mStream {
 
 impl Y4mStream {
     pub fn fps(&self) -> f64 {
-        if self.fps_den == 0 || self.fps_num == 0 {
-            30.0
-        } else {
-            f64::from(self.fps_num) / f64::from(self.fps_den)
-        }
+        if self.fps_den == 0 || self.fps_num == 0 { 30.0 } else { f64::from(self.fps_num) / f64::from(self.fps_den) }
     }
 
     /// Parses a Y4M stream defaulting to BT.709 matrix and Limited range unless
@@ -266,11 +254,7 @@ pub struct IndexedY4mStream {
 
 impl IndexedY4mStream {
     pub fn fps(&self) -> f64 {
-        if self.fps_den == 0 || self.fps_num == 0 {
-            30.0
-        } else {
-            f64::from(self.fps_num) / f64::from(self.fps_den)
-        }
+        if self.fps_den == 0 || self.fps_num == 0 { 30.0 } else { f64::from(self.fps_num) / f64::from(self.fps_den) }
     }
 
     pub fn frame_count(&self) -> usize {
@@ -469,7 +453,9 @@ impl VideoPlayer {
     pub fn current_frame(&self) -> &Yuv420Frame {
         match &self.source {
             VideoSource::Owned(s) => &s.frames[self.frame_index],
-            VideoSource::Indexed(_) => panic!("current_frame() requires Owned Y4mStream; use current_planes() for IndexedY4mStream"),
+            VideoSource::Indexed(_) => {
+                panic!("current_frame() requires Owned Y4mStream; use current_planes() for IndexedY4mStream")
+            }
         }
     }
 
@@ -489,11 +475,7 @@ impl VideoPlayer {
 
     pub fn seek_frame(&mut self, index: usize) {
         let total = self.frame_count();
-        self.frame_index = if self.looping {
-            index % total
-        } else {
-            index.min(total.saturating_sub(1))
-        };
+        self.frame_index = if self.looping { index % total } else { index.min(total.saturating_sub(1)) };
         self.elapsed = self.frame_index as f64 / self.fps();
     }
 
@@ -732,19 +714,7 @@ impl VideoTexture {
             multiview_mask: None,
             cache: None,
         });
-        Ok(Self {
-            width,
-            height,
-            y_tex,
-            u_tex,
-            v_tex,
-            output,
-            output_view,
-            srgb_view,
-            params,
-            bind_group,
-            pipeline,
-        })
+        Ok(Self { width, height, y_tex, u_tex, v_tex, output, output_view, srgb_view, params, bind_group, pipeline })
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -1007,10 +977,9 @@ mod tests {
             .expect("GPU adapter required for YUV420p witness");
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
 
-        for (cs, matrix) in [
-            (ColorSpace::Bt709Limited, ColorMatrix::Bt709),
-            (ColorSpace::Bt601Full, ColorMatrix::Bt601),
-        ] {
+        for (cs, matrix) in
+            [(ColorSpace::Bt709Limited, ColorMatrix::Bt709), (ColorSpace::Bt601Full, ColorMatrix::Bt601)]
+        {
             let stream = Y4mStream::parse_with_matrix(&make_quadrant_y4m(cs), matrix).unwrap();
             let frame = &stream.frames[0];
             let video = VideoTexture::new(&device, frame.width, frame.height).unwrap();

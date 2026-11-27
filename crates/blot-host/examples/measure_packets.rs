@@ -59,8 +59,7 @@ fn main() -> Result<()> {
                 (Ok(out), Some(expected)) => {
                     let mut reply = [0; 12];
                     memory.read(&store, out as usize, &mut reply)?;
-                    let values: Vec<_> =
-                        reply.as_chunks::<4>().0.iter().map(|&v| u32::from_le_bytes(v)).collect();
+                    let values: Vec<_> = reply.as_chunks::<4>().0.iter().map(|&v| u32::from_le_bytes(v)).collect();
                     ensure!(
                         values == [2, expected[0], expected[1]],
                         "case {index} got {values:?}, wanted {expected:?}"

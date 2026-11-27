@@ -236,12 +236,9 @@ mod tests {
         assert!(pbr[1] > 0.2 && pbr[2] > 0.2, "PBR Neutral should desaturate intense red: {pbr:?}");
 
         // Mid-gray monotonicity across all 4 operators.
-        for op in [
-            TonemapOperator::Shoulder,
-            TonemapOperator::AgX,
-            TonemapOperator::AcesFilmic,
-            TonemapOperator::PbrNeutral,
-        ] {
+        for op in
+            [TonemapOperator::Shoulder, TonemapOperator::AgX, TonemapOperator::AcesFilmic, TonemapOperator::PbrNeutral]
+        {
             let low = tonemap_linear_f64([0.05; 3], op)[0];
             let mid = tonemap_linear_f64([0.18; 3], op)[0];
             let high = tonemap_linear_f64([2.0; 3], op)[0];

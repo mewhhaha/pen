@@ -355,12 +355,7 @@ impl Graph {
                 pass.targets
                     .iter()
                     .map(|view| {
-                        Some(wgpu::RenderPassColorAttachment {
-                            view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops,
-                        })
+                        Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops })
                     })
                     .collect()
             };

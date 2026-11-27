@@ -73,12 +73,16 @@ frame loop does not start these processes automatically.
 
 ## Contracts
 
-- Guest ABI 8 uses owned data stacks and copied numeric host packets. Native and
-  browser readers must agree with the compiler. Do not restore counted/COW/RC
-  semantics or language-task support. Copied-packet host workers remain.
-- Native packages are 0.1.0, compiler-plugin integration 0.2.0 and locked
-  Wasmtime 49.0.3. Build matching tools; a pre-existing `pen` on PATH may
-  differ.
+- Guest ABI 8 uses owned data stacks and copied numeric host packets, and
+  `pen:guest/1` provides an `externref`-free ABI (`pen:guest/1::exchange`,
+  `pen:main`, `pen:allocate`, standard `memory`) for non-Blot languages. Native
+  and browser readers agree on both. Do not restore counted/COW/RC semantics or
+  language-task support. Copied-packet host workers remain.
+- Native packages are 0.1.0, compiler-plugin integration `pen:plugin@0.4.0`
+  (adding `codegen` and diagnostic `fix`/`doc` fields), and locked Wasmtime
+  49.0.3. `pen build --web --game DIR` exports prebuilt bundles directly, and
+  `pen.json` supports `compiler.entry` / `compiler.devtools` plus `web`. Build
+  matching tools; a pre-existing `pen` on PATH may differ.
 - Session protocol 2 preserves explicit Snapshot/Restore. Renderer rejection
   does not roll simulation back. Retries must not advance simulation twice;
   trapped sessions may require recreation from a checkpoint.

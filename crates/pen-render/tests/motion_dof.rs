@@ -146,13 +146,8 @@ fn moving_object_taa_tracks_velocity_without_trailing_ghosts() {
     let mut renderer = Renderer::new(device.clone(), queue.clone(), options).unwrap();
     let mut target = Offscreen::new(&device, 64);
 
-    let mut base = frame(vec![Draw {
-        mesh: 0,
-        material: 0,
-        transform: translate(-0.4, 0.0, 0.5),
-        parameters: None,
-        extra: None,
-    }]);
+    let mut base =
+        frame(vec![Draw { mesh: 0, material: 0, transform: translate(-0.4, 0.0, 0.5), parameters: None, extra: None }]);
     base.quality.taa = true;
     pump(&mut renderer, &base, &catalog, &mut target, |e| {
         ready(e, "quad.mesh.json", 1) && ready(e, "red.material.json", 1) && ready(e, "flat.wgsl", 1)
@@ -179,7 +174,10 @@ fn moving_object_taa_tracks_velocity_without_trailing_ghosts() {
         center[0].abs_diff(shown(1.0)) <= 4 && center[1] <= 2 && center[2] <= 2,
         "moving quad interior should stay bright red under TAA, got {center:?}"
     );
-    assert!(trail[0] <= 2 && trail[1] <= 2 && trail[2] <= 2, "trailing background must be black without ghosting, got {trail:?}");
+    assert!(
+        trail[0] <= 2 && trail[1] <= 2 && trail[2] <= 2,
+        "trailing background must be black without ghosting, got {trail:?}"
+    );
 }
 
 #[test]
@@ -211,13 +209,8 @@ fn velocity_motion_blur_smears_along_motion_axis_including_skeletal_motion() {
     let mut target = Offscreen::new(&device, 64);
 
     // 1. Rigid per-object horizontal motion blur (moving right along +X, zero Y motion).
-    let mut rigid = frame(vec![Draw {
-        mesh: 0,
-        material: 0,
-        transform: translate(0.0, 0.0, 0.5),
-        parameters: None,
-        extra: None,
-    }]);
+    let mut rigid =
+        frame(vec![Draw { mesh: 0, material: 0, transform: translate(0.0, 0.0, 0.5), parameters: None, extra: None }]);
     rigid.quality.effects = true;
     rigid.motion_blur = MotionBlur { strength: 1.0, max_radius: 0.16, samples: 16 };
     rigid.motions.push(Motion { draw: 0, previous: translate(-0.32, 0.0, 0.5) });
@@ -243,13 +236,8 @@ fn velocity_motion_blur_smears_along_motion_axis_including_skeletal_motion() {
     );
 
     // 2. Automatic skeletal joint motion blur (draw transform stays fixed at IDENTITY while joint 0 translates).
-    let mut skinned_a = frame(vec![Draw {
-        mesh: 1,
-        material: 0,
-        transform: translate(0.0, 0.0, 0.5),
-        parameters: None,
-        extra: None,
-    }]);
+    let mut skinned_a =
+        frame(vec![Draw { mesh: 1, material: 0, transform: translate(0.0, 0.0, 0.5), parameters: None, extra: None }]);
     skinned_a.quality.effects = true;
     skinned_a.motion_blur = MotionBlur { strength: 1.0, max_radius: 0.16, samples: 16 };
     skinned_a.bone_matrices.push(BoneMatrix { inset: 0, draw: 0, joint: 0, matrix: translate(-0.32, 0.0, 0.0) });

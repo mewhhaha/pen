@@ -35,7 +35,12 @@ fn fixture() -> &'static (Engine, GuestModule) {
             .arg(blot.join("std/prelude.blot"))
             .output()
             .unwrap();
-        assert!(built.status.success(), "{}{}", String::from_utf8_lossy(&built.stdout), String::from_utf8_lossy(&built.stderr));
+        assert!(
+            built.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&built.stdout),
+            String::from_utf8_lossy(&built.stderr)
+        );
         let engine = blot_host::engine().unwrap();
         let module = GuestModule::new(&engine, &std::fs::read(output).unwrap(), None).unwrap();
         (engine, module)
@@ -89,11 +94,7 @@ fn apply(guest: &mut Guest, world: u32, values: &[u32]) -> Result<u32> {
 #[test]
 fn native_turns_replay_same_spawning_caller_and_world_at_every_tick() -> Result<()> {
     let (engine, module) = fixture();
-    let host = Arc::new(Mutex::new(Processes::new(
-        engine,
-        module,
-        vec![policy("planner", 1, 2, 1, MEMORY)],
-    )?));
+    let host = Arc::new(Mutex::new(Processes::new(engine, module, vec![policy("planner", 1, 2, 1, MEMORY)])?));
     let handles: Arc<Mutex<Vec<ProcessHandle>>> = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::new(Mutex::new(VecDeque::new()));
     let coordinator = host.clone();

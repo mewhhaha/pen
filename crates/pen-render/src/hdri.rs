@@ -139,7 +139,10 @@ impl HdriImage {
                                 }
                             } else {
                                 let count = code as usize;
-                                ensure!(count > 0 && cursor + count <= bytes.len() && x + count <= w, "invalid HDR RLE literal");
+                                ensure!(
+                                    count > 0 && cursor + count <= bytes.len() && x + count <= w,
+                                    "invalid HDR RLE literal"
+                                );
                                 for _ in 0..count {
                                     scanline[x * 4 + channel] = bytes[cursor];
                                     cursor += 1;
@@ -164,12 +167,7 @@ impl HdriImage {
                 let b = scanline[x * 4 + 2];
                 let e = scanline[x * 4 + 3];
                 let rgb = rgbe_to_rgb(r, g, b, e);
-                pixels[dst_y * w + dst_x] = [
-                    rgb[0] * inv_exposure,
-                    rgb[1] * inv_exposure,
-                    rgb[2] * inv_exposure,
-                    1.0,
-                ];
+                pixels[dst_y * w + dst_x] = [rgb[0] * inv_exposure, rgb[1] * inv_exposure, rgb[2] * inv_exposure, 1.0];
             }
         }
         Ok(Self { width, height, pixels })
@@ -249,7 +247,7 @@ impl HdriImage {
 
         let lines_per_block: usize = match compression {
             0..=2 => 1, // NO_COMPRESSION, RLE, ZIPS
-            3 => 16,        // ZIP
+            3 => 16,    // ZIP
             other => bail!("unsupported EXR compression mode {other} (supported: NONE, RLE, ZIPS, ZIP)"),
         };
         let num_blocks = (height as usize).div_ceil(lines_per_block);
@@ -284,11 +282,8 @@ impl HdriImage {
                     packed.to_vec()
                 }
                 1 => {
-                    let uncomp = if packed.len() < raw_size {
-                        exr_rle_decode(packed, raw_size)?
-                    } else {
-                        packed.to_vec()
-                    };
+                    let uncomp =
+                        if packed.len() < raw_size { exr_rle_decode(packed, raw_size)? } else { packed.to_vec() };
                     exr_unpredict_and_reorder(&uncomp)
                 }
                 2 | 3 => {
@@ -424,17 +419,7 @@ impl HdriImage {
 
         // Cosine lobe transfer weights (divided by PI so sky_ambient evaluates irradiance / pi).
         // A0 = pi, A1 = 2*pi/3, A2 = pi/4 -> divided by pi: 1.0, 2/3, 1/4.
-        let band_scale = [
-            1.0f64,
-            2.0 / 3.0,
-            2.0 / 3.0,
-            2.0 / 3.0,
-            0.25,
-            0.25,
-            0.25,
-            0.25,
-            0.25,
-        ];
+        let band_scale = [1.0f64, 2.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 0.25, 0.25, 0.25, 0.25, 0.25];
 
         for y in 0..h {
             let theta = (y as f64 + 0.5) * d_theta;
@@ -473,11 +458,7 @@ impl HdriImage {
             }
         }
 
-        let norm = if total_solid_angle > 1e-12 {
-            (4.0 * std::f64::consts::PI) / total_solid_angle
-        } else {
-            1.0
-        };
+        let norm = if total_solid_angle > 1e-12 { (4.0 * std::f64::consts::PI) / total_solid_angle } else { 1.0 };
         #[allow(clippy::cast_possible_truncation, reason = "SH coefficients are f32 GPU uniforms")]
         std::array::from_fn(|i| {
             let s = norm * band_scale[i];
@@ -838,10 +819,7 @@ impl HdriPrefilterer {
                             resource: wgpu::BindingResource::TextureView(&equirect_view),
                         },
                         wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(&face_view),
-                        },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&face_view) },
                     ],
                 });
                 groups.push((mip, bg));
@@ -961,9 +939,7 @@ mod tests {
         let img = HdriImage::from_rgba_f32(w, h, pixels).unwrap();
         let prefilterer = HdriPrefilterer::new(&device, None);
         let mut encoder = device.create_command_encoder(&Default::default());
-        let cube = prefilterer
-            .build_cubemap(&device, &queue, &mut encoder, &img, 16, 4, 32, 1.0, 0.0)
-            .unwrap();
+        let cube = prefilterer.build_cubemap(&device, &queue, &mut encoder, &img, 16, 4, 32, 1.0, 0.0).unwrap();
 
         // Read back +Y face (layer 2) and -Y face (layer 3) at mip 0 (16x16 Rgba16Float -> 8 bytes/px).
         let padded_row = 256u32;

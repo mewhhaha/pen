@@ -107,11 +107,7 @@ impl Channel {
             return fixed;
         }
         let factor = self.times.len() * if self.interpolation == Interpolation::Cubic { 3 } else { 1 };
-        if factor > 0 && self.values.len().is_multiple_of(factor) {
-            self.values.len() / factor
-        } else {
-            0
-        }
+        if factor > 0 && self.values.len().is_multiple_of(factor) { self.values.len() / factor } else { 0 }
     }
 }
 
@@ -386,12 +382,8 @@ impl Rig {
     /// Samples blended morph target weights across `layers` for the rig's primary
     /// morph-animated node (first node referenced by a `Path::Weights` channel).
     pub fn morph_weights(&self, layers: &[Layer], target_count: usize) -> Vec<f32> {
-        let Some(node) = self
-            .clips
-            .iter()
-            .flat_map(|c| c.channels.iter())
-            .find(|ch| ch.path == Path::Weights)
-            .map(|ch| ch.node)
+        let Some(node) =
+            self.clips.iter().flat_map(|c| c.channels.iter()).find(|ch| ch.path == Path::Weights).map(|ch| ch.node)
         else {
             return vec![0.0f32; target_count];
         };

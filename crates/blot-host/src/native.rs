@@ -24,7 +24,9 @@ pub fn native_metadata(wasm: &[u8]) -> Result<Vec<u8>> {
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
         let payload = payload?;
         let keep = match &payload {
-            wasmparser::Payload::MemorySection(_) | wasmparser::Payload::ExportSection(_) => true,
+            wasmparser::Payload::ImportSection(_)
+            | wasmparser::Payload::MemorySection(_)
+            | wasmparser::Payload::ExportSection(_) => true,
             wasmparser::Payload::CustomSection(section) => {
                 matches!(
                     section.name(),

@@ -59,6 +59,7 @@ pub(crate) mod bindings {
     });
 }
 
+pub use bindings::exports::pen::plugin::codegen::{GeneratedFile, Generation};
 pub use bindings::exports::pen::plugin::compiler::BuildResult;
 pub use bindings::exports::pen::plugin::tests::{Expectation, TestModule};
 pub use bindings::pen::plugin::types::{Diagnostic, Overlay};
@@ -97,12 +98,13 @@ pub struct Config {
     /// The game's own events and render sections, which `pen codegen`
     /// and pen's tools read (pen-codegen's `extensions`).
     pub protocol: Option<serde_json::Value>,
-    /// Its store builds and where reports go, which `pen build` reads for
-    /// itself (the pen crate's `publish` and `reports`).
+    /// Its store builds, web host settings and where reports go, which `pen build`
+    /// reads for itself (the pen crate's `project`, `publish` and `reports`).
+    pub web: Option<serde_json::Value>,
     pub steam: Option<serde_json::Value>,
     pub itch: Option<serde_json::Value>,
     pub reports: Option<serde_json::Value>,
-    /// Native reference suites, run by `pen test-blot` after the Blot checks.
+    /// Native reference suites, run by `pen test-guest` / `pen test-blot`.
     pub tests: Option<NativeTests>,
     /// Checkout-owned Rust tools, invoked with `pen tool NAME -- ARGS`.
     #[serde(default)]
@@ -141,6 +143,12 @@ pub struct PluginConfig {
 #[serde(deny_unknown_fields)]
 pub struct Choice {
     pub plugin: String,
+    /// Optional entry path relative to the checkout root (defaults to `src/main.blot`).
+    #[serde(default)]
+    pub entry: Option<String>,
+    /// Optional dev tools entry path relative to the checkout root.
+    #[serde(default)]
+    pub devtools: Option<String>,
     #[serde(default)]
     pub settings: Option<serde_json::Value>,
 }
@@ -245,6 +253,16 @@ impl Plugins {
     /// Whether the checkout compiles through a plugin.
     pub fn compiles(&self) -> bool {
         self.config.compiler.is_some()
+    }
+
+    /// Configured main program entry relative to the checkout root, defaulting to `src/main.blot`.
+    pub fn entry(&self) -> &str {
+        self.config.compiler.as_ref().and_then(|choice| choice.entry.as_deref()).unwrap_or("src/main.blot")
+    }
+
+    /// Configured dev tools entry relative to the checkout root, if declared.
+    pub fn devtools(&self) -> Option<&str> {
+        self.config.compiler.as_ref().and_then(|choice| choice.devtools.as_deref())
     }
 
     /// The compiler's choice: its plugin and settings.
@@ -354,6 +372,22 @@ impl Plugins {
         within(&mut store, timeout, |store| plugin.pen_plugin_tests().call_find(store, &program, &paths, filter))
             .map_err(|error| failed(name, timeout, error))?
             .map_err(|error| anyhow!("{name}: {error}"))
+    }
+
+    /// Generates language-specific protocol bindings through the checkout's
+    /// compiler plugin, given `protocol/schema.json` and the checkout's
+    /// `pen.json` `protocol` block (or `"{}"`).
+    pub fn codegen(&self, schema_json: &str, extensions_json: &str) -> Result<Generation> {
+        let choice = self.chosen()?;
+        let name = &choice.plugin;
+        let (mut store, plugin) = self.start(name)?;
+        let settings = choice.settings.as_ref().map_or_else(|| "{}".to_owned(), ToString::to_string);
+        let timeout = self.timeout(name);
+        within(&mut store, timeout, |store| {
+            plugin.pen_plugin_codegen().call_generate(store, schema_json, extensions_json, &settings)
+        })
+        .map_err(|error| failed(name, timeout, error))?
+        .map_err(|error| anyhow!("{name}: {error}"))
     }
 }
 

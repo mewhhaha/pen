@@ -7,18 +7,10 @@
 //! when another arrow goes down, it lets go of the held one. The game gets
 //! these as it gets the player's, and input recordings keep them.
 //!
-//! Unlike a game's `main`, a mod's `frame` takes and returns arrays, which
-//! Rust can export directly: the module needs no adapter, only the
-//! `blot:abi` manifest below and its memory exported as `blot:memory`
-//! (build.rs).
+//! Unlike a game's `pen:main`, a mod's `frame` takes and returns arrays:
+//! exporting `frame`, `pen:allocate`, and standard `memory` is all pen needs
+//! (no custom manifest section or linker flags).
 use pen_protocol::boundary::{EVENT_FLOATS, event_tags, key_code};
-
-/// The guest ABI's manifest: version 2, one function, `frame: Array F32 ->
-/// Array F32`, no constants.
-#[cfg(target_arch = "wasm32")]
-#[unsafe(link_section = "blot:abi")]
-#[used]
-static MANIFEST: [u8; 11] = [0x02, 0x01, 0x05, b'f', b'r', b'a', b'm', b'e', 0x06, 0x06, 0x00];
 
 const ARROWS: [&str; 4] = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"];
 
@@ -79,18 +71,13 @@ mod exports {
     static ANSWER: Cell<Vec<u32>> = Cell(UnsafeCell::new(Vec::new()));
     static STICKY: Cell<super::Sticky> = Cell(UnsafeCell::new(super::Sticky { held: None }));
 
-    #[unsafe(export_name = "blot:allocate")]
+    #[unsafe(export_name = "pen:allocate")]
     extern "C" fn allocate(bytes: u32) -> *mut u32 {
         // SAFETY: the host writes here before it calls frame, which reads it.
         let request = unsafe { &mut *REQUEST.0.get() };
         request.clear();
         request.resize((bytes as usize).div_ceil(4), 0);
         request.as_mut_ptr()
-    }
-
-    #[unsafe(export_name = "blot:reset")]
-    extern "C" fn reset(_: u32) -> u32 {
-        0
     }
 
     #[unsafe(export_name = "frame")]

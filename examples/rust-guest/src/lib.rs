@@ -1,21 +1,18 @@
 //! Gather, a tiny game written in Rust for pen: steer the square with the
 //! arrow keys (or WASD) and gather the gems. It is here to show that pen's
-//! guest boundary is not Blot's alone. Built for wasm32-unknown-unknown and
-//! bundled by `src/bin/bundle.rs`, it speaks what a Blot game does: the
-//! `blot:abi` manifest's `main: (Array F32 -> Array F32 ! {Foreign}) ->
-//! Unit` with its array arena, the program protocol (ink's
-//! `lib/pen/program.blot`) and pen's packets (`protocol/schema.json`,
-//! through pen-protocol's own constants), so pen runs it unchanged.
+//! guest boundary is language-agnostic. Built straight for
+//! `wasm32-unknown-unknown` with no bytecode rewriter, it speaks pen's
+//! `externref`-free `pen:guest/1` ABI (`pen:guest/1::exchange(ptr) -> ptr`,
+//! `pen:main`, `pen:allocate`, standard `memory`), session protocol v2, and
+//! pen's packets (`protocol/schema.json` via `pen-protocol`).
 //!
 //! The game and its protocol are plain Rust, tested natively against pen's
-//! packet decoder; only `guest.rs` (the Wasm exports) and `adapt.rs` (which
-//! gives them the guest ABI's shape) depend on where it runs.
+//! packet decoder; only `guest.rs` (the Wasm import and exports) depends on
+//! `wasm32`.
 use pen_protocol::boundary::{
     EVENT_FLOATS, FRAME_HEADER_FLOATS, PACKET_HEADER_FLOATS, PACKET_MAGIC, SPRITE_FLOATS, event_tags, key_code, lanes,
 };
 
-#[cfg(not(target_arch = "wasm32"))]
-pub mod adapt;
 #[cfg(target_arch = "wasm32")]
 mod guest;
 
@@ -199,12 +196,7 @@ impl World {
         packet[lanes::header::SCHEMA] = SCHEMA;
         packet[lanes::header::SPRITE_COUNT] = sprites.len() as f32;
         // No 3D scene: identity views and projections.
-        for matrix in [
-            lanes::header::VIEW,
-            lanes::header::PROJECTION,
-            lanes::header::SHADOW_VIEW,
-            lanes::header::SHADOW_PROJECTION,
-        ] {
+        for matrix in [lanes::header::VIEW, lanes::header::PROJECTION, lanes::header::SHADOW_VIEW] {
             for diagonal in [0, 5, 10, 15] {
                 packet[matrix + diagonal] = 1.0;
             }
@@ -212,6 +204,30 @@ impl World {
         packet[lanes::header::CLEAR..lanes::header::CLEAR + 4].copy_from_slice(&[0.04, 0.05, 0.08, 1.0]);
         packet[lanes::header::LIGHT_DIRECTION + 1] = -1.0;
         packet[lanes::header::LIGHT_COLOR..lanes::header::LIGHT_COLOR + 3].copy_from_slice(&[1.0, 1.0, 1.0]);
+        packet[lanes::header::FOG_HEIGHT] = 1.0;
+        packet[lanes::header::FOG_NOISE_SCALE] = 16.0;
+        packet[lanes::header::FOG_ALBEDO..lanes::header::FOG_ALBEDO + 3].copy_from_slice(&[1.0, 1.0, 1.0]);
+        packet[lanes::header::FOG_SUN] = 1.0;
+        packet[lanes::header::FOG_AMBIENT] = 1.0;
+        packet[lanes::header::EXPOSURE_MIN] = -6.0;
+        packet[lanes::header::EXPOSURE_MAX] = 6.0;
+        packet[lanes::header::EXPOSURE_BRIGHTEN] = 3.0;
+        packet[lanes::header::EXPOSURE_DARKEN] = 1.0;
+        packet[lanes::header::EXPOSURE_LOW] = 0.1;
+        packet[lanes::header::EXPOSURE_HIGH] = 0.9;
+        packet[lanes::header::EXPOSURE_RANGE_LOW] = -10.0;
+        packet[lanes::header::EXPOSURE_RANGE_HIGH] = 6.0;
+        packet[lanes::header::EXPOSURE_TARGET] = 0.18;
+        packet[lanes::header::GRADE_CONTRAST] = 1.0;
+        packet[lanes::header::GRADE_PIVOT] = 0.18;
+        packet[lanes::header::GRADE_SATURATION] = 1.0;
+        packet[lanes::header::GRADE_GAMMA..lanes::header::GRADE_GAMMA + 3].copy_from_slice(&[1.0, 1.0, 1.0]);
+        packet[lanes::header::GRADE_GAIN..lanes::header::GRADE_GAIN + 3].copy_from_slice(&[1.0, 1.0, 1.0]);
+        packet[lanes::header::GRADE_LUT_WEIGHT] = 1.0;
+        packet[lanes::header::GRADE_VIGNETTE_RADIUS] = 0.5;
+        packet[lanes::header::MOTION_BLUR_MAX_RADIUS] = 0.05;
+        packet[lanes::header::MOTION_BLUR_SAMPLES] = 8.0;
+        packet[lanes::header::DOF_MAX_BLUR] = 0.025;
         packet[lanes::header::QUALITY_MSAA] = 1.0;
         packet[lanes::header::QUALITY_SCALE] = 1.0;
         packet[lanes::header::QUALITY_FILTERING] = 1.0;

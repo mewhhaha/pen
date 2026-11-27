@@ -126,4 +126,53 @@ const log = () => instances.at(-1).exports.log.value;
   await guest.close();
   assert.equal(log(), 0);
 }
-console.log('guest.js: ownership hooks, teardown and trap stacks ok');
+
+// A language-agnostic, externref-free `pen:guest/1` game: imports
+// `pen:guest/1::exchange(i32) -> i32`, exports `pen:main() -> ()`,
+// `pen:allocate(i32) -> i32`, and standard `memory`, with no `blot:abi`
+// custom section and no `reset` hook.
+function simpleGame() {
+  const types = vector([
+    [0x60, 1, 0x7f, 1, 0x7f], // 0: (i32) -> i32
+    [0x60, 0, 0],             // 1: () -> ()
+  ]);
+  const imports = vector([[...text('pen:guest/1'), ...text('exchange'), 0, 0]]);
+  const functions = vector([[1], [0]]);
+  const memory = vector([[0, 1]]);
+  const globals = vector([[0x7f, 1, 0x41, ...leb(1024), 0x0b]]);
+  const exports = vector([
+    [...text('pen:main'), 0, 1],
+    [...text('memory'), 2, 0],
+    [...text('pen:allocate'), 0, 2],
+  ]);
+  const body = (code, locals = []) => {
+    const bytes = [...vector(locals), ...code, 0x0b];
+    return [...leb(bytes.length), ...bytes];
+  };
+  const code = vector([
+    // pen:main: send handshake at 16, loop until op lane (offset 8) == 0.
+    body([0x41, 16, 0x10, 0, 0x1a]),
+    // pen:allocate: bump global 0 rounded to 4.
+    body([0x23, 0, 0x23, 0, 0x20, 0, 0x41, 3, 0x6a, 0x41, ...leb(-4 & 0x7f), 0x71, 0x6a, 0x24, 0]),
+  ]);
+  const handshake = [...i32(4), ...f32(4670544), ...f32(2), ...f32(7), ...f32(0)];
+  const data = vector([[0, 0x41, 16, 0x0b, ...leb(handshake.length), ...handshake]]);
+  return new Uint8Array([
+    0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
+    ...section(1, types),
+    ...section(2, imports),
+    ...section(3, functions),
+    ...section(5, memory),
+    ...section(6, globals),
+    ...section(7, exports),
+    ...section(10, code),
+    ...section(11, data),
+  ]);
+}
+{
+  const guest = await openGuest(simpleGame(), false);
+  assert.deepEqual([...guest.description], [4670544, 2, 7, 0]);
+  assert.equal(guest.memoryBytes(), 65536);
+  await guest.close();
+}
+console.log('guest.js: ownership hooks, pen:guest/1, teardown and trap stacks ok');

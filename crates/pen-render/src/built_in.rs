@@ -59,8 +59,8 @@ pub(crate) enum BuiltIn {
 }
 
 impl BuiltIn {
-    /// Every one a frame drawn with `samples` per pixel may draw with.
-    pub fn all(samples: u32) -> [BuiltIn; 17] {
+    /// Pipelines prepared at startup for this sample count. Decals compile on their first draw.
+    pub fn all(samples: u32) -> [BuiltIn; 15] {
         [
             BuiltIn::Occlusion(samples),
             BuiltIn::Atmosphere(samples),
@@ -72,8 +72,6 @@ impl BuiltIn {
             BuiltIn::BloomDown { first: true },
             BuiltIn::BloomDown { first: false },
             BuiltIn::BloomUp,
-            BuiltIn::Decal { samples, paint: true },
-            BuiltIn::Decal { samples, paint: false },
             BuiltIn::Composite,
             BuiltIn::OpaqueDepth(samples),
             BuiltIn::OpaqueMip,
@@ -197,6 +195,7 @@ mod tests {
             ] {
                 assert!(all.contains(&needed), "{needed:?}");
             }
+            assert!(!all.iter().any(|pipeline| matches!(pipeline, BuiltIn::Decal { .. })));
             let distinct: HashSet<BuiltIn> = all.into_iter().collect();
             assert_eq!(distinct.len(), all.len());
         }

@@ -32,77 +32,116 @@ fn fxaa(uv: vec2f) -> vec3f {
   // ties avoid changing orientation/endpoints for the same 8-bit pixels.
   let epsilon = 0.0001;
   let texel = present.source.xy;
-  let color = fetch(uv);
-  let m = luma(color);
-  let n = luma(fetch_fast(uv - vec2f(0.0, texel.y)));
-  let s = luma(fetch_fast(uv + vec2f(0.0, texel.y)));
-  let w = luma(fetch_fast(uv - vec2f(texel.x, 0.0)));
-  let e = luma(fetch_fast(uv + vec2f(texel.x, 0.0)));
+  var cardinal_off = array<vec2f, 5>(
+    vec2f(0.0, 0.0),
+    vec2f(0.0, -texel.y),
+    vec2f(0.0, texel.y),
+    vec2f(-texel.x, 0.0),
+    vec2f(texel.x, 0.0),
+  );
+  var color = vec3f(0.0);
+  var cardinal: array<f32, 5>;
+  for (var i = 0u; i < 5u; i++) {
+    let rgb = fetch_fast(uv + cardinal_off[i]);
+    if (i == 0u) {
+      color = rgb;
+    }
+    cardinal[i] = luma(rgb);
+  }
+  let m = cardinal[0];
+  let n = cardinal[1];
+  let s = cardinal[2];
+  let w = cardinal[3];
+  let e = cardinal[4];
   let low = min(m, min(min(n, s), min(w, e)));
   let high = max(m, max(max(n, s), max(w, e)));
   let contrast = high - low;
+  var sample_uv = uv;
   if (contrast < max(0.0312, high * 0.125)) {
-    return color;
-  }
-  let nw = luma(fetch_fast(uv - texel));
-  let ne = luma(fetch_fast(uv + vec2f(texel.x, -texel.y)));
-  let sw = luma(fetch_fast(uv + vec2f(-texel.x, texel.y)));
-  let se = luma(fetch_fast(uv + texel));
-  let horizontal = abs(nw + sw - 2.0 * w) + 2.0 * abs(n + s - 2.0 * m) + abs(ne + se - 2.0 * e);
-  let vertical = abs(nw + ne - 2.0 * n) + 2.0 * abs(w + e - 2.0 * m) + abs(sw + se - 2.0 * s);
-  var across = vec2f(texel.x, 0.0);
-  var along = vec2f(0.0, texel.y);
-  var negative = w;
-  var positive = e;
-  if (horizontal + epsilon >= vertical) {
-    across = vec2f(0.0, texel.y);
-    along = vec2f(texel.x, 0.0);
-    negative = n;
-    positive = s;
-  }
-  var adjacent = positive;
-  if (abs(negative - m) + epsilon >= abs(positive - m)) {
-    across = -across;
-    adjacent = negative;
-  }
-  let gradient = max(abs(negative - m), abs(positive - m)) * 0.25;
-  let edge_luma = 0.5 * (adjacent + m);
-  let edge = uv + across * 0.5;
-  var distance_n = 0.0;
-  var distance_p = 0.0;
-  var endpoint_n = 0.0;
-  var endpoint_p = 0.0;
-  var done_n = false;
-  var done_p = false;
-  // Four endpoint reads per side at most. The final 12-pixel extension
-  // bounds a span that has no detected endpoint, as in preset 12.
-  let steps = array<f32, 4>(1.0, 1.5, 2.0, 4.0);
-  for (var index = 0u; index < 4u; index++) {
-    if (!done_n) {
-      distance_n += steps[index];
-      endpoint_n = luma(fetch_fast(edge - along * distance_n)) - edge_luma;
-      done_n = abs(endpoint_n) + epsilon >= gradient;
+    if (present.output.w <= 0.5) {
+      return color;
     }
-    if (!done_p) {
-      distance_p += steps[index];
-      endpoint_p = luma(fetch_fast(edge + along * distance_p)) - edge_luma;
-      done_p = abs(endpoint_p) + epsilon >= gradient;
+  } else {
+    var diag_off = array<vec2f, 4>(
+      -texel,
+      vec2f(texel.x, -texel.y),
+      vec2f(-texel.x, texel.y),
+      texel,
+    );
+    var diag: array<f32, 4>;
+    for (var i = 0u; i < 4u; i++) {
+      diag[i] = luma(fetch_fast(uv + diag_off[i]));
     }
-    if (done_n && done_p) {
-      break;
+    let nw = diag[0];
+    let ne = diag[1];
+    let sw = diag[2];
+    let se = diag[3];
+    let horizontal = abs(nw + sw - 2.0 * w) + 2.0 * abs(n + s - 2.0 * m) + abs(ne + se - 2.0 * e);
+    let vertical = abs(nw + ne - 2.0 * n) + 2.0 * abs(w + e - 2.0 * m) + abs(sw + se - 2.0 * s);
+    var across = vec2f(texel.x, 0.0);
+    var along = vec2f(0.0, texel.y);
+    var negative = w;
+    var positive = e;
+    if (horizontal + epsilon >= vertical) {
+      across = vec2f(0.0, texel.y);
+      along = vec2f(texel.x, 0.0);
+      negative = n;
+      positive = s;
     }
+    var adjacent = positive;
+    if (abs(negative - m) + epsilon >= abs(positive - m)) {
+      across = -across;
+      adjacent = negative;
+    }
+    let gradient = max(abs(negative - m), abs(positive - m)) * 0.25;
+    let edge_luma = 0.5 * (adjacent + m);
+    let edge = uv + across * 0.5;
+    var distance_n = 0.0;
+    var distance_p = 0.0;
+    var endpoint_n = 0.0;
+    var endpoint_p = 0.0;
+    var done_n = false;
+    var done_p = false;
+    // Four endpoint reads per side at most. The final 12-pixel extension
+    // bounds a span that has no detected endpoint, as in preset 12.
+    var steps = array<f32, 4>(1.0, 1.5, 2.0, 4.0);
+    for (var index = 0u; index < 4u; index++) {
+      let step = steps[index];
+      for (var side = 0u; side < 2u; side++) {
+        let searching = select(!done_p, !done_n, side == 0u);
+        if (searching) {
+          let dist = select(distance_p, distance_n, side == 0u) + step;
+          let dir_sign = select(1.0, -1.0, side == 0u);
+          let end_luma = luma(fetch_fast(edge + along * (dir_sign * dist))) - edge_luma;
+          let done = abs(end_luma) + epsilon >= gradient;
+          if (side == 0u) {
+            distance_n = dist;
+            endpoint_n = end_luma;
+            done_n = done;
+          } else {
+            distance_p = dist;
+            endpoint_p = end_luma;
+            done_p = done;
+          }
+        }
+      }
+      if (done_n && done_p) {
+        break;
+      }
+    }
+    if (!done_n) { distance_n += 12.0; }
+    if (!done_p) { distance_p += 12.0; }
+    var endpoint = endpoint_p;
+    if (distance_n < distance_p) { endpoint = endpoint_n; }
+    var edge_blend = 0.0;
+    if ((endpoint < -epsilon) != (m - edge_luma < -epsilon)) {
+      edge_blend = 0.5 - min(distance_n, distance_p) / (distance_n + distance_p);
+    }
+    let average = (2.0 * (n + s + w + e) + nw + ne + sw + se) / 12.0;
+    let subpixel = clamp(abs(average - m) / contrast, 0.0, 1.0);
+    let subpixel_curve = subpixel * subpixel * (3.0 - 2.0 * subpixel);
+    let blend = max(edge_blend, subpixel_curve * subpixel_curve * 0.25);
+    sample_uv = uv + across * blend;
   }
-  if (!done_n) { distance_n += 12.0; }
-  if (!done_p) { distance_p += 12.0; }
-  var endpoint = endpoint_p;
-  if (distance_n < distance_p) { endpoint = endpoint_n; }
-  var edge_blend = 0.0;
-  if ((endpoint < -epsilon) != (m - edge_luma < -epsilon)) {
-    edge_blend = 0.5 - min(distance_n, distance_p) / (distance_n + distance_p);
-  }
-  let average = (2.0 * (n + s + w + e) + nw + ne + sw + se) / 12.0;
-  let subpixel = clamp(abs(average - m) / contrast, 0.0, 1.0);
-  let subpixel_curve = subpixel * subpixel * (3.0 - 2.0 * subpixel);
-  let blend = max(edge_blend, subpixel_curve * subpixel_curve * 0.25);
-  return fetch(uv + across * blend);
+  return fetch(sample_uv);
 }

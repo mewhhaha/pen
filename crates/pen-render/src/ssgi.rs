@@ -3,8 +3,8 @@ use pen_protocol::Matrix;
 
 use crate::matrix::invert;
 
-const FULLSCREEN: &str = include_str!("shaders/fullscreen.wgsl");
-const SSGI_SHADER: &str = include_str!("shaders/ssgi.wgsl");
+const FULLSCREEN: &str = crate::wgsl!("fullscreen.wgsl");
+const SSGI_SHADER: &str = crate::wgsl!("ssgi.wgsl");
 
 /// World-space bounce march radius, indirect intensity, and depth-hit thickness.
 const SSGI_RADIUS: f32 = 3.5;

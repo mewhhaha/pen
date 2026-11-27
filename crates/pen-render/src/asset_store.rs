@@ -7,10 +7,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use pen_protocol::GameEvent;
+#[cfg(feature = "mesh-json")]
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::animation::{Clip, JointJson, NodeJson, Rig, RigJson, read_rig, write_rig};
+#[cfg(feature = "mesh-json")]
+use crate::animation::{Clip, JointJson, NodeJson, RigJson};
+use crate::animation::{Rig, read_rig, write_rig};
 use crate::culling::Sphere;
 use crate::loader::{Job, JobQueue, Priority};
 use crate::meshlet_dag::{DagClusterGpu, MeshletDagMesh};
@@ -21,6 +24,7 @@ mod instances;
 mod layout;
 mod packed;
 mod precision;
+#[cfg(feature = "mesh-json")]
 mod recipe;
 pub(crate) use instances::MeshInstances;
 
@@ -483,8 +487,18 @@ impl Surface {
             specular_color_texture: tex_key("specularColorTexture")?,
             iridescence: number("iridescence", defaults.iridescence, 0.0, 1.0)?,
             iridescence_ior: number("iridescenceIor", defaults.iridescence_ior, 1.0, float32)?,
-            iridescence_thickness_min: number("iridescenceThicknessMin", defaults.iridescence_thickness_min, 0.0, float32)?,
-            iridescence_thickness_max: number("iridescenceThicknessMax", defaults.iridescence_thickness_max, 0.0, float32)?,
+            iridescence_thickness_min: number(
+                "iridescenceThicknessMin",
+                defaults.iridescence_thickness_min,
+                0.0,
+                float32,
+            )?,
+            iridescence_thickness_max: number(
+                "iridescenceThicknessMax",
+                defaults.iridescence_thickness_max,
+                0.0,
+                float32,
+            )?,
             iridescence_texture: tex_key("iridescenceTexture")?,
             dispersion: number("dispersion", defaults.dispersion, 0.0, float32)?,
             lightmap_texture: tex_key("lightmapTexture")?,
@@ -550,6 +564,7 @@ const MESHLET_SUB_CLUSTERS: u32 = 1;
 const MESHLET_SUB_DAG: u32 = 2;
 const MESH_HEADER: usize = 16;
 
+#[cfg(feature = "mesh-json")]
 #[derive(Deserialize)]
 struct MorphTargetArrays {
     positions: Vec<f32>,
@@ -559,6 +574,7 @@ struct MorphTargetArrays {
 
 /// A mesh as its JSON has it: flat arrays, three or two numbers a vertex,
 /// and any simpler levels of detail over the same vertices.
+#[cfg(feature = "mesh-json")]
 #[derive(Deserialize)]
 struct MeshArrays {
     #[serde(default)]
@@ -596,6 +612,7 @@ struct MeshArrays {
     morphs: Option<Vec<MorphTargetArrays>>,
 }
 
+#[cfg(feature = "mesh-json")]
 #[derive(Deserialize)]
 struct LodArrays {
     error: f32,
@@ -604,12 +621,21 @@ struct LodArrays {
 
 /// A mesh asset: its JSON, or the binary form `pack_mesh` makes of it.
 pub(crate) fn parse_mesh(bytes: &[u8]) -> Result<Mesh> {
+    #[cfg(feature = "mesh-json")]
     if bytes.starts_with(b"PMRP") {
         return parse_mesh(&packed::decode_recipe(bytes)?);
     }
     if bytes.starts_with(MESH_MAGIC) {
         return unpack_mesh(bytes);
     }
+    #[cfg(not(feature = "mesh-json"))]
+    bail!("use a host built with mesh-json for unpacked JSON or recipe meshes");
+    #[cfg(feature = "mesh-json")]
+    parse_mesh_json(bytes)
+}
+
+#[cfg(feature = "mesh-json")]
+fn parse_mesh_json(bytes: &[u8]) -> Result<Mesh> {
     let arrays: MeshArrays = serde_json::from_slice(bytes).map_err(|error| anyhow!("mesh JSON: {error}"))?;
     let MeshArrays {
         precision,
@@ -734,6 +760,7 @@ pub(crate) fn push_lod(lods: &mut Vec<Lod>, first: usize, count: usize, error: f
     Ok(())
 }
 
+#[cfg_attr(not(feature = "mesh-json"), allow(dead_code))]
 fn checked_mesh(
     vertices: Vec<f32>,
     mut indices: Vec<u32>,
@@ -933,8 +960,12 @@ pub fn pack_mesh(bytes: &[u8]) -> Result<Vec<u8>> {
 
 /// Applies the author’s precision setting before generating any derived geometry.
 pub(crate) fn quantize_mesh(mesh: &mut Mesh) {
+    #[cfg(feature = "mesh-json")]
+    let has_recipe = mesh.instances.as_ref().is_some_and(|instances| instances.recipe.is_some());
+    #[cfg(not(feature = "mesh-json"))]
+    let has_recipe = false;
     if let Some(bits) = mesh.precision.take().filter(|&bits| bits < 23)
-        && !mesh.instances.as_ref().is_some_and(|instances| instances.recipe.is_some())
+        && !has_recipe
     {
         precision::reduce(mesh, bits);
     }
@@ -950,6 +981,7 @@ pub(crate) fn is_packed_mesh(bytes: &[u8]) -> Result<bool> {
 }
 
 pub(crate) fn pack(mesh: &Mesh) -> Result<Vec<u8>> {
+    #[cfg(feature = "mesh-json")]
     if mesh.instances.as_ref().is_some_and(|instances| instances.recipe.is_some()) {
         return packed::encode_recipe(mesh);
     }
@@ -1691,19 +1723,17 @@ mod tests {
     fn bounce_color_parses_optionally_for_gi_albedo() {
         let plain = parse_material(br#"{"shader":"s.wgsl","color":[1,1,1,1],"lighting":"lit"}"#).unwrap();
         assert_eq!(plain.bounce_color, None);
-        let tinted = parse_material(
-            br#"{"shader":"s.wgsl","color":[1,1,1,1],"bounceColor":[0.85,0.45,0.2],"lighting":"lit"}"#,
-        )
-        .unwrap();
+        let tinted =
+            parse_material(br#"{"shader":"s.wgsl","color":[1,1,1,1],"bounceColor":[0.85,0.45,0.2],"lighting":"lit"}"#)
+                .unwrap();
         assert_eq!(tinted.bounce_color, Some([0.85, 0.45, 0.2]));
-        assert!(parse_material(
-            br#"{"shader":"s.wgsl","color":[1,1,1,1],"bounceColor":[1,0],"lighting":"lit"}"#
-        )
-        .is_err());
-        assert!(parse_material(
-            br#"{"shader":"s.wgsl","color":[1,1,1,1],"bounceColor":[-0.1,0,0],"lighting":"lit"}"#
-        )
-        .is_err());
+        assert!(
+            parse_material(br#"{"shader":"s.wgsl","color":[1,1,1,1],"bounceColor":[1,0],"lighting":"lit"}"#).is_err()
+        );
+        assert!(
+            parse_material(br#"{"shader":"s.wgsl","color":[1,1,1,1],"bounceColor":[-0.1,0,0],"lighting":"lit"}"#)
+                .is_err()
+        );
     }
 
     #[test]

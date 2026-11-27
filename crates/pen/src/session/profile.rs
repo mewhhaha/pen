@@ -68,7 +68,8 @@ impl Profile {
         );
         if let Ok(path) = std::env::var("PEN_TRACE_OUT")
             && !path.is_empty()
-            && let Err(err) = write_chrome_trace_with_intervals(std::path::Path::new(&path), &self.timings, &self.intervals)
+            && let Err(err) =
+                write_chrome_trace_with_intervals(std::path::Path::new(&path), &self.timings, &self.intervals)
         {
             eprintln!("failed writing Chrome trace to {path}: {err}");
         }

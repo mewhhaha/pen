@@ -47,8 +47,8 @@ pub(crate) const TABLE_BYTES: u64 = 16 + 80 * SLOTS as u64;
 /// How near the capture's frustum reaches, in world units.
 pub(crate) const NEAR: f32 = 0.05;
 
-const FINALISE: &str = include_str!("../shaders/probe_finalise.wgsl");
-const FILTER: &str = include_str!("../shaders/probe_filter.wgsl");
+const FINALISE: &str = crate::wgsl!("probe_finalise.wgsl");
+const FILTER: &str = crate::wgsl!("probe_filter.wgsl");
 
 // Pass uniforms: faces finished in a frame, then the halvings, then the filters.
 const FINALISE_PASSES: u64 = 6;
@@ -129,7 +129,7 @@ impl Memory {
                 (index, if held(probe.id) { near * KEEP } else { near })
             })
             .collect();
-        ranked.sort_by(|&(a, near_a), &(b, near_b)| {
+        crate::sort::insertion_sort_by(&mut ranked, |&(a, near_a), &(b, near_b)| {
             probes[b]
                 .priority
                 .cmp(&probes[a].priority)
@@ -246,7 +246,9 @@ impl Memory {
                     .then_some((index, slot))
             })
             .collect();
-        rows.sort_by_key(|&(index, _)| (std::cmp::Reverse(probes[index].priority), probes[index].id));
+        crate::sort::insertion_sort_by(&mut rows, |&(a, _), &(b, _)| {
+            probes[b].priority.cmp(&probes[a].priority).then_with(|| probes[a].id.cmp(&probes[b].id))
+        });
         rows
     }
 }

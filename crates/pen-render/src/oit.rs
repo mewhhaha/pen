@@ -4,7 +4,7 @@
 //! into dual offscreen targets (`accum: Rgba16Float`, `reveal: R8Unorm`) so
 //! final pixels are strictly independent of draw submission order.
 
-const OIT_COMPOSITE_WGSL: &str = include_str!("shaders/oit_composite.wgsl");
+const OIT_COMPOSITE_WGSL: &str = crate::wgsl!("oit_composite.wgsl");
 
 /// WGSL helper snippet for translucent fragment shaders targeting WBOIT.
 pub const OIT_SHADER_HELPERS_WGSL: &str = r#"

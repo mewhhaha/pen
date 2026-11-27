@@ -440,11 +440,7 @@ impl JitterBuffer {
         if let Some(frame) = self.queue.remove(&expected) {
             self.consecutive_plc = 0;
             self.idle_ticks = 0;
-            if frame.dtx || frame.payload.is_empty() {
-                PopAction::Silence
-            } else {
-                PopAction::Play(frame.payload)
-            }
+            if frame.dtx || frame.payload.is_empty() { PopAction::Silence } else { PopAction::Play(frame.payload) }
         } else if self.consecutive_plc < self.max_plc {
             self.consecutive_plc += 1;
             self.plc_frames += 1;
@@ -570,10 +566,7 @@ impl VoiceRouter {
         for _ in 0..span {
             let candidate = self.base_voice_id + (self.next_alloc_offset % span);
             self.next_alloc_offset = self.next_alloc_offset.wrapping_add(1);
-            if candidate >= 1
-                && candidate <= max_id
-                && !self.routes.values().any(|r| r.voice_id == candidate)
-            {
+            if candidate >= 1 && candidate <= max_id && !self.routes.values().any(|r| r.voice_id == candidate) {
                 return Some(candidate);
             }
         }
@@ -624,10 +617,12 @@ impl VoiceRouter {
             }
         }
         let delay = self.target_delay;
-        self.buffers
-            .entry(packet.speaker_id)
-            .or_insert_with(|| JitterBuffer::new(delay))
-            .push_packet(packet.seq, Some(packet.timestamp), packet.flags, packet.payload);
+        self.buffers.entry(packet.speaker_id).or_insert_with(|| JitterBuffer::new(delay)).push_packet(
+            packet.seq,
+            Some(packet.timestamp),
+            packet.flags,
+            packet.payload,
+        );
         true
     }
 
@@ -638,7 +633,7 @@ impl VoiceRouter {
             return Vec::new();
         }
         let mut ids: Vec<u32> = self.buffers.keys().copied().collect();
-        ids.sort_unstable();
+        crate::sort::sort_by_u64_key(&mut ids, |&id| u64::from(id));
         let mut out = Vec::with_capacity(ids.len());
         let mut expired = Vec::new();
         for id in ids {
@@ -779,12 +774,30 @@ mod tests {
         assert_ne!(router.route(3).unwrap().voice_id, router.route(2).unwrap().voice_id);
 
         // Two talkers fill slots; after speaker 1 goes idle, speaker 3 can join.
-        assert!(router.receive(VoicePacket { speaker_id: 1, seq: 1, timestamp: 960, flags: FLAG_SPEAKING, payload: vec![1] }));
-        assert!(router.receive(VoicePacket { speaker_id: 2, seq: 1, timestamp: 960, flags: FLAG_SPEAKING, payload: vec![2] }));
+        assert!(router.receive(VoicePacket {
+            speaker_id: 1,
+            seq: 1,
+            timestamp: 960,
+            flags: FLAG_SPEAKING,
+            payload: vec![1]
+        }));
+        assert!(router.receive(VoicePacket {
+            speaker_id: 2,
+            seq: 1,
+            timestamp: 960,
+            flags: FLAG_SPEAKING,
+            payload: vec![2]
+        }));
         for _ in 0..10 {
             let _ = router.pop_all();
         }
-        assert!(router.receive(VoicePacket { speaker_id: 3, seq: 1, timestamp: 960, flags: FLAG_SPEAKING, payload: vec![3] }));
+        assert!(router.receive(VoicePacket {
+            speaker_id: 3,
+            seq: 1,
+            timestamp: 960,
+            flags: FLAG_SPEAKING,
+            payload: vec![3]
+        }));
         // Muting clears buffered packets so unmuting never plays stale audio.
         router.set_muted(3, true);
         router.set_muted(3, false);

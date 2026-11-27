@@ -13,7 +13,7 @@ use crate::asset_store::MESH_VERTEX_FLOATS;
 use crate::matrix::{IDENTITY, multiply};
 use crate::shader::SKIN_VERTEX_BYTES;
 
-const SHADER: &str = include_str!("../shaders/velocity.wgsl");
+const SHADER: &str = crate::wgsl!("velocity.wgsl");
 
 /// Clear value marking pixels without explicit object velocity (sky or idle frame).
 pub(crate) const SENTINEL: f64 = 1024.0;

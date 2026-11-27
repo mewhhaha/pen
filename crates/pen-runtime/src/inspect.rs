@@ -403,12 +403,13 @@ pub fn flame<'a>(stacks: impl IntoIterator<Item = (&'a [u32], u64)>, name: impl 
             *running.entry(top).or_default() += samples;
         }
     }
-    let mut hottest: Vec<(u32, u64)> = running.into_iter().collect();
-    hottest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut hottest: Vec<(u64, u32)> = running.into_iter().map(|(func, samples)| (!samples, func)).collect();
+    crate::sort::sort_u64_u32(&mut hottest);
     hottest.truncate(HOTTEST);
     let named = |function: u32| -> Vec<f32> { code_points(&name(function)).into_iter().take(NAME_LENGTH).collect() };
     let mut values = vec![hottest.len() as f32];
-    for &(function, samples) in &hottest {
+    for &(inv_samples, function) in &hottest {
+        let samples = !inv_samples;
         let name = named(function);
         values.extend([function as f32, samples as f32, name.len() as f32]);
         values.extend(name);
@@ -432,7 +433,7 @@ pub fn flame<'a>(stacks: impl IntoIterator<Item = (&'a [u32], u64)>, name: impl 
             continue;
         }
         let mut callees: Vec<&Call> = call.callees.iter().filter(|callee| callee.samples >= least).collect();
-        callees.sort_by(|a, b| b.samples.cmp(&a.samples).then(a.function.cmp(&b.function)));
+        crate::sort::shell_sort_by(&mut callees, |a, b| b.samples.cmp(&a.samples).then(a.function.cmp(&b.function)));
         // Children from the first on, each starting where the one before ended.
         let mut starts = Vec::with_capacity(callees.len());
         let mut at = first;

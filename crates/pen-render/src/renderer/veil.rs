@@ -7,7 +7,7 @@ use crate::matrix::narrow;
 use crate::shader::PipelineContext;
 
 // Flowing contours and a faceted light, with no assets to load.
-const VEIL_SHADER: &str = include_str!("../shaders/veil.wgsl");
+const VEIL_SHADER: &str = crate::wgsl!("veil.wgsl");
 
 // How long (seconds) the veil waits on loads that bring nothing before it
 // clears anyway.

@@ -4,6 +4,13 @@
 //! among them) and insets, over assets (KTX2 compressed textures among them)
 //! that stream in on loader threads. Natively and in the browser (WebGPU)
 //! alike. See ARCHITECTURE.md for how it works.
+macro_rules! wgsl {
+    ($name:literal) => {
+        include_str!(concat!(env!("OUT_DIR"), "/shaders/", $name))
+    };
+}
+pub(crate) use wgsl;
+
 pub mod animation;
 pub mod area_lights;
 mod asset_store;
@@ -51,11 +58,13 @@ mod renderer;
 pub mod restir;
 pub mod restir_specular;
 mod shader;
+#[cfg(feature = "shader-graph")]
 pub mod shader_graph;
 pub mod sharc;
 #[cfg(feature = "simplify")]
 mod simplify;
 mod solids;
+mod sort;
 mod sprites;
 mod ssgi;
 mod subsurface;
@@ -66,7 +75,7 @@ mod taa;
 #[cfg(test)]
 mod testing;
 mod texture;
-#[cfg(not(all(target_arch = "wasm32", feature = "web-compact")))]
+#[cfg(feature = "texture-recipes")]
 mod texture_recipe;
 pub mod tonemap;
 pub mod video;
@@ -148,6 +157,7 @@ pub use restir::{RESTIR_MAX_LIGHTS, RESTIR_WGSL, RestirInputs, RestirParams, Res
 pub use restir_specular::{
     RESTIR_SPECULAR_WGSL, RestirSpecularInputs, RestirSpecularOutputs, RestirSpecularParams, RestirSpecularRenderer,
 };
+#[cfg(feature = "shader-graph")]
 pub use shader_graph::{
     CompiledShaderGraph, NodeRef, PortType, RampStop, ShaderGraph, ShaderNode, ShaderNodeKind, is_shader_graph_key,
 };
@@ -168,7 +178,7 @@ pub use volume::{TRANSLUCENCY_WGSL, VolumeImage, VolumeLayer};
 /// WGSL a sprite shader adds to draw text from a multi-channel signed
 /// distance field atlas (pen-texture's `msdf`), crisp at any scale:
 /// `msdf_coverage(msdf_median(field.rgb), uv, range, size)`.
-pub const MSDF_WGSL: &str = include_str!("shaders/msdf.wgsl");
+pub const MSDF_WGSL: &str = crate::wgsl!("msdf.wgsl");
 pub use renderer::{
     ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentFoliage, EnvironmentScene,
     EnvironmentTerrain, GPU_PARTICLES_EXT_TAG, GpuParticleScene, JFA_OUTLINE_EXT_TAG, JfaOutlineScene,

@@ -10,7 +10,7 @@ use crate::matrix::{invert, multiply, narrow};
 use crate::post::SCENE_FORMAT;
 use crate::shader::PipelineContext;
 
-const RIBBONS_WGSL: &str = include_str!("../shaders/ribbons.wgsl");
+const RIBBONS_WGSL: &str = crate::wgsl!("ribbons.wgsl");
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

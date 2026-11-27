@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::pipeline_cache::PipelineCache;
 
-const SHADER: &str = include_str!("shaders/mipmaps.wgsl");
+const SHADER: &str = crate::wgsl!("mipmaps.wgsl");
 
 pub(crate) struct Mipmapper {
     cache: PipelineCache,

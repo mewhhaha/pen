@@ -15,7 +15,7 @@ default = ["compiler"]
 compiler = ["wasmtime/cranelift", "wasmtime/incremental-cache", "wasmtime/parallel-compilation", "dep:sha2", "dep:wasm-encoder", "dep:wasmparser"]
 
 [dependencies]
-anyhow.workspace = true
+anyhow = { workspace = true, features = ["std"] }
 # Arrays cross the boundary as little-endian words, which on this machine
 # are its own: copied whole, and their buffers reused.
 bytemuck = { version = "1", features = ["extern_crate_alloc"] }

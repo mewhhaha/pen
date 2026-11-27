@@ -16,15 +16,18 @@ use pen_runtime::abi::{KernelManifest, ValueType, WireSchema, WireSchemaKind};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
-#[wasm_bindgen(raw_module = "./kernels.js")]
+#[wasm_bindgen(raw_module = "./guest.js")]
 extern "C" {
-    #[wasm_bindgen(catch, js_name = compileKernelModule)]
-    fn compile_kernel_module(bytes: &Uint8Array) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(catch, js_name = compileKernelModuleLazy)]
+    fn compile_kernel_module_lazy(bytes: &Uint8Array) -> Result<Promise, JsValue>;
 
+    #[wasm_bindgen(catch, js_name = openKernelPoolLazy)]
+    fn open_kernel_pool_lazy(source: &JsValue, name: &str, config: &JsValue) -> Result<Promise, JsValue>;
+}
+
+#[wasm_bindgen]
+extern "C" {
     type BrowserKernelPool;
-
-    #[wasm_bindgen(static_method_of = BrowserKernelPool, catch)]
-    fn open(source: &JsValue, name: &str, config: &JsValue) -> Result<Promise, JsValue>;
 
     #[wasm_bindgen(method, catch, js_name = setContext)]
     fn set_context(this: &BrowserKernelPool, revision: f64, bytes: &Uint8Array) -> Result<Promise, JsValue>;
@@ -443,12 +446,13 @@ pub struct WebKernelService {
 }
 
 impl WebKernelService {
-    pub fn maybe_new(wasm_bytes: &[u8]) -> Option<Self> {
+    pub async fn maybe_new(wasm_bytes: &[u8]) -> Option<Self> {
         let abi = pen_runtime::abi::read_abi(wasm_bytes).ok()?;
         if abi.kernels.is_empty() {
             return None;
         }
-        let receipt = compile_kernel_module(&Uint8Array::from(wasm_bytes)).ok()?;
+        let promise = compile_kernel_module_lazy(&Uint8Array::from(wasm_bytes)).ok()?;
+        let receipt = JsFuture::from(promise).await.ok()?;
         Some(Self {
             receipt,
             kernels: abi.kernels,
@@ -467,11 +471,14 @@ impl WebKernelService {
         })
     }
 
-    pub fn reload(&mut self, wasm_bytes: &[u8]) {
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
+    pub async fn reload(&mut self, wasm_bytes: &[u8]) {
         self.close_all_pools();
         self.lru.clear();
         if let Ok(abi) = pen_runtime::abi::read_abi(wasm_bytes)
-            && let Ok(receipt) = compile_kernel_module(&Uint8Array::from(wasm_bytes))
+            && !abi.kernels.is_empty()
+            && let Ok(promise) = compile_kernel_module_lazy(&Uint8Array::from(wasm_bytes))
+            && let Ok(receipt) = JsFuture::from(promise).await
         {
             self.receipt = receipt;
             self.kernels = abi.kernels;
@@ -867,7 +874,7 @@ impl WebKernelService {
         let _ = Reflect::set(&config, &"deadlineMs".into(), &JsValue::from(WEB_BATCH_DEADLINE_MS));
         let _ = Reflect::set(&config, &"maxTotalOutputBytes".into(), &JsValue::from((2u32 << 20) as f64));
         let _ = Reflect::set(&config, &"maxPhysicalOutputBytes".into(), &JsValue::from((4u32 << 20) as f64));
-        let promise = BrowserKernelPool::open(&self.receipt, name, &config.into()).map_err(|_| ERR_UNAVAILABLE)?;
+        let promise = open_kernel_pool_lazy(&self.receipt, name, &config.into()).map_err(|_| ERR_UNAVAILABLE)?;
         let value = JsFuture::from(promise).await.map_err(|_| ERR_UNAVAILABLE)?;
         let pool: BrowserKernelPool = value.unchecked_into();
         self.pools.insert(kernel_id, WebPoolSlot { pool, installed_revision: None });

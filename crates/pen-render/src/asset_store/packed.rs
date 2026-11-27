@@ -18,6 +18,7 @@ const VERSION: u8 = 2;
 // Bound allocations before trusting a compressed asset's claimed length.
 const MAX_EXPANDED: usize = 256 * 1024 * 1024;
 
+#[cfg(feature = "mesh-json")]
 pub(super) fn encode_recipe(mesh: &super::Mesh) -> Result<Vec<u8>> {
     ensure!(mesh.lods.len() == 1, "instance recipe meshes cannot have extra LODs");
     let instances = mesh.instances.as_ref().context("missing instance recipe")?;
@@ -43,6 +44,7 @@ pub(super) fn encode_recipe(mesh: &super::Mesh) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(feature = "mesh-json")]
 pub(super) fn decode_recipe(bytes: &[u8]) -> Result<Vec<u8>> {
     ensure!(bytes.len() >= 8, "instance recipe header ends early");
     let length = u32::from_le_bytes(bytes[4..8].try_into()?) as usize;

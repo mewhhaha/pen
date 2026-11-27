@@ -350,7 +350,7 @@ impl SourceMap {
                 column: whole(column)?,
             });
         }
-        segments.sort_by_key(|segment| segment.offset);
+        crate::sort::sort_by_u64_key(&mut segments, |segment| u64::from(segment.offset));
         Ok(SourceMap { sources, segments })
     }
 

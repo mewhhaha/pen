@@ -9,7 +9,7 @@ use wgpu::util::DeviceExt;
 
 use crate::camera_precision::DepthMode;
 
-pub const JFA_OUTLINE_WGSL: &str = include_str!("shaders/jfa_outline.wgsl");
+pub const JFA_OUTLINE_WGSL: &str = crate::wgsl!("jfa_outline.wgsl");
 pub const OUTLINE_STYLE_CAPACITY: usize = 256;
 /// Marks a masked pixel as occluded. The low 16 bits hold the palette index plus
 /// one. A mask value of zero denotes background.
@@ -277,6 +277,7 @@ impl JfaOutlinePass {
         queue.write_buffer(&self.styles, 0, bytemuck::cast_slice(&Self::pack_styles(styles)));
     }
 
+    #[cfg_attr(not(feature = "render-jfa-outline"), allow(dead_code))]
     pub(crate) fn encode_styles(
         &self,
         device: &wgpu::Device,
@@ -362,6 +363,7 @@ impl JfaOutlinePass {
         self.prepare_mesh_mask_inner(device, params, kind, None)
     }
 
+    #[cfg_attr(not(feature = "render-jfa-outline"), allow(dead_code))]
     pub(crate) fn prepare_scene_mask(
         &mut self,
         device: &wgpu::Device,

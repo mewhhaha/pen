@@ -73,6 +73,7 @@ impl Provenance {
     }
 }
 
+#[cfg(feature = "diagnostics")]
 pub(crate) fn read_provenance(values: &[f32], packet_end: usize) -> anyhow::Result<Provenance> {
     anyhow::ensure!(values.len() <= MAX_PROVENANCE_LANES, "provenance payload is too large");
     let bytes: Option<Vec<u8>> =
@@ -84,6 +85,7 @@ pub(crate) fn read_provenance(values: &[f32], packet_end: usize) -> anyhow::Resu
 }
 
 /// Untrusted or ambiguous metadata is ignored when explaining another fault.
+#[cfg(feature = "diagnostics")]
 pub(crate) fn origin(packet: &[f32], start: usize, lane: usize) -> Option<Origin> {
     use crate::boundary::{EXTENSIONS_MARKER, MAX_EXTENSION_LANES, MAX_EXTENSION_TAG, MAX_EXTENSIONS, whole};
     if packet.get(start) != Some(&EXTENSIONS_MARKER) {
@@ -186,6 +188,7 @@ impl Location {
         Self { section: self.section, item: self.item, path: format!("{}.{name}", self.path) }
     }
 
+    #[cfg(feature = "diagnostics")]
     pub(crate) fn index(&self, item: usize) -> Self {
         Self { section: self.section, item: self.item.or(Some(item)), path: format!("{}[{item}]", self.path) }
     }
@@ -205,85 +208,189 @@ impl Location {
             origin: None,
         }
     }
+
+    #[cold]
+    #[inline(never)]
+    fn field_loc(&self, field: &str) -> Self {
+        if field.is_empty() {
+            Self { section: self.section, item: self.item, path: self.path.clone() }
+        } else {
+            self.field(field)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn field_err(&self, field: &str, lane: usize, expected: &str, actual: Actual) -> FrameDiagnostic {
+        if field.is_empty() {
+            self.error(lane, expected, actual)
+        } else {
+            self.field(field).error(lane, expected, actual)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn field_err_owned(&self, field: &str, lane: usize, expected: String, actual: Actual) -> FrameDiagnostic {
+        if field.is_empty() {
+            self.error(lane, expected, actual)
+        } else {
+            self.field(field).error(lane, expected, actual)
+        }
+    }
 }
 
 pub(crate) struct Inspector<'a> {
     pub(crate) packet: &'a [f32],
 }
 
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 impl Inspector<'_> {
-    pub(crate) fn value(&self, at: &Location, lane: usize) -> Check<f32> {
-        self.packet.get(lane).copied().ok_or_else(|| at.error(lane, "a float32 lane", Actual::Missing))
+    #[inline(never)]
+    pub(crate) fn value(&self, at: &Location, field: &str, lane: usize) -> Check<f32> {
+        self.packet.get(lane).copied().ok_or_else(|| at.field_err(field, lane, "a float32 lane", Actual::Missing))
     }
 
-    pub(crate) fn equal(&self, at: &Location, lane: usize, expected: f32) -> Check {
-        let actual = self.value(at, lane)?;
+    #[inline(never)]
+    pub(crate) fn equal(&self, at: &Location, field: &str, lane: usize, expected: f32) -> Check {
+        let actual = self.value(at, field, lane)?;
         if actual != expected {
-            return Err(at.error(lane, expected.to_string(), Actual::Value(actual)));
+            return Err(at.field_err_owned(field, lane, expected.to_string(), Actual::Value(actual)));
         }
         Ok(())
     }
 
-    pub(crate) fn count(&self, at: &Location, lane: usize, maximum: usize) -> Check<usize> {
-        let value = self.value(at, lane)?;
+    #[inline(never)]
+    pub(crate) fn count(&self, at: &Location, field: &str, lane: usize, maximum: usize) -> Check<usize> {
+        let value = self.value(at, field, lane)?;
         if let Some(value) = crate::boundary::whole(value)
             && let Ok(value) = usize::try_from(value)
             && value <= maximum
         {
             return Ok(value);
         }
-        Err(at.error(lane, format!("a whole number in 0..={maximum}"), Actual::Value(value)))
+        Err(at.field_err_owned(field, lane, format!("a whole number in 0..={maximum}"), Actual::Value(value)))
     }
 
-    pub(crate) fn reference(&self, at: &Location, lane: usize, count: usize, required: bool) -> Check {
-        if required && count == 0 {
-            return Err(at.error(lane, "an index in a nonempty catalog", Actual::Value(self.value(at, lane)?)));
+    #[inline(never)]
+    pub(crate) fn min_count(
+        &self,
+        at: &Location,
+        field: &str,
+        lane: usize,
+        min: usize,
+        maximum: usize,
+    ) -> Check<usize> {
+        let value = self.count(at, field, lane, maximum)?;
+        if value < min {
+            return Err(at.field_err_owned(field, lane, format!("at least {min}"), Actual::Value(value as f32)));
         }
-        self.count(at, lane, count.saturating_sub(1)).map(|_| ())
+        Ok(value)
     }
 
-    pub(crate) fn finite(&self, at: &Location, lane: usize) -> Check {
-        let value = self.value(at, lane)?;
+    #[inline(never)]
+    pub(crate) fn reference(&self, at: &Location, field: &str, lane: usize, count: usize, required: bool) -> Check {
+        if required && count == 0 {
+            return Err(at.field_err(
+                field,
+                lane,
+                "an index in a nonempty catalog",
+                Actual::Value(self.value(at, field, lane)?),
+            ));
+        }
+        self.count(at, field, lane, count.saturating_sub(1)).map(|_| ())
+    }
+
+    #[inline(never)]
+    pub(crate) fn finite(&self, at: &Location, field: &str, lane: usize) -> Check {
+        let value = self.value(at, field, lane)?;
         if !value.is_finite() {
-            return Err(at.error(lane, "a finite float32", Actual::Value(value)));
+            return Err(at.field_err(field, lane, "a finite float32", Actual::Value(value)));
         }
         Ok(())
     }
 
     /// A vector uses component names, other runs use zero-based lane indices.
-    pub(crate) fn values(&self, at: &Location, first: usize, count: usize, components: &[&str]) -> Check {
-        let end =
-            first.checked_add(count).ok_or_else(|| at.error(first, "a bounded lane range", Actual::Length(count)))?;
+    #[inline(never)]
+    pub(crate) fn values(&self, at: &Location, field: &str, first: usize, count: usize, components: &[&str]) -> Check {
+        let end = first
+            .checked_add(count)
+            .ok_or_else(|| at.field_err(field, first, "a bounded lane range", Actual::Length(count)))?;
         let available = self.packet.get(first..end.min(self.packet.len())).unwrap_or_default();
         if let Some(index) = available.iter().position(|value| !value.is_finite()) {
-            let at = components.get(index).map_or_else(|| at.element(index), |name| at.field(name));
-            return self.finite(&at, first + index);
+            let base = at.field_loc(field);
+            let loc = components.get(index).map_or_else(|| base.element(index), |name| base.field(name));
+            return self.finite(&loc, "", first + index);
         }
         if end > self.packet.len() {
             let index = self.packet.len().saturating_sub(first);
-            let at = components.get(index).map_or_else(|| at.element(index), |name| at.field(name));
-            return Err(at.error(first + index, "a finite float32", Actual::Missing));
+            let base = at.field_loc(field);
+            let loc = components.get(index).map_or_else(|| base.element(index), |name| base.field(name));
+            return Err(loc.error(first + index, "a finite float32", Actual::Missing));
         }
         Ok(())
     }
 
-    pub(crate) fn end(&self, at: &Location, first: usize, count: usize, width: usize) -> Check<usize> {
+    #[inline(never)]
+    pub(crate) fn optional(&self, at: &Location, field: &str, lane: usize, size: usize) -> Check {
+        let count = self.count(at, field, lane, size).map_err(|mut err| {
+            err.path.push_str(".count");
+            err
+        })?;
+        if count != 0 && count != size {
+            let base = at.field_loc(field);
+            return Err(base.field_err_owned("count", lane, format!("0 or {size}"), Actual::Value(count as f32)));
+        }
+        self.values(at, field, lane + 1, size, &[])
+    }
+
+    #[inline(never)]
+    pub(crate) fn tail(
+        &self,
+        at: &Location,
+        field: &str,
+        lane: usize,
+        maximum: usize,
+        unit: usize,
+        extras_cursor: &mut usize,
+    ) -> Check {
+        let count = self.count(at, field, lane, maximum)?;
+        let end = self.end(at, field, *extras_cursor, count, unit)?;
+        self.values(at, field, *extras_cursor, end - *extras_cursor, &[])?;
+        *extras_cursor = end;
+        Ok(())
+    }
+
+    #[inline(never)]
+    pub(crate) fn end(&self, at: &Location, field: &str, first: usize, count: usize, width: usize) -> Check<usize> {
         count
             .checked_mul(width)
             .and_then(|length| first.checked_add(length))
-            .ok_or_else(|| at.error(first, "a bounded lane range", Actual::Length(count)))
+            .ok_or_else(|| at.field_err(field, first, "a bounded lane range", Actual::Length(count)))
     }
 
-    pub(crate) fn within(&self, at: &Location, first: usize, end: usize, limit: usize) -> Check {
+    #[inline(never)]
+    pub(crate) fn within(&self, at: &Location, field: &str, first: usize, end: usize, limit: usize) -> Check {
         if end > limit {
-            return Err(at.error(first, format!("a record ending by lane {limit}"), Actual::Length(end - first)));
+            return Err(at.field_err_owned(
+                field,
+                first,
+                format!("a record ending by lane {limit}"),
+                Actual::Length(end - first),
+            ));
         }
         Ok(())
     }
 
-    pub(crate) fn exhausted(&self, at: &Location, end: usize, expected: usize) -> Check {
+    #[inline(never)]
+    pub(crate) fn exhausted(&self, at: &Location, field: &str, end: usize, expected: usize) -> Check {
         if end != expected {
-            return Err(at.error(end.min(expected), format!("section ending at lane {expected}"), Actual::Length(end)));
+            return Err(at.field_err_owned(
+                field,
+                end.min(expected),
+                format!("section ending at lane {expected}"),
+                Actual::Length(end),
+            ));
         }
         Ok(())
     }

@@ -11,7 +11,7 @@ use crate::ray_tracing::TLAS_TRAVERSAL_HW_WGSL;
 use crate::ray_tracing::{RtLocalLight, TLAS_TRAVERSAL_WGSL, TlasSceneGpu, device_supports_hardware_ray_query};
 use crate::sharc::{SHARC_COMMON_WGSL, SharcCache};
 
-pub const RESTIR_WGSL: &str = include_str!("shaders/restir.wgsl");
+pub const RESTIR_WGSL: &str = crate::wgsl!("restir.wgsl");
 pub const RESTIR_MAX_LIGHTS: usize = 256;
 
 const RESTIR_SHARC_DECLS_WGSL: &str = r"

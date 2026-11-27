@@ -1,3 +1,4 @@
+#![cfg_attr(not(all(feature = "render-atmosphere", feature = "render-env")), allow(unused_imports, dead_code))]
 use super::super::State;
 use super::{ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, WiredPasses};
 use crate::atmosphere_lut::{
@@ -14,12 +15,14 @@ use anyhow::Result;
 use pen_protocol::{Matrix, RenderFrame};
 use std::hash::{Hash, Hasher};
 
+#[cfg(feature = "render-env")]
 pub(in crate::renderer) struct EnvPipelines {
     pub terrain: TerrainPipeline,
     pub water: WaterPipeline,
     pub foliage: FoliagePipeline,
 }
 
+#[cfg(feature = "render-env")]
 impl EnvPipelines {
     fn new(device: &wgpu::Device, samples: u32, depth_mode: DepthMode) -> Self {
         let target = match depth_mode {
@@ -44,6 +47,18 @@ impl EnvPipelines {
 impl State {
     /// Ensures physical atmosphere LUTs & optional cloud target exist before `Post::begin`
     /// builds the pass graph, returning their views and generation key for `BuiltIn::Atmosphere`.
+    #[cfg(not(feature = "render-atmosphere"))]
+    pub(in crate::renderer) fn prepare_physical_sky(
+        &mut self,
+        _frame: &RenderFrame,
+        _scene_size: (u32, u32),
+    ) -> Result<Option<PhysicalSkyBinding>> {
+        Ok(None)
+    }
+
+    /// Ensures physical atmosphere LUTs & optional cloud target exist before `Post::begin`
+    /// builds the pass graph, returning their views and generation key for `BuiltIn::Atmosphere`.
+    #[cfg(feature = "render-atmosphere")]
     pub(in crate::renderer) fn prepare_physical_sky(
         &mut self,
         frame: &RenderFrame,
@@ -77,6 +92,20 @@ impl State {
 
     /// Updates Hillaire physical atmosphere LUTs & volumetric clouds when `quality.physical_sky` is on.
     /// Uses the active (potentially TAA-jittered) projection and unified world-meters-to-km camera coordinates.
+    #[cfg(not(feature = "render-atmosphere"))]
+    pub(in crate::renderer) fn encode_physical_sky(
+        &mut self,
+        _encoder: &mut wgpu::CommandEncoder,
+        _frame: &RenderFrame,
+        _active_projection: &Matrix,
+        _scene_size: (u32, u32),
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Updates Hillaire physical atmosphere LUTs & volumetric clouds when `quality.physical_sky` is on.
+    /// Uses the active (potentially TAA-jittered) projection and unified world-meters-to-km camera coordinates.
+    #[cfg(feature = "render-atmosphere")]
     pub(in crate::renderer) fn encode_physical_sky(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -125,6 +154,24 @@ impl State {
 
     /// Encodes outdoor GPU environment passes (CDLOD terrain, Gerstner water, GPU foliage)
     /// driven by either [`Renderer::set_environment_scene`] or optional Blot `RenderFrame::extensions`.
+    #[cfg(not(feature = "render-env"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_environment_passes(
+        _wired: &mut WiredPasses,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _pass: &mut wgpu::RenderPass<'_>,
+        _frame: &RenderFrame,
+        _active_proj: &Matrix,
+        _samples: u32,
+        _depth_mode: DepthMode,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Encodes outdoor GPU environment passes (CDLOD terrain, Gerstner water, GPU foliage)
+    /// driven by either [`Renderer::set_environment_scene`] or optional Blot `RenderFrame::extensions`.
+    #[cfg(feature = "render-env")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_environment_passes(
         wired: &mut WiredPasses,

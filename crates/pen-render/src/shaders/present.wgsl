@@ -102,25 +102,23 @@ fn easu_sample_source(uv: vec2f) -> vec3f {
   let fp = vec2i(floor(pp_full));
   let pp = pp_full - vec2f(fp);
 
-  let b = easu_load(fp + vec2i(0, -1), last);
-  let c = easu_load(fp + vec2i(1, -1), last);
-  let e = easu_load(fp + vec2i(-1, 0), last);
-  let f = easu_load(fp + vec2i(0, 0), last);
-  let g = easu_load(fp + vec2i(1, 0), last);
-  let h = easu_load(fp + vec2i(2, 0), last);
-  let i = easu_load(fp + vec2i(-1, 1), last);
-  let j = easu_load(fp + vec2i(0, 1), last);
-  let k = easu_load(fp + vec2i(1, 1), last);
-  let l = easu_load(fp + vec2i(2, 1), last);
-  let n = easu_load(fp + vec2i(0, 2), last);
-  let o = easu_load(fp + vec2i(1, 2), last);
+  var offsets = array<vec2i, 12>(
+    vec2i(0, -1), vec2i(1, -1),
+    vec2i(-1, 0), vec2i(0, 0), vec2i(1, 0), vec2i(2, 0),
+    vec2i(-1, 1), vec2i(0, 1), vec2i(1, 1), vec2i(2, 1),
+    vec2i(0, 2), vec2i(1, 2),
+  );
+  var c: array<vec3f, 12>;
+  for (var k = 0u; k < 12u; k++) {
+    c[k] = easu_load(fp + offsets[k], last);
+  }
 
   var dir = vec2f(0.0);
   var aniso = 0.0;
-  easu_dir_set(&dir, &aniso, (1.0 - pp.x) * (1.0 - pp.y), easu_luma(b), easu_luma(e), easu_luma(f), easu_luma(g), easu_luma(j));
-  easu_dir_set(&dir, &aniso, pp.x * (1.0 - pp.y), easu_luma(c), easu_luma(f), easu_luma(g), easu_luma(h), easu_luma(k));
-  easu_dir_set(&dir, &aniso, (1.0 - pp.x) * pp.y, easu_luma(f), easu_luma(i), easu_luma(j), easu_luma(k), easu_luma(n));
-  easu_dir_set(&dir, &aniso, pp.x * pp.y, easu_luma(g), easu_luma(j), easu_luma(k), easu_luma(l), easu_luma(o));
+  easu_dir_set(&dir, &aniso, (1.0 - pp.x) * (1.0 - pp.y), easu_luma(c[0]), easu_luma(c[2]), easu_luma(c[3]), easu_luma(c[4]), easu_luma(c[7]));
+  easu_dir_set(&dir, &aniso, pp.x * (1.0 - pp.y), easu_luma(c[1]), easu_luma(c[3]), easu_luma(c[4]), easu_luma(c[5]), easu_luma(c[8]));
+  easu_dir_set(&dir, &aniso, (1.0 - pp.x) * pp.y, easu_luma(c[3]), easu_luma(c[6]), easu_luma(c[7]), easu_luma(c[8]), easu_luma(c[10]));
+  easu_dir_set(&dir, &aniso, pp.x * pp.y, easu_luma(c[4]), easu_luma(c[7]), easu_luma(c[8]), easu_luma(c[9]), easu_luma(c[11]));
 
   let dir2 = dot(dir, dir);
   dir = select(dir * inverseSqrt(max(dir2, 1e-6)), vec2f(1.0, 0.0), dir2 < 1e-6);
@@ -134,21 +132,12 @@ fn easu_sample_source(uv: vec2f) -> vec3f {
 
   var ac = vec3f(0.0);
   var aw = 0.0;
-  easu_tap(&ac, &aw, vec2f(0.0, -1.0) - pp, dir, len_scale, lob, clmp, b);
-  easu_tap(&ac, &aw, vec2f(1.0, -1.0) - pp, dir, len_scale, lob, clmp, c);
-  easu_tap(&ac, &aw, vec2f(-1.0, 0.0) - pp, dir, len_scale, lob, clmp, e);
-  easu_tap(&ac, &aw, vec2f(0.0, 0.0) - pp, dir, len_scale, lob, clmp, f);
-  easu_tap(&ac, &aw, vec2f(1.0, 0.0) - pp, dir, len_scale, lob, clmp, g);
-  easu_tap(&ac, &aw, vec2f(2.0, 0.0) - pp, dir, len_scale, lob, clmp, h);
-  easu_tap(&ac, &aw, vec2f(-1.0, 1.0) - pp, dir, len_scale, lob, clmp, i);
-  easu_tap(&ac, &aw, vec2f(0.0, 1.0) - pp, dir, len_scale, lob, clmp, j);
-  easu_tap(&ac, &aw, vec2f(1.0, 1.0) - pp, dir, len_scale, lob, clmp, k);
-  easu_tap(&ac, &aw, vec2f(2.0, 1.0) - pp, dir, len_scale, lob, clmp, l);
-  easu_tap(&ac, &aw, vec2f(0.0, 2.0) - pp, dir, len_scale, lob, clmp, n);
-  easu_tap(&ac, &aw, vec2f(1.0, 2.0) - pp, dir, len_scale, lob, clmp, o);
+  for (var k = 0u; k < 12u; k++) {
+    easu_tap(&ac, &aw, vec2f(offsets[k]) - pp, dir, len_scale, lob, clmp, c[k]);
+  }
 
-  let mn4 = min(min(f, g), min(j, k));
-  let mx4 = max(max(f, g), max(j, k));
+  let mn4 = min(min(c[3], c[4]), min(c[7], c[8]));
+  let mx4 = max(max(c[3], c[4]), max(c[7], c[8]));
   return easu_decompress(clamp(ac / max(aw, 1e-5), mn4, mx4));
 }
 
@@ -226,12 +215,18 @@ fn shade(uv: vec2f) -> vec3f {
     return vec4f(base, 1.0);
   }
   var red = base.r;
-  if (marked(uv - split)) {
-    red = shade(uv - split).r;
-  }
   var blue = base.b;
-  if (marked(uv + split)) {
-    blue = shade(uv + split).b;
+  for (var channel = 0u; channel < 2u; channel++) {
+    let offset = select(split, -split, channel == 0u);
+    let sample_uv = uv + offset;
+    if (marked(sample_uv)) {
+      let sample_rgb = fetch(sample_uv);
+      if (channel == 0u) {
+        red = sample_rgb.r;
+      } else {
+        blue = sample_rgb.b;
+      }
+    }
   }
   return vec4f(red, base.g, blue, 1.0);
 }

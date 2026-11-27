@@ -379,7 +379,7 @@ impl Devtools {
                         return Answer::unavailable();
                     };
                     let mut tuned: Vec<(u32, f32)> = tuned.into_iter().collect();
-                    tuned.sort_by_key(|(id, _)| *id);
+                    crate::sort::sort_by_u64_key(&mut tuned, |&(id, _)| u64::from(id));
                     let values = tuned.into_iter().flat_map(|(id, value)| [id as f32, value]).collect();
                     Answer { values, ..Answer::ok(0.0) }
                 }

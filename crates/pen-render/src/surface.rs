@@ -11,16 +11,16 @@
 /// WGSL a material shader adds first to use the standard surface: the
 /// `StandardSurface`, its lobes (clear coat, sheen, anisotropy, subsurface,
 /// transmission's maths), `surface_light`, `standard_sun`, and `parallax_uv`.
-pub const SURFACE_LOBES_WGSL: &str = include_str!("shaders/surface_lobes.wgsl");
+pub const SURFACE_LOBES_WGSL: &str = crate::wgsl!("surface_lobes.wgsl");
 
 /// WGSL that lights a `StandardSurface` with the sky and the frame's lights:
 /// `standard_surface`, and `surface_ambient` and `clustered_surface`. It needs
 /// `SURFACE_LOBES_WGSL`, `ENVIRONMENT_WGSL` and `LIGHTS_WGSL`.
-pub const SURFACE_WGSL: &str = include_str!("shaders/surface.wgsl");
+pub const SURFACE_WGSL: &str = crate::wgsl!("surface.wgsl");
 
 /// WGSL that reads the picture behind a transmissive surface:
 /// `surface_transmit`. It needs the two above and the translucency library.
-pub const SURFACE_TRANSMISSION_WGSL: &str = include_str!("shaders/surface_transmission.wgsl");
+pub const SURFACE_TRANSMISSION_WGSL: &str = crate::wgsl!("surface_transmission.wgsl");
 
 #[cfg(test)]
 mod compat;

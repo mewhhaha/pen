@@ -9,5 +9,5 @@ description = "Deterministic noise service shared by both hosts"
 workspace = true
 
 [dependencies]
-pen-protocol.workspace = true
-pen-runtime.workspace = true
+pen-protocol = { workspace = true, default-features = false }
+pen-runtime = { workspace = true, default-features = false }

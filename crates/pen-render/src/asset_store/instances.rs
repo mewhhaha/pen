@@ -1,5 +1,6 @@
 //! Persistent instance records belong to the mesh asset, not a frame packet.
 use anyhow::{Context, Result, ensure};
+#[cfg(feature = "mesh-json")]
 use serde::Deserialize;
 
 use super::Mesh;
@@ -8,20 +9,22 @@ use crate::culling::Sphere;
 
 /// Five vec4s at shader locations 3..7. Their meaning belongs to the shader.
 /// Bounds enclose all instances in mesh space, before shader deformation.
-#[derive(Deserialize)]
+#[cfg_attr(feature = "mesh-json", derive(Deserialize))]
 pub(crate) struct MeshInstances {
-    #[serde(default)]
+    #[cfg_attr(feature = "mesh-json", serde(default))]
     pub data: Vec<f32>,
+    #[cfg(feature = "mesh-json")]
     #[serde(default)]
     pub(super) recipe: Option<Box<super::recipe::Recipe>>,
     /// JSON records can use fixed-point integers. Bounds stay in mesh units;
     /// binary files and GPU records always contain the expanded values.
-    #[serde(default = "unit_scale")]
+    #[cfg_attr(feature = "mesh-json", serde(default = "unit_scale"))]
     pub scale: f32,
     pub min: [f32; 3],
     pub max: [f32; 3],
 }
 
+#[cfg(feature = "mesh-json")]
 fn unit_scale() -> f32 {
     1.0
 }
@@ -44,13 +47,21 @@ impl MeshInstances {
             |bytes: &[u8]| bytes.as_chunks::<4>().0.iter().map(|&value| f32::from_le_bytes(value)).collect::<Vec<_>>();
         let bounds = values(&bytes[layout.bounds.clone()]);
         let data = values(&bytes[layout.records.range()]);
-        Ok(Self { min: bounds[..3].try_into()?, max: bounds[3..].try_into()?, data, scale: 1.0, recipe: None })
+        Ok(Self {
+            min: bounds[..3].try_into()?,
+            max: bounds[3..].try_into()?,
+            data,
+            scale: 1.0,
+            #[cfg(feature = "mesh-json")]
+            recipe: None,
+        })
     }
 }
 
 impl Mesh {
     pub(super) fn set_instances(&mut self, mut instances: Option<MeshInstances>) -> Result<()> {
         if let Some(instances) = &mut instances {
+            #[cfg(feature = "mesh-json")]
             if let Some(recipe) = &instances.recipe {
                 ensure!(
                     instances.data.is_empty() && instances.scale == 1.0,

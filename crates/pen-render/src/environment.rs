@@ -19,10 +19,10 @@ pub(crate) use reflection_probes::{CaptureTargets, ReflectionProbes, Step, box_v
 /// WGSL a material shader adds to light with the sky: `ambient_light(world,
 /// normal)`, `sky_reflection(world, normal, view, roughness, f0)`,
 /// `surface_ambient` and `specular_occlusion`.
-pub const ENVIRONMENT_WGSL: &str = include_str!("shaders/environment.wgsl");
+pub const ENVIRONMENT_WGSL: &str = crate::wgsl!("environment.wgsl");
 
-const PREFILTER: &str = include_str!("shaders/environment_prefilter.wgsl");
-const TABLE_SHADER: &str = include_str!("shaders/environment_table.wgsl");
+const PREFILTER: &str = crate::wgsl!("environment_prefilter.wgsl");
+const TABLE_SHADER: &str = crate::wgsl!("environment_table.wgsl");
 
 /// A face's width in texels, and the levels down to two texels; level `n`
 /// holds roughness `n / (LEVELS - 1)`.
@@ -363,17 +363,20 @@ impl Environment {
 
     /// Storage buffer bound at `@group(0) @binding(8)` (`probe_data`), reused by live GPU DDGI
     /// cascade packing when `quality.ddgi` is active so forward PBR shaders need zero extra textures.
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub(crate) fn probe_data_buffer(&self) -> &wgpu::Buffer {
         &self.probe_data
     }
 
     /// Capacity of `probe_data` in `vec4f` elements.
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub(crate) fn probe_data_capacity_vec4s(&self) -> u32 {
         u32::try_from(PROBE_BYTES / 16).expect("probe_data capacity fits in u32")
     }
 
     /// Switches `sky_light.probe_counts.w` into live GPU DDGI mode (`2.0`) for the current frame
     /// (invalidating any cached CPU SH probe resident tag so turning DDGI off cleanly re-uploads SH probes).
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub(crate) fn set_ddgi_active(&mut self, queue: &wgpu::Queue, active: bool) {
         if active {
             self.resident = None;
@@ -1358,7 +1361,7 @@ fn direction_at(pixel: vec2f) -> vec3f {{
     /// At most four probes with a weight count.
     fn coverage_of(probes: &[ReflectionProbe], world: [f64; 3]) -> f64 {
         let mut order: Vec<&ReflectionProbe> = probes.iter().collect();
-        order.sort_by_key(|probe| (std::cmp::Reverse(probe.priority), probe.id));
+        crate::sort::insertion_sort_by(&mut order, |a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
         let (mut remaining, mut missed, mut weight, mut priority, mut used) = (1.0, 1.0, 0.0, None, 0);
         for probe in order {
             let w = weight_of(probe, world);

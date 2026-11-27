@@ -104,7 +104,7 @@ fn normal(tag: &str) -> String {
 impl Locales {
     /// The base table in `base_language`, and translations by tag.
     pub fn new(base: Table, base_language: &str, mut tables: Vec<(String, Table)>) -> Locales {
-        tables.sort_by(|(one, _), (other, _)| one.cmp(other));
+        crate::sort::insertion_sort_by(&mut tables, |(one, _), (other, _)| one.cmp(other));
         Locales { base, base_language: base_language.to_owned(), tables }
     }
 

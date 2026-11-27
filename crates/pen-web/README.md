@@ -5,11 +5,17 @@ platform services, IndexedDB saves and the game's Blot dev tools, drawn through
 `pen-render` on WebGPU. A browser without WebGPU cannot run the game: the
 page says so.
 
-`pen build --web --web-compact` uses the compact browser host for static
-single-player games. It leaves out development reload, the dev tools
-program, netplay, video textures, GTEX texture recipes and the qualification
-API. Build it locally with `./build.sh OUTPUT --compact`. The release bundle
-contains both hosts.
+`pen build --web --web-compact` ships a smaller browser host for static
+single-player games (omitting development reload, dev tools, netplay, video
+textures, replay recording, runtime mesh/texture/shader recipes, and software
+RT). When building from a source checkout without `PEN_WEB_COMPACT_HOST`, it
+automatically inspects `game.wasm`, `game.json`, and shipped assets to build a
+tailored host containing only the subsystems the game uses, and `--web-features
+LIST` selects an exact feature set manually. All `pen build --web` exports omit
+`structured.js` and `kernels.js`/`kernel_worker.js` when unused. Build the
+general compact host locally with `./build.sh OUTPUT --compact`, or a tailored
+host with `./build.sh OUTPUT --features LIST`. The release bundle contains both
+the full and general compact hosts.
 
 `pen-runtime` contains what native pen and the browser share: request
 validation and the frame protocol, the guest ABI manifest, transactional

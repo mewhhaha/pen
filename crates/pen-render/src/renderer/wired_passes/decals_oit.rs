@@ -1,3 +1,4 @@
+#![cfg_attr(not(all(feature = "render-pbr-decals", feature = "render-oit")), allow(unused_imports, dead_code))]
 use super::super::{GpuAsset, Scratch, State, TextureRef};
 use super::WiredPasses;
 use crate::asset_store::AssetKind;
@@ -80,6 +81,18 @@ impl State {
 
     /// Resolves PBR decal materials/textures ahead of constructing `Drawing` so the render pass
     /// can borrow `self.wired` disjointly from `self.assets`.
+    #[cfg(not(feature = "render-pbr-decals"))]
+    pub(in crate::renderer) fn prepare_pbr_decals(
+        &mut self,
+        _frame: &RenderFrame,
+        _catalog: &Catalog,
+    ) -> Result<Vec<super::PreparedPbrDecalBatch>> {
+        Ok(Vec::new())
+    }
+
+    /// Resolves PBR decal materials/textures ahead of constructing `Drawing` so the render pass
+    /// can borrow `self.wired` disjointly from `self.assets`.
+    #[cfg(feature = "render-pbr-decals")]
     pub(in crate::renderer) fn prepare_pbr_decals(
         &mut self,
         frame: &RenderFrame,
@@ -132,6 +145,27 @@ impl State {
     }
 
     /// Encodes prepared PBR decal batches via `PbrDecalPass` onto the opaque HDR scene target.
+    #[cfg(not(feature = "render-pbr-decals"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_pbr_decals_prepared(
+        _wired: &mut WiredPasses,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _encoder: &mut wgpu::CommandEncoder,
+        _frame: &RenderFrame,
+        _batches: &[PreparedPbrDecalBatch],
+        _color_attachment: wgpu::RenderPassColorAttachment<'_>,
+        _depth_view: &wgpu::TextureView,
+        _depth_only: &wgpu::TextureView,
+        _samples: u32,
+        _scene_size: (u32, u32),
+        _depth_mode: DepthMode,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Encodes prepared PBR decal batches via `PbrDecalPass` onto the opaque HDR scene target.
+    #[cfg(feature = "render-pbr-decals")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_pbr_decals_prepared(
         wired: &mut WiredPasses,
@@ -200,6 +234,19 @@ impl State {
 
     /// Prepares (lazily compiling and caching) WBOIT render pipelines for every translucent entry
     /// when `frame.quality.oit` is enabled.
+    #[cfg(not(feature = "render-oit"))]
+    pub(in crate::renderer) fn prepare_oit_pipelines(
+        &mut self,
+        _frame: &RenderFrame,
+        _scratch: &Scratch,
+        _samples: u32,
+    ) -> Vec<Option<wgpu::RenderPipeline>> {
+        Vec::new()
+    }
+
+    /// Prepares (lazily compiling and caching) WBOIT render pipelines for every translucent entry
+    /// when `frame.quality.oit` is enabled.
+    #[cfg(feature = "render-oit")]
     pub(in crate::renderer) fn prepare_oit_pipelines(
         &mut self,
         frame: &RenderFrame,

@@ -296,6 +296,7 @@ pub fn hash_render_packet(packet: &[f32]) -> u64 {
 /// FNV-1a over a resolved retained frame so a live retained delta and a
 /// post-restore retained reset that produce the exact same scene hash identically,
 /// while preserving `exposure.cut` normalization and ephemeral `service::KERNEL` filtering.
+#[cfg(any(feature = "replay", feature = "semantic", feature = "netplay", not(target_arch = "wasm32")))]
 fn hash_resolved_frame(frame: &mut RenderFrame, schema: u32) -> u64 {
     let saved_cut = frame.exposure.cut;
     frame.exposure.cut = false;
@@ -574,6 +575,7 @@ impl<B: Backend> GameRuntime<B> {
         self.active.instances.commit(undo);
         self.active.accept();
         self.snapshot = None;
+        #[cfg(any(feature = "replay", feature = "semantic", feature = "netplay", not(target_arch = "wasm32")))]
         if self.hashing {
             self.packet_hash = if was_retained {
                 hash_resolved_frame(&mut frame, self.active.schema)
@@ -581,6 +583,8 @@ impl<B: Backend> GameRuntime<B> {
                 hash_render_packet(&packet)
             };
         }
+        #[cfg(not(any(feature = "replay", feature = "semantic", feature = "netplay", not(target_arch = "wasm32"))))]
+        let _ = was_retained;
         self.packet_lanes = packet.len();
         if self.keeping {
             self.received = Some(frame.clone());

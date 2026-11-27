@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-meshlets"), allow(unused_imports, dead_code))]
 use super::super::{GpuAsset, MeshletIndirectSlot, Scratch, Shape, Source, State, hiz, timing};
 use super::{DagLodSettings, NANITE_EXT_TAG, OutlineScenes, PlannedDagDraw, PlannedMeshletDraw, WiredPasses, outlined};
 use crate::camera_precision::DepthMode;
@@ -55,6 +56,30 @@ impl State {
     /// screen-space error LOD cut selection for opaque LOD0 mesh draws.
     /// When prior-frame Hi-Z is active and matches `depth_mode`, records `phase2_flags` so Phase 2
     /// can recover newly disoccluded clusters on the exact same frame (0-frame lag).
+    #[cfg(not(feature = "render-meshlets"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_meshlet_culling_phase1(
+        &mut self,
+        _device: &wgpu::Device,
+        _encoder: &mut wgpu::CommandEncoder,
+        _frame: &RenderFrame,
+        _scratch: &mut Scratch,
+        _outline_scenes: &OutlineScenes,
+        _active_proj: &Matrix,
+        _viewport_height: f32,
+        _depth_mode: DepthMode,
+    ) -> Result<()> {
+        self.wired.last_meshlet_cull_draws = 0;
+        self.wired.last_meshlet_dag_draws = 0;
+        self.wired.meshlet_phase1_used_hiz = false;
+        self.wired.dag_phase1_used_hiz = false;
+        self.wired.last_meshlet_phase2_active = false;
+        self.wired.meshlet_plan.clear();
+        self.wired.dag_plan.clear();
+        Ok(())
+    }
+
+    #[cfg(feature = "render-meshlets")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_meshlet_culling_phase1(
         &mut self,
@@ -325,6 +350,27 @@ impl State {
     /// Phase 2 of two-phase GPU meshlet and continuous DAG occlusion culling: re-tests ONLY
     /// `phase2_flags == 1` candidates against the fresh current-frame Hi-Z built from Phase 1
     /// opaque depth so newly disoccluded clusters render in the exact same frame with zero overlap.
+    #[cfg(not(feature = "render-meshlets"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_meshlet_culling_phase2(
+        _wired: &mut WiredPasses,
+        _hiz: &hiz::HiZ,
+        _assets: &crate::asset_store::AssetStore<GpuAsset>,
+        _meshlet_indirect: &[MeshletIndirectSlot],
+        _meshlet_dag_outputs: &[MeshletDagTwoPhaseOutput],
+        _timer: &timing::GpuTimer,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _encoder: &mut wgpu::CommandEncoder,
+        _frame: &RenderFrame,
+        _active_proj: &Matrix,
+        _viewport_height: f32,
+        _depth_mode: DepthMode,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "render-meshlets")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_meshlet_culling_phase2(
         wired: &mut WiredPasses,
@@ -455,11 +501,16 @@ mod tests {
         let plain = RenderFrame::default();
         assert_eq!(resolve_nanite_override(&plain, defaults), (true, true, 1.5));
 
-        let off = RenderFrame { extensions: vec![Extension { tag: NANITE_EXT_TAG, values: vec![0.0] }], ..Default::default() };
+        let off = RenderFrame {
+            extensions: vec![Extension { tag: NANITE_EXT_TAG, values: vec![0.0] }],
+            ..Default::default()
+        };
         assert_eq!(resolve_nanite_override(&off, defaults), (false, false, 1.5));
 
-        let meshlets_only =
-            RenderFrame { extensions: vec![Extension { tag: NANITE_EXT_TAG, values: vec![1.0] }], ..Default::default() };
+        let meshlets_only = RenderFrame {
+            extensions: vec![Extension { tag: NANITE_EXT_TAG, values: vec![1.0] }],
+            ..Default::default()
+        };
         assert_eq!(resolve_nanite_override(&meshlets_only, defaults), (true, false, 1.5));
 
         let dag_quality = RenderFrame {

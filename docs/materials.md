@@ -406,6 +406,11 @@ an instance's below, so the tangent does not sit among them.
   UI/insets and accessibility color filters retain their usual order. Target
   textures are reused across frames; with no active filters, no extra pass or
   target allocation occurs. Standalone overlays/loading do not run scene filters.
+- A translucent mesh material with `"scene_filter": true` runs before ordinary
+  translucency, in draw order. Binding 14 reads the resolved HDR scene for the
+  first filter and the preceding filter's result for each subsequent filter.
+  Binding 15 keeps the original opaque depth. A filter sees a single color mip
+  after the first pass.
 
 Projections map depth into WebGPU's 0 to 1. pen compiles only the pipelines
 the loaded materials draw with, on background threads; a shader that does

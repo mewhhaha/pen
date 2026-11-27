@@ -502,6 +502,7 @@ impl Audio {
         }
         &self.buses[index - 1]
     }
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     pub fn reload(&mut self) {
         self.clips.borrow_mut().clear();
         self.loading.clear();
@@ -568,13 +569,19 @@ impl Audio {
             let result = async {
                 let bytes = crate::fetch(&path).await?;
                 if path.ends_with(".sound") {
-                    let recipe = pen_runtime::sound_recipe::Recipe::parse(&bytes)?;
-                    let samples = recipe.render()?;
-                    let buffer =
-                        context.create_buffer(1, u32::try_from(samples.len())?, recipe.rate as f32).map_err(error)?;
-                    buffer.copy_to_channel(&samples, 0).map_err(error)?;
-                    clips.borrow_mut().insert(id, Loaded::Buffer(buffer));
-                    return Ok(());
+                    #[cfg(feature = "sound-recipes")]
+                    {
+                        let recipe = pen_runtime::sound_recipe::Recipe::parse(&bytes)?;
+                        let samples = recipe.render()?;
+                        let buffer = context
+                            .create_buffer(1, u32::try_from(samples.len())?, recipe.rate as f32)
+                            .map_err(error)?;
+                        buffer.copy_to_channel(&samples, 0).map_err(error)?;
+                        clips.borrow_mut().insert(id, Loaded::Buffer(buffer));
+                        return Ok(());
+                    }
+                    #[cfg(not(feature = "sound-recipes"))]
+                    anyhow::bail!("use a host built with sound-recipes for .sound assets");
                 }
                 if pen_runtime::clip::streams(&bytes) {
                     clips.borrow_mut().insert(id, streamed(&bytes)?);
@@ -1143,6 +1150,7 @@ fn latency_hint() -> Option<wasm_bindgen::JsValue> {
 impl Audio {
     /// The mix as it plays, for the dev tools: how late the output is (the
     /// context's base and output latency), and each bus's meters.
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     pub fn report(&self) -> Option<AudioReport> {
         let context = self.context.as_ref()?;
         let seconds = |name: &str| js_sys::Reflect::get(context, &name.into()).ok().and_then(|value| value.as_f64());
@@ -1175,13 +1183,14 @@ impl Audio {
     }
     /// The developer mutes (`mute`) or solos bus `bus`, or stops, from the
     /// next frame on; false without sound.
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     pub fn monitor(&mut self, bus: usize, mute: bool, on: bool) -> bool {
         self.monitor.set(bus, mute, on);
         self.context.is_some()
     }
 }
 
-#[cfg(not(feature = "compact"))]
+#[cfg(feature = "devtools")]
 pub async fn qualify() -> Result<()> {
     let canvas: HtmlCanvasElement = web_sys::window()
         .unwrap()

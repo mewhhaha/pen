@@ -57,10 +57,23 @@ pub(crate) enum LevelReader {
 
 impl LevelReader {
     /// For a device with `features`, which must sample the file's format.
+    #[cfg(test)]
     pub fn open(bytes: Vec<u8>, features: wgpu::Features) -> Result<Self> {
         if !ktx2::is_ktx2(&bytes) {
             return Ok(LevelReader::Packed(PackedReader::open(bytes)?));
         }
+        Self::open_ktx2(bytes, features)
+    }
+
+    /// Async variant used by the asset loader so browser GTEX v3 recipes decode via `ImageBitmap`.
+    pub async fn open_async(bytes: Vec<u8>, features: wgpu::Features) -> Result<Self> {
+        if !ktx2::is_ktx2(&bytes) {
+            return Ok(LevelReader::Packed(PackedReader::open_async(bytes).await?));
+        }
+        Self::open_ktx2(bytes, features)
+    }
+
+    fn open_ktx2(bytes: Vec<u8>, features: wgpu::Features) -> Result<Self> {
         let reader = ktx2::Reader::open(bytes)?;
         let format = reader.header().format;
         ensure!(features.contains(feature(format.family())), "the device cannot sample {format:?} textures");

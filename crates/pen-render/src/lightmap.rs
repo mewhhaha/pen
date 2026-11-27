@@ -11,7 +11,7 @@ use anyhow::{Result, ensure};
 use crate::hdri::HdriImage;
 use crate::ray_tracing::{TLAS_TRAVERSAL_WGSL, TlasSceneGpu};
 
-pub const LIGHTMAP_BAKE_WGSL: &str = include_str!("shaders/lightmap_bake.wgsl");
+pub const LIGHTMAP_BAKE_WGSL: &str = crate::wgsl!("lightmap_bake.wgsl");
 
 /// World-space mesh triangle fed into UV2 chart packing and lightmap baking.
 #[derive(Clone, Copy, Debug)]
@@ -96,6 +96,7 @@ impl BakedLightmap {
     }
 
     /// Saves `lightmap_irradiance.exr`, `lightmap_directional.png`, and `lightmap_shadowmask.png` into `dir`.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn write_to_dir(&self, dir: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join("lightmap_irradiance.exr"), self.encode_irradiance_exr()?)?;
@@ -474,7 +475,13 @@ fn tex_rgba32f(device: &wgpu::Device, label: &str, w: u32, h: u32, usage: wgpu::
     })
 }
 
-fn readback_rgba32f(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, w: u32, h: u32) -> Result<Vec<[f32; 4]>> {
+fn readback_rgba32f(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    w: u32,
+    h: u32,
+) -> Result<Vec<[f32; 4]>> {
     let bpr = (w * 16).next_multiple_of(256);
     let rb = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("lm_rb"),
@@ -625,9 +632,8 @@ impl GpuLightmapBaker {
         let (pos_data, norm_data) = rasterize_uv2_gbuffer(target_triangles, &packed.triangle_uv2, w, h);
 
         let gbuf_usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
-        let rw_usage = wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::STORAGE_BINDING
-            | wgpu::TextureUsages::COPY_SRC;
+        let rw_usage =
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC;
 
         let pos_tex = tex_rgba32f(device, "lm_gbuf_pos", w, h, gbuf_usage);
         let norm_tex = tex_rgba32f(device, "lm_gbuf_norm", w, h, gbuf_usage);
@@ -672,7 +678,12 @@ impl GpuLightmapBaker {
                 params.sky_zenith[2].max(0.0),
                 params.max_ray_distance.max(1.0),
             ],
-            sky_horizon: [params.sky_horizon[0].max(0.0), params.sky_horizon[1].max(0.0), params.sky_horizon[2].max(0.0), 0.0],
+            sky_horizon: [
+                params.sky_horizon[0].max(0.0),
+                params.sky_horizon[1].max(0.0),
+                params.sky_horizon[2].max(0.0),
+                0.0,
+            ],
             counts: [scene.tlas_node_count, scene.tlas_instance_count, scene.blas_tri_count, params.visibility_mask],
             bake_cfg: [w, h, params.samples_per_texel.clamp(1, 256), params.max_bounces.clamp(1, 4)],
         };
@@ -713,10 +724,8 @@ impl GpuLightmapBaker {
             ],
         });
         {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("lm_bake"),
-                timestamp_writes: None,
-            });
+            let mut pass =
+                enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("lm_bake"), timestamp_writes: None });
             pass.set_pipeline(&self.bake_pipe);
             pass.set_bind_group(0, &bake_bg, &[]);
             pass.dispatch_workgroups(gx, gy, 1);
@@ -735,10 +744,8 @@ impl GpuLightmapBaker {
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&irr_bv) },
                 ],
             });
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("lm_denoise"),
-                timestamp_writes: None,
-            });
+            let mut pass = enc
+                .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("lm_denoise"), timestamp_writes: None });
             pass.set_pipeline(&self.denoise_pipe);
             pass.set_bind_group(0, &dn_bg, &[]);
             pass.dispatch_workgroups(gx, gy, 1);
@@ -898,7 +905,8 @@ mod tests {
             let tx = (wx + 2.0) / 4.0;
             let tz = 1.0 - (wz + 2.0) / 4.0; // bucket 2 (+Y) projects [x, -z]
             let px = ((u_min + tx * (u_max - u_min)) * baked.width as f32).clamp(0.0, (baked.width - 1) as f32) as u32;
-            let py = ((v_min + tz * (v_max - v_min)) * baked.height as f32).clamp(0.0, (baked.height - 1) as f32) as u32;
+            let py =
+                ((v_min + tz * (v_max - v_min)) * baked.height as f32).clamp(0.0, (baked.height - 1) as f32) as u32;
             let idx = (py * baked.width + px) as usize;
             (baked.irradiance_rgba32f[idx], baked.shadowmask_r8[idx])
         };

@@ -5,7 +5,7 @@
 use std::f64::consts::PI;
 
 /// Standalone WGSL source implementing LTC Rect/Disk/Tube area lights and cookie projectors.
-pub const AREA_LIGHTS_WGSL: &str = include_str!("shaders/area_lights.wgsl");
+pub const AREA_LIGHTS_WGSL: &str = crate::wgsl!("area_lights.wgsl");
 
 pub const LTC_LUT_SIZE: u32 = 64;
 

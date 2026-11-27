@@ -944,7 +944,14 @@ const OPTIONS: &[OptionSpec] = &[
         value: "",
         commands: &["build"],
         place: Place::Command,
-        about: "with --web, use the smaller static single-player host with precomputed textures",
+        about: "with --web, build a tailored single-player host containing only the features this game uses",
+    },
+    OptionSpec {
+        name: "--web-features",
+        value: "LIST",
+        commands: &["build"],
+        place: Place::Command,
+        about: "with --web, pass an explicit comma-separated pen-web feature list (empty for bare core)",
     },
     OptionSpec {
         name: "--worker-deadlines",
@@ -2608,7 +2615,9 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         "build" => {
             let web = args.flag("--web");
             let compact = args.flag("--web-compact");
+            let web_features = args.value("--web-features");
             ensure!(!compact || web, "--web-compact goes with --web");
+            ensure!(web_features.is_none() || web, "--web-features goes with --web");
             let options = project::PackageOptions {
                 optimize: !args.flag("--no-optimize"),
                 runtime: args.path("--runtime"),
@@ -2635,7 +2644,14 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             .plan(project)?;
             let out = if web {
                 let out = args.path("--out").unwrap_or_else(|| project.root.join(".pen/web-export"));
-                project::export_web(project, &out, args.path("--zip").as_deref(), options.optimize, compact)?;
+                project::export_web(
+                    project,
+                    &out,
+                    args.path("--zip").as_deref(),
+                    options.optimize,
+                    compact,
+                    web_features.as_deref(),
+                )?;
                 out
             } else {
                 ensure!(!args.flag("--zip"), "--zip goes with --web");

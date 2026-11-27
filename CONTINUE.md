@@ -2,10 +2,13 @@
 
 ## Current status
 
-Web exports list their startup files in `game.json` and load required assets
-alongside GPU setup. Optional files absent from the export cause no requests.
-`pen build --web --web-compact` selects the smaller host for static
-single-player games. The Linux tools bundle publishes both browser hosts.
+Web exports list their startup files in `game.json`, prune unused optional JS
+glue (`structured.js`, `kernels.js`, `kernel_worker.js`), and load required
+assets alongside GPU setup. Optional files absent from the export cause no
+requests. `pen build --web --web-compact` selects the compact browser host for
+static single-player games (auto-tailoring features per game when `build.sh` is
+available, or via `--web-features LIST`). The Linux tools bundle publishes both
+full and general compact browser hosts.
 
 Read `AGENTS.md` and [Blot's shared continuation](../blot2/CONTINUE.md). Use the
 existing sibling checkouts and pinned toolchains. This is a greenfield project;

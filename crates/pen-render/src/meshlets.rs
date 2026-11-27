@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Result, ensure};
 
-pub const MESHLET_CULL_WGSL: &str = include_str!("shaders/meshlet_cull.wgsl");
+pub const MESHLET_CULL_WGSL: &str = crate::wgsl!("meshlet_cull.wgsl");
 
 pub const DEFAULT_MAX_MESHLET_VERTICES: usize = 64;
 pub const DEFAULT_MAX_MESHLET_TRIANGLES: usize = 124;

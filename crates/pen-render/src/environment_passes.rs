@@ -11,9 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, anyhow, ensure};
 
-pub const TERRAIN_WGSL: &str = include_str!("shaders/terrain.wgsl");
-pub const WATER_WGSL: &str = include_str!("shaders/water.wgsl");
-pub const FOLIAGE_WGSL: &str = include_str!("shaders/foliage.wgsl");
+pub const TERRAIN_WGSL: &str = crate::wgsl!("terrain.wgsl");
+pub const WATER_WGSL: &str = crate::wgsl!("water.wgsl");
+pub const FOLIAGE_WGSL: &str = crate::wgsl!("foliage.wgsl");
 
 const UNIFORM_RING_SLOTS: usize = 64;
 const MAX_GRID_CELLS: u32 = 256;
@@ -273,7 +273,7 @@ impl TerrainPipeline {
             );
             sorted.push((cells, p));
         }
-        sorted.sort_by_key(|&(c, _)| c);
+        crate::sort::sort_by_u64_key(&mut sorted, |&(c, _)| u64::from(c));
         let ordered_patches: Vec<TerrainPatch> = sorted.iter().map(|&(_, p)| p).collect();
 
         let rec_bytes = std::mem::size_of::<TerrainPatch>();

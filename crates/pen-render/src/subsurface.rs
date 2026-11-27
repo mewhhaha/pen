@@ -117,9 +117,9 @@ fn kernel_wgsl() -> String {
     format!("const KERNEL = array<vec4f, {}>(\n  {taps});", TAPS + 1)
 }
 
-const SHADER: &str = include_str!("shaders/subsurface.wgsl");
+const SHADER: &str = crate::wgsl!("subsurface.wgsl");
 
-const FULLSCREEN: &str = include_str!("shaders/fullscreen.wgsl");
+const FULLSCREEN: &str = crate::wgsl!("fullscreen.wgsl");
 
 /// One of the two passes' shader, reading the depth and the stencil marks of a
 /// scene of `samples` per pixel.

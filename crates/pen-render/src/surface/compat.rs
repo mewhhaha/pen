@@ -21,7 +21,7 @@ use crate::{ENVIRONMENT_WGSL, LIGHTS_WGSL};
 
 use super::{SURFACE_LOBES_WGSL, SURFACE_WGSL};
 
-const BASELINE: &str = include_str!("baseline.wgsl");
+const BASELINE: &str = include_str!(concat!(env!("OUT_DIR"), "/surface/baseline.wgsl"));
 
 fn library() -> String {
     format!("{ENVIRONMENT_WGSL}\n{LIGHTS_WGSL}\n{SURFACE_LOBES_WGSL}\n{SURFACE_WGSL}\n{BASELINE}")

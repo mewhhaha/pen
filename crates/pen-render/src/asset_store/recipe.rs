@@ -6,7 +6,7 @@
     reason = "validated recipe indices and finite float output"
 )]
 use anyhow::{Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -21,8 +21,8 @@ pub(super) struct Recipe {
     output: [usize; 20],
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
 enum Node {
     Constant { value: f64 },
     Input { lane: usize },
@@ -43,6 +43,75 @@ enum Node {
     Round { input: usize, units: f64 },
     Select { test: usize, yes: usize, no: usize },
     MixBits { input: usize, shift: u32, multiplier: u32, final_shift: u32 },
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let map = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        parse_node(map).map_err(serde::de::Error::custom)
+    }
+}
+
+fn parse_node(mut map: serde_json::Map<String, serde_json::Value>) -> std::result::Result<Node, String> {
+    let take_usize =
+        |map: &mut serde_json::Map<String, serde_json::Value>, key: &str| -> std::result::Result<usize, String> {
+            let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+            let n = raw.as_u64().ok_or_else(|| format!("expected unsigned integer for `{key}`"))?;
+            usize::try_from(n).map_err(|_| format!("integer out of range for `{key}`"))
+        };
+    let take_u32 =
+        |map: &mut serde_json::Map<String, serde_json::Value>, key: &str| -> std::result::Result<u32, String> {
+            let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+            let n = raw.as_u64().ok_or_else(|| format!("expected u32 for `{key}`"))?;
+            u32::try_from(n).map_err(|_| format!("u32 out of range for `{key}`"))
+        };
+    let take_f64 =
+        |map: &mut serde_json::Map<String, serde_json::Value>, key: &str| -> std::result::Result<f64, String> {
+            let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+            raw.as_f64().ok_or_else(|| format!("expected number for `{key}`"))
+        };
+    let op = map
+        .remove("op")
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        })
+        .ok_or_else(|| "missing field `op`".to_owned())?;
+    let node = match op.as_str() {
+        "constant" => Node::Constant { value: take_f64(&mut map, "value")? },
+        "input" => Node::Input { lane: take_usize(&mut map, "lane")? },
+        "random" => Node::Random { index: take_usize(&mut map, "index")? },
+        "lookup" => Node::Lookup { table: take_usize(&mut map, "table")?, index: take_usize(&mut map, "index")? },
+        "add" => Node::Add { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "subtract" => Node::Subtract { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "multiply" => Node::Multiply { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "divide" => Node::Divide { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "min" => Node::Min { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "max" => Node::Max { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "less" => Node::Less { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "sin" => Node::Sin { input: take_usize(&mut map, "input")? },
+        "cos" => Node::Cos { input: take_usize(&mut map, "input")? },
+        "exp" => Node::Exp { input: take_usize(&mut map, "input")? },
+        "sqrt" => Node::Sqrt { input: take_usize(&mut map, "input")? },
+        "floor" => Node::Floor { input: take_usize(&mut map, "input")? },
+        "round" => Node::Round { input: take_usize(&mut map, "input")?, units: take_f64(&mut map, "units")? },
+        "select" => Node::Select {
+            test: take_usize(&mut map, "test")?,
+            yes: take_usize(&mut map, "yes")?,
+            no: take_usize(&mut map, "no")?,
+        },
+        "mix_bits" => Node::MixBits {
+            input: take_usize(&mut map, "input")?,
+            shift: take_u32(&mut map, "shift")?,
+            multiplier: take_u32(&mut map, "multiplier")?,
+            final_shift: take_u32(&mut map, "final_shift")?,
+        },
+        other => return Err(format!("unknown instance recipe op `{other}`")),
+    };
+    if let Some(extra) = map.keys().next() {
+        return Err(format!("unknown field `{extra}`"));
+    }
+    Ok(node)
 }
 
 impl Node {

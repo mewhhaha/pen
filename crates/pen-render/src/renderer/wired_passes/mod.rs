@@ -7,6 +7,7 @@
 //! - AMD FidelityFX RCAS sharpening & Post-FX polish (`grade.{sharpness, grain, flare, outline_strength}`)
 //! - Render-to-texture & split-screen secondary cameras (`frame.camera_targets`)
 
+#[cfg(feature = "render-rt")]
 mod ddgi;
 mod decals_oit;
 mod gpu_particles;
@@ -15,29 +16,42 @@ mod lines;
 mod meshlets;
 mod post_split;
 mod render2d;
+#[cfg(feature = "render-rt")]
 mod rt;
 mod sky_env;
 
+#[cfg(feature = "render-atmosphere")]
 use crate::atmosphere_lut::PhysicalAtmosphere;
 use crate::built_in::{BuiltIn, BuiltIns};
+#[cfg(feature = "render-rt")]
 use crate::ddgi::DdgiVolume;
+#[cfg(feature = "render-pbr-decals")]
 use crate::decals::PbrDecalPass;
 use crate::environment_passes::{
     FoliageInstance, FoliageUniform, TerrainHeightmap, TerrainPatch, TerrainUniform, WaterUniform,
 };
+#[cfg(feature = "render-meshlets")]
 use crate::meshlets::MeshletCuller;
+#[cfg(feature = "render-oit")]
 use crate::oit::OitPass;
+#[cfg(feature = "render-post-fx")]
 use crate::post_fx::{PostFxPass, RcasSharpener};
+#[cfg(feature = "render-rt")]
 use crate::ray_tracing::{GpuBlasPool, TlasRayTracer, TlasSceneGpu};
 use crate::render_targets::SplitScreenCompositor;
+#[cfg(feature = "render-rt")]
 use crate::restir::RestirRenderer;
+#[cfg(feature = "render-rt")]
 use crate::restir_specular::RestirSpecularRenderer;
+#[cfg(feature = "render-rt")]
 use crate::sharc::SharcCache;
 use pen_protocol::{Matrix, RenderFrame};
+#[cfg(feature = "render-rt")]
 use rt::{RtCompositePipelines, SvgfRtState};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[cfg(feature = "render-rt")]
 pub(super) use ddgi::has_active_point_spot_lights;
 pub(super) use decals_oit::PreparedPbrDecalBatch;
 pub use gpu_particles::GpuParticleScene;
@@ -49,6 +63,7 @@ pub(super) use lines::LineWiredState;
 pub(super) use post_split::SplitViewSlot;
 pub(super) use render2d::Render2dWiredState;
 pub use render2d::{RadianceCascades2dLayer, Scene2d, SpriteLayer2d, TilemapLayer2d};
+#[cfg(feature = "render-env")]
 pub(super) use sky_env::EnvPipelines;
 
 /// Built-in optional `RenderFrame::extensions` tags driving outdoor GPU environment passes from Blot.
@@ -116,6 +131,7 @@ struct BlitShared {
     sampler: wgpu::Sampler,
 }
 
+#[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(super) struct PlannedMeshletDraw {
     pub slot: usize,
@@ -126,6 +142,7 @@ pub(super) struct PlannedMeshletDraw {
     pub backface_cull: bool,
 }
 
+#[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
 #[derive(Clone, Copy)]
 pub(super) struct PlannedDagDraw {
     pub slot: usize,
@@ -138,6 +155,7 @@ pub(super) struct PlannedDagDraw {
 pub(super) struct DagLodSettings {
     pub enabled: bool,
     pub pixel_error_threshold: f32,
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
     pub frame_pixel_error: f32,
 }
 
@@ -147,6 +165,7 @@ impl Default for DagLodSettings {
     }
 }
 
+#[cfg(feature = "render-rt")]
 #[derive(Default)]
 pub(super) struct RtHistory {
     restir: Option<RestirRenderer>,
@@ -154,55 +173,89 @@ pub(super) struct RtHistory {
     svgf_rt: Option<Box<SvgfRtState>>,
 }
 
+#[cfg(not(feature = "render-rt"))]
+#[derive(Default)]
+pub(super) struct RtHistory;
+
 #[derive(Default)]
 pub(super) struct WiredPasses {
+    #[cfg(feature = "render-atmosphere")]
     pub physical_atmosphere: Option<PhysicalAtmosphere>,
+    #[cfg(feature = "render-atmosphere")]
     pub physical_sky_serial: u64,
+    #[cfg(feature = "render-atmosphere")]
     pub physical_sky_last_key: (bool, u64),
+    #[cfg(feature = "render-pbr-decals")]
     pub pbr_decals: HashMap<u32, PbrDecalPass>,
+    #[cfg(feature = "render-oit")]
     pub oit_pass: Option<OitPass>,
+    #[cfg(feature = "render-oit")]
     pub oit_pipelines: HashMap<(usize, u64, u32, bool), Option<wgpu::RenderPipeline>>,
+    #[cfg(feature = "render-rt")]
     pub blas_pool: Option<GpuBlasPool>,
+    #[cfg(feature = "render-rt")]
     pub tlas_hash: u64,
+    #[cfg(feature = "render-rt")]
     pub tlas_gpu: Option<TlasSceneGpu>,
+    #[cfg(feature = "render-rt")]
     pub tlas_bounds: Option<([f32; 3], [f32; 3])>,
+    #[cfg(feature = "render-rt")]
     pub ray_tracer: Option<TlasRayTracer>,
     pub rt_history: RtHistory,
+    #[cfg(feature = "render-rt")]
     pub sharc: Option<SharcCache>,
+    #[cfg(feature = "render-rt")]
     pub sharc_needs_clear: bool,
+    #[cfg(feature = "render-rt")]
     sharc_frame: Option<u64>,
     pub split_child: bool,
+    #[cfg(feature = "render-rt")]
     rt_composite: Option<RtCompositePipelines>,
+    #[cfg(feature = "render-rt")]
     pub ddgi_near: Option<DdgiVolume>,
+    #[cfg(feature = "render-rt")]
     pub ddgi_far: Option<DdgiVolume>,
+    #[cfg(feature = "render-rt")]
     pub ddgi_active_this_frame: bool,
+    #[cfg(feature = "render-meshlets")]
     pub meshlet_culler: Option<MeshletCuller>,
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
     pub meshlet_indirect_serial: u64,
     pub last_meshlet_cull_draws: u32,
     pub meshlet_phase1_used_hiz: bool,
     pub last_meshlet_phase2_active: bool,
     pub meshlet_plan: Vec<PlannedMeshletDraw>,
+    #[cfg(feature = "render-meshlets")]
     pub meshlet_dag_culler: Option<crate::meshlet_dag::MeshletDagCuller>,
     pub last_meshlet_dag_draws: u32,
     pub dag_phase1_used_hiz: bool,
     pub dag_plan: Vec<PlannedDagDraw>,
     pub dag_lod: DagLodSettings,
+    #[cfg(feature = "render-env")]
     pub env_pipelines: HashMap<(u32, bool), EnvPipelines>,
     pub env_scene: Option<EnvironmentScene>,
+    #[cfg(feature = "render-env")]
     pub ext_terrain_hm: Option<(u64, TerrainHeightmap)>,
     pub gpu_particles: GpuParticleWiredState,
     pub lines: LineWiredState,
     pub jfa_outline: JfaOutlineWiredState,
     pub render2d: Render2dWiredState,
+    #[cfg(feature = "render-post-fx")]
     pub rcas: Option<RcasSharpener>,
+    #[cfg(feature = "render-post-fx")]
     pub post_fx: Option<PostFxPass>,
     pub split_screen: Option<(wgpu::TextureFormat, SplitScreenCompositor)>,
     pub split_views: Vec<SplitViewSlot>,
     pub polish_input: Option<(u32, u32, wgpu::TextureFormat, wgpu::Texture, wgpu::TextureView)>,
+    #[allow(dead_code)]
     pub msaa_depth_resolve: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    #[allow(dead_code)]
     msaa_depth_resolve_bg: Option<(wgpu::TextureView, u32, wgpu::BindGroup)>,
+    #[allow(dead_code)]
     pub dummy_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub dummy_vel: Option<(wgpu::Texture, wgpu::TextureView)>,
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub dummy_rgba16f: Option<(wgpu::Texture, wgpu::TextureView)>,
     blit_shared: Option<BlitShared>,
     blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
@@ -255,12 +308,18 @@ pub(super) fn secondary_frame(frame: &RenderFrame, view: Matrix, projection: Mat
 }
 
 impl WiredPasses {
+    #[cfg(feature = "render-post-fx")]
     pub fn wants_post_polish(frame: &RenderFrame) -> bool {
         frame.grade.sharpness > 0.0
             || frame.quality.upscale
             || frame.grade.grain > 0.0
             || frame.grade.flare > 0.0
             || frame.grade.outline_strength > 0.0
+    }
+
+    #[cfg(not(feature = "render-post-fx"))]
+    pub fn wants_post_polish(_frame: &RenderFrame) -> bool {
+        false
     }
 
     pub fn polish_target(
@@ -289,6 +348,7 @@ impl WiredPasses {
         self.polish_input.as_ref().unwrap().4.clone()
     }
 
+    #[allow(dead_code)]
     pub fn dummy_depth_view(&mut self, device: &wgpu::Device) -> wgpu::TextureView {
         if self.dummy_depth.is_none() {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -307,6 +367,7 @@ impl WiredPasses {
         self.dummy_depth.as_ref().unwrap().1.clone()
     }
 
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub fn dummy_velocity_view(&mut self, device: &wgpu::Device) -> wgpu::TextureView {
         if self.dummy_vel.is_none() {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -325,6 +386,7 @@ impl WiredPasses {
         self.dummy_vel.as_ref().unwrap().1.clone()
     }
 
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub fn dummy_rgba16f_view(&mut self, device: &wgpu::Device) -> wgpu::TextureView {
         if self.dummy_rgba16f.is_none() {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -345,6 +407,7 @@ impl WiredPasses {
 
     /// Resolves a multisampled depth view into a cached 1x `R32Float` texture via `BuiltIn::OpaqueDepth`
     /// so screen-space outlines work identically under MSAA.
+    #[allow(dead_code)]
     pub fn resolve_msaa_depth(
         &mut self,
         device: &wgpu::Device,

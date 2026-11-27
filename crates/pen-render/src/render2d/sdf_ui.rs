@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::{Draw2d, buffer, pipeline, prepared};
 
-pub const SDF_UI_WGSL: &str = include_str!("../shaders/render2d_sdf_ui.wgsl");
+pub const SDF_UI_WGSL: &str = crate::wgsl!("render2d_sdf_ui.wgsl");
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]

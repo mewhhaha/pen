@@ -60,7 +60,14 @@ pub fn select_video_evictions(
             .filter(|(k, _, _, touched)| !*touched && !evict.iter().any(|e| e == k))
             .map(|(k, last, bytes, _)| (k.as_str(), *last, *bytes))
             .collect();
-        candidates.sort_by_key(|&(_, last, _)| last);
+        // Tiny in-place stable sort (few cached entries; avoids driftsort monomorphization on wasm32).
+        for i in 1..candidates.len() {
+            let mut j = i;
+            while j > 0 && candidates[j - 1].1 > candidates[j].1 {
+                candidates.swap(j - 1, j);
+                j -= 1;
+            }
+        }
         for (key, _, bytes) in candidates {
             if remaining_bytes <= max_total_bytes {
                 break;
@@ -102,7 +109,11 @@ pub fn noise_buffer_len(sample_rate: f32) -> usize {
 
 /// Clamps half-second granular loop frame count for WebAudio granular synths.
 pub fn granular_loop_frames(sample_rate: f32) -> usize {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "clamped positive half-second frame count")]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamped positive half-second frame count"
+    )]
     {
         (sample_rate * 0.5).clamp(256.0, 96_000.0) as usize
     }
@@ -135,9 +146,7 @@ pub fn synth_adsr_level(elapsed: f64, attack: f32, decay: f32, sustain: f32) -> 
 /// Hysteresis test deciding whether two reverb rooms `(decay, damping)` differ enough to
 /// regenerate the WebAudio convolution impulse response and crossfade ConvolverNodes.
 pub fn reverb_room_changed(next: (f32, f32), current: (f32, f32)) -> bool {
-    (next.0 - current.0).abs() > 0.08
-        || (next.1 - current.1).abs() > 0.05
-        || ((next.0 > 0.0) != (current.0 > 0.0))
+    (next.0 - current.0).abs() > 0.08 || (next.1 - current.1).abs() > 0.05 || ((next.0 > 0.0) != (current.0 > 0.0))
 }
 
 /// Computes linear sidechain ducking multiplier in `0.0..=1.0` from `duck_amount` and sidechain RMS.

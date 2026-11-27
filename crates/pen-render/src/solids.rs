@@ -102,7 +102,7 @@ fn solid_polygons(solid: &Solid) -> Vec<Polygon> {
             let offset = subtract(point, center);
             dot(offset, v).atan2(dot(offset, u))
         };
-        points.sort_by(|a, b| angle(*a).total_cmp(&angle(*b)));
+        crate::sort::insertion_sort_by(&mut points, |a, b| angle(*a).total_cmp(&angle(*b)));
         polygons.push(Polygon { normal: plane.normal, material: plane.material, points });
     }
     polygons

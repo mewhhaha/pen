@@ -610,6 +610,7 @@ pub(crate) fn pipelines(
 
 /// A shader's Weighted Blended OIT pipeline (dual `accum: Rgba16Float` + `reveal: R8Unorm` targets,
 /// depth-tested without depth writes).
+#[cfg_attr(not(feature = "render-oit"), allow(dead_code))]
 pub(crate) fn oit_pipeline(
     context: &PipelineContext,
     module: &wgpu::ShaderModule,

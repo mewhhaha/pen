@@ -104,7 +104,7 @@ impl Scene {
                     changes.push((pos, old_draw));
                 }
                 if self.moved_buf.len() > 1 {
-                    self.moved_buf.sort_unstable_by_key(|(draw, _)| *draw);
+                    crate::sort::sort_by_u64_key(&mut self.moved_buf, |&(draw, _)| u64::from(draw));
                 }
                 self.started = true;
                 SceneRollback::InPlace { prev_started, changes }
@@ -230,13 +230,20 @@ impl Scene {
         let is_sorted = self.entries.windows(2).all(|w| (w[0].order, w[0].id) <= (w[1].order, w[1].id));
         if !is_sorted {
             let count = self.entries.len();
-            let mut perm: Vec<usize> = (0..count).collect();
-            perm.sort_unstable_by_key(|&i| (self.entries[i].order, self.entries[i].id));
+            #[allow(clippy::cast_possible_truncation, reason = "entries.len() <= MAX_DRAWS fits in u32")]
+            let mut perm: Vec<(u64, u32)> = self
+                .entries
+                .iter()
+                .enumerate()
+                .map(|(i, e)| ((u64::from(e.order) << 32) | u64::from(e.id), i as u32))
+                .collect();
+            crate::sort::sort_u64_u32(&mut perm);
             let old_entries = std::mem::take(&mut self.entries);
             let mut old_ordered = std::mem::take(&mut self.ordered);
             self.entries.reserve(count);
             self.ordered.reserve(count);
-            for (new_pos, old_pos) in perm.into_iter().enumerate() {
+            for (new_pos, (_, old_pos)) in perm.into_iter().enumerate() {
+                let old_pos = old_pos as usize;
                 let entry = old_entries[old_pos];
                 self.entries.push(entry);
                 self.ordered.push(std::mem::take(&mut old_ordered[old_pos]));
@@ -250,7 +257,7 @@ impl Scene {
                 self.moved_buf.push((resolved, previous));
             }
             if self.moved_buf.len() > 1 {
-                self.moved_buf.sort_unstable_by_key(|(draw, _)| *draw);
+                crate::sort::sort_by_u64_key(&mut self.moved_buf, |&(draw, _)| u64::from(draw));
             }
         }
         self.started = true;

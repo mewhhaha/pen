@@ -9,7 +9,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
-anyhow = "1"
+anyhow = { version = "1", default-features = false }
 pen-codegen = { path = "crates/pen-codegen" }
 pen-gltf = { path = "crates/pen-gltf" }
 blot-host = { path = "crates/blot-host", default-features = false }

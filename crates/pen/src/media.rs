@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use pen_protocol::{Catalog, RenderFrame};
 use pen_render::{IvfStream, Renderer, VideoPlayer};
-use pen_runtime::voice::{
-    PopAction, VOICE_FRAME_SAMPLES, VoiceActivityDetector, VoicePacket, VoiceRouter,
-};
+use pen_runtime::voice::{PopAction, VOICE_FRAME_SAMPLES, VoiceActivityDetector, VoicePacket, VoiceRouter};
 
 use crate::opus::{VoiceDecoder, VoiceEncoder};
 
@@ -59,7 +57,8 @@ impl VideoRegistry {
             if !self.streams.contains_key(&tex_key) {
                 let video_path = self.assets_dir.join(&tex_key);
                 if let Some(player) = load_video_player(&video_path, spec.looping, max_dim)? {
-                    self.streams.insert(tex_key.clone(), ActiveVideo { player, last_frame_index: None, last_seek: None });
+                    self.streams
+                        .insert(tex_key.clone(), ActiveVideo { player, last_frame_index: None, last_seek: None });
                 } else {
                     continue;
                 }
@@ -145,13 +144,7 @@ impl VoiceSession {
         {
             self.timestamp = self.timestamp.wrapping_add(mono_pcm.len() as u32);
         }
-        Ok(Some(VoicePacket {
-            speaker_id: self.local_speaker,
-            seq,
-            timestamp: ts,
-            flags: 0,
-            payload,
-        }))
+        Ok(Some(VoicePacket { speaker_id: self.local_speaker, seq, timestamp: ts, flags: 0, payload }))
     }
 
     /// Queues an incoming peer voice packet into its speaker's jitter buffer.

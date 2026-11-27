@@ -5,9 +5,9 @@
 use anyhow::{Result, ensure};
 
 /// Standalone WGSL source for the transmittance, multi-scattering, and sky-view LUT compute passes.
-pub const ATMOSPHERE_LUT_WGSL: &str = include_str!("shaders/atmosphere_lut.wgsl");
+pub const ATMOSPHERE_LUT_WGSL: &str = crate::wgsl!("atmosphere_lut.wgsl");
 /// Standalone WGSL source for raymarched 3D volumetric clouds.
-pub const CLOUDS_WGSL: &str = include_str!("shaders/clouds.wgsl");
+pub const CLOUDS_WGSL: &str = crate::wgsl!("clouds.wgsl");
 
 pub const TRANSMITTANCE_SIZE: (u32, u32) = (256, 64);
 pub const MULTISCATTER_SIZE: (u32, u32) = (32, 32);

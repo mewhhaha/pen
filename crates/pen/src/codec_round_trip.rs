@@ -670,11 +670,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
             local_texels: rng.whole(4096),
         },
         blur: rng.number(),
-        motion_blur: MotionBlur {
-            strength: rng.number(),
-            max_radius: rng.number(),
-            samples: rng.whole(32),
-        },
+        motion_blur: MotionBlur { strength: rng.number(), max_radius: rng.number(), samples: rng.whole(32) },
         dof: Dof {
             focus_distance: rng.number(),
             focus_range: rng.number(),
@@ -1015,10 +1011,7 @@ fn random_render(rng: &mut Rng, catalog: &Catalog) -> (RenderFrame, u32, Vec<f32
         },
         motions: {
             let count = rng.count(8);
-            rng.list(count, |rng| Motion {
-                draw: rng.whole(u32::try_from(MAX_DRAWS).unwrap()),
-                previous: rng.lanes(),
-            })
+            rng.list(count, |rng| Motion { draw: rng.whole(u32::try_from(MAX_DRAWS).unwrap()), previous: rng.lanes() })
         },
         ribbons: {
             let count = rng.count(8);

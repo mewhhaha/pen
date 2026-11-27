@@ -85,21 +85,14 @@ impl Pads {
     /// gilrs, or None (and the game plays without pads) where it cannot
     /// read them: no udev, no permission, or a platform it does not know.
     pub fn open() -> Option<Pads> {
-        let built = match GilrsBuilder::new()
-            .with_default_filters(false)
-            .with_force_feedback(true)
-            .build()
-        {
+        let built = match GilrsBuilder::new().with_default_filters(false).with_force_feedback(true).build() {
             Ok(gilrs) => Ok(gilrs),
             Err(_) => GilrsBuilder::new().with_default_filters(false).with_force_feedback(false).build(),
         };
         match built {
-            Ok(gilrs) => Some(Pads {
-                gilrs,
-                gamepads: Gamepads::default(),
-                ids: HashMap::new(),
-                effects: HashMap::new(),
-            }),
+            Ok(gilrs) => {
+                Some(Pads { gilrs, gamepads: Gamepads::default(), ids: HashMap::new(), effects: HashMap::new() })
+            }
             Err(error) => {
                 eprintln!("gamepads are off: {error}");
                 None

@@ -18,8 +18,8 @@ use crate::matrix::{multiply, narrow};
 use crate::post::SCENE_FORMAT;
 use crate::shader::PipelineContext;
 
-const SIMULATE: &str = include_str!("../shaders/particles.wgsl");
-const QUADS: &str = include_str!("../shaders/particle_quads.wgsl");
+const SIMULATE: &str = crate::wgsl!("particles.wgsl");
+const QUADS: &str = crate::wgsl!("particle_quads.wgsl");
 
 // The most particles a frame draws, all emitters together: 64 MB of them,
 // within a storage binding and a dispatch.

@@ -12,14 +12,17 @@ pub mod gamepad;
 pub mod input;
 pub mod inspect;
 mod instances;
+#[cfg(feature = "locales")]
 pub mod locale;
 pub mod memory_image;
 pub mod mix;
 pub mod mods;
+#[cfg(feature = "netplay")]
 pub mod net;
 pub mod panner;
 pub mod pathfinding;
 pub mod program;
+#[cfg(feature = "replay")]
 pub mod recording;
 pub mod remote;
 pub mod reverb;
@@ -28,6 +31,8 @@ pub mod scale;
 pub mod semantic;
 pub mod services;
 pub mod snapshot;
+pub mod sort;
+#[cfg(feature = "sound-recipes")]
 pub mod sound_recipe;
 pub mod state;
 pub mod symbols;

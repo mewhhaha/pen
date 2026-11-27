@@ -113,7 +113,7 @@ impl Development {
         if std::mem::replace(&mut self.mail.borrow_mut().baking, true) {
             return false;
         }
-        values.sort_by_key(|(id, _)| *id);
+        pen_runtime::sort::sort_by_u64_key(&mut values, |&(id, _)| u64::from(id));
         let mail = self.mail.clone();
         spawn_local(async move {
             let line = match post(&values).await {

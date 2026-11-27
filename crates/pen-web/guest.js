@@ -9,7 +9,17 @@
 // thread, suspended at each host call. Without it, a cross-origin isolated
 // page runs the guest in a worker (this module again), which blocks at each
 // host call on a SharedArrayBuffer until the page sends the next request.
-import { openStructured, runStructuredSync } from './structured.js';
+
+let kernelsMod;
+async function loadKernels() {
+  return (kernelsMod ??= await import('./kernels.js'));
+}
+export async function compileKernelModuleLazy(bytes) {
+  return (await loadKernels()).compileKernelModule(bytes);
+}
+export async function openKernelPoolLazy(source, name, config) {
+  return (await loadKernels()).BrowserKernelPool.open(source, name, config);
+}
 
 function hasTasksSection(module) {
   return WebAssembly.Module.customSections(module, 'blot:tasks').length !== 0;
@@ -17,7 +27,11 @@ function hasTasksSection(module) {
 export async function openGuest(bytes, ownership) {
   if (WebAssembly.Suspending && WebAssembly.promising) {
     const module = await WebAssembly.compile(bytes);
-    return hasTasksSection(module) ? openStructured(bytes) : openSuspending(module, ownership);
+    if (hasTasksSection(module)) {
+      const { openStructured } = await import('./structured.js');
+      return openStructured(bytes);
+    }
+    return openSuspending(module, ownership);
   }
   if (globalThis.crossOriginIsolated && typeof SharedArrayBuffer === 'function') return openWorker(bytes, ownership);
   throw new Error('This browser needs WebAssembly JS Promise Integration (JSPI), or a cross-origin isolated page '
@@ -270,6 +284,7 @@ function serveWorker() {
       const module = await WebAssembly.compile(bytes);
       structured = hasTasksSection(module);
       if (structured) {
+        const { runStructuredSync } = await import('./structured.js');
         await runStructuredSync(bytes, exchangeValues);
       } else {
         exports = await instantiate(module, ownership, exchange);

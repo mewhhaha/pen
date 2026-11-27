@@ -26,8 +26,8 @@ const BINS: u64 = 256;
 /// Stops, at most, either way.
 pub(crate) const MAX_STOPS: f32 = 16.0;
 
-const METER: &str = include_str!("shaders/meter.wgsl");
-const ADAPT: &str = include_str!("shaders/adapt.wgsl");
+const METER: &str = crate::wgsl!("meter.wgsl");
+const ADAPT: &str = crate::wgsl!("adapt.wgsl");
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -323,7 +323,7 @@ pub(crate) mod reference {
     pub fn exact_average(pixels: &[[f64; 3]], wanted: &Wanted) -> f64 {
         let mut logs: Vec<f64> =
             pixels.iter().map(|pixel| luminance_of(*pixel).max(f64::from(wanted.range_low).exp2()).log2()).collect();
-        logs.sort_by(f64::total_cmp);
+        crate::sort::sort_by_u64_key(&mut logs, |&x| crate::sort::f64_sortable(x));
         let count = logs.len() as f64;
         let (low, high) = (f64::from(wanted.low) * count, f64::from(wanted.high) * count);
         let (mut weight, mut sum) = (0.0, 0.0);

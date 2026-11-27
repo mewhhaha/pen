@@ -68,7 +68,7 @@ impl ModManifest {
             let capability = capability.as_str().ok_or_else(|| anyhow!("a capability is a name"))?;
             capabilities.push(Capability::named(capability)?);
         }
-        capabilities.sort();
+        crate::sort::insertion_sort_by(&mut capabilities, Ord::cmp);
         capabilities.dedup();
         Ok(ModManifest { name: name.to_owned(), capabilities })
     }

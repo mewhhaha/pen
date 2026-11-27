@@ -8,7 +8,7 @@ use pen_protocol::RenderFrame;
 use super::{GpuAsset, MeshAsset, Scratch, State};
 use crate::asset_store::{AssetStore, MESH_VERTEX_FLOATS};
 
-const MORPH_SHADER: &str = include_str!("../shaders/morph.wgsl");
+const MORPH_SHADER: &str = crate::wgsl!("morph.wgsl");
 
 struct MorphJob {
     mesh_slot: usize,

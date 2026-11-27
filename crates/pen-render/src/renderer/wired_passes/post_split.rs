@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-post-fx"), allow(unused_imports, dead_code))]
 use super::super::{State, ViewTemporalState};
 use super::{WiredPasses, secondary_frame};
 use crate::RenderTarget;
@@ -41,6 +42,29 @@ impl State {
 
     /// Runs AMD FidelityFX RCAS sharpening and/or Post-FX polish (film grain, anamorphic lens flare,
     /// screen-space outlines) on `polish_src` and writes the final result into `dst_output`.
+    #[cfg(not(feature = "render-post-fx"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_post_polish_wired(
+        _wired: &mut WiredPasses,
+        _built_ins: &mut BuiltIns,
+        _device: &wgpu::Device,
+        _encoder: &mut wgpu::CommandEncoder,
+        _frame: &RenderFrame,
+        _frames_count: u64,
+        _target_format: wgpu::TextureFormat,
+        _polish_src: &wgpu::TextureView,
+        _depth_view: &wgpu::TextureView,
+        _depth_size: (u32, u32),
+        _dst_output: &wgpu::TextureView,
+        _size: (u32, u32),
+        _samples: u32,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Runs AMD FidelityFX RCAS sharpening and/or Post-FX polish (film grain, anamorphic lens flare,
+    /// screen-space outlines) on `polish_src` and writes the final result into `dst_output`.
+    #[cfg(feature = "render-post-fx")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_post_polish_wired(
         wired: &mut WiredPasses,

@@ -115,6 +115,7 @@ struct Kept {
 
 pub struct Timeline {
     /// Optional development observations indexed by this timeline's positions.
+    #[cfg(feature = "semantic")]
     pub observations: crate::semantic::Observations,
     /// Frames from position `base` on.
     frames: VecDeque<Recorded>,
@@ -139,6 +140,7 @@ pub struct Timeline {
 impl Default for Timeline {
     fn default() -> Timeline {
         Timeline {
+            #[cfg(feature = "semantic")]
             observations: crate::semantic::Observations::default(),
             frames: VecDeque::new(),
             base: 0,
@@ -168,13 +170,18 @@ impl Timeline {
 
     /// The accepted output at the next position, before `ran` advances it.
     pub fn observe(&mut self, frame: &RenderFrame, replaced: bool) {
-        if !self.observations.enabled() {
-            return;
+        #[cfg(feature = "semantic")]
+        {
+            if !self.observations.enabled() {
+                return;
+            }
+            self.observations.ran(self.cursor + 1, frame, replaced || self.restored_here());
+            if let Some(earliest) = self.earliest() {
+                self.observations.retain_from(earliest);
+            }
         }
-        self.observations.ran(self.cursor + 1, frame, replaced || self.restored_here());
-        if let Some(earliest) = self.earliest() {
-            self.observations.retain_from(earliest);
-        }
+        #[cfg(not(feature = "semantic"))]
+        let _ = (frame, replaced);
     }
 
     /// The next frame to run; frames before it have run.
@@ -332,6 +339,7 @@ impl Timeline {
 
     /// The recorded future is dropped: play continues live from the cursor.
     pub fn go_live(&mut self) {
+        #[cfg(feature = "semantic")]
         self.observations.branch(self.cursor);
         self.restored_next = self.restored_here();
         self.frames.truncate(self.index(self.cursor));
@@ -340,6 +348,7 @@ impl Timeline {
 
     /// A new build of the game runs from here on.
     pub fn rebuilt(&mut self) {
+        #[cfg(feature = "semantic")]
         self.observations.invalidate("build_changed");
         self.build += 1;
     }
@@ -353,6 +362,7 @@ impl Timeline {
     /// Plays a recording whose start is at `position` of the run it came
     /// from (a spectator joining a stream late), counting frames from there.
     pub fn load_at(&mut self, recording: Recording, position: u64) {
+        #[cfg(feature = "semantic")]
         self.observations.invalidate("recording_replaced");
         self.frames = recording.frames.into();
         self.base = position;
@@ -406,6 +416,7 @@ impl Timeline {
             let end = self.index(at);
             self.frames.drain(..end);
             self.base = at;
+            #[cfg(feature = "semantic")]
             self.observations.retain_from(at);
         }
     }
@@ -494,8 +505,13 @@ impl Timeline {
             self.prepare(runtime, host).await?;
             let idx = self.index(self.cursor);
             let (frame, replaced) = run_unseen(runtime, host, &self.frames[idx]).await?;
-            let restored = self.frames[idx].restored;
-            self.observations.replayed(self.cursor + 1, &frame, restored || replaced);
+            #[cfg(feature = "semantic")]
+            {
+                let restored = self.frames[idx].restored;
+                self.observations.replayed(self.cursor + 1, &frame, restored || replaced);
+            }
+            #[cfg(not(feature = "semantic"))]
+            let _ = replaced;
             unseen(self.cursor, &self.frames[idx], runtime)?;
             shown = Some(frame);
             self.cursor += 1;

@@ -112,6 +112,7 @@ const MAPS_AT: usize = SURFACE_AT + SURFACE_FLOATS;
 const DRAW_BYTES: u64 = (MAPS_AT + MAPS_FLOATS) as u64 * 4;
 
 /// CPU geometry retained for BLAS construction on the first RT or DDGI use.
+#[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
 pub(crate) struct RtMeshSource {
     id: u64,
     vertices: Vec<f32>,
@@ -119,6 +120,7 @@ pub(crate) struct RtMeshSource {
     indices: Option<Vec<u32>>,
 }
 
+#[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
 impl RtMeshSource {
     fn triangles(&self) -> Vec<BlasTriangle> {
         let vertices = self.vertices.as_chunks::<MESH_VERTEX_FLOATS>().0;
@@ -139,6 +141,7 @@ impl RtMeshSource {
 pub(crate) struct MeshletGpuAsset {
     pub indices: wgpu::Buffer,
     pub descriptors: wgpu::Buffer,
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
     pub count: u32,
 }
 
@@ -162,6 +165,7 @@ pub(crate) struct MeshAsset {
     morphs: Option<MeshMorphs>,
     instances: Option<MeshInstanceBuffer>,
     /// LOD0 triangles for lazy ray-tracing / DDGI BLAS construction.
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     rt_source: Option<Arc<RtMeshSource>>,
     /// LOD0 meshlet clusters for GPU frustum/backface/Hi-Z cluster culling.
     meshlets: Option<MeshletGpuAsset>,
@@ -196,6 +200,7 @@ pub(crate) struct ShaderAsset {
     revision: u64,
     module: wgpu::ShaderModule,
     /// Original WGSL source retained for on-demand WBOIT pipeline derivation.
+    #[cfg_attr(not(feature = "render-oit"), allow(dead_code))]
     code: Arc<String>,
     /// Whether it has a `vertex_instanced` entry point.
     instancing: bool,
@@ -406,6 +411,7 @@ struct SolidMesh {
     buffer: wgpu::Buffer,
     count: u32,
     /// Triangle snapshot for lazy ray-tracing / DDGI BLAS construction.
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     rt_source: Option<Arc<RtMeshSource>>,
 }
 
@@ -636,9 +642,11 @@ struct Scratch {
 /// Indirect draw and two-phase occlusion candidate buffers for one meshlet-culled draw slot.
 pub(super) struct MeshletIndirectSlot {
     pub count: u32,
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
     pub generation: u64,
     pub draws_phase1: wgpu::Buffer,
     pub draws_phase2: wgpu::Buffer,
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
     pub phase2_flags: wgpu::Buffer,
 }
 
@@ -1764,8 +1772,11 @@ impl State {
         self.particles = None;
         self.ribbons = None;
         self.decals = None;
+        #[cfg(feature = "render-oit")]
         self.wired.oit_pipelines.clear();
+        #[cfg(feature = "render-pbr-decals")]
         self.wired.pbr_decals.clear();
+        #[cfg(feature = "render-env")]
         self.wired.env_pipelines.clear();
     }
 
@@ -1801,7 +1812,10 @@ impl State {
 
     pub fn clear_gpu_particle_scene(&mut self) {
         self.wired.gpu_particles.scene = None;
-        self.wired.gpu_particles.system = None;
+        #[cfg(feature = "render-particles")]
+        {
+            self.wired.gpu_particles.system = None;
+        }
         self.wired.gpu_particles.config_key = None;
         self.wired.gpu_particles.last_seed_snapshot.clear();
     }

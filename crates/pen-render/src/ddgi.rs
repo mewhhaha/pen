@@ -12,7 +12,7 @@ use crate::ray_tracing::{MAX_RT_LOCAL_LIGHTS, RtLocalLight, TLAS_TRAVERSAL_WGSL,
 #[cfg(not(target_arch = "wasm32"))]
 use crate::ray_tracing::{TLAS_TRAVERSAL_HW_WGSL, device_supports_hardware_ray_query};
 
-pub const DDGI_WGSL: &str = include_str!("shaders/ddgi.wgsl");
+pub const DDGI_WGSL: &str = crate::wgsl!("ddgi.wgsl");
 
 /// Number of `vec4f` header slots reserved at the start of the packed DDGI storage buffer (1 global + 2 cascades * 6).
 pub const DDGI_PACKED_HEADER_VEC4S: u32 = 16;
@@ -210,6 +210,7 @@ pub struct DdgiVolume {
 }
 
 impl DdgiVolume {
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub(crate) fn supported(device: &wgpu::Device) -> bool {
         device.limits().max_storage_buffers_per_shader_stage >= 7
     }

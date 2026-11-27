@@ -21,10 +21,10 @@ use crate::matrix::multiply;
 use crate::post::atmosphere_of;
 use crate::shader::PipelineContext;
 
-const COMMON: &str = include_str!("shaders/volume_common.wgsl");
-const INJECT: &str = include_str!("shaders/volume_inject.wgsl");
-const INTEGRATE: &str = include_str!("shaders/volume_integrate.wgsl");
-const ATMOSPHERE_COMMON: &str = include_str!("shaders/atmosphere_common.wgsl");
+const COMMON: &str = crate::wgsl!("volume_common.wgsl");
+const INJECT: &str = crate::wgsl!("volume_inject.wgsl");
+const INTEGRATE: &str = crate::wgsl!("volume_integrate.wgsl");
+const ATMOSPHERE_COMMON: &str = crate::wgsl!("atmosphere_common.wgsl");
 
 /// WGSL: the volume's uniform and slicing, which the passes that fill the
 /// volume and the atmosphere pass that applies it share.
@@ -36,7 +36,7 @@ pub(crate) const COMMON_WGSL: &str = COMMON;
 /// `opaque_behind`, `opaque_levels`, `opaque_depth_at`, `fog_apply` and, for
 /// light that only adds, `fog_terms`. It needs the filtering `sky_sampler` of
 /// binding 6, which `ENVIRONMENT_WGSL` declares.
-pub const TRANSLUCENCY_WGSL: &str = include_str!("shaders/translucency.wgsl");
+pub const TRANSLUCENCY_WGSL: &str = crate::wgsl!("translucency.wgsl");
 
 /// The scene uniform as the volume's injection declares it.
 const SCENE: &str = "struct Scene {

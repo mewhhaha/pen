@@ -19,6 +19,9 @@ flate2 = "1"
 read-fonts = { version = "0.45", optional = true }
 skrifa = { version = "0.48", optional = true }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow = { workspace = true, features = ["std"] }
+
 [dev-dependencies]
 # An independent decoder, to check what the encoders write.
 texture2ddecoder = "0.1.2"

@@ -4,12 +4,12 @@ use pen_protocol::{Dof, Matrix};
 
 use crate::matrix::invert;
 
-const SHADER: &str = include_str!("shaders/dof.wgsl");
+const SHADER: &str = crate::wgsl!("dof.wgsl");
 
 pub(crate) fn shader(samples: u32) -> String {
     SHADER
         .replace("${depth_texture}", if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" })
-        .replace("${fullscreen}", include_str!("shaders/fullscreen.wgsl"))
+        .replace("${fullscreen}", crate::wgsl!("fullscreen.wgsl"))
 }
 
 pub(crate) fn uniform(projection: &Matrix, dof: &Dof, size: (u32, u32)) -> [f32; 24] {

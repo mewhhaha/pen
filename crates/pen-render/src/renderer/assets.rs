@@ -429,6 +429,7 @@ impl State {
         let device = self.device.clone();
         match loaded {
             Loaded::Mesh(prepared) => {
+                #[cfg_attr(not(feature = "render-rt"), allow(unused_mut))]
                 let crate::mesh_cache::PreparedMesh { mut mesh, meshlets: meshlet_data, meshlet_dag: meshlet_dag_data } =
                     *prepared;
                 let instance_bytes: &[u8] =
@@ -482,14 +483,26 @@ impl State {
                 let rt_id = self.view_id();
                 let lod0_count = mesh.lods[0].count as usize;
                 let (asset, check) = shader::scoped(&device, || {
+                    #[cfg(feature = "render-meshlets")]
                     let meshlets = meshlet_data.as_ref().map(|ml| super::MeshletGpuAsset {
                         indices: buffer(bytemuck::cast_slice(&ml.indices), wgpu::BufferUsages::INDEX),
                         descriptors: buffer(bytemuck::cast_slice(&ml.meshlets), wgpu::BufferUsages::STORAGE),
                         count: u32::try_from(ml.meshlets.len()).unwrap_or(0),
                     });
+                    #[cfg(not(feature = "render-meshlets"))]
+                    let meshlets = {
+                        let _ = &meshlet_data;
+                        None
+                    };
+                    #[cfg(feature = "render-meshlets")]
                     let meshlet_dag = meshlet_dag_data
                         .as_ref()
                         .and_then(|dag| crate::meshlet_dag::MeshletDagGpu::upload(&device, dag).ok());
+                    #[cfg(not(feature = "render-meshlets"))]
+                    let meshlet_dag = {
+                        let _ = &meshlet_dag_data;
+                        None
+                    };
                     GpuAsset::Mesh(MeshAsset {
                         vertex_count,
                         vertices: buffer(bytemuck::cast_slice(&mesh.vertices), vertex_usage),
@@ -515,6 +528,7 @@ impl State {
                             targets,
                             deltas: buffer(bytes, wgpu::BufferUsages::STORAGE),
                         }),
+                        #[cfg(feature = "render-rt")]
                         rt_source: Some(Arc::new(super::RtMeshSource {
                             id: rt_id,
                             vertices: mesh.vertices,
@@ -523,6 +537,11 @@ impl State {
                                 Some(mesh.indices)
                             },
                         })),
+                        #[cfg(not(feature = "render-rt"))]
+                        rt_source: {
+                            let _ = (rt_id, lod0_count);
+                            None
+                        },
                         meshlets,
                         meshlet_dag,
                     })
@@ -869,7 +888,9 @@ impl State {
             })
             .map(|(id, slot)| (id, slot.last_used, slot.gpu_bytes))
             .collect();
-        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)));
+        crate::sort::shell_sort_by(&mut candidates, |a, b| {
+            a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)).then_with(|| a.0.cmp(&b.0))
+        });
         let mut evicted = 0;
         for (id, _, _) in candidates {
             if self.assets.total_gpu_bytes() <= target_bytes {

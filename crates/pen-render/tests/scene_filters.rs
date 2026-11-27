@@ -159,3 +159,70 @@ fn filters_preserve_scene_effects_chain_before_ui_and_resize() {
         );
     }
 }
+
+#[test]
+fn mesh_filters_chain_in_hdr_with_and_without_msaa() {
+    let (device, queue) = device().expect("mesh filter regression needs a GPU adapter");
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("mesh-scene-filters-test");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("filter.wgsl"),
+        r#"
+struct Draw { model: mat4x4f, normal: mat4x4f, color: vec4f, settings: vec4f, parameters: vec4f };
+@group(1) @binding(0) var<uniform> draw: Draw;
+@group(0) @binding(14) var opaque_color: texture_2d<f32>;
+@vertex fn vertex(@location(0) pos: vec3f) -> @builtin(position) vec4f { return vec4f(pos, 1); }
+@fragment fn fragment(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let prior = textureLoad(opaque_color, vec2i(pos.xy), 0).rgb;
+  return vec4f(prior * draw.parameters.x + draw.parameters.y, 1);
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("shape.mesh.json"),
+        r#"{"positions":[-1,-1,0,3,-1,0,-1,3,0],"normals":[0,0,1,0,0,1,0,0,1],"uvs":[0,0,1,0,0,1],"indices":[0,1,2]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("filter.material.json"),
+        r#"{"shader":"filter.wgsl","scene_filter":true,"blend":true,"lighting":"unlit","color":[1,1,1,1]}"#,
+    )
+    .unwrap();
+    let catalog = Catalog {
+        sounds: vec![],
+        meshes: vec!["shape.mesh.json".into()],
+        materials: vec!["filter.material.json".into()],
+    };
+    let mut renderer = Renderer::new(
+        device.clone(),
+        queue.clone(),
+        RendererOptions { format: FORMAT, display: Display::SDR, assets: root, veil: None, pipeline_cache: None },
+    )
+    .unwrap();
+    let draw = |gain, offset| Draw {
+        mesh: 0,
+        material: 0,
+        transform: IDENTITY,
+        parameters: Some([gain, offset, 0., 0.]),
+        extra: None,
+    };
+    let mut picture = frame(vec![draw(0.5, 0.25), draw(0.25, 0.125)]);
+    picture.clear = Color { r: 0.8, g: 0.8, b: 0.8, a: 1. };
+    let mut target = Offscreen::new(&device, 64);
+    pump(&mut renderer, &picture, &catalog, &mut target, |events| ready(events, "filter.wgsl", 1));
+    for samples in [1, 4] {
+        picture.quality.msaa = samples;
+        renderer.submit(&picture, &catalog, &mut target).unwrap();
+        let actual = middle(&device, &queue, &target.0);
+        let mut reference = picture.clone();
+        reference.draws.clear();
+        reference.clear = Color { r: 0.2875, g: 0.2875, b: 0.2875, a: 1. };
+        renderer.submit(&reference, &catalog, &mut target).unwrap();
+        let expected = middle(&device, &queue, &target.0);
+        assert!(
+            actual[0].abs_diff(expected[0]) < 3,
+            "mesh filter chain at {samples}× MSAA: {actual:?}, wanted {expected:?}"
+        );
+    }
+}

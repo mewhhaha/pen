@@ -389,6 +389,7 @@ pub struct TlasRayTracer {
 }
 
 impl TlasRayTracer {
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub(crate) fn supported(device: &wgpu::Device) -> bool {
         device.limits().max_storage_buffers_per_shader_stage >= 8
     }

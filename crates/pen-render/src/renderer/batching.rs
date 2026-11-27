@@ -265,9 +265,7 @@ impl State {
                 scratch.gpu_order.push(i);
             }
         }
-        scratch
-            .gpu_order
-            .sort_by(|&a, &b| scratch.batches[b].count.cmp(&scratch.batches[a].count).then_with(|| a.cmp(&b)));
+        crate::sort::sort_by_u64_key(&mut scratch.gpu_order, |&i| u64::from(!scratch.batches[i].count));
         for i in 0..scratch.gpu_order.len() {
             let index = scratch.gpu_order[i];
             let batch = &mut scratch.batches[index];
@@ -854,10 +852,12 @@ impl State {
             }
         }
         for list in [&mut scratch.opaque, &mut scratch.capture_list] {
-            list.sort_by_key(|&index| {
+            crate::sort::sort_by_u64_key(list, |&index| {
                 let entry = &ready[index];
                 let item = &items[entry.item];
-                (stencil(&entry.material.material), item.material, matches!(item.shape, Shape::Batch(_)))
+                (u64::from(stencil(&entry.material.material)) << 33)
+                    | (u64::from(item.material) << 1)
+                    | u64::from(matches!(item.shape, Shape::Batch(_)))
             });
         }
         let view = &frame.view;
@@ -867,9 +867,8 @@ impl State {
                 + f64::from(view[10]) * f64::from(transform[14])
                 + f64::from(view[14])
         };
-        scratch.translucent.sort_by(|&a, &b| {
-            let (a, b) = (items[ready[a].item].transform(frame), items[ready[b].item].transform(frame));
-            depth_of(a).total_cmp(&depth_of(b))
+        crate::sort::sort_by_u64_key(&mut scratch.translucent, |&index| {
+            crate::sort::f64_sortable(depth_of(items[ready[index].item].transform(frame)))
         });
         // Lit, opaque surfaces cast shadows, unless their material says not:
         // those a shadow map sees, whether the camera does or not, sorted
@@ -893,9 +892,9 @@ impl State {
                 }
             }
             for list in [&mut scratch.casters, &mut scratch.contact_casters] {
-                list.sort_by_key(|&index| {
+                crate::sort::sort_by_u64_key(list, |&index| {
                     let item = &items[ready[index].item];
-                    (item.material, matches!(item.shape, Shape::Batch(_)))
+                    (u64::from(item.material) << 1) | u64::from(matches!(item.shape, Shape::Batch(_)))
                 });
             }
         }
@@ -920,6 +919,7 @@ impl State {
             let image = self.resolve(AssetKind::Texture, key)?;
             let Some(GpuAsset::Texture(image)) = self.assets.current(image) else { continue };
             let paint = !material.material.lit;
+            self.built_ins.prepare([crate::built_in::BuiltIn::Decal { samples: self.samples_shown, paint }]);
             let found = scratch.decals.iter().position(|other| {
                 other.texture_id == image.view_id && other.paint == paint && other.material == material_slot
             });
@@ -1041,11 +1041,14 @@ impl State {
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                 }),
             };
+            #[cfg(feature = "render-rt")]
             let rt_source = Some(std::sync::Arc::new(super::RtMeshSource {
                 id: self.view_id(),
                 vertices: batch.vertices,
                 indices: None,
             }));
+            #[cfg(not(feature = "render-rt"))]
+            let rt_source = None;
             self.solid_meshes.push(SolidMesh { material: batch.material, buffer, count, rt_source });
         }
     }

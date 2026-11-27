@@ -16,11 +16,11 @@ pub use bvh::{
 pub use pool::GpuBlasPool;
 pub use tracer::{GpuRayTracer, MAX_RT_LOCAL_LIGHTS, RayTraceParams, RtLocalLight, TlasRayTraceParams, TlasRayTracer};
 
-pub const BVH_RAYTRACE_WGSL: &str = include_str!("../shaders/bvh_raytrace.wgsl");
-pub const TLAS_TRAVERSAL_WGSL: &str = include_str!("../shaders/tlas_traversal.wgsl");
-pub const TLAS_RAYTRACE_WGSL: &str = include_str!("../shaders/tlas_raytrace.wgsl");
+pub const BVH_RAYTRACE_WGSL: &str = crate::wgsl!("bvh_raytrace.wgsl");
+pub const TLAS_TRAVERSAL_WGSL: &str = crate::wgsl!("tlas_traversal.wgsl");
+pub const TLAS_RAYTRACE_WGSL: &str = crate::wgsl!("tlas_raytrace.wgsl");
 #[cfg(not(target_arch = "wasm32"))]
-pub const TLAS_TRAVERSAL_HW_WGSL: &str = include_str!("../shaders/tlas_traversal_hw.wgsl");
+pub const TLAS_TRAVERSAL_HW_WGSL: &str = crate::wgsl!("tlas_traversal_hw.wgsl");
 
 /// Reports whether the active GPU adapter advertises hardware ray-query support (`KHR_ray_query` / Metal RT / DXR).
 /// Note that [`GpuRayTracer`] executes portably via compute BVH traversal on ALL WebGPU/Vulkan/Metal backends.

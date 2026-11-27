@@ -12,7 +12,7 @@ use pen_protocol::Vector;
 use crate::environment::{LEVELS as ENV_LEVELS, SIZE as ENV_SIZE};
 use crate::pipeline_cache::PipelineCache;
 
-const HDRI_IBL_WGSL: &str = include_str!("shaders/hdri_ibl.wgsl");
+const HDRI_IBL_WGSL: &str = crate::wgsl!("hdri_ibl.wgsl");
 
 /// Default cubemap face resolution for prefiltered HDRI specular IBL.
 pub const DEFAULT_HDRI_FACE_SIZE: u32 = 128;

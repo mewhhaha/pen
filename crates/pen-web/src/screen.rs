@@ -104,10 +104,13 @@ impl RenderTarget for Canvas {
 
 pub struct Screen {
     /// The graphics adapter's name.
+    #[cfg(feature = "devtools")]
     pub adapter: String,
     pub renderer: Renderer,
     /// The dev tools' sprites, over the game's frame.
+    #[cfg(feature = "devtools")]
     overlay: Option<Renderer>,
+    #[cfg(feature = "devtools")]
     assets: String,
     pub canvas: Canvas,
     /// Completion fences in submission order, at most FRAMES_IN_FLIGHT.
@@ -131,6 +134,7 @@ impl Screen {
             })
             .await
             .context(no_webgpu)?;
+        #[cfg(feature = "devtools")]
         let info = adapter.get_info();
         // With the texture compression the adapter offers, and timestamps,
         // which time the GPU's passes for the dev tools, where it has them.
@@ -142,6 +146,7 @@ impl Screen {
         };
         let (device, queue) = adapter.request_device(&descriptor).await?;
         // The API first: the diagnostics cut long names short.
+        #[cfg(feature = "devtools")]
         let name = if info.name.is_empty() { "WebGPU".to_owned() } else { format!("WebGPU: {}", info.name) };
         // Once each: an error a frame repeats would otherwise flood the console.
         let reported = Mutex::new(HashSet::new());
@@ -195,7 +200,17 @@ impl Screen {
             pinned: None,
             timings: DrawTimings::default(),
         };
-        Ok(Self { adapter: name, renderer, overlay: None, assets, canvas, in_flight: VecDeque::new() })
+        Ok(Self {
+            #[cfg(feature = "devtools")]
+            adapter: name,
+            renderer,
+            #[cfg(feature = "devtools")]
+            overlay: None,
+            #[cfg(feature = "devtools")]
+            assets,
+            canvas,
+            in_flight: VecDeque::new(),
+        })
     }
 
     /// Follows the canvas's size and the display's density: the backing
@@ -207,6 +222,7 @@ impl Screen {
     /// Keeps the canvas backed by `size` (a replay's viewport, which its
     /// frames were laid out on), shown whole within the canvas, or with
     /// None follows the canvas again.
+    #[cfg_attr(not(feature = "replay"), allow(dead_code))]
     pub fn pin(&mut self, size: Option<(u32, u32)>) {
         self.canvas.pinned = size;
         let fit = if size.is_some() { "contain" } else { "" };
@@ -236,10 +252,12 @@ impl Screen {
         self.canvas.timings.pace_ms = pacing.elapsed().as_secs_f64() * 1000.0;
         let rendering = Instant::now();
         self.canvas.fit();
-        if !cfg!(feature = "compact") && overlay.is_some() && self.overlay.is_none() {
+        #[cfg(feature = "devtools")]
+        if overlay.is_some() && self.overlay.is_none() {
             self.overlay = Some(self.renderer.share(self.assets.clone().into())?);
         }
         self.renderer.submit(game, catalog, &mut self.canvas)?;
+        #[cfg(feature = "devtools")]
         if let (Some(overlay), Some(renderer)) = (overlay, &mut self.overlay) {
             renderer.prepare_sprites(&overlay.sprites, catalog)?;
             if let Some(frame) = &self.canvas.frame {
@@ -247,7 +265,10 @@ impl Screen {
                 renderer.overlay(&overlay.sprites, catalog, &view, self.canvas.size())?;
             }
         }
+        #[cfg(not(feature = "devtools"))]
+        let _ = overlay;
         // The dev tools' asset events stay with their renderer.
+        #[cfg(feature = "devtools")]
         if let Some(renderer) = &mut self.overlay {
             let _ = renderer.take_events();
         }
@@ -273,9 +294,17 @@ impl Screen {
     }
 
     pub fn overlay_pending(&self) -> usize {
-        self.overlay.as_ref().map_or(0, Renderer::pending)
+        #[cfg(feature = "devtools")]
+        {
+            self.overlay.as_ref().map_or(0, Renderer::pending)
+        }
+        #[cfg(not(feature = "devtools"))]
+        {
+            0
+        }
     }
 
+    #[cfg(feature = "devtools")]
     pub fn reload_overlay(&mut self) {
         if let Some(renderer) = &mut self.overlay {
             renderer.reload_all();

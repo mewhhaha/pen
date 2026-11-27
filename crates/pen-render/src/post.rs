@@ -51,16 +51,16 @@ pub(crate) const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16
 /// channel shows as it is; above, it rolls off smoothly toward 1 without
 /// reaching it, so bright surfaces go white as they did when the screen
 /// clipped them, keeping their shading, and nothing hard-clips.
-pub(crate) const TONED_WGSL: &str = include_str!("shaders/toned.wgsl");
+pub(crate) const TONED_WGSL: &str = crate::wgsl!("toned.wgsl");
 
-const FULLSCREEN: &str = include_str!("shaders/fullscreen.wgsl");
+const FULLSCREEN: &str = crate::wgsl!("fullscreen.wgsl");
 
 /// WGSL: the sRGB transfer function and exposure as light (`exposed`), which the
 /// bloom's first pass, the metering and the present pass share.
-pub(crate) const TRANSFER_WGSL: &str = include_str!("shaders/transfer.wgsl");
+pub(crate) const TRANSFER_WGSL: &str = crate::wgsl!("transfer.wgsl");
 
 /// WGSL: the color grade (`grade_apply`), reference of Ink's `color.grade`.
-pub(crate) const GRADE_WGSL: &str = include_str!("shaders/grade.wgsl");
+pub(crate) const GRADE_WGSL: &str = crate::wgsl!("grade.wgsl");
 
 fn depth_texture(samples: u32) -> &'static str {
     if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" }
@@ -69,9 +69,9 @@ fn depth_texture(samples: u32) -> &'static str {
 // The sky's colors come from the frame's lighting. Each pixel blends the sky
 // and fog by how many of its samples the scene left empty, so MSAA keeps its
 // smooth edges against the sky.
-const ATMOSPHERE_SHADER: &str = include_str!("shaders/atmosphere.wgsl");
+const ATMOSPHERE_SHADER: &str = crate::wgsl!("atmosphere.wgsl");
 
-const ATMOSPHERE_COMMON: &str = include_str!("shaders/atmosphere_common.wgsl");
+const ATMOSPHERE_COMMON: &str = crate::wgsl!("atmosphere_common.wgsl");
 
 pub(crate) fn atmosphere_shader(samples: u32, depth_mode: crate::camera_precision::DepthMode) -> String {
     let (depth_clear, empty_cond, nearer_op) = match depth_mode {
@@ -91,7 +91,7 @@ pub(crate) fn atmosphere_shader(samples: u32, depth_mode: crate::camera_precisio
 }
 
 // Ground-truth ambient occlusion (GTAO): horizon-based visibility from depth.
-const OCCLUSION_SHADER: &str = include_str!("shaders/occlusion.wgsl");
+const OCCLUSION_SHADER: &str = crate::wgsl!("occlusion.wgsl");
 
 pub(crate) fn occlusion_shader(samples: u32) -> String {
     OCCLUSION_SHADER
@@ -102,7 +102,7 @@ pub(crate) fn occlusion_shader(samples: u32) -> String {
 // The opaque scene's nearest depth to read from the translucent pass, its
 // picture's chain of levels, and the picture written into the translucent
 // pass's samples.
-const OPAQUE_DEPTH_SHADER: &str = include_str!("shaders/opaque_depth.wgsl");
+const OPAQUE_DEPTH_SHADER: &str = crate::wgsl!("opaque_depth.wgsl");
 
 pub(crate) fn opaque_depth_shader(samples: u32, depth_mode: crate::camera_precision::DepthMode) -> String {
     let (depth_clear, nearer_op) = match depth_mode {
@@ -117,15 +117,15 @@ pub(crate) fn opaque_depth_shader(samples: u32, depth_mode: crate::camera_precis
         .replace("${nearer_op}", nearer_op)
 }
 
-const OPAQUE_MIP_SHADER: &str = include_str!("shaders/opaque_mip.wgsl");
+const OPAQUE_MIP_SHADER: &str = crate::wgsl!("opaque_mip.wgsl");
 
-const BACKDROP_SHADER: &str = include_str!("shaders/backdrop.wgsl");
+const BACKDROP_SHADER: &str = crate::wgsl!("backdrop.wgsl");
 
 pub(crate) fn backdrop_shader() -> String {
     BACKDROP_SHADER.replace("${fullscreen}", FULLSCREEN)
 }
 
-const PRESENT_SHADER: &str = include_str!("shaders/present.wgsl");
+const PRESENT_SHADER: &str = crate::wgsl!("present.wgsl");
 
 pub(crate) fn present_shader(samples: u32, display: &crate::Display) -> String {
     // An HDR display's highlights roll off toward its peak, not white.
@@ -137,7 +137,7 @@ pub(crate) fn present_shader(samples: u32, display: &crate::Display) -> String {
         .replace("${transfer}", TRANSFER_WGSL)
         .replace("${grade}", GRADE_WGSL)
         .replace("${tonedWgsl}", &toned_full)
-        .replace("${fxaa}", include_str!("shaders/fxaa.wgsl"))
+        .replace("${fxaa}", crate::wgsl!("fxaa.wgsl"))
 }
 
 // Bloom: glare, a small share of the picture's light scattered round where it
@@ -154,9 +154,9 @@ pub(crate) fn present_shader(samples: u32, display: &crate::Display) -> String {
 // neighbourhood at any exposure instead of flooding the frame (after Jorge
 // Jimenez's bloom for Call of Duty: Advanced Warfare: a 13-tap filter down, a
 // 9-tap tent up).
-const BLOOM_VERTEX: &str = include_str!("shaders/bloom_vertex.wgsl");
+const BLOOM_VERTEX: &str = crate::wgsl!("bloom_vertex.wgsl");
 
-const BLOOM_DOWN_SHADER: &str = include_str!("shaders/bloom_down.wgsl");
+const BLOOM_DOWN_SHADER: &str = crate::wgsl!("bloom_down.wgsl");
 
 pub(crate) fn bloom_down_shader(first: bool) -> String {
     // The first level reads the picture as the camera exposes it, in linear light,
@@ -177,7 +177,7 @@ pub(crate) fn bloom_down_shader(first: bool) -> String {
         .replace("${weight}", if first { "1.0 / (1.0 + brightness(color))" } else { "1.0" })
 }
 
-const BLOOM_UP_SHADER: &str = include_str!("shaders/bloom_up.wgsl");
+const BLOOM_UP_SHADER: &str = crate::wgsl!("bloom_up.wgsl");
 
 pub(crate) fn bloom_up_shader() -> String {
     BLOOM_UP_SHADER.replace("${bloomVertex}", BLOOM_VERTEX)
@@ -373,6 +373,8 @@ struct Targets {
     multisampled: Option<wgpu::TextureView>,
     /// The resolved scene.
     scene: wgpu::TextureView,
+    /// Resolved color copied between ordered mesh filters.
+    filter_picture: Option<wgpu::TextureView>,
     /// The graph of the passes after the scene; with TAA, one for each
     /// history texture it reads, turn about.
     graphs: Vec<Graph>,
@@ -425,6 +427,13 @@ impl SceneTargets {
                 ops: wgpu::Operations { load, store: if last { wgpu::StoreOp::Discard } else { wgpu::StoreOp::Store } },
             },
         }
+    }
+
+    /// Resolve for the next mesh filter while preserving the samples for subsequent draws.
+    pub fn mesh_filter_color(&self, first: bool) -> wgpu::RenderPassColorAttachment<'_> {
+        let mut attachment = self.color(wgpu::Color::BLACK, first, true);
+        attachment.ops.store = wgpu::StoreOp::Store;
+        attachment
     }
 
     /// The color attachment of the translucent pass: cleared, which the backdrop
@@ -893,7 +902,7 @@ impl Post {
             };
             let multisampled =
                 (samples > 1).then(|| texture(device, width, height, attachment, samples, SCENE_FORMAT, 1));
-            let scene = texture(device, width, height, sampled, 1, SCENE_FORMAT, 1);
+            let scene = texture(device, width, height, sampled | wgpu::TextureUsages::COPY_SRC, 1, SCENE_FORMAT, 1);
             let marks = depth.create_view(&wgpu::TextureViewDescriptor {
                 aspect: wgpu::TextureAspect::StencilOnly,
                 ..Default::default()
@@ -955,6 +964,7 @@ impl Post {
                 depth_only: depth_only(),
                 multisampled: multisampled.as_ref().map(view),
                 scene: view(&scene),
+                filter_picture: None,
                 marks,
                 graphs,
                 split: None,
@@ -1141,6 +1151,26 @@ impl Post {
             .as_ref()
             .expect("a frame with subsurface surfaces has its diffusion");
         diffusion.execute(encoder, built_ins, None, timer, Span::Subsurface, None, &mut |_, _| {});
+    }
+
+    /// Reuse a resolved HDR image for the next mesh filter's binding 14.
+    pub fn mesh_filter_picture(&mut self) -> wgpu::TextureView {
+        let targets = self.targets.as_mut().expect("Post::begin comes first");
+        targets
+            .filter_picture
+            .get_or_insert_with(|| {
+                texture(
+                    &self.device,
+                    targets.key.width,
+                    targets.key.height,
+                    wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                    1,
+                    SCENE_FORMAT,
+                    1,
+                )
+                .create_view(&Default::default())
+            })
+            .clone()
     }
 
     /// Draws the opaque picture into every sample of the translucent pass, which

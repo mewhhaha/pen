@@ -9,7 +9,7 @@ use pen_protocol::Matrix;
 
 use crate::{camera_precision::DepthMode, environment_passes::PipelineTarget};
 
-pub const LINES_WGSL: &str = include_str!("shaders/lines.wgsl");
+pub const LINES_WGSL: &str = crate::wgsl!("lines.wgsl");
 
 const W_EPSILON: f32 = 1e-6;
 const X_RAY_FLAG: f32 = 1.0;

@@ -9,5 +9,5 @@ description = "Generate the game's Rust and Blot packet contract"
 workspace = true
 
 [dependencies]
-anyhow.workspace = true
+anyhow = { workspace = true, features = ["std"] }
 serde_json = { version = "1", features = ["preserve_order"] }

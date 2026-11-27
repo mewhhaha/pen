@@ -12,7 +12,7 @@ use crate::ray_tracing::{RtLocalLight, TLAS_TRAVERSAL_WGSL, TlasSceneGpu, device
 use crate::restir::{RESTIR_MAX_LIGHTS, RESTIR_WGSL};
 use crate::sharc::{SHARC_HASH_WGSL, SHARC_QUERY_RO_FN_WGSL, SharcCache};
 
-pub const RESTIR_SPECULAR_WGSL: &str = include_str!("shaders/restir_specular.wgsl");
+pub const RESTIR_SPECULAR_WGSL: &str = crate::wgsl!("restir_specular.wgsl");
 
 const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const GEOMETRY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;

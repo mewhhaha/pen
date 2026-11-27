@@ -7,7 +7,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::buffer;
 
-pub const RADIANCE_CASCADES_2D_WGSL: &str = include_str!("../shaders/render2d_rc2d.wgsl");
+pub const RADIANCE_CASCADES_2D_WGSL: &str = crate::wgsl!("render2d_rc2d.wgsl");
 
 /// Spacing doubles and direction count quadruples at each level.
 #[derive(Clone, Copy, Debug)]

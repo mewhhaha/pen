@@ -4,7 +4,7 @@
 //! retain one accumulator across samples.
 #![allow(clippy::cast_possible_truncation, reason = "bounded audio samples")]
 use anyhow::{Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -18,8 +18,8 @@ pub struct Recipe {
     nodes: Vec<Node>,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
 enum Node {
     Constant { value: f64 },
     Time,
@@ -30,6 +30,52 @@ enum Node {
     Sin { input: usize },
     Exp { input: usize },
     Lowpass { input: usize, coefficient: usize },
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let map = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        parse_node(map).map_err(serde::de::Error::custom)
+    }
+}
+
+fn parse_node(mut map: serde_json::Map<String, serde_json::Value>) -> std::result::Result<Node, String> {
+    let take_usize =
+        |map: &mut serde_json::Map<String, serde_json::Value>, key: &str| -> std::result::Result<usize, String> {
+            let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+            let n = raw.as_u64().ok_or_else(|| format!("expected unsigned integer for `{key}`"))?;
+            usize::try_from(n).map_err(|_| format!("integer out of range for `{key}`"))
+        };
+    let take_f64 =
+        |map: &mut serde_json::Map<String, serde_json::Value>, key: &str| -> std::result::Result<f64, String> {
+            let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+            raw.as_f64().ok_or_else(|| format!("expected number for `{key}`"))
+        };
+    let op = map
+        .remove("op")
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        })
+        .ok_or_else(|| "missing field `op`".to_owned())?;
+    let node = match op.as_str() {
+        "constant" => Node::Constant { value: take_f64(&mut map, "value")? },
+        "time" => Node::Time,
+        "noise" => Node::Noise,
+        "add" => Node::Add { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "subtract" => Node::Subtract { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "multiply" => Node::Multiply { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "sin" => Node::Sin { input: take_usize(&mut map, "input")? },
+        "exp" => Node::Exp { input: take_usize(&mut map, "input")? },
+        "lowpass" => {
+            Node::Lowpass { input: take_usize(&mut map, "input")?, coefficient: take_usize(&mut map, "coefficient")? }
+        }
+        other => return Err(format!("unknown sound recipe op `{other}`")),
+    };
+    if let Some(extra) = map.keys().next() {
+        return Err(format!("unknown field `{extra}`"));
+    }
+    Ok(node)
 }
 
 impl Recipe {

@@ -381,12 +381,15 @@ impl State {
         let drawn = self.draw(frame, catalog, target, &mut scratch);
         self.scratch = scratch;
         if drawn.is_err() {
-            self.wired.blas_pool = None;
-            self.wired.tlas_gpu = None;
-            self.wired.tlas_hash = 0;
-            self.wired.tlas_bounds = None;
-            self.wired.rt_history = Default::default();
-            self.wired.sharc_needs_clear = true;
+            #[cfg(feature = "render-rt")]
+            {
+                self.wired.blas_pool = None;
+                self.wired.tlas_gpu = None;
+                self.wired.tlas_hash = 0;
+                self.wired.tlas_bounds = None;
+                self.wired.rt_history = Default::default();
+                self.wired.sharc_needs_clear = true;
+            }
         }
         drawn
     }
@@ -419,7 +422,10 @@ impl State {
         self.waiting = false;
         if !self.wired.in_secondary_camera {
             self.frames += 1;
-            self.wired.sharc_needs_clear |= frame.exposure.cut;
+            #[cfg(feature = "render-rt")]
+            {
+                self.wired.sharc_needs_clear |= frame.exposure.cut;
+            }
             self.loading_seen = frame.loading;
             if !frame.loading {
                 self.ready_sent = false;
@@ -498,6 +504,17 @@ impl State {
         self.prepare_particles(frame, catalog, samples, scratch)?;
         self.prepare_ribbons(frame, catalog, samples, scratch)?;
         self.sort_passes(frame, scratch, shadowed);
+        let mut mesh_filters = Vec::new();
+        scratch.translucent.retain(|&index| {
+            if scratch.ready[index].material.material.scene_filter {
+                mesh_filters.push(index);
+                return false;
+            }
+            true
+        });
+        // Effect order follows the frame's draw order, independent of depth sorting.
+        crate::sort::sort_by_u64_key(&mut mesh_filters, |&index| scratch.ready[index].item as u64);
+
         // Until they are ready, draw the cover and any opted-in startup sprites.
         if covered && !self.built_ins.ready(BuiltIn::all(samples)) {
             self.waiting = true;
@@ -545,7 +562,8 @@ impl State {
         // draws the scene as one picture.
         let line_scene = self.gather_line_scene(frame);
         let has_3d_lines = line_scene.as_ref().is_some_and(|s| s.batch.has_3d());
-        let translucent = !scratch.translucent.is_empty()
+        let translucent = !mesh_filters.is_empty()
+            || !scratch.translucent.is_empty()
             || !scratch.overlays.is_empty()
             || !scratch.emitters.is_empty()
             || !scratch.ribbons.is_empty()
@@ -553,7 +571,7 @@ impl State {
             || jfa_scenes.iter().any(Option::is_some);
         let mut opaque_mips = false;
         let mut opaque_depth = !scratch.emitters.is_empty() || !scratch.ribbons.is_empty();
-        for &index in scratch.translucent.iter().chain(&scratch.overlays) {
+        for &index in mesh_filters.iter().chain(&scratch.translucent).chain(&scratch.overlays) {
             let entry = &scratch.ready[index];
             if let Some(GpuAsset::Shader(shader)) = self.assets.current(entry.shader) {
                 opaque_mips |= shader.reads_opaque_color;
@@ -636,13 +654,19 @@ impl State {
         };
         let capture = self.prepare_capture(frame, scratch, samples);
         let oit_pipelines = self.prepare_oit_pipelines(frame, scratch, samples);
-        let tlas_ready = self.prepare_tlas_scene(&mut encoder, frame, scratch)?;
-        if tlas_ready && frame.quality.ddgi && crate::ddgi::DdgiVolume::supported(&device) {
-            self.encode_ddgi_prepass(&mut encoder, frame)?;
-        }
-        let rt_active = tlas_ready && crate::ray_tracing::TlasRayTracer::supported(&device);
-        let restir_di_active =
-            rt_active && frame.quality.ray_tracing >= 3 && super::wired_passes::has_active_point_spot_lights(frame);
+        #[cfg(feature = "render-rt")]
+        let (rt_active, restir_di_active) = {
+            let tlas_ready = self.prepare_tlas_scene(&mut encoder, frame, scratch)?;
+            if tlas_ready && frame.quality.ddgi && crate::ddgi::DdgiVolume::supported(&device) {
+                self.encode_ddgi_prepass(&mut encoder, frame)?;
+            }
+            let rt_active = tlas_ready && crate::ray_tracing::TlasRayTracer::supported(&device);
+            let restir_di_active =
+                rt_active && frame.quality.ray_tracing >= 3 && super::wired_passes::has_active_point_spot_lights(frame);
+            (rt_active, restir_di_active)
+        };
+        #[cfg(not(feature = "render-rt"))]
+        let (rt_active, restir_di_active) = (false, false);
         #[allow(clippy::cast_precision_loss, reason = "viewport height in pixels")]
         let dag_viewport_height = targets.size.1 as f32;
         self.encode_meshlet_culling_phase1(
@@ -995,6 +1019,7 @@ impl State {
         } else {
             None
         };
+        #[cfg(feature = "render-rt")]
         if rt_active && frame.quality.ray_tracing > 0 {
             let ddgi_buf = self.wired.ddgi_active_this_frame.then_some(self.environment.probe_data_buffer());
             let vel_view = targets.velocity.as_ref().map(|(v, _)| v);
@@ -1028,12 +1053,48 @@ impl State {
         if subsurface {
             self.post.as_mut().unwrap().diffuse(&mut self.built_ins, &mut encoder, frame, &self.timer);
         }
-        if targets.opaque.is_some() {
+        if let Some(opaque) = &targets.opaque {
+            let feedback = if mesh_filters.len() > 1 {
+                let picture = self.post.as_mut().unwrap().mesh_filter_picture();
+                let group = self.bind_mesh_filter(&picture, opaque, &volume);
+                Some((picture, group))
+            } else {
+                None
+            };
             let post = self.post.as_mut().unwrap();
             post.opaque(&mut self.built_ins, &mut encoder, frame, &self.timer);
             let group = &self.translucent_group.as_ref().expect("a translucent frame binds its own scene").0;
-            let use_oit = frame.quality.oit && oit_pipelines.iter().any(Option::is_some);
-            if use_oit {
+            for (pass_index, &entry) in mesh_filters.iter().enumerate() {
+                let first = pass_index == 0;
+                let filter_group = if first {
+                    group
+                } else {
+                    let (picture, bindings) = feedback.as_ref().expect("mesh filter feedback");
+                    encoder.copy_texture_to_texture(
+                        targets.scene.texture().as_image_copy(),
+                        picture.texture().as_image_copy(),
+                        wgpu::Extent3d { width: targets.size.0, height: targets.size.1, depth_or_array_layers: 1 },
+                    );
+                    bindings
+                };
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("mesh_scene_filter"),
+                    color_attachments: &[Some(targets.mesh_filter_color(first))],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &targets.depth,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    }),
+                    timestamp_writes: self.timer.pass(Span::Post),
+                    ..Default::default()
+                });
+                if first {
+                    post.draw_backdrop(&mut self.built_ins, &mut pass);
+                }
+                draw_layers(&mut pass, filter_group, lights, &[(&[entry], Layer::Translucent)], &mut stats);
+            }
+            #[cfg(feature = "render-oit")]
+            let drew_oit = if frame.quality.oit && oit_pipelines.iter().any(Option::is_some) {
                 let mut fallback_translucent = Vec::new();
                 for (slot, &entry_idx) in scratch.translucent.iter().enumerate() {
                     if oit_pipelines.get(slot).and_then(Option::as_ref).is_none() {
@@ -1045,7 +1106,7 @@ impl State {
                     || !scratch.ribbons.is_empty()
                     || !scratch.overlays.is_empty()
                     || has_3d_lines;
-                {
+                if mesh_filters.is_empty() {
                     let mut backdrop_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("translucent_backdrop"),
                         color_attachments: &[Some(targets.color(wgpu::Color::BLACK, true, false))],
@@ -1145,10 +1206,23 @@ impl State {
                         )?;
                     }
                 }
+                true
             } else {
+                false
+            };
+            #[cfg(not(feature = "render-oit"))]
+            let drew_oit = {
+                let _ = &oit_pipelines;
+                false
+            };
+            if !drew_oit {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("translucent"),
-                    color_attachments: &[Some(targets.translucent_color())],
+                    color_attachments: &[Some(if mesh_filters.is_empty() {
+                        targets.translucent_color()
+                    } else {
+                        targets.color(wgpu::Color::BLACK, false, true)
+                    })],
                     timestamp_writes: self.timer.pass(Span::Scene),
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                         view: &targets.depth,
@@ -1157,7 +1231,9 @@ impl State {
                     }),
                     ..Default::default()
                 });
-                post.draw_backdrop(&mut self.built_ins, &mut pass);
+                if mesh_filters.is_empty() {
+                    post.draw_backdrop(&mut self.built_ins, &mut pass);
+                }
                 draw_layers(&mut pass, group, lights, &[(&scratch.translucent, Layer::Translucent)], &mut stats);
                 particles::draw(&mut pass, &scratch.emitters);
                 ribbons::draw(&mut pass, self.ribbons.as_ref(), &scratch.ribbons);
@@ -1325,7 +1401,7 @@ impl State {
         }
         // Stable order within each layer; sprites under a modal are drawn
         // before its backdrop and 3D icons, then the modal's own text follows.
-        scratch.insets.sort_by_key(|&(index, _)| frame.insets[index].after_sprites);
+        crate::sort::sort_by_u64_key(&mut scratch.insets, |&(index, _)| frame.insets[index].after_sprites as u64);
         let mut cursor = 0;
         for layer in 0..scratch.insets.len() {
             let index = scratch.insets[layer].0;
@@ -1610,7 +1686,7 @@ impl State {
             (output_width, output_height),
         )?;
         let ready = &scratch.ready;
-        scratch.insets.sort_by_key(|&(index, _)| frame.insets[index].after_sprites);
+        crate::sort::sort_by_u64_key(&mut scratch.insets, |&(index, _)| frame.insets[index].after_sprites as u64);
         let mut cursor = 0;
         for layer in 0..scratch.insets.len() {
             let index = scratch.insets[layer].0;

@@ -13,13 +13,19 @@ use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::asset_store::{MESH_VERTEX_FLOATS, Mesh};
+#[cfg(any(not(target_arch = "wasm32"), feature = "simplify", test))]
+use crate::asset_store::MESH_VERTEX_FLOATS;
+use crate::asset_store::Mesh;
 #[cfg(any(not(target_arch = "wasm32"), test))]
 use crate::meshlet_dag::DagClusterGpu;
-use crate::meshlet_dag::{MeshletDagConfig, MeshletDagMesh, build_meshlet_dag, build_meshlet_dag_from_leaves};
+use crate::meshlet_dag::MeshletDagMesh;
+#[cfg(any(not(target_arch = "wasm32"), feature = "simplify", test))]
+use crate::meshlet_dag::{MeshletDagConfig, build_meshlet_dag, build_meshlet_dag_from_leaves};
+use crate::meshlets::MeshletMesh;
+#[cfg(any(not(target_arch = "wasm32"), feature = "simplify", test))]
+use crate::meshlets::build_meshlets;
 #[cfg(any(not(target_arch = "wasm32"), test))]
 use crate::meshlets::{DEFAULT_MAX_MESHLET_TRIANGLES, DEFAULT_MAX_MESHLET_VERTICES, MeshletGpu};
-use crate::meshlets::{MeshletMesh, build_meshlets};
 
 #[cfg(any(not(target_arch = "wasm32"), test))]
 const CACHE_MAGIC: [u8; 8] = *b"PENMLC01";
@@ -140,10 +146,12 @@ pub(crate) fn build_meshlets_and_dag(mesh: &Mesh) -> (Option<MeshletMesh>, Optio
     build_meshlets_and_dag_from_slice(&mesh_positions(&mesh.vertices), idx_slice, &MeshletDagConfig::default())
 }
 
+#[cfg(any(not(target_arch = "wasm32"), feature = "simplify", test))]
 fn mesh_positions(vertices: &[f32]) -> Vec<[f32; 3]> {
     vertices.as_chunks::<MESH_VERTEX_FLOATS>().0.iter().map(|v| [v[0], v[1], v[2]]).collect()
 }
 
+#[cfg(any(not(target_arch = "wasm32"), feature = "simplify", test))]
 fn build_meshlets_and_dag_from_slice(
     positions: &[[f32; 3]],
     idx_slice: &[u32],
@@ -194,6 +202,12 @@ fn build_meshlets_and_dag_from_slice(
 pub(crate) fn prepare_mesh(mut mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
     let baked_ml = mesh.meshlets.take();
     let baked_dag = mesh.meshlet_dag.take();
+    #[cfg(target_arch = "wasm32")]
+    let (meshlets, meshlet_dag) = {
+        let _ = cache;
+        (baked_ml, baked_dag)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
     let (meshlets, meshlet_dag) = if baked_ml.is_some() || baked_dag.is_some() {
         (baked_ml, baked_dag)
     } else if mesh.skin.is_none() && mesh.morphs.is_none() && mesh.instances.is_none() {
@@ -206,20 +220,12 @@ pub(crate) fn prepare_mesh(mut mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
             && idx_slice.len() / 3 >= 128
         {
             let config = MeshletDagConfig::default();
-            #[cfg(not(target_arch = "wasm32"))]
             let hash = cache.enabled().then(|| hash_mesh_inputs(&mesh.vertices, idx_slice, &config));
-            #[cfg(not(target_arch = "wasm32"))]
             let cached = hash.as_ref().and_then(|hash| cache.load(hash));
-            #[cfg(target_arch = "wasm32")]
-            let cached: Option<(Option<MeshletMesh>, Option<MeshletDagMesh>)> = {
-                let _ = cache;
-                None
-            };
             if let Some(cached) = cached {
                 cached
             } else {
                 let (ml, dag) = build_meshlets_and_dag_from_slice(&mesh_positions(&mesh.vertices), idx_slice, &config);
-                #[cfg(not(target_arch = "wasm32"))]
                 if let Some(hash) = &hash {
                     cache.store(hash, ml.as_ref(), dag.as_ref());
                 }

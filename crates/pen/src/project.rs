@@ -970,37 +970,225 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
     Ok(())
 }
 
+/// What optional host JS files and Cargo features a static web export actually needs.
+#[cfg(feature = "compiler")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebHostPlan {
+    /// Whether the game uses retired `blot:tasks` structured concurrency (`structured.js`).
+    pub structured_js: bool,
+    /// Whether the game declares any compute kernels in `blot:abi` (`kernels.js` + `kernel_worker.js`).
+    pub kernels_js: bool,
+    /// Exact Cargo features to pass to `build.sh --features` when tailoring a static host.
+    pub features: Vec<&'static str>,
+}
+
+#[cfg(feature = "compiler")]
+fn wasm_contains_ext_tag(wasm: &[u8], tag: u32) -> bool {
+    let f32_le = (tag as f32).to_le_bytes();
+    if memchr::memmem::find(wasm, &f32_le).is_some() {
+        return true;
+    }
+    let mut leb = [0u8; 5];
+    let mut len = 0;
+    let mut value = tag;
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            leb[len] = byte;
+            len += 1;
+            break;
+        }
+        leb[len] = byte | 0x80;
+        len += 1;
+    }
+    memchr::memmem::find(wasm, &leb[..len]).is_some()
+}
+
+#[cfg(feature = "compiler")]
+impl WebHostPlan {
+    /// Inspects the exported `game.wasm`, `WebFiles` manifest, and shipped `assets/` directory
+    /// so static web exports never ship unused JS glue or unused host subsystems.
+    pub fn detect(wasm: &[u8], web: &pen_runtime::web::WebFiles, assets_dir: &Path) -> Result<Self> {
+        let abi = pen_runtime::abi::read_abi(wasm).ok();
+        let structured_js = abi.as_ref().is_some_and(|a| a.tasks.is_some());
+        let kernels_js = abi.as_ref().is_some_and(|a| !a.kernels.is_empty());
+
+        let mut sound_recipes = false;
+        let mut shader_graph = false;
+        let mut texture_recipes = false;
+        let mut mesh_json = false;
+        let mut render_meshlets = false;
+        let mut video = false;
+
+        if assets_dir.is_dir() {
+            for key in asset_keys(assets_dir)? {
+                let path = assets_dir.join(&key);
+                let mut head = [0u8; 6];
+                let head_len = std::fs::File::open(&path)
+                    .and_then(|mut file| {
+                        use std::io::Read;
+                        file.read(&mut head)
+                    })
+                    .unwrap_or(0);
+                if head_len >= 5 && &head[..4] == b"GTEX" && head[4] == 3 {
+                    texture_recipes = true;
+                }
+                if head_len >= 6 && &head[..4] == b"PMSH" {
+                    // Byte 5 carries the mesh flags in both PMSH v1 and v2; bit 7 (128) is MESH_MESHLETS.
+                    if (head[5] & 128) != 0 {
+                        render_meshlets = true;
+                    }
+                } else if (head_len >= 4 && &head[..4] == b"PMRP") || key.ends_with(".mesh.json") {
+                    mesh_json = true;
+                }
+                if key.ends_with(".sound") {
+                    sound_recipes = true;
+                } else if key.ends_with(".matgraph.json") {
+                    shader_graph = true;
+                } else if key.ends_with(".y4m")
+                    || key.ends_with(".ivf")
+                    || key.ends_with(".webm")
+                    || key.ends_with(".mp4")
+                {
+                    video = true;
+                }
+            }
+        }
+
+        let mut features = Vec::new();
+        if web.devtools {
+            features.push("devtools");
+        }
+        if kernels_js {
+            features.push("kernels");
+        }
+        if web.locales {
+            features.push("locales");
+        }
+        if web.saved {
+            features.push("saved-adapter");
+        }
+        if sound_recipes {
+            features.push("sound-recipes");
+        }
+        if mesh_json {
+            features.push("mesh-json");
+        }
+        if texture_recipes {
+            features.push("texture-recipes");
+        }
+        if shader_graph {
+            features.push("shader-graph");
+        }
+        if video {
+            features.push("video");
+        }
+        if wasm_contains_ext_tag(wasm, 65_008) || wasm_contains_ext_tag(wasm, 65_009) {
+            features.push("render-2d");
+        }
+        if wasm_contains_ext_tag(wasm, 65_001)
+            || wasm_contains_ext_tag(wasm, 65_002)
+            || wasm_contains_ext_tag(wasm, 65_003)
+        {
+            features.push("render-env");
+        }
+        if wasm_contains_ext_tag(wasm, 65_005) {
+            features.push("render-particles");
+        }
+        if wasm_contains_ext_tag(wasm, 65_006) {
+            features.push("render-lines");
+        }
+        if wasm_contains_ext_tag(wasm, 65_007) {
+            features.push("render-jfa-outline");
+        }
+        if render_meshlets {
+            features.push("render-meshlets");
+        }
+        // Standard RenderFrame header passes (cannot be statically ruled out from bytecode alone;
+        // authors can drop any of these explicitly via `--web-features`).
+        features.extend(["render-oit", "render-atmosphere", "render-pbr-decals", "render-post-fx"]);
+
+        Ok(Self { structured_js, kernels_js, features })
+    }
+}
+
 /// The browser host's files, into `out`: PEN_WEB_HOST's, those `just
 /// install` put beside this executable, else built from this repository.
 #[cfg(feature = "compiler")]
 pub fn web_host(out: &Path, compact: bool) -> Result<()> {
+    web_host_with_plan(out, compact, None, None)
+}
+
+#[cfg(feature = "compiler")]
+fn web_host_with_plan(
+    out: &Path,
+    compact: bool,
+    plan: Option<&WebHostPlan>,
+    explicit_features: Option<&str>,
+) -> Result<()> {
+    let ship_structured = plan.is_none_or(|p| p.structured_js);
+    let ship_kernels = match explicit_features {
+        Some(list) => list.split(',').any(|f| f.trim() == "kernels"),
+        None => plan.is_none_or(|p| p.kernels_js),
+    };
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pen-web/build.sh");
+    let tailored_features = explicit_features.map(str::to_owned).or_else(|| {
+        (compact && std::env::var_os("PEN_WEB_COMPACT_HOST").is_none() && script.is_file())
+            .then(|| plan.map(|p| p.features.join(",")))
+            .flatten()
+    });
+
+    if let Some(features) = tailored_features {
+        ensure!(script.is_file(), "tailoring the browser host requires crates/pen-web/build.sh");
+        let mut build = Command::new("sh");
+        build.arg(&script).arg(out).arg("--features").arg(&features);
+        let status = build.status().context("building tailored pen-web")?;
+        ensure!(status.success(), "the browser host did not build");
+        if ship_structured && !out.join("structured.js").is_file() {
+            let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pen-web/structured.js");
+            std::fs::copy(&src, out.join("structured.js")).context("copying browser host structured.js")?;
+        }
+        return Ok(());
+    }
+
     let (variable, directory) = if compact { ("PEN_WEB_COMPACT_HOST", "web-compact") } else { ("PEN_WEB_HOST", "web") };
     let host = std::env::var_os(variable).map(PathBuf::from).or_else(|| {
         let beside = std::env::current_exe().ok()?.parent()?.join(directory);
         beside.join("pen_web_bg.wasm").is_file().then_some(beside)
     });
     if let Some(host) = host {
-        for file in [
-            "pen_web.js",
-            "pen_web_bg.wasm",
-            "guest.js",
-            "structured.js",
-            "kernels.js",
-            "kernel_worker.js",
-            "index.html",
-        ] {
+        for file in ["pen_web.js", "pen_web_bg.wasm", "guest.js", "index.html"] {
             std::fs::copy(host.join(file), out.join(file)).with_context(|| format!("copying browser host {file}"))?;
         }
+        if ship_structured && host.join("structured.js").is_file() {
+            std::fs::copy(host.join("structured.js"), out.join("structured.js"))
+                .context("copying browser host structured.js")?;
+        }
+        if ship_kernels {
+            for file in ["kernels.js", "kernel_worker.js"] {
+                if host.join(file).is_file() {
+                    std::fs::copy(host.join(file), out.join(file))
+                        .with_context(|| format!("copying browser host {file}"))?;
+                }
+            }
+        }
     } else {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pen-web/build.sh");
         ensure!(script.is_file(), "set {variable} to a built pen-web host directory");
         let mut build = Command::new("sh");
-        build.arg(script).arg(out);
+        build.arg(&script).arg(out);
         if compact {
             build.arg("--compact");
         }
         let status = build.status().context("building pen-web")?;
         ensure!(status.success(), "the browser host did not build");
+        if !ship_structured {
+            let _ = std::fs::remove_file(out.join("structured.js"));
+        }
+        if !ship_kernels {
+            let _ = std::fs::remove_file(out.join("kernels.js"));
+            let _ = std::fs::remove_file(out.join("kernel_worker.js"));
+        }
     }
     Ok(())
 }
@@ -1009,11 +1197,18 @@ pub fn web_host(out: &Path, compact: bool) -> Result<()> {
 /// manifest as a complete static site, ready to host (`web_export`): its
 /// files precompressed and a service worker; and, given `zip`, as a ZIP.
 #[cfg(feature = "compiler")]
-pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: bool, compact: bool) -> Result<()> {
+pub fn export_web(
+    project: &Project,
+    out: &Path,
+    zip: Option<&Path>,
+    optimize: bool,
+    compact: bool,
+    explicit_features: Option<&str>,
+) -> Result<()> {
     ensure!(!compact || project.devtools().is_none(), "--web-compact cannot include a dev tools program");
     let staging = crate::staging::Staging::new(&project.root, out)?;
     let site = &staging.directory;
-    let PreparedGame { assets, .. } = prepare_game(&GameSource::Checkout(project), site, optimize)?;
+    let PreparedGame { wasm, assets } = prepare_game(&GameSource::Checkout(project), site, optimize)?;
     crate::services::locale::ship_tables(&project.assets(), site)?;
     project.compile_devtools(site)?;
     if site.join("devtools.wasm").is_file() {
@@ -1031,11 +1226,28 @@ pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: b
         captions: assets_dir.join("captions.json").is_file(),
         locales: site.join("text.json").is_file(),
     };
+    let plan = WebHostPlan::detect(&wasm, &web, &assets_dir)?;
     Manifest { game: project.identity.clone(), runtime: None, worker_deadlines: false, web: Some(web) }.write(site)?;
-    web_host(site, compact)?;
+    web_host_with_plan(site, compact, Some(&plan), explicit_features)?;
     notices(site)?;
     let hosting = crate::web_export::prepare(site)?;
-    eprintln!("exported {}: {assets}; {hosting}; {:.1} MB in all", out.display(), size_of(site) as f64 / 1e6);
+    let host_note = match explicit_features {
+        Some(list) => format!("host features=[{list}]"),
+        None if compact => format!("tailored host features=[{}]", plan.features.join(",")),
+        None => format!(
+            "host js={}",
+            [plan.structured_js.then_some("structured"), plan.kernels_js.then_some("kernels"),]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    };
+    eprintln!(
+        "exported {}: {assets}; {host_note}; {hosting}; {:.1} MB in all",
+        out.display(),
+        size_of(site) as f64 / 1e6
+    );
     crate::reproducible::settle_times(site)?;
     staging.publish()?;
     if let Some(zip) = zip {
@@ -1364,6 +1576,56 @@ mod tests {
         // The source is never written through.
         assert_eq!(std::fs::read_to_string(assets.join("cube.mesh.json")).unwrap(), mesh);
         assert_eq!(shipped.bytes, size_of(&out));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn web_host_plan_only_includes_features_the_game_uses() {
+        let root = fixture("web_plan");
+        let assets = root.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+
+        // 1. Minimal static 3D game with only a packed PMSH mesh (without meshlets) and plain PNGs:
+        //    no structured.js, no kernels.js, no locales, no saved-adapter, no recipes,
+        //    no shader-graph, no meshlets, no 2D/env/particles/lines/jfa passes.
+        std::fs::write(assets.join("cube.mesh.json"), b"PMSH\x01\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+        let web =
+            pen_runtime::web::WebFiles { scene: false, devtools: false, saved: false, captions: false, locales: false };
+        let minimal = WebHostPlan::detect(b"\0asm\x01\0\0\0", &web, &assets).unwrap();
+        assert!(!minimal.structured_js);
+        assert!(!minimal.kernels_js);
+        assert_eq!(minimal.features, vec!["render-oit", "render-atmosphere", "render-pbr-decals", "render-post-fx"]);
+
+        // 2. Game using locales, saved.json, .sound recipe, .matgraph.json, GTEX v3 (even under .png),
+        //    PMSH mesh with MESH_MESHLETS flag, unpacked JSON mesh, and 2D + lines extension tags:
+        std::fs::write(assets.join("boom.sound"), b"{}").unwrap();
+        std::fs::write(assets.join("look.matgraph.json"), b"{}").unwrap();
+        std::fs::write(assets.join("proc.png"), b"GTEX\x03\x04\x01\x01").unwrap();
+        std::fs::write(assets.join("hi.mesh.json"), b"PMSH\x02\x80\0\0\0\0\0\0\0\0\0\0").unwrap();
+        std::fs::write(assets.join("raw.mesh.json"), b"{}").unwrap();
+        let web_full =
+            pen_runtime::web::WebFiles { scene: true, devtools: false, saved: true, captions: true, locales: true };
+        let mut wasm_with_tags = b"\0asm\x01\0\0\0".to_vec();
+        wasm_with_tags.extend_from_slice(&65_008.0f32.to_le_bytes());
+        wasm_with_tags.extend_from_slice(&65_006.0f32.to_le_bytes());
+        let detected = WebHostPlan::detect(&wasm_with_tags, &web_full, &assets).unwrap();
+        for expected in [
+            "locales",
+            "saved-adapter",
+            "sound-recipes",
+            "mesh-json",
+            "texture-recipes",
+            "shader-graph",
+            "render-2d",
+            "render-lines",
+            "render-meshlets",
+        ] {
+            assert!(detected.features.contains(&expected), "missing {expected} in {:?}", detected.features);
+        }
+        assert!(!detected.features.contains(&"render-env"));
+        assert!(!detected.features.contains(&"render-particles"));
+        assert!(!detected.features.contains(&"render-jfa-outline"));
+        assert!(!detected.features.contains(&"kernels"));
         std::fs::remove_dir_all(root).unwrap();
     }
 }

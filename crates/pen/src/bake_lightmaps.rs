@@ -166,8 +166,8 @@ pub fn run(opts: &BakeCliOptions) -> Result<()> {
 
         if let Some(mesh_rel) = &spec.mesh {
             let mesh_path = base_dir.join(mesh_rel);
-            let mraw = std::fs::read_to_string(&mesh_path)
-                .with_context(|| format!("reading mesh {}", mesh_path.display()))?;
+            let mraw =
+                std::fs::read_to_string(&mesh_path).with_context(|| format!("reading mesh {}", mesh_path.display()))?;
             let mesh: MeshJson = serde_json::from_str(&mraw)?;
             let idx_list: Vec<u32> = if mesh.indices.is_empty() {
                 (0..u32::try_from(mesh.positions.len()).context("mesh vertex count exceeds u32::MAX")?).collect()

@@ -8,7 +8,15 @@ description = "The frame and render packets between pen and a game"
 [lints]
 workspace = true
 
+[features]
+default = ["diagnostics"]
+# Detailed structural packet diagnostics and development provenance parsing.
+diagnostics = []
+
 [dependencies]
 anyhow.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow = { workspace = true, features = ["std"] }

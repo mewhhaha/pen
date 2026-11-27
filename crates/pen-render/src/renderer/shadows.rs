@@ -21,7 +21,7 @@ use pen_protocol::boundary::MAX_CASCADES;
 
 /// WGSL a material shader adds to take the sun's shadows: `sun_shadow(world,
 /// normal, position)`, `sun_visibility`, `contact_shadow` (shadows.wgsl).
-pub const SHADOWS_WGSL: &str = include_str!("../shaders/shadows.wgsl");
+pub const SHADOWS_WGSL: &str = crate::wgsl!("shadows.wgsl");
 
 // The share of a slice, at its far end, over which a surface blends into the
 // next map's.
@@ -434,6 +434,21 @@ impl State {
             let group = self.build_scene(&bound, Some(&translucency));
             self.translucent_group = Some((group, bound));
         }
+    }
+
+    /// A mesh filter reads the previous filter's HDR color and the original opaque depth.
+    pub(super) fn bind_mesh_filter(
+        &self,
+        picture: &wgpu::TextureView,
+        opaque: &crate::post::OpaqueTargets,
+        volume: &crate::volume::Applied,
+    ) -> wgpu::BindGroup {
+        let (_, plain) = self.scene_group.as_ref().expect("filters draw after the scene");
+        let bound = SceneKey { opaque: opaque.serial, volume: volume.serial, ..*plain };
+        self.build_scene(
+            &bound,
+            Some(&Translucency { picture, depth: &opaque.depth, froxels: &volume.texture, fog: &volume.uniform }),
+        )
     }
 
     /// A scene bind group for the maps, contact depth and picture `bound` names,

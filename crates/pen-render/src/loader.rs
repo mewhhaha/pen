@@ -349,7 +349,11 @@ impl Loader {
         loader(self.jobs.sharing(worker))
     }
 
-    fn parts(root: PathBuf, context: PipelineContext, mesh_cache: MeshCache) -> (Worker, impl FnOnce(JobQueue) -> Loader) {
+    fn parts(
+        root: PathBuf,
+        context: PipelineContext,
+        mesh_cache: MeshCache,
+    ) -> (Worker, impl FnOnce(JobQueue) -> Loader) {
         let (sender, results) = channel();
         let closed = Arc::new(AtomicBool::new(false));
         let needs = Arc::new(Mutex::new(Needs::default()));
@@ -404,7 +408,13 @@ impl Worker {
         match job {
             Job::Load { slot, kind, key, revision, early } => self.load(slot, kind, &key, revision, early).await,
             Job::Sort { key } => {
+                #[cfg(feature = "shader-graph")]
                 if crate::shader_graph::is_shader_graph_key(&key) {
+                    self.send(Message::Sorted { key, sprite: false });
+                    return;
+                }
+                #[cfg(not(feature = "shader-graph"))]
+                if key.ends_with(".matgraph.json") {
                     self.send(Message::Sorted { key, sprite: false });
                     return;
                 }
@@ -551,6 +561,15 @@ impl Worker {
                 self.send(loaded(pipeline.map(Loaded::SpriteShader)));
             }
             AssetKind::Shader => {
+                #[cfg(not(feature = "shader-graph"))]
+                if key.ends_with(".matgraph.json") {
+                    return self.send(loaded(Err(anyhow::anyhow!(
+                        "use a host built with shader-graph for .matgraph.json shader graphs"
+                    ))));
+                }
+                #[cfg(not(feature = "shader-graph"))]
+                let compiled_graph: Option<String> = None;
+                #[cfg(feature = "shader-graph")]
                 let compiled_graph = if crate::shader_graph::is_shader_graph_key(key) {
                     match serde_json::from_slice::<crate::shader_graph::ShaderGraph>(&bytes)
                         .map_err(anyhow::Error::from)
@@ -590,7 +609,7 @@ impl Worker {
                     // An image, whole, its smaller levels drawn from it.
                     return self.send(loaded(platform::decode_image(bytes).await.map(Loaded::Image)));
                 }
-                let mut reader = match LevelReader::open(bytes, device.features()) {
+                let mut reader = match LevelReader::open_async(bytes, device.features()).await {
                     Ok(reader) => reader,
                     Err(error) => return self.send(loaded(Err(error))),
                 };

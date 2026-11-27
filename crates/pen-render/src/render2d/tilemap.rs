@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::{Draw2d, buffer, pipeline, prepared};
 
-pub const TILEMAP_WGSL: &str = include_str!("../shaders/render2d_tilemap.wgsl");
+pub const TILEMAP_WGSL: &str = crate::wgsl!("render2d_tilemap.wgsl");
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Pod, Zeroable)]

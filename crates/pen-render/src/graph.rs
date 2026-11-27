@@ -197,7 +197,7 @@ impl GraphBuilder {
         // First used first, each into an allocation of its spec that is free
         // by then, or a new one.
         let mut order: Vec<usize> = (0..self.textures.len()).filter(|&index| uses[index].is_some()).collect();
-        order.sort_by_key(|&index| uses[index].unwrap().0);
+        crate::sort::insertion_sort_by(&mut order, |&a, &b| uses[a].unwrap().0.cmp(&uses[b].unwrap().0));
         let mut allocation = vec![None; self.textures.len()];
         let mut allocations: Vec<Spec> = Vec::new();
         let mut free_after: Vec<usize> = Vec::new();

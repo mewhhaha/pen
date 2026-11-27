@@ -18,7 +18,7 @@ use crate::meshlets::{
     build_meshlets,
 };
 
-pub const MESHLET_DAG_CUT_WGSL: &str = include_str!("shaders/meshlet_dag_cut.wgsl");
+pub const MESHLET_DAG_CUT_WGSL: &str = crate::wgsl!("meshlet_dag_cut.wgsl");
 const NO_PARENT: u32 = u32::MAX;
 const ROOT_ERROR: f32 = 1e30;
 const ROOT_ERROR_MIN: f32 = 1e29;
@@ -699,6 +699,7 @@ pub fn build_meshlet_dag(positions: &[[f32; 3]], indices: &[u32], config: &Meshl
 /// Builds a Cluster DAG from pre-partitioned leaf meshlets that already address
 /// finite positions and contain no degenerate triangles, avoiding a redundant
 /// leaf `build_meshlets` pass.
+#[cfg_attr(all(target_arch = "wasm32", not(feature = "simplify")), allow(dead_code))]
 pub(crate) fn build_meshlet_dag_from_leaves(
     positions: &[[f32; 3]],
     leaves: &MeshletMesh,
@@ -956,6 +957,7 @@ fn build_cull_uniform(
     })
 }
 
+#[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
 pub(crate) struct MeshletDagBatchEntry<'a> {
     pub mesh: &'a MeshletDagGpu,
     pub output: &'a MeshletDagTwoPhaseOutput,
@@ -983,12 +985,14 @@ struct DagTwoPhasePipelines {
     phase2_pipeline: wgpu::ComputePipeline,
 }
 
+#[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
 #[derive(Default)]
 struct DagBatchSlot {
     uniform_buf: Option<wgpu::Buffer>,
     bg_cache: Vec<(bool, wgpu::Buffer, wgpu::Buffer, wgpu::TextureView, wgpu::BindGroup)>,
 }
 
+#[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
 #[derive(Default)]
 struct DagBatchCache {
     phase1: DagBatchSlot,
@@ -1003,6 +1007,7 @@ pub struct MeshletDagCuller {
     shader: wgpu::ShaderModule,
     two_phase: OnceLock<DagTwoPhasePipelines>,
     dummy_hiz: wgpu::TextureView,
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
     batch_cache: Box<DagBatchCache>,
 }
 
@@ -1140,6 +1145,7 @@ impl MeshletDagCuller {
         self.dispatch(device, encoder, mesh, DagCullPass::Phase2(output), params, current_hiz)
     }
 
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
     pub(crate) fn cull_batch_single(
         &mut self,
         device: &wgpu::Device,
@@ -1151,6 +1157,7 @@ impl MeshletDagCuller {
         self.dispatch_batch(device, queue, encoder, batch, false, false, hiz)
     }
 
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
     pub(crate) fn cull_batch_phase1(
         &mut self,
         device: &wgpu::Device,
@@ -1162,6 +1169,7 @@ impl MeshletDagCuller {
         self.dispatch_batch(device, queue, encoder, batch, true, false, prior_hiz)
     }
 
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
     pub(crate) fn cull_batch_phase2(
         &mut self,
         device: &wgpu::Device,
@@ -1173,6 +1181,7 @@ impl MeshletDagCuller {
         self.dispatch_batch(device, queue, encoder, batch, true, true, current_hiz)
     }
 
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     fn dispatch_batch(
         &mut self,

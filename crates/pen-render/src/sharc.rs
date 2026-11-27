@@ -8,7 +8,7 @@ use anyhow::{Result, ensure};
 use wgpu::util::DeviceExt;
 
 pub const SHARC_DEFAULT_CAPACITY: u32 = 1 << 17;
-pub const SHARC_WGSL: &str = include_str!("shaders/sharc.wgsl");
+pub const SHARC_WGSL: &str = crate::wgsl!("sharc.wgsl");
 
 /// Prefix this to a read-write shader with its own `sharc_u`, `sharc_keys`,
 /// `sharc_accum` and `sharc_resolved` bindings. See the WGSL for their types.

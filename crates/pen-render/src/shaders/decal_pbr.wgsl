@@ -31,15 +31,25 @@ struct PbrDecal {
 
 const PI: f32 = 3.14159265359;
 
-const CORNERS = array<vec3f, 8>(
-  vec3f(-1.0, -1.0, -1.0), vec3f(1.0, -1.0, -1.0), vec3f(-1.0, 1.0, -1.0), vec3f(1.0, 1.0, -1.0),
-  vec3f(-1.0, -1.0, 1.0), vec3f(1.0, -1.0, 1.0), vec3f(-1.0, 1.0, 1.0), vec3f(1.0, 1.0, 1.0),
-);
-const FACES = array<u32, 36>(
-  0u, 4u, 6u, 0u, 6u, 2u, 1u, 3u, 7u, 1u, 7u, 5u,
-  0u, 1u, 5u, 0u, 5u, 4u, 2u, 6u, 7u, 2u, 7u, 3u,
-  0u, 2u, 3u, 0u, 3u, 1u, 4u, 5u, 7u, 4u, 7u, 6u,
-);
+fn cube_corner(vertex: u32) -> vec3f {
+  let face = vertex / 6u;
+  let slot = vertex % 6u;
+  var packed = 0u;
+  switch face {
+    case 0u: { packed = 0u | (4u << 3u) | (6u << 6u) | (0u << 9u) | (6u << 12u) | (2u << 15u); }
+    case 1u: { packed = 1u | (3u << 3u) | (7u << 6u) | (1u << 9u) | (7u << 12u) | (5u << 15u); }
+    case 2u: { packed = 0u | (1u << 3u) | (5u << 6u) | (0u << 9u) | (5u << 12u) | (4u << 15u); }
+    case 3u: { packed = 2u | (6u << 3u) | (7u << 6u) | (2u << 9u) | (7u << 12u) | (3u << 15u); }
+    case 4u: { packed = 0u | (2u << 3u) | (3u << 6u) | (0u << 9u) | (3u << 12u) | (1u << 15u); }
+    default: { packed = 4u | (5u << 3u) | (7u << 6u) | (4u << 9u) | (7u << 12u) | (6u << 15u); }
+  }
+  let c = (packed >> (slot * 3u)) & 7u;
+  return vec3f(
+    select(-1.0, 1.0, (c & 1u) != 0u),
+    select(-1.0, 1.0, (c & 2u) != 0u),
+    select(-1.0, 1.0, (c & 4u) != 0u),
+  );
+}
 
 struct BoxOut {
   @builtin(position) position: vec4f,
@@ -47,7 +57,7 @@ struct BoxOut {
 };
 
 @vertex fn vertex(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> BoxOut {
-  let corner = CORNERS[FACES[vid]];
+  let corner = cube_corner(vid);
   return BoxOut(view.view_projection * decals[iid].model * vec4f(corner, 1.0), iid);
 }
 

@@ -4,7 +4,7 @@
 
 use anyhow::{Result, ensure};
 
-pub const SVGF_WGSL: &str = include_str!("shaders/svgf.wgsl");
+pub const SVGF_WGSL: &str = crate::wgsl!("svgf.wgsl");
 
 /// Tuning parameters for the SVGF temporal accumulation and À-Trous edge-stopping passes.
 #[derive(Clone, Copy, Debug)]

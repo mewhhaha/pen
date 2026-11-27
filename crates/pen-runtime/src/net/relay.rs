@@ -420,7 +420,7 @@ impl RelayBroker {
                 capacity: room.players,
             })
             .collect();
-        out.sort_by(|a, b| a.room.cmp(&b.room));
+        crate::sort::shell_sort_by(&mut out, |a, b| a.room.cmp(&b.room));
         out
     }
 

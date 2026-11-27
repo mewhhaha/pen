@@ -10,8 +10,8 @@ use anyhow::{Result, ensure};
 
 use crate::environment_passes::PipelineTarget;
 
-pub const GPU_PARTICLES_SIM_WGSL: &str = include_str!("shaders/gpu_particles_sim.wgsl");
-pub const GPU_PARTICLES_DRAW_WGSL: &str = include_str!("shaders/gpu_particles_draw.wgsl");
+pub const GPU_PARTICLES_SIM_WGSL: &str = crate::wgsl!("gpu_particles_sim.wgsl");
+pub const GPU_PARTICLES_DRAW_WGSL: &str = crate::wgsl!("gpu_particles_draw.wgsl");
 
 /// GPU-side 64-byte stateful particle record matching `gpu_particles_sim.wgsl`.
 #[repr(C)]
@@ -163,7 +163,9 @@ pub struct GpuParticleSystem {
     pipe_compact: wgpu::ComputePipeline,
     draw_uniform: wgpu::Buffer,
     draw_bg: wgpu::BindGroup,
+    #[cfg_attr(not(feature = "render-particles"), allow(dead_code))]
     draw_module: wgpu::ShaderModule,
+    #[cfg_attr(not(feature = "render-particles"), allow(dead_code))]
     draw_layout: wgpu::PipelineLayout,
     draw_pipelines: Vec<(PipelineTarget, wgpu::RenderPipeline)>,
     mesh_vb: wgpu::Buffer,
@@ -461,6 +463,7 @@ impl GpuParticleSystem {
         })
     }
 
+    #[cfg_attr(not(feature = "render-particles"), allow(dead_code))]
     pub(crate) fn select_draw_target(&mut self, device: &wgpu::Device, target: PipelineTarget) {
         if let Some(index) = self.draw_pipelines.iter().position(|(key, _)| *key == target) {
             self.draw_pipelines.swap(0, index);

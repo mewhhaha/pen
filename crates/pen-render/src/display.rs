@@ -123,7 +123,7 @@ pub(crate) fn toned_wgsl(peak: f32) -> String {
     )
 }
 
-pub(crate) const DECODE: &str = include_str!("shaders/decode.wgsl");
+pub(crate) const DECODE: &str = crate::wgsl!("decode.wgsl");
 
 /// The `Screen` of one surface, which every renderer drawing over its frames
 /// shares: behind a mutex natively, where a renderer may move between
@@ -185,7 +185,7 @@ impl Screen {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("decode"),
             source: wgpu::ShaderSource::Wgsl(
-                DECODE.replace("${fullscreen}", include_str!("shaders/fullscreen.wgsl")).into(),
+                DECODE.replace("${fullscreen}", crate::wgsl!("fullscreen.wgsl")).into(),
             ),
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {

@@ -19,12 +19,14 @@ pub(crate) const DECAL_MARK: u32 = 2;
 // Model and inverse matrices, then color times opacity, per decal.
 const DECAL_FLOATS: usize = 36;
 
-const SHADER: &str = include_str!("shaders/decals.wgsl");
+const SHADER: &str = crate::wgsl!("decals.wgsl");
 /// Standalone WGSL source for physically based deferred decals (albedo + tangent-space normal + ORM + emissive).
-pub const PBR_DECAL_WGSL: &str = include_str!("shaders/decal_pbr.wgsl");
+pub const PBR_DECAL_WGSL: &str = crate::wgsl!("decal_pbr.wgsl");
 
-fn shader(samples: u32) -> String {
-    SHADER.replace("${depth_texture}", if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" })
+fn shader(samples: u32, paint: bool) -> String {
+    SHADER
+        .replace("${depth_texture}", if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" })
+        .replace("${paint}", if paint { "true" } else { "false" })
 }
 
 fn pbr_shader(samples: u32) -> String {
@@ -59,9 +61,66 @@ pub(crate) struct DecalBatch {
 pub(crate) fn pipeline(context: &PipelineContext, samples: u32, paint: bool) -> wgpu::RenderPipeline {
     use wgpu::{BlendComponent, BlendFactor, BlendOperation};
     let device = &context.device;
+    let label = if paint { "decals (paint)" } else { "decals (multiply)" };
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(shader(samples, paint).into()),
+    });
+    let group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("decals"),
-        source: wgpu::ShaderSource::Wgsl(shader(samples).into()),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(144),
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: samples > 1,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("decals"),
+        bind_group_layouts: &[Some(&group_layout)],
+        immediate_size: 0,
     });
     let keep = wgpu::StencilFaceState {
         compare: wgpu::CompareFunction::Equal,
@@ -78,11 +137,11 @@ pub(crate) fn pipeline(context: &PipelineContext, samples: u32, paint: bool) -> 
         BlendComponent { src_factor: BlendFactor::Dst, dst_factor: BlendFactor::Zero, operation: BlendOperation::Add }
     };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("decals"),
-        layout: None,
+        label: Some(label),
+        layout: Some(&layout),
         vertex: wgpu::VertexState {
             module: &module,
-            entry_point: None,
+            entry_point: Some("vertex"),
             compilation_options: Default::default(),
             buffers: &[],
         },
@@ -104,7 +163,7 @@ pub(crate) fn pipeline(context: &PipelineContext, samples: u32, paint: bool) -> 
         multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
         fragment: Some(wgpu::FragmentState {
             module: &module,
-            entry_point: Some(if paint { "paint" } else { "fragment" }),
+            entry_point: Some("fragment"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
                 format: SCENE_FORMAT,

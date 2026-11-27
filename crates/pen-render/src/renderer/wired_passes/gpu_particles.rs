@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-particles"), allow(unused_imports, dead_code))]
 use super::super::State;
 use super::{GPU_PARTICLES_EXT_TAG, WiredPasses};
 use crate::built_in::BuiltIns;
@@ -71,6 +72,7 @@ impl Default for GpuParticleScene {
 #[derive(Default)]
 pub(in crate::renderer) struct GpuParticleWiredState {
     pub scene: Option<GpuParticleScene>,
+    #[cfg(feature = "render-particles")]
     pub system: Option<GpuParticleSystem>,
     pub config_key: Option<(u32, u64)>,
     last_step_frame: Option<u64>,
@@ -172,6 +174,12 @@ fn decode_ext_gpu_particles(frame: &RenderFrame) -> Option<(GpuParticleScene, bo
 }
 
 impl State {
+    #[cfg(not(feature = "render-particles"))]
+    pub(in crate::renderer) fn has_active_gpu_particles(&self, _frame: &RenderFrame) -> bool {
+        false
+    }
+
+    #[cfg(feature = "render-particles")]
     pub(in crate::renderer) fn has_active_gpu_particles(&self, frame: &RenderFrame) -> bool {
         if self.device.limits().max_storage_buffers_per_shader_stage < 5 {
             return false;
@@ -180,6 +188,27 @@ impl State {
             || frame.extensions.iter().any(|e| e.tag == GPU_PARTICLES_EXT_TAG && e.values.len() >= 16)
     }
 
+    #[cfg(not(feature = "render-particles"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_gpu_particles_wired(
+        _wired: &mut WiredPasses,
+        _built_ins: &mut BuiltIns,
+        _device: &wgpu::Device,
+        _encoder: &mut wgpu::CommandEncoder,
+        _frame: &RenderFrame,
+        _active_proj: &Matrix,
+        _color_attachment: wgpu::RenderPassColorAttachment<'_>,
+        _depth_view: &wgpu::TextureView,
+        _depth_only: &wgpu::TextureView,
+        _size: (u32, u32),
+        _samples: u32,
+        _depth_mode: DepthMode,
+        _frame_number: u64,
+    ) -> Result<Option<ParticleStep>> {
+        Ok(None)
+    }
+
+    #[cfg(feature = "render-particles")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_gpu_particles_wired(
         wired: &mut WiredPasses,

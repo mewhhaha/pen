@@ -12,18 +12,80 @@ workspace = true
 crate-type = ["cdylib"]
 
 [features]
-# Static single-player games without dev tools, netplay or video textures.
-compact = ["pen-render/web-compact"]
+default = [
+  "devtools",
+  "netplay",
+  "video",
+  "replay",
+  "kernels",
+  "locales",
+  "saved-adapter",
+  "sound-recipes",
+  "mesh-json",
+  "texture-recipes",
+  "shader-graph",
+  "render-rt",
+  "render-2d",
+  "render-env",
+  "render-particles",
+  "render-lines",
+  "render-jfa-outline",
+  "render-meshlets",
+  "render-oit",
+  "render-atmosphere",
+  "render-pbr-decals",
+  "render-post-fx",
+]
+# General-purpose static single-player host (omits dev tools, netplay, video,
+# replay recording, runtime mesh/texture/shader recipes, and software RT).
+compact = [
+  "kernels",
+  "locales",
+  "saved-adapter",
+  "sound-recipes",
+  "render-2d",
+  "render-env",
+  "render-particles",
+  "render-lines",
+  "render-jfa-outline",
+  "render-meshlets",
+  "render-oit",
+  "render-atmosphere",
+  "render-pbr-decals",
+  "render-post-fx",
+]
+devtools = ["pen-protocol/diagnostics", "pen-runtime/semantic"]
+netplay = ["pen-runtime/netplay"]
+video = []
+replay = ["pen-runtime/replay"]
+kernels = []
+locales = ["pen-runtime/locales"]
+saved-adapter = ["dep:pen-ink"]
+sound-recipes = ["pen-runtime/sound-recipes"]
+mesh-json = ["pen-render/mesh-json"]
+texture-recipes = ["pen-render/texture-recipes"]
+shader-graph = ["pen-render/shader-graph"]
+render-rt = ["pen-render/render-rt"]
+render-2d = ["pen-render/render-2d"]
+render-env = ["pen-render/render-env"]
+render-particles = ["pen-render/render-particles"]
+render-lines = ["pen-render/render-lines"]
+render-jfa-outline = ["pen-render/render-jfa-outline"]
+render-meshlets = ["pen-render/render-meshlets"]
+render-oit = ["pen-render/render-oit"]
+render-atmosphere = ["pen-render/render-atmosphere"]
+render-pbr-decals = ["pen-render/render-pbr-decals"]
+render-post-fx = ["pen-render/render-post-fx"]
 
 # The browser host builds for wasm32-unknown-unknown (build.sh, with the
 # workspace's `web` profile); for any other target the crate is empty, so
 # the workspace builds and lints as a whole.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 anyhow.workspace = true
-pen-protocol.workspace = true
-pen-runtime.workspace = true
-pen-ink.workspace = true
-pen-render.workspace = true
+pen-protocol = { path = "../pen-protocol", default-features = false }
+pen-runtime = { path = "../pen-runtime", default-features = false }
+pen-ink = { path = "../pen-ink", optional = true }
+pen-render = { path = "../pen-render", default-features = false }
 pen-simulation.workspace = true
 futures-channel = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["async-await-macro"] }

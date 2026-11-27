@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-jfa-outline"), allow(unused_imports, dead_code))]
 use super::super::{Drawing, GpuAsset, ReadyEntry, Source, State};
 use super::{JFA_OUTLINE_EXT_TAG, WiredPasses};
 use crate::asset_store::MESH_VERTEX_FLOATS;
@@ -43,6 +44,7 @@ pub struct JfaOutlineScene {
 pub(in crate::renderer) struct JfaOutlineWiredState {
     pub scene: Option<JfaOutlineScene>,
     pub devtools_scene: Option<JfaOutlineScene>,
+    #[cfg(feature = "render-jfa-outline")]
     pub pass: Option<JfaOutlinePass>,
 }
 
@@ -96,6 +98,12 @@ fn decode_ext_jfa(frame: &RenderFrame) -> Option<JfaOutlineScene> {
 }
 
 impl State {
+    #[cfg(not(feature = "render-jfa-outline"))]
+    pub(in crate::renderer) fn gather_jfa_outlines(&self, _frame: &RenderFrame) -> OutlineScenes {
+        Default::default()
+    }
+
+    #[cfg(feature = "render-jfa-outline")]
     pub(in crate::renderer) fn gather_jfa_outlines(&self, frame: &RenderFrame) -> OutlineScenes {
         let normalize = |mut scene: JfaOutlineScene| {
             let mut unique = BTreeMap::new();
@@ -117,6 +125,30 @@ impl State {
         ]
     }
 
+    #[cfg(not(feature = "render-jfa-outline"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_jfa_outlines_wired(
+        _wired: &mut WiredPasses,
+        _built_ins: &mut BuiltIns,
+        _drawing: &Drawing<'_>,
+        _ready: &[ReadyEntry],
+        _joints: Option<(&wgpu::Buffer, u64)>,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _encoder: &mut wgpu::CommandEncoder,
+        _frame: &RenderFrame,
+        _outline_scene: &JfaOutlineScene,
+        _active_proj: &Matrix,
+        _scene_view: &wgpu::TextureView,
+        _depth_only: &wgpu::TextureView,
+        _size: (u32, u32),
+        _samples: u32,
+        _depth_mode: DepthMode,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "render-jfa-outline")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_jfa_outlines_wired(
         wired: &mut WiredPasses,

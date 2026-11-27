@@ -195,7 +195,7 @@ pub(crate) fn select(lights: &[Light], view: &Matrix, projection: &Matrix, budge
                 })
         })
         .collect();
-    asking.sort_by(|&a, &b| rank(lights, eye, a, b));
+    crate::sort::insertion_sort_by(&mut asking, |&a, &b| rank(lights, eye, a, b));
     for index in asking {
         if selection.casters.len() >= budget as usize {
             break;

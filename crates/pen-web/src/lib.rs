@@ -7,21 +7,21 @@ pub mod policy;
 mod accessibility;
 #[cfg(target_arch = "wasm32")]
 mod audio;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "devtools"))]
 mod development;
 #[cfg(target_arch = "wasm32")]
 mod files;
 #[cfg(target_arch = "wasm32")]
 mod input;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "kernels"))]
 mod kernels;
-#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+#[cfg(all(target_arch = "wasm32", feature = "netplay"))]
 pub mod net;
 #[cfg(target_arch = "wasm32")]
 mod preferences;
 #[cfg(target_arch = "wasm32")]
 mod program;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "replay"))]
 mod replay;
 #[cfg(target_arch = "wasm32")]
 mod run;
@@ -31,9 +31,9 @@ mod saves;
 mod screen;
 #[cfg(target_arch = "wasm32")]
 mod services;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "devtools"))]
 mod tools;
-#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+#[cfg(all(target_arch = "wasm32", feature = "video"))]
 mod video;
 
 #[cfg(target_arch = "wasm32")]
@@ -42,7 +42,7 @@ use anyhow::Result;
 use js_sys::Uint8Array;
 #[cfg(target_arch = "wasm32")]
 use pen_protocol::{Catalog, RenderFrame, Viewport};
-#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+#[cfg(all(target_arch = "wasm32", feature = "devtools"))]
 use pen_protocol::{GameEvent, service, service_status};
 #[cfg(target_arch = "wasm32")]
 use pen_runtime::devtools::{Log, log_source};
@@ -50,10 +50,12 @@ use pen_runtime::devtools::{Log, log_source};
 use pen_runtime::game::Host;
 #[cfg(target_arch = "wasm32")]
 use pen_runtime::snapshot;
-#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+#[cfg(all(target_arch = "wasm32", feature = "devtools"))]
 use pen_runtime::snapshot::SavedState;
+#[cfg(all(target_arch = "wasm32", feature = "saved-adapter"))]
+use pen_runtime::state::CONFIG_FILE;
 #[cfg(target_arch = "wasm32")]
-use pen_runtime::state::{self, CONFIG_FILE, StateAdapter};
+use pen_runtime::state::{self, StateAdapter};
 #[cfg(target_arch = "wasm32")]
 use pen_runtime::web::WebFiles;
 #[cfg(target_arch = "wasm32")]
@@ -71,7 +73,7 @@ use program::{BrowserBackend, error};
 use run::{Browser, Options, Runtime};
 #[cfg(target_arch = "wasm32")]
 use screen::Screen;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "devtools"))]
 use tools::Tools;
 
 /// Fetches `path`, relative to the page.
@@ -93,7 +95,7 @@ async fn read_response(path: &str, response: Response) -> Result<Vec<u8>> {
 }
 
 /// Loads the game's string tables through the translation index beside the page.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "locales"))]
 async fn load_locales() -> Result<Option<pen_runtime::locale::Locales>> {
     use anyhow::Context;
 
@@ -145,7 +147,7 @@ async fn load_locales() -> Result<Option<pen_runtime::locale::Locales>> {
 
 /// Fetches `path`, rejecting responses whose `Content-Length` or payload exceeds `max_bytes`
 /// before copying into Wasm linear memory.
-#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+#[cfg(all(target_arch = "wasm32", feature = "video"))]
 pub async fn fetch_bounded(path: &str, max_bytes: usize) -> Result<Vec<u8>> {
     let response: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str(path))
         .await
@@ -167,7 +169,7 @@ pub async fn fetch_bounded(path: &str, max_bytes: usize) -> Result<Vec<u8>> {
 }
 
 /// Missing optional declarations are opaque; all other failures stay visible.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "saved-adapter"))]
 pub(crate) async fn load_state_adapter(assets: &str) -> Arc<dyn StateAdapter> {
     let path = format!("{assets}/{CONFIG_FILE}");
     let loaded: Result<Arc<dyn StateAdapter>> = async {
@@ -190,6 +192,12 @@ pub(crate) async fn load_state_adapter(assets: &str) -> Arc<dyn StateAdapter> {
         web_sys::console::error_1(&message.clone().into());
         state::invalid(message)
     })
+}
+
+#[cfg(all(target_arch = "wasm32", not(feature = "saved-adapter")))]
+#[cfg_attr(not(feature = "devtools"), allow(dead_code))]
+pub(crate) async fn load_state_adapter(_assets: &str) -> Arc<dyn StateAdapter> {
+    state::opaque()
 }
 
 /// Names the page after the game, as its `game.json` (`pen build --web`
@@ -267,10 +275,11 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         |key: &str| js_sys::Reflect::get(&options, &key.into()).ok().and_then(|value| value.as_bool()).unwrap_or(false);
     let assets = path("assets", "assets");
     let development = flag("development");
-    if cfg!(feature = "compact")
-        && (development || flag("qualify") || js_sys::Reflect::has(&options, &"netRelay".into()).unwrap_or(false))
-    {
-        return Err(failed("use the full browser host for development, qualification or netplay"));
+    if !cfg!(feature = "devtools") && (development || flag("qualify")) {
+        return Err(failed("use a browser host built with devtools for development or qualification"));
+    }
+    if !cfg!(feature = "netplay") && js_sys::Reflect::has(&options, &"netRelay".into()).unwrap_or(false) {
+        return Err(failed("use a browser host built with netplay for netRelay"));
     }
     let manifest_path = path("manifest", "game.json");
     let game_path = path("game", "game.wasm");
@@ -288,10 +297,17 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
             captions: development,
             locales: development,
         });
-        if cfg!(feature = "compact") && files.devtools {
-            return Err(failed("use the full browser host to run devtools.wasm"));
+        if !cfg!(feature = "devtools") && files.devtools {
+            return Err(failed("use a browser host built with devtools to run devtools.wasm"));
+        }
+        if !cfg!(feature = "saved-adapter") && files.saved {
+            return Err(failed("use a browser host built with saved-adapter for assets/saved.json"));
+        }
+        if !cfg!(feature = "locales") && files.locales {
+            return Err(failed("use a browser host built with locales for text.json"));
         }
         let saved = async { if files.saved { load_state_adapter(&assets).await } else { state::opaque() } };
+        #[cfg(feature = "locales")]
         let locales = async {
             if !files.locales {
                 return None;
@@ -301,6 +317,8 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
                 None
             })
         };
+        #[cfg(not(feature = "locales"))]
+        let locales = async { None::<()> };
         let (scene, devtools, state_adapter, captions, locales) = futures_util::join!(
             optional_file(&scene_path, files.scene),
             optional_file(&devtools_path, files.devtools),
@@ -323,6 +341,8 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     let mut screen = screen.map_err(failed)?;
     screen.renderer.preload(&catalog);
     let (name, scene, devtools, state_adapter, captions, locales) = content?;
+    #[cfg(not(feature = "locales"))]
+    let _ = locales;
     let scene = scene.and_then(|bytes| snapshot::decode(&bytes).ok());
     let captions = captions.map_or_else(Default::default, |bytes| {
         pen_runtime::captions::Captions::parse(&String::from_utf8_lossy(&bytes)).unwrap_or_else(|error| {
@@ -330,7 +350,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
             Default::default()
         })
     });
-    #[cfg(not(feature = "compact"))]
+    #[cfg(feature = "netplay")]
     let relay_config =
         js_sys::Reflect::get(&options, &"netRelay".into()).ok().filter(|v| v.is_object()).and_then(|obj| {
             let url = js_sys::Reflect::get(&obj, &"url".into()).ok()?.as_string()?;
@@ -355,30 +375,33 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         development,
         qualify: flag("qualify"),
         name,
+        #[cfg(feature = "replay")]
         replay: replay::linked(),
         state_adapter: state_adapter.clone(),
         assets: assets.clone(),
         captions,
+        #[cfg(feature = "locales")]
         locales,
-        #[cfg(not(feature = "compact"))]
+        #[cfg(feature = "netplay")]
         netplay: None,
     };
     let mut log = Log::new(run::LOG_LINES);
     log.push(log_source::SESSION, false, "pen browser host ready");
     let viewport = screen.viewport();
+    #[cfg(feature = "kernels")]
     let game_wasm_for_kernels = game.clone();
-    #[cfg(not(feature = "compact"))]
+    #[cfg(feature = "netplay")]
     let build_hash = pen_runtime::net::wire::hash_bytes(&game);
     let started = {
         let mut host = Starting { viewport, log: &mut log, state_adapter: &state_adapter };
         Runtime::new(&BrowserBackend, game, catalog.clone(), &mut host, autosave, scene).await
     };
     let runtime = started.map_err(failed)?;
-    #[cfg(not(feature = "compact"))]
+    #[cfg(feature = "netplay")]
     let mut runtime = runtime;
-    #[cfg(not(feature = "compact"))]
+    #[cfg(feature = "netplay")]
     let mut options = options;
-    #[cfg(not(feature = "compact"))]
+    #[cfg(feature = "netplay")]
     if let Some(cfg) = relay_config {
         let link =
             net::BrowserRelayLink::connect(&cfg.url, &cfg.room, cfg.player, cfg.players, cfg.token).map_err(failed)?;
@@ -387,18 +410,33 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         options.netplay =
             Some(pen_runtime::net::Netplay::new(settings, Box::new(link), build_hash, &start, 1).map_err(failed)?);
     }
+    #[cfg(feature = "devtools")]
     let tools = match devtools {
-        Some(_) if cfg!(feature = "compact") => None,
         Some(module) => {
             let saved = saves::read("pen.devtools").await;
             Some(Tools::start(module, &catalog, viewport, saved, &mut log).await.map_err(failed)?)
         }
         None => None,
     };
+    #[cfg(not(feature = "devtools"))]
+    let _ = devtools;
+    #[cfg(feature = "kernels")]
+    let kernels = kernels::WebKernelService::maybe_new(&game_wasm_for_kernels).await;
     let input = input::Input::install(&canvas);
     let audio = audio::Audio::new(&canvas, assets);
-    let browser = Browser::new(runtime, Some(game_wasm_for_kernels), tools, screen, input, audio, log, options)
-        .map_err(failed)?;
+    let browser = Browser::new(
+        runtime,
+        #[cfg(feature = "kernels")]
+        kernels,
+        #[cfg(feature = "devtools")]
+        tools,
+        screen,
+        input,
+        audio,
+        log,
+        options,
+    )
+    .map_err(failed)?;
     spawn_local(async move {
         if let Err(error) = browser.run().await {
             web_sys::console::error_1(&format!("{error:#}").into());
@@ -412,7 +450,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
 
 /// Browser engine qualification: identical request packets to `pen packets`.
 /// It deliberately skips rendering and platform IO, just as native packet runs do.
-#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+#[cfg(all(target_arch = "wasm32", feature = "devtools"))]
 #[wasm_bindgen]
 pub async fn qualify(module: Uint8Array, scene: Uint8Array, inputs: js_sys::Array) -> Result<js_sys::Array, JsValue> {
     use pen_runtime::program::{Backend, Operation, Program};
@@ -442,7 +480,7 @@ pub async fn qualify(module: Uint8Array, scene: Uint8Array, inputs: js_sys::Arra
 }
 
 /// Exercises real browser platform adapters without changing a game's saves.
-#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+#[cfg(all(target_arch = "wasm32", feature = "devtools"))]
 #[wasm_bindgen]
 pub async fn qualify_platform() -> Result<String, JsValue> {
     let result = async {
@@ -487,7 +525,7 @@ pub async fn qualify_platform() -> Result<String, JsValue> {
 /// The simulation services' answers to fixed requests, here in wasm32, as
 /// their digest: the same bits as native's, or an error saying what
 /// differs. Needs no page, so node runs it too (tests/services.mjs).
-#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+#[cfg(all(target_arch = "wasm32", feature = "devtools"))]
 #[wasm_bindgen]
 pub fn qualify_services() -> Result<String, JsValue> {
     let mut services = pen_runtime::services::Services::<()>::new();
@@ -496,7 +534,7 @@ pub fn qualify_services() -> Result<String, JsValue> {
 }
 
 /// Checks the host boundary with the same binary fixtures as the native tests.
-#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+#[cfg(all(target_arch = "wasm32", feature = "devtools"))]
 #[wasm_bindgen]
 pub fn qualify_frame(packet: &[f32], schema: u32, catalog: &str) -> Result<String, JsValue> {
     let catalog = serde_json::from_str(catalog).map_err(failed)?;

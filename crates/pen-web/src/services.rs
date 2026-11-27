@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use pen_protocol::{clipboard_op, service, url_op};
+#[cfg(feature = "locales")]
 use pen_runtime::locale::{LocaleService, Locales};
 use pen_runtime::services::{Answer, Platform, Request, Service, Services, Unavailable, openable};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -41,6 +42,7 @@ pub fn with_preferences(preferences: pen_runtime::engine_preferences::Preference
 }
 
 /// Installs the current tables and returns the selected BCP 47 tag and direction.
+#[cfg(feature = "locales")]
 pub fn register_locale(services: &mut Services, locales: Locales) -> (String, bool) {
     let window = web_sys::window().unwrap();
     let wanted = window

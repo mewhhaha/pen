@@ -22,7 +22,7 @@ const PER_CLUSTER: u32 = 256;
 
 /// WGSL a material shader adds to light with the frame's lights:
 /// `clustered_light(world, normal, position, view_z)`.
-pub const LIGHTS_WGSL: &str = include_str!("shaders/lights.wgsl");
+pub const LIGHTS_WGSL: &str = crate::wgsl!("lights.wgsl");
 
 /// How the depth ahead is cut into slices: a depth's slice is
 /// `log(depth) * scale + bias`, or `depth * scale + bias` when `linear`.

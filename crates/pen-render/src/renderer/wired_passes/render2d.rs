@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-2d"), allow(unused_imports, dead_code))]
 use super::super::{GpuAsset, State, TextureAsset};
 use super::{RENDER2D_EXT_TAG, RENDER2D_WORLD_EXT_TAG, WiredPasses};
 use crate::asset_store::AssetKind;
@@ -201,16 +202,27 @@ struct CachedRc2d {
 pub(in crate::renderer) struct Render2dWiredState {
     pub scene: Option<Scene2d>,
     pub devtools_sdf_overlay: Vec<SdfShape>,
+    #[cfg(feature = "render-2d")]
     sprites_passes: HashMap<wgpu::TextureFormat, Sprites2dPass>,
+    #[cfg(feature = "render-2d")]
     tilemap_passes: HashMap<wgpu::TextureFormat, TilemapPass>,
+    #[cfg(feature = "render-2d")]
     sdf_passes: HashMap<wgpu::TextureFormat, SdfShapePass>,
+    #[cfg(feature = "render-2d")]
     default_sampler: Option<wgpu::Sampler>,
+    #[cfg(feature = "render-2d")]
     rc_state: Option<CachedRc2d>,
+    #[cfg(feature = "render-2d")]
     rc_targets: Option<([u32; 2], wgpu::Texture, wgpu::TextureView, wgpu::Texture, wgpu::TextureView)>,
+    #[cfg(feature = "render-2d")]
     rc_emitter_tex: Option<([u32; 2], u64, wgpu::Texture, wgpu::TextureView)>,
+    #[cfg(feature = "render-2d")]
     rc_emitter_raster: Option<Rc2dEmitterRaster>,
+    #[cfg(feature = "render-2d")]
     ext_tilemap_buffers: HashMap<u64, Arc<wgpu::Buffer>>,
+    #[cfg(feature = "render-2d")]
     alpha_blit_shared: Option<AlphaBlitShared>,
+    #[cfg(feature = "render-2d")]
     alpha_blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
 }
 
@@ -354,6 +366,7 @@ fn tile_grid_dim(value: f32) -> u32 {
     value.round().clamp(1.0, 1024.0) as u32
 }
 
+#[cfg(feature = "render-2d")]
 fn decode_ext_world_2d(
     device: &wgpu::Device,
     wired: &mut Render2dWiredState,
@@ -461,11 +474,11 @@ fn decode_ext_world_2d(
         };
         raw_sprites.push((mat_id, sprite));
     }
-    raw_sprites.sort_by(|a, b| {
+    crate::sort::sort_by_u64_key(&mut raw_sprites, |(_, s)| {
         let k = |x: f32| x + 0.0;
-        k(a.1.pivot_rot_layer[3])
-            .total_cmp(&k(b.1.pivot_rot_layer[3]))
-            .then_with(|| if y_sort { k(b.1.pos[1]).total_cmp(&k(a.1.pos[1])) } else { std::cmp::Ordering::Equal })
+        let layer = u64::from(crate::sort::f32_sortable(k(s.pivot_rot_layer[3])));
+        let y = if y_sort { u64::from(!crate::sort::f32_sortable(k(s.pos[1]))) } else { 0 };
+        (layer << 32) | y
     });
     let mut sprite_layers: Vec<SpriteLayer2d> = Vec::new();
     let mut idx = 0;
@@ -511,6 +524,7 @@ fn decode_ext_world_2d(
     })
 }
 
+#[cfg(feature = "render-2d")]
 impl Render2dWiredState {
     fn default_sampler(&mut self, device: &wgpu::Device) -> wgpu::Sampler {
         self.default_sampler
@@ -655,6 +669,27 @@ impl State {
 
     /// Encodes world-space 2D tilemaps, sprites2d, optional 2D Radiance Cascades GI, and base
     /// vector SDF UI shapes onto `output` BEFORE Pen's MSDF `frame.sprites`.
+    #[cfg(not(feature = "render-2d"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_render2d_base_wired(
+        _wired: &mut WiredPasses,
+        _assets: &crate::asset_store::AssetStore<GpuAsset>,
+        _white: &TextureAsset,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _encoder: &mut wgpu::CommandEncoder,
+        _frame: &RenderFrame,
+        _catalog: &Catalog,
+        _target_view: &wgpu::TextureView,
+        _target_format: wgpu::TextureFormat,
+        _size: (u32, u32),
+    ) -> Result<Vec<SdfShape>> {
+        Ok(Vec::new())
+    }
+
+    /// Encodes world-space 2D tilemaps, sprites2d, optional 2D Radiance Cascades GI, and base
+    /// vector SDF UI shapes onto `output` BEFORE Pen's MSDF `frame.sprites`.
+    #[cfg(feature = "render-2d")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_render2d_base_wired(
         wired: &mut WiredPasses,
@@ -1052,6 +1087,20 @@ impl State {
     }
 
     /// Encodes overlay vector SDF UI shapes AFTER Pen's MSDF `frame.sprites`.
+    #[cfg(not(feature = "render-2d"))]
+    pub(in crate::renderer) fn encode_render2d_overlay_wired(
+        _wired: &mut WiredPasses,
+        _device: &wgpu::Device,
+        _encoder: &mut wgpu::CommandEncoder,
+        _shapes: &[SdfShape],
+        _target_view: &wgpu::TextureView,
+        _target_format: wgpu::TextureFormat,
+        _size: (u32, u32),
+    ) {
+    }
+
+    /// Encodes overlay vector SDF UI shapes AFTER Pen's MSDF `frame.sprites`.
+    #[cfg(feature = "render-2d")]
     pub(in crate::renderer) fn encode_render2d_overlay_wired(
         wired: &mut WiredPasses,
         device: &wgpu::Device,
@@ -1071,6 +1120,7 @@ impl State {
     }
 }
 
+#[cfg(feature = "render-2d")]
 impl Render2dWiredState {
     fn draw_sdf_layers<'a>(
         &mut self,

@@ -4,12 +4,12 @@ use pen_protocol::{Matrix, MotionBlur};
 
 use crate::matrix::{invert, multiply, narrow};
 
-const SHADER: &str = include_str!("shaders/motion_blur.wgsl");
+const SHADER: &str = crate::wgsl!("motion_blur.wgsl");
 
 pub(crate) fn shader(samples: u32) -> String {
     SHADER
         .replace("${depth_texture}", if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" })
-        .replace("${fullscreen}", include_str!("shaders/fullscreen.wgsl"))
+        .replace("${fullscreen}", crate::wgsl!("fullscreen.wgsl"))
 }
 
 pub(crate) fn uniform(

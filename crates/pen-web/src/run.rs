@@ -9,34 +9,54 @@ use std::rc::Rc;
 use anyhow::Result;
 use pen_protocol::{Catalog, Frame, GameEvent, RenderFrame, Viewport};
 use pen_runtime::clock::Clock;
-use pen_runtime::devtools::{self, FrameReport, Log, TimelineStatus, log_source};
-use pen_runtime::game::{FrameTimings, GameRuntime, Host, InvalidFrame, Quiet, ReloadResult, hash_lanes};
+#[cfg(feature = "devtools")]
+use pen_runtime::devtools::{self, FrameReport, TimelineStatus};
+use pen_runtime::devtools::{Log, log_source};
+#[cfg(feature = "replay")]
+use pen_runtime::game::Quiet;
+#[cfg(feature = "devtools")]
+use pen_runtime::game::{FrameTimings, InvalidFrame, ReloadResult};
+use pen_runtime::game::{GameRuntime, Host, hash_lanes};
 use pen_runtime::input::Hotkey;
+#[cfg(feature = "devtools")]
 use pen_runtime::program::Unresponsive;
+#[cfg(feature = "replay")]
 use pen_runtime::recording;
-use pen_runtime::services::{Answer, Services};
+#[cfg(feature = "devtools")]
+use pen_runtime::services::Answer;
+use pen_runtime::services::Services;
 use pen_runtime::snapshot::{self, SavedState};
 use pen_runtime::state::StateAdapter;
 use pen_runtime::text::text_box;
-use pen_runtime::timeline::{self, KEEP_SECONDS, Load, REPLAY_SECONDS, Recorded, Recording, Timeline};
+#[cfg(feature = "replay")]
+use pen_runtime::timeline::Recording;
+use pen_runtime::timeline::{self, KEEP_SECONDS, Load, REPLAY_SECONDS, Recorded, Timeline};
 use pen_runtime::transport::{Replaying, Rewind, Transport};
 use std::sync::Arc;
-use wasm_bindgen_futures::{JsFuture, spawn_local};
+#[cfg(any(feature = "devtools", feature = "replay"))]
+use wasm_bindgen_futures::JsFuture;
+use wasm_bindgen_futures::spawn_local;
+#[cfg(feature = "devtools")]
 use web_sys::HtmlCanvasElement;
 use web_time::Instant;
 
 use crate::accessibility::Accessibility;
 use crate::audio::Audio;
+#[cfg(feature = "devtools")]
 use crate::development::{Development, Update};
-use crate::files::{self, Arrival, Files};
+#[cfg(any(feature = "devtools", feature = "replay"))]
+use crate::files;
+use crate::files::{Arrival, Files};
 use crate::input::Input;
 use crate::preferences::Preferences;
 use crate::program::{BrowserBackend, error};
+#[cfg(feature = "replay")]
 use crate::replay::{self, Recorder};
 use crate::saves;
 use crate::screen::{FRAMES_IN_FLIGHT, Screen};
+#[cfg(feature = "devtools")]
 use crate::tools::Tools;
-#[cfg(not(feature = "compact"))]
+#[cfg(feature = "video")]
 use crate::video::WebVideoRegistry;
 
 pub type Runtime = GameRuntime<BrowserBackend>;
@@ -129,6 +149,7 @@ macro_rules! shell {
 /// `data-events` holds the input events of the frames that ran, recorded or
 /// live, the latest `EVENT_HOOKS`, each as its five lanes (tag, code, x, y,
 /// delta); assets' and services' are left out.
+#[cfg(feature = "devtools")]
 pub struct Hooks {
     canvas: HtmlCanvasElement,
     /// Submitted frames, written once their GPU queue slot is released.
@@ -138,8 +159,10 @@ pub struct Hooks {
 }
 
 /// The input events `data-events` keeps.
+#[cfg(feature = "devtools")]
 const EVENT_HOOKS: usize = 512;
 
+#[cfg(feature = "devtools")]
 impl Hooks {
     const NAMES: [&str; 5] = ["data-frame", "data-quality", "data-pending", "aria-busy", "data-packet"];
 
@@ -193,6 +216,7 @@ struct Autosave {
     changed: bool,
     /// The hashes of the states written last.
     game: Option<u64>,
+    #[cfg(feature = "devtools")]
     tools: Option<u64>,
 }
 
@@ -211,7 +235,7 @@ fn keep(name: &'static str, saved: SavedState, last: Option<u64>) -> Option<u64>
 }
 
 /// Optional browser WebSocket relay netplay configuration passed via `options.netRelay`.
-#[cfg(not(feature = "compact"))]
+#[cfg(feature = "netplay")]
 pub struct NetRelayConfig {
     pub url: String,
     pub room: String,
@@ -227,20 +251,25 @@ pub struct Options {
     /// pauses the game instead of stopping the page.
     pub development: bool,
     /// Write the hooks the browser harnesses read (`Hooks`).
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     pub qualify: bool,
     /// The explicit state adapter selected by `assets/saved.json`.
     pub state_adapter: Arc<dyn StateAdapter>,
+    #[cfg_attr(not(any(feature = "devtools", feature = "video")), allow(dead_code))]
     pub assets: String,
     /// The captions the game's sounds carry (the assets' captions.json).
     pub captions: pen_runtime::captions::Captions,
     /// The base string table and translations, when the game supplies them.
+    #[cfg(feature = "locales")]
     pub locales: Option<pen_runtime::locale::Locales>,
     /// The game's name, which the files it hands the player are named after.
+    #[cfg_attr(not(any(feature = "devtools", feature = "replay")), allow(dead_code))]
     pub name: String,
     /// Where the page's link has a recording to play (`replay::linked`).
+    #[cfg(feature = "replay")]
     pub replay: Option<String>,
     /// Optional WebSocket relay netplay session (`BrowserRelayLink`).
-    #[cfg(not(feature = "compact"))]
+    #[cfg(feature = "netplay")]
     pub netplay: Option<pen_runtime::net::Netplay>,
 }
 
@@ -253,9 +282,12 @@ pub struct Browser {
     accessibility: Accessibility,
     /// The captions of what plays, shared with the captions service.
     captions: pen_runtime::captions::Shared,
+    #[cfg(feature = "devtools")]
     tools: Option<Tools>,
     services: Services,
+    #[cfg(all(feature = "devtools", feature = "locales"))]
     has_locales: bool,
+    #[cfg(feature = "kernels")]
     kernels: Option<crate::kernels::WebKernelService>,
     preferences: Preferences,
     /// The game's actions, which live frames' events move.
@@ -275,8 +307,11 @@ pub struct Browser {
     pacer: Option<(Instant, f64)>,
     pub log: Log,
     /// The last frame's timings, while measured.
+    #[cfg(feature = "devtools")]
     timings: Option<FrameTimings>,
+    #[cfg(feature = "devtools")]
     development: Option<Development>,
+    #[cfg(feature = "devtools")]
     hooks: Option<Hooks>,
     autosave: Autosave,
     /// The page's status line still says something (it clears once the
@@ -288,34 +323,39 @@ pub struct Browser {
     ready_frames: usize,
     cursor_hidden: bool,
     /// The last animation frame's time.
+    #[cfg(feature = "devtools")]
     previous: Option<f64>,
     state_adapter: Arc<dyn StateAdapter>,
+    #[cfg(feature = "devtools")]
     assets: String,
     /// Files the player hands the page (saves, recordings), and the word on
     /// files handed over.
     files: Files,
     /// The game's name, for the files it hands over.
+    #[cfg(any(feature = "devtools", feature = "replay"))]
     name: String,
     /// A save the player handed the page, loaded with the next live frame.
     importing: Option<(String, SavedState)>,
     /// The input recording being made (`/record`).
+    #[cfg(feature = "replay")]
     recorder: Option<Recorder>,
     /// The recording the page's link names, played first.
+    #[cfg(feature = "replay")]
     linked: Option<String>,
     /// Active browser WebSocket relay netplay session, when configured via `options.netRelay`.
-    #[cfg(not(feature = "compact"))]
+    #[cfg(feature = "netplay")]
     #[allow(dead_code)]
     netplay: Option<pen_runtime::net::Netplay>,
-    #[cfg(not(feature = "compact"))]
+    #[cfg(feature = "video")]
     videos: WebVideoRegistry,
 }
 
 impl Browser {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        mut game: Runtime,
-        game_wasm: Option<Vec<u8>>,
-        tools: Option<Tools>,
+        #[cfg_attr(not(feature = "devtools"), allow(unused_mut))] mut game: Runtime,
+        #[cfg(feature = "kernels")] kernels: Option<crate::kernels::WebKernelService>,
+        #[cfg(feature = "devtools")] tools: Option<Tools>,
         screen: Screen,
         input: Rc<RefCell<Input>>,
         audio: Audio,
@@ -330,17 +370,22 @@ impl Browser {
         if options.development {
             timeline.keep_history(Some(KEEP_SECONDS));
         }
-        let hooks = (!cfg!(feature = "compact") && options.qualify).then(|| Hooks::new(screen.canvas.element.clone()));
+        #[cfg(feature = "devtools")]
+        let hooks = options.qualify.then(|| Hooks::new(screen.canvas.element.clone()));
         let captions = options.captions.shared();
         services.register(Box::new(pen_runtime::captions::CaptionsService(captions.clone())));
         let accessibility = Accessibility::new(input.clone())?;
+        #[cfg(all(feature = "devtools", feature = "locales"))]
         let has_locales = options.locales.is_some();
+        #[cfg(feature = "locales")]
         let (tag, rtl) = options
             .locales
             .map(|locales| crate::services::register_locale(&mut services, locales))
             .unwrap_or_else(|| ("en".into(), false));
+        #[cfg(not(feature = "locales"))]
+        let (tag, rtl) = ("en".to_owned(), false);
         accessibility.set_locale(&tag, rtl)?;
-        let kernels = game_wasm.as_deref().and_then(crate::kernels::WebKernelService::maybe_new);
+        #[cfg(feature = "devtools")]
         game.hash_packets(hooks.is_some());
         Ok(Browser {
             shown: game.take_drawn().unwrap_or_default(),
@@ -350,9 +395,12 @@ impl Browser {
             accessibility,
             input,
             audio,
+            #[cfg(feature = "devtools")]
             tools,
             services,
+            #[cfg(all(feature = "devtools", feature = "locales"))]
             has_locales,
+            #[cfg(feature = "kernels")]
             kernels,
             captions,
             events: preferences.events().collect(),
@@ -364,25 +412,33 @@ impl Browser {
             clock: Clock::real(),
             pacer: None,
             log,
+            #[cfg(feature = "devtools")]
             timings: None,
-            development: (!cfg!(feature = "compact") && options.development).then(Development::watch),
+            #[cfg(feature = "devtools")]
+            development: options.development.then(Development::watch),
+            #[cfg(feature = "devtools")]
             hooks,
             autosave: Autosave::default(),
             status: true,
             rejected: false,
             ready_frames: 0,
             cursor_hidden: false,
+            #[cfg(feature = "devtools")]
             previous: None,
             state_adapter: options.state_adapter,
-            #[cfg(not(feature = "compact"))]
+            #[cfg(feature = "video")]
             videos: WebVideoRegistry::new(options.assets.clone()),
+            #[cfg(feature = "devtools")]
             assets: options.assets,
             files: Files::install(),
+            #[cfg(any(feature = "devtools", feature = "replay"))]
             name: options.name,
             importing: None,
+            #[cfg(feature = "replay")]
             recorder: None,
+            #[cfg(feature = "replay")]
             linked: options.replay,
-            #[cfg(not(feature = "compact"))]
+            #[cfg(feature = "netplay")]
             netplay: options.netplay,
         })
     }
@@ -401,33 +457,44 @@ impl Browser {
     }
 
     fn fence_kernels(&mut self) {
+        #[cfg(feature = "kernels")]
         if let Some(kernels) = &mut self.kernels {
             kernels.fence();
         }
     }
 
     /// Compute a frame, then draw at repaint; whether to go on and when it drew.
-    async fn frame(&mut self, timestamp: f64) -> Result<(bool, f64)> {
+    async fn frame(
+        &mut self,
+        #[cfg_attr(not(feature = "devtools"), allow(unused_variables))] timestamp: f64,
+    ) -> Result<(bool, f64)> {
+        #[cfg(feature = "devtools")]
         let interval = self.previous.replace(timestamp).map_or(0.0, |previous| (timestamp - previous) * 1000.0);
         self.screen.fit();
+        #[cfg(feature = "devtools")]
         self.read_mail();
         self.input.borrow_mut().poll_gamepads();
         let hotkeys = self.take_input();
-        if !cfg!(feature = "compact") {
+        #[cfg(feature = "devtools")]
+        {
             self.run_tools(timestamp, interval).await;
             self.qualification_request().await?;
         }
+        #[cfg(feature = "devtools")]
         let started = Instant::now();
         for hotkey in hotkeys {
             self.hotkey(hotkey);
         }
         self.take_answers();
         let ran = self.step().await?;
+        #[cfg(feature = "devtools")]
         let overlay = self.tools.as_ref().and_then(|tools| tools.frame.as_ref());
+        #[cfg(not(feature = "devtools"))]
+        let overlay = None;
         self.preferences.apply(&mut self.screen.renderer);
-        #[cfg(feature = "compact")]
-        anyhow::ensure!(self.shown.video_streams.is_empty(), "use the full browser host for video textures");
-        #[cfg(not(feature = "compact"))]
+        #[cfg(not(feature = "video"))]
+        anyhow::ensure!(self.shown.video_streams.is_empty(), "use a browser host built with video for video textures");
+        #[cfg(feature = "video")]
         if !self.shown.video_streams.is_empty() {
             for message in self.videos.update(&self.shown, &self.catalog, &mut self.screen.renderer) {
                 say(&mut self.log, log_source::GAME, true, message);
@@ -440,9 +507,12 @@ impl Browser {
                 return Err(err);
             }
         };
+        #[cfg(feature = "devtools")]
         if ran.is_some() {
             self.timings = self.game.last_timings().map(|timings| timings.completed(draw_timings, ms(started)));
         }
+        #[cfg(not(feature = "devtools"))]
+        let _ = draw_timings;
         if let Err(err) = self.present() {
             self.fence_kernels();
             return Err(err);
@@ -460,19 +530,28 @@ impl Browser {
             let mut input = self.input.borrow_mut();
             (std::mem::take(&mut input.events), std::mem::take(&mut input.tools), std::mem::take(&mut input.hotkeys))
         };
-        for event in events {
-            let game = self.tools.as_mut().is_none_or(|tools| tools.route(&event));
-            if game {
-                self.events.push(event);
+        #[cfg(feature = "devtools")]
+        {
+            for event in events {
+                let game = self.tools.as_mut().is_none_or(|tools| tools.route(&event));
+                if game {
+                    self.events.push(event);
+                }
+            }
+            if let Some(tools) = &mut self.tools {
+                tools.take(actions);
             }
         }
-        if let Some(tools) = &mut self.tools {
-            tools.take(actions);
+        #[cfg(not(feature = "devtools"))]
+        {
+            let _ = actions;
+            self.events.extend(events);
         }
         hotkeys
     }
 
     /// The dev tools' frame, which may ask things of the game's.
+    #[cfg(feature = "devtools")]
     async fn run_tools(&mut self, timestamp: f64, interval: f64) {
         if let Some(mut tools) = self.tools.take() {
             tools.frame(self, timestamp, interval).await;
@@ -482,6 +561,7 @@ impl Browser {
 
     /// Headless harnesses exercise the real devtools host without a second
     /// guest/UI fixture. No command input is read outside qualification mode.
+    #[cfg(feature = "devtools")]
     async fn qualification_request(&mut self) -> Result<()> {
         let Some(hooks) = &self.hooks else { return Ok(()) };
         let canvas = hooks.canvas.clone();
@@ -515,6 +595,7 @@ impl Browser {
     }
 
     /// What the development endpoints said, into the log.
+    #[cfg(feature = "devtools")]
     fn read_mail(&mut self) {
         if let Some(development) = &self.development {
             for (error, line) in development.take_lines() {
@@ -539,23 +620,56 @@ impl Browser {
         self.transport.replaying().is_none() && self.timeline.next().is_none()
     }
 
+    fn pause_play(&mut self) {
+        let was_playing = self.transport.pause();
+        self.stopped(was_playing);
+    }
+
+    fn resume_play(&mut self) {
+        if !self.transport.resume() {
+            return;
+        }
+        if self.transport.replaying().is_none() && self.timeline.next().is_some() {
+            self.timeline.go_live();
+            self.fence_kernels();
+        }
+        if self.transport.replaying().is_none() {
+            self.screen.pin(None);
+        }
+        self.clock.resume();
+        self.pacer = None;
+    }
+
+    fn step_play(&mut self, frames: u32) {
+        let was_playing = self.transport.step(frames);
+        self.stopped(was_playing);
+    }
+
+    fn rewind_play(&mut self, frame: u64) {
+        let was_playing = self.transport.rewind_to(frame);
+        self.stopped(was_playing);
+    }
+
+    fn replay_play(&mut self, seconds: f64) {
+        self.transport.replay_recent(seconds);
+    }
+
     fn hotkey(&mut self, hotkey: Hotkey) {
-        use devtools::Host as _;
         match hotkey {
             Hotkey::Pause if self.transport.paused() => {
-                self.resume();
+                self.resume_play();
                 say(&mut self.log, log_source::SESSION, false, "playing");
             }
             Hotkey::Pause => {
-                self.pause();
+                self.pause_play();
                 let back = if self.timeline.history() { ", Ctrl+Shift+comma back" } else { "" };
                 let frame = self.timeline.position();
                 let said = format!("paused at frame {frame} (Ctrl+Shift+period steps{back}, Ctrl+Shift+P plays)");
                 say(&mut self.log, log_source::SESSION, false, said);
             }
-            Hotkey::Step => self.step_frames(1),
-            Hotkey::Back => self.rewind_to(self.transport.target(self.timeline.position()).saturating_sub(1)),
-            Hotkey::Replay => self.replay_recent(REPLAY_SECONDS),
+            Hotkey::Step => self.step_play(1),
+            Hotkey::Back => self.rewind_play(self.transport.target(self.timeline.position()).saturating_sub(1)),
+            Hotkey::Replay => self.replay_play(REPLAY_SECONDS),
         }
     }
 
@@ -585,18 +699,20 @@ impl Browser {
     /// Carries out what was asked of time, then runs the game's frame if
     /// one runs now: Some(whether the game asked to exit) if it did.
     async fn step(&mut self) -> Result<Option<bool>> {
-        if !cfg!(feature = "compact")
-            && let Some(update) = self.development.as_ref().and_then(Development::take_update)
-        {
+        #[cfg(feature = "devtools")]
+        if let Some(update) = self.development.as_ref().and_then(Development::take_update) {
             self.reload(update).await;
         }
         self.arrivals().await;
+        #[cfg(feature = "replay")]
         if let Some(path) = self.transport.take_record() {
             match path {
                 Some(_) => self.start_recording().await,
                 None => self.stop_recording(),
             }
         }
+        #[cfg(not(feature = "replay"))]
+        let _ = self.transport.take_record();
         while let Some(rewind) = self.transport.next_rewind() {
             let result = match rewind {
                 Rewind::To(frame) => self.rewind(frame).await,
@@ -630,14 +746,19 @@ impl Browser {
                     events: std::mem::take(&mut self.events),
                 };
                 self.actions.borrow_mut().map(&mut frame.events);
+                #[cfg_attr(not(feature = "kernels"), allow(unused_mut))]
                 let mut input = self.game.input(&frame)?;
+                #[cfg(feature = "kernels")]
                 let cap_events = match &mut self.kernels {
                     Some(kernels) => kernels.join_live_kernels_async(&mut input).await,
                     None => 0,
                 };
+                #[cfg(not(feature = "kernels"))]
+                let cap_events = 0usize;
                 (input, None, cap_events)
             }
         };
+        #[cfg(feature = "devtools")]
         if let Some(hooks) = &mut self.hooks {
             hooks.ran(&input)?;
         }
@@ -656,8 +777,8 @@ impl Browser {
     /// asked to exit.
     async fn complete(
         &mut self,
-        mut input: Vec<f32>,
-        cap_events: usize,
+        #[cfg_attr(not(feature = "kernels"), allow(unused_mut))] mut input: Vec<f32>,
+        #[cfg_attr(not(feature = "kernels"), allow(unused_variables))] cap_events: usize,
         replayed: Option<Vec<Load>>,
         rendered: RenderFrame,
     ) -> Result<bool> {
@@ -671,6 +792,7 @@ impl Browser {
         // recording), before an undo or load replaces the world asking.
         // Pre-dispatch partition: `service::KERNEL` NEVER enters generic `Services::answer`.
         if replayed.is_none() {
+            #[cfg(feature = "kernels")]
             if crate::kernels::has_kernel_requests(&rendered.services) {
                 if let Some(kernels) = &mut self.kernels {
                     kernels.submit(&rendered.services);
@@ -687,6 +809,8 @@ impl Browser {
             } else {
                 self.services.answer(&rendered.services);
             }
+            #[cfg(not(feature = "kernels"))]
+            self.services.answer(&rendered.services);
         }
         let mut state_replaced = {
             let mut shell = shell!(self);
@@ -736,8 +860,10 @@ impl Browser {
             self.fence_kernels();
         }
         // Strip live-only unrecorded `CAP` before constructing `Recorded`!
+        #[cfg(feature = "kernels")]
         crate::kernels::strip_trailing_events(&mut input, cap_events);
         let recorded = Recorded { input, loads, restored: self.timeline.restored_here() };
+        #[cfg(feature = "replay")]
         if let Some(recorder) = &mut self.recorder {
             recorder.frame(&recorded);
         }
@@ -749,6 +875,7 @@ impl Browser {
         self.timeline.ran(recorded);
         self.autosave.changed = true;
         self.show(shown);
+        #[cfg(feature = "devtools")]
         if let Some(position) = self.timeline.observations.take_break() {
             let was_playing = self.transport.breakpoint();
             self.stopped(was_playing);
@@ -763,30 +890,39 @@ impl Browser {
     /// Invalid guest output never commits its candidate state. While
     /// developing, the last valid frame stays and the game pauses until a
     /// new build; otherwise the page stops.
-    fn reject_frame(&mut self, position: u64, error: anyhow::Error) -> Result<()> {
+    fn reject_frame(
+        &mut self,
+        #[cfg_attr(not(feature = "devtools"), allow(unused_variables))] position: u64,
+        error: anyhow::Error,
+    ) -> Result<()> {
         self.fence_kernels();
-        if self.development.is_none() || !error.is::<InvalidFrame>() {
-            return Err(error);
+        #[cfg(not(feature = "devtools"))]
+        return Err(error);
+        #[cfg(feature = "devtools")]
+        {
+            if self.development.is_none() || !error.is::<InvalidFrame>() {
+                return Err(error);
+            }
+            let was_playing = self.transport.reject();
+            self.stopped(was_playing);
+            self.timings = None;
+            self.events.clear();
+            self.events.push(GameEvent::FocusLost);
+            // A program that stopped answering is gone: a new one restores the last frame's state.
+            if error.is::<Unresponsive>() {
+                self.transport.restore_at(self.timeline.position());
+            }
+            let said = format!(
+                "dev: frame {position} rejected: {error:#}\ngame paused; fix the source to reload, or use Play to retry"
+            );
+            self.rejected = true;
+            self.status = false;
+            if let Some(status) = web_sys::window().unwrap().document().unwrap().get_element_by_id("status") {
+                status.set_text_content(Some(&said));
+            }
+            say(&mut self.log, log_source::GAME, true, said);
+            Ok(())
         }
-        let was_playing = self.transport.reject();
-        self.stopped(was_playing);
-        self.timings = None;
-        self.events.clear();
-        self.events.push(GameEvent::FocusLost);
-        // A program that stopped answering is gone: a new one restores the last frame's state.
-        if error.is::<Unresponsive>() {
-            self.transport.restore_at(self.timeline.position());
-        }
-        let said = format!(
-            "dev: frame {position} rejected: {error:#}\ngame paused; fix the source to reload, or use Play to retry"
-        );
-        self.rejected = true;
-        self.status = false;
-        if let Some(status) = web_sys::window().unwrap().document().unwrap().get_element_by_id("status") {
-            status.set_text_content(Some(&said));
-        }
-        say(&mut self.log, log_source::GAME, true, said);
-        Ok(())
     }
 
     /// A new frame shows; the one it replaces is decoded into next.
@@ -907,7 +1043,7 @@ impl Browser {
         self.game.continue_clock(self.clock.now());
         let position = self.timeline.position();
         let said = if replayed == Some(Replaying::File) {
-            devtools::Host::pause(self);
+            self.pause_play();
             format!("the replay ended at frame {position}; paused (Ctrl+Shift+P plays on, live)")
         } else {
             format!("the replay ended at frame {position}; playing live")
@@ -919,6 +1055,7 @@ impl Browser {
     /// a recording (the page's link's first) plays, and a save loads with
     /// the next live frame.
     async fn arrivals(&mut self) {
+        #[cfg(feature = "replay")]
         if let Some(source) = self.linked.take() {
             match replay::fetch(&source).await {
                 Ok((recording, name)) => self.play(recording, &name).await,
@@ -928,6 +1065,7 @@ impl Browser {
         for arrival in self.files.take() {
             match arrival {
                 Arrival::Note { error, text } => say(&mut self.log, log_source::SESSION, error, text),
+                #[cfg(feature = "replay")]
                 Arrival::File { name, bytes } if recording::is_recording(&bytes) => match recording::decode(&bytes) {
                     Ok(decoded) => self.play(decoded.recording, &name).await,
                     Err(error) => say(&mut self.log, log_source::SESSION, true, format!("{name}: {error:#}")),
@@ -954,6 +1092,7 @@ impl Browser {
 
     /// Plays `recording` (from `name`) in place of the player's input, from
     /// its start; it pauses where it ends.
+    #[cfg(feature = "replay")]
     async fn play(&mut self, recording: Recording, name: &str) {
         if self.recorder.take().is_some() {
             say(&mut self.log, log_source::SESSION, false, "stopped recording input: a replay starts");
@@ -991,6 +1130,7 @@ impl Browser {
     /// restoring the recording's moment, so the game is restored from it
     /// here too, as native pen does: what it keeps outside its state then
     /// starts over in both alike.
+    #[cfg(feature = "replay")]
     async fn start_recording(&mut self) {
         self.stop_recording();
         let position = self.timeline.position();
@@ -1022,6 +1162,7 @@ impl Browser {
     /// Stops the recording being made, if one is, and hands it to the
     /// player: as a `.penrec` download and as a link that plays it, which
     /// goes on the clipboard (and the browser's console).
+    #[cfg(feature = "replay")]
     fn stop_recording(&mut self) {
         let Some(recorder) = self.recorder.take() else { return };
         let frames = recorder.frames();
@@ -1054,57 +1195,70 @@ impl Browser {
 
     /// The game went back to `at` and ran on to `position` (unseen): the
     /// input recording goes back too, or stops if it started later.
-    fn rewind_recording(&mut self, at: u64, position: u64) {
-        let Some(recorder) = &mut self.recorder else { return };
-        if at < recorder.first {
-            self.recorder = None;
-            say(&mut self.log, log_source::SESSION, false, "stopped recording input: went back before it started");
-            return;
-        }
-        recorder.rewind(at);
-        for frame in at..position {
-            if let Some(recorded) = self.timeline.recorded(frame) {
-                recorder.frame(recorded);
+    fn rewind_recording(
+        &mut self,
+        #[cfg_attr(not(feature = "replay"), allow(unused_variables))] at: u64,
+        #[cfg_attr(not(feature = "replay"), allow(unused_variables))] position: u64,
+    ) {
+        #[cfg(feature = "replay")]
+        {
+            let Some(recorder) = &mut self.recorder else { return };
+            if at < recorder.first {
+                self.recorder = None;
+                say(&mut self.log, log_source::SESSION, false, "stopped recording input: went back before it started");
+                return;
+            }
+            recorder.rewind(at);
+            for frame in at..position {
+                if let Some(recorded) = self.timeline.recorded(frame) {
+                    recorder.frame(recorded);
+                }
             }
         }
     }
 
     /// A new build from `pen web`, taken while the game is idle.
+    #[cfg(feature = "devtools")]
     async fn reload(&mut self, update: Update) {
         self.state_adapter = crate::load_state_adapter(&self.assets).await;
-        let language = match crate::load_locales().await {
-            Ok(Some(locales)) => {
-                self.has_locales = true;
-                Some(crate::services::register_locale(&mut self.services, locales))
-            }
-            Ok(None) if self.has_locales => {
-                self.has_locales = false;
-                self.services.register(Box::new(pen_runtime::services::Unavailable(pen_protocol::service::LOCALE)));
-                Some(("en".into(), false))
-            }
-            Ok(None) => None,
-            Err(error) => {
-                say(&mut self.log, log_source::RELOAD, true, format!("the game's string tables: {error:#}"));
-                None
-            }
-        };
-        if let Some((tag, rtl)) = language
-            && let Err(error) = self.accessibility.set_locale(&tag, rtl)
+        #[cfg(feature = "locales")]
         {
-            say(&mut self.log, log_source::RELOAD, true, format!("interface language: {error:#}"));
+            let language = match crate::load_locales().await {
+                Ok(Some(locales)) => {
+                    self.has_locales = true;
+                    Some(crate::services::register_locale(&mut self.services, locales))
+                }
+                Ok(None) if self.has_locales => {
+                    self.has_locales = false;
+                    self.services.register(Box::new(pen_runtime::services::Unavailable(pen_protocol::service::LOCALE)));
+                    Some(("en".into(), false))
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    say(&mut self.log, log_source::RELOAD, true, format!("the game's string tables: {error:#}"));
+                    None
+                }
+            };
+            if let Some((tag, rtl)) = language
+                && let Err(error) = self.accessibility.set_locale(&tag, rtl)
+            {
+                say(&mut self.log, log_source::RELOAD, true, format!("interface language: {error:#}"));
+            }
         }
         let catalog = update.catalog.unwrap_or_else(|| self.catalog.clone());
         if let Some(module) = update.game {
+            #[cfg(feature = "kernels")]
             let kernel_bytes = module.clone();
             let result = {
                 let mut shell = shell!(self);
                 self.game.reload(&mut shell, module, catalog.clone()).await
             };
             if result == ReloadResult::Activated {
+                #[cfg(feature = "kernels")]
                 if let Some(kernels) = &mut self.kernels {
-                    kernels.reload(&kernel_bytes);
+                    kernels.reload(&kernel_bytes).await;
                 } else {
-                    self.kernels = crate::kernels::WebKernelService::maybe_new(&kernel_bytes);
+                    self.kernels = crate::kernels::WebKernelService::maybe_new(&kernel_bytes).await;
                 }
                 self.status = true;
                 self.catalog = catalog;
@@ -1141,7 +1295,10 @@ impl Browser {
     /// What the page shows besides the canvas: the interface for assistive
     /// technology, the pointer, the harnesses' hooks and the status line.
     fn present(&mut self) -> Result<()> {
+        #[cfg(feature = "devtools")]
         let tools = self.tools.as_ref().and_then(|tools| tools.frame.as_ref()).filter(|frame| !frame.ui.is_empty());
+        #[cfg(not(feature = "devtools"))]
+        let tools: Option<&RenderFrame> = None;
         match tools {
             Some(frame) => self.accessibility.update(&frame.ui, true)?,
             None => self.accessibility.update(&self.shown.ui, false)?,
@@ -1153,7 +1310,10 @@ impl Browser {
         let showing = captions.visible(self.shown.show_captions);
         drop(captions);
         self.accessibility.captions(showing.as_deref())?;
+        #[cfg(feature = "devtools")]
         let hidden = self.shown.hide_cursor && !self.tools.as_ref().is_some_and(Tools::wants_pointer);
+        #[cfg(not(feature = "devtools"))]
+        let hidden = self.shown.hide_cursor;
         if hidden != self.cursor_hidden {
             self.cursor_hidden = hidden;
             let cursor = if hidden { "none" } else { "auto" };
@@ -1167,6 +1327,7 @@ impl Browser {
                 self.screen.canvas.element.set_attribute("data-ready", "true").map_err(error)?;
             }
         }
+        #[cfg(feature = "devtools")]
         if let Some(hooks) = &mut self.hooks {
             let quality = self.shown.quality;
             hooks.drawn([
@@ -1198,6 +1359,7 @@ impl Browser {
                 Err(error) => say(&mut self.log, log_source::SESSION, true, format!("autosave: {error:#}")),
             }
         }
+        #[cfg(feature = "devtools")]
         if let Some(tools) = &mut self.tools
             && let Some(saved) = tools.snapshot().await
         {
@@ -1209,6 +1371,7 @@ impl Browser {
     async fn finish(mut self) -> Result<()> {
         saves::write("pen.autosave", &self.game.snapshot().await?).await?;
         self.game.close().await;
+        #[cfg(feature = "devtools")]
         if let Some(tools) = &mut self.tools {
             if let Some(saved) = tools.snapshot().await {
                 saves::write("pen.devtools", &saved).await?;
@@ -1219,6 +1382,7 @@ impl Browser {
     }
 }
 
+#[cfg(feature = "devtools")]
 impl devtools::Host for Browser {
     fn state_adapter(&self) -> Arc<dyn StateAdapter> {
         self.state_adapter.clone()
@@ -1387,7 +1551,7 @@ impl devtools::Host for Browser {
     /// Has `pen web` write the game's tuned values into the checkout as
     /// the defaults; the log says how it went. A static export cannot.
     async fn bake(&mut self) -> Answer {
-        if cfg!(feature = "compact") || self.development.is_none() {
+        if self.development.is_none() {
             return Answer::unavailable();
         }
         let Some(saved) = devtools::Host::snapshot(self).await else { return Answer::unavailable() };

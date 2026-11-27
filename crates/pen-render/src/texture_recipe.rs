@@ -4,7 +4,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "bounded pixel coordinates and channels")]
 use crate::packed_texture::{PackedHeader, PackedLevel};
 use anyhow::{Context, Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -12,8 +12,6 @@ struct Recipe {
     nodes: Vec<Node>,
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 enum Node {
     Source,
     Tile { input: usize, exponent: f64 },
@@ -25,6 +23,76 @@ enum Node {
     Abs { input: usize },
     Join { a: usize, b: usize },
     Normal { input: usize, strength: f64 },
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let map = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        parse_node(map).map_err(serde::de::Error::custom)
+    }
+}
+
+fn parse_node(mut map: serde_json::Map<String, serde_json::Value>) -> std::result::Result<Node, String> {
+    let take_usize =
+        |map: &mut serde_json::Map<String, serde_json::Value>, key: &str| -> std::result::Result<usize, String> {
+            let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+            let n = raw.as_u64().ok_or_else(|| format!("expected unsigned integer for `{key}`"))?;
+            usize::try_from(n).map_err(|_| format!("integer out of range for `{key}`"))
+        };
+    let take_f64 =
+        |map: &mut serde_json::Map<String, serde_json::Value>, key: &str| -> std::result::Result<f64, String> {
+            let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+            raw.as_f64().ok_or_else(|| format!("expected number for `{key}`"))
+        };
+    let take_bool =
+        |map: &mut serde_json::Map<String, serde_json::Value>, key: &str| -> std::result::Result<bool, String> {
+            let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+            raw.as_bool().ok_or_else(|| format!("expected bool for `{key}`"))
+        };
+    let take_f64_vec =
+        |map: &mut serde_json::Map<String, serde_json::Value>, key: &str| -> std::result::Result<Vec<f64>, String> {
+            let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+            let arr = raw.as_array().ok_or_else(|| format!("expected array for `{key}`"))?;
+            arr.iter().map(|v| v.as_f64().ok_or_else(|| format!("expected number in `{key}`"))).collect()
+        };
+    let op = map
+        .remove("op")
+        .and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        })
+        .ok_or_else(|| "missing field `op`".to_owned())?;
+    let node = match op.as_str() {
+        "source" => Node::Source,
+        "tile" => Node::Tile { input: take_usize(&mut map, "input")?, exponent: take_f64(&mut map, "exponent")? },
+        "power" => Node::Power {
+            input: take_usize(&mut map, "input")?,
+            exponent: take_f64(&mut map, "exponent")?,
+            clamp: take_bool(&mut map, "clamp")?,
+        },
+        "scale" => Node::Scale {
+            input: take_usize(&mut map, "input")?,
+            scale: take_f64_vec(&mut map, "scale")?,
+            offset: take_f64_vec(&mut map, "offset")?,
+            clamp: take_bool(&mut map, "clamp")?,
+        },
+        "luma" => {
+            let input = take_usize(&mut map, "input")?;
+            let weights: [f64; 3] =
+                take_f64_vec(&mut map, "weights")?.try_into().map_err(|_| "expected 3 weights".to_owned())?;
+            Node::Luma { input, weights }
+        }
+        "blur" => Node::Blur { input: take_usize(&mut map, "input")?, sigma: take_f64(&mut map, "sigma")? },
+        "subtract" => Node::Subtract { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "abs" => Node::Abs { input: take_usize(&mut map, "input")? },
+        "join" => Node::Join { a: take_usize(&mut map, "a")?, b: take_usize(&mut map, "b")? },
+        "normal" => Node::Normal { input: take_usize(&mut map, "input")?, strength: take_f64(&mut map, "strength")? },
+        other => return Err(format!("unknown texture recipe op `{other}`")),
+    };
+    if let Some(extra) = map.keys().next() {
+        return Err(format!("unknown field `{extra}`"));
+    }
+    Ok(node)
 }
 
 impl Node {
@@ -56,7 +124,7 @@ impl Field {
     }
 }
 
-pub(crate) fn generate(bytes: &[u8], header: PackedHeader, kind: u8) -> Result<Vec<PackedLevel>> {
+fn parse_recipe(bytes: &[u8], header: PackedHeader, kind: u8) -> Result<(Recipe, Vec<usize>, &[u8])> {
     let (w, h) = (header.width as usize, header.height as usize);
     ensure!(
         w.is_power_of_two() && h.is_power_of_two() && w * h <= 1024 * 1024,
@@ -83,25 +151,152 @@ pub(crate) fn generate(bytes: &[u8], header: PackedHeader, kind: u8) -> Result<V
         }
     }
     ensure!(work <= 400_000_000, "texture recipe exceeds its filter work limit");
-    let image = &bytes[4 + length..];
+    Ok((recipe, uses, &bytes[4 + length..]))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn generate(bytes: &[u8], header: PackedHeader, kind: u8) -> Result<Vec<PackedLevel>> {
+    let (recipe, uses, image) = parse_recipe(bytes, header, kind)?;
     // Read dimensions before allocating the source image.
     let reader = image::ImageReader::with_format(std::io::Cursor::new(image), image::ImageFormat::Jpeg);
     let (iw, ih) = reader.into_dimensions()?;
     ensure!(iw > 0 && ih > 0 && u64::from(iw) * u64::from(ih) <= 4096 * 4096, "recipe source image is too large");
+    let source_rgb = if matches!(recipe.nodes.first(), Some(Node::Source)) {
+        let source = image::load_from_memory_with_format(image, image::ImageFormat::Jpeg)?.into_rgb8();
+        let source =
+            image::imageops::resize(&source, header.width, header.height, image::imageops::FilterType::Lanczos3);
+        Some(source.into_raw())
+    } else {
+        None
+    };
+    evaluate(recipe, uses, source_rgb, header, kind)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn generate_async(bytes: &[u8], header: PackedHeader, kind: u8) -> Result<Vec<PackedLevel>> {
+    let (recipe, uses, image) = parse_recipe(bytes, header, kind)?;
+    let decoded = crate::platform::decode_image(image.to_vec()).await?;
+    let (iw, ih) = (decoded.width, decoded.height);
+    ensure!(iw > 0 && ih > 0 && u64::from(iw) * u64::from(ih) <= 4096 * 4096, "recipe source image is too large");
+    let source_rgb = if matches!(recipe.nodes.first(), Some(Node::Source)) {
+        let mut rgb = Vec::with_capacity((iw as usize) * (ih as usize) * 3);
+        for px in decoded.pixels.as_chunks::<4>().0 {
+            rgb.extend_from_slice(&px[..3]);
+        }
+        Some(if iw == header.width && ih == header.height {
+            rgb
+        } else {
+            resize_rgb_lanczos3(&rgb, iw, ih, header.width, header.height)
+        })
+    } else {
+        None
+    };
+    evaluate(recipe, uses, source_rgb, header, kind)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn lanczos3(x: f64) -> f64 {
+    let ax = x.abs();
+    if ax < 1e-12 {
+        1.0
+    } else if ax >= 3.0 {
+        0.0
+    } else {
+        let px = std::f64::consts::PI * ax;
+        (px.sin() / px) * ((px / 3.0).sin() / (px / 3.0))
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to 4096x4096 dimensions and 0..=255 pixel range"
+)]
+fn resize_rgb_lanczos3(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
+    let (sw, sh, dw, dh) = (src_w as usize, src_h as usize, dst_w as usize, dst_h as usize);
+    // Horizontal pass into f64 buffer (sh x dw x 3).
+    let scale_x = (sw as f64 / dw as f64).max(1.0);
+    let support_x = 3.0 * scale_x;
+    let mut horiz = vec![0.0f64; sh * dw * 3];
+    let mut weights = Vec::new();
+    for dx in 0..dw {
+        let input = (dx as f64 + 0.5) * (sw as f64 / dw as f64);
+        let left = (input - support_x).floor().clamp(0.0, (sw - 1) as f64) as usize;
+        let right = (input + support_x).ceil().clamp((left + 1) as f64, sw as f64) as usize;
+        let center = input - 0.5;
+        weights.clear();
+        let mut sum = 0.0;
+        for sx in left..right {
+            let w = lanczos3((sx as f64 - center) / scale_x);
+            weights.push((sx, w));
+            sum += w;
+        }
+        let inv = if sum.abs() > 1e-12 { 1.0 / sum } else { 1.0 };
+        for y in 0..sh {
+            let mut acc = [0.0f64; 3];
+            for &(sx, w) in &weights {
+                let p = (y * sw + sx) * 3;
+                for c in 0..3 {
+                    acc[c] += f64::from(src[p + c]) * w;
+                }
+            }
+            let out = (y * dw + dx) * 3;
+            for c in 0..3 {
+                horiz[out + c] = acc[c] * inv;
+            }
+        }
+    }
+    // Vertical pass into u8 RGB buffer (dh x dw x 3).
+    let scale_y = (sh as f64 / dh as f64).max(1.0);
+    let support_y = 3.0 * scale_y;
+    let mut out = vec![0u8; dh * dw * 3];
+    for dy in 0..dh {
+        let input = (dy as f64 + 0.5) * (sh as f64 / dh as f64);
+        let top = (input - support_y).floor().clamp(0.0, (sh - 1) as f64) as usize;
+        let bottom = (input + support_y).ceil().clamp((top + 1) as f64, sh as f64) as usize;
+        let center = input - 0.5;
+        weights.clear();
+        let mut sum = 0.0;
+        for sy in top..bottom {
+            let w = lanczos3((sy as f64 - center) / scale_y);
+            weights.push((sy, w));
+            sum += w;
+        }
+        let inv = if sum.abs() > 1e-12 { 1.0 / sum } else { 1.0 };
+        for x in 0..dw {
+            let mut acc = [0.0f64; 3];
+            for &(sy, w) in &weights {
+                let p = (sy * dw + x) * 3;
+                for c in 0..3 {
+                    acc[c] += horiz[p + c] * w;
+                }
+            }
+            let dst = (dy * dw + x) * 3;
+            for c in 0..3 {
+                out[dst + c] = (acc[c] * inv).clamp(0.0, 255.0).round() as u8;
+            }
+        }
+    }
+    out
+}
+
+fn evaluate(
+    recipe: Recipe,
+    mut uses: Vec<usize>,
+    mut source_rgb: Option<Vec<u8>>,
+    header: PackedHeader,
+    kind: u8,
+) -> Result<Vec<PackedLevel>> {
+    let (w, h) = (header.width as usize, header.height as usize);
     let mut fields: Vec<Option<Field>> = Vec::new();
     for (i, node) in recipe.nodes.iter().enumerate() {
         let field = |index: usize| fields[index].as_ref().expect("referenced fields are retained");
         let made = match node {
             Node::Source => {
                 ensure!(i == 0, "texture recipe source must be its first node");
-                let source = image::load_from_memory_with_format(image, image::ImageFormat::Jpeg)?.into_rgb8();
-                let source = image::imageops::resize(
-                    &source,
-                    header.width,
-                    header.height,
-                    image::imageops::FilterType::Lanczos3,
-                );
-                Field { channels: 3, pixels: source.into_raw().into_iter().map(|v| f64::from(v) / 255.0).collect() }
+                let raw = source_rgb.take().context("missing decoded recipe source image")?;
+                Field { channels: 3, pixels: raw.into_iter().map(|v| f64::from(v) / 255.0).collect() }
             }
             Node::Tile { input, exponent } => {
                 ensure!(exponent.is_finite() && *exponent > 0.0, "invalid tile exponent");
@@ -383,5 +578,26 @@ mod tests {
         let mut oversized = bytes;
         oversized[8..12].copy_from_slice(&16384u32.to_le_bytes());
         assert!(PackedReader::open(oversized).is_err());
+    }
+
+    #[test]
+    fn lanczos3_resizer_matches_image_crate() {
+        let (sw, sh) = (17u32, 13u32);
+        let mut src = Vec::with_capacity((sw * sh * 3) as usize);
+        for y in 0..sh {
+            for x in 0..sw {
+                src.push(((x * 15 + y * 7) % 256) as u8);
+                src.push(((x * 9 + y * 19 + 30) % 256) as u8);
+                src.push(((x * 23 + y * 5 + 90) % 256) as u8);
+            }
+        }
+        let img = image::RgbImage::from_raw(sw, sh, src.clone()).unwrap();
+        for (dw, dh) in [(8u32, 8u32), (32, 24), (11, 19)] {
+            let expected = image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Lanczos3);
+            let actual = super::resize_rgb_lanczos3(&src, sw, sh, dw, dh);
+            assert_eq!(actual.len(), expected.as_raw().len());
+            let max_diff = actual.iter().zip(expected.as_raw()).map(|(&a, &b)| a.abs_diff(b)).max().unwrap_or(0);
+            assert!(max_diff <= 3, "resize {sw}x{sh} -> {dw}x{dh}: max diff {max_diff} > 3");
+        }
     }
 }

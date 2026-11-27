@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 
 use super::{Draw2d, buffer, pipeline, prepared};
 
-pub const SPRITES_2D_WGSL: &str = include_str!("../shaders/render2d_sprites.wgsl");
+pub const SPRITES_2D_WGSL: &str = crate::wgsl!("render2d_sprites.wgsl");
 
 /// World X points right and world Y points up. Positive rotations are clockwise
 /// on screen. Zoom measures screen pixels per world unit.
@@ -69,10 +69,10 @@ impl Default for Sprite2d {
 pub fn sort_sprites(sprites: &mut [Sprite2d], y_sort: bool) {
     // Treat the two representations of zero as the same painter's key.
     let key = |x: f32| x + 0.0;
-    sprites.sort_by(|a, b| {
-        key(a.pivot_rot_layer[3])
-            .total_cmp(&key(b.pivot_rot_layer[3]))
-            .then_with(|| if y_sort { key(b.pos[1]).total_cmp(&key(a.pos[1])) } else { std::cmp::Ordering::Equal })
+    crate::sort::sort_by_u64_key(sprites, |s| {
+        let layer = u64::from(crate::sort::f32_sortable(key(s.pivot_rot_layer[3])));
+        let y = if y_sort { u64::from(!crate::sort::f32_sortable(key(s.pos[1]))) } else { 0 };
+        (layer << 32) | y
     });
 }
 

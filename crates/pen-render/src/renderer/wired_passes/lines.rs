@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-lines"), allow(unused_imports, dead_code))]
 use super::super::State;
 use super::{LINES_EXT_TAG, WiredPasses};
 use crate::camera_precision::DepthMode;
@@ -19,7 +20,9 @@ pub struct LineScene {
 pub(in crate::renderer) struct LineWiredState {
     pub scene: Option<LineScene>,
     pub devtools_scene: Option<LineScene>,
+    #[cfg(feature = "render-lines")]
     pub renderer_3d: Option<LineRenderer>,
+    #[cfg(feature = "render-lines")]
     pub renderer_2d: Option<LineRenderer>,
 }
 
@@ -68,6 +71,12 @@ fn decode_ext_lines(frame: &RenderFrame, batch: &mut LineBatch) -> Option<XRaySt
 }
 
 impl State {
+    #[cfg(not(feature = "render-lines"))]
+    pub(in crate::renderer) fn gather_line_scene(&self, _frame: &RenderFrame) -> Option<LineScene> {
+        None
+    }
+
+    #[cfg(feature = "render-lines")]
     pub(in crate::renderer) fn gather_line_scene(&self, frame: &RenderFrame) -> Option<LineScene> {
         let mut batch = LineBatch::new();
         let mut xray = XRayStyle::default();
@@ -92,6 +101,24 @@ impl State {
         (!batch.is_empty()).then_some(LineScene { batch, xray })
     }
 
+    #[cfg(not(feature = "render-lines"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_lines_3d_wired(
+        _wired: &mut WiredPasses,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _pass: &mut wgpu::RenderPass<'_>,
+        _scene: &LineScene,
+        _view: &Matrix,
+        _active_proj: &Matrix,
+        _size: (u32, u32),
+        _samples: u32,
+        _depth_mode: DepthMode,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "render-lines")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_lines_3d_wired(
         wired: &mut WiredPasses,
@@ -127,6 +154,22 @@ impl State {
         Ok(())
     }
 
+    #[cfg(not(feature = "render-lines"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::renderer) fn encode_lines_2d_wired(
+        _wired: &mut WiredPasses,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _encoder: &mut wgpu::CommandEncoder,
+        _scene: &LineScene,
+        _target_view: &wgpu::TextureView,
+        _target_format: wgpu::TextureFormat,
+        _size: (u32, u32),
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg(feature = "render-lines")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_lines_2d_wired(
         wired: &mut WiredPasses,

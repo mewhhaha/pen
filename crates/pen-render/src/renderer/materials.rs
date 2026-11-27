@@ -516,7 +516,7 @@ impl State {
             let materials = &mut scratch.materials;
             materials.extend(frame.draws.iter().map(|draw| draw.material));
             materials.extend(frame.solids.iter().flat_map(|solid| solid.faces.iter().map(|face| face.material)));
-            materials.sort_unstable();
+            crate::sort::sort_by_u64_key(materials, |&m| u64::from(m));
             materials.dedup();
             for index in std::mem::take(materials) {
                 let Some(material) = self.material(catalog, index)? else { continue };

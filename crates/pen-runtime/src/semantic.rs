@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, ensure};
 use pen_protocol::{Extension, RenderFrame, boundary::MAX_EXTENSION_TAG};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value as Json, json};
 
 use crate::services::{Answer, code_points};
@@ -80,13 +80,53 @@ pub struct Schema {
     pub types: Vec<Type>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Value {
     Unsigned(u32),
     Float(f32),
     Boolean(bool),
     Encoded(Vec<u32>),
+}
+
+impl<'de> Deserialize<'de> for Value {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let map = serde_json::Map::<String, Json>::deserialize(deserializer)?;
+        parse_value_map(map).map_err(serde::de::Error::custom)
+    }
+}
+
+fn json_u32(val: &Json, key: &str) -> std::result::Result<u32, String> {
+    let n = val.as_u64().ok_or_else(|| format!("expected u32 for `{key}`"))?;
+    u32::try_from(n).map_err(|_| format!("u32 out of range for `{key}`"))
+}
+
+fn json_u32_vec(val: &Json, key: &str) -> std::result::Result<Vec<u32>, String> {
+    let arr = val.as_array().ok_or_else(|| format!("expected array for `{key}`"))?;
+    arr.iter().map(|v| json_u32(v, key)).collect()
+}
+
+fn parse_value_map(mut map: serde_json::Map<String, Json>) -> std::result::Result<Value, String> {
+    let kind = match map.remove("kind") {
+        Some(Json::String(s)) => s,
+        Some(_) => return Err("expected string for `kind`".to_owned()),
+        None => return Err("missing field `kind`".to_owned()),
+    };
+    let raw = map.remove("value").ok_or_else(|| "missing field `value`".to_owned())?;
+    if let Some(extra) = map.keys().next() {
+        return Err(format!("unknown field `{extra}`"));
+    }
+    match kind.as_str() {
+        "unsigned" => Ok(Value::Unsigned(json_u32(&raw, "value")?)),
+        "float" =>
+        {
+            #[allow(clippy::cast_possible_truncation, reason = "JSON numbers narrow to f32 for semantic Value::Float")]
+            raw.as_f64().map(|v| Value::Float(v as f32)).ok_or_else(|| "expected number for `value`".to_owned())
+        }
+        "boolean" => raw.as_bool().map(Value::Boolean).ok_or_else(|| "expected bool for `value`".to_owned()),
+        "encoded" => Ok(Value::Encoded(json_u32_vec(&raw, "value")?)),
+        other => Err(format!("unknown value kind `{other}`")),
+    }
 }
 
 impl Value {
@@ -277,15 +317,15 @@ fn decode(values: &[f32]) -> Result<Observation> {
         serde_json::from_slice(&bytes.ok_or_else(|| anyhow::anyhow!("invalid UTF-8 bytes"))?)?;
     observation.validate()?;
     // Descriptor order is presentation, not identity or compatibility.
-    observation.schema.types.sort_unstable_by_key(|ty| ty.id);
+    crate::sort::sort_by_u64_key(&mut observation.schema.types, |ty| u64::from(ty.id));
     for ty in &mut observation.schema.types {
-        ty.descriptor.variants.sort_unstable_by_key(|variant| variant.tag);
+        crate::sort::sort_by_u64_key(&mut ty.descriptor.variants, |variant| u64::from(variant.tag));
         for variant in &mut ty.descriptor.variants {
-            variant.fields.sort_unstable_by_key(|field| field.id);
+            crate::sort::sort_by_u64_key(&mut variant.fields, |field| u64::from(field.id));
         }
     }
     for object in &mut observation.objects {
-        object.fields.sort_unstable_by_key(|field| field.id);
+        crate::sort::sort_by_u64_key(&mut object.fields, |field| u64::from(field.id));
     }
     Ok(observation)
 }
@@ -397,50 +437,129 @@ pub struct Watch {
     pub equals: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Debug)]
 pub enum Request {
-    Capture {
-        tag: Option<u32>,
-    },
+    Capture { tag: Option<u32> },
     Status,
-    Schema {
-        position: String,
-        #[serde(default)]
-        first: u32,
-    },
-    Objects {
-        position: String,
-        #[serde(default)]
-        first: u32,
-    },
-    Values {
-        position: String,
-        object: Identity,
-        #[serde(default)]
-        first: u32,
-    },
-    Diff {
-        before: String,
-        after: String,
-        object: Option<Identity>,
-        #[serde(default)]
-        first: u32,
-    },
-    Decisions {
-        from: String,
-        through: String,
-        object: Option<Identity>,
-        #[serde(default)]
-        first: u32,
-    },
-    Watch {
-        watch: Watch,
-    },
+    Schema { position: String, first: u32 },
+    Objects { position: String, first: u32 },
+    Values { position: String, object: Identity, first: u32 },
+    Diff { before: String, after: String, object: Option<Identity>, first: u32 },
+    Decisions { from: String, through: String, object: Option<Identity>, first: u32 },
+    Watch { watch: Watch },
     Unwatch,
-    Seek {
-        position: String,
-    },
+    Seek { position: String },
+}
+
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let map = serde_json::Map::<String, Json>::deserialize(deserializer)?;
+        parse_request_map(map).map_err(serde::de::Error::custom)
+    }
+}
+
+fn req_str(map: &mut serde_json::Map<String, Json>, key: &str) -> std::result::Result<String, String> {
+    match map.remove(key) {
+        Some(Json::String(s)) => Ok(s),
+        Some(_) => Err(format!("expected string for `{key}`")),
+        None => Err(format!("missing field `{key}`")),
+    }
+}
+
+fn req_opt_u32(map: &mut serde_json::Map<String, Json>, key: &str) -> std::result::Result<Option<u32>, String> {
+    match map.remove(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(v) => json_u32(&v, key).map(Some),
+    }
+}
+
+fn req_first(map: &mut serde_json::Map<String, Json>) -> std::result::Result<u32, String> {
+    Ok(req_opt_u32(map, "first")?.unwrap_or(0))
+}
+
+fn parse_identity_val(val: Json, key: &str) -> std::result::Result<Identity, String> {
+    let mut map = match val {
+        Json::Object(m) => m,
+        _ => return Err(format!("expected object for `{key}`")),
+    };
+    let kind = req_str(&mut map, "kind")?;
+    let words_val = map.remove("words").ok_or_else(|| "missing field `words`".to_owned())?;
+    let words = json_u32_vec(&words_val, "words")?;
+    if let Some(extra) = map.keys().next() {
+        return Err(format!("unknown field `{extra}`"));
+    }
+    Ok(Identity { kind, words })
+}
+
+fn req_identity(map: &mut serde_json::Map<String, Json>, key: &str) -> std::result::Result<Identity, String> {
+    let val = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+    parse_identity_val(val, key)
+}
+
+fn req_opt_identity(
+    map: &mut serde_json::Map<String, Json>,
+    key: &str,
+) -> std::result::Result<Option<Identity>, String> {
+    match map.remove(key) {
+        None | Some(Json::Null) => Ok(None),
+        Some(val) => parse_identity_val(val, key).map(Some),
+    }
+}
+
+fn parse_watch_val(val: Json) -> std::result::Result<Watch, String> {
+    let mut map = match val {
+        Json::Object(m) => m,
+        _ => return Err("expected object for `watch`".to_owned()),
+    };
+    let object = req_identity(&mut map, "object")?;
+    let field = req_opt_u32(&mut map, "field")?;
+    let equals = match map.remove("equals") {
+        None | Some(Json::Null) => None,
+        Some(Json::Object(m)) => Some(parse_value_map(m)?),
+        Some(_) => return Err("expected object for `equals`".to_owned()),
+    };
+    if let Some(extra) = map.keys().next() {
+        return Err(format!("unknown field `{extra}`"));
+    }
+    Ok(Watch { object, field, equals })
+}
+
+fn parse_request_map(mut map: serde_json::Map<String, Json>) -> std::result::Result<Request, String> {
+    let op = req_str(&mut map, "op")?;
+    let req = match op.as_str() {
+        "capture" => Request::Capture { tag: req_opt_u32(&mut map, "tag")? },
+        "status" => Request::Status,
+        "schema" => Request::Schema { position: req_str(&mut map, "position")?, first: req_first(&mut map)? },
+        "objects" => Request::Objects { position: req_str(&mut map, "position")?, first: req_first(&mut map)? },
+        "values" => Request::Values {
+            position: req_str(&mut map, "position")?,
+            object: req_identity(&mut map, "object")?,
+            first: req_first(&mut map)?,
+        },
+        "diff" => Request::Diff {
+            before: req_str(&mut map, "before")?,
+            after: req_str(&mut map, "after")?,
+            object: req_opt_identity(&mut map, "object")?,
+            first: req_first(&mut map)?,
+        },
+        "decisions" => Request::Decisions {
+            from: req_str(&mut map, "from")?,
+            through: req_str(&mut map, "through")?,
+            object: req_opt_identity(&mut map, "object")?,
+            first: req_first(&mut map)?,
+        },
+        "watch" => {
+            let val = map.remove("watch").ok_or_else(|| "missing field `watch`".to_owned())?;
+            Request::Watch { watch: parse_watch_val(val)? }
+        }
+        "unwatch" => Request::Unwatch,
+        "seek" => Request::Seek { position: req_str(&mut map, "position")? },
+        other => return Err(format!("unknown semantic op `{other}`")),
+    };
+    if let Some(extra) = map.keys().next() {
+        return Err(format!("unknown field `{extra}`"));
+    }
+    Ok(req)
 }
 
 pub fn request(values: &[f32]) -> Result<Request> {

@@ -2,19 +2,39 @@
 # Builds the browser host as an ES module and its wasm:
 #   OUT/pen_web.js, OUT/pen_web_bg.wasm (and .d.ts typings)
 # OUT defaults to crates/pen-web/pkg. Pass --compact after OUT for the
-# static single-player host. The crate builds in the workspace with
-# its `web` profile, into target/browser. The wasm-bindgen CLI must match the
-# wasm-bindgen version Cargo.lock pins; the first build installs it under
-# target/wasm-tools. wasm-opt (binaryen) shrinks the wasm further; without
-# it on PATH the build warns and the wasm stays unoptimized.
+# general static single-player host, or --features LIST for a tailored build
+# with only the named Cargo features (using --no-default-features). The crate
+# builds in the workspace with its `web` profile, into target/browser. The
+# wasm-bindgen CLI must match the wasm-bindgen version Cargo.lock pins; the
+# first build installs it under target/wasm-tools. wasm-opt (binaryen) shrinks
+# the wasm further; without it on PATH the build warns and the wasm stays
+# unoptimized.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 out=${1:-$here/pkg}
+ship_structured=1
+ship_kernels=1
 case ${2:-} in
-  --compact) set -- --features compact ;;
+  --compact)
+    ship_structured=0
+    set -- --no-default-features --features compact
+    ;;
+  --features)
+    ship_structured=0
+    features=${3:-}
+    case ",$features," in
+      *,kernels,*) ship_kernels=1 ;;
+      *) ship_kernels=0 ;;
+    esac
+    if [ -n "$features" ]; then
+      set -- --no-default-features --features "$features"
+    else
+      set -- --no-default-features
+    fi
+    ;;
   '') set -- ;;
-  *) echo "usage: $0 [OUT [--compact]]" >&2; exit 2 ;;
+  *) echo "usage: $0 [OUT [--compact | --features LIST]]" >&2; exit 2 ;;
 esac
 version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' "$root/Cargo.lock")
 [ -n "$version" ] || { echo "build.sh: Cargo.lock pins no wasm-bindgen" >&2; exit 1; }
@@ -31,10 +51,21 @@ mkdir -p "$out"
 "$bindgen" --target web --out-dir "$out" --out-name pen_web \
   "$CARGO_TARGET_DIR/wasm32-unknown-unknown/web/pen_web.wasm"
 cp "$here/guest.js" "$out/guest.js"
-cp "$here/structured.js" "$out/structured.js"
-cp "$here/kernels.js" "$out/kernels.js"
-cp "$here/kernel_worker.js" "$out/kernel_worker.js"
 cp "$here/index.html" "$out/index.html"
+js_files="$out/pen_web.js $out/guest.js"
+if [ "$ship_structured" = "1" ]; then
+  cp "$here/structured.js" "$out/structured.js"
+  js_files="$js_files $out/structured.js"
+fi
+if [ "$ship_kernels" = "1" ]; then
+  cp "$here/kernels.js" "$out/kernels.js"
+  cp "$here/kernel_worker.js" "$out/kernel_worker.js"
+  js_files="$js_files $out/kernels.js $out/kernel_worker.js"
+fi
+if command -v node >/dev/null; then
+  # shellcheck disable=SC2086
+  node "$here/minify-js.mjs" $js_files
+fi
 # -O1 with the features rustc's wasm32-unknown-unknown enables: -Os and -Oz
 # make a smaller module that compresses worse, so it downloads larger.
 if command -v wasm-opt >/dev/null; then

@@ -59,11 +59,8 @@ impl Spec {
             let players: usize = players_s.trim().parse().context(usage)?;
             ensure!((2..=32).contains(&players) && player < players, "{usage}: 2 to 32 players, PLAYER < PLAYERS");
             let (addr_s, room_part) = target.split_once('/').context(usage)?;
-            let server = addr_s
-                .trim()
-                .to_socket_addrs()?
-                .next()
-                .with_context(|| format!("{addr_s} names no address"))?;
+            let server =
+                addr_s.trim().to_socket_addrs()?.next().with_context(|| format!("{addr_s} names no address"))?;
             let (room, token) = match room_part.split_once('#') {
                 Some((r, tok)) => (r.trim().to_owned(), tok.trim().parse::<u64>().context(usage)?),
                 None => (room_part.trim().to_owned(), 0),
@@ -97,7 +94,9 @@ impl Spec {
     /// Opens the configured transport link (direct UDP or framed TCP relay).
     pub fn connect(&self) -> Result<Box<dyn Link>> {
         match &self.relay {
-            Some(relay) => Ok(Box::new(TcpRelay::connect(relay.server, &relay.room, self.player, relay.players, relay.token)?)),
+            Some(relay) => {
+                Ok(Box::new(TcpRelay::connect(relay.server, &relay.room, self.player, relay.players, relay.token)?))
+            }
             None => Ok(Box::new(Udp::bind(self)?)),
         }
     }
@@ -554,9 +553,7 @@ impl TcpRelayServer {
                                 client.raw_buf.extend_from_slice(chunk);
                             }
                             ClientMode::WebSocket => {
-                                if client.raw_buf.len() + chunk.len()
-                                    > pen_runtime::net::relay::MAX_FRAME_BYTES + 32
-                                {
+                                if client.raw_buf.len() + chunk.len() > pen_runtime::net::relay::MAX_FRAME_BYTES + 32 {
                                     peer_closed = true;
                                     break;
                                 }
@@ -667,8 +664,7 @@ impl TcpRelayServer {
                                         }
                                     }
                                     0 => {
-                                        if !client.frag_active
-                                            || client.frag_buf.len() + frame.payload.len() > max_msg
+                                        if !client.frag_active || client.frag_buf.len() + frame.payload.len() > max_msg
                                         {
                                             dropped.push(id);
                                             break;

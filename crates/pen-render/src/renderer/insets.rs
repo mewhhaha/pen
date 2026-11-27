@@ -19,7 +19,7 @@ use crate::shader::PipelineContext;
 // Lays an inset's resolved image over the screen in its rectangle, toned as
 // the scene is; its color is premultiplied by its coverage, so edges blend
 // smoothly.
-const COMPOSITE_SHADER: &str = include_str!("../shaders/composite.wgsl");
+const COMPOSITE_SHADER: &str = crate::wgsl!("composite.wgsl");
 
 /// The pipeline laying an inset's image over the output.
 pub(crate) fn composite_pipeline(context: &PipelineContext) -> wgpu::RenderPipeline {

@@ -9,7 +9,7 @@ use crate::camera_precision::DepthMode;
 use crate::matrix::{invert, multiply};
 use crate::shader::SKIN_VERTEX_BYTES;
 
-const SHADER: &str = include_str!("../shaders/thin_gbuffer.wgsl");
+const SHADER: &str = crate::wgsl!("thin_gbuffer.wgsl");
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const INSTANCE_BYTES: u64 = 80;
@@ -97,7 +97,9 @@ impl DrawGbuf {
         let pbr_params = uses_pbr_parameters(m);
         let (mut metallic, mut roughness) = if pbr_params {
             match m.instance_parameters {
-                Some(p) => ((p[0] as f32).clamp(0.0, 1.0), if p[1] > 0.0 { (p[1] as f32).clamp(0.04, 1.0) } else { 0.5 }),
+                Some(p) => {
+                    ((p[0] as f32).clamp(0.0, 1.0), if p[1] > 0.0 { (p[1] as f32).clamp(0.04, 1.0) } else { 0.5 })
+                }
                 None => (0.0, 0.5),
             }
         } else {
@@ -547,14 +549,17 @@ impl ThinGbuffer {
         }
     }
 
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub fn normal_roughness_view(&self) -> Option<&wgpu::TextureView> {
         self.targets.as_ref().map(|targets| &targets.normal_roughness)
     }
 
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub fn albedo_metallic_view(&self) -> Option<&wgpu::TextureView> {
         self.targets.as_ref().map(|targets| &targets.albedo_metallic)
     }
 
+    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub fn depth_view(&self) -> Option<&wgpu::TextureView> {
         self.targets.as_ref().map(|targets| &targets.depth)
     }

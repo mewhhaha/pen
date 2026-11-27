@@ -16,7 +16,7 @@ use crate::asset_store::{Lod, MAX_LODS};
 use crate::culling::{Detail, MAX_VIEWS, Sphere, ViewMask, Views};
 use crate::shader::PipelineContext;
 
-pub(crate) const CULL_WGSL: &str = include_str!("../shaders/cull.wgsl");
+pub(crate) const CULL_WGSL: &str = crate::wgsl!("cull.wgsl");
 
 /// Batches of at least this many instances cull on the GPU, where it can.
 pub(crate) const GPU_CULLING_FROM: u32 = 32;

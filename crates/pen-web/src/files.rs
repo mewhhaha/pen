@@ -82,6 +82,7 @@ impl Files {
     /// Asks the player for a file (`accept` lists the extensions offered),
     /// which arrives once chosen. Browsers open their chooser only soon
     /// after the player pressed a key or clicked.
+    #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     pub fn choose(&self, accept: &str) -> Result<()> {
         let document = web_sys::window().unwrap().document().unwrap();
         let input: HtmlInputElement = document.create_element("input").map_err(error)?.unchecked_into();
@@ -100,6 +101,7 @@ impl Files {
 }
 
 /// Hands `bytes` to the player as a download named `name`.
+#[cfg_attr(not(any(feature = "devtools", feature = "replay")), allow(dead_code))]
 pub fn download(name: &str, bytes: &[u8], kind: &str) -> Result<()> {
     let parts = Array::of1(&Uint8Array::from(bytes));
     let options = BlobPropertyBag::new();
@@ -123,6 +125,7 @@ pub fn download(name: &str, bytes: &[u8], kind: &str) -> Result<()> {
 
 /// A name for a file made now: `PREFIX-20261016-142301.EXTENSION` (UTC),
 /// as native pen names its shots and recordings.
+#[cfg_attr(not(any(feature = "devtools", feature = "replay")), allow(dead_code))]
 pub fn named(prefix: &str, extension: &str) -> String {
     let now = js_sys::Date::new_0();
     format!(
@@ -137,6 +140,7 @@ pub fn named(prefix: &str, extension: &str) -> String {
 }
 
 /// The last part of `path`, as a download's name.
+#[cfg_attr(not(feature = "devtools"), allow(dead_code))]
 pub fn base_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }

@@ -14,16 +14,28 @@ struct Decal {
 @group(0) @binding(3) var image: texture_2d<f32>;
 @group(0) @binding(4) var image_sampler: sampler;
 
+const PAINT: bool = ${paint};
+
 // The cube -1..1, wound counterclockwise seen from outside.
-const corners = array<vec3f, 8>(
-  vec3f(-1.0, -1.0, -1.0), vec3f(1.0, -1.0, -1.0), vec3f(-1.0, 1.0, -1.0), vec3f(1.0, 1.0, -1.0),
-  vec3f(-1.0, -1.0, 1.0), vec3f(1.0, -1.0, 1.0), vec3f(-1.0, 1.0, 1.0), vec3f(1.0, 1.0, 1.0),
-);
-const faces = array<u32, 36>(
-  0u, 4u, 6u, 0u, 6u, 2u, 1u, 3u, 7u, 1u, 7u, 5u,
-  0u, 1u, 5u, 0u, 5u, 4u, 2u, 6u, 7u, 2u, 7u, 3u,
-  0u, 2u, 3u, 0u, 3u, 1u, 4u, 5u, 7u, 4u, 7u, 6u,
-);
+fn cube_corner(vertex: u32) -> vec3f {
+  let face = vertex / 6u;
+  let slot = vertex % 6u;
+  var packed = 0u;
+  switch face {
+    case 0u: { packed = 0u | (4u << 3u) | (6u << 6u) | (0u << 9u) | (6u << 12u) | (2u << 15u); }
+    case 1u: { packed = 1u | (3u << 3u) | (7u << 6u) | (1u << 9u) | (7u << 12u) | (5u << 15u); }
+    case 2u: { packed = 0u | (1u << 3u) | (5u << 6u) | (0u << 9u) | (5u << 12u) | (4u << 15u); }
+    case 3u: { packed = 2u | (6u << 3u) | (7u << 6u) | (2u << 9u) | (7u << 12u) | (3u << 15u); }
+    case 4u: { packed = 0u | (2u << 3u) | (3u << 6u) | (0u << 9u) | (3u << 12u) | (1u << 15u); }
+    default: { packed = 4u | (5u << 3u) | (7u << 6u) | (4u << 9u) | (7u << 12u) | (6u << 15u); }
+  }
+  let c = (packed >> (slot * 3u)) & 7u;
+  return vec3f(
+    select(-1.0, 1.0, (c & 1u) != 0u),
+    select(-1.0, 1.0, (c & 2u) != 0u),
+    select(-1.0, 1.0, (c & 4u) != 0u),
+  );
+}
 
 struct Box {
   @builtin(position) position: vec4f,
@@ -31,16 +43,16 @@ struct Box {
 };
 
 @vertex fn vertex(@builtin(vertex_index) vertex: u32, @builtin(instance_index) index: u32) -> Box {
-  let corner = corners[faces[vertex]];
+  let corner = cube_corner(vertex);
   return Box(view.view_projection * (decals[index].model * vec4f(corner, 1.0)), index);
 }
 
 // The decal's tinted texture where the surface behind the box lies in it, its
 // alpha how much of the surface it covers: none outside the box.
-fn laid(box: Box) -> vec4f {
-  let decal = decals[box.index];
-  let pixel = vec2i(box.position.xy);
-  let ndc = vec2f(box.position.x / view.size.x * 2.0 - 1.0, 1.0 - box.position.y / view.size.y * 2.0);
+fn laid(position: vec4f, index: u32) -> vec4f {
+  let decal = decals[index];
+  let pixel = vec2i(position.xy);
+  let ndc = vec2f(position.x / view.size.x * 2.0 - 1.0, 1.0 - position.y / view.size.y * 2.0);
   let world = view.inverse_view_projection * vec4f(ndc, textureLoad(depth, pixel, 0), 1.0);
   let local = (decal.inverse * vec4f(world.xyz / world.w, 1.0)).xyz;
   if (any(abs(local) > vec3f(1.0))) {
@@ -51,21 +63,13 @@ fn laid(box: Box) -> vec4f {
   return vec4f(texel.rgb * decal.color.rgb, cover);
 }
 
-// Multiplied over the surface, so its lighting and shadow show through.
 @fragment fn fragment(box: Box) -> @location(0) vec4f {
-  let found = laid(box);
+  let found = laid(box.position, box.index);
   if (found.a <= 0.0) {
     discard;
+  }
+  if (PAINT) {
+    return vec4f(found.rgb * found.a, found.a);
   }
   return vec4f(mix(vec3f(1.0), found.rgb, found.a), 1.0);
-}
-
-// Painted over the surface in its own color, premultiplied, whatever light
-// falls there.
-@fragment fn paint(box: Box) -> @location(0) vec4f {
-  let found = laid(box);
-  if (found.a <= 0.0) {
-    discard;
-  }
-  return vec4f(found.rgb * found.a, found.a);
 }

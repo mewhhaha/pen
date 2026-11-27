@@ -4,8 +4,8 @@
 
 use anyhow::{Result, ensure};
 
-pub const UPSCALE_RCAS_WGSL: &str = include_str!("shaders/upscale_rcas.wgsl");
-pub const POST_FX_WGSL: &str = include_str!("shaders/post_fx.wgsl");
+pub const UPSCALE_RCAS_WGSL: &str = crate::wgsl!("upscale_rcas.wgsl");
+pub const POST_FX_WGSL: &str = crate::wgsl!("post_fx.wgsl");
 
 /// Standard AMD FSR 2.2 / 3.1 quality presets mapping output displays to internal render scale,
 /// jitter phase count, negative texture LOD mip bias, and recommended RCAS sharpening.

@@ -128,14 +128,19 @@ impl WebVideoRegistry {
                                             let backoff = video_retry_backoff_frames(next_attempts);
                                             st.material_keys.insert(
                                                 mat_key_owned.clone(),
-                                                MaterialSlot::Failed { retry_at: now_frame + backoff, attempts: next_attempts },
+                                                MaterialSlot::Failed {
+                                                    retry_at: now_frame + backoff,
+                                                    attempts: next_attempts,
+                                                },
                                             );
                                             st.errors.push(format!("video material {mat_key_owned}: invalid texture key {tex_key:?}: {err:#}"));
                                             return;
                                         }
                                         let mut st = shared.borrow_mut();
-                                        st.material_keys
-                                            .insert(mat_key_owned.clone(), MaterialSlot::Resolved(Some(tex_key.clone())));
+                                        st.material_keys.insert(
+                                            mat_key_owned.clone(),
+                                            MaterialSlot::Resolved(Some(tex_key.clone())),
+                                        );
                                         tex_key
                                     }
                                     Ok(None) => {
@@ -151,7 +156,10 @@ impl WebVideoRegistry {
                                         let backoff = video_retry_backoff_frames(next_attempts);
                                         st.material_keys.insert(
                                             mat_key_owned.clone(),
-                                            MaterialSlot::Failed { retry_at: now_frame + backoff, attempts: next_attempts },
+                                            MaterialSlot::Failed {
+                                                retry_at: now_frame + backoff,
+                                                attempts: next_attempts,
+                                            },
                                         );
                                         st.errors.push(format!("video material {mat_key_owned}: {err:#}"));
                                         return;
@@ -161,7 +169,10 @@ impl WebVideoRegistry {
                                 // Proceed to fetch the Y4M stream within the same concurrency slot.
                                 {
                                     let mut st = shared.borrow_mut();
-                                    if matches!(st.streams.get(&tex_key), Some(StreamSlot::Loading | StreamSlot::Ready(_))) {
+                                    if matches!(
+                                        st.streams.get(&tex_key),
+                                        Some(StreamSlot::Loading | StreamSlot::Ready(_))
+                                    ) {
                                         st.in_flight = st.in_flight.saturating_sub(1);
                                         return;
                                     }
@@ -311,10 +322,8 @@ async fn fetch_stream_task(
         Err(err) => {
             let next_attempts = attempts.saturating_add(1);
             let backoff = video_retry_backoff_frames(next_attempts);
-            st.streams.insert(
-                tex_key.clone(),
-                StreamSlot::Failed { retry_at: now_frame + backoff, attempts: next_attempts },
-            );
+            st.streams
+                .insert(tex_key.clone(), StreamSlot::Failed { retry_at: now_frame + backoff, attempts: next_attempts });
             st.errors.push(format!("video stream {tex_key}: {err:#}"));
         }
     }

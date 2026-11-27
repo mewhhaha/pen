@@ -11,8 +11,8 @@ use crate::camera_precision::DepthMode;
 use crate::matrix::IDENTITY;
 use crate::packed_texture::mip_levels;
 
-const HIZ_BASE_WGSL: &str = include_str!("../shaders/hiz_base.wgsl");
-const HIZ_REDUCE_WGSL: &str = include_str!("../shaders/hiz.wgsl");
+const HIZ_BASE_WGSL: &str = crate::wgsl!("hiz_base.wgsl");
+const HIZ_REDUCE_WGSL: &str = crate::wgsl!("hiz.wgsl");
 
 const WORKGROUP: u32 = 8;
 static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);

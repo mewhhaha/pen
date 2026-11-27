@@ -103,13 +103,31 @@ impl PackedReader {
         ensure!(bytes.len() >= 16, "packed texture requires a GTEX header");
         let header = parse_header(&bytes[..16])?;
         let generated = match bytes[4] {
-            #[cfg(all(target_arch = "wasm32", feature = "web-compact"))]
-            3 => bail!("use the full browser host for GTEX texture recipes"),
-            #[cfg(not(all(target_arch = "wasm32", feature = "web-compact")))]
+            #[cfg(not(feature = "texture-recipes"))]
+            3 => bail!("use a host built with texture-recipes for GTEX texture recipes"),
+            #[cfg(all(target_arch = "wasm32", feature = "texture-recipes"))]
+            3 => bail!("GTEX texture recipes must be opened asynchronously on wasm32"),
+            #[cfg(all(not(target_arch = "wasm32"), feature = "texture-recipes"))]
             3 => Some(crate::texture_recipe::generate(&bytes[16..], header, bytes[6])?.into_iter()),
             _ => None,
         };
         Ok(Self { bytes, at: 16, header, next: i64::from(header.levels) - 1, generated })
+    }
+
+    pub async fn open_async(bytes: Vec<u8>) -> Result<Self> {
+        #[cfg(all(target_arch = "wasm32", feature = "texture-recipes"))]
+        if bytes.len() >= 16 && bytes[4] == 3 {
+            let header = parse_header(&bytes[..16])?;
+            let levels = crate::texture_recipe::generate_async(&bytes[16..], header, bytes[6]).await?;
+            return Ok(Self {
+                bytes,
+                at: 16,
+                header,
+                next: i64::from(header.levels) - 1,
+                generated: Some(levels.into_iter()),
+            });
+        }
+        Self::open(bytes)
     }
 
     fn read(&mut self, count: usize) -> Result<&[u8]> {

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Value type flowing along a shader graph edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,14 +54,22 @@ pub struct RampStop {
 }
 
 /// Supported visual material graph node kinds.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ShaderNodeKind {
     // Constants & vertex/scene inputs
-    FloatConst { value: f32 },
-    Vec2Const { value: [f32; 2] },
-    Vec3Const { value: [f32; 3] },
-    Vec4Const { value: [f32; 4] },
+    FloatConst {
+        value: f32,
+    },
+    Vec2Const {
+        value: [f32; 2],
+    },
+    Vec3Const {
+        value: [f32; 3],
+    },
+    Vec4Const {
+        value: [f32; 4],
+    },
     Uv,
     Uv1,
     WorldPos,
@@ -69,57 +77,43 @@ pub enum ShaderNodeKind {
     ViewDir,
     VertexColor,
     Time,
-    InstanceParam { index: u32 },
+    InstanceParam {
+        index: u32,
+    },
 
     // Coordinate transforms & textures
     UvTransform {
-        #[serde(default)]
         uv: Option<NodeRef>,
-        #[serde(default = "default_one2")]
         scale: [f32; 2],
-        #[serde(default)]
         offset: [f32; 2],
-        #[serde(default)]
         rotation_rad: f32,
     },
     Texture2D {
-        #[serde(default)]
         uv: Option<NodeRef>,
-        #[serde(default = "default_white3")]
         fallback_color: [f32; 3],
     },
     Triplanar {
-        #[serde(default = "default_one")]
         scale: f32,
-        #[serde(default = "default_four")]
         sharpness: f32,
     },
 
     // Procedural noise
     SimplexNoise {
-        #[serde(default)]
         coords: Option<NodeRef>,
-        #[serde(default = "default_four")]
         scale: f32,
     },
     WorleyNoise {
-        #[serde(default)]
         coords: Option<NodeRef>,
-        #[serde(default = "default_four")]
         scale: f32,
     },
     FbmNoise {
-        #[serde(default)]
         coords: Option<NodeRef>,
-        #[serde(default = "default_four")]
         scale: f32,
-        #[serde(default = "default_octaves")]
         octaves: u32,
     },
 
     // Shading helpers
     Fresnel {
-        #[serde(default = "default_five")]
         power: f32,
     },
     ColorRamp {
@@ -132,71 +126,298 @@ pub enum ShaderNodeKind {
     },
 
     // Math & vector operations
-    Add { a: NodeRef, b: NodeRef },
-    Sub { a: NodeRef, b: NodeRef },
-    Mul { a: NodeRef, b: NodeRef },
-    Div { a: NodeRef, b: NodeRef },
-    Pow { base: NodeRef, exp: NodeRef },
-    Sin { x: NodeRef },
-    Cos { x: NodeRef },
-    Clamp { x: NodeRef, min: f32, max: f32 },
-    Smoothstep { edge0: f32, edge1: f32, x: NodeRef },
-    Lerp { a: NodeRef, b: NodeRef, t: NodeRef },
-    Dot { a: NodeRef, b: NodeRef },
-    Normalize { x: NodeRef },
-    Swizzle { input: NodeRef, mask: String },
-    Combine3 { x: NodeRef, y: NodeRef, z: NodeRef },
+    Add {
+        a: NodeRef,
+        b: NodeRef,
+    },
+    Sub {
+        a: NodeRef,
+        b: NodeRef,
+    },
+    Mul {
+        a: NodeRef,
+        b: NodeRef,
+    },
+    Div {
+        a: NodeRef,
+        b: NodeRef,
+    },
+    Pow {
+        base: NodeRef,
+        exp: NodeRef,
+    },
+    Sin {
+        x: NodeRef,
+    },
+    Cos {
+        x: NodeRef,
+    },
+    Clamp {
+        x: NodeRef,
+        min: f32,
+        max: f32,
+    },
+    Smoothstep {
+        edge0: f32,
+        edge1: f32,
+        x: NodeRef,
+    },
+    Lerp {
+        a: NodeRef,
+        b: NodeRef,
+        t: NodeRef,
+    },
+    Dot {
+        a: NodeRef,
+        b: NodeRef,
+    },
+    Normalize {
+        x: NodeRef,
+    },
+    Swizzle {
+        input: NodeRef,
+        mask: String,
+    },
+    Combine3 {
+        x: NodeRef,
+        y: NodeRef,
+        z: NodeRef,
+    },
 
     // Master PBR output node
     StandardSurfaceOutput {
-        #[serde(default)]
         base_color: Option<NodeRef>,
-        #[serde(default)]
         metallic: Option<NodeRef>,
-        #[serde(default)]
         roughness: Option<NodeRef>,
-        #[serde(default)]
         normal: Option<NodeRef>,
-        #[serde(default)]
         emissive: Option<NodeRef>,
-        #[serde(default)]
         ao: Option<NodeRef>,
-        #[serde(default)]
         alpha: Option<NodeRef>,
-        #[serde(default)]
         clearcoat: Option<NodeRef>,
-        #[serde(default)]
         iridescence: Option<NodeRef>,
     },
 }
 
-fn default_one() -> f32 {
-    1.0
-}
-fn default_four() -> f32 {
-    4.0
-}
-fn default_five() -> f32 {
-    5.0
-}
-fn default_octaves() -> u32 {
-    4
-}
-fn default_one2() -> [f32; 2] {
-    [1.0, 1.0]
-}
-fn default_white3() -> [f32; 3] {
-    [1.0, 1.0, 1.0]
-}
-
 /// One positioned node inside a `.matgraph.json` visual shader graph.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ShaderNode {
     pub id: String,
-    #[serde(default)]
     pub ui_pos: [f32; 2],
     #[serde(flatten)]
     pub kind: ShaderNodeKind,
+}
+
+impl<'de> Deserialize<'de> for ShaderNodeKind {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let map = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        parse_shader_node_kind(map).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for ShaderNode {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let mut map = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let id = sg_str(&mut map, "id").map_err(serde::de::Error::custom)?;
+        let ui_pos = sg_opt_f32_arr(&mut map, "ui_pos", [0.0, 0.0]).map_err(serde::de::Error::custom)?;
+        let kind = parse_shader_node_kind(map).map_err(serde::de::Error::custom)?;
+        Ok(Self { id, ui_pos, kind })
+    }
+}
+
+type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+fn sg_str(map: &mut JsonMap, key: &str) -> std::result::Result<String, String> {
+    match map.remove(key) {
+        Some(serde_json::Value::String(s)) => Ok(s),
+        Some(_) => Err(format!("expected string for `{key}`")),
+        None => Err(format!("missing field `{key}`")),
+    }
+}
+
+fn sg_f32(map: &mut JsonMap, key: &str) -> std::result::Result<f32, String> {
+    let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+    raw.as_f64().map(|v| v as f32).ok_or_else(|| format!("expected number for `{key}`"))
+}
+
+fn sg_opt_f32(map: &mut JsonMap, key: &str, default: f32) -> std::result::Result<f32, String> {
+    match map.remove(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(v) => v.as_f64().map(|x| x as f32).ok_or_else(|| format!("expected number for `{key}`")),
+    }
+}
+
+fn sg_u32(map: &mut JsonMap, key: &str) -> std::result::Result<u32, String> {
+    let raw = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+    let n = raw.as_u64().ok_or_else(|| format!("expected u32 for `{key}`"))?;
+    u32::try_from(n).map_err(|_| format!("u32 out of range for `{key}`"))
+}
+
+fn sg_opt_u32(map: &mut JsonMap, key: &str, default: u32) -> std::result::Result<u32, String> {
+    match map.remove(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| format!("expected u32 for `{key}`"))?;
+            u32::try_from(n).map_err(|_| format!("u32 out of range for `{key}`"))
+        }
+    }
+}
+
+fn sg_f32_arr<const N: usize>(val: &serde_json::Value, key: &str) -> std::result::Result<[f32; N], String> {
+    let arr = val.as_array().ok_or_else(|| format!("expected array for `{key}`"))?;
+    if arr.len() != N {
+        return Err(format!("expected {N} elements for `{key}`"));
+    }
+    let mut out = [0.0f32; N];
+    for (dst, src) in out.iter_mut().zip(arr) {
+        *dst = src.as_f64().ok_or_else(|| format!("expected number in `{key}`"))? as f32;
+    }
+    Ok(out)
+}
+
+fn sg_req_f32_arr<const N: usize>(map: &mut JsonMap, key: &str) -> std::result::Result<[f32; N], String> {
+    let val = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+    sg_f32_arr(&val, key)
+}
+
+fn sg_opt_f32_arr<const N: usize>(
+    map: &mut JsonMap,
+    key: &str,
+    default: [f32; N],
+) -> std::result::Result<[f32; N], String> {
+    match map.remove(key) {
+        None | Some(serde_json::Value::Null) => Ok(default),
+        Some(val) => sg_f32_arr(&val, key),
+    }
+}
+
+fn sg_parse_node_ref(val: serde_json::Value, key: &str) -> std::result::Result<NodeRef, String> {
+    let mut obj = match val {
+        serde_json::Value::Object(m) => m,
+        _ => return Err(format!("expected object for `{key}`")),
+    };
+    let node = sg_str(&mut obj, "node")?;
+    let output = sg_opt_u32(&mut obj, "output", 0)?;
+    Ok(NodeRef { node, output })
+}
+
+fn sg_ref(map: &mut JsonMap, key: &str) -> std::result::Result<NodeRef, String> {
+    let val = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+    sg_parse_node_ref(val, key)
+}
+
+fn sg_opt_ref(map: &mut JsonMap, key: &str) -> std::result::Result<Option<NodeRef>, String> {
+    match map.remove(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(val) => sg_parse_node_ref(val, key).map(Some),
+    }
+}
+
+fn sg_stops(map: &mut JsonMap, key: &str) -> std::result::Result<Vec<RampStop>, String> {
+    let val = map.remove(key).ok_or_else(|| format!("missing field `{key}`"))?;
+    let arr = match val {
+        serde_json::Value::Array(a) => a,
+        _ => return Err(format!("expected array for `{key}`")),
+    };
+    let mut stops = Vec::with_capacity(arr.len());
+    for item in arr {
+        let mut obj = match item {
+            serde_json::Value::Object(m) => m,
+            _ => return Err("expected object in `stops`".to_owned()),
+        };
+        let t = sg_f32(&mut obj, "t")?;
+        let color = sg_req_f32_arr::<3>(&mut obj, "color")?;
+        stops.push(RampStop { t, color });
+    }
+    Ok(stops)
+}
+
+fn parse_shader_node_kind(mut map: JsonMap) -> std::result::Result<ShaderNodeKind, String> {
+    let op = sg_str(&mut map, "op")?;
+    let kind = match op.as_str() {
+        "float_const" => ShaderNodeKind::FloatConst { value: sg_f32(&mut map, "value")? },
+        "vec2_const" => ShaderNodeKind::Vec2Const { value: sg_req_f32_arr(&mut map, "value")? },
+        "vec3_const" => ShaderNodeKind::Vec3Const { value: sg_req_f32_arr(&mut map, "value")? },
+        "vec4_const" => ShaderNodeKind::Vec4Const { value: sg_req_f32_arr(&mut map, "value")? },
+        "uv" => ShaderNodeKind::Uv,
+        "uv1" => ShaderNodeKind::Uv1,
+        "world_pos" => ShaderNodeKind::WorldPos,
+        "world_normal" => ShaderNodeKind::WorldNormal,
+        "view_dir" => ShaderNodeKind::ViewDir,
+        "vertex_color" => ShaderNodeKind::VertexColor,
+        "time" => ShaderNodeKind::Time,
+        "instance_param" => ShaderNodeKind::InstanceParam { index: sg_u32(&mut map, "index")? },
+        "uv_transform" => ShaderNodeKind::UvTransform {
+            uv: sg_opt_ref(&mut map, "uv")?,
+            scale: sg_opt_f32_arr(&mut map, "scale", [1.0, 1.0])?,
+            offset: sg_opt_f32_arr(&mut map, "offset", [0.0, 0.0])?,
+            rotation_rad: sg_opt_f32(&mut map, "rotation_rad", 0.0)?,
+        },
+        "texture2_d" => ShaderNodeKind::Texture2D {
+            uv: sg_opt_ref(&mut map, "uv")?,
+            fallback_color: sg_opt_f32_arr(&mut map, "fallback_color", [1.0, 1.0, 1.0])?,
+        },
+        "triplanar" => ShaderNodeKind::Triplanar {
+            scale: sg_opt_f32(&mut map, "scale", 1.0)?,
+            sharpness: sg_opt_f32(&mut map, "sharpness", 4.0)?,
+        },
+        "simplex_noise" => ShaderNodeKind::SimplexNoise {
+            coords: sg_opt_ref(&mut map, "coords")?,
+            scale: sg_opt_f32(&mut map, "scale", 4.0)?,
+        },
+        "worley_noise" => ShaderNodeKind::WorleyNoise {
+            coords: sg_opt_ref(&mut map, "coords")?,
+            scale: sg_opt_f32(&mut map, "scale", 4.0)?,
+        },
+        "fbm_noise" => ShaderNodeKind::FbmNoise {
+            coords: sg_opt_ref(&mut map, "coords")?,
+            scale: sg_opt_f32(&mut map, "scale", 4.0)?,
+            octaves: sg_opt_u32(&mut map, "octaves", 4)?,
+        },
+        "fresnel" => ShaderNodeKind::Fresnel { power: sg_opt_f32(&mut map, "power", 5.0)? },
+        "color_ramp" => ShaderNodeKind::ColorRamp { t: sg_ref(&mut map, "t")?, stops: sg_stops(&mut map, "stops")? },
+        "normal_blend" => {
+            ShaderNodeKind::NormalBlend { base: sg_ref(&mut map, "base")?, detail: sg_ref(&mut map, "detail")? }
+        }
+        "add" => ShaderNodeKind::Add { a: sg_ref(&mut map, "a")?, b: sg_ref(&mut map, "b")? },
+        "sub" => ShaderNodeKind::Sub { a: sg_ref(&mut map, "a")?, b: sg_ref(&mut map, "b")? },
+        "mul" => ShaderNodeKind::Mul { a: sg_ref(&mut map, "a")?, b: sg_ref(&mut map, "b")? },
+        "div" => ShaderNodeKind::Div { a: sg_ref(&mut map, "a")?, b: sg_ref(&mut map, "b")? },
+        "pow" => ShaderNodeKind::Pow { base: sg_ref(&mut map, "base")?, exp: sg_ref(&mut map, "exp")? },
+        "sin" => ShaderNodeKind::Sin { x: sg_ref(&mut map, "x")? },
+        "cos" => ShaderNodeKind::Cos { x: sg_ref(&mut map, "x")? },
+        "clamp" => ShaderNodeKind::Clamp {
+            x: sg_ref(&mut map, "x")?,
+            min: sg_f32(&mut map, "min")?,
+            max: sg_f32(&mut map, "max")?,
+        },
+        "smoothstep" => ShaderNodeKind::Smoothstep {
+            edge0: sg_f32(&mut map, "edge0")?,
+            edge1: sg_f32(&mut map, "edge1")?,
+            x: sg_ref(&mut map, "x")?,
+        },
+        "lerp" => {
+            ShaderNodeKind::Lerp { a: sg_ref(&mut map, "a")?, b: sg_ref(&mut map, "b")?, t: sg_ref(&mut map, "t")? }
+        }
+        "dot" => ShaderNodeKind::Dot { a: sg_ref(&mut map, "a")?, b: sg_ref(&mut map, "b")? },
+        "normalize" => ShaderNodeKind::Normalize { x: sg_ref(&mut map, "x")? },
+        "swizzle" => ShaderNodeKind::Swizzle { input: sg_ref(&mut map, "input")?, mask: sg_str(&mut map, "mask")? },
+        "combine3" => {
+            ShaderNodeKind::Combine3 { x: sg_ref(&mut map, "x")?, y: sg_ref(&mut map, "y")?, z: sg_ref(&mut map, "z")? }
+        }
+        "standard_surface_output" => ShaderNodeKind::StandardSurfaceOutput {
+            base_color: sg_opt_ref(&mut map, "base_color")?,
+            metallic: sg_opt_ref(&mut map, "metallic")?,
+            roughness: sg_opt_ref(&mut map, "roughness")?,
+            normal: sg_opt_ref(&mut map, "normal")?,
+            emissive: sg_opt_ref(&mut map, "emissive")?,
+            ao: sg_opt_ref(&mut map, "ao")?,
+            alpha: sg_opt_ref(&mut map, "alpha")?,
+            clearcoat: sg_opt_ref(&mut map, "clearcoat")?,
+            iridescence: sg_opt_ref(&mut map, "iridescence")?,
+        },
+        other => return Err(format!("unknown shader graph op `{other}`")),
+    };
+    Ok(kind)
 }
 
 /// Complete visual material node graph document (`.matgraph.json`).
@@ -330,7 +551,10 @@ fn wider_type(a: PortType, b: PortType) -> PortType {
 
 fn swizzle_type(mask: &str) -> Result<PortType> {
     ensure!((1..=4).contains(&mask.len()), "invalid swizzle mask '{mask}'");
-    ensure!(mask.chars().all(|c| matches!(c, 'x' | 'y' | 'z' | 'w' | 'r' | 'g' | 'b' | 'a')), "invalid swizzle '{mask}'");
+    ensure!(
+        mask.chars().all(|c| matches!(c, 'x' | 'y' | 'z' | 'w' | 'r' | 'g' | 'b' | 'a')),
+        "invalid swizzle '{mask}'"
+    );
     Ok(match mask.len() {
         1 => PortType::Float,
         2 => PortType::Vec2,
@@ -631,7 +855,11 @@ impl ShaderGraph {
             ensure!(!node.id.is_empty(), "shader node at index {i} has empty id");
             ensure!(by_id.insert(node.id.as_str(), (i, node)).is_none(), "duplicate shader node id '{}'", node.id);
             if matches!(node.kind, ShaderNodeKind::StandardSurfaceOutput { .. }) {
-                ensure!(output_node_id.is_none(), "shader graph '{}' has multiple StandardSurfaceOutput nodes", self.name);
+                ensure!(
+                    output_node_id.is_none(),
+                    "shader graph '{}' has multiple StandardSurfaceOutput nodes",
+                    self.name
+                );
                 output_node_id = Some(node.id.as_str());
             }
         }
@@ -676,9 +904,7 @@ impl ShaderGraph {
         let mut emitted = HashSet::new();
 
         let get_var = |vars: &HashMap<&str, (String, PortType)>, r: &NodeRef| -> Result<(String, PortType)> {
-            vars.get(r.node.as_str())
-                .cloned()
-                .with_context(|| format!("unresolved node reference '{}'", r.node))
+            vars.get(r.node.as_str()).cloned().with_context(|| format!("unresolved node reference '{}'", r.node))
         };
 
         let mut out_exprs = (
@@ -825,10 +1051,7 @@ impl ShaderGraph {
                         )?;
                     } else {
                         // Procedural checker/tile preview fallback when standalone without external texture slot.
-                        writeln!(
-                            body,
-                            "  let {vname}_chk: f32 = 0.85 + 0.15 * sg_value_noise({uv_e} * 8.0);"
-                        )?;
+                        writeln!(body, "  let {vname}_chk: f32 = 0.85 + 0.15 * sg_value_noise({uv_e} * 8.0);")?;
                         writeln!(
                             body,
                             "  let {vname}: vec4f = vec4f(vec3f({}, {}, {}) * {vname}_chk, 1.0);",
@@ -875,7 +1098,12 @@ impl ShaderGraph {
                     } else {
                         "in_v.uv".to_owned()
                     };
-                    writeln!(body, "  let {vname}: f32 = sg_fbm({c} * {}, {}u);", fmt_f32(*scale), (*octaves).clamp(1, 8))?;
+                    writeln!(
+                        body,
+                        "  let {vname}: f32 = sg_fbm({c} * {}, {}u);",
+                        fmt_f32(*scale),
+                        (*octaves).clamp(1, 8)
+                    )?;
                     vars.insert(id, (vname, PortType::Float));
                 }
                 ShaderNodeKind::Fresnel { power } => {
@@ -891,7 +1119,7 @@ impl ShaderGraph {
                     let (te, tt) = get_var(&vars, t)?;
                     let tf = promote(&te, tt, PortType::Float);
                     let mut sorted = stops.clone();
-                    sorted.sort_by(|a, b| a.t.total_cmp(&b.t));
+                    crate::sort::insertion_sort_by(&mut sorted, |a, b| a.t.total_cmp(&b.t));
                     let first = sorted[0].color;
                     writeln!(
                         body,
@@ -920,7 +1148,10 @@ impl ShaderGraph {
                     let (de, dt) = get_var(&vars, detail)?;
                     let b3 = promote(&be, bt, PortType::Vec3);
                     let d3 = promote(&de, dt, PortType::Vec3);
-                    writeln!(body, "  let {vname}: vec3f = normalize(vec3f(({b3}).xy + ({d3}).xy, ({b3}).z * ({d3}).z));")?;
+                    writeln!(
+                        body,
+                        "  let {vname}: vec3f = normalize(vec3f(({b3}).xy + ({d3}).xy, ({b3}).z * ({d3}).z));"
+                    )?;
                     vars.insert(id, (vname, PortType::Vec3));
                 }
                 ShaderNodeKind::Add { a, b }
@@ -1105,11 +1336,7 @@ impl ShaderGraph {
             writeln!(wgsl, "  let sg_base = ({}) * draw.color.rgb;", out_exprs.0)?;
             writeln!(wgsl, "  let sg_emissive = {};", out_exprs.4)?;
             writeln!(wgsl, "  if (draw.settings.x <= 0.5) {{ return vec4f(sg_base + sg_emissive, sg_alpha); }}")?;
-            writeln!(
-                wgsl,
-                "  let sg_normal = {};",
-                out_exprs.3
-            )?;
+            writeln!(wgsl, "  let sg_normal = {};", out_exprs.3)?;
             writeln!(
                 wgsl,
                 "  var s = surface_default(in_v.world_pos, sg_normal, in_view, sg_base, clamp({}, 0.0, 1.0), clamp({}, 0.04, 1.0), in_v.clip, in_v.view_z);",
@@ -1117,7 +1344,10 @@ impl ShaderGraph {
             )?;
             writeln!(wgsl, "  s.occlusion = clamp({}, 0.0, 1.0);", out_exprs.5)?;
             writeln!(wgsl, "  let sg_coat = clamp({}, 0.0, 1.0);", out_exprs.7)?;
-            writeln!(wgsl, "  if (sg_coat > 0.0) {{ s.lobes |= surface_coat; s.coat = sg_coat; s.coat_roughness = 0.08; }}")?;
+            writeln!(
+                wgsl,
+                "  if (sg_coat > 0.0) {{ s.lobes |= surface_coat; s.coat = sg_coat; s.coat_roughness = 0.08; }}"
+            )?;
             writeln!(wgsl, "  let sg_irid = clamp({}, 0.0, 1.0);", out_exprs.8)?;
             writeln!(wgsl, "  if (sg_irid > 0.0) {{ s.lobes |= surface_iridescence; s.iridescence = sg_irid; }}")?;
             writeln!(wgsl, "  let sg_vis = sun_shadow(in_v.world_pos, sg_normal, in_v.clip);")?;
@@ -1184,7 +1414,11 @@ mod tests {
                         ],
                     },
                 },
-                ShaderNode { id: "fresnel".into(), ui_pos: [120.0, 120.0], kind: ShaderNodeKind::Fresnel { power: 3.0 } },
+                ShaderNode {
+                    id: "fresnel".into(),
+                    ui_pos: [120.0, 120.0],
+                    kind: ShaderNodeKind::Fresnel { power: 3.0 },
+                },
                 ShaderNode {
                     id: "glow_col".into(),
                     ui_pos: [240.0, 120.0],
@@ -1195,8 +1429,16 @@ mod tests {
                     ui_pos: [360.0, 120.0],
                     kind: ShaderNodeKind::Mul { a: NodeRef::of("glow_col"), b: NodeRef::of("fresnel") },
                 },
-                ShaderNode { id: "rough".into(), ui_pos: [240.0, 220.0], kind: ShaderNodeKind::FloatConst { value: 0.25 } },
-                ShaderNode { id: "irid".into(), ui_pos: [240.0, 280.0], kind: ShaderNodeKind::FloatConst { value: 0.7 } },
+                ShaderNode {
+                    id: "rough".into(),
+                    ui_pos: [240.0, 220.0],
+                    kind: ShaderNodeKind::FloatConst { value: 0.25 },
+                },
+                ShaderNode {
+                    id: "irid".into(),
+                    ui_pos: [240.0, 280.0],
+                    kind: ShaderNodeKind::FloatConst { value: 0.7 },
+                },
                 ShaderNode {
                     id: "out".into(),
                     ui_pos: [500.0, 100.0],
@@ -1320,7 +1562,10 @@ mod tests {
                     view: &view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 ..Default::default()
             });
@@ -1354,7 +1599,10 @@ mod tests {
                 max_r = max_r.max(r);
             }
         }
-        assert!(max_r > 80 && max_r > min_r + 15, "procedural shader graph output must show lit variation: min={min_r}, max={max_r}");
+        assert!(
+            max_r > 80 && max_r > min_r + 15,
+            "procedural shader graph output must show lit variation: min={min_r}, max={max_r}"
+        );
         drop(data);
         rb.unmap();
 

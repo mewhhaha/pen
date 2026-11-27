@@ -2,7 +2,8 @@
 use super::super::State;
 use super::{ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, WiredPasses};
 use crate::atmosphere_lut::{
-    AtmosphereParams, BASE_CAMERA_ALTITUDE_KM, PhysicalAtmosphere, WORLD_METERS_TO_KM, physical_camera_km,
+    AtmosphereParams, BASE_CAMERA_ALTITUDE_KM, CloudDepthSource, PhysicalAtmosphere, WORLD_METERS_TO_KM,
+    physical_camera_km,
 };
 use crate::camera_precision::DepthMode;
 use crate::environment_passes::{
@@ -93,12 +94,15 @@ impl State {
     /// Updates Hillaire physical atmosphere LUTs & volumetric clouds when `quality.physical_sky` is on.
     /// Uses the active (potentially TAA-jittered) projection and unified world-meters-to-km camera coordinates.
     #[cfg(not(feature = "render-atmosphere"))]
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_physical_sky(
-        &mut self,
+        _wired: &mut WiredPasses,
+        _device: &wgpu::Device,
         _encoder: &mut wgpu::CommandEncoder,
         _frame: &RenderFrame,
         _active_projection: &Matrix,
         _scene_size: (u32, u32),
+        _depth: Option<(&wgpu::TextureView, u32, DepthMode, u64)>,
     ) -> Result<()> {
         Ok(())
     }
@@ -106,18 +110,20 @@ impl State {
     /// Updates Hillaire physical atmosphere LUTs & volumetric clouds when `quality.physical_sky` is on.
     /// Uses the active (potentially TAA-jittered) projection and unified world-meters-to-km camera coordinates.
     #[cfg(feature = "render-atmosphere")]
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_physical_sky(
-        &mut self,
+        wired: &mut WiredPasses,
+        device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         frame: &RenderFrame,
         active_projection: &Matrix,
         scene_size: (u32, u32),
+        depth: Option<(&wgpu::TextureView, u32, DepthMode, u64)>,
     ) -> Result<()> {
         if !frame.quality.physical_sky || !crate::deferred_shaders::ready_all(&["atmosphere_lut.wgsl", "clouds.wgsl"]) {
             return Ok(());
         }
-        let device = self.device.clone();
-        let atmo = self.wired.physical_atmosphere.get_or_insert_with(|| PhysicalAtmosphere::new(&device));
+        let atmo = wired.physical_atmosphere.get_or_insert_with(|| PhysicalAtmosphere::new(device));
         let eye = invert(&frame.view);
         let world_eye = [eye[12], eye[13], eye[14]];
         let cam_km = physical_camera_km(world_eye);
@@ -132,14 +138,21 @@ impl State {
         if frame.clouds.cover <= 0.001 {
             params.cloud_density = 0.0;
         }
-        atmo.update_luts(&device, encoder, &params);
+        atmo.update_luts(device, encoder, &params);
         if frame.clouds.cover > 0.001 {
             let vp = multiply(active_projection, &frame.view);
             let inv_vp = invert(&vp);
             let cw = (scene_size.0 / 2).clamp(16, 1024);
             let ch = (scene_size.1 / 2).clamp(16, 1024);
-            atmo.render_clouds_world(
-                &device,
+            let depth_arg = depth.map(|(view, samples, mode, serial)| CloudDepthSource {
+                view,
+                samples,
+                reversed_z: mode == DepthMode::ReversedZ,
+                scene_size,
+                serial,
+            });
+            atmo.render_clouds_world_with_depth(
+                device,
                 encoder,
                 &params,
                 inv_vp,
@@ -147,6 +160,7 @@ impl State {
                 WORLD_METERS_TO_KM,
                 BASE_CAMERA_ALTITUDE_KM,
                 (cw, ch),
+                depth_arg,
             )?;
         }
         Ok(())

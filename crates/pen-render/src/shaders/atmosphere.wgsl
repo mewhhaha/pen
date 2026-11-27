@@ -87,15 +87,15 @@ fn physical_sky_background(direction: vec3f, screen_uv: vec2f, with_clouds: bool
   return col;
 }
 
-// The ambient occlusion here, blurred over the 4 x 4 pixels its noise repeats
-// in: four filtered reads, each averaging 2 x 2.
+// The ambient occlusion here, bilinearly upsampled and blurred over a centered
+// 2 x 2 half-res (= 4 x 4 full-res) tent filter to smooth the slice rotation noise.
 fn occlusion(pixel: vec2f) -> f32 {
-  let texel = 1.0 / atmosphere.size.xy;
-  let at = pixel * texel;
+  let at = pixel / atmosphere.size.xy;
+  let ao_texel = 1.0 / max(vec2f(textureDimensions(occlusion_map, 0)), vec2f(1.0));
   var total = 0.0;
   for (var corner = 0; corner < 4; corner++) {
-    let offset = vec2f(select(-0.5, 1.5, (corner & 1) == 1), select(-0.5, 1.5, corner > 1));
-    total += textureSampleLevel(occlusion_map, occlusion_sampler, at + offset * texel, 0.0).r;
+    let offset = vec2f(select(-0.5, 0.5, (corner & 1) == 1), select(-0.5, 0.5, corner > 1));
+    total += textureSampleLevel(occlusion_map, occlusion_sampler, at + offset * ao_texel, 0.0).r;
   }
   return total * 0.25;
 }

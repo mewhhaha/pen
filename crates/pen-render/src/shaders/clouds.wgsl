@@ -1,10 +1,12 @@
-// Raymarched 3D volumetric clouds with procedural Perlin-Worley FBM density,
-// cumulus height shaping, dual-lobe Henyey-Greenstein silver lining, Beer-Powder
-// multi-scattering energy conservation, and sun light marching toward shell exit.
+// Raymarched 3D volumetric clouds backed by a one-time prebaked 64^3 tileable 3D
+// Perlin-Worley FBM noise texture, cumulus height shaping, dual-lobe Henyey-Greenstein
+// silver lining, Beer-Powder multi-scattering energy conservation, optional conservative
+// opaque-depth early-out, and sun light marching toward shell exit.
 // Supports cameras below, inside, and above the cloud shell (including downward views).
 // Outputs Rgba16Float: rgb = in-scattered cloud radiance, a = transmittance (1 = clear sky).
 
 const PI: f32 = 3.14159265359;
+const DEPTH_SAMPLES: i32 = 1;
 
 struct CloudUniform {
     inverse_view_projection: mat4x4f,
@@ -20,12 +22,18 @@ struct CloudUniform {
     wind: vec4f,
     // xy: output dimensions, z: detail frequency, w: silver_lining_g (0.8)
     params: vec4f,
-    // x: primary ray steps (8..64), y: max march distance km, zw: reserved
+    // x: primary ray steps (8..64), y: max march distance km, z: world_to_km, w: base_alt_km
     quality: vec4f,
+    // x: depth early-out enabled (>0.5), y: reversed_z (>0.5), zw: scene depth dimensions
+    depth_info: vec4f,
 };
 
 @group(0) @binding(0) var<uniform> cloud: CloudUniform;
 @group(0) @binding(1) var out_tex: texture_storage_2d<rgba16float, write>;
+@group(0) @binding(2) var noise_tex: texture_3d<f32>;
+@group(0) @binding(3) var noise_sampler: sampler;
+@group(0) @binding(4) var scene_depth: texture_depth_2d;
+@group(0) @binding(5) var noise_out: texture_storage_3d<rgba8unorm, write>;
 
 fn pcg3(v_in: vec3u) -> vec3u {
     var v = v_in * 1664525u + 1013904223u;
@@ -39,30 +47,39 @@ fn pcg3(v_in: vec3u) -> vec3u {
     return v;
 }
 
-fn hash3(p: vec3f) -> vec3f {
-    return vec3f(pcg3(vec3u(vec3i(p))) >> vec3u(8u)) * (1.0 / 16777216.0);
+fn hash3_u(q: vec3u) -> vec3f {
+    return vec3f(pcg3(q) >> vec3u(8u)) * (1.0 / 16777216.0);
 }
 
-fn hash1(p: vec3f) -> f32 {
-    let q = vec3u(vec3i(p));
+fn hash1_u(q: vec3u) -> f32 {
     var h = q.x * 374761393u + q.y * 668265263u + q.z * 2147483647u;
     h = (h ^ (h >> 13u)) * 1274126177u;
     h ^= h >> 16u;
     return f32(h >> 8u) * (1.0 / 16777216.0);
 }
 
-fn value_noise3(p: vec3f) -> f32 {
-    let i = floor(p);
-    let f = p - i;
+fn hash1(p: vec3f) -> f32 {
+    return hash1_u(vec3u(vec3i(p)));
+}
+
+fn wrap_cell(v: vec3i, period: i32, seed: u32) -> vec3u {
+    let wrapped = ((v % period) + period) % period;
+    return vec3u(wrapped) + vec3u(seed, seed * 3u, seed * 7u);
+}
+
+fn periodic_value_noise3(p: vec3f, period: i32, seed: u32) -> f32 {
+    let fl = floor(p);
+    let i = vec3i(fl);
+    let f = p - fl;
     let u = f * f * (3.0 - 2.0 * f);
-    let n000 = hash1(i + vec3f(0.0, 0.0, 0.0));
-    let n100 = hash1(i + vec3f(1.0, 0.0, 0.0));
-    let n010 = hash1(i + vec3f(0.0, 1.0, 0.0));
-    let n110 = hash1(i + vec3f(1.0, 1.0, 0.0));
-    let n001 = hash1(i + vec3f(0.0, 0.0, 1.0));
-    let n101 = hash1(i + vec3f(1.0, 0.0, 1.0));
-    let n011 = hash1(i + vec3f(0.0, 1.0, 1.0));
-    let n111 = hash1(i + vec3f(1.0, 1.0, 1.0));
+    let n000 = hash1_u(wrap_cell(i + vec3i(0, 0, 0), period, seed));
+    let n100 = hash1_u(wrap_cell(i + vec3i(1, 0, 0), period, seed));
+    let n010 = hash1_u(wrap_cell(i + vec3i(0, 1, 0), period, seed));
+    let n110 = hash1_u(wrap_cell(i + vec3i(1, 1, 0), period, seed));
+    let n001 = hash1_u(wrap_cell(i + vec3i(0, 0, 1), period, seed));
+    let n101 = hash1_u(wrap_cell(i + vec3i(1, 0, 1), period, seed));
+    let n011 = hash1_u(wrap_cell(i + vec3i(0, 1, 1), period, seed));
+    let n111 = hash1_u(wrap_cell(i + vec3i(1, 1, 1), period, seed));
     let nx00 = mix(n000, n100, u.x);
     let nx10 = mix(n010, n110, u.x);
     let nx01 = mix(n001, n101, u.x);
@@ -70,21 +87,38 @@ fn value_noise3(p: vec3f) -> f32 {
     return mix(mix(nx00, nx10, u.y), mix(nx01, nx11, u.y), u.z);
 }
 
-fn worley3(p: vec3f) -> f32 {
-    let i = floor(p);
-    let f = p - i;
+fn periodic_worley3(p: vec3f, period: i32, seed: u32) -> f32 {
+    let fl = floor(p);
+    let i = vec3i(fl);
+    let f = p - fl;
     var min_d2 = 4.0;
     for (var z = -1; z <= 1; z++) {
         for (var y = -1; y <= 1; y++) {
             for (var x = -1; x <= 1; x++) {
-                let nb = vec3f(f32(x), f32(y), f32(z));
-                let jitter = hash3(i + nb);
-                let diff = nb + jitter - f;
+                let nb = vec3i(x, y, z);
+                let jitter = hash3_u(wrap_cell(i + nb, period, seed));
+                let diff = vec3f(nb) + jitter - f;
                 min_d2 = min(min_d2, dot(diff, diff));
             }
         }
     }
     return clamp(1.0 - sqrt(min_d2), 0.0, 1.0);
+}
+
+@compute @workgroup_size(4, 4, 4)
+fn bake_noise(@builtin(global_invocation_id) id: vec3u) {
+    let dims = textureDimensions(noise_out);
+    if (id.x >= dims.x || id.y >= dims.y || id.z >= dims.z) {
+        return;
+    }
+    let u = (vec3f(id) + 0.5) / vec3f(dims);
+    let base_perlin = 0.55 * periodic_value_noise3(u * 8.0, 8, 1u)
+        + 0.30 * periodic_value_noise3(u * 16.0, 16, 17u)
+        + 0.15 * periodic_value_noise3(u * 32.0, 32, 53u);
+    let billows = periodic_worley3(u * 12.0, 12, 97u);
+    let shape = mix(base_perlin, billows, 0.45);
+    let detail = periodic_worley3(u * 16.0, 16, 193u);
+    textureStore(noise_out, vec3i(id), vec4f(shape, detail, billows, base_perlin));
 }
 
 fn cloud_density(pos_km: vec3f, with_detail: bool) -> f32 {
@@ -98,9 +132,7 @@ fn cloud_density(pos_km: vec3f, with_detail: bool) -> f32 {
     let h = clamp((alt - bottom) / (top - bottom), 0.0, 1.0);
     let height_profile = smoothstep(0.0, 0.18, h) * smoothstep(1.0, 0.65, h);
     let p = (pos_km + cloud.wind.xyz) * max(cloud.params.z, 0.05);
-    let base_perlin = 0.55 * value_noise3(p) + 0.30 * value_noise3(p * 2.07 + 3.1) + 0.15 * value_noise3(p * 4.13 - 1.7);
-    let billows = worley3(p * 1.45);
-    let shape = mix(base_perlin, billows, 0.45);
+    let shape = textureSampleLevel(noise_tex, noise_sampler, p * 0.125, 0.0).r;
     let coverage = clamp(cloud.sun_dir.w, 0.0, 1.0);
     let threshold = 1.0 - coverage;
     let raw = clamp((shape - threshold) / max(1.0 - threshold, 0.05), 0.0, 1.0);
@@ -109,7 +141,7 @@ fn cloud_density(pos_km: vec3f, with_detail: bool) -> f32 {
     }
     var eroded = raw;
     if (with_detail) {
-        let detail = worley3(p * 3.8 + vec3f(1.3, 2.7, 0.9));
+        let detail = textureSampleLevel(noise_tex, noise_sampler, p * 0.2375 + vec3f(0.17, 0.31, 0.11), 0.0).g;
         eroded = max(0.0, raw - (1.0 - detail) * 0.25 * (1.0 - raw));
     }
     return eroded * height_profile * max(cloud.sun_color.w, 0.0);
@@ -189,6 +221,36 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
         textureStore(out_tex, vec2i(id.xy), vec4f(0.0, 0.0, 0.0, 1.0));
         return;
     }
+    // Conservative opaque-depth early-out: skip raymarching when every full-res pixel whose
+    // bilinear composite can read this half-res texel is fully covered by opaque geometry.
+    if (cloud.depth_info.x > 0.5) {
+        let scene_dims = vec2i(cloud.depth_info.zw);
+        let last = max(scene_dims - vec2i(1), vec2i(0));
+        let scale = cloud.depth_info.zw / vec2f(dims);
+        let p0 = vec2i(floor((vec2f(id.xy) - 0.5) * scale));
+        let p1 = vec2i(ceil((vec2f(id.xy) + 1.5) * scale)) - vec2i(1);
+        let span = max(p1 - p0, vec2i(0));
+        let reversed_z = cloud.depth_info.y > 0.5;
+        var any_sky = false;
+        for (var iy = 0; iy < 4 && !any_sky; iy++) {
+            let py = clamp(p0.y + (span.y * iy) / 3, 0, last.y);
+            for (var ix = 0; ix < 4 && !any_sky; ix++) {
+                let px = clamp(p0.x + (span.x * ix) / 3, 0, last.x);
+                for (var s = 0; s < DEPTH_SAMPLES; s++) {
+                    let d = textureLoad(scene_depth, vec2i(px, py), s);
+                    if (select(d >= 1.0, d <= 0.0, reversed_z)) {
+                        any_sky = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!any_sky) {
+            textureStore(out_tex, vec2i(id.xy), vec4f(0.0, 0.0, 0.0, 1.0));
+            return;
+        }
+    }
+
     let uv = (vec2f(id.xy) + 0.5) / vec2f(dims);
     let ndc = vec2f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
     let world_h = cloud.inverse_view_projection * vec4f(ndc, 0.5, 1.0);

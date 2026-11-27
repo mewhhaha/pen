@@ -1281,7 +1281,10 @@ impl Post {
         // whatever the quality asks, as that is what the translucent pass starts from.
         if !matches!(part, Part::After) {
             let occlusion = if occluding {
-                let occlusion = graph.texture("occlusion", full(wgpu::TextureFormat::R8Unorm));
+                let occlusion = graph.texture(
+                    "occlusion",
+                    Spec { width: width.div_ceil(2), height: height.div_ceil(2), format: wgpu::TextureFormat::R8Unorm },
+                );
                 let uniform = Binding::Uniform(self.uniform("occlusion", 160));
                 let bindings = vec![uniform, Binding::Texture(depth)];
                 graph.pass("occlusion", BuiltIn::Occlusion(samples), bindings, Target::Texture(occlusion), false);
@@ -1489,6 +1492,10 @@ impl Post {
         let (projection, _) = self.jittered.unwrap_or((frame.projection, (0.0, 0.0)));
         if occluding {
             let uniform = self.uniform("occlusion", 160);
+            let reversed_z = crate::camera_precision::detect_depth_mode(&frame.projection)
+                == Some(crate::camera_precision::DepthMode::ReversedZ);
+            let ao_w = width.div_ceil(2) as f32;
+            let ao_h = height.div_ceil(2) as f32;
             let mut data = [0.0f32; 40];
             data[..16].copy_from_slice(&projection);
             data[16..32].copy_from_slice(&invert(&projection));
@@ -1496,11 +1503,11 @@ impl Post {
                 OCCLUSION_RADIUS,
                 OCCLUSION_POWER,
                 OCCLUSION_BIAS,
-                0.0,
+                if reversed_z { 1.0 } else { 0.0 },
                 width as f32,
                 height as f32,
-                0.0,
-                0.0,
+                width as f32 / ao_w,
+                height as f32 / ao_h,
             ]);
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }

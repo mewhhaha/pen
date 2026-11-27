@@ -185,6 +185,7 @@ pub(super) struct WiredPasses {
     pub physical_sky_serial: u64,
     #[cfg(feature = "render-atmosphere")]
     pub physical_sky_last_key: (bool, u64),
+    pub scene_depth_serial: u64,
     #[cfg(feature = "render-pbr-decals")]
     pub pbr_decals: HashMap<u32, PbrDecalPass>,
     #[cfg(feature = "render-oit")]

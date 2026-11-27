@@ -3,6 +3,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "GPU texture dimensions")]
 
 use anyhow::{Result, ensure};
+use std::collections::HashMap;
 
 /// Standalone WGSL source for the transmittance, multi-scattering, and sky-view LUT compute passes.
 pub const ATMOSPHERE_LUT_WGSL: &str = crate::wgsl!("atmosphere_lut.wgsl");
@@ -12,6 +13,7 @@ pub const CLOUDS_WGSL: &str = crate::wgsl!("clouds.wgsl");
 pub const TRANSMITTANCE_SIZE: (u32, u32) = (256, 64);
 pub const MULTISCATTER_SIZE: (u32, u32) = (32, 32);
 pub const SKY_VIEW_SIZE: (u32, u32) = (192, 108);
+pub const CLOUD_NOISE_SIZE: u32 = 64;
 
 /// Physical Earth-like atmosphere & volumetric cloud configuration (distances in km).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -102,6 +104,7 @@ struct CloudUniform {
     wind: [f32; 4],
     params: [f32; 4],
     quality: [f32; 4],
+    depth_info: [f32; 4],
 }
 
 /// World-space scene units (meters) converted to atmosphere kilometers (`1 unit = 1 meter`).
@@ -170,11 +173,85 @@ pub struct PhysicalAtmosphere {
     pipe_sky: wgpu::ComputePipeline,
     cloud_bgl: wgpu::BindGroupLayout,
     cloud_pipe: wgpu::ComputePipeline,
+    cloud_msaa_pipes: HashMap<u32, (wgpu::BindGroupLayout, wgpu::ComputePipeline)>,
     cloud_uniform: wgpu::Buffer,
-    cloud_tex: Option<(u32, u32, wgpu::Texture, wgpu::TextureView, wgpu::BindGroup)>,
+    cloud_noise_tex: wgpu::Texture,
+    cloud_noise_view: wgpu::TextureView,
+    cloud_noise_sampler: wgpu::Sampler,
+    cloud_bake_pipe: wgpu::ComputePipeline,
+    cloud_bake_bg: wgpu::BindGroup,
+    cloud_noise_baked: bool,
+    dummy_depth_tex: wgpu::Texture,
+    dummy_depth_view: wgpu::TextureView,
+    cloud_tex: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
+    cloud_bg: Option<(u64, u32, u64, wgpu::BindGroup)>,
     cloud_serial: u64,
     last_medium_key: Option<[u32; 19]>,
     last_sky_key: Option<[u32; 8]>,
+}
+
+fn cloud_bind_group_layout(device: &wgpu::Device, multisampled_depth: bool) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(if multisampled_depth { "clouds_msaa_bgl" } else { "clouds_bgl" }),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: multisampled_depth,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// Optional opaque scene depth source for conservative volumetric cloud early-out.
+#[derive(Clone, Copy)]
+pub(crate) struct CloudDepthSource<'a> {
+    pub view: &'a wgpu::TextureView,
+    pub samples: u32,
+    pub reversed_z: bool,
+    pub scene_size: (u32, u32),
+    pub serial: u64,
 }
 
 impl PhysicalAtmosphere {
@@ -314,31 +391,7 @@ impl PhysicalAtmosphere {
         let pipe_ms = make_pipe("multiscatter_lut");
         let pipe_sky = make_pipe("sky_view_lut");
 
-        let cloud_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("clouds_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        let cloud_bgl = cloud_bind_group_layout(device, false);
         let cloud_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("clouds"),
             source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("clouds.wgsl").into()),
@@ -356,6 +409,76 @@ impl PhysicalAtmosphere {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: crate::pipeline_cache::active().as_ref(),
         });
+        let cloud_noise_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cloud_noise_3d"),
+            size: wgpu::Extent3d {
+                width: CLOUD_NOISE_SIZE,
+                height: CLOUD_NOISE_SIZE,
+                depth_or_array_layers: CLOUD_NOISE_SIZE,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let cloud_noise_view = cloud_noise_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let cloud_noise_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("cloud_noise_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        let bake_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("clouds_bake_bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                },
+                count: None,
+            }],
+        });
+        let bake_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("clouds_bake_pl"),
+            bind_group_layouts: &[Some(&bake_bgl)],
+            immediate_size: 0,
+        });
+        let cloud_bake_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("clouds_bake_noise"),
+            layout: Some(&bake_pl),
+            module: &cloud_module,
+            entry_point: Some("bake_noise"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: crate::pipeline_cache::active().as_ref(),
+        });
+        let cloud_bake_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("clouds_bake_bg"),
+            layout: &bake_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(&cloud_noise_view),
+            }],
+        });
+        let dummy_depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("clouds_dummy_depth"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let dummy_depth_view = dummy_depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let cloud_uniform = make_ubuf("clouds_u", std::mem::size_of::<CloudUniform>() as u64);
 
         Self {
@@ -380,8 +503,18 @@ impl PhysicalAtmosphere {
             pipe_sky,
             cloud_bgl,
             cloud_pipe,
+            cloud_msaa_pipes: HashMap::new(),
             cloud_uniform,
+            cloud_noise_tex,
+            cloud_noise_view,
+            cloud_noise_sampler,
+            cloud_bake_pipe,
+            cloud_bake_bg,
+            cloud_noise_baked: false,
+            dummy_depth_tex,
+            dummy_depth_view,
             cloud_tex: None,
+            cloud_bg: None,
             cloud_serial: 0,
             last_medium_key: None,
             last_sky_key: None,
@@ -424,7 +557,7 @@ impl PhysicalAtmosphere {
             width >= 1 && height >= 1 && width <= max_dim && height <= max_dim,
             "invalid cloud size {width}x{height} (max {max_dim})"
         );
-        let need_alloc = !matches!(&self.cloud_tex, Some((w, h, _, _, _)) if *w == width && *h == height);
+        let need_alloc = !matches!(&self.cloud_tex, Some((w, h, _, _)) if *w == width && *h == height);
         if need_alloc {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("volumetric_clouds"),
@@ -439,15 +572,8 @@ impl PhysicalAtmosphere {
                 view_formats: &[],
             });
             let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("clouds_bg"),
-                layout: &self.cloud_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.cloud_uniform.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
-                ],
-            });
-            self.cloud_tex = Some((width, height, tex, view, bg));
+            self.cloud_tex = Some((width, height, tex, view));
+            self.cloud_bg = None;
             self.cloud_serial += 1;
         }
         Ok(self.cloud_serial)
@@ -603,14 +729,60 @@ impl PhysicalAtmosphere {
         world_camera_pos: [f32; 3],
         world_to_km: f32,
         base_altitude_km: f32,
+        size: (u32, u32),
+    ) -> Result<()> {
+        self.render_clouds_world_with_depth(
+            device,
+            encoder,
+            params,
+            inverse_view_projection,
+            world_camera_pos,
+            world_to_km,
+            base_altitude_km,
+            size,
+            None,
+        )
+    }
+
+    /// Raymarches the 3D volumetric cloud layer with an optional opaque scene depth source
+    /// so fully occluded tiles exit before raymarching.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn render_clouds_world_with_depth(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        params: &AtmosphereParams,
+        inverse_view_projection: [f32; 16],
+        world_camera_pos: [f32; 3],
+        world_to_km: f32,
+        base_altitude_km: f32,
         (width, height): (u32, u32),
+        depth: Option<CloudDepthSource<'_>>,
     ) -> Result<()> {
         self.ensure_clouds(device, (width, height))?;
         ensure!(inverse_view_projection.iter().all(|v| v.is_finite()), "non-finite inverse_view_projection");
         ensure!(world_camera_pos.iter().all(|v| v.is_finite()), "non-finite camera position");
+        if !self.cloud_noise_baked {
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Post);
+            let mut bake = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("volumetric_clouds_bake_noise"),
+                timestamp_writes: ts.compute(),
+            });
+            bake.set_pipeline(&self.cloud_bake_pipe);
+            bake.set_bind_group(0, &self.cloud_bake_bg, &[]);
+            let groups = CLOUD_NOISE_SIZE.div_ceil(4);
+            bake.dispatch_workgroups(groups, groups, groups);
+            self.cloud_noise_baked = true;
+        }
         let sun = normalize3(params.sun_direction);
         let bottom = finite_or(params.cloud_bottom_km, 1.5).max(0.1);
         let top = finite_or(params.cloud_top_km, bottom + 2.5).max(bottom + 0.2);
+        let (depth_view, depth_samples, depth_serial, depth_info) = match depth {
+            Some(CloudDepthSource { view, samples, reversed_z, scene_size: (sw, sh), serial }) if sw > 0 && sh > 0 => {
+                (view, samples.max(1), serial, [1.0, if reversed_z { 1.0 } else { 0.0 }, sw as f32, sh as f32])
+            }
+            _ => (&self.dummy_depth_view, 1, 0, [0.0; 4]),
+        };
         let u = CloudUniform {
             inverse_view_projection,
             camera: [
@@ -650,15 +822,67 @@ impl PhysicalAtmosphere {
                 finite_or(world_to_km, 1.0).max(1e-6),
                 finite_or(base_altitude_km, 0.0),
             ],
+            depth_info,
         };
         encode_uniform_upload(device, encoder, &self.cloud_uniform, bytemuck::bytes_of(&u));
-        let (_, _, _, _, bg) = self.cloud_tex.as_ref().unwrap();
+        let (bgl, pipe) = if depth_samples > 1 {
+            let (bgl, pipe) = self.cloud_msaa_pipes.entry(depth_samples).or_insert_with(|| {
+                let bgl = cloud_bind_group_layout(device, true);
+                let src = crate::deferred_wgsl!("clouds.wgsl")
+                    .replace("texture_depth_2d", "texture_depth_multisampled_2d")
+                    .replace("const DEPTH_SAMPLES: i32 = 1;", &format!("const DEPTH_SAMPLES: i32 = {depth_samples};"));
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("clouds_msaa"),
+                    source: wgpu::ShaderSource::Wgsl(src.into()),
+                });
+                let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("clouds_msaa_pl"),
+                    bind_group_layouts: &[Some(&bgl)],
+                    immediate_size: 0,
+                });
+                let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("clouds_msaa_main"),
+                    layout: Some(&pl),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    cache: crate::pipeline_cache::active().as_ref(),
+                });
+                (bgl, pipe)
+            });
+            (&*bgl, &*pipe)
+        } else {
+            (&self.cloud_bgl, &self.cloud_pipe)
+        };
+        let bg_key = (self.cloud_serial, depth_samples, depth_serial);
+        if !matches!(&self.cloud_bg, Some((cs, ds, ser, _)) if (*cs, *ds, *ser) == bg_key) {
+            let (_, _, _, out_view) = self.cloud_tex.as_ref().unwrap();
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("clouds_bg"),
+                layout: bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.cloud_uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(out_view) },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&self.cloud_noise_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.cloud_noise_sampler),
+                    },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(depth_view) },
+                ],
+            });
+            self.cloud_bg = Some((bg_key.0, bg_key.1, bg_key.2, bg));
+        }
+        let (_, _, _, bg) = self.cloud_bg.as_ref().unwrap();
         let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Post);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("volumetric_clouds"),
             timestamp_writes: ts.compute(),
         });
-        pass.set_pipeline(&self.cloud_pipe);
+        pass.set_pipeline(pipe);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
         Ok(())
@@ -666,6 +890,7 @@ impl PhysicalAtmosphere {
 
     #[allow(dead_code)]
     fn _keep_alive(&self) -> (&wgpu::Texture, &wgpu::TextureView, &wgpu::Sampler, &wgpu::BindGroupLayout) {
+        let _ = (&self.cloud_noise_tex, &self.dummy_depth_tex);
         (&self.dummy_tex, &self.dummy_view, &self.sampler, &self.bgl)
     }
 }

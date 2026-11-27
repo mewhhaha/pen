@@ -629,6 +629,7 @@ impl State {
         if targets.targets_recreated {
             self.velocity.reset_target();
             self.hiz.reset_target();
+            self.wired.scene_depth_serial += 1;
         }
         if frame.exposure.cut {
             self.hiz.invalidate();
@@ -667,8 +668,6 @@ impl State {
         self.clusters.encode_cookies(&device, &mut encoder, &cookie_uploads);
         // The sky's reflection, drawn again if its colors changed.
         self.environment.encode(&device, &mut encoder);
-        // Physical atmosphere LUTs and raymarched 3D volumetric clouds when enabled (matching jittered rays).
-        self.encode_physical_sky(&mut encoder, frame, &active_proj_for_trails, targets.size)?;
         // Evaluate morph targets and cull instanced batches on the GPU before any pass draws them.
         self.morphing.dispatch(&device, &mut encoder, &self.assets);
         self.culling.dispatch(&mut encoder, &self.timer, &self.instance_buffer, &self.hiz);
@@ -1082,6 +1081,18 @@ impl State {
         if subsurface {
             self.post.as_mut().unwrap().diffuse(&mut self.built_ins, &mut encoder, frame, &self.timer);
         }
+        // Physical atmosphere LUTs and raymarched 3D volumetric clouds run after the opaque scene
+        // pass so opaque pixels early-out against `targets.depth_only` before `BuiltIn::Atmosphere`.
+        let scene_depth_serial = self.wired.scene_depth_serial;
+        Self::encode_physical_sky(
+            &mut self.wired,
+            &device,
+            &mut encoder,
+            frame,
+            &active_proj_for_trails,
+            targets.size,
+            Some((&targets.depth_only, samples, depth_mode, scene_depth_serial)),
+        )?;
         if let Some(opaque) = &targets.opaque {
             let feedback = if mesh_filters.len() > 1 {
                 let picture = self.post.as_mut().unwrap().mesh_filter_picture();

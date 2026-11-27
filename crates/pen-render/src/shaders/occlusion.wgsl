@@ -1,10 +1,12 @@
-// Horizon-based Ground-Truth Ambient Occlusion (GTAO): integrates analytical
-// cosine-weighted hemisphere visibility across screen-space horizon slices.
+// Half-resolution Horizon-based Ground-Truth Ambient Occlusion (GTAO): integrates analytical
+// cosine-weighted hemisphere visibility across screen-space horizon slices using fast linear-Z
+// view-space reconstruction.
 struct Occlusion {
   projection: mat4x4f,
   inverse_projection: mat4x4f,
-  // radius, power, bias
+  // radius, power, bias, reversed_z (>0.5)
   settings: vec4f,
+  // full_width, full_height, scale_x (full_w / ao_w), scale_y (full_h / ao_h)
   size: vec4f,
 };
 @group(0) @binding(0) var<uniform> occlusion: Occlusion;
@@ -14,18 +16,45 @@ ${fullscreen}
 const PI: f32 = 3.14159265359;
 const HALF_PI: f32 = 1.57079632679;
 
+struct LinearUnproj {
+  // x_view = (pixel.x * px_scale.x + px_bias.x) * inv_w
+  // y_view = (pixel.y * px_scale.y + px_bias.y) * inv_w
+  // z_view = (depth * z_params.x + z_params.y) * inv_w
+  // w_clip = depth * z_params.z + z_params.w
+  px_scale: vec2f,
+  px_bias: vec2f,
+  z_params: vec4f,
+};
+
+fn make_unproj(inv_size: vec2f) -> LinearUnproj {
+  let ip = occlusion.inverse_projection;
+  let ip0x = ip[0].x;
+  let ip1y = ip[1].y;
+  let ip3 = ip[3];
+  return LinearUnproj(
+    vec2f(2.0 * inv_size.x * ip0x, -2.0 * inv_size.y * ip1y),
+    vec2f(ip3.x - ip0x, ip3.y + ip1y),
+    vec4f(ip[2].z, ip3.z, ip[2].w, ip3.w),
+  );
+}
+
 fn depth_at(pixel: vec2i, last: vec2i) -> f32 {
   return textureLoad(scene_depth, clamp(pixel, vec2i(0), last), 0);
 }
 
-fn view_at(pixel: vec2f, depth: f32, inv_size: vec2f) -> vec3f {
-  let ndc = vec2f(pixel.x * inv_size.x * 2.0 - 1.0, 1.0 - pixel.y * inv_size.y * 2.0);
-  let point = occlusion.inverse_projection * vec4f(ndc, depth, 1.0);
-  return point.xyz / point.w;
+fn is_sky(depth: f32, reversed_z: bool) -> bool {
+  return select(depth >= 1.0, depth <= 0.0, reversed_z);
 }
 
-fn neighbour(pixel: vec2f, step: vec2i, last: vec2i, inv_size: vec2f) -> vec3f {
-  return view_at(pixel + vec2f(step), depth_at(vec2i(pixel) + step, last), inv_size);
+fn view_at(pixel: vec2f, depth: f32, u: LinearUnproj) -> vec3f {
+  let inv_w = 1.0 / (depth * u.z_params.z + u.z_params.w);
+  let xy = pixel * u.px_scale + u.px_bias;
+  let z = depth * u.z_params.x + u.z_params.y;
+  return vec3f(xy.x, xy.y, z) * inv_w;
+}
+
+fn neighbour(pixel: vec2f, step: vec2i, last: vec2i, u: LinearUnproj) -> vec3f {
+  return view_at(pixel + vec2f(step), depth_at(vec2i(pixel) + step, last), u);
 }
 
 fn gtao_arc_cs(theta: f32, gamma: f32, cos_g: f32, sin_g: f32) -> f32 {
@@ -35,18 +64,22 @@ fn gtao_arc_cs(theta: f32, gamma: f32, cos_g: f32, sin_g: f32) -> f32 {
 @fragment fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
   let last = vec2i(occlusion.size.xy) - 1;
   let inv_size = 1.0 / occlusion.size.xy;
-  let depth = depth_at(vec2i(position.xy), last);
-  if (depth >= 1.0) {
+  let scale = select(vec2f(1.0), occlusion.size.zw, occlusion.size.z > 0.0 && occlusion.size.w > 0.0);
+  let full_pos = position.xy * scale;
+  let reversed_z = occlusion.settings.w > 0.5;
+  let depth = depth_at(vec2i(full_pos), last);
+  if (is_sky(depth, reversed_z)) {
     return vec4f(1.0);
   }
-  let middle = view_at(position.xy, depth, inv_size);
+  let unproj = make_unproj(inv_size);
+  let middle = view_at(full_pos, depth, unproj);
   let view_dir = normalize(-middle);
 
   // Edge-preserving view-space normal from the closer neighbour on each axis.
-  let right = neighbour(position.xy, vec2i(1, 0), last, inv_size) - middle;
-  let left = middle - neighbour(position.xy, vec2i(-1, 0), last, inv_size);
-  let down = neighbour(position.xy, vec2i(0, 1), last, inv_size) - middle;
-  let up = middle - neighbour(position.xy, vec2i(0, -1), last, inv_size);
+  let right = neighbour(full_pos, vec2i(1, 0), last, unproj) - middle;
+  let left = middle - neighbour(full_pos, vec2i(-1, 0), last, unproj);
+  let down = neighbour(full_pos, vec2i(0, 1), last, unproj) - middle;
+  let up = middle - neighbour(full_pos, vec2i(0, -1), last, unproj);
   let across = select(left, right, abs(right.z) < abs(left.z));
   let along = select(up, down, abs(down.z) < abs(up.z));
   var normal = normalize(cross(across, along));
@@ -101,10 +134,10 @@ fn gtao_arc_cs(theta: f32, gamma: f32, cos_g: f32, sin_g: f32) -> f32 {
       let offset_px = dir_px * max(screen_radius * frac * frac, f32(step + 1));
 
       // +side horizon search
-      let p_pos = position.xy + offset_px;
+      let p_pos = full_pos + offset_px;
       let d_pos = depth_at(vec2i(p_pos), last);
-      if (d_pos < 1.0) {
-        let delta = view_at(p_pos, d_pos, inv_size) - middle;
+      if (!is_sky(d_pos, reversed_z)) {
+        let delta = view_at(p_pos, d_pos, unproj) - middle;
         let dist2 = dot(delta, delta);
         if (dist2 > bias2 && dist2 < max_r2) {
           let inv_dist = inverseSqrt(dist2);
@@ -116,10 +149,10 @@ fn gtao_arc_cs(theta: f32, gamma: f32, cos_g: f32, sin_g: f32) -> f32 {
       }
 
       // -side horizon search
-      let p_neg = position.xy - offset_px;
+      let p_neg = full_pos - offset_px;
       let d_neg = depth_at(vec2i(p_neg), last);
-      if (d_neg < 1.0) {
-        let delta = view_at(p_neg, d_neg, inv_size) - middle;
+      if (!is_sky(d_neg, reversed_z)) {
+        let delta = view_at(p_neg, d_neg, unproj) - middle;
         let dist2 = dot(delta, delta);
         if (dist2 > bias2 && dist2 < max_r2) {
           let inv_dist = inverseSqrt(dist2);

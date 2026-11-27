@@ -186,6 +186,7 @@ pub(super) struct WiredPasses {
     #[cfg(feature = "render-atmosphere")]
     pub physical_sky_last_key: (bool, u64),
     pub scene_depth_serial: u64,
+    pub depth_write_epoch: u64,
     #[cfg(feature = "render-pbr-decals")]
     pub pbr_decals: HashMap<u32, PbrDecalPass>,
     #[cfg(feature = "render-oit")]
@@ -263,6 +264,8 @@ pub(super) struct WiredPasses {
     #[allow(dead_code)]
     msaa_depth_resolve_bg: Option<(wgpu::TextureView, u32, wgpu::BindGroup)>,
     #[allow(dead_code)]
+    msaa_depth_resolved_key: Option<(wgpu::TextureView, u64, u32, (u32, u32))>,
+    #[allow(dead_code)]
     pub dummy_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
     #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub dummy_vel: Option<(wgpu::Texture, wgpu::TextureView)>,
@@ -271,50 +274,68 @@ pub(super) struct WiredPasses {
     blit_shared: Option<BlitShared>,
     blit_pipelines: HashMap<wgpu::TextureFormat, wgpu::RenderPipeline>,
     blit_bg: Option<(wgpu::TextureView, wgpu::BindGroup)>,
+    pub secondary_frame_scratch: Option<Box<RenderFrame>>,
     pub in_secondary_camera: bool,
     pub bypass_display_output: bool,
 }
 
-/// Builds a lightweight secondary-camera `RenderFrame` cloning only 3D scene fields and
-/// omitting audio, UI, services, haptics, video streams, camera targets, sprites, and insets.
-pub(super) fn secondary_frame(frame: &RenderFrame, view: Matrix, projection: Matrix) -> RenderFrame {
-    RenderFrame {
-        view,
-        projection,
-        clear: frame.clear,
-        ambient: frame.ambient,
-        light_direction: frame.light_direction,
-        light_color: frame.light_color,
-        aberration: frame.aberration,
-        quality: frame.quality,
-        sky: frame.sky,
-        probe_volume: frame.probe_volume,
-        fog: frame.fog,
-        shadow: frame.shadow,
-        blur: frame.blur,
-        clouds: frame.clouds,
-        exposure: frame.exposure,
-        grade: frame.grade,
-        reflection: frame.reflection,
-        motion_blur: frame.motion_blur,
-        dof: frame.dof,
-        draws: frame.draws.clone(),
-        solids: frame.solids.clone(),
-        decals: frame.decals.clone(),
-        poses: frame.poses.clone(),
-        emitters: frame.emitters.clone(),
-        lights: frame.lights.clone(),
-        cascades: frame.cascades.clone(),
-        probes: frame.probes.clone(),
-        reflection_probes: frame.reflection_probes.clone(),
-        fog_volumes: frame.fog_volumes.clone(),
-        bone_matrices: frame.bone_matrices.clone(),
-        morph_weights: frame.morph_weights.clone(),
-        motions: frame.motions.clone(),
-        ribbons: frame.ribbons.clone(),
-        area_lights: frame.area_lights.clone(),
-        pbr_decals: frame.pbr_decals.clone(),
-        ..RenderFrame::default()
+/// Populates a reusable secondary-camera `RenderFrame` in-place (preserving Vec capacities
+/// across frames) with only 3D scene fields, omitting audio, UI, services, haptics, video
+/// streams, camera targets, sprites, and insets.
+pub(super) fn populate_secondary_frame(
+    dst: &mut RenderFrame,
+    frame: &RenderFrame,
+    view: Matrix,
+    projection: Matrix,
+    split_extensions: bool,
+) {
+    dst.view = view;
+    dst.projection = projection;
+    dst.clear = frame.clear;
+    dst.ambient = frame.ambient;
+    dst.light_direction = frame.light_direction;
+    dst.light_color = frame.light_color;
+    dst.aberration = frame.aberration;
+    dst.quality = frame.quality;
+    dst.sky = frame.sky;
+    dst.probe_volume = frame.probe_volume;
+    dst.fog = frame.fog;
+    dst.shadow = frame.shadow;
+    dst.blur = frame.blur;
+    dst.clouds = frame.clouds;
+    dst.exposure = frame.exposure;
+    dst.grade = frame.grade;
+    dst.reflection = frame.reflection;
+    dst.motion_blur = frame.motion_blur;
+    dst.dof = frame.dof;
+    dst.loading = false;
+    dst.draws.clone_from(&frame.draws);
+    dst.solids.clone_from(&frame.solids);
+    dst.decals.clone_from(&frame.decals);
+    dst.poses.clone_from(&frame.poses);
+    dst.emitters.clone_from(&frame.emitters);
+    dst.lights.clone_from(&frame.lights);
+    dst.cascades.clone_from(&frame.cascades);
+    dst.probes.clone_from(&frame.probes);
+    dst.reflection_probes.clone_from(&frame.reflection_probes);
+    dst.fog_volumes.clone_from(&frame.fog_volumes);
+    dst.bone_matrices.clone_from(&frame.bone_matrices);
+    dst.morph_weights.clone_from(&frame.morph_weights);
+    dst.motions.clone_from(&frame.motions);
+    dst.ribbons.clone_from(&frame.ribbons);
+    dst.area_lights.clone_from(&frame.area_lights);
+    dst.pbr_decals.clone_from(&frame.pbr_decals);
+    dst.extensions.clear();
+    if split_extensions {
+        dst.extensions.extend(
+            frame
+                .extensions
+                .iter()
+                .filter(|ext| {
+                    matches!(ext.tag, GPU_PARTICLES_EXT_TAG | LINES_EXT_TAG | JFA_OUTLINE_EXT_TAG | NANITE_EXT_TAG)
+                })
+                .cloned(),
+        );
     }
 }
 
@@ -416,8 +437,9 @@ impl WiredPasses {
         self.dummy_rgba16f.as_ref().unwrap().1.clone()
     }
 
-    /// Resolves a multisampled depth view into a cached 1x `R32Float` texture via `BuiltIn::OpaqueDepth`
-    /// so screen-space outlines work identically under MSAA.
+    /// Resolves a multisampled (or 1x `Depth24PlusStencil8`) depth view into a cached 1x
+    /// `R32Float` texture via `BuiltIn::OpaqueDepth`. Deduplicates redundant resolves within
+    /// the same frame when `depth_only`, `depth_write_epoch`, `samples`, and `size` match.
     #[allow(dead_code)]
     pub fn resolve_msaa_depth(
         &mut self,
@@ -429,6 +451,13 @@ impl WiredPasses {
         samples: u32,
     ) -> wgpu::TextureView {
         let size = (size.0.max(1), size.1.max(1));
+        if matches!(&self.msaa_depth_resolve, Some((w, h, _, _)) if *w == size.0 && *h == size.1)
+            && self.msaa_depth_resolved_key.as_ref().is_some_and(|(view, epoch, s, sz)| {
+                view == depth_only && *epoch == self.depth_write_epoch && *s == samples && *sz == size
+            })
+        {
+            return self.msaa_depth_resolve.as_ref().unwrap().3.clone();
+        }
         if !matches!(&self.msaa_depth_resolve, Some((w, h, _, _)) if *w == size.0 && *h == size.1) {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("wired_msaa_depth_resolve"),
@@ -457,8 +486,10 @@ impl WiredPasses {
             self.msaa_depth_resolve_bg = Some((depth_only.clone(), samples, bg));
         }
         let bg = &self.msaa_depth_resolve_bg.as_ref().unwrap().2;
+        let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("wired_msaa_depth_resolve"),
+            timestamp_writes: ts.render(),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &dst,
                 depth_slice: None,
@@ -470,6 +501,7 @@ impl WiredPasses {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bg, &[]);
         pass.draw(0..3, 0..1);
+        self.msaa_depth_resolved_key = Some((depth_only.clone(), self.depth_write_epoch, samples, size));
         dst
     }
 

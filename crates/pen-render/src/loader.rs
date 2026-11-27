@@ -15,7 +15,7 @@ use anyhow::Result;
 use crate::asset_store::{AssetKind, Material, parse_material, parse_mesh, validate_asset_key};
 use crate::built_in::BuiltIn;
 use crate::compressed::{self, LevelReader};
-use crate::mesh_cache::{MeshCache, PreparedMesh, prepare_mesh};
+use crate::mesh_cache::{MeshCache, PreparedMesh, prepare_mesh_deferred};
 use crate::packed_texture::{PackedHeader, PackedLevel};
 use crate::platform;
 use crate::prefetch::{Prefetch, Prepared};
@@ -288,6 +288,7 @@ pub(crate) struct Worker {
     /// first loads.
     prefetch: Arc<Mutex<Option<Prefetch>>>,
     /// On-disk cache for CPU-built meshlets and Cluster DAGs.
+    #[allow(dead_code)]
     mesh_cache: MeshCache,
 }
 
@@ -332,7 +333,8 @@ pub(crate) struct Loader {
     pub results: Receiver<Message>,
     pub needs: Arc<Mutex<Needs>>,
     pub prefetch: Arc<Mutex<Option<Prefetch>>>,
-    mesh_cache: MeshCache,
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
+    pub(crate) mesh_cache: MeshCache,
     closed: Arc<AtomicBool>,
 }
 
@@ -521,7 +523,7 @@ impl Worker {
         let bytes = match prepared {
             Some(Prepared::Bytes(bytes)) => bytes,
             Some(Prepared::Mesh(mesh)) => {
-                let prepared = prepare_mesh(*mesh, &self.mesh_cache);
+                let prepared = prepare_mesh_deferred(*mesh);
                 return self.send(loaded(Ok(Loaded::Mesh(Box::new(prepared)))));
             }
             Some(Prepared::Material(material)) => {
@@ -554,9 +556,9 @@ impl Worker {
         };
         let device = &self.context.device;
         match kind {
-            AssetKind::Mesh => self.send(loaded(
-                parse_mesh(&bytes).map(|mesh| Loaded::Mesh(Box::new(prepare_mesh(mesh, &self.mesh_cache)))),
-            )),
+            AssetKind::Mesh => {
+                self.send(loaded(parse_mesh(&bytes).map(|mesh| Loaded::Mesh(Box::new(prepare_mesh_deferred(mesh))))))
+            }
             AssetKind::Material => {
                 let material = self.material(key, parse_material(&bytes));
                 self.send(loaded(material.map(|m| Loaded::Material(Box::new(m)))));

@@ -11,7 +11,7 @@ use crate::ray_tracing::{RtLocalLight, TlasRayTraceParams, TlasRayTracer};
 use crate::restir::{RESTIR_MAX_LIGHTS, RestirInputs, RestirParams, RestirRenderer};
 use crate::restir_specular::{RestirSpecularInputs, RestirSpecularParams, RestirSpecularRenderer};
 use crate::sharc::{SharcCache, SharcConfig, SharcParams};
-use crate::svgf::{SvgfDenoiser, SvgfInputs, SvgfParams};
+use crate::svgf::{SvgfDenoiser, SvgfInputs, SvgfMultiChannel, SvgfMultiDenoiser, SvgfMultiInputs, SvgfParams};
 use anyhow::Result;
 use pen_protocol::{Matrix, RenderFrame};
 
@@ -343,10 +343,8 @@ pub(super) struct SvgfRtState {
     prep_pipe: wgpu::ComputePipeline,
     prep_bgl: wgpu::BindGroupLayout,
     prep_u: wgpu::Buffer,
-    sao: SvgfDenoiser,
+    diffuse: SvgfMultiDenoiser,
     refl: SvgfDenoiser,
-    gi: SvgfDenoiser,
-    di: SvgfDenoiser,
     buffers: Option<SvgfRtBuffers>,
     prev_vp: Option<[f32; 16]>,
 }
@@ -423,20 +421,16 @@ impl SvgfRtState {
             prep_pipe,
             prep_bgl,
             prep_u,
-            sao: SvgfDenoiser::new(device),
+            diffuse: SvgfMultiDenoiser::new(device),
             refl: SvgfDenoiser::new(device),
-            gi: SvgfDenoiser::new(device),
-            di: SvgfDenoiser::new(device),
             buffers: None,
             prev_vp: None,
         }
     }
 
     pub(super) fn reset_history(&mut self) {
-        self.sao.reset_history();
+        self.diffuse.reset_history();
         self.refl.reset_history();
-        self.gi.reset_history();
-        self.di.reset_history();
         self.prev_vp = None;
     }
 }
@@ -927,21 +921,61 @@ impl State {
                 pass.set_bind_group(0, prep_bg, &[]);
                 pass.dispatch_workgroups(rt_size.0.div_ceil(8), rt_size.1.div_ceil(8), 1);
             }
-            let sao_params =
-                SvgfParams { min_alpha: 0.1, atrous_iterations: 3, reset_history: !has_prev, ..Default::default() };
-            let sao_in = SvgfInputs {
-                noisy_signal: &sao_raw_view,
+            let defaults = SvgfParams::default();
+            let gi_ch = if tier >= 2 && !ddgi_active {
+                raw_gi.as_ref().map(|gv| SvgfMultiChannel {
+                    noisy_signal: gv,
+                    min_alpha: 0.1,
+                    phi_color: 4.5,
+                    atrous_iterations: 3,
+                    reset_history: !has_prev,
+                })
+            } else {
+                None
+            };
+            let di_ch = if tier >= 2 {
+                raw_di.as_ref().map(|dv| SvgfMultiChannel {
+                    noisy_signal: dv,
+                    min_alpha: 0.12,
+                    phi_color: 4.0,
+                    atrous_iterations: 2,
+                    reset_history: !has_prev,
+                })
+            } else {
+                None
+            };
+            let diffuse_in = SvgfMultiInputs {
+                channels: [
+                    Some(SvgfMultiChannel {
+                        noisy_signal: &sao_raw_view,
+                        min_alpha: 0.1,
+                        phi_color: defaults.phi_color,
+                        atrous_iterations: 3,
+                        reset_history: !has_prev,
+                    }),
+                    gi_ch,
+                    di_ch,
+                ],
                 depth: &bufs.depth[curr].view,
                 prev_depth: &bufs.depth[prev].view,
                 normal: &bufs.normal[curr].view,
                 prev_normal: &bufs.normal[prev].view,
                 motion: &bufs.motion.view,
+                max_history: defaults.max_history,
+                depth_threshold: defaults.depth_threshold,
+                normal_threshold: defaults.normal_threshold,
+                phi_normal: defaults.phi_normal,
+                phi_depth: defaults.phi_depth,
+                variance_boost: defaults.variance_boost,
             };
-            svgf.sao.denoise(device, encoder, &sao_in, rt_size, &sao_params)?;
+            svgf.diffuse.denoise(device, encoder, &diffuse_in, rt_size)?;
+            let denoised_sao = svgf.diffuse.output_view(0).cloned().unwrap_or(sao_raw_view);
+            let denoised_gi = gi_ch.and_then(|_| svgf.diffuse.output_view(1).cloned());
+            let denoised_di = di_ch.and_then(|_| svgf.diffuse.output_view(2).cloned());
             let mut denoised_refl = None;
-            let mut denoised_gi = None;
-            let mut denoised_di = None;
-            if tier >= 2 {
+            if tier >= 2
+                && let Some(rv) = raw_refl.as_ref()
+            {
                 let refl_params = SvgfParams {
                     min_alpha: 0.12,
                     phi_color: 4.0,
@@ -949,44 +983,22 @@ impl State {
                     reset_history: !has_prev,
                     specular_mode: true,
                     hit_distance_adaptive: use_restir_specular,
-                    ..Default::default()
+                    ..defaults
                 };
-                let gi_params = SvgfParams {
-                    min_alpha: 0.1,
-                    phi_color: 4.5,
-                    atrous_iterations: 3,
-                    reset_history: !has_prev,
-                    specular_mode: false,
-                    ..Default::default()
+                let refl_motion = raw_refl_motion.as_ref().unwrap_or(&bufs.motion.view);
+                let refl_in = SvgfInputs {
+                    noisy_signal: rv,
+                    depth: &bufs.depth[curr].view,
+                    prev_depth: &bufs.depth[prev].view,
+                    normal: &bufs.normal[curr].view,
+                    prev_normal: &bufs.normal[prev].view,
+                    motion: refl_motion,
                 };
-                if let Some(rv) = raw_refl.as_ref() {
-                    let refl_motion = raw_refl_motion.as_ref().unwrap_or(sao_in.motion);
-                    let refl_in = SvgfInputs { noisy_signal: rv, motion: refl_motion, ..sao_in };
-                    svgf.refl.denoise(device, encoder, &refl_in, rt_size, &refl_params)?;
-                    denoised_refl = svgf.refl.output_view().cloned();
-                }
-                if !ddgi_active && let Some(gv) = raw_gi.as_ref() {
-                    let gi_in = SvgfInputs { noisy_signal: gv, ..sao_in };
-                    svgf.gi.denoise(device, encoder, &gi_in, rt_size, &gi_params)?;
-                    denoised_gi = svgf.gi.output_view().cloned();
-                }
-                if let Some(dv) = raw_di.as_ref() {
-                    let di_params = SvgfParams {
-                        min_alpha: 0.12,
-                        phi_color: 4.0,
-                        atrous_iterations: 2,
-                        reset_history: !has_prev,
-                        specular_mode: false,
-                        ..Default::default()
-                    };
-                    let di_in = SvgfInputs { noisy_signal: dv, ..sao_in };
-                    svgf.di.denoise(device, encoder, &di_in, rt_size, &di_params)?;
-                    denoised_di = svgf.di.output_view().cloned();
-                }
+                svgf.refl.denoise(device, encoder, &refl_in, rt_size, &refl_params)?;
+                denoised_refl = svgf.refl.output_view().cloned();
             }
             bufs.parity = prev;
             svgf.prev_vp = Some(active_vp);
-            let denoised_sao = svgf.sao.output_view().cloned().unwrap_or(sao_raw_view);
             let has_csm = !frame.cascades.is_empty() && frame.shadow.texels > 0;
             wired.composite_ray_tracing(
                 device,

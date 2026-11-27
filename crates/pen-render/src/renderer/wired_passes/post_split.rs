@@ -1,6 +1,6 @@
 #![cfg_attr(not(feature = "render-post-fx"), allow(unused_imports, dead_code))]
 use super::super::{State, ViewTemporalState};
-use super::{WiredPasses, secondary_frame};
+use super::{WiredPasses, populate_secondary_frame};
 use crate::RenderTarget;
 use crate::built_in::BuiltIns;
 use crate::matrix::invert;
@@ -22,6 +22,7 @@ impl State {
             return Ok(());
         }
         self.wired.in_secondary_camera = true;
+        let mut sub = self.wired.secondary_frame_scratch.take().unwrap_or_default();
         let result = (|| -> Result<()> {
             for cam in &frame.camera_targets {
                 if cam.split_screen {
@@ -31,11 +32,12 @@ impl State {
                 let Some(key) = mat.material.texture.clone() else { continue };
                 let w = if cam.width == 0 { 256 } else { cam.width.clamp(16, 4096) };
                 let h = if cam.height == 0 { 256 } else { cam.height.clamp(16, 4096) };
-                let sub = secondary_frame(frame, cam.view, cam.projection);
+                populate_secondary_frame(&mut sub, frame, cam.view, cam.projection, false);
                 self.render_camera_to_texture(&key, &sub, catalog, (w, h))?;
             }
             Ok(())
         })();
+        self.wired.secondary_frame_scratch = Some(sub);
         self.wired.in_secondary_camera = false;
         result
     }
@@ -180,6 +182,7 @@ impl State {
         let mut scale_sum = 0.0f32;
         let mut rendered_count = 0u32;
 
+        let mut sub = self.wired.secondary_frame_scratch.take().unwrap_or_default();
         let res = (|| -> Result<()> {
             for (idx, (cam, rect)) in split_cams.iter().zip(&rects).enumerate() {
                 let size = (rect.width, rect.height);
@@ -190,22 +193,7 @@ impl State {
                 } else if views[idx].target.size() != size || views[idx].target.format() != format {
                     views[idx].target = OffscreenRenderTarget::new(&self.device, size.0, size.1, format)?;
                 }
-                let mut sub = secondary_frame(frame, cam.view, cam.projection);
-                sub.extensions.extend(
-                    frame
-                        .extensions
-                        .iter()
-                        .filter(|ext| {
-                            matches!(
-                                ext.tag,
-                                super::GPU_PARTICLES_EXT_TAG
-                                    | super::LINES_EXT_TAG
-                                    | super::JFA_OUTLINE_EXT_TAG
-                                    | super::NANITE_EXT_TAG
-                            )
-                        })
-                        .cloned(),
-                );
+                populate_secondary_frame(&mut sub, frame, cam.view, cam.projection, true);
                 let slot = &mut views[idx];
                 self.wired.split_child = true;
                 let result = self.submit_secondary_view(&sub, catalog, &mut slot.target, &mut slot.temporal);
@@ -234,6 +222,7 @@ impl State {
             views.truncate(split_cams.len());
             Ok(())
         })();
+        self.wired.secondary_frame_scratch = Some(sub);
         self.wired.split_views = views;
         res?;
         if rendered_count > 0 {

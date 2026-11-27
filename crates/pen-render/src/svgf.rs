@@ -482,6 +482,504 @@ impl SvgfDenoiser {
     }
 }
 
+/// Per-channel configuration for [`SvgfMultiDenoiser`] (up to 3 diffuse channels, e.g. SAO/GI/DI).
+#[derive(Clone, Copy)]
+pub struct SvgfMultiChannel<'a> {
+    pub noisy_signal: &'a wgpu::TextureView,
+    pub min_alpha: f32,
+    pub phi_color: f32,
+    pub atrous_iterations: u32,
+    pub reset_history: bool,
+}
+
+/// Shared geometric inputs and up to 3 diffuse channels for [`SvgfMultiDenoiser::denoise`].
+pub struct SvgfMultiInputs<'a> {
+    pub channels: [Option<SvgfMultiChannel<'a>>; 3],
+    pub depth: &'a wgpu::TextureView,
+    pub prev_depth: &'a wgpu::TextureView,
+    pub normal: &'a wgpu::TextureView,
+    pub prev_normal: &'a wgpu::TextureView,
+    pub motion: &'a wgpu::TextureView,
+    pub max_history: f32,
+    pub depth_threshold: f32,
+    pub normal_threshold: f32,
+    pub phi_normal: f32,
+    pub phi_depth: f32,
+    pub variance_boost: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SvgfMultiUniform {
+    dims: [u32; 4],
+    temporal_params: [f32; 4],
+    min_alphas: [f32; 4],
+    phi_colors: [f32; 4],
+    edge_params: [f32; 4],
+}
+
+struct ArrayTarget {
+    _tex: wgpu::Texture,
+    array_view: wgpu::TextureView,
+    layer_views: [wgpu::TextureView; 3],
+}
+
+impl ArrayTarget {
+    fn new(device: &wgpu::Device, label: &str, size: (u32, u32)) -> Self {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 3 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let array_view = tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            base_array_layer: 0,
+            array_layer_count: Some(3),
+            ..Default::default()
+        });
+        let layer_views = std::array::from_fn(|layer| {
+            tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: layer as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        });
+        Self { _tex: tex, array_view, layer_views }
+    }
+}
+
+struct SvgfMultiState {
+    size: (u32, u32),
+    color_bufs: [ArrayTarget; 3],
+    moments: [ArrayTarget; 2],
+    history_color_idx: usize,
+    output_idx: [usize; 3],
+    moments_idx: usize,
+    channel_has_history: [bool; 3],
+    temporal_bgs: [Option<([wgpu::TextureView; 8], wgpu::BindGroup)>; 6],
+    atrous_bgs: [Option<([wgpu::TextureView; 2], wgpu::BindGroup)>; 9],
+}
+
+fn tex_array_ro(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn storage_array_wo(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: wgpu::TextureFormat::Rgba16Float,
+            view_dimension: wgpu::TextureViewDimension::D2Array,
+        },
+        count: None,
+    }
+}
+
+/// Fused multi-channel GPU SVGF denoiser for up to 3 diffuse/non-specular signals
+/// (SAO, GI, DI) sharing geometry fetches, disocclusion checks, and A-Trous edge weights.
+pub struct SvgfMultiDenoiser {
+    temporal_pipe: wgpu::ComputePipeline,
+    temporal_bgl: wgpu::BindGroupLayout,
+    atrous_pipe: wgpu::ComputePipeline,
+    atrous_bgl: wgpu::BindGroupLayout,
+    uniform: wgpu::Buffer,
+    uniform_stride: u32,
+    staged: Vec<u8>,
+    state: Option<Box<SvgfMultiState>>,
+}
+
+impl SvgfMultiDenoiser {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let uniform_size = std::mem::size_of::<SvgfMultiUniform>() as u32;
+        let align = device.limits().min_uniform_buffer_offset_alignment.max(16);
+        let uniform_stride = uniform_size.next_multiple_of(align);
+        let u_entry = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(u64::from(uniform_size)),
+            },
+            count: None,
+        };
+        let temporal_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("svgf_multi_temporal_bgl"),
+            entries: &[
+                u_entry,
+                tex_ro(1),
+                tex_ro(2),
+                tex_ro(3),
+                tex_array_ro(4),
+                tex_array_ro(5),
+                tex_ro(6),
+                tex_ro(7),
+                tex_ro(8),
+                tex_ro(9),
+                tex_ro(10),
+                storage_array_wo(11),
+                storage_array_wo(12),
+            ],
+        });
+        let atrous_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("svgf_multi_atrous_bgl"),
+            entries: &[u_entry, tex_array_ro(1), tex_ro(2), tex_ro(3), storage_array_wo(4)],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("svgf_multi_wgsl"),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("svgf.wgsl").into()),
+        });
+        let temporal_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("svgf_multi_temporal_pl"),
+            bind_group_layouts: &[Some(&temporal_bgl)],
+            immediate_size: 0,
+        });
+        let atrous_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("svgf_multi_atrous_pl"),
+            bind_group_layouts: &[Some(&atrous_bgl)],
+            immediate_size: 0,
+        });
+        let temporal_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("svgf_multi_temporal_pipe"),
+            layout: Some(&temporal_pl),
+            module: &module,
+            entry_point: Some("svgf_temporal_multi"),
+            compilation_options: Default::default(),
+            cache: crate::pipeline_cache::active().as_ref(),
+        });
+        let atrous_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("svgf_multi_atrous_pipe"),
+            layout: Some(&atrous_pl),
+            module: &module,
+            entry_point: Some("svgf_atrous_multi"),
+            compilation_options: Default::default(),
+            cache: crate::pipeline_cache::active().as_ref(),
+        });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("svgf_multi_u"),
+            size: u64::from(uniform_stride) * 6,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self {
+            temporal_pipe,
+            temporal_bgl,
+            atrous_pipe,
+            atrous_bgl,
+            uniform,
+            uniform_stride,
+            staged: Vec::new(),
+            state: None,
+        }
+    }
+
+    pub fn reset_history(&mut self) {
+        if let Some(st) = &mut self.state {
+            st.channel_has_history = [false; 3];
+        }
+    }
+
+    pub fn output_view(&self, channel: usize) -> Option<&wgpu::TextureView> {
+        let st = self.state.as_ref()?;
+        let buf_idx = *st.output_idx.get(channel)?;
+        st.color_bufs[buf_idx].layer_views.get(channel)
+    }
+
+    #[cfg(test)]
+    fn output_texture(&self, channel: usize) -> Option<(&wgpu::Texture, u32)> {
+        let st = self.state.as_ref()?;
+        let buf_idx = *st.output_idx.get(channel)?;
+        Some((&st.color_bufs[buf_idx]._tex, channel as u32))
+    }
+
+    pub fn denoise(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        inputs: &SvgfMultiInputs<'_>,
+        size: (u32, u32),
+    ) -> Result<()> {
+        let max_dim = device.limits().max_texture_dimension_2d;
+        ensure!(size.0 >= 1 && size.1 >= 1 && size.0 <= max_dim && size.1 <= max_dim, "invalid SVGF size {size:?}");
+        for (name, view) in [
+            ("depth", inputs.depth),
+            ("prev_depth", inputs.prev_depth),
+            ("normal", inputs.normal),
+            ("prev_normal", inputs.prev_normal),
+            ("motion", inputs.motion),
+        ] {
+            let sz = view.texture().size();
+            ensure!((sz.width, sz.height) == size, "SVGF {name} extent {}x{} != {size:?}", sz.width, sz.height);
+        }
+        let mut active_mask = 0u32;
+        let mut max_iters = 0u32;
+        let mut first_noisy: Option<&wgpu::TextureView> = None;
+        for (ch, opt) in inputs.channels.iter().enumerate() {
+            if let Some(cfg) = opt {
+                let sz = cfg.noisy_signal.texture().size();
+                ensure!(
+                    (sz.width, sz.height) == size,
+                    "SVGF channel {ch} extent {}x{} != {size:?}",
+                    sz.width,
+                    sz.height
+                );
+                active_mask |= 1u32 << ch;
+                max_iters = max_iters.max(cfg.atrous_iterations.clamp(1, 5));
+                if first_noisy.is_none() {
+                    first_noisy = Some(cfg.noisy_signal);
+                }
+            }
+        }
+        let Some(fallback_noisy) = first_noisy else { return Ok(()) };
+
+        if !matches!(&self.state, Some(st) if st.size == size) {
+            self.state = Some(Box::new(SvgfMultiState {
+                size,
+                color_bufs: [
+                    ArrayTarget::new(device, "svgf_multi_color_0", size),
+                    ArrayTarget::new(device, "svgf_multi_color_1", size),
+                    ArrayTarget::new(device, "svgf_multi_color_2", size),
+                ],
+                moments: [
+                    ArrayTarget::new(device, "svgf_multi_moments_0", size),
+                    ArrayTarget::new(device, "svgf_multi_moments_1", size),
+                ],
+                history_color_idx: 0,
+                output_idx: [1, 1, 1],
+                moments_idx: 0,
+                channel_has_history: [false; 3],
+                temporal_bgs: std::array::from_fn(|_| None),
+                atrous_bgs: std::array::from_fn(|_| None),
+            }));
+        }
+        let st = self.state.as_mut().unwrap();
+
+        let mut reset_mask = 0u32;
+        let mut min_alphas = [0.05f32; 4];
+        let mut phi_colors = [4.0f32; 4];
+        let mut ch_iters = [0u32; 3];
+        for ch in 0..3 {
+            if let Some(cfg) = inputs.channels[ch] {
+                if cfg.reset_history || !st.channel_has_history[ch] {
+                    reset_mask |= 1u32 << ch;
+                }
+                min_alphas[ch] = cfg.min_alpha.clamp(0.01, 1.0);
+                phi_colors[ch] = cfg.phi_color.max(0.05);
+                ch_iters[ch] = cfg.atrous_iterations.clamp(1, 5);
+            } else {
+                st.channel_has_history[ch] = false;
+            }
+        }
+
+        let u_base = SvgfMultiUniform {
+            dims: [size.0, size.1, 1, reset_mask | (active_mask << 4)],
+            temporal_params: [
+                inputs.max_history.clamp(1.0, 256.0),
+                inputs.depth_threshold.max(1e-4),
+                inputs.normal_threshold.clamp(-1.0, 1.0),
+                inputs.variance_boost.max(1.0),
+            ],
+            min_alphas,
+            phi_colors,
+            edge_params: [inputs.phi_normal.max(1.0), inputs.phi_depth.max(1e-4), 0.0, 0.0],
+        };
+        let stride = self.uniform_stride as usize;
+        let u_size = std::mem::size_of::<SvgfMultiUniform>();
+        let slots = 1 + max_iters as usize;
+        self.staged.clear();
+        self.staged.resize(slots * stride, 0);
+        self.staged[..u_size].copy_from_slice(bytemuck::bytes_of(&u_base));
+        for iter in 0..max_iters {
+            let mut iter_mask = 0u32;
+            for (ch, &iters) in ch_iters.iter().enumerate() {
+                if iter < iters {
+                    iter_mask |= 1u32 << ch;
+                }
+            }
+            let u_iter = SvgfMultiUniform { dims: [size.0, size.1, 1u32 << iter, iter_mask << 4], ..u_base };
+            let off = (1 + iter as usize) * stride;
+            self.staged[off..off + u_size].copy_from_slice(bytemuck::bytes_of(&u_iter));
+        }
+        encode_copy(device, encoder, &self.uniform, &self.staged);
+
+        let hist_c = st.history_color_idx;
+        let slot_a = (hist_c + 1) % 3;
+        let slot_b = (hist_c + 2) % 3;
+        let prev_m = st.moments_idx;
+        let curr_m = 1 - prev_m;
+
+        let u_binding = wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer: &self.uniform,
+            offset: 0,
+            size: wgpu::BufferSize::new(u_size as u64),
+        });
+        let noisy0 = inputs.channels[0].map_or(fallback_noisy, |c| c.noisy_signal);
+        let noisy1 = inputs.channels[1].map_or(fallback_noisy, |c| c.noisy_signal);
+        let noisy2 = inputs.channels[2].map_or(fallback_noisy, |c| c.noisy_signal);
+        let t_slot = hist_c * 2 + prev_m;
+        let t_hit = st.temporal_bgs[t_slot].as_ref().is_some_and(|(keys, _)| {
+            &keys[0] == noisy0
+                && &keys[1] == noisy1
+                && &keys[2] == noisy2
+                && &keys[3] == inputs.depth
+                && &keys[4] == inputs.prev_depth
+                && &keys[5] == inputs.normal
+                && &keys[6] == inputs.prev_normal
+                && &keys[7] == inputs.motion
+        });
+        if !t_hit {
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("svgf_multi_temporal_bg"),
+                layout: &self.temporal_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(noisy0) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(noisy1) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(noisy2) },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&st.color_bufs[hist_c].array_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(&st.moments[prev_m].array_view),
+                    },
+                    wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(inputs.depth) },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: wgpu::BindingResource::TextureView(inputs.prev_depth),
+                    },
+                    wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(inputs.normal) },
+                    wgpu::BindGroupEntry {
+                        binding: 9,
+                        resource: wgpu::BindingResource::TextureView(inputs.prev_normal),
+                    },
+                    wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(inputs.motion) },
+                    wgpu::BindGroupEntry {
+                        binding: 11,
+                        resource: wgpu::BindingResource::TextureView(&st.color_bufs[slot_a].array_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 12,
+                        resource: wgpu::BindingResource::TextureView(&st.moments[curr_m].array_view),
+                    },
+                ],
+            });
+            st.temporal_bgs[t_slot] = Some((
+                [
+                    noisy0.clone(),
+                    noisy1.clone(),
+                    noisy2.clone(),
+                    inputs.depth.clone(),
+                    inputs.prev_depth.clone(),
+                    inputs.normal.clone(),
+                    inputs.prev_normal.clone(),
+                    inputs.motion.clone(),
+                ],
+                bg,
+            ));
+        }
+        let tbg = &st.temporal_bgs[t_slot].as_ref().unwrap().1;
+        let (gx, gy) = (size.0.div_ceil(8), size.1.div_ceil(8));
+        {
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("svgf_multi_temporal"),
+                timestamp_writes: ts.compute(),
+            });
+            pass.set_pipeline(&self.temporal_pipe);
+            pass.set_bind_group(0, tbg, &[0]);
+            pass.dispatch_workgroups(gx, gy, 1);
+        }
+
+        let mut src_idx = slot_a;
+        let mut dst_idx = slot_b;
+        for iter in 0..max_iters {
+            let a_slot = src_idx * 3 + dst_idx;
+            let a_hit = st.atrous_bgs[a_slot]
+                .as_ref()
+                .is_some_and(|(keys, _)| &keys[0] == inputs.depth && &keys[1] == inputs.normal);
+            if !a_hit {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("svgf_multi_atrous_bg"),
+                    layout: &self.atrous_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: u_binding.clone() },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&st.color_bufs[src_idx].array_view),
+                        },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(inputs.depth) },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(inputs.normal),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::TextureView(&st.color_bufs[dst_idx].array_view),
+                        },
+                    ],
+                });
+                st.atrous_bgs[a_slot] = Some(([inputs.depth.clone(), inputs.normal.clone()], bg));
+            }
+            let abg = &st.atrous_bgs[a_slot].as_ref().unwrap().1;
+            let dyn_off = (1 + iter) * self.uniform_stride;
+            {
+                let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("svgf_multi_atrous"),
+                    timestamp_writes: ts.compute(),
+                });
+                pass.set_pipeline(&self.atrous_pipe);
+                pass.set_bind_group(0, abg, &[dyn_off]);
+                pass.dispatch_workgroups(gx, gy, 1);
+            }
+            for (ch, &iters) in ch_iters.iter().enumerate() {
+                if iters == iter + 1 {
+                    st.output_idx[ch] = dst_idx;
+                }
+            }
+            if iter + 1 < max_iters {
+                if iter == 0 {
+                    src_idx = slot_b;
+                    dst_idx = slot_a;
+                } else {
+                    src_idx = dst_idx;
+                    dst_idx = if dst_idx == slot_a { hist_c } else { slot_a };
+                }
+            }
+        }
+        for (ch, opt) in inputs.channels.iter().enumerate() {
+            if opt.is_some() {
+                st.channel_has_history[ch] = true;
+            }
+        }
+        st.history_color_idx = slot_b;
+        st.moments_idx = curr_m;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1047,5 +1545,211 @@ mod tests {
         );
         assert!(contact_gradient > distant_gradient + 0.03, "contact={contact_gradient}, distant={distant_gradient}");
         assert!(contact_var < noisy_var * 0.8 && distant_var < noisy_var * 0.8);
+    }
+
+    fn read_rgba16f_layer(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tex: &wgpu::Texture,
+        layer: u32,
+        w: u32,
+        h: u32,
+    ) -> Vec<[f32; 4]> {
+        let bpp = 8u32;
+        let bpr = (w * bpp).next_multiple_of(256);
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("svgf_multi_readback"),
+            size: u64::from(bpr * h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().unwrap();
+        let mut out = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            let row = (y * bpr) as usize;
+            for x in 0..w {
+                let off = row + (x * bpp) as usize;
+                let mut px = [0.0f32; 4];
+                for (c, lane) in px.iter_mut().enumerate() {
+                    let bits = u16::from_le_bytes([data[off + c * 2], data[off + c * 2 + 1]]);
+                    *lane = f16_to_f32(bits);
+                }
+                out.push(px);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn gpu_svgf_multi_matches_single_channel_denoiser() {
+        let Some((device, queue)) = crate::testing::device() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let (w, h) = (32u32, 32u32);
+        let n = (w * h) as usize;
+        let depth = upload_rgba16f(
+            &device,
+            &queue,
+            w,
+            h,
+            &(0..n).map(|i| [if (i as u32 % w) < 16 { 5.0 } else { 12.0 }, 0.0, 0.0, 1.0]).collect::<Vec<_>>(),
+        )
+        .create_view(&Default::default());
+        let normal =
+            upload_rgba16f(&device, &queue, w, h, &vec![[0.0, 1.0, 0.0, 0.5]; n]).create_view(&Default::default());
+        let motion = upload_rgba16f(&device, &queue, w, h, &vec![[0.0; 4]; n]).create_view(&Default::default());
+
+        let make_noisy = |seed: u32, base: [f32; 3]| {
+            let px: Vec<[f32; 4]> = (0..n)
+                .map(|i| {
+                    let h = ((i as u32) ^ seed).wrapping_mul(0x9e37_79b9).rotate_left(7);
+                    let jitter = ((h & 255) as f32 / 255.0 - 0.5) * 0.25;
+                    [(base[0] + jitter).max(0.0), (base[1] + jitter).max(0.0), (base[2] + jitter).max(0.0), 1.0]
+                })
+                .collect();
+            upload_rgba16f(&device, &queue, w, h, &px).create_view(&Default::default())
+        };
+
+        let mut single_sao = SvgfDenoiser::new(&device);
+        let mut single_gi = SvgfDenoiser::new(&device);
+        let mut single_di = SvgfDenoiser::new(&device);
+        let mut multi = SvgfMultiDenoiser::new(&device);
+        let defaults = SvgfParams::default();
+        let sao_p = SvgfParams { min_alpha: 0.1, phi_color: 4.0, atrous_iterations: 3, ..defaults };
+        let gi_p = SvgfParams { min_alpha: 0.1, phi_color: 4.5, atrous_iterations: 3, ..defaults };
+        let di_p = SvgfParams { min_alpha: 0.12, phi_color: 4.0, atrous_iterations: 2, ..defaults };
+
+        for frame in 0..3u32 {
+            let n0 = make_noisy(11 + frame * 7, [0.8, 0.7, 0.2]);
+            let n1 = make_noisy(37 + frame * 13, [0.3, 0.5, 0.9]);
+            let n2 = make_noisy(91 + frame * 19, [0.9, 0.4, 0.2]);
+            let mut enc = device.create_command_encoder(&Default::default());
+            single_sao
+                .denoise(
+                    &device,
+                    &mut enc,
+                    &SvgfInputs {
+                        noisy_signal: &n0,
+                        depth: &depth,
+                        prev_depth: &depth,
+                        normal: &normal,
+                        prev_normal: &normal,
+                        motion: &motion,
+                    },
+                    (w, h),
+                    &sao_p,
+                )
+                .unwrap();
+            single_gi
+                .denoise(
+                    &device,
+                    &mut enc,
+                    &SvgfInputs {
+                        noisy_signal: &n1,
+                        depth: &depth,
+                        prev_depth: &depth,
+                        normal: &normal,
+                        prev_normal: &normal,
+                        motion: &motion,
+                    },
+                    (w, h),
+                    &gi_p,
+                )
+                .unwrap();
+            single_di
+                .denoise(
+                    &device,
+                    &mut enc,
+                    &SvgfInputs {
+                        noisy_signal: &n2,
+                        depth: &depth,
+                        prev_depth: &depth,
+                        normal: &normal,
+                        prev_normal: &normal,
+                        motion: &motion,
+                    },
+                    (w, h),
+                    &di_p,
+                )
+                .unwrap();
+            multi
+                .denoise(
+                    &device,
+                    &mut enc,
+                    &SvgfMultiInputs {
+                        channels: [
+                            Some(SvgfMultiChannel {
+                                noisy_signal: &n0,
+                                min_alpha: 0.1,
+                                phi_color: 4.0,
+                                atrous_iterations: 3,
+                                reset_history: false,
+                            }),
+                            Some(SvgfMultiChannel {
+                                noisy_signal: &n1,
+                                min_alpha: 0.1,
+                                phi_color: 4.5,
+                                atrous_iterations: 3,
+                                reset_history: false,
+                            }),
+                            Some(SvgfMultiChannel {
+                                noisy_signal: &n2,
+                                min_alpha: 0.12,
+                                phi_color: 4.0,
+                                atrous_iterations: 2,
+                                reset_history: false,
+                            }),
+                        ],
+                        depth: &depth,
+                        prev_depth: &depth,
+                        normal: &normal,
+                        prev_normal: &normal,
+                        motion: &motion,
+                        max_history: defaults.max_history,
+                        depth_threshold: defaults.depth_threshold,
+                        normal_threshold: defaults.normal_threshold,
+                        phi_normal: defaults.phi_normal,
+                        phi_depth: defaults.phi_depth,
+                        variance_boost: defaults.variance_boost,
+                    },
+                    (w, h),
+                )
+                .unwrap();
+            queue.submit([enc.finish()]);
+        }
+
+        for (ch, single) in [(0usize, &single_sao), (1, &single_gi), (2, &single_di)] {
+            let ref_px = read_rgba16f_tex(&device, &queue, single.output_texture().unwrap(), w, h);
+            let (mtex, layer) = multi.output_texture(ch).unwrap();
+            let got_px = read_rgba16f_layer(&device, &queue, mtex, layer, w, h);
+            let max_diff = ref_px
+                .iter()
+                .zip(got_px.iter())
+                .flat_map(|(a, b)| (0..3).map(move |c| (a[c] - b[c]).abs()))
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 2e-3,
+                "fused SVGF channel {ch} diverged from single-channel SVGF: max_diff={max_diff:.6}"
+            );
+        }
     }
 }

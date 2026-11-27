@@ -168,9 +168,20 @@ pub(crate) struct MeshAsset {
     /// Blendshape / morph target deltas on the GPU, evaluated by compute pass.
     morphs: Option<MeshMorphs>,
     instances: Option<MeshInstanceBuffer>,
-    /// LOD0 triangles for lazy ray-tracing / DDGI BLAS construction.
-    #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
+    /// LOD0 triangles for lazy ray-tracing / DDGI BLAS and lazy meshlet/DAG construction.
+    #[cfg_attr(not(any(feature = "render-rt", feature = "render-meshlets")), allow(dead_code))]
     rt_source: Option<Arc<RtMeshSource>>,
+    /// Pre-baked meshlets waiting for lazy GPU upload on first qualifying solo draw.
+    #[cfg(feature = "render-meshlets")]
+    baked_meshlets: Option<Box<crate::meshlets::MeshletMesh>>,
+    /// Pre-baked Cluster DAG waiting for lazy GPU upload on first qualifying solo draw.
+    #[cfg(feature = "render-meshlets")]
+    baked_meshlet_dag: Option<Box<crate::meshlet_dag::MeshletDagMesh>>,
+    /// Whether lazy meshlet / DAG materialization has already been attempted for this mesh.
+    #[cfg(feature = "render-meshlets")]
+    meshlets_attempted: bool,
+    #[cfg(feature = "render-meshlets")]
+    dag_attempted: bool,
     /// LOD0 meshlet clusters for GPU frustum/backface/Hi-Z cluster culling.
     meshlets: Option<MeshletGpuAsset>,
     /// Multi-level continuous meshlet DAG for GPU screen-space error LOD cut selection.

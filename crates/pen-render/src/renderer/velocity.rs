@@ -113,6 +113,34 @@ impl Velocity {
         self.dirty = true;
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
+    }
+
+    /// Whether any opaque draw in the frame has explicit object motion or prior-frame skinning.
+    pub(super) fn has_object_motion(
+        frame: &RenderFrame,
+        scratch: &Scratch,
+        drawing: &Drawing<'_>,
+        skinning: &Skinning,
+        ready: &[ReadyEntry],
+    ) -> bool {
+        !frame.motions.is_empty()
+            || scratch.opaque.iter().any(|&idx| {
+                let entry = &ready[idx];
+                entry.skin.is_some()
+                    && entry.mesh.is_some_and(|mesh| {
+                        scratch
+                            .target_of_source(drawing.items[entry.item].source)
+                            .is_some_and(|t| skinning.previous_offset(t, mesh).is_some())
+                    })
+            })
+    }
+
     fn ensure_pipelines(&mut self, device: &wgpu::Device) {
         if self.pipelines.is_some() {
             return;
@@ -347,16 +375,7 @@ impl Velocity {
         return;
         #[cfg(feature = "render-taa")]
         {
-            let has_object_motion = !frame.motions.is_empty()
-                || scratch.opaque.iter().any(|&idx| {
-                    let entry = &ready[idx];
-                    entry.skin.is_some()
-                        && entry.mesh.is_some_and(|mesh| {
-                            scratch
-                                .target_of_source(drawing.items[entry.item].source)
-                                .is_some_and(|t| skinning.previous_offset(t, mesh).is_some())
-                        })
-                });
+            let has_object_motion = Self::has_object_motion(frame, scratch, drawing, skinning, ready);
 
             let clear = wgpu::Color { r: SENTINEL, g: SENTINEL, b: 0.0, a: 0.0 };
             if !has_object_motion {

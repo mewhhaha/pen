@@ -290,7 +290,7 @@ pub use sharc::{
 #[cfg(feature = "render-3d")]
 pub use surface_atlas::{SURFACE_ATLAS_WGSL, SurfaceAtlasPacker, SurfaceTile, TileCopy};
 #[cfg(feature = "render-3d")]
-pub use svgf::{SVGF_WGSL, SvgfDenoiser, SvgfInputs, SvgfParams};
+pub use svgf::{SVGF_WGSL, SvgfDenoiser, SvgfInputs, SvgfMultiChannel, SvgfMultiDenoiser, SvgfMultiInputs, SvgfParams};
 #[cfg(feature = "render-3d")]
 pub use taa::{fsr_jitter_phase_count, fsr_mip_bias};
 #[cfg(feature = "render-3d")]

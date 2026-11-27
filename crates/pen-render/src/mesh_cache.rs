@@ -123,6 +123,57 @@ impl MeshCache {
             log::warn!("meshlet cache {}: {error}", path.display());
         }
     }
+
+    /// Lazily loads or builds meshlets and (optionally) the continuous Cluster DAG
+    /// for a static mesh's LOD0 geometry, caching completed builds on disk.
+    #[cfg_attr(not(feature = "render-meshlets"), allow(dead_code))]
+    pub(crate) fn load_or_build(
+        &self,
+        vertices: &[f32],
+        idx_slice: &[u32],
+        want_dag: bool,
+    ) -> (Option<MeshletMesh>, Option<MeshletDagMesh>) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (vertices, idx_slice, want_dag);
+            (None, None)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let tris = idx_slice.len() / 3;
+            if tris < 128 {
+                return (None, None);
+            }
+            let config = MeshletDagConfig::default();
+            let hash = self.enabled().then(|| hash_mesh_inputs(vertices, idx_slice, &config));
+            if let Some(cached) = hash.as_ref().and_then(|h| self.load(h))
+                && (!want_dag || cached.1.is_some() || tris < 768)
+            {
+                return cached;
+            }
+            let positions = mesh_positions(vertices);
+            if want_dag || tris < 768 {
+                let (ml, dag) = build_meshlets_and_dag_from_slice(&positions, idx_slice, &config);
+                if let Some(h) = &hash {
+                    self.store(h, ml.as_ref(), dag.as_ref());
+                }
+                (ml, dag)
+            } else {
+                let ml = build_meshlets(&positions, idx_slice, config.max_vertices, config.max_triangles)
+                    .ok()
+                    .filter(|ml| ml.meshlets.len() > 1);
+                (ml, None)
+            }
+        }
+    }
+}
+
+/// Defers meshlet and Cluster DAG construction until a solo mesh actually enters
+/// GPU meshlet/DAG culling, while preserving any pre-baked `PMSH` meshlet payloads.
+pub(crate) fn prepare_mesh_deferred(mut mesh: Mesh) -> PreparedMesh {
+    let meshlets = mesh.meshlets.take();
+    let meshlet_dag = mesh.meshlet_dag.take();
+    PreparedMesh { mesh, meshlets, meshlet_dag }
 }
 
 /// Builds GPU meshlets and (for meshes >= 768 triangles) a continuous LOD Cluster DAG
@@ -199,6 +250,7 @@ fn build_meshlets_and_dag_from_slice(
 /// Prepares meshlets and the Cluster DAG for GPU upload.
 /// Packaged `PMSH` meshes that already carry pre-baked meshlets/DAG skip building and
 /// disk-cache I/O completely; unpacked dev meshes use `cache` on worker threads.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn prepare_mesh(mut mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
     let baked_ml = mesh.meshlets.take();
     let baked_dag = mesh.meshlet_dag.take();

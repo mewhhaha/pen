@@ -517,26 +517,15 @@ impl State {
                 let rt_id = self.view_id();
                 let lod0_count = mesh.lods[0].count as usize;
                 let (asset, check) = shader::scoped(&device, || {
+                    let static_meshlet_eligible = mesh.skin.is_none()
+                        && mesh.morphs.is_none()
+                        && mesh.instances.is_none()
+                        && lod0_count / 3 >= 128;
                     #[cfg(feature = "render-meshlets")]
-                    let meshlets = meshlet_data.as_ref().map(|ml| super::MeshletGpuAsset {
-                        indices: buffer(bytemuck::cast_slice(&ml.indices), wgpu::BufferUsages::INDEX),
-                        descriptors: buffer(bytemuck::cast_slice(&ml.meshlets), wgpu::BufferUsages::STORAGE),
-                        count: u32::try_from(ml.meshlets.len()).unwrap_or(0),
-                    });
+                    let (baked_meshlets, baked_meshlet_dag) =
+                        (meshlet_data.map(Box::new), meshlet_dag_data.map(Box::new));
                     #[cfg(not(feature = "render-meshlets"))]
-                    let meshlets = {
-                        let _ = &meshlet_data;
-                        None
-                    };
-                    #[cfg(feature = "render-meshlets")]
-                    let meshlet_dag = meshlet_dag_data
-                        .as_ref()
-                        .and_then(|dag| crate::meshlet_dag::MeshletDagGpu::upload(&device, dag).ok());
-                    #[cfg(not(feature = "render-meshlets"))]
-                    let meshlet_dag = {
-                        let _ = &meshlet_dag_data;
-                        None
-                    };
+                    let _ = (&meshlet_data, &meshlet_dag_data, static_meshlet_eligible);
                     GpuAsset::Mesh(MeshAsset {
                         vertex_count,
                         vertices: buffer(bytemuck::cast_slice(&mesh.vertices), vertex_usage),
@@ -562,22 +551,34 @@ impl State {
                             targets,
                             deltas: buffer(bytes, wgpu::BufferUsages::STORAGE),
                         }),
-                        #[cfg(feature = "render-rt")]
-                        rt_source: Some(Arc::new(super::RtMeshSource {
-                            id: rt_id,
-                            vertices: mesh.vertices,
-                            indices: {
-                                mesh.indices.truncate(lod0_count);
-                                Some(mesh.indices)
-                            },
-                        })),
-                        #[cfg(not(feature = "render-rt"))]
+                        #[cfg(any(feature = "render-rt", feature = "render-meshlets"))]
+                        rt_source: if cfg!(feature = "render-rt") || static_meshlet_eligible {
+                            Some(Arc::new(super::RtMeshSource {
+                                id: rt_id,
+                                vertices: mesh.vertices,
+                                indices: {
+                                    mesh.indices.truncate(lod0_count);
+                                    Some(mesh.indices)
+                                },
+                            }))
+                        } else {
+                            None
+                        },
+                        #[cfg(not(any(feature = "render-rt", feature = "render-meshlets")))]
                         rt_source: {
                             let _ = (rt_id, lod0_count);
                             None
                         },
-                        meshlets,
-                        meshlet_dag,
+                        #[cfg(feature = "render-meshlets")]
+                        baked_meshlets,
+                        #[cfg(feature = "render-meshlets")]
+                        baked_meshlet_dag,
+                        #[cfg(feature = "render-meshlets")]
+                        meshlets_attempted: false,
+                        #[cfg(feature = "render-meshlets")]
+                        dag_attempted: false,
+                        meshlets: None,
+                        meshlet_dag: None,
                     })
                 });
                 Ok(Some((asset, Some(check))))

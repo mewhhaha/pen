@@ -1,20 +1,38 @@
-// Material constants and geometric normals for the first opaque hit.
+// Material constants, geometric normals, and optional screen-space motion vectors
+// for the first opaque hit. Supports both 2-attachment thin G-buffer and combined
+// 3-attachment MRT (normal_roughness + albedo_metallic + Rg16Float velocity).
+struct CameraGbuf {
+  curr_jittered_vp: mat4x4f,
+  curr_vp: mat4x4f,
+  prev_vp: mat4x4f,
+};
+
 struct DrawGbuf {
   model: mat4x4f,
+  prev_model: mat4x4f,
   normal_mat: mat4x4f,
   albedo_metallic: vec4f,
   // Roughness after clearcoat, then the clearcoat roughness limit for instances.
   roughness_pad: vec4f,
 };
 
-@group(0) @binding(0) var<uniform> view_projection: mat4x4f;
+@group(0) @binding(0) var<uniform> camera: CameraGbuf;
 @group(1) @binding(0) var<uniform> draw: DrawGbuf;
 @group(2) @binding(0) var<storage, read> joints: array<mat4x4f>;
+@group(2) @binding(1) var<storage, read> prev_joints: array<mat4x4f>;
 
 struct VertexOut {
   @builtin(position) position: vec4f,
   @location(0) normal: vec3f,
   @location(1) @interpolate(flat) metallic_roughness: vec2f,
+};
+
+struct VertexVelOut {
+  @builtin(position) position: vec4f,
+  @location(0) normal: vec3f,
+  @location(1) @interpolate(flat) metallic_roughness: vec2f,
+  @location(2) curr_clip: vec4f,
+  @location(3) prev_clip: vec4f,
 };
 
 // For normal directions the cofactor matrix needs only the sign of the
@@ -36,13 +54,47 @@ fn finite(value: f32) -> bool {
   return (bitcast<u32>(value) & 0x7f800000u) != 0x7f800000u;
 }
 
+fn instance_mr(parameters: vec4f) -> vec2f {
+  var metallic = draw.albedo_metallic.a;
+  var roughness = draw.roughness_pad.x;
+  if (draw.roughness_pad.z > 0.5) {
+    if (finite(parameters.x)) {
+      metallic = clamp(parameters.x, 0.0, 1.0);
+    }
+    if (finite(parameters.y) && parameters.y > 0.0) {
+      roughness = min(clamp(parameters.y, 0.04, 1.0), draw.roughness_pad.y);
+    }
+  }
+  return vec2f(metallic, roughness);
+}
+
 fn project(world: vec4f, normal: vec3f, metallic_roughness: vec2f) -> VertexOut {
-  return VertexOut(view_projection * world, normal, metallic_roughness);
+  return VertexOut(camera.curr_jittered_vp * world, normal, metallic_roughness);
+}
+
+fn project_vel(curr_world: vec4f, prev_world: vec4f, normal: vec3f, metallic_roughness: vec2f) -> VertexVelOut {
+  return VertexVelOut(
+    camera.curr_jittered_vp * curr_world,
+    normal,
+    metallic_roughness,
+    camera.curr_vp * curr_world,
+    camera.prev_vp * prev_world,
+  );
 }
 
 @vertex fn vertex_plain(@location(0) position: vec3f, @location(1) normal: vec3f) -> VertexOut {
   return project(
     draw.model * vec4f(position, 1.0),
+    (draw.normal_mat * vec4f(normal, 0.0)).xyz,
+    vec2f(draw.albedo_metallic.a, draw.roughness_pad.x),
+  );
+}
+
+@vertex fn vertex_plain_vel(@location(0) position: vec3f, @location(1) normal: vec3f) -> VertexVelOut {
+  let local = vec4f(position, 1.0);
+  return project_vel(
+    draw.model * local,
+    draw.prev_model * local,
     (draw.normal_mat * vec4f(normal, 0.0)).xyz,
     vec2f(draw.albedo_metallic.a, draw.roughness_pad.x),
   );
@@ -58,20 +110,53 @@ fn project(world: vec4f, normal: vec3f, metallic_roughness: vec2f) -> VertexOut 
   @location(7) parameters: vec4f,
 ) -> VertexOut {
   let model = mat4x4f(m0, m1, m2, m3);
-  var metallic = draw.albedo_metallic.a;
-  var roughness = draw.roughness_pad.x;
-  if (draw.roughness_pad.z > 0.5) {
-    if (finite(parameters.x)) {
-      metallic = clamp(parameters.x, 0.0, 1.0);
-    }
-    if (finite(parameters.y) && parameters.y > 0.0) {
-      roughness = min(clamp(parameters.y, 0.04, 1.0), draw.roughness_pad.y);
-    }
-  }
   return project(
     model * vec4f(position, 1.0),
     transform_normal(model, normal),
-    vec2f(metallic, roughness),
+    instance_mr(parameters),
+  );
+}
+
+@vertex fn vertex_instanced_vel(
+  @location(0) position: vec3f,
+  @location(1) normal: vec3f,
+  @location(3) m0: vec4f,
+  @location(4) m1: vec4f,
+  @location(5) m2: vec4f,
+  @location(6) m3: vec4f,
+  @location(7) parameters: vec4f,
+) -> VertexVelOut {
+  let model = mat4x4f(m0, m1, m2, m3);
+  let world = model * vec4f(position, 1.0);
+  return project_vel(
+    world,
+    world,
+    transform_normal(model, normal),
+    instance_mr(parameters),
+  );
+}
+
+@vertex fn vertex_instanced_moving_vel(
+  @location(0) position: vec3f,
+  @location(1) normal: vec3f,
+  @location(3) c0: vec4f,
+  @location(4) c1: vec4f,
+  @location(5) c2: vec4f,
+  @location(6) c3: vec4f,
+  @location(7) p0: vec4f,
+  @location(8) p1: vec4f,
+  @location(9) p2: vec4f,
+  @location(10) p3: vec4f,
+  @location(11) parameters: vec4f,
+) -> VertexVelOut {
+  let curr_model = mat4x4f(c0, c1, c2, c3);
+  let prev_model = mat4x4f(p0, p1, p2, p3);
+  let local = vec4f(position, 1.0);
+  return project_vel(
+    curr_model * local,
+    prev_model * local,
+    transform_normal(curr_model, normal),
+    instance_mr(parameters),
   );
 }
 
@@ -104,19 +189,78 @@ fn project(world: vec4f, normal: vec3f, metallic_roughness: vec2f) -> VertexOut 
   );
 }
 
+@vertex fn vertex_skinned_vel(
+  @location(0) position: vec3f,
+  @location(1) normal: vec3f,
+  @location(9) indices: vec4u,
+  @location(10) weights: vec4f,
+) -> VertexVelOut {
+  let curr_skin = joints[indices.x] * weights.x
+    + joints[indices.y] * weights.y
+    + joints[indices.z] * weights.z
+    + joints[indices.w] * weights.w;
+  let prev_skin = prev_joints[indices.x] * weights.x
+    + prev_joints[indices.y] * weights.y
+    + prev_joints[indices.z] * weights.z
+    + prev_joints[indices.w] * weights.w;
+  let a = curr_skin[0].xyz;
+  let b = curr_skin[1].xyz;
+  let c = curr_skin[2].xyz;
+  let cofactors = mat3x3f(cross(b, c), cross(c, a), cross(a, b));
+  let determinant = dot(a, cofactors[0]);
+  var posed_normal = normal;
+  if (determinant != 0.0) {
+    posed_normal = (cofactors * normal) / determinant;
+  }
+  let local = vec4f(position, 1.0);
+  return project_vel(
+    draw.model * (curr_skin * local),
+    draw.prev_model * (prev_skin * local),
+    (draw.normal_mat * vec4f(posed_normal, 0.0)).xyz,
+    vec2f(draw.albedo_metallic.a, draw.roughness_pad.x),
+  );
+}
+
 struct GbufferOut {
   @location(0) normal_roughness: vec4f,
   @location(1) albedo_metallic: vec4f,
 };
 
-@fragment fn fragment(in: VertexOut) -> GbufferOut {
-  let magnitude = max(abs(in.normal.x), max(abs(in.normal.y), abs(in.normal.z)));
-  var normal = vec3f(0.0, 0.0, 1.0);
+struct GbufferVelOut {
+  @location(0) normal_roughness: vec4f,
+  @location(1) albedo_metallic: vec4f,
+  @location(2) velocity: vec4f,
+};
+
+fn normalize_world_normal(raw: vec3f) -> vec3f {
+  let magnitude = max(abs(raw.x), max(abs(raw.y), abs(raw.z)));
   if (magnitude > 0.0 && finite(magnitude)) {
-    normal = normalize(in.normal / magnitude);
+    return normalize(raw / magnitude);
   }
+  return vec3f(0.0, 0.0, 1.0);
+}
+
+@fragment fn fragment(in: VertexOut) -> GbufferOut {
+  let normal = normalize_world_normal(in.normal);
   return GbufferOut(
     vec4f(normal, in.metallic_roughness.y),
     vec4f(draw.albedo_metallic.rgb, in.metallic_roughness.x),
+  );
+}
+
+@fragment fn fragment_vel(in: VertexVelOut) -> GbufferVelOut {
+  let normal = normalize_world_normal(in.normal);
+  var vel = vec2f(1024.0, 1024.0);
+  if (in.curr_clip.w > 1e-5 && in.prev_clip.w > 1e-5) {
+    let curr_ndc = in.curr_clip.xy / in.curr_clip.w;
+    let prev_ndc = in.prev_clip.xy / in.prev_clip.w;
+    let curr_uv = vec2f(curr_ndc.x * 0.5 + 0.5, 0.5 - curr_ndc.y * 0.5);
+    let prev_uv = vec2f(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+    vel = clamp(curr_uv - prev_uv, vec2f(-10.0), vec2f(10.0));
+  }
+  return GbufferVelOut(
+    vec4f(normal, in.metallic_roughness.y),
+    vec4f(draw.albedo_metallic.rgb, in.metallic_roughness.x),
+    vec4f(vel, 0.0, 0.0),
   );
 }

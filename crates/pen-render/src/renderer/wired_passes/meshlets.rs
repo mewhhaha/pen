@@ -80,6 +80,70 @@ impl State {
     }
 
     #[cfg(feature = "render-meshlets")]
+    fn ensure_meshlet_gpu_assets(
+        assets: &mut crate::asset_store::AssetStore<GpuAsset>,
+        mesh_cache: &crate::mesh_cache::MeshCache,
+        device: &wgpu::Device,
+        mesh_slot: usize,
+        want_meshlets: bool,
+        want_dag: bool,
+    ) {
+        use wgpu::util::DeviceExt;
+        let Some(GpuAsset::Mesh(mesh)) = assets.current_mut(mesh_slot) else {
+            return;
+        };
+        if mesh.skin.is_some() || mesh.morphs.is_some() || mesh.instances.is_some() {
+            return;
+        }
+        if want_dag && mesh.meshlet_dag.is_none() && !mesh.dag_attempted {
+            mesh.dag_attempted = true;
+            if let Some(baked_dag) = mesh.baked_meshlet_dag.take() {
+                mesh.meshlet_dag = crate::meshlet_dag::MeshletDagGpu::upload(device, &baked_dag).ok();
+            } else if let Some(src) = &mesh.rt_source
+                && let Some(indices) = &src.indices
+            {
+                let (ml, dag) = mesh_cache.load_or_build(&src.vertices, indices, true);
+                if let Some(dag) = dag {
+                    mesh.meshlet_dag = crate::meshlet_dag::MeshletDagGpu::upload(device, &dag).ok();
+                }
+                if mesh.meshlets.is_none() && mesh.baked_meshlets.is_none() {
+                    mesh.baked_meshlets = ml.map(Box::new);
+                }
+            }
+        }
+        let need_ml = want_meshlets && !(want_dag && mesh.meshlet_dag.is_some());
+        if need_ml && mesh.meshlets.is_none() && !mesh.meshlets_attempted {
+            mesh.meshlets_attempted = true;
+            let ml = mesh.baked_meshlets.take().or_else(|| {
+                let src = mesh.rt_source.as_ref()?;
+                let indices = src.indices.as_ref()?;
+                let (ml, dag) = mesh_cache.load_or_build(&src.vertices, indices, false);
+                if mesh.meshlet_dag.is_none() && mesh.baked_meshlet_dag.is_none() {
+                    mesh.baked_meshlet_dag = dag.map(Box::new);
+                }
+                ml.map(Box::new)
+            });
+            if let Some(ml) = ml {
+                let indices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("meshlet_indices"),
+                    contents: bytemuck::cast_slice(&ml.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                let descriptors = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("meshlet_descriptors"),
+                    contents: bytemuck::cast_slice(&ml.meshlets),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+                mesh.meshlets = Some(super::super::MeshletGpuAsset {
+                    indices,
+                    descriptors,
+                    count: u32::try_from(ml.meshlets.len()).unwrap_or(0),
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "render-meshlets")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_meshlet_culling_phase1(
         &mut self,
@@ -138,6 +202,14 @@ impl State {
             let Some(mesh_slot) = entry.mesh else {
                 continue;
             };
+            Self::ensure_meshlet_gpu_assets(
+                &mut self.assets,
+                &self.loader.mesh_cache,
+                device,
+                mesh_slot,
+                allow_meshlets,
+                allow_dag && perspective_near.is_some(),
+            );
             let Some(GpuAsset::Mesh(mesh)) = self.assets.current(mesh_slot) else {
                 continue;
             };

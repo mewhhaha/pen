@@ -469,6 +469,7 @@ impl State {
         let now = self.now();
         self.receive(now);
         self.waiting = false;
+        self.wired.depth_write_epoch = self.wired.depth_write_epoch.wrapping_add(1);
         if !self.wired.in_secondary_camera {
             self.frames += 1;
             #[cfg(feature = "render-rt")]
@@ -753,23 +754,43 @@ impl State {
         };
         if let Some((vel_view, vel_depth)) = &targets.velocity {
             let active_proj = jittered.unwrap_or(frame.projection);
-            self.velocity.encode(
-                &device,
-                &self.queue,
-                &mut encoder,
-                vel_view,
-                vel_depth,
-                frame,
-                &active_proj,
-                previous_vp,
-                scratch,
-                &drawing,
-                &self.skinning,
-                ready,
-                &self.timer,
-            );
-        }
-        if rt_active && frame.quality.ray_tracing > 0 {
+            if rt_active && frame.quality.ray_tracing > 0 {
+                let drew_vel = self.thin_gbuffer.encode_with_velocity(
+                    &device,
+                    &self.queue,
+                    &mut encoder,
+                    targets.size,
+                    depth_mode,
+                    frame,
+                    &active_proj,
+                    previous_vp,
+                    vel_view,
+                    self.velocity.is_dirty(),
+                    scratch,
+                    &drawing,
+                    &self.skinning,
+                    ready,
+                    &self.timer,
+                );
+                self.velocity.set_dirty(drew_vel);
+            } else {
+                self.velocity.encode(
+                    &device,
+                    &self.queue,
+                    &mut encoder,
+                    vel_view,
+                    vel_depth,
+                    frame,
+                    &active_proj,
+                    previous_vp,
+                    scratch,
+                    &drawing,
+                    &self.skinning,
+                    ready,
+                    &self.timer,
+                );
+            }
+        } else if rt_active && frame.quality.ray_tracing > 0 {
             self.thin_gbuffer.encode(
                 &device,
                 &self.queue,
@@ -922,6 +943,7 @@ impl State {
                 depth_mode,
             )?;
         }
+        self.wired.depth_write_epoch = self.wired.depth_write_epoch.wrapping_add(1);
         let wants_hiz_build = self.hiz.enabled()
             && ((self.culling.active() && depth_mode == crate::camera_precision::DepthMode::ForwardZ)
                 || self.wired.last_meshlet_cull_draws > 0
@@ -996,6 +1018,7 @@ impl State {
                     drawing.draw_meshlet_phase2(&mut phase2, entry, draw_ml, draw_dag);
                 }
             }
+            self.wired.depth_write_epoch = self.wired.depth_write_epoch.wrapping_add(1);
             if wants_hiz_build {
                 let active_proj = jittered.unwrap_or(frame.projection);
                 let active_vp = crate::matrix::multiply(&active_proj, &frame.view);
@@ -1060,7 +1083,7 @@ impl State {
             )?;
         }
         let particle_step = if has_gpu_particles {
-            Self::encode_gpu_particles_wired(
+            let step = Self::encode_gpu_particles_wired(
                 &mut self.wired,
                 &mut self.built_ins,
                 &device,
@@ -1074,7 +1097,9 @@ impl State {
                 samples,
                 depth_mode,
                 self.frames,
-            )?
+            )?;
+            self.wired.depth_write_epoch = self.wired.depth_write_epoch.wrapping_add(1);
+            step
         } else {
             None
         };
@@ -1330,6 +1355,7 @@ impl State {
                     )?;
                 }
             }
+            self.wired.depth_write_epoch = self.wired.depth_write_epoch.wrapping_add(1);
         }
         for jfa in jfa_scenes.iter().flatten() {
             Self::encode_jfa_outlines_wired(

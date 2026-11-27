@@ -634,7 +634,7 @@ impl KernelService {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "compiler"))]
     pub fn host_epoch(&self) -> u64 {
         self.host_epoch
     }
@@ -1134,9 +1134,12 @@ mod kernels_law6_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "compiler")]
     use pen_protocol::boundary::encode_frame;
+    #[cfg(feature = "compiler")]
     use pen_protocol::{Frame, Viewport};
 
+    #[cfg(feature = "compiler")]
     fn dummy_service_from_blot(source: &str) -> KernelService {
         let blot_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../blot2");
         let blotc = blot_root.join("compiler-goose/build/blotc-goose");
@@ -1157,6 +1160,7 @@ mod tests {
         KernelService::new_with_workers(engine, module, false, 2)
     }
 
+    #[cfg(feature = "compiler")]
     fn req(id: u32, op: u32, a: f32, b: f32, c: f32, d: f32, values: Vec<f32>) -> ServiceRequest {
         ServiceRequest {
             request: id,

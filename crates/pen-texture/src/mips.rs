@@ -36,6 +36,11 @@ fn linear_to_srgb_u8(value: f32, lut: &[f32]) -> u8 {
         return to_u8(value * (12.92 * 255.0));
     }
     let scaled = value.clamp(0.0, 1.0) * SRGB_LUT_LEN as f32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "scaled is clamped to [0, SRGB_LUT_LEN]"
+    )]
     let idx = (scaled as usize).min(SRGB_LUT_LEN - 1);
     let frac = scaled - idx as f32;
     to_u8(lut[idx] + (lut[idx + 1] - lut[idx]) * frac)
@@ -109,7 +114,13 @@ fn downsample(rgba: &[u8], width: u32, height: u32, tables: Option<&SrgbTables>)
                                 + u16::from(row0[s1 + c])
                                 + u16::from(row1[s0 + c])
                                 + u16::from(row1[s1 + c]);
-                            dst[d + c] = ((sum + 2) >> 2) as u8;
+                            #[allow(
+                                clippy::cast_possible_truncation,
+                                reason = "average of four u8 channels fits in u8"
+                            )]
+                            {
+                                dst[d + c] = ((sum + 2) >> 2) as u8;
+                            }
                         }
                     }
                 }

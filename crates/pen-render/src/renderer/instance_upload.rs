@@ -132,11 +132,11 @@ mod tests {
             current[slot * STRIDE] = slot as f32;
         }
         let first = uploads.changed_strided(&current, STRIDE);
-        assert_eq!(first, &[0..STRIDE * 8]);
+        assert_eq!(first, std::slice::from_ref(&(0..STRIDE * 8)));
         assert!(uploads.changed_strided(&current, STRIDE).is_empty());
         current[5 * STRIDE + 17] = 42.0;
         let second = uploads.changed_strided(&current, STRIDE);
-        assert_eq!(second, &[5 * STRIDE..6 * STRIDE]);
+        assert_eq!(second, std::slice::from_ref(&(5 * STRIDE..6 * STRIDE)));
         assert!(uploads.changed_strided(&current, STRIDE).is_empty());
     }
 }

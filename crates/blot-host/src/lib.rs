@@ -3389,7 +3389,7 @@ mod tests {
         let signed_leb_i32 = |mut value: i32| -> Vec<u8> {
             let mut bytes = Vec::new();
             loop {
-                let byte = (value & 0x7f) as u8;
+                let byte = (value.cast_unsigned() & 0x7f) as u8;
                 value >>= 7;
                 let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
                 bytes.push(if done { byte } else { byte | 0x80 });

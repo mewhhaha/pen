@@ -832,6 +832,7 @@ impl State2d {
             if self.tilemap_cache.len() > 32 && !self.tilemap_cache.contains_key(&key) {
                 self.tilemap_cache.clear();
             }
+            #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
             let buf = self
                 .tilemap_cache
                 .entry(key)
@@ -995,7 +996,7 @@ impl State2d {
 fn f32_to_f16(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let exp = ((bits >> 23) & 0xff).cast_signed() - 127 + 15;
     let mant = (bits & 0x007f_ffff) >> 13;
     if exp <= 0 {
         sign

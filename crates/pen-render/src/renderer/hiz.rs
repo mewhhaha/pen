@@ -161,7 +161,6 @@ impl HiZ {
         #[cfg(not(feature = "render-gpu-culling"))]
         {
             self.valid = false;
-            return;
         }
         #[cfg(feature = "render-gpu-culling")]
         {

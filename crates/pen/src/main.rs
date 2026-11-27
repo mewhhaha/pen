@@ -12,6 +12,7 @@ mod asset_lint;
 #[cfg(feature = "compiler")]
 mod atlas;
 mod audio;
+#[cfg(feature = "compiler")]
 mod bake_lightmaps;
 #[cfg(feature = "compiler")]
 mod bench;

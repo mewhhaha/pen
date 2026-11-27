@@ -628,23 +628,22 @@ fn snapshot_generator(
     aliases: &[(String, String)],
     files: &mut impl Files,
 ) -> Result<Snapshot, String> {
-    let mut sources: BTreeMap<String, String> = BTreeMap::new();
-    let mut hashes: BTreeMap<String, String> = BTreeMap::new();
-    let mut watched: Vec<String> = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
+    struct WalkState {
+        sources: BTreeMap<String, String>,
+        hashes: BTreeMap<String, String>,
+        watched: Vec<String>,
+        visited: HashSet<String>,
+    }
 
     fn visit(
         path: &str,
         required: bool,
         aliases: &[(String, String)],
         files: &mut impl Files,
-        sources: &mut BTreeMap<String, String>,
-        hashes: &mut BTreeMap<String, String>,
-        watched: &mut Vec<String>,
-        visited: &mut HashSet<String>,
+        state: &mut WalkState,
     ) -> Result<Option<String>, String> {
-        if !watched.iter().any(|existing| existing == path) {
-            watched.push(path.to_owned());
+        if !state.watched.iter().any(|existing| existing == path) {
+            state.watched.push(path.to_owned());
         }
         let canonical = match files.canonical(path) {
             Ok(path) => path,
@@ -655,10 +654,10 @@ fn snapshot_generator(
                 return Ok(None);
             }
         };
-        if !watched.iter().any(|existing| existing == &canonical) {
-            watched.push(canonical.clone());
+        if !state.watched.iter().any(|existing| existing == &canonical) {
+            state.watched.push(canonical.clone());
         }
-        if !visited.insert(canonical.clone()) {
+        if !state.visited.insert(canonical.clone()) {
             return Ok(Some(canonical));
         }
         let bytes = match files.read(&canonical) {
@@ -673,31 +672,33 @@ fn snapshot_generator(
         let text = String::from_utf8(bytes).map_err(|_| format!("Generator source {canonical} is not valid UTF-8"))?;
         let hash = sha256_hex(text.as_bytes());
         let imports = import_paths(&text);
-        sources.insert(canonical.clone(), text);
-        hashes.insert(canonical.clone(), hash);
+        state.sources.insert(canonical.clone(), text);
+        state.hashes.insert(canonical.clone(), hash);
         for specifier in imports {
             if let Some(imported) = resolve_import(&canonical, &specifier, aliases) {
-                visit(&imported, false, aliases, files, sources, hashes, watched, visited)?;
+                visit(&imported, false, aliases, files, state)?;
             }
         }
         Ok(Some(canonical))
     }
 
-    let entry = visit(generator, true, aliases, files, &mut sources, &mut hashes, &mut watched, &mut visited)?
-        .expect("required entry returns canonical path");
+    let mut state =
+        WalkState { sources: BTreeMap::new(), hashes: BTreeMap::new(), watched: Vec::new(), visited: HashSet::new() };
+
+    let entry = visit(generator, true, aliases, files, &mut state)?.expect("required entry returns canonical path");
     if let Some(prelude) = prelude {
-        visit(prelude, false, aliases, files, &mut sources, &mut hashes, &mut watched, &mut visited)?;
+        visit(prelude, false, aliases, files, &mut state)?;
     }
 
     let mut key_hash = Sha256::new();
-    for (path, hash) in &hashes {
+    for (path, hash) in &state.hashes {
         key_hash.update(path.as_bytes());
         key_hash.update(b"\0");
         key_hash.update(hash.as_bytes());
         key_hash.update(b"\n");
     }
     let key = format!("{:x}", key_hash.finalize());
-    Ok(Snapshot { entry, sources, watched, key })
+    Ok(Snapshot { entry, sources: state.sources, watched: state.watched, key })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -996,7 +997,7 @@ where
     match initial {
         Build::Built(wasm) => {
             let _ = session.close();
-            return match validate_stage0_wasm(&wasm, export_name, entry) {
+            match validate_stage0_wasm(&wasm, export_name, entry) {
                 Ok(true) => Ok(Ok(CompiledGenerator {
                     wasm,
                     adapter_name: export_name.to_owned(),
@@ -1009,7 +1010,7 @@ where
                 })),
                 Ok(false) => Ok(Err(vec![asset_diagnostic(entry, 0, 0, unsupported, Some(provenance))])),
                 Err(message) => Ok(Err(vec![asset_diagnostic(entry, 0, 0, message, Some(provenance))])),
-            };
+            }
         }
         Build::Rejected(initial_diags) => {
             if initial_diags.is_empty() || initial_diags.iter().any(|d| d.code != "entry_type") {

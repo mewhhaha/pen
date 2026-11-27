@@ -5,6 +5,9 @@
 //! while preserving exact intra-command-buffer ordering when the same destination buffer is
 //! updated multiple times within a single `CommandEncoder`.
 use std::cell::RefCell;
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
 
 const INITIAL_RING_BYTES: u64 = 256 * 1024;
@@ -20,7 +23,10 @@ struct RingState {
 /// Reusable GPU upload ring owned by the renderer.
 #[derive(Clone)]
 pub(crate) struct FrameStaging {
+    #[cfg(not(target_arch = "wasm32"))]
     inner: Arc<Mutex<RingState>>,
+    #[cfg(target_arch = "wasm32")]
+    inner: Rc<RefCell<RingState>>,
 }
 
 thread_local! {
@@ -39,28 +45,50 @@ impl Drop for ActiveGuard {
 
 impl FrameStaging {
     pub fn new(queue: wgpu::Queue) -> Self {
-        Self { inner: Arc::new(Mutex::new(RingState { queue, buffer: None, cursor: 0, peak: 0 })) }
+        let state = RingState { queue, buffer: None, cursor: 0, peak: 0 };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            Self { inner: Arc::new(Mutex::new(state)) }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self { inner: Rc::new(RefCell::new(state)) }
+        }
+    }
+
+    fn with_state<R>(&self, f: impl FnOnce(&mut RingState) -> R) -> R {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut state = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            f(&mut state)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut state = self.inner.borrow_mut();
+            f(&mut state)
+        }
     }
 
     /// Resets the write cursor at the start of a top-level frame, growing the ring
     /// once if the previous frame overflowed its backing buffer.
     pub fn begin_frame(&self, device: &wgpu::Device) {
-        let mut state = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let needed = state.peak.max(INITIAL_RING_BYTES).next_power_of_two();
-        if state.buffer.as_ref().is_none_or(|b| b.size() < needed) {
-            let max_buf = device.limits().max_buffer_size;
-            let size = needed.min(max_buf);
-            if size >= COPY_ALIGN {
-                state.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("frame_staging_ring"),
-                    size,
-                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
+        self.with_state(|state| {
+            let needed = state.peak.max(INITIAL_RING_BYTES).next_power_of_two();
+            if state.buffer.as_ref().is_none_or(|b| b.size() < needed) {
+                let max_buf = device.limits().max_buffer_size;
+                let size = needed.min(max_buf);
+                if size >= COPY_ALIGN {
+                    state.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("frame_staging_ring"),
+                        size,
+                        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                }
             }
-        }
-        state.cursor = 0;
-        state.peak = 0;
+            state.cursor = 0;
+            state.peak = 0;
+        });
     }
 
     /// Runs `f` with this staging ring active on the current thread.
@@ -83,31 +111,32 @@ impl FrameStaging {
             return false;
         }
         let aligned = len.next_multiple_of(COPY_ALIGN);
-        let mut state = self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.buffer.is_none() {
-            let size = INITIAL_RING_BYTES.max(aligned).next_power_of_two().min(device.limits().max_buffer_size);
-            if size >= aligned {
-                state.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("frame_staging_ring"),
-                    size,
-                    usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
+        self.with_state(|state| {
+            if state.buffer.is_none() {
+                let size = INITIAL_RING_BYTES.max(aligned).next_power_of_two().min(device.limits().max_buffer_size);
+                if size >= aligned {
+                    state.buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("frame_staging_ring"),
+                        size,
+                        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                }
             }
-        }
-        let end = state.cursor.saturating_add(aligned);
-        state.peak = state.peak.max(end);
-        let Some(buf) = &state.buffer else {
-            return false;
-        };
-        if end <= buf.size() {
-            let offset = state.cursor;
-            state.queue.write_buffer(buf, offset, bytes);
-            encoder.copy_buffer_to_buffer(buf, offset, dst, dst_offset, len);
-            state.cursor = end;
-            return true;
-        }
-        false
+            let end = state.cursor.saturating_add(aligned);
+            state.peak = state.peak.max(end);
+            let Some(buf) = &state.buffer else {
+                return false;
+            };
+            if end <= buf.size() {
+                let offset = state.cursor;
+                state.queue.write_buffer(buf, offset, bytes);
+                encoder.copy_buffer_to_buffer(buf, offset, dst, dst_offset, len);
+                state.cursor = end;
+                return true;
+            }
+            false
+        })
     }
 }
 

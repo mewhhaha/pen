@@ -13,34 +13,47 @@
 
 use std::any::Any;
 use std::ffi::c_void;
+#[cfg(feature = "compiler")]
 use std::io::Write;
 #[cfg(feature = "compiler")]
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+#[cfg(feature = "compiler")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "compiler")]
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(feature = "compiler")]
+use std::sync::OnceLock;
+#[cfg(feature = "compiler")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 #[cfg(feature = "compiler")]
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 #[cfg(feature = "compiler")]
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use libloading::Library;
-use pen_runtime::abi::{CallbackType, GuestAbi, GuestFunction, INVOCATION_FINISH, Parameter, ValueType};
+#[cfg(feature = "compiler")]
+use pen_runtime::abi::INVOCATION_FINISH;
+use pen_runtime::abi::{CallbackType, GuestAbi, GuestFunction, Parameter, ValueType};
 use pen_runtime::memory_image::{Captured, MemoryImage, PAGE};
 use wasmtime::Val;
 
+#[cfg(feature = "compiler")]
+use crate::HOST_MODULE;
 use crate::{
-    Active, Argument, GuestImage, HOST_MODULE, LEFT_FAILING, LEFT_NORMALLY, Limits, OWNERSHIP_ENTER, OWNERSHIP_LEAVE,
-    Probe, TEARDOWN, TOKENS, Value, array_range,
+    Active, Argument, GuestImage, LEFT_FAILING, LEFT_NORMALLY, Limits, OWNERSHIP_ENTER, OWNERSHIP_LEAVE, Probe,
+    TEARDOWN, TOKENS, Value, array_range,
 };
 
+#[cfg(feature = "compiler")]
 fn parse_env_bool(name: &str) -> Option<bool> {
     std::env::var(name).ok().map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
 }
 
+#[cfg(feature = "compiler")]
 fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else {
         return false;
@@ -59,12 +72,14 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+#[cfg(feature = "compiler")]
 fn is_bare_prog_name(s: &str) -> bool {
     !s.is_empty() && !s.contains(std::path::MAIN_SEPARATOR) && !s.contains('/') && s != "." && s != ".."
 }
 
 /// Returns an absolute-only, empty-entry-free `PATH` so subprocess execution resolves bare names
 /// identically to `find_in_path` with zero CWD lookup.
+#[cfg(feature = "compiler")]
 fn sanitized_path_env() -> Option<std::ffi::OsString> {
     let raw = std::env::var_os("PATH")?;
     let dirs: Vec<PathBuf> =
@@ -75,6 +90,7 @@ fn sanitized_path_env() -> Option<std::ffi::OsString> {
     std::env::join_paths(dirs).ok()
 }
 
+#[cfg(feature = "compiler")]
 fn find_in_path(name: &str) -> Option<PathBuf> {
     if !is_bare_prog_name(name) {
         return None;
@@ -89,6 +105,7 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(feature = "compiler")]
 fn resolve_wtime_aot_bin() -> Option<PathBuf> {
     if let Ok(explicit) = std::env::var("PEN_WTIME_AOT_BIN")
         && !explicit.is_empty()
@@ -122,6 +139,7 @@ fn resolve_wtime_aot_bin() -> Option<PathBuf> {
 }
 
 /// Returns whether the `wtime-aot` backend is explicitly forced on everywhere.
+#[cfg(feature = "compiler")]
 pub fn enabled() -> bool {
     parse_env_bool("PEN_WTIME_AOT").unwrap_or(false)
 }
@@ -130,6 +148,7 @@ pub fn enabled() -> bool {
 ///
 /// Defaults to `true` when `wtime-aot` (or `PEN_WTIME_AOT_SO`) is available,
 /// unless opted out via `PEN_WTIME_AOT=0` / `false`.
+#[cfg(feature = "compiler")]
 pub fn preferred_for_run() -> bool {
     if let Some(explicit) = parse_env_bool("PEN_WTIME_AOT") {
         return explicit;
@@ -142,9 +161,12 @@ pub fn preferred_for_run() -> bool {
 
 type HostFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u64, u64, *mut u64) -> i32;
 
+#[cfg(feature = "compiler")]
 type FnAbiVersion = unsafe extern "C" fn() -> u32;
 type FnTrapMessage = unsafe extern "C" fn(u8, *mut *const u8, *mut usize) -> i32;
+#[cfg(feature = "compiler")]
 type FnImportCount = unsafe extern "C" fn() -> u32;
+#[cfg(feature = "compiler")]
 type FnImportName = unsafe extern "C" fn(u32, *mut *const u8, *mut usize, *mut *const u8, *mut usize) -> i32;
 type FnNew = unsafe extern "C" fn(*mut c_void, Option<HostFn>, u64, *mut u8) -> *mut c_void;
 type FnDrop = unsafe extern "C" fn(*mut c_void);
@@ -282,6 +304,7 @@ pub struct AotModule {
     lib: Arc<AotLibrary>,
 }
 
+#[cfg(feature = "compiler")]
 fn default_cache_dir(cache: Option<&Path>) -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("PEN_WTIME_AOT_CACHE")
         && !dir.is_empty()
@@ -970,6 +993,7 @@ fn rt_sources_fingerprint(canon_bin: &Path) -> Result<String> {
 fn host_cpu_fingerprint() -> &'static str {
     static FP: OnceLock<String> = OnceLock::new();
     FP.get_or_init(|| {
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut raw = format!("arch={};", std::env::consts::ARCH);
         #[cfg(target_os = "linux")]
         if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
@@ -1906,6 +1930,7 @@ fn probe_link_env_and_cet(
     struct LinkProbeOut {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         so_bytes: Vec<u8>,
         canon_obj: PathBuf,
     }
@@ -1946,8 +1971,15 @@ fn probe_link_env_and_cet(
         if !l_out.status.success() {
             return Ok(None);
         }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         let so_bytes = std::fs::read(&so_path)?;
-        Ok(Some(LinkProbeOut { stdout: l_out.stdout, stderr: l_out.stderr, so_bytes, canon_obj: canon_o }))
+        Ok(Some(LinkProbeOut {
+            stdout: l_out.stdout,
+            stderr: l_out.stderr,
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            so_bytes,
+            canon_obj: canon_o,
+        }))
     };
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -2681,11 +2713,6 @@ fn resolved_aarch64_isa_tag(target_cpu: &str) -> Result<&'static str> {
     }
 }
 
-#[cfg(not(feature = "compiler"))]
-fn load_verified_so(_wasm: &[u8], _cache: Option<&Path>) -> Result<Library> {
-    bail!("wtime-aot compilation requires blot-host's `compiler` feature")
-}
-
 /// Default `wtime-aot` backend when `PEN_WTIME_AOT_BACKEND` is unset (`wtime` v0.1.7).
 /// Uses native Linux `"aarch64"` on ARM64 Linux and `"x64"` elsewhere, falling back
 /// automatically to `"c"` (`--c-opt auto --target-cpu native`) on [`X64FallbackError`].
@@ -3244,6 +3271,7 @@ fn wasmparser_val(value: ValueType) -> wasmparser::ValType {
     }
 }
 
+#[cfg(feature = "compiler")]
 struct ValidatedAotWasm {
     memory_limits: Option<(u64, Option<u64>)>,
     has_blot_memory_export: bool,
@@ -3504,23 +3532,12 @@ fn validate_aot_wasm(wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
     })
 }
 
-#[cfg(not(feature = "compiler"))]
-fn validate_aot_wasm(_wasm: &[u8], abi: &GuestAbi) -> Result<ValidatedAotWasm> {
-    Ok(ValidatedAotWasm {
-        memory_limits: None,
-        has_blot_memory_export: abi.uses_arrays(),
-        has_mut_extern_table: false,
-        expected_imports: None,
-        counter_names: Vec::new(),
-        imaged: Ok(Vec::new()),
-    })
-}
-
 /// Decodes a static UTF-8 byte slice returned by an AOT library export.
 ///
 /// # Safety
 /// If `len > 0`, `ptr` must point to `len` readable immutable bytes that remain live for the
 /// lifetime of `_lib` (the loaded `libloading::Library`).
+#[cfg(feature = "compiler")]
 unsafe fn read_aot_str(_lib: &Library, ptr: *const u8, len: usize) -> Result<&str> {
     if len == 0 {
         return Ok("");
@@ -3531,6 +3548,7 @@ unsafe fn read_aot_str(_lib: &Library, ptr: *const u8, len: usize) -> Result<&st
     std::str::from_utf8(bytes).context("invalid_abi: non-UTF-8 string returned by AOT library")
 }
 
+#[cfg(feature = "compiler")]
 impl AotModule {
     pub fn compile(wasm: &[u8], abi: &GuestAbi, cache: Option<&Path>) -> Result<(Self, Result<Vec<String>, String>)> {
         ensure!(abi.tasks.is_none(), "wtime-aot experimental backend does not support legacy tasks");

@@ -156,12 +156,11 @@ impl GuestRuntime {
 
         {
             let data = memory.data_mut(&mut store);
-            let address =
-                array_range(data.len(), input_ptr, input.len()).map_err(|message| CallError::Invalid(message))?;
+            let address = array_range(data.len(), input_ptr, input.len()).map_err(CallError::Invalid)?;
             data[address..address + 4].copy_from_slice(&input_len.to_le_bytes());
             let body = &mut data[address + 4..address + 4 + input.len() * 4];
-            for (chunk, word) in body.chunks_exact_mut(4).zip(input) {
-                chunk.copy_from_slice(&word.to_le_bytes());
+            for (chunk, word) in body.as_chunks_mut::<4>().0.iter_mut().zip(input) {
+                *chunk = word.to_le_bytes();
             }
         }
 
@@ -181,8 +180,8 @@ impl GuestRuntime {
         array_range(data.len(), output_ptr, out_len).map_err(CallError::Invalid)?;
         let body = &data[address + 4..address + 4 + out_len * 4];
         let mut out = Vec::with_capacity(out_len);
-        for chunk in body.chunks_exact(4) {
-            out.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        for chunk in body.as_chunks::<4>().0 {
+            out.push(u32::from_le_bytes(*chunk));
         }
         Ok(out)
     }

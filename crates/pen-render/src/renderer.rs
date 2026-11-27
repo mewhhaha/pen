@@ -1885,6 +1885,7 @@ impl State {
         self.wired.jfa_outline.scene = None;
     }
 
+    #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
     pub fn upload_tilemap_cells(&self, cells: &[crate::render2d::TileCell]) -> Arc<wgpu::Buffer> {
         Arc::new(crate::render2d::TilemapPass::upload_cells(&self.device, cells))
     }

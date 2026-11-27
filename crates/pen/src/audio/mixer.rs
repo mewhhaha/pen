@@ -2418,7 +2418,7 @@ mod tests {
 
         let mut mixer = Mixer::new(RATE);
         // Settle the 250 ms crossfade into the ray-traced room before triggering the burst.
-        let idle = Mix { buses: vec![MASTER, PLAIN], acoustics: Some(profile.clone()), ..Mix::default() };
+        let idle = Mix { buses: vec![MASTER, PLAIN], acoustics: Some(profile), ..Mix::default() };
         play(&mut mixer, (0..24).map(|_| idle.clone()));
 
         // Send dry=0, reverb=1 burst through bus 1 -> master so output is purely the ray-traced IR!
@@ -2438,7 +2438,7 @@ mod tests {
         s.gain = 1.0;
         let mut trig = Mix { buses: vec![MASTER, PLAIN], sounds: vec![s], acoustics: Some(profile), ..Mix::default() };
         let mut out = play(&mut mixer, [trig]);
-        trig = Mix { buses: vec![MASTER, PLAIN], acoustics: idle.acoustics.clone(), ..Mix::default() };
+        trig = Mix { buses: vec![MASTER, PLAIN], acoustics: idle.acoustics, ..Mix::default() };
         out.extend(play(&mut mixer, (0..12).map(|_| trig.clone())));
 
         let echo_win = (0.010 * RATE) as usize..(0.020 * RATE) as usize;
@@ -2481,7 +2481,7 @@ mod tests {
         };
 
         let mut mixer = Mixer::new(RATE);
-        let idle = Mix { buses: vec![MASTER, PLAIN], acoustics: Some(profile.clone()), ..Mix::default() };
+        let idle = Mix { buses: vec![MASTER, PLAIN], acoustics: Some(profile), ..Mix::default() };
         play(&mut mixer, (0..24).map(|_| idle.clone()));
 
         let mut p = placed([2.0, 0.0, 0.0]); // hard right (+90 deg): dry left channel is ~0!

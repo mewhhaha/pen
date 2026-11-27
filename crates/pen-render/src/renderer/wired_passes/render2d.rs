@@ -439,6 +439,7 @@ fn decode_ext_world_2d(
         if wired.ext_tilemap_buffers.len() > 32 && !wired.ext_tilemap_buffers.contains_key(&key) {
             wired.ext_tilemap_buffers.clear();
         }
+        #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
         let buf = wired
             .ext_tilemap_buffers
             .entry(key)

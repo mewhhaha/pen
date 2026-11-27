@@ -4,14 +4,19 @@
 //! its own player: `--net 1:127.0.0.1:7000,127.0.0.1:7001` is player 1 of
 //! 2, listening on the second address. Datagrams from any other address
 //! are dropped.
+#[cfg(any(feature = "compiler", test))]
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+#[cfg(any(feature = "compiler", test))]
+use std::net::TcpListener;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
 use pen_protocol::{RenderFrame, Viewport};
-pub use pen_runtime::net::relay::{ChannelLink, ClientId, FrameDecoder, RelayBroker, RelayPacket, Transport};
+pub use pen_runtime::net::relay::{ChannelLink, FrameDecoder, Transport};
+#[cfg(any(feature = "compiler", test))]
+pub use pen_runtime::net::relay::{ClientId, RelayBroker, RelayPacket};
 pub use pen_runtime::net::{Link, Netplay, Settings, Stats};
 
 use crate::game::{GameRuntime, Host, Moment};
@@ -21,12 +26,17 @@ use crate::timeline::{Timeline, Unseen};
 const DATAGRAM: usize = 65536;
 /// Unambiguous 4-byte native TCP relay stream preface (distinct from HTTP `GET `).
 pub const TCP_PREFACE: &[u8; 4] = b"PENR";
+#[cfg(any(feature = "compiler", test))]
 const MAX_RELAY_CLIENTS: usize = 1024;
+#[cfg(any(feature = "compiler", test))]
 const MAX_HTTP_HEADER_BYTES: usize = 8192;
 const MAX_OUTBOX_BYTES: usize = 262_144;
 const MAX_READ_BYTES_PER_POLL: usize = 65_536;
+#[cfg(any(feature = "compiler", test))]
 const MAX_FRAMES_PER_POLL: usize = 64;
+#[cfg(any(feature = "compiler", test))]
 const DETECT_TIMEOUT_SECS: u64 = 5;
+#[cfg(any(feature = "compiler", test))]
 const IDLE_TIMEOUT_SECS: u64 = 60;
 
 /// NAT-traversal relay target parsed from `--net relay:PLAYER/PLAYERS@HOST:PORT/ROOM[#TOKEN]`.
@@ -234,6 +244,7 @@ impl Link for TcpRelay {
     }
 }
 
+#[cfg(any(feature = "compiler", test))]
 #[derive(PartialEq, Eq)]
 enum ClientMode {
     Detecting,
@@ -241,6 +252,7 @@ enum ClientMode {
     WebSocket,
 }
 
+#[cfg(any(feature = "compiler", test))]
 struct RelayClient {
     stream: TcpStream,
     mode: ClientMode,
@@ -255,6 +267,7 @@ struct RelayClient {
     last_activity: Instant,
 }
 
+#[cfg(any(feature = "compiler", test))]
 impl RelayClient {
     fn queue_bytes(&mut self, bytes: &[u8]) -> bool {
         let pending = self.write_buf.len().saturating_sub(self.write_pos);
@@ -286,6 +299,7 @@ impl RelayClient {
     }
 }
 
+#[cfg(any(feature = "compiler", test))]
 fn encode_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len() + 10);
     out.push(0x80 | (opcode & 0x0f));
@@ -304,10 +318,12 @@ fn encode_ws_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(any(feature = "compiler", test))]
 fn encode_ws_binary(payload: &[u8]) -> Vec<u8> {
     encode_ws_frame(2, payload)
 }
 
+#[cfg(any(feature = "compiler", test))]
 #[derive(Debug)]
 struct WsFrame {
     fin: bool,
@@ -315,6 +331,7 @@ struct WsFrame {
     payload: Vec<u8>,
 }
 
+#[cfg(any(feature = "compiler", test))]
 enum WsParse {
     Incomplete,
     Frame(WsFrame),
@@ -324,6 +341,7 @@ enum WsParse {
 /// Validates and decodes one RFC 6455 client-to-server WebSocket frame from `buf`,
 /// enforcing RSV == 0, client masking, canonical payload lengths, control-frame rules,
 /// and `max_payload` before buffering any payload bytes.
+#[cfg(any(feature = "compiler", test))]
 fn pop_ws_frame(buf: &mut Vec<u8>, max_payload: usize) -> WsParse {
     if buf.len() < 2 {
         return WsParse::Incomplete;
@@ -395,6 +413,7 @@ fn pop_ws_frame(buf: &mut Vec<u8>, max_payload: usize) -> WsParse {
 }
 
 /// Validates an RFC 6455 HTTP/1.1 WebSocket upgrade header block and returns `Sec-WebSocket-Key`.
+#[cfg(any(feature = "compiler", test))]
 fn validate_ws_upgrade(head: &str) -> Option<String> {
     let mut lines = head.split("\r\n");
     let req_line = lines.next()?;
@@ -434,6 +453,7 @@ fn validate_ws_upgrade(head: &str) -> Option<String> {
 
 /// Non-blocking multi-room TCP + RFC 6455 WebSocket relay server wrapping [`RelayBroker`].
 /// Auto-detects HTTP/1.1 WebSocket upgrades and `PENR`-prefaced length-prefixed native TCP clients.
+#[cfg(any(feature = "compiler", test))]
 pub struct TcpRelayServer {
     listener: TcpListener,
     broker: RelayBroker,
@@ -442,6 +462,7 @@ pub struct TcpRelayServer {
     read_buf: Vec<u8>,
 }
 
+#[cfg(any(feature = "compiler", test))]
 impl TcpRelayServer {
     pub fn bind(addr: impl ToSocketAddrs) -> Result<Self> {
         let listener = TcpListener::bind(addr)?;
@@ -460,6 +481,7 @@ impl TcpRelayServer {
     }
 
     /// Runs the relay server loop until `stop()` returns true.
+    #[cfg(feature = "compiler")]
     pub fn serve(&mut self, mut stop: impl FnMut() -> bool) -> Result<()> {
         while !stop() {
             self.poll();

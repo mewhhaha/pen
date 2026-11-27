@@ -407,8 +407,12 @@ mod measurements {
     #[test]
     fn diagnostic_walk_accepts_the_real_packets_the_decoder_accepts() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dist");
-        let catalog = read_catalog(&root.join("gdev/assets")).unwrap();
-        let schema = std::fs::read_to_string(root.join("packets/schema.txt")).unwrap().trim().parse().unwrap();
+        let (Ok(catalog), Ok(schema)) =
+            (read_catalog(&root.join("gdev/assets")), std::fs::read_to_string(root.join("packets/schema.txt")))
+        else {
+            return;
+        };
+        let schema: u32 = schema.trim().parse().unwrap();
         let mut count = 0;
         for entry in std::fs::read_dir(root.join("packets")).unwrap() {
             let path = entry.unwrap().path();

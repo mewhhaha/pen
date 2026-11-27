@@ -661,7 +661,7 @@ fn reports_trap_provenance_and_source_locations() {
     let store_trap = |trap_id: i32| -> Vec<u8> {
         [
             vec![0x41],
-            signed_leb(blot_host::TRAP_SITE_OFFSET as i32),
+            signed_leb(i32::try_from(blot_host::TRAP_SITE_OFFSET).unwrap()),
             vec![0x41],
             signed_leb(trap_id),
             vec![0x36, 0x02, 0x00, 0x00, 0x0b],

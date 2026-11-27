@@ -90,7 +90,7 @@ mod tests {
 
     #[test]
     fn insertion_and_shell_sort_match_std() {
-        let mut a: Vec<(u32, usize)> = (0..64).map(|i| (((i * 19 + 5) % 9) as u32, i)).collect();
+        let mut a: Vec<(u32, usize)> = (0..64u32).map(|i| ((i * 19 + 5) % 9, i as usize)).collect();
         let mut expected = a.clone();
         expected.sort_by_key(|&(k, _)| k);
         insertion_sort_by(&mut a, |x, y| x.0.cmp(&y.0));
